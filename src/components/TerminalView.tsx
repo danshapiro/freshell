@@ -110,6 +110,29 @@ export default function TerminalView({ tabId, hidden }: { tabId: string; hidden?
       ws.send({ type: 'terminal.input', terminalId, data })
     })
 
+    // Handle copy/paste keyboard shortcuts
+    term.attachCustomKeyEventHandler((event) => {
+      // Ctrl+Shift+C to copy
+      if (event.ctrlKey && event.shiftKey && event.key === 'C' && event.type === 'keydown') {
+        const selection = term.getSelection()
+        if (selection) {
+          navigator.clipboard.writeText(selection)
+        }
+        return false // Prevent default
+      }
+      // Ctrl+Shift+V to paste
+      if (event.ctrlKey && event.shiftKey && event.key === 'V' && event.type === 'keydown') {
+        navigator.clipboard.readText().then((text) => {
+          const terminalId = terminalIdRef.current
+          if (terminalId && text) {
+            ws.send({ type: 'terminal.input', terminalId, data: text })
+          }
+        })
+        return false // Prevent default
+      }
+      return true // Allow other keys
+    })
+
     const ro = new ResizeObserver(() => {
       // Only fit if visible and not disposed
       if (hiddenRef.current || termRef.current !== term) return
