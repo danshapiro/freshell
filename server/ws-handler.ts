@@ -5,6 +5,8 @@ import { logger } from './logger'
 import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed } from './auth'
 import type { TerminalRegistry, TerminalMode } from './terminal-registry'
 import { configStore } from './config-store'
+import type { ClaudeSessionManager } from './claude-session'
+import type { ClaudeEvent } from './claude-stream-types'
 
 const MAX_CONNECTIONS = Number(process.env.MAX_CONNECTIONS || 10)
 const HELLO_TIMEOUT_MS = Number(process.env.HELLO_TIMEOUT_MS || 5_000)
@@ -85,6 +87,29 @@ const TerminalListSchema = z.object({
   requestId: z.string().min(1),
 })
 
+// Claude session schemas
+const ClaudeCreateSchema = z.object({
+  type: z.literal('claude.create'),
+  requestId: z.string().min(1),
+  prompt: z.string().min(1),
+  cwd: z.string().optional(),
+  resumeSessionId: z.string().optional(),
+  model: z.string().optional(),
+  maxTurns: z.number().int().positive().optional(),
+  permissionMode: z.enum(['default', 'plan', 'acceptEdits', 'bypassPermissions']).optional(),
+})
+
+const ClaudeInputSchema = z.object({
+  type: z.literal('claude.input'),
+  sessionId: z.string().min(1),
+  data: z.string(),
+})
+
+const ClaudeKillSchema = z.object({
+  type: z.literal('claude.kill'),
+  sessionId: z.string().min(1),
+})
+
 const ClientMessageSchema = z.discriminatedUnion('type', [
   HelloSchema,
   PingSchema,
@@ -95,12 +120,16 @@ const ClientMessageSchema = z.discriminatedUnion('type', [
   TerminalResizeSchema,
   TerminalKillSchema,
   TerminalListSchema,
+  ClaudeCreateSchema,
+  ClaudeInputSchema,
+  ClaudeKillSchema,
 ])
 
 type ClientState = {
   authenticated: boolean
   attachedTerminalIds: Set<string>
   createdByRequestId: Map<string, string>
+  claudeSessions: Set<string>
   helloTimer?: NodeJS.Timeout
 }
 
@@ -108,7 +137,11 @@ export class WsHandler {
   private wss: WebSocketServer
   private connections = new Set<WebSocket>()
 
-  constructor(server: http.Server, private registry: TerminalRegistry) {
+  constructor(
+    server: http.Server,
+    private registry: TerminalRegistry,
+    private claudeManager?: ClaudeSessionManager
+  ) {
     this.wss = new WebSocketServer({
       server,
       path: '/ws',
@@ -153,6 +186,7 @@ export class WsHandler {
       authenticated: false,
       attachedTerminalIds: new Set(),
       createdByRequestId: new Map(),
+      claudeSessions: new Set(),
     }
 
     this.connections.add(ws)
@@ -183,6 +217,12 @@ export class WsHandler {
       ws.send(JSON.stringify(msg))
     } catch {
       // ignore
+    }
+  }
+
+  private safeSend(ws: WebSocket, msg: unknown) {
+    if (ws.readyState === WebSocket.OPEN) {
+      this.send(ws, msg)
     }
   }
 
@@ -351,6 +391,102 @@ export class WsHandler {
           }
         })
         this.send(ws, { type: 'terminal.list.response', requestId: m.requestId, terminals: merged })
+        return
+      }
+
+      case 'claude.create': {
+        if (!this.claudeManager) {
+          this.sendError(ws, {
+            code: 'INTERNAL_ERROR',
+            message: 'Claude sessions not enabled',
+            requestId: m.requestId,
+          })
+          return
+        }
+
+        try {
+          const session = this.claudeManager.create({
+            prompt: m.prompt,
+            cwd: m.cwd,
+            resumeSessionId: m.resumeSessionId,
+            model: m.model,
+            maxTurns: m.maxTurns,
+            permissionMode: m.permissionMode,
+          })
+
+          // Track this client's session
+          state.claudeSessions.add(session.id)
+
+          // Stream events to client
+          session.on('event', (event: ClaudeEvent) => {
+            this.safeSend(ws, {
+              type: 'claude.event',
+              sessionId: session.id,
+              event,
+            })
+          })
+
+          session.on('exit', (code: number) => {
+            this.safeSend(ws, {
+              type: 'claude.exit',
+              sessionId: session.id,
+              exitCode: code,
+            })
+          })
+
+          session.on('stderr', (text: string) => {
+            this.safeSend(ws, {
+              type: 'claude.stderr',
+              sessionId: session.id,
+              text,
+            })
+          })
+
+          this.send(ws, {
+            type: 'claude.created',
+            requestId: m.requestId,
+            sessionId: session.id,
+          })
+        } catch (err: any) {
+          logger.warn({ err }, 'claude.create failed')
+          this.sendError(ws, {
+            code: 'INTERNAL_ERROR',
+            message: err?.message || 'Failed to create Claude session',
+            requestId: m.requestId,
+          })
+        }
+        return
+      }
+
+      case 'claude.input': {
+        if (!this.claudeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Claude sessions not enabled' })
+          return
+        }
+
+        const session = this.claudeManager.get(m.sessionId)
+        if (!session) {
+          this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Session not found' })
+          return
+        }
+
+        session.sendInput(m.data)
+        return
+      }
+
+      case 'claude.kill': {
+        if (!this.claudeManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Claude sessions not enabled' })
+          return
+        }
+
+        const removed = this.claudeManager.remove(m.sessionId)
+        state.claudeSessions.delete(m.sessionId)
+        this.send(ws, {
+          type: 'claude.killed',
+          sessionId: m.sessionId,
+          success: removed,
+        })
         return
       }
 
