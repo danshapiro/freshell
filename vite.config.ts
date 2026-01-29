@@ -21,6 +21,7 @@ export default defineConfig(({ mode }) => ({
   server: {
     proxy: {
       '/api': 'http://localhost:3001',
+      '/local-file': 'http://localhost:3001',
       '/ws': {
         target: 'http://localhost:3001',
         ws: true,

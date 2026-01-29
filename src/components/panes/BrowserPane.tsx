@@ -13,6 +13,16 @@ interface BrowserPaneProps {
 
 const MAX_HISTORY_SIZE = 50
 
+// Convert file:// URLs to API endpoint for iframe loading
+function toIframeSrc(url: string): string {
+  if (url.startsWith('file://')) {
+    // Extract path from file:// URL (handle both file:/// and file://)
+    const filePath = url.replace(/^file:\/\/\/?/, '')
+    return `/local-file?path=${encodeURIComponent(filePath)}`
+  }
+  return url
+}
+
 export default function BrowserPane({ paneId, tabId, url, devToolsOpen }: BrowserPaneProps) {
   const dispatch = useAppDispatch()
   const iframeRef = useRef<HTMLIFrameElement>(null)
@@ -25,9 +35,9 @@ export default function BrowserPane({ paneId, tabId, url, devToolsOpen }: Browse
   const navigate = useCallback((newUrl: string) => {
     if (!newUrl.trim()) return
 
-    // Add protocol if missing
+    // Add protocol if missing (preserve file:// URLs)
     let fullUrl = newUrl
-    if (!fullUrl.match(/^https?:\/\//)) {
+    if (!fullUrl.match(/^(https?|file):\/\//)) {
       fullUrl = 'https://' + fullUrl
     }
 
@@ -188,7 +198,7 @@ export default function BrowserPane({ paneId, tabId, url, devToolsOpen }: Browse
           ) : currentUrl ? (
             <iframe
               ref={iframeRef}
-              src={currentUrl}
+              src={toIframeSrc(currentUrl)}
               className="w-full h-full border-0 bg-white"
               sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
               onLoad={() => setIsLoading(false)}

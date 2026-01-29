@@ -1,5 +1,6 @@
 import 'dotenv/config'
 import express from 'express'
+import fs from 'fs'
 import http from 'http'
 import path from 'path'
 import { fileURLToPath } from 'url'
@@ -23,6 +24,31 @@ async function main() {
   app.disable('x-powered-by')
 
   app.use(express.json({ limit: '1mb' }))
+
+  // --- Local file serving for browser pane (no auth required, same-origin only) ---
+  app.get('/local-file', (req, res) => {
+    const filePath = req.query.path as string
+    if (!filePath) {
+      return res.status(400).json({ error: 'path query parameter required' })
+    }
+
+    // Normalize and resolve the path
+    const resolved = path.resolve(filePath)
+
+    // Check if file exists
+    if (!fs.existsSync(resolved)) {
+      return res.status(404).json({ error: 'File not found' })
+    }
+
+    // Check if it's a file (not a directory)
+    const stat = fs.statSync(resolved)
+    if (stat.isDirectory()) {
+      return res.status(400).json({ error: 'Cannot serve directories' })
+    }
+
+    // Send the file with appropriate content type
+    res.sendFile(resolved)
+  })
 
   // Basic rate limiting for /api
   app.use(
