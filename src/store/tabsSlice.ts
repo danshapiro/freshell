@@ -1,0 +1,80 @@
+import { createSlice, PayloadAction } from '@reduxjs/toolkit'
+import type { Tab, TerminalStatus, TabMode, ShellType } from './types'
+import { nanoid } from 'nanoid'
+
+export interface TabsState {
+  tabs: Tab[]
+  activeTabId: string | null
+}
+
+const DEFAULT_CWD = import.meta.env.VITE_DEFAULT_CWD || undefined
+
+const initialState: TabsState = {
+  tabs: [],
+  activeTabId: null,
+}
+
+type AddTabPayload = {
+  title?: string
+  description?: string
+  terminalId?: string
+  status?: TerminalStatus
+  mode?: TabMode
+  shell?: ShellType
+  initialCwd?: string
+  resumeSessionId?: string
+}
+
+export const tabsSlice = createSlice({
+  name: 'tabs',
+  initialState,
+  reducers: {
+    addTab: (state, action: PayloadAction<AddTabPayload | undefined>) => {
+      const payload = action.payload || {}
+      const id = nanoid()
+      const tab: Tab = {
+        id,
+        createRequestId: id,
+        title: payload.title || `Terminal ${state.tabs.length + 1}`,
+        description: payload.description,
+        terminalId: payload.terminalId,
+        status: payload.status || 'creating',
+        mode: payload.mode || 'shell',
+        shell: payload.shell || 'system',
+        initialCwd: payload.initialCwd ?? DEFAULT_CWD,
+        resumeSessionId: payload.resumeSessionId,
+        createdAt: Date.now(),
+      }
+      state.tabs.push(tab)
+      state.activeTabId = id
+    },
+    setActiveTab: (state, action: PayloadAction<string>) => {
+      state.activeTabId = action.payload
+    },
+    updateTab: (state, action: PayloadAction<{ id: string; updates: Partial<Tab> }>) => {
+      const tab = state.tabs.find((t) => t.id === action.payload.id)
+      if (tab) Object.assign(tab, action.payload.updates)
+    },
+    removeTab: (state, action: PayloadAction<string>) => {
+      state.tabs = state.tabs.filter((t) => t.id !== action.payload)
+      if (state.activeTabId === action.payload) {
+        state.activeTabId = state.tabs.length > 0 ? state.tabs[0].id : null
+      }
+    },
+    hydrateTabs: (state, action: PayloadAction<TabsState>) => {
+      // Basic sanity: ensure dates exist, status defaults.
+      state.tabs = (action.payload.tabs || []).map((t) => ({
+        ...t,
+        createdAt: t.createdAt || Date.now(),
+        createRequestId: (t as any).createRequestId || t.id,
+        status: t.status || 'creating',
+        mode: t.mode || 'shell',
+        shell: t.shell || 'system',
+      }))
+      state.activeTabId = action.payload.activeTabId || (state.tabs[0]?.id ?? null)
+    },
+  },
+})
+
+export const { addTab, setActiveTab, updateTab, removeTab, hydrateTabs } = tabsSlice.actions
+export default tabsSlice.reducer

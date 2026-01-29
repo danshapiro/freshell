@@ -1,0 +1,118 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Light mode - airy, clean, Linear/Notion inspired */
+  --background: 0 0% 100%;
+  --foreground: 240 10% 10%;
+  --card: 0 0% 98%;
+  --card-foreground: 240 10% 10%;
+  --muted: 240 5% 96%;
+  --muted-foreground: 240 4% 46%;
+  --accent: 240 5% 96%;
+  --accent-foreground: 240 10% 10%;
+  --border: 240 6% 92%;
+  --primary: 240 10% 10%;
+  --primary-foreground: 0 0% 100%;
+  --destructive: 0 72% 51%;
+  --destructive-foreground: 0 0% 100%;
+  --success: 142 71% 45%;
+  --success-foreground: 0 0% 100%;
+  --warning: 38 92% 50%;
+  --warning-foreground: 0 0% 100%;
+  --radius: 0.5rem;
+
+  /* Shadows for light mode */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.06);
+  --shadow-lg: 0 4px 16px rgba(0, 0, 0, 0.08);
+}
+
+.dark {
+  /* Dark mode - focused, immersive, Raycast/Vercel inspired */
+  --background: 240 10% 4%;
+  --foreground: 0 0% 98%;
+  --card: 240 6% 10%;
+  --card-foreground: 0 0% 98%;
+  --muted: 240 4% 16%;
+  --muted-foreground: 240 5% 65%;
+  --accent: 240 4% 16%;
+  --accent-foreground: 0 0% 98%;
+  --border: 240 4% 16%;
+  --primary: 0 0% 98%;
+  --primary-foreground: 240 10% 4%;
+  --destructive: 0 62% 50%;
+  --destructive-foreground: 0 0% 98%;
+  --success: 142 71% 45%;
+  --success-foreground: 0 0% 100%;
+  --warning: 38 92% 50%;
+  --warning-foreground: 0 0% 100%;
+
+  /* Shadows for dark mode */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
+  --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+html {
+  /* UI scale applied via JavaScript - default 125% for comfortable desktop viewing */
+  --ui-scale: 1.25;
+}
+
+body {
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Apply UI scale to the app container using zoom */
+#root {
+  zoom: var(--ui-scale, 1.25);
+}
+
+/* Firefox doesn't support zoom, use transform as fallback */
+@supports not (zoom: 1) {
+  #root {
+    transform: scale(var(--ui-scale, 1.25));
+    transform-origin: top left;
+    width: calc(100% / var(--ui-scale, 1.25));
+    height: calc(100% / var(--ui-scale, 1.25));
+  }
+}
+
+/* Elegant scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--muted-foreground) / 0.3);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground) / 0.5);
+}
+
+/* Subtle focus rings */
+*:focus-visible {
+  outline: 2px solid hsl(var(--foreground) / 0.2);
+  outline-offset: 2px;
+}
+
+/* Selection color */
+::selection {
+  background: hsl(var(--foreground) / 0.1);
+}

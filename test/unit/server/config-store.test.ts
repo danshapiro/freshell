@@ -1,0 +1,572 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import fsp from 'fs/promises'
+import path from 'path'
+import os from 'os'
+
+// Use vi.hoisted to ensure mockState is available before vi.mock runs
+// vitest hoists vi.mock calls to the top, so we need vi.hoisted for dependencies
+const mockState = vi.hoisted(() => ({
+  homeDir: process.env.TEMP || process.env.TMP || '/tmp',
+}))
+
+vi.mock('os', async () => {
+  const actual = await vi.importActual<typeof import('os')>('os')
+  return {
+    ...actual,
+    default: {
+      ...actual,
+      homedir: () => mockState.homeDir,
+    },
+    homedir: () => mockState.homeDir,
+  }
+})
+
+// Import after mocking
+import {
+  ConfigStore,
+  defaultSettings,
+  type UserConfig,
+} from '../../../server/config-store'
+
+describe('ConfigStore', () => {
+  let tempDir: string
+  let configDir: string
+  let configPath: string
+
+  beforeEach(async () => {
+    // Create a unique temp directory for each test
+    tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'config-store-test-'))
+    mockState.homeDir = tempDir
+    configDir = path.join(tempDir, '.ccso')
+    configPath = path.join(configDir, 'config.json')
+  })
+
+  afterEach(async () => {
+    // Clean up temp directory
+    try {
+      await fsp.rm(tempDir, { recursive: true, force: true })
+    } catch {
+      // Ignore cleanup errors
+    }
+  })
+
+  describe('load()', () => {
+    it('returns defaults when no file exists', async () => {
+      const store = new ConfigStore()
+      const config = await store.load()
+
+      expect(config.version).toBe(1)
+      expect(config.settings).toEqual(defaultSettings)
+      expect(config.sessionOverrides).toEqual({})
+      expect(config.terminalOverrides).toEqual({})
+      expect(config.projectColors).toEqual({})
+    })
+
+    it('creates config file when none exists', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      const exists = await fsp
+        .access(configPath)
+        .then(() => true)
+        .catch(() => false)
+      expect(exists).toBe(true)
+    })
+
+    it('creates .ccso directory if needed', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      const stat = await fsp.stat(configDir)
+      expect(stat.isDirectory()).toBe(true)
+    })
+
+    it('parses existing config file', async () => {
+      // Create config directory and file
+      await fsp.mkdir(configDir, { recursive: true })
+      const existingConfig: UserConfig = {
+        version: 1,
+        settings: {
+          ...defaultSettings,
+          theme: 'dark',
+          terminal: {
+            ...defaultSettings.terminal,
+            fontSize: 16,
+          },
+        },
+        sessionOverrides: { 'session-1': { titleOverride: 'Custom Title' } },
+        terminalOverrides: { 'term-1': { deleted: true } },
+        projectColors: { '/projects/foo': '#ff0000' },
+      }
+      await fsp.writeFile(configPath, JSON.stringify(existingConfig, null, 2))
+
+      const store = new ConfigStore()
+      const config = await store.load()
+
+      expect(config.settings.theme).toBe('dark')
+      expect(config.settings.terminal.fontSize).toBe(16)
+      expect(config.sessionOverrides['session-1']?.titleOverride).toBe('Custom Title')
+      expect(config.terminalOverrides['term-1']?.deleted).toBe(true)
+      expect(config.projectColors['/projects/foo']).toBe('#ff0000')
+    })
+
+    it('merges partial settings with defaults', async () => {
+      // Create a config with only some settings
+      await fsp.mkdir(configDir, { recursive: true })
+      const partialConfig = {
+        version: 1,
+        settings: {
+          theme: 'light' as const,
+          // terminal and safety omitted
+        },
+        sessionOverrides: {},
+        terminalOverrides: {},
+        projectColors: {},
+      }
+      await fsp.writeFile(configPath, JSON.stringify(partialConfig, null, 2))
+
+      const store = new ConfigStore()
+      const config = await store.load()
+
+      expect(config.settings.theme).toBe('light')
+      // Default terminal settings should be merged in
+      expect(config.settings.terminal).toEqual(defaultSettings.terminal)
+      expect(config.settings.safety).toEqual(defaultSettings.safety)
+    })
+
+    it('returns null for invalid version and creates default config', async () => {
+      await fsp.mkdir(configDir, { recursive: true })
+      await fsp.writeFile(configPath, JSON.stringify({ version: 99, settings: {} }))
+
+      const store = new ConfigStore()
+      const config = await store.load()
+
+      // Should return defaults since version doesn't match
+      expect(config.version).toBe(1)
+      expect(config.settings).toEqual(defaultSettings)
+    })
+
+    it('returns defaults for malformed JSON', async () => {
+      await fsp.mkdir(configDir, { recursive: true })
+      await fsp.writeFile(configPath, 'not valid json {{{')
+
+      const store = new ConfigStore()
+      const config = await store.load()
+
+      expect(config.version).toBe(1)
+      expect(config.settings).toEqual(defaultSettings)
+    })
+
+    it('uses cached value on subsequent calls', async () => {
+      const store = new ConfigStore()
+      const config1 = await store.load()
+
+      // Modify the file directly
+      await fsp.writeFile(
+        configPath,
+        JSON.stringify({
+          version: 1,
+          settings: { ...defaultSettings, theme: 'light' },
+          sessionOverrides: {},
+          terminalOverrides: {},
+          projectColors: {},
+        })
+      )
+
+      // Should still return cached value
+      const config2 = await store.load()
+      expect(config2).toBe(config1) // Same reference
+    })
+  })
+
+  describe('save()', () => {
+    it('writes config to disk', async () => {
+      const store = new ConfigStore()
+      const config: UserConfig = {
+        version: 1,
+        settings: { ...defaultSettings, theme: 'dark' },
+        sessionOverrides: {},
+        terminalOverrides: {},
+        projectColors: {},
+      }
+
+      await store.save(config)
+
+      const raw = await fsp.readFile(configPath, 'utf-8')
+      const saved = JSON.parse(raw)
+      expect(saved.settings.theme).toBe('dark')
+    })
+
+    it('creates directory if needed', async () => {
+      const store = new ConfigStore()
+      const config: UserConfig = {
+        version: 1,
+        settings: defaultSettings,
+        sessionOverrides: {},
+        terminalOverrides: {},
+        projectColors: {},
+      }
+
+      // Directory doesn't exist yet
+      const existsBefore = await fsp
+        .access(configDir)
+        .then(() => true)
+        .catch(() => false)
+      expect(existsBefore).toBe(false)
+
+      await store.save(config)
+
+      const existsAfter = await fsp
+        .access(configDir)
+        .then(() => true)
+        .catch(() => false)
+      expect(existsAfter).toBe(true)
+    })
+
+    it('updates the cache', async () => {
+      const store = new ConfigStore()
+
+      // Load initial config
+      await store.load()
+
+      // Save new config
+      const newConfig: UserConfig = {
+        version: 1,
+        settings: { ...defaultSettings, theme: 'dark' },
+        sessionOverrides: {},
+        terminalOverrides: {},
+        projectColors: {},
+      }
+      await store.save(newConfig)
+
+      // Subsequent load should return the saved config (from cache)
+      const loaded = await store.load()
+      expect(loaded.settings.theme).toBe('dark')
+    })
+
+    it('writes formatted JSON with indentation', async () => {
+      const store = new ConfigStore()
+      const config: UserConfig = {
+        version: 1,
+        settings: defaultSettings,
+        sessionOverrides: {},
+        terminalOverrides: {},
+        projectColors: {},
+      }
+
+      await store.save(config)
+
+      const raw = await fsp.readFile(configPath, 'utf-8')
+      expect(raw).toContain('\n') // Has newlines (formatted)
+      expect(raw).toMatch(/^\{[\r\n]/) // Starts with { followed by newline
+    })
+  })
+
+  describe('getSettings()', () => {
+    it('returns current settings', async () => {
+      const store = new ConfigStore()
+      const settings = await store.getSettings()
+
+      expect(settings).toEqual(defaultSettings)
+    })
+
+    it('returns settings from existing config', async () => {
+      await fsp.mkdir(configDir, { recursive: true })
+      const existingConfig: UserConfig = {
+        version: 1,
+        settings: { ...defaultSettings, theme: 'light' },
+        sessionOverrides: {},
+        terminalOverrides: {},
+        projectColors: {},
+      }
+      await fsp.writeFile(configPath, JSON.stringify(existingConfig))
+
+      const store = new ConfigStore()
+      const settings = await store.getSettings()
+
+      expect(settings.theme).toBe('light')
+    })
+  })
+
+  describe('patchSettings() (updateSettings)', () => {
+    it('merges partial updates', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      const updated = await store.patchSettings({ theme: 'dark' })
+
+      expect(updated.theme).toBe('dark')
+      // Other settings should remain default
+      expect(updated.terminal).toEqual(defaultSettings.terminal)
+      expect(updated.safety).toEqual(defaultSettings.safety)
+    })
+
+    it('deep merges nested objects', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      const updated = await store.patchSettings({
+        terminal: { fontSize: 18 },
+      })
+
+      expect(updated.terminal.fontSize).toBe(18)
+      // Other terminal settings should remain default
+      expect(updated.terminal.fontFamily).toBe(defaultSettings.terminal.fontFamily)
+      expect(updated.terminal.cursorBlink).toBe(defaultSettings.terminal.cursorBlink)
+    })
+
+    it('persists updates to disk', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      await store.patchSettings({ theme: 'light' })
+
+      // Read from disk directly
+      const raw = await fsp.readFile(configPath, 'utf-8')
+      const saved = JSON.parse(raw)
+      expect(saved.settings.theme).toBe('light')
+    })
+
+    it('can update safety settings', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      const updated = await store.patchSettings({
+        safety: { autoKillIdleMinutes: 60 },
+      })
+
+      expect(updated.safety.autoKillIdleMinutes).toBe(60)
+      expect(updated.safety.warnBeforeKillMinutes).toBe(defaultSettings.safety.warnBeforeKillMinutes)
+    })
+
+    it('can set defaultCwd', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      const updated = await store.patchSettings({
+        defaultCwd: '/custom/path',
+      })
+
+      expect(updated.defaultCwd).toBe('/custom/path')
+    })
+  })
+
+  describe('session overrides', () => {
+    it('getSessionOverride returns undefined for non-existent session', async () => {
+      const store = new ConfigStore()
+      const override = await store.getSessionOverride('non-existent')
+      expect(override).toBeUndefined()
+    })
+
+    it('patchSessionOverride creates new override', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      const result = await store.patchSessionOverride('session-1', {
+        titleOverride: 'Custom Title',
+      })
+
+      expect(result.titleOverride).toBe('Custom Title')
+    })
+
+    it('patchSessionOverride merges with existing', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      await store.patchSessionOverride('session-1', { titleOverride: 'Title' })
+      const result = await store.patchSessionOverride('session-1', {
+        summaryOverride: 'Summary',
+      })
+
+      expect(result.titleOverride).toBe('Title')
+      expect(result.summaryOverride).toBe('Summary')
+    })
+
+    it('deleteSession marks session as deleted', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      await store.deleteSession('session-1')
+
+      const override = await store.getSessionOverride('session-1')
+      expect(override?.deleted).toBe(true)
+    })
+  })
+
+  describe('terminal overrides', () => {
+    it('getTerminalOverride returns undefined for non-existent terminal', async () => {
+      const store = new ConfigStore()
+      const override = await store.getTerminalOverride('non-existent')
+      expect(override).toBeUndefined()
+    })
+
+    it('patchTerminalOverride creates new override', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      const result = await store.patchTerminalOverride('term-1', {
+        titleOverride: 'Custom Terminal',
+      })
+
+      expect(result.titleOverride).toBe('Custom Terminal')
+    })
+
+    it('deleteTerminal marks terminal as deleted', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      await store.deleteTerminal('term-1')
+
+      const override = await store.getTerminalOverride('term-1')
+      expect(override?.deleted).toBe(true)
+    })
+  })
+
+  describe('project colors', () => {
+    it('setProjectColor saves color for project path', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      await store.setProjectColor('/projects/my-app', '#ff5500')
+
+      const colors = await store.getProjectColors()
+      expect(colors['/projects/my-app']).toBe('#ff5500')
+    })
+
+    it('getProjectColors returns empty object by default', async () => {
+      const store = new ConfigStore()
+      const colors = await store.getProjectColors()
+      expect(colors).toEqual({})
+    })
+
+    it('can set multiple project colors', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      await store.setProjectColor('/project1', '#ff0000')
+      await store.setProjectColor('/project2', '#00ff00')
+
+      const colors = await store.getProjectColors()
+      expect(colors['/project1']).toBe('#ff0000')
+      expect(colors['/project2']).toBe('#00ff00')
+    })
+  })
+
+  describe('snapshot()', () => {
+    it('returns current config state', async () => {
+      const store = new ConfigStore()
+      await store.load()
+      await store.patchSettings({ theme: 'dark' })
+
+      const snapshot = await store.snapshot()
+
+      expect(snapshot.version).toBe(1)
+      expect(snapshot.settings.theme).toBe('dark')
+    })
+  })
+
+  describe('settings validation (type safety)', () => {
+    it('theme must be valid enum value', async () => {
+      await fsp.mkdir(configDir, { recursive: true })
+      const invalidConfig = {
+        version: 1,
+        settings: { ...defaultSettings, theme: 'invalid-theme' },
+        sessionOverrides: {},
+        terminalOverrides: {},
+        projectColors: {},
+      }
+      await fsp.writeFile(configPath, JSON.stringify(invalidConfig))
+
+      const store = new ConfigStore()
+      const config = await store.load()
+
+      // The current implementation doesn't validate - it just passes through
+      // This documents the actual behavior
+      expect(config.settings.theme).toBe('invalid-theme')
+    })
+
+    it('terminal fontSize accepts number values', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      const updated = await store.patchSettings({
+        terminal: { fontSize: 20 },
+      })
+
+      expect(updated.terminal.fontSize).toBe(20)
+    })
+
+    it('terminal scrollback accepts number values', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      const updated = await store.patchSettings({
+        terminal: { scrollback: 10000 },
+      })
+
+      expect(updated.terminal.scrollback).toBe(10000)
+    })
+  })
+
+  describe('edge cases', () => {
+    it('handles empty settings object in file', async () => {
+      await fsp.mkdir(configDir, { recursive: true })
+      await fsp.writeFile(
+        configPath,
+        JSON.stringify({
+          version: 1,
+          settings: {},
+          sessionOverrides: {},
+          terminalOverrides: {},
+          projectColors: {},
+        })
+      )
+
+      const store = new ConfigStore()
+      const config = await store.load()
+
+      // Should merge with defaults
+      expect(config.settings.theme).toBe(defaultSettings.theme)
+      expect(config.settings.terminal).toEqual(defaultSettings.terminal)
+    })
+
+    it('handles missing optional fields', async () => {
+      await fsp.mkdir(configDir, { recursive: true })
+      await fsp.writeFile(
+        configPath,
+        JSON.stringify({
+          version: 1,
+          settings: defaultSettings,
+          // Missing sessionOverrides, terminalOverrides, projectColors
+        })
+      )
+
+      const store = new ConfigStore()
+      const config = await store.load()
+
+      expect(config.sessionOverrides).toEqual({})
+      expect(config.terminalOverrides).toEqual({})
+      expect(config.projectColors).toEqual({})
+    })
+
+    it('sequential saves maintain valid JSON', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      // Run saves sequentially
+      await store.patchSettings({ theme: 'dark' })
+      await store.setProjectColor('/p1', '#000')
+      await store.patchSessionOverride('s1', { titleOverride: 'T1' })
+
+      // File should still be valid JSON
+      const raw = await fsp.readFile(configPath, 'utf-8')
+      expect(() => JSON.parse(raw)).not.toThrow()
+
+      // Verify all changes were persisted
+      const parsed = JSON.parse(raw)
+      expect(parsed.settings.theme).toBe('dark')
+      expect(parsed.projectColors['/p1']).toBe('#000')
+      expect(parsed.sessionOverrides['s1'].titleOverride).toBe('T1')
+    })
+  })
+})

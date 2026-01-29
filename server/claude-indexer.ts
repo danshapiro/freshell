@@ -1,0 +1,295 @@
+import path from 'path'
+import os from 'os'
+import fsp from 'fs/promises'
+import fs from 'fs'
+import chokidar from 'chokidar'
+import { logger } from './logger'
+import { configStore, SessionOverride } from './config-store'
+
+export type ClaudeSession = {
+  sessionId: string
+  projectPath: string
+  updatedAt: number
+  messageCount?: number
+  title?: string
+  summary?: string
+  cwd?: string
+}
+
+export type ProjectGroup = {
+  projectPath: string
+  sessions: ClaudeSession[]
+  color?: string
+}
+
+function defaultClaudeHome(): string {
+  // Claude Code stores logs in ~/.claude by default (Linux/macOS).
+  // On Windows, set CLAUDE_HOME to a path you can access from Node (e.g. \\wsl$\...).
+  return process.env.CLAUDE_HOME || path.join(os.homedir(), '.claude')
+}
+
+function looksLikePath(s: string): boolean {
+  return s.includes('/') || s.includes('\\') || /^[A-Za-z]:\\/.test(s)
+}
+
+async function tryReadJson(filePath: string): Promise<any | null> {
+  try {
+    const raw = await fsp.readFile(filePath, 'utf-8')
+    return JSON.parse(raw)
+  } catch {
+    return null
+  }
+}
+
+async function resolveProjectPath(projectDir: string): Promise<string> {
+  // Try known files first
+  const candidates = ['project.json', 'metadata.json', 'config.json']
+  for (const name of candidates) {
+    const p = path.join(projectDir, name)
+    const json = await tryReadJson(p)
+    if (json) {
+      const possible =
+        json.projectPath || json.path || json.cwd || json.root || json.project_root || json.project_root_path
+      if (typeof possible === 'string' && looksLikePath(possible)) return possible
+    }
+  }
+
+  // Heuristic: scan small json files in directory
+  try {
+    const files = await fsp.readdir(projectDir)
+    for (const f of files) {
+      if (!f.endsWith('.json')) continue
+      const p = path.join(projectDir, f)
+      const stat = await fsp.stat(p)
+      if (stat.size > 200_000) continue
+      const json = await tryReadJson(p)
+      if (!json) continue
+      const keys = ['projectPath', 'path', 'cwd', 'root']
+      for (const k of keys) {
+        const v = json[k]
+        if (typeof v === 'string' && looksLikePath(v)) return v
+      }
+    }
+  } catch {}
+
+  // Fallback to directory name.
+  return path.basename(projectDir)
+}
+
+type JsonlMeta = {
+  cwd?: string
+  title?: string
+  summary?: string
+  messageCount?: number
+}
+
+async function parseSessionJsonlMeta(filePath: string): Promise<JsonlMeta> {
+  try {
+    const stream = fs.createReadStream(filePath, { encoding: 'utf-8', highWaterMark: 256 * 1024 })
+    let data = ''
+    for await (const chunk of stream) {
+      data += chunk
+      if (data.length >= 256 * 1024) break
+    }
+    stream.close()
+
+    const lines = data.split(/\r?\n/).filter(Boolean)
+    let cwd: string | undefined
+    let title: string | undefined
+    let summary: string | undefined
+
+    for (const line of lines) {
+      let obj: any
+      try {
+        obj = JSON.parse(line)
+      } catch {
+        continue
+      }
+
+      const candidates = [
+        obj?.cwd,
+        obj?.context?.cwd,
+        obj?.payload?.cwd,
+        obj?.data?.cwd,
+        obj?.message?.cwd,
+      ].filter((v: any) => typeof v === 'string') as string[]
+      if (!cwd) {
+        const found = candidates.find((v) => looksLikePath(v))
+        if (found) cwd = found
+      }
+
+      if (!title) {
+        const t =
+          obj?.title ||
+          obj?.sessionTitle ||
+          (obj?.role === 'user' && typeof obj?.content === 'string' ? obj.content : undefined) ||
+          (obj?.message?.role === 'user' && typeof obj?.message?.content === 'string'
+            ? obj.message.content
+            : undefined)
+
+        if (typeof t === 'string' && t.trim()) {
+          title = t.trim().replace(/\s+/g, ' ').slice(0, 80)
+        }
+      }
+
+      if (!summary) {
+        const s = obj?.summary || obj?.sessionSummary
+        if (typeof s === 'string' && s.trim()) summary = s.trim().slice(0, 240)
+      }
+
+      if (cwd && title && summary) break
+    }
+
+    return {
+      cwd,
+      title,
+      summary,
+      messageCount: lines.length,
+    }
+  } catch {
+    return {}
+  }
+}
+
+function applyOverride(session: ClaudeSession, ov: SessionOverride | undefined): ClaudeSession | null {
+  if (ov?.deleted) return null
+  return {
+    ...session,
+    title: ov?.titleOverride || session.title,
+    summary: ov?.summaryOverride || session.summary,
+  }
+}
+
+export class ClaudeSessionIndexer {
+  private claudeHome = defaultClaudeHome()
+  private watcher: chokidar.FSWatcher | null = null
+  private projects: ProjectGroup[] = []
+  private onUpdateHandlers = new Set<(projects: ProjectGroup[]) => void>()
+  private refreshTimer: NodeJS.Timeout | null = null
+
+  async start() {
+    // Initial scan
+    await this.refresh()
+
+    const projectsDir = path.join(this.claudeHome, 'projects')
+    const sessionsGlob = path.join(projectsDir, '**', 'sessions', '*.jsonl')
+    logger.info({ sessionsGlob }, 'Starting Claude sessions watcher')
+
+    this.watcher = chokidar.watch(sessionsGlob, {
+      ignoreInitial: true,
+      awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 100 },
+    })
+
+    const schedule = () => this.scheduleRefresh()
+
+    this.watcher.on('add', schedule)
+    this.watcher.on('change', schedule)
+    this.watcher.on('unlink', schedule)
+    this.watcher.on('error', (err) => logger.warn({ err }, 'Claude watcher error'))
+  }
+
+  stop() {
+    this.watcher?.close().catch(() => {})
+    this.watcher = null
+    if (this.refreshTimer) clearTimeout(this.refreshTimer)
+    this.refreshTimer = null
+  }
+
+  onUpdate(handler: (projects: ProjectGroup[]) => void): () => void {
+    this.onUpdateHandlers.add(handler)
+    return () => this.onUpdateHandlers.delete(handler)
+  }
+
+  getProjects(): ProjectGroup[] {
+    return this.projects
+  }
+
+  private scheduleRefresh() {
+    if (this.refreshTimer) clearTimeout(this.refreshTimer)
+    this.refreshTimer = setTimeout(() => {
+      this.refresh().catch((err) => logger.warn({ err }, 'Refresh failed'))
+    }, 250)
+  }
+
+  async refresh() {
+    const projectsDir = path.join(this.claudeHome, 'projects')
+    const colors = await configStore.getProjectColors()
+    const cfg = await configStore.snapshot()
+
+    const groups: ProjectGroup[] = []
+    let projectDirs: string[] = []
+    try {
+      projectDirs = (await fsp.readdir(projectsDir)).map((name) => path.join(projectsDir, name))
+    } catch (err: any) {
+      logger.warn({ err, projectsDir }, 'Could not read Claude projects directory')
+      this.projects = []
+      this.emitUpdate()
+      return
+    }
+
+    for (const projectDir of projectDirs) {
+      const sessionsDir = path.join(projectDir, 'sessions')
+      let files: string[] = []
+      try {
+        files = (await fsp.readdir(sessionsDir)).filter((f) => f.endsWith('.jsonl'))
+      } catch {
+        continue
+      }
+
+      const projectPath = await resolveProjectPath(projectDir)
+
+      const sessions: ClaudeSession[] = []
+      for (const file of files) {
+        const full = path.join(sessionsDir, file)
+        let stat: any
+        try {
+          stat = await fsp.stat(full)
+        } catch {
+          continue
+        }
+        const sessionId = path.basename(file, '.jsonl')
+        const meta = await parseSessionJsonlMeta(full)
+
+        const baseSession: ClaudeSession = {
+          sessionId,
+          projectPath,
+          updatedAt: stat.mtimeMs || stat.mtime.getTime(),
+          messageCount: meta.messageCount,
+          title: meta.title,
+          summary: meta.summary,
+          cwd: meta.cwd,
+        }
+
+        const ov = cfg.sessionOverrides?.[sessionId]
+        const merged = applyOverride(baseSession, ov)
+        if (merged) sessions.push(merged)
+      }
+
+      if (sessions.length === 0) continue
+
+      groups.push({
+        projectPath,
+        color: colors[projectPath],
+        sessions: sessions.sort((a, b) => b.updatedAt - a.updatedAt),
+      })
+    }
+
+    // Sort projects by most recent session activity.
+    groups.sort((a, b) => (b.sessions[0]?.updatedAt || 0) - (a.sessions[0]?.updatedAt || 0))
+
+    this.projects = groups
+    this.emitUpdate()
+  }
+
+  private emitUpdate() {
+    for (const h of this.onUpdateHandlers) {
+      try {
+        h(this.projects)
+      } catch (err) {
+        logger.warn({ err }, 'onUpdate handler failed')
+      }
+    }
+  }
+}
+
+export const claudeIndexer = new ClaudeSessionIndexer()
