@@ -10,7 +10,7 @@ import panesReducer, {
   hydratePanes,
   PanesState,
 } from '../../../../src/store/panesSlice'
-import type { PaneNode, PaneContent } from '../../../../src/store/paneTypes'
+import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent } from '../../../../src/store/paneTypes'
 
 // Mock nanoid to return predictable IDs for testing
 let mockIdCounter = 0
@@ -32,16 +32,20 @@ describe('panesSlice', () => {
 
   describe('initLayout', () => {
     it('creates a single-pane layout for a tab', () => {
-      const content: PaneContent = { kind: 'terminal', mode: 'shell' }
       const state = panesReducer(
         initialState,
-        initLayout({ tabId: 'tab-1', content })
+        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
       )
 
       expect(state.layouts['tab-1']).toBeDefined()
       expect(state.layouts['tab-1'].type).toBe('leaf')
       const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
-      expect(leaf.content).toEqual(content)
+      expect(leaf.content.kind).toBe('terminal')
+      if (leaf.content.kind === 'terminal') {
+        expect(leaf.content.mode).toBe('shell')
+        expect(leaf.content.createRequestId).toBeDefined()
+        expect(leaf.content.status).toBe('creating')
+      }
       expect(leaf.id).toBeDefined()
     })
 
@@ -77,7 +81,7 @@ describe('panesSlice', () => {
     })
 
     it('creates layouts for different tabs independently', () => {
-      const content1: PaneContent = { kind: 'terminal', mode: 'shell' }
+      const content1 = { kind: 'terminal' as const, mode: 'shell' as const }
       const content2: PaneContent = { kind: 'browser', url: 'https://example.com', devToolsOpen: false }
 
       let state = panesReducer(
@@ -93,19 +97,55 @@ describe('panesSlice', () => {
       expect(state.layouts['tab-2']).toBeDefined()
       const leaf1 = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
       const leaf2 = state.layouts['tab-2'] as Extract<PaneNode, { type: 'leaf' }>
-      expect(leaf1.content).toEqual(content1)
+      expect(leaf1.content.kind).toBe('terminal')
       expect(leaf2.content).toEqual(content2)
+    })
+
+    it('generates createRequestId and status for terminal content', () => {
+      // Initialize with minimal terminal input
+      const state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-1',
+          content: { kind: 'terminal', mode: 'shell' },
+        })
+      )
+
+      const layout = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+
+      expect(layout.content.kind).toBe('terminal')
+      if (layout.content.kind === 'terminal') {
+        expect(layout.content.createRequestId).toBeDefined()
+        expect(layout.content.createRequestId.length).toBeGreaterThan(0)
+        expect(layout.content.status).toBe('creating')
+        expect(layout.content.shell).toBe('system')
+      }
+    })
+
+    it('preserves provided createRequestId and status', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-1',
+          content: { kind: 'terminal', createRequestId: 'custom-req', status: 'running', mode: 'claude' },
+        })
+      )
+
+      const layout = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+
+      if (layout.content.kind === 'terminal') {
+        expect(layout.content.createRequestId).toBe('custom-req')
+        expect(layout.content.status).toBe('running')
+        expect(layout.content.mode).toBe('claude')
+      }
     })
   })
 
   describe('splitPane', () => {
     it('converts a leaf pane into a horizontal split with two children', () => {
-      const content1: PaneContent = { kind: 'terminal', mode: 'shell' }
-      const content2: PaneContent = { kind: 'terminal', mode: 'claude' }
-
       let state = panesReducer(
         initialState,
-        initLayout({ tabId: 'tab-1', content: content1 })
+        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
       )
       const originalPaneId = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).id
 
@@ -115,7 +155,7 @@ describe('panesSlice', () => {
           tabId: 'tab-1',
           paneId: originalPaneId,
           direction: 'horizontal',
-          newContent: content2,
+          newContent: { kind: 'terminal', mode: 'claude' },
         })
       )
 
@@ -129,8 +169,16 @@ describe('panesSlice', () => {
       const [first, second] = split.children
       expect(first.type).toBe('leaf')
       expect(second.type).toBe('leaf')
-      expect((first as Extract<PaneNode, { type: 'leaf' }>).content).toEqual(content1)
-      expect((second as Extract<PaneNode, { type: 'leaf' }>).content).toEqual(content2)
+      const firstContent = (first as Extract<PaneNode, { type: 'leaf' }>).content
+      const secondContent = (second as Extract<PaneNode, { type: 'leaf' }>).content
+      expect(firstContent.kind).toBe('terminal')
+      expect(secondContent.kind).toBe('terminal')
+      if (firstContent.kind === 'terminal') {
+        expect(firstContent.mode).toBe('shell')
+      }
+      if (secondContent.kind === 'terminal') {
+        expect(secondContent.mode).toBe('claude')
+      }
     })
 
     it('converts a leaf pane into a vertical split', () => {
@@ -298,6 +346,77 @@ describe('panesSlice', () => {
       // Layout should be unchanged
       expect(state.layouts['tab-1']).toEqual(originalLayout)
     })
+
+    it('generates createRequestId for new terminal panes', () => {
+      // Initialize with terminal content (full form)
+      let state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-1',
+          content: { kind: 'terminal', createRequestId: 'orig-req', status: 'running', mode: 'shell' }
+        })
+      )
+
+      const layoutBefore = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+
+      // Split with partial terminal content (no createRequestId/status)
+      state = panesReducer(
+        state,
+        splitPane({
+          tabId: 'tab-1',
+          paneId: layoutBefore.id,
+          direction: 'horizontal',
+          newContent: { kind: 'terminal', mode: 'shell' },
+        })
+      )
+
+      const layout = state.layouts['tab-1']
+      expect(layout.type).toBe('split')
+
+      const split = layout as Extract<PaneNode, { type: 'split' }>
+      const newPane = split.children[1] as Extract<PaneNode, { type: 'leaf' }>
+
+      expect(newPane.content.kind).toBe('terminal')
+      if (newPane.content.kind === 'terminal') {
+        expect(newPane.content.createRequestId).toBeDefined()
+        expect(newPane.content.createRequestId).not.toBe('orig-req')
+        expect(newPane.content.status).toBe('creating')
+        expect(newPane.content.shell).toBe('system') // Default applied
+      }
+    })
+
+    it('preserves browser content unchanged in splitPane', () => {
+      let state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-1',
+          content: { kind: 'terminal', createRequestId: 'req-1', status: 'running', mode: 'shell' }
+        })
+      )
+
+      const layoutBefore = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+
+      // Split with browser content
+      state = panesReducer(
+        state,
+        splitPane({
+          tabId: 'tab-1',
+          paneId: layoutBefore.id,
+          direction: 'horizontal',
+          newContent: { kind: 'browser', url: 'https://example.com', devToolsOpen: true },
+        })
+      )
+
+      const layout = state.layouts['tab-1']
+      const split = layout as Extract<PaneNode, { type: 'split' }>
+      const newPane = split.children[1] as Extract<PaneNode, { type: 'leaf' }>
+
+      expect(newPane.content.kind).toBe('browser')
+      if (newPane.content.kind === 'browser') {
+        expect(newPane.content.url).toBe('https://example.com')
+        expect(newPane.content.devToolsOpen).toBe(true)
+      }
+    })
   })
 
   describe('closePane', () => {
@@ -316,12 +435,9 @@ describe('panesSlice', () => {
     })
 
     it('collapses a split to the remaining pane when one child is closed', () => {
-      const content1: PaneContent = { kind: 'terminal', mode: 'shell' }
-      const content2: PaneContent = { kind: 'terminal', mode: 'claude' }
-
       let state = panesReducer(
         initialState,
-        initLayout({ tabId: 'tab-1', content: content1 })
+        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
       )
       const pane1Id = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).id
 
@@ -331,7 +447,7 @@ describe('panesSlice', () => {
           tabId: 'tab-1',
           paneId: pane1Id,
           direction: 'horizontal',
-          newContent: content2,
+          newContent: { kind: 'terminal', mode: 'claude' },
         })
       )
 
@@ -345,16 +461,17 @@ describe('panesSlice', () => {
       const remaining = state.layouts['tab-1']
       expect(remaining.type).toBe('leaf')
       expect((remaining as Extract<PaneNode, { type: 'leaf' }>).id).toBe(pane1Id)
-      expect((remaining as Extract<PaneNode, { type: 'leaf' }>).content).toEqual(content1)
+      const remainingContent = (remaining as Extract<PaneNode, { type: 'leaf' }>).content
+      expect(remainingContent.kind).toBe('terminal')
+      if (remainingContent.kind === 'terminal') {
+        expect(remainingContent.mode).toBe('shell')
+      }
     })
 
     it('collapses to the other pane when the first child is closed', () => {
-      const content1: PaneContent = { kind: 'terminal', mode: 'shell' }
-      const content2: PaneContent = { kind: 'terminal', mode: 'claude' }
-
       let state = panesReducer(
         initialState,
-        initLayout({ tabId: 'tab-1', content: content1 })
+        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
       )
       const pane1Id = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).id
 
@@ -364,7 +481,7 @@ describe('panesSlice', () => {
           tabId: 'tab-1',
           paneId: pane1Id,
           direction: 'horizontal',
-          newContent: content2,
+          newContent: { kind: 'terminal', mode: 'claude' },
         })
       )
 
@@ -374,7 +491,11 @@ describe('panesSlice', () => {
       // Should collapse to the second pane
       const remaining = state.layouts['tab-1']
       expect(remaining.type).toBe('leaf')
-      expect((remaining as Extract<PaneNode, { type: 'leaf' }>).content).toEqual(content2)
+      const remainingContent = (remaining as Extract<PaneNode, { type: 'leaf' }>).content
+      expect(remainingContent.kind).toBe('terminal')
+      if (remainingContent.kind === 'terminal') {
+        expect(remainingContent.mode).toBe('claude')
+      }
     })
 
     it('updates active pane when the active pane is closed', () => {
@@ -881,6 +1002,56 @@ describe('panesSlice', () => {
       expect(root.children[1].type).toBe('split')
       const nested = root.children[1] as Extract<PaneNode, { type: 'split' }>
       expect(nested.sizes).toEqual([30, 70])
+    })
+  })
+
+  describe('PaneContent types', () => {
+    it('TerminalPaneContent has required lifecycle fields', () => {
+      const content: TerminalPaneContent = {
+        kind: 'terminal',
+        createRequestId: 'req-123',
+        status: 'creating',
+        mode: 'shell',
+      }
+      expect(content.kind).toBe('terminal')
+      expect(content.createRequestId).toBe('req-123')
+      expect(content.status).toBe('creating')
+    })
+
+    it('TerminalPaneContent shell is optional with default behavior', () => {
+      const content: TerminalPaneContent = {
+        kind: 'terminal',
+        createRequestId: 'req-123',
+        status: 'creating',
+        mode: 'shell',
+        // shell is optional - defaults handled by reducer
+      }
+      expect(content.shell).toBeUndefined()
+    })
+
+    it('BrowserPaneContent unchanged', () => {
+      const content: BrowserPaneContent = {
+        kind: 'browser',
+        url: 'https://example.com',
+        devToolsOpen: false,
+      }
+      expect(content.kind).toBe('browser')
+    })
+
+    it('PaneContent is union of both types', () => {
+      const terminal: PaneContent = {
+        kind: 'terminal',
+        createRequestId: 'req-1',
+        status: 'running',
+        mode: 'shell',
+      }
+      const browser: PaneContent = {
+        kind: 'browser',
+        url: '',
+        devToolsOpen: false,
+      }
+      expect(terminal.kind).toBe('terminal')
+      expect(browser.kind).toBe('browser')
     })
   })
 })

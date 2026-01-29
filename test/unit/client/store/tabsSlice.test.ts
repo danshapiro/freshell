@@ -1,12 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer, {
   addTab,
   setActiveTab,
   updateTab,
   removeTab,
   hydrateTabs,
+  closeTab,
   TabsState,
 } from '../../../../src/store/tabsSlice'
+import panesReducer, { initLayout } from '../../../../src/store/panesSlice'
 import type { Tab } from '../../../../src/store/types'
 
 // Mock nanoid to return predictable IDs for testing
@@ -412,6 +415,35 @@ describe('tabsSlice', () => {
       expect(tab.initialCwd).toBe('/custom/path')
       expect(tab.resumeSessionId).toBe('session-abc')
       expect(tab.createdAt).toBe(5000000)
+    })
+  })
+
+  describe('closeTab with multiple panes', () => {
+    it('removes layout when tab is closed', async () => {
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+        },
+      })
+
+      // Create tab
+      store.dispatch(addTab({ mode: 'shell' }))
+      const tabId = store.getState().tabs.tabs[0].id
+
+      // Initialize pane
+      store.dispatch(initLayout({
+        tabId,
+        content: { kind: 'terminal', mode: 'shell' },
+      }))
+
+      expect(store.getState().panes.layouts[tabId]).toBeDefined()
+
+      // Close tab
+      await store.dispatch(closeTab(tabId))
+
+      // Layout should be removed
+      expect(store.getState().panes.layouts[tabId]).toBeUndefined()
     })
   })
 })

@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updateTab } from '@/store/tabsSlice'
+import { updatePaneContent } from '@/store/panesSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import { nanoid } from 'nanoid'
@@ -8,13 +9,13 @@ import { cn } from '@/lib/utils'
 import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
 import { Loader2 } from 'lucide-react'
-import type { PaneContent } from '@/store/paneTypes'
+import type { PaneContent, TerminalPaneContent } from '@/store/paneTypes'
 import 'xterm/css/xterm.css'
 
 interface TerminalViewProps {
   tabId: string
-  paneId?: string
-  paneContent?: PaneContent | null
+  paneId: string
+  paneContent: PaneContent
   hidden?: boolean
 }
 
@@ -23,41 +24,59 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const settings = useAppSelector((s) => s.settings.settings)
 
-  // Use pane content when available, otherwise fall back to tab properties
-  const terminalMode = paneContent?.kind === 'terminal' ? paneContent.mode : tab?.mode
-  const terminalResumeSessionId = paneContent?.kind === 'terminal' ? paneContent.resumeSessionId : tab?.resumeSessionId
-  const terminalInitialCwd = paneContent?.kind === 'terminal' ? paneContent.initialCwd : tab?.initialCwd
-
+  // All hooks MUST be called before any conditional returns
   const ws = useMemo(() => getWsClient(), [])
   const [isAttaching, setIsAttaching] = useState(false)
 
   const containerRef = useRef<HTMLDivElement | null>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
-
-  const requestIdRef = useRef<string | null>(null)
-  const terminalIdRef = useRef<string | undefined>(tab?.terminalId)
   const mountedRef = useRef(false)
   const hiddenRef = useRef(hidden)
 
-  // Keep refs in sync
+  // Extract terminal-specific fields (safe because we check kind later)
+  const isTerminal = paneContent.kind === 'terminal'
+  const terminalContent = isTerminal ? paneContent : null
+
+  // Refs for terminal lifecycle (only meaningful if isTerminal)
+  // CRITICAL: Use refs to avoid callback/effect dependency on changing content
+  const requestIdRef = useRef<string>(terminalContent?.createRequestId || '')
+  const terminalIdRef = useRef<string | undefined>(terminalContent?.terminalId)
+  const contentRef = useRef<TerminalPaneContent | null>(terminalContent)
+
+  // Keep refs in sync with props
   useEffect(() => {
-    terminalIdRef.current = tab?.terminalId
-  }, [tab?.terminalId])
+    if (terminalContent) {
+      terminalIdRef.current = terminalContent.terminalId
+      requestIdRef.current = terminalContent.createRequestId
+      contentRef.current = terminalContent
+    }
+  }, [terminalContent])
 
   useEffect(() => {
     hiddenRef.current = hidden
   }, [hidden])
 
+  // Helper to update pane content - uses ref to avoid recreation on content changes
+  // This is CRITICAL: if updateContent depended on terminalContent directly,
+  // it would be recreated on every status update, causing the effect to re-run
+  const updateContent = useCallback((updates: Partial<TerminalPaneContent>) => {
+    const current = contentRef.current
+    if (!current) return
+    dispatch(updatePaneContent({
+      tabId,
+      paneId,
+      content: { ...current, ...updates },
+    }))
+  }, [dispatch, tabId, paneId]) // NO terminalContent dependency - uses ref
+
   // Init xterm once
   useEffect(() => {
+    if (!isTerminal) return
     if (!containerRef.current) return
-
-    // Prevent re-init on StrictMode double-mount
     if (mountedRef.current && termRef.current) return
     mountedRef.current = true
 
-    // Clean up any existing terminal first
     if (termRef.current) {
       termRef.current.dispose()
       termRef.current = null
@@ -81,62 +100,49 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
     term.open(containerRef.current)
 
-    // Delay fit to allow renderer to initialize
     requestAnimationFrame(() => {
       if (termRef.current === term) {
-        try {
-          fit.fit()
-        } catch {
-          // Ignore if disposed
-        }
+        try { fit.fit() } catch { /* disposed */ }
       }
     })
 
     term.onData((data) => {
-      const terminalId = terminalIdRef.current
-      if (!terminalId) return
-      ws.send({ type: 'terminal.input', terminalId, data })
+      const tid = terminalIdRef.current
+      if (!tid) return
+      ws.send({ type: 'terminal.input', terminalId: tid, data })
     })
 
-    // Handle copy/paste keyboard shortcuts
     term.attachCustomKeyEventHandler((event) => {
       // Ctrl+Shift+C to copy (ignore key repeat)
       if (event.ctrlKey && event.shiftKey && event.key === 'C' && event.type === 'keydown' && !event.repeat) {
         const selection = term.getSelection()
         if (selection) {
-          void navigator.clipboard.writeText(selection).catch(() => {
-            // Ignore clipboard errors (e.g., permission denied)
-          })
+          void navigator.clipboard.writeText(selection).catch(() => {})
         }
-        return false // Prevent default
+        return false
       }
       // Ctrl+Shift+V to paste (ignore key repeat)
       if (event.ctrlKey && event.shiftKey && event.key === 'V' && event.type === 'keydown' && !event.repeat) {
         void navigator.clipboard.readText().then((text) => {
-          const terminalId = terminalIdRef.current
-          if (terminalId && text) {
-            ws.send({ type: 'terminal.input', terminalId, data: text })
+          const tid = terminalIdRef.current
+          if (tid && text) {
+            ws.send({ type: 'terminal.input', terminalId: tid, data: text })
           }
-        }).catch(() => {
-          // Ignore clipboard errors (e.g., permission denied)
-        })
-        return false // Prevent default
+        }).catch(() => {})
+        return false
       }
-      return true // Allow other keys
+      return true
     })
 
     const ro = new ResizeObserver(() => {
-      // Only fit if visible and not disposed
       if (hiddenRef.current || termRef.current !== term) return
       try {
         fit.fit()
-        const terminalId = terminalIdRef.current
-        if (terminalId) {
-          ws.send({ type: 'terminal.resize', terminalId, cols: term.cols, rows: term.rows })
+        const tid = terminalIdRef.current
+        if (tid) {
+          ws.send({ type: 'terminal.resize', terminalId: tid, cols: term.cols, rows: term.rows })
         }
-      } catch {
-        // Ignore if disposed
-      }
+      } catch { /* disposed */ }
     })
     ro.observe(containerRef.current)
 
@@ -149,184 +155,160 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [isTerminal])
 
   // Apply settings changes
   useEffect(() => {
+    if (!isTerminal) return
     const term = termRef.current
     if (!term) return
-    // Set options individually to avoid read-only option errors
     term.options.cursorBlink = settings.terminal.cursorBlink
     term.options.fontSize = settings.terminal.fontSize
     term.options.fontFamily = settings.terminal.fontFamily
     term.options.lineHeight = settings.terminal.lineHeight
     term.options.scrollback = settings.terminal.scrollback
     term.options.theme = getTerminalTheme(settings.terminal.theme, settings.theme)
-    // Fit after font changes
     if (!hidden) fitRef.current?.fit()
-  }, [settings, hidden])
+  }, [isTerminal, settings, hidden])
 
   // When becoming visible, fit and send size
   useEffect(() => {
+    if (!isTerminal) return
     if (!hidden) {
-      // Use requestAnimationFrame to wait for browser layout reflow after display:none is removed
       const frameId = requestAnimationFrame(() => {
         fitRef.current?.fit()
         const term = termRef.current
-        const terminalId = terminalIdRef.current
-        if (term && terminalId) {
-          ws.send({ type: 'terminal.resize', terminalId, cols: term.cols, rows: term.rows })
+        const tid = terminalIdRef.current
+        if (term && tid) {
+          ws.send({ type: 'terminal.resize', terminalId: tid, cols: term.cols, rows: term.rows })
         }
       })
       return () => cancelAnimationFrame(frameId)
     }
-  }, [hidden, ws])
+  }, [isTerminal, hidden, ws])
 
-  // Create or attach to backend terminal.
+  // Create or attach to backend terminal
   useEffect(() => {
-    if (!tab) return
-
+    if (!isTerminal || !terminalContent) return
     const term = termRef.current
     if (!term) return
+
+    // NOTE: We intentionally don't destructure terminalId here.
+    // We read it from terminalIdRef.current to avoid stale closures.
+    const { createRequestId, mode, shell, initialCwd, resumeSessionId } = terminalContent
 
     let unsub = () => {}
     let unsubReconnect = () => {}
 
-    function attach(terminalId: string) {
+    function attach(tid: string) {
       setIsAttaching(true)
-      ws.send({ type: 'terminal.attach', terminalId })
-      // Send current size after attach
-      ws.send({ type: 'terminal.resize', terminalId, cols: term.cols, rows: term.rows })
+      ws.send({ type: 'terminal.attach', terminalId: tid })
+      ws.send({ type: 'terminal.resize', terminalId: tid, cols: term.cols, rows: term.rows })
     }
 
     async function ensure() {
       try {
         await ws.connect()
-      } catch {
-        // handled elsewhere
-      }
+      } catch { /* handled elsewhere */ }
 
-      // Subscribe to messages for this terminal
       unsub = ws.onMessage((msg) => {
-        const terminalId = terminalIdRef.current
+        const tid = terminalIdRef.current
+        const reqId = requestIdRef.current
 
-        if (msg.type === 'terminal.output' && msg.terminalId && msg.terminalId === terminalId) {
+        if (msg.type === 'terminal.output' && msg.terminalId === tid) {
           term.write(msg.data || '')
         }
 
-        if (msg.type === 'terminal.snapshot' && msg.terminalId && msg.terminalId === terminalId) {
-          // Clear and render snapshot
-          try {
-            term.clear()
-          } catch {
-            // Ignore if disposed
-          }
-          const snapshot = msg.snapshot || ''
-          if (snapshot) {
-            try {
-              term.write(snapshot)
-            } catch {
-              // Ignore if disposed
-            }
+        if (msg.type === 'terminal.snapshot' && msg.terminalId === tid) {
+          try { term.clear() } catch {}
+          if (msg.snapshot) {
+            try { term.write(msg.snapshot) } catch {}
           }
         }
 
-        // Terminal created in response to our request
-        if (msg.type === 'terminal.created' && msg.requestId && msg.requestId === requestIdRef.current) {
+        if (msg.type === 'terminal.created' && msg.requestId === reqId) {
           const newId = msg.terminalId as string
           terminalIdRef.current = newId
-          dispatch(updateTab({ id: tab.id, updates: { terminalId: newId, status: 'running' } }))
-          if (msg.snapshot) {
-            try {
-              term.clear()
-              term.write(msg.snapshot)
-            } catch {
-              // Ignore if disposed
-            }
+          updateContent({ terminalId: newId, status: 'running' })
+          // Also update tab for title purposes
+          if (tab) {
+            dispatch(updateTab({ id: tab.id, updates: { terminalId: newId, status: 'running' } }))
           }
-          // Some servers may require explicit attach after create; safe to do anyway.
+          if (msg.snapshot) {
+            try { term.clear(); term.write(msg.snapshot) } catch {}
+          }
           attach(newId)
         }
 
-        if (msg.type === 'terminal.attached' && msg.terminalId && msg.terminalId === terminalId) {
+        if (msg.type === 'terminal.attached' && msg.terminalId === tid) {
           setIsAttaching(false)
           if (msg.snapshot) {
-            try {
-              term.clear()
-              term.write(msg.snapshot)
-            } catch {
-              // Ignore if disposed
-            }
+            try { term.clear(); term.write(msg.snapshot) } catch {}
           }
-          dispatch(updateTab({ id: tab.id, updates: { status: 'running' } }))
+          updateContent({ status: 'running' })
         }
 
-        if (msg.type === 'terminal.exit' && msg.terminalId && msg.terminalId === terminalId) {
-          const code = typeof msg.exitCode === 'number' ? msg.exitCode : undefined
-          dispatch(
-            updateTab({
-              id: tab.id,
-              updates: { status: 'exited', title: tab.title + (code !== undefined ? ` (exit ${code})` : '') },
-            }),
-          )
+        if (msg.type === 'terminal.exit' && msg.terminalId === tid) {
+          updateContent({ status: 'exited' })
+          if (tab) {
+            const code = typeof msg.exitCode === 'number' ? msg.exitCode : undefined
+            dispatch(updateTab({ id: tab.id, updates: { status: 'exited', title: tab.title + (code !== undefined ? ` (exit ${code})` : '') } }))
+          }
         }
 
         // Auto-update title from Claude session (only if user hasn't manually set it)
-        if (msg.type === 'terminal.title.updated' && msg.terminalId && msg.terminalId === terminalId) {
-          if (!tab.titleSetByUser && msg.title) {
+        if (msg.type === 'terminal.title.updated' && msg.terminalId === tid) {
+          if (tab && !tab.titleSetByUser && msg.title) {
             dispatch(updateTab({ id: tab.id, updates: { title: msg.title } }))
           }
         }
 
-        if (msg.type === 'error' && msg.requestId && msg.requestId === requestIdRef.current) {
+        if (msg.type === 'error' && msg.requestId === reqId) {
           setIsAttaching(false)
-          dispatch(updateTab({ id: tab.id, updates: { status: 'error' } }))
+          updateContent({ status: 'error' })
           term.writeln(`\r\n[Error] ${msg.message || msg.code || 'Unknown error'}\r\n`)
         }
 
-        // Handle INVALID_TERMINAL_ID errors (e.g., after server restart)
-        // These come without requestId when attach fails
         if (msg.type === 'error' && msg.code === 'INVALID_TERMINAL_ID' && !msg.requestId) {
-          const terminalId = terminalIdRef.current
-          if (terminalId) {
-            // Terminal no longer exists on server - recreate it
+          if (terminalIdRef.current) {
             term.writeln('\r\n[Reconnecting...]\r\n')
             const newRequestId = nanoid()
             requestIdRef.current = newRequestId
             terminalIdRef.current = undefined
-            dispatch(updateTab({ id: tab.id, updates: { terminalId: undefined, createRequestId: newRequestId, status: 'creating' } }))
+            updateContent({ terminalId: undefined, createRequestId: newRequestId, status: 'creating' })
             ws.send({
               type: 'terminal.create',
               requestId: newRequestId,
-              mode: terminalMode,
-              shell: tab.shell || 'system',
-              cwd: terminalInitialCwd,
-              resumeSessionId: terminalResumeSessionId,
+              mode,
+              shell: shell || 'system',
+              cwd: initialCwd,
+              resumeSessionId,
             })
           }
         }
       })
 
       unsubReconnect = ws.onReconnect(() => {
-        const terminalId = terminalIdRef.current
-        if (terminalId) {
-          attach(terminalId)
-        }
+        const tid = terminalIdRef.current
+        if (tid) attach(tid)
       })
 
-      if (tab.terminalId) {
-        attach(tab.terminalId)
+      // Use paneContent for terminal lifecycle - NOT tab
+      // Read terminalId from REF (not from destructured value) to get current value
+      // This is critical: we want the effect to run once per createRequestId,
+      // not re-run when terminalId changes from undefined to defined
+      const currentTerminalId = terminalIdRef.current
+
+      if (currentTerminalId) {
+        attach(currentTerminalId)
       } else {
-        // Create a new terminal on first mount.
-        const requestId = tab.createRequestId
-        requestIdRef.current = requestId
         ws.send({
           type: 'terminal.create',
-          requestId,
-          mode: terminalMode,
-          shell: tab.shell || 'system',
-          cwd: terminalInitialCwd,
-          resumeSessionId: terminalResumeSessionId,
+          requestId: createRequestId,
+          mode,
+          shell: shell || 'system',
+          cwd: initialCwd,
+          resumeSessionId,
         })
       }
     }
@@ -337,11 +319,27 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       unsub()
       unsubReconnect()
     }
-  }, [tabId, tab?.terminalId]) // intentionally not including tab object to avoid re-run loops
+  // Dependencies explanation:
+  // - isTerminal: skip effect for non-terminal panes
+  // - paneId: unique identifier for this pane instance
+  // - terminalContent?.createRequestId: re-run when createRequestId changes (reconnect after INVALID_TERMINAL_ID)
+  // - updateContent: stable callback (uses refs internally)
+  // - ws: WebSocket client instance
+  //
+  // NOTE: terminalId is intentionally NOT in dependencies!
+  // - On fresh creation: terminalId=undefined, we create, handler sets terminalId
+  //   Effect should NOT re-run (handler already attached)
+  // - On hydration: terminalId from storage, we attach once
+  // - On reconnect: createRequestId changes, effect re-runs, terminalId is undefined, we create
+  // We read terminalId from terminalIdRef.current to get the current value without triggering re-runs
+  }, [isTerminal, paneId, terminalContent?.createRequestId, updateContent, ws, tab, dispatch])
 
-  if (!tab) return null
+  // NOW we can do the conditional return - after all hooks
+  if (!isTerminal || !terminalContent) {
+    return null
+  }
 
-  const showSpinner = tab.status === 'creating' || isAttaching
+  const showSpinner = terminalContent.status === 'creating' || isAttaching
 
   return (
     <div className={cn('h-full w-full relative', hidden ? 'hidden' : '')}>
@@ -351,7 +349,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           <div className="flex flex-col items-center gap-3">
             <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
             <span className="text-sm text-muted-foreground">
-              {tab.status === 'creating' ? 'Starting terminal...' : 'Reconnecting...'}
+              {terminalContent.status === 'creating' ? 'Starting terminal...' : 'Reconnecting...'}
             </span>
           </div>
         </div>

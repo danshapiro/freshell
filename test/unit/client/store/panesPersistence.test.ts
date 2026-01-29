@@ -184,3 +184,106 @@ describe('Panes Persistence Integration', () => {
     expect(loaded!.layouts[tabId].type).toBe('split')
   })
 })
+
+describe('PaneContent migration', () => {
+  beforeEach(() => {
+    localStorageMock.clear()
+  })
+
+  it('migrates old terminal pane content to include lifecycle fields', () => {
+    // Simulate old format without createRequestId/status (version undefined)
+    const oldPanesState = {
+      layouts: {
+        'tab1': {
+          type: 'leaf',
+          id: 'pane1',
+          content: { kind: 'terminal', mode: 'shell' },
+        },
+      },
+      activePane: { 'tab1': 'pane1' },
+      // No version field
+    }
+
+    localStorage.setItem('freshell.panes.v1', JSON.stringify(oldPanesState))
+
+    const loaded = loadPersistedPanes()
+
+    const layout = loaded.layouts['tab1'] as { type: 'leaf'; content: any }
+    expect(layout.content.createRequestId).toBeDefined()
+    expect(layout.content.status).toBe('creating')
+    expect(layout.content.shell).toBe('system')
+    expect(loaded.version).toBe(2) // Migrated version
+  })
+
+  it('migrates nested split panes recursively', () => {
+    const oldPanesState = {
+      layouts: {
+        'tab1': {
+          type: 'split',
+          id: 'split1',
+          direction: 'horizontal',
+          sizes: [50, 50],
+          children: [
+            { type: 'leaf', id: 'pane1', content: { kind: 'terminal', mode: 'shell' } },
+            { type: 'leaf', id: 'pane2', content: { kind: 'terminal', mode: 'claude' } },
+          ],
+        },
+      },
+      activePane: { 'tab1': 'pane1' },
+    }
+
+    localStorage.setItem('freshell.panes.v1', JSON.stringify(oldPanesState))
+
+    const loaded = loadPersistedPanes()
+
+    const layout = loaded.layouts['tab1'] as any
+    expect(layout.children[0].content.createRequestId).toBeDefined()
+    expect(layout.children[1].content.createRequestId).toBeDefined()
+    expect(layout.children[0].content.createRequestId).not.toBe(layout.children[1].content.createRequestId)
+  })
+
+  it('does not re-migrate already migrated content', () => {
+    const migratedState = {
+      version: 2,
+      layouts: {
+        'tab1': {
+          type: 'leaf',
+          id: 'pane1',
+          content: { kind: 'terminal', createRequestId: 'existing-req', status: 'running', mode: 'shell', shell: 'powershell' },
+        },
+      },
+      activePane: { 'tab1': 'pane1' },
+    }
+
+    localStorage.setItem('freshell.panes.v1', JSON.stringify(migratedState))
+
+    const loaded = loadPersistedPanes()
+
+    const layout = loaded.layouts['tab1'] as { type: 'leaf'; content: any }
+    expect(layout.content.createRequestId).toBe('existing-req') // Preserved
+    expect(layout.content.status).toBe('running') // Preserved
+    expect(layout.content.shell).toBe('powershell') // Preserved
+  })
+
+  it('preserves browser pane content unchanged', () => {
+    const oldPanesState = {
+      layouts: {
+        'tab1': {
+          type: 'leaf',
+          id: 'pane1',
+          content: { kind: 'browser', url: 'https://example.com', devToolsOpen: true },
+        },
+      },
+      activePane: { 'tab1': 'pane1' },
+    }
+
+    localStorage.setItem('freshell.panes.v1', JSON.stringify(oldPanesState))
+
+    const loaded = loadPersistedPanes()
+
+    const layout = loaded.layouts['tab1'] as { type: 'leaf'; content: any }
+    expect(layout.content.kind).toBe('browser')
+    expect(layout.content.url).toBe('https://example.com')
+    expect(layout.content.devToolsOpen).toBe(true)
+  })
+})

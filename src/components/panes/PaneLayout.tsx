@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { initLayout, splitPane } from '@/store/panesSlice'
-import type { PaneContent } from '@/store/paneTypes'
+import type { PaneContentInput } from '@/store/paneTypes'
 import PaneContainer from './PaneContainer'
 import FloatingActionButton from './FloatingActionButton'
 
 interface PaneLayoutProps {
   tabId: string
-  defaultContent: PaneContent
+  defaultContent: PaneContentInput
 }
 
 export default function PaneLayout({ tabId, defaultContent }: PaneLayoutProps) {

@@ -21,6 +21,7 @@
 ## Features
 
 - **Multi-tab terminal sessions** — Run shell, Claude Code, and Codex in parallel tabs
+- **Split panes** — Divide any tab into independent terminal panes (horizontal/vertical)
 - **Detach/reattach** — Background terminals persist across browser sessions
 - **Search & browse** — Filter Claude sessions by project, date, or content
 - **Speak with the dead** — Invoke the spirits of ancient Claudes and ask them what they were thinking
