@@ -116,7 +116,7 @@ export class ClaudeSession extends EventEmitter {
 
   private handleStdout(data: string) {
     this.buffer += data
-    const lines = this.buffer.split('\n')
+    const lines = this.buffer.split(/\r?\n/)
 
     // Keep incomplete last line in buffer
     this.buffer = lines.pop() || ''

@@ -942,4 +942,382 @@ describe('buildSpawnSpec Unix paths', () => {
       expect(spec.cwd).toBe('/home/user/project..old')
     })
   })
+
+  /**
+   * Additional comprehensive tests for Mac/Linux spawn behavior
+   * These tests ensure thorough coverage of the Unix spawn path in buildSpawnSpec()
+   */
+  describe('comprehensive Mac/Linux spawn behavior', () => {
+    // Store original values to restore after tests
+    const originalPlatform = process.platform
+    const originalEnv = { ...process.env }
+
+    function mockPlatform(platform: string) {
+      Object.defineProperty(process, 'platform', {
+        value: platform,
+        writable: true,
+        configurable: true,
+      })
+    }
+
+    beforeEach(() => {
+      vi.resetAllMocks()
+      process.env = { ...originalEnv }
+      vi.mocked(fs.existsSync).mockReturnValue(true)
+    })
+
+    afterEach(() => {
+      Object.defineProperty(process, 'platform', {
+        value: originalPlatform,
+        writable: true,
+        configurable: true,
+      })
+      process.env = originalEnv
+    })
+
+    describe('basic shell spawn on macOS (darwin)', () => {
+      beforeEach(() => {
+        mockPlatform('darwin')
+      })
+
+      it('uses system shell from getSystemShell() on macOS', () => {
+        process.env.SHELL = '/usr/local/bin/zsh'
+
+        const spec = buildSpawnSpec('shell', '/Users/test', 'system')
+
+        expect(spec.file).toBe('/usr/local/bin/zsh')
+      })
+
+      it('passes -l flag for login shell on macOS', () => {
+        process.env.SHELL = '/bin/zsh'
+
+        const spec = buildSpawnSpec('shell', '/Users/test', 'system')
+
+        expect(spec.args).toEqual(['-l'])
+      })
+
+      it('sets TERM=xterm-256color when not already set on macOS', () => {
+        delete process.env.TERM
+        process.env.SHELL = '/bin/zsh'
+
+        const spec = buildSpawnSpec('shell', '/Users/test', 'system')
+
+        expect(spec.env.TERM).toBe('xterm-256color')
+      })
+
+      it('preserves existing TERM value on macOS', () => {
+        process.env.TERM = 'xterm-color'
+        process.env.SHELL = '/bin/zsh'
+
+        const spec = buildSpawnSpec('shell', '/Users/test', 'system')
+
+        expect(spec.env.TERM).toBe('xterm-color')
+      })
+    })
+
+    describe('basic shell spawn on Linux', () => {
+      beforeEach(() => {
+        mockPlatform('linux')
+      })
+
+      it('uses system shell from getSystemShell() on Linux', () => {
+        process.env.SHELL = '/usr/bin/bash'
+
+        const spec = buildSpawnSpec('shell', '/home/user', 'system')
+
+        expect(spec.file).toBe('/usr/bin/bash')
+      })
+
+      it('passes -l flag for login shell on Linux', () => {
+        process.env.SHELL = '/bin/bash'
+
+        const spec = buildSpawnSpec('shell', '/home/user', 'system')
+
+        expect(spec.args).toEqual(['-l'])
+      })
+
+      it('sets TERM=xterm-256color when not already set on Linux', () => {
+        delete process.env.TERM
+        process.env.SHELL = '/bin/bash'
+
+        const spec = buildSpawnSpec('shell', '/home/user', 'system')
+
+        expect(spec.env.TERM).toBe('xterm-256color')
+      })
+
+      it('preserves existing TERM value on Linux', () => {
+        process.env.TERM = 'linux'
+        process.env.SHELL = '/bin/bash'
+
+        const spec = buildSpawnSpec('shell', '/home/user', 'system')
+
+        expect(spec.env.TERM).toBe('linux')
+      })
+    })
+
+    describe('spawn with custom cwd', () => {
+      it('cwd is passed correctly on macOS', () => {
+        mockPlatform('darwin')
+        process.env.SHELL = '/bin/zsh'
+
+        const spec = buildSpawnSpec('shell', '/Users/developer/projects/myapp', 'system')
+
+        expect(spec.cwd).toBe('/Users/developer/projects/myapp')
+      })
+
+      it('cwd is passed correctly on Linux', () => {
+        mockPlatform('linux')
+        process.env.SHELL = '/bin/bash'
+
+        const spec = buildSpawnSpec('shell', '/home/user/project', 'system')
+
+        expect(spec.cwd).toBe('/home/user/project')
+      })
+
+      it('works with typical Unix paths like /home/user/project', () => {
+        mockPlatform('linux')
+        process.env.SHELL = '/bin/bash'
+
+        const spec = buildSpawnSpec('shell', '/home/user/project', 'system')
+
+        expect(spec.cwd).toBe('/home/user/project')
+        // Verify it's a valid Unix-style path
+        expect(spec.cwd?.startsWith('/')).toBe(true)
+      })
+
+      it('handles undefined cwd gracefully', () => {
+        mockPlatform('linux')
+        process.env.SHELL = '/bin/bash'
+
+        const spec = buildSpawnSpec('shell', undefined, 'system')
+
+        expect(spec.cwd).toBeUndefined()
+      })
+    })
+
+    describe('claude mode on Mac/Linux', () => {
+      it('spawns claude command on macOS when mode is claude', () => {
+        mockPlatform('darwin')
+        delete process.env.CLAUDE_CMD
+
+        const spec = buildSpawnSpec('claude', '/Users/developer', 'system')
+
+        expect(spec.file).toBe('claude')
+        expect(spec.cwd).toBe('/Users/developer')
+      })
+
+      it('spawns claude command on Linux when mode is claude', () => {
+        mockPlatform('linux')
+        delete process.env.CLAUDE_CMD
+
+        const spec = buildSpawnSpec('claude', '/home/user', 'system')
+
+        expect(spec.file).toBe('claude')
+        expect(spec.cwd).toBe('/home/user')
+      })
+
+      it('command is passed correctly with custom CLAUDE_CMD', () => {
+        mockPlatform('darwin')
+        process.env.CLAUDE_CMD = '/opt/claude/bin/claude'
+
+        const spec = buildSpawnSpec('claude', '/Users/developer', 'system')
+
+        expect(spec.file).toBe('/opt/claude/bin/claude')
+      })
+
+      it('includes --resume flag with session ID when resuming', () => {
+        mockPlatform('darwin')
+        delete process.env.CLAUDE_CMD
+
+        const spec = buildSpawnSpec('claude', '/Users/developer', 'system', 'session-12345')
+
+        expect(spec.args).toContain('--resume')
+        expect(spec.args).toContain('session-12345')
+      })
+
+      it('has empty args when not resuming session', () => {
+        mockPlatform('darwin')
+        delete process.env.CLAUDE_CMD
+
+        const spec = buildSpawnSpec('claude', '/Users/developer', 'system')
+
+        expect(spec.args).toEqual([])
+      })
+    })
+
+    describe('codex mode on Mac/Linux', () => {
+      it('spawns codex command on macOS when mode is codex', () => {
+        mockPlatform('darwin')
+        delete process.env.CODEX_CMD
+
+        const spec = buildSpawnSpec('codex', '/Users/developer', 'system')
+
+        expect(spec.file).toBe('codex')
+        expect(spec.cwd).toBe('/Users/developer')
+      })
+
+      it('spawns codex command on Linux when mode is codex', () => {
+        mockPlatform('linux')
+        delete process.env.CODEX_CMD
+
+        const spec = buildSpawnSpec('codex', '/home/user', 'system')
+
+        expect(spec.file).toBe('codex')
+        expect(spec.cwd).toBe('/home/user')
+      })
+
+      it('command is passed correctly with custom CODEX_CMD', () => {
+        mockPlatform('linux')
+        process.env.CODEX_CMD = '/usr/local/bin/codex-cli'
+
+        const spec = buildSpawnSpec('codex', '/home/user', 'system')
+
+        expect(spec.file).toBe('/usr/local/bin/codex-cli')
+      })
+
+      it('has empty args for codex mode', () => {
+        mockPlatform('linux')
+        delete process.env.CODEX_CMD
+
+        const spec = buildSpawnSpec('codex', '/home/user', 'system')
+
+        expect(spec.args).toEqual([])
+      })
+    })
+
+    describe('environment variables', () => {
+      it('SHELL env var is used for shell selection', () => {
+        mockPlatform('linux')
+        process.env.SHELL = '/usr/bin/fish'
+
+        const spec = buildSpawnSpec('shell', '/home/user', 'system')
+
+        expect(spec.file).toBe('/usr/bin/fish')
+      })
+
+      it('TERM defaults to xterm-256color when not set', () => {
+        mockPlatform('linux')
+        delete process.env.TERM
+        process.env.SHELL = '/bin/bash'
+
+        const spec = buildSpawnSpec('shell', '/home/user', 'system')
+
+        expect(spec.env.TERM).toBe('xterm-256color')
+      })
+
+      it('COLORTERM defaults to truecolor when not set', () => {
+        mockPlatform('linux')
+        delete process.env.COLORTERM
+        process.env.SHELL = '/bin/bash'
+
+        const spec = buildSpawnSpec('shell', '/home/user', 'system')
+
+        expect(spec.env.COLORTERM).toBe('truecolor')
+      })
+
+      it('custom env vars are passed through', () => {
+        mockPlatform('darwin')
+        process.env.SHELL = '/bin/zsh'
+        process.env.CUSTOM_VAR = 'custom_value'
+        process.env.ANOTHER_VAR = 'another_value'
+
+        const spec = buildSpawnSpec('shell', '/Users/test', 'system')
+
+        expect(spec.env.CUSTOM_VAR).toBe('custom_value')
+        expect(spec.env.ANOTHER_VAR).toBe('another_value')
+      })
+
+      it('preserves PATH environment variable', () => {
+        mockPlatform('linux')
+        process.env.SHELL = '/bin/bash'
+        process.env.PATH = '/usr/local/bin:/usr/bin:/bin'
+
+        const spec = buildSpawnSpec('shell', '/home/user', 'system')
+
+        expect(spec.env.PATH).toBe('/usr/local/bin:/usr/bin:/bin')
+      })
+
+      it('preserves HOME environment variable', () => {
+        mockPlatform('darwin')
+        process.env.SHELL = '/bin/zsh'
+        process.env.HOME = '/Users/developer'
+
+        const spec = buildSpawnSpec('shell', '/Users/developer', 'system')
+
+        expect(spec.env.HOME).toBe('/Users/developer')
+      })
+    })
+
+    describe('shell type normalization on Unix platforms', () => {
+      it('normalizes windows shell types to system on darwin', () => {
+        mockPlatform('darwin')
+        process.env.SHELL = '/bin/zsh'
+
+        // cmd, powershell, and wsl should all normalize to system shell on macOS
+        const specCmd = buildSpawnSpec('shell', '/Users/test', 'cmd')
+        const specPowershell = buildSpawnSpec('shell', '/Users/test', 'powershell')
+        const specWsl = buildSpawnSpec('shell', '/Users/test', 'wsl')
+
+        expect(specCmd.file).toBe('/bin/zsh')
+        expect(specPowershell.file).toBe('/bin/zsh')
+        expect(specWsl.file).toBe('/bin/zsh')
+      })
+
+      it('normalizes windows shell types to system on linux', () => {
+        mockPlatform('linux')
+        process.env.SHELL = '/bin/bash'
+
+        // cmd, powershell, and wsl should all normalize to system shell on Linux
+        const specCmd = buildSpawnSpec('shell', '/home/user', 'cmd')
+        const specPowershell = buildSpawnSpec('shell', '/home/user', 'powershell')
+        const specWsl = buildSpawnSpec('shell', '/home/user', 'wsl')
+
+        expect(specCmd.file).toBe('/bin/bash')
+        expect(specPowershell.file).toBe('/bin/bash')
+        expect(specWsl.file).toBe('/bin/bash')
+      })
+    })
+
+    describe('spawn spec completeness for Unix', () => {
+      it('returns complete spec object with all required fields for shell mode', () => {
+        mockPlatform('darwin')
+        process.env.SHELL = '/bin/zsh'
+
+        const spec = buildSpawnSpec('shell', '/Users/test', 'system')
+
+        expect(spec).toMatchObject({
+          file: expect.any(String),
+          args: expect.any(Array),
+          env: expect.any(Object),
+        })
+        expect(spec).toHaveProperty('cwd')
+      })
+
+      it('returns complete spec object for claude mode', () => {
+        mockPlatform('linux')
+
+        const spec = buildSpawnSpec('claude', '/home/user', 'system')
+
+        expect(spec).toMatchObject({
+          file: expect.any(String),
+          args: expect.any(Array),
+          env: expect.any(Object),
+        })
+        expect(spec).toHaveProperty('cwd')
+      })
+
+      it('returns complete spec object for codex mode', () => {
+        mockPlatform('linux')
+
+        const spec = buildSpawnSpec('codex', '/home/user', 'system')
+
+        expect(spec).toMatchObject({
+          file: expect.any(String),
+          args: expect.any(Array),
+          env: expect.any(Object),
+        })
+        expect(spec).toHaveProperty('cwd')
+      })
+    })
+  })
 })
