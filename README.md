@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <strong>Run multiple terminals in tabs | Detach & reattach sessions | Browse Claude Code history</strong> | What if tmux and Claude fell in love?
+  <strong>Run multiple terminals in tabs | Detach & reattach sessions | Browse Claude Code history | What if tmux and Claude fell in love?</strong>
 </p>
 
 ---
