@@ -63,10 +63,10 @@ export type UserConfig = {
 export const defaultSettings: AppSettings = {
   theme: 'system',
   terminal: {
-    fontSize: 13,
+    fontSize: 12,
     fontFamily:
       'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
-    lineHeight: 1.2,
+    lineHeight: 1,
     cursorBlink: true,
     scrollback: 5000,
     theme: 'dark',

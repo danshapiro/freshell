@@ -24,9 +24,9 @@ describe('settingsSlice', () => {
       expect(state.settings.theme).toBe('system')
       expect(state.settings.uiScale).toBe(1.25)
       expect(state.settings.terminal).toEqual({
-        fontSize: 14,
+        fontSize: 12,
         fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
-        lineHeight: 1.2,
+        lineHeight: 1,
         cursorBlink: true,
         scrollback: 5000,
         theme: 'dark',
