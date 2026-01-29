@@ -1,6 +1,7 @@
-import { createSlice, PayloadAction } from '@reduxjs/toolkit'
+import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
 import type { Tab, TerminalStatus, TabMode, ShellType } from './types'
 import { nanoid } from 'nanoid'
+import { removeLayout } from './panesSlice'
 
 export interface TabsState {
   tabs: Tab[]
@@ -89,4 +90,13 @@ export const tabsSlice = createSlice({
 })
 
 export const { addTab, setActiveTab, updateTab, removeTab, hydrateTabs } = tabsSlice.actions
+
+export const closeTab = createAsyncThunk(
+  'tabs/closeTab',
+  async (tabId: string, { dispatch }) => {
+    dispatch(removeTab(tabId))
+    dispatch(removeLayout({ tabId }))
+  }
+)
+
 export default tabsSlice.reducer

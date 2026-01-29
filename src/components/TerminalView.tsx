@@ -8,12 +8,25 @@ import { cn } from '@/lib/utils'
 import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
 import { Loader2 } from 'lucide-react'
+import type { PaneContent } from '@/store/paneTypes'
 import 'xterm/css/xterm.css'
 
-export default function TerminalView({ tabId, hidden }: { tabId: string; hidden?: boolean }) {
+interface TerminalViewProps {
+  tabId: string
+  paneId?: string
+  paneContent?: PaneContent | null
+  hidden?: boolean
+}
+
+export default function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps) {
   const dispatch = useAppDispatch()
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const settings = useAppSelector((s) => s.settings.settings)
+
+  // Use pane content when available, otherwise fall back to tab properties
+  const terminalMode = paneContent?.kind === 'terminal' ? paneContent.mode : tab?.mode
+  const terminalResumeSessionId = paneContent?.kind === 'terminal' ? paneContent.resumeSessionId : tab?.resumeSessionId
+  const terminalInitialCwd = paneContent?.kind === 'terminal' ? paneContent.initialCwd : tab?.initialCwd
 
   const ws = useMemo(() => getWsClient(), [])
   const [isAttaching, setIsAttaching] = useState(false)
@@ -285,10 +298,10 @@ export default function TerminalView({ tabId, hidden }: { tabId: string; hidden?
             ws.send({
               type: 'terminal.create',
               requestId: newRequestId,
-              mode: tab.mode,
+              mode: terminalMode,
               shell: tab.shell || 'system',
-              cwd: tab.initialCwd,
-              resumeSessionId: tab.resumeSessionId,
+              cwd: terminalInitialCwd,
+              resumeSessionId: terminalResumeSessionId,
             })
           }
         }
@@ -310,10 +323,10 @@ export default function TerminalView({ tabId, hidden }: { tabId: string; hidden?
         ws.send({
           type: 'terminal.create',
           requestId,
-          mode: tab.mode,
+          mode: terminalMode,
           shell: tab.shell || 'system',
-          cwd: tab.initialCwd,
-          resumeSessionId: tab.resumeSessionId,
+          cwd: terminalInitialCwd,
+          resumeSessionId: terminalResumeSessionId,
         })
       }
     }

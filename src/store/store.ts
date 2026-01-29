@@ -4,7 +4,8 @@ import connectionReducer from './connectionSlice'
 import sessionsReducer from './sessionsSlice'
 import settingsReducer from './settingsSlice'
 import claudeReducer from './claudeSlice'
-import { persistMiddleware, loadPersistedTabs } from './persistMiddleware'
+import panesReducer, { hydratePanes } from './panesSlice'
+import { persistMiddleware, loadPersistedTabs, loadPersistedPanes } from './persistMiddleware'
 
 export const store = configureStore({
   reducer: {
@@ -13,6 +14,7 @@ export const store = configureStore({
     sessions: sessionsReducer,
     settings: settingsReducer,
     claude: claudeReducer,
+    panes: panesReducer,
   },
   middleware: (getDefault) =>
     getDefault({
@@ -23,9 +25,15 @@ export const store = configureStore({
 })
 
 // Hydrate persisted tabs once on startup.
-const persisted = loadPersistedTabs()
-if (persisted?.tabs) {
-  store.dispatch(hydrateTabs(persisted.tabs))
+const persistedTabs = loadPersistedTabs()
+if (persistedTabs?.tabs) {
+  store.dispatch(hydrateTabs(persistedTabs.tabs))
+}
+
+// Hydrate persisted panes once on startup.
+const persistedPanes = loadPersistedPanes()
+if (persistedPanes) {
+  store.dispatch(hydratePanes(persistedPanes))
 }
 
 export type RootState = ReturnType<typeof store.getState>

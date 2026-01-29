@@ -1,6 +1,7 @@
-import TerminalView from './TerminalView'
+import { PaneLayout } from './panes'
 import ClaudeSessionView from './ClaudeSessionView'
 import { useAppSelector } from '@/store/hooks'
+import type { PaneContent } from '@/store/paneTypes'
 
 interface TabContentProps {
   tabId: string
@@ -12,11 +13,24 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
 
   if (!tab) return null
 
-  // Use ClaudeSessionView for claude mode with claudeSessionId
-  if (tab.mode === 'claude' && tab.claudeSessionId) {
+  // For claude mode with existing claudeSessionId and no terminal, use ClaudeSessionView
+  // This is for viewing historical sessions, not live terminals
+  if (tab.mode === 'claude' && tab.claudeSessionId && !tab.terminalId) {
     return <ClaudeSessionView sessionId={tab.claudeSessionId} hidden={hidden} />
   }
 
-  // Fall back to terminal for shell mode or claude without claudeSessionId yet
-  return <TerminalView tabId={tabId} hidden={hidden} />
+  // Build default content based on tab
+  const defaultContent: PaneContent = {
+    kind: 'terminal',
+    mode: tab.mode,
+    resumeSessionId: tab.resumeSessionId,
+    initialCwd: tab.initialCwd,
+  }
+
+  // Use PaneLayout for all terminal-based tabs
+  return (
+    <div className={hidden ? 'hidden' : 'h-full w-full'}>
+      <PaneLayout tabId={tabId} defaultContent={defaultContent} />
+    </div>
+  )
 }

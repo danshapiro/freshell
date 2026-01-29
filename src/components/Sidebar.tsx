@@ -177,12 +177,12 @@ export default function Sidebar({
 
   const handleItemClick = (item: SessionItem) => {
     if (item.isRunning && item.runningTerminalId) {
-      // Session is running - switch to existing terminal
+      // Session is running - check if tab with this terminal already exists
       const existingTab = tabs.find((t) => t.terminalId === item.runningTerminalId)
       if (existingTab) {
         dispatch(setActiveTab(existingTab.id))
       } else {
-        // Attach to the running terminal
+        // Create new tab to attach to the running terminal
         dispatch(addTab({
           title: item.title,
           terminalId: item.runningTerminalId,
@@ -191,13 +191,19 @@ export default function Sidebar({
         }))
       }
     } else {
-      // Session not running - resume it
-      dispatch(addTab({
-        title: item.title,
-        mode: 'claude',
-        initialCwd: item.cwd,
-        resumeSessionId: item.sessionId
-      }))
+      // Session not running - check if tab with this session already exists
+      const existingTab = tabs.find((t) => t.resumeSessionId === item.sessionId)
+      if (existingTab) {
+        dispatch(setActiveTab(existingTab.id))
+      } else {
+        // Create new tab to resume the session
+        dispatch(addTab({
+          title: item.title,
+          mode: 'claude',
+          initialCwd: item.cwd,
+          resumeSessionId: item.sessionId
+        }))
+      }
     }
     onNavigate('terminal')
   }
