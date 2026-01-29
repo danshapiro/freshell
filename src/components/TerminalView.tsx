@@ -45,11 +45,16 @@ export default function TerminalView({ tabId, hidden }: { tabId: string; hidden?
   const requestIdRef = useRef<string | null>(null)
   const terminalIdRef = useRef<string | undefined>(tab?.terminalId)
   const mountedRef = useRef(false)
+  const hiddenRef = useRef(hidden)
 
   // Keep refs in sync
   useEffect(() => {
     terminalIdRef.current = tab?.terminalId
   }, [tab?.terminalId])
+
+  useEffect(() => {
+    hiddenRef.current = hidden
+  }, [hidden])
 
   // Init xterm once
   useEffect(() => {
@@ -102,7 +107,7 @@ export default function TerminalView({ tabId, hidden }: { tabId: string; hidden?
 
     const ro = new ResizeObserver(() => {
       // Only fit if visible and not disposed
-      if (hidden || termRef.current !== term) return
+      if (hiddenRef.current || termRef.current !== term) return
       try {
         fit.fit()
         const terminalId = terminalIdRef.current
@@ -144,12 +149,16 @@ export default function TerminalView({ tabId, hidden }: { tabId: string; hidden?
   // When becoming visible, fit and send size
   useEffect(() => {
     if (!hidden) {
-      fitRef.current?.fit()
-      const term = termRef.current
-      const terminalId = terminalIdRef.current
-      if (term && terminalId) {
-        ws.send({ type: 'terminal.resize', terminalId, cols: term.cols, rows: term.rows })
-      }
+      // Use requestAnimationFrame to wait for browser layout reflow after display:none is removed
+      const frameId = requestAnimationFrame(() => {
+        fitRef.current?.fit()
+        const term = termRef.current
+        const terminalId = terminalIdRef.current
+        if (term && terminalId) {
+          ws.send({ type: 'terminal.resize', terminalId, cols: term.cols, rows: term.rows })
+        }
+      })
+      return () => cancelAnimationFrame(frameId)
     }
   }, [hidden, ws])
 
