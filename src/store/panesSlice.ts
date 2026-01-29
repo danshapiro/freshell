@@ -1,6 +1,26 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import { nanoid } from 'nanoid'
-import type { PanesState, PaneContent, PaneNode } from './paneTypes'
+import type { PanesState, PaneContent, PaneContentInput, PaneNode } from './paneTypes'
+
+/**
+ * Normalize terminal input to full PaneContent with defaults.
+ */
+function normalizeContent(input: PaneContentInput): PaneContent {
+  if (input.kind === 'terminal') {
+    return {
+      kind: 'terminal',
+      terminalId: input.terminalId,
+      createRequestId: input.createRequestId || nanoid(),
+      status: input.status || 'creating',
+      mode: input.mode || 'shell',
+      shell: input.shell || 'system',
+      resumeSessionId: input.resumeSessionId,
+      initialCwd: input.initialCwd,
+    }
+  }
+  // Browser content passes through unchanged
+  return input
+}
 
 // Load persisted panes state directly at module initialization time
 // This ensures the initial state includes persisted data BEFORE the store is created
@@ -65,7 +85,7 @@ export const panesSlice = createSlice({
   reducers: {
     initLayout: (
       state,
-      action: PayloadAction<{ tabId: string; content: PaneContent }>
+      action: PayloadAction<{ tabId: string; content: PaneContentInput }>
     ) => {
       const { tabId, content } = action.payload
       // Don't overwrite existing layout
@@ -75,7 +95,7 @@ export const panesSlice = createSlice({
       state.layouts[tabId] = {
         type: 'leaf',
         id: paneId,
-        content,
+        content: normalizeContent(content),
       }
       state.activePane[tabId] = paneId
     },
@@ -86,7 +106,7 @@ export const panesSlice = createSlice({
         tabId: string
         paneId: string
         direction: 'horizontal' | 'vertical'
-        newContent: PaneContent
+        newContent: PaneContentInput
       }>
     ) => {
       const { tabId, paneId, direction, newContent } = action.payload
@@ -112,7 +132,7 @@ export const panesSlice = createSlice({
         sizes: [50, 50],
         children: [
           { ...targetPane }, // Keep original pane
-          { type: 'leaf', id: newPaneId, content: newContent }, // New pane
+          { type: 'leaf', id: newPaneId, content: normalizeContent(newContent) }, // New pane with normalized content
         ],
       }
 
