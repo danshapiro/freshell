@@ -3,8 +3,6 @@ type MessageHandler = (msg: any) => void
 type ReconnectHandler = () => void
 
 const CONNECTION_TIMEOUT_MS = 10_000
-const PING_INTERVAL_MS = 30_000
-const PONG_TIMEOUT_MS = 10_000
 
 // Single source of auth token: sessionStorage only.
 function getAuthToken(): string | undefined {
@@ -42,9 +40,6 @@ export class WsClient {
   private wasConnectedOnce = false
 
   private maxQueueSize = 1000
-
-  private pingIntervalId: number | null = null
-  private pongTimeoutId: number | null = null
 
   constructor(private url: string) {}
 
@@ -110,9 +105,6 @@ export class WsClient {
           this.wasConnectedOnce = true
           this._state = 'ready'
 
-          // Start keepalive ping
-          this.startPingInterval()
-
           // Flush queued messages
           while (this.pendingMessages.length > 0) {
             const next = this.pendingMessages.shift()
@@ -126,14 +118,6 @@ export class WsClient {
           finishResolve()
         }
 
-        if (msg.type === 'pong') {
-          // Clear pong timeout - connection is alive
-          if (this.pongTimeoutId !== null) {
-            window.clearTimeout(this.pongTimeoutId)
-            this.pongTimeoutId = null
-          }
-        }
-
         if (msg.type === 'error' && msg.code === 'NOT_AUTHENTICATED') {
           window.clearTimeout(timeout)
           finishReject(new Error('Authentication failed'))
@@ -145,7 +129,6 @@ export class WsClient {
 
       this.ws.onclose = (event) => {
         window.clearTimeout(timeout)
-        this.stopPingInterval()
         const wasConnecting = this._state === 'connecting'
         this._state = 'disconnected'
         this.ws = null
@@ -188,31 +171,6 @@ export class WsClient {
     })
   }
 
-  private startPingInterval() {
-    this.stopPingInterval()
-    this.pingIntervalId = window.setInterval(() => {
-      if (this._state === 'ready' && this.ws?.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({ type: 'ping' }))
-        // Set timeout for pong response
-        this.pongTimeoutId = window.setTimeout(() => {
-          console.warn('WsClient: pong timeout, closing connection')
-          this.ws?.close()
-        }, PONG_TIMEOUT_MS)
-      }
-    }, PING_INTERVAL_MS)
-  }
-
-  private stopPingInterval() {
-    if (this.pingIntervalId !== null) {
-      window.clearInterval(this.pingIntervalId)
-      this.pingIntervalId = null
-    }
-    if (this.pongTimeoutId !== null) {
-      window.clearTimeout(this.pongTimeoutId)
-      this.pongTimeoutId = null
-    }
-  }
-
   private scheduleReconnect() {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       console.error('WsClient: max reconnect attempts reached')
@@ -231,7 +189,6 @@ export class WsClient {
 
   disconnect() {
     this.intentionalClose = true
-    this.stopPingInterval()
     this.ws?.close()
     this.ws = null
     this._state = 'disconnected'

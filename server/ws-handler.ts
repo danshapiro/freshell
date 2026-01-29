@@ -10,6 +10,12 @@ import type { ClaudeEvent } from './claude-stream-types'
 
 const MAX_CONNECTIONS = Number(process.env.MAX_CONNECTIONS || 10)
 const HELLO_TIMEOUT_MS = Number(process.env.HELLO_TIMEOUT_MS || 5_000)
+const PING_INTERVAL_MS = Number(process.env.PING_INTERVAL_MS || 30_000)
+
+// Extended WebSocket with liveness tracking for keepalive
+interface LiveWebSocket extends WebSocket {
+  isAlive?: boolean
+}
 
 const CLOSE_CODES = {
   NOT_AUTHENTICATED: 4001,
@@ -135,7 +141,8 @@ type ClientState = {
 
 export class WsHandler {
   private wss: WebSocketServer
-  private connections = new Set<WebSocket>()
+  private connections = new Set<LiveWebSocket>()
+  private pingInterval: NodeJS.Timeout | null = null
 
   constructor(
     server: http.Server,
@@ -148,7 +155,19 @@ export class WsHandler {
       maxPayload: 1_000_000,
     })
 
-    this.wss.on('connection', (ws, req) => this.onConnection(ws, req))
+    this.wss.on('connection', (ws, req) => this.onConnection(ws as LiveWebSocket, req))
+
+    // Start protocol-level ping interval for keepalive
+    this.pingInterval = setInterval(() => {
+      for (const ws of this.connections) {
+        if (ws.isAlive === false) {
+          ws.terminate()
+          continue
+        }
+        ws.isAlive = false
+        ws.ping()
+      }
+    }, PING_INTERVAL_MS)
   }
 
   getServer() {
@@ -159,7 +178,7 @@ export class WsHandler {
     return this.connections.size
   }
 
-  private onConnection(ws: WebSocket, req: http.IncomingMessage) {
+  private onConnection(ws: LiveWebSocket, req: http.IncomingMessage) {
     if (this.connections.size >= MAX_CONNECTIONS) {
       ws.close(CLOSE_CODES.MAX_CONNECTIONS, 'Too many connections')
       return
@@ -189,6 +208,12 @@ export class WsHandler {
       claudeSessions: new Set(),
     }
 
+    // Mark connection alive for keepalive pings
+    ws.isAlive = true
+    ws.on('pong', () => {
+      ws.isAlive = true
+    })
+
     this.connections.add(ws)
 
     state.helloTimer = setTimeout(() => {
@@ -202,7 +227,7 @@ export class WsHandler {
     ws.on('error', (err) => logger.debug({ err }, 'WS error'))
   }
 
-  private onClose(ws: WebSocket, state: ClientState) {
+  private onClose(ws: LiveWebSocket, state: ClientState) {
     if (state.helloTimer) clearTimeout(state.helloTimer)
     this.connections.delete(ws)
     // Detach from any terminals
@@ -212,7 +237,7 @@ export class WsHandler {
     state.attachedTerminalIds.clear()
   }
 
-  private send(ws: WebSocket, msg: unknown) {
+  private send(ws: LiveWebSocket, msg: unknown) {
     try {
       ws.send(JSON.stringify(msg))
     } catch {
@@ -220,13 +245,13 @@ export class WsHandler {
     }
   }
 
-  private safeSend(ws: WebSocket, msg: unknown) {
+  private safeSend(ws: LiveWebSocket, msg: unknown) {
     if (ws.readyState === WebSocket.OPEN) {
       this.send(ws, msg)
     }
   }
 
-  private sendError(ws: WebSocket, params: { code: z.infer<typeof ErrorCode>; message: string; requestId?: string }) {
+  private sendError(ws: LiveWebSocket, params: { code: z.infer<typeof ErrorCode>; message: string; requestId?: string }) {
     this.send(ws, {
       type: 'error',
       code: params.code,
@@ -236,7 +261,7 @@ export class WsHandler {
     })
   }
 
-  private async onMessage(ws: WebSocket, state: ClientState, data: WebSocket.RawData) {
+  private async onMessage(ws: LiveWebSocket, state: ClientState, data: WebSocket.RawData) {
     let msg: any
     try {
       msg = JSON.parse(data.toString())
@@ -508,6 +533,12 @@ export class WsHandler {
    * Gracefully close all WebSocket connections and the server.
    */
   close(): void {
+    // Stop keepalive ping interval
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval)
+      this.pingInterval = null
+    }
+
     // Close all client connections
     for (const ws of this.connections) {
       try {
