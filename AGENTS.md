@@ -64,15 +64,17 @@ npm run test:coverage       # Generate coverage report
 
 **Claude Session Discovery:** Watches `~/.claude/projects/*/sessions/*.jsonl` for new files. Parses JSONL streams to extract messages, groups by project path.
 
-**Redux State Management:** Slices for tabs, connection, sessions, settings, claude. Persist middleware saves tabs to localStorage. Async thunks for API calls.
+**Redux State Management:** Slices for tabs, panes, connection, sessions, settings, claude. Persist middleware saves tabs and panes to localStorage. Async thunks for API calls.
 
 **Configuration Persistence:** User config stored at `~/.freshell/config.json`. Atomic writes with temp file + rename. Settings changes POST to `/api/settings` and broadcast via WebSocket.
+
+**Pane System:** Tabs contain pane layouts (tree structure of splits). Each pane owns its terminal lifecycle via `createRequestId` and `terminalId`. When splitting panes, each new pane gets its own `createRequestId`, ensuring independent backend terminals. Pane content types: `terminal` (with mode, shell, status) and `browser` (with URL, devtools state).
 
 ### Data Flow
 
 1. Browser loads → fetches settings from `/api/settings` and sessions from `/api/sessions`
 2. WebSocket connects → client sends `hello` with auth token → server sends `ready`
-3. Terminal creation → UI sends `terminal.create` WS message → server spawns PTY → sends back `terminal.created` with initial snapshot
+3. Terminal creation → Pane content has `createRequestId` → UI sends `terminal.create` WS message with that ID → server spawns PTY → sends back `terminal.created` with `terminalId` → pane content updated
 4. Terminal I/O → `terminal.input` WS messages write to PTY stdin → stdout/stderr streams to attached clients
 
 ## Path Aliases
