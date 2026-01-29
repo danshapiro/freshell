@@ -116,8 +116,8 @@ export default function TabBar() {
       setActiveId(null)
 
       if (over && active.id !== over.id) {
-        const oldIndex = tabs.findIndex((t) => t.id === active.id)
-        const newIndex = tabs.findIndex((t) => t.id === over.id)
+        const oldIndex = tabs.findIndex((t: Tab) => t.id === active.id)
+        const newIndex = tabs.findIndex((t: Tab) => t.id === over.id)
         dispatch(reorderTabs({ fromIndex: oldIndex, toIndex: newIndex }))
       }
     },
@@ -127,7 +127,7 @@ export default function TabBar() {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.shiftKey && activeTabId) {
-        const currentIndex = tabs.findIndex((t) => t.id === activeTabId)
+        const currentIndex = tabs.findIndex((t: Tab) => t.id === activeTabId)
         if (e.key === 'ArrowLeft' && currentIndex > 0) {
           dispatch(reorderTabs({ fromIndex: currentIndex, toIndex: currentIndex - 1 }))
           e.preventDefault()
@@ -141,7 +141,7 @@ export default function TabBar() {
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [activeTabId, tabs, dispatch])
 
-  const activeTab = activeId ? tabs.find((t) => t.id === activeId) : null
+  const activeTab = activeId ? tabs.find((t: Tab) => t.id === activeId) : null
 
   if (tabs.length === 0) return null
 
@@ -154,11 +154,11 @@ export default function TabBar() {
         onDragEnd={handleDragEnd}
       >
         <SortableContext
-          items={tabs.map((t) => t.id)}
+          items={tabs.map((t: Tab) => t.id)}
           strategy={horizontalListSortingStrategy}
         >
           <div className="flex items-center gap-0.5 overflow-x-auto flex-1 py-1">
-            {tabs.map((tab) => (
+            {tabs.map((tab: Tab) => (
               <SortableTab
                 key={tab.id}
                 tab={tab}
