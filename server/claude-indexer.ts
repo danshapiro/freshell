@@ -22,13 +22,24 @@ export type ProjectGroup = {
   color?: string
 }
 
-function defaultClaudeHome(): string {
+export function defaultClaudeHome(): string {
   // Claude Code stores logs in ~/.claude by default (Linux/macOS).
   // On Windows, set CLAUDE_HOME to a path you can access from Node (e.g. \\wsl$\...).
   return process.env.CLAUDE_HOME || path.join(os.homedir(), '.claude')
 }
 
-function looksLikePath(s: string): boolean {
+export function looksLikePath(s: string): boolean {
+  // Reject URLs and protocol-based strings (contain :// before any path separator)
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s)) {
+    return false
+  }
+
+  // Accept special directory references
+  if (s === '~' || s === '.' || s === '..') {
+    return true
+  }
+
+  // Accept paths with separators or Windows drive letters
   return s.includes('/') || s.includes('\\') || /^[A-Za-z]:\\/.test(s)
 }
 
@@ -76,14 +87,71 @@ async function resolveProjectPath(projectDir: string): Promise<string> {
   return path.basename(projectDir)
 }
 
-type JsonlMeta = {
+export type JsonlMeta = {
   cwd?: string
   title?: string
   summary?: string
   messageCount?: number
 }
 
-async function parseSessionJsonlMeta(filePath: string): Promise<JsonlMeta> {
+/** Parse session metadata from jsonl content (pure function for testing) */
+export function parseSessionContent(content: string): JsonlMeta {
+  const lines = content.split(/\r?\n/).filter(Boolean)
+  let cwd: string | undefined
+  let title: string | undefined
+  let summary: string | undefined
+
+  for (const line of lines) {
+    let obj: any
+    try {
+      obj = JSON.parse(line)
+    } catch {
+      continue
+    }
+
+    const candidates = [
+      obj?.cwd,
+      obj?.context?.cwd,
+      obj?.payload?.cwd,
+      obj?.data?.cwd,
+      obj?.message?.cwd,
+    ].filter((v: any) => typeof v === 'string') as string[]
+    if (!cwd) {
+      const found = candidates.find((v) => looksLikePath(v))
+      if (found) cwd = found
+    }
+
+    if (!title) {
+      const t =
+        obj?.title ||
+        obj?.sessionTitle ||
+        (obj?.role === 'user' && typeof obj?.content === 'string' ? obj.content : undefined) ||
+        (obj?.message?.role === 'user' && typeof obj?.message?.content === 'string'
+          ? obj.message.content
+          : undefined)
+
+      if (typeof t === 'string' && t.trim()) {
+        title = t.trim().replace(/\s+/g, ' ').slice(0, 80)
+      }
+    }
+
+    if (!summary) {
+      const s = obj?.summary || obj?.sessionSummary
+      if (typeof s === 'string' && s.trim()) summary = s.trim().slice(0, 240)
+    }
+
+    if (cwd && title && summary) break
+  }
+
+  return {
+    cwd,
+    title,
+    summary,
+    messageCount: lines.length,
+  }
+}
+
+export async function parseSessionJsonlMeta(filePath: string): Promise<JsonlMeta> {
   try {
     const stream = fs.createReadStream(filePath, { encoding: 'utf-8', highWaterMark: 256 * 1024 })
     let data = ''
@@ -93,59 +161,7 @@ async function parseSessionJsonlMeta(filePath: string): Promise<JsonlMeta> {
     }
     stream.close()
 
-    const lines = data.split(/\r?\n/).filter(Boolean)
-    let cwd: string | undefined
-    let title: string | undefined
-    let summary: string | undefined
-
-    for (const line of lines) {
-      let obj: any
-      try {
-        obj = JSON.parse(line)
-      } catch {
-        continue
-      }
-
-      const candidates = [
-        obj?.cwd,
-        obj?.context?.cwd,
-        obj?.payload?.cwd,
-        obj?.data?.cwd,
-        obj?.message?.cwd,
-      ].filter((v: any) => typeof v === 'string') as string[]
-      if (!cwd) {
-        const found = candidates.find((v) => looksLikePath(v))
-        if (found) cwd = found
-      }
-
-      if (!title) {
-        const t =
-          obj?.title ||
-          obj?.sessionTitle ||
-          (obj?.role === 'user' && typeof obj?.content === 'string' ? obj.content : undefined) ||
-          (obj?.message?.role === 'user' && typeof obj?.message?.content === 'string'
-            ? obj.message.content
-            : undefined)
-
-        if (typeof t === 'string' && t.trim()) {
-          title = t.trim().replace(/\s+/g, ' ').slice(0, 80)
-        }
-      }
-
-      if (!summary) {
-        const s = obj?.summary || obj?.sessionSummary
-        if (typeof s === 'string' && s.trim()) summary = s.trim().slice(0, 240)
-      }
-
-      if (cwd && title && summary) break
-    }
-
-    return {
-      cwd,
-      title,
-      summary,
-      messageCount: lines.length,
-    }
+    return parseSessionContent(data)
   } catch {
     return {}
   }
@@ -258,6 +274,9 @@ export class ClaudeSessionIndexer {
         }
         const sessionId = path.basename(file, '.jsonl')
         const meta = await parseSessionJsonlMeta(full)
+
+        // Skip orphaned sessions (no conversation events, just snapshots)
+        if (!meta.cwd) continue
 
         const baseSession: ClaudeSession = {
           sessionId,
