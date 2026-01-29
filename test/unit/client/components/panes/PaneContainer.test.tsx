@@ -7,8 +7,15 @@ import panesReducer from '@/store/panesSlice'
 import type { PanesState } from '@/store/panesSlice'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
 
+// Hoist mock functions so vi.mock can reference them
+const { mockSend, mockTerminalView } = vi.hoisted(() => ({
+  mockSend: vi.fn(),
+  mockTerminalView: vi.fn(({ tabId, paneId, hidden }: { tabId: string; paneId: string; hidden?: boolean }) => (
+    <div data-testid={`terminal-${paneId}`} data-hidden={String(hidden)}>Terminal for {tabId}/{paneId}</div>
+  )),
+}))
+
 // Mock the ws-client module
-const mockSend = vi.fn()
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: mockSend,
@@ -39,9 +46,7 @@ vi.mock('lucide-react', () => ({
 
 // Mock TerminalView component to avoid xterm.js dependencies
 vi.mock('@/components/TerminalView', () => ({
-  default: ({ tabId, paneId }: { tabId: string; paneId: string }) => (
-    <div data-testid={`terminal-${paneId}`}>Terminal for {tabId}/{paneId}</div>
-  ),
+  default: mockTerminalView,
 }))
 
 // Mock BrowserPane component
@@ -84,6 +89,7 @@ function renderWithStore(
 describe('PaneContainer', () => {
   beforeEach(() => {
     mockSend.mockClear()
+    mockTerminalView.mockClear()
   })
 
   afterEach(() => {
@@ -553,6 +559,86 @@ describe('PaneContainer', () => {
 
       // Now pane2 should be active
       expect(store.getState().panes.activePane['tab-1']).toBe(pane2Id)
+    })
+  })
+
+  describe('hidden prop propagation', () => {
+    it('passes hidden=true to TerminalView', () => {
+      const paneId = 'pane-1'
+      const leafNode: PaneNode = {
+        type: 'leaf',
+        id: paneId,
+        content: createTerminalContent(),
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': leafNode },
+        activePane: { 'tab-1': paneId },
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={leafNode} hidden={true} />,
+        store
+      )
+
+      // The mock TerminalView should have received hidden=true
+      expect(mockTerminalView).toHaveBeenLastCalledWith(
+        expect.objectContaining({ hidden: true }),
+        expect.anything()
+      )
+    })
+
+    it('passes hidden=false to TerminalView when not hidden', () => {
+      const paneId = 'pane-1'
+      const leafNode: PaneNode = {
+        type: 'leaf',
+        id: paneId,
+        content: createTerminalContent(),
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': leafNode },
+        activePane: { 'tab-1': paneId },
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={leafNode} hidden={false} />,
+        store
+      )
+
+      expect(mockTerminalView).toHaveBeenLastCalledWith(
+        expect.objectContaining({ hidden: false }),
+        expect.anything()
+      )
+    })
+
+    it('propagates hidden through nested splits', () => {
+      const rootNode: PaneNode = {
+        type: 'split',
+        id: 'split-1',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          { type: 'leaf', id: 'pane-1', content: createTerminalContent() },
+          { type: 'leaf', id: 'pane-2', content: createTerminalContent() },
+        ],
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': rootNode },
+        activePane: { 'tab-1': 'pane-1' },
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={rootNode} hidden={true} />,
+        store
+      )
+
+      // Both terminals should receive hidden=true
+      const calls = mockTerminalView.mock.calls
+      expect(calls.length).toBe(2)
+      expect(calls[0][0]).toMatchObject({ hidden: true })
+      expect(calls[1][0]).toMatchObject({ hidden: true })
     })
   })
 })

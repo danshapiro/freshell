@@ -12,9 +12,10 @@ import { getWsClient } from '@/lib/ws-client'
 interface PaneContainerProps {
   tabId: string
   node: PaneNode
+  hidden?: boolean
 }
 
-export default function PaneContainer({ tabId, node }: PaneContainerProps) {
+export default function PaneContainer({ tabId, node, hidden }: PaneContainerProps) {
   const dispatch = useAppDispatch()
   const activePane = useAppSelector((s) => s.panes.activePane[tabId])
   const containerRef = useRef<HTMLDivElement>(null)
@@ -69,7 +70,7 @@ export default function PaneContainer({ tabId, node }: PaneContainerProps) {
         onClose={() => handleClose(node.id, node.content)}
         onFocus={() => handleFocus(node.id)}
       >
-        {renderContent(tabId, node.id, node.content)}
+        {renderContent(tabId, node.id, node.content, hidden)}
       </Pane>
     )
   }
@@ -86,7 +87,7 @@ export default function PaneContainer({ tabId, node }: PaneContainerProps) {
       )}
     >
       <div style={{ [node.direction === 'horizontal' ? 'width' : 'height']: `${size1}%` }} className="min-w-0 min-h-0">
-        <PaneContainer tabId={tabId} node={node.children[0]} />
+        <PaneContainer tabId={tabId} node={node.children[0]} hidden={hidden} />
       </div>
 
       <PaneDivider
@@ -96,17 +97,17 @@ export default function PaneContainer({ tabId, node }: PaneContainerProps) {
       />
 
       <div style={{ [node.direction === 'horizontal' ? 'width' : 'height']: `${size2}%` }} className="min-w-0 min-h-0">
-        <PaneContainer tabId={tabId} node={node.children[1]} />
+        <PaneContainer tabId={tabId} node={node.children[1]} hidden={hidden} />
       </div>
     </div>
   )
 }
 
-function renderContent(tabId: string, paneId: string, content: PaneContent) {
+function renderContent(tabId: string, paneId: string, content: PaneContent, hidden?: boolean) {
   if (content.kind === 'terminal') {
     // Terminal panes need a unique key based on paneId for proper lifecycle
     // Pass paneContent directly to avoid redundant tree traversal in TerminalView
-    return <TerminalView key={paneId} tabId={tabId} paneId={paneId} paneContent={content} hidden={false} />
+    return <TerminalView key={paneId} tabId={tabId} paneId={paneId} paneContent={content} hidden={hidden} />
   }
 
   if (content.kind === 'browser') {
