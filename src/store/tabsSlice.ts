@@ -119,10 +119,19 @@ export const tabsSlice = createSlice({
       }))
       state.activeTabId = action.payload.activeTabId || (state.tabs[0]?.id ?? null)
     },
+    reorderTabs: (
+      state,
+      action: PayloadAction<{ fromIndex: number; toIndex: number }>
+    ) => {
+      const { fromIndex, toIndex } = action.payload
+      if (fromIndex === toIndex) return
+      const [removed] = state.tabs.splice(fromIndex, 1)
+      state.tabs.splice(toIndex, 0, removed)
+    },
   },
 })
 
-export const { addTab, setActiveTab, updateTab, removeTab, hydrateTabs } = tabsSlice.actions
+export const { addTab, setActiveTab, updateTab, removeTab, hydrateTabs, reorderTabs } = tabsSlice.actions
 
 export const closeTab = createAsyncThunk(
   'tabs/closeTab',

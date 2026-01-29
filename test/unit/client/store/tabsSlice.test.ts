@@ -5,6 +5,7 @@ import tabsReducer, {
   updateTab,
   removeTab,
   hydrateTabs,
+  reorderTabs,
   TabsState,
 } from '../../../../src/store/tabsSlice'
 import type { Tab } from '../../../../src/store/types'
@@ -412,6 +413,69 @@ describe('tabsSlice', () => {
       expect(tab.initialCwd).toBe('/custom/path')
       expect(tab.resumeSessionId).toBe('session-abc')
       expect(tab.createdAt).toBe(5000000)
+    })
+  })
+
+  describe('reorderTabs', () => {
+    it('moves tab from index 0 to index 2', () => {
+      // Setup: create 3 tabs
+      let state = tabsReducer(initialState, addTab({ title: 'Tab A' }))
+      const tabAId = state.tabs[0].id
+      state = tabsReducer(state, addTab({ title: 'Tab B' }))
+      const tabBId = state.tabs[1].id
+      state = tabsReducer(state, addTab({ title: 'Tab C' }))
+      const tabCId = state.tabs[2].id
+
+      // Move Tab A from index 0 to index 2
+      state = tabsReducer(state, reorderTabs({ fromIndex: 0, toIndex: 2 }))
+
+      // Order should now be: B, C, A
+      expect(state.tabs[0].id).toBe(tabBId)
+      expect(state.tabs[1].id).toBe(tabCId)
+      expect(state.tabs[2].id).toBe(tabAId)
+    })
+
+    it('moves tab from index 2 to index 0', () => {
+      let state = tabsReducer(initialState, addTab({ title: 'Tab A' }))
+      const tabAId = state.tabs[0].id
+      state = tabsReducer(state, addTab({ title: 'Tab B' }))
+      const tabBId = state.tabs[1].id
+      state = tabsReducer(state, addTab({ title: 'Tab C' }))
+      const tabCId = state.tabs[2].id
+
+      // Move Tab C from index 2 to index 0
+      state = tabsReducer(state, reorderTabs({ fromIndex: 2, toIndex: 0 }))
+
+      // Order should now be: C, A, B
+      expect(state.tabs[0].id).toBe(tabCId)
+      expect(state.tabs[1].id).toBe(tabAId)
+      expect(state.tabs[2].id).toBe(tabBId)
+    })
+
+    it('is a no-op when fromIndex equals toIndex', () => {
+      let state = tabsReducer(initialState, addTab({ title: 'Tab A' }))
+      const tabAId = state.tabs[0].id
+      state = tabsReducer(state, addTab({ title: 'Tab B' }))
+      const tabBId = state.tabs[1].id
+
+      state = tabsReducer(state, reorderTabs({ fromIndex: 1, toIndex: 1 }))
+
+      expect(state.tabs[0].id).toBe(tabAId)
+      expect(state.tabs[1].id).toBe(tabBId)
+    })
+
+    it('preserves activeTabId when reordering', () => {
+      let state = tabsReducer(initialState, addTab({ title: 'Tab A' }))
+      state = tabsReducer(state, addTab({ title: 'Tab B' }))
+      state = tabsReducer(state, addTab({ title: 'Tab C' }))
+
+      // Tab C is active (last added)
+      const activeId = state.activeTabId
+
+      state = tabsReducer(state, reorderTabs({ fromIndex: 0, toIndex: 2 }))
+
+      // activeTabId should be unchanged
+      expect(state.activeTabId).toBe(activeId)
     })
   })
 })
