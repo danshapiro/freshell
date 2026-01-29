@@ -13,7 +13,7 @@ import TabContent from '@/components/TabContent'
 import HistoryView from '@/components/HistoryView'
 import SettingsView from '@/components/SettingsView'
 import OverviewView from '@/components/OverviewView'
-import { Wifi, WifiOff, Moon, Sun } from 'lucide-react'
+import { Wifi, WifiOff, Moon, Sun, Share2 } from 'lucide-react'
 import { updateSettingsLocal, markSaved } from '@/store/settingsSlice'
 
 export default function App() {
@@ -35,6 +35,36 @@ export default function App() {
       await api.patch('/api/settings', { theme: newTheme })
       dispatch(markSaved())
     } catch {}
+  }
+
+  const handleShare = async () => {
+    // Build shareable URL with token
+    const url = new URL(window.location.href)
+    const token = sessionStorage.getItem('authToken')
+    if (token) {
+      url.searchParams.set('token', token)
+    }
+
+    if (navigator.share) {
+      try {
+        await navigator.share({
+          title: 'Freshell Terminal',
+          text: 'Access my terminal session',
+          url: url.toString(),
+        })
+      } catch (err) {
+        // User cancelled or share failed - that's okay
+        console.warn('Share cancelled or failed:', err)
+      }
+    } else {
+      // Fallback: copy to clipboard
+      try {
+        await navigator.clipboard.writeText(url.toString())
+        // TODO: Show toast notification
+      } catch (err) {
+        console.warn('Clipboard write failed:', err)
+      }
+    }
   }
 
   // Bootstrap: load settings, sessions, and connect websocket.
@@ -209,6 +239,13 @@ export default function App() {
             ) : (
               <Sun className="h-3.5 w-3.5 text-muted-foreground" />
             )}
+          </button>
+          <button
+            onClick={handleShare}
+            className="p-1.5 rounded-md hover:bg-muted transition-colors"
+            title="Share LAN access"
+          >
+            <Share2 className="h-3.5 w-3.5 text-muted-foreground" />
           </button>
           <div
             className="p-1.5"

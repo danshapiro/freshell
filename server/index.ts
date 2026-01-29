@@ -1,3 +1,4 @@
+import './bootstrap' // Must be first - ensures .env exists before dotenv loads
 import 'dotenv/config'
 import express from 'express'
 import fs from 'fs'
