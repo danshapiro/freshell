@@ -32,16 +32,20 @@ describe('panesSlice', () => {
 
   describe('initLayout', () => {
     it('creates a single-pane layout for a tab', () => {
-      const content: PaneContent = { kind: 'terminal', mode: 'shell' }
       const state = panesReducer(
         initialState,
-        initLayout({ tabId: 'tab-1', content })
+        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
       )
 
       expect(state.layouts['tab-1']).toBeDefined()
       expect(state.layouts['tab-1'].type).toBe('leaf')
       const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
-      expect(leaf.content).toEqual(content)
+      expect(leaf.content.kind).toBe('terminal')
+      if (leaf.content.kind === 'terminal') {
+        expect(leaf.content.mode).toBe('shell')
+        expect(leaf.content.createRequestId).toBeDefined()
+        expect(leaf.content.status).toBe('creating')
+      }
       expect(leaf.id).toBeDefined()
     })
 
@@ -139,12 +143,9 @@ describe('panesSlice', () => {
 
   describe('splitPane', () => {
     it('converts a leaf pane into a horizontal split with two children', () => {
-      const content1: PaneContent = { kind: 'terminal', mode: 'shell' }
-      const content2: PaneContent = { kind: 'terminal', mode: 'claude' }
-
       let state = panesReducer(
         initialState,
-        initLayout({ tabId: 'tab-1', content: content1 })
+        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
       )
       const originalPaneId = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).id
 
@@ -154,7 +155,7 @@ describe('panesSlice', () => {
           tabId: 'tab-1',
           paneId: originalPaneId,
           direction: 'horizontal',
-          newContent: content2,
+          newContent: { kind: 'terminal', mode: 'claude' },
         })
       )
 
@@ -168,8 +169,16 @@ describe('panesSlice', () => {
       const [first, second] = split.children
       expect(first.type).toBe('leaf')
       expect(second.type).toBe('leaf')
-      expect((first as Extract<PaneNode, { type: 'leaf' }>).content).toEqual(content1)
-      expect((second as Extract<PaneNode, { type: 'leaf' }>).content).toEqual(content2)
+      const firstContent = (first as Extract<PaneNode, { type: 'leaf' }>).content
+      const secondContent = (second as Extract<PaneNode, { type: 'leaf' }>).content
+      expect(firstContent.kind).toBe('terminal')
+      expect(secondContent.kind).toBe('terminal')
+      if (firstContent.kind === 'terminal') {
+        expect(firstContent.mode).toBe('shell')
+      }
+      if (secondContent.kind === 'terminal') {
+        expect(secondContent.mode).toBe('claude')
+      }
     })
 
     it('converts a leaf pane into a vertical split', () => {
@@ -426,12 +435,9 @@ describe('panesSlice', () => {
     })
 
     it('collapses a split to the remaining pane when one child is closed', () => {
-      const content1: PaneContent = { kind: 'terminal', mode: 'shell' }
-      const content2: PaneContent = { kind: 'terminal', mode: 'claude' }
-
       let state = panesReducer(
         initialState,
-        initLayout({ tabId: 'tab-1', content: content1 })
+        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
       )
       const pane1Id = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).id
 
@@ -441,7 +447,7 @@ describe('panesSlice', () => {
           tabId: 'tab-1',
           paneId: pane1Id,
           direction: 'horizontal',
-          newContent: content2,
+          newContent: { kind: 'terminal', mode: 'claude' },
         })
       )
 
@@ -455,16 +461,17 @@ describe('panesSlice', () => {
       const remaining = state.layouts['tab-1']
       expect(remaining.type).toBe('leaf')
       expect((remaining as Extract<PaneNode, { type: 'leaf' }>).id).toBe(pane1Id)
-      expect((remaining as Extract<PaneNode, { type: 'leaf' }>).content).toEqual(content1)
+      const remainingContent = (remaining as Extract<PaneNode, { type: 'leaf' }>).content
+      expect(remainingContent.kind).toBe('terminal')
+      if (remainingContent.kind === 'terminal') {
+        expect(remainingContent.mode).toBe('shell')
+      }
     })
 
     it('collapses to the other pane when the first child is closed', () => {
-      const content1: PaneContent = { kind: 'terminal', mode: 'shell' }
-      const content2: PaneContent = { kind: 'terminal', mode: 'claude' }
-
       let state = panesReducer(
         initialState,
-        initLayout({ tabId: 'tab-1', content: content1 })
+        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
       )
       const pane1Id = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).id
 
@@ -474,7 +481,7 @@ describe('panesSlice', () => {
           tabId: 'tab-1',
           paneId: pane1Id,
           direction: 'horizontal',
-          newContent: content2,
+          newContent: { kind: 'terminal', mode: 'claude' },
         })
       )
 
@@ -484,7 +491,11 @@ describe('panesSlice', () => {
       // Should collapse to the second pane
       const remaining = state.layouts['tab-1']
       expect(remaining.type).toBe('leaf')
-      expect((remaining as Extract<PaneNode, { type: 'leaf' }>).content).toEqual(content2)
+      const remainingContent = (remaining as Extract<PaneNode, { type: 'leaf' }>).content
+      expect(remainingContent.kind).toBe('terminal')
+      if (remainingContent.kind === 'terminal') {
+        expect(remainingContent.mode).toBe('claude')
+      }
     })
 
     it('updates active pane when the active pane is closed', () => {
