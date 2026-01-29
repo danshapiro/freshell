@@ -10,7 +10,7 @@ export const defaultSettings: AppSettings = {
     lineHeight: 1,
     cursorBlink: true,
     scrollback: 5000,
-    theme: 'dark',
+    theme: 'default',
   },
   defaultCwd: undefined,
   safety: {

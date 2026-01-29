@@ -88,20 +88,6 @@ export default function SettingsView() {
               </div>
             </SettingsRow>
 
-            <SettingsRow label="Terminal theme">
-              <SegmentedControl
-                value={settings.terminal.theme}
-                options={[
-                  { value: 'default', label: 'Default' },
-                  { value: 'light', label: 'Light' },
-                  { value: 'dark', label: 'Dark' },
-                ]}
-                onChange={(v) => {
-                  dispatch(updateSettingsLocal({ terminal: { theme: v as any } } as any))
-                  scheduleSave({ terminal: { theme: v } })
-                }}
-              />
-            </SettingsRow>
           </SettingsSection>
 
           {/* Sidebar */}

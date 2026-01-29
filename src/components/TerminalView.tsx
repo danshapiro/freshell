@@ -7,8 +7,15 @@ import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
 import 'xterm/css/xterm.css'
 
-function getXtermTheme(theme: 'default' | 'dark' | 'light') {
-  if (theme === 'light') {
+function getSystemPrefersDark(): boolean {
+  return window.matchMedia?.('(prefers-color-scheme: dark)')?.matches ?? false
+}
+
+function getXtermTheme(appTheme: 'dark' | 'light' | 'system') {
+  // Always follow app theme
+  const isDark = appTheme === 'dark' ? true : appTheme === 'light' ? false : getSystemPrefersDark()
+
+  if (!isDark) {
     return {
       background: '#ffffff',
       foreground: '#1a1a2e',
@@ -18,17 +25,14 @@ function getXtermTheme(theme: 'default' | 'dark' | 'light') {
       selectionForeground: '#1a1a2e',
     }
   }
-  if (theme === 'dark') {
-    return {
-      background: '#09090b',
-      foreground: '#fafafa',
-      cursor: '#fafafa',
-      cursorAccent: '#09090b',
-      selectionBackground: 'rgba(255, 255, 255, 0.15)',
-      selectionForeground: '#fafafa',
-    }
+  return {
+    background: '#09090b',
+    foreground: '#fafafa',
+    cursor: '#fafafa',
+    cursorAccent: '#09090b',
+    selectionBackground: 'rgba(255, 255, 255, 0.15)',
+    selectionForeground: '#fafafa',
   }
-  return undefined
 }
 
 export default function TerminalView({ tabId, hidden }: { tabId: string; hidden?: boolean }) {
@@ -78,7 +82,7 @@ export default function TerminalView({ tabId, hidden }: { tabId: string; hidden?
       fontFamily: settings.terminal.fontFamily,
       lineHeight: settings.terminal.lineHeight,
       scrollback: settings.terminal.scrollback,
-      theme: getXtermTheme(settings.terminal.theme),
+      theme: getXtermTheme(settings.theme),
     })
     const fit = new FitAddon()
     term.loadAddon(fit)
@@ -141,7 +145,7 @@ export default function TerminalView({ tabId, hidden }: { tabId: string; hidden?
     term.options.fontFamily = settings.terminal.fontFamily
     term.options.lineHeight = settings.terminal.lineHeight
     term.options.scrollback = settings.terminal.scrollback
-    term.options.theme = getXtermTheme(settings.terminal.theme)
+    term.options.theme = getXtermTheme(settings.theme)
     // Fit after font changes
     if (!hidden) fitRef.current?.fit()
   }, [settings, hidden])
