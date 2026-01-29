@@ -1,7 +1,7 @@
 import { X, Plus, Circle } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { addTab, removeTab, setActiveTab, updateTab } from '@/store/tabsSlice'
+import { addTab, closeTab, setActiveTab, updateTab } from '@/store/tabsSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { useMemo, useState } from 'react'
 
@@ -95,7 +95,7 @@ export default function TabBar() {
                       terminalId: tab.terminalId,
                     })
                   }
-                  dispatch(removeTab(tab.id))
+                  dispatch(closeTab(tab.id))
                 }}
               >
                 <X className="h-3 w-3" />
