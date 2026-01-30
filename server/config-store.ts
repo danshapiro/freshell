@@ -64,7 +64,7 @@ export const defaultSettings: AppSettings = {
   theme: 'system',
   terminal: {
     fontSize: 12,
-    fontFamily: 'JetBrains Mono',
+    fontFamily: 'Consolas',
     lineHeight: 1,
     cursorBlink: true,
     scrollback: 5000,

@@ -25,7 +25,7 @@ describe('settingsSlice', () => {
       expect(state.settings.uiScale).toBe(1.0)
       expect(state.settings.terminal).toEqual({
         fontSize: 16,
-        fontFamily: 'JetBrains Mono',
+        fontFamily: 'Consolas',
         lineHeight: 1,
         cursorBlink: true,
         scrollback: 5000,
