@@ -6,6 +6,7 @@ import Pane from './Pane'
 import PaneDivider from './PaneDivider'
 import TerminalView from '../TerminalView'
 import BrowserPane from './BrowserPane'
+import EditorPane from './EditorPane'
 import { cn } from '@/lib/utils'
 import { getWsClient } from '@/lib/ws-client'
 
@@ -112,6 +113,20 @@ function renderContent(tabId: string, paneId: string, content: PaneContent, hidd
 
   if (content.kind === 'browser') {
     return <BrowserPane paneId={paneId} tabId={tabId} url={content.url} devToolsOpen={content.devToolsOpen} />
+  }
+
+  if (content.kind === 'editor') {
+    return (
+      <EditorPane
+        paneId={paneId}
+        tabId={tabId}
+        filePath={content.filePath}
+        language={content.language}
+        readOnly={content.readOnly}
+        content={content.content}
+        viewMode={content.viewMode}
+      />
+    )
   }
 
   return null
