@@ -147,8 +147,8 @@ describe('TabBar', () => {
 
       renderWithStore(<TabBar />, store)
 
-      const activeTabElement = screen.getByText('Active Tab').closest('div')
-      const inactiveTabElement = screen.getByText('Inactive Tab').closest('div')
+      const activeTabElement = screen.getByText('Active Tab').closest('div[class*="group"]')
+      const inactiveTabElement = screen.getByText('Inactive Tab').closest('div[class*="group"]')
 
       // Active tab should have bg-muted class
       expect(activeTabElement?.className).toContain('bg-muted')
@@ -170,7 +170,7 @@ describe('TabBar', () => {
       const { rerender } = renderWithStore(<TabBar />, store)
 
       // Initial state - tab 1 is active
-      let tab1Element = screen.getByText('Tab 1').closest('div')
+      let tab1Element = screen.getByText('Tab 1').closest('div[class*="group"]')
       expect(tab1Element?.className).toContain('bg-muted')
 
       // Click tab 2 to change active tab
@@ -184,8 +184,8 @@ describe('TabBar', () => {
       )
 
       // Now tab 2 should be active
-      const tab2Element = screen.getByText('Tab 2').closest('div')
-      tab1Element = screen.getByText('Tab 1').closest('div')
+      const tab2Element = screen.getByText('Tab 2').closest('div[class*="group"]')
+      tab1Element = screen.getByText('Tab 1').closest('div[class*="group"]')
 
       expect(tab2Element?.className).toContain('bg-muted')
       expect(tab1Element?.className).not.toContain('bg-muted text-foreground')

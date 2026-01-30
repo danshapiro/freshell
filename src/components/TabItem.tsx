@@ -74,19 +74,21 @@ export default function TabItem({
         />
       ) : (
         <Tooltip>
-          <TooltipTrigger asChild>
-            <span
-              className={cn(
-                'relative whitespace-nowrap truncate text-sm',
-                isActive ? 'max-w-[10rem]' : 'max-w-[5rem]'
-              )}
-            >
-              {tab.title}
-              <TooltipContent className="whitespace-nowrap">
+          <div className="relative">
+            <TooltipTrigger asChild>
+              <span
+                className={cn(
+                  'whitespace-nowrap truncate text-sm block',
+                  isActive ? 'max-w-[10rem]' : 'max-w-[5rem]'
+                )}
+              >
                 {tab.title}
-              </TooltipContent>
-            </span>
-          </TooltipTrigger>
+              </span>
+            </TooltipTrigger>
+            <TooltipContent className="whitespace-nowrap">
+              {tab.title}
+            </TooltipContent>
+          </div>
         </Tooltip>
       )}
 
