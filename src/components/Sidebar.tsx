@@ -4,6 +4,7 @@ import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, setActiveTab } from '@/store/tabsSlice'
+import { selectAllSessionActivity } from '@/store/sessionActivitySlice'
 import { getWsClient } from '@/lib/ws-client'
 import type { BackgroundTerminal, ClaudeSession, ProjectGroup } from '@/store/types'
 
@@ -18,6 +19,9 @@ interface SessionItem {
   projectColor?: string
   timestamp: number
   cwd?: string
+  hasTab: boolean
+  tabLastInputAt?: number
+  ratchetedActivity?: number
   // Running state (derived from terminals)
   isRunning: boolean
   runningTerminalId?: string
@@ -56,6 +60,7 @@ export default function Sidebar({
   const projects = useAppSelector((s) => s.sessions.projects)
   const tabs = useAppSelector((s) => s.tabs.tabs)
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
+  const sessionActivity = useAppSelector(selectAllSessionActivity)
 
   const ws = useMemo(() => getWsClient(), [])
   const [terminals, setTerminals] = useState<BackgroundTerminal[]>([])
@@ -104,10 +109,28 @@ export default function Sidebar({
       }
     })
 
-    // Add sessions with running state
+    // Build map: sessionId -> tab info
+    const tabSessionMap = new Map<string, { hasTab: boolean; lastInputAt?: number }>()
+    tabs.forEach((t) => {
+      if (!t.resumeSessionId) return
+      const existing = tabSessionMap.get(t.resumeSessionId)
+      if (!existing) {
+        tabSessionMap.set(t.resumeSessionId, { hasTab: true, lastInputAt: t.lastInputAt })
+        return
+      }
+      const existingTime = existing.lastInputAt ?? 0
+      const nextTime = t.lastInputAt ?? 0
+      if (nextTime > existingTime) {
+        tabSessionMap.set(t.resumeSessionId, { hasTab: true, lastInputAt: t.lastInputAt })
+      }
+    })
+
+    // Add sessions with running, tab, and ratcheted activity state
     projectsArray.forEach((project) => {
       project.sessions.forEach((session) => {
         const runningTerminalId = runningSessionMap.get(session.sessionId)
+        const tabInfo = tabSessionMap.get(session.sessionId)
+        const ratchetedActivity = sessionActivity[session.sessionId]
         items.push({
           id: `session-${session.sessionId}`,
           sessionId: session.sessionId,
@@ -117,6 +140,9 @@ export default function Sidebar({
           projectColor: project.color,
           timestamp: session.updatedAt,
           cwd: session.cwd,
+          hasTab: tabInfo?.hasTab ?? false,
+          tabLastInputAt: tabInfo?.lastInputAt,
+          ratchetedActivity,
           isRunning: !!runningTerminalId,
           runningTerminalId,
         })
@@ -124,7 +150,7 @@ export default function Sidebar({
     })
 
     return items
-  }, [terminals, projects])
+  }, [terminals, projects, tabs, sessionActivity])
 
   // Filter items
   const filteredItems = useMemo(() => {
@@ -148,11 +174,25 @@ export default function Sidebar({
     }
 
     if (sortMode === 'activity') {
-      return items.sort((a, b) => {
-        if (a.isRunning && !b.isRunning) return -1
-        if (!a.isRunning && b.isRunning) return 1
-        return b.timestamp - a.timestamp
+      const withTabs = items.filter((i) => i.hasTab)
+      const withoutTabs = items.filter((i) => !i.hasTab)
+
+      withTabs.sort((a, b) => {
+        const aTime = a.tabLastInputAt ?? a.timestamp
+        const bTime = b.tabLastInputAt ?? b.timestamp
+        return bTime - aTime
       })
+
+      withoutTabs.sort((a, b) => {
+        const aHasRatcheted = typeof a.ratchetedActivity === 'number'
+        const bHasRatcheted = typeof b.ratchetedActivity === 'number'
+        if (aHasRatcheted !== bHasRatcheted) return aHasRatcheted ? -1 : 1
+        const aTime = a.ratchetedActivity ?? a.timestamp
+        const bTime = b.ratchetedActivity ?? b.timestamp
+        return bTime - aTime
+      })
+
+      return [...withTabs, ...withoutTabs]
     }
 
     if (sortMode === 'project') {
@@ -355,7 +395,7 @@ function SidebarItem({
     >
       {/* Status indicator */}
       <div className="flex-shrink-0">
-        {item.isRunning ? (
+        {item.hasTab ? (
           <div className="relative">
             <Play className="h-2.5 w-2.5 fill-success text-success" />
             <div className="absolute inset-0 h-2.5 w-2.5 rounded-full bg-success/30 animate-pulse-subtle" />

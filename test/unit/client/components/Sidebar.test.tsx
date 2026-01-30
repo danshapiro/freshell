@@ -7,6 +7,7 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
+import sessionActivityReducer from '@/store/sessionActivitySlice'
 import type { ProjectGroup, BackgroundTerminal } from '@/store/types'
 
 // Mock the WebSocket client
@@ -25,10 +26,17 @@ vi.mock('@/lib/ws-client', () => ({
 function createTestStore(options?: {
   projects?: ProjectGroup[]
   terminals?: BackgroundTerminal[]
-  tabs?: Array<{ id: string; terminalId?: string; resumeSessionId?: string; mode?: string }>
+  tabs?: Array<{
+    id: string
+    terminalId?: string
+    resumeSessionId?: string
+    mode?: string
+    lastInputAt?: number
+  }>
   activeTabId?: string
   sortMode?: 'hybrid' | 'recency' | 'activity' | 'project'
   showProjectBadges?: boolean
+  sessionActivity?: Record<string, number>
 }) {
   return configureStore({
     reducer: {
@@ -36,6 +44,7 @@ function createTestStore(options?: {
       tabs: tabsReducer,
       connection: connectionReducer,
       sessions: sessionsReducer,
+      sessionActivity: sessionActivityReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -69,6 +78,9 @@ function createTestStore(options?: {
       connection: {
         status: 'connected',
         error: null,
+      },
+      sessionActivity: {
+        sessions: options?.sessionActivity ?? {},
       },
     },
   })
@@ -384,6 +396,254 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(screen.getByText('Recent')).toBeInTheDocument()
       expect(screen.getByText('Running session')).toBeInTheDocument()
       expect(screen.getByText('Recent session')).toBeInTheDocument()
+    })
+  })
+
+  describe('activity sort mode', () => {
+    it('shows sessions with tabs above sessions without tabs', async () => {
+      const now = Date.now()
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: 'session-no-tab',
+              projectPath: '/home/user/project',
+              updatedAt: now,
+              title: 'Session without tab',
+              cwd: '/home/user/project',
+            },
+            {
+              sessionId: 'session-with-tab',
+              projectPath: '/home/user/project',
+              updatedAt: now - 10000,
+              title: 'Session with tab',
+              cwd: '/home/user/project',
+            },
+          ],
+        },
+      ]
+
+      const tabs = [
+        {
+          id: 'tab-1',
+          resumeSessionId: 'session-with-tab',
+          mode: 'claude',
+          lastInputAt: now - 5000,
+        },
+      ]
+
+      const store = createTestStore({ projects, tabs, sortMode: 'activity' })
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const buttons = screen.getAllByRole('button').filter(
+        (btn) => btn.textContent?.includes('Session')
+      )
+
+      expect(buttons[0]).toHaveTextContent('Session with tab')
+      expect(buttons[1]).toHaveTextContent('Session without tab')
+    })
+
+    it('sorts tabbed sessions by lastInputAt', async () => {
+      const now = Date.now()
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: 'session-old-input',
+              projectPath: '/home/user/project',
+              updatedAt: now,
+              title: 'Old input session',
+              cwd: '/home/user/project',
+            },
+            {
+              sessionId: 'session-recent-input',
+              projectPath: '/home/user/project',
+              updatedAt: now - 10000,
+              title: 'Recent input session',
+              cwd: '/home/user/project',
+            },
+          ],
+        },
+      ]
+
+      const tabs = [
+        {
+          id: 'tab-1',
+          resumeSessionId: 'session-old-input',
+          mode: 'claude',
+          lastInputAt: now - 60000,
+        },
+        {
+          id: 'tab-2',
+          resumeSessionId: 'session-recent-input',
+          mode: 'claude',
+          lastInputAt: now - 1000,
+        },
+      ]
+
+      const store = createTestStore({ projects, tabs, sortMode: 'activity' })
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const buttons = screen.getAllByRole('button').filter(
+        (btn) => btn.textContent?.includes('session')
+      )
+
+      expect(buttons[0]).toHaveTextContent('Recent input session')
+      expect(buttons[1]).toHaveTextContent('Old input session')
+    })
+
+    it('uses session timestamp for tabbed sessions without lastInputAt', async () => {
+      const now = Date.now()
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: 'session-with-input',
+              projectPath: '/home/user/project',
+              updatedAt: now - 60000,
+              title: 'Has input timestamp',
+              cwd: '/home/user/project',
+            },
+            {
+              sessionId: 'session-no-input',
+              projectPath: '/home/user/project',
+              updatedAt: now,
+              title: 'No input timestamp',
+              cwd: '/home/user/project',
+            },
+          ],
+        },
+      ]
+
+      const tabs = [
+        {
+          id: 'tab-1',
+          resumeSessionId: 'session-with-input',
+          mode: 'claude',
+          lastInputAt: now - 30000,
+        },
+        {
+          id: 'tab-2',
+          resumeSessionId: 'session-no-input',
+          mode: 'claude',
+        },
+      ]
+
+      const store = createTestStore({ projects, tabs, sortMode: 'activity' })
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const buttons = screen.getAllByRole('button').filter(
+        (btn) => btn.textContent?.includes('timestamp')
+      )
+
+      expect(buttons[0]).toHaveTextContent('No input timestamp')
+      expect(buttons[1]).toHaveTextContent('Has input timestamp')
+    })
+
+    it('uses ratcheted sessionActivity for closed tabs (preserves position)', async () => {
+      const now = Date.now()
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: 'session-was-active',
+              projectPath: '/home/user/project',
+              updatedAt: now - 60000,
+              title: 'Was active session',
+              cwd: '/home/user/project',
+            },
+            {
+              sessionId: 'session-never-active',
+              projectPath: '/home/user/project',
+              updatedAt: now,
+              title: 'Never active session',
+              cwd: '/home/user/project',
+            },
+          ],
+        },
+      ]
+
+      const sessionActivity = {
+        'session-was-active': now - 1000,
+      }
+
+      const store = createTestStore({
+        projects,
+        tabs: [],
+        sortMode: 'activity',
+        sessionActivity,
+      })
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const buttons = screen.getAllByRole('button').filter(
+        (btn) => btn.textContent?.includes('session')
+      )
+
+      expect(buttons[0]).toHaveTextContent('Was active session')
+      expect(buttons[1]).toHaveTextContent('Never active session')
+    })
+
+    it('shows green indicator for sessions with tabs, grey for others', async () => {
+      const now = Date.now()
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: 'session-with-tab',
+              projectPath: '/home/user/project',
+              updatedAt: now,
+              title: 'Tabbed session',
+              cwd: '/home/user/project',
+            },
+            {
+              sessionId: 'session-no-tab',
+              projectPath: '/home/user/project',
+              updatedAt: now,
+              title: 'No tab session',
+              cwd: '/home/user/project',
+            },
+          ],
+        },
+      ]
+
+      const tabs = [
+        {
+          id: 'tab-1',
+          resumeSessionId: 'session-with-tab',
+          mode: 'claude',
+        },
+      ]
+
+      const store = createTestStore({ projects, tabs, sortMode: 'activity' })
+      renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const playIcons = document.querySelectorAll('.text-success')
+      expect(playIcons.length).toBeGreaterThan(0)
     })
   })
 
