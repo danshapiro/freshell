@@ -4,11 +4,23 @@ import { FileText } from 'lucide-react'
 import { useAppDispatch } from '@/store/hooks'
 import { updatePaneContent } from '@/store/panesSlice'
 import EditorToolbar from './EditorToolbar'
+import MarkdownPreview from './MarkdownPreview'
 
 function isPreviewable(filePath: string | null): boolean {
   if (!filePath) return false
   const lower = filePath.toLowerCase()
   return lower.endsWith('.md') || lower.endsWith('.htm') || lower.endsWith('.html')
+}
+
+function isMarkdown(filePath: string | null): boolean {
+  if (!filePath) return false
+  return filePath.toLowerCase().endsWith('.md')
+}
+
+function isHtml(filePath: string | null): boolean {
+  if (!filePath) return false
+  const lower = filePath.toLowerCase()
+  return lower.endsWith('.htm') || lower.endsWith('.html')
 }
 
 interface EditorPaneProps {
@@ -82,6 +94,40 @@ export default function EditorPane({
     updateContent({ viewMode: viewMode === 'source' ? 'preview' : 'source' })
   }, [updateContent, viewMode])
 
+  const showPreview = viewMode === 'preview' && showViewToggle
+
+  const renderContent = () => {
+    if (showPreview && isMarkdown(filePath)) {
+      return <MarkdownPreview content={content} />
+    }
+
+    if (showPreview && isHtml(filePath)) {
+      return (
+        <iframe
+          srcDoc={content}
+          title="HTML Preview"
+          className="w-full h-full border-0 bg-white"
+          sandbox="allow-scripts"
+        />
+      )
+    }
+
+    return (
+      <Editor
+        height="100%"
+        language={language || undefined}
+        value={content}
+        onChange={handleContentChange}
+        options={{
+          readOnly,
+          minimap: { enabled: false },
+          scrollBeyondLastLine: false,
+        }}
+        theme="vs-dark"
+      />
+    )
+  }
+
   // Empty state
   if (!filePath && !content) {
     return (
@@ -118,20 +164,7 @@ export default function EditorPane({
         onViewModeToggle={handleViewModeToggle}
         showViewToggle={showViewToggle}
       />
-      <div className="flex-1 min-h-0">
-        <Editor
-          height="100%"
-          language={language || undefined}
-          value={content}
-          onChange={handleContentChange}
-          options={{
-            readOnly,
-            minimap: { enabled: false },
-            scrollBeyondLastLine: false,
-          }}
-          theme="vs-dark"
-        />
-      </div>
+      <div className="flex-1 min-h-0">{renderContent()}</div>
     </div>
   )
 }

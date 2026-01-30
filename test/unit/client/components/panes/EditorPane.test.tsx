@@ -123,4 +123,41 @@ describe('EditorPane', () => {
 
     expect(screen.queryByRole('button', { name: /preview/i })).not.toBeInTheDocument()
   })
+
+  it('renders markdown preview when viewMode is preview', () => {
+    render(
+      <Provider store={store}>
+        <EditorPane
+          paneId="pane-1"
+          tabId="tab-1"
+          filePath="/readme.md"
+          language="markdown"
+          readOnly={false}
+          content="# Hello World"
+          viewMode="preview"
+        />
+      </Provider>
+    )
+
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('Hello World')
+    expect(screen.queryByTestId('monaco-mock')).not.toBeInTheDocument()
+  })
+
+  it('renders HTML in iframe when viewMode is preview', () => {
+    render(
+      <Provider store={store}>
+        <EditorPane
+          paneId="pane-1"
+          tabId="tab-1"
+          filePath="/page.html"
+          language="html"
+          readOnly={false}
+          content="<h1>Test</h1>"
+          viewMode="preview"
+        />
+      </Provider>
+    )
+
+    expect(screen.getByTitle('HTML Preview')).toBeInTheDocument()
+  })
 })
