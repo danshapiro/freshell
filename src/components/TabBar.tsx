@@ -2,6 +2,7 @@ import { Plus } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, closeTab, setActiveTab, updateTab, reorderTabs } from '@/store/tabsSlice'
 import { getWsClient } from '@/lib/ws-client'
+import { deriveTabName } from '@/lib/deriveTabName'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import TabItem from './TabItem'
 import {
@@ -27,6 +28,7 @@ import type { Tab } from '@/store/types'
 
 interface SortableTabProps {
   tab: Tab
+  displayTitle: string
   isActive: boolean
   isDragging: boolean
   isRenaming: boolean
@@ -41,6 +43,7 @@ interface SortableTabProps {
 
 function SortableTab({
   tab,
+  displayTitle,
   isActive,
   isDragging,
   isRenaming,
@@ -65,10 +68,16 @@ function SortableTab({
     transition: transition || 'transform 150ms ease',
   }
 
+  // Create tab with display title for rendering
+  const tabWithDisplayTitle = useMemo(
+    () => ({ ...tab, title: displayTitle }),
+    [tab, displayTitle]
+  )
+
   return (
     <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
       <TabItem
-        tab={tab}
+        tab={tabWithDisplayTitle}
         isActive={isActive}
         isDragging={isDragging}
         isRenaming={isRenaming}
@@ -84,11 +93,31 @@ function SortableTab({
   )
 }
 
+// Stable empty object to avoid creating new references
+const EMPTY_LAYOUTS: Record<string, never> = {}
+
 export default function TabBar() {
   const dispatch = useAppDispatch()
   const { tabs, activeTabId } = useAppSelector((s) => s.tabs)
+  const paneLayouts = useAppSelector((s) => s.panes?.layouts) ?? EMPTY_LAYOUTS
 
   const ws = useMemo(() => getWsClient(), [])
+
+  // Compute display title for a single tab
+  // Priority: user-set title > programmatically-set title (e.g., from Claude) > derived name
+  const getDisplayTitle = useCallback((tab: Tab): string => {
+    if (tab.titleSetByUser) {
+      return tab.title
+    }
+    const layout = paneLayouts[tab.id]
+    const derivedName = layout ? deriveTabName(layout) : null
+    // If tab has a non-default title (not "Tab N"), prefer it over derived name
+    // This preserves titles set by Claude via terminal.title.updated
+    if (!tab.title.match(/^Tab \d+$/) && tab.title !== derivedName) {
+      return tab.title
+    }
+    return derivedName ?? tab.title
+  }, [paneLayouts])
 
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
@@ -162,6 +191,7 @@ export default function TabBar() {
               <SortableTab
                 key={tab.id}
                 tab={tab}
+                displayTitle={getDisplayTitle(tab)}
                 isActive={tab.id === activeTabId}
                 isDragging={activeId === tab.id}
                 isRenaming={renamingId === tab.id}
@@ -193,7 +223,7 @@ export default function TabBar() {
                 onClick={() => dispatch(setActiveTab(tab.id))}
                 onDoubleClick={() => {
                   setRenamingId(tab.id)
-                  setRenameValue(tab.title)
+                  setRenameValue(getDisplayTitle(tab))
                 }}
               />
             ))}
@@ -211,7 +241,7 @@ export default function TabBar() {
               }}
             >
               <TabItem
-                tab={activeTab}
+                tab={{ ...activeTab, title: getDisplayTitle(activeTab) }}
                 isActive={activeTab.id === activeTabId}
                 isDragging={false}
                 isRenaming={false}
