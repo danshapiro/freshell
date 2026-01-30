@@ -364,6 +364,34 @@ export default function SettingsView() {
 
           </SettingsSection>
 
+          {/* Sidebar */}
+          <SettingsSection title="Sidebar" description="Session list and navigation">
+            <SettingsRow label="Sort mode">
+              <select
+                value={settings.sidebar?.sortMode || 'activity'}
+                onChange={(e) => {
+                  const v = e.target.value as SidebarSortMode
+                  dispatch(updateSettingsLocal({ sidebar: { sortMode: v } } as any))
+                  scheduleSave({ sidebar: { sortMode: v } })
+                }}
+                className="h-8 px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border"
+              >
+                <option value="recency">Recency</option>
+                <option value="activity">Activity</option>
+                <option value="project">Project</option>
+              </select>
+            </SettingsRow>
+
+            <SettingsRow label="Show project badges">
+              <Toggle
+                checked={settings.sidebar?.showProjectBadges ?? true}
+                onChange={(checked) => {
+                  dispatch(updateSettingsLocal({ sidebar: { showProjectBadges: checked } } as any))
+                  scheduleSave({ sidebar: { showProjectBadges: checked } })
+                }}
+              />
+            </SettingsRow>
+          </SettingsSection>
           {/* Terminal */}
           <SettingsSection title="Terminal" description="Font and rendering options">
             <SettingsRow label="Color scheme">

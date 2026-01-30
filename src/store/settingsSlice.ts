@@ -1,5 +1,5 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
-import type { AppSettings } from './types'
+import type { AppSettings, SidebarSortMode } from './types'
 
 export const defaultSettings: AppSettings = {
   theme: 'system',
@@ -18,11 +18,18 @@ export const defaultSettings: AppSettings = {
     warnBeforeKillMinutes: 5,
   },
   sidebar: {
-    sortMode: 'hybrid',
+    sortMode: 'activity',
     showProjectBadges: true,
     width: 288,
     collapsed: false,
   },
+}
+
+export function migrateSortMode(mode: string | undefined): SidebarSortMode {
+  if (mode === 'recency' || mode === 'activity' || mode === 'project') {
+    return mode
+  }
+  return 'activity'
 }
 
 export interface SettingsState {
@@ -41,7 +48,13 @@ export const settingsSlice = createSlice({
   initialState,
   reducers: {
     setSettings: (state, action: PayloadAction<AppSettings>) => {
-      state.settings = action.payload
+      state.settings = {
+        ...action.payload,
+        sidebar: {
+          ...action.payload.sidebar,
+          sortMode: migrateSortMode(action.payload.sidebar?.sortMode),
+        },
+      }
       state.loaded = true
     },
     updateSettingsLocal: (state, action: PayloadAction<Partial<AppSettings>>) => {
@@ -50,7 +63,11 @@ export const settingsSlice = createSlice({
         ...action.payload,
         terminal: { ...state.settings.terminal, ...(action.payload.terminal || {}) },
         safety: { ...state.settings.safety, ...(action.payload.safety || {}) },
-        sidebar: { ...state.settings.sidebar, ...(action.payload.sidebar || {}) },
+        sidebar: {
+          ...state.settings.sidebar,
+          ...(action.payload.sidebar || {}),
+          sortMode: migrateSortMode(action.payload.sidebar?.sortMode ?? state.settings.sidebar.sortMode),
+        },
       }
     },
     markSaved: (state) => {

@@ -260,8 +260,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
         vi.advanceTimersByTime(100)
       })
 
-      // In hybrid mode, running sessions appear in "Running" section
-      expect(screen.getByText('Running')).toBeInTheDocument()
+      expect(screen.queryByText(/^Running$/)).not.toBeInTheDocument()
       expect(screen.getByText('Active work session')).toBeInTheDocument()
     })
 
@@ -391,11 +390,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
         vi.advanceTimersByTime(100)
       })
 
-      // Both sections should appear
-      expect(screen.getByText('Running')).toBeInTheDocument()
-      expect(screen.getByText('Recent')).toBeInTheDocument()
       expect(screen.getByText('Running session')).toBeInTheDocument()
       expect(screen.getByText('Recent session')).toBeInTheDocument()
+      expect(screen.queryByText(/^Running$/)).not.toBeInTheDocument()
+      expect(screen.queryByText(/^Recent$/)).not.toBeInTheDocument()
     })
   })
 

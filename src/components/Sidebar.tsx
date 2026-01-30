@@ -166,7 +166,7 @@ export default function Sidebar({
 
   // Sort items based on settings
   const sortedItems = useMemo(() => {
-    const sortMode = settings.sidebar?.sortMode || 'hybrid'
+    const sortMode = settings.sidebar?.sortMode || 'activity'
     const items = [...filteredItems]
 
     if (sortMode === 'recency') {
@@ -204,19 +204,8 @@ export default function Sidebar({
       })
     }
 
-    // Hybrid: running sessions first, then recency
-    const running = items.filter((i) => i.isRunning)
-    const rest = items.filter((i) => !i.isRunning)
-    running.sort((a, b) => b.timestamp - a.timestamp)
-    rest.sort((a, b) => b.timestamp - a.timestamp)
-    return [...running, ...rest]
+    return items
   }, [filteredItems, settings.sidebar?.sortMode])
-
-  // Separate running sessions for hybrid display
-  const runningSessions = sortedItems.filter((i) => i.isRunning)
-  const otherItems = settings.sidebar?.sortMode === 'hybrid'
-    ? sortedItems.filter((i) => !i.isRunning)
-    : sortedItems
 
   const handleItemClick = (item: SessionItem) => {
     if (item.isRunning && item.runningTerminalId) {
@@ -309,62 +298,29 @@ export default function Sidebar({
 
       {/* Session List */}
       <div className="flex-1 overflow-y-auto px-2">
-        {/* Running sessions section (hybrid mode) */}
-        {settings.sidebar?.sortMode === 'hybrid' && runningSessions.length > 0 && (
-          <div className="mb-3">
-            <div className="px-2 py-1.5 text-2xs font-medium text-muted-foreground uppercase tracking-wider">
-              Running
+        <div className="space-y-0.5">
+          {sortedItems.length === 0 ? (
+            <div className="px-2 py-8 text-center text-sm text-muted-foreground">
+              No sessions yet
             </div>
-            <div className="space-y-0.5">
-              {runningSessions.map((item) => {
-                const activeTab = tabs.find((t) => t.id === activeTabId)
-                const isActive = item.runningTerminalId === activeTab?.terminalId
+          ) : (
+            sortedItems.map((item) => {
+              const activeTab = tabs.find((t) => t.id === activeTabId)
+              const isActive = item.isRunning
+                ? item.runningTerminalId === activeTab?.terminalId
+                : item.sessionId === activeTab?.resumeSessionId
 
-                return (
-                  <SidebarItem
-                    key={item.id}
-                    item={item}
-                    isActiveTab={isActive}
-                    showProjectBadge={settings.sidebar?.showProjectBadges}
-                    onClick={() => handleItemClick(item)}
-                  />
-                )
-              })}
-            </div>
-          </div>
-        )}
-
-        {/* Recent items */}
-        <div>
-          {settings.sidebar?.sortMode === 'hybrid' && runningSessions.length > 0 && otherItems.length > 0 && (
-            <div className="px-2 py-1.5 text-2xs font-medium text-muted-foreground uppercase tracking-wider">
-              Recent
-            </div>
+              return (
+                <SidebarItem
+                  key={item.id}
+                  item={item}
+                  isActiveTab={isActive}
+                  showProjectBadge={settings.sidebar?.showProjectBadges}
+                  onClick={() => handleItemClick(item)}
+                />
+              )
+            })
           )}
-          <div className="space-y-0.5">
-            {otherItems.length === 0 && runningSessions.length === 0 ? (
-              <div className="px-2 py-8 text-center text-sm text-muted-foreground">
-                No sessions yet
-              </div>
-            ) : (
-              otherItems.map((item) => {
-                const activeTab = tabs.find((t) => t.id === activeTabId)
-                const isActive = item.isRunning
-                  ? item.runningTerminalId === activeTab?.terminalId
-                  : item.sessionId === activeTab?.resumeSessionId
-
-                return (
-                  <SidebarItem
-                    key={item.id}
-                    item={item}
-                    isActiveTab={isActive}
-                    showProjectBadge={settings.sidebar?.showProjectBadges}
-                    onClick={() => handleItemClick(item)}
-                  />
-                )
-              })
-            )}
-          </div>
         </div>
       </div>
 

@@ -70,7 +70,7 @@ export interface TerminalOverride {
   deleted?: boolean
 }
 
-export type SidebarSortMode = 'recency' | 'activity' | 'project' | 'hybrid'
+export type SidebarSortMode = 'recency' | 'activity' | 'project'
 
 export type TerminalTheme =
   | 'auto'           // Follow app theme (dark/light)

@@ -37,7 +37,7 @@ describe('settingsSlice', () => {
         warnBeforeKillMinutes: 5,
       })
       expect(state.settings.sidebar).toEqual({
-        sortMode: 'hybrid',
+        sortMode: 'activity',
         showProjectBadges: true,
         width: 288,
         collapsed: false,
@@ -325,5 +325,25 @@ describe('settingsSlice', () => {
       expect(defaultSettings).toHaveProperty('safety')
       expect(defaultSettings).toHaveProperty('sidebar')
     })
+  })
+})
+
+describe('settingsSlice - sortMode migration', () => {
+  it('migrates hybrid to activity', async () => {
+    const { migrateSortMode } = await import('@/store/settingsSlice')
+    expect(migrateSortMode('hybrid')).toBe('activity')
+  })
+
+  it('preserves valid sort modes', async () => {
+    const { migrateSortMode } = await import('@/store/settingsSlice')
+    expect(migrateSortMode('recency')).toBe('recency')
+    expect(migrateSortMode('activity')).toBe('activity')
+    expect(migrateSortMode('project')).toBe('project')
+  })
+
+  it('defaults invalid values to activity', async () => {
+    const { migrateSortMode } = await import('@/store/settingsSlice')
+    expect(migrateSortMode('invalid' as any)).toBe('activity')
+    expect(migrateSortMode(undefined as any)).toBe('activity')
   })
 })
