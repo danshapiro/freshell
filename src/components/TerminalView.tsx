@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updateTab } from '@/store/tabsSlice'
-import { updatePaneContent } from '@/store/panesSlice'
+import { updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import { getResumeSessionIdFromRef } from '@/components/terminal-view-utils'
@@ -156,6 +156,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     tabRef.current = tab
   }, [tab])
 
+  // Ref for paneId to avoid stale closures in title handlers
+  const paneIdRef = useRef(paneId)
+  useEffect(() => {
+    paneIdRef.current = paneId
+  }, [paneId])
+
   // Track last title we set to avoid churn from spinner animations
   const lastTitleRef = useRef<string | null>(null)
   const lastTitleUpdateRef = useRef<number>(0)
@@ -188,6 +194,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       lastTitleUpdateRef.current = now
 
       dispatch(updateTab({ id: currentTab.id, updates: { title: cleanTitle } }))
+      dispatch(updatePaneTitle({ tabId, paneId: paneIdRef.current, title: cleanTitle }))
     })
 
     return () => disposable.dispose()
@@ -304,6 +311,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           const titleTab = tabRef.current
           if (titleTab && !titleTab.titleSetByUser && msg.title) {
             dispatch(updateTab({ id: titleTab.id, updates: { title: msg.title } }))
+            dispatch(updatePaneTitle({ tabId, paneId: paneIdRef.current, title: msg.title }))
           }
         }
 
