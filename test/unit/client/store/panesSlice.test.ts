@@ -9,6 +9,7 @@ import panesReducer, {
   updatePaneContent,
   removeLayout,
   hydratePanes,
+  updatePaneTitle,
   PanesState,
 } from '../../../../src/store/panesSlice'
 import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent } from '../../../../src/store/paneTypes'
@@ -26,6 +27,7 @@ describe('panesSlice', () => {
     initialState = {
       layouts: {},
       activePane: {},
+      paneTitles: {},
     }
     mockIdCounter = 0
     vi.clearAllMocks()
@@ -946,6 +948,7 @@ describe('panesSlice', () => {
           'tab-1': 'pane-saved-1',
           'tab-2': 'pane-saved-3',
         },
+        paneTitles: {},
       }
 
       const state = panesReducer(initialState, hydratePanes(savedState))
@@ -957,12 +960,14 @@ describe('panesSlice', () => {
       const savedState: PanesState = {
         layouts: {},
         activePane: {},
+        paneTitles: {},
       }
 
       const state = panesReducer(initialState, hydratePanes(savedState))
 
       expect(state.layouts).toEqual({})
       expect(state.activePane).toEqual({})
+      expect(state.paneTitles).toEqual({})
     })
 
     it('preserves complex nested structures', () => {
@@ -991,6 +996,7 @@ describe('panesSlice', () => {
         activePane: {
           'tab-1': 'pane-2',
         },
+        paneTitles: {},
       }
 
       const state = panesReducer(initialState, hydratePanes(savedState))
@@ -1323,6 +1329,39 @@ describe('panesSlice', () => {
         expect(newPane.content.createRequestId).toBeDefined()
         expect(newPane.content.status).toBe('creating')
       }
+    })
+  })
+
+  describe('updatePaneTitle', () => {
+    it('updates the title for a specific pane', () => {
+      const initialLayout: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: { kind: 'terminal', createRequestId: 'req-1', status: 'running', mode: 'shell' },
+      }
+      const state: PanesState = {
+        layouts: { 'tab-1': initialLayout },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+      }
+
+      const result = panesReducer(state, updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-1', title: 'My Terminal' }))
+
+      expect(result.paneTitles['tab-1']).toBeDefined()
+      expect(result.paneTitles['tab-1']['pane-1']).toBe('My Terminal')
+    })
+
+    it('preserves other pane titles when updating one', () => {
+      const state: PanesState = {
+        layouts: {},
+        activePane: {},
+        paneTitles: { 'tab-1': { 'pane-2': 'Other Pane' } },
+      }
+
+      const result = panesReducer(state, updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-1', title: 'First Pane' }))
+
+      expect(result.paneTitles['tab-1']['pane-1']).toBe('First Pane')
+      expect(result.paneTitles['tab-1']['pane-2']).toBe('Other Pane')
     })
   })
 })

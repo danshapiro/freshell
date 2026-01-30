@@ -68,6 +68,8 @@ export interface PanesState {
   layouts: Record<string, PaneNode>
   /** Map of tabId -> currently focused pane id */
   activePane: Record<string, string>
+  /** Map of tabId -> (paneId -> title) for pane headers */
+  paneTitles: Record<string, Record<string, string>>
 }
 
 /**

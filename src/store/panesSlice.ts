@@ -28,6 +28,7 @@ function loadInitialPanesState(): PanesState {
   const defaultState: PanesState = {
     layouts: {},
     activePane: {},
+    paneTitles: {},
   }
 
   try {
@@ -38,6 +39,7 @@ function loadInitialPanesState(): PanesState {
     return {
       layouts: parsed.layouts || {},
       activePane: parsed.activePane || {},
+      paneTitles: parsed.paneTitles || {},
     }
   } catch (err) {
     console.error('[PanesSlice] Failed to load from localStorage:', err)
@@ -352,6 +354,17 @@ export const panesSlice = createSlice({
       state.layouts = action.payload.layouts || {}
       state.activePane = action.payload.activePane || {}
     },
+
+    updatePaneTitle: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string; title: string }>
+    ) => {
+      const { tabId, paneId, title } = action.payload
+      if (!state.paneTitles[tabId]) {
+        state.paneTitles[tabId] = {}
+      }
+      state.paneTitles[tabId][paneId] = title
+    },
   },
 })
 
@@ -365,6 +378,7 @@ export const {
   updatePaneContent,
   removeLayout,
   hydratePanes,
+  updatePaneTitle,
 } = panesSlice.actions
 
 export default panesSlice.reducer
