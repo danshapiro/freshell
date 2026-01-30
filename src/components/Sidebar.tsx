@@ -370,15 +370,18 @@ function SidebarItem({
       {/* Content */}
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
-          <span className={cn(
-            'text-sm truncate',
-            isActiveTab ? 'font-medium' : ''
-          )}>
+          <span
+            className={cn(
+              'text-sm truncate',
+              isActiveTab ? 'font-medium' : ''
+            )}
+            title={item.title}
+          >
             {item.title}
           </span>
         </div>
         {item.subtitle && showProjectBadge && (
-          <div className="text-2xs text-muted-foreground truncate">
+          <div className="text-2xs text-muted-foreground truncate" title={item.subtitle}>
             {item.subtitle}
           </div>
         )}
