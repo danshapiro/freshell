@@ -83,7 +83,7 @@ export function TooltipContent({
   return createPortal(
     <div
       className={cn(
-        'fixed z-50 rounded-md border border-border bg-popover px-2 py-1 text-xs text-popover-foreground shadow-md animate-in fade-in-0 zoom-in-95',
+        'fixed z-50 rounded-md border border-zinc-700 bg-zinc-800 px-2 py-1 text-xs text-zinc-100 shadow-lg animate-in fade-in-0 zoom-in-95',
         className
       )}
       style={{ top: position.top, left: position.left }}
