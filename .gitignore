@@ -6,3 +6,5 @@ nul
 *.txt
 *.log
 .worktrees
+
+.worktrees/
