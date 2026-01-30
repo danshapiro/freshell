@@ -47,18 +47,18 @@ describe('TabItem', () => {
 
   it('renders tab title', () => {
     render(<TabItem {...defaultProps} />)
-    expect(screen.getByTitle('Test Tab')).toBeInTheDocument()
+    expect(screen.getByText('Test Tab')).toBeInTheDocument()
   })
 
   it('applies active styles when isActive is true', () => {
     render(<TabItem {...defaultProps} isActive={true} />)
-    const tabElement = screen.getByTitle('Test Tab').closest('div[class*="group"]')
+    const tabElement = screen.getByText('Test Tab').closest('div[class*="group"]')
     expect(tabElement?.className).toContain('bg-muted')
   })
 
   it('applies dragging opacity when isDragging is true', () => {
     render(<TabItem {...defaultProps} isDragging={true} />)
-    const tabElement = screen.getByTitle('Test Tab').closest('div[class*="group"]')
+    const tabElement = screen.getByText('Test Tab').closest('div[class*="group"]')
     expect(tabElement?.className).toContain('opacity-50')
   })
 
@@ -77,7 +77,7 @@ describe('TabItem', () => {
     const onClick = vi.fn()
     render(<TabItem {...defaultProps} onClick={onClick} />)
 
-    const tabElement = screen.getByTitle('Test Tab').closest('div[class*="group"]')
+    const tabElement = screen.getByText('Test Tab').closest('div[class*="group"]')
     fireEvent.click(tabElement!)
     expect(onClick).toHaveBeenCalled()
   })
@@ -95,7 +95,7 @@ describe('TabItem', () => {
     const onDoubleClick = vi.fn()
     render(<TabItem {...defaultProps} onDoubleClick={onDoubleClick} />)
 
-    const tabElement = screen.getByTitle('Test Tab').closest('div[class*="group"]')
+    const tabElement = screen.getByText('Test Tab').closest('div[class*="group"]')
     fireEvent.doubleClick(tabElement!)
     expect(onDoubleClick).toHaveBeenCalled()
   })

@@ -147,8 +147,8 @@ describe('TabBar', () => {
 
       renderWithStore(<TabBar />, store)
 
-      const activeTabElement = screen.getByTitle('Active Tab').closest('div[class*="group"]')
-      const inactiveTabElement = screen.getByTitle('Inactive Tab').closest('div[class*="group"]')
+      const activeTabElement = screen.getByText('Active Tab').closest('div[class*="group"]')
+      const inactiveTabElement = screen.getByText('Inactive Tab').closest('div[class*="group"]')
 
       // Active tab should have bg-muted class
       expect(activeTabElement?.className).toContain('bg-muted')
@@ -170,11 +170,11 @@ describe('TabBar', () => {
       const { rerender } = renderWithStore(<TabBar />, store)
 
       // Initial state - tab 1 is active
-      let tab1Element = screen.getByTitle('Tab 1').closest('div[class*="group"]')
+      let tab1Element = screen.getByText('Tab 1').closest('div[class*="group"]')
       expect(tab1Element?.className).toContain('bg-muted')
 
       // Click tab 2 to change active tab
-      fireEvent.click(screen.getByTitle('Tab 2'))
+      fireEvent.click(screen.getByText('Tab 2'))
 
       // Re-render to reflect state change
       rerender(
@@ -184,8 +184,8 @@ describe('TabBar', () => {
       )
 
       // Now tab 2 should be active
-      const tab2Element = screen.getByTitle('Tab 2').closest('div[class*="group"]')
-      tab1Element = screen.getByTitle('Tab 1').closest('div[class*="group"]')
+      const tab2Element = screen.getByText('Tab 2').closest('div[class*="group"]')
+      tab1Element = screen.getByText('Tab 1').closest('div[class*="group"]')
 
       expect(tab2Element?.className).toContain('bg-muted')
       expect(tab1Element?.className).not.toContain('bg-muted text-foreground')
@@ -626,8 +626,8 @@ describe('TabBar', () => {
       renderWithStore(<TabBar />, store)
 
       // Both tabs should be rendered (sortable context doesn't change this)
-      expect(screen.getByTitle('Tab 1')).toBeInTheDocument()
-      expect(screen.getByTitle('Tab 2')).toBeInTheDocument()
+      expect(screen.getByText('Tab 1')).toBeInTheDocument()
+      expect(screen.getByText('Tab 2')).toBeInTheDocument()
     })
 
     it('Ctrl+Shift+ArrowRight moves active tab right', () => {

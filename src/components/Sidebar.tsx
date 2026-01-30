@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Terminal, History, Settings, LayoutGrid, Search, Play } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, setActiveTab } from '@/store/tabsSlice'
 import { getWsClient } from '@/lib/ws-client'
@@ -370,20 +371,29 @@ function SidebarItem({
       {/* Content */}
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
-          <span
-            className={cn(
-              'text-sm truncate',
-              isActiveTab ? 'font-medium' : ''
-            )}
-            title={item.title}
-          >
-            {item.title}
-          </span>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span
+                className={cn(
+                  'text-sm truncate',
+                  isActiveTab ? 'font-medium' : ''
+                )}
+              >
+                {item.title}
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>{item.title}</TooltipContent>
+          </Tooltip>
         </div>
         {item.subtitle && showProjectBadge && (
-          <div className="text-2xs text-muted-foreground truncate" title={item.subtitle}>
-            {item.subtitle}
-          </div>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <div className="text-2xs text-muted-foreground truncate">
+                {item.subtitle}
+              </div>
+            </TooltipTrigger>
+            <TooltipContent>{item.subtitle}</TooltipContent>
+          </Tooltip>
         )}
       </div>
 

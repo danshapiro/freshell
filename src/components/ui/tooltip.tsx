@@ -1,9 +1,11 @@
 import * as React from 'react'
+import { createPortal } from 'react-dom'
 import { cn } from '@/lib/utils'
 
 type TooltipContextValue = {
   open: boolean
   setOpen: (v: boolean) => void
+  triggerRef: React.RefObject<HTMLElement>
 }
 
 const TooltipContext = React.createContext<TooltipContextValue | null>(null)
@@ -14,7 +16,12 @@ export function TooltipProvider({ children }: { children: React.ReactNode }) {
 
 export function Tooltip({ children }: { children: React.ReactNode }) {
   const [open, setOpen] = React.useState(false)
-  return <TooltipContext.Provider value={{ open, setOpen }}>{children}</TooltipContext.Provider>
+  const triggerRef = React.useRef<HTMLElement>(null)
+  return (
+    <TooltipContext.Provider value={{ open, setOpen, triggerRef }}>
+      {children}
+    </TooltipContext.Provider>
+  )
 }
 
 export function TooltipTrigger({
@@ -26,20 +33,22 @@ export function TooltipTrigger({
 }) {
   const ctx = React.useContext(TooltipContext)
   if (!ctx) return children
+
   const child = React.cloneElement(children, {
-    onMouseEnter: (e: any) => {
+    ref: ctx.triggerRef,
+    onMouseEnter: (e: React.MouseEvent) => {
       ctx.setOpen(true)
       children.props.onMouseEnter?.(e)
     },
-    onMouseLeave: (e: any) => {
+    onMouseLeave: (e: React.MouseEvent) => {
       ctx.setOpen(false)
       children.props.onMouseLeave?.(e)
     },
-    onFocus: (e: any) => {
+    onFocus: (e: React.FocusEvent) => {
       ctx.setOpen(true)
       children.props.onFocus?.(e)
     },
-    onBlur: (e: any) => {
+    onBlur: (e: React.FocusEvent) => {
       ctx.setOpen(false)
       children.props.onBlur?.(e)
     },
@@ -50,24 +59,37 @@ export function TooltipTrigger({
 export function TooltipContent({
   children,
   className,
-  sideOffset = 6,
+  sideOffset = 4,
 }: {
   children: React.ReactNode
   className?: string
   sideOffset?: number
 }) {
   const ctx = React.useContext(TooltipContext)
+  const [position, setPosition] = React.useState({ top: 0, left: 0 })
+
+  React.useLayoutEffect(() => {
+    if (ctx?.open && ctx.triggerRef.current) {
+      const rect = ctx.triggerRef.current.getBoundingClientRect()
+      setPosition({
+        top: rect.bottom + sideOffset,
+        left: rect.left,
+      })
+    }
+  }, [ctx?.open, sideOffset])
+
   if (!ctx?.open) return null
-  // Render in place (no portal) for simplicity.
-  return (
-    <span
+
+  return createPortal(
+    <div
       className={cn(
-        'absolute z-50 rounded-md border border-border bg-card px-2 py-1 text-xs shadow-md',
-        className,
+        'fixed z-50 rounded-md border border-border bg-popover px-2 py-1 text-xs text-popover-foreground shadow-md animate-in fade-in-0 zoom-in-95',
+        className
       )}
-      style={{ marginTop: sideOffset }}
+      style={{ top: position.top, left: position.left }}
     >
       {children}
-    </span>
+    </div>,
+    document.body
   )
 }
