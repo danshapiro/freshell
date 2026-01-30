@@ -1,5 +1,5 @@
 import type { Request, Response, NextFunction } from 'express'
-import { logger } from './logger'
+import { logger } from './logger.js'
 
 const DEFAULT_BAD_TOKENS = new Set(['changeme', 'default', 'password', 'token'])
 
