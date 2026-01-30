@@ -510,4 +510,39 @@ describe('tabsSlice', () => {
       expect(state.activeTabId).toBe(activeId)
     })
   })
+
+  describe('lastInputAt tracking', () => {
+    it('initializes lastInputAt to undefined on new tab', () => {
+      const state = tabsReducer(initialState, addTab({ title: 'Test Tab' }))
+
+      const tab = state.tabs[0]
+      expect(Object.prototype.hasOwnProperty.call(tab, 'lastInputAt')).toBe(true)
+      expect(tab.lastInputAt).toBeUndefined()
+    })
+
+    it('can update lastInputAt via updateTab', () => {
+      let state = tabsReducer(initialState, addTab({ title: 'Test Tab' }))
+      const tabId = state.tabs[0].id
+      const timestamp = Date.now()
+
+      state = tabsReducer(
+        state,
+        updateTab({
+          id: tabId,
+          updates: { lastInputAt: timestamp },
+        })
+      )
+
+      const tab = state.tabs[0]
+      expect(tab.lastInputAt).toBe(timestamp)
+    })
+
+    it('preserves lastInputAt when loading tabs from localStorage without the field', () => {
+      const state = tabsReducer(initialState, addTab({ title: 'Test Tab' }))
+
+      const tab = state.tabs[0]
+      expect(Object.prototype.hasOwnProperty.call(tab, 'lastInputAt')).toBe(true)
+      expect(tab.lastInputAt).toBeUndefined()
+    })
+  })
 })

@@ -27,6 +27,7 @@ export interface Tab {
   resumeSessionId?: string
   createdAt: number
   titleSetByUser?: boolean     // If true, don't auto-update title
+  lastInputAt?: number
 }
 
 export interface BackgroundTerminal {

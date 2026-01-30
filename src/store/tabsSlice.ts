@@ -37,6 +37,7 @@ function loadInitialTabsState(): TabsState {
         status: t.status || 'creating',
         mode: t.mode || 'shell',
         shell: t.shell || 'system',
+        lastInputAt: t.lastInputAt,
       })),
       activeTabId: tabsState.activeTabId || (tabsState.tabs[0]?.id ?? null),
     }
@@ -90,6 +91,7 @@ export const tabsSlice = createSlice({
         initialCwd: payload.initialCwd ?? DEFAULT_CWD,
         resumeSessionId: payload.resumeSessionId,
         createdAt: Date.now(),
+        lastInputAt: undefined,
       }
       state.tabs.push(tab)
       state.activeTabId = id
