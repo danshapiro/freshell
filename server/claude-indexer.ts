@@ -195,7 +195,7 @@ export class ClaudeSessionIndexer {
   async start() {
     // Initial scan (populates knownSessionIds with existing sessions)
     await this.refresh()
-    // Now enable onNewSession handlers for subsequently detected sessions
+    // Now enable onNewSession handlers for new sessions detected after startup
     this.initialized = true
 
     const projectsDir = path.join(this.claudeHome, 'projects')
