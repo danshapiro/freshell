@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, act, cleanup, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import SettingsView from '@/components/SettingsView'
@@ -99,20 +99,46 @@ describe('SettingsView Component', () => {
       const store = createTestStore()
       renderWithStore(store)
 
+      expect(screen.getByText('Terminal preview')).toBeInTheDocument()
+
       expect(screen.getByText('Appearance')).toBeInTheDocument()
       expect(screen.getByText('Theme and visual preferences')).toBeInTheDocument()
 
-      expect(screen.getByText('Sidebar')).toBeInTheDocument()
-      expect(screen.getByText('Session list and navigation')).toBeInTheDocument()
-
       expect(screen.getByText('Terminal')).toBeInTheDocument()
       expect(screen.getByText('Font and rendering options')).toBeInTheDocument()
+
+      expect(screen.getByText('Sidebar')).toBeInTheDocument()
+      expect(screen.getByText('Session list and navigation')).toBeInTheDocument()
 
       expect(screen.getByText('Safety')).toBeInTheDocument()
       expect(screen.getByText('Auto-kill and idle terminal management')).toBeInTheDocument()
 
       expect(screen.getByText('Keyboard shortcuts')).toBeInTheDocument()
       expect(screen.getByText('Quick navigation')).toBeInTheDocument()
+    })
+
+    it('renders a terminal preview above Appearance', () => {
+      const store = createTestStore()
+      renderWithStore(store)
+
+      const preview = screen.getByTestId('terminal-preview')
+      const appearanceHeading = screen.getByText('Appearance')
+
+      expect(preview).toBeInTheDocument()
+      expect(preview.compareDocumentPosition(appearanceHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+
+      const previewLines = within(preview).getAllByTestId('terminal-preview-line')
+      expect(previewLines).toHaveLength(8)
+    })
+
+    it('orders Terminal section above Sidebar', () => {
+      const store = createTestStore()
+      renderWithStore(store)
+
+      const terminalHeading = screen.getByText('Terminal')
+      const sidebarHeading = screen.getByText('Sidebar')
+
+      expect(terminalHeading.compareDocumentPosition(sidebarHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     })
 
     it('renders all setting labels', () => {
@@ -639,16 +665,9 @@ describe('SettingsView Component', () => {
       })
       renderWithStore(store)
 
-      // Find toggle buttons - they have a specific structure (w-9 h-5 rounded-full)
-      const allButtons = screen.getAllByRole('button')
-      const toggleButtons = allButtons.filter((btn) => {
-        const classes = btn.className
-        return classes.includes('w-9') && classes.includes('h-5') && classes.includes('rounded-full')
-      })
-
-      // First toggle should be for "Show project badges"
-      expect(toggleButtons.length).toBeGreaterThan(0)
-      const showBadgesToggle = toggleButtons[0]
+      const showBadgesRow = screen.getByText('Show project badges').closest('div')
+      expect(showBadgesRow).toBeTruthy()
+      const showBadgesToggle = within(showBadgesRow!).getByRole('button')
       fireEvent.click(showBadgesToggle)
 
       expect(store.getState().settings.settings.sidebar.showProjectBadges).toBe(false)
@@ -663,15 +682,9 @@ describe('SettingsView Component', () => {
       })
       renderWithStore(store)
 
-      const allButtons = screen.getAllByRole('button')
-      const toggleButtons = allButtons.filter((btn) => {
-        const classes = btn.className
-        return classes.includes('w-9') && classes.includes('h-5') && classes.includes('rounded-full')
-      })
-
-      // Second toggle should be for cursor blink
-      expect(toggleButtons.length).toBeGreaterThan(1)
-      const cursorBlinkToggle = toggleButtons[1]
+      const cursorBlinkRow = screen.getByText('Cursor blink').closest('div')
+      expect(cursorBlinkRow).toBeTruthy()
+      const cursorBlinkToggle = within(cursorBlinkRow!).getByRole('button')
       fireEvent.click(cursorBlinkToggle)
 
       expect(store.getState().settings.settings.terminal.cursorBlink).toBe(false)

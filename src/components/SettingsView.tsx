@@ -3,7 +3,7 @@ import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updateSettingsLocal, markSaved } from '@/store/settingsSlice'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import { terminalThemes, darkThemes, lightThemes } from '@/lib/terminal-themes'
+import { terminalThemes, darkThemes, lightThemes, getTerminalTheme } from '@/lib/terminal-themes'
 import type { SidebarSortMode, TerminalTheme } from '@/store/types'
 
 /** Monospace fonts with good Unicode block element support for terminal use */
@@ -21,6 +21,112 @@ const terminalFonts = [
   { value: 'monospace', label: 'System monospace' },
 ]
 
+type PreviewTokenKind =
+  | 'comment'
+  | 'keyword'
+  | 'type'
+  | 'function'
+  | 'string'
+  | 'number'
+  | 'boolean'
+  | 'null'
+  | 'property'
+  | 'operator'
+  | 'punctuation'
+  | 'variable'
+
+type PreviewToken = {
+  text: string
+  kind?: PreviewTokenKind
+}
+
+const terminalPreviewWidth = 40
+const terminalPreviewHeight = 8
+
+const terminalPreviewLines: PreviewToken[][] = [
+  [{ text: '// terminal preview: syntax demo', kind: 'comment' }],
+  [
+    { text: 'const ', kind: 'keyword' },
+    { text: 'answer', kind: 'variable' },
+    { text: ': ', kind: 'punctuation' },
+    { text: 'number', kind: 'type' },
+    { text: ' = ', kind: 'operator' },
+    { text: '42', kind: 'number' },
+  ],
+  [
+    { text: 'type ', kind: 'keyword' },
+    { text: 'User', kind: 'type' },
+    { text: ' = ', kind: 'operator' },
+    { text: '{ ', kind: 'punctuation' },
+    { text: 'id', kind: 'property' },
+    { text: ': ', kind: 'punctuation' },
+    { text: 'number', kind: 'type' },
+    { text: ' }', kind: 'punctuation' },
+  ],
+  [
+    { text: 'const ', kind: 'keyword' },
+    { text: 'user', kind: 'variable' },
+    { text: ': ', kind: 'punctuation' },
+    { text: 'User', kind: 'type' },
+    { text: ' = ', kind: 'operator' },
+    { text: '{ ', kind: 'punctuation' },
+    { text: 'id', kind: 'property' },
+    { text: ': ', kind: 'punctuation' },
+    { text: '7', kind: 'number' },
+    { text: ' }', kind: 'punctuation' },
+  ],
+  [
+    { text: 'function ', kind: 'keyword' },
+    { text: 'greet', kind: 'function' },
+    { text: '(', kind: 'punctuation' },
+    { text: 'name', kind: 'variable' },
+    { text: ': ', kind: 'punctuation' },
+    { text: 'string', kind: 'type' },
+    { text: ') {', kind: 'punctuation' },
+  ],
+  [
+    { text: '  ', kind: 'punctuation' },
+    { text: 'return ', kind: 'keyword' },
+    { text: '"hi, "', kind: 'string' },
+    { text: ' + ', kind: 'operator' },
+    { text: 'name', kind: 'variable' },
+  ],
+  [
+    { text: '}', kind: 'punctuation' },
+    { text: ' ', kind: 'punctuation' },
+    { text: '// end', kind: 'comment' },
+  ],
+  [
+    { text: 'const ', kind: 'keyword' },
+    { text: 'ok', kind: 'variable' },
+    { text: ' = ', kind: 'operator' },
+    { text: 'true', kind: 'boolean' },
+    { text: ' && ', kind: 'operator' },
+    { text: 'null', kind: 'null' },
+    { text: ' === ', kind: 'operator' },
+    { text: '0', kind: 'number' },
+  ],
+].map((tokens) => normalizePreviewLine(tokens, terminalPreviewWidth))
+
+function normalizePreviewLine(tokens: PreviewToken[], width: number): PreviewToken[] {
+  let remaining = width
+  const normalized: PreviewToken[] = []
+
+  for (const token of tokens) {
+    if (remaining <= 0) break
+    const text = token.text.slice(0, remaining)
+    if (!text.length) continue
+    normalized.push({ ...token, text })
+    remaining -= text.length
+  }
+
+  if (remaining > 0) {
+    normalized.push({ text: ' '.repeat(remaining) })
+  }
+
+  return normalized
+}
+
 export default function SettingsView() {
   const dispatch = useAppDispatch()
   const settings = useAppSelector((s) => s.settings.settings)
@@ -30,6 +136,27 @@ export default function SettingsView() {
   const [fontsReady, setFontsReady] = useState(false)
 
   const pendingRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const previewTheme = useMemo(
+    () => getTerminalTheme(settings.terminal.theme, settings.theme),
+    [settings.terminal.theme, settings.theme],
+  )
+  const previewColors = useMemo(
+    () => ({
+      comment: previewTheme.brightBlack ?? previewTheme.foreground ?? '#c0c0c0',
+      keyword: previewTheme.blue ?? previewTheme.foreground ?? '#7aa2f7',
+      type: previewTheme.magenta ?? previewTheme.foreground ?? '#bb9af7',
+      function: previewTheme.cyan ?? previewTheme.foreground ?? '#7dcfff',
+      string: previewTheme.green ?? previewTheme.foreground ?? '#9ece6a',
+      number: previewTheme.yellow ?? previewTheme.foreground ?? '#e0af68',
+      boolean: previewTheme.magenta ?? previewTheme.foreground ?? '#bb9af7',
+      null: previewTheme.red ?? previewTheme.foreground ?? '#f7768e',
+      property: previewTheme.cyan ?? previewTheme.foreground ?? '#7dcfff',
+      operator: previewTheme.foreground ?? '#c0c0c0',
+      punctuation: previewTheme.foreground ?? '#c0c0c0',
+      variable: previewTheme.foreground ?? '#c0c0c0',
+    }),
+    [previewTheme],
+  )
 
   const patch = useMemo(
     () => async (updates: any) => {
@@ -166,6 +293,43 @@ export default function SettingsView() {
       <div className="flex-1 overflow-y-auto">
         <div className="max-w-2xl mx-auto px-6 py-6 space-y-8">
 
+          {/* Terminal preview */}
+          <div className="space-y-2" data-testid="terminal-preview">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-medium">Terminal preview</h2>
+              <span className="text-xs text-muted-foreground">40×8</span>
+            </div>
+            <div
+              aria-label="Terminal preview"
+              className="rounded-md border border-border/40 shadow-sm overflow-hidden font-mono"
+              style={{
+                width: '40ch',
+                height: `${terminalPreviewHeight * settings.terminal.lineHeight}em`,
+                fontFamily: settings.terminal.fontFamily,
+                fontSize: `${settings.terminal.fontSize}px`,
+                lineHeight: settings.terminal.lineHeight,
+                backgroundColor: previewTheme.background,
+                color: previewTheme.foreground,
+                whiteSpace: 'pre',
+              }}
+            >
+              {terminalPreviewLines.map((line, lineIndex) => (
+                <div key={lineIndex} data-testid="terminal-preview-line">
+                  {line.map((token, tokenIndex) => (
+                    <span
+                      key={`${lineIndex}-${tokenIndex}`}
+                      style={{
+                        color: token.kind ? previewColors[token.kind] : previewTheme.foreground,
+                      }}
+                    >
+                      {token.text}
+                    </span>
+                  ))}
+                </div>
+              ))}
+            </div>
+          </div>
+
           {/* Appearance */}
           <SettingsSection title="Appearance" description="Theme and visual preferences">
             <SettingsRow label="Theme">
@@ -198,36 +362,6 @@ export default function SettingsView() {
               />
             </SettingsRow>
 
-          </SettingsSection>
-
-          {/* Sidebar */}
-          <SettingsSection title="Sidebar" description="Session list and navigation">
-            <SettingsRow label="Sort mode">
-              <select
-                value={settings.sidebar?.sortMode || 'hybrid'}
-                onChange={(e) => {
-                  const v = e.target.value as SidebarSortMode
-                  dispatch(updateSettingsLocal({ sidebar: { sortMode: v } } as any))
-                  scheduleSave({ sidebar: { sortMode: v } })
-                }}
-                className="h-8 px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border"
-              >
-                <option value="hybrid">Hybrid (running first)</option>
-                <option value="recency">Recency</option>
-                <option value="activity">Activity</option>
-                <option value="project">Project</option>
-              </select>
-            </SettingsRow>
-
-            <SettingsRow label="Show project badges">
-              <Toggle
-                checked={settings.sidebar?.showProjectBadges ?? true}
-                onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ sidebar: { showProjectBadges: checked } } as any))
-                  scheduleSave({ sidebar: { showProjectBadges: checked } })
-                }}
-              />
-            </SettingsRow>
           </SettingsSection>
 
           {/* Terminal */}
@@ -323,6 +457,36 @@ export default function SettingsView() {
                   <option key={font.value} value={font.value}>{font.label}</option>
                 ))}
               </select>
+            </SettingsRow>
+          </SettingsSection>
+
+          {/* Sidebar */}
+          <SettingsSection title="Sidebar" description="Session list and navigation">
+            <SettingsRow label="Sort mode">
+              <select
+                value={settings.sidebar?.sortMode || 'hybrid'}
+                onChange={(e) => {
+                  const v = e.target.value as SidebarSortMode
+                  dispatch(updateSettingsLocal({ sidebar: { sortMode: v } } as any))
+                  scheduleSave({ sidebar: { sortMode: v } })
+                }}
+                className="h-8 px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border"
+              >
+                <option value="hybrid">Hybrid (running first)</option>
+                <option value="recency">Recency</option>
+                <option value="activity">Activity</option>
+                <option value="project">Project</option>
+              </select>
+            </SettingsRow>
+
+            <SettingsRow label="Show project badges">
+              <Toggle
+                checked={settings.sidebar?.showProjectBadges ?? true}
+                onChange={(checked) => {
+                  dispatch(updateSettingsLocal({ sidebar: { showProjectBadges: checked } } as any))
+                  scheduleSave({ sidebar: { showProjectBadges: checked } })
+                }}
+              />
             </SettingsRow>
           </SettingsSection>
 
