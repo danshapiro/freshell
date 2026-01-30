@@ -1443,4 +1443,53 @@ describe('panesSlice', () => {
       expect(result.paneTitles['tab-1']['pane-2']).toBe('Other Pane')
     })
   })
+
+  describe('splitPane title initialization', () => {
+    it('initializes title for new pane using derivePaneTitle', () => {
+      const leaf: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: { kind: 'terminal', createRequestId: 'req-1', status: 'running', mode: 'shell' },
+      }
+      const state: PanesState = {
+        layouts: { 'tab-1': leaf },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+      }
+
+      const result = panesReducer(state, splitPane({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        direction: 'horizontal',
+        newContent: { kind: 'terminal', mode: 'claude' },
+      }))
+
+      // Find the new pane ID (it's the active pane after split)
+      const newPaneId = result.activePane['tab-1']
+      expect(result.paneTitles['tab-1'][newPaneId]).toBe('Claude')
+    })
+  })
+
+  describe('addPane title initialization', () => {
+    it('initializes title for new pane using derivePaneTitle', () => {
+      const leaf: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: { kind: 'terminal', createRequestId: 'req-1', status: 'running', mode: 'shell' },
+      }
+      const state: PanesState = {
+        layouts: { 'tab-1': leaf },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+      }
+
+      const result = panesReducer(state, addPane({
+        tabId: 'tab-1',
+        newContent: { kind: 'terminal', mode: 'codex' },
+      }))
+
+      const newPaneId = result.activePane['tab-1']
+      expect(result.paneTitles['tab-1'][newPaneId]).toBe('Codex')
+    })
+  })
 })

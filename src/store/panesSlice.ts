@@ -1,6 +1,7 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import { nanoid } from 'nanoid'
 import type { PanesState, PaneContent, PaneContentInput, PaneNode } from './paneTypes'
+import { derivePaneTitle } from '@/lib/derivePaneTitle'
 
 /**
  * Normalize terminal input to full PaneContent with defaults.
@@ -219,6 +220,13 @@ export const panesSlice = createSlice({
       if (newRoot) {
         state.layouts[tabId] = newRoot
         state.activePane[tabId] = newPaneId
+
+        // Initialize title for new pane
+        const normalizedContent = normalizeContent(newContent)
+        if (!state.paneTitles[tabId]) {
+          state.paneTitles[tabId] = {}
+        }
+        state.paneTitles[tabId][newPaneId] = derivePaneTitle(normalizedContent)
       }
     },
 
@@ -257,6 +265,12 @@ export const panesSlice = createSlice({
       const allLeaves = [...existingLeaves, newLeaf]
       state.layouts[tabId] = buildGridLayout(allLeaves)
       state.activePane[tabId] = newPaneId
+
+      // Initialize title for new pane
+      if (!state.paneTitles[tabId]) {
+        state.paneTitles[tabId] = {}
+      }
+      state.paneTitles[tabId][newPaneId] = derivePaneTitle(newLeaf.content)
     },
 
     closePane: (
