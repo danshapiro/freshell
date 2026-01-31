@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Terminal, Globe, FileText } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { useAppSelector } from '@/store/hooks'
 
-type PaneType = 'shell' | 'browser' | 'editor'
+type PaneType = 'shell' | 'cmd' | 'powershell' | 'wsl' | 'browser' | 'editor'
 
 interface PickerOption {
   type: PaneType
@@ -11,11 +12,23 @@ interface PickerOption {
   shortcut: string
 }
 
-const options: PickerOption[] = [
-  { type: 'shell', label: 'Shell', icon: Terminal, shortcut: 'S' },
+const shellOption: PickerOption = { type: 'shell', label: 'Shell', icon: Terminal, shortcut: 'S' }
+
+const windowsShellOptions: PickerOption[] = [
+  { type: 'cmd', label: 'CMD', icon: Terminal, shortcut: 'C' },
+  { type: 'powershell', label: 'PowerShell', icon: Terminal, shortcut: 'P' },
+  { type: 'wsl', label: 'WSL', icon: Terminal, shortcut: 'W' },
+]
+
+const nonShellOptions: PickerOption[] = [
   { type: 'browser', label: 'Browser', icon: Globe, shortcut: 'B' },
   { type: 'editor', label: 'Editor', icon: FileText, shortcut: 'E' },
 ]
+
+function getOptions(platform: string | null): PickerOption[] {
+  const shellOptions = platform === 'win32' ? windowsShellOptions : [shellOption]
+  return [...shellOptions, ...nonShellOptions]
+}
 
 interface PanePickerProps {
   onSelect: (type: PaneType) => void
@@ -24,6 +37,9 @@ interface PanePickerProps {
 }
 
 export default function PanePicker({ onSelect, onCancel, isOnlyPane }: PanePickerProps) {
+  const platform = useAppSelector((s) => s.connection.platform)
+  const options = getOptions(platform)
+
   const [focusedIndex, setFocusedIndex] = useState<number | null>(null)
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null)
   const [fading, setFading] = useState(false)
@@ -66,7 +82,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane }: PanePicke
 
     document.addEventListener('keydown', handleKeyDown)
     return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [handleSelect, onCancel, isOnlyPane])
+  }, [handleSelect, onCancel, isOnlyPane, options])
 
   const handleArrowNav = useCallback((e: React.KeyboardEvent, currentIndex: number) => {
     let nextIndex: number | null = null
@@ -93,7 +109,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane }: PanePicke
       setFocusedIndex(nextIndex)
       buttonRefs.current[nextIndex]?.focus()
     }
-  }, [handleSelect])
+  }, [handleSelect, options])
 
   const showHint = (index: number) => focusedIndex === index || hoveredIndex === index
 

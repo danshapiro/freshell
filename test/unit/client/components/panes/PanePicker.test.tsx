@@ -15,6 +15,14 @@ vi.mock('lucide-react', () => ({
   ),
 }))
 
+// Mock redux hooks
+vi.mock('@/store/hooks', () => ({
+  useAppSelector: vi.fn(),
+}))
+
+import { useAppSelector } from '@/store/hooks'
+const mockUseAppSelector = vi.mocked(useAppSelector)
+
 describe('PanePicker', () => {
   let onSelect: ReturnType<typeof vi.fn>
   let onCancel: ReturnType<typeof vi.fn>
@@ -22,6 +30,7 @@ describe('PanePicker', () => {
   beforeEach(() => {
     onSelect = vi.fn()
     onCancel = vi.fn()
+    mockUseAppSelector.mockReturnValue(null) // Default: unknown platform
   })
 
   afterEach(() => {
@@ -29,8 +38,9 @@ describe('PanePicker', () => {
   })
 
   // Helper to get the container div that handles transition
+  // Uses 'Browser' text which is always present regardless of platform
   const getContainer = () => {
-    return screen.getByText('Shell').closest('button')!.parentElement!.parentElement!
+    return screen.getByText('Browser').closest('button')!.parentElement!.parentElement!
   }
 
   // Helper to complete the fade animation
@@ -150,6 +160,89 @@ describe('PanePicker', () => {
       fireEvent.mouseLeave(shellButton)
       const hint = screen.getByText('S', { selector: '.shortcut-hint' })
       expect(hint).toHaveClass('opacity-0')
+    })
+  })
+
+  describe('platform-specific shell options', () => {
+    it('shows single Shell option on non-Windows platforms', () => {
+      mockUseAppSelector.mockReturnValue('darwin')
+      render(<PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={false} />)
+
+      expect(screen.getByText('Shell')).toBeInTheDocument()
+      expect(screen.queryByText('CMD')).not.toBeInTheDocument()
+      expect(screen.queryByText('PowerShell')).not.toBeInTheDocument()
+      expect(screen.queryByText('WSL')).not.toBeInTheDocument()
+    })
+
+    it('shows CMD, PowerShell, WSL options on Windows', () => {
+      mockUseAppSelector.mockReturnValue('win32')
+      render(<PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={false} />)
+
+      expect(screen.getByText('CMD')).toBeInTheDocument()
+      expect(screen.getByText('PowerShell')).toBeInTheDocument()
+      expect(screen.getByText('WSL')).toBeInTheDocument()
+      expect(screen.queryByText('Shell')).not.toBeInTheDocument()
+    })
+
+    it('calls onSelect with cmd when CMD clicked on Windows', () => {
+      mockUseAppSelector.mockReturnValue('win32')
+      render(<PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={false} />)
+
+      fireEvent.click(screen.getByText('CMD'))
+      completeFadeAnimation()
+      expect(onSelect).toHaveBeenCalledWith('cmd')
+    })
+
+    it('calls onSelect with powershell when PowerShell clicked', () => {
+      mockUseAppSelector.mockReturnValue('win32')
+      render(<PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={false} />)
+
+      fireEvent.click(screen.getByText('PowerShell'))
+      completeFadeAnimation()
+      expect(onSelect).toHaveBeenCalledWith('powershell')
+    })
+
+    it('calls onSelect with wsl when WSL clicked', () => {
+      mockUseAppSelector.mockReturnValue('win32')
+      render(<PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={false} />)
+
+      fireEvent.click(screen.getByText('WSL'))
+      completeFadeAnimation()
+      expect(onSelect).toHaveBeenCalledWith('wsl')
+    })
+
+    it('uses C shortcut for CMD on Windows', () => {
+      mockUseAppSelector.mockReturnValue('win32')
+      render(<PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={false} />)
+
+      fireEvent.keyDown(document, { key: 'c' })
+      completeFadeAnimation()
+      expect(onSelect).toHaveBeenCalledWith('cmd')
+    })
+
+    it('uses P shortcut for PowerShell on Windows', () => {
+      mockUseAppSelector.mockReturnValue('win32')
+      render(<PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={false} />)
+
+      fireEvent.keyDown(document, { key: 'p' })
+      completeFadeAnimation()
+      expect(onSelect).toHaveBeenCalledWith('powershell')
+    })
+
+    it('uses W shortcut for WSL on Windows', () => {
+      mockUseAppSelector.mockReturnValue('win32')
+      render(<PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={false} />)
+
+      fireEvent.keyDown(document, { key: 'w' })
+      completeFadeAnimation()
+      expect(onSelect).toHaveBeenCalledWith('wsl')
+    })
+
+    it('falls back to Shell option when platform is null', () => {
+      mockUseAppSelector.mockReturnValue(null)
+      render(<PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={false} />)
+
+      expect(screen.getByText('Shell')).toBeInTheDocument()
     })
   })
 })

@@ -121,6 +121,10 @@ async function main() {
     res.json({ ips: detectLanIps() })
   })
 
+  app.get('/api/platform', (_req, res) => {
+    res.json({ platform: process.platform })
+  })
+
   app.patch('/api/settings', async (req, res) => {
     const patch = migrateSettingsSortMode(req.body || {}) as any
     const updated = await configStore.patchSettings(patch)

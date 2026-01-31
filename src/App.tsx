@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { setStatus, setError } from '@/store/connectionSlice'
+import { setStatus, setError, setPlatform } from '@/store/connectionSlice'
 import { setSettings } from '@/store/settingsSlice'
 import { setProjects } from '@/store/sessionsSlice'
 import { addTab, removeTab } from '@/store/tabsSlice'
@@ -162,6 +162,13 @@ export default function App() {
         if (!cancelled) dispatch(setSettings(settings))
       } catch (err: any) {
         console.warn('Failed to load settings', err)
+      }
+
+      try {
+        const platformInfo = await api.get<{ platform: string }>('/api/platform')
+        if (!cancelled) dispatch(setPlatform(platformInfo.platform))
+      } catch (err: any) {
+        console.warn('Failed to load platform info', err)
       }
 
       try {

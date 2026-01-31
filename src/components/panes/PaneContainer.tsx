@@ -128,7 +128,7 @@ function PickerWrapper({
 }) {
   const dispatch = useAppDispatch()
 
-  const handleSelect = useCallback((type: 'shell' | 'browser' | 'editor') => {
+  const handleSelect = useCallback((type: 'shell' | 'cmd' | 'powershell' | 'wsl' | 'browser' | 'editor') => {
     let newContent: PaneContent
 
     switch (type) {
@@ -137,6 +137,33 @@ function PickerWrapper({
           kind: 'terminal',
           mode: 'shell',
           shell: 'system',
+          createRequestId: nanoid(),
+          status: 'creating',
+        }
+        break
+      case 'cmd':
+        newContent = {
+          kind: 'terminal',
+          mode: 'shell',
+          shell: 'cmd',
+          createRequestId: nanoid(),
+          status: 'creating',
+        }
+        break
+      case 'powershell':
+        newContent = {
+          kind: 'terminal',
+          mode: 'shell',
+          shell: 'powershell',
+          createRequestId: nanoid(),
+          status: 'creating',
+        }
+        break
+      case 'wsl':
+        newContent = {
+          kind: 'terminal',
+          mode: 'shell',
+          shell: 'wsl',
           createRequestId: nanoid(),
           status: 'creating',
         }
