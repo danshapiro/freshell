@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import type { ProjectGroup, ClaudeSession } from './claude-indexer.js'
 
 export const SearchTier = {
   Title: 'title',
@@ -45,3 +46,35 @@ export const SearchResponseSchema = z.object({
 })
 
 export type SearchResponse = z.infer<typeof SearchResponseSchema>
+
+export function searchTitleTier(
+  projects: ProjectGroup[],
+  query: string,
+  limit = 50
+): SearchResult[] {
+  const q = query.toLowerCase()
+  const results: SearchResult[] = []
+
+  for (const project of projects) {
+    for (const session of project.sessions) {
+      const titleMatch = session.title?.toLowerCase().includes(q)
+      const summaryMatch = session.summary?.toLowerCase().includes(q)
+
+      if (titleMatch || summaryMatch) {
+        results.push({
+          sessionId: session.sessionId,
+          projectPath: session.projectPath,
+          title: session.title,
+          summary: session.summary,
+          matchedIn: titleMatch ? 'title' : 'summary',
+          snippet: titleMatch ? session.title : session.summary,
+          updatedAt: session.updatedAt,
+          cwd: session.cwd,
+        })
+      }
+    }
+  }
+
+  results.sort((a, b) => b.updatedAt - a.updatedAt)
+  return results.slice(0, limit)
+}
