@@ -23,7 +23,17 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
   // Build default content based on setting
   let defaultContent: PaneContentInput
 
-  if (defaultNewPane === 'ask') {
+  // If tab already has a terminalId (e.g., restored from persistence), use that
+  if (tab.terminalId) {
+    defaultContent = {
+      kind: 'terminal',
+      mode: tab.mode,
+      shell: tab.shell,
+      resumeSessionId: tab.resumeSessionId,
+      initialCwd: tab.initialCwd,
+      terminalId: tab.terminalId,
+    }
+  } else if (defaultNewPane === 'ask') {
     defaultContent = { kind: 'picker' }
   } else if (defaultNewPane === 'browser') {
     defaultContent = { kind: 'browser', url: '', devToolsOpen: false }

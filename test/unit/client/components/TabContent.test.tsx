@@ -22,7 +22,24 @@ vi.mock('@/components/ClaudeSessionView', () => ({
   default: () => <div data-testid="claude-session-view" />,
 }))
 
-function createStore(tabs: Array<{ id: string; mode: string; terminalId?: string }>) {
+interface TabConfig {
+  id: string
+  mode: string
+  terminalId?: string
+}
+
+interface StoreOptions {
+  defaultNewPane?: 'ask' | 'shell' | 'browser' | 'editor'
+}
+
+function createStore(tabs: TabConfig[], options: StoreOptions = {}) {
+  const settings = {
+    ...defaultSettings,
+    panes: {
+      ...defaultSettings.panes,
+      defaultNewPane: options.defaultNewPane || 'ask',
+    },
+  }
   return configureStore({
     reducer: {
       tabs: tabsReducer,
@@ -46,7 +63,7 @@ function createStore(tabs: Array<{ id: string; mode: string; terminalId?: string
         activePane: {},
       },
       settings: {
-        settings: defaultSettings,
+        settings,
         status: 'loaded' as const,
       },
     },
@@ -82,8 +99,8 @@ describe('TabContent', () => {
       )
     })
 
-    it('passes undefined terminalId when tab has no terminalId', () => {
-      const store = createStore([{ id: 'tab-1', mode: 'shell' }])
+    it('shows picker when tab has no terminalId and defaultNewPane is ask', () => {
+      const store = createStore([{ id: 'tab-1', mode: 'shell' }], { defaultNewPane: 'ask' })
 
       render(
         <Provider store={store}>
@@ -94,6 +111,26 @@ describe('TabContent', () => {
       expect(mockPaneLayout).toHaveBeenCalledWith(
         expect.objectContaining({
           defaultContent: expect.objectContaining({
+            kind: 'picker',
+          }),
+        }),
+        expect.anything()
+      )
+    })
+
+    it('passes undefined terminalId when tab has no terminalId and defaultNewPane is shell', () => {
+      const store = createStore([{ id: 'tab-1', mode: 'shell' }], { defaultNewPane: 'shell' })
+
+      render(
+        <Provider store={store}>
+          <TabContent tabId="tab-1" />
+        </Provider>
+      )
+
+      expect(mockPaneLayout).toHaveBeenCalledWith(
+        expect.objectContaining({
+          defaultContent: expect.objectContaining({
+            kind: 'terminal',
             terminalId: undefined,
           }),
         }),
