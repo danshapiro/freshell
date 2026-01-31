@@ -10,6 +10,7 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, __dirname, '')
   const backendPort = env.PORT || '3001'
   const backendUrl = `http://localhost:${backendPort}`
+  const vitePort = parseInt(env.VITE_PORT || '5173', 10)
 
   return {
     plugins: [react()],
@@ -25,6 +26,7 @@ export default defineConfig(({ mode }) => {
     },
     server: {
       host: true,
+      port: vitePort,
       watch: {
         ignored: ['**/.worktrees/**'],
       },
