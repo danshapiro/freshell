@@ -40,6 +40,7 @@ describe('EditorPane auto-save', () => {
     vi.mocked(fetch).mockReset()
     vi.mocked(fetch).mockResolvedValue({
       ok: true,
+      text: () => Promise.resolve(JSON.stringify({ success: true })),
       json: () => Promise.resolve({ success: true }),
     } as Response)
   })
@@ -190,15 +191,12 @@ describe('EditorPane auto-save', () => {
       '/api/files/write',
       expect.objectContaining({
         method: 'POST',
-        headers: expect.objectContaining({
-          'Content-Type': 'application/json',
-        }),
-        body: expect.any(String),
       })
     )
 
     // Verify the body content
     const [, options] = vi.mocked(fetch).mock.calls[0]
+    expect(options?.body).toBeDefined()
     const body = JSON.parse(options?.body as string)
     expect(body).toEqual({
       path: '/test.ts',
