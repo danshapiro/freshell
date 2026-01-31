@@ -38,6 +38,9 @@ export type AppSettings = {
     autoKillIdleMinutes: number
     warnBeforeKillMinutes: number
   }
+  panes: {
+    defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor'
+  }
 }
 
 export type SessionOverride = {
@@ -74,6 +77,9 @@ export const defaultSettings: AppSettings = {
   safety: {
     autoKillIdleMinutes: 180,
     warnBeforeKillMinutes: 5,
+  },
+  panes: {
+    defaultNewPane: 'ask',
   },
 }
 
@@ -112,6 +118,7 @@ function mergeSettings(base: AppSettings, patch: Partial<AppSettings>): AppSetti
     ...patch,
     terminal: { ...base.terminal, ...(patch.terminal || {}) },
     safety: { ...base.safety, ...(patch.safety || {}) },
+    panes: { ...base.panes, ...(patch.panes || {}) },
   }
 }
 
