@@ -23,6 +23,9 @@ export const defaultSettings: AppSettings = {
     width: 288,
     collapsed: false,
   },
+  panes: {
+    defaultNewPane: 'ask' as const,
+  },
 }
 
 export function migrateSortMode(mode: string | undefined): SidebarSortMode {
@@ -69,6 +72,7 @@ export const settingsSlice = createSlice({
           ...(action.payload.sidebar || {}),
           sortMode: migrateSortMode(action.payload.sidebar?.sortMode ?? currentSidebar.sortMode),
         },
+        panes: { ...state.settings.panes, ...(action.payload.panes || {}) },
       }
     },
     markSaved: (state) => {
