@@ -27,17 +27,11 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 
 ## Releasing (Only When Explicitly Requested)
 
-**Never release without explicit user approval.** Merging to main does not mean releasing. The README points users to a specific release tag (e.g., `--branch v0.1.0`), so main can contain work-in-progress.
+**Never release without explicit user request.** Main can contain work-in-progress; users clone a specific release tag.
 
-When the user explicitly asks to release:
+**Sanity check first:** If something seems off (discontinuous version like 0.25→2.6, failing tests, broken code), confirm with the user before proceeding.
 
-1. Ensure all tests pass and main is stable
-2. Bump version in `package.json` (if not already done)
-3. Push main: `git push origin main`
-4. Create and push tag: `git tag -a vX.Y.Z -m "vX.Y.Z - Description" && git push origin vX.Y.Z`
-5. Create GitHub release: `gh release create vX.Y.Z --title "vX.Y.Z - Title" --notes "Release notes"`
-6. Update README.md to point to new tag: change `--branch vOLD` to `--branch vX.Y.Z`
-7. Commit and push the README change
+Steps: ensure tests pass → bump `package.json` version → push main → tag and push (`git tag -a vX.Y.Z`) → create GitHub release (`gh release create`) → update README's `--branch` to new tag → commit and push.
 
 ## Codex Agent in CMD Instructions (Codex agents only; only when running in CMD on windows; all other agents must ignore)
 - Prefer bash/WSL over PowerShell; Windows paths map like `D:\...` -> `/mnt/d/...`.
