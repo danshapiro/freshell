@@ -72,6 +72,8 @@ export interface TerminalOverride {
 
 export type SidebarSortMode = 'recency' | 'activity' | 'project'
 
+export type DefaultNewPane = 'ask' | 'shell' | 'browser' | 'editor'
+
 export type TerminalTheme =
   | 'auto'           // Follow app theme (dark/light)
   | 'dracula'
@@ -103,5 +105,8 @@ export interface AppSettings {
     showProjectBadges: boolean
     width: number // pixels, default 288 (equivalent to w-72)
     collapsed: boolean // for mobile/responsive use
+  }
+  panes: {
+    defaultNewPane: DefaultNewPane
   }
 }
