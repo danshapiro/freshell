@@ -358,7 +358,7 @@ async function main() {
     const url = `http://${lanIp}:${port}/?token=${token}`
 
     console.log('')
-    console.log(`\x1b[32m\u{1F41A} freshell is ready!\x1b[0m`)
+    console.log(`\x1b[32m\u{1F41A}\u{1F525} freshell is ready!\x1b[0m`)
     console.log(`   Visit from anywhere on your network: \x1b[36m${url}\x1b[0m`)
     console.log('')
   })
