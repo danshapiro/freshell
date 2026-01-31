@@ -4,7 +4,7 @@
  * This module runs synchronously on import, BEFORE dotenv/config loads,
  * to ensure that a valid .env file exists with AUTH_TOKEN and other defaults.
  *
- * Usage: import './bootstrap' as the first import in server/index.ts
+ * Usage: import './bootstrap.js' as the first import in server/index.ts
  */
 
 import crypto from 'crypto'
