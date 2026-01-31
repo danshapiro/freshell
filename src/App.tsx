@@ -7,6 +7,8 @@ import { addTab, removeTab } from '@/store/tabsSlice'
 import { api } from '@/lib/api'
 import { buildShareUrl } from '@/lib/utils'
 import { getWsClient } from '@/lib/ws-client'
+import { getSessionsForHello } from '@/lib/session-utils'
+import { store } from '@/store/store'
 import { useThemeEffect } from '@/hooks/useTheme'
 import Sidebar, { AppView } from '@/components/Sidebar'
 import TabBar from '@/components/TabBar'
@@ -170,6 +172,12 @@ export default function App() {
       }
 
       const ws = getWsClient()
+
+      // Set up hello extension to include session IDs for prioritized repair
+      ws.setHelloExtensionProvider(() => ({
+        sessions: getSessionsForHello(store.getState()),
+      }))
+
       dispatch(setError(undefined))
       dispatch(setStatus('connecting'))
       try {
@@ -195,6 +203,16 @@ export default function App() {
           const terminalId = msg.terminalId
           const code = msg.exitCode
           console.log('terminal exit', terminalId, code)
+        }
+        if (msg.type === 'session.status') {
+          // Log session repair status (silent for healthy/repaired, visible for problems)
+          const { sessionId, status, orphansFixed } = msg
+          if (status === 'missing') {
+            console.warn(`Session ${sessionId.slice(0, 8)}... file is missing`)
+          } else if (status === 'repaired') {
+            console.log(`Session ${sessionId.slice(0, 8)}... repaired (${orphansFixed} orphans fixed)`)
+          }
+          // For 'healthy' status, no logging needed
         }
       })
 

@@ -1,0 +1,21 @@
+{"type":"system","subtype":"init","session_id":"deep-corrupted-id","uuid":"msg-001","timestamp":"2025-01-30T10:00:00.000Z"}
+{"type":"user","message":"Message 1","uuid":"msg-002","parentUuid":"msg-001","timestamp":"2025-01-30T10:00:01.000Z"}
+{"type":"assistant","message":"Response 1","uuid":"msg-003","parentUuid":"msg-002","timestamp":"2025-01-30T10:00:02.000Z"}
+{"type":"user","message":"Message 2","uuid":"msg-004","parentUuid":"msg-003","timestamp":"2025-01-30T10:00:03.000Z"}
+{"type":"assistant","message":"Response 2","uuid":"msg-005","parentUuid":"msg-004","timestamp":"2025-01-30T10:00:04.000Z"}
+{"type":"progress","message":"Working...","uuid":"msg-006","parentUuid":"subagent-missing","timestamp":"2025-01-30T10:00:05.000Z"}
+{"type":"assistant","message":"Response 3","uuid":"msg-007","parentUuid":"msg-006","timestamp":"2025-01-30T10:00:06.000Z"}
+{"type":"user","message":"Message 3","uuid":"msg-008","parentUuid":"msg-007","timestamp":"2025-01-30T10:00:07.000Z"}
+{"type":"assistant","message":"Response 4","uuid":"msg-009","parentUuid":"msg-008","timestamp":"2025-01-30T10:00:08.000Z"}
+{"type":"user","message":"Message 4","uuid":"msg-010","parentUuid":"msg-009","timestamp":"2025-01-30T10:00:09.000Z"}
+{"type":"assistant","message":"Response 5","uuid":"msg-011","parentUuid":"msg-010","timestamp":"2025-01-30T10:00:10.000Z"}
+{"type":"user","message":"Message 5","uuid":"msg-012","parentUuid":"msg-011","timestamp":"2025-01-30T10:00:11.000Z"}
+{"type":"assistant","message":"Response 6","uuid":"msg-013","parentUuid":"msg-012","timestamp":"2025-01-30T10:00:12.000Z"}
+{"type":"user","message":"Message 6","uuid":"msg-014","parentUuid":"msg-013","timestamp":"2025-01-30T10:00:13.000Z"}
+{"type":"assistant","message":"Response 7","uuid":"msg-015","parentUuid":"msg-014","timestamp":"2025-01-30T10:00:14.000Z"}
+{"type":"user","message":"Message 7","uuid":"msg-016","parentUuid":"msg-015","timestamp":"2025-01-30T10:00:15.000Z"}
+{"type":"assistant","message":"Response 8","uuid":"msg-017","parentUuid":"msg-016","timestamp":"2025-01-30T10:00:16.000Z"}
+{"type":"user","message":"Message 8","uuid":"msg-018","parentUuid":"msg-017","timestamp":"2025-01-30T10:00:17.000Z"}
+{"type":"assistant","message":"Response 9","uuid":"msg-019","parentUuid":"msg-018","timestamp":"2025-01-30T10:00:18.000Z"}
+{"type":"user","message":"Message 9","uuid":"msg-020","parentUuid":"msg-019","timestamp":"2025-01-30T10:00:19.000Z"}
+{"type":"assistant","message":"Final response","uuid":"msg-021","parentUuid":"msg-020","timestamp":"2025-01-30T10:00:20.000Z"}

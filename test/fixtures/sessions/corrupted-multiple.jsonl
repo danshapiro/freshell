@@ -1,0 +1,12 @@
+{"type":"system","subtype":"init","session_id":"multiple-corrupted-id","uuid":"msg-001","timestamp":"2025-01-30T10:00:00.000Z"}
+{"type":"user","message":"First request","uuid":"msg-002","parentUuid":"msg-001","timestamp":"2025-01-30T10:00:01.000Z"}
+{"type":"assistant","message":"First response","uuid":"msg-003","parentUuid":"msg-002","timestamp":"2025-01-30T10:00:02.000Z"}
+{"type":"progress","message":"Progress 1","uuid":"msg-004","parentUuid":"missing-parent-1","timestamp":"2025-01-30T10:00:03.000Z"}
+{"type":"assistant","message":"After progress 1","uuid":"msg-005","parentUuid":"msg-004","timestamp":"2025-01-30T10:00:04.000Z"}
+{"type":"user","message":"Second request","uuid":"msg-006","parentUuid":"msg-005","timestamp":"2025-01-30T10:00:05.000Z"}
+{"type":"assistant","message":"Second response","uuid":"msg-007","parentUuid":"msg-006","timestamp":"2025-01-30T10:00:06.000Z"}
+{"type":"progress","message":"Progress 2","uuid":"msg-008","parentUuid":"missing-parent-2","timestamp":"2025-01-30T10:00:07.000Z"}
+{"type":"assistant","message":"After progress 2","uuid":"msg-009","parentUuid":"msg-008","timestamp":"2025-01-30T10:00:08.000Z"}
+{"type":"user","message":"Third request","uuid":"msg-010","parentUuid":"msg-009","timestamp":"2025-01-30T10:00:09.000Z"}
+{"type":"progress","message":"Progress 3","uuid":"msg-011","parentUuid":"missing-parent-3","timestamp":"2025-01-30T10:00:10.000Z"}
+{"type":"assistant","message":"Final response","uuid":"msg-012","parentUuid":"msg-011","timestamp":"2025-01-30T10:00:11.000Z"}

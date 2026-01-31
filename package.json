@@ -34,6 +34,7 @@
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "express-rate-limit": "^7.4.0",
+    "glob": "^13.0.0",
     "lucide-react": "^0.469.0",
     "nanoid": "^5.0.7",
     "node-pty": "^1.0.0",

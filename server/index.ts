@@ -16,6 +16,7 @@ import { claudeSessionManager } from './claude-session.js'
 import { AI_CONFIG, PROMPTS, stripAnsi } from './ai-prompts.js'
 import { migrateSettingsSortMode } from './settings-migrate.js'
 import { filesRouter } from './files-router.js'
+import { getSessionRepairService } from './session-scanner/service.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -86,8 +87,12 @@ async function main() {
   const settings = migrateSettingsSortMode(await configStore.getSettings())
   const registry = new TerminalRegistry(settings)
 
+  // Start session repair service (background scanning of Claude sessions)
+  const sessionRepairService = getSessionRepairService()
+  await sessionRepairService.start()
+
   const server = http.createServer(app)
-  const wsHandler = new WsHandler(server, registry, claudeSessionManager)
+  const wsHandler = new WsHandler(server, registry, claudeSessionManager, sessionRepairService)
 
   // --- API: settings ---
   //
@@ -353,7 +358,10 @@ async function main() {
     // 5. Stop the Claude indexer
     claudeIndexer.stop()
 
-    // 5. Exit cleanly
+    // 6. Stop session repair service
+    await sessionRepairService.stop()
+
+    // 7. Exit cleanly
     logger.info('Shutdown complete')
     process.exit(0)
   }

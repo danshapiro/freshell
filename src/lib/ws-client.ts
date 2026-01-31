@@ -1,6 +1,7 @@
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'ready'
 type MessageHandler = (msg: any) => void
 type ReconnectHandler = () => void
+type HelloExtensionProvider = () => { sessions?: { active?: string; visible?: string[]; background?: string[] } }
 
 const CONNECTION_TIMEOUT_MS = 10_000
 
@@ -33,6 +34,7 @@ export class WsClient {
   private reconnectHandlers = new Set<ReconnectHandler>()
   private pendingMessages: unknown[] = []
   private intentionalClose = false
+  private helloExtensionProvider?: HelloExtensionProvider
 
   private reconnectAttempts = 0
   private maxReconnectAttempts = 10
@@ -42,6 +44,14 @@ export class WsClient {
   private maxQueueSize = 1000
 
   constructor(private url: string) {}
+
+  /**
+   * Set a provider for additional data to include in the hello message.
+   * Used to send session IDs for prioritized repair scanning.
+   */
+  setHelloExtensionProvider(provider: HelloExtensionProvider): void {
+    this.helloExtensionProvider = provider
+  }
 
   get state(): ConnectionState {
     return this._state
@@ -87,7 +97,8 @@ export class WsClient {
 
         // Send hello with token in message body (not URL).
         const token = getAuthToken()
-        this.ws?.send(JSON.stringify({ type: 'hello', token }))
+        const extensions = this.helloExtensionProvider?.() || {}
+        this.ws?.send(JSON.stringify({ type: 'hello', token, ...extensions }))
       }
 
       this.ws.onmessage = (event) => {

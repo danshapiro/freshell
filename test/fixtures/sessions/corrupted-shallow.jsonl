@@ -1,0 +1,8 @@
+{"type":"system","subtype":"init","session_id":"shallow-corrupted-id","uuid":"msg-001","timestamp":"2025-01-30T10:00:00.000Z"}
+{"type":"user","message":"Hello, can you help me with a task?","uuid":"msg-002","parentUuid":"msg-001","timestamp":"2025-01-30T10:00:01.000Z"}
+{"type":"assistant","message":"Of course! What would you like help with?","uuid":"msg-003","parentUuid":"msg-002","timestamp":"2025-01-30T10:00:02.000Z"}
+{"type":"user","message":"Please fix this bug","uuid":"msg-004","parentUuid":"msg-003","timestamp":"2025-01-30T10:00:03.000Z"}
+{"type":"assistant","message":"I'll look into that bug for you.","uuid":"msg-005","parentUuid":"msg-004","timestamp":"2025-01-30T10:00:04.000Z"}
+{"type":"progress","message":"Analyzing code...","uuid":"msg-006","parentUuid":"subagent-uuid-not-in-file","timestamp":"2025-01-30T10:00:05.000Z"}
+{"type":"assistant","message":"Found the issue! Here's the fix.","uuid":"msg-007","parentUuid":"msg-006","timestamp":"2025-01-30T10:00:06.000Z"}
+{"type":"system","message":"Task completed","uuid":"msg-008","parentUuid":"msg-007","timestamp":"2025-01-30T10:00:07.000Z"}

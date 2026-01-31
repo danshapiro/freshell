@@ -7,6 +7,7 @@ import type { TerminalRegistry, TerminalMode } from './terminal-registry.js'
 import { configStore } from './config-store.js'
 import type { ClaudeSessionManager } from './claude-session.js'
 import type { ClaudeEvent } from './claude-stream-types.js'
+import type { SessionRepairService } from './session-scanner/service.js'
 
 const MAX_CONNECTIONS = Number(process.env.MAX_CONNECTIONS || 10)
 const HELLO_TIMEOUT_MS = Number(process.env.HELLO_TIMEOUT_MS || 5_000)
@@ -43,6 +44,11 @@ function nowIso() {
 const HelloSchema = z.object({
   type: z.literal('hello'),
   token: z.string().optional(),
+  sessions: z.object({
+    active: z.string().optional(),
+    visible: z.array(z.string()).optional(),
+    background: z.array(z.string()).optional(),
+  }).optional(),
 })
 
 const PingSchema = z.object({
@@ -136,19 +142,24 @@ type ClientState = {
   attachedTerminalIds: Set<string>
   createdByRequestId: Map<string, string>
   claudeSessions: Set<string>
+  interestedSessions: Set<string>
   helloTimer?: NodeJS.Timeout
 }
 
 export class WsHandler {
   private wss: WebSocketServer
   private connections = new Set<LiveWebSocket>()
+  private clientStates = new Map<LiveWebSocket, ClientState>()
   private pingInterval: NodeJS.Timeout | null = null
+  private sessionRepairService?: SessionRepairService
 
   constructor(
     server: http.Server,
     private registry: TerminalRegistry,
-    private claudeManager?: ClaudeSessionManager
+    private claudeManager?: ClaudeSessionManager,
+    sessionRepairService?: SessionRepairService
   ) {
+    this.sessionRepairService = sessionRepairService
     this.wss = new WebSocketServer({
       server,
       path: '/ws',
@@ -168,6 +179,41 @@ export class WsHandler {
         ws.ping()
       }
     }, PING_INTERVAL_MS)
+
+    // Subscribe to session repair events
+    if (this.sessionRepairService) {
+      this.sessionRepairService.on('scanned', (result) => {
+        this.broadcastSessionStatus(result.sessionId, {
+          type: 'session.status',
+          sessionId: result.sessionId,
+          status: result.status === 'healthy' ? 'healthy' : 'corrupted',
+          chainDepth: result.chainDepth,
+        })
+      })
+
+      this.sessionRepairService.on('repaired', (result) => {
+        this.broadcastSessionStatus(result.sessionId, {
+          type: 'session.status',
+          sessionId: result.sessionId,
+          status: 'repaired',
+          chainDepth: result.newChainDepth,
+          orphansFixed: result.orphansFixed,
+        })
+      })
+    }
+  }
+
+  /**
+   * Broadcast session status to clients interested in that session.
+   */
+  private broadcastSessionStatus(sessionId: string, msg: unknown): void {
+    for (const [ws, state] of this.clientStates) {
+      if (state.authenticated && state.interestedSessions.has(sessionId)) {
+        if (ws.readyState === WebSocket.OPEN) {
+          this.send(ws, msg)
+        }
+      }
+    }
   }
 
   getServer() {
@@ -213,7 +259,9 @@ export class WsHandler {
       attachedTerminalIds: new Set(),
       createdByRequestId: new Map(),
       claudeSessions: new Set(),
+      interestedSessions: new Set(),
     }
+    this.clientStates.set(ws, state)
 
     // Mark connection alive for keepalive pings
     ws.isAlive = true
@@ -237,6 +285,7 @@ export class WsHandler {
   private onClose(ws: LiveWebSocket, state: ClientState) {
     if (state.helloTimer) clearTimeout(state.helloTimer)
     this.connections.delete(ws)
+    this.clientStates.delete(ws)
     // Detach from any terminals
     for (const terminalId of state.attachedTerminalIds) {
       this.registry.detach(terminalId, ws)
@@ -300,6 +349,22 @@ export class WsHandler {
       }
       state.authenticated = true
       if (state.helloTimer) clearTimeout(state.helloTimer)
+
+      // Track and prioritize sessions from client
+      if (m.sessions && this.sessionRepairService) {
+        const allSessions = [
+          m.sessions.active,
+          ...(m.sessions.visible || []),
+          ...(m.sessions.background || []),
+        ].filter((s): s is string => !!s)
+
+        for (const sessionId of allSessions) {
+          state.interestedSessions.add(sessionId)
+        }
+
+        this.sessionRepairService.prioritizeSessions(m.sessions)
+      }
+
       this.send(ws, { type: 'ready', timestamp: nowIso() })
       return
     }
@@ -326,11 +391,28 @@ export class WsHandler {
             state.createdByRequestId.delete(m.requestId)
           }
 
+          // Wait for session repair before resuming Claude
+          let effectiveResumeSessionId = m.resumeSessionId
+          if (m.mode === 'claude' && m.resumeSessionId && this.sessionRepairService) {
+            try {
+              const result = await this.sessionRepairService.waitForSession(m.resumeSessionId, 10000)
+              if (result.status === 'missing') {
+                // Session file doesn't exist - don't try to resume
+                logger.info({ sessionId: m.resumeSessionId }, 'Session file missing, starting fresh')
+                effectiveResumeSessionId = undefined
+              }
+              // For 'healthy', 'corrupted' (which is now repaired), we proceed with resume
+            } catch (err) {
+              // Timeout or not in queue - proceed anyway, Claude will handle missing session
+              logger.debug({ err, sessionId: m.resumeSessionId }, 'Session repair wait failed, proceeding')
+            }
+          }
+
           const record = this.registry.create({
             mode: m.mode as TerminalMode,
             shell: m.shell as 'system' | 'cmd' | 'powershell' | 'wsl',
             cwd: m.cwd,
-            resumeSessionId: m.resumeSessionId,
+            resumeSessionId: effectiveResumeSessionId,
           })
 
           state.createdByRequestId.set(m.requestId, record.terminalId)
