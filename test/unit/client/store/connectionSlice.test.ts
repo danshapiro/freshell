@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import connectionReducer, {
   setStatus,
   setError,
+  setPlatform,
   ConnectionState,
   ConnectionStatus,
 } from '../../../../src/store/connectionSlice'
@@ -164,6 +165,40 @@ describe('connectionSlice', () => {
 
       expect(state.lastReadyAt).toBe(1234567890)
       expect(state.lastError).toBe('Temporary error')
+    })
+  })
+
+  describe('platform state', () => {
+    it('has null platform in initial state', () => {
+      const state = connectionReducer(undefined, { type: 'unknown' })
+      expect(state.platform).toBeNull()
+    })
+
+    it('sets platform with setPlatform action', () => {
+      const initialState: ConnectionState = {
+        status: 'disconnected',
+        platform: null,
+      }
+      const state = connectionReducer(initialState, setPlatform('win32'))
+      expect(state.platform).toBe('win32')
+    })
+
+    it('accepts darwin platform', () => {
+      const initialState: ConnectionState = {
+        status: 'disconnected',
+        platform: null,
+      }
+      const state = connectionReducer(initialState, setPlatform('darwin'))
+      expect(state.platform).toBe('darwin')
+    })
+
+    it('accepts linux platform', () => {
+      const initialState: ConnectionState = {
+        status: 'disconnected',
+        platform: null,
+      }
+      const state = connectionReducer(initialState, setPlatform('linux'))
+      expect(state.platform).toBe('linux')
     })
   })
 
