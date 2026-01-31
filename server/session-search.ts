@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import fs from 'fs'
+import path from 'path'
 import type { ProjectGroup, ClaudeSession } from './claude-indexer.js'
 
 export const SearchTier = {
@@ -215,4 +216,87 @@ export async function searchSessionFile(
   }
 
   return null
+}
+
+export interface SearchSessionsOptions {
+  projects: ProjectGroup[]
+  claudeHome: string
+  query: string
+  tier: SearchTierType
+  limit?: number
+}
+
+export async function searchSessions(
+  options: SearchSessionsOptions
+): Promise<SearchResponse> {
+  const { projects, claudeHome, query, tier, limit = 50 } = options
+
+  // Tier 1: Title search (instant, metadata only)
+  if (tier === SearchTier.Title) {
+    const results = searchTitleTier(projects, query, limit)
+    return {
+      results,
+      tier,
+      query,
+      totalScanned: projects.reduce((sum, p) => sum + p.sessions.length, 0),
+    }
+  }
+
+  // Tier 2 & 3: File-based search
+  const results: SearchResult[] = []
+  let totalScanned = 0
+
+  for (const project of projects) {
+    for (const session of project.sessions) {
+      totalScanned++
+
+      // Construct file path - project path is encoded by replacing / and : with -
+      const projectDirName = project.projectPath
+        .replace(/[/\\:]/g, '-')
+        .replace(/^-+/, '')
+      const sessionFile = path.join(
+        claudeHome,
+        'projects',
+        projectDirName,
+        `${session.sessionId}.jsonl`
+      )
+
+      // Try to access the file
+      try {
+        await fs.promises.access(sessionFile)
+      } catch {
+        // File not found at expected path - skip
+        continue
+      }
+
+      const searchTier = tier === SearchTier.UserMessages ? 'userMessages' : 'fullText'
+      const match = await searchSessionFile(sessionFile, query, searchTier)
+
+      if (match) {
+        results.push({
+          sessionId: session.sessionId,
+          projectPath: session.projectPath,
+          title: session.title,
+          summary: session.summary,
+          matchedIn: match.matchedIn!,
+          snippet: match.snippet,
+          updatedAt: session.updatedAt,
+          cwd: session.cwd,
+        })
+
+        if (results.length >= limit) break
+      }
+    }
+    if (results.length >= limit) break
+  }
+
+  // Sort by updatedAt descending
+  results.sort((a, b) => b.updatedAt - a.updatedAt)
+
+  return {
+    results,
+    tier,
+    query,
+    totalScanned,
+  }
 }

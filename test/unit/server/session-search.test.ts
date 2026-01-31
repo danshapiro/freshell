@@ -9,6 +9,7 @@ import {
   extractUserMessages,
   extractAllMessages,
   searchSessionFile,
+  searchSessions,
   type SearchResult,
   type SearchMatch,
 } from '../../../server/session-search.js'
@@ -300,5 +301,136 @@ describe('searchSessionFile()', () => {
     const result = await searchSessionFile(filePath, 'bug', 'userMessages')
 
     expect(result).not.toBeNull()
+  })
+})
+
+describe('searchSessions() orchestrator', () => {
+  let tempDir: string
+  let mockClaudeHome: string
+
+  beforeEach(async () => {
+    tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'search-orchestrator-'))
+    mockClaudeHome = path.join(tempDir, '.claude')
+    const projectDir = path.join(mockClaudeHome, 'projects', 'test-project')
+    await fsp.mkdir(projectDir, { recursive: true })
+
+    // Create test sessions
+    await fsp.writeFile(
+      path.join(projectDir, 'session-1.jsonl'),
+      '{"type":"user","message":"Fix login bug","uuid":"1","cwd":"/project"}\n'
+    )
+    await fsp.writeFile(
+      path.join(projectDir, 'session-2.jsonl'),
+      '{"type":"user","message":"Hello","uuid":"1","cwd":"/project"}\n' +
+        '{"type":"assistant","message":"The authentication system works","uuid":"2"}\n'
+    )
+  })
+
+  afterEach(async () => {
+    await fsp.rm(tempDir, { recursive: true, force: true })
+  })
+
+  it('tier title only searches metadata', async () => {
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/test-project',
+        sessions: [
+          {
+            sessionId: 'session-1',
+            projectPath: '/test-project',
+            updatedAt: 1000,
+            title: 'Fix login bug',
+            cwd: '/project',
+          },
+          {
+            sessionId: 'session-2',
+            projectPath: '/test-project',
+            updatedAt: 2000,
+            title: 'Hello',
+            cwd: '/project',
+          },
+        ],
+      },
+    ]
+
+    const response = await searchSessions({
+      projects,
+      claudeHome: mockClaudeHome,
+      query: 'login',
+      tier: 'title',
+    })
+
+    expect(response.results).toHaveLength(1)
+    expect(response.results[0].sessionId).toBe('session-1')
+    expect(response.tier).toBe('title')
+  })
+
+  it('tier userMessages searches file content', async () => {
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/test-project',
+        sessions: [
+          {
+            sessionId: 'session-1',
+            projectPath: '/test-project',
+            updatedAt: 1000,
+            title: 'Fix login bug',
+            cwd: '/project',
+          },
+          {
+            sessionId: 'session-2',
+            projectPath: '/test-project',
+            updatedAt: 2000,
+            title: 'Hello',
+            cwd: '/project',
+          },
+        ],
+      },
+    ]
+
+    const response = await searchSessions({
+      projects,
+      claudeHome: mockClaudeHome,
+      query: 'login',
+      tier: 'userMessages',
+    })
+
+    expect(response.results).toHaveLength(1)
+    expect(response.results[0].sessionId).toBe('session-1')
+  })
+
+  it('tier fullText finds assistant message matches', async () => {
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/test-project',
+        sessions: [
+          {
+            sessionId: 'session-1',
+            projectPath: '/test-project',
+            updatedAt: 1000,
+            title: 'Login',
+            cwd: '/project',
+          },
+          {
+            sessionId: 'session-2',
+            projectPath: '/test-project',
+            updatedAt: 2000,
+            title: 'Hello',
+            cwd: '/project',
+          },
+        ],
+      },
+    ]
+
+    const response = await searchSessions({
+      projects,
+      claudeHome: mockClaudeHome,
+      query: 'authentication',
+      tier: 'fullText',
+    })
+
+    expect(response.results).toHaveLength(1)
+    expect(response.results[0].sessionId).toBe('session-2')
+    expect(response.results[0].matchedIn).toBe('assistantMessage')
   })
 })
