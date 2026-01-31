@@ -100,6 +100,13 @@ export class SessionCache {
   }
 
   /**
+   * Return cached file paths for session index building.
+   */
+  listPaths(): string[] {
+    return Array.from(this.cache.keys())
+  }
+
+  /**
    * Persist cache to disk (graceful shutdown).
    */
   async persist(): Promise<void> {

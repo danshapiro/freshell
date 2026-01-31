@@ -1,5 +1,9 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { ChunkRingBuffer } from '../../../server/terminal-registry'
+
+vi.mock('node-pty', () => ({
+  spawn: vi.fn(),
+}))
 
 describe('ChunkRingBuffer', () => {
   describe('append', () => {

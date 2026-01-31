@@ -2,6 +2,16 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { TerminalRegistry } from '../../server/terminal-registry'
 import { ClaudeSessionIndexer, ClaudeSession } from '../../server/claude-indexer'
 
+vi.mock('node-pty', () => ({
+  spawn: vi.fn(() => ({
+    onData: vi.fn(),
+    onExit: vi.fn(),
+    write: vi.fn(),
+    resize: vi.fn(),
+    kill: vi.fn(),
+  })),
+}))
+
 describe('Session-Terminal Association Integration', () => {
   it('should associate terminal with session when session is created', () => {
     const registry = new TerminalRegistry()

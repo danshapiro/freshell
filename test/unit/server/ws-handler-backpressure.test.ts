@@ -4,6 +4,10 @@ import WebSocket from 'ws'
 import { WsHandler } from '../../../server/ws-handler'
 import { TerminalRegistry } from '../../../server/terminal-registry'
 
+vi.mock('node-pty', () => ({
+  spawn: vi.fn(),
+}))
+
 describe('WsHandler backpressure', () => {
   let server: http.Server
   let handler: WsHandler

@@ -151,9 +151,7 @@ describe('SessionRepairQueue', () => {
       ])
 
       queue.start()
-
-      // Wait for processing
-      await new Promise(r => setTimeout(r, 100))
+      await queue.waitFor('healthy', 5000)
 
       expect(scanned.length).toBe(1)
       expect(scanned[0].sessionId).toBe('healthy')
@@ -173,29 +171,34 @@ describe('SessionRepairQueue', () => {
       ])
 
       queue.start()
-
-      // Wait for processing
-      await new Promise(r => setTimeout(r, 200))
+      await queue.waitFor('corrupted', 5000)
 
       expect(repaired.length).toBe(1)
       expect(repaired[0].status).toBe('repaired')
     })
 
     it('emits error event on failure', async () => {
-      const errors: Array<{ sessionId: string; error: Error }> = []
-      queue.on('error', (sessionId, error) => errors.push({ sessionId, error }))
+      const errorScanner = {
+        scan: vi.fn().mockRejectedValue(new Error('boom')),
+        repair: vi.fn(),
+      }
+      const errorQueue = new SessionRepairQueue(errorScanner as any, cache)
 
-      queue.enqueue([
-        { sessionId: 'nonexistent', filePath: '/does/not/exist.jsonl', priority: 'active' },
+      const errors: Array<{ sessionId: string; error: Error }> = []
+      errorQueue.on('error', (sessionId, error) => errors.push({ sessionId, error }))
+
+      errorQueue.enqueue([
+        { sessionId: 'broken', filePath: '/does/not/exist.jsonl', priority: 'active' },
       ])
 
-      queue.start()
+      errorQueue.start()
+      await new Promise(r => setTimeout(r, 50))
 
-      // Wait for processing
-      await new Promise(r => setTimeout(r, 100))
+      expect(errors).toHaveLength(1)
+      expect(errors[0].sessionId).toBe('broken')
+      expect(errors[0].error.message).toMatch(/boom/i)
 
-      // Non-existent file is "missing" status, not an error
-      // Error would be thrown for other failures
+      await errorQueue.stop()
     })
 
     it('caches scan results', async () => {
@@ -204,12 +207,33 @@ describe('SessionRepairQueue', () => {
       ])
 
       queue.start()
-      await new Promise(r => setTimeout(r, 100))
+      await queue.waitFor('healthy', 5000)
 
       // Check cache
       const cached = await cache.get(path.join(FIXTURES_DIR, 'healthy.jsonl'))
       expect(cached).not.toBeNull()
       expect(cached?.status).toBe('healthy')
+    })
+
+    it('auto-starts when new items are enqueued after drain', async () => {
+      const scanned: SessionScanResult[] = []
+      queue.on('scanned', (result) => scanned.push(result))
+
+      queue.enqueue([
+        { sessionId: 'first', filePath: path.join(FIXTURES_DIR, 'healthy.jsonl'), priority: 'active' },
+      ])
+
+      queue.start()
+      await queue.waitFor('first', 5000)
+
+      expect(scanned).toHaveLength(1)
+
+      queue.enqueue([
+        { sessionId: 'second', filePath: path.join(FIXTURES_DIR, 'healthy.jsonl'), priority: 'active' },
+      ])
+
+      await queue.waitFor('second', 5000)
+      expect(scanned).toHaveLength(2)
     })
   })
 
@@ -224,12 +248,11 @@ describe('SessionRepairQueue', () => {
 
       await queue.stop()
 
-      // Queue should not process after stop
       queue.start()
       await new Promise(r => setTimeout(r, 50))
 
-      // Actually, stop() should prevent start() from doing anything
-      // The queue should be marked as stopped
+      expect(scanned).toHaveLength(0)
+      expect(queue.size()).toBe(1)
     })
 
     it('can be called multiple times safely', async () => {
@@ -274,10 +297,48 @@ describe('SessionRepairQueue', () => {
   })
 
   describe('isProcessing()', () => {
-    it('returns true for session currently being processed', async () => {
-      // This is tricky to test - need to check during processing
-      // For now, just verify the method exists and returns boolean
-      expect(typeof queue.isProcessing('any')).toBe('boolean')
+    it('returns true while a session is being processed', async () => {
+      let resolveScan: ((result: SessionScanResult) => void) | null = null
+      let signalStart: (() => void) | null = null
+      const scanStarted = new Promise<void>((resolve) => {
+        signalStart = resolve
+      })
+      const scanPromise = new Promise<SessionScanResult>((resolve) => {
+        resolveScan = resolve
+      })
+
+      const slowScanner = {
+        scan: vi.fn().mockImplementation(() => {
+          signalStart?.()
+          return scanPromise
+        }),
+        repair: vi.fn(),
+      }
+      const slowQueue = new SessionRepairQueue(slowScanner as any, cache)
+
+      slowQueue.enqueue([
+        { sessionId: 'slow', filePath: '/tmp/slow.jsonl', priority: 'active' },
+      ])
+
+      slowQueue.start()
+      await scanStarted
+
+      expect(slowQueue.isProcessing('slow')).toBe(true)
+
+      resolveScan!({
+        sessionId: 'slow',
+        filePath: '/tmp/slow.jsonl',
+        status: 'healthy',
+        chainDepth: 1,
+        orphanCount: 0,
+        fileSize: 1,
+        messageCount: 1,
+      })
+
+      await slowQueue.waitFor('slow', 5000)
+      expect(slowQueue.isProcessing('slow')).toBe(false)
+
+      await slowQueue.stop()
     })
   })
 

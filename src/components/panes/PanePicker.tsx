@@ -37,7 +37,7 @@ interface PanePickerProps {
 }
 
 export default function PanePicker({ onSelect, onCancel, isOnlyPane }: PanePickerProps) {
-  const platform = useAppSelector((s) => s.connection.platform)
+  const platform = useAppSelector((s) => s.connection?.platform ?? null)
   const options = getOptions(platform)
 
   const [focusedIndex, setFocusedIndex] = useState<number | null>(null)

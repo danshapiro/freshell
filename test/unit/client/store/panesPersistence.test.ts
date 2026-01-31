@@ -19,13 +19,19 @@ Object.defineProperty(globalThis, 'localStorage', { value: localStorageMock, wri
 // Now import slices - they'll see our mocked localStorage
 import tabsReducer, { hydrateTabs, addTab } from '../../../../src/store/tabsSlice'
 import panesReducer, { hydratePanes, initLayout, splitPane } from '../../../../src/store/panesSlice'
-import { loadPersistedPanes, loadPersistedTabs, persistMiddleware } from '../../../../src/store/persistMiddleware'
+import {
+  loadPersistedPanes,
+  loadPersistedTabs,
+  persistMiddleware,
+  resetPersistFlushListenersForTests,
+} from '../../../../src/store/persistMiddleware'
 
 describe('Panes Persistence Integration', () => {
   beforeEach(() => {
     localStorageMock.clear()
     vi.clearAllMocks()
     vi.useFakeTimers()
+    resetPersistFlushListenersForTests()
   })
 
   afterEach(() => {
@@ -225,6 +231,27 @@ describe('Panes Persistence Integration', () => {
     const layout = parsedPanes.layouts[tabId]
     expect(layout.content.kind).toBe('editor')
     expect(layout.content.content).toBe('')
+  })
+
+  it('flushes pending writes on visibility change', () => {
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+      },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+
+    store.dispatch(addTab({ mode: 'shell' }))
+    const tabId = store.getState().tabs.tabs[0].id
+    store.dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
+
+    expect(localStorage.getItem('freshell.panes.v1')).toBeNull()
+
+    Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true })
+    document.dispatchEvent(new Event('visibilitychange'))
+
+    expect(localStorage.getItem('freshell.panes.v1')).not.toBeNull()
   })
 })
 

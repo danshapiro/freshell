@@ -9,6 +9,49 @@ type SessionActivityState = {
   }
 }
 
+const flushCallbacks = new Set<() => void>()
+let flushListenersAttached = false
+
+function notifyFlushCallbacks() {
+  for (const cb of flushCallbacks) {
+    try {
+      cb()
+    } catch {
+      // ignore
+    }
+  }
+}
+
+function attachFlushListeners() {
+  if (flushListenersAttached) return
+  if (typeof document === 'undefined' || typeof window === 'undefined') return
+
+  const handleVisibility = () => {
+    if (document.visibilityState === 'hidden') {
+      notifyFlushCallbacks()
+    }
+  }
+
+  const handlePageHide = () => {
+    notifyFlushCallbacks()
+  }
+
+  document.addEventListener('visibilitychange', handleVisibility)
+  window.addEventListener('pagehide', handlePageHide)
+  window.addEventListener('beforeunload', handlePageHide)
+
+  flushListenersAttached = true
+}
+
+function registerFlushCallback(cb: () => void) {
+  flushCallbacks.add(cb)
+  attachFlushListeners()
+}
+
+export function resetSessionActivityFlushListenersForTests() {
+  flushCallbacks.clear()
+}
+
 function canUseStorage(): boolean {
   return typeof localStorage !== 'undefined'
 }
@@ -39,6 +82,16 @@ export const sessionActivityPersistMiddleware: Middleware<{}, SessionActivitySta
     if (flushTimer) return
     flushTimer = setTimeout(flush, SESSION_ACTIVITY_PERSIST_DEBOUNCE_MS)
   }
+
+  const flushNow = () => {
+    if (flushTimer) {
+      clearTimeout(flushTimer)
+      flushTimer = null
+    }
+    flush()
+  }
+
+  registerFlushCallback(flushNow)
 
   return (next) => (action) => {
     const result = next(action)

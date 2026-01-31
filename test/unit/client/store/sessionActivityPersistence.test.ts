@@ -4,12 +4,14 @@ import sessionActivityReducer, { updateSessionActivity, SESSION_ACTIVITY_STORAGE
 import {
   sessionActivityPersistMiddleware,
   SESSION_ACTIVITY_PERSIST_DEBOUNCE_MS,
+  resetSessionActivityFlushListenersForTests,
 } from '@/store/sessionActivityPersistence'
 
 describe('sessionActivity persistence middleware', () => {
   beforeEach(() => {
     localStorage.clear()
     vi.useFakeTimers()
+    resetSessionActivityFlushListenersForTests()
   })
 
   afterEach(() => {
@@ -65,6 +67,18 @@ describe('sessionActivity persistence middleware', () => {
     globalThis.localStorage = originalStorage
 
     vi.advanceTimersByTime(SESSION_ACTIVITY_PERSIST_DEBOUNCE_MS)
+
+    expect(localStorage.getItem(SESSION_ACTIVITY_STORAGE_KEY)).not.toBeNull()
+  })
+
+  it('flushes pending writes on visibility change', () => {
+    const store = createStore()
+    store.dispatch(updateSessionActivity({ sessionId: 'session-1', lastInputAt: 123 }))
+
+    expect(localStorage.getItem(SESSION_ACTIVITY_STORAGE_KEY)).toBeNull()
+
+    Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true })
+    document.dispatchEvent(new Event('visibilitychange'))
 
     expect(localStorage.getItem(SESSION_ACTIVITY_STORAGE_KEY)).not.toBeNull()
   })

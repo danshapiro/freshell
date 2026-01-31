@@ -26,7 +26,7 @@ const selectSortMode = (state: RootState) => state.settings.settings.sidebar?.so
 const selectSessionActivityForSort = (state: RootState) => {
   const sortMode = state.settings.settings.sidebar?.sortMode || 'activity'
   if (sortMode !== 'activity') return EMPTY_ACTIVITY
-  return state.sessionActivity.sessions || EMPTY_ACTIVITY
+  return state.sessionActivity?.sessions || EMPTY_ACTIVITY
 }
 const selectTerminals = (_state: RootState, terminals: BackgroundTerminal[]) => terminals
 const selectFilter = (_state: RootState, _terminals: BackgroundTerminal[], filter: string) => filter

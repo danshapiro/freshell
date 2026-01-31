@@ -35,6 +35,9 @@ export class SessionRepairService extends EventEmitter {
   private queue: SessionRepairQueue
   private initialized = false
   private cacheDir: string
+  private claudeBase: string
+  private sessionPathIndex = new Map<string, string>()
+  private indexInitialized = false
 
   constructor(options: SessionRepairServiceOptions = {}) {
     super()
@@ -42,9 +45,17 @@ export class SessionRepairService extends EventEmitter {
     this.scanner = options.scanner || createSessionScanner()
     this.cache = new SessionCache(path.join(this.cacheDir, CACHE_FILENAME))
     this.queue = new SessionRepairQueue(this.scanner, this.cache)
+    this.claudeBase = path.join(os.homedir(), '.claude', 'projects')
 
     // Forward queue events
-    this.queue.on('scanned', (result: SessionScanResult) => this.emit('scanned', result))
+    this.queue.on('scanned', (result: SessionScanResult) => {
+      if (result.status === 'missing') {
+        this.sessionPathIndex.delete(result.sessionId)
+      } else if (result.filePath) {
+        this.sessionPathIndex.set(result.sessionId, result.filePath)
+      }
+      this.emit('scanned', result)
+    })
     this.queue.on('repaired', (result: SessionRepairResult) => this.emit('repaired', result))
     this.queue.on('error', (sessionId: string, error: Error) => this.emit('error', sessionId, error))
   }
@@ -61,36 +72,11 @@ export class SessionRepairService extends EventEmitter {
     // Load cache from disk
     await this.cache.load()
 
+    // Seed session index from cached entries (no disk scan).
+    this.ensureSessionIndex()
+
     // Cleanup old backups
     await this.cleanupOldBackups()
-
-    // Discover all session files
-    const claudeBase = path.join(os.homedir(), '.claude', 'projects')
-    let sessionFiles: string[] = []
-
-    try {
-      // Find all JSONL files (sessions) in project directories
-      // Pattern: ~/.claude/projects/*/*.jsonl (session files are directly in project dirs)
-      sessionFiles = await glob('*/*.jsonl', {
-        cwd: claudeBase,
-        absolute: true,
-        nodir: true,
-      })
-    } catch (err) {
-      logger.warn({ err }, 'Failed to glob session files')
-    }
-
-    // Queue all sessions at 'disk' priority
-    if (sessionFiles.length > 0) {
-      logger.info({ count: sessionFiles.length }, 'Discovered session files')
-      this.queue.enqueue(
-        sessionFiles.map((filePath) => ({
-          sessionId: path.basename(filePath, '.jsonl'),
-          filePath,
-          priority: 'disk' as Priority,
-        }))
-      )
-    }
 
     // Start background processing
     this.queue.start()
@@ -117,27 +103,10 @@ export class SessionRepairService extends EventEmitter {
     visible?: string[]
     background?: string[]
   }): void {
-    const claudeBase = path.join(os.homedir(), '.claude', 'projects')
-    const items: Array<{ sessionId: string; filePath: string; priority: Priority }> = []
-
-    // Helper to find session file path
-    const findSessionFile = async (sessionId: string): Promise<string | null> => {
-      // Try to find the session file in any project directory
-      const matches = await glob(`*/${sessionId}.jsonl`, {
-        cwd: claudeBase,
-        absolute: true,
-        nodir: true,
-      })
-      return matches[0] || null
-    }
-
-    // We need to resolve paths synchronously, so we'll use a simple heuristic:
-    // Just build paths and let the queue handle missing files gracefully
-
+    const items: Array<{ sessionId: string; priority: Priority }> = []
     if (sessions.active) {
       items.push({
         sessionId: sessions.active,
-        filePath: '', // Will be resolved by queue or cached
         priority: 'active',
       })
     }
@@ -145,7 +114,6 @@ export class SessionRepairService extends EventEmitter {
     for (const id of sessions.visible || []) {
       items.push({
         sessionId: id,
-        filePath: '',
         priority: 'visible',
       })
     }
@@ -153,13 +121,13 @@ export class SessionRepairService extends EventEmitter {
     for (const id of sessions.background || []) {
       items.push({
         sessionId: id,
-        filePath: '',
         priority: 'background',
       })
     }
 
-    // Re-prioritize in queue (queue will handle missing filePath by looking up existing entries)
-    this.queue.enqueue(items)
+    if (items.length === 0) return
+
+    this.enqueueResolved(items)
   }
 
   /**
@@ -167,6 +135,10 @@ export class SessionRepairService extends EventEmitter {
    * Used by terminal.create before spawning Claude with --resume.
    */
   async waitForSession(sessionId: string, timeoutMs = 30000): Promise<SessionScanResult> {
+    const filePath = await this.resolveFilePath(sessionId)
+    if (filePath) {
+      this.queue.enqueue([{ sessionId, filePath, priority: 'active' }])
+    }
     return this.queue.waitFor(sessionId, timeoutMs)
   }
 
@@ -182,7 +154,7 @@ export class SessionRepairService extends EventEmitter {
    * Clean up backup files older than retention period.
    */
   private async cleanupOldBackups(): Promise<void> {
-    const claudeBase = path.join(os.homedir(), '.claude', 'projects')
+    const claudeBase = this.claudeBase
     const retentionMs = BACKUP_RETENTION_DAYS * 24 * 60 * 60 * 1000
     const cutoff = Date.now() - retentionMs
 
@@ -215,6 +187,74 @@ export class SessionRepairService extends EventEmitter {
       }
     } catch (err) {
       logger.debug({ err }, 'Failed to cleanup backups')
+    }
+  }
+
+  private ensureSessionIndex(): void {
+    if (this.indexInitialized) return
+    for (const filePath of this.cache.listPaths()) {
+      const sessionId = path.basename(filePath, '.jsonl')
+      this.sessionPathIndex.set(sessionId, filePath)
+    }
+    this.indexInitialized = true
+  }
+
+  private resolveCachedPath(sessionId: string): string | null {
+    this.ensureSessionIndex()
+    return this.sessionPathIndex.get(sessionId) || null
+  }
+
+  private async resolveFilePath(sessionId: string): Promise<string | null> {
+    const cached = this.resolveCachedPath(sessionId)
+    if (cached) return cached
+
+    try {
+      const matches = await glob(`*/${sessionId}.jsonl`, {
+        cwd: this.claudeBase,
+        absolute: true,
+        nodir: true,
+      })
+      const match = matches[0] || null
+      if (match) {
+        this.sessionPathIndex.set(sessionId, match)
+      }
+      return match
+    } catch (err) {
+      logger.debug({ err, sessionId }, 'Failed to resolve session file path')
+      return null
+    }
+  }
+
+  private enqueueResolved(items: Array<{ sessionId: string; priority: Priority }>): void {
+    const immediate: Array<{ sessionId: string; filePath: string; priority: Priority }> = []
+    const pending: Array<{ sessionId: string; priority: Priority }> = []
+
+    for (const item of items) {
+      const cached = this.resolveCachedPath(item.sessionId)
+      if (cached) {
+        immediate.push({ ...item, filePath: cached })
+      } else {
+        pending.push(item)
+      }
+    }
+
+    if (immediate.length > 0) {
+      this.queue.enqueue(immediate)
+    }
+
+    if (pending.length > 0) {
+      void (async () => {
+        const resolved: Array<{ sessionId: string; filePath: string; priority: Priority }> = []
+        for (const item of pending) {
+          const filePath = await this.resolveFilePath(item.sessionId)
+          if (filePath) {
+            resolved.push({ ...item, filePath })
+          }
+        }
+        if (resolved.length > 0) {
+          this.queue.enqueue(resolved)
+        }
+      })()
     }
   }
 }

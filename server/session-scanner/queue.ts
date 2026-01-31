@@ -49,6 +49,7 @@ export class SessionRepairQueue extends EventEmitter {
   private cache: SessionCache
   private running = false
   private stopped = false
+  private hasStarted = false
   private waiting: Map<string, WaitingPromise[]> = new Map()
   private maxProcessedCache: number
 
@@ -110,6 +111,10 @@ export class SessionRepairQueue extends EventEmitter {
     if (needsSort) {
       this.sortQueue()
     }
+
+    if (this.hasStarted && !this.running && !this.stopped && this.queue.length > 0) {
+      this.start()
+    }
   }
 
   /**
@@ -154,6 +159,7 @@ export class SessionRepairQueue extends EventEmitter {
   start(): void {
     if (this.stopped) return
     if (this.running) return
+    this.hasStarted = true
     this.running = true
     this.processNext()
   }

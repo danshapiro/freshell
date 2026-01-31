@@ -33,6 +33,7 @@ const ErrorCode = z.enum([
   'INVALID_MESSAGE',
   'UNKNOWN_MESSAGE',
   'INVALID_TERMINAL_ID',
+  'INVALID_SESSION_ID',
   'PTY_SPAWN_FAILED',
   'FILE_WATCHER_ERROR',
   'INTERNAL_ERROR',
@@ -626,7 +627,7 @@ export class WsHandler {
 
         const session = this.claudeManager.get(m.sessionId)
         if (!session) {
-          this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Session not found' })
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'Session not found' })
           return
         }
 

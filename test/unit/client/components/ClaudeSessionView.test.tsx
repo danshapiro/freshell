@@ -1,15 +1,19 @@
 import { describe, it, expect, afterEach, vi } from 'vitest'
-import { render, screen, cleanup } from '@testing-library/react'
+import { render, screen, cleanup, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import ClaudeSessionView from '../../../../src/components/ClaudeSessionView'
 import claudeReducer from '../../../../src/store/claudeSlice'
 
+const mockConnect = vi.fn().mockResolvedValue(undefined)
+const mockSend = vi.fn()
+const mockOnMessage = vi.fn(() => () => {})
+
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
-    send: vi.fn(),
-    onMessage: vi.fn(() => () => {}),
-    connect: vi.fn().mockResolvedValue(undefined),
+    send: mockSend,
+    onMessage: mockOnMessage,
+    connect: mockConnect,
   }),
 }))
 
@@ -35,7 +39,12 @@ function createTestStore(claudeState = {}) {
   })
 }
 
-afterEach(() => cleanup())
+afterEach(() => {
+  cleanup()
+  mockConnect.mockClear()
+  mockSend.mockClear()
+  mockOnMessage.mockClear()
+})
 
 describe('ClaudeSessionView', () => {
   it('renders session prompt', () => {
@@ -47,6 +56,17 @@ describe('ClaudeSessionView', () => {
     )
 
     expect(screen.getByText(/test prompt/)).toBeInTheDocument()
+  })
+
+  it('connects the websocket on mount', async () => {
+    const store = createTestStore()
+    render(
+      <Provider store={store}>
+        <ClaudeSessionView sessionId="session-1" />
+      </Provider>
+    )
+
+    await waitFor(() => expect(mockConnect).toHaveBeenCalled())
   })
 
   it('renders message events', () => {

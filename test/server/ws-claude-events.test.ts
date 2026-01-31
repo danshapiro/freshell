@@ -7,6 +7,16 @@ import { WsHandler } from '../../server/ws-handler'
 import { TerminalRegistry } from '../../server/terminal-registry'
 import { ClaudeSessionManager } from '../../server/claude-session'
 
+vi.mock('node-pty', () => ({
+  spawn: vi.fn(() => ({
+    onData: vi.fn(),
+    onExit: vi.fn(),
+    write: vi.fn(),
+    resize: vi.fn(),
+    kill: vi.fn(),
+  })),
+}))
+
 // Set auth token for tests
 process.env.AUTH_TOKEN = 'test-token'
 

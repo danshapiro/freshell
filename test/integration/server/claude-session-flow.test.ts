@@ -8,13 +8,23 @@
 // Set RUN_CLAUDE_INTEGRATION=true to run this test:
 //   RUN_CLAUDE_INTEGRATION=true npm run test:server
 //
-import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest'
 import http from 'http'
 import express from 'express'
 import WebSocket from 'ws'
 import { WsHandler } from '../../../server/ws-handler'
 import { TerminalRegistry } from '../../../server/terminal-registry'
 import { ClaudeSessionManager } from '../../../server/claude-session'
+
+vi.mock('node-pty', () => ({
+  spawn: vi.fn(() => ({
+    onData: vi.fn(),
+    onExit: vi.fn(),
+    write: vi.fn(),
+    resize: vi.fn(),
+    kill: vi.fn(),
+  })),
+}))
 
 // Set auth token for tests
 process.env.AUTH_TOKEN = 'test-token'
