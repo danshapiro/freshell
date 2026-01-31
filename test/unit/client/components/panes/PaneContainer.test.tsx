@@ -5,6 +5,7 @@ import { Provider } from 'react-redux'
 import PaneContainer from '@/components/panes/PaneContainer'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
+import connectionReducer, { ConnectionState } from '@/store/connectionSlice'
 import type { PanesState } from '@/store/panesSlice'
 import type { PaneNode, PaneContent, EditorPaneContent } from '@/store/paneTypes'
 
@@ -96,11 +97,15 @@ function createTerminalContent(overrides: Partial<PaneContent & { kind: 'termina
   }
 }
 
-function createStore(initialPanesState: Partial<PanesState> = {}) {
+function createStore(
+  initialPanesState: Partial<PanesState> = {},
+  initialConnectionState: Partial<ConnectionState> = {}
+) {
   return configureStore({
     reducer: {
       panes: panesReducer,
       settings: settingsReducer,
+      connection: connectionReducer,
     },
     preloadedState: {
       panes: {
@@ -108,6 +113,11 @@ function createStore(initialPanesState: Partial<PanesState> = {}) {
         activePane: {},
         paneTitles: {},
         ...initialPanesState,
+      },
+      connection: {
+        status: 'disconnected',
+        platform: null,
+        ...initialConnectionState,
       },
     },
   })
@@ -774,6 +784,147 @@ describe('PaneContainer', () => {
 
       // Should render the mocked Monaco editor
       expect(screen.getByTestId('monaco-mock')).toBeInTheDocument()
+    })
+  })
+
+  describe('PickerWrapper shell type handling', () => {
+    // Helper to create a picker pane
+    function createPickerNode(paneId: string): PaneNode {
+      return {
+        type: 'leaf',
+        id: paneId,
+        content: { kind: 'picker' },
+      }
+    }
+
+    it('creates terminal with shell=cmd when cmd is selected', () => {
+      const node = createPickerNode('pane-1')
+      const store = createStore(
+        { layouts: { 'tab-1': node }, activePane: { 'tab-1': 'pane-1' } },
+        { platform: 'win32' }
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store
+      )
+
+      // Press 'c' key for CMD
+      fireEvent.keyDown(document, { key: 'c' })
+
+      // Wait for transition to complete (the picker has a fade animation)
+      const picker = screen.getByText('CMD').closest('div[class*="transition"]')
+      if (picker) {
+        fireEvent.transitionEnd(picker)
+      }
+
+      // Verify the pane content was updated with shell=cmd
+      const state = store.getState().panes
+      const paneContent = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
+      expect(paneContent.kind).toBe('terminal')
+      if (paneContent.kind === 'terminal') {
+        expect(paneContent.shell).toBe('cmd')
+        expect(paneContent.mode).toBe('shell')
+        expect(paneContent.status).toBe('creating')
+        expect(paneContent.createRequestId).toBeDefined()
+      }
+    })
+
+    it('creates terminal with shell=powershell when powershell is selected', () => {
+      const node = createPickerNode('pane-1')
+      const store = createStore(
+        { layouts: { 'tab-1': node }, activePane: { 'tab-1': 'pane-1' } },
+        { platform: 'win32' }
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store
+      )
+
+      // Press 'p' key for PowerShell
+      fireEvent.keyDown(document, { key: 'p' })
+
+      // Wait for transition to complete
+      const picker = screen.getByText('PowerShell').closest('div[class*="transition"]')
+      if (picker) {
+        fireEvent.transitionEnd(picker)
+      }
+
+      // Verify the pane content was updated with shell=powershell
+      const state = store.getState().panes
+      const paneContent = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
+      expect(paneContent.kind).toBe('terminal')
+      if (paneContent.kind === 'terminal') {
+        expect(paneContent.shell).toBe('powershell')
+        expect(paneContent.mode).toBe('shell')
+        expect(paneContent.status).toBe('creating')
+      }
+    })
+
+    it('creates terminal with shell=wsl when wsl is selected', () => {
+      const node = createPickerNode('pane-1')
+      const store = createStore(
+        { layouts: { 'tab-1': node }, activePane: { 'tab-1': 'pane-1' } },
+        { platform: 'win32' }
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store
+      )
+
+      // Press 'w' key for WSL
+      fireEvent.keyDown(document, { key: 'w' })
+
+      // Wait for transition to complete
+      const picker = screen.getByText('WSL').closest('div[class*="transition"]')
+      if (picker) {
+        fireEvent.transitionEnd(picker)
+      }
+
+      // Verify the pane content was updated with shell=wsl
+      const state = store.getState().panes
+      const paneContent = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
+      expect(paneContent.kind).toBe('terminal')
+      if (paneContent.kind === 'terminal') {
+        expect(paneContent.shell).toBe('wsl')
+        expect(paneContent.mode).toBe('shell')
+        expect(paneContent.status).toBe('creating')
+      }
+    })
+
+    it('creates terminal with shell=system when shell is selected (non-Windows)', () => {
+      const node = createPickerNode('pane-1')
+      // For non-Windows, platform will be null (default) which shows 'Shell' option
+      const store = createStore(
+        { layouts: { 'tab-1': node }, activePane: { 'tab-1': 'pane-1' } },
+        { platform: 'linux' }
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store
+      )
+
+      // Press 's' key for Shell
+      fireEvent.keyDown(document, { key: 's' })
+
+      // Wait for transition to complete
+      const picker = screen.getByText('Shell').closest('div[class*="transition"]')
+      if (picker) {
+        fireEvent.transitionEnd(picker)
+      }
+
+      // Verify the pane content was updated with shell=system
+      const state = store.getState().panes
+      const paneContent = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
+      expect(paneContent.kind).toBe('terminal')
+      if (paneContent.kind === 'terminal') {
+        expect(paneContent.shell).toBe('system')
+        expect(paneContent.mode).toBe('shell')
+        expect(paneContent.status).toBe('creating')
+      }
     })
   })
 })
