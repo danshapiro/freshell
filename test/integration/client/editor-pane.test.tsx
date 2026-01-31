@@ -97,6 +97,7 @@ describe('Editor Pane Integration', () => {
   let store: ReturnType<typeof createTestStore>
 
   beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
     store = createTestStore()
     vi.stubGlobal('fetch', mockFetch)
     mockFetch.mockReset()
@@ -117,15 +118,18 @@ describe('Editor Pane Integration', () => {
     }))
   })
 
-  afterEach(() => {
+  afterEach(async () => {
+    // Flush all pending timers (e.g., debounced functions) before cleanup
+    await vi.runAllTimersAsync()
     cleanup()
+    vi.useRealTimers()
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
   })
 
   // Skip: JSDOM doesn't fire CSS transitionend events needed for PanePicker selection
   it.skip('can add editor pane via FAB', async () => {
-    const user = userEvent.setup()
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
 
     // Initialize with terminal
     store.dispatch(
@@ -162,7 +166,7 @@ describe('Editor Pane Integration', () => {
 
   // Skip: JSDOM doesn't fire CSS transitionend events needed for PanePicker selection
   it.skip('displays editor toolbar with path input', async () => {
-    const user = userEvent.setup()
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
 
     store.dispatch(
       initLayout({
@@ -191,7 +195,7 @@ describe('Editor Pane Integration', () => {
   })
 
   it('loads file when path is entered', async () => {
-    const user = userEvent.setup()
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
     sessionStorage.setItem('auth-token', 'test-token')
 
     mockFetch.mockResolvedValue(
@@ -244,7 +248,7 @@ describe('Editor Pane Integration', () => {
   })
 
   it('shows Monaco editor when content is loaded', async () => {
-    const user = userEvent.setup()
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
     sessionStorage.setItem('auth-token', 'test-token')
 
     mockFetch.mockResolvedValue(
@@ -293,7 +297,7 @@ describe('Editor Pane Integration', () => {
   })
 
   it('shows view toggle for markdown files after loading', async () => {
-    const user = userEvent.setup()
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
     sessionStorage.setItem('auth-token', 'test-token')
 
     mockFetch.mockResolvedValue(
@@ -343,7 +347,7 @@ describe('Editor Pane Integration', () => {
   })
 
   it('can toggle between source and preview modes', async () => {
-    const user = userEvent.setup()
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
     sessionStorage.setItem('auth-token', 'test-token')
 
     mockFetch.mockResolvedValue(
@@ -403,7 +407,7 @@ describe('Editor Pane Integration', () => {
   })
 
   it('maintains editor state when splitting panes', async () => {
-    const user = userEvent.setup()
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
 
     // Start with an editor pane containing content
     store.dispatch(
@@ -449,7 +453,7 @@ describe('Editor Pane Integration', () => {
   })
 
   it('handles file load error gracefully', async () => {
-    const user = userEvent.setup()
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
     mockFetch.mockResolvedValue({
@@ -500,7 +504,7 @@ describe('Editor Pane Integration', () => {
 
   // Skip: JSDOM doesn't fire CSS transitionend events needed for PanePicker selection
   it.skip('integrates with terminal and editor panes in split view', async () => {
-    const user = userEvent.setup()
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
 
     // Start with a terminal
     store.dispatch(
