@@ -1,5 +1,6 @@
 import { detectLanIps } from './bootstrap.js' // Must be first - ensures .env exists before dotenv loads
 import 'dotenv/config'
+import { createRequire } from 'module'
 import express from 'express'
 import fs from 'fs'
 import http from 'http'
@@ -17,6 +18,14 @@ import { AI_CONFIG, PROMPTS, stripAnsi } from './ai-prompts.js'
 import { migrateSettingsSortMode } from './settings-migrate.js'
 import { filesRouter } from './files-router.js'
 import { getSessionRepairService } from './session-scanner/service.js'
+import { runUpdateCheck } from './updater/index.js'
+
+const require = createRequire(import.meta.url)
+const packageJson = require('../package.json')
+const APP_VERSION: string = packageJson.version
+
+const SKIP_UPDATE_CHECK = process.argv.includes('--skip-update-check') ||
+                          process.env.SKIP_UPDATE_CHECK === 'true'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -76,6 +85,7 @@ async function main() {
     const cfg = await configStore.snapshot()
     res.json({
       version: 1,
+      appVersion: APP_VERSION,
       wsConnections: wsHandler.connectionCount(),
       settings: cfg.settings,
       sessionsProjects: claudeIndexer.getProjects(),
@@ -329,6 +339,17 @@ async function main() {
       logger.warn({ err, terminalId: term.terminalId }, 'Failed to broadcast session association')
     }
   })
+
+  // Run update check before starting server
+  if (!SKIP_UPDATE_CHECK) {
+    const updateResult = await runUpdateCheck(APP_VERSION)
+
+    if (updateResult.action === 'updated') {
+      // Exit so process manager can restart with new version
+      console.log('Restarting with new version...')
+      process.exit(0)
+    }
+  }
 
   const port = Number(process.env.PORT || 3001)
   server.listen(port, '0.0.0.0', () => {

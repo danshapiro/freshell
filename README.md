@@ -177,6 +177,45 @@ npm start
 
 Access the app at http://localhost:3001/?token=YOUR_AUTH_TOKEN
 
+## Auto-Update
+
+Freshell checks for updates on startup. When a new version is available, you'll see:
+
+```
+╭─────────────────────────────────────────────╮
+│                                             │
+│  There's a new Freshell waiting for you!   │
+│                                             │
+│    0.1.0 → 0.2.0                           │
+│                                             │
+╰─────────────────────────────────────────────╯
+
+Upgrade now? [Y/n]
+```
+
+Press Enter (default Yes) to update, or 'n' to skip.
+
+### Restart Behavior
+
+After a successful update, Freshell exits with code 0. How to restart depends on your setup:
+
+- **Manual (`npm start`)**: Re-run `npm start` after the process exits
+- **pm2**: Automatic restart - the updated version runs immediately
+- **systemd**: Automatic restart if configured with `Restart=always`
+- **Docker**: Depends on your restart policy
+
+### Disabling Auto-Update
+
+To skip the update check (useful for CI/testing):
+
+```bash
+# Via command line flag
+npm start -- --skip-update-check
+
+# Via environment variable
+SKIP_UPDATE_CHECK=true npm start
+```
+
 ## Keyboard Shortcuts
 
 freshell uses a tmux-style prefix system. Press `Ctrl+B` followed by a command key:

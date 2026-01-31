@@ -16,6 +16,15 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - Specific user instructions override ALL other instructions, including the above, and including superpowers or skills
 - Server uses NodeNext/ESM; relative imports must include `.js` extensions
 
+## Merging to Main (CRITICAL - Read This)
+
+**You are running inside Freshell right now. This session, the terminal you're typing in, is served by the main branch. If you break main, you kill yourself mid-operation and the user has to clean up your mess with a separate agent.**
+
+- Never run `git merge` directly on main - merge conflicts write `<<<<<<< HEAD` markers into source files, which crashes the server instantly
+- Always merge main INTO the feature branch in the worktree first, resolve any conflicts there
+- Then fast-forward main: `git merge --ff-only feature/branch` - this is atomic (pointer move, no intermediate states)
+- If `--ff-only` fails, go back to the worktree and rebase/merge until it can fast-forward
+
 ## Codex Agent in CMD Instructions (Codex agents only; only when running in CMD on windows; all other agents must ignore)
 - Prefer bash/WSL over PowerShell; Windows paths map like `D:\...` -> `/mnt/d/...`.
 - Use `bash -lc "<cmd>"` for non-interactive commands; avoid interactive shells so commands return control.
