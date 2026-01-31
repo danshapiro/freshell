@@ -392,6 +392,28 @@ export default function SettingsView() {
               />
             </SettingsRow>
           </SettingsSection>
+
+          {/* Panes */}
+          <SettingsSection title="Panes" description="New pane behavior">
+            <SettingsRow label="Default new pane">
+              <select
+                aria-label="Default new pane"
+                value={settings.panes?.defaultNewPane || 'ask'}
+                onChange={(e) => {
+                  const v = e.target.value as 'ask' | 'shell' | 'browser' | 'editor'
+                  dispatch(updateSettingsLocal({ panes: { defaultNewPane: v } } as any))
+                  scheduleSave({ panes: { defaultNewPane: v } })
+                }}
+                className="h-8 px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border"
+              >
+                <option value="ask">Ask</option>
+                <option value="shell">Shell</option>
+                <option value="browser">Browser</option>
+                <option value="editor">Editor</option>
+              </select>
+            </SettingsRow>
+          </SettingsSection>
+
           {/* Terminal */}
           <SettingsSection title="Terminal" description="Font and rendering options">
             <SettingsRow label="Color scheme">
