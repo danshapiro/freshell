@@ -436,7 +436,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const showSpinner = terminalContent.status === 'creating' || isAttaching
 
   return (
-    <div className={cn('h-full w-full relative', hidden ? 'hidden' : '')}>
+    <div className={cn('h-full w-full', hidden ? 'tab-hidden' : 'tab-visible relative')}>
       <div ref={containerRef} className="h-full w-full" />
       {showSpinner && (
         <div className="absolute inset-0 flex items-center justify-center bg-background/80">
