@@ -1230,4 +1230,40 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(sidebar.className).toContain('transition-')
     })
   })
+
+  describe('Search tier toggle', () => {
+    it('renders tier selector when searching', async () => {
+      const store = createTestStore()
+      const { getByPlaceholderText, getByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      // Type in search
+      const input = getByPlaceholderText('Search...')
+      fireEvent.change(input, { target: { value: 'test' } })
+
+      // Should show tier selector
+      expect(getByRole('combobox', { name: /search tier/i })).toBeInTheDocument()
+    })
+
+    it('hides tier selector when search is empty', async () => {
+      const store = createTestStore()
+      const { getByPlaceholderText, queryByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      const input = getByPlaceholderText('Search...')
+      expect(input).toHaveValue('')
+      expect(queryByRole('combobox', { name: /search tier/i })).not.toBeInTheDocument()
+    })
+
+    it('defaults to title tier', async () => {
+      const store = createTestStore()
+      const { getByPlaceholderText, getByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      fireEvent.change(getByPlaceholderText('Search...'), { target: { value: 'test' } })
+
+      const select = getByRole('combobox', { name: /search tier/i })
+      expect(select).toHaveValue('title')
+    })
+  })
 })

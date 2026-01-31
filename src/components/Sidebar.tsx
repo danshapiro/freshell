@@ -65,6 +65,7 @@ export default function Sidebar({
   const ws = useMemo(() => getWsClient(), [])
   const [terminals, setTerminals] = useState<BackgroundTerminal[]>([])
   const [filter, setFilter] = useState('')
+  const [searchTier, setSearchTier] = useState<'title' | 'userMessages' | 'fullText'>('title')
   const requestIdRef = useRef<string | null>(null)
 
   // Fetch background terminals
@@ -269,6 +270,20 @@ export default function Sidebar({
             className="w-full h-8 pl-8 pr-3 text-sm bg-muted/50 border-0 rounded-md placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-border"
           />
         </div>
+        {filter.trim() && (
+          <div className="mt-2">
+            <select
+              aria-label="Search tier"
+              value={searchTier}
+              onChange={(e) => setSearchTier(e.target.value as typeof searchTier)}
+              className="w-full h-7 px-2 text-xs bg-muted/50 border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border"
+            >
+              <option value="title">Title</option>
+              <option value="userMessages">User Msg</option>
+              <option value="fullText">Full Text</option>
+            </select>
+          </div>
+        )}
       </div>
 
       {/* Navigation */}
