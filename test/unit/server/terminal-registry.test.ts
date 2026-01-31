@@ -599,6 +599,15 @@ describe('buildSpawnSpec Unix paths', () => {
 
       expect(spec.file).toBe('/opt/codex/bin/codex')
     })
+
+    it('adds resume subcommand when resumeSessionId provided', () => {
+      delete process.env.CODEX_CMD
+
+      const spec = buildSpawnSpec('codex', '/home/user/project', 'system', 'session-123')
+
+      expect(spec.file).toBe('codex')
+      expect(spec.args).toEqual(['resume', 'session-123'])
+    })
   })
 
   describe('environment variables in spawn spec', () => {
@@ -1116,7 +1125,7 @@ describe('TerminalRegistry', () => {
     })
   })
 
-  describe('findClaudeTerminalsBySession() exact match', () => {
+  describe('findTerminalsBySession() exact match', () => {
     it('finds terminal by exact resumeSessionId match', () => {
       const record = registry.create({
         mode: 'claude',
@@ -1124,7 +1133,7 @@ describe('TerminalRegistry', () => {
         resumeSessionId: 'session-exact-match',
       })
 
-      const found = registry.findClaudeTerminalsBySession('session-exact-match')
+      const found = registry.findTerminalsBySession('claude', 'session-exact-match')
 
       expect(found).toHaveLength(1)
       expect(found[0].terminalId).toBe(record.terminalId)
@@ -1138,7 +1147,7 @@ describe('TerminalRegistry', () => {
         resumeSessionId: 'session-different',
       })
 
-      const found = registry.findClaudeTerminalsBySession('session-nonexistent')
+      const found = registry.findTerminalsBySession('claude', 'session-nonexistent')
 
       expect(found).toHaveLength(0)
     })
@@ -1155,14 +1164,14 @@ describe('TerminalRegistry', () => {
         resumeSessionId: 'session-shared',
       })
 
-      const found = registry.findClaudeTerminalsBySession('session-shared')
+      const found = registry.findTerminalsBySession('claude', 'session-shared')
 
       expect(found).toHaveLength(2)
       expect(found.every(t => t.resumeSessionId === 'session-shared')).toBe(true)
     })
   })
 
-  describe('findClaudeTerminalsBySession() ignores cwd parameter', () => {
+  describe('findTerminalsBySession() ignores cwd parameter', () => {
     it('does not match by cwd, only by resumeSessionId', () => {
       registry.create({
         mode: 'claude',
@@ -1171,7 +1180,7 @@ describe('TerminalRegistry', () => {
       })
 
       // cwd matches but sessionId doesn't - should not find terminal
-      const found = registry.findClaudeTerminalsBySession('session-nonexistent', '/home/user/project')
+      const found = registry.findTerminalsBySession('claude', 'session-nonexistent', '/home/user/project')
 
       expect(found).toHaveLength(0)
     })
@@ -1184,14 +1193,14 @@ describe('TerminalRegistry', () => {
       })
 
       // cwd differs but sessionId matches - should find terminal
-      const found = registry.findClaudeTerminalsBySession('session-target', '/home/user/different')
+      const found = registry.findTerminalsBySession('claude', 'session-target', '/home/user/different')
 
       expect(found).toHaveLength(1)
       expect(found[0].terminalId).toBe(record.terminalId)
     })
   })
 
-  describe('findClaudeTerminalsBySession() ignores shell mode', () => {
+  describe('findTerminalsBySession() ignores shell mode', () => {
     it('does not return shell-mode terminals even with matching resumeSessionId', () => {
       registry.create({
         mode: 'shell',
@@ -1199,7 +1208,7 @@ describe('TerminalRegistry', () => {
         resumeSessionId: 'session-123',
       })
 
-      const found = registry.findClaudeTerminalsBySession('session-123', '/home/user/project')
+      const found = registry.findTerminalsBySession('claude', 'session-123', '/home/user/project')
 
       expect(found).toHaveLength(0)
     })
@@ -1211,7 +1220,7 @@ describe('TerminalRegistry', () => {
         resumeSessionId: 'session-exact',
       })
 
-      const found = registry.findClaudeTerminalsBySession('session-exact')
+      const found = registry.findTerminalsBySession('claude', 'session-exact')
 
       expect(found).toHaveLength(0)
     })
@@ -1223,7 +1232,7 @@ describe('TerminalRegistry', () => {
         resumeSessionId: 'session-123',
       })
 
-      const found = registry.findClaudeTerminalsBySession('session-123', '/home/user/project')
+      const found = registry.findTerminalsBySession('claude', 'session-123', '/home/user/project')
 
       expect(found).toHaveLength(0)
     })
@@ -1245,7 +1254,7 @@ describe('TerminalRegistry', () => {
         resumeSessionId: 'session-shared',
       })
 
-      const found = registry.findClaudeTerminalsBySession('session-shared')
+      const found = registry.findTerminalsBySession('claude', 'session-shared')
 
       expect(found).toHaveLength(1)
       expect(found[0].terminalId).toBe(claudeRecord.terminalId)

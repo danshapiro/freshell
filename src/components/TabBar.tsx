@@ -6,6 +6,7 @@ import { deriveTabName } from '@/lib/deriveTabName'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import TabItem from './TabItem'
 import { useTerminalActivityMonitor } from '@/hooks/useTerminalActivityMonitor'
+import { cancelCodingCliRequest } from '@/store/codingCliSlice'
 import {
   DndContext,
   closestCenter,
@@ -229,6 +230,15 @@ export default function TabBar() {
                       type: e.shiftKey ? 'terminal.kill' : 'terminal.detach',
                       terminalId: tab.terminalId,
                     })
+                  } else if (tab.codingCliSessionId) {
+                    if (tab.status === 'creating') {
+                      dispatch(cancelCodingCliRequest({ requestId: tab.codingCliSessionId }))
+                    } else {
+                      ws.send({
+                        type: 'codingcli.kill',
+                        sessionId: tab.codingCliSessionId,
+                      })
+                    }
                   }
                   dispatch(closeTab(tab.id))
                 }}

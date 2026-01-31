@@ -5,6 +5,7 @@ import fs from 'fs'
 import chokidar from 'chokidar'
 import { logger } from './logger.js'
 import { configStore, SessionOverride } from './config-store.js'
+import { makeSessionKey } from './coding-cli/types.js'
 import { extractTitleFromMessage } from './title-utils.js'
 
 const SEEN_SESSION_RETENTION_MS = Number(process.env.CLAUDE_SEEN_SESSION_RETENTION_MS || 7 * 24 * 60 * 60 * 1000)
@@ -432,7 +433,8 @@ export class ClaudeSessionIndexer {
       cwd: meta.cwd,
     }
 
-    const ov = cfg.sessionOverrides?.[sessionId]
+    const compositeKey = makeSessionKey('claude', sessionId)
+    const ov = cfg.sessionOverrides?.[compositeKey] || cfg.sessionOverrides?.[sessionId]
     const merged = applyOverride(baseSession, ov)
     if (!merged) {
       if (this.removeSession(sessionId)) {
@@ -508,7 +510,8 @@ export class ClaudeSessionIndexer {
           cwd: meta.cwd,
         }
 
-        const ov = cfg.sessionOverrides?.[sessionId]
+        const compositeKey = makeSessionKey('claude', sessionId)
+        const ov = cfg.sessionOverrides?.[compositeKey] || cfg.sessionOverrides?.[sessionId]
         const merged = applyOverride(baseSession, ov)
         if (merged) sessions.push(merged)
       }

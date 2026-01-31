@@ -1,13 +1,14 @@
 import { cn } from '@/lib/utils'
-import type { ToolUseContent } from '@/lib/claude-types'
+import type { NormalizedEvent } from '@/lib/coding-cli-types'
 
 interface ToolCallBlockProps {
-  tool: ToolUseContent
+  tool: NonNullable<NormalizedEvent['toolCall']>
   className?: string
 }
 
 export function ToolCallBlock({ tool, className }: ToolCallBlockProps) {
-  const inputStr = JSON.stringify(tool.input, null, 2)
+  const inputStr =
+    typeof tool.arguments === 'string' ? tool.arguments : JSON.stringify(tool.arguments ?? {}, null, 2)
 
   return (
     <div className={cn('rounded-md border bg-background/50 p-3 my-2', className)}>

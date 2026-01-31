@@ -2,16 +2,10 @@ import { describe, it, expect, afterEach, vi } from 'vitest'
 import path from 'path'
 import os from 'os'
 
-// Import the functions we want to test
-import {
-  looksLikePath,
-  defaultClaudeHome,
-  parseSessionContent,
-  ClaudeSessionIndexer,
-  ClaudeSession,
-} from '../../../server/claude-indexer'
+import { defaultClaudeHome, parseSessionContent } from '../../../../server/coding-cli/providers/claude'
+import { looksLikePath } from '../../../../server/coding-cli/utils'
 
-describe('claude-indexer cross-platform tests', () => {
+describe('claude provider cross-platform tests', () => {
   describe('defaultClaudeHome()', () => {
     const originalEnv = process.env.CLAUDE_HOME
 

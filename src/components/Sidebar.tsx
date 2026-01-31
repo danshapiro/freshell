@@ -7,7 +7,8 @@ import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, setActiveTab } from '@/store/tabsSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { searchSessions, type SearchResult } from '@/lib/api'
-import type { BackgroundTerminal } from '@/store/types'
+import { getProviderLabel } from '@/lib/coding-cli-utils'
+import type { BackgroundTerminal, CodingCliProviderName } from '@/store/types'
 import { makeSelectSortedSessionItems, type SidebarSessionItem } from '@/store/selectors/sidebarSelectors'
 
 export type AppView = 'terminal' | 'sessions' | 'overview' | 'settings'
@@ -103,6 +104,33 @@ export default function Sidebar({
         const response = await searchSessions({
           query: filter.trim(),
           tier: searchTier,
+=======
+    // Build map: sessionId -> running terminalId
+    const runningSessionMap = new Map<string, string>()
+    terminalsArray.forEach((t) => {
+      if (isCodingCliMode(t.mode) && t.status === 'running' && t.resumeSessionId) {
+        runningSessionMap.set(`${t.mode}:${t.resumeSessionId}`, t.terminalId)
+      }
+    })
+
+    // Add sessions with running state
+    projectsArray.forEach((project) => {
+      project.sessions.forEach((session) => {
+        const provider = session.provider || 'claude'
+        const runningTerminalId = runningSessionMap.get(`${provider}:${session.sessionId}`)
+        items.push({
+          id: `session-${provider}-${session.sessionId}`,
+          sessionId: session.sessionId,
+          provider,
+          title: session.title || session.sessionId.slice(0, 8),
+          subtitle: getProjectName(project.projectPath),
+          projectPath: project.projectPath,
+          projectColor: project.color,
+          timestamp: session.updatedAt,
+          cwd: session.cwd,
+          isRunning: !!runningTerminalId,
+          runningTerminalId,
+>>>>>>> 4ad4128 (\)
         })
         if (!controller.signal.aborted) {
           setSearchResults(response.results)
@@ -127,27 +155,45 @@ export default function Sidebar({
 
   // Build session list with selector for local filtering (title tier)
   const localFilteredItems = useAppSelector((state) => selectSortedItems(state, terminals, filter))
+  const allItems = useAppSelector((state) => selectSortedItems(state, terminals, ''))
+  const itemsByKey = useMemo(() => {
+    const map = new Map<string, SidebarSessionItem>()
+    for (const item of allItems) {
+      map.set(`${item.provider}:${item.sessionId}`, item)
+    }
+    return map
+  }, [allItems])
 
   // Combine local and backend search results
   const sortedItems = useMemo(() => {
     // If we have backend search results, convert them to SessionItems
     if (searchResults !== null) {
-      return searchResults.map((result): SessionItem => ({
-        id: `search-${result.sessionId}`,
-        sessionId: result.sessionId,
-        title: result.title || result.sessionId.slice(0, 8),
-        subtitle: getProjectName(result.projectPath),
-        projectPath: result.projectPath,
-        timestamp: result.updatedAt,
-        cwd: result.cwd,
-        hasTab: tabs.some((t) => t.resumeSessionId === result.sessionId),
-        isRunning: false,
-      }))
+      return searchResults.map((result): SessionItem => {
+        const provider = 'claude' as CodingCliProviderName
+        const key = `${provider}:${result.sessionId}`
+        const existing = itemsByKey.get(key)
+        return {
+          id: `search-${provider}-${result.sessionId}`,
+          sessionId: result.sessionId,
+          provider,
+          title: result.title || result.sessionId.slice(0, 8),
+          subtitle: getProjectName(result.projectPath),
+          projectPath: result.projectPath,
+          projectColor: existing?.projectColor,
+          timestamp: result.updatedAt,
+          cwd: result.cwd,
+          hasTab: existing?.hasTab ?? false,
+          tabLastInputAt: existing?.tabLastInputAt,
+          ratchetedActivity: existing?.ratchetedActivity,
+          isRunning: existing?.isRunning ?? false,
+          runningTerminalId: existing?.runningTerminalId,
+        }
+      })
     }
 
     // Otherwise use local filtering for title tier
     return localFilteredItems
-  }, [searchResults, localFilteredItems, tabs])
+  }, [itemsByKey, localFilteredItems, searchResults])
 
   useEffect(() => {
     const container = listContainerRef.current
@@ -169,6 +215,7 @@ export default function Sidebar({
   }, [])
 
   const handleItemClick = (item: SessionItem) => {
+    const provider = item.provider as CodingCliProviderName
     if (item.isRunning && item.runningTerminalId) {
       // Session is running - check if tab with this terminal already exists
       const existingTab = tabs.find((t) => t.terminalId === item.runningTerminalId)
@@ -180,20 +227,24 @@ export default function Sidebar({
           title: item.title,
           terminalId: item.runningTerminalId,
           status: 'running',
-          mode: 'claude',
+          mode: provider,
+          codingCliProvider: provider,
           resumeSessionId: item.sessionId,
         }))
       }
     } else {
       // Session not running - check if tab with this session already exists
-      const existingTab = tabs.find((t) => t.resumeSessionId === item.sessionId)
+      const existingTab = tabs.find((t) =>
+        t.resumeSessionId === item.sessionId && (t.codingCliProvider || t.mode) === provider
+      )
       if (existingTab) {
         dispatch(setActiveTab(existingTab.id))
       } else {
         // Create new tab to resume the session
         dispatch(addTab({
           title: item.title,
-          mode: 'claude',
+          mode: provider,
+          codingCliProvider: provider,
           initialCwd: item.cwd,
           resumeSessionId: item.sessionId
         }))
@@ -210,7 +261,10 @@ export default function Sidebar({
   ]
 
   const activeTab = tabs.find((t) => t.id === activeTabId)
-  const activeResumeSessionId = activeTab?.resumeSessionId
+  const activeProvider = activeTab?.codingCliProvider || (activeTab?.mode !== 'shell' ? activeTab?.mode : undefined)
+  const activeSessionKey = activeTab?.resumeSessionId && activeProvider
+    ? `${activeProvider}:${activeTab.resumeSessionId}`
+    : null
   const activeTerminalId = activeTab?.terminalId
   const effectiveListHeight = listHeight > 0
     ? listHeight
@@ -218,17 +272,17 @@ export default function Sidebar({
 
   const rowProps = useMemo(() => ({
     items: sortedItems,
-    activeResumeSessionId,
+    activeSessionKey,
     activeTerminalId,
     showProjectBadge: settings.sidebar?.showProjectBadges,
     onItemClick: handleItemClick,
-  }), [sortedItems, activeResumeSessionId, activeTerminalId, settings.sidebar?.showProjectBadges, handleItemClick])
+  }), [sortedItems, activeSessionKey, activeTerminalId, settings.sidebar?.showProjectBadges, handleItemClick])
 
   const Row = ({ index, style, ariaAttributes, ...data }: RowComponentProps<typeof rowProps>) => {
     const item = data.items[index]
     const isActive = item.isRunning
       ? item.runningTerminalId === data.activeTerminalId
-      : item.sessionId === data.activeResumeSessionId
+      : `${item.provider}:${item.sessionId}` === data.activeSessionKey
     return (
       <div style={{ ...style, paddingBottom: 2 }} {...ariaAttributes}>
         <SidebarItem
@@ -398,6 +452,9 @@ function SidebarItem({
             </TooltipTrigger>
             <TooltipContent>{item.title}</TooltipContent>
           </Tooltip>
+          <span className="text-2xs text-muted-foreground bg-muted/60 px-1.5 py-0.5 rounded">
+            {getProviderLabel(item.provider)}
+          </span>
         </div>
         {item.subtitle && showProjectBadge && (
           <Tooltip>

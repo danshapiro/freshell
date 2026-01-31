@@ -1,16 +1,13 @@
 import { cn } from '@/lib/utils'
-import type { ToolResultContent } from '@/lib/claude-types'
+import type { NormalizedEvent } from '@/lib/coding-cli-types'
 
 interface ToolResultBlockProps {
-  result: ToolResultContent
-  stdout?: string
-  stderr?: string
+  result: NonNullable<NormalizedEvent['toolResult']>
   className?: string
 }
 
-export function ToolResultBlock({ result, stdout, stderr, className }: ToolResultBlockProps) {
-  const content = stdout || result.content
-  const hasError = result.is_error || !!stderr
+export function ToolResultBlock({ result, className }: ToolResultBlockProps) {
+  const hasError = result.isError
 
   return (
     <div
@@ -25,14 +22,9 @@ export function ToolResultBlock({ result, stdout, stderr, className }: ToolResul
           {hasError ? 'Error' : 'Result'}
         </span>
       </div>
-      {content && (
+      {result.output && (
         <pre className="text-xs overflow-x-auto whitespace-pre-wrap break-words bg-muted/50 p-2 rounded max-h-64 overflow-y-auto">
-          {content}
-        </pre>
-      )}
-      {stderr && (
-        <pre className="text-xs overflow-x-auto whitespace-pre-wrap break-words bg-destructive/10 p-2 rounded mt-2 text-destructive">
-          {stderr}
+          {result.output}
         </pre>
       )}
     </div>

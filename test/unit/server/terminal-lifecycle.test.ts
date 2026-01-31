@@ -68,15 +68,31 @@ function createMockWebSocket(): any {
 function createTestSettings(overrides?: Partial<AppSettings>): AppSettings {
   return {
     theme: 'system',
+    uiScale: 1.0,
     terminal: {
       fontFamily: 'monospace',
       fontSize: 14,
+      lineHeight: 1,
       cursorBlink: true,
       scrollback: 5000,
+      theme: 'auto',
     },
     safety: {
       autoKillIdleMinutes: 30,
       warnBeforeKillMinutes: 5,
+    },
+    sidebar: {
+      sortMode: 'hybrid',
+      showProjectBadges: true,
+      width: 288,
+      collapsed: false,
+    },
+    codingCli: {
+      enabledProviders: ['claude', 'codex'],
+      providers: {
+        claude: { permissionMode: 'default' },
+        codex: {},
+      },
     },
     ...overrides,
   }

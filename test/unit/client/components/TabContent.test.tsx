@@ -17,15 +17,17 @@ vi.mock('@/components/panes', () => ({
   PaneLayout: mockPaneLayout,
 }))
 
-// Mock ClaudeSessionView
-vi.mock('@/components/ClaudeSessionView', () => ({
-  default: () => <div data-testid="claude-session-view" />,
+// Mock SessionView
+vi.mock('@/components/SessionView', () => ({
+  default: () => <div data-testid="session-view" />,
 }))
 
 interface TabConfig {
   id: string
   mode: string
   terminalId?: string
+  codingCliSessionId?: string
+  resumeSessionId?: string
 }
 
 interface StoreOptions {
@@ -50,10 +52,12 @@ function createStore(tabs: TabConfig[], options: StoreOptions = {}) {
       tabs: {
         tabs: tabs.map((t) => ({
           id: t.id,
-          mode: t.mode as 'shell' | 'claude',
+          mode: t.mode as any,
           status: 'running' as const,
           title: 'Test',
           terminalId: t.terminalId,
+          codingCliSessionId: t.codingCliSessionId,
+          resumeSessionId: t.resumeSessionId,
           createRequestId: 'req-1',
         })),
         activeTabId: tabs[0]?.id,
@@ -64,7 +68,7 @@ function createStore(tabs: TabConfig[], options: StoreOptions = {}) {
       },
       settings: {
         settings,
-        status: 'loaded' as const,
+        loaded: true,
       },
     },
   })
@@ -136,6 +140,23 @@ describe('TabContent', () => {
         }),
         expect.anything()
       )
+    })
+  })
+
+  describe('coding CLI sessions', () => {
+    it('renders SessionView when codingCliSessionId is present and no terminalId', () => {
+      const store = createStore([
+        { id: 'tab-1', mode: 'codex', codingCliSessionId: 'coding-session-1' },
+      ])
+
+      const { getByTestId } = render(
+        <Provider store={store}>
+          <TabContent tabId="tab-1" />
+        </Provider>
+      )
+
+      expect(getByTestId('session-view')).toBeInTheDocument()
+      expect(mockPaneLayout).not.toHaveBeenCalled()
     })
   })
 

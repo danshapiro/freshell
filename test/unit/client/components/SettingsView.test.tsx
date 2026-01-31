@@ -113,6 +113,9 @@ describe('SettingsView Component', () => {
       expect(screen.getByText('Safety')).toBeInTheDocument()
       expect(screen.getByText('Auto-kill and idle terminal management')).toBeInTheDocument()
 
+      expect(screen.getByText('Coding CLIs')).toBeInTheDocument()
+      expect(screen.getByText('Providers and defaults for coding sessions')).toBeInTheDocument()
+
       expect(screen.getByText('Keyboard shortcuts')).toBeInTheDocument()
       expect(screen.getByText('Quick navigation')).toBeInTheDocument()
     })
@@ -166,6 +169,13 @@ describe('SettingsView Component', () => {
       expect(screen.getByText('Auto-kill idle (minutes)')).toBeInTheDocument()
       expect(screen.getByText('Warn before kill (minutes)')).toBeInTheDocument()
       expect(screen.getByText('Default working directory')).toBeInTheDocument()
+
+      // Coding CLI section
+      expect(screen.getByText('Enable Claude')).toBeInTheDocument()
+      expect(screen.getByText('Enable Codex')).toBeInTheDocument()
+      expect(screen.getByText('Claude permission mode')).toBeInTheDocument()
+      expect(screen.getByText('Codex model')).toBeInTheDocument()
+      expect(screen.getByText('Codex sandbox')).toBeInTheDocument()
     })
   })
 
@@ -701,6 +711,57 @@ describe('SettingsView Component', () => {
 
       expect(api.patch).toHaveBeenCalledWith('/api/settings', {
         terminal: { cursorBlink: false },
+      })
+    })
+
+    it('toggles codex provider enabled state', () => {
+      const store = createTestStore()
+      renderWithStore(store)
+
+      const row = screen.getByText('Enable Codex').closest('div')!
+      const toggle = row.querySelector('button')!
+      fireEvent.click(toggle)
+
+      expect(store.getState().settings.settings.codingCli.enabledProviders).not.toContain('codex')
+    })
+
+    it('updates codex model input', async () => {
+      const store = createTestStore()
+      renderWithStore(store)
+
+      const input = screen.getByPlaceholderText('e.g. gpt-5-codex')
+      fireEvent.change(input, { target: { value: 'gpt-5-codex' } })
+
+      expect(store.getState().settings.settings.codingCli.providers.codex?.model).toBe('gpt-5-codex')
+
+      await act(async () => {
+        vi.advanceTimersByTime(500)
+      })
+
+      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
+        codingCli: { providers: { codex: { model: 'gpt-5-codex' } } },
+      })
+    })
+
+    it('updates codex sandbox select', async () => {
+      const store = createTestStore()
+      renderWithStore(store)
+
+      const selects = screen.getAllByRole('combobox')
+      const sandboxSelect = selects.find((select) => {
+        return select.querySelector('option[value="workspace-write"]') !== null
+      })!
+
+      fireEvent.change(sandboxSelect, { target: { value: 'workspace-write' } })
+
+      expect(store.getState().settings.settings.codingCli.providers.codex?.sandbox).toBe('workspace-write')
+
+      await act(async () => {
+        vi.advanceTimersByTime(500)
+      })
+
+      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
+        codingCli: { providers: { codex: { sandbox: 'workspace-write' } } },
       })
     })
 

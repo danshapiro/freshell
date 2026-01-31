@@ -4,7 +4,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import TabBar from '@/components/TabBar'
 import tabsReducer, { TabsState } from '@/store/tabsSlice'
-import claudeReducer from '@/store/claudeSlice'
+import codingCliReducer, { registerCodingCliRequest } from '@/store/codingCliSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import terminalActivityReducer from '@/store/terminalActivitySlice'
@@ -57,7 +57,7 @@ function createStore(initialState: Partial<TabsState> = {}) {
   return configureStore({
     reducer: {
       tabs: tabsReducer,
-      claude: claudeReducer,
+      codingCli: codingCliReducer,
       panes: panesReducer,
       settings: settingsReducer,
       terminalActivity: terminalActivityReducer,
@@ -68,8 +68,9 @@ function createStore(initialState: Partial<TabsState> = {}) {
         activeTabId: null,
         ...initialState,
       },
-      claude: {
+      codingCli: {
         sessions: {},
+        pendingRequests: {},
       },
       panes: {
         layouts: {},

@@ -42,6 +42,15 @@ describe('settingsSlice', () => {
         width: 288,
         collapsed: false,
       })
+      expect(state.settings.codingCli).toEqual({
+        enabledProviders: ['claude', 'codex'],
+        providers: {
+          claude: {
+            permissionMode: 'default',
+          },
+          codex: {},
+        },
+      })
     })
   })
 
@@ -72,7 +81,19 @@ describe('settingsSlice', () => {
           sortMode: 'recency',
           showProjectBadges: false,
           width: 320,
-          collapsed: true,
+          collapsed: false,
+        },
+        codingCli: {
+          enabledProviders: ['codex'],
+          providers: {
+            codex: {
+              model: 'gpt-5-codex',
+              sandbox: 'read-only',
+            },
+          },
+        },
+        panes: {
+          defaultNewPane: 'ask',
         },
         panes: {
           defaultNewPane: 'shell',
@@ -200,6 +221,31 @@ describe('settingsSlice', () => {
 
       expect(state.settings.sidebar.sortMode).toBe('activity')
       expect(state.settings.sidebar.showProjectBadges).toBe(defaultSettings.sidebar.showProjectBadges)
+    })
+
+    it('deep merges coding CLI settings', () => {
+      const initialState: SettingsState = {
+        settings: defaultSettings,
+        loaded: true,
+      }
+
+      const state = settingsReducer(
+        initialState,
+        updateSettingsLocal({
+          codingCli: {
+            enabledProviders: ['claude'],
+            providers: {
+              codex: {
+                model: 'gpt-5-codex',
+              },
+            },
+          },
+        })
+      )
+
+      expect(state.settings.codingCli.enabledProviders).toEqual(['claude'])
+      expect(state.settings.codingCli.providers.codex?.model).toBe('gpt-5-codex')
+      expect(state.settings.codingCli.providers.claude?.permissionMode).toBe('default')
     })
 
     it('handles multiple nested updates simultaneously', () => {
@@ -332,6 +378,7 @@ describe('settingsSlice', () => {
       expect(defaultSettings).toHaveProperty('terminal')
       expect(defaultSettings).toHaveProperty('safety')
       expect(defaultSettings).toHaveProperty('sidebar')
+      expect(defaultSettings).toHaveProperty('codingCli')
     })
   })
 })

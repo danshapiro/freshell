@@ -5,8 +5,7 @@ import { logger } from './logger.js'
 import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed } from './auth.js'
 import type { TerminalRegistry, TerminalMode } from './terminal-registry.js'
 import { configStore } from './config-store.js'
-import type { ClaudeSessionManager } from './claude-session.js'
-import type { ClaudeEvent } from './claude-stream-types.js'
+import type { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import type { SessionRepairService } from './session-scanner/service.js'
 import type { SessionScanResult, SessionRepairResult } from './session-scanner/types.js'
 
@@ -63,7 +62,8 @@ const ShellSchema = z.enum(['system', 'cmd', 'powershell', 'wsl'])
 const TerminalCreateSchema = z.object({
   type: z.literal('terminal.create'),
   requestId: z.string().min(1),
-  mode: z.enum(['shell', 'claude', 'codex']).default('shell'),
+  // Mode supports shell and all coding CLI providers (future providers need spawn logic)
+  mode: z.enum(['shell', 'claude', 'codex', 'opencode', 'gemini', 'kimi']).default('shell'),
   shell: ShellSchema.default('system'),
   cwd: z.string().optional(),
   resumeSessionId: z.string().optional(),
@@ -102,26 +102,30 @@ const TerminalListSchema = z.object({
   requestId: z.string().min(1),
 })
 
-// Claude session schemas
-const ClaudeCreateSchema = z.object({
-  type: z.literal('claude.create'),
+const CodingCliProviderSchema = z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
+
+// Coding CLI session schemas
+const CodingCliCreateSchema = z.object({
+  type: z.literal('codingcli.create'),
   requestId: z.string().min(1),
+  provider: CodingCliProviderSchema,
   prompt: z.string().min(1),
   cwd: z.string().optional(),
   resumeSessionId: z.string().optional(),
   model: z.string().optional(),
   maxTurns: z.number().int().positive().optional(),
   permissionMode: z.enum(['default', 'plan', 'acceptEdits', 'bypassPermissions']).optional(),
+  sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
 })
 
-const ClaudeInputSchema = z.object({
-  type: z.literal('claude.input'),
+const CodingCliInputSchema = z.object({
+  type: z.literal('codingcli.input'),
   sessionId: z.string().min(1),
   data: z.string(),
 })
 
-const ClaudeKillSchema = z.object({
-  type: z.literal('claude.kill'),
+const CodingCliKillSchema = z.object({
+  type: z.literal('codingcli.kill'),
   sessionId: z.string().min(1),
 })
 
@@ -135,17 +139,17 @@ const ClientMessageSchema = z.discriminatedUnion('type', [
   TerminalResizeSchema,
   TerminalKillSchema,
   TerminalListSchema,
-  ClaudeCreateSchema,
-  ClaudeInputSchema,
-  ClaudeKillSchema,
+  CodingCliCreateSchema,
+  CodingCliInputSchema,
+  CodingCliKillSchema,
 ])
 
 type ClientState = {
   authenticated: boolean
   attachedTerminalIds: Set<string>
   createdByRequestId: Map<string, string>
-  claudeSessions: Set<string>
-  claudeSubscriptions: Map<string, () => void>
+  codingCliSessions: Set<string>
+  codingCliSubscriptions: Map<string, () => void>
   interestedSessions: Set<string>
   helloTimer?: NodeJS.Timeout
 }
@@ -164,7 +168,7 @@ export class WsHandler {
   constructor(
     server: http.Server,
     private registry: TerminalRegistry,
-    private claudeManager?: ClaudeSessionManager,
+    private codingCliManager?: CodingCliSessionManager,
     sessionRepairService?: SessionRepairService
   ) {
     this.sessionRepairService = sessionRepairService
@@ -270,8 +274,8 @@ export class WsHandler {
       authenticated: false,
       attachedTerminalIds: new Set(),
       createdByRequestId: new Map(),
-      claudeSessions: new Set(),
-      claudeSubscriptions: new Map(),
+      codingCliSessions: new Set(),
+      codingCliSubscriptions: new Map(),
       interestedSessions: new Set(),
     }
     this.clientStates.set(ws, state)
@@ -304,17 +308,17 @@ export class WsHandler {
       this.registry.detach(terminalId, ws)
     }
     state.attachedTerminalIds.clear()
-    for (const off of state.claudeSubscriptions.values()) {
+    for (const off of state.codingCliSubscriptions.values()) {
       off()
     }
-    state.claudeSubscriptions.clear()
+    state.codingCliSubscriptions.clear()
   }
 
-  private removeClaudeSubscription(state: ClientState, sessionId: string) {
-    const off = state.claudeSubscriptions.get(sessionId)
+  private removeCodingCliSubscription(state: ClientState, sessionId: string) {
+    const off = state.codingCliSubscriptions.get(sessionId)
     if (off) {
       off()
-      state.claudeSubscriptions.delete(sessionId)
+      state.codingCliSubscriptions.delete(sessionId)
     }
   }
 
@@ -376,7 +380,7 @@ export class WsHandler {
       return
     }
 
-        if (m.type === 'hello') {
+    if (m.type === 'hello') {
       const expected = getRequiredAuthToken()
       if (!m.token || m.token !== expected) {
         this.sendError(ws, { code: 'NOT_AUTHENTICATED', message: 'Invalid token' })
@@ -544,51 +548,75 @@ export class WsHandler {
         return
       }
 
-      case 'claude.create': {
-        if (!this.claudeManager) {
+      case 'codingcli.create': {
+        if (!this.codingCliManager) {
           this.sendError(ws, {
             code: 'INTERNAL_ERROR',
-            message: 'Claude sessions not enabled',
+            message: 'Coding CLI sessions not enabled',
             requestId: m.requestId,
           })
           return
         }
 
         try {
-          const session = this.claudeManager.create({
+          const cfg = await awaitConfig()
+          if (!this.codingCliManager.hasProvider(m.provider)) {
+            this.sendError(ws, {
+              code: 'INVALID_MESSAGE',
+              message: `Provider not supported: ${m.provider}`,
+              requestId: m.requestId,
+            })
+            return
+          }
+          const enabledProviders = cfg.settings?.codingCli?.enabledProviders
+          if (enabledProviders && !enabledProviders.includes(m.provider)) {
+            this.sendError(ws, {
+              code: 'INVALID_MESSAGE',
+              message: `Provider disabled: ${m.provider}`,
+              requestId: m.requestId,
+            })
+            return
+          }
+
+          const providerDefaults = cfg.settings?.codingCli?.providers?.[m.provider] || {}
+          const session = this.codingCliManager.create(m.provider, {
             prompt: m.prompt,
             cwd: m.cwd,
             resumeSessionId: m.resumeSessionId,
-            model: m.model,
-            maxTurns: m.maxTurns,
-            permissionMode: m.permissionMode,
+            model: m.model ?? providerDefaults.model,
+            maxTurns: m.maxTurns ?? providerDefaults.maxTurns,
+            permissionMode: m.permissionMode ?? providerDefaults.permissionMode,
+            sandbox: m.sandbox ?? providerDefaults.sandbox,
           })
 
           // Track this client's session
-          state.claudeSessions.add(session.id)
+          state.codingCliSessions.add(session.id)
 
           // Stream events to client with detachable listeners
-          const onEvent = (event: ClaudeEvent) => {
+          const onEvent = (event: unknown) => {
             this.safeSend(ws, {
-              type: 'claude.event',
+              type: 'codingcli.event',
               sessionId: session.id,
+              provider: session.provider.name,
               event,
             })
           }
 
           const onExit = (code: number) => {
             this.safeSend(ws, {
-              type: 'claude.exit',
+              type: 'codingcli.exit',
               sessionId: session.id,
+              provider: session.provider.name,
               exitCode: code,
             })
-            this.removeClaudeSubscription(state, session.id)
+            this.removeCodingCliSubscription(state, session.id)
           }
 
           const onStderr = (text: string) => {
             this.safeSend(ws, {
-              type: 'claude.stderr',
+              type: 'codingcli.stderr',
               sessionId: session.id,
+              provider: session.provider.name,
               text,
             })
           }
@@ -597,35 +625,36 @@ export class WsHandler {
           session.on('exit', onExit)
           session.on('stderr', onStderr)
 
-          state.claudeSubscriptions.set(session.id, () => {
+          state.codingCliSubscriptions.set(session.id, () => {
             session.off('event', onEvent)
             session.off('exit', onExit)
             session.off('stderr', onStderr)
           })
 
           this.send(ws, {
-            type: 'claude.created',
+            type: 'codingcli.created',
             requestId: m.requestId,
             sessionId: session.id,
+            provider: session.provider.name,
           })
         } catch (err: any) {
-          logger.warn({ err }, 'claude.create failed')
+          logger.warn({ err }, 'codingcli.create failed')
           this.sendError(ws, {
             code: 'INTERNAL_ERROR',
-            message: err?.message || 'Failed to create Claude session',
+            message: err?.message || 'Failed to create coding CLI session',
             requestId: m.requestId,
           })
         }
         return
       }
 
-      case 'claude.input': {
-        if (!this.claudeManager) {
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Claude sessions not enabled' })
+      case 'codingcli.input': {
+        if (!this.codingCliManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Coding CLI sessions not enabled' })
           return
         }
 
-        const session = this.claudeManager.get(m.sessionId)
+        const session = this.codingCliManager.get(m.sessionId)
         if (!session) {
           this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'Session not found' })
           return
@@ -635,17 +664,17 @@ export class WsHandler {
         return
       }
 
-      case 'claude.kill': {
-        if (!this.claudeManager) {
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Claude sessions not enabled' })
+      case 'codingcli.kill': {
+        if (!this.codingCliManager) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Coding CLI sessions not enabled' })
           return
         }
 
-        const removed = this.claudeManager.remove(m.sessionId)
-        state.claudeSessions.delete(m.sessionId)
-        this.removeClaudeSubscription(state, m.sessionId)
+        const removed = this.codingCliManager.remove(m.sessionId)
+        state.codingCliSessions.delete(m.sessionId)
+        this.removeCodingCliSubscription(state, m.sessionId)
         this.send(ws, {
-          type: 'claude.killed',
+          type: 'codingcli.killed',
           sessionId: m.sessionId,
           success: removed,
         })

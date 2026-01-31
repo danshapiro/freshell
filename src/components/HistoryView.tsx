@@ -1,9 +1,11 @@
 import { useMemo, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
+import type { CodingCliProviderName } from '@/store/types'
 import { toggleProjectExpanded, setProjects } from '@/store/sessionsSlice'
 import { api } from '@/lib/api'
 import { addTab } from '@/store/tabsSlice'
 import { cn } from '@/lib/utils'
+import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { Search, ChevronRight, MoreHorizontal, Play, Pencil, Trash2, RefreshCw } from 'lucide-react'
 
 function formatTime(ts: number) {
@@ -41,7 +43,14 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
           const title = (s.title || s.sessionId).toLowerCase()
           const sum = (s.summary || '').toLowerCase()
           const cwd = (s.cwd || '').toLowerCase()
-          return title.includes(q) || sum.includes(q) || p.projectPath.toLowerCase().includes(q) || cwd.includes(q)
+          const provider = getProviderLabel(s.provider).toLowerCase()
+          return (
+            title.includes(q) ||
+            sum.includes(q) ||
+            p.projectPath.toLowerCase().includes(q) ||
+            cwd.includes(q) ||
+            provider.includes(q)
+          )
         }),
       }))
       .filter((p) => p.sessions.length > 0)
@@ -62,19 +71,26 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
     await refresh()
   }
 
-  async function renameSession(sessionId: string, titleOverride?: string, summaryOverride?: string) {
-    await api.patch(`/api/sessions/${encodeURIComponent(sessionId)}`, { titleOverride, summaryOverride })
+  async function renameSession(provider: string | undefined, sessionId: string, titleOverride?: string, summaryOverride?: string) {
+    // Use composite key format: provider:sessionId
+    const compositeKey = `${provider || 'claude'}:${sessionId}`
+    await api.patch(`/api/sessions/${encodeURIComponent(compositeKey)}`, { titleOverride, summaryOverride })
     await refresh()
   }
 
-  async function deleteSession(sessionId: string) {
-    await api.delete(`/api/sessions/${encodeURIComponent(sessionId)}`)
+  async function deleteSession(provider: string | undefined, sessionId: string) {
+    // Use composite key format: provider:sessionId
+    const compositeKey = `${provider || 'claude'}:${sessionId}`
+    await api.delete(`/api/sessions/${encodeURIComponent(compositeKey)}`)
     await refresh()
   }
 
-  function openSession(cwd: string | undefined, sessionId: string, title: string) {
+  function openSession(cwd: string | undefined, sessionId: string, title: string, provider: string | undefined) {
     // cwd might be undefined if session metadata didn't include it
-    dispatch(addTab({ title: title || 'Claude', mode: 'claude', initialCwd: cwd, resumeSessionId: sessionId }))
+    const label = getProviderLabel(provider)
+    // TabMode now includes all CodingCliProviderName values, so this is type-safe
+    const mode = (provider || 'claude') as CodingCliProviderName
+    dispatch(addTab({ title: title || label, mode, initialCwd: cwd, resumeSessionId: sessionId }))
     onOpenSession?.()
   }
 
@@ -139,9 +155,9 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
                 expanded={expandedProjects.has(project.projectPath)}
                 onToggle={() => dispatch(toggleProjectExpanded(project.projectPath))}
                 onColorChange={(color) => setProjectColor(project.projectPath, color)}
-                onOpenSession={(sessionId, title, cwd) => openSession(cwd, sessionId, title)}
-                onRenameSession={renameSession}
-                onDeleteSession={deleteSession}
+                  onOpenSession={(sessionId, title, cwd, provider) => openSession(cwd, sessionId, title, provider)}
+                onRenameSession={(provider, sessionId, title, summary) => renameSession(provider, sessionId, title, summary)}
+                onDeleteSession={(provider, sessionId) => deleteSession(provider, sessionId)}
               />
             ))
           )}
@@ -164,9 +180,9 @@ function ProjectCard({
   expanded: boolean
   onToggle: () => void
   onColorChange: (color: string) => void
-  onOpenSession: (sessionId: string, title: string, cwd?: string) => void
-  onRenameSession: (sessionId: string, title?: string, summary?: string) => void
-  onDeleteSession: (sessionId: string) => void
+  onOpenSession: (sessionId: string, title: string, cwd?: string, provider?: string) => void
+  onRenameSession: (provider: string | undefined, sessionId: string, title?: string, summary?: string) => void
+  onDeleteSession: (provider: string | undefined, sessionId: string) => void
 }) {
   const color = project.color || '#6b7280'
   const [showColorPicker, setShowColorPicker] = useState(false)
@@ -234,9 +250,9 @@ function ProjectCard({
                 <SessionRow
                   key={session.sessionId}
                   session={session}
-                  onOpen={() => onOpenSession(session.sessionId, session.title || session.sessionId.slice(0, 8), session.cwd)}
-                  onRename={(title, summary) => onRenameSession(session.sessionId, title, summary)}
-                  onDelete={() => onDeleteSession(session.sessionId)}
+                  onOpen={() => onOpenSession(session.sessionId, session.title || session.sessionId.slice(0, 8), session.cwd, session.provider)}
+                  onRename={(title, summary) => onRenameSession(session.provider, session.sessionId, title, summary)}
+                  onDelete={() => onDeleteSession(session.provider, session.sessionId)}
                 />
               ))}
           </div>
@@ -315,6 +331,9 @@ function SessionRow({
           <div className="flex items-center gap-2">
             <span className="font-medium text-sm truncate">
               {session.title || session.sessionId.slice(0, 8)}
+            </span>
+            <span className="text-2xs text-muted-foreground bg-muted/60 px-1.5 py-0.5 rounded">
+              {getProviderLabel(session.provider)}
             </span>
             <span className="text-2xs text-muted-foreground">
               {formatTime(session.updatedAt)}

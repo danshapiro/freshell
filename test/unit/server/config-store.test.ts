@@ -132,6 +132,8 @@ describe('ConfigStore', () => {
       // Default terminal settings should be merged in
       expect(config.settings.terminal).toEqual(defaultSettings.terminal)
       expect(config.settings.safety).toEqual(defaultSettings.safety)
+      expect(config.settings.uiScale).toBe(defaultSettings.uiScale)
+      expect(config.settings.sidebar).toEqual(defaultSettings.sidebar)
     })
 
     it('returns null for invalid version and creates default config', async () => {

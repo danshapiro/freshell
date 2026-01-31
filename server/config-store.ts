@@ -2,6 +2,7 @@ import fsp from 'fs/promises'
 import path from 'path'
 import os from 'os'
 import { logger } from './logger.js'
+import type { CodingCliProviderName } from './coding-cli/types.js'
 
 /**
  * Simple promise-based mutex to serialize write operations.
@@ -25,13 +26,22 @@ class Mutex {
 
 export type AppSettings = {
   theme: 'system' | 'light' | 'dark'
+  uiScale: number
   terminal: {
     fontSize: number
     fontFamily: string
     lineHeight: number
     cursorBlink: boolean
     scrollback: number
-    theme: 'default' | 'dark' | 'light'
+    theme:
+      | 'auto'
+      | 'dracula'
+      | 'one-dark'
+      | 'solarized-dark'
+      | 'github-dark'
+      | 'one-light'
+      | 'solarized-light'
+      | 'github-light'
   }
   defaultCwd?: string
   safety: {
@@ -40,6 +50,21 @@ export type AppSettings = {
   }
   panes: {
     defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor'
+  }
+  sidebar: {
+    sortMode: 'recency' | 'activity' | 'project'
+    showProjectBadges: boolean
+    width: number
+    collapsed: boolean
+  }
+  codingCli: {
+    enabledProviders: CodingCliProviderName[]
+    providers: Partial<Record<CodingCliProviderName, {
+      model?: string
+      sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
+      permissionMode?: 'default' | 'plan' | 'acceptEdits' | 'bypassPermissions'
+      maxTurns?: number
+    }>>
   }
 }
 
@@ -65,13 +90,14 @@ export type UserConfig = {
 
 export const defaultSettings: AppSettings = {
   theme: 'system',
+  uiScale: 1.0,
   terminal: {
-    fontSize: 12,
+    fontSize: 16,
     fontFamily: 'Consolas',
     lineHeight: 1,
     cursorBlink: true,
     scrollback: 5000,
-    theme: 'default',
+    theme: 'auto',
   },
   defaultCwd: undefined,
   safety: {
@@ -80,6 +106,21 @@ export const defaultSettings: AppSettings = {
   },
   panes: {
     defaultNewPane: 'ask',
+  },
+  sidebar: {
+    sortMode: 'activity',
+    showProjectBadges: true,
+    width: 288,
+    collapsed: false,
+  },
+  codingCli: {
+    enabledProviders: ['claude', 'codex'],
+    providers: {
+      claude: {
+        permissionMode: 'default',
+      },
+      codex: {},
+    },
   },
 }
 
@@ -119,6 +160,15 @@ function mergeSettings(base: AppSettings, patch: Partial<AppSettings>): AppSetti
     terminal: { ...base.terminal, ...(patch.terminal || {}) },
     safety: { ...base.safety, ...(patch.safety || {}) },
     panes: { ...base.panes, ...(patch.panes || {}) },
+    sidebar: { ...base.sidebar, ...(patch.sidebar || {}) },
+    codingCli: {
+      ...base.codingCli,
+      ...(patch.codingCli || {}),
+      providers: {
+        ...base.codingCli.providers,
+        ...(patch.codingCli?.providers || {}),
+      },
+    },
   }
 }
 

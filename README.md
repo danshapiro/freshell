@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <strong>Run multiple terminals in tabs | Detach & reattach sessions | Browse Claude Code history | What if tmux and Claude fell in love?</strong>
+  <strong>Run multiple terminals in tabs | Detach & reattach sessions | Browse coding CLI history | What if tmux and Claude fell in love?</strong>
 </p>
 
 ---
@@ -23,7 +23,7 @@
 - **Multi-tab terminal sessions** — Run shell, Claude Code, and Codex in parallel tabs
 - **Split panes** — Divide any tab into independent terminal panes (horizontal/vertical)
 - **Detach/reattach** — Background terminals persist across browser sessions
-- **Full-text search** — Search the complete text of every Claude session you've ever had
+- **Search & browse** — Filter coding CLI sessions by provider, project, date, or content
 - **Speak with the dead** — Invoke the spirits of ancient Claudes and ask them what they were thinking
 - **Keep it tidy** — AI (or your pedantic self) names, summarizes, and organizes
 - **Dark/light themes** — Are we savages?
@@ -238,6 +238,7 @@ freshell uses a tmux-style prefix system. Press `Ctrl+B` followed by a command k
 | `PORT` | No | Server port (default: 3001) |
 | `ALLOWED_ORIGINS` | No | Comma-separated allowed CORS origins |
 | `CLAUDE_HOME` | No | Path to Claude config directory |
+| `CODEX_HOME` | No | Path to Codex config directory |
 | `WINDOWS_SHELL` | No | Windows shell: `cmd` (default), `powershell`, or `wsl` |
 | `WSL_DISTRO` | No | WSL distribution name (Windows only) |
 | `CLAUDE_CMD` | No | Claude CLI command override |
@@ -254,7 +255,30 @@ CLAUDE_HOME=\\wsl$\Ubuntu\home\your-username\.claude
 WSL_DISTRO=Ubuntu
 ```
 
-The server will watch `CLAUDE_HOME/projects/**/sessions/*.jsonl` for new sessions.
+The server will watch `CLAUDE_HOME/projects/**/sessions/*.jsonl` and `CODEX_HOME/sessions/**/*.jsonl` for new sessions.
+
+### Coding CLI Providers
+
+Freshell indexes local session history for supported coding CLIs:
+
+- **Claude Code** — `~/.claude/projects/**/sessions/*.jsonl`
+- **Codex** — `~/.codex/sessions/**/*.jsonl`
+
+You can enable/disable providers and set defaults in the Settings UI or via `~/.freshell/config.json`:
+
+```json
+{
+  "settings": {
+    "codingCli": {
+      "enabledProviders": ["claude", "codex"],
+      "providers": {
+        "claude": { "permissionMode": "default" },
+        "codex": { "model": "gpt-5-codex", "sandbox": "read-only" }
+      }
+    }
+  }
+}
+```
 
 ## Security
 
@@ -298,7 +322,11 @@ freshell/
 ├── server/               # Backend source
 │   ├── index.ts          # Server entry point
 │   ├── ws-handler.ts     # WebSocket handling
-│   └── claude-session.ts # Session indexer
+│   ├── terminal-registry.ts # PTY lifecycle management
+│   └── coding-cli/       # Multi-provider session support
+│       ├── types.ts      # Normalized event types
+│       ├── session-indexer.ts # Session discovery & indexing
+│       └── providers/    # Claude, Codex adapters
 ├── test/                 # Test suites
 └── dist/                 # Build output
 ```

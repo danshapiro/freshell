@@ -829,6 +829,13 @@ describe('State Edge Cases', () => {
             visualWhenFinished: false,
             soundWhenFinished: false,
           },
+          codingCli: {
+            enabledProviders: ['claude', 'codex'],
+            providers: {
+              claude: { permissionMode: 'default' },
+              codex: { model: 'gpt-5-codex' },
+            },
+          },
         }
 
         store.dispatch(setSettings(customSettings))

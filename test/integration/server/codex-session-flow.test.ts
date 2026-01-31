@@ -1,39 +1,27 @@
-// test/integration/server/claude-session-flow.test.ts
+// test/integration/server/codex-session-flow.test.ts
 //
 // NOTE: This is a true end-to-end integration test that requires:
-// 1. The `claude` CLI to be installed and in PATH
-// 2. A valid Claude API key configured
-// 3. Network access to Anthropic's API
+// 1. The `codex` CLI to be installed and in PATH
+// 2. A valid OpenAI API key configured for Codex CLI
+// 3. Network access to OpenAI's API
 //
-// Set RUN_CLAUDE_INTEGRATION=true to run this test:
-//   RUN_CLAUDE_INTEGRATION=true npm run test:server
+// Set RUN_CODEX_INTEGRATION=true to run this test:
+//   RUN_CODEX_INTEGRATION=true npm run test:server
 //
-import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import http from 'http'
 import express from 'express'
 import WebSocket from 'ws'
 import { WsHandler } from '../../../server/ws-handler'
 import { TerminalRegistry } from '../../../server/terminal-registry'
 import { CodingCliSessionManager } from '../../../server/coding-cli/session-manager'
-import { claudeProvider } from '../../../server/coding-cli/providers/claude'
+import { codexProvider } from '../../../server/coding-cli/providers/codex'
 
-vi.mock('node-pty', () => ({
-  spawn: vi.fn(() => ({
-    onData: vi.fn(),
-    onExit: vi.fn(),
-    write: vi.fn(),
-    resize: vi.fn(),
-    kill: vi.fn(),
-  })),
-}))
-
-// Set auth token for tests
 process.env.AUTH_TOKEN = 'test-token'
 
-// Skip unless explicitly enabled - this test requires real Claude CLI
-const runClaudeIntegration = process.env.RUN_CLAUDE_INTEGRATION === 'true'
+const runCodexIntegration = process.env.RUN_CODEX_INTEGRATION === 'true'
 
-describe.skipIf(!runClaudeIntegration)('Claude Session Flow Integration', () => {
+describe.skipIf(!runCodexIntegration)('Codex Session Flow Integration', () => {
   let server: http.Server
   let port: number
   let wsHandler: WsHandler
@@ -44,7 +32,7 @@ describe.skipIf(!runClaudeIntegration)('Claude Session Flow Integration', () => 
     const app = express()
     server = http.createServer(app)
     registry = new TerminalRegistry()
-    cliManager = new CodingCliSessionManager([claudeProvider])
+    cliManager = new CodingCliSessionManager([codexProvider])
     wsHandler = new WsHandler(server, registry, cliManager)
 
     await new Promise<void>((resolve) => {
@@ -102,10 +90,9 @@ describe.skipIf(!runClaudeIntegration)('Claude Session Flow Integration', () => 
 
     ws.send(JSON.stringify({
       type: 'codingcli.create',
-      requestId: 'test-req-1',
-      provider: 'claude',
-      prompt: 'say \"hello world\" and nothing else',
-      permissionMode: 'bypassPermissions',
+      requestId: 'test-req-codex',
+      provider: 'codex',
+      prompt: 'say "hello world" and nothing else',
     }))
 
     await done
@@ -113,10 +100,9 @@ describe.skipIf(!runClaudeIntegration)('Claude Session Flow Integration', () => 
     expect(sessionId).toBeDefined()
     expect(events.length).toBeGreaterThan(0)
 
-    // Should have at least init and end events
     const hasInit = events.some((e) => e.type === 'session.init')
-    const hasResult = events.some((e) => e.type === 'session.end')
-    expect(hasInit || hasResult).toBe(true)
+    const hasMessage = events.some((e) => e.type === 'message.assistant')
+    expect(hasInit || hasMessage).toBe(true)
 
     ws.close()
   }, 30000)

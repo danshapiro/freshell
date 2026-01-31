@@ -1,11 +1,13 @@
-import { describe, it, expect, beforeAll, afterAll, vi, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import http from 'http'
 import express from 'express'
 import WebSocket from 'ws'
-import { EventEmitter } from 'events'
 import { WsHandler } from '../../server/ws-handler'
 import { TerminalRegistry } from '../../server/terminal-registry'
-import { ClaudeSessionManager } from '../../server/claude-session'
+import { CodingCliSessionManager } from '../../server/coding-cli/session-manager'
+import { claudeProvider } from '../../server/coding-cli/providers/claude'
+import { configStore } from '../../server/config-store'
+import { EventEmitter } from 'events'
 
 vi.mock('node-pty', () => ({
   spawn: vi.fn(() => ({
@@ -30,19 +32,33 @@ vi.mock('../../server/logger', () => ({
   },
 }))
 
-describe('WebSocket Claude Events', () => {
+vi.mock('../../server/config-store', () => ({
+  configStore: {
+    snapshot: vi.fn(),
+  },
+}))
+
+describe('WebSocket Coding CLI Events', () => {
   let server: http.Server
   let port: number
   let wsHandler: WsHandler
   let registry: TerminalRegistry
-  let claudeManager: ClaudeSessionManager
+  let cliManager: CodingCliSessionManager
 
   beforeEach(async () => {
+    vi.mocked(configStore.snapshot).mockResolvedValue({
+      settings: {
+        codingCli: {
+          enabledProviders: ['claude'],
+          providers: {},
+        },
+      },
+    })
     const app = express()
     server = http.createServer(app)
     registry = new TerminalRegistry()
-    claudeManager = new ClaudeSessionManager()
-    wsHandler = new WsHandler(server, registry, claudeManager)
+    cliManager = new CodingCliSessionManager([claudeProvider])
+    wsHandler = new WsHandler(server, registry, cliManager)
 
     await new Promise<void>((resolve) => {
       server.listen(0, '127.0.0.1', () => {
@@ -53,7 +69,7 @@ describe('WebSocket Claude Events', () => {
   })
 
   afterEach(async () => {
-    claudeManager.shutdown()
+    cliManager.shutdown()
     registry.shutdown()
     wsHandler.close()
     await new Promise<void>((resolve) => server.close(() => resolve()))
@@ -75,7 +91,7 @@ describe('WebSocket Claude Events', () => {
     })
   }
 
-  it('validates claude.create message schema', async () => {
+  it('validates codingcli.create message schema', async () => {
     const ws = await createAuthenticatedWs()
 
     const responsePromise = new Promise<any>((resolve) => {
@@ -88,9 +104,9 @@ describe('WebSocket Claude Events', () => {
     // Missing required prompt field
     ws.send(
       JSON.stringify({
-        type: 'claude.create',
+        type: 'codingcli.create',
         requestId: 'req-123',
-        // no prompt
+        provider: 'claude',
       })
     )
 
@@ -101,7 +117,69 @@ describe('WebSocket Claude Events', () => {
     ws.close()
   })
 
-  it('handles claude.input for unknown session', async () => {
+  it('rejects codingcli.create when provider disabled', async () => {
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      settings: {
+        codingCli: {
+          enabledProviders: [],
+          providers: {},
+        },
+      },
+    })
+
+    const ws = await createAuthenticatedWs()
+
+    const responsePromise = new Promise<any>((resolve) => {
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data.toString())
+        if (msg.type === 'error' && msg.requestId === 'req-disabled') resolve(msg)
+      })
+    })
+
+    ws.send(
+      JSON.stringify({
+        type: 'codingcli.create',
+        requestId: 'req-disabled',
+        provider: 'claude',
+        prompt: 'test',
+      })
+    )
+
+    const response = await responsePromise
+    expect(response.type).toBe('error')
+    expect(response.code).toBe('INVALID_MESSAGE')
+
+    ws.close()
+  })
+
+  it('rejects codingcli.create when provider is unsupported', async () => {
+    const ws = await createAuthenticatedWs()
+
+    const responsePromise = new Promise<any>((resolve) => {
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data.toString())
+        if (msg.type === 'error' && msg.requestId === 'req-unsupported') resolve(msg)
+      })
+    })
+
+    ws.send(
+      JSON.stringify({
+        type: 'codingcli.create',
+        requestId: 'req-unsupported',
+        provider: 'gemini',
+        prompt: 'test',
+      })
+    )
+
+    const response = await responsePromise
+    expect(response.type).toBe('error')
+    expect(response.code).toBe('INVALID_MESSAGE')
+    expect(response.message).toContain('not supported')
+
+    ws.close()
+  })
+
+  it('handles codingcli.input for unknown session', async () => {
     const ws = await createAuthenticatedWs()
 
     const responsePromise = new Promise<any>((resolve) => {
@@ -113,7 +191,7 @@ describe('WebSocket Claude Events', () => {
 
     ws.send(
       JSON.stringify({
-        type: 'claude.input',
+        type: 'codingcli.input',
         sessionId: 'unknown-session',
         data: 'test input',
       })
@@ -125,38 +203,107 @@ describe('WebSocket Claude Events', () => {
     ws.close()
   })
 
-  it('handles claude.kill for unknown session', async () => {
+  it('handles codingcli.kill for unknown session', async () => {
     const ws = await createAuthenticatedWs()
 
     const responsePromise = new Promise<any>((resolve) => {
       ws.on('message', (data) => {
         const msg = JSON.parse(data.toString())
-        if (msg.type === 'claude.killed') resolve(msg)
+        if (msg.type === 'codingcli.killed') resolve(msg)
       })
     })
 
     ws.send(
       JSON.stringify({
-        type: 'claude.kill',
+        type: 'codingcli.kill',
         sessionId: 'unknown-session',
       })
     )
 
     const response = await responsePromise
-    expect(response.type).toBe('claude.killed')
+    expect(response.type).toBe('codingcli.killed')
     expect(response.success).toBe(false)
 
     ws.close()
   })
 
-  it('detaches Claude listeners on socket close', async () => {
+  it('applies provider defaults from settings', async () => {
+    const createMock = vi.fn()
+    class FakeSession extends EventEmitter {
+      id = 'session-1'
+      provider = { name: 'claude' }
+    }
+
+    const fakeManager = {
+      create: (...args: any[]) => {
+        createMock(...args)
+        return new FakeSession()
+      },
+      hasProvider: (name: string) => name === 'claude',
+      get: vi.fn(),
+      remove: vi.fn(),
+    } as unknown as CodingCliSessionManager
+
+    wsHandler.close()
+    wsHandler = new WsHandler(server, registry, fakeManager)
+
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      settings: {
+        codingCli: {
+          enabledProviders: ['claude'],
+          providers: {
+            claude: {
+              model: 'claude-test',
+              permissionMode: 'plan',
+              maxTurns: 3,
+            },
+          },
+        },
+      },
+    })
+
+    const ws = await createAuthenticatedWs()
+
+    const createdPromise = new Promise<void>((resolve) => {
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data.toString())
+        if (msg.type === 'codingcli.created') resolve()
+      })
+    })
+
+    ws.send(
+      JSON.stringify({
+        type: 'codingcli.create',
+        requestId: 'req-defaults',
+        provider: 'claude',
+        prompt: 'test',
+      })
+    )
+
+    await createdPromise
+
+    expect(createMock).toHaveBeenCalledWith(
+      'claude',
+      expect.objectContaining({
+        prompt: 'test',
+        model: 'claude-test',
+        permissionMode: 'plan',
+        maxTurns: 3,
+      })
+    )
+
+    ws.close()
+  })
+
+  it('detaches coding cli listeners on socket close', async () => {
     const fakeSession = Object.assign(new EventEmitter(), {
       id: 'fake-session-1',
+      provider: { name: 'claude' },
       sendInput: vi.fn(),
       kill: vi.fn(),
     })
 
-    const createSpy = vi.spyOn(claudeManager, 'create').mockReturnValue(fakeSession as any)
+    const createSpy = vi.spyOn(cliManager, 'create').mockReturnValue(fakeSession as any)
 
     const ws = {
       bufferedAmount: 0,
@@ -169,15 +316,15 @@ describe('WebSocket Claude Events', () => {
       authenticated: true,
       attachedTerminalIds: new Set<string>(),
       createdByRequestId: new Map<string, string>(),
-      claudeSessions: new Set<string>(),
-      claudeSubscriptions: new Map<string, () => void>(),
+      codingCliSessions: new Set<string>(),
+      codingCliSubscriptions: new Map<string, () => void>(),
       interestedSessions: new Set<string>(),
     }
 
     await (wsHandler as any).onMessage(
       ws,
       state,
-      Buffer.from(JSON.stringify({ type: 'claude.create', requestId: 'req-1', prompt: 'hello' }))
+      Buffer.from(JSON.stringify({ type: 'codingcli.create', requestId: 'req-1', provider: 'claude', prompt: 'hello' }))
     )
 
     expect(fakeSession.listenerCount('event')).toBe(1)
@@ -194,7 +341,7 @@ describe('WebSocket Claude Events', () => {
   })
 })
 
-describe('WebSocket Claude Events - Without ClaudeManager', () => {
+describe('WebSocket Coding CLI Events - Without Manager', () => {
   let server: http.Server
   let port: number
   let wsHandler: WsHandler
@@ -204,7 +351,7 @@ describe('WebSocket Claude Events - Without ClaudeManager', () => {
     const app = express()
     server = http.createServer(app)
     registry = new TerminalRegistry()
-    // No claudeManager - tests the error case
+    // No manager - tests the error case
     wsHandler = new WsHandler(server, registry)
 
     await new Promise<void>((resolve) => {
@@ -237,7 +384,7 @@ describe('WebSocket Claude Events - Without ClaudeManager', () => {
     })
   }
 
-  it('rejects claude.create when claudeManager not provided', async () => {
+  it('rejects codingcli.create when manager not provided', async () => {
     const ws = await createAuthenticatedWs()
 
     const responsePromise = new Promise<any>((resolve) => {
@@ -249,8 +396,9 @@ describe('WebSocket Claude Events - Without ClaudeManager', () => {
 
     ws.send(
       JSON.stringify({
-        type: 'claude.create',
+        type: 'codingcli.create',
         requestId: 'req-123',
+        provider: 'claude',
         prompt: 'test',
       })
     )

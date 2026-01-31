@@ -12,7 +12,11 @@ import { configStore } from './config-store.js'
 import { TerminalRegistry } from './terminal-registry.js'
 import { WsHandler } from './ws-handler.js'
 import { claudeIndexer, defaultClaudeHome } from './claude-indexer.js'
-import { claudeSessionManager } from './claude-session.js'
+import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
+import { CodingCliSessionManager } from './coding-cli/session-manager.js'
+import { claudeProvider } from './coding-cli/providers/claude.js'
+import { codexProvider } from './coding-cli/providers/codex.js'
+import { makeSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
 import { AI_CONFIG, PROMPTS, stripAnsi } from './ai-prompts.js'
 import { migrateSettingsSortMode } from './settings-migrate.js'
 import { filesRouter } from './files-router.js'
@@ -88,6 +92,10 @@ async function main() {
 
   app.use('/api', httpAuthMiddleware)
 
+  const codingCliProviders = [claudeProvider, codexProvider]
+  const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders)
+  const codingCliSessionManager = new CodingCliSessionManager(codingCliProviders)
+
   app.get('/api/debug', async (_req, res) => {
     const cfg = await configStore.snapshot()
     res.json({
@@ -95,7 +103,7 @@ async function main() {
       appVersion: APP_VERSION,
       wsConnections: wsHandler.connectionCount(),
       settings: cfg.settings,
-      sessionsProjects: claudeIndexer.getProjects(),
+      sessionsProjects: codingCliIndexer.getProjects(),
       terminals: registry.list(),
       time: new Date().toISOString(),
     })
@@ -109,7 +117,7 @@ async function main() {
   await sessionRepairService.start()
 
   const server = http.createServer(app)
-  const wsHandler = new WsHandler(server, registry, claudeSessionManager, sessionRepairService)
+  const wsHandler = new WsHandler(server, registry, codingCliSessionManager, sessionRepairService)
 
   // --- API: settings ---
   //
@@ -148,6 +156,9 @@ async function main() {
     const migrated = migrateSettingsSortMode(updated)
     registry.setSettings(migrated)
     wsHandler.broadcast({ type: 'settings.updated', settings: migrated })
+    await codingCliIndexer.refresh()
+    wsHandler.broadcast({ type: 'sessions.updated', projects: codingCliIndexer.getProjects() })
+    await claudeIndexer.refresh()
     res.json(migrated)
   })
 
@@ -158,6 +169,9 @@ async function main() {
     const migrated = migrateSettingsSortMode(updated)
     registry.setSettings(migrated)
     wsHandler.broadcast({ type: 'settings.updated', settings: migrated })
+    await codingCliIndexer.refresh()
+    wsHandler.broadcast({ type: 'sessions.updated', projects: codingCliIndexer.getProjects() })
+    await claudeIndexer.refresh()
     res.json(migrated)
   })
 
@@ -193,27 +207,33 @@ async function main() {
   })
 
   app.get('/api/sessions', async (_req, res) => {
-    res.json(claudeIndexer.getProjects())
+    res.json(codingCliIndexer.getProjects())
   })
 
   app.patch('/api/sessions/:sessionId', async (req, res) => {
-    const sessionId = req.params.sessionId
+    const rawId = req.params.sessionId
+    const provider = (req.query.provider as CodingCliProviderName) || 'claude'
+    const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
     const { titleOverride, summaryOverride, deleted } = req.body || {}
-    const next = await configStore.patchSessionOverride(sessionId, {
+    const next = await configStore.patchSessionOverride(compositeKey, {
       titleOverride,
       summaryOverride,
       deleted,
     })
+    await codingCliIndexer.refresh()
+    wsHandler.broadcast({ type: 'sessions.updated', projects: codingCliIndexer.getProjects() })
     await claudeIndexer.refresh()
-    wsHandler.broadcast({ type: 'sessions.updated', projects: claudeIndexer.getProjects() })
     res.json(next)
   })
 
   app.delete('/api/sessions/:sessionId', async (req, res) => {
-    const sessionId = req.params.sessionId
-    await configStore.deleteSession(sessionId)
+    const rawId = req.params.sessionId
+    const provider = (req.query.provider as CodingCliProviderName) || 'claude'
+    const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
+    await configStore.deleteSession(compositeKey)
+    await codingCliIndexer.refresh()
+    wsHandler.broadcast({ type: 'sessions.updated', projects: codingCliIndexer.getProjects() })
     await claudeIndexer.refresh()
-    wsHandler.broadcast({ type: 'sessions.updated', projects: claudeIndexer.getProjects() })
     res.json({ ok: true })
   })
 
@@ -221,8 +241,9 @@ async function main() {
     const { projectPath, color } = req.body || {}
     if (!projectPath || !color) return res.status(400).json({ error: 'projectPath and color required' })
     await configStore.setProjectColor(projectPath, color)
+    await codingCliIndexer.refresh()
+    wsHandler.broadcast({ type: 'sessions.updated', projects: codingCliIndexer.getProjects() })
     await claudeIndexer.refresh()
-    wsHandler.broadcast({ type: 'sessions.updated', projects: claudeIndexer.getProjects() })
     res.json({ ok: true })
   })
 
@@ -322,9 +343,9 @@ async function main() {
     app.get('*', (_req, res) => res.sendFile(indexHtml))
   }
 
-  // Start Claude watcher
-  await claudeIndexer.start()
-  claudeIndexer.onUpdate((projects) => {
+  // Start coding CLI watcher
+  await codingCliIndexer.start()
+  codingCliIndexer.onUpdate((projects) => {
     wsHandler.broadcast({ type: 'sessions.updated', projects })
 
     // Auto-update terminal titles based on session data
@@ -333,10 +354,16 @@ async function main() {
         if (!session.title) continue
 
         // Find terminals that match this session
-        const matchingTerminals = registry.findClaudeTerminalsBySession(session.sessionId, session.cwd)
+        const matchingTerminals = registry.findTerminalsBySession(session.provider, session.sessionId, session.cwd)
         for (const term of matchingTerminals) {
-          // Only update if title is still the default "Claude"
-          if (term.title === 'Claude') {
+          const defaultTitle =
+            session.provider === 'claude'
+              ? 'Claude'
+              : session.provider === 'codex'
+                ? 'Codex'
+                : 'CLI'
+          // Only update if title is still the default
+          if (term.title === defaultTitle) {
             registry.updateTitle(term.terminalId, session.title)
             wsHandler.broadcast({
               type: 'terminal.title.updated',
@@ -348,6 +375,9 @@ async function main() {
       }
     }
   })
+
+  // Start Claude watcher (for search + session association)
+  await claudeIndexer.start()
 
   // One-time session association for new Claude sessions
   // When Claude creates a session file, associate it with the oldest unassociated
@@ -411,13 +441,14 @@ async function main() {
     // 2. Kill all running terminals
     registry.shutdown()
 
-    // 3. Kill all Claude sessions
-    claudeSessionManager.shutdown()
+    // 3. Kill all coding CLI sessions
+    codingCliSessionManager.shutdown()
 
     // 4. Close WebSocket connections gracefully
     wsHandler.close()
 
-    // 5. Stop the Claude indexer
+    // 5. Stop session indexers
+    codingCliIndexer.stop()
     claudeIndexer.stop()
 
     // 6. Stop session repair service

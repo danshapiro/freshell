@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { updateSettingsLocal, markSaved } from '@/store/settingsSlice'
+import { updateSettingsLocal, markSaved, defaultSettings, mergeSettings } from '@/store/settingsSlice'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { terminalThemes, darkThemes, lightThemes, getTerminalTheme } from '@/lib/terminal-themes'
-import type { SidebarSortMode, TerminalTheme } from '@/store/types'
+import type { SidebarSortMode, TerminalTheme, CodexSandboxMode, ClaudePermissionMode, CodingCliProviderName } from '@/store/types'
+import { CODING_CLI_PROVIDER_CONFIGS } from '@/lib/coding-cli-utils'
 
 /** Monospace fonts with good Unicode block element support for terminal use */
 const terminalFonts = [
@@ -129,8 +130,13 @@ function normalizePreviewLine(tokens: PreviewToken[], width: number): PreviewTok
 
 export default function SettingsView() {
   const dispatch = useAppDispatch()
-  const settings = useAppSelector((s) => s.settings.settings)
+  const rawSettings = useAppSelector((s) => s.settings.settings)
+  const settings = useMemo(
+    () => mergeSettings(defaultSettings, rawSettings || {}),
+    [rawSettings],
+  )
   const lastSavedAt = useAppSelector((s) => s.settings.lastSavedAt)
+  const enabledProviders = settings.codingCli?.enabledProviders ?? []
 
   const [availableTerminalFonts, setAvailableTerminalFonts] = useState(terminalFonts)
   const [fontsReady, setFontsReady] = useState(false)
@@ -179,6 +185,14 @@ export default function SettingsView() {
       pendingRef.current = null
     }, 500)
   }, [patch])
+
+  const setProviderEnabled = useCallback((provider: CodingCliProviderName, enabled: boolean) => {
+    const next = enabled
+      ? Array.from(new Set([...enabledProviders, provider]))
+      : enabledProviders.filter((p) => p !== provider)
+    dispatch(updateSettingsLocal({ codingCli: { enabledProviders: next } } as any))
+    scheduleSave({ codingCli: { enabledProviders: next } })
+  }, [dispatch, enabledProviders, scheduleSave])
 
   useEffect(() => {
     let cancelled = false
@@ -585,6 +599,87 @@ export default function SettingsView() {
                 }}
               />
             </SettingsRow>
+          </SettingsSection>
+
+          {/* Coding CLIs */}
+          <SettingsSection title="Coding CLIs" description="Providers and defaults for coding sessions">
+            {CODING_CLI_PROVIDER_CONFIGS.map((provider) => (
+              <SettingsRow key={`enable-${provider.name}`} label={`Enable ${provider.label}`}>
+                <Toggle
+                  checked={enabledProviders.includes(provider.name)}
+                  onChange={(checked) => setProviderEnabled(provider.name as CodingCliProviderName, checked)}
+                />
+              </SettingsRow>
+            ))}
+
+            {CODING_CLI_PROVIDER_CONFIGS.map((provider) => {
+              const providerSettings = settings.codingCli?.providers?.[provider.name] || {}
+
+              return (
+                <div key={`provider-${provider.name}`} className="space-y-4">
+                  {provider.supportsPermissionMode && (
+                    <SettingsRow label={`${provider.label} permission mode`}>
+                      <select
+                        value={(providerSettings.permissionMode as ClaudePermissionMode) || 'default'}
+                        onChange={(e) => {
+                          const v = e.target.value as ClaudePermissionMode
+                          dispatch(updateSettingsLocal({
+                            codingCli: { providers: { [provider.name]: { permissionMode: v } } },
+                          } as any))
+                          scheduleSave({ codingCli: { providers: { [provider.name]: { permissionMode: v } } } })
+                        }}
+                        className="h-8 px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border"
+                      >
+                        <option value="default">Default</option>
+                        <option value="plan">Plan</option>
+                        <option value="acceptEdits">Accept edits</option>
+                        <option value="bypassPermissions">Bypass permissions</option>
+                      </select>
+                    </SettingsRow>
+                  )}
+
+                  {provider.supportsModel && (
+                    <SettingsRow label={`${provider.label} model`}>
+                      <input
+                        type="text"
+                        value={providerSettings.model || ''}
+                        placeholder={provider.name === 'codex' ? 'e.g. gpt-5-codex' : 'e.g. claude-3-5-sonnet'}
+                        onChange={(e) => {
+                          const model = e.target.value.trim()
+                          dispatch(updateSettingsLocal({
+                            codingCli: { providers: { [provider.name]: { model: model || undefined } } },
+                          } as any))
+                          scheduleSave({ codingCli: { providers: { [provider.name]: { model: model || undefined } } } })
+                        }}
+                        className="w-full max-w-xs h-8 px-3 text-sm bg-muted border-0 rounded-md placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-border"
+                      />
+                    </SettingsRow>
+                  )}
+
+                  {provider.supportsSandbox && (
+                    <SettingsRow label={`${provider.label} sandbox`}>
+                      <select
+                        value={(providerSettings.sandbox as CodexSandboxMode) || ''}
+                        onChange={(e) => {
+                          const v = e.target.value as CodexSandboxMode
+                          const sandbox = v || undefined
+                          dispatch(updateSettingsLocal({
+                            codingCli: { providers: { [provider.name]: { sandbox } } },
+                          } as any))
+                          scheduleSave({ codingCli: { providers: { [provider.name]: { sandbox } } } })
+                        }}
+                        className="h-8 px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border"
+                      >
+                        <option value="">Default</option>
+                        <option value="read-only">Read-only</option>
+                        <option value="workspace-write">Workspace write</option>
+                        <option value="danger-full-access">Danger full access</option>
+                      </select>
+                    </SettingsRow>
+                  )}
+                </div>
+              )
+            })}
           </SettingsSection>
 
           {/* Keyboard shortcuts */}

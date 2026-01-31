@@ -160,8 +160,11 @@ describe('Settings API Integration', () => {
 
       expect(res.status).toBe(200)
       expect(res.body).toHaveProperty('theme')
+      expect(res.body).toHaveProperty('uiScale')
       expect(res.body).toHaveProperty('terminal')
       expect(res.body).toHaveProperty('safety')
+      expect(res.body).toHaveProperty('sidebar')
+      expect(res.body).toHaveProperty('codingCli')
       expect(res.body.terminal).toHaveProperty('fontSize')
       expect(res.body.terminal).toHaveProperty('fontFamily')
       expect(res.body.terminal).toHaveProperty('lineHeight')
@@ -170,6 +173,10 @@ describe('Settings API Integration', () => {
       expect(res.body.terminal).toHaveProperty('theme')
       expect(res.body.safety).toHaveProperty('autoKillIdleMinutes')
       expect(res.body.safety).toHaveProperty('warnBeforeKillMinutes')
+      expect(res.body.sidebar).toHaveProperty('sortMode')
+      expect(res.body.sidebar).toHaveProperty('showProjectBadges')
+      expect(res.body.sidebar).toHaveProperty('width')
+      expect(res.body.sidebar).toHaveProperty('collapsed')
     })
 
     it('returns previously saved settings', async () => {

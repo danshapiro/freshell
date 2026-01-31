@@ -1,5 +1,5 @@
 import { PaneLayout } from './panes'
-import ClaudeSessionView from './ClaudeSessionView'
+import SessionView from './SessionView'
 import { useAppSelector } from '@/store/hooks'
 import type { PaneContentInput } from '@/store/paneTypes'
 
@@ -14,10 +14,9 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
 
   if (!tab) return null
 
-  // For claude mode with existing claudeSessionId and no terminal, use ClaudeSessionView
-  // This is for viewing historical sessions, not live terminals
-  if (tab.mode === 'claude' && tab.claudeSessionId && !tab.terminalId) {
-    return <ClaudeSessionView sessionId={tab.claudeSessionId} hidden={hidden} />
+  // For coding CLI session views with no terminal, use SessionView
+  if (tab.codingCliSessionId && !tab.terminalId) {
+    return <SessionView sessionId={tab.codingCliSessionId} hidden={hidden} />
   }
 
   // Build default content based on setting

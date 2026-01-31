@@ -31,6 +31,15 @@ export const defaultSettings: AppSettings = {
     visualWhenFinished: true,
     soundWhenFinished: true,
   },
+  codingCli: {
+    enabledProviders: ['claude', 'codex'],
+    providers: {
+      claude: {
+        permissionMode: 'default',
+      },
+      codex: {},
+    },
+  },
 }
 
 export function migrateSortMode(mode: string | undefined): SidebarSortMode {
@@ -51,42 +60,46 @@ const initialState: SettingsState = {
   loaded: false,
 }
 
+export function mergeSettings(base: AppSettings, patch: Partial<AppSettings>): AppSettings {
+  const baseNotifications = base.notifications ?? defaultSettings.notifications
+  const baseCodingCli = base.codingCli ?? defaultSettings.codingCli
+  const merged = {
+    ...base,
+    ...patch,
+    terminal: { ...base.terminal, ...(patch.terminal || {}) },
+    safety: { ...base.safety, ...(patch.safety || {}) },
+    sidebar: { ...base.sidebar, ...(patch.sidebar || {}) },
+    panes: { ...base.panes, ...(patch.panes || {}) },
+    notifications: { ...baseNotifications, ...(patch.notifications || {}) },
+    codingCli: {
+      ...baseCodingCli,
+      ...(patch.codingCli || {}),
+      providers: {
+        ...baseCodingCli.providers,
+        ...(patch.codingCli?.providers || {}),
+      },
+    },
+  }
+
+  return {
+    ...merged,
+    sidebar: {
+      ...merged.sidebar,
+      sortMode: migrateSortMode(merged.sidebar?.sortMode),
+    },
+  }
+}
+
 export const settingsSlice = createSlice({
   name: 'settings',
   initialState,
   reducers: {
     setSettings: (state, action: PayloadAction<AppSettings>) => {
-      state.settings = {
-        ...defaultSettings,
-        ...action.payload,
-        terminal: { ...defaultSettings.terminal, ...(action.payload.terminal || {}) },
-        safety: { ...defaultSettings.safety, ...(action.payload.safety || {}) },
-        sidebar: {
-          ...defaultSettings.sidebar,
-          ...(action.payload.sidebar || {}),
-          sortMode: migrateSortMode(action.payload.sidebar?.sortMode),
-        },
-        panes: { ...defaultSettings.panes, ...(action.payload.panes || {}) },
-        notifications: { ...defaultSettings.notifications, ...(action.payload.notifications || {}) },
-      }
+      state.settings = mergeSettings(defaultSettings, action.payload)
       state.loaded = true
     },
     updateSettingsLocal: (state, action: PayloadAction<Partial<AppSettings>>) => {
-      const currentSidebar = state.settings.sidebar ?? defaultSettings.sidebar
-      const currentNotifications = state.settings.notifications ?? defaultSettings.notifications
-      state.settings = {
-        ...state.settings,
-        ...action.payload,
-        terminal: { ...state.settings.terminal, ...(action.payload.terminal || {}) },
-        safety: { ...state.settings.safety, ...(action.payload.safety || {}) },
-        sidebar: {
-          ...currentSidebar,
-          ...(action.payload.sidebar || {}),
-          sortMode: migrateSortMode(action.payload.sidebar?.sortMode ?? currentSidebar.sortMode),
-        },
-        panes: { ...state.settings.panes, ...(action.payload.panes || {}) },
-        notifications: { ...currentNotifications, ...(action.payload.notifications || {}) },
-      }
+      state.settings = mergeSettings(state.settings, action.payload)
     },
     markSaved: (state) => {
       state.lastSavedAt = Date.now()

@@ -1,10 +1,11 @@
 import { createSelector } from '@reduxjs/toolkit'
 import type { RootState } from '../store'
-import type { BackgroundTerminal } from '../types'
+import type { BackgroundTerminal, CodingCliProviderName } from '../types'
 
 export interface SidebarSessionItem {
   id: string
   sessionId: string
+  provider: CodingCliProviderName
   title: string
   subtitle?: string
   projectPath?: string
@@ -47,33 +48,39 @@ function buildSessionItems(
   const tabSessionMap = new Map<string, { hasTab: boolean; lastInputAt?: number }>()
 
   for (const terminal of terminals || []) {
-    if (terminal.mode === 'claude' && terminal.status === 'running' && terminal.resumeSessionId) {
-      runningSessionMap.set(terminal.resumeSessionId, terminal.terminalId)
+    if (terminal.mode && terminal.mode !== 'shell' && terminal.status === 'running' && terminal.resumeSessionId) {
+      runningSessionMap.set(`${terminal.mode}:${terminal.resumeSessionId}`, terminal.terminalId)
     }
   }
 
   for (const tab of tabs || []) {
     if (!tab.resumeSessionId) continue
-    const existing = tabSessionMap.get(tab.resumeSessionId)
+    const provider = tab.codingCliProvider || (tab.mode && tab.mode !== 'shell' ? tab.mode as CodingCliProviderName : undefined)
+    if (!provider) continue
+    const key = `${provider}:${tab.resumeSessionId}`
+    const existing = tabSessionMap.get(key)
     if (!existing) {
-      tabSessionMap.set(tab.resumeSessionId, { hasTab: true, lastInputAt: tab.lastInputAt })
+      tabSessionMap.set(key, { hasTab: true, lastInputAt: tab.lastInputAt })
       continue
     }
     const existingTime = existing.lastInputAt ?? 0
     const nextTime = tab.lastInputAt ?? 0
     if (nextTime > existingTime) {
-      tabSessionMap.set(tab.resumeSessionId, { hasTab: true, lastInputAt: tab.lastInputAt })
+      tabSessionMap.set(key, { hasTab: true, lastInputAt: tab.lastInputAt })
     }
   }
 
   for (const project of projects || []) {
     for (const session of project.sessions || []) {
-      const runningTerminalId = runningSessionMap.get(session.sessionId)
-      const tabInfo = tabSessionMap.get(session.sessionId)
-      const ratchetedActivity = sessionActivity[session.sessionId]
+      const provider = session.provider || 'claude'
+      const key = `${provider}:${session.sessionId}`
+      const runningTerminalId = runningSessionMap.get(key)
+      const tabInfo = tabSessionMap.get(key)
+      const ratchetedActivity = sessionActivity[key]
       items.push({
-        id: `session-${session.sessionId}`,
+        id: `session-${provider}-${session.sessionId}`,
         sessionId: session.sessionId,
+        provider,
         title: session.title || session.sessionId.slice(0, 8),
         subtitle: getProjectName(project.projectPath),
         projectPath: project.projectPath,
@@ -99,7 +106,8 @@ function filterSessionItems(items: SidebarSessionItem[], filter: string): Sideba
     (item) =>
       item.title.toLowerCase().includes(q) ||
       item.subtitle?.toLowerCase().includes(q) ||
-      item.projectPath?.toLowerCase().includes(q)
+      item.projectPath?.toLowerCase().includes(q) ||
+      item.provider.toLowerCase().includes(q)
   )
 }
 

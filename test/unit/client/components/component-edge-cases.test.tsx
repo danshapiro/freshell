@@ -23,7 +23,7 @@
  *
  * IDENTIFIED CRASH SCENARIOS:
  * - OverviewView: Crashes when API returns null instead of array (items.filter fails)
- * - SettingsView: Crashes when safety settings are undefined (direct property access)
+ * - SettingsView: Should render safely even when safety settings are undefined
  * - Sidebar: Crashes when projects array is undefined (forEach fails)
  * - HistoryView: Crashes when projects array is undefined (reduce/map fails)
  * - TabBar: Crashes when tabs array is undefined (map fails)
@@ -102,7 +102,7 @@ import tabsReducer, { TabsState } from '@/store/tabsSlice'
 import settingsReducer, { defaultSettings, SettingsState } from '@/store/settingsSlice'
 import sessionsReducer, { SessionsState } from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
-import claudeReducer from '@/store/claudeSlice'
+import codingCliReducer from '@/store/codingCliSlice'
 import panesReducer from '@/store/panesSlice'
 import terminalActivityReducer from '@/store/terminalActivitySlice'
 import type { Tab, AppSettings, ProjectGroup, BackgroundTerminal } from '@/store/types'
@@ -128,7 +128,7 @@ function createTestStore(state: TestStoreState = {}) {
       settings: settingsReducer,
       sessions: sessionsReducer,
       connection: connectionReducer,
-      claude: claudeReducer,
+      codingCli: codingCliReducer,
       panes: panesReducer,
       terminalActivity: terminalActivityReducer,
     },
@@ -154,6 +154,9 @@ function createTestStore(state: TestStoreState = {}) {
         projects: [],
         expandedProjects: new Set<string>(),
         ...state.sessions,
+      },
+      codingCli: {
+        sessions: {},
       },
       panes: {
         layouts: {},
@@ -298,9 +301,8 @@ describe('Component Edge Cases', () => {
           settings: { settings: settingsWithUndefinedSafety },
         })
 
-        // This might throw because safety settings are accessed directly
-        // Tests the component's resilience
-        expect(() => renderWithStore(<SettingsView />, store)).toThrow()
+        // SettingsView should be resilient to partial settings payloads
+        expect(() => renderWithStore(<SettingsView />, store)).not.toThrow()
       })
     })
 
@@ -1060,8 +1062,8 @@ describe('Component Edge Cases', () => {
           },
         })
 
-        // This should throw because settings properties are accessed
-        expect(() => renderWithStore(<SettingsView />, store as any)).toThrow()
+        // SettingsView should provide safe defaults even if settings are missing
+        expect(() => renderWithStore(<SettingsView />, store as any)).not.toThrow()
       })
     })
 

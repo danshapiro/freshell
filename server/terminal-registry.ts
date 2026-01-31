@@ -11,8 +11,69 @@ const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 
 const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 64 * 1024)
 const MAX_TERMINALS = Number(process.env.MAX_TERMINALS || 50)
 
-export type TerminalMode = 'shell' | 'claude' | 'codex'
+// TerminalMode includes 'shell' for regular terminals, plus coding CLI providers.
+// Provider command defaults are configurable via env vars; resume semantics
+// are only configured for providers that define resume args.
+export type TerminalMode = 'shell' | 'claude' | 'codex' | 'opencode' | 'gemini' | 'kimi'
 export type ShellType = 'system' | 'cmd' | 'powershell' | 'wsl'
+
+type CodingCliCommandSpec = {
+  label: string
+  envVar: string
+  defaultCommand: string
+  resumeArgs?: (sessionId: string) => string[]
+}
+
+const CODING_CLI_COMMANDS: Record<Exclude<TerminalMode, 'shell'>, CodingCliCommandSpec> = {
+  claude: {
+    label: 'Claude',
+    envVar: 'CLAUDE_CMD',
+    defaultCommand: 'claude',
+    resumeArgs: (sessionId) => ['--resume', sessionId],
+  },
+  codex: {
+    label: 'Codex',
+    envVar: 'CODEX_CMD',
+    defaultCommand: 'codex',
+    resumeArgs: (sessionId) => ['resume', sessionId],
+  },
+  opencode: {
+    label: 'OpenCode',
+    envVar: 'OPENCODE_CMD',
+    defaultCommand: 'opencode',
+  },
+  gemini: {
+    label: 'Gemini',
+    envVar: 'GEMINI_CMD',
+    defaultCommand: 'gemini',
+  },
+  kimi: {
+    label: 'Kimi',
+    envVar: 'KIMI_CMD',
+    defaultCommand: 'kimi',
+  },
+}
+
+function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string) {
+  if (mode === 'shell') return null
+  const spec = CODING_CLI_COMMANDS[mode]
+  const command = process.env[spec.envVar] || spec.defaultCommand
+  let args: string[] = []
+  if (resumeSessionId) {
+    if (spec.resumeArgs) {
+      args = spec.resumeArgs(resumeSessionId)
+    } else {
+      logger.warn({ mode, resumeSessionId }, 'Resume requested but no resume args configured')
+    }
+  }
+  return { command, args, label: spec.label }
+}
+
+function getModeLabel(mode: TerminalMode): string {
+  if (mode === 'shell') return 'Shell'
+  const label = CODING_CLI_COMMANDS[mode]?.label
+  return label || mode.toUpperCase()
+}
 
 export type TerminalRecord = {
   terminalId: string
@@ -155,7 +216,7 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
         ? effectiveShell
         : (process.env.WINDOWS_SHELL || 'wsl').toLowerCase()
 
-    // Option A: WSL (default) — recommended for Claude/Codex on Windows.
+    // Option A: WSL (default) — recommended for coding CLIs on Windows.
     if (windowsMode === 'wsl') {
       const wsl = process.env.WSL_EXE || 'wsl.exe'
       const distro = process.env.WSL_DISTRO // optional
@@ -172,16 +233,13 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
         return { file: wsl, args, cwd: undefined, env }
       }
 
-      if (mode === 'claude') {
-        const cmd = process.env.CLAUDE_CMD || 'claude'
-        const cmdArgs: string[] = []
-        if (resumeSessionId) cmdArgs.push('--resume', resumeSessionId)
-        args.push('--exec', cmd, ...cmdArgs)
+      const cli = resolveCodingCliCommand(mode, resumeSessionId)
+      if (!cli) {
+        args.push('--exec', 'bash', '-l')
         return { file: wsl, args, cwd: undefined, env }
       }
 
-      const cmd = process.env.CODEX_CMD || 'codex'
-      args.push('--exec', cmd)
+      args.push('--exec', cli.command, ...cli.args)
       return { file: wsl, args, cwd: undefined, env }
     }
 
@@ -196,8 +254,9 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
       if (mode === 'shell') {
         return { file, args: ['/K'], cwd: winCwd, env }
       }
-      const cmd = mode === 'claude' ? (process.env.CLAUDE_CMD || 'claude') : (process.env.CODEX_CMD || 'codex')
-      const resume = mode === 'claude' && resumeSessionId ? ` --resume ${resumeSessionId}` : ''
+      const cli = resolveCodingCliCommand(mode, resumeSessionId)
+      const cmd = cli?.command || mode
+      const resume = cli?.args.length ? ` ${cli.args.join(' ')}` : ''
       const cd = winCwd ? `cd /d ${winCwd} && ` : ''
       return { file, args: ['/K', `${cd}${cmd}${resume}`], cwd: winCwd, env }
     }
@@ -210,8 +269,9 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
       return { file, args: ['-NoLogo'], cwd: winCwd, env }
     }
 
-    const cmd = mode === 'claude' ? (process.env.CLAUDE_CMD || 'claude') : (process.env.CODEX_CMD || 'codex')
-    const resumeArgs = mode === 'claude' && resumeSessionId ? ` --resume ${resumeSessionId}` : ''
+    const cli = resolveCodingCliCommand(mode, resumeSessionId)
+    const cmd = cli?.command || mode
+    const resumeArgs = cli?.args.length ? ` ${cli.args.join(' ')}` : ''
     const cd = winCwd ? `Set-Location -LiteralPath ${quote(winCwd)}; ` : ''
     const command = `${cd}${cmd}${resumeArgs}`
     return { file, args: ['-NoLogo', '-NoExit', '-Command', command], cwd: winCwd, env }
@@ -223,15 +283,10 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
     return { file: systemShell, args: ['-l'], cwd, env }
   }
 
-  if (mode === 'claude') {
-    const cmd = process.env.CLAUDE_CMD || 'claude'
-    const args: string[] = []
-    if (resumeSessionId) args.push('--resume', resumeSessionId)
-    return { file: cmd, args, cwd, env }
-  }
-
-  const cmd = process.env.CODEX_CMD || 'codex'
-  return { file: cmd, args: [], cwd, env }
+  const cli = resolveCodingCliCommand(mode, resumeSessionId)
+  const cmd = cli?.command || mode
+  const args = cli?.args || []
+  return { file: cmd, args, cwd, env }
 }
 
 export class TerminalRegistry {
@@ -303,7 +358,7 @@ export class TerminalRegistry {
       env: env as any,
     })
 
-    const title = opts.mode === 'shell' ? 'Shell' : opts.mode === 'claude' ? 'Claude' : 'Codex'
+    const title = getModeLabel(opts.mode)
 
     const record: TerminalRecord = {
       terminalId,
@@ -472,13 +527,13 @@ export class TerminalRegistry {
   }
 
   /**
-   * Find claude-mode terminals that match a session by exact resumeSessionId.
+   * Find provider-mode terminals that match a session by exact resumeSessionId.
    * The cwd parameter is kept for API compatibility but ignored.
    */
-  findClaudeTerminalsBySession(sessionId: string, _cwd?: string): TerminalRecord[] {
+  findTerminalsBySession(mode: TerminalMode, sessionId: string, _cwd?: string): TerminalRecord[] {
     const results: TerminalRecord[] = []
     for (const term of this.terminals.values()) {
-      if (term.mode !== 'claude') continue
+      if (term.mode !== mode) continue
       if (term.resumeSessionId === sessionId) {
         results.push(term)
       }

@@ -2,8 +2,8 @@ import { describe, it, expect, afterEach, vi } from 'vitest'
 import { render, screen, cleanup, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
-import ClaudeSessionView from '../../../../src/components/ClaudeSessionView'
-import claudeReducer from '../../../../src/store/claudeSlice'
+import SessionView from '../../../../src/components/SessionView'
+import codingCliReducer from '../../../../src/store/codingCliSlice'
 
 const mockConnect = vi.fn().mockResolvedValue(undefined)
 const mockSend = vi.fn()
@@ -17,22 +17,23 @@ vi.mock('@/lib/ws-client', () => ({
   }),
 }))
 
-function createTestStore(claudeState = {}) {
+function createTestStore(codingCliState = {}) {
   return configureStore({
     reducer: {
-      claude: claudeReducer,
+      codingCli: codingCliReducer,
     },
     preloadedState: {
-      claude: {
+      codingCli: {
         sessions: {
           'session-1': {
             sessionId: 'session-1',
+            provider: 'claude',
             prompt: 'test prompt',
             status: 'running' as const,
-            messages: [],
+            events: [],
             createdAt: Date.now(),
           },
-          ...claudeState,
+          ...codingCliState,
         },
       },
     },
@@ -46,12 +47,12 @@ afterEach(() => {
   mockOnMessage.mockClear()
 })
 
-describe('ClaudeSessionView', () => {
+describe('SessionView', () => {
   it('renders session prompt', () => {
     const store = createTestStore()
     render(
       <Provider store={store}>
-        <ClaudeSessionView sessionId="session-1" />
+        <SessionView sessionId="session-1" />
       </Provider>
     )
 
@@ -62,7 +63,7 @@ describe('ClaudeSessionView', () => {
     const store = createTestStore()
     render(
       <Provider store={store}>
-        <ClaudeSessionView sessionId="session-1" />
+        <SessionView sessionId="session-1" />
       </Provider>
     )
 
@@ -73,17 +74,20 @@ describe('ClaudeSessionView', () => {
     const store = createTestStore({
       'session-1': {
         sessionId: 'session-1',
+        provider: 'claude',
         prompt: 'test',
         status: 'running' as const,
-        messages: [
+        events: [
           {
-            type: 'assistant',
+            type: 'message.assistant',
+            timestamp: new Date().toISOString(),
+            sessionId: 'provider-session',
+            provider: 'claude',
+            raw: {},
             message: {
               role: 'assistant',
-              content: [{ type: 'text', text: 'Hello from Claude!' }],
+              content: 'Hello from Claude!',
             },
-            session_id: 'abc',
-            uuid: '123',
           },
         ],
         createdAt: Date.now(),
@@ -92,7 +96,7 @@ describe('ClaudeSessionView', () => {
 
     render(
       <Provider store={store}>
-        <ClaudeSessionView sessionId="session-1" />
+        <SessionView sessionId="session-1" />
       </Provider>
     )
 
@@ -103,7 +107,7 @@ describe('ClaudeSessionView', () => {
     const store = createTestStore()
     render(
       <Provider store={store}>
-        <ClaudeSessionView sessionId="session-1" />
+        <SessionView sessionId="session-1" />
       </Provider>
     )
 
@@ -114,39 +118,39 @@ describe('ClaudeSessionView', () => {
     const store = createTestStore({
       'session-1': {
         sessionId: 'session-1',
+        provider: 'claude',
         prompt: 'test',
         status: 'completed' as const,
-        messages: [],
-        result: {
-          type: 'result',
-          subtype: 'success',
-          is_error: false,
-          duration_ms: 1000,
-          session_id: 'abc',
-        },
+        events: [
+          {
+            type: 'session.end',
+            timestamp: new Date().toISOString(),
+            sessionId: 'provider-session',
+            provider: 'claude',
+            raw: {},
+          },
+        ],
         createdAt: Date.now(),
       },
     })
 
     render(
       <Provider store={store}>
-        <ClaudeSessionView sessionId="session-1" />
+        <SessionView sessionId="session-1" />
       </Provider>
     )
 
-    // The word "completed" appears in multiple places - status badge, duration, and footer
-    // Just check that at least one exists
     expect(screen.getAllByText(/completed/i).length).toBeGreaterThan(0)
   })
 
-  it('returns null for unknown session', () => {
+  it('shows placeholder for unknown session', () => {
     const store = createTestStore()
-    const { container } = render(
+    render(
       <Provider store={store}>
-        <ClaudeSessionView sessionId="unknown" />
+        <SessionView sessionId="unknown" />
       </Provider>
     )
 
-    expect(container.firstChild).toBeNull()
+    expect(screen.getByText(/starting session/i)).toBeInTheDocument()
   })
 })
