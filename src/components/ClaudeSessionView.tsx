@@ -3,7 +3,6 @@ import { useAppSelector, useAppDispatch } from '@/store/hooks'
 import { addClaudeEvent, setClaudeSessionStatus } from '@/store/claudeSlice'
 import { cn } from '@/lib/utils'
 import { MessageBubble } from './claude/MessageBubble'
-import { isMessageEvent, isResultEvent } from '@/lib/claude-types'
 import { getWsClient } from '@/lib/ws-client'
 
 interface ClaudeSessionViewProps {
@@ -41,12 +40,12 @@ export default function ClaudeSessionView({ sessionId, hidden }: ClaudeSessionVi
     if (scrollRef.current && !hidden) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight
     }
-  }, [session?.events.length, hidden])
+  }, [session?.messages.length, session?.result, hidden])
 
   if (!session) return null
 
-  const messageEvents = session.events.filter(isMessageEvent)
-  const resultEvent = session.events.find(isResultEvent)
+  const messageEvents = session.messages
+  const resultEvent = session.result
 
   return (
     <div className={cn('h-full w-full flex flex-col', hidden ? 'hidden' : '')}>

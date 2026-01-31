@@ -58,10 +58,12 @@ describe('TerminalView - lastInputAt updates', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     onDataCallback = null
+    vi.useFakeTimers()
   })
 
   afterEach(() => {
     cleanup()
+    vi.useRealTimers()
   })
 
   function createStore(opts?: { resumeSessionId?: string }) {
@@ -165,6 +167,45 @@ describe('TerminalView - lastInputAt updates', () => {
     const sessionTime = store.getState().sessionActivity.sessions['claude-session-123']
     expect(sessionTime).toBeGreaterThanOrEqual(beforeInput)
     expect(sessionTime).toBeLessThanOrEqual(afterInput)
+  })
+
+  it('throttles sessionActivity updates to avoid per-keystroke dispatch', async () => {
+    const store = createStore({ resumeSessionId: 'claude-session-123' })
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-1',
+      terminalId: 'term-1',
+      mode: 'claude',
+      shell: 'system',
+      status: 'running',
+    }
+
+    render(
+      <Provider store={store}>
+        <TerminalView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={paneContent}
+        />
+      </Provider>
+    )
+
+    expect(onDataCallback).not.toBeNull()
+
+    onDataCallback!('first')
+    const firstTime = store.getState().sessionActivity.sessions['claude-session-123']
+
+    vi.advanceTimersByTime(1000)
+    onDataCallback!('second')
+    const secondTime = store.getState().sessionActivity.sessions['claude-session-123']
+
+    expect(secondTime).toBe(firstTime)
+
+    vi.advanceTimersByTime(5000)
+    onDataCallback!('third')
+    const thirdTime = store.getState().sessionActivity.sessions['claude-session-123']
+
+    expect(thirdTime).toBeGreaterThan(firstTime)
   })
 
   it('does not update sessionActivity for tabs without resumeSessionId', async () => {

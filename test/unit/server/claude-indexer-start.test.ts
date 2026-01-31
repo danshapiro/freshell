@@ -34,7 +34,7 @@ describe('ClaudeSessionIndexer start', () => {
     watchMock.mockClear()
   })
 
-  it('schedules a refresh when watcher becomes ready', async () => {
+  it('does not trigger a full refresh on watcher ready', async () => {
     vi.useFakeTimers()
 
     const indexer = new ClaudeSessionIndexer()
@@ -49,7 +49,7 @@ describe('ClaudeSessionIndexer start', () => {
 
     await vi.runAllTimersAsync()
 
-    expect(refreshSpy).toHaveBeenCalledTimes(2)
+    expect(refreshSpy).toHaveBeenCalledTimes(1)
 
     indexer.stop()
   })

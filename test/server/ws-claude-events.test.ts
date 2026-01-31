@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, vi, beforeEach, afterEach } 
 import http from 'http'
 import express from 'express'
 import WebSocket from 'ws'
+import { EventEmitter } from 'events'
 import { WsHandler } from '../../server/ws-handler'
 import { TerminalRegistry } from '../../server/terminal-registry'
 import { ClaudeSessionManager } from '../../server/claude-session'
@@ -136,6 +137,50 @@ describe('WebSocket Claude Events', () => {
     expect(response.success).toBe(false)
 
     ws.close()
+  })
+
+  it('detaches Claude listeners on socket close', async () => {
+    const fakeSession = Object.assign(new EventEmitter(), {
+      id: 'fake-session-1',
+      sendInput: vi.fn(),
+      kill: vi.fn(),
+    })
+
+    const createSpy = vi.spyOn(claudeManager, 'create').mockReturnValue(fakeSession as any)
+
+    const ws = {
+      bufferedAmount: 0,
+      readyState: WebSocket.OPEN,
+      send: vi.fn(),
+      close: vi.fn(),
+    } as any
+
+    const state = {
+      authenticated: true,
+      attachedTerminalIds: new Set<string>(),
+      createdByRequestId: new Map<string, string>(),
+      claudeSessions: new Set<string>(),
+      claudeSubscriptions: new Map<string, () => void>(),
+      interestedSessions: new Set<string>(),
+    }
+
+    await (wsHandler as any).onMessage(
+      ws,
+      state,
+      Buffer.from(JSON.stringify({ type: 'claude.create', requestId: 'req-1', prompt: 'hello' }))
+    )
+
+    expect(fakeSession.listenerCount('event')).toBe(1)
+    expect(fakeSession.listenerCount('exit')).toBe(1)
+    expect(fakeSession.listenerCount('stderr')).toBe(1)
+
+    ;(wsHandler as any).onClose(ws, state)
+
+    expect(fakeSession.listenerCount('event')).toBe(0)
+    expect(fakeSession.listenerCount('exit')).toBe(0)
+    expect(fakeSession.listenerCount('stderr')).toBe(0)
+
+    createSpy.mockRestore()
   })
 })
 

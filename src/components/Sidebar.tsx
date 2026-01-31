@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Terminal, History, Settings, LayoutGrid, Search, Play } from 'lucide-react'
-import { FixedSizeList as List, type ListChildComponentProps } from 'react-window'
+import { List, type RowComponentProps } from 'react-window'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
@@ -150,7 +150,7 @@ export default function Sidebar({
     ? listHeight
     : Math.min(sortedItems.length * SESSION_ITEM_HEIGHT, SESSION_LIST_MAX_HEIGHT)
 
-  const listData = useMemo(() => ({
+  const rowProps = useMemo(() => ({
     items: sortedItems,
     activeResumeSessionId,
     activeTerminalId,
@@ -158,13 +158,13 @@ export default function Sidebar({
     onItemClick: handleItemClick,
   }), [sortedItems, activeResumeSessionId, activeTerminalId, settings.sidebar?.showProjectBadges, handleItemClick])
 
-  const Row = ({ index, style, data }: ListChildComponentProps<typeof listData>) => {
+  const Row = ({ index, style, ariaAttributes, ...data }: RowComponentProps<typeof rowProps>) => {
     const item = data.items[index]
     const isActive = item.isRunning
       ? item.runningTerminalId === data.activeTerminalId
       : item.sessionId === data.activeResumeSessionId
     return (
-      <div style={{ ...style, paddingBottom: 2 }}>
+      <div style={{ ...style, paddingBottom: 2 }} {...ariaAttributes}>
         <SidebarItem
           item={item}
           isActiveTab={isActive}
@@ -232,16 +232,14 @@ export default function Sidebar({
           </div>
         ) : (
           <List
-            height={effectiveListHeight}
-            itemCount={sortedItems.length}
-            itemSize={SESSION_ITEM_HEIGHT}
-            width="100%"
-            itemData={listData}
-            itemKey={(index, data) => data.items[index].id}
+            defaultHeight={effectiveListHeight}
+            rowCount={sortedItems.length}
+            rowHeight={SESSION_ITEM_HEIGHT}
+            rowComponent={Row}
+            rowProps={rowProps}
             className="overflow-y-auto"
-          >
-            {Row}
-          </List>
+            style={{ height: effectiveListHeight, width: '100%' }}
+          />
         )}
       </div>
 

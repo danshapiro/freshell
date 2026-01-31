@@ -7,6 +7,7 @@ import claudeReducer from './claudeSlice'
 import panesReducer from './panesSlice'
 import sessionActivityReducer from './sessionActivitySlice'
 import { persistMiddleware } from './persistMiddleware'
+import { sessionActivityPersistMiddleware } from './sessionActivityPersistence'
 
 export const store = configureStore({
   reducer: {
@@ -23,7 +24,7 @@ export const store = configureStore({
       serializableCheck: {
         ignoredPaths: ['sessions.expandedProjects'],
       },
-    }).concat(persistMiddleware),
+    }).concat(persistMiddleware, sessionActivityPersistMiddleware),
 })
 
 // Note: Tabs and Panes are now loaded from localStorage directly in their slice

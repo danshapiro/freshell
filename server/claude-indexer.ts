@@ -9,6 +9,7 @@ import { extractTitleFromMessage } from './title-utils.js'
 
 const SEEN_SESSION_RETENTION_MS = Number(process.env.CLAUDE_SEEN_SESSION_RETENTION_MS || 7 * 24 * 60 * 60 * 1000)
 const MAX_SEEN_SESSION_IDS = Number(process.env.CLAUDE_SEEN_SESSION_MAX || 10_000)
+const INCREMENTAL_DEBOUNCE_MS = Number(process.env.CLAUDE_INDEXER_DEBOUNCE_MS || 250)
 
 export type ClaudeSession = {
   sessionId: string
@@ -186,11 +187,13 @@ export class ClaudeSessionIndexer {
   private watcher: chokidar.FSWatcher | null = null
   private projects: ProjectGroup[] = []
   private onUpdateHandlers = new Set<(projects: ProjectGroup[]) => void>()
-  private refreshTimer: NodeJS.Timeout | null = null
   private knownSessionIds = new Set<string>()
   private seenSessionIds = new Map<string, number>()
   private onNewSessionHandlers = new Set<(session: ClaudeSession) => void>()
   private initialized = false
+  private sessionsById = new Map<string, ClaudeSession>()
+  private projectsByPath = new Map<string, ProjectGroup>()
+  private incrementalTimers = new Map<string, NodeJS.Timeout>()
 
   async start() {
     // Initial scan (populates knownSessionIds with existing sessions)
@@ -207,20 +210,22 @@ export class ClaudeSessionIndexer {
       awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 100 },
     })
 
-    const schedule = () => this.scheduleRefresh()
+    const scheduleUpsert = (filePath: string) => this.scheduleFileUpsert(filePath)
+    const scheduleRemove = (filePath: string) => this.scheduleFileRemove(filePath)
 
-    this.watcher.on('add', schedule)
-    this.watcher.on('change', schedule)
-    this.watcher.on('unlink', schedule)
-    this.watcher.on('ready', schedule)
+    this.watcher.on('add', scheduleUpsert)
+    this.watcher.on('change', scheduleUpsert)
+    this.watcher.on('unlink', scheduleRemove)
     this.watcher.on('error', (err) => logger.warn({ err }, 'Claude watcher error'))
   }
 
   stop() {
     this.watcher?.close().catch(() => {})
     this.watcher = null
-    if (this.refreshTimer) clearTimeout(this.refreshTimer)
-    this.refreshTimer = null
+    for (const timer of this.incrementalTimers.values()) {
+      clearTimeout(timer)
+    }
+    this.incrementalTimers.clear()
   }
 
   onUpdate(handler: (projects: ProjectGroup[]) => void): () => void {
@@ -300,11 +305,144 @@ export class ClaudeSessionIndexer {
     return this.projects
   }
 
-  private scheduleRefresh() {
-    if (this.refreshTimer) clearTimeout(this.refreshTimer)
-    this.refreshTimer = setTimeout(() => {
-      this.refresh().catch((err) => logger.warn({ err }, 'Refresh failed'))
-    }, 250)
+  private scheduleFileUpsert(filePath: string) {
+    const existing = this.incrementalTimers.get(filePath)
+    if (existing) clearTimeout(existing)
+    this.incrementalTimers.set(
+      filePath,
+      setTimeout(() => {
+        this.incrementalTimers.delete(filePath)
+        this.upsertSessionFromFile(filePath).catch((err) =>
+          logger.warn({ err, filePath }, 'Incremental session update failed')
+        )
+      }, INCREMENTAL_DEBOUNCE_MS)
+    )
+  }
+
+  private scheduleFileRemove(filePath: string) {
+    const existing = this.incrementalTimers.get(filePath)
+    if (existing) clearTimeout(existing)
+    this.incrementalTimers.set(
+      filePath,
+      setTimeout(() => {
+        this.incrementalTimers.delete(filePath)
+        const sessionId = path.basename(filePath, '.jsonl')
+        if (this.removeSession(sessionId)) {
+          this.rebuildProjects()
+        }
+      }, INCREMENTAL_DEBOUNCE_MS)
+    )
+  }
+
+  private removeSession(sessionId: string): boolean {
+    const existing = this.sessionsById.get(sessionId)
+    if (!existing) return false
+
+    this.sessionsById.delete(sessionId)
+    this.removeSessionFromProject(existing.sessionId, existing.projectPath)
+    return true
+  }
+
+  private removeSessionFromProject(sessionId: string, projectPath: string) {
+    const group = this.projectsByPath.get(projectPath)
+    if (!group) return
+    group.sessions = group.sessions.filter((s) => s.sessionId !== sessionId)
+    if (group.sessions.length === 0) {
+      this.projectsByPath.delete(projectPath)
+    }
+  }
+
+  private applySessionUpdate(session: ClaudeSession, projectColor?: string) {
+    const existing = this.sessionsById.get(session.sessionId)
+    if (existing && existing.projectPath !== session.projectPath) {
+      this.removeSessionFromProject(existing.sessionId, existing.projectPath)
+    }
+
+    this.sessionsById.set(session.sessionId, session)
+
+    let group = this.projectsByPath.get(session.projectPath)
+    if (!group) {
+      group = {
+        projectPath: session.projectPath,
+        sessions: [],
+        color: projectColor,
+      }
+      this.projectsByPath.set(session.projectPath, group)
+    }
+
+    group.color = projectColor
+
+    const idx = group.sessions.findIndex((s) => s.sessionId === session.sessionId)
+    if (idx >= 0) {
+      group.sessions[idx] = session
+    } else {
+      group.sessions.push(session)
+    }
+  }
+
+  private rebuildProjects() {
+    const groups = Array.from(this.projectsByPath.values()).filter((g) => g.sessions.length > 0)
+
+    for (const group of groups) {
+      group.sessions.sort((a, b) => b.updatedAt - a.updatedAt)
+    }
+
+    groups.sort((a, b) => (b.sessions[0]?.updatedAt || 0) - (a.sessions[0]?.updatedAt || 0))
+
+    const allSessions = groups.flatMap((g) => g.sessions)
+    this.detectNewSessions(allSessions)
+
+    this.projects = groups
+    this.emitUpdate()
+  }
+
+  private async upsertSessionFromFile(filePath: string) {
+    const sessionId = path.basename(filePath, '.jsonl')
+    let stat: any
+    try {
+      stat = await fsp.stat(filePath)
+    } catch {
+      if (this.removeSession(sessionId)) {
+        this.rebuildProjects()
+      }
+      return
+    }
+
+    const meta = await parseSessionJsonlMeta(filePath)
+    if (!meta.cwd) {
+      if (this.removeSession(sessionId)) {
+        this.rebuildProjects()
+      }
+      return
+    }
+
+    const projectDir = path.dirname(filePath)
+    const projectPath = await resolveProjectPath(projectDir)
+
+    const cfg = await configStore.snapshot()
+    const colors = await configStore.getProjectColors()
+
+    const baseSession: ClaudeSession = {
+      sessionId,
+      projectPath,
+      updatedAt: stat.mtimeMs || stat.mtime.getTime(),
+      messageCount: meta.messageCount,
+      title: meta.title,
+      summary: meta.summary,
+      cwd: meta.cwd,
+    }
+
+    const ov = cfg.sessionOverrides?.[sessionId]
+    const merged = applyOverride(baseSession, ov)
+    if (!merged) {
+      if (this.removeSession(sessionId)) {
+        this.rebuildProjects()
+      }
+      return
+    }
+
+    this.applySessionUpdate(merged, colors[projectPath])
+    this.rebuildProjects()
   }
 
   async refresh() {
@@ -319,6 +457,8 @@ export class ClaudeSessionIndexer {
     } catch (err: any) {
       logger.warn({ err, projectsDir }, 'Could not read Claude projects directory')
       this.projects = []
+      this.sessionsById.clear()
+      this.projectsByPath.clear()
       this.emitUpdate()
       return
     }
@@ -385,9 +525,17 @@ export class ClaudeSessionIndexer {
     // Sort projects by most recent session activity.
     groups.sort((a, b) => (b.sessions[0]?.updatedAt || 0) - (a.sessions[0]?.updatedAt || 0))
 
-    // Detect newly discovered sessions
-    const allSessions = groups.flatMap(g => g.sessions)
+    const allSessions = groups.flatMap((g) => g.sessions)
     this.detectNewSessions(allSessions)
+
+    this.sessionsById.clear()
+    this.projectsByPath.clear()
+    for (const group of groups) {
+      this.projectsByPath.set(group.projectPath, group)
+      for (const session of group.sessions) {
+        this.sessionsById.set(session.sessionId, session)
+      }
+    }
 
     this.projects = groups
     this.emitUpdate()

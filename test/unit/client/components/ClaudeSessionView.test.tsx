@@ -25,7 +25,7 @@ function createTestStore(claudeState = {}) {
             sessionId: 'session-1',
             prompt: 'test prompt',
             status: 'running' as const,
-            events: [],
+            messages: [],
             createdAt: Date.now(),
           },
           ...claudeState,
@@ -55,7 +55,7 @@ describe('ClaudeSessionView', () => {
         sessionId: 'session-1',
         prompt: 'test',
         status: 'running' as const,
-        events: [
+        messages: [
           {
             type: 'assistant',
             message: {
@@ -96,15 +96,14 @@ describe('ClaudeSessionView', () => {
         sessionId: 'session-1',
         prompt: 'test',
         status: 'completed' as const,
-        events: [
-          {
-            type: 'result',
-            subtype: 'success',
-            is_error: false,
-            duration_ms: 1000,
-            session_id: 'abc',
-          },
-        ],
+        messages: [],
+        result: {
+          type: 'result',
+          subtype: 'success',
+          is_error: false,
+          duration_ms: 1000,
+          session_id: 'abc',
+        },
         createdAt: Date.now(),
       },
     })
