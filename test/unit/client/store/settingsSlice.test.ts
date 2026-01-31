@@ -39,6 +39,8 @@ describe('settingsSlice', () => {
       expect(state.settings.sidebar).toEqual({
         sortMode: 'hybrid',
         showProjectBadges: true,
+        width: 288,
+        collapsed: false,
       })
     })
   })
