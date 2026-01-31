@@ -134,8 +134,8 @@ export const persistMiddleware: Middleware<{}, RootState> = (store) => (next) =>
     }
     const panesJson = JSON.stringify(panesPayload)
     localStorage.setItem(PANES_STORAGE_KEY, panesJson)
-  } catch {
-    // ignore quota errors
+  } catch (err) {
+    console.error('[Panes Persist] Failed to save to localStorage:', err)
   }
 
   return result
