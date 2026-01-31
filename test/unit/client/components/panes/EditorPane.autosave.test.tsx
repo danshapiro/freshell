@@ -4,16 +4,30 @@ import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import EditorPane from '@/components/panes/EditorPane'
 import panesReducer from '@/store/panesSlice'
+import settingsReducer from '@/store/settingsSlice'
 
-vi.mock('@monaco-editor/react', () => ({
-  default: ({ value, onChange }: any) => (
-    <textarea
-      data-testid="monaco-mock"
-      value={value}
-      onChange={(e) => onChange?.(e.target.value)}
-    />
-  ),
-}))
+// Mock Monaco to avoid loading issues in tests
+vi.mock('@monaco-editor/react', () => {
+  const MockEditor = ({ value, onChange }: any) => {
+    const React = require('react')
+    return React.createElement('textarea', {
+      'data-testid': 'monaco-mock',
+      value,
+      onChange: (e: any) => onChange?.(e.target.value),
+    })
+  }
+  return {
+    default: MockEditor,
+    Editor: MockEditor,
+  }
+})
+
+// Helper to create a proper mock response for the api module (which uses res.text())
+const createMockResponse = (data: unknown, ok = true, statusText = 'OK') => ({
+  ok,
+  statusText,
+  text: async () => JSON.stringify(data),
+})
 
 // Mock fetch for auto-save
 global.fetch = vi.fn()
@@ -22,6 +36,7 @@ const createMockStore = () =>
   configureStore({
     reducer: {
       panes: panesReducer,
+      settings: settingsReducer,
     },
   })
 
@@ -32,10 +47,20 @@ describe('EditorPane auto-save', () => {
     vi.useFakeTimers()
     store = createMockStore()
     vi.mocked(fetch).mockReset()
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve({ success: true }),
-    } as Response)
+    // Default mock for all endpoints
+    vi.mocked(fetch).mockImplementation(async (url: RequestInfo | URL) => {
+      const urlStr = url.toString()
+      if (urlStr === '/api/terminals') {
+        return createMockResponse([]) as Response
+      }
+      if (urlStr === '/api/files/write') {
+        return createMockResponse({ success: true }) as Response
+      }
+      if (urlStr.startsWith('/api/files/complete')) {
+        return createMockResponse({ suggestions: [] }) as Response
+      }
+      return createMockResponse({ success: true }) as Response
+    })
   })
 
   afterEach(() => {
@@ -75,12 +100,12 @@ describe('EditorPane auto-save', () => {
     await act(async () => {
       vi.advanceTimersByTime(1000)
     })
-    expect(fetch).toHaveBeenCalledWith(
-      '/api/files/write',
-      expect.objectContaining({
-        method: 'POST',
-      })
+
+    // Check that /api/files/write was called
+    const writeCalls = vi.mocked(fetch).mock.calls.filter(
+      (call) => call[0] === '/api/files/write'
     )
+    expect(writeCalls.length).toBeGreaterThan(0)
   })
 
   it('does not auto-save scratch pads (no filePath)', async () => {
@@ -103,7 +128,11 @@ describe('EditorPane auto-save', () => {
       vi.advanceTimersByTime(10000)
     })
 
-    expect(fetch).not.toHaveBeenCalled()
+    // Check that /api/files/write was NOT called (other calls like /api/terminals are okay)
+    const writeCalls = vi.mocked(fetch).mock.calls.filter(
+      (call) => call[0] === '/api/files/write'
+    )
+    expect(writeCalls).toHaveLength(0)
   })
 
   it('resets debounce timer on each change', async () => {
@@ -150,7 +179,11 @@ describe('EditorPane auto-save', () => {
       vi.advanceTimersByTime(2000)
     })
 
-    expect(fetch).toHaveBeenCalledTimes(1)
+    // Should have saved once
+    const writeCalls = vi.mocked(fetch).mock.calls.filter(
+      (call) => call[0] === '/api/files/write'
+    )
+    expect(writeCalls).toHaveLength(1)
   })
 
   it('sends correct content in auto-save request', async () => {
@@ -180,19 +213,16 @@ describe('EditorPane auto-save', () => {
       vi.advanceTimersByTime(5000)
     })
 
-    expect(fetch).toHaveBeenCalledWith(
-      '/api/files/write',
-      expect.objectContaining({
-        method: 'POST',
-        headers: expect.objectContaining({
-          'Content-Type': 'application/json',
-        }),
-        body: expect.any(String),
-      })
+    // Find the write call
+    const writeCalls = vi.mocked(fetch).mock.calls.filter(
+      (call) => call[0] === '/api/files/write'
     )
+    expect(writeCalls.length).toBeGreaterThan(0)
+
+    const [, options] = writeCalls[0]
+    expect(options?.method).toBe('POST')
 
     // Verify the body content
-    const [, options] = vi.mocked(fetch).mock.calls[0]
     const body = JSON.parse(options?.body as string)
     expect(body).toEqual({
       path: '/test.ts',
@@ -220,7 +250,11 @@ describe('EditorPane auto-save', () => {
       vi.advanceTimersByTime(10000)
     })
 
-    expect(fetch).not.toHaveBeenCalled()
+    // Check that /api/files/write was NOT called
+    const writeCalls = vi.mocked(fetch).mock.calls.filter(
+      (call) => call[0] === '/api/files/write'
+    )
+    expect(writeCalls).toHaveLength(0)
   })
 
   it('cleans up timer on unmount', async () => {
@@ -254,6 +288,9 @@ describe('EditorPane auto-save', () => {
     })
 
     // Should not have saved since component unmounted
-    expect(fetch).not.toHaveBeenCalled()
+    const writeCalls = vi.mocked(fetch).mock.calls.filter(
+      (call) => call[0] === '/api/files/write'
+    )
+    expect(writeCalls).toHaveLength(0)
   })
 })

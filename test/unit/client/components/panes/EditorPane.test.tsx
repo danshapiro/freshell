@@ -5,17 +5,30 @@ import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import EditorPane from '@/components/panes/EditorPane'
 import panesReducer from '@/store/panesSlice'
+import settingsReducer from '@/store/settingsSlice'
 
 // Mock Monaco to avoid loading issues in tests
-vi.mock('@monaco-editor/react', () => ({
-  default: ({ value, onChange }: any) => (
-    <textarea
-      data-testid="monaco-mock"
-      value={value}
-      onChange={(e) => onChange?.(e.target.value)}
-    />
-  ),
-}))
+vi.mock('@monaco-editor/react', () => {
+  const MockEditor = ({ value, onChange }: any) => {
+    const React = require('react')
+    return React.createElement('textarea', {
+      'data-testid': 'monaco-mock',
+      value,
+      onChange: (e: any) => onChange?.(e.target.value),
+    })
+  }
+  return {
+    default: MockEditor,
+    Editor: MockEditor,
+  }
+})
+
+// Helper to create a proper mock response for the api module (which uses res.text())
+const createMockResponse = (data: unknown, ok = true, statusText = 'OK') => ({
+  ok,
+  statusText,
+  text: async () => JSON.stringify(data),
+})
 
 // Mock fetch for file loading tests
 const mockFetch = vi.fn()
@@ -24,6 +37,7 @@ const createMockStore = () =>
   configureStore({
     reducer: {
       panes: panesReducer,
+      settings: settingsReducer,
     },
   })
 
@@ -33,6 +47,13 @@ describe('EditorPane', () => {
   beforeEach(() => {
     store = createMockStore()
     vi.stubGlobal('fetch', mockFetch)
+    // Default mock for /api/terminals endpoint that EditorPane calls on mount
+    mockFetch.mockImplementation(async (url: string) => {
+      if (url === '/api/terminals') {
+        return createMockResponse([])
+      }
+      return createMockResponse({}, false, 'Not Found')
+    })
     sessionStorage.clear()
   })
 
@@ -57,7 +78,9 @@ describe('EditorPane', () => {
       </Provider>
     )
 
-    expect(screen.getByRole('button', { name: /open file/i })).toBeInTheDocument()
+    // The empty state shows an "Open File" button distinct from the toolbar's file picker
+    const buttons = screen.getAllByRole('button', { name: /open file/i })
+    expect(buttons.length).toBeGreaterThanOrEqual(1)
   })
 
   it('renders Monaco editor when content is provided', () => {
@@ -166,16 +189,19 @@ describe('EditorPane', () => {
       </Provider>
     )
 
-    expect(screen.getByTitle('HTML Preview')).toBeInTheDocument()
+    expect(screen.getByTitle('HTML preview')).toBeInTheDocument()
   })
 
   describe('file loading', () => {
     it('loads file content from server when path is entered', async () => {
       const user = userEvent.setup()
       sessionStorage.setItem('auth-token', 'test-token')
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ content: 'const x = 42' }),
+      mockFetch.mockImplementation(async (url: string) => {
+        if (url === '/api/terminals') return createMockResponse([])
+        if (url.startsWith('/api/files/read')) {
+          return createMockResponse({ content: 'const x = 42' })
+        }
+        return createMockResponse({}, false, 'Not Found')
       })
 
       render(
@@ -200,7 +226,7 @@ describe('EditorPane', () => {
         expect(mockFetch).toHaveBeenCalledWith(
           '/api/files/read?path=%2Fpath%2Fto%2Ffile.ts',
           expect.objectContaining({
-            headers: { 'x-auth-token': 'test-token' },
+            headers: expect.any(Headers),
           })
         )
       })
@@ -209,9 +235,12 @@ describe('EditorPane', () => {
     it('sends auth token from sessionStorage with file load request', async () => {
       const user = userEvent.setup()
       sessionStorage.setItem('auth-token', 'my-secret-token')
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ content: 'file content' }),
+      mockFetch.mockImplementation(async (url: string) => {
+        if (url === '/api/terminals') return createMockResponse([])
+        if (url.startsWith('/api/files/read')) {
+          return createMockResponse({ content: 'file content' })
+        }
+        return createMockResponse({}, false, 'Not Found')
       })
 
       render(
@@ -233,21 +262,23 @@ describe('EditorPane', () => {
       await user.type(input, '/test.js{enter}')
 
       await waitFor(() => {
-        expect(mockFetch).toHaveBeenCalledWith(
-          expect.any(String),
-          expect.objectContaining({
-            headers: { 'x-auth-token': 'my-secret-token' },
-          })
-        )
+        const calls = mockFetch.mock.calls
+        const fileReadCall = calls.find((c: any) => c[0].startsWith('/api/files/read'))
+        expect(fileReadCall).toBeTruthy()
+        const headers = fileReadCall![1].headers as Headers
+        expect(headers.get('x-auth-token')).toBe('my-secret-token')
       })
     })
 
     it('handles empty auth token gracefully', async () => {
       const user = userEvent.setup()
       // No token in sessionStorage
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ content: 'content' }),
+      mockFetch.mockImplementation(async (url: string) => {
+        if (url === '/api/terminals') return createMockResponse([])
+        if (url.startsWith('/api/files/read')) {
+          return createMockResponse({ content: 'content' })
+        }
+        return createMockResponse({}, false, 'Not Found')
       })
 
       render(
@@ -269,21 +300,24 @@ describe('EditorPane', () => {
       await user.type(input, '/test.js{enter}')
 
       await waitFor(() => {
-        expect(mockFetch).toHaveBeenCalledWith(
-          expect.any(String),
-          expect.objectContaining({
-            headers: { 'x-auth-token': '' },
-          })
-        )
+        const calls = mockFetch.mock.calls
+        const fileReadCall = calls.find((c: any) => c[0].startsWith('/api/files/read'))
+        expect(fileReadCall).toBeTruthy()
+        // When no token, the header should not be set
+        const headers = fileReadCall![1].headers as Headers
+        expect(headers.get('x-auth-token')).toBeNull()
       })
     })
 
     it('logs error when file load fails', async () => {
       const user = userEvent.setup()
       const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-      mockFetch.mockResolvedValueOnce({
-        ok: false,
-        statusText: 'Not Found',
+      mockFetch.mockImplementation(async (url: string) => {
+        if (url === '/api/terminals') return createMockResponse([])
+        if (url.startsWith('/api/files/read')) {
+          return createMockResponse({ error: 'Not Found' }, false, 'Not Found')
+        }
+        return createMockResponse({}, false, 'Not Found')
       })
 
       render(
@@ -305,7 +339,9 @@ describe('EditorPane', () => {
       await user.type(input, '/nonexistent.ts{enter}')
 
       await waitFor(() => {
-        expect(consoleSpy).toHaveBeenCalledWith('Failed to load file:', 'Not Found')
+        expect(consoleSpy).toHaveBeenCalledWith(
+          expect.stringContaining('editor_file_load_failed')
+        )
       })
 
       consoleSpy.mockRestore()
@@ -314,7 +350,13 @@ describe('EditorPane', () => {
     it('logs error when fetch throws', async () => {
       const user = userEvent.setup()
       const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-      mockFetch.mockRejectedValueOnce(new Error('Network error'))
+      mockFetch.mockImplementation(async (url: string) => {
+        if (url === '/api/terminals') return createMockResponse([])
+        if (url.startsWith('/api/files/read')) {
+          throw new Error('Network error')
+        }
+        return createMockResponse({}, false, 'Not Found')
+      })
 
       render(
         <Provider store={store}>
@@ -335,7 +377,9 @@ describe('EditorPane', () => {
       await user.type(input, '/test.ts{enter}')
 
       await waitFor(() => {
-        expect(consoleSpy).toHaveBeenCalledWith('Failed to load file:', expect.any(Error))
+        expect(consoleSpy).toHaveBeenCalledWith(
+          expect.stringContaining('editor_file_load_failed')
+        )
       })
 
       consoleSpy.mockRestore()
@@ -343,9 +387,12 @@ describe('EditorPane', () => {
 
     it('determines language from file extension', async () => {
       const user = userEvent.setup()
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ content: 'print("hello")' }),
+      mockFetch.mockImplementation(async (url: string) => {
+        if (url === '/api/terminals') return createMockResponse([])
+        if (url.startsWith('/api/files/read')) {
+          return createMockResponse({ content: 'print("hello")' })
+        }
+        return createMockResponse({}, false, 'Not Found')
       })
 
       render(
@@ -367,21 +414,21 @@ describe('EditorPane', () => {
       await user.type(input, '/script.py{enter}')
 
       await waitFor(() => {
-        expect(mockFetch).toHaveBeenCalled()
+        expect(mockFetch).toHaveBeenCalledWith(
+          '/api/files/read?path=%2Fscript.py',
+          expect.any(Object)
+        )
       })
-
-      // The language detection happens internally, we verify fetch was called with the right path
-      expect(mockFetch).toHaveBeenCalledWith(
-        '/api/files/read?path=%2Fscript.py',
-        expect.any(Object)
-      )
     })
 
     it('sets preview mode as default for markdown files', async () => {
       const user = userEvent.setup()
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ content: '# Hello' }),
+      mockFetch.mockImplementation(async (url: string) => {
+        if (url === '/api/terminals') return createMockResponse([])
+        if (url.startsWith('/api/files/read')) {
+          return createMockResponse({ content: '# Hello' })
+        }
+        return createMockResponse({}, false, 'Not Found')
       })
 
       render(
@@ -403,15 +450,21 @@ describe('EditorPane', () => {
       await user.type(input, '/readme.md{enter}')
 
       await waitFor(() => {
-        expect(mockFetch).toHaveBeenCalled()
+        expect(mockFetch).toHaveBeenCalledWith(
+          '/api/files/read?path=%2Freadme.md',
+          expect.any(Object)
+        )
       })
     })
 
     it('sets preview mode as default for html files', async () => {
       const user = userEvent.setup()
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({ content: '<h1>Hello</h1>' }),
+      mockFetch.mockImplementation(async (url: string) => {
+        if (url === '/api/terminals') return createMockResponse([])
+        if (url.startsWith('/api/files/read')) {
+          return createMockResponse({ content: '<h1>Hello</h1>' })
+        }
+        return createMockResponse({}, false, 'Not Found')
       })
 
       render(
@@ -433,12 +486,24 @@ describe('EditorPane', () => {
       await user.type(input, '/page.html{enter}')
 
       await waitFor(() => {
-        expect(mockFetch).toHaveBeenCalled()
+        expect(mockFetch).toHaveBeenCalledWith(
+          '/api/files/read?path=%2Fpage.html',
+          expect.any(Object)
+        )
       })
     })
 
     it('does not load file when path is cleared', async () => {
       const user = userEvent.setup()
+      const fileReadCalls: string[] = []
+      mockFetch.mockImplementation(async (url: string) => {
+        if (url === '/api/terminals') return createMockResponse([])
+        if (url.startsWith('/api/files/read')) {
+          fileReadCalls.push(url)
+          return createMockResponse({ content: 'content' })
+        }
+        return createMockResponse({}, false, 'Not Found')
+      })
 
       render(
         <Provider store={store}>
@@ -458,8 +523,11 @@ describe('EditorPane', () => {
       await user.clear(input)
       fireEvent.keyDown(input, { key: 'Enter' })
 
-      // fetch should not be called when path is empty
-      expect(mockFetch).not.toHaveBeenCalled()
+      // Small delay to ensure any async calls would have been made
+      await new Promise((r) => setTimeout(r, 50))
+
+      // No file read calls should have been made
+      expect(fileReadCalls).toHaveLength(0)
     })
   })
 })

@@ -2,86 +2,52 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup } from '@testing-library/react'
 import EditorToolbar from '@/components/panes/EditorToolbar'
 
+const defaultProps = {
+  filePath: '',
+  onPathChange: vi.fn(),
+  onPathSelect: vi.fn(),
+  onOpenFilePicker: vi.fn(),
+  suggestions: [],
+  viewMode: 'source' as const,
+  onViewModeToggle: vi.fn(),
+  showViewToggle: false,
+}
+
 describe('EditorToolbar', () => {
   afterEach(() => {
     cleanup()
   })
 
   it('renders path input', () => {
-    render(
-      <EditorToolbar
-        filePath=""
-        onPathChange={vi.fn()}
-        onOpenFile={vi.fn()}
-        viewMode="source"
-        onViewModeToggle={vi.fn()}
-        showViewToggle={false}
-      />
-    )
+    render(<EditorToolbar {...defaultProps} />)
 
     expect(screen.getByPlaceholderText(/enter file path/i)).toBeInTheDocument()
   })
 
   it('renders file picker button', () => {
-    render(
-      <EditorToolbar
-        filePath=""
-        onPathChange={vi.fn()}
-        onOpenFile={vi.fn()}
-        viewMode="source"
-        onViewModeToggle={vi.fn()}
-        showViewToggle={false}
-      />
-    )
+    render(<EditorToolbar {...defaultProps} />)
 
-    expect(screen.getByRole('button', { name: /browse/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /open file picker/i })).toBeInTheDocument()
   })
 
-  it('calls onPathChange when Enter is pressed', () => {
-    const onPathChange = vi.fn()
+  it('calls onPathSelect when Enter is pressed', () => {
+    const onPathSelect = vi.fn()
 
-    render(
-      <EditorToolbar
-        filePath=""
-        onPathChange={onPathChange}
-        onOpenFile={vi.fn()}
-        viewMode="source"
-        onViewModeToggle={vi.fn()}
-        showViewToggle={false}
-      />
-    )
+    render(<EditorToolbar {...defaultProps} onPathSelect={onPathSelect} />)
 
     const input = screen.getByPlaceholderText(/enter file path/i)
     fireEvent.change(input, { target: { value: '/path/to/file.ts' } })
     fireEvent.keyDown(input, { key: 'Enter' })
 
-    expect(onPathChange).toHaveBeenCalledWith('/path/to/file.ts')
+    expect(onPathSelect).toHaveBeenCalledWith('/path/to/file.ts')
   })
 
   it('shows view toggle only when showViewToggle is true', () => {
-    const { rerender } = render(
-      <EditorToolbar
-        filePath="/test.md"
-        onPathChange={vi.fn()}
-        onOpenFile={vi.fn()}
-        viewMode="source"
-        onViewModeToggle={vi.fn()}
-        showViewToggle={false}
-      />
-    )
+    const { rerender } = render(<EditorToolbar {...defaultProps} filePath="/test.md" />)
 
     expect(screen.queryByRole('button', { name: /preview|source/i })).not.toBeInTheDocument()
 
-    rerender(
-      <EditorToolbar
-        filePath="/test.md"
-        onPathChange={vi.fn()}
-        onOpenFile={vi.fn()}
-        viewMode="source"
-        onViewModeToggle={vi.fn()}
-        showViewToggle={true}
-      />
-    )
+    rerender(<EditorToolbar {...defaultProps} filePath="/test.md" showViewToggle={true} />)
 
     expect(screen.getByRole('button', { name: /preview/i })).toBeInTheDocument()
   })

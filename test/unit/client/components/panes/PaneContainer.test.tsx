@@ -4,6 +4,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import PaneContainer from '@/components/panes/PaneContainer'
 import panesReducer from '@/store/panesSlice'
+import settingsReducer from '@/store/settingsSlice'
 import type { PanesState } from '@/store/panesSlice'
 import type { PaneNode, PaneContent, EditorPaneContent } from '@/store/paneTypes'
 
@@ -72,15 +73,20 @@ vi.mock('@/components/panes/BrowserPane', () => ({
 }))
 
 // Mock Monaco editor
-vi.mock('@monaco-editor/react', () => ({
-  default: ({ value, onChange }: any) => (
-    <textarea
-      data-testid="monaco-mock"
-      value={value}
-      onChange={(e) => onChange?.(e.target.value)}
-    />
-  ),
-}))
+vi.mock('@monaco-editor/react', () => {
+  const MockEditor = ({ value, onChange }: any) => {
+    const React = require('react')
+    return React.createElement('textarea', {
+      'data-testid': 'monaco-mock',
+      value,
+      onChange: (e: any) => onChange?.(e.target.value),
+    })
+  }
+  return {
+    default: MockEditor,
+    Editor: MockEditor,
+  }
+})
 
 function createTerminalContent(overrides: Partial<PaneContent & { kind: 'terminal' }> = {}): PaneContent {
   return {
@@ -94,6 +100,7 @@ function createStore(initialPanesState: Partial<PanesState> = {}) {
   return configureStore({
     reducer: {
       panes: panesReducer,
+      settings: settingsReducer,
     },
     preloadedState: {
       panes: {
@@ -113,14 +120,27 @@ function renderWithStore(
   return render(<Provider store={store}>{ui}</Provider>)
 }
 
+// Helper to create a proper mock response for the api module
+const createMockResponse = (data: unknown, ok = true) => ({
+  ok,
+  text: async () => JSON.stringify(data),
+})
+
 describe('PaneContainer', () => {
   beforeEach(() => {
     mockSend.mockClear()
     mockTerminalView.mockClear()
+    // Mock fetch for EditorPane's /api/terminals call
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+      if (url === '/api/terminals') return createMockResponse([])
+      if (url.startsWith('/api/files/complete')) return createMockResponse({ suggestions: [] })
+      return createMockResponse({}, false)
+    }))
   })
 
   afterEach(() => {
     cleanup()
+    vi.unstubAllGlobals()
   })
 
   describe('terminal cleanup on pane close', () => {
@@ -669,7 +689,6 @@ describe('PaneContainer', () => {
     })
   })
 
-<<<<<<< HEAD
   describe('pane title rendering', () => {
     it('passes explicit pane title to Pane component', () => {
       const layout: PaneNode = {
@@ -743,21 +762,14 @@ describe('PaneContainer', () => {
         content: editorContent,
       }
 
-      const state: PanesState = {
+      const store = createStore({
         layouts: { 'tab-1': node },
         activePane: { 'tab-1': 'pane-1' },
-      }
-
-      const store = configureStore({
-        reducer: {
-          panes: () => state,
-        },
       })
 
-      render(
-        <Provider store={store}>
-          <PaneContainer tabId="tab-1" node={node} />
-        </Provider>
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store
       )
 
       // Should render the mocked Monaco editor

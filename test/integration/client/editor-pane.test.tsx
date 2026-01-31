@@ -4,18 +4,24 @@ import userEvent from '@testing-library/user-event'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import panesReducer, { initLayout } from '@/store/panesSlice'
+import settingsReducer from '@/store/settingsSlice'
 import PaneLayout from '@/components/panes/PaneLayout'
 
 // Mock Monaco to avoid loading issues in tests
-vi.mock('@monaco-editor/react', () => ({
-  default: ({ value, onChange }: any) => (
-    <textarea
-      data-testid="monaco-mock"
-      value={value}
-      onChange={(e) => onChange?.(e.target.value)}
-    />
-  ),
-}))
+vi.mock('@monaco-editor/react', () => {
+  const MockEditor = ({ value, onChange }: any) => {
+    const React = require('react')
+    return React.createElement('textarea', {
+      'data-testid': 'monaco-mock',
+      value,
+      onChange: (e: any) => onChange?.(e.target.value),
+    })
+  }
+  return {
+    default: MockEditor,
+    Editor: MockEditor,
+  }
+})
 
 // Mock ws-client to avoid WebSocket connections
 const mockSend = vi.fn()
@@ -51,6 +57,21 @@ vi.mock('lucide-react', () => ({
   Code: ({ className }: { className?: string }) => (
     <svg data-testid="code-icon" className={className} />
   ),
+  Circle: ({ className }: { className?: string }) => (
+    <svg data-testid="circle-icon" className={className} />
+  ),
+  SplitSquareHorizontal: ({ className }: { className?: string }) => (
+    <svg data-testid="split-h-icon" className={className} />
+  ),
+  SplitSquareVertical: ({ className }: { className?: string }) => (
+    <svg data-testid="split-v-icon" className={className} />
+  ),
+  Maximize2: ({ className }: { className?: string }) => (
+    <svg data-testid="maximize-icon" className={className} />
+  ),
+  Minimize2: ({ className }: { className?: string }) => (
+    <svg data-testid="minimize-icon" className={className} />
+  ),
 }))
 
 // Mock TerminalView component to avoid xterm.js dependencies
@@ -67,12 +88,20 @@ vi.mock('@/components/panes/BrowserPane', () => ({
   ),
 }))
 
+// Helper to create a proper mock response for the api module (which uses res.text())
+const createMockResponse = (data: unknown, ok = true, statusText = 'OK') => ({
+  ok,
+  statusText,
+  text: async () => JSON.stringify(data),
+})
+
 const mockFetch = vi.fn()
 
 const createTestStore = () =>
   configureStore({
     reducer: {
       panes: panesReducer,
+      settings: settingsReducer,
     },
   })
 
@@ -85,6 +114,18 @@ describe('Editor Pane Integration', () => {
     mockFetch.mockReset()
     mockSend.mockReset()
     sessionStorage.clear()
+
+    // Default mock for all endpoints
+    mockFetch.mockImplementation(async (url: RequestInfo | URL) => {
+      const urlStr = url.toString()
+      if (urlStr === '/api/terminals') {
+        return createMockResponse([])
+      }
+      if (urlStr.startsWith('/api/files/complete')) {
+        return createMockResponse({ suggestions: [] })
+      }
+      return createMockResponse({}, false, 'Not Found')
+    })
 
     // Mock getBoundingClientRect for split direction calculation
     Element.prototype.getBoundingClientRect = vi.fn(() => ({
@@ -132,9 +173,10 @@ describe('Editor Pane Integration', () => {
     // Click Editor option
     await user.click(screen.getByRole('menuitem', { name: /editor/i }))
 
-    // Should see empty state with Open File button
+    // Should see empty state with Open File button(s) - there may be multiple (toolbar + empty state)
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: /open file/i })).toBeInTheDocument()
+      const openFileButtons = screen.getAllByRole('button', { name: /open file/i })
+      expect(openFileButtons.length).toBeGreaterThanOrEqual(1)
     })
 
     // Verify the pane was added to the store
@@ -175,15 +217,23 @@ describe('Editor Pane Integration', () => {
     const user = userEvent.setup()
     sessionStorage.setItem('auth-token', 'test-token')
 
-    mockFetch.mockResolvedValue({
-      ok: true,
-      json: () =>
-        Promise.resolve({
+    mockFetch.mockImplementation(async (url: RequestInfo | URL) => {
+      const urlStr = url.toString()
+      if (urlStr === '/api/terminals') {
+        return createMockResponse([])
+      }
+      if (urlStr.startsWith('/api/files/read')) {
+        return createMockResponse({
           content: '# Hello',
           size: 7,
           modifiedAt: new Date().toISOString(),
-        }),
-    } as Response)
+        })
+      }
+      if (urlStr.startsWith('/api/files/complete')) {
+        return createMockResponse({ suggestions: [] })
+      }
+      return createMockResponse({}, false, 'Not Found')
+    })
 
     store.dispatch(
       initLayout({
@@ -213,34 +263,40 @@ describe('Editor Pane Integration', () => {
     await user.type(input, '/test.md{Enter}')
 
     await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalledWith(
-        expect.stringContaining('/api/files/read'),
-        expect.any(Object)
-      )
+      const calls = mockFetch.mock.calls
+      const fileReadCall = calls.find((c: any) => c[0].toString().startsWith('/api/files/read'))
+      expect(fileReadCall).toBeTruthy()
     })
 
-    // Verify the auth token was sent
-    expect(mockFetch).toHaveBeenCalledWith(
-      '/api/files/read?path=%2Ftest.md',
-      expect.objectContaining({
-        headers: { 'x-auth-token': 'test-token' },
-      })
-    )
+    // Verify the auth token was sent (Headers object is used by the api module)
+    const calls = mockFetch.mock.calls
+    const fileReadCall = calls.find((c: any) => c[0].toString().includes('/api/files/read'))
+    expect(fileReadCall).toBeTruthy()
+    const headers = fileReadCall![1].headers as Headers
+    expect(headers.get('x-auth-token')).toBe('test-token')
   })
 
   it('shows Monaco editor when content is loaded', async () => {
     const user = userEvent.setup()
     sessionStorage.setItem('auth-token', 'test-token')
 
-    mockFetch.mockResolvedValue({
-      ok: true,
-      json: () =>
-        Promise.resolve({
+    mockFetch.mockImplementation(async (url: RequestInfo | URL) => {
+      const urlStr = url.toString()
+      if (urlStr === '/api/terminals') {
+        return createMockResponse([])
+      }
+      if (urlStr.startsWith('/api/files/read')) {
+        return createMockResponse({
           content: 'const x = 1',
           size: 11,
           modifiedAt: new Date().toISOString(),
-        }),
-    } as Response)
+        })
+      }
+      if (urlStr.startsWith('/api/files/complete')) {
+        return createMockResponse({ suggestions: [] })
+      }
+      return createMockResponse({}, false, 'Not Found')
+    })
 
     store.dispatch(
       initLayout({
@@ -270,7 +326,9 @@ describe('Editor Pane Integration', () => {
     await user.type(input, '/code.ts{Enter}')
 
     await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalled()
+      const calls = mockFetch.mock.calls
+      const fileReadCall = calls.find((c: any) => c[0].toString().startsWith('/api/files/read'))
+      expect(fileReadCall).toBeTruthy()
     })
 
     // Wait for content to be loaded and Monaco editor to appear
@@ -283,15 +341,23 @@ describe('Editor Pane Integration', () => {
     const user = userEvent.setup()
     sessionStorage.setItem('auth-token', 'test-token')
 
-    mockFetch.mockResolvedValue({
-      ok: true,
-      json: () =>
-        Promise.resolve({
+    mockFetch.mockImplementation(async (url: RequestInfo | URL) => {
+      const urlStr = url.toString()
+      if (urlStr === '/api/terminals') {
+        return createMockResponse([])
+      }
+      if (urlStr.startsWith('/api/files/read')) {
+        return createMockResponse({
           content: '# Hello World',
           size: 13,
           modifiedAt: new Date().toISOString(),
-        }),
-    } as Response)
+        })
+      }
+      if (urlStr.startsWith('/api/files/complete')) {
+        return createMockResponse({ suggestions: [] })
+      }
+      return createMockResponse({}, false, 'Not Found')
+    })
 
     store.dispatch(
       initLayout({
@@ -321,7 +387,9 @@ describe('Editor Pane Integration', () => {
     await user.type(input, '/readme.md{Enter}')
 
     await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalled()
+      const calls = mockFetch.mock.calls
+      const fileReadCall = calls.find((c: any) => c[0].toString().startsWith('/api/files/read'))
+      expect(fileReadCall).toBeTruthy()
     })
 
     // Markdown files should show the preview toggle (Source button when in preview mode)
@@ -335,15 +403,23 @@ describe('Editor Pane Integration', () => {
     const user = userEvent.setup()
     sessionStorage.setItem('auth-token', 'test-token')
 
-    mockFetch.mockResolvedValue({
-      ok: true,
-      json: () =>
-        Promise.resolve({
+    mockFetch.mockImplementation(async (url: RequestInfo | URL) => {
+      const urlStr = url.toString()
+      if (urlStr === '/api/terminals') {
+        return createMockResponse([])
+      }
+      if (urlStr.startsWith('/api/files/read')) {
+        return createMockResponse({
           content: '# Hello World',
           size: 13,
           modifiedAt: new Date().toISOString(),
-        }),
-    } as Response)
+        })
+      }
+      if (urlStr.startsWith('/api/files/complete')) {
+        return createMockResponse({ suggestions: [] })
+      }
+      return createMockResponse({}, false, 'Not Found')
+    })
 
     store.dispatch(
       initLayout({
@@ -373,7 +449,9 @@ describe('Editor Pane Integration', () => {
     await user.type(input, '/readme.md{Enter}')
 
     await waitFor(() => {
-      expect(mockFetch).toHaveBeenCalled()
+      const calls = mockFetch.mock.calls
+      const fileReadCall = calls.find((c: any) => c[0].toString().startsWith('/api/files/read'))
+      expect(fileReadCall).toBeTruthy()
     })
 
     // Should be in preview mode by default for markdown
@@ -443,10 +521,19 @@ describe('Editor Pane Integration', () => {
     const user = userEvent.setup()
     const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
-    mockFetch.mockResolvedValue({
-      ok: false,
-      statusText: 'Not Found',
-    } as Response)
+    mockFetch.mockImplementation(async (url: RequestInfo | URL) => {
+      const urlStr = url.toString()
+      if (urlStr === '/api/terminals') {
+        return createMockResponse([])
+      }
+      if (urlStr.startsWith('/api/files/read')) {
+        return createMockResponse({ error: 'Not Found' }, false, 'Not Found')
+      }
+      if (urlStr.startsWith('/api/files/complete')) {
+        return createMockResponse({ suggestions: [] })
+      }
+      return createMockResponse({}, false, 'Not Found')
+    })
 
     store.dispatch(
       initLayout({
@@ -476,11 +563,14 @@ describe('Editor Pane Integration', () => {
     await user.type(input, '/nonexistent.ts{Enter}')
 
     await waitFor(() => {
-      expect(consoleSpy).toHaveBeenCalledWith('Failed to load file:', 'Not Found')
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining('editor_file_load_failed')
+      )
     })
 
-    // Should still show empty state (Open File button)
-    expect(screen.getByRole('button', { name: /open file/i })).toBeInTheDocument()
+    // Should still show empty state (Open File button) - we may have multiple buttons
+    const openFileButtons = screen.getAllByRole('button', { name: /open file/i })
+    expect(openFileButtons.length).toBeGreaterThanOrEqual(1)
 
     consoleSpy.mockRestore()
   })
@@ -520,8 +610,9 @@ describe('Editor Pane Integration', () => {
 
     // Both terminal and editor should be visible
     await waitFor(() => {
-      // Editor's empty state
-      expect(screen.getByRole('button', { name: /open file/i })).toBeInTheDocument()
+      // Editor's empty state - may have multiple buttons
+      const openFileButtons = screen.getAllByRole('button', { name: /open file/i })
+      expect(openFileButtons.length).toBeGreaterThanOrEqual(1)
     })
 
     // Verify store has split layout with both pane types

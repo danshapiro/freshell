@@ -58,15 +58,16 @@ export const settingsSlice = createSlice({
       state.loaded = true
     },
     updateSettingsLocal: (state, action: PayloadAction<Partial<AppSettings>>) => {
+      const currentSidebar = state.settings.sidebar ?? defaultSettings.sidebar
       state.settings = {
         ...state.settings,
         ...action.payload,
         terminal: { ...state.settings.terminal, ...(action.payload.terminal || {}) },
         safety: { ...state.settings.safety, ...(action.payload.safety || {}) },
         sidebar: {
-          ...state.settings.sidebar,
+          ...currentSidebar,
           ...(action.payload.sidebar || {}),
-          sortMode: migrateSortMode(action.payload.sidebar?.sortMode ?? state.settings.sidebar.sortMode),
+          sortMode: migrateSortMode(action.payload.sidebar?.sortMode ?? currentSidebar.sortMode),
         },
       }
     },

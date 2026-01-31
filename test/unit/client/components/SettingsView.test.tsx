@@ -131,14 +131,15 @@ describe('SettingsView Component', () => {
       expect(previewLines).toHaveLength(8)
     })
 
-    it('orders Terminal section above Sidebar', () => {
+    it('orders Sidebar section above Terminal', () => {
       const store = createTestStore()
       renderWithStore(store)
 
       const terminalHeading = screen.getByText('Terminal')
       const sidebarHeading = screen.getByText('Sidebar')
 
-      expect(terminalHeading.compareDocumentPosition(sidebarHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+      // Sidebar should come before Terminal (PRECEDING means Terminal comes after Sidebar)
+      expect(terminalHeading.compareDocumentPosition(sidebarHeading) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy()
     })
 
     it('renders all setting labels', () => {
