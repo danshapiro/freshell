@@ -32,8 +32,8 @@
 ## Quick Start
 
 ```bash
-# Clone the repository
-git clone https://github.com/danshapiro/freshell.git
+# Clone the repository at the latest stable release
+git clone --branch v0.1.0 https://github.com/danshapiro/freshell.git
 cd freshell
 
 # Install dependencies
@@ -110,8 +110,8 @@ sudo apt install -y nodejs
 ## Installation
 
 ```bash
-# Clone
-git clone https://github.com/yourusername/freshell.git
+# Clone the latest stable release
+git clone --branch v0.1.0 https://github.com/danshapiro/freshell.git
 cd freshell
 
 # Install dependencies
