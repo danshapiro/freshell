@@ -4,8 +4,8 @@
   "version": "0.2.1",
   "type": "module",
   "scripts": {
-    "predev": "node scripts/precheck.js",
-    "preserve": "node scripts/precheck.js",
+    "predev": "tsx scripts/precheck.ts",
+    "preserve": "tsx scripts/precheck.ts",
     "dev": "concurrently -n client,server -c blue,green \"vite\" \"tsx watch server/index.ts\"",
     "dev:client": "vite",
     "dev:server": "tsx watch server/index.ts",

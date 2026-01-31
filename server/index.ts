@@ -17,7 +17,6 @@ import { AI_CONFIG, PROMPTS, stripAnsi } from './ai-prompts.js'
 import { migrateSettingsSortMode } from './settings-migrate.js'
 import { filesRouter } from './files-router.js'
 import { getSessionRepairService } from './session-scanner/service.js'
-import { runUpdateCheck } from './updater/index.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -37,9 +36,6 @@ function findPackageJson(): string {
 
 const packageJson = JSON.parse(fs.readFileSync(findPackageJson(), 'utf-8'))
 const APP_VERSION: string = packageJson.version
-
-const SKIP_UPDATE_CHECK = process.argv.includes('--skip-update-check') ||
-                          process.env.SKIP_UPDATE_CHECK === 'true'
 
 async function main() {
   validateStartupSecurity()
@@ -350,17 +346,6 @@ async function main() {
       logger.warn({ err, terminalId: term.terminalId }, 'Failed to broadcast session association')
     }
   })
-
-  // Run update check before starting server
-  if (!SKIP_UPDATE_CHECK) {
-    const updateResult = await runUpdateCheck(APP_VERSION)
-
-    if (updateResult.action === 'updated') {
-      // Exit so process manager can restart with new version
-      console.log('Restarting with new version...')
-      process.exit(0)
-    }
-  }
 
   const port = Number(process.env.PORT || 3001)
   server.listen(port, '0.0.0.0', () => {

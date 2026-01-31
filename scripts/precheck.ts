@@ -1,39 +1,43 @@
-#!/usr/bin/env node
+#!/usr/bin/env tsx
 
 /**
- * Pre-flight check before starting dev server.
- * Detects if another freshell instance is already running on the configured ports.
+ * Pre-flight check before starting dev/serve.
  *
- * This prevents confusing scenarios where:
- * - A ghost process from a crashed dev server is still holding the port
- * - Another freshell is running in a different terminal or worktree
- * - A freshell instance is running in WSL (which appears as Windows IP Helper service)
- *
- * Detection approach:
- * - Server: Check /api/health for {"app": "freshell"} response
- * - Vite: Check index page for "freshell" or "@vite/client" markers
- *
- * Timeouts and connection resets are treated as "free" since they usually indicate
- * Windows networking services (like IP Helper for WSL) that won't block Vite from binding.
+ * Checks (in order):
+ * 1. Update availability - prompts user to update if newer version exists
+ * 2. Missing dependencies - ensures node_modules has all required packages
+ * 3. Port conflicts - detects if freshell is already running
  */
 
 import { readFileSync, existsSync } from 'fs'
 import { resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
+import { runUpdateCheck } from '../server/updater/index.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const rootDir = resolve(__dirname, '..')
+
+// Load package.json for version
+function getPackageVersion(): string {
+  try {
+    const pkgPath = resolve(rootDir, 'package.json')
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'))
+    return pkg.version || '0.0.0'
+  } catch {
+    return '0.0.0'
+  }
+}
 
 /**
  * Check if node_modules is missing required dependencies from package.json.
  * Returns list of missing packages.
  */
-function checkMissingDependencies() {
-  const missing = []
+function checkMissingDependencies(): string[] {
+  const missing: string[] = []
   try {
     const pkgPath = resolve(rootDir, 'package.json')
     const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'))
-    const allDeps = {
+    const allDeps: Record<string, string> = {
       ...pkg.dependencies,
       ...pkg.devDependencies,
     }
@@ -51,11 +55,11 @@ function checkMissingDependencies() {
 }
 
 // Load .env file manually (dotenv not available at this stage)
-function loadEnv() {
+function loadEnv(): Record<string, string> {
   try {
     const envPath = resolve(__dirname, '..', '.env')
     const content = readFileSync(envPath, 'utf-8')
-    const env = {}
+    const env: Record<string, string> = {}
     for (const line of content.split('\n')) {
       const trimmed = line.trim()
       if (!trimmed || trimmed.startsWith('#')) continue
@@ -73,11 +77,19 @@ function loadEnv() {
 const env = loadEnv()
 const VITE_PORT = parseInt(env.VITE_PORT || '5173', 10)
 const SERVER_PORT = parseInt(env.PORT || '3001', 10)
+const SKIP_UPDATE_CHECK = process.argv.includes('--skip-update-check') ||
+                          process.env.SKIP_UPDATE_CHECK === 'true' ||
+                          process.env.NODE_ENV === 'development'
+
+interface PortCheckResult {
+  status: 'freshell' | 'other' | 'free'
+  data?: unknown
+}
 
 /**
  * Check if freshell server is running on a port via /api/health endpoint.
  */
-async function checkServerPort(port) {
+async function checkServerPort(port: number): Promise<PortCheckResult> {
   try {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 2000)
@@ -88,22 +100,23 @@ async function checkServerPort(port) {
     clearTimeout(timeout)
 
     if (res.ok) {
-      const data = await res.json()
+      const data = await res.json() as { app?: string }
       if (data.app === 'freshell') {
         return { status: 'freshell', data }
       }
       return { status: 'other' }
     }
     return { status: 'other' }
-  } catch (err) {
-    if (err.code === 'ECONNREFUSED' || err.cause?.code === 'ECONNREFUSED') {
+  } catch (err: unknown) {
+    const error = err as { code?: string; name?: string; cause?: { code?: string } }
+    if (error.code === 'ECONNREFUSED' || error.cause?.code === 'ECONNREFUSED') {
       return { status: 'free' }
     }
     // Timeout or reset: likely nothing useful (e.g., WSL networking via IP Helper)
-    if (err.name === 'AbortError') {
+    if (error.name === 'AbortError') {
       return { status: 'free' }
     }
-    if (err.code === 'ECONNRESET' || err.cause?.code === 'ECONNRESET') {
+    if (error.code === 'ECONNRESET' || error.cause?.code === 'ECONNRESET') {
       return { status: 'free' }
     }
     return { status: 'other' }
@@ -113,7 +126,7 @@ async function checkServerPort(port) {
 /**
  * Check if freshell Vite dev server is running by looking for markers in the index page.
  */
-async function checkVitePort() {
+async function checkVitePort(): Promise<PortCheckResult> {
   try {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 2000)
@@ -128,23 +141,42 @@ async function checkVitePort() {
       return { status: 'freshell' }
     }
     return { status: 'other' }
-  } catch (err) {
-    if (err.code === 'ECONNREFUSED' || err.cause?.code === 'ECONNREFUSED') {
+  } catch (err: unknown) {
+    const error = err as { code?: string; name?: string; cause?: { code?: string } }
+    if (error.code === 'ECONNREFUSED' || error.cause?.code === 'ECONNREFUSED') {
       return { status: 'free' }
     }
     // Timeout or reset: likely nothing useful (e.g., WSL networking via IP Helper)
-    if (err.name === 'AbortError') {
+    if (error.name === 'AbortError') {
       return { status: 'free' }
     }
-    if (err.code === 'ECONNRESET' || err.cause?.code === 'ECONNRESET') {
+    if (error.code === 'ECONNRESET' || error.cause?.code === 'ECONNRESET') {
       return { status: 'free' }
     }
     return { status: 'other' }
   }
 }
 
-async function main() {
-  // Check for missing dependencies first
+async function main(): Promise<void> {
+  // 1. Check for updates first (before anything else can fail)
+  if (!SKIP_UPDATE_CHECK) {
+    const currentVersion = getPackageVersion()
+    const updateResult = await runUpdateCheck(currentVersion)
+
+    if (updateResult.action === 'updated') {
+      // Update succeeded - it already ran npm install and build
+      // Exit with special code to signal caller that update happened
+      console.log('\n\x1b[32m✓ Update complete!\x1b[0m Restart freshell to use the new version.\n')
+      process.exit(0)
+    }
+
+    if (updateResult.action === 'error') {
+      console.error(`\n\x1b[33m⚠ Update failed: ${updateResult.error}\x1b[0m`)
+      console.error('Continuing with current version...\n')
+    }
+  }
+
+  // 2. Check for missing dependencies
   const missingDeps = checkMissingDependencies()
   if (missingDeps.length > 0) {
     console.error('\n\x1b[31m✖ Missing dependencies detected:\x1b[0m\n')
@@ -157,12 +189,13 @@ async function main() {
     process.exit(1)
   }
 
+  // 3. Check for port conflicts
   const [serverCheck, viteCheck] = await Promise.all([
     checkServerPort(SERVER_PORT),
     checkVitePort(),
   ])
 
-  const issues = []
+  const issues: string[] = []
 
   if (serverCheck.status === 'freshell') {
     issues.push(`Port ${SERVER_PORT}: Another freshell server is already running`)
