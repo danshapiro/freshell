@@ -344,7 +344,11 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         }
 
         if (msg.type === 'error' && msg.code === 'INVALID_TERMINAL_ID' && !msg.requestId) {
-          if (terminalIdRef.current) {
+          // Only auto-reconnect if terminal hasn't already exited.
+          // This prevents an infinite respawn loop when terminals fail immediately
+          // (e.g., due to permission errors on cwd). User must explicitly restart.
+          const current = contentRef.current
+          if (terminalIdRef.current && current?.status !== 'exited') {
             term.writeln('\r\n[Reconnecting...]\r\n')
             const newRequestId = nanoid()
             requestIdRef.current = newRequestId
