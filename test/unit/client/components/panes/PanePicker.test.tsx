@@ -28,6 +28,16 @@ describe('PanePicker', () => {
     cleanup()
   })
 
+  // Helper to get the container div that handles transition
+  const getContainer = () => {
+    return screen.getByText('Shell').closest('button')!.parentElement!.parentElement!
+  }
+
+  // Helper to complete the fade animation
+  const completeFadeAnimation = () => {
+    fireEvent.transitionEnd(getContainer())
+  }
+
   describe('rendering', () => {
     it('renders all three options', () => {
       render(<PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={false} />)
@@ -45,23 +55,46 @@ describe('PanePicker', () => {
   })
 
   describe('mouse interaction', () => {
-    it('calls onSelect with shell when Shell is clicked', () => {
+    it('calls onSelect with shell when Shell is clicked after fade', () => {
       render(<PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={false} />)
       fireEvent.click(screen.getByText('Shell'))
+      // onSelect is called after fade animation completes
+      expect(onSelect).not.toHaveBeenCalled()
+      completeFadeAnimation()
+      expect(onSelect).toHaveBeenCalledWith('shell')
+    })
+
+    it('starts fade animation on click', () => {
+      render(<PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={false} />)
+      const container = getContainer()
+      expect(container).not.toHaveClass('opacity-0')
+      fireEvent.click(screen.getByText('Shell'))
+      expect(container).toHaveClass('opacity-0')
+    })
+
+    it('ignores additional clicks during fade', () => {
+      render(<PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={false} />)
+      fireEvent.click(screen.getByText('Shell'))
+      fireEvent.click(screen.getByText('Browser'))
+      completeFadeAnimation()
+      expect(onSelect).toHaveBeenCalledTimes(1)
       expect(onSelect).toHaveBeenCalledWith('shell')
     })
   })
 
   describe('keyboard shortcuts', () => {
-    it('calls onSelect with shell on S key', () => {
+    it('calls onSelect with shell on S key after fade', () => {
       render(<PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={false} />)
       fireEvent.keyDown(document, { key: 's' })
+      expect(onSelect).not.toHaveBeenCalled()
+      completeFadeAnimation()
       expect(onSelect).toHaveBeenCalledWith('shell')
     })
 
     it('shortcuts are case-insensitive', () => {
       render(<PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={false} />)
       fireEvent.keyDown(document, { key: 'S' })
+      completeFadeAnimation()
       expect(onSelect).toHaveBeenCalledWith('shell')
     })
   })
@@ -76,11 +109,13 @@ describe('PanePicker', () => {
       expect(browserButton).toHaveFocus()
     })
 
-    it('selects focused option on Enter', () => {
+    it('selects focused option on Enter after fade', () => {
       render(<PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={false} />)
       const browserButton = screen.getByText('Browser').closest('button')!
       browserButton.focus()
       fireEvent.keyDown(browserButton, { key: 'Enter' })
+      expect(onSelect).not.toHaveBeenCalled()
+      completeFadeAnimation()
       expect(onSelect).toHaveBeenCalledWith('browser')
     })
   })

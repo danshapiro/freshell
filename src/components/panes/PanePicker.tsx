@@ -26,7 +26,23 @@ interface PanePickerProps {
 export default function PanePicker({ onSelect, onCancel, isOnlyPane }: PanePickerProps) {
   const [focusedIndex, setFocusedIndex] = useState<number | null>(null)
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null)
+  const [fading, setFading] = useState(false)
+  const pendingSelection = useRef<PaneType | null>(null)
   const buttonRefs = useRef<(HTMLButtonElement | null)[]>([])
+
+  // Start fade animation before selection
+  const handleSelect = useCallback((type: PaneType) => {
+    if (fading) return
+    pendingSelection.current = type
+    setFading(true)
+  }, [fading])
+
+  // After fade animation completes, trigger actual selection
+  const handleTransitionEnd = useCallback(() => {
+    if (pendingSelection.current) {
+      onSelect(pendingSelection.current)
+    }
+  }, [onSelect])
 
   // Global keyboard shortcuts
   useEffect(() => {
@@ -37,7 +53,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane }: PanePicke
       const option = options.find((o) => o.shortcut.toLowerCase() === key)
       if (option) {
         e.preventDefault()
-        onSelect(option.type)
+        handleSelect(option.type)
         return
       }
 
@@ -50,7 +66,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane }: PanePicke
 
     document.addEventListener('keydown', handleKeyDown)
     return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [onSelect, onCancel, isOnlyPane])
+  }, [handleSelect, onCancel, isOnlyPane])
 
   const handleArrowNav = useCallback((e: React.KeyboardEvent, currentIndex: number) => {
     let nextIndex: number | null = null
@@ -69,7 +85,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane }: PanePicke
       case 'Enter':
       case ' ':
         e.preventDefault()
-        onSelect(options[currentIndex].type)
+        handleSelect(options[currentIndex].type)
         return
     }
 
@@ -77,18 +93,25 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane }: PanePicke
       setFocusedIndex(nextIndex)
       buttonRefs.current[nextIndex]?.focus()
     }
-  }, [onSelect])
+  }, [handleSelect])
 
   const showHint = (index: number) => focusedIndex === index || hoveredIndex === index
 
   return (
-    <div className="h-full w-full flex items-center justify-center p-8">
+    <div
+      className={cn(
+        'h-full w-full flex items-center justify-center p-8',
+        'transition-opacity duration-150 ease-out',
+        fading && 'opacity-0'
+      )}
+      onTransitionEnd={handleTransitionEnd}
+    >
       <div className="flex flex-wrap justify-center gap-8">
         {options.map((option, index) => (
           <button
             key={option.type}
             ref={(el) => { buttonRefs.current[index] = el }}
-            onClick={() => onSelect(option.type)}
+            onClick={() => handleSelect(option.type)}
             onKeyDown={(e) => handleArrowNav(e, index)}
             onFocus={() => setFocusedIndex(index)}
             onBlur={() => setFocusedIndex(null)}
