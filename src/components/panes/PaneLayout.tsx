@@ -44,6 +44,20 @@ export default function PaneLayout({ tabId, defaultContent, hidden }: PaneLayout
     }))
   }, [dispatch, tabId])
 
+  const handleAddEditor = useCallback(() => {
+    dispatch(addPane({
+      tabId,
+      newContent: {
+        kind: 'editor',
+        filePath: null,
+        language: null,
+        readOnly: false,
+        content: '',
+        viewMode: 'source',
+      },
+    }))
+  }, [dispatch, tabId])
+
   if (!layout) {
     return <div className="h-full w-full" /> // Loading state
   }
@@ -54,6 +68,7 @@ export default function PaneLayout({ tabId, defaultContent, hidden }: PaneLayout
       <FloatingActionButton
         onAddTerminal={handleAddTerminal}
         onAddBrowser={handleAddBrowser}
+        onAddEditor={handleAddEditor}
       />
     </div>
   )

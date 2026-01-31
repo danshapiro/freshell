@@ -36,8 +36,11 @@ vi.mock('lucide-react', () => ({
   Terminal: ({ className }: { className?: string }) => (
     <svg data-testid="terminal-icon" className={className} />
   ),
-  Circle: ({ className }: { className?: string }) => (
+Circle: ({ className }: { className?: string }) => (
     <svg data-testid="circle-icon" className={className} />
+  ),
+  FileText: ({ className }: { className?: string }) => (
+    <svg data-testid="file-text-icon" className={className} />
   ),
 }))
 

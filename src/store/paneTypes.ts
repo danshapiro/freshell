@@ -32,9 +32,26 @@ export type BrowserPaneContent = {
 }
 
 /**
+ * Editor pane content for Monaco-based file editing.
+ */
+export type EditorPaneContent = {
+  kind: 'editor'
+  /** File path being edited, null for scratch pad */
+  filePath: string | null
+  /** Language for syntax highlighting, null for auto-detect */
+  language: string | null
+  /** Whether the file is read-only */
+  readOnly: boolean
+  /** Current buffer content */
+  content: string
+  /** View mode: source editor or rendered preview */
+  viewMode: 'source' | 'preview'
+}
+
+/**
  * Union type for all pane content types.
  */
-export type PaneContent = TerminalPaneContent | BrowserPaneContent
+export type PaneContent = TerminalPaneContent | BrowserPaneContent | EditorPaneContent
 
 /**
  * Input type for creating terminal panes.
@@ -46,10 +63,16 @@ export type TerminalPaneInput = Omit<TerminalPaneContent, 'createRequestId' | 's
 }
 
 /**
+ * Input type for editor panes.
+ * Same as EditorPaneContent since no lifecycle fields need defaults.
+ */
+export type EditorPaneInput = EditorPaneContent
+
+/**
  * Input type for splitPane/initLayout actions.
  * Accepts either full content or partial terminal input.
  */
-export type PaneContentInput = TerminalPaneInput | BrowserPaneContent
+export type PaneContentInput = TerminalPaneInput | BrowserPaneContent | EditorPaneInput
 
 /**
  * Recursive tree structure for pane layouts.

@@ -15,6 +15,7 @@ import { claudeIndexer } from './claude-indexer.js'
 import { claudeSessionManager } from './claude-session.js'
 import { AI_CONFIG, PROMPTS, stripAnsi } from './ai-prompts.js'
 import { migrateSettingsSortMode } from './settings-migrate.js'
+import { filesRouter } from './files-router.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -251,6 +252,9 @@ async function main() {
       res.json({ description: heuristic(), source: 'heuristic' })
     }
   })
+
+  // --- API: files (for editor pane) ---
+  app.use('/api/files', filesRouter)
 
   // --- Static client in production ---
   const distRoot = path.resolve(__dirname, '..')
