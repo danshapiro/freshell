@@ -93,6 +93,69 @@ function renderWithProvider(ui: React.ReactNode) {
   return { store, ...utils }
 }
 
+function createStoreWithSession() {
+  return configureStore({
+    reducer: {
+      tabs: tabsReducer,
+      panes: panesReducer,
+      sessions: sessionsReducer,
+    },
+    middleware: (getDefaultMiddleware) =>
+      getDefaultMiddleware({ serializableCheck: false }),
+    preloadedState: {
+      tabs: {
+        tabs: [
+          {
+            id: 'tab-1',
+            createRequestId: 'tab-1',
+            title: 'Tab One',
+            status: 'running',
+            mode: 'shell',
+            shell: 'system',
+            createdAt: 1,
+          },
+        ],
+        activeTabId: 'tab-1',
+      },
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'shell',
+              status: 'running',
+              terminalId: 'term-1',
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+      },
+      sessions: {
+        projects: [
+          {
+            projectPath: '/test/project',
+            sessions: [
+              {
+                sessionId: 'session-123',
+                provider: 'claude',
+                title: 'Test Session',
+                cwd: '/test/project',
+                createdAt: 1000,
+                updatedAt: 2000,
+                messageCount: 5,
+              },
+            ],
+          },
+        ],
+        expandedProjects: new Set<string>(),
+      },
+    },
+  })
+}
+
 describe('ContextMenuProvider', () => {
   afterEach(() => cleanup())
   it('opens menu on right click and dispatches close tab', async () => {
@@ -169,5 +232,61 @@ describe('ContextMenuProvider', () => {
     fireEvent.keyDown(document, { key: 'F10', shiftKey: true })
 
     expect(screen.getByRole('menu')).toBeInTheDocument()
+  })
+
+  it('open in this tab splits the pane instead of replacing the layout', async () => {
+    const user = userEvent.setup()
+    const store = createStoreWithSession()
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="history"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.SidebarSession}
+            data-session-id="session-123"
+            data-provider="claude"
+          >
+            Test Session
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    // Verify initial state has one pane
+    const initialLayout = store.getState().panes.layouts['tab-1']
+    expect(initialLayout?.type).toBe('leaf')
+
+    // Open context menu and click "Open in this tab"
+    await user.pointer({ target: screen.getByText('Test Session'), keys: '[MouseRight]' })
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+    await user.click(screen.getByText('Open in this tab'))
+
+    // After clicking, the layout should be a split with two panes
+    const newLayout = store.getState().panes.layouts['tab-1']
+    expect(newLayout?.type).toBe('split')
+    if (newLayout?.type === 'split') {
+      expect(newLayout.children).toHaveLength(2)
+      // Original pane should still exist
+      const originalPane = newLayout.children.find(
+        (child) => child.type === 'leaf' && child.id === 'pane-1'
+      )
+      expect(originalPane).toBeDefined()
+      // New pane should have the session info
+      const newPane = newLayout.children.find(
+        (child) => child.type === 'leaf' && child.id !== 'pane-1'
+      )
+      expect(newPane).toBeDefined()
+      if (newPane?.type === 'leaf') {
+        expect(newPane.content.kind).toBe('terminal')
+        if (newPane.content.kind === 'terminal') {
+          expect(newPane.content.mode).toBe('claude')
+          expect(newPane.content.resumeSessionId).toBe('session-123')
+        }
+      }
+    }
   })
 })

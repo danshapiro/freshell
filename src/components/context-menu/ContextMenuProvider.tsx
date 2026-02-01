@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, closeTab, reorderTabs, updateTab, setActiveTab } from '@/store/tabsSlice'
-import { closePane, initLayout, resetLayout, resetSplit, swapSplit, updatePaneTitle } from '@/store/panesSlice'
+import { addPane, closePane, initLayout, resetLayout, resetSplit, swapSplit, updatePaneTitle } from '@/store/panesSlice'
 import { setProjects, setProjectExpanded } from '@/store/sessionsSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'
@@ -275,27 +275,9 @@ export function ContextMenuProvider({
       menuState?.target.kind === 'sidebar-session' && menuState?.target.sessionId === sessionId
         ? menuState?.target.runningTerminalId
         : undefined
-    const layout = panes[activeTabId]
-    if (layout) {
-      const terminalIds = collectTerminalIds(layout)
-      terminalIds.forEach((terminalId) => ws.send({ type: 'terminal.detach', terminalId }))
-    }
-    dispatch(updateTab({
-      id: activeTabId,
-      updates: {
-        title: session.title || session.sessionId.slice(0, 8),
-        mode,
-        codingCliProvider: mode,
-        codingCliSessionId: undefined,
-        claudeSessionId: undefined,
-        resumeSessionId: session.sessionId,
-        terminalId: runningTerminalId,
-        status: runningTerminalId ? 'running' : 'creating',
-      },
-    }))
-    dispatch(resetLayout({
+    dispatch(addPane({
       tabId: activeTabId,
-      content: {
+      newContent: {
         kind: 'terminal',
         mode,
         resumeSessionId: session.sessionId,
@@ -304,7 +286,7 @@ export function ContextMenuProvider({
         status: runningTerminalId ? 'running' : 'creating',
       },
     }))
-  }, [tabsState.activeTabId, dispatch, getSessionInfo, openSessionInNewTab, panes, ws])
+  }, [tabsState.activeTabId, dispatch, getSessionInfo, openSessionInNewTab, menuState?.target])
 
   const renameSession = useCallback(async (sessionId: string, provider?: string, withSummary?: boolean) => {
     const info = getSessionInfo(sessionId, provider)
