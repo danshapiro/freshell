@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Terminal, History, Settings, LayoutGrid, Search, Play, Loader2, X, Archive } from 'lucide-react'
+import { Terminal, History, Settings, LayoutGrid, Search, Loader2, X, Archive } from 'lucide-react'
 import { List, type RowComponentProps } from 'react-window'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
@@ -14,6 +14,7 @@ import type { PaneNode } from '@/store/paneTypes'
 import { makeSelectSortedSessionItems, type SidebarSessionItem } from '@/store/selectors/sidebarSelectors'
 import { collectTerminalPanes, findPaneByTerminalId } from '@/lib/pane-utils'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
+import { ProviderIcon } from '@/components/icons/provider-icons'
 
 export type AppView = 'terminal' | 'sessions' | 'overview' | 'settings'
 
@@ -426,19 +427,17 @@ function SidebarItem({
       data-running-terminal-id={item.runningTerminalId}
       data-has-tab={item.hasTab ? 'true' : 'false'}
     >
-      {/* Status indicator */}
+      {/* Provider icon */}
       <div className="flex-shrink-0">
-        {item.hasTab ? (
-          <div className="relative">
-            <Play className="h-2.5 w-2.5 fill-success text-success" />
-            <div className="absolute inset-0 h-2.5 w-2.5 rounded-full bg-success/30 animate-pulse-subtle" />
-          </div>
-        ) : (
-          <div
-            className="h-2 w-2 rounded-sm"
-            style={{ backgroundColor: item.projectColor || '#6b7280' }}
+        <div className={cn('relative', item.hasTab && 'animate-pulse-subtle')}>
+          <ProviderIcon
+            provider={item.provider}
+            className={cn(
+              'h-3.5 w-3.5',
+              item.hasTab ? 'text-success' : 'text-muted-foreground'
+            )}
           />
-        )}
+        </div>
       </div>
 
       {/* Content */}
@@ -455,11 +454,8 @@ function SidebarItem({
                 {item.title}
               </span>
             </TooltipTrigger>
-            <TooltipContent>{item.title}</TooltipContent>
+            <TooltipContent>{getProviderLabel(item.provider)}: {item.title}</TooltipContent>
           </Tooltip>
-          <span className="text-2xs text-muted-foreground bg-muted/60 px-1.5 py-0.5 rounded">
-            {getProviderLabel(item.provider)}
-          </span>
           {item.archived && (
             <Archive className="h-3 w-3 text-muted-foreground/70" aria-label="Archived session" />
           )}
