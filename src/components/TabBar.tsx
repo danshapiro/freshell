@@ -208,6 +208,7 @@ export default function TabBar() {
                   setRenamingId(null)
                 }}
                 onRenameKeyDown={(e) => {
+                  e.stopPropagation() // Prevent dnd-kit from intercepting keys (esp. space)
                   if (e.key === 'Enter' || e.key === 'Escape') {
                     ;(e.target as HTMLInputElement).blur()
                   }
