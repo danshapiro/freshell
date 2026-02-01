@@ -103,15 +103,7 @@ describe('settingsSlice', () => {
           },
         },
         panes: {
-          defaultNewPane: 'ask',
-        },
-        panes: {
           defaultNewPane: 'shell',
-        },
-        notifications: {
-          visualWhenWorking: false,
-          visualWhenFinished: false,
-          soundWhenFinished: false,
         },
       }
 
