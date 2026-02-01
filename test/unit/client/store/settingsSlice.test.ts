@@ -4,6 +4,7 @@ import settingsReducer, {
   updateSettingsLocal,
   markSaved,
   defaultSettings,
+  resolveDefaultLoggingDebug,
   SettingsState,
 } from '../../../../src/store/settingsSlice'
 import type { AppSettings } from '../../../../src/store/types'
@@ -51,6 +52,16 @@ describe('settingsSlice', () => {
           codex: {},
         },
       })
+    })
+  })
+
+  describe('logging defaults', () => {
+    it('enables debug logging in development', () => {
+      expect(resolveDefaultLoggingDebug(true)).toBe(true)
+    })
+
+    it('disables debug logging in production', () => {
+      expect(resolveDefaultLoggingDebug(false)).toBe(false)
     })
   })
 

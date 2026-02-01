@@ -93,6 +93,10 @@ export type UserConfig = {
   projectColors: Record<string, string>
 }
 
+export function resolveDefaultLoggingDebug(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.NODE_ENV !== 'production'
+}
+
 export const defaultSettings: AppSettings = {
   theme: 'system',
   uiScale: 1.0,
@@ -106,7 +110,7 @@ export const defaultSettings: AppSettings = {
   },
   defaultCwd: undefined,
   logging: {
-    debug: false,
+    debug: resolveDefaultLoggingDebug(),
   },
   safety: {
     autoKillIdleMinutes: 180,

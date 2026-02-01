@@ -1,6 +1,10 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import type { AppSettings, SidebarSortMode } from './types'
 
+export function resolveDefaultLoggingDebug(isDev: boolean = import.meta.env.DEV): boolean {
+  return !!isDev
+}
+
 export const defaultSettings: AppSettings = {
   theme: 'system',
   uiScale: 1.0, // 100% = UI text matches terminal font size
@@ -14,7 +18,7 @@ export const defaultSettings: AppSettings = {
   },
   defaultCwd: undefined,
   logging: {
-    debug: false,
+    debug: resolveDefaultLoggingDebug(),
   },
   safety: {
     autoKillIdleMinutes: 180,

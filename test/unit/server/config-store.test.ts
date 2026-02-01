@@ -25,8 +25,20 @@ vi.mock('os', async () => {
 import {
   ConfigStore,
   defaultSettings,
+  resolveDefaultLoggingDebug,
   type UserConfig,
 } from '../../../server/config-store'
+
+describe('resolveDefaultLoggingDebug', () => {
+  it('returns true for non-production environments', () => {
+    expect(resolveDefaultLoggingDebug({ NODE_ENV: 'development' } as NodeJS.ProcessEnv)).toBe(true)
+    expect(resolveDefaultLoggingDebug({} as NodeJS.ProcessEnv)).toBe(true)
+  })
+
+  it('returns false in production', () => {
+    expect(resolveDefaultLoggingDebug({ NODE_ENV: 'production' } as NodeJS.ProcessEnv)).toBe(false)
+  })
+})
 
 describe('ConfigStore', () => {
   let tempDir: string
