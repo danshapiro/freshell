@@ -1,31 +1,24 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import type { AppSettings, SidebarSortMode } from './types'
 
-export function resolveDefaultLoggingDebug(isDev: boolean = import.meta.env.DEV): boolean {
-  return !!isDev
-}
-
 export const defaultSettings: AppSettings = {
   theme: 'system',
   uiScale: 1.0, // 100% = UI text matches terminal font size
   terminal: {
     fontSize: 16,
-    fontFamily: 'monospace',
+    fontFamily: 'Consolas',
     lineHeight: 1,
     cursorBlink: true,
     scrollback: 5000,
     theme: 'auto',
   },
   defaultCwd: undefined,
-  logging: {
-    debug: resolveDefaultLoggingDebug(),
-  },
   safety: {
     autoKillIdleMinutes: 180,
     warnBeforeKillMinutes: 5,
   },
   sidebar: {
-    sortMode: 'recency-pinned',
+    sortMode: 'activity',
     showProjectBadges: true,
     width: 288,
     collapsed: false,
@@ -45,14 +38,10 @@ export const defaultSettings: AppSettings = {
 }
 
 export function migrateSortMode(mode: string | undefined): SidebarSortMode {
-  if (mode === 'recency' || mode === 'recency-pinned' || mode === 'activity' || mode === 'project') {
+  if (mode === 'recency' || mode === 'activity' || mode === 'project') {
     return mode
   }
-  // Migrate legacy 'hybrid' mode to 'activity' (similar behavior)
-  if (mode === 'hybrid') {
-    return 'activity'
-  }
-  return 'recency-pinned'
+  return 'activity'
 }
 
 export interface SettingsState {
@@ -67,13 +56,11 @@ const initialState: SettingsState = {
 }
 
 export function mergeSettings(base: AppSettings, patch: Partial<AppSettings>): AppSettings {
-  const baseLogging = base.logging ?? defaultSettings.logging
   const baseCodingCli = base.codingCli ?? defaultSettings.codingCli
   const merged = {
     ...base,
     ...patch,
     terminal: { ...base.terminal, ...(patch.terminal || {}) },
-    logging: { ...baseLogging, ...(patch.logging || {}) },
     safety: { ...base.safety, ...(patch.safety || {}) },
     sidebar: { ...base.sidebar, ...(patch.sidebar || {}) },
     panes: { ...base.panes, ...(patch.panes || {}) },

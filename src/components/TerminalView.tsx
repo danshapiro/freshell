@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
-import { recordOutput, recordInput } from '@/store/terminalActivitySlice'
 import { getWsClient } from '@/lib/ws-client'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import { getResumeSessionIdFromRef } from '@/components/terminal-view-utils'
@@ -145,9 +144,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       const tid = terminalIdRef.current
       if (!tid) return
       ws.send({ type: 'terminal.input', terminalId: tid, data })
-
-      // Track input for activity monitoring (to filter out echo)
-      dispatch(recordInput({ paneId }))
 
       const now = Date.now()
       const sessionId = contentRef.current?.resumeSessionId
@@ -296,8 +292,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
         if (msg.type === 'terminal.output' && msg.terminalId === tid) {
           term.write(msg.data || '')
-          // Track output activity for notification system
-          dispatch(recordOutput({ paneId }))
         }
 
         if (msg.type === 'terminal.snapshot' && msg.terminalId === tid) {

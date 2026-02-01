@@ -20,19 +20,14 @@
 
 ## Features
 
-- **Multi-tab terminal sessions** — Run shell, Claude Code, Codex, and other coding CLIs in parallel tabs
-- **Flexible workspaces** — Arrange terminals, browsers, and code editors side by side in split panes within each tab
-- **Detach/reattach** — Background terminals persist across browser sessions; reconnect from any device
-- **Search & browse** — Three-tier search across coding CLI sessions: titles, user messages, and full transcript text
+- **Multi-tab terminal sessions** — Run shell, Claude Code, and Codex in parallel tabs
+- **Split panes** — Divide any tab into independent terminal panes (horizontal/vertical)
+- **Detach/reattach** — Background terminals persist across browser sessions
+- **Search & browse** — Filter coding CLI sessions by provider, project, date, or content
 - **Speak with the dead** — Invoke the spirits of ancient Claudes and ask them what they were thinking
-- **Keep it tidy** — AI-powered terminal summaries (via Gemini), custom session titles, archiving, and project color-coding
-- **Overview dashboard** — See all running and exited terminals at a glance with status, idle time, and AI summaries
-- **Dark/light themes** — 8 terminal themes (Dracula, One Dark, Solarized, GitHub, and more) plus system/light/dark app themes
-- **Drag-and-drop tabs** — Reorder tabs by dragging, with keyboard and touch support
-- **Context menus** — Right-click menus for tabs, terminals, sessions, projects, and messages with 40+ actions
-- **Activity notifications** — Audio alert when a terminal finishes while the window is in the background
-- **Mobile responsive** — Auto-collapsing sidebar and overlay navigation for phones and tablets
-- **Auto-update** — Checks for new releases on startup and offers one-key upgrade
+- **Keep it tidy** — AI (or your pedantic self) names, summarizes, and organizes
+- **Dark/light themes** — Are we savages?
+- **Keyboard-driven** — tmux-style prefix shortcuts for power users
 
 ## Quick Start
 
@@ -44,40 +39,194 @@ cd freshell
 # Install dependencies
 npm install
 
+# Configure environment
+cp .env.example .env
+# Edit .env and set AUTH_TOKEN to a secure random value
+
 # Build and run
 npm run serve
 ```
 
-On first run, freshell auto-generates a `.env` file with a secure random `AUTH_TOKEN`. The token is printed to the console at startup — open the URL shown to connect.
+Open http://localhost:3001/?token=YOUR_AUTH_TOKEN
 
 ## Prerequisites
 
-Node.js 18+ (20+ recommended) and platform build tools for native modules (`windows-build-tools` on Windows, Xcode CLI Tools on macOS, `build-essential python3` on Linux).
+| Platform | Requirements |
+|----------|-------------|
+| **All** | Node.js 18+ (20+ recommended), npm |
+| **Windows** | Build tools for native modules (see below) |
+| **macOS** | Xcode Command Line Tools |
+| **Linux** | build-essential, python3 |
 
-> **Note:** On native Windows, terminals default to WSL. Set `WINDOWS_SHELL=cmd` or `WINDOWS_SHELL=powershell` to use a native Windows shell instead.
+> **Note:** WSL is optional on Windows. The app defaults to `cmd.exe` for terminals. Set `WINDOWS_SHELL=wsl` or `WINDOWS_SHELL=powershell` to change. WSL is only needed if your Claude sessions live inside the Linux filesystem.
+
+### Platform-Specific Setup
+
+<details>
+<summary><strong>Windows</strong></summary>
+
+1. Install [Node.js](https://nodejs.org/) (LTS version)
+2. Install build tools for native modules:
+   ```powershell
+   npm install -g windows-build-tools
+   ```
+3. **(Optional)** Install [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) if you want Linux terminals or need to access Claude sessions stored in WSL:
+   ```powershell
+   wsl --install -d Ubuntu
+   ```
+   Then set `WINDOWS_SHELL=wsl` in your `.env` file.
+
+</details>
+
+<details>
+<summary><strong>macOS</strong></summary>
+
+1. Install Xcode Command Line Tools:
+   ```bash
+   xcode-select --install
+   ```
+2. Install Node.js via Homebrew:
+   ```bash
+   brew install node
+   ```
+
+</details>
+
+<details>
+<summary><strong>Linux (Debian/Ubuntu)</strong></summary>
+
+```bash
+# Install build dependencies
+sudo apt update
+sudo apt install -y build-essential python3
+
+# Install Node.js (via NodeSource)
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+```
+
+</details>
+
+## Installation
+
+```bash
+# Clone the latest stable release
+git clone --branch v0.3.0 https://github.com/danshapiro/freshell.git
+cd freshell
+
+# Install dependencies
+npm install
+
+# Create environment file
+cp .env.example .env
+```
+
+Edit `.env` with your configuration:
+
+```bash
+# Required: secure random token (min 16 characters)
+AUTH_TOKEN=your-secure-random-token-here
+
+# Optional: server port (default 3001)
+PORT=3001
+
+# Windows only: shell type (cmd, powershell, or wsl). Default: cmd
+# WINDOWS_SHELL=cmd
+
+# Windows/WSL: path to Claude home (use WSL path if using WSL)
+CLAUDE_HOME=\\wsl$\Ubuntu\home\your-user\.claude
+WSL_DISTRO=Ubuntu
+
+# Optional: Gemini API key for AI summaries
+GOOGLE_GENERATIVE_AI_API_KEY=your-api-key
+```
 
 ## Usage
 
+### Development
+
+Run the client and server with hot reload:
+
 ```bash
-npm run dev     # Development with hot reload
-npm run serve   # Production build and run
+npm run dev
 ```
+
+Or run them separately:
+
+```bash
+# Terminal 1 - Server
+npm run dev:server
+
+# Terminal 2 - Client
+npm run dev:client
+```
+
+### Production
+
+```bash
+# Build and run (recommended)
+npm run serve
+```
+
+Or build and run separately:
+
+```bash
+npm run build
+npm start
+```
+
+Access the app at http://localhost:3001/?token=YOUR_AUTH_TOKEN
 
 ## Auto-Update
 
-Freshell checks for new GitHub releases before starting. Accept the prompt to auto-pull, install, and rebuild. Disable with `SKIP_UPDATE_CHECK=true`.
+Freshell checks for updates on startup. When a new version is available, you'll see:
+
+```
+╭─────────────────────────────────────────────╮
+│                                             │
+│  There's a new Freshell waiting for you!   │
+│                                             │
+│    0.1.0 → 0.2.0                           │
+│                                             │
+╰─────────────────────────────────────────────╯
+
+Upgrade now? [Y/n]
+```
+
+Press Enter (default Yes) to update, or 'n' to skip.
+
+### Restart Behavior
+
+After a successful update, Freshell exits with code 0. How to restart depends on your setup:
+
+- **Manual (`npm start`)**: Re-run `npm start` after the process exits
+- **pm2**: Automatic restart - the updated version runs immediately
+- **systemd**: Automatic restart if configured with `Restart=always`
+- **Docker**: Depends on your restart policy
+
+### Disabling Auto-Update
+
+To skip the update check (useful for CI/testing):
+
+```bash
+# Via command line flag
+npm start -- --skip-update-check
+
+# Via environment variable
+SKIP_UPDATE_CHECK=true npm start
+```
 
 ## Keyboard Shortcuts
 
+freshell uses a tmux-style prefix system. Press `Ctrl+B` followed by a command key:
+
 | Shortcut | Action |
 |----------|--------|
-| `Ctrl+Shift+[` | Previous tab |
-| `Ctrl+Shift+]` | Next tab |
-| `Ctrl+Shift+ArrowLeft` | Move tab left |
-| `Ctrl+Shift+ArrowRight` | Move tab right |
-| `Ctrl+Shift+C` | Copy selection (in terminal) |
-| `Ctrl+V` / `Ctrl+Shift+V` | Paste (in terminal) |
-| `Right-click` / `Shift+F10` | Context menu |
+| `Ctrl+B` `T` | New terminal tab |
+| `Ctrl+B` `W` | Close current tab |
+| `Ctrl+B` `S` | Sessions view |
+| `Ctrl+B` `O` | Overview view |
+| `Ctrl+B` `,` | Settings |
 
 ## Configuration
 
@@ -85,67 +234,101 @@ Freshell checks for new GitHub releases before starting. Accept the prompt to au
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `AUTH_TOKEN` | Auto | Authentication token (auto-generated on first run, min 16 chars) |
+| `AUTH_TOKEN` | Yes | Authentication token for API and WebSocket |
 | `PORT` | No | Server port (default: 3001) |
-| `ALLOWED_ORIGINS` | No | Comma-separated allowed CORS origins (auto-detected from LAN) |
-| `CLAUDE_HOME` | No | Path to Claude config directory (default: `~/.claude`) |
-| `CODEX_HOME` | No | Path to Codex config directory (default: `~/.codex`) |
-| `WINDOWS_SHELL` | No | Windows shell: `wsl` (default), `cmd`, or `powershell` |
+| `ALLOWED_ORIGINS` | No | Comma-separated allowed CORS origins |
+| `CLAUDE_HOME` | No | Path to Claude config directory |
+| `CODEX_HOME` | No | Path to Codex config directory |
+| `WINDOWS_SHELL` | No | Windows shell: `cmd` (default), `powershell`, or `wsl` |
 | `WSL_DISTRO` | No | WSL distribution name (Windows only) |
 | `CLAUDE_CMD` | No | Claude CLI command override |
 | `CODEX_CMD` | No | Codex CLI command override |
-| `OPENCODE_CMD` | No | OpenCode CLI command override |
-| `GEMINI_CMD` | No | Gemini CLI command override |
-| `KIMI_CMD` | No | Kimi CLI command override |
-| `GOOGLE_GENERATIVE_AI_API_KEY` | No | Gemini API key for AI-powered terminal summaries |
+| `GOOGLE_GENERATIVE_AI_API_KEY` | No | Gemini API key for AI summaries |
 
-### Windows + WSL
+### Windows + WSL (Optional)
 
-Freshell defaults to WSL for terminals on Windows. If your Claude Code sessions live inside WSL at `~/.claude`, you may need to configure `CLAUDE_HOME` so the server can find them from Windows:
+If your Claude Code sessions live inside WSL at `~/.claude`, configure access from Windows:
 
 ```bash
+WINDOWS_SHELL=wsl
 CLAUDE_HOME=\\wsl$\Ubuntu\home\your-username\.claude
 WSL_DISTRO=Ubuntu
 ```
 
-On WSL2, freshell automatically sets up port forwarding and firewall rules so you can access it from other devices on your LAN.
+The server will watch `CLAUDE_HOME/projects/**/sessions/*.jsonl` and `CODEX_HOME/sessions/**/*.jsonl` for new sessions.
 
 ### Coding CLI Providers
 
-Freshell indexes local session history and can launch terminals for these coding CLIs:
+Freshell indexes local session history for supported coding CLIs:
 
-| Provider | Session history | Launch terminals | Home directory |
-|----------|:-:|:-:|----------------|
-| **Claude Code** | Yes | Yes | `~/.claude` |
-| **Codex** | Yes | Yes | `~/.codex` |
-| **OpenCode** | — | Yes | — |
-| **Gemini** | — | Yes | — |
-| **Kimi** | — | Yes | — |
+- **Claude Code** — `~/.claude/projects/**/sessions/*.jsonl`
+- **Codex** — `~/.codex/sessions/**/*.jsonl`
 
-Enable/disable providers and set defaults in the Settings UI or via `~/.freshell/config.json`.
+You can enable/disable providers and set defaults in the Settings UI or via `~/.freshell/config.json`:
+
+```json
+{
+  "settings": {
+    "codingCli": {
+      "enabledProviders": ["claude", "codex"],
+      "providers": {
+        "claude": { "permissionMode": "default" },
+        "codex": { "model": "gpt-5-codex", "sandbox": "read-only" }
+      }
+    }
+  }
+}
+```
 
 ## Security
 
-- **AUTH_TOKEN is mandatory** — Auto-generated on first run (64 hex chars); server refuses to start without one (min 16 chars, rejects known weak values)
-- **API authentication** — All `/api/*` routes require `x-auth-token` header (except `/api/health`)
+- **AUTH_TOKEN is mandatory** — The server refuses to start without it
+- **API authentication** — All `/api/*` routes require `x-auth-token` header
 - **WebSocket handshake** — Connections must send a valid token in the `hello` message
-- **Origin restriction** — WebSocket and CORS limited to allowed origins (auto-detected from LAN, configurable via `ALLOWED_ORIGINS`)
-- **Rate limiting** — API routes are rate-limited to 300 requests per minute
+- **Origin restriction** — WebSocket connections limited to allowed origins
+
+## Testing
+
+```bash
+# Run all tests
+npm test
+
+# Run with UI
+npm run test:ui
+
+# Run specific test suites
+npm run test:unit          # Unit tests only
+npm run test:server        # Server tests only
+npm run test:client        # Client tests only
+npm run test:coverage      # With coverage report
+```
 
 ## Tech Stack
 
-- **Frontend**: React 18, Redux Toolkit, Tailwind CSS, xterm.js, Monaco Editor, Zod, lucide-react
-- **Backend**: Express, WebSocket (ws), node-pty, Pino, Chokidar, Zod
+- **Frontend**: React 18, Redux Toolkit, Tailwind CSS, xterm.js
+- **Backend**: Express, WebSocket (ws), node-pty
 - **Build**: Vite, TypeScript
-- **Testing**: Vitest, Testing Library, supertest, superwstest
 - **AI**: Vercel AI SDK with Google Gemini
 
 ## Project Structure
 
 ```
-src/          React frontend (components, Redux store, hooks)
-server/       Express backend (PTY management, WebSocket, coding CLI providers, session search, auto-updater)
-test/         Vitest suites (unit, integration, e2e)
+freshell/
+├── src/                  # Frontend source
+│   ├── components/       # React components
+│   ├── store/            # Redux store & slices
+│   ├── lib/              # Utilities & API client
+│   └── hooks/            # Custom React hooks
+├── server/               # Backend source
+│   ├── index.ts          # Server entry point
+│   ├── ws-handler.ts     # WebSocket handling
+│   ├── terminal-registry.ts # PTY lifecycle management
+│   └── coding-cli/       # Multi-provider session support
+│       ├── types.ts      # Normalized event types
+│       ├── session-indexer.ts # Session discovery & indexing
+│       └── providers/    # Claude, Codex adapters
+├── test/                 # Test suites
+└── dist/                 # Build output
 ```
 
 ## Contributing
