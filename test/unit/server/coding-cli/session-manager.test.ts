@@ -5,13 +5,19 @@ import type { CodingCliProvider } from '../../../../server/coding-cli/provider'
 import { claudeProvider } from '../../../../server/coding-cli/providers/claude'
 
 // Mock logger to suppress output
-vi.mock('../../../../server/logger', () => ({
-  logger: {
+vi.mock('../../../../server/logger', () => {
+  const logger = {
     info: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
-  },
-}))
+    debug: vi.fn(),
+    trace: vi.fn(),
+    fatal: vi.fn(),
+    child: vi.fn(),
+  }
+  logger.child.mockReturnValue(logger)
+  return { logger }
+})
 
 // Helper to create a mock process
 function createMockProcess() {

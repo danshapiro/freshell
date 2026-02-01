@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url'
 import rateLimit from 'express-rate-limit'
 import { z } from 'zod'
 import { logger } from './logger.js'
+import { requestLogger } from './request-logger.js'
 import { validateStartupSecurity, httpAuthMiddleware } from './auth.js'
 import { configStore } from './config-store.js'
 import { TerminalRegistry } from './terminal-registry.js'
@@ -22,6 +23,7 @@ import { AI_CONFIG, PROMPTS, stripAnsi } from './ai-prompts.js'
 import { migrateSettingsSortMode } from './settings-migrate.js'
 import { filesRouter } from './files-router.js'
 import { getSessionRepairService } from './session-scanner/service.js'
+import { createClientLogsRouter } from './client-logs.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -41,6 +43,7 @@ function findPackageJson(): string {
 
 const packageJson = JSON.parse(fs.readFileSync(findPackageJson(), 'utf-8'))
 const APP_VERSION: string = packageJson.version
+const log = logger.child({ component: 'server' })
 
 async function main() {
   validateStartupSecurity()
@@ -49,6 +52,7 @@ async function main() {
   app.disable('x-powered-by')
 
   app.use(express.json({ limit: '1mb' }))
+  app.use(requestLogger)
 
   // --- Local file serving for browser pane (no auth required, same-origin only) ---
   app.get('/local-file', (req, res) => {
@@ -92,6 +96,7 @@ async function main() {
   )
 
   app.use('/api', httpAuthMiddleware)
+  app.use('/api', createClientLogsRouter())
 
   const codingCliProviders = [claudeProvider, codexProvider]
   const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders)
@@ -202,7 +207,7 @@ async function main() {
 
       res.json(response)
     } catch (err: any) {
-      logger.error({ err }, 'Session search failed')
+      log.error({ err }, 'Session search failed')
       res.status(500).json({ error: 'Search failed' })
     }
   })
@@ -343,7 +348,7 @@ async function main() {
       const description = (result.text || '').trim().slice(0, 240) || heuristic()
       res.json({ description, source: 'ai' })
     } catch (err: any) {
-      logger.warn({ err }, 'AI summary failed; using heuristic')
+      log.warn({ err }, 'AI summary failed; using heuristic')
       res.json({ description: heuristic(), source: 'heuristic' })
     }
   })
@@ -412,7 +417,7 @@ async function main() {
     // Only associate the oldest terminal (first in sorted list)
     // This prevents incorrect associations when multiple terminals share the same cwd
     const term = unassociated[0]
-    logger.info({ terminalId: term.terminalId, sessionId: session.sessionId }, 'Associating terminal with new Claude session')
+    log.info({ terminalId: term.terminalId, sessionId: session.sessionId }, 'Associating terminal with new Claude session')
     registry.setResumeSessionId(term.terminalId, session.sessionId)
     try {
       wsHandler.broadcast({
@@ -421,13 +426,13 @@ async function main() {
         sessionId: session.sessionId,
       })
     } catch (err) {
-      logger.warn({ err, terminalId: term.terminalId }, 'Failed to broadcast session association')
+      log.warn({ err, terminalId: term.terminalId }, 'Failed to broadcast session association')
     }
   })
 
   const port = Number(process.env.PORT || 3001)
   server.listen(port, '0.0.0.0', () => {
-    logger.info({ port }, 'Server listening')
+    log.info({ port, appVersion: APP_VERSION }, 'Server listening')
 
     // Print friendly startup message
     const token = process.env.AUTH_TOKEN
@@ -447,12 +452,12 @@ async function main() {
     if (isShuttingDown) return
     isShuttingDown = true
 
-    logger.info({ signal }, 'Shutting down...')
+    log.info({ signal }, 'Shutting down...')
 
     // 1. Stop accepting new connections by closing the HTTP server
     server.close((err) => {
       if (err) {
-        logger.warn({ err }, 'Error closing HTTP server')
+        log.warn({ err }, 'Error closing HTTP server')
       }
     })
 
@@ -473,7 +478,7 @@ async function main() {
     await sessionRepairService.stop()
 
     // 7. Exit cleanly
-    logger.info('Shutdown complete')
+    log.info('Shutdown complete')
     process.exit(0)
   }
 
@@ -482,6 +487,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  logger.error({ err }, 'Fatal startup error')
+  log.error({ err }, 'Fatal startup error')
   process.exit(1)
 })

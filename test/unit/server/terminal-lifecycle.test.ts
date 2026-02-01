@@ -42,14 +42,19 @@ vi.mock('node-pty', () => ({
   }),
 }))
 
-vi.mock('../../../server/logger', () => ({
-  logger: {
+vi.mock('../../../server/logger', () => {
+  const logger = {
     info: vi.fn(),
     warn: vi.fn(),
     debug: vi.fn(),
     error: vi.fn(),
-  },
-}))
+    trace: vi.fn(),
+    fatal: vi.fn(),
+    child: vi.fn(),
+  }
+  logger.child.mockReturnValue(logger)
+  return { logger }
+})
 
 // Import after mocking
 import { TerminalRegistry, type TerminalRecord, ChunkRingBuffer } from '../../../server/terminal-registry'

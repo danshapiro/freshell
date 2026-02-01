@@ -15,6 +15,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - Always work in a worktree (in \.worktrees\)
 - Specific user instructions override ALL other instructions, including the above, and including superpowers or skills
 - Server uses NodeNext/ESM; relative imports must include `.js` extensions
+- Always consider checking logs for debugging; server logs (including client console logs) are in the server process stdout/stderr (e.g., `npm run dev`/`npm start`).
 
 ## Merging to Main (CRITICAL - Read This)
 

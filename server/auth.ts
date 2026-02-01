@@ -1,6 +1,8 @@
 import type { Request, Response, NextFunction } from 'express'
 import { logger } from './logger.js'
 
+const log = logger.child({ component: 'auth' })
+
 const DEFAULT_BAD_TOKENS = new Set(['changeme', 'default', 'password', 'token'])
 
 export function getRequiredAuthToken(): string {
@@ -20,7 +22,7 @@ export function validateStartupSecurity() {
   if (DEFAULT_BAD_TOKENS.has(token.toLowerCase())) {
     throw new Error('AUTH_TOKEN appears to be a default/weak value. Refusing to start.')
   }
-  logger.info('Security: AUTH_TOKEN configured (%d chars)', token.length)
+  log.info({ tokenLength: token.length, event: 'auth_token_configured' }, 'Security: AUTH_TOKEN configured')
 }
 
 export function httpAuthMiddleware(req: Request, res: Response, next: NextFunction) {

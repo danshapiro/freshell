@@ -5,8 +5,10 @@ import { store } from '@/store/store'
 import App from '@/App'
 import '@/index.css'
 import { initializeAuthToken } from '@/lib/ws-client'
+import { createClientLogger } from '@/lib/client-logger'
 
 initializeAuthToken()
+createClientLogger().installConsoleCapture()
 
 if (import.meta.env.DEV) {
   document.title = 'freshell:dev'

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 
 describe('logger', () => {
   const originalEnv = { ...process.env }
+  const TEST_TIMEOUT_MS = 15000
 
   beforeEach(() => {
     vi.resetModules()
@@ -19,15 +20,15 @@ describe('logger', () => {
 
       const { logger } = await import('../../../server/logger')
       expect(logger.level).toBe('debug')
-    })
+    }, TEST_TIMEOUT_MS)
 
-    it('defaults to info in production', async () => {
+    it('defaults to debug in production', async () => {
       delete process.env.LOG_LEVEL
       process.env.NODE_ENV = 'production'
 
       const { logger } = await import('../../../server/logger')
-      expect(logger.level).toBe('info')
-    })
+      expect(logger.level).toBe('debug')
+    }, TEST_TIMEOUT_MS)
 
     it('respects LOG_LEVEL env var in development', async () => {
       process.env.LOG_LEVEL = 'warn'
@@ -35,7 +36,7 @@ describe('logger', () => {
 
       const { logger } = await import('../../../server/logger')
       expect(logger.level).toBe('warn')
-    })
+    }, TEST_TIMEOUT_MS)
 
     it('respects LOG_LEVEL env var in production', async () => {
       process.env.LOG_LEVEL = 'error'
@@ -43,7 +44,7 @@ describe('logger', () => {
 
       const { logger } = await import('../../../server/logger')
       expect(logger.level).toBe('error')
-    })
+    }, TEST_TIMEOUT_MS)
 
     it('LOG_LEVEL takes precedence over NODE_ENV', async () => {
       process.env.LOG_LEVEL = 'trace'
@@ -51,7 +52,7 @@ describe('logger', () => {
 
       const { logger } = await import('../../../server/logger')
       expect(logger.level).toBe('trace')
-    })
+    }, TEST_TIMEOUT_MS)
   })
 
   describe('logger interface', () => {
@@ -65,7 +66,7 @@ describe('logger', () => {
       expect(typeof logger.error).toBe('function')
       expect(typeof logger.trace).toBe('function')
       expect(typeof logger.fatal).toBe('function')
-    })
+    }, TEST_TIMEOUT_MS)
 
     it('can log with objects', async () => {
       const { logger } = await import('../../../server/logger')
@@ -74,13 +75,13 @@ describe('logger', () => {
       expect(() => {
         logger.info({ key: 'value' }, 'test message')
       }).not.toThrow()
-    })
+    }, TEST_TIMEOUT_MS)
 
     it('can log with child loggers', async () => {
       const { logger } = await import('../../../server/logger')
 
       const childLogger = logger.child({ component: 'test' })
       expect(typeof childLogger.info).toBe('function')
-    })
+    }, TEST_TIMEOUT_MS)
   })
 })

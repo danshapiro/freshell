@@ -23,14 +23,19 @@ vi.mock('node-pty', () => ({
 process.env.AUTH_TOKEN = 'test-token'
 
 // Mock logger
-vi.mock('../../server/logger', () => ({
-  logger: {
+vi.mock('../../server/logger', () => {
+  const logger = {
     info: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
     debug: vi.fn(),
-  },
-}))
+    trace: vi.fn(),
+    fatal: vi.fn(),
+    child: vi.fn(),
+  }
+  logger.child.mockReturnValue(logger)
+  return { logger }
+})
 
 vi.mock('../../server/config-store', () => ({
   configStore: {

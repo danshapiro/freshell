@@ -1,4 +1,5 @@
 import type http from 'http'
+import { randomUUID } from 'crypto'
 import WebSocket, { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { logger } from './logger.js'
@@ -14,9 +15,13 @@ const HELLO_TIMEOUT_MS = Number(process.env.HELLO_TIMEOUT_MS || 5_000)
 const PING_INTERVAL_MS = Number(process.env.PING_INTERVAL_MS || 30_000)
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
 
+const log = logger.child({ component: 'ws' })
+
 // Extended WebSocket with liveness tracking for keepalive
 interface LiveWebSocket extends WebSocket {
   isAlive?: boolean
+  connectionId?: string
+  connectedAt?: number
 }
 
 const CLOSE_CODES = {
@@ -248,6 +253,7 @@ export class WsHandler {
 
     const origin = req.headers.origin as string | undefined
     const remoteAddr = (req.socket.remoteAddress as string | undefined) || undefined
+    const userAgent = req.headers['user-agent'] as string | undefined
 
     // Trust loopback connections (e.g., Vite dev proxy) regardless of Origin header.
     // In dev mode, Vite proxies WebSocket requests from remote clients but the connection
@@ -270,6 +276,10 @@ export class WsHandler {
       }
     }
 
+    const connectionId = randomUUID()
+    ws.connectionId = connectionId
+    ws.connectedAt = Date.now()
+
     const state: ClientState = {
       authenticated: false,
       attachedTerminalIds: new Set(),
@@ -288,6 +298,18 @@ export class WsHandler {
 
     this.connections.add(ws)
 
+    log.info(
+      {
+        event: 'ws_connection_open',
+        connectionId,
+        origin,
+        remoteAddr,
+        userAgent,
+        connectionCount: this.connections.size,
+      },
+      'WebSocket connection opened',
+    )
+
     state.helloTimer = setTimeout(() => {
       if (!state.authenticated) {
         ws.close(CLOSE_CODES.HELLO_TIMEOUT, 'Hello timeout')
@@ -295,11 +317,11 @@ export class WsHandler {
     }, HELLO_TIMEOUT_MS)
 
     ws.on('message', (data) => void this.onMessage(ws, state, data))
-    ws.on('close', () => this.onClose(ws, state))
-    ws.on('error', (err) => logger.debug({ err }, 'WS error'))
+    ws.on('close', (code, reason) => this.onClose(ws, state, code, reason))
+    ws.on('error', (err) => log.debug({ err, connectionId }, 'WS error'))
   }
 
-  private onClose(ws: LiveWebSocket, state: ClientState) {
+  private onClose(ws: LiveWebSocket, state: ClientState, code?: number, reason?: Buffer) {
     if (state.helloTimer) clearTimeout(state.helloTimer)
     this.connections.delete(ws)
     this.clientStates.delete(ws)
@@ -312,6 +334,21 @@ export class WsHandler {
       off()
     }
     state.codingCliSubscriptions.clear()
+
+    const durationMs = ws.connectedAt ? Date.now() - ws.connectedAt : undefined
+    const reasonText = reason ? reason.toString() : undefined
+
+    log.info(
+      {
+        event: 'ws_connection_closed',
+        connectionId: ws.connectionId,
+        code,
+        reason: reasonText,
+        durationMs,
+        connectionCount: this.connections.size,
+      },
+      'WebSocket connection closed',
+    )
   }
 
   private removeCodingCliSubscription(state: ClientState, sessionId: string) {
@@ -383,12 +420,15 @@ export class WsHandler {
     if (m.type === 'hello') {
       const expected = getRequiredAuthToken()
       if (!m.token || m.token !== expected) {
+        log.warn({ event: 'ws_auth_failed', connectionId: ws.connectionId }, 'WebSocket auth failed')
         this.sendError(ws, { code: 'NOT_AUTHENTICATED', message: 'Invalid token' })
         ws.close(CLOSE_CODES.NOT_AUTHENTICATED, 'Invalid token')
         return
       }
       state.authenticated = true
       if (state.helloTimer) clearTimeout(state.helloTimer)
+
+      log.info({ event: 'ws_authenticated', connectionId: ws.connectionId }, 'WebSocket client authenticated')
 
       // Track and prioritize sessions from client
       if (m.sessions && this.sessionRepairService) {
@@ -438,13 +478,13 @@ export class WsHandler {
               const result = await this.sessionRepairService.waitForSession(m.resumeSessionId, 10000)
               if (result.status === 'missing') {
                 // Session file doesn't exist - don't try to resume
-                logger.info({ sessionId: m.resumeSessionId }, 'Session file missing, starting fresh')
+                log.info({ sessionId: m.resumeSessionId, connectionId: ws.connectionId }, 'Session file missing, starting fresh')
                 effectiveResumeSessionId = undefined
               }
               // For 'healthy', 'corrupted' (which is now repaired), we proceed with resume
             } catch (err) {
               // Timeout or not in queue - proceed anyway, Claude will handle missing session
-              logger.debug({ err, sessionId: m.resumeSessionId }, 'Session repair wait failed, proceeding')
+              log.debug({ err, sessionId: m.resumeSessionId, connectionId: ws.connectionId }, 'Session repair wait failed, proceeding')
             }
           }
 
@@ -472,7 +512,7 @@ export class WsHandler {
           // Notify all clients that list changed
           this.broadcast({ type: 'terminal.list.updated' })
         } catch (err: any) {
-          logger.warn({ err }, 'terminal.create failed')
+          log.warn({ err, connectionId: ws.connectionId }, 'terminal.create failed')
           this.sendError(ws, {
             code: 'PTY_SPAWN_FAILED',
             message: err?.message || 'Failed to spawn PTY',
@@ -638,7 +678,7 @@ export class WsHandler {
             provider: session.provider.name,
           })
         } catch (err: any) {
-          logger.warn({ err }, 'codingcli.create failed')
+          log.warn({ err, connectionId: ws.connectionId }, 'codingcli.create failed')
           this.sendError(ws, {
             code: 'INTERNAL_ERROR',
             message: err?.message || 'Failed to create coding CLI session',
@@ -724,7 +764,7 @@ export class WsHandler {
     // Close the WebSocket server
     this.wss.close()
 
-    logger.info('WebSocket server closed')
+    log.info('WebSocket server closed')
   }
 }
 

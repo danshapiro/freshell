@@ -16,14 +16,19 @@ import { EventEmitter } from 'events'
 import type WebSocket from 'ws'
 
 // Mock the logger before importing modules that use it
-vi.mock('../../../server/logger', () => ({
-  logger: {
+vi.mock('../../../server/logger', () => {
+  const logger = {
     info: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
     debug: vi.fn(),
-  },
-}))
+    trace: vi.fn(),
+    fatal: vi.fn(),
+    child: vi.fn(),
+  }
+  logger.child.mockReturnValue(logger)
+  return { logger }
+})
 
 // Mock node-pty with controllable behavior
 const mockPtySpawn = vi.fn()

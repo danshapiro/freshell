@@ -18,14 +18,19 @@ vi.mock('../../server/config-store', () => ({
 }))
 
 // Mock logger to avoid unnecessary output
-vi.mock('../../server/logger', () => ({
-  logger: {
+vi.mock('../../server/logger', () => {
+  const logger = {
     info: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
     debug: vi.fn(),
-  },
-}))
+    trace: vi.fn(),
+    fatal: vi.fn(),
+    child: vi.fn(),
+  }
+  logger.child.mockReturnValue(logger)
+  return { logger }
+})
 
 // Import after mocks are set up
 import { httpAuthMiddleware } from '../../server/auth'
