@@ -1,10 +1,8 @@
 import type { Request, Response, NextFunction } from 'express'
 import { randomUUID } from 'crypto'
 import { logger, withLogContext } from './logger.js'
-import { getPerfConfig, logPerfEvent } from './perf-logger.js'
 
 type RequestWithId = Request & { id?: string }
-const perfConfig = getPerfConfig()
 
 function getRequestId(req: Request): string {
   const headerId = req.headers['x-request-id']
@@ -43,21 +41,6 @@ export function requestLogger(req: RequestWithId, res: Response, next: NextFunct
           },
           'HTTP request',
         )
-
-        if (perfConfig.enabled && durationMs >= perfConfig.httpSlowMs) {
-          logPerfEvent(
-            'http_request_slow',
-            {
-              method: req.method,
-              path: req.originalUrl,
-              statusCode,
-              durationMs: Number(durationMs.toFixed(2)),
-              requestBytes: req.headers['content-length'],
-              responseBytes: res.getHeader('content-length'),
-            },
-            'warn',
-          )
-        }
       })
 
       next()

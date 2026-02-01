@@ -16,7 +16,6 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - Specific user instructions override ALL other instructions, including the above, and including superpowers or skills
 - Server uses NodeNext/ESM; relative imports must include `.js` extensions
 - Always consider checking logs for debugging; server logs (including client console logs) are in the server process stdout/stderr (e.g., `npm run dev`/`npm start`).
-- Debug logging toggle (UI Settings → Debugging → Debug logging) enables debug-level logs and perf logging; keep OFF outside perf investigations.
 
 ## Merging to Main (CRITICAL - Read This)
 
@@ -57,7 +56,6 @@ npm run dev:server          # Node with tsx watch for server auto-reload
 npm run build               # Full build (client + server)
 npm run build:client        # Vite build → dist/client
 npm run build:server        # TypeScript compile → dist/server
-npm run serve               # Build and run production server
 ```
 
 ### Testing
@@ -106,31 +104,6 @@ npm run test:coverage       # Generate coverage report
 2. WebSocket connects → client sends `hello` with auth token → server sends `ready`
 3. Terminal creation → Pane content has `createRequestId` → UI sends `terminal.create` WS message with that ID → server spawns PTY → sends back `terminal.created` with `terminalId` → pane content updated
 4. Terminal I/O → `terminal.input` WS messages write to PTY stdin → stdout/stderr streams to attached clients
-
-## Accessibility (A11y) Requirements
-
-All components **must** be accessible for browser-use automation and WCAG compliance:
-
-**Semantic HTML:**
-- Use `<button>`, `<a>`, `<input>`, `<label>` for interactive elements (not div with onClick)
-- Use semantic headers (`<h1>`-`<h6>`), nav, main, aside
-- Use proper form structure with labels associated to controls
-
-**ARIA & Labels:**
-- Icon-only buttons: `aria-label="Description"` or `<span className="sr-only">`
-- Clickable cards/tiles: `role="button"` + `aria-label`
-- Custom components: appropriate roles and ARIA props
-- Complex widgets: `aria-expanded`, `aria-pressed`, `aria-selected` where applicable
-
-**Browser-use Requirements:**
-- All interactive elements must be indexable (semantic HTML or proper roles)
-- All interactive elements must be identifiable (visible text or aria-label)
-- Never rely on selectors for automation; fix accessibility instead
-
-**Linting:**
-- Run `npm run lint` to check a11y violations (eslint-plugin-jsx-a11y)
-- Fix with `npm run lint:fix` for auto-fixable issues
-- A11y linting is CI requirement before merging
 
 ## Path Aliases
 

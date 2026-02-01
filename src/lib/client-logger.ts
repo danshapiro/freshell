@@ -73,7 +73,7 @@ function getClientId(): string {
 
   const generated = typeof crypto !== 'undefined' && 'randomUUID' in crypto
     ? crypto.randomUUID()
-    : `client-${Math.random().toString(36).slice(2)}`
+    : client-
 
   sessionStorage.setItem('client-log-id', generated)
   return generated
