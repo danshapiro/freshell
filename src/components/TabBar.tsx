@@ -176,7 +176,7 @@ export default function TabBar() {
   if (tabs.length === 0) return null
 
   return (
-    <div className="h-10 flex items-end px-2 border-b border-border/30 bg-muted/30">
+    <div className="h-10 flex items-end px-2 bg-card">
       <DndContext
         sensors={sensors}
         collisionDetection={closestCenter}
