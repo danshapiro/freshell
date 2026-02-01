@@ -1,26 +1,18 @@
 import path from 'path'
+import os from 'os'
 import fsp from 'fs/promises'
 import fs from 'fs'
-import { createInterface } from 'readline'
 import chokidar from 'chokidar'
 import { logger } from './logger.js'
 import { getPerfConfig, startPerfTimer } from './perf-logger.js'
 import { configStore, SessionOverride } from './config-store.js'
 import { makeSessionKey } from './coding-cli/types.js'
 import { extractTitleFromMessage } from './title-utils.js'
-import { getClaudeProjectsDir } from './claude-home.js'
-import { isValidClaudeSessionId } from './claude-session-id.js'
 
 const SEEN_SESSION_RETENTION_MS = Number(process.env.CLAUDE_SEEN_SESSION_RETENTION_MS || 7 * 24 * 60 * 60 * 1000)
 const MAX_SEEN_SESSION_IDS = Number(process.env.CLAUDE_SEEN_SESSION_MAX || 10_000)
 const INCREMENTAL_DEBOUNCE_MS = Number(process.env.CLAUDE_INDEXER_DEBOUNCE_MS || 250)
 const perfConfig = getPerfConfig()
-const IS_WINDOWS = process.platform === 'win32'
-
-const normalizeFilePath = (filePath: string) => {
-  const resolved = path.resolve(filePath)
-  return IS_WINDOWS ? resolved.toLowerCase() : resolved
-}
 
 export type ClaudeSession = {
   sessionId: string
@@ -38,6 +30,12 @@ export type ProjectGroup = {
   projectPath: string
   sessions: ClaudeSession[]
   color?: string
+}
+
+export function defaultClaudeHome(): string {
+  // Claude Code stores logs in ~/.claude by default (Linux/macOS).
+  // On Windows, set CLAUDE_HOME to a path you can access from Node (e.g. \\wsl$\...).
+  return process.env.CLAUDE_HOME || path.join(os.homedir(), '.claude')
 }
 
 export function looksLikePath(s: string): boolean {
@@ -105,26 +103,6 @@ export type JsonlMeta = {
   summary?: string
   messageCount?: number
   createdAt?: number
-  sessionId?: string
-}
-
-type JsonlMetaAccumulator = {
-  cwd?: string
-  title?: string
-  summary?: string
-  messageCount: number
-  createdAt?: number
-  sessionId?: string
-}
-
-type JsonlMetaReadOptions = {
-  maxBytes?: number
-}
-
-type CachedJsonlMeta = {
-  mtimeMs: number
-  size: number
-  meta: JsonlMeta
 }
 
 function parseTimestamp(value: unknown): number | undefined {
@@ -148,132 +126,92 @@ function parseTimestamp(value: unknown): number | undefined {
   return undefined
 }
 
-function createMetaAccumulator(): JsonlMetaAccumulator {
-  return { messageCount: 0 }
-}
-
-function applyJsonlLine(meta: JsonlMetaAccumulator, line: string): void {
-  let obj: any
-  try {
-    obj = JSON.parse(line)
-  } catch {
-    return
-  }
-
-  if (!meta.sessionId) {
-    const candidates = [
-      obj?.sessionId,
-      obj?.session_id,
-      obj?.message?.sessionId,
-      obj?.message?.session_id,
-      obj?.data?.sessionId,
-      obj?.data?.session_id,
-    ].filter((v: any) => typeof v === 'string') as string[]
-    const valid = candidates.find((v) => isValidClaudeSessionId(v))
-    if (valid) meta.sessionId = valid
-  }
-
-  const candidates = [
-    obj?.cwd,
-    obj?.context?.cwd,
-    obj?.payload?.cwd,
-    obj?.data?.cwd,
-    obj?.message?.cwd,
-  ].filter((v: any) => typeof v === 'string') as string[]
-  if (!meta.cwd) {
-    const found = candidates.find((v) => looksLikePath(v))
-    if (found) meta.cwd = found
-  }
-
-  if (!meta.title) {
-    const t =
-      obj?.title ||
-      obj?.sessionTitle ||
-      (obj?.role === 'user' && typeof obj?.content === 'string' ? obj.content : undefined) ||
-      (obj?.message?.role === 'user' && typeof obj?.message?.content === 'string'
-        ? obj.message.content
-        : undefined)
-
-    if (typeof t === 'string' && t.trim()) {
-      // Store up to 200 chars - UI truncates visually, tooltip shows full text
-      meta.title = extractTitleFromMessage(t, 200)
-    }
-  }
-
-  if (!meta.summary) {
-    const s = obj?.summary || obj?.sessionSummary
-    if (typeof s === 'string' && s.trim()) meta.summary = s.trim().slice(0, 240)
-  }
-
-  const candidate = parseTimestamp(obj?.timestamp || obj?.created_at || obj?.createdAt)
-  if (candidate !== undefined) {
-    if (meta.createdAt === undefined || candidate < meta.createdAt) {
-      meta.createdAt = candidate
-    }
-  }
-}
-
-function isMetaComplete(meta: JsonlMetaAccumulator): boolean {
-  return Boolean(meta.cwd && meta.title && meta.summary && meta.createdAt !== undefined && meta.sessionId)
-}
-
-function toJsonlMeta(meta: JsonlMetaAccumulator): JsonlMeta {
-  return {
-    cwd: meta.cwd,
-    title: meta.title,
-    summary: meta.summary,
-    messageCount: meta.messageCount,
-    createdAt: meta.createdAt,
-    sessionId: meta.sessionId,
-  }
-}
-
 /** Parse session metadata from jsonl content (pure function for testing) */
 export function parseSessionContent(content: string): JsonlMeta {
   const lines = content.split(/\r?\n/).filter(Boolean)
-  const meta = createMetaAccumulator()
+  let cwd: string | undefined
+  let title: string | undefined
+  let summary: string | undefined
+  let createdAt: number | undefined
 
   for (const line of lines) {
-    meta.messageCount += 1
-    applyJsonlLine(meta, line)
-    if (isMetaComplete(meta)) break
+    let obj: any
+    try {
+      obj = JSON.parse(line)
+    } catch {
+      continue
+    }
+
+    const candidates = [
+      obj?.cwd,
+      obj?.context?.cwd,
+      obj?.payload?.cwd,
+      obj?.data?.cwd,
+      obj?.message?.cwd,
+    ].filter((v: any) => typeof v === 'string') as string[]
+    if (!cwd) {
+      const found = candidates.find((v) => looksLikePath(v))
+      if (found) cwd = found
+    }
+
+    if (!title) {
+      const t =
+        obj?.title ||
+        obj?.sessionTitle ||
+        (obj?.role === 'user' && typeof obj?.content === 'string' ? obj.content : undefined) ||
+        (obj?.message?.role === 'user' && typeof obj?.message?.content === 'string'
+          ? obj.message.content
+          : undefined)
+
+      if (typeof t === 'string' && t.trim()) {
+        // Store up to 200 chars - UI truncates visually, tooltip shows full text
+        title = extractTitleFromMessage(t, 200)
+      }
+    }
+
+    if (!summary) {
+      const s = obj?.summary || obj?.sessionSummary
+      if (typeof s === 'string' && s.trim()) summary = s.trim().slice(0, 240)
+    }
+
+    if (createdAt === undefined) {
+      const candidate = parseTimestamp(obj?.timestamp || obj?.created_at || obj?.createdAt)
+      if (candidate !== undefined) {
+        createdAt = candidate
+      }
+    } else {
+      const candidate = parseTimestamp(obj?.timestamp || obj?.created_at || obj?.createdAt)
+      if (candidate !== undefined && candidate < createdAt) {
+        createdAt = candidate
+      }
+    }
+
+    if (cwd && title && summary && createdAt !== undefined) break
   }
 
-  return toJsonlMeta(meta)
+  return {
+    cwd,
+    title,
+    summary,
+    messageCount: lines.length,
+    createdAt,
+  }
 }
 
-export async function parseSessionJsonlMeta(
-  filePath: string,
-  options: JsonlMetaReadOptions = {},
-): Promise<JsonlMeta> {
-  const maxBytes = options.maxBytes && options.maxBytes > 0 ? options.maxBytes : 256 * 1024
-  const meta = createMetaAccumulator()
-  let bytesRead = 0
-  let stream: fs.ReadStream | null = null
-  let reader: ReturnType<typeof createInterface> | null = null
-
+export async function parseSessionJsonlMeta(filePath: string): Promise<JsonlMeta> {
   try {
-    stream = fs.createReadStream(filePath, {
-      encoding: 'utf-8',
-      highWaterMark: Math.min(maxBytes, 64 * 1024),
-    })
-    reader = createInterface({ input: stream, crlfDelay: Infinity })
-
-    for await (const line of reader) {
-      if (!line) continue
-      meta.messageCount += 1
-      bytesRead += Buffer.byteLength(line, 'utf8') + 1
-      applyJsonlLine(meta, line)
-      if (bytesRead >= maxBytes || isMetaComplete(meta)) break
+    const stream = fs.createReadStream(filePath, { encoding: 'utf-8', highWaterMark: 256 * 1024 })
+    let data = ''
+    for await (const chunk of stream) {
+      data += chunk
+      if (data.length >= 256 * 1024) break
     }
+    stream.close()
+
+    return parseSessionContent(data)
   } catch {
     return {}
-  } finally {
-    reader?.close()
-    stream?.destroy()
   }
-
-  return toJsonlMeta(meta)
 }
 
 function deriveCreatedAt(stat: fs.Stats): number {
@@ -296,6 +234,7 @@ export function applyOverride(session: ClaudeSession, ov: SessionOverride | unde
 }
 
 export class ClaudeSessionIndexer {
+  private claudeHome = defaultClaudeHome()
   private watcher: chokidar.FSWatcher | null = null
   private projects: ProjectGroup[] = []
   private onUpdateHandlers = new Set<(projects: ProjectGroup[]) => void>()
@@ -307,9 +246,6 @@ export class ClaudeSessionIndexer {
   private projectsByPath = new Map<string, ProjectGroup>()
   private incrementalTimers = new Map<string, NodeJS.Timeout>()
   private createdAtPinned = new Set<string>()
-  private fileCache = new Map<string, CachedJsonlMeta>()
-  private filePathToSessionId = new Map<string, string>()
-  private sessionIdToFilePath = new Map<string, string>()
 
   async start() {
     // Initial scan (populates knownSessionIds with existing sessions)
@@ -317,7 +253,7 @@ export class ClaudeSessionIndexer {
     // Now enable onNewSession handlers for new sessions detected after startup
     this.initialized = true
 
-    const projectsDir = getClaudeProjectsDir()
+    const projectsDir = path.join(this.claudeHome, 'projects')
     const sessionsGlob = path.join(projectsDir, '**', '*.jsonl')
     logger.info({ sessionsGlob }, 'Starting Claude sessions watcher')
 
@@ -441,11 +377,7 @@ export class ClaudeSessionIndexer {
       filePath,
       setTimeout(() => {
         this.incrementalTimers.delete(filePath)
-        const cacheKey = normalizeFilePath(filePath)
-        const mappedSessionId = this.filePathToSessionId.get(cacheKey)
-        this.fileCache.delete(cacheKey)
-        this.clearSessionMapping(filePath)
-        const sessionId = mappedSessionId || path.basename(filePath, '.jsonl')
+        const sessionId = path.basename(filePath, '.jsonl')
         if (this.removeSession(sessionId)) {
           this.rebuildProjects()
         }
@@ -459,10 +391,6 @@ export class ClaudeSessionIndexer {
 
     this.sessionsById.delete(sessionId)
     this.removeSessionFromProject(existing.sessionId, existing.projectPath)
-    const mappedPath = this.sessionIdToFilePath.get(sessionId)
-    if (mappedPath) {
-      this.clearSessionMapping(mappedPath)
-    }
     // Clean up createdAtPinned to prevent unbounded growth
     this.createdAtPinned.delete(makeSessionKey('claude', sessionId))
     this.createdAtPinned.delete(sessionId) // Also check legacy key format
@@ -506,29 +434,6 @@ export class ClaudeSessionIndexer {
     }
   }
 
-  private setSessionMapping(filePath: string, sessionId: string) {
-    const key = normalizeFilePath(filePath)
-    const oldSessionId = this.filePathToSessionId.get(key)
-    if (oldSessionId && oldSessionId !== sessionId) {
-      this.sessionIdToFilePath.delete(oldSessionId)
-    }
-    this.filePathToSessionId.set(key, sessionId)
-    this.sessionIdToFilePath.set(sessionId, filePath)
-  }
-
-  private clearSessionMapping(filePath: string) {
-    const key = normalizeFilePath(filePath)
-    const sessionId = this.filePathToSessionId.get(key)
-    if (sessionId) {
-      this.sessionIdToFilePath.delete(sessionId)
-    }
-    this.filePathToSessionId.delete(key)
-  }
-
-  getFilePathForSession(sessionId: string): string | undefined {
-    return this.sessionIdToFilePath.get(sessionId)
-  }
-
   private rebuildProjects() {
     const groups = Array.from(this.projectsByPath.values()).filter((g) => g.sessions.length > 0)
 
@@ -546,56 +451,24 @@ export class ClaudeSessionIndexer {
   }
 
   private async upsertSessionFromFile(filePath: string) {
-    const fileSessionId = path.basename(filePath, '.jsonl')
-    const cacheKey = normalizeFilePath(filePath)
-    const mappedSessionId = this.filePathToSessionId.get(cacheKey)
+    const sessionId = path.basename(filePath, '.jsonl')
     let stat: any
     try {
       stat = await fsp.stat(filePath)
     } catch {
-      this.fileCache.delete(cacheKey)
-      this.clearSessionMapping(filePath)
-      if (this.removeSession(mappedSessionId || fileSessionId)) {
+      if (this.removeSession(sessionId)) {
         this.rebuildProjects()
       }
       return
     }
 
-    const mtimeMs = stat.mtimeMs || stat.mtime.getTime()
-    const size = stat.size
-    const cached = this.fileCache.get(cacheKey)
-    const meta =
-      cached && cached.mtimeMs === mtimeMs && cached.size === size ? cached.meta : await parseSessionJsonlMeta(filePath)
-    if (!cached || cached.mtimeMs !== mtimeMs || cached.size !== size) {
-      this.fileCache.set(cacheKey, { mtimeMs, size, meta })
-    }
+    const meta = await parseSessionJsonlMeta(filePath)
     if (!meta.cwd) {
-      this.clearSessionMapping(filePath)
-      if (this.removeSession(mappedSessionId || fileSessionId)) {
+      if (this.removeSession(sessionId)) {
         this.rebuildProjects()
       }
       return
     }
-
-    const contentSessionId = meta.sessionId && isValidClaudeSessionId(meta.sessionId) ? meta.sessionId : undefined
-    const filenameSessionId = isValidClaudeSessionId(fileSessionId) ? fileSessionId : undefined
-    const sessionId = contentSessionId || filenameSessionId
-
-    if (!sessionId) {
-      logger.warn({ filePath }, 'Skipping Claude session with invalid sessionId')
-      this.clearSessionMapping(filePath)
-      if (mappedSessionId) {
-        if (this.removeSession(mappedSessionId)) {
-          this.rebuildProjects()
-        }
-      }
-      return
-    }
-
-    if (mappedSessionId && mappedSessionId !== sessionId) {
-      this.removeSession(mappedSessionId)
-    }
-    this.setSessionMapping(filePath, sessionId)
 
     const projectDir = path.dirname(filePath)
     const projectPath = await resolveProjectPath(projectDir)
@@ -604,15 +477,7 @@ export class ClaudeSessionIndexer {
     const colors = await configStore.getProjectColors()
 
     const compositeKey = makeSessionKey('claude', sessionId)
-    let ov = cfg.sessionOverrides?.[compositeKey] || cfg.sessionOverrides?.[sessionId]
-    if (!ov && filenameSessionId && filenameSessionId !== sessionId) {
-      const legacyKey = makeSessionKey('claude', filenameSessionId)
-      const legacyOverride = cfg.sessionOverrides?.[legacyKey] || cfg.sessionOverrides?.[filenameSessionId]
-      if (legacyOverride) {
-        logger.warn({ sessionId, legacySessionId: filenameSessionId }, 'Using legacy Claude session override')
-        ov = legacyOverride
-      }
-    }
+    const ov = cfg.sessionOverrides?.[compositeKey] || cfg.sessionOverrides?.[sessionId]
     const createdAt = ov?.createdAtOverride ?? meta.createdAt ?? deriveCreatedAt(stat)
 
     const baseSession: ClaudeSession = {
@@ -644,17 +509,14 @@ export class ClaudeSessionIndexer {
       {},
       { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
     )
-    const projectsDir = getClaudeProjectsDir()
+    const projectsDir = path.join(this.claudeHome, 'projects')
     const colors = await configStore.getProjectColors()
     const cfg = await configStore.snapshot()
 
     const groups: ProjectGroup[] = []
-    this.filePathToSessionId.clear()
-    this.sessionIdToFilePath.clear()
     let projectDirs: string[] = []
     let fileCount = 0
     let sessionCount = 0
-    const seenFiles = new Set<string>()
     try {
       projectDirs = (await fsp.readdir(projectsDir)).map((name) => path.join(projectsDir, name))
     } catch (err: any) {
@@ -662,9 +524,6 @@ export class ClaudeSessionIndexer {
       this.projects = []
       this.sessionsById.clear()
       this.projectsByPath.clear()
-      this.fileCache.clear()
-      this.filePathToSessionId.clear()
-      this.sessionIdToFilePath.clear()
       this.emitUpdate()
       endRefreshTimer({ error: 'projects_read_failed' })
       return
@@ -694,48 +553,20 @@ export class ClaudeSessionIndexer {
       const sessions: ClaudeSession[] = []
       for (const file of files) {
         const full = path.join(projectDir, file)
-        const cacheKey = normalizeFilePath(full)
-        seenFiles.add(cacheKey)
         let stat: any
         try {
           stat = await fsp.stat(full)
         } catch {
-          this.fileCache.delete(cacheKey)
           continue
         }
-        const fileSessionId = path.basename(file, '.jsonl')
-        const mtimeMs = stat.mtimeMs || stat.mtime.getTime()
-        const size = stat.size
-        const cached = this.fileCache.get(cacheKey)
-        const meta =
-          cached && cached.mtimeMs === mtimeMs && cached.size === size ? cached.meta : await parseSessionJsonlMeta(full)
-        if (!cached || cached.mtimeMs !== mtimeMs || cached.size !== size) {
-          this.fileCache.set(cacheKey, { mtimeMs, size, meta })
-        }
+        const sessionId = path.basename(file, '.jsonl')
+        const meta = await parseSessionJsonlMeta(full)
 
         // Skip orphaned sessions (no conversation events, just snapshots)
         if (!meta.cwd) continue
 
-        const contentSessionId = meta.sessionId && isValidClaudeSessionId(meta.sessionId) ? meta.sessionId : undefined
-        const filenameSessionId = isValidClaudeSessionId(fileSessionId) ? fileSessionId : undefined
-        const sessionId = contentSessionId || filenameSessionId
-        if (!sessionId) {
-          logger.warn({ filePath: full }, 'Skipping Claude session with invalid sessionId')
-          continue
-        }
-
-        this.setSessionMapping(full, sessionId)
-
         const compositeKey = makeSessionKey('claude', sessionId)
-        let ov = cfg.sessionOverrides?.[compositeKey] || cfg.sessionOverrides?.[sessionId]
-        if (!ov && filenameSessionId && filenameSessionId !== sessionId) {
-          const legacyKey = makeSessionKey('claude', filenameSessionId)
-          const legacyOverride = cfg.sessionOverrides?.[legacyKey] || cfg.sessionOverrides?.[filenameSessionId]
-          if (legacyOverride) {
-            logger.warn({ sessionId, legacySessionId: filenameSessionId }, 'Using legacy Claude session override')
-            ov = legacyOverride
-          }
-        }
+        const ov = cfg.sessionOverrides?.[compositeKey] || cfg.sessionOverrides?.[sessionId]
         const createdAt = ov?.createdAtOverride ?? meta.createdAt ?? deriveCreatedAt(stat)
 
         const baseSession: ClaudeSession = {
@@ -782,11 +613,6 @@ export class ClaudeSessionIndexer {
 
     this.projects = groups
     this.emitUpdate()
-    for (const cachedFile of this.fileCache.keys()) {
-      if (!seenFiles.has(cachedFile)) {
-        this.fileCache.delete(cachedFile)
-      }
-    }
     endRefreshTimer({ projectCount: groups.length, sessionCount, projectDirCount: projectDirs.length, fileCount })
   }
 
