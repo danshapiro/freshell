@@ -96,6 +96,7 @@ export default function Sidebar({
   useEffect(() => {
     if (!filter.trim() || searchTier === 'title') {
       setSearchResults(null)
+      setIsSearching(false)
       return
     }
 
@@ -125,6 +126,7 @@ export default function Sidebar({
     return () => {
       controller.abort()
       clearTimeout(timeoutId)
+      setIsSearching(false)
     }
   }, [filter, searchTier])
 

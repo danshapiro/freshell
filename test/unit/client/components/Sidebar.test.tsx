@@ -1395,6 +1395,37 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       expect(getByText(/no results/i)).toBeInTheDocument()
     })
+
+    it('clears loading state when switching back to title tier during search', async () => {
+      // Make the search take a long time to ensure we can switch tiers mid-search
+      vi.mocked(mockSearchSessions).mockImplementation(
+        () => new Promise((resolve) => setTimeout(() => resolve({
+          results: [],
+          tier: 'userMessages',
+          query: 'test',
+          totalScanned: 0,
+        }), 5000))
+      )
+
+      const store = createTestStore({ projects: [] })
+      const { getByPlaceholderText, getByRole, getByTestId, queryByTestId } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      // Start a userMessages search
+      fireEvent.change(getByPlaceholderText('Search...'), { target: { value: 'test' } })
+      fireEvent.change(getByRole('combobox', { name: /search tier/i }), { target: { value: 'userMessages' } })
+
+      // Wait for debounce - loading indicator should appear
+      await act(() => vi.advanceTimersByTime(350))
+      expect(getByTestId('search-loading')).toBeInTheDocument()
+
+      // Switch back to title tier while search is in progress
+      fireEvent.change(getByRole('combobox', { name: /search tier/i }), { target: { value: 'title' } })
+
+      // Loading indicator should disappear immediately
+      await act(() => vi.advanceTimersByTime(0))
+      expect(queryByTestId('search-loading')).not.toBeInTheDocument()
+    })
   })
 
   describe('Backend search integration', () => {
