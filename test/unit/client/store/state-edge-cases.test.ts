@@ -829,6 +829,11 @@ describe('State Edge Cases', () => {
             visualWhenFinished: false,
             soundWhenFinished: false,
           },
+          notifications: {
+            visualWhenWorking: true,
+            visualWhenFinished: true,
+            soundWhenFinished: true,
+          },
           codingCli: {
             enabledProviders: ['claude', 'codex'],
             providers: {
