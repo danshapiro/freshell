@@ -37,4 +37,24 @@ describe('derivePaneTitle', () => {
     }
     expect(derivePaneTitle(content)).toBe('Claude')
   })
+
+  it('returns "Codex" for codex mode terminal', () => {
+    const content: PaneContent = {
+      kind: 'terminal',
+      mode: 'codex',
+      status: 'running',
+      createRequestId: 'test',
+    }
+    expect(derivePaneTitle(content)).toBe('Codex')
+  })
+
+  it('returns "Gemini" for gemini mode terminal', () => {
+    const content: PaneContent = {
+      kind: 'terminal',
+      mode: 'gemini',
+      status: 'running',
+      createRequestId: 'test',
+    }
+    expect(derivePaneTitle(content)).toBe('Gemini')
+  })
 })

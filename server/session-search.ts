@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import fs from 'fs'
-import path from 'path'
-import type { ProjectGroup, ClaudeSession } from './claude-indexer.js'
+import type { CodingCliProvider } from './coding-cli/provider.js'
+import type { CodingCliProviderName, NormalizedEvent, ProjectGroup } from './coding-cli/types.js'
 
 export const SearchTier = {
   Title: 'title',
@@ -21,6 +21,7 @@ export type SearchMatch = z.infer<typeof SearchMatchSchema>
 
 export const SearchResultSchema = z.object({
   sessionId: z.string(),
+  provider: z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi']),
   projectPath: z.string(),
   title: z.string().optional(),
   summary: z.string().optional(),
@@ -63,8 +64,10 @@ export function searchTitleTier(
       const summaryMatch = session.summary?.toLowerCase().includes(q)
 
       if (titleMatch || summaryMatch) {
+        const provider = (session.provider || 'claude') as CodingCliProviderName
         results.push({
           sessionId: session.sessionId,
+          provider,
           projectPath: session.projectPath,
           title: session.title,
           summary: session.summary,
@@ -173,6 +176,7 @@ function extractSnippet(text: string, query: string, contextLength = 50): string
 }
 
 export async function searchSessionFile(
+  provider: CodingCliProvider,
   filePath: string,
   query: string,
   tier: 'userMessages' | 'fullText'
@@ -189,28 +193,25 @@ export async function searchSessionFile(
   const lines = content.split(/\r?\n/).filter(Boolean)
 
   for (const line of lines) {
-    let obj: Record<string, unknown>
+    let events: NormalizedEvent[] = []
     try {
-      obj = JSON.parse(line) as Record<string, unknown>
+      events = provider.parseEvent(line)
     } catch {
       continue
     }
 
-    const isUser = obj.type === 'user'
-    const isAssistant = obj.type === 'assistant'
+    for (const event of events) {
+      if (event.type !== 'message.user' && event.type !== 'message.assistant') continue
+      if (tier === 'userMessages' && event.type !== 'message.user') continue
 
-    // In userMessages tier, only search user messages
-    if (tier === 'userMessages' && !isUser) continue
-    // In fullText tier, search both
-    if (tier === 'fullText' && !isUser && !isAssistant) continue
+      const text = event.message?.content
+      if (!text) continue
 
-    const text = extractMessageText(obj)
-    if (!text) continue
-
-    if (text.toLowerCase().includes(q)) {
-      return {
-        matchedIn: isUser ? 'userMessage' : 'assistantMessage',
-        snippet: extractSnippet(text, query),
+      if (text.toLowerCase().includes(q)) {
+        return {
+          matchedIn: event.type === 'message.user' ? 'userMessage' : 'assistantMessage',
+          snippet: extractSnippet(text, query),
+        }
       }
     }
   }
@@ -220,7 +221,7 @@ export async function searchSessionFile(
 
 export interface SearchSessionsOptions {
   projects: ProjectGroup[]
-  claudeHome: string
+  providers: CodingCliProvider[]
   query: string
   tier: SearchTierType
   limit?: number
@@ -229,7 +230,10 @@ export interface SearchSessionsOptions {
 export async function searchSessions(
   options: SearchSessionsOptions
 ): Promise<SearchResponse> {
-  const { projects, claudeHome, query, tier, limit = 50 } = options
+  const { projects, providers, query, tier, limit = 50 } = options
+  const providersByName = new Map<CodingCliProviderName, CodingCliProvider>(
+    providers.map((provider) => [provider.name, provider])
+  )
 
   // Tier 1: Title search (instant, metadata only)
   if (tier === SearchTier.Title) {
@@ -250,16 +254,12 @@ export async function searchSessions(
     for (const session of project.sessions) {
       totalScanned++
 
-      // Construct file path - project path is encoded by replacing / and : with -
-      const projectDirName = project.projectPath
-        .replace(/[/\\:]/g, '-')
-        .replace(/^-+/, '')
-      const sessionFile = path.join(
-        claudeHome,
-        'projects',
-        projectDirName,
-        `${session.sessionId}.jsonl`
-      )
+      const providerName = (session.provider || 'claude') as CodingCliProviderName
+      const provider = providersByName.get(providerName)
+      if (!provider) continue
+
+      const sessionFile = session.sourceFile
+      if (!sessionFile) continue
 
       // Try to access the file
       try {
@@ -270,11 +270,12 @@ export async function searchSessions(
       }
 
       const searchTier = tier === SearchTier.UserMessages ? 'userMessages' : 'fullText'
-      const match = await searchSessionFile(sessionFile, query, searchTier)
+      const match = await searchSessionFile(provider, sessionFile, query, searchTier)
 
       if (match) {
         results.push({
           sessionId: session.sessionId,
+          provider: providerName,
           projectPath: session.projectPath,
           title: session.title,
           summary: session.summary,

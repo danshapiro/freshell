@@ -133,7 +133,11 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         if (currentTab.resumeSessionId) {
           if (now - lastSessionActivityAtRef.current >= SESSION_ACTIVITY_THROTTLE_MS) {
             lastSessionActivityAtRef.current = now
-            dispatch(updateSessionActivity({ sessionId: currentTab.resumeSessionId, lastInputAt: now }))
+            const provider =
+              currentTab.codingCliProvider ||
+              (currentTab.mode !== 'shell' ? currentTab.mode : undefined) ||
+              'claude'
+            dispatch(updateSessionActivity({ sessionId: currentTab.resumeSessionId, provider, lastInputAt: now }))
           }
         }
       }

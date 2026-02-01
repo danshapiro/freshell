@@ -104,33 +104,6 @@ export default function Sidebar({
         const response = await searchSessions({
           query: filter.trim(),
           tier: searchTier,
-=======
-    // Build map: sessionId -> running terminalId
-    const runningSessionMap = new Map<string, string>()
-    terminalsArray.forEach((t) => {
-      if (isCodingCliMode(t.mode) && t.status === 'running' && t.resumeSessionId) {
-        runningSessionMap.set(`${t.mode}:${t.resumeSessionId}`, t.terminalId)
-      }
-    })
-
-    // Add sessions with running state
-    projectsArray.forEach((project) => {
-      project.sessions.forEach((session) => {
-        const provider = session.provider || 'claude'
-        const runningTerminalId = runningSessionMap.get(`${provider}:${session.sessionId}`)
-        items.push({
-          id: `session-${provider}-${session.sessionId}`,
-          sessionId: session.sessionId,
-          provider,
-          title: session.title || session.sessionId.slice(0, 8),
-          subtitle: getProjectName(project.projectPath),
-          projectPath: project.projectPath,
-          projectColor: project.color,
-          timestamp: session.updatedAt,
-          cwd: session.cwd,
-          isRunning: !!runningTerminalId,
-          runningTerminalId,
->>>>>>> 4ad4128 (\)
         })
         if (!controller.signal.aborted) {
           setSearchResults(response.results)
@@ -169,7 +142,7 @@ export default function Sidebar({
     // If we have backend search results, convert them to SessionItems
     if (searchResults !== null) {
       return searchResults.map((result): SessionItem => {
-        const provider = 'claude' as CodingCliProviderName
+        const provider = (result.provider || 'claude') as CodingCliProviderName
         const key = `${provider}:${result.sessionId}`
         const existing = itemsByKey.get(key)
         return {

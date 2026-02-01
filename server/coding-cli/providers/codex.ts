@@ -259,7 +259,8 @@ export const codexProvider: CodingCliProvider = {
       return [
         {
           ...base,
-          type: 'thinking',
+          type: 'reasoning',
+          reasoning: obj.payload.text || obj.payload.message || '',
           thinking: obj.payload.text || obj.payload.message || '',
         },
       ]
@@ -294,17 +295,14 @@ export const codexProvider: CodingCliProvider = {
   },
 
   supportsLiveStreaming() {
-    // IMPORTANT: Codex only supports JSON streaming in `exec` mode (one-shot non-interactive).
-    // The interactive TUI does NOT support --json flag.
-    // Resume sessions must use PTY mode via terminal.create, not codingcli.create.
-    // We return false here to indicate the CodingCliSessionManager should not be used
-    // for interactive Codex sessions.
-    return false
+    // IMPORTANT: Codex supports JSON streaming only in `exec` mode (one-shot non-interactive).
+    // We still allow streaming sessions for new prompts, but resume requires PTY mode.
+    return true
   },
 
   supportsSessionResume() {
     // Codex supports resume via `codex resume <sessionId>` but NOT with JSON output.
-    // Resume must go through PTY mode (terminal.create with mode='codex').
-    return true
+    // Streaming resume is not supported; use terminal.create with mode='codex'.
+    return false
   },
 }

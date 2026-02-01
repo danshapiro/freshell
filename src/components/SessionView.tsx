@@ -22,6 +22,7 @@ export default function SessionView({ sessionId, hidden }: SessionViewProps) {
 
   // Subscribe to WebSocket events for this session
   useEffect(() => {
+    ws.connect().catch(() => {})
     const unsub = ws.onMessage((msg) => {
       if (msg.type === 'codingcli.event' && msg.sessionId === sessionId) {
         dispatch(addCodingCliEvent({ sessionId, event: msg.event }))
@@ -68,10 +69,11 @@ export default function SessionView({ sessionId, hidden }: SessionViewProps) {
     if (event.type === 'tool.result' && event.toolResult) {
       return <ToolResultBlock key={index} result={event.toolResult} />
     }
-    if (event.type === 'thinking' && event.thinking) {
+    if ((event.type === 'reasoning' || event.type === 'thinking') && (event.reasoning || event.thinking)) {
+      const text = event.reasoning || event.thinking
       return (
         <div key={index} className="text-xs text-muted-foreground italic whitespace-pre-wrap">
-          {event.thinking}
+          {text}
         </div>
       )
     }

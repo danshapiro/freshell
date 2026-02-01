@@ -66,7 +66,8 @@ describe('TerminalView - lastInputAt updates', () => {
     vi.useRealTimers()
   })
 
-  function createStore(opts?: { resumeSessionId?: string }) {
+  function createStore(opts?: { resumeSessionId?: string; provider?: 'claude' | 'codex' }) {
+    const provider = opts?.provider || (opts?.resumeSessionId ? 'claude' : undefined)
     return configureStore({
       reducer: {
         tabs: tabsReducer,
@@ -82,10 +83,11 @@ describe('TerminalView - lastInputAt updates', () => {
             createRequestId: 'req-1',
             title: 'Test Tab',
             status: 'running' as const,
-            mode: (opts?.resumeSessionId ? 'claude' : 'shell') as const,
+            mode: (provider || 'shell') as const,
             createdAt: Date.now(),
             terminalId: 'term-1',
             resumeSessionId: opts?.resumeSessionId,
+            codingCliProvider: provider,
           }],
           activeTabId: 'tab-1',
         },
@@ -164,7 +166,7 @@ describe('TerminalView - lastInputAt updates', () => {
     onDataCallback!('hello')
     const afterInput = Date.now()
 
-    const sessionTime = store.getState().sessionActivity.sessions['claude-session-123']
+    const sessionTime = store.getState().sessionActivity.sessions['claude:claude-session-123']
     expect(sessionTime).toBeGreaterThanOrEqual(beforeInput)
     expect(sessionTime).toBeLessThanOrEqual(afterInput)
   })
@@ -193,17 +195,17 @@ describe('TerminalView - lastInputAt updates', () => {
     expect(onDataCallback).not.toBeNull()
 
     onDataCallback!('first')
-    const firstTime = store.getState().sessionActivity.sessions['claude-session-123']
+    const firstTime = store.getState().sessionActivity.sessions['claude:claude-session-123']
 
     vi.advanceTimersByTime(1000)
     onDataCallback!('second')
-    const secondTime = store.getState().sessionActivity.sessions['claude-session-123']
+    const secondTime = store.getState().sessionActivity.sessions['claude:claude-session-123']
 
     expect(secondTime).toBe(firstTime)
 
     vi.advanceTimersByTime(5000)
     onDataCallback!('third')
-    const thirdTime = store.getState().sessionActivity.sessions['claude-session-123']
+    const thirdTime = store.getState().sessionActivity.sessions['claude:claude-session-123']
 
     expect(thirdTime).toBeGreaterThan(firstTime)
   })

@@ -187,6 +187,13 @@ export class CodingCliSessionManager {
       )
     }
 
+    if (options.resumeSessionId && !provider.supportsSessionResume()) {
+      throw new Error(
+        `Provider '${providerName}' does not support streaming resume. ` +
+        `Use terminal.create with mode='${providerName}' to resume sessions.`
+      )
+    }
+
     const session = new CodingCliSession({ ...options, provider })
     this.sessions.set(session.id, session)
 

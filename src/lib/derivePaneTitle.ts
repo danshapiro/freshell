@@ -1,4 +1,5 @@
 import type { PaneContent } from '@/store/paneTypes'
+import { getProviderLabel, isCodingCliMode } from '@/lib/coding-cli-utils'
 
 /**
  * Derives a default title for a pane based on its content.
@@ -21,8 +22,9 @@ export function derivePaneTitle(content: PaneContent): string {
   }
 
   // Terminal content
-  if (content.mode === 'claude') return 'Claude'
-  if (content.mode === 'codex') return 'Codex'
+  if (isCodingCliMode(content.mode)) {
+    return getProviderLabel(content.mode)
+  }
 
   // Shell mode - use shell type if specified
   if (content.shell) {

@@ -836,6 +836,9 @@ describe('State Edge Cases', () => {
               codex: { model: 'gpt-5-codex' },
             },
           },
+          panes: {
+            defaultNewPane: 'ask',
+          },
         }
 
         store.dispatch(setSettings(customSettings))

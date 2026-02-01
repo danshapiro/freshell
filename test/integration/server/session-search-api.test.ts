@@ -19,14 +19,14 @@ vi.mock('os', async () => {
 })
 
 import { searchSessions, SearchRequestSchema } from '../../../server/session-search.js'
-import type { ProjectGroup } from '../../../server/claude-indexer.js'
+import { claudeProvider } from '../../../server/coding-cli/providers/claude.js'
+import type { ProjectGroup } from '../../../server/coding-cli/types.js'
 
 const TEST_AUTH_TOKEN = 'test-auth-token'
 
 describe('Session Search API', () => {
   let app: Express
   let tempDir: string
-  let claudeHome: string
   let mockProjects: ProjectGroup[]
 
   beforeAll(() => {
@@ -36,22 +36,30 @@ describe('Session Search API', () => {
   beforeEach(async () => {
     tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'search-api-test-'))
     mockState.homeDir = tempDir
-    claudeHome = path.join(tempDir, '.claude')
 
     // Create mock sessions
-    const projectDir = path.join(claudeHome, 'projects', 'test-project')
+    const projectDir = path.join(tempDir, 'projects')
     await fsp.mkdir(projectDir, { recursive: true })
 
+    const sessionPath = path.join(projectDir, 'session-abc.jsonl')
     await fsp.writeFile(
-      path.join(projectDir, 'session-abc.jsonl'),
-      '{"type":"user","message":"Fix login bug","uuid":"1","cwd":"/project"}\n'
+      sessionPath,
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Fix login bug"}]},"cwd":"/project"}\n'
     )
 
     mockProjects = [
       {
         projectPath: '/test-project',
         sessions: [
-          { sessionId: 'session-abc', projectPath: '/test-project', updatedAt: 1000, title: 'Fix login bug', cwd: '/project' },
+          {
+            provider: 'claude',
+            sessionId: 'session-abc',
+            projectPath: '/test-project',
+            updatedAt: 1000,
+            title: 'Fix login bug',
+            cwd: '/project',
+            sourceFile: sessionPath,
+          },
         ],
       },
     ]
@@ -81,7 +89,7 @@ describe('Session Search API', () => {
 
         const response = await searchSessions({
           projects: mockProjects,
-          claudeHome,
+          providers: [claudeProvider],
           query: parsed.data.query,
           tier: parsed.data.tier,
           limit: parsed.data.limit,
@@ -125,6 +133,7 @@ describe('Session Search API', () => {
     expect(res.body.tier).toBe('title')
     expect(res.body.results).toHaveLength(1)
     expect(res.body.results[0].sessionId).toBe('session-abc')
+    expect(res.body.results[0].provider).toBe('claude')
   })
 
   it('accepts tier parameter', async () => {

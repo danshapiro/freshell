@@ -2,11 +2,13 @@ export type CodingCliProviderName = 'claude' | 'codex' | 'opencode' | 'gemini' |
 
 export type NormalizedEventType =
   | 'session.start'       // Session initialized (was session.init)
+  | 'session.init'        // Alias for session.start
   | 'session.end'         // Session completed/terminated
   | 'message.user'        // User message
   | 'message.assistant'   // Assistant text response
   | 'message.delta'       // Streaming text delta
-  | 'thinking'            // Reasoning/chain-of-thought (was reasoning)
+  | 'reasoning'           // Reasoning/chain-of-thought
+  | 'thinking'            // Legacy alias for reasoning
   | 'tool.call'           // Tool invocation request
   | 'tool.result'         // Tool execution result
   | 'token.usage'         // Token/cost tracking
@@ -74,6 +76,7 @@ export interface NormalizedEvent {
   tokens?: TokenPayload
   error?: ErrorPayload
   approval?: ApprovalPayload
+  reasoning?: string
   thinking?: string
 
   // Legacy aliases (for backward compatibility)

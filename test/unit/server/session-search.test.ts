@@ -11,9 +11,10 @@ import {
   searchSessionFile,
   searchSessions,
   type SearchResult,
-  type SearchMatch,
 } from '../../../server/session-search.js'
-import type { ProjectGroup } from '../../../server/claude-indexer.js'
+import { claudeProvider } from '../../../server/coding-cli/providers/claude.js'
+import { codexProvider } from '../../../server/coding-cli/providers/codex.js'
+import type { ProjectGroup } from '../../../server/coding-cli/types.js'
 
 describe('session-search types', () => {
   describe('SearchTier enum', () => {
@@ -28,6 +29,7 @@ describe('session-search types', () => {
     it('validates a valid search result', () => {
       const result: SearchResult = {
         sessionId: 'abc123',
+        provider: 'claude',
         projectPath: '/home/user/project',
         title: 'Fix the bug',
         matchedIn: 'title',
@@ -41,6 +43,16 @@ describe('session-search types', () => {
       const invalid = { title: 'Test' }
       expect(() => SearchResultSchema.parse(invalid)).toThrow()
     })
+
+    it('requires provider', () => {
+      const invalid = {
+        sessionId: 'abc123',
+        projectPath: '/home/user/project',
+        matchedIn: 'title',
+        updatedAt: Date.now(),
+      }
+      expect(() => SearchResultSchema.parse(invalid)).toThrow()
+    })
   })
 })
 
@@ -50,6 +62,7 @@ describe('searchTitleTier()', () => {
       projectPath: '/home/user/project-a',
       sessions: [
         {
+          provider: 'claude',
           sessionId: 'session-1',
           projectPath: '/home/user/project-a',
           updatedAt: 1000,
@@ -57,6 +70,7 @@ describe('searchTitleTier()', () => {
           cwd: '/home/user/project-a',
         },
         {
+          provider: 'claude',
           sessionId: 'session-2',
           projectPath: '/home/user/project-a',
           updatedAt: 2000,
@@ -69,6 +83,7 @@ describe('searchTitleTier()', () => {
       projectPath: '/home/user/project-b',
       sessions: [
         {
+          provider: 'claude',
           sessionId: 'session-3',
           projectPath: '/home/user/project-b',
           updatedAt: 3000,
@@ -84,6 +99,7 @@ describe('searchTitleTier()', () => {
     const results = searchTitleTier(mockProjects, 'login')
     expect(results).toHaveLength(1)
     expect(results[0].sessionId).toBe('session-1')
+    expect(results[0].provider).toBe('claude')
     expect(results[0].matchedIn).toBe('title')
   })
 
@@ -241,11 +257,11 @@ describe('searchSessionFile()', () => {
 
   it('finds match in user message (tier userMessages)', async () => {
     const filePath = await createTestSession('test1', [
-      '{"type":"user","message":"Fix the authentication bug","uuid":"1"}',
-      '{"type":"assistant","message":"I will fix that","uuid":"2"}',
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Fix the authentication bug"}]}}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I will fix that"}]}}',
     ].join('\n'))
 
-    const result = await searchSessionFile(filePath, 'authentication', 'userMessages')
+    const result = await searchSessionFile(claudeProvider, filePath, 'authentication', 'userMessages')
 
     expect(result).not.toBeNull()
     expect(result?.matchedIn).toBe('userMessage')
@@ -254,22 +270,22 @@ describe('searchSessionFile()', () => {
 
   it('does not search assistant messages in tier userMessages', async () => {
     const filePath = await createTestSession('test2', [
-      '{"type":"user","message":"Hello","uuid":"1"}',
-      '{"type":"assistant","message":"The authentication is fixed","uuid":"2"}',
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Hello"}]}}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The authentication is fixed"}]}}',
     ].join('\n'))
 
-    const result = await searchSessionFile(filePath, 'authentication', 'userMessages')
+    const result = await searchSessionFile(claudeProvider, filePath, 'authentication', 'userMessages')
 
     expect(result).toBeNull()
   })
 
   it('searches assistant messages in tier fullText', async () => {
     const filePath = await createTestSession('test3', [
-      '{"type":"user","message":"Hello","uuid":"1"}',
-      '{"type":"assistant","message":"The authentication is fixed","uuid":"2"}',
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Hello"}]}}',
+      '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The authentication is fixed"}]}}',
     ].join('\n'))
 
-    const result = await searchSessionFile(filePath, 'authentication', 'fullText')
+    const result = await searchSessionFile(claudeProvider, filePath, 'authentication', 'fullText')
 
     expect(result).not.toBeNull()
     expect(result?.matchedIn).toBe('assistantMessage')
@@ -278,51 +294,76 @@ describe('searchSessionFile()', () => {
   it('extracts snippet context around match', async () => {
     const longMessage = 'A'.repeat(50) + 'TARGET' + 'B'.repeat(50)
     const filePath = await createTestSession('test4', [
-      `{"type":"user","message":"${longMessage}","uuid":"1"}`,
+      `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"${longMessage}"}]}}`,
     ].join('\n'))
 
-    const result = await searchSessionFile(filePath, 'TARGET', 'userMessages')
+    const result = await searchSessionFile(claudeProvider, filePath, 'TARGET', 'userMessages')
 
     expect(result?.snippet?.length).toBeLessThanOrEqual(120)
     expect(result?.snippet).toContain('TARGET')
   })
 
   it('returns null for non-existent file', async () => {
-    const result = await searchSessionFile('/nonexistent/file.jsonl', 'test', 'fullText')
+    const result = await searchSessionFile(claudeProvider, '/nonexistent/file.jsonl', 'test', 'fullText')
 
     expect(result).toBeNull()
   })
 
   it('is case-insensitive', async () => {
     const filePath = await createTestSession('test5', [
-      '{"type":"user","message":"Fix the BUG","uuid":"1"}',
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Fix the BUG"}]}}',
     ].join('\n'))
 
-    const result = await searchSessionFile(filePath, 'bug', 'userMessages')
+    const result = await searchSessionFile(claudeProvider, filePath, 'bug', 'userMessages')
 
     expect(result).not.toBeNull()
+  })
+
+  it('parses Codex user messages', async () => {
+    const filePath = await createTestSession('codex-user', [
+      '{"type":"session_meta","payload":{"id":"session-1","cwd":"/project"}}',
+      '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Fix the auth bug"}]}}',
+      '{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Working on it"}]}}',
+    ].join('\n'))
+
+    const result = await searchSessionFile(codexProvider, filePath, 'auth bug', 'userMessages')
+
+    expect(result).not.toBeNull()
+    expect(result?.matchedIn).toBe('userMessage')
+  })
+
+  it('parses Codex assistant messages for fullText', async () => {
+    const filePath = await createTestSession('codex-assistant', [
+      '{"type":"session_meta","payload":{"id":"session-2","cwd":"/project"}}',
+      '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Hello"}]}}',
+      '{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The bug is fixed"}]}}',
+    ].join('\n'))
+
+    const result = await searchSessionFile(codexProvider, filePath, 'bug is fixed', 'fullText')
+
+    expect(result).not.toBeNull()
+    expect(result?.matchedIn).toBe('assistantMessage')
   })
 })
 
 describe('searchSessions() orchestrator', () => {
   let tempDir: string
-  let mockClaudeHome: string
+  let projectDir: string
 
   beforeEach(async () => {
     tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'search-orchestrator-'))
-    mockClaudeHome = path.join(tempDir, '.claude')
-    const projectDir = path.join(mockClaudeHome, 'projects', 'test-project')
+    projectDir = path.join(tempDir, 'project-sessions')
     await fsp.mkdir(projectDir, { recursive: true })
 
     // Create test sessions
     await fsp.writeFile(
       path.join(projectDir, 'session-1.jsonl'),
-      '{"type":"user","message":"Fix login bug","uuid":"1","cwd":"/project"}\n'
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Fix login bug"}]},"cwd":"/project"}\n'
     )
     await fsp.writeFile(
       path.join(projectDir, 'session-2.jsonl'),
-      '{"type":"user","message":"Hello","uuid":"1","cwd":"/project"}\n' +
-        '{"type":"assistant","message":"The authentication system works","uuid":"2"}\n'
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Hello"}]},"cwd":"/project"}\n' +
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The authentication system works"}]}}'
     )
   })
 
@@ -336,18 +377,22 @@ describe('searchSessions() orchestrator', () => {
         projectPath: '/test-project',
         sessions: [
           {
+            provider: 'claude',
             sessionId: 'session-1',
             projectPath: '/test-project',
             updatedAt: 1000,
             title: 'Fix login bug',
             cwd: '/project',
+            sourceFile: path.join(projectDir, 'session-1.jsonl'),
           },
           {
+            provider: 'claude',
             sessionId: 'session-2',
             projectPath: '/test-project',
             updatedAt: 2000,
             title: 'Hello',
             cwd: '/project',
+            sourceFile: path.join(projectDir, 'session-2.jsonl'),
           },
         ],
       },
@@ -355,7 +400,7 @@ describe('searchSessions() orchestrator', () => {
 
     const response = await searchSessions({
       projects,
-      claudeHome: mockClaudeHome,
+      providers: [claudeProvider],
       query: 'login',
       tier: 'title',
     })
@@ -371,18 +416,22 @@ describe('searchSessions() orchestrator', () => {
         projectPath: '/test-project',
         sessions: [
           {
+            provider: 'claude',
             sessionId: 'session-1',
             projectPath: '/test-project',
             updatedAt: 1000,
             title: 'Fix login bug',
             cwd: '/project',
+            sourceFile: path.join(projectDir, 'session-1.jsonl'),
           },
           {
+            provider: 'claude',
             sessionId: 'session-2',
             projectPath: '/test-project',
             updatedAt: 2000,
             title: 'Hello',
             cwd: '/project',
+            sourceFile: path.join(projectDir, 'session-2.jsonl'),
           },
         ],
       },
@@ -390,7 +439,7 @@ describe('searchSessions() orchestrator', () => {
 
     const response = await searchSessions({
       projects,
-      claudeHome: mockClaudeHome,
+      providers: [claudeProvider],
       query: 'login',
       tier: 'userMessages',
     })
@@ -405,18 +454,22 @@ describe('searchSessions() orchestrator', () => {
         projectPath: '/test-project',
         sessions: [
           {
+            provider: 'claude',
             sessionId: 'session-1',
             projectPath: '/test-project',
             updatedAt: 1000,
             title: 'Login',
             cwd: '/project',
+            sourceFile: path.join(projectDir, 'session-1.jsonl'),
           },
           {
+            provider: 'claude',
             sessionId: 'session-2',
             projectPath: '/test-project',
             updatedAt: 2000,
             title: 'Hello',
             cwd: '/project',
+            sourceFile: path.join(projectDir, 'session-2.jsonl'),
           },
         ],
       },
@@ -424,7 +477,7 @@ describe('searchSessions() orchestrator', () => {
 
     const response = await searchSessions({
       projects,
-      claudeHome: mockClaudeHome,
+      providers: [claudeProvider],
       query: 'authentication',
       tier: 'fullText',
     })

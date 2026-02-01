@@ -107,7 +107,16 @@ describe('settingsSlice', () => {
 
       const state = settingsReducer(initialState, setSettings(newSettings))
 
-      expect(state.settings).toEqual(newSettings)
+      expect(state.settings).toEqual({
+        ...newSettings,
+        codingCli: {
+          ...newSettings.codingCli,
+          providers: {
+            ...defaultSettings.codingCli.providers,
+            ...newSettings.codingCli.providers,
+          },
+        },
+      })
     })
 
     it('sets loaded to true', () => {

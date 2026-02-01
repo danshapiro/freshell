@@ -28,7 +28,7 @@ describe('sessionActivity persistence middleware', () => {
   it('debounces localStorage writes', () => {
     const store = createStore()
 
-    store.dispatch(updateSessionActivity({ sessionId: 'session-1', lastInputAt: Date.now() }))
+    store.dispatch(updateSessionActivity({ sessionId: 'session-1', provider: 'claude', lastInputAt: Date.now() } as any))
 
     expect(localStorage.getItem(SESSION_ACTIVITY_STORAGE_KEY)).toBeNull()
 
@@ -42,14 +42,14 @@ describe('sessionActivity persistence middleware', () => {
     const now = Date.now()
     const oldTime = now - 1000 * 60 * 60 * 24 * 31
 
-    store.dispatch(updateSessionActivity({ sessionId: 'old-session', lastInputAt: oldTime }))
-    store.dispatch(updateSessionActivity({ sessionId: 'fresh-session', lastInputAt: now }))
+    store.dispatch(updateSessionActivity({ sessionId: 'old-session', provider: 'claude', lastInputAt: oldTime } as any))
+    store.dispatch(updateSessionActivity({ sessionId: 'fresh-session', provider: 'claude', lastInputAt: now } as any))
 
     vi.runAllTimers()
 
     const stored = JSON.parse(localStorage.getItem(SESSION_ACTIVITY_STORAGE_KEY) || '{}')
-    expect(stored['old-session']).toBeUndefined()
-    expect(stored['fresh-session']).toBe(now)
+    expect(stored['claude:old-session']).toBeUndefined()
+    expect(stored['claude:fresh-session']).toBe(now)
   })
 
   it('retries persistence when storage becomes available', () => {
@@ -58,7 +58,7 @@ describe('sessionActivity persistence middleware', () => {
     globalThis.localStorage = undefined
 
     const store = createStore()
-    store.dispatch(updateSessionActivity({ sessionId: 'session-1', lastInputAt: 123 }))
+    store.dispatch(updateSessionActivity({ sessionId: 'session-1', provider: 'claude', lastInputAt: 123 } as any))
 
     vi.advanceTimersByTime(SESSION_ACTIVITY_PERSIST_DEBOUNCE_MS)
 
@@ -73,7 +73,7 @@ describe('sessionActivity persistence middleware', () => {
 
   it('flushes pending writes on visibility change', () => {
     const store = createStore()
-    store.dispatch(updateSessionActivity({ sessionId: 'session-1', lastInputAt: 123 }))
+    store.dispatch(updateSessionActivity({ sessionId: 'session-1', provider: 'claude', lastInputAt: 123 } as any))
 
     expect(localStorage.getItem(SESSION_ACTIVITY_STORAGE_KEY)).toBeNull()
 

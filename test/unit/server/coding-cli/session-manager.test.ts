@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { EventEmitter } from 'events'
 import { CodingCliSession, CodingCliSessionManager, type SpawnFn } from '../../../../server/coding-cli/session-manager'
+import type { CodingCliProvider } from '../../../../server/coding-cli/provider'
 import { claudeProvider } from '../../../../server/coding-cli/providers/claude'
 
 // Mock logger to suppress output
@@ -230,6 +231,26 @@ describe('CodingCliSessionManager', () => {
   let mockProcess: any
   let mockSpawn: ReturnType<typeof vi.fn>
 
+  function makeProvider(overrides: Partial<CodingCliProvider> = {}): CodingCliProvider {
+    return {
+      name: 'codex',
+      displayName: 'Codex',
+      homeDir: '/tmp',
+      getSessionGlob: () => '/tmp/*.jsonl',
+      listSessionFiles: async () => [],
+      parseSessionFile: () => ({}),
+      resolveProjectPath: async () => '/project',
+      extractSessionId: () => 'session-id',
+      getCommand: () => 'codex',
+      getStreamArgs: () => ['exec', '--json', 'test'],
+      getResumeArgs: () => ['resume', 'session-id'],
+      parseEvent: () => [],
+      supportsLiveStreaming: () => true,
+      supportsSessionResume: () => true,
+      ...overrides,
+    }
+  }
+
   beforeEach(() => {
     mockProcess = createMockProcess()
     mockSpawn = vi.fn().mockReturnValue(mockProcess)
@@ -256,5 +277,32 @@ describe('CodingCliSessionManager', () => {
   it('returns undefined for unknown session id', () => {
     const manager = new CodingCliSessionManager([claudeProvider])
     expect(manager.get('missing')).toBeUndefined()
+  })
+
+  it('rejects providers without streaming support', () => {
+    const provider = makeProvider({ supportsLiveStreaming: () => false })
+    const manager = new CodingCliSessionManager([provider])
+
+    expect(() =>
+      manager.create('codex', {
+        prompt: 'test',
+        _spawn: mockSpawn as SpawnFn,
+        _nanoid: () => 'id-1',
+      })
+    ).toThrow(/does not support interactive JSON streaming/i)
+  })
+
+  it('rejects resume when provider does not support streaming resume', () => {
+    const provider = makeProvider({ supportsSessionResume: () => false })
+    const manager = new CodingCliSessionManager([provider])
+
+    expect(() =>
+      manager.create('codex', {
+        prompt: 'test',
+        resumeSessionId: 'session-1',
+        _spawn: mockSpawn as SpawnFn,
+        _nanoid: () => 'id-1',
+      })
+    ).toThrow(/resume/i)
   })
 })

@@ -24,11 +24,13 @@ export function parseSessionKey(key: SessionCompositeKey): { provider: CodingCli
 
 export type NormalizedEventType =
   | 'session.start'       // Session initialized (was session.init)
+  | 'session.init'        // Alias for session.start
   | 'session.end'         // Session completed/terminated
   | 'message.user'        // User message
   | 'message.assistant'   // Assistant text response
   | 'message.delta'       // Streaming text delta
-  | 'thinking'            // Reasoning/chain-of-thought (was reasoning)
+  | 'reasoning'           // Reasoning/chain-of-thought
+  | 'thinking'            // Legacy alias for reasoning
   | 'tool.call'           // Tool invocation request
   | 'tool.result'         // Tool execution result
   | 'token.usage'         // Token/cost tracking
@@ -51,7 +53,8 @@ export interface NormalizedEvent {
   tokens?: TokenPayload          // token.usage
   error?: ErrorPayload           // error
   approval?: ApprovalPayload     // approval.request, approval.response
-  thinking?: string              // thinking (was reasoning)
+  reasoning?: string             // reasoning
+  thinking?: string              // legacy alias for reasoning
 
   // Legacy aliases (for backward compatibility during migration)
   sessionInfo?: SessionPayload   // Alias for session
@@ -136,6 +139,7 @@ export interface CodingCliSession {
   title?: string
   summary?: string
   cwd?: string
+  sourceFile?: string
 }
 
 export interface ProjectGroup {

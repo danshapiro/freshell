@@ -85,6 +85,25 @@ describe('codingCliSlice', () => {
       const state = store.getState().codingCli
       expect(state.sessions['session-1'].providerSessionId).toBe('provider-session-abc')
     })
+
+    it('extracts providerSessionId from session.init event', () => {
+      const store = createTestStore()
+      store.dispatch(createCodingCliSession({ sessionId: 'session-1', provider: 'claude', prompt: 'test' }))
+
+      const initEvent = {
+        type: 'session.init',
+        timestamp: new Date().toISOString(),
+        sessionId: 'provider-session-init',
+        provider: 'claude',
+        raw: {},
+        sessionInfo: { cwd: '/test', model: 'claude-3', provider: 'claude' },
+      } as unknown as NormalizedEvent
+
+      store.dispatch(addCodingCliEvent({ sessionId: 'session-1', event: initEvent }))
+
+      const state = store.getState().codingCli
+      expect(state.sessions['session-1'].providerSessionId).toBe('provider-session-init')
+    })
   })
 
   describe('setCodingCliSessionStatus', () => {

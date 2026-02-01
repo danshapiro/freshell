@@ -91,6 +91,30 @@ vi.mock('lucide-react', () => ({
   MessageSquare: ({ className }: { className?: string }) => <svg data-testid="message-square-icon" className={className} />,
 }))
 
+// Mock react-window to avoid hook usage in JSDOM edge case tests
+vi.mock('react-window', () => ({
+  List: ({ rowCount, rowComponent: Row, rowProps, style }: {
+    rowCount: number
+    rowComponent: React.ComponentType<any>
+    rowProps: any
+    style: React.CSSProperties
+  }) => {
+    const items = []
+    for (let i = 0; i < rowCount; i++) {
+      items.push(
+        <Row
+          key={i}
+          index={i}
+          style={{ height: 56 }}
+          ariaAttributes={{}}
+          {...rowProps}
+        />
+      )
+    }
+    return <div style={style} data-testid="virtualized-list">{items}</div>
+  },
+}))
+
 // Now import the components and store slices after mocks are set up
 import TabBar from '@/components/TabBar'
 import SettingsView from '@/components/SettingsView'
@@ -480,8 +504,8 @@ describe('Component Edge Cases', () => {
         const searchInput = screen.getByPlaceholderText('Search...')
         fireEvent.change(searchInput, { target: { value: 'xyznonexistent' } })
 
-        // Should show empty state
-        expect(screen.getByText('No sessions yet')).toBeInTheDocument()
+        // Should show empty state for a filtered search
+        expect(screen.getByText('No matching sessions')).toBeInTheDocument()
       })
     })
 

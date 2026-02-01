@@ -8,6 +8,12 @@ export interface SessionActivityState {
   sessions: Record<string, number>
 }
 
+function makeSessionKey(sessionId: string, provider?: string): string {
+  if (sessionId.includes(':')) return sessionId
+  if (provider) return `${provider}:${sessionId}`
+  return sessionId
+}
+
 function canUseStorage(): boolean {
   return typeof localStorage !== 'undefined'
 }
@@ -72,13 +78,14 @@ export const sessionActivitySlice = createSlice({
   reducers: {
     updateSessionActivity: (
       state,
-      action: PayloadAction<{ sessionId: string; lastInputAt: number }>
+      action: PayloadAction<{ sessionId: string; provider?: string; lastInputAt: number }>
     ) => {
-      const { sessionId, lastInputAt } = action.payload
-      const existing = state.sessions[sessionId] || 0
+      const { sessionId, provider, lastInputAt } = action.payload
+      const key = makeSessionKey(sessionId, provider)
+      const existing = state.sessions[key] || 0
 
       if (lastInputAt > existing) {
-        state.sessions[sessionId] = lastInputAt
+        state.sessions[key] = lastInputAt
         const pruned = pruneSessions(state.sessions, lastInputAt)
         if (pruned !== state.sessions) {
           state.sessions = pruned

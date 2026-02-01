@@ -57,6 +57,7 @@ export interface CodingCliSession {
   title?: string
   summary?: string
   cwd?: string
+  sourceFile?: string
 }
 
 export interface ProjectGroup {

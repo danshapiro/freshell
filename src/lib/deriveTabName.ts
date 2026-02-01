@@ -1,4 +1,5 @@
 import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent } from '../store/paneTypes'
+import { getProviderLabel, isCodingCliMode } from './coding-cli-utils'
 
 /**
  * Collect all leaf pane contents in tree order (left-to-right, top-to-bottom).
@@ -12,7 +13,7 @@ function collectContents(node: PaneNode): PaneContent[] {
  * Check if a terminal is a CLI (claude or codex mode).
  */
 function isCli(content: PaneContent): content is TerminalPaneContent {
-  return content.kind === 'terminal' && (content.mode === 'claude' || content.mode === 'codex')
+  return content.kind === 'terminal' && isCodingCliMode(content.mode)
 }
 
 /**
@@ -83,7 +84,7 @@ export function deriveTabName(layout: PaneNode): string {
   // Priority 1: First CLI instance
   const cli = contents.find(isCli)
   if (cli) {
-    return cli.mode === 'claude' ? 'Claude' : 'Codex'
+    return getProviderLabel(cli.mode)
   }
 
   // Priority 2: First browser

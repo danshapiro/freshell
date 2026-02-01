@@ -103,6 +103,36 @@ describe('SessionView', () => {
     expect(screen.getByText('Hello from Claude!')).toBeInTheDocument()
   })
 
+  it('renders reasoning events', () => {
+    const store = createTestStore({
+      'session-1': {
+        sessionId: 'session-1',
+        provider: 'claude',
+        prompt: 'test',
+        status: 'running' as const,
+        events: [
+          {
+            type: 'reasoning',
+            timestamp: new Date().toISOString(),
+            sessionId: 'provider-session',
+            provider: 'claude',
+            raw: {},
+            reasoning: 'Thinking through the problem...',
+          },
+        ],
+        createdAt: Date.now(),
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <SessionView sessionId="session-1" />
+      </Provider>
+    )
+
+    expect(screen.getByText('Thinking through the problem...')).toBeInTheDocument()
+  })
+
   it('shows loading state when no events', () => {
     const store = createTestStore()
     render(

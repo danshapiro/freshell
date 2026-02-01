@@ -121,6 +121,7 @@ export class CodingCliSessionIndexer {
           title: meta.title,
           summary: meta.summary,
           cwd: meta.cwd,
+          sourceFile: file,
         }
 
         const compositeKey = makeSessionKey(provider.name, sessionId)

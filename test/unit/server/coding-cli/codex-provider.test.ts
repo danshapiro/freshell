@@ -85,6 +85,21 @@ describe('codex-provider', () => {
     expect(resultEvents[0].toolResult?.output).toBe('ok')
   })
 
+  it('normalizes codex reasoning events', () => {
+    const reasoningLine = JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'agent_reasoning',
+        text: 'Reasoning here',
+      },
+    })
+
+    const events = codexProvider.parseEvent(reasoningLine)
+
+    expect(events[0].type).toBe('reasoning')
+    expect(events[0].reasoning).toBe('Reasoning here')
+  })
+
   it('builds stream args with model and sandbox', () => {
     const args = codexProvider.getStreamArgs({
       prompt: 'Hello',

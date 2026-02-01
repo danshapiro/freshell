@@ -11,7 +11,7 @@ import { validateStartupSecurity, httpAuthMiddleware } from './auth.js'
 import { configStore } from './config-store.js'
 import { TerminalRegistry } from './terminal-registry.js'
 import { WsHandler } from './ws-handler.js'
-import { claudeIndexer, defaultClaudeHome } from './claude-indexer.js'
+import { claudeIndexer } from './claude-indexer.js'
 import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
 import { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { claudeProvider } from './coding-cli/providers/claude.js'
@@ -192,8 +192,8 @@ async function main() {
       }
 
       const response = await searchSessions({
-        projects: claudeIndexer.getProjects(),
-        claudeHome: defaultClaudeHome(),
+        projects: codingCliIndexer.getProjects(),
+        providers: codingCliProviders,
         query: parsed.data.query,
         tier: parsed.data.tier,
         limit: parsed.data.limit,

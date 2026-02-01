@@ -2,19 +2,22 @@
  * Session utilities for extracting session information from store state.
  */
 
-import type { PaneNode } from '@/store/paneTypes'
+import type { PaneContent, PaneNode } from '@/store/paneTypes'
 import type { RootState } from '@/store/store'
 
 /**
  * Extract all session IDs from a pane tree.
  */
+function extractClaudeSessionId(content: PaneContent): string | undefined {
+  if (content.kind !== 'terminal') return undefined
+  if (content.mode !== 'claude') return undefined
+  return content.resumeSessionId
+}
+
 function collectSessionIds(node: PaneNode): string[] {
   if (node.type === 'leaf') {
-    const content = node.content
-    if (content.kind === 'terminal' && content.resumeSessionId) {
-      return [content.resumeSessionId]
-    }
-    return []
+    const sessionId = extractClaudeSessionId(node.content)
+    return sessionId ? [sessionId] : []
   }
   return [
     ...collectSessionIds(node.children[0]),
@@ -61,8 +64,8 @@ export function getSessionsForHello(state: RootState): {
       }
 
       const activeLeaf = findLeaf(layout)
-      if (activeLeaf?.type === 'leaf' && activeLeaf.content.kind === 'terminal') {
-        result.active = activeLeaf.content.resumeSessionId
+      if (activeLeaf?.type === 'leaf') {
+        result.active = extractClaudeSessionId(activeLeaf.content)
       }
     }
 

@@ -72,7 +72,7 @@ describe('searchSessions()', () => {
   it('returns search response', async () => {
     const mockResponse: SearchResponse = {
       results: [
-        { sessionId: 'abc', projectPath: '/proj', matchedIn: 'title', updatedAt: 1000 },
+        { sessionId: 'abc', provider: 'claude', projectPath: '/proj', matchedIn: 'title', updatedAt: 1000 },
       ],
       tier: 'title',
       query: 'test',

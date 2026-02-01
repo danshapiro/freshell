@@ -226,6 +226,14 @@ export class SessionRepairService extends EventEmitter {
   }
 
   private enqueueResolved(items: Array<{ sessionId: string; priority: Priority }>): void {
+    // Always re-prioritize any existing queue entries, even if we can't resolve a path yet.
+    this.queue.enqueue(
+      items.map((item) => ({
+        ...item,
+        filePath: '',
+      }))
+    )
+
     const immediate: Array<{ sessionId: string; filePath: string; priority: Priority }> = []
     const pending: Array<{ sessionId: string; priority: Priority }> = []
 

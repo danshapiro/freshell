@@ -54,7 +54,7 @@ const codingCliSlice = createSlice({
       const session = state.sessions[action.payload.sessionId]
       if (session) {
         session.events.push(action.payload.event)
-        if (action.payload.event.type === 'session.start') {
+        if (action.payload.event.type === 'session.start' || action.payload.event.type === 'session.init') {
           session.providerSessionId = action.payload.event.sessionId
         }
       }

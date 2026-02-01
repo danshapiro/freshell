@@ -73,6 +73,14 @@ function createTestStore(options?: {
   showProjectBadges?: boolean
   sessionActivity?: Record<string, number>
 }) {
+  const projects = (options?.projects ?? []).map((project) => ({
+    ...project,
+    sessions: (project.sessions ?? []).map((session) => ({
+      ...session,
+      provider: session.provider ?? 'claude',
+    })),
+  }))
+
   return configureStore({
     reducer: {
       settings: settingsReducer,
@@ -105,7 +113,7 @@ function createTestStore(options?: {
         activeTabId: options?.activeTabId ?? null,
       },
       sessions: {
-        projects: options?.projects ?? [],
+        projects,
         expandedProjects: new Set<string>(),
         isLoading: false,
         error: null,
@@ -560,7 +568,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       ]
 
       const sessionActivity = {
-        'session-was-active': now - 1000,
+        'claude:session-was-active': now - 1000,
       }
 
       const store = createTestStore({
@@ -808,7 +816,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       ]
 
       const sessionActivity = {
-        'session-was-active': now - 1000,
+        'claude:session-was-active': now - 1000,
       }
 
       const store = createTestStore({
@@ -1397,7 +1405,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
     it('calls searchSessions API when tier is not title and query exists', async () => {
       vi.mocked(mockSearchSessions).mockResolvedValue({
         results: [
-          { sessionId: 'result-1', projectPath: '/proj', matchedIn: 'userMessage', updatedAt: 1000, snippet: 'Found it' },
+          { sessionId: 'result-1', provider: 'claude', projectPath: '/proj', matchedIn: 'userMessage', updatedAt: 1000, snippet: 'Found it' },
         ],
         tier: 'userMessages',
         query: 'test',
@@ -1426,7 +1434,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
     it('displays search results from API', async () => {
       vi.mocked(mockSearchSessions).mockResolvedValue({
         results: [
-          { sessionId: 'result-1', projectPath: '/proj', matchedIn: 'userMessage', updatedAt: 1000, title: 'Found Session', snippet: 'test found here' },
+          { sessionId: 'result-1', provider: 'claude', projectPath: '/proj', matchedIn: 'userMessage', updatedAt: 1000, title: 'Found Session', snippet: 'test found here' },
         ],
         tier: 'userMessages',
         query: 'test',
@@ -1454,7 +1462,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
         projects: [
           {
             projectPath: '/proj',
-            sessions: [{ sessionId: 's1', projectPath: '/proj', updatedAt: 1000, title: 'Test session', cwd: '/proj' }],
+            sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/proj', updatedAt: 1000, title: 'Test session', cwd: '/proj' }],
           },
         ],
       })

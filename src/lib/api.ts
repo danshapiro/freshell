@@ -1,3 +1,5 @@
+import type { CodingCliProviderName } from './coding-cli-types'
+
 export type ApiError = {
   status: number
   message: string
@@ -61,6 +63,7 @@ export const api = {
 
 export type SearchResult = {
   sessionId: string
+  provider: CodingCliProviderName
   projectPath: string
   title?: string
   summary?: string
