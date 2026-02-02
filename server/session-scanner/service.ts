@@ -146,8 +146,7 @@ export class SessionRepairService extends EventEmitter {
    * Get the scan result for a session if already processed.
    */
   getResult(sessionId: string): SessionScanResult | undefined {
-    // Check if in processed cache
-    return undefined // Queue doesn't expose processed map, rely on waitFor
+    return this.queue.getResult(sessionId)
   }
 
   /**

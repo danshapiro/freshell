@@ -132,55 +132,71 @@ describe("logger", () => {
   })
 
   describe("debug log path resolution", () => {
-    it("skips debug log path when running under vitest", async () => {
-      const { resolveDebugLogPath } = await import("../../../server/logger")
-      const resolved = resolveDebugLogPath(
-        { VITEST: "true", NODE_ENV: "production" } as NodeJS.ProcessEnv,
-        "/home/test",
-      )
-      expect(resolved).toBeNull()
-    })
+    it(
+      "skips debug log path when running under vitest",
+      async () => {
+        const { resolveDebugLogPath } = await import("../../../server/logger")
+        const resolved = resolveDebugLogPath(
+          { VITEST: "true", NODE_ENV: "production" } as NodeJS.ProcessEnv,
+          "/home/test",
+        )
+        expect(resolved).toBeNull()
+      },
+      TEST_TIMEOUT_MS,
+    )
 
-    it("prefers LOG_DEBUG_PATH when provided", async () => {
-      const customPath = path.join(os.tmpdir(), "freshell-debug.jsonl")
-      const { resolveDebugLogPath } = await import("../../../server/logger")
-      const resolved = resolveDebugLogPath({ LOG_DEBUG_PATH: customPath } as NodeJS.ProcessEnv, "/home/test")
-      expect(resolved).toBe(path.resolve(customPath))
-    })
+    it(
+      "prefers LOG_DEBUG_PATH when provided",
+      async () => {
+        const customPath = path.join(os.tmpdir(), "freshell-debug.jsonl")
+        const { resolveDebugLogPath } = await import("../../../server/logger")
+        const resolved = resolveDebugLogPath({ LOG_DEBUG_PATH: customPath } as NodeJS.ProcessEnv, "/home/test")
+        expect(resolved).toBe(path.resolve(customPath))
+      },
+      TEST_TIMEOUT_MS,
+    )
 
-    it("uses FRESHELL_LOG_DIR when set", async () => {
-      const logDir = path.join(os.tmpdir(), "freshell-logs")
-      const { resolveDebugLogPath } = await import("../../../server/logger")
-      const resolved = resolveDebugLogPath(
-        { FRESHELL_LOG_DIR: logDir, NODE_ENV: "development" } as NodeJS.ProcessEnv,
-        "/home/test",
-      )
-      expect(resolved).toBe(path.join(path.resolve(logDir), "server-debug.jsonl"))
-    })
+    it(
+      "uses FRESHELL_LOG_DIR when set",
+      async () => {
+        const logDir = path.join(os.tmpdir(), "freshell-logs")
+        const { resolveDebugLogPath } = await import("../../../server/logger")
+        const resolved = resolveDebugLogPath(
+          { FRESHELL_LOG_DIR: logDir, NODE_ENV: "development" } as NodeJS.ProcessEnv,
+          "/home/test",
+        )
+        expect(resolved).toBe(path.join(path.resolve(logDir), "server-debug.jsonl"))
+      },
+      TEST_TIMEOUT_MS,
+    )
 
-    it("skips default path in test env without explicit override", async () => {
-      const { resolveDebugLogPath } = await import("../../../server/logger")
-      const resolved = resolveDebugLogPath({ NODE_ENV: "test" } as NodeJS.ProcessEnv, "/home/test")
-      expect(resolved).toBeNull()
-    })
+    it(
+      "skips default path in test env without explicit override",
+      async () => {
+        const { resolveDebugLogPath } = await import("../../../server/logger")
+        const resolved = resolveDebugLogPath({ NODE_ENV: "test" } as NodeJS.ProcessEnv, "/home/test")
+        expect(resolved).toBeNull()
+      },
+      TEST_TIMEOUT_MS,
+    )
   })
 
   describe("debug log file stream", () => {
     it(
       "writes log entries to the debug file",
       async () => {
-      const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "freshell-logs-"))
-      const filePath = path.join(tempDir, "server-debug.jsonl")
-      const { createDebugFileStream } = await import("../../../server/logger")
-      const stream = createDebugFileStream(filePath, { size: "1K", maxFiles: 2 })
+        const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "freshell-logs-"))
+        const filePath = path.join(tempDir, "server-debug.jsonl")
+        const { createDebugFileStream } = await import("../../../server/logger")
+        const stream = createDebugFileStream(filePath, { size: "1K", maxFiles: 2 })
 
-      stream.write("{\"event\":\"test\"}\n")
-      await new Promise<void>((resolve) => stream.end(resolve))
+        stream.write("{\"event\":\"test\"}\n")
+        await new Promise<void>((resolve) => stream.end(resolve))
 
-      const content = await fsp.readFile(filePath, "utf-8")
-      expect(content).toContain("\"event\":\"test\"")
+        const content = await fsp.readFile(filePath, "utf-8")
+        expect(content).toContain("\"event\":\"test\"")
 
-      await fsp.rm(tempDir, { recursive: true, force: true })
+        await fsp.rm(tempDir, { recursive: true, force: true })
       },
       TEST_TIMEOUT_MS,
     )

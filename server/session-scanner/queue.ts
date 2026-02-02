@@ -325,4 +325,11 @@ export class SessionRepairQueue extends EventEmitter {
   isProcessing(sessionId: string): boolean {
     return this.processing.has(sessionId)
   }
+
+  /**
+   * Get the last processed result for a session, if any.
+   */
+  getResult(sessionId: string): SessionScanResult | undefined {
+    return this.processed.get(sessionId)
+  }
 }

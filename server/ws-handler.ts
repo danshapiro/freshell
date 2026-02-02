@@ -634,20 +634,31 @@ export class WsHandler {
             state.createdByRequestId.delete(m.requestId)
           }
 
-          // Wait for session repair before resuming Claude
+          // Kick off session repair without blocking terminal creation.
           let effectiveResumeSessionId = m.resumeSessionId
           if (m.mode === 'claude' && m.resumeSessionId && this.sessionRepairService) {
-            try {
-              const result = await this.sessionRepairService.waitForSession(m.resumeSessionId, 10000)
-              if (result.status === 'missing') {
-                // Session file doesn't exist - don't try to resume
-                log.info({ sessionId: m.resumeSessionId, connectionId: ws.connectionId }, 'Session file missing, starting fresh')
-                effectiveResumeSessionId = undefined
-              }
-              // For 'healthy', 'corrupted' (which is now repaired), we proceed with resume
-            } catch (err) {
-              // Timeout or not in queue - proceed anyway, Claude will handle missing session
-              log.debug({ err, sessionId: m.resumeSessionId, connectionId: ws.connectionId }, 'Session repair wait failed, proceeding')
+            const sessionId = m.resumeSessionId
+            const cached = this.sessionRepairService.getResult(sessionId)
+            if (cached?.status === 'missing') {
+              log.info({ sessionId, connectionId: ws.connectionId }, 'Session previously marked missing; resume will start fresh')
+              effectiveResumeSessionId = undefined
+            } else {
+              const endRepairTimer = startPerfTimer(
+                'terminal_create_repair_wait',
+                { connectionId: ws.connectionId, sessionId },
+                { minDurationMs: perfConfig.slowTerminalCreateMs, level: 'warn' },
+              )
+              void this.sessionRepairService.waitForSession(sessionId, 10000)
+                .then((result) => {
+                  endRepairTimer({ status: result.status })
+                  if (result.status === 'missing') {
+                    log.info({ sessionId, connectionId: ws.connectionId }, 'Session file missing; resume may start fresh')
+                  }
+                })
+                .catch((err) => {
+                  endRepairTimer({ error: err instanceof Error ? err.message : String(err) })
+                  log.debug({ err, sessionId, connectionId: ws.connectionId }, 'Session repair wait failed, proceeding')
+                })
             }
           }
 
