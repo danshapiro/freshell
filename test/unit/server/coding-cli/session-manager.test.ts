@@ -50,7 +50,6 @@ function makeStreamingProvider(): CodingCliProvider {
         sessionId: 'provider-session',
         provider: 'codex',
         sequenceNumber: Number(line),
-        raw: { line },
         message: { role: 'assistant', content: line },
       },
     ],
