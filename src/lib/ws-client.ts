@@ -110,6 +110,13 @@ export class WsClient {
       }
 
       this.ws.onmessage = (event) => {
+        let payloadBytes: number | undefined
+        if (perfConfig.enabled) {
+          if (typeof event.data === 'string') payloadBytes = event.data.length
+          else if (event.data instanceof Blob) payloadBytes = event.data.size
+          else if (event.data instanceof ArrayBuffer) payloadBytes = event.data.byteLength
+        }
+
         let msg: any
         try {
           msg = JSON.parse(event.data)
@@ -167,6 +174,8 @@ export class WsClient {
             logClientPerf('perf.ws_message_handlers_slow', {
               durationMs: Number(durationMs.toFixed(2)),
               messageType: msg?.type,
+              payloadBytes,
+              handlerCount: this.messageHandlers.size,
             }, 'warn')
           }
         } else {

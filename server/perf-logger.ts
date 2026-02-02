@@ -6,6 +6,7 @@ export type PerfConfig = {
   httpSlowMs: number
   wsSlowMs: number
   wsBackpressureBytes: number
+  wsPayloadWarnBytes: number
   terminalSampleMs: number
   processSampleMs: number
   eventLoopResolutionMs: number
@@ -34,6 +35,7 @@ export function resolvePerfConfig(env: NodeJS.ProcessEnv = process.env): PerfCon
     httpSlowMs: readNumber(env, 'PERF_HTTP_SLOW_MS', 500),
     wsSlowMs: readNumber(env, 'PERF_WS_SLOW_MS', 50),
     wsBackpressureBytes: readNumber(env, 'PERF_WS_BACKPRESSURE_BYTES', 2 * 1024 * 1024),
+    wsPayloadWarnBytes: readNumber(env, 'PERF_WS_PAYLOAD_WARN_BYTES', 50 * 1024),
     terminalSampleMs: readNumber(env, 'PERF_TERMINAL_SAMPLE_MS', 5000),
     processSampleMs: readNumber(env, 'PERF_PROCESS_SAMPLE_MS', 10000),
     eventLoopResolutionMs: readNumber(env, 'PERF_EVENT_LOOP_RESOLUTION_MS', 20),

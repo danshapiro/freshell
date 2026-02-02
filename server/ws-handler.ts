@@ -432,7 +432,54 @@ export class WsHandler {
         ws.close(CLOSE_CODES.BACKPRESSURE, 'Backpressure')
         return
       }
-      ws.send(JSON.stringify(msg))
+      let serialized = ''
+      let payloadBytes: number | undefined
+      let messageType: string | undefined
+      let serializeMs: number | undefined
+      let shouldLogSend = false
+
+      if (perfConfig.enabled) {
+        if (msg && typeof msg === 'object' && 'type' in msg) {
+          const typeValue = (msg as { type?: unknown }).type
+          if (typeof typeValue === 'string') messageType = typeValue
+        }
+
+        const serializeStart = process.hrtime.bigint()
+        serialized = JSON.stringify(msg)
+        const serializeEnd = process.hrtime.bigint()
+        payloadBytes = Buffer.byteLength(serialized)
+
+        if (payloadBytes >= perfConfig.wsPayloadWarnBytes) {
+          shouldLogSend = shouldLog(
+            `ws_send_large_${ws.connectionId || 'unknown'}_${messageType || 'unknown'}`,
+            perfConfig.rateLimitMs,
+          )
+          if (shouldLogSend) {
+            serializeMs = Number((Number(serializeEnd - serializeStart) / 1e6).toFixed(2))
+          }
+        }
+      } else {
+        serialized = JSON.stringify(msg)
+      }
+
+      const sendStart = shouldLogSend ? process.hrtime.bigint() : null
+      ws.send(serialized, (err) => {
+        if (!shouldLogSend) return
+        const sendMs = sendStart ? Number((Number(process.hrtime.bigint() - sendStart) / 1e6).toFixed(2)) : undefined
+        logPerfEvent(
+          'ws_send_large',
+          {
+            connectionId: ws.connectionId,
+            messageType,
+            payloadBytes,
+            bufferedBytes: buffered,
+            serializeMs,
+            sendMs,
+            error: !!err,
+          },
+          'warn',
+        )
+      })
     } catch {
       // ignore
     }

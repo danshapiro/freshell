@@ -7,6 +7,10 @@ type ClientPerfConfig = {
   wsQueueWarnSize: number
   memorySampleMs: number
   rateLimitMs: number
+  frameLongMs: number
+  apiSlowMs: number
+  apiParseSlowMs: number
+  reduxActionSlowMs: number
 }
 
 function parseBoolean(value: string | undefined): boolean {
@@ -31,6 +35,10 @@ export function resolveClientPerfConfig(flag?: string): ClientPerfConfig {
     wsQueueWarnSize: readNumber(undefined, 200),
     memorySampleMs: readNumber(undefined, 10000),
     rateLimitMs: readNumber(undefined, 5000),
+    frameLongMs: readNumber(undefined, 200),
+    apiSlowMs: readNumber(undefined, 1000),
+    apiParseSlowMs: readNumber(undefined, 25),
+    reduxActionSlowMs: readNumber(undefined, 32),
   }
 }
 
@@ -41,6 +49,11 @@ const perfConfig = resolveClientPerfConfig(perfFlag)
 const lastLogByKey = new Map<string, number>()
 let perfInitialized = false
 let memoryTimer: number | null = null
+let inputTrackingInstalled = false
+let frameObserverInitialized = false
+let lastUserInputAt: number | null = null
+let lastLongTaskAt: number | null = null
+let longTaskSinceGapLog = 0
 
 export function getClientPerfConfig(): ClientPerfConfig {
   return perfConfig
@@ -81,6 +94,68 @@ function shouldLog(key: string, intervalMs: number): boolean {
   return true
 }
 
+function toFixedMs(value: number): number {
+  return Number(value.toFixed(2))
+}
+
+function safeDuration(start: number, end: number): number | undefined {
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return undefined
+  const delta = end - start
+  if (delta < 0) return undefined
+  return toFixedMs(delta)
+}
+
+function installUserInputTracking() {
+  if (inputTrackingInstalled || typeof window === 'undefined') return
+  inputTrackingInstalled = true
+  const updateLastInput = () => {
+    if (typeof performance !== 'undefined') {
+      lastUserInputAt = performance.now()
+    } else {
+      lastUserInputAt = Date.now()
+    }
+  }
+  window.addEventListener('pointerdown', updateLastInput, { capture: true, passive: true })
+  window.addEventListener('keydown', updateLastInput, { capture: true, passive: true })
+}
+
+function observeFrameGaps() {
+  if (frameObserverInitialized || typeof performance === 'undefined') return
+  frameObserverInitialized = true
+  let lastFrame = performance.now()
+
+  const tick = (now: number) => {
+    if (document.visibilityState !== 'visible') {
+      lastFrame = now
+      requestAnimationFrame(tick)
+      return
+    }
+
+    const gapMs = now - lastFrame
+    if (gapMs >= perfConfig.frameLongMs && shouldLog('perf.frame_gap', perfConfig.rateLimitMs)) {
+      const sinceInputMs = lastUserInputAt !== null ? toFixedMs(now - lastUserInputAt) : undefined
+      const sinceLongTaskMs = lastLongTaskAt !== null ? toFixedMs(now - lastLongTaskAt) : undefined
+      logClientPerf(
+        'perf.frame_gap',
+        {
+          gapMs: toFixedMs(gapMs),
+          sinceLastInputMs: sinceInputMs,
+          sinceLastLongTaskMs: sinceLongTaskMs,
+          longTasksSinceLastGap: longTaskSinceGapLog,
+          visibilityState: document.visibilityState,
+        },
+        'warn',
+      )
+      longTaskSinceGapLog = 0
+    }
+
+    lastFrame = now
+    requestAnimationFrame(tick)
+  }
+
+  requestAnimationFrame(tick)
+}
+
 export function logClientPerf(
   event: string,
   context: Record<string, unknown> = {},
@@ -117,10 +192,27 @@ function observeLongTasks() {
     const observer = new PerformanceObserver((list) => {
       for (const entry of list.getEntries()) {
         if (entry.duration < perfConfig.longTaskThresholdMs) continue
+        lastLongTaskAt = typeof performance !== 'undefined' ? performance.now() : Date.now()
+        longTaskSinceGapLog += 1
+        const anyEntry = entry as any
+        const attribution = Array.isArray(anyEntry.attribution)
+          ? anyEntry.attribution.slice(0, 3).map((item: any) => ({
+            name: item?.name,
+            entryType: item?.entryType,
+            containerType: item?.containerType,
+            containerId: item?.containerId,
+            containerName: item?.containerName,
+            scriptURL: item?.scriptURL,
+            lineNumber: item?.lineNumber,
+            columnNumber: item?.columnNumber,
+          }))
+          : undefined
         logClientPerf('perf.longtask', {
           name: entry.name,
-          startTime: Number(entry.startTime.toFixed(2)),
-          durationMs: Number(entry.duration.toFixed(2)),
+          startTime: toFixedMs(entry.startTime),
+          durationMs: toFixedMs(entry.duration),
+          attributionCount: Array.isArray(anyEntry.attribution) ? anyEntry.attribution.length : undefined,
+          attribution,
         }, 'warn')
       }
     })
@@ -136,10 +228,32 @@ function observeResources() {
     const observer = new PerformanceObserver((list) => {
       for (const entry of list.getEntries() as PerformanceResourceTiming[]) {
         if (entry.duration < perfConfig.resourceSlowMs) continue
+        const queueMs = safeDuration(entry.startTime, entry.requestStart)
+        const ttfbMs = safeDuration(entry.requestStart, entry.responseStart)
+        const downloadMs = safeDuration(entry.responseStart, entry.responseEnd)
+        const dnsMs = safeDuration(entry.domainLookupStart, entry.domainLookupEnd)
+        const connectMs = safeDuration(entry.connectStart, entry.connectEnd)
+        const tlsMs = entry.secureConnectionStart
+          ? safeDuration(entry.secureConnectionStart, entry.connectEnd)
+          : undefined
+        const responseStatus = (entry as any).responseStatus as number | undefined
         logClientPerf('perf.resource_slow', {
           name: entry.name,
           initiatorType: entry.initiatorType,
-          durationMs: Number(entry.duration.toFixed(2)),
+          durationMs: toFixedMs(entry.duration),
+          startTime: toFixedMs(entry.startTime),
+          fetchStart: toFixedMs(entry.fetchStart),
+          requestStart: toFixedMs(entry.requestStart),
+          responseStart: toFixedMs(entry.responseStart),
+          responseEnd: toFixedMs(entry.responseEnd),
+          queueMs,
+          dnsMs,
+          connectMs,
+          tlsMs,
+          ttfbMs,
+          downloadMs,
+          nextHopProtocol: entry.nextHopProtocol || undefined,
+          responseStatus: typeof responseStatus === 'number' && responseStatus > 0 ? responseStatus : undefined,
           transferSize: entry.transferSize,
           encodedBodySize: entry.encodedBodySize,
           decodedBodySize: entry.decodedBodySize,
@@ -195,6 +309,8 @@ export function initClientPerfLogging(): void {
 
   logClientPerf('perf_logging_enabled', { config: perfConfig })
 
+  installUserInputTracking()
+
   if (document.readyState === 'complete') {
     logNavigationTiming()
   } else {
@@ -204,5 +320,6 @@ export function initClientPerfLogging(): void {
   observeLongTasks()
   observeResources()
   observePaint()
+  observeFrameGaps()
   startMemorySampling()
 }

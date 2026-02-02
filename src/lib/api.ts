@@ -1,4 +1,5 @@
 import type { CodingCliProviderName } from './coding-cli-types'
+import { getClientPerfConfig, isClientPerfLoggingEnabled, logClientPerf } from '@/lib/perf-logger'
 
 export type ApiError = {
   status: number
@@ -11,6 +12,10 @@ function getAuthToken(): string | undefined {
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const perfEnabled = isClientPerfLoggingEnabled() && typeof performance !== 'undefined'
+  const perfConfig = getClientPerfConfig()
+  const startAt = perfEnabled ? performance.now() : 0
+
   const headers = new Headers(options.headers || {})
   if (!headers.has('Content-Type') && options.body) {
     headers.set('Content-Type', 'application/json')
@@ -22,13 +27,64 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   }
 
   const res = await fetch(path, { ...options, headers })
+  const headersAt = perfEnabled ? performance.now() : 0
   const text = await res.text()
+  const bodyAt = perfEnabled ? performance.now() : 0
 
   let data: any = null
-  try {
-    data = text ? JSON.parse(text) : null
-  } catch {
-    data = text
+  let parseMs: number | undefined
+  if (text) {
+    const parseStart = perfEnabled ? performance.now() : 0
+    try {
+      data = JSON.parse(text)
+    } catch {
+      data = text
+    } finally {
+      if (perfEnabled) {
+        parseMs = performance.now() - parseStart
+      }
+    }
+  } else {
+    data = null
+  }
+
+  if (perfEnabled) {
+    const totalMs = bodyAt - startAt
+    const ttfbMs = headersAt - startAt
+    const bodyMs = bodyAt - headersAt
+    const payloadChars = text.length
+    const method = options.method || 'GET'
+
+    if (totalMs >= perfConfig.apiSlowMs) {
+      logClientPerf(
+        'perf.api_slow',
+        {
+          path,
+          method,
+          status: res.status,
+          durationMs: Number(totalMs.toFixed(2)),
+          ttfbMs: Number(ttfbMs.toFixed(2)),
+          bodyMs: Number(bodyMs.toFixed(2)),
+          parseMs: parseMs !== undefined ? Number(parseMs.toFixed(2)) : undefined,
+          payloadChars,
+        },
+        'warn',
+      )
+    }
+
+    if (parseMs !== undefined && parseMs >= perfConfig.apiParseSlowMs) {
+      logClientPerf(
+        'perf.api_parse_slow',
+        {
+          path,
+          method,
+          status: res.status,
+          parseMs: Number(parseMs.toFixed(2)),
+          payloadChars,
+        },
+        'warn',
+      )
+    }
   }
 
   if (!res.ok) {

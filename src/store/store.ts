@@ -10,6 +10,7 @@ import codingCliReducer from './codingCliSlice'
 import panesReducer from './panesSlice'
 import sessionActivityReducer from './sessionActivitySlice'
 import terminalActivityReducer from './terminalActivitySlice'
+import { perfMiddleware } from './perfMiddleware'
 import { persistMiddleware } from './persistMiddleware'
 import { sessionActivityPersistMiddleware } from './sessionActivityPersistence'
 
@@ -29,7 +30,7 @@ export const store = configureStore({
       serializableCheck: {
         ignoredPaths: ['sessions.expandedProjects'],
       },
-    }).concat(persistMiddleware, sessionActivityPersistMiddleware),
+    }).concat(perfMiddleware, persistMiddleware, sessionActivityPersistMiddleware),
 })
 
 // Note: Tabs and Panes are now loaded from localStorage directly in their slice
