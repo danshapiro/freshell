@@ -619,3 +619,269 @@ describe('App Bootstrap', () => {
     expect(settingsCalls.length).toBe(1)
   })
 })
+
+describe('Tab Switching Keyboard Shortcuts', () => {
+  const originalSessionStorage = global.sessionStorage
+
+  function createStoreWithTabs(tabCount: number, activeIndex: number = 0) {
+    const tabs = Array.from({ length: tabCount }, (_, i) => ({
+      id: `tab-${i + 1}`,
+      createRequestId: `req-${i + 1}`,
+      title: `Tab ${i + 1}`,
+      mode: 'shell' as const,
+      shell: 'system' as const,
+      status: 'running' as const,
+      createdAt: Date.now(),
+    }))
+    return configureStore({
+      reducer: {
+        settings: settingsReducer,
+        tabs: tabsReducer,
+        connection: connectionReducer,
+        sessions: sessionsReducer,
+        panes: panesReducer,
+      },
+      middleware: (getDefault) =>
+        getDefault({
+          serializableCheck: {
+            ignoredPaths: ['sessions.expandedProjects'],
+          },
+        }),
+      preloadedState: {
+        settings: {
+          settings: defaultSettings,
+          loaded: true,
+          lastSavedAt: undefined,
+        },
+        tabs: {
+          tabs,
+          activeTabId: tabs[activeIndex]?.id || null,
+        },
+        sessions: {
+          projects: [],
+          expandedProjects: new Set<string>(),
+          isLoading: false,
+          error: null,
+        },
+        connection: {
+          status: 'ready' as const,
+          lastError: undefined,
+        },
+        panes: {
+          layouts: {},
+          activePane: {},
+        },
+      },
+    })
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    const sessionStorageMock: Record<string, string> = {
+      'auth-token': 'test-token',
+    }
+    Object.defineProperty(global, 'sessionStorage', {
+      value: {
+        getItem: vi.fn((key: string) => sessionStorageMock[key] || null),
+        setItem: vi.fn(),
+        removeItem: vi.fn(),
+        clear: vi.fn(),
+      },
+      writable: true,
+    })
+    mockApiGet.mockResolvedValue({})
+  })
+
+  afterEach(() => {
+    cleanup()
+    Object.defineProperty(global, 'sessionStorage', {
+      value: originalSessionStorage,
+      writable: true,
+    })
+  })
+
+  describe('Ctrl+PageDown / Ctrl+PageUp (next/prev tab)', () => {
+    it('Ctrl+PageDown switches to next tab', async () => {
+      const store = createStoreWithTabs(3, 0) // 3 tabs, first active
+      renderApp(store)
+
+      fireEvent.keyDown(window, { key: 'PageDown', ctrlKey: true })
+
+      expect(store.getState().tabs.activeTabId).toBe('tab-2')
+    })
+
+    it('Ctrl+PageUp switches to previous tab', async () => {
+      const store = createStoreWithTabs(3, 1) // 3 tabs, second active
+      renderApp(store)
+
+      fireEvent.keyDown(window, { key: 'PageUp', ctrlKey: true })
+
+      expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    })
+
+    it('Ctrl+PageDown wraps to first tab when on last tab', async () => {
+      const store = createStoreWithTabs(3, 2) // 3 tabs, last active
+      renderApp(store)
+
+      fireEvent.keyDown(window, { key: 'PageDown', ctrlKey: true })
+
+      expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    })
+
+    it('Ctrl+PageUp wraps to last tab when on first tab', async () => {
+      const store = createStoreWithTabs(3, 0) // 3 tabs, first active
+      renderApp(store)
+
+      fireEvent.keyDown(window, { key: 'PageUp', ctrlKey: true })
+
+      expect(store.getState().tabs.activeTabId).toBe('tab-3')
+    })
+
+    it('does nothing with single tab', async () => {
+      const store = createStoreWithTabs(1, 0)
+      renderApp(store)
+
+      fireEvent.keyDown(window, { key: 'PageDown', ctrlKey: true })
+      expect(store.getState().tabs.activeTabId).toBe('tab-1')
+
+      fireEvent.keyDown(window, { key: 'PageUp', ctrlKey: true })
+      expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    })
+  })
+
+  describe('Cmd+Option+Arrow (Mac equivalents)', () => {
+    it('Cmd+Option+Right switches to next tab', async () => {
+      const store = createStoreWithTabs(3, 0)
+      renderApp(store)
+
+      fireEvent.keyDown(window, { key: 'ArrowRight', metaKey: true, altKey: true })
+
+      expect(store.getState().tabs.activeTabId).toBe('tab-2')
+    })
+
+    it('Cmd+Option+Left switches to previous tab', async () => {
+      const store = createStoreWithTabs(3, 1)
+      renderApp(store)
+
+      fireEvent.keyDown(window, { key: 'ArrowLeft', metaKey: true, altKey: true })
+
+      expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    })
+
+    it('Cmd+Option+Right wraps to first tab when on last tab', async () => {
+      const store = createStoreWithTabs(3, 2)
+      renderApp(store)
+
+      fireEvent.keyDown(window, { key: 'ArrowRight', metaKey: true, altKey: true })
+
+      expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    })
+
+    it('Cmd+Option+Left wraps to last tab when on first tab', async () => {
+      const store = createStoreWithTabs(3, 0)
+      renderApp(store)
+
+      fireEvent.keyDown(window, { key: 'ArrowLeft', metaKey: true, altKey: true })
+
+      expect(store.getState().tabs.activeTabId).toBe('tab-3')
+    })
+  })
+
+  describe('Ctrl+B prefix shortcuts (n/p for next/prev)', () => {
+    it('Ctrl+B, n switches to next tab', async () => {
+      const store = createStoreWithTabs(3, 0)
+      renderApp(store)
+
+      // Press Ctrl+B to activate prefix
+      fireEvent.keyDown(window, { key: 'b', ctrlKey: true })
+      // Then press 'n' for next
+      fireEvent.keyDown(window, { key: 'n' })
+
+      expect(store.getState().tabs.activeTabId).toBe('tab-2')
+    })
+
+    it('Ctrl+B, p switches to previous tab', async () => {
+      const store = createStoreWithTabs(3, 1)
+      renderApp(store)
+
+      fireEvent.keyDown(window, { key: 'b', ctrlKey: true })
+      fireEvent.keyDown(window, { key: 'p' })
+
+      expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    })
+
+    it('Ctrl+B, n wraps around', async () => {
+      const store = createStoreWithTabs(3, 2)
+      renderApp(store)
+
+      fireEvent.keyDown(window, { key: 'b', ctrlKey: true })
+      fireEvent.keyDown(window, { key: 'n' })
+
+      expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    })
+
+    it('Ctrl+B, p wraps around', async () => {
+      const store = createStoreWithTabs(3, 0)
+      renderApp(store)
+
+      fireEvent.keyDown(window, { key: 'b', ctrlKey: true })
+      fireEvent.keyDown(window, { key: 'p' })
+
+      expect(store.getState().tabs.activeTabId).toBe('tab-3')
+    })
+  })
+
+  describe('Ctrl+B, 1-9 (direct tab access)', () => {
+    it('Ctrl+B, 1 switches to first tab', async () => {
+      const store = createStoreWithTabs(5, 2)
+      renderApp(store)
+
+      fireEvent.keyDown(window, { key: 'b', ctrlKey: true })
+      fireEvent.keyDown(window, { key: '1' })
+
+      expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    })
+
+    it('Ctrl+B, 5 switches to fifth tab', async () => {
+      const store = createStoreWithTabs(5, 0)
+      renderApp(store)
+
+      fireEvent.keyDown(window, { key: 'b', ctrlKey: true })
+      fireEvent.keyDown(window, { key: '5' })
+
+      expect(store.getState().tabs.activeTabId).toBe('tab-5')
+    })
+
+    it('Ctrl+B, 9 switches to ninth tab when available', async () => {
+      const store = createStoreWithTabs(10, 0)
+      renderApp(store)
+
+      fireEvent.keyDown(window, { key: 'b', ctrlKey: true })
+      fireEvent.keyDown(window, { key: '9' })
+
+      expect(store.getState().tabs.activeTabId).toBe('tab-9')
+    })
+
+    it('does nothing when tab number exceeds available tabs', async () => {
+      const store = createStoreWithTabs(3, 0)
+      renderApp(store)
+
+      fireEvent.keyDown(window, { key: 'b', ctrlKey: true })
+      fireEvent.keyDown(window, { key: '5' })
+
+      // Should stay on tab-1 since tab-5 doesn't exist
+      expect(store.getState().tabs.activeTabId).toBe('tab-1')
+    })
+
+    it('Ctrl+B, 0 does nothing (no tab 0)', async () => {
+      const store = createStoreWithTabs(3, 1)
+      renderApp(store)
+
+      fireEvent.keyDown(window, { key: 'b', ctrlKey: true })
+      fireEvent.keyDown(window, { key: '0' })
+
+      // Should stay on tab-2
+      expect(store.getState().tabs.activeTabId).toBe('tab-2')
+    })
+  })
+})

@@ -3,7 +3,7 @@ import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { setStatus, setError, setPlatform } from '@/store/connectionSlice'
 import { setSettings } from '@/store/settingsSlice'
 import { setProjects } from '@/store/sessionsSlice'
-import { addTab, removeTab } from '@/store/tabsSlice'
+import { addTab, removeTab, setActiveTab } from '@/store/tabsSlice'
 import { api } from '@/lib/api'
 import { buildShareUrl } from '@/lib/utils'
 import { getWsClient } from '@/lib/ws-client'
@@ -261,8 +261,55 @@ export default function App() {
       return false
     }
 
+    function switchToNextTab() {
+      if (tabs.length <= 1) return
+      const currentIndex = tabs.findIndex((t) => t.id === activeTabId)
+      const nextIndex = (currentIndex + 1) % tabs.length
+      dispatch(setActiveTab(tabs[nextIndex].id))
+    }
+
+    function switchToPrevTab() {
+      if (tabs.length <= 1) return
+      const currentIndex = tabs.findIndex((t) => t.id === activeTabId)
+      const prevIndex = (currentIndex - 1 + tabs.length) % tabs.length
+      dispatch(setActiveTab(tabs[prevIndex].id))
+    }
+
+    function switchToTabNumber(num: number) {
+      if (num < 1 || num > tabs.length) return
+      dispatch(setActiveTab(tabs[num - 1].id))
+    }
+
     function onKeyDown(e: KeyboardEvent) {
       if (isTextInput(e.target)) return
+
+      // Ctrl+PageDown / Ctrl+PageUp for tab switching (VS Code / Chrome style)
+      if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) {
+        if (e.key === 'PageDown') {
+          e.preventDefault()
+          switchToNextTab()
+          return
+        }
+        if (e.key === 'PageUp') {
+          e.preventDefault()
+          switchToPrevTab()
+          return
+        }
+      }
+
+      // Cmd+Option+Arrow for Mac (metaKey + altKey)
+      if (e.metaKey && e.altKey && !e.ctrlKey && !e.shiftKey) {
+        if (e.key === 'ArrowRight') {
+          e.preventDefault()
+          switchToNextTab()
+          return
+        }
+        if (e.key === 'ArrowLeft') {
+          e.preventDefault()
+          switchToPrevTab()
+          return
+        }
+      }
 
       if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === 'b' || e.key === 'B')) {
         e.preventDefault()
@@ -296,6 +343,15 @@ export default function App() {
       } else if (key === 'b') {
         e.preventDefault()
         toggleSidebarCollapse()
+      } else if (key === 'n') {
+        e.preventDefault()
+        switchToNextTab()
+      } else if (key === 'p') {
+        e.preventDefault()
+        switchToPrevTab()
+      } else if (key >= '1' && key <= '9') {
+        e.preventDefault()
+        switchToTabNumber(parseInt(key, 10))
       }
     }
 
@@ -304,7 +360,7 @@ export default function App() {
       window.removeEventListener('keydown', onKeyDown)
       if (prefixTimeoutRef.current) window.clearTimeout(prefixTimeoutRef.current)
     }
-  }, [dispatch, activeTabId])
+  }, [dispatch, activeTabId, tabs])
 
   // Ensure at least one tab exists for first-time users.
   useEffect(() => {
