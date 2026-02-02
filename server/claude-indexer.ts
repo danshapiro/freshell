@@ -2,6 +2,7 @@ import path from 'path'
 import os from 'os'
 import fsp from 'fs/promises'
 import fs from 'fs'
+import { createInterface } from 'readline'
 import chokidar from 'chokidar'
 import { logger } from './logger.js'
 import { getPerfConfig, startPerfTimer } from './perf-logger.js'
@@ -105,6 +106,18 @@ export type JsonlMeta = {
   createdAt?: number
 }
 
+type JsonlMetaAccumulator = {
+  cwd?: string
+  title?: string
+  summary?: string
+  messageCount: number
+  createdAt?: number
+}
+
+type JsonlMetaReadOptions = {
+  maxBytes?: number
+}
+
 function parseTimestamp(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value
@@ -126,92 +139,118 @@ function parseTimestamp(value: unknown): number | undefined {
   return undefined
 }
 
-/** Parse session metadata from jsonl content (pure function for testing) */
-export function parseSessionContent(content: string): JsonlMeta {
-  const lines = content.split(/\r?\n/).filter(Boolean)
-  let cwd: string | undefined
-  let title: string | undefined
-  let summary: string | undefined
-  let createdAt: number | undefined
+function createMetaAccumulator(): JsonlMetaAccumulator {
+  return { messageCount: 0 }
+}
 
-  for (const line of lines) {
-    let obj: any
-    try {
-      obj = JSON.parse(line)
-    } catch {
-      continue
-    }
-
-    const candidates = [
-      obj?.cwd,
-      obj?.context?.cwd,
-      obj?.payload?.cwd,
-      obj?.data?.cwd,
-      obj?.message?.cwd,
-    ].filter((v: any) => typeof v === 'string') as string[]
-    if (!cwd) {
-      const found = candidates.find((v) => looksLikePath(v))
-      if (found) cwd = found
-    }
-
-    if (!title) {
-      const t =
-        obj?.title ||
-        obj?.sessionTitle ||
-        (obj?.role === 'user' && typeof obj?.content === 'string' ? obj.content : undefined) ||
-        (obj?.message?.role === 'user' && typeof obj?.message?.content === 'string'
-          ? obj.message.content
-          : undefined)
-
-      if (typeof t === 'string' && t.trim()) {
-        // Store up to 200 chars - UI truncates visually, tooltip shows full text
-        title = extractTitleFromMessage(t, 200)
-      }
-    }
-
-    if (!summary) {
-      const s = obj?.summary || obj?.sessionSummary
-      if (typeof s === 'string' && s.trim()) summary = s.trim().slice(0, 240)
-    }
-
-    if (createdAt === undefined) {
-      const candidate = parseTimestamp(obj?.timestamp || obj?.created_at || obj?.createdAt)
-      if (candidate !== undefined) {
-        createdAt = candidate
-      }
-    } else {
-      const candidate = parseTimestamp(obj?.timestamp || obj?.created_at || obj?.createdAt)
-      if (candidate !== undefined && candidate < createdAt) {
-        createdAt = candidate
-      }
-    }
-
-    if (cwd && title && summary && createdAt !== undefined) break
+function applyJsonlLine(meta: JsonlMetaAccumulator, line: string): void {
+  let obj: any
+  try {
+    obj = JSON.parse(line)
+  } catch {
+    return
   }
 
-  return {
-    cwd,
-    title,
-    summary,
-    messageCount: lines.length,
-    createdAt,
+  const candidates = [
+    obj?.cwd,
+    obj?.context?.cwd,
+    obj?.payload?.cwd,
+    obj?.data?.cwd,
+    obj?.message?.cwd,
+  ].filter((v: any) => typeof v === 'string') as string[]
+  if (!meta.cwd) {
+    const found = candidates.find((v) => looksLikePath(v))
+    if (found) meta.cwd = found
+  }
+
+  if (!meta.title) {
+    const t =
+      obj?.title ||
+      obj?.sessionTitle ||
+      (obj?.role === 'user' && typeof obj?.content === 'string' ? obj.content : undefined) ||
+      (obj?.message?.role === 'user' && typeof obj?.message?.content === 'string'
+        ? obj.message.content
+        : undefined)
+
+    if (typeof t === 'string' && t.trim()) {
+      // Store up to 200 chars - UI truncates visually, tooltip shows full text
+      meta.title = extractTitleFromMessage(t, 200)
+    }
+  }
+
+  if (!meta.summary) {
+    const s = obj?.summary || obj?.sessionSummary
+    if (typeof s === 'string' && s.trim()) meta.summary = s.trim().slice(0, 240)
+  }
+
+  const candidate = parseTimestamp(obj?.timestamp || obj?.created_at || obj?.createdAt)
+  if (candidate !== undefined) {
+    if (meta.createdAt === undefined || candidate < meta.createdAt) {
+      meta.createdAt = candidate
+    }
   }
 }
 
-export async function parseSessionJsonlMeta(filePath: string): Promise<JsonlMeta> {
-  try {
-    const stream = fs.createReadStream(filePath, { encoding: 'utf-8', highWaterMark: 256 * 1024 })
-    let data = ''
-    for await (const chunk of stream) {
-      data += chunk
-      if (data.length >= 256 * 1024) break
-    }
-    stream.close()
+function isMetaComplete(meta: JsonlMetaAccumulator): boolean {
+  return Boolean(meta.cwd && meta.title && meta.summary && meta.createdAt !== undefined)
+}
 
-    return parseSessionContent(data)
+function toJsonlMeta(meta: JsonlMetaAccumulator): JsonlMeta {
+  return {
+    cwd: meta.cwd,
+    title: meta.title,
+    summary: meta.summary,
+    messageCount: meta.messageCount,
+    createdAt: meta.createdAt,
+  }
+}
+
+/** Parse session metadata from jsonl content (pure function for testing) */
+export function parseSessionContent(content: string): JsonlMeta {
+  const lines = content.split(/\r?\n/).filter(Boolean)
+  const meta = createMetaAccumulator()
+
+  for (const line of lines) {
+    meta.messageCount += 1
+    applyJsonlLine(meta, line)
+    if (isMetaComplete(meta)) break
+  }
+
+  return toJsonlMeta(meta)
+}
+
+export async function parseSessionJsonlMeta(
+  filePath: string,
+  options: JsonlMetaReadOptions = {},
+): Promise<JsonlMeta> {
+  const maxBytes = options.maxBytes && options.maxBytes > 0 ? options.maxBytes : 256 * 1024
+  const meta = createMetaAccumulator()
+  let bytesRead = 0
+  let stream: fs.ReadStream | null = null
+  let reader: ReturnType<typeof createInterface> | null = null
+
+  try {
+    stream = fs.createReadStream(filePath, {
+      encoding: 'utf-8',
+      highWaterMark: Math.min(maxBytes, 64 * 1024),
+    })
+    reader = createInterface({ input: stream, crlfDelay: Infinity })
+
+    for await (const line of reader) {
+      if (!line) continue
+      meta.messageCount += 1
+      bytesRead += Buffer.byteLength(line, 'utf8') + 1
+      applyJsonlLine(meta, line)
+      if (bytesRead >= maxBytes || isMetaComplete(meta)) break
+    }
   } catch {
     return {}
+  } finally {
+    reader?.close()
+    stream?.destroy()
   }
+
+  return toJsonlMeta(meta)
 }
 
 function deriveCreatedAt(stat: fs.Stats): number {
