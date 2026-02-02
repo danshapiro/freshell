@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import fs from 'fs'
 import fsp from 'fs/promises'
 import path from 'path'
 import os from 'os'
@@ -338,9 +339,9 @@ describe('searchSessionFile()', () => {
   })
 
   it('returns null for non-existent file', async () => {
-    const result = await searchSessionFile(claudeProvider, '/nonexistent/file.jsonl', 'test', 'fullText')
-
-    expect(result).toBeNull()
+    await expect(
+      searchSessionFile(claudeProvider, '/nonexistent/file.jsonl', 'test', 'fullText')
+    ).rejects.toThrow()
   })
 
   it('is case-insensitive', async () => {
@@ -519,5 +520,127 @@ describe('searchSessions() orchestrator', () => {
     expect(response.results).toHaveLength(1)
     expect(response.results[0].sessionId).toBe('session-2')
     expect(response.results[0].matchedIn).toBe('assistantMessage')
+  })
+
+  it('marks results partial when maxFiles budget is exceeded', async () => {
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/test-project',
+        sessions: [
+          {
+            provider: 'claude',
+            sessionId: 'session-1',
+            projectPath: '/test-project',
+            updatedAt: 1000,
+            title: 'Login',
+            cwd: '/project',
+            sourceFile: path.join(projectDir, 'session-1.jsonl'),
+          },
+          {
+            provider: 'claude',
+            sessionId: 'session-2',
+            projectPath: '/test-project',
+            updatedAt: 2000,
+            title: 'Hello',
+            cwd: '/project',
+            sourceFile: path.join(projectDir, 'session-2.jsonl'),
+          },
+        ],
+      },
+    ]
+
+    const response = await searchSessions({
+      projects,
+      providers: [claudeProvider],
+      query: 'authentication',
+      tier: 'fullText',
+      maxFiles: 1,
+    })
+
+    expect(response.results).toHaveLength(0)
+    expect(response.totalScanned).toBe(1)
+    expect(response.partial).toBe(true)
+    expect(response.partialReason).toBe('budget')
+  })
+
+  it('marks results partial when a session file is missing', async () => {
+    const missingFile = path.join(projectDir, 'missing.jsonl')
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/test-project',
+        sessions: [
+          {
+            provider: 'claude',
+            sessionId: 'session-missing',
+            projectPath: '/test-project',
+            updatedAt: 1000,
+            title: 'Missing',
+            cwd: '/project',
+            sourceFile: missingFile,
+          },
+        ],
+      },
+    ]
+
+    const response = await searchSessions({
+      projects,
+      providers: [claudeProvider],
+      query: 'authentication',
+      tier: 'fullText',
+    })
+
+    expect(response.results).toHaveLength(0)
+    expect(response.totalScanned).toBe(1)
+    expect(response.partial).toBe(true)
+    expect(response.partialReason).toBe('io_error')
+  })
+
+  it('marks results partial when stream read fails', async () => {
+    const filePath = path.join(projectDir, 'session-error.jsonl')
+    await fsp.writeFile(
+      filePath,
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Fix login bug"}]},"cwd":"/project"}\n'
+    )
+
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/test-project',
+        sessions: [
+          {
+            provider: 'claude',
+            sessionId: 'session-error',
+            projectPath: '/test-project',
+            updatedAt: 1000,
+            title: 'Error',
+            cwd: '/project',
+            sourceFile: filePath,
+          },
+        ],
+      },
+    ]
+
+    const original = fs.promises.open
+    const spy = vi.spyOn(fs.promises, 'open').mockImplementation(((path, flags) => {
+      if (path === filePath) {
+        throw new Error('open failure')
+      }
+      return original(path as any, flags as any)
+    }) as typeof fs.promises.open)
+
+    try {
+      const response = await searchSessions({
+        projects,
+        providers: [claudeProvider],
+        query: 'login',
+        tier: 'fullText',
+      })
+
+      expect(response.results).toHaveLength(0)
+      expect(response.totalScanned).toBe(1)
+      expect(response.partial).toBe(true)
+      expect(response.partialReason).toBe('io_error')
+    } finally {
+      spy.mockRestore()
+    }
   })
 })

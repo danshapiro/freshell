@@ -248,6 +248,7 @@ async function main() {
         query: req.query.q,
         tier: req.query.tier || 'title',
         limit: req.query.limit ? Number(req.query.limit) : undefined,
+        maxFiles: req.query.maxFiles ? Number(req.query.maxFiles) : undefined,
       })
 
       if (!parsed.success) {
@@ -271,6 +272,7 @@ async function main() {
           query: parsed.data.query,
           tier: parsed.data.tier,
           limit: parsed.data.limit,
+          maxFiles: parsed.data.maxFiles,
         })
 
         endSearchTimer({ resultCount: response.results.length, totalScanned: response.totalScanned })

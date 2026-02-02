@@ -46,6 +46,12 @@ describe('Session Search API', () => {
       sessionPath,
       '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Fix login bug"}]},"cwd":"/project"}\n'
     )
+    const sessionPathTwo = path.join(projectDir, 'session-def.jsonl')
+    await fsp.writeFile(
+      sessionPathTwo,
+      '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Hello"}]},"cwd":"/project"}\n' +
+        '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The authentication system works"}]}}'
+    )
 
     mockProjects = [
       {
@@ -59,6 +65,15 @@ describe('Session Search API', () => {
             title: 'Fix login bug',
             cwd: '/project',
             sourceFile: sessionPath,
+          },
+          {
+            provider: 'claude',
+            sessionId: 'session-def',
+            projectPath: '/test-project',
+            updatedAt: 2000,
+            title: 'Hello',
+            cwd: '/project',
+            sourceFile: sessionPathTwo,
           },
         ],
       },
@@ -81,6 +96,7 @@ describe('Session Search API', () => {
           query: req.query.q,
           tier: req.query.tier || 'title',
           limit: req.query.limit ? Number(req.query.limit) : undefined,
+          maxFiles: req.query.maxFiles ? Number(req.query.maxFiles) : undefined,
         })
 
         if (!parsed.success) {
@@ -93,6 +109,7 @@ describe('Session Search API', () => {
           query: parsed.data.query,
           tier: parsed.data.tier,
           limit: parsed.data.limit,
+          maxFiles: parsed.data.maxFiles,
         })
 
         res.json(response)
@@ -151,6 +168,16 @@ describe('Session Search API', () => {
       .set('x-auth-token', TEST_AUTH_TOKEN)
 
     expect(res.status).toBe(200)
+  })
+
+  it('accepts maxFiles parameter and marks partial results', async () => {
+    const res = await request(app)
+      .get('/api/sessions/search?q=authentication&tier=fullText&maxFiles=1')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(res.status).toBe(200)
+    expect(res.body.partial).toBe(true)
+    expect(res.body.partialReason).toBe('budget')
   })
 
   it('rejects invalid tier', async () => {

@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import fs from 'fs'
+import { createInterface } from 'readline'
 import type { CodingCliProvider } from './coding-cli/provider.js'
 import type { CodingCliProviderName, NormalizedEvent, ProjectGroup } from './coding-cli/types.js'
 
@@ -39,6 +40,7 @@ export const SearchRequestSchema = z.object({
   query: z.string().min(1).max(500),
   tier: z.enum(['title', 'userMessages', 'fullText']).default('title'),
   limit: z.number().min(1).max(100).default(50),
+  maxFiles: z.number().min(1).max(100_000).optional(),
 })
 
 export type SearchRequest = z.infer<typeof SearchRequestSchema>
@@ -48,6 +50,8 @@ export const SearchResponseSchema = z.object({
   tier: z.enum(['title', 'userMessages', 'fullText']),
   query: z.string(),
   totalScanned: z.number(),
+  partial: z.boolean().optional(),
+  partialReason: z.enum(['budget', 'io_error']).optional(),
 })
 
 export type SearchResponse = z.infer<typeof SearchResponseSchema>
@@ -194,29 +198,31 @@ export async function searchSessionFile(
 ): Promise<Omit<SearchResult, 'sessionId' | 'projectPath' | 'updatedAt'> | null> {
   const q = query.toLowerCase()
 
-  let content: string
+  let handle: fs.promises.FileHandle | null = null
+  let stream: fs.ReadStream | null = null
+  let reader: ReturnType<typeof createInterface> | null = null
+
   try {
-    content = await fs.promises.readFile(filePath, 'utf-8')
-  } catch {
-    return null
-  }
+    handle = await fs.promises.open(filePath, 'r')
+    stream = handle.createReadStream({ encoding: 'utf-8' })
+    reader = createInterface({ input: stream, crlfDelay: Infinity })
 
-  const lines = content.split(/\r?\n/).filter(Boolean)
+    for await (const line of reader) {
+      if (!line) continue
 
-  for (const line of lines) {
-    let events: NormalizedEvent[] = []
-    try {
-      events = provider.parseEvent(line)
-    } catch {
-      continue
-    }
+      let events: NormalizedEvent[] = []
+      try {
+        events = provider.parseEvent(line)
+      } catch {
+        continue
+      }
 
-    for (const event of events) {
-      if (event.type !== 'message.user' && event.type !== 'message.assistant') continue
-      if (tier === 'userMessages' && event.type !== 'message.user') continue
+      for (const event of events) {
+        if (event.type !== 'message.user' && event.type !== 'message.assistant') continue
+        if (tier === 'userMessages' && event.type !== 'message.user') continue
 
-      const text = event.message?.content
-      if (!text) continue
+        const text = event.message?.content
+        if (!text) continue
 
       if (text.toLowerCase().includes(q)) {
         return {
@@ -225,6 +231,13 @@ export async function searchSessionFile(
           snippet: extractSnippet(text, query),
         }
       }
+    }
+  }
+  } finally {
+    reader?.close()
+    stream?.destroy()
+    if (handle) {
+      await handle.close().catch(() => {})
     }
   }
 
@@ -237,12 +250,13 @@ export interface SearchSessionsOptions {
   query: string
   tier: SearchTierType
   limit?: number
+  maxFiles?: number
 }
 
 export async function searchSessions(
   options: SearchSessionsOptions
 ): Promise<SearchResponse> {
-  const { projects, providers, query, tier, limit = 50 } = options
+  const { projects, providers, query, tier, limit = 50, maxFiles } = options
   const providersByName = new Map<CodingCliProviderName, CodingCliProvider>(
     providers.map((provider) => [provider.name, provider])
   )
@@ -255,15 +269,32 @@ export async function searchSessions(
       tier,
       query,
       totalScanned: projects.reduce((sum, p) => sum + p.sessions.length, 0),
+      partial: false,
     }
   }
 
   // Tier 2 & 3: File-based search
   const results: SearchResult[] = []
   let totalScanned = 0
+  let partial = false
+  let partialReason: 'budget' | 'io_error' | undefined
+  const markIoError = () => {
+    partial = true
+    if (partialReason !== 'budget') {
+      partialReason = 'io_error'
+    }
+  }
 
+  let budgetExceeded = false
   for (const project of projects) {
     for (const session of project.sessions) {
+      if (maxFiles !== undefined && totalScanned >= maxFiles) {
+        partial = true
+        partialReason = 'budget'
+        budgetExceeded = true
+        break
+      }
+
       totalScanned++
 
       const providerName = (session.provider || 'claude') as CodingCliProviderName
@@ -273,16 +304,14 @@ export async function searchSessions(
       const sessionFile = session.sourceFile
       if (!sessionFile) continue
 
-      // Try to access the file
+      const searchTier = tier === SearchTier.UserMessages ? 'userMessages' : 'fullText'
+      let match: Omit<SearchResult, 'sessionId' | 'projectPath' | 'updatedAt'> | null = null
       try {
-        await fs.promises.access(sessionFile)
+        match = await searchSessionFile(provider, sessionFile, query, searchTier)
       } catch {
-        // File not found at expected path - skip
+        markIoError()
         continue
       }
-
-      const searchTier = tier === SearchTier.UserMessages ? 'userMessages' : 'fullText'
-      const match = await searchSessionFile(provider, sessionFile, query, searchTier)
 
       if (match) {
         results.push({
@@ -302,7 +331,7 @@ export async function searchSessions(
         if (results.length >= limit) break
       }
     }
-    if (results.length >= limit) break
+    if (results.length >= limit || budgetExceeded) break
   }
 
   // Sort by updatedAt descending
@@ -313,5 +342,7 @@ export async function searchSessions(
     tier,
     query,
     totalScanned,
+    partial,
+    partialReason,
   }
 }

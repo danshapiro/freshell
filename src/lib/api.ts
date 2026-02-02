@@ -80,18 +80,22 @@ export type SearchResponse = {
   tier: 'title' | 'userMessages' | 'fullText'
   query: string
   totalScanned: number
+  partial?: boolean
+  partialReason?: 'budget' | 'io_error'
 }
 
 export type SearchOptions = {
   query: string
   tier?: 'title' | 'userMessages' | 'fullText'
   limit?: number
+  maxFiles?: number
 }
 
 export async function searchSessions(options: SearchOptions): Promise<SearchResponse> {
-  const { query, tier = 'title', limit } = options
+  const { query, tier = 'title', limit, maxFiles } = options
   const params = new URLSearchParams({ q: query, tier })
   if (limit) params.set('limit', String(limit))
+  if (maxFiles) params.set('maxFiles', String(maxFiles))
 
   return api.get<SearchResponse>(`/api/sessions/search?${params}`)
 }

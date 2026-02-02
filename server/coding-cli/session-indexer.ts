@@ -9,6 +9,9 @@ import type { CodingCliSession, ProjectGroup } from './types.js'
 import { makeSessionKey } from './types.js'
 
 const perfConfig = getPerfConfig()
+const REFRESH_YIELD_EVERY = 200
+
+const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve))
 
 function applyOverride(session: CodingCliSession, ov: SessionOverride | undefined): CodingCliSession | null {
   if (ov?.deleted) return null
@@ -120,6 +123,7 @@ export class CodingCliSessionIndexer {
     const groupsByPath = new Map<string, ProjectGroup>()
     let fileCount = 0
     let sessionCount = 0
+    let processedEntries = 0
     const seenFiles = new Set<string>()
 
     for (const provider of this.providers) {
@@ -134,6 +138,10 @@ export class CodingCliSessionIndexer {
       fileCount += files.length
 
       for (const file of files) {
+        processedEntries += 1
+        if (processedEntries % REFRESH_YIELD_EVERY === 0) {
+          await yieldToEventLoop()
+        }
         seenFiles.add(file)
         let stat: any
         try {
@@ -209,6 +217,10 @@ export class CodingCliSessionIndexer {
     }
 
     for (const cachedFile of this.fileCache.keys()) {
+      processedEntries += 1
+      if (processedEntries % REFRESH_YIELD_EVERY === 0) {
+        await yieldToEventLoop()
+      }
       if (!seenFiles.has(cachedFile)) {
         this.fileCache.delete(cachedFile)
       }
