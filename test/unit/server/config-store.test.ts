@@ -93,6 +93,35 @@ describe('ConfigStore', () => {
       expect(stat.isDirectory()).toBe(true)
     })
 
+    it('cleans up stale config temp files on startup', async () => {
+      await fsp.mkdir(configDir, { recursive: true })
+      const stalePath = path.join(configDir, 'config.json.tmp-123-0')
+      const freshPath = path.join(configDir, 'config.json.tmp-456-0')
+
+      await fsp.writeFile(stalePath, 'stale')
+      await fsp.writeFile(freshPath, 'fresh')
+
+      const oldTime = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+      const recentTime = new Date(Date.now() - 2 * 60 * 1000)
+      await fsp.utimes(stalePath, oldTime, oldTime)
+      await fsp.utimes(freshPath, recentTime, recentTime)
+
+      const store = new ConfigStore()
+      await store.load()
+
+      const staleExists = await fsp
+        .access(stalePath)
+        .then(() => true)
+        .catch(() => false)
+      const freshExists = await fsp
+        .access(freshPath)
+        .then(() => true)
+        .catch(() => false)
+
+      expect(staleExists).toBe(false)
+      expect(freshExists).toBe(true)
+    })
+
     it('parses existing config file', async () => {
       // Create config directory and file
       await fsp.mkdir(configDir, { recursive: true })

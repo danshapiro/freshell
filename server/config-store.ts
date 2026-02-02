@@ -144,6 +144,11 @@ function configPath(): string {
   return path.join(configDir(), 'config.json')
 }
 
+const CONFIG_TMP_PREFIX = 'config.json.tmp-'
+const DEFAULT_CONFIG_TMP_MAX_AGE_MS = 24 * 60 * 60 * 1000
+let cleanupPromise: Promise<void> | null = null
+let cleanupDir: string | null = null
+
 async function ensureDir() {
   await fsp.mkdir(configDir(), { recursive: true })
 }
@@ -172,6 +177,73 @@ async function renameWithRetry(tmpPath: string, filePath: string) {
       await delay(RENAME_RETRY_DELAYS_MS[attempt])
     }
   }
+}
+
+async function cleanupStaleConfigTmpFiles(options: { directory?: string; maxAgeMs?: number } = {}) {
+  const directory = options.directory ?? configDir()
+  const maxAgeMs = options.maxAgeMs ?? DEFAULT_CONFIG_TMP_MAX_AGE_MS
+  let entries: string[]
+  try {
+    entries = await fsp.readdir(directory)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return
+    logger.warn({ event: 'config_tmp_cleanup_error', directory, err }, 'Failed to read config directory for temp cleanup')
+    return
+  }
+
+  const now = Date.now()
+  let removed = 0
+  let failed = 0
+  const errors: Array<{ file: string; code?: string; message: string }> = []
+
+  for (const entry of entries) {
+    if (!entry.startsWith(CONFIG_TMP_PREFIX)) continue
+    const filePath = path.join(directory, entry)
+    try {
+      const stat = await fsp.stat(filePath)
+      if (!stat.isFile()) continue
+      if (now - stat.mtimeMs <= maxAgeMs) continue
+      await fsp.rm(filePath, { force: true })
+      removed += 1
+    } catch (err) {
+      failed += 1
+      if (errors.length < 5) {
+        errors.push({
+          file: entry,
+          code: (err as NodeJS.ErrnoException).code,
+          message: err instanceof Error ? err.message : String(err),
+        })
+      }
+    }
+  }
+
+  if (removed === 0 && failed === 0) return
+
+  const payload = {
+    event: 'config_tmp_cleanup',
+    directory,
+    removed,
+    failed,
+    maxAgeMs,
+    errors: errors.length > 0 ? errors : undefined,
+  }
+
+  if (failed > 0) {
+    logger.warn(payload, 'Config temp cleanup completed with errors')
+    return
+  }
+
+  logger.info(payload, 'Config temp cleanup completed')
+}
+
+function ensureConfigTmpCleanup(): Promise<void> {
+  const directory = configDir()
+  if (cleanupPromise && cleanupDir === directory) return cleanupPromise
+  cleanupDir = directory
+  cleanupPromise = cleanupStaleConfigTmpFiles({ directory }).catch((err) => {
+    logger.warn({ event: 'config_tmp_cleanup_error', directory, err }, 'Config temp cleanup failed')
+  })
+  return cleanupPromise
 }
 
 async function atomicWriteFile(filePath: string, data: string) {
@@ -229,6 +301,7 @@ export class ConfigStore {
 
   async load(): Promise<UserConfig> {
     if (this.cache) return this.cache
+    await ensureConfigTmpCleanup()
     const existing = await readConfigFile()
     if (existing) {
       this.cache = {
