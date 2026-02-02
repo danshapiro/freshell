@@ -67,7 +67,7 @@ export function setPerfLoggingEnabled(enabled: boolean, source?: string): void {
 
   if (enabled) {
     initPerfLogging()
-    perfLogger.info({ event: 'perf_logging_toggled', enabled: true, source }, 'Perf logging toggled')
+    perfLogger.debug({ event: 'perf_logging_toggled', enabled: true, source }, 'Perf logging toggled')
     return
   }
 
@@ -82,7 +82,7 @@ export function setPerfLoggingEnabled(enabled: boolean, source?: string): void {
   lastCpu = null
   lastUptime = 0
   perfInitialized = false
-  perfLogger.info({ event: 'perf_logging_toggled', enabled: false, source }, 'Perf logging toggled')
+  perfLogger.debug({ event: 'perf_logging_toggled', enabled: false, source }, 'Perf logging toggled')
 }
 
 export function shouldLog(key: string, intervalMs: number): boolean {
@@ -98,29 +98,41 @@ function toMs(ns: number): number {
   return Number((ns / 1e6).toFixed(2))
 }
 
+type PerfSeverity = 'debug' | 'info' | 'warn' | 'error'
+
+function withPerfSeverity(level: PerfSeverity, payload: Record<string, unknown>) {
+  if ((level === 'warn' || level === 'error') && payload.perfSeverity === undefined) {
+    return { ...payload, perfSeverity: level }
+  }
+  return payload
+}
+
 export function logPerfEvent(
   event: string,
   context: Record<string, unknown>,
-  level: 'debug' | 'info' | 'warn' | 'error' = 'info',
+  level: PerfSeverity = 'info',
 ) {
   if (!perfConfig.enabled) return
-  perfLogger[level]({ event, ...context }, 'Perf event')
+  perfLogger.debug(withPerfSeverity(level, { event, ...context }), 'Perf event')
 }
 
 export function startPerfTimer(
   event: string,
   context: Record<string, unknown> = {},
-  options: { minDurationMs?: number; level?: 'debug' | 'info' | 'warn' | 'error' } = {},
+  options: { minDurationMs?: number; level?: PerfSeverity } = {},
 ) {
   if (!perfConfig.enabled) return () => {}
   const start = performance.now()
   return (extra: Record<string, unknown> = {}) => {
     const durationMs = performance.now() - start
     if (options.minDurationMs && durationMs < options.minDurationMs) return
-    perfLogger[options.level || 'info'](
-      { event, durationMs: Number(durationMs.toFixed(2)), ...context, ...extra },
-      'Perf timing',
-    )
+    const payload = withPerfSeverity(options.level || 'info', {
+      event,
+      durationMs: Number(durationMs.toFixed(2)),
+      ...context,
+      ...extra,
+    })
+    perfLogger.debug(payload, 'Perf timing')
   }
 }
 
@@ -128,7 +140,7 @@ export async function withPerfSpan<T>(
   event: string,
   fn: () => Promise<T>,
   context: Record<string, unknown> = {},
-  options: { minDurationMs?: number; level?: 'debug' | 'info' | 'warn' | 'error' } = {},
+  options: { minDurationMs?: number; level?: PerfSeverity } = {},
 ): Promise<T> {
   if (!perfConfig.enabled) return await fn()
   const end = startPerfTimer(event, context, options)
@@ -143,7 +155,7 @@ export function initPerfLogging(): void {
   if (!perfConfig.enabled || perfInitialized) return
   perfInitialized = true
 
-  perfLogger.info({ event: 'perf_logging_enabled', config: perfConfig }, 'Perf logging enabled')
+  perfLogger.debug({ event: 'perf_logging_enabled', config: perfConfig }, 'Perf logging enabled')
 
   eventLoopHistogram = monitorEventLoopDelay({ resolution: perfConfig.eventLoopResolutionMs })
   eventLoopHistogram.enable()
@@ -169,7 +181,7 @@ export function initPerfLogging(): void {
       p99Ms: toMs(eventLoopHistogram.percentile(99)),
     }
 
-    perfLogger.info(
+    perfLogger.debug(
       {
         event: 'perf_system',
         uptimeSec: Number(uptime.toFixed(1)),

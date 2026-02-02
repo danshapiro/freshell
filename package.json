@@ -47,6 +47,7 @@
     "react-redux": "^9.1.2",
     "react-window": "^2.2.6",
     "remark-gfm": "^4.0.0",
+    "rotating-file-stream": "^3.2.8",
     "ws": "^8.18.0",
     "xterm": "^5.3.0",
     "xterm-addon-fit": "^0.8.0",

@@ -1,5 +1,39 @@
-import { describe, it, expect } from 'vitest'
-import { resolvePerfConfig, setPerfLoggingEnabled, isPerfLoggingEnabled } from '../../../server/perf-logger'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+const mockState = vi.hoisted(() => {
+  const debugEntries: Record<string, unknown>[] = []
+  const perfLogger = {
+    debug: vi.fn((payload: Record<string, unknown>) => debugEntries.push(payload)),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  }
+  const logger = {
+    child: vi.fn(() => perfLogger),
+  }
+  return { debugEntries, perfLogger, logger }
+})
+
+vi.mock('../../../server/logger', () => ({ logger: mockState.logger }))
+
+import {
+  resolvePerfConfig,
+  setPerfLoggingEnabled,
+  isPerfLoggingEnabled,
+  getPerfConfig,
+  logPerfEvent,
+  startPerfTimer,
+} from '../../../server/perf-logger'
+
+const { debugEntries, perfLogger } = mockState
+
+beforeEach(() => {
+  debugEntries.length = 0
+  perfLogger.debug.mockClear()
+  perfLogger.info.mockClear()
+  perfLogger.warn.mockClear()
+  perfLogger.error.mockClear()
+  getPerfConfig().enabled = false
+})
 
 describe('perf logger config', () => {
   it('defaults to disabled with standard thresholds', () => {
@@ -36,5 +70,23 @@ describe('perf logger config', () => {
     expect(isPerfLoggingEnabled()).toBe(true)
     setPerfLoggingEnabled(false, 'test')
     expect(isPerfLoggingEnabled()).toBe(false)
+  })
+
+  it('logs perf events as debug with perfSeverity for warn', () => {
+    getPerfConfig().enabled = true
+    logPerfEvent('http_request_slow', { statusCode: 500 }, 'warn')
+    expect(perfLogger.debug).toHaveBeenCalledTimes(1)
+    expect(debugEntries[0].perfSeverity).toBe('warn')
+    expect(perfLogger.warn).not.toHaveBeenCalled()
+  })
+
+  it('logs perf timing as debug with perfSeverity when configured', () => {
+    getPerfConfig().enabled = true
+    const end = startPerfTimer('session_refresh', { step: 'start' }, { minDurationMs: 0, level: 'warn' })
+    end()
+    expect(perfLogger.debug).toHaveBeenCalledTimes(1)
+    expect(debugEntries[0].event).toBe('session_refresh')
+    expect(debugEntries[0].perfSeverity).toBe('warn')
+    expect(typeof debugEntries[0].durationMs).toBe('number')
   })
 })
