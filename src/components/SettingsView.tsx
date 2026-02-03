@@ -382,7 +382,7 @@ export default function SettingsView() {
           <SettingsSection title="Sidebar" description="Session list and navigation">
             <SettingsRow label="Sort mode">
               <select
-                value={settings.sidebar?.sortMode || 'activity'}
+                value={settings.sidebar?.sortMode || 'recency-pinned'}
                 onChange={(e) => {
                   const v = e.target.value as SidebarSortMode
                   dispatch(updateSettingsLocal({ sidebar: { sortMode: v } } as any))

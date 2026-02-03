@@ -24,9 +24,9 @@ const EMPTY_ACTIVITY: Record<string, number> = {}
 
 const selectProjects = (state: RootState) => state.sessions.projects
 const selectTabs = (state: RootState) => state.tabs.tabs
-const selectSortMode = (state: RootState) => state.settings.settings.sidebar?.sortMode || 'activity'
+const selectSortMode = (state: RootState) => state.settings.settings.sidebar?.sortMode || 'recency-pinned'
 const selectSessionActivityForSort = (state: RootState) => {
-  const sortMode = state.settings.settings.sidebar?.sortMode || 'activity'
+  const sortMode = state.settings.settings.sidebar?.sortMode || 'recency-pinned'
   if (sortMode !== 'activity') return EMPTY_ACTIVITY
   return state.sessionActivity?.sessions || EMPTY_ACTIVITY
 }

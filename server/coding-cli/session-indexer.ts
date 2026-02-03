@@ -20,6 +20,16 @@ const normalizeFilePath = (filePath: string) => {
   return IS_WINDOWS ? resolved.toLowerCase() : resolved
 }
 
+/**
+ * Check if a file path is a Claude subagent session.
+ * Subagent sessions are internal implementation details and shouldn't
+ * appear in the user-facing session list.
+ */
+function isSubagentSession(filePath: string): boolean {
+  const normalized = filePath.toLowerCase()
+  return normalized.includes('/subagents/') || normalized.includes('\\subagents\\')
+}
+
 function applyOverride(session: CodingCliSession, ov: SessionOverride | undefined): CodingCliSession | null {
   if (ov?.deleted) return null
   return {

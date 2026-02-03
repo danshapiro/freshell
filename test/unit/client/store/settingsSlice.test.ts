@@ -38,7 +38,7 @@ describe('settingsSlice', () => {
         warnBeforeKillMinutes: 5,
       })
       expect(state.settings.sidebar).toEqual({
-        sortMode: 'activity',
+        sortMode: 'recency-pinned',
         showProjectBadges: true,
         width: 288,
         collapsed: false,
@@ -413,9 +413,9 @@ describe('settingsSlice - sortMode migration', () => {
     expect(migrateSortMode('project')).toBe('project')
   })
 
-  it('defaults invalid values to activity', async () => {
+  it('defaults invalid values to recency-pinned', async () => {
     const { migrateSortMode } = await import('@/store/settingsSlice')
-    expect(migrateSortMode('invalid' as any)).toBe('activity')
-    expect(migrateSortMode(undefined as any)).toBe('activity')
+    expect(migrateSortMode('invalid' as any)).toBe('recency-pinned')
+    expect(migrateSortMode(undefined as any)).toBe('recency-pinned')
   })
 })
