@@ -8,14 +8,16 @@ import type { SidebarSortMode, TerminalTheme } from '@/store/types'
 
 /** Monospace fonts with good Unicode block element support for terminal use */
 const terminalFonts = [
+  { value: 'Menlo', label: 'Menlo' },
+  { value: 'Monaco', label: 'Monaco' },
+  { value: 'SF Mono', label: 'SF Mono' },
+  { value: 'Consolas', label: 'Consolas' },
   { value: 'JetBrains Mono', label: 'JetBrains Mono' },
   { value: 'Cascadia Code', label: 'Cascadia Code' },
   { value: 'Fira Code', label: 'Fira Code' },
   { value: 'Source Code Pro', label: 'Source Code Pro' },
   { value: 'IBM Plex Mono', label: 'IBM Plex Mono' },
-  { value: 'Consolas', label: 'Consolas' },
-  { value: 'Monaco', label: 'Monaco' },
-  { value: 'Menlo', label: 'Menlo' },
+  { value: 'Courier New', label: 'Courier New' },
   { value: 'monospace', label: 'System monospace' },
 ]
 
