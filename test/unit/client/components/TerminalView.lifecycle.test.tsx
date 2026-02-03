@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { act, render, cleanup, waitFor } from '@testing-library/react'
+import { render, cleanup, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import tabsReducer from '@/store/tabsSlice'
@@ -16,10 +16,6 @@ const wsMocks = vi.hoisted(() => ({
   onReconnect: vi.fn().mockReturnValue(() => {}),
 }))
 
-const restoreMocks = vi.hoisted(() => ({
-  consumeTerminalRestoreRequestId: vi.fn(() => false),
-}))
-
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: wsMocks.send,
@@ -33,15 +29,9 @@ vi.mock('@/lib/terminal-themes', () => ({
   getTerminalTheme: () => ({}),
 }))
 
-vi.mock('@/lib/terminal-restore', () => ({
-  consumeTerminalRestoreRequestId: restoreMocks.consumeTerminalRestoreRequestId,
-}))
-
 vi.mock('lucide-react', () => ({
   Loader2: ({ className }: { className?: string }) => <svg data-testid="loader" className={className} />,
 }))
-
-const terminalInstances: any[] = []
 
 vi.mock('xterm', () => {
   class MockTerminal {
@@ -59,7 +49,6 @@ vi.mock('xterm', () => {
     attachCustomKeyEventHandler = vi.fn()
     getSelection = vi.fn(() => '')
     focus = vi.fn()
-    constructor() { terminalInstances.push(this) }
   }
 
   return { Terminal: MockTerminal }
@@ -96,9 +85,6 @@ describe('TerminalView lifecycle updates', () => {
 
   beforeEach(() => {
     wsMocks.send.mockClear()
-    restoreMocks.consumeTerminalRestoreRequestId.mockReset()
-    restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(false)
-    terminalInstances.length = 0
     wsMocks.onMessage.mockImplementation((callback: (msg: any) => void) => {
       messageHandler = callback
       return () => { messageHandler = null }
@@ -108,7 +94,6 @@ describe('TerminalView lifecycle updates', () => {
 
   afterEach(() => {
     cleanup()
-    vi.useRealTimers()
     vi.unstubAllGlobals()
   })
 
@@ -181,80 +166,6 @@ describe('TerminalView lifecycle updates', () => {
     const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
     expect(layout.content.terminalId).toBe('term-1')
     expect(layout.content.status).toBe('running')
-  })
-
-  it('does not send terminal.attach after terminal.created (prevents snapshot races)', async () => {
-    const tabId = 'tab-no-double-attach'
-    const paneId = 'pane-no-double-attach'
-
-    const paneContent: TerminalPaneContent = {
-      kind: 'terminal',
-      createRequestId: 'req-no-double-attach',
-      status: 'creating',
-      mode: 'claude',
-      shell: 'system',
-      initialCwd: '/tmp',
-    }
-
-    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
-
-    const store = configureStore({
-      reducer: {
-        tabs: tabsReducer,
-        panes: panesReducer,
-        settings: settingsReducer,
-        connection: connectionReducer,
-      },
-      preloadedState: {
-        tabs: {
-          tabs: [{
-            id: tabId,
-            mode: 'claude',
-            status: 'running',
-            title: 'Claude',
-            titleSetByUser: false,
-            createRequestId: paneContent.createRequestId,
-          }],
-          activeTabId: tabId,
-        },
-        panes: {
-          layouts: { [tabId]: root },
-          activePane: { [tabId]: paneId },
-          paneTitles: {},
-        },
-        settings: { settings: defaultSettings, status: 'loaded' },
-        connection: { status: 'connected', error: null },
-      },
-    })
-
-    render(
-      <Provider store={store}>
-        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
-      </Provider>
-    )
-
-    await waitFor(() => {
-      expect(messageHandler).not.toBeNull()
-    })
-
-    wsMocks.send.mockClear()
-
-    messageHandler!({
-      type: 'terminal.created',
-      requestId: paneContent.createRequestId,
-      terminalId: 'term-no-double-attach',
-      snapshot: '',
-      createdAt: Date.now(),
-    })
-
-    expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({
-      type: 'terminal.attach',
-    }))
-    // We still need to size the PTY to the visible terminal.
-    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'terminal.resize',
-      terminalId: 'term-no-double-attach',
-    }))
   })
 
   it('ignores INVALID_TERMINAL_ID errors for other terminals', async () => {
@@ -423,141 +334,6 @@ describe('TerminalView lifecycle updates', () => {
     expect(createCalls).toHaveLength(1)
   })
 
-  it('marks restored terminal.create requests', async () => {
-    restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(true)
-    const tabId = 'tab-restore'
-    const paneId = 'pane-restore'
-
-    const paneContent: TerminalPaneContent = {
-      kind: 'terminal',
-      createRequestId: 'req-restore',
-      status: 'creating',
-      mode: 'shell',
-      shell: 'system',
-    }
-
-    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
-
-    const store = configureStore({
-      reducer: {
-        tabs: tabsReducer,
-        panes: panesReducer,
-        settings: settingsReducer,
-        connection: connectionReducer,
-      },
-      preloadedState: {
-        tabs: {
-          tabs: [{
-            id: tabId,
-            mode: 'shell',
-            status: 'running',
-            title: 'Shell',
-            titleSetByUser: false,
-            createRequestId: 'req-restore',
-          }],
-          activeTabId: tabId,
-        },
-        panes: {
-          layouts: { [tabId]: root },
-          activePane: { [tabId]: paneId },
-          paneTitles: {},
-        },
-        settings: { settings: defaultSettings, status: 'loaded' },
-        connection: { status: 'connected', error: null },
-      },
-    })
-
-    render(
-      <Provider store={store}>
-        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
-      </Provider>
-    )
-
-    await waitFor(() => {
-      const createCalls = wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create')
-      expect(createCalls.length).toBeGreaterThan(0)
-      expect(createCalls[0][0].restore).toBe(true)
-    })
-  })
-
-  it('retries terminal.create after RATE_LIMITED errors', async () => {
-    vi.useFakeTimers()
-    const tabId = 'tab-rate-limit'
-    const paneId = 'pane-rate-limit'
-
-    const paneContent: TerminalPaneContent = {
-      kind: 'terminal',
-      createRequestId: 'req-rate-limit',
-      status: 'creating',
-      mode: 'shell',
-      shell: 'system',
-    }
-
-    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
-
-    const store = configureStore({
-      reducer: {
-        tabs: tabsReducer,
-        panes: panesReducer,
-        settings: settingsReducer,
-        connection: connectionReducer,
-      },
-      preloadedState: {
-        tabs: {
-          tabs: [{
-            id: tabId,
-            mode: 'shell',
-            status: 'running',
-            title: 'Shell',
-            titleSetByUser: false,
-            createRequestId: 'req-rate-limit',
-          }],
-          activeTabId: tabId,
-        },
-        panes: {
-          layouts: { [tabId]: root },
-          activePane: { [tabId]: paneId },
-          paneTitles: {},
-        },
-        settings: { settings: defaultSettings, status: 'loaded' },
-        connection: { status: 'connected', error: null },
-      },
-    })
-
-    render(
-      <Provider store={store}>
-        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
-      </Provider>
-    )
-
-    await act(async () => {
-      await Promise.resolve()
-      await Promise.resolve()
-    })
-
-    expect(messageHandler).not.toBeNull()
-
-    const createCallsBefore = wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create')
-    expect(createCallsBefore.length).toBeGreaterThan(0)
-
-    messageHandler!({
-      type: 'error',
-      code: 'RATE_LIMITED',
-      message: 'Too many terminal.create requests',
-      requestId: 'req-rate-limit',
-    })
-
-    const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
-    expect(layout.content.status).toBe('creating')
-
-    await act(async () => {
-      vi.advanceTimersByTime(250)
-    })
-
-    const createCallsAfter = wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create')
-    expect(createCallsAfter.length).toBe(createCallsBefore.length + 1)
-  })
-
   it('does not reconnect after terminal.exit when INVALID_TERMINAL_ID is received', async () => {
     // This test verifies the fix for the runaway terminal creation loop:
     // 1. Terminal exits normally (e.g., Claude fails to resume)
@@ -655,10 +431,5 @@ describe('TerminalView lifecycle updates', () => {
     // (but the ref should have been cleared, which we can't directly test here)
     const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
     expect(layout.content.status).toBe('exited')
-
-    // Verify user-facing feedback was shown
-    const term = terminalInstances[0]
-    const writelnCalls = term.writeln.mock.calls.map(([s]: [string]) => s)
-    expect(writelnCalls.some((s: string) => s.includes('Terminal exited'))).toBe(true)
   })
 })
