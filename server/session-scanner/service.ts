@@ -135,27 +135,25 @@ export class SessionRepairService extends EventEmitter {
    * Used by terminal.create before spawning Claude with --resume.
    */
   async waitForSession(sessionId: string, timeoutMs = 30000): Promise<SessionScanResult> {
+    // Check if already processed
     const existing = this.queue.getResult(sessionId)
     if (existing) {
       return existing
     }
 
-    const filePath = await this.resolveFilePath(sessionId)
-    if (!filePath) {
-      const missingResult: SessionScanResult = {
-        sessionId,
-        filePath: '',
-        status: 'missing',
-        chainDepth: 0,
-        orphanCount: 0,
-        fileSize: 0,
-        messageCount: 0,
-      }
-      this.sessionPathIndex.delete(sessionId)
-      this.queue.seedResult(sessionId, missingResult)
-      return missingResult
+    // Check if already enqueued or processing - if so, just wait for it
+    if (this.queue.isQueued(sessionId) || this.queue.isProcessing(sessionId)) {
+      return this.queue.waitFor(sessionId, timeoutMs)
     }
 
+    // Not enqueued - try to resolve the file path
+    const filePath = await this.resolveFilePath(sessionId)
+    if (!filePath) {
+      // Session file doesn't exist - reject rather than returning 'missing'
+      throw new Error(`Session ${sessionId} not in queue and file not found`)
+    }
+
+    // Check cache for recent result
     const cached = await this.cache.get(filePath, { allowStaleMs: ACTIVE_CACHE_GRACE_MS })
     if (cached) {
       if (cached.status === 'missing') {
@@ -165,6 +163,7 @@ export class SessionRepairService extends EventEmitter {
       return cached
     }
 
+    // Enqueue and wait
     this.queue.enqueue([{ sessionId, filePath, priority: 'active' }])
     return this.queue.waitFor(sessionId, timeoutMs)
   }
