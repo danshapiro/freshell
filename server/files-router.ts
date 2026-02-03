@@ -2,6 +2,7 @@ import express from 'express'
 import fsp from 'fs/promises'
 import path from 'path'
 import { spawn } from 'child_process'
+import { isReachableDirectory } from './path-utils.js'
 
 export const filesRouter = express.Router()
 
@@ -113,6 +114,21 @@ filesRouter.get('/complete', async (req, res) => {
     }
     return res.status(500).json({ error: err.message })
   }
+})
+
+filesRouter.post('/validate-dir', async (req, res) => {
+  const pathInput = req.body?.path
+  if (!pathInput || typeof pathInput !== 'string') {
+    return res.status(400).json({ error: 'path is required' })
+  }
+
+  const trimmed = pathInput.trim()
+  if (!trimmed) {
+    return res.status(400).json({ error: 'path is required' })
+  }
+
+  const { ok, resolvedPath } = await isReachableDirectory(trimmed)
+  return res.json({ valid: ok, resolvedPath })
 })
 
 filesRouter.post('/open', async (req, res) => {

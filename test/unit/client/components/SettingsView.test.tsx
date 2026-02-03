@@ -925,22 +925,55 @@ describe('SettingsView Component', () => {
       expect(store.getState().settings.settings.safety.warnBeforeKillMinutes).toBe(10)
     })
 
-    it('updates default working directory input', async () => {
+    it('validates default working directory before saving', async () => {
+      vi.mocked(api.post).mockResolvedValue({ valid: true })
       const store = createTestStore()
       renderWithStore(store)
 
       const cwdInput = screen.getByPlaceholderText('e.g. C:\\Users\\you\\projects')
       fireEvent.change(cwdInput, { target: { value: '/home/user/projects' } })
 
-      expect(store.getState().settings.settings.defaultCwd).toBe('/home/user/projects')
+      expect(store.getState().settings.settings.defaultCwd).toBeUndefined()
 
       await act(async () => {
         vi.advanceTimersByTime(500)
+        await Promise.resolve()
       })
 
+      expect(api.post).toHaveBeenCalledWith('/api/files/validate-dir', {
+        path: '/home/user/projects',
+      })
       expect(api.patch).toHaveBeenCalledWith('/api/settings', {
         defaultCwd: '/home/user/projects',
       })
+      expect(store.getState().settings.settings.defaultCwd).toBe('/home/user/projects')
+    })
+
+    it('shows an error and clears default when directory is not found', async () => {
+      vi.mocked(api.post).mockResolvedValue({ valid: false })
+      const store = createTestStore({
+        settings: { ...defaultSettings, defaultCwd: '/some/path' },
+      })
+      renderWithStore(store)
+
+      const cwdInput = screen.getByDisplayValue('/some/path')
+      fireEvent.change(cwdInput, { target: { value: '/missing/path' } })
+
+      expect(store.getState().settings.settings.defaultCwd).toBe('/some/path')
+
+      await act(async () => {
+        vi.advanceTimersByTime(500)
+        await Promise.resolve()
+      })
+
+      expect(api.post).toHaveBeenCalledWith('/api/files/validate-dir', {
+        path: '/missing/path',
+      })
+      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
+        defaultCwd: undefined,
+      })
+      expect(store.getState().settings.settings.defaultCwd).toBeUndefined()
+      expect(screen.getByText('directory not found')).toBeInTheDocument()
     })
 
     it('clears default working directory when input is emptied', async () => {
@@ -952,6 +985,17 @@ describe('SettingsView Component', () => {
       const cwdInput = screen.getByDisplayValue('/some/path')
       fireEvent.change(cwdInput, { target: { value: '' } })
 
+      expect(store.getState().settings.settings.defaultCwd).toBe('/some/path')
+
+      await act(async () => {
+        vi.advanceTimersByTime(500)
+        await Promise.resolve()
+      })
+
+      expect(api.post).not.toHaveBeenCalled()
+      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
+        defaultCwd: undefined,
+      })
       expect(store.getState().settings.settings.defaultCwd).toBeUndefined()
     })
   })

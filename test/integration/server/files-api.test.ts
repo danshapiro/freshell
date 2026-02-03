@@ -250,4 +250,55 @@ describe('Files API Integration', () => {
       expect(res.body.suggestions).toEqual([])
     })
   })
+
+  describe('POST /api/files/validate-dir', () => {
+    it('returns valid=true for existing directories', async () => {
+      const dirPath = path.join(tempDir, 'valid-dir')
+      await fsp.mkdir(dirPath, { recursive: true })
+
+      const res = await request(app)
+        .post('/api/files/validate-dir')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ path: dirPath })
+
+      expect(res.status).toBe(200)
+      expect(res.body.valid).toBe(true)
+      expect(res.body.resolvedPath).toBe(path.resolve(dirPath))
+    })
+
+    it('returns valid=false for files', async () => {
+      const filePath = path.join(tempDir, 'not-a-dir.txt')
+      await fsp.writeFile(filePath, 'content')
+
+      const res = await request(app)
+        .post('/api/files/validate-dir')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ path: filePath })
+
+      expect(res.status).toBe(200)
+      expect(res.body.valid).toBe(false)
+    })
+
+    it('returns valid=false for missing paths', async () => {
+      const missingPath = path.join(tempDir, 'does-not-exist')
+
+      const res = await request(app)
+        .post('/api/files/validate-dir')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ path: missingPath })
+
+      expect(res.status).toBe(200)
+      expect(res.body.valid).toBe(false)
+    })
+
+    it('returns 400 when path is missing', async () => {
+      const res = await request(app)
+        .post('/api/files/validate-dir')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({})
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toContain('path')
+    })
+  })
 })

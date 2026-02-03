@@ -140,8 +140,13 @@ export default function SettingsView() {
 
   const [availableTerminalFonts, setAvailableTerminalFonts] = useState(terminalFonts)
   const [fontsReady, setFontsReady] = useState(false)
+  const [defaultCwdInput, setDefaultCwdInput] = useState(settings.defaultCwd ?? '')
+  const [defaultCwdError, setDefaultCwdError] = useState<string | null>(null)
 
   const pendingRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const defaultCwdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const defaultCwdValidationRef = useRef(0)
+  const lastSettingsDefaultCwdRef = useRef(settings.defaultCwd ?? '')
   const previewTheme = useMemo(
     () => getTerminalTheme(settings.terminal.theme, settings.theme),
     [settings.terminal.theme, settings.theme],
@@ -175,6 +180,7 @@ export default function SettingsView() {
   useEffect(() => {
     return () => {
       if (pendingRef.current) clearTimeout(pendingRef.current)
+      if (defaultCwdTimerRef.current) clearTimeout(defaultCwdTimerRef.current)
     }
   }, [])
 
@@ -185,6 +191,53 @@ export default function SettingsView() {
       pendingRef.current = null
     }, 500)
   }, [patch])
+
+  useEffect(() => {
+    const next = settings.defaultCwd ?? ''
+    if (defaultCwdInput === lastSettingsDefaultCwdRef.current) {
+      setDefaultCwdInput(next)
+    }
+    lastSettingsDefaultCwdRef.current = next
+  }, [defaultCwdInput, settings.defaultCwd])
+
+  const commitDefaultCwd = useCallback((nextValue: string | undefined) => {
+    if (nextValue === settings.defaultCwd) return
+    dispatch(updateSettingsLocal({ defaultCwd: nextValue } as any))
+    patch({ defaultCwd: nextValue }).catch((err) => console.warn('Failed to save settings', err))
+  }, [dispatch, patch, settings.defaultCwd])
+
+  const scheduleDefaultCwdValidation = useCallback((value: string) => {
+    defaultCwdValidationRef.current += 1
+    const validationId = defaultCwdValidationRef.current
+    if (defaultCwdTimerRef.current) clearTimeout(defaultCwdTimerRef.current)
+
+    defaultCwdTimerRef.current = setTimeout(() => {
+      if (defaultCwdValidationRef.current !== validationId) return
+      const trimmed = value.trim()
+      if (!trimmed) {
+        setDefaultCwdError(null)
+        commitDefaultCwd(undefined)
+        return
+      }
+
+      api.post<{ valid: boolean }>('/api/files/validate-dir', { path: trimmed })
+        .then((result) => {
+          if (defaultCwdValidationRef.current !== validationId) return
+          if (result.valid) {
+            setDefaultCwdError(null)
+            commitDefaultCwd(trimmed)
+            return
+          }
+          setDefaultCwdError('directory not found')
+          commitDefaultCwd(undefined)
+        })
+        .catch(() => {
+          if (defaultCwdValidationRef.current !== validationId) return
+          setDefaultCwdError('directory not found')
+          commitDefaultCwd(undefined)
+        })
+    }, 500)
+  }, [commitDefaultCwd])
 
   const setProviderEnabled = useCallback((provider: CodingCliProviderName, enabled: boolean) => {
     const next = enabled
@@ -556,16 +609,28 @@ export default function SettingsView() {
             </SettingsRow>
 
             <SettingsRow label="Default working directory">
-              <input
-                type="text"
-                value={settings.defaultCwd || ''}
-                placeholder="e.g. C:\Users\you\projects"
-                onChange={(e) => {
-                  dispatch(updateSettingsLocal({ defaultCwd: e.target.value || undefined }))
-                  scheduleSave({ defaultCwd: e.target.value || undefined })
-                }}
-                className="w-full max-w-xs h-8 px-3 text-sm bg-muted border-0 rounded-md placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-border"
-              />
+              <div className="relative w-full max-w-xs">
+                <input
+                  type="text"
+                  value={defaultCwdInput}
+                  placeholder="e.g. C:\Users\you\projects"
+                  aria-invalid={defaultCwdError ? true : undefined}
+                  onChange={(e) => {
+                    const nextValue = e.target.value
+                    setDefaultCwdInput(nextValue)
+                    setDefaultCwdError(null)
+                    scheduleDefaultCwdValidation(nextValue)
+                  }}
+                  className="w-full h-8 px-3 text-sm bg-muted border-0 rounded-md placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-border"
+                />
+                {defaultCwdError && (
+                  <span
+                    className="pointer-events-none absolute right-2 -bottom-4 text-[10px] text-destructive"
+                  >
+                    {defaultCwdError}
+                  </span>
+                )}
+              </div>
             </SettingsRow>
           </SettingsSection>
 

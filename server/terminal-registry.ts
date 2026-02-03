@@ -7,6 +7,7 @@ import fs from 'fs'
 import { logger } from './logger.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
 import type { AppSettings } from './config-store.js'
+import { isReachableDirectorySync } from './path-utils.js'
 
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
 const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 64 * 1024)
@@ -141,7 +142,10 @@ export class ChunkRingBuffer {
 }
 
 function getDefaultCwd(settings?: AppSettings): string | undefined {
-  return settings?.defaultCwd || undefined
+  const candidate = settings?.defaultCwd
+  if (!candidate) return undefined
+  const { ok, resolvedPath } = isReachableDirectorySync(candidate)
+  return ok ? resolvedPath : undefined
 }
 
 function isWindows(): boolean {

@@ -1,14 +1,17 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { isLinuxPath, getSystemShell, escapeCmdExe, buildSpawnSpec, TerminalRegistry, isWsl, isWindowsLike } from '../../../server/terminal-registry'
 import * as fs from 'fs'
+import os from 'os'
 
 // Mock fs.existsSync for shell existence checks
 // Need to provide both named export and default export since the implementation uses `import fs from 'fs'`
 vi.mock('fs', () => {
   const existsSync = vi.fn()
+  const statSync = vi.fn()
   return {
     existsSync,
-    default: { existsSync },
+    statSync,
+    default: { existsSync, statSync },
   }
 })
 
@@ -1313,6 +1316,43 @@ describe('TerminalRegistry', () => {
 
       expect(record.resumeSessionId).toBe('shell-session-123')
       expect(record.mode).toBe('shell')
+    })
+  })
+
+  describe('defaultCwd validation', () => {
+    const originalPlatform = process.platform
+
+    afterEach(() => {
+      Object.defineProperty(process, 'platform', { value: originalPlatform })
+    })
+
+    it('uses defaultCwd when directory exists', () => {
+      Object.defineProperty(process, 'platform', { value: 'linux' })
+      vi.mocked(fs.statSync).mockImplementation((pathValue) => {
+        if (pathValue === '/valid/path') {
+          return { isDirectory: () => true } as any
+        }
+        throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
+      })
+
+      const registryWithSettings = new TerminalRegistry({ defaultCwd: '/valid/path' } as any, 10)
+      const record = registryWithSettings.create({ mode: 'shell' })
+
+      expect(record.cwd).toBe('/valid/path')
+      registryWithSettings.shutdown()
+    })
+
+    it('falls back to home when defaultCwd is invalid', () => {
+      Object.defineProperty(process, 'platform', { value: 'linux' })
+      vi.mocked(fs.statSync).mockImplementation(() => {
+        throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
+      })
+
+      const registryWithSettings = new TerminalRegistry({ defaultCwd: '/missing/path' } as any, 10)
+      const record = registryWithSettings.create({ mode: 'shell' })
+
+      expect(record.cwd).toBe(os.homedir())
+      registryWithSettings.shutdown()
     })
   })
 
