@@ -252,6 +252,9 @@ export function ContextMenuProvider({
       } else {
         ws.send({ type: 'codingcli.kill', sessionId })
       }
+    } else if (content?.kind === 'terminal' && content.terminalId) {
+      // Detach from terminal to stop receiving output
+      ws.send({ type: 'terminal.detach', terminalId: content.terminalId })
     }
     dispatch(closePane({ tabId, paneId }))
   }, [dispatch, panes, pendingRequests, ws])

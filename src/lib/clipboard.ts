@@ -25,8 +25,23 @@ export async function copyText(text: string): Promise<boolean> {
   }
 }
 
+/**
+ * Check if clipboard read is available in this context.
+ * Clipboard API requires secure context (HTTPS or localhost).
+ */
+export function isClipboardReadAvailable(): boolean {
+  if (typeof navigator === 'undefined') return false
+  if (typeof navigator.clipboard?.readText !== 'function') return false
+  // Check if we're in a secure context (required for clipboard API)
+  if (typeof window !== 'undefined' && 'isSecureContext' in window) {
+    return window.isSecureContext
+  }
+  // Fallback: localhost is always secure
+  return typeof location !== 'undefined' && location.hostname === 'localhost'
+}
+
 export async function readText(): Promise<string | null> {
-  if (typeof navigator !== 'undefined' && navigator.clipboard?.readText) {
+  if (isClipboardReadAvailable()) {
     try {
       return await navigator.clipboard.readText()
     } catch {

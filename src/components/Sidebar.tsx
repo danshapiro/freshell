@@ -12,7 +12,7 @@ import { getProviderLabel } from '@/lib/coding-cli-utils'
 import type { BackgroundTerminal, CodingCliProviderName } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
 import { makeSelectSortedSessionItems, type SidebarSessionItem } from '@/store/selectors/sidebarSelectors'
-import { collectTerminalPanes, findPaneByTerminalId } from '@/lib/pane-utils'
+import { collectTerminalPanes, collectSessionPanes, findPaneByTerminalId } from '@/lib/pane-utils'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { ProviderIcon } from '@/components/icons/provider-icons'
 
@@ -219,9 +219,18 @@ export default function Sidebar({
       // Session not running - check if tab with this session already exists
       let existingTabId: string | null = null
       for (const [tabId, layout] of Object.entries(panes)) {
+        // Check terminal panes
         const terminalPanes = collectTerminalPanes(layout)
         if (terminalPanes.some((pane) =>
           pane.content.resumeSessionId === item.sessionId && pane.content.mode === provider
+        )) {
+          existingTabId = tabId
+          break
+        }
+        // Check session panes
+        const sessionPanes = collectSessionPanes(layout)
+        if (sessionPanes.some((pane) =>
+          pane.content.sessionId === item.sessionId && pane.content.provider === provider
         )) {
           existingTabId = tabId
           break
@@ -257,16 +266,22 @@ export default function Sidebar({
   const activeTerminalIds = new Set(
     activeLayout ? collectTerminalPanes(activeLayout).map((pane) => pane.content.terminalId).filter(Boolean) as string[] : []
   )
-  const activeSessionKeys = new Set(
-    activeLayout
-      ? collectTerminalPanes(activeLayout)
-          .map((pane) => {
-            if (!pane.content.resumeSessionId) return null
-            return `${pane.content.mode}:${pane.content.resumeSessionId}`
-          })
-          .filter(Boolean) as string[]
-      : []
-  )
+  // Collect active session keys from both terminal panes (with resumeSessionId) and session panes
+  const activeSessionKeys = useMemo(() => {
+    if (!activeLayout) return new Set<string>()
+    const keys: string[] = []
+    // From terminal panes
+    for (const pane of collectTerminalPanes(activeLayout)) {
+      if (pane.content.resumeSessionId && pane.content.mode) {
+        keys.push(`${pane.content.mode}:${pane.content.resumeSessionId}`)
+      }
+    }
+    // From session panes
+    for (const pane of collectSessionPanes(activeLayout)) {
+      keys.push(`${pane.content.provider}:${pane.content.sessionId}`)
+    }
+    return new Set(keys)
+  }, [activeLayout])
   const effectiveListHeight = listHeight > 0
     ? listHeight
     : Math.min(sortedItems.length * SESSION_ITEM_HEIGHT, SESSION_LIST_MAX_HEIGHT)

@@ -72,11 +72,13 @@ vi.mock('xterm/css/xterm.css', () => ({}))
 const clipboardMocks = vi.hoisted(() => ({
   readText: vi.fn().mockResolvedValue('pasted content'),
   copyText: vi.fn().mockResolvedValue(undefined),
+  isClipboardReadAvailable: vi.fn().mockReturnValue(true),
 }))
 
 vi.mock('@/lib/clipboard', () => ({
   readText: clipboardMocks.readText,
   copyText: clipboardMocks.copyText,
+  isClipboardReadAvailable: clipboardMocks.isClipboardReadAvailable,
 }))
 
 import TerminalView from '@/components/TerminalView'

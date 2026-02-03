@@ -1,7 +1,5 @@
 import type { Middleware } from '@reduxjs/toolkit'
-import type { TabsState } from './tabsSlice'
-import type { PanesState } from './paneTypes'
-import type { Tab } from './types'
+import type { RootState } from './store'
 import { nanoid } from 'nanoid'
 
 const STORAGE_KEY = 'freshell.tabs.v1'
@@ -49,11 +47,11 @@ function registerFlushCallback(cb: () => void) {
   attachFlushListeners()
 }
 
-function stripTabVolatileFields(tab: Tab) {
-  return {
-    ...tab,
-    lastInputAt: undefined,
-  }
+function stripTabVolatileFields(tab: RootState['tabs']['tabs'][number]) {
+  // Strip any runtime-added volatile fields that shouldn't be persisted
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { lastInputAt, ...rest } = tab as typeof tab & { lastInputAt?: number }
+  return rest
 }
 
 export function resetPersistFlushListenersForTests() {
@@ -224,12 +222,7 @@ export function loadPersistedPanes(): any | null {
   }
 }
 
-type PersistState = {
-  tabs: TabsState
-  panes: PanesState
-}
-
-export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
+export const persistMiddleware: Middleware<{}, RootState> = (store) => {
   let tabsDirty = false
   let panesDirty = false
   let flushTimer: ReturnType<typeof setTimeout> | null = null
@@ -299,17 +292,16 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
   return (next) => (action) => {
     const result = next(action)
 
-    const a = action as any
-    if (a?.meta?.skipPersist) {
+    if (action?.meta?.skipPersist) {
       return result
     }
 
-    if (typeof a?.type === 'string') {
-      if (a.type.startsWith('tabs/')) {
+    if (typeof action?.type === 'string') {
+      if (action.type.startsWith('tabs/')) {
         tabsDirty = true
         scheduleFlush()
       }
-      if (a.type.startsWith('panes/')) {
+      if (action.type.startsWith('panes/')) {
         panesDirty = true
         scheduleFlush()
       }

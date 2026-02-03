@@ -261,6 +261,9 @@ export class CodingCliSessionIndexer {
         fileCount += files.length
 
         for (const file of files) {
+          // Skip subagent sessions - they're internal implementation details
+          if (isSubagentSession(file)) continue
+
           processedEntries += 1
           if (processedEntries % REFRESH_YIELD_EVERY === 0) {
             await yieldToEventLoop()
@@ -292,6 +295,12 @@ export class CodingCliSessionIndexer {
       }
 
       for (const file of dirtyFiles) {
+        // Skip subagent sessions - they're internal implementation details
+        if (isSubagentSession(file)) {
+          this.fileCache.delete(file)
+          continue
+        }
+
         processedEntries += 1
         if (processedEntries % REFRESH_YIELD_EVERY === 0) {
           await yieldToEventLoop()

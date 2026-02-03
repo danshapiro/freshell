@@ -424,12 +424,30 @@ export const panesSlice = createSlice({
 
       state.layouts[tabId] = updateContent(root)
       if (!previousContent) return
-      if (previousContent.kind !== content.kind) {
-        if (state.paneTitles[tabId]?.[paneId]) {
+
+      // Clear titles when content changes significantly
+      const kindChanged = previousContent.kind !== content.kind
+      const terminalIdChanged = previousContent.kind === 'terminal' &&
+        content.kind === 'terminal' &&
+        previousContent.terminalId !== content.terminalId &&
+        content.terminalId !== undefined
+      const sessionIdChanged = previousContent.kind === 'session' &&
+        content.kind === 'session' &&
+        previousContent.sessionId !== content.sessionId
+
+      if (kindChanged || terminalIdChanged || sessionIdChanged) {
+        // Only clear non-user-set titles
+        if (state.paneTitles[tabId]?.[paneId] && !state.paneTitleSetByUser[tabId]?.[paneId]) {
           delete state.paneTitles[tabId][paneId]
         }
-        if (state.paneTitleSetByUser[tabId]?.[paneId]) {
-          delete state.paneTitleSetByUser[tabId][paneId]
+        // Always clear kind-related state when kind changes
+        if (kindChanged) {
+          if (state.paneTitles[tabId]?.[paneId]) {
+            delete state.paneTitles[tabId][paneId]
+          }
+          if (state.paneTitleSetByUser[tabId]?.[paneId]) {
+            delete state.paneTitleSetByUser[tabId][paneId]
+          }
         }
       }
     },

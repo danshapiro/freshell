@@ -49,9 +49,14 @@ export default function SessionView({ sessionId, hidden }: SessionViewProps) {
   }, [events.length, hidden])
 
   if (!session) {
+    // Session pane exists but session data is missing (e.g., after page reload)
+    // Session events are not persisted, so we show a helpful message
     return (
-      <div className={cn('h-full w-full flex items-center justify-center', hidden ? 'hidden' : '')}>
-        <span className="text-sm text-muted-foreground">Starting session...</span>
+      <div className={cn('h-full w-full flex flex-col items-center justify-center gap-2', hidden ? 'hidden' : '')}>
+        <span className="text-sm text-muted-foreground">Session history unavailable</span>
+        <span className="text-xs text-muted-foreground/70">
+          Close this tab and resume the session from the sidebar
+        </span>
       </div>
     )
   }
