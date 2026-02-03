@@ -1,17 +1,24 @@
 import fs from 'fs'
+import path from 'path'
 import fsp from 'fs/promises'
 import chokidar from 'chokidar'
 import { logger } from '../logger.js'
 import { getPerfConfig, startPerfTimer } from '../perf-logger.js'
 import { configStore, SessionOverride } from '../config-store.js'
 import type { CodingCliProvider } from './provider.js'
-import type { CodingCliSession, ProjectGroup } from './types.js'
+import type { CodingCliSession, CodingCliProviderName, ProjectGroup } from './types.js'
 import { makeSessionKey } from './types.js'
 
 const perfConfig = getPerfConfig()
 const REFRESH_YIELD_EVERY = 200
 
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve))
+const IS_WINDOWS = process.platform === 'win32'
+
+const normalizeFilePath = (filePath: string) => {
+  const resolved = path.resolve(filePath)
+  return IS_WINDOWS ? resolved.toLowerCase() : resolved
+}
 
 function applyOverride(session: CodingCliSession, ov: SessionOverride | undefined): CodingCliSession | null {
   if (ov?.deleted) return null
@@ -38,6 +45,7 @@ async function readSessionSnippet(filePath: string): Promise<string> {
 }
 
 type CachedSessionEntry = {
+  provider: CodingCliProviderName
   mtimeMs: number
   size: number
   baseSession: CodingCliSession | null
@@ -51,10 +59,15 @@ export class CodingCliSessionIndexer {
   private refreshInFlight = false
   private refreshQueued = false
   private fileCache = new Map<string, CachedSessionEntry>()
+  private dirtyFiles = new Set<string>()
+  private deletedFiles = new Set<string>()
+  private needsFullScan = true
+  private lastEnabledKey = ''
 
   constructor(private providers: CodingCliProvider[]) {}
 
   async start() {
+    this.needsFullScan = true
     await this.refresh()
     const globs = this.providers.map((p) => p.getSessionGlob())
     logger.info({ globs }, 'Starting coding CLI sessions watcher')
@@ -64,9 +77,18 @@ export class CodingCliSessionIndexer {
     })
 
     const schedule = () => this.scheduleRefresh()
-    this.watcher.on('add', schedule)
-    this.watcher.on('change', schedule)
-    this.watcher.on('unlink', schedule)
+    this.watcher.on('add', (filePath) => {
+      this.markDirty(filePath)
+      schedule()
+    })
+    this.watcher.on('change', (filePath) => {
+      this.markDirty(filePath)
+      schedule()
+    })
+    this.watcher.on('unlink', (filePath) => {
+      this.markDeleted(filePath)
+      schedule()
+    })
     this.watcher.on('error', (err) => logger.warn({ err }, 'Coding CLI watcher error'))
   }
 
@@ -84,6 +106,87 @@ export class CodingCliSessionIndexer {
 
   getProjects(): ProjectGroup[] {
     return this.projects
+  }
+
+  private markDirty(filePath: string) {
+    const normalized = normalizeFilePath(filePath)
+    this.deletedFiles.delete(normalized)
+    this.dirtyFiles.add(normalized)
+  }
+
+  private markDeleted(filePath: string) {
+    const normalized = normalizeFilePath(filePath)
+    this.dirtyFiles.delete(normalized)
+    this.deletedFiles.add(normalized)
+  }
+
+  private resolveProviderForFile(filePath: string): CodingCliProvider | undefined {
+    const normalized = normalizeFilePath(filePath)
+    let matched: CodingCliProvider | undefined
+    let matchedLength = -1
+
+    for (const provider of this.providers) {
+      const homeDir = normalizeFilePath(provider.homeDir)
+      if (!normalized.startsWith(homeDir)) continue
+      if (homeDir.length > matchedLength) {
+        matched = provider
+        matchedLength = homeDir.length
+      }
+    }
+
+    return matched
+  }
+
+  private async updateCacheEntry(provider: CodingCliProvider, filePath: string, cacheKey: string) {
+    let stat: fs.Stats
+    try {
+      stat = await fsp.stat(filePath)
+    } catch {
+      this.fileCache.delete(cacheKey)
+      return
+    }
+
+    const mtimeMs = stat.mtimeMs || stat.mtime.getTime()
+    const size = stat.size
+
+    const cached = this.fileCache.get(cacheKey)
+    if (cached && cached.mtimeMs === mtimeMs && cached.size === size) {
+      return
+    }
+
+    const content = await readSessionSnippet(filePath)
+    const meta = provider.parseSessionFile(content, filePath)
+    if (!meta.cwd) {
+      this.fileCache.set(cacheKey, {
+        provider: provider.name,
+        mtimeMs,
+        size,
+        baseSession: null,
+      })
+      return
+    }
+
+    const projectPath = await provider.resolveProjectPath(filePath, meta)
+    const sessionId = meta.sessionId || provider.extractSessionId(filePath, meta)
+
+    const baseSession: CodingCliSession = {
+      provider: provider.name,
+      sessionId,
+      projectPath,
+      updatedAt: stat.mtimeMs || stat.mtime.getTime(),
+      messageCount: meta.messageCount,
+      title: meta.title,
+      summary: meta.summary,
+      cwd: meta.cwd,
+      sourceFile: filePath,
+    }
+
+    this.fileCache.set(cacheKey, {
+      provider: provider.name,
+      mtimeMs,
+      size,
+      baseSession,
+    })
   }
 
   private scheduleRefresh() {
@@ -115,115 +218,116 @@ export class CodingCliSessionIndexer {
       {},
       { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
     )
-    const colors = await configStore.getProjectColors()
-    const cfg = await configStore.snapshot()
+    const [colors, cfg] = await Promise.all([configStore.getProjectColors(), configStore.snapshot()])
     const enabledProviders = cfg.settings?.codingCli?.enabledProviders
     const enabledSet = new Set(enabledProviders ?? this.providers.map((p) => p.name))
+    const enabledKey = Array.from(enabledSet).sort().join(',')
+    if (enabledKey !== this.lastEnabledKey) {
+      this.lastEnabledKey = enabledKey
+      this.needsFullScan = true
+    }
 
     const groupsByPath = new Map<string, ProjectGroup>()
     let fileCount = 0
     let sessionCount = 0
     let processedEntries = 0
-    const seenFiles = new Set<string>()
 
-    for (const provider of this.providers) {
-      if (!enabledSet.has(provider.name)) continue
-      let files: string[] = []
-      try {
-        files = await provider.listSessionFiles()
-      } catch (err) {
-        logger.warn({ err, provider: provider.name }, 'Could not list session files')
-        continue
+    const shouldFullScan = this.needsFullScan || this.fileCache.size === 0
+    if (shouldFullScan) {
+      this.needsFullScan = false
+      this.dirtyFiles.clear()
+      this.deletedFiles.clear()
+
+      const seenFiles = new Set<string>()
+      for (const provider of this.providers) {
+        if (!enabledSet.has(provider.name)) continue
+        let files: string[] = []
+        try {
+          files = await provider.listSessionFiles()
+        } catch (err) {
+          logger.warn({ err, provider: provider.name }, 'Could not list session files')
+          continue
+        }
+        fileCount += files.length
+
+        for (const file of files) {
+          processedEntries += 1
+          if (processedEntries % REFRESH_YIELD_EVERY === 0) {
+            await yieldToEventLoop()
+          }
+          const cacheKey = normalizeFilePath(file)
+          seenFiles.add(cacheKey)
+          await this.updateCacheEntry(provider, file, cacheKey)
+        }
       }
-      fileCount += files.length
 
-      for (const file of files) {
+      for (const cachedFile of this.fileCache.keys()) {
         processedEntries += 1
         if (processedEntries % REFRESH_YIELD_EVERY === 0) {
           await yieldToEventLoop()
         }
-        seenFiles.add(file)
-        let stat: any
-        try {
-          stat = await fsp.stat(file)
-        } catch {
-          continue
+        const cached = this.fileCache.get(cachedFile)
+        if (!cached || !enabledSet.has(cached.provider) || !seenFiles.has(cachedFile)) {
+          this.fileCache.delete(cachedFile)
         }
-        const mtimeMs = stat.mtimeMs || stat.mtime.getTime()
-        const size = stat.size
+      }
+    } else {
+      const deletedFiles = Array.from(this.deletedFiles)
+      const dirtyFiles = Array.from(this.dirtyFiles)
+      this.deletedFiles.clear()
+      this.dirtyFiles.clear()
 
+      for (const file of deletedFiles) {
+        this.fileCache.delete(file)
+      }
+
+      for (const file of dirtyFiles) {
+        processedEntries += 1
+        if (processedEntries % REFRESH_YIELD_EVERY === 0) {
+          await yieldToEventLoop()
+        }
         const cached = this.fileCache.get(file)
-        if (cached && cached.mtimeMs === mtimeMs && cached.size === size) {
-          if (!cached.baseSession) continue
-          const compositeKey = makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId)
-          const ov = cfg.sessionOverrides?.[compositeKey]
-          const merged = applyOverride(cached.baseSession, ov)
-          if (!merged) continue
-          const group = groupsByPath.get(merged.projectPath) || {
-            projectPath: merged.projectPath,
-            sessions: [],
-          }
-          group.sessions.push(merged)
-          groupsByPath.set(merged.projectPath, group)
-          sessionCount += 1
+        const provider = cached
+          ? this.providers.find((p) => p.name === cached.provider)
+          : this.resolveProviderForFile(file)
+        if (!provider) {
+          this.needsFullScan = true
           continue
         }
-
-        const content = await readSessionSnippet(file)
-        const meta = provider.parseSessionFile(content, file)
-        if (!meta.cwd) {
-          this.fileCache.set(file, {
-            mtimeMs,
-            size,
-            baseSession: null,
-          })
+        if (!enabledSet.has(provider.name)) {
+          this.fileCache.delete(file)
           continue
         }
-
-        const projectPath = await provider.resolveProjectPath(file, meta)
-        const sessionId = meta.sessionId || provider.extractSessionId(file, meta)
-
-        const baseSession: CodingCliSession = {
-          provider: provider.name,
-          sessionId,
-          projectPath,
-          updatedAt: stat.mtimeMs || stat.mtime.getTime(),
-          messageCount: meta.messageCount,
-          title: meta.title,
-          summary: meta.summary,
-          cwd: meta.cwd,
-          sourceFile: file,
-        }
-
-        this.fileCache.set(file, {
-          mtimeMs,
-          size,
-          baseSession,
-        })
-
-        const compositeKey = makeSessionKey(provider.name, sessionId)
-        const ov = cfg.sessionOverrides?.[compositeKey]
-        const merged = applyOverride(baseSession, ov)
-        if (!merged) continue
-
-        const group = groupsByPath.get(projectPath) || {
-          projectPath,
-          sessions: [],
-        }
-        group.sessions.push(merged)
-        groupsByPath.set(projectPath, group)
-        sessionCount += 1
+        await this.updateCacheEntry(provider, file, file)
       }
     }
 
-    for (const cachedFile of this.fileCache.keys()) {
+    if (fileCount === 0) {
+      fileCount = this.fileCache.size
+    }
+
+    processedEntries = 0
+    for (const [cachedFile, cached] of this.fileCache) {
       processedEntries += 1
       if (processedEntries % REFRESH_YIELD_EVERY === 0) {
         await yieldToEventLoop()
       }
-      if (!seenFiles.has(cachedFile)) {
+      if (!enabledSet.has(cached.provider)) {
         this.fileCache.delete(cachedFile)
+        continue
       }
+      if (!cached.baseSession) continue
+      const compositeKey = makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId)
+      const ov = cfg.sessionOverrides?.[compositeKey]
+      const merged = applyOverride(cached.baseSession, ov)
+      if (!merged) continue
+      const group = groupsByPath.get(merged.projectPath) || {
+        projectPath: merged.projectPath,
+        sessions: [],
+      }
+      group.sessions.push(merged)
+      groupsByPath.set(merged.projectPath, group)
+      sessionCount += 1
     }
 
     const groups: ProjectGroup[] = Array.from(groupsByPath.values()).map((group) => ({

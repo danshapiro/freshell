@@ -23,6 +23,7 @@ const PRIORITY_ORDER: Record<Priority, number> = {
 }
 
 const MAX_PROCESSED_CACHE = 1000
+const ACTIVE_CACHE_GRACE_MS = 15000
 
 export interface QueueItem {
   sessionId: string
@@ -180,7 +181,9 @@ export class SessionRepairQueue extends EventEmitter {
 
     try {
       // Check cache first
-      const cached = await this.cache.get(item.filePath)
+      const cached = await this.cache.get(item.filePath, {
+        allowStaleMs: item.priority === 'active' ? ACTIVE_CACHE_GRACE_MS : undefined,
+      })
       if (cached) {
         this.setProcessed(item.sessionId, cached)
         this.emit('scanned', cached)

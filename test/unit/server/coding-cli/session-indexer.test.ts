@@ -160,17 +160,33 @@ describe('CodingCliSessionIndexer', () => {
     expect(parseSessionFile).toHaveBeenCalledTimes(1)
   })
 
+  it('avoids relisting session files when nothing changed', async () => {
+    const fileA = path.join(tempDir, 'session-a.jsonl')
+    await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')
+
+    const listSessionFiles = vi.fn().mockResolvedValue([fileA])
+    const provider: CodingCliProvider = {
+      ...makeProvider([fileA]),
+      listSessionFiles,
+    }
+
+    const indexer = new CodingCliSessionIndexer([provider])
+
+    await indexer.refresh()
+    await indexer.refresh()
+
+    expect(listSessionFiles).toHaveBeenCalledTimes(1)
+  })
+
   it('coalesces refreshes while a refresh is in flight', async () => {
     const fileA = path.join(tempDir, 'session-a.jsonl')
     await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')
 
     const firstList = createDeferred<string[]>()
-    const secondList = createDeferred<string[]>()
 
     const listSessionFiles = vi
       .fn()
       .mockReturnValueOnce(firstList.promise)
-      .mockReturnValueOnce(secondList.promise)
 
     const provider: CodingCliProvider = {
       ...makeProvider([fileA]),
@@ -191,9 +207,9 @@ describe('CodingCliSessionIndexer', () => {
     expect(listSessionFiles).toHaveBeenCalledTimes(1)
 
     firstList.resolve([fileA])
-    secondList.resolve([fileA])
     await refreshPromise
 
-    expect(listSessionFiles).toHaveBeenCalledTimes(2)
+    expect(listSessionFiles).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(configStore.snapshot)).toHaveBeenCalledTimes(2)
   })
 })

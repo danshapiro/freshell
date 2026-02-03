@@ -16,6 +16,8 @@ export interface CacheEntry {
   mtime: number
   /** File size in bytes */
   size: number
+  /** Timestamp when cached (ms since epoch) */
+  cachedAt: number
   /** Cached scan result */
   result: SessionScanResult
 }
@@ -43,7 +45,10 @@ export class SessionCache {
    * Get cached result if file hasn't changed.
    * Returns null if cache miss or file modified.
    */
-  async get(filePath: string): Promise<SessionScanResult | null> {
+  async get(
+    filePath: string,
+    options?: { allowStaleMs?: number },
+  ): Promise<SessionScanResult | null> {
     const entry = this.cache.get(filePath)
     if (!entry) return null
 
@@ -59,6 +64,10 @@ export class SessionCache {
 
     // Invalidate if file changed
     if (stat.mtimeMs !== entry.mtime || stat.size !== entry.size) {
+      const allowStaleMs = options?.allowStaleMs
+      if (allowStaleMs && Date.now() - entry.cachedAt <= allowStaleMs) {
+        return entry.result
+      }
       this.cache.delete(filePath)
       return null
     }
@@ -81,6 +90,7 @@ export class SessionCache {
     this.cache.set(filePath, {
       mtime: stat.mtimeMs,
       size: stat.size,
+      cachedAt: Date.now(),
       result,
     })
   }
@@ -136,7 +146,11 @@ export class SessionCache {
         return
       }
 
-      this.cache = new Map(Object.entries(data.entries))
+      const entries = Object.entries(data.entries).map(([filePath, entry]) => {
+        const cachedAt = typeof entry.cachedAt === 'number' ? entry.cachedAt : 0
+        return [filePath, { ...entry, cachedAt }] as const
+      })
+      this.cache = new Map(entries)
     } catch {
       // File missing or corrupted - start with empty cache
       this.cache = new Map()

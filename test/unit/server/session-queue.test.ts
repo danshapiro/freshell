@@ -215,6 +215,43 @@ describe('SessionRepairQueue', () => {
       expect(cached?.status).toBe('healthy')
     })
 
+    it('reuses recent cached scans for active sessions when the file changes', async () => {
+      const filePath = path.join(tempDir, 'healthy.jsonl')
+      await fs.copyFile(path.join(FIXTURES_DIR, 'healthy.jsonl'), filePath)
+
+      const scanResult: SessionScanResult = {
+        sessionId: 'healthy',
+        filePath,
+        status: 'healthy',
+        chainDepth: 1,
+        orphanCount: 0,
+        fileSize: 1,
+        messageCount: 1,
+      }
+
+      const scanner = {
+        scan: vi.fn().mockResolvedValue(scanResult),
+        repair: vi.fn(),
+      }
+
+      const localCache = new SessionCache(path.join(tempDir, 'cache.json'))
+      await localCache.set(filePath, scanResult)
+      await fs.appendFile(filePath, '\n')
+
+      const localQueue = new SessionRepairQueue(scanner as any, localCache)
+      localQueue.enqueue([
+        { sessionId: 'healthy', filePath, priority: 'active' },
+      ])
+
+      localQueue.start()
+      const result = await localQueue.waitFor('healthy', 5000)
+
+      expect(result.status).toBe('healthy')
+      expect(scanner.scan).not.toHaveBeenCalled()
+
+      await localQueue.stop()
+    })
+
     it('auto-starts when new items are enqueued after drain', async () => {
       const scanned: SessionScanResult[] = []
       queue.on('scanned', (result) => scanned.push(result))
