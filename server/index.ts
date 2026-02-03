@@ -1,14 +1,6 @@
 import { detectLanIps } from './bootstrap.js' // Must be first - ensures .env exists before dotenv loads
 import 'dotenv/config'
 import { setupWslPortForwarding } from './wsl-port-forward.js'
-
-// WSL2 port forwarding - must run AFTER dotenv loads so PORT/NODE_ENV are available
-const wslPortForwardResult = setupWslPortForwarding()
-if (wslPortForwardResult === 'success') {
-  console.log('[server] WSL2 port forwarding configured')
-} else if (wslPortForwardResult === 'failed') {
-  console.warn('[server] WSL2 port forwarding failed - LAN access may not work')
-}
 import express from 'express'
 import fs from 'fs'
 import http from 'http'
@@ -60,6 +52,16 @@ const perfConfig = getPerfConfig()
 
 async function main() {
   validateStartupSecurity()
+
+  // WSL2 port forwarding - must run AFTER security validation passes
+  // and AFTER dotenv loads so PORT/NODE_ENV from .env are available
+  const wslPortForwardResult = setupWslPortForwarding()
+  if (wslPortForwardResult === 'success') {
+    console.log('[server] WSL2 port forwarding configured')
+  } else if (wslPortForwardResult === 'failed') {
+    console.warn('[server] WSL2 port forwarding failed - LAN access may not work')
+  }
+
   initPerfLogging()
 
   const app = express()

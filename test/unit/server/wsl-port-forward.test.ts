@@ -26,32 +26,50 @@ describe('wsl-port-forward', () => {
   })
 
   describe('getWslIp', () => {
-    it('returns first IPv4 address from hostname -I', () => {
-      vi.mocked(execSync).mockReturnValue('172.30.149.249 10.0.0.5 \n')
+    it('returns IP from eth0 interface when available', () => {
+      vi.mocked(execSync).mockReturnValueOnce(`
+2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
+    inet 172.30.149.249/20 brd 172.30.159.255 scope global eth0
+       valid_lft forever preferred_lft forever
+`)
+
+      const ip = getWslIp()
+
+      expect(ip).toBe('172.30.149.249')
+      expect(execSync).toHaveBeenCalledWith('ip -4 addr show eth0 2>/dev/null', expect.anything())
+    })
+
+    it('falls back to hostname -I when eth0 fails', () => {
+      vi.mocked(execSync)
+        .mockImplementationOnce(() => { throw new Error('eth0 not found') })
+        .mockReturnValueOnce('172.30.149.249 10.0.0.5 \n')
 
       const ip = getWslIp()
 
       expect(ip).toBe('172.30.149.249')
     })
 
-    it('skips IPv6 addresses and returns first IPv4', () => {
-      vi.mocked(execSync).mockReturnValue('fe80::1 2001:db8::1 172.30.149.249 10.0.0.5\n')
+    it('skips IPv6 addresses in fallback', () => {
+      vi.mocked(execSync)
+        .mockImplementationOnce(() => { throw new Error('eth0 not found') })
+        .mockReturnValueOnce('fe80::1 2001:db8::1 172.30.149.249 10.0.0.5\n')
 
       const ip = getWslIp()
 
       expect(ip).toBe('172.30.149.249')
     })
 
-    it('skips Docker bridge IP (172.17.x.x) and returns WSL IP', () => {
-      // Docker bridge often appears before WSL IP on some systems
-      vi.mocked(execSync).mockReturnValue('172.17.0.1 172.30.149.249\n')
+    it('skips Docker bridge IP (172.17.x.x) in fallback', () => {
+      vi.mocked(execSync)
+        .mockImplementationOnce(() => { throw new Error('eth0 not found') })
+        .mockReturnValueOnce('172.17.0.1 172.30.149.249\n')
 
       const ip = getWslIp()
 
       expect(ip).toBe('172.30.149.249')
     })
 
-    it('returns null when hostname -I fails', () => {
+    it('returns null when both eth0 and hostname -I fail', () => {
       vi.mocked(execSync).mockImplementation(() => {
         throw new Error('Command failed')
       })
@@ -61,24 +79,30 @@ describe('wsl-port-forward', () => {
       expect(ip).toBeNull()
     })
 
-    it('returns null when no IPv4 addresses found', () => {
-      vi.mocked(execSync).mockReturnValue('fe80::1 2001:db8::1\n')
+    it('returns null when no IPv4 addresses found in fallback', () => {
+      vi.mocked(execSync)
+        .mockImplementationOnce(() => { throw new Error('eth0 not found') })
+        .mockReturnValueOnce('fe80::1 2001:db8::1\n')
 
       const ip = getWslIp()
 
       expect(ip).toBeNull()
     })
 
-    it('returns null when only Docker bridge IP found', () => {
-      vi.mocked(execSync).mockReturnValue('172.17.0.1\n')
+    it('returns null when only Docker bridge IP found in fallback', () => {
+      vi.mocked(execSync)
+        .mockImplementationOnce(() => { throw new Error('eth0 not found') })
+        .mockReturnValueOnce('172.17.0.1\n')
 
       const ip = getWslIp()
 
       expect(ip).toBeNull()
     })
 
-    it('returns null when output is empty', () => {
-      vi.mocked(execSync).mockReturnValue('')
+    it('returns null when fallback output is empty', () => {
+      vi.mocked(execSync)
+        .mockImplementationOnce(() => { throw new Error('eth0 not found') })
+        .mockReturnValueOnce('')
 
       const ip = getWslIp()
 
@@ -362,7 +386,7 @@ Address         Port        Address         Port
 
       // Mock execSync calls in order
       vi.mocked(execSync)
-        .mockReturnValueOnce('172.30.149.249\n') // hostname -I (getWslIp)
+        .mockReturnValueOnce('inet 172.30.149.249/20 scope global eth0\n') // ip -4 addr show eth0 (getWslIp)
         .mockReturnValueOnce(`
 Listen on ipv4:             Connect to ipv4:
 
@@ -393,7 +417,7 @@ Address         Port        Address         Port
 
       // Mock execSync calls in order
       vi.mocked(execSync)
-        .mockReturnValueOnce('172.30.149.249\n') // hostname -I (getWslIp)
+        .mockReturnValueOnce('inet 172.30.149.249/20 scope global eth0\n') // ip -4 addr show eth0 (getWslIp)
         .mockReturnValueOnce('') // netsh show - no existing rules
         .mockReturnValueOnce('') // PowerShell elevation
         .mockReturnValueOnce(`
@@ -420,7 +444,7 @@ Address         Port        Address         Port
 
       // Mock execSync calls in order
       vi.mocked(execSync)
-        .mockReturnValueOnce('172.30.149.249\n') // hostname -I
+        .mockReturnValueOnce('inet 172.30.149.249/20 scope global eth0\n') // ip -4 addr show eth0
         .mockReturnValueOnce('') // netsh show - no existing rules
         .mockReturnValueOnce('') // PowerShell (UAC cancelled, no error thrown)
         .mockReturnValueOnce('') // netsh show - still no rules (verification fails)
@@ -434,7 +458,7 @@ Address         Port        Address         Port
       vi.mocked(fs.readFileSync).mockReturnValue('Linux version 5.15.0-microsoft-standard-WSL2')
 
       vi.mocked(execSync)
-        .mockReturnValueOnce('172.30.149.249\n') // hostname -I
+        .mockReturnValueOnce('inet 172.30.149.249/20 scope global eth0\n') // ip -4 addr show eth0
         .mockReturnValueOnce('') // netsh show - no existing rules
         .mockImplementationOnce(() => {
           // PowerShell throws (e.g., timeout, command not found)

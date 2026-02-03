@@ -36,23 +36,38 @@ export function parsePortProxyRules(output: string): Map<number, PortProxyRule> 
   return rules
 }
 
-// Docker bridge network range - should be skipped when selecting WSL IP
-const DOCKER_BRIDGE_PREFIX = '172.17.'
-
 /**
  * Get the current WSL2 IPv4 address.
- * Returns the first IPv4 address from `hostname -I`, skipping:
- * - IPv6 addresses
- * - Docker bridge IPs (172.17.x.x)
+ *
+ * Strategy:
+ * 1. Try to get IP from eth0 (WSL2's primary interface)
+ * 2. Fall back to hostname -I (first non-Docker IPv4)
+ *
+ * This avoids selecting Docker bridge or VPN interfaces.
  */
 export function getWslIp(): string | null {
+  // Try eth0 first - this is WSL2's primary interface
+  try {
+    const eth0Output = execSync('ip -4 addr show eth0 2>/dev/null', {
+      encoding: 'utf-8',
+      timeout: 5000,
+    })
+    const eth0Match = eth0Output.match(/inet\s+([\d.]+)/)
+    if (eth0Match && IPV4_REGEX.test(eth0Match[1])) {
+      return eth0Match[1]
+    }
+  } catch {
+    // eth0 not available, fall through to hostname -I
+  }
+
+  // Fallback: use hostname -I, skipping Docker bridge (172.17.x.x)
   try {
     const output = execSync('hostname -I', { encoding: 'utf-8', timeout: 5000 })
     const addresses = output.trim().split(/\s+/).filter(Boolean)
 
-    // Find first IPv4 address (skip IPv6 and Docker bridge)
+    // Find first IPv4 address (skip IPv6 and Docker bridge 172.17.x.x)
     for (const addr of addresses) {
-      if (IPV4_REGEX.test(addr) && !addr.startsWith(DOCKER_BRIDGE_PREFIX)) {
+      if (IPV4_REGEX.test(addr) && !addr.startsWith('172.17.')) {
         return addr
       }
     }
