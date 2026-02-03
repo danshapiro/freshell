@@ -2,20 +2,28 @@ import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import { nanoid } from 'nanoid'
 import type { PanesState, PaneContent, PaneContentInput, PaneNode } from './paneTypes'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
+import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 
 /**
  * Normalize terminal input to full PaneContent with defaults.
  */
 function normalizeContent(input: PaneContentInput): PaneContent {
   if (input.kind === 'terminal') {
+    const mode = input.mode || 'shell'
+    const resumeSessionId =
+      mode === 'claude' && isValidClaudeSessionId(input.resumeSessionId)
+        ? input.resumeSessionId
+        : mode === 'claude'
+          ? undefined
+          : input.resumeSessionId
     return {
       kind: 'terminal',
       terminalId: input.terminalId,
       createRequestId: input.createRequestId || nanoid(),
       status: input.status || 'creating',
-      mode: input.mode || 'shell',
+      mode,
       shell: input.shell || 'system',
-      resumeSessionId: input.resumeSessionId,
+      resumeSessionId,
       initialCwd: input.initialCwd,
     }
   }

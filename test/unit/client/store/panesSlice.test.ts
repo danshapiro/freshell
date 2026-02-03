@@ -14,6 +14,8 @@ import panesReducer, {
 } from '../../../../src/store/panesSlice'
 import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent, EditorPaneContent } from '../../../../src/store/paneTypes'
 
+const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
+
 // Mock nanoid to return predictable IDs for testing
 let mockIdCounter = 0
 vi.mock('nanoid', () => ({
@@ -142,6 +144,60 @@ describe('panesSlice', () => {
         expect(layout.content.mode).toBe('claude')
       }
     })
+
+    it('does not auto-assign resumeSessionId for claude panes', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'claude' } })
+      )
+
+      const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      if (leaf.content.kind === 'terminal') {
+        expect(leaf.content.resumeSessionId).toBeUndefined()
+      }
+    })
+
+    it('preserves existing resumeSessionId for claude panes', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-1',
+          content: { kind: 'terminal', mode: 'claude', resumeSessionId: VALID_CLAUDE_SESSION_ID },
+        })
+      )
+
+      const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      if (leaf.content.kind === 'terminal') {
+        expect(leaf.content.resumeSessionId).toBe(VALID_CLAUDE_SESSION_ID)
+      }
+    })
+
+    it('does not assign resumeSessionId for shell panes', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
+      )
+
+      const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      if (leaf.content.kind === 'terminal') {
+        expect(leaf.content.resumeSessionId).toBeUndefined()
+      }
+    })
+
+    it('drops invalid resumeSessionId for claude panes', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-1',
+          content: { kind: 'terminal', mode: 'claude', resumeSessionId: 'not-a-uuid' },
+        })
+      )
+
+      const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      if (leaf.content.kind === 'terminal') {
+        expect(leaf.content.resumeSessionId).toBeUndefined()
+      }
+    })
   })
 
   describe('splitPane', () => {
@@ -181,6 +237,30 @@ describe('panesSlice', () => {
       }
       if (secondContent.kind === 'terminal') {
         expect(secondContent.mode).toBe('claude')
+      }
+    })
+
+    it('does not auto-assign resumeSessionId for claude panes created by splitPane', () => {
+      let state = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
+      )
+      const originalPaneId = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).id
+
+      state = panesReducer(
+        state,
+        splitPane({
+          tabId: 'tab-1',
+          paneId: originalPaneId,
+          direction: 'horizontal',
+          newContent: { kind: 'terminal', mode: 'claude' },
+        })
+      )
+
+      const split = state.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
+      const claudeLeaf = split.children[1] as Extract<PaneNode, { type: 'leaf' }>
+      if (claudeLeaf.content.kind === 'terminal') {
+        expect(claudeLeaf.content.resumeSessionId).toBeUndefined()
       }
     })
 
