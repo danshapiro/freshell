@@ -26,6 +26,7 @@ import { getSessionRepairService } from './session-scanner/service.js'
 import { createClientLogsRouter } from './client-logs.js'
 import { createStartupState } from './startup-state.js'
 import { getPerfConfig, initPerfLogging, setPerfLoggingEnabled, startPerfTimer, withPerfSpan } from './perf-logger.js'
+import { detectPlatform } from './platform.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -187,8 +188,9 @@ async function main() {
     res.json({ ips: detectLanIps() })
   })
 
-  app.get('/api/platform', (_req, res) => {
-    res.json({ platform: process.platform })
+  app.get('/api/platform', async (_req, res) => {
+    const platform = await detectPlatform()
+    res.json({ platform })
   })
 
   app.patch('/api/settings', async (req, res) => {

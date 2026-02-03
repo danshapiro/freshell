@@ -26,8 +26,12 @@ const nonShellOptions: PickerOption[] = [
   { type: 'editor', label: 'Editor', icon: FileText, shortcut: 'E' },
 ]
 
+function isWindowsLike(platform: string | null): boolean {
+  return platform === 'win32' || platform === 'wsl'
+}
+
 function getOptions(platform: string | null): PickerOption[] {
-  const shellOptions = platform === 'win32' ? windowsShellOptions : [shellOption]
+  const shellOptions = isWindowsLike(platform) ? windowsShellOptions : [shellOption]
   return [...shellOptions, ...nonShellOptions]
 }
 

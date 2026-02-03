@@ -56,6 +56,11 @@ export type MenuBuildContext = {
   expandedProjects: Set<string>
   contextElement: HTMLElement | null
   actions: MenuActions
+  platform: string | null
+}
+
+function isWindowsLike(platform: string | null): boolean {
+  return platform === 'win32' || platform === 'wsl'
 }
 
 function getSessionById(projects: ProjectGroup[], sessionId: string, provider?: string) {
@@ -67,7 +72,7 @@ function getSessionById(projects: ProjectGroup[], sessionId: string, provider?: 
 }
 
 export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): MenuItem[] {
-  const { actions, tabs, paneLayouts, sessions, view, sidebarCollapsed, expandedProjects, contextElement } = ctx
+  const { actions, tabs, paneLayouts, sessions, view, sidebarCollapsed, expandedProjects, contextElement, platform } = ctx
 
   if (target.kind === 'global') {
     const views: Array<{ id: AppView; label: string }> = [
@@ -95,11 +100,16 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
   }
 
   if (target.kind === 'tab-add') {
+    const shellItems: MenuItem[] = isWindowsLike(platform)
+      ? [
+          { type: 'item', id: 'new-cmd', label: 'New CMD tab', onSelect: () => actions.newTabWithPane('cmd') },
+          { type: 'item', id: 'new-powershell', label: 'New PowerShell tab', onSelect: () => actions.newTabWithPane('powershell') },
+          { type: 'item', id: 'new-wsl', label: 'New WSL tab', onSelect: () => actions.newTabWithPane('wsl') },
+        ]
+      : [{ type: 'item', id: 'new-shell', label: 'New Shell tab', onSelect: () => actions.newTabWithPane('shell') }]
+
     return [
-      { type: 'item', id: 'new-shell', label: 'New Shell tab', onSelect: () => actions.newTabWithPane('shell') },
-      { type: 'item', id: 'new-cmd', label: 'New CMD tab', onSelect: () => actions.newTabWithPane('cmd') },
-      { type: 'item', id: 'new-powershell', label: 'New PowerShell tab', onSelect: () => actions.newTabWithPane('powershell') },
-      { type: 'item', id: 'new-wsl', label: 'New WSL tab', onSelect: () => actions.newTabWithPane('wsl') },
+      ...shellItems,
       { type: 'separator', id: 'new-tab-sep' },
       { type: 'item', id: 'new-browser', label: 'New Browser tab', onSelect: () => actions.newTabWithPane('browser') },
       { type: 'item', id: 'new-editor', label: 'New Editor tab', onSelect: () => actions.newTabWithPane('editor') },

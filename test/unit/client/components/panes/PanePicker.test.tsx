@@ -244,5 +244,24 @@ describe('PanePicker', () => {
 
       expect(screen.getByText('Shell')).toBeInTheDocument()
     })
+
+    it('shows CMD, PowerShell, WSL options on WSL platform', () => {
+      mockUseAppSelector.mockReturnValue('wsl')
+      render(<PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={false} />)
+
+      expect(screen.getByText('CMD')).toBeInTheDocument()
+      expect(screen.getByText('PowerShell')).toBeInTheDocument()
+      expect(screen.getByText('WSL')).toBeInTheDocument()
+      expect(screen.queryByText('Shell')).not.toBeInTheDocument()
+    })
+
+    it('calls onSelect with cmd when CMD clicked on WSL', () => {
+      mockUseAppSelector.mockReturnValue('wsl')
+      render(<PanePicker onSelect={onSelect} onCancel={onCancel} isOnlyPane={false} />)
+
+      fireEvent.click(screen.getByText('CMD'))
+      completeFadeAnimation()
+      expect(onSelect).toHaveBeenCalledWith('cmd')
+    })
   })
 })

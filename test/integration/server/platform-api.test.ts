@@ -74,12 +74,13 @@ describe('Platform API', () => {
       expect(typeof res.body.platform).toBe('string')
     })
 
-    it('returns a valid Node.js platform value', async () => {
+    it('returns a valid platform value (including wsl)', async () => {
       const res = await request(app)
         .get('/api/platform')
         .set('x-auth-token', TEST_AUTH_TOKEN)
 
-      const validPlatforms = ['aix', 'darwin', 'freebsd', 'linux', 'openbsd', 'sunos', 'win32']
+      // Standard Node.js platforms plus 'wsl' for Windows Subsystem for Linux
+      const validPlatforms = ['aix', 'darwin', 'freebsd', 'linux', 'openbsd', 'sunos', 'win32', 'wsl']
       expect(validPlatforms).toContain(res.body.platform)
     })
 
