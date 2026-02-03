@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { execSync } from 'child_process'
+import fs from 'fs'
 
 vi.mock('child_process')
+vi.mock('fs')
 
 import {
   getWslIp,
@@ -10,6 +12,7 @@ import {
   getRequiredPorts,
   needsPortForwardingUpdate,
   buildPortForwardingScript,
+  setupWslPortForwarding,
   type PortProxyRule
 } from '../../../server/wsl-port-forward.js'
 
@@ -282,6 +285,104 @@ Address         Port        Address         Port
       expect(script).toContain('listenport=4000')
       expect(script).toContain('connectport=4000')
       expect(script).toContain('localport=4000')
+    })
+  })
+
+  describe('setupWslPortForwarding', () => {
+    const originalEnv = process.env
+
+    beforeEach(() => {
+      vi.clearAllMocks()
+      process.env = { ...originalEnv }
+      // Default: not WSL2
+      vi.mocked(fs.readFileSync).mockReturnValue('Linux version 5.10.0')
+    })
+
+    afterEach(() => {
+      vi.resetAllMocks()
+      process.env = originalEnv
+    })
+
+    it('returns not-wsl2 when not running in WSL2', () => {
+      vi.mocked(fs.readFileSync).mockReturnValue('Linux version 5.10.0-generic')
+
+      const result = setupWslPortForwarding()
+
+      expect(result).toBe('not-wsl2')
+    })
+
+    it('returns skipped when rules are already correct', () => {
+      // Mock WSL2 detection
+      vi.mocked(fs.readFileSync).mockReturnValue('Linux version 5.15.0-microsoft-standard-WSL2')
+
+      // Mock execSync calls in order
+      vi.mocked(execSync)
+        .mockReturnValueOnce('172.30.149.249\n') // hostname -I (getWslIp)
+        .mockReturnValueOnce(`
+Listen on ipv4:             Connect to ipv4:
+
+Address         Port        Address         Port
+--------------- ----------  --------------- ----------
+0.0.0.0         3001        172.30.149.249  3001
+0.0.0.0         5173        172.30.149.249  5173
+`) // netsh show (getExistingPortProxyRules)
+
+      const result = setupWslPortForwarding()
+
+      expect(result).toBe('skipped')
+    })
+
+    it('returns failed when WSL IP cannot be detected', () => {
+      vi.mocked(fs.readFileSync).mockReturnValue('Linux version 5.15.0-microsoft-standard-WSL2')
+      vi.mocked(execSync).mockImplementation(() => {
+        throw new Error('Command failed')
+      })
+
+      const result = setupWslPortForwarding()
+
+      expect(result).toBe('failed')
+    })
+
+    it('returns success when rules are applied and verified', () => {
+      vi.mocked(fs.readFileSync).mockReturnValue('Linux version 5.15.0-microsoft-standard-WSL2')
+
+      // Mock execSync calls in order
+      vi.mocked(execSync)
+        .mockReturnValueOnce('172.30.149.249\n') // hostname -I (getWslIp)
+        .mockReturnValueOnce('') // netsh show - no existing rules
+        .mockReturnValueOnce('') // PowerShell elevation
+        .mockReturnValueOnce(`
+Listen on ipv4:             Connect to ipv4:
+
+Address         Port        Address         Port
+--------------- ----------  --------------- ----------
+0.0.0.0         3001        172.30.149.249  3001
+0.0.0.0         5173        172.30.149.249  5173
+`) // netsh show - verification after elevation
+
+      const result = setupWslPortForwarding()
+
+      expect(result).toBe('success')
+      // Verify PowerShell was called with absolute path
+      expect(execSync).toHaveBeenCalledWith(
+        expect.stringContaining('/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'),
+        expect.anything()
+      )
+    })
+
+    it('returns failed when rules not applied after elevation (UAC cancelled)', () => {
+      vi.mocked(fs.readFileSync).mockReturnValue('Linux version 5.15.0-microsoft-standard-WSL2')
+
+      // Mock execSync calls in order
+      vi.mocked(execSync)
+        .mockReturnValueOnce('172.30.149.249\n') // hostname -I
+        .mockReturnValueOnce('') // netsh show - no existing rules
+        .mockReturnValueOnce('') // PowerShell (UAC cancelled, no error thrown)
+        .mockReturnValueOnce('') // netsh show - still no rules (verification fails)
+
+      const result = setupWslPortForwarding()
+
+      expect(result).toBe('failed')
     })
   })
 })

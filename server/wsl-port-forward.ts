@@ -1,7 +1,9 @@
 import { execSync } from 'child_process'
+import fs from 'fs'
 
 const IPV4_REGEX = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/
 const NETSH_PATH = '/mnt/c/Windows/System32/netsh.exe'
+const POWERSHELL_PATH = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
 const DEFAULT_PORT = 3001
 const DEV_PORT = 5173
 
@@ -140,4 +142,81 @@ export function buildPortForwardingScript(wslIp: string, ports: number[]): strin
   )
 
   return commands.join('; ')
+}
+
+/**
+ * Check if running inside WSL2.
+ */
+function isWSL2(): boolean {
+  try {
+    const version = fs.readFileSync('/proc/version', 'utf-8')
+    return version.toLowerCase().includes('microsoft')
+  } catch {
+    return false
+  }
+}
+
+export type SetupResult = 'success' | 'skipped' | 'failed' | 'not-wsl2'
+
+/**
+ * Set up Windows port forwarding for WSL2 LAN access.
+ *
+ * - Detects if running in WSL2
+ * - Gets required ports from environment
+ * - Checks existing port proxy rules
+ * - Launches elevated PowerShell to add/update rules if needed
+ * - Verifies rules were actually applied
+ *
+ * Returns:
+ * - 'not-wsl2': Not running in WSL2, no action needed
+ * - 'skipped': Rules already configured correctly
+ * - 'success': Rules were added/updated and verified
+ * - 'failed': Failed to configure (UAC dismissed, error, or verification failed)
+ */
+export function setupWslPortForwarding(): SetupResult {
+  if (!isWSL2()) {
+    return 'not-wsl2'
+  }
+
+  const wslIp = getWslIp()
+  if (!wslIp) {
+    console.error('[wsl-port-forward] Failed to detect WSL2 IP address')
+    return 'failed'
+  }
+
+  const requiredPorts = getRequiredPorts()
+  const existingRules = getExistingPortProxyRules()
+
+  if (!needsPortForwardingUpdate(wslIp, requiredPorts, existingRules)) {
+    console.log(`[wsl-port-forward] Rules up to date for ${wslIp}`)
+    return 'skipped'
+  }
+
+  console.log(`[wsl-port-forward] Configuring port forwarding for ${wslIp}...`)
+  console.log('[wsl-port-forward] UAC prompt required - please approve to enable LAN access')
+
+  try {
+    const script = buildPortForwardingScript(wslIp, requiredPorts)
+    // Escape single quotes for PowerShell ArgumentList
+    const escapedScript = script.replace(/'/g, "''")
+
+    execSync(
+      `${POWERSHELL_PATH} -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-Command', '${escapedScript}'"`,
+      { encoding: 'utf-8', timeout: 60000, stdio: 'inherit' }
+    )
+
+    // Verify rules were actually applied (UAC cancel doesn't always throw)
+    const verifyRules = getExistingPortProxyRules()
+    if (needsPortForwardingUpdate(wslIp, requiredPorts, verifyRules)) {
+      console.error('[wsl-port-forward] Rules were not applied - UAC may have been cancelled')
+      return 'failed'
+    }
+
+    console.log('[wsl-port-forward] Port forwarding configured successfully')
+    return 'success'
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err)
+    console.error(`[wsl-port-forward] Failed to configure: ${message}`)
+    return 'failed'
+  }
 }
