@@ -539,8 +539,7 @@ export class WsHandler {
     let messageType: string | undefined
     let payloadBytes: number | undefined
     if (perfConfig.enabled) {
-      if (typeof data === 'string') payloadBytes = data.length
-      else if (Array.isArray(data)) payloadBytes = data.reduce((sum, item) => sum + item.length, 0)
+      if (Array.isArray(data)) payloadBytes = data.reduce((sum, item) => sum + item.length, 0)
       else if (Buffer.isBuffer(data)) payloadBytes = data.length
       else if (data instanceof ArrayBuffer) payloadBytes = data.byteLength
     }
