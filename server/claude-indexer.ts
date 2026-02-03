@@ -14,6 +14,12 @@ const SEEN_SESSION_RETENTION_MS = Number(process.env.CLAUDE_SEEN_SESSION_RETENTI
 const MAX_SEEN_SESSION_IDS = Number(process.env.CLAUDE_SEEN_SESSION_MAX || 10_000)
 const INCREMENTAL_DEBOUNCE_MS = Number(process.env.CLAUDE_INDEXER_DEBOUNCE_MS || 250)
 const perfConfig = getPerfConfig()
+const IS_WINDOWS = process.platform === 'win32'
+
+const normalizeFilePath = (filePath: string) => {
+  const resolved = path.resolve(filePath)
+  return IS_WINDOWS ? resolved.toLowerCase() : resolved
+}
 
 export type ClaudeSession = {
   sessionId: string
@@ -116,6 +122,12 @@ type JsonlMetaAccumulator = {
 
 type JsonlMetaReadOptions = {
   maxBytes?: number
+}
+
+type CachedJsonlMeta = {
+  mtimeMs: number
+  size: number
+  meta: JsonlMeta
 }
 
 function parseTimestamp(value: unknown): number | undefined {
@@ -285,6 +297,7 @@ export class ClaudeSessionIndexer {
   private projectsByPath = new Map<string, ProjectGroup>()
   private incrementalTimers = new Map<string, NodeJS.Timeout>()
   private createdAtPinned = new Set<string>()
+  private fileCache = new Map<string, CachedJsonlMeta>()
 
   async start() {
     // Initial scan (populates knownSessionIds with existing sessions)
@@ -416,6 +429,7 @@ export class ClaudeSessionIndexer {
       filePath,
       setTimeout(() => {
         this.incrementalTimers.delete(filePath)
+        this.fileCache.delete(normalizeFilePath(filePath))
         const sessionId = path.basename(filePath, '.jsonl')
         if (this.removeSession(sessionId)) {
           this.rebuildProjects()
@@ -495,13 +509,22 @@ export class ClaudeSessionIndexer {
     try {
       stat = await fsp.stat(filePath)
     } catch {
+      this.fileCache.delete(normalizeFilePath(filePath))
       if (this.removeSession(sessionId)) {
         this.rebuildProjects()
       }
       return
     }
 
-    const meta = await parseSessionJsonlMeta(filePath)
+    const cacheKey = normalizeFilePath(filePath)
+    const mtimeMs = stat.mtimeMs || stat.mtime.getTime()
+    const size = stat.size
+    const cached = this.fileCache.get(cacheKey)
+    const meta =
+      cached && cached.mtimeMs === mtimeMs && cached.size === size ? cached.meta : await parseSessionJsonlMeta(filePath)
+    if (!cached || cached.mtimeMs !== mtimeMs || cached.size !== size) {
+      this.fileCache.set(cacheKey, { mtimeMs, size, meta })
+    }
     if (!meta.cwd) {
       if (this.removeSession(sessionId)) {
         this.rebuildProjects()
@@ -556,6 +579,7 @@ export class ClaudeSessionIndexer {
     let projectDirs: string[] = []
     let fileCount = 0
     let sessionCount = 0
+    const seenFiles = new Set<string>()
     try {
       projectDirs = (await fsp.readdir(projectsDir)).map((name) => path.join(projectsDir, name))
     } catch (err: any) {
@@ -563,6 +587,7 @@ export class ClaudeSessionIndexer {
       this.projects = []
       this.sessionsById.clear()
       this.projectsByPath.clear()
+      this.fileCache.clear()
       this.emitUpdate()
       endRefreshTimer({ error: 'projects_read_failed' })
       return
@@ -592,14 +617,24 @@ export class ClaudeSessionIndexer {
       const sessions: ClaudeSession[] = []
       for (const file of files) {
         const full = path.join(projectDir, file)
+        const cacheKey = normalizeFilePath(full)
+        seenFiles.add(cacheKey)
         let stat: any
         try {
           stat = await fsp.stat(full)
         } catch {
+          this.fileCache.delete(cacheKey)
           continue
         }
         const sessionId = path.basename(file, '.jsonl')
-        const meta = await parseSessionJsonlMeta(full)
+        const mtimeMs = stat.mtimeMs || stat.mtime.getTime()
+        const size = stat.size
+        const cached = this.fileCache.get(cacheKey)
+        const meta =
+          cached && cached.mtimeMs === mtimeMs && cached.size === size ? cached.meta : await parseSessionJsonlMeta(full)
+        if (!cached || cached.mtimeMs !== mtimeMs || cached.size !== size) {
+          this.fileCache.set(cacheKey, { mtimeMs, size, meta })
+        }
 
         // Skip orphaned sessions (no conversation events, just snapshots)
         if (!meta.cwd) continue
@@ -652,6 +687,11 @@ export class ClaudeSessionIndexer {
 
     this.projects = groups
     this.emitUpdate()
+    for (const cachedFile of this.fileCache.keys()) {
+      if (!seenFiles.has(cachedFile)) {
+        this.fileCache.delete(cachedFile)
+      }
+    }
     endRefreshTimer({ projectCount: groups.length, sessionCount, projectDirCount: projectDirs.length, fileCount })
   }
 

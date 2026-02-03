@@ -13,7 +13,7 @@ import { EventEmitter } from 'events'
 import { logger } from '../logger.js'
 import { createSessionScanner } from './scanner.js'
 import { SessionCache } from './cache.js'
-import { SessionRepairQueue, type Priority } from './queue.js'
+import { SessionRepairQueue, type Priority, ACTIVE_CACHE_GRACE_MS } from './queue.js'
 import type { SessionScanner, SessionScanResult, SessionRepairResult } from './types.js'
 
 const BACKUP_RETENTION_DAYS = 30
@@ -135,10 +135,37 @@ export class SessionRepairService extends EventEmitter {
    * Used by terminal.create before spawning Claude with --resume.
    */
   async waitForSession(sessionId: string, timeoutMs = 30000): Promise<SessionScanResult> {
-    const filePath = await this.resolveFilePath(sessionId)
-    if (filePath) {
-      this.queue.enqueue([{ sessionId, filePath, priority: 'active' }])
+    const existing = this.queue.getResult(sessionId)
+    if (existing) {
+      return existing
     }
+
+    const filePath = await this.resolveFilePath(sessionId)
+    if (!filePath) {
+      const missingResult: SessionScanResult = {
+        sessionId,
+        filePath: '',
+        status: 'missing',
+        chainDepth: 0,
+        orphanCount: 0,
+        fileSize: 0,
+        messageCount: 0,
+      }
+      this.sessionPathIndex.delete(sessionId)
+      this.queue.seedResult(sessionId, missingResult)
+      return missingResult
+    }
+
+    const cached = await this.cache.get(filePath, { allowStaleMs: ACTIVE_CACHE_GRACE_MS })
+    if (cached) {
+      if (cached.status === 'missing') {
+        this.sessionPathIndex.delete(sessionId)
+      }
+      this.queue.seedResult(sessionId, cached)
+      return cached
+    }
+
+    this.queue.enqueue([{ sessionId, filePath, priority: 'active' }])
     return this.queue.waitFor(sessionId, timeoutMs)
   }
 

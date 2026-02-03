@@ -7,6 +7,22 @@ import type { NormalizedEvent, ParsedSessionMeta } from '../types.js'
 import { parseClaudeEvent, isMessageEvent, isResultEvent, isToolResultContent, isToolUseContent, isTextContent } from '../../claude-stream-types.js'
 import { looksLikePath } from '../utils.js'
 
+const IS_WINDOWS = process.platform === 'win32'
+const PROJECT_PATH_CACHE_MAX = 2000
+const projectPathCache = new Map<string, string>()
+
+const normalizeProjectDir = (projectDir: string) => {
+  const resolved = path.resolve(projectDir)
+  return IS_WINDOWS ? resolved.toLowerCase() : resolved
+}
+
+function cacheProjectPath(cacheKey: string, projectPath: string) {
+  if (projectPathCache.size >= PROJECT_PATH_CACHE_MAX) {
+    projectPathCache.clear()
+  }
+  projectPathCache.set(cacheKey, projectPath)
+}
+
 export function defaultClaudeHome(): string {
   // Claude Code stores logs in ~/.claude by default (Linux/macOS).
   // On Windows, set CLAUDE_HOME to a path you can access from Node (e.g. \\wsl$\\...).
@@ -23,6 +39,10 @@ async function tryReadJson(filePath: string): Promise<any | null> {
 }
 
 async function resolveProjectPath(projectDir: string): Promise<string> {
+  const cacheKey = normalizeProjectDir(projectDir)
+  const cached = projectPathCache.get(cacheKey)
+  if (cached) return cached
+
   // Try known files first
   const candidates = ['project.json', 'metadata.json', 'config.json']
   for (const name of candidates) {
@@ -31,7 +51,10 @@ async function resolveProjectPath(projectDir: string): Promise<string> {
     if (json) {
       const possible =
         json.projectPath || json.path || json.cwd || json.root || json.project_root || json.project_root_path
-      if (typeof possible === 'string' && looksLikePath(possible)) return possible
+      if (typeof possible === 'string' && looksLikePath(possible)) {
+        cacheProjectPath(cacheKey, possible)
+        return possible
+      }
     }
   }
 
@@ -48,13 +71,18 @@ async function resolveProjectPath(projectDir: string): Promise<string> {
       const keys = ['projectPath', 'path', 'cwd', 'root']
       for (const k of keys) {
         const v = json[k]
-        if (typeof v === 'string' && looksLikePath(v)) return v
+        if (typeof v === 'string' && looksLikePath(v)) {
+          cacheProjectPath(cacheKey, v)
+          return v
+        }
       }
     }
   } catch {}
 
   // Fallback to directory name.
-  return path.basename(projectDir)
+  const fallback = path.basename(projectDir)
+  cacheProjectPath(cacheKey, fallback)
+  return fallback
 }
 
 export type JsonlMeta = {

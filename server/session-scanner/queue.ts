@@ -23,7 +23,7 @@ const PRIORITY_ORDER: Record<Priority, number> = {
 }
 
 const MAX_PROCESSED_CACHE = 1000
-const ACTIVE_CACHE_GRACE_MS = 15000
+export const ACTIVE_CACHE_GRACE_MS = 15000
 
 export interface QueueItem {
   sessionId: string
@@ -264,6 +264,14 @@ export class SessionRepairQueue extends EventEmitter {
         this.processed.delete(oldest)
       }
     }
+  }
+
+  /**
+   * Store a result and resolve any waiters without queueing work.
+   */
+  seedResult(sessionId: string, result: SessionScanResult): void {
+    this.setProcessed(sessionId, result)
+    this.resolveWaiting(sessionId, result)
   }
 
   /**
