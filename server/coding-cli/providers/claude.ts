@@ -2,6 +2,7 @@ import path from 'path'
 import os from 'os'
 import fsp from 'fs/promises'
 import { extractTitleFromMessage } from '../../title-utils.js'
+import { isValidClaudeSessionId } from '../../claude-session-id.js'
 import type { CodingCliProvider } from '../provider.js'
 import type { NormalizedEvent, ParsedSessionMeta } from '../types.js'
 import { parseClaudeEvent, isMessageEvent, isResultEvent, isToolResultContent, isToolUseContent, isTextContent } from '../../claude-stream-types.js'
@@ -155,7 +156,7 @@ export const claudeProvider: CodingCliProvider = {
 
   getStreamArgs(options) {
     const args = ['-p', options.prompt, '--output-format', 'stream-json']
-    if (options.resumeSessionId) {
+    if (options.resumeSessionId && isValidClaudeSessionId(options.resumeSessionId)) {
       args.push('--resume', options.resumeSessionId)
     }
     if (options.model) {
@@ -177,6 +178,7 @@ export const claudeProvider: CodingCliProvider = {
   },
 
   getResumeArgs(sessionId: string) {
+    if (!isValidClaudeSessionId(sessionId)) return []
     return ['--resume', sessionId]
   },
 

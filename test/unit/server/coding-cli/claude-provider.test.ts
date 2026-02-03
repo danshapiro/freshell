@@ -5,6 +5,8 @@ import { claudeProvider, defaultClaudeHome, parseSessionContent } from '../../..
 import { ClaudeSessionIndexer, applyOverride } from '../../../../server/claude-indexer'
 import { looksLikePath } from '../../../../server/coding-cli/utils'
 
+const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
+
 describe('claudeProvider.resolveProjectPath()', () => {
   it('returns cwd from session metadata (like Codex)', async () => {
     const meta = { cwd: '/home/user/my-project' }
@@ -18,6 +20,19 @@ describe('claudeProvider.resolveProjectPath()', () => {
     expect(result).toBe('unknown')
   })
 
+})
+
+describe('claudeProvider.getStreamArgs()', () => {
+  it('includes --resume when resumeSessionId is a valid UUID', () => {
+    const args = claudeProvider.getStreamArgs({ prompt: 'hi', resumeSessionId: VALID_CLAUDE_SESSION_ID })
+    expect(args).toContain('--resume')
+    expect(args).toContain(VALID_CLAUDE_SESSION_ID)
+  })
+
+  it('omits --resume when resumeSessionId is invalid', () => {
+    const args = claudeProvider.getStreamArgs({ prompt: 'hi', resumeSessionId: 'not-a-uuid' })
+    expect(args).not.toContain('--resume')
+  })
 })
 
 describe('claude provider cross-platform tests', () => {

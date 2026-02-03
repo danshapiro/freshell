@@ -9,6 +9,7 @@ import { logger } from './logger.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
 import type { AppSettings } from './config-store.js'
 import { isReachableDirectorySync } from './path-utils.js'
+import { isValidClaudeSessionId } from './claude-session-id.js'
 
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
 const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 64 * 1024)
@@ -75,6 +76,14 @@ function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string) {
     }
   }
   return { command, args, label: spec.label }
+}
+
+function normalizeResumeSessionId(mode: TerminalMode, resumeSessionId?: string): string | undefined {
+  if (!resumeSessionId) return undefined
+  if (mode !== 'claude') return resumeSessionId
+  if (isValidClaudeSessionId(resumeSessionId)) return resumeSessionId
+  logger.warn({ resumeSessionId }, 'Ignoring invalid Claude resumeSessionId')
+  return undefined
 }
 
 function getModeLabel(mode: TerminalMode): string {
@@ -345,6 +354,8 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
     COLORTERM: process.env.COLORTERM || 'truecolor',
   }
 
+  const normalizedResume = normalizeResumeSessionId(mode, resumeSessionId)
+
   // Resolve shell for the current platform
   const effectiveShell = resolveShell(shell)
 
@@ -393,7 +404,7 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
         return { file: wsl, args, cwd: undefined, env }
       }
 
-      const cli = resolveCodingCliCommand(mode, resumeSessionId)
+      const cli = resolveCodingCliCommand(mode, normalizedResume)
       if (!cli) {
         args.push('--exec', 'bash', '-l')
         return { file: wsl, args, cwd: undefined, env }
@@ -430,7 +441,7 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
         }
         return { file, args: ['/K'], cwd: procCwd, env }
       }
-      const cli = resolveCodingCliCommand(mode, resumeSessionId)
+      const cli = resolveCodingCliCommand(mode, normalizedResume)
       const cmd = cli?.command || mode
       const resume = cli?.args.length ? ` ${cli.args.join(' ')}` : ''
       const cd = winCwd ? `cd /d "${winCwd}" && ` : ''
@@ -459,7 +470,7 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
       return { file, args: ['-NoLogo'], cwd: procCwd, env }
     }
 
-    const cli = resolveCodingCliCommand(mode, resumeSessionId)
+    const cli = resolveCodingCliCommand(mode, normalizedResume)
     const cmd = cli?.command || mode
     const resumeArgs = cli?.args.length ? ` ${cli.args.join(' ')}` : ''
     const cd = winCwd ? `Set-Location -LiteralPath "${winCwd}"; ` : ''
@@ -473,7 +484,7 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
     return { file: systemShell, args: ['-l'], cwd, env }
   }
 
-  const cli = resolveCodingCliCommand(mode, resumeSessionId)
+  const cli = resolveCodingCliCommand(mode, normalizedResume)
   const cmd = cli?.command || mode
   const args = cli?.args || []
   return { file: cmd, args, cwd, env }
@@ -669,8 +680,9 @@ export class TerminalRegistry extends EventEmitter {
     const rows = opts.rows || 30
 
     const cwd = opts.cwd || getDefaultCwd(this.settings) || (isWindows() ? undefined : os.homedir())
+    const normalizedResume = normalizeResumeSessionId(opts.mode, opts.resumeSessionId)
 
-    const { file, args, env, cwd: procCwd } = buildSpawnSpec(opts.mode, cwd, opts.shell || 'system', opts.resumeSessionId)
+    const { file, args, env, cwd: procCwd } = buildSpawnSpec(opts.mode, cwd, opts.shell || 'system', normalizedResume)
 
     const endSpawnTimer = startPerfTimer(
       'terminal_spawn',
@@ -696,7 +708,7 @@ export class TerminalRegistry extends EventEmitter {
       title,
       description: undefined,
       mode: opts.mode,
-      resumeSessionId: opts.resumeSessionId,
+      resumeSessionId: normalizedResume,
       createdAt,
       lastActivityAt: createdAt,
       status: 'running',
@@ -1029,6 +1041,10 @@ export class TerminalRegistry extends EventEmitter {
   setResumeSessionId(terminalId: string, sessionId: string): boolean {
     const term = this.terminals.get(terminalId)
     if (!term) return false
+    if (term.mode === 'claude' && !isValidClaudeSessionId(sessionId)) {
+      logger.warn({ sessionId, terminalId }, 'Ignoring invalid Claude resumeSessionId')
+      return false
+    }
     term.resumeSessionId = sessionId
     return true
   }
