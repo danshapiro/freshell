@@ -149,16 +149,44 @@ function isWindows(): boolean {
 }
 
 /**
+ * Detect if running inside Windows Subsystem for Linux.
+ * Uses environment variables set by WSL.
+ */
+export function isWsl(): boolean {
+  return process.platform === 'linux' && (
+    !!process.env.WSL_DISTRO_NAME ||
+    !!process.env.WSL_INTEROP ||
+    !!process.env.WSLENV
+  )
+}
+
+/**
+ * Returns true if Windows shells (cmd, powershell) are available.
+ * This is true on native Windows and in WSL (via interop).
+ */
+export function isWindowsLike(): boolean {
+  return isWindows() || isWsl()
+}
+
+/**
  * Resolve the effective shell based on platform and requested shell type.
- * - Windows: 'system' → 'cmd', others pass through
- * - macOS/Linux: always normalize to 'system' (use $SHELL or fallback)
+ * - Windows/WSL: 'system' → platform default, others pass through
+ * - macOS/Linux (non-WSL): always normalize to 'system' (use $SHELL or fallback)
  */
 function resolveShell(requested: ShellType): ShellType {
   if (isWindows()) {
-    // On Windows, 'system' maps to cmd (or ComSpec)
+    // On native Windows, 'system' maps to cmd (or ComSpec)
     return requested === 'system' ? 'cmd' : requested
   }
-  // On macOS/Linux, always use 'system' shell
+  if (isWsl()) {
+    // On WSL, 'system' and 'wsl' both use the Linux shell
+    // 'cmd' and 'powershell' use Windows executables via interop
+    if (requested === 'system' || requested === 'wsl') {
+      return 'system'
+    }
+    return requested // 'cmd' or 'powershell' pass through
+  }
+  // On macOS/Linux (non-WSL), always use 'system' shell
   // Windows-specific options are normalized to system
   return 'system'
 }
@@ -220,9 +248,14 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
   // Resolve shell for the current platform
   const effectiveShell = resolveShell(shell)
 
-  if (isWindows()) {
+  // In WSL with 'system' shell (which 'wsl' resolves to), use Linux shell directly
+  // For 'cmd' or 'powershell' in WSL, fall through to Windows shell handling
+  const inWslWithLinuxShell = isWsl() && effectiveShell === 'system'
+
+  if (isWindowsLike() && !inWslWithLinuxShell) {
     // If the cwd is a Linux path, force WSL mode since native Windows shells can't use it
-    const forceWsl = isLinuxPath(cwd)
+    // (Only applies on native Windows, not when already in WSL)
+    const forceWsl = isWindows() && isLinuxPath(cwd)
 
     // Use protocol-specified shell, falling back to env var for backwards compatibility
     const windowsMode = forceWsl
@@ -231,7 +264,8 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
         ? effectiveShell
         : (process.env.WINDOWS_SHELL || 'wsl').toLowerCase()
 
-    // Option A: WSL (default) — recommended for coding CLIs on Windows.
+    // Option A: WSL (from native Windows) — recommended for coding CLIs on Windows.
+    // This path is skipped when already running inside WSL.
     if (windowsMode === 'wsl') {
       const wsl = process.env.WSL_EXE || 'wsl.exe'
       const distro = process.env.WSL_DISTRO // optional

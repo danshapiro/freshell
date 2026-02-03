@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import express, { type Express } from 'express'
 import request from 'supertest'
+import { detectPlatform } from '../../../server/platform.js'
 
 const TEST_AUTH_TOKEN = 'test-auth-token-12345678'
 
@@ -27,9 +28,10 @@ describe('Platform API', () => {
       next()
     })
 
-    // Platform endpoint (mirrors server/index.ts implementation)
-    app.get('/api/platform', (_req, res) => {
-      res.json({ platform: process.platform })
+    // Platform endpoint (uses detectPlatform matching server/index.ts implementation)
+    app.get('/api/platform', async (_req, res) => {
+      const platform = await detectPlatform()
+      res.json({ platform })
     })
   })
 

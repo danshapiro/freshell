@@ -7,6 +7,7 @@ import { Provider } from 'react-redux'
 import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import sessionsReducer from '@/store/sessionsSlice'
+import connectionReducer from '@/store/connectionSlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 
@@ -30,12 +31,13 @@ vi.mock('@/lib/api', () => ({
   },
 }))
 
-function createTestStore() {
+function createTestStore(options?: { platform?: string | null }) {
   return configureStore({
     reducer: {
       tabs: tabsReducer,
       panes: panesReducer,
       sessions: sessionsReducer,
+      connection: connectionReducer,
     },
     middleware: (getDefaultMiddleware) =>
       getDefaultMiddleware({ serializableCheck: false }),
@@ -72,12 +74,16 @@ function createTestStore() {
         projects: [],
         expandedProjects: new Set<string>(),
       },
+      connection: {
+        status: 'ready',
+        platform: options?.platform ?? null,
+      },
     },
   })
 }
 
-function renderWithProvider(ui: React.ReactNode) {
-  const store = createTestStore()
+function renderWithProvider(ui: React.ReactNode, options?: { platform?: string | null }) {
+  const store = createTestStore(options)
   const utils = render(
     <Provider store={store}>
       <ContextMenuProvider
@@ -288,5 +294,78 @@ describe('ContextMenuProvider', () => {
         }
       }
     }
+  })
+
+  describe('platform-specific tab-add menu', () => {
+    it('shows Shell option on non-Windows platforms', async () => {
+      const user = userEvent.setup()
+      renderWithProvider(
+        <div data-context={ContextIds.TabAdd}>Add Tab</div>,
+        { platform: 'darwin' }
+      )
+
+      await user.pointer({ target: screen.getByText('Add Tab'), keys: '[MouseRight]' })
+
+      expect(screen.getByText('New Shell tab')).toBeInTheDocument()
+      expect(screen.queryByText('New CMD tab')).not.toBeInTheDocument()
+      expect(screen.queryByText('New PowerShell tab')).not.toBeInTheDocument()
+      expect(screen.queryByText('New WSL tab')).not.toBeInTheDocument()
+    })
+
+    it('shows Windows shell options on win32 platform', async () => {
+      const user = userEvent.setup()
+      renderWithProvider(
+        <div data-context={ContextIds.TabAdd}>Add Tab</div>,
+        { platform: 'win32' }
+      )
+
+      await user.pointer({ target: screen.getByText('Add Tab'), keys: '[MouseRight]' })
+
+      expect(screen.getByText('New CMD tab')).toBeInTheDocument()
+      expect(screen.getByText('New PowerShell tab')).toBeInTheDocument()
+      expect(screen.getByText('New WSL tab')).toBeInTheDocument()
+      expect(screen.queryByText('New Shell tab')).not.toBeInTheDocument()
+    })
+
+    it('shows Windows shell options on wsl platform', async () => {
+      const user = userEvent.setup()
+      renderWithProvider(
+        <div data-context={ContextIds.TabAdd}>Add Tab</div>,
+        { platform: 'wsl' }
+      )
+
+      await user.pointer({ target: screen.getByText('Add Tab'), keys: '[MouseRight]' })
+
+      expect(screen.getByText('New CMD tab')).toBeInTheDocument()
+      expect(screen.getByText('New PowerShell tab')).toBeInTheDocument()
+      expect(screen.getByText('New WSL tab')).toBeInTheDocument()
+      expect(screen.queryByText('New Shell tab')).not.toBeInTheDocument()
+    })
+
+    it('shows Shell option when platform is null', async () => {
+      const user = userEvent.setup()
+      renderWithProvider(
+        <div data-context={ContextIds.TabAdd}>Add Tab</div>,
+        { platform: null }
+      )
+
+      await user.pointer({ target: screen.getByText('Add Tab'), keys: '[MouseRight]' })
+
+      expect(screen.getByText('New Shell tab')).toBeInTheDocument()
+      expect(screen.queryByText('New CMD tab')).not.toBeInTheDocument()
+    })
+
+    it('always shows Browser and Editor options', async () => {
+      const user = userEvent.setup()
+      renderWithProvider(
+        <div data-context={ContextIds.TabAdd}>Add Tab</div>,
+        { platform: 'win32' }
+      )
+
+      await user.pointer({ target: screen.getByText('Add Tab'), keys: '[MouseRight]' })
+
+      expect(screen.getByText('New Browser tab')).toBeInTheDocument()
+      expect(screen.getByText('New Editor tab')).toBeInTheDocument()
+    })
   })
 })

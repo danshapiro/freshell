@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { isLinuxPath, getSystemShell, escapeCmdExe, buildSpawnSpec, TerminalRegistry } from '../../../server/terminal-registry'
+import { isLinuxPath, getSystemShell, escapeCmdExe, buildSpawnSpec, TerminalRegistry, isWsl, isWindowsLike } from '../../../server/terminal-registry'
 import * as fs from 'fs'
 
 // Mock fs.existsSync for shell existence checks
@@ -316,6 +316,112 @@ describe('isLinuxPath', () => {
     it('identifies /Users/dan as Linux path', () => {
       expect(isLinuxPath('/Users/dan')).toBe(true)
     })
+  })
+})
+
+/**
+ * Tests for isWsl
+ * This function detects if running inside Windows Subsystem for Linux
+ * by checking for WSL-specific environment variables.
+ */
+describe('isWsl', () => {
+  const originalPlatform = process.platform
+  const originalEnv = { ...process.env }
+
+  afterEach(() => {
+    Object.defineProperty(process, 'platform', { value: originalPlatform })
+    process.env = { ...originalEnv }
+  })
+
+  it('returns false on Windows', () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+    process.env.WSL_DISTRO_NAME = 'Ubuntu'
+
+    expect(isWsl()).toBe(false)
+  })
+
+  it('returns false on macOS', () => {
+    Object.defineProperty(process, 'platform', { value: 'darwin' })
+
+    expect(isWsl()).toBe(false)
+  })
+
+  it('returns false on native Linux without WSL env vars', () => {
+    Object.defineProperty(process, 'platform', { value: 'linux' })
+    delete process.env.WSL_DISTRO_NAME
+    delete process.env.WSL_INTEROP
+    delete process.env.WSLENV
+
+    expect(isWsl()).toBe(false)
+  })
+
+  it('returns true on Linux with WSL_DISTRO_NAME', () => {
+    Object.defineProperty(process, 'platform', { value: 'linux' })
+    process.env.WSL_DISTRO_NAME = 'Ubuntu'
+    delete process.env.WSL_INTEROP
+    delete process.env.WSLENV
+
+    expect(isWsl()).toBe(true)
+  })
+
+  it('returns true on Linux with WSL_INTEROP', () => {
+    Object.defineProperty(process, 'platform', { value: 'linux' })
+    delete process.env.WSL_DISTRO_NAME
+    process.env.WSL_INTEROP = '/run/WSL/123_interop'
+    delete process.env.WSLENV
+
+    expect(isWsl()).toBe(true)
+  })
+
+  it('returns true on Linux with WSLENV', () => {
+    Object.defineProperty(process, 'platform', { value: 'linux' })
+    delete process.env.WSL_DISTRO_NAME
+    delete process.env.WSL_INTEROP
+    process.env.WSLENV = 'PATH/l'
+
+    expect(isWsl()).toBe(true)
+  })
+})
+
+/**
+ * Tests for isWindowsLike
+ * Returns true when Windows shells are available (native Windows or WSL).
+ */
+describe('isWindowsLike', () => {
+  const originalPlatform = process.platform
+  const originalEnv = { ...process.env }
+
+  afterEach(() => {
+    Object.defineProperty(process, 'platform', { value: originalPlatform })
+    process.env = { ...originalEnv }
+  })
+
+  it('returns true on Windows', () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+
+    expect(isWindowsLike()).toBe(true)
+  })
+
+  it('returns false on macOS', () => {
+    Object.defineProperty(process, 'platform', { value: 'darwin' })
+
+    expect(isWindowsLike()).toBe(false)
+  })
+
+  it('returns false on native Linux', () => {
+    Object.defineProperty(process, 'platform', { value: 'linux' })
+    delete process.env.WSL_DISTRO_NAME
+    delete process.env.WSL_INTEROP
+    delete process.env.WSLENV
+
+    expect(isWindowsLike()).toBe(false)
+  })
+
+  it('returns true on WSL', () => {
+    Object.defineProperty(process, 'platform', { value: 'linux' })
+    process.env.WSL_DISTRO_NAME = 'Ubuntu'
+
+    expect(isWindowsLike()).toBe(true)
   })
 })
 
@@ -980,6 +1086,125 @@ describe('buildSpawnSpec Unix paths', () => {
     it('handles paths with multiple consecutive dots in name', () => {
       const spec = buildSpawnSpec('shell', '/home/user/project..old', 'system')
       expect(spec.cwd).toBe('/home/user/project..old')
+    })
+  })
+})
+
+/**
+ * Tests for buildSpawnSpec - WSL (Windows Subsystem for Linux) code paths
+ *
+ * These tests verify spawn spec generation when running inside WSL.
+ * In WSL, we can spawn Windows executables (cmd.exe, powershell.exe) via interop,
+ * but 'wsl' and 'system' shells should use the native Linux shell.
+ */
+describe('buildSpawnSpec WSL paths', () => {
+  const originalPlatform = process.platform
+  const originalEnv = { ...process.env }
+
+  function mockWsl() {
+    Object.defineProperty(process, 'platform', {
+      value: 'linux',
+      writable: true,
+      configurable: true,
+    })
+    process.env.WSL_DISTRO_NAME = 'Ubuntu'
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks()
+    process.env = { ...originalEnv }
+    vi.mocked(fs.existsSync).mockReturnValue(true)
+  })
+
+  afterEach(() => {
+    Object.defineProperty(process, 'platform', {
+      value: originalPlatform,
+      writable: true,
+      configurable: true,
+    })
+    process.env = originalEnv
+  })
+
+  describe('shell type handling in WSL', () => {
+    it('uses Linux shell for system shell type in WSL', () => {
+      mockWsl()
+      process.env.SHELL = '/bin/bash'
+
+      const spec = buildSpawnSpec('shell', '/home/user/project', 'system')
+
+      expect(spec.file).toBe('/bin/bash')
+      expect(spec.args).toContain('-l')
+      expect(spec.cwd).toBe('/home/user/project')
+    })
+
+    it('uses Linux shell for wsl shell type in WSL', () => {
+      mockWsl()
+      process.env.SHELL = '/bin/bash'
+
+      const spec = buildSpawnSpec('shell', '/home/user/project', 'wsl')
+
+      expect(spec.file).toBe('/bin/bash')
+      expect(spec.args).toContain('-l')
+    })
+
+    it('uses cmd.exe for cmd shell type in WSL', () => {
+      mockWsl()
+
+      const spec = buildSpawnSpec('shell', '/home/user/project', 'cmd')
+
+      expect(spec.file).toBe('cmd.exe')
+      expect(spec.args).toContain('/K')
+    })
+
+    it('uses powershell.exe for powershell shell type in WSL', () => {
+      mockWsl()
+
+      const spec = buildSpawnSpec('shell', '/home/user/project', 'powershell')
+
+      expect(spec.file.toLowerCase()).toContain('powershell')
+      expect(spec.args).toContain('-NoLogo')
+    })
+  })
+
+  describe('cwd handling for Windows shells in WSL', () => {
+    it('ignores Linux paths for cmd.exe in WSL', () => {
+      mockWsl()
+
+      const spec = buildSpawnSpec('shell', '/home/user/project', 'cmd')
+
+      // Linux paths should be ignored for cmd.exe since it can't handle them
+      expect(spec.cwd).toBeUndefined()
+    })
+
+    it('ignores Linux paths for powershell.exe in WSL', () => {
+      mockWsl()
+
+      const spec = buildSpawnSpec('shell', '/home/user/project', 'powershell')
+
+      // Linux paths should be ignored for powershell.exe since it can't handle them
+      expect(spec.cwd).toBeUndefined()
+    })
+  })
+
+  describe('coding CLI modes in WSL with Linux shell', () => {
+    it('spawns claude directly in WSL with system shell', () => {
+      mockWsl()
+      delete process.env.CLAUDE_CMD
+
+      const spec = buildSpawnSpec('claude', '/home/user/project', 'system')
+
+      expect(spec.file).toBe('claude')
+      expect(spec.cwd).toBe('/home/user/project')
+    })
+
+    it('spawns codex directly in WSL with system shell', () => {
+      mockWsl()
+      delete process.env.CODEX_CMD
+
+      const spec = buildSpawnSpec('codex', '/home/user/project', 'system')
+
+      expect(spec.file).toBe('codex')
+      expect(spec.cwd).toBe('/home/user/project')
     })
   })
 })
@@ -2208,11 +2433,15 @@ describe('buildSpawnSpec Unix paths', () => {
         expect(specWsl.file).toBe('/bin/zsh')
       })
 
-      it('normalizes windows shell types to system on linux', () => {
+      it('normalizes windows shell types to system on native linux (not WSL)', () => {
         mockPlatform('linux')
         process.env.SHELL = '/bin/bash'
+        // Clear WSL env vars to simulate native Linux (not WSL)
+        delete process.env.WSL_DISTRO_NAME
+        delete process.env.WSL_INTEROP
+        delete process.env.WSLENV
 
-        // cmd, powershell, and wsl should all normalize to system shell on Linux
+        // cmd, powershell, and wsl should all normalize to system shell on native Linux
         const specCmd = buildSpawnSpec('shell', '/home/user', 'cmd')
         const specPowershell = buildSpawnSpec('shell', '/home/user', 'powershell')
         const specWsl = buildSpawnSpec('shell', '/home/user', 'wsl')
