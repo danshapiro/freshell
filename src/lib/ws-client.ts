@@ -73,7 +73,7 @@ export class WsClient {
 
     this.intentionalClose = false
     this._state = 'connecting'
-    if (perfConfig.enabled) {
+    if (isClientPerfLoggingEnabled()) {
       this.connectStartedAt = performance.now()
     }
 
@@ -111,7 +111,7 @@ export class WsClient {
 
       this.ws.onmessage = (event) => {
         let payloadBytes: number | undefined
-        if (perfConfig.enabled) {
+        if (isClientPerfLoggingEnabled()) {
           if (typeof event.data === 'string') payloadBytes = event.data.length
           else if (event.data instanceof Blob) payloadBytes = event.data.size
           else if (event.data instanceof ArrayBuffer) payloadBytes = event.data.byteLength
@@ -131,7 +131,7 @@ export class WsClient {
           this.wasConnectedOnce = true
           this._state = 'ready'
 
-          if (perfConfig.enabled && this.connectStartedAt !== null) {
+          if (isClientPerfLoggingEnabled() && this.connectStartedAt !== null) {
             const durationMs = performance.now() - this.connectStartedAt
             this.connectStartedAt = null
             if (durationMs >= perfConfig.wsReadySlowMs) {
@@ -166,7 +166,7 @@ export class WsClient {
           return
         }
 
-        if (perfConfig.enabled) {
+        if (isClientPerfLoggingEnabled()) {
           const start = performance.now()
           this.messageHandlers.forEach((handler) => handler(msg))
           const durationMs = performance.now() - start
@@ -213,7 +213,7 @@ export class WsClient {
           finishReject(new Error('Connection closed before ready'))
         }
 
-        if (perfConfig.enabled) {
+        if (isClientPerfLoggingEnabled()) {
           logClientPerf('perf.ws_closed', {
             code: event.code,
             reason: event.reason,
@@ -250,7 +250,7 @@ export class WsClient {
       }
     }, delay)
 
-    if (perfConfig.enabled) {
+    if (isClientPerfLoggingEnabled()) {
       logClientPerf('perf.ws_reconnect_scheduled', {
         delayMs: delay,
         attempt: this.reconnectAttempts,
@@ -284,7 +284,7 @@ export class WsClient {
     }
     this.pendingMessages.push(msg)
 
-    if (perfConfig.enabled && this.pendingMessages.length >= perfConfig.wsQueueWarnSize) {
+    if (isClientPerfLoggingEnabled() && this.pendingMessages.length >= perfConfig.wsQueueWarnSize) {
       const now = Date.now()
       if (now - this.lastQueueLogAt >= perfConfig.rateLimitMs) {
         this.lastQueueLogAt = now

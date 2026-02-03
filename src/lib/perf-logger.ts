@@ -46,6 +46,9 @@ const perfFlag = typeof __PERF_LOGGING__ !== 'undefined' && __PERF_LOGGING__
   ? __PERF_LOGGING__
   : import.meta.env.VITE_PERF_LOGGING
 const perfConfig = resolveClientPerfConfig(perfFlag)
+// Perf logging is controlled by the runtime debug switch, not build-time flags.
+let perfSwitchEnabled = false
+perfConfig.enabled = false
 const lastLogByKey = new Map<string, number>()
 let perfInitialized = false
 let memoryTimer: number | null = null
@@ -60,12 +63,13 @@ export function getClientPerfConfig(): ClientPerfConfig {
 }
 
 export function isClientPerfLoggingEnabled(): boolean {
-  return perfConfig.enabled
+  return perfSwitchEnabled
 }
 
 export function setClientPerfEnabled(enabled: boolean, source?: string): void {
-  if (perfConfig.enabled === enabled) return
+  if (perfSwitchEnabled === enabled) return
   if (enabled) {
+    perfSwitchEnabled = true
     perfConfig.enabled = true
     if (perfInitialized) {
       startMemorySampling()
@@ -78,6 +82,7 @@ export function setClientPerfEnabled(enabled: boolean, source?: string): void {
 
   // Log before disabling to ensure it is recorded.
   logClientPerf('perf_logging_toggled', { enabled: false, source })
+  perfSwitchEnabled = false
   perfConfig.enabled = false
   if (memoryTimer !== null && typeof window !== 'undefined') {
     window.clearInterval(memoryTimer)
@@ -86,7 +91,7 @@ export function setClientPerfEnabled(enabled: boolean, source?: string): void {
 }
 
 function shouldLog(key: string, intervalMs: number): boolean {
-  if (!perfConfig.enabled) return false
+  if (!perfSwitchEnabled) return false
   const now = Date.now()
   const last = lastLogByKey.get(key) || 0
   if (now - last < intervalMs) return false
@@ -161,7 +166,7 @@ export function logClientPerf(
   context: Record<string, unknown> = {},
   level: 'debug' | 'info' | 'warn' | 'error' = 'info',
 ) {
-  if (!perfConfig.enabled) return
+  if (!perfSwitchEnabled) return
   const payload = { event, perf: true, ...context }
   if (level === 'error') console.error(payload)
   else if (level === 'warn') console.warn(payload)
@@ -303,7 +308,7 @@ function startMemorySampling() {
 }
 
 export function initClientPerfLogging(): void {
-  if (!perfConfig.enabled || perfInitialized) return
+  if (!perfSwitchEnabled || perfInitialized) return
   if (typeof window === 'undefined' || typeof performance === 'undefined') return
   perfInitialized = true
 
