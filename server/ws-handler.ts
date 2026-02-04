@@ -48,6 +48,8 @@ import {
   SdkSetModelSchema,
   SdkSetPermissionModeSchema,
 } from '../shared/ws-protocol.js'
+import { UiLayoutSyncSchema } from './agent-api/layout-schema.js'
+import type { LayoutStore } from './agent-api/layout-store.js'
 
 const MAX_CONNECTIONS = Number(process.env.MAX_CONNECTIONS || 50)
 const HELLO_TIMEOUT_MS = Number(process.env.HELLO_TIMEOUT_MS || 5_000)
@@ -247,6 +249,7 @@ const ClientMessageSchema = z.discriminatedUnion('type', [
   SdkAttachSchema,
   SdkSetModelSchema,
   SdkSetPermissionModeSchema,
+  UiLayoutSyncSchema,
 ])
 
 type ClientState = {
@@ -289,6 +292,7 @@ export class WsHandler {
   private handshakeSnapshotProvider?: HandshakeSnapshotProvider
   private terminalMetaListProvider?: () => TerminalMeta[]
   private tabsRegistryStore?: TabsRegistryStore
+  private layoutStore?: LayoutStore
   private readonly serverInstanceId: string
   private sessionRepairListeners?: {
     scanned: (result: SessionScanResult) => void
@@ -306,11 +310,13 @@ export class WsHandler {
     terminalMetaListProvider?: () => TerminalMeta[],
     tabsRegistryStore?: TabsRegistryStore,
     serverInstanceId?: string,
+    layoutStore?: LayoutStore,
   ) {
     this.sessionRepairService = sessionRepairService
     this.handshakeSnapshotProvider = handshakeSnapshotProvider
     this.terminalMetaListProvider = terminalMetaListProvider
     this.tabsRegistryStore = tabsRegistryStore
+    this.layoutStore = layoutStore
     this.serverInstanceId = serverInstanceId && serverInstanceId.trim().length > 0
       ? serverInstanceId
       : `srv-${randomUUID()}`
@@ -1062,6 +1068,12 @@ export class WsHandler {
       }
 
       switch (m.type) {
+      case 'ui.layout.sync': {
+        if (this.layoutStore) {
+          this.layoutStore.updateFromUi(m, ws.connectionId || 'unknown')
+        }
+        return
+      }
       case 'terminal.create': {
         log.debug({
           requestId: m.requestId,

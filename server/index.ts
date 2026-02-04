@@ -48,6 +48,8 @@ import { createSettingsRouter } from './settings-router.js'
 import { createPerfRouter } from './perf-router.js'
 import { createAiRouter } from './ai-router.js'
 import { createDebugRouter } from './debug-router.js'
+import { LayoutStore } from './agent-api/layout-store.js'
+import { createAgentApiRouter } from './agent-api/router.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -127,6 +129,8 @@ async function main() {
   const settings = migrateSettingsSortMode(await configStore.getSettings())
   const registry = new TerminalRegistry(settings)
   const terminalMetadata = new TerminalMetadataService()
+  const layoutStore = new LayoutStore()
+  const terminalMetadata = new TerminalMetadataService()
 
   const sessionRepairService = getSessionRepairService()
   const serverInstanceId = await loadOrCreateServerInstanceId()
@@ -156,12 +160,14 @@ async function main() {
     () => terminalMetadata.list(),
     tabsRegistryStore,
     serverInstanceId,
+    layoutStore,
   )
   const port = Number(process.env.PORT || 3001)
   const isDev = process.env.NODE_ENV !== 'production'
   const vitePort = isDev ? Number(process.env.VITE_PORT || 5173) : undefined
   const networkManager = new NetworkManager(server, configStore, port, isDev, vitePort)
   networkManager.setWsHandler(wsHandler)
+  app.use('/api', createAgentApiRouter({ layoutStore, registry, wsHandler }))
 
   const sessionsSync = new SessionsSyncService(wsHandler)
   const associationCoordinator = new SessionAssociationCoordinator(registry, ASSOCIATION_MAX_AGE_MS)
