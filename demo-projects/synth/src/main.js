@@ -543,15 +543,18 @@ function buildSequencer(parent) {
     bpmValEl.textContent = bpm;
   });
 
+  // Scrollable area for grid
+  const scroll = mk('div', 'seq-scroll', panel);
+
   // Step numbers
-  const stepNums = mk('div', 'step-numbers', panel);
+  const stepNums = mk('div', 'step-numbers', scroll);
   for (let c = 0; c < 16; c++) {
     const sn = mk('span', 'step-num', stepNums);
     sn.textContent = c + 1;
     if (c % 4 === 0) sn.classList.add('beat');
   }
 
-  const wrapper = mk('div', 'seq-grid-wrapper', panel);
+  const wrapper = mk('div', 'seq-grid-wrapper', scroll);
 
   // Labels
   const labels = mk('div', 'seq-labels', wrapper);
@@ -673,7 +676,7 @@ function drawADSR() {
 
   // Phase labels
   adsrCtx.font = '8px sans-serif';
-  adsrCtx.fillStyle = '#666680';
+  adsrCtx.fillStyle = '#8a7a66';
   adsrCtx.textAlign = 'center';
   adsrCtx.fillText('A', pad + aW / 2, h - 2);
   adsrCtx.fillText('D', pad + aW + decW / 2, h - 2);
@@ -687,15 +690,15 @@ function drawADSR() {
   adsrCtx.lineTo(pad, pad + dh);
   adsrCtx.closePath();
   const grad = adsrCtx.createLinearGradient(0, pad, 0, pad + dh);
-  grad.addColorStop(0, 'rgba(0, 240, 255, 0.15)');
-  grad.addColorStop(1, 'rgba(0, 240, 255, 0.02)');
+  grad.addColorStop(0, 'rgba(212, 162, 76, 0.18)');
+  grad.addColorStop(1, 'rgba(212, 162, 76, 0.02)');
   adsrCtx.fillStyle = grad;
   adsrCtx.fill();
 
-  // Cyan envelope line
+  // Amber envelope line
   adsrCtx.beginPath();
   pts.forEach(([x, y], i) => (i === 0 ? adsrCtx.moveTo(x, y) : adsrCtx.lineTo(x, y)));
-  adsrCtx.strokeStyle = '#00f0ff';
+  adsrCtx.strokeStyle = '#d4a24c';
   adsrCtx.lineWidth = 2;
   adsrCtx.lineJoin = 'round';
   adsrCtx.stroke();
@@ -732,18 +735,18 @@ function drawADSR() {
     adsrCtx.beginPath();
     adsrCtx.moveTo(x, pad);
     adsrCtx.lineTo(x, pad + dh);
-    adsrCtx.strokeStyle = 'rgba(255, 0, 170, 0.35)';
+    adsrCtx.strokeStyle = 'rgba(184, 85, 42, 0.4)';
     adsrCtx.lineWidth = 1;
     adsrCtx.stroke();
 
     // Dot
     adsrCtx.beginPath();
     adsrCtx.arc(x, y, 4, 0, Math.PI * 2);
-    adsrCtx.fillStyle = '#ff00aa';
+    adsrCtx.fillStyle = '#b8552a';
     adsrCtx.fill();
     adsrCtx.beginPath();
     adsrCtx.arc(x, y, 7, 0, Math.PI * 2);
-    adsrCtx.strokeStyle = 'rgba(255, 0, 170, 0.3)';
+    adsrCtx.strokeStyle = 'rgba(184, 85, 42, 0.35)';
     adsrCtx.lineWidth = 2;
     adsrCtx.stroke();
   }
@@ -764,7 +767,7 @@ function drawVisualizer() {
     vizCtx.beginPath();
     vizCtx.moveTo(0, h / 2);
     vizCtx.lineTo(w, h / 2);
-    vizCtx.strokeStyle = 'rgba(0, 240, 255, 0.15)';
+    vizCtx.strokeStyle = 'rgba(212, 162, 76, 0.15)';
     vizCtx.lineWidth = 1;
     vizCtx.stroke();
     return;
@@ -783,9 +786,9 @@ function drawVisualizer() {
     const x = i * barW;
 
     const grd = vizCtx.createLinearGradient(x, h, x, h - barH);
-    grd.addColorStop(0, 'rgba(0, 240, 255, 0.12)');
-    grd.addColorStop(0.5, 'rgba(0, 240, 255, 0.06)');
-    grd.addColorStop(1, 'rgba(255, 0, 170, 0.04)');
+    grd.addColorStop(0, 'rgba(212, 162, 76, 0.14)');
+    grd.addColorStop(0.5, 'rgba(212, 162, 76, 0.06)');
+    grd.addColorStop(1, 'rgba(184, 85, 42, 0.04)');
     vizCtx.fillStyle = grd;
     vizCtx.fillRect(x + 1, h - barH, barW - 2, barH);
   }
@@ -802,9 +805,9 @@ function drawVisualizer() {
     if (i === 0) vizCtx.moveTo(0, y);
     else vizCtx.lineTo(i * sliceW, y);
   }
-  vizCtx.strokeStyle = '#00f0ff';
+  vizCtx.strokeStyle = '#d4a24c';
   vizCtx.lineWidth = 1.5;
-  vizCtx.shadowColor = 'rgba(0, 240, 255, 0.5)';
+  vizCtx.shadowColor = 'rgba(212, 162, 76, 0.5)';
   vizCtx.shadowBlur = 6;
   vizCtx.stroke();
   vizCtx.shadowBlur = 0;
