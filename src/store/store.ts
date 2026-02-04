@@ -21,6 +21,7 @@ import { perfMiddleware } from './perfMiddleware'
 import { persistMiddleware } from './persistMiddleware'
 import { sessionActivityPersistMiddleware } from './sessionActivityPersistence'
 import { createLogger } from '@/lib/client-logger'
+import { layoutMirrorMiddleware } from './layoutMirrorMiddleware'
 
 enableMapSet()
 
@@ -48,7 +49,7 @@ export const store = configureStore({
       serializableCheck: {
         ignoredPaths: ['sessions.expandedProjects'],
       },
-    }).concat(perfMiddleware, persistMiddleware, sessionActivityPersistMiddleware),
+    }).concat(perfMiddleware, persistMiddleware, layoutMirrorMiddleware, sessionActivityPersistMiddleware),
 })
 
 // Note: Tabs and Panes are now loaded from localStorage directly in their slice
