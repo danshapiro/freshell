@@ -4,6 +4,7 @@ import { useAppDispatch } from '@/store/hooks'
 import { updatePaneContent } from '@/store/panesSlice'
 import { cn } from '@/lib/utils'
 import { copyText } from '@/lib/clipboard'
+import { rewriteLocalhostUrl } from '@/lib/url-rewrite'
 import { registerBrowserActions } from '@/lib/pane-action-registry'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 
@@ -16,14 +17,16 @@ interface BrowserPaneProps {
 
 const MAX_HISTORY_SIZE = 50
 
-// Convert file:// URLs to API endpoint for iframe loading
+// Convert URLs for iframe loading:
+// - file:// URLs → /local-file API endpoint
+// - localhost/127.0.0.1 URLs → rewritten to use host machine's address when accessing remotely
 function toIframeSrc(url: string): string {
   if (url.startsWith('file://')) {
     // Extract path from file:// URL (handle both file:/// and file://)
     const filePath = url.replace(/^file:\/\/\/?/, '')
     return `/local-file?path=${encodeURIComponent(filePath)}`
   }
-  return url
+  return rewriteLocalhostUrl(url, window.location.hostname)
 }
 
 export default function BrowserPane({ paneId, tabId, url, devToolsOpen }: BrowserPaneProps) {
@@ -138,7 +141,10 @@ export default function BrowserPane({ paneId, tabId, url, devToolsOpen }: Browse
         if (currentUrl) await copyText(currentUrl)
       },
       openExternal: () => {
-        if (currentUrl) window.open(currentUrl, '_blank', 'noopener,noreferrer')
+        if (currentUrl) {
+          const resolved = rewriteLocalhostUrl(currentUrl, window.location.hostname)
+          window.open(resolved, '_blank', 'noopener,noreferrer')
+        }
       },
       toggleDevTools,
     })
