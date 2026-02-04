@@ -3,6 +3,23 @@ import { nanoid } from 'nanoid'
 import { ok, approx, fail } from './response.js'
 import { renderCapture } from './capture.js'
 
+const truthy = (value: unknown) => value === true || value === 'true' || value === '1' || value === 'yes'
+
+const parseRegex = (raw: string) => {
+  if (raw.startsWith('/') && raw.lastIndexOf('/') > 0) {
+    const last = raw.lastIndexOf('/')
+    const body = raw.slice(1, last)
+    const flags = raw.slice(last + 1)
+    return new RegExp(body, flags)
+  }
+  return new RegExp(raw)
+}
+
+const looksLikePrompt = (text: string) => {
+  const lastLine = text.split(/\r?\n/).filter(Boolean).pop() || ''
+  return /[#$>] ?$/.test(lastLine.trimEnd())
+}
+
 export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { layoutStore: any; registry: any; wsHandler?: any }) {
   const router = Router()
 
@@ -101,6 +118,81 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
 
     const output = renderCapture(term.buffer.snapshot(), { includeAnsi, joinLines, start })
     res.type('text/plain').send(output)
+  })
+
+  router.get('/panes/:id/wait-for', async (req, res) => {
+    const paneId = req.params.id
+    let terminalId = layoutStore.resolvePaneToTerminal?.(paneId)
+    if (!terminalId && layoutStore.resolveTarget) {
+      const target = layoutStore.resolveTarget(paneId)
+      if (target?.paneId) terminalId = layoutStore.resolvePaneToTerminal?.(target.paneId)
+    }
+    const term = terminalId ? registry.get?.(terminalId) : undefined
+    if (!term) return res.status(404).json(fail('terminal not found'))
+
+    const rawPattern = (req.query.pattern || req.query.p) as string | undefined
+    let pattern: RegExp | undefined
+    if (rawPattern) {
+      try {
+        pattern = parseRegex(rawPattern)
+      } catch {
+        return res.status(400).json(fail('invalid pattern'))
+      }
+    }
+
+    const rawStable = req.query.stable || req.query.s
+    const stableSeconds = typeof rawStable === 'string' ? Number(rawStable) : undefined
+    let stableMs = Number.isFinite(stableSeconds) ? stableSeconds * 1000 : undefined
+
+    const waitExit = truthy(req.query.exit)
+    const waitPrompt = truthy(req.query.prompt)
+
+    const rawTimeout = req.query.T || req.query.timeout
+    const timeoutSeconds = typeof rawTimeout === 'string' ? Number(rawTimeout) : undefined
+    const timeoutMs = Number.isFinite(timeoutSeconds) ? timeoutSeconds * 1000 : 30000
+
+    let usedFallback = false
+    if (waitPrompt && stableMs === undefined) {
+      stableMs = 1000
+      usedFallback = true
+    }
+    if (!pattern && !waitExit && !waitPrompt && stableMs === undefined) {
+      stableMs = 1000
+      usedFallback = true
+    }
+
+    const getText = () => renderCapture(term.buffer.snapshot(), { includeAnsi: false })
+    const start = Date.now()
+    let lastText = getText()
+    let stableSince = Date.now()
+
+    while (true) {
+      const text = getText()
+      if (pattern) {
+        pattern.lastIndex = 0
+        if (pattern.test(text)) return res.json(ok({ matched: true, reason: 'pattern' }, 'pattern matched'))
+      }
+      if (waitExit && term.status === 'exited') {
+        return res.json(ok({ matched: true, reason: 'exit', exitCode: term.exitCode }, 'terminal exited'))
+      }
+      if (waitPrompt && looksLikePrompt(text)) {
+        return res.json(ok({ matched: true, reason: 'prompt' }, 'prompt detected'))
+      }
+      if (stableMs !== undefined) {
+        if (text === lastText) {
+          if (Date.now() - stableSince >= stableMs) {
+            const responder = usedFallback ? approx : ok
+            const message = waitPrompt && usedFallback ? 'prompt not detected; output stable' : usedFallback ? 'no wait condition; output stable' : 'output stable'
+            return res.json(responder({ matched: true, reason: 'stable' }, message))
+          }
+        } else {
+          lastText = text
+          stableSince = Date.now()
+        }
+      }
+      if (Date.now() - start >= timeoutMs) return res.json(approx({ matched: false }, 'timeout'))
+      await new Promise((resolve) => setTimeout(resolve, 200))
+    }
   })
 
   router.post('/panes/:id/split', (req, res) => {
