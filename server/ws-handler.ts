@@ -1757,6 +1757,10 @@ export class WsHandler {
     }
   }
 
+  broadcastUiCommand(command: { command: string; payload?: any }) {
+    this.broadcast({ type: 'ui.command', ...command })
+  }
+
   /**
    * Broadcast sessions.updated to all connected clients with chunking for mobile compatibility.
    * This handles backpressure per-client to avoid overwhelming mobile WebSocket buffers.

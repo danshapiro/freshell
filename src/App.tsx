@@ -17,6 +17,7 @@ import { getWsClient } from '@/lib/ws-client'
 import { getSessionsForHello } from '@/lib/session-utils'
 import { setClientPerfEnabled } from '@/lib/perf-logger'
 import { applyLocalTerminalFontFamily } from '@/lib/terminal-fonts'
+import { handleUiCommand } from '@/lib/ui-commands'
 import { store } from '@/store/store'
 import { useThemeEffect } from '@/hooks/useTheme'
 import { useMobile } from '@/hooks/useMobile'
@@ -438,6 +439,9 @@ export default function App() {
         if (msg.type === 'settings.updated') {
           dispatch(setSettings(applyLocalTerminalFontFamily(msg.settings as AppSettings)))
         }
+        if (msg.type === 'ui.command') {
+          handleUiCommand(msg as Record<string, unknown>, dispatch)
+        }
         if (msg.type === 'terminal.meta.list.response') {
           const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''
           const requestedAt = requestId
@@ -508,7 +512,6 @@ export default function App() {
         unsubscribe()
       }
       if (cleanedUp) cleanup()
-
       dispatch(setError(undefined))
       dispatch(setErrorCode(undefined))
       dispatch(setStatus('connecting'))
