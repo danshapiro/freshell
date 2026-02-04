@@ -267,6 +267,9 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       ? [buildCopyResumeMenuItem('terminal-copy-resume-command', resumeCandidate, actions)]
       : []
     return [
+      { type: 'item', id: 'terminal-split-h', label: 'Split horizontally', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'horizontal') },
+      { type: 'item', id: 'terminal-split-v', label: 'Split vertically', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'vertical') },
+      { type: 'separator', id: 'terminal-split-sep' },
       {
         type: 'item',
         id: 'terminal-copy',
@@ -326,6 +329,9 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
   if (target.kind === 'browser') {
     const browserActions = actions.getBrowserActions(target.paneId)
     return [
+      { type: 'item', id: 'browser-split-h', label: 'Split horizontally', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'horizontal') },
+      { type: 'item', id: 'browser-split-v', label: 'Split vertically', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'vertical') },
+      { type: 'separator', id: 'browser-split-sep' },
       { type: 'item', id: 'browser-back', label: 'Back', onSelect: () => browserActions?.back(), disabled: !browserActions },
       { type: 'item', id: 'browser-forward', label: 'Forward', onSelect: () => browserActions?.forward(), disabled: !browserActions },
       { type: 'item', id: 'browser-refresh', label: 'Reload/Stop', onSelect: () => browserActions?.reload(), disabled: !browserActions },
@@ -346,6 +352,9 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     const readOnly = !!(paneContent && paneContent.kind === 'editor' && paneContent.readOnly)
 
     return [
+      { type: 'item', id: 'editor-split-h', label: 'Split horizontally', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'horizontal') },
+      { type: 'item', id: 'editor-split-v', label: 'Split vertically', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'vertical') },
+      { type: 'separator', id: 'editor-split-sep' },
       { type: 'item', id: 'editor-cut', label: 'Cut', onSelect: () => editorActions?.cut(), disabled: !editorActions || readOnly },
       { type: 'item', id: 'editor-copy', label: 'Copy', onSelect: () => editorActions?.copy(), disabled: !editorActions },
       { type: 'item', id: 'editor-paste', label: 'Paste', onSelect: () => editorActions?.paste(), disabled: !editorActions || readOnly },
