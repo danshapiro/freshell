@@ -647,4 +647,75 @@ describe('ws protocol', () => {
 
     ws.close()
   })
+
+  it('rate limits terminal.create after too many requests', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+
+    await new Promise<void>((resolve) => {
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data.toString())
+        if (msg.type === 'ready') resolve()
+      })
+    })
+
+    const messages: any[] = []
+    ws.on('message', (data) => {
+      messages.push(JSON.parse(data.toString()))
+    })
+
+    // Send 6 terminal.create requests rapidly (default limit is 5 per 10s)
+    for (let i = 0; i < 6; i++) {
+      ws.send(JSON.stringify({ type: 'terminal.create', requestId: `rate-test-${i}`, mode: 'shell' }))
+    }
+
+    // Wait for all responses
+    await new Promise(resolve => setTimeout(resolve, 200))
+
+    const created = messages.filter((m) => m.type === 'terminal.created')
+    const rateLimited = messages.filter((m) => m.type === 'error' && m.code === 'RATE_LIMITED')
+
+    expect(created).toHaveLength(5)
+    expect(rateLimited).toHaveLength(1)
+    expect(rateLimited[0].requestId).toBe('rate-test-5')
+
+    ws.close()
+  })
+
+  it('does not rate-count deduped terminal.create requests', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+
+    await new Promise<void>((resolve) => {
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data.toString())
+        if (msg.type === 'ready') resolve()
+      })
+    })
+
+    const messages: any[] = []
+    ws.on('message', (data) => {
+      messages.push(JSON.parse(data.toString()))
+    })
+
+    // Send the same requestId multiple times — deduped requests bypass rate counting
+    const requestId = 'dedup-rate-test'
+    ws.send(JSON.stringify({ type: 'terminal.create', requestId, mode: 'shell' }))
+    await new Promise(resolve => setTimeout(resolve, 50))
+
+    // Same requestId again — should be deduped, not rate-counted
+    ws.send(JSON.stringify({ type: 'terminal.create', requestId, mode: 'shell' }))
+    await new Promise(resolve => setTimeout(resolve, 50))
+
+    const created = messages.filter((m) => m.type === 'terminal.created')
+    const rateLimited = messages.filter((m) => m.type === 'error' && m.code === 'RATE_LIMITED')
+
+    // Both should succeed (first creates, second dedupes)
+    expect(created).toHaveLength(2)
+    expect(rateLimited).toHaveLength(0)
+
+    ws.close()
+  })
 })

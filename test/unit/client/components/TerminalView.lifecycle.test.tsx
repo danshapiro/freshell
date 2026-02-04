@@ -33,6 +33,8 @@ vi.mock('lucide-react', () => ({
   Loader2: ({ className }: { className?: string }) => <svg data-testid="loader" className={className} />,
 }))
 
+const terminalInstances: any[] = []
+
 vi.mock('xterm', () => {
   class MockTerminal {
     options: Record<string, unknown> = {}
@@ -48,6 +50,7 @@ vi.mock('xterm', () => {
     onTitleChange = vi.fn(() => ({ dispose: vi.fn() }))
     attachCustomKeyEventHandler = vi.fn()
     getSelection = vi.fn(() => '')
+    constructor() { terminalInstances.push(this) }
   }
 
   return { Terminal: MockTerminal }
@@ -84,6 +87,7 @@ describe('TerminalView lifecycle updates', () => {
 
   beforeEach(() => {
     wsMocks.send.mockClear()
+    terminalInstances.length = 0
     wsMocks.onMessage.mockImplementation((callback: (msg: any) => void) => {
       messageHandler = callback
       return () => { messageHandler = null }
@@ -435,5 +439,10 @@ describe('TerminalView lifecycle updates', () => {
     // (but the ref should have been cleared, which we can't directly test here)
     const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
     expect(layout.content.status).toBe('exited')
+
+    // Verify user-facing feedback was shown
+    const term = terminalInstances[0]
+    const writelnCalls = term.writeln.mock.calls.map(([s]: [string]) => s)
+    expect(writelnCalls.some((s: string) => s.includes('Terminal exited'))).toBe(true)
   })
 })

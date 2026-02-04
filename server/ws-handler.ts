@@ -18,6 +18,9 @@ const PING_INTERVAL_MS = Number(process.env.PING_INTERVAL_MS || 30_000)
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
 // Max payload size per WebSocket message for mobile browser compatibility (500KB)
 const MAX_CHUNK_BYTES = Number(process.env.MAX_WS_CHUNK_BYTES || 500 * 1024)
+// Rate limit: max terminal.create requests per client within a sliding window
+const TERMINAL_CREATE_RATE_LIMIT = Number(process.env.TERMINAL_CREATE_RATE_LIMIT || 5)
+const TERMINAL_CREATE_RATE_WINDOW_MS = Number(process.env.TERMINAL_CREATE_RATE_WINDOW_MS || 10_000)
 
 const log = logger.child({ component: 'ws' })
 const perfConfig = getPerfConfig()
@@ -197,6 +200,7 @@ type ClientState = {
   authenticated: boolean
   attachedTerminalIds: Set<string>
   createdByRequestId: Map<string, string>
+  terminalCreateTimestamps: number[]
   codingCliSessions: Set<string>
   codingCliSubscriptions: Map<string, () => void>
   interestedSessions: Set<string>
@@ -378,6 +382,7 @@ export class WsHandler {
       authenticated: false,
       attachedTerminalIds: new Set(),
       createdByRequestId: new Map(),
+      terminalCreateTimestamps: [],
       codingCliSessions: new Set(),
       codingCliSubscriptions: new Map(),
       interestedSessions: new Set(),
@@ -696,6 +701,7 @@ export class WsHandler {
         let terminalId: string | undefined
         let reused = false
         let error = false
+        let rateLimited = false
         try {
           const existingId = state.createdByRequestId.get(m.requestId)
           if (existingId) {
@@ -711,6 +717,19 @@ export class WsHandler {
             // If it no longer exists, fall through and create a new one.
             state.createdByRequestId.delete(m.requestId)
           }
+
+          // Rate limit: prevent runaway terminal creation (e.g., infinite respawn loops)
+          const now = Date.now()
+          state.terminalCreateTimestamps = state.terminalCreateTimestamps.filter(
+            (t) => now - t < TERMINAL_CREATE_RATE_WINDOW_MS
+          )
+          if (state.terminalCreateTimestamps.length >= TERMINAL_CREATE_RATE_LIMIT) {
+            rateLimited = true
+            log.warn({ connectionId: ws.connectionId, count: state.terminalCreateTimestamps.length }, 'terminal.create rate limited')
+            this.sendError(ws, { code: 'RATE_LIMITED', message: 'Too many terminal.create requests', requestId: m.requestId })
+            return
+          }
+          state.terminalCreateTimestamps.push(now)
 
           // Kick off session repair without blocking terminal creation.
           let effectiveResumeSessionId = m.resumeSessionId
@@ -773,7 +792,7 @@ export class WsHandler {
             requestId: m.requestId,
           })
         } finally {
-          endCreateTimer({ terminalId, reused, error })
+          endCreateTimer({ terminalId, reused, error, rateLimited })
         }
         return
       }

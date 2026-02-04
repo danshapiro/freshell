@@ -415,19 +415,26 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
         if (msg.type === 'error' && msg.code === 'INVALID_TERMINAL_ID' && !msg.requestId) {
           const currentTerminalId = terminalIdRef.current
+          const current = contentRef.current
           if (msg.terminalId && msg.terminalId !== currentTerminalId) {
+            // Show feedback if the terminal already exited (the ID was cleared by
+            // the exit handler, so msg.terminalId no longer matches the ref)
+            if (current?.status === 'exited') {
+              term.writeln('\r\n[Terminal exited — use the + button or split to start a new session]\r\n')
+            }
             return
           }
           // Only auto-reconnect if terminal hasn't already exited.
           // This prevents an infinite respawn loop when terminals fail immediately
           // (e.g., due to permission errors on cwd). User must explicitly restart.
-          const current = contentRef.current
           if (currentTerminalId && current?.status !== 'exited') {
             term.writeln('\r\n[Reconnecting...]\r\n')
             const newRequestId = nanoid()
             requestIdRef.current = newRequestId
             terminalIdRef.current = undefined
             updateContent({ terminalId: undefined, createRequestId: newRequestId, status: 'creating' })
+          } else if (current?.status === 'exited') {
+            term.writeln('\r\n[Terminal exited — use the + button or split to start a new session]\r\n')
           }
         }
       })
