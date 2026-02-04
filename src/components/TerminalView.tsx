@@ -1141,6 +1141,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         shell: shell || 'system',
         cwd: initialCwd,
         resumeSessionId: resumeId,
+        tabId,
+        paneId: paneIdRef.current,
         ...(restore ? { restore: true } : {}),
       })
     }

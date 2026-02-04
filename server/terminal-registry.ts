@@ -533,12 +533,19 @@ function buildPowerShellCommand(command: string, args: string[]): string {
   const invocation = ['&', quotePowerShellLiteral(command), ...args.map(quotePowerShellLiteral)].join(' ')
   return invocation
 }
-
-export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shell: ShellType, resumeSessionId?: string, providerSettings?: ProviderSettings) {
+export function buildSpawnSpec(
+  mode: TerminalMode,
+  cwd: string | undefined,
+  shell: ShellType,
+  resumeSessionId?: string,
+  providerSettings?: ProviderSettings,
+  envOverrides?: Record<string, string>,
+) {
   const env = {
     ...process.env,
     TERM: process.env.TERM || 'xterm-256color',
     COLORTERM: process.env.COLORTERM || 'truecolor',
+    ...envOverrides,
   }
 
   const normalizedResume = normalizeResumeSessionId(mode, resumeSessionId)
@@ -861,7 +868,16 @@ export class TerminalRegistry extends EventEmitter {
     }
   }
 
-  create(opts: { mode: TerminalMode; shell?: ShellType; cwd?: string; cols?: number; rows?: number; resumeSessionId?: string; providerSettings?: ProviderSettings }): TerminalRecord {
+  create(opts: {
+    mode: TerminalMode
+    shell?: ShellType
+    cwd?: string
+    cols?: number
+    rows?: number
+    resumeSessionId?: string
+    providerSettings?: ProviderSettings
+    envContext?: { tabId?: string; paneId?: string }
+  }): TerminalRecord {
     this.reapExitedTerminals()
     if (this.runningCount() >= this.maxTerminals) {
       throw new Error(`Maximum terminal limit (${this.maxTerminals}) reached. Please close some terminals before creating new ones.`)
@@ -875,7 +891,24 @@ export class TerminalRegistry extends EventEmitter {
     const cwd = opts.cwd || getDefaultCwd(this.settings) || (isWindows() ? undefined : os.homedir())
     const normalizedResume = normalizeResumeSessionId(opts.mode, opts.resumeSessionId)
 
-    const { file, args, env, cwd: procCwd } = buildSpawnSpec(opts.mode, cwd, opts.shell || 'system', normalizedResume, opts.providerSettings)
+    const port = Number(process.env.PORT || 3001)
+    const baseEnv = {
+      FRESHELL: '1',
+      FRESHELL_URL: process.env.FRESHELL_URL || `http://localhost:${port}`,
+      FRESHELL_TOKEN: process.env.AUTH_TOKEN || '',
+      FRESHELL_TERMINAL_ID: terminalId,
+      ...(opts.envContext?.tabId ? { FRESHELL_TAB_ID: opts.envContext.tabId } : {}),
+      ...(opts.envContext?.paneId ? { FRESHELL_PANE_ID: opts.envContext.paneId } : {}),
+    }
+
+    const { file, args, env, cwd: procCwd } = buildSpawnSpec(
+      opts.mode,
+      cwd,
+      opts.shell || 'system',
+      normalizedResume,
+      opts.providerSettings,
+      baseEnv,
+    )
 
     const endSpawnTimer = startPerfTimer(
       'terminal_spawn',
