@@ -25,7 +25,7 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
   const router = Router()
 
   router.post('/tabs', (req, res) => {
-    const { name, mode, shell, cwd, browser, editor } = req.body || {}
+    const { name, mode, shell, cwd, browser, editor, resumeSessionId } = req.body || {}
     const note = browser || editor ? 'browser/editor requested; created terminal tab' : 'tab created'
 
     try {
@@ -34,6 +34,7 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
         mode: mode || 'shell',
         shell,
         cwd,
+        resumeSessionId,
         envContext: { tabId, paneId },
       })
 
@@ -41,7 +42,7 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
 
       wsHandler?.broadcastUiCommand({
         command: 'tab.create',
-        payload: { id: tabId, title: name, mode: mode || 'shell', shell, terminalId: terminal.terminalId, initialCwd: cwd },
+        payload: { id: tabId, title: name, mode: mode || 'shell', shell, terminalId: terminal.terminalId, initialCwd: cwd, resumeSessionId },
       })
 
       const responder = browser || editor ? approx : ok
