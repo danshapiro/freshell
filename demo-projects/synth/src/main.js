@@ -265,8 +265,6 @@ function buildVisualizer(parent) {
   h2.textContent = 'Analyser';
   vizCanvas = mk('canvas', null, panel);
   vizCanvas.id = 'visualizer-canvas';
-  vizCanvas.width = 1100;
-  vizCanvas.height = 130;
   vizCtx = vizCanvas.getContext('2d');
 }
 
@@ -331,8 +329,6 @@ function buildEnvelopePanel(parent) {
 
   adsrCanvas = mk('canvas', null, inner);
   adsrCanvas.id = 'adsr-canvas';
-  adsrCanvas.width = 240;
-  adsrCanvas.height = 120;
   adsrCtx = adsrCanvas.getContext('2d');
 }
 
@@ -454,19 +450,15 @@ function buildKnob(parent, label, initial, min, max, onChange, extraClass) {
 // ---------- Keyboard ----------
 function buildKeyboard(parent) {
   const kb = mk('div', 'keyboard', parent);
-  const W = 42;
   const whiteNotes = [0, 2, 4, 5, 7, 9, 11];
 
-  // White keys
+  // White keys — CSS flex handles sizing
   for (let oct = 0; oct < 2; oct++) {
     const base = 48 + oct * 12;
     whiteNotes.forEach((semi) => {
       const midi = base + semi;
       const key = mk('div', 'key white', kb);
       key.dataset.midi = midi;
-      key.style.position = 'relative';
-      key.style.width = W + 'px';
-      key.style.flexShrink = '0';
       const note = mk('span', 'key-note', key);
       note.textContent = midiToName(midi);
       const lbl = mk('span', 'key-label', key);
@@ -475,15 +467,14 @@ function buildKeyboard(parent) {
     });
   }
 
-  // Black keys (absolute positioned)
+  // Black keys — percentage positioned
   for (let oct = 0; oct < 2; oct++) {
     const base = 48 + oct * 12;
     BLACK_OFFSETS.forEach(({ semi, pos }) => {
       const midi = base + semi;
       const key = mk('div', 'key black', kb);
       key.dataset.midi = midi;
-      const leftPx = (oct * 7 + pos) * W + (oct * 7 + Math.floor(pos)) * 1;
-      key.style.left = leftPx + 'px';
+      key.style.left = ((oct * 7 + pos) / 14 * 100) + '%';
       const lbl = mk('span', 'key-label', key);
       lbl.textContent = MIDI_LABEL[midi] || '';
       keyEls.set(midi, key);
@@ -568,7 +559,6 @@ function buildSequencer(parent) {
 
   // Grid
   const grid = mk('div', 'seq-grid', wrapper);
-  grid.style.gridTemplateRows = `repeat(${SEQ_ROWS}, 22px)`;
   for (let r = 0; r < SEQ_ROWS; r++) {
     seqCells[r] = [];
     for (let c = 0; c < 16; c++) {
@@ -646,13 +636,28 @@ function clearStepHighlight() {
 }
 
 // ===========================================================================
+// CANVAS RESIZE
+// ===========================================================================
+
+function syncCanvasSize(canvas) {
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  if (w > 0 && h > 0 && (canvas.width !== w || canvas.height !== h)) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+}
+
+// ===========================================================================
 // ADSR VISUALIZER
 // ===========================================================================
 
 function drawADSR() {
   if (!adsrCtx) return;
+  syncCanvasSize(adsrCanvas);
   const w = adsrCanvas.width;
   const h = adsrCanvas.height;
+  if (w === 0 || h === 0) return;
   const pad = 12;
   const dw = w - 2 * pad;
   const dh = h - 2 * pad;
@@ -758,8 +763,10 @@ function drawADSR() {
 
 function drawVisualizer() {
   if (!vizCtx) return;
+  syncCanvasSize(vizCanvas);
   const w = vizCanvas.width;
   const h = vizCanvas.height;
+  if (w === 0 || h === 0) return;
   vizCtx.clearRect(0, 0, w, h);
 
   if (!analyser) {

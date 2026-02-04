@@ -13,6 +13,7 @@
   --acc2-a10: rgba(184, 85, 42, 0.1);
   --font: 'Georgia', 'Palatino Linotype', 'Book Antiqua', serif;
   --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+  --seq-row: 22px;
 }
 
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
@@ -28,21 +29,21 @@ body {
 #app {
   max-width: 1100px;
   margin: 0 auto;
-  padding: 16px 20px 32px;
+  padding: 12px 16px 24px;
 }
 
 /* ===== HEADER ===== */
 .header {
   display: flex;
   align-items: baseline;
-  gap: 12px;
-  margin-bottom: 14px;
-  padding-bottom: 10px;
+  gap: 10px;
+  margin-bottom: 8px;
+  padding-bottom: 8px;
   border-bottom: 1px solid var(--border);
 }
 .header h1 {
   font-family: var(--font);
-  font-size: 22px;
+  font-size: 20px;
   font-weight: 700;
   letter-spacing: 6px;
   color: var(--accent);
@@ -61,7 +62,7 @@ body {
   background: linear-gradient(170deg, var(--panel) 0%, #1c150e 100%);
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 14px;
+  padding: 10px 12px;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 220, 160, 0.03);
 }
 .panel h2 {
@@ -71,7 +72,7 @@ body {
   letter-spacing: 3px;
   color: var(--text-dim);
   text-transform: uppercase;
-  margin-bottom: 12px;
+  margin-bottom: 8px;
 }
 
 /* ===== VISUALIZER ===== */
@@ -79,43 +80,43 @@ body {
   padding: 0;
   overflow: hidden;
   position: relative;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
 }
 .visualizer-panel h2 {
   position: absolute;
-  top: 10px;
-  left: 14px;
+  top: 8px;
+  left: 12px;
   z-index: 2;
   margin: 0;
 }
 #visualizer-canvas {
   display: block;
   width: 100%;
-  height: 130px;
+  height: clamp(60px, 12vw, 120px);
   background: linear-gradient(180deg, rgba(212, 162, 76, 0.015) 0%, transparent 100%);
 }
 
 /* ===== CONTROLS ROW ===== */
 .controls-row {
   display: grid;
-  grid-template-columns: 140px 1fr 280px;
-  gap: 10px;
-  margin-bottom: 10px;
+  grid-template-columns: 130px 1fr 260px;
+  gap: 8px;
+  margin-bottom: 8px;
 }
 
 /* ===== OSCILLATOR / WAVEFORM ===== */
 .waveform-selector {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 6px;
+  gap: 4px;
 }
 .wave-btn {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 3px;
-  height: 48px;
+  gap: 2px;
+  height: 44px;
   background: rgba(255, 220, 160, 0.03);
   border: 1px solid var(--border);
   border-radius: 5px;
@@ -123,8 +124,8 @@ body {
   transition: all 0.15s;
 }
 .wave-btn svg {
-  width: 34px;
-  height: 20px;
+  width: 30px;
+  height: 18px;
   stroke: var(--text-dim);
   fill: none;
   stroke-width: 2;
@@ -158,18 +159,19 @@ body {
 /* ===== ENVELOPE ===== */
 .envelope-inner {
   display: flex;
-  gap: 16px;
+  gap: 12px;
 }
 .adsr-sliders {
   display: flex;
-  gap: 8px;
+  gap: 6px;
   align-items: flex-end;
+  flex-shrink: 0;
 }
 .slider-group {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 4px;
+  gap: 3px;
 }
 .slider-group .slider-val {
   font-family: var(--mono);
@@ -186,11 +188,11 @@ body {
 }
 .slider-track {
   position: relative;
-  width: 24px;
-  height: 100px;
+  width: 22px;
+  height: 80px;
   background: rgba(255, 220, 160, 0.04);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: 11px;
   cursor: pointer;
   touch-action: none;
 }
@@ -200,16 +202,16 @@ body {
   left: 0;
   right: 0;
   background: linear-gradient(to top, var(--acc-a10), var(--acc-a20));
-  border-radius: 0 0 11px 11px;
+  border-radius: 0 0 10px 10px;
   pointer-events: none;
 }
 .slider-thumb {
   position: absolute;
   left: 50%;
-  width: 20px;
-  height: 8px;
+  width: 18px;
+  height: 7px;
   background: var(--accent);
-  border-radius: 4px;
+  border-radius: 3px;
   transform: translate(-50%, 50%);
   pointer-events: none;
   box-shadow: 0 0 6px rgba(212, 162, 76, 0.4);
@@ -219,13 +221,15 @@ body {
   background: rgba(0, 0, 0, 0.3);
   border: 1px solid var(--border);
   display: block;
-  flex-shrink: 0;
+  flex: 1;
+  min-width: 0;
+  height: 100px;
 }
 
 /* ===== KNOBS ===== */
 .effects-inner {
   display: flex;
-  gap: 14px;
+  gap: 12px;
   justify-content: center;
   flex-wrap: wrap;
 }
@@ -239,24 +243,24 @@ body {
   font-size: 8px;
   letter-spacing: 2px;
   color: var(--text-dim);
-  margin-bottom: 4px;
+  margin-bottom: 2px;
   text-transform: uppercase;
   font-family: var(--mono);
 }
 .fx-group .knobs-row {
   display: flex;
-  gap: 12px;
+  gap: 10px;
 }
 .knob-container {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 2px;
+  gap: 1px;
 }
 .knob-ring {
   position: relative;
-  width: 52px;
-  height: 52px;
+  width: 48px;
+  height: 48px;
 }
 .knob-svg {
   position: absolute;
@@ -283,8 +287,8 @@ body {
   position: absolute;
   top: 50%;
   left: 50%;
-  width: 34px;
-  height: 34px;
+  width: 30px;
+  height: 30px;
   border-radius: 50%;
   background: radial-gradient(circle at 38% 35%, #4a3d30, #201812 70%);
   border: 1px solid #5a4a38;
@@ -300,7 +304,7 @@ body {
   top: 3px;
   left: 50%;
   width: 2px;
-  height: 10px;
+  height: 9px;
   background: var(--accent);
   border-radius: 1px;
   transform: translateX(-50%);
@@ -333,18 +337,18 @@ body {
 
 /* ===== KEYBOARD ===== */
 .keyboard-section {
-  margin-bottom: 10px;
+  margin-bottom: 8px;
   display: flex;
   justify-content: center;
-  overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
 }
 .keyboard {
   position: relative;
   display: flex;
-  height: 140px;
+  width: 100%;
+  max-width: 604px;
+  height: clamp(90px, 18vw, 136px);
   user-select: none;
-  flex-shrink: 0;
+  touch-action: none;
 }
 .key {
   position: relative;
@@ -356,19 +360,19 @@ body {
   transition: background 0.06s, box-shadow 0.06s;
 }
 .key.white {
-  width: 42px;
-  height: 140px;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
   background: linear-gradient(to bottom, #f5f0e4, #e4dcc8);
   border: 1px solid #b0a890;
   border-radius: 0 0 5px 5px;
   z-index: 0;
-  margin-right: 1px;
 }
 .key.white .key-label {
   font-size: 9px;
   font-family: var(--mono);
   color: #8a7e6a;
-  padding-bottom: 6px;
+  padding-bottom: 5px;
 }
 .key.white .key-note {
   font-size: 7px;
@@ -384,18 +388,20 @@ body {
 
 .key.black {
   position: absolute;
-  width: 26px;
-  height: 90px;
+  width: 4.4%;
+  height: 64%;
+  top: 0;
   background: linear-gradient(to bottom, #3a2e20, #1a1208);
   border: 1px solid #0a0804;
   border-radius: 0 0 4px 4px;
   z-index: 1;
+  transform: translateX(-50%);
 }
 .key.black .key-label {
   font-size: 8px;
   font-family: var(--mono);
   color: #7a6a56;
-  padding-bottom: 6px;
+  padding-bottom: 5px;
 }
 .key.black:hover { background: linear-gradient(to bottom, #4a3e2e, #2a1e10); }
 .key.black.active {
@@ -405,19 +411,19 @@ body {
 .key.black.active .key-label { color: #1a0e04; }
 
 /* ===== SEQUENCER ===== */
-.seq-panel { padding: 14px; }
+.seq-panel { padding: 10px 12px; }
 .seq-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 6px;
 }
 .seq-controls {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   flex-wrap: wrap;
 }
 .seq-btn {
@@ -425,7 +431,7 @@ body {
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 2px;
-  padding: 5px 16px;
+  padding: 4px 14px;
   border: 1px solid var(--border);
   border-radius: 4px;
   background: rgba(255, 220, 160, 0.04);
@@ -444,7 +450,7 @@ body {
 .bpm-group {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 .bpm-group label {
   font-size: 9px;
@@ -459,38 +465,38 @@ body {
 }
 .seq-grid-wrapper {
   display: grid;
-  grid-template-columns: 32px 1fr;
+  grid-template-columns: 30px 1fr;
   gap: 0;
-  min-width: 540px;
+  min-width: 400px;
 }
 .seq-labels {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding-right: 4px;
+  padding-right: 3px;
 }
 .seq-label {
-  height: 22px;
+  height: var(--seq-row);
   display: flex;
   align-items: center;
   justify-content: flex-end;
   font-family: var(--mono);
   font-size: 8px;
   color: var(--text-dim);
-  padding-right: 4px;
+  padding-right: 3px;
 }
 .seq-label.sharp { color: var(--accent2); opacity: 0.55; }
 
 .seq-grid {
   display: grid;
   grid-template-columns: repeat(16, 1fr);
+  grid-auto-rows: var(--seq-row);
   gap: 2px;
 }
 .seq-row-cells {
   display: contents;
 }
 .seq-cell {
-  height: 22px;
   background: rgba(255, 220, 160, 0.025);
   border: 1px solid transparent;
   border-radius: 3px;
@@ -500,14 +506,12 @@ body {
 .seq-cell:hover { background: rgba(255, 220, 160, 0.06); }
 .seq-cell.beat-start { border-left: 1px solid rgba(255, 220, 160, 0.04); }
 
-/* Active steps = copper */
 .seq-cell.on {
   background: var(--accent2);
   box-shadow: 0 0 6px var(--acc2-a20);
   border-color: transparent;
 }
 
-/* Playhead column = amber outline */
 .seq-cell.step-active {
   border-color: var(--accent) !important;
   box-shadow: inset 0 0 6px var(--acc-a20), 0 0 4px var(--acc-a10);
@@ -522,9 +526,9 @@ body {
   display: grid;
   grid-template-columns: repeat(16, 1fr);
   gap: 2px;
-  margin-left: 36px;
-  margin-bottom: 4px;
-  min-width: 508px;
+  margin-left: 33px;
+  margin-bottom: 3px;
+  min-width: 370px;
 }
 .step-num {
   text-align: center;
@@ -535,7 +539,7 @@ body {
 .step-num.beat { color: var(--text-dim); }
 
 /* ===== SCROLLBAR ===== */
-::-webkit-scrollbar { height: 6px; width: 6px; }
+::-webkit-scrollbar { height: 5px; width: 5px; }
 ::-webkit-scrollbar-track { background: var(--bg); }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
@@ -543,99 +547,77 @@ body {
    RESPONSIVE
    ================================================================ */
 
-/* Tablet / narrow desktop */
 @media (max-width: 900px) {
-  #app { padding: 12px 14px 24px; }
-
-  .header h1 { font-size: 18px; letter-spacing: 4px; }
-
   .controls-row {
     grid-template-columns: 120px 1fr;
-    grid-template-rows: auto auto;
   }
-  /* Effects panel spans full width on second row */
   .controls-row > :nth-child(3) {
     grid-column: 1 / -1;
   }
-
-  .envelope-inner { gap: 10px; }
-  #adsr-canvas { width: 180px; height: 100px; }
-
-  #visualizer-canvas { height: 100px; }
+  .envelope-inner { gap: 8px; }
+  #adsr-canvas { height: 88px; }
+  #visualizer-canvas { height: clamp(50px, 10vw, 100px); }
 }
 
-/* Mobile */
-@media (max-width: 620px) {
-  #app { padding: 10px 10px 20px; }
+@media (max-width: 680px) {
+  #app { padding: 8px 8px 16px; }
 
-  .header { flex-direction: column; gap: 2px; }
-  .header h1 { font-size: 16px; letter-spacing: 3px; }
+  .header { gap: 6px; }
+  .header h1 { font-size: 16px; letter-spacing: 4px; }
   .header .subtitle { font-size: 9px; letter-spacing: 2px; }
 
-  #visualizer-canvas { height: 80px; }
-
   .controls-row {
-    grid-template-columns: 1fr;
+    grid-template-columns: 1fr 1fr;
   }
-  .controls-row > :nth-child(3) {
-    grid-column: auto;
-  }
+  .controls-row > :nth-child(2) { grid-column: 1 / -1; }
+  .controls-row > :nth-child(3) { grid-column: 1 / -1; }
 
-  /* Oscillator: horizontal row */
-  .waveform-selector {
-    grid-template-columns: repeat(4, 1fr);
-  }
-  .wave-btn { height: 42px; }
-  .wave-btn svg { width: 28px; height: 16px; }
+  /* Oscillator: 4-across */
+  .waveform-selector { grid-template-columns: repeat(4, 1fr); }
+  .wave-btn { height: 38px; }
+  .wave-btn svg { width: 26px; height: 15px; }
 
   /* Envelope: stack canvas below sliders */
   .envelope-inner {
     flex-direction: column;
-    gap: 10px;
+    align-items: stretch;
+    gap: 8px;
   }
   .adsr-sliders { justify-content: center; }
-  #adsr-canvas { width: 100%; height: 80px; }
-  .slider-track { height: 80px; }
+  #adsr-canvas { height: 70px; flex: none; }
+  .slider-track { height: 70px; }
 
-  /* Effects: smaller knobs */
-  .knob-ring { width: 46px; height: 46px; }
-  .knob-body { width: 30px; height: 30px; }
-  .knob-indicator { height: 8px; }
-  .effects-inner { gap: 10px; }
-  .fx-group .knobs-row { gap: 8px; }
+  /* Keyboard labels hide on narrow widths to keep keys usable */
+  .key.white .key-note { display: none; }
 
-  /* Keyboard: smaller keys */
-  .keyboard { height: 110px; }
-  .key.white { width: 32px; height: 110px; }
-  .key.white .key-label { font-size: 8px; padding-bottom: 4px; }
-  .key.white .key-note { font-size: 6px; }
-  .key.black { width: 20px; height: 68px; }
-  .key.black .key-label { font-size: 7px; padding-bottom: 4px; }
-
-  /* Sequencer */
+  /* Sequencer tighter */
+  :root { --seq-row: 18px; }
   .seq-header { flex-direction: column; align-items: flex-start; }
-  .seq-cell { height: 18px; }
-  .seq-label { height: 18px; font-size: 7px; }
-  .panel { padding: 10px; }
-  .seq-panel { padding: 10px; }
-  .bpm-group .knob-ring { width: 40px; height: 40px; }
-  .bpm-group .knob-body { width: 26px; height: 26px; }
+  .panel { padding: 8px 10px; }
 }
 
-/* Very small */
-@media (max-width: 400px) {
-  .header h1 { font-size: 14px; letter-spacing: 2px; }
-  #visualizer-canvas { height: 60px; }
-  .keyboard { height: 90px; }
-  .key.white { width: 26px; height: 90px; }
-  .key.white .key-label { font-size: 7px; }
-  .key.white .key-note { display: none; }
-  .key.black { width: 17px; height: 55px; }
-  .key.black .key-label { font-size: 6px; }
+@media (max-width: 480px) {
+  .header h1 { font-size: 14px; letter-spacing: 3px; }
+  .header .subtitle { display: none; }
+
+  .controls-row { grid-template-columns: 1fr; gap: 6px; }
+  .controls-row > :nth-child(2) { grid-column: auto; }
+  .controls-row > :nth-child(3) { grid-column: auto; }
+
   .wave-btn .wave-name { display: none; }
-  .wave-btn { height: 36px; }
-  .effects-inner { gap: 8px; }
-  .knob-ring { width: 40px; height: 40px; }
+  .wave-btn { height: 34px; }
+
+  .knob-ring { width: 42px; height: 42px; }
   .knob-body { width: 26px; height: 26px; }
-  .knob-indicator { height: 7px; top: 2px; }
+  .knob-indicator { height: 8px; top: 2px; }
+  .effects-inner { gap: 8px; }
+  .fx-group .knobs-row { gap: 6px; }
+
+  .key.white .key-label { font-size: 8px; padding-bottom: 3px; }
+  .key.black .key-label { font-size: 7px; padding-bottom: 3px; }
+
+  :root { --seq-row: 16px; }
+  .seq-label { font-size: 7px; }
+  .seq-grid-wrapper { min-width: 340px; }
+  .step-numbers { min-width: 310px; margin-left: 30px; }
 }
