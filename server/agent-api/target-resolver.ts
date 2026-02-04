@@ -46,23 +46,25 @@ export function resolveTarget(target: string, snapshot: LayoutSnapshot): Resolve
   const paneTabId = paneToTab.get(clean)
   if (paneTabId) return { tabId: paneTabId, paneId: clean }
 
-  // tab.pane or session:window.pane
-  if (clean.includes('.')) {
-    const noSession = clean.includes(':') ? clean.split(':').slice(1).join(':') : clean
-    const [tabPart, panePart] = noSession.split('.')
-    const tab = snapshot.tabs.find((t) => t.id === tabPart || t.title === tabPart)
-    if (tab) {
-      const idx = Number(panePart)
-      const leaves = panesByTab.get(tab.id) || []
-      const pane = leaves[Number.isFinite(idx) ? idx : 0]
-      return { tabId: tab.id, paneId: pane?.id, message: pane ? undefined : 'pane not found; active pane used' }
-    }
-  }
-
   // exact tab id or title
   const tabMatch = snapshot.tabs.find((t) => t.id === clean || t.title === clean)
   if (tabMatch) {
     return { tabId: tabMatch.id, paneId: snapshot.activePane?.[tabMatch.id], message: 'tab matched; active pane used' }
+  }
+
+  // tab.pane or session:window.pane
+  if (clean.includes('.')) {
+    const noSession = clean.includes(':') ? clean.split(':').slice(1).join(':') : clean
+    const [tabPart, panePart] = noSession.split('.')
+    const idx = Number(panePart)
+    if (Number.isFinite(idx)) {
+      const tab = snapshot.tabs.find((t) => t.id === tabPart || t.title === tabPart)
+      if (tab) {
+        const leaves = panesByTab.get(tab.id) || []
+        const pane = leaves[idx]
+        return { tabId: tab.id, paneId: pane?.id, message: pane ? undefined : 'pane not found; active pane used' }
+      }
+    }
   }
 
   // numeric pane index in active tab

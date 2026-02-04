@@ -226,11 +226,14 @@ export class LayoutStore {
 
   selectPane(tabId: string | undefined, paneId: string) {
     if (!this.snapshot) return { message: 'no layout snapshot' as const }
-    const targetTab = tabId || this.snapshot.tabs.find((tab) => {
-      const root = this.snapshot?.layouts?.[tab.id]
-      const leaves = this.collectLeaves(root, [])
-      return leaves.some((leaf) => leaf.id === paneId)
-    })?.id
+    const tabExists = tabId ? this.snapshot.tabs.some((tab) => tab.id === tabId) : false
+    const targetTab = tabExists
+      ? tabId
+      : this.snapshot.tabs.find((tab) => {
+          const root = this.snapshot?.layouts?.[tab.id]
+          const leaves = this.collectLeaves(root, [])
+          return leaves.some((leaf) => leaf.id === paneId)
+        })?.id
     if (!targetTab) return { message: 'pane not found' as const }
     this.snapshot.activePane[targetTab] = paneId
     this.snapshot.activeTabId = targetTab
