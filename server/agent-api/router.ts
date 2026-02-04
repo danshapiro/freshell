@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { nanoid } from 'nanoid'
 import { ok, approx, fail } from './response.js'
+import { renderCapture } from './capture.js'
 
 export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { layoutStore: any; registry: any; wsHandler?: any }) {
   const router = Router()
@@ -81,6 +82,25 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
     const tabId = req.query.tabId as string | undefined
     const panes = layoutStore.listPanes?.(tabId) || []
     res.json(ok({ panes }))
+  })
+
+  router.get('/panes/:id/capture', (req, res) => {
+    const paneId = req.params.id
+    let terminalId = layoutStore.resolvePaneToTerminal?.(paneId)
+    if (!terminalId && layoutStore.resolveTarget) {
+      const target = layoutStore.resolveTarget(paneId)
+      if (target?.paneId) terminalId = layoutStore.resolvePaneToTerminal?.(target.paneId)
+    }
+    const term = terminalId ? registry.get?.(terminalId) : undefined
+    if (!term) return res.status(404).json(fail('terminal not found'))
+
+    const rawStart = req.query.S
+    const start = typeof rawStart === 'string' ? Number(rawStart) : undefined
+    const joinLines = req.query.J === 'true' || req.query.J === '1'
+    const includeAnsi = req.query.e === 'true' || req.query.e === '1'
+
+    const output = renderCapture(term.buffer.snapshot(), { includeAnsi, joinLines, start })
+    res.type('text/plain').send(output)
   })
 
   router.post('/panes/:id/split', (req, res) => {
