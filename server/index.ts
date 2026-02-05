@@ -590,18 +590,27 @@ async function main() {
   }
 
   const port = Number(process.env.PORT || 3001)
-  server.listen(port, '0.0.0.0', () => {
-    log.info({ port, appVersion: APP_VERSION }, 'Server listening')
+  const host = process.env.HOST || '127.0.0.1'  // Default to localhost for safety
+  server.listen(port, host, () => {
+    log.info({ port, host, appVersion: APP_VERSION }, 'Server listening')
 
     // Print friendly startup message
     const token = process.env.AUTH_TOKEN
     const lanIps = detectLanIps()
     const lanIp = lanIps[0] || 'localhost'
-    const url = `http://${lanIp}:${port}/?token=${token}`
+    const isDev = process.env.NODE_ENV !== 'production'
+    const frontendPort = isDev ? (process.env.VITE_PORT || '5173') : port
+    const networkUrl = `http://${lanIp}:${frontendPort}/?token=${token}`
+    const localUrl = `http://localhost:${frontendPort}/?token=${token}`
 
     console.log('')
     console.log(`\x1b[32m\u{1F41A}\u{1F525} freshell is ready!\x1b[0m`)
-    console.log(`   Visit from anywhere on your network: \x1b[36m${url}\x1b[0m`)
+    if (host === '127.0.0.1' || host === 'localhost') {
+      console.log(`   Local only: \x1b[36m${localUrl}\x1b[0m`)
+      console.log(`   \x1b[33m(Set HOST=0.0.0.0 to expose to network)\x1b[0m`)
+    } else {
+      console.log(`   Visit from anywhere on your network: \x1b[36m${networkUrl}\x1b[0m`)
+    }
     console.log('')
 
     startBackgroundTasks()

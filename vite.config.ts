@@ -29,7 +29,7 @@ export default defineConfig(({ mode }) => {
       sourcemap: mode === 'development',
     },
     server: {
-      host: true,
+      host: env.VITE_HOST || '127.0.0.1',  // Default to localhost for safety
       port: vitePort,
       watch: {
         ignored: ['**/.worktrees/**', '**/demo-projects/**'],
