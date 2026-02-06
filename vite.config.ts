@@ -1,10 +1,21 @@
 import { defineConfig, loadEnv } from 'vite'
+import type { HttpProxy } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
 import { fileURLToPath } from 'url'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
+
+/** Suppress ECONNREFUSED proxy errors during startup (server not ready yet). */
+function silenceStartupErrors(proxy: HttpProxy.Server) {
+  proxy.on('error', (err, _req, res) => {
+    if ('code' in err && err.code === 'ECONNREFUSED' && 'writeHead' in res) {
+      res.writeHead(503)
+      res.end()
+    }
+  })
+}
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, __dirname, '')
@@ -35,12 +46,19 @@ export default defineConfig(({ mode }) => {
         ignored: ['**/.worktrees/**', '**/demo-projects/**'],
       },
       proxy: {
-        '/api': backendUrl,
-        '/local-file': backendUrl,
+        '/api': {
+          target: backendUrl,
+          configure: silenceStartupErrors,
+        },
+        '/local-file': {
+          target: backendUrl,
+          configure: silenceStartupErrors,
+        },
         '/ws': {
           target: backendUrl,
           ws: true,
           changeOrigin: true,
+          configure: silenceStartupErrors,
         },
       },
     },

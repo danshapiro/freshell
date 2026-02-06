@@ -28,6 +28,7 @@ import { createClientLogsRouter } from './client-logs.js'
 import { createStartupState } from './startup-state.js'
 import { getPerfConfig, initPerfLogging, setPerfLoggingEnabled, startPerfTimer, withPerfSpan } from './perf-logger.js'
 import { detectPlatform } from './platform.js'
+import { resolveVisitPort } from './startup-url.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -595,13 +596,14 @@ async function main() {
 
   const port = Number(process.env.PORT || 3001)
   server.listen(port, '0.0.0.0', () => {
-    log.info({ port, appVersion: APP_VERSION }, 'Server listening')
+    log.info({ event: 'server_listening', port, appVersion: APP_VERSION }, 'Server listening')
 
     // Print friendly startup message
     const token = process.env.AUTH_TOKEN
     const lanIps = detectLanIps()
     const lanIp = lanIps[0] || 'localhost'
-    const url = `http://${lanIp}:${port}/?token=${token}`
+    const visitPort = resolveVisitPort(port, process.env)
+    const url = `http://${lanIp}:${visitPort}/?token=${token}`
 
     console.log('')
     console.log(`\x1b[32m\u{1F41A}\u{1F525} freshell is ready!\x1b[0m`)

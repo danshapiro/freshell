@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest"
 import os from "os"
 import path from "path"
 import fsp from "fs/promises"
+import { Writable } from "stream"
 
 describe("logger", () => {
   const originalEnv = { ...process.env }
@@ -176,6 +177,35 @@ describe("logger", () => {
         const { resolveDebugLogPath } = await import("../../../server/logger")
         const resolved = resolveDebugLogPath({ NODE_ENV: "test" } as NodeJS.ProcessEnv, "/home/test")
         expect(resolved).toBeNull()
+      },
+      TEST_TIMEOUT_MS,
+    )
+  })
+
+  describe("single output per log call", () => {
+    it(
+      "produces exactly one output per log message with a custom destination",
+      async () => {
+        const chunks: string[] = []
+        const dest = new Writable({
+          write(chunk, _encoding, callback) {
+            chunks.push(chunk.toString())
+            callback()
+          },
+        })
+
+        const { createLogger } = await import("../../../server/logger")
+        const testLogger = createLogger(dest)
+
+        testLogger.info("single message test")
+
+        // Pino batches writes; flush by waiting a tick
+        await new Promise((resolve) => setTimeout(resolve, 50))
+
+        // Each chunk should contain exactly one JSON log line
+        const lines = chunks.join("").split("\n").filter(Boolean)
+        expect(lines).toHaveLength(1)
+        expect(JSON.parse(lines[0])).toHaveProperty("msg", "single message test")
       },
       TEST_TIMEOUT_MS,
     )
