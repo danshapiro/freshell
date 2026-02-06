@@ -92,4 +92,20 @@ describe('WsClient.connect', () => {
     // Should schedule a reconnect attempt (baseReconnectDelay = 1000).
     expect(setTimeoutSpy.mock.calls.some((call) => call[1] === 1000)).toBe(true)
   })
+
+  it('treats BACKPRESSURE as transient and schedules reconnect with a minimum delay', async () => {
+    const setTimeoutSpy = vi.spyOn(window, 'setTimeout')
+
+    const c = new WsClient('ws://example/ws')
+    const p = c.connect()
+    expect(MockWebSocket.instances).toHaveLength(1)
+
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._close(4008, 'Backpressure')
+
+    await expect(p).rejects.toThrow(/backpressure/i)
+
+    const delays = setTimeoutSpy.mock.calls.map((call) => call[1]).filter((d): d is number => typeof d === 'number')
+    expect(Math.max(...delays)).toBeGreaterThanOrEqual(5000)
+  })
 })

@@ -16,6 +16,7 @@ const MIN_SCROLLBACK_CHARS = 64 * 1024
 const MAX_SCROLLBACK_CHARS = 2 * 1024 * 1024
 const APPROX_CHARS_PER_LINE = 200
 const MAX_TERMINALS = Number(process.env.MAX_TERMINALS || 50)
+const DEFAULT_MAX_PENDING_SNAPSHOT_CHARS = 512 * 1024
 const perfConfig = getPerfConfig()
 
 // TerminalMode includes 'shell' for regular terminals, plus coding CLI providers.
@@ -82,6 +83,11 @@ function getModeLabel(mode: TerminalMode): string {
   return label || mode.toUpperCase()
 }
 
+type PendingSnapshotQueue = {
+  chunks: string[]
+  queuedChars: number
+}
+
 export type TerminalRecord = {
   terminalId: string
   title: string
@@ -97,7 +103,7 @@ export type TerminalRecord = {
   cols: number
   rows: number
   clients: Set<WebSocket>
-  pendingSnapshotClients: Map<WebSocket, string[]>
+  pendingSnapshotClients: Map<WebSocket, PendingSnapshotQueue>
   warnedIdle?: boolean
   buffer: ChunkRingBuffer
   pty: pty.IPty
@@ -481,6 +487,7 @@ export class TerminalRegistry extends EventEmitter {
   private maxTerminals: number
   private maxExitedTerminals: number
   private scrollbackMaxChars: number
+  private maxPendingSnapshotChars: number
 
   constructor(settings?: AppSettings, maxTerminals?: number, maxExitedTerminals?: number) {
     super()
@@ -488,6 +495,10 @@ export class TerminalRegistry extends EventEmitter {
     this.maxTerminals = maxTerminals ?? MAX_TERMINALS
     this.maxExitedTerminals = maxExitedTerminals ?? Number(process.env.MAX_EXITED_TERMINALS || 200)
     this.scrollbackMaxChars = this.computeScrollbackMaxChars(settings)
+    {
+      const raw = Number(process.env.MAX_PENDING_SNAPSHOT_CHARS || DEFAULT_MAX_PENDING_SNAPSHOT_CHARS)
+      this.maxPendingSnapshotChars = Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_MAX_PENDING_SNAPSHOT_CHARS
+    }
     this.startIdleMonitor()
     this.startPerfMonitor()
   }
@@ -583,7 +594,11 @@ export class TerminalRegistry extends EventEmitter {
     if (!settings) return
     const killMinutes = settings.safety.autoKillIdleMinutes
     if (!killMinutes || killMinutes <= 0) return
-    const warnMinutes = settings.safety.warnBeforeKillMinutes
+    const rawWarnMinutes = settings.safety.warnBeforeKillMinutes
+    const warnMinutes =
+      typeof rawWarnMinutes === 'number' && Number.isFinite(rawWarnMinutes) && rawWarnMinutes > 0 && rawWarnMinutes < killMinutes
+        ? rawWarnMinutes
+        : 0
 
     const now = Date.now()
 
@@ -594,7 +609,7 @@ export class TerminalRegistry extends EventEmitter {
       const idleMs = now - term.lastActivityAt
       const idleMinutes = idleMs / 60000
 
-      if (warnMinutes && warnMinutes > 0) {
+      if (warnMinutes > 0) {
         const warnAtMinutes = killMinutes - warnMinutes
         if (idleMinutes >= warnAtMinutes && idleMinutes < killMinutes && !term.warnedIdle) {
           term.warnedIdle = true
@@ -748,9 +763,21 @@ export class TerminalRegistry extends EventEmitter {
         }
       }
       for (const client of record.clients) {
-        const q = record.pendingSnapshotClients.get(client)
-        if (q) {
-          q.push(data)
+        const pending = record.pendingSnapshotClients.get(client)
+        if (pending) {
+          pending.chunks.push(data)
+          pending.queuedChars += data.length
+          if (pending.queuedChars > this.maxPendingSnapshotChars) {
+            // If a terminal spews output while we're sending a snapshot, queueing unboundedly can OOM the server.
+            // Prefer explicit resync: drop the client and let it reconnect/reattach for a fresh snapshot.
+            try {
+              ;(client as any).close?.(4008, 'Backpressure')
+            } catch {
+              // ignore
+            }
+            record.pendingSnapshotClients.delete(client)
+            record.clients.delete(client)
+          }
           continue
         }
         this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf: record.perf })
@@ -780,7 +807,7 @@ export class TerminalRegistry extends EventEmitter {
     if (!term) return null
     term.clients.add(client)
     term.warnedIdle = false
-    if (opts?.pendingSnapshot) term.pendingSnapshotClients.set(client, [])
+    if (opts?.pendingSnapshot) term.pendingSnapshotClients.set(client, { chunks: [], queuedChars: 0 })
     return term
   }
 
@@ -790,7 +817,7 @@ export class TerminalRegistry extends EventEmitter {
     const queued = term.pendingSnapshotClients.get(client)
     if (!queued) return
     term.pendingSnapshotClients.delete(client)
-    for (const data of queued) {
+    for (const data of queued.chunks) {
       this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf: term.perf })
     }
   }
@@ -1013,6 +1040,10 @@ export class TerminalRegistry extends EventEmitter {
     if (this.idleTimer) {
       clearInterval(this.idleTimer)
       this.idleTimer = null
+    }
+    if (this.perfTimer) {
+      clearInterval(this.perfTimer)
+      this.perfTimer = null
     }
 
     // Kill all terminals

@@ -213,6 +213,29 @@ describe('TerminalRegistry Lifecycle', () => {
       expect(outputs[0].data).toBe('queued output\n')
     })
 
+    it('closes the client if the pending snapshot queue grows too large (prevents OOM)', () => {
+      const prev = process.env.MAX_PENDING_SNAPSHOT_CHARS
+      process.env.MAX_PENDING_SNAPSHOT_CHARS = '16'
+      try {
+        const local = new TerminalRegistry(settings)
+        const term = local.create({ mode: 'shell' })
+        const pty = mockPtyProcess.instances[mockPtyProcess.instances.length - 1]
+        const client = createMockWebSocket()
+
+        local.attach(term.terminalId, client, { pendingSnapshot: true })
+
+        pty._emitData('x'.repeat(32))
+
+        expect(client.send).not.toHaveBeenCalled()
+        expect(client.close).toHaveBeenCalledWith(4008, expect.any(String))
+
+        local.shutdown()
+      } finally {
+        if (prev === undefined) delete process.env.MAX_PENDING_SNAPSHOT_CHARS
+        else process.env.MAX_PENDING_SNAPSHOT_CHARS = prev
+      }
+    })
+
     it('should properly clean up zombie terminal on remove', () => {
       const term = registry.create({ mode: 'shell' })
       const pty = mockPtyProcess.instances[0]
@@ -510,6 +533,20 @@ describe('TerminalRegistry Lifecycle', () => {
       term.lastActivityAt = Date.now() - 8 * 60 * 1000
       await registry.enforceIdleKillsForTest()
       expect(onWarn).toHaveBeenCalledTimes(1)
+    })
+
+    it('does not emit an idle warning when warnBeforeKillMinutes >= autoKillIdleMinutes', async () => {
+      registry = new TerminalRegistry(createTestSettings({ safety: { autoKillIdleMinutes: 10, warnBeforeKillMinutes: 10 } }))
+      const term = registry.create({ mode: 'shell' })
+
+      const onWarn = vi.fn()
+      registry.on('terminal.idle.warning', onWarn)
+
+      term.lastActivityAt = Date.now() - 9 * 60 * 1000
+      await registry.enforceIdleKillsForTest()
+
+      expect(term.status).toBe('running')
+      expect(onWarn).not.toHaveBeenCalled()
     })
 
     it('should kill terminal exactly at threshold', () => {
@@ -1092,6 +1129,25 @@ describe('Graceful shutdown', () => {
     // If timer was still running, it would have called enforceIdleKills
     // Since we already shut down, no further action should happen
     expect(mockPtyProcess.instances[0].kill).toHaveBeenCalledTimes(1)
+  })
+
+  it('should clear perf monitor timer on shutdown when perf is enabled', () => {
+    const cfg = getPerfConfig()
+    const prevEnabled = cfg.enabled
+    cfg.enabled = true
+    try {
+      const clearSpy = vi.spyOn(globalThis, 'clearInterval')
+      const local = new TerminalRegistry(createTestSettings())
+      local.create({ mode: 'shell' })
+
+      local.shutdown()
+
+      // One for idle monitor, one for perf monitor.
+      expect(clearSpy.mock.calls.length).toBeGreaterThanOrEqual(2)
+      clearSpy.mockRestore()
+    } finally {
+      cfg.enabled = prevEnabled
+    }
   })
 
   it('should notify all attached clients of terminal exit', () => {

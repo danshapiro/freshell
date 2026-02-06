@@ -5,13 +5,18 @@ import { enableMapSet } from 'immer'
 enableMapSet()
 
 let errorSpy: ReturnType<typeof vi.spyOn> | null = null
-let consoleErrorCalls: unknown[][] = []
+let consoleErrorCalls: Array<{ args: unknown[]; stack?: string }> = []
 
 beforeEach(() => {
   consoleErrorCalls = []
-  errorSpy = vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
-    consoleErrorCalls.push(args)
-  })
+  const impl = (...args: unknown[]) => {
+    const err = new Error('console.error captured')
+    // Exclude this helper from the captured stack for better signal.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ;(Error as any).captureStackTrace?.(err, impl)
+    consoleErrorCalls.push({ args, stack: err.stack })
+  }
+  errorSpy = vi.spyOn(console, 'error').mockImplementation(impl)
 })
 
 afterEach(() => {
@@ -22,8 +27,10 @@ afterEach(() => {
   ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = false
 
   if (!allow && consoleErrorCalls.length > 0) {
-    const first = consoleErrorCalls[0]?.map(String).join(' ') ?? ''
-    throw new Error(`Unexpected console.error: ${first}`)
+    const first = consoleErrorCalls[0]
+    const rendered = first?.args?.map(String).join(' ') ?? ''
+    const stack = first?.stack ? `\n${first.stack}` : ''
+    throw new Error(`Unexpected console.error: ${rendered}${stack}`)
   }
 })
 

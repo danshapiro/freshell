@@ -72,8 +72,10 @@ export default function BackgroundSessions() {
 
   const detachedRunning = terminals.filter((t) => t.status === 'running' && !t.hasClients)
 
-  const warnMinutes = settings.safety.warnBeforeKillMinutes
-  const killMinutes = settings.safety.autoKillIdleMinutes
+  const killMinutesRaw = Number(settings.safety.autoKillIdleMinutes) || 0
+  const warnMinutesRaw = Number(settings.safety.warnBeforeKillMinutes) || 0
+  const killMinutes = killMinutesRaw > 0 ? killMinutesRaw : 0
+  const warnMinutes = warnMinutesRaw > 0 && warnMinutesRaw < killMinutes ? warnMinutesRaw : 0
   const now = Date.now()
 
   return (
@@ -100,8 +102,9 @@ export default function BackgroundSessions() {
             .map((t) => {
               const idleMs = now - (t.lastActivityAt || t.createdAt)
               const idleMinutes = idleMs / 60000
-              const warn = idleMinutes >= killMinutes - warnMinutes
-              const over = idleMinutes >= killMinutes
+              const warnAtMinutes = warnMinutes > 0 ? killMinutes - warnMinutes : Number.POSITIVE_INFINITY
+              const warn = warnMinutes > 0 && idleMinutes >= warnAtMinutes && idleMinutes < killMinutes
+              const over = killMinutes > 0 && idleMinutes >= killMinutes
 
               return (
                 <div

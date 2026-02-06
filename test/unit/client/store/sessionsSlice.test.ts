@@ -446,4 +446,18 @@ describe('sessionsSlice', () => {
       expect(state.expandedProjects.has('/project/one')).toBe(false)
     })
   })
+
+  describe('robustness', () => {
+    it('does not throw if setProjects receives a non-array payload', () => {
+      const state = sessionsReducer(initialState, setProjects({} as any))
+      expect(state.projects).toEqual([])
+      expect(state.expandedProjects.size).toBe(0)
+    })
+
+    it('does not throw if mergeProjects receives a non-array payload', () => {
+      const state = sessionsReducer(initialState, mergeProjects('nope' as any))
+      expect(state.projects).toEqual([])
+      expect(state.expandedProjects.size).toBe(0)
+    })
+  })
 })

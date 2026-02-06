@@ -1,6 +1,20 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import type { ProjectGroup } from './types'
 
+function normalizeProjects(payload: unknown): ProjectGroup[] {
+  if (!Array.isArray(payload)) return []
+  const out: ProjectGroup[] = []
+  for (const raw of payload as any[]) {
+    if (!raw || typeof raw !== 'object') continue
+    const projectPath = (raw as any).projectPath
+    if (typeof projectPath !== 'string' || projectPath.length === 0) continue
+    const sessions = Array.isArray((raw as any).sessions) ? (raw as any).sessions : []
+    const color = typeof (raw as any).color === 'string' ? (raw as any).color : undefined
+    out.push({ projectPath, sessions, ...(color ? { color } : {}) } as ProjectGroup)
+  }
+  return out
+}
+
 export interface SessionsState {
   projects: ProjectGroup[]
   expandedProjects: Set<string>
@@ -17,7 +31,7 @@ export const sessionsSlice = createSlice({
   initialState,
   reducers: {
     setProjects: (state, action: PayloadAction<ProjectGroup[]>) => {
-      state.projects = action.payload
+      state.projects = normalizeProjects(action.payload)
       state.lastLoadedAt = Date.now()
       const valid = new Set(state.projects.map((p) => p.projectPath))
       state.expandedProjects = new Set(Array.from(state.expandedProjects).filter((k) => valid.has(k)))
@@ -27,9 +41,10 @@ export const sessionsSlice = createSlice({
       state.expandedProjects = new Set()
     },
     mergeProjects: (state, action: PayloadAction<ProjectGroup[]>) => {
+      const incoming = normalizeProjects(action.payload)
       // Merge incoming projects with existing ones by projectPath
       const projectMap = new Map(state.projects.map((p) => [p.projectPath, p]))
-      for (const project of action.payload) {
+      for (const project of incoming) {
         projectMap.set(project.projectPath, project)
       }
       state.projects = Array.from(projectMap.values())

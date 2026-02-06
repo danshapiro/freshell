@@ -212,8 +212,8 @@ export class WsClient {
 
         if (event.code === 4008) {
           // Backpressure close - surface as warning, but don't reconnect aggressively.
-          this.intentionalClose = true
           finishReject(new Error('Connection too slow (backpressure)'))
+          if (!this.intentionalClose) this.scheduleReconnect({ minDelayMs: 5000 })
           return
         }
 
@@ -242,13 +242,14 @@ export class WsClient {
     return this.connectPromise
   }
 
-  private scheduleReconnect() {
+  private scheduleReconnect(opts?: { minDelayMs?: number }) {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       if (import.meta.env.DEV) console.error('WsClient: max reconnect attempts reached')
       return
     }
 
-    const delay = this.baseReconnectDelay * Math.pow(2, this.reconnectAttempts)
+    const computedDelay = this.baseReconnectDelay * Math.pow(2, this.reconnectAttempts)
+    const delay = Math.max(computedDelay, opts?.minDelayMs ?? 0)
     this.reconnectAttempts++
 
     window.setTimeout(() => {
