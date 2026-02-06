@@ -229,13 +229,20 @@ Requirements:
      - When the pane type chooser appears for a new pane, always choose **Editor** (not CMD/WSL/PowerShell).
      - Do not open any files in those Editor panes during the stress test; just leave them at the "Enter file path..." prompt.
      - Reason: Terminal panes consume backend terminal slots and can hit the server's terminal limit, which would break the rest of the smoke test.
+     - Do this one pane at a time (avoid stale element errors):
+       1. Click "Add pane" once.
+       2. In the NEW pane's chooser that appears, click "Editor" once.
+       3. Confirm visually that the new pane is now an Editor pane (shows the "Enter file path..." UI).
+       4. Only then repeat for the next pane.
 5) Create a new *Freshell shell tab* using the in-app tab bar (NOT a new browser tab):
    - In the Freshell UI at the top, there is an in-app tab bar with tabs like "New Tab".
    - Click the plus button with tooltip/title "New shell tab".
    - This stays in the same browser tab/window. Do NOT open a new browser tab/window and do NOT expect the browser's tab list to change.
 6) On that new Freshell tab, create a few panes and set up EXACTLY one of each type: Editor, Terminal, Browser (keep this tab multi-pane for quick review).
    - In the Editor pane: open this file path: {known_text_file}. Verify visually the editor shows content (not an empty placeholder).
-   - In the Terminal pane: run `node -v` (or `git --version` if node is unavailable). Verify visually the output looks like a version string.
+   - In the Terminal pane: run `node -v` (or `git --version` if node is unavailable).
+     - WAIT for the command to finish and then explicitly verify visually that the terminal output contains a version-looking string (examples: `v20.11.0` or `git version 2.44.0`).
+     - If you do not see version output, try the fallback command and verify that output instead.
    - In the Browser pane: open the standard "Example Domain" website (IANA Example Domains) and verify visually it shows "Example Domain".
    - Keep terminal creation minimal: do not create extra terminal panes beyond this one.
 7) Create one more *Freshell shell tab* for Settings verification (again: in-app tab, not a browser tab).
@@ -260,6 +267,9 @@ SMOKE_RESULT: FAIL - <short reason>
     # Also exclude page-text scraping helpers that can give misleading negatives for xterm/iframes.
     tools=Tools(exclude_actions=["write_file", "replace_file", "read_file", "search_page", "extract"]),
     use_vision=True,
+    # Reduce stale-element flakes by keeping each step small and disabling auto-URL opening from task text.
+    max_actions_per_step=2,
+    directly_open_url=False,
   )
 
   _start, elapsed_s = monotonic_timer()
