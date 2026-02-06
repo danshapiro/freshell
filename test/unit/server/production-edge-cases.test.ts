@@ -426,7 +426,7 @@ describe('TerminalRegistry Production Edge Cases', () => {
   // --------------------------------------------------------------------------
 
   describe('Backpressure Handling', () => {
-    it('drops messages when client bufferedAmount exceeds limit', () => {
+    it('closes slow clients when bufferedAmount exceeds limit (no silent drops)', () => {
       const { pty, emitData } = createMockPty()
       mockPtySpawn.mockReturnValue(pty)
 
@@ -436,6 +436,7 @@ describe('TerminalRegistry Production Edge Cases', () => {
       // Client with high buffered amount (simulating slow consumer)
       const slowClient = {
         send: vi.fn(),
+        close: vi.fn(),
         bufferedAmount: 10 * 1024 * 1024, // 10MB - exceeds 2MB limit
       } as unknown as WebSocket
 
@@ -444,11 +445,12 @@ describe('TerminalRegistry Production Edge Cases', () => {
       // Emit data
       emitData('test output')
 
-      // Message should be dropped due to backpressure
+      // Client should be closed due to backpressure
       expect(slowClient.send).not.toHaveBeenCalled()
+      expect(slowClient.close).toHaveBeenCalledWith(4008, expect.any(String))
     })
 
-    it('sends to fast clients while dropping for slow ones', () => {
+    it('sends to fast clients while closing slow ones', () => {
       const { pty, emitData } = createMockPty()
       mockPtySpawn.mockReturnValue(pty)
 
@@ -457,11 +459,13 @@ describe('TerminalRegistry Production Edge Cases', () => {
 
       const fastClient = {
         send: vi.fn(),
+        close: vi.fn(),
         bufferedAmount: 0,
       } as unknown as WebSocket
 
       const slowClient = {
         send: vi.fn(),
+        close: vi.fn(),
         bufferedAmount: 10 * 1024 * 1024,
       } as unknown as WebSocket
 
@@ -472,6 +476,7 @@ describe('TerminalRegistry Production Edge Cases', () => {
 
       expect(fastClient.send).toHaveBeenCalled()
       expect(slowClient.send).not.toHaveBeenCalled()
+      expect(slowClient.close).toHaveBeenCalledWith(4008, expect.any(String))
     })
 
     it('handles send() throwing an error', () => {

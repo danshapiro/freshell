@@ -601,11 +601,12 @@ describe('TerminalRegistry Lifecycle', () => {
 
       registry.attach(term.terminalId, client)
 
-      // Output should be dropped due to backpressure
+      // Output should force-close the client due to backpressure
       pty._emitData('should be dropped')
 
       // safeSend should not have sent (due to backpressure check)
       expect(client.send).not.toHaveBeenCalled()
+      expect(client.close).toHaveBeenCalledWith(4008, expect.any(String))
     })
 
     it('should send to healthy clients even if one has backpressure', () => {
@@ -627,6 +628,7 @@ describe('TerminalRegistry Lifecycle', () => {
       pty._emitData('test output')
 
       expect(slowClient.send).not.toHaveBeenCalled()
+      expect(slowClient.close).toHaveBeenCalledWith(4008, expect.any(String))
       expect(fastClient.send).toHaveBeenCalled()
     })
   })

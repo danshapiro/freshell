@@ -839,7 +839,12 @@ export class TerminalRegistry {
           )
         }
       }
-      // Drop output to prevent unbounded memory.
+      // Prefer explicit resync over silent corruption.
+      try {
+        ;(client as any).close?.(4008, 'Backpressure')
+      } catch {
+        // ignore
+      }
       return
     }
     try {
