@@ -358,7 +358,11 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           if (msg.snapshot) {
             try { term.clear(); term.write(msg.snapshot) } catch { /* disposed */ }
           }
-          attach(newId)
+          // Creator is already attached server-side for this terminal.
+          // Avoid sending terminal.attach here: it can race with terminal.output and lead to
+          // the later terminal.attached snapshot wiping already-rendered output.
+          ws.send({ type: 'terminal.resize', terminalId: newId, cols: term.cols, rows: term.rows })
+          setIsAttaching(false)
         }
 
         if (msg.type === 'terminal.attached' && msg.terminalId === tid) {

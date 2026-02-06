@@ -169,6 +169,80 @@ describe('TerminalView lifecycle updates', () => {
     expect(layout.content.status).toBe('running')
   })
 
+  it('does not send terminal.attach after terminal.created (prevents snapshot races)', async () => {
+    const tabId = 'tab-no-double-attach'
+    const paneId = 'pane-no-double-attach'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-no-double-attach',
+      status: 'creating',
+      mode: 'claude',
+      shell: 'system',
+      initialCwd: '/tmp',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'claude',
+            status: 'running',
+            title: 'Claude',
+            titleSetByUser: false,
+            createRequestId: paneContent.createRequestId,
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: { settings: defaultSettings, status: 'loaded' },
+        connection: { status: 'connected', error: null },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    wsMocks.send.mockClear()
+
+    messageHandler!({
+      type: 'terminal.created',
+      requestId: paneContent.createRequestId,
+      terminalId: 'term-no-double-attach',
+      snapshot: '',
+      createdAt: Date.now(),
+    })
+
+    expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'terminal.attach',
+    }))
+    // We still need to size the PTY to the visible terminal.
+    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'terminal.resize',
+      terminalId: 'term-no-double-attach',
+    }))
+  })
+
   it('ignores INVALID_TERMINAL_ID errors for other terminals', async () => {
     const tabId = 'tab-2'
     const paneId = 'pane-2'

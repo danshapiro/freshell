@@ -701,11 +701,12 @@ export class WsHandler {
           if (existingId) {
             const existing = this.registry.get(existingId)
             if (existing) {
-              this.registry.attach(existingId, ws)
+              this.registry.attach(existingId, ws, { pendingSnapshot: true })
               state.attachedTerminalIds.add(existingId)
               terminalId = existingId
               reused = true
               this.send(ws, { type: 'terminal.created', requestId: m.requestId, terminalId: existingId, snapshot: existing.buffer.snapshot(), createdAt: existing.createdAt })
+              setImmediate(() => this.registry.finishAttachSnapshot(existingId, ws))
               return
             }
             // If it no longer exists, fall through and create a new one.
@@ -751,7 +752,7 @@ export class WsHandler {
           terminalId = record.terminalId
 
           // Attach creator immediately
-          this.registry.attach(record.terminalId, ws)
+          this.registry.attach(record.terminalId, ws, { pendingSnapshot: true })
           state.attachedTerminalIds.add(record.terminalId)
 
           this.send(ws, {
@@ -761,6 +762,7 @@ export class WsHandler {
             snapshot: record.buffer.snapshot(),
             createdAt: record.createdAt,
           })
+          setImmediate(() => this.registry.finishAttachSnapshot(record.terminalId, ws))
 
           // Notify all clients that list changed
           this.broadcast({ type: 'terminal.list.updated' })
@@ -779,13 +781,14 @@ export class WsHandler {
       }
 
       case 'terminal.attach': {
-        const rec = this.registry.attach(m.terminalId, ws)
+        const rec = this.registry.attach(m.terminalId, ws, { pendingSnapshot: true })
         if (!rec) {
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Unknown terminalId', terminalId: m.terminalId })
           return
         }
         state.attachedTerminalIds.add(m.terminalId)
         this.send(ws, { type: 'terminal.attached', terminalId: m.terminalId, snapshot: rec.buffer.snapshot() })
+        setImmediate(() => this.registry.finishAttachSnapshot(m.terminalId, ws))
         this.broadcast({ type: 'terminal.list.updated' })
         return
       }

@@ -76,6 +76,7 @@ class FakeRegistry {
   inputCalls: { terminalId: string; data: string }[] = []
   resizeCalls: { terminalId: string; cols: number; rows: number }[] = []
   killCalls: string[] = []
+  emitOutputOnNextAttach: { terminalId: string; data: string } | null = null
 
   // Control hooks for testing edge cases
   onOutputListeners = new Map<string, (data: string) => void>()
@@ -93,6 +94,7 @@ class FakeRegistry {
       status: 'running',
       exitCode: undefined as number | undefined,
       clients: new Set<WebSocket>(),
+      pendingSnapshotClients: new Map<WebSocket, string[]>(),
     }
     this.records.set(terminalId, rec)
     return rec
@@ -102,17 +104,36 @@ class FakeRegistry {
     return this.records.get(terminalId) || null
   }
 
-  attach(terminalId: string, ws: WebSocket) {
+  attach(terminalId: string, ws: WebSocket, opts?: { pendingSnapshot?: boolean }) {
     const rec = this.records.get(terminalId)
     if (!rec) return null
     rec.clients.add(ws)
+    if (opts?.pendingSnapshot) rec.pendingSnapshotClients.set(ws, [])
+
+    if (opts?.pendingSnapshot && this.emitOutputOnNextAttach?.terminalId === terminalId) {
+      const { data } = this.emitOutputOnNextAttach
+      this.emitOutputOnNextAttach = null
+      this.simulateOutput(terminalId, data)
+    }
     return rec
+  }
+
+  finishAttachSnapshot(terminalId: string, ws: WebSocket) {
+    const rec = this.records.get(terminalId)
+    if (!rec) return
+    const queued = rec.pendingSnapshotClients.get(ws)
+    if (!queued) return
+    rec.pendingSnapshotClients.delete(ws)
+    for (const data of queued) {
+      this.safeSend(ws, { type: 'terminal.output', terminalId, data })
+    }
   }
 
   detach(terminalId: string, ws: WebSocket) {
     const rec = this.records.get(terminalId)
     if (!rec) return false
     rec.clients.delete(ws)
+    rec.pendingSnapshotClients.delete(ws)
     return true
   }
 
@@ -141,6 +162,7 @@ class FakeRegistry {
       this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: 0 })
     }
     rec.clients.clear()
+    rec.pendingSnapshotClients.clear()
     return true
   }
 
@@ -162,6 +184,11 @@ class FakeRegistry {
     if (!rec || rec.status !== 'running') return
     rec.buffer.append(data)
     for (const client of rec.clients) {
+      const q = rec.pendingSnapshotClients.get(client)
+      if (q) {
+        q.push(data)
+        continue
+      }
       this.safeSend(client, { type: 'terminal.output', terminalId, data })
     }
   }
@@ -176,6 +203,7 @@ class FakeRegistry {
       this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode })
     }
     rec.clients.clear()
+    rec.pendingSnapshotClients.clear()
   }
 
   // Simulate backpressure by checking buffered amount
@@ -619,6 +647,49 @@ describe('WebSocket edge cases', () => {
       expect(attached.snapshot).toContain('line 1')
       expect(attached.snapshot).toContain('line 2')
       expect(attached.snapshot).toContain('line 3')
+
+      close2()
+    })
+
+    it('sends terminal.attached snapshot before any terminal.output after attach', async () => {
+      const { ws: ws1, close: close1 } = await createAuthenticatedConnection()
+
+      const terminalId = await createTerminal(ws1, 'attach-order')
+      close1()
+      await new Promise((r) => setTimeout(r, 50))
+
+      const { ws: ws2, close: close2 } = await createAuthenticatedConnection()
+
+      // Force "PTY output" to occur during attach before the snapshot is sent.
+      registry.emitOutputOnNextAttach = { terminalId, data: 'raced output\n' }
+      ws2.send(JSON.stringify({ type: 'terminal.attach', terminalId }))
+
+      const msgs = await new Promise<any[]>((resolve, reject) => {
+        const received: any[] = []
+        const timeout = setTimeout(() => {
+          ws2.off('message', handler)
+          reject(new Error('Timeout waiting for attached+output messages'))
+        }, 2000)
+
+        const handler = (data: WebSocket.Data) => {
+          const msg = JSON.parse(data.toString())
+          if ((msg.type !== 'terminal.attached' && msg.type !== 'terminal.output') || msg.terminalId !== terminalId) return
+          received.push(msg)
+          if (received.some((m) => m.type === 'terminal.attached') && received.some((m) => m.type === 'terminal.output')) {
+            clearTimeout(timeout)
+            ws2.off('message', handler)
+            resolve(received)
+          }
+        }
+
+        ws2.on('message', handler)
+      })
+
+      const attachedIdx = msgs.findIndex((m) => m.type === 'terminal.attached')
+      const outputIdx = msgs.findIndex((m) => m.type === 'terminal.output')
+
+      expect(attachedIdx).toBeGreaterThanOrEqual(0)
+      expect(outputIdx).toBeGreaterThan(attachedIdx)
 
       close2()
     })

@@ -93,6 +93,7 @@ export type TerminalRecord = {
   cols: number
   rows: number
   clients: Set<WebSocket>
+  pendingSnapshotClients: Map<WebSocket, string[]>
   warnedIdle?: boolean
   buffer: ChunkRingBuffer
   pty: pty.IPty
@@ -637,6 +638,7 @@ export class TerminalRegistry {
       cols,
       rows,
       clients: new Set(),
+      pendingSnapshotClients: new Map(),
       buffer: new ChunkRingBuffer(DEFAULT_MAX_SCROLLBACK_CHARS),
       pty: ptyProc,
       perf: perfConfig.enabled
@@ -693,6 +695,11 @@ export class TerminalRegistry {
         }
       }
       for (const client of record.clients) {
+        const q = record.pendingSnapshotClients.get(client)
+        if (q) {
+          q.push(data)
+          continue
+        }
         this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf: record.perf })
       }
     })
@@ -707,6 +714,7 @@ export class TerminalRegistry {
         this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: e.exitCode }, { terminalId, perf: record.perf })
       }
       record.clients.clear()
+      record.pendingSnapshotClients.clear()
       this.reapExitedTerminals()
     })
 
@@ -714,17 +722,30 @@ export class TerminalRegistry {
     return record
   }
 
-  attach(terminalId: string, client: WebSocket): TerminalRecord | null {
+  attach(terminalId: string, client: WebSocket, opts?: { pendingSnapshot?: boolean }): TerminalRecord | null {
     const term = this.terminals.get(terminalId)
     if (!term) return null
     term.clients.add(client)
+    if (opts?.pendingSnapshot) term.pendingSnapshotClients.set(client, [])
     return term
+  }
+
+  finishAttachSnapshot(terminalId: string, client: WebSocket): void {
+    const term = this.terminals.get(terminalId)
+    if (!term) return
+    const queued = term.pendingSnapshotClients.get(client)
+    if (!queued) return
+    term.pendingSnapshotClients.delete(client)
+    for (const data of queued) {
+      this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf: term.perf })
+    }
   }
 
   detach(terminalId: string, client: WebSocket): boolean {
     const term = this.terminals.get(terminalId)
     if (!term) return false
     term.clients.delete(client)
+    term.pendingSnapshotClients.delete(client)
     return true
   }
 
@@ -777,6 +798,7 @@ export class TerminalRegistry {
       this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: term.exitCode })
     }
     term.clients.clear()
+    term.pendingSnapshotClients.clear()
     this.reapExitedTerminals()
     return true
   }

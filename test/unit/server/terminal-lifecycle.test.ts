@@ -194,6 +194,25 @@ describe('TerminalRegistry Lifecycle', () => {
       expect(term.clients.size).toBe(1)
     })
 
+    it('queues output while attach snapshot is pending and flushes after finishAttachSnapshot', () => {
+      const term = registry.create({ mode: 'shell' })
+      const pty = mockPtyProcess.instances[0]
+      const client = createMockWebSocket()
+
+      registry.attach(term.terminalId, client, { pendingSnapshot: true })
+
+      pty._emitData('queued output\n')
+
+      expect(client.send).not.toHaveBeenCalled()
+
+      registry.finishAttachSnapshot(term.terminalId, client)
+
+      const sent = (client.send as Mock).mock.calls.map((call) => JSON.parse(call[0]))
+      const outputs = sent.filter((m) => m.type === 'terminal.output')
+      expect(outputs).toHaveLength(1)
+      expect(outputs[0].data).toBe('queued output\n')
+    })
+
     it('should properly clean up zombie terminal on remove', () => {
       const term = registry.create({ mode: 'shell' })
       const pty = mockPtyProcess.instances[0]
