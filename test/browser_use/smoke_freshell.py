@@ -404,9 +404,9 @@ Steps:
    - Create a new in-app tab with the '+' button.
    - Rename it to: Coding CLIs (same rename approach as above).
    - You should see a pane type picker. Look at the options.
-     - If you see "Claude": click it to create a Claude Code pane. Wait a few seconds for it to initialize. Do not type anything into it (it may cost money).
+     - If you see "Claude": click it to create a Claude Code pane. Wait a few seconds for it to initialize.
      - Split once ("Add pane") to get another picker.
-     - If you see "Codex": click it to create a Codex pane. Wait a few seconds. Do not type anything into it.
+     - If you see "Codex": click it to create a Codex pane. Wait a few seconds.
      - If neither "Claude" nor "Codex" is visible, pick "Shell" instead. This is NOT a failure; it just means the CLIs are not installed on this system.
    - Confirm this tab ends up with at least 2 panes.
 
