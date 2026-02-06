@@ -7,6 +7,25 @@
     <title>freshell</title>
   </head>
   <body class="h-full">
+    <script>
+      // Capture console.error calls and uncaught errors from the very first
+      // moment the page loads.  Browser-use preflight checks query this array
+      // via `window.__consoleErrors` to abort early when the app is broken.
+      (function () {
+        var errors = (window.__consoleErrors = []);
+        var orig = console.error;
+        console.error = function () {
+          errors.push({
+            ts: Date.now(),
+            args: Array.prototype.slice.call(arguments).map(String),
+          });
+          return orig.apply(console, arguments);
+        };
+        window.addEventListener("error", function (e) {
+          errors.push({ ts: Date.now(), args: [e.message || "Unknown error"] });
+        });
+      })();
+    </script>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
