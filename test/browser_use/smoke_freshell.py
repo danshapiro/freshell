@@ -243,6 +243,10 @@ Requirements:
    - In the Terminal pane: run `node -v` (or `git --version` if node is unavailable).
      - WAIT for the command to finish and then explicitly verify visually that the terminal output contains a version-looking string (examples: `v20.11.0` or `git version 2.44.0`).
      - If you do not see version output, try the fallback command and verify that output instead.
+     - Terminal input reliability rules:
+       - Do NOT send `{Enter}` as part of the text (it often gets typed literally). Type the command text, then send `Enter` as a separate keypress.
+       - If normal typing is garbled or goes into the wrong field, click inside the terminal output area to focus it.
+       - If that still fails, locate the terminal's hidden textarea (often `textarea.xterm-helper-textarea`) and type the command into that element, then press `Enter`.
    - In the Browser pane: open the standard "Example Domain" website (IANA Example Domains) and verify visually it shows "Example Domain".
    - Keep terminal creation minimal: do not create extra terminal panes beyond this one.
 7) Create one more *Freshell shell tab* for Settings verification (again: in-app tab, not a browser tab).
