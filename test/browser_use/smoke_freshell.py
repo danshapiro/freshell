@@ -174,25 +174,25 @@ Requirements:
    - If you can still add panes indefinitely, stop once you have created at least {args.pane_target} panes total (this is a "good enough" stress level for this smoke test).
    - IMPORTANT: Don't try to verify pane types on this stress-test tab. Just create many panes and then stop.
 6) Create a new shell tab (click the plus button in the tab bar with the tooltip/title "New shell tab"). Do not open new windows.
-7) On that new tab, create a few panes and verify one of each type:
-   - Editor pane:
-     - Choose the "Editor" pane type for a pane.
-     - Open this file path: {known_text_file}
-     - Verify the editor shows content from that file (any recognizable text from README).
-   - Terminal pane:
-     - Choose the "Terminal"/shell pane type for a different pane (WSL/system shell is fine).
-      - Run `node -v` (or `git --version` if node is unavailable).
-     - Verify visually the command output looks like a version string.
-   - Browser pane:
-     - Choose the "Browser" pane type for a different pane.
-     - Navigate to https://example.com
-     - Verify the page shows "Example Domain".
-8) Create one more new shell tab (again, the plus button in the tab bar).
-9) On that tab, open the sidebar (if it is collapsed) using the top-left toggle button.
-10) Click "Settings" in the sidebar.
-11) On the Settings page, confirm "Terminal preview" is visible.
-12) Navigate back to the terminal view.
-13) Click through each tab in the tab bar to confirm they still render (stress tab, types tab, settings tab).
+7) On that new tab, create a few panes and confirm one of each type exists (Editor, Terminal, Browser). Keep this as a multi-pane tab for quick review.
+8) Create a new shell tab for a single-pane Editor verification:
+   - Create an Editor pane.
+   - Open this file path: {known_text_file}
+   - Verify the editor shows content from that file by using `find_text` to scroll to "Quick Start".
+9) Create a new shell tab for a single-pane Terminal verification:
+   - Create a WSL (or other shell) terminal pane.
+   - Run `node -v` (or `git --version` if node is unavailable).
+   - Verify visually the command output looks like a version string in the terminal output.
+10) Create a new shell tab for a single-pane Browser verification:
+   - Create a Browser pane.
+   - Navigate to https://example.com
+   - Verify visually the page shows "Example Domain".
+11) Create one more new shell tab for Settings verification.
+12) On that tab, open the sidebar (if it is collapsed) using the top-left toggle button.
+13) Click "Settings" in the sidebar.
+14) On the Settings page, confirm "Terminal preview" is visible (use `find_text`).
+15) Navigate back to the terminal view.
+16) Click through the tabs in the tab bar to confirm they still render (stress, multi-pane, editor, terminal, browser, settings).
 
 Output:
 At the end, output exactly one line:
@@ -206,7 +206,8 @@ SMOKE_RESULT: FAIL - <short reason>
     llm=llm,
     browser=browser,
     # Disallow filesystem mutation actions (keeps the smoke "pure" and avoids /tmp todo.md noise).
-    tools=Tools(exclude_actions=["write_file", "replace_file", "read_file"]),
+    # Also exclude page-text scraping helpers that can give misleading negatives for xterm/iframes.
+    tools=Tools(exclude_actions=["write_file", "replace_file", "read_file", "search_page", "extract"]),
     use_vision=True,
   )
 
