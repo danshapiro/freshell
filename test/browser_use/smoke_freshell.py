@@ -169,6 +169,25 @@ async def _run(args: argparse.Namespace) -> int:
       await browser.event_bus.dispatch(SwitchTabEvent(target_id=None))
     except Exception:
       pass
+
+    # Close any about:blank tabs so the agent doesn't get "stuck" on an empty tab and navigate away unauthenticated.
+    try:
+      from browser_use.browser.events import CloseTabEvent, SwitchTabEvent  # type: ignore
+
+      pages = await browser.get_pages()
+      for p in pages:
+        try:
+          url = await p.get_url()
+          if url == "about:blank":
+            tid = getattr(p, "_target_id", None)
+            if tid:
+              await browser.event_bus.dispatch(CloseTabEvent(target_id=tid))
+        except Exception:
+          continue
+      # Re-focus the most recently opened page after closing blanks.
+      await browser.event_bus.dispatch(SwitchTabEvent(target_id=None))
+    except Exception:
+      pass
     # Wait for the SPA to fully bootstrap auth:
     # - token removed from URL
     # - auth-token stored in sessionStorage
@@ -219,6 +238,7 @@ Important constraints:
 
 Requirements:
 1) Wait until the page is fully loaded and the top bar is visible.
+   - If you see an "Empty DOM tree" / blank page, switch to the browser tab that shows Freshell (localhost:5173) and continue from there. Do not navigate away to other sites.
 2) Verify the app header contains the text "freshell".
 3) Verify the connection indicator shows the app is connected (not disconnected).
 4) Pane stress test (do this once):
