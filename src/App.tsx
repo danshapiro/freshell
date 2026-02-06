@@ -11,6 +11,7 @@ import { buildShareUrl } from '@/lib/utils'
 import { getWsClient } from '@/lib/ws-client'
 import { getSessionsForHello } from '@/lib/session-utils'
 import { setClientPerfEnabled } from '@/lib/perf-logger'
+import { applyLocalTerminalFontFamily } from '@/lib/terminal-fonts'
 import { store } from '@/store/store'
 import { useThemeEffect } from '@/hooks/useTheme'
 import { buildDefaultPaneContent } from '@/lib/default-pane'
@@ -163,10 +164,56 @@ export default function App() {
   // Bootstrap: load settings, sessions, and connect websocket.
   useEffect(() => {
     let cancelled = false
+    const ws = getWsClient()
+
+    // Set up hello extension to include session IDs for prioritized repair.
+    ws.setHelloExtensionProvider(() => ({
+      sessions: getSessionsForHello(store.getState()),
+    }))
+
+    // Keep message handlers registered even if the initial connect() fails.
+    // WsClient can reconnect on its own; we still want to recover UI state.
+    const unsubscribe = ws.onMessage((msg) => {
+      if (!msg?.type) return
+
+      if (msg.type === 'ready') {
+        if (!cancelled) {
+          dispatch(setError(undefined))
+          dispatch(setStatus('ready'))
+        }
+        return
+      }
+
+      if (msg.type === 'sessions.updated') {
+        dispatch(setProjects(msg.projects || []))
+      }
+      if (msg.type === 'settings.updated') {
+        dispatch(setSettings(applyLocalTerminalFontFamily(msg.settings)))
+      }
+      if (msg.type === 'terminal.exit') {
+        const terminalId = msg.terminalId
+        const code = msg.exitCode
+        console.log('terminal exit', terminalId, code)
+      }
+      if (msg.type === 'session.status') {
+        // Log session repair status (silent for healthy/repaired, visible for problems)
+        const { sessionId, status, orphansFixed } = msg
+        if (status === 'missing') {
+          console.warn(`Session ${sessionId.slice(0, 8)}... file is missing`)
+        } else if (status === 'repaired') {
+          console.log(`Session ${sessionId.slice(0, 8)}... repaired (${orphansFixed} orphans fixed)`)
+        }
+        // For 'healthy' status, no logging needed
+      }
+      if (msg.type === 'perf.logging') {
+        setClientPerfEnabled(!!msg.enabled, 'server')
+      }
+    })
+
     async function bootstrap() {
       try {
         const settings = await api.get('/api/settings')
-        if (!cancelled) dispatch(setSettings(settings))
+        if (!cancelled) dispatch(setSettings(applyLocalTerminalFontFamily(settings)))
       } catch (err: any) {
         console.warn('Failed to load settings', err)
       }
@@ -190,13 +237,6 @@ export default function App() {
         console.warn('Failed to load sessions', err)
       }
 
-      const ws = getWsClient()
-
-      // Set up hello extension to include session IDs for prioritized repair
-      ws.setHelloExtensionProvider(() => ({
-        sessions: getSessionsForHello(store.getState()),
-      }))
-
       dispatch(setError(undefined))
       dispatch(setStatus('connecting'))
       try {
@@ -209,45 +249,12 @@ export default function App() {
         }
         return
       }
-
-      const unsubscribe = ws.onMessage((msg) => {
-        if (!msg?.type) return
-        if (msg.type === 'sessions.updated') {
-          dispatch(setProjects(msg.projects || []))
-        }
-        if (msg.type === 'settings.updated') {
-          dispatch(setSettings(msg.settings))
-        }
-        if (msg.type === 'terminal.exit') {
-          const terminalId = msg.terminalId
-          const code = msg.exitCode
-          console.log('terminal exit', terminalId, code)
-        }
-        if (msg.type === 'session.status') {
-          // Log session repair status (silent for healthy/repaired, visible for problems)
-          const { sessionId, status, orphansFixed } = msg
-          if (status === 'missing') {
-            console.warn(`Session ${sessionId.slice(0, 8)}... file is missing`)
-          } else if (status === 'repaired') {
-            console.log(`Session ${sessionId.slice(0, 8)}... repaired (${orphansFixed} orphans fixed)`)
-          }
-          // For 'healthy' status, no logging needed
-        }
-        if (msg.type === 'perf.logging') {
-          setClientPerfEnabled(!!msg.enabled, 'server')
-        }
-      })
-
-      return () => {
-        unsubscribe()
-      }
     }
 
-    const cleanupPromise = bootstrap()
-
+    void bootstrap()
     return () => {
       cancelled = true
-      void cleanupPromise
+      unsubscribe()
     }
   }, [dispatch])
 

@@ -20,10 +20,15 @@ import type { CodingCliProviderName } from '@/store/types'
 import type { ContextTarget } from './context-menu-types'
 import { ContextMenu } from './ContextMenu'
 import { ContextIds } from './context-menu-constants'
+import type { ContextId } from './context-menu-constants'
 import { buildMenuItems } from './menu-defs'
 import { copyDataset, isTextInputLike, parseContextTarget } from './context-menu-utils'
 
 const CONTEXT_MENU_KEYS = ['ContextMenu']
+const EMPTY_PENDING_REQUESTS: Record<string, never> = {}
+const EMPTY_SESSION_ACTIVITY: Record<string, number> = {}
+const EMPTY_PANE_TITLES: Record<string, Record<string, string>> = {}
+const EMPTY_ACTIVE_PANES: Record<string, string> = {}
 
 
 type MenuState = {
@@ -57,10 +62,13 @@ function findContextElement(start: HTMLElement | null): HTMLElement | null {
   return null
 }
 
-function resolveContextId(value: string | undefined): string {
+function isContextId(value: string): value is ContextId {
+  return (Object.values(ContextIds) as readonly string[]).includes(value)
+}
+
+function resolveContextId(value: string | undefined): ContextId {
   if (!value) return ContextIds.Global
-  const allowed = new Set(Object.values(ContextIds))
-  return allowed.has(value) ? value : ContextIds.Global
+  return isContextId(value) ? value : ContextIds.Global
 }
 
 export function ContextMenuProvider({
@@ -73,10 +81,10 @@ export function ContextMenuProvider({
   const dispatch = useAppDispatch()
   const tabsState = useAppSelector((s) => s.tabs)
   const panes = useAppSelector((s) => s.panes.layouts)
-  const paneTitles = useAppSelector((s) => s.panes.paneTitles)
-  const activePanes = useAppSelector((s) => s.panes.activePane)
-  const pendingRequests = useAppSelector((s) => s.codingCli.pendingRequests)
-  const sessionActivity = useAppSelector((s) => s.sessionActivity.sessions)
+  const paneTitles = useAppSelector((s) => s.panes?.paneTitles) ?? EMPTY_PANE_TITLES
+  const activePanes = useAppSelector((s) => s.panes?.activePane) ?? EMPTY_ACTIVE_PANES
+  const pendingRequests = useAppSelector((s) => s.codingCli?.pendingRequests) ?? EMPTY_PENDING_REQUESTS
+  const sessionActivity = useAppSelector((s) => s.sessionActivity?.sessions) ?? EMPTY_SESSION_ACTIVITY
   const sessions = useAppSelector((s) => s.sessions.projects)
   const expandedProjects = useAppSelector((s) => s.sessions.expandedProjects)
   const platform = useAppSelector((s) => s.connection?.platform ?? null)

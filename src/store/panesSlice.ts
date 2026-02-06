@@ -1,25 +1,115 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import { nanoid } from 'nanoid'
 import type { PanesState, PaneContent, PaneContentInput, PaneNode } from './paneTypes'
+import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 
 /**
  * Normalize terminal input to full PaneContent with defaults.
  */
 function normalizeContent(input: PaneContentInput): PaneContent {
   if (input.kind === 'terminal') {
+    const mode = input.mode || 'shell'
+    // Only validate Claude resume IDs; other providers pass through unchanged.
+    const resumeSessionId =
+      mode === 'claude' && isValidClaudeSessionId(input.resumeSessionId)
+        ? input.resumeSessionId
+        : mode === 'claude'
+          ? undefined
+          : input.resumeSessionId
     return {
       kind: 'terminal',
       terminalId: input.terminalId,
       createRequestId: input.createRequestId || nanoid(),
       status: input.status || 'creating',
-      mode: input.mode || 'shell',
+      mode,
       shell: input.shell || 'system',
-      resumeSessionId: input.resumeSessionId,
+      resumeSessionId,
       initialCwd: input.initialCwd,
     }
   }
   // Browser content passes through unchanged
   return input
+}
+
+function applyLegacyResumeSessionIds(state: PanesState): PanesState {
+  if (typeof localStorage === 'undefined') return state
+  const rawTabs = localStorage.getItem('freshell.tabs.v1')
+  if (!rawTabs) return state
+
+  let parsedTabs: any
+  try {
+    parsedTabs = JSON.parse(rawTabs)
+  } catch {
+    return state
+  }
+
+  const tabsState = parsedTabs?.tabs
+  if (!tabsState?.tabs) return state
+
+  const resumeByTabId = new Map<string, string>()
+  for (const tab of tabsState.tabs) {
+    // Legacy tabs may not have mode persisted; resumeSessionId is the signal.
+    if (isValidClaudeSessionId(tab?.resumeSessionId)) {
+      resumeByTabId.set(tab.id, tab.resumeSessionId)
+    }
+  }
+
+  if (resumeByTabId.size === 0) return state
+
+  const nextLayouts: Record<string, PaneNode> = {}
+  let changed = false
+
+  const findLeaf = (node: PaneNode, targetId: string): Extract<PaneNode, { type: 'leaf' }> | null => {
+    if (node.type === 'leaf') return node.id === targetId ? node : null
+    return findLeaf(node.children[0], targetId) || findLeaf(node.children[1], targetId)
+  }
+
+  const findFirstClaudeLeaf = (node: PaneNode): Extract<PaneNode, { type: 'leaf' }> | null => {
+    if (node.type === 'leaf') {
+      if (node.content.kind === 'terminal' && node.content.mode === 'claude') return node
+      return null
+    }
+    return findFirstClaudeLeaf(node.children[0]) || findFirstClaudeLeaf(node.children[1])
+  }
+
+  const assignToTarget = (node: PaneNode, targetId: string, resumeSessionId: string): PaneNode => {
+    if (node.type === 'leaf') {
+      if (node.id !== targetId) return node
+      if (node.content.kind !== 'terminal' || node.content.mode !== 'claude') return node
+      if (node.content.resumeSessionId) return node
+      changed = true
+      return { ...node, content: { ...node.content, resumeSessionId } }
+    }
+
+    const left = assignToTarget(node.children[0], targetId, resumeSessionId)
+    const right = assignToTarget(node.children[1], targetId, resumeSessionId)
+    if (left === node.children[0] && right === node.children[1]) return node
+    return { ...node, children: [left, right] }
+  }
+
+  for (const [tabId, node] of Object.entries(state.layouts)) {
+    const resume = resumeByTabId.get(tabId)
+    if (!resume) {
+      nextLayouts[tabId] = node as PaneNode
+      continue
+    }
+
+    const activeId = state.activePane[tabId]
+    const activeLeaf = activeId ? findLeaf(node as PaneNode, activeId) : null
+    const targetLeaf =
+      activeLeaf && activeLeaf.content.kind === 'terminal' && activeLeaf.content.mode === 'claude'
+        ? activeLeaf
+        : findFirstClaudeLeaf(node as PaneNode)
+
+    if (!targetLeaf) {
+      nextLayouts[tabId] = node as PaneNode
+      continue
+    }
+
+    nextLayouts[tabId] = assignToTarget(node as PaneNode, targetLeaf.id, resume)
+  }
+
+  return changed ? { ...state, layouts: nextLayouts } : state
 }
 
 // Load persisted panes state directly at module initialization time
@@ -37,12 +127,13 @@ function loadInitialPanesState(): PanesState {
     if (!raw) return defaultState
     const parsed = JSON.parse(raw) as PanesState
     console.log('[PanesSlice] Loaded initial state from localStorage:', Object.keys(parsed.layouts || {}))
-    return {
+    const state = {
       layouts: parsed.layouts || {},
       activePane: parsed.activePane || {},
       paneTitles: parsed.paneTitles || {},
       paneTitleSetByUser: parsed.paneTitleSetByUser || {},
     }
+    return applyLegacyResumeSessionIds(state)
   } catch (err) {
     console.error('[PanesSlice] Failed to load from localStorage:', err)
     return defaultState
@@ -406,23 +497,29 @@ export const panesSlice = createSlice({
       const { tabId, paneId, content } = action.payload
       const root = state.layouts[tabId]
       if (!root) return
-      let previousContent: PaneContent | null = null
 
-      function updateContent(node: PaneNode): PaneNode {
+      function updateContent(node: PaneNode): { node: PaneNode; previousContent: PaneContent | null } {
         if (node.type === 'leaf') {
           if (node.id === paneId) {
-            previousContent = node.content
-            return { ...node, content }
+            return { node: { ...node, content }, previousContent: node.content }
           }
-          return node
+          return { node, previousContent: null }
         }
+
+        const left = updateContent(node.children[0])
+        const right = updateContent(node.children[1])
         return {
-          ...node,
-          children: [updateContent(node.children[0]), updateContent(node.children[1])],
+          node: {
+            ...node,
+            children: [left.node, right.node],
+          },
+          previousContent: left.previousContent ?? right.previousContent,
         }
       }
 
-      state.layouts[tabId] = updateContent(root)
+      const updated = updateContent(root)
+      state.layouts[tabId] = updated.node
+      const previousContent = updated.previousContent
       if (!previousContent) return
 
       // Clear titles when content changes significantly

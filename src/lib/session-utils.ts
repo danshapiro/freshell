@@ -66,8 +66,8 @@ export function findTabIdForSession(state: RootState, provider: CodingCliProvide
       continue
     }
 
-    // Fallback for tabs without pane layout yet (e.g., early boot).
-    const tabProvider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
+    // Fallback for tabs without pane layout yet (e.g., early boot/persisted tabs).
+    const tabProvider = tab.codingCliProvider || (tab.mode && tab.mode !== 'shell' ? tab.mode : undefined)
     if (tabProvider !== provider) continue
     const tabSessionId = tab.resumeSessionId
     if (!tabSessionId) continue

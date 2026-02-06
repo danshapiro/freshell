@@ -60,6 +60,9 @@ vi.mock('@/lib/api', async () => {
 
 import { searchSessions as mockSearchSessions } from '@/lib/api'
 
+const SESSION_TO_RESUME_ID = '11111111-1111-1111-1111-111111111111'
+const SESSION_RUNNING_NO_TAB_ID = '22222222-2222-2222-2222-222222222222'
+
 function createTestStore(options?: {
   projects?: ProjectGroup[]
   terminals?: BackgroundTerminal[]
@@ -1108,15 +1111,15 @@ describe('Sidebar Component - Session-Centric Display', () => {
   describe('session click handling', () => {
     it('resumes non-running session on click', async () => {
       const projects: ProjectGroup[] = [
-        {
-          projectPath: '/home/user/project',
-          sessions: [
-            {
-              sessionId: 'session-to-resume',
-              projectPath: '/home/user/project',
-              updatedAt: Date.now(),
-              title: 'Session to resume',
-              cwd: '/home/user/project',
+	        {
+	          projectPath: '/home/user/project',
+	          sessions: [
+	            {
+	              sessionId: SESSION_TO_RESUME_ID,
+	              projectPath: '/home/user/project',
+	              updatedAt: Date.now(),
+	              title: 'Session to resume',
+	              cwd: '/home/user/project',
             },
           ],
         },
@@ -1138,13 +1141,13 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(state.tabs.tabs).toHaveLength(1)
       const newTabId = state.tabs.tabs[0].id
       const layout = state.panes.layouts[newTabId]
-      expect(layout).toBeDefined()
-      expect(layout.type).toBe('leaf')
-      if (layout.type === 'leaf' && layout.content.kind === 'terminal') {
-        expect(layout.content.resumeSessionId).toBe('session-to-resume')
-        expect(layout.content.mode).toBe('claude')
-      }
-    })
+	      expect(layout).toBeDefined()
+	      expect(layout.type).toBe('leaf')
+	      if (layout.type === 'leaf' && layout.content.kind === 'terminal') {
+	        expect(layout.content.resumeSessionId).toBe(SESSION_TO_RESUME_ID)
+	        expect(layout.content.mode).toBe('claude')
+	      }
+	    })
 
     it('switches to existing tab and sets active pane when clicking non-running session that is already open', async () => {
       const projects: ProjectGroup[] = [
@@ -1264,15 +1267,15 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
     it('creates new tab to attach when clicking running session without existing tab', async () => {
       const projects: ProjectGroup[] = [
-        {
-          projectPath: '/home/user/project',
-          sessions: [
-            {
-              sessionId: 'session-running-no-tab',
-              projectPath: '/home/user/project',
-              updatedAt: Date.now(),
-              title: 'Running without tab',
-              cwd: '/home/user/project',
+	        {
+	          projectPath: '/home/user/project',
+	          sessions: [
+	            {
+	              sessionId: SESSION_RUNNING_NO_TAB_ID,
+	              projectPath: '/home/user/project',
+	              updatedAt: Date.now(),
+	              title: 'Running without tab',
+	              cwd: '/home/user/project',
             },
           ],
         },
@@ -1285,12 +1288,12 @@ describe('Sidebar Component - Session-Centric Display', () => {
           createdAt: Date.now(),
           lastActivityAt: Date.now(),
           status: 'running',
-          hasClients: false,
-          mode: 'claude',
-          resumeSessionId: 'session-running-no-tab',
-          cwd: '/home/user/project',
-        },
-      ]
+	          hasClients: false,
+	          mode: 'claude',
+	          resumeSessionId: SESSION_RUNNING_NO_TAB_ID,
+	          cwd: '/home/user/project',
+	        },
+	      ]
 
       const store = createTestStore({ projects, tabs: [], activeTabId: null, sortMode: 'activity' })
       const { onNavigate } = renderSidebar(store, terminals)
@@ -1312,14 +1315,14 @@ describe('Sidebar Component - Session-Centric Display', () => {
       const newTabId = state.tabs.tabs[0].id
       const layout = state.panes.layouts[newTabId]
       expect(layout).toBeDefined()
-      expect(layout.type).toBe('leaf')
-      if (layout.type === 'leaf' && layout.content.kind === 'terminal') {
-        expect(layout.content.terminalId).toBe('orphan-terminal-id')
-        expect(layout.content.resumeSessionId).toBe('session-running-no-tab')
-        expect(layout.content.mode).toBe('claude')
-      }
-    })
-  })
+	      expect(layout.type).toBe('leaf')
+	      if (layout.type === 'leaf' && layout.content.kind === 'terminal') {
+	        expect(layout.content.terminalId).toBe('orphan-terminal-id')
+	        expect(layout.content.resumeSessionId).toBe(SESSION_RUNNING_NO_TAB_ID)
+	        expect(layout.content.mode).toBe('claude')
+	      }
+	    })
+	  })
 
   describe('empty state', () => {
     it('shows empty message when no sessions exist', async () => {

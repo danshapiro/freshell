@@ -118,7 +118,7 @@ function filterSessionItems(items: SidebarSessionItem[], filter: string): Sideba
   )
 }
 
-function sortSessionItems(items: SidebarSessionItem[], sortMode: string): SidebarSessionItem[] {
+export function sortSessionItems(items: SidebarSessionItem[], sortMode: string): SidebarSessionItem[] {
   const sorted = [...items]
 
   const active = sorted.filter((i) => !i.archived)
@@ -131,13 +131,23 @@ function sortSessionItems(items: SidebarSessionItem[], sortMode: string): Sideba
       return copy.sort((a, b) => b.timestamp - a.timestamp)
     }
 
+    if (sortMode === 'recency-pinned') {
+      const withTabs = copy.filter((i) => i.hasTab)
+      const withoutTabs = copy.filter((i) => !i.hasTab)
+
+      withTabs.sort((a, b) => b.timestamp - a.timestamp)
+      withoutTabs.sort((a, b) => b.timestamp - a.timestamp)
+
+      return [...withTabs, ...withoutTabs]
+    }
+
     if (sortMode === 'activity') {
       const withTabs = copy.filter((i) => i.hasTab)
       const withoutTabs = copy.filter((i) => !i.hasTab)
 
       withTabs.sort((a, b) => {
-        const aTime = a.tabLastInputAt ?? a.timestamp
-        const bTime = b.tabLastInputAt ?? b.timestamp
+        const aTime = a.ratchetedActivity ?? a.timestamp
+        const bTime = b.ratchetedActivity ?? b.timestamp
         return bTime - aTime
       })
 

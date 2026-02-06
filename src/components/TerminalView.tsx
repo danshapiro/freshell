@@ -328,8 +328,10 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   // Create or attach to backend terminal
   useEffect(() => {
     if (!isTerminal || !terminalContent) return
-    const term = termRef.current
-    if (!term) return
+    const xterm = termRef.current
+    if (!xterm) return
+    // TS doesn't preserve outer-scope null narrowing inside closures; capture a non-null instance.
+    const xtermApi = xterm
 
     // NOTE: We intentionally don't destructure terminalId here.
     // We read it from terminalIdRef.current to avoid stale closures.
@@ -341,7 +343,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     function attach(tid: string) {
       setIsAttaching(true)
       ws.send({ type: 'terminal.attach', terminalId: tid })
-      ws.send({ type: 'terminal.resize', terminalId: tid, cols: term.cols, rows: term.rows })
+      ws.send({ type: 'terminal.resize', terminalId: tid, cols: xtermApi.cols, rows: xtermApi.rows })
     }
 
     async function ensure() {
@@ -354,7 +356,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         const reqId = requestIdRef.current
 
         if (msg.type === 'terminal.output' && msg.terminalId === tid) {
-          term.write(msg.data || '')
+          xtermApi.write(msg.data || '')
           // Throttle recordOutput dispatches to avoid performance issues with chatty terminals
           const now = Date.now()
           if (now - lastOutputDispatchAtRef.current >= OUTPUT_DISPATCH_THROTTLE_MS) {
@@ -364,9 +366,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         }
 
         if (msg.type === 'terminal.snapshot' && msg.terminalId === tid) {
-          try { term.clear() } catch {}
+          try { xtermApi.clear() } catch {}
           if (msg.snapshot) {
-            try { term.write(msg.snapshot) } catch {}
+            try { xtermApi.write(msg.snapshot) } catch {}
           }
         }
 
@@ -375,7 +377,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           terminalIdRef.current = newId
           updateContent({ terminalId: newId, status: 'running' })
           if (msg.snapshot) {
-            try { term.clear(); term.write(msg.snapshot) } catch {}
+            try { xtermApi.clear(); xtermApi.write(msg.snapshot) } catch {}
           }
           attach(newId)
         }
@@ -383,7 +385,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         if (msg.type === 'terminal.attached' && msg.terminalId === tid) {
           setIsAttaching(false)
           if (msg.snapshot) {
-            try { term.clear(); term.write(msg.snapshot) } catch {}
+            try { xtermApi.clear(); xtermApi.write(msg.snapshot) } catch {}
           }
           updateContent({ status: 'running' })
         }
@@ -415,7 +417,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         if (msg.type === 'error' && msg.requestId === reqId) {
           setIsAttaching(false)
           updateContent({ status: 'error' })
-          term.writeln(`\r\n[Error] ${msg.message || msg.code || 'Unknown error'}\r\n`)
+          xtermApi.writeln(`\r\n[Error] ${msg.message || msg.code || 'Unknown error'}\r\n`)
         }
 
         if (msg.type === 'error' && msg.code === 'INVALID_TERMINAL_ID' && !msg.requestId) {
@@ -424,7 +426,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             return
           }
           if (currentTerminalId) {
-            term.writeln('\r\n[Reconnecting...]\r\n')
+            xtermApi.writeln('\r\n[Reconnecting...]\r\n')
             const newRequestId = nanoid()
             requestIdRef.current = newRequestId
             terminalIdRef.current = undefined

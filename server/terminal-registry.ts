@@ -4,13 +4,20 @@ import * as pty from 'node-pty'
 import os from 'os'
 import path from 'path'
 import fs from 'fs'
+import { EventEmitter } from 'events'
 import { logger } from './logger.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
 import type { AppSettings } from './config-store.js'
+import { isReachableDirectorySync } from './path-utils.js'
+import { isValidClaudeSessionId } from './claude-session-id.js'
 
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
 const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 64 * 1024)
+const MIN_SCROLLBACK_CHARS = 64 * 1024
+const MAX_SCROLLBACK_CHARS = 2 * 1024 * 1024
+const APPROX_CHARS_PER_LINE = 200
 const MAX_TERMINALS = Number(process.env.MAX_TERMINALS || 50)
+const DEFAULT_MAX_PENDING_SNAPSHOT_CHARS = 512 * 1024
 const perfConfig = getPerfConfig()
 
 // TerminalMode includes 'shell' for regular terminals, plus coding CLI providers.
@@ -71,10 +78,23 @@ function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string) {
   return { command, args, label: spec.label }
 }
 
+function normalizeResumeSessionId(mode: TerminalMode, resumeSessionId?: string): string | undefined {
+  if (!resumeSessionId) return undefined
+  if (mode !== 'claude') return resumeSessionId
+  if (isValidClaudeSessionId(resumeSessionId)) return resumeSessionId
+  logger.warn({ resumeSessionId }, 'Ignoring invalid Claude resumeSessionId')
+  return undefined
+}
+
 function getModeLabel(mode: TerminalMode): string {
   if (mode === 'shell') return 'Shell'
   const label = CODING_CLI_COMMANDS[mode]?.label
   return label || mode.toUpperCase()
+}
+
+type PendingSnapshotQueue = {
+  chunks: string[]
+  queuedChars: number
 }
 
 export type TerminalRecord = {
@@ -85,12 +105,14 @@ export type TerminalRecord = {
   resumeSessionId?: string
   createdAt: number
   lastActivityAt: number
+  exitedAt?: number
   status: 'running' | 'exited'
   exitCode?: number
   cwd?: string
   cols: number
   rows: number
   clients: Set<WebSocket>
+  pendingSnapshotClients: Map<WebSocket, PendingSnapshotQueue>
   warnedIdle?: boolean
   buffer: ChunkRingBuffer
   pty: pty.IPty
@@ -114,20 +136,34 @@ export class ChunkRingBuffer {
   private size = 0
   constructor(private maxChars: number) {}
 
-  append(chunk: string) {
-    if (!chunk) return
-    this.chunks.push(chunk)
-    this.size += chunk.length
-    while (this.size > this.maxChars && this.chunks.length > 1) {
+  private trimToMax() {
+    const max = this.maxChars
+    if (max <= 0) {
+      this.clear()
+      return
+    }
+    while (this.size > max && this.chunks.length > 1) {
       const removed = this.chunks.shift()!
       this.size -= removed.length
     }
     // If a single chunk is enormous, truncate it.
-    if (this.size > this.maxChars && this.chunks.length === 1) {
+    if (this.size > max && this.chunks.length === 1) {
       const only = this.chunks[0]
-      this.chunks[0] = only.slice(-this.maxChars)
+      this.chunks[0] = only.slice(-max)
       this.size = this.chunks[0].length
     }
+  }
+
+  append(chunk: string) {
+    if (!chunk) return
+    this.chunks.push(chunk)
+    this.size += chunk.length
+    this.trimToMax()
+  }
+
+  setMaxChars(next: number) {
+    this.maxChars = Math.max(0, next)
+    this.trimToMax()
   }
 
   snapshot(): string {
@@ -141,7 +177,10 @@ export class ChunkRingBuffer {
 }
 
 function getDefaultCwd(settings?: AppSettings): string | undefined {
-  return settings?.defaultCwd || undefined
+  const candidate = settings?.defaultCwd
+  if (!candidate) return undefined
+  const { ok, resolvedPath } = isReachableDirectorySync(candidate)
+  return ok ? resolvedPath : undefined
 }
 
 function isWindows(): boolean {
@@ -166,6 +205,76 @@ export function isWsl(): boolean {
  */
 export function isWindowsLike(): boolean {
   return isWindows() || isWsl()
+}
+
+/**
+ * Get the executable path for cmd.exe or powershell.exe.
+ * On native Windows, uses the simple name (relies on PATH).
+ * On WSL, uses full paths since Windows executables may not be on PATH.
+ */
+function getWindowsExe(exe: 'cmd' | 'powershell'): string {
+  if (isWindows()) {
+    return exe === 'cmd' ? 'cmd.exe' : (process.env.POWERSHELL_EXE || 'powershell.exe')
+  }
+  // On WSL, use explicit paths since Windows PATH may not be available
+  const systemRoot = process.env.WSL_WINDOWS_SYS32 || '/mnt/c/Windows/System32'
+  if (exe === 'cmd') {
+    return `${systemRoot}/cmd.exe`
+  }
+  return process.env.POWERSHELL_EXE || `${systemRoot}/WindowsPowerShell/v1.0/powershell.exe`
+}
+
+/**
+ * Get the WSL mount prefix for Windows drives.
+ * Derives from WSL_WINDOWS_SYS32 (e.g., /mnt/c/Windows/System32 → /mnt)
+ * or defaults to /mnt for standard WSL configurations.
+ *
+ * Handles various mount configurations:
+ * - /mnt/c/... → /mnt (standard)
+ * - /c/... → '' (drives at root)
+ * - /win/c/... → /win (custom prefix)
+ */
+function getWslMountPrefix(): string {
+  const sys32 = process.env.WSL_WINDOWS_SYS32
+  if (sys32) {
+    // Extract mount prefix from path like /mnt/c/Windows/System32
+    // The drive letter is a single char followed by /
+    const match = sys32.match(/^(.*)\/[a-zA-Z]\//)
+    if (match) {
+      return match[1]
+    }
+  }
+  return '/mnt'
+}
+
+/**
+ * Get a sensible default working directory for Windows shells.
+ * On native Windows: user's home directory (C:\Users\<username>)
+ * In WSL: Windows user profile converted to WSL path, falling back to C:\
+ *
+ * This avoids UNC paths (\\wsl.localhost\...) which cmd.exe doesn't support.
+ * Respects custom WSL mount configurations via WSL_WINDOWS_SYS32.
+ */
+function getWindowsDefaultCwd(): string {
+  if (isWindows()) {
+    return os.homedir()
+  }
+  // In WSL, we need a Windows-accessible path
+  const mountPrefix = getWslMountPrefix()
+
+  // Try USERPROFILE if it's shared via WSLENV, convert to WSL mount path
+  const userProfile = process.env.USERPROFILE
+  if (userProfile) {
+    // Convert Windows path (C:\Users\name) to WSL path (/mnt/c/Users/name)
+    const match = userProfile.match(/^([A-Za-z]):\\(.*)$/)
+    if (match) {
+      const drive = match[1].toLowerCase()
+      const rest = match[2].replace(/\\/g, '/')
+      return `${mountPrefix}/${drive}/${rest}`
+    }
+  }
+  // Fallback: use C:\ root
+  return `${mountPrefix}/c`
 }
 
 /**
@@ -245,8 +354,21 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
     COLORTERM: process.env.COLORTERM || 'truecolor',
   }
 
+  const normalizedResume = normalizeResumeSessionId(mode, resumeSessionId)
+
   // Resolve shell for the current platform
   const effectiveShell = resolveShell(shell)
+
+  // Debug logging for shell/cwd resolution
+  logger.debug({
+    mode,
+    requestedShell: shell,
+    effectiveShell,
+    cwd,
+    isLinuxPath: cwd ? isLinuxPath(cwd) : false,
+    isWsl: isWsl(),
+    isWindows: isWindows(),
+  }, 'buildSpawnSpec: resolving shell and cwd')
 
   // In WSL with 'system' shell (which 'wsl' resolves to), use Linux shell directly
   // For 'cmd' or 'powershell' in WSL, fall through to Windows shell handling
@@ -282,7 +404,7 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
         return { file: wsl, args, cwd: undefined, env }
       }
 
-      const cli = resolveCodingCliCommand(mode, resumeSessionId)
+      const cli = resolveCodingCliCommand(mode, normalizedResume)
       if (!cli) {
         args.push('--exec', 'bash', '-l')
         return { file: wsl, args, cwd: undefined, env }
@@ -297,33 +419,63 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
     const quote = (s: string) => `"${escapePowershell(s)}"`
 
     if (windowsMode === 'cmd') {
-      const file = 'cmd.exe'
-      // Don't use Linux paths as cwd on native Windows
-      const winCwd = isLinuxPath(cwd) ? undefined : cwd
+      const file = getWindowsExe('cmd')
+      // In WSL, we can't pass Linux paths as cwd to Windows executables (they become UNC paths)
+      // Instead, pass no cwd and use cd /d inside the command
+      const inWsl = isWsl()
+      const winCwd = inWsl ? getWindowsDefaultCwd() : (isLinuxPath(cwd) ? undefined : cwd)
+      // For WSL: don't pass cwd to node-pty, use cd /d in command instead
+      const procCwd = inWsl ? undefined : winCwd
+      logger.debug({
+        shell: 'cmd',
+        inWsl,
+        originalCwd: cwd,
+        winCwd,
+        procCwd,
+        file,
+      }, 'buildSpawnSpec: cmd.exe cwd resolution')
       if (mode === 'shell') {
-        return { file, args: ['/K'], cwd: winCwd, env }
+        if (inWsl && winCwd) {
+          // Use /K with cd command to change to Windows directory
+          return { file, args: ['/K', `cd /d "${winCwd}"`], cwd: procCwd, env }
+        }
+        return { file, args: ['/K'], cwd: procCwd, env }
       }
-      const cli = resolveCodingCliCommand(mode, resumeSessionId)
+      const cli = resolveCodingCliCommand(mode, normalizedResume)
       const cmd = cli?.command || mode
       const resume = cli?.args.length ? ` ${cli.args.join(' ')}` : ''
-      const cd = winCwd ? `cd /d ${winCwd} && ` : ''
-      return { file, args: ['/K', `${cd}${cmd}${resume}`], cwd: winCwd, env }
+      const cd = winCwd ? `cd /d "${winCwd}" && ` : ''
+      return { file, args: ['/K', `${cd}${cmd}${resume}`], cwd: procCwd, env }
     }
 
     // default to PowerShell
-    const file = process.env.POWERSHELL_EXE || 'powershell.exe'
-    // Don't use Linux paths as cwd on native Windows
-    const winCwd = isLinuxPath(cwd) ? undefined : cwd
+    const file = getWindowsExe('powershell')
+    // In WSL, we can't pass Linux paths as cwd to Windows executables (they become UNC paths)
+    const inWsl = isWsl()
+    const winCwd = inWsl ? getWindowsDefaultCwd() : (isLinuxPath(cwd) ? undefined : cwd)
+    const procCwd = inWsl ? undefined : winCwd
+    logger.debug({
+      shell: 'powershell',
+      inWsl,
+      originalCwd: cwd,
+      winCwd,
+      procCwd,
+      file,
+    }, 'buildSpawnSpec: powershell.exe cwd resolution')
     if (mode === 'shell') {
-      return { file, args: ['-NoLogo'], cwd: winCwd, env }
+      if (inWsl && winCwd) {
+        // Use Set-Location to change to Windows directory
+        return { file, args: ['-NoLogo', '-NoExit', '-Command', `Set-Location -LiteralPath "${winCwd}"`], cwd: procCwd, env }
+      }
+      return { file, args: ['-NoLogo'], cwd: procCwd, env }
     }
 
-    const cli = resolveCodingCliCommand(mode, resumeSessionId)
+    const cli = resolveCodingCliCommand(mode, normalizedResume)
     const cmd = cli?.command || mode
     const resumeArgs = cli?.args.length ? ` ${cli.args.join(' ')}` : ''
-    const cd = winCwd ? `Set-Location -LiteralPath ${quote(winCwd)}; ` : ''
+    const cd = winCwd ? `Set-Location -LiteralPath "${winCwd}"; ` : ''
     const command = `${cd}${cmd}${resumeArgs}`
-    return { file, args: ['-NoLogo', '-NoExit', '-Command', command], cwd: winCwd, env }
+    return { file, args: ['-NoLogo', '-NoExit', '-Command', command], cwd: procCwd, env }
   }
 // Non-Windows: native spawn using system shell
   const systemShell = getSystemShell()
@@ -332,28 +484,49 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
     return { file: systemShell, args: ['-l'], cwd, env }
   }
 
-  const cli = resolveCodingCliCommand(mode, resumeSessionId)
+  const cli = resolveCodingCliCommand(mode, normalizedResume)
   const cmd = cli?.command || mode
   const args = cli?.args || []
   return { file: cmd, args, cwd, env }
 }
 
-export class TerminalRegistry {
+export class TerminalRegistry extends EventEmitter {
   private terminals = new Map<string, TerminalRecord>()
   private settings: AppSettings | undefined
   private idleTimer: NodeJS.Timeout | null = null
   private perfTimer: NodeJS.Timeout | null = null
   private maxTerminals: number
+  private maxExitedTerminals: number
+  private scrollbackMaxChars: number
+  private maxPendingSnapshotChars: number
 
-  constructor(settings?: AppSettings, maxTerminals?: number) {
+  constructor(settings?: AppSettings, maxTerminals?: number, maxExitedTerminals?: number) {
+    super()
     this.settings = settings
     this.maxTerminals = maxTerminals ?? MAX_TERMINALS
+    this.maxExitedTerminals = maxExitedTerminals ?? Number(process.env.MAX_EXITED_TERMINALS || 200)
+    this.scrollbackMaxChars = this.computeScrollbackMaxChars(settings)
+    {
+      const raw = Number(process.env.MAX_PENDING_SNAPSHOT_CHARS || DEFAULT_MAX_PENDING_SNAPSHOT_CHARS)
+      this.maxPendingSnapshotChars = Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_MAX_PENDING_SNAPSHOT_CHARS
+    }
     this.startIdleMonitor()
     this.startPerfMonitor()
   }
 
   setSettings(settings: AppSettings) {
     this.settings = settings
+    this.scrollbackMaxChars = this.computeScrollbackMaxChars(settings)
+    for (const t of this.terminals.values()) {
+      t.buffer.setMaxChars(this.scrollbackMaxChars)
+    }
+  }
+
+  private computeScrollbackMaxChars(settings?: AppSettings): number {
+    const lines = settings?.terminal?.scrollback
+    if (typeof lines !== 'number' || !Number.isFinite(lines)) return DEFAULT_MAX_SCROLLBACK_CHARS
+    const computed = Math.floor(lines * APPROX_CHARS_PER_LINE)
+    return Math.min(MAX_SCROLLBACK_CHARS, Math.max(MIN_SCROLLBACK_CHARS, computed))
   }
 
   private startIdleMonitor() {
@@ -432,6 +605,11 @@ export class TerminalRegistry {
     if (!settings) return
     const killMinutes = settings.safety.autoKillIdleMinutes
     if (!killMinutes || killMinutes <= 0) return
+    const rawWarnMinutes = settings.safety.warnBeforeKillMinutes
+    const warnMinutes =
+      typeof rawWarnMinutes === 'number' && Number.isFinite(rawWarnMinutes) && rawWarnMinutes > 0 && rawWarnMinutes < killMinutes
+        ? rawWarnMinutes
+        : 0
 
     const now = Date.now()
 
@@ -442,6 +620,19 @@ export class TerminalRegistry {
       const idleMs = now - term.lastActivityAt
       const idleMinutes = idleMs / 60000
 
+      if (warnMinutes > 0) {
+        const warnAtMinutes = killMinutes - warnMinutes
+        if (idleMinutes >= warnAtMinutes && idleMinutes < killMinutes && !term.warnedIdle) {
+          term.warnedIdle = true
+          this.emit('terminal.idle.warning', {
+            terminalId: term.terminalId,
+            killMinutes,
+            warnMinutes,
+            lastActivityAt: term.lastActivityAt,
+          })
+        }
+      }
+
       if (idleMinutes >= killMinutes) {
         logger.info({ terminalId: term.terminalId }, 'Auto-killing idle detached terminal')
         this.kill(term.terminalId)
@@ -449,8 +640,37 @@ export class TerminalRegistry {
     }
   }
 
+  // Exposed for unit tests to validate idle warning/kill behavior without relying on timers.
+  async enforceIdleKillsForTest(): Promise<void> {
+    await this.enforceIdleKills()
+  }
+
+  private runningCount(): number {
+    let n = 0
+    for (const t of this.terminals.values()) {
+      if (t.status === 'running') n += 1
+    }
+    return n
+  }
+
+  private reapExitedTerminals(): void {
+    const max = this.maxExitedTerminals
+    if (!max || max <= 0) return
+
+    const exited = Array.from(this.terminals.values())
+      .filter((t) => t.status === 'exited')
+      .sort((a, b) => (a.exitedAt ?? a.lastActivityAt) - (b.exitedAt ?? b.lastActivityAt))
+
+    const excess = exited.length - max
+    if (excess <= 0) return
+    for (let i = 0; i < excess; i += 1) {
+      this.terminals.delete(exited[i].terminalId)
+    }
+  }
+
   create(opts: { mode: TerminalMode; shell?: ShellType; cwd?: string; cols?: number; rows?: number; resumeSessionId?: string }): TerminalRecord {
-    if (this.terminals.size >= this.maxTerminals) {
+    this.reapExitedTerminals()
+    if (this.runningCount() >= this.maxTerminals) {
       throw new Error(`Maximum terminal limit (${this.maxTerminals}) reached. Please close some terminals before creating new ones.`)
     }
 
@@ -460,8 +680,9 @@ export class TerminalRegistry {
     const rows = opts.rows || 30
 
     const cwd = opts.cwd || getDefaultCwd(this.settings) || (isWindows() ? undefined : os.homedir())
+    const normalizedResume = normalizeResumeSessionId(opts.mode, opts.resumeSessionId)
 
-    const { file, args, env, cwd: procCwd } = buildSpawnSpec(opts.mode, cwd, opts.shell || 'system', opts.resumeSessionId)
+    const { file, args, env, cwd: procCwd } = buildSpawnSpec(opts.mode, cwd, opts.shell || 'system', normalizedResume)
 
     const endSpawnTimer = startPerfTimer(
       'terminal_spawn',
@@ -487,7 +708,7 @@ export class TerminalRegistry {
       title,
       description: undefined,
       mode: opts.mode,
-      resumeSessionId: opts.resumeSessionId,
+      resumeSessionId: normalizedResume,
       createdAt,
       lastActivityAt: createdAt,
       status: 'running',
@@ -495,7 +716,9 @@ export class TerminalRegistry {
       cols,
       rows,
       clients: new Set(),
-      buffer: new ChunkRingBuffer(DEFAULT_MAX_SCROLLBACK_CHARS),
+      pendingSnapshotClients: new Map(),
+      warnedIdle: false,
+      buffer: new ChunkRingBuffer(this.scrollbackMaxChars),
       pty: ptyProc,
       perf: perfConfig.enabled
         ? {
@@ -517,6 +740,7 @@ export class TerminalRegistry {
     ptyProc.onData((data) => {
       const now = Date.now()
       record.lastActivityAt = now
+      record.warnedIdle = false
       record.buffer.append(data)
       if (record.perf) {
         record.perf.outBytes += data.length
@@ -551,6 +775,25 @@ export class TerminalRegistry {
         }
       }
       for (const client of record.clients) {
+        const pending = record.pendingSnapshotClients.get(client)
+        if (pending) {
+          const nextChars = pending.queuedChars + data.length
+          if (data.length > this.maxPendingSnapshotChars || nextChars > this.maxPendingSnapshotChars) {
+            // If a terminal spews output while we're sending a snapshot, queueing unboundedly can OOM the server.
+            // Prefer explicit resync: drop the client and let it reconnect/reattach for a fresh snapshot.
+            try {
+              ;(client as any).close?.(4008, 'Attach snapshot queue overflow')
+            } catch {
+              // ignore
+            }
+            record.pendingSnapshotClients.delete(client)
+            record.clients.delete(client)
+            continue
+          }
+          pending.chunks.push(data)
+          pending.queuedChars = nextChars
+          continue
+        }
         this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf: record.perf })
       }
     })
@@ -558,28 +801,46 @@ export class TerminalRegistry {
     ptyProc.onExit((e) => {
       record.status = 'exited'
       record.exitCode = e.exitCode
-      record.lastActivityAt = Date.now()
+      const now = Date.now()
+      record.lastActivityAt = now
+      record.exitedAt = now
       for (const client of record.clients) {
         this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: e.exitCode }, { terminalId, perf: record.perf })
       }
       record.clients.clear()
+      record.pendingSnapshotClients.clear()
+      this.reapExitedTerminals()
     })
 
     this.terminals.set(terminalId, record)
     return record
   }
 
-  attach(terminalId: string, client: WebSocket): TerminalRecord | null {
+  attach(terminalId: string, client: WebSocket, opts?: { pendingSnapshot?: boolean }): TerminalRecord | null {
     const term = this.terminals.get(terminalId)
     if (!term) return null
     term.clients.add(client)
+    term.warnedIdle = false
+    if (opts?.pendingSnapshot) term.pendingSnapshotClients.set(client, { chunks: [], queuedChars: 0 })
     return term
+  }
+
+  finishAttachSnapshot(terminalId: string, client: WebSocket): void {
+    const term = this.terminals.get(terminalId)
+    if (!term) return
+    const queued = term.pendingSnapshotClients.get(client)
+    if (!queued) return
+    term.pendingSnapshotClients.delete(client)
+    for (const data of queued.chunks) {
+      this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf: term.perf })
+    }
   }
 
   detach(terminalId: string, client: WebSocket): boolean {
     const term = this.terminals.get(terminalId)
     if (!term) return false
     term.clients.delete(client)
+    term.pendingSnapshotClients.delete(client)
     return true
   }
 
@@ -588,6 +849,7 @@ export class TerminalRegistry {
     if (!term || term.status !== 'running') return false
     const now = Date.now()
     term.lastActivityAt = now
+    term.warnedIdle = false
     if (term.perf) {
       term.perf.inBytes += data.length
       term.perf.inChunks += 1
@@ -625,10 +887,15 @@ export class TerminalRegistry {
     }
     term.status = 'exited'
     term.exitCode = term.exitCode ?? 0
+    const now = Date.now()
+    term.lastActivityAt = now
+    term.exitedAt = now
     for (const client of term.clients) {
       this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: term.exitCode })
     }
     term.clients.clear()
+    term.pendingSnapshotClients.clear()
+    this.reapExitedTerminals()
     return true
   }
 
@@ -690,7 +957,12 @@ export class TerminalRegistry {
           )
         }
       }
-      // Drop output to prevent unbounded memory.
+      // Prefer explicit resync over silent corruption.
+      try {
+        ;(client as any).close?.(4008, 'Backpressure')
+      } catch {
+        // ignore
+      }
       return
     }
     try {
@@ -738,6 +1010,18 @@ export class TerminalRegistry {
   }
 
   /**
+   * Find a running Claude terminal that already owns the given sessionId.
+   */
+  findRunningClaudeTerminalBySession(sessionId: string): TerminalRecord | undefined {
+    for (const term of this.terminals.values()) {
+      if (term.mode !== 'claude') continue
+      if (term.status !== 'running') continue
+      if (term.resumeSessionId === sessionId) return term
+    }
+    return undefined
+  }
+
+  /**
    * Find claude-mode terminals that have no resumeSessionId (waiting to be associated)
    * and whose cwd matches the given path. Results sorted by createdAt (oldest first).
    */
@@ -769,6 +1053,10 @@ export class TerminalRegistry {
   setResumeSessionId(terminalId: string, sessionId: string): boolean {
     const term = this.terminals.get(terminalId)
     if (!term) return false
+    if (term.mode === 'claude' && !isValidClaudeSessionId(sessionId)) {
+      logger.warn({ sessionId, terminalId }, 'Ignoring invalid Claude resumeSessionId')
+      return false
+    }
     term.resumeSessionId = sessionId
     return true
   }
@@ -782,6 +1070,10 @@ export class TerminalRegistry {
     if (this.idleTimer) {
       clearInterval(this.idleTimer)
       this.idleTimer = null
+    }
+    if (this.perfTimer) {
+      clearInterval(this.perfTimer)
+      this.perfTimer = null
     }
 
     // Kill all terminals

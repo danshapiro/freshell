@@ -43,6 +43,18 @@ vi.mock('../../../server/logger', () => {
   return { logger }
 })
 
+const CLAUDE_SESSION_ID_ABC123 = '11111111-1111-1111-1111-111111111111'
+const CLAUDE_SESSION_ID_LINUX_123 = '22222222-2222-2222-2222-222222222222'
+const CLAUDE_SESSION_ID_12345 = '33333333-3333-3333-3333-333333333333'
+const CLAUDE_SESSION_ID_111 = '44444444-4444-4444-4444-444444444444'
+const CLAUDE_SESSION_ID_222 = '55555555-5555-5555-5555-555555555555'
+const CLAUDE_SESSION_ID_EXACT_MATCH = '66666666-6666-6666-6666-666666666666'
+const CLAUDE_SESSION_ID_DIFFERENT = '77777777-7777-7777-7777-777777777777'
+const CLAUDE_SESSION_ID_SHARED = '88888888-8888-8888-8888-888888888888'
+const CLAUDE_SESSION_ID_TARGET = '99999999-9999-9999-9999-999999999999'
+const CLAUDE_SESSION_ID_EXISTING = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+const CLAUDE_SESSION_ID_NEW = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+
 /**
  * Tests for getSystemShell - cross-platform shell resolution
  * This function returns the appropriate shell for macOS/Linux systems.
@@ -671,11 +683,11 @@ describe('buildSpawnSpec Unix paths', () => {
     it('passes --resume flag with session ID when resuming', () => {
       delete process.env.CLAUDE_CMD
 
-      const spec = buildSpawnSpec('claude', '/Users/john', 'system', 'session-abc123')
+      const spec = buildSpawnSpec('claude', '/Users/john', 'system', CLAUDE_SESSION_ID_ABC123)
 
       expect(spec.file).toBe('claude')
       expect(spec.args).toContain('--resume')
-      expect(spec.args).toContain('session-abc123')
+      expect(spec.args).toContain(CLAUDE_SESSION_ID_ABC123)
     })
 
     it('does not include --resume when no session ID provided', () => {
@@ -903,11 +915,11 @@ describe('buildSpawnSpec Unix paths', () => {
     it('handles --resume flag correctly on Linux', () => {
       delete process.env.CLAUDE_CMD
 
-      const spec = buildSpawnSpec('claude', '/home/user', 'system', 'linux-session-123')
+      const spec = buildSpawnSpec('claude', '/home/user', 'system', CLAUDE_SESSION_ID_LINUX_123)
 
       expect(spec.args).toContain('--resume')
-      expect(spec.args).toContain('linux-session-123')
-      expect(spec.args).toEqual(['--resume', 'linux-session-123'])
+      expect(spec.args).toContain(CLAUDE_SESSION_ID_LINUX_123)
+      expect(spec.args).toEqual(['--resume', CLAUDE_SESSION_ID_LINUX_123])
     })
 
     it('includes proper env vars in claude mode on Linux', () => {
@@ -1152,7 +1164,7 @@ describe('buildSpawnSpec WSL paths', () => {
 
       const spec = buildSpawnSpec('shell', '/home/user/project', 'cmd')
 
-      expect(spec.file).toBe('cmd.exe')
+      expect(spec.file.toLowerCase()).toContain('cmd.exe')
       expect(spec.args).toContain('/K')
     })
 
@@ -1245,10 +1257,10 @@ describe('TerminalRegistry', () => {
       const record = registry.create({
         mode: 'claude',
         cwd: '/home/user/project',
-        resumeSessionId: 'session-abc123',
+        resumeSessionId: CLAUDE_SESSION_ID_ABC123,
       })
 
-      expect(record.resumeSessionId).toBe('session-abc123')
+      expect(record.resumeSessionId).toBe(CLAUDE_SESSION_ID_ABC123)
       expect(record.mode).toBe('claude')
     })
 
@@ -1278,19 +1290,19 @@ describe('TerminalRegistry', () => {
       registry.create({
         mode: 'claude',
         cwd: '/home/user/project1',
-        resumeSessionId: 'session-111',
+        resumeSessionId: CLAUDE_SESSION_ID_111,
       })
       registry.create({
         mode: 'claude',
         cwd: '/home/user/project2',
-        resumeSessionId: 'session-222',
+        resumeSessionId: CLAUDE_SESSION_ID_222,
       })
 
       const terminals = registry.list()
 
       expect(terminals).toHaveLength(2)
       const sessionIds = terminals.map(t => t.resumeSessionId).sort()
-      expect(sessionIds).toEqual(['session-111', 'session-222'])
+      expect(sessionIds).toEqual([CLAUDE_SESSION_ID_111, CLAUDE_SESSION_ID_222])
     })
 
     it('includes undefined resumeSessionId in list output when not set', () => {
@@ -1360,21 +1372,21 @@ describe('TerminalRegistry', () => {
       const record = registry.create({
         mode: 'claude',
         cwd: '/home/user/project',
-        resumeSessionId: 'session-exact-match',
+        resumeSessionId: CLAUDE_SESSION_ID_EXACT_MATCH,
       })
 
-      const found = registry.findTerminalsBySession('claude', 'session-exact-match')
+      const found = registry.findTerminalsBySession('claude', CLAUDE_SESSION_ID_EXACT_MATCH)
 
       expect(found).toHaveLength(1)
       expect(found[0].terminalId).toBe(record.terminalId)
-      expect(found[0].resumeSessionId).toBe('session-exact-match')
+      expect(found[0].resumeSessionId).toBe(CLAUDE_SESSION_ID_EXACT_MATCH)
     })
 
     it('returns empty array when no matching resumeSessionId', () => {
       registry.create({
         mode: 'claude',
         cwd: '/home/user/project',
-        resumeSessionId: 'session-different',
+        resumeSessionId: CLAUDE_SESSION_ID_DIFFERENT,
       })
 
       const found = registry.findTerminalsBySession('claude', 'session-nonexistent')
@@ -1386,18 +1398,18 @@ describe('TerminalRegistry', () => {
       registry.create({
         mode: 'claude',
         cwd: '/home/user/project1',
-        resumeSessionId: 'session-shared',
+        resumeSessionId: CLAUDE_SESSION_ID_SHARED,
       })
       registry.create({
         mode: 'claude',
         cwd: '/home/user/project2',
-        resumeSessionId: 'session-shared',
+        resumeSessionId: CLAUDE_SESSION_ID_SHARED,
       })
 
-      const found = registry.findTerminalsBySession('claude', 'session-shared')
+      const found = registry.findTerminalsBySession('claude', CLAUDE_SESSION_ID_SHARED)
 
       expect(found).toHaveLength(2)
-      expect(found.every(t => t.resumeSessionId === 'session-shared')).toBe(true)
+      expect(found.every(t => t.resumeSessionId === CLAUDE_SESSION_ID_SHARED)).toBe(true)
     })
   })
 
@@ -1406,7 +1418,7 @@ describe('TerminalRegistry', () => {
       registry.create({
         mode: 'claude',
         cwd: '/home/user/project',
-        resumeSessionId: 'session-different',
+        resumeSessionId: CLAUDE_SESSION_ID_DIFFERENT,
       })
 
       // cwd matches but sessionId doesn't - should not find terminal
@@ -1419,11 +1431,11 @@ describe('TerminalRegistry', () => {
       const record = registry.create({
         mode: 'claude',
         cwd: '/home/user/project-a',
-        resumeSessionId: 'session-target',
+        resumeSessionId: CLAUDE_SESSION_ID_TARGET,
       })
 
       // cwd differs but sessionId matches - should find terminal
-      const found = registry.findTerminalsBySession('claude', 'session-target', '/home/user/different')
+      const found = registry.findTerminalsBySession('claude', CLAUDE_SESSION_ID_TARGET, '/home/user/different')
 
       expect(found).toHaveLength(1)
       expect(found[0].terminalId).toBe(record.terminalId)
@@ -1471,20 +1483,20 @@ describe('TerminalRegistry', () => {
       registry.create({
         mode: 'shell',
         cwd: '/home/user/project',
-        resumeSessionId: 'session-shared',
+        resumeSessionId: CLAUDE_SESSION_ID_SHARED,
       })
       const claudeRecord = registry.create({
         mode: 'claude',
         cwd: '/home/user/project',
-        resumeSessionId: 'session-shared',
+        resumeSessionId: CLAUDE_SESSION_ID_SHARED,
       })
       registry.create({
         mode: 'codex',
         cwd: '/home/user/project',
-        resumeSessionId: 'session-shared',
+        resumeSessionId: CLAUDE_SESSION_ID_SHARED,
       })
 
-      const found = registry.findTerminalsBySession('claude', 'session-shared')
+      const found = registry.findTerminalsBySession('claude', CLAUDE_SESSION_ID_SHARED)
 
       expect(found).toHaveLength(1)
       expect(found[0].terminalId).toBe(claudeRecord.terminalId)
@@ -1497,7 +1509,7 @@ describe('TerminalRegistry', () => {
       // Create a claude terminal without resumeSessionId
       const term1 = registry.create({ mode: 'claude', cwd: '/home/user/project' })
       // Create a claude terminal WITH resumeSessionId (should not match)
-      registry.create({ mode: 'claude', cwd: '/home/user/project', resumeSessionId: 'existing-session' })
+      registry.create({ mode: 'claude', cwd: '/home/user/project', resumeSessionId: CLAUDE_SESSION_ID_EXISTING })
       // Create a shell terminal (should not match)
       registry.create({ mode: 'shell', cwd: '/home/user/project' })
 
@@ -1560,10 +1572,10 @@ describe('TerminalRegistry', () => {
     it('should set resumeSessionId on existing terminal', () => {
       const term = registry.create({ mode: 'claude', cwd: '/home/user/project' })
 
-      const result = registry.setResumeSessionId(term.terminalId, 'new-session-id')
+      const result = registry.setResumeSessionId(term.terminalId, CLAUDE_SESSION_ID_NEW)
 
       expect(result).toBe(true)
-      expect(registry.get(term.terminalId)?.resumeSessionId).toBe('new-session-id')
+      expect(registry.get(term.terminalId)?.resumeSessionId).toBe(CLAUDE_SESSION_ID_NEW)
     })
 
     it('should return false for non-existent terminal', () => {
@@ -1704,11 +1716,11 @@ describe('buildSpawnSpec Unix paths', () => {
     it('passes --resume flag with session ID when resuming', () => {
       delete process.env.CLAUDE_CMD
 
-      const spec = buildSpawnSpec('claude', '/Users/john', 'system', 'session-abc123')
+      const spec = buildSpawnSpec('claude', '/Users/john', 'system', CLAUDE_SESSION_ID_ABC123)
 
       expect(spec.file).toBe('claude')
       expect(spec.args).toContain('--resume')
-      expect(spec.args).toContain('session-abc123')
+      expect(spec.args).toContain(CLAUDE_SESSION_ID_ABC123)
     })
 
     it('does not include --resume when no session ID provided', () => {
@@ -1927,11 +1939,11 @@ describe('buildSpawnSpec Unix paths', () => {
     it('handles --resume flag correctly on Linux', () => {
       delete process.env.CLAUDE_CMD
 
-      const spec = buildSpawnSpec('claude', '/home/user', 'system', 'linux-session-123')
+      const spec = buildSpawnSpec('claude', '/home/user', 'system', CLAUDE_SESSION_ID_LINUX_123)
 
       expect(spec.args).toContain('--resume')
-      expect(spec.args).toContain('linux-session-123')
-      expect(spec.args).toEqual(['--resume', 'linux-session-123'])
+      expect(spec.args).toContain(CLAUDE_SESSION_ID_LINUX_123)
+      expect(spec.args).toEqual(['--resume', CLAUDE_SESSION_ID_LINUX_123])
     })
 
     it('includes proper env vars in claude mode on Linux', () => {
@@ -2299,10 +2311,10 @@ describe('buildSpawnSpec Unix paths', () => {
         mockPlatform('darwin')
         delete process.env.CLAUDE_CMD
 
-        const spec = buildSpawnSpec('claude', '/Users/developer', 'system', 'session-12345')
+        const spec = buildSpawnSpec('claude', '/Users/developer', 'system', CLAUDE_SESSION_ID_12345)
 
         expect(spec.args).toContain('--resume')
-        expect(spec.args).toContain('session-12345')
+        expect(spec.args).toContain(CLAUDE_SESSION_ID_12345)
       })
 
       it('has empty args when not resuming session', () => {

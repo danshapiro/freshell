@@ -1093,8 +1093,8 @@ describe('Component Edge Cases', () => {
           },
         })
 
-        // This should throw because tabs.map is called on undefined
-        expect(() => renderWithStore(<TabBar />, store as any)).toThrow()
+        // TabBar should not crash even if the tabs slice is partially missing.
+        expect(() => renderWithStore(<TabBar />, store as any)).not.toThrow()
       })
     })
 

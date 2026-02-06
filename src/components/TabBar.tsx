@@ -29,6 +29,7 @@ import { CSS } from '@dnd-kit/utilities'
 import type { Tab, TerminalStatus } from '@/store/types'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { buildDefaultPaneContent } from '@/lib/default-pane'
+import { defaultSettings } from '@/store/settingsSlice'
 
 interface SortableTabProps {
   tab: Tab
@@ -104,6 +105,8 @@ function SortableTab({
 const EMPTY_LAYOUTS: Record<string, never> = {}
 const EMPTY_PANE_TITLES: Record<string, Record<string, string>> = {}
 const EMPTY_ACTIVE_PANES: Record<string, string> = {}
+const EMPTY_PENDING_REQUESTS: Record<string, never> = {}
+const EMPTY_CODINGCLI_SESSIONS: Record<string, never> = {}
 
 export default function TabBar() {
   useTerminalActivityMonitor()
@@ -115,9 +118,9 @@ export default function TabBar() {
   const paneLayouts = useAppSelector((s) => s.panes?.layouts) ?? EMPTY_LAYOUTS
   const paneTitles = useAppSelector((s) => s.panes?.paneTitles) ?? EMPTY_PANE_TITLES
   const activePanes = useAppSelector((s) => s.panes?.activePane) ?? EMPTY_ACTIVE_PANES
-  const pendingRequests = useAppSelector((s) => s.codingCli.pendingRequests)
-  const codingCliSessions = useAppSelector((s) => s.codingCli.sessions)
-  const settings = useAppSelector((s) => s.settings.settings)
+  const pendingRequests = useAppSelector((s) => s.codingCli?.pendingRequests) ?? EMPTY_PENDING_REQUESTS
+  const codingCliSessions = useAppSelector((s) => s.codingCli?.sessions) ?? EMPTY_CODINGCLI_SESSIONS
+  const settings = useAppSelector((s) => s.settings?.settings) ?? defaultSettings
 
   // Compute display title for a single tab
   // Priority: user-set title > programmatically-set title (e.g., from Claude) > derived name
