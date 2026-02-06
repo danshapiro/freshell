@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Terminal, History, Settings, LayoutGrid, Search, Loader2, X, Archive } from 'lucide-react'
 import { List, type RowComponentProps } from 'react-window'
 import { cn } from '@/lib/utils'
@@ -53,7 +53,13 @@ export default function Sidebar({
   const settings = useAppSelector((s) => s.settings.settings)
   const tabs = useAppSelector((s) => s.tabs.tabs)
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
-  const activeSessionRef = useAppSelector((s) => activeTabId ? getActiveSessionRefForTab(s, activeTabId) : undefined)
+  const activeSessionKeyFromPanes = useAppSelector((s) => {
+    const tabId = s.tabs.activeTabId
+    if (!tabId) return null
+    const ref = getActiveSessionRefForTab(s, tabId)
+    if (!ref) return null
+    return `${ref.provider}:${ref.sessionId}`
+  })
   const selectSortedItems = useMemo(() => makeSelectSortedSessionItems(), [])
 
   const ws = useMemo(() => getWsClient(), [])
@@ -67,11 +73,11 @@ export default function Sidebar({
   const [listHeight, setListHeight] = useState(0)
 
   // Fetch background terminals
-  const refresh = () => {
+  const refresh = useCallback(() => {
     const requestId = `list-${Date.now()}`
     requestIdRef.current = requestId
     ws.send({ type: 'terminal.list', requestId })
-  }
+  }, [ws])
 
   useEffect(() => {
     ws.connect().catch(() => {})
@@ -92,7 +98,7 @@ export default function Sidebar({
       unsub()
       window.clearInterval(interval)
     }
-  }, [ws])
+  }, [ws, refresh])
 
   // Backend search for non-title tiers
   useEffect(() => {
@@ -193,7 +199,7 @@ export default function Sidebar({
     return () => ro.disconnect()
   }, [])
 
-  const handleItemClick = (item: SessionItem) => {
+  const handleItemClick = useCallback((item: SessionItem) => {
     const provider = item.provider as CodingCliProviderName
     dispatch(openSessionTab({
       sessionId: item.sessionId,
@@ -203,7 +209,7 @@ export default function Sidebar({
       terminalId: item.isRunning ? item.runningTerminalId : undefined,
     }))
     onNavigate('terminal')
-  }
+  }, [dispatch, onNavigate])
 
   const nav = [
     { id: 'terminal' as const, label: 'Terminal', icon: Terminal, shortcut: 'T' },
@@ -213,9 +219,7 @@ export default function Sidebar({
   ]
 
   const activeTab = tabs.find((t) => t.id === activeTabId)
-  const activeSessionKey = activeSessionRef
-    ? `${activeSessionRef.provider}:${activeSessionRef.sessionId}`
-    : null
+  const activeSessionKey = activeSessionKeyFromPanes
   const activeTerminalId = activeTab?.terminalId
   const effectiveListHeight = listHeight > 0
     ? listHeight

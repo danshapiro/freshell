@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, closeTab, reorderTabs, updateTab, setActiveTab, openSessionTab } from '@/store/tabsSlice'
-import { addPane, closePane, initLayout, resetLayout, resetSplit, swapSplit, updatePaneTitle } from '@/store/panesSlice'
+import { addPane, closePane, initLayout, resetSplit, swapSplit, updatePaneTitle } from '@/store/panesSlice'
 import { setProjects, setProjectExpanded } from '@/store/sessionsSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'

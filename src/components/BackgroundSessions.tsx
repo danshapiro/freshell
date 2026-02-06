@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { getWsClient } from '@/lib/ws-client'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -32,11 +32,11 @@ export default function BackgroundSessions() {
   const [terminals, setTerminals] = useState<BackgroundTerminal[]>([])
   const requestIdRef = useRef<string | null>(null)
 
-  const refresh = () => {
+  const refresh = useCallback(() => {
     const requestId = `list-${Date.now()}`
     requestIdRef.current = requestId
     ws.send({ type: 'terminal.list', requestId })
-  }
+  }, [ws])
 
   useEffect(() => {
     let unsub = () => {}
@@ -68,7 +68,7 @@ export default function BackgroundSessions() {
       unsub()
       if (interval) window.clearInterval(interval)
     }
-  }, [ws])
+  }, [ws, refresh])
 
   const detachedRunning = terminals.filter((t) => t.status === 'running' && !t.hasClients)
 

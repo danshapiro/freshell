@@ -141,7 +141,10 @@ export default function SettingsView() {
     [rawSettings],
   )
   const lastSavedAt = useAppSelector((s) => s.settings.lastSavedAt)
-  const enabledProviders = settings.codingCli?.enabledProviders ?? []
+  const enabledProviders = useMemo(
+    () => settings.codingCli?.enabledProviders ?? [],
+    [settings.codingCli?.enabledProviders],
+  )
 
   const [availableTerminalFonts, setAvailableTerminalFonts] = useState(terminalFonts)
   const [fontsReady, setFontsReady] = useState(false)

@@ -80,7 +80,7 @@ export function TooltipContent({
         left: rect.left,
       })
     }
-  }, [ctx?.open, sideOffset])
+  }, [ctx?.open, ctx?.triggerRef, sideOffset])
 
   if (!ctx?.open) return null
 

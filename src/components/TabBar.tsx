@@ -101,7 +101,7 @@ const EMPTY_LAYOUTS: Record<string, never> = {}
 export default function TabBar() {
   const dispatch = useAppDispatch()
   const tabsState = useAppSelector((s) => s.tabs as any) as { tabs?: Tab[]; activeTabId?: string | null } | undefined
-  const tabs = tabsState?.tabs ?? []
+  const tabs = useMemo(() => tabsState?.tabs ?? [], [tabsState?.tabs])
   const activeTabId = tabsState?.activeTabId ?? null
   const paneLayouts = useAppSelector((s) => s.panes?.layouts) ?? EMPTY_LAYOUTS
 
