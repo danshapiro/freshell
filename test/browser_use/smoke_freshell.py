@@ -144,6 +144,7 @@ async def _run(args: argparse.Namespace) -> int:
 
   # Imports are inside the async runner so `python -m py_compile` works without deps installed.
   from browser_use import Agent, Browser, ChatBrowserUse  # type: ignore
+  from browser_use.tools.service import Tools  # type: ignore
 
   llm = ChatBrowserUse(model=model)
   browser = Browser(
@@ -200,6 +201,8 @@ SMOKE_RESULT: FAIL - <short reason>
     task=task.strip(),
     llm=llm,
     browser=browser,
+    # Disallow filesystem mutation actions (keeps the smoke "pure" and avoids /tmp todo.md noise).
+    tools=Tools(exclude_actions=["write_file", "replace_file", "read_file"]),
     use_vision=True,
   )
 
