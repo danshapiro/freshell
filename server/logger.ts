@@ -124,7 +124,6 @@ function createConsoleStream(shouldPrettyPrint: boolean): DestinationStream {
   if (!shouldPrettyPrint) return pino.destination(1)
   const pinoPretty = require('pino-pretty') as typeof import('pino-pretty')
   const pretty = pinoPretty({ colorize: true, translateTime: 'SYS:standard' })
-  pretty.pipe(process.stdout)
   return pretty
 }
 
