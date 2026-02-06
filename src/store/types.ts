@@ -107,6 +107,7 @@ export interface CodingCliSettings {
     sandbox?: CodexSandboxMode
     permissionMode?: ClaudePermissionMode
     maxTurns?: number
+    cwd?: string
   }>>
 }
 
