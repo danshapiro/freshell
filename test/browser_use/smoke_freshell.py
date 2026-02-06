@@ -32,6 +32,29 @@ from smoke_utils import (
 )
 
 
+def _parse_smoke_result(final_text: str) -> tuple[bool, str | None]:
+  """
+  Enforce strict output contract:
+  - Exactly one line
+  - Exactly "SMOKE_RESULT: PASS"
+    or "SMOKE_RESULT: FAIL - <short reason>"
+  """
+  text = (final_text or "").strip()
+  if not text:
+    return False, "missing_final_result"
+
+  lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+  if len(lines) != 1:
+    return False, "final_result_not_single_line"
+
+  line = lines[0]
+  if line == "SMOKE_RESULT: PASS":
+    return True, None
+  if line.startswith("SMOKE_RESULT: FAIL - ") and len(line) > len("SMOKE_RESULT: FAIL - "):
+    return False, None
+  return False, "final_result_invalid_format"
+
+
 async def _run(args: argparse.Namespace) -> int:
   repo_root = Path(__file__).resolve().parents[2]
   package_json_path = find_upwards(repo_root, "package.json")
@@ -58,6 +81,13 @@ async def _run(args: argparse.Namespace) -> int:
   if args.require_api_key and not os.environ.get("BROWSER_USE_API_KEY"):
     log.error("Missing BROWSER_USE_API_KEY", event="missing_browser_use_api_key")
     return 2
+
+  # Hard cap: keep the smoke run small and fast.
+  # This also enforces the repo-local rule: never open more than 6 panes during this smoke.
+  MAX_PANES = 6
+  if args.pane_target > MAX_PANES:
+    log.warn("Clamping pane_target to 6", event="pane_target_clamped", requested=args.pane_target, clamped=MAX_PANES)
+    args.pane_target = MAX_PANES
 
   base_url = args.base_url or default_base_url(dotenv)
   token = env_or(args.token, "AUTH_TOKEN") or dotenv.get("AUTH_TOKEN")
@@ -106,7 +136,7 @@ async def _run(args: argparse.Namespace) -> int:
       return self._stream.flush()
 
   root_logger = logging.getLogger()
-  root_logger.setLevel(logging.INFO if args.debug else logging.INFO)
+  root_logger.setLevel(logging.DEBUG if args.debug else logging.INFO)
   for h in root_logger.handlers:
     h.addFilter(_RedactTokenFilter())
 
@@ -146,6 +176,8 @@ async def _run(args: argparse.Namespace) -> int:
   # Imports are inside the async runner so `python -m py_compile` works without deps installed.
   from browser_use import Agent, Browser, ChatBrowserUse  # type: ignore
   from browser_use.tools.service import Tools  # type: ignore
+  from browser_use.agent.views import ActionResult  # type: ignore
+  from pydantic import BaseModel  # type: ignore
 
   llm = ChatBrowserUse(model=model)
   browser = Browser(
@@ -155,37 +187,91 @@ async def _run(args: argparse.Namespace) -> int:
     viewport={"width": args.width, "height": args.height},
     no_viewport=False,
   )
+  browser_started = False
 
   # Pre-open the authenticated URL outside the agent task to avoid printing the token.
   # browser_use prints the entire task (and action URLs) to stdout; keep secrets out of it.
   try:
     log.info("Pre-opening target URL", event="preopen_target", targetUrl=redacted_target_url)
     await browser.start()
-    page = await browser.new_page(target_url)
-    # Ensure the agent focus is on the freshly opened tab.
+    browser_started = True
+    # Avoid leaking browser tabs across runs: when attaching over CDP to an existing Chrome,
+    # tabs may remain open after we disconnect. Each open Freshell tab maintains its own
+    # backend WS connection, and the backend enforces a max-connection limit.
+    #
+    # Strategy:
+    # - Reuse a single existing page (navigate it to the authed URL)
+    # - Close other Freshell/blank tabs to free WS connections
+    pages = []
     try:
-      from browser_use.browser.events import SwitchTabEvent  # type: ignore
+      pages = await browser.get_pages()
+    except Exception:
+      pages = []
 
-      await browser.event_bus.dispatch(SwitchTabEvent(target_id=None))
+    page = None
+    if pages:
+      for p in reversed(pages):
+        try:
+          url = await p.get_url()
+          title = await p.get_title()
+          if (title and "freshell" in title.lower()) or (url and url.startswith(base_url)):
+            page = p
+            break
+        except Exception:
+          continue
+      if page is None:
+        page = pages[-1]
+    else:
+      page = await browser.new_page("about:blank")
+
+    try:
+      from browser_use.browser.events import CloseTabEvent  # type: ignore
+
+      for p in pages:
+        if p is page:
+          continue
+        try:
+          url = await p.get_url()
+          title = await p.get_title()
+          is_freshellish = (title and "freshell" in title.lower()) or (url and url.startswith(base_url)) or url == "about:blank"
+          if not is_freshellish:
+            continue
+          tid = getattr(p, "_target_id", None)
+          if tid:
+            await browser.event_bus.dispatch(CloseTabEvent(target_id=tid))
+        except Exception:
+          continue
     except Exception:
       pass
 
-    # Close any about:blank tabs so the agent doesn't get "stuck" on an empty tab and navigate away unauthenticated.
+    # Navigate without opening a new browser tab (keeps WS connections bounded).
     try:
-      from browser_use.browser.events import CloseTabEvent, SwitchTabEvent  # type: ignore
+      goto = getattr(page, "goto", None)
+      if callable(goto):
+        await goto(target_url)
+      else:
+        navigate = getattr(page, "navigate", None)
+        if callable(navigate):
+          await navigate(target_url)
+        else:
+          page = await browser.new_page(target_url)
+    except Exception:
+      page = await browser.new_page(target_url)
 
-      pages = await browser.get_pages()
-      for p in pages:
-        try:
-          url = await p.get_url()
-          if url == "about:blank":
-            tid = getattr(p, "_target_id", None)
-            if tid:
-              await browser.event_bus.dispatch(CloseTabEvent(target_id=tid))
-        except Exception:
-          continue
-      # Re-focus the most recently opened page after closing blanks.
-      await browser.event_bus.dispatch(SwitchTabEvent(target_id=None))
+    # Ensure the agent focus is on the active tab we just navigated.
+    try:
+      from browser_use.browser.events import SwitchTabEvent  # type: ignore
+
+      tid = getattr(page, "_target_id", None)
+      await browser.event_bus.dispatch(SwitchTabEvent(target_id=tid))
+    except Exception:
+      pass
+
+    # Ensure viewport is applied to the active page (especially when attaching over CDP).
+    try:
+      set_viewport_size = getattr(page, "set_viewport_size", None)
+      if callable(set_viewport_size):
+        await set_viewport_size(args.width, args.height)
     except Exception:
       pass
     # Wait for the SPA to fully bootstrap auth:
@@ -202,7 +288,8 @@ async def _run(args: argparse.Namespace) -> int:
         auth_present = await page.evaluate("() => !!sessionStorage.getItem('auth-token')")
         token_removed = await page.evaluate("() => !new URLSearchParams(window.location.search).has('token')")
         has_add_pane = await page.evaluate("() => !!document.querySelector('button[aria-label=\"Add pane\"]')")
-        if auth_present and token_removed and has_add_pane:
+        has_connected = await page.evaluate("() => !!document.querySelector('[title=\"Connected\"]')")
+        if auth_present and token_removed and has_add_pane and has_connected:
           ready = True
           break
       except Exception:
@@ -221,7 +308,7 @@ async def _run(args: argparse.Namespace) -> int:
     log.error("Failed to pre-open target URL", event="preopen_target_failed", error=str(e))
     try:
       stop = getattr(browser, "stop", None)
-      if callable(stop):
+      if browser_started and callable(stop):
         await stop()
     except Exception:
       pass
@@ -234,47 +321,60 @@ The app is already opened and authenticated in the current tab.
 
 Important constraints:
 - Do not create or write any files during this run.
-- Do everything in a single browser window. You may open new tabs inside that window. Do not open any new windows.
+- Do everything in a single browser window and a single browser tab. Do not open any new windows or browser tabs.
 
 Requirements:
 1) Wait until the page is fully loaded and the top bar is visible.
-   - If you see an "Empty DOM tree" / blank page, switch to the browser tab that shows Freshell (localhost:5173) and continue from there. Do not navigate away to other sites.
+   - If you see an "Empty DOM tree" / blank page, make sure you are looking at the Freshell page ({base_url}) and continue from there. Do not navigate away to other sites.
 2) Verify the app header contains the text "freshell".
 3) Verify the connection indicator shows the app is connected (not disconnected).
-4) Pane stress test (do this once):
-   - Use the UI control(s) for adding/splitting panes (floating action button, split buttons, etc).
-   - Try to add panes until the UI prevents adding more (button disabled, no new pane appears, or explicit limit message).
-   - If you can still add panes indefinitely, stop once you have created at least {args.pane_target} panes total (this is a "good enough" stress level for this smoke test).
-   - IMPORTANT: This is ONLY a pane-count/layout stress. Do NOT create Terminal panes on this stress-test tab.
-     - When the pane type chooser appears for a new pane, always choose **Editor** (not CMD/WSL/PowerShell).
-     - Do not open any files in those Editor panes during the stress test; just leave them at the "Enter file path..." prompt.
-     - Reason: Terminal panes consume backend terminal slots and can hit the server's terminal limit, which would break the rest of the smoke test.
-     - Do this one pane at a time (avoid stale element errors):
-       1. Click "Add pane" once.
-       2. In the NEW pane's chooser that appears, click "Editor" once.
-       3. Confirm visually that the new pane is now an Editor pane (shows the "Enter file path..." UI).
-       4. Only then repeat for the next pane.
-5) Create a new *Freshell shell tab* using the in-app tab bar (NOT a new browser tab):
-   - In the Freshell UI at the top, there is an in-app tab bar with tabs like "New Tab".
-   - Click the plus button with tooltip/title "New shell tab".
-   - This stays in the same browser tab/window. Do NOT open a new browser tab/window and do NOT expect the browser's tab list to change.
-6) On that new Freshell tab, create a few panes and set up EXACTLY one of each type: Editor, Terminal, Browser (keep this tab multi-pane for quick review).
-   - In the Editor pane: open this file path: {known_text_file}. Verify visually the editor shows content (not an empty placeholder).
-   - In the Terminal pane: run `node -v` (or `git --version` if node is unavailable).
+   - If it says "Disconnected", wait up to ~10 seconds for it to become connected, then re-check.
+   - If it stays disconnected, FAIL with a short reason.
+4) Pane cap (strict): Do NOT have more than 6 panes open at any point in this run (across the whole app).
+   - If the current in-app tab already has multiple panes, close panes until there is only one pane visible before continuing.
+5) Pane stress (do this ONCE, then reduce panes again so later tabs stay within the cap):
+   - On the current in-app tab, add Editor panes until there are exactly {args.pane_target} panes total (this value will never exceed 6).
+   - Do this one pane at a time (avoid stale element errors): click "Add pane" once, then choose "Editor" once in the new pane.
+   - After reaching {args.pane_target} panes, close panes until there is only one pane visible again.
+6) Mixed panes on a new in-app tab:
+   - Create a new Freshell in-app shell tab using the '+' button in the top tab bar (tooltip: "New shell tab").
+   - On this new in-app tab, create a 3-pane layout with EXACTLY one of each type: Editor, Terminal, Browser.
+     - Use the "Add pane" button to split, then pick the pane type in the new pane chooser.
+     - For the Terminal pane, choose **WSL** (Linux shell).
+7) Verify the Editor pane:
+   - In the Editor pane: open this file path: {known_text_file}.
+     - IMPORTANT: Do this even if the file already looks open. Do NOT assume prior state.
+     - Click the "Enter file path..." input in the editor toolbar, clear it, type/paste the full file path, then press Enter to load it.
+     - Verify the empty-state text "or start typing to create a scratch pad" is no longer visible.
+     - Ensure Preview mode works:
+       - You MUST click the "Source" button and then the "Preview" button (in that order) to prove mode switching works.
+       - If you cannot find either button, FAIL with a short reason.
+     - Use `find_text` to confirm "Quick Start" is visible (this ensures file content actually loaded).
+8) Verify the Terminal pane:
+   - In the Terminal (WSL) pane:
+     - Wait for the terminal to be ready (not stuck on "Starting terminal..." / "Reconnecting...").
+       - If it is still stuck after ~15 seconds, close just the Terminal pane and re-create a Terminal (WSL) pane once, then wait again.
+       - If it is still stuck, FAIL with a short reason.
+     - Then run `node -v` (or `git --version` if node is unavailable).
      - WAIT for the command to finish and then explicitly verify visually that the terminal output contains a version-looking string (examples: `v20.11.0` or `git version 2.44.0`).
      - If you do not see version output, try the fallback command and verify that output instead.
      - Terminal input reliability rules:
-       - Do NOT send `{{Enter}}` as part of the text (it often gets typed literally). Type the command text, then send `Enter` as a separate keypress.
-       - If normal typing is garbled or goes into the wrong field, click inside the terminal output area to focus it.
-       - If that still fails, locate the terminal's hidden textarea (often `textarea.xterm-helper-textarea`) and type the command into that element, then press `Enter`.
-   - In the Browser pane: open the standard "Example Domain" website (IANA Example Domains) and verify visually it shows "Example Domain".
-   - Keep terminal creation minimal: do not create extra terminal panes beyond this one.
-7) Create one more *Freshell shell tab* for Settings verification (again: in-app tab, not a browser tab).
-8) On that tab, open the sidebar (if it is collapsed) using the top-left toggle button.
-9) Click "Settings" in the sidebar.
-10) On the Settings page, confirm "Terminal preview" is visible (use `find_text`).
-11) Navigate back to the terminal view.
-12) Click through the *Freshell in-app tabs* in the top tab bar to confirm they still render (stress, multi-pane, settings).
+       - Do NOT send `{{Enter}}` as part of the text (it often gets typed literally).
+       - Do NOT use `send_keys` to type command text into the terminal (it can double-type in xterm).
+       - Instead, click the terminal pane to focus it, then use the `insert_text` tool to insert the command text, then `send_keys` with `Enter`.
+9) Verify the Browser pane:
+   - In the Browser pane: open the standard "Example Domain" website (IANA Example Domains).
+   - Verify visually (inside the Browser pane content) that the heading "Example Domain" is visible.
+   - Do NOT rely on `find_text` for this (the Browser pane renders cross-origin content).
+10) Settings navigation:
+   - Stay on the current in-app tab.
+   - Open the sidebar (if it is collapsed) using the top-left toggle button.
+   - Click "Settings" in the sidebar.
+   - Confirm "Terminal preview" is visible by using `find_text`. If `find_text` fails, FAIL.
+   - Navigate back to the terminal view by opening the sidebar and clicking "Terminal".
+
+Strict success rules:
+- If any verification fails, you MUST output `SMOKE_RESULT: FAIL - <short reason>`.
 
 Output:
 At the end, output exactly one line:
@@ -284,13 +384,35 @@ SMOKE_RESULT: FAIL - <short reason>
 """
 
   log.info("Agent init start", event="agent_init_start")
+
+  # Register a helper tool to insert text via CDP Input.insertText.
+  #
+  # Rationale: browser_use's `send_keys` dispatches keydown+char events per character
+  # which can double-type into xterm.js terminals. Using CDP insertText behaves like
+  # a paste into the currently focused element and is much more reliable for terminals.
+  tools = Tools(exclude_actions=["write_file", "replace_file", "read_file", "search_page", "extract", "evaluate"])
+
+  class InsertTextAction(BaseModel):
+    text: str
+
+  @tools.registry.action("Insert text into the currently focused element (CDP Input.insertText).", param_model=InsertTextAction)
+  async def insert_text(params: InsertTextAction, browser_session):  # type: ignore[no-untyped-def]
+    try:
+      cdp_session = await browser_session.get_or_create_cdp_session(target_id=None, focus=True)
+      await cdp_session.cdp_client.send.Input.insertText(
+        params={"text": params.text},
+        session_id=cdp_session.session_id,
+      )
+      memory = f"Inserted text: {params.text}"
+      return ActionResult(extracted_content=memory, long_term_memory=memory)
+    except Exception as e:
+      return ActionResult(error=f"Failed to insert text: {type(e).__name__}: {e}")
+
   agent = Agent(
     task=task.strip(),
     llm=llm,
     browser=browser,
-    # Disallow filesystem mutation actions (keeps the smoke "pure" and avoids /tmp todo.md noise).
-    # Also exclude page-text scraping helpers that can give misleading negatives for xterm/iframes.
-    tools=Tools(exclude_actions=["write_file", "replace_file", "read_file", "search_page", "extract"]),
+    tools=tools,
     use_vision=True,
     # Reduce stale-element flakes by keeping each step small and disabling auto-URL opening from task text.
     max_actions_per_step=2,
@@ -312,7 +434,7 @@ SMOKE_RESULT: FAIL - <short reason>
   finally:
     # Best-effort cleanup. The Browser API exposes start/stop in some versions.
     stop = getattr(browser, "stop", None)
-    if callable(stop):
+    if browser_started and callable(stop):
       try:
         await stop()
       except Exception:
@@ -362,23 +484,69 @@ SMOKE_RESULT: FAIL - <short reason>
   if callable(has_errors) and has_errors():
     errors = getattr(history, "errors", None)
     errs = errors() if callable(errors) else None
-    log.error("Agent history contains errors", event="agent_has_errors", errors=errs)
+    # browser_use can report transient LLM transport errors inside history.errors().
+    # Treat those as advisory and only fail if we see non-transient errors.
+    transient_prefixes = (
+      "API request failed:",
+      "LLM call failed",
+    )
+    non_transient: list[str] = []
+    if isinstance(errs, list):
+      for e in errs:
+        if not e:
+          continue
+        if isinstance(e, str) and any(e.startswith(p) for p in transient_prefixes):
+          continue
+        non_transient.append(str(e))
+    elif isinstance(errs, str):
+      if not any(errs.startswith(p) for p in transient_prefixes):
+        non_transient.append(errs)
+    elif errs:
+      non_transient.append(str(errs))
+
+    if non_transient:
+      log.error("Agent history contains non-transient errors", event="agent_has_errors", errors=non_transient)
+      return 1
+
+    log.warn("Agent history contains only transient errors", event="agent_has_transient_errors", errors=errs)
+
+  # Browser Use can emit a separate judge verdict even if the agent prints PASS.
+  # Treat judge FAIL as a smoke failure (keeps this test honest).
+  judgement_data = None
+  try:
+    judgement = getattr(history, "judgement", None)
+    judgement_data = judgement() if callable(judgement) else None
+  except Exception:
+    judgement_data = None
+
+  verdict_from_judgement = None
+  if isinstance(judgement_data, dict):
+    verdict_from_judgement = judgement_data.get("verdict")
+  elif judgement_data is not None:
+    verdict_from_judgement = getattr(judgement_data, "verdict", None)
+
+  if verdict_from_judgement is False:
+    log.error("Judge verdict: FAIL", event="judge_fail", judgement=judgement_data)
     return 1
+
+  is_validated = getattr(history, "is_validated", None)
+  if callable(is_validated):
+    verdict = is_validated()
+    if verdict is False:
+      log.error("Judge verdict: FAIL", event="judge_fail", judgement=judgement_data)
+      return 1
 
   final_result_fn = getattr(history, "final_result", None)
   final = final_result_fn() if callable(final_result_fn) else None
   final_text = str(final or "").strip()
-  if "SMOKE_RESULT: PASS" in final_text:
+  ok, parse_err = _parse_smoke_result(final_text)
+  if parse_err:
+    log.error("Invalid final_result() format", event="invalid_final_result", error=parse_err, text=final_text[:2000])
+    return 1
+  if ok:
     log.info("SMOKE_RESULT: PASS", event="smoke_pass")
     return 0
-  if "SMOKE_RESULT: FAIL" in final_text:
-    log.error("SMOKE_RESULT: FAIL", event="smoke_fail", reason=final_text[:2000])
-    return 1
-
-  # If the agent didn't follow output instructions, treat as failure (keeps smoke honest).
-  log.error("Missing SMOKE_RESULT marker in final_result()", event="missing_smoke_result")
-  if final_text:
-    log.error("final_result()", event="final_result_text", text=final_text[:2000])
+  log.error("SMOKE_RESULT: FAIL", event="smoke_fail", reason=final_text[:2000])
   return 1
 
 
@@ -392,7 +560,7 @@ def main(argv: list[str]) -> int:
   p.add_argument("--width", type=int, default=1024, help="Browser viewport width")
   p.add_argument("--height", type=int, default=768, help="Browser viewport height")
   p.add_argument("--max-steps", type=int, default=120, help="Max agent steps")
-  p.add_argument("--pane-target", type=int, default=24, help="Stop pane stress after this many panes if no limit is reached")
+  p.add_argument("--pane-target", type=int, default=6, help="Target total panes for the small pane stress (hard-capped at 6)")
   p.add_argument("--preflight", action="store_true", help="Fail fast if /api/health is unreachable")
   p.add_argument("--debug", action="store_true", help="Enable debug logging")
   p.add_argument(
