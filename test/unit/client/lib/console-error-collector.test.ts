@@ -37,6 +37,7 @@ describe('console error collector (index.html inline script)', () => {
   let cleanup: () => void
 
   beforeEach(() => {
+    ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true
     cleanup = installCollector()
   })
 
