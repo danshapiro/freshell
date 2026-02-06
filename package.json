@@ -26,6 +26,7 @@
     "test:integration": "vitest run --config vitest.server.config.ts test/server",
     "test:client": "vitest run test/unit/client",
     "test:all": "vitest run && vitest run --config vitest.server.config.ts",
+    "smoke:browser-use": "python3 test/browser_use/smoke_freshell.py",
     "prepare:icons": "node assets/icons/prepare-icons.mjs",
     "lint": "eslint src --ext .js,.jsx,.ts,.tsx",
     "lint:fix": "eslint src --ext .js,.jsx,.ts,.tsx --fix"
