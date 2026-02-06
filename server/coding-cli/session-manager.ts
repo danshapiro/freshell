@@ -1,4 +1,4 @@
-import { spawn as nodeSpawn, ChildProcess, SpawnOptionsWithoutStdio } from 'child_process'
+import { spawn as nodeSpawn, ChildProcess, SpawnOptions } from 'child_process'
 import { EventEmitter } from 'events'
 import { nanoid as defaultNanoid } from 'nanoid'
 import { logger } from '../logger.js'
@@ -25,7 +25,7 @@ const CLEANUP_INTERVAL_MS = 5 * 60 * 1000
 export type SpawnFn = (
   command: string,
   args: string[],
-  options: SpawnOptionsWithoutStdio
+  options: SpawnOptions
 ) => ChildProcess
 
 export interface CodingCliSessionOptions {
