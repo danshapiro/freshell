@@ -1064,8 +1064,7 @@ describe('Component Edge Cases', () => {
           },
         })
 
-        // This should throw because tabs.map is called on undefined
-        expect(() => renderWithStore(<TabBar />, store as any)).toThrow()
+        expect(() => renderWithStore(<TabBar />, store as any)).not.toThrow()
       })
     })
 
