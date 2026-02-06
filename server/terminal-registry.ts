@@ -86,6 +86,7 @@ export type TerminalRecord = {
   resumeSessionId?: string
   createdAt: number
   lastActivityAt: number
+  exitedAt?: number
   status: 'running' | 'exited'
   exitCode?: number
   cwd?: string
@@ -459,10 +460,12 @@ export class TerminalRegistry {
   private idleTimer: NodeJS.Timeout | null = null
   private perfTimer: NodeJS.Timeout | null = null
   private maxTerminals: number
+  private maxExitedTerminals: number
 
-  constructor(settings?: AppSettings, maxTerminals?: number) {
+  constructor(settings?: AppSettings, maxTerminals?: number, maxExitedTerminals?: number) {
     this.settings = settings
     this.maxTerminals = maxTerminals ?? MAX_TERMINALS
+    this.maxExitedTerminals = maxExitedTerminals ?? Number(process.env.MAX_EXITED_TERMINALS || 200)
     this.startIdleMonitor()
     this.startPerfMonitor()
   }
@@ -564,8 +567,32 @@ export class TerminalRegistry {
     }
   }
 
+  private runningCount(): number {
+    let n = 0
+    for (const t of this.terminals.values()) {
+      if (t.status === 'running') n += 1
+    }
+    return n
+  }
+
+  private reapExitedTerminals(): void {
+    const max = this.maxExitedTerminals
+    if (!max || max <= 0) return
+
+    const exited = Array.from(this.terminals.values())
+      .filter((t) => t.status === 'exited')
+      .sort((a, b) => (a.exitedAt ?? a.lastActivityAt) - (b.exitedAt ?? b.lastActivityAt))
+
+    const excess = exited.length - max
+    if (excess <= 0) return
+    for (let i = 0; i < excess; i += 1) {
+      this.terminals.delete(exited[i].terminalId)
+    }
+  }
+
   create(opts: { mode: TerminalMode; shell?: ShellType; cwd?: string; cols?: number; rows?: number; resumeSessionId?: string }): TerminalRecord {
-    if (this.terminals.size >= this.maxTerminals) {
+    this.reapExitedTerminals()
+    if (this.runningCount() >= this.maxTerminals) {
       throw new Error(`Maximum terminal limit (${this.maxTerminals}) reached. Please close some terminals before creating new ones.`)
     }
 
@@ -673,11 +700,14 @@ export class TerminalRegistry {
     ptyProc.onExit((e) => {
       record.status = 'exited'
       record.exitCode = e.exitCode
-      record.lastActivityAt = Date.now()
+      const now = Date.now()
+      record.lastActivityAt = now
+      record.exitedAt = now
       for (const client of record.clients) {
         this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: e.exitCode }, { terminalId, perf: record.perf })
       }
       record.clients.clear()
+      this.reapExitedTerminals()
     })
 
     this.terminals.set(terminalId, record)
@@ -740,10 +770,14 @@ export class TerminalRegistry {
     }
     term.status = 'exited'
     term.exitCode = term.exitCode ?? 0
+    const now = Date.now()
+    term.lastActivityAt = now
+    term.exitedAt = now
     for (const client of term.clients) {
       this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: term.exitCode })
     }
     term.clients.clear()
+    this.reapExitedTerminals()
     return true
   }
 

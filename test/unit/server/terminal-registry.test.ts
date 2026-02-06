@@ -1297,6 +1297,30 @@ describe('TerminalRegistry', () => {
     registry.shutdown()
   })
 
+  describe('reaping exited terminals', () => {
+    it('does not count exited terminals against MAX_TERMINALS', () => {
+      const reg = new TerminalRegistry(undefined, 2)
+      const t1 = reg.create({ mode: 'shell' })
+      reg.create({ mode: 'shell' })
+
+      reg.kill(t1.terminalId)
+
+      expect(() => reg.create({ mode: 'shell' })).not.toThrow()
+      reg.shutdown()
+    })
+
+    it('reaps old exited terminals to prevent unbounded growth', () => {
+      const reg = new TerminalRegistry(undefined, 1, 5)
+      for (let i = 0; i < 20; i += 1) {
+        const t = reg.create({ mode: 'shell' })
+        reg.kill(t.terminalId)
+      }
+
+      expect(reg.list().length).toBeLessThanOrEqual(5)
+      reg.shutdown()
+    })
+  })
+
   describe('create() with resumeSessionId', () => {
     it('stores resumeSessionId on the terminal record when provided', () => {
       const record = registry.create({
