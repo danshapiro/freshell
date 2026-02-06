@@ -330,43 +330,38 @@ Requirements:
 3) Verify the connection indicator shows the app is connected (not disconnected).
    - If it says "Disconnected", wait up to ~10 seconds for it to become connected, then re-check.
    - If it stays disconnected, FAIL with a short reason.
-4) Pane cap (strict): Do NOT have more than 6 panes open at any point in this run (across the whole app).
-   - If the current in-app tab already has multiple panes, close panes until there is only one pane visible before continuing.
-5) Pane stress (do this ONCE, then reduce panes again so later tabs stay within the cap):
-   - On the current in-app tab, add Editor panes until there are exactly {args.pane_target} panes total (this value will never exceed 6).
-   - Do this one pane at a time (avoid stale element errors): click "Add pane" once, then choose "Editor" once in the new pane.
-   - After reaching {args.pane_target} panes, close panes until there is only one pane visible again.
-6) Mixed panes on a new in-app tab:
+4) Pane stress:
+   - Open a new tab to use for this test
+   - Rename the tab by double clicking on it 'Stress test'
+   - On the current in-app tab, add shell panes until there are {args.pane_target} panes.
+   - Do this one pane at a time (avoid stale element errors): click "Add pane" once, then choose "shell" once. If there are multiple choices for shell (cmd, powershell, wsl) rotate your choice each pane.
+5) Mixed panes on a new in-app tab:
    - Create a new Freshell in-app shell tab using the '+' button in the top tab bar (tooltip: "New shell tab").
-   - On this new in-app tab, create a 3-pane layout with EXACTLY one of each type: Editor, Terminal, Browser.
+   - Rename the tab by double clicking on it 'Test mixed panes'
+   - On this new in-app tab, create a 3-pane layout with EXACTLY one of each type: Editor, shell, Browser.
      - Use the "Add pane" button to split, then pick the pane type in the new pane chooser.
-     - For the Terminal pane, choose **WSL** (Linux shell).
-7) Verify the Editor pane:
+6) Verify the Editor pane:
    - In the Editor pane: open this file path: {known_text_file}.
-     - IMPORTANT: Do this even if the file already looks open. Do NOT assume prior state.
      - Click the "Enter file path..." input in the editor toolbar, clear it, type/paste the full file path, then press Enter to load it.
-     - Verify the empty-state text "or start typing to create a scratch pad" is no longer visible.
      - Ensure Preview mode works:
-       - You MUST click the "Source" button and then the "Preview" button (in that order) to prove mode switching works.
-       - If you cannot find either button, FAIL with a short reason.
+       - Click the "Source" button and then the "Preview" button (in that order) to prove mode switching works.
      - Use `find_text` to confirm "Quick Start" is visible (this ensures file content actually loaded).
-8) Verify the Terminal pane:
-   - In the Terminal (WSL) pane:
+7) Verify the Terminal pane:
+   - In the shell pane:
      - Wait for the terminal to be ready (not stuck on "Starting terminal..." / "Reconnecting...").
-       - If it is still stuck after ~15 seconds, close just the Terminal pane and re-create a Terminal (WSL) pane once, then wait again.
+       - If it is still stuck after ~15 seconds, close just the Terminal pane and re-create a shell pane once, then wait again.
        - If it is still stuck, FAIL with a short reason.
      - Then run `node -v` (or `git --version` if node is unavailable).
-     - WAIT for the command to finish and then explicitly verify visually that the terminal output contains a version-looking string (examples: `v20.11.0` or `git version 2.44.0`).
-     - If you do not see version output, try the fallback command and verify that output instead.
+     - WAIT for the command to finish and then check that the terminal output contains a version-looking string (examples: `v20.11.0` or `git version 2.44.0`).
      - Terminal input reliability rules:
        - Do NOT send `{{Enter}}` as part of the text (it often gets typed literally).
        - Do NOT use `send_keys` to type command text into the terminal (it can double-type in xterm).
        - Instead, click the terminal pane to focus it, then use the `insert_text` tool to insert the command text, then `send_keys` with `Enter`.
-9) Verify the Browser pane:
-   - In the Browser pane: open the standard "Example Domain" website (IANA Example Domains).
+8) Verify the Browser pane:
+   - In the Browser pane: open example.com.
    - Verify visually (inside the Browser pane content) that the heading "Example Domain" is visible.
    - Do NOT rely on `find_text` for this (the Browser pane renders cross-origin content).
-10) Settings navigation:
+9) Settings navigation:
    - Stay on the current in-app tab.
    - Open the sidebar (if it is collapsed) using the top-left toggle button.
    - Click "Settings" in the sidebar.
