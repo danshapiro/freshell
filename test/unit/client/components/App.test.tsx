@@ -8,6 +8,7 @@ import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
+import idleWarningsReducer from '@/store/idleWarningsSlice'
 
 // Ensure DOM is clean even if another test file forgot cleanup.
 beforeEach(() => {
@@ -79,6 +80,7 @@ function createTestStore() {
       connection: connectionReducer,
       sessions: sessionsReducer,
       panes: panesReducer,
+      idleWarnings: idleWarningsReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -109,6 +111,9 @@ function createTestStore() {
       panes: {
         layouts: {},
         activePane: {},
+      },
+      idleWarnings: {
+        warnings: {},
       },
     },
   })
@@ -559,6 +564,43 @@ describe('App Component - Share Button', () => {
       // Should still have called share (with localhost fallback)
       const callArgs = mockShare.mock.calls[0][0]
       expect(callArgs.text).toContain('token=test-token-abc123')
+    })
+  })
+})
+
+describe('App Component - Idle Warnings', () => {
+  let messageHandler: ((msg: any) => void) | null = null
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockOnMessage.mockImplementation((cb: (msg: any) => void) => {
+      messageHandler = cb
+      return () => { messageHandler = null }
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+    messageHandler = null
+  })
+
+  it('shows an indicator when the server warns an idle terminal will auto-kill soon', async () => {
+    renderApp()
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    messageHandler!({
+      type: 'terminal.idle.warning',
+      terminalId: 'term-idle',
+      killMinutes: 10,
+      warnMinutes: 3,
+      lastActivityAt: Date.now(),
+    })
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /auto-kill soon/i })).toBeInTheDocument()
     })
   })
 })

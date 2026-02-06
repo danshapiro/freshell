@@ -153,6 +153,10 @@ async function main() {
     }
   })
 
+  registry.on('terminal.idle.warning', (payload) => {
+    wsHandler.broadcast({ type: 'terminal.idle.warning', ...(payload as any) })
+  })
+
   const applyDebugLogging = (enabled: boolean, source: string) => {
     const nextEnabled = !!enabled
     setLogLevel(nextEnabled ? 'debug' : 'info')

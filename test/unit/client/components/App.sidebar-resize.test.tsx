@@ -8,6 +8,7 @@ import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
+import idleWarningsReducer from '@/store/idleWarningsSlice'
 
 // Mock the WebSocket client
 const mockSend = vi.fn()
@@ -78,6 +79,7 @@ function createTestStore(options?: {
       connection: connectionReducer,
       sessions: sessionsReducer,
       panes: panesReducer,
+      idleWarnings: idleWarningsReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -115,6 +117,9 @@ function createTestStore(options?: {
       panes: {
         layouts: {},
         activePane: {},
+      },
+      idleWarnings: {
+        warnings: {},
       },
     },
   })

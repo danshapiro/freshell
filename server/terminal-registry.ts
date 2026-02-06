@@ -4,6 +4,7 @@ import * as pty from 'node-pty'
 import os from 'os'
 import path from 'path'
 import fs from 'fs'
+import { EventEmitter } from 'events'
 import { logger } from './logger.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
 import type { AppSettings } from './config-store.js'
@@ -472,7 +473,7 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
   return { file: cmd, args, cwd, env }
 }
 
-export class TerminalRegistry {
+export class TerminalRegistry extends EventEmitter {
   private terminals = new Map<string, TerminalRecord>()
   private settings: AppSettings | undefined
   private idleTimer: NodeJS.Timeout | null = null
@@ -482,6 +483,7 @@ export class TerminalRegistry {
   private scrollbackMaxChars: number
 
   constructor(settings?: AppSettings, maxTerminals?: number, maxExitedTerminals?: number) {
+    super()
     this.settings = settings
     this.maxTerminals = maxTerminals ?? MAX_TERMINALS
     this.maxExitedTerminals = maxExitedTerminals ?? Number(process.env.MAX_EXITED_TERMINALS || 200)
@@ -581,6 +583,7 @@ export class TerminalRegistry {
     if (!settings) return
     const killMinutes = settings.safety.autoKillIdleMinutes
     if (!killMinutes || killMinutes <= 0) return
+    const warnMinutes = settings.safety.warnBeforeKillMinutes
 
     const now = Date.now()
 
@@ -591,11 +594,29 @@ export class TerminalRegistry {
       const idleMs = now - term.lastActivityAt
       const idleMinutes = idleMs / 60000
 
+      if (warnMinutes && warnMinutes > 0) {
+        const warnAtMinutes = killMinutes - warnMinutes
+        if (idleMinutes >= warnAtMinutes && idleMinutes < killMinutes && !term.warnedIdle) {
+          term.warnedIdle = true
+          this.emit('terminal.idle.warning', {
+            terminalId: term.terminalId,
+            killMinutes,
+            warnMinutes,
+            lastActivityAt: term.lastActivityAt,
+          })
+        }
+      }
+
       if (idleMinutes >= killMinutes) {
         logger.info({ terminalId: term.terminalId }, 'Auto-killing idle detached terminal')
         this.kill(term.terminalId)
       }
     }
+  }
+
+  // Exposed for unit tests to validate idle warning/kill behavior without relying on timers.
+  async enforceIdleKillsForTest(): Promise<void> {
+    await this.enforceIdleKills()
   }
 
   private runningCount(): number {
@@ -669,6 +690,7 @@ export class TerminalRegistry {
       rows,
       clients: new Set(),
       pendingSnapshotClients: new Map(),
+      warnedIdle: false,
       buffer: new ChunkRingBuffer(this.scrollbackMaxChars),
       pty: ptyProc,
       perf: perfConfig.enabled
@@ -691,6 +713,7 @@ export class TerminalRegistry {
     ptyProc.onData((data) => {
       const now = Date.now()
       record.lastActivityAt = now
+      record.warnedIdle = false
       record.buffer.append(data)
       if (record.perf) {
         record.perf.outBytes += data.length
@@ -756,6 +779,7 @@ export class TerminalRegistry {
     const term = this.terminals.get(terminalId)
     if (!term) return null
     term.clients.add(client)
+    term.warnedIdle = false
     if (opts?.pendingSnapshot) term.pendingSnapshotClients.set(client, [])
     return term
   }
@@ -784,6 +808,7 @@ export class TerminalRegistry {
     if (!term || term.status !== 'running') return false
     const now = Date.now()
     term.lastActivityAt = now
+    term.warnedIdle = false
     if (term.perf) {
       term.perf.inBytes += data.length
       term.perf.inChunks += 1

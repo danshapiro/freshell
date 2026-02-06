@@ -480,6 +480,38 @@ describe('TerminalRegistry Lifecycle', () => {
   })
 
   describe('Idle timeout edge cases', () => {
+    it('emits an idle warning before auto-kill (once per idle period)', async () => {
+      registry = new TerminalRegistry(createTestSettings({ safety: { autoKillIdleMinutes: 10, warnBeforeKillMinutes: 3 } }))
+      const term = registry.create({ mode: 'shell' })
+
+      const onWarn = vi.fn()
+      registry.on('terminal.idle.warning', onWarn)
+
+      // Detached terminal idle long enough to warn (>= 7 minutes) but not kill (< 10).
+      term.lastActivityAt = Date.now() - 8 * 60 * 1000
+
+      await registry.enforceIdleKillsForTest()
+
+      expect(term.status).toBe('running')
+      expect(onWarn).toHaveBeenCalledTimes(1)
+      expect(onWarn.mock.calls[0][0]).toMatchObject({
+        terminalId: term.terminalId,
+        killMinutes: 10,
+        warnMinutes: 3,
+      })
+
+      // Subsequent checks should not spam warnings without new activity.
+      onWarn.mockClear()
+      await registry.enforceIdleKillsForTest()
+      expect(onWarn).not.toHaveBeenCalled()
+
+      // Any activity should reset warnedIdle so the next idle period warns again.
+      registry.input(term.terminalId, 'x')
+      term.lastActivityAt = Date.now() - 8 * 60 * 1000
+      await registry.enforceIdleKillsForTest()
+      expect(onWarn).toHaveBeenCalledTimes(1)
+    })
+
     it('should kill terminal exactly at threshold', () => {
       registry = new TerminalRegistry(createTestSettings({ safety: { autoKillIdleMinutes: 30, warnBeforeKillMinutes: 5 } }))
       registry.create({ mode: 'shell' })

@@ -23,6 +23,7 @@ import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvid
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { Wifi, WifiOff, Moon, Sun, Share2, X, Copy, Check, PanelLeftClose, PanelLeft } from 'lucide-react'
 import { updateSettingsLocal, markSaved } from '@/store/settingsSlice'
+import { clearIdleWarning, recordIdleWarning } from '@/store/idleWarningsSlice'
 
 const SIDEBAR_MIN_WIDTH = 200
 const SIDEBAR_MAX_WIDTH = 500
@@ -37,6 +38,8 @@ export default function App() {
   const connection = useAppSelector((s) => s.connection.status)
   const connectionError = useAppSelector((s) => s.connection.lastError)
   const settings = useAppSelector((s) => s.settings.settings)
+  const idleWarnings = useAppSelector((s) => s.idleWarnings.warnings)
+  const idleWarningCount = Object.keys(idleWarnings).length
 
   const [view, setView] = useState<AppView>('terminal')
   const [shareModalUrl, setShareModalUrl] = useState<string | null>(null)
@@ -239,6 +242,16 @@ export default function App() {
           const terminalId = msg.terminalId
           const code = msg.exitCode
           console.log('terminal exit', terminalId, code)
+          if (terminalId) dispatch(clearIdleWarning(terminalId))
+        }
+        if (msg.type === 'terminal.idle.warning') {
+          if (!msg.terminalId) return
+          dispatch(recordIdleWarning({
+            terminalId: msg.terminalId,
+            killMinutes: Number(msg.killMinutes) || 0,
+            warnMinutes: Number(msg.warnMinutes) || 0,
+            lastActivityAt: typeof msg.lastActivityAt === 'number' ? msg.lastActivityAt : undefined,
+          }))
         }
         if (msg.type === 'session.status') {
           // Log session repair status (silent for healthy/repaired, visible for problems)
@@ -354,6 +367,16 @@ export default function App() {
           <span className="font-mono text-base font-semibold tracking-tight">🐚🔥freshell</span>
         </div>
         <div className="flex items-center gap-1">
+          {idleWarningCount > 0 && (
+            <button
+              onClick={() => setView('overview')}
+              className="px-2 py-1 rounded-md bg-amber-100 text-amber-950 hover:bg-amber-200 transition-colors text-xs font-medium"
+              aria-label={`${idleWarningCount} terminal(s) will auto-kill soon`}
+              title="View idle terminals"
+            >
+              {idleWarningCount} terminal{idleWarningCount === 1 ? '' : 's'} will auto-kill soon
+            </button>
+          )}
           <button
             onClick={toggleTheme}
             className="p-1.5 rounded-md hover:bg-muted transition-colors"
