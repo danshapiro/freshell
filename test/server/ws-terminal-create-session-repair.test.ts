@@ -116,6 +116,8 @@ class FakeRegistry {
     return rec
   }
 
+  finishAttachSnapshot(_terminalId: string, _ws: any) {}
+
   detach(terminalId: string, ws: any) {
     const rec = this.records.get(terminalId)
     if (!rec) return false
