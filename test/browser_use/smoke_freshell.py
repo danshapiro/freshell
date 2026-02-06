@@ -169,22 +169,29 @@ async def _run(args: argparse.Namespace) -> int:
       await browser.event_bus.dispatch(SwitchTabEvent(target_id=None))
     except Exception:
       pass
-    # Wait for the SPA to render enough that the agent sees real DOM content.
-    # In some environments the first few extraction snapshots can come back empty even though navigation succeeded.
-    deadline = time.monotonic() + 20.0
+    # Wait for the SPA to fully bootstrap auth:
+    # - token removed from URL
+    # - auth-token stored in sessionStorage
+    # - terminal view rendered (Add Pane button present)
+    #
+    # Without this, the agent may refresh/navigate and lose auth, causing flaky failures.
+    deadline = time.monotonic() + 30.0
     ready = False
     while time.monotonic() < deadline:
       try:
-        # The Add Pane button is a good proxy for "terminal view rendered".
+        # These checks intentionally avoid reading the token value to keep it out of any debug logs.
+        auth_present = await page.evaluate("() => !!sessionStorage.getItem('auth-token')")
+        token_removed = await page.evaluate("() => !new URLSearchParams(window.location.search).has('token')")
         has_add_pane = await page.evaluate("() => !!document.querySelector('button[aria-label=\"Add pane\"]')")
-        if has_add_pane:
+        if auth_present and token_removed and has_add_pane:
           ready = True
           break
       except Exception:
         pass
       await asyncio.sleep(0.5)
     if not ready:
-      log.warn("Pre-open did not detect rendered UI in time", event="preopen_target_not_ready")
+      log.error("Pre-open did not complete auth bootstrap in time", event="preopen_target_not_ready")
+      raise RuntimeError("App did not bootstrap auth/render in time")
 
     try:
       current_url = await page.get_url()
@@ -212,7 +219,6 @@ Important constraints:
 
 Requirements:
 1) Wait until the page is fully loaded and the top bar is visible.
-   - If the page looks blank/empty after waiting, do a single refresh and wait again.
 2) Verify the app header contains the text "freshell".
 3) Verify the connection indicator shows the app is connected (not disconnected).
 4) Pane stress test (do this once):
