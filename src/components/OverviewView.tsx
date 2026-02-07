@@ -3,7 +3,7 @@ import { api } from '@/lib/api'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { setActiveTab } from '@/store/tabsSlice'
 import { createTabWithPane } from '@/store/tabThunks'
-import { updatePaneTitle, setActivePane } from '@/store/panesSlice'
+import { updatePaneTitle } from '@/store/panesSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { cn } from '@/lib/utils'
 import { collectTerminalPanes, findPaneByTerminalId } from '@/lib/pane-utils'
@@ -149,7 +149,6 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                         const existing = findPaneByTerminalId(paneLayouts, t.terminalId)
                         if (existing) {
                           dispatch(setActiveTab(existing.tabId))
-                          dispatch(setActivePane({ tabId: existing.tabId, paneId: existing.paneId }))
                           onOpenTab?.()
                           return
                         }
@@ -221,7 +220,6 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                         const existing = findPaneByTerminalId(paneLayouts, t.terminalId)
                         if (existing) {
                           dispatch(setActiveTab(existing.tabId))
-                          dispatch(setActivePane({ tabId: existing.tabId, paneId: existing.paneId }))
                           onOpenTab?.()
                           return
                         }

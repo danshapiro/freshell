@@ -1,7 +1,7 @@
 import { createSelector } from '@reduxjs/toolkit'
 import type { RootState } from '../store'
 import type { BackgroundTerminal, CodingCliProviderName } from '../types'
-import { collectTerminalPanes, collectSessionPanes } from '@/lib/pane-utils'
+import { collectTerminalPanes } from '@/lib/pane-utils'
 
 export interface SidebarSessionItem {
   id: string
@@ -58,20 +58,11 @@ function buildSessionItems(
   }
 
   for (const layout of Object.values(layouts || {})) {
-    // Collect from terminal panes (which may have resumeSessionId)
     const terminals = collectTerminalPanes(layout)
     for (const terminal of terminals) {
       if (!terminal.content.resumeSessionId) continue
       if (!terminal.content.mode || terminal.content.mode === 'shell') continue
       const key = `${terminal.content.mode}:${terminal.content.resumeSessionId}`
-      tabSessionSet.add(key)
-    }
-
-    // Collect from session panes (non-terminal session views)
-    const sessionPanes = collectSessionPanes(layout)
-    for (const sessionPane of sessionPanes) {
-      const provider = sessionPane.content.provider || 'claude'
-      const key = `${provider}:${sessionPane.content.sessionId}`
       tabSessionSet.add(key)
     }
   }

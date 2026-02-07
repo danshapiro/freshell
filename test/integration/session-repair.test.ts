@@ -107,10 +107,10 @@ describe('SessionRepairService Integration', () => {
       expect(result.status).toBe('healthy')
     })
 
-    it('returns missing for non-existent session', async () => {
-      const result = await service.waitForSession('nonexistent', 100)
-      expect(result.status).toBe('missing')
-      expect(result.sessionId).toBe('nonexistent')
+    it('times out for non-existent session', async () => {
+      await expect(
+        service.waitForSession('nonexistent', 100)
+      ).rejects.toThrow(/not in queue/)
     })
 
     it('uses CLAUDE_HOME when resolving session files', async () => {

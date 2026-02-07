@@ -5,12 +5,7 @@ import type { Tab, TerminalStatus } from '@/store/types'
 import type { MouseEvent, KeyboardEvent } from 'react'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 
-function StatusIndicator({ status, isWorking }: { status: TerminalStatus; isWorking?: boolean }) {
-  // Working state: pulsing grey (terminal is streaming)
-  if (isWorking) {
-    return <Circle className="h-2 w-2 fill-muted-foreground text-muted-foreground animate-pulse" />
-  }
-  // Ready state (default): green dot for running terminals
+function StatusIndicator({ status }: { status: TerminalStatus }) {
   if (status === 'running') {
     return <Circle className="h-2 w-2 fill-success text-success" />
   }

@@ -17,46 +17,18 @@ export type JsonlMeta = {
 }
 
 /**
- * Known XML tag prefixes used for system context injection.
- * These are internal tags used by Claude Code subagents, not user content.
- */
-const SYSTEM_CONTEXT_XML_PREFIXES = [
-  'system',
-  'context',
-  'environment',
-  'instructions',
-  'tool',
-  'mcp',
-  'claude',
-  'agent',
-  'prompt',
-]
-
-/**
  * Check if a "user" message is actually system context.
  * Claude subagents inject system prompts as role:"user" messages:
  * - Agent mode instructions: [SUGGESTION MODE: ...], [REVIEW MODE: ...]
  * - AGENTS.md/instruction files: "# AGENTS.md instructions..."
  * - XML-wrapped system context: <system_context>, <environment_context>, etc.
- *
- * We specifically match known system context tag names to avoid filtering
- * legitimate user prompts that happen to start with XML/HTML tags.
  */
 function isSystemContext(text: string): boolean {
   const trimmed = text.trim()
   // Bracketed agent mode instructions: [SUGGESTION MODE: ...], [REVIEW MODE: ...]
   if (/^\[[A-Z][A-Z_ ]*:/.test(trimmed)) return true
-  // XML-wrapped system context: only match known system context tag prefixes
-  // This avoids filtering user prompts like "<html>..." or "<div>..."
-  const xmlMatch = trimmed.match(/^<([a-zA-Z_][\w_-]*)/)
-  if (xmlMatch) {
-    const tagName = xmlMatch[1].toLowerCase()
-    // Match if tag name starts with or equals a known system prefix
-    // e.g., "system_context", "environment_info", "tool_result"
-    if (SYSTEM_CONTEXT_XML_PREFIXES.some((prefix) => tagName === prefix || tagName.startsWith(prefix + '_'))) {
-      return true
-    }
-  }
+  // XML-wrapped system context: <system_context>, <environment_context>, <INSTRUCTIONS>, etc.
+  if (/^<[a-zA-Z_][\w_-]*[>\s]/.test(trimmed)) return true
   // Instruction file headers: "# AGENTS.md instructions for...", "# System", "# Instructions"
   if (/^#\s*(AGENTS|Instructions?|System)/i.test(trimmed)) return true
   return false

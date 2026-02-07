@@ -2,12 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
-import { recordInput, recordOutput } from '@/store/terminalActivitySlice'
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
 import { getWsClient } from '@/lib/ws-client'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import { getResumeSessionIdFromRef } from '@/components/terminal-view-utils'
-import { copyText, readText, isClipboardReadAvailable } from '@/lib/clipboard'
+import { copyText, readText } from '@/lib/clipboard'
 import { registerTerminalActions } from '@/lib/pane-action-registry'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { nanoid } from 'nanoid'
@@ -42,10 +41,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const mountedRef = useRef(false)
   const hiddenRef = useRef(hidden)
   const lastSessionActivityAtRef = useRef(0)
-  const lastOutputDispatchAtRef = useRef(0)
-
-  // Throttle recordOutput dispatches to avoid performance issues with chatty terminals
-  const OUTPUT_DISPATCH_THROTTLE_MS = 500
 
   // Extract terminal-specific fields (safe because we check kind later)
   const isTerminal = paneContent.kind === 'terminal'
@@ -132,17 +127,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         const tid = terminalIdRef.current
         if (!tid) return
         ws.send({ type: 'terminal.input', terminalId: tid, data: text })
-        dispatch(recordInput({ paneId }))
-        // Update session activity for sidebar sorting
-        const now = Date.now()
-        const sessionId = contentRef.current?.resumeSessionId
-        const mode = contentRef.current?.mode
-        if (sessionId && mode && isCodingCliMode(mode)) {
-          if (now - lastSessionActivityAtRef.current >= SESSION_ACTIVITY_THROTTLE_MS) {
-            lastSessionActivityAtRef.current = now
-            dispatch(updateSessionActivity({ sessionId, provider: mode, lastInputAt: now }))
-          }
-        }
       },
       selectAll: () => term.selectAll(),
       clearScrollback: () => term.clear(),
@@ -162,9 +146,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       if (!tid) return
       ws.send({ type: 'terminal.input', terminalId: tid, data })
 
-      // Track input for activity monitoring (to filter out echo)
-      dispatch(recordInput({ paneId }))
-
       const now = Date.now()
       const sessionId = contentRef.current?.resumeSessionId
       const mode = contentRef.current?.mode
@@ -181,40 +162,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       if (event.ctrlKey && event.shiftKey && event.key === 'C' && event.type === 'keydown' && !event.repeat) {
         const selection = term.getSelection()
         if (selection) {
-          void copyText(selection)
+          void navigator.clipboard.writeText(selection).catch(() => {})
         }
         return false
       }
-
-      // Ctrl+V or Ctrl+Shift+V to paste
-      // Only intercept if clipboard API is available (secure context required)
-      // Otherwise, let the browser handle paste natively via paste event
-      if (event.ctrlKey && (event.key === 'v' || event.key === 'V') && event.type === 'keydown' && !event.repeat) {
-        if (isClipboardReadAvailable()) {
-          void readText().then((text) => {
-            if (!text) return
-            const tid = terminalIdRef.current
-            if (!tid) return
-            ws.send({ type: 'terminal.input', terminalId: tid, data: text })
-            dispatch(recordInput({ paneId }))
-            // Update session activity for sidebar sorting
-            const now = Date.now()
-            const sessionId = contentRef.current?.resumeSessionId
-            const mode = contentRef.current?.mode
-            if (sessionId && mode && isCodingCliMode(mode)) {
-              if (now - lastSessionActivityAtRef.current >= SESSION_ACTIVITY_THROTTLE_MS) {
-                lastSessionActivityAtRef.current = now
-                dispatch(updateSessionActivity({ sessionId, provider: mode, lastInputAt: now }))
-              }
-            }
-          })
-          return false
-        }
-        // Non-secure context: return false to prevent xterm from processing
-        // Ctrl+V (which sends ^V and cancels the event). This allows the
-        // browser's native paste event to fire.
-        return false
-      }
+      // Paste is handled by xterm.js's internal paste handler, which fires onData.
+      // We intentionally do NOT handle Ctrl+Shift+V here to avoid double-paste.
 
       // Tab switching: Ctrl+Shift+[ (prev) and Ctrl+Shift+] (next)
       if (event.ctrlKey && event.shiftKey && !event.altKey && !event.metaKey && event.type === 'keydown' && !event.repeat) {
@@ -355,12 +308,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
         if (msg.type === 'terminal.output' && msg.terminalId === tid) {
           term.write(msg.data || '')
-          // Throttle recordOutput dispatches to avoid performance issues with chatty terminals
-          const now = Date.now()
-          if (now - lastOutputDispatchAtRef.current >= OUTPUT_DISPATCH_THROTTLE_MS) {
-            lastOutputDispatchAtRef.current = now
-            dispatch(recordOutput({ paneId }))
-          }
         }
 
         if (msg.type === 'terminal.snapshot' && msg.terminalId === tid) {
@@ -429,6 +376,14 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             requestIdRef.current = newRequestId
             terminalIdRef.current = undefined
             updateContent({ terminalId: undefined, createRequestId: newRequestId, status: 'creating' })
+            ws.send({
+              type: 'terminal.create',
+              requestId: newRequestId,
+              mode,
+              shell: shell || 'system',
+              cwd: initialCwd,
+              resumeSessionId: getResumeSessionIdFromRef(contentRef),
+            })
           }
         }
       })
@@ -443,13 +398,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       // This is critical: we want the effect to run once per createRequestId,
       // not re-run when terminalId changes from undefined to defined
       const currentTerminalId = terminalIdRef.current
-      const currentStatus = contentRef.current?.status
 
       if (currentTerminalId) {
         attach(currentTerminalId)
-      } else if (currentStatus === 'exited') {
-        // Terminal has exited - don't create a new one
-        // User can restart manually via context menu if needed
       } else {
         ws.send({
           type: 'terminal.create',

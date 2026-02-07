@@ -186,6 +186,6 @@ describe('SessionView', () => {
       </Provider>
     )
 
-    expect(screen.getByText(/session history unavailable/i)).toBeInTheDocument()
+    expect(screen.getByText(/starting session/i)).toBeInTheDocument()
   })
 })

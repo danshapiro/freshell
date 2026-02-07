@@ -281,14 +281,28 @@ export default function App() {
     }
   }, [dispatch])
 
-  // Keyboard shortcuts
+  // Keyboard shortcuts: Ctrl+B prefix, then a command.
+  const prefixActiveRef = useRef(false)
+  const prefixTimeoutRef = useRef<number | null>(null)
+
   useEffect(() => {
+    function clearPrefix() {
+      prefixActiveRef.current = false
+      if (prefixTimeoutRef.current) window.clearTimeout(prefixTimeoutRef.current)
+      prefixTimeoutRef.current = null
+    }
+
     function isTextInput(el: any): boolean {
       if (!el) return false
       const tag = (el.tagName || '').toLowerCase()
       if (tag === 'input' || tag === 'textarea' || el.isContentEditable) return true
       if (el.classList?.contains('xterm-helper-textarea')) return true
       return false
+    }
+
+    function switchToTabNumber(num: number) {
+      if (num < 1 || num > tabs.length) return
+      dispatch(setActiveTab(tabs[num - 1].id))
     }
 
     function onKeyDown(e: KeyboardEvent) {
@@ -308,13 +322,85 @@ export default function App() {
           return
         }
       }
+
+      // Ctrl+PageDown / Ctrl+PageUp for tab switching (VS Code / Chrome style)
+      if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey) {
+        if (e.key === 'PageDown') {
+          e.preventDefault()
+          dispatch(switchToNextTab())
+          return
+        }
+        if (e.key === 'PageUp') {
+          e.preventDefault()
+          dispatch(switchToPrevTab())
+          return
+        }
+      }
+
+      // Cmd+Option+Arrow for Mac (metaKey + altKey)
+      if (e.metaKey && e.altKey && !e.ctrlKey && !e.shiftKey) {
+        if (e.key === 'ArrowRight') {
+          e.preventDefault()
+          dispatch(switchToNextTab())
+          return
+        }
+        if (e.key === 'ArrowLeft') {
+          e.preventDefault()
+          dispatch(switchToPrevTab())
+          return
+        }
+      }
+
+      if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === 'b' || e.key === 'B')) {
+        e.preventDefault()
+        prefixActiveRef.current = true
+        if (prefixTimeoutRef.current) window.clearTimeout(prefixTimeoutRef.current)
+        prefixTimeoutRef.current = window.setTimeout(clearPrefix, 1500)
+        return
+      }
+
+      if (!prefixActiveRef.current) return
+
+      const key = e.key.toLowerCase()
+      clearPrefix()
+
+      if (key === 't') {
+        e.preventDefault()
+        dispatch(createTabWithPane({ content: buildDefaultPaneContent(settings) }))
+        setView('terminal')
+      } else if (key === 'w') {
+        e.preventDefault()
+        if (activeTabId) dispatch(closeTabWithCleanup({ tabId: activeTabId }))
+      } else if (key === 's') {
+        e.preventDefault()
+        setView('sessions')
+      } else if (key === 'o') {
+        e.preventDefault()
+        setView('overview')
+      } else if (key === ',') {
+        e.preventDefault()
+        setView('settings')
+      } else if (key === 'b') {
+        e.preventDefault()
+        toggleSidebarCollapse()
+      } else if (key === 'n') {
+        e.preventDefault()
+        dispatch(switchToNextTab())
+      } else if (key === 'p') {
+        e.preventDefault()
+        dispatch(switchToPrevTab())
+      } else if (key >= '1' && key <= '9') {
+        e.preventDefault()
+        switchToTabNumber(parseInt(key, 10))
+      }
     }
 
     window.addEventListener('keydown', onKeyDown)
     return () => {
       window.removeEventListener('keydown', onKeyDown)
+      if (prefixTimeoutRef.current) window.clearTimeout(prefixTimeoutRef.current)
     }
-  }, [dispatch])
+  }, [dispatch, activeTabId, tabs, settings, toggleSidebarCollapse])
 
   // Ensure at least one tab exists for first-time users.
   useEffect(() => {

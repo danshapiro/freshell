@@ -1182,7 +1182,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       }
     })
 
-    it('switches to existing tab and sets active pane when clicking non-running session that is already open', async () => {
+    it('switches to existing tab when clicking non-running session that is already open', async () => {
       const projects: ProjectGroup[] = [
         {
           projectPath: '/home/user/project',
@@ -1222,10 +1222,6 @@ describe('Sidebar Component - Session-Centric Display', () => {
       const state = store.getState()
       expect(state.tabs.tabs).toHaveLength(1)
       expect(state.tabs.activeTabId).toBe('existing-tab-id')
-
-      // Should also set the active pane for the tab
-      const expectedPaneId = 'pane-existing-tab-id'
-      expect(state.panes.activePane['existing-tab-id']).toBe(expectedPaneId)
     })
 
     // Note: Tests for running sessions require complex WebSocket mocking that is currently

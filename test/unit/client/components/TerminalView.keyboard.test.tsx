@@ -72,13 +72,11 @@ vi.mock('xterm/css/xterm.css', () => ({}))
 const clipboardMocks = vi.hoisted(() => ({
   readText: vi.fn().mockResolvedValue('pasted content'),
   copyText: vi.fn().mockResolvedValue(undefined),
-  isClipboardReadAvailable: vi.fn().mockReturnValue(true),
 }))
 
 vi.mock('@/lib/clipboard', () => ({
   readText: clipboardMocks.readText,
   copyText: clipboardMocks.copyText,
-  isClipboardReadAvailable: clipboardMocks.isClipboardReadAvailable,
 }))
 
 import TerminalView from '@/components/TerminalView'
@@ -275,35 +273,6 @@ describe('TerminalView keyboard handling', () => {
       // Should return true to let xterm handle normal 'v' key
       expect(result).toBe(true)
       expect(clipboardMocks.readText).not.toHaveBeenCalled()
-    })
-
-    it('returns false when clipboard is not available (non-secure context)', async () => {
-      // Mock clipboard as unavailable (e.g., non-secure HTTP origin)
-      clipboardMocks.isClipboardReadAvailable.mockReturnValue(false)
-
-      const { store, tabId, paneId, paneContent } = createTestStore('term-1')
-
-      render(
-        <Provider store={store}>
-          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
-        </Provider>
-      )
-
-      await waitFor(() => {
-        expect(capturedKeyHandler).not.toBeNull()
-      })
-
-      const event = createKeyboardEvent('v', { ctrlKey: true })
-      const result = capturedKeyHandler!(event)
-
-      // Should return false to prevent xterm from processing Ctrl+V
-      // This allows the browser's native paste event to fire
-      expect(result).toBe(false)
-      // Should not call clipboard API since it's not available
-      expect(clipboardMocks.readText).not.toHaveBeenCalled()
-
-      // Restore mock for other tests
-      clipboardMocks.isClipboardReadAvailable.mockReturnValue(true)
     })
   })
 

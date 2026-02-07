@@ -7,7 +7,6 @@ import tabsReducer, { TabsState } from '@/store/tabsSlice'
 import codingCliReducer, { registerCodingCliRequest } from '@/store/codingCliSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
-import terminalActivityReducer from '@/store/terminalActivitySlice'
 import type { Tab } from '@/store/types'
 
 // Mock the ws-client module
@@ -53,18 +52,16 @@ type StoreOverrides = Partial<TabsState> & {
   panes?: Partial<ReturnType<typeof panesReducer>>
   codingCli?: Partial<ReturnType<typeof codingCliReducer>>
   settings?: Partial<ReturnType<typeof settingsReducer>>
-  terminalActivity?: Partial<ReturnType<typeof terminalActivityReducer>>
 }
 
 function createStore(overrides: StoreOverrides = {}) {
-  const { panes, codingCli, settings, terminalActivity, ...tabsState } = overrides
+  const { panes, codingCli, settings, ...tabsState } = overrides
   return configureStore({
     reducer: {
       tabs: tabsReducer,
       codingCli: codingCliReducer,
       panes: panesReducer,
       settings: settingsReducer,
-      terminalActivity: terminalActivityReducer,
     },
     preloadedState: {
       tabs: {
@@ -88,13 +85,6 @@ function createStore(overrides: StoreOverrides = {}) {
         settings: defaultSettings,
         loaded: true,
         ...settings,
-      },
-      terminalActivity: {
-        lastOutputAt: {},
-        lastInputAt: {},
-        working: {},
-        finished: {},
-        ...terminalActivity,
       },
     },
   })

@@ -3,10 +3,9 @@ import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { setActiveTab, updateTab, reorderTabs, clearTabRenameRequest } from '@/store/tabsSlice'
 import { closeTabWithCleanup, createTabWithPane } from '@/store/tabThunks'
 import { getTabDisplayTitle } from '@/lib/tab-title'
-import { collectTerminalPanes, collectSessionPanes } from '@/lib/pane-utils'
+import { collectTerminalPanes, collectSessionPanes, deriveTabStatus } from '@/lib/pane-utils'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import TabItem from './TabItem'
-import { useTerminalActivityMonitor } from '@/hooks/useTerminalActivityMonitor'
 import {
   DndContext,
   closestCenter,
@@ -106,7 +105,6 @@ const EMPTY_PANE_TITLES: Record<string, Record<string, string>> = {}
 const EMPTY_ACTIVE_PANES: Record<string, string> = {}
 
 export default function TabBar() {
-  useTerminalActivityMonitor()
   const dispatch = useAppDispatch()
   const tabsState = useAppSelector((s) => s.tabs)
   const tabs = tabsState?.tabs ?? []
@@ -131,23 +129,19 @@ export default function TabBar() {
     const layout = paneLayouts[tabId]
     if (!layout) return 'creating'
 
+    const terminalPanes = collectTerminalPanes(layout)
+    if (terminalPanes.length > 0) {
+      return deriveTabStatus(layout)
+    }
+
+    const sessionPanes = collectSessionPanes(layout)
+    if (sessionPanes.length === 0) return 'running'
+
     let hasRunning = false
     let hasCreating = false
     let hasError = false
     let hasExited = false
 
-    // Collect terminal pane statuses
-    const terminalPanes = collectTerminalPanes(layout)
-    for (const terminal of terminalPanes) {
-      const status = terminal.content.status
-      if (status === 'running') hasRunning = true
-      else if (status === 'creating') hasCreating = true
-      else if (status === 'error') hasError = true
-      else if (status === 'exited') hasExited = true
-    }
-
-    // Collect session pane statuses
-    const sessionPanes = collectSessionPanes(layout)
     for (const session of sessionPanes) {
       const sessionId = session.content.sessionId
       if (pendingRequests[sessionId]) {
@@ -160,13 +154,10 @@ export default function TabBar() {
       else if (status === 'completed') hasExited = true
     }
 
-    // Priority: running > creating > error > exited
     if (hasRunning) return 'running'
     if (hasCreating) return 'creating'
     if (hasError) return 'error'
     if (hasExited) return 'exited'
-
-    // Default for tabs with no terminal or session panes (e.g., browser-only)
     return 'running'
   }, [paneLayouts, pendingRequests, codingCliSessions])
 

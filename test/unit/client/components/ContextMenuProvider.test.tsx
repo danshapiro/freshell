@@ -9,6 +9,7 @@ import panesReducer from '@/store/panesSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import codingCliReducer from '@/store/codingCliSlice'
+import connectionReducer from '@/store/connectionSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
@@ -47,6 +48,7 @@ function createTestStore(options?: { platform?: string | null }) {
       codingCli: codingCliReducer,
       settings: settingsReducer,
       sessionActivity: sessionActivityReducer,
+      connection: connectionReducer,
     },
     middleware: (getDefaultMiddleware) =>
       getDefaultMiddleware({ serializableCheck: false }),
@@ -91,6 +93,10 @@ function createTestStore(options?: { platform?: string | null }) {
       },
       sessionActivity: {
         sessions: {},
+      },
+      connection: {
+        status: 'ready',
+        platform: options?.platform ?? null,
       },
     },
   })
@@ -341,7 +347,6 @@ describe('ContextMenuProvider', () => {
         (child) => child.type === 'leaf' && child.id === 'pane-1'
       )
       expect(originalPane).toBeDefined()
-
       // New pane should have the session info
       const newPane = newLayout.children.find(
         (child) => child.type === 'leaf' && child.id !== 'pane-1'
