@@ -546,18 +546,16 @@ describe('ws protocol', () => {
   it('terminal.input returns error for non-existent terminal', async () => {
     const { ws, close } = await createAuthenticatedConnection()
 
+    const messagesPromise = collectUntil(ws, (msg) => msg.type === 'error', 5000)
     ws.send(JSON.stringify({ type: 'terminal.input', terminalId: 'nonexistent_terminal', data: 'test' }))
 
-    const error = await new Promise<any>((resolve) => {
-      ws.on('message', (data) => {
-        const msg = JSON.parse(data.toString())
-        if (msg.type === 'error') resolve(msg)
-      })
-    })
+    const messages = await messagesPromise
+    const error = messages.find((m) => m.type === 'error')
+    expect(error).toBeTruthy()
 
-    expect(error.type).toBe('error')
-    expect(error.code).toBe('INVALID_TERMINAL_ID')
-    expect(error.terminalId).toBe('nonexistent_terminal')
+    expect((error as any).type).toBe('error')
+    expect((error as any).code).toBe('INVALID_TERMINAL_ID')
+    expect((error as any).terminalId).toBe('nonexistent_terminal')
 
     await close()
   })
