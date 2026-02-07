@@ -5,7 +5,7 @@ import { Provider } from 'react-redux'
 import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
-import terminalActivityReducer, { recordInput, STREAMING_THRESHOLD_MS } from '@/store/terminalActivitySlice'
+import terminalActivityReducer, { recordInput, recordOutput, STREAMING_THRESHOLD_MS } from '@/store/terminalActivitySlice'
 import { useTerminalActivityMonitor } from '@/hooks/useTerminalActivityMonitor'
 import type { Tab } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
@@ -231,6 +231,29 @@ describe('useTerminalActivityMonitor', () => {
 
       // No additional sound calls since pane is no longer working
       expect(playSound).not.toHaveBeenCalled()
+    })
+
+    it('does not recreate the interval on unrelated working-map updates while still working', async () => {
+      const store = createStore(baseTime)
+      const setIntervalSpy = vi.spyOn(window, 'setInterval')
+      const clearIntervalSpy = vi.spyOn(window, 'clearInterval')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>,
+      )
+
+      expect(setIntervalSpy).toHaveBeenCalledTimes(1)
+
+      await act(async () => {
+        // This keeps hasWorkingPanes=true but changes the working map reference by adding a new key.
+        store.dispatch(recordOutput({ paneId: 'pane-2', at: baseTime + 10 }))
+        store.dispatch(recordOutput({ paneId: 'pane-2', at: baseTime + 20 }))
+      })
+
+      expect(clearIntervalSpy).not.toHaveBeenCalled()
+      expect(setIntervalSpy).toHaveBeenCalledTimes(1)
     })
   })
 })
