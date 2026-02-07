@@ -6,7 +6,6 @@ import PaneContainer from '@/components/panes/PaneContainer'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import connectionReducer, { ConnectionState } from '@/store/connectionSlice'
-import codingCliReducer from '@/store/codingCliSlice'
 import type { PanesState } from '@/store/panesSlice'
 import type { PaneNode, PaneContent, EditorPaneContent } from '@/store/paneTypes'
 
@@ -107,14 +106,12 @@ function createStore(
       panes: panesReducer,
       settings: settingsReducer,
       connection: connectionReducer,
-      codingCli: codingCliReducer,
     },
     preloadedState: {
       panes: {
         layouts: {},
         activePane: {},
         paneTitles: {},
-        paneTitleSetByUser: {},
         ...initialPanesState,
       },
       connection: {
@@ -122,10 +119,6 @@ function createStore(
         platform: null,
         availableClis: {},
         ...initialConnectionState,
-      },
-      codingCli: {
-        sessions: {},
-        pendingRequests: {},
       },
     },
   })

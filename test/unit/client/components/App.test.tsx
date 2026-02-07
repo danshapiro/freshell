@@ -8,9 +8,12 @@ import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
-import terminalActivityReducer from '@/store/terminalActivitySlice'
-import codingCliReducer from '@/store/codingCliSlice'
-import sessionActivityReducer from '@/store/sessionActivitySlice'
+import idleWarningsReducer from '@/store/idleWarningsSlice'
+
+// Ensure DOM is clean even if another test file forgot cleanup.
+beforeEach(() => {
+  cleanup()
+})
 
 // Mock the WebSocket client
 const mockSend = vi.fn()
@@ -77,9 +80,7 @@ function createTestStore() {
       connection: connectionReducer,
       sessions: sessionsReducer,
       panes: panesReducer,
-      terminalActivity: terminalActivityReducer,
-      codingCli: codingCliReducer,
-      sessionActivity: sessionActivityReducer,
+      idleWarnings: idleWarningsReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -94,7 +95,7 @@ function createTestStore() {
         lastSavedAt: undefined,
       },
       tabs: {
-        tabs: [{ id: 'tab-1', title: 'Tab 1', createdAt: Date.now() }],
+        tabs: [{ id: 'tab-1', mode: 'shell' }],
         activeTabId: 'tab-1',
       },
       sessions: {
@@ -111,21 +112,9 @@ function createTestStore() {
       panes: {
         layouts: {},
         activePane: {},
-        paneTitles: {},
-        paneTitleSetByUser: {},
       },
-      terminalActivity: {
-        lastOutputAt: {},
-        lastInputAt: {},
-        working: {},
-        finished: {},
-      },
-      codingCli: {
-        sessions: {},
-        pendingRequests: {},
-      },
-      sessionActivity: {
-        sessions: {},
+      idleWarnings: {
+        warnings: {},
       },
     },
   })
@@ -149,6 +138,9 @@ describe('App Component - Share Button', () => {
     localStorage.setItem('freshell.auth-token', 'test-token-abc123')
     // Mock API responses
     mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/sessions') return Promise.resolve([])
       if (url === '/api/lan-info') {
         return Promise.resolve({ ips: ['192.168.1.100'] })
       }
@@ -501,6 +493,9 @@ describe('App Component - Share Button', () => {
 
     // Mock specific LAN IP
     mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/sessions') return Promise.resolve([])
       if (url === '/api/lan-info') {
         return Promise.resolve({ ips: ['10.0.0.50'] })
       }
@@ -532,6 +527,9 @@ describe('App Component - Share Button', () => {
 
     // Mock API failure
     mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/sessions') return Promise.resolve([])
       if (url === '/api/lan-info') {
         return Promise.reject(new Error('Network error'))
       }
@@ -551,11 +549,100 @@ describe('App Component - Share Button', () => {
     })
   })
 })
+
+describe('App Component - Idle Warnings', () => {
+  let messageHandler: ((msg: any) => void) | null = null
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockOnMessage.mockImplementation((cb: (msg: any) => void) => {
+      messageHandler = cb
+      return () => { messageHandler = null }
+    })
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/sessions') return Promise.resolve([])
+      return Promise.resolve({})
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+    messageHandler = null
+  })
+
+  it('shows an indicator when the server warns an idle terminal will auto-kill soon', async () => {
+    renderApp()
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    messageHandler!({
+      type: 'terminal.idle.warning',
+      terminalId: 'term-idle',
+      killMinutes: 10,
+      warnMinutes: 3,
+      lastActivityAt: Date.now(),
+    })
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /auto-kill soon/i })).toBeInTheDocument()
+    })
+  })
+})
+
+describe('App Component - Mobile Sidebar', () => {
+  const originalInnerWidth = window.innerWidth
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    localStorage.clear()
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/sessions') return Promise.resolve([])
+      return Promise.resolve({})
+    })
+  })
+
+  afterEach(() => {
+    Object.defineProperty(window, 'innerWidth', {
+      value: originalInnerWidth,
+      writable: true,
+    })
+  })
+
+  it('auto-collapses on mobile but does not re-collapse after user opens it', async () => {
+    Object.defineProperty(window, 'innerWidth', { value: 500, writable: true })
+
+    renderApp()
+
+    // After effects settle, it should be collapsed on mobile.
+    await waitFor(() => {
+      expect(screen.getByTitle('Show sidebar')).toBeInTheDocument()
+      expect(screen.queryByTestId('mock-sidebar')).not.toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByTitle('Show sidebar'))
+
+    await waitFor(() => {
+      expect(screen.getByTitle('Hide sidebar')).toBeInTheDocument()
+      expect(screen.getByTestId('mock-sidebar')).toBeInTheDocument()
+    })
+
+    // Give effects a chance to run; sidebar should remain open.
+    await new Promise((r) => setTimeout(r, 0))
+    expect(screen.getByTestId('mock-sidebar')).toBeInTheDocument()
+  })
+})
 describe('App Bootstrap', () => {
   const originalSessionStorage = global.sessionStorage
 
   beforeEach(() => {
     vi.clearAllMocks()
+    localStorage.clear()
     const sessionStorageMock: Record<string, string> = {
       'auth-token': 'test-token-abc123',
     }
@@ -572,7 +659,12 @@ describe('App Bootstrap', () => {
       },
       writable: true,
     })
-    mockApiGet.mockResolvedValue({})
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/sessions') return Promise.resolve([])
+      return Promise.resolve({})
+    })
   })
 
   afterEach(() => {
@@ -784,6 +876,7 @@ describe('Tab Switching Keyboard Shortcuts', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    localStorage.clear()
     const sessionStorageMock: Record<string, string> = {
       'auth-token': 'test-token',
     }

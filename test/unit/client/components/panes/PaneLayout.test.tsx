@@ -4,8 +4,6 @@ import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import PaneLayout from '@/components/panes/PaneLayout'
 import panesReducer from '@/store/panesSlice'
-import codingCliReducer from '@/store/codingCliSlice'
-import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import type { PanesState } from '@/store/panesSlice'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
 
@@ -78,24 +76,13 @@ function createStore(initialPanesState: Partial<PanesState> = {}) {
   return configureStore({
     reducer: {
       panes: panesReducer,
-      codingCli: codingCliReducer,
-      settings: settingsReducer,
     },
     preloadedState: {
       panes: {
         layouts: {},
         activePane: {},
         paneTitles: {},
-        paneTitleSetByUser: {},
         ...initialPanesState,
-      },
-      codingCli: {
-        sessions: {},
-        pendingRequests: {},
-      },
-      settings: {
-        settings: defaultSettings,
-        loaded: true,
       },
     },
   })

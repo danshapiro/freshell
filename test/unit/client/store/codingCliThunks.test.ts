@@ -1,7 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer from '@/store/tabsSlice'
-import panesReducer from '@/store/panesSlice'
 import codingCliReducer from '@/store/codingCliSlice'
 import { createCodingCliTab } from '@/store/codingCliThunks'
 import { cancelCodingCliRequest } from '@/store/codingCliSlice'
@@ -26,12 +25,10 @@ function createStore() {
     reducer: {
       tabs: tabsReducer,
       codingCli: codingCliReducer,
-      panes: panesReducer,
     },
     preloadedState: {
       tabs: { tabs: [], activeTabId: null },
       codingCli: { sessions: {}, pendingRequests: {} },
-      panes: { layouts: {}, activePane: {}, paneTitles: {}, paneTitleSetByUser: {} },
     },
   })
 }
@@ -52,15 +49,11 @@ describe('codingCliThunks', () => {
 
     const tabsAfterAdd = store.getState().tabs.tabs
     expect(tabsAfterAdd).toHaveLength(1)
-    const tabId = tabsAfterAdd[0].id
-    const layout = store.getState().panes.layouts[tabId]
-    expect(layout).toBeDefined()
-    expect(layout.type).toBe('leaf')
-    const pendingSessionId =
-      layout.type === 'leaf' && layout.content.kind === 'session'
-        ? layout.content.sessionId
-        : undefined
-    expect(pendingSessionId).toBeDefined()
+    const tab = tabsAfterAdd[0]
+    expect(tab.codingCliProvider).toBe('codex')
+    expect(tab.codingCliSessionId).toBeDefined()
+    expect(tab.status).toBe('creating')
+    expect(tab.mode).toBe('codex')
 
     await Promise.resolve()
 
@@ -71,22 +64,20 @@ describe('codingCliThunks', () => {
       prompt: 'Do the thing',
       cwd: undefined,
     })
-    expect(sent?.requestId).toBe(pendingSessionId)
+    expect(sent?.requestId).toBe(tab.codingCliSessionId)
 
     messageHandler?.({
       type: 'codingcli.created',
-      requestId: pendingSessionId,
+      requestId: tab.codingCliSessionId,
       sessionId: 'session-123',
       provider: 'codex',
     })
 
     await promise
 
-    const updatedLayout = store.getState().panes.layouts[tabId]
-    expect(updatedLayout.type).toBe('leaf')
-    if (updatedLayout.type === 'leaf' && updatedLayout.content.kind === 'session') {
-      expect(updatedLayout.content.sessionId).toBe('session-123')
-    }
+    const updatedTab = store.getState().tabs.tabs[0]
+    expect(updatedTab.codingCliSessionId).toBe('session-123')
+    expect(updatedTab.status).toBe('running')
     expect(store.getState().codingCli.sessions['session-123']).toBeDefined()
   })
 
@@ -97,13 +88,8 @@ describe('codingCliThunks', () => {
       createCodingCliTab({ provider: 'claude', prompt: 'Cancel me' })
     )
 
-    const tabId = store.getState().tabs.tabs[0].id
-    const layout = store.getState().panes.layouts[tabId]
-    const requestId =
-      layout.type === 'leaf' && layout.content.kind === 'session'
-        ? layout.content.sessionId
-        : ''
-    expect(requestId).not.toBe('')
+    const tab = store.getState().tabs.tabs[0]
+    const requestId = tab.codingCliSessionId as string
 
     store.dispatch(cancelCodingCliRequest({ requestId }))
 

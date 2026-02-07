@@ -7,7 +7,6 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
-import terminalActivityReducer from '@/store/terminalActivitySlice'
 import TerminalView from '@/components/TerminalView'
 import type { TerminalPaneContent } from '@/store/paneTypes'
 
@@ -68,7 +67,10 @@ describe('TerminalView - lastInputAt updates', () => {
     vi.useRealTimers()
   })
 
-  function createStore() {
+  const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
+
+  function createStore(opts?: { resumeSessionId?: string; provider?: 'claude' | 'codex' }) {
+    const provider = opts?.provider || (opts?.resumeSessionId ? 'claude' : undefined)
     return configureStore({
       reducer: {
         tabs: tabsReducer,
@@ -76,22 +78,24 @@ describe('TerminalView - lastInputAt updates', () => {
         settings: settingsReducer,
         connection: connectionReducer,
         sessionActivity: sessionActivityReducer,
-        terminalActivity: terminalActivityReducer,
       },
       preloadedState: {
         tabs: {
           tabs: [{
             id: 'tab-1',
+            createRequestId: 'req-1',
             title: 'Test Tab',
+            status: 'running' as const,
+            mode: (provider || 'shell') as const,
             createdAt: Date.now(),
+            terminalId: 'term-1',
+            codingCliProvider: provider,
           }],
           activeTabId: 'tab-1',
         },
         panes: {
           layouts: {},
           activePane: {},
-          paneTitles: {},
-          paneTitleSetByUser: {},
         },
         settings: {
           settings: defaultSettings,
@@ -103,17 +107,11 @@ describe('TerminalView - lastInputAt updates', () => {
         sessionActivity: {
           sessions: {},
         },
-        terminalActivity: {
-          lastOutputAt: {},
-          lastInputAt: {},
-          working: {},
-          finished: {},
-        },
       },
     })
   }
 
-  it('records last input time for terminal pane when user types', async () => {
+  it('dispatches updateTab with lastInputAt when user types', async () => {
     const store = createStore()
     const paneContent: TerminalPaneContent = {
       kind: 'terminal',
@@ -122,39 +120,6 @@ describe('TerminalView - lastInputAt updates', () => {
       mode: 'shell',
       shell: 'system',
       status: 'running',
-    }
-    const paneId = 'pane-1'
-
-    render(
-      <Provider store={store}>
-        <TerminalView
-          tabId="tab-1"
-          paneId={paneId}
-          paneContent={paneContent}
-        />
-      </Provider>
-    )
-
-    expect(onDataCallback).not.toBeNull()
-    const beforeInput = Date.now()
-    onDataCallback!('hello')
-    const afterInput = Date.now()
-
-    const lastInputAt = store.getState().terminalActivity.lastInputAt[paneId]
-    expect(lastInputAt).toBeGreaterThanOrEqual(beforeInput)
-    expect(lastInputAt).toBeLessThanOrEqual(afterInput)
-  })
-
-  it('updates sessionActivity for Claude sessions with resumeSessionId', async () => {
-    const store = createStore()
-    const paneContent: TerminalPaneContent = {
-      kind: 'terminal',
-      createRequestId: 'req-1',
-      terminalId: 'term-1',
-      mode: 'claude',
-      shell: 'system',
-      status: 'running',
-      resumeSessionId: 'claude-session-123',
     }
 
     render(
@@ -172,13 +137,13 @@ describe('TerminalView - lastInputAt updates', () => {
     onDataCallback!('hello')
     const afterInput = Date.now()
 
-    const sessionTime = store.getState().sessionActivity.sessions['claude:claude-session-123']
-    expect(sessionTime).toBeGreaterThanOrEqual(beforeInput)
-    expect(sessionTime).toBeLessThanOrEqual(afterInput)
+    const tab = store.getState().tabs.tabs[0]
+    expect(tab.lastInputAt).toBeGreaterThanOrEqual(beforeInput)
+    expect(tab.lastInputAt).toBeLessThanOrEqual(afterInput)
   })
 
-  it('throttles sessionActivity updates to avoid per-keystroke dispatch', async () => {
-    const store = createStore()
+  it('updates sessionActivity for Claude sessions with resumeSessionId', async () => {
+    const store = createStore({ resumeSessionId: VALID_CLAUDE_SESSION_ID })
     const paneContent: TerminalPaneContent = {
       kind: 'terminal',
       createRequestId: 'req-1',
@@ -186,7 +151,39 @@ describe('TerminalView - lastInputAt updates', () => {
       mode: 'claude',
       shell: 'system',
       status: 'running',
-      resumeSessionId: 'claude-session-123',
+      resumeSessionId: VALID_CLAUDE_SESSION_ID,
+    }
+
+    render(
+      <Provider store={store}>
+        <TerminalView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={paneContent}
+        />
+      </Provider>
+    )
+
+    expect(onDataCallback).not.toBeNull()
+    const beforeInput = Date.now()
+    onDataCallback!('hello')
+    const afterInput = Date.now()
+
+    const sessionTime = store.getState().sessionActivity.sessions[`claude:${VALID_CLAUDE_SESSION_ID}`]
+    expect(sessionTime).toBeGreaterThanOrEqual(beforeInput)
+    expect(sessionTime).toBeLessThanOrEqual(afterInput)
+  })
+
+  it('throttles sessionActivity updates to avoid per-keystroke dispatch', async () => {
+    const store = createStore({ resumeSessionId: VALID_CLAUDE_SESSION_ID })
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-1',
+      terminalId: 'term-1',
+      mode: 'claude',
+      shell: 'system',
+      status: 'running',
+      resumeSessionId: VALID_CLAUDE_SESSION_ID,
     }
 
     render(
@@ -202,23 +199,23 @@ describe('TerminalView - lastInputAt updates', () => {
     expect(onDataCallback).not.toBeNull()
 
     onDataCallback!('first')
-    const firstTime = store.getState().sessionActivity.sessions['claude:claude-session-123']
+    const firstTime = store.getState().sessionActivity.sessions[`claude:${VALID_CLAUDE_SESSION_ID}`]
 
     vi.advanceTimersByTime(1000)
     onDataCallback!('second')
-    const secondTime = store.getState().sessionActivity.sessions['claude:claude-session-123']
+    const secondTime = store.getState().sessionActivity.sessions[`claude:${VALID_CLAUDE_SESSION_ID}`]
 
     expect(secondTime).toBe(firstTime)
 
     vi.advanceTimersByTime(5000)
     onDataCallback!('third')
-    const thirdTime = store.getState().sessionActivity.sessions['claude:claude-session-123']
+    const thirdTime = store.getState().sessionActivity.sessions[`claude:${VALID_CLAUDE_SESSION_ID}`]
 
     expect(thirdTime).toBeGreaterThan(firstTime)
   })
 
   it('does not update sessionActivity for tabs without resumeSessionId', async () => {
-    const store = createStore()
+    const store = createStore({ resumeSessionId: undefined })
     const paneContent: TerminalPaneContent = {
       kind: 'terminal',
       createRequestId: 'req-1',

@@ -10,8 +10,7 @@ import {
   markWsSnapshotReceived,
   resetWsSnapshotReceived,
 } from '@/store/sessionsSlice'
-import { switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
-import { createTabWithPane } from '@/store/tabThunks'
+import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { api } from '@/lib/api'
 import { getAuthToken } from '@/lib/auth'
 import { buildShareUrl } from '@/lib/utils'
@@ -21,7 +20,6 @@ import { setClientPerfEnabled } from '@/lib/perf-logger'
 import { applyLocalTerminalFontFamily } from '@/lib/terminal-fonts'
 import { store } from '@/store/store'
 import { useThemeEffect } from '@/hooks/useTheme'
-import { buildDefaultPaneContent } from '@/lib/default-pane'
 import Sidebar, { AppView } from '@/components/Sidebar'
 import TabBar from '@/components/TabBar'
 import TabContent from '@/components/TabContent'
@@ -34,10 +32,12 @@ import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvid
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { Wifi, WifiOff, Moon, Sun, Share2, X, Copy, Check, PanelLeftClose, PanelLeft } from 'lucide-react'
 import { updateSettingsLocal, markSaved } from '@/store/settingsSlice'
+import { clearIdleWarning, recordIdleWarning } from '@/store/idleWarningsSlice'
 
 const SIDEBAR_MIN_WIDTH = 200
 const SIDEBAR_MAX_WIDTH = 500
 const MOBILE_BREAKPOINT = 768
+const EMPTY_IDLE_WARNINGS: Record<string, unknown> = {}
 
 export default function App() {
   useThemeEffect()
@@ -48,12 +48,15 @@ export default function App() {
   const connection = useAppSelector((s) => s.connection.status)
   const connectionError = useAppSelector((s) => s.connection.lastError)
   const settings = useAppSelector((s) => s.settings.settings)
+  const idleWarnings = useAppSelector((s) => (s as any).idleWarnings?.warnings ?? EMPTY_IDLE_WARNINGS)
+  const idleWarningCount = Object.keys(idleWarnings).length
 
   const [view, setView] = useState<AppView>('terminal')
   const [shareModalUrl, setShareModalUrl] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
   const [isMobile, setIsMobile] = useState(false)
   const mainContentRef = useRef<HTMLDivElement>(null)
+  const userOpenedSidebarOnMobileRef = useRef(false)
 
   // Sidebar width from settings (or local state during drag)
   const sidebarWidth = settings.sidebar?.width ?? 288
@@ -71,10 +74,14 @@ export default function App() {
 
   // Auto-collapse sidebar on mobile
   useEffect(() => {
-    if (isMobile && !sidebarCollapsed) {
+    if (!isMobile) {
+      userOpenedSidebarOnMobileRef.current = false
+      return
+    }
+    if (!sidebarCollapsed && !userOpenedSidebarOnMobileRef.current) {
       dispatch(updateSettingsLocal({ sidebar: { ...settings.sidebar, collapsed: true } }))
     }
-  }, [isMobile])
+  }, [isMobile, sidebarCollapsed, settings.sidebar, dispatch])
 
   const handleSidebarResize = useCallback((delta: number) => {
     const newWidth = Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, sidebarWidth + delta))
@@ -85,17 +92,24 @@ export default function App() {
     try {
       await api.patch('/api/settings', { sidebar: settings.sidebar })
       dispatch(markSaved())
-    } catch {}
+    } catch (err) {
+      console.warn('Failed to save sidebar settings', err)
+    }
   }, [settings.sidebar, dispatch])
 
   const toggleSidebarCollapse = useCallback(async () => {
     const newCollapsed = !sidebarCollapsed
+    if (isMobile && !newCollapsed) {
+      userOpenedSidebarOnMobileRef.current = true
+    }
     dispatch(updateSettingsLocal({ sidebar: { ...settings.sidebar, collapsed: newCollapsed } }))
     try {
       await api.patch('/api/settings', { sidebar: { ...settings.sidebar, collapsed: newCollapsed } })
       dispatch(markSaved())
-    } catch {}
-  }, [sidebarCollapsed, settings.sidebar, dispatch])
+    } catch (err) {
+      console.warn('Failed to save sidebar settings', err)
+    }
+  }, [isMobile, sidebarCollapsed, settings.sidebar, dispatch])
 
   const toggleTheme = async () => {
     const newTheme = settings.theme === 'dark' ? 'light' : settings.theme === 'light' ? 'system' : 'dark'
@@ -103,7 +117,9 @@ export default function App() {
     try {
       await api.patch('/api/settings', { theme: newTheme })
       dispatch(markSaved())
-    } catch {}
+    } catch (err) {
+      console.warn('Failed to save theme setting', err)
+    }
   }
 
   const handleShare = async () => {
@@ -171,68 +187,8 @@ export default function App() {
   // Bootstrap: load settings, sessions, and connect websocket.
   useEffect(() => {
     let cancelled = false
-    const ws = getWsClient()
-
-    // Set up hello extension to include session IDs for prioritized repair.
-    ws.setHelloExtensionProvider(() => ({
-      sessions: getSessionsForHello(store.getState()),
-    }))
-
-    // Keep message handlers registered even if the initial connect() fails.
-    // WsClient can reconnect on its own; we still want to recover UI state.
-    const unsubscribe = ws.onMessage((msg) => {
-      if (!msg?.type) return
-
-      if (msg.type === 'ready') {
-        if (!cancelled) {
-          dispatch(setError(undefined))
-          dispatch(setStatus('ready'))
-          dispatch(resetWsSnapshotReceived())
-        }
-        return
-      }
-
-      if (msg.type === 'sessions.updated') {
-        // Support chunked sessions for mobile browsers with limited WebSocket buffers.
-        if (msg.clear) {
-          dispatch(clearProjects())
-          dispatch(mergeProjects(msg.projects || []))
-        } else if (msg.append) {
-          dispatch(mergeProjects(msg.projects || []))
-        } else {
-          dispatch(setProjects(msg.projects || []))
-        }
-        dispatch(markWsSnapshotReceived())
-      }
-      if (msg.type === 'sessions.patch') {
-        dispatch(applySessionsPatch({
-          upsertProjects: msg.upsertProjects || [],
-          removeProjectPaths: msg.removeProjectPaths || [],
-        }))
-      }
-      if (msg.type === 'settings.updated') {
-        dispatch(setSettings(applyLocalTerminalFontFamily(msg.settings)))
-      }
-      if (msg.type === 'terminal.exit') {
-        const terminalId = msg.terminalId
-        const code = msg.exitCode
-        console.log('terminal exit', terminalId, code)
-      }
-      if (msg.type === 'session.status') {
-        // Log session repair status (silent for healthy/repaired, visible for problems)
-        const { sessionId, status, orphansFixed } = msg
-        if (status === 'missing') {
-          console.warn(`Session ${sessionId.slice(0, 8)}... file is missing`)
-        } else if (status === 'repaired') {
-          console.log(`Session ${sessionId.slice(0, 8)}... repaired (${orphansFixed} orphans fixed)`)
-        }
-        // For 'healthy' status, no logging needed
-      }
-      if (msg.type === 'perf.logging') {
-        setClientPerfEnabled(!!msg.enabled, 'server')
-      }
-    })
-
+    let cleanedUp = false
+    let cleanup: (() => void) | null = null
     async function bootstrap() {
       try {
         const settings = await api.get('/api/settings')
@@ -260,6 +216,81 @@ export default function App() {
         console.warn('Failed to load sessions', err)
       }
 
+      const ws = getWsClient()
+
+      // Set up hello extension to include session IDs for prioritized repair
+      ws.setHelloExtensionProvider(() => ({
+        sessions: getSessionsForHello(store.getState()),
+      }))
+
+      const unsubscribe = ws.onMessage((msg) => {
+        if (!msg?.type) return
+        if (msg.type === 'ready') {
+          // If the initial connect attempt failed before ready, WsClient may still auto-reconnect.
+          // Treat 'ready' as the source of truth for connection status.
+          dispatch(setError(undefined))
+          dispatch(setStatus('ready'))
+          dispatch(resetWsSnapshotReceived())
+        }
+        if (msg.type === 'sessions.updated') {
+          // Support chunked sessions for mobile browsers with limited WebSocket buffers
+          if (msg.clear) {
+            // First chunk: clear existing, then merge
+            dispatch(clearProjects())
+            dispatch(mergeProjects(msg.projects || []))
+          } else if (msg.append) {
+            // Subsequent chunks: merge with existing
+            dispatch(mergeProjects(msg.projects || []))
+          } else {
+            // Full update (broadcasts, legacy): replace all
+            dispatch(setProjects(msg.projects || []))
+          }
+          dispatch(markWsSnapshotReceived())
+        }
+        if (msg.type === 'sessions.patch') {
+          dispatch(applySessionsPatch({
+            upsertProjects: msg.upsertProjects || [],
+            removeProjectPaths: msg.removeProjectPaths || [],
+          }))
+        }
+        if (msg.type === 'settings.updated') {
+          dispatch(setSettings(applyLocalTerminalFontFamily(msg.settings)))
+        }
+        if (msg.type === 'terminal.exit') {
+          const terminalId = msg.terminalId
+          const code = msg.exitCode
+          if (import.meta.env.MODE === 'development') console.log('terminal exit', terminalId, code)
+          if (terminalId) dispatch(clearIdleWarning(terminalId))
+        }
+        if (msg.type === 'terminal.idle.warning') {
+          if (!msg.terminalId) return
+          dispatch(recordIdleWarning({
+            terminalId: msg.terminalId,
+            killMinutes: Number(msg.killMinutes) || 0,
+            warnMinutes: Number(msg.warnMinutes) || 0,
+            lastActivityAt: typeof msg.lastActivityAt === 'number' ? msg.lastActivityAt : undefined,
+          }))
+        }
+        if (msg.type === 'session.status') {
+          // Log session repair status (silent for healthy/repaired, visible for problems)
+          const { sessionId, status, orphansFixed } = msg
+          if (status === 'missing') {
+            if (import.meta.env.MODE === 'development') console.warn(`Session ${sessionId.slice(0, 8)}... file is missing`)
+          } else if (status === 'repaired') {
+            if (import.meta.env.MODE === 'development') console.log(`Session ${sessionId.slice(0, 8)}... repaired (${orphansFixed} orphans fixed)`)
+          }
+          // For 'healthy' status, no logging needed
+        }
+        if (msg.type === 'perf.logging') {
+          setClientPerfEnabled(!!msg.enabled, 'server')
+        }
+      })
+
+      cleanup = () => {
+        unsubscribe()
+      }
+      if (cleanedUp) cleanup()
+
       dispatch(setError(undefined))
       dispatch(setStatus('connecting'))
       try {
@@ -270,14 +301,16 @@ export default function App() {
           dispatch(setStatus('disconnected'))
           dispatch(setError(err?.message || 'WebSocket connection failed'))
         }
-        return
       }
     }
 
-    void bootstrap()
+    const cleanupPromise = bootstrap()
+
     return () => {
       cancelled = true
-      unsubscribe()
+      cleanedUp = true
+      cleanup?.()
+      void cleanupPromise
     }
   }, [dispatch])
 
@@ -319,9 +352,9 @@ export default function App() {
   // Ensure at least one tab exists for first-time users.
   useEffect(() => {
     if (tabs.length === 0) {
-      dispatch(createTabWithPane({ content: buildDefaultPaneContent(settings) }))
+      dispatch(addTab({ mode: 'shell' }))
     }
-  }, [tabs.length, settings, dispatch])
+  }, [tabs.length, dispatch])
 
   const content = (() => {
     if (view === 'sessions') return <HistoryView onOpenSession={() => setView('terminal')} />
@@ -367,6 +400,16 @@ export default function App() {
           <span className="font-mono text-base font-semibold tracking-tight">🐚🔥freshell</span>
         </div>
         <div className="flex items-center gap-1">
+          {idleWarningCount > 0 && (
+            <button
+              onClick={() => setView('overview')}
+              className="px-2 py-1 rounded-md bg-amber-100 text-amber-950 hover:bg-amber-200 transition-colors text-xs font-medium"
+              aria-label={`${idleWarningCount} terminal(s) will auto-kill soon`}
+              title="View idle terminals"
+            >
+              {idleWarningCount} terminal{idleWarningCount === 1 ? '' : 's'} will auto-kill soon
+            </button>
+          )}
           <button
             onClick={toggleTheme}
             className="p-1.5 rounded-md hover:bg-muted transition-colors"
@@ -405,7 +448,12 @@ export default function App() {
         {isMobile && !sidebarCollapsed && (
           <div
             className="absolute inset-0 bg-black/50 z-10"
+            role="presentation"
             onClick={toggleSidebarCollapse}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') toggleSidebarCollapse()
+            }}
+            tabIndex={-1}
           />
         )}
         {/* Sidebar - on mobile it overlays, on desktop it's inline */}
@@ -434,10 +482,19 @@ export default function App() {
       {shareModalUrl && (
         <div
           className="fixed inset-0 bg-black/50 flex items-center justify-center z-[60]"
+          role="presentation"
           onClick={() => setShareModalUrl(null)}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') setShareModalUrl(null)
+          }}
+          tabIndex={-1}
         >
+          {/* eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-noninteractive-element-interactions */}
           <div
             className="bg-background border border-border rounded-lg shadow-lg max-w-md w-full mx-4 p-6"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Share freshell invitation"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between mb-4">

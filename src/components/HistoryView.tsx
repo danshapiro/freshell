@@ -3,10 +3,10 @@ import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import type { CodingCliProviderName } from '@/store/types'
 import { toggleProjectExpanded, setProjects } from '@/store/sessionsSlice'
 import { api } from '@/lib/api'
-import { createTabWithPane } from '@/store/tabThunks'
+import { openSessionTab } from '@/store/tabsSlice'
 import { cn } from '@/lib/utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
-import { Search, ChevronRight, MoreHorizontal, Play, Pencil, Trash2, RefreshCw } from 'lucide-react'
+import { Search, ChevronRight, Play, Pencil, Trash2, RefreshCw } from 'lucide-react'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 
 function formatTime(ts: number) {
@@ -91,16 +91,7 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
     const label = getProviderLabel(provider)
     // TabMode now includes all CodingCliProviderName values, so this is type-safe
     const mode = (provider || 'claude') as CodingCliProviderName
-    dispatch(createTabWithPane({
-      title: title || label,
-      content: {
-        kind: 'terminal',
-        mode,
-        resumeSessionId: sessionId,
-        status: 'creating',
-        initialCwd: cwd,
-      },
-    }))
+    dispatch(openSessionTab({ sessionId, title: title || label, cwd, provider: mode }))
     onOpenSession?.()
   }
 
@@ -120,12 +111,13 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
           <button
             onClick={refresh}
             disabled={loading}
+            aria-label={loading ? 'Loading...' : 'Refresh sessions'}
             className={cn(
               'p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors',
               loading && 'animate-spin'
             )}
           >
-            <RefreshCw className="h-4 w-4" />
+            <RefreshCw className="h-4 w-4" aria-hidden="true" />
           </button>
         </div>
 
@@ -236,6 +228,7 @@ function ProjectCard({
                 onClick={() => setShowColorPicker(!showColorPicker)}
                 className="h-5 w-8 rounded border border-border/50"
                 style={{ backgroundColor: color }}
+                aria-label="Open color picker"
               />
               {showColorPicker && (
                 <input
@@ -246,8 +239,8 @@ function ProjectCard({
                     setShowColorPicker(false)
                   }}
                   className="absolute top-full left-0 mt-1"
-                  autoFocus
                   onBlur={() => setShowColorPicker(false)}
+                  aria-label="Project color picker"
                 />
               )}
             </div>
@@ -288,7 +281,6 @@ function SessionRow({
   const [editing, setEditing] = useState(false)
   const [title, setTitle] = useState(session.title || '')
   const [summary, setSummary] = useState(session.summary || '')
-  const [showActions, setShowActions] = useState(false)
 
   if (editing) {
     return (
@@ -298,13 +290,14 @@ function SessionRow({
           value={title}
           onChange={(e) => setTitle(e.target.value)}
           placeholder="Title"
-          autoFocus
+          aria-label="Session title"
         />
         <input
           className="w-full h-8 px-3 text-sm bg-background border border-border rounded-md focus:outline-none focus:ring-1 focus:ring-border"
           value={summary}
           onChange={(e) => setSummary(e.target.value)}
           placeholder="Summary"
+          aria-label="Session summary"
         />
         <div className="flex items-center gap-2">
           <button
@@ -333,16 +326,18 @@ function SessionRow({
 
   return (
     <div
-      className="group px-4 py-3 hover:bg-muted/30 transition-colors cursor-pointer"
-      onClick={onOpen}
-      onMouseEnter={() => setShowActions(true)}
-      onMouseLeave={() => setShowActions(false)}
+      className="group w-full px-4 py-3 hover:bg-muted/30 transition-colors rounded-md"
       data-context={ContextIds.HistorySession}
       data-session-id={session.sessionId}
       data-provider={session.provider}
     >
       <div className="flex items-start gap-3">
-        <div className="flex-1 min-w-0">
+        <button
+          type="button"
+          className="flex-1 min-w-0 text-left cursor-pointer"
+          onClick={onOpen}
+          aria-label={`Open session ${session.title || session.sessionId.slice(0, 8)}`}
+        >
           <div className="flex items-center gap-2">
             <span className="font-medium text-sm truncate">
               {session.title || session.sessionId.slice(0, 8)}
@@ -364,36 +359,38 @@ function SessionRow({
               {session.cwd}
             </p>
           )}
-        </div>
+        </button>
 
         {/* Actions */}
         <div
           className={cn(
-            'flex items-center gap-1 transition-opacity',
-            showActions ? 'opacity-100' : 'opacity-0'
+            'flex items-center gap-1 transition-opacity opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'
           )}
-          onClick={(e) => e.stopPropagation()}
+          role="presentation"
         >
           <button
+            type="button"
             onClick={onOpen}
             className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
-            title="Open"
+            aria-label="Open session"
           >
-            <Play className="h-3.5 w-3.5" />
+            <Play className="h-3.5 w-3.5" aria-hidden="true" />
           </button>
           <button
+            type="button"
             onClick={() => setEditing(true)}
             className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
-            title="Edit"
+            aria-label="Edit session"
           >
-            <Pencil className="h-3.5 w-3.5" />
+            <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
           </button>
           <button
+            type="button"
             onClick={onDelete}
             className="p-1.5 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
-            title="Delete"
+            aria-label="Delete session"
           >
-            <Trash2 className="h-3.5 w-3.5" />
+            <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
           </button>
         </div>
       </div>

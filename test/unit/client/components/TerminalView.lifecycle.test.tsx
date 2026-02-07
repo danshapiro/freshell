@@ -138,8 +138,11 @@ describe('TerminalView lifecycle updates', () => {
         tabs: {
           tabs: [{
             id: tabId,
+            mode: 'claude',
+            status: 'running',
             title: 'Claude',
-            createdAt: Date.now(),
+            titleSetByUser: false,
+            createRequestId: 'req-1',
           }],
           activeTabId: tabId,
         },
@@ -147,7 +150,6 @@ describe('TerminalView lifecycle updates', () => {
           layouts: { [tabId]: root },
           activePane: { [tabId]: paneId },
           paneTitles: {},
-          paneTitleSetByUser: {},
         },
         settings: { settings: defaultSettings, status: 'loaded' },
         connection: { status: 'connected', error: null },
@@ -284,8 +286,12 @@ describe('TerminalView lifecycle updates', () => {
         tabs: {
           tabs: [{
             id: tabId,
+            mode: 'claude',
+            status: 'running',
             title: 'Claude',
-            createdAt: Date.now(),
+            titleSetByUser: false,
+            terminalId: 'term-1',
+            createRequestId: 'req-2',
           }],
           activeTabId: tabId,
         },
@@ -293,7 +299,6 @@ describe('TerminalView lifecycle updates', () => {
           layouts: { [tabId]: root },
           activePane: { [tabId]: paneId },
           paneTitles: {},
-          paneTitleSetByUser: {},
         },
         settings: { settings: defaultSettings, status: 'loaded' },
         connection: { status: 'connected', error: null },

@@ -4,7 +4,6 @@ import { initLayout, addPane } from '@/store/panesSlice'
 import type { PaneContentInput } from '@/store/paneTypes'
 import PaneContainer from './PaneContainer'
 import FloatingActionButton from './FloatingActionButton'
-import { buildDefaultPaneContent } from '@/lib/default-pane'
 
 interface PaneLayoutProps {
   tabId: string
@@ -15,7 +14,6 @@ interface PaneLayoutProps {
 export default function PaneLayout({ tabId, defaultContent, hidden }: PaneLayoutProps) {
   const dispatch = useAppDispatch()
   const layout = useAppSelector((s) => s.panes.layouts[tabId])
-  const settings = useAppSelector((s) => s.settings.settings)
   const containerRef = useRef<HTMLDivElement>(null)
 
   // Initialize layout if not exists
@@ -29,9 +27,9 @@ export default function PaneLayout({ tabId, defaultContent, hidden }: PaneLayout
   const handleAddPane = useCallback(() => {
     dispatch(addPane({
       tabId,
-      newContent: buildDefaultPaneContent(settings),
+      newContent: { kind: 'picker' },
     }))
-  }, [dispatch, tabId, settings])
+  }, [dispatch, tabId])
 
   if (!layout) {
     return <div className="h-full w-full" /> // Loading state

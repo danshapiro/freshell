@@ -7,7 +7,6 @@ import tabsReducer, { TabsState } from '@/store/tabsSlice'
 import codingCliReducer, { registerCodingCliRequest } from '@/store/codingCliSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
-import terminalActivityReducer from '@/store/terminalActivitySlice'
 import type { Tab } from '@/store/types'
 
 // Mock the ws-client module
@@ -43,82 +42,44 @@ vi.mock('lucide-react', () => ({
 function createTab(overrides: Partial<Tab> = {}): Tab {
   return {
     id: `tab-${Math.random().toString(36).slice(2)}`,
+    createRequestId: 'req-1',
     title: 'Terminal 1',
+    status: 'running',
+    mode: 'shell',
+    shell: 'system',
     createdAt: Date.now(),
     ...overrides,
   }
 }
 
-type StoreOverrides = Partial<TabsState> & {
-  panes?: Partial<ReturnType<typeof panesReducer>>
-  codingCli?: Partial<ReturnType<typeof codingCliReducer>>
-  settings?: Partial<ReturnType<typeof settingsReducer>>
-  terminalActivity?: Partial<ReturnType<typeof terminalActivityReducer>>
-}
-
-function createStore(overrides: StoreOverrides = {}) {
-  const { panes, codingCli, settings, terminalActivity, ...tabsState } = overrides
+function createStore(initialState: Partial<TabsState> = {}) {
   return configureStore({
     reducer: {
       tabs: tabsReducer,
       codingCli: codingCliReducer,
       panes: panesReducer,
       settings: settingsReducer,
-      terminalActivity: terminalActivityReducer,
     },
     preloadedState: {
       tabs: {
         tabs: [],
         activeTabId: null,
-        ...tabsState,
+        ...initialState,
       },
       codingCli: {
         sessions: {},
         pendingRequests: {},
-        ...codingCli,
       },
       panes: {
         layouts: {},
         activePane: {},
-        paneTitles: {},
-        paneTitleSetByUser: {},
-        ...panes,
       },
       settings: {
         settings: defaultSettings,
         loaded: true,
-        ...settings,
-      },
-      terminalActivity: {
-        lastOutputAt: {},
-        lastInputAt: {},
-        working: {},
-        finished: {},
-        ...terminalActivity,
       },
     },
   })
-}
-
-function terminalLayoutFor(tabId: string, status: 'creating' | 'running' | 'exited' | 'error', terminalId = 'term-1') {
-  return {
-    layouts: {
-      [tabId]: {
-        type: 'leaf',
-        id: `pane-${tabId}`,
-        content: {
-          kind: 'terminal',
-          terminalId,
-          createRequestId: `req-${tabId}`,
-          status,
-          mode: 'shell',
-        },
-      },
-    },
-    activePane: { [tabId]: `pane-${tabId}` },
-    paneTitles: {},
-    paneTitleSetByUser: {},
-  }
 }
 
 function renderWithStore(
@@ -167,7 +128,7 @@ describe('TabBar', () => {
 
       renderWithStore(<TabBar />, store)
 
-      const addButton = screen.getByTitle('New tab')
+      const addButton = screen.getByTitle('New shell tab')
       expect(addButton).toBeInTheDocument()
     })
 
@@ -263,7 +224,7 @@ describe('TabBar', () => {
       expect(store.getState().tabs.activeTabId).toBe('tab-2')
     })
 
-    it('add button creates new tab with default pane', () => {
+    it('add button creates new shell tab', () => {
       const tab1 = createTab({ id: 'tab-1', title: 'Terminal 1' })
 
       const store = createStore({
@@ -274,23 +235,16 @@ describe('TabBar', () => {
       renderWithStore(<TabBar />, store)
 
       // Click the add button
-      const addButton = screen.getByTitle('New tab')
+      const addButton = screen.getByTitle('New shell tab')
       fireEvent.click(addButton)
 
       // Check that a new tab was added
       const state = store.getState().tabs
       expect(state.tabs).toHaveLength(2)
       expect(state.tabs[1].title).toBe('Tab 2')
+      expect(state.tabs[1].mode).toBe('shell')
       // New tab should become active
       expect(state.activeTabId).toBe(state.tabs[1].id)
-      // New tab should have a picker pane by default
-      const panesState = store.getState().panes
-      const layout = panesState.layouts[state.tabs[1].id]
-      expect(layout).toBeDefined()
-      expect(layout.type).toBe('leaf')
-      if (layout.type === 'leaf') {
-        expect(layout.content.kind).toBe('picker')
-      }
     })
 
     it('close button removes tab', () => {
@@ -318,29 +272,12 @@ describe('TabBar', () => {
       const tab = createTab({
         id: 'tab-1',
         title: 'Tab 1',
+        terminalId: 'term-123',
       })
 
       const store = createStore({
         tabs: [tab],
         activeTabId: 'tab-1',
-        panes: {
-          layouts: {
-            'tab-1': {
-              type: 'leaf',
-              id: 'pane-1',
-              content: {
-                kind: 'terminal',
-                terminalId: 'term-123',
-                createRequestId: 'req-1',
-                status: 'running',
-                mode: 'shell',
-              },
-            },
-          },
-          activePane: { 'tab-1': 'pane-1' },
-          paneTitles: {},
-          paneTitleSetByUser: {},
-        },
       })
 
       renderWithStore(<TabBar />, store)
@@ -358,29 +295,12 @@ describe('TabBar', () => {
       const tab = createTab({
         id: 'tab-1',
         title: 'Tab 1',
+        terminalId: 'term-456',
       })
 
       const store = createStore({
         tabs: [tab],
         activeTabId: 'tab-1',
-        panes: {
-          layouts: {
-            'tab-1': {
-              type: 'leaf',
-              id: 'pane-1',
-              content: {
-                kind: 'terminal',
-                terminalId: 'term-456',
-                createRequestId: 'req-1',
-                status: 'running',
-                mode: 'shell',
-              },
-            },
-          },
-          activePane: { 'tab-1': 'pane-1' },
-          paneTitles: {},
-          paneTitleSetByUser: {},
-        },
       })
 
       renderWithStore(<TabBar />, store)
@@ -398,29 +318,12 @@ describe('TabBar', () => {
       const tab = createTab({
         id: 'tab-1',
         title: 'Tab 1',
+        terminalId: undefined,
       })
 
       const store = createStore({
         tabs: [tab],
         activeTabId: 'tab-1',
-        panes: {
-          layouts: {
-            'tab-1': {
-              type: 'leaf',
-              id: 'pane-1',
-              content: {
-                kind: 'terminal',
-                terminalId: undefined,
-                createRequestId: 'req-1',
-                status: 'running',
-                mode: 'shell',
-              },
-            },
-          },
-          activePane: { 'tab-1': 'pane-1' },
-          paneTitles: {},
-          paneTitleSetByUser: {},
-        },
       })
 
       renderWithStore(<TabBar />, store)
@@ -460,12 +363,11 @@ describe('TabBar', () => {
     }
 
     it('shows running status indicator for running terminal', () => {
-      const tab = createTab({ id: 'tab-1' })
+      const tab = createTab({ id: 'tab-1', status: 'running' })
 
       const store = createStore({
         tabs: [tab],
         activeTabId: 'tab-1',
-        panes: terminalLayoutFor('tab-1', 'running'),
       })
 
       renderWithStore(<TabBar />, store)
@@ -479,12 +381,11 @@ describe('TabBar', () => {
     })
 
     it('shows exited status indicator for exited terminal', () => {
-      const tab = createTab({ id: 'tab-1' })
+      const tab = createTab({ id: 'tab-1', status: 'exited' })
 
       const store = createStore({
         tabs: [tab],
         activeTabId: 'tab-1',
-        panes: terminalLayoutFor('tab-1', 'exited'),
       })
 
       renderWithStore(<TabBar />, store)
@@ -497,12 +398,11 @@ describe('TabBar', () => {
     })
 
     it('shows error status indicator for error terminal', () => {
-      const tab = createTab({ id: 'tab-1' })
+      const tab = createTab({ id: 'tab-1', status: 'error' })
 
       const store = createStore({
         tabs: [tab],
         activeTabId: 'tab-1',
-        panes: terminalLayoutFor('tab-1', 'error'),
       })
 
       renderWithStore(<TabBar />, store)
@@ -515,12 +415,11 @@ describe('TabBar', () => {
     })
 
     it('shows creating status indicator (pulsing) for creating terminal', () => {
-      const tab = createTab({ id: 'tab-1' })
+      const tab = createTab({ id: 'tab-1', status: 'creating' })
 
       const store = createStore({
         tabs: [tab],
         activeTabId: 'tab-1',
-        panes: terminalLayoutFor('tab-1', 'creating'),
       })
 
       renderWithStore(<TabBar />, store)
@@ -533,27 +432,13 @@ describe('TabBar', () => {
     })
 
     it('displays correct status for multiple tabs with different statuses', () => {
-      const runningTab = createTab({ id: 'tab-1', title: 'Running' })
-      const exitedTab = createTab({ id: 'tab-2', title: 'Exited' })
-      const errorTab = createTab({ id: 'tab-3', title: 'Error' })
+      const runningTab = createTab({ id: 'tab-1', status: 'running', title: 'Running' })
+      const exitedTab = createTab({ id: 'tab-2', status: 'exited', title: 'Exited' })
+      const errorTab = createTab({ id: 'tab-3', status: 'error', title: 'Error' })
 
       const store = createStore({
         tabs: [runningTab, exitedTab, errorTab],
         activeTabId: 'tab-1',
-        panes: {
-          layouts: {
-            'tab-1': terminalLayoutFor('tab-1', 'running').layouts['tab-1'],
-            'tab-2': terminalLayoutFor('tab-2', 'exited').layouts['tab-2'],
-            'tab-3': terminalLayoutFor('tab-3', 'error').layouts['tab-3'],
-          },
-          activePane: {
-            'tab-1': 'pane-tab-1',
-            'tab-2': 'pane-tab-2',
-            'tab-3': 'pane-tab-3',
-          },
-          paneTitles: {},
-          paneTitleSetByUser: {},
-        },
       })
 
       renderWithStore(<TabBar />, store)

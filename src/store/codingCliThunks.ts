@@ -1,12 +1,10 @@
 import { createAsyncThunk } from '@reduxjs/toolkit'
 import { getWsClient } from '@/lib/ws-client'
-import { updatePaneContent } from './panesSlice'
-import { createTabWithPane } from './tabThunks'
-import { createCodingCliSession, registerCodingCliRequest, resolveCodingCliRequest, setCodingCliSessionStatus } from './codingCliSlice'
+import { addTab, updateTab } from './tabsSlice'
+import { createCodingCliSession, registerCodingCliRequest, resolveCodingCliRequest } from './codingCliSlice'
 import type { RootState } from './store'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import { nanoid } from 'nanoid'
-import { findPaneContent, findPaneIdByContent } from '@/lib/pane-utils'
 
 export const createCodingCliTab = createAsyncThunk(
   'codingCli/createTab',
@@ -18,26 +16,29 @@ export const createCodingCliTab = createAsyncThunk(
 
     dispatch(registerCodingCliRequest({ requestId, provider, prompt, cwd }))
 
-    const title = prompt.slice(0, 30) + (prompt.length > 30 ? '...' : '')
-    const tabId = nanoid()
-    dispatch(createTabWithPane({
-      tabId,
-      title,
-      content: {
-        kind: 'session',
-        sessionId: requestId,
-        provider,
-        title,
-      },
-    }))
+    dispatch(
+      addTab({
+        title: prompt.slice(0, 30) + (prompt.length > 30 ? '...' : ''),
+        mode: provider,
+        status: 'creating',
+        initialCwd: cwd,
+        codingCliProvider: provider,
+        codingCliSessionId: requestId,
+        createRequestId: requestId,
+      })
+    )
+
+    const state = getState() as RootState
+    const createdTabId = state.tabs.tabs.find((t) => t.codingCliSessionId === requestId)?.id
 
     const ws = getWsClient()
     try {
       await ws.connect()
     } catch (err) {
       dispatch(resolveCodingCliRequest({ requestId }))
-      dispatch(createCodingCliSession({ sessionId: requestId, provider, prompt, cwd }))
-      dispatch(setCodingCliSessionStatus({ sessionId: requestId, status: 'error' }))
+      if (createdTabId) {
+        dispatch(updateTab({ id: createdTabId, updates: { status: 'error' } }))
+      }
       throw err
     }
 
@@ -60,27 +61,17 @@ export const createCodingCliTab = createAsyncThunk(
               cwd,
             })
           )
-          const state = getState() as RootState
-          const layout = state.panes.layouts[tabId]
-          if (layout) {
-            const paneId = findPaneIdByContent(
-              layout,
-              (content) => content.kind === 'session' && content.sessionId === requestId
+          if (createdTabId) {
+            dispatch(
+              updateTab({
+                id: createdTabId,
+                updates: {
+                  codingCliSessionId: msg.sessionId,
+                  codingCliProvider: provider,
+                  status: 'running',
+                },
+              })
             )
-            if (paneId) {
-              const content = findPaneContent(layout, paneId)
-              if (content?.kind === 'session') {
-                dispatch(updatePaneContent({
-                  tabId,
-                  paneId,
-                  content: {
-                    ...content,
-                    sessionId: msg.sessionId,
-                    provider,
-                  },
-                }))
-              }
-            }
           }
           resolve(msg.sessionId)
         }
@@ -88,9 +79,13 @@ export const createCodingCliTab = createAsyncThunk(
           const canceled = (getState() as RootState).codingCli.pendingRequests[requestId]?.canceled
           dispatch(resolveCodingCliRequest({ requestId }))
           unsub()
-          if (!canceled) {
-            dispatch(createCodingCliSession({ sessionId: requestId, provider, prompt, cwd }))
-            dispatch(setCodingCliSessionStatus({ sessionId: requestId, status: 'error' }))
+          if (!canceled && createdTabId) {
+            dispatch(
+              updateTab({
+                id: createdTabId,
+                updates: { status: 'error' },
+              })
+            )
           }
           reject(new Error(canceled ? 'Canceled' : msg.message))
         }

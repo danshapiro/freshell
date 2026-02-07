@@ -18,30 +18,6 @@ describe('derivePaneTitle', () => {
     expect(derivePaneTitle(content)).toBe('Browser')
   })
 
-  it('returns file name for editor with filePath', () => {
-    const content: PaneContent = {
-      kind: 'editor',
-      filePath: '/Users/test/project/README.md',
-      language: 'markdown',
-      readOnly: false,
-      content: '',
-      viewMode: 'source',
-    }
-    expect(derivePaneTitle(content)).toBe('README.md')
-  })
-
-  it('returns "Editor" for editor without filePath', () => {
-    const content: PaneContent = {
-      kind: 'editor',
-      filePath: null,
-      language: null,
-      readOnly: false,
-      content: '',
-      viewMode: 'source',
-    }
-    expect(derivePaneTitle(content)).toBe('Editor')
-  })
-
   it('returns "Shell" for shell mode terminal', () => {
     const content: PaneContent = {
       kind: 'terminal',

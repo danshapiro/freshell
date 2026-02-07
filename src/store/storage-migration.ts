@@ -12,7 +12,7 @@
 // - Any persisted state shape changes incompatibly
 // ============================================================
 
-const STORAGE_VERSION = 4 // Incremented for pane title tracking changes
+const STORAGE_VERSION = 2 // Incremented for multi-CLI architecture
 
 function runStorageMigration() {
   try {

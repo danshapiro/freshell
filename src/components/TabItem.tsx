@@ -1,16 +1,12 @@
 import { X, Circle } from 'lucide-react'
+import { useRef, useEffect } from 'react'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
-import type { Tab, TerminalStatus } from '@/store/types'
+import type { Tab } from '@/store/types'
 import type { MouseEvent, KeyboardEvent } from 'react'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 
-function StatusIndicator({ status, isWorking }: { status: TerminalStatus; isWorking: boolean }) {
-  // Working state: pulsing grey (terminal is streaming)
-  if (isWorking) {
-    return <Circle className="h-2 w-2 fill-muted-foreground text-muted-foreground animate-pulse" />
-  }
-  // Ready state (default): green dot for running terminals
+function StatusIndicator({ status }: { status: string }) {
   if (status === 'running') {
     return <Circle className="h-2 w-2 fill-success text-success" />
   }
@@ -26,12 +22,9 @@ function StatusIndicator({ status, isWorking }: { status: TerminalStatus; isWork
 
 export interface TabItemProps {
   tab: Tab
-  status: TerminalStatus
   isActive: boolean
   isDragging: boolean
   isRenaming: boolean
-  isWorking: boolean
-  isFinished: boolean
   renameValue: string
   onRenameChange: (value: string) => void
   onRenameBlur: () => void
@@ -43,12 +36,9 @@ export interface TabItemProps {
 
 export default function TabItem({
   tab,
-  status,
   isActive,
   isDragging,
   isRenaming,
-  isWorking,
-  isFinished,
   renameValue,
   onRenameChange,
   onRenameBlur,
@@ -57,6 +47,14 @@ export default function TabItem({
   onClick,
   onDoubleClick,
 }: TabItemProps) {
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    if (isRenaming && inputRef.current) {
+      inputRef.current.focus()
+    }
+  }, [isRenaming])
+
   return (
     <div
       className={cn(
@@ -64,22 +62,29 @@ export default function TabItem({
         isActive
           ? 'bg-background text-foreground shadow-sm'
           : 'bg-muted text-muted-foreground hover:text-foreground hover:bg-accent mt-1',
-        isDragging && 'opacity-50',
-        // Finished state: green ring on background tabs that need attention
-        isFinished && !isActive && 'ring-2 ring-success'
+        isDragging && 'opacity-50'
       )}
+      role="button"
+      tabIndex={0}
+      aria-label={tab.title}
       data-context={ContextIds.Tab}
       data-tab-id={tab.id}
       onClick={onClick}
       onDoubleClick={onDoubleClick}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          onClick()
+        }
+      }}
     >
-      <StatusIndicator status={status} isWorking={isWorking} />
+      <StatusIndicator status={tab.status} />
 
       {isRenaming ? (
         <input
+          ref={inputRef}
           className="bg-transparent outline-none w-32 text-sm"
           value={renameValue}
-          autoFocus
           onChange={(e) => onRenameChange(e.target.value)}
           onBlur={onRenameBlur}
           onKeyDown={onRenameKeyDown}

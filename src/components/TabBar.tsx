@@ -1,12 +1,11 @@
 import { Plus } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { setActiveTab, updateTab, reorderTabs, clearTabRenameRequest } from '@/store/tabsSlice'
-import { closeTabWithCleanup, createTabWithPane } from '@/store/tabThunks'
+import { addTab, closeTab, setActiveTab, updateTab, reorderTabs, clearTabRenameRequest } from '@/store/tabsSlice'
+import { getWsClient } from '@/lib/ws-client'
 import { getTabDisplayTitle } from '@/lib/tab-title'
-import { collectTerminalPanes, collectSessionPanes, deriveTabStatus } from '@/lib/pane-utils'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import TabItem from './TabItem'
-import { useTerminalActivityMonitor } from '@/hooks/useTerminalActivityMonitor'
+import { cancelCodingCliRequest } from '@/store/codingCliSlice'
 import {
   DndContext,
   closestCenter,
@@ -26,19 +25,15 @@ import {
   useSortable,
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
-import type { Tab, TerminalStatus } from '@/store/types'
+import type { Tab } from '@/store/types'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
-import { buildDefaultPaneContent } from '@/lib/default-pane'
 
 interface SortableTabProps {
   tab: Tab
-  status: TerminalStatus
   displayTitle: string
   isActive: boolean
   isDragging: boolean
   isRenaming: boolean
-  isWorking: boolean
-  isFinished: boolean
   renameValue: string
   onRenameChange: (value: string) => void
   onRenameBlur: () => void
@@ -50,13 +45,10 @@ interface SortableTabProps {
 
 function SortableTab({
   tab,
-  status,
   displayTitle,
   isActive,
   isDragging,
   isRenaming,
-  isWorking,
-  isFinished,
   renameValue,
   onRenameChange,
   onRenameBlur,
@@ -88,12 +80,9 @@ function SortableTab({
     <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
       <TabItem
         tab={tabWithDisplayTitle}
-        status={status}
         isActive={isActive}
         isDragging={isDragging}
         isRenaming={isRenaming}
-        isWorking={isWorking}
-        isFinished={isFinished}
         renameValue={renameValue}
         onRenameChange={onRenameChange}
         onRenameBlur={onRenameBlur}
@@ -108,68 +97,25 @@ function SortableTab({
 
 // Stable empty object to avoid creating new references
 const EMPTY_LAYOUTS: Record<string, never> = {}
-const EMPTY_PANE_TITLES: Record<string, Record<string, string>> = {}
-const EMPTY_ACTIVE_PANES: Record<string, string> = {}
 
 export default function TabBar() {
   const dispatch = useAppDispatch()
-  const tabsState = useAppSelector((s) => s.tabs)
-  const tabs = tabsState?.tabs ?? []
+  const tabsState = useAppSelector((s) => s.tabs as any) as
+    | { tabs?: Tab[]; activeTabId?: string | null; renameRequestTabId?: string | null }
+    | undefined
+  const tabs = useMemo(() => tabsState?.tabs ?? [], [tabsState?.tabs])
   const activeTabId = tabsState?.activeTabId ?? null
   const renameRequestTabId = tabsState?.renameRequestTabId ?? null
   const paneLayouts = useAppSelector((s) => s.panes?.layouts) ?? EMPTY_LAYOUTS
-  const paneTitles = useAppSelector((s) => s.panes?.paneTitles) ?? EMPTY_PANE_TITLES
-  const activePanes = useAppSelector((s) => s.panes?.activePane) ?? EMPTY_ACTIVE_PANES
-  const pendingRequests = useAppSelector((s) => s.codingCli.pendingRequests)
-  const codingCliSessions = useAppSelector((s) => s.codingCli.sessions)
-  const settings = useAppSelector((s) => s.settings.settings)
 
-  // Monitor terminal activity for working/ready indicators
-  const { tabActivityStates } = useTerminalActivityMonitor()
+  const ws = useMemo(() => getWsClient(), [])
 
   // Compute display title for a single tab
   // Priority: user-set title > programmatically-set title (e.g., from Claude) > derived name
   const getDisplayTitle = useCallback(
-    (tab: Tab): string =>
-      getTabDisplayTitle(tab, paneLayouts[tab.id], paneTitles[tab.id], activePanes[tab.id]),
-    [paneLayouts, paneTitles, activePanes]
+    (tab: Tab): string => getTabDisplayTitle(tab, paneLayouts[tab.id]),
+    [paneLayouts]
   )
-
-  const getTabStatus = useCallback((tabId: string): TerminalStatus => {
-    const layout = paneLayouts[tabId]
-    if (!layout) return 'creating'
-
-    const terminalPanes = collectTerminalPanes(layout)
-    if (terminalPanes.length > 0) {
-      return deriveTabStatus(layout)
-    }
-
-    const sessionPanes = collectSessionPanes(layout)
-    if (sessionPanes.length === 0) return 'running'
-
-    let hasRunning = false
-    let hasCreating = false
-    let hasError = false
-    let hasExited = false
-
-    for (const session of sessionPanes) {
-      const sessionId = session.content.sessionId
-      if (pendingRequests[sessionId]) {
-        hasCreating = true
-        continue
-      }
-      const status = codingCliSessions[sessionId]?.status
-      if (status === 'running') hasRunning = true
-      else if (status === 'error') hasError = true
-      else if (status === 'completed') hasExited = true
-    }
-
-    if (hasRunning) return 'running'
-    if (hasCreating) return 'creating'
-    if (hasError) return 'error'
-    if (hasExited) return 'exited'
-    return 'running'
-  }, [paneLayouts, pendingRequests, codingCliSessions])
 
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
@@ -252,55 +198,61 @@ export default function TabBar() {
           strategy={horizontalListSortingStrategy}
         >
           <div className="flex items-end gap-0.5 overflow-x-auto flex-1">
-            {tabs.map((tab: Tab) => {
-              const activityState = tabActivityStates[tab.id] ?? { isFinished: false }
-              const status = getTabStatus(tab.id)
-              return (
-                <SortableTab
-                  key={tab.id}
-                  tab={tab}
-                  status={status}
-                  displayTitle={getDisplayTitle(tab)}
-                  isActive={tab.id === activeTabId}
-                  isDragging={activeId === tab.id}
-                  isRenaming={renamingId === tab.id}
-                  isWorking={activityState.isWorking}
-                  isFinished={activityState.isFinished}
-                  renameValue={renameValue}
-                  onRenameChange={setRenameValue}
-                  onRenameBlur={() => {
-                    dispatch(
-                      updateTab({
-                        id: tab.id,
-                        updates: { title: renameValue || tab.title, titleSetByUser: true },
+            {tabs.map((tab: Tab) => (
+              <SortableTab
+                key={tab.id}
+                tab={tab}
+                displayTitle={getDisplayTitle(tab)}
+                isActive={tab.id === activeTabId}
+                isDragging={activeId === tab.id}
+                isRenaming={renamingId === tab.id}
+                renameValue={renameValue}
+                onRenameChange={setRenameValue}
+                onRenameBlur={() => {
+                  dispatch(
+                    updateTab({
+                      id: tab.id,
+                      updates: { title: renameValue || tab.title, titleSetByUser: true },
+                    })
+                  )
+                  setRenamingId(null)
+                }}
+                onRenameKeyDown={(e) => {
+                  e.stopPropagation() // Prevent dnd-kit from intercepting keys (esp. space)
+                  if (e.key === 'Enter' || e.key === 'Escape') {
+                    ;(e.target as HTMLInputElement).blur()
+                  }
+                }}
+                onClose={(e) => {
+                  if (tab.terminalId) {
+                    ws.send({
+                      type: e.shiftKey ? 'terminal.kill' : 'terminal.detach',
+                      terminalId: tab.terminalId,
+                    })
+                  } else if (tab.codingCliSessionId) {
+                    if (tab.status === 'creating') {
+                      dispatch(cancelCodingCliRequest({ requestId: tab.codingCliSessionId }))
+                    } else {
+                      ws.send({
+                        type: 'codingcli.kill',
+                        sessionId: tab.codingCliSessionId,
                       })
-                    )
-                    setRenamingId(null)
-                  }}
-                  onRenameKeyDown={(e) => {
-                    e.stopPropagation() // Prevent dnd-kit from intercepting keys (esp. space)
-                    if (e.key === 'Enter' || e.key === 'Escape') {
-                      ;(e.target as HTMLInputElement).blur()
                     }
-                  }}
-                  onClose={(e) => {
-                    dispatch(closeTabWithCleanup({ tabId: tab.id, killTerminals: e.shiftKey }))
-                  }}
-                  onClick={() => dispatch(setActiveTab(tab.id))}
-                  onDoubleClick={() => {
-                    setRenamingId(tab.id)
-                    setRenameValue(getDisplayTitle(tab))
-                  }}
-                />
-              )
-            })}
+                  }
+                  dispatch(closeTab(tab.id))
+                }}
+                onClick={() => dispatch(setActiveTab(tab.id))}
+                onDoubleClick={() => {
+                  setRenamingId(tab.id)
+                  setRenameValue(getDisplayTitle(tab))
+                }}
+              />
+            ))}
             <button
               className="flex-shrink-0 ml-1 mb-1 p-1 rounded-md border border-dashed border-muted-foreground/40 text-muted-foreground hover:text-foreground hover:border-foreground/50 hover:bg-muted/30 transition-colors"
-              title="New tab"
-              aria-label="New tab"
-              onClick={() =>
-                dispatch(createTabWithPane({ content: buildDefaultPaneContent(settings) }))
-              }
+              title="New shell tab"
+              aria-label="New shell tab"
+              onClick={() => dispatch(addTab({ mode: 'shell' }))}
               data-context={ContextIds.TabAdd}
             >
               <Plus className="h-3.5 w-3.5" />
@@ -320,12 +272,9 @@ export default function TabBar() {
             >
               <TabItem
                 tab={{ ...activeTab, title: getDisplayTitle(activeTab) }}
-                status={getTabStatus(activeTab.id)}
                 isActive={activeTab.id === activeTabId}
                 isDragging={false}
                 isRenaming={false}
-                isWorking={tabActivityStates[activeTab.id]?.isWorking ?? false}
-                isFinished={tabActivityStates[activeTab.id]?.isFinished ?? false}
                 renameValue=""
                 onRenameChange={() => {}}
                 onRenameBlur={() => {}}

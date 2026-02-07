@@ -30,7 +30,6 @@ describe('panesSlice', () => {
       layouts: {},
       activePane: {},
       paneTitles: {},
-      paneTitleSetByUser: {},
     }
     mockIdCounter = 0
     vi.clearAllMocks()
@@ -707,15 +706,12 @@ describe('panesSlice', () => {
         layouts: { 'tab-1': layout },
         activePane: { 'tab-1': 'pane-1' },
         paneTitles: { 'tab-1': { 'pane-1': 'First', 'pane-2': 'Second' } },
-        paneTitleSetByUser: { 'tab-1': { 'pane-1': true, 'pane-2': true } },
       }
 
       const result = panesReducer(state, closePane({ tabId: 'tab-1', paneId: 'pane-1' }))
 
       expect(result.paneTitles['tab-1']['pane-1']).toBeUndefined()
       expect(result.paneTitles['tab-1']['pane-2']).toBe('Second')
-      expect(result.paneTitleSetByUser['tab-1']?.['pane-1']).toBeUndefined()
-      expect(result.paneTitleSetByUser['tab-1']?.['pane-2']).toBe(true)
     })
   })
 
@@ -937,31 +933,6 @@ describe('panesSlice', () => {
       expect(firstPane.content).toEqual(content3)
     })
 
-    it('clears title overrides when pane kind changes', () => {
-      const content1: PaneContent = { kind: 'terminal', mode: 'shell' }
-      const content2: PaneContent = { kind: 'browser', url: 'https://example.com', devToolsOpen: false }
-
-      let state = panesReducer(
-        initialState,
-        initLayout({ tabId: 'tab-1', content: content1 })
-      )
-      const paneId = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).id
-
-      state = {
-        ...state,
-        paneTitles: { 'tab-1': { [paneId]: 'Custom Title' } },
-        paneTitleSetByUser: { 'tab-1': { [paneId]: true } },
-      }
-
-      const result = panesReducer(
-        state,
-        updatePaneContent({ tabId: 'tab-1', paneId, content: content2 })
-      )
-
-      expect(result.paneTitles['tab-1']?.[paneId]).toBeUndefined()
-      expect(result.paneTitleSetByUser['tab-1']?.[paneId]).toBeUndefined()
-    })
-
     it('does nothing if tab layout does not exist', () => {
       const content: PaneContent = { kind: 'terminal', mode: 'shell' }
       const state = panesReducer(
@@ -1062,13 +1033,11 @@ describe('panesSlice', () => {
         },
         activePane: { 'tab-1': 'pane-1' },
         paneTitles: { 'tab-1': { 'pane-1': 'My Title' } },
-        paneTitleSetByUser: { 'tab-1': { 'pane-1': true } },
       }
 
       const result = panesReducer(state, removeLayout({ tabId: 'tab-1' }))
 
       expect(result.paneTitles['tab-1']).toBeUndefined()
-      expect(result.paneTitleSetByUser['tab-1']).toBeUndefined()
     })
 
     it('preserves paneTitles for other tabs when removing one', () => {
@@ -1079,15 +1048,12 @@ describe('panesSlice', () => {
         },
         activePane: { 'tab-1': 'pane-1', 'tab-2': 'pane-2' },
         paneTitles: { 'tab-1': { 'pane-1': 'Title 1' }, 'tab-2': { 'pane-2': 'Title 2' } },
-        paneTitleSetByUser: { 'tab-1': { 'pane-1': true }, 'tab-2': { 'pane-2': true } },
       }
 
       const result = panesReducer(state, removeLayout({ tabId: 'tab-1' }))
 
       expect(result.paneTitles['tab-1']).toBeUndefined()
       expect(result.paneTitles['tab-2']).toEqual({ 'pane-2': 'Title 2' })
-      expect(result.paneTitleSetByUser['tab-1']).toBeUndefined()
-      expect(result.paneTitleSetByUser['tab-2']).toEqual({ 'pane-2': true })
     })
   })
 
@@ -1116,7 +1082,6 @@ describe('panesSlice', () => {
           'tab-2': 'pane-saved-3',
         },
         paneTitles: {},
-        paneTitleSetByUser: {},
       }
 
       const state = panesReducer(initialState, hydratePanes(savedState))
@@ -1129,7 +1094,6 @@ describe('panesSlice', () => {
         layouts: {},
         activePane: {},
         paneTitles: {},
-        paneTitleSetByUser: {},
       }
 
       const state = panesReducer(initialState, hydratePanes(savedState))
@@ -1137,7 +1101,6 @@ describe('panesSlice', () => {
       expect(state.layouts).toEqual({})
       expect(state.activePane).toEqual({})
       expect(state.paneTitles).toEqual({})
-      expect(state.paneTitleSetByUser).toEqual({})
     })
 
     it('preserves complex nested structures', () => {
@@ -1167,7 +1130,6 @@ describe('panesSlice', () => {
           'tab-1': 'pane-2',
         },
         paneTitles: {},
-        paneTitleSetByUser: {},
       }
 
       const state = panesReducer(initialState, hydratePanes(savedState))
@@ -1189,13 +1151,11 @@ describe('panesSlice', () => {
         },
         activePane: { 'tab-1': 'pane-1' },
         paneTitles: { 'tab-1': { 'pane-1': 'My Shell' } },
-        paneTitleSetByUser: { 'tab-1': { 'pane-1': true } },
       }
 
       const state = panesReducer(initialState, hydratePanes(savedState))
 
       expect(state.paneTitles).toEqual({ 'tab-1': { 'pane-1': 'My Shell' } })
-      expect(state.paneTitleSetByUser).toEqual({ 'tab-1': { 'pane-1': true } })
     })
 
     it('handles missing paneTitles in persisted state', () => {
@@ -1208,7 +1168,6 @@ describe('panesSlice', () => {
       const state = panesReducer(initialState, hydratePanes(savedStateWithoutTitles))
 
       expect(state.paneTitles).toEqual({})
-      expect(state.paneTitleSetByUser).toEqual({})
     })
   })
 
@@ -1582,7 +1541,6 @@ describe('panesSlice', () => {
         layouts: { 'tab-1': initialLayout },
         activePane: { 'tab-1': 'pane-1' },
         paneTitles: {},
-        paneTitleSetByUser: {},
       }
 
       const result = panesReducer(state, updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-1', title: 'My Terminal' }))
@@ -1591,30 +1549,11 @@ describe('panesSlice', () => {
       expect(result.paneTitles['tab-1']['pane-1']).toBe('My Terminal')
     })
 
-    it('does not override user-set titles with automatic updates', () => {
-      const initialLayout: PaneNode = {
-        type: 'leaf',
-        id: 'pane-1',
-        content: { kind: 'terminal', createRequestId: 'req-1', status: 'running', mode: 'shell' },
-      }
-      const state: PanesState = {
-        layouts: { 'tab-1': initialLayout },
-        activePane: { 'tab-1': 'pane-1' },
-        paneTitles: { 'tab-1': { 'pane-1': 'User Title' } },
-        paneTitleSetByUser: { 'tab-1': { 'pane-1': true } },
-      }
-
-      const result = panesReducer(state, updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-1', title: 'Auto Title' }))
-
-      expect(result.paneTitles['tab-1']['pane-1']).toBe('User Title')
-    })
-
     it('preserves other pane titles when updating one', () => {
       const state: PanesState = {
         layouts: {},
         activePane: {},
         paneTitles: { 'tab-1': { 'pane-2': 'Other Pane' } },
-        paneTitleSetByUser: { 'tab-1': { 'pane-2': true } },
       }
 
       const result = panesReducer(state, updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-1', title: 'First Pane' }))
@@ -1625,7 +1564,7 @@ describe('panesSlice', () => {
   })
 
   describe('splitPane title initialization', () => {
-    it('does not create title overrides for new panes', () => {
+    it('initializes title for new pane using derivePaneTitle', () => {
       const leaf: PaneNode = {
         type: 'leaf',
         id: 'pane-1',
@@ -1635,7 +1574,6 @@ describe('panesSlice', () => {
         layouts: { 'tab-1': leaf },
         activePane: { 'tab-1': 'pane-1' },
         paneTitles: {},
-        paneTitleSetByUser: {},
       }
 
       const result = panesReducer(state, splitPane({
@@ -1647,12 +1585,12 @@ describe('panesSlice', () => {
 
       // Find the new pane ID (it's the active pane after split)
       const newPaneId = result.activePane['tab-1']
-      expect(result.paneTitles['tab-1']?.[newPaneId]).toBeUndefined()
+      expect(result.paneTitles['tab-1'][newPaneId]).toBe('Claude')
     })
   })
 
   describe('addPane title initialization', () => {
-    it('does not create title overrides for new panes', () => {
+    it('initializes title for new pane using derivePaneTitle', () => {
       const leaf: PaneNode = {
         type: 'leaf',
         id: 'pane-1',
@@ -1662,7 +1600,6 @@ describe('panesSlice', () => {
         layouts: { 'tab-1': leaf },
         activePane: { 'tab-1': 'pane-1' },
         paneTitles: {},
-        paneTitleSetByUser: {},
       }
 
       const result = panesReducer(state, addPane({
@@ -1671,7 +1608,7 @@ describe('panesSlice', () => {
       }))
 
       const newPaneId = result.activePane['tab-1']
-      expect(result.paneTitles['tab-1']?.[newPaneId]).toBeUndefined()
+      expect(result.paneTitles['tab-1'][newPaneId]).toBe('Codex')
     })
   })
 

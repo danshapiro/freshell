@@ -19,9 +19,21 @@ export type ShellType = 'system' | 'cmd' | 'powershell' | 'wsl'
 
 export interface Tab {
   id: string
+  createRequestId: string
   title: string
+  description?: string
+  terminalId?: string          // For shell mode
+  codingCliSessionId?: string  // For coding CLI session view
+  codingCliProvider?: CodingCliProviderName
+  claudeSessionId?: string     // Legacy field (migrated to codingCliSessionId)
+  status: TerminalStatus
+  mode: TabMode
+  shell?: ShellType
+  initialCwd?: string
+  resumeSessionId?: string     // Compatibility-only seed for initial pane; pane content is authoritative (do not mutate after creation)
   createdAt: number
   titleSetByUser?: boolean     // If true, don't auto-update title
+  lastInputAt?: number
 }
 
 export interface BackgroundTerminal {
@@ -70,7 +82,7 @@ export interface TerminalOverride {
   deleted?: boolean
 }
 
-export type SidebarSortMode = 'recency' | 'activity' | 'project'
+export type SidebarSortMode = 'recency' | 'recency-pinned' | 'activity' | 'project'
 
 export type DefaultNewPane = 'ask' | 'shell' | 'browser' | 'editor'
 
@@ -111,6 +123,9 @@ export interface AppSettings {
     theme: TerminalTheme
   }
   defaultCwd?: string
+  logging: {
+    debug: boolean
+  }
   safety: {
     autoKillIdleMinutes: number
     warnBeforeKillMinutes: number
@@ -124,13 +139,5 @@ export interface AppSettings {
   codingCli: CodingCliSettings
   panes: {
     defaultNewPane: DefaultNewPane
-  }
-  notifications: {
-    /** Show pulsing indicator on tab when terminal is actively streaming output */
-    visualWhenWorking: boolean
-    /** Show "ready" badge on tab when streaming finishes (clears when tab is selected) */
-    visualWhenFinished: boolean
-    /** Play sound when streaming finishes on a background tab */
-    soundWhenFinished: boolean
   }
 }

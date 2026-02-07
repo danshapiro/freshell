@@ -1,20 +1,18 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Terminal, History, Settings, LayoutGrid, Search, Loader2, X, Archive } from 'lucide-react'
 import { List, type RowComponentProps } from 'react-window'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
-import { ProviderIcon } from '@/components/icons/provider-icons'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { setActiveTab } from '@/store/tabsSlice'
-import { createTabWithPane } from '@/store/tabThunks'
+import { openSessionTab } from '@/store/tabsSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { searchSessions, type SearchResult } from '@/lib/api'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import type { BackgroundTerminal, CodingCliProviderName } from '@/store/types'
-import type { PaneNode } from '@/store/paneTypes'
 import { makeSelectSortedSessionItems, type SidebarSessionItem } from '@/store/selectors/sidebarSelectors'
-import { collectTerminalPanes, findPaneByTerminalId } from '@/lib/pane-utils'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
+import { ProviderIcon } from '@/components/icons/provider-icons'
+import { getActiveSessionRefForTab } from '@/lib/session-utils'
 
 export type AppView = 'terminal' | 'sessions' | 'overview' | 'settings'
 
@@ -22,7 +20,6 @@ type SessionItem = SidebarSessionItem
 
 const SESSION_ITEM_HEIGHT = 56
 const SESSION_LIST_MAX_HEIGHT = 600
-const EMPTY_LAYOUTS: Record<string, PaneNode> = {}
 
 function formatRelativeTime(timestamp: number): string {
   const now = Date.now()
@@ -53,9 +50,16 @@ export default function Sidebar({
   width?: number
 }) {
   const dispatch = useAppDispatch()
-  const settings = useAppSelector((s) => s.settings?.settings)
-  const activeTabId = useAppSelector((s) => s.tabs?.activeTabId ?? null)
-  const panes = useAppSelector((s) => s.panes?.layouts) ?? EMPTY_LAYOUTS
+  const settings = useAppSelector((s) => s.settings.settings)
+  const tabs = useAppSelector((s) => s.tabs.tabs)
+  const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
+  const activeSessionKeyFromPanes = useAppSelector((s) => {
+    const tabId = s.tabs.activeTabId
+    if (!tabId) return null
+    const ref = getActiveSessionRefForTab(s, tabId)
+    if (!ref) return null
+    return `${ref.provider}:${ref.sessionId}`
+  })
   const selectSortedItems = useMemo(() => makeSelectSortedSessionItems(), [])
 
   const ws = useMemo(() => getWsClient(), [])
@@ -69,11 +73,11 @@ export default function Sidebar({
   const [listHeight, setListHeight] = useState(0)
 
   // Fetch background terminals
-  const refresh = () => {
+  const refresh = useCallback(() => {
     const requestId = `list-${Date.now()}`
     requestIdRef.current = requestId
     ws.send({ type: 'terminal.list', requestId })
-  }
+  }, [ws])
 
   useEffect(() => {
     ws.connect().catch(() => {})
@@ -94,12 +98,13 @@ export default function Sidebar({
       unsub()
       window.clearInterval(interval)
     }
-  }, [ws])
+  }, [ws, refresh])
 
   // Backend search for non-title tiers
   useEffect(() => {
     if (!filter.trim() || searchTier === 'title') {
       setSearchResults(null)
+      setIsSearching(false)
       return
     }
 
@@ -129,6 +134,7 @@ export default function Sidebar({
     return () => {
       controller.abort()
       clearTimeout(timeoutId)
+      setIsSearching(false)
     }
   }, [filter, searchTier])
 
@@ -163,7 +169,6 @@ export default function Sidebar({
           archived: result.archived,
           cwd: result.cwd,
           hasTab: existing?.hasTab ?? false,
-          tabLastInputAt: existing?.tabLastInputAt,
           ratchetedActivity: existing?.ratchetedActivity,
           isRunning: existing?.isRunning ?? false,
           runningTerminalId: existing?.runningTerminalId,
@@ -194,57 +199,17 @@ export default function Sidebar({
     return () => ro.disconnect()
   }, [])
 
-  const handleItemClick = (item: SessionItem) => {
+  const handleItemClick = useCallback((item: SessionItem) => {
     const provider = item.provider as CodingCliProviderName
-    if (item.isRunning && item.runningTerminalId) {
-      // Session is running - check if tab with this terminal already exists
-      const existing = findPaneByTerminalId(panes, item.runningTerminalId)
-      if (existing) {
-        dispatch(setActiveTab(existing.tabId))
-      } else {
-        // Create new tab to attach to the running terminal
-        dispatch(createTabWithPane({
-          title: item.title,
-          content: {
-            kind: 'terminal',
-            mode: provider,
-            terminalId: item.runningTerminalId,
-            resumeSessionId: item.sessionId,
-            status: 'running',
-            initialCwd: item.cwd,
-          },
-        }))
-      }
-    } else {
-      // Session not running - check if tab with this session already exists
-      let existingTabId: string | null = null
-      for (const [tabId, layout] of Object.entries(panes)) {
-        const terminalPanes = collectTerminalPanes(layout)
-        if (terminalPanes.some((pane) =>
-          pane.content.resumeSessionId === item.sessionId && pane.content.mode === provider
-        )) {
-          existingTabId = tabId
-          break
-        }
-      }
-      if (existingTabId) {
-        dispatch(setActiveTab(existingTabId))
-      } else {
-        // Create new tab to resume the session
-        dispatch(createTabWithPane({
-          title: item.title,
-          content: {
-            kind: 'terminal',
-            mode: provider,
-            resumeSessionId: item.sessionId,
-            status: 'creating',
-            initialCwd: item.cwd,
-          },
-        }))
-      }
-    }
+    dispatch(openSessionTab({
+      sessionId: item.sessionId,
+      title: item.title,
+      cwd: item.cwd,
+      provider,
+      terminalId: item.isRunning ? item.runningTerminalId : undefined,
+    }))
     onNavigate('terminal')
-  }
+  }, [dispatch, onNavigate])
 
   const nav = [
     { id: 'terminal' as const, label: 'Terminal', icon: Terminal, shortcut: 'T' },
@@ -253,37 +218,26 @@ export default function Sidebar({
     { id: 'settings' as const, label: 'Settings', icon: Settings, shortcut: ',' },
   ]
 
-  const activeLayout = activeTabId ? panes[activeTabId] : undefined
-  const activeTerminalIds = new Set(
-    activeLayout ? collectTerminalPanes(activeLayout).map((pane) => pane.content.terminalId).filter(Boolean) as string[] : []
-  )
-  const activeSessionKeys = new Set(
-    activeLayout
-      ? collectTerminalPanes(activeLayout)
-          .map((pane) => {
-            if (!pane.content.resumeSessionId) return null
-            return `${pane.content.mode}:${pane.content.resumeSessionId}`
-          })
-          .filter(Boolean) as string[]
-      : []
-  )
+  const activeTab = tabs.find((t) => t.id === activeTabId)
+  const activeSessionKey = activeSessionKeyFromPanes
+  const activeTerminalId = activeTab?.terminalId
   const effectiveListHeight = listHeight > 0
     ? listHeight
     : Math.min(sortedItems.length * SESSION_ITEM_HEIGHT, SESSION_LIST_MAX_HEIGHT)
 
   const rowProps = useMemo(() => ({
     items: sortedItems,
-    activeSessionKeys,
-    activeTerminalIds,
-    showProjectBadge: settings?.sidebar?.showProjectBadges,
+    activeSessionKey,
+    activeTerminalId,
+    showProjectBadge: settings.sidebar?.showProjectBadges,
     onItemClick: handleItemClick,
-  }), [sortedItems, activeSessionKeys, activeTerminalIds, settings?.sidebar?.showProjectBadges, handleItemClick])
+  }), [sortedItems, activeSessionKey, activeTerminalId, settings.sidebar?.showProjectBadges, handleItemClick])
 
   const Row = ({ index, style, ariaAttributes, ...data }: RowComponentProps<typeof rowProps>) => {
     const item = data.items[index]
     const isActive = item.isRunning
-      ? (item.runningTerminalId ? data.activeTerminalIds.has(item.runningTerminalId) : false)
-      : data.activeSessionKeys.has(`${item.provider}:${item.sessionId}`)
+      ? item.runningTerminalId === data.activeTerminalId
+      : `${item.provider}:${item.sessionId}` === data.activeSessionKey
     return (
       <div style={{ ...style, paddingBottom: 2 }} {...ariaAttributes}>
         <SidebarItem

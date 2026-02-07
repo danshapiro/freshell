@@ -1,4 +1,4 @@
-import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent, SessionPaneContent, EditorPaneContent } from '../store/paneTypes'
+import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent } from '../store/paneTypes'
 import { getProviderLabel, isCodingCliMode } from './coding-cli-utils'
 
 /**
@@ -21,14 +21,6 @@ function isCli(content: PaneContent): content is TerminalPaneContent {
  */
 function isBrowser(content: PaneContent): content is BrowserPaneContent {
   return content.kind === 'browser'
-}
-
-function isSession(content: PaneContent): content is SessionPaneContent {
-  return content.kind === 'session'
-}
-
-function isEditor(content: PaneContent): content is EditorPaneContent {
-  return content.kind === 'editor'
 }
 
 /**
@@ -83,10 +75,8 @@ function extractLastDirSegment(path: string): string | null {
 /**
  * Derives a tab name from pane layout content using priority order:
  * 1. First CLI instance (claude or codex mode terminal)
- * 2. First session pane (coding CLI session view)
- * 3. First browser
- * 4. First editor
- * 5. First shell terminal (using last directory segment of initialCwd)
+ * 2. First browser
+ * 3. First shell terminal (using last directory segment of initialCwd)
  */
 export function deriveTabName(layout: PaneNode): string {
   const contents = collectContents(layout)
@@ -97,15 +87,7 @@ export function deriveTabName(layout: PaneNode): string {
     return getProviderLabel(cli.mode)
   }
 
-  // Priority 2: First session pane
-  const session = contents.find(isSession)
-  if (session) {
-    if (session.title) return session.title
-    if (session.provider) return getProviderLabel(session.provider)
-    return 'Session'
-  }
-
-  // Priority 3: First browser
+  // Priority 2: First browser
   const browser = contents.find(isBrowser)
   if (browser) {
     if (!browser.url) return 'Browser'
@@ -113,16 +95,7 @@ export function deriveTabName(layout: PaneNode): string {
     return hostname || 'Browser'
   }
 
-  // Priority 4: First editor
-  const editor = contents.find(isEditor)
-  if (editor) {
-    if (!editor.filePath) return 'Editor'
-    const normalized = editor.filePath.replace(/\\/g, '/')
-    const segments = normalized.split('/')
-    return segments[segments.length - 1] || 'Editor'
-  }
-
-  // Priority 5: First shell terminal
+  // Priority 3: First shell terminal
   const shell = contents.find(isShellTerminal)
   if (shell) {
     if (!shell.initialCwd) return 'Shell'

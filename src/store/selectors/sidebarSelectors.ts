@@ -1,7 +1,8 @@
 import { createSelector } from '@reduxjs/toolkit'
 import type { RootState } from '../store'
 import type { BackgroundTerminal, CodingCliProviderName } from '../types'
-import { collectTerminalPanes } from '@/lib/pane-utils'
+import { collectSessionRefsFromNode } from '@/lib/session-utils'
+import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 
 export interface SidebarSessionItem {
   id: string
@@ -15,21 +16,19 @@ export interface SidebarSessionItem {
   timestamp: number
   cwd?: string
   hasTab: boolean
-  tabLastInputAt?: number
   ratchetedActivity?: number
   isRunning: boolean
   runningTerminalId?: string
 }
 
 const EMPTY_ACTIVITY: Record<string, number> = {}
-const EMPTY_PROJECTS: RootState['sessions']['projects'] = []
-const EMPTY_LAYOUTS: RootState['panes']['layouts'] = {}
 
-const selectProjects = (state: RootState) => state.sessions?.projects ?? EMPTY_PROJECTS
-const selectLayouts = (state: RootState) => state.panes?.layouts ?? EMPTY_LAYOUTS
-const selectSortMode = (state: RootState) => state.settings?.settings?.sidebar?.sortMode || 'activity'
+const selectProjects = (state: RootState) => state.sessions.projects
+const selectTabs = (state: RootState) => state.tabs.tabs
+const selectPanes = (state: RootState) => state.panes
+const selectSortMode = (state: RootState) => state.settings.settings.sidebar?.sortMode || 'recency-pinned'
 const selectSessionActivityForSort = (state: RootState) => {
-  const sortMode = state.settings?.settings?.sidebar?.sortMode || 'activity'
+  const sortMode = state.settings.settings.sidebar?.sortMode || 'recency-pinned'
   if (sortMode !== 'activity') return EMPTY_ACTIVITY
   return state.sessionActivity?.sessions || EMPTY_ACTIVITY
 }
@@ -43,13 +42,14 @@ function getProjectName(projectPath: string): string {
 
 function buildSessionItems(
   projects: RootState['sessions']['projects'],
-  layouts: RootState['panes']['layouts'],
+  tabs: RootState['tabs']['tabs'],
+  panes: RootState['panes'],
   terminals: BackgroundTerminal[],
   sessionActivity: Record<string, number>
 ): SidebarSessionItem[] {
   const items: SidebarSessionItem[] = []
   const runningSessionMap = new Map<string, string>()
-  const tabSessionSet = new Set<string>()
+  const tabSessionMap = new Map<string, { hasTab: boolean }>()
 
   for (const terminal of terminals || []) {
     if (terminal.mode && terminal.mode !== 'shell' && terminal.status === 'running' && terminal.resumeSessionId) {
@@ -57,13 +57,28 @@ function buildSessionItems(
     }
   }
 
-  for (const layout of Object.values(layouts || {})) {
-    const terminals = collectTerminalPanes(layout)
-    for (const terminal of terminals) {
-      if (!terminal.content.resumeSessionId) continue
-      if (!terminal.content.mode || terminal.content.mode === 'shell') continue
-      const key = `${terminal.content.mode}:${terminal.content.resumeSessionId}`
-      tabSessionSet.add(key)
+  for (const tab of tabs || []) {
+    const layout = panes.layouts[tab.id]
+    if (!layout) {
+      const provider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode as CodingCliProviderName : undefined)
+      const sessionId = tab.resumeSessionId
+      if (provider && sessionId) {
+        // Legacy fallback for tabs without a pane layout. Claude session IDs must be UUIDs.
+        if (provider !== 'claude' || isValidClaudeSessionId(sessionId)) {
+          const key = `${provider}:${sessionId}`
+          if (!tabSessionMap.has(key)) {
+            tabSessionMap.set(key, { hasTab: true })
+          }
+        }
+      }
+      continue
+    }
+    const sessionRefs = collectSessionRefsFromNode(layout)
+    for (const ref of sessionRefs) {
+      const key = `${ref.provider}:${ref.sessionId}`
+      if (!tabSessionMap.has(key)) {
+        tabSessionMap.set(key, { hasTab: true })
+      }
     }
   }
 
@@ -72,7 +87,7 @@ function buildSessionItems(
       const provider = session.provider || 'claude'
       const key = `${provider}:${session.sessionId}`
       const runningTerminalId = runningSessionMap.get(key)
-      const hasTab = tabSessionSet.has(key)
+      const tabInfo = tabSessionMap.get(key)
       const ratchetedActivity = sessionActivity[key]
       items.push({
         id: `session-${provider}-${session.sessionId}`,
@@ -85,8 +100,7 @@ function buildSessionItems(
         archived: session.archived,
         timestamp: session.updatedAt,
         cwd: session.cwd,
-        hasTab,
-        tabLastInputAt: hasTab ? sessionActivity[key] : undefined,
+        hasTab: tabInfo?.hasTab ?? false,
         ratchetedActivity,
         isRunning: !!runningTerminalId,
         runningTerminalId,
@@ -109,7 +123,7 @@ function filterSessionItems(items: SidebarSessionItem[], filter: string): Sideba
   )
 }
 
-function sortSessionItems(items: SidebarSessionItem[], sortMode: string): SidebarSessionItem[] {
+export function sortSessionItems(items: SidebarSessionItem[], sortMode: string): SidebarSessionItem[] {
   const sorted = [...items]
 
   const active = sorted.filter((i) => !i.archived)
@@ -122,13 +136,24 @@ function sortSessionItems(items: SidebarSessionItem[], sortMode: string): Sideba
       return copy.sort((a, b) => b.timestamp - a.timestamp)
     }
 
+    if (sortMode === 'recency-pinned') {
+      const withTabs = copy.filter((i) => i.hasTab)
+      const withoutTabs = copy.filter((i) => !i.hasTab)
+
+      // Sort both groups by recency (timestamp)
+      withTabs.sort((a, b) => b.timestamp - a.timestamp)
+      withoutTabs.sort((a, b) => b.timestamp - a.timestamp)
+
+      return [...withTabs, ...withoutTabs]
+    }
+
     if (sortMode === 'activity') {
       const withTabs = copy.filter((i) => i.hasTab)
       const withoutTabs = copy.filter((i) => !i.hasTab)
 
       withTabs.sort((a, b) => {
-        const aTime = a.tabLastInputAt ?? a.timestamp
-        const bTime = b.tabLastInputAt ?? b.timestamp
+        const aTime = a.ratchetedActivity ?? a.timestamp
+        const bTime = b.ratchetedActivity ?? b.timestamp
         return bTime - aTime
       })
 
@@ -161,9 +186,9 @@ function sortSessionItems(items: SidebarSessionItem[], sortMode: string): Sideba
 
 export const makeSelectSortedSessionItems = () =>
   createSelector(
-    [selectProjects, selectLayouts, selectSessionActivityForSort, selectSortMode, selectTerminals, selectFilter],
-    (projects, layouts, sessionActivity, sortMode, terminals, filter) => {
-      const items = buildSessionItems(projects, layouts, terminals, sessionActivity)
+    [selectProjects, selectTabs, selectPanes, selectSessionActivityForSort, selectSortMode, selectTerminals, selectFilter],
+    (projects, tabs, panes, sessionActivity, sortMode, terminals, filter) => {
+      const items = buildSessionItems(projects, tabs, panes, terminals, sessionActivity)
       const filtered = filterSessionItems(items, filter)
       return sortSessionItems(filtered, sortMode)
     }

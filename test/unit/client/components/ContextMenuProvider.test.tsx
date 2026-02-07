@@ -8,14 +8,9 @@ import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
-import codingCliReducer from '@/store/codingCliSlice'
-import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
-import sessionActivityReducer from '@/store/sessionActivitySlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import TabBar from '@/components/TabBar'
-
-const VALID_SESSION_ID = '33333333-3333-3333-3333-333333333333'
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -37,6 +32,8 @@ vi.mock('@/lib/api', () => ({
   },
 }))
 
+const VALID_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
+
 function createTestStore(options?: { platform?: string | null }) {
   return configureStore({
     reducer: {
@@ -44,9 +41,6 @@ function createTestStore(options?: { platform?: string | null }) {
       panes: panesReducer,
       sessions: sessionsReducer,
       connection: connectionReducer,
-      codingCli: codingCliReducer,
-      settings: settingsReducer,
-      sessionActivity: sessionActivityReducer,
     },
     middleware: (getDefaultMiddleware) =>
       getDefaultMiddleware({ serializableCheck: false }),
@@ -55,12 +49,20 @@ function createTestStore(options?: { platform?: string | null }) {
         tabs: [
           {
             id: 'tab-1',
+            createRequestId: 'tab-1',
             title: 'Tab One',
+            status: 'running',
+            mode: 'shell',
+            shell: 'system',
             createdAt: 1,
           },
           {
             id: 'tab-2',
+            createRequestId: 'tab-2',
             title: 'Tab Two',
+            status: 'running',
+            mode: 'shell',
+            shell: 'system',
             createdAt: 2,
           },
         ],
@@ -71,7 +73,6 @@ function createTestStore(options?: { platform?: string | null }) {
         layouts: {},
         activePane: {},
         paneTitles: {},
-        paneTitleSetByUser: {},
       },
       sessions: {
         projects: [],
@@ -80,17 +81,6 @@ function createTestStore(options?: { platform?: string | null }) {
       connection: {
         status: 'ready',
         platform: options?.platform ?? null,
-      },
-      codingCli: {
-        sessions: {},
-        pendingRequests: {},
-      },
-      settings: {
-        settings: defaultSettings,
-        loaded: true,
-      },
-      sessionActivity: {
-        sessions: {},
       },
     },
   })
@@ -119,9 +109,6 @@ function createStoreWithSession() {
       tabs: tabsReducer,
       panes: panesReducer,
       sessions: sessionsReducer,
-      codingCli: codingCliReducer,
-      settings: settingsReducer,
-      sessionActivity: sessionActivityReducer,
     },
     middleware: (getDefaultMiddleware) =>
       getDefaultMiddleware({ serializableCheck: false }),
@@ -156,7 +143,6 @@ function createStoreWithSession() {
         },
         activePane: { 'tab-1': 'pane-1' },
         paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
-        paneTitleSetByUser: {},
       },
       sessions: {
         projects: [
@@ -176,17 +162,6 @@ function createStoreWithSession() {
           },
         ],
         expandedProjects: new Set<string>(),
-      },
-      codingCli: {
-        sessions: {},
-        pendingRequests: {},
-      },
-      settings: {
-        settings: defaultSettings,
-        loaded: true,
-      },
-      sessionActivity: {
-        sessions: {},
       },
     },
   })

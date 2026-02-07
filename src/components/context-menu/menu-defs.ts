@@ -2,7 +2,8 @@ import type { MenuItem, ContextTarget } from './context-menu-types'
 import type { AppView } from '@/components/Sidebar'
 import type { Tab, ProjectGroup } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
-import { collectTerminalPanes, findPaneContent } from '@/lib/pane-utils'
+import { findPaneContent } from '@/lib/pane-utils'
+import { collectSessionRefsFromNode } from '@/lib/session-utils'
 import type { TerminalActions, EditorActions, BrowserActions } from '@/lib/pane-action-registry'
 
 export type MenuActions = {
@@ -56,6 +57,11 @@ export type MenuBuildContext = {
   expandedProjects: Set<string>
   contextElement: HTMLElement | null
   actions: MenuActions
+  platform: string | null
+}
+
+function isWindowsLike(platform: string | null): boolean {
+  return platform === 'win32' || platform === 'wsl'
 }
 
 function getSessionById(projects: ProjectGroup[], sessionId: string, provider?: string) {
@@ -67,7 +73,19 @@ function getSessionById(projects: ProjectGroup[], sessionId: string, provider?: 
 }
 
 export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): MenuItem[] {
-  const { actions, tabs, paneLayouts, sessions, view, sidebarCollapsed, expandedProjects, contextElement } = ctx
+  const { actions, tabs, paneLayouts, sessions, view, sidebarCollapsed, expandedProjects, contextElement, platform } = ctx
+  const isSessionOpen = (sessionId: string, provider?: string) => {
+    const keyProvider = provider || 'claude'
+    for (const tab of tabs) {
+      const layout = paneLayouts[tab.id]
+      if (!layout) continue
+      const refs = collectSessionRefsFromNode(layout)
+      if (refs.some((ref) => ref.provider === keyProvider && ref.sessionId === sessionId)) {
+        return true
+      }
+    }
+    return false
+  }
 
   if (target.kind === 'global') {
     const views: Array<{ id: AppView; label: string }> = [
@@ -95,11 +113,16 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
   }
 
   if (target.kind === 'tab-add') {
+    const shellItems: MenuItem[] = isWindowsLike(platform)
+      ? [
+          { type: 'item', id: 'new-cmd', label: 'New CMD tab', onSelect: () => actions.newTabWithPane('cmd') },
+          { type: 'item', id: 'new-powershell', label: 'New PowerShell tab', onSelect: () => actions.newTabWithPane('powershell') },
+          { type: 'item', id: 'new-wsl', label: 'New WSL tab', onSelect: () => actions.newTabWithPane('wsl') },
+        ]
+      : [{ type: 'item', id: 'new-shell', label: 'New Shell tab', onSelect: () => actions.newTabWithPane('shell') }]
+
     return [
-      { type: 'item', id: 'new-shell', label: 'New Shell tab', onSelect: () => actions.newTabWithPane('shell') },
-      { type: 'item', id: 'new-cmd', label: 'New CMD tab', onSelect: () => actions.newTabWithPane('cmd') },
-      { type: 'item', id: 'new-powershell', label: 'New PowerShell tab', onSelect: () => actions.newTabWithPane('powershell') },
-      { type: 'item', id: 'new-wsl', label: 'New WSL tab', onSelect: () => actions.newTabWithPane('wsl') },
+      ...shellItems,
       { type: 'separator', id: 'new-tab-sep' },
       { type: 'item', id: 'new-browser', label: 'New Browser tab', onSelect: () => actions.newTabWithPane('browser') },
       { type: 'item', id: 'new-editor', label: 'New Editor tab', onSelect: () => actions.newTabWithPane('editor') },
@@ -292,15 +315,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
   if (target.kind === 'history-session') {
     const sessionInfo = getSessionById(sessions, target.sessionId, target.provider)
     const hasSummary = !!sessionInfo?.session.summary
-    const provider = target.provider || 'claude'
-    const isOpen = Object.values(paneLayouts).some((layout) => {
-      const terminals = collectTerminalPanes(layout)
-      return terminals.some(
-        (terminal) =>
-          terminal.content.resumeSessionId === target.sessionId &&
-          terminal.content.mode === provider
-      )
-    })
+    const isOpen = isSessionOpen(target.sessionId, target.provider)
     return [
       { type: 'item', id: 'history-session-open', label: 'Open session', onSelect: () => actions.openSessionInNewTab(target.sessionId, target.provider) },
       { type: 'item', id: 'history-session-rename', label: 'Rename', onSelect: () => actions.renameSession(target.sessionId, target.provider, true) },

@@ -1,7 +1,9 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
-import type { Tab } from './types'
+import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
 import { nanoid } from 'nanoid'
 import { removeLayout } from './panesSlice'
+import { findTabIdForSession } from '@/lib/session-utils'
+import type { RootState } from './store'
 
 export interface TabsState {
   tabs: Tab[]
@@ -33,19 +35,32 @@ function loadInitialTabsState(): TabsState {
     }
 
     // Apply same transformations as hydrateTabs to ensure consistency
-    const mappedTabs = (tabsState.tabs as Tab[]).map((t) => ({
-      ...t,
-      createdAt: t.createdAt || Date.now(),
-    }))
+    const mappedTabs = tabsState.tabs.map((t: Tab) => {
+      const legacyClaudeSessionId = (t as any).claudeSessionId as string | undefined
+      return {
+        ...t,
+        codingCliSessionId: t.codingCliSessionId || legacyClaudeSessionId,
+        codingCliProvider: t.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined),
+        createdAt: t.createdAt || Date.now(),
+        createRequestId: (t as any).createRequestId || t.id,
+        status: t.status || 'creating',
+        mode: t.mode || 'shell',
+        shell: t.shell || 'system',
+        lastInputAt: t.lastInputAt,
+      }
+    })
     const desired = tabsState.activeTabId
     const has = desired && mappedTabs.some((t) => t.id === desired)
+
     return {
       tabs: mappedTabs,
       activeTabId: has ? desired! : (mappedTabs[0]?.id ?? null),
       renameRequestTabId: null,
     }
   } catch (err) {
-    console.error('[TabsSlice] Failed to load from localStorage:', err)
+    if (import.meta.env.MODE === 'development') {
+      console.error('[TabsSlice] Failed to load from localStorage:', err)
+    }
     return defaultState
   }
 }
@@ -55,7 +70,18 @@ const initialState: TabsState = loadInitialTabsState()
 type AddTabPayload = {
   id?: string
   title?: string
-  titleSetByUser?: boolean
+  description?: string
+  terminalId?: string
+  codingCliSessionId?: string
+  codingCliProvider?: CodingCliProviderName
+  claudeSessionId?: string
+  status?: TerminalStatus
+  mode?: TabMode
+  shell?: ShellType
+  initialCwd?: string
+  resumeSessionId?: string
+  forceNew?: boolean
+  createRequestId?: string
 }
 
 export const tabsSlice = createSlice({
@@ -63,14 +89,30 @@ export const tabsSlice = createSlice({
   initialState,
   reducers: {
     addTab: (state, action: PayloadAction<AddTabPayload | undefined>) => {
+      // Dedupe by session is handled in openSessionTab using pane state.
       const payload = action.payload || {}
 
       const id = payload.id || nanoid()
+      const legacyClaudeSessionId = payload.claudeSessionId
+      const codingCliSessionId = payload.codingCliSessionId || legacyClaudeSessionId
+      const codingCliProvider =
+        payload.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined)
       const tab: Tab = {
         id,
+        createRequestId: payload.createRequestId || id,
         title: payload.title || `Tab ${state.tabs.length + 1}`,
+        description: payload.description,
+        terminalId: payload.terminalId,
+        codingCliSessionId,
+        codingCliProvider,
+        claudeSessionId: payload.claudeSessionId,
+        status: payload.status || 'creating',
+        mode: payload.mode || 'shell',
+        shell: payload.shell || 'system',
+        initialCwd: payload.initialCwd,
+        resumeSessionId: payload.resumeSessionId,
         createdAt: Date.now(),
-        titleSetByUser: payload.titleSetByUser,
+        lastInputAt: undefined,
       }
       state.tabs.push(tab)
       state.activeTabId = id
@@ -95,11 +137,18 @@ export const tabsSlice = createSlice({
       }
     },
     hydrateTabs: (state, action: PayloadAction<TabsState>) => {
-      // Basic sanity: ensure dates exist.
+      // Basic sanity: ensure dates exist, status defaults.
       state.tabs = (action.payload.tabs || []).map((t) => {
+        const legacyClaudeSessionId = (t as any).claudeSessionId as string | undefined
         return {
           ...t,
+          codingCliSessionId: t.codingCliSessionId || legacyClaudeSessionId,
+          codingCliProvider: t.codingCliProvider || (legacyClaudeSessionId ? 'claude' : undefined),
           createdAt: t.createdAt || Date.now(),
+          createRequestId: (t as any).createRequestId || t.id,
+          status: t.status || 'creating',
+          mode: t.mode || 'shell',
+          shell: t.shell || 'system',
         }
       })
       const desired = action.payload.activeTabId
@@ -116,6 +165,18 @@ export const tabsSlice = createSlice({
       const [removed] = state.tabs.splice(fromIndex, 1)
       state.tabs.splice(toIndex, 0, removed)
     },
+    switchToNextTab: (state) => {
+      if (state.tabs.length <= 1) return
+      const currentIndex = state.tabs.findIndex((t) => t.id === state.activeTabId)
+      const nextIndex = (currentIndex + 1) % state.tabs.length
+      state.activeTabId = state.tabs[nextIndex].id
+    },
+    switchToPrevTab: (state) => {
+      if (state.tabs.length <= 1) return
+      const currentIndex = state.tabs.findIndex((t) => t.id === state.activeTabId)
+      const prevIndex = (currentIndex - 1 + state.tabs.length) % state.tabs.length
+      state.activeTabId = state.tabs[prevIndex].id
+    },
   },
 })
 
@@ -128,6 +189,8 @@ export const {
   removeTab,
   hydrateTabs,
   reorderTabs,
+  switchToNextTab,
+  switchToPrevTab,
 } = tabsSlice.actions
 
 export const closeTab = createAsyncThunk(
@@ -135,6 +198,52 @@ export const closeTab = createAsyncThunk(
   async (tabId: string, { dispatch }) => {
     dispatch(removeTab(tabId))
     dispatch(removeLayout({ tabId }))
+  }
+)
+
+export const openSessionTab = createAsyncThunk(
+  'tabs/openSessionTab',
+  async (
+    { sessionId, title, cwd, provider, terminalId, forceNew }: { sessionId: string; title?: string; cwd?: string; provider?: CodingCliProviderName; terminalId?: string; forceNew?: boolean },
+    { dispatch, getState }
+  ) => {
+    const resolvedProvider = provider || 'claude'
+    const state = getState() as RootState
+
+    if (terminalId) {
+      if (!forceNew) {
+        const existingTab = state.tabs.tabs.find((t) => t.terminalId === terminalId)
+        if (existingTab) {
+          dispatch(setActiveTab(existingTab.id))
+          return
+        }
+      }
+      dispatch(addTab({
+        title: title || (resolvedProvider === 'claude' ? 'Claude' : resolvedProvider),
+        terminalId,
+        status: 'running',
+        mode: resolvedProvider,
+        codingCliProvider: resolvedProvider,
+        initialCwd: cwd,
+        resumeSessionId: sessionId,
+      }))
+      return
+    }
+
+    if (!forceNew) {
+      const existingTabId = findTabIdForSession(state, resolvedProvider, sessionId)
+      if (existingTabId) {
+        dispatch(setActiveTab(existingTabId))
+        return
+      }
+    }
+    dispatch(addTab({
+      title: title || (resolvedProvider === 'claude' ? 'Claude' : resolvedProvider),
+      mode: resolvedProvider,
+      codingCliProvider: resolvedProvider,
+      initialCwd: cwd,
+      resumeSessionId: sessionId,
+    }))
   }
 )
 

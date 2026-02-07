@@ -9,7 +9,7 @@ const PANES_STORAGE_KEY = 'freshell.panes.v1'
 export const PERSIST_DEBOUNCE_MS = 500
 
 // Current panes schema version
-const PANES_SCHEMA_VERSION = 4
+const PANES_SCHEMA_VERSION = 3
 
 const flushCallbacks = new Set<() => void>()
 let flushListenersAttached = false
@@ -181,14 +181,12 @@ export function loadPersistedPanes(): any | null {
         ...parsed,
         layouts: sanitizedLayouts,
         paneTitles: parsed.paneTitles || {},
-        paneTitleSetByUser: parsed.paneTitleSetByUser || {},
       }
     }
 
     // Run migrations
     let layouts = parsed.layouts || {}
     let paneTitles = parsed.paneTitles || {}
-    let paneTitleSetByUser = parsed.paneTitleSetByUser || {}
 
     // Version 1 -> 2: migrate pane content to include lifecycle fields
     if (currentVersion < 2) {
@@ -201,11 +199,6 @@ export function loadPersistedPanes(): any | null {
 
     // Version 2 -> 3: add paneTitles (already defaulted to {} above)
     // No additional migration needed, just ensure the field exists
-    // Version 3 -> 4: paneTitles semantics changed; reset overrides
-    if (currentVersion < 4) {
-      paneTitles = {}
-      paneTitleSetByUser = {}
-    }
 
     const sanitizedLayouts: Record<string, any> = {}
     for (const [tabId, node] of Object.entries(layouts)) {
@@ -216,7 +209,6 @@ export function loadPersistedPanes(): any | null {
       layouts: sanitizedLayouts,
       activePane: parsed.activePane || {},
       paneTitles,
-      paneTitleSetByUser,
       version: PANES_SCHEMA_VERSION,
     }
   } catch {

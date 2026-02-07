@@ -128,8 +128,6 @@ import sessionsReducer, { SessionsState } from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import codingCliReducer from '@/store/codingCliSlice'
 import panesReducer from '@/store/panesSlice'
-import type { PanesState } from '@/store/panesSlice'
-import terminalActivityReducer from '@/store/terminalActivitySlice'
 import type { Tab, AppSettings, ProjectGroup, BackgroundTerminal } from '@/store/types'
 
 // Import the mocked api to get access to the mocks
@@ -144,7 +142,6 @@ interface TestStoreState {
   tabs?: Partial<TabsState>
   settings?: Partial<SettingsState>
   sessions?: Partial<SessionsState>
-  panes?: Partial<PanesState>
 }
 
 function createTestStore(state: TestStoreState = {}) {
@@ -156,7 +153,6 @@ function createTestStore(state: TestStoreState = {}) {
       connection: connectionReducer,
       codingCli: codingCliReducer,
       panes: panesReducer,
-      terminalActivity: terminalActivityReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -183,20 +179,10 @@ function createTestStore(state: TestStoreState = {}) {
       },
       codingCli: {
         sessions: {},
-        pendingRequests: {},
       },
       panes: {
         layouts: {},
         activePane: {},
-        paneTitles: {},
-        paneTitleSetByUser: {},
-        ...state.panes,
-      },
-      terminalActivity: {
-        lastOutputAt: {},
-        lastInputAt: {},
-        working: {},
-        finished: {},
       },
     },
   })
@@ -205,7 +191,11 @@ function createTestStore(state: TestStoreState = {}) {
 function createTab(overrides: Partial<Tab> = {}): Tab {
   return {
     id: `tab-${Math.random().toString(36).slice(2)}`,
+    createRequestId: `req-${Math.random().toString(36).slice(2)}`,
     title: 'Terminal 1',
+    status: 'running',
+    mode: 'shell',
+    shell: 'system',
     createdAt: Date.now(),
     ...overrides,
   }
@@ -232,6 +222,7 @@ describe('Component Edge Cases', () => {
   beforeEach(() => {
     vi.useFakeTimers()
     vi.clearAllMocks()
+    localStorage.clear()
     mockWsOnMessage.mockReturnValue(() => {})
     mockWsOnReconnect.mockReturnValue(() => {})
     mockWsConnect.mockResolvedValue(undefined)
@@ -252,7 +243,8 @@ describe('Component Edge Cases', () => {
       it('renders safely with undefined tab properties', () => {
         const tabWithUndefined = createTab({
           title: undefined as unknown as string,
-          createdAt: undefined as unknown as number,
+          terminalId: undefined,
+          description: undefined,
         })
 
         const store = createTestStore({
@@ -272,26 +264,13 @@ describe('Component Edge Cases', () => {
         expect(screen.getByText('Terminal 1')).toBeInTheDocument()
       })
 
-      it('handles pane with undefined status', () => {
-        const tab = createTab()
+      it('handles tab with undefined status', () => {
+        const tabWithUndefinedStatus = createTab({
+          status: undefined as unknown as 'running',
+        })
 
         const store = createTestStore({
-          tabs: { tabs: [tab], activeTabId: tab.id },
-          panes: {
-            layouts: {
-              [tab.id]: {
-                type: 'leaf',
-                id: 'pane-1',
-                content: {
-                  kind: 'terminal',
-                  createRequestId: 'req-1',
-                  status: undefined as unknown as 'running',
-                  mode: 'shell',
-                },
-              },
-            },
-            activePane: { [tab.id]: 'pane-1' },
-          },
+          tabs: { tabs: [tabWithUndefinedStatus], activeTabId: tabWithUndefinedStatus.id },
         })
 
         // StatusIndicator should handle undefined status (falls through to default case)
@@ -760,25 +739,10 @@ describe('Component Edge Cases', () => {
 
     describe('TabBar with error status', () => {
       it('displays error indicator for tabs with error status', () => {
-        const errorTab = createTab({ title: 'Error Tab' })
+        const errorTab = createTab({ status: 'error', title: 'Error Tab' })
 
         const store = createTestStore({
           tabs: { tabs: [errorTab], activeTabId: errorTab.id },
-          panes: {
-            layouts: {
-              [errorTab.id]: {
-                type: 'leaf',
-                id: 'pane-err',
-                content: {
-                  kind: 'terminal',
-                  createRequestId: 'req-err',
-                  status: 'error',
-                  mode: 'shell',
-                },
-              },
-            },
-            activePane: { [errorTab.id]: 'pane-err' },
-          },
         })
 
         renderWithStore(<TabBar />, store)
@@ -1100,8 +1064,7 @@ describe('Component Edge Cases', () => {
           },
         })
 
-        // This should throw because tabs.map is called on undefined
-        expect(() => renderWithStore(<TabBar />, store as any)).toThrow()
+        expect(() => renderWithStore(<TabBar />, store as any)).not.toThrow()
       })
     })
 
