@@ -477,8 +477,11 @@ describe('App Component - Share Button', () => {
       expect(screen.getByText('Welcome to your freshell!')).toBeInTheDocument()
     })
 
-    // Click the backdrop overlay button
-    fireEvent.click(screen.getByLabelText('Close share modal'))
+    // Click the backdrop (the outer div with the dark overlay)
+    const backdrop = screen.getByText('Welcome to your freshell!').closest('.fixed')
+    if (backdrop) {
+      fireEvent.click(backdrop)
+    }
 
     await waitFor(() => {
       expect(screen.queryByText('Welcome to your freshell!')).not.toBeInTheDocument()
