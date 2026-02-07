@@ -5,6 +5,7 @@ import { setSettings } from '@/store/settingsSlice'
 import { setProjects, clearProjects, mergeProjects } from '@/store/sessionsSlice'
 import { switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { createTabWithPane } from '@/store/tabThunks'
+import { clearIdleWarning, recordIdleWarning } from '@/store/idleWarningsSlice'
 import { api } from '@/lib/api'
 import { getAuthToken } from '@/lib/auth'
 import { buildShareUrl } from '@/lib/utils'
@@ -42,6 +43,7 @@ export default function App() {
   const connection = useAppSelector((s) => s.connection.status)
   const connectionError = useAppSelector((s) => s.connection.lastError)
   const settings = useAppSelector((s) => s.settings.settings)
+  const idleWarningCount = useAppSelector((s) => Object.keys(s.idleWarnings?.warnings ?? {}).length)
 
   const [view, setView] = useState<AppView>('terminal')
   const [shareModalUrl, setShareModalUrl] = useState<string | null>(null)
@@ -218,8 +220,20 @@ export default function App() {
       }
       if (msg.type === 'terminal.exit') {
         const terminalId = msg.terminalId
+        if (typeof terminalId === 'string' && terminalId) {
+          dispatch(clearIdleWarning(terminalId))
+        }
         const code = msg.exitCode
         console.log('terminal exit', terminalId, code)
+      }
+      if (msg.type === 'terminal.idle.warning') {
+        if (!msg.terminalId) return
+        dispatch(recordIdleWarning({
+          terminalId: msg.terminalId,
+          killMinutes: Number(msg.killMinutes) || 0,
+          warnMinutes: Number(msg.warnMinutes) || 0,
+          lastActivityAt: typeof msg.lastActivityAt === 'number' ? msg.lastActivityAt : undefined,
+        }))
       }
       if (msg.type === 'session.status') {
         // Log session repair status (silent for healthy/repaired, visible for problems)
@@ -370,6 +384,17 @@ export default function App() {
           <span className="font-mono text-base font-semibold tracking-tight">🐚🔥freshell</span>
         </div>
         <div className="flex items-center gap-1">
+          {idleWarningCount > 0 && (
+            <button
+              type="button"
+              onClick={() => setView('overview')}
+              className="mr-1 px-2 py-1 rounded-md text-xs font-medium bg-amber-500/10 text-amber-700 hover:bg-amber-500/20 transition-colors"
+              title="Auto-kill soon"
+              aria-label="Auto-kill soon"
+            >
+              Auto-kill soon
+            </button>
+          )}
           <button
             onClick={toggleTheme}
             className="p-1.5 rounded-md hover:bg-muted transition-colors"
