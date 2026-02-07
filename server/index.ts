@@ -14,6 +14,7 @@ import { validateStartupSecurity, httpAuthMiddleware } from './auth.js'
 import { configStore } from './config-store.js'
 import { TerminalRegistry } from './terminal-registry.js'
 import { WsHandler } from './ws-handler.js'
+import { SessionsSyncService } from './sessions-sync/service.js'
 import { claudeIndexer } from './claude-indexer.js'
 import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
 import { CodingCliSessionManager } from './coding-cli/session-manager.js'
@@ -153,6 +154,7 @@ async function main() {
       perfLogging: perfConfig.enabled,
     }
   })
+  const sessionsSync = new SessionsSyncService(wsHandler)
 
   registry.on('terminal.idle.warning', (payload) => {
     wsHandler.broadcast({ type: 'terminal.idle.warning', ...(payload as any) })
@@ -237,7 +239,7 @@ async function main() {
       {},
       { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
     )
-    wsHandler.broadcastSessionsUpdated(codingCliIndexer.getProjects())
+    sessionsSync.publish(codingCliIndexer.getProjects())
     await withPerfSpan(
       'claude_refresh',
       () => claudeIndexer.refresh(),
@@ -261,7 +263,7 @@ async function main() {
       {},
       { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
     )
-    wsHandler.broadcastSessionsUpdated(codingCliIndexer.getProjects())
+    sessionsSync.publish(codingCliIndexer.getProjects())
     await withPerfSpan(
       'claude_refresh',
       () => claudeIndexer.refresh(),
@@ -357,7 +359,7 @@ async function main() {
       createdAtOverride,
     })
     await codingCliIndexer.refresh()
-    wsHandler.broadcastSessionsUpdated(codingCliIndexer.getProjects())
+    sessionsSync.publish(codingCliIndexer.getProjects())
     await claudeIndexer.refresh()
     res.json(next)
   })
@@ -368,7 +370,7 @@ async function main() {
     const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
     await configStore.deleteSession(compositeKey)
     await codingCliIndexer.refresh()
-    wsHandler.broadcastSessionsUpdated(codingCliIndexer.getProjects())
+    sessionsSync.publish(codingCliIndexer.getProjects())
     await claudeIndexer.refresh()
     res.json({ ok: true })
   })
@@ -378,7 +380,7 @@ async function main() {
     if (!projectPath || !color) return res.status(400).json({ error: 'projectPath and color required' })
     await configStore.setProjectColor(projectPath, color)
     await codingCliIndexer.refresh()
-    wsHandler.broadcastSessionsUpdated(codingCliIndexer.getProjects())
+    sessionsSync.publish(codingCliIndexer.getProjects())
     await claudeIndexer.refresh()
     res.json({ ok: true })
   })
@@ -493,7 +495,7 @@ async function main() {
 
   // Coding CLI watcher hooks
   codingCliIndexer.onUpdate((projects) => {
-    wsHandler.broadcastSessionsUpdated(projects)
+    sessionsSync.publish(projects)
 
     // Auto-update terminal titles based on session data
     for (const project of projects) {

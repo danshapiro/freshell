@@ -1178,6 +1178,16 @@ export class WsHandler {
     }
   }
 
+  broadcastSessionsUpdatedToLegacy(projects: ProjectGroup[]): void {
+    for (const ws of this.connections) {
+      if (ws.readyState !== WebSocket.OPEN) continue
+      const state = this.clientStates.get(ws)
+      if (!state?.authenticated) continue
+      if (state.supportsSessionsPatchV1 && state.sessionsSnapshotSent) continue
+      void this.sendChunkedSessions(ws, projects)
+    }
+  }
+
   broadcastSessionsPatch(msg: { type: 'sessions.patch'; upsertProjects: ProjectGroup[]; removeProjectPaths: string[] }): void {
     for (const ws of this.connections) {
       if (ws.readyState !== WebSocket.OPEN) continue
