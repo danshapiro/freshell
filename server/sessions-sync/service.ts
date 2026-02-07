@@ -1,6 +1,10 @@
 import type { ProjectGroup } from '../coding-cli/types.js'
 import { diffProjects } from './diff.js'
 
+function estimateBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value))
+}
+
 export class SessionsSyncService {
   private last: ProjectGroup[] = []
   private hasLast = false
@@ -23,15 +27,20 @@ export class SessionsSyncService {
     // No changes.
     if (diff.upsertProjects.length === 0 && diff.removeProjectPaths.length === 0) return
 
-    // Patch-first: send diffs to capable clients; snapshots only to legacy clients.
-    // If we later find patch messages can become too large, we can add a size guard
-    // that falls back to broadcastSessionsUpdated(next).
-    this.ws.broadcastSessionsPatch({
+    const patchMsg = {
       type: 'sessions.patch',
       upsertProjects: diff.upsertProjects,
       removeProjectPaths: diff.removeProjectPaths,
-    })
+    } as const
+
+    const maxBytes = Number(process.env.MAX_WS_CHUNK_BYTES || 500 * 1024)
+    if (estimateBytes(patchMsg) > maxBytes) {
+      this.ws.broadcastSessionsUpdated(next)
+      return
+    }
+
+    // Patch-first: send diffs to capable clients; snapshots only to legacy clients.
+    this.ws.broadcastSessionsPatch(patchMsg)
     this.ws.broadcastSessionsUpdatedToLegacy(next)
   }
 }
-
