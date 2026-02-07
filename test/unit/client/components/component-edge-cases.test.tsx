@@ -129,6 +129,7 @@ import connectionReducer from '@/store/connectionSlice'
 import codingCliReducer from '@/store/codingCliSlice'
 import panesReducer from '@/store/panesSlice'
 import type { PanesState } from '@/store/panesSlice'
+import terminalActivityReducer from '@/store/terminalActivitySlice'
 import type { Tab, AppSettings, ProjectGroup, BackgroundTerminal } from '@/store/types'
 
 // Import the mocked api to get access to the mocks
@@ -155,6 +156,7 @@ function createTestStore(state: TestStoreState = {}) {
       connection: connectionReducer,
       codingCli: codingCliReducer,
       panes: panesReducer,
+      terminalActivity: terminalActivityReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -189,6 +191,12 @@ function createTestStore(state: TestStoreState = {}) {
         paneTitles: {},
         paneTitleSetByUser: {},
         ...state.panes,
+      },
+      terminalActivity: {
+        lastOutputAt: {},
+        lastInputAt: {},
+        working: {},
+        finished: {},
       },
     },
   })

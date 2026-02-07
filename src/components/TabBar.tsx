@@ -6,6 +6,7 @@ import { getTabDisplayTitle } from '@/lib/tab-title'
 import { collectTerminalPanes, collectSessionPanes, deriveTabStatus } from '@/lib/pane-utils'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import TabItem from './TabItem'
+import { useTerminalActivityMonitor } from '@/hooks/useTerminalActivityMonitor'
 import {
   DndContext,
   closestCenter,
@@ -36,6 +37,8 @@ interface SortableTabProps {
   isActive: boolean
   isDragging: boolean
   isRenaming: boolean
+  isWorking: boolean
+  isFinished: boolean
   renameValue: string
   onRenameChange: (value: string) => void
   onRenameBlur: () => void
@@ -52,6 +55,8 @@ function SortableTab({
   isActive,
   isDragging,
   isRenaming,
+  isWorking,
+  isFinished,
   renameValue,
   onRenameChange,
   onRenameBlur,
@@ -87,6 +92,8 @@ function SortableTab({
         isActive={isActive}
         isDragging={isDragging}
         isRenaming={isRenaming}
+        isWorking={isWorking}
+        isFinished={isFinished}
         renameValue={renameValue}
         onRenameChange={onRenameChange}
         onRenameBlur={onRenameBlur}
@@ -116,6 +123,9 @@ export default function TabBar() {
   const pendingRequests = useAppSelector((s) => s.codingCli.pendingRequests)
   const codingCliSessions = useAppSelector((s) => s.codingCli.sessions)
   const settings = useAppSelector((s) => s.settings.settings)
+
+  // Monitor terminal activity for working/ready indicators
+  const { tabActivityStates } = useTerminalActivityMonitor()
 
   // Compute display title for a single tab
   // Priority: user-set title > programmatically-set title (e.g., from Claude) > derived name
@@ -243,6 +253,7 @@ export default function TabBar() {
         >
           <div className="flex items-end gap-0.5 overflow-x-auto flex-1">
             {tabs.map((tab: Tab) => {
+              const activityState = tabActivityStates[tab.id] ?? { isFinished: false }
               const status = getTabStatus(tab.id)
               return (
                 <SortableTab
@@ -253,6 +264,8 @@ export default function TabBar() {
                   isActive={tab.id === activeTabId}
                   isDragging={activeId === tab.id}
                   isRenaming={renamingId === tab.id}
+                  isWorking={activityState.isWorking}
+                  isFinished={activityState.isFinished}
                   renameValue={renameValue}
                   onRenameChange={setRenameValue}
                   onRenameBlur={() => {
@@ -311,6 +324,8 @@ export default function TabBar() {
                 isActive={activeTab.id === activeTabId}
                 isDragging={false}
                 isRenaming={false}
+                isWorking={tabActivityStates[activeTab.id]?.isWorking ?? false}
+                isFinished={tabActivityStates[activeTab.id]?.isFinished ?? false}
                 renameValue=""
                 onRenameChange={() => {}}
                 onRenameBlur={() => {}}

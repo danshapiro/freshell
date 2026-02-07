@@ -8,6 +8,7 @@ import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
+import terminalActivityReducer from '@/store/terminalActivitySlice'
 import codingCliReducer from '@/store/codingCliSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
 
@@ -80,6 +81,7 @@ function createTestStore(options?: {
       connection: connectionReducer,
       sessions: sessionsReducer,
       panes: panesReducer,
+      terminalActivity: terminalActivityReducer,
       codingCli: codingCliReducer,
       sessionActivity: sessionActivityReducer,
     },
@@ -121,6 +123,12 @@ function createTestStore(options?: {
         activePane: {},
         paneTitles: {},
         paneTitleSetByUser: {},
+      },
+      terminalActivity: {
+        lastOutputAt: {},
+        lastInputAt: {},
+        working: {},
+        finished: {},
       },
       codingCli: {
         sessions: {},

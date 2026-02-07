@@ -125,4 +125,12 @@ export interface AppSettings {
   panes: {
     defaultNewPane: DefaultNewPane
   }
+  notifications: {
+    /** Show pulsing indicator on tab when terminal is actively streaming output */
+    visualWhenWorking: boolean
+    /** Show "ready" badge on tab when streaming finishes (clears when tab is selected) */
+    visualWhenFinished: boolean
+    /** Play sound when streaming finishes on a background tab */
+    soundWhenFinished: boolean
+  }
 }

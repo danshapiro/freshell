@@ -3,6 +3,7 @@ import { Terminal, History, Settings, LayoutGrid, Search, Loader2, X, Archive } 
 import { List, type RowComponentProps } from 'react-window'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
+import { ProviderIcon } from '@/components/icons/provider-icons'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { setActiveTab } from '@/store/tabsSlice'
 import { createTabWithPane } from '@/store/tabThunks'
@@ -14,7 +15,6 @@ import type { PaneNode } from '@/store/paneTypes'
 import { makeSelectSortedSessionItems, type SidebarSessionItem } from '@/store/selectors/sidebarSelectors'
 import { collectTerminalPanes, findPaneByTerminalId } from '@/lib/pane-utils'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
-import { ProviderIcon } from '@/components/icons/provider-icons'
 
 export type AppView = 'terminal' | 'sessions' | 'overview' | 'settings'
 
