@@ -61,7 +61,7 @@ export class WsClient {
       this.connectStartedAt = performance.now()
     }
 
-    this.connectPromise = new Promise((resolve, reject) => {
+    const promise = new Promise<void>((resolve, reject) => {
       let finished = false
       const finishResolve = () => {
         if (!finished) {
@@ -223,7 +223,8 @@ export class WsClient {
       }
     })
 
-    return this.connectPromise
+    this.connectPromise = promise
+    return promise
   }
 
   private scheduleReconnect(opts?: { minDelayMs?: number }) {
