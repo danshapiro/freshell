@@ -476,11 +476,8 @@ describe('App Component - Share Button', () => {
       expect(screen.getByText('Welcome to your freshell!')).toBeInTheDocument()
     })
 
-    // Click the backdrop (the outer div with the dark overlay)
-    const backdrop = screen.getByText('Welcome to your freshell!').closest('.fixed')
-    if (backdrop) {
-      fireEvent.click(backdrop)
-    }
+    // Click the backdrop overlay button
+    fireEvent.click(screen.getByLabelText('Close share modal'))
 
     await waitFor(() => {
       expect(screen.queryByText('Welcome to your freshell!')).not.toBeInTheDocument()
@@ -611,6 +608,50 @@ describe('App Bootstrap', () => {
     const settingsCalls = mockApiGet.mock.calls.filter(([url]) => url === '/api/settings')
     expect(sessionsCalls.length).toBe(1)
     expect(settingsCalls.length).toBe(1)
+  })
+})
+
+describe('App WS message handling', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/sessions') return Promise.resolve([])
+      return Promise.resolve({})
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  it('merges chunked sessions.updated messages (clear/append) instead of replacing', async () => {
+    let handler: ((msg: any) => void) | null = null
+    mockOnMessage.mockImplementation((cb: (msg: any) => void) => {
+      handler = cb
+      return () => { handler = null }
+    })
+
+    const store = createTestStore()
+    renderApp(store)
+
+    await waitFor(() => expect(handler).not.toBeNull())
+
+    handler!({
+      type: 'sessions.updated',
+      clear: true,
+      projects: [{ projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', updatedAt: 1 }] }],
+    })
+    handler!({
+      type: 'sessions.updated',
+      append: true,
+      projects: [{ projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', updatedAt: 2 }] }],
+    })
+
+    await waitFor(() => {
+      expect(store.getState().sessions.projects.map((p: any) => p.projectPath).sort()).toEqual(['/p1', '/p2'])
+    })
   })
 })
 
