@@ -367,7 +367,13 @@ export class CodingCliSessionIndexer {
     }))
 
     // Sort projects by most recent session activity.
-    groups.sort((a, b) => (b.sessions[0]?.updatedAt || 0) - (a.sessions[0]?.updatedAt || 0))
+    groups.sort((a, b) => {
+      const diff = (b.sessions[0]?.updatedAt || 0) - (a.sessions[0]?.updatedAt || 0)
+      if (diff !== 0) return diff
+      if (a.projectPath < b.projectPath) return -1
+      if (a.projectPath > b.projectPath) return 1
+      return 0
+    })
 
     this.projects = groups
     this.emitUpdate()

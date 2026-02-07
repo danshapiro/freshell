@@ -6,19 +6,22 @@ export type SessionsProjectsDiff = {
 }
 
 function sessionsEqual(a: CodingCliSession, b: CodingCliSession): boolean {
-  return (
-    (a.provider || 'claude') === (b.provider || 'claude') &&
-    a.sessionId === b.sessionId &&
-    a.projectPath === b.projectPath &&
-    a.updatedAt === b.updatedAt &&
-    a.createdAt === b.createdAt &&
-    a.messageCount === b.messageCount &&
-    a.title === b.title &&
-    a.summary === b.summary &&
-    a.cwd === b.cwd &&
-    a.archived === b.archived &&
-    a.sourceFile === b.sourceFile
-  )
+  // Compare all own enumerable fields, so new session fields can't be silently ignored.
+  if ((a.provider || 'claude') !== (b.provider || 'claude')) return false
+
+  for (const key in a) {
+    if (!Object.prototype.hasOwnProperty.call(a, key)) continue
+    if (key === 'provider') continue
+    if ((a as any)[key] !== (b as any)[key]) return false
+  }
+
+  for (const key in b) {
+    if (!Object.prototype.hasOwnProperty.call(b, key)) continue
+    if (key === 'provider') continue
+    if ((a as any)[key] !== (b as any)[key]) return false
+  }
+
+  return true
 }
 
 function projectEqual(a: ProjectGroup, b: ProjectGroup): boolean {
@@ -55,4 +58,3 @@ export function diffProjects(prev: ProjectGroup[], next: ProjectGroup[]): Sessio
 
   return { upsertProjects, removeProjectPaths }
 }
-

@@ -104,6 +104,25 @@ describe('CodingCliSessionIndexer', () => {
     expect(projectB?.sessions[0].title).toBe('Title B')
   })
 
+  it('sorts projects deterministically by newest session updatedAt then projectPath', async () => {
+    const fileA = path.join(tempDir, 'session-a.jsonl')
+    const fileB = path.join(tempDir, 'session-b.jsonl')
+
+    await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/b', title: 'B' }) + '\n')
+    await fsp.writeFile(fileB, JSON.stringify({ cwd: '/project/a', title: 'A' }) + '\n')
+
+    const sameTime = new Date('2020-01-01T00:00:00.000Z')
+    await fsp.utimes(fileA, sameTime, sameTime)
+    await fsp.utimes(fileB, sameTime, sameTime)
+
+    const provider = makeProvider([fileA, fileB])
+    const indexer = new CodingCliSessionIndexer([provider])
+
+    await indexer.refresh()
+
+    expect(indexer.getProjects().map((p) => p.projectPath)).toEqual(['/project/a', '/project/b'])
+  })
+
   it('skips providers that are disabled in settings', async () => {
     const fileA = path.join(tempDir, 'session-a.jsonl')
     await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')
