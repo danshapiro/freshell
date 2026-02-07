@@ -3,7 +3,7 @@ import { hydratePanes } from './panesSlice'
 import { hydrateTabs } from './tabsSlice'
 import { collectPaneIdsSafe } from '@/lib/pane-utils'
 import { parsePersistedPanesRaw, parsePersistedTabsRaw, PANES_STORAGE_KEY, TABS_STORAGE_KEY } from './persistedState'
-import { getPersistBroadcastSourceId, PERSIST_BROADCAST_CHANNEL_NAME } from './persistBroadcast'
+import { getPersistBroadcastSourceId, onPersistBroadcast, PERSIST_BROADCAST_CHANNEL_NAME } from './persistBroadcast'
 
 type StoreLike = {
   dispatch: (action: any) => any
@@ -103,6 +103,14 @@ export function installCrossTabSync(store: StoreLike): () => void {
     handleIncomingRaw(store, key, raw)
   }
 
+  // Keep dedupe state in sync with local writes too. Otherwise, if we process a remote raw,
+  // then diverge locally (persisted raw changes), a later remote event with the original raw
+  // could be incorrectly ignored.
+  const unsubscribeLocal = onPersistBroadcast((msg) => {
+    if (msg.key !== TABS_STORAGE_KEY && msg.key !== PANES_STORAGE_KEY) return
+    lastProcessedRawByKey.set(msg.key, msg.raw)
+  })
+
   const onStorage = (e: StorageEvent) => {
     if (e.storageArea && e.storageArea !== localStorage) return
     const key = e.key
@@ -125,6 +133,7 @@ export function installCrossTabSync(store: StoreLike): () => void {
   }
 
   return () => {
+    unsubscribeLocal()
     window.removeEventListener('storage', onStorage)
     if (channel) {
       try {

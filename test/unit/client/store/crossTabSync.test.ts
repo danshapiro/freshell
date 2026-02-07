@@ -4,6 +4,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer, { hydrateTabs } from '../../../../src/store/tabsSlice'
 import panesReducer, { hydratePanes } from '../../../../src/store/panesSlice'
 import { installCrossTabSync } from '../../../../src/store/crossTabSync'
+import { broadcastPersistedRaw } from '../../../../src/store/persistBroadcast'
 import { PANES_STORAGE_KEY, TABS_STORAGE_KEY } from '../../../../src/store/persistedState'
 
 describe('crossTabSync', () => {
@@ -135,5 +136,34 @@ describe('crossTabSync', () => {
     } finally {
       ;(globalThis as any).BroadcastChannel = original
     }
+  })
+
+  it('does not permanently dedupe: identical remote payload should hydrate again after a local persisted change', () => {
+    const dispatchSpy = vi.fn()
+    const storeLike = {
+      dispatch: dispatchSpy,
+      getState: () => ({ tabs: { activeTabId: null }, panes: { activePane: {} } }),
+    }
+
+    cleanups.push(installCrossTabSync(storeLike as any))
+
+    const raw1 = JSON.stringify({
+      version: 1,
+      tabs: { activeTabId: null, tabs: [{ id: 't1', title: 'T1', createdAt: 1 }] },
+    })
+    window.dispatchEvent(new StorageEvent('storage', { key: TABS_STORAGE_KEY, newValue: raw1 }))
+
+    const raw2 = JSON.stringify({
+      version: 1,
+      tabs: { activeTabId: null, tabs: [{ id: 't1', title: 'T1 local change', createdAt: 1 }] },
+    })
+    broadcastPersistedRaw(TABS_STORAGE_KEY, raw2)
+
+    window.dispatchEvent(new StorageEvent('storage', { key: TABS_STORAGE_KEY, newValue: raw1 }))
+
+    const hydrateCalls = dispatchSpy.mock.calls
+      .map((c) => c[0])
+      .filter((a: any) => a?.type === 'tabs/hydrateTabs')
+    expect(hydrateCalls).toHaveLength(2)
   })
 })
