@@ -224,7 +224,9 @@ export default function App() {
           dispatch(clearIdleWarning(terminalId))
         }
         const code = msg.exitCode
-        console.log('terminal exit', terminalId, code)
+        if (store.getState()?.settings?.settings?.logging?.debug) {
+          console.log('terminal exit', terminalId, code)
+        }
       }
       if (msg.type === 'terminal.idle.warning') {
         if (!msg.terminalId) return

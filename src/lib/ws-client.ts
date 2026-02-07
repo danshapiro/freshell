@@ -239,7 +239,10 @@ export class WsClient {
 
   private scheduleReconnect(options: { minDelayMs?: number } = {}) {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error('WsClient: max reconnect attempts reached')
+      logClientPerf('perf.ws_max_reconnect_attempts', {
+        attempts: this.reconnectAttempts,
+        maxAttempts: this.maxReconnectAttempts,
+      }, 'error')
       return
     }
 
@@ -249,7 +252,11 @@ export class WsClient {
 
     window.setTimeout(() => {
       if (!this.intentionalClose) {
-        this.connect().catch((err) => console.error('WsClient: reconnect failed', err))
+        this.connect().catch((err) => {
+          logClientPerf('perf.ws_reconnect_failed', {
+            error: err instanceof Error ? err.message : String(err),
+          }, 'warn')
+        })
       }
     }, delay)
 
