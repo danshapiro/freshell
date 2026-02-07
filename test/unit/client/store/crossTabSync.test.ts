@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 
 import tabsReducer, { hydrateTabs } from '../../../../src/store/tabsSlice'
@@ -96,5 +96,44 @@ describe('crossTabSync', () => {
     expect(store.getState().panes.layouts['tab-1']?.id).toBe('split-remote')
     expect(store.getState().panes.activePane['tab-1']).toBe('pane-a')
   })
-})
 
+  it('dedupes identical persisted payloads delivered via both storage and BroadcastChannel', () => {
+    const dispatchSpy = vi.fn()
+    const storeLike = {
+      dispatch: dispatchSpy,
+      getState: () => ({ tabs: { activeTabId: null }, panes: { activePane: {} } }),
+    }
+
+    const original = (globalThis as any).BroadcastChannel
+    class MockBC {
+      static instance: MockBC | null = null
+      onmessage: ((ev: any) => void) | null = null
+      constructor(_name: string) {
+        MockBC.instance = this
+      }
+      close() {}
+    }
+    ;(globalThis as any).BroadcastChannel = MockBC
+
+    try {
+      const cleanup = installCrossTabSync(storeLike as any)
+
+      const raw = JSON.stringify({
+        version: 1,
+        tabs: { activeTabId: null, tabs: [{ id: 't1', title: 'T1', createdAt: 1 }] },
+      })
+      window.dispatchEvent(new StorageEvent('storage', { key: TABS_STORAGE_KEY, newValue: raw }))
+
+      MockBC.instance!.onmessage?.({ data: { type: 'persist', key: TABS_STORAGE_KEY, raw, sourceId: 'other' } })
+
+      const hydrateCalls = dispatchSpy.mock.calls
+        .map((c) => c[0])
+        .filter((a: any) => a?.type === 'tabs/hydrateTabs')
+      expect(hydrateCalls).toHaveLength(1)
+
+      cleanup()
+    } finally {
+      ;(globalThis as any).BroadcastChannel = original
+    }
+  })
+})
