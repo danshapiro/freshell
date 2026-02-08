@@ -1,7 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { TerminalRegistry, modeSupportsResume } from '../../server/terminal-registry'
 import { ClaudeSessionIndexer, ClaudeSession } from '../../server/claude-indexer'
-import { CodingCliSessionIndexer } from '../../server/coding-cli/session-indexer'
 import type { CodingCliSession } from '../../server/coding-cli/types'
 
 vi.mock('node-pty', () => ({
@@ -396,183 +395,19 @@ describe('Session-Terminal Association Platform-specific', () => {
   })
 })
 
-describe('Codex Session-Terminal Association via CodingCliSessionIndexer', () => {
+describe('Codex Session-Terminal Association via onUpdate', () => {
   /**
-   * Helper that wires up the codingCliIndexer.onNewSession handler
-   * matching the pattern from server/index.ts for non-Claude providers.
+   * Simulates the association logic in the codingCliIndexer.onUpdate handler.
+   * This mirrors the pattern from server/index.ts: on every indexer update,
+   * try to associate each session with an unassociated terminal of matching mode/cwd.
+   * Association is idempotent — already-associated terminals are excluded by
+   * findUnassociatedTerminals, and setResumeSessionId rejects duplicates.
    */
-  function wireUpCodexAssociation(
+  function associateOnUpdate(
     registry: TerminalRegistry,
-    indexer: CodingCliSessionIndexer,
+    projects: { projectPath: string; sessions: CodingCliSession[] }[],
     broadcasts: any[],
   ) {
-    indexer.onNewSession((session) => {
-      // Skip Claude (handled by existing claudeIndexer path)
-      if (session.provider === 'claude') return
-      // Skip providers that don't support resume
-      if (!modeSupportsResume(session.provider)) return
-      if (!session.cwd) return
-
-      const unassociated = registry.findUnassociatedTerminals(session.provider, session.cwd)
-      if (unassociated.length === 0) return
-
-      const term = unassociated[0] // Only oldest
-      registry.setResumeSessionId(term.terminalId, session.sessionId)
-      broadcasts.push({
-        type: 'terminal.session.associated',
-        terminalId: term.terminalId,
-        sessionId: session.sessionId,
-      })
-    })
-  }
-
-  it('codex terminal gets associated when codex session appears', () => {
-    const registry = new TerminalRegistry()
-    const indexer = new CodingCliSessionIndexer([])
-    const broadcasts: any[] = []
-
-    wireUpCodexAssociation(registry, indexer, broadcasts)
-    indexer['initialized'] = true
-
-    // Create an unassociated codex terminal
-    const term = registry.create({ mode: 'codex', cwd: '/home/user/project' })
-    expect(term.resumeSessionId).toBeUndefined()
-
-    // Simulate new codex session detection
-    const newSession: CodingCliSession = {
-      provider: 'codex',
-      sessionId: 'codex-session-abc-123',
-      projectPath: '/home/user/project',
-      updatedAt: Date.now(),
-      cwd: '/home/user/project',
-    }
-    indexer['detectNewSessions']([newSession])
-
-    // Verify association
-    expect(registry.get(term.terminalId)?.resumeSessionId).toBe('codex-session-abc-123')
-    expect(broadcasts).toHaveLength(1)
-    expect(broadcasts[0]).toEqual({
-      type: 'terminal.session.associated',
-      terminalId: term.terminalId,
-      sessionId: 'codex-session-abc-123',
-    })
-
-    registry.shutdown()
-  })
-
-  it('does not cross-associate: codex session does not match claude terminal', () => {
-    const registry = new TerminalRegistry()
-    const indexer = new CodingCliSessionIndexer([])
-    const broadcasts: any[] = []
-
-    wireUpCodexAssociation(registry, indexer, broadcasts)
-    indexer['initialized'] = true
-
-    // Create a claude terminal (not codex)
-    registry.create({ mode: 'claude', cwd: '/home/user/project' })
-
-    // Simulate codex session
-    indexer['detectNewSessions']([{
-      provider: 'codex',
-      sessionId: 'codex-session-abc-123',
-      projectPath: '/home/user/project',
-      updatedAt: Date.now(),
-      cwd: '/home/user/project',
-    }])
-
-    // Should NOT associate - mode mismatch
-    expect(broadcasts).toHaveLength(0)
-
-    registry.shutdown()
-  })
-
-  it('only associates the oldest terminal when multiple match', () => {
-    const registry = new TerminalRegistry()
-    const indexer = new CodingCliSessionIndexer([])
-    const broadcasts: any[] = []
-
-    wireUpCodexAssociation(registry, indexer, broadcasts)
-    indexer['initialized'] = true
-
-    const term1 = registry.create({ mode: 'codex', cwd: '/home/user/project' })
-    const term2 = registry.create({ mode: 'codex', cwd: '/home/user/project' })
-
-    indexer['detectNewSessions']([{
-      provider: 'codex',
-      sessionId: 'codex-session-abc-123',
-      projectPath: '/home/user/project',
-      updatedAt: Date.now(),
-      cwd: '/home/user/project',
-    }])
-
-    expect(broadcasts).toHaveLength(1)
-    expect(broadcasts[0].terminalId).toBe(term1.terminalId)
-    expect(registry.get(term1.terminalId)?.resumeSessionId).toBe('codex-session-abc-123')
-    expect(registry.get(term2.terminalId)?.resumeSessionId).toBeUndefined()
-
-    registry.shutdown()
-  })
-
-  it('skips providers without resume support (e.g., opencode)', () => {
-    const registry = new TerminalRegistry()
-    const indexer = new CodingCliSessionIndexer([])
-    const broadcasts: any[] = []
-
-    wireUpCodexAssociation(registry, indexer, broadcasts)
-    indexer['initialized'] = true
-
-    registry.create({ mode: 'opencode', cwd: '/home/user/project' })
-
-    indexer['detectNewSessions']([{
-      provider: 'opencode',
-      sessionId: 'opencode-session-123',
-      projectPath: '/home/user/project',
-      updatedAt: Date.now(),
-      cwd: '/home/user/project',
-    }])
-
-    // Should NOT associate - opencode doesn't support resume
-    expect(broadcasts).toHaveLength(0)
-
-    registry.shutdown()
-  })
-
-  it('skips claude sessions (handled by existing claudeIndexer path)', () => {
-    const registry = new TerminalRegistry()
-    const indexer = new CodingCliSessionIndexer([])
-    const broadcasts: any[] = []
-
-    wireUpCodexAssociation(registry, indexer, broadcasts)
-    indexer['initialized'] = true
-
-    registry.create({ mode: 'claude', cwd: '/home/user/project' })
-
-    indexer['detectNewSessions']([{
-      provider: 'claude',
-      sessionId: SESSION_ID_ONE,
-      projectPath: '/home/user/project',
-      updatedAt: Date.now(),
-      cwd: '/home/user/project',
-    }])
-
-    // Should NOT associate via this handler - claude is skipped
-    expect(broadcasts).toHaveLength(0)
-
-    registry.shutdown()
-  })
-})
-
-describe('Startup association race condition fix', () => {
-  /**
-   * Simulates the startup association pass that runs after codingCliIndexer.start() completes.
-   * This matches the logic that should exist in server/index.ts.
-   */
-  function runStartupAssociationPass(
-    registry: TerminalRegistry,
-    indexer: CodingCliSessionIndexer,
-    broadcasts: any[],
-  ) {
-    const projects = indexer.getProjects()
     for (const project of projects) {
       for (const session of project.sessions) {
         if (session.provider === 'claude') continue
@@ -594,94 +429,142 @@ describe('Startup association race condition fix', () => {
     }
   }
 
-  it('associates codex terminals with sessions that were already known at startup', () => {
+  it('associates codex terminal when session appears in onUpdate', () => {
     const registry = new TerminalRegistry()
-    const indexer = new CodingCliSessionIndexer([])
     const broadcasts: any[] = []
 
-    // Simulate: terminal is created during startup
     const term = registry.create({ mode: 'codex', cwd: '/home/user/project' })
     expect(term.resumeSessionId).toBeUndefined()
 
-    // Simulate: initial scan found this session (so it's in knownSessionKeys before initialized=true)
-    // This mirrors what happens when Codex creates the session file immediately at spawn time,
-    // and the coding CLI indexer's slow initial scan picks it up.
-    const session: CodingCliSession = {
-      provider: 'codex',
-      sessionId: 'codex-session-startup-race',
+    // Simulate onUpdate delivering projects with a codex session
+    associateOnUpdate(registry, [{
       projectPath: '/home/user/project',
-      updatedAt: Date.now(),
-      cwd: '/home/user/project',
-    }
-    // detectNewSessions with initialized=false => session added to knownSessionKeys but no event
-    indexer['detectNewSessions']([session])
-    expect(broadcasts).toHaveLength(0) // No onNewSession fired
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'codex-session-abc-123',
+        projectPath: '/home/user/project',
+        updatedAt: Date.now(),
+        cwd: '/home/user/project',
+      }],
+    }], broadcasts)
 
-    // Now indexer is initialized (normal flow)
-    indexer['initialized'] = true
-
-    // A subsequent refresh with the same session does NOT fire onNewSession (it's already known)
-    indexer['detectNewSessions']([session])
-    expect(broadcasts).toHaveLength(0) // Still no event!
-
-    // The startup association pass should catch this
-    // We need to set up the projects data so getProjects() returns the session
-    indexer['projects'] = [{
-      projectPath: '/home/user/project',
-      sessions: [session],
-    }]
-
-    runStartupAssociationPass(registry, indexer, broadcasts)
-
-    // NOW the terminal should be associated
-    expect(registry.get(term.terminalId)?.resumeSessionId).toBe('codex-session-startup-race')
+    expect(registry.get(term.terminalId)?.resumeSessionId).toBe('codex-session-abc-123')
     expect(broadcasts).toHaveLength(1)
     expect(broadcasts[0]).toEqual({
       type: 'terminal.session.associated',
       terminalId: term.terminalId,
-      sessionId: 'codex-session-startup-race',
+      sessionId: 'codex-session-abc-123',
     })
 
     registry.shutdown()
   })
 
-  it('does not double-associate terminals that already have a resumeSessionId', () => {
+  it('is idempotent: repeated onUpdate calls do not double-associate', () => {
     const registry = new TerminalRegistry()
-    const indexer = new CodingCliSessionIndexer([])
     const broadcasts: any[] = []
 
-    // Terminal already associated (from previous server session, persisted in client)
-    const term = registry.create({ mode: 'codex', cwd: '/home/user/project', resumeSessionId: 'existing-session' })
-    expect(term.resumeSessionId).toBe('existing-session')
+    const term = registry.create({ mode: 'codex', cwd: '/home/user/project' })
 
-    indexer['projects'] = [{
+    const projects = [{
       projectPath: '/home/user/project',
       sessions: [{
-        provider: 'codex',
-        sessionId: 'different-session',
+        provider: 'codex' as const,
+        sessionId: 'codex-session-abc-123',
         projectPath: '/home/user/project',
         updatedAt: Date.now(),
         cwd: '/home/user/project',
       }],
     }]
 
-    runStartupAssociationPass(registry, indexer, broadcasts)
+    // First update — associates
+    associateOnUpdate(registry, projects, broadcasts)
+    expect(broadcasts).toHaveLength(1)
 
-    // Should NOT change the existing association
-    expect(registry.get(term.terminalId)?.resumeSessionId).toBe('existing-session')
+    // Second update with same data — no-op
+    associateOnUpdate(registry, projects, broadcasts)
+    expect(broadcasts).toHaveLength(1) // Still 1
+    expect(registry.get(term.terminalId)?.resumeSessionId).toBe('codex-session-abc-123')
+
+    registry.shutdown()
+  })
+
+  it('does not cross-associate: codex session does not match claude terminal', () => {
+    const registry = new TerminalRegistry()
+    const broadcasts: any[] = []
+
+    registry.create({ mode: 'claude', cwd: '/home/user/project' })
+
+    associateOnUpdate(registry, [{
+      projectPath: '/home/user/project',
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'codex-session-abc-123',
+        projectPath: '/home/user/project',
+        updatedAt: Date.now(),
+        cwd: '/home/user/project',
+      }],
+    }], broadcasts)
+
     expect(broadcasts).toHaveLength(0)
 
     registry.shutdown()
   })
 
-  it('skips claude sessions in startup pass (handled by claudeIndexer)', () => {
+  it('only associates the oldest terminal when multiple match', () => {
     const registry = new TerminalRegistry()
-    const indexer = new CodingCliSessionIndexer([])
+    const broadcasts: any[] = []
+
+    const term1 = registry.create({ mode: 'codex', cwd: '/home/user/project' })
+    const term2 = registry.create({ mode: 'codex', cwd: '/home/user/project' })
+
+    associateOnUpdate(registry, [{
+      projectPath: '/home/user/project',
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'codex-session-abc-123',
+        projectPath: '/home/user/project',
+        updatedAt: Date.now(),
+        cwd: '/home/user/project',
+      }],
+    }], broadcasts)
+
+    expect(broadcasts).toHaveLength(1)
+    expect(broadcasts[0].terminalId).toBe(term1.terminalId)
+    expect(registry.get(term1.terminalId)?.resumeSessionId).toBe('codex-session-abc-123')
+    expect(registry.get(term2.terminalId)?.resumeSessionId).toBeUndefined()
+
+    registry.shutdown()
+  })
+
+  it('skips providers without resume support', () => {
+    const registry = new TerminalRegistry()
+    const broadcasts: any[] = []
+
+    registry.create({ mode: 'opencode', cwd: '/home/user/project' })
+
+    associateOnUpdate(registry, [{
+      projectPath: '/home/user/project',
+      sessions: [{
+        provider: 'opencode',
+        sessionId: 'opencode-session-123',
+        projectPath: '/home/user/project',
+        updatedAt: Date.now(),
+        cwd: '/home/user/project',
+      }],
+    }], broadcasts)
+
+    expect(broadcasts).toHaveLength(0)
+
+    registry.shutdown()
+  })
+
+  it('skips claude sessions (handled by claudeIndexer)', () => {
+    const registry = new TerminalRegistry()
     const broadcasts: any[] = []
 
     registry.create({ mode: 'claude', cwd: '/home/user/project' })
 
-    indexer['projects'] = [{
+    associateOnUpdate(registry, [{
       projectPath: '/home/user/project',
       sessions: [{
         provider: 'claude',
@@ -690,10 +573,31 @@ describe('Startup association race condition fix', () => {
         updatedAt: Date.now(),
         cwd: '/home/user/project',
       }],
-    }]
+    }], broadcasts)
 
-    runStartupAssociationPass(registry, indexer, broadcasts)
+    expect(broadcasts).toHaveLength(0)
 
+    registry.shutdown()
+  })
+
+  it('does not overwrite existing resumeSessionId', () => {
+    const registry = new TerminalRegistry()
+    const broadcasts: any[] = []
+
+    const term = registry.create({ mode: 'codex', cwd: '/home/user/project', resumeSessionId: 'existing-session' })
+
+    associateOnUpdate(registry, [{
+      projectPath: '/home/user/project',
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'different-session',
+        projectPath: '/home/user/project',
+        updatedAt: Date.now(),
+        cwd: '/home/user/project',
+      }],
+    }], broadcasts)
+
+    expect(registry.get(term.terminalId)?.resumeSessionId).toBe('existing-session')
     expect(broadcasts).toHaveLength(0)
 
     registry.shutdown()

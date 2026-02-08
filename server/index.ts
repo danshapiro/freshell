@@ -546,28 +546,49 @@ async function main() {
   codingCliIndexer.onUpdate((projects) => {
     sessionsSync.publish(projects)
 
-    // Auto-update terminal titles based on session data
     for (const project of projects) {
       for (const session of project.sessions) {
-        if (!session.title) continue
+        // Session association for non-Claude providers (e.g. Codex).
+        // Runs on every update — idempotent because findUnassociatedTerminals
+        // excludes already-associated terminals and setResumeSessionId rejects duplicates.
+        if (session.provider !== 'claude' && modeSupportsResume(session.provider) && session.cwd) {
+          const unassociated = registry.findUnassociatedTerminals(session.provider, session.cwd)
+          if (unassociated.length > 0) {
+            const term = unassociated[0]
+            log.info({ terminalId: term.terminalId, sessionId: session.sessionId, provider: session.provider }, 'Associating terminal with coding CLI session')
+            const associated = registry.setResumeSessionId(term.terminalId, session.sessionId)
+            if (associated) {
+              try {
+                wsHandler.broadcast({
+                  type: 'terminal.session.associated' as const,
+                  terminalId: term.terminalId,
+                  sessionId: session.sessionId,
+                })
+              } catch (err) {
+                log.warn({ err, terminalId: term.terminalId }, 'Failed to broadcast session association')
+              }
+            }
+          }
+        }
 
-        // Find terminals that match this session
-        const matchingTerminals = registry.findTerminalsBySession(session.provider, session.sessionId, session.cwd)
-        for (const term of matchingTerminals) {
-          const defaultTitle =
-            session.provider === 'claude'
-              ? 'Claude'
-              : session.provider === 'codex'
-                ? 'Codex'
-                : 'CLI'
-          // Only update if title is still the default
-          if (term.title === defaultTitle) {
-            registry.updateTitle(term.terminalId, session.title)
-            wsHandler.broadcast({
-              type: 'terminal.title.updated',
-              terminalId: term.terminalId,
-              title: session.title,
-            })
+        // Auto-update terminal titles based on session data
+        if (session.title) {
+          const matchingTerminals = registry.findTerminalsBySession(session.provider, session.sessionId, session.cwd)
+          for (const term of matchingTerminals) {
+            const defaultTitle =
+              session.provider === 'claude'
+                ? 'Claude'
+                : session.provider === 'codex'
+                  ? 'Codex'
+                  : 'CLI'
+            if (term.title === defaultTitle) {
+              registry.updateTitle(term.terminalId, session.title)
+              wsHandler.broadcast({
+                type: 'terminal.title.updated',
+                terminalId: term.terminalId,
+                title: session.title,
+              })
+            }
           }
         }
       }
@@ -608,39 +629,6 @@ async function main() {
     }
   })
 
-  // Associate a coding CLI session with the oldest unassociated terminal of matching mode/cwd.
-  // Used both by the onNewSession handler and the startup association pass.
-  function associateCodingCliSession(session: { provider: string; sessionId: string; cwd?: string }, context: string) {
-    if (session.provider === 'claude') return
-    if (!modeSupportsResume(session.provider)) return
-    if (!session.cwd) return
-
-    const unassociated = registry.findUnassociatedTerminals(session.provider, session.cwd)
-    if (unassociated.length === 0) return
-
-    const term = unassociated[0]
-    log.info({ terminalId: term.terminalId, sessionId: session.sessionId, provider: session.provider }, `${context}: associating terminal with coding CLI session`)
-    const associated = registry.setResumeSessionId(term.terminalId, session.sessionId)
-    if (!associated) {
-      log.warn({ terminalId: term.terminalId, sessionId: session.sessionId, provider: session.provider }, `${context}: skipping invalid session association`)
-      return
-    }
-    try {
-      wsHandler.broadcast({
-        type: 'terminal.session.associated' as const,
-        terminalId: term.terminalId,
-        sessionId: session.sessionId,
-      })
-    } catch (err) {
-      log.warn({ err, terminalId: term.terminalId }, `${context}: failed to broadcast session association`)
-    }
-  }
-
-  // Session association for non-Claude coding CLI providers (e.g. Codex)
-  codingCliIndexer.onNewSession((session) => {
-    associateCodingCliSession(session, 'onNewSession')
-  })
-
   const startBackgroundTasks = () => {
     void withPerfSpan(
       'session_repair_start',
@@ -665,15 +653,6 @@ async function main() {
       .then(() => {
         startupState.markReady('codingCliIndexer')
         logger.info({ task: 'codingCliIndexer' }, 'Startup task ready')
-
-        // Startup association pass: associate terminals spawned during the initial scan.
-        // Codex creates session files immediately at spawn, so the slow initial scan
-        // picks them up as "already known" and onNewSession never fires for them.
-        for (const project of codingCliIndexer.getProjects()) {
-          for (const session of project.sessions) {
-            associateCodingCliSession(session, 'Startup pass')
-          }
-        }
       })
       .catch((err) => {
         logger.error({ err }, 'Coding CLI indexer failed to start')

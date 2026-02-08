@@ -6,8 +6,7 @@ import { logger } from '../logger.js'
 import { getPerfConfig, startPerfTimer } from '../perf-logger.js'
 import { configStore, SessionOverride } from '../config-store.js'
 import type { CodingCliProvider } from './provider.js'
-import type { CodingCliSession, CodingCliProviderName, ProjectGroup } from './types.js'
-import { makeSessionKey } from './types.js'
+import { makeSessionKey, type CodingCliSession, type CodingCliProviderName, type ProjectGroup } from './types.js'
 
 const perfConfig = getPerfConfig()
 const REFRESH_YIELD_EVERY = 200
@@ -65,9 +64,6 @@ export class CodingCliSessionIndexer {
   private watcher: chokidar.FSWatcher | null = null
   private projects: ProjectGroup[] = []
   private onUpdateHandlers = new Set<(projects: ProjectGroup[]) => void>()
-  private onNewSessionHandlers = new Set<(session: CodingCliSession) => void>()
-  private knownSessionKeys = new Set<string>()
-  private initialized = false
   private refreshTimer: NodeJS.Timeout | null = null
   private refreshInFlight = false
   private refreshQueued = false
@@ -82,8 +78,6 @@ export class CodingCliSessionIndexer {
   async start() {
     this.needsFullScan = true
     await this.refresh()
-    // Now enable onNewSession handlers for new sessions detected after startup
-    this.initialized = true
     const globs = this.providers.map((p) => p.getSessionGlob())
     logger.info({ globs }, 'Starting coding CLI sessions watcher')
 
@@ -117,11 +111,6 @@ export class CodingCliSessionIndexer {
   onUpdate(handler: (projects: ProjectGroup[]) => void): () => void {
     this.onUpdateHandlers.add(handler)
     return () => this.onUpdateHandlers.delete(handler)
-  }
-
-  onNewSession(handler: (session: CodingCliSession) => void): () => void {
-    this.onNewSessionHandlers.add(handler)
-    return () => this.onNewSessionHandlers.delete(handler)
   }
 
   getProjects(): ProjectGroup[] {
@@ -376,54 +365,9 @@ export class CodingCliSessionIndexer {
       return 0
     })
 
-    const allSessions = groups.flatMap((g) => g.sessions)
-    this.detectNewSessions(allSessions)
-
     this.projects = groups
     this.emitUpdate()
     endRefreshTimer({ projectCount: groups.length, sessionCount, fileCount })
-  }
-
-  private detectNewSessions(sessions: CodingCliSession[]) {
-    // Build set of current session keys to prune stale entries (prevents memory leak)
-    const currentKeys = new Set(sessions.map(s => makeSessionKey(s.provider, s.sessionId)))
-
-    // Prune knownSessionKeys to only contain keys that still exist
-    for (const key of this.knownSessionKeys) {
-      if (!currentKeys.has(key)) {
-        this.knownSessionKeys.delete(key)
-      }
-    }
-
-    const newSessions: CodingCliSession[] = []
-    for (const session of sessions) {
-      // Skip sessions without cwd - can't associate them
-      if (!session.cwd) continue
-
-      const key = makeSessionKey(session.provider, session.sessionId)
-      const wasKnown = this.knownSessionKeys.has(key)
-      if (!wasKnown) this.knownSessionKeys.add(key)
-
-      if (this.initialized && !wasKnown) {
-        newSessions.push(session)
-      }
-    }
-
-    if (this.initialized && newSessions.length > 0) {
-      newSessions.sort((a, b) => {
-        const diff = a.updatedAt - b.updatedAt
-        return diff !== 0 ? diff : makeSessionKey(a.provider, a.sessionId).localeCompare(makeSessionKey(b.provider, b.sessionId))
-      })
-      for (const session of newSessions) {
-        for (const h of this.onNewSessionHandlers) {
-          try {
-            h(session)
-          } catch (err) {
-            logger.warn({ err }, 'onNewSession handler failed')
-          }
-        }
-      }
-    }
   }
 
   private emitUpdate() {
