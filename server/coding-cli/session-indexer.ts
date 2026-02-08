@@ -6,8 +6,7 @@ import { logger } from '../logger.js'
 import { getPerfConfig, startPerfTimer } from '../perf-logger.js'
 import { configStore, SessionOverride } from '../config-store.js'
 import type { CodingCliProvider } from './provider.js'
-import type { CodingCliSession, CodingCliProviderName, ProjectGroup } from './types.js'
-import { makeSessionKey } from './types.js'
+import { makeSessionKey, type CodingCliSession, type CodingCliProviderName, type ProjectGroup } from './types.js'
 
 const perfConfig = getPerfConfig()
 const REFRESH_YIELD_EVERY = 200

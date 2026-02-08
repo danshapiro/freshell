@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { isLinuxPath, getSystemShell, escapeCmdExe, buildSpawnSpec, TerminalRegistry, isWsl, isWindowsLike } from '../../../server/terminal-registry'
+import { isLinuxPath, getSystemShell, escapeCmdExe, buildSpawnSpec, TerminalRegistry, isWsl, isWindowsLike, modeSupportsResume } from '../../../server/terminal-registry'
 import { isValidClaudeSessionId } from '../../../server/claude-session-id'
 import * as fs from 'fs'
 import os from 'os'
@@ -1826,6 +1826,101 @@ describe('TerminalRegistry', () => {
     })
   })
 
+  describe('findUnassociatedTerminals', () => {
+    it('should find codex terminals without resumeSessionId matching cwd', () => {
+      const term1 = registry.create({ mode: 'codex', cwd: '/home/user/project' })
+      // codex terminal WITH resumeSessionId (should not match)
+      registry.create({ mode: 'codex', cwd: '/home/user/project', resumeSessionId: 'codex-session-123' })
+      // shell terminal (should not match)
+      registry.create({ mode: 'shell', cwd: '/home/user/project' })
+      // claude terminal (should not match for codex mode)
+      registry.create({ mode: 'claude', cwd: '/home/user/project' })
+
+      const results = registry.findUnassociatedTerminals('codex', '/home/user/project')
+
+      expect(results).toHaveLength(1)
+      expect(results[0].terminalId).toBe(term1.terminalId)
+    })
+
+    it('should return empty array when cwd does not match', () => {
+      registry.create({ mode: 'codex', cwd: '/other/path' })
+
+      const results = registry.findUnassociatedTerminals('codex', '/home/user/project')
+
+      expect(results).toHaveLength(0)
+    })
+
+    it('should return results sorted by createdAt (oldest first)', () => {
+      const term1 = registry.create({ mode: 'codex', cwd: '/home/user/project' })
+      const term2 = registry.create({ mode: 'codex', cwd: '/home/user/project' })
+      const term3 = registry.create({ mode: 'codex', cwd: '/home/user/project' })
+
+      const results = registry.findUnassociatedTerminals('codex', '/home/user/project')
+
+      expect(results).toHaveLength(3)
+      expect(results[0].terminalId).toBe(term1.terminalId)
+      expect(results[1].terminalId).toBe(term2.terminalId)
+      expect(results[2].terminalId).toBe(term3.terminalId)
+    })
+
+    it('should normalize backslashes and trailing slashes', () => {
+      const term = registry.create({ mode: 'codex', cwd: 'C:\\Users\\Dan\\project' })
+
+      const results = registry.findUnassociatedTerminals('codex', 'C:/Users/Dan/project')
+
+      expect(results).toHaveLength(1)
+      expect(results[0].terminalId).toBe(term.terminalId)
+    })
+
+    it('should work for claude mode (delegates same logic)', () => {
+      const term = registry.create({ mode: 'claude', cwd: '/home/user/project' })
+      registry.create({ mode: 'codex', cwd: '/home/user/project' })
+
+      const results = registry.findUnassociatedTerminals('claude', '/home/user/project')
+
+      expect(results).toHaveLength(1)
+      expect(results[0].terminalId).toBe(term.terminalId)
+    })
+  })
+
+  describe('findUnassociatedClaudeTerminals delegates to findUnassociatedTerminals', () => {
+    it('should return the same results as findUnassociatedTerminals for claude mode', () => {
+      registry.create({ mode: 'claude', cwd: '/home/user/project' })
+      registry.create({ mode: 'codex', cwd: '/home/user/project' })
+
+      const claude = registry.findUnassociatedClaudeTerminals('/home/user/project')
+      const generic = registry.findUnassociatedTerminals('claude', '/home/user/project')
+
+      expect(claude).toEqual(generic)
+    })
+  })
+
+  describe('modeSupportsResume', () => {
+    it('returns true for claude', () => {
+      expect(modeSupportsResume('claude')).toBe(true)
+    })
+
+    it('returns true for codex', () => {
+      expect(modeSupportsResume('codex')).toBe(true)
+    })
+
+    it('returns false for shell', () => {
+      expect(modeSupportsResume('shell')).toBe(false)
+    })
+
+    it('returns false for opencode (no resumeArgs)', () => {
+      expect(modeSupportsResume('opencode')).toBe(false)
+    })
+
+    it('returns false for gemini (no resumeArgs)', () => {
+      expect(modeSupportsResume('gemini')).toBe(false)
+    })
+
+    it('returns false for kimi (no resumeArgs)', () => {
+      expect(modeSupportsResume('kimi')).toBe(false)
+    })
+  })
+
   describe('setResumeSessionId', () => {
     it('should set resumeSessionId on existing terminal', () => {
       const term = registry.create({ mode: 'claude', cwd: '/home/user/project' })
@@ -1843,6 +1938,15 @@ describe('TerminalRegistry', () => {
 
       expect(result).toBe(false)
       expect(registry.get(term.terminalId)?.resumeSessionId).toBeUndefined()
+    })
+
+    it('accepts any sessionId for codex terminals', () => {
+      const term = registry.create({ mode: 'codex', cwd: '/home/user/project' })
+
+      const result = registry.setResumeSessionId(term.terminalId, 'codex-session-abc-123')
+
+      expect(result).toBe(true)
+      expect(registry.get(term.terminalId)?.resumeSessionId).toBe('codex-session-abc-123')
     })
 
     it('should return false for non-existent terminal', () => {

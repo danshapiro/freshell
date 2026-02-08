@@ -63,6 +63,15 @@ const CODING_CLI_COMMANDS: Record<Exclude<TerminalMode, 'shell'>, CodingCliComma
   },
 }
 
+/**
+ * Check if a terminal mode supports session resume.
+ * Only modes with configured resumeArgs in CODING_CLI_COMMANDS support resume.
+ */
+export function modeSupportsResume(mode: TerminalMode): boolean {
+  if (mode === 'shell') return false
+  return !!CODING_CLI_COMMANDS[mode]?.resumeArgs
+}
+
 type ProviderTarget = 'unix' | 'windows'
 
 function providerNotificationArgs(mode: TerminalMode, target: ProviderTarget): string[] {
@@ -1100,10 +1109,10 @@ export class TerminalRegistry extends EventEmitter {
   }
 
   /**
-   * Find claude-mode terminals that have no resumeSessionId (waiting to be associated)
+   * Find terminals of a given mode that have no resumeSessionId (waiting to be associated)
    * and whose cwd matches the given path. Results sorted by createdAt (oldest first).
    */
-  findUnassociatedClaudeTerminals(cwd: string): TerminalRecord[] {
+  findUnassociatedTerminals(mode: TerminalMode, cwd: string): TerminalRecord[] {
     const results: TerminalRecord[] = []
     // Platform-aware normalization: case-insensitive on Windows, case-sensitive on Unix
     const normalize = (p: string) => {
@@ -1113,7 +1122,7 @@ export class TerminalRegistry extends EventEmitter {
     const targetCwd = normalize(cwd)
 
     for (const term of this.terminals.values()) {
-      if (term.mode !== 'claude') continue
+      if (term.mode !== mode) continue
       if (term.resumeSessionId) continue // Already associated
       if (!term.cwd) continue
       if (normalize(term.cwd) === targetCwd) {
@@ -1122,6 +1131,14 @@ export class TerminalRegistry extends EventEmitter {
     }
     // Sort by createdAt ascending (oldest first), with fallback for safety
     return results.sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))
+  }
+
+  /**
+   * Find claude-mode terminals that have no resumeSessionId (waiting to be associated)
+   * and whose cwd matches the given path. Results sorted by createdAt (oldest first).
+   */
+  findUnassociatedClaudeTerminals(cwd: string): TerminalRecord[] {
+    return this.findUnassociatedTerminals('claude', cwd)
   }
 
   /**

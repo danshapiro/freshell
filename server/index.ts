@@ -12,7 +12,7 @@ import { logger, setLogLevel } from './logger.js'
 import { requestLogger } from './request-logger.js'
 import { validateStartupSecurity, httpAuthMiddleware } from './auth.js'
 import { configStore } from './config-store.js'
-import { TerminalRegistry } from './terminal-registry.js'
+import { TerminalRegistry, modeSupportsResume } from './terminal-registry.js'
 import { WsHandler } from './ws-handler.js'
 import { SessionsSyncService } from './sessions-sync/service.js'
 import { claudeIndexer } from './claude-indexer.js'
@@ -54,6 +54,11 @@ const packageJson = JSON.parse(fs.readFileSync(findPackageJson(), 'utf-8'))
 const APP_VERSION: string = packageJson.version
 const log = logger.child({ component: 'server' })
 const perfConfig = getPerfConfig()
+
+// Max age difference (ms) between a session's updatedAt and a terminal's createdAt
+// for association to be considered valid. Prevents binding to stale sessions
+// from previous server runs.
+const ASSOCIATION_MAX_AGE_MS = 30_000
 
 async function main() {
   validateStartupSecurity()
@@ -546,28 +551,53 @@ async function main() {
   codingCliIndexer.onUpdate((projects) => {
     sessionsSync.publish(projects)
 
-    // Auto-update terminal titles based on session data
     for (const project of projects) {
       for (const session of project.sessions) {
-        if (!session.title) continue
+        // Session association for non-Claude providers (e.g. Codex).
+        // Runs on every update — idempotent because findUnassociatedTerminals
+        // excludes already-associated terminals.
+        // Time guard: only associate if the session is recent relative to the terminal,
+        // preventing stale sessions from previous server runs from being matched.
+        if (session.provider !== 'claude' && modeSupportsResume(session.provider) && session.cwd) {
+          const unassociated = registry.findUnassociatedTerminals(session.provider, session.cwd)
+          if (unassociated.length > 0) {
+            const term = unassociated[0]
+            if (session.updatedAt >= term.createdAt - ASSOCIATION_MAX_AGE_MS) {
+              log.info({ terminalId: term.terminalId, sessionId: session.sessionId, provider: session.provider }, 'Associating terminal with coding CLI session')
+              const associated = registry.setResumeSessionId(term.terminalId, session.sessionId)
+              if (associated) {
+                try {
+                  wsHandler.broadcast({
+                    type: 'terminal.session.associated' as const,
+                    terminalId: term.terminalId,
+                    sessionId: session.sessionId,
+                  })
+                } catch (err) {
+                  log.warn({ err, terminalId: term.terminalId }, 'Failed to broadcast session association')
+                }
+              }
+            }
+          }
+        }
 
-        // Find terminals that match this session
-        const matchingTerminals = registry.findTerminalsBySession(session.provider, session.sessionId, session.cwd)
-        for (const term of matchingTerminals) {
-          const defaultTitle =
-            session.provider === 'claude'
-              ? 'Claude'
-              : session.provider === 'codex'
-                ? 'Codex'
-                : 'CLI'
-          // Only update if title is still the default
-          if (term.title === defaultTitle) {
-            registry.updateTitle(term.terminalId, session.title)
-            wsHandler.broadcast({
-              type: 'terminal.title.updated',
-              terminalId: term.terminalId,
-              title: session.title,
-            })
+        // Auto-update terminal titles based on session data
+        if (session.title) {
+          const matchingTerminals = registry.findTerminalsBySession(session.provider, session.sessionId, session.cwd)
+          for (const term of matchingTerminals) {
+            const defaultTitle =
+              session.provider === 'claude'
+                ? 'Claude'
+                : session.provider === 'codex'
+                  ? 'Codex'
+                  : 'CLI'
+            if (term.title === defaultTitle) {
+              registry.updateTitle(term.terminalId, session.title)
+              wsHandler.broadcast({
+                type: 'terminal.title.updated',
+                terminalId: term.terminalId,
+                title: session.title,
+              })
+            }
           }
         }
       }
