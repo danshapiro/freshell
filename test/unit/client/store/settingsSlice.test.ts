@@ -40,6 +40,8 @@ describe('settingsSlice', () => {
       expect(state.settings.sidebar).toEqual({
         sortMode: 'recency-pinned',
         showProjectBadges: true,
+        showSubagents: false,
+        showNoninteractiveSessions: false,
         width: 288,
         collapsed: false,
       })
@@ -94,6 +96,8 @@ describe('settingsSlice', () => {
         sidebar: {
           sortMode: 'recency',
           showProjectBadges: false,
+          showSubagents: false,
+          showNoninteractiveSessions: false,
           width: 320,
           collapsed: false,
         },

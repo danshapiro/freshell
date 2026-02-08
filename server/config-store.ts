@@ -56,6 +56,8 @@ export type AppSettings = {
   sidebar: {
     sortMode: 'recency' | 'activity' | 'project'
     showProjectBadges: boolean
+    showSubagents: boolean
+    showNoninteractiveSessions: boolean
     width: number
     collapsed: boolean
   }
@@ -122,6 +124,8 @@ export const defaultSettings: AppSettings = {
   sidebar: {
     sortMode: 'activity',
     showProjectBadges: true,
+    showSubagents: false,
+    showNoninteractiveSessions: false,
     width: 288,
     collapsed: false,
   },

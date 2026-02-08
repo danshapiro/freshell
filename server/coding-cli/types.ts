@@ -116,6 +116,7 @@ export interface ParsedSessionMeta {
   summary?: string
   messageCount?: number
   projectPath?: string
+  isNonInteractive?: boolean
 }
 
 export interface CodingCliSessionInfo {
@@ -143,6 +144,8 @@ export interface CodingCliSession {
   summary?: string
   cwd?: string
   sourceFile?: string
+  isSubagent?: boolean
+  isNonInteractive?: boolean
 }
 
 export interface ProjectGroup {

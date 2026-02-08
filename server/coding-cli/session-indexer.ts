@@ -21,17 +21,14 @@ const normalizeFilePath = (filePath: string) => {
 
 /**
  * Check if a file path is a Claude subagent session.
- * Subagent sessions are internal implementation details and shouldn't
- * appear in the user-facing session list.
- *
  * Only applies to Claude paths (containing /.claude/ or \.claude\) to avoid
- * filtering non-Claude sessions that happen to be in a directory named "subagents".
+ * flagging non-Claude sessions that happen to be in a directory named "subagents".
  */
-function isSubagentSession(filePath: string): boolean {
+export function isSubagentSession(filePath: string): boolean {
   const normalized = filePath.toLowerCase()
   const hasSubagents = normalized.includes('/subagents/') || normalized.includes('\\subagents\\')
   if (!hasSubagents) return false
-  // Only filter if this is a Claude path
+  // Only flag if this is a Claude path
   return normalized.includes('/.claude/') || normalized.includes('\\.claude\\')
 }
 
@@ -153,12 +150,6 @@ export class CodingCliSessionIndexer {
   }
 
   private async updateCacheEntry(provider: CodingCliProvider, filePath: string, cacheKey: string) {
-    // Filter subagent sessions early so they never appear in the cache
-    if (isSubagentSession(filePath)) {
-      this.fileCache.delete(cacheKey)
-      return
-    }
-
     let stat: fs.Stats
     try {
       stat = await fsp.stat(filePath)
@@ -200,6 +191,8 @@ export class CodingCliSessionIndexer {
       summary: meta.summary,
       cwd: meta.cwd,
       sourceFile: filePath,
+      isSubagent: isSubagentSession(filePath) || undefined,
+      isNonInteractive: meta.isNonInteractive || undefined,
     }
 
     this.fileCache.set(cacheKey, {
