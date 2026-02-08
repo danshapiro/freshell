@@ -561,6 +561,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             requestIdRef.current = newRequestId
             terminalIdRef.current = undefined
             updateContent({ terminalId: undefined, createRequestId: newRequestId, status: 'creating' })
+            // Also clear the tab's terminalId to keep it in sync.
+            // This prevents openSessionTab from using the stale terminalId for dedup.
+            const currentTab = tabRef.current
+            if (currentTab) {
+              dispatch(updateTab({ id: currentTab.id, updates: { terminalId: undefined, status: 'creating' } }))
+            }
           } else if (current?.status === 'exited') {
             term.writeln('\r\n[Terminal exited - use the + button or split to start a new session]\r\n')
           }
