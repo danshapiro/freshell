@@ -6,7 +6,7 @@ import { getClaudeHome } from '../../claude-home.js'
 import type { CodingCliProvider } from '../provider.js'
 import type { NormalizedEvent, ParsedSessionMeta } from '../types.js'
 import { parseClaudeEvent, isMessageEvent, isResultEvent, isToolResultContent, isToolUseContent, isTextContent } from '../../claude-stream-types.js'
-import { looksLikePath } from '../utils.js'
+import { looksLikePath, isSystemContext, extractFromIdeContext } from '../utils.js'
 
 export type JsonlMeta = {
   sessionId?: string
@@ -14,24 +14,6 @@ export type JsonlMeta = {
   title?: string
   summary?: string
   messageCount?: number
-}
-
-/**
- * Check if a "user" message is actually system context.
- * Claude subagents inject system prompts as role:"user" messages:
- * - Agent mode instructions: [SUGGESTION MODE: ...], [REVIEW MODE: ...]
- * - AGENTS.md/instruction files: "# AGENTS.md instructions..."
- * - XML-wrapped system context: <system_context>, <environment_context>, etc.
- */
-function isSystemContext(text: string): boolean {
-  const trimmed = text.trim()
-  // Bracketed agent mode instructions: [SUGGESTION MODE: ...], [REVIEW MODE: ...]
-  if (/^\[[A-Z][A-Z_ ]*:/.test(trimmed)) return true
-  // XML-wrapped system context: <system_context>, <environment_context>, <INSTRUCTIONS>, etc.
-  if (/^<[a-zA-Z_][\w_-]*[>\s]/.test(trimmed)) return true
-  // Instruction file headers: "# AGENTS.md instructions for...", "# System", "# Instructions"
-  if (/^#\s*(AGENTS|Instructions?|System)/i.test(trimmed)) return true
-  return false
 }
 
 /** Parse session metadata from jsonl content (pure function for testing) */
@@ -84,9 +66,15 @@ export function parseSessionContent(content: string): JsonlMeta {
           ? obj.message.content
           : undefined)
 
-      if (typeof t === 'string' && t.trim() && !isSystemContext(t)) {
-        // Store up to 200 chars - UI truncates visually, tooltip shows full text
-        title = extractTitleFromMessage(t, 200)
+      if (typeof t === 'string' && t.trim()) {
+        // Try to extract user request from IDE-formatted context first
+        const ideRequest = extractFromIdeContext(t)
+        if (ideRequest) {
+          title = extractTitleFromMessage(ideRequest, 200)
+        } else if (!isSystemContext(t)) {
+          // Store up to 200 chars - UI truncates visually, tooltip shows full text
+          title = extractTitleFromMessage(t, 200)
+        }
       }
     }
 

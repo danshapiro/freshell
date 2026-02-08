@@ -43,6 +43,32 @@ describe('title-utils', () => {
       const result = extractTitleFromMessage('A'.repeat(300), 200)
       expect(result.length).toBe(200)
     })
+
+    it('uses first non-empty line for multi-line content', () => {
+      const result = extractTitleFromMessage('Fix the login bug\nThis needs to handle edge cases\nAnd update tests')
+      expect(result).toBe('Fix the login bug')
+    })
+
+    it('skips empty first lines in multi-line content', () => {
+      const result = extractTitleFromMessage('\n\n  \nActual title here\nMore details')
+      expect(result).toBe('Actual title here')
+    })
+
+    it('truncates long first line in multi-line content', () => {
+      const longLine = 'A'.repeat(100)
+      const result = extractTitleFromMessage(`${longLine}\nSecond line`, 50)
+      expect(result).toBe('A'.repeat(50))
+    })
+
+    it('falls back to collapsing single-line content', () => {
+      const result = extractTitleFromMessage('Just a single line with   extra   spaces')
+      expect(result).toBe('Just a single line with extra spaces')
+    })
+
+    it('handles content where all lines are empty', () => {
+      const result = extractTitleFromMessage('\n\n  \n  ')
+      expect(result).toBe('')
+    })
   })
 
   describe('extractTitleFromJsonlObject', () => {
