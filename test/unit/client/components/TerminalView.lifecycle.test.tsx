@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, render, cleanup, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
-import tabsReducer from '@/store/tabsSlice'
+import tabsReducer, { setActiveTab } from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
@@ -184,6 +184,100 @@ describe('TerminalView lifecycle updates', () => {
     const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
     expect(layout.content.terminalId).toBe('term-1')
     expect(layout.content.status).toBe('running')
+  })
+
+  it('focuses the remembered active pane terminal when tab becomes active', async () => {
+    const paneA: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-a',
+      status: 'running',
+      mode: 'shell',
+      shell: 'system',
+    }
+    const paneB: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-b',
+      status: 'running',
+      mode: 'shell',
+      shell: 'system',
+    }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [
+            {
+              id: 'tab-1',
+              mode: 'shell',
+              status: 'running',
+              title: 'Tab 1',
+              createRequestId: 'tab-1',
+            },
+            {
+              id: 'tab-2',
+              mode: 'shell',
+              status: 'running',
+              title: 'Tab 2',
+              createRequestId: 'tab-2',
+            },
+          ],
+          activeTabId: 'tab-1',
+        },
+        panes: {
+          layouts: {},
+          activePane: {
+            'tab-2': 'pane-2b',
+          },
+          paneTitles: {},
+        },
+        settings: { settings: defaultSettings, status: 'loaded' },
+        connection: { status: 'connected', error: null },
+      },
+    })
+
+    function Tab2TerminalViews() {
+      const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
+      const hidden = activeTabId !== 'tab-2'
+
+      return (
+        <>
+          <TerminalView tabId="tab-2" paneId="pane-2a" paneContent={paneA} hidden={hidden} />
+          <TerminalView tabId="tab-2" paneId="pane-2b" paneContent={paneB} hidden={hidden} />
+        </>
+      )
+    }
+
+    render(
+      <Provider store={store}>
+        <Tab2TerminalViews />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(terminalInstances).toHaveLength(2)
+    })
+    await waitFor(() => {
+      expect(terminalInstances[0].focus).toHaveBeenCalled()
+      expect(terminalInstances[1].focus).toHaveBeenCalled()
+    })
+
+    terminalInstances[0].focus.mockClear()
+    terminalInstances[1].focus.mockClear()
+
+    act(() => {
+      store.dispatch(setActiveTab('tab-2'))
+    })
+
+    await waitFor(() => {
+      expect(terminalInstances[1].focus).toHaveBeenCalledTimes(1)
+    })
+    expect(terminalInstances[0].focus).not.toHaveBeenCalled()
   })
 
   it('records turn completion and strips BEL from codex output', async () => {

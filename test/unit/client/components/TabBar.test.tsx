@@ -611,26 +611,26 @@ describe('TabBar', () => {
   })
 
   describe('removing active tab behavior', () => {
-    it('removing active tab switches to first remaining tab', () => {
+    it('removing active tab switches to immediate left tab', () => {
       const tab1 = createTab({ id: 'tab-1', title: 'Tab 1' })
       const tab2 = createTab({ id: 'tab-2', title: 'Tab 2' })
       const tab3 = createTab({ id: 'tab-3', title: 'Tab 3' })
 
       const store = createStore({
         tabs: [tab1, tab2, tab3],
-        activeTabId: 'tab-2', // tab 2 is active
+        activeTabId: 'tab-3',
       })
 
       renderWithStore(<TabBar />, store)
 
-      // Close tab 2 (the active tab)
+      // Close tab 3 (the active tab)
       const closeButtons = screen.getAllByTitle('Close (Shift+Click to kill)')
-      fireEvent.click(closeButtons[1])
+      fireEvent.click(closeButtons[2])
 
-      // Active tab should switch to first remaining tab (tab-1)
+      // Active tab should switch to immediate left tab (tab-2)
       const state = store.getState().tabs
       expect(state.tabs).toHaveLength(2)
-      expect(state.activeTabId).toBe('tab-1')
+      expect(state.activeTabId).toBe('tab-2')
     })
 
     it('removing last tab sets activeTabId to null', () => {

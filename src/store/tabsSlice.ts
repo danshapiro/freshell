@@ -131,9 +131,20 @@ export const tabsSlice = createSlice({
       if (tab) Object.assign(tab, action.payload.updates)
     },
     removeTab: (state, action: PayloadAction<string>) => {
-      state.tabs = state.tabs.filter((t) => t.id !== action.payload)
-      if (state.activeTabId === action.payload) {
-        state.activeTabId = state.tabs.length > 0 ? state.tabs[0].id : null
+      const removedTabId = action.payload
+      const removedIndex = state.tabs.findIndex((t) => t.id === removedTabId)
+      const wasActive = state.activeTabId === removedTabId
+
+      state.tabs = state.tabs.filter((t) => t.id !== removedTabId)
+
+      if (wasActive) {
+        if (state.tabs.length === 0) {
+          state.activeTabId = null
+          return
+        }
+
+        const nextIndex = removedIndex > 0 ? removedIndex - 1 : 0
+        state.activeTabId = state.tabs[nextIndex]?.id ?? state.tabs[0].id
       }
     },
     hydrateTabs: (state, action: PayloadAction<TabsState>) => {

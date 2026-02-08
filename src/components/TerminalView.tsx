@@ -39,6 +39,8 @@ interface TerminalViewProps {
 export default function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps) {
   const dispatch = useAppDispatch()
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
+  const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
+  const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
   const settings = useAppSelector((s) => s.settings.settings)
 
   // All hooks MUST be called before any conditional returns
@@ -78,6 +80,21 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   useEffect(() => {
     hiddenRef.current = hidden
   }, [hidden])
+
+  const shouldFocusActiveTerminal = !hidden && activeTabId === tabId && activePaneId === paneId
+
+  // Keep the active pane's terminal focused when tabs/panes switch so typing works immediately.
+  useEffect(() => {
+    if (!isTerminal) return
+    if (!shouldFocusActiveTerminal) return
+    const term = termRef.current
+    if (!term) return
+
+    requestAnimationFrame(() => {
+      if (termRef.current !== term) return
+      term.focus()
+    })
+  }, [isTerminal, shouldFocusActiveTerminal])
 
   useEffect(() => {
     lastSessionActivityAtRef.current = 0

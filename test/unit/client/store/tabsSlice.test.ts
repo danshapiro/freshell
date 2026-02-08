@@ -226,20 +226,39 @@ describe('tabsSlice', () => {
       expect(state.tabs).toHaveLength(0)
     })
 
-    it('updates activeTabId to first remaining tab when active tab is removed', () => {
+    it('updates activeTabId to immediate left tab when active tab is removed', () => {
+      let state = tabsReducer(initialState, addTab({ title: 'Tab 1' }))
+      const tab1Id = state.tabs[0].id
+      state = tabsReducer(state, addTab({ title: 'Tab 2' }))
+      const tab2Id = state.tabs[1].id
+      state = tabsReducer(state, addTab({ title: 'Tab 3' }))
+      const tab3Id = state.tabs[2].id
+
+      // Tab 3 is active
+      expect(state.activeTabId).toBe(tab3Id)
+
+      // Remove active tab (Tab 3)
+      state = tabsReducer(state, removeTab(tab3Id))
+
+      // Should switch to immediate left tab (Tab 2)
+      expect(state.activeTabId).toBe(tab2Id)
+      expect(state.tabs).toHaveLength(2)
+    })
+
+    it('falls back to first remaining tab when active tab has no left neighbor', () => {
       let state = tabsReducer(initialState, addTab({ title: 'Tab 1' }))
       const tab1Id = state.tabs[0].id
       state = tabsReducer(state, addTab({ title: 'Tab 2' }))
       const tab2Id = state.tabs[1].id
 
-      // Tab 2 is active
+      // Make Tab 1 active (no left neighbor)
+      state = tabsReducer(state, setActiveTab(tab1Id))
+
+      // Remove active tab (Tab 1)
+      state = tabsReducer(state, removeTab(tab1Id))
+
+      // Should switch to remaining tab (Tab 2)
       expect(state.activeTabId).toBe(tab2Id)
-
-      // Remove active tab (Tab 2)
-      state = tabsReducer(state, removeTab(tab2Id))
-
-      // Should switch to first remaining tab (Tab 1)
-      expect(state.activeTabId).toBe(tab1Id)
       expect(state.tabs).toHaveLength(1)
     })
 
