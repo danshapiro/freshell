@@ -387,7 +387,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     function attach(tid: string) {
       setIsAttaching(true)
       ws.send({ type: 'terminal.attach', terminalId: tid })
-      ws.send({ type: 'terminal.resize', terminalId: tid, cols: term.cols, rows: term.rows })
+      // NOTE: Do NOT send terminal.resize here. At this point fit() hasn't run yet,
+      // so term.cols/rows are xterm defaults (80×24), not the actual viewport size.
+      // Sending a resize with wrong dimensions causes the PTY to resize, triggering
+      // a TUI redraw at the wrong size (e.g., Codex renders 24 rows in a 40-row viewport,
+      // putting the text input at the top of the pane). The correct resize is sent by:
+      // - ResizeObserver callback (for visible tabs, after fit() runs)
+      // - Visibility effect (for hidden tabs, when they become visible)
     }
 
     async function ensure() {
