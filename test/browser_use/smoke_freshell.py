@@ -100,7 +100,7 @@ Steps:
    - Rename it to: Test mixed panes (same rename approach: double_click tab name -> input with clear=true -> Enter -> verify).
    - On this tab, build a 3-pane layout with EXACTLY:
      - one Editor pane
-     - one shell pane
+     - one CMD shell pane
      - one Browser pane
    - Use the "Add pane" button to split, then pick the pane type in the new pane chooser.
 
@@ -108,11 +108,15 @@ Steps:
    - In the Editor pane, open this file:
      {known_text_file}
    - Use the "Enter file path..." box, paste/type the full path, and press Enter.
-   - Prove the preview toggle works:
-     - click "Source", then click "Preview".
-   - Confirm "Quick Start" appears in the editor by using your find_text action to search for it.
+   - Prove the source/preview toggle works:
+     - The editor uses ONE toggle button whose label alternates between "Source" and "Preview".
+     - Click the toggle when it shows "Source".
+     - Then click the same toggle when it shows "Preview".
+     - Then click the same toggle again when it shows "Source".
+     - Do not search for a separate Preview button.
+   - Confirm "README.md" appears in the editor by using your find_text action to search for it.
      - find_text is the right tool here because it proves on-screen visibility.
-     - If find_text does not find "Quick Start", output:
+     - If find_text does not find "README.md", output:
        SMOKE_RESULT: FAIL - editor did not load file
 
 7) Shell pane check:
@@ -134,12 +138,12 @@ Steps:
      - Do not type a literal "{{Enter}}".
      - Use insert_text for the command, then send_keys with Enter.
    - Paste shortcut regression check (single-ingress):
-     - Run this exact command in the shell (insert_text, then Enter):
-       node -e 'process.stdin.once("data",d=>(console.log(String(d).replace(/\\r?\\n$/,"")==="{PASTE_PROBE_TOKEN}"?"PASTE_PROBE_OK":"PASTE_PROBE_BAD:"+JSON.stringify(String(d).replace(/\\r?\\n$/,""))),process.exit(0)))'
-     - Then call dispatch_paste_shortcut exactly once with text:
+     - Keep the shell pane focused.
+     - Call dispatch_paste_shortcut exactly once with text:
        {PASTE_PROBE_TOKEN}
-     - Press Enter once.
-     - If output is not exactly PASTE_PROBE_OK, output:
+     - This action returns PASTE_PROBE_OK only when exactly one terminal.input message
+       containing exactly that text is sent.
+     - If it does not return PASTE_PROBE_OK, output:
        SMOKE_RESULT: FAIL - paste probe failed
 
 8) Browser pane check:
@@ -478,9 +482,60 @@ async def _run(args: argparse.Namespace) -> int:
       cdp_session = await browser_session.get_or_create_cdp_session(target_id=None, focus=True)
       escaped_text = json.dumps(params.text)
       expression = f"""
-(() => {{
+(async () => {{
+  const w = window;
+  if (!w.__freshellPasteProbe) {{
+    w.__freshellPasteProbe = {{ events: [], hooked: false }};
+  }}
+
+  if (!w.__freshellPasteProbe.hooked) {{
+    const originalSend = WebSocket.prototype.send;
+    WebSocket.prototype.send = function (...args) {{
+      try {{
+        const [data] = args;
+        if (typeof data === "string") {{
+          const parsed = JSON.parse(data);
+          if (parsed && parsed.type === "terminal.input") {{
+            w.__freshellPasteProbe.events.push({{
+              terminalId: parsed.terminalId ?? null,
+              data: typeof parsed.data === "string" ? parsed.data : String(parsed.data ?? ""),
+              timestamp: Date.now(),
+            }});
+          }}
+        }}
+      }} catch (_err) {{
+        // no-op
+      }}
+      return originalSend.apply(this, args);
+    }};
+    w.__freshellPasteProbe.hooked = true;
+  }}
+
+  const beforeCount = w.__freshellPasteProbe.events.length;
   const text = {escaped_text};
-  const target = document.activeElement;
+  let target = document.activeElement;
+
+  // browser_use often focuses the pane wrapper (role=button), not xterm's input.
+  // Route synthetic paste to the active pane's xterm helper textarea when available.
+  const activePane = target && typeof target.closest === "function"
+    ? target.closest('[aria-label^="Focus pane "]')
+    : null;
+  let termTarget = null;
+  if (activePane) {{
+    termTarget = activePane.querySelector('.xterm-helper-textarea');
+  }}
+  if (!termTarget) {{
+    const visibleHelpers = Array.from(document.querySelectorAll('.xterm-helper-textarea'))
+      .filter((el) => {{
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < window.innerHeight;
+      }});
+    termTarget = visibleHelpers.length > 0 ? visibleHelpers[0] : null;
+  }}
+  if (termTarget) {{
+    termTarget.focus();
+    target = termTarget;
+  }}
   if (!target) return "no-active-element";
 
   const isApple = /Mac|iPhone|iPad|iPod/.test(navigator.platform || "");
@@ -510,17 +565,57 @@ async def _run(args: argparse.Namespace) -> int:
   }}
 
   target.dispatchEvent(pasteEvent);
-  return "ok";
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  const deltaEvents = w.__freshellPasteProbe.events.slice(beforeCount);
+  return {{
+    status: "ok",
+    targetTag: target?.tagName || null,
+    targetClass: target?.className || null,
+    inputCount: deltaEvents.length,
+    inputs: deltaEvents.map((event) => event.data),
+  }};
 }})()
 """.strip()
-      await cdp_session.cdp_client.send.Runtime.evaluate(
+      evaluate_result = await cdp_session.cdp_client.send.Runtime.evaluate(
         params={
           "expression": expression,
           "returnByValue": True,
+          "awaitPromise": True,
         },
         session_id=cdp_session.session_id,
       )
-      memory = f"Dispatched paste shortcut for text: {params.text}"
+
+      value: dict[str, object] | None = None
+      if isinstance(evaluate_result, dict):
+        if isinstance(evaluate_result.get("result"), dict):
+          candidate = evaluate_result.get("result") or {}
+          if isinstance(candidate.get("value"), dict):
+            value = candidate.get("value")  # type: ignore[assignment]
+        elif isinstance(evaluate_result.get("value"), dict):
+          value = evaluate_result.get("value")  # type: ignore[assignment]
+
+      if value is None:
+        return ActionResult(error="Paste shortcut probe failed: missing evaluate result payload")
+
+      raw_count = value.get("inputCount")
+      input_count = int(raw_count) if isinstance(raw_count, (int, float, str)) and str(raw_count).isdigit() else -1
+      raw_inputs = value.get("inputs")
+      inputs = [str(item) for item in raw_inputs] if isinstance(raw_inputs, list) else []
+
+      expected = params.text.replace("\r\n", "\n").replace("\r", "\n")
+      normalized_inputs = [item.replace("\r\n", "\n").replace("\r", "\n") for item in inputs]
+      is_single_exact = input_count == 1 and len(normalized_inputs) == 1 and normalized_inputs[0] == expected
+
+      if not is_single_exact:
+        target_tag = value.get("targetTag")
+        target_class = value.get("targetClass")
+        details = (
+          f"Paste shortcut probe mismatch: inputCount={input_count}, "
+          f"inputs={json.dumps(inputs)[:300]}, targetTag={target_tag}, targetClass={target_class}"
+        )
+        return ActionResult(error=details)
+
+      memory = "PASTE_PROBE_OK"
       return ActionResult(extracted_content=memory, long_term_memory=memory)
     except Exception as e:
       return ActionResult(error=f"Failed to dispatch paste shortcut: {type(e).__name__}: {e}")
