@@ -55,6 +55,11 @@ const APP_VERSION: string = packageJson.version
 const log = logger.child({ component: 'server' })
 const perfConfig = getPerfConfig()
 
+// Max age difference (ms) between a session's updatedAt and a terminal's createdAt
+// for association to be considered valid. Prevents binding to stale sessions
+// from previous server runs.
+const ASSOCIATION_MAX_AGE_MS = 30_000
+
 async function main() {
   validateStartupSecurity()
 
@@ -550,22 +555,26 @@ async function main() {
       for (const session of project.sessions) {
         // Session association for non-Claude providers (e.g. Codex).
         // Runs on every update — idempotent because findUnassociatedTerminals
-        // excludes already-associated terminals and setResumeSessionId rejects duplicates.
+        // excludes already-associated terminals.
+        // Time guard: only associate if the session is recent relative to the terminal,
+        // preventing stale sessions from previous server runs from being matched.
         if (session.provider !== 'claude' && modeSupportsResume(session.provider) && session.cwd) {
           const unassociated = registry.findUnassociatedTerminals(session.provider, session.cwd)
           if (unassociated.length > 0) {
             const term = unassociated[0]
-            log.info({ terminalId: term.terminalId, sessionId: session.sessionId, provider: session.provider }, 'Associating terminal with coding CLI session')
-            const associated = registry.setResumeSessionId(term.terminalId, session.sessionId)
-            if (associated) {
-              try {
-                wsHandler.broadcast({
-                  type: 'terminal.session.associated' as const,
-                  terminalId: term.terminalId,
-                  sessionId: session.sessionId,
-                })
-              } catch (err) {
-                log.warn({ err, terminalId: term.terminalId }, 'Failed to broadcast session association')
+            if (session.updatedAt >= term.createdAt - ASSOCIATION_MAX_AGE_MS) {
+              log.info({ terminalId: term.terminalId, sessionId: session.sessionId, provider: session.provider }, 'Associating terminal with coding CLI session')
+              const associated = registry.setResumeSessionId(term.terminalId, session.sessionId)
+              if (associated) {
+                try {
+                  wsHandler.broadcast({
+                    type: 'terminal.session.associated' as const,
+                    terminalId: term.terminalId,
+                    sessionId: session.sessionId,
+                  })
+                } catch (err) {
+                  log.warn({ err, terminalId: term.terminalId }, 'Failed to broadcast session association')
+                }
               }
             }
           }
