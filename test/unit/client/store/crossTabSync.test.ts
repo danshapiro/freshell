@@ -192,6 +192,58 @@ describe('crossTabSync', () => {
     expect(content.status).toBe('running')
   })
 
+  it('does not crash on malformed remote pane layout (corrupted localStorage)', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+
+    // Local state: valid terminal pane
+    store.dispatch(hydratePanes({
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-1',
+          content: {
+            kind: 'terminal',
+            mode: 'shell',
+            createRequestId: 'req-1',
+            status: 'running',
+            terminalId: 'local-terminal-123',
+          },
+        } as any,
+      },
+      activePane: { 'tab-1': 'pane-1' },
+      paneTitles: {},
+    }))
+
+    // Remote state: malformed split with missing children
+    const remoteRaw = JSON.stringify({
+      version: 4,
+      layouts: {
+        'tab-1': {
+          type: 'split',
+          id: 'split-bad',
+          direction: 'horizontal',
+          sizes: [50, 50],
+          // children is missing entirely — corrupted data
+        },
+      },
+      activePane: { 'tab-1': 'pane-1' },
+      paneTitles: {},
+      paneTitleSetByUser: {},
+    })
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    // Should not throw — gracefully falls back to incoming
+    expect(() => {
+      window.dispatchEvent(new StorageEvent('storage', { key: PANES_STORAGE_KEY, newValue: remoteRaw }))
+    }).not.toThrow()
+
+    // Layout should be updated (to incoming, since merge can't recurse)
+    expect(store.getState().panes.layouts['tab-1']).toBeDefined()
+  })
+
   it('does not permanently dedupe: identical remote payload should hydrate again after a local persisted change', () => {
     const dispatchSpy = vi.fn()
     const storeLike = {

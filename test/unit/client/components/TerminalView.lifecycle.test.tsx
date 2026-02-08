@@ -19,6 +19,7 @@ const wsMocks = vi.hoisted(() => ({
 
 const restoreMocks = vi.hoisted(() => ({
   consumeTerminalRestoreRequestId: vi.fn(() => false),
+  addTerminalRestoreRequestId: vi.fn(),
 }))
 
 vi.mock('@/lib/ws-client', () => ({
@@ -36,6 +37,7 @@ vi.mock('@/lib/terminal-themes', () => ({
 
 vi.mock('@/lib/terminal-restore', () => ({
   consumeTerminalRestoreRequestId: restoreMocks.consumeTerminalRestoreRequestId,
+  addTerminalRestoreRequestId: restoreMocks.addTerminalRestoreRequestId,
 }))
 
 vi.mock('lucide-react', () => ({
@@ -1124,5 +1126,164 @@ describe('TerminalView lifecycle updates', () => {
     const term = terminalInstances[0]
     const writelnCalls = term.writeln.mock.calls.map(([s]: [string]) => s)
     expect(writelnCalls.some((s: string) => s.includes('Terminal exited'))).toBe(true)
+  })
+
+  it('mirrors resumeSessionId to tab on terminal.session.associated', async () => {
+    const tabId = 'tab-session-assoc'
+    const paneId = 'pane-session-assoc'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-assoc',
+      status: 'creating',
+      mode: 'claude',
+      shell: 'system',
+      initialCwd: '/tmp',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'claude',
+            status: 'running',
+            title: 'Claude',
+            titleSetByUser: false,
+            createRequestId: 'req-assoc',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: { settings: defaultSettings, status: 'loaded' },
+        connection: { status: 'connected', error: null },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    // Simulate terminal creation first to set terminalId
+    messageHandler!({
+      type: 'terminal.created',
+      requestId: 'req-assoc',
+      terminalId: 'term-assoc',
+      snapshot: '',
+      createdAt: Date.now(),
+    })
+
+    // Simulate session association
+    messageHandler!({
+      type: 'terminal.session.associated',
+      terminalId: 'term-assoc',
+      sessionId: 'session-abc-123',
+    })
+
+    // Verify pane content has resumeSessionId
+    const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
+    expect(layout.content.resumeSessionId).toBe('session-abc-123')
+
+    // Verify tab also has resumeSessionId mirrored
+    const tab = store.getState().tabs.tabs.find(t => t.id === tabId)
+    expect(tab?.resumeSessionId).toBe('session-abc-123')
+  })
+
+  it('clears tab terminalId and sets status to creating on INVALID_TERMINAL_ID reconnect', async () => {
+    const tabId = 'tab-clear-tid'
+    const paneId = 'pane-clear-tid'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-clear',
+      status: 'running',
+      mode: 'claude',
+      shell: 'system',
+      terminalId: 'term-clear',
+      initialCwd: '/tmp',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'claude',
+            status: 'running',
+            title: 'Claude',
+            titleSetByUser: false,
+            terminalId: 'term-clear',
+            createRequestId: 'req-clear',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: { settings: defaultSettings, status: 'loaded' },
+        connection: { status: 'connected', error: null },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    // Trigger INVALID_TERMINAL_ID for the current terminal
+    messageHandler!({
+      type: 'error',
+      code: 'INVALID_TERMINAL_ID',
+      message: 'Unknown terminalId',
+      terminalId: 'term-clear',
+    })
+
+    // Wait for state update
+    await waitFor(() => {
+      const tab = store.getState().tabs.tabs.find(t => t.id === tabId)
+      expect(tab?.terminalId).toBeUndefined()
+    })
+
+    // Verify tab status was set to 'creating'
+    const tab = store.getState().tabs.tabs.find(t => t.id === tabId)
+    expect(tab?.status).toBe('creating')
+
+    // Verify pane content was also updated
+    const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
+    expect(layout.content.terminalId).toBeUndefined()
+    expect(layout.content.status).toBe('creating')
   })
 })

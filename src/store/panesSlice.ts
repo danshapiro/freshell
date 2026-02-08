@@ -302,11 +302,14 @@ function buildGridLayout(leaves: Extract<PaneNode, { type: 'leaf' }>[]): PaneNod
  * with a terminalId beats an incoming pane without one (same createRequestId).
  */
 function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode {
+  // Guard: bail to incoming if either node is malformed (corrupted localStorage)
+  if (!incoming || !local || !incoming.type || !local.type) return incoming
+
   // If same leaf with same createRequestId, prefer local if it has terminalId
   if (incoming.type === 'leaf' && local.type === 'leaf') {
     if (
-      incoming.content.kind === 'terminal' &&
-      local.content.kind === 'terminal' &&
+      incoming.content?.kind === 'terminal' &&
+      local.content?.kind === 'terminal' &&
       incoming.content.createRequestId === local.content.createRequestId
     ) {
       // Local has terminalId, incoming doesn't → keep local terminal state
@@ -317,8 +320,12 @@ function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode {
     return incoming
   }
 
-  // If both splits with same structure, recurse
-  if (incoming.type === 'split' && local.type === 'split') {
+  // If both splits with same structure, recurse (guard children array shape)
+  if (
+    incoming.type === 'split' && local.type === 'split' &&
+    Array.isArray(incoming.children) && incoming.children.length === 2 &&
+    Array.isArray(local.children) && local.children.length === 2
+  ) {
     return {
       ...incoming,
       children: [
@@ -328,7 +335,7 @@ function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode {
     }
   }
 
-  // Structure changed (leaf↔split) — take incoming
+  // Structure changed (leaf↔split) or malformed children — take incoming
   return incoming
 }
 
