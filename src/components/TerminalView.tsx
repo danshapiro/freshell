@@ -156,9 +156,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       paste: async () => {
         const text = await readText()
         if (!text) return
-        const tid = terminalIdRef.current
-        if (!tid) return
-        ws.send({ type: 'terminal.input', terminalId: tid, data: text })
+        term.paste(text)
       },
       selectAll: () => term.selectAll(),
       clearScrollback: () => term.clear(),

@@ -7,6 +7,7 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
+import { getTerminalActions } from '@/lib/pane-action-registry'
 
 const wsMocks = vi.hoisted(() => ({
   send: vi.fn(),
@@ -34,6 +35,8 @@ vi.mock('lucide-react', () => ({
 
 // Capture the keyboard handler callback
 let capturedKeyHandler: ((event: KeyboardEvent) => boolean) | null = null
+let capturedOnData: ((data: string) => void) | null = null
+let capturedTerminal: { paste: ReturnType<typeof vi.fn> } | null = null
 
 vi.mock('xterm', () => {
   class MockTerminal {
@@ -46,15 +49,24 @@ vi.mock('xterm', () => {
     writeln = vi.fn()
     clear = vi.fn()
     dispose = vi.fn()
-    onData = vi.fn()
+    onData = vi.fn((cb: (data: string) => void) => {
+      capturedOnData = cb
+    })
     onTitleChange = vi.fn(() => ({ dispose: vi.fn() }))
     selectAll = vi.fn()
     reset = vi.fn()
+    paste = vi.fn((text: string) => {
+      capturedOnData?.(text)
+    })
     attachCustomKeyEventHandler = vi.fn((handler: (event: KeyboardEvent) => boolean) => {
       capturedKeyHandler = handler
     })
     getSelection = vi.fn(() => 'selected text')
     focus = vi.fn()
+
+    constructor() {
+      capturedTerminal = this
+    }
   }
 
   return { Terminal: MockTerminal }
@@ -156,6 +168,8 @@ function createKeyboardEvent(key: string, modifiers: { ctrlKey?: boolean; shiftK
 describe('TerminalView keyboard handling', () => {
   beforeEach(() => {
     capturedKeyHandler = null
+    capturedOnData = null
+    capturedTerminal = null
     wsMocks.send.mockClear()
     clipboardMocks.readText.mockClear()
     clipboardMocks.copyText.mockClear()
@@ -315,6 +329,44 @@ describe('TerminalView keyboard handling', () => {
 
       expect(result).toBe(false)
       expect(event.preventDefault).toHaveBeenCalled()
+    })
+  })
+
+  describe('terminal actions paste', () => {
+    it('context-menu paste uses term.paste and emits exactly one terminal.input via onData', async () => {
+      clipboardMocks.readText.mockResolvedValue('pasted content')
+      const { store, tabId, paneId, paneContent } = createTestStore('term-1')
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(capturedTerminal).not.toBeNull()
+      })
+
+      const actions = getTerminalActions(paneId)
+      expect(actions).toBeDefined()
+
+      const initialInputMessages = wsMocks.send.mock.calls.filter(
+        ([msg]) => (msg as { type?: string }).type === 'terminal.input'
+      ).length
+
+      await actions!.paste()
+
+      expect(capturedTerminal!.paste).toHaveBeenCalledWith('pasted content')
+
+      const inputMessages = wsMocks.send.mock.calls.filter(
+        ([msg]) => (msg as { type?: string }).type === 'terminal.input'
+      )
+      expect(inputMessages).toHaveLength(initialInputMessages + 1)
+      expect(inputMessages.at(-1)?.[0]).toEqual({
+        type: 'terminal.input',
+        terminalId: 'term-1',
+        data: 'pasted content',
+      })
     })
   })
 
