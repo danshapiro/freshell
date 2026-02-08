@@ -56,26 +56,67 @@ function createDeferred<T>() {
   return { promise, resolve, reject }
 }
 
-describe('CodingCliSessionIndexer', () => {
-  let tempDir: string
+let tempDir: string
 
-  beforeEach(async () => {
-    tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-coding-cli-'))
-    vi.mocked(configStore.snapshot).mockResolvedValue({
-      sessionOverrides: {},
-      settings: {
-        codingCli: {
-          enabledProviders: ['claude'],
-          providers: {},
-        },
+beforeEach(async () => {
+  tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-coding-cli-'))
+  vi.mocked(configStore.snapshot).mockResolvedValue({
+    sessionOverrides: {},
+    settings: {
+      codingCli: {
+        enabledProviders: ['claude'],
+        providers: {},
       },
-    })
+    },
+  })
+})
+
+afterEach(async () => {
+  await fsp.rm(tempDir, { recursive: true, force: true })
+  vi.clearAllMocks()
+})
+
+describe('isSubagentSession() scoping', () => {
+  it('filters Claude subagent paths (/.claude/.../subagents/...)', async () => {
+    const claudeSubagentPath = path.join(tempDir, '.claude', 'projects', 'proj', 'subagents', 'session.jsonl')
+    await fsp.mkdir(path.dirname(claudeSubagentPath), { recursive: true })
+    await fsp.writeFile(claudeSubagentPath, JSON.stringify({ cwd: '/project/a', title: 'Subagent' }) + '\n')
+
+    const provider: CodingCliProvider = {
+      ...makeProvider([claudeSubagentPath]),
+      homeDir: tempDir,
+    }
+
+    const indexer = new CodingCliSessionIndexer([provider])
+    await indexer.refresh()
+
+    const projects = indexer.getProjects()
+    // Should be filtered out — it's a Claude subagent
+    expect(projects).toHaveLength(0)
   })
 
-  afterEach(async () => {
-    await fsp.rm(tempDir, { recursive: true, force: true })
-    vi.clearAllMocks()
+  it('does NOT filter non-Claude paths containing "subagents"', async () => {
+    // A Codex session in a directory named "subagents" should NOT be filtered
+    const codexSubagentPath = path.join(tempDir, 'codex', 'sessions', 'subagents', 'session.jsonl')
+    await fsp.mkdir(path.dirname(codexSubagentPath), { recursive: true })
+    await fsp.writeFile(codexSubagentPath, JSON.stringify({ cwd: '/project/a', title: 'Codex Session' }) + '\n')
+
+    const provider: CodingCliProvider = {
+      ...makeProvider([codexSubagentPath]),
+      homeDir: path.join(tempDir, 'codex'),
+    }
+
+    const indexer = new CodingCliSessionIndexer([provider])
+    await indexer.refresh()
+
+    const projects = indexer.getProjects()
+    // Should NOT be filtered - it's not a Claude path
+    expect(projects).toHaveLength(1)
+    expect(projects[0].sessions[0].title).toBe('Codex Session')
   })
+})
+
+describe('CodingCliSessionIndexer', () => {
 
   it('groups sessions by project path with provider metadata', async () => {
     const fileA = path.join(tempDir, 'session-a.jsonl')

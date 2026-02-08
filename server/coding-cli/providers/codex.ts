@@ -4,7 +4,7 @@ import fsp from 'fs/promises'
 import { extractTitleFromMessage } from '../../title-utils.js'
 import type { CodingCliProvider } from '../provider.js'
 import type { NormalizedEvent, ParsedSessionMeta } from '../types.js'
-import { looksLikePath } from '../utils.js'
+import { looksLikePath, isSystemContext, extractFromIdeContext } from '../utils.js'
 
 export function defaultCodexHome(): string {
   return process.env.CODEX_HOME || path.join(os.homedir(), '.codex')
@@ -16,22 +16,6 @@ function extractTextContent(items: any[] | undefined): string {
     .map((item) => (item && typeof item.text === 'string' ? item.text : ''))
     .filter(Boolean)
     .join('\n')
-}
-
-/**
- * Check if a "user" message is actually system context injected by Codex.
- * Codex marks several things as role:"user" that aren't real user prompts:
- * - AGENTS.md/instruction files (start with "# AGENTS.md" or similar)
- * - Environment context (wrapped in <environment_context> XML)
- * - Other XML-wrapped system context (starts with <tag>)
- */
-function isSystemContext(text: string): boolean {
-  const trimmed = text.trim()
-  // XML-wrapped system context: <environment_context>, <INSTRUCTIONS>, etc.
-  if (/^<[a-zA-Z_][\w_-]*[>\s]/.test(trimmed)) return true
-  // Instruction file headers: "# AGENTS.md instructions for...", "# System", "# Instructions"
-  if (/^#\s*(AGENTS|Instructions?|System)/i.test(trimmed)) return true
-  return false
 }
 
 export function parseCodexSessionContent(content: string): ParsedSessionMeta {
@@ -66,8 +50,14 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
 
     if (!title && obj?.type === 'response_item' && obj?.payload?.type === 'message' && obj?.payload?.role === 'user') {
       const text = extractTextContent(obj.payload.content)
-      if (text.trim() && !isSystemContext(text)) {
-        title = extractTitleFromMessage(text, 200)
+      if (text.trim()) {
+        // Try to extract user request from IDE-formatted context first
+        const ideRequest = extractFromIdeContext(text)
+        if (ideRequest) {
+          title = extractTitleFromMessage(ideRequest, 200)
+        } else if (!isSystemContext(text)) {
+          title = extractTitleFromMessage(text, 200)
+        }
       }
     }
 

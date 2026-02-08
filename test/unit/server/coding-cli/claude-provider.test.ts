@@ -519,6 +519,87 @@ describe('claude provider cross-platform tests', () => {
 
       expect(meta.title).toBe('Hello, I need help')
     })
+
+    it('skips pasted log/debug output (digit+comma)', () => {
+      const content = [
+        '{"cwd": "/project"}',
+        '{"role": "user", "content": "0, totalJsHeapSize: 12345678, usedJsHeapSize: 9876543"}',
+        '{"role": "user", "content": "Why is memory usage so high?"}',
+      ].join('\n')
+
+      const meta = parseSessionContent(content)
+
+      expect(meta.title).toBe('Why is memory usage so high?')
+    })
+
+    it('skips agent boilerplate "You are an automated..."', () => {
+      const content = [
+        '{"cwd": "/project"}',
+        '{"role": "user", "content": "You are an automated coding assistant that helps with..."}',
+        '{"role": "user", "content": "Add error handling to the API"}',
+      ].join('\n')
+
+      const meta = parseSessionContent(content)
+
+      expect(meta.title).toBe('Add error handling to the API')
+    })
+
+    it('skips pasted shell output "> command"', () => {
+      const content = [
+        '{"cwd": "/project"}',
+        '{"role": "user", "content": "> npm run build\\n\\nadded 42 packages"}',
+        '{"role": "user", "content": "The build is failing, help me fix it"}',
+      ].join('\n')
+
+      const meta = parseSessionContent(content)
+
+      expect(meta.title).toBe('The build is failing, help me fix it')
+    })
+
+    it('skips <user_instructions> tags', () => {
+      const content = [
+        '{"cwd": "/project"}',
+        '{"role": "user", "content": "<user_instructions>\\nAlways use TypeScript\\n</user_instructions>"}',
+        '{"role": "user", "content": "Refactor the auth module"}',
+      ].join('\n')
+
+      const meta = parseSessionContent(content)
+
+      expect(meta.title).toBe('Refactor the auth module')
+    })
+
+    it('returns no title when only system context exists', () => {
+      const content = [
+        '{"cwd": "/project"}',
+        '{"role": "user", "content": "<environment_context>\\n  <cwd>/project</cwd>\\n</environment_context>"}',
+        '{"role": "user", "content": "# AGENTS.md instructions\\n\\nFollow these rules..."}',
+      ].join('\n')
+
+      const meta = parseSessionContent(content)
+
+      expect(meta.title).toBeUndefined()
+    })
+
+    it('extracts user request from IDE context messages', () => {
+      const ideMessage = [
+        '# Context from my IDE setup:',
+        '',
+        '## My codebase',
+        'This is a React project...',
+        '',
+        '## My request for Codex:',
+        'Fix the authentication bug in the login form',
+      ].join('\\n')
+
+      const content = [
+        '{"cwd": "/project"}',
+        `{"role": "user", "content": "${ideMessage}"}`,
+      ].join('\n')
+
+      const meta = parseSessionContent(content)
+
+      expect(meta.title).toBe('Fix the authentication bug in the login form')
+    })
   })
 
   describe('parseSessionContent() - orphaned sessions (snapshot-only)', () => {

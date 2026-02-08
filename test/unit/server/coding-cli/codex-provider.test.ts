@@ -242,5 +242,181 @@ describe('codex-provider', () => {
 
       expect(meta.title).toBe('Hello, help me debug this')
     })
+
+    it('skips pasted log/debug output (digit+comma)', () => {
+      const content = [
+        JSON.stringify({
+          type: 'session_meta',
+          payload: { id: 'session-5', cwd: '/project' },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: '0, totalJsHeapSize: 12345678' }],
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Why is memory high?' }],
+          },
+        }),
+      ].join('\n')
+
+      const meta = parseCodexSessionContent(content)
+
+      expect(meta.title).toBe('Why is memory high?')
+    })
+
+    it('skips agent boilerplate "You are an automated..."', () => {
+      const content = [
+        JSON.stringify({
+          type: 'session_meta',
+          payload: { id: 'session-6', cwd: '/project' },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'You are an automated coding assistant that helps with...' }],
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Add error handling' }],
+          },
+        }),
+      ].join('\n')
+
+      const meta = parseCodexSessionContent(content)
+
+      expect(meta.title).toBe('Add error handling')
+    })
+
+    it('skips pasted shell output "$ command"', () => {
+      const content = [
+        JSON.stringify({
+          type: 'session_meta',
+          payload: { id: 'session-7', cwd: '/project' },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: '$ git status\nOn branch main' }],
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'The build is failing' }],
+          },
+        }),
+      ].join('\n')
+
+      const meta = parseCodexSessionContent(content)
+
+      expect(meta.title).toBe('The build is failing')
+    })
+
+    it('skips <user_instructions> tags', () => {
+      const content = [
+        JSON.stringify({
+          type: 'session_meta',
+          payload: { id: 'session-8', cwd: '/project' },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: '<user_instructions>\nAlways use TypeScript\n</user_instructions>' }],
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Refactor the auth module' }],
+          },
+        }),
+      ].join('\n')
+
+      const meta = parseCodexSessionContent(content)
+
+      expect(meta.title).toBe('Refactor the auth module')
+    })
+
+    it('returns no title when only system context exists', () => {
+      const content = [
+        JSON.stringify({
+          type: 'session_meta',
+          payload: { id: 'session-9', cwd: '/project' },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: '<environment_context>\n  <cwd>/project</cwd>\n</environment_context>' }],
+          },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: '# AGENTS.md instructions\n\nFollow these rules...' }],
+          },
+        }),
+      ].join('\n')
+
+      const meta = parseCodexSessionContent(content)
+
+      expect(meta.title).toBeUndefined()
+    })
+
+    it('extracts user request from IDE context messages', () => {
+      const ideMessage = [
+        '# Context from my IDE setup:',
+        '',
+        '## My codebase',
+        'This is a React project...',
+        '',
+        '## My request for Codex:',
+        'Fix the authentication bug in the login form',
+      ].join('\n')
+
+      const content = [
+        JSON.stringify({
+          type: 'session_meta',
+          payload: { id: 'session-10', cwd: '/project' },
+        }),
+        JSON.stringify({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: ideMessage }],
+          },
+        }),
+      ].join('\n')
+
+      const meta = parseCodexSessionContent(content)
+
+      expect(meta.title).toBe('Fix the authentication bug in the login form')
+    })
   })
 })
