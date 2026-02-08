@@ -3,6 +3,7 @@ import type { TabsState } from './tabsSlice'
 import type { PanesState } from './paneTypes'
 import type { Tab } from './types'
 import { nanoid } from 'nanoid'
+import { broadcastPersistedRaw } from './persistBroadcast'
 
 const STORAGE_KEY = 'freshell.tabs.v1'
 const PANES_STORAGE_KEY = 'freshell.panes.v1'
@@ -245,7 +246,9 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
       }
 
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(tabsPayload))
+        const raw = JSON.stringify(tabsPayload)
+        localStorage.setItem(STORAGE_KEY, raw)
+        broadcastPersistedRaw(STORAGE_KEY, raw)
       } catch {
         // ignore quota
       }
@@ -264,6 +267,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
         }
         const panesJson = JSON.stringify(panesPayload)
         localStorage.setItem(PANES_STORAGE_KEY, panesJson)
+        broadcastPersistedRaw(PANES_STORAGE_KEY, panesJson)
       } catch (err) {
         console.error('[Panes Persist] Failed to save to localStorage:', err)
       }

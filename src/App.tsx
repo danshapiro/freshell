@@ -20,6 +20,7 @@ import { setClientPerfEnabled } from '@/lib/perf-logger'
 import { applyLocalTerminalFontFamily } from '@/lib/terminal-fonts'
 import { store } from '@/store/store'
 import { useThemeEffect } from '@/hooks/useTheme'
+import { installCrossTabSync } from '@/store/crossTabSync'
 import Sidebar, { AppView } from '@/components/Sidebar'
 import TabBar from '@/components/TabBar'
 import TabContent from '@/components/TabContent'
@@ -57,6 +58,11 @@ export default function App() {
   const [isMobile, setIsMobile] = useState(false)
   const mainContentRef = useRef<HTMLDivElement>(null)
   const userOpenedSidebarOnMobileRef = useRef(false)
+
+  // Keep this tab's Redux state in sync with persisted writes from other browser tabs.
+  useEffect(() => {
+    return installCrossTabSync(store)
+  }, [])
 
   // Sidebar width from settings (or local state during drag)
   const sidebarWidth = settings.sidebar?.width ?? 288
