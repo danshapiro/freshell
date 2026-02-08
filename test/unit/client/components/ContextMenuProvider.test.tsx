@@ -444,6 +444,102 @@ describe('ContextMenuProvider', () => {
     expect(clipboardMocks.copyText).toHaveBeenCalledWith('codex resume codex-session-123')
   })
 
+  it('copies resume command from pane header context menu for cli panes', async () => {
+    const user = userEvent.setup()
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        sessions: sessionsReducer,
+        connection: connectionReducer,
+      },
+      middleware: (getDefaultMiddleware) =>
+        getDefaultMiddleware({ serializableCheck: false }),
+      preloadedState: {
+        tabs: {
+          tabs: [
+            {
+              id: 'tab-1',
+              createRequestId: 'tab-1',
+              title: 'Claude',
+              status: 'running',
+              mode: 'claude',
+              createdAt: 1,
+            },
+          ],
+          activeTabId: 'tab-1',
+          renameRequestTabId: null,
+        },
+        panes: {
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: 'claude',
+                status: 'running',
+                resumeSessionId: VALID_SESSION_ID,
+              },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+          paneTitles: {},
+        },
+        sessions: {
+          projects: [],
+          expandedProjects: new Set<string>(),
+        },
+        connection: {
+          status: 'ready',
+          platform: null,
+        },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div data-context={ContextIds.Pane} data-tab-id="tab-1" data-pane-id="pane-1">
+            Pane Header
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Pane Header'), keys: '[MouseRight]' })
+    await user.click(screen.getByRole('menuitem', { name: 'Copy resume command' }))
+
+    expect(clipboardMocks.copyText).toHaveBeenCalledWith(`claude --resume ${VALID_SESSION_ID}`)
+  })
+
+  it('does not show resume command on shell pane header context menu', async () => {
+    const user = userEvent.setup()
+    const store = createStoreWithSession()
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div data-context={ContextIds.Pane} data-tab-id="tab-1" data-pane-id="pane-1">
+            Shell Pane Header
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Shell Pane Header'), keys: '[MouseRight]' })
+    expect(screen.queryByRole('menuitem', { name: 'Copy resume command' })).toBeNull()
+  })
+
   it('does not show resume command on shell pane context menu', async () => {
     const user = userEvent.setup()
     const store = createStoreWithSession()

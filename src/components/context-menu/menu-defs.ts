@@ -221,7 +221,15 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
   }
 
   if (target.kind === 'pane') {
+    const tab = tabs.find((t) => t.id === target.tabId)
+    const layout = paneLayouts[target.tabId]
+    const paneContent = layout ? findPaneContent(layout, target.paneId) : null
+    const resumeCandidate = paneContent ? getResumeCandidateForTerminalContent(paneContent, tab) : null
+    const paneResumeMenuItem = resumeCandidate
+      ? [buildCopyResumeMenuItem('pane-copy-resume-command', resumeCandidate, actions)]
+      : []
     return [
+      ...paneResumeMenuItem,
       { type: 'item', id: 'rename-pane', label: 'Rename pane', onSelect: () => actions.renamePane(target.tabId, target.paneId) },
     ]
   }
