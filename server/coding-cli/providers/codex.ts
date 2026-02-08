@@ -24,6 +24,7 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
   let cwd: string | undefined
   let title: string | undefined
   let summary: string | undefined
+  let isNonInteractive: boolean | undefined
 
   for (const line of lines) {
     let obj: any
@@ -38,6 +39,9 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
       if (!sessionId && typeof payload.id === 'string') sessionId = payload.id
       if (!cwd && typeof payload.cwd === 'string' && looksLikePath(payload.cwd)) {
         cwd = payload.cwd
+      }
+      if (payload.source === 'exec') {
+        isNonInteractive = true
       }
     }
 
@@ -82,6 +86,7 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
     title,
     summary,
     messageCount: lines.length,
+    isNonInteractive,
   }
 }
 

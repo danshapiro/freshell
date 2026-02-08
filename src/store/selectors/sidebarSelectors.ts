@@ -19,6 +19,8 @@ export interface SidebarSessionItem {
   ratchetedActivity?: number
   isRunning: boolean
   runningTerminalId?: string
+  isSubagent?: boolean
+  isNonInteractive?: boolean
 }
 
 const EMPTY_ACTIVITY: Record<string, number> = {}
@@ -32,6 +34,8 @@ const selectSessionActivityForSort = (state: RootState) => {
   if (sortMode !== 'activity') return EMPTY_ACTIVITY
   return state.sessionActivity?.sessions || EMPTY_ACTIVITY
 }
+const selectShowSubagents = (state: RootState) => state.settings.settings.sidebar?.showSubagents ?? false
+const selectShowNoninteractiveSessions = (state: RootState) => state.settings.settings.sidebar?.showNoninteractiveSessions ?? false
 const selectTerminals = (_state: RootState, terminals: BackgroundTerminal[]) => terminals
 const selectFilter = (_state: RootState, _terminals: BackgroundTerminal[], filter: string) => filter
 
@@ -104,6 +108,8 @@ function buildSessionItems(
         ratchetedActivity,
         isRunning: !!runningTerminalId,
         runningTerminalId,
+        isSubagent: session.isSubagent,
+        isNonInteractive: session.isNonInteractive,
       })
     }
   }
@@ -121,6 +127,22 @@ function filterSessionItems(items: SidebarSessionItem[], filter: string): Sideba
       item.projectPath?.toLowerCase().includes(q) ||
       item.provider.toLowerCase().includes(q)
   )
+}
+
+export interface VisibilitySettings {
+  showSubagents: boolean
+  showNoninteractiveSessions: boolean
+}
+
+export function filterSessionItemsByVisibility(
+  items: SidebarSessionItem[],
+  settings: VisibilitySettings,
+): SidebarSessionItem[] {
+  return items.filter((item) => {
+    if (!settings.showSubagents && item.isSubagent) return false
+    if (!settings.showNoninteractiveSessions && item.isNonInteractive) return false
+    return true
+  })
 }
 
 export function sortSessionItems(items: SidebarSessionItem[], sortMode: string): SidebarSessionItem[] {
@@ -186,10 +208,11 @@ export function sortSessionItems(items: SidebarSessionItem[], sortMode: string):
 
 export const makeSelectSortedSessionItems = () =>
   createSelector(
-    [selectProjects, selectTabs, selectPanes, selectSessionActivityForSort, selectSortMode, selectTerminals, selectFilter],
-    (projects, tabs, panes, sessionActivity, sortMode, terminals, filter) => {
+    [selectProjects, selectTabs, selectPanes, selectSessionActivityForSort, selectSortMode, selectShowSubagents, selectShowNoninteractiveSessions, selectTerminals, selectFilter],
+    (projects, tabs, panes, sessionActivity, sortMode, showSubagents, showNoninteractiveSessions, terminals, filter) => {
       const items = buildSessionItems(projects, tabs, panes, terminals, sessionActivity)
-      const filtered = filterSessionItems(items, filter)
+      const visible = filterSessionItemsByVisibility(items, { showSubagents, showNoninteractiveSessions })
+      const filtered = filterSessionItems(visible, filter)
       return sortSessionItems(filtered, sortMode)
     }
   )

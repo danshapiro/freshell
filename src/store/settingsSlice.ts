@@ -27,6 +27,8 @@ export const defaultSettings: AppSettings = {
   sidebar: {
     sortMode: 'recency-pinned',
     showProjectBadges: true,
+    showSubagents: false,
+    showNoninteractiveSessions: false,
     width: 288,
     collapsed: false,
   },

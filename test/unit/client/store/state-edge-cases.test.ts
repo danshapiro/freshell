@@ -814,6 +814,8 @@ describe('State Edge Cases', () => {
           sidebar: {
             sortMode: 'activity',
             showProjectBadges: false,
+            showSubagents: false,
+            showNoninteractiveSessions: false,
             width: 400,
             collapsed: true,
           },

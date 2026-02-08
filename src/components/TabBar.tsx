@@ -3,6 +3,7 @@ import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, closeTab, setActiveTab, updateTab, reorderTabs, clearTabRenameRequest } from '@/store/tabsSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { getTabDisplayTitle } from '@/lib/tab-title'
+import { collectTerminalIds } from '@/lib/pane-utils'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import TabItem from './TabItem'
 import { cancelCodingCliRequest } from '@/store/codingCliSlice'
@@ -122,6 +123,17 @@ export default function TabBar() {
     [paneLayouts]
   )
 
+  const getTerminalIdsForTab = useCallback((tab: Tab): string[] => {
+    const layout = paneLayouts[tab.id]
+    if (layout) {
+      const ids = collectTerminalIds(layout)
+      if (ids.length > 0) {
+        return Array.from(new Set(ids))
+      }
+    }
+    return tab.terminalId ? [tab.terminalId] : []
+  }, [paneLayouts])
+
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const [activeId, setActiveId] = useState<string | null>(null)
@@ -230,11 +242,15 @@ export default function TabBar() {
                   }
                 }}
                 onClose={(e) => {
-                  if (tab.terminalId) {
-                    ws.send({
-                      type: e.shiftKey ? 'terminal.kill' : 'terminal.detach',
-                      terminalId: tab.terminalId,
-                    })
+                  const terminalIds = getTerminalIdsForTab(tab)
+                  if (terminalIds.length > 0) {
+                    const messageType = e.shiftKey ? 'terminal.kill' : 'terminal.detach'
+                    for (const terminalId of terminalIds) {
+                      ws.send({
+                        type: messageType,
+                        terminalId,
+                      })
+                    }
                   } else if (tab.codingCliSessionId) {
                     if (tab.status === 'creating') {
                       dispatch(cancelCodingCliRequest({ requestId: tab.codingCliSessionId }))

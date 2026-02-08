@@ -129,8 +129,29 @@ export const claudeProvider: CodingCliProvider = {
         continue
       }
       for (const entry of entries) {
-        if (!entry.endsWith('.jsonl')) continue
-        files.push(path.join(projectDir, entry))
+        const entryPath = path.join(projectDir, entry)
+        if (entry.endsWith('.jsonl')) {
+          files.push(entryPath)
+          continue
+        }
+        // Scan session subdirectories for subagents/*.jsonl
+        try {
+          const entryStat = await fsp.stat(entryPath)
+          if (!entryStat.isDirectory()) continue
+        } catch {
+          continue
+        }
+        const subagentsDir = path.join(entryPath, 'subagents')
+        try {
+          const subEntries = await fsp.readdir(subagentsDir)
+          for (const sub of subEntries) {
+            if (sub.endsWith('.jsonl')) {
+              files.push(path.join(subagentsDir, sub))
+            }
+          }
+        } catch {
+          // No subagents directory — that's fine
+        }
       }
     }
     return files

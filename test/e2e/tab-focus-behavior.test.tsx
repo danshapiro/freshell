@@ -232,4 +232,106 @@ describe('tab focus behavior (e2e)', () => {
       expect(store.getState().tabs.activeTabId).toBe('tab-2')
     })
   })
+
+  it('closing a split tab detaches all pane terminals', async () => {
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+        turnCompletion: turnCompletionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [
+            {
+              id: 'tab-1',
+              title: 'Tab 1',
+              createRequestId: 'tab-1',
+              terminalId: 'term-stale',
+              mode: 'shell' as const,
+              status: 'running' as const,
+              shell: 'system' as const,
+              createdAt: Date.now(),
+            },
+          ],
+          activeTabId: 'tab-1',
+        },
+        panes: {
+          layouts: {
+            'tab-1': {
+              type: 'split',
+              id: 'split-1',
+              direction: 'horizontal' as const,
+              sizes: [50, 50] as [number, number],
+              children: [
+                {
+                  type: 'leaf',
+                  id: 'pane-1',
+                  content: {
+                    kind: 'terminal',
+                    mode: 'shell',
+                    shell: 'system',
+                    status: 'running',
+                    createRequestId: 'req-pane-1',
+                    terminalId: 'term-a',
+                  },
+                },
+                {
+                  type: 'leaf',
+                  id: 'pane-2',
+                  content: {
+                    kind: 'terminal',
+                    mode: 'shell',
+                    shell: 'system',
+                    status: 'running',
+                    createRequestId: 'req-pane-2',
+                    terminalId: 'term-b',
+                  },
+                },
+              ],
+            },
+          },
+          activePane: {
+            'tab-1': 'pane-1',
+          },
+          paneTitles: {},
+        },
+        settings: {
+          settings: defaultSettings,
+          loaded: true,
+        },
+        connection: {
+          status: 'ready' as const,
+          platform: 'linux',
+          availableClis: {},
+        },
+        turnCompletion: {
+          seq: 0,
+          lastEvent: null,
+          pendingEvents: [],
+          attentionByTab: {},
+        },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TabBar />
+      </Provider>
+    )
+
+    const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
+    fireEvent.click(closeButton)
+
+    const detachMessages = wsMocks.send.mock.calls
+      .map(([msg]) => msg)
+      .filter((msg) => msg?.type === 'terminal.detach')
+
+    expect(detachMessages).toEqual([
+      { type: 'terminal.detach', terminalId: 'term-a' },
+      { type: 'terminal.detach', terminalId: 'term-b' },
+    ])
+  })
 })

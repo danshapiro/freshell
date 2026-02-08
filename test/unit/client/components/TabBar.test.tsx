@@ -9,6 +9,7 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import type { Tab } from '@/store/types'
+import type { PaneNode } from '@/store/paneTypes'
 
 // Mock the ws-client module
 const mockSend = vi.fn()
@@ -53,7 +54,50 @@ function createTab(overrides: Partial<Tab> = {}): Tab {
   }
 }
 
-function createStore(initialState: Partial<TabsState> = {}, attentionByTab: Record<string, boolean> = {}) {
+function createTwoTerminalSplitLayout(firstTerminalId: string, secondTerminalId: string): PaneNode {
+  return {
+    type: 'split',
+    id: 'split-1',
+    direction: 'horizontal',
+    sizes: [50, 50],
+    children: [
+      {
+        type: 'leaf',
+        id: 'pane-1',
+        content: {
+          kind: 'terminal',
+          mode: 'shell',
+          shell: 'system',
+          status: 'running',
+          createRequestId: 'req-pane-1',
+          terminalId: firstTerminalId,
+        },
+      },
+      {
+        type: 'leaf',
+        id: 'pane-2',
+        content: {
+          kind: 'terminal',
+          mode: 'shell',
+          shell: 'system',
+          status: 'running',
+          createRequestId: 'req-pane-2',
+          terminalId: secondTerminalId,
+        },
+      },
+    ],
+  }
+}
+
+function createStore(
+  initialState: Partial<TabsState> = {},
+  attentionByTab: Record<string, boolean> = {},
+  panesState: {
+    layouts?: Record<string, PaneNode>
+    activePane?: Record<string, string>
+    paneTitles?: Record<string, Record<string, string>>
+  } = {},
+) {
   return configureStore({
     reducer: {
       tabs: tabsReducer,
@@ -76,6 +120,8 @@ function createStore(initialState: Partial<TabsState> = {}, attentionByTab: Reco
       panes: {
         layouts: {},
         activePane: {},
+        paneTitles: {},
+        ...panesState,
       },
       settings: {
         settings: defaultSettings,
@@ -339,6 +385,84 @@ describe('TabBar', () => {
       expect(mockSend).toHaveBeenCalledWith({
         type: 'terminal.kill',
         terminalId: 'term-456',
+      })
+    })
+
+    it('close button detaches every terminal in split pane layout', () => {
+      const tab = createTab({
+        id: 'tab-1',
+        title: 'Tab 1',
+        terminalId: 'term-stale',
+      })
+
+      const store = createStore(
+        {
+          tabs: [tab],
+          activeTabId: 'tab-1',
+        },
+        {},
+        {
+          layouts: {
+            'tab-1': createTwoTerminalSplitLayout('term-a', 'term-b'),
+          },
+          activePane: {
+            'tab-1': 'pane-1',
+          },
+        },
+      )
+
+      renderWithStore(<TabBar />, store)
+
+      const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
+      fireEvent.click(closeButton)
+
+      expect(mockSend).toHaveBeenCalledTimes(2)
+      expect(mockSend).toHaveBeenNthCalledWith(1, {
+        type: 'terminal.detach',
+        terminalId: 'term-a',
+      })
+      expect(mockSend).toHaveBeenNthCalledWith(2, {
+        type: 'terminal.detach',
+        terminalId: 'term-b',
+      })
+    })
+
+    it('shift+click kills every terminal in split pane layout', () => {
+      const tab = createTab({
+        id: 'tab-1',
+        title: 'Tab 1',
+        terminalId: 'term-stale',
+      })
+
+      const store = createStore(
+        {
+          tabs: [tab],
+          activeTabId: 'tab-1',
+        },
+        {},
+        {
+          layouts: {
+            'tab-1': createTwoTerminalSplitLayout('term-a', 'term-b'),
+          },
+          activePane: {
+            'tab-1': 'pane-1',
+          },
+        },
+      )
+
+      renderWithStore(<TabBar />, store)
+
+      const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
+      fireEvent.click(closeButton, { shiftKey: true })
+
+      expect(mockSend).toHaveBeenCalledTimes(2)
+      expect(mockSend).toHaveBeenNthCalledWith(1, {
+        type: 'terminal.kill',
+        terminalId: 'term-a',
+      })
+      expect(mockSend).toHaveBeenNthCalledWith(2, {
+        type: 'terminal.kill',
+        terminalId: 'term-b',
       })
     })
 

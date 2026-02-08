@@ -60,6 +60,8 @@ export interface CodingCliSession {
   cwd?: string
   archived?: boolean
   sourceFile?: string
+  isSubagent?: boolean
+  isNonInteractive?: boolean
 }
 
 export interface ProjectGroup {
@@ -133,6 +135,8 @@ export interface AppSettings {
   sidebar: {
     sortMode: SidebarSortMode
     showProjectBadges: boolean
+    showSubagents: boolean
+    showNoninteractiveSessions: boolean
     width: number // pixels, default 288 (equivalent to w-72)
     collapsed: boolean // for mobile/responsive use
   }

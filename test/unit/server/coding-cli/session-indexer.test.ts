@@ -79,7 +79,7 @@ afterEach(async () => {
 })
 
 describe('isSubagentSession() scoping', () => {
-  it('filters Claude subagent paths (/.claude/.../subagents/...)', async () => {
+  it('flags Claude subagent paths with isSubagent: true', async () => {
     const claudeSubagentPath = path.join(tempDir, '.claude', 'projects', 'proj', 'subagents', 'session.jsonl')
     await fsp.mkdir(path.dirname(claudeSubagentPath), { recursive: true })
     await fsp.writeFile(claudeSubagentPath, JSON.stringify({ cwd: '/project/a', title: 'Subagent' }) + '\n')
@@ -93,12 +93,14 @@ describe('isSubagentSession() scoping', () => {
     await indexer.refresh()
 
     const projects = indexer.getProjects()
-    // Should be filtered out — it's a Claude subagent
-    expect(projects).toHaveLength(0)
+    // Should be included with isSubagent flag set
+    expect(projects).toHaveLength(1)
+    expect(projects[0].sessions[0].title).toBe('Subagent')
+    expect(projects[0].sessions[0].isSubagent).toBe(true)
   })
 
-  it('does NOT filter non-Claude paths containing "subagents"', async () => {
-    // A Codex session in a directory named "subagents" should NOT be filtered
+  it('does NOT flag non-Claude paths containing "subagents"', async () => {
+    // A Codex session in a directory named "subagents" should NOT be flagged
     const codexSubagentPath = path.join(tempDir, 'codex', 'sessions', 'subagents', 'session.jsonl')
     await fsp.mkdir(path.dirname(codexSubagentPath), { recursive: true })
     await fsp.writeFile(codexSubagentPath, JSON.stringify({ cwd: '/project/a', title: 'Codex Session' }) + '\n')
@@ -112,9 +114,9 @@ describe('isSubagentSession() scoping', () => {
     await indexer.refresh()
 
     const projects = indexer.getProjects()
-    // Should NOT be filtered - it's not a Claude path
     expect(projects).toHaveLength(1)
     expect(projects[0].sessions[0].title).toBe('Codex Session')
+    expect(projects[0].sessions[0].isSubagent).toBeUndefined()
   })
 })
 

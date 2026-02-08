@@ -543,6 +543,26 @@ export default function SettingsView() {
                 }}
               />
             </SettingsRow>
+
+            <SettingsRow label="Show subagent sessions">
+              <Toggle
+                checked={settings.sidebar?.showSubagents ?? false}
+                onChange={(checked) => {
+                  dispatch(updateSettingsLocal({ sidebar: { showSubagents: checked } } as any))
+                  scheduleSave({ sidebar: { showSubagents: checked } })
+                }}
+              />
+            </SettingsRow>
+
+            <SettingsRow label="Show non-interactive sessions">
+              <Toggle
+                checked={settings.sidebar?.showNoninteractiveSessions ?? false}
+                onChange={(checked) => {
+                  dispatch(updateSettingsLocal({ sidebar: { showNoninteractiveSessions: checked } } as any))
+                  scheduleSave({ sidebar: { showNoninteractiveSessions: checked } })
+                }}
+              />
+            </SettingsRow>
           </SettingsSection>
 
           {/* Panes */}
