@@ -30,7 +30,7 @@
 - **Dark/light themes** — 8 terminal themes (Dracula, One Dark, Solarized, GitHub, and more) plus system/light/dark app themes
 - **Drag-and-drop tabs** — Reorder tabs by dragging, with keyboard and touch support
 - **Context menus** — Right-click menus for tabs, terminals, sessions, projects, and messages with 40+ actions
-- **Activity notifications** — Audio alert when a terminal finishes while the window is in the background
+- **Activity notifications** — Audio bell and tab badge when a coding CLI finishes its turn, plus alerts when terminals exit in background tabs
 - **Mobile responsive** — Auto-collapsing sidebar and overlay navigation for phones and tablets
 - **Auto-update** — Checks for new releases on startup and offers one-key upgrade
 
@@ -38,7 +38,7 @@
 
 ```bash
 # Clone the repository at the latest stable release
-git clone --branch v0.3.2 https://github.com/danshapiro/freshell.git
+git clone --branch v0.4.0 https://github.com/danshapiro/freshell.git
 cd freshell
 
 # Install dependencies
