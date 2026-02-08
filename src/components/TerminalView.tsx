@@ -513,6 +513,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         if (msg.type === 'terminal.session.associated' && msg.terminalId === tid) {
           const sessionId = msg.sessionId as string
           updateContent({ resumeSessionId: sessionId })
+          // Mirror to tab so TabContent can reconstruct correct default
+          // content if pane layout is lost (e.g., localStorage quota error)
+          const currentTab = tabRef.current
+          if (currentTab) {
+            dispatch(updateTab({ id: currentTab.id, updates: { resumeSessionId: sessionId } }))
+          }
         }
 
         if (msg.type === 'error' && msg.requestId === reqId) {
