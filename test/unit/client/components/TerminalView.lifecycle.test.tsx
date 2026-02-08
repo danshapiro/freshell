@@ -469,6 +469,161 @@ describe('TerminalView lifecycle updates', () => {
     }))
   })
 
+  it('does not send duplicate terminal.resize from attach (visibility effect handles it)', async () => {
+    const tabId = 'tab-no-premature-resize'
+    const paneId = 'pane-no-premature-resize'
+
+    // Simulate a refresh scenario: pane already has a terminalId from localStorage.
+    // The attach() function should NOT send its own terminal.resize. The only resize
+    // should come from the visibility effect (which calls fit() first), preventing
+    // a premature resize with xterm's default 80×24 that would cause TUI apps like
+    // Codex to render at the wrong dimensions (text input at top of pane).
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-no-premature-resize',
+      status: 'running',
+      mode: 'codex',
+      shell: 'system',
+      terminalId: 'term-existing',
+      initialCwd: '/tmp',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'codex',
+            status: 'running',
+            title: 'Codex',
+            titleSetByUser: false,
+            terminalId: 'term-existing',
+            createRequestId: paneContent.createRequestId,
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: { settings: defaultSettings, status: 'loaded' },
+        connection: { status: 'connected', error: null },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalViewFromStore tabId={tabId} paneId={paneId} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    // terminal.attach is sent from the attach function
+    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'terminal.attach',
+      terminalId: 'term-existing',
+    }))
+
+    // terminal.resize should be sent exactly once (from the visibility effect, which
+    // calls fit() before sending). The attach() function must NOT send a second resize.
+    const resizeCalls = wsMocks.send.mock.calls.filter(
+      ([msg]: [any]) => msg.type === 'terminal.resize'
+    )
+    expect(resizeCalls).toHaveLength(1)
+
+    // The resize must come BEFORE the attach (visibility effect runs before WS effect)
+    const allCalls = wsMocks.send.mock.calls.map(([msg]: [any]) => msg.type)
+    const resizeIdx = allCalls.indexOf('terminal.resize')
+    const attachIdx = allCalls.indexOf('terminal.attach')
+    expect(resizeIdx).toBeLessThan(attachIdx)
+  })
+
+  it('does not send terminal.resize for hidden tabs on attach (defers to visibility effect)', async () => {
+    const tabId = 'tab-hidden-resize'
+    const paneId = 'pane-hidden-resize'
+
+    // Hidden (background) tabs should not send any resize on attach.
+    // The visibility effect skips hidden tabs, and attach() no longer sends resize.
+    // The correct resize will be sent when the tab becomes visible.
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-hidden-resize',
+      status: 'running',
+      mode: 'codex',
+      shell: 'system',
+      terminalId: 'term-hidden',
+      initialCwd: '/tmp',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'codex',
+            status: 'running',
+            title: 'Codex',
+            titleSetByUser: false,
+            terminalId: 'term-hidden',
+            createRequestId: paneContent.createRequestId,
+          }],
+          activeTabId: 'some-other-tab',
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: { settings: defaultSettings, status: 'loaded' },
+        connection: { status: 'connected', error: null },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} hidden />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    // terminal.attach is sent
+    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'terminal.attach',
+      terminalId: 'term-hidden',
+    }))
+
+    // No terminal.resize should be sent: visibility effect skips hidden tabs,
+    // and attach() no longer sends resize. Without this fix, attach() would
+    // send 80×24 (xterm defaults), causing the Codex TUI to render at wrong
+    // dimensions and persist until the tab becomes visible.
+    expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: 'terminal.resize',
+    }))
+  })
+
   it('ignores INVALID_TERMINAL_ID errors for other terminals', async () => {
     const tabId = 'tab-2'
     const paneId = 'pane-2'
