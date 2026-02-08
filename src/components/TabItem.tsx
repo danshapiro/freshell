@@ -23,6 +23,7 @@ function StatusIndicator({ status }: { status: string }) {
 export interface TabItemProps {
   tab: Tab
   isActive: boolean
+  needsAttention: boolean
   isDragging: boolean
   isRenaming: boolean
   renameValue: string
@@ -37,6 +38,7 @@ export interface TabItemProps {
 export default function TabItem({
   tab,
   isActive,
+  needsAttention,
   isDragging,
   isRenaming,
   renameValue,
@@ -61,7 +63,9 @@ export default function TabItem({
         'group flex items-center gap-2 h-8 px-3 rounded-t-md text-sm cursor-pointer transition-all',
         isActive
           ? 'bg-background text-foreground shadow-sm'
-          : 'bg-muted text-muted-foreground hover:text-foreground hover:bg-accent mt-1',
+          : needsAttention
+            ? 'bg-emerald-100 text-emerald-900 hover:bg-emerald-200 mt-1 dark:bg-emerald-900/40 dark:text-emerald-100 dark:hover:bg-emerald-900/55'
+            : 'bg-muted text-muted-foreground hover:text-foreground hover:bg-accent mt-1',
         isDragging && 'opacity-50'
       )}
       role="button"

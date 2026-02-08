@@ -6,6 +6,7 @@ import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
+import turnCompletionReducer from '@/store/turnCompletionSlice'
 import { useAppSelector } from '@/store/hooks'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 
@@ -183,6 +184,215 @@ describe('TerminalView lifecycle updates', () => {
     const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
     expect(layout.content.terminalId).toBe('term-1')
     expect(layout.content.status).toBe('running')
+  })
+
+  it('records turn completion and strips BEL from codex output', async () => {
+    const tabId = 'tab-codex-bell'
+    const paneId = 'pane-codex-bell'
+    const terminalId = 'term-codex-bell'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-codex-bell',
+      status: 'running',
+      mode: 'codex',
+      shell: 'system',
+      terminalId,
+      initialCwd: '/tmp',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+        turnCompletion: turnCompletionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'codex',
+            status: 'running',
+            title: 'Codex',
+            titleSetByUser: false,
+            terminalId,
+            createRequestId: 'req-codex-bell',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: { settings: defaultSettings, status: 'loaded' },
+        connection: { status: 'connected', error: null },
+        turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    messageHandler!({
+      type: 'terminal.output',
+      terminalId,
+      data: 'hello\x07world',
+    })
+
+    expect(terminalInstances[0].write).toHaveBeenCalledWith('helloworld')
+    expect(store.getState().turnCompletion.lastEvent?.tabId).toBe(tabId)
+    expect(store.getState().turnCompletion.lastEvent?.paneId).toBe(paneId)
+    expect(store.getState().turnCompletion.lastEvent?.terminalId).toBe(terminalId)
+    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(1)
+  })
+
+  it('preserves OSC title BEL terminators and does not record turn completion', async () => {
+    const tabId = 'tab-codex-osc'
+    const paneId = 'pane-codex-osc'
+    const terminalId = 'term-codex-osc'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-codex-osc',
+      status: 'running',
+      mode: 'codex',
+      shell: 'system',
+      terminalId,
+      initialCwd: '/tmp',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+        turnCompletion: turnCompletionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'codex',
+            status: 'running',
+            title: 'Codex',
+            titleSetByUser: false,
+            terminalId,
+            createRequestId: 'req-codex-osc',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: { settings: defaultSettings, status: 'loaded' },
+        connection: { status: 'connected', error: null },
+        turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    messageHandler!({
+      type: 'terminal.output',
+      terminalId,
+      data: '\x1b]0;New title\x07',
+    })
+
+    expect(terminalInstances[0].write).toHaveBeenCalledWith('\x1b]0;New title\x07')
+    expect(store.getState().turnCompletion.lastEvent).toBeNull()
+  })
+
+  it('does not record turn completion for shell mode output', async () => {
+    const tabId = 'tab-shell-bell'
+    const paneId = 'pane-shell-bell'
+    const terminalId = 'term-shell-bell'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-shell-bell',
+      status: 'running',
+      mode: 'shell',
+      shell: 'system',
+      terminalId,
+      initialCwd: '/tmp',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+        turnCompletion: turnCompletionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'shell',
+            status: 'running',
+            title: 'Shell',
+            titleSetByUser: false,
+            terminalId,
+            createRequestId: 'req-shell-bell',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: { settings: defaultSettings, status: 'loaded' },
+        connection: { status: 'connected', error: null },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    messageHandler!({
+      type: 'terminal.output',
+      terminalId,
+      data: 'hello\x07world',
+    })
+
+    expect(terminalInstances[0].write).toHaveBeenCalledWith('hello\x07world')
+    expect(store.getState().turnCompletion.lastEvent).toBeNull()
   })
 
   it('does not send terminal.attach after terminal.created (prevents snapshot races)', async () => {

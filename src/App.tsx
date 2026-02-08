@@ -20,6 +20,7 @@ import { setClientPerfEnabled } from '@/lib/perf-logger'
 import { applyLocalTerminalFontFamily } from '@/lib/terminal-fonts'
 import { store } from '@/store/store'
 import { useThemeEffect } from '@/hooks/useTheme'
+import { useTurnCompletionNotifications } from '@/hooks/useTurnCompletionNotifications'
 import { installCrossTabSync } from '@/store/crossTabSync'
 import Sidebar, { AppView } from '@/components/Sidebar'
 import TabBar from '@/components/TabBar'
@@ -42,6 +43,7 @@ const EMPTY_IDLE_WARNINGS: Record<string, unknown> = {}
 
 export default function App() {
   useThemeEffect()
+  useTurnCompletionNotifications()
 
   const dispatch = useAppDispatch()
   const tabs = useAppSelector((s) => s.tabs.tabs)

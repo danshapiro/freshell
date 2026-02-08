@@ -50,6 +50,37 @@ vi.mock('../../../server/logger', () => {
 const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 const OTHER_CLAUDE_SESSION_ID = '6f1c2b3a-4d5e-6f70-8a9b-0c1d2e3f4a5b'
 
+function expectCodexTurnCompleteArgs(args: string[]) {
+  expect(args).toContain('-c')
+  expect(args).toContain('tui.notification_method=bel')
+  expect(args).toContain("tui.notifications=['agent-turn-complete']")
+}
+
+function expectClaudeTurnCompleteArgs(args: string[]) {
+  const command = getClaudeStopHookCommand(args)
+  expect(command).toContain("printf '\\a'")
+}
+
+function getClaudeStopHookCommand(args: string[]): string {
+  const settingsIndex = args.indexOf('--settings')
+  expect(settingsIndex).toBeGreaterThan(-1)
+  const settingsJson = args[settingsIndex + 1]
+  expect(typeof settingsJson).toBe('string')
+  const settings = JSON.parse(settingsJson) as {
+    hooks?: {
+      Stop?: Array<{
+        hooks?: Array<{
+          type?: string
+          command?: string
+        }>
+      }>
+    }
+  }
+  const stopHook = settings.hooks?.Stop?.[0]?.hooks?.[0]
+  expect(stopHook?.type).toBe('command')
+  return stopHook?.command || ''
+}
+
 /**
  * Tests for getSystemShell - cross-platform shell resolution
  * This function returns the appropriate shell for macOS/Linux systems.
@@ -710,7 +741,7 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('claude', '/Users/john', 'system')
 
       expect(spec.args).not.toContain('--resume')
-      expect(spec.args).toEqual([])
+      expectClaudeTurnCompleteArgs(spec.args)
     })
   })
 
@@ -725,7 +756,7 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('codex', '/home/user/project', 'system')
 
       expect(spec.file).toBe('codex')
-      expect(spec.args).toEqual([])
+      expectCodexTurnCompleteArgs(spec.args)
       expect(spec.cwd).toBe('/home/user/project')
     })
 
@@ -743,7 +774,8 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('codex', '/home/user/project', 'system', 'session-123')
 
       expect(spec.file).toBe('codex')
-      expect(spec.args).toEqual(['resume', 'session-123'])
+      expectCodexTurnCompleteArgs(spec.args)
+      expect(spec.args.slice(-2)).toEqual(['resume', 'session-123'])
     })
   })
 
@@ -933,7 +965,8 @@ describe('buildSpawnSpec Unix paths', () => {
 
       expect(spec.args).toContain('--resume')
       expect(spec.args).toContain(VALID_CLAUDE_SESSION_ID)
-      expect(spec.args).toEqual(['--resume', VALID_CLAUDE_SESSION_ID])
+      expectClaudeTurnCompleteArgs(spec.args)
+      expect(spec.args.slice(-2)).toEqual(['--resume', VALID_CLAUDE_SESSION_ID])
     })
 
     it('includes proper env vars in claude mode on Linux', () => {
@@ -958,7 +991,7 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('codex', '/Users/john/project', 'system')
 
       expect(spec.file).toBe('codex')
-      expect(spec.args).toEqual([])
+      expectCodexTurnCompleteArgs(spec.args)
       expect(spec.cwd).toBe('/Users/john/project')
     })
 
@@ -1314,6 +1347,60 @@ describe('buildSpawnSpec resume validation on Windows shells', () => {
     Object.defineProperty(process, 'platform', { value: 'win32' })
     const spec = buildSpawnSpec('claude', 'C:\\tmp', 'wsl', 'not-a-uuid')
     expect(spec.args).not.toContain('--resume')
+  })
+
+  it('quotes coding-cli args for cmd.exe to preserve JSON and whitespace', () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+    process.env.CLAUDE_CMD = 'C:\\Program Files\\Claude\\claude.cmd'
+
+    const spec = buildSpawnSpec('claude', 'C:\\tmp', 'cmd', VALID_CLAUDE_SESSION_ID)
+    expect(spec.file).toBe('cmd.exe')
+    expect(spec.args[0]).toBe('/K')
+    expect(spec.args[1]).toContain('"C:\\Program Files\\Claude\\claude.cmd"')
+    expect(spec.args[1]).toContain('"--settings"')
+    expect(spec.args[1]).toContain('\\"hooks\\"')
+    expect(spec.args[1]).toContain('"--resume"')
+    expect(spec.args[1]).toContain(`"${VALID_CLAUDE_SESSION_ID}"`)
+  })
+
+  it('quotes coding-cli args for PowerShell to preserve literals', () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+    process.env.CODEX_CMD = 'C:\\Program Files\\Codex\\codex.cmd'
+
+    const spec = buildSpawnSpec('codex', 'C:\\tmp', 'powershell', 'session-123')
+    expect(spec.file).toBe('powershell.exe')
+    expect(spec.args).toContain('-NoExit')
+    expect(spec.args[3]).toContain("& 'C:\\Program Files\\Codex\\codex.cmd'")
+    expect(spec.args[3]).toContain("'-c'")
+    expect(spec.args[3]).toContain("'tui.notification_method=bel'")
+    expect(spec.args[3]).toContain("'tui.notifications=[''agent-turn-complete'']'")
+    expect(spec.args[3]).toContain("'resume'")
+    expect(spec.args[3]).toContain("'session-123'")
+  })
+
+  it('uses a Windows-compatible Claude stop-hook command for native Windows shells', () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+
+    const cmdSpec = buildSpawnSpec('claude', 'C:\\tmp', 'cmd')
+    const psSpec = buildSpawnSpec('claude', 'C:\\tmp', 'powershell')
+
+    expect(cmdSpec.args[1]).toContain('powershell.exe')
+    expect(cmdSpec.args[1]).not.toContain('/dev/tty')
+    expect(cmdSpec.args[1]).toContain('CONOUT$')
+    expect(cmdSpec.args[1]).toContain('[Console]::Out.Write($bell)')
+    expect(psSpec.args[3]).toContain('powershell.exe')
+    expect(psSpec.args[3]).not.toContain('/dev/tty')
+    expect(psSpec.args[3]).toContain('CONOUT$')
+    expect(psSpec.args[3]).toContain('[Console]::Out.Write($bell)')
+  })
+
+  it('keeps Unix Claude stop-hook command when launching through WSL', () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+
+    const spec = buildSpawnSpec('claude', '/home/user/project', 'wsl')
+    const hookCommand = getClaudeStopHookCommand(spec.args)
+    expect(hookCommand).toContain("printf '\\a'")
+    expect(hookCommand).toContain('/dev/tty')
   })
 })
 
@@ -1909,7 +1996,7 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('claude', '/Users/john', 'system')
 
       expect(spec.args).not.toContain('--resume')
-      expect(spec.args).toEqual([])
+      expectClaudeTurnCompleteArgs(spec.args)
     })
   })
 
@@ -1924,7 +2011,7 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('codex', '/home/user/project', 'system')
 
       expect(spec.file).toBe('codex')
-      expect(spec.args).toEqual([])
+      expectCodexTurnCompleteArgs(spec.args)
       expect(spec.cwd).toBe('/home/user/project')
     })
 
@@ -2123,7 +2210,8 @@ describe('buildSpawnSpec Unix paths', () => {
 
       expect(spec.args).toContain('--resume')
       expect(spec.args).toContain(VALID_CLAUDE_SESSION_ID)
-      expect(spec.args).toEqual(['--resume', VALID_CLAUDE_SESSION_ID])
+      expectClaudeTurnCompleteArgs(spec.args)
+      expect(spec.args.slice(-2)).toEqual(['--resume', VALID_CLAUDE_SESSION_ID])
     })
 
     it('includes proper env vars in claude mode on Linux', () => {
@@ -2148,7 +2236,7 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('codex', '/Users/john/project', 'system')
 
       expect(spec.file).toBe('codex')
-      expect(spec.args).toEqual([])
+      expectCodexTurnCompleteArgs(spec.args)
       expect(spec.cwd).toBe('/Users/john/project')
     })
 
@@ -2503,7 +2591,7 @@ describe('buildSpawnSpec Unix paths', () => {
 
         const spec = buildSpawnSpec('claude', '/Users/developer', 'system')
 
-        expect(spec.args).toEqual([])
+        expectClaudeTurnCompleteArgs(spec.args)
       })
     })
 
@@ -2543,7 +2631,7 @@ describe('buildSpawnSpec Unix paths', () => {
 
         const spec = buildSpawnSpec('codex', '/home/user', 'system')
 
-        expect(spec.args).toEqual([])
+        expectCodexTurnCompleteArgs(spec.args)
       })
     })
 

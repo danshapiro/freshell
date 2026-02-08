@@ -34,6 +34,7 @@ describe('TabItem', () => {
   const defaultProps = {
     tab: createTab(),
     isActive: false,
+    needsAttention: false,
     isDragging: false,
     isRenaming: false,
     renameValue: '',
@@ -60,6 +61,20 @@ describe('TabItem', () => {
     render(<TabItem {...defaultProps} isDragging={true} />)
     const tabElement = screen.getByText('Test Tab').closest('div[class*="group"]')
     expect(tabElement?.className).toContain('opacity-50')
+  })
+
+  it('applies light-green attention styles when tab needs attention', () => {
+    render(<TabItem {...defaultProps} needsAttention={true} />)
+    const tabElement = screen.getByText('Test Tab').closest('div[class*="group"]')
+    expect(tabElement?.className).toContain('bg-emerald-100')
+    expect(tabElement?.className).toContain('text-emerald-900')
+  })
+
+  it('active styles take precedence over attention styles', () => {
+    render(<TabItem {...defaultProps} isActive={true} needsAttention={true} />)
+    const tabElement = screen.getByText('Test Tab').closest('div[class*="group"]')
+    expect(tabElement?.className).toContain('bg-background')
+    expect(tabElement?.className).not.toContain('bg-emerald-100')
   })
 
   it('shows input when isRenaming is true', () => {

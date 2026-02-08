@@ -7,6 +7,7 @@ import tabsReducer, { TabsState } from '@/store/tabsSlice'
 import codingCliReducer, { registerCodingCliRequest } from '@/store/codingCliSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
+import turnCompletionReducer from '@/store/turnCompletionSlice'
 import type { Tab } from '@/store/types'
 
 // Mock the ws-client module
@@ -52,18 +53,20 @@ function createTab(overrides: Partial<Tab> = {}): Tab {
   }
 }
 
-function createStore(initialState: Partial<TabsState> = {}) {
+function createStore(initialState: Partial<TabsState> = {}, attentionByTab: Record<string, boolean> = {}) {
   return configureStore({
     reducer: {
       tabs: tabsReducer,
       codingCli: codingCliReducer,
       panes: panesReducer,
       settings: settingsReducer,
+      turnCompletion: turnCompletionReducer,
     },
     preloadedState: {
       tabs: {
         tabs: [],
         activeTabId: null,
+        renameRequestTabId: null,
         ...initialState,
       },
       codingCli: {
@@ -77,6 +80,12 @@ function createStore(initialState: Partial<TabsState> = {}) {
       settings: {
         settings: defaultSettings,
         loaded: true,
+      },
+      turnCompletion: {
+        seq: 0,
+        lastEvent: null,
+        pendingEvents: [],
+        attentionByTab,
       },
     },
   })
@@ -202,6 +211,25 @@ describe('TabBar', () => {
 
       expect(tab2Element?.className).toContain('bg-background')
       expect(tab1Element?.className).not.toContain('bg-background text-foreground')
+    })
+
+    it('highlights inactive tabs that need attention', () => {
+      const tab1 = createTab({ id: 'tab-1', title: 'Active Tab' })
+      const tab2 = createTab({ id: 'tab-2', title: 'Needs Attention' })
+
+      const store = createStore(
+        {
+          tabs: [tab1, tab2],
+          activeTabId: 'tab-1',
+        },
+        { 'tab-2': true }
+      )
+
+      renderWithStore(<TabBar />, store)
+
+      const attentionTabElement = screen.getByText('Needs Attention').closest('div[class*="group"]')
+      expect(attentionTabElement?.className).toContain('bg-emerald-100')
+      expect(attentionTabElement?.className).toContain('text-emerald-900')
     })
   })
 

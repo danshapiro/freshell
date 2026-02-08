@@ -12,6 +12,7 @@ import panesReducer from './panesSlice'
 import sessionActivityReducer from './sessionActivitySlice'
 import terminalActivityReducer from './terminalActivitySlice'
 import idleWarningsReducer from './idleWarningsSlice'
+import turnCompletionReducer from './turnCompletionSlice'
 import { perfMiddleware } from './perfMiddleware'
 import { persistMiddleware } from './persistMiddleware'
 import { sessionActivityPersistMiddleware } from './sessionActivityPersistence'
@@ -29,6 +30,7 @@ export const store = configureStore({
     sessionActivity: sessionActivityReducer,
     terminalActivity: terminalActivityReducer,
     idleWarnings: idleWarningsReducer,
+    turnCompletion: turnCompletionReducer,
   },
   middleware: (getDefault) =>
     getDefault({

@@ -63,19 +63,54 @@ const CODING_CLI_COMMANDS: Record<Exclude<TerminalMode, 'shell'>, CodingCliComma
   },
 }
 
-function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string) {
+type ProviderTarget = 'unix' | 'windows'
+
+function providerNotificationArgs(mode: TerminalMode, target: ProviderTarget): string[] {
+  if (mode === 'codex') {
+    return [
+      '-c', 'tui.notification_method=bel',
+      '-c', "tui.notifications=['agent-turn-complete']",
+    ]
+  }
+
+  if (mode === 'claude') {
+    const bellCommand = target === 'windows'
+      ? `powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$bell=[char]7; $ok=$false; try {[System.IO.File]::AppendAllText('\\\\.\\CONOUT$', [string]$bell); $ok=$true} catch {}; if (-not $ok) { try {[Console]::Out.Write($bell); $ok=$true} catch {} }; if (-not $ok) { try {[Console]::Error.Write($bell)} catch {} }"`
+      : `sh -lc "printf '\\a' > /dev/tty 2>/dev/null || true"`
+    const settings = {
+      hooks: {
+        Stop: [
+          {
+            hooks: [
+              {
+                type: 'command',
+                command: bellCommand,
+              },
+            ],
+          },
+        ],
+      },
+    }
+    return ['--settings', JSON.stringify(settings)]
+  }
+
+  return []
+}
+
+function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, target: ProviderTarget = 'unix') {
   if (mode === 'shell') return null
   const spec = CODING_CLI_COMMANDS[mode]
   const command = process.env[spec.envVar] || spec.defaultCommand
-  let args: string[] = []
+  const providerArgs = providerNotificationArgs(mode, target)
+  let resumeArgs: string[] = []
   if (resumeSessionId) {
     if (spec.resumeArgs) {
-      args = spec.resumeArgs(resumeSessionId)
+      resumeArgs = spec.resumeArgs(resumeSessionId)
     } else {
       logger.warn({ mode, resumeSessionId }, 'Resume requested but no resume args configured')
     }
   }
-  return { command, args, label: spec.label }
+  return { command, args: [...providerArgs, ...resumeArgs], label: spec.label }
 }
 
 function normalizeResumeSessionId(mode: TerminalMode, resumeSessionId?: string): string | undefined {
@@ -347,6 +382,51 @@ export function escapeCmdExe(s: string): string {
     .replace(/"/g, '\\"')
 }
 
+function quoteCmdArg(arg: string): string {
+  // cmd.exe expands %VAR% even inside quotes; double % to preserve literals.
+  const escaped = arg.replace(/%/g, '%%')
+  let quoted = '"'
+  let backslashCount = 0
+  for (const ch of escaped) {
+    if (ch === '\\') {
+      backslashCount += 1
+      continue
+    }
+
+    if (ch === '"') {
+      quoted += '\\'.repeat(backslashCount * 2 + 1)
+      quoted += '"'
+      backslashCount = 0
+      continue
+    }
+
+    if (backslashCount > 0) {
+      quoted += '\\'.repeat(backslashCount)
+      backslashCount = 0
+    }
+    quoted += ch
+  }
+
+  if (backslashCount > 0) {
+    quoted += '\\'.repeat(backslashCount * 2)
+  }
+  quoted += '"'
+  return quoted
+}
+
+function buildCmdCommand(command: string, args: string[]): string {
+  return [command, ...args].map(quoteCmdArg).join(' ')
+}
+
+function quotePowerShellLiteral(arg: string): string {
+  return `'${arg.replace(/'/g, "''")}'`
+}
+
+function buildPowerShellCommand(command: string, args: string[]): string {
+  const invocation = ['&', quotePowerShellLiteral(command), ...args.map(quotePowerShellLiteral)].join(' ')
+  return invocation
+}
+
 export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shell: ShellType, resumeSessionId?: string) {
   const env = {
     ...process.env,
@@ -404,7 +484,7 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
         return { file: wsl, args, cwd: undefined, env }
       }
 
-      const cli = resolveCodingCliCommand(mode, normalizedResume)
+      const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix')
       if (!cli) {
         args.push('--exec', 'bash', '-l')
         return { file: wsl, args, cwd: undefined, env }
@@ -415,8 +495,6 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
     }
 
     // Option B: Native Windows shells (PowerShell/cmd)
-    const escapePowershell = (s: string) => s.replace(/`/g, '``').replace(/"/g, '`"')
-    const quote = (s: string) => `"${escapePowershell(s)}"`
 
     if (windowsMode === 'cmd') {
       const file = getWindowsExe('cmd')
@@ -437,15 +515,15 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
       if (mode === 'shell') {
         if (inWsl && winCwd) {
           // Use /K with cd command to change to Windows directory
-          return { file, args: ['/K', `cd /d "${winCwd}"`], cwd: procCwd, env }
+          return { file, args: ['/K', `cd /d ${quoteCmdArg(winCwd)}`], cwd: procCwd, env }
         }
         return { file, args: ['/K'], cwd: procCwd, env }
       }
-      const cli = resolveCodingCliCommand(mode, normalizedResume)
+      const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows')
       const cmd = cli?.command || mode
-      const resume = cli?.args.length ? ` ${cli.args.join(' ')}` : ''
-      const cd = winCwd ? `cd /d "${winCwd}" && ` : ''
-      return { file, args: ['/K', `${cd}${cmd}${resume}`], cwd: procCwd, env }
+      const command = buildCmdCommand(cmd, cli?.args || [])
+      const cd = winCwd ? `cd /d ${quoteCmdArg(winCwd)} && ` : ''
+      return { file, args: ['/K', `${cd}${command}`], cwd: procCwd, env }
     }
 
     // default to PowerShell
@@ -465,16 +543,16 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
     if (mode === 'shell') {
       if (inWsl && winCwd) {
         // Use Set-Location to change to Windows directory
-        return { file, args: ['-NoLogo', '-NoExit', '-Command', `Set-Location -LiteralPath "${winCwd}"`], cwd: procCwd, env }
+        return { file, args: ['-NoLogo', '-NoExit', '-Command', `Set-Location -LiteralPath ${quotePowerShellLiteral(winCwd)}`], cwd: procCwd, env }
       }
       return { file, args: ['-NoLogo'], cwd: procCwd, env }
     }
 
-    const cli = resolveCodingCliCommand(mode, normalizedResume)
+    const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows')
     const cmd = cli?.command || mode
-    const resumeArgs = cli?.args.length ? ` ${cli.args.join(' ')}` : ''
-    const cd = winCwd ? `Set-Location -LiteralPath "${winCwd}"; ` : ''
-    const command = `${cd}${cmd}${resumeArgs}`
+    const invocation = buildPowerShellCommand(cmd, cli?.args || [])
+    const cd = winCwd ? `Set-Location -LiteralPath ${quotePowerShellLiteral(winCwd)}; ` : ''
+    const command = `${cd}${invocation}`
     return { file, args: ['-NoLogo', '-NoExit', '-Command', command], cwd: procCwd, env }
   }
 // Non-Windows: native spawn using system shell
@@ -484,7 +562,7 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
     return { file: systemShell, args: ['-l'], cwd, env }
   }
 
-  const cli = resolveCodingCliCommand(mode, normalizedResume)
+  const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix')
   const cmd = cli?.command || mode
   const args = cli?.args || []
   return { file: cmd, args, cwd, env }

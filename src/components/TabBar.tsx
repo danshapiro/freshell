@@ -32,6 +32,7 @@ interface SortableTabProps {
   tab: Tab
   displayTitle: string
   isActive: boolean
+  needsAttention: boolean
   isDragging: boolean
   isRenaming: boolean
   renameValue: string
@@ -47,6 +48,7 @@ function SortableTab({
   tab,
   displayTitle,
   isActive,
+  needsAttention,
   isDragging,
   isRenaming,
   renameValue,
@@ -81,6 +83,7 @@ function SortableTab({
       <TabItem
         tab={tabWithDisplayTitle}
         isActive={isActive}
+        needsAttention={needsAttention}
         isDragging={isDragging}
         isRenaming={isRenaming}
         renameValue={renameValue}
@@ -97,6 +100,7 @@ function SortableTab({
 
 // Stable empty object to avoid creating new references
 const EMPTY_LAYOUTS: Record<string, never> = {}
+const EMPTY_ATTENTION: Record<string, boolean> = {}
 
 export default function TabBar() {
   const dispatch = useAppDispatch()
@@ -107,6 +111,7 @@ export default function TabBar() {
   const activeTabId = tabsState?.activeTabId ?? null
   const renameRequestTabId = tabsState?.renameRequestTabId ?? null
   const paneLayouts = useAppSelector((s) => s.panes?.layouts) ?? EMPTY_LAYOUTS
+  const attentionByTab = useAppSelector((s) => s.turnCompletion?.attentionByTab) ?? EMPTY_ATTENTION
 
   const ws = useMemo(() => getWsClient(), [])
 
@@ -204,6 +209,7 @@ export default function TabBar() {
                 tab={tab}
                 displayTitle={getDisplayTitle(tab)}
                 isActive={tab.id === activeTabId}
+                needsAttention={!!attentionByTab[tab.id]}
                 isDragging={activeId === tab.id}
                 isRenaming={renamingId === tab.id}
                 renameValue={renameValue}
@@ -273,6 +279,7 @@ export default function TabBar() {
               <TabItem
                 tab={{ ...activeTab, title: getDisplayTitle(activeTab) }}
                 isActive={activeTab.id === activeTabId}
+                needsAttention={!!attentionByTab[activeTab.id]}
                 isDragging={false}
                 isRenaming={false}
                 renameValue=""

@@ -3,12 +3,17 @@ import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
+import { recordTurnComplete } from '@/store/turnCompletionSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import { getResumeSessionIdFromRef } from '@/components/terminal-view-utils'
 import { copyText, readText } from '@/lib/clipboard'
 import { registerTerminalActions } from '@/lib/pane-action-registry'
 import { consumeTerminalRestoreRequestId } from '@/lib/terminal-restore'
+import {
+  createTurnCompleteSignalParserState,
+  extractTurnCompleteSignals,
+} from '@/lib/turn-complete-signal'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { resolveTerminalFontFamily } from '@/lib/terminal-fonts'
 import { nanoid } from 'nanoid'
@@ -49,6 +54,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const rateLimitRetryRef = useRef<{ count: number; timer: ReturnType<typeof setTimeout> | null }>({ count: 0, timer: null })
   const restoreRequestIdRef = useRef<string | null>(null)
   const restoreFlagRef = useRef(false)
+  const turnCompleteSignalStateRef = useRef(createTurnCompleteSignalParserState())
 
   // Extract terminal-specific fields (safe because we check kind later)
   const isTerminal = paneContent.kind === 'terminal'
@@ -321,6 +327,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     const termCandidate = termRef.current
     if (!termCandidate) return
     const term = termCandidate
+    turnCompleteSignalStateRef.current = createTurnCompleteSignalParserState()
 
     // NOTE: We intentionally don't destructure terminalId here.
     // We read it from terminalIdRef.current to avoid stale closures.
@@ -396,7 +403,22 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         const reqId = requestIdRef.current
 
         if (msg.type === 'terminal.output' && msg.terminalId === tid) {
-          term.write(msg.data || '')
+          const raw = msg.data || ''
+          const mode = contentRef.current?.mode || 'shell'
+          const { cleaned, count } = extractTurnCompleteSignals(raw, mode, turnCompleteSignalStateRef.current)
+
+          if (count > 0) {
+            dispatch(recordTurnComplete({
+              tabId,
+              paneId: paneIdRef.current,
+              terminalId: tid,
+              at: Date.now(),
+            }))
+          }
+
+          if (cleaned) {
+            term.write(cleaned)
+          }
         }
 
         if (msg.type === 'terminal.snapshot' && msg.terminalId === tid) {
