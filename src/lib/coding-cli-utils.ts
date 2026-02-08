@@ -43,9 +43,22 @@ export const CODING_CLI_PROVIDER_CONFIGS: CodingCliProviderConfig[] = [
   },
 ]
 
+export type ResumeCommandProvider = Extract<CodingCliProviderName, 'claude' | 'codex'>
+
 export function isCodingCliProviderName(value?: string): value is CodingCliProviderName {
   if (!value) return false
   return CODING_CLI_PROVIDERS.includes(value as CodingCliProviderName)
+}
+
+export function isResumeCommandProvider(value?: string): value is ResumeCommandProvider {
+  return value === 'claude' || value === 'codex'
+}
+
+export function buildResumeCommand(provider?: string, sessionId?: string): string | null {
+  if (!sessionId) return null
+  if (!isResumeCommandProvider(provider)) return null
+  if (provider === 'claude') return `claude --resume ${sessionId}`
+  return `codex resume ${sessionId}`
 }
 
 export function isCodingCliMode(mode?: string): mode is CodingCliProviderName {

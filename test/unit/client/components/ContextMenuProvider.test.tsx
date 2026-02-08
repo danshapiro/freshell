@@ -12,6 +12,10 @@ import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvid
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import TabBar from '@/components/TabBar'
 
+const clipboardMocks = vi.hoisted(() => ({
+  copyText: vi.fn().mockResolvedValue(undefined),
+}))
+
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: vi.fn(),
@@ -30,6 +34,10 @@ vi.mock('@/lib/api', () => ({
     put: vi.fn().mockResolvedValue({}),
     delete: vi.fn().mockResolvedValue({}),
   },
+}))
+
+vi.mock('@/lib/clipboard', () => ({
+  copyText: clipboardMocks.copyText,
 }))
 
 const VALID_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
@@ -168,7 +176,10 @@ function createStoreWithSession() {
 }
 
 describe('ContextMenuProvider', () => {
-  afterEach(() => cleanup())
+  afterEach(() => {
+    cleanup()
+    vi.clearAllMocks()
+  })
   it('opens menu on right click and dispatches close tab', async () => {
     const user = userEvent.setup()
     const { store } = renderWithProvider(
@@ -329,6 +340,233 @@ describe('ContextMenuProvider', () => {
         }
       }
     }
+  })
+
+  it('copies resume command from sidebar session context menu', async () => {
+    const user = userEvent.setup()
+    const store = createStoreWithSession()
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.SidebarSession}
+            data-session-id={VALID_SESSION_ID}
+            data-provider="claude"
+          >
+            Sidebar Session
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Sidebar Session'), keys: '[MouseRight]' })
+    await user.click(screen.getByRole('menuitem', { name: 'Copy resume command' }))
+
+    expect(clipboardMocks.copyText).toHaveBeenCalledWith(`claude --resume ${VALID_SESSION_ID}`)
+  })
+
+  it('copies resume command from terminal pane context menu for codex pane', async () => {
+    const user = userEvent.setup()
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        sessions: sessionsReducer,
+        connection: connectionReducer,
+      },
+      middleware: (getDefaultMiddleware) =>
+        getDefaultMiddleware({ serializableCheck: false }),
+      preloadedState: {
+        tabs: {
+          tabs: [
+            {
+              id: 'tab-1',
+              createRequestId: 'tab-1',
+              title: 'Codex',
+              status: 'running',
+              mode: 'codex',
+              createdAt: 1,
+            },
+          ],
+          activeTabId: 'tab-1',
+          renameRequestTabId: null,
+        },
+        panes: {
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: 'codex',
+                status: 'running',
+                resumeSessionId: 'codex-session-123',
+              },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+          paneTitles: {},
+        },
+        sessions: {
+          projects: [],
+          expandedProjects: new Set<string>(),
+        },
+        connection: {
+          status: 'ready',
+          platform: null,
+        },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div data-context={ContextIds.Terminal} data-tab-id="tab-1" data-pane-id="pane-1">
+            Codex Pane
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Codex Pane'), keys: '[MouseRight]' })
+    await user.click(screen.getByRole('menuitem', { name: 'Copy resume command' }))
+
+    expect(clipboardMocks.copyText).toHaveBeenCalledWith('codex resume codex-session-123')
+  })
+
+  it('does not show resume command on shell pane context menu', async () => {
+    const user = userEvent.setup()
+    const store = createStoreWithSession()
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div data-context={ContextIds.Terminal} data-tab-id="tab-1" data-pane-id="pane-1">
+            Shell Pane
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Shell Pane'), keys: '[MouseRight]' })
+    expect(screen.queryByRole('menuitem', { name: 'Copy resume command' })).toBeNull()
+  })
+
+  it('shows resume command on tab context menu only when tab has a single CLI pane', async () => {
+    const user = userEvent.setup()
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        sessions: sessionsReducer,
+        connection: connectionReducer,
+      },
+      middleware: (getDefaultMiddleware) =>
+        getDefaultMiddleware({ serializableCheck: false }),
+      preloadedState: {
+        tabs: {
+          tabs: [
+            {
+              id: 'tab-1',
+              createRequestId: 'tab-1',
+              title: 'Claude',
+              status: 'running',
+              mode: 'claude',
+              createdAt: 1,
+            },
+            {
+              id: 'tab-2',
+              createRequestId: 'tab-2',
+              title: 'Split',
+              status: 'running',
+              mode: 'shell',
+              createdAt: 2,
+            },
+          ],
+          activeTabId: 'tab-1',
+          renameRequestTabId: null,
+        },
+        panes: {
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: 'claude',
+                status: 'running',
+                resumeSessionId: VALID_SESSION_ID,
+              },
+            },
+            'tab-2': {
+              type: 'split',
+              id: 'split-1',
+              direction: 'horizontal',
+              sizes: [0.5, 0.5],
+              children: [
+                {
+                  type: 'leaf',
+                  id: 'pane-2a',
+                  content: { kind: 'terminal', mode: 'claude', status: 'running', resumeSessionId: VALID_SESSION_ID },
+                },
+                {
+                  type: 'leaf',
+                  id: 'pane-2b',
+                  content: { kind: 'terminal', mode: 'shell', status: 'running' },
+                },
+              ],
+            },
+          },
+          activePane: { 'tab-1': 'pane-1', 'tab-2': 'pane-2a' },
+          paneTitles: {},
+        },
+        sessions: {
+          projects: [],
+          expandedProjects: new Set<string>(),
+        },
+        connection: {
+          status: 'ready',
+          platform: null,
+        },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div>
+            <div data-context={ContextIds.Tab} data-tab-id="tab-1">Single CLI Tab</div>
+            <div data-context={ContextIds.Tab} data-tab-id="tab-2">Split Tab</div>
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Single CLI Tab'), keys: '[MouseRight]' })
+    await user.click(screen.getByRole('menuitem', { name: 'Copy resume command' }))
+    expect(clipboardMocks.copyText).toHaveBeenCalledWith(`claude --resume ${VALID_SESSION_ID}`)
+
+    await user.pointer({ target: screen.getByText('Split Tab'), keys: '[MouseRight]' })
+    expect(screen.queryByRole('menuitem', { name: 'Copy resume command' })).toBeNull()
   })
 
   describe('platform-specific tab-add menu', () => {

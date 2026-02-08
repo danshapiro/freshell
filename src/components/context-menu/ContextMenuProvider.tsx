@@ -12,6 +12,7 @@ import { collectTerminalIds, findPaneContent } from '@/lib/pane-utils'
 import { collectSessionRefsFromNode } from '@/lib/session-utils'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { getBrowserActions, getEditorActions, getTerminalActions } from '@/lib/pane-action-registry'
+import { buildResumeCommand, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { AppView } from '@/components/Sidebar'
 import type { CodingCliProviderName } from '@/store/types'
@@ -426,6 +427,12 @@ export function ContextMenuProvider({
     await copyText(JSON.stringify(metadata, null, 2))
   }, [getSessionInfo, tabsState.tabs, panes, menuState?.target])
 
+  const copyResumeCommand = useCallback(async (provider: ResumeCommandProvider, sessionId: string) => {
+    const command = buildResumeCommand(provider, sessionId)
+    if (!command) return
+    await copyText(command)
+  }, [])
+
   const setProjectColor = useCallback(async (projectPath: string) => {
     const next = window.prompt('Project color (hex)', '#6b7280')
     if (!next) return
@@ -700,6 +707,7 @@ export function ContextMenuProvider({
         copySessionCwd,
         copySessionSummary,
         copySessionMetadata,
+        copyResumeCommand,
         setProjectColor,
         toggleProjectExpanded: toggleProjectExpandedAction,
         openAllSessionsInProject,
@@ -745,6 +753,7 @@ export function ContextMenuProvider({
     copySessionCwd,
     copySessionSummary,
     copySessionMetadata,
+    copyResumeCommand,
     setProjectColor,
     toggleProjectExpandedAction,
     openAllSessionsInProject,

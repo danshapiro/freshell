@@ -1,10 +1,11 @@
 import type { MenuItem, ContextTarget } from './context-menu-types'
 import type { AppView } from '@/components/Sidebar'
 import type { Tab, ProjectGroup } from '@/store/types'
-import type { PaneNode } from '@/store/paneTypes'
+import type { PaneNode, PaneContent } from '@/store/paneTypes'
 import { findPaneContent } from '@/lib/pane-utils'
 import { collectSessionRefsFromNode } from '@/lib/session-utils'
 import type { TerminalActions, EditorActions, BrowserActions } from '@/lib/pane-action-registry'
+import { buildResumeCommand, isResumeCommandProvider, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
 
 export type MenuActions = {
   newDefaultTab: () => void
@@ -35,6 +36,7 @@ export type MenuActions = {
   copySessionCwd: (sessionId: string, provider?: string) => void
   copySessionSummary: (sessionId: string, provider?: string) => void
   copySessionMetadata: (sessionId: string, provider?: string) => void
+  copyResumeCommand: (provider: ResumeCommandProvider, sessionId: string) => void
   setProjectColor: (projectPath: string) => void
   toggleProjectExpanded: (projectPath: string, expanded: boolean) => void
   openAllSessionsInProject: (projectPath: string) => void
@@ -70,6 +72,50 @@ function getSessionById(projects: ProjectGroup[], sessionId: string, provider?: 
     if (session && (!provider || session.provider === provider)) return { session, project }
   }
   return null
+}
+
+type ResumeCommandCandidate = {
+  provider: ResumeCommandProvider
+  sessionId?: string
+}
+
+function getTabProvider(tab?: Tab): string | undefined {
+  if (!tab) return undefined
+  return tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
+}
+
+function getResumeCandidateForTerminalContent(content: PaneContent, tab?: Tab): ResumeCommandCandidate | null {
+  if (content.kind !== 'terminal') return null
+  if (!isResumeCommandProvider(content.mode)) return null
+  const tabProvider = getTabProvider(tab)
+  const sessionId = content.resumeSessionId || (tabProvider === content.mode ? tab?.resumeSessionId : undefined)
+  return {
+    provider: content.mode,
+    sessionId,
+  }
+}
+
+function getResumeCandidateForLegacyTab(tab?: Tab): ResumeCommandCandidate | null {
+  const provider = getTabProvider(tab)
+  if (!isResumeCommandProvider(provider)) return null
+  return {
+    provider,
+    sessionId: tab?.resumeSessionId,
+  }
+}
+
+function buildCopyResumeMenuItem(id: string, candidate: ResumeCommandCandidate, actions: MenuActions): MenuItem {
+  const canCopy = !!buildResumeCommand(candidate.provider, candidate.sessionId)
+  return {
+    type: 'item',
+    id,
+    label: 'Copy resume command',
+    onSelect: () => {
+      if (!candidate.sessionId) return
+      actions.copyResumeCommand(candidate.provider, candidate.sessionId)
+    },
+    disabled: !canCopy,
+  }
 }
 
 export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): MenuItem[] {
@@ -131,12 +177,24 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
 
   if (target.kind === 'tab') {
     const index = tabs.findIndex((t) => t.id === target.tabId)
+    const tab = tabs[index]
+    const layout = paneLayouts[target.tabId]
+    const resumeCandidate =
+      layout?.type === 'leaf'
+        ? getResumeCandidateForTerminalContent(layout.content, tab)
+        : !layout
+          ? getResumeCandidateForLegacyTab(tab)
+          : null
+    const tabResumeMenuItem = resumeCandidate
+      ? [buildCopyResumeMenuItem('tab-copy-resume-command', resumeCandidate, actions)]
+      : []
     const isFirst = index <= 0
     const isLast = index === tabs.length - 1
     const onlyOne = tabs.length <= 1
 
     return [
       { type: 'item', id: 'copy-tab-name', label: 'Copy tab name', onSelect: () => actions.copyTabName(target.tabId) },
+      ...tabResumeMenuItem,
       { type: 'item', id: 'rename-tab', label: 'Rename tab', onSelect: () => actions.renameTab(target.tabId) },
       { type: 'separator', id: 'tab-sep' },
       { type: 'item', id: 'close-tab', label: 'Close tab', onSelect: () => actions.closeTab(target.tabId) },
@@ -178,6 +236,13 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
   if (target.kind === 'terminal') {
     const terminalActions = actions.getTerminalActions(target.paneId)
     const hasSelection = terminalActions?.hasSelection() ?? false
+    const tab = tabs.find((t) => t.id === target.tabId)
+    const layout = paneLayouts[target.tabId]
+    const paneContent = layout ? findPaneContent(layout, target.paneId) : null
+    const resumeCandidate = paneContent ? getResumeCandidateForTerminalContent(paneContent, tab) : null
+    const terminalResumeMenuItem = resumeCandidate
+      ? [buildCopyResumeMenuItem('terminal-copy-resume-command', resumeCandidate, actions)]
+      : []
     return [
       {
         type: 'item',
@@ -200,6 +265,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
         onSelect: () => terminalActions?.selectAll(),
         disabled: !terminalActions,
       },
+      ...terminalResumeMenuItem,
       { type: 'separator', id: 'terminal-sep' },
       {
         type: 'item',
@@ -270,6 +336,16 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     const sessionInfo = getSessionById(sessions, target.sessionId, target.provider)
     const archived = sessionInfo?.session.archived ?? false
     const isRunning = !!target.runningTerminalId
+    const provider = target.provider || 'claude'
+    const resumeCandidate = isResumeCommandProvider(provider)
+      ? {
+          provider,
+          sessionId: target.sessionId,
+        }
+      : null
+    const sidebarResumeMenuItem = resumeCandidate
+      ? [buildCopyResumeMenuItem('session-copy-resume-command', resumeCandidate, actions)]
+      : []
 
     return [
       { type: 'item', id: 'session-open-new', label: 'Open in new tab', onSelect: () => actions.openSessionInNewTab(target.sessionId, target.provider) },
@@ -290,6 +366,7 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
         disabled: isRunning,
       },
       { type: 'separator', id: 'session-sep' },
+      ...sidebarResumeMenuItem,
       { type: 'item', id: 'session-copy-id', label: 'Copy session ID', onSelect: () => actions.copySessionId(target.sessionId) },
       { type: 'item', id: 'session-copy-cwd', label: 'Copy CWD', onSelect: () => actions.copySessionCwd(target.sessionId, target.provider) },
       { type: 'item', id: 'session-copy-meta', label: 'Copy full metadata', onSelect: () => actions.copySessionMetadata(target.sessionId, target.provider) },
