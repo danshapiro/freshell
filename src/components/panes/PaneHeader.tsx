@@ -1,3 +1,4 @@
+import { useRef, useEffect } from 'react'
 import { X, Circle } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { TerminalStatus } from '@/store/types'
@@ -24,6 +25,12 @@ interface PaneHeaderProps {
   status: TerminalStatus
   isActive: boolean
   onClose: () => void
+  isRenaming?: boolean
+  renameValue?: string
+  onRenameChange?: (value: string) => void
+  onRenameBlur?: () => void
+  onRenameKeyDown?: (e: React.KeyboardEvent) => void
+  onDoubleClick?: () => void
 }
 
 export default function PaneHeader({
@@ -31,19 +38,50 @@ export default function PaneHeader({
   status,
   isActive,
   onClose,
+  isRenaming,
+  renameValue,
+  onRenameChange,
+  onRenameBlur,
+  onRenameKeyDown,
+  onDoubleClick,
 }: PaneHeaderProps) {
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    if (isRenaming && inputRef.current) {
+      inputRef.current.focus()
+      inputRef.current.select()
+    }
+  }, [isRenaming])
+
   return (
     <div
       className={cn(
         'flex items-center gap-2 h-7 px-2 text-sm border-b border-border shrink-0',
         isActive ? 'bg-muted' : 'bg-muted/50 text-muted-foreground'
       )}
+      onDoubleClick={onDoubleClick}
+      role="banner"
+      aria-label={`Pane: ${title}`}
     >
       <StatusIndicator status={status} />
 
-      <span className="flex-1 truncate" title={title}>
-        {title}
-      </span>
+      {isRenaming ? (
+        <input
+          ref={inputRef}
+          className="bg-transparent outline-none flex-1 min-w-0 text-sm"
+          value={renameValue ?? ''}
+          onChange={(e) => onRenameChange?.(e.target.value)}
+          onBlur={onRenameBlur}
+          onKeyDown={onRenameKeyDown}
+          onClick={(e) => e.stopPropagation()}
+          aria-label="Rename pane"
+        />
+      ) : (
+        <span className="flex-1 truncate" title={title}>
+          {title}
+        </span>
+      )}
 
       <button
         onMouseDown={(e) => e.stopPropagation()}

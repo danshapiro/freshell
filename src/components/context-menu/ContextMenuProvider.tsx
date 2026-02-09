@@ -1,14 +1,14 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, closeTab, reorderTabs, updateTab, setActiveTab, openSessionTab, requestTabRename } from '@/store/tabsSlice'
-import { addPane, closePane, initLayout, resetSplit, swapSplit, updatePaneTitle } from '@/store/panesSlice'
+import { addPane, closePane, initLayout, resetSplit, swapSplit, requestPaneRename } from '@/store/panesSlice'
 import { setProjects, setProjectExpanded } from '@/store/sessionsSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'
 import { getAuthToken } from '@/lib/auth'
 import { buildShareUrl } from '@/lib/utils'
 import { copyText } from '@/lib/clipboard'
-import { collectTerminalIds, findPaneContent } from '@/lib/pane-utils'
+import { collectTerminalIds } from '@/lib/pane-utils'
 import { collectSessionRefsFromNode } from '@/lib/session-utils'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { getBrowserActions, getEditorActions, getTerminalActions } from '@/lib/pane-action-registry'
@@ -189,14 +189,9 @@ export function ContextMenuProvider({
   }, [dispatch, tabsState.tabs])
 
   const renamePane = useCallback((tabId: string, paneId: string) => {
-    const layout = panes[tabId]
-    if (!layout) return
-    const current = findPaneContent(layout, paneId)
-    const title = current && current.kind === 'terminal' ? current.mode : 'Pane'
-    const next = window.prompt('Rename pane', title)
-    if (!next) return
-    dispatch(updatePaneTitle({ tabId, paneId, title: next }))
-  }, [dispatch, panes])
+    suppressNextFocusRestoreRef.current = true
+    dispatch(requestPaneRename({ tabId, paneId }))
+  }, [dispatch])
 
   const closeTabById = useCallback((tabId: string) => {
     const layout = panes[tabId]

@@ -14,6 +14,12 @@ interface PaneProps {
   onClose: () => void
   onFocus: () => void
   children: React.ReactNode
+  isRenaming?: boolean
+  renameValue?: string
+  onRenameChange?: (value: string) => void
+  onRenameBlur?: () => void
+  onRenameKeyDown?: (e: React.KeyboardEvent) => void
+  onDoubleClickTitle?: () => void
 }
 
 export default function Pane({
@@ -26,6 +32,12 @@ export default function Pane({
   onClose,
   onFocus,
   children,
+  isRenaming,
+  renameValue,
+  onRenameChange,
+  onRenameBlur,
+  onRenameKeyDown,
+  onDoubleClickTitle,
 }: PaneProps) {
   const showHeader = !isOnlyPane && title !== undefined
 
@@ -55,6 +67,12 @@ export default function Pane({
             status={status || 'creating'}
             isActive={isActive}
             onClose={onClose}
+            isRenaming={isRenaming}
+            renameValue={renameValue}
+            onRenameChange={onRenameChange}
+            onRenameBlur={onRenameBlur}
+            onRenameKeyDown={onRenameKeyDown}
+            onDoubleClick={onDoubleClickTitle}
           />
         </div>
       )}

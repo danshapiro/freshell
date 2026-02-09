@@ -189,11 +189,12 @@ function loadPersistedPanesUncached(): any | null {
       for (const [tabId, node] of Object.entries(parsed.layouts || {})) {
         sanitizedLayouts[tabId] = stripEditorContentFromNode(node)
       }
-      // Already up to date, but ensure paneTitles exists
+      // Already up to date, but ensure paneTitles/paneTitleSetByUser exist
       return {
         ...parsed,
         layouts: sanitizedLayouts,
         paneTitles: parsed.paneTitles || {},
+        paneTitleSetByUser: parsed.paneTitleSetByUser || {},
       }
     }
 
@@ -222,6 +223,7 @@ function loadPersistedPanesUncached(): any | null {
       layouts: sanitizedLayouts,
       activePane: parsed.activePane || {},
       paneTitles,
+      paneTitleSetByUser: parsed.paneTitleSetByUser || {},
       version: PANES_SCHEMA_VERSION,
     }
   } catch {
@@ -272,8 +274,13 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
         for (const [tabId, node] of Object.entries(state.panes.layouts)) {
           sanitizedLayouts[tabId] = stripEditorContentFromNode(node)
         }
+        const {
+          renameRequestTabId: _rrt,
+          renameRequestPaneId: _rrp,
+          ...persistablePanes
+        } = state.panes
         const panesPayload = {
-          ...state.panes,
+          ...persistablePanes,
           layouts: sanitizedLayouts,
           version: PANES_SCHEMA_VERSION,
         }

@@ -10,6 +10,8 @@ import panesReducer, {
   removeLayout,
   hydratePanes,
   updatePaneTitle,
+  requestPaneRename,
+  clearPaneRenameRequest,
   PanesState,
 } from '../../../../src/store/panesSlice'
 import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent, EditorPaneContent } from '../../../../src/store/paneTypes'
@@ -30,6 +32,9 @@ describe('panesSlice', () => {
       layouts: {},
       activePane: {},
       paneTitles: {},
+      paneTitleSetByUser: {},
+      renameRequestTabId: null,
+      renameRequestPaneId: null,
     }
     mockIdCounter = 0
     vi.clearAllMocks()
@@ -1082,6 +1087,9 @@ describe('panesSlice', () => {
           'tab-2': 'pane-saved-3',
         },
         paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
       }
 
       const state = panesReducer(initialState, hydratePanes(savedState))
@@ -1130,6 +1138,9 @@ describe('panesSlice', () => {
           'tab-1': 'pane-2',
         },
         paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
       }
 
       const state = panesReducer(initialState, hydratePanes(savedState))
@@ -1879,6 +1890,120 @@ describe('panesSlice', () => {
 
       const newPaneId = result.activePane['tab-1']
       expect(result.paneTitles['tab-1'][newPaneId]).toBe('Codex')
+    })
+  })
+
+  describe('paneTitleSetByUser guard', () => {
+    const makeState = (setByUser: boolean): PanesState => ({
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-1',
+          content: { kind: 'terminal', createRequestId: 'req-1', status: 'running', mode: 'shell' },
+        },
+      },
+      activePane: { 'tab-1': 'pane-1' },
+      paneTitles: { 'tab-1': { 'pane-1': 'User Title' } },
+      paneTitleSetByUser: setByUser ? { 'tab-1': { 'pane-1': true } } : {},
+      renameRequestTabId: null,
+      renameRequestPaneId: null,
+    })
+
+    it('updatePaneContent does NOT overwrite title when paneTitleSetByUser is true', () => {
+      const state = makeState(true)
+      const result = panesReducer(state, updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: { kind: 'terminal', createRequestId: 'req-1', status: 'running', mode: 'claude' },
+      }))
+
+      expect(result.paneTitles['tab-1']['pane-1']).toBe('User Title')
+    })
+
+    it('updatePaneContent DOES overwrite title when paneTitleSetByUser is false/missing', () => {
+      const state = makeState(false)
+      const result = panesReducer(state, updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: { kind: 'terminal', createRequestId: 'req-1', status: 'running', mode: 'claude' },
+      }))
+
+      // derivePaneTitle for claude mode returns 'Claude'
+      expect(result.paneTitles['tab-1']['pane-1']).toBe('Claude')
+    })
+
+    it('updatePaneTitle sets paneTitleSetByUser to true', () => {
+      const state = makeState(false)
+      const result = panesReducer(state, updatePaneTitle({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        title: 'Custom Name',
+      }))
+
+      expect(result.paneTitleSetByUser['tab-1']?.['pane-1']).toBe(true)
+    })
+
+    it('closePane cleans up paneTitleSetByUser entry', () => {
+      // Need a split so we can actually close a pane
+      const state: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'split',
+            id: 'split-1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              { type: 'leaf', id: 'pane-1', content: { kind: 'terminal', createRequestId: 'req-1', status: 'running', mode: 'shell' } },
+              { type: 'leaf', id: 'pane-2', content: { kind: 'terminal', createRequestId: 'req-2', status: 'running', mode: 'claude' } },
+            ],
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell', 'pane-2': 'Claude' } },
+        paneTitleSetByUser: { 'tab-1': { 'pane-1': true, 'pane-2': true } },
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+      }
+
+      const result = panesReducer(state, closePane({ tabId: 'tab-1', paneId: 'pane-2' }))
+
+      expect(result.paneTitleSetByUser['tab-1']?.['pane-2']).toBeUndefined()
+      // pane-1 should still be there
+      expect(result.paneTitleSetByUser['tab-1']?.['pane-1']).toBe(true)
+    })
+
+    it('removeLayout cleans up paneTitleSetByUser for the tab', () => {
+      const state: PanesState = {
+        ...initialState,
+        layouts: { 'tab-1': { type: 'leaf', id: 'pane-1', content: { kind: 'terminal', createRequestId: 'req-1', status: 'running', mode: 'shell' } } },
+        paneTitleSetByUser: { 'tab-1': { 'pane-1': true } },
+      }
+
+      const result = panesReducer(state, removeLayout({ tabId: 'tab-1' }))
+
+      expect(result.paneTitleSetByUser['tab-1']).toBeUndefined()
+    })
+  })
+
+  describe('requestPaneRename / clearPaneRenameRequest', () => {
+    it('requestPaneRename sets tabId and paneId', () => {
+      const result = panesReducer(initialState, requestPaneRename({ tabId: 'tab-1', paneId: 'pane-1' }))
+
+      expect(result.renameRequestTabId).toBe('tab-1')
+      expect(result.renameRequestPaneId).toBe('pane-1')
+    })
+
+    it('clearPaneRenameRequest resets to null', () => {
+      const state: PanesState = {
+        ...initialState,
+        renameRequestTabId: 'tab-1',
+        renameRequestPaneId: 'pane-1',
+      }
+
+      const result = panesReducer(state, clearPaneRenameRequest())
+
+      expect(result.renameRequestTabId).toBeNull()
+      expect(result.renameRequestPaneId).toBeNull()
     })
   })
 

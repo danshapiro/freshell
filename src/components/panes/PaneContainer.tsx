@@ -1,6 +1,6 @@
-import { useRef, useCallback, useMemo, useState } from 'react'
+import { useRef, useCallback, useMemo, useState, useEffect } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { closePane, setActivePane, resizePanes, updatePaneContent } from '@/store/panesSlice'
+import { closePane, setActivePane, resizePanes, updatePaneContent, updatePaneTitle, clearPaneRenameRequest } from '@/store/panesSlice'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
 import Pane from './Pane'
 import PaneDivider from './PaneDivider'
@@ -38,6 +38,49 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   // Check if this is the only pane (root is a leaf)
   const rootNode = useAppSelector((s) => s.panes.layouts[tabId])
   const isOnlyPane = rootNode?.type === 'leaf'
+
+  // Inline rename state (local to this PaneContainer instance)
+  const [renamingPaneId, setRenamingPaneId] = useState<string | null>(null)
+  const [renameValue, setRenameValue] = useState('')
+
+  // Listen for rename requests from Redux (context menu trigger)
+  const renameRequestTabId = useAppSelector((s) => s.panes.renameRequestTabId)
+  const renameRequestPaneId = useAppSelector((s) => s.panes.renameRequestPaneId)
+
+  useEffect(() => {
+    if (!renameRequestTabId || !renameRequestPaneId) return
+    if (renameRequestTabId !== tabId) return
+    // Only handle the request if this PaneContainer renders the target pane as a leaf
+    if (node.type !== 'leaf' || node.id !== renameRequestPaneId) return
+
+    const currentTitle = paneTitles[node.id] ?? derivePaneTitle(node.content)
+    setRenamingPaneId(node.id)
+    setRenameValue(currentTitle)
+    dispatch(clearPaneRenameRequest())
+  }, [renameRequestTabId, renameRequestPaneId, tabId, node, paneTitles, dispatch])
+
+  const startRename = useCallback((paneId: string, currentTitle: string) => {
+    setRenamingPaneId(paneId)
+    setRenameValue(currentTitle)
+  }, [])
+
+  const commitRename = useCallback(() => {
+    if (!renamingPaneId) return
+    const trimmed = renameValue.trim()
+    if (trimmed) {
+      dispatch(updatePaneTitle({ tabId, paneId: renamingPaneId, title: trimmed }))
+    }
+    // Empty value keeps the original title (no dispatch)
+    setRenamingPaneId(null)
+    setRenameValue('')
+  }, [dispatch, tabId, renamingPaneId, renameValue])
+
+  const handleRenameKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' || e.key === 'Escape') {
+      e.preventDefault()
+      ;(e.target as HTMLInputElement).blur()
+    }
+  }, [])
 
   const handleClose = useCallback((paneId: string, content: PaneContent) => {
     // Clean up terminal process if this pane has one
@@ -80,6 +123,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     const explicitTitle = paneTitles[node.id]
     const paneTitle = explicitTitle ?? derivePaneTitle(node.content)
     const paneStatus = node.content.kind === 'terminal' ? node.content.status : 'running'
+    const isRenaming = renamingPaneId === node.id
 
     return (
       <Pane
@@ -91,6 +135,12 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         status={paneStatus}
         onClose={() => handleClose(node.id, node.content)}
         onFocus={() => handleFocus(node.id)}
+        isRenaming={isRenaming}
+        renameValue={isRenaming ? renameValue : undefined}
+        onRenameChange={isRenaming ? setRenameValue : undefined}
+        onRenameBlur={isRenaming ? commitRename : undefined}
+        onRenameKeyDown={isRenaming ? handleRenameKeyDown : undefined}
+        onDoubleClickTitle={() => startRename(node.id, paneTitle)}
       >
         {renderContent(tabId, node.id, node.content, isOnlyPane, hidden)}
       </Pane>

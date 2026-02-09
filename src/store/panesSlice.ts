@@ -139,14 +139,22 @@ function cleanOrphanedLayouts(state: PanesState): PanesState {
     const nextLayouts = { ...state.layouts }
     const nextActivePane = { ...state.activePane }
     const nextPaneTitles = { ...state.paneTitles }
+    const nextPaneTitleSetByUser = { ...state.paneTitleSetByUser }
 
     for (const tabId of orphaned) {
       delete nextLayouts[tabId]
       delete nextActivePane[tabId]
       delete nextPaneTitles[tabId]
+      delete nextPaneTitleSetByUser[tabId]
     }
 
-    return { layouts: nextLayouts, activePane: nextActivePane, paneTitles: nextPaneTitles }
+    return {
+      ...state,
+      layouts: nextLayouts,
+      activePane: nextActivePane,
+      paneTitles: nextPaneTitles,
+      paneTitleSetByUser: nextPaneTitleSetByUser,
+    }
   } catch {
     return state
   }
@@ -161,6 +169,9 @@ function loadInitialPanesState(): PanesState {
     layouts: {},
     activePane: {},
     paneTitles: {},
+    paneTitleSetByUser: {},
+    renameRequestTabId: null,
+    renameRequestPaneId: null,
   }
 
   try {
@@ -174,6 +185,9 @@ function loadInitialPanesState(): PanesState {
       layouts: loaded.layouts || {},
       activePane: loaded.activePane || {},
       paneTitles: loaded.paneTitles || {},
+      paneTitleSetByUser: loaded.paneTitleSetByUser || {},
+      renameRequestTabId: null,
+      renameRequestPaneId: null,
     }
     state = applyLegacyResumeSessionIds(state)
     state = cleanOrphanedLayouts(state)
@@ -514,9 +528,12 @@ export const panesSlice = createSlice({
         state.activePane[tabId] = remainingLeaves[remainingLeaves.length - 1].id
       }
 
-      // Clean up pane title
+      // Clean up pane title and user-set flag
       if (state.paneTitles[tabId]?.[paneId]) {
         delete state.paneTitles[tabId][paneId]
+      }
+      if (state.paneTitleSetByUser?.[tabId]?.[paneId]) {
+        delete state.paneTitleSetByUser[tabId][paneId]
       }
     },
 
@@ -621,11 +638,13 @@ export const panesSlice = createSlice({
 
       state.layouts[tabId] = updateContent(root)
 
-      // Update pane title when content changes
-      if (!state.paneTitles[tabId]) {
-        state.paneTitles[tabId] = {}
+      // Update pane title when content changes, unless user explicitly set it
+      if (!state.paneTitleSetByUser?.[tabId]?.[paneId]) {
+        if (!state.paneTitles[tabId]) {
+          state.paneTitles[tabId] = {}
+        }
+        state.paneTitles[tabId][paneId] = derivePaneTitle(content)
       }
-      state.paneTitles[tabId][paneId] = derivePaneTitle(content)
     },
 
     removeLayout: (
@@ -636,6 +655,9 @@ export const panesSlice = createSlice({
       delete state.layouts[tabId]
       delete state.activePane[tabId]
       delete state.paneTitles[tabId]
+      if (state.paneTitleSetByUser) {
+        delete state.paneTitleSetByUser[tabId]
+      }
     },
 
     hydratePanes: (state, action: PayloadAction<PanesState>) => {
@@ -662,6 +684,11 @@ export const panesSlice = createSlice({
       state.layouts = mergedLayouts
       state.activePane = incoming.activePane || {}
       state.paneTitles = incoming.paneTitles || {}
+      // paneTitleSetByUser may not be present on old states; default to empty
+      state.paneTitleSetByUser = (incoming as any).paneTitleSetByUser || {}
+      // Ephemeral signals must never be hydrated from remote
+      state.renameRequestTabId = null
+      state.renameRequestPaneId = null
     },
 
     updatePaneTitle: (
@@ -673,6 +700,26 @@ export const panesSlice = createSlice({
         state.paneTitles[tabId] = {}
       }
       state.paneTitles[tabId][paneId] = title
+      if (!state.paneTitleSetByUser) {
+        state.paneTitleSetByUser = {}
+      }
+      if (!state.paneTitleSetByUser[tabId]) {
+        state.paneTitleSetByUser[tabId] = {}
+      }
+      state.paneTitleSetByUser[tabId][paneId] = true
+    },
+
+    requestPaneRename: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string }>
+    ) => {
+      state.renameRequestTabId = action.payload.tabId
+      state.renameRequestPaneId = action.payload.paneId
+    },
+
+    clearPaneRenameRequest: (state) => {
+      state.renameRequestTabId = null
+      state.renameRequestPaneId = null
     },
   },
 })
@@ -691,6 +738,8 @@ export const {
   removeLayout,
   hydratePanes,
   updatePaneTitle,
+  requestPaneRename,
+  clearPaneRenameRequest,
 } = panesSlice.actions
 
 export default panesSlice.reducer

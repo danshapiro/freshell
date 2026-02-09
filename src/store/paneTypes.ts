@@ -103,6 +103,14 @@ export interface PanesState {
    * Used to keep user-edited or derived titles stable across renders.
    */
   paneTitles: Record<string, Record<string, string>>
+  /** Map of tabId -> paneId -> whether the user explicitly set the title */
+  paneTitleSetByUser: Record<string, Record<string, boolean>>
+  /**
+   * Ephemeral UI signal: request PaneContainer to enter inline rename mode.
+   * Must never be persisted.
+   */
+  renameRequestTabId: string | null
+  renameRequestPaneId: string | null
 }
 
 /**
