@@ -1287,6 +1287,53 @@ describe('panesSlice', () => {
       expect(pane2Content.resumeSessionId).toBe('session-X')
     })
 
+    it('accepts incoming when resumeSessionId matches local (no conflict)', () => {
+      const localState: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              createRequestId: 'req-1',
+              status: 'creating',
+              resumeSessionId: 'session-A',
+            },
+          } as any,
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+      }
+
+      const incoming: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              createRequestId: 'req-1',
+              status: 'running',
+              terminalId: 'remote-t1',
+              resumeSessionId: 'session-A',
+            },
+          } as any,
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+      }
+
+      const state = panesReducer(localState, hydratePanes(incoming))
+      const content = (state.layouts['tab-1'] as any).content
+
+      // Same session — incoming accepted wholesale (lifecycle progress propagated)
+      expect(content.resumeSessionId).toBe('session-A')
+      expect(content.terminalId).toBe('remote-t1')
+      expect(content.status).toBe('running')
+    })
+
     it('preserves local resumeSessionId even when incoming has exited status', () => {
       const localState: PanesState = {
         layouts: {
