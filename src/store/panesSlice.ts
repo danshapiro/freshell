@@ -317,6 +317,16 @@ function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode {
         ) {
           return { ...incoming, content: local.content }
         }
+        // Guard resumeSessionId: if the local pane has a session and incoming
+        // differs, preserve the local session. resumeSessionId is pane identity
+        // (which Claude session this pane represents) and must not be silently
+        // swapped by cross-tab sync from another browser tab's terminal.
+        if (
+          local.content.resumeSessionId &&
+          incoming.content.resumeSessionId !== local.content.resumeSessionId
+        ) {
+          return { ...incoming, content: { ...incoming.content, resumeSessionId: local.content.resumeSessionId } }
+        }
       } else if (local.content.status === 'creating') {
         // Different createRequestId and local is reconnecting: local just
         // regenerated its ID (e.g. after INVALID_TERMINAL_ID). Stale remote

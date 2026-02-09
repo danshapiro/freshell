@@ -1158,6 +1158,181 @@ describe('panesSlice', () => {
       expect(state.paneTitles).toEqual({ 'tab-1': { 'pane-1': 'My Shell' } })
     })
 
+    it('preserves local resumeSessionId when incoming has different session (same createRequestId)', () => {
+      // Simulate local state: Claude pane with SESSION_A, still creating
+      const localState: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              createRequestId: 'req-1',
+              status: 'creating',
+              resumeSessionId: 'session-A',
+            },
+          } as any,
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+      }
+
+      // Incoming: same createRequestId but different resumeSessionId
+      const incoming: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              createRequestId: 'req-1',
+              status: 'running',
+              terminalId: 'remote-t1',
+              resumeSessionId: 'session-B',
+            },
+          } as any,
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+      }
+
+      const state = panesReducer(localState, hydratePanes(incoming))
+      const content = (state.layouts['tab-1'] as any).content
+
+      expect(content.resumeSessionId).toBe('session-A')
+    })
+
+    it('preserves local resumeSessionId inside split pane trees', () => {
+      const localState: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'split',
+            id: 'split-1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              {
+                type: 'leaf',
+                id: 'pane-1',
+                content: {
+                  kind: 'terminal',
+                  mode: 'shell',
+                  createRequestId: 'req-1',
+                  status: 'running',
+                  terminalId: 't1',
+                },
+              },
+              {
+                type: 'leaf',
+                id: 'pane-2',
+                content: {
+                  kind: 'terminal',
+                  mode: 'claude',
+                  createRequestId: 'req-2',
+                  status: 'creating',
+                  resumeSessionId: 'session-X',
+                },
+              },
+            ],
+          } as any,
+        },
+        activePane: { 'tab-1': 'pane-2' },
+        paneTitles: {},
+      }
+
+      const incoming: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'split',
+            id: 'split-1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              {
+                type: 'leaf',
+                id: 'pane-1',
+                content: {
+                  kind: 'terminal',
+                  mode: 'shell',
+                  createRequestId: 'req-1',
+                  status: 'running',
+                  terminalId: 't1',
+                },
+              },
+              {
+                type: 'leaf',
+                id: 'pane-2',
+                content: {
+                  kind: 'terminal',
+                  mode: 'claude',
+                  createRequestId: 'req-2',
+                  status: 'running',
+                  terminalId: 'remote-t2',
+                  resumeSessionId: 'session-Y',
+                },
+              },
+            ],
+          } as any,
+        },
+        activePane: { 'tab-1': 'pane-2' },
+        paneTitles: {},
+      }
+
+      const state = panesReducer(localState, hydratePanes(incoming))
+      const split = state.layouts['tab-1'] as any
+      const pane2Content = split.children[1].content
+
+      expect(pane2Content.resumeSessionId).toBe('session-X')
+    })
+
+    it('allows resumeSessionId update when local has no session', () => {
+      // Local pane has no resumeSessionId (new terminal, not yet associated)
+      const localState: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              createRequestId: 'req-1',
+              status: 'creating',
+              // no resumeSessionId
+            },
+          } as any,
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+      }
+
+      const incoming: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              createRequestId: 'req-1',
+              status: 'running',
+              terminalId: 'remote-t1',
+              resumeSessionId: 'session-new',
+            },
+          } as any,
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+      }
+
+      const state = panesReducer(localState, hydratePanes(incoming))
+      const content = (state.layouts['tab-1'] as any).content
+
+      // When local has NO resumeSessionId, incoming's session should be accepted
+      expect(content.resumeSessionId).toBe('session-new')
+    })
+
     it('handles missing paneTitles in persisted state', () => {
       const savedStateWithoutTitles = {
         layouts: {},

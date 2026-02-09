@@ -353,6 +353,60 @@ describe('crossTabSync', () => {
     expect(store.getState().panes.layouts['tab-1']).toBeDefined()
   })
 
+  it('preserves local resumeSessionId when remote has different session for same createRequestId', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+
+    // Local state: Claude pane creating with SESSION_A
+    store.dispatch(hydratePanes({
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-1',
+          content: {
+            kind: 'terminal',
+            mode: 'claude',
+            createRequestId: 'req-1',
+            status: 'creating',
+            resumeSessionId: 'session-A',
+          },
+        } as any,
+      },
+      activePane: { 'tab-1': 'pane-1' },
+      paneTitles: {},
+    }))
+
+    // Remote: same createRequestId but different resumeSessionId (from another tab)
+    const remoteRaw = JSON.stringify({
+      version: 4,
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-1',
+          content: {
+            kind: 'terminal',
+            mode: 'claude',
+            createRequestId: 'req-1',
+            status: 'running',
+            terminalId: 'remote-terminal-456',
+            resumeSessionId: 'session-B',
+          },
+        },
+      },
+      activePane: { 'tab-1': 'pane-1' },
+      paneTitles: {},
+      paneTitleSetByUser: {},
+    })
+
+    cleanups.push(installCrossTabSync(store as any))
+    window.dispatchEvent(new StorageEvent('storage', { key: PANES_STORAGE_KEY, newValue: remoteRaw }))
+
+    // Local resumeSessionId must NOT be overwritten by remote
+    const content = (store.getState().panes.layouts['tab-1'] as any).content
+    expect(content.resumeSessionId).toBe('session-A')
+  })
+
   it('does not permanently dedupe: identical remote payload should hydrate again after a local persisted change', () => {
     const dispatchSpy = vi.fn()
     const storeLike = {
