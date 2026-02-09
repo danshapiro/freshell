@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { cleanup } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer, { updateTab } from '@/store/tabsSlice'
-import panesReducer from '@/store/panesSlice'
+import panesReducer, { updatePaneTitle } from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 
@@ -255,5 +255,135 @@ describe('TerminalView title normalization', () => {
     // Should only have 2 updates: "Building..." and "Done"
     expect(updateCount).toBe(2)
     expect(store.getState().tabs.tabs[0].title).toBe('Done')
+  })
+})
+
+describe('TerminalView decoupled title guards', () => {
+  // Tab and pane title auto-updates should be independently guarded:
+  // - Tab title gated by tab.titleSetByUser
+  // - Pane title gated by paneTitleSetByUser (in the reducer)
+  // Renaming one should NOT block auto-updates on the other.
+
+  const TAB_ID = 'tab-1'
+  const PANE_ID = 'pane-1'
+
+  function createStore(opts: {
+    tabTitleSetByUser: boolean
+    paneTitleSetByUser: boolean
+    tabTitle?: string
+    paneTitle?: string
+  }) {
+    return configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: TAB_ID,
+            mode: 'shell' as const,
+            status: 'running' as const,
+            title: opts.tabTitle ?? 'Terminal',
+            titleSetByUser: opts.tabTitleSetByUser,
+            createRequestId: 'req-1',
+          }],
+          activeTabId: TAB_ID,
+        },
+        panes: {
+          layouts: {},
+          activePane: {},
+          paneTitles: { [TAB_ID]: { [PANE_ID]: opts.paneTitle ?? 'Terminal' } },
+          paneTitleSetByUser: opts.paneTitleSetByUser
+            ? { [TAB_ID]: { [PANE_ID]: true } }
+            : {},
+        },
+        settings: { settings: defaultSettings, status: 'loaded' as const },
+        connection: { status: 'connected' as const, error: null },
+      },
+    })
+  }
+
+  /** Simulate the DESIRED decoupled title update logic from TerminalView. */
+  function simulateDecoupledTitleUpdate(
+    store: ReturnType<typeof createStore>,
+    newTitle: string
+  ) {
+    const tab = store.getState().tabs.tabs[0]
+
+    // Tab title: only gated by tab.titleSetByUser
+    if (!tab.titleSetByUser && newTitle) {
+      store.dispatch(updateTab({ id: tab.id, updates: { title: newTitle } }))
+    }
+
+    // Pane title: always dispatched with setByUser:false — reducer handles guard
+    if (newTitle) {
+      store.dispatch(updatePaneTitle({
+        tabId: TAB_ID,
+        paneId: PANE_ID,
+        title: newTitle,
+        setByUser: false,
+      }))
+    }
+  }
+
+  it('updates pane title even when tab title is user-set', () => {
+    const store = createStore({
+      tabTitleSetByUser: true,
+      paneTitleSetByUser: false,
+      tabTitle: 'My Custom Tab',
+      paneTitle: 'Terminal',
+    })
+
+    simulateDecoupledTitleUpdate(store, 'user@host:~/project')
+
+    // Tab title should NOT change (user renamed it)
+    expect(store.getState().tabs.tabs[0].title).toBe('My Custom Tab')
+    // Pane title SHOULD update (pane was not renamed by user)
+    expect(store.getState().panes.paneTitles[TAB_ID][PANE_ID]).toBe('user@host:~/project')
+  })
+
+  it('updates tab title even when pane title is user-set', () => {
+    const store = createStore({
+      tabTitleSetByUser: false,
+      paneTitleSetByUser: true,
+      tabTitle: 'Terminal',
+      paneTitle: 'My Custom Pane',
+    })
+
+    simulateDecoupledTitleUpdate(store, 'user@host:~/project')
+
+    // Tab title SHOULD update (tab was not renamed by user)
+    expect(store.getState().tabs.tabs[0].title).toBe('user@host:~/project')
+    // Pane title should NOT change (user renamed it, reducer blocks setByUser:false)
+    expect(store.getState().panes.paneTitles[TAB_ID][PANE_ID]).toBe('My Custom Pane')
+  })
+
+  it('updates both when neither is user-set', () => {
+    const store = createStore({
+      tabTitleSetByUser: false,
+      paneTitleSetByUser: false,
+    })
+
+    simulateDecoupledTitleUpdate(store, 'vim README.md')
+
+    expect(store.getState().tabs.tabs[0].title).toBe('vim README.md')
+    expect(store.getState().panes.paneTitles[TAB_ID][PANE_ID]).toBe('vim README.md')
+  })
+
+  it('updates neither when both are user-set', () => {
+    const store = createStore({
+      tabTitleSetByUser: true,
+      paneTitleSetByUser: true,
+      tabTitle: 'My Tab',
+      paneTitle: 'My Pane',
+    })
+
+    simulateDecoupledTitleUpdate(store, 'user@host:~/project')
+
+    expect(store.getState().tabs.tabs[0].title).toBe('My Tab')
+    expect(store.getState().panes.paneTitles[TAB_ID][PANE_ID]).toBe('My Pane')
   })
 })

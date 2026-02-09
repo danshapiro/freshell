@@ -280,9 +280,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     if (!term) return
 
     const disposable = term.onTitleChange((rawTitle: string) => {
-      const currentTab = tabRef.current
-      if (!currentTab || currentTab.titleSetByUser) return
-
       // Strip prefix noise (spinners, status chars) - everything before first letter
       const match = rawTitle.match(/[a-zA-Z]/)
       if (!match) return // No letters = all noise, ignore
@@ -299,7 +296,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       lastTitleRef.current = cleanTitle
       lastTitleUpdateRef.current = now
 
-      dispatch(updateTab({ id: currentTab.id, updates: { title: cleanTitle } }))
+      // Tab and pane titles are independently guarded:
+      // - Tab title gated by tab.titleSetByUser
+      // - Pane title gated by paneTitleSetByUser (in the reducer)
+      const currentTab = tabRef.current
+      if (currentTab && !currentTab.titleSetByUser) {
+        dispatch(updateTab({ id: currentTab.id, updates: { title: cleanTitle } }))
+      }
       dispatch(updatePaneTitle({ tabId, paneId: paneIdRef.current, title: cleanTitle, setByUser: false }))
     })
 
@@ -499,13 +502,14 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           }
         }
 
-        // Auto-update title from Claude session (only if user hasn't manually set it)
-        if (msg.type === 'terminal.title.updated' && msg.terminalId === tid) {
+        // Auto-update title from Claude session
+        // Tab and pane titles are independently guarded
+        if (msg.type === 'terminal.title.updated' && msg.terminalId === tid && msg.title) {
           const titleTab = tabRef.current
-          if (titleTab && !titleTab.titleSetByUser && msg.title) {
+          if (titleTab && !titleTab.titleSetByUser) {
             dispatch(updateTab({ id: titleTab.id, updates: { title: msg.title } }))
-            dispatch(updatePaneTitle({ tabId, paneId: paneIdRef.current, title: msg.title, setByUser: false }))
           }
+          dispatch(updatePaneTitle({ tabId, paneId: paneIdRef.current, title: msg.title, setByUser: false }))
         }
 
         // Handle one-time session association (when Claude creates a new session)
