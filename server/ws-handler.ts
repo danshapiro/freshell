@@ -820,7 +820,15 @@ export class WsHandler {
       }
     }
   ): void {
-    const connectionId = ws.connectionId || 'unknown'
+    const connectionId = ws.connectionId
+    if (!connectionId) {
+      log.warn(
+        { terminalId: args.terminalId },
+        'Missing connectionId for attach snapshot queue; sending without per-connection chain',
+      )
+      void this.sendAttachSnapshotAndFinalize(ws, state, args)
+      return
+    }
     const key = `${connectionId}:${args.terminalId}`
     const perConnectionKeys = this.attachChainKeysByConnection.get(connectionId) || new Set<string>()
     perConnectionKeys.add(key)
