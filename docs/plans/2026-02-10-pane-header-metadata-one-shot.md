@@ -11,6 +11,7 @@ Example: `freshell (main*)  25%` then whitespace, then pane action icons.
 Also:
 - always render a pane title bar even when a tab has only one pane.
 - make the active tab background match the pane title bar color; inactive tabs should be white so tabs visually blend into the title bar.
+- keep title-bar behavior as close as possible between Codex and Claude panes (same layout, spacing, truncation strategy, fallback rendering, and visibility rules), with differences only where provider telemetry differs.
 
 **Architecture:** Keep terminal runtime metadata server-authoritative (`terminal.meta.*` over WS), store it in a non-persisted Redux slice keyed by `terminalId`, and render a single formatted right-aligned string in an always-visible `PaneHeader`. Metadata is sourced from terminal registry + coding-cli session indexer + provider token parsing. Update tab-strip styling in `TabBar` so active-tab background matches title-bar background and inactive tabs are white.
 
@@ -57,6 +58,7 @@ Also:
 - Keep persisted pane layout schema untouched (runtime-only metadata).
 - Backward-compatible WS protocol additions only.
 - Existing behavior in `App.tsx` message handlers (notably `terminal.exit` idle-warning cleanup) must be preserved.
+- Provider parity rule: Codex/Claude pane-header rendering must use one shared formatter/path and identical UI behavior where possible; provider-specific branches are allowed only for token-threshold derivation.
 
 ---
 
@@ -444,6 +446,7 @@ git commit -m "feat(client): ingest terminal metadata snapshot and live updates"
 - metadata hidden for non-coding-cli modes.
 - icon buttons still render after metadata text.
 - title bar renders even when a tab has a single pane (no split).
+- Codex and Claude with equivalent metadata inputs render equivalent title text/spacing output.
 
 `Pane.test.tsx` should assert metadata prop/select path is wired.
 
@@ -544,6 +547,7 @@ Flow:
 - assert right-aligned text updates correctly.
 - emit `terminal.exit` and assert metadata is removed.
 - assert pane title bar is present in single-pane layout.
+- assert parity for equivalent Codex/Claude metadata (same text shape and fallback behavior).
 
 **Step 2: Run e2e + full regression**
 
@@ -575,7 +579,8 @@ git commit -m "test(e2e): verify terminal metadata websocket flow to right-align
 8. Pane header shows right-aligned metadata text in format `<subdir> (<branch><*>)  <percent>%` before icons.
 9. Non-coding-cli panes do not show this metadata string.
 10. Active tab background matches pane title-bar background; inactive tabs are white.
-11. `npm run lint` and `npm test` are green.
+11. Codex and Claude pane title bars have parity in rendering behavior except for provider-specific threshold math.
+12. `npm run lint` and `npm test` are green.
 
 ---
 
