@@ -462,7 +462,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           const mode = contentRef.current?.mode || 'shell'
           const { cleaned, count } = extractTurnCompleteSignals(raw, mode, turnCompleteSignalStateRef.current)
 
-          if (count > 0) {
+          if (count > 0 && tid) {
             dispatch(recordTurnComplete({
               tabId,
               paneId: paneIdRef.current,
