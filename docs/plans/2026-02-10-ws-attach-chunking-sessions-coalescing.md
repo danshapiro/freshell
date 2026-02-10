@@ -80,7 +80,8 @@
 - With `MAX_CHUNK_BYTES` (from env `MAX_WS_CHUNK_BYTES`) defaulting to ~500KB and snapshot upper bound 2M UTF-16 code units, chunk counts vary by serialized byte size.
 - ANSI/control-character-heavy content can expand significantly under JSON escaping, so chunk count can exceed 4 for the same character count.
 - Exact byte safety requires candidate-string serialization in the probe loop; optimize by precomputing stable envelope fragments and limiting probe count.
-- Acceptance target: chunking time should scale roughly linearly with serialized payload size; treat >100ms per MiB serialized payload as a regression to optimize.
+- Reference algorithm is O(N log N) due binary-search probing; keep probe count bounded and payload sizes capped.
+- Acceptance target: <= 200ms for a 2MB serialized payload on baseline dev hardware; treat sustained regressions above that as optimization work.
 
 8. **Chunk ordering relies on websocket/TCP in-order delivery for a single connection.**
 - `terminal.attached.chunk` intentionally has no explicit sequence index.
@@ -200,16 +201,7 @@ export function chunkTerminalSnapshot(snapshot: string, maxBytes: number, termin
       }
     }
 
-    if (best === cursor) {
-      // Fall back to exactly one full code point to avoid splitting surrogate pairs.
-      const cp = snapshot.codePointAt(cursor)
-      const next = cursor + (cp !== undefined && cp > 0xFFFF ? 2 : 1)
-      const candidate = snapshot.slice(cursor, next)
-      if (payloadBytes(candidate) > maxBytes) {
-        throw new Error('Unable to chunk snapshot safely within max byte budget')
-      }
-      best = next
-    } else if (best < snapshot.length) {
+    if (best < snapshot.length && best > cursor) {
       // If boundary lands between high+low surrogate, step back one code unit.
       const prev = snapshot.charCodeAt(best - 1)
       const next = snapshot.charCodeAt(best)
@@ -279,8 +271,9 @@ In `server/ws-handler.ts`:
 - Parse new hello capability.
 - Keep existing `send(ws, msg)` signature unchanged.
 - Add attach chunk size floor for safety:
+  - `ATTACH_CHUNK_BYTES = Number(process.env.MAX_WS_ATTACH_CHUNK_BYTES || process.env.MAX_WS_CHUNK_BYTES || 500 * 1024)`.
   - `MIN_ATTACH_CHUNK_BYTES = 16 * 1024`.
-  - `effectiveAttachChunkBytes = Math.max(MAX_CHUNK_BYTES, MIN_ATTACH_CHUNK_BYTES)` in attach chunking path.
+  - `effectiveAttachChunkBytes = Math.max(ATTACH_CHUNK_BYTES, MIN_ATTACH_CHUNK_BYTES)` in attach chunking path.
 - Add `queueAttachFrame(ws, msg): Promise<boolean>` helper for attach snapshot flow only:
   - resolves `false` if socket is not open before send.
   - performs the same backpressure guard behavior as `send` (including `4008` close on overflow) before enqueue.
@@ -294,6 +287,7 @@ In `server/ws-handler.ts`:
   - Maintain secondary index `attachChainKeysByConnection: Map<string, Set<string>>` for efficient cleanup by connection.
   - On completion/failure, clear map entry in `finally` if it still points to the active promise.
   - On websocket close, clear all chain keys for that connection ID via the secondary index, then clear the index entry.
+  - Cleanup operations are idempotent; missing keys are treated as no-op.
   - Rely on existing websocket close detach behavior to clear `pendingSnapshotClients` server-side for that connection.
 - Add a private class method (inside `WsHandler`) that sends snapshot inline or chunked and finalizes attach only after a complete snapshot send:
 
@@ -323,6 +317,7 @@ Method behavior:
   - If `created` present, send `terminal.created` with `snapshot`.
   - Else send `terminal.attached` with `snapshot`.
   - If `await queueAttachFrame(...)` returns `true`, schedule `setImmediate(() => this.registry.finishAttachSnapshot(terminalId, ws))`.
+  - Rationale: `queueAttachFrame` resolves only after frame enqueue callback/close outcome, so `setImmediate` still preserves snapshot-before-output ordering.
 - Chunk path (oversized + capable):
   - Compute chunks first via `chunkTerminalSnapshot(..., effectiveAttachChunkBytes, ...)`.
   - If chunks are empty or a single chunk, use inline path (do not send `snapshotChunked: true`).
@@ -382,7 +377,8 @@ Add lifecycle tests for chunk flow:
 - incomplete stream cleanup:
   - on websocket reconnect/disconnect, buffered chunks for that terminal are dropped.
   - on timeout (no `terminal.attached.end` within `ATTACH_CHUNK_TIMEOUT_MS = 10_000`), buffered chunks are dropped and attach spinner is cleared.
-  - on repeated `terminal.attached.start` for same terminal, previous in-flight chunks are replaced.
+- on repeated `terminal.attached.start` for same terminal, previous in-flight chunks are replaced.
+- reconnect/disconnect increments a local connection-generation token and clears all in-flight buffers for prior generation.
 - timeout recovery keeps terminal usable for subsequent live output (no permanent error state).
 - timeout recovery performs one guarded auto-reattach attempt (`terminal.attach` only, no detach) to restore snapshot context; if it fails, continue in degraded live-output-only mode with warning.
 - Explicit timeout coordination:
@@ -396,6 +392,7 @@ Add lifecycle tests for chunk flow:
 In `TerminalView.tsx`:
 - Add `useRef<Map<string, string[]>>` for in-flight attach chunks.
 - Add `useRef<Map<string, number>>` (or equivalent) for per-terminal chunk timeout timers.
+- Add `useRef<number>` (connection generation token) incremented on reconnect/disconnect cleanup.
 - Add `const ATTACH_CHUNK_TIMEOUT_MS = 10_000`.
 - Handle:
   - `terminal.attached.start`
@@ -407,6 +404,7 @@ In `TerminalView.tsx`:
   - if `snapshotChunked: true`, keep attaching state until `terminal.attached.end`.
 - Explicitly skip `setIsAttaching(false)` in the `terminal.created` handler when `snapshotChunked: true`.
 - On reconnect/unmount/detach/terminal change, clear in-flight chunk buffers and timers.
+- On reconnect/disconnect, clear chunk state immediately and bump generation token so stale chunks from prior connection are ignored.
 - On chunk timeout, drop buffered chunks, clear timer, and set `isAttaching` false (do not render partial snapshot).
 - On `terminal.attached.end`, validate `reassembled.length === totalCodeUnits`; if mismatch, discard snapshot and log warning/debug event.
 - On `terminal.attached.end`, validate received chunk count matches `totalChunks`; if mismatch, discard snapshot and log warning/debug event.
