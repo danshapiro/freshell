@@ -95,7 +95,9 @@ Expected: FAIL (crate/type does not exist yet)
 
 ```rust
 // rust/crates/freshell-protocol/src/lib.rs
-#[derive(Debug, Clone)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WsServerMessage {
     Ready { timestamp: String },
 }
@@ -188,6 +190,7 @@ use freshell_protocol::{WsClientMessage, WsServerMessage};
 
 #[test]
 fn ws_schema_covers_all_required_message_families() {
+    // Editor pane remains HTTP-only (/api/files/*); no editor.* WS message family is expected.
     let client_types = [
         r#"{"type":"hello","token":"token-1234567890abcd","capabilities":{"sessionsPatchV1":true,"terminalAttachChunkV1":true}}"#,
         r#"{"type":"hello","capabilities":{"sessionsPatchV1":true}}"#,
@@ -308,14 +311,24 @@ pub enum SandboxMode { ReadOnly, WorkspaceWrite, DangerFullAccess }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ErrorCode { InvalidMessage, RateLimited, InvalidTerminalId, Unauthorized }
+pub enum ErrorCode {
+    InvalidMessage,
+    UnknownMessage,
+    RateLimited,
+    InvalidTerminalId,
+    InvalidSessionId,
+    PtySpawnFailed,
+    FileWatcherError,
+    Unauthorized,
+    InternalError,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionHealthStatus { Healthy, Corrupted, Repaired }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all_fields = "camelCase")]
+#[serde(tag = "type")]
 pub enum WsClientMessage {
     #[serde(rename = "hello")]
     Hello {
@@ -325,43 +338,49 @@ pub enum WsClientMessage {
     },
     #[serde(rename = "terminal.create")]
     TerminalCreate {
+        #[serde(rename = "requestId")]
         request_id: String,
         mode: TerminalMode,
         shell: ShellType,
         cwd: Option<String>,
+        #[serde(rename = "resumeSessionId")]
         resume_session_id: Option<String>,
         restore: Option<bool>,
     },
     #[serde(rename = "terminal.attach")]
-    TerminalAttach { terminal_id: String },
+    TerminalAttach { #[serde(rename = "terminalId")] terminal_id: String },
     #[serde(rename = "terminal.detach")]
-    TerminalDetach { terminal_id: String },
+    TerminalDetach { #[serde(rename = "terminalId")] terminal_id: String },
     #[serde(rename = "terminal.input")]
-    TerminalInput { terminal_id: String, data: String },
+    TerminalInput { #[serde(rename = "terminalId")] terminal_id: String, data: String },
     #[serde(rename = "terminal.resize")]
-    TerminalResize { terminal_id: String, cols: u16, rows: u16 },
+    TerminalResize { #[serde(rename = "terminalId")] terminal_id: String, cols: u16, rows: u16 },
     #[serde(rename = "terminal.kill")]
-    TerminalKill { terminal_id: String },
+    TerminalKill { #[serde(rename = "terminalId")] terminal_id: String },
     #[serde(rename = "terminal.list")]
-    TerminalList { request_id: String },
+    TerminalList { #[serde(rename = "requestId")] request_id: String },
     #[serde(rename = "terminal.meta.list")]
-    TerminalMetaList { request_id: String },
+    TerminalMetaList { #[serde(rename = "requestId")] request_id: String },
     #[serde(rename = "codingcli.create")]
     CodingCliCreate {
+        #[serde(rename = "requestId")]
         request_id: String,
         provider: CodingCliProvider,
         prompt: String,
         cwd: Option<String>,
+        #[serde(rename = "resumeSessionId")]
         resume_session_id: Option<String>,
         model: Option<String>,
+        #[serde(rename = "maxTurns")]
         max_turns: Option<u32>,
+        #[serde(rename = "permissionMode")]
         permission_mode: Option<PermissionMode>,
         sandbox: Option<SandboxMode>,
     },
     #[serde(rename = "codingcli.input")]
-    CodingCliInput { session_id: String, data: String },
+    CodingCliInput { #[serde(rename = "sessionId")] session_id: String, data: String },
     #[serde(rename = "codingcli.kill")]
-    CodingCliKill { session_id: String },
+    CodingCliKill { #[serde(rename = "sessionId")] session_id: String },
     #[serde(rename = "ping")]
     Ping,
 }
@@ -384,55 +403,86 @@ pub struct HelloSessions {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all_fields = "camelCase")]
+#[serde(tag = "type")]
 pub enum WsServerMessage {
     #[serde(rename = "ready")]
     Ready { timestamp: String },
     #[serde(rename = "terminal.created")]
     TerminalCreated {
+        #[serde(rename = "requestId")]
         request_id: String,
+        #[serde(rename = "terminalId")]
         terminal_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         snapshot: Option<String>,
+        #[serde(rename = "snapshotChunked")]
         #[serde(default, skip_serializing_if = "Option::is_none")]
         snapshot_chunked: Option<bool>,
+        #[serde(rename = "createdAt")]
         created_at: u64,
+        #[serde(rename = "effectiveResumeSessionId")]
         effective_resume_session_id: Option<String>,
     },
     #[serde(rename = "terminal.attached")]
-    TerminalAttached { terminal_id: String, snapshot: String },
+    TerminalAttached { #[serde(rename = "terminalId")] terminal_id: String, snapshot: String },
     #[serde(rename = "terminal.attached.start")]
-    TerminalAttachedStart { terminal_id: String, total_code_units: usize, total_chunks: usize },
+    TerminalAttachedStart {
+        #[serde(rename = "terminalId")]
+        terminal_id: String,
+        #[serde(rename = "totalCodeUnits")]
+        total_code_units: usize,
+        #[serde(rename = "totalChunks")]
+        total_chunks: usize,
+    },
     #[serde(rename = "terminal.attached.chunk")]
-    TerminalAttachedChunk { terminal_id: String, chunk: String },
+    TerminalAttachedChunk { #[serde(rename = "terminalId")] terminal_id: String, chunk: String },
     #[serde(rename = "terminal.attached.end")]
-    TerminalAttachedEnd { terminal_id: String, total_code_units: usize, total_chunks: usize },
+    TerminalAttachedEnd {
+        #[serde(rename = "terminalId")]
+        terminal_id: String,
+        #[serde(rename = "totalCodeUnits")]
+        total_code_units: usize,
+        #[serde(rename = "totalChunks")]
+        total_chunks: usize,
+    },
     #[serde(rename = "terminal.detached")]
-    TerminalDetached { terminal_id: String },
+    TerminalDetached { #[serde(rename = "terminalId")] terminal_id: String },
     #[serde(rename = "terminal.output")]
-    TerminalOutput { terminal_id: String, data: String },
+    TerminalOutput { #[serde(rename = "terminalId")] terminal_id: String, data: String },
     #[serde(rename = "terminal.exit")]
-    TerminalExit { terminal_id: String, exit_code: i32 },
+    TerminalExit { #[serde(rename = "terminalId")] terminal_id: String, #[serde(rename = "exitCode")] exit_code: i32 },
     #[serde(rename = "terminal.meta.updated")]
     TerminalMetaUpdated { upsert: Vec<TerminalMetaRecord>, remove: Vec<String> },
     #[serde(rename = "terminal.meta.list.response")]
-    TerminalMetaListResponse { request_id: String, terminals: Vec<TerminalMetaRecord> },
+    TerminalMetaListResponse { #[serde(rename = "requestId")] request_id: String, terminals: Vec<TerminalMetaRecord> },
     #[serde(rename = "terminal.list.response")]
-    TerminalListResponse { request_id: String, terminals: Vec<TerminalListItem> },
+    TerminalListResponse { #[serde(rename = "requestId")] request_id: String, terminals: Vec<TerminalListItem> },
     #[serde(rename = "terminal.list.updated")]
     TerminalListUpdated,
     #[serde(rename = "terminal.title.updated")]
-    TerminalTitleUpdated { terminal_id: String, title: String },
+    TerminalTitleUpdated { #[serde(rename = "terminalId")] terminal_id: String, title: String },
     #[serde(rename = "codingcli.created")]
-    CodingCliCreated { request_id: String, session_id: String, provider: CodingCliProvider },
+    CodingCliCreated {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        provider: CodingCliProvider,
+    },
     #[serde(rename = "codingcli.event")]
-    CodingCliEvent { session_id: String, provider: CodingCliProvider, event: serde_json::Value },
+    CodingCliEvent { #[serde(rename = "sessionId")] session_id: String, provider: CodingCliProvider, event: serde_json::Value },
     #[serde(rename = "codingcli.exit")]
-    CodingCliExit { session_id: String, provider: CodingCliProvider, exit_code: i32 },
+    CodingCliExit {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        provider: CodingCliProvider,
+        #[serde(rename = "exitCode")]
+        exit_code: i32,
+    },
     #[serde(rename = "codingcli.stderr")]
-    CodingCliStderr { session_id: String, provider: CodingCliProvider, text: String },
+    CodingCliStderr { #[serde(rename = "sessionId")] session_id: String, provider: CodingCliProvider, text: String },
     #[serde(rename = "codingcli.killed")]
-    CodingCliKilled { session_id: String, success: bool },
+    CodingCliKilled { #[serde(rename = "sessionId")] session_id: String, success: bool },
     #[serde(rename = "sessions.updated")]
     SessionsUpdated {
         projects: Vec<serde_json::Value>,
@@ -442,29 +492,41 @@ pub enum WsServerMessage {
         append: Option<bool>,
     },
     #[serde(rename = "sessions.patch")]
-    SessionsPatch { upsert_projects: Vec<serde_json::Value>, remove_project_paths: Vec<String> },
+    SessionsPatch {
+        #[serde(rename = "upsertProjects")]
+        upsert_projects: Vec<serde_json::Value>,
+        #[serde(rename = "removeProjectPaths")]
+        remove_project_paths: Vec<String>,
+    },
     #[serde(rename = "session.status")]
     SessionStatus {
+        #[serde(rename = "sessionId")]
         session_id: String,
         status: SessionHealthStatus,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "chainDepth")]
         chain_depth: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "orphansFixed")]
         orphans_fixed: Option<u64>,
     },
     #[serde(rename = "session.repair.activity")]
     SessionRepairActivity {
         event: String,
+        #[serde(rename = "sessionId")]
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<SessionHealthStatus>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "chainDepth")]
         chain_depth: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "orphanCount")]
         orphan_count: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(rename = "orphansFixed")]
         orphans_fixed: Option<u64>,
     },
     #[serde(rename = "settings.updated")]
@@ -472,16 +534,32 @@ pub enum WsServerMessage {
     #[serde(rename = "perf.logging")]
     PerfLogging { enabled: bool },
     #[serde(rename = "terminal.idle.warning")]
-    TerminalIdleWarning { terminal_id: String, kill_minutes: u64, warn_minutes: u64, last_activity_at: u64 },
+    TerminalIdleWarning {
+        #[serde(rename = "terminalId")]
+        terminal_id: String,
+        #[serde(rename = "killMinutes")]
+        kill_minutes: u64,
+        #[serde(rename = "warnMinutes")]
+        warn_minutes: u64,
+        #[serde(rename = "lastActivityAt")]
+        last_activity_at: u64,
+    },
     #[serde(rename = "terminal.session.associated")]
-    TerminalSessionAssociated { terminal_id: String, session_id: String },
+    TerminalSessionAssociated {
+        #[serde(rename = "terminalId")]
+        terminal_id: String,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
     #[serde(rename = "pong")]
     Pong { timestamp: String },
     #[serde(rename = "error")]
     Error {
         code: ErrorCode,
         message: String,
+        #[serde(rename = "requestId")]
         request_id: Option<String>,
+        #[serde(rename = "terminalId")]
         terminal_id: Option<String>,
         timestamp: String,
     },
@@ -528,6 +606,7 @@ pub struct TokenUsageSummary {
     pub context_tokens: Option<u64>,
     pub model_context_window: Option<u64>,
     pub compact_threshold_tokens: Option<u64>,
+    // Must remain in 0..=100 (match source schema validation).
     pub compact_percent: Option<u8>,
 }
 ```
@@ -535,7 +614,7 @@ pub struct TokenUsageSummary {
 Also implement a single outbound WS serializer in `freshell-server` so every server frame, including `terminal.output`, is emitted from `WsServerMessage` instead of ad-hoc JSON payloads.
 Attach compatibility rule: emit `terminal.attached` for non-chunk-capable clients (and small-snapshot fast path), and `terminal.attached.start/chunk/end` for chunk-capable large snapshots.
 In the protocol tests, add explicit key-name assertions for `requestId`, `terminalId`, `resumeSessionId`, and `lastActivityAt` to ensure camelCase wire keys stay correct.
-Use a serde version that supports `rename_all_fields` for internally-tagged enums, or apply per-field `#[serde(rename = "...")]` annotations if you cannot rely on that attribute.
+Prefer explicit per-field `#[serde(rename = "...")]` on enum variants so wire keys stay stable across serde versions.
 
 **Step 4: Run test to verify it passes**
 
@@ -691,6 +770,7 @@ async fn api_routes_are_rate_limited_per_ip() {
         .unwrap();
     assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
 }
+// Test harness uses 3/60s for determinism; production parity remains 300/60s.
 ```
 
 **Step 2: Run test to verify it fails**
@@ -810,6 +890,21 @@ async fn registry_enforces_max_running_and_exited_terminal_limits() {
     reg.mark_test_terminal_exited_for_test(&t2).await;
     assert_eq!(reg.exited_terminal_count_for_test(), 1);
 }
+
+#[tokio::test]
+async fn detached_idle_terminal_warns_then_autokills() {
+    let mut reg = freshell_pty::TerminalRegistry::new_for_test();
+    reg.set_idle_policy_for_test(180, 5);
+    let term_id = reg.create_test_terminal("idle\n").await;
+    reg.detach_all_clients_for_test(&term_id).await;
+    reg.set_last_activity_minutes_ago_for_test(&term_id, 176).await;
+    reg.enforce_idle_kills_for_test().await;
+    let warn = reg.take_idle_warning_for_test().unwrap();
+    assert_eq!(warn["terminalId"], term_id);
+    reg.set_last_activity_minutes_ago_for_test(&term_id, 181).await;
+    reg.enforce_idle_kills_for_test().await;
+    assert_eq!(reg.status_for_test(&term_id), "exited");
+}
 ```
 
 **Step 2: Run test to verify it fails**
@@ -833,6 +928,7 @@ Expected: FAIL
 // - enforce MAX_TERMINALS (default 50) and MAX_EXITED_TERMINALS (default 200) with exited-terminal reaping
 // - pending snapshot queue + bounded overflow handling
 // - negotiated chunking via hello.capabilities.terminalAttachChunkV1
+// - idle monitor parity: 30s poll, detached-only warnings, warnBeforeKillMinutes + autoKillIdleMinutes behavior
 ```
 
 **Step 4: Run test to verify it passes**
@@ -1103,6 +1199,7 @@ git commit -m "feat(ws): implement full terminal websocket lifecycle commands"
 - Create: `.worktrees/rust-port/rust/crates/freshell-coding-cli/src/providers/gemini.rs`
 - Create: `.worktrees/rust-port/rust/crates/freshell-coding-cli/src/providers/kimi.rs`
 - Create: `.worktrees/rust-port/rust/crates/freshell-coding-cli/src/provider_contract.rs`
+- Create: `.worktrees/rust-port/rust/crates/freshell-coding-cli/tests/provider_contracts_doc.rs`
 - Create: `.worktrees/rust-port/docs/provider-contracts.md`
 - Modify: `.worktrees/rust-port/rust/crates/freshell-server/src/ws/mod.rs`
 - Test: `.worktrees/rust-port/rust/crates/freshell-server/tests/ws_codingcli_lifecycle.rs`
@@ -1139,6 +1236,18 @@ async fn codingcli_create_stream_input_kill_emits_expected_events() {
     assert_eq!(killed["sessionId"], session_id);
     assert!(killed["success"].as_bool().unwrap_or(false));
 }
+
+#[test]
+fn provider_contract_doc_defines_non_legacy_provider_behavior() {
+    let doc = std::fs::read_to_string("docs/provider-contracts.md").unwrap();
+    for provider in ["opencode", "gemini", "kimi"] {
+        assert!(doc.contains(provider));
+    }
+    assert!(doc.contains("command name"));
+    assert!(doc.contains("event stream shape"));
+    assert!(doc.contains("stderr mapping"));
+    assert!(doc.contains("kill semantics"));
+}
 ```
 
 **Step 2: Run test to verify it fails**
@@ -1160,6 +1269,7 @@ Expected: FAIL
 // - opencode/gemini/kimi: explicit contract doc + golden fixtures in docs/provider-contracts.md and provider_contract.rs
 //   (binary command names from CODING_CLI_COMMANDS, required env/cwd wiring, stream event shape,
 //    stderr text field, kill semantics, unavailable-binary behavior)
+// - docs/provider-contracts.md must include runnable fixture transcripts for create/input/kill per provider.
 // Wire WS commands/events: codingcli.create/input/kill + created/event/exit/stderr/killed.
 ```
 
@@ -1383,7 +1493,8 @@ Expected: FAIL
 ```rust
 // Add publish(next_projects):
 // - diff previous vs next
-// - when patch size <= 500 * 1024 bytes (MAX_WS_CHUNK_BYTES default):
+// - compute serialized patch payload bytes (JSON wire size)
+// - when serialized patch size <= 500 * 1024 bytes (MAX_WS_CHUNK_BYTES default):
 //   - send sessions.patch to sessionsPatchV1 clients
 //   - send full sessions.updated snapshot to legacy clients
 // - when patch size > 500 * 1024 bytes:
@@ -1565,6 +1676,15 @@ async fn http_route_parity_smoke_covers_existing_surface() {
     freshell_server::tests::assert_route_exists(&app, "DELETE", "/api/proxy/forward/:port").await;
     freshell_server::tests::assert_route_exists(&app, "GET", "/api/files/candidate-dirs").await;
 }
+
+#[tokio::test]
+async fn perf_toggle_and_debug_endpoint_match_runtime_behavior() {
+    let h = freshell_server::tests::HttpWsHarness::spawn().await;
+    h.post_json("/api/perf", r#"{"enabled":true}"#).await.assert_status(200);
+    assert_eq!(h.ws_client().wait_type("perf.logging").await["enabled"], true);
+    let debug = h.get("/api/debug").await.assert_status(200).json();
+    assert!(debug["connections"].is_number() || debug["terminals"].is_array());
+}
 ```
 
 **Step 2: Run tests to verify fail**
@@ -1582,6 +1702,8 @@ Expected: FAIL
 // - /api/terminals, /api/terminals/:terminalId (patch/delete)
 // - /api/debug, /api/perf (POST), /api/ai/terminals/:terminalId/summary (POST)
 // - /api/logs/client (POST), /api/proxy/forward (POST), /api/proxy/forward/:port (DELETE), /api/files/candidate-dirs
+// - /api/perf must apply debug/perf toggle and broadcast perf.logging over WS
+// - /api/debug must return runtime state snapshot for diagnostics
 ```
 
 **Step 4: Run tests to verify pass**
@@ -1932,6 +2054,7 @@ Expected: FAIL
 // Browser pane behavior:
 // - url bar/history/back/forward/reload
 // - convert file:// URLs to /local-file?path=... for iframe loading parity
+//   (strip leading slash then encodeURIComponent to match current BrowserPane behavior)
 // - localhost detection + /api/proxy/forward call when needed
 // - persist pane-level devToolsOpen state in local pane content model
 // - web: limited inspector + "open external" action
