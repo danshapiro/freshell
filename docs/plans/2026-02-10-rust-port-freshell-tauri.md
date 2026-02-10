@@ -319,7 +319,7 @@ pub enum ErrorCode {
     InvalidSessionId,
     PtySpawnFailed,
     FileWatcherError,
-    Unauthorized,
+    NotAuthenticated,
     InternalError,
 }
 
@@ -645,6 +645,18 @@ fn auth_token_short_is_rejected() {
     let err = freshell_server::auth::validate_auth_token("short").unwrap_err();
     assert!(err.to_string().contains("at least 16"));
 }
+
+#[test]
+fn auth_token_weak_common_value_is_rejected() {
+    let err = freshell_server::auth::validate_auth_token("passwordpassword").unwrap_err();
+    assert!(err.to_string().contains("weak"));
+}
+
+#[test]
+fn auth_token_valid_value_is_accepted() {
+    let ok = freshell_server::auth::validate_auth_token("token-1234567890abcd");
+    assert!(ok.is_ok());
+}
 ```
 
 **Step 2: Run test to verify it fails**
@@ -922,8 +934,9 @@ Expected: FAIL
 // - fallback attach protocol: terminal.attached for non-chunk-capable clients (and small-snapshot fast path)
 // - attach-begin/finish flow to avoid output loss during snapshot send
 // - detach, input, resize, kill
-// - ring buffer sized by character count (default 64 * 1024 chars, not bytes)
+// - ring buffer sized by character count (minimum floor 64 * 1024 chars, not bytes)
 // - scrollback chars derived from settings.scrollback lines using approx 200 chars/line, then clamped to [64 * 1024, 2 * 1024 * 1024]
+// - with default settings (5000 lines), effective default capacity is ~1_000_000 chars after conversion/clamp
 // - support env overrides for max scrollback chars where parity source does
 // - enforce MAX_TERMINALS (default 50) and MAX_EXITED_TERMINALS (default 200) with exited-terminal reaping
 // - pending snapshot queue + bounded overflow handling
@@ -976,6 +989,23 @@ async fn ws_closes_with_4009_on_server_shutdown() {
 }
 
 #[tokio::test]
+async fn ws_closes_with_4002_when_hello_timeout_expires() {
+    let harness = freshell_server::tests::WsHarness::spawn_with_hello_timeout_ms(50).await;
+    let mut client = harness.connect().await;
+    let close = client.wait_close().await;
+    assert_eq!(close.code, 4002);
+}
+
+#[tokio::test]
+async fn ws_closes_with_4003_when_max_connections_is_exceeded() {
+    let harness = freshell_server::tests::WsHarness::spawn_with_max_connections(1).await;
+    let _first = harness.connect().await;
+    let mut second = harness.connect().await;
+    let close = second.wait_close().await;
+    assert_eq!(close.code, 4003);
+}
+
+#[tokio::test]
 async fn ws_keepalive_ping_closes_stale_connection_without_pong() {
     let harness = freshell_server::tests::WsHarness::spawn().await;
     let mut client = harness.authed_client().await;
@@ -999,7 +1029,7 @@ Expected: FAIL
 // - parse hello, verify token, store capabilities (sessionsPatchV1 + terminalAttachChunkV1)
 // - send ready + initial snapshot messages
 // - protocol-level ping interval (30s) with liveness tracking; terminate stale sockets
-// - close with 4001/4002/4003/4008/4009 codes as needed
+// - close with 4001/4002/4003/4008/4009 codes as needed (auth/hello-timeout/max-connections/backpressure/shutdown)
 ```
 
 **Step 4: Run test to verify it passes**
@@ -1063,7 +1093,8 @@ Expected: FAIL
 // Mirror source behavior:
 // - close sockets when bufferedAmount exceeds MAX_WS_BUFFERED_AMOUNT (2 MiB, close code 4008)
 // - maintain pending snapshot queues per attached client
-// - bound pending queue growth; close/detach when overflow threshold exceeded
+// - bound pending queue growth with MAX_PENDING_SNAPSHOT_CHARS default 512 * 1024
+// - close/detach when overflow threshold exceeded
 ```
 
 **Step 4: Run tests to verify pass**
@@ -1155,6 +1186,23 @@ async fn terminal_create_is_rate_limited_after_threshold() {
     let err = c.wait_type("error").await;
     assert_eq!(err["code"], "RATE_LIMITED");
 }
+
+#[tokio::test]
+async fn terminal_create_restore_requests_bypass_rate_limit() {
+    let h = freshell_server::tests::WsHarness::spawn().await;
+    let mut c = h.authed_client().await;
+    for i in 0..20 {
+        c.send_json(serde_json::json!({
+            "type":"terminal.create",
+            "requestId": format!("restore-{i}"),
+            "mode":"shell",
+            "shell":"system",
+            "restore": true
+        })).await;
+    }
+    let err = c.try_wait_type("error").await;
+    assert!(err.is_none());
+}
 ```
 
 **Step 2: Run test to verify it fails**
@@ -1171,6 +1219,7 @@ Expected: FAIL
 // terminal.input, terminal.resize, terminal.kill, terminal.list, terminal.meta.list
 // plus request-id idempotency map and create rate limiter (default 10 terminal.create messages per 10s window;
 // env-configurable via TERMINAL_CREATE_RATE_LIMIT and TERMINAL_CREATE_RATE_WINDOW_MS).
+// restore=true requests bypass create rate limiting (parity behavior).
 // all outbound events must be sent through a typed send_ws(WsServerMessage) helper (no raw JSON bypasses).
 ```
 
@@ -1480,6 +1529,18 @@ async fn sends_patch_to_capable_clients_snapshot_to_legacy_clients() {
     assert_eq!(modern.wait_type("sessions.patch").await["type"], "sessions.patch");
     assert_eq!(legacy.wait_type("sessions.updated").await["type"], "sessions.updated");
 }
+
+#[tokio::test]
+async fn large_snapshot_is_chunked_with_clear_then_append_flags() {
+    let h = freshell_server::tests::WsHarness::spawn().await;
+    let mut legacy = h.legacy_client_without_patch_capability().await;
+    h.publish_sessions_fixture("projects_very_large").await;
+
+    let first = legacy.wait_type("sessions.updated").await;
+    assert_eq!(first["clear"], true);
+    let second = legacy.wait_type("sessions.updated").await;
+    assert_eq!(second["append"], true);
+}
 ```
 
 **Step 2: Run test to verify it fails**
@@ -1499,6 +1560,8 @@ Expected: FAIL
 //   - send full sessions.updated snapshot to legacy clients
 // - when patch size > 500 * 1024 bytes:
 //   - send full sessions.updated snapshot to all clients
+//   - chunk oversized snapshots into multiple sessions.updated frames:
+//     first frame includes clear=true, subsequent frames include append=true
 ```
 
 **Step 4: Run test to verify it passes**
@@ -1599,19 +1662,97 @@ async fn proxy_forward_is_scoped_to_requester_identity() {
 }
 
 #[tokio::test]
-async fn local_file_route_serves_files_but_rejects_directories() {
-    let app = freshell_server::http::build_test_router();
-    let file = freshell_server::tests::get_local_file(&app, "/tmp/freshell-demo.txt").await;
+async fn files_read_write_and_directory_errors_match_existing_contract() {
+    let h = freshell_server::tests::HttpHarness::spawn().await;
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("nested").join("note.txt");
+    let file_path_str = file_path.to_string_lossy().to_string();
+
+    h.post_json("/api/files/write", serde_json::json!({
+        "path": file_path_str,
+        "content": "hello"
+    })).await.assert_status(200);
+
+    let read = h.get_json(&format!("/api/files/read?path={}", urlencoding::encode(&file_path_str)))
+        .await
+        .assert_status(200)
+        .json();
+    assert_eq!(read["content"], "hello");
+    assert!(read["size"].is_number());
+    assert!(read["modifiedAt"].is_string());
+
+    let dir_read = h.get_json(&format!("/api/files/read?path={}", urlencoding::encode(temp.path().to_string_lossy().as_ref())))
+        .await;
+    assert_eq!(dir_read.status(), axum::http::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn files_complete_validate_and_open_routes_match_existing_semantics() {
+    let h = freshell_server::tests::HttpHarness::spawn().await;
+    let temp = tempfile::tempdir().unwrap();
+    let src_dir = temp.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(src_dir.join("index.ts"), "").unwrap();
+    std::fs::write(temp.path().join("package.json"), "{}").unwrap();
+
+    let complete = h.get_json(&format!(
+        "/api/files/complete?prefix={}&dirs=true",
+        urlencoding::encode(temp.path().to_string_lossy().as_ref())
+    )).await.assert_status(200).json();
+    assert!(complete["suggestions"].as_array().unwrap().iter().all(|v| v["isDirectory"] == true));
+
+    let validate = h.post_json("/api/files/validate-dir", serde_json::json!({
+        "path": src_dir.to_string_lossy().to_string()
+    })).await.assert_status(200).json();
+    assert_eq!(validate["valid"], true);
+
+    let open = h.post_json("/api/files/open", serde_json::json!({
+        "path": src_dir.join("index.ts").to_string_lossy().to_string()
+    })).await;
+    assert_eq!(open.status(), axum::http::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn ai_summary_falls_back_to_heuristic_and_missing_terminal_is_404() {
+    let h = freshell_server::tests::HttpHarness::spawn_with_ai_disabled().await;
+    let terminal_id = h.spawn_terminal_with_buffer("line one\nline two\n").await;
+
+    let summary = h.post_json(
+        &format!("/api/ai/terminals/{terminal_id}/summary"),
+        serde_json::json!({})
+    ).await.assert_status(200).json();
+    assert_eq!(summary["source"], "heuristic");
+    assert!(summary["description"].as_str().unwrap().len() > 0);
+
+    h.post_json("/api/ai/terminals/missing/summary", serde_json::json!({}))
+        .await
+        .assert_status(404);
+}
+
+#[tokio::test]
+async fn local_file_route_serves_temp_files_but_rejects_directories() {
+    let h = freshell_server::tests::HttpHarness::spawn().await;
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("freshell-demo.txt");
+    std::fs::write(&file_path, "demo").unwrap();
+
+    let file = h.get(&format!(
+        "/local-file?path={}",
+        urlencoding::encode(file_path.to_string_lossy().as_ref())
+    )).await;
     assert_eq!(file.status(), axum::http::StatusCode::OK);
 
-    let dir = freshell_server::tests::get_local_file(&app, "/tmp").await;
+    let dir = h.get(&format!(
+        "/local-file?path={}",
+        urlencoding::encode(temp.path().to_string_lossy().as_ref())
+    )).await;
     assert_eq!(dir.status(), axum::http::StatusCode::BAD_REQUEST);
 }
 ```
 
 **Step 2: Run test to verify it fails**
 
-Run: `cd .worktrees/rust-port/rust && cargo test -p freshell-server proxy_forward_is_scoped_to_requester_identity`
+Run: `cd .worktrees/rust-port/rust && cargo test -p freshell-server http_files_proxy_ai`
 
 Expected: FAIL
 
@@ -1621,12 +1762,19 @@ Expected: FAIL
 // Port forward manager:
 // - key by (target_port, requester_key)
 // - allow connections only from requester allowed IPs
-// - idle cleanup timer
+// - deduplicate concurrent forward() calls per (target_port, requester_key)
+// - reuse existing forward for repeat requests and idle-cleanup stale entries
 // Files API:
-// - read/write/complete/validate-dir/open
-// - GET /local-file?path=... (file only, no directory serving)
+// - GET /api/files/read?path=... -> {content,size,modifiedAt}, 400 for directory, 404 for ENOENT
+// - POST /api/files/write {path,content} -> create parent dirs, return {success,modifiedAt}
+// - GET /api/files/complete?prefix=...&dirs=true|1 -> dirs-first sort, cap at 20, support ~ expansion
+// - POST /api/files/validate-dir {path} -> {valid,resolvedPath}
+// - POST /api/files/open {path,reveal?} -> platform launcher (explorer/open/xdg-open), detached child
+// - GET /local-file?path=... serves files only (no directory serving, no auth requirement)
 // AI summary:
-// - provider call + heuristic fallback
+// - 404 when terminal missing
+// - provider call + deterministic heuristic fallback when AI disabled/fails
+// - return {description, source: "ai" | "heuristic"}
 ```
 
 **Step 4: Run test to verify it passes**
@@ -1685,6 +1833,40 @@ async fn perf_toggle_and_debug_endpoint_match_runtime_behavior() {
     let debug = h.get("/api/debug").await.assert_status(200).json();
     assert!(debug["connections"].is_number() || debug["terminals"].is_array());
 }
+
+#[tokio::test]
+async fn sessions_search_and_project_colors_match_validation_behavior() {
+    let h = freshell_server::tests::HttpHarness::spawn().await;
+
+    h.get("/api/sessions/search?tier=title")
+        .await
+        .assert_status(400);
+
+    h.put_json("/api/project-colors", serde_json::json!({"projectPath":"/repo"}))
+        .await
+        .assert_status(400);
+
+    h.put_json("/api/project-colors", serde_json::json!({"projectPath":"/repo","color":"#22c55e"}))
+        .await
+        .assert_status(200);
+}
+
+#[tokio::test]
+async fn terminals_patch_updates_live_registry_and_emits_list_updated() {
+    let h = freshell_server::tests::HttpWsHarness::spawn().await;
+    let terminal_id = h.spawn_terminal_for_test().await;
+    let mut ws = h.ws_client().await;
+
+    h.patch_json(
+        &format!("/api/terminals/{terminal_id}"),
+        serde_json::json!({"titleOverride":"  New title  ","descriptionOverride":"desc"})
+    ).await.assert_status(200);
+
+    assert_eq!(ws.wait_type("terminal.list.updated").await["type"], "terminal.list.updated");
+    let list = h.get("/api/terminals").await.assert_status(200).json();
+    let updated = list.as_array().unwrap().iter().find(|t| t["terminalId"] == terminal_id).unwrap();
+    assert_eq!(updated["title"], "New title");
+}
 ```
 
 **Step 2: Run tests to verify fail**
@@ -1704,6 +1886,9 @@ Expected: FAIL
 // - /api/logs/client (POST), /api/proxy/forward (POST), /api/proxy/forward/:port (DELETE), /api/files/candidate-dirs
 // - /api/perf must apply debug/perf toggle and broadcast perf.logging over WS
 // - /api/debug must return runtime state snapshot for diagnostics
+// - /api/sessions/search preserves validation semantics (bad query => 400 with details)
+// - /api/project-colors requires both projectPath and color
+// - /api/terminals PATCH mutates live registry title/description and broadcasts terminal.list.updated
 ```
 
 **Step 4: Run tests to verify pass**
@@ -2420,6 +2605,7 @@ Also in this task:
 - remove stale npm-only runtime deps no longer needed after xterm/monaco interop shims are pinned
 - regenerate or remove JS lockfiles so they match the post-cutover package manifest
 - ensure no command in README/scripts points to Node server entrypoints
+- wire static frontend serving in rust runtime: serve compiled Leptos/WASM artifacts (HTML/JS/WASM/CSS) plus SPA fallback route in browser mode
 ```
 
 **Step 4: Run smoke + full tests**
