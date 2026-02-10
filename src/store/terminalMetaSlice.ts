@@ -30,6 +30,11 @@ export type TerminalMetaState = {
   byTerminalId: Record<string, TerminalMetaRecord>
 }
 
+type TerminalMetaSnapshotPayload = {
+  terminals: TerminalMetaRecord[]
+  requestedAt?: number
+}
+
 const initialState: TerminalMetaState = {
   byTerminalId: {},
 }
@@ -38,11 +43,24 @@ const terminalMetaSlice = createSlice({
   name: 'terminalMeta',
   initialState,
   reducers: {
-    setTerminalMetaSnapshot(state, action: PayloadAction<TerminalMetaRecord[]>) {
+    setTerminalMetaSnapshot(state, action: PayloadAction<TerminalMetaSnapshotPayload>) {
+      const requestedAt = action.payload.requestedAt ?? 0
       const next: Record<string, TerminalMetaRecord> = {}
-      for (const record of action.payload) {
+      const incomingIds = new Set<string>()
+
+      for (const record of action.payload.terminals) {
         next[record.terminalId] = record
+        incomingIds.add(record.terminalId)
       }
+
+      for (const [terminalId, existing] of Object.entries(state.byTerminalId)) {
+        if (incomingIds.has(terminalId)) continue
+        // Keep local updates that arrived after this snapshot request started.
+        if (existing.updatedAt > requestedAt) {
+          next[terminalId] = existing
+        }
+      }
+
       state.byTerminalId = next
     },
     upsertTerminalMeta(state, action: PayloadAction<TerminalMetaRecord[]>) {

@@ -61,6 +61,7 @@ export default function App() {
   const [isMobile, setIsMobile] = useState(false)
   const mainContentRef = useRef<HTMLDivElement>(null)
   const userOpenedSidebarOnMobileRef = useRef(false)
+  const terminalMetaListRequestStartedAtRef = useRef(new Map<string, number>())
 
   // Keep this tab's Redux state in sync with persisted writes from other browser tabs.
   useEffect(() => {
@@ -240,9 +241,12 @@ export default function App() {
           dispatch(setError(undefined))
           dispatch(setStatus('ready'))
           dispatch(resetWsSnapshotReceived())
+          terminalMetaListRequestStartedAtRef.current.clear()
+          const requestId = `terminal-meta-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+          terminalMetaListRequestStartedAtRef.current.set(requestId, Date.now())
           ws.send({
             type: 'terminal.meta.list',
-            requestId: `terminal-meta-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            requestId,
           })
         }
         if (msg.type === 'sessions.updated') {
@@ -270,7 +274,17 @@ export default function App() {
           dispatch(setSettings(applyLocalTerminalFontFamily(msg.settings)))
         }
         if (msg.type === 'terminal.meta.list.response') {
-          dispatch(setTerminalMetaSnapshot(msg.terminals || []))
+          const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''
+          const requestedAt = requestId
+            ? terminalMetaListRequestStartedAtRef.current.get(requestId)
+            : undefined
+          if (requestId) {
+            terminalMetaListRequestStartedAtRef.current.delete(requestId)
+          }
+          dispatch(setTerminalMetaSnapshot({
+            terminals: msg.terminals || [],
+            requestedAt,
+          }))
         }
         if (msg.type === 'terminal.meta.updated') {
           const upsert = Array.isArray(msg.upsert) ? msg.upsert : []

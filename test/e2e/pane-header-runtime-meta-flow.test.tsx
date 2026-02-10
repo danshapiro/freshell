@@ -337,4 +337,71 @@ describe('pane header runtime metadata flow (e2e)', () => {
       expect(screen.queryByText(/^freshell \(main\*\)$/)).not.toBeInTheDocument()
     })
   })
+
+  it('does not erase newer runtime metadata when an older snapshot response arrives', async () => {
+    const store = createStore()
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.connect).toHaveBeenCalled()
+    })
+
+    act(() => {
+      wsMocks.emitMessage({ type: 'ready' })
+    })
+
+    let requestId = ''
+    await waitFor(() => {
+      const metaCall = wsMocks.send.mock.calls
+        .map((call) => call[0])
+        .find((msg) => msg?.type === 'terminal.meta.list')
+      expect(metaCall).toBeDefined()
+      requestId = metaCall.requestId
+    })
+
+    act(() => {
+      wsMocks.emitMessage({
+        type: 'terminal.meta.updated',
+        upsert: [
+          {
+            terminalId: 'term-codex',
+            provider: 'codex',
+            displaySubdir: 'freshell',
+            branch: 'main',
+            isDirty: true,
+            tokenUsage: {
+              inputTokens: 10,
+              outputTokens: 5,
+              cachedTokens: 0,
+              totalTokens: 15,
+              compactPercent: 25,
+            },
+            updatedAt: Date.now(),
+          },
+        ],
+        remove: [],
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText(/freshell \(main\*\)\s+25%/)).toBeInTheDocument()
+    })
+
+    act(() => {
+      wsMocks.emitMessage({
+        type: 'terminal.meta.list.response',
+        requestId,
+        terminals: [],
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText(/freshell \(main\*\)\s+25%/)).toBeInTheDocument()
+    })
+  })
 })
