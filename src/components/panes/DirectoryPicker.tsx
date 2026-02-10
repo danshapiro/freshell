@@ -103,34 +103,40 @@ export default function DirectoryPicker({
       return
     }
 
+    completionRequestIdRef.current += 1
+    const requestId = completionRequestIdRef.current
     const prefix = inputValue.trim()
     if (!prefix) {
       setPathSuggestions([])
       return
     }
 
-    completionRequestIdRef.current += 1
-    const requestId = completionRequestIdRef.current
+    let cancelled = false
     const timer = setTimeout(() => {
-      api.get<{ suggestions?: CompletionSuggestion[] }>(
-        `/api/files/complete?prefix=${encodeURIComponent(prefix)}&dirs=true`
-      )
+      if (cancelled || completionRequestIdRef.current !== requestId) return
+      void Promise
+        .resolve(api.get<{ suggestions?: CompletionSuggestion[] }>(
+          `/api/files/complete?prefix=${encodeURIComponent(prefix)}&dirs=true`
+        ))
         .then((result) => {
-          if (completionRequestIdRef.current !== requestId) return
+          if (cancelled || completionRequestIdRef.current !== requestId) return
           const directories = dedupeDirectories(
-            (result.suggestions || [])
+            (result?.suggestions || [])
               .filter((entry) => entry.isDirectory)
               .map((entry) => entry.path)
           )
           setPathSuggestions(directories.slice(0, 15))
         })
         .catch(() => {
-          if (completionRequestIdRef.current !== requestId) return
+          if (cancelled || completionRequestIdRef.current !== requestId) return
           setPathSuggestions([])
         })
     }, 200)
 
-    return () => clearTimeout(timer)
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
   }, [pathMode, inputValue])
 
   const suggestions = pathMode ? pathSuggestions : fuzzySuggestions

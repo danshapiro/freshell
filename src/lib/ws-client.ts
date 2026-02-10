@@ -95,7 +95,7 @@ export class WsClient {
         this.ws?.send(JSON.stringify({
           type: 'hello',
           token,
-          capabilities: { sessionsPatchV1: true },
+          capabilities: { sessionsPatchV1: true, terminalAttachChunkV1: true },
           ...extensions,
         }))
       }

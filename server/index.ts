@@ -813,26 +813,29 @@ async function main() {
       }
     })
 
-    // 2. Kill all running terminals
+    // 2. Stop any coalesced sessions publish timers
+    sessionsSync.shutdown()
+
+    // 3. Kill all running terminals
     registry.shutdown()
 
-    // 3. Kill all coding CLI sessions
+    // 4. Kill all coding CLI sessions
     codingCliSessionManager.shutdown()
 
-    // 4. Close WebSocket connections gracefully
+    // 5. Close WebSocket connections gracefully
     wsHandler.close()
 
-    // 5. Close port forwards
+    // 6. Close port forwards
     portForwardManager.closeAll()
 
-    // 6. Stop session indexers
+    // 7. Stop session indexers
     codingCliIndexer.stop()
     claudeIndexer.stop()
 
-    // 7. Stop session repair service
+    // 8. Stop session repair service
     await sessionRepairService.stop()
 
-    // 8. Exit cleanly
+    // 9. Exit cleanly
     log.info('Shutdown complete')
     process.exit(0)
   }

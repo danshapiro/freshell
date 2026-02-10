@@ -77,6 +77,7 @@ class FakeRegistry {
   inputCalls: { terminalId: string; data: string }[] = []
   resizeCalls: { terminalId: string; cols: number; rows: number }[] = []
   killCalls: string[] = []
+  finishAttachSnapshotCalls: { terminalId: string; ws: WebSocket }[] = []
   emitOutputOnNextAttach: { terminalId: string; data: string } | null = null
 
   // Control hooks for testing edge cases
@@ -123,6 +124,7 @@ class FakeRegistry {
   finishAttachSnapshot(terminalId: string, ws: WebSocket) {
     const rec = this.records.get(terminalId)
     if (!rec) return
+    this.finishAttachSnapshotCalls.push({ terminalId, ws })
     const queued = rec.pendingSnapshotClients.get(ws)
     if (!queued) return
     rec.pendingSnapshotClients.delete(ws)
@@ -246,6 +248,7 @@ describe('WebSocket edge cases', () => {
     process.env.AUTH_TOKEN = 'testtoken-testtoken'
     process.env.HELLO_TIMEOUT_MS = '500' // Longer timeout for edge case tests
     process.env.MAX_CONNECTIONS = '5'
+    process.env.MAX_WS_ATTACH_CHUNK_BYTES = '16384'
 
     ;({ WsHandler } = await import('../../server/ws-handler'))
     server = http.createServer((_req, res) => {
@@ -263,6 +266,7 @@ describe('WebSocket edge cases', () => {
     registry.inputCalls = []
     registry.resizeCalls = []
     registry.killCalls = []
+    registry.finishAttachSnapshotCalls = []
   })
 
   afterAll(async () => {
@@ -271,7 +275,12 @@ describe('WebSocket edge cases', () => {
   }, HOOK_TIMEOUT_MS)
 
   // Helper: create authenticated connection
-  async function createAuthenticatedConnection(): Promise<{ ws: WebSocket; close: () => void }> {
+  async function createAuthenticatedConnection(opts?: {
+    capabilities?: {
+      sessionsPatchV1?: boolean
+      terminalAttachChunkV1?: boolean
+    }
+  }): Promise<{ ws: WebSocket; close: () => void }> {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('Connection timeout')), 5000)
@@ -284,7 +293,11 @@ describe('WebSocket edge cases', () => {
         reject(err)
       })
     })
-    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+    ws.send(JSON.stringify({
+      type: 'hello',
+      token: 'testtoken-testtoken',
+      ...(opts?.capabilities ? { capabilities: opts.capabilities } : {}),
+    }))
 
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('Ready timeout')), 5000)
@@ -760,6 +773,302 @@ describe('WebSocket edge cases', () => {
       expect(error.code).toBe('INVALID_TERMINAL_ID')
 
       close2()
+    })
+  })
+
+  describe('chunked attach', () => {
+    it('chunked attach sends start/chunk/end in order for large terminal.attach', async () => {
+      const { ws: ws1, close: close1 } = await createAuthenticatedConnection()
+      const terminalId = await createTerminal(ws1, 'chunk-attach-order')
+      registry.simulateOutput(terminalId, 'x'.repeat(70_000))
+      close1()
+      await new Promise((r) => setTimeout(r, 50))
+
+      const { ws: ws2, close: close2 } = await createAuthenticatedConnection({
+        capabilities: { terminalAttachChunkV1: true },
+      })
+
+      const stream = await new Promise<any[]>((resolve, reject) => {
+        const received: any[] = []
+        const timeout = setTimeout(() => {
+          ws2.off('message', handler)
+          reject(new Error('Timeout waiting for chunked attach sequence'))
+        }, 5000)
+
+        const handler = (data: WebSocket.Data) => {
+          const msg = JSON.parse(data.toString())
+          if (!msg || msg.terminalId !== terminalId) return
+          if (!['terminal.attached.start', 'terminal.attached.chunk', 'terminal.attached.end', 'terminal.attached'].includes(msg.type)) return
+          received.push(msg)
+          if (msg.type === 'terminal.attached.end') {
+            clearTimeout(timeout)
+            ws2.off('message', handler)
+            resolve(received)
+          }
+        }
+
+        ws2.on('message', handler)
+        ws2.send(JSON.stringify({ type: 'terminal.attach', terminalId }))
+      })
+
+      expect(stream[0]?.type).toBe('terminal.attached.start')
+      expect(stream[stream.length - 1]?.type).toBe('terminal.attached.end')
+      expect(stream.some((m) => m.type === 'terminal.attached.chunk')).toBe(true)
+      expect(stream.some((m) => m.type === 'terminal.attached')).toBe(false)
+
+      close2()
+    })
+
+    it('chunked attach sends snapshot before any terminal.output after attach', async () => {
+      const { ws: ws1, close: close1 } = await createAuthenticatedConnection()
+      const terminalId = await createTerminal(ws1, 'chunk-attach-snapshot-first')
+      registry.simulateOutput(terminalId, 'x'.repeat(70_000))
+      close1()
+      await new Promise((r) => setTimeout(r, 50))
+
+      const { ws: ws2, close: close2 } = await createAuthenticatedConnection({
+        capabilities: { terminalAttachChunkV1: true },
+      })
+
+      registry.emitOutputOnNextAttach = { terminalId, data: 'raced output\n' }
+      const msgs = await new Promise<any[]>((resolve, reject) => {
+        const received: any[] = []
+        const timeout = setTimeout(() => {
+          ws2.off('message', handler)
+          reject(new Error(`Timeout waiting for attach snapshot + output (received=${received.map((m) => m.type).join(',')})`))
+        }, 5000)
+
+        const handler = (data: WebSocket.Data) => {
+          const msg = JSON.parse(data.toString())
+          if (!msg || msg.terminalId !== terminalId) return
+          if (!['terminal.attached', 'terminal.attached.start', 'terminal.attached.chunk', 'terminal.attached.end', 'terminal.output'].includes(msg.type)) return
+          received.push(msg)
+          const hasSnapshot = received.some((m) => m.type === 'terminal.attached.end' || m.type === 'terminal.attached')
+          const hasOutput = received.some((m) => m.type === 'terminal.output')
+          if (hasSnapshot && hasOutput) {
+            clearTimeout(timeout)
+            ws2.off('message', handler)
+            resolve(received)
+          }
+        }
+
+        ws2.on('message', handler)
+        ws2.send(JSON.stringify({ type: 'terminal.attach', terminalId }))
+      })
+
+      const endIdx = msgs.findIndex((m) => m.type === 'terminal.attached.end')
+      const attachedIdx = msgs.findIndex((m) => m.type === 'terminal.attached')
+      const snapshotIdx = endIdx >= 0 ? endIdx : attachedIdx
+      const outputIdx = msgs.findIndex((m) => m.type === 'terminal.output')
+      expect(snapshotIdx).toBeGreaterThanOrEqual(0)
+      expect(outputIdx).toBeGreaterThan(snapshotIdx)
+
+      close2()
+    })
+
+    it('chunked attach uses chunk flow for reused terminal.create snapshot path', async () => {
+      const { ws, close } = await createAuthenticatedConnection({
+        capabilities: { terminalAttachChunkV1: true },
+      })
+
+      const requestId = 'chunk-create-reused'
+      const terminalId = await createTerminal(ws, requestId)
+      registry.simulateOutput(terminalId, 'x'.repeat(70_000))
+
+      ws.send(JSON.stringify({ type: 'terminal.create', requestId, mode: 'shell' }))
+
+      const received = await new Promise<any[]>((resolve, reject) => {
+        const msgs: any[] = []
+        let sawCreated = false
+        let sawEnd = false
+        const timeout = setTimeout(() => {
+          ws.off('message', handler)
+          reject(new Error('Timeout waiting for chunked terminal.create reuse stream'))
+        }, 5000)
+
+        const handler = (data: WebSocket.Data) => {
+          const msg = JSON.parse(data.toString())
+          if (!msg) return
+          if (msg.type === 'terminal.created' && msg.requestId === requestId) {
+            msgs.push(msg)
+            sawCreated = true
+          }
+          if (msg.terminalId === terminalId && ['terminal.attached.start', 'terminal.attached.chunk', 'terminal.attached.end', 'terminal.attached'].includes(msg.type)) {
+            msgs.push(msg)
+            if (msg.type === 'terminal.attached.end') sawEnd = true
+          }
+          if (sawCreated && sawEnd) {
+            clearTimeout(timeout)
+            ws.off('message', handler)
+            resolve(msgs)
+          }
+        }
+
+        ws.on('message', handler)
+      })
+
+      const created = received.find((m) => m.type === 'terminal.created' && m.requestId === requestId)
+      expect(created).toBeDefined()
+      expect(created.snapshotChunked).toBe(true)
+      expect(created.snapshot).toBeUndefined()
+      expect(received.some((m) => m.type === 'terminal.attached.start')).toBe(true)
+      expect(received.some((m) => m.type === 'terminal.attached.end')).toBe(true)
+      expect(received.some((m) => m.type === 'terminal.attached')).toBe(false)
+
+      close()
+    })
+
+    it('chunked attach aborts stream and does not finalize attach when client closes mid-stream', async () => {
+      const { ws: ws1, close: close1 } = await createAuthenticatedConnection()
+      const terminalId = await createTerminal(ws1, 'chunk-mid-close')
+      registry.simulateOutput(terminalId, 'x'.repeat(70_000))
+      close1()
+      await new Promise((r) => setTimeout(r, 50))
+
+      const { ws: ws2 } = await createAuthenticatedConnection({
+        capabilities: { terminalAttachChunkV1: true },
+      })
+
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          ws2.off('message', handler)
+          reject(new Error('Timeout waiting for first chunk before forced close'))
+        }, 5000)
+        const handler = (data: WebSocket.Data) => {
+          const msg = JSON.parse(data.toString())
+          if (msg.type !== 'terminal.attached.chunk' || msg.terminalId !== terminalId) return
+          clearTimeout(timeout)
+          ws2.off('message', handler)
+          ws2.close()
+          resolve()
+        }
+        ws2.on('message', handler)
+        ws2.send(JSON.stringify({ type: 'terminal.attach', terminalId }))
+      })
+
+      await new Promise<void>((resolve) => {
+        if (ws2.readyState === WebSocket.CLOSED) return resolve()
+        ws2.once('close', () => resolve())
+      })
+      await new Promise((r) => setTimeout(r, 100))
+
+      const finalizeCalls = registry.finishAttachSnapshotCalls.filter((call) => call.terminalId === terminalId && call.ws === ws2)
+      expect(finalizeCalls.length).toBe(0)
+    })
+
+    it('chunked attach keeps empty snapshots inline and never marks snapshotChunked', async () => {
+      const { ws, close } = await createAuthenticatedConnection({
+        capabilities: { terminalAttachChunkV1: true },
+      })
+
+      const requestId = 'chunk-empty-inline'
+      ws.send(JSON.stringify({ type: 'terminal.create', requestId, mode: 'shell' }))
+
+      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId, 5000)
+      expect(created.snapshotChunked).not.toBe(true)
+      expect(typeof created.snapshot).toBe('string')
+
+      const messages = await collectMessages(ws, 200)
+      const startForTerminal = messages.find((m) => m.type === 'terminal.attached.start' && m.terminalId === created.terminalId)
+      expect(startForTerminal).toBeUndefined()
+
+      close()
+    })
+
+    it('chunked attach serializes concurrent attach/create streams for same terminal and connection', async () => {
+      const { ws, close } = await createAuthenticatedConnection({
+        capabilities: { terminalAttachChunkV1: true },
+      })
+
+      const requestId = 'chunk-concurrent-streams'
+      const terminalId = await createTerminal(ws, requestId)
+      registry.simulateOutput(terminalId, 'x'.repeat(70_000))
+
+      const serverWs = Array.from((wsHandler as any).connections).find((candidate: any) => {
+        const state = (wsHandler as any).clientStates.get(candidate)
+        return state?.authenticated
+      }) as WebSocket | undefined
+      expect(serverWs).toBeDefined()
+
+      let releaseFirstChunk: (() => void) | null = null
+      const firstChunkBlocked = new Promise<void>((resolve) => {
+        releaseFirstChunk = resolve
+      })
+      const originalSend = (serverWs as any).send.bind(serverWs)
+      let blockedOnce = false
+
+      ;(serverWs as any).send = (data: any, cb?: (err?: Error) => void) => {
+        let msg: any
+        try {
+          msg = JSON.parse(typeof data === 'string' ? data : data.toString())
+        } catch {
+          msg = null
+        }
+        if (!blockedOnce && msg?.type === 'terminal.attached.chunk' && msg.terminalId === terminalId) {
+          blockedOnce = true
+          void firstChunkBlocked.then(() => originalSend(data, cb))
+          return
+        }
+        return originalSend(data, cb)
+      }
+
+      try {
+        ws.send(JSON.stringify({ type: 'terminal.attach', terminalId }))
+        const firstStart = await waitForMessage(
+          ws,
+          (m) => m.type === 'terminal.attached.start' && m.terminalId === terminalId,
+          5000,
+        )
+        ws.send(JSON.stringify({ type: 'terminal.create', requestId, mode: 'shell' }))
+        releaseFirstChunk?.()
+
+        const sequence = await new Promise<string[]>((resolve, reject) => {
+          const events: string[] = [firstStart.type]
+          let endCount = 0
+          let createdCount = 0
+          const timeout = setTimeout(() => {
+            ws.off('message', handler)
+            reject(new Error('Timeout waiting for serialized chunk streams'))
+          }, 8000)
+
+          const handler = (data: WebSocket.Data) => {
+            const msg = JSON.parse(data.toString())
+            if (msg.type === 'terminal.created' && msg.requestId === requestId) {
+              createdCount += 1
+            }
+            if (msg.terminalId !== terminalId) return
+            if (!['terminal.attached.start', 'terminal.attached.chunk', 'terminal.attached.end'].includes(msg.type)) return
+            events.push(msg.type)
+            if (msg.type === 'terminal.attached.end') endCount += 1
+            if (createdCount >= 1 && endCount >= 2) {
+              clearTimeout(timeout)
+              ws.off('message', handler)
+              resolve(events)
+            }
+          }
+
+          ws.on('message', handler)
+        })
+
+        expect(sequence.filter((t) => t === 'terminal.attached.start')).toHaveLength(2)
+        expect(sequence.filter((t) => t === 'terminal.attached.end')).toHaveLength(2)
+
+        let active = 0
+        for (const type of sequence) {
+          if (type === 'terminal.attached.start') {
+            active += 1
+            expect(active).toBe(1)
+          } else if (type === 'terminal.attached.end') {
+            expect(active).toBe(1)
+            active -= 1
+          }
+        }
+        expect(active).toBe(0)
+      } finally {
+        ;(serverWs as any).send = originalSend
+      }
+
+      close()
     })
   })
 

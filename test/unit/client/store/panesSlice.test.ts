@@ -8,6 +8,7 @@ import panesReducer, {
   resizePanes,
   resizeMultipleSplits,
   updatePaneContent,
+  replacePane,
   removeLayout,
   hydratePanes,
   updatePaneTitle,
@@ -1176,6 +1177,112 @@ describe('panesSlice', () => {
       )
 
       expect(state.layouts['tab-1']).toEqual(originalLayout)
+    })
+  })
+
+  describe('replacePane', () => {
+    it('sets pane content to picker', () => {
+      const leaf: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: { kind: 'terminal', createRequestId: 'req-1', status: 'running', mode: 'shell', terminalId: 'term-1' },
+      }
+      const state: PanesState = {
+        layouts: { 'tab-1': leaf },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+      }
+
+      const result = panesReducer(state, replacePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+
+      const resultLeaf = result.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(resultLeaf.content).toEqual({ kind: 'picker' })
+    })
+
+    it('clears paneTitleSetByUser and resets derived title', () => {
+      const leaf: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: { kind: 'terminal', createRequestId: 'req-1', status: 'running', mode: 'shell' },
+      }
+      const state: PanesState = {
+        layouts: { 'tab-1': leaf },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'My Custom Name' } },
+        paneTitleSetByUser: { 'tab-1': { 'pane-1': true } },
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+      }
+
+      const result = panesReducer(state, replacePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+
+      expect(result.paneTitles['tab-1']['pane-1']).toBe('New Tab')
+      expect(result.paneTitleSetByUser['tab-1']?.['pane-1']).toBeUndefined()
+    })
+
+    it('is a no-op on non-existent tab', () => {
+      const result = panesReducer(initialState, replacePane({ tabId: 'nope', paneId: 'pane-1' }))
+      expect(result).toEqual(initialState)
+    })
+
+    it('is a no-op on non-existent pane (layout unchanged)', () => {
+      const leaf: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: { kind: 'terminal', createRequestId: 'req-1', status: 'running', mode: 'shell' },
+      }
+      const state: PanesState = {
+        layouts: { 'tab-1': leaf },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+      }
+
+      const result = panesReducer(state, replacePane({ tabId: 'tab-1', paneId: 'non-existent' }))
+
+      // Content should be unchanged
+      const resultLeaf = result.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(resultLeaf.content.kind).toBe('terminal')
+
+      // No ghost title entry should be created for non-existent pane
+      expect(result.paneTitles['tab-1']['non-existent']).toBeUndefined()
+    })
+
+    it('works on a pane inside a split', () => {
+      const layout: PaneNode = {
+        type: 'split',
+        id: 'split-1',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          { type: 'leaf', id: 'pane-1', content: { kind: 'terminal', createRequestId: 'req-1', status: 'running', mode: 'shell' } },
+          { type: 'leaf', id: 'pane-2', content: { kind: 'terminal', createRequestId: 'req-2', status: 'running', mode: 'claude' } },
+        ],
+      }
+      const state: PanesState = {
+        layouts: { 'tab-1': layout },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell', 'pane-2': 'Claude' } },
+        paneTitleSetByUser: { 'tab-1': { 'pane-2': true } },
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+      }
+
+      const result = panesReducer(state, replacePane({ tabId: 'tab-1', paneId: 'pane-2' }))
+
+      // pane-2 should be picker, pane-1 untouched
+      const split = result.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
+      const pane1 = split.children[0] as Extract<PaneNode, { type: 'leaf' }>
+      const pane2 = split.children[1] as Extract<PaneNode, { type: 'leaf' }>
+      expect(pane1.content.kind).toBe('terminal')
+      expect(pane2.content).toEqual({ kind: 'picker' })
+      expect(result.paneTitles['tab-1']['pane-2']).toBe('New Tab')
+      expect(result.paneTitleSetByUser['tab-1']?.['pane-2']).toBeUndefined()
     })
   })
 
