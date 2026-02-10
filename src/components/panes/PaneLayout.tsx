@@ -33,10 +33,11 @@ export default function PaneLayout({ tabId, defaultContent, hidden }: PaneLayout
   }, [dispatch, tabId, layout])
 
   // Escape key handler: unzoom when a pane is zoomed.
-  // Only active when zoom is engaged. Ignores Escape from inside terminals
-  // (xterm.js textarea) to avoid conflicting with vim/other TUI Escape usage.
+  // Only active when zoom is engaged and the tab is visible. Ignores Escape
+  // from inside terminals (xterm.js textarea) to avoid conflicting with
+  // vim/other TUI Escape usage.
   useEffect(() => {
-    if (!zoomedPaneId) return
+    if (!zoomedPaneId || hidden) return
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return
@@ -52,7 +53,7 @@ export default function PaneLayout({ tabId, defaultContent, hidden }: PaneLayout
     return () => {
       document.removeEventListener('keydown', handleKeyDown)
     }
-  }, [dispatch, tabId, zoomedPaneId])
+  }, [dispatch, tabId, zoomedPaneId, hidden])
 
   const handleAddPane = useCallback(() => {
     dispatch(addPane({
