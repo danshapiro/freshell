@@ -8,7 +8,11 @@
 
 Example: `freshell (main*)  25%` then whitespace, then pane action icons.
 
-**Architecture:** Keep terminal runtime metadata server-authoritative (`terminal.meta.*` over WS), store it in a non-persisted Redux slice keyed by `terminalId`, and render a single formatted right-aligned string in `PaneHeader`. Metadata is sourced from terminal registry + coding-cli session indexer + provider token parsing.
+Also:
+- always render a pane title bar even when a tab has only one pane.
+- make the active tab background match the pane title bar color; inactive tabs should be white so tabs visually blend into the title bar.
+
+**Architecture:** Keep terminal runtime metadata server-authoritative (`terminal.meta.*` over WS), store it in a non-persisted Redux slice keyed by `terminalId`, and render a single formatted right-aligned string in an always-visible `PaneHeader`. Metadata is sourced from terminal registry + coding-cli session indexer + provider token parsing. Update tab-strip styling in `TabBar` so active-tab background matches title-bar background and inactive tabs are white.
 
 **Tech Stack:** TypeScript, Node/Express/WebSocket (`ws`), Redux Toolkit, React, Vitest, Testing Library.
 
@@ -120,7 +124,7 @@ git commit -m "feat(coding-cli): add explicit checkout-root and git branch/dirty
 
 Cover:
 - parse `event_msg.payload.type = token_count` with nested `payload.info`.
-- prefer `info.last_token_usage.total_tokens` for context usage.
+- prefer `info.total_token_usage.total_tokens` for context usage.
 - keep compatibility fallback for legacy flat payload shape.
 - parse `session_meta.payload.git.branch` when present.
 
@@ -422,7 +426,7 @@ git commit -m "feat(client): ingest terminal metadata snapshot and live updates"
 
 ---
 
-### Task 8: Render right-aligned title text + existing icons in pane header
+### Task 8: Render always-visible pane title bar with right-aligned metadata + existing icons
 
 **Files:**
 - Modify: `src/components/panes/PaneContainer.tsx`
@@ -439,6 +443,7 @@ git commit -m "feat(client): ingest terminal metadata snapshot and live updates"
 - percentage omitted when compact threshold unknown.
 - metadata hidden for non-coding-cli modes.
 - icon buttons still render after metadata text.
+- title bar renders even when a tab has a single pane (no split).
 
 `Pane.test.tsx` should assert metadata prop/select path is wired.
 
@@ -456,6 +461,10 @@ In `PaneHeader`:
 - keep existing left icon + title behavior.
 - add a right-side metadata text element before action icons.
 - preserve whitespace between metadata and icons.
+
+In pane rendering path (`Pane` / `PaneContainer`):
+- remove conditional suppression of title bar for single-pane tabs.
+- ensure title bar is always present for pane content types that currently use `PaneHeader`.
 
 ```tsx
 <div className="ml-auto flex items-center gap-2">
@@ -480,12 +489,49 @@ Expected: PASS.
 
 ```bash
 git add src/components/panes/PaneContainer.tsx src/components/panes/Pane.tsx src/components/panes/PaneHeader.tsx src/lib/format-terminal-title-meta.ts test/unit/client/components/panes/PaneHeader.test.tsx test/unit/client/components/panes/Pane.test.tsx
-git commit -m "feat(ui): render right-aligned cwd/branch-dirty/compact-percent metadata in pane headers"
+git commit -m "feat(ui): render always-visible pane header metadata with right-aligned compact-percent label"
 ```
 
 ---
 
-### Task 9: End-to-end metadata-to-header flow + full regression
+### Task 9: Blend tab strip into title bar (active matches title color, inactive white)
+
+**Files:**
+- Modify: `src/components/TabBar.tsx`
+- Modify: `test/unit/client/components/TabBar.test.tsx`
+
+**Step 1: Add failing tab-style tests**
+
+In `TabBar.test.tsx`, assert:
+- active tab has the same background token/class as pane title bar.
+- inactive tabs use white background.
+- existing active-state semantics (selected tab, focus, close button behavior) remain unchanged.
+
+**Step 2: Implement tab background styling**
+
+In `src/components/TabBar.tsx`:
+- update class logic so active tab uses the same surface/background style token as `PaneHeader`.
+- set inactive tabs to white background.
+- keep hover/focus/contrast behavior accessible.
+
+**Step 3: Run tests**
+
+Run:
+- `npm test -- test/unit/client/components/TabBar.test.tsx`
+- `npm test -- test/unit/client/components/TabBar.a11y.test.tsx`
+
+Expected: PASS.
+
+**Step 4: Commit**
+
+```bash
+git add src/components/TabBar.tsx test/unit/client/components/TabBar.test.tsx
+git commit -m "feat(ui): align active tab background with pane title bar and set inactive tabs white"
+```
+
+---
+
+### Task 10: End-to-end metadata-to-header flow + full regression
 
 **Files:**
 - Create: `test/e2e/pane-header-runtime-meta-flow.test.tsx`
@@ -497,6 +543,7 @@ Flow:
 - emit metadata snapshot + update messages.
 - assert right-aligned text updates correctly.
 - emit `terminal.exit` and assert metadata is removed.
+- assert pane title bar is present in single-pane layout.
 
 **Step 2: Run e2e + full regression**
 
@@ -524,9 +571,11 @@ git commit -m "test(e2e): verify terminal metadata websocket flow to right-align
 4. `ParsedSessionMeta` and `CodingCliSession` both carry `tokenUsage` (and related git metadata) explicitly.
 5. `terminal.meta.list` and `terminal.meta.updated` WS messages work end-to-end.
 6. `terminal.exit` handling in `App.tsx` preserves existing idle-warning cleanup and removes terminal metadata.
-7. Pane header shows right-aligned metadata text in format `<subdir> (<branch><*>)  <percent>%` before icons.
-8. Non-coding-cli panes do not show this metadata string.
-9. `npm run lint` and `npm test` are green.
+7. Pane title bar is always visible, including when a tab has only one pane.
+8. Pane header shows right-aligned metadata text in format `<subdir> (<branch><*>)  <percent>%` before icons.
+9. Non-coding-cli panes do not show this metadata string.
+10. Active tab background matches pane title-bar background; inactive tabs are white.
+11. `npm run lint` and `npm test` are green.
 
 ---
 
