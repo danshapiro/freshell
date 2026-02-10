@@ -34,7 +34,7 @@ export const defaultSettings: AppSettings = {
   },
   panes: {
     defaultNewPane: 'ask' as const,
-    snapThreshold: 4,
+    snapThreshold: 2,
     iconsOnTabs: true,
   },
   codingCli: {

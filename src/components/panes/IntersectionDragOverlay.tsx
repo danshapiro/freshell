@@ -29,7 +29,7 @@ export default function IntersectionDragOverlay({
   const dispatch = useAppDispatch()
   const layout = useAppSelector((s) => s.panes.layouts[tabId])
   const snapThreshold = useAppSelector(
-    (s) => s.settings?.settings?.panes?.snapThreshold ?? 4,
+    (s) => s.settings?.settings?.panes?.snapThreshold ?? 2,
   )
 
   // Dragging state
@@ -150,6 +150,16 @@ export default function IntersectionDragOverlay({
     },
     [getSplitInfo],
   )
+
+  // Lock cursor globally during drag so it doesn't flicker over other elements
+  useEffect(() => {
+    if (!dragging) return
+    const style = document.createElement('style')
+    style.setAttribute('data-drag-cursor', '')
+    style.textContent = `* { cursor: move !important; }`
+    document.head.appendChild(style)
+    return () => { style.remove() }
+  }, [dragging])
 
   // Global mouse move/up handlers during drag
   useEffect(() => {

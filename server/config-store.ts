@@ -121,7 +121,7 @@ export const defaultSettings: AppSettings = {
   },
   panes: {
     defaultNewPane: 'ask',
-    snapThreshold: 4,
+    snapThreshold: 2,
   },
   sidebar: {
     sortMode: 'activity',

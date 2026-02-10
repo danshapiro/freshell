@@ -448,6 +448,80 @@ describe('PaneDivider', () => {
     })
   })
 
+  describe('cursor locking during drag', () => {
+    afterEach(() => {
+      // Clean up any leaked style tags
+      document.querySelectorAll('style[data-drag-cursor]').forEach((el) => el.remove())
+    })
+
+    it('locks cursor to col-resize during horizontal mouse drag', () => {
+      render(
+        <PaneDivider direction="horizontal" onResize={onResize} onResizeEnd={onResizeEnd} />
+      )
+      const divider = screen.getByRole('separator')
+
+      expect(document.querySelector('style[data-drag-cursor]')).not.toBeInTheDocument()
+
+      fireEvent.mouseDown(divider, { clientX: 100, clientY: 50 })
+
+      const style = document.querySelector('style[data-drag-cursor]')
+      expect(style).toBeInTheDocument()
+      expect(style!.textContent).toContain('col-resize')
+
+      fireEvent.mouseUp(document)
+
+      expect(document.querySelector('style[data-drag-cursor]')).not.toBeInTheDocument()
+    })
+
+    it('locks cursor to row-resize during vertical mouse drag', () => {
+      render(
+        <PaneDivider direction="vertical" onResize={onResize} onResizeEnd={onResizeEnd} />
+      )
+      const divider = screen.getByRole('separator')
+
+      fireEvent.mouseDown(divider, { clientX: 50, clientY: 100 })
+
+      const style = document.querySelector('style[data-drag-cursor]')
+      expect(style).toBeInTheDocument()
+      expect(style!.textContent).toContain('row-resize')
+
+      fireEvent.mouseUp(document)
+
+      expect(document.querySelector('style[data-drag-cursor]')).not.toBeInTheDocument()
+    })
+
+    it('locks cursor during touch drag', () => {
+      render(
+        <PaneDivider direction="horizontal" onResize={onResize} onResizeEnd={onResizeEnd} />
+      )
+      const divider = screen.getByRole('separator')
+
+      fireEvent.touchStart(divider, {
+        touches: [{ clientX: 100, clientY: 50 }],
+      })
+
+      expect(document.querySelector('style[data-drag-cursor]')).toBeInTheDocument()
+
+      fireEvent.touchEnd(document)
+
+      expect(document.querySelector('style[data-drag-cursor]')).not.toBeInTheDocument()
+    })
+
+    it('cleans up cursor lock on unmount during drag', () => {
+      render(
+        <PaneDivider direction="horizontal" onResize={onResize} onResizeEnd={onResizeEnd} />
+      )
+      const divider = screen.getByRole('separator')
+
+      fireEvent.mouseDown(divider, { clientX: 100, clientY: 50 })
+      expect(document.querySelector('style[data-drag-cursor]')).toBeInTheDocument()
+
+      cleanup()
+
+      expect(document.querySelector('style[data-drag-cursor]')).not.toBeInTheDocument()
+    })
+  })
+
   describe('event listener cleanup', () => {
     it('removes mouse event listeners when component unmounts during drag', () => {
       render(

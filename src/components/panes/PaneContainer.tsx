@@ -1,6 +1,7 @@
 import { useRef, useCallback, useMemo, useState, useEffect } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { closePane, setActivePane, resizePanes, updatePaneContent, updatePaneTitle, clearPaneRenameRequest, toggleZoom } from '@/store/panesSlice'
+import { updateTab } from '@/store/tabsSlice'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
 import Pane from './Pane'
 import PaneDivider from './PaneDivider'
@@ -32,11 +33,12 @@ interface PaneContainerProps {
 export default function PaneContainer({ tabId, node, hidden }: PaneContainerProps) {
   const dispatch = useAppDispatch()
   const activePane = useAppSelector((s) => s.panes.activePane[tabId])
+  const tabTerminalId = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId)?.terminalId)
   const paneTitles = useAppSelector((s) => s.panes.paneTitles[tabId] ?? EMPTY_PANE_TITLES)
   const zoomedPaneId = useAppSelector((s) => s.panes.zoomedPane?.[tabId])
   const containerRef = useRef<HTMLDivElement>(null)
   const ws = useMemo(() => getWsClient(), [])
-  const snapThreshold = useAppSelector((s) => s.settings?.settings?.panes?.snapThreshold ?? 4)
+  const snapThreshold = useAppSelector((s) => s.settings?.settings?.panes?.snapThreshold ?? 2)
 
   // Drag state for snapping: track the original size and accumulated delta
   const dragStartSizeRef = useRef<number>(0)
@@ -96,9 +98,14 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         type: 'terminal.detach',
         terminalId: content.terminalId,
       })
+      // Clear stale tab.terminalId so background-terminal dedup doesn't
+      // focus this tab after the pane's terminal has been detached
+      if (tabTerminalId === content.terminalId) {
+        dispatch(updateTab({ id: tabId, updates: { terminalId: undefined } }))
+      }
     }
     dispatch(closePane({ tabId, paneId }))
-  }, [dispatch, tabId, ws])
+  }, [dispatch, tabId, tabTerminalId, ws])
 
   const handleFocus = useCallback((paneId: string) => {
     dispatch(setActivePane({ tabId, paneId }))

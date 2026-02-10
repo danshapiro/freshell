@@ -272,6 +272,32 @@ describe('IntersectionDragOverlay', () => {
       expect(rootAfterMore.sizes).toEqual(sizesAfterUp)
     })
 
+    it('locks cursor to move during drag', () => {
+      const store = createStore({
+        layouts: { 'tab-1': create2x2Grid() },
+      })
+      const containerRef = createContainerRef(800, 600)
+
+      renderWithStore(
+        <IntersectionDragOverlay tabId="tab-1" containerRef={containerRef} />,
+        store,
+      )
+
+      const hotzone = screen.getByTestId('intersection-hotzone-400,300')
+
+      expect(document.querySelector('style[data-drag-cursor]')).not.toBeInTheDocument()
+
+      fireEvent.mouseDown(hotzone, { clientX: 400, clientY: 300 })
+
+      const style = document.querySelector('style[data-drag-cursor]')
+      expect(style).toBeInTheDocument()
+      expect(style!.textContent).toContain('move')
+
+      fireEvent.mouseUp(document)
+
+      expect(document.querySelector('style[data-drag-cursor]')).not.toBeInTheDocument()
+    })
+
     it('clamps sizes to min 10 max 90', () => {
       const store = createStore({
         layouts: { 'tab-1': create2x2Grid() },

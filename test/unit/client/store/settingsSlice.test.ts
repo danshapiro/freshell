@@ -48,7 +48,7 @@ describe('settingsSlice', () => {
       })
       expect(state.settings.panes).toEqual({
         defaultNewPane: 'ask',
-        snapThreshold: 4,
+        snapThreshold: 2,
         iconsOnTabs: true,
       })
       expect(state.settings.codingCli).toEqual({
@@ -451,8 +451,8 @@ describe('mergeSettings – panes.snapThreshold', () => {
     expect(result.panes.defaultNewPane).toBe('ask') // preserved
   })
 
-  it('defaults panes.snapThreshold to 4', () => {
-    expect(defaultSettings.panes.snapThreshold).toBe(4)
+  it('defaults panes.snapThreshold to 2', () => {
+    expect(defaultSettings.panes.snapThreshold).toBe(2)
   })
 
   it('preserves snapThreshold when patching defaultNewPane', () => {

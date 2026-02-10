@@ -4,6 +4,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import PaneLayout from '@/components/panes/PaneLayout'
 import panesReducer from '@/store/panesSlice'
+import tabsReducer from '@/store/tabsSlice'
 import type { PanesState } from '@/store/panesSlice'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
 
@@ -92,6 +93,7 @@ function createStore(initialPanesState: Partial<PanesState> = {}) {
   return configureStore({
     reducer: {
       panes: panesReducer,
+      tabs: tabsReducer,
     },
     preloadedState: {
       panes: {
@@ -103,6 +105,10 @@ function createStore(initialPanesState: Partial<PanesState> = {}) {
         renameRequestPaneId: null,
         zoomedPane: {},
         ...initialPanesState,
+      },
+      tabs: {
+        tabs: [{ id: 'tab-1', createRequestId: 'tab-1', title: 'Tab 1', mode: 'shell' as const, status: 'running' as const, createdAt: 1 }],
+        activeTabId: 'tab-1',
       },
     },
   })

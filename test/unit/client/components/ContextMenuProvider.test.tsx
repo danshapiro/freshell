@@ -16,14 +16,16 @@ const clipboardMocks = vi.hoisted(() => ({
   copyText: vi.fn().mockResolvedValue(undefined),
 }))
 
+const wsMocks = vi.hoisted(() => ({
+  send: vi.fn(),
+  connect: vi.fn().mockResolvedValue(undefined),
+  onMessage: vi.fn().mockReturnValue(() => {}),
+  onReconnect: vi.fn().mockReturnValue(() => {}),
+  setHelloExtensionProvider: vi.fn(),
+}))
+
 vi.mock('@/lib/ws-client', () => ({
-  getWsClient: () => ({
-    send: vi.fn(),
-    connect: vi.fn().mockResolvedValue(undefined),
-    onMessage: vi.fn().mockReturnValue(() => {}),
-    onReconnect: vi.fn().mockReturnValue(() => {}),
-    setHelloExtensionProvider: vi.fn(),
-  }),
+  getWsClient: () => wsMocks,
 }))
 
 vi.mock('@/lib/api', () => ({
@@ -736,5 +738,103 @@ describe('ContextMenuProvider', () => {
       expect(screen.getByText('New Browser tab')).toBeInTheDocument()
       expect(screen.getByText('New Editor tab')).toBeInTheDocument()
     })
+  })
+
+  describe('Replace pane', () => {
+    function createStoreWithTerminalPane() {
+      return configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+          sessions: sessionsReducer,
+          connection: connectionReducer,
+        },
+        middleware: (getDefaultMiddleware) =>
+          getDefaultMiddleware({ serializableCheck: false }),
+        preloadedState: {
+          tabs: {
+            tabs: [
+              {
+                id: 'tab-1',
+                createRequestId: 'tab-1',
+                title: 'Shell',
+                status: 'running',
+                mode: 'shell',
+                shell: 'system',
+                createdAt: 1,
+                terminalId: 'term-1',
+              },
+            ],
+            activeTabId: 'tab-1',
+            renameRequestTabId: null,
+          },
+          panes: {
+            layouts: {
+              'tab-1': {
+                type: 'leaf',
+                id: 'pane-1',
+                content: {
+                  kind: 'terminal',
+                  mode: 'shell',
+                  status: 'running',
+                  terminalId: 'term-1',
+                },
+              },
+            },
+            activePane: { 'tab-1': 'pane-1' },
+            paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+          },
+          sessions: {
+            projects: [],
+            expandedProjects: new Set<string>(),
+          },
+          connection: {
+            status: 'ready',
+            platform: 'linux',
+          },
+        },
+      })
+    }
+
+    it('detaches terminal and replaces pane with picker via context menu', async () => {
+      const user = userEvent.setup()
+      wsMocks.send.mockClear()
+
+      const store = createStoreWithTerminalPane()
+
+      render(
+        <Provider store={store}>
+          <ContextMenuProvider
+            view="terminal"
+            onViewChange={() => {}}
+            onToggleSidebar={() => {}}
+            sidebarCollapsed={false}
+          >
+            <div data-context={ContextIds.Terminal} data-tab-id="tab-1" data-pane-id="pane-1">
+              Terminal Content
+            </div>
+          </ContextMenuProvider>
+        </Provider>
+      )
+
+      await user.pointer({ target: screen.getByText('Terminal Content'), keys: '[MouseRight]' })
+      expect(screen.getByRole('menu')).toBeInTheDocument()
+
+      await user.click(screen.getByRole('menuitem', { name: 'Replace pane' }))
+
+      // Verify terminal.detach was sent via the actual handler
+      expect(wsMocks.send).toHaveBeenCalledWith({ type: 'terminal.detach', terminalId: 'term-1' })
+
+      // Verify pane content is now picker
+      const layout = store.getState().panes.layouts['tab-1']
+      expect(layout.type).toBe('leaf')
+      if (layout.type === 'leaf') {
+        expect(layout.content).toEqual({ kind: 'picker' })
+      }
+
+      // Verify stale tab.terminalId is cleared
+      expect(store.getState().tabs.tabs[0].terminalId).toBeUndefined()
+    })
+
   })
 })

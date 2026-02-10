@@ -39,6 +39,17 @@ export default function PaneDivider({
     startPosRef.current = direction === 'horizontal' ? touch.clientX : touch.clientY
   }, [direction, onResizeStart])
 
+  // Lock cursor globally during drag so it doesn't flicker over other elements
+  useEffect(() => {
+    if (!isDragging) return
+    const cursor = direction === 'horizontal' ? 'col-resize' : 'row-resize'
+    const style = document.createElement('style')
+    style.setAttribute('data-drag-cursor', '')
+    style.textContent = `* { cursor: ${cursor} !important; }`
+    document.head.appendChild(style)
+    return () => { style.remove() }
+  }, [isDragging, direction])
+
   useEffect(() => {
     if (!isDragging) return
 

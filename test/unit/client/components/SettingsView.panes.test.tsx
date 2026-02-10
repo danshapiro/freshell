@@ -47,7 +47,7 @@ function createTestStore(defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor' 
           },
           panes: {
             defaultNewPane,
-            snapThreshold: 4,
+            snapThreshold: 2,
             iconsOnTabs: true,
           },
           codingCli: {
@@ -142,7 +142,7 @@ describe('SettingsView Panes section', () => {
       </Provider>
     )
 
-    // The slider should show "4%" for the default value
-    expect(screen.getByText('4%')).toBeInTheDocument()
+    // The slider should show "2%" for the default value
+    expect(screen.getByText('2%')).toBeInTheDocument()
   })
 })

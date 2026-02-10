@@ -587,7 +587,7 @@ export default function SettingsView() {
 
             <SettingsRow label="Snap distance">
               <RangeSlider
-                value={settings.panes?.snapThreshold ?? 4}
+                value={settings.panes?.snapThreshold ?? 2}
                 min={0}
                 max={8}
                 step={1}

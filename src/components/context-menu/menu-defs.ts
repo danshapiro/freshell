@@ -21,6 +21,7 @@ export type MenuActions = {
   closeTabsToRight: (tabId: string) => void
   moveTab: (tabId: string, dir: -1 | 1) => void
   renamePane: (tabId: string, paneId: string) => void
+  replacePane: (tabId: string, paneId: string) => void
   splitPane: (tabId: string, paneId: string, direction: 'horizontal' | 'vertical') => void
   resetSplit: (tabId: string, splitId: string) => void
   swapSplit: (tabId: string, splitId: string) => void
@@ -235,6 +236,8 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       { type: 'item', id: 'split-down', label: 'Split down', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'vertical') },
       { type: 'separator', id: 'pane-split-sep' },
       { type: 'item', id: 'rename-pane', label: 'Rename pane', onSelect: () => actions.renamePane(target.tabId, target.paneId) },
+      { type: 'separator', id: 'pane-replace-sep' },
+      { type: 'item', id: 'replace-pane', label: 'Replace pane', onSelect: () => actions.replacePane(target.tabId, target.paneId) },
     ]
   }
 
@@ -293,6 +296,8 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
         onSelect: () => terminalActions?.reset(),
         disabled: !terminalActions,
       },
+      { type: 'separator', id: 'terminal-replace-sep' },
+      { type: 'item', id: 'replace-pane', label: 'Replace pane', onSelect: () => actions.replacePane(target.tabId, target.paneId) },
     ]
   }
 
@@ -306,6 +311,8 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       { type: 'item', id: 'browser-copy-url', label: 'Copy URL', onSelect: () => browserActions?.copyUrl(), disabled: !browserActions },
       { type: 'item', id: 'browser-open', label: 'Open in external browser', onSelect: () => browserActions?.openExternal(), disabled: !browserActions },
       { type: 'item', id: 'browser-devtools', label: 'Toggle devtools', onSelect: () => browserActions?.toggleDevTools(), disabled: !browserActions },
+      { type: 'separator', id: 'browser-replace-sep' },
+      { type: 'item', id: 'replace-pane', label: 'Replace pane', onSelect: () => actions.replacePane(target.tabId, target.paneId) },
     ]
   }
 
@@ -327,6 +334,8 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       { type: 'item', id: 'editor-toggle-preview', label: 'Toggle preview/source', onSelect: () => editorActions?.togglePreview(), disabled: !editorActions },
       { type: 'item', id: 'editor-copy-path', label: 'Copy file path', onSelect: () => editorActions?.copyPath(), disabled: !editorActions },
       { type: 'item', id: 'editor-reveal', label: 'Reveal in file explorer', onSelect: () => editorActions?.revealInExplorer(), disabled: !editorActions },
+      { type: 'separator', id: 'editor-replace-sep' },
+      { type: 'item', id: 'replace-pane', label: 'Replace pane', onSelect: () => actions.replacePane(target.tabId, target.paneId) },
     ]
   }
 
