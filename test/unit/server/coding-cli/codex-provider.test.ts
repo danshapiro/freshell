@@ -212,7 +212,96 @@ describe('codex-provider', () => {
       contextTokens: 70744,
       modelContextWindow: 200000,
       compactThresholdTokens: explicitLimit,
-      compactPercent: Math.round((70744 / explicitLimit) * 100),
+      compactPercent: Math.round(((70744 - 12000) / (explicitLimit - 12000)) * 100),
+    })
+  })
+
+  it('derives compact threshold at 90% of model context window and applies codex baseline for percent full', () => {
+    const content = [
+      JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          id: 'session-default-limit',
+          cwd: '/project/a',
+        },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            last_token_usage: {
+              input_tokens: 80000,
+              output_tokens: 3284,
+              cached_input_tokens: 80000,
+              total_tokens: 163284,
+            },
+            model_context_window: 258400,
+          },
+        },
+      }),
+    ].join('\n')
+
+    const meta = parseCodexSessionContent(content)
+    const expectedLimit = Math.round(258400 * 0.9)
+
+    expect(meta.tokenUsage).toEqual({
+      inputTokens: 80000,
+      outputTokens: 3284,
+      cachedTokens: 80000,
+      totalTokens: 163284,
+      contextTokens: 163284,
+      modelContextWindow: 258400,
+      compactThresholdTokens: expectedLimit,
+      compactPercent: Math.round(((163284 - 12000) / (expectedLimit - 12000)) * 100),
+    })
+  })
+
+  it('prefers last_token_usage snapshot over cumulative total_usage_tokens when context window is missing', () => {
+    const content = [
+      JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          id: 'session-cumulative',
+          cwd: '/project/a',
+        },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_usage_tokens: 83181483,
+            last_token_usage: {
+              input_tokens: 58073,
+              cached_input_tokens: 55552,
+              output_tokens: 624,
+              reasoning_output_tokens: 172,
+              total_tokens: 58697,
+            },
+            total_token_usage: {
+              input_tokens: 82880676,
+              cached_input_tokens: 77492992,
+              output_tokens: 300807,
+              reasoning_output_tokens: 163157,
+              total_tokens: 83181483,
+            },
+          },
+        },
+      }),
+    ].join('\n')
+
+    const meta = parseCodexSessionContent(content)
+
+    expect(meta.tokenUsage).toEqual({
+      inputTokens: 58073,
+      outputTokens: 624,
+      cachedTokens: 55552,
+      totalTokens: 58697,
+      contextTokens: 58697,
+      modelContextWindow: undefined,
+      compactThresholdTokens: undefined,
+      compactPercent: undefined,
     })
   })
 

@@ -1,5 +1,7 @@
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
 
+const tokenNumberFormatter = new Intl.NumberFormat('en-US')
+
 function safeBasename(input?: string): string | undefined {
   if (!input) return undefined
   const normalized = input.replace(/[\\/]+$/, '')
@@ -56,7 +58,9 @@ export function formatPaneRuntimeTooltip(meta: TerminalMetaRecord | undefined): 
     const normalizedPercent = typeof compactPercent === 'number' && Number.isFinite(compactPercent)
       ? Math.max(0, Math.min(100, Math.round(compactPercent)))
       : Math.max(0, Math.min(100, Math.round((contextTokens / compactThresholdTokens) * 100)))
-    lines.push(`Tokens: ${Math.round(contextTokens)}/${Math.round(compactThresholdTokens)}(${normalizedPercent}% full)`)
+    lines.push(
+      `Tokens: ${tokenNumberFormatter.format(Math.round(contextTokens))}/${tokenNumberFormatter.format(Math.round(compactThresholdTokens))}(${normalizedPercent}% full)`,
+    )
   }
 
   return lines.length ? lines.join('\n') : undefined

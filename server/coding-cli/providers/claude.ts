@@ -40,7 +40,12 @@ const CLAUDE_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'claude-3-haiku-20240307': 200_000,
 }
 
-const claudeDebugCompactThresholdCache = new Map<string, number | null>()
+type ClaudeDebugAutocompactSnapshot = {
+  tokens?: number
+  threshold?: number
+}
+
+const claudeDebugAutocompactCache = new Map<string, ClaudeDebugAutocompactSnapshot | null>()
 
 function toFiniteNumber(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) return value
@@ -79,50 +84,58 @@ function assistantUsageDedupKey(obj: any, line: string): string {
   return `line:${createHash('sha1').update(line).digest('hex')}`
 }
 
-function parseAutocompactThresholdFromDebugText(text: string): number | undefined {
-  const matches = text.matchAll(/autocompact:\s*tokens=\d+\s+threshold=(\d+)/g)
-  let threshold: number | undefined
+function parseAutocompactSnapshotFromDebugText(text: string): ClaudeDebugAutocompactSnapshot | undefined {
+  const matches = text.matchAll(/autocompact:\s*tokens=(\d+)\s+threshold=(\d+)/g)
+  let snapshot: ClaudeDebugAutocompactSnapshot | undefined
   for (const match of matches) {
-    const parsed = Number(match[1])
-    if (Number.isFinite(parsed) && parsed > 0) {
-      threshold = parsed
+    const tokens = Number(match[1])
+    const threshold = Number(match[2])
+    if (!snapshot) snapshot = {}
+    if (Number.isFinite(tokens) && tokens > 0) {
+      snapshot.tokens = tokens
+    }
+    if (Number.isFinite(threshold) && threshold > 0) {
+      snapshot.threshold = threshold
     }
   }
-  return threshold
+  return snapshot?.tokens || snapshot?.threshold ? snapshot : undefined
 }
 
-function readClaudeDebugCompactThreshold(sessionId: string, claudeHome: string): number | undefined {
+function readClaudeDebugAutocompactSnapshot(
+  sessionId: string,
+  claudeHome: string,
+): ClaudeDebugAutocompactSnapshot | undefined {
   if (!sessionId || !isValidClaudeSessionId(sessionId)) return undefined
 
-  const cached = claudeDebugCompactThresholdCache.get(sessionId)
+  const cached = claudeDebugAutocompactCache.get(sessionId)
   if (cached !== undefined) {
-    return cached ?? undefined
+    return cached || undefined
   }
 
   const debugPath = path.join(claudeHome, 'debug', `${sessionId}.txt`)
   try {
     const fd = fs.openSync(debugPath, 'r')
-    let threshold: number | undefined
+    let snapshot: ClaudeDebugAutocompactSnapshot | undefined
     try {
       const stat = fs.fstatSync(fd)
       const bytesToRead = Math.min(stat.size, CLAUDE_DEBUG_TAIL_BYTES)
       if (bytesToRead <= 0) {
-        claudeDebugCompactThresholdCache.set(sessionId, null)
+        claudeDebugAutocompactCache.set(sessionId, null)
         return undefined
       }
 
       const start = Math.max(0, stat.size - bytesToRead)
       const buffer = Buffer.alloc(bytesToRead)
       const read = fs.readSync(fd, buffer, 0, bytesToRead, start)
-      threshold = parseAutocompactThresholdFromDebugText(buffer.subarray(0, read).toString('utf8'))
+      snapshot = parseAutocompactSnapshotFromDebugText(buffer.subarray(0, read).toString('utf8'))
     } finally {
       fs.closeSync(fd)
     }
 
-    claudeDebugCompactThresholdCache.set(sessionId, threshold ?? null)
-    return threshold
+    claudeDebugAutocompactCache.set(sessionId, snapshot ?? null)
+    return snapshot
   } catch {
-    claudeDebugCompactThresholdCache.set(sessionId, null)
+    claudeDebugAutocompactCache.set(sessionId, null)
     return undefined
   }
 }
@@ -130,6 +143,7 @@ function readClaudeDebugCompactThreshold(sessionId: string, claudeHome: string):
 type ParseSessionOptions = {
   fallbackSessionId?: string
   compactThresholdTokens?: number
+  contextTokens?: number
 }
 
 /** Parse session metadata from jsonl content (pure function for testing) */
@@ -263,7 +277,8 @@ export function parseSessionContent(content: string, options: ParseSessionOption
 
   let tokenUsage: TokenSummary | undefined
   if (latestUsage) {
-    const contextTokens = latestUsage.inputTokens + latestUsage.outputTokens + latestUsage.cachedTokens
+    const contextTokensFromUsage = latestUsage.inputTokens + latestUsage.outputTokens + latestUsage.cachedTokens
+    const contextTokens = options.contextTokens ?? contextTokensFromUsage
     const modelContextWindow = resolveClaudeContextWindow(model)
     const compactThresholdTokens =
       options.compactThresholdTokens ??
@@ -356,10 +371,11 @@ export const claudeProvider: CodingCliProvider = {
 
   parseSessionFile(content: string, filePath: string): ParsedSessionMeta {
     const fallbackSessionId = path.basename(filePath, '.jsonl')
-    const compactThresholdTokens = readClaudeDebugCompactThreshold(fallbackSessionId, this.homeDir)
+    const debugAutocompact = readClaudeDebugAutocompactSnapshot(fallbackSessionId, this.homeDir)
     return parseSessionContent(content, {
       fallbackSessionId,
-      compactThresholdTokens,
+      compactThresholdTokens: debugAutocompact?.threshold,
+      contextTokens: debugAutocompact?.tokens,
     })
   },
 

@@ -81,7 +81,7 @@ describe('PaneHeader', () => {
         <PaneHeader
           title="My Terminal"
           metaLabel="freshell (main*)  25%"
-          metaTooltip={'Directory: /home/user/code/freshell\nbranch: main*\nTokens: 54414/167000(33% full)'}
+          metaTooltip={'Directory: /home/user/code/freshell\nbranch: main*\nTokens: 54,414/167,000(33% full)'}
           status="running"
           isActive={true}
           onClose={vi.fn()}
@@ -92,7 +92,7 @@ describe('PaneHeader', () => {
 
       expect(
         screen.getByText((_, element) =>
-          element?.getAttribute('title') === 'Directory: /home/user/code/freshell\nbranch: main*\nTokens: 54414/167000(33% full)',
+          element?.getAttribute('title') === 'Directory: /home/user/code/freshell\nbranch: main*\nTokens: 54,414/167,000(33% full)',
         ),
       ).toBeInTheDocument()
       expect(screen.getByTitle('Maximize pane')).toBeInTheDocument()
@@ -182,7 +182,7 @@ describe('PaneHeader', () => {
       expect(tooltip).toBe(
         'Directory: /home/user/code/freshell/.worktrees/fix-token-percent-calc\n' +
         'branch: fix/token-percent-calc*\n' +
-        'Tokens: 54414/167000(33% full)',
+        'Tokens: 54,414/167,000(33% full)',
       )
     })
   })

@@ -6,6 +6,9 @@ import type { CodingCliProvider } from '../provider.js'
 import type { NormalizedEvent, ParsedSessionMeta, TokenPayload, TokenSummary } from '../types.js'
 import { looksLikePath, isSystemContext, extractFromIdeContext, resolveGitRepoRoot } from '../utils.js'
 
+const CODEX_BASELINE_TOKENS = 12_000
+const CODEX_MAX_PLAUSIBLE_CONTEXT_TOKENS_WITHOUT_WINDOW = 5_000_000
+
 export function defaultCodexHome(): string {
   return process.env.CODEX_HOME || path.join(os.homedir(), '.codex')
 }
@@ -33,11 +36,42 @@ function normalizeCompactPercent(numerator: number, denominator?: number): numbe
   return Math.max(0, Math.min(100, ratio))
 }
 
-function coerceLikelyContextTokens(value: number | undefined, modelContextWindow?: number): number | undefined {
+function normalizeCompactPercentWithBaseline(
+  numerator: number,
+  denominator?: number,
+  baselineTokens = 0,
+): number | undefined {
+  if (!denominator || denominator <= 0) return undefined
+  if (baselineTokens <= 0) return normalizeCompactPercent(numerator, denominator)
+
+  const adjustedDenominator = denominator - baselineTokens
+  if (adjustedDenominator <= 0) return normalizeCompactPercent(numerator, denominator)
+
+  const adjustedNumerator = Math.max(numerator - baselineTokens, 0)
+  return normalizeCompactPercent(adjustedNumerator, adjustedDenominator)
+}
+
+function coerceLikelyContextTokens(
+  value: number | undefined,
+  modelContextWindow?: number,
+  preferredContextTokens?: number,
+): number | undefined {
   if (value === undefined || value < 0) return undefined
   // `total_token_usage.total_tokens` can be cumulative for the entire transcript.
   // Treat values far above the model context window as non-context counters.
   if (modelContextWindow && modelContextWindow > 0 && value > modelContextWindow * 2) {
+    return undefined
+  }
+  // If we don't have a context window, still reject implausibly large counters.
+  if (!modelContextWindow && value > CODEX_MAX_PLAUSIBLE_CONTEXT_TOKENS_WITHOUT_WINDOW) {
+    return undefined
+  }
+  // Prefer the latest turn snapshot over cumulative totals when both exist.
+  if (
+    preferredContextTokens &&
+    preferredContextTokens > 0 &&
+    value > preferredContextTokens * 8
+  ) {
     return undefined
   }
   return value
@@ -92,20 +126,21 @@ function parseCodexTokenEnvelope(payload: any): {
 
     const compactThresholdTokens =
       explicitCompactLimit ??
-      (modelContextWindow ? Math.round(modelContextWindow * (90 / 95)) : undefined)
+      (modelContextWindow ? Math.round(modelContextWindow * 0.9) : undefined)
 
     const contextCandidates = [
       toFiniteNumber(info.current_context_tokens),
       toFiniteNumber(info.context_tokens),
       toFiniteNumber(info.context_token_count),
-      toFiniteNumber(info.total_usage_tokens),
       toFiniteNumber(info.last_token_usage?.total_tokens),
       lastUsage?.totalTokens,
+      toFiniteNumber(info.total_usage_tokens),
       toFiniteNumber(info.total_token_usage?.total_tokens),
       totalUsage?.totalTokens,
     ]
+    const preferredContextTokens = lastUsage?.totalTokens
     const contextTokens = contextCandidates
-      .map((candidate) => coerceLikelyContextTokens(candidate, modelContextWindow))
+      .map((candidate) => coerceLikelyContextTokens(candidate, modelContextWindow, preferredContextTokens))
       .find((candidate): candidate is number => candidate !== undefined)
 
     // `last_token_usage` reflects the current context snapshot and is what users
@@ -122,7 +157,11 @@ function parseCodexTokenEnvelope(payload: any): {
           compactThresholdTokens,
           compactPercent:
             contextTokens !== undefined
-              ? normalizeCompactPercent(contextTokens, compactThresholdTokens)
+              ? normalizeCompactPercentWithBaseline(
+                contextTokens,
+                compactThresholdTokens,
+                CODEX_BASELINE_TOKENS,
+              )
               : undefined,
         }
       : undefined

@@ -133,7 +133,8 @@ export class TerminalMetadataService {
       ...current,
       provider: session.provider,
       sessionId: session.sessionId,
-      cwd: session.cwd ?? current.cwd,
+      // Keep live terminal cwd authoritative; session snapshots can lag after cd/worktree switches.
+      cwd: current.cwd ?? session.cwd,
       branch: session.gitBranch ?? current.branch,
       isDirty: session.isDirty ?? current.isDirty,
       tokenUsage: session.tokenUsage ?? current.tokenUsage,

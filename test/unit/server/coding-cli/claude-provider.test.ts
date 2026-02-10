@@ -204,6 +204,37 @@ describe('parseSessionContent() - token usage snapshots', () => {
     expect(meta.tokenUsage?.compactPercent).toBe(Math.round((54414 / 167000) * 100))
   })
 
+  it('supports context-token overrides sourced outside session JSON (e.g. debug logs)', () => {
+    const content = [
+      JSON.stringify({
+        type: 'assistant',
+        uuid: 'uuid-debug-context',
+        message: {
+          role: 'assistant',
+          usage: {
+            input_tokens: 1,
+            output_tokens: 8,
+            cache_read_input_tokens: 49961,
+            cache_creation_input_tokens: 4444,
+          },
+        },
+      }),
+    ].join('\n')
+
+    const meta = parseSessionContent(content, {
+      compactThresholdTokens: 167000,
+      contextTokens: 55880,
+    })
+
+    expect(meta.tokenUsage?.inputTokens).toBe(1)
+    expect(meta.tokenUsage?.outputTokens).toBe(8)
+    expect(meta.tokenUsage?.cachedTokens).toBe(54405)
+    expect(meta.tokenUsage?.totalTokens).toBe(55880)
+    expect(meta.tokenUsage?.contextTokens).toBe(55880)
+    expect(meta.tokenUsage?.compactThresholdTokens).toBe(167000)
+    expect(meta.tokenUsage?.compactPercent).toBe(Math.round((55880 / 167000) * 100))
+  })
+
   it('reads compact threshold from Claude debug logs when parsing session files', async () => {
     const homeDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-claude-debug-'))
     const sessionId = SESSION_A
@@ -243,9 +274,9 @@ describe('parseSessionContent() - token usage snapshots', () => {
         path.join(homeDir, 'projects', 'project-a', `${sessionId}.jsonl`),
       )
 
-      expect(meta.tokenUsage?.contextTokens).toBe(54414)
+      expect(meta.tokenUsage?.contextTokens).toBe(55880)
       expect(meta.tokenUsage?.compactThresholdTokens).toBe(167000)
-      expect(meta.tokenUsage?.compactPercent).toBe(Math.round((54414 / 167000) * 100))
+      expect(meta.tokenUsage?.compactPercent).toBe(Math.round((55880 / 167000) * 100))
     } finally {
       ;(claudeProvider as any).homeDir = originalHomeDir
       await fsp.rm(homeDir, { recursive: true, force: true })

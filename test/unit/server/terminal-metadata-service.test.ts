@@ -130,6 +130,43 @@ describe('TerminalMetadataService', () => {
     })
   })
 
+  it('preserves the terminal cwd when session snapshots report a stale cwd', async () => {
+    const { service } = createService({ branch: 'feature/worktree', isDirty: false })
+    await service.seedFromTerminal(
+      createTerminalRecord({
+        terminalId: 'term-2b',
+        mode: 'codex',
+        cwd: '/workspace/repo/.worktrees/feature-branch',
+      }),
+    )
+
+    const session: CodingCliSession = {
+      provider: 'codex',
+      sessionId: 'codex-session-2b',
+      projectPath: '/workspace/repo',
+      updatedAt: Date.now(),
+      cwd: '/workspace/repo',
+      gitBranch: 'main',
+      isDirty: true,
+      tokenUsage: {
+        inputTokens: 20,
+        outputTokens: 9,
+        cachedTokens: 12,
+        totalTokens: 41,
+        contextTokens: 41,
+        modelContextWindow: 200000,
+        compactThresholdTokens: 190000,
+        compactPercent: 0,
+      },
+    }
+
+    const updated = await service.applySessionMetadata('term-2b', session)
+
+    expect(updated?.cwd).toBe('/workspace/repo/.worktrees/feature-branch')
+    expect(updated?.branch).toBe('feature/worktree')
+    expect(updated?.isDirty).toBe(false)
+  })
+
   it('returns undefined for idempotent updates and avoids duplicate change payloads', async () => {
     const { service } = createService()
     await service.seedFromTerminal(
