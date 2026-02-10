@@ -615,6 +615,43 @@ describe('tabsSlice', () => {
       expect(tabs[0].status).toBe('running')
       expect(tabs[0].resumeSessionId).toBe(VALID_CLAUDE_SESSION_ID)
     })
+
+    it('uses capitalized provider label for codex tab title', async () => {
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+        },
+      })
+
+      await store.dispatch(openSessionTab({
+        sessionId: 'codex-sess-123',
+        provider: 'codex',
+      }))
+
+      const tabs = store.getState().tabs.tabs
+      expect(tabs).toHaveLength(1)
+      expect(tabs[0].title).toBe('Codex')
+    })
+
+    it('uses capitalized provider label for codex tab with terminalId', async () => {
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+        },
+      })
+
+      await store.dispatch(openSessionTab({
+        sessionId: 'codex-sess-456',
+        provider: 'codex',
+        terminalId: 'term-codex-3',
+      }))
+
+      const tabs = store.getState().tabs.tabs
+      expect(tabs).toHaveLength(1)
+      expect(tabs[0].title).toBe('Codex')
+    })
   })
 
   describe('lastInputAt tracking', () => {

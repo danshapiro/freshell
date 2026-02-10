@@ -3,6 +3,7 @@ import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } f
 import { nanoid } from 'nanoid'
 import { removeLayout } from './panesSlice'
 import { findTabIdForSession } from '@/lib/session-utils'
+import { getProviderLabel } from '@/lib/coding-cli-utils'
 import type { RootState } from './store'
 
 export interface TabsState {
@@ -230,7 +231,7 @@ export const openSessionTab = createAsyncThunk(
         }
       }
       dispatch(addTab({
-        title: title || (resolvedProvider === 'claude' ? 'Claude' : resolvedProvider),
+        title: title || getProviderLabel(resolvedProvider),
         terminalId,
         status: 'running',
         mode: resolvedProvider,
@@ -249,7 +250,7 @@ export const openSessionTab = createAsyncThunk(
       }
     }
     dispatch(addTab({
-      title: title || (resolvedProvider === 'claude' ? 'Claude' : resolvedProvider),
+      title: title || getProviderLabel(resolvedProvider),
       mode: resolvedProvider,
       codingCliProvider: resolvedProvider,
       initialCwd: cwd,
