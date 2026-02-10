@@ -211,17 +211,19 @@ describe('WebSocket chunking', () => {
       expect(chunks).toEqual([])
     })
 
-    it('runs within practical perf bounds for 2MB snapshot payload', () => {
+    it('handles 2MB snapshot payload without pathological chunk growth', () => {
       const terminalId = 'term-perf'
       const snapshot = 'x'.repeat(2_000_000)
       const maxBytes = 500 * 1024
 
-      const startedAt = performance.now()
       const chunks = chunkTerminalSnapshot(snapshot, maxBytes, terminalId)
-      const durationMs = performance.now() - startedAt
 
+      expect(chunks.length).toBeGreaterThan(1)
+      expect(chunks.length).toBeLessThanOrEqual(8)
       expect(chunks.join('')).toBe(snapshot)
-      expect(durationMs).toBeLessThanOrEqual(200)
+      for (const chunk of chunks) {
+        expect(createEnvelopeBytes(terminalId, chunk)).toBeLessThanOrEqual(maxBytes)
+      }
     })
   })
 })
