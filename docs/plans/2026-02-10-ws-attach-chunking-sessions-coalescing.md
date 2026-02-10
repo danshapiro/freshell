@@ -80,12 +80,22 @@
 - With `MAX_CHUNK_BYTES` (from env `MAX_WS_CHUNK_BYTES`) defaulting to ~500KB and snapshot upper bound 2M UTF-16 code units, chunk counts vary by serialized byte size.
 - ANSI/control-character-heavy content can expand significantly under JSON escaping, so chunk count can exceed 4 for the same character count.
 - Exact byte safety requires candidate-string serialization in the probe loop; optimize by precomputing stable envelope fragments and limiting probe count.
-- Reference algorithm is O(N log N) due binary-search probing; keep probe count bounded and payload sizes capped.
+- Reference algorithm is O(N log N) due binary-search probing, but practical runtime is dominated by repeated `JSON.stringify` in probes; keep probe count bounded and payload sizes capped.
 - Acceptance target: <= 200ms for a 2MB serialized payload on baseline dev hardware; treat sustained regressions above that as optimization work.
 
 8. **Chunk ordering relies on websocket/TCP in-order delivery for a single connection.**
 - `terminal.attached.chunk` intentionally has no explicit sequence index.
 - Client validates count + metadata consistency (`start` vs `end`) and discards on mismatch.
+
+9. **Do not block the websocket message loop while chunking.**
+- `onMessage` handlers enqueue attach snapshot work into per-terminal-per-connection promise chains and return immediately.
+- `sendAttachSnapshotAndFinalize` runs only inside the chain, and errors are handled/logged inside the chain to avoid unhandled rejections.
+
+10. **Client/server timeout coordination avoids routine overlap races.**
+- Server attach frame timeout remains 30s default (`ATTACH_FRAME_SEND_TIMEOUT_MS`, from env `WS_ATTACH_FRAME_SEND_TIMEOUT_MS`).
+- Client chunk completion timeout is set to 35s default (`ATTACH_CHUNK_TIMEOUT_MS`) and must satisfy:
+  - `ATTACH_CHUNK_TIMEOUT_MS >= ATTACH_FRAME_SEND_TIMEOUT_MS + reconnectMinDelay`.
+- No client-side cancel message is added in v1; timeout alignment prevents clients from routinely abandoning streams before server-side timeout handling completes.
 
 ---
 
@@ -122,6 +132,7 @@ For chunk-capable clients and oversized snapshots:
 ```
 
 `totalCodeUnits` is explicitly `snapshot.length` (UTF-16 code units).
+It is for reassembly validation only; transport chunk sizing is always byte-based (`Buffer.byteLength` over serialized envelope).
 Ordering guarantee relies on websocket/TCP message order on a single connection.
 
 For `terminal.create`, keep `terminal.created` but allow chunk follow-up:
@@ -130,7 +141,9 @@ For `terminal.create`, keep `terminal.created` but allow chunk follow-up:
 { type: 'terminal.created', requestId, terminalId, createdAt, effectiveResumeSessionId, snapshotChunked: true, snapshot?: string }
 ```
 
-The existing `terminal.created` `snapshot` field remains unchanged for inline/small snapshots; it is optional/omitted when `snapshotChunked: true`.
+The existing `terminal.created` `snapshot` field remains unchanged for inline/small snapshots.
+When `snapshotChunked: true`, omit `snapshot` entirely (do not send empty string placeholders).
+If a non-capable client ever receives chunk message types due to server bug/regression, they remain safely ignorable as unknown message types.
 
 ---
 
@@ -258,6 +271,7 @@ In `test/server/ws-edge-cases.test.ts`, add tests asserting:
 5. Empty snapshots always use inline path and never advertise `snapshotChunked: true`.
 6. Concurrent attach/create attempts for the same terminal+connection do not interleave chunk streams.
    - Use a controllable barrier in send/attach sequencing so a second attach starts while first is in-flight.
+   - Recommended harness: wrap/mock the test websocket `send` callback to pause resolution for a targeted frame until the test releases a deferred promise.
    - Assert each attach stream still emits ordered, non-interleaved `start/chunk/end` triplets per request.
 
 Note: this file uses `FakeRegistry.simulateOutput(...)` intentionally (test helper, not production `TerminalRegistry`).
@@ -307,6 +321,30 @@ private async sendAttachSnapshotAndFinalize(
 ): Promise<void>
 ```
 
+- Add a small wrapper that enqueues chain work and returns immediately from message handlers:
+
+```ts
+private enqueueAttachSnapshotSend(
+  ws: LiveWebSocket,
+  state: ClientState,
+  args: {
+    terminalId: string
+    snapshot: string
+    created?: {
+      requestId: string
+      createdAt: number
+      effectiveResumeSessionId?: string
+    }
+  }
+): void
+```
+
+`enqueueAttachSnapshotSend(...)` requirements:
+- Compute chain key `${state.id}:${args.terminalId}`.
+- Append `sendAttachSnapshotAndFinalize(...)` to the key's promise chain.
+- Catch/log inside the chain so the websocket message loop is never blocked and never gets unhandled rejection noise.
+- Keep `onMessage` handlers non-blocking by calling this wrapper and returning immediately (do not `await` chain completion in handlers).
+
 Implementation safety:
 - Wrap chunking + send sequence in `try/catch`.
 - On chunk helper/send-sequencing exception, log context, abort stream, and avoid `finishAttachSnapshot` for that connection.
@@ -321,7 +359,7 @@ Method behavior:
 - Chunk path (oversized + capable):
   - Compute chunks first via `chunkTerminalSnapshot(..., effectiveAttachChunkBytes, ...)`.
   - If chunks are empty or a single chunk, use inline path (do not send `snapshotChunked: true`).
-  - If `created`, send `terminal.created` with `snapshotChunked: true` and no snapshot body.
+  - If `created`, send `terminal.created` with `snapshotChunked: true` and omit `snapshot`.
   - Send `terminal.attached.start`, each `terminal.attached.chunk`, then `terminal.attached.end` with `totalCodeUnits`, awaiting `queueAttachFrame(...)` at each step.
   - Call `finishAttachSnapshot(...)` only if all chunk frames were accepted.
   - If any frame enqueue returns `false`, abort remaining chunks and do not finish attach for that connection.
@@ -337,7 +375,7 @@ Replace direct snapshot sends + `setImmediate(finishAttachSnapshot)` in:
 3. `terminal.create` new terminal path.
 4. `terminal.attach` path.
 
-All must call `sendAttachSnapshotAndFinalize(...)`.
+All must call `enqueueAttachSnapshotSend(...)` (which internally serializes and invokes `sendAttachSnapshotAndFinalize(...)`).
 
 ### Step 4. Run tests (green)
 
@@ -376,16 +414,17 @@ Add lifecycle tests for chunk flow:
 - `terminal.exit` for the same terminal during chunk accumulation cancels the sequence and clears timers/buffers.
 - incomplete stream cleanup:
   - on websocket reconnect/disconnect, buffered chunks for that terminal are dropped.
-  - on timeout (no `terminal.attached.end` within `ATTACH_CHUNK_TIMEOUT_MS = 10_000`), buffered chunks are dropped and attach spinner is cleared.
+  - on timeout (no `terminal.attached.end` within `ATTACH_CHUNK_TIMEOUT_MS = 35_000`), buffered chunks are dropped and attach spinner is cleared.
 - on repeated `terminal.attached.start` for same terminal, previous in-flight chunks are replaced.
 - reconnect/disconnect increments a local connection-generation token and clears all in-flight buffers for prior generation.
 - timeout recovery keeps terminal usable for subsequent live output (no permanent error state).
 - timeout recovery performs one guarded auto-reattach attempt (`terminal.attach` only, no detach) to restore snapshot context; if it fails, continue in degraded live-output-only mode with warning.
 - auto-reattach guard scope: at most one automatic retry per `terminalId` per connection generation; if that retry also fails/times out, no further automatic retries until manual user action or generation changes.
 - Explicit timeout coordination:
-  - server in-flight frame timeout: 30s default (`WS_ATTACH_FRAME_SEND_TIMEOUT_MS`)
-  - client chunk completion timeout: 10s
+  - server in-flight frame timeout: 30s default (`ATTACH_FRAME_SEND_TIMEOUT_MS`, from env `WS_ATTACH_FRAME_SEND_TIMEOUT_MS`)
+  - client chunk completion timeout: 35s default (`ATTACH_CHUNK_TIMEOUT_MS`)
   - ws reconnect min delay after backpressure close: 5s
+  - invariant: `ATTACH_CHUNK_TIMEOUT_MS >= ATTACH_FRAME_SEND_TIMEOUT_MS + reconnectMinDelay`
   - client disconnect cleanup runs immediately and clears chunk buffers before timer fallback.
 
 ### Step 2. Implement client behavior
@@ -395,7 +434,7 @@ In `TerminalView.tsx`:
 - Add `useRef<Map<string, number>>` (or equivalent) for per-terminal chunk timeout timers.
 - Add `useRef<number>` (connection generation token) incremented on reconnect/disconnect cleanup.
 - Add `useRef<Set<string>>` for consumed auto-reattach guards keyed by `${terminalId}:${generation}`.
-- Add `const ATTACH_CHUNK_TIMEOUT_MS = 10_000`.
+- Add `const ATTACH_CHUNK_TIMEOUT_MS = 35_000`.
 - Handle:
   - `terminal.attached.start`
   - `terminal.attached.chunk`
