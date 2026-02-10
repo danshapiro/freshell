@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, closeTab, reorderTabs, updateTab, setActiveTab, openSessionTab, requestTabRename } from '@/store/tabsSlice'
-import { addPane, closePane, initLayout, replacePane, resetSplit, swapSplit, requestPaneRename } from '@/store/panesSlice'
+import { addPane, closePane, initLayout, replacePane, resetSplit, splitPane as splitPaneAction, swapSplit, requestPaneRename } from '@/store/panesSlice'
 import { setProjects, setProjectExpanded } from '@/store/sessionsSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'
@@ -705,6 +705,9 @@ export function ContextMenuProvider({
         moveTab,
         renamePane,
         replacePane: replacePaneAction,
+        splitPane: (tabId: string, paneId: string, direction: 'horizontal' | 'vertical') => {
+          dispatch(splitPaneAction({ tabId, paneId, direction, newContent: { kind: 'picker' } }))
+        },
         resetSplit: (tabId, splitId) => dispatch(resetSplit({ tabId, splitId })),
         swapSplit: (tabId, splitId) => dispatch(swapSplit({ tabId, splitId })),
         closePane: (tabId, paneId) => {

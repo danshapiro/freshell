@@ -6,6 +6,7 @@ import panesReducer, {
   closePane,
   setActivePane,
   resizePanes,
+  resizeMultipleSplits,
   updatePaneContent,
   replacePane,
   removeLayout,
@@ -13,6 +14,7 @@ import panesReducer, {
   updatePaneTitle,
   requestPaneRename,
   clearPaneRenameRequest,
+  toggleZoom,
   PanesState,
 } from '../../../../src/store/panesSlice'
 import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent, EditorPaneContent } from '../../../../src/store/paneTypes'
@@ -36,6 +38,7 @@ describe('panesSlice', () => {
       paneTitleSetByUser: {},
       renameRequestTabId: null,
       renameRequestPaneId: null,
+      zoomedPane: {},
     }
     mockIdCounter = 0
     vi.clearAllMocks()
@@ -509,6 +512,25 @@ describe('panesSlice', () => {
   })
 
   describe('closePane', () => {
+    // Helpers for constructing pane trees directly
+    function terminalContent(createRequestId: string): PaneContent {
+      return { kind: 'terminal', createRequestId, status: 'running', mode: 'shell' }
+    }
+
+    function makeClosePaneState(
+      layouts: Record<string, PaneNode>,
+      activePane: Record<string, string>
+    ): PanesState {
+      return {
+        layouts,
+        activePane,
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+      }
+    }
+
     it('does nothing when there is only one pane', () => {
       const content: PaneContent = { kind: 'terminal', mode: 'shell' }
       let state = panesReducer(
@@ -719,6 +741,104 @@ describe('panesSlice', () => {
       expect(result.paneTitles['tab-1']['pane-1']).toBeUndefined()
       expect(result.paneTitles['tab-1']['pane-2']).toBe('Second')
     })
+
+    // --- Sibling promotion tests ---
+
+    it('promotes sibling when closing right child of a split', () => {
+      const tabId = 'tab1'
+      const leftLeaf: PaneNode = { type: 'leaf', id: 'left', content: terminalContent('left-req') }
+      const rightLeaf: PaneNode = { type: 'leaf', id: 'right', content: terminalContent('right-req') }
+      const root: PaneNode = {
+        type: 'split', id: 'split1', direction: 'horizontal',
+        sizes: [60, 40], children: [leftLeaf, rightLeaf],
+      }
+      const state = makeClosePaneState({ [tabId]: root }, { [tabId]: 'right' })
+      const result = panesReducer(state, closePane({ tabId, paneId: 'right' }))
+      // Root should now be the left leaf directly (promoted)
+      expect(result.layouts[tabId]).toEqual(leftLeaf)
+      expect(result.activePane[tabId]).toBe('left')
+    })
+
+    it('promotes sibling when closing left child of a split', () => {
+      const tabId = 'tab1'
+      const leftLeaf: PaneNode = { type: 'leaf', id: 'left', content: terminalContent('left-req') }
+      const rightLeaf: PaneNode = { type: 'leaf', id: 'right', content: terminalContent('right-req') }
+      const root: PaneNode = {
+        type: 'split', id: 'split1', direction: 'vertical',
+        sizes: [50, 50], children: [leftLeaf, rightLeaf],
+      }
+      const state = makeClosePaneState({ [tabId]: root }, { [tabId]: 'left' })
+      const result = panesReducer(state, closePane({ tabId, paneId: 'left' }))
+      expect(result.layouts[tabId]).toEqual(rightLeaf)
+      expect(result.activePane[tabId]).toBe('right')
+    })
+
+    it('preserves tree structure when closing a pane in a nested split', () => {
+      // Setup: root is V-split(H-split(A, B), C)
+      // Action: close A
+      // Expected: root becomes V-split(B, C) -- B promoted to replace H-split
+      const tabId = 'tab1'
+      const a: PaneNode = { type: 'leaf', id: 'a', content: terminalContent('a-req') }
+      const b: PaneNode = { type: 'leaf', id: 'b', content: terminalContent('b-req') }
+      const c: PaneNode = { type: 'leaf', id: 'c', content: terminalContent('c-req') }
+      const innerSplit: PaneNode = {
+        type: 'split', id: 'inner', direction: 'horizontal',
+        sizes: [50, 50], children: [a, b],
+      }
+      const root: PaneNode = {
+        type: 'split', id: 'outer', direction: 'vertical',
+        sizes: [70, 30], children: [innerSplit, c],
+      }
+      const state = makeClosePaneState({ [tabId]: root }, { [tabId]: 'a' })
+      const result = panesReducer(state, closePane({ tabId, paneId: 'a' }))
+      // Outer split should remain with same sizes, but inner replaced by b
+      expect(result.layouts[tabId]).toEqual({
+        type: 'split', id: 'outer', direction: 'vertical',
+        sizes: [70, 30], children: [b, c],
+      })
+      expect(result.activePane[tabId]).toBe('b')
+    })
+
+    it('preserves deeply nested tree structure', () => {
+      // Setup: root = V-split(H-split(A, B), H-split(C, D))
+      // Close B
+      // Expected: root = V-split(A, H-split(C, D))
+      // H-split(C, D) is completely untouched including sizes
+      const tabId = 'tab1'
+      const a: PaneNode = { type: 'leaf', id: 'a', content: terminalContent('a-req') }
+      const b: PaneNode = { type: 'leaf', id: 'b', content: terminalContent('b-req') }
+      const c: PaneNode = { type: 'leaf', id: 'c', content: terminalContent('c-req') }
+      const d: PaneNode = { type: 'leaf', id: 'd', content: terminalContent('d-req') }
+      const top: PaneNode = {
+        type: 'split', id: 'top', direction: 'horizontal',
+        sizes: [40, 60], children: [a, b],
+      }
+      const bottom: PaneNode = {
+        type: 'split', id: 'bottom', direction: 'horizontal',
+        sizes: [30, 70], children: [c, d],
+      }
+      const root: PaneNode = {
+        type: 'split', id: 'root', direction: 'vertical',
+        sizes: [50, 50], children: [top, bottom],
+      }
+      const state = makeClosePaneState({ [tabId]: root }, { [tabId]: 'b' })
+      const result = panesReducer(state, closePane({ tabId, paneId: 'b' }))
+      expect(result.layouts[tabId]).toEqual({
+        type: 'split', id: 'root', direction: 'vertical',
+        sizes: [50, 50], children: [a, bottom],
+      })
+      // Untouched subtree should preserve referential identity (Immer structural sharing)
+      const resultRoot = result.layouts[tabId] as Extract<PaneNode, { type: 'split' }>
+      expect(resultRoot.children[1]).toBe(bottom)
+    })
+
+    it('does nothing when closing the only pane (leaf root)', () => {
+      const tabId = 'tab1'
+      const leaf: PaneNode = { type: 'leaf', id: 'only', content: terminalContent('only-req') }
+      const state = makeClosePaneState({ [tabId]: leaf }, { [tabId]: 'only' })
+      const result = panesReducer(state, closePane({ tabId, paneId: 'only' }))
+      expect(result.layouts[tabId]).toEqual(leaf)
+    })
   })
 
   describe('setActivePane', () => {
@@ -885,6 +1005,98 @@ describe('panesSlice', () => {
 
       const split = state.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
       expect(split.sizes).toEqual(originalSizes)
+    })
+  })
+
+  describe('resizeMultipleSplits', () => {
+    it('updates multiple splits at once', () => {
+      // Build a 2x2 grid: V-split(H-split(A, B), H-split(C, D))
+      const stateWithA = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
+      )
+      const paneAId = (stateWithA.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).id
+
+      // Split A vertically to get top/bottom
+      const stateWithAB = panesReducer(
+        stateWithA,
+        splitPane({ tabId: 'tab-1', paneId: paneAId, direction: 'vertical', newContent: { kind: 'terminal', mode: 'shell' } })
+      )
+      const vSplit = stateWithAB.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
+      const vSplitId = vSplit.id
+      const topPaneId = (vSplit.children[0] as Extract<PaneNode, { type: 'leaf' }>).id
+      const botPaneId = (vSplit.children[1] as Extract<PaneNode, { type: 'leaf' }>).id
+
+      // Split top pane horizontally
+      const stateWithTop = panesReducer(
+        stateWithAB,
+        splitPane({ tabId: 'tab-1', paneId: topPaneId, direction: 'horizontal', newContent: { kind: 'terminal', mode: 'shell' } })
+      )
+      const root1 = stateWithTop.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
+      const topHSplit = root1.children[0] as Extract<PaneNode, { type: 'split' }>
+      const topHSplitId = topHSplit.id
+
+      // Split bottom pane horizontally
+      const stateWithAll = panesReducer(
+        stateWithTop,
+        splitPane({ tabId: 'tab-1', paneId: botPaneId, direction: 'horizontal', newContent: { kind: 'terminal', mode: 'shell' } })
+      )
+      const root2 = stateWithAll.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
+      const botHSplit = root2.children[1] as Extract<PaneNode, { type: 'split' }>
+      const botHSplitId = botHSplit.id
+
+      // Now resize both H-splits and the V-split in one action
+      const finalState = panesReducer(
+        stateWithAll,
+        resizeMultipleSplits({
+          tabId: 'tab-1',
+          resizes: [
+            { splitId: topHSplitId, sizes: [60, 40] },
+            { splitId: botHSplitId, sizes: [60, 40] },
+            { splitId: vSplitId, sizes: [40, 60] },
+          ],
+        })
+      )
+
+      const finalRoot = finalState.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
+      expect(finalRoot.sizes).toEqual([40, 60])
+      const finalTopH = finalRoot.children[0] as Extract<PaneNode, { type: 'split' }>
+      expect(finalTopH.sizes).toEqual([60, 40])
+      const finalBotH = finalRoot.children[1] as Extract<PaneNode, { type: 'split' }>
+      expect(finalBotH.sizes).toEqual([60, 40])
+    })
+
+    it('does nothing if tab layout does not exist', () => {
+      const state = panesReducer(
+        initialState,
+        resizeMultipleSplits({
+          tabId: 'non-existent',
+          resizes: [{ splitId: 's1', sizes: [60, 40] }],
+        })
+      )
+      expect(state).toEqual(initialState)
+    })
+
+    it('preserves sizes of splits not in the resizes array', () => {
+      // Build a simple H-split(A, B) with [50,50]
+      const s1 = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
+      )
+      const pId = (s1.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).id
+      const s2 = panesReducer(
+        s1,
+        splitPane({ tabId: 'tab-1', paneId: pId, direction: 'horizontal', newContent: { kind: 'terminal', mode: 'shell' } })
+      )
+      const splitId = (s2.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>).id
+
+      // Resize with empty array - nothing changes
+      const s3 = panesReducer(
+        s2,
+        resizeMultipleSplits({ tabId: 'tab-1', resizes: [] })
+      )
+      const split = s3.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
+      expect(split.sizes).toEqual([50, 50])
     })
   })
 
@@ -1197,6 +1409,7 @@ describe('panesSlice', () => {
         paneTitleSetByUser: {},
         renameRequestTabId: null,
         renameRequestPaneId: null,
+        zoomedPane: {},
       }
 
       const state = panesReducer(initialState, hydratePanes(savedState))
@@ -1248,6 +1461,7 @@ describe('panesSlice', () => {
         paneTitleSetByUser: {},
         renameRequestTabId: null,
         renameRequestPaneId: null,
+        zoomedPane: {},
       }
 
       const state = panesReducer(initialState, hydratePanes(savedState))
@@ -1648,17 +1862,30 @@ describe('panesSlice', () => {
     })
   })
 
-  describe('addPane (grid layout)', () => {
+  describe('addPane', () => {
+    // Helper to construct state with explicit layouts and activePane
+    function terminalContent(createRequestId: string): PaneContent {
+      return { kind: 'terminal', createRequestId, status: 'running', mode: 'shell' }
+    }
+
+    function makeState(
+      layouts: Record<string, PaneNode>,
+      activePane: Record<string, string>
+    ): PanesState {
+      return {
+        layouts,
+        activePane,
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+      }
+    }
+
     // Helper to count leaves in a pane tree
     function countLeaves(node: PaneNode): number {
       if (node.type === 'leaf') return 1
       return countLeaves(node.children[0]) + countLeaves(node.children[1])
-    }
-
-    // Helper to collect all leaf contents in order (left-to-right, top-to-bottom)
-    function collectLeaves(node: PaneNode): PaneContent[] {
-      if (node.type === 'leaf') return [node.content]
-      return [...collectLeaves(node.children[0]), ...collectLeaves(node.children[1])]
     }
 
     it('does nothing if layout does not exist', () => {
@@ -1669,178 +1896,77 @@ describe('panesSlice', () => {
       expect(state.layouts['non-existent']).toBeUndefined()
     })
 
-    it('adds 2nd pane: creates horizontal split [1][2]', () => {
-      // Start with 1 pane
-      let state = panesReducer(
-        initialState,
-        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
-      )
-
-      // Add 2nd pane
-      state = panesReducer(
-        state,
-        addPane({ tabId: 'tab-1', newContent: { kind: 'terminal', mode: 'claude' } })
-      )
-
-      const root = state.layouts['tab-1']
+    it('falls back to first leaf when no active pane is set', () => {
+      const tabId = 'tab1'
+      const leaf: PaneNode = { type: 'leaf', id: 'only', content: terminalContent('only-req') }
+      // activePane is empty — no active pane set for this tab
+      const state = makeState({ [tabId]: leaf }, {})
+      const result = panesReducer(state, addPane({ tabId, newContent: { kind: 'picker' } }))
+      // Should still split the only leaf
+      const root = result.layouts[tabId]
       expect(root.type).toBe('split')
-      expect(countLeaves(root)).toBe(2)
-
-      const split = root as Extract<PaneNode, { type: 'split' }>
-      expect(split.direction).toBe('horizontal')
-      expect(split.children[0].type).toBe('leaf')
-      expect(split.children[1].type).toBe('leaf')
-
-      const leaves = collectLeaves(root)
-      expect(leaves[0].kind).toBe('terminal')
-      expect((leaves[0] as any).mode).toBe('shell')
-      expect(leaves[1].kind).toBe('terminal')
-      expect((leaves[1] as any).mode).toBe('claude')
+      if (root.type !== 'split') return
+      expect(root.children[0]).toEqual(leaf)
+      expect(root.children[1].type).toBe('leaf')
     })
 
-    it('adds 3rd pane: [1][2] on top, [3] full width bottom', () => {
-      // Start with 1 pane
-      let state = panesReducer(
-        initialState,
-        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
-      )
-
-      // Add 2nd pane
-      state = panesReducer(
-        state,
-        addPane({ tabId: 'tab-1', newContent: { kind: 'terminal', mode: 'claude' } })
-      )
-
-      // Add 3rd pane
-      state = panesReducer(
-        state,
-        addPane({ tabId: 'tab-1', newContent: { kind: 'terminal', mode: 'codex' } })
-      )
-
-      const root = state.layouts['tab-1']
-      expect(countLeaves(root)).toBe(3)
-
-      // Structure: vertical split with top row (horizontal split) and bottom (single pane)
+    it('splits the active pane to the right', () => {
+      const tabId = 'tab1'
+      const leaf: PaneNode = { type: 'leaf', id: 'active', content: terminalContent('active-req') }
+      const state = makeState({ [tabId]: leaf }, { [tabId]: 'active' })
+      const result = panesReducer(state, addPane({
+        tabId,
+        newContent: { kind: 'picker' },
+      }))
+      // Root should be a horizontal split with active pane on left, new pane on right
+      const root = result.layouts[tabId]
       expect(root.type).toBe('split')
-      const outerSplit = root as Extract<PaneNode, { type: 'split' }>
-      expect(outerSplit.direction).toBe('vertical')
-
-      // Top row: horizontal split of [1][2]
-      expect(outerSplit.children[0].type).toBe('split')
-      const topRow = outerSplit.children[0] as Extract<PaneNode, { type: 'split' }>
-      expect(topRow.direction).toBe('horizontal')
-      expect(topRow.children[0].type).toBe('leaf')
-      expect(topRow.children[1].type).toBe('leaf')
-
-      // Bottom row: single pane [3]
-      expect(outerSplit.children[1].type).toBe('leaf')
-
-      const leaves = collectLeaves(root)
-      expect((leaves[0] as any).mode).toBe('shell')
-      expect((leaves[1] as any).mode).toBe('claude')
-      expect((leaves[2] as any).mode).toBe('codex')
-    })
-
-    it('adds 4th pane: 2x2 grid [1][2] / [3][4]', () => {
-      let state = panesReducer(
-        initialState,
-        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
-      )
-
-      // Add panes 2, 3, 4
-      state = panesReducer(state, addPane({ tabId: 'tab-1', newContent: { kind: 'terminal', mode: 'claude' } }))
-      state = panesReducer(state, addPane({ tabId: 'tab-1', newContent: { kind: 'terminal', mode: 'codex' } }))
-      state = panesReducer(state, addPane({ tabId: 'tab-1', newContent: { kind: 'browser', url: 'https://example.com', devToolsOpen: false } }))
-
-      const root = state.layouts['tab-1']
-      expect(countLeaves(root)).toBe(4)
-
-      // Structure: vertical split with two horizontal splits
-      expect(root.type).toBe('split')
-      const outerSplit = root as Extract<PaneNode, { type: 'split' }>
-      expect(outerSplit.direction).toBe('vertical')
-
-      // Top row: [1][2]
-      expect(outerSplit.children[0].type).toBe('split')
-      const topRow = outerSplit.children[0] as Extract<PaneNode, { type: 'split' }>
-      expect(topRow.direction).toBe('horizontal')
-
-      // Bottom row: [3][4]
-      expect(outerSplit.children[1].type).toBe('split')
-      const bottomRow = outerSplit.children[1] as Extract<PaneNode, { type: 'split' }>
-      expect(bottomRow.direction).toBe('horizontal')
-
-      const leaves = collectLeaves(root)
-      expect((leaves[0] as any).mode).toBe('shell')
-      expect((leaves[1] as any).mode).toBe('claude')
-      expect((leaves[2] as any).mode).toBe('codex')
-      expect(leaves[3].kind).toBe('browser')
-    })
-
-    it('adds 5th pane: [1][2][3] on top, [4][5] on bottom', () => {
-      let state = panesReducer(
-        initialState,
-        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
-      )
-
-      // Add panes 2-5
-      for (let i = 2; i <= 5; i++) {
-        state = panesReducer(state, addPane({ tabId: 'tab-1', newContent: { kind: 'terminal', mode: 'shell' } }))
+      if (root.type !== 'split') return
+      expect(root.direction).toBe('horizontal')
+      expect(root.sizes).toEqual([50, 50])
+      expect(root.children[0]).toEqual(leaf) // Original pane preserved
+      expect(root.children[1].type).toBe('leaf')
+      if (root.children[1].type === 'leaf') {
+        expect(root.children[1].content.kind).toBe('picker')
       }
-
-      const root = state.layouts['tab-1']
-      expect(countLeaves(root)).toBe(5)
-
-      // Top row should have 3 panes, bottom row should have 2
-      const outerSplit = root as Extract<PaneNode, { type: 'split' }>
-      expect(outerSplit.direction).toBe('vertical')
-
-      // Top row: 3 panes
-      expect(countLeaves(outerSplit.children[0])).toBe(3)
-      // Bottom row: 2 panes
-      expect(countLeaves(outerSplit.children[1])).toBe(2)
     })
 
-    it('adds 6th pane: 3x2 grid [1][2][3] / [4][5][6]', () => {
-      let state = panesReducer(
-        initialState,
-        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
-      )
-
-      // Add panes 2-6
-      for (let i = 2; i <= 6; i++) {
-        state = panesReducer(state, addPane({ tabId: 'tab-1', newContent: { kind: 'terminal', mode: 'shell' } }))
+    it('splits only the active pane, preserving the rest of the tree', () => {
+      // Setup: H-split(A, B), A is active
+      // Action: addPane
+      // Expected: H-split(H-split(A, new), B) — only A was split
+      const tabId = 'tab1'
+      const a: PaneNode = { type: 'leaf', id: 'a', content: terminalContent('a-req') }
+      const b: PaneNode = { type: 'leaf', id: 'b', content: terminalContent('b-req') }
+      const root: PaneNode = {
+        type: 'split', id: 'split1', direction: 'horizontal',
+        sizes: [50, 50], children: [a, b],
       }
-
-      const root = state.layouts['tab-1']
-      expect(countLeaves(root)).toBe(6)
-
-      const outerSplit = root as Extract<PaneNode, { type: 'split' }>
-      expect(outerSplit.direction).toBe('vertical')
-
-      // Both rows should have 3 panes
-      expect(countLeaves(outerSplit.children[0])).toBe(3)
-      expect(countLeaves(outerSplit.children[1])).toBe(3)
+      const state = makeState({ [tabId]: root }, { [tabId]: 'a' })
+      const result = panesReducer(state, addPane({ tabId, newContent: { kind: 'picker' } }))
+      const newRoot = result.layouts[tabId]
+      expect(newRoot.type).toBe('split')
+      if (newRoot.type !== 'split') return
+      // B should be completely untouched
+      expect(newRoot.children[1]).toBe(b)
+      // A's position should now contain a split
+      expect(newRoot.children[0].type).toBe('split')
     })
 
     it('sets the new pane as active', () => {
-      let state = panesReducer(
-        initialState,
-        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
-      )
-
-      state = panesReducer(
-        state,
-        addPane({ tabId: 'tab-1', newContent: { kind: 'terminal', mode: 'claude' } })
-      )
-
-      // Find the new pane (should be the second leaf)
-      const root = state.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
-      const newPane = root.children[1] as Extract<PaneNode, { type: 'leaf' }>
-      expect(state.activePane['tab-1']).toBe(newPane.id)
+      const tabId = 'tab1'
+      const leaf: PaneNode = { type: 'leaf', id: 'active', content: terminalContent('active-req') }
+      const state = makeState({ [tabId]: leaf }, { [tabId]: 'active' })
+      const result = panesReducer(state, addPane({ tabId, newContent: { kind: 'picker' } }))
+      expect(result.activePane[tabId]).not.toBe('active')
+      // Active should be the new pane's id
+      const root = result.layouts[tabId]
+      if (root.type === 'split' && root.children[1].type === 'leaf') {
+        expect(result.activePane[tabId]).toBe(root.children[1].id)
+      }
     })
 
-    it('preserves existing pane IDs when restructuring', () => {
+    it('preserves existing pane IDs when splitting', () => {
       let state = panesReducer(
         initialState,
         initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
@@ -1856,45 +1982,6 @@ describe('panesSlice', () => {
       const root = state.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
       const firstPane = root.children[0] as Extract<PaneNode, { type: 'leaf' }>
       expect(firstPane.id).toBe(pane1Id)
-    })
-
-    it('preserves pane contents when restructuring for 3rd pane', () => {
-      let state = panesReducer(
-        initialState,
-        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-1', status: 'running' } })
-      )
-      state = panesReducer(
-        state,
-        addPane({ tabId: 'tab-1', newContent: { kind: 'terminal', mode: 'claude', createRequestId: 'req-2', status: 'running' } })
-      )
-
-      // Capture pane IDs
-      const split2 = state.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
-      const pane1Id = (split2.children[0] as Extract<PaneNode, { type: 'leaf' }>).id
-      const pane2Id = (split2.children[1] as Extract<PaneNode, { type: 'leaf' }>).id
-
-      state = panesReducer(
-        state,
-        addPane({ tabId: 'tab-1', newContent: { kind: 'terminal', mode: 'codex', createRequestId: 'req-3', status: 'running' } })
-      )
-
-      // After restructure, original panes should have same IDs and content
-      const leaves = collectLeaves(state.layouts['tab-1'])
-      expect(leaves[0].kind).toBe('terminal')
-      expect((leaves[0] as any).createRequestId).toBe('req-1')
-      expect(leaves[1].kind).toBe('terminal')
-      expect((leaves[1] as any).createRequestId).toBe('req-2')
-      expect(leaves[2].kind).toBe('terminal')
-      expect((leaves[2] as any).createRequestId).toBe('req-3')
-
-      // Check IDs are preserved
-      function findLeafById(node: PaneNode, id: string): PaneNode | null {
-        if (node.type === 'leaf') return node.id === id ? node : null
-        return findLeafById(node.children[0], id) || findLeafById(node.children[1], id)
-      }
-
-      expect(findLeafById(state.layouts['tab-1'], pane1Id)).not.toBeNull()
-      expect(findLeafById(state.layouts['tab-1'], pane2Id)).not.toBeNull()
     })
 
     it('generates createRequestId for new terminal panes', () => {
@@ -1915,6 +2002,41 @@ describe('panesSlice', () => {
         expect(newPane.content.createRequestId).toBeDefined()
         expect(newPane.content.status).toBe('creating')
       }
+    })
+
+    it('preserves pane contents when adding a 3rd pane (splits active, not grid rebuild)', () => {
+      let state = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-1', status: 'running' } })
+      )
+      state = panesReducer(
+        state,
+        addPane({ tabId: 'tab-1', newContent: { kind: 'terminal', mode: 'claude', createRequestId: 'req-2', status: 'running' } })
+      )
+
+      // After first addPane: H-split(shell, claude) with claude as active
+      const split2 = state.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
+      const pane1Id = (split2.children[0] as Extract<PaneNode, { type: 'leaf' }>).id
+
+      // Add 3rd pane — should split the active (claude) pane, not rebuild grid
+      state = panesReducer(
+        state,
+        addPane({ tabId: 'tab-1', newContent: { kind: 'terminal', mode: 'codex', createRequestId: 'req-3', status: 'running' } })
+      )
+
+      // Root should still be H-split; left child is original shell pane
+      const root = state.layouts['tab-1']
+      expect(root.type).toBe('split')
+      if (root.type !== 'split') return
+      expect(root.direction).toBe('horizontal')
+      // Left child should be the original shell pane (untouched)
+      expect(root.children[0].type).toBe('leaf')
+      const leftLeaf = root.children[0] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leftLeaf.id).toBe(pane1Id)
+      // Right child should now be a split (claude | codex)
+      expect(root.children[1].type).toBe('split')
+
+      expect(countLeaves(root)).toBe(3)
     })
   })
 
@@ -2184,6 +2306,195 @@ describe('panesSlice', () => {
       const root = state.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
       const editorPane = root.children[1] as Extract<PaneNode, { type: 'leaf' }>
       expect(editorPane.content.kind).toBe('editor')
+    })
+  })
+
+  describe('toggleZoom', () => {
+    function terminalContent(createRequestId: string): PaneContent {
+      return { kind: 'terminal', createRequestId, status: 'running', mode: 'shell' }
+    }
+
+    function makeZoomState(
+      layouts: Record<string, PaneNode>,
+      activePane: Record<string, string>,
+      zoomedPane: Record<string, string | undefined> = {}
+    ): PanesState {
+      return {
+        layouts,
+        activePane,
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane,
+      }
+    }
+
+    it('sets zoomedPane when not zoomed', () => {
+      const tabId = 'tab1'
+      const leaf: PaneNode = { type: 'leaf', id: 'pane-a', content: terminalContent('a-req') }
+      const state = makeZoomState({ [tabId]: leaf }, { [tabId]: 'pane-a' })
+
+      const result = panesReducer(state, toggleZoom({ tabId, paneId: 'pane-a' }))
+
+      expect(result.zoomedPane[tabId]).toBe('pane-a')
+    })
+
+    it('clears zoomedPane when same pane already zoomed (toggle off)', () => {
+      const tabId = 'tab1'
+      const leaf: PaneNode = { type: 'leaf', id: 'pane-a', content: terminalContent('a-req') }
+      const state = makeZoomState(
+        { [tabId]: leaf },
+        { [tabId]: 'pane-a' },
+        { [tabId]: 'pane-a' }
+      )
+
+      const result = panesReducer(state, toggleZoom({ tabId, paneId: 'pane-a' }))
+
+      expect(result.zoomedPane[tabId]).toBeUndefined()
+    })
+
+    it('switches zoom to different pane', () => {
+      const tabId = 'tab1'
+      const a: PaneNode = { type: 'leaf', id: 'pane-a', content: terminalContent('a-req') }
+      const b: PaneNode = { type: 'leaf', id: 'pane-b', content: terminalContent('b-req') }
+      const root: PaneNode = {
+        type: 'split', id: 'split1', direction: 'horizontal',
+        sizes: [50, 50], children: [a, b],
+      }
+      const state = makeZoomState(
+        { [tabId]: root },
+        { [tabId]: 'pane-a' },
+        { [tabId]: 'pane-a' }
+      )
+
+      const result = panesReducer(state, toggleZoom({ tabId, paneId: 'pane-b' }))
+
+      expect(result.zoomedPane[tabId]).toBe('pane-b')
+    })
+
+    it('does not affect other tabs', () => {
+      const a: PaneNode = { type: 'leaf', id: 'pane-a', content: terminalContent('a-req') }
+      const b: PaneNode = { type: 'leaf', id: 'pane-b', content: terminalContent('b-req') }
+      const state = makeZoomState(
+        { 'tab1': a, 'tab2': b },
+        { 'tab1': 'pane-a', 'tab2': 'pane-b' },
+        { 'tab2': 'pane-b' }
+      )
+
+      const result = panesReducer(state, toggleZoom({ tabId: 'tab1', paneId: 'pane-a' }))
+
+      expect(result.zoomedPane['tab1']).toBe('pane-a')
+      expect(result.zoomedPane['tab2']).toBe('pane-b')
+    })
+  })
+
+  describe('closePane clears zoom', () => {
+    function terminalContent(createRequestId: string): PaneContent {
+      return { kind: 'terminal', createRequestId, status: 'running', mode: 'shell' }
+    }
+
+    it('clears zoom when zoomed pane is closed', () => {
+      const tabId = 'tab1'
+      const a: PaneNode = { type: 'leaf', id: 'pane-a', content: terminalContent('a-req') }
+      const b: PaneNode = { type: 'leaf', id: 'pane-b', content: terminalContent('b-req') }
+      const root: PaneNode = {
+        type: 'split', id: 'split1', direction: 'horizontal',
+        sizes: [50, 50], children: [a, b],
+      }
+      const state: PanesState = {
+        layouts: { [tabId]: root },
+        activePane: { [tabId]: 'pane-b' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: { [tabId]: 'pane-b' },
+      }
+
+      const result = panesReducer(state, closePane({ tabId, paneId: 'pane-b' }))
+
+      expect(result.zoomedPane[tabId]).toBeUndefined()
+    })
+
+    it('preserves zoom when non-zoomed pane is closed', () => {
+      const tabId = 'tab1'
+      const a: PaneNode = { type: 'leaf', id: 'pane-a', content: terminalContent('a-req') }
+      const b: PaneNode = { type: 'leaf', id: 'pane-b', content: terminalContent('b-req') }
+      const root: PaneNode = {
+        type: 'split', id: 'split1', direction: 'horizontal',
+        sizes: [50, 50], children: [a, b],
+      }
+      const state: PanesState = {
+        layouts: { [tabId]: root },
+        activePane: { [tabId]: 'pane-a' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: { [tabId]: 'pane-a' },
+      }
+
+      const result = panesReducer(state, closePane({ tabId, paneId: 'pane-b' }))
+
+      expect(result.zoomedPane[tabId]).toBe('pane-a')
+    })
+  })
+
+  describe('addPane clears zoom', () => {
+    it('clears zoom when adding a pane while zoomed', () => {
+      const tabId = 'tab1'
+      const a: PaneNode = { type: 'leaf', id: 'pane-a', content: { kind: 'terminal', createRequestId: 'a-req', status: 'running', mode: 'shell' } }
+      const b: PaneNode = { type: 'leaf', id: 'pane-b', content: { kind: 'terminal', createRequestId: 'b-req', status: 'running', mode: 'shell' } }
+      const root: PaneNode = {
+        type: 'split', id: 'split1', direction: 'horizontal',
+        sizes: [50, 50], children: [a, b],
+      }
+      const state: PanesState = {
+        layouts: { [tabId]: root },
+        activePane: { [tabId]: 'pane-a' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: { [tabId]: 'pane-a' },
+      }
+
+      const result = panesReducer(state, addPane({ tabId, newContent: { kind: 'picker' } }))
+
+      // Zoom should be cleared so the new pane is visible
+      expect(result.zoomedPane[tabId]).toBeUndefined()
+    })
+  })
+
+  describe('splitPane clears zoom', () => {
+    it('clears zoom when splitting a pane while zoomed', () => {
+      const tabId = 'tab1'
+      const a: PaneNode = { type: 'leaf', id: 'pane-a', content: { kind: 'terminal', createRequestId: 'a-req', status: 'running', mode: 'shell' } }
+      const b: PaneNode = { type: 'leaf', id: 'pane-b', content: { kind: 'terminal', createRequestId: 'b-req', status: 'running', mode: 'shell' } }
+      const root: PaneNode = {
+        type: 'split', id: 'split1', direction: 'horizontal',
+        sizes: [50, 50], children: [a, b],
+      }
+      const state: PanesState = {
+        layouts: { [tabId]: root },
+        activePane: { [tabId]: 'pane-a' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: { [tabId]: 'pane-a' },
+      }
+
+      const result = panesReducer(state, splitPane({
+        tabId,
+        paneId: 'pane-a',
+        direction: 'horizontal',
+        newContent: { kind: 'picker' },
+      }))
+
+      // Zoom should be cleared so the new pane is visible
+      expect(result.zoomedPane[tabId]).toBeUndefined()
     })
   })
 })

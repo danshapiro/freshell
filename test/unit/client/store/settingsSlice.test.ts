@@ -48,6 +48,7 @@ describe('settingsSlice', () => {
       })
       expect(state.settings.panes).toEqual({
         defaultNewPane: 'ask',
+        snapThreshold: 2,
         iconsOnTabs: true,
       })
       expect(state.settings.codingCli).toEqual({
@@ -117,6 +118,7 @@ describe('settingsSlice', () => {
         },
         panes: {
           defaultNewPane: 'shell',
+          snapThreshold: 2,
           iconsOnTabs: true,
         },
       }
@@ -437,6 +439,35 @@ describe('settingsSlice', () => {
       expect(state.settings.panes.iconsOnTabs).toBe(false)
       expect(state.settings.panes.defaultNewPane).toBe('ask')
     })
+  })
+})
+
+describe('mergeSettings – panes.snapThreshold', () => {
+  it('merges panes.snapThreshold without clobbering defaultNewPane', () => {
+    const base = { ...defaultSettings }
+    const patch = { panes: { snapThreshold: 6 } }
+    const result = mergeSettings(base, patch as any)
+    expect(result.panes.snapThreshold).toBe(6)
+    expect(result.panes.defaultNewPane).toBe('ask') // preserved
+  })
+
+  it('defaults panes.snapThreshold to 2', () => {
+    expect(defaultSettings.panes.snapThreshold).toBe(2)
+  })
+
+  it('preserves snapThreshold when patching defaultNewPane', () => {
+    const base = { ...defaultSettings, panes: { ...defaultSettings.panes, snapThreshold: 7 } }
+    const patch = { panes: { defaultNewPane: 'shell' as const } }
+    const result = mergeSettings(base, patch as any)
+    expect(result.panes.defaultNewPane).toBe('shell')
+    expect(result.panes.snapThreshold).toBe(7)
+  })
+
+  it('allows snapThreshold to be set to 0 (off)', () => {
+    const base = { ...defaultSettings }
+    const patch = { panes: { snapThreshold: 0 } }
+    const result = mergeSettings(base, patch as any)
+    expect(result.panes.snapThreshold).toBe(0)
   })
 })
 

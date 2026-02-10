@@ -47,6 +47,7 @@ function createTestStore(defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor' 
           },
           panes: {
             defaultNewPane,
+            snapThreshold: 2,
             iconsOnTabs: true,
           },
           codingCli: {
@@ -120,5 +121,28 @@ describe('SettingsView Panes section', () => {
     expect(options[1]).toHaveValue('shell')
     expect(options[2]).toHaveValue('browser')
     expect(options[3]).toHaveValue('editor')
+  })
+
+  it('renders Snap distance slider', () => {
+    const store = createTestStore()
+    render(
+      <Provider store={store}>
+        <SettingsView />
+      </Provider>
+    )
+
+    expect(screen.getByText('Snap distance')).toBeInTheDocument()
+  })
+
+  it('shows snap distance slider with default value', () => {
+    const store = createTestStore()
+    render(
+      <Provider store={store}>
+        <SettingsView />
+      </Provider>
+    )
+
+    // The slider should show "2%" for the default value
+    expect(screen.getByText('2%')).toBeInTheDocument()
   })
 })

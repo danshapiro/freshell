@@ -44,6 +44,12 @@ vi.mock('lucide-react', () => ({
   FileText: ({ className }: { className?: string }) => (
     <svg data-testid="file-text-icon" className={className} />
   ),
+  Maximize2: ({ className }: { className?: string }) => (
+    <svg data-testid="maximize-icon" className={className} />
+  ),
+  Minimize2: ({ className }: { className?: string }) => (
+    <svg data-testid="minimize-icon" className={className} />
+  ),
   LayoutGrid: ({ className }: { className?: string }) => (
     <svg data-testid="layout-grid-icon" className={className} />
   ),
@@ -94,6 +100,10 @@ function createStore(initialPanesState: Partial<PanesState> = {}) {
         layouts: {},
         activePane: {},
         paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
         ...initialPanesState,
       },
       tabs: {
@@ -466,7 +476,7 @@ describe('PaneLayout', () => {
   })
 
   describe('edge cases', () => {
-    it('adds pane even when no active pane is set (grid layout does not require active pane)', async () => {
+    it('adds pane even when no active pane is set (falls back to first leaf)', async () => {
       const paneId = 'pane-1'
       const store = createStore({
         layouts: {
@@ -484,7 +494,7 @@ describe('PaneLayout', () => {
         store
       )
 
-      // Click FAB to add picker pane - with grid layout, this works without active pane
+      // Click FAB to add picker pane - falls back to first leaf when no active pane is set
       fireEvent.click(screen.getByTitle('Add pane'))
 
       // Layout should now be a split with 2 panes
@@ -523,6 +533,62 @@ describe('PaneLayout', () => {
       state = store.getState().panes
       // Should have 3 panes now in a nested structure
       expect(state.activePane['tab-1']).not.toBe(firstNewPaneId)
+    })
+  })
+
+  describe('zoom escape key', () => {
+    it('does not unzoom when tab is hidden (background tab)', () => {
+      const paneId = 'pane-1'
+      const store = createStore({
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: paneId,
+            content: createTerminalContent(),
+          },
+        },
+        activePane: { 'tab-1': paneId },
+        zoomedPane: { 'tab-1': paneId },
+      })
+
+      renderWithStore(
+        <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} hidden={true} />,
+        store
+      )
+
+      // Press Escape on a hidden (background) tab
+      fireEvent.keyDown(document, { key: 'Escape' })
+
+      // Zoom state should NOT have changed - background tabs ignore Escape
+      const state = store.getState().panes
+      expect(state.zoomedPane['tab-1']).toBe(paneId)
+    })
+
+    it('unzooms when tab is visible (not hidden)', () => {
+      const paneId = 'pane-1'
+      const store = createStore({
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: paneId,
+            content: createTerminalContent(),
+          },
+        },
+        activePane: { 'tab-1': paneId },
+        zoomedPane: { 'tab-1': paneId },
+      })
+
+      renderWithStore(
+        <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} hidden={false} />,
+        store
+      )
+
+      // Press Escape on a visible tab
+      fireEvent.keyDown(document, { key: 'Escape' })
+
+      // Zoom state should be cleared
+      const state = store.getState().panes
+      expect(state.zoomedPane['tab-1']).toBeUndefined()
     })
   })
 

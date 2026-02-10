@@ -61,6 +61,12 @@ vi.mock('lucide-react', () => ({
   Circle: ({ className }: { className?: string }) => (
     <svg data-testid="circle-icon" className={className} />
   ),
+  Maximize2: ({ className }: { className?: string }) => (
+    <svg data-testid="maximize-icon" className={className} />
+  ),
+  Minimize2: ({ className }: { className?: string }) => (
+    <svg data-testid="minimize-icon" className={className} />
+  ),
   LayoutGrid: ({ className }: { className?: string }) => (
     <svg data-testid="layout-grid-icon" className={className} />
   ),

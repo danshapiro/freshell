@@ -566,7 +566,7 @@ export default function SettingsView() {
           </SettingsSection>
 
           {/* Panes */}
-          <SettingsSection title="Panes" description="New pane behavior">
+          <SettingsSection title="Panes" description="Pane layout and behavior">
             <SettingsRow label="Default new pane">
               <select
                 aria-label="Default new pane"
@@ -583,6 +583,21 @@ export default function SettingsView() {
                 <option value="browser">Browser</option>
                 <option value="editor">Editor</option>
               </select>
+            </SettingsRow>
+
+            <SettingsRow label="Snap distance">
+              <RangeSlider
+                value={settings.panes?.snapThreshold ?? 2}
+                min={0}
+                max={8}
+                step={1}
+                labelWidth="w-10"
+                format={(v) => v === 0 ? 'Off' : `${v}%`}
+                onChange={(v) => {
+                  dispatch(updateSettingsLocal({ panes: { snapThreshold: v } } as any))
+                  scheduleSave({ panes: { snapThreshold: v } })
+                }}
+              />
             </SettingsRow>
 
             <SettingsRow label="Icons on tabs">

@@ -111,6 +111,12 @@ export interface PanesState {
    */
   renameRequestTabId: string | null
   renameRequestPaneId: string | null
+  /**
+   * Ephemeral zoom state: map of tabId -> zoomed paneId.
+   * When set, only the zoomed pane renders; the rest of the tree is hidden but preserved.
+   * Must never be persisted.
+   */
+  zoomedPane: Record<string, string | undefined>
 }
 
 /**

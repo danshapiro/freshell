@@ -22,6 +22,7 @@ export type MenuActions = {
   moveTab: (tabId: string, dir: -1 | 1) => void
   renamePane: (tabId: string, paneId: string) => void
   replacePane: (tabId: string, paneId: string) => void
+  splitPane: (tabId: string, paneId: string, direction: 'horizontal' | 'vertical') => void
   resetSplit: (tabId: string, splitId: string) => void
   swapSplit: (tabId: string, splitId: string) => void
   closePane: (tabId: string, paneId: string) => void
@@ -231,6 +232,9 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       : []
     return [
       ...paneResumeMenuItem,
+      { type: 'item', id: 'split-right', label: 'Split right', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'horizontal') },
+      { type: 'item', id: 'split-down', label: 'Split down', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'vertical') },
+      { type: 'separator', id: 'pane-split-sep' },
       { type: 'item', id: 'rename-pane', label: 'Rename pane', onSelect: () => actions.renamePane(target.tabId, target.paneId) },
       { type: 'separator', id: 'pane-replace-sep' },
       { type: 'item', id: 'replace-pane', label: 'Replace pane', onSelect: () => actions.replacePane(target.tabId, target.paneId) },

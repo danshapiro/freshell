@@ -143,6 +143,7 @@ export interface AppSettings {
   codingCli: CodingCliSettings
   panes: {
     defaultNewPane: DefaultNewPane
+    snapThreshold: number // 0-8, % of container's smallest dimension; 0 = off
     iconsOnTabs: boolean
   }
 }

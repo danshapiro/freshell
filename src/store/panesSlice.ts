@@ -172,6 +172,7 @@ function loadInitialPanesState(): PanesState {
     paneTitleSetByUser: {},
     renameRequestTabId: null,
     renameRequestPaneId: null,
+    zoomedPane: {},
   }
 
   try {
@@ -188,6 +189,7 @@ function loadInitialPanesState(): PanesState {
       paneTitleSetByUser: loaded.paneTitleSetByUser || {},
       renameRequestTabId: null,
       renameRequestPaneId: null,
+      zoomedPane: {},
     }
     state = applyLegacyResumeSessionIds(state)
     state = cleanOrphanedLayouts(state)
@@ -240,74 +242,10 @@ function collectLeaves(node: PaneNode): Extract<PaneNode, { type: 'leaf' }>[] {
   return [...collectLeaves(node.children[0]), ...collectLeaves(node.children[1])]
 }
 
-// Helper to create a horizontal split from an array of leaves
-function buildHorizontalRow(leaves: Extract<PaneNode, { type: 'leaf' }>[]): PaneNode {
-  if (leaves.length === 1) return leaves[0]
-  if (leaves.length === 2) {
-    return {
-      type: 'split',
-      id: nanoid(),
-      direction: 'horizontal',
-      sizes: [50, 50],
-      children: [leaves[0], leaves[1]],
-    }
-  }
-  // For 3+ panes in a row, nest horizontally: [a, [b, c]] -> [a, [b, [c, d]]] etc.
-  // Or use a more balanced approach: split in half
-  const mid = Math.ceil(leaves.length / 2)
-  const left = leaves.slice(0, mid)
-  const right = leaves.slice(mid)
-  return {
-    type: 'split',
-    id: nanoid(),
-    direction: 'horizontal',
-    sizes: [50, 50],
-    children: [buildHorizontalRow(left), buildHorizontalRow(right)],
-  }
-}
-
-/**
- * Build a grid layout from leaves.
- * Pattern:
- * - 1 pane: single leaf
- * - 2 panes: [1][2] horizontal
- * - 3 panes: [1][2] top, [3] bottom (full width)
- * - 4 panes: [1][2] top, [3][4] bottom
- * - 5 panes: [1][2][3] top, [4][5] bottom
- * - 6 panes: [1][2][3] top, [4][5][6] bottom
- * - etc.
- */
-function buildGridLayout(leaves: Extract<PaneNode, { type: 'leaf' }>[]): PaneNode {
-  if (leaves.length === 1) return leaves[0]
-  if (leaves.length === 2) {
-    return {
-      type: 'split',
-      id: nanoid(),
-      direction: 'horizontal',
-      sizes: [50, 50],
-      children: [leaves[0], leaves[1]],
-    }
-  }
-
-  // For 3+ panes, use 2 rows with ceiling division for top row
-  // 3 panes: 2 top, 1 bottom
-  // 4 panes: 2 top, 2 bottom
-  // 5 panes: 3 top, 2 bottom
-  // 6 panes: 3 top, 3 bottom
-  const topCount = Math.ceil(leaves.length / 2)
-  const topLeaves = leaves.slice(0, topCount)
-  const bottomLeaves = leaves.slice(topCount)
-
-  const topRow = buildHorizontalRow(topLeaves)
-  const bottomRow = buildHorizontalRow(bottomLeaves)
-
-  return {
-    type: 'split',
-    id: nanoid(),
-    direction: 'vertical',
-    sizes: [50, 50],
-    children: [topRow, bottomRow],
-  }
+// Helper to find a leaf node by id in the tree
+function findLeaf(node: PaneNode, id: string): Extract<PaneNode, { type: 'leaf' }> | null {
+  if (node.type === 'leaf') return node.id === id ? node : null
+  return findLeaf(node.children[0], id) || findLeaf(node.children[1], id)
 }
 
 /**
@@ -421,15 +359,10 @@ export const panesSlice = createSlice({
       if (!root) return
 
       const newPaneId = nanoid()
+      const normalizedContent = normalizeContent(newContent)
 
-      // Find the target pane and get its content
-      function findPane(node: PaneNode, id: string): PaneNode | null {
-        if (node.type === 'leaf') return node.id === id ? node : null
-        return findPane(node.children[0], id) || findPane(node.children[1], id)
-      }
-
-      const targetPane = findPane(root, paneId)
-      if (!targetPane || targetPane.type !== 'leaf') return
+      const targetPane = findLeaf(root, paneId)
+      if (!targetPane) return
 
       // Create the split node
       const splitNode: PaneNode = {
@@ -439,7 +372,7 @@ export const panesSlice = createSlice({
         sizes: [50, 50],
         children: [
           { ...targetPane }, // Keep original pane
-          { type: 'leaf', id: newPaneId, content: normalizeContent(newContent) }, // New pane with normalized content
+          { type: 'leaf', id: newPaneId, content: normalizedContent },
         ],
       }
 
@@ -449,8 +382,12 @@ export const panesSlice = createSlice({
         state.layouts[tabId] = newRoot
         state.activePane[tabId] = newPaneId
 
+        // Clear zoom so the new pane is visible
+        if (state.zoomedPane?.[tabId]) {
+          delete state.zoomedPane[tabId]
+        }
+
         // Initialize title for new pane
-        const normalizedContent = normalizeContent(newContent)
         if (!state.paneTitles[tabId]) {
           state.paneTitles[tabId] = {}
         }
@@ -459,13 +396,9 @@ export const panesSlice = createSlice({
     },
 
     /**
-     * Add a pane using grid layout pattern.
-     * Restructures the entire layout to maintain the grid:
-     * - 2 panes: [1][2] side by side
-     * - 3 panes: [1][2] top, [3] bottom (full width)
-     * - 4 panes: [1][2] / [3][4] (2x2 grid)
-     * - 5 panes: [1][2][3] top, [4][5] bottom
-     * - etc.
+     * Add a pane by splitting the active pane horizontally (to the right).
+     * Preserves the existing layout structure instead of rebuilding a grid.
+     * The new pane is placed to the right of the active pane and becomes active.
      */
     addPane: (
       state,
@@ -478,27 +411,47 @@ export const panesSlice = createSlice({
       const root = state.layouts[tabId]
       if (!root) return
 
-      // Collect existing leaves
-      const existingLeaves = collectLeaves(root)
+      const activePaneId = state.activePane[tabId]
+
+      // Find the active pane; fall back to first leaf if active pane is missing
+      const activeLeaf = (activePaneId && findLeaf(root, activePaneId))
+        || collectLeaves(root)[0]
+      if (!activeLeaf) return
 
       // Create new leaf
       const newPaneId = nanoid()
-      const newLeaf: Extract<PaneNode, { type: 'leaf' }> = {
+      const normalizedContent = normalizeContent(newContent)
+      const newLeaf: PaneNode = {
         type: 'leaf',
         id: newPaneId,
-        content: normalizeContent(newContent),
+        content: normalizedContent,
       }
 
-      // Build new grid layout with all leaves
-      const allLeaves = [...existingLeaves, newLeaf]
-      state.layouts[tabId] = buildGridLayout(allLeaves)
+      // Replace the active pane with a horizontal split: [activePane, newPane]
+      const replacement: PaneNode = {
+        type: 'split',
+        id: nanoid(),
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [{ ...activeLeaf }, newLeaf],
+      }
+
+      const newRoot = findAndReplace(root, activeLeaf.id, replacement)
+      if (!newRoot) return
+
+      state.layouts[tabId] = newRoot
       state.activePane[tabId] = newPaneId
+
+      // Clear zoom so the new pane is visible
+      if (state.zoomedPane?.[tabId]) {
+        delete state.zoomedPane[tabId]
+      }
 
       // Initialize title for new pane
       if (!state.paneTitles[tabId]) {
         state.paneTitles[tabId] = {}
       }
-      state.paneTitles[tabId][newPaneId] = derivePaneTitle(newLeaf.content)
+      state.paneTitles[tabId][newPaneId] = derivePaneTitle(normalizedContent)
     },
 
     closePane: (
@@ -512,28 +465,56 @@ export const panesSlice = createSlice({
       // Can't close the only pane
       if (root.type === 'leaf') return
 
-      // Collect all leaves except the one being closed
-      const allLeaves = collectLeaves(root)
-      const remainingLeaves = allLeaves.filter(leaf => leaf.id !== paneId)
+      // Find the parent split containing the target pane and replace it
+      // with the surviving sibling. This preserves the rest of the tree
+      // structure exactly as the user arranged it.
+      // Returns [newTree, siblingNode] where siblingNode is the promoted sibling.
+      function removePane(node: PaneNode, targetId: string): [PaneNode, PaneNode] | null {
+        if (node.type === 'leaf') return null
 
-      // If no leaves remain (shouldn't happen), bail out
-      if (remainingLeaves.length === 0) return
+        const [left, right] = node.children
 
-      // Rebuild layout with remaining leaves using grid pattern
-      state.layouts[tabId] = buildGridLayout(remainingLeaves)
+        // Check if target is a direct child (leaf or split)
+        if (left.id === targetId) return [right, right]
+        if (right.id === targetId) return [left, left]
 
-      // Update active pane if needed
-      if (state.activePane[tabId] === paneId) {
-        // Set active to the last remaining leaf (similar to where the new pane would be)
-        state.activePane[tabId] = remainingLeaves[remainingLeaves.length - 1].id
+        // Recurse into children
+        const leftResult = removePane(left, targetId)
+        if (leftResult) {
+          return [{ ...node, children: [leftResult[0], right] }, leftResult[1]]
+        }
+        const rightResult = removePane(right, targetId)
+        if (rightResult) {
+          return [{ ...node, children: [left, rightResult[0]] }, rightResult[1]]
+        }
+        return null
       }
 
-      // Clean up pane title and user-set flag
-      if (state.paneTitles[tabId]?.[paneId]) {
-        delete state.paneTitles[tabId][paneId]
-      }
-      if (state.paneTitleSetByUser?.[tabId]?.[paneId]) {
-        delete state.paneTitleSetByUser[tabId][paneId]
+      const result = removePane(root, paneId)
+      if (result) {
+        const [newRoot, sibling] = result
+        state.layouts[tabId] = newRoot
+
+        // Update active pane if the closed pane was active.
+        // Focus the first leaf in the promoted sibling subtree — that's the
+        // pane that now occupies the space where the closed pane was.
+        if (state.activePane[tabId] === paneId) {
+          const siblingLeaves = collectLeaves(sibling)
+          state.activePane[tabId] = siblingLeaves[0].id
+        }
+
+        // Clean up pane title and user-set flag
+        if (state.paneTitles[tabId]?.[paneId]) {
+          delete state.paneTitles[tabId][paneId]
+        }
+        if (state.paneTitleSetByUser?.[tabId]?.[paneId]) {
+          delete state.paneTitleSetByUser[tabId][paneId]
+        }
+
+        // Clear zoom if the zoomed pane was closed
+        if (state.zoomedPane?.[tabId] === paneId) {
+          delete state.zoomedPane[tabId]
+        }
       }
     },
 
@@ -565,6 +546,31 @@ export const panesSlice = createSlice({
       }
 
       state.layouts[tabId] = updateSizes(root)
+    },
+
+    resizeMultipleSplits: (
+      state,
+      action: PayloadAction<{
+        tabId: string
+        resizes: Array<{ splitId: string; sizes: [number, number] }>
+      }>
+    ) => {
+      const { tabId, resizes } = action.payload
+      const root = state.layouts[tabId]
+      if (!root) return
+
+      function applySizes(node: PaneNode): PaneNode {
+        if (node.type === 'leaf') return node
+        const match = resizes.find(r => r.splitId === node.id)
+        const newSizes = match ? match.sizes : node.sizes
+        return {
+          ...node,
+          sizes: newSizes,
+          children: [applySizes(node.children[0]), applySizes(node.children[1])],
+        }
+      }
+
+      state.layouts[tabId] = applySizes(root)
     },
 
     resetSplit: (
@@ -696,6 +702,9 @@ export const panesSlice = createSlice({
       delete state.layouts[tabId]
       delete state.activePane[tabId]
       delete state.paneTitles[tabId]
+      if (state.zoomedPane) {
+        delete state.zoomedPane[tabId]
+      }
       if (state.paneTitleSetByUser) {
         delete state.paneTitleSetByUser[tabId]
       }
@@ -730,6 +739,7 @@ export const panesSlice = createSlice({
       // Ephemeral signals must never be hydrated from remote
       state.renameRequestTabId = null
       state.renameRequestPaneId = null
+      state.zoomedPane = {}
     },
 
     updatePaneTitle: (
@@ -768,6 +778,20 @@ export const panesSlice = createSlice({
       state.renameRequestTabId = null
       state.renameRequestPaneId = null
     },
+
+    toggleZoom: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string }>
+    ) => {
+      const { tabId, paneId } = action.payload
+      if (state.zoomedPane[tabId] === paneId) {
+        // Same pane already zoomed -> unzoom
+        delete state.zoomedPane[tabId]
+      } else {
+        // Different pane or not zoomed -> zoom it
+        state.zoomedPane[tabId] = paneId
+      }
+    },
   },
 })
 
@@ -779,6 +803,7 @@ export const {
   closePane,
   setActivePane,
   resizePanes,
+  resizeMultipleSplits,
   resetSplit,
   swapSplit,
   replacePane,
@@ -788,6 +813,7 @@ export const {
   updatePaneTitle,
   requestPaneRename,
   clearPaneRenameRequest,
+  toggleZoom,
 } = panesSlice.actions
 
 export default panesSlice.reducer

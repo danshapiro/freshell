@@ -16,7 +16,7 @@
 
 ---
 
-![freshell screenshot](docs/freshell-screenshot.jpg)
+![freshell screenshot](docs/fresheyes-demo-moog.png)
 
 ## Features
 
@@ -28,7 +28,7 @@
 - **Keep it tidy** — AI-powered terminal summaries (via Gemini), custom session titles, archiving, and project color-coding
 - **Overview dashboard** — See all running and exited terminals at a glance with status, idle time, and AI summaries
 - **Dark/light themes** — 8 terminal themes (Dracula, One Dark, Solarized, GitHub, and more) plus system/light/dark app themes
-- **Drag-and-drop tabs** — Reorder tabs by dragging, with keyboard and touch support
+- **Fancy tabs** — Auto-name from terminal content, drag-and-drop reorder, and per-pane type icons so you know what's in each tab
 - **Context menus** — Right-click menus for tabs, terminals, sessions, projects, and messages with 40+ actions
 - **Activity notifications** — Audio bell and tab badge when a coding CLI finishes its turn, plus alerts when terminals exit in background tabs
 - **Mobile responsive** — Auto-collapsing sidebar and overlay navigation for phones and tablets
@@ -38,7 +38,7 @@
 
 ```bash
 # Clone the repository at the latest stable release
-git clone --branch v0.4.0 https://github.com/danshapiro/freshell.git
+git clone --branch v0.4.1 https://github.com/danshapiro/freshell.git
 cd freshell
 
 # Install dependencies

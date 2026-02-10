@@ -9,6 +9,12 @@ vi.mock('lucide-react', () => ({
   Circle: ({ className }: { className?: string }) => (
     <svg data-testid="circle-icon" className={className} />
   ),
+  Maximize2: ({ className }: { className?: string }) => (
+    <svg data-testid="maximize-icon" className={className} />
+  ),
+  Minimize2: ({ className }: { className?: string }) => (
+    <svg data-testid="minimize-icon" className={className} />
+  ),
 }))
 
 vi.mock('@/components/icons/PaneIcon', () => ({
@@ -294,6 +300,99 @@ describe('PaneHeader', () => {
 
       fireEvent.doubleClick(screen.getByText('My Terminal'))
       expect(onDoubleClick).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('zoom button', () => {
+    it('renders maximize button when not zoomed', () => {
+      render(
+        <PaneHeader
+          title="My Terminal"
+          status="running"
+          isActive={true}
+          onClose={vi.fn()}
+          content={makeTerminalContent()}
+          onToggleZoom={vi.fn()}
+          isZoomed={false}
+        />
+      )
+
+      const btn = screen.getByTitle('Maximize pane')
+      expect(btn).toBeInTheDocument()
+      expect(btn).toHaveAttribute('aria-label', 'Maximize pane')
+      expect(screen.getByTestId('maximize-icon')).toBeInTheDocument()
+    })
+
+    it('renders restore button when zoomed', () => {
+      render(
+        <PaneHeader
+          title="My Terminal"
+          status="running"
+          isActive={true}
+          onClose={vi.fn()}
+          content={makeTerminalContent()}
+          onToggleZoom={vi.fn()}
+          isZoomed={true}
+        />
+      )
+
+      const btn = screen.getByTitle('Restore pane')
+      expect(btn).toBeInTheDocument()
+      expect(btn).toHaveAttribute('aria-label', 'Restore pane')
+      expect(screen.getByTestId('minimize-icon')).toBeInTheDocument()
+    })
+
+    it('calls onToggleZoom when clicked', () => {
+      const onToggleZoom = vi.fn()
+      render(
+        <PaneHeader
+          title="My Terminal"
+          status="running"
+          isActive={true}
+          onClose={vi.fn()}
+          content={makeTerminalContent()}
+          onToggleZoom={onToggleZoom}
+          isZoomed={false}
+        />
+      )
+
+      fireEvent.click(screen.getByTitle('Maximize pane'))
+      expect(onToggleZoom).toHaveBeenCalledTimes(1)
+    })
+
+    it('allows mouseDown to propagate so parent can activate pane', () => {
+      const parentMouseDown = vi.fn()
+      render(
+        <div onMouseDown={parentMouseDown}>
+          <PaneHeader
+            title="My Terminal"
+            status="running"
+            isActive={true}
+            onClose={vi.fn()}
+            content={makeTerminalContent()}
+            onToggleZoom={vi.fn()}
+            isZoomed={false}
+          />
+        </div>
+      )
+
+      fireEvent.mouseDown(screen.getByTitle('Maximize pane'))
+      expect(parentMouseDown).toHaveBeenCalledTimes(1)
+    })
+
+    it('does not render zoom button when onToggleZoom is not provided', () => {
+      render(
+        <PaneHeader
+          title="My Terminal"
+          status="running"
+          isActive={true}
+          onClose={vi.fn()}
+          content={makeTerminalContent()}
+        />
+      )
+
+      expect(screen.queryByTitle('Maximize pane')).not.toBeInTheDocument()
+      expect(screen.queryByTitle('Restore pane')).not.toBeInTheDocument()
     })
   })
 

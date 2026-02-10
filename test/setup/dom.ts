@@ -4,6 +4,16 @@ import { enableMapSet } from 'immer'
 
 enableMapSet()
 
+// Provide a minimal ResizeObserver stub for jsdom environments
+if (typeof globalThis.ResizeObserver === 'undefined') {
+  globalThis.ResizeObserver = class ResizeObserver {
+    observe = vi.fn()
+    disconnect = vi.fn()
+    unobserve = vi.fn()
+    constructor(_cb: ResizeObserverCallback) {}
+  } as unknown as typeof globalThis.ResizeObserver
+}
+
 let errorSpy: ReturnType<typeof vi.spyOn> | null = null
 let consoleErrorCalls: Array<{ args: unknown[]; stack?: string }> = []
 let hasCapturedErrorStack = false

@@ -52,6 +52,7 @@ export type AppSettings = {
   }
   panes: {
     defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor'
+    snapThreshold: number // 0-8, % of container's smallest dimension; 0 = off
   }
   sidebar: {
     sortMode: 'recency' | 'activity' | 'project'
@@ -120,6 +121,7 @@ export const defaultSettings: AppSettings = {
   },
   panes: {
     defaultNewPane: 'ask',
+    snapThreshold: 2,
   },
   sidebar: {
     sortMode: 'activity',
