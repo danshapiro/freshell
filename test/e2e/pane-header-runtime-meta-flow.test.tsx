@@ -244,6 +244,9 @@ describe('pane header runtime metadata flow (e2e)', () => {
         .map((call) => call[0])
         .find((msg) => msg?.type === 'terminal.meta.list')
       expect(metaCall).toBeDefined()
+      if (!metaCall || typeof metaCall.requestId !== 'string') {
+        throw new Error('Missing terminal.meta.list requestId')
+      }
       requestId = metaCall.requestId
     })
 
@@ -362,6 +365,9 @@ describe('pane header runtime metadata flow (e2e)', () => {
         .map((call) => call[0])
         .find((msg) => msg?.type === 'terminal.meta.list')
       expect(metaCall).toBeDefined()
+      if (!metaCall || typeof metaCall.requestId !== 'string') {
+        throw new Error('Missing terminal.meta.list requestId')
+      }
       requestId = metaCall.requestId
     })
 
