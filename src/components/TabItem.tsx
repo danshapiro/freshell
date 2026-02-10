@@ -108,8 +108,8 @@ export default function TabItem({
         isActive
           ? "z-30 -mb-px border-b border-b-background bg-background text-foreground after:pointer-events-none after:absolute after:inset-x-0 after:-bottom-px after:h-[2px] after:bg-background after:content-['']"
           : needsAttention
-            ? 'border-b border-muted-foreground/45 bg-emerald-100 text-emerald-900 hover:bg-emerald-200 mt-1 dark:bg-emerald-900/40 dark:text-emerald-100 dark:hover:bg-emerald-900/55'
-            : 'border-b border-muted-foreground/45 bg-muted text-muted-foreground hover:text-foreground hover:bg-muted/90 mt-1',
+            ? 'border-b-0 bg-emerald-100 text-emerald-900 hover:bg-emerald-200 mt-1 dark:bg-emerald-900/40 dark:text-emerald-100 dark:hover:bg-emerald-900/55'
+            : 'border-b-0 bg-muted text-muted-foreground hover:text-foreground hover:bg-muted/90 mt-1',
         isDragging && 'opacity-50'
       )}
       role="button"
