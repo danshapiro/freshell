@@ -13,6 +13,8 @@ type BackgroundTerminal = {
   cwd?: string
   status: 'running' | 'exited'
   hasClients: boolean
+  mode?: string
+  resumeSessionId?: string
 }
 
 function formatAge(ms: number): string {
@@ -123,7 +125,7 @@ export default function BackgroundSessions() {
                     size="sm"
                     variant="outline"
                     onClick={() => {
-                      dispatch(addTab({ title: t.title, terminalId: t.terminalId, status: 'running', mode: 'shell' }))
+                      dispatch(addTab({ title: t.title, terminalId: t.terminalId, status: 'running', mode: (t.mode as any) || 'shell', resumeSessionId: t.resumeSessionId }))
                     }}
                   >
                     Attach
