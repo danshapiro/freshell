@@ -17,6 +17,7 @@ import {
 } from '@/lib/turn-complete-signal'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { resolveTerminalFontFamily } from '@/lib/terminal-fonts'
+import { useChunkedAttach } from '@/components/terminal/useChunkedAttach'
 import { nanoid } from 'nanoid'
 import { cn } from '@/lib/utils'
 import { Terminal } from 'xterm'
@@ -115,6 +116,38 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       content: next,
     }))
   }, [dispatch, tabId, paneId]) // NO terminalContent dependency - uses ref
+
+  const sendWsMessage = useCallback((msg: { type: 'terminal.attach'; terminalId: string }) => {
+    ws.send(msg)
+  }, [ws])
+
+  const applyChunkedSnapshot = useCallback((snapshot: string) => {
+    const term = termRef.current
+    if (!term) return
+    try { term.clear() } catch { /* disposed */ }
+    if (snapshot) {
+      try { term.write(snapshot) } catch { /* disposed */ }
+    }
+  }, [])
+
+  const markChunkedRunning = useCallback(() => {
+    updateContent({ status: 'running' })
+  }, [updateContent])
+
+  const {
+    snapshotWarning,
+    handleChunkLifecycleMessage,
+    markSnapshotChunkedCreated,
+    bumpConnectionGeneration,
+    clearChunkedAttachState,
+  } = useChunkedAttach({
+    activeTerminalId: terminalContent?.terminalId,
+    activeTerminalIdRef: terminalIdRef,
+    setIsAttaching,
+    applySnapshot: applyChunkedSnapshot,
+    markRunning: markChunkedRunning,
+    wsSend: sendWsMessage,
+  })
 
   const sendInput = useCallback((data: string) => {
     const tid = terminalIdRef.current
@@ -424,6 +457,10 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         const tid = terminalIdRef.current
         const reqId = requestIdRef.current
 
+        if (handleChunkLifecycleMessage(msg)) {
+          return
+        }
+
         if (msg.type === 'terminal.output' && msg.terminalId === tid) {
           const raw = msg.data || ''
           const mode = contentRef.current?.mode || 'shell'
@@ -463,14 +500,19 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           if (msg.effectiveResumeSessionId && msg.effectiveResumeSessionId !== contentRef.current?.resumeSessionId) {
             updateContent({ resumeSessionId: msg.effectiveResumeSessionId })
           }
-          if (msg.snapshot) {
+          const isSnapshotChunked = msg.snapshotChunked === true
+          if (isSnapshotChunked) {
+            markSnapshotChunkedCreated(newId)
+          } else if (msg.snapshot) {
             try { term.clear(); term.write(msg.snapshot) } catch { /* disposed */ }
           }
           // Creator is already attached server-side for this terminal.
           // Avoid sending terminal.attach here: it can race with terminal.output and lead to
           // the later terminal.attached snapshot wiping already-rendered output.
           ws.send({ type: 'terminal.resize', terminalId: newId, cols: term.cols, rows: term.rows })
-          setIsAttaching(false)
+          if (!isSnapshotChunked) {
+            setIsAttaching(false)
+          }
         }
 
         if (msg.type === 'terminal.attached' && msg.terminalId === tid) {
@@ -578,6 +620,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       })
 
       unsubReconnect = ws.onReconnect(() => {
+        bumpConnectionGeneration()
         const tid = terminalIdRef.current
         if (tid) attach(tid)
       })
@@ -601,6 +644,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       clearRateLimitRetry()
       unsub()
       unsubReconnect()
+      clearChunkedAttachState()
     }
   // Dependencies explanation:
   // - isTerminal: skip effect for non-terminal panes
@@ -619,7 +663,18 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   // NOTE: tab is intentionally NOT in dependencies - we use tabRef to avoid re-attaching
   // when tab properties (like title) change
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isTerminal, paneId, terminalContent?.createRequestId, updateContent, ws, dispatch])
+  }, [
+    isTerminal,
+    paneId,
+    terminalContent?.createRequestId,
+    updateContent,
+    ws,
+    dispatch,
+    bumpConnectionGeneration,
+    clearChunkedAttachState,
+    handleChunkLifecycleMessage,
+    markSnapshotChunkedCreated,
+  ])
 
   // NOW we can do the conditional return - after all hooks
   if (!isTerminal || !terminalContent) {
@@ -644,6 +699,11 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
               {terminalContent.status === 'creating' ? 'Starting terminal...' : 'Reconnecting...'}
             </span>
           </div>
+        </div>
+      )}
+      {snapshotWarning && (
+        <div className="pointer-events-none absolute inset-x-2 bottom-2 rounded border border-amber-300 bg-amber-50/95 px-2 py-1 text-xs text-amber-900">
+          {snapshotWarning}
         </div>
       )}
     </div>

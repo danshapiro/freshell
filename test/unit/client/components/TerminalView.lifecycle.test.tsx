@@ -96,6 +96,7 @@ class MockResizeObserver {
 
 describe('TerminalView lifecycle updates', () => {
   let messageHandler: ((msg: any) => void) | null = null
+  let reconnectHandler: (() => void) | null = null
 
   beforeEach(() => {
     wsMocks.send.mockClear()
@@ -106,6 +107,12 @@ describe('TerminalView lifecycle updates', () => {
       messageHandler = callback
       return () => { messageHandler = null }
     })
+    wsMocks.onReconnect.mockImplementation((callback: () => void) => {
+      reconnectHandler = callback
+      return () => {
+        if (reconnectHandler === callback) reconnectHandler = null
+      }
+    })
     vi.stubGlobal('ResizeObserver', MockResizeObserver)
   })
 
@@ -113,6 +120,7 @@ describe('TerminalView lifecycle updates', () => {
     cleanup()
     vi.useRealTimers()
     vi.unstubAllGlobals()
+    reconnectHandler = null
   })
 
   it('preserves terminalId across sequential status updates', async () => {
@@ -1285,5 +1293,234 @@ describe('TerminalView lifecycle updates', () => {
     const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
     expect(layout.content.terminalId).toBeUndefined()
     expect(layout.content.status).toBe('creating')
+  })
+
+  describe('chunked attach lifecycle', () => {
+    const ATTACH_CHUNK_TIMEOUT_MS = 35_000
+
+    async function renderTerminalHarness(opts?: { status?: 'creating' | 'running'; terminalId?: string }) {
+      const tabId = 'tab-chunked'
+      const paneId = 'pane-chunked'
+      const requestId = 'req-chunked'
+      const initialStatus = opts?.status ?? 'running'
+      const terminalId = opts?.terminalId
+
+      const paneContent: TerminalPaneContent = {
+        kind: 'terminal',
+        createRequestId: requestId,
+        status: initialStatus,
+        mode: 'shell',
+        shell: 'system',
+        ...(terminalId ? { terminalId } : {}),
+      }
+
+      const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+          settings: settingsReducer,
+          connection: connectionReducer,
+        },
+        preloadedState: {
+          tabs: {
+            tabs: [{
+              id: tabId,
+              mode: 'shell',
+              status: initialStatus,
+              title: 'Shell',
+              titleSetByUser: false,
+              createRequestId: requestId,
+              ...(terminalId ? { terminalId } : {}),
+            }],
+            activeTabId: tabId,
+          },
+          panes: {
+            layouts: { [tabId]: root },
+            activePane: { [tabId]: paneId },
+            paneTitles: {},
+          },
+          settings: { settings: defaultSettings, status: 'loaded' },
+          connection: { status: 'connected', error: null },
+        },
+      })
+
+      const view = render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+      })
+      await waitFor(() => {
+        expect(terminalInstances.length).toBeGreaterThan(0)
+      })
+
+      wsMocks.send.mockClear()
+
+      return {
+        ...view,
+        store,
+        term: terminalInstances[terminalInstances.length - 1],
+        tabId,
+        paneId,
+        requestId,
+        terminalId: terminalId || 'term-chunked',
+      }
+    }
+
+    it('buffers start/chunk frames and writes exactly once on terminal.attached.end', async () => {
+      const { term, terminalId } = await renderTerminalHarness({ status: 'running', terminalId: 'term-chunk-1' })
+
+      messageHandler!({ type: 'terminal.attached.start', terminalId, totalCodeUnits: 6, totalChunks: 2 })
+      messageHandler!({ type: 'terminal.attached.chunk', terminalId, chunk: 'abc' })
+      expect(term.write).not.toHaveBeenCalled()
+
+      messageHandler!({ type: 'terminal.attached.chunk', terminalId, chunk: 'def' })
+      messageHandler!({ type: 'terminal.attached.end', terminalId, totalCodeUnits: 6, totalChunks: 2 })
+
+      expect(term.clear).toHaveBeenCalledTimes(1)
+      expect(term.write).toHaveBeenCalledTimes(1)
+      expect(term.write).toHaveBeenCalledWith('abcdef')
+    })
+
+    it('keeps attaching state pending after terminal.created with snapshotChunked until end arrives', async () => {
+      const { term, requestId, queryByTestId } = await renderTerminalHarness({ status: 'creating' })
+
+      messageHandler!({
+        type: 'terminal.created',
+        requestId,
+        terminalId: 'term-chunk-created',
+        snapshotChunked: true,
+        createdAt: Date.now(),
+      })
+
+      expect(term.write).not.toHaveBeenCalled()
+      expect(queryByTestId('loader')).not.toBeNull()
+
+      messageHandler!({ type: 'terminal.attached.start', terminalId: 'term-chunk-created', totalCodeUnits: 3, totalChunks: 1 })
+      messageHandler!({ type: 'terminal.attached.chunk', terminalId: 'term-chunk-created', chunk: 'ok!' })
+      messageHandler!({ type: 'terminal.attached.end', terminalId: 'term-chunk-created', totalCodeUnits: 3, totalChunks: 1 })
+
+      expect(term.write).toHaveBeenCalledWith('ok!')
+    })
+
+    it('drops snapshot when totalCodeUnits mismatches and triggers guarded auto-reattach', async () => {
+      const { term, terminalId } = await renderTerminalHarness({ status: 'running', terminalId: 'term-codeunits' })
+
+      messageHandler!({ type: 'terminal.attached.start', terminalId, totalCodeUnits: 5, totalChunks: 1 })
+      messageHandler!({ type: 'terminal.attached.chunk', terminalId, chunk: 'abc' })
+      messageHandler!({ type: 'terminal.attached.end', terminalId, totalCodeUnits: 5, totalChunks: 1 })
+
+      expect(term.write).not.toHaveBeenCalled()
+      expect(wsMocks.send).toHaveBeenCalledWith({ type: 'terminal.attach', terminalId })
+    })
+
+    it('drops snapshot when chunk count mismatches and triggers guarded auto-reattach', async () => {
+      const { term, terminalId } = await renderTerminalHarness({ status: 'running', terminalId: 'term-chunkcount' })
+
+      messageHandler!({ type: 'terminal.attached.start', terminalId, totalCodeUnits: 3, totalChunks: 2 })
+      messageHandler!({ type: 'terminal.attached.chunk', terminalId, chunk: 'abc' })
+      messageHandler!({ type: 'terminal.attached.end', terminalId, totalCodeUnits: 3, totalChunks: 2 })
+
+      expect(term.write).not.toHaveBeenCalled()
+      expect(wsMocks.send).toHaveBeenCalledWith({ type: 'terminal.attach', terminalId })
+    })
+
+    it('drops snapshot when start/end metadata mismatches and triggers guarded auto-reattach', async () => {
+      const { term, terminalId } = await renderTerminalHarness({ status: 'running', terminalId: 'term-meta-mismatch' })
+
+      messageHandler!({ type: 'terminal.attached.start', terminalId, totalCodeUnits: 3, totalChunks: 1 })
+      messageHandler!({ type: 'terminal.attached.chunk', terminalId, chunk: 'abc' })
+      messageHandler!({ type: 'terminal.attached.end', terminalId, totalCodeUnits: 4, totalChunks: 1 })
+
+      expect(term.write).not.toHaveBeenCalled()
+      expect(wsMocks.send).toHaveBeenCalledWith({ type: 'terminal.attach', terminalId })
+    })
+
+    it('ignores mismatched terminalId chunk frames and logs a warning', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const { term, terminalId } = await renderTerminalHarness({ status: 'running', terminalId: 'term-active' })
+
+      messageHandler!({ type: 'terminal.attached.start', terminalId, totalCodeUnits: 3, totalChunks: 1 })
+      messageHandler!({ type: 'terminal.attached.chunk', terminalId: 'term-other', chunk: 'xxx' })
+      messageHandler!({ type: 'terminal.attached.chunk', terminalId, chunk: 'abc' })
+      messageHandler!({ type: 'terminal.attached.end', terminalId, totalCodeUnits: 3, totalChunks: 1 })
+
+      expect(term.write).toHaveBeenCalledWith('abc')
+      expect(warnSpy).toHaveBeenCalled()
+      warnSpy.mockRestore()
+    })
+
+    it('cancels in-flight chunk sequence on terminal.exit and ignores later end frame', async () => {
+      const { term, terminalId } = await renderTerminalHarness({ status: 'running', terminalId: 'term-exit-mid' })
+
+      messageHandler!({ type: 'terminal.attached.start', terminalId, totalCodeUnits: 3, totalChunks: 1 })
+      messageHandler!({ type: 'terminal.attached.chunk', terminalId, chunk: 'abc' })
+      messageHandler!({ type: 'terminal.exit', terminalId, exitCode: 0 })
+      messageHandler!({ type: 'terminal.attached.end', terminalId, totalCodeUnits: 3, totalChunks: 1 })
+
+      expect(term.write).not.toHaveBeenCalled()
+    })
+
+    it('replaces prior in-flight chunk state when a new start arrives for the same terminal', async () => {
+      const { term, terminalId } = await renderTerminalHarness({ status: 'running', terminalId: 'term-restart' })
+
+      messageHandler!({ type: 'terminal.attached.start', terminalId, totalCodeUnits: 6, totalChunks: 2 })
+      messageHandler!({ type: 'terminal.attached.chunk', terminalId, chunk: 'old' })
+
+      messageHandler!({ type: 'terminal.attached.start', terminalId, totalCodeUnits: 3, totalChunks: 1 })
+      messageHandler!({ type: 'terminal.attached.chunk', terminalId, chunk: 'new' })
+      messageHandler!({ type: 'terminal.attached.end', terminalId, totalCodeUnits: 3, totalChunks: 1 })
+
+      expect(term.write).toHaveBeenCalledTimes(1)
+      expect(term.write).toHaveBeenCalledWith('new')
+    })
+
+    it('times out chunked attach and auto-reattaches at most once per terminal per generation', async () => {
+      const { terminalId } = await renderTerminalHarness({ status: 'running', terminalId: 'term-timeout-once' })
+      vi.useFakeTimers()
+
+      messageHandler!({ type: 'terminal.attached.start', terminalId, totalCodeUnits: 3, totalChunks: 1 })
+      await act(async () => {
+        vi.advanceTimersByTime(ATTACH_CHUNK_TIMEOUT_MS + 1)
+      })
+
+      const firstAutoAttachCalls = wsMocks.send.mock.calls.filter((call) => call[0]?.type === 'terminal.attach' && call[0]?.terminalId === terminalId)
+      expect(firstAutoAttachCalls).toHaveLength(1)
+
+      messageHandler!({ type: 'terminal.attached.start', terminalId, totalCodeUnits: 3, totalChunks: 1 })
+      await act(async () => {
+        vi.advanceTimersByTime(ATTACH_CHUNK_TIMEOUT_MS + 1)
+      })
+
+      const totalAutoAttachCalls = wsMocks.send.mock.calls.filter((call) => call[0]?.type === 'terminal.attach' && call[0]?.terminalId === terminalId)
+      expect(totalAutoAttachCalls).toHaveLength(1)
+    })
+
+    it('resets auto-reattach guard after reconnect generation changes', async () => {
+      const { terminalId } = await renderTerminalHarness({ status: 'running', terminalId: 'term-timeout-generation' })
+      vi.useFakeTimers()
+
+      messageHandler!({ type: 'terminal.attached.start', terminalId, totalCodeUnits: 3, totalChunks: 1 })
+      await act(async () => {
+        vi.advanceTimersByTime(ATTACH_CHUNK_TIMEOUT_MS + 1)
+      })
+      const beforeReconnect = wsMocks.send.mock.calls.filter((call) => call[0]?.type === 'terminal.attach' && call[0]?.terminalId === terminalId)
+      expect(beforeReconnect).toHaveLength(1)
+
+      reconnectHandler?.()
+      wsMocks.send.mockClear()
+
+      messageHandler!({ type: 'terminal.attached.start', terminalId, totalCodeUnits: 3, totalChunks: 1 })
+      await act(async () => {
+        vi.advanceTimersByTime(ATTACH_CHUNK_TIMEOUT_MS + 1)
+      })
+      const afterReconnect = wsMocks.send.mock.calls.filter((call) => call[0]?.type === 'terminal.attach' && call[0]?.terminalId === terminalId)
+      expect(afterReconnect).toHaveLength(1)
+    })
   })
 })
