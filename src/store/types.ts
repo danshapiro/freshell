@@ -123,6 +123,7 @@ export interface AppSettings {
     cursorBlink: boolean
     scrollback: number
     theme: TerminalTheme
+    warnExternalLinks: boolean
   }
   defaultCwd?: string
   logging: {

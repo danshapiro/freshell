@@ -41,6 +41,7 @@ export type AppSettings = {
       | 'one-light'
       | 'solarized-light'
       | 'github-light'
+    warnExternalLinks: boolean
   }
   defaultCwd?: string
   logging: {
@@ -110,6 +111,7 @@ export const defaultSettings: AppSettings = {
     cursorBlink: true,
     scrollback: 5000,
     theme: 'auto',
+    warnExternalLinks: true,
   },
   defaultCwd: undefined,
   logging: {
@@ -289,6 +291,7 @@ function mergeSettings(base: AppSettings, patch: Partial<AppSettings>): AppSetti
     cursorBlink: terminalPatch.cursorBlink,
     scrollback: terminalPatch.scrollback,
     theme: terminalPatch.theme,
+    warnExternalLinks: terminalPatch.warnExternalLinks,
   }
   return {
     ...base,
