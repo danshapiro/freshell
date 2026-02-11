@@ -15,6 +15,7 @@ export const defaultSettings: AppSettings = {
     cursorBlink: true,
     scrollback: 5000,
     theme: 'auto',
+    warnExternalLinks: true,
   },
   defaultCwd: undefined,
   logging: {

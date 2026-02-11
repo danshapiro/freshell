@@ -691,6 +691,16 @@ export default function SettingsView() {
               />
             </SettingsRow>
 
+            <SettingsRow label="Warn on external links">
+              <Toggle
+                checked={settings.terminal.warnExternalLinks}
+                onChange={(checked) => {
+                  dispatch(updateSettingsLocal({ terminal: { warnExternalLinks: checked } } as any))
+                  scheduleSave({ terminal: { warnExternalLinks: checked } })
+                }}
+              />
+            </SettingsRow>
+
             <SettingsRow label="Font family">
               <select
                 value={isSelectedFontAvailable ? settings.terminal.fontFamily : fallbackFontFamily}

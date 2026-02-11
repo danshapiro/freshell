@@ -176,6 +176,17 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       lineHeight: settings.terminal.lineHeight,
       scrollback: settings.terminal.scrollback,
       theme: getTerminalTheme(settings.terminal.theme, settings.theme),
+      linkHandler: {
+        activate: (_event: MouseEvent, uri: string) => {
+          if (settings.terminal.warnExternalLinks !== false) {
+            if (confirm(`Do you want to navigate to ${uri}?\n\nWARNING: This link could potentially be dangerous`)) {
+              window.open(uri, '_blank')
+            }
+          } else {
+            window.open(uri, '_blank')
+          }
+        },
+      },
     })
     const fit = new FitAddon()
     term.loadAddon(fit)
