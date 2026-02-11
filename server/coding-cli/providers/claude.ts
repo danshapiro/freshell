@@ -8,7 +8,7 @@ import { getClaudeHome } from '../../claude-home.js'
 import type { CodingCliProvider } from '../provider.js'
 import type { NormalizedEvent, ParsedSessionMeta, TokenSummary } from '../types.js'
 import { parseClaudeEvent, isMessageEvent, isResultEvent, isToolResultContent, isToolUseContent, isTextContent } from '../../claude-stream-types.js'
-import { looksLikePath, isSystemContext, extractFromIdeContext, resolveGitRepoRoot } from '../utils.js'
+import { looksLikePath, isSystemContext, extractFromIdeContext, resolveGitCheckoutRoot } from '../utils.js'
 
 export type JsonlMeta = {
   sessionId?: string
@@ -381,7 +381,7 @@ export const claudeProvider: CodingCliProvider = {
 
   async resolveProjectPath(_filePath: string, meta: ParsedSessionMeta): Promise<string> {
     if (!meta.cwd) return 'unknown'
-    return resolveGitRepoRoot(meta.cwd)
+    return resolveGitCheckoutRoot(meta.cwd)
   },
 
   extractSessionId(filePath: string): string {
