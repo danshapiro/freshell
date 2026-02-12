@@ -25,7 +25,7 @@ function makeProvider(files: string[]): CodingCliProvider {
     homeDir: '/tmp',
     getSessionGlob: () => path.join('/tmp', '*.jsonl'),
     listSessionFiles: async () => files,
-    parseSessionFile: (content: string) => {
+    parseSessionFile: async (content: string) => {
       const lines = content.split(/\r?\n/).filter(Boolean)
       let cwd: string | undefined
       let title: string | undefined
@@ -206,7 +206,7 @@ describe('CodingCliSessionIndexer', () => {
     const fileA = path.join(tempDir, 'session-a.jsonl')
     await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')
 
-    const parseSessionFile = vi.fn().mockReturnValue({
+    const parseSessionFile = vi.fn().mockResolvedValue({
       cwd: '/project/a',
       title: 'Title A',
       messageCount: 1,
@@ -231,7 +231,7 @@ describe('CodingCliSessionIndexer', () => {
 
     const provider: CodingCliProvider = {
       ...makeProvider([fileA]),
-      parseSessionFile: () => ({
+      parseSessionFile: async () => ({
         cwd: '/project/a',
         title: 'Title A',
         sessionId: 'canonical-id',
@@ -253,7 +253,7 @@ describe('CodingCliSessionIndexer', () => {
 
     const provider: CodingCliProvider = {
       ...makeProvider([fileA]),
-      parseSessionFile: () => ({
+      parseSessionFile: async () => ({
         cwd: '/project/a',
         title: 'Title A',
         messageCount: 1,
@@ -292,7 +292,7 @@ describe('CodingCliSessionIndexer', () => {
     ].join('\n') + '\n'
     await fsp.writeFile(fileA, content)
 
-    const parseSessionFile = vi.fn((snippet: string) => ({
+    const parseSessionFile = vi.fn(async (snippet: string) => ({
       cwd: snippet.includes('"cwd":"/project/a"') ? '/project/a' : undefined,
       title: snippet.includes('tail-sentinel') ? 'Tail Title' : 'Head Title',
       messageCount: snippet.split(/\r?\n/).filter(Boolean).length,
@@ -333,7 +333,7 @@ describe('CodingCliSessionIndexer', () => {
 
     const provider: CodingCliProvider = {
       ...makeProvider([fileA]),
-      parseSessionFile: () => ({
+      parseSessionFile: async () => ({
         cwd: '/project/a',
         title: 'Title A',
         sessionId: canonicalId,
@@ -381,7 +381,7 @@ describe('CodingCliSessionIndexer', () => {
     const provider: CodingCliProvider = {
       ...makeProvider([fileA]),
       listSessionFiles,
-      parseSessionFile: vi.fn().mockReturnValue({
+      parseSessionFile: vi.fn().mockResolvedValue({
         cwd: '/project/a',
         title: 'Title A',
         messageCount: 1,

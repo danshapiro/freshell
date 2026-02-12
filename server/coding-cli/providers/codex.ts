@@ -6,10 +6,12 @@ import type { CodingCliProvider } from '../provider.js'
 import type { NormalizedEvent, ParsedSessionMeta, TokenPayload, TokenSummary } from '../types.js'
 import { looksLikePath, isSystemContext, extractFromIdeContext, resolveGitRepoRoot } from '../utils.js'
 
-const CODEX_BASELINE_TOKENS = 12_000
 const CODEX_MAX_PLAUSIBLE_CONTEXT_TOKENS_WITHOUT_WINDOW = 5_000_000
-const CODEX_PERCENT_CALIBRATION_SLOPE = 0.973
-const CODEX_PERCENT_CALIBRATION_INTERCEPT = -4.65
+// Codex `model_context_window` is reduced by `effective_context_window_percent` (default 95%).
+// Auto-compaction triggers at 90% of the full context window. When Codex doesn't report an
+// explicit auto-compact limit, approximate it by scaling from the effective window.
+const CODEX_AUTO_COMPACT_DEFAULT_PERCENT = 90
+const CODEX_EFFECTIVE_CONTEXT_WINDOW_DEFAULT_PERCENT = 95
 
 export function defaultCodexHome(): string {
   return process.env.CODEX_HOME || path.join(os.homedir(), '.codex')
@@ -38,32 +40,19 @@ function normalizeCompactPercent(numerator: number, denominator?: number): numbe
   return Math.max(0, Math.min(100, ratio))
 }
 
-function normalizeCompactPercentWithBaseline(
-  numerator: number,
-  denominator?: number,
-  baselineTokens = 0,
+function deriveCodexCompactThresholdTokens(
+  modelContextWindow?: number,
+  explicitLimit?: number,
 ): number | undefined {
-  if (!denominator || denominator <= 0) return undefined
-  if (baselineTokens <= 0) return normalizeCompactPercent(numerator, denominator)
-
-  const adjustedDenominator = denominator - baselineTokens
-  if (adjustedDenominator <= 0) return normalizeCompactPercent(numerator, denominator)
-
-  const adjustedNumerator = Math.max(numerator - baselineTokens, 0)
-  return normalizeCompactPercent(adjustedNumerator, adjustedDenominator)
-}
-
-function calibrateCodexCompactPercent(
-  rawPercent: number | undefined,
-  contextTokens: number,
-  compactThresholdTokens?: number,
-): number | undefined {
-  if (rawPercent === undefined) return undefined
-  if (compactThresholdTokens && compactThresholdTokens > 0 && contextTokens >= compactThresholdTokens) {
-    return 100
+  if (explicitLimit && Number.isFinite(explicitLimit) && explicitLimit > 0) {
+    return Math.round(explicitLimit)
   }
-  const calibrated = Math.round((rawPercent * CODEX_PERCENT_CALIBRATION_SLOPE) + CODEX_PERCENT_CALIBRATION_INTERCEPT)
-  return Math.max(0, Math.min(100, calibrated))
+  if (!modelContextWindow || !Number.isFinite(modelContextWindow) || modelContextWindow <= 0) {
+    return undefined
+  }
+  return Math.round(
+    modelContextWindow * (CODEX_AUTO_COMPACT_DEFAULT_PERCENT / CODEX_EFFECTIVE_CONTEXT_WINDOW_DEFAULT_PERCENT),
+  )
 }
 
 function coerceLikelyContextTokens(
@@ -114,7 +103,9 @@ function parseUsagePayload(payload: any): CodexUsage | undefined {
     ) ?? 0
 
   const explicitTotal = toFiniteNumber(payload.total_tokens ?? payload.totalTokens ?? payload.total)
-  const totalTokens = explicitTotal ?? (inputTokens + outputTokens + cachedTokens)
+  // Codex cached-input token fields represent a subset of input tokens (not additive).
+  // If the payload does not include an explicit total, fall back to input + output.
+  const totalTokens = explicitTotal ?? (inputTokens + outputTokens)
 
   if (inputTokens === 0 && outputTokens === 0 && cachedTokens === 0 && totalTokens === 0) {
     return undefined
@@ -139,19 +130,16 @@ function parseCodexTokenEnvelope(payload: any): {
       toFiniteNumber(info.auto_compact_token_limit) ??
       toFiniteNumber(info.compact_token_limit)
 
-    const compactThresholdTokens =
-      explicitCompactLimit ??
-      (modelContextWindow ? Math.round(modelContextWindow * 0.9) : undefined)
+    const compactThresholdTokens = deriveCodexCompactThresholdTokens(modelContextWindow, explicitCompactLimit)
 
     const contextCandidates = [
       toFiniteNumber(info.current_context_tokens),
       toFiniteNumber(info.context_tokens),
       toFiniteNumber(info.context_token_count),
-      toFiniteNumber(info.last_token_usage?.total_tokens),
       lastUsage?.totalTokens,
+      toFiniteNumber(info.last_token_usage?.total_tokens),
+      // Avoid `total_token_usage.total_tokens`: it is cumulative across the session.
       toFiniteNumber(info.total_usage_tokens),
-      toFiniteNumber(info.total_token_usage?.total_tokens),
-      totalUsage?.totalTokens,
     ]
     const preferredContextTokens = lastUsage?.totalTokens
     const contextTokens = contextCandidates
@@ -162,11 +150,7 @@ function parseCodexTokenEnvelope(payload: any): {
     // see in the live Codex status bar. `total_token_usage` may be cumulative.
     const aggregate = lastUsage ?? totalUsage
     const rawCompactPercent = contextTokens !== undefined
-      ? normalizeCompactPercentWithBaseline(
-        contextTokens,
-        compactThresholdTokens,
-        CODEX_BASELINE_TOKENS,
-      )
+      ? normalizeCompactPercent(contextTokens, compactThresholdTokens)
       : undefined
 
     const summary = aggregate || contextTokens !== undefined
@@ -178,9 +162,8 @@ function parseCodexTokenEnvelope(payload: any): {
           contextTokens,
           modelContextWindow,
           compactThresholdTokens,
-          compactPercent: contextTokens !== undefined
-            ? calibrateCodexCompactPercent(rawCompactPercent, contextTokens, compactThresholdTokens)
-            : undefined,
+          // Percent used to compact, based on the auto-compaction threshold.
+          compactPercent: rawCompactPercent,
         }
       : undefined
 
@@ -343,7 +326,7 @@ export const codexProvider: CodingCliProvider = {
     return walkJsonlFiles(sessionsDir)
   },
 
-  parseSessionFile(content: string, _filePath: string) {
+  async parseSessionFile(content: string, _filePath: string) {
     return parseCodexSessionContent(content)
   },
 
@@ -508,7 +491,9 @@ export const codexProvider: CodingCliProvider = {
       }
       const input = parsedToken.eventTokens.inputTokens
       const output = parsedToken.eventTokens.outputTokens
-      const total = input + output + (parsedToken.eventTokens.cachedTokens || 0)
+      // Codex `cached_input_tokens` is a subset of `input_tokens` (not additive),
+      // so prefer the explicit `total_tokens` from the envelope when available.
+      const total = parsedToken.summary?.totalTokens ?? (input + output)
       return [
         {
           ...base,

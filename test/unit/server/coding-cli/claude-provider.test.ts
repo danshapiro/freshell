@@ -249,6 +249,9 @@ describe('parseSessionContent() - token usage snapshots', () => {
       ].join('\n'),
       'utf8',
     )
+    // Ensure the last autocompact line can fall outside of the cheapest tail read.
+    // Claude debug logs are noisy and can grow large without additional autocompact entries.
+    await fsp.appendFile(debugFile, `\n${'x'.repeat(200_000)}`, 'utf8')
 
     const originalHomeDir = (claudeProvider as any).homeDir
     ;(claudeProvider as any).homeDir = homeDir
@@ -269,7 +272,7 @@ describe('parseSessionContent() - token usage snapshots', () => {
         }),
       ].join('\n')
 
-      const meta = claudeProvider.parseSessionFile(
+      const meta = await claudeProvider.parseSessionFile(
         content,
         path.join(homeDir, 'projects', 'project-a', `${sessionId}.jsonl`),
       )
@@ -277,6 +280,23 @@ describe('parseSessionContent() - token usage snapshots', () => {
       expect(meta.tokenUsage?.contextTokens).toBe(55880)
       expect(meta.tokenUsage?.compactThresholdTokens).toBe(167000)
       expect(meta.tokenUsage?.compactPercent).toBe(Math.round((55880 / 167000) * 100))
+
+      // Debug files are updated during an active session; ensure we re-read when they change
+      // so token counts don't freeze and drift.
+      await fsp.appendFile(
+        debugFile,
+        '\nautocompact: tokens=60000 threshold=170000 effectiveWindow=180000',
+        'utf8',
+      )
+
+      const refreshed = await claudeProvider.parseSessionFile(
+        content,
+        path.join(homeDir, 'projects', 'project-a', `${sessionId}.jsonl`),
+      )
+
+      expect(refreshed.tokenUsage?.contextTokens).toBe(60000)
+      expect(refreshed.tokenUsage?.compactThresholdTokens).toBe(170000)
+      expect(refreshed.tokenUsage?.compactPercent).toBe(Math.round((60000 / 170000) * 100))
     } finally {
       ;(claudeProvider as any).homeDir = originalHomeDir
       await fsp.rm(homeDir, { recursive: true, force: true })

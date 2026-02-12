@@ -193,7 +193,7 @@ export class CodingCliSessionIndexer {
     }
 
     const content = await readSessionSnippet(filePath)
-    const meta = provider.parseSessionFile(content, filePath)
+    const meta = await provider.parseSessionFile(content, filePath)
     if (!meta.cwd) {
       this.fileCache.set(cacheKey, {
         provider: provider.name,

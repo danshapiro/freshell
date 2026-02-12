@@ -3,11 +3,6 @@ import path from 'path'
 import os from 'os'
 import { codexProvider, defaultCodexHome, parseCodexSessionContent } from '../../../../server/coding-cli/providers/codex'
 
-function calibrateExpectedCodexPercent(rawPercent: number): number {
-  const calibrated = Math.round((rawPercent * 0.973) - 4.65)
-  return Math.max(0, Math.min(100, calibrated))
-}
-
 describe('codex-provider', () => {
   describe('defaultCodexHome()', () => {
     const originalEnv = process.env.CODEX_HOME
@@ -217,11 +212,53 @@ describe('codex-provider', () => {
       contextTokens: 70744,
       modelContextWindow: 200000,
       compactThresholdTokens: explicitLimit,
-      compactPercent: calibrateExpectedCodexPercent(Math.round(((70744 - 12000) / (explicitLimit - 12000)) * 100)),
+      compactPercent: Math.round((70744 / explicitLimit) * 100),
     })
   })
 
-  it('derives compact threshold at 90% of model context window and applies codex baseline for percent full', () => {
+  it('does not double-count cached tokens when total_tokens is missing', () => {
+    const explicitLimit = 180000
+    const content = [
+      JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          id: 'session-missing-total',
+          cwd: '/project/a',
+        },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            last_token_usage: {
+              input_tokens: 100,
+              output_tokens: 20,
+              cached_input_tokens: 80,
+              // total_tokens intentionally omitted
+            },
+            model_context_window: 200000,
+            model_auto_compact_token_limit: explicitLimit,
+          },
+        },
+      }),
+    ].join('\n')
+
+    const meta = parseCodexSessionContent(content)
+
+    expect(meta.tokenUsage).toEqual({
+      inputTokens: 100,
+      outputTokens: 20,
+      cachedTokens: 80,
+      totalTokens: 120,
+      contextTokens: 120,
+      modelContextWindow: 200000,
+      compactThresholdTokens: explicitLimit,
+      compactPercent: Math.round((120 / explicitLimit) * 100),
+    })
+  })
+
+  it('derives codex compact threshold from model_context_window when explicit limit is missing', () => {
     const content = [
       JSON.stringify({
         type: 'session_meta',
@@ -248,7 +285,7 @@ describe('codex-provider', () => {
     ].join('\n')
 
     const meta = parseCodexSessionContent(content)
-    const expectedLimit = Math.round(258400 * 0.9)
+    const derivedLimit = Math.round(258400 * (90 / 95))
 
     expect(meta.tokenUsage).toEqual({
       inputTokens: 80000,
@@ -257,17 +294,18 @@ describe('codex-provider', () => {
       totalTokens: 163284,
       contextTokens: 163284,
       modelContextWindow: 258400,
-      compactThresholdTokens: expectedLimit,
-      compactPercent: calibrateExpectedCodexPercent(Math.round(((163284 - 12000) / (expectedLimit - 12000)) * 100)),
+      compactThresholdTokens: derivedLimit,
+      compactPercent: Math.round((163284 / derivedLimit) * 100),
     })
   })
 
-  it('applies calibrated compact-percent mapping that tracks Codex context-left gauge', () => {
-    const compactLimit = 100000
+  it('computes compact percent against the derived compact threshold', () => {
+    const contextWindow = 100000
+    const derivedLimit = Math.round(contextWindow * (90 / 95))
     const points = [
-      { totalTokens: 23440, expectedCompactPercent: 8 },  // was 13 before calibration
-      { totalTokens: 38400, expectedCompactPercent: 25 }, // was 30 before calibration
-      { totalTokens: 56000, expectedCompactPercent: 44 }, // was 50 before calibration
+      { totalTokens: 23440, expectedCompactPercent: Math.round((23440 / derivedLimit) * 100) },
+      { totalTokens: 38400, expectedCompactPercent: Math.round((38400 / derivedLimit) * 100) },
+      { totalTokens: 56000, expectedCompactPercent: Math.round((56000 / derivedLimit) * 100) },
     ]
 
     for (const point of points) {
@@ -275,7 +313,7 @@ describe('codex-provider', () => {
         JSON.stringify({
           type: 'session_meta',
           payload: {
-            id: `session-calibration-${point.totalTokens}`,
+            id: `session-derived-limit-${point.totalTokens}`,
             cwd: '/project/a',
           },
         }),
@@ -290,7 +328,7 @@ describe('codex-provider', () => {
                 cached_input_tokens: 0,
                 total_tokens: point.totalTokens,
               },
-              model_auto_compact_token_limit: compactLimit,
+              model_context_window: contextWindow,
             },
           },
         }),
@@ -298,6 +336,7 @@ describe('codex-provider', () => {
 
       const meta = parseCodexSessionContent(content)
       expect(meta.tokenUsage?.compactPercent).toBe(point.expectedCompactPercent)
+      expect(meta.tokenUsage?.compactThresholdTokens).toBe(derivedLimit)
     }
   })
 

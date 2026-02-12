@@ -9,7 +9,6 @@
 **Why a separate SdkBridge instead of extending CodingCliSessionManager?** The existing `CodingCliSessionManager` + `codingcli.*` protocol spawns Claude Code as a PTY, pipes raw terminal bytes through xterm.js, and supports generic coding CLI providers (Claude, Codex, etc.). The SDK bridge is fundamentally different: it uses structured JSON messages over WebSocket (not a PTY), requires bidirectional message routing (permission requests/responses, interrupts), and maintains rich session state (message history, streaming deltas, cost tracking) that the terminal model has no concept of. Attempting to shoehorn this into the PTY-based provider interface would compromise both systems. The two systems coexist cleanly: terminal-mode Claude (`codingcli.*`) for the TUI experience, SDK-mode Claude (`sdk.*`) for the rich web chat experience. Session indexing is shared — both appear in the sidebar via the existing `claude-indexer` which watches `~/.claude/projects/`.
 
 **Undocumented SDK protocol risk:** Claude Code's `--sdk-url` flag and NDJSON protocol are not officially documented and were reverse-engineered by the companion project. Mitigation: (1) keep all protocol types in a single file (`sdk-bridge-types.ts`) with Zod schemas — invalid messages are logged and skipped rather than crashing, (2) pin the minimum Claude Code version in package.json's `engines` or a runtime check, (3) if the protocol changes, only `sdk-bridge-types.ts` and `sdk-bridge.ts` need updating.
-
 **Tech Stack:** React 18, Redux Toolkit, Zod (message schemas), ws (SDK bridge), react-markdown + remark-gfm (message rendering), Tailwind CSS + shadcn/ui (styling), Vitest (testing)
 
 ---
@@ -246,6 +245,12 @@ export const UsageSchema = z.object({
 }).passthrough()
 
 // ── CLI → Server NDJSON messages ──
+<<<<<<< HEAD
+
+const CliSystemInitSchema = z.object({
+  type: z.literal('system'),
+  subtype: z.literal('init'),
+=======
 // Note: system messages share `type: 'system'` and are distinguished by `subtype`.
 // We use a single schema with z.union() for the subtype-specific fields,
 // since z.discriminatedUnion() requires unique discriminator values per variant.
@@ -253,6 +258,7 @@ export const UsageSchema = z.object({
 const CliSystemSchema = z.object({
   type: z.literal('system'),
   subtype: z.string(),
+>>>>>>> 98b863f (docs: add Claude Web Client Pane implementation plan)
   session_id: z.string().optional(),
   tools: z.array(z.object({ name: z.string() }).passthrough()).optional(),
   model: z.string().optional(),
@@ -261,6 +267,14 @@ const CliSystemSchema = z.object({
   mcp_servers: z.array(z.unknown()).optional(),
 }).passthrough()
 
+<<<<<<< HEAD
+const CliSystemStatusSchema = z.object({
+  type: z.literal('system'),
+  subtype: z.literal('status'),
+}).passthrough()
+
+=======
+>>>>>>> 98b863f (docs: add Claude Web Client Pane implementation plan)
 const CliAssistantSchema = z.object({
   type: z.literal('assistant'),
   message: z.object({
@@ -313,7 +327,12 @@ const CliAuthStatusSchema = z.object({
 }).passthrough()
 
 export const CliMessageSchema = z.discriminatedUnion('type', [
+<<<<<<< HEAD
+  CliSystemInitSchema,
+  CliSystemStatusSchema,
+=======
   CliSystemSchema,
+>>>>>>> 98b863f (docs: add Claude Web Client Pane implementation plan)
   CliAssistantSchema,
   CliResultSchema,
   CliStreamEventSchema,
@@ -448,11 +467,24 @@ The bridge spawns headless Claude Code, accepts its WebSocket connection, and ro
 
 ```typescript
 // test/unit/server/sdk-bridge.test.ts
+<<<<<<< HEAD
+=======
 import { EventEmitter } from 'events'
+>>>>>>> 98b863f (docs: add Claude Web Client Pane implementation plan)
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { SdkBridge } from '../../../server/sdk-bridge.js'
 import type { SdkSessionState } from '../../../server/sdk-bridge-types.js'
 
+<<<<<<< HEAD
+// Mock child_process.spawn
+vi.mock('child_process', () => ({
+  spawn: vi.fn(() => {
+    const proc = new (require('events').EventEmitter)()
+    proc.pid = 12345
+    proc.kill = vi.fn()
+    proc.stdout = new (require('events').EventEmitter)()
+    proc.stderr = new (require('events').EventEmitter)()
+=======
 // Mock child_process.spawn (ESM-compatible — uses top-level import)
 vi.mock('child_process', () => ({
   spawn: vi.fn(() => {
@@ -461,6 +493,7 @@ vi.mock('child_process', () => ({
     proc.kill = vi.fn()
     proc.stdout = new EventEmitter()
     proc.stderr = new EventEmitter()
+>>>>>>> 98b863f (docs: add Claude Web Client Pane implementation plan)
     return proc
   }),
 }))
@@ -504,6 +537,30 @@ describe('SdkBridge', () => {
     })
   })
 
+<<<<<<< HEAD
+  describe('NDJSON parsing', () => {
+    it('parses single-line NDJSON', () => {
+      const parsed = (bridge as any).parseNdjson(
+        '{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}\n'
+      )
+      expect(parsed).toHaveLength(1)
+      expect(parsed[0].type).toBe('assistant')
+    })
+
+    it('handles multiple lines', () => {
+      const data = [
+        '{"type":"keep_alive"}',
+        '{"type":"result","result":"success"}',
+      ].join('\n') + '\n'
+      const parsed = (bridge as any).parseNdjson(data)
+      expect(parsed).toHaveLength(2)
+    })
+
+    it('ignores empty lines and invalid JSON', () => {
+      const data = '{"type":"keep_alive"}\n\nnot json\n{"type":"result"}\n'
+      const parsed = (bridge as any).parseNdjson(data)
+      expect(parsed).toHaveLength(2)
+=======
   describe('CLI message handling (exercises NDJSON parsing internally)', () => {
     it('processes a valid assistant message and stores it', () => {
       const session = bridge.createSession({ cwd: '/tmp' })
@@ -521,6 +578,7 @@ describe('SdkBridge', () => {
       // Should not throw — invalid messages are logged and skipped
       ;(bridge as any).handleCliMessage(session.sessionId, { type: 'bogus_unknown' })
       expect(bridge.getSession(session.sessionId)?.messages).toHaveLength(0)
+>>>>>>> 98b863f (docs: add Claude Web Client Pane implementation plan)
     })
   })
 
@@ -631,11 +689,15 @@ export class SdkBridge extends EventEmitter {
     super()
     this.port = options.port ?? 0
 
+<<<<<<< HEAD
+    this.wss = new WebSocketServer({ port: this.port, path: '/ws/sdk' })
+=======
     // Bind to loopback only — the SDK bridge WS is for local CLI↔server
     // communication only, not exposed to the network. The CLI connects
     // using ws://127.0.0.1:PORT, and the sessionId (nanoid) acts as a
     // bearer token to prevent unauthorized local connections.
     this.wss = new WebSocketServer({ host: '127.0.0.1', port: this.port, path: '/ws/sdk' })
+>>>>>>> 98b863f (docs: add Claude Web Client Pane implementation plan)
     this.wss.on('listening', () => {
       const addr = this.wss.address()
       this.port = typeof addr === 'object' ? addr.port : this.port
@@ -804,13 +866,22 @@ export class SdkBridge extends EventEmitter {
       '--sdk-url', sdkUrl,
       '--output-format', 'stream-json',
       '--input-format', 'stream-json',
+<<<<<<< HEAD
+      '--print', // synonym for -p
+      '--verbose',
+=======
       '--verbose',
       '-p', '', // headless: empty prompt → waits for input via WS
+>>>>>>> 98b863f (docs: add Claude Web Client Pane implementation plan)
     ]
 
     if (options.model) args.push('--model', options.model)
     if (options.permissionMode) args.push('--permission-mode', options.permissionMode)
     if (options.resumeSessionId) args.push('--resume', options.resumeSessionId)
+<<<<<<< HEAD
+    args.push('-p', '') // headless: empty prompt → waits for input via WS
+=======
+>>>>>>> 98b863f (docs: add Claude Web Client Pane implementation plan)
 
     log.info({ sessionId, cmd: CLAUDE_CMD, args, cwd: options.cwd }, 'Spawning Claude Code in SDK mode')
 
@@ -981,7 +1052,11 @@ export class SdkBridge extends EventEmitter {
     }
   }
 
+<<<<<<< HEAD
+  parseNdjson(data: string): unknown[] {
+=======
   private parseNdjson(data: string): unknown[] {
+>>>>>>> 98b863f (docs: add Claude Web Client Pane implementation plan)
     const results: unknown[] = []
     for (const line of data.split('\n')) {
       if (!line.trim()) continue
@@ -1089,18 +1164,26 @@ Test that `PaneContent` union accepts `{ kind: 'claude-chat', ... }` and `derive
 
 ```typescript
 // In paneTypes.ts, add:
+<<<<<<< HEAD
+=======
 
 /** SDK session statuses — richer than TerminalStatus to reflect Claude Code lifecycle */
 export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited'
 
+>>>>>>> 98b863f (docs: add Claude Web Client Pane implementation plan)
 export type ClaudeChatPaneContent = {
   kind: 'claude-chat'
   /** SDK session ID (undefined until created) */
   sessionId?: string
   /** Idempotency key for sdk.create */
   createRequestId: string
+<<<<<<< HEAD
+  /** Current status */
+  status: TerminalStatus
+=======
   /** Current status — uses SdkSessionStatus, not TerminalStatus */
   status: SdkSessionStatus
+>>>>>>> 98b863f (docs: add Claude Web Client Pane implementation plan)
   /** Claude session to resume */
   resumeSessionId?: string
   /** Working directory */
@@ -1437,11 +1520,30 @@ Handle the full lifecycle: creating SDK sessions when panes mount, cleanup on cl
 
 ---
 
+<<<<<<< HEAD
+### Task 14: Install react-markdown Dependency
+
+The chat UI needs markdown rendering for assistant messages.
+
+**Files:**
+- Modify: `package.json`
+
+**Step 1: Install**
+
+```bash
+npm install react-markdown remark-gfm
+```
+
+Note: Check if these are already dependencies. If not, install and commit the lockfile change.
+
+**Step 2: Commit**
+=======
 ### Task 14: Verify Markdown Dependencies
 
 ~~The chat UI needs markdown rendering for assistant messages.~~
 
 **Status: No action needed.** `react-markdown` (^9.0.1) and `remark-gfm` (^4.0.0) are already in `package.json`. Verify they're importable and move on.
+>>>>>>> 98b863f (docs: add Claude Web Client Pane implementation plan)
 
 ---
 
@@ -1527,4 +1629,8 @@ When creating a new Claude Web pane, show the directory picker (reuse existing `
 - Task 12-13 depend on Tasks 4 and 11
 - Tasks 16-18 depend on Task 15 (integration verified)
 
+<<<<<<< HEAD
+**Key risk:** Claude Code's `--sdk-url` flag and NDJSON protocol are not officially documented and were reverse-engineered by the companion project. If Anthropic changes the protocol, the bridge will need updating. Mitigation: keep the protocol types in a single file (`sdk-bridge-types.ts`) and validate all messages with Zod schemas — invalid messages are logged and skipped rather than crashing.
+=======
 **Key risks and mitigations:** See the "Undocumented SDK protocol risk" and "Why a separate SdkBridge" sections in the Architecture preamble above.
+>>>>>>> 98b863f (docs: add Claude Web Client Pane implementation plan)
