@@ -110,6 +110,11 @@ export default function TabItem({
         isActive
           ? cn(
               "z-30 -mb-px border-b border-b-background bg-background text-foreground after:pointer-events-none after:absolute after:inset-x-0 after:-bottom-px after:h-[2px] after:bg-background after:content-['']",
+              needsAttention && tabAttentionStyle !== 'none' && (
+                tabAttentionStyle === 'darken'
+                  ? 'border-t-[3px] border-t-muted-foreground bg-foreground/[0.08] shadow-[inset_0_4px_8px_hsl(var(--foreground)/0.1)]'
+                  : 'border-t-[3px] border-t-success bg-success/15 shadow-[inset_0_4px_8px_hsl(var(--success)/0.2)]'
+              ),
               needsAttention && tabAttentionStyle === 'pulse' && 'animate-pulse'
             )
           : needsAttention && tabAttentionStyle !== 'none'
@@ -122,19 +127,6 @@ export default function TabItem({
             : 'border-b border-muted-foreground/45 bg-muted text-muted-foreground hover:text-foreground hover:bg-muted/90 mt-1',
         isDragging && 'opacity-50'
       )}
-      style={isActive && needsAttention && tabAttentionStyle !== 'none' ? {
-        borderTopWidth: '3px',
-        borderTopStyle: 'solid',
-        borderTopColor: tabAttentionStyle === 'darken'
-          ? 'hsl(var(--muted-foreground))'
-          : 'hsl(var(--success))',
-        backgroundColor: tabAttentionStyle === 'darken'
-          ? 'hsl(var(--foreground) / 0.08)'
-          : 'hsl(var(--success) / 0.15)',
-        boxShadow: tabAttentionStyle === 'darken'
-          ? 'inset 0 4px 8px hsl(var(--foreground) / 0.1)'
-          : 'inset 0 4px 8px hsl(var(--success) / 0.2)',
-      } : undefined}
       role="button"
       tabIndex={0}
       aria-label={tab.title}
