@@ -61,7 +61,7 @@ describe('ws session repair activity', () => {
     sessionRepairService = new FakeSessionRepairService()
     const registry = new FakeRegistry()
 
-    new WsHandler(server, registry as any, undefined, sessionRepairService as any)
+    new WsHandler(server, registry as any, undefined, undefined, sessionRepairService as any)
     const info = await listen(server)
     port = info.port
   }, HOOK_TIMEOUT_MS)

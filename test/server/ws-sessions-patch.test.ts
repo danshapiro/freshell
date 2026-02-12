@@ -56,6 +56,7 @@ describe('ws sessions.patch broadcast', () => {
       new FakeRegistry() as any,
       undefined,
       undefined,
+      undefined,
       async () => ({
         projects: [{ projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', updatedAt: 1 }] }],
       }),

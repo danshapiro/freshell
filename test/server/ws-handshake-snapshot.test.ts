@@ -167,6 +167,7 @@ describe('ws handshake snapshot', () => {
       new FakeRegistry() as any,
       undefined,
       undefined,
+      undefined,
       async () => snapshot
     )
 
@@ -250,6 +251,7 @@ describe('ws handshake snapshot with chunking', () => {
     new (WsHandler as any)(
       server,
       new FakeRegistry() as any,
+      undefined,
       undefined,
       undefined,
       async () => largeSnapshot

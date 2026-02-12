@@ -189,7 +189,7 @@ describe('terminal.create session repair wait', () => {
 
     sessionRepairService = new FakeSessionRepairService()
     registry = new FakeRegistry()
-    new WsHandler(server, registry as any, undefined, sessionRepairService as any)
+    new WsHandler(server, registry as any, undefined, undefined, sessionRepairService as any)
 
     const info = await listen(server)
     port = info.port

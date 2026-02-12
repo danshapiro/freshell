@@ -103,6 +103,7 @@ describe('ws terminal metadata protocol', () => {
       undefined,
       undefined,
       undefined,
+      undefined,
       () => sampleMeta as any,
     )
     port = await listen(server)

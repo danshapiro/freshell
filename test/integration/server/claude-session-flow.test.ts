@@ -161,7 +161,7 @@ describe.skipIf(!runClaudeIntegration)('Claude Session Flow Integration', () => 
     const server2 = http.createServer(app)
     const registry2 = new TerminalRegistry()
     const cliManager2 = new CodingCliSessionManager([claudeProvider])
-    const wsHandler2 = new WsHandler(server2, registry2, cliManager2, sessionRepairService)
+    const wsHandler2 = new WsHandler(server2, registry2, cliManager2, undefined, sessionRepairService)
 
     let port2 = 0
     await new Promise<void>((resolve) => {
