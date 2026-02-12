@@ -28,6 +28,7 @@ export function useTurnCompletionNotifications() {
   const activePaneByTab = useAppSelector((state) => state.panes?.activePane)
   const { play } = useNotificationSound()
   const lastHandledSeqRef = useRef(0)
+  const prevActiveTabIdRef = useRef(activeTabId)
   const [focused, setFocused] = useState(() => isWindowFocused())
 
   useEffect(() => {
@@ -73,10 +74,15 @@ export function useTurnCompletionNotifications() {
     }
   }, [activeTabId, dispatch, pendingEvents, play])
 
-  // 'click' mode: clear tab + pane attention when the user switches to the tab (and window is focused)
+  // 'click' mode: clear attention only when the user *switches* to a tab that has attention.
+  // If a completion arrives on the already-active tab, the indicator persists until the user
+  // navigates away and back (an actual click/switch).
   useEffect(() => {
+    const switched = prevActiveTabIdRef.current !== activeTabId
+    prevActiveTabIdRef.current = activeTabId
+
     if (attentionDismiss !== 'click') return
-    if (!focused || !activeTabId) return
+    if (!switched || !focused || !activeTabId) return
     if (attentionByTab?.[activeTabId]) {
       dispatch(clearTabAttention({ tabId: activeTabId }))
     }

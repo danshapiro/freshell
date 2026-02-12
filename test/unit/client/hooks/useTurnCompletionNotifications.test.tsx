@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { render, cleanup, act, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
-import tabsReducer from '@/store/tabsSlice'
+import tabsReducer, { setActiveTab } from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import turnCompletionReducer, { recordTurnComplete } from '@/store/turnCompletionSlice'
@@ -275,7 +275,28 @@ describe('useTurnCompletionNotifications', () => {
     })
   })
 
-  it('attention clears in click mode when active tab has attention and window is focused', async () => {
+  it('click mode: attention persists on active tab until user switches away and back', async () => {
+    const store = createStore('tab-1', 'click')
+
+    render(
+      <Provider store={store}>
+        <TestComponent />
+      </Provider>
+    )
+
+    // Completion on active tab while focused — attention should persist (no auto-clear)
+    act(() => {
+      store.dispatch(recordTurnComplete({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 'term-1', at: 100 }))
+    })
+
+    await waitFor(() => {
+      expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+    })
+    expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
+    expect(store.getState().turnCompletion.attentionByPane['pane-1']).toBe(true)
+  })
+
+  it('click mode: attention persists through window blur/focus cycle without tab switch', async () => {
     hasFocus = false
     const store = createStore('tab-2', 'click')
 
@@ -292,12 +313,42 @@ describe('useTurnCompletionNotifications', () => {
     await waitFor(() => {
       expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
     })
-    expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
 
-    // Regain focus — in 'click' mode, both tab and pane attention should clear
+    // Regain focus without switching tabs — attention should persist
     act(() => {
       hasFocus = true
       window.dispatchEvent(new Event('focus'))
+    })
+
+    // Give React a chance to flush effects
+    await waitFor(() => {
+      expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
+    })
+    expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
+  })
+
+  it('click mode: switching to a tab with attention clears both tab and pane attention', async () => {
+    const store = createStore('tab-1', 'click')
+
+    render(
+      <Provider store={store}>
+        <TestComponent />
+      </Provider>
+    )
+
+    // Background tab completes
+    act(() => {
+      store.dispatch(recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-2', terminalId: 'term-2', at: 100 }))
+    })
+
+    await waitFor(() => {
+      expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
+    })
+    expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
+
+    // Simulate switching to tab-2 (as TabBar click would)
+    act(() => {
+      store.dispatch(setActiveTab('tab-2'))
     })
 
     await waitFor(() => {
