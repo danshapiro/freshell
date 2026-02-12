@@ -42,6 +42,7 @@ export interface TabItemProps {
   renameValue: string
   paneContents?: PaneContent[]
   iconsOnTabs?: boolean
+  tabAttentionStyle?: string
   onRenameChange: (value: string) => void
   onRenameBlur: () => void
   onRenameKeyDown: (e: KeyboardEvent<HTMLInputElement>) => void
@@ -59,6 +60,7 @@ export default function TabItem({
   renameValue,
   paneContents,
   iconsOnTabs = true,
+  tabAttentionStyle = 'highlight',
   onRenameChange,
   onRenameBlur,
   onRenameKeyDown,
@@ -106,12 +108,29 @@ export default function TabItem({
       className={cn(
         'group relative flex items-center gap-2 h-8 px-3 rounded-t-md border-x border-t border-muted-foreground/45 text-sm cursor-pointer transition-colors',
         isActive
-          ? "z-30 -mb-px border-b border-b-background bg-background text-foreground after:pointer-events-none after:absolute after:inset-x-0 after:-bottom-px after:h-[2px] after:bg-background after:content-['']"
-          : needsAttention
-            ? 'border-b border-muted-foreground/45 bg-emerald-100 text-emerald-900 hover:bg-emerald-200 mt-1 dark:bg-emerald-900/40 dark:text-emerald-100 dark:hover:bg-emerald-900/55'
+          ? cn(
+              "z-30 -mb-px border-b border-b-background bg-background text-foreground after:pointer-events-none after:absolute after:inset-x-0 after:-bottom-px after:h-[2px] after:bg-background after:content-['']",
+              needsAttention && tabAttentionStyle !== 'none' && tabAttentionStyle === 'pulse' && 'animate-pulse'
+            )
+          : needsAttention && tabAttentionStyle !== 'none'
+            ? tabAttentionStyle === 'darken'
+              ? 'border-b border-muted-foreground/45 bg-foreground/15 text-foreground hover:bg-foreground/20 mt-1 dark:bg-foreground/20 dark:text-foreground dark:hover:bg-foreground/25'
+              : cn(
+                  'border-b border-muted-foreground/45 bg-emerald-100 text-emerald-900 hover:bg-emerald-200 mt-1 dark:bg-emerald-900/40 dark:text-emerald-100 dark:hover:bg-emerald-900/55',
+                  tabAttentionStyle === 'pulse' && 'animate-pulse'
+                )
             : 'border-b border-muted-foreground/45 bg-muted text-muted-foreground hover:text-foreground hover:bg-muted/90 mt-1',
         isDragging && 'opacity-50'
       )}
+      style={isActive && needsAttention && tabAttentionStyle !== 'none' ? {
+        borderTopWidth: '3px',
+        borderTopStyle: 'solid',
+        borderTopColor: tabAttentionStyle === 'darken' ? '#666' : '#059669',
+        backgroundColor: tabAttentionStyle === 'darken' ? 'rgba(0,0,0,0.15)' : 'rgba(16,185,129,0.25)',
+        boxShadow: tabAttentionStyle === 'darken'
+          ? 'inset 0 4px 8px rgba(0,0,0,0.15)'
+          : 'inset 0 4px 8px rgba(16,185,129,0.3)',
+      } : undefined}
       role="button"
       tabIndex={0}
       aria-label={tab.title}

@@ -1,7 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import {
-  clearTabAttention,
   consumeTurnCompleteEvents,
   markTabAttention,
   type TurnCompleteEvent,
@@ -21,23 +20,7 @@ export function useTurnCompletionNotifications() {
   const activeTabId = useAppSelector((state) => state.tabs.activeTabId)
   const pendingEvents = useAppSelector((state) => state.turnCompletion?.pendingEvents ?? EMPTY_PENDING_EVENTS)
   const { play } = useNotificationSound()
-  const [focused, setFocused] = useState(() => isWindowFocused())
   const lastHandledSeqRef = useRef(0)
-
-  useEffect(() => {
-    if (typeof window === 'undefined' || typeof document === 'undefined') return
-
-    const updateFocus = () => setFocused(isWindowFocused())
-    window.addEventListener('focus', updateFocus)
-    window.addEventListener('blur', updateFocus)
-    document.addEventListener('visibilitychange', updateFocus)
-
-    return () => {
-      window.removeEventListener('focus', updateFocus)
-      window.removeEventListener('blur', updateFocus)
-      document.removeEventListener('visibilitychange', updateFocus)
-    }
-  }, [])
 
   useEffect(() => {
     if (pendingEvents.length === 0) return
@@ -49,10 +32,10 @@ export function useTurnCompletionNotifications() {
     for (const event of pendingEvents) {
       if (event.seq <= lastHandledSeqRef.current) continue
       highestHandledSeq = Math.max(highestHandledSeq, event.seq)
+      dispatch(markTabAttention({ tabId: event.tabId }))
       if (windowFocused && activeTabId === event.tabId) {
         continue
       }
-      dispatch(markTabAttention({ tabId: event.tabId }))
       shouldPlay = true
     }
 
@@ -66,8 +49,7 @@ export function useTurnCompletionNotifications() {
     }
   }, [activeTabId, dispatch, pendingEvents, play])
 
-  useEffect(() => {
-    if (!focused || !activeTabId) return
-    dispatch(clearTabAttention({ tabId: activeTabId }))
-  }, [activeTabId, dispatch, focused])
+  // Attention is cleared by TerminalView when the user sends input,
+  // not by a timer. This keeps the indicator visible until the user
+  // actually engages with the tab.
 }

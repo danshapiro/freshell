@@ -15,6 +15,7 @@ export const defaultSettings: AppSettings = {
     cursorBlink: true,
     scrollback: 5000,
     theme: 'auto',
+    warnExternalLinks: true,
   },
   defaultCwd: undefined,
   logging: {
@@ -36,6 +37,7 @@ export const defaultSettings: AppSettings = {
     defaultNewPane: 'ask' as const,
     snapThreshold: 2,
     iconsOnTabs: true,
+    tabAttentionStyle: 'highlight' as const,
   },
   codingCli: {
     enabledProviders: ['claude', 'codex'],

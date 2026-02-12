@@ -41,6 +41,7 @@ export type AppSettings = {
       | 'one-light'
       | 'solarized-light'
       | 'github-light'
+    warnExternalLinks: boolean
   }
   defaultCwd?: string
   logging: {
@@ -53,6 +54,7 @@ export type AppSettings = {
   panes: {
     defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor'
     snapThreshold: number // 0-8, % of container's smallest dimension; 0 = off
+    tabAttentionStyle: 'highlight' | 'pulse' | 'darken' | 'none'
   }
   sidebar: {
     sortMode: 'recency' | 'activity' | 'project'
@@ -110,6 +112,7 @@ export const defaultSettings: AppSettings = {
     cursorBlink: true,
     scrollback: 5000,
     theme: 'auto',
+    warnExternalLinks: true,
   },
   defaultCwd: undefined,
   logging: {
@@ -289,6 +292,7 @@ function mergeSettings(base: AppSettings, patch: Partial<AppSettings>): AppSetti
     cursorBlink: terminalPatch.cursorBlink,
     scrollback: terminalPatch.scrollback,
     theme: terminalPatch.theme,
+    warnExternalLinks: terminalPatch.warnExternalLinks,
   }
   return {
     ...base,

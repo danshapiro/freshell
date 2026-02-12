@@ -40,6 +40,7 @@ interface SortableTabProps {
   renameValue: string
   paneContents?: PaneContent[]
   iconsOnTabs?: boolean
+  tabAttentionStyle?: string
   onRenameChange: (value: string) => void
   onRenameBlur: () => void
   onRenameKeyDown: (e: React.KeyboardEvent<HTMLInputElement>) => void
@@ -58,6 +59,7 @@ function SortableTab({
   renameValue,
   paneContents,
   iconsOnTabs,
+  tabAttentionStyle,
   onRenameChange,
   onRenameBlur,
   onRenameKeyDown,
@@ -95,6 +97,7 @@ function SortableTab({
         renameValue={renameValue}
         paneContents={paneContents}
         iconsOnTabs={iconsOnTabs}
+        tabAttentionStyle={tabAttentionStyle}
         onRenameChange={onRenameChange}
         onRenameBlur={onRenameBlur}
         onRenameKeyDown={onRenameKeyDown}
@@ -121,6 +124,7 @@ export default function TabBar() {
   const paneLayouts = useAppSelector((s) => s.panes?.layouts) ?? EMPTY_LAYOUTS
   const attentionByTab = useAppSelector((s) => s.turnCompletion?.attentionByTab) ?? EMPTY_ATTENTION
   const iconsOnTabs = useAppSelector((s) => s.settings?.settings?.panes?.iconsOnTabs ?? true)
+  const tabAttentionStyle = useAppSelector((s) => s.settings?.settings?.panes?.tabAttentionStyle ?? 'highlight')
 
   const ws = useMemo(() => getWsClient(), [])
 
@@ -257,6 +261,7 @@ export default function TabBar() {
                 renameValue={renameValue}
                 paneContents={getPaneContents(tab)}
                 iconsOnTabs={iconsOnTabs}
+                tabAttentionStyle={tabAttentionStyle}
                 onRenameChange={setRenameValue}
                 onRenameBlur={() => {
                   dispatch(
@@ -333,6 +338,7 @@ export default function TabBar() {
                 renameValue=""
                 paneContents={getPaneContents(activeTab)}
                 iconsOnTabs={iconsOnTabs}
+                tabAttentionStyle={tabAttentionStyle}
                 onRenameChange={() => {}}
                 onRenameBlur={() => {}}
                 onRenameKeyDown={() => {}}

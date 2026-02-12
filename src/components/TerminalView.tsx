@@ -3,7 +3,7 @@ import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
-import { recordTurnComplete } from '@/store/turnCompletionSlice'
+import { recordTurnComplete, clearTabAttention } from '@/store/turnCompletionSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import { getResumeSessionIdFromRef } from '@/components/terminal-view-utils'
@@ -152,8 +152,10 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const sendInput = useCallback((data: string) => {
     const tid = terminalIdRef.current
     if (!tid) return
+    // Clear attention indicator when user starts typing
+    dispatch(clearTabAttention({ tabId }))
     ws.send({ type: 'terminal.input', terminalId: tid, data })
-  }, [ws])
+  }, [dispatch, tabId, ws])
 
   // Init xterm once
   useEffect(() => {
@@ -176,6 +178,17 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       lineHeight: settings.terminal.lineHeight,
       scrollback: settings.terminal.scrollback,
       theme: getTerminalTheme(settings.terminal.theme, settings.theme),
+      linkHandler: {
+        activate: (_event: MouseEvent, uri: string) => {
+          if (settings.terminal.warnExternalLinks !== false) {
+            if (confirm(`Do you want to navigate to ${uri}?\n\nWARNING: This link could potentially be dangerous`)) {
+              window.open(uri, '_blank')
+            }
+          } else {
+            window.open(uri, '_blank')
+          }
+        },
+      },
     })
     const fit = new FitAddon()
     term.loadAddon(fit)
