@@ -26,6 +26,7 @@ import { AI_CONFIG, PROMPTS, stripAnsi } from './ai-prompts.js'
 import { migrateSettingsSortMode } from './settings-migrate.js'
 import { filesRouter } from './files-router.js'
 import { getSessionRepairService } from './session-scanner/service.js'
+import { SdkBridge } from './sdk-bridge.js'
 import { createClientLogsRouter } from './client-logs.js'
 import { createStartupState } from './startup-state.js'
 import { getPerfConfig, initPerfLogging, setPerfLoggingEnabled, startPerfTimer, withPerfSpan } from './perf-logger.js'
@@ -156,11 +157,14 @@ async function main() {
 
   const sessionRepairService = getSessionRepairService()
 
+  const sdkBridge = new SdkBridge()
+
   const server = http.createServer(app)
   const wsHandler = new WsHandler(
     server,
     registry,
     codingCliSessionManager,
+    sdkBridge,
     sessionRepairService,
     async () => {
       const currentSettings = migrateSettingsSortMode(await configStore.getSettings())
@@ -822,20 +826,23 @@ async function main() {
     // 4. Kill all coding CLI sessions
     codingCliSessionManager.shutdown()
 
-    // 5. Close WebSocket connections gracefully
+    // 5. Close SDK bridge sessions
+    sdkBridge.close()
+
+    // 6. Close WebSocket connections gracefully
     wsHandler.close()
 
-    // 6. Close port forwards
+    // 7. Close port forwards
     portForwardManager.closeAll()
 
-    // 7. Stop session indexers
+    // 8. Stop session indexers
     codingCliIndexer.stop()
     claudeIndexer.stop()
 
-    // 8. Stop session repair service
+    // 9. Stop session repair service
     await sessionRepairService.stop()
 
-    // 9. Exit cleanly
+    // 10. Exit cleanly
     log.info('Shutdown complete')
     process.exit(0)
   }

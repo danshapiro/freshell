@@ -124,7 +124,7 @@ export type CliMessage = z.infer<typeof CliMessageSchema>
 
 // ── Browser → Server SDK messages ──
 
-const SdkCreateSchema = z.object({
+export const SdkCreateSchema = z.object({
   type: z.literal('sdk.create'),
   requestId: z.string().min(1),
   cwd: z.string().optional(),
@@ -133,7 +133,7 @@ const SdkCreateSchema = z.object({
   permissionMode: z.string().optional(),
 })
 
-const SdkSendSchema = z.object({
+export const SdkSendSchema = z.object({
   type: z.literal('sdk.send'),
   sessionId: z.string().min(1),
   text: z.string().min(1),
@@ -143,7 +143,7 @@ const SdkSendSchema = z.object({
   })).optional(),
 })
 
-const SdkPermissionRespondSchema = z.object({
+export const SdkPermissionRespondSchema = z.object({
   type: z.literal('sdk.permission.respond'),
   sessionId: z.string().min(1),
   requestId: z.string().min(1),
@@ -152,17 +152,17 @@ const SdkPermissionRespondSchema = z.object({
   message: z.string().optional(),
 })
 
-const SdkInterruptSchema = z.object({
+export const SdkInterruptSchema = z.object({
   type: z.literal('sdk.interrupt'),
   sessionId: z.string().min(1),
 })
 
-const SdkKillSchema = z.object({
+export const SdkKillSchema = z.object({
   type: z.literal('sdk.kill'),
   sessionId: z.string().min(1),
 })
 
-const SdkAttachSchema = z.object({
+export const SdkAttachSchema = z.object({
   type: z.literal('sdk.attach'),
   sessionId: z.string().min(1),
 })

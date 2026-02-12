@@ -14,6 +14,16 @@ import type { TerminalMeta } from './terminal-metadata-service.js'
 import type { SessionRepairService } from './session-scanner/service.js'
 import type { SessionScanResult, SessionRepairResult } from './session-scanner/types.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
+import type { SdkBridge } from './sdk-bridge.js'
+import type { SdkServerMessage } from './sdk-bridge-types.js'
+import {
+  SdkCreateSchema,
+  SdkSendSchema,
+  SdkPermissionRespondSchema,
+  SdkInterruptSchema,
+  SdkKillSchema,
+  SdkAttachSchema,
+} from './sdk-bridge-types.js'
 
 const MAX_CONNECTIONS = Number(process.env.MAX_CONNECTIONS || 10)
 const HELLO_TIMEOUT_MS = Number(process.env.HELLO_TIMEOUT_MS || 5_000)
@@ -315,6 +325,12 @@ const ClientMessageSchema = z.discriminatedUnion('type', [
   CodingCliCreateSchema,
   CodingCliInputSchema,
   CodingCliKillSchema,
+  SdkCreateSchema,
+  SdkSendSchema,
+  SdkPermissionRespondSchema,
+  SdkInterruptSchema,
+  SdkKillSchema,
+  SdkAttachSchema,
 ])
 
 type ClientState = {
@@ -327,6 +343,8 @@ type ClientState = {
   terminalCreateTimestamps: number[]
   codingCliSessions: Set<string>
   codingCliSubscriptions: Map<string, () => void>
+  sdkSessions: Set<string>
+  sdkSubscriptions: Map<string, () => void>
   interestedSessions: Set<string>
   helloTimer?: NodeJS.Timeout
 }
@@ -360,6 +378,7 @@ export class WsHandler {
     server: http.Server,
     private registry: TerminalRegistry,
     private codingCliManager?: CodingCliSessionManager,
+    private sdkBridge?: SdkBridge,
     sessionRepairService?: SessionRepairService,
     handshakeSnapshotProvider?: HandshakeSnapshotProvider,
     terminalMetaListProvider?: () => TerminalMeta[]
@@ -517,6 +536,8 @@ export class WsHandler {
       terminalCreateTimestamps: [],
       codingCliSessions: new Set(),
       codingCliSubscriptions: new Map(),
+      sdkSessions: new Set(),
+      sdkSubscriptions: new Map(),
       interestedSessions: new Set(),
     }
     this.clientStates.set(ws, state)
@@ -577,6 +598,10 @@ export class WsHandler {
       off()
     }
     state.codingCliSubscriptions.clear()
+    for (const off of state.sdkSubscriptions.values()) {
+      off()
+    }
+    state.sdkSubscriptions.clear()
 
     const durationMs = ws.connectedAt ? Date.now() - ws.connectedAt : undefined
     const reasonText = reason ? reason.toString() : undefined
@@ -1433,6 +1458,124 @@ export class WsHandler {
           type: 'codingcli.killed',
           sessionId: m.sessionId,
           success: removed,
+        })
+        return
+      }
+
+      case 'sdk.create': {
+        if (!this.sdkBridge) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled', requestId: m.requestId })
+          return
+        }
+        try {
+          const session = this.sdkBridge.createSession({
+            cwd: m.cwd,
+            resumeSessionId: m.resumeSessionId,
+            model: m.model,
+            permissionMode: m.permissionMode,
+          })
+          state.sdkSessions.add(session.sessionId)
+
+          // Subscribe this client to session events
+          const off = this.sdkBridge.subscribe(session.sessionId, (msg: SdkServerMessage) => {
+            this.safeSend(ws, msg)
+          })
+          if (off) state.sdkSubscriptions.set(session.sessionId, off)
+
+          this.send(ws, { type: 'sdk.created', requestId: m.requestId, sessionId: session.sessionId })
+
+          if (m.cwd?.trim()) {
+            void configStore.pushRecentDirectory(m.cwd.trim()).catch((err) => {
+              log.warn({ err, cwd: m.cwd }, 'Failed to record recent directory for SDK session')
+            })
+          }
+        } catch (err: any) {
+          log.warn({ err }, 'sdk.create failed')
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: err?.message || 'Failed to create SDK session', requestId: m.requestId })
+        }
+        return
+      }
+
+      case 'sdk.send': {
+        if (!this.sdkBridge) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
+          return
+        }
+        const ok = this.sdkBridge.sendUserMessage(m.sessionId, m.text, m.images)
+        if (!ok) {
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'SDK session not found' })
+        }
+        return
+      }
+
+      case 'sdk.permission.respond': {
+        if (!this.sdkBridge) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
+          return
+        }
+        const ok = this.sdkBridge.respondPermission(m.sessionId, m.requestId, m.behavior, m.updatedInput, m.message)
+        if (!ok) {
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'SDK session not found' })
+        }
+        return
+      }
+
+      case 'sdk.interrupt': {
+        if (!this.sdkBridge) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
+          return
+        }
+        this.sdkBridge.interrupt(m.sessionId)
+        return
+      }
+
+      case 'sdk.kill': {
+        if (!this.sdkBridge) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
+          return
+        }
+        const killed = this.sdkBridge.killSession(m.sessionId)
+        state.sdkSessions.delete(m.sessionId)
+        const off = state.sdkSubscriptions.get(m.sessionId)
+        if (off) {
+          off()
+          state.sdkSubscriptions.delete(m.sessionId)
+        }
+        this.send(ws, { type: 'sdk.killed', sessionId: m.sessionId, success: killed })
+        return
+      }
+
+      case 'sdk.attach': {
+        if (!this.sdkBridge) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
+          return
+        }
+        const session = this.sdkBridge.getSession(m.sessionId)
+        if (!session) {
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'SDK session not found' })
+          return
+        }
+
+        // Subscribe this client to session events if not already
+        if (!state.sdkSubscriptions.has(m.sessionId)) {
+          const off = this.sdkBridge.subscribe(m.sessionId, (msg: SdkServerMessage) => {
+            this.safeSend(ws, msg)
+          })
+          if (off) state.sdkSubscriptions.set(m.sessionId, off)
+        }
+
+        // Send history replay
+        this.send(ws, {
+          type: 'sdk.history',
+          sessionId: m.sessionId,
+          messages: session.messages,
+        })
+
+        // Send current status
+        this.send(ws, {
+          type: 'sdk.status',
+          sessionId: m.sessionId,
+          status: session.status,
         })
         return
       }
