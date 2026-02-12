@@ -90,9 +90,10 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     warnExternalLinksRef.current = settings.terminal.warnExternalLinks
   }, [settings.terminal.warnExternalLinks])
 
-  useEffect(() => {
-    hasAttentionRef.current = hasAttention
-  }, [hasAttention])
+  // Sync ref during render (not in useEffect) so sendInput always sees the
+  // latest value — avoids a stale-ref window where the first keystroke after
+  // attention is set wouldn't clear it.
+  hasAttentionRef.current = hasAttention
 
   const shouldFocusActiveTerminal = !hidden && activeTabId === tabId && activePaneId === paneId
 
