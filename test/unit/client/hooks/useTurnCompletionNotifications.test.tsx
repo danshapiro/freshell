@@ -117,7 +117,7 @@ describe('useTurnCompletionNotifications', () => {
     expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
   })
 
-  it('does not play bell or mark attention when the active tab completes while focused', async () => {
+  it('does not play bell but marks attention when the active tab completes while focused', async () => {
     const store = createStore('tab-1')
 
     render(
@@ -135,7 +135,8 @@ describe('useTurnCompletionNotifications', () => {
     })
 
     expect(playSound).not.toHaveBeenCalled()
-    expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBeUndefined()
+    // Attention is now always marked; cleared later by TerminalView on user input
+    expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
     expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
   })
 
@@ -200,11 +201,12 @@ describe('useTurnCompletionNotifications', () => {
     })
 
     expect(playSound).toHaveBeenCalledTimes(1)
-    expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBeUndefined()
+    // Attention is now marked for all events; active tab attention cleared by TerminalView
+    expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
     expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
   })
 
-  it('clears attention when tab is active and window regains focus', async () => {
+  it('does not auto-clear attention on focus (cleared by TerminalView on user input)', async () => {
     hasFocus = false
     const store = createStore('tab-1')
 
@@ -228,8 +230,7 @@ describe('useTurnCompletionNotifications', () => {
       window.dispatchEvent(new Event('focus'))
     })
 
-    await waitFor(() => {
-      expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBeUndefined()
-    })
+    // Attention persists until TerminalView clears it on user input
+    expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
   })
 })

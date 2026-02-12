@@ -253,7 +253,7 @@ describe('turn complete notification flow (e2e)', () => {
     }
   })
 
-  it('bells and highlights on background completion, then clears when selected and focused', async () => {
+  it('bells and highlights on background completion, attention persists until user input', async () => {
     const store = createStore()
 
     render(
@@ -292,6 +292,8 @@ describe('turn complete notification flow (e2e)', () => {
       expect(store.getState().tabs.activeTabId).toBe('tab-2')
     })
 
+    // Attention persists after switching tab and regaining focus;
+    // it's now cleared by TerminalView on user input, not by focus events
     expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
 
     act(() => {
@@ -299,11 +301,12 @@ describe('turn complete notification flow (e2e)', () => {
       window.dispatchEvent(new Event('focus'))
     })
 
-    await waitFor(() => {
-      expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBeUndefined()
-    })
+    // Attention still persists — no auto-clear on focus
+    expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
 
+    // Active tab with attention uses inline styles (colored top border + bg)
+    // instead of the bg-emerald-100 class used on inactive tabs
     const backgroundTabAfter = screen.getByText('Background').closest('div[class*="group"]')
-    expect(backgroundTabAfter?.className).not.toContain('bg-emerald-100')
+    expect(backgroundTabAfter?.style.borderTopColor).toBe('rgb(5, 150, 105)')
   })
 })

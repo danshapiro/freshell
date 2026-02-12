@@ -573,6 +573,7 @@ describe('Settings API Integration', () => {
         cursorBlink: false,
         scrollback: 3000,
         theme: 'light',
+        warnExternalLinks: true,
       })
       expect(res.body.terminal).not.toHaveProperty('fontFamily')
     })
