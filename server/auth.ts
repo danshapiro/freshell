@@ -29,6 +29,11 @@ export function httpAuthMiddleware(req: Request, res: Response, next: NextFuncti
   // Allow health checks without auth (optional)
   if (req.path === '/api/health') return next()
 
+  // Optional: trust Cloudflare Access for auth (SSO) when explicitly enabled.
+  // This allows single-login via Access for remote usage while keeping AUTH_TOKEN
+  // as the fallback for direct/local access.
+  if (isCloudflareAccessAuthAllowed(req)) return next()
+
   const token = process.env.AUTH_TOKEN
   if (!token) return res.status(500).json({ error: 'Server misconfigured: AUTH_TOKEN missing' })
 
@@ -37,6 +42,35 @@ export function httpAuthMiddleware(req: Request, res: Response, next: NextFuncti
     return res.status(401).json({ error: 'Unauthorized' })
   }
   next()
+}
+
+function parseCsvEnv(name: string): string[] {
+  const raw = process.env[name]
+  if (!raw) return []
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+}
+
+export function getCloudflareAccessEmail(req: Request): string | null {
+  // Cloudflare Access injects this header for authenticated users.
+  const email = req.headers['cf-access-authenticated-user-email'] as string | undefined
+  if (!email) return null
+  return email.trim() || null
+}
+
+export function isCloudflareAccessAuthAllowed(req: Request): boolean {
+  const enabled = (process.env.FRESHELL_TRUST_CF_ACCESS || '').toLowerCase() === 'true'
+  if (!enabled) return false
+
+  const email = getCloudflareAccessEmail(req)
+  if (!email) return false
+
+  const allow = parseCsvEnv('FRESHELL_CF_ACCESS_EMAIL_ALLOWLIST').map((e) => e.toLowerCase())
+  if (allow.length === 0) return false
+
+  return allow.includes(email.toLowerCase())
 }
 
 export function parseAllowedOrigins(): string[] {

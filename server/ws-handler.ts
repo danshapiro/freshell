@@ -4,7 +4,7 @@ import WebSocket, { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { logger } from './logger.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
-import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed } from './auth.js'
+import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed, isCloudflareAccessAuthAllowed } from './auth.js'
 import type { TerminalRegistry, TerminalMode } from './terminal-registry.js'
 import { configStore, type AppSettings } from './config-store.js'
 import type { CodingCliSessionManager } from './coding-cli/session-manager.js'
@@ -203,6 +203,7 @@ const ClientMessageSchema = z.discriminatedUnion('type', [
 
 type ClientState = {
   authenticated: boolean
+  authenticatedViaAccess: boolean
   supportsSessionsPatchV1: boolean
   sessionsSnapshotSent: boolean
   attachedTerminalIds: Set<string>
@@ -367,7 +368,6 @@ export class WsHandler {
     const isLoopback = isLoopbackAddress(remoteAddr)
 
     if (!isLoopback) {
-      // Remote connections must have a valid Origin
       if (!origin) {
         ws.close(CLOSE_CODES.NOT_AUTHENTICATED, 'Origin required')
         return
@@ -385,8 +385,11 @@ export class WsHandler {
     ws.connectionId = connectionId
     ws.connectedAt = Date.now()
 
+    const accessAuthed = isCloudflareAccessAuthAllowed(req as any)
+
     const state: ClientState = {
       authenticated: false,
+      authenticatedViaAccess: accessAuthed,
       supportsSessionsPatchV1: false,
       sessionsSnapshotSent: false,
       attachedTerminalIds: new Set(),
@@ -413,6 +416,7 @@ export class WsHandler {
         origin,
         remoteAddr,
         userAgent,
+        accessAuthed,
         connectionCount: this.connections.size,
       },
       'WebSocket connection opened',
@@ -663,12 +667,14 @@ export class WsHandler {
       }
 
       if (m.type === 'hello') {
-        const expected = getRequiredAuthToken()
-        if (!m.token || m.token !== expected) {
-          log.warn({ event: 'ws_auth_failed', connectionId: ws.connectionId }, 'WebSocket auth failed')
-          this.sendError(ws, { code: 'NOT_AUTHENTICATED', message: 'Invalid token' })
-          ws.close(CLOSE_CODES.NOT_AUTHENTICATED, 'Invalid token')
-          return
+        if (!state.authenticatedViaAccess) {
+          const expected = getRequiredAuthToken()
+          if (!m.token || m.token !== expected) {
+            log.warn({ event: 'ws_auth_failed', connectionId: ws.connectionId }, 'WebSocket auth failed')
+            this.sendError(ws, { code: 'NOT_AUTHENTICATED', message: 'Invalid token' })
+            ws.close(CLOSE_CODES.NOT_AUTHENTICATED, 'Invalid token')
+            return
+          }
         }
         state.authenticated = true
         state.supportsSessionsPatchV1 = !!m.capabilities?.sessionsPatchV1

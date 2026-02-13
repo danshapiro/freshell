@@ -688,16 +688,16 @@ async function main() {
   server.listen(port, bindHost, () => {
     log.info({ event: 'server_listening', port, appVersion: APP_VERSION }, 'Server listening')
 
-    // Print friendly startup message
-    const token = process.env.AUTH_TOKEN
+    // Print friendly startup message without leaking the auth token to logs.
     const lanIps = detectLanIps()
     const lanIp = bindHost === '0.0.0.0' ? (lanIps[0] || 'localhost') : bindHost
     const visitPort = resolveVisitPort(port, process.env)
-    const url = `http://${lanIp}:${visitPort}/?token=${token}`
+    const url = `http://${lanIp}:${visitPort}/`
 
     console.log('')
     console.log(`\x1b[32m\u{1F41A}\u{1F525} freshell is ready!\x1b[0m`)
     console.log(`   Visit from anywhere on your network: \x1b[36m${url}\x1b[0m`)
+    console.log('   Auth token is configured in .env (not printed to logs).')
     console.log('')
 
     startBackgroundTasks()
