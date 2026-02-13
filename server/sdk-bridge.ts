@@ -1,6 +1,15 @@
 import { nanoid } from 'nanoid'
 import { EventEmitter } from 'events'
-import { query, type SDKMessage, type Query as SdkQuery } from '@anthropic-ai/claude-agent-sdk'
+import {
+  query,
+  type SDKMessage,
+  type SDKSystemMessage,
+  type SDKAssistantMessage,
+  type SDKResultMessage,
+  type SDKPartialAssistantMessage,
+  type SDKStatusMessage,
+  type Query as SdkQuery,
+} from '@anthropic-ai/claude-agent-sdk'
 import type { PermissionResult, PermissionUpdate } from '@anthropic-ai/claude-agent-sdk'
 import { logger } from './logger.js'
 import type {
@@ -11,6 +20,11 @@ import type {
 
 const log = logger.child({ component: 'sdk-bridge' })
 
+interface InputStreamHandle {
+  push: (msg: unknown) => void
+  end: () => void
+}
+
 interface SessionProcess {
   query: SdkQuery
   abortController: AbortController
@@ -18,6 +32,7 @@ interface SessionProcess {
   /** Buffer messages until the first subscriber attaches (prevents race condition) */
   messageBuffer: SdkServerMessage[]
   hasSubscribers: boolean
+  inputStream: InputStreamHandle
 }
 
 export class SdkBridge extends EventEmitter {
@@ -47,9 +62,10 @@ export class SdkBridge extends EventEmitter {
     this.sessions.set(sessionId, state)
 
     const abortController = new AbortController()
+    const { iterable: inputIterable, handle: inputStream } = this.createInputStream()
 
     const sdkQuery = query({
-      prompt: this.createInputStream(sessionId),
+      prompt: inputIterable as AsyncIterable<any>,
       options: {
         cwd: options.cwd || undefined,
         resume: options.resumeSessionId,
@@ -70,6 +86,7 @@ export class SdkBridge extends EventEmitter {
       browserListeners: new Set(),
       messageBuffer: [],
       hasSubscribers: false,
+      inputStream,
     })
 
     // Start consuming the message stream in the background
@@ -81,13 +98,13 @@ export class SdkBridge extends EventEmitter {
   }
 
   // Creates an async iterable that yields user messages written via sendUserMessage
-  private createInputStream(sessionId: string): AsyncIterable<any> {
-    const queue: any[] = []
-    let waiting: ((value: IteratorResult<any>) => void) | null = null
+  private createInputStream(): { iterable: AsyncIterable<unknown>; handle: InputStreamHandle } {
+    const queue: unknown[] = []
+    let waiting: ((value: IteratorResult<unknown>) => void) | null = null
     let done = false
 
-    const inputStream = {
-      push: (msg: any) => {
+    const handle: InputStreamHandle = {
+      push: (msg: unknown) => {
         if (waiting) {
           const resolve = waiting
           waiting = null
@@ -106,13 +123,10 @@ export class SdkBridge extends EventEmitter {
       },
     }
 
-    // Store on the instance for sendUserMessage to find
-    ;(this as any)[`_input_${sessionId}`] = inputStream
-
-    return {
+    const iterable: AsyncIterable<unknown> = {
       [Symbol.asyncIterator]() {
         return {
-          next(): Promise<IteratorResult<any>> {
+          next(): Promise<IteratorResult<unknown>> {
             if (queue.length > 0) {
               return Promise.resolve({ value: queue.shift(), done: false })
             }
@@ -124,6 +138,8 @@ export class SdkBridge extends EventEmitter {
         }
       },
     }
+
+    return { iterable, handle }
   }
 
   private async consumeStream(sessionId: string, sdkQuery: SdkQuery): Promise<void> {
@@ -151,12 +167,8 @@ export class SdkBridge extends EventEmitter {
           sessionId,
           exitCode: undefined,
         })
-        // Clean up input stream
-        const inputStream = (this as any)[`_input_${sessionId}`]
-        if (inputStream) {
-          inputStream.end()
-          delete (this as any)[`_input_${sessionId}`]
-        }
+        // End the input stream before removing the process entry
+        sp?.inputStream.end()
         this.processes.delete(sessionId)
         this.sessions.delete(sessionId)
       } else {
@@ -174,10 +186,10 @@ export class SdkBridge extends EventEmitter {
     switch (msg.type) {
       case 'system': {
         if (msg.subtype === 'init') {
-          const init = msg as any
+          const init = msg as SDKSystemMessage
           state.cliSessionId = init.session_id
           state.model = init.model || state.model
-          state.tools = (init.tools as string[] | undefined)?.map((t: string) => ({ name: t }))
+          state.tools = init.tools?.map((t) => ({ name: t }))
           state.cwd = init.cwd || state.cwd
           state.status = 'connected'
           this.broadcastToSession(sessionId, {
@@ -189,8 +201,8 @@ export class SdkBridge extends EventEmitter {
             tools: state.tools,
           })
         } else if (msg.subtype === 'status') {
-          const status = (msg as any).status
-          if (status === 'compacting') {
+          const statusMsg = msg as SDKStatusMessage
+          if (statusMsg.status === 'compacting') {
             state.status = 'compacting'
             this.broadcastToSession(sessionId, {
               type: 'sdk.status',
@@ -203,7 +215,7 @@ export class SdkBridge extends EventEmitter {
       }
 
       case 'assistant': {
-        const aMsg = msg as any
+        const aMsg = msg as SDKAssistantMessage
         const content = aMsg.message?.content || []
         const blocks: ContentBlock[] = content.map((b: any) => {
           if (b.type === 'text') return { type: 'text' as const, text: b.text }
@@ -222,32 +234,43 @@ export class SdkBridge extends EventEmitter {
           type: 'sdk.assistant',
           sessionId,
           content: blocks,
-          model: aMsg.message?.model,
+          model: (aMsg.message as any)?.model,
         })
         break
       }
 
       case 'result': {
-        const rMsg = msg as any
+        const rMsg = msg as SDKResultMessage
         if (rMsg.total_cost_usd != null) state.costUsd += rMsg.total_cost_usd
         if (rMsg.usage) {
           state.totalInputTokens += rMsg.usage.input_tokens ?? 0
           state.totalOutputTokens += rMsg.usage.output_tokens ?? 0
         }
         state.status = 'idle'
+        // Extract usage fields to satisfy the Zod-inferred structural type (SDK's
+        // NonNullableUsage is a mapped type that is structurally compatible but not directly
+        // assignable to the Zod output type)
+        const usage = rMsg.usage
+          ? {
+              input_tokens: rMsg.usage.input_tokens,
+              output_tokens: rMsg.usage.output_tokens,
+              cache_creation_input_tokens: rMsg.usage.cache_creation_input_tokens,
+              cache_read_input_tokens: rMsg.usage.cache_read_input_tokens,
+            }
+          : undefined
         this.broadcastToSession(sessionId, {
           type: 'sdk.result',
           sessionId,
           result: rMsg.subtype,
           durationMs: rMsg.duration_ms,
           costUsd: rMsg.total_cost_usd,
-          usage: rMsg.usage,
+          usage,
         })
         break
       }
 
       case 'stream_event': {
-        const sMsg = msg as any
+        const sMsg = msg as SDKPartialAssistantMessage
         this.broadcastToSession(sessionId, {
           type: 'sdk.stream',
           sessionId,
@@ -354,8 +377,8 @@ export class SdkBridge extends EventEmitter {
   }
 
   sendUserMessage(sessionId: string, text: string, images?: Array<{ mediaType: string; data: string }>): boolean {
-    const inputStream = (this as any)[`_input_${sessionId}`]
-    if (!inputStream) return false
+    const sp = this.processes.get(sessionId)
+    if (!sp) return false
 
     const state = this.sessions.get(sessionId)
     if (state) {
@@ -376,7 +399,7 @@ export class SdkBridge extends EventEmitter {
       }
     }
 
-    inputStream.push({
+    sp.inputStream.push({
       type: 'user',
       message: { role: 'user', content },
       parent_tool_use_id: null,
