@@ -78,6 +78,51 @@ export function findTabIdForSession(state: RootState, provider: CodingCliProvide
 }
 
 /**
+ * Find the tab and pane that contain a specific session.
+ * Walks all tabs' pane trees looking for a terminal pane matching the provider + sessionId.
+ * Falls back to tab-level resumeSessionId when no layout exists (early boot/rehydration).
+ */
+export function findPaneForSession(
+  state: RootState,
+  provider: CodingCliProviderName,
+  sessionId: string
+): { tabId: string; paneId: string | undefined } | undefined {
+  for (const tab of state.tabs.tabs) {
+    const layout = state.panes.layouts[tab.id]
+    if (layout) {
+      const paneId = findPaneInNode(layout, provider, sessionId)
+      if (paneId) return { tabId: tab.id, paneId }
+      continue
+    }
+
+    // Fallback: tab has resumeSessionId but no pane layout yet (early boot)
+    const tabProvider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
+    if (tabProvider !== provider) continue
+    const tabSessionId = tab.resumeSessionId
+    if (!tabSessionId) continue
+    if (provider === 'claude' && !isValidClaudeSessionId(tabSessionId)) continue
+    if (tabSessionId === sessionId) return { tabId: tab.id, paneId: undefined }
+  }
+  return undefined
+}
+
+function findPaneInNode(
+  node: PaneNode,
+  provider: CodingCliProviderName,
+  sessionId: string
+): string | undefined {
+  if (node.type === 'leaf') {
+    const ref = extractSessionRef(node.content)
+    if (ref && ref.provider === provider && ref.sessionId === sessionId) {
+      return node.id
+    }
+    return undefined
+  }
+  return findPaneInNode(node.children[0], provider, sessionId)
+    ?? findPaneInNode(node.children[1], provider, sessionId)
+}
+
+/**
  * Build session info for the WebSocket hello message.
  * Returns session IDs categorized by priority:
  * - active: session in the active pane of the active tab
