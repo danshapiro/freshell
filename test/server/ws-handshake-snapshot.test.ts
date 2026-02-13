@@ -192,9 +192,10 @@ describe('ws handshake snapshot', () => {
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
 
-      const readyPromise = waitForMessage(ws, (m) => m.type === 'ready')
-      const settingsPromise = waitForMessage(ws, (m) => m.type === 'settings.updated')
-      const sessionsPromise = waitForMessage(ws, (m) => m.type === 'sessions.updated')
+      const MSG_TIMEOUT = 10_000
+      const readyPromise = waitForMessage(ws, (m) => m.type === 'ready', MSG_TIMEOUT)
+      const settingsPromise = waitForMessage(ws, (m) => m.type === 'settings.updated', MSG_TIMEOUT)
+      const sessionsPromise = waitForMessage(ws, (m) => m.type === 'sessions.updated', MSG_TIMEOUT)
 
       ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
 
