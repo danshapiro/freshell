@@ -10,9 +10,9 @@ import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
-import turnCompletionReducer, { clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
+import turnCompletionReducer from '@/store/turnCompletionSlice'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
-import type { Tab } from '@/store/types'
+import type { Tab, AttentionDismiss } from '@/store/types'
 
 const playSound = vi.hoisted(() => vi.fn())
 
@@ -122,7 +122,7 @@ function Harness() {
   )
 }
 
-function createStore() {
+function createStore(attentionDismiss: AttentionDismiss = 'click') {
   const foregroundTab: Tab = {
     id: 'tab-1',
     createRequestId: 'req-1',
@@ -193,7 +193,10 @@ function createStore() {
         paneTitles: {},
       },
       settings: {
-        settings: defaultSettings,
+        settings: {
+          ...defaultSettings,
+          panes: { ...defaultSettings.panes, attentionDismiss },
+        },
         loaded: true,
       },
       connection: {
@@ -254,7 +257,7 @@ describe('turn complete notification flow (e2e)', () => {
     }
   })
 
-  it('bells and highlights on background completion, then clears when user types', async () => {
+  it('bells and highlights on background completion, clears on tab click (default click mode)', async () => {
     const store = createStore()
 
     render(
@@ -282,20 +285,11 @@ describe('turn complete notification flow (e2e)', () => {
     const backgroundTabBefore = screen.getByText('Background').closest('div[class*="group"]')
     expect(backgroundTabBefore?.className).toContain('bg-emerald-100')
 
-    // Switch to the background tab
+    // Switch to the background tab — in 'click' mode, attention clears on tab switch
     fireEvent.click(screen.getByText('Background'))
 
     await waitFor(() => {
       expect(store.getState().tabs.activeTabId).toBe('tab-2')
-    })
-
-    // Attention persists after switching tabs (no auto-clear on focus)
-    expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
-
-    // Attention is cleared when the user types (dispatches clearTabAttention).
-    // TerminalView calls clearTabAttention in its sendInput handler.
-    act(() => {
-      store.dispatch(clearTabAttention({ tabId: 'tab-2' }))
     })
 
     await waitFor(() => {
@@ -306,7 +300,7 @@ describe('turn complete notification flow (e2e)', () => {
     expect(backgroundTabAfter?.className).not.toContain('bg-emerald-100')
   })
 
-  it('sets pane attention on completion and clears on user input dispatch', async () => {
+  it('click mode clears both tab and pane attention when switching to completed tab', async () => {
     const store = createStore()
 
     render(
@@ -328,22 +322,85 @@ describe('turn complete notification flow (e2e)', () => {
       })
     })
 
-    // Pane attention should be set alongside tab attention
+    // Both tab and pane attention should be set
     await waitFor(() => {
       expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
     })
     expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
 
-    // Simulate clearing pane attention (TerminalView dispatches this on user input)
-    act(() => {
-      store.dispatch(clearPaneAttention({ paneId: 'pane-2' }))
+    // Switch to the background tab — click mode clears both tab AND pane attention
+    fireEvent.click(screen.getByText('Background'))
+
+    await waitFor(() => {
+      expect(store.getState().tabs.activeTabId).toBe('tab-2')
+    })
+
+    await waitFor(() => {
+      expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBeUndefined()
     })
 
     await waitFor(() => {
       expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBeUndefined()
     })
+  })
 
-    // Tab attention remains (cleared independently by tab-level input)
+  it('type mode: attention persists after tab switch, clears on terminal input', async () => {
+    const store = createStore('type')
+
+    render(
+      <Provider store={store}>
+        <Harness />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.onMessage).toHaveBeenCalled()
+    })
+
+    // Emit turn complete signal on background tab's terminal
+    act(() => {
+      wsMocks.emitMessage({
+        type: 'terminal.output',
+        terminalId: 'term-2',
+        data: '\x07',
+      })
+    })
+
+    await waitFor(() => {
+      expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
+    })
+    expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
+
+    // Switch to background tab — in 'type' mode, attention persists
+    fireEvent.click(screen.getByText('Background'))
+
+    await waitFor(() => {
+      expect(store.getState().tabs.activeTabId).toBe('tab-2')
+    })
+
+    // Attention should still be set (type mode does NOT clear on tab switch)
     expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
+    expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
+
+    // Simulate user typing in tab-2's terminal.
+    // terminalInstances[0] = tab-1, terminalInstances[1] = tab-2
+    // Each has onData registered by TerminalView during init.
+    const tab2Terminal = terminalInstances[1]
+    expect(tab2Terminal.onData).toHaveBeenCalled()
+    const onDataCallback = tab2Terminal.onData.mock.calls[0][0] as (data: string) => void
+
+    // Give React a render cycle so refs are synced with the latest attention state
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0))
+    })
+
+    act(() => {
+      onDataCallback('x')
+    })
+
+    await waitFor(() => {
+      expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBeUndefined()
+    })
+    expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBeUndefined()
   })
 })

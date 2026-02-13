@@ -23,6 +23,7 @@ import { cn } from '@/lib/utils'
 import { Terminal } from 'xterm'
 import { FitAddon } from 'xterm-addon-fit'
 import { Loader2 } from 'lucide-react'
+import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { PaneContent, TerminalPaneContent } from '@/store/paneTypes'
 import 'xterm/css/xterm.css'
 
@@ -52,6 +53,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   // All hooks MUST be called before any conditional returns
   const ws = useMemo(() => getWsClient(), [])
   const [isAttaching, setIsAttaching] = useState(false)
+  const [pendingLinkUri, setPendingLinkUri] = useState<string | null>(null)
+  const setPendingLinkUriRef = useRef(setPendingLinkUri)
 
   const containerRef = useRef<HTMLDivElement | null>(null)
   const termRef = useRef<Terminal | null>(null)
@@ -64,6 +67,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const restoreFlagRef = useRef(false)
   const turnCompleteSignalStateRef = useRef(createTurnCompleteSignalParserState())
   const warnExternalLinksRef = useRef(settings.terminal.warnExternalLinks)
+  const attentionDismissRef = useRef(settings.panes?.attentionDismiss ?? 'click')
 
   // Extract terminal-specific fields (safe because we check kind later)
   const isTerminal = paneContent.kind === 'terminal'
@@ -92,11 +96,10 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     warnExternalLinksRef.current = settings.terminal.warnExternalLinks
   }, [settings.terminal.warnExternalLinks])
 
-  // Sync ref during render (not in useEffect) so sendInput always sees the
-  // latest value — avoids a stale-ref window where the first keystroke after
-  // attention is set wouldn't clear it.
+  // Sync during render (not in useEffect) so refs always have latest values
   hasAttentionRef.current = hasAttention
   hasPaneAttentionRef.current = hasPaneAttention
+  attentionDismissRef.current = settings.panes?.attentionDismiss ?? 'click'
 
   const shouldFocusActiveTerminal = !hidden && activeTabId === tabId && activePaneId === paneId
 
@@ -167,11 +170,15 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const sendInput = useCallback((data: string) => {
     const tid = terminalIdRef.current
     if (!tid) return
-    if (hasAttentionRef.current) {
-      dispatch(clearTabAttention({ tabId }))
-    }
-    if (hasPaneAttentionRef.current) {
-      dispatch(clearPaneAttention({ paneId }))
+    // In 'type' mode, clear attention when user sends input.
+    // In 'click' mode, attention is cleared by the notification hook on tab switch.
+    if (attentionDismissRef.current === 'type') {
+      if (hasAttentionRef.current) {
+        dispatch(clearTabAttention({ tabId }))
+      }
+      if (hasPaneAttentionRef.current) {
+        dispatch(clearPaneAttention({ paneId }))
+      }
     }
     ws.send({ type: 'terminal.input', terminalId: tid, data })
   }, [dispatch, tabId, paneId, ws])
@@ -200,9 +207,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       linkHandler: {
         activate: (_event: MouseEvent, uri: string) => {
           if (warnExternalLinksRef.current !== false) {
-            if (confirm(`Do you want to navigate to ${uri}?\n\nWARNING: This link could potentially be dangerous`)) {
-              window.open(uri, '_blank', 'noopener,noreferrer')
-            }
+            setPendingLinkUriRef.current(uri)
           } else {
             window.open(uri, '_blank', 'noopener,noreferrer')
           }
@@ -734,6 +739,24 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           {snapshotWarning}
         </div>
       )}
+      <ConfirmModal
+        open={pendingLinkUri !== null}
+        title="Open external link?"
+        body={
+          <>
+            <p className="break-all font-mono text-xs bg-muted rounded px-2 py-1 mb-2">{pendingLinkUri}</p>
+            <p>Links from terminal output could be dangerous. Only open links you trust.</p>
+          </>
+        }
+        confirmLabel="Open link"
+        onConfirm={() => {
+          if (pendingLinkUri) {
+            window.open(pendingLinkUri, '_blank', 'noopener,noreferrer')
+          }
+          setPendingLinkUri(null)
+        }}
+        onCancel={() => setPendingLinkUri(null)}
+      />
     </div>
   )
 }

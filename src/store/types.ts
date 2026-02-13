@@ -90,6 +90,8 @@ export type DefaultNewPane = 'ask' | 'shell' | 'browser' | 'editor'
 
 export type TabAttentionStyle = 'highlight' | 'pulse' | 'darken' | 'none'
 
+export type AttentionDismiss = 'click' | 'type'
+
 export type TerminalTheme =
   | 'auto'           // Follow app theme (dark/light)
   | 'dracula'
@@ -149,5 +151,6 @@ export interface AppSettings {
     snapThreshold: number // 0-8, % of container's smallest dimension; 0 = off
     iconsOnTabs: boolean
     tabAttentionStyle: TabAttentionStyle
+    attentionDismiss: AttentionDismiss
   }
 }

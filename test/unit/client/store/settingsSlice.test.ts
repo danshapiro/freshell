@@ -52,6 +52,7 @@ describe('settingsSlice', () => {
         snapThreshold: 2,
         iconsOnTabs: true,
         tabAttentionStyle: 'highlight',
+        attentionDismiss: 'click',
       })
       expect(state.settings.codingCli).toEqual({
         enabledProviders: ['claude', 'codex'],
@@ -94,7 +95,7 @@ describe('settingsSlice', () => {
           lineHeight: 1.4,
           cursorBlink: false,
           scrollback: 10000,
-          theme: 'light',
+          theme: 'one-light',
           warnExternalLinks: true,
         },
         defaultCwd: '/home/user',
@@ -124,6 +125,7 @@ describe('settingsSlice', () => {
           snapThreshold: 2,
           iconsOnTabs: true,
           tabAttentionStyle: 'highlight',
+          attentionDismiss: 'click' as const,
         },
       }
 

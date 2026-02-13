@@ -38,6 +38,7 @@ export const defaultSettings: AppSettings = {
     snapThreshold: 2,
     iconsOnTabs: true,
     tabAttentionStyle: 'highlight' as const,
+    attentionDismiss: 'click' as const,
   },
   codingCli: {
     enabledProviders: ['claude', 'codex'],

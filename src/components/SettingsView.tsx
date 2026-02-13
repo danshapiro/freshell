@@ -625,6 +625,20 @@ export default function SettingsView() {
                 }}
               />
             </SettingsRow>
+
+            <SettingsRow label="Dismiss attention on">
+              <SegmentedControl
+                value={settings.panes?.attentionDismiss ?? 'click'}
+                options={[
+                  { value: 'click', label: 'Tab click' },
+                  { value: 'type', label: 'Typing' },
+                ]}
+                onChange={(v: string) => {
+                  dispatch(updateSettingsLocal({ panes: { attentionDismiss: v } } as any))
+                  scheduleSave({ panes: { attentionDismiss: v } })
+                }}
+              />
+            </SettingsRow>
           </SettingsSection>
 
           {/* Terminal */}
