@@ -536,8 +536,11 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           const isSnapshotChunked = msg.snapshotChunked === true
           if (isSnapshotChunked) {
             markSnapshotChunkedCreated()
-          } else if (msg.snapshot) {
-            try { term.clear(); term.write(msg.snapshot) } catch { /* disposed */ }
+          } else {
+            try { term.clear() } catch { /* disposed */ }
+            if (msg.snapshot) {
+              try { term.write(msg.snapshot) } catch { /* disposed */ }
+            }
           }
           // Creator is already attached server-side for this terminal.
           // Avoid sending terminal.attach here: it can race with terminal.output and lead to
@@ -551,8 +554,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         if (msg.type === 'terminal.attached' && msg.terminalId === tid) {
           clearRateLimitRetry()
           setIsAttaching(false)
+          try { term.clear() } catch { /* disposed */ }
           if (msg.snapshot) {
-            try { term.clear(); term.write(msg.snapshot) } catch { /* disposed */ }
+            try { term.write(msg.snapshot) } catch { /* disposed */ }
           }
           updateContent({ status: 'running' })
         }
