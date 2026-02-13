@@ -436,6 +436,49 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
+    it('sends sdk.created before replaying buffered session messages', async () => {
+      // Make createSession return a session, but make subscribe replay a buffered message
+      const subscribeFn = vi.fn().mockImplementation((_sessionId: string, listener: Function) => {
+        // Simulate buffer replay: the init message is sent synchronously during subscribe
+        listener({
+          type: 'sdk.session.init',
+          sessionId: 'sdk-sess-1',
+          cliSessionId: 'cli-123',
+          model: 'claude-sonnet-4-5-20250929',
+          cwd: '/tmp',
+          tools: [],
+        })
+        return () => {}
+      })
+      mockSdkBridge.subscribe = subscribeFn
+
+      const ws = await connectAndAuth()
+      try {
+        const received: any[] = []
+        ws.on('message', (data: WebSocket.RawData) => {
+          const parsed = JSON.parse(data.toString())
+          if (parsed.type === 'sdk.created' || parsed.type === 'sdk.session.init') {
+            received.push(parsed)
+          }
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.create',
+          requestId: 'req-order',
+          cwd: '/tmp',
+        }))
+
+        // Wait for both messages
+        await vi.waitFor(() => expect(received.length).toBeGreaterThanOrEqual(2), { timeout: 3000 })
+
+        // sdk.created MUST arrive before sdk.session.init
+        expect(received[0].type).toBe('sdk.created')
+        expect(received[1].type).toBe('sdk.session.init')
+      } finally {
+        ws.close()
+      }
+    })
+
     it('returns error for sdk.send with unowned session', async () => {
       const ws = await connectAndAuth()
       try {

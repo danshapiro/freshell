@@ -1477,13 +1477,15 @@ export class WsHandler {
           })
           state.sdkSessions.add(session.sessionId)
 
-          // Subscribe this client to session events
+          // Send sdk.created FIRST so the client creates the Redux session
+          // before any buffered messages (sdk.session.init, sdk.error) arrive.
+          this.send(ws, { type: 'sdk.created', requestId: m.requestId, sessionId: session.sessionId })
+
+          // Subscribe this client to session events (replays buffered messages)
           const off = this.sdkBridge.subscribe(session.sessionId, (msg: SdkServerMessage) => {
             this.safeSend(ws, msg)
           })
           if (off) state.sdkSubscriptions.set(session.sessionId, off)
-
-          this.send(ws, { type: 'sdk.created', requestId: m.requestId, sessionId: session.sessionId })
 
           if (m.cwd?.trim()) {
             void configStore.pushRecentDirectory(m.cwd.trim()).catch((err) => {
