@@ -144,6 +144,12 @@ describe('API Edge Cases - Security Testing', () => {
   // 1. MALFORMED JSON IN REQUEST BODY
   // =============================================================================
   describe('Malformed JSON Handling', () => {
+    beforeEach(() => {
+      // These tests intentionally send malformed JSON, which triggers
+      // console.error from Express's built-in JSON parser. That's expected.
+      ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true
+    })
+
     it('rejects completely invalid JSON with 400', async () => {
       const res = await request(app)
         .patch('/api/settings')
@@ -310,6 +316,10 @@ describe('API Edge Cases - Security Testing', () => {
   // 3. EXTREMELY LARGE PAYLOADS
   // =============================================================================
   describe('Payload Size Limits', () => {
+    beforeEach(() => {
+      ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true
+    })
+
     it('rejects payload larger than 1MB', async () => {
       const largeString = 'a'.repeat(1.5 * 1024 * 1024) // 1.5MB
       const res = await request(app)
@@ -1198,6 +1208,10 @@ describe('API Edge Cases - Security Testing', () => {
   // 12. CONTENT-TYPE EDGE CASES
   // =============================================================================
   describe('Content-Type Edge Cases', () => {
+    beforeEach(() => {
+      ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true
+    })
+
     it('rejects non-JSON content type', async () => {
       const res = await request(app)
         .patch('/api/settings')
