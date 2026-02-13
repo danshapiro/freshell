@@ -820,8 +820,8 @@ async function main() {
     // 2. Stop any coalesced sessions publish timers
     sessionsSync.shutdown()
 
-    // 3. Kill all running terminals
-    registry.shutdown()
+    // 3. Gracefully shut down terminals (gives Claude time to flush JSONL writes)
+    await registry.shutdownGracefully(5000)
 
     // 4. Kill all coding CLI sessions
     codingCliSessionManager.shutdown()

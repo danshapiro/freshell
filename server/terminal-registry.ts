@@ -1194,4 +1194,87 @@ export class TerminalRegistry extends EventEmitter {
 
     logger.info({ count: terminalIds.length }, 'All terminals shut down')
   }
+
+  /**
+   * Gracefully shutdown all terminals. Sends SIGTERM (or plain kill on Windows)
+   * and waits for processes to exit, giving them time to flush writes.
+   * Falls back to forced kill after timeout.
+   */
+  async shutdownGracefully(timeoutMs: number = 5000): Promise<void> {
+    // Stop timers
+    if (this.idleTimer) {
+      clearInterval(this.idleTimer)
+      this.idleTimer = null
+    }
+    if (this.perfTimer) {
+      clearInterval(this.perfTimer)
+      this.perfTimer = null
+    }
+
+    const running: TerminalRecord[] = []
+    for (const term of this.terminals.values()) {
+      if (term.status === 'running') running.push(term)
+    }
+
+    if (running.length === 0) {
+      logger.info('No running terminals to shut down')
+      return
+    }
+
+    // Set up exit listeners BEFORE sending signals (avoid race)
+    const exitPromises = running.map(term =>
+      new Promise<void>(resolve => {
+        if (term.status === 'exited') { resolve(); return }
+        const handler = (evt: { terminalId: string }) => {
+          if (evt.terminalId === term.terminalId) {
+            this.off('terminal.exit', handler)
+            resolve()
+          }
+        }
+        this.on('terminal.exit', handler)
+        // Re-check after listener setup (TOCTOU guard)
+        if (term.status === 'exited') {
+          this.off('terminal.exit', handler)
+          resolve()
+        }
+      })
+    )
+
+    // Send SIGTERM (or plain kill on Windows where signal args are unsupported)
+    const isWindows = process.platform === 'win32'
+    for (const term of running) {
+      try {
+        if (isWindows) {
+          term.pty.kill()
+        } else {
+          term.pty.kill('SIGTERM')
+        }
+      } catch {
+        // Already gone — will be cleaned up below
+      }
+    }
+
+    logger.info({ count: running.length }, 'Sent SIGTERM to running terminals, waiting for exit...')
+
+    // Wait for all to exit, or timeout
+    await Promise.race([
+      Promise.all(exitPromises),
+      new Promise<void>(r => setTimeout(r, timeoutMs)),
+    ])
+
+    // Force kill any that didn't exit in time
+    let forceKilled = 0
+    for (const term of running) {
+      if (term.status !== 'exited') {
+        this.kill(term.terminalId)
+        forceKilled++
+      }
+    }
+
+    if (forceKilled > 0) {
+      logger.warn({ forceKilled }, 'Force-killed terminals after graceful timeout')
+    }
+
+    logger.info({ count: running.length, forceKilled }, 'All terminals shut down')
+  }
 }

@@ -1232,6 +1232,115 @@ describe('Graceful shutdown', () => {
   })
 })
 
+describe('shutdownGracefully', () => {
+  let registry: TerminalRegistry
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.useRealTimers()
+    mockPtyProcess.instances = []
+    registry = new TerminalRegistry(createTestSettings())
+  })
+
+  it('should send SIGTERM to running terminals', async () => {
+    registry.create({ mode: 'shell' })
+    registry.create({ mode: 'shell' })
+
+    const ptys = mockPtyProcess.instances
+
+    // Simulate processes that exit when SIGTERM arrives
+    for (const pty of ptys) {
+      pty.kill.mockImplementation(() => {
+        setTimeout(() => pty._emitExit(0), 10)
+      })
+    }
+
+    await registry.shutdownGracefully(5000)
+
+    for (const pty of ptys) {
+      expect(pty.kill).toHaveBeenCalledWith('SIGTERM')
+    }
+  })
+
+  it('should wait for terminals to exit within timeout', async () => {
+    registry.create({ mode: 'shell' })
+    const pty = mockPtyProcess.instances[0]
+
+    pty.kill.mockImplementation(() => {
+      setTimeout(() => pty._emitExit(0), 50)
+    })
+
+    const start = Date.now()
+    await registry.shutdownGracefully(5000)
+    // Should resolve quickly, not wait the full 5s
+    expect(Date.now() - start).toBeLessThan(1000)
+  })
+
+  it('should force-kill terminals after timeout', async () => {
+    registry.create({ mode: 'shell' })
+    const pty = mockPtyProcess.instances[0]
+
+    // Never exits on SIGTERM
+    pty.kill.mockImplementation(() => {})
+
+    await registry.shutdownGracefully(200)
+
+    // Should have been called at least twice: once SIGTERM, once forced
+    expect(pty.kill).toHaveBeenCalledTimes(2)
+    expect(pty.kill).toHaveBeenNthCalledWith(1, 'SIGTERM')
+  })
+
+  it('should handle already exited terminals', async () => {
+    const term = registry.create({ mode: 'shell' })
+    const pty = mockPtyProcess.instances[0]
+    pty._emitExit(0)
+    expect(term.status).toBe('exited')
+
+    await expect(registry.shutdownGracefully(1000)).resolves.toBeUndefined()
+  })
+
+  it('should handle no terminals', async () => {
+    await expect(registry.shutdownGracefully(1000)).resolves.toBeUndefined()
+  })
+
+  it('should use SIGTERM on non-Windows platforms', async () => {
+    const originalPlatform = process.platform
+    Object.defineProperty(process, 'platform', { value: 'linux', configurable: true })
+
+    try {
+      registry.create({ mode: 'shell' })
+      const pty = mockPtyProcess.instances[0]
+      pty.kill.mockImplementation(() => {
+        setTimeout(() => pty._emitExit(0), 10)
+      })
+
+      await registry.shutdownGracefully(1000)
+      expect(pty.kill).toHaveBeenCalledWith('SIGTERM')
+    } finally {
+      Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true })
+    }
+  })
+
+  it('should skip signal argument on Windows', async () => {
+    const originalPlatform = process.platform
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true })
+
+    try {
+      registry.create({ mode: 'shell' })
+      const pty = mockPtyProcess.instances[0]
+      pty.kill.mockImplementation(() => {
+        setTimeout(() => pty._emitExit(0), 10)
+      })
+
+      await registry.shutdownGracefully(1000)
+      // On Windows, kill() is called without a signal argument
+      expect(pty.kill).toHaveBeenCalledWith()
+    } finally {
+      Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true })
+    }
+  })
+})
+
 describe('ChunkRingBuffer edge cases for lifecycle', () => {
   it('should handle concurrent appends correctly', () => {
     const buffer = new ChunkRingBuffer(100)
