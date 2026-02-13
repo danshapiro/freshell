@@ -1,5 +1,4 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
-import { closePane, removeLayout } from './panesSlice.js'
 
 type TurnCompletePayload = {
   tabId: string
@@ -60,18 +59,6 @@ const turnCompletionSlice = createSlice({
       if (!state.attentionByPane[action.payload.paneId]) return
       delete state.attentionByPane[action.payload.paneId]
     },
-  },
-  extraReducers: (builder) => {
-    builder
-      .addCase(closePane, (state, action) => {
-        const { tabId, paneId } = action.payload
-        if (state.attentionByPane) delete state.attentionByPane[paneId]
-        if (state.attentionByTab) delete state.attentionByTab[tabId]
-      })
-      .addCase(removeLayout, (state, action) => {
-        const { tabId } = action.payload
-        if (state.attentionByTab) delete state.attentionByTab[tabId]
-      })
   },
 })
 

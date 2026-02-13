@@ -1,7 +1,7 @@
 import { useRef, useCallback, useMemo, useState, useEffect } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { closePane, setActivePane, resizePanes, updatePaneContent, updatePaneTitle, clearPaneRenameRequest, toggleZoom } from '@/store/panesSlice'
-import { updateTab } from '@/store/tabsSlice'
+import { setActivePane, resizePanes, updatePaneContent, updatePaneTitle, clearPaneRenameRequest, toggleZoom } from '@/store/panesSlice'
+import { updateTab, closePaneWithCleanup } from '@/store/tabsSlice'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
 import Pane from './Pane'
 import PaneDivider from './PaneDivider'
@@ -199,7 +199,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         dispatch(clearPendingCreate({ requestId: content.createRequestId }))
       }
     }
-    dispatch(closePane({ tabId, paneId }))
+    dispatch(closePaneWithCleanup({ tabId, paneId }))
   }, [dispatch, tabId, tabTerminalId, ws, sdkPendingCreates])
 
   const handleFocus = useCallback((paneId: string) => {
@@ -502,7 +502,7 @@ function PickerWrapper({
   }, [createContentForType, dispatch, paneId, settings, step, tabId])
 
   const handleCancel = useCallback(() => {
-    dispatch(closePane({ tabId, paneId }))
+    dispatch(closePaneWithCleanup({ tabId, paneId }))
   }, [dispatch, tabId, paneId])
 
   if (step.step === 'directory') {

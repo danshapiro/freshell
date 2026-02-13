@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { addTab, closeTab, reorderTabs, updateTab, setActiveTab, openSessionTab, requestTabRename } from '@/store/tabsSlice'
-import { addPane, closePane, initLayout, replacePane, resetSplit, splitPane as splitPaneAction, swapSplit, requestPaneRename } from '@/store/panesSlice'
+import { addTab, closeTab, closePaneWithCleanup, reorderTabs, updateTab, setActiveTab, openSessionTab, requestTabRename } from '@/store/tabsSlice'
+import { addPane, initLayout, replacePane, resetSplit, splitPane as splitPaneAction, swapSplit, requestPaneRename } from '@/store/panesSlice'
 import { setProjects, setProjectExpanded } from '@/store/sessionsSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'
@@ -716,7 +716,7 @@ export function ContextMenuProvider({
             ws.send({ type: 'terminal.detach', terminalId: content.terminalId })
             clearStaleTabTerminalId(tabId, content.terminalId)
           }
-          dispatch(closePane({ tabId, paneId }))
+          dispatch(closePaneWithCleanup({ tabId, paneId }))
         },
         getTerminalActions: getTerminalActions,
         getEditorActions: getEditorActions,
