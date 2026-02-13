@@ -1,46 +1,95 @@
-# Design: Sync Tabs & Panes to Server
+# Design: Sync Tabs & Panes to Server (Per-Device Namespacing)
 
 **Status: DESIGN** — Awaiting review before implementation.
 
-**Goal:** Persist the tab/pane layout on the server so that connecting from a different machine (or a fresh browser) restores the same workspace. The client remains the source of truth. The server also maintains a list of recently-closed tabs, shown greyed-out in the tab bar for easy reopening — absorbing and replacing the current "Background Sessions" panel.
+**Goal:** Persist tab/pane layouts on the server, keyed per device, so that connecting from a different machine shows both your local tabs and the other machine's tabs. Each device owns its own tab namespace — no sync conflicts. The server also maintains closed tabs per device, shown greyed-out for easy reopening.
 
 ---
 
 ## 1. Why This Matters
 
-Today, tabs and panes live only in `localStorage`. If you work on Machine A, then walk to Machine B, you get a blank slate and have to manually reattach to background terminals. This design makes the workspace follow you across machines while keeping the client authoritative over its own layout.
+Today, tabs and panes live only in `localStorage`. If you work on `danshapiro-main` then walk to `dan-laptop`, you get a blank slate and have to manually hunt through background terminals. With per-device workspace sync:
 
-Because Freshell is self-hosted (all clients talk to the same server), `terminalId` values are valid across machines. Syncing the layout is the missing piece — once Machine B has the tab/pane tree, it can attach to the exact same running PTYs.
+- `dan-laptop` connects and immediately sees `danshapiro-main`'s tabs (read-only, greyed, or in a separate group)
+- Clicking one of those tabs creates a **local copy** on `dan-laptop`, attached to the **same running PTYs** on the server
+- Now both devices have their own tab pointing at the same terminals — zero collision risk
+- Each device's tabs are labeled with the device name for clarity
+
+Because Freshell is self-hosted, `terminalId` values are server-side PTY handles valid from any client. The missing piece is knowing *what tabs exist on other devices* so you can adopt them.
 
 ---
 
-## 2. Data Model
+## 2. Core Concept: Device-Owned Workspaces
 
-### 2.1 Workspace File
+```
+┌─────────────────────────────────────────────────────────┐
+│  Server: ~/.freshell/workspace.json                     │
+│                                                         │
+│  devices: {                                             │
+│    "danshapiro-main": {                                 │
+│      tabs: [ freshell(3 panes), api-server(1 pane) ]    │
+│      closedTabs: [ old-debug(exited) ]                  │
+│    },                                                   │
+│    "dan-laptop": {                                      │
+│      tabs: [ freshell(3 panes) ]  ← cloned from main   │
+│      closedTabs: []                                     │
+│    }                                                    │
+│  }                                                      │
+└─────────────────────────────────────────────────────────┘
+```
 
-New file: `~/.freshell/workspace.json`, managed by a new `WorkspaceStore` (same atomic-write + mutex pattern as `ConfigStore`).
+**Key principle:** Each device only writes to its own slot. No device ever mutates another device's data. This makes the entire system conflict-free — concurrent writes from different devices touch different keys.
+
+---
+
+## 3. Data Model
+
+### 3.1 Device Identity
+
+Each client has a **device name** — a human-readable identifier like `danshapiro-main` or `dan-laptop`. This is:
+
+- Configured in Settings (new field: `settings.deviceName`)
+- Defaults to `os.hostname()` on first connect if unset
+- Stored in `~/.freshell/config.json` alongside other settings
+- Sent in the `hello` message so the server knows which device slot to use
 
 ```typescript
-// ~/.freshell/workspace.json
+// New field in AppSettings
+{
+  deviceName: string   // e.g., "danshapiro-main"
+}
+```
+
+The server can also suggest a default from `os.hostname()` in the `ready` message for first-time setup.
+
+### 3.2 Workspace File
+
+`~/.freshell/workspace.json`, managed by `WorkspaceStore`:
+
+```typescript
 {
   version: 1,
-  updatedAt: number,           // epoch ms — last mutation timestamp
-  sourceClientId: string,      // which client wrote this (for leader-election-free conflict resolution)
+  devices: Record<string, DeviceWorkspace>,
+}
 
-  // Active workspace (mirrors the persisted Redux state)
-  tabs: Tab[],                 // same shape as localStorage persisted tabs (volatile fields stripped)
+type DeviceWorkspace = {
+  updatedAt: number,            // epoch ms — server-assigned on each write
+  lastSeenAt: number,           // epoch ms — last time this device connected
+
+  // Active tabs (mirrors persisted Redux state, volatile fields stripped)
+  tabs: Tab[],
   activeTabId: string | null,
   layouts: Record<string, PaneNode>,
   activePane: Record<string, string>,
   paneTitles: Record<string, Record<string, string>>,
   paneTitleSetByUser: Record<string, Record<string, boolean>>,
 
-  // Closed tabs (most-recent-first, capped)
+  // Closed tabs (most-recent-first, capped per device)
   closedTabs: ClosedTab[],
 }
 ```
 
-### 2.2 ClosedTab
+### 3.3 ClosedTab
 
 ```typescript
 type ClosedTab = {
@@ -57,48 +106,58 @@ type ClosedTab = {
   }
   layout?: PaneNode            // pane tree snapshot (stripped of editor content)
   paneTitles?: Record<string, string>
-  terminalIds: string[]        // all terminal IDs from pane leaves (for status enrichment)
+  terminalIds: string[]        // terminal IDs from pane leaves (for status enrichment)
 }
 ```
 
-The server enriches each `ClosedTab` with live status when sending to clients:
+Server enriches with live terminal status when sending to clients:
 
 ```typescript
 type ClosedTabWithStatus = ClosedTab & {
   terminals: Array<{
     terminalId: string
-    status: 'running' | 'exited' | 'gone'   // 'gone' = reaped from registry
+    status: 'running' | 'exited' | 'gone'
     idleSince?: number
   }>
 }
+
+type DeviceWorkspaceWithStatus = Omit<DeviceWorkspace, 'closedTabs'> & {
+  deviceName: string
+  closedTabs: ClosedTabWithStatus[]
+  isLocal: boolean              // true if this is the receiving client's own device
+}
 ```
 
-### 2.3 Limits
+### 3.4 Limits
 
 | Limit | Value | Rationale |
 |-------|-------|-----------|
-| Max closed tabs | 50 | Prevent unbounded growth |
-| Max active tabs in workspace file | 200 | Sanity cap |
-| Workspace file max size | 512 KB | Reject writes that exceed this |
+| Max closed tabs per device | 50 | Prevent unbounded growth |
+| Max active tabs per device | 200 | Sanity cap |
+| Max devices | 20 | Prune oldest `lastSeenAt` beyond this |
+| Device stale TTL | 30 days | Auto-prune devices not seen in 30 days |
+| Workspace file max size | 1 MB | Reject writes that exceed this |
 | Closed tab TTL | 7 days | Auto-prune on write |
 
 ---
 
-## 3. Sync Protocol
+## 4. Sync Protocol
 
-### 3.1 New WebSocket Messages
+### 4.1 New WebSocket Messages
 
 ```
 Client → Server
 ─────────────────────────────────────────────
-workspace.sync          Full workspace state push (debounced)
-workspace.tab-closed    Single tab closed (immediate)
-workspace.reopen-tab    Request to reopen a closed tab
+workspace.sync          Push this device's full workspace (debounced)
+workspace.tab-closed    This device closed a tab (immediate)
+workspace.reopen-tab    Reopen a closed tab on this device
+workspace.adopt-tab     Clone a tab from another device to this device
 
 Server → Client
 ─────────────────────────────────────────────
-workspace.state         Full workspace snapshot (on connect, or after another client pushes)
-workspace.closed-tabs   Closed tabs list update (after close/reopen/prune)
+workspace.state         All devices' workspaces (on connect)
+workspace.device-updated   A single device's workspace changed (incremental)
+workspace.closed-tabs      A device's closed tabs list changed
 ```
 
 #### `workspace.sync` (Client → Server)
@@ -106,7 +165,7 @@ workspace.closed-tabs   Closed tabs list update (after close/reopen/prune)
 ```typescript
 {
   type: 'workspace.sync',
-  updatedAt: number,
+  // deviceName not needed — server knows from hello handshake
   tabs: Tab[],
   activeTabId: string | null,
   layouts: Record<string, PaneNode>,
@@ -115,6 +174,8 @@ workspace.closed-tabs   Closed tabs list update (after close/reopen/prune)
   paneTitleSetByUser: Record<string, Record<string, boolean>>,
 }
 ```
+
+Server writes to `devices[clientDeviceName]`, broadcasts `workspace.device-updated` to other clients.
 
 #### `workspace.tab-closed` (Client → Server)
 
@@ -125,7 +186,19 @@ workspace.closed-tabs   Closed tabs list update (after close/reopen/prune)
 }
 ```
 
-Sent immediately (not debounced) when a tab is closed, so the closed-tab entry is captured before any subsequent sync overwrites.
+Sent immediately when a tab is closed. Server appends to this device's `closedTabs`, broadcasts update.
+
+#### `workspace.adopt-tab` (Client → Server)
+
+```typescript
+{
+  type: 'workspace.adopt-tab',
+  fromDevice: string,           // source device name
+  tabId: string,                // tab ID on the source device
+}
+```
+
+Client is saying: "I want to open a copy of this tab from that device." The server responds with the full tab + layout data in a `workspace.device-updated` for the adopting device (after the client adds it locally). This message is mainly informational — the client already has the data from the last `workspace.state` and handles the local tab creation itself.
 
 #### `workspace.reopen-tab` (Client → Server)
 
@@ -136,320 +209,410 @@ Sent immediately (not debounced) when a tab is closed, so the closed-tab entry i
 }
 ```
 
-Server removes from `closedTabs`, broadcasts updated list. The requesting client handles adding the tab locally (it already has the closed tab data from its local state or the last `workspace.closed-tabs` message).
+Server removes from this device's `closedTabs`, broadcasts update.
 
-#### `workspace.state` (Server → Client)
+#### `workspace.state` (Server → Client, on connect)
 
 ```typescript
 {
   type: 'workspace.state',
-  updatedAt: number,
-  sourceClientId: string,
-  tabs: Tab[],
-  activeTabId: string | null,
-  layouts: Record<string, PaneNode>,
-  activePane: Record<string, string>,
-  paneTitles: Record<string, Record<string, string>>,
-  paneTitleSetByUser: Record<string, Record<string, boolean>>,
-  closedTabs: ClosedTabWithStatus[],
+  devices: DeviceWorkspaceWithStatus[],
 }
 ```
+
+Full snapshot of all devices. Sent once after handshake.
+
+#### `workspace.device-updated` (Server → Client, incremental)
+
+```typescript
+{
+  type: 'workspace.device-updated',
+  device: DeviceWorkspaceWithStatus,
+}
+```
+
+Sent to all OTHER clients when a device pushes a sync. Not sent back to the originating client.
 
 #### `workspace.closed-tabs` (Server → Client)
 
 ```typescript
 {
   type: 'workspace.closed-tabs',
+  deviceName: string,
   closedTabs: ClosedTabWithStatus[],
 }
 ```
 
-### 3.2 Capability Negotiation
+### 4.2 Capability Negotiation
 
-Add `supportsWorkspaceSyncV1: true` to the `hello` capabilities object. Server only sends `workspace.state` to capable clients. This ensures backward compatibility with older client builds.
+Add `supportsWorkspaceSyncV1: true` to the `hello` capabilities. Also send `deviceName` in the hello:
+
+```typescript
+{
+  type: 'hello',
+  token: '...',
+  capabilities: {
+    supportsWorkspaceSyncV1: true,
+  },
+  deviceName: 'danshapiro-main',
+}
+```
 
 ---
 
-## 4. Data Flow
+## 5. Data Flow
 
-### 4.1 Client Makes a Change (Happy Path)
+### 5.1 Client Makes a Change
 
 ```
-User adds/closes/rearranges tab
+User adds/rearranges tab on danshapiro-main
   → Redux dispatch (immediate local UI update)
   → persistMiddleware → localStorage (500ms debounce, unchanged)
-  → NEW: workspaceSyncMiddleware → WS workspace.sync (500ms debounce, separate timer)
-  → Server receives workspace.sync
-  → WorkspaceStore persists to ~/.freshell/workspace.json (atomic write)
-  → Server broadcasts workspace.state to OTHER connected clients (not sender)
-  → Other clients merge into local state (reusing hydrateTabs/hydratePanes logic)
+  → workspaceSyncMiddleware → WS workspace.sync (500ms debounce)
+  → Server writes to devices["danshapiro-main"]
+  → Server broadcasts workspace.device-updated to dan-laptop (if connected)
+  → dan-laptop updates its "remote devices" state (no merge into local tabs)
 ```
 
-### 4.2 Client Connects (Fresh Browser / Different Machine)
+### 5.2 New Device Connects
 
 ```
-Client connects → sends hello (supportsWorkspaceSyncV1: true)
+dan-laptop connects → hello with deviceName="dan-laptop"
   → Server sends ready
-  → Server sends workspace.state (from disk, enriched with terminal statuses)
-  → Client checks: do I have local tabs in localStorage?
-    → NO local state:  hydrate entirely from workspace.state
-    → YES local state: compare updatedAt timestamps
-      → Server newer: hydrate from server (merge with smart terminal state preservation)
-      → Local newer:  keep local, push workspace.sync to server
+  → Server sends workspace.state (all devices, enriched)
+  → Client sees: devices["danshapiro-main"] has 2 tabs, devices["dan-laptop"] has 0 tabs
+  → Client checks localStorage for its own tabs:
+    → Has local state? → push workspace.sync, show local tabs
+    → No local state? → show empty tab bar + other devices' tabs as adoptable
+  → Tab bar renders:
+    [+ New Tab]  |  danshapiro-main: freshell (3)  api-server (1)
 ```
 
-### 4.3 Tab Closed
+### 5.3 Adopting a Tab from Another Device
 
 ```
-User closes tab
-  → closeTab() thunk dispatches removeTab() (local)
-  → workspaceSyncMiddleware intercepts tabs/removeTab
-  → Captures tab snapshot + layout BEFORE removal (via middleware pre-processing)
+User on dan-laptop clicks "freshell (3)" from danshapiro-main
+  → Client reads tab + layout from remoteDevices["danshapiro-main"]
+  → Creates local tab: same title, same pane tree, same terminalIds
+  → Dispatches addTab() + initLayout()
+  → Terminal panes: terminalIds are valid (same server) → attach
+  → Normal workspace.sync pushes dan-laptop's new tab to server
+  → Tab bar now shows:
+    freshell (3)  |  danshapiro-main: freshell (3)  api-server (1)
+    └ local tab      └ still visible as remote
+```
+
+Both devices now have "freshell (3)" — each in their own namespace, both attached to the same PTYs. No conflict.
+
+### 5.4 Tab Closed
+
+```
+User closes tab on danshapiro-main
+  → closeTab() thunk (local)
+  → workspaceSyncMiddleware captures snapshot before removal
   → Sends workspace.tab-closed immediately
-  → Then queues workspace.sync for the updated active state (debounced)
-  → Server appends to closedTabs, prunes if over limit
+  → Server appends to devices["danshapiro-main"].closedTabs
   → Server broadcasts workspace.closed-tabs to all clients
+  → dan-laptop sees the closed tab appear in danshapiro-main's greyed section
+  → danshapiro-main sees it in its own greyed section
 ```
 
-### 4.4 Reopen Closed Tab
+### 5.5 Reconnecting to Same Device
 
 ```
-User clicks greyed-out closed tab
-  → Client creates new tab locally from ClosedTab snapshot
-  → Dispatches addTab() + initLayout() with the saved layout
-  → Terminal panes: if terminalIds are still running → attach
-                    if exited/gone → set status 'creating', spawn new PTY
-  → Sends workspace.reopen-tab to server
-  → Server removes from closedTabs, persists
-  → Server broadcasts workspace.closed-tabs to all clients
-  → Normal workspace.sync follows from the client's tab addition
+danshapiro-main browser crashes and reopens
+  → Connects with deviceName="danshapiro-main"
+  → Receives workspace.state including its own device data
+  → Client checks: localStorage empty (crash cleared it)
+  → Hydrates from server's devices["danshapiro-main"] data
+  → Tabs restored, terminal panes reattach to still-running PTYs
 ```
 
----
-
-## 5. Conflict Resolution
-
-**Principle: last writer wins at the server, smart merge at the client.**
-
-- The server stores whichever `workspace.sync` arrived most recently (by `updatedAt`).
-- When a client receives `workspace.state`, it merges using the existing `hydrateTabs` / `hydratePanes` logic, which already handles:
-  - Preserving local `terminalId` when remote lacks it
-  - Preserving local `activeTabId` if the tab exists in the remote set
-  - Smart `resumeSessionId` merge to prevent cross-client clobbering
-- Two simultaneous editors: both push syncs; the server keeps the later one. The "losing" client receives a `workspace.state` broadcast and merges. In practice, the merge is usually additive (different tabs being modified).
-
-**No vector clocks, no CRDTs.** The workspace is small, changes are infrequent relative to network latency, and the existing merge logic handles the realistic conflict cases (same tab modified on two machines). This is intentionally simple — the same strategy that powers the existing cross-tab sync.
+This is the primary "sync to yourself on the same machine" use case — surviving browser crashes/refreshes even when localStorage is lost.
 
 ---
 
-## 6. Performance Analysis
+## 6. No Conflict Resolution Needed
 
-### 6.1 Payload Size
+Because each device writes only to its own slot in the workspace file:
 
-Typical workspace: 10 tabs, each with 1-3 panes. Estimated JSON size:
+- **Concurrent writes from different devices** touch different keys → no conflict
+- **Same device, multiple browser tabs** → same device name, same slot. Last write wins within the single device (same behavior as current localStorage cross-tab sync). The existing `persistMiddleware` + `BroadcastChannel` sync keeps browser tabs in lockstep locally.
+- **No merge logic, no CRDTs, no vector clocks, no last-writer-wins tiebreaking**
 
-| Field | Per-tab | 10 tabs |
-|-------|---------|---------|
-| Tab metadata | ~300 B | 3 KB |
-| PaneNode tree | ~200 B | 2 KB |
-| Pane titles | ~100 B | 1 KB |
-| Closed tabs (50) | — | 15 KB |
-| **Total** | — | **~21 KB** |
-
-This is well within a single WebSocket frame. No chunking needed.
-
-### 6.2 Write Frequency
-
-- `workspace.sync` debounced at 500ms — at most 2 writes/sec during active tab manipulation.
-- `workspace.tab-closed` is immediate but infrequent (user closes a tab).
-- File I/O: atomic write to `workspace.json` is ~1ms (small file, temp+rename).
-
-### 6.3 Server Memory
-
-- `WorkspaceStore` holds one parsed workspace in memory (~20 KB).
-- No per-client workspace state needed — server has one canonical workspace.
-
-### 6.4 Network
-
-- `workspace.state` broadcast skips the sender (they already have the state).
-- No polling. Entirely event-driven.
-- On reconnect, one `workspace.state` message (~20 KB) — negligible compared to the `sessions.updated` snapshots (~500 KB) already sent.
-
-### 6.5 localStorage Interaction
-
-- localStorage persist continues unchanged (no regression for same-browser cross-tab sync).
-- Server sync is additive — a second transport layer, not a replacement.
-- If the server is unreachable (e.g., network blip), localStorage still works locally.
+The only "merge" is when a device reconnects and decides whether to use server state or local state for its own slot (section 5.2). This is a simple "local vs. remote, pick one" decision — not a semantic merge.
 
 ---
 
-## 7. Closed Tabs UX
+## 7. Performance Analysis
 
-### 7.1 Tab Bar Integration
+### 7.1 Payload Size
 
-Closed tabs appear at the right end of the tab bar, visually distinct:
+Per-device workspace: ~6 KB for 10 tabs. Full `workspace.state` with 3 devices:
 
-- **Greyed out** (reduced opacity, no background highlight)
-- **Italic title** to distinguish from active tabs
-- **Status indicator dot**: green if terminal still running, grey if exited/gone
-- **Click** to reopen (restores full pane layout and reattaches terminals)
-- **Right-click → "Dismiss"** to permanently remove from closed list
-- **Separator** (thin vertical line or gap) between active and closed tabs
+| Component | Size |
+|-----------|------|
+| 3 devices × 10 tabs each | ~18 KB |
+| 3 devices × 10 closed tabs each | ~9 KB |
+| **Total workspace.state** | **~27 KB** |
 
-### 7.2 Replacing Background Sessions
+Well within a single WebSocket frame.
 
-The current `BackgroundSessions` component (polling `terminal.list` every 5s) is replaced by the closed tabs bar. Benefits:
+### 7.2 Incremental Updates
 
-- No more polling — closed tabs are pushed via WebSocket events
-- Richer context — you see the original tab title and pane layout, not just "terminal-abc123"
-- Same actions available — reattach or kill
+After initial connect, only `workspace.device-updated` messages are sent (~6 KB per device change). These are debounced at 500ms on the client side.
 
-Running terminals with no associated tab (e.g., orphans from crashes) still appear in the closed tabs list. The server constructs synthetic `ClosedTab` entries for running terminals that have no client AND no matching `closedTabs` entry.
+### 7.3 Write Frequency
 
-### 7.3 Overflow
+- `workspace.sync` debounced at 500ms → at most 2 writes/sec during active tab manipulation
+- Server write: atomic temp+rename to `workspace.json`, ~1ms
+- Only the changed device's slot is updated (read-modify-write under mutex)
 
-If many closed tabs accumulate, the tab bar shows a `+N closed` overflow button that opens a dropdown/popover listing all closed tabs with timestamps and status.
+### 7.4 Server Memory
+
+- One parsed workspace in memory (all devices, ~30 KB typical)
+- No per-connection workspace state needed
+
+### 7.5 Network
+
+- `workspace.device-updated` skips the sender
+- No polling — entirely event-driven
+- Initial `workspace.state` (~27 KB) is negligible vs. existing `sessions.updated` (~500 KB)
+
+### 7.6 localStorage Unchanged
+
+- localStorage persist continues as-is (same-browser cross-tab sync)
+- Server sync is additive — works alongside localStorage, not instead of it
+- If server is unreachable, local-only operation continues
 
 ---
 
-## 8. WorkspaceStore (Server)
+## 8. Tab Bar UX
+
+### 8.1 Layout
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ [freshell ▾] [api-server]  │  ░ old-debug ░  ║  danshapiro-main:   │
+│  ↑ local active tabs        ↑ local closed     [freshell (3)]       │
+│                                                [api-server]         │
+│                                                 ↑ remote tabs       │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 Local Tabs (Left Section)
+- Normal active tabs — existing behavior, unchanged
+- User's own device, no device label needed
+
+### 8.3 Local Closed Tabs (Middle Section)
+- Greyed out, italic title
+- Status dot: green (terminal running), grey (exited/gone)
+- Click to reopen (restores layout, reattaches terminals)
+- Right-click → "Dismiss" to remove permanently
+
+### 8.4 Remote Device Tabs (Right Section)
+- Grouped by device name with a label header
+- Slightly different visual treatment (perhaps a subtle background tint or border)
+- Show tab title + pane count badge
+- Click to **adopt** — creates a local copy attached to the same terminals
+- Remote closed tabs also visible (greyed, with device label)
+
+### 8.5 Remote Tab Indicators
+- **Device name** shown as a small label/badge above or beside the tab group
+- **Online indicator** — green dot if the device is currently connected, grey if last seen N hours ago
+- **Terminal status** — if the tab's terminals are still running (useful when the remote device disconnected)
+
+### 8.6 Overflow
+- If remote tabs are numerous, collapse into a `danshapiro-main: +N` pill that opens a dropdown
+- Local closed tabs overflow into `+N closed` button with dropdown
+
+### 8.7 Replacing Background Sessions
+
+The `BackgroundSessions` component (polling `terminal.list` every 5s) is fully replaced:
+
+- Local closed tabs show your own detached terminals with full context
+- Remote device tabs show other machines' terminals
+- Orphan terminals (running with no client, no tab association) are surfaced as synthetic closed tabs on a special `(server)` pseudo-device
+
+---
+
+## 9. WorkspaceStore (Server)
 
 New file: `server/workspace-store.ts`
-
-Follows the same pattern as `ConfigStore`:
 
 ```typescript
 class WorkspaceStore {
   private mutex = new Mutex()
-  private cached: WorkspaceData | null = null
+  private cached: WorkspaceFile | null = null
   private filePath: string  // ~/.freshell/workspace.json
 
-  async load(): Promise<WorkspaceData>
-  async save(data: WorkspaceData): Promise<void>           // atomic write
-  async updateWorkspace(sync: WorkspaceSync): Promise<void> // merge active state
-  async addClosedTab(tab: ClosedTab): Promise<void>
-  async removeClosedTab(id: string): Promise<ClosedTab | null>
-  async pruneClosedTabs(): Promise<void>                   // TTL + count cap
+  async load(): Promise<WorkspaceFile>
+  async save(data: WorkspaceFile): Promise<void>
+
+  // Device operations (all serialized under mutex)
+  async getDevice(name: string): Promise<DeviceWorkspace | null>
+  async updateDevice(name: string, workspace: DeviceWorkspaceSync): Promise<void>
+  async addClosedTab(deviceName: string, tab: ClosedTab): Promise<void>
+  async removeClosedTab(deviceName: string, tabId: string): Promise<ClosedTab | null>
+  async touchDevice(name: string): Promise<void>  // update lastSeenAt
+
+  // Maintenance
+  async pruneStaleDevices(maxAge: number): Promise<string[]>  // returns pruned device names
+  async pruneClosedTabs(deviceName: string): Promise<void>    // TTL + count cap
+
+  // Read (no mutex needed)
+  getAllDevices(): Record<string, DeviceWorkspace>
 
   // Enrichment
-  enrichClosedTabs(
-    closedTabs: ClosedTab[],
-    registry: TerminalRegistry
-  ): ClosedTabWithStatus[]
+  enrichDevice(
+    device: DeviceWorkspace,
+    deviceName: string,
+    registry: TerminalRegistry,
+    isLocal: boolean,
+  ): DeviceWorkspaceWithStatus
 }
 ```
 
 ---
 
-## 9. Client-Side Changes
+## 10. Client-Side Changes
 
-### 9.1 New: `workspaceSyncMiddleware`
+### 10.1 New: `workspaceSyncMiddleware`
 
-Similar to `persistMiddleware`, intercepts `tabs/*` and `panes/*` actions:
+Intercepts `tabs/*` and `panes/*` actions, debounces, and pushes to server:
 
 ```typescript
-// Debounce timer (500ms, separate from persist)
-// On flush: read current state, send workspace.sync over WS
-// On tab close: capture snapshot pre-removal, send workspace.tab-closed immediately
-// Skip actions tagged with { source: 'workspace-sync' } to prevent echo
+// - Debounce: 500ms (separate timer from persistMiddleware)
+// - On flush: snapshot current tabs + panes state, send workspace.sync
+// - On tab close: capture snapshot BEFORE removal, send workspace.tab-closed immediately
+// - Skip actions tagged with { source: 'workspace-sync' } to prevent echo loops
+// - Skip if WS not connected (degrade gracefully)
 ```
 
-### 9.2 New: `closedTabsSlice`
+### 10.2 New: `remoteDevicesSlice`
 
 ```typescript
-type ClosedTabsState = {
-  closedTabs: ClosedTabWithStatus[]
+type RemoteDevicesState = {
+  devices: DeviceWorkspaceWithStatus[]   // all devices except local
+  localClosedTabs: ClosedTabWithStatus[] // this device's closed tabs from server
 }
 
 // Reducers:
-//   setClosedTabs(tabs)      — from workspace.state or workspace.closed-tabs
-//   clearClosedTab(id)       — local removal (before reopen or dismiss)
+//   setAllDevices(devices[])       — from workspace.state
+//   updateDevice(device)           — from workspace.device-updated
+//   setClosedTabs(deviceName, tabs) — from workspace.closed-tabs
 
 // Selectors:
-//   selectClosedTabs         — all closed tabs
-//   selectClosedTabsWithRunning — only those with at least one running terminal
+//   selectRemoteDevices            — other devices with their tabs
+//   selectLocalClosedTabs          — this device's closed tabs
+//   selectOnlineDevices            — devices with active WS connections
 ```
 
-### 9.3 Modified: Connection Handler
+### 10.3 New: `deviceNameSlice` (or extend `settingsSlice`)
 
-On receiving `workspace.state`:
-- If no local tabs: hydrate fully
-- If local tabs exist: compare `updatedAt`, merge or push accordingly
-- Always update `closedTabs` slice
+```typescript
+// Stores the local device name
+// Loaded from settings on startup
+// Editable in Settings UI
+// Sent in hello message
+```
 
-### 9.4 Modified: Tab Bar
+### 10.4 Modified: Connection Handler
 
-- Render closed tabs after active tabs with visual distinction
-- Click handler dispatches reopen flow
-- Right-click context menu with "Dismiss" option
+On `workspace.state`:
+- Populate `remoteDevicesSlice` with all non-local devices
+- For own device: if localStorage is empty, hydrate from server data
+- For own device: if localStorage exists, keep local, push sync to server
+- Set local closed tabs from own device's closedTabs
+
+### 10.5 Modified: Tab Bar
+
+- Render local active tabs (unchanged)
+- Render local closed tabs (new, greyed section)
+- Render remote device tab groups (new, rightmost section)
+- Click handlers for adopt and reopen flows
 
 ---
 
-## 10. Migration & Backward Compatibility
+## 11. Migration & Backward Compatibility
 
-- **Old clients** (no `supportsWorkspaceSyncV1`): continue using localStorage only. No `workspace.state` sent. No breakage.
-- **First connection with new client**: server has no `workspace.json` yet. Client pushes its localStorage state to server on connect. From then on, workspace is synced.
-- **Downgrade**: if a user reverts to an older Freshell version, `workspace.json` is ignored. localStorage still works. No data loss.
-- **Background Sessions panel**: removed in the new UI. The tab bar closed-tabs section replaces it entirely. The `terminal.list` / `terminal.list.response` / `terminal.list.updated` WS messages remain available but are no longer polled by the default UI.
+- **Old clients** (no `supportsWorkspaceSyncV1`): no `deviceName` in hello, no workspace messages sent. Fully backward compatible.
+- **First connect with new client**: server has no `workspace.json`. Client pushes initial sync. File created.
+- **Downgrade**: `workspace.json` ignored. localStorage still works.
+- **Device rename**: old device name persists as stale entry, auto-pruned after 30 days. No data loss.
+- **Background Sessions**: `terminal.list` WS messages remain in protocol but UI no longer polls them. Removed in a follow-up cleanup pass.
 
 ---
 
-## 11. Edge Cases
+## 12. Edge Cases
 
 | Scenario | Behavior |
 |----------|----------|
-| Two machines connected, both editing | Both push syncs; last writer wins at server. Loser receives broadcast, merges. Tabs are additive so typically no visible conflict. |
-| Client disconnects mid-sync | Server has last successful write. Client reconnects, receives stale-but-valid state, pushes fresh sync. |
-| Server restart | `workspace.json` survives on disk. First client to connect receives persisted state. |
-| `workspace.json` corrupted | Server logs error, treats as empty. First client push recreates it. |
-| Tab closed on Machine A, terminal killed before Machine B sees it | Machine B receives `closedTabs` with terminal status `'gone'`. Reopening creates a fresh terminal. |
-| 200+ tabs | Server rejects `workspace.sync` exceeding size cap. Client keeps local state. Log warning. |
-| Clock skew between machines | `updatedAt` is set by the server on receipt (not trusted from client), eliminating clock skew issues. |
+| Two browser tabs, same device name | Both push to same device slot. Last write wins (same as current localStorage behavior). BroadcastChannel keeps them in sync locally. |
+| Device name collision (two machines with same hostname) | Unlikely but handled: last writer wins for that slot. User should rename one device in Settings. |
+| Adopt a tab whose terminals have exited | Panes show `status: 'exited'`. User can see scrollback (if still in server buffer) or close. |
+| Remote device disconnects | Its tabs remain visible. `lastSeenAt` stops updating. Online indicator goes grey. Tabs still adoptable if terminals are running. |
+| Server restart | `workspace.json` on disk survives. All devices' data preserved. |
+| `workspace.json` corrupted | Server logs error, starts fresh. Each device pushes on next connect. |
+| 20+ devices over time | Oldest by `lastSeenAt` pruned automatically. |
+| Device has 200+ tabs | Server rejects the sync with a warning. Client keeps local state. |
 
 ---
 
-## 12. Testing Strategy
+## 13. Testing Strategy
 
 ### Unit Tests
-- `WorkspaceStore`: load/save/prune/enrich, atomic writes, mutex serialization
-- `closedTabsSlice`: reducers, selectors
+- `WorkspaceStore`: per-device load/save/prune, atomic writes, mutex serialization, stale device cleanup
+- `remoteDevicesSlice`: reducers, selectors
 - `workspaceSyncMiddleware`: debounce, skip-echo, pre-removal capture
-- Workspace message Zod schemas: validation, edge cases
+- Workspace message Zod schemas: validation
+- Tab adoption logic: clone tab + layout, remap IDs
 
 ### Integration Tests
-- WS handler: `workspace.sync` → persist → broadcast flow
-- WS handler: `workspace.tab-closed` → closed list update → broadcast
+- WS handler: `workspace.sync` → persist to device slot → broadcast to others
+- WS handler: `workspace.tab-closed` → update device closedTabs → broadcast
 - WS handler: capability negotiation (old client gets no workspace messages)
-- Connect flow: fresh client hydration from server state
+- WS handler: device name from hello used correctly
+- Connect flow: fresh device hydration from server state
+- Connect flow: existing device pushes local state
 
 ### E2E Tests
-- Open tab on "Machine A" (browser tab 1), verify it appears on "Machine B" (browser tab 2 after clearing localStorage)
-- Close tab, verify grey tab appears on both machines
-- Reopen closed tab, verify terminal reattaches
-- Kill terminal, verify closed tab shows grey status dot
+- Device A creates tabs, Device B sees them in remote section
+- Device B adopts Device A's tab, both attached to same terminals
+- Close tab on Device A, grey tab visible on both devices
+- Reopen closed tab, terminal reattaches
+- Device A disconnects, Device B still sees its tabs (stale but visible)
+- Browser crash on Device A → reconnect → hydrate from server → tabs restored
 
 ---
 
-## 13. Implementation Order
+## 14. Implementation Order
 
-1. **WorkspaceStore** — server-side persistence (file I/O, mutex, prune logic)
-2. **WS message schemas** — Zod schemas for all new message types
-3. **WS handler integration** — receive `workspace.sync` / `workspace.tab-closed` / `workspace.reopen-tab`, send `workspace.state` / `workspace.closed-tabs`, capability negotiation
-4. **closedTabsSlice** — client-side Redux slice
-5. **workspaceSyncMiddleware** — client-side middleware (debounced push, pre-removal capture)
-6. **Connection handler** — hydration logic on connect (fresh vs. existing state)
-7. **Tab bar UI** — closed tabs rendering, reopen, dismiss
-8. **Remove BackgroundSessions** — replace with closed tabs bar
-9. **Cross-machine E2E tests**
+1. **Device name setting** — new `deviceName` field in AppSettings, default from `os.hostname()`, UI in Settings
+2. **WorkspaceStore** — per-device persistence (file I/O, mutex, prune)
+3. **WS message schemas** — Zod schemas for all new message types
+4. **WS handler integration** — device-aware sync/broadcast, capability negotiation, `deviceName` in hello
+5. **remoteDevicesSlice** — client Redux state for remote devices + local closed tabs
+6. **workspaceSyncMiddleware** — debounced push, tab-closed capture
+7. **Connection handler** — hydration on connect, push local state
+8. **Tab bar UI** — closed tabs, remote device groups, adopt flow
+9. **Replace BackgroundSessions** — orphan terminal surfacing on `(server)` pseudo-device
+10. **E2E tests**
 
 ---
 
-## 14. Open Questions
+## 15. Open Questions
 
-1. **Should `updatedAt` be server-assigned?** Proposed yes (avoids clock skew). But this means a client can't tell if its local state is "newer" than the server's without comparing content. Alternative: use a monotonic counter instead of timestamp.
+1. **Device name UX:** Should we prompt on first connect ("What should we call this device?") or silently default to hostname and let users rename later in Settings?
 
-2. **Should closed tabs sync bidirectionally?** Current proposal: server is authoritative for closed tabs (clients only add/remove via WS messages). Alternative: clients could maintain their own closed tab lists and merge.
+2. **Adopt vs. mirror:** When you adopt a tab, should it be a one-time clone (independent from that point) or a live mirror that stays in sync with the source device? Proposed: one-time clone (simpler, no ongoing sync coupling between devices).
 
-3. **Should we support "workspace profiles"?** (e.g., save/restore named layouts.) Out of scope for v1 but the data model supports it naturally — a workspace profile is just a named snapshot of the active workspace fields.
+3. **Tab title decoration:** How to show device provenance? Options:
+   - `freshell (danshapiro-main)` in the tab title
+   - Small device badge below the tab
+   - Separate grouped section with device header label
+   - Color-coded per device
 
-4. **Pane zoom state:** Currently ephemeral (not persisted). Should we sync it? Probably not — it's a transient view preference.
+4. **Should remote closed tabs be visible?** Or only remote active tabs? Proposed: both, but remote closed tabs are lower priority and could be hidden behind an expand toggle.
+
+5. **Workspace profiles:** Out of scope for v1, but the per-device data model supports it naturally — a "profile" could be a snapshot of a device's workspace that you can restore later.
