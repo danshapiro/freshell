@@ -684,13 +684,14 @@ async function main() {
   }
 
   const port = Number(process.env.PORT || 3001)
-  server.listen(port, '0.0.0.0', () => {
+  const bindHost = process.env.BIND_HOST || process.env.HOST || '127.0.0.1'
+  server.listen(port, bindHost, () => {
     log.info({ event: 'server_listening', port, appVersion: APP_VERSION }, 'Server listening')
 
     // Print friendly startup message
     const token = process.env.AUTH_TOKEN
     const lanIps = detectLanIps()
-    const lanIp = lanIps[0] || 'localhost'
+    const lanIp = bindHost === '0.0.0.0' ? (lanIps[0] || 'localhost') : bindHost
     const visitPort = resolveVisitPort(port, process.env)
     const url = `http://${lanIp}:${visitPort}/?token=${token}`
 

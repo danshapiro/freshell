@@ -23,6 +23,11 @@ export default defineConfig(({ mode }) => {
   const backendHost = env.VITE_BACKEND_HOST || env.BACKEND_HOST || '127.0.0.1'
   const backendUrl = `http://${backendHost}:${backendPort}`
   const vitePort = parseInt(env.VITE_PORT || '5173', 10)
+  const viteHost = env.VITE_HOST || env.HOST || '127.0.0.1'
+  const allowedHosts = (env.VITE_ALLOWED_HOSTS || 'localhost,127.0.0.1,shell.l7-partners.com')
+    .split(',')
+    .map((h) => h.trim())
+    .filter(Boolean)
 
   return {
     plugins: [react()],
@@ -40,7 +45,8 @@ export default defineConfig(({ mode }) => {
       sourcemap: mode === 'development',
     },
     server: {
-      host: true,
+      host: viteHost,
+      allowedHosts,
       port: vitePort,
       watch: {
         ignored: ['**/.worktrees/**', '**/demo-projects/**'],
