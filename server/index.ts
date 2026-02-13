@@ -792,11 +792,17 @@ async function main() {
     const lanIps = detectLanIps()
     const lanIp = lanIps[0] || 'localhost'
     const visitPort = resolveVisitPort(port, process.env)
-    const url = `http://${lanIp}:${visitPort}/?token=${token}`
+    const hideToken = process.env.HIDE_STARTUP_TOKEN?.toLowerCase() === 'true'
+    const url = hideToken
+      ? `http://${lanIp}:${visitPort}/`
+      : `http://${lanIp}:${visitPort}/?token=${token}`
 
     console.log('')
     console.log(`\x1b[32m\u{1F41A}\u{1F525} freshell is ready!\x1b[0m`)
     console.log(`   Visit from anywhere on your network: \x1b[36m${url}\x1b[0m`)
+    if (hideToken) {
+      console.log('   Auth token is configured in .env (not printed to logs).')
+    }
     console.log('')
 
     startBackgroundTasks()
