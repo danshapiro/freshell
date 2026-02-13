@@ -344,6 +344,48 @@ describe('turn complete notification flow (e2e)', () => {
     })
   })
 
+  it('click mode: clicking the already-active tab clears attention', async () => {
+    const store = createStore()
+
+    render(
+      <Provider store={store}>
+        <Harness />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.onMessage).toHaveBeenCalled()
+    })
+
+    // Switch to tab-2 first so it's active
+    fireEvent.click(screen.getByText('Background'))
+    await waitFor(() => {
+      expect(store.getState().tabs.activeTabId).toBe('tab-2')
+    })
+
+    // Emit turn complete signal on tab-2 (the now-active tab)
+    act(() => {
+      wsMocks.emitMessage({
+        type: 'terminal.output',
+        terminalId: 'term-2',
+        data: '\x07',
+      })
+    })
+
+    // Tab-2 should have attention
+    await waitFor(() => {
+      expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
+    })
+
+    // Click tab-2 again (already active) — should clear attention
+    fireEvent.click(screen.getByText('Background'))
+
+    await waitFor(() => {
+      expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBeUndefined()
+    })
+    expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBeUndefined()
+  })
+
   it('type mode: attention persists after tab switch, clears on terminal input', async () => {
     const store = createStore('type')
 

@@ -1,6 +1,7 @@
 import { Plus } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, closeTab, setActiveTab, updateTab, reorderTabs, clearTabRenameRequest } from '@/store/tabsSlice'
+import { clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { collectTerminalIds, collectPaneContents } from '@/lib/pane-utils'
@@ -123,6 +124,9 @@ export default function TabBar() {
   const renameRequestTabId = tabsState?.renameRequestTabId ?? null
   const paneLayouts = useAppSelector((s) => s.panes?.layouts) ?? EMPTY_LAYOUTS
   const attentionByTab = useAppSelector((s) => s.turnCompletion?.attentionByTab) ?? EMPTY_ATTENTION
+  const attentionByPane = useAppSelector((s) => s.turnCompletion?.attentionByPane) ?? EMPTY_ATTENTION
+  const activePaneMap = useAppSelector((s) => s.panes?.activePane)
+  const attentionDismiss = useAppSelector((s) => s.settings?.settings?.panes?.attentionDismiss ?? 'click')
   const iconsOnTabs = useAppSelector((s) => s.settings?.settings?.panes?.iconsOnTabs ?? true)
   const tabAttentionStyle = useAppSelector((s) => s.settings?.settings?.panes?.tabAttentionStyle ?? 'highlight')
 
@@ -300,7 +304,16 @@ export default function TabBar() {
                   }
                   dispatch(closeTab(tab.id))
                 }}
-                onClick={() => dispatch(setActiveTab(tab.id))}
+                onClick={() => {
+                  if (attentionDismiss === 'click' && attentionByTab[tab.id]) {
+                    dispatch(clearTabAttention({ tabId: tab.id }))
+                    const activePaneId = activePaneMap?.[tab.id]
+                    if (activePaneId && attentionByPane[activePaneId]) {
+                      dispatch(clearPaneAttention({ paneId: activePaneId }))
+                    }
+                  }
+                  dispatch(setActiveTab(tab.id))
+                }}
                 onDoubleClick={() => {
                   setRenamingId(tab.id)
                   setRenameValue(getDisplayTitle(tab))

@@ -5,7 +5,7 @@ import { Provider } from 'react-redux'
 import tabsReducer, { setActiveTab } from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
-import turnCompletionReducer, { recordTurnComplete } from '@/store/turnCompletionSlice'
+import turnCompletionReducer, { recordTurnComplete, clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
 import { useTurnCompletionNotifications } from '@/hooks/useTurnCompletionNotifications'
 import type { Tab, AttentionDismiss } from '@/store/types'
 
@@ -325,6 +325,35 @@ describe('useTurnCompletionNotifications', () => {
       expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
     })
     expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
+  })
+
+  it('click mode: clearTabAttention/clearPaneAttention actions clear attention state', async () => {
+    const store = createStore('tab-1', 'click')
+
+    render(
+      <Provider store={store}>
+        <TestComponent />
+      </Provider>
+    )
+
+    // Completion arrives on the active tab
+    act(() => {
+      store.dispatch(recordTurnComplete({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 'term-1', at: 100 }))
+    })
+
+    await waitFor(() => {
+      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
+    })
+
+    // Simulate clicking the already-active tab (dispatches setActiveTab with same value)
+    // This triggers the TabBar's onClick which should clear attention directly
+    act(() => {
+      store.dispatch(clearTabAttention({ tabId: 'tab-1' }))
+      store.dispatch(clearPaneAttention({ paneId: 'pane-1' }))
+    })
+
+    expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBeUndefined()
+    expect(store.getState().turnCompletion.attentionByPane['pane-1']).toBeUndefined()
   })
 
   it('click mode: switching to a tab with attention clears both tab and pane attention', async () => {
