@@ -128,7 +128,7 @@ function buildCopyResumeMenuItem(id: string, candidate: ResumeCommandCandidate, 
 }
 
 export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): MenuItem[] {
-  const { actions, tabs, paneLayouts, sessions, view, sidebarCollapsed, expandedProjects, contextElement, clickTarget: _clickTarget, platform } = ctx
+  const { actions, tabs, paneLayouts, sessions, view, sidebarCollapsed, expandedProjects, contextElement, clickTarget, platform } = ctx
   const isSessionOpen = (sessionId: string, provider?: string) => {
     const keyProvider = provider || 'claude'
     for (const tab of tabs) {
@@ -457,7 +457,14 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
   if (target.kind === 'freshclaude-chat') {
     const selection = window.getSelection()
     const hasSelection = !!(selection && selection.toString().trim())
-    return [
+
+    // Detect sub-region from click target using closest()
+    const codeBlock = clickTarget?.closest?.('.prose pre code') as HTMLElement | null
+    const toolInput = clickTarget?.closest?.('[data-tool-input]') as HTMLElement | null
+    const toolOutput = clickTarget?.closest?.('[data-tool-output]') as HTMLElement | null
+    const diffView = clickTarget?.closest?.('[data-diff]') as HTMLElement | null
+
+    const items: MenuItem[] = [
       {
         type: 'item',
         id: 'fc-copy',
@@ -472,8 +479,8 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
         id: 'fc-select-all',
         label: 'Select all',
         onSelect: () => {
-          const range = document.createRange()
           if (contextElement) {
+            const range = document.createRange()
             range.selectNodeContents(contextElement)
             const sel = window.getSelection()
             sel?.removeAllRanges()
@@ -482,6 +489,79 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
         },
       },
     ]
+
+    // Context-sensitive items
+    if (codeBlock) {
+      items.push(
+        { type: 'separator', id: 'fc-code-sep' },
+        {
+          type: 'item',
+          id: 'fc-copy-code-block',
+          label: 'Copy code block',
+          onSelect: () => actions.copyFreshclaudeCodeBlock(codeBlock),
+        },
+      )
+    }
+
+    if (toolInput) {
+      const toolName = toolInput.getAttribute('data-tool-name')
+      const isBash = toolName === 'Bash'
+      items.push(
+        { type: 'separator', id: 'fc-tool-input-sep' },
+        {
+          type: 'item',
+          id: isBash ? 'fc-copy-command' : 'fc-copy-input',
+          label: isBash ? 'Copy command' : 'Copy input',
+          onSelect: () => actions.copyFreshclaudeToolInput(toolInput),
+        },
+      )
+    }
+
+    if (toolOutput) {
+      // Don't add separator if we just added one for toolInput
+      if (!toolInput) items.push({ type: 'separator', id: 'fc-tool-output-sep' })
+      items.push({
+        type: 'item',
+        id: 'fc-copy-output',
+        label: 'Copy output',
+        onSelect: () => actions.copyFreshclaudeToolOutput(toolOutput),
+      })
+    }
+
+    if (diffView) {
+      const filePath = diffView.getAttribute('data-file-path')
+      items.push(
+        { type: 'separator', id: 'fc-diff-sep' },
+        {
+          type: 'item',
+          id: 'fc-copy-new-version',
+          label: 'Copy new version',
+          onSelect: () => actions.copyFreshclaudeDiffNew(diffView),
+        },
+        {
+          type: 'item',
+          id: 'fc-copy-old-version',
+          label: 'Copy old version',
+          onSelect: () => actions.copyFreshclaudeDiffOld(diffView),
+        },
+      )
+      if (filePath) {
+        items.push({
+          type: 'item',
+          id: 'fc-copy-file-path',
+          label: 'Copy file path',
+          onSelect: () => actions.copyFreshclaudeFilePath(diffView),
+        })
+      }
+    }
+
+    // Session metadata at the bottom
+    items.push(
+      { type: 'separator', id: 'fc-session-sep' },
+      { type: 'item', id: 'fc-copy-session', label: 'Copy session ID', onSelect: () => actions.copySessionId(target.sessionId) },
+    )
+
+    return items
   }
 
   return []
