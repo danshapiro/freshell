@@ -12,8 +12,7 @@ import {
 } from '@/store/sessionsSlice'
 import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { api } from '@/lib/api'
-import { getAuthToken } from '@/lib/auth'
-import { buildShareUrl } from '@/lib/utils'
+import { getShareAction } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { getSessionsForHello } from '@/lib/session-utils'
 import { setClientPerfEnabled } from '@/lib/perf-logger'
@@ -34,11 +33,33 @@ import { SetupWizard } from '@/components/SetupWizard'
 import { fetchNetworkStatus } from '@/store/networkSlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
-import { Wifi, WifiOff, Moon, Sun, Share2, X, Copy, Check, PanelLeftClose, PanelLeft } from 'lucide-react'
+import { Wifi, WifiOff, Moon, Sun, Share2, X, Copy, Check, PanelLeftClose, PanelLeft, Loader2 } from 'lucide-react'
 import { updateSettingsLocal, markSaved } from '@/store/settingsSlice'
 import { clearIdleWarning, recordIdleWarning } from '@/store/idleWarningsSlice'
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
+
+// Lazy QR code component to avoid loading lean-qr until the share panel opens
+function ShareQrCode({ url }: { url: string }) {
+  const [svgUrl, setSvgUrl] = useState<string | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const { generate } = await import('lean-qr')
+        const { toSvgDataURL } = await import('lean-qr/extras/svg')
+        if (cancelled) return
+        const code = generate(url)
+        setSvgUrl(toSvgDataURL(code))
+      } catch {
+        // QR generation failed — panel still shows URL text
+      }
+    })()
+    return () => { cancelled = true }
+  }, [url])
+  if (!svgUrl) return null
+  return <img src={svgUrl} alt="QR code for access URL" className="w-48 h-48" />
+}
 
 const SIDEBAR_MIN_WIDTH = 200
 const SIDEBAR_MAX_WIDTH = 500
@@ -59,8 +80,10 @@ export default function App() {
   const idleWarningCount = Object.keys(idleWarnings).length
   const networkStatus = useAppSelector((s) => s.network.status)
 
+  const networkLoading = useAppSelector((s) => s.network.loading)
+
   const [view, setView] = useState<AppView>('terminal')
-  const [shareModalUrl, setShareModalUrl] = useState<string | null>(null)
+  const [showSharePanel, setShowSharePanel] = useState(false)
   const [showSetupWizard, setShowSetupWizard] = useState(false)
   const [wizardInitialStep, setWizardInitialStep] = useState<1 | 2>(1)
   const [copied, setCopied] = useState(false)
@@ -138,61 +161,30 @@ export default function App() {
     }
   }
 
-  const handleShare = async () => {
-    // Build shareable URL with LAN IP and token
-    let lanIp: string | null = null
-    try {
-      const res = await api.get<{ ips: string[] }>('/api/lan-info')
-      if (res.ips.length > 0) {
-        lanIp = res.ips[0]
-      }
-    } catch {
-      // Fall back to current host if LAN info unavailable
-    }
+  const handleShare = () => {
+    const action = getShareAction(networkStatus)
 
-    const token = getAuthToken() ?? null
-    const shareUrl = buildShareUrl({
-      currentUrl: window.location.href,
-      lanIp,
-      token,
-      isDev: import.meta.env.DEV,
-    })
-
-    // On Windows, show a modal instead of using system share
-    const isWindows = navigator.platform.includes('Win')
-    if (isWindows) {
-      setCopied(false)
-      setShareModalUrl(shareUrl)
-      return
-    }
-
-    const shareText = `You need to use this on your local network or with a VPN.\n${shareUrl}`
-
-    if (navigator.share) {
-      try {
-        await navigator.share({
-          title: 'Welcome to your freshell!',
-          text: shareText,
-        })
-      } catch (err) {
-        // User cancelled or share failed - that's okay
-        console.warn('Share cancelled or failed:', err)
-      }
-    } else {
-      // Fallback: copy to clipboard
-      try {
-        await navigator.clipboard.writeText(shareText)
-        // TODO: Show toast notification
-      } catch (err) {
-        console.warn('Clipboard write failed:', err)
-      }
+    switch (action.type) {
+      case 'loading':
+        // Network status not loaded yet — retry the fetch so a transient
+        // failure doesn't permanently disable the Share button.
+        dispatch(fetchNetworkStatus())
+        return
+      case 'wizard':
+        setWizardInitialStep(action.initialStep)
+        setShowSetupWizard(true)
+        return
+      case 'panel':
+        setCopied(false)
+        setShowSharePanel(true)
+        return
     }
   }
 
-  const handleCopyShareLink = async () => {
-    if (!shareModalUrl) return
+  const handleCopyAccessUrl = async () => {
+    if (!networkStatus?.accessUrl) return
     try {
-      await navigator.clipboard.writeText(shareModalUrl)
+      await navigator.clipboard.writeText(networkStatus.accessUrl)
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     } catch (err) {
@@ -497,8 +489,13 @@ export default function App() {
             onClick={handleShare}
             className="p-1.5 rounded-md hover:bg-muted transition-colors"
             title="Share LAN access"
+            aria-label="Share"
           >
-            <Share2 className="h-3.5 w-3.5 text-muted-foreground" />
+            {networkLoading ? (
+              <Loader2 className="h-3.5 w-3.5 text-muted-foreground animate-spin" />
+            ) : (
+              <Share2 className="h-3.5 w-3.5 text-muted-foreground" />
+            )}
           </button>
           <div
             className="p-1.5"
@@ -550,14 +547,14 @@ export default function App() {
         </div>
       </div>
 
-      {/* Share modal for Windows */}
-      {shareModalUrl && (
+      {/* Network-aware share panel */}
+      {showSharePanel && networkStatus && (
         <div
           className="fixed inset-0 bg-black/50 flex items-center justify-center z-[60]"
           role="presentation"
-          onClick={() => setShareModalUrl(null)}
+          onClick={() => setShowSharePanel(false)}
           onKeyDown={(e) => {
-            if (e.key === 'Escape') setShareModalUrl(null)
+            if (e.key === 'Escape') setShowSharePanel(false)
           }}
           tabIndex={-1}
         >
@@ -566,26 +563,37 @@ export default function App() {
             className="bg-background border border-border rounded-lg shadow-lg max-w-md w-full mx-4 p-6"
             role="dialog"
             aria-modal="true"
-            aria-label="Share freshell invitation"
+            aria-label="Share freshell access"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between mb-4">
-              <h2 className="text-lg font-semibold">Welcome to your freshell!</h2>
+              <h2 className="text-lg font-semibold">Share Access</h2>
               <button
-                onClick={() => setShareModalUrl(null)}
+                onClick={() => setShowSharePanel(false)}
                 className="p-1 rounded hover:bg-muted transition-colors"
+                aria-label="Close share panel"
               >
                 <X className="h-4 w-4 text-muted-foreground" />
               </button>
             </div>
             <p className="text-sm text-muted-foreground mb-4">
-              You need to use this on your local network or with a VPN.
+              Share this link with devices on your local network or VPN.
             </p>
+            {networkStatus.accessUrl && (
+              <div className="flex justify-center mb-4">
+                <ShareQrCode url={networkStatus.accessUrl} />
+              </div>
+            )}
+            {networkStatus.mdns?.enabled && networkStatus.mdns.hostname && (
+              <p className="text-xs text-muted-foreground text-center mb-2">
+                Also available at <code className="text-xs">{networkStatus.mdns.hostname}.local</code>
+              </p>
+            )}
             <div className="bg-muted rounded-md p-3 mb-4">
-              <code className="text-sm break-all select-all">{shareModalUrl}</code>
+              <code className="text-sm break-all select-all">{networkStatus.accessUrl}</code>
             </div>
             <button
-              onClick={handleCopyShareLink}
+              onClick={handleCopyAccessUrl}
               className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90 transition-colors"
             >
               {copied ? (

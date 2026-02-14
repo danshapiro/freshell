@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import App from '@/App'
@@ -9,7 +9,7 @@ import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
 import idleWarningsReducer from '@/store/idleWarningsSlice'
-import { networkReducer } from '@/store/networkSlice'
+import { networkReducer, setNetworkStatus, type NetworkStatusResponse } from '@/store/networkSlice'
 
 // Ensure DOM is clean even if another test file forgot cleanup.
 beforeEach(() => {
@@ -69,7 +69,9 @@ vi.mock('@/components/OverviewView', () => ({
 }))
 
 vi.mock('@/components/SetupWizard', () => ({
-  SetupWizard: () => <div data-testid="mock-setup-wizard">Setup Wizard</div>,
+  SetupWizard: ({ initialStep }: { initialStep?: number }) => (
+    <div data-testid="mock-setup-wizard" data-initial-step={initialStep}>Setup Wizard (step {initialStep ?? 1})</div>
+  ),
 }))
 
 // Mock the useThemeEffect hook to avoid errors from missing settings.terminal.fontSize
@@ -140,21 +142,33 @@ function renderApp(store = createTestStore()) {
   )
 }
 
-describe('App Component - Share Button', () => {
-  const originalNavigator = global.navigator
+function makeNetworkStatus(overrides: Partial<NetworkStatusResponse> = {}): NetworkStatusResponse {
+  return {
+    configured: true,
+    host: '0.0.0.0',
+    port: 3001,
+    lanIps: ['192.168.1.100'],
+    machineHostname: 'test-host',
+    mdns: { enabled: false, hostname: 'freshell' },
+    firewall: { platform: 'linux', active: false, portOpen: null, commands: [], configuring: false },
+    rebinding: false,
+    devMode: false,
+    accessUrl: 'http://192.168.1.100:3001',
+    ...overrides,
+  }
+}
 
+describe('App Component - Share Button', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     localStorage.clear()
-    // Auth token is now stored in localStorage via @/lib/auth
     localStorage.setItem('freshell.auth-token', 'test-token-abc123')
-    // Mock API responses
     mockApiGet.mockImplementation((url: string) => {
       if (url === '/api/settings') return Promise.resolve(defaultSettings)
       if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
       if (url === '/api/sessions') return Promise.resolve([])
-      if (url === '/api/lan-info') {
-        return Promise.resolve({ ips: ['192.168.1.100'] })
+      if (url === '/api/network/status') {
+        return Promise.resolve(makeNetworkStatus())
       }
       return Promise.resolve({})
     })
@@ -162,10 +176,6 @@ describe('App Component - Share Button', () => {
 
   afterEach(() => {
     cleanup()
-    Object.defineProperty(global, 'navigator', {
-      value: originalNavigator,
-      writable: true,
-    })
   })
 
   it('renders the share button in the header', () => {
@@ -187,211 +197,129 @@ describe('App Component - Share Button', () => {
     expect(connector.className).toContain('bg-background')
   })
 
-  it('uses Web Share API when available (non-Windows)', async () => {
-    const mockShare = vi.fn().mockResolvedValue(undefined)
-    Object.defineProperty(global, 'navigator', {
-      value: {
-        ...originalNavigator,
-        share: mockShare,
-        platform: 'MacIntel', // Non-Windows platform
-      },
-      writable: true,
+  it('opens setup wizard when network not configured', () => {
+    const store = createTestStore()
+    // Set network to unconfigured localhost
+    act(() => {
+      store.dispatch(setNetworkStatus(makeNetworkStatus({
+        configured: false,
+        host: '127.0.0.1',
+      })))
     })
 
-    renderApp()
+    renderApp(store)
 
     const shareButton = screen.getByTitle('Share LAN access')
     fireEvent.click(shareButton)
 
-    await waitFor(() => {
-      expect(mockShare).toHaveBeenCalledWith(
-        expect.objectContaining({
-          title: 'Welcome to your freshell!',
-          text: expect.stringContaining('You need to use this on your local network or with a VPN.'),
-        })
-      )
-      // URL is embedded in text with LAN IP and token
-      const callArgs = mockShare.mock.calls[0][0]
-      expect(callArgs.text).toContain('192.168.1.100')
-      expect(callArgs.text).toContain('token=test-token-abc123')
-    })
+    // Should show the wizard at step 1
+    expect(screen.getByTestId('mock-setup-wizard')).toBeInTheDocument()
+    expect(screen.getByTestId('mock-setup-wizard').dataset.initialStep).toBe('1')
   })
 
-  it('falls back to clipboard when Web Share API is unavailable (non-Windows)', async () => {
-    const mockWriteText = vi.fn().mockResolvedValue(undefined)
-    Object.defineProperty(global, 'navigator', {
-      value: {
-        ...originalNavigator,
-        share: undefined,
-        platform: 'MacIntel',
-        clipboard: {
-          writeText: mockWriteText,
-        },
-      },
-      writable: true,
+  it('opens setup wizard at step 2 when configured but localhost-only', () => {
+    const store = createTestStore()
+    // Set network to configured but localhost
+    act(() => {
+      store.dispatch(setNetworkStatus(makeNetworkStatus({
+        configured: true,
+        host: '127.0.0.1',
+      })))
     })
 
-    renderApp()
+    renderApp(store)
 
+    // Close the auto-opened wizard first (auto-show only triggers for unconfigured)
+    // In this case configured=true so no auto-show, we just click Share
     const shareButton = screen.getByTitle('Share LAN access')
     fireEvent.click(shareButton)
 
-    await waitFor(() => {
-      expect(mockWriteText).toHaveBeenCalledWith(expect.stringContaining('token=test-token-abc123'))
-      expect(mockWriteText).toHaveBeenCalledWith(expect.stringContaining('You need to use this on your local network or with a VPN.'))
-    })
+    expect(screen.getByTestId('mock-setup-wizard')).toBeInTheDocument()
+    expect(screen.getByTestId('mock-setup-wizard').dataset.initialStep).toBe('2')
   })
 
-  it('includes auth token in shared URL (non-Windows)', async () => {
-    const mockShare = vi.fn().mockResolvedValue(undefined)
-    Object.defineProperty(global, 'navigator', {
-      value: {
-        ...originalNavigator,
-        share: mockShare,
-        platform: 'MacIntel',
-      },
-      writable: true,
+  it('shows share panel with access URL when configured with remote access', async () => {
+    const store = createTestStore()
+    act(() => {
+      store.dispatch(setNetworkStatus(makeNetworkStatus({
+        configured: true,
+        host: '0.0.0.0',
+        accessUrl: 'http://192.168.1.100:3001',
+      })))
     })
 
-    renderApp()
+    renderApp(store)
 
     const shareButton = screen.getByTitle('Share LAN access')
     fireEvent.click(shareButton)
 
     await waitFor(() => {
-      expect(mockShare).toHaveBeenCalled()
-      const callArgs = mockShare.mock.calls[0][0]
-      // Token is in the text (which contains the URL)
-      expect(callArgs.text).toContain('token=test-token-abc123')
-    })
-  })
-
-  it('handles missing auth token gracefully (non-Windows)', async () => {
-    // Remove auth token from localStorage
-    localStorage.removeItem('freshell.auth-token')
-
-    const mockShare = vi.fn().mockResolvedValue(undefined)
-    Object.defineProperty(global, 'navigator', {
-      value: {
-        ...originalNavigator,
-        share: mockShare,
-        platform: 'MacIntel',
-      },
-      writable: true,
-    })
-
-    renderApp()
-
-    const shareButton = screen.getByTitle('Share LAN access')
-    fireEvent.click(shareButton)
-
-    await waitFor(() => {
-      expect(mockShare).toHaveBeenCalled()
-      const callArgs = mockShare.mock.calls[0][0]
-      // Text should not contain token param when token is missing
-      expect(callArgs.text).not.toContain('token=')
-    })
-  })
-
-  it('handles Web Share API rejection gracefully (non-Windows)', async () => {
-    const mockShare = vi.fn().mockRejectedValue(new Error('User cancelled'))
-    const mockWriteText = vi.fn().mockResolvedValue(undefined)
-    Object.defineProperty(global, 'navigator', {
-      value: {
-        ...originalNavigator,
-        share: mockShare,
-        platform: 'MacIntel',
-        clipboard: {
-          writeText: mockWriteText,
-        },
-      },
-      writable: true,
-    })
-
-    const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
-
-    renderApp()
-
-    const shareButton = screen.getByTitle('Share LAN access')
-    fireEvent.click(shareButton)
-
-    // Should not throw, and should not fall back to clipboard on user cancel
-    await waitFor(() => {
-      expect(mockShare).toHaveBeenCalled()
-    })
-
-    consoleSpy.mockRestore()
-  })
-
-  it('shows modal instead of Web Share API on Windows', async () => {
-    const mockShare = vi.fn().mockResolvedValue(undefined)
-    Object.defineProperty(global, 'navigator', {
-      value: {
-        ...originalNavigator,
-        share: mockShare,
-        platform: 'Win32',
-        clipboard: {
-          writeText: vi.fn().mockResolvedValue(undefined),
-        },
-      },
-      writable: true,
-    })
-
-    renderApp()
-
-    const shareButton = screen.getByTitle('Share LAN access')
-    fireEvent.click(shareButton)
-
-    // On Windows, should show modal instead of calling navigator.share
-    await waitFor(() => {
-      expect(screen.getByText('Welcome to your freshell!')).toBeInTheDocument()
-      expect(screen.getByText('You need to use this on your local network or with a VPN.')).toBeInTheDocument()
+      expect(screen.getByText('Share Access')).toBeInTheDocument()
+      expect(screen.getByText('http://192.168.1.100:3001')).toBeInTheDocument()
       expect(screen.getByText('Copy link')).toBeInTheDocument()
     })
-
-    // navigator.share should NOT have been called
-    expect(mockShare).not.toHaveBeenCalled()
   })
 
-  it('Windows modal displays URL with LAN IP and token', async () => {
-    Object.defineProperty(global, 'navigator', {
-      value: {
-        ...originalNavigator,
-        platform: 'Win32',
-        clipboard: {
-          writeText: vi.fn().mockResolvedValue(undefined),
-        },
-      },
-      writable: true,
+  it('shows share panel for legacy HOST env override (configured=false, host=0.0.0.0)', async () => {
+    const store = createTestStore()
+    act(() => {
+      store.dispatch(setNetworkStatus(makeNetworkStatus({
+        configured: false,
+        host: '0.0.0.0',
+        accessUrl: 'http://10.0.0.5:3001',
+      })))
     })
 
-    renderApp()
+    renderApp(store)
 
     const shareButton = screen.getByTitle('Share LAN access')
     fireEvent.click(shareButton)
 
     await waitFor(() => {
-      // Modal should contain URL with LAN IP and token
-      const codeElement = screen.getByRole('code') || screen.getByText(/192\.168\.1\.100/)
-      expect(codeElement.textContent).toContain('192.168.1.100')
-      expect(codeElement.textContent).toContain('token=test-token-abc123')
+      expect(screen.getByText('Share Access')).toBeInTheDocument()
+      expect(screen.getByText('http://10.0.0.5:3001')).toBeInTheDocument()
     })
   })
 
-  it('Windows modal copy button copies URL to clipboard', async () => {
-    const mockWriteText = vi.fn().mockResolvedValue(undefined)
-    Object.defineProperty(global, 'navigator', {
-      value: {
-        ...originalNavigator,
-        platform: 'Win32',
-        clipboard: {
-          writeText: mockWriteText,
-        },
-      },
-      writable: true,
+  it('share panel shows mDNS hostname when enabled', async () => {
+    const store = createTestStore()
+    act(() => {
+      store.dispatch(setNetworkStatus(makeNetworkStatus({
+        configured: true,
+        host: '0.0.0.0',
+        accessUrl: 'http://192.168.1.100:3001',
+        mdns: { enabled: true, hostname: 'myshell' },
+      })))
     })
 
-    renderApp()
+    renderApp(store)
+
+    const shareButton = screen.getByTitle('Share LAN access')
+    fireEvent.click(shareButton)
+
+    await waitFor(() => {
+      expect(screen.getByText('myshell.local')).toBeInTheDocument()
+    })
+  })
+
+  it('share panel copy button copies access URL to clipboard', async () => {
+    const mockWriteText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText: mockWriteText },
+      writable: true,
+      configurable: true,
+    })
+
+    const store = createTestStore()
+    act(() => {
+      store.dispatch(setNetworkStatus(makeNetworkStatus({
+        configured: true,
+        host: '0.0.0.0',
+        accessUrl: 'http://192.168.1.100:3001',
+      })))
+    })
+
+    renderApp(store)
 
     const shareButton = screen.getByTitle('Share LAN access')
     fireEvent.click(shareButton)
@@ -400,177 +328,52 @@ describe('App Component - Share Button', () => {
       expect(screen.getByText('Copy link')).toBeInTheDocument()
     })
 
-    const copyButton = screen.getByText('Copy link')
-    fireEvent.click(copyButton)
+    fireEvent.click(screen.getByText('Copy link'))
 
     await waitFor(() => {
-      expect(mockWriteText).toHaveBeenCalledWith(expect.stringContaining('192.168.1.100'))
-      expect(mockWriteText).toHaveBeenCalledWith(expect.stringContaining('token=test-token-abc123'))
+      expect(mockWriteText).toHaveBeenCalledWith('http://192.168.1.100:3001')
     })
   })
 
-  it('Windows modal shows "Copied!" after copying', async () => {
-    const mockWriteText = vi.fn().mockResolvedValue(undefined)
-    Object.defineProperty(global, 'navigator', {
-      value: {
-        ...originalNavigator,
-        platform: 'Win32',
-        clipboard: {
-          writeText: mockWriteText,
-        },
-      },
-      writable: true,
+  it('share panel can be closed by clicking X button', async () => {
+    const store = createTestStore()
+    act(() => {
+      store.dispatch(setNetworkStatus(makeNetworkStatus({
+        configured: true,
+        host: '0.0.0.0',
+        accessUrl: 'http://192.168.1.100:3001',
+      })))
     })
 
-    renderApp()
+    renderApp(store)
 
     const shareButton = screen.getByTitle('Share LAN access')
     fireEvent.click(shareButton)
 
     await waitFor(() => {
-      expect(screen.getByText('Copy link')).toBeInTheDocument()
+      expect(screen.getByText('Share Access')).toBeInTheDocument()
     })
 
-    const copyButton = screen.getByText('Copy link')
-    fireEvent.click(copyButton)
+    const closeButton = screen.getByLabelText('Close share panel')
+    fireEvent.click(closeButton)
 
     await waitFor(() => {
-      expect(screen.getByText('Copied!')).toBeInTheDocument()
+      expect(screen.queryByText('Share Access')).not.toBeInTheDocument()
     })
   })
 
-  it('Windows modal can be closed by clicking X button', async () => {
-    Object.defineProperty(global, 'navigator', {
-      value: {
-        ...originalNavigator,
-        platform: 'Win32',
-        clipboard: {
-          writeText: vi.fn().mockResolvedValue(undefined),
-        },
-      },
-      writable: true,
-    })
+  it('retries network status fetch when clicked with null status', () => {
+    const store = createTestStore()
+    // network.status starts as null (default)
 
-    renderApp()
+    renderApp(store)
 
     const shareButton = screen.getByTitle('Share LAN access')
     fireEvent.click(shareButton)
 
-    await waitFor(() => {
-      expect(screen.getByText('Welcome to your freshell!')).toBeInTheDocument()
-    })
-
-    // Find and click the close button (the X button in the header)
-    const modalHeader = screen.getByText('Welcome to your freshell!').parentElement
-    const xButton = modalHeader?.querySelector('button')
-    if (xButton) {
-      fireEvent.click(xButton)
-    }
-
-    await waitFor(() => {
-      expect(screen.queryByText('Welcome to your freshell!')).not.toBeInTheDocument()
-    })
-  })
-
-  it('Windows modal can be closed by clicking backdrop', async () => {
-    Object.defineProperty(global, 'navigator', {
-      value: {
-        ...originalNavigator,
-        platform: 'Win32',
-        clipboard: {
-          writeText: vi.fn().mockResolvedValue(undefined),
-        },
-      },
-      writable: true,
-    })
-
-    renderApp()
-
-    const shareButton = screen.getByTitle('Share LAN access')
-    fireEvent.click(shareButton)
-
-    await waitFor(() => {
-      expect(screen.getByText('Welcome to your freshell!')).toBeInTheDocument()
-    })
-
-    // Click the backdrop (the outer div with the dark overlay)
-    const backdrop = screen.getByText('Welcome to your freshell!').closest('.fixed')
-    if (backdrop) {
-      fireEvent.click(backdrop)
-    }
-
-    await waitFor(() => {
-      expect(screen.queryByText('Welcome to your freshell!')).not.toBeInTheDocument()
-    })
-  })
-
-  it('uses LAN IP from server in share URL', async () => {
-    const mockShare = vi.fn().mockResolvedValue(undefined)
-    Object.defineProperty(global, 'navigator', {
-      value: {
-        ...originalNavigator,
-        share: mockShare,
-        platform: 'MacIntel',
-      },
-      writable: true,
-    })
-
-    // Mock specific LAN IP
-    mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') return Promise.resolve(defaultSettings)
-      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
-      if (url === '/api/sessions') return Promise.resolve([])
-      if (url === '/api/lan-info') {
-        return Promise.resolve({ ips: ['10.0.0.50'] })
-      }
-      return Promise.resolve({})
-    })
-
-    renderApp()
-
-    const shareButton = screen.getByTitle('Share LAN access')
-    fireEvent.click(shareButton)
-
-    await waitFor(() => {
-      expect(mockShare).toHaveBeenCalled()
-      const callArgs = mockShare.mock.calls[0][0]
-      expect(callArgs.text).toContain('10.0.0.50')
-    })
-  })
-
-  it('falls back to current host if LAN info API fails', async () => {
-    const mockShare = vi.fn().mockResolvedValue(undefined)
-    Object.defineProperty(global, 'navigator', {
-      value: {
-        ...originalNavigator,
-        share: mockShare,
-        platform: 'MacIntel',
-      },
-      writable: true,
-    })
-
-    // Mock API failure
-    mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') return Promise.resolve(defaultSettings)
-      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
-      if (url === '/api/sessions') return Promise.resolve([])
-      if (url === '/api/lan-info') {
-        return Promise.reject(new Error('Network error'))
-      }
-      return Promise.resolve({})
-    })
-
-    renderApp()
-
-    const shareButton = screen.getByTitle('Share LAN access')
-    fireEvent.click(shareButton)
-
-    await waitFor(() => {
-      expect(mockShare).toHaveBeenCalled()
-      // Should still have called share (with localhost fallback)
-      const callArgs = mockShare.mock.calls[0][0]
-      expect(callArgs.text).toContain('token=test-token-abc123')
-    })
+    // Should have dispatched fetchNetworkStatus (the loading case triggers a retry)
+    // The mock API will be called for /api/network/status
+    expect(mockApiGet).toHaveBeenCalledWith('/api/network/status')
   })
 })
 

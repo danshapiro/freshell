@@ -137,6 +137,7 @@ import sessionsReducer, { SessionsState } from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import codingCliReducer from '@/store/codingCliSlice'
 import panesReducer from '@/store/panesSlice'
+import { networkReducer } from '@/store/networkSlice'
 import type { Tab, AppSettings, ProjectGroup, BackgroundTerminal } from '@/store/types'
 
 // Import the mocked api to get access to the mocks
@@ -162,6 +163,7 @@ function createTestStore(state: TestStoreState = {}) {
       connection: connectionReducer,
       codingCli: codingCliReducer,
       panes: panesReducer,
+      network: networkReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -1083,6 +1085,7 @@ describe('Component Edge Cases', () => {
         const store = configureStore({
           reducer: {
             settings: (state = { settings: undefined, loaded: false }) => state,
+            network: networkReducer,
           },
           preloadedState: {
             settings: { settings: undefined, loaded: false } as any,
