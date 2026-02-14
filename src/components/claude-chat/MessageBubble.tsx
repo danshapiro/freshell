@@ -5,6 +5,11 @@ import { cn } from '@/lib/utils'
 import type { ChatContentBlock } from '@/store/claudeChatTypes'
 import ToolBlock from './ToolBlock'
 
+/** Strip SDK-injected <system-reminder>...</system-reminder> tags from text. */
+function stripSystemReminders(text: string): string {
+  return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
+}
+
 interface MessageBubbleProps {
   role: 'user' | 'assistant'
   content: ChatContentBlock[]
@@ -97,9 +102,10 @@ function MessageBubble({
           if (!showTools) return null
           // Look up the matching tool_result to show as a unified block
           const result = block.id ? resultMap.get(block.id) : undefined
-          const resultContent = result
+          const rawResult = result
             ? (typeof result.content === 'string' ? result.content : JSON.stringify(result.content))
             : undefined
+          const resultContent = rawResult ? stripSystemReminders(rawResult) : undefined
           return (
             <ToolBlock
               key={block.id || i}
@@ -120,9 +126,10 @@ function MessageBubble({
             return null
           }
           // Render orphaned results (no matching tool_use) as standalone
-          const resultContent = typeof block.content === 'string'
+          const raw = typeof block.content === 'string'
             ? block.content
             : JSON.stringify(block.content)
+          const resultContent = stripSystemReminders(raw)
           return (
             <ToolBlock
               key={block.tool_use_id || i}

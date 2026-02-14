@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest'
 import { render, screen, cleanup } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import MessageBubble from '../../../../../src/components/claude-chat/MessageBubble'
 import type { ChatContentBlock } from '@/store/claudeChatTypes'
 
@@ -157,5 +158,48 @@ describe('MessageBubble display toggles', () => {
     expect(screen.getByText(/Let me think/)).toBeInTheDocument()
     expect(screen.getByText('Bash')).toBeInTheDocument()
     expect(screen.getByRole('article').querySelector('time')).not.toBeInTheDocument()
+  })
+})
+
+describe('MessageBubble system-reminder stripping', () => {
+  afterEach(cleanup)
+
+  it('strips system-reminder tags from standalone tool result content', async () => {
+    const user = userEvent.setup()
+    render(
+      <MessageBubble
+        role="assistant"
+        content={[{
+          type: 'tool_result',
+          tool_use_id: 't1',
+          content: 'actual content\n<system-reminder>\nHidden system text\n</system-reminder>\nmore content',
+        }]}
+      />
+    )
+    // Expand the tool block to reveal content
+    await user.click(screen.getByRole('button', { name: 'Result tool call' }))
+    expect(screen.getByText(/actual content/)).toBeInTheDocument()
+    expect(screen.queryByText(/Hidden system text/)).not.toBeInTheDocument()
+  })
+
+  it('strips system-reminder tags from paired tool_use/tool_result content', async () => {
+    const user = userEvent.setup()
+    render(
+      <MessageBubble
+        role="assistant"
+        content={[
+          { type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'foo.ts' } },
+          {
+            type: 'tool_result',
+            tool_use_id: 't1',
+            content: 'file content\n<system-reminder>\nSecret metadata\n</system-reminder>\nmore',
+          },
+        ]}
+      />
+    )
+    // Expand the tool block to reveal content
+    await user.click(screen.getByRole('button', { name: 'Read tool call' }))
+    expect(screen.getByText(/file content/)).toBeInTheDocument()
+    expect(screen.queryByText(/Secret metadata/)).not.toBeInTheDocument()
   })
 })
