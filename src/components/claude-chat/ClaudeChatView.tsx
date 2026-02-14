@@ -277,7 +277,7 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
       </div>
 
       {/* Message area */}
-      <div ref={scrollContainerRef} onScroll={handleScroll} className="flex-1 overflow-y-auto p-4 space-y-3">
+      <div ref={scrollContainerRef} onScroll={handleScroll} className="flex-1 overflow-y-auto p-4 space-y-3" data-context="freshclaude-chat" data-session-id={paneContent.sessionId}>
         {!session?.messages.length && (
           <div className="text-center text-muted-foreground text-sm py-8">
             <p className="font-medium mb-2">freshclaude</p>

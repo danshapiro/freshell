@@ -338,3 +338,24 @@ describe('freshclaude polish e2e: system-reminder stripping', () => {
     expect(fullText).not.toContain('system-reminder')
   })
 })
+
+describe('freshclaude polish e2e: context menu data attribute', () => {
+  afterEach(cleanup)
+
+  it('scroll container has data-context="freshclaude-chat" with session ID', () => {
+    const store = makeStore()
+    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
+    store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'Hello' }))
+    store.dispatch(setSessionStatus({ sessionId: 'sess-1', status: 'idle' }))
+
+    const { container } = render(
+      <Provider store={store}>
+        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+      </Provider>,
+    )
+
+    const scrollArea = container.querySelector('[data-context="freshclaude-chat"]')
+    expect(scrollArea).not.toBeNull()
+    expect(scrollArea?.getAttribute('data-session-id')).toBe('sess-1')
+  })
+})
