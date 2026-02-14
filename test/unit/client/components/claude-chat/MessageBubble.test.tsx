@@ -7,26 +7,32 @@ describe('MessageBubble', () => {
   afterEach(() => {
     cleanup()
   })
-  it('renders user text message', () => {
-    render(
-      <MessageBubble
-        role="user"
-        content={[{ type: 'text', text: 'Hello world' }]}
-      />
+  it('renders user text as left-aligned with orange left border', () => {
+    const { container } = render(
+      <MessageBubble role="user" content={[{ type: 'text', text: 'Hello world' }]} />
     )
     expect(screen.getByText('Hello world')).toBeInTheDocument()
     expect(screen.getByRole('article', { name: 'user message' })).toBeInTheDocument()
+    // User messages have thicker left border
+    const article = container.querySelector('[role="article"]')!
+    expect(article.className).toContain('border-l-[3px]')
   })
 
-  it('renders assistant text message with markdown', () => {
-    render(
-      <MessageBubble
-        role="assistant"
-        content={[{ type: 'text', text: '**Bold text**' }]}
-      />
+  it('renders assistant text with blue left border and markdown', () => {
+    const { container } = render(
+      <MessageBubble role="assistant" content={[{ type: 'text', text: '**Bold text**' }]} />
     )
     expect(screen.getByText('Bold text')).toBeInTheDocument()
-    expect(screen.getByRole('article', { name: 'assistant message' })).toBeInTheDocument()
+    const article = container.querySelector('[role="article"]')!
+    expect(article.className).toContain('border-l-2')
+  })
+
+  it('constrains content width with max-w-prose', () => {
+    const { container } = render(
+      <MessageBubble role="assistant" content={[{ type: 'text', text: 'Hello' }]} />
+    )
+    const article = container.querySelector('[role="article"]')!
+    expect(article.className).toContain('max-w-prose')
   })
 
   it('renders thinking block as collapsible', () => {
@@ -50,13 +56,13 @@ describe('MessageBubble', () => {
   })
 
   it('renders timestamp and model', () => {
-    const timestamp = new Date().toISOString()
     render(
       <MessageBubble
         role="assistant"
         content={[{ type: 'text', text: 'Hi' }]}
-        timestamp={timestamp}
+        timestamp="2026-02-13T10:00:00Z"
         model="claude-sonnet-4-5"
+        showTimecodes={true}
       />
     )
     expect(screen.getByText('claude-sonnet-4-5')).toBeInTheDocument()
