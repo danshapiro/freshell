@@ -703,8 +703,15 @@ export class WsHandler {
           'warn',
         )
       })
-    } catch {
-      // ignore
+    } catch (err) {
+      log.warn(
+        {
+          err: err instanceof Error ? err : new Error(String(err)),
+          connectionId: ws.connectionId || 'unknown',
+          messageType: messageType || 'unknown',
+        },
+        'WebSocket send failed',
+      )
     }
   }
 

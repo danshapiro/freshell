@@ -1059,10 +1059,22 @@ export class TerminalRegistry extends EventEmitter {
       }
       return
     }
+    let messageType: string | undefined
+    if (msg && typeof msg === 'object' && 'type' in msg) {
+      const typeValue = (msg as { type?: unknown }).type
+      if (typeof typeValue === 'string') messageType = typeValue
+    }
     try {
       client.send(JSON.stringify(msg))
-    } catch {
-      // ignore
+    } catch (err) {
+      logger.warn(
+        {
+          err: err instanceof Error ? err : new Error(String(err)),
+          terminalId: context?.terminalId || 'unknown',
+          messageType: messageType || 'unknown',
+        },
+        'Terminal output send failed',
+      )
     }
   }
 
