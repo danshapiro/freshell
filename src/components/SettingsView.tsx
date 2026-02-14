@@ -7,6 +7,10 @@ import { terminalThemes, darkThemes, lightThemes, getTerminalTheme } from '@/lib
 import { resolveTerminalFontFamily, saveLocalTerminalFontFamily } from '@/lib/terminal-fonts'
 import type { SidebarSortMode, TerminalTheme, CodexSandboxMode, ClaudePermissionMode, CodingCliProviderName } from '@/store/types'
 import { configureNetwork, fetchNetworkStatus } from '@/store/networkSlice'
+import { addTab } from '@/store/tabsSlice'
+import { initLayout } from '@/store/panesSlice'
+import { fetchFirewallConfig } from '@/lib/firewall-configure'
+import { nanoid } from '@reduxjs/toolkit'
 import type { AppView } from '@/components/Sidebar'
 import { CODING_CLI_PROVIDER_CONFIGS } from '@/lib/coding-cli-utils'
 
@@ -135,7 +139,7 @@ function normalizePreviewLine(tokens: PreviewToken[], width: number): PreviewTok
   return normalized
 }
 
-export default function SettingsView({ onNavigate }: { onNavigate?: (view: AppView) => void } = {}) {
+export default function SettingsView({ onNavigate, onFirewallTerminal }: { onNavigate?: (view: AppView) => void; onFirewallTerminal?: (cmd: { tabId: string; command: string }) => void } = {}) {
   const dispatch = useAppDispatch()
   const rawSettings = useAppSelector((s) => s.settings.settings)
   const settings = useMemo(
@@ -536,7 +540,34 @@ export default function SettingsView({ onNavigate }: { onNavigate?: (view: AppVi
                         : 'Firewall detected'
                     }
                   >
-                    <span className="text-xs text-muted-foreground">{networkStatus.firewall.platform}</span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-muted-foreground">{networkStatus.firewall.platform}</span>
+                      {networkStatus.firewall.active && networkStatus.firewall.portOpen !== true && networkStatus.firewall.commands.length > 0 && (
+                        <button
+                          onClick={async () => {
+                            try {
+                              const result = await fetchFirewallConfig()
+                              if (result.method === 'terminal') {
+                                const tabId = nanoid()
+                                dispatch(addTab({ id: tabId, title: 'Firewall Setup', mode: 'shell', shell: 'system' }))
+                                dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
+                                onFirewallTerminal?.({ tabId, command: result.command })
+                                onNavigate?.('terminal')
+                              } else if (result.method === 'wsl2' || result.method === 'windows-elevated') {
+                                // Server handles it; re-fetch status after a delay
+                                setTimeout(() => dispatch(fetchNetworkStatus()), 2000)
+                              }
+                            } catch {
+                              // Silently fail — user can retry
+                            }
+                          }}
+                          className="rounded border px-2 py-0.5 text-xs font-medium transition-colors hover:bg-muted"
+                          aria-label="Fix firewall configuration"
+                        >
+                          Fix
+                        </button>
+                      )}
+                    </div>
                   </SettingsRow>
                 )}
 

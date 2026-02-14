@@ -285,6 +285,14 @@ export class NetworkManager {
     }
   }
 
+  resetFirewallCache(): void {
+    this.firewallInfo = null
+  }
+
+  setFirewallConfiguring(configuring: boolean): void {
+    this.firewallConfiguring = configuring
+  }
+
   getRelevantPorts(): number[] {
     const ports = [this.port]
     if (this.devMode && this.devPort && this.devPort !== this.port) {

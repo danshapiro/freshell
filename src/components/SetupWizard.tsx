@@ -1,8 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { configureNetwork, fetchNetworkStatus } from '@/store/networkSlice'
+import { addTab } from '@/store/tabsSlice'
+import { initLayout } from '@/store/panesSlice'
+import { fetchFirewallConfig } from '@/lib/firewall-configure'
 import { generate } from 'lean-qr'
 import { toSvgDataURL } from 'lean-qr/extras/svg'
+import { nanoid } from '@reduxjs/toolkit'
 import { Check, Loader2, AlertCircle, Copy, ExternalLink } from 'lucide-react'
 import type { AppView } from '@/components/Sidebar'
 
@@ -10,6 +14,7 @@ interface SetupWizardProps {
   onComplete: () => void
   initialStep?: 1 | 2
   onNavigate?: (view: AppView) => void
+  onFirewallTerminal?: (cmd: { tabId: string; command: string }) => void
 }
 
 type ChecklistItemStatus = 'pending' | 'active' | 'done' | 'error'
@@ -45,7 +50,7 @@ function QrCode({ url }: { url: string }) {
   return <img src={dataUrl} alt="QR code for access URL" className="h-32 w-32" />
 }
 
-export function SetupWizard({ onComplete, initialStep = 1, onNavigate }: SetupWizardProps) {
+export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewallTerminal }: SetupWizardProps) {
   const dispatch = useAppDispatch()
   const networkStatus = useAppSelector((s) => s.network.status)
   const settings = useAppSelector((s) => s.settings.settings)
@@ -144,6 +149,44 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate }: SetupWi
     }
   }, [networkStatus?.accessUrl])
 
+  const handleConfigureFirewall = useCallback(async () => {
+    try {
+      const result = await fetchFirewallConfig()
+      if (result.method === 'terminal') {
+        const tabId = nanoid()
+        dispatch(addTab({ id: tabId, title: 'Firewall Setup', mode: 'shell', shell: 'system' }))
+        dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
+        onFirewallTerminal?.({ tabId, command: result.command })
+        // Dismiss the wizard overlay so the user can interact with the
+        // terminal pane (type the sudo password). The wizard is z-[70]
+        // which blocks all interaction with the terminal underneath.
+        onComplete?.()
+        onNavigate?.('terminal')
+      } else if (result.method === 'wsl2' || result.method === 'windows-elevated') {
+        // Server handles elevated process; poll for completion
+        setFirewallStatus('active')
+        setFirewallDetail('Configuring firewall...')
+        const pollFirewall = async (attempts = 0) => {
+          if (attempts >= 10) return
+          try {
+            const action = await dispatch(fetchNetworkStatus()).unwrap()
+            if (!action.firewall.configuring) {
+              setFirewallStatus('done')
+              setFirewallDetail('Firewall configured')
+              return
+            }
+          } catch { /* ignore */ }
+          setTimeout(() => pollFirewall(attempts + 1), 1000)
+        }
+        setTimeout(() => pollFirewall(), 1000)
+      }
+      // method === 'none' or 'in-progress': do nothing
+    } catch (err: any) {
+      setFirewallStatus('error')
+      setFirewallDetail(err?.message || 'Firewall configuration failed')
+    }
+  }, [dispatch, onComplete, onNavigate, onFirewallTerminal])
+
   return (
     <div
       className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 backdrop-blur-sm"
@@ -207,6 +250,15 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate }: SetupWi
                 detail={bindStatus === 'done' ? `mDNS name: ${mdnsHostname}.local` : undefined}
               />
               <ChecklistItem label="Checking firewall..." status={firewallStatus} detail={firewallDetail} />
+              {firewallStatus === 'error' && networkStatus?.firewall?.commands && networkStatus.firewall.commands.length > 0 && (
+                <button
+                  onClick={handleConfigureFirewall}
+                  className="ml-8 mt-1 rounded-md border px-3 py-1.5 text-xs font-medium transition-colors hover:bg-muted"
+                  aria-label="Configure firewall now"
+                >
+                  Configure now
+                </button>
+              )}
             </div>
 
             {bindStatus === 'error' && (

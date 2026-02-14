@@ -251,6 +251,55 @@ describe('NetworkManager', () => {
     )
   })
 
+  describe('resetFirewallCache and setFirewallConfiguring', () => {
+    it('resets firewall cache so next getStatus re-detects', async () => {
+      const { detectFirewall } = await import('../../../server/firewall.js')
+      vi.mocked(detectFirewall).mockResolvedValue({ platform: 'linux-ufw', active: true })
+
+      manager = new NetworkManager(server, mockConfigStore, testPort)
+      const status1 = await manager.getStatus()
+      expect(status1.firewall.platform).toBe('linux-ufw')
+
+      // Change mock
+      vi.mocked(detectFirewall).mockResolvedValue({ platform: 'linux-none', active: false })
+
+      // Without reset, cached value is still used
+      const status2 = await manager.getStatus()
+      expect(status2.firewall.platform).toBe('linux-ufw')
+
+      // After reset, re-detects
+      manager.resetFirewallCache()
+      const status3 = await manager.getStatus()
+      expect(status3.firewall.platform).toBe('linux-none')
+    })
+
+    it('tracks firewall configuring state', async () => {
+      manager = new NetworkManager(server, mockConfigStore, testPort)
+      const status1 = await manager.getStatus()
+      expect(status1.firewall.configuring).toBe(false)
+
+      manager.setFirewallConfiguring(true)
+      const status2 = await manager.getStatus()
+      expect(status2.firewall.configuring).toBe(true)
+
+      manager.setFirewallConfiguring(false)
+      const status3 = await manager.getStatus()
+      expect(status3.firewall.configuring).toBe(false)
+    })
+  })
+
+  describe('configureFirewall', () => {
+    it('returns commands for the detected platform', async () => {
+      const { detectFirewall, firewallCommands } = await import('../../../server/firewall.js')
+      vi.mocked(detectFirewall).mockResolvedValue({ platform: 'linux-ufw', active: true })
+      vi.mocked(firewallCommands).mockReturnValue([`sudo ufw allow ${testPort}/tcp`])
+
+      manager = new NetworkManager(server, mockConfigStore, testPort)
+      const status = await manager.getStatus()
+      expect(status.firewall.commands).toEqual([`sudo ufw allow ${testPort}/tcp`])
+    })
+  })
+
   describe('initializeFromStartup', () => {
     it('rebuilds ALLOWED_ORIGINS without persisting to config', async () => {
       manager = new NetworkManager(server, mockConfigStore, testPort)

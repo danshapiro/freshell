@@ -10,6 +10,8 @@ import { z } from 'zod'
 import { NetworkManager } from '../../../server/network-manager.js'
 import { ConfigStore } from '../../../server/config-store.js'
 import { httpAuthMiddleware } from '../../../server/auth.js'
+import { detectFirewall } from '../../../server/firewall.js'
+import { firewallCommands } from '../../../server/firewall.js'
 
 // Mock firewall detection to avoid real system calls
 vi.mock('../../../server/firewall.js', async () => {
@@ -30,6 +32,15 @@ vi.mock('bonjour-service', () => {
     default: vi.fn().mockImplementation(() => ({ publish, unpublishAll, destroy })),
     Bonjour: vi.fn().mockImplementation(() => ({ publish, unpublishAll, destroy })),
   }
+})
+vi.mock('../../../server/wsl-port-forward.js', () => ({
+  getWslIp: vi.fn().mockReturnValue('172.24.0.2'),
+  buildPortForwardingScript: vi.fn().mockReturnValue('$null # mock script'),
+  setupWslPortForwarding: vi.fn(),
+}))
+vi.mock('node:child_process', async () => {
+  const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process')
+  return { ...actual, execFile: vi.fn() }
 })
 
 describe('Network API integration', () => {
@@ -92,6 +103,81 @@ describe('Network API integration', () => {
         res.json({ ...status, rebindScheduled })
       } catch (err) {
         res.status(500).json({ error: 'Failed to configure network' })
+      }
+    })
+
+    // Firewall configuration endpoint (mirrors server/index.ts)
+    app.post('/api/network/configure-firewall', async (_req, res) => {
+      try {
+        const status = await networkManager.getStatus()
+        if (status.firewall.configuring) {
+          return res.status(409).json({
+            error: 'Firewall configuration already in progress',
+            method: 'in-progress',
+          })
+        }
+        const commands = status.firewall.commands
+        if (commands.length === 0) {
+          if (status.firewall.platform === 'wsl2') {
+            const { execFile } = await import('node:child_process')
+            const { buildPortForwardingScript, getWslIp } = await import('../../../server/wsl-port-forward.js')
+            const POWERSHELL_PATH = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
+            try {
+              const wslIp = getWslIp()
+              if (!wslIp) {
+                return res.status(500).json({ error: 'Could not detect WSL2 IP address' })
+              }
+              const ports = networkManager.getRelevantPorts()
+              const rawScript = buildPortForwardingScript(wslIp, ports)
+              const script = rawScript.replace(/\\\$/g, '$')
+              const escapedScript = script.replace(/'/g, "''")
+              networkManager.setFirewallConfiguring(true)
+              const child = execFile(POWERSHELL_PATH, [
+                '-Command',
+                `Start-Process powershell -Verb RunAs -Wait -ArgumentList '-Command', '${escapedScript}'`,
+              ], { timeout: 120000 }, (err: any) => {
+                networkManager.resetFirewallCache()
+                networkManager.setFirewallConfiguring(false)
+              })
+              child.on('error', () => {
+                networkManager.resetFirewallCache()
+                networkManager.setFirewallConfiguring(false)
+              })
+              return res.json({ method: 'wsl2', status: 'started' })
+            } catch {
+              networkManager.setFirewallConfiguring(false)
+              return res.status(500).json({ error: 'WSL2 port forwarding failed to start' })
+            }
+          }
+          return res.json({ method: 'none', message: 'No firewall detected' })
+        }
+        if (status.firewall.platform === 'windows') {
+          const { execFile } = await import('node:child_process')
+          const script = commands.join('; ')
+          const escapedScript = script.replace(/'/g, "''")
+          try {
+            networkManager.setFirewallConfiguring(true)
+            const child = execFile('powershell.exe', [
+              '-Command',
+              `Start-Process powershell -Verb RunAs -Wait -ArgumentList '-Command', '${escapedScript}'`,
+            ], { timeout: 120000 }, (err: any) => {
+              networkManager.resetFirewallCache()
+              networkManager.setFirewallConfiguring(false)
+            })
+            child.on('error', () => {
+              networkManager.resetFirewallCache()
+              networkManager.setFirewallConfiguring(false)
+            })
+            return res.json({ method: 'windows-elevated', status: 'started' })
+          } catch {
+            networkManager.setFirewallConfiguring(false)
+            return res.status(500).json({ error: 'Windows firewall configuration failed to start' })
+          }
+        }
+        const command = commands.join(' && ')
+        res.json({ method: 'terminal', command })
+      } catch (err) {
+        res.status(500).json({ error: 'Firewall configuration failed' })
       }
     })
 
@@ -228,6 +314,83 @@ describe('Network API integration', () => {
         .get('/local-file?path=/tmp/test-file.txt')
         .set('Cookie', 'freshell-auth=wrong-token-value')
       expect(res.status).toBe(401)
+    })
+  })
+
+  describe('POST /api/network/configure-firewall', () => {
+    it('requires auth', async () => {
+      const res = await request(app)
+        .post('/api/network/configure-firewall')
+      expect(res.status).toBe(401)
+    })
+
+    it('returns method: none when no firewall detected', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'linux-none',
+        active: false,
+      })
+      const res = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+      expect(res.status).toBe(200)
+      expect(res.body.method).toBe('none')
+    })
+
+    it('returns terminal commands for linux-ufw platform', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'linux-ufw',
+        active: true,
+      })
+      // Need to clear the cached firewall info so it re-detects
+      networkManager.resetFirewallCache()
+      const res = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+      expect(res.status).toBe(200)
+      expect(res.body.method).toBe('terminal')
+      expect(res.body.command).toContain('ufw allow')
+    })
+
+    it('returns wsl2 method for wsl2 platform', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+      const cp = await import('node:child_process')
+      vi.mocked(cp.execFile).mockImplementation((_cmd: any, _args: any, _opts: any, cb: any) => {
+        // Don't call cb — leave firewall in configuring state for this test
+        return { on: vi.fn() } as any
+      })
+      const wslModule = await import('../../../server/wsl-port-forward.js')
+      vi.mocked(wslModule.getWslIp).mockReturnValue('172.24.0.2')
+      vi.mocked(wslModule.buildPortForwardingScript).mockReturnValue('$null # mock script')
+
+      const res = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+      expect(res.status).toBe(200)
+      expect(res.body.method).toBe('wsl2')
+      expect(res.body.status).toBe('started')
+
+      // Clean up configuring state (callback was not called in the mock)
+      networkManager.setFirewallConfiguring(false)
+    })
+
+    it('rejects concurrent firewall configuration (in-flight guard)', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.setFirewallConfiguring(true)
+
+      const res = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+      expect(res.status).toBe(409)
+      expect(res.body.error).toContain('already in progress')
+
+      networkManager.setFirewallConfiguring(false)
     })
   })
 })

@@ -38,6 +38,7 @@ import { updateSettingsLocal, markSaved } from '@/store/settingsSlice'
 import { clearIdleWarning, recordIdleWarning } from '@/store/idleWarningsSlice'
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
+import { initLayout } from '@/store/panesSlice'
 
 // Lazy QR code component to avoid loading lean-qr until the share panel opens
 function ShareQrCode({ url }: { url: string }) {
@@ -87,7 +88,9 @@ export default function App() {
   const [showSetupWizard, setShowSetupWizard] = useState(false)
   const [wizardInitialStep, setWizardInitialStep] = useState<1 | 2>(1)
   const [copied, setCopied] = useState(false)
+  const [pendingFirewallCommand, setPendingFirewallCommand] = useState<{ tabId: string; command: string } | null>(null)
   const [isMobile, setIsMobile] = useState(false)
+  const paneLayouts = useAppSelector((s) => s.panes.layouts)
   const mainContentRef = useRef<HTMLDivElement>(null)
   const userOpenedSidebarOnMobileRef = useRef(false)
   const terminalMetaListRequestStartedAtRef = useRef(new Map<string, number>())
@@ -370,6 +373,23 @@ export default function App() {
     }
   }, [networkStatus?.configured, networkStatus?.host])
 
+  // Watch for terminal to become ready, then send the pending firewall command.
+  // This respects the pane-owned terminal lifecycle in TerminalView.tsx —
+  // TerminalView sends terminal.create and handles terminal.created internally.
+  useEffect(() => {
+    if (!pendingFirewallCommand) return
+    const { tabId, command } = pendingFirewallCommand
+    const layout = paneLayouts[tabId]
+    if (!layout || layout.type !== 'leaf' || layout.content.kind !== 'terminal') return
+    const terminalId = layout.content.terminalId
+    if (!terminalId) return // terminal not ready yet
+
+    // Terminal is running — send the firewall command
+    const ws = getWsClient()
+    ws.send({ type: 'terminal.input', terminalId, data: command + '\n' })
+    setPendingFirewallCommand(null)
+  }, [pendingFirewallCommand, paneLayouts])
+
   // Keyboard shortcuts
   useEffect(() => {
     function isTextInput(el: any): boolean {
@@ -414,7 +434,7 @@ export default function App() {
 
   const content = (() => {
     if (view === 'sessions') return <HistoryView onOpenSession={() => setView('terminal')} />
-    if (view === 'settings') return <SettingsView onNavigate={setView} />
+    if (view === 'settings') return <SettingsView onNavigate={setView} onFirewallTerminal={setPendingFirewallCommand} />
     if (view === 'overview') return <OverviewView onOpenTab={() => setView('terminal')} />
     return (
       <div className="flex flex-col h-full">
@@ -616,6 +636,7 @@ export default function App() {
         <SetupWizard
           initialStep={wizardInitialStep}
           onNavigate={setView}
+          onFirewallTerminal={setPendingFirewallCommand}
           onComplete={() => {
             setShowSetupWizard(false)
             dispatch(fetchNetworkStatus())
