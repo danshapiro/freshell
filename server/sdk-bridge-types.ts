@@ -77,6 +77,7 @@ export const SdkCreateSchema = z.object({
   resumeSessionId: z.string().optional(),
   model: z.string().optional(),
   permissionMode: z.string().optional(),
+  effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
 })
 
 export const SdkSendSchema = z.object({
@@ -115,6 +116,18 @@ export const SdkAttachSchema = z.object({
   sessionId: z.string().min(1),
 })
 
+export const SdkSetModelSchema = z.object({
+  type: z.literal('sdk.set-model'),
+  sessionId: z.string().min(1),
+  model: z.string().min(1),
+})
+
+export const SdkSetPermissionModeSchema = z.object({
+  type: z.literal('sdk.set-permission-mode'),
+  sessionId: z.string().min(1),
+  permissionMode: z.string().min(1),
+})
+
 export const BrowserSdkMessageSchema = z.discriminatedUnion('type', [
   SdkCreateSchema,
   SdkSendSchema,
@@ -122,6 +135,8 @@ export const BrowserSdkMessageSchema = z.discriminatedUnion('type', [
   SdkInterruptSchema,
   SdkKillSchema,
   SdkAttachSchema,
+  SdkSetModelSchema,
+  SdkSetPermissionModeSchema,
 ])
 
 export type BrowserSdkMessage = z.infer<typeof BrowserSdkMessageSchema>
@@ -141,6 +156,7 @@ export type SdkServerMessage =
   | { type: 'sdk.history'; sessionId: string; messages: Array<{ role: 'user' | 'assistant'; content: ContentBlock[]; timestamp?: string }> }
   | { type: 'sdk.exit'; sessionId: string; exitCode?: number }
   | { type: 'sdk.killed'; sessionId: string; success: boolean }
+  | { type: 'sdk.models'; sessionId: string; models: Array<{ value: string; displayName: string; description: string }> }
 
 export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited'
 

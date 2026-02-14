@@ -409,10 +409,14 @@ function PickerWrapper({
 
   const createContentForType = useCallback((type: PanePickerType, cwd?: string): PaneContent => {
     if (type === 'claude-web') {
+      const defaults = settings?.freshclaude
       return {
         kind: 'claude-chat',
         createRequestId: nanoid(),
         status: 'creating',
+        model: defaults?.defaultModel,
+        permissionMode: defaults?.defaultPermissionMode,
+        effort: defaults?.defaultEffort,
         ...(cwd ? { initialCwd: cwd } : {}),
       }
     }

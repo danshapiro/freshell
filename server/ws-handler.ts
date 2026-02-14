@@ -23,6 +23,8 @@ import {
   SdkInterruptSchema,
   SdkKillSchema,
   SdkAttachSchema,
+  SdkSetModelSchema,
+  SdkSetPermissionModeSchema,
 } from './sdk-bridge-types.js'
 
 const MAX_CONNECTIONS = Number(process.env.MAX_CONNECTIONS || 10)
@@ -334,6 +336,8 @@ const ClientMessageSchema = z.discriminatedUnion('type', [
   SdkInterruptSchema,
   SdkKillSchema,
   SdkAttachSchema,
+  SdkSetModelSchema,
+  SdkSetPermissionModeSchema,
 ])
 
 type ClientState = {
@@ -1509,6 +1513,7 @@ export class WsHandler {
             resumeSessionId: m.resumeSessionId,
             model: m.model,
             permissionMode: m.permissionMode,
+            effort: m.effort,
           })
           state.sdkSessions.add(session.sessionId)
 
@@ -1616,6 +1621,32 @@ export class WsHandler {
           state.sdkSubscriptions.delete(m.sessionId)
         }
         this.send(ws, { type: 'sdk.killed', sessionId: m.sessionId, success: killed })
+        return
+      }
+
+      case 'sdk.set-model': {
+        if (!this.sdkBridge) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
+          return
+        }
+        if (!state.sdkSessions.has(m.sessionId) && !state.sdkSubscriptions.has(m.sessionId)) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
+          return
+        }
+        this.sdkBridge.setModel(m.sessionId, m.model)
+        return
+      }
+
+      case 'sdk.set-permission-mode': {
+        if (!this.sdkBridge) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
+          return
+        }
+        if (!state.sdkSessions.has(m.sessionId) && !state.sdkSubscriptions.has(m.sessionId)) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
+          return
+        }
+        this.sdkBridge.setPermissionMode(m.sessionId, m.permissionMode)
         return
       }
 

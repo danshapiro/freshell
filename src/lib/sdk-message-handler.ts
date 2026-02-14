@@ -15,6 +15,7 @@ import {
   replayHistory,
   sessionError,
   removeSession,
+  setAvailableModels,
 } from '@/store/claudeChatSlice'
 
 /**
@@ -152,6 +153,12 @@ export function handleSdkMessage(dispatch: AppDispatch, msg: Record<string, unkn
       // Session killed confirmation — clean up client state
       dispatch(removeSession({
         sessionId: msg.sessionId as string,
+      }))
+      return true
+
+    case 'sdk.models':
+      dispatch(setAvailableModels({
+        models: msg.models as Array<{ value: string; displayName: string; description: string }>,
       }))
       return true
 

@@ -52,6 +52,7 @@ export const defaultSettings: AppSettings = {
       codex: {},
     },
   },
+  freshclaude: {},
 }
 
 export function migrateSortMode(mode: string | undefined): SidebarSortMode {
@@ -96,6 +97,7 @@ export function mergeSettings(base: AppSettings, patch: Partial<AppSettings>): A
         ...(patch.codingCli?.providers || {}),
       },
     },
+    freshclaude: { ...base.freshclaude, ...(patch.freshclaude || {}) },
   }
 
   return {

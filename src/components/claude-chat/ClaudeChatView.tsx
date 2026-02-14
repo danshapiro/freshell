@@ -13,9 +13,11 @@ import ThinkingIndicator from './ThinkingIndicator'
 import { useStreamDebounce } from './useStreamDebounce'
 import CollapsedTurn from './CollapsedTurn'
 import type { ChatMessage } from '@/store/claudeChatTypes'
+import { api } from '@/lib/api'
 
 const DEFAULT_MODEL = 'claude-opus-4-6'
 const DEFAULT_PERMISSION_MODE = 'bypassPermissions'
+const DEFAULT_EFFORT = 'high'
 
 interface ClaudeChatViewProps {
   tabId: string
@@ -43,6 +45,7 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
   const session = useAppSelector(
     (s) => paneContent.sessionId ? s.claudeChat.sessions[paneContent.sessionId] : undefined,
   )
+  const availableModels = useAppSelector((s) => s.claudeChat.availableModels)
 
   // Wire sessionId from pendingCreates back into the pane content
   useEffect(() => {
@@ -84,6 +87,7 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
       requestId: paneContent.createRequestId,
       model: paneContent.model ?? DEFAULT_MODEL,
       permissionMode: paneContent.permissionMode ?? DEFAULT_PERMISSION_MODE,
+      effort: paneContent.effort ?? DEFAULT_EFFORT,
       ...(paneContent.initialCwd ? { cwd: paneContent.initialCwd } : {}),
       ...(paneContent.resumeSessionId ? { resumeSessionId: paneContent.resumeSessionId } : {}),
     })
@@ -158,7 +162,28 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
       paneId,
       content: { ...paneContentRef.current, ...changes },
     }))
-  }, [tabId, paneId, dispatch])
+
+    const pc = paneContentRef.current
+
+    // Mid-session model change
+    if (changes.model && pc.sessionId && pc.status !== 'creating') {
+      ws.send({ type: 'sdk.set-model', sessionId: pc.sessionId, model: changes.model as string })
+    }
+
+    // Mid-session permission mode change
+    if (changes.permissionMode && pc.sessionId && pc.status !== 'creating') {
+      ws.send({ type: 'sdk.set-permission-mode', sessionId: pc.sessionId, permissionMode: changes.permissionMode as string })
+    }
+
+    // Persist as defaults
+    const defaultsPatch: Record<string, string> = {}
+    if (changes.model) defaultsPatch.defaultModel = changes.model as string
+    if (changes.permissionMode) defaultsPatch.defaultPermissionMode = changes.permissionMode as string
+    if (changes.effort) defaultsPatch.defaultEffort = changes.effort as string
+    if (Object.keys(defaultsPatch).length > 0) {
+      void api.patch('/api/settings', { freshclaude: defaultsPatch }).catch(() => {})
+    }
+  }, [tabId, paneId, dispatch, ws])
 
   const handleSettingsDismiss = useCallback(() => {
     dispatch(updatePaneContent({
@@ -168,9 +193,8 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
     }))
   }, [tabId, paneId, dispatch])
 
-  // Controls (model, permissions) should be locked once sdk.create has been sent.
-  // The pane status transitions from 'creating' to 'starting' immediately after sdk.create,
-  // so any status other than 'creating' means the session is already configured.
+  // Effort is locked once sdk.create has been sent (no mid-session setter in SDK).
+  // Model and permission mode can be changed mid-session via sdk.set-model / sdk.set-permission-mode.
   const sessionStarted = paneContent.status !== 'creating'
 
   const isInteractive = paneContent.status === 'idle' || paneContent.status === 'connected'
@@ -265,11 +289,13 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
           <FreshclaudeSettings
             model={paneContent.model ?? DEFAULT_MODEL}
             permissionMode={paneContent.permissionMode ?? DEFAULT_PERMISSION_MODE}
+            effort={paneContent.effort ?? DEFAULT_EFFORT}
             showThinking={paneContent.showThinking ?? true}
             showTools={paneContent.showTools ?? true}
             showTimecodes={paneContent.showTimecodes ?? false}
             sessionStarted={sessionStarted}
             defaultOpen={!paneContent.settingsDismissed}
+            modelOptions={availableModels.length > 0 ? availableModels : undefined}
             onChange={handleSettingsChange}
             onDismiss={handleSettingsDismiss}
           />

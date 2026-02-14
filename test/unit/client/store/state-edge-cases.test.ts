@@ -841,7 +841,7 @@ describe('State Edge Cases', () => {
 
         store.dispatch(setSettings(customSettings))
 
-        expect(store.getState().settings.settings).toEqual(customSettings)
+        expect(store.getState().settings.settings).toEqual({ ...customSettings, freshclaude: {} })
         expect(store.getState().settings.loaded).toBe(true)
       })
 

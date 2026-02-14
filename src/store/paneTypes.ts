@@ -77,6 +77,8 @@ export type ClaudeChatPaneContent = {
   model?: string
   /** Permission mode (default: bypassPermissions) */
   permissionMode?: string
+  /** Effort level (default: high, creation-time only) */
+  effort?: 'low' | 'medium' | 'high' | 'max'
   /** Show thinking blocks in message feed (default: true) */
   showThinking?: boolean
   /** Show tool-use blocks in message feed (default: true) */

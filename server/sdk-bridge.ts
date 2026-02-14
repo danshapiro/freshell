@@ -38,12 +38,14 @@ interface SessionProcess {
 export class SdkBridge extends EventEmitter {
   private sessions = new Map<string, SdkSessionState>()
   private processes = new Map<string, SessionProcess>()
+  private cachedModels: Array<{ value: string; displayName: string; description: string }> | null = null
 
   async createSession(options: {
     cwd?: string
     resumeSessionId?: string
     model?: string
     permissionMode?: string
+    effort?: 'low' | 'medium' | 'high' | 'max'
   }): Promise<SdkSessionState> {
     const sessionId = nanoid()
     const state: SdkSessionState = {
@@ -76,6 +78,7 @@ export class SdkBridge extends EventEmitter {
         resume: options.resumeSessionId,
         model: options.model,
         permissionMode: options.permissionMode as any,
+        effort: options.effort,
         ...(options.permissionMode === 'bypassPermissions' && { allowDangerouslySkipPermissions: true }),
         pathToClaudeCodeExecutable: process.env.CLAUDE_CMD || undefined,
         includePartialMessages: true,
@@ -217,6 +220,9 @@ export class SdkBridge extends EventEmitter {
             cwd: state.cwd,
             tools: state.tools,
           })
+
+          // Fetch available models and broadcast to client
+          this.fetchAndBroadcastModels(sessionId)
         } else if (msg.subtype === 'status') {
           const statusMsg = msg as SDKStatusMessage
           if (statusMsg.status === 'compacting') {
@@ -448,6 +454,59 @@ export class SdkBridge extends EventEmitter {
       log.warn({ sessionId, err }, 'Interrupt failed')
     })
     return true
+  }
+
+  setModel(sessionId: string, model: string): boolean {
+    const sp = this.processes.get(sessionId)
+    if (!sp) return false
+    const state = this.sessions.get(sessionId)
+    if (state) state.model = model
+    sp.query.setModel(model).catch((err) => {
+      log.warn({ sessionId, err }, 'setModel failed')
+    })
+    return true
+  }
+
+  setPermissionMode(sessionId: string, mode: string): boolean {
+    const sp = this.processes.get(sessionId)
+    if (!sp) return false
+    const state = this.sessions.get(sessionId)
+    if (state) state.permissionMode = mode
+    sp.query.setPermissionMode(mode as any).catch((err) => {
+      log.warn({ sessionId, err }, 'setPermissionMode failed')
+    })
+    return true
+  }
+
+  private fetchAndBroadcastModels(sessionId: string): void {
+    // Use cache if available
+    if (this.cachedModels) {
+      this.broadcastToSession(sessionId, {
+        type: 'sdk.models',
+        sessionId,
+        models: this.cachedModels,
+      })
+      return
+    }
+
+    const sp = this.processes.get(sessionId)
+    if (!sp) return
+
+    sp.query.supportedModels().then((models) => {
+      const mapped = models.map((m: any) => ({
+        value: m.value ?? m.id ?? String(m),
+        displayName: m.displayName ?? m.display_name ?? m.value ?? String(m),
+        description: m.description ?? '',
+      }))
+      this.cachedModels = mapped
+      this.broadcastToSession(sessionId, {
+        type: 'sdk.models',
+        sessionId,
+        models: mapped,
+      })
+    }).catch((err) => {
+      log.warn({ sessionId, err }, 'Failed to fetch supported models')
+    })
   }
 
   close(): void {

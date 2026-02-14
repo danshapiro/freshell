@@ -13,6 +13,7 @@ describe('FreshclaudeSettings', () => {
   const defaults = {
     model: 'claude-opus-4-6',
     permissionMode: 'dangerouslySkipPermissions',
+    effort: 'high',
     showThinking: true,
     showTools: true,
     showTimecodes: false,
@@ -73,19 +74,22 @@ describe('FreshclaudeSettings', () => {
     expect(screen.queryByText('Model')).not.toBeInTheDocument()
   })
 
-  it('disables model and permission dropdowns when session has started', () => {
+  it('allows model and permission changes mid-session, disables effort', () => {
     render(
       <FreshclaudeSettings
         {...defaults}
+        effort="high"
         sessionStarted={true}
         defaultOpen={true}
         onChange={vi.fn()}
       />
     )
     const modelSelect = screen.getByLabelText('Model')
-    expect(modelSelect).toBeDisabled()
+    expect(modelSelect).not.toBeDisabled()
     const permSelect = screen.getByLabelText('Permissions')
-    expect(permSelect).toBeDisabled()
+    expect(permSelect).not.toBeDisabled()
+    const effortSelect = screen.getByLabelText('Effort')
+    expect(effortSelect).toBeDisabled()
   })
 
   it('calls onChange when a display toggle is changed', () => {

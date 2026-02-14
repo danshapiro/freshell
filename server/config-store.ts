@@ -78,6 +78,11 @@ export type AppSettings = {
       cwd?: string
     }>>
   }
+  freshclaude?: {
+    defaultModel?: string
+    defaultPermissionMode?: string
+    defaultEffort?: 'low' | 'medium' | 'high' | 'max'
+  }
 }
 
 export type SessionOverride = {
@@ -152,6 +157,7 @@ export const defaultSettings: AppSettings = {
       codex: {},
     },
   },
+  freshclaude: {},
 }
 
 function configDir(): string {
@@ -325,6 +331,7 @@ function mergeSettings(base: AppSettings, patch: Partial<AppSettings>): AppSetti
         ...(patch.codingCli?.providers || {}),
       },
     },
+    freshclaude: { ...base.freshclaude, ...(patch.freshclaude || {}) },
   }
 }
 

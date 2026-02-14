@@ -146,6 +146,7 @@ describe('settingsSlice', () => {
             ...newSettings.codingCli.providers,
           },
         },
+        freshclaude: {},
       })
     })
 

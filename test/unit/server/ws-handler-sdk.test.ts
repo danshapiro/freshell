@@ -479,6 +479,103 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
+    it('routes sdk.create with effort to sdkBridge.createSession', async () => {
+      const ws = await connectAndAuth()
+      try {
+        await sendAndWaitForResponse(ws, {
+          type: 'sdk.create',
+          requestId: 'req-effort',
+          cwd: '/tmp',
+          effort: 'max',
+        }, 'sdk.created')
+
+        expect(mockSdkBridge.createSession).toHaveBeenCalledWith(
+          expect.objectContaining({ effort: 'max' }),
+        )
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('routes sdk.set-model to sdkBridge.setModel', async () => {
+      mockSdkBridge.setModel = vi.fn().mockReturnValue(true)
+      const ws = await connectAndAuth()
+      try {
+        // First create a session so client owns it
+        await sendAndWaitForResponse(ws, {
+          type: 'sdk.create',
+          requestId: 'req-setmodel',
+        }, 'sdk.created')
+
+        ws.send(JSON.stringify({
+          type: 'sdk.set-model',
+          sessionId: 'sdk-sess-1',
+          model: 'claude-sonnet-4-5-20250929',
+        }))
+
+        await new Promise((resolve) => setTimeout(resolve, 100))
+
+        expect(mockSdkBridge.setModel).toHaveBeenCalledWith('sdk-sess-1', 'claude-sonnet-4-5-20250929')
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('rejects sdk.set-model for unowned session', async () => {
+      mockSdkBridge.setModel = vi.fn().mockReturnValue(true)
+      const ws = await connectAndAuth()
+      try {
+        const response = await sendAndWaitForResponse(ws, {
+          type: 'sdk.set-model',
+          sessionId: 'not-my-session',
+          model: 'claude-sonnet-4-5-20250929',
+        }, 'error')
+
+        expect(response.code).toBe('UNAUTHORIZED')
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('routes sdk.set-permission-mode to sdkBridge.setPermissionMode', async () => {
+      mockSdkBridge.setPermissionMode = vi.fn().mockReturnValue(true)
+      const ws = await connectAndAuth()
+      try {
+        await sendAndWaitForResponse(ws, {
+          type: 'sdk.create',
+          requestId: 'req-setperm',
+        }, 'sdk.created')
+
+        ws.send(JSON.stringify({
+          type: 'sdk.set-permission-mode',
+          sessionId: 'sdk-sess-1',
+          permissionMode: 'default',
+        }))
+
+        await new Promise((resolve) => setTimeout(resolve, 100))
+
+        expect(mockSdkBridge.setPermissionMode).toHaveBeenCalledWith('sdk-sess-1', 'default')
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('rejects sdk.set-permission-mode for unowned session', async () => {
+      mockSdkBridge.setPermissionMode = vi.fn().mockReturnValue(true)
+      const ws = await connectAndAuth()
+      try {
+        const response = await sendAndWaitForResponse(ws, {
+          type: 'sdk.set-permission-mode',
+          sessionId: 'not-my-session',
+          permissionMode: 'default',
+        }, 'error')
+
+        expect(response.code).toBe('UNAUTHORIZED')
+      } finally {
+        ws.close()
+      }
+    })
+
     it('sends preliminary sdk.session.init to break init deadlock', async () => {
       // The SDK subprocess only emits system/init after the first user message,
       // but the UI waits for sdk.session.init before showing the chat input.

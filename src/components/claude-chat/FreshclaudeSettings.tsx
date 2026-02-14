@@ -4,16 +4,18 @@ import { cn } from '@/lib/utils'
 import { Switch } from '@/components/ui/switch'
 import type { ClaudeChatPaneContent } from '@/store/paneTypes'
 
-type SettingsFields = Pick<ClaudeChatPaneContent, 'model' | 'permissionMode' | 'showThinking' | 'showTools' | 'showTimecodes'>
+type SettingsFields = Pick<ClaudeChatPaneContent, 'model' | 'permissionMode' | 'effort' | 'showThinking' | 'showTools' | 'showTimecodes'>
 
 interface FreshclaudeSettingsProps {
   model: string
   permissionMode: string
+  effort: string
   showThinking: boolean
   showTools: boolean
   showTimecodes: boolean
   sessionStarted: boolean
   defaultOpen?: boolean
+  modelOptions?: Array<{ value: string; displayName: string }>
   onChange: (changes: Partial<SettingsFields>) => void
   onDismiss?: () => void
 }
@@ -29,14 +31,23 @@ const PERMISSION_OPTIONS = [
   { value: 'default', label: 'Default (ask)' },
 ]
 
+const EFFORT_OPTIONS = [
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High' },
+  { value: 'max', label: 'Max' },
+]
+
 export default function FreshclaudeSettings({
   model,
   permissionMode,
+  effort,
   showThinking,
   showTools,
   showTimecodes,
   sessionStarted,
   defaultOpen = false,
+  modelOptions,
   onChange,
   onDismiss,
 }: FreshclaudeSettingsProps) {
@@ -87,6 +98,11 @@ export default function FreshclaudeSettings({
     return () => document.removeEventListener('keydown', handleEscape)
   }, [open, handleClose])
 
+  // Use dynamic model options when available, fall back to hardcoded
+  const resolvedModelOptions = modelOptions
+    ? modelOptions.map((m) => ({ value: m.value, label: m.displayName }))
+    : MODEL_OPTIONS
+
   return (
     <div className="relative">
       <button
@@ -118,11 +134,10 @@ export default function FreshclaudeSettings({
                 id={`${instanceId}-model`}
                 aria-label="Model"
                 value={model}
-                disabled={sessionStarted}
                 onChange={(e) => onChange({ model: e.target.value })}
-                className="w-full rounded border bg-background px-2 py-1 text-xs disabled:opacity-50"
+                className="w-full rounded border bg-background px-2 py-1 text-xs"
               >
-                {MODEL_OPTIONS.map((opt) => (
+                {resolvedModelOptions.map((opt) => (
                   <option key={opt.value} value={opt.value}>{opt.label}</option>
                 ))}
               </select>
@@ -135,11 +150,27 @@ export default function FreshclaudeSettings({
                 id={`${instanceId}-permissions`}
                 aria-label="Permissions"
                 value={permissionMode}
-                disabled={sessionStarted}
                 onChange={(e) => onChange({ permissionMode: e.target.value })}
-                className="w-full rounded border bg-background px-2 py-1 text-xs disabled:opacity-50"
+                className="w-full rounded border bg-background px-2 py-1 text-xs"
               >
                 {PERMISSION_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Effort — locked after session starts */}
+            <div className="space-y-1">
+              <label htmlFor={`${instanceId}-effort`} className="text-xs font-medium">Effort</label>
+              <select
+                id={`${instanceId}-effort`}
+                aria-label="Effort"
+                value={effort}
+                disabled={sessionStarted}
+                onChange={(e) => onChange({ effort: e.target.value as ClaudeChatPaneContent['effort'] })}
+                className="w-full rounded border bg-background px-2 py-1 text-xs disabled:opacity-50"
+              >
+                {EFFORT_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.value}>{opt.label}</option>
                 ))}
               </select>

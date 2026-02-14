@@ -156,4 +156,9 @@ export interface AppSettings {
     tabAttentionStyle: TabAttentionStyle
     attentionDismiss: AttentionDismiss
   }
+  freshclaude?: {
+    defaultModel?: string
+    defaultPermissionMode?: string
+    defaultEffort?: 'low' | 'medium' | 'high' | 'max'
+  }
 }
