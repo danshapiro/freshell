@@ -13,6 +13,10 @@ interface MessageBubbleProps {
   showThinking?: boolean
   showTools?: boolean
   showTimecodes?: boolean
+  /** Index offset for this message's completed tool blocks in the global sequence. */
+  completedToolOffset?: number
+  /** Completed tools at globalIndex >= this value get initialExpanded=true. */
+  autoExpandAbove?: number
 }
 
 function MessageBubble({
@@ -23,6 +27,8 @@ function MessageBubble({
   showThinking = true,
   showTools = true,
   showTimecodes = false,
+  completedToolOffset,
+  autoExpandAbove,
 }: MessageBubbleProps) {
   // Pair tool_use blocks with their tool_result blocks for unified rendering.
   // This allows ToolBlock to show the tool name, input preview, AND result
@@ -36,6 +42,21 @@ function MessageBubble({
     }
     return map
   }, [content])
+
+  // Pre-compute which tool_use blocks should auto-expand based on global index.
+  // Only completed tools (those with a matching result) consume expand slots.
+  const expandSet = useMemo(() => {
+    if (autoExpandAbove == null) return new Set<string>()
+    const set = new Set<string>()
+    let idx = completedToolOffset ?? 0
+    for (const block of content) {
+      if (block.type === 'tool_use' && block.id && resultMap.has(block.id)) {
+        if (idx >= autoExpandAbove) set.add(block.id)
+        idx++
+      }
+    }
+    return set
+  }, [content, resultMap, completedToolOffset, autoExpandAbove])
 
   return (
     <div
@@ -87,6 +108,7 @@ function MessageBubble({
               output={resultContent}
               isError={result?.is_error}
               status={result ? 'complete' : 'running'}
+              initialExpanded={block.id ? expandSet.has(block.id) : false}
             />
           )
         }

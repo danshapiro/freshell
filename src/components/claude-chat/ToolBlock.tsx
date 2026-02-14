@@ -8,6 +8,8 @@ interface ToolBlockProps {
   output?: string
   isError?: boolean
   status: 'running' | 'complete'
+  /** When true, tool block starts expanded (used for recent tools). Default: false. */
+  initialExpanded?: boolean
 }
 
 const TOOL_ICONS: Record<string, typeof Terminal> = {
@@ -77,8 +79,8 @@ function getResultSummary(name: string, output?: string, isError?: boolean): str
   return 'done'
 }
 
-function ToolBlock({ name, input, output, isError, status }: ToolBlockProps) {
-  const [expanded, setExpanded] = useState(false)
+function ToolBlock({ name, input, output, isError, status, initialExpanded }: ToolBlockProps) {
+  const [expanded, setExpanded] = useState(initialExpanded ?? false)
   const Icon = TOOL_ICONS[name] || Terminal
   const preview = useMemo(() => getToolPreview(name, input), [name, input])
   const resultSummary = useMemo(

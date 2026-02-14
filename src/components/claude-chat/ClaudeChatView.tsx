@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 import type { ClaudeChatPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updatePaneContent } from '@/store/panesSlice'
@@ -173,6 +173,29 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
   const isRunning = paneContent.status === 'running'
   const pendingPermissions = session ? Object.values(session.pendingPermissions) : []
 
+  // Auto-expand: count completed tools across all messages, expand the most recent N
+  const RECENT_TOOLS_EXPANDED = 3
+  const messages = session?.messages ?? []
+  const { completedToolOffsets, autoExpandAbove } = useMemo(() => {
+    let totalCompletedTools = 0
+    const offsets: number[] = []
+    for (const msg of messages) {
+      offsets.push(totalCompletedTools)
+      for (const b of msg.content) {
+        if (b.type === 'tool_use' && b.id) {
+          const hasResult = msg.content.some(
+            r => r.type === 'tool_result' && r.tool_use_id === b.id
+          )
+          if (hasResult) totalCompletedTools++
+        }
+      }
+    }
+    return {
+      completedToolOffsets: offsets,
+      autoExpandAbove: Math.max(0, totalCompletedTools - RECENT_TOOLS_EXPANDED),
+    }
+  }, [messages])
+
   return (
     <div className={cn('h-full w-full flex flex-col', hidden ? 'tab-hidden' : 'tab-visible')} role="region" aria-label="freshclaude Chat">
       {/* Status bar */}
@@ -215,7 +238,7 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
           </div>
         )}
 
-        {session?.messages.map((msg, i) => (
+        {messages.map((msg, i) => (
           <MessageBubble
             key={i}
             role={msg.role}
@@ -225,6 +248,8 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
             showThinking={paneContent.showThinking ?? true}
             showTools={paneContent.showTools ?? true}
             showTimecodes={paneContent.showTimecodes ?? false}
+            completedToolOffset={completedToolOffsets[i]}
+            autoExpandAbove={autoExpandAbove}
           />
         ))}
 
