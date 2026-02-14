@@ -315,6 +315,16 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         }
       }
 
+      // Shift+Enter → send newline (same as Ctrl+J)
+      if (event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey
+          && event.key === 'Enter' && event.type === 'keydown' && !event.repeat) {
+        const tid = terminalIdRef.current
+        if (tid) {
+          ws.send({ type: 'terminal.input', terminalId: tid, data: '\n' })
+        }
+        return false
+      }
+
       return true
     })
 

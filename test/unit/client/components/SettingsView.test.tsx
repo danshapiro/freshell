@@ -125,7 +125,7 @@ describe('SettingsView Component', () => {
       expect(screen.getByText('Providers and defaults for coding sessions')).toBeInTheDocument()
 
       expect(screen.getByText('Keyboard shortcuts')).toBeInTheDocument()
-      expect(screen.getByText('Tab navigation')).toBeInTheDocument()
+      expect(screen.getByText('Navigation and terminal')).toBeInTheDocument()
     })
 
     it('renders a terminal preview above Appearance', () => {
