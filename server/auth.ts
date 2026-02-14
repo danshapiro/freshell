@@ -1,4 +1,5 @@
 import type { Request, Response, NextFunction } from 'express'
+import { timingSafeEqual } from 'crypto'
 import { logger } from './logger.js'
 
 const log = logger.child({ component: 'auth' })
@@ -25,6 +26,13 @@ export function validateStartupSecurity() {
   log.info({ tokenLength: token.length, event: 'auth_token_configured' }, 'Security: AUTH_TOKEN configured')
 }
 
+export function timingSafeCompare(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, 'utf8')
+  const bufB = Buffer.from(b, 'utf8')
+  if (bufA.length !== bufB.length) return false
+  return timingSafeEqual(bufA, bufB)
+}
+
 export function httpAuthMiddleware(req: Request, res: Response, next: NextFunction) {
   // Allow health checks without auth (optional)
   if (req.path === '/api/health') return next()
@@ -33,7 +41,7 @@ export function httpAuthMiddleware(req: Request, res: Response, next: NextFuncti
   if (!token) return res.status(500).json({ error: 'Server misconfigured: AUTH_TOKEN missing' })
 
   const provided = (req.headers['x-auth-token'] as string | undefined) || undefined
-  if (!provided || provided !== token) {
+  if (!provided || !timingSafeCompare(provided, token)) {
     return res.status(401).json({ error: 'Unauthorized' })
   }
   next()
