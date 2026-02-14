@@ -24,6 +24,8 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
   const ws = getWsClient()
   const createSentRef = useRef(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const isAtBottomRef = useRef(true)
   // Keep a ref to the latest paneContent to avoid stale closures in effects
   // while using only primitive deps for triggering.
   const paneContentRef = useRef(paneContent)
@@ -108,9 +110,11 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
     })
   }, [paneContent.sessionId, ws])
 
-  // Auto-scroll on new messages
+  // Smart auto-scroll: only scroll if user is already at/near the bottom
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    if (isAtBottomRef.current) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
   }, [session?.messages.length, session?.streamingActive])
 
   const handleSend = useCallback((text: string) => {
@@ -136,14 +140,19 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
     ws.send({ type: 'sdk.permission.respond', sessionId: paneContent.sessionId, requestId, behavior: 'deny' })
   }, [paneContent.sessionId, dispatch, ws])
 
-  if (hidden) return null
+  const handleScroll = useCallback(() => {
+    const el = scrollContainerRef.current
+    if (!el) return
+    const threshold = 50
+    isAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < threshold
+  }, [])
 
   const isInteractive = paneContent.status === 'idle' || paneContent.status === 'connected'
   const isRunning = paneContent.status === 'running'
   const pendingPermissions = session ? Object.values(session.pendingPermissions) : []
 
   return (
-    <div className="h-full w-full flex flex-col" role="region" aria-label="freshclaude Chat">
+    <div className={cn('h-full w-full flex flex-col', hidden ? 'tab-hidden' : 'tab-visible')} role="region" aria-label="freshclaude Chat">
       {/* Status bar */}
       <div className="flex items-center justify-between px-3 py-1.5 border-b text-xs text-muted-foreground">
         <span>
@@ -161,7 +170,7 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
       </div>
 
       {/* Message area */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-3">
+      <div ref={scrollContainerRef} onScroll={handleScroll} className="flex-1 overflow-y-auto p-4 space-y-3">
         {!session?.messages.length && (
           <div className="text-center text-muted-foreground text-sm py-8">
             <p className="font-medium mb-2">freshclaude</p>
