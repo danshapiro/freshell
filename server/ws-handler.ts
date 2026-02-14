@@ -1752,6 +1752,53 @@ export class WsHandler {
   }
 
   /**
+   * Prepare for hot rebind: close all client connections and set the closed
+   * flag so the patched server.close() → this.close() is a no-op.
+   */
+  prepareForRebind(): void {
+    for (const ws of this.connections) {
+      try {
+        ws.close(CLOSE_CODES.SERVER_SHUTDOWN, 'Server rebinding')
+        setTimeout(() => {
+          if (ws.readyState !== ws.CLOSED) {
+            ws.terminate()
+          }
+        }, 5000)
+      } catch {
+        try { ws.terminate() } catch { /* ignore */ }
+      }
+    }
+
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval)
+      this.pingInterval = null
+    }
+
+    this.closed = true
+    log.info('WsHandler prepared for rebind (connections closed, WSS preserved)')
+  }
+
+  /**
+   * Resume after hot rebind: reset the closed flag and restart ping interval.
+   */
+  resumeAfterRebind(): void {
+    this.closed = false
+
+    this.pingInterval = setInterval(() => {
+      for (const ws of this.connections) {
+        if (ws.isAlive === false) {
+          ws.terminate()
+          continue
+        }
+        ws.isAlive = false
+        ws.ping()
+      }
+    }, PING_INTERVAL_MS)
+
+    log.info('WsHandler resumed after rebind')
+  }
+
+  /**
    * Gracefully close all WebSocket connections and the server.
    */
   close(): void {

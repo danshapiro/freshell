@@ -32,6 +32,8 @@ import { createStartupState } from './startup-state.js'
 import { getPerfConfig, initPerfLogging, setPerfLoggingEnabled, startPerfTimer, withPerfSpan } from './perf-logger.js'
 import { detectPlatform, detectAvailableClis } from './platform.js'
 import { resolveVisitPort } from './startup-url.js'
+import { NetworkManager } from './network-manager.js'
+import cookieParser from 'cookie-parser'
 import { PortForwardManager } from './port-forward.js'
 import { getRequesterIdentity, parseTrustProxyEnv } from './request-ip.js'
 import { collectCandidateDirectories } from './candidate-dirs.js'
@@ -65,14 +67,8 @@ const ASSOCIATION_MAX_AGE_MS = 30_000
 async function main() {
   validateStartupSecurity()
 
-  // WSL2 port forwarding - must run AFTER security validation passes
-  // and AFTER dotenv loads so PORT/NODE_ENV from .env are available
-  const wslPortForwardResult = setupWslPortForwarding()
-  if (wslPortForwardResult === 'success') {
-    console.log('[server] WSL2 port forwarding configured')
-  } else if (wslPortForwardResult === 'failed') {
-    console.warn('[server] WSL2 port forwarding failed - LAN access may not work')
-  }
+  // WSL2 port forwarding is deferred until bindHost is known (after config load).
+  // See the conditional call before server.listen() below.
 
   initPerfLogging()
 
@@ -83,8 +79,17 @@ async function main() {
   app.use(express.json({ limit: '1mb' }))
   app.use(requestLogger)
 
-  // --- Local file serving for browser pane (no auth required, same-origin only) ---
-  app.get('/local-file', (req, res) => {
+  // --- Local file serving for browser pane (cookie auth for iframes) ---
+  app.get('/local-file', cookieParser(), (req, res, next) => {
+    const headerToken = req.headers['x-auth-token'] as string | undefined
+    const cookieToken = req.cookies?.['freshell-auth']
+    const token = headerToken || cookieToken
+    const expectedToken = process.env.AUTH_TOKEN
+    if (!expectedToken || token !== expectedToken) {
+      return res.status(401).json({ error: 'Unauthorized' })
+    }
+    next()
+  }, (req, res) => {
     const filePath = req.query.path as string
     if (!filePath) {
       return res.status(400).json({ error: 'path query parameter required' })
@@ -176,6 +181,12 @@ async function main() {
     },
     () => terminalMetadata.list(),
   )
+  const port = Number(process.env.PORT || 3001)
+  const isDev = process.env.NODE_ENV !== 'production'
+  const vitePort = isDev ? Number(process.env.VITE_PORT || 5173) : undefined
+  const networkManager = new NetworkManager(server, configStore, port, isDev, vitePort)
+  networkManager.setWsHandler(wsHandler)
+
   const sessionsSync = new SessionsSyncService(wsHandler)
 
   const broadcastTerminalMetaUpserts = (upsert: ReturnType<TerminalMetadataService['list']>) => {
@@ -269,6 +280,51 @@ async function main() {
 
   app.get('/api/lan-info', (_req, res) => {
     res.json({ ips: detectLanIps() })
+  })
+
+  // --- Network management endpoints ---
+  app.get('/api/network/status', async (_req, res) => {
+    try {
+      const status = await networkManager.getStatus()
+      res.json(status)
+    } catch (err) {
+      log.error({ err }, 'Failed to get network status')
+      res.status(500).json({ error: 'Failed to get network status' })
+    }
+  })
+
+  const NetworkConfigureSchema = z.object({
+    host: z.enum(['127.0.0.1', '0.0.0.0']),
+    configured: z.boolean(),
+    mdns: z.object({
+      enabled: z.boolean(),
+      hostname: z.string()
+        .min(1).max(63)
+        .regex(/^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$/, 'Invalid mDNS hostname')
+        .transform((s) => s.toLowerCase()),
+    }),
+  })
+
+  app.post('/api/network/configure', async (req, res) => {
+    const parsed = NetworkConfigureSchema.safeParse(req.body || {})
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
+    }
+    try {
+      const { rebindScheduled } = await networkManager.configure(parsed.data)
+      const status = await networkManager.getStatus()
+      res.json({ ...status, rebindScheduled })
+    } catch (err) {
+      log.error({ err }, 'Failed to configure network')
+      res.status(500).json({ error: 'Failed to configure network' })
+      return
+    }
+    try {
+      const fullSettings = await configStore.getSettings()
+      wsHandler.broadcast({ type: 'settings.updated', settings: fullSettings })
+    } catch (broadcastErr) {
+      log.error({ err: broadcastErr }, 'Failed to broadcast settings after network configure')
+    }
   })
 
   app.get('/api/platform', async (_req, res) => {
@@ -783,9 +839,33 @@ async function main() {
       })
   }
 
-  const port = Number(process.env.PORT || 3001)
-  server.listen(port, '0.0.0.0', () => {
-    log.info({ event: 'server_listening', port, appVersion: APP_VERSION }, 'Server listening')
+  // Determine bind host from config, with HOST env override for unconfigured deployments
+  const currentSettings = await configStore.getSettings()
+  const envHost = process.env.HOST
+  const bindHost = (!currentSettings.network.configured && (envHost === '0.0.0.0' || envHost === '127.0.0.1'))
+    ? envHost
+    : currentSettings.network.host
+
+  // WSL2 port forwarding — only when bound to 0.0.0.0 (remote access active)
+  if (bindHost === '0.0.0.0') {
+    const wslPortForwardResult = setupWslPortForwarding()
+    if (wslPortForwardResult === 'success') {
+      console.log('[server] WSL2 port forwarding configured')
+    } else if (wslPortForwardResult === 'failed') {
+      console.warn('[server] WSL2 port forwarding failed - LAN access may not work')
+    }
+  }
+
+  // Initialize NetworkManager (ALLOWED_ORIGINS, mDNS) before accepting connections
+  if (currentSettings.network.configured || bindHost === '0.0.0.0') {
+    await networkManager.initializeFromStartup(
+      bindHost as '127.0.0.1' | '0.0.0.0',
+      currentSettings.network,
+    )
+  }
+
+  server.listen(port, bindHost, () => {
+    log.info({ event: 'server_listening', port, host: bindHost, appVersion: APP_VERSION }, 'Server listening')
 
     // Print friendly startup message
     const token = process.env.AUTH_TOKEN
@@ -835,7 +915,10 @@ async function main() {
     // 5. Close SDK bridge sessions
     sdkBridge.close()
 
-    // 6. Close WebSocket connections gracefully
+    // 6. Stop NetworkManager (mDNS, etc.)
+    await networkManager.stop()
+
+    // 7. Close WebSocket connections gracefully
     wsHandler.close()
 
     // 7. Close port forwards
