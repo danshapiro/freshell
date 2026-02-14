@@ -332,7 +332,9 @@ export class SessionRepairService extends EventEmitter {
         if (resolved.length > 0) {
           this.queue.enqueue(resolved)
         }
-      })()
+      })().catch((err) => {
+        logger.warn({ err, sessionIds: pending.map((i) => i.sessionId) }, 'Failed to resolve pending session file paths')
+      })
     }
   }
 }
