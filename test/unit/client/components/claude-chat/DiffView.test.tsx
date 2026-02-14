@@ -56,4 +56,15 @@ describe('DiffView', () => {
     render(<DiffView oldStr="a" newStr="b" />)
     expect(screen.getByRole('figure', { name: /diff/i })).toBeInTheDocument()
   })
+
+  // --- data-* attribute tests for context menu ---
+
+  it('tags diff container with data-diff and data-file-path', () => {
+    const oldStr = ['line1', 'line2'].join('\n')
+    const newStr = ['line1', 'changed'].join('\n')
+    render(<DiffView oldStr={oldStr} newStr={newStr} filePath="/tmp/test.ts" />)
+    const diffEl = document.querySelector('[data-diff]')
+    expect(diffEl).not.toBeNull()
+    expect(diffEl?.getAttribute('data-file-path')).toBe('/tmp/test.ts')
+  })
 })

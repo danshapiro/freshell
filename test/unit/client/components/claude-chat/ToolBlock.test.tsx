@@ -108,4 +108,21 @@ describe('ToolBlock', () => {
     const wrapper = container.firstElementChild!
     expect(wrapper.className).toContain('border-l')
   })
+
+  // --- data-* attribute tests for context menu ---
+
+  describe('data attributes for context menu', () => {
+    it('tags tool input with data-tool-input and data-tool-name', () => {
+      render(<ToolBlock name="Bash" input={{ command: 'ls' }} status="complete" output="files" initialExpanded />)
+      const inputEl = document.querySelector('[data-tool-input]')
+      expect(inputEl).not.toBeNull()
+      expect(inputEl?.getAttribute('data-tool-name')).toBe('Bash')
+    })
+
+    it('tags tool output with data-tool-output', () => {
+      render(<ToolBlock name="Bash" input={{ command: 'ls' }} status="complete" output="file1\nfile2" initialExpanded />)
+      const outputEl = document.querySelector('[data-tool-output]')
+      expect(outputEl).not.toBeNull()
+    })
+  })
 })

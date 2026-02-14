@@ -42,7 +42,13 @@ function DiffView({ oldStr, newStr, filePath }: DiffViewProps) {
   }
 
   return (
-    <div role="figure" aria-label="diff view" className="text-xs font-mono overflow-x-auto">
+    <div
+      role="figure"
+      aria-label="diff view"
+      className="text-xs font-mono overflow-x-auto"
+      data-diff=""
+      data-file-path={filePath}
+    >
       {filePath && (
         <div className="text-muted-foreground px-2 py-0.5 border-b border-border/50">
           {filePath}

@@ -137,17 +137,24 @@ function ToolBlock({ name, input, output, isError, status, initialExpanded }: To
           ) : (
             <>
               {input && (
-                <pre className="whitespace-pre-wrap font-mono opacity-80 max-h-48 overflow-y-auto">
+                <pre
+                  className="whitespace-pre-wrap font-mono opacity-80 max-h-48 overflow-y-auto"
+                  data-tool-input=""
+                  data-tool-name={name}
+                >
                   {name === 'Bash' && typeof input.command === 'string'
                     ? input.command
                     : JSON.stringify(input, null, 2)}
                 </pre>
               )}
               {output && (
-                <pre className={cn(
-                  'whitespace-pre-wrap font-mono max-h-48 overflow-y-auto mt-1',
-                  isError ? 'text-red-500' : 'opacity-80'
-                )}>
+                <pre
+                  className={cn(
+                    'whitespace-pre-wrap font-mono max-h-48 overflow-y-auto mt-1',
+                    isError ? 'text-red-500' : 'opacity-80'
+                  )}
+                  data-tool-output=""
+                >
                   {output}
                 </pre>
               )}
