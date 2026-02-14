@@ -156,13 +156,14 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
       {/* Status bar */}
       <div className="flex items-center justify-between px-3 py-1.5 border-b text-xs text-muted-foreground">
         <span>
-          {paneContent.status === 'creating' && 'Creating session...'}
-          {paneContent.status === 'starting' && 'Starting Claude Code...'}
-          {paneContent.status === 'connected' && 'Connected'}
-          {paneContent.status === 'running' && 'Running...'}
-          {paneContent.status === 'idle' && 'Ready'}
-          {paneContent.status === 'compacting' && 'Compacting context...'}
-          {paneContent.status === 'exited' && 'Session ended'}
+          {pendingPermissions.length > 0 && 'Waiting for answer...'}
+          {pendingPermissions.length === 0 && paneContent.status === 'creating' && 'Creating session...'}
+          {pendingPermissions.length === 0 && paneContent.status === 'starting' && 'Starting Claude Code...'}
+          {pendingPermissions.length === 0 && paneContent.status === 'connected' && 'Connected'}
+          {pendingPermissions.length === 0 && paneContent.status === 'running' && 'Running...'}
+          {pendingPermissions.length === 0 && paneContent.status === 'idle' && 'Ready'}
+          {pendingPermissions.length === 0 && paneContent.status === 'compacting' && 'Compacting context...'}
+          {pendingPermissions.length === 0 && paneContent.status === 'exited' && 'Session ended'}
         </span>
         {paneContent.initialCwd && (
           <span className="truncate ml-2">{paneContent.initialCwd}</span>
@@ -222,7 +223,13 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
         onInterrupt={handleInterrupt}
         disabled={!isInteractive && !isRunning}
         isRunning={isRunning}
-        placeholder={isInteractive ? 'Message Claude...' : 'Waiting for connection...'}
+        placeholder={
+          pendingPermissions.length > 0
+            ? 'Waiting for answer...'
+            : isInteractive
+              ? 'Message Claude...'
+              : 'Waiting for connection...'
+        }
       />
     </div>
   )
