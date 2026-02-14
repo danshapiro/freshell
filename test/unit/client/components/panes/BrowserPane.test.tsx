@@ -145,14 +145,14 @@ describe('BrowserPane', () => {
   })
 
   describe('file:// URL handling', () => {
-    it('converts file:// URLs to /local-file API endpoint', () => {
+    it('converts file:// URLs to /api/local-file endpoint', () => {
       renderBrowserPane({ url: 'file:///home/user/index.html' })
 
       const iframe = document.querySelector('iframe')
       expect(iframe).toBeTruthy()
       // The existing regex strips the leading slash after file:///
       expect(iframe!.getAttribute('src')).toBe(
-        '/local-file?path=' + encodeURIComponent('home/user/index.html'),
+        '/api/local-file?path=' + encodeURIComponent('home/user/index.html'),
       )
     })
   })
@@ -257,9 +257,9 @@ describe('BrowserPane', () => {
 
       const iframe = document.querySelector('iframe')
       expect(iframe).toBeTruthy()
-      // file:// should still go through /local-file endpoint (existing regex strips leading /)
+      // file:// should still go through /api/local-file endpoint (existing regex strips leading /)
       expect(iframe!.getAttribute('src')).toBe(
-        '/local-file?path=' + encodeURIComponent('home/user/index.html'),
+        '/api/local-file?path=' + encodeURIComponent('home/user/index.html'),
       )
     })
 

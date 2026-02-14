@@ -18,11 +18,11 @@ interface BrowserPaneProps {
 
 const MAX_HISTORY_SIZE = 50
 
-// Convert file:// URLs to the /local-file API endpoint for iframe loading
+// Convert file:// URLs to the /api/local-file endpoint for iframe loading
 function toIframeSrc(url: string): string {
   if (url.startsWith('file://')) {
     const filePath = url.replace(/^file:\/\/\/?/, '')
-    return `/local-file?path=${encodeURIComponent(filePath)}`
+    return `/api/local-file?path=${encodeURIComponent(filePath)}`
   }
   return url
 }
