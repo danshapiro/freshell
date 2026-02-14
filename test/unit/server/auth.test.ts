@@ -110,6 +110,18 @@ describe('auth module', () => {
       expect(next).toHaveBeenCalled()
     })
 
+    it('requires auth for /api/local-file', () => {
+      process.env.AUTH_TOKEN = 'valid-token-16chars'
+      const req = { path: '/api/local-file', headers: {} } as any
+      const res = { status: vi.fn().mockReturnThis(), json: vi.fn() } as any
+      const next = vi.fn()
+
+      httpAuthMiddleware(req, res, next)
+
+      expect(res.status).toHaveBeenCalledWith(401)
+      expect(next).not.toHaveBeenCalled()
+    })
+
     it('returns 500 when AUTH_TOKEN is not configured', () => {
       delete process.env.AUTH_TOKEN
       const req = { path: '/api/settings', headers: {} } as any

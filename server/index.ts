@@ -82,31 +82,6 @@ async function main() {
   app.use(express.json({ limit: '1mb' }))
   app.use(requestLogger)
 
-  // --- Local file serving for browser pane (no auth required, same-origin only) ---
-  app.get('/local-file', (req, res) => {
-    const filePath = req.query.path as string
-    if (!filePath) {
-      return res.status(400).json({ error: 'path query parameter required' })
-    }
-
-    // Normalize and resolve the path
-    const resolved = path.resolve(filePath)
-
-    // Check if file exists
-    if (!fs.existsSync(resolved)) {
-      return res.status(404).json({ error: 'File not found' })
-    }
-
-    // Check if it's a file (not a directory)
-    const stat = fs.statSync(resolved)
-	    if (stat.isDirectory()) {
-	      return res.status(400).json({ error: 'Cannot serve directories' })
-	    }
-
-	    // Send the file with appropriate content type
-	    res.sendFile(resolved)
-	  })
-
   const startupState = createStartupState()
 
   // Health check endpoint (no auth required - used by precheck script)
@@ -132,6 +107,31 @@ async function main() {
 
   app.use('/api', httpAuthMiddleware)
   app.use('/api', createClientLogsRouter())
+
+  // --- Local file serving for browser pane (auth required via /api prefix) ---
+  app.get('/api/local-file', (req, res) => {
+    const filePath = req.query.path as string
+    if (!filePath) {
+      return res.status(400).json({ error: 'path query parameter required' })
+    }
+
+    // Normalize and resolve the path
+    const resolved = path.resolve(filePath)
+
+    // Check if file exists
+    if (!fs.existsSync(resolved)) {
+      return res.status(404).json({ error: 'File not found' })
+    }
+
+    // Check if it's a file (not a directory)
+    const stat = fs.statSync(resolved)
+    if (stat.isDirectory()) {
+      return res.status(400).json({ error: 'Cannot serve directories' })
+    }
+
+    // Send the file with appropriate content type
+    res.sendFile(resolved)
+  })
 
   const codingCliProviders = [claudeProvider, codexProvider]
   const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders)
