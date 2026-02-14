@@ -66,6 +66,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const restoreRequestIdRef = useRef<string | null>(null)
   const restoreFlagRef = useRef(false)
   const turnCompleteSignalStateRef = useRef(createTurnCompleteSignalParserState())
+  const savedScrollRef = useRef<number | undefined>(undefined)
   const warnExternalLinksRef = useRef(settings.terminal.warnExternalLinks)
   const debugRef = useRef(!!(settings as any).logging?.debug)
   const attentionDismissRef = useRef(settings.panes?.attentionDismiss ?? 'click')
@@ -409,16 +410,33 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     if (!hidden) fitRef.current?.fit()
   }, [isTerminal, settings, hidden])
 
-  // When becoming visible, fit and send size
+  // When becoming visible, fit and send size; when hiding, save scroll position
   // Note: With visibility:hidden CSS, dimensions are always stable, so no RAF needed
   useEffect(() => {
     if (!isTerminal) return
-    if (!hidden) {
+    if (hidden) {
+      // Save scroll position before tab hides
+      const term = termRef.current
+      if (term) {
+        const viewportY = term.buffer?.active?.viewportY
+        if (viewportY !== undefined) {
+          savedScrollRef.current = viewportY
+        }
+      }
+    } else {
       fitRef.current?.fit()
       const term = termRef.current
       const tid = terminalIdRef.current
       if (term && tid) {
         ws.send({ type: 'terminal.resize', terminalId: tid, cols: term.cols, rows: term.rows })
+      }
+      // Restore scroll position after fit() processes the resize
+      if (term && savedScrollRef.current !== undefined) {
+        const scrollLine = savedScrollRef.current
+        savedScrollRef.current = undefined
+        requestAnimationFrame(() => {
+          term.scrollToLine(scrollLine)
+        })
       }
     }
   }, [isTerminal, hidden, ws])
