@@ -4,6 +4,7 @@ import { setupWslPortForwarding } from './wsl-port-forward.js'
 import express from 'express'
 import fs from 'fs'
 import http from 'http'
+import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import rateLimit from 'express-rate-limit'
@@ -974,9 +975,24 @@ async function main() {
 
     console.log('')
     console.log(`\x1b[32m\u{1F41A}\u{1F525} freshell is ready!\x1b[0m`)
-    console.log(`   Visit from anywhere on your network: \x1b[36m${url}\x1b[0m`)
-    if (hideToken) {
-      console.log('   Auth token is configured in .env (not printed to logs).')
+    if (bindHost === '127.0.0.1') {
+      const localUrl = hideToken
+        ? `http://localhost:${visitPort}/`
+        : `http://localhost:${visitPort}/?token=${token}`
+      console.log(`   Local only: \x1b[36m${localUrl}\x1b[0m`)
+      if (hideToken) {
+        console.log('   Auth token is configured in .env (not printed to logs).')
+      }
+      console.log(`   Run the setup wizard to enable remote access.`)
+    } else {
+      console.log(`   Visit from anywhere on your network: \x1b[36m${url}\x1b[0m`)
+      if (currentSettings.network.mdns.enabled) {
+        const localHostname = os.hostname().replace(/\.local$/, '')
+        console.log(`   Or use: \x1b[36mhttp://${localHostname}.local:${visitPort}/\x1b[0m`)
+      }
+      if (hideToken) {
+        console.log('   Auth token is configured in .env (not printed to logs).')
+      }
     }
     console.log('')
 
