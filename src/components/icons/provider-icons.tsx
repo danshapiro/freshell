@@ -71,6 +71,20 @@ export function GeminiIcon(props: IconProps) {
   )
 }
 
+export function FreshclaudeIcon(props: IconProps) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 24 24"
+      fill="currentColor"
+      {...props}
+    >
+      <path d="M12 2C6.48 2 2 5.58 2 10c0 2.48 1.3 4.7 3.33 6.22V20l2.78-1.54C9.33 18.8 10.63 19 12 19c5.52 0 10-3.58 10-8S17.52 2 12 2Z"/>
+      <path d="M12 6.5 13.09 9.26 16 9.64 13.95 11.54 14.47 14.5 12 13.09 9.53 14.5 10.05 11.54 8 9.64 10.91 9.26Z" fill="var(--background, #fff)"/>
+    </svg>
+  )
+}
+
 // Fallback for unknown providers
 export function DefaultProviderIcon(props: IconProps) {
   return (
