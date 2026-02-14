@@ -59,6 +59,7 @@ npm run serve               # Build and run production server
 ### Testing
 ```bash
 npm test                    # Run all tests (client + server)
+npm run verify              # Build + test (catches type errors that vitest misses)
 npm run test:coverage       # Generate coverage report
 ```
 

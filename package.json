@@ -18,6 +18,7 @@
     "start": "cross-env NODE_ENV=production node dist/server/index.js",
     "serve": "npm run build && npm run start",
     "test": "vitest run",
+    "verify": "npm run build && npm test",
     "test:watch": "vitest",
     "test:ui": "vitest --ui",
     "test:server": "vitest --config vitest.server.config.ts",
