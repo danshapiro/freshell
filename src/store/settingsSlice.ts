@@ -55,6 +55,14 @@ export const defaultSettings: AppSettings = {
     },
   },
   freshclaude: {},
+  network: {
+    host: '127.0.0.1' as const,
+    configured: false,
+    mdns: {
+      enabled: false,
+      hostname: 'freshell',
+    },
+  },
 }
 
 export function migrateSortMode(mode: string | undefined): SidebarSortMode {
@@ -100,6 +108,14 @@ export function mergeSettings(base: AppSettings, patch: Partial<AppSettings>): A
       },
     },
     freshclaude: { ...base.freshclaude, ...(patch.freshclaude || {}) },
+  }
+
+  if (patch.network) {
+    merged.network = {
+      ...merged.network,
+      ...patch.network,
+      mdns: { ...merged.network.mdns, ...patch.network?.mdns },
+    }
   }
 
   return {

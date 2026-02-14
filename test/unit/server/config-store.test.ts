@@ -664,6 +664,58 @@ describe('ConfigStore', () => {
     })
   })
 
+  describe('network settings', () => {
+    it('should include network defaults with host 127.0.0.1 and configured false', async () => {
+      const store = new ConfigStore()
+      const settings = await store.getSettings()
+      expect(settings.network).toEqual({
+        host: '127.0.0.1',
+        configured: false,
+        mdns: {
+          enabled: false,
+          hostname: 'freshell',
+        },
+      })
+    })
+
+    it('should persist network settings through patch', async () => {
+      const store = new ConfigStore()
+      await store.patchSettings({
+        network: {
+          host: '0.0.0.0',
+          configured: true,
+          mdns: { enabled: true, hostname: 'mybox' },
+        },
+      })
+      const settings = await store.getSettings()
+      expect(settings.network).toEqual({
+        host: '0.0.0.0',
+        configured: true,
+        mdns: { enabled: true, hostname: 'mybox' },
+      })
+    })
+
+    it('should deep-merge network settings (partial mdns patch)', async () => {
+      const store = new ConfigStore()
+      // First: set all network fields explicitly
+      await store.patchSettings({
+        network: { host: '0.0.0.0', configured: true, mdns: { enabled: true, hostname: 'freshell' } },
+      })
+      // Second: patch ONLY mdns.hostname — a shallow merge would clobber
+      // the mdns object entirely, losing enabled:true. A correct deep merge
+      // preserves mdns.enabled while updating mdns.hostname.
+      await store.patchSettings({
+        network: { mdns: { hostname: 'custom' } },
+      } as any)
+      const settings = await store.getSettings()
+      // Deep merge should preserve the unpatched fields:
+      expect(settings.network.host).toBe('0.0.0.0')
+      expect(settings.network.configured).toBe(true)
+      expect(settings.network.mdns.enabled).toBe(true)
+      expect(settings.network.mdns.hostname).toBe('custom')
+    })
+  })
+
   describe('edge cases', () => {
     it('handles empty settings object in file', async () => {
       await fsp.mkdir(configDir, { recursive: true })

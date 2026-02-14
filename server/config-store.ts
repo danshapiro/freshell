@@ -24,6 +24,15 @@ class Mutex {
   }
 }
 
+export interface NetworkSettings {
+  host: '127.0.0.1' | '0.0.0.0'
+  configured: boolean
+  mdns: {
+    enabled: boolean
+    hostname: string
+  }
+}
+
 export type AppSettings = {
   theme: 'system' | 'light' | 'dark'
   uiScale: number
@@ -85,6 +94,7 @@ export type AppSettings = {
     defaultPermissionMode?: string
     defaultEffort?: 'low' | 'medium' | 'high' | 'max'
   }
+  network: NetworkSettings
 }
 
 export type SessionOverride = {
@@ -162,6 +172,14 @@ export const defaultSettings: AppSettings = {
     },
   },
   freshclaude: {},
+  network: {
+    host: '127.0.0.1',
+    configured: false,
+    mdns: {
+      enabled: false,
+      hostname: 'freshell',
+    },
+  },
 }
 
 function configDir(): string {
@@ -338,6 +356,11 @@ function mergeSettings(base: AppSettings, patch: Partial<AppSettings>): AppSetti
       },
     },
     freshclaude: { ...base.freshclaude, ...(patch.freshclaude || {}) },
+    network: {
+      ...base.network,
+      ...(patch.network || {}),
+      mdns: { ...base.network.mdns, ...(patch.network?.mdns || {}) },
+    },
   }
 }
 

@@ -137,6 +137,11 @@ describe('settingsSlice', () => {
           tabAttentionStyle: 'highlight',
           attentionDismiss: 'click' as const,
         },
+        network: {
+          host: '127.0.0.1' as const,
+          configured: false,
+          mdns: { enabled: false, hostname: 'freshell' },
+        },
       }
 
       const state = settingsReducer(initialState, setSettings(newSettings))
