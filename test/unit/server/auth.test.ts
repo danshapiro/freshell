@@ -6,6 +6,7 @@ import {
   parseAllowedOrigins,
   isOriginAllowed,
   isLoopbackAddress,
+  timingSafeCompare,
 } from '../../../server/auth'
 
 describe('auth module', () => {
@@ -157,6 +158,34 @@ describe('auth module', () => {
     it('returns false for disallowed origin', () => {
       delete process.env.ALLOWED_ORIGINS
       expect(isOriginAllowed('http://evil.com')).toBe(false)
+    })
+  })
+
+  describe('timingSafeCompare', () => {
+    it('returns true for identical tokens', () => {
+      expect(timingSafeCompare('my-secret-token', 'my-secret-token')).toBe(true)
+    })
+
+    it('returns false for different tokens of same length', () => {
+      expect(timingSafeCompare('my-secret-token', 'xx-secret-token')).toBe(false)
+    })
+
+    it('returns false for different length tokens', () => {
+      expect(timingSafeCompare('short', 'a-much-longer-token')).toBe(false)
+    })
+
+    it('returns true for two empty strings', () => {
+      expect(timingSafeCompare('', '')).toBe(true)
+    })
+
+    it('returns false when one is empty', () => {
+      expect(timingSafeCompare('', 'non-empty')).toBe(false)
+      expect(timingSafeCompare('non-empty', '')).toBe(false)
+    })
+
+    it('handles unicode/multibyte characters', () => {
+      expect(timingSafeCompare('tokën-with-ünïcödé', 'tokën-with-ünïcödé')).toBe(true)
+      expect(timingSafeCompare('tokën-with-ünïcödé', 'token-with-unicode')).toBe(false)
     })
   })
 
