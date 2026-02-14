@@ -285,7 +285,8 @@ describe('buildMenuItems — freshclaude-chat context-sensitive items', () => {
     const { ctx } = makeContextWithClickTarget(div)
     const target: ContextTarget = { kind: 'freshclaude-chat', sessionId: 's1' }
     const items = buildMenuItems(target, ctx)
-    const ids = items.filter(i => i.type === 'item').map(i => i.id)
-    expect(ids).toContain('fc-copy-session')
+    const sessionIdx = items.findIndex(i => i.type === 'item' && i.id === 'fc-copy-session')
+    expect(sessionIdx).toBeGreaterThan(0)
+    expect(items[sessionIdx - 1]?.type).toBe('separator')
   })
 })
