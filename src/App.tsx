@@ -37,7 +37,7 @@ import { fetchNetworkStatus } from '@/store/networkSlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { triggerHapticFeedback } from '@/lib/mobile-haptics'
-import { Wifi, WifiOff, Moon, Sun, Share2, X, Copy, Check, PanelLeftClose, PanelLeft, Loader2, Minimize2, Maximize2, AlertCircle } from 'lucide-react'
+import { Wifi, WifiOff, Moon, Sun, Share2, X, Copy, Check, PanelLeftClose, PanelLeft, Loader2, Minimize2, Maximize2, AlertCircle, AlertTriangle } from 'lucide-react'
 import { updateSettingsLocal, markSaved } from '@/store/settingsSlice'
 import { clearIdleWarning, recordIdleWarning } from '@/store/idleWarningsSlice'
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
@@ -76,6 +76,24 @@ function isVersionInfo(value: unknown): value is VersionInfo {
   return !!value && typeof value === 'object' && typeof (value as { currentVersion?: unknown }).currentVersion === 'string'
 }
 
+type ConfigFallbackInfo = {
+  reason: 'PARSE_ERROR' | 'VERSION_MISMATCH' | 'READ_ERROR' | 'ENOENT'
+  backupExists: boolean
+}
+
+function describeConfigFallbackReason(reason: ConfigFallbackInfo['reason']): string {
+  if (reason === 'PARSE_ERROR') return 'could not parse config JSON'
+  if (reason === 'VERSION_MISMATCH') return 'config version is incompatible'
+  if (reason === 'READ_ERROR') return 'config file could not be read'
+  return 'config file was missing'
+}
+
+function parseConfigFallbackReason(value: unknown): ConfigFallbackInfo['reason'] {
+  return value === 'PARSE_ERROR' || value === 'VERSION_MISMATCH' || value === 'READ_ERROR' || value === 'ENOENT'
+    ? value
+    : 'READ_ERROR'
+}
+
 export default function App() {
   useThemeEffect()
   useTurnCompletionNotifications()
@@ -98,6 +116,7 @@ export default function App() {
   const [showSharePanel, setShowSharePanel] = useState(false)
   const [showUpdateInstructions, setShowUpdateInstructions] = useState(false)
   const [showSetupWizard, setShowSetupWizard] = useState(false)
+  const [configFallback, setConfigFallback] = useState<ConfigFallbackInfo | null>(null)
   const [wizardInitialStep, setWizardInitialStep] = useState<1 | 2>(1)
   const [copied, setCopied] = useState(false)
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null)
@@ -441,6 +460,12 @@ export default function App() {
         }
         if (msg.type === 'perf.logging') {
           setClientPerfEnabled(!!msg.enabled, 'server')
+        }
+        if (msg.type === 'config.fallback') {
+          setConfigFallback({
+            reason: parseConfigFallbackReason(msg.reason),
+            backupExists: !!msg.backupExists,
+          })
         }
 
         // SDK message handling (freshclaude pane)
@@ -788,6 +813,28 @@ export default function App() {
                 <WifiOff className="h-3.5 w-3.5 text-muted-foreground" />
               )}
             </div>
+          </div>
+        </div>
+      )}
+      {configFallback && (
+        <div className="px-3 md:px-4 py-2 border-b border-destructive/30 bg-destructive/10 text-destructive text-xs">
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="h-3.5 w-3.5 mt-0.5 flex-shrink-0" aria-hidden="true" />
+            <div className="flex-1 min-w-0" role="status" aria-live="polite">
+              <p>
+                Config file was invalid ({describeConfigFallbackReason(configFallback.reason)}), so freshell loaded defaults.
+                {configFallback.backupExists
+                  ? ' Backup found at ~/.freshell/config.backup.json.'
+                  : ' No backup file was found.'}
+              </p>
+            </div>
+            <button
+              onClick={() => setConfigFallback(null)}
+              className="text-destructive/80 hover:text-destructive transition-colors"
+              aria-label="Dismiss config fallback warning"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
           </div>
         </div>
       )}

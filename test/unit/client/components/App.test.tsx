@@ -476,6 +476,31 @@ describe('App Component - Idle Warnings', () => {
       expect(screen.getByRole('button', { name: /auto-kill soon/i })).toBeInTheDocument()
     })
   })
+
+  it('shows and dismisses config fallback warning when server reports corrupted config', async () => {
+    renderApp()
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    messageHandler!({
+      type: 'config.fallback',
+      reason: 'PARSE_ERROR',
+      backupExists: true,
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText(/Config file was invalid/)).toBeInTheDocument()
+      expect(screen.getByText(/Backup found at ~\/\.freshell\/config\.backup\.json\./)).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByLabelText('Dismiss config fallback warning'))
+
+    await waitFor(() => {
+      expect(screen.queryByText(/Config file was invalid/)).not.toBeInTheDocument()
+    })
+  })
 })
 
 describe('App Component - Mobile Sidebar', () => {

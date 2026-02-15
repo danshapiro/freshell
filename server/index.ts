@@ -179,10 +179,15 @@ async function main() {
     sessionRepairService,
     async () => {
       const currentSettings = migrateSettingsSortMode(await configStore.getSettings())
+      const readError = configStore.getLastReadError()
+      const configFallback = readError
+        ? { reason: readError, backupExists: await configStore.backupExists() }
+        : undefined
       return {
         settings: currentSettings,
         projects: codingCliIndexer.getProjects(),
         perfLogging: perfConfig.enabled,
+        configFallback,
       }
     },
     () => terminalMetadata.list(),
