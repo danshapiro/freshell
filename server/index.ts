@@ -35,6 +35,7 @@ import { resolveVisitPort } from './startup-url.js'
 import { PortForwardManager } from './port-forward.js'
 import { getRequesterIdentity, parseTrustProxyEnv } from './request-ip.js'
 import { collectCandidateDirectories } from './candidate-dirs.js'
+import { checkForUpdate } from './updater/version-checker.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -277,6 +278,16 @@ async function main() {
       detectAvailableClis(),
     ])
     res.json({ platform, availableClis })
+  })
+
+  app.get('/api/version', async (_req, res) => {
+    try {
+      const updateCheck = await checkForUpdate(APP_VERSION)
+      res.json({ currentVersion: APP_VERSION, updateCheck })
+    } catch (err) {
+      console.warn('[version] checkForUpdate failed:', err instanceof Error ? err.message : String(err))
+      res.json({ currentVersion: APP_VERSION, updateCheck: null })
+    }
   })
 
   app.get('/api/files/candidate-dirs', async (_req, res) => {

@@ -9,6 +9,7 @@ import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
 import idleWarningsReducer from '@/store/idleWarningsSlice'
+import versionReducer from '@/store/versionSlice'
 
 // Ensure DOM is clean even if another test file forgot cleanup.
 beforeEach(() => {
@@ -81,6 +82,7 @@ function createTestStore() {
       sessions: sessionsReducer,
       panes: panesReducer,
       idleWarnings: idleWarningsReducer,
+      version: versionReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -850,6 +852,7 @@ describe('Tab Switching Keyboard Shortcuts', () => {
         connection: connectionReducer,
         sessions: sessionsReducer,
         panes: panesReducer,
+        version: versionReducer,
       },
       middleware: (getDefault) =>
         getDefault({

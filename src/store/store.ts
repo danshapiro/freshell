@@ -15,6 +15,7 @@ import idleWarningsReducer from './idleWarningsSlice'
 import turnCompletionReducer from './turnCompletionSlice'
 import terminalMetaReducer from './terminalMetaSlice'
 import claudeChatReducer from './claudeChatSlice'
+import versionReducer from './versionSlice'
 import { perfMiddleware } from './perfMiddleware'
 import { persistMiddleware } from './persistMiddleware'
 import { sessionActivityPersistMiddleware } from './sessionActivityPersistence'
@@ -35,6 +36,7 @@ export const store = configureStore({
     turnCompletion: turnCompletionReducer,
     terminalMeta: terminalMetaReducer,
     claudeChat: claudeChatReducer,
+    version: versionReducer,
   },
   middleware: (getDefault) =>
     getDefault({

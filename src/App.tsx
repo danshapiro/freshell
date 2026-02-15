@@ -11,7 +11,7 @@ import {
   resetWsSnapshotReceived,
 } from '@/store/sessionsSlice'
 import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
-import { api } from '@/lib/api'
+import { api, type VersionInfo } from '@/lib/api'
 import { getAuthToken } from '@/lib/auth'
 import { buildShareUrl } from '@/lib/utils'
 import { getWsClient } from '@/lib/ws-client'
@@ -32,11 +32,12 @@ import PaneDivider from '@/components/panes/PaneDivider'
 import { AuthRequiredModal } from '@/components/AuthRequiredModal'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
-import { Wifi, WifiOff, Moon, Sun, Share2, X, Copy, Check, PanelLeftClose, PanelLeft } from 'lucide-react'
+import { Wifi, WifiOff, Moon, Sun, Share2, X, Copy, Check, PanelLeftClose, PanelLeft, AlertCircle } from 'lucide-react'
 import { updateSettingsLocal, markSaved } from '@/store/settingsSlice'
 import { clearIdleWarning, recordIdleWarning } from '@/store/idleWarningsSlice'
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
+import { setVersionInfo } from '@/store/versionSlice'
 
 const SIDEBAR_MIN_WIDTH = 200
 const SIDEBAR_MAX_WIDTH = 500
@@ -55,6 +56,7 @@ export default function App() {
   const settings = useAppSelector((s) => s.settings.settings)
   const idleWarnings = useAppSelector((s) => (s as any).idleWarnings?.warnings ?? EMPTY_IDLE_WARNINGS)
   const idleWarningCount = Object.keys(idleWarnings).length
+  const versionState = useAppSelector((s) => s.version)
 
   const [view, setView] = useState<AppView>('terminal')
   const [shareModalUrl, setShareModalUrl] = useState<string | null>(null)
@@ -218,6 +220,13 @@ export default function App() {
         }
       } catch (err: any) {
         console.warn('Failed to load platform info', err)
+      }
+
+      try {
+        const versionInfo = await api.get<VersionInfo>('/api/version')
+        if (!cancelled) dispatch(setVersionInfo(versionInfo))
+      } catch (err: any) {
+        console.warn('Failed to load version info', err)
       }
 
       try {
@@ -454,6 +463,19 @@ export default function App() {
             )}
           </button>
           <span className="font-mono text-base font-semibold tracking-tight">🐚🔥freshell</span>
+          {versionState.currentVersion && (
+            <span
+              className={`text-xs ${versionState.updateAvailable ? 'text-amber-600' : 'text-muted-foreground'}`}
+              title={
+                versionState.updateAvailable
+                  ? `Update available: v${versionState.latestVersion}`
+                  : `Up to date`
+              }
+            >
+              {versionState.updateAvailable && <AlertCircle className="inline h-3 w-3 mr-0.5 -mt-0.5" />}
+              v{versionState.currentVersion}
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-1">
           {idleWarningCount > 0 && (
