@@ -471,7 +471,7 @@ export default function App() {
         <div className="flex items-center gap-2">
           <button
             onClick={toggleSidebarCollapse}
-            className="p-1.5 rounded-md hover:bg-muted transition-colors"
+            className="p-1.5 rounded-md hover:bg-muted transition-colors min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center"
             title={sidebarCollapsed ? 'Show sidebar' : 'Hide sidebar'}
           >
             {sidebarCollapsed ? (
@@ -495,7 +495,7 @@ export default function App() {
           )}
           <button
             onClick={toggleTheme}
-            className="p-1.5 rounded-md hover:bg-muted transition-colors"
+            className="p-1.5 rounded-md hover:bg-muted transition-colors min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center"
             title={`Theme: ${settings.theme}`}
           >
             {settings.theme === 'dark' ? (
@@ -506,7 +506,7 @@ export default function App() {
           </button>
           <button
             onClick={handleShare}
-            className="p-1.5 rounded-md hover:bg-muted transition-colors"
+            className="p-1.5 rounded-md hover:bg-muted transition-colors min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center"
             title="Share LAN access"
             aria-label="Share"
           >
@@ -517,7 +517,7 @@ export default function App() {
             )}
           </button>
           <div
-            className="p-1.5"
+            className="p-1.5 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center"
             title={connection === 'ready' ? 'Connected' : connection === 'connecting' ? 'Connecting...' : connectionError || 'Disconnected'}
           >
             {connection === 'ready' ? (
