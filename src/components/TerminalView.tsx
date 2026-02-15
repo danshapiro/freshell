@@ -101,7 +101,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState<{ resultIndex: number; resultCount: number } | null>(null)
   const [keyboardInsetPx, setKeyboardInsetPx] = useState(0)
-  const [ctrlModifierActive, setCtrlModifierActive] = useState(false)
   const setPendingLinkUriRef = useRef(setPendingLinkUri)
 
   const containerRef = useRef<HTMLDivElement | null>(null)
@@ -232,12 +231,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       }
       viewport.removeEventListener('resize', updateKeyboardInset)
       viewport.removeEventListener('scroll', updateKeyboardInset)
-    }
-  }, [isMobile])
-
-  useEffect(() => {
-    if (!isMobile) {
-      setCtrlModifierActive(false)
     }
   }, [isMobile])
 
@@ -395,17 +388,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     }
   }, [clearLongPressTimer])
 
-  const applyCtrlModifier = useCallback((input: string, keyId: string) => {
-    if (!ctrlModifierActive || keyId === 'ctrl') return input
-    setCtrlModifierActive(false)
-
-    if (input.length === 1 && /[A-Za-z]/.test(input)) {
-      const upper = input.toUpperCase().charCodeAt(0)
-      return String.fromCharCode(upper - 64)
-    }
-    return input
-  }, [ctrlModifierActive])
-
   // Helper to update pane content - uses ref to avoid recreation on content changes
   // This is CRITICAL: if updateContent depended on terminalContent directly,
   // it would be recreated on every status update, causing the effect to re-run
@@ -548,13 +530,16 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     ws.send({ type: 'terminal.input', terminalId: tid, data })
   }, [dispatch, tabId, paneId, ws])
 
-  const handleMobileToolbarKey = useCallback((input: string, keyId: string) => {
-    const payload = applyCtrlModifier(input, keyId)
-    sendInput(payload)
+  const handleMobileToolbarKey = useCallback((input: string, _keyId: string) => {
+    sendInput(input)
     requestAnimationFrame(() => {
       termRef.current?.focus()
     })
-  }, [applyCtrlModifier, sendInput])
+  }, [sendInput])
+
+  const handleMobileToolbarNewTab = useCallback(() => {
+    dispatch(addTab({ mode: 'shell' }))
+  }, [dispatch])
 
   const searchOpts = useMemo(() => ({
     caseSensitive: false,
@@ -1251,9 +1236,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       />
       {isMobile && (
         <MobileTerminalToolbar
-          ctrlActive={ctrlModifierActive}
           keyboardInsetPx={keyboardInsetPx}
-          onCtrlToggle={() => setCtrlModifierActive((prev) => !prev)}
+          onNewTab={handleMobileToolbarNewTab}
           onSendKey={handleMobileToolbarKey}
         />
       )}

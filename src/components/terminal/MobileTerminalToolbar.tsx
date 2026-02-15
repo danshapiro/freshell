@@ -1,8 +1,6 @@
 import { cn } from '@/lib/utils'
 
 const TOOLBAR_KEYS: Array<{ id: string; label: string; input: string }> = [
-  { id: 'tab', label: 'Tab', input: '\t' },
-  { id: 'esc', label: 'Esc', input: '\u001b' },
   { id: 'pipe', label: '|', input: '|' },
   { id: 'slash', label: '/', input: '/' },
   { id: 'tilde', label: '~', input: '~' },
@@ -25,16 +23,14 @@ const TOOLBAR_KEYS: Array<{ id: string; label: string; input: string }> = [
 ]
 
 interface MobileTerminalToolbarProps {
-  ctrlActive: boolean
   keyboardInsetPx: number
-  onCtrlToggle: () => void
+  onNewTab: () => void
   onSendKey: (input: string, id: string) => void
 }
 
 export function MobileTerminalToolbar({
-  ctrlActive,
   keyboardInsetPx,
-  onCtrlToggle,
+  onNewTab,
   onSendKey,
 }: MobileTerminalToolbarProps) {
   return (
@@ -47,17 +43,14 @@ export function MobileTerminalToolbar({
         <div className="inline-flex min-w-full items-center gap-2 pr-2">
           <button
             type="button"
-            onClick={onCtrlToggle}
+            onClick={onNewTab}
             className={cn(
-              'min-h-11 min-w-11 rounded-md border px-2 text-xs font-medium transition-colors',
-              ctrlActive
-                ? 'border-foreground bg-foreground text-background'
-                : 'border-border bg-muted text-foreground',
+              'min-h-11 rounded-md border px-3 text-xs font-semibold transition-colors',
+              'border-emerald-800/30 bg-emerald-600 text-white hover:bg-emerald-500',
             )}
-            aria-pressed={ctrlActive}
-            aria-label="Toggle control modifier"
+            aria-label="Create new tab"
           >
-            Ctrl
+            + New Tab
           </button>
           {TOOLBAR_KEYS.map((key) => (
             <button

@@ -30,6 +30,7 @@ vi.mock('@xterm/xterm', () => ({
     onData: vi.fn(() => ({ dispose: vi.fn() })),
     onTitleChange: vi.fn(() => ({ dispose: vi.fn() })),
     attachCustomKeyEventHandler: vi.fn(),
+    registerLinkProvider: vi.fn(() => ({ dispose: vi.fn() })),
     write: vi.fn(),
     clear: vi.fn(),
     dispose: vi.fn(),
@@ -200,7 +201,7 @@ describe('TerminalView mobile viewport handling', () => {
     expect(terminalContainer.style.height).toBe('')
   })
 
-  it('renders mobile key toolbar and sends tab input', async () => {
+  it('renders mobile key toolbar, creates a new tab, and sends key input', async () => {
     const viewport = createVisualViewportMock(860, 0)
     Object.defineProperty(window, 'visualViewport', { value: viewport, configurable: true })
     Object.defineProperty(window, 'innerHeight', { value: 900, configurable: true })
@@ -219,10 +220,17 @@ describe('TerminalView mobile viewport handling', () => {
     )
 
     expect(screen.getByTestId('mobile-terminal-toolbar')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Send Tab' }))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Create new tab' }))
+    await waitFor(() => {
+      expect(store.getState().tabs.tabs).toHaveLength(2)
+      expect(store.getState().tabs.activeTabId).not.toBe('tab-1')
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Send |' }))
 
     await waitFor(() => {
-      expect(mockSend).toHaveBeenCalledWith({ type: 'terminal.input', terminalId: 'term-1', data: '\t' })
+      expect(mockSend).toHaveBeenCalledWith({ type: 'terminal.input', terminalId: 'term-1', data: '|' })
     })
   })
 })
