@@ -23,12 +23,14 @@ import { useMobile } from '@/hooks/useMobile'
 import { useTurnCompletionNotifications } from '@/hooks/useTurnCompletionNotifications'
 import { useDrag } from '@use-gesture/react'
 import { installCrossTabSync } from '@/store/crossTabSync'
+import { startTabRegistrySync } from '@/store/tabRegistrySync'
 import Sidebar, { AppView } from '@/components/Sidebar'
 import TabBar from '@/components/TabBar'
 import TabContent from '@/components/TabContent'
 import HistoryView from '@/components/HistoryView'
 import SettingsView from '@/components/SettingsView'
 import OverviewView from '@/components/OverviewView'
+import TabsView from '@/components/TabsView'
 import PaneDivider from '@/components/panes/PaneDivider'
 import { AuthRequiredModal } from '@/components/AuthRequiredModal'
 import { SetupWizard } from '@/components/SetupWizard'
@@ -251,6 +253,7 @@ export default function App() {
     let cancelled = false
     let cleanedUp = false
     let cleanup: (() => void) | null = null
+    let stopTabRegistrySync: (() => void) | null = null
     async function bootstrap() {
       try {
         const settings = await api.get('/api/settings')
@@ -282,6 +285,7 @@ export default function App() {
       if (!cancelled) dispatch(fetchNetworkStatus())
 
       const ws = getWsClient()
+      stopTabRegistrySync = startTabRegistrySync(store, ws)
 
       // Set up hello extension to include session IDs for prioritized repair
       ws.setHelloExtensionProvider(() => ({
@@ -412,6 +416,7 @@ export default function App() {
       cancelled = true
       cleanedUp = true
       cleanup?.()
+      stopTabRegistrySync?.()
       void cleanupPromise
     }
   }, [dispatch])
@@ -487,6 +492,7 @@ export default function App() {
     if (view === 'sessions') return <HistoryView onOpenSession={() => setView('terminal')} />
     if (view === 'settings') return <SettingsView onNavigate={setView} onFirewallTerminal={setPendingFirewallCommand} onSharePanel={() => { setCopied(false); setShowSharePanel(true) }} />
     if (view === 'overview') return <OverviewView onOpenTab={() => setView('terminal')} />
+    if (view === 'tabs') return <TabsView onOpenTab={() => setView('terminal')} />
     return (
       <div className="flex flex-col h-full">
         <TabBar />
@@ -539,8 +545,8 @@ export default function App() {
             <button
               onClick={() => setView('overview')}
               className="px-2 py-1 rounded-md bg-amber-100 text-amber-950 hover:bg-amber-200 transition-colors text-xs font-medium"
-              aria-label={`${idleWarningCount} terminal(s) will auto-kill soon`}
-              title="View idle terminals"
+              aria-label={`${idleWarningCount} coding agent terminal(s) will auto-kill soon`}
+              title="View in Panes"
             >
               {idleWarningCount} terminal{idleWarningCount === 1 ? '' : 's'} will auto-kill soon
             </button>

@@ -6,6 +6,12 @@ import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import type { PaneNode } from './paneTypes'
 import { findTabIdForSession } from '@/lib/session-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
+import { recordClosedTabSnapshot } from './tabRegistrySlice'
+import {
+  buildClosedTabRegistryRecord,
+  countPaneLeaves,
+  shouldKeepClosedTab,
+} from '@/lib/tab-registry-snapshot'
 import type { RootState } from './store'
 
 export interface TabsState {
@@ -233,9 +239,34 @@ export const closePaneWithCleanup = createAsyncThunk(
 export const closeTab = createAsyncThunk(
   'tabs/closeTab',
   async (tabId: string, { dispatch, getState }) => {
+    const stateBeforeClose = getState() as RootState
+    const tab = stateBeforeClose.tabs.tabs.find((item) => item.id === tabId)
+    const layout = stateBeforeClose.panes.layouts[tabId]
+    const tabRegistryState = (stateBeforeClose as { tabRegistry?: RootState['tabRegistry'] }).tabRegistry
+    if (tab && layout && tabRegistryState) {
+      const paneCount = countPaneLeaves(layout)
+      const openDurationMs = Math.max(0, Date.now() - (tab.createdAt || Date.now()))
+      const keep = shouldKeepClosedTab({
+        openDurationMs,
+        paneCount,
+        titleSetByUser: !!tab.titleSetByUser,
+      })
+      if (keep) {
+        dispatch(recordClosedTabSnapshot(buildClosedTabRegistryRecord({
+          tab,
+          layout,
+          paneTitles: stateBeforeClose.panes.paneTitles[tabId],
+          deviceId: tabRegistryState.deviceId,
+          deviceLabel: tabRegistryState.deviceLabel,
+          revision: 0,
+          updatedAt: Date.now(),
+        })))
+      }
+    }
+
     // Collect all pane IDs before removing the layout
-    const layout = (getState() as RootState).panes.layouts[tabId]
-    const paneIds = collectPaneIds(layout)
+    const currentLayout = (getState() as RootState).panes.layouts[tabId]
+    const paneIds = collectPaneIds(currentLayout)
 
     dispatch(removeTab(tabId))
     dispatch(removeLayout({ tabId }))
