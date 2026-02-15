@@ -15,7 +15,6 @@ import { configStore } from './config-store.js'
 import { TerminalRegistry, modeSupportsResume } from './terminal-registry.js'
 import { WsHandler } from './ws-handler.js'
 import { SessionsSyncService } from './sessions-sync/service.js'
-import { claudeIndexer } from './claude-indexer.js'
 import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
 import { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { claudeProvider } from './coding-cli/providers/claude.js'
@@ -317,12 +316,6 @@ async function main() {
 	      {},
 	      { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
 	    )
-	    await withPerfSpan(
-	      'claude_refresh',
-	      () => claudeIndexer.refresh(),
-	      {},
-	      { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
-    )
     res.json(migrated)
   })
 
@@ -340,12 +333,6 @@ async function main() {
 	      {},
 	      { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
 	    )
-	    await withPerfSpan(
-	      'claude_refresh',
-	      () => claudeIndexer.refresh(),
-	      {},
-	      { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
-    )
     res.json(migrated)
   })
 
@@ -435,7 +422,6 @@ async function main() {
 	      createdAtOverride,
 	    })
 	    await codingCliIndexer.refresh()
-	    await claudeIndexer.refresh()
 	    res.json(next)
 	  })
 
@@ -445,7 +431,6 @@ async function main() {
 	    const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
 	    await configStore.deleteSession(compositeKey)
 	    await codingCliIndexer.refresh()
-	    await claudeIndexer.refresh()
 	    res.json({ ok: true })
 	  })
 
@@ -454,7 +439,6 @@ async function main() {
 	    if (!projectPath || !color) return res.status(400).json({ error: 'projectPath and color required' })
 	    await configStore.setProjectColor(projectPath, color)
 	    await codingCliIndexer.refresh()
-	    await claudeIndexer.refresh()
 	    res.json({ ok: true })
 	  })
 
@@ -611,12 +595,12 @@ async function main() {
 
     for (const project of projects) {
       for (const session of project.sessions) {
-        // Session association for non-Claude providers (e.g. Codex).
+        // Session association for all providers (Claude, Codex, etc.).
         // Runs on every update — idempotent because findUnassociatedTerminals
         // excludes already-associated terminals.
         // Time guard: only associate if the session is recent relative to the terminal,
         // preventing stale sessions from previous server runs from being matched.
-        if (session.provider !== 'claude' && modeSupportsResume(session.provider) && session.cwd) {
+        if (modeSupportsResume(session.provider) && session.cwd) {
           const unassociated = registry.findUnassociatedTerminals(session.provider, session.cwd)
           if (unassociated.length > 0) {
             const term = unassociated[0]
@@ -689,15 +673,14 @@ async function main() {
     }
   })
 
-  // Claude watcher hooks (for search + session association)
-
-  // One-time session association for new Claude sessions
-  // When Claude creates a session file, associate it with the oldest unassociated
-  // claude-mode terminal matching the session's cwd. This allows the terminal to
-  // resume the session after server restart.
+  // One-time session association for newly discovered Claude sessions.
+  // When the indexer first discovers a session file, associate it with the oldest
+  // unassociated claude-mode terminal matching the session's cwd. This allows the
+  // terminal to resume the session after server restart.
   //
   // Broadcast message type: { type: 'terminal.session.associated', terminalId: string, sessionId: string }
-  claudeIndexer.onNewSession((session) => {
+  codingCliIndexer.onNewSession((session) => {
+    if (session.provider !== 'claude') return
     if (!session.cwd) return
 
     const unassociated = registry.findUnassociatedClaudeTerminals(session.cwd)
@@ -760,26 +743,12 @@ async function main() {
       { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
     )
       .then(() => {
+        sessionRepairService.setFilePathResolver((id) => codingCliIndexer.getFilePathForSession(id))
         startupState.markReady('codingCliIndexer')
         logger.info({ task: 'codingCliIndexer' }, 'Startup task ready')
       })
       .catch((err) => {
         logger.error({ err }, 'Coding CLI indexer failed to start')
-      })
-
-    void withPerfSpan(
-      'claude_indexer_start',
-      () => claudeIndexer.start(),
-      {},
-      { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
-    )
-      .then(() => {
-        sessionRepairService.setFilePathResolver((id) => claudeIndexer.getFilePathForSession(id))
-        startupState.markReady('claudeIndexer')
-        logger.info({ task: 'claudeIndexer' }, 'Startup task ready')
-      })
-      .catch((err) => {
-        logger.error({ err }, 'Claude indexer failed to start')
       })
   }
 
@@ -841,9 +810,8 @@ async function main() {
     // 7. Close port forwards
     portForwardManager.closeAll()
 
-    // 8. Stop session indexers
+    // 8. Stop session indexer
     codingCliIndexer.stop()
-    claudeIndexer.stop()
 
     // 9. Stop session repair service
     await sessionRepairService.stop()
