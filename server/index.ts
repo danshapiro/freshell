@@ -10,7 +10,7 @@ import rateLimit from 'express-rate-limit'
 import { z } from 'zod'
 import { logger, setLogLevel } from './logger.js'
 import { requestLogger } from './request-logger.js'
-import { validateStartupSecurity, httpAuthMiddleware } from './auth.js'
+import { validateStartupSecurity, httpAuthMiddleware, timingSafeCompare } from './auth.js'
 import { configStore } from './config-store.js'
 import { TerminalRegistry, modeSupportsResume } from './terminal-registry.js'
 import { WsHandler } from './ws-handler.js'
@@ -82,11 +82,15 @@ async function main() {
 
   // --- Local file serving for browser pane (cookie auth for iframes) ---
   app.get('/local-file', cookieParser(), (req, res, next) => {
-    const headerToken = req.headers['x-auth-token'] as string | undefined
-    const cookieToken = req.cookies?.['freshell-auth']
+    const headerToken = typeof req.headers['x-auth-token'] === 'string'
+      ? req.headers['x-auth-token']
+      : undefined
+    const cookieToken = typeof req.cookies?.['freshell-auth'] === 'string'
+      ? req.cookies['freshell-auth']
+      : undefined
     const token = headerToken || cookieToken
     const expectedToken = process.env.AUTH_TOKEN
-    if (!expectedToken || token !== expectedToken) {
+    if (!expectedToken || !token || !timingSafeCompare(token, expectedToken)) {
       return res.status(401).json({ error: 'Unauthorized' })
     }
     next()

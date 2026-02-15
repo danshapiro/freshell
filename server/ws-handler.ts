@@ -4,7 +4,7 @@ import WebSocket, { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { logger } from './logger.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
-import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed } from './auth.js'
+import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed, timingSafeCompare } from './auth.js'
 import { modeSupportsResume } from './terminal-registry.js'
 import type { TerminalRegistry, TerminalMode } from './terminal-registry.js'
 import { configStore, type AppSettings } from './config-store.js'
@@ -717,8 +717,15 @@ export class WsHandler {
           'warn',
         )
       })
-    } catch {
-      // ignore
+    } catch (err) {
+      log.warn(
+        {
+          err: err instanceof Error ? err : new Error(String(err)),
+          connectionId: ws.connectionId || 'unknown',
+          messageType: messageType || 'unknown',
+        },
+        'WebSocket send failed',
+      )
     }
   }
 
@@ -1052,7 +1059,7 @@ export class WsHandler {
 
       if (m.type === 'hello') {
         const expected = getRequiredAuthToken()
-        if (!m.token || m.token !== expected) {
+        if (!m.token || !timingSafeCompare(m.token, expected)) {
           log.warn({ event: 'ws_auth_failed', connectionId: ws.connectionId }, 'WebSocket auth failed')
           this.sendError(ws, { code: 'NOT_AUTHENTICATED', message: 'Invalid token' })
           ws.close(CLOSE_CODES.NOT_AUTHENTICATED, 'Invalid token')

@@ -6,6 +6,9 @@ import type { RootState } from './store'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import { nanoid } from 'nanoid'
 
+const CODING_CLI_CREATE_TIMEOUT_MS = 30_000
+const CODING_CLI_CREATE_TIMEOUT_CLEANUP_MS = 60_000
+
 export const createCodingCliTab = createAsyncThunk(
   'codingCli/createTab',
   async (
@@ -42,12 +45,26 @@ export const createCodingCliTab = createAsyncThunk(
       throw err
     }
 
-    return new Promise<string>((resolve, reject) => {
-      const unsub = ws.onMessage((msg) => {
+    let unsub: (() => void) | undefined
+    let timeoutId: ReturnType<typeof setTimeout> | undefined
+    let timeoutCleanupId: ReturnType<typeof setTimeout> | undefined
+    let timedOut = false
+
+    const mainPromise = new Promise<string>((resolve, reject) => {
+      unsub = ws.onMessage((msg) => {
         if (msg.type === 'codingcli.created' && msg.requestId === requestId) {
+          if (timedOut) {
+            // Late success after timeout: best effort cleanup to avoid orphan sessions.
+            ws.send({ type: 'codingcli.kill', sessionId: msg.sessionId })
+            unsub?.()
+            return
+          }
+
+          clearTimeout(timeoutId)
+          clearTimeout(timeoutCleanupId)
           const canceled = (getState() as RootState).codingCli.pendingRequests[requestId]?.canceled
           dispatch(resolveCodingCliRequest({ requestId }))
-          unsub()
+          unsub?.()
           if (canceled) {
             ws.send({ type: 'codingcli.kill', sessionId: msg.sessionId })
             reject(new Error('Canceled'))
@@ -76,9 +93,16 @@ export const createCodingCliTab = createAsyncThunk(
           resolve(msg.sessionId)
         }
         if (msg.type === 'error' && msg.requestId === requestId) {
+          if (timedOut) {
+            unsub?.()
+            return
+          }
+
+          clearTimeout(timeoutId)
+          clearTimeout(timeoutCleanupId)
           const canceled = (getState() as RootState).codingCli.pendingRequests[requestId]?.canceled
           dispatch(resolveCodingCliRequest({ requestId }))
-          unsub()
+          unsub?.()
           if (!canceled && createdTabId) {
             dispatch(
               updateTab({
@@ -99,5 +123,24 @@ export const createCodingCliTab = createAsyncThunk(
         cwd,
       })
     })
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(() => {
+        timedOut = true
+        dispatch(resolveCodingCliRequest({ requestId }))
+        if (createdTabId) {
+          dispatch(updateTab({ id: createdTabId, updates: { status: 'error' } }))
+        }
+
+        // Allow a short grace period to receive a late codingcli.created and kill it.
+        timeoutCleanupId = setTimeout(() => {
+          unsub?.()
+        }, CODING_CLI_CREATE_TIMEOUT_CLEANUP_MS)
+
+        reject(new Error('Coding CLI creation timed out after 30 seconds'))
+      }, CODING_CLI_CREATE_TIMEOUT_MS)
+    })
+
+    return Promise.race([mainPromise, timeoutPromise])
   }
 )

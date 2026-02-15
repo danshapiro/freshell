@@ -51,6 +51,7 @@ export type AppSettings = {
     renderer: 'auto' | 'webgl' | 'canvas'
   }
   defaultCwd?: string
+  allowedFilePaths?: string[]
   logging: {
     debug: boolean
   }
@@ -134,6 +135,7 @@ export const defaultSettings: AppSettings = {
     renderer: 'auto',
   },
   defaultCwd: undefined,
+  allowedFilePaths: undefined,
   logging: {
     debug: resolveDefaultLoggingDebug(),
   },

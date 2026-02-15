@@ -127,7 +127,7 @@ describe('SettingsView Component', () => {
       expect(screen.getByText('Providers and defaults for coding sessions')).toBeInTheDocument()
 
       expect(screen.getByText('Keyboard shortcuts')).toBeInTheDocument()
-      expect(screen.getByText('Tab navigation')).toBeInTheDocument()
+      expect(screen.getByText('Navigation and terminal')).toBeInTheDocument()
     })
 
     it('renders a terminal preview above Appearance', () => {
@@ -1042,6 +1042,8 @@ describe('SettingsView Component', () => {
 
       expect(screen.getByText('Previous tab')).toBeInTheDocument()
       expect(screen.getByText('Next tab')).toBeInTheDocument()
+      expect(screen.getByText('Newline (same as Ctrl+J)')).toBeInTheDocument()
+      expect(screen.getByText('Newline')).toBeInTheDocument()
     })
 
     it('displays keyboard shortcut keys', () => {
