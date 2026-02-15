@@ -538,6 +538,10 @@ export default function App() {
             className="absolute inset-0 bg-black/50 z-10"
             role="presentation"
             onClick={toggleSidebarCollapse}
+            onTouchEnd={(e) => {
+              e.preventDefault()
+              toggleSidebarCollapse()
+            }}
             onKeyDown={(e) => {
               if (e.key === 'Escape') toggleSidebarCollapse()
             }}

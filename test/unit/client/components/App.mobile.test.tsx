@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import App from '@/App'
@@ -189,5 +189,129 @@ describe('App Header - Mobile Touch Targets', () => {
     const sidebarToggle = screen.getByTitle('Hide sidebar')
     expect(sidebarToggle.className).toContain('md:min-h-0')
     expect(sidebarToggle.className).toContain('md:min-w-0')
+  })
+})
+
+describe('App Mobile - Sidebar Backdrop', () => {
+  const originalInnerWidth = window.innerWidth
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    localStorage.clear()
+    localStorage.setItem('freshell.auth-token', 'test-token-abc123')
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/sessions') return Promise.resolve([])
+      return Promise.resolve({})
+    })
+    // Set mobile viewport
+    Object.defineProperty(window, 'innerWidth', { value: 500, writable: true })
+  })
+
+  afterEach(() => {
+    cleanup()
+    Object.defineProperty(window, 'innerWidth', {
+      value: originalInnerWidth,
+      writable: true,
+    })
+  })
+
+  it('shows backdrop overlay when sidebar is open on mobile', async () => {
+    renderApp()
+
+    // Wait for auto-collapse on mobile
+    await waitFor(() => {
+      expect(screen.getByTitle('Show sidebar')).toBeInTheDocument()
+    })
+
+    // Open the sidebar
+    fireEvent.click(screen.getByTitle('Show sidebar'))
+
+    await waitFor(() => {
+      expect(screen.getByTestId('mock-sidebar')).toBeInTheDocument()
+    })
+
+    // Backdrop should be present
+    const backdrop = screen.getByRole('presentation')
+    expect(backdrop.className).toContain('bg-black/50')
+    expect(backdrop.className).toContain('absolute')
+    expect(backdrop.className).toContain('inset-0')
+  })
+
+  it('closes sidebar when backdrop is clicked', async () => {
+    renderApp()
+
+    await waitFor(() => {
+      expect(screen.getByTitle('Show sidebar')).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByTitle('Show sidebar'))
+
+    await waitFor(() => {
+      expect(screen.getByTestId('mock-sidebar')).toBeInTheDocument()
+    })
+
+    const backdrop = screen.getByRole('presentation')
+    fireEvent.click(backdrop)
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('mock-sidebar')).not.toBeInTheDocument()
+      expect(screen.getByTitle('Show sidebar')).toBeInTheDocument()
+    })
+  })
+
+  it('closes sidebar on touchEnd and calls preventDefault for iOS reliability', async () => {
+    renderApp()
+
+    await waitFor(() => {
+      expect(screen.getByTitle('Show sidebar')).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByTitle('Show sidebar'))
+
+    await waitFor(() => {
+      expect(screen.getByTestId('mock-sidebar')).toBeInTheDocument()
+    })
+
+    const backdrop = screen.getByRole('presentation')
+
+    // Fire touchEnd — React's fireEvent returns the event object, but to
+    // check preventDefault we need to create it ourselves.
+    const touchEndEvent = new TouchEvent('touchend', {
+      bubbles: true,
+      cancelable: true,
+    })
+    const preventDefaultSpy = vi.spyOn(touchEndEvent, 'preventDefault')
+
+    backdrop.dispatchEvent(touchEndEvent)
+
+    expect(preventDefaultSpy).toHaveBeenCalled()
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('mock-sidebar')).not.toBeInTheDocument()
+      expect(screen.getByTitle('Show sidebar')).toBeInTheDocument()
+    })
+  })
+
+  it('closes sidebar when Escape is pressed on backdrop', async () => {
+    renderApp()
+
+    await waitFor(() => {
+      expect(screen.getByTitle('Show sidebar')).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByTitle('Show sidebar'))
+
+    await waitFor(() => {
+      expect(screen.getByTestId('mock-sidebar')).toBeInTheDocument()
+    })
+
+    const backdrop = screen.getByRole('presentation')
+    fireEvent.keyDown(backdrop, { key: 'Escape' })
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('mock-sidebar')).not.toBeInTheDocument()
+    })
   })
 })
