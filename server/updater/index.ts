@@ -13,9 +13,11 @@ export interface UpdateCheckResult {
 
 function printProgress(progress: UpdateProgress): void {
   const labels: Record<string, string> = {
+    'verify-tag': 'Verifying release signature',
     'git-pull': 'Pulling latest changes',
     'npm-install': 'Installing dependencies',
-    'build': 'Building application'
+    'build': 'Building application',
+    'rollback': 'Rolling back to previous version'
   }
 
   const label = labels[progress.step] || progress.step
@@ -49,10 +51,21 @@ export async function runUpdateCheck(currentVersion: string): Promise<UpdateChec
 
   console.log('\nUpdating Freshell...\n')
 
-  const updateResult = await executeUpdate(printProgress)
+  const targetTag = `v${checkResult.latestVersion}`
+  const requireGpgVerification = process.env.REQUIRE_GPG_VERIFICATION === 'true'
+
+  const updateResult = await executeUpdate(printProgress, undefined, {
+    targetTag,
+    requireGpgVerification
+  })
 
   if (!updateResult.success) {
-    console.log('\n\x1b[31mUpdate failed!\x1b[0m Please try updating manually.\n')
+    const rollbackStatus = updateResult.rolledBack === true
+      ? ' Rolled back to previous version.'
+      : updateResult.rolledBack === false
+        ? ' Rollback failed — manual recovery may be needed.'
+        : ''
+    console.log(`\n\x1b[31mUpdate failed!\x1b[0m${rollbackStatus} Please try updating manually.\n`)
     return { action: 'error', error: updateResult.error }
   }
 

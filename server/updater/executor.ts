@@ -34,6 +34,39 @@ function findProjectRoot(startDir: string = __dirname): string {
 
 export interface ExecuteUpdateOptions {
   projectRoot?: string
+  targetTag?: string
+  requireGpgVerification?: boolean
+}
+
+function extractErrorMessage(err: unknown): string {
+  if (err instanceof Error) {
+    const execErr = err as Error & { stderr?: string }
+    return execErr.stderr ? `${err.message}\n${execErr.stderr}` : err.message
+  }
+  return String(err)
+}
+
+/**
+ * Attempt to roll back to a previous commit SHA after a failed update.
+ * Runs git reset --hard to restore code, then npm ci to restore dependencies.
+ */
+async function rollback(
+  snapshotSha: string,
+  projectRoot: string,
+  onProgress: (progress: UpdateProgress) => void,
+  execAsync: ExecAsyncFn
+): Promise<boolean> {
+  onProgress({ step: 'rollback', status: 'running' })
+  try {
+    await execAsync(`git reset --hard ${snapshotSha}`, { cwd: projectRoot })
+    await execAsync('npm ci', { cwd: projectRoot })
+    onProgress({ step: 'rollback', status: 'complete' })
+    return true
+  } catch (rollbackErr: unknown) {
+    const rollbackMsg = extractErrorMessage(rollbackErr)
+    onProgress({ step: 'rollback', status: 'error', error: rollbackMsg })
+    return false
+  }
 }
 
 export async function executeUpdate(
@@ -43,6 +76,41 @@ export async function executeUpdate(
 ): Promise<UpdateResult> {
   const projectRoot = options.projectRoot ?? findProjectRoot()
 
+  // Snapshot current HEAD for rollback
+  let snapshotSha: string | undefined
+  try {
+    const { stdout } = await execAsync('git rev-parse HEAD', { cwd: projectRoot })
+    snapshotSha = stdout.trim()
+  } catch {
+    // If we can't get the SHA, we can't rollback — continue without it
+  }
+
+  // GPG tag verification (optional)
+  if (options.targetTag) {
+    onProgress({ step: 'verify-tag', status: 'running' })
+
+    // Fetch the tag first so git verify-tag can find it
+    try {
+      await execAsync(`git fetch origin tag ${options.targetTag}`, { cwd: projectRoot })
+    } catch {
+      // Tag fetch failed — verification will also fail, handled below
+    }
+
+    try {
+      await execAsync(`git verify-tag ${options.targetTag}`, { cwd: projectRoot })
+      onProgress({ step: 'verify-tag', status: 'complete' })
+    } catch (err: unknown) {
+      const errorMsg = extractErrorMessage(err)
+      if (options.requireGpgVerification) {
+        onProgress({ step: 'verify-tag', status: 'error', error: errorMsg })
+        return { success: false, error: errorMsg, snapshotSha }
+      }
+      // Permissive mode: warn but continue
+      onProgress({ step: 'verify-tag', status: 'error', error: errorMsg })
+    }
+  }
+
+  // Core update steps
   const steps: { step: UpdateStep; command: string }[] = [
     { step: 'git-pull', command: 'git pull' },
     { step: 'npm-install', command: 'npm ci' },
@@ -56,18 +124,19 @@ export async function executeUpdate(
       await execAsync(command, { cwd: projectRoot })
       onProgress({ step, status: 'complete' })
     } catch (err: unknown) {
-      let errorMsg: string
-      if (err instanceof Error) {
-        // ExecException from child_process includes stderr in the error
-        const execErr = err as Error & { stderr?: string }
-        errorMsg = execErr.stderr ? `${err.message}\n${execErr.stderr}` : err.message
-      } else {
-        errorMsg = String(err)
-      }
+      const errorMsg = extractErrorMessage(err)
       onProgress({ step, status: 'error', error: errorMsg })
-      return { success: false, error: errorMsg }
+
+      // Rollback if we have a snapshot and this isn't the git-pull step
+      // (git-pull failure means code hasn't changed yet, no rollback needed)
+      if (snapshotSha && step !== 'git-pull') {
+        const rolledBack = await rollback(snapshotSha, projectRoot, onProgress, execAsync)
+        return { success: false, error: errorMsg, snapshotSha, rolledBack }
+      }
+
+      return { success: false, error: errorMsg, snapshotSha }
     }
   }
 
-  return { success: true }
+  return { success: true, snapshotSha }
 }

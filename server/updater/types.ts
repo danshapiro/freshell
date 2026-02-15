@@ -11,7 +11,7 @@ export interface UpdateCheckResult {
 }
 
 // Executor types
-export type UpdateStep = 'git-pull' | 'npm-install' | 'build'
+export type UpdateStep = 'verify-tag' | 'git-pull' | 'npm-install' | 'build' | 'rollback'
 export type UpdateStatus = 'running' | 'complete' | 'error'
 
 export interface UpdateProgress {
@@ -23,4 +23,6 @@ export interface UpdateProgress {
 export interface UpdateResult {
   success: boolean
   error?: string
+  snapshotSha?: string
+  rolledBack?: boolean
 }

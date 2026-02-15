@@ -124,7 +124,14 @@ describe('update orchestrator', () => {
           await runUpdateCheck('0.1.0')
 
           expect(executeUpdate).toHaveBeenCalledTimes(1)
-          expect(executeUpdate).toHaveBeenCalledWith(expect.any(Function))
+          expect(executeUpdate).toHaveBeenCalledWith(
+            expect.any(Function),
+            undefined,
+            expect.objectContaining({
+              targetTag: expect.any(String),
+              requireGpgVerification: expect.any(Boolean)
+            })
+          )
         })
 
         it('returns action: updated with newVersion on success', async () => {
