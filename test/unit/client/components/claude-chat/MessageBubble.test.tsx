@@ -53,7 +53,7 @@ describe('MessageBubble', () => {
         content={[{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls -la' } }]}
       />
     )
-    expect(screen.getByText('Bash')).toBeInTheDocument()
+    expect(screen.getByText('Bash:')).toBeInTheDocument()
   })
 
   it('renders timestamp and model', () => {
@@ -109,7 +109,7 @@ describe('MessageBubble display toggles', () => {
         showTools={false}
       />
     )
-    expect(screen.queryByText('Bash')).not.toBeInTheDocument()
+    expect(screen.queryByText('Bash:')).not.toBeInTheDocument()
   })
 
   it('hides tool_result blocks when showTools is false', () => {
@@ -120,7 +120,7 @@ describe('MessageBubble display toggles', () => {
         showTools={false}
       />
     )
-    expect(screen.queryByText('Result')).not.toBeInTheDocument()
+    expect(screen.queryByText('Result:')).not.toBeInTheDocument()
   })
 
   it('shows timestamp when showTimecodes is true', () => {
@@ -156,7 +156,7 @@ describe('MessageBubble display toggles', () => {
       />
     )
     expect(screen.getByText(/Let me think/)).toBeInTheDocument()
-    expect(screen.getByText('Bash')).toBeInTheDocument()
+    expect(screen.getByText('Bash:')).toBeInTheDocument()
     expect(screen.getByRole('article').querySelector('time')).not.toBeInTheDocument()
   })
 })

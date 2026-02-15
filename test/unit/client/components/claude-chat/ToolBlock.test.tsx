@@ -8,7 +8,7 @@ describe('ToolBlock', () => {
 
   it('renders tool name and preview', () => {
     render(<ToolBlock name="Bash" input={{ command: 'ls -la' }} status="running" />)
-    expect(screen.getByText('Bash')).toBeInTheDocument()
+    expect(screen.getByText('Bash:')).toBeInTheDocument()
     expect(screen.getByText('$ ls -la')).toBeInTheDocument()
   })
 
@@ -28,7 +28,7 @@ describe('ToolBlock', () => {
 
   it('shows error styling when isError is true', () => {
     render(<ToolBlock name="Result" output="Command failed" isError={true} status="complete" />)
-    expect(screen.getByText('Result')).toBeInTheDocument()
+    expect(screen.getByText('Result:')).toBeInTheDocument()
   })
 
   // --- New: smart header tests ---

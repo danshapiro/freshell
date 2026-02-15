@@ -1,5 +1,5 @@
 import { useState, memo, useMemo } from 'react'
-import { ChevronRight, Terminal, FileText, Eye, Pencil, Search, Globe, Loader2, Check, X } from 'lucide-react'
+import { ChevronRight, Loader2, Check, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import DiffView from './DiffView'
 
@@ -11,17 +11,6 @@ interface ToolBlockProps {
   status: 'running' | 'complete'
   /** When true, tool block starts expanded (used for recent tools). Default: false. */
   initialExpanded?: boolean
-}
-
-const TOOL_ICONS: Record<string, typeof Terminal> = {
-  Bash: Terminal,
-  Read: Eye,
-  Write: FileText,
-  Edit: Pencil,
-  Grep: Search,
-  Glob: Search,
-  WebFetch: Globe,
-  WebSearch: Globe,
 }
 
 /** Generate a context-rich one-line preview for the tool header. */
@@ -82,7 +71,6 @@ function getResultSummary(name: string, output?: string, isError?: boolean): str
 
 function ToolBlock({ name, input, output, isError, status, initialExpanded }: ToolBlockProps) {
   const [expanded, setExpanded] = useState(initialExpanded ?? false)
-  const Icon = TOOL_ICONS[name] || Terminal
   const preview = useMemo(() => getToolPreview(name, input), [name, input])
   const resultSummary = useMemo(
     () => status === 'complete' ? getResultSummary(name, output, isError) : null,
@@ -106,8 +94,7 @@ function ToolBlock({ name, input, output, isError, status, initialExpanded }: To
         aria-label={`${name} tool call`}
       >
         <ChevronRight className={cn('h-3 w-3 shrink-0 transition-transform', expanded && 'rotate-90')} />
-        <Icon className="h-3 w-3 shrink-0 text-muted-foreground" />
-        <span className="font-medium">{name}</span>
+        <span className="font-medium">{name}:</span>
         {preview && <span className="truncate text-muted-foreground font-mono">{preview}</span>}
         {resultSummary && (
           <span className={cn(
