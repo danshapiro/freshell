@@ -321,7 +321,7 @@ export default function TabBar() {
               />
             ))}
             <button
-              className="flex-shrink-0 ml-1 mb-1 p-1 rounded-md border border-dashed border-muted-foreground/40 text-muted-foreground hover:text-foreground hover:border-foreground/50 hover:bg-muted/30 transition-colors"
+              className="flex-shrink-0 ml-1 mb-1 p-1 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded-md border border-dashed border-muted-foreground/40 text-muted-foreground hover:text-foreground hover:border-foreground/50 hover:bg-muted/30 transition-colors"
               title="New shell tab"
               aria-label="New shell tab"
               onClick={() => dispatch(addTab({ mode: 'shell' }))}

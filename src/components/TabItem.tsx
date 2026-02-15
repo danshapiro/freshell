@@ -171,7 +171,7 @@ export default function TabItem({
 
       <button
         className={cn(
-          'ml-0.5 p-0.5 rounded transition-opacity',
+          'ml-0.5 p-0.5 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded transition-opacity',
           isActive
             ? 'opacity-60 hover:opacity-100'
             : 'opacity-0 group-hover:opacity-60 hover:!opacity-100'
