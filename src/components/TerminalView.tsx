@@ -67,7 +67,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const restoreFlagRef = useRef(false)
   const turnCompleteSignalStateRef = useRef(createTurnCompleteSignalParserState())
   const warnExternalLinksRef = useRef(settings.terminal.warnExternalLinks)
-  const debugRef = useRef(!!(settings as any).logging?.debug)
+  const debugRef = useRef(!!settings.logging?.debug)
   const attentionDismissRef = useRef(settings.panes?.attentionDismiss ?? 'click')
 
   // Extract terminal-specific fields (safe because we check kind later)
@@ -110,7 +110,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   hasAttentionRef.current = hasAttention
   hasPaneAttentionRef.current = hasPaneAttention
   attentionDismissRef.current = settings.panes?.attentionDismiss ?? 'click'
-  debugRef.current = !!(settings as any).logging?.debug
+  debugRef.current = !!settings.logging?.debug
 
   const shouldFocusActiveTerminal = !hidden && activeTabId === tabId && activePaneId === paneId
 
