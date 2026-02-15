@@ -86,14 +86,14 @@ git commit -m "test: codex session binding ownership invariants and duplicate-as
 **Step 1: Implement minimal authority with explicit result types**
 
 ```ts
-export type SessionBindingKey = `${CodingCliProviderName}:${string}`
+import { makeSessionKey, type SessionCompositeKey, type CodingCliProviderName } from './coding-cli/types.js'
 
 export class SessionBindingAuthority {
-  private bySession = new Map<SessionBindingKey, string>()
-  private byTerminal = new Map<string, SessionBindingKey>()
+  private bySession = new Map<SessionCompositeKey, string>()
+  private byTerminal = new Map<string, SessionCompositeKey>()
 
   bind(input: { provider: CodingCliProviderName; sessionId: string; terminalId: string }) {
-    const key = `${input.provider}:${input.sessionId}` as SessionBindingKey
+    const key = makeSessionKey(input.provider, input.sessionId)
     const owner = this.bySession.get(key)
     if (owner && owner !== input.terminalId) return { ok: false as const, reason: 'session_already_owned', owner }
     const existing = this.byTerminal.get(input.terminalId)
@@ -104,12 +104,12 @@ export class SessionBindingAuthority {
   }
 
   ownerForSession(provider: CodingCliProviderName, sessionId: string): string | undefined {
-    return this.bySession.get(`${provider}:${sessionId}` as SessionBindingKey)
+    return this.bySession.get(makeSessionKey(provider, sessionId))
   }
 
-  unbindTerminal(terminalId: string): { ok: boolean; key?: SessionBindingKey } {
+  unbindTerminal(terminalId: string): { ok: boolean; key?: SessionCompositeKey; reason?: 'not_bound' } {
     const key = this.byTerminal.get(terminalId)
-    if (!key) return { ok: false }
+    if (!key) return { ok: false, reason: 'not_bound' }
     this.byTerminal.delete(terminalId)
     if (this.bySession.get(key) === terminalId) this.bySession.delete(key)
     return { ok: true, key }
@@ -122,7 +122,8 @@ export class SessionBindingAuthority {
 ```ts
 bindSession(terminalId: string, mode: TerminalMode, sessionId: string): BindResult {
   if (!modeSupportsResume(mode)) return { ok: false, reason: 'mode_not_bindable' }
-  const auth = this.bindingAuthority.bind({ provider: mode, sessionId, terminalId })
+  const provider = mode as CodingCliProviderName
+  const auth = this.bindingAuthority.bind({ provider, sessionId, terminalId })
   if (!auth.ok) return auth
   const term = this.terminals.get(terminalId)
   if (!term) return { ok: false, reason: 'terminal_missing' }
@@ -184,7 +185,7 @@ it('does not rebind when authority reports existing owner', () => {
 **Step 2: Implement coordinator that tracks last seen session watermark**
 
 ```ts
-type SessionWatermark = Map<string, number> // key: provider:sessionId -> updatedAt
+type SessionWatermark = Map<SessionCompositeKey, number> // provider+sessionId -> updatedAt
 
 collectNewOrAdvanced(projects: ProjectGroup[]): CodingCliSession[] {
   // emit only sessions whose updatedAt increased (or unseen)
@@ -259,11 +260,13 @@ it('emits conflict log + unbinds duplicate records during lookup repair', async 
 **Step 2: Add canonical lookup API in registry**
 
 ```ts
-findCanonicalRunningTerminalBySession(mode: TerminalMode, sessionId: string) {
-  // 1) authoritative owner lookup
-  // 2) legacy fallback scan (records with resumeSessionId set but no authority entry)
-  // 3) repair: choose earliest created running terminal as canonical owner
-  // 4) quarantine duplicates: clear duplicate resumeSessionId and unbind terminal mapping
+getCanonicalRunningTerminalBySession(mode: TerminalMode, sessionId: string) {
+  // Pure lookup: authority owner first; no mutation in this method.
+}
+
+repairLegacySessionOwners(mode: TerminalMode, sessionId: string) {
+  // Legacy = terminal has resumeSessionId set but authority has no owner mapping yet.
+  // Choose earliest-created running terminal as owner, bind it, clear duplicates.
 }
 ```
 
@@ -271,7 +274,11 @@ findCanonicalRunningTerminalBySession(mode: TerminalMode, sessionId: string) {
 
 ```ts
 if (modeSupportsResume(mode) && effectiveResumeSessionId) {
-  const existing = this.registry.findCanonicalRunningTerminalBySession(mode, effectiveResumeSessionId)
+  let existing = this.registry.getCanonicalRunningTerminalBySession(mode, effectiveResumeSessionId)
+  if (!existing) {
+    this.registry.repairLegacySessionOwners(mode, effectiveResumeSessionId)
+    existing = this.registry.getCanonicalRunningTerminalBySession(mode, effectiveResumeSessionId)
+  }
   if (existing) { /* attach + early return */ }
 }
 ```
@@ -333,9 +340,16 @@ serverInstanceId: z.string().min(1)
 ```
 
 ```ts
-// App bootstrap ready handler
-if (msg.type === 'ready' && typeof msg.serverInstanceId === 'string') {
-  dispatch(setServerInstanceId(msg.serverInstanceId))
+const ReadyMessageSchema = z.object({
+  type: z.literal('ready'),
+  timestamp: z.string(),
+  serverInstanceId: z.string().min(1),
+})
+
+// App bootstrap ready handler (schema-validated)
+if (msg.type === 'ready') {
+  const parsed = ReadyMessageSchema.safeParse(msg)
+  if (parsed.success) dispatch(setServerInstanceId(parsed.data.serverInstanceId))
 }
 ```
 
@@ -393,10 +407,10 @@ it('drops resumeSessionId when opening remote tab copy from different serverInst
 })
 ```
 
-**Step 2: Add `sessionRef` payload model**
+**Step 2: Add `sessionRef` payload model (reusing existing extract helper)**
 
 ```ts
-type SessionRef = {
+type SessionLocator = {
   provider: CodingCliProviderName
   sessionId: string
   serverInstanceId?: string
@@ -412,6 +426,10 @@ return {
 }
 ```
 
+Migration note:
+- Keep writing both `sessionRef` and `resumeSessionId` for one compatibility cycle.
+- After migration lands and old records age out, remove `resumeSessionId` from registry snapshot payload writes (runtime state still keeps it in live pane content).
+
 **Step 3: Gate rehydration in `TabsView.sanitizePaneSnapshot`**
 
 ```ts
@@ -422,8 +440,8 @@ return { kind: 'terminal', mode, shell, resumeSessionId: safeResumeId, sessionRe
 
 ```ts
 // session-utils integration (avoid split-brain semantics):
-// prefer explicit sessionRef when present; fallback to resumeSessionId for legacy panes
-function extractSessionRef(content: PaneContent): SessionRef | undefined {
+// extend existing extractSessionRef; do not introduce a second helper.
+function extractSessionRef(content: PaneContent): SessionLocator | undefined {
   if ('sessionRef' in content && content.sessionRef?.provider && content.sessionRef?.sessionId) {
     return content.sessionRef
   }
@@ -481,7 +499,9 @@ it('keeps codex sessions bound to original panes after reconnect and repeated in
 
 ```ts
 it('opens remote tab copy without auto-resuming foreign machine codex sessions', async () => {
-  // open copy from remote record, confirm created pane has undefined resumeSessionId
+  // open copy from remote record, confirm created pane has:
+  //   resumeSessionId === undefined
+  //   sessionRef.provider/sessionRef.sessionId preserved for explicit user-driven resume
 })
 ```
 
