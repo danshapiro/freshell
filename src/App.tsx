@@ -612,6 +612,9 @@ export default function App() {
             )}
           </div>
         )}
+        {/* TODO(#5): When fullscreen mode (#29) is implemented, add a vertical swipe-down
+             gesture here to reveal the hidden tab bar. The @use-gesture/react useDrag
+             infrastructure from the sidebar swipe can be extended for this. */}
         <div
           className="flex-1 min-w-0 flex flex-col"
           {...(isMobile ? bindTabSwipe() : {})}
