@@ -66,13 +66,19 @@ export function isPathAllowed(targetPath: string, allowedRoots: string[] | undef
   }
 
   const normalizedTarget = path.normalize(realTarget)
+  const compareTarget = process.platform === 'win32'
+    ? normalizedTarget.toLowerCase()
+    : normalizedTarget
 
   for (const root of allowedRoots) {
-    const normalizedRoot = path.normalize(path.resolve(root))
+    const normalizedRoot = normalizePath(root)
+    const compareRoot = process.platform === 'win32'
+      ? normalizedRoot.toLowerCase()
+      : normalizedRoot
     // Ensure prefix match is at a directory boundary
     if (
-      normalizedTarget === normalizedRoot ||
-      normalizedTarget.startsWith(normalizedRoot + path.sep)
+      compareTarget === compareRoot ||
+      compareTarget.startsWith(compareRoot + path.sep)
     ) {
       return true
     }

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import path from 'path'
+import os from 'os'
 import { isPathAllowed, normalizePath, resolveUserPath } from '../../../server/path-utils'
 
 // Mock logger to prevent console output in tests
@@ -60,6 +61,12 @@ describe('path-utils', () => {
 
       it('allows path inside second allowed root', () => {
         expect(isPathAllowed('/tmp/workspace/file.txt', allowedRoots)).toBe(true)
+      })
+
+      it('allows paths for roots configured with tilde', () => {
+        const homeProjectsRoot = '~/projects'
+        const targetPath = path.join(os.homedir(), 'projects', 'app', 'index.ts')
+        expect(isPathAllowed(targetPath, [homeProjectsRoot])).toBe(true)
       })
 
       it('blocks path outside all allowed directories', () => {

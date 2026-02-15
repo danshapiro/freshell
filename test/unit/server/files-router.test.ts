@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import path from 'path'
+import os from 'os'
 
 // Mock logger before importing files-router
 vi.mock('../../../server/logger', () => ({
@@ -116,6 +117,21 @@ describe('files-router path validation', () => {
 
       expect(res.status).toBe(403)
       expect(res.body.error).toBe('Path not allowed')
+    })
+
+    it('resolves tilde paths consistently for validation and file read', async () => {
+      const homeDir = os.homedir()
+      mockGetSettings.mockResolvedValue({ allowedFilePaths: [homeDir] })
+      mockStat.mockResolvedValue({ isDirectory: () => false, size: 42, mtime: new Date() })
+      mockReadFile.mockResolvedValue('file content')
+
+      const res = await request(app)
+        .get('/api/files/read')
+        .query({ path: '~/projects/notes.txt' })
+
+      expect(res.status).toBe(200)
+      expect(mockStat).toHaveBeenCalledWith(path.join(homeDir, 'projects', 'notes.txt'))
+      expect(mockReadFile).toHaveBeenCalledWith(path.join(homeDir, 'projects', 'notes.txt'), 'utf-8')
     })
   })
 

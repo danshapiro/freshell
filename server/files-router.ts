@@ -34,7 +34,7 @@ filesRouter.get('/read', validatePath, async (req, res) => {
     return res.status(400).json({ error: 'path query parameter required' })
   }
 
-  const resolved = path.resolve(filePath)
+  const resolved = path.resolve(resolveUserPath(filePath))
 
   try {
     const stat = await fsp.stat(resolved)
@@ -66,7 +66,7 @@ filesRouter.post('/write', validatePath, async (req, res) => {
     return res.status(400).json({ error: 'content is required' })
   }
 
-  const resolved = path.resolve(filePath)
+  const resolved = path.resolve(resolveUserPath(filePath))
 
   try {
     // Create parent directories if needed
@@ -161,7 +161,7 @@ filesRouter.post('/open', validatePath, async (req, res) => {
     return res.status(400).json({ error: 'path is required' })
   }
 
-  const resolved = path.resolve(filePath)
+  const resolved = path.resolve(resolveUserPath(filePath))
 
   try {
     await fsp.stat(resolved)
