@@ -98,6 +98,19 @@ describe('TabBar mobile touch targets', () => {
     expect(newTabButton.className).toMatch(/min-w-11/)
   })
 
+  it('tab bar container has h-12 for mobile and md:h-10 for desktop', () => {
+    const store = createStore(defaultTabsState, defaultPanesState)
+    render(
+      <Provider store={store}>
+        <TabBar />
+      </Provider>
+    )
+    // Find the tab bar - it's a div with the z-20 class
+    const tabBar = screen.getByRole('button', { name: 'New shell tab' }).closest('.z-20')
+    expect(tabBar?.className).toMatch(/h-12/)
+    expect(tabBar?.className).toMatch(/md:h-10/)
+  })
+
   it('tab close button has min-h-11 min-w-11 class for mobile touch target', () => {
     const store = createStore(defaultTabsState, defaultPanesState)
 
