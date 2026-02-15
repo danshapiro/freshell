@@ -204,8 +204,8 @@ describe('Sidebar mobile touch targets', () => {
       vi.advanceTimersByTime(100)
     })
 
-    // Nav buttons have title attributes like "Terminal (Ctrl+B T)"
-    const terminalNavButton = screen.getByTitle('Terminal (Ctrl+B T)')
+    // Nav buttons have title attributes like "Coding Agents (Ctrl+B T)"
+    const terminalNavButton = screen.getByTitle('Coding Agents (Ctrl+B T)')
     expect(terminalNavButton.className).toMatch(/py-2\.5/)
     expect(terminalNavButton.className).toMatch(/md:py-1\.5/)
     expect(terminalNavButton.className).toMatch(/min-h-11/)

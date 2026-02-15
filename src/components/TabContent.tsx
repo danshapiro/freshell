@@ -1,5 +1,6 @@
 import { PaneLayout } from './panes'
 import SessionView from './SessionView'
+import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { useAppSelector } from '@/store/hooks'
 import type { PaneContentInput } from '@/store/paneTypes'
 
@@ -63,7 +64,9 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
   // Use PaneLayout for all terminal-based tabs
   return (
     <div className={hidden ? 'tab-hidden' : 'tab-visible h-full w-full'}>
-      <PaneLayout tabId={tabId} defaultContent={defaultContent} hidden={hidden} />
+      <ErrorBoundary key={tabId} label="Tab">
+        <PaneLayout tabId={tabId} defaultContent={defaultContent} hidden={hidden} />
+      </ErrorBoundary>
     </div>
   )
 }

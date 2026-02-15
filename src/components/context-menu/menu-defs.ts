@@ -144,9 +144,10 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
 
   if (target.kind === 'global') {
     const views: Array<{ id: AppView; label: string }> = [
-      { id: 'terminal', label: 'Terminal' },
-      { id: 'sessions', label: 'Sessions' },
-      { id: 'overview', label: 'Overview' },
+      { id: 'terminal', label: 'Coding Agents' },
+      { id: 'tabs', label: 'Tabs' },
+      { id: 'overview', label: 'Panes' },
+      { id: 'sessions', label: 'Projects' },
       { id: 'settings', label: 'Settings' },
     ]
 

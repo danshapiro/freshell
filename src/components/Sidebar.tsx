@@ -16,7 +16,7 @@ import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { ProviderIcon } from '@/components/icons/provider-icons'
 import { getActiveSessionRefForTab } from '@/lib/session-utils'
 
-export type AppView = 'terminal' | 'sessions' | 'overview' | 'settings'
+export type AppView = 'terminal' | 'tabs' | 'sessions' | 'overview' | 'settings'
 
 type SessionItem = SidebarSessionItem
 
@@ -250,9 +250,10 @@ export default function Sidebar({
   }, [dispatch, onNavigate, activeTabId, store])
 
   const nav = [
-    { id: 'terminal' as const, label: 'Terminal', icon: Terminal, shortcut: 'T' },
-    { id: 'sessions' as const, label: 'Sessions', icon: History, shortcut: 'S' },
-    { id: 'overview' as const, label: 'Overview', icon: LayoutGrid, shortcut: 'O' },
+    { id: 'terminal' as const, label: 'Coding Agents', icon: Terminal, shortcut: 'T' },
+    { id: 'tabs' as const, label: 'Tabs', icon: LayoutGrid, shortcut: 'B' },
+    { id: 'overview' as const, label: 'Panes', icon: LayoutGrid, shortcut: 'O' },
+    { id: 'sessions' as const, label: 'Projects', icon: History, shortcut: 'P' },
     { id: 'settings' as const, label: 'Settings', icon: Settings, shortcut: ',' },
   ]
 

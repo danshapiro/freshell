@@ -87,7 +87,7 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
       <div className="px-6 py-5 border-b border-border/30">
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-xl font-semibold tracking-tight">Overview</h1>
+            <h1 className="text-xl font-semibold tracking-tight">Panes</h1>
             <p className="text-sm text-muted-foreground">
               {runningTerminals.length} running, {exitedTerminals.length} exited
             </p>

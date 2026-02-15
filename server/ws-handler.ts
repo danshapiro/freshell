@@ -7,7 +7,7 @@ import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-l
 import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed, timingSafeCompare } from './auth.js'
 import { modeSupportsResume } from './terminal-registry.js'
 import type { TerminalRegistry, TerminalMode } from './terminal-registry.js'
-import { configStore, type AppSettings } from './config-store.js'
+import { configStore, type AppSettings, type ConfigReadError } from './config-store.js'
 import type { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import type { ProjectGroup } from './coding-cli/types.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
@@ -16,6 +16,8 @@ import type { SessionScanResult, SessionRepairResult } from './session-scanner/t
 import { isValidClaudeSessionId } from './claude-session-id.js'
 import type { SdkBridge } from './sdk-bridge.js'
 import type { SdkServerMessage } from './sdk-bridge-types.js'
+import { TabRegistryRecordSchema } from './tabs-registry/types.js'
+import type { TabsRegistryStore } from './tabs-registry/store.js'
 import {
   SdkCreateSchema,
   SdkSendSchema,
@@ -261,6 +263,20 @@ const TerminalMetaListSchema = z.object({
   requestId: z.string().min(1),
 })
 
+const TabsSyncPushSchema = z.object({
+  type: z.literal('tabs.sync.push'),
+  deviceId: z.string().min(1),
+  deviceLabel: z.string().min(1),
+  records: z.array(TabRegistryRecordSchema),
+})
+
+const TabsSyncQuerySchema = z.object({
+  type: z.literal('tabs.sync.query'),
+  requestId: z.string().min(1),
+  deviceId: z.string().min(1),
+  rangeDays: z.number().int().positive().optional(),
+})
+
 const CodingCliProviderSchema = z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
 
 const TokenSummarySchema = z.object({
@@ -336,6 +352,8 @@ const ClientMessageSchema = z.discriminatedUnion('type', [
   TerminalKillSchema,
   TerminalListSchema,
   TerminalMetaListSchema,
+  TabsSyncPushSchema,
+  TabsSyncQuerySchema,
   CodingCliCreateSchema,
   CodingCliInputSchema,
   CodingCliKillSchema,
@@ -369,6 +387,10 @@ type HandshakeSnapshot = {
   settings?: AppSettings
   projects?: ProjectGroup[]
   perfLogging?: boolean
+  configFallback?: {
+    reason: ConfigReadError
+    backupExists: boolean
+  }
 }
 
 type HandshakeSnapshotProvider = () => Promise<HandshakeSnapshot>
@@ -384,6 +406,7 @@ export class WsHandler {
   private sessionRepairService?: SessionRepairService
   private handshakeSnapshotProvider?: HandshakeSnapshotProvider
   private terminalMetaListProvider?: () => TerminalMeta[]
+  private tabsRegistryStore?: TabsRegistryStore
   private sessionRepairListeners?: {
     scanned: (result: SessionScanResult) => void
     repaired: (result: SessionRepairResult) => void
@@ -397,11 +420,13 @@ export class WsHandler {
     private sdkBridge?: SdkBridge,
     sessionRepairService?: SessionRepairService,
     handshakeSnapshotProvider?: HandshakeSnapshotProvider,
-    terminalMetaListProvider?: () => TerminalMeta[]
+    terminalMetaListProvider?: () => TerminalMeta[],
+    tabsRegistryStore?: TabsRegistryStore,
   ) {
     this.sessionRepairService = sessionRepairService
     this.handshakeSnapshotProvider = handshakeSnapshotProvider
     this.terminalMetaListProvider = terminalMetaListProvider
+    this.tabsRegistryStore = tabsRegistryStore
     this.wss = new WebSocketServer({
       server,
       path: '/ws',
@@ -977,6 +1002,9 @@ export class WsHandler {
       if (typeof snapshot.perfLogging === 'boolean') {
         this.safeSend(ws, { type: 'perf.logging', enabled: snapshot.perfLogging })
       }
+      if (snapshot.configFallback) {
+        this.safeSend(ws, { type: 'config.fallback', ...snapshot.configFallback })
+      }
     } catch (err) {
       logger.warn({ err }, 'Failed to send handshake snapshot')
     }
@@ -1375,6 +1403,46 @@ export class WsHandler {
           return
         }
         this.send(ws, response.data)
+        return
+      }
+
+      case 'tabs.sync.push': {
+        if (!this.tabsRegistryStore) {
+          this.sendError(ws, {
+            code: 'INTERNAL_ERROR',
+            message: 'Tabs registry unavailable',
+          })
+          return
+        }
+        for (const record of m.records) {
+          await this.tabsRegistryStore.upsert({
+            ...record,
+            deviceId: m.deviceId,
+            deviceLabel: m.deviceLabel,
+          })
+        }
+        this.send(ws, { type: 'tabs.sync.ack', updated: m.records.length })
+        return
+      }
+
+      case 'tabs.sync.query': {
+        if (!this.tabsRegistryStore) {
+          this.send(ws, {
+            type: 'tabs.sync.snapshot',
+            requestId: m.requestId,
+            data: { localOpen: [], remoteOpen: [], closed: [] },
+          })
+          return
+        }
+        const data = await this.tabsRegistryStore.query({
+          deviceId: m.deviceId,
+          rangeDays: m.rangeDays,
+        })
+        this.send(ws, {
+          type: 'tabs.sync.snapshot',
+          requestId: m.requestId,
+          data,
+        })
         return
       }
 

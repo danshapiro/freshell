@@ -171,3 +171,9 @@ export interface AppSettings {
     configured: boolean
   }
 }
+
+export type {
+  RegistryPaneSnapshot,
+  RegistryTabRecord,
+  RegistryTabStatus,
+} from './tabRegistryTypes'

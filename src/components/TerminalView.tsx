@@ -782,7 +782,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     ro.observe(containerRef.current)
 
     return () => {
-      filePathLinkDisposable.dispose()
+      filePathLinkDisposable?.dispose()
       ro.disconnect()
       unregisterActions()
       searchResultsDisposable.dispose()

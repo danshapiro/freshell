@@ -38,6 +38,8 @@ import cookieParser from 'cookie-parser'
 import { PortForwardManager } from './port-forward.js'
 import { getRequesterIdentity, parseTrustProxyEnv } from './request-ip.js'
 import { collectCandidateDirectories } from './candidate-dirs.js'
+import { createTabsRegistryStore } from './tabs-registry/store.js'
+import { checkForUpdate } from './updater/version-checker.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -147,6 +149,7 @@ async function main() {
   const codingCliProviders = [claudeProvider, codexProvider]
   const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders)
   const codingCliSessionManager = new CodingCliSessionManager(codingCliProviders)
+  const tabsRegistryStore = createTabsRegistryStore()
 
   app.get('/api/debug', async (_req, res) => {
     const cfg = await configStore.snapshot()
@@ -156,6 +159,10 @@ async function main() {
       wsConnections: wsHandler.connectionCount(),
       settings: cfg.settings,
       sessionsProjects: codingCliIndexer.getProjects(),
+      tabsRegistry: {
+        recordCount: tabsRegistryStore.count(),
+        deviceCount: tabsRegistryStore.listDevices().length,
+      },
       terminals: registry.list(),
       time: new Date().toISOString(),
     })
@@ -178,13 +185,19 @@ async function main() {
     sessionRepairService,
     async () => {
       const currentSettings = migrateSettingsSortMode(await configStore.getSettings())
+      const readError = configStore.getLastReadError()
+      const configFallback = readError
+        ? { reason: readError, backupExists: await configStore.backupExists() }
+        : undefined
       return {
         settings: currentSettings,
         projects: codingCliIndexer.getProjects(),
         perfLogging: perfConfig.enabled,
+        configFallback,
       }
     },
     () => terminalMetadata.list(),
+    tabsRegistryStore,
   )
   const port = Number(process.env.PORT || 3001)
   const isDev = process.env.NODE_ENV !== 'production'
@@ -428,6 +441,16 @@ async function main() {
       detectAvailableClis(),
     ])
     res.json({ platform, availableClis })
+  })
+
+  app.get('/api/version', async (_req, res) => {
+    try {
+      const updateCheck = await checkForUpdate(APP_VERSION)
+      res.json({ currentVersion: APP_VERSION, updateCheck })
+    } catch (err) {
+      log.warn({ err }, 'Version check failed')
+      res.json({ currentVersion: APP_VERSION, updateCheck: null })
+    }
   })
 
   app.get('/api/files/candidate-dirs', async (_req, res) => {

@@ -28,6 +28,7 @@ import { clearPaneAttention, clearTabAttention } from '@/store/turnCompletionSli
 import { clearPendingCreate, removeSession } from '@/store/claudeChatSlice'
 import { cancelCreate } from '@/lib/sdk-message-handler'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
+import { ErrorBoundary } from '@/components/ui/error-boundary'
 
 // Stable empty object to avoid selector memoization issues
 const EMPTY_PANE_TITLES: Record<string, string> = {}
@@ -557,31 +558,44 @@ function PickerWrapper({
 
 function renderContent(tabId: string, paneId: string, content: PaneContent, isOnlyPane: boolean, hidden?: boolean) {
   if (content.kind === 'terminal') {
-    // Terminal panes need a unique key based on paneId for proper lifecycle
-    // Pass paneContent directly to avoid redundant tree traversal in TerminalView
-    return <TerminalView key={paneId} tabId={tabId} paneId={paneId} paneContent={content} hidden={hidden} />
+    return (
+      <ErrorBoundary key={paneId} label="Terminal">
+        {/* Keep pane-specific key on terminal to preserve lifecycle behavior across pane reuse */}
+        <TerminalView key={paneId} tabId={tabId} paneId={paneId} paneContent={content} hidden={hidden} />
+      </ErrorBoundary>
+    )
   }
 
   if (content.kind === 'browser') {
-    return <BrowserPane paneId={paneId} tabId={tabId} url={content.url} devToolsOpen={content.devToolsOpen} />
+    return (
+      <ErrorBoundary key={paneId} label="Browser">
+        <BrowserPane paneId={paneId} tabId={tabId} url={content.url} devToolsOpen={content.devToolsOpen} />
+      </ErrorBoundary>
+    )
   }
 
   if (content.kind === 'editor') {
     return (
-      <EditorPane
-        paneId={paneId}
-        tabId={tabId}
-        filePath={content.filePath}
-        language={content.language}
-        readOnly={content.readOnly}
-        content={content.content}
-        viewMode={content.viewMode}
-      />
+      <ErrorBoundary key={paneId} label="Editor">
+        <EditorPane
+          paneId={paneId}
+          tabId={tabId}
+          filePath={content.filePath}
+          language={content.language}
+          readOnly={content.readOnly}
+          content={content.content}
+          viewMode={content.viewMode}
+        />
+      </ErrorBoundary>
     )
   }
 
   if (content.kind === 'claude-chat') {
-    return <ClaudeChatView key={paneId} tabId={tabId} paneId={paneId} paneContent={content} hidden={hidden} />
+    return (
+      <ErrorBoundary key={paneId} label="Chat">
+        <ClaudeChatView key={paneId} tabId={tabId} paneId={paneId} paneContent={content} hidden={hidden} />
+      </ErrorBoundary>
+    )
   }
 
   if (content.kind === 'picker') {

@@ -150,7 +150,7 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
     ws.send({ type: 'sdk.permission.respond', sessionId: paneContent.sessionId, requestId, behavior: 'deny' })
   }, [paneContent.sessionId, dispatch, ws])
 
-  const handleContainerClick = useCallback((e: React.MouseEvent) => {
+  const handleContainerPointerUp = useCallback((e: React.PointerEvent) => {
     // Don't steal focus from interactive elements or text selections
     const target = e.target as HTMLElement
     if (
@@ -280,7 +280,7 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
   const collapseThreshold = Math.max(0, turnItems.length - RECENT_TURNS_FULL)
 
   return (
-    <div className={cn('h-full w-full flex flex-col', hidden ? 'tab-hidden' : 'tab-visible')} role="region" aria-label="freshclaude Chat" onClick={handleContainerClick}>
+    <div className={cn('h-full w-full flex flex-col', hidden ? 'tab-hidden' : 'tab-visible')} role="region" aria-label="freshclaude Chat" onPointerUp={handleContainerPointerUp}>
       {/* Status bar */}
       <div className="flex items-center justify-between px-3 py-1.5 border-b text-xs text-muted-foreground">
         <span>

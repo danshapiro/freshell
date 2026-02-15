@@ -347,7 +347,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
 }
 .picker-option:hover .picker-shortcut { opacity: .4; }
 
-/* ========== Sessions View ========== */
+/* ========== Projects View ========== */
 .sessions-view { flex: 1; overflow-y: auto; background: hsl(var(--background)); transition: background-color .2s; }
 .sv-header {
   padding: 20px 24px 16px; border-bottom: 1px solid hsl(var(--border) / .3);
@@ -424,14 +424,15 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
       <div class="sb-search">
         <div class="sb-search-wrap">
           <i data-lucide="search" class="icon"></i>
-          <input type="text" placeholder="Search sessions…" readonly>
+          <input type="text" placeholder="Search coding agents, tabs, projects…" readonly>
         </div>
       </div>
       <div class="sb-nav">
-        <button class="sb-nav-btn active"><i data-lucide="terminal" class="icon"></i></button>
-        <button class="sb-nav-btn"><i data-lucide="history" class="icon"></i></button>
-        <button class="sb-nav-btn"><i data-lucide="layout-grid" class="icon"></i></button>
-        <button class="sb-nav-btn"><i data-lucide="settings" class="icon"></i></button>
+        <button class="sb-nav-btn active" title="Coding Agents"><i data-lucide="terminal" class="icon"></i></button>
+        <button class="sb-nav-btn" title="Tabs"><i data-lucide="rows-3" class="icon"></i></button>
+        <button class="sb-nav-btn" title="Panes"><i data-lucide="layout-grid" class="icon"></i></button>
+        <button class="sb-nav-btn" title="Projects"><i data-lucide="history" class="icon"></i></button>
+        <button class="sb-nav-btn" title="Settings"><i data-lucide="settings" class="icon"></i></button>
       </div>
       <div class="sb-list">
         <div class="sb-item"><div class="sb-item-icon"><svg viewBox="75.73 64.08 872.25 872.25"><path d="M616.9,649.5h-209.7c0,0,0,104.7,0,104.7h-56.6c0,0,.2-104.5.2-104.5h-48.6s.2,104.5.2,104.5h-56.7c0,0,.2-104.4.2-104.4l-48.6-.7v-96.4c.1,0-104.8,0-104.8,0v-104.9s104.9,0,104.9,0v-201.6c0,0,628.9,0,628.9,0v201.6c0,0,104.9,0,104.9,0v104.9s-104.9,0-104.9,0v96.6c.1,0-56.5.4-56.5.4l.2,104.5h-48.6s.2-104.6.2-104.6h-56.6s.2,104.6.2,104.6h-48.6s.2-104.6.2-104.6ZM351.1,447.5l-.5-96.4h-48.4c0,0,0,96.6,0,96.6l48.8-.2ZM722,447.7l-.4-96.7h-56.5c0,0,0,96.8,0,96.8h56.9Z"/></svg></div><div class="sb-item-body"><div class="sb-item-title">Add dark mode toggle</div><div class="sb-item-meta"><span>freshell</span><span>2m</span></div></div></div>
@@ -473,7 +474,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
         </div>
         <div class="tab" data-tab="sessions">
           <span class="tab-dot idle"></span>
-          <span class="tab-label">Sessions</span>
+          <span class="tab-label">Projects</span>
           <span class="tab-close"><i data-lucide="x" class="icon-xs"></i></span>
         </div>
         <div class="tab" data-tab="start">
@@ -571,15 +572,15 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
         </div>
       </div>
 
-      <!-- Sessions -->
+      <!-- Projects -->
       <div class="tab-panel" id="panel-sessions">
         <div class="sessions-view">
           <div class="sv-header">
-            <span class="sv-title">Sessions</span>
+            <span class="sv-title">Projects</span>
             <span class="sv-count">12 sessions across 3 projects</span>
             <button class="sv-refresh"><i data-lucide="refresh-cw" class="icon"></i></button>
           </div>
-          <div class="sv-search"><div class="sv-search-wrap"><i data-lucide="search" class="icon-md"></i><input type="text" placeholder="Search sessions, projects…" readonly></div></div>
+          <div class="sv-search"><div class="sv-search-wrap"><i data-lucide="search" class="icon-md"></i><input type="text" placeholder="Search project sessions, projects…" readonly></div></div>
           <div class="sv-body">
             <div class="sv-project open">
               <div class="sv-project-header">

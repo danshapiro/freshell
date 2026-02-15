@@ -157,6 +157,25 @@ function makeNetworkStatus(overrides: Partial<NetworkStatusResponse> = {}): Netw
   }
 }
 
+function makeVersionInfo(overrides: Partial<{
+  currentVersion: string
+  updateAvailable: boolean
+  latestVersion: string | null
+  releaseUrl: string | null
+  error: string | null
+}> = {}) {
+  return {
+    currentVersion: overrides.currentVersion ?? '0.4.5',
+    updateCheck: {
+      updateAvailable: overrides.updateAvailable ?? false,
+      currentVersion: overrides.currentVersion ?? '0.4.5',
+      latestVersion: overrides.latestVersion ?? '0.4.5',
+      releaseUrl: overrides.releaseUrl ?? 'https://github.com/danshapiro/freshell/releases/latest',
+      error: overrides.error ?? null,
+    },
+  }
+}
+
 describe('App Component - Share Button', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -165,6 +184,7 @@ describe('App Component - Share Button', () => {
     mockApiGet.mockImplementation((url: string) => {
       if (url === '/api/settings') return Promise.resolve(defaultSettings)
       if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/version') return Promise.resolve(makeVersionInfo())
       if (url === '/api/sessions') return Promise.resolve([])
       if (url === '/api/network/status') {
         return Promise.resolve(makeNetworkStatus())
@@ -355,6 +375,65 @@ describe('App Component - Share Button', () => {
   })
 })
 
+describe('App Component - Version Status', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/version') return Promise.resolve(makeVersionInfo())
+      if (url === '/api/sessions') return Promise.resolve([])
+      return Promise.resolve({})
+    })
+  })
+
+  it('shows version details in a tooltip instead of always rendering text in header', async () => {
+    renderApp()
+
+    const brandStatus = await screen.findByTestId('app-brand-status')
+    expect(screen.queryByText('v0.4.5 (up to date)')).not.toBeInTheDocument()
+
+    fireEvent.mouseEnter(brandStatus)
+    await waitFor(() => {
+      expect(screen.getByText('v0.4.5 (up to date)')).toBeInTheDocument()
+    })
+  })
+
+  it('highlights brand and opens update instructions when update is available', async () => {
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/version') {
+        return Promise.resolve(makeVersionInfo({
+          currentVersion: '0.4.5',
+          updateAvailable: true,
+          latestVersion: '0.5.0',
+          releaseUrl: 'https://github.com/danshapiro/freshell/releases/tag/v0.5.0',
+        }))
+      }
+      if (url === '/api/sessions') return Promise.resolve([])
+      return Promise.resolve({})
+    })
+
+    renderApp()
+
+    const brandStatus = await screen.findByTestId('app-brand-status')
+    expect(brandStatus.className).toContain('text-amber-700')
+
+    fireEvent.click(brandStatus)
+
+    await waitFor(() => {
+      expect(screen.getByText('Update Available')).toBeInTheDocument()
+      expect(screen.getByText(/You are running v0\.4\.5/)).toBeInTheDocument()
+      expect(screen.getByText(/git pull/)).toBeInTheDocument()
+      expect(screen.getByRole('link', { name: 'Release notes' })).toHaveAttribute(
+        'href',
+        'https://github.com/danshapiro/freshell/releases/tag/v0.5.0'
+      )
+    })
+  })
+})
+
 describe('App Component - Idle Warnings', () => {
   let messageHandler: ((msg: any) => void) | null = null
 
@@ -367,6 +446,7 @@ describe('App Component - Idle Warnings', () => {
     mockApiGet.mockImplementation((url: string) => {
       if (url === '/api/settings') return Promise.resolve(defaultSettings)
       if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/version') return Promise.resolve(makeVersionInfo())
       if (url === '/api/sessions') return Promise.resolve([])
       return Promise.resolve({})
     })
@@ -396,6 +476,31 @@ describe('App Component - Idle Warnings', () => {
       expect(screen.getByRole('button', { name: /auto-kill soon/i })).toBeInTheDocument()
     })
   })
+
+  it('shows and dismisses config fallback warning when server reports corrupted config', async () => {
+    renderApp()
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    messageHandler!({
+      type: 'config.fallback',
+      reason: 'PARSE_ERROR',
+      backupExists: true,
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText(/Config file was invalid/)).toBeInTheDocument()
+      expect(screen.getByText(/Backup found at ~\/\.freshell\/config\.backup\.json\./)).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByLabelText('Dismiss config fallback warning'))
+
+    await waitFor(() => {
+      expect(screen.queryByText(/Config file was invalid/)).not.toBeInTheDocument()
+    })
+  })
 })
 
 describe('App Component - Mobile Sidebar', () => {
@@ -405,6 +510,7 @@ describe('App Component - Mobile Sidebar', () => {
     mockApiGet.mockImplementation((url: string) => {
       if (url === '/api/settings') return Promise.resolve(defaultSettings)
       if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/version') return Promise.resolve(makeVersionInfo())
       if (url === '/api/sessions') return Promise.resolve([])
       return Promise.resolve({})
     })
@@ -462,6 +568,7 @@ describe('App Bootstrap', () => {
     mockApiGet.mockImplementation((url: string) => {
       if (url === '/api/settings') return Promise.resolve(defaultSettings)
       if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/version') return Promise.resolve(makeVersionInfo())
       if (url === '/api/sessions') return Promise.resolve([])
       return Promise.resolve({})
     })
@@ -512,6 +619,7 @@ describe('App WS message handling', () => {
     mockApiGet.mockImplementation((url: string) => {
       if (url === '/api/settings') return Promise.resolve(defaultSettings)
       if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/version') return Promise.resolve(makeVersionInfo())
       if (url === '/api/sessions') return Promise.resolve([])
       return Promise.resolve({})
     })

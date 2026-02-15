@@ -119,9 +119,9 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
       <div className="border-b border-border/30 px-3 py-4 md:px-6 md:py-5">
         <div className="flex items-center justify-between mb-4">
           <div>
-            <h1 className="text-xl font-semibold tracking-tight">Sessions</h1>
+            <h1 className="text-xl font-semibold tracking-tight">Projects</h1>
             <p className="text-sm text-muted-foreground">
-              {totalSessions} session{totalSessions !== 1 ? 's' : ''} across {(projects ?? []).length} project{(projects ?? []).length !== 1 ? 's' : ''}
+              {totalSessions} project session{totalSessions !== 1 ? 's' : ''} across {(projects ?? []).length} project{(projects ?? []).length !== 1 ? 's' : ''}
             </p>
           </div>
           <button
