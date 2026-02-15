@@ -184,6 +184,12 @@ function configPath(): string {
   return path.join(configDir(), 'config.json')
 }
 
+function backupPath(): string {
+  return path.join(configDir(), 'config.backup.json')
+}
+
+export type ConfigReadError = 'ENOENT' | 'PARSE_ERROR' | 'VERSION_MISMATCH' | 'READ_ERROR'
+
 const CONFIG_TMP_PREFIX = 'config.json.tmp-'
 const DEFAULT_CONFIG_TMP_MAX_AGE_MS = 24 * 60 * 60 * 1000
 let cleanupPromise: Promise<void> | null = null
@@ -303,14 +309,61 @@ async function atomicWriteFile(filePath: string, data: string) {
   }
 }
 
-async function readConfigFile(): Promise<UserConfig | null> {
+function logConfigFallback(error: ConfigReadError, details: { err?: unknown; filePath: string; foundVersion?: unknown }) {
+  const backupFile = backupPath()
+  if (error === 'PARSE_ERROR') {
+    logger.error(
+      { err: details.err, filePath: details.filePath, event: 'config_parse_error' },
+      'Config file parse failed; falling back to defaults'
+    )
+  } else if (error === 'VERSION_MISMATCH') {
+    logger.error(
+      {
+        filePath: details.filePath,
+        event: 'config_version_mismatch',
+        found: details.foundVersion,
+      },
+      'Config file version mismatch; falling back to defaults'
+    )
+  } else if (error === 'READ_ERROR') {
+    logger.error(
+      { err: details.err, filePath: details.filePath, event: 'config_read_error' },
+      'Config file read failed; falling back to defaults'
+    )
+  }
+  logger.warn(
+    { backupPath: backupFile, error },
+    'Config fallback in effect; restore backup with: mv ~/.freshell/config.backup.json ~/.freshell/config.json'
+  )
+}
+
+async function readConfigFile(): Promise<{ config: UserConfig | null; error?: ConfigReadError }> {
+  const filePath = configPath()
   try {
-    const raw = await fsp.readFile(configPath(), 'utf-8')
-    const parsed = JSON.parse(raw)
-    if (parsed?.version !== 1) return null
-    return parsed as UserConfig
-  } catch {
-    return null
+    const raw = await fsp.readFile(filePath, 'utf-8')
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch (err) {
+      logConfigFallback('PARSE_ERROR', { err, filePath })
+      return { config: null, error: 'PARSE_ERROR' }
+    }
+
+    if ((parsed as UserConfig)?.version !== 1) {
+      logConfigFallback('VERSION_MISMATCH', {
+        filePath,
+        foundVersion: (parsed as { version?: unknown })?.version,
+      })
+      return { config: null, error: 'VERSION_MISMATCH' }
+    }
+
+    return { config: parsed as UserConfig }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { config: null }
+    }
+    logConfigFallback('READ_ERROR', { err, filePath })
+    return { config: null, error: 'READ_ERROR' }
   }
 }
 
@@ -360,12 +413,28 @@ function mergeSettings(base: AppSettings, patch: Partial<AppSettings>): AppSetti
 export class ConfigStore {
   private cache: UserConfig | null = null
   private writeMutex = new Mutex()
+  private lastReadError?: ConfigReadError
+
+  getLastReadError(): ConfigReadError | undefined {
+    return this.lastReadError
+  }
+
+  async backupExists(): Promise<boolean> {
+    try {
+      await fsp.access(backupPath())
+      return true
+    } catch {
+      return false
+    }
+  }
 
   async load(): Promise<UserConfig> {
     if (this.cache) return this.cache
     await ensureConfigTmpCleanup()
-    const existing = await readConfigFile()
+    const { config: existing, error } = await readConfigFile()
+    this.lastReadError = error
     if (existing) {
+      this.lastReadError = undefined
       this.cache = {
         ...existing,
         settings: mergeSettings(defaultSettings, existing.settings || {}),
@@ -397,9 +466,7 @@ export class ConfigStore {
   }
 
   async save(cfg: UserConfig) {
-    await ensureDir()
-    await atomicWriteFile(configPath(), JSON.stringify(cfg, null, 2))
-    this.cache = cfg
+    await this.saveInternal(cfg)
   }
 
   /**
@@ -409,6 +476,11 @@ export class ConfigStore {
   private async saveInternal(cfg: UserConfig) {
     await ensureDir()
     await atomicWriteFile(configPath(), JSON.stringify(cfg, null, 2))
+    try {
+      await fsp.copyFile(configPath(), backupPath())
+    } catch (err) {
+      logger.warn({ err, event: 'config_backup_failed' }, 'Failed to write config backup')
+    }
     this.cache = cfg
   }
 

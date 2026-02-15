@@ -7,7 +7,7 @@ import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-l
 import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed, timingSafeCompare } from './auth.js'
 import { modeSupportsResume } from './terminal-registry.js'
 import type { TerminalRegistry, TerminalMode } from './terminal-registry.js'
-import { configStore, type AppSettings } from './config-store.js'
+import { configStore, type AppSettings, type ConfigReadError } from './config-store.js'
 import type { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import type { ProjectGroup } from './coding-cli/types.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
@@ -369,6 +369,10 @@ type HandshakeSnapshot = {
   settings?: AppSettings
   projects?: ProjectGroup[]
   perfLogging?: boolean
+  configFallback?: {
+    reason: ConfigReadError
+    backupExists: boolean
+  }
 }
 
 type HandshakeSnapshotProvider = () => Promise<HandshakeSnapshot>
@@ -976,6 +980,9 @@ export class WsHandler {
       }
       if (typeof snapshot.perfLogging === 'boolean') {
         this.safeSend(ws, { type: 'perf.logging', enabled: snapshot.perfLogging })
+      }
+      if (snapshot.configFallback) {
+        this.safeSend(ws, { type: 'config.fallback', ...snapshot.configFallback })
       }
     } catch (err) {
       logger.warn({ err }, 'Failed to send handshake snapshot')

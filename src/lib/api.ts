@@ -114,6 +114,17 @@ export const api = {
   },
 }
 
+export type VersionInfo = {
+  currentVersion: string
+  updateCheck: {
+    updateAvailable: boolean
+    currentVersion: string
+    latestVersion: string | null
+    releaseUrl: string | null
+    error: string | null
+  } | null
+}
+
 export type SearchResult = {
   sessionId: string
   provider: CodingCliProviderName

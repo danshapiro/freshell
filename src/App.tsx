@@ -11,7 +11,7 @@ import {
   resetWsSnapshotReceived,
 } from '@/store/sessionsSlice'
 import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
-import { api } from '@/lib/api'
+import { api, type VersionInfo } from '@/lib/api'
 import { getShareAction } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { getSessionsForHello } from '@/lib/session-utils'
@@ -32,11 +32,12 @@ import OverviewView from '@/components/OverviewView'
 import PaneDivider from '@/components/panes/PaneDivider'
 import { AuthRequiredModal } from '@/components/AuthRequiredModal'
 import { SetupWizard } from '@/components/SetupWizard'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { fetchNetworkStatus } from '@/store/networkSlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { triggerHapticFeedback } from '@/lib/mobile-haptics'
-import { Wifi, WifiOff, Moon, Sun, Share2, X, Copy, Check, PanelLeftClose, PanelLeft, Loader2, Minimize2, Maximize2 } from 'lucide-react'
+import { Wifi, WifiOff, Moon, Sun, Share2, X, Copy, Check, PanelLeftClose, PanelLeft, Loader2, Minimize2, Maximize2, AlertCircle, AlertTriangle } from 'lucide-react'
 import { updateSettingsLocal, markSaved } from '@/store/settingsSlice'
 import { clearIdleWarning, recordIdleWarning } from '@/store/idleWarningsSlice'
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
@@ -73,6 +74,28 @@ const CHROME_REVEAL_TOP_EDGE_PX = 48
 const CHROME_REVEAL_SWIPE_PX = 60
 const EMPTY_IDLE_WARNINGS: Record<string, unknown> = {}
 
+function isVersionInfo(value: unknown): value is VersionInfo {
+  return !!value && typeof value === 'object' && typeof (value as { currentVersion?: unknown }).currentVersion === 'string'
+}
+
+type ConfigFallbackInfo = {
+  reason: 'PARSE_ERROR' | 'VERSION_MISMATCH' | 'READ_ERROR' | 'ENOENT'
+  backupExists: boolean
+}
+
+function describeConfigFallbackReason(reason: ConfigFallbackInfo['reason']): string {
+  if (reason === 'PARSE_ERROR') return 'could not parse config JSON'
+  if (reason === 'VERSION_MISMATCH') return 'config version is incompatible'
+  if (reason === 'READ_ERROR') return 'config file could not be read'
+  return 'config file was missing'
+}
+
+function parseConfigFallbackReason(value: unknown): ConfigFallbackInfo['reason'] {
+  return value === 'PARSE_ERROR' || value === 'VERSION_MISMATCH' || value === 'READ_ERROR' || value === 'ENOENT'
+    ? value
+    : 'READ_ERROR'
+}
+
 export default function App() {
   useThemeEffect()
   useTurnCompletionNotifications()
@@ -93,9 +116,12 @@ export default function App() {
 
   const [view, setView] = useState<AppView>('terminal')
   const [showSharePanel, setShowSharePanel] = useState(false)
+  const [showUpdateInstructions, setShowUpdateInstructions] = useState(false)
   const [showSetupWizard, setShowSetupWizard] = useState(false)
+  const [configFallback, setConfigFallback] = useState<ConfigFallbackInfo | null>(null)
   const [wizardInitialStep, setWizardInitialStep] = useState<1 | 2>(1)
   const [copied, setCopied] = useState(false)
+  const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null)
   const [pendingFirewallCommand, setPendingFirewallCommand] = useState<{ tabId: string; command: string } | null>(null)
   const [landscapeTabBarRevealed, setLandscapeTabBarRevealed] = useState(false)
   const isMobile = useMobile()
@@ -285,6 +311,18 @@ export default function App() {
     }
   }
 
+  const currentVersion = versionInfo?.currentVersion ?? null
+  const updateCheck = versionInfo?.updateCheck ?? null
+  const updateAvailable = !!updateCheck?.updateAvailable
+  const latestVersion = updateCheck?.latestVersion ?? null
+  const releaseUrl = updateCheck?.releaseUrl ?? null
+
+  const handleBrandClick = useCallback(() => {
+    if (updateAvailable) {
+      setShowUpdateInstructions(true)
+    }
+  }, [updateAvailable])
+
   // Bootstrap: load settings, sessions, and connect websocket.
   useEffect(() => {
     let cancelled = false
@@ -308,6 +346,15 @@ export default function App() {
         }
       } catch (err: any) {
         console.warn('Failed to load platform info', err)
+      }
+
+      try {
+        const nextVersionInfo = await api.get<VersionInfo>('/api/version')
+        if (!cancelled && isVersionInfo(nextVersionInfo)) {
+          setVersionInfo(nextVersionInfo)
+        }
+      } catch (err: any) {
+        console.warn('Failed to load version info', err)
       }
 
       try {
@@ -422,6 +469,12 @@ export default function App() {
         }
         if (msg.type === 'perf.logging') {
           setClientPerfEnabled(!!msg.enabled, 'server')
+        }
+        if (msg.type === 'config.fallback') {
+          setConfigFallback({
+            reason: parseConfigFallbackReason(msg.reason),
+            backupExists: !!msg.backupExists,
+          })
         }
 
         // SDK message handling (freshclaude pane)
@@ -606,7 +659,42 @@ export default function App() {
       {/* Top header bar spanning full width */}
       {isLandscapeTerminalView ? (
         <div className="h-6 px-2 flex items-center justify-between border-b border-border/30 bg-background/95 flex-shrink-0 text-xs">
-          <span className="font-mono text-[11px] text-muted-foreground">freshell</span>
+          {currentVersion ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  className={`font-mono text-[11px] rounded px-1 -mx-1 border-0 p-0 bg-transparent inline-flex items-center gap-1 transition-colors ${
+                    updateAvailable
+                      ? 'text-amber-700 dark:text-amber-400 bg-amber-100/60 dark:bg-amber-950/40 hover:bg-amber-200/70 dark:hover:bg-amber-900/60 cursor-pointer'
+                      : 'text-muted-foreground cursor-default'
+                  }`}
+                  onClick={handleBrandClick}
+                  aria-label={
+                    updateAvailable
+                      ? `Freshell v${currentVersion}. Update available${latestVersion ? `: v${latestVersion}` : ''}. Click for update instructions.`
+                      : `Freshell v${currentVersion}. Up to date.`
+                  }
+                  data-testid="app-brand-status"
+                >
+                  <span>freshell</span>
+                  {updateAvailable && <AlertCircle className="h-3 w-3" aria-hidden="true" />}
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>
+                {updateAvailable ? (
+                  <div>
+                    <div>v{currentVersion} - {latestVersion ? `v${latestVersion} available` : 'update available'}</div>
+                    <div className="text-muted-foreground">Click for update instructions</div>
+                  </div>
+                ) : (
+                  <div>v{currentVersion} (up to date)</div>
+                )}
+              </TooltipContent>
+            </Tooltip>
+          ) : (
+            <span className="font-mono text-[11px] text-muted-foreground">freshell</span>
+          )}
           <div className="flex items-center gap-1">
             <button
               onClick={() => { triggerHapticFeedback(); void toggleFullscreen(mainContentRef.current) }}
@@ -643,7 +731,42 @@ export default function App() {
                 <PanelLeftClose className="h-3.5 w-3.5 text-muted-foreground" />
               )}
             </button>
-            <span className="font-mono text-sm md:text-base font-semibold tracking-tight whitespace-nowrap truncate">🐚🔥freshell</span>
+            {currentVersion ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    className={`font-mono min-w-0 text-sm md:text-base font-semibold tracking-tight whitespace-nowrap rounded px-1 -mx-1 border-0 p-0 bg-transparent inline-flex items-center gap-1 transition-colors ${
+                      updateAvailable
+                        ? 'text-amber-700 dark:text-amber-400 bg-amber-100/60 dark:bg-amber-950/40 hover:bg-amber-200/70 dark:hover:bg-amber-900/60 cursor-pointer'
+                        : 'cursor-default'
+                    }`}
+                    onClick={handleBrandClick}
+                    aria-label={
+                      updateAvailable
+                        ? `Freshell v${currentVersion}. Update available${latestVersion ? `: v${latestVersion}` : ''}. Click for update instructions.`
+                        : `Freshell v${currentVersion}. Up to date.`
+                    }
+                    data-testid="app-brand-status"
+                  >
+                    <span className="truncate">🐚🔥freshell</span>
+                    {updateAvailable && <AlertCircle className="h-3.5 w-3.5" aria-hidden="true" />}
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {updateAvailable ? (
+                    <div>
+                      <div>v{currentVersion} - {latestVersion ? `v${latestVersion} available` : 'update available'}</div>
+                      <div className="text-muted-foreground">Click for update instructions</div>
+                    </div>
+                  ) : (
+                    <div>v{currentVersion} (up to date)</div>
+                  )}
+                </TooltipContent>
+              </Tooltip>
+            ) : (
+              <span className="font-mono text-sm md:text-base font-semibold tracking-tight whitespace-nowrap truncate">🐚🔥freshell</span>
+            )}
           </div>
           <div className="flex shrink-0 items-center gap-0 md:gap-1">
             {idleWarningCount > 0 && (
@@ -708,6 +831,28 @@ export default function App() {
           </div>
         </div>
       )}
+      {configFallback && (
+        <div className="px-3 md:px-4 py-2 border-b border-destructive/30 bg-destructive/10 text-destructive text-xs">
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="h-3.5 w-3.5 mt-0.5 flex-shrink-0" aria-hidden="true" />
+            <div className="flex-1 min-w-0" role="status" aria-live="polite">
+              <p>
+                Config file was invalid ({describeConfigFallbackReason(configFallback.reason)}), so freshell loaded defaults.
+                {configFallback.backupExists
+                  ? ' Backup found at ~/.freshell/config.backup.json.'
+                  : ' No backup file was found.'}
+              </p>
+            </div>
+            <button
+              onClick={() => setConfigFallback(null)}
+              className="text-destructive/80 hover:text-destructive transition-colors"
+              aria-label="Dismiss config fallback warning"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
       {/* Main content area with sidebar */}
       <div className="flex-1 min-h-0 flex relative" ref={mainContentRef} {...(isMobile ? bindSidebarSwipe() : {})} style={isMobile ? { touchAction: 'pan-y' } : undefined}>
         {/* Mobile overlay when sidebar is open */}
@@ -751,6 +896,67 @@ export default function App() {
           {content}
         </div>
       </div>
+
+      {showUpdateInstructions && currentVersion && updateAvailable && (
+        <div
+          className="fixed inset-0 bg-black/50 flex items-center justify-center z-[60]"
+          role="presentation"
+          onClick={() => setShowUpdateInstructions(false)}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') setShowUpdateInstructions(false)
+          }}
+          tabIndex={-1}
+        >
+          {/* eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-noninteractive-element-interactions */}
+          <div
+            className="bg-background border border-border rounded-lg shadow-lg max-w-md w-full mx-4 p-6"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Update instructions"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="text-lg font-semibold">Update Available</h2>
+              <button
+                onClick={() => setShowUpdateInstructions(false)}
+                className="p-1 rounded hover:bg-muted transition-colors"
+                aria-label="Close update instructions"
+              >
+                <X className="h-4 w-4 text-muted-foreground" />
+              </button>
+            </div>
+            <p className="text-sm text-muted-foreground mb-3">
+              You are running v{currentVersion}. {latestVersion ? `v${latestVersion} is available.` : 'A newer release is available.'}
+            </p>
+            <p className="text-sm text-muted-foreground mb-2">From your freshell install directory:</p>
+            <pre className="bg-muted rounded-md p-3 text-xs overflow-x-auto mb-3">{`git pull
+npm install
+npm run build
+npm run serve`}</pre>
+            <p className="text-sm text-muted-foreground mb-4">
+              You can also restart and accept the startup auto-update prompt.
+            </p>
+            <div className="flex items-center justify-end gap-2">
+              {releaseUrl && (
+                <a
+                  href={releaseUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="h-8 px-3 rounded-md border border-border hover:bg-muted transition-colors text-sm inline-flex items-center"
+                >
+                  Release notes
+                </a>
+              )}
+              <button
+                onClick={() => setShowUpdateInstructions(false)}
+                className="h-8 px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors text-sm"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Network-aware share panel */}
       {showSharePanel && networkStatus && (
