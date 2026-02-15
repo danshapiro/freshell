@@ -1,9 +1,17 @@
 import { useSyncExternalStore } from 'react'
 
 const LANDSCAPE_QUERY = '(orientation: landscape)'
+const LANDSCAPE_COMPACT_MAX_HEIGHT = 500
+
+let mql: MediaQueryList | null = null
 
 function getMql(): MediaQueryList {
-  return window.matchMedia(LANDSCAPE_QUERY)
+  if (!mql) mql = window.matchMedia(LANDSCAPE_QUERY)
+  return mql
+}
+
+export function resetOrientationHookForTests(): void {
+  mql = null
 }
 
 function subscribe(callback: () => void): () => void {
@@ -20,7 +28,7 @@ function getSnapshot(): boolean {
   if (!getMql().matches) return false
   // Landscape compact mode is intentionally phone-focused; large tablet viewports
   // should keep standard chrome even when orientation is landscape.
-  return window.innerHeight <= 500
+  return window.innerHeight <= LANDSCAPE_COMPACT_MAX_HEIGHT
 }
 
 function getServerSnapshot(): boolean {

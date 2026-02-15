@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { render, screen, act, cleanup, waitFor } from '@testing-library/react'
-import { useOrientation } from '@/hooks/useOrientation'
+import { useOrientation, resetOrientationHookForTests } from '@/hooks/useOrientation'
 
 function OrientationProbe() {
   const { isLandscape } = useOrientation()
@@ -13,6 +13,8 @@ describe('useOrientation', () => {
   const originalInnerHeight = Object.getOwnPropertyDescriptor(window, 'innerHeight')
 
   beforeEach(() => {
+    resetOrientationHookForTests()
+
     let matches = false
     let innerWidth = 390
     let innerHeight = 844
@@ -59,6 +61,7 @@ describe('useOrientation', () => {
 
   afterEach(() => {
     cleanup()
+    resetOrientationHookForTests()
     Object.defineProperty(window, 'matchMedia', {
       configurable: true,
       writable: true,

@@ -305,6 +305,38 @@ describe('ws protocol', () => {
     await closeWebSocket(ws)
   })
 
+  it('respects hello client.mobile override when classifying the connection', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, {
+      headers: {
+        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+      },
+    })
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+
+    ws.send(JSON.stringify({
+      type: 'hello',
+      token: 'testtoken-testtoken',
+      client: { mobile: true },
+    }))
+    await waitForMessage(ws, (msg) => msg.type === 'ready', 5000)
+
+    const requestId = 'req-mobile-override'
+    ws.send(JSON.stringify({ type: 'terminal.create', requestId, mode: 'shell' }))
+    const created = await waitForMessage(
+      ws,
+      (msg) => msg.type === 'terminal.created' && msg.requestId === requestId,
+      5000,
+    )
+
+    const record = registry.records.get(created.terminalId)
+    expect(record).toBeDefined()
+    if (!record) throw new Error('missing terminal record after create')
+    const attachedClient = Array.from(record.clients)[0] as { isMobileClient?: boolean } | undefined
+    expect(attachedClient?.isMobileClient).toBe(true)
+
+    await closeWebSocket(ws)
+  })
+
   it('creates a terminal and returns terminal.created', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))

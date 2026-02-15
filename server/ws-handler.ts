@@ -196,6 +196,9 @@ const HelloSchema = z.object({
     sessionsPatchV1: z.boolean().optional(),
     terminalAttachChunkV1: z.boolean().optional(),
   }).optional(),
+  client: z.object({
+    mobile: z.boolean().optional(),
+  }).optional(),
   sessions: z.object({
     active: z.string().optional(),
     visible: z.array(z.string()).optional(),
@@ -1058,6 +1061,9 @@ export class WsHandler {
         state.authenticated = true
         state.supportsSessionsPatchV1 = !!m.capabilities?.sessionsPatchV1
         state.supportsTerminalAttachChunkV1 = !!m.capabilities?.terminalAttachChunkV1
+        if (typeof m.client?.mobile === 'boolean') {
+          ws.isMobileClient = m.client.mobile
+        }
         if (state.helloTimer) clearTimeout(state.helloTimer)
 
         log.info({ event: 'ws_authenticated', connectionId: ws.connectionId }, 'WebSocket client authenticated')

@@ -334,7 +334,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
     if (touchSelectionModeRef.current) return
 
-    event.preventDefault()
     const deltaY = touch.clientY - touchLastYRef.current
     touchLastYRef.current = touch.clientY
     touchScrollAccumulatorRef.current += deltaY

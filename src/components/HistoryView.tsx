@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import type { CodingCliProviderName } from '@/store/types'
+import type { CodingCliProviderName, CodingCliSession, ProjectGroup } from '@/store/types'
 import { toggleProjectExpanded, setProjects } from '@/store/sessionsSlice'
 import { api } from '@/lib/api'
 import { openSessionTab } from '@/store/tabsSlice'
@@ -30,7 +30,7 @@ function getProjectName(path: string): string {
 }
 
 type MobileSessionSheetState = {
-  session: any
+  session: CodingCliSession
   onOpen: () => void
   onRename: (title?: string, summary?: string) => void
   onDelete: () => void
@@ -82,21 +82,21 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
     await refresh()
   }
 
-  async function renameSession(provider: string | undefined, sessionId: string, titleOverride?: string, summaryOverride?: string) {
+  async function renameSession(provider: CodingCliProviderName | undefined, sessionId: string, titleOverride?: string, summaryOverride?: string) {
     // Use composite key format: provider:sessionId
     const compositeKey = `${provider || 'claude'}:${sessionId}`
     await api.patch(`/api/sessions/${encodeURIComponent(compositeKey)}`, { titleOverride, summaryOverride })
     await refresh()
   }
 
-  async function deleteSession(provider: string | undefined, sessionId: string) {
+  async function deleteSession(provider: CodingCliProviderName | undefined, sessionId: string) {
     // Use composite key format: provider:sessionId
     const compositeKey = `${provider || 'claude'}:${sessionId}`
     await api.delete(`/api/sessions/${encodeURIComponent(compositeKey)}`)
     await refresh()
   }
 
-  function openSession(cwd: string | undefined, sessionId: string, title: string, provider: string | undefined) {
+  function openSession(cwd: string | undefined, sessionId: string, title: string, provider: CodingCliProviderName | undefined) {
     // cwd might be undefined if session metadata didn't include it
     const label = getProviderLabel(provider)
     // TabMode now includes all CodingCliProviderName values, so this is type-safe
@@ -213,14 +213,14 @@ function ProjectCard({
   onDeleteSession,
   onShowSessionDetails,
 }: {
-  project: { projectPath: string; sessions: any[]; color?: string }
+  project: ProjectGroup
   expanded: boolean
   isMobile: boolean
   onToggle: () => void
   onColorChange: (color: string) => void
-  onOpenSession: (sessionId: string, title: string, cwd?: string, provider?: string) => void
-  onRenameSession: (provider: string | undefined, sessionId: string, title?: string, summary?: string) => void
-  onDeleteSession: (provider: string | undefined, sessionId: string) => void
+  onOpenSession: (sessionId: string, title: string, cwd?: string, provider?: CodingCliProviderName) => void
+  onRenameSession: (provider: CodingCliProviderName | undefined, sessionId: string, title?: string, summary?: string) => void
+  onDeleteSession: (provider: CodingCliProviderName | undefined, sessionId: string) => void
   onShowSessionDetails: (sheetState: MobileSessionSheetState) => void
 }) {
   const color = project.color || '#6b7280'
@@ -320,7 +320,7 @@ function SessionRow({
   onShowDetails,
 }: {
   isMobile: boolean
-  session: any
+  session: CodingCliSession
   onOpen: () => void
   onRename: (title?: string, summary?: string) => void
   onDelete: () => void
@@ -454,7 +454,7 @@ function MobileSessionDetailsSheet({
   onRename,
   onDelete,
 }: {
-  session: any
+  session: CodingCliSession
   onClose: () => void
   onOpen: () => void
   onRename: (title?: string, summary?: string) => void

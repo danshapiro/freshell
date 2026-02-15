@@ -1,15 +1,17 @@
+const MOBILE_QUERY = '(max-width: 767px)'
+
+let mql: MediaQueryList | null = null
+
+function getMql(): MediaQueryList | null {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return null
+  if (!mql) mql = window.matchMedia(MOBILE_QUERY)
+  return mql
+}
+
 export function isMobileDevice(): boolean {
-  if (typeof window === 'undefined') return false
-
   try {
-    if (window.matchMedia('(max-width: 767px)').matches) {
-      return true
-    }
+    return getMql()?.matches === true
   } catch {
-    // Ignore matchMedia failures and continue with user-agent fallback.
+    return false
   }
-
-  if (typeof navigator === 'undefined') return false
-  const ua = navigator.userAgent || ''
-  return /Mobi|Android|iPhone|iPad|iPod/i.test(ua)
 }

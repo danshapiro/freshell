@@ -146,6 +146,7 @@ type PendingSnapshotQueue = {
 type PendingMobileOutput = {
   timer: NodeJS.Timeout | null
   chunksByTerminal: Map<string, string[]>
+  perfByTerminal: Map<string, TerminalRecord['perf'] | undefined>
   queuedChars: number
 }
 
@@ -1075,7 +1076,8 @@ export class TerminalRegistry extends EventEmitter {
     for (const [terminalId, chunks] of pending.chunksByTerminal) {
       if (chunks.length === 0) continue
       const data = chunks.join('')
-      this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId })
+      const perf = pending.perfByTerminal.get(terminalId)
+      this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf })
     }
     this.mobileOutputBuffers.delete(client)
   }
@@ -1091,6 +1093,7 @@ export class TerminalRegistry extends EventEmitter {
       pending = {
         timer: null,
         chunksByTerminal: new Map(),
+        perfByTerminal: new Map(),
         queuedChars: 0,
       }
       this.mobileOutputBuffers.set(client, pending)
@@ -1106,6 +1109,7 @@ export class TerminalRegistry extends EventEmitter {
     const chunks = pending.chunksByTerminal.get(terminalId) || []
     chunks.push(data)
     pending.chunksByTerminal.set(terminalId, chunks)
+    pending.perfByTerminal.set(terminalId, perf)
     pending.queuedChars = nextSize
 
     if (!pending.timer) {

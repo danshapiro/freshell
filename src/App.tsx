@@ -96,6 +96,7 @@ export default function App() {
   const [copied, setCopied] = useState(false)
   const [pendingFirewallCommand, setPendingFirewallCommand] = useState<{ tabId: string; command: string } | null>(null)
   const isMobile = useMobile()
+  const isMobileRef = useRef(isMobile)
   const { isLandscape } = useOrientation()
   const { isFullscreen, toggleFullscreen, exitFullscreen } = useFullscreen()
   const paneLayouts = useAppSelector((s) => s.panes.layouts)
@@ -109,6 +110,10 @@ export default function App() {
   useEffect(() => {
     return installCrossTabSync(store)
   }, [])
+
+  useEffect(() => {
+    isMobileRef.current = isMobile
+  }, [isMobile])
 
   // Sidebar width from settings (or local state during drag)
   const sidebarWidth = settings.sidebar?.width ?? 288
@@ -311,6 +316,7 @@ export default function App() {
       // Set up hello extension to include session IDs for prioritized repair
       ws.setHelloExtensionProvider(() => ({
         sessions: getSessionsForHello(store.getState()),
+        client: { mobile: isMobileRef.current },
       }))
 
       const unsubscribe = ws.onMessage((msg) => {

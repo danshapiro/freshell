@@ -4,7 +4,10 @@ import { getAuthToken } from '@/lib/auth'
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'ready'
 type MessageHandler = (msg: any) => void
 type ReconnectHandler = () => void
-type HelloExtensionProvider = () => { sessions?: { active?: string; visible?: string[]; background?: string[] } }
+type HelloExtensionProvider = () => {
+  sessions?: { active?: string; visible?: string[]; background?: string[] }
+  client?: { mobile?: boolean }
+}
 
 const CONNECTION_TIMEOUT_MS = 10_000
 const perfConfig = getClientPerfConfig()

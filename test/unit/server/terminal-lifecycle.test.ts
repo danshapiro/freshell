@@ -234,6 +234,27 @@ describe('TerminalRegistry Lifecycle', () => {
       expect(outputs[0].data).toBe('hello mobile')
     })
 
+    it('tracks dropped output metrics for flushed mobile batches', () => {
+      setPerfLoggingEnabled(true, 'test')
+      try {
+        const local = new TerminalRegistry(settings)
+        const term = local.create({ mode: 'shell' })
+        const pty = mockPtyProcess.instances[mockPtyProcess.instances.length - 1]
+        const mobileClient = createMockWebSocket({ isMobileClient: true })
+        mobileClient.bufferedAmount = 3 * 1024 * 1024
+
+        local.attach(term.terminalId, mobileClient)
+        pty._emitData('mobile batch')
+
+        vi.advanceTimersByTime(50)
+
+        expect(term.perf?.droppedMessages).toBe(1)
+        local.shutdown()
+      } finally {
+        setPerfLoggingEnabled(false, 'test')
+      }
+    })
+
     it('closes the client if the pending snapshot queue grows too large (prevents OOM)', () => {
       const prev = process.env.MAX_PENDING_SNAPSHOT_CHARS
       process.env.MAX_PENDING_SNAPSHOT_CHARS = '16'

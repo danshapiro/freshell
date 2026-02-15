@@ -142,5 +142,27 @@ describe('App WS bootstrap recovery', () => {
       expect(store.getState().connection.lastError).toBeUndefined()
     })
   })
-})
 
+  it('includes current mobile state in hello extensions', async () => {
+    const store = createStore()
+    ;(globalThis as any).setMobileForTest(true)
+    wsMocks.connect.mockResolvedValueOnce(undefined)
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.setHelloExtensionProvider).toHaveBeenCalled()
+    })
+
+    const provider = wsMocks.setHelloExtensionProvider.mock.calls.at(-1)?.[0] as (() => any) | undefined
+    expect(provider).toBeTypeOf('function')
+
+    const extension = provider?.()
+    expect(extension?.sessions).toBeDefined()
+    expect(extension?.client?.mobile).toBe(true)
+  })
+})
