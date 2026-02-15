@@ -677,7 +677,7 @@ export default function App() {
                   {updateAvailable && <AlertCircle className="h-3 w-3" aria-hidden="true" />}
                 </button>
               </TooltipTrigger>
-              <TooltipContent>
+              <TooltipContent side="bottom">
                 {updateAvailable ? (
                   <div>
                     <div>v{currentVersion} - {latestVersion ? `v${latestVersion} available` : 'update available'}</div>
@@ -749,10 +749,10 @@ export default function App() {
                     {updateAvailable && <AlertCircle className="h-3.5 w-3.5" aria-hidden="true" />}
                   </button>
                 </TooltipTrigger>
-                <TooltipContent>
-                  {updateAvailable ? (
-                    <div>
-                      <div>v{currentVersion} - {latestVersion ? `v${latestVersion} available` : 'update available'}</div>
+              <TooltipContent side="bottom">
+                {updateAvailable ? (
+                  <div>
+                    <div>v{currentVersion} - {latestVersion ? `v${latestVersion} available` : 'update available'}</div>
                       <div className="text-muted-foreground">Click for update instructions</div>
                     </div>
                   ) : (
