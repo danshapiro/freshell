@@ -15,3 +15,7 @@ export function isMobileDevice(): boolean {
     return false
   }
 }
+
+export function resetMobileDeviceForTests(): void {
+  mql = null
+}

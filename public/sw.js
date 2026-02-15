@@ -24,7 +24,6 @@ self.addEventListener('fetch', (event) => {
 
   // Never cache API responses.
   if (url.origin === self.location.origin && url.pathname.startsWith('/api/')) {
-    event.respondWith(fetch(event.request))
     return
   }
 
