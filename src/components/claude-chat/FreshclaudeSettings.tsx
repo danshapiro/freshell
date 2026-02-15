@@ -190,7 +190,7 @@ export default function FreshclaudeSettings({
               onChange={(v) => onChange({ showTools: v })}
             />
             <ToggleRow
-              label="Show timecodes"
+              label="Show timecodes & model"
               checked={showTimecodes}
               onChange={(v) => onChange({ showTimecodes: v })}
             />

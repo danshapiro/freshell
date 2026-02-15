@@ -144,9 +144,9 @@ function MessageBubble({
         return null
       })}
 
-      {((showTimecodes && timestamp) || model) && (
+      {showTimecodes && (timestamp || model) && (
         <div className="flex items-center gap-2 text-xs text-muted-foreground mt-1">
-          {showTimecodes && timestamp && (
+          {timestamp && (
             <time>{new Date(timestamp).toLocaleTimeString()}</time>
           )}
           {model && <span className="opacity-60">{model}</span>}
