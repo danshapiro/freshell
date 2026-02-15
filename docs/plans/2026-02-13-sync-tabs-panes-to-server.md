@@ -387,52 +387,156 @@ After initial connect, only `workspace.device-updated` messages are sent (~6 KB 
 
 ---
 
-## 8. Tab Bar UX
+## 8. Sidebar "Tabs" Panel
 
-### 8.1 Layout
+The tab bar stays clean (only local active tabs). All cross-device browsing, closed tab management, and pane-level drill-down lives in a new **Tabs** sidebar panel — the 5th nav button alongside Terminal, Sessions, Overview, and Settings.
+
+### 8.1 Sidebar Layout
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│ [freshell ▾] [api-server]  │  ░ old-debug ░  ║  danshapiro-main:   │
-│  ↑ local active tabs        ↑ local closed     [freshell (3)]       │
-│                                                [api-server]         │
-│                                                 ↑ remote tabs       │
-└──────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────┐
+│ [Terminal] [Sessions] [Tabs]    │  ← new nav button
+│ [Overview] [Settings]           │
+├─────────────────────────────────┤
+│ 🔍 Filter tabs...              │
+│ Sort: Recency ▾                 │
+├─────────────────────────────────┤
+│ ▼ This device (dan-laptop)      │  ← collapsible group
+│   ● freshell          3 panes   │  ← active, click = jump
+│   ● api-server        1 pane    │
+│   ○ old-debug (closed) 2 panes  │  ← closed, click = reopen
+├─────────────────────────────────┤
+│ ▼ danshapiro-main  🟢 online    │  ← remote device group
+│   ● freshell          3 panes   │  ← click = adopt
+│   ● api-server        1 pane    │
+│   ○ old-debug (closed) 2 panes  │
+├─────────────────────────────────┤
+│ ▶ dan-office  ⚫ 3 days ago     │  ← collapsed, stale
+└─────────────────────────────────┘
 ```
 
-### 8.2 Local Tabs (Left Section)
-- Normal active tabs — existing behavior, unchanged
-- User's own device, no device label needed
+### 8.2 Item Structure
 
-### 8.3 Local Closed Tabs (Middle Section)
-- Greyed out, italic title
-- Status dot: green (terminal running), grey (exited/gone)
-- Click to reopen (restores layout, reattaches terminals)
-- Right-click → "Dismiss" to remove permanently
+Each item in the list is a **tab** (active or closed, local or remote). Follows the same `SidebarItem` pattern as Sessions:
 
-### 8.4 Remote Device Tabs (Right Section)
-- Grouped by device name with a label header
-- Slightly different visual treatment (perhaps a subtle background tint or border)
-- Show tab title + pane count badge
-- Click to **adopt** — creates a local copy attached to the same terminals
-- Remote closed tabs also visible (greyed, with device label)
+```typescript
+interface TabsPanelItem {
+  // Identity
+  tabId: string
+  deviceName: string
+  isLocal: boolean              // this device's tab vs. remote
 
-### 8.5 Remote Tab Indicators
-- **Device name** shown as a small label/badge above or beside the tab group
-- **Online indicator** — green dot if the device is currently connected, grey if last seen N hours ago
-- **Terminal status** — if the tab's terminals are still running (useful when the remote device disconnected)
+  // Display
+  title: string
+  mode: TabMode                 // icon: shell, claude, codex, browser, etc.
+  paneCount: number             // badge: "3 panes"
+  createdAt: number
 
-### 8.6 Overflow
-- If remote tabs are numerous, collapse into a `danshapiro-main: +N` pill that opens a dropdown
-- Local closed tabs overflow into `+N closed` button with dropdown
+  // State
+  status: 'active' | 'closed'
+  terminalStatuses: Array<{     // for status dots
+    terminalId: string
+    status: 'running' | 'exited' | 'gone'
+  }>
 
-### 8.7 Replacing Background Sessions
+  // Pane drill-down (expandable)
+  panes: TabsPanelPaneItem[]
+}
 
-The `BackgroundSessions` component (polling `terminal.list` every 5s) is fully replaced:
+interface TabsPanelPaneItem {
+  paneId: string
+  title: string                 // pane title or auto-generated
+  kind: 'terminal' | 'browser' | 'editor'
+  terminalId?: string
+  terminalStatus?: 'running' | 'exited' | 'gone'
+  mode?: TabMode                // for terminal panes
+  url?: string                  // for browser panes
+}
+```
 
-- Local closed tabs show your own detached terminals with full context
-- Remote device tabs show other machines' terminals
-- Orphan terminals (running with no client, no tab association) are surfaced as synthetic closed tabs on a special `(server)` pseudo-device
+### 8.3 Interactions
+
+| Action | Local Active Tab | Local Closed Tab | Remote Active Tab | Remote Closed Tab |
+|--------|-----------------|-----------------|-------------------|-------------------|
+| **Click** | Jump to tab | Reopen tab (restore layout, reattach PTYs) | Adopt tab (clone locally, attach to same PTYs) | Adopt closed tab (clone + reopen) |
+| **Expand (▶)** | Show panes | Show pane snapshot | Show panes | Show pane snapshot |
+| **Click pane** | Focus that pane in the tab | Open pane in current tab (split) | Adopt single pane into current tab | Adopt single pane |
+| **Right-click** | Context menu (close, rename) | Dismiss / Reopen | Adopt / Adopt as new tab | Dismiss |
+| **Drag pane** | Reorder (future) | — | Drop into current tab layout | — |
+
+**Pane-level adoption** is key: you don't have to take an entire remote tab. You can grab a single pane (a terminal, browser, editor) and drop it into your current tab's layout. Same pattern as the existing terminals selector — but supporting all pane types.
+
+### 8.4 Filtering & Sorting
+
+Follows the same patterns as the Sessions panel:
+
+**Filter** (search box at top):
+- Searches: tab title, pane titles, device name, mode/provider
+- Case-insensitive substring match
+- Instant client-side filtering
+
+**Sort modes:**
+
+| Mode | Behavior |
+|------|----------|
+| **Recency** (default) | Most recently updated first, across all devices |
+| **Device** | Group by device, then recency within each group |
+| **Status** | Active first, then closed; within each: recency |
+
+**Visibility toggles** (in sort/filter dropdown):
+- Show/hide closed tabs
+- Show/hide remote devices
+- Show/hide stale devices (offline > N days)
+
+### 8.5 Device Groups
+
+Each device is a collapsible section header:
+
+- **This device** always first (labeled with local device name)
+- **Online remote devices** next (sorted by most recent activity)
+- **Offline remote devices** last (collapsed by default)
+
+Device header shows:
+- Device name
+- Online status: 🟢 connected / ⚫ "3 hours ago" / ⚫ "5 days ago"
+- Tab count badge
+- Collapse/expand toggle
+
+### 8.6 Pane Drill-Down
+
+Expanding a tab item (▶ arrow) reveals its pane tree as indented sub-items:
+
+```
+▼ freshell                    3 panes
+    ● shell (zsh)             running
+    ● claude (session abc)    running
+    ● browser (localhost:3000)
+```
+
+Each pane sub-item shows:
+- Icon for pane kind (terminal, browser, editor)
+- Title (pane title, or auto-derived from mode/URL/session)
+- Terminal status dot (running/exited) for terminal panes
+- Click to open that specific pane (in current tab as a split, or as a new tab)
+
+This mirrors how the Sessions sidebar lets you click to open a session — but at the pane granularity level, and for all pane types (not just terminals).
+
+### 8.7 Tab Bar Changes
+
+The tab bar itself stays minimal:
+- **Only local active tabs** — no closed tabs, no remote tabs in the tab bar
+- Existing tab bar behavior unchanged
+- When a closed/remote tab is opened from the sidebar, it appears in the tab bar as a normal active tab
+
+### 8.8 Replacing Background Sessions
+
+The `BackgroundSessions` component (polling `terminal.list` every 5s) is fully replaced by the Tabs panel:
+
+- **Local closed tabs** show your own detached terminals with full context (tab title, pane layout, not just "terminal-abc123")
+- **Remote device tabs** show other machines' terminals, browsable and adoptable
+- **Orphan terminals** (running PTYs with no tab on any device) are surfaced as synthetic entries under a `(server)` pseudo-device group
+- **No polling** — all state is pushed via WebSocket workspace events
+- **Richer context** — see the original tab name, pane layout, and per-terminal status instead of a flat terminal list
 
 ---
 
@@ -489,23 +593,28 @@ Intercepts `tabs/*` and `panes/*` actions, debounces, and pushes to server:
 // - Skip if WS not connected (degrade gracefully)
 ```
 
-### 10.2 New: `remoteDevicesSlice`
+### 10.2 New: `workspaceSlice`
+
+Holds all device workspace data (local + remote) received from the server:
 
 ```typescript
-type RemoteDevicesState = {
-  devices: DeviceWorkspaceWithStatus[]   // all devices except local
-  localClosedTabs: ClosedTabWithStatus[] // this device's closed tabs from server
+type WorkspaceState = {
+  devices: Record<string, DeviceWorkspaceWithStatus>  // keyed by device name
+  localDeviceName: string | null                      // this client's device name
 }
 
 // Reducers:
-//   setAllDevices(devices[])       — from workspace.state
-//   updateDevice(device)           — from workspace.device-updated
+//   setAllDevices(devices[])       — from workspace.state (initial load)
+//   updateDevice(device)           — from workspace.device-updated (incremental)
 //   setClosedTabs(deviceName, tabs) — from workspace.closed-tabs
+//   setLocalDeviceName(name)       — from settings/hello
 
 // Selectors:
-//   selectRemoteDevices            — other devices with their tabs
+//   selectLocalDevice              — this device's workspace (own tabs + closed tabs)
+//   selectRemoteDevices            — all other devices' workspaces
+//   selectAllDevices               — all devices (for the Tabs panel)
 //   selectLocalClosedTabs          — this device's closed tabs
-//   selectOnlineDevices            — devices with active WS connections
+//   selectDeviceByName(name)       — single device lookup
 ```
 
 ### 10.3 New: `deviceNameSlice` (or extend `settingsSlice`)
@@ -525,12 +634,18 @@ On `workspace.state`:
 - For own device: if localStorage exists, keep local, push sync to server
 - Set local closed tabs from own device's closedTabs
 
-### 10.5 Modified: Tab Bar
+### 10.5 New: Tabs Sidebar Panel
 
-- Render local active tabs (unchanged)
-- Render local closed tabs (new, greyed section)
-- Render remote device tab groups (new, rightmost section)
-- Click handlers for adopt and reopen flows
+New component: `TabsPanel` (in `src/components/TabsPanel.tsx` or similar)
+
+- New 5th nav button in sidebar: "Tabs"
+- Virtualized list (react-window) following same pattern as Sessions panel
+- Device-grouped sections with collapse/expand
+- Filter/sort using selectors in `tabsPanelSelectors.ts` (same pattern as `sidebarSelectors.ts`)
+- Pane drill-down: expandable items showing pane tree
+- Click handlers: jump (local active), reopen (local closed), adopt (remote)
+- Context menus following existing `data-context` pattern
+- Tab bar itself unchanged — only local active tabs, no remote/closed
 
 ---
 
@@ -592,12 +707,13 @@ On `workspace.state`:
 2. **WorkspaceStore** — per-device persistence (file I/O, mutex, prune)
 3. **WS message schemas** — Zod schemas for all new message types
 4. **WS handler integration** — device-aware sync/broadcast, capability negotiation, `deviceName` in hello
-5. **remoteDevicesSlice** — client Redux state for remote devices + local closed tabs
+5. **workspaceSlice** — client Redux state for all devices' workspaces
 6. **workspaceSyncMiddleware** — debounced push, tab-closed capture
 7. **Connection handler** — hydration on connect, push local state
-8. **Tab bar UI** — closed tabs, remote device groups, adopt flow
-9. **Replace BackgroundSessions** — orphan terminal surfacing on `(server)` pseudo-device
-10. **E2E tests**
+8. **Tabs sidebar panel** — new nav button, device-grouped list, filter/sort, pane drill-down
+9. **Adopt/reopen flows** — click handlers for remote tab adoption, closed tab reopening, single-pane adoption
+10. **Replace BackgroundSessions** — orphan terminal surfacing on `(server)` pseudo-device
+11. **E2E tests**
 
 ---
 
@@ -607,12 +723,10 @@ On `workspace.state`:
 
 2. **Adopt vs. mirror:** When you adopt a tab, should it be a one-time clone (independent from that point) or a live mirror that stays in sync with the source device? Proposed: one-time clone (simpler, no ongoing sync coupling between devices).
 
-3. **Tab title decoration:** How to show device provenance? Options:
-   - `freshell (danshapiro-main)` in the tab title
-   - Small device badge below the tab
-   - Separate grouped section with device header label
-   - Color-coded per device
+3. **Pane adoption granularity:** When adopting a single pane from a remote tab, should it open as a split in the current tab, or as a new tab with one pane? Proposed: split in current tab (matches existing "open terminal" from sidebar), with right-click option to open as new tab.
 
-4. **Should remote closed tabs be visible?** Or only remote active tabs? Proposed: both, but remote closed tabs are lower priority and could be hidden behind an expand toggle.
+4. **Should remote closed tabs be visible?** Or only remote active tabs? Proposed: both, but remote closed tabs are collapsed by default within their device group. Visibility toggle in the filter dropdown.
 
-5. **Workspace profiles:** Out of scope for v1, but the per-device data model supports it naturally — a "profile" could be a snapshot of a device's workspace that you can restore later.
+5. **Sidebar nav space:** Adding a 5th nav button (Tabs) alongside Terminal, Sessions, Overview, Settings. Is this too many? Could combine with Sessions panel as a second "mode" within it, but that adds complexity. Proposed: separate button — it's a distinct concept.
+
+6. **Workspace profiles:** Out of scope for v1, but the per-device data model supports it naturally — a "profile" could be a named snapshot of a device's workspace that you can restore later.
