@@ -36,6 +36,14 @@ it('rejects binding the same session key to a second terminal', () => {
   expect(second.ok).toBe(false)
   expect(second.reason).toBe('session_already_owned')
 })
+
+it('is idempotent when binding the same provider/session to the same terminal', () => {
+  const authority = new SessionBindingAuthority()
+  const first = authority.bind({ provider: 'codex', sessionId: 's1', terminalId: 't1' })
+  const second = authority.bind({ provider: 'codex', sessionId: 's1', terminalId: 't1' })
+  expect(first.ok).toBe(true)
+  expect(second.ok).toBe(true)
+})
 ```
 
 **Step 2: Add failing integration regression for repeated onUpdate snapshots**
@@ -92,7 +100,7 @@ export class SessionBindingAuthority {
   private bySession = new Map<SessionCompositeKey, string>()
   private byTerminal = new Map<string, SessionCompositeKey>()
 
-  bind(input: { provider: CodingCliProviderName; sessionId: string; terminalId: string }) {
+  bind(input: { provider: CodingCliProviderName; sessionId: string; terminalId: string }): BindResult {
     const key = makeSessionKey(input.provider, input.sessionId)
     const owner = this.bySession.get(key)
     if (owner && owner !== input.terminalId) return { ok: false as const, reason: 'session_already_owned', owner }
@@ -107,7 +115,7 @@ export class SessionBindingAuthority {
     return this.bySession.get(makeSessionKey(provider, sessionId))
   }
 
-  unbindTerminal(terminalId: string): { ok: boolean; key?: SessionCompositeKey; reason?: 'not_bound' } {
+  unbindTerminal(terminalId: string): UnbindResult {
     const key = this.byTerminal.get(terminalId)
     if (!key) return { ok: false, reason: 'not_bound' }
     this.byTerminal.delete(terminalId)
@@ -115,21 +123,34 @@ export class SessionBindingAuthority {
     return { ok: true, key }
   }
 }
+
+type BindResult =
+  | { ok: true; key: SessionCompositeKey }
+  | { ok: false; reason: 'session_already_owned'; owner: string }
+  | { ok: false; reason: 'terminal_already_bound'; existing: SessionCompositeKey }
+
+type UnbindResult =
+  | { ok: true; key: SessionCompositeKey }
+  | { ok: false; reason: 'not_bound' }
 ```
 
 **Step 2: Replace raw `setResumeSessionId` writes with guarded bind path**
 
 ```ts
-bindSession(terminalId: string, mode: TerminalMode, sessionId: string): BindResult {
-  if (!modeSupportsResume(mode)) return { ok: false, reason: 'mode_not_bindable' }
-  const provider = mode as CodingCliProviderName
-  const auth = this.bindingAuthority.bind({ provider, sessionId, terminalId })
-  if (!auth.ok) return auth
+bindSession(terminalId: string, provider: CodingCliProviderName, sessionId: string): BindSessionResult {
   const term = this.terminals.get(terminalId)
   if (!term) return { ok: false, reason: 'terminal_missing' }
+  if (term.mode !== provider) return { ok: false, reason: 'mode_mismatch' }
+  const auth = this.bindingAuthority.bind({ provider, sessionId, terminalId })
+  if (!auth.ok) return auth
   term.resumeSessionId = sessionId
   return { ok: true, terminalId, sessionId }
 }
+
+type BindSessionResult =
+  | { ok: true; terminalId: string; sessionId: string }
+  | { ok: false; reason: 'terminal_missing' | 'mode_mismatch' }
+  | BindResult
 ```
 
 **Step 3: Add unbind on terminal shutdown/exit**
@@ -190,6 +211,10 @@ type SessionWatermark = Map<SessionCompositeKey, number> // provider+sessionId -
 collectNewOrAdvanced(projects: ProjectGroup[]): CodingCliSession[] {
   // emit only sessions whose updatedAt increased (or unseen)
 }
+
+associateSingleSession(session: CodingCliSession): { associated: boolean; terminalId?: string } {
+  // single-session entrypoint used by claudeIndexer.onNewSession
+}
 ```
 
 **Step 3: Wire `codingCliIndexer.onUpdate` to coordinator + `registry.bindSession`**
@@ -208,7 +233,13 @@ for (const session of candidates) {
 ```ts
 // Keep Claude onNewSession path, but route through the same coordinator + authority
 claudeIndexer.onNewSession((session) => {
-  const result = coordinator.associateClaudeSession(session)
+  const result = coordinator.associateSingleSession({
+    provider: 'claude',
+    sessionId: session.sessionId,
+    projectPath: session.projectPath,
+    updatedAt: session.updatedAt,
+    cwd: session.cwd,
+  })
   if (!result?.associated) return
   wsHandler.broadcast({
     type: 'terminal.session.associated',
@@ -266,7 +297,9 @@ getCanonicalRunningTerminalBySession(mode: TerminalMode, sessionId: string) {
 
 repairLegacySessionOwners(mode: TerminalMode, sessionId: string) {
   // Legacy = terminal has resumeSessionId set but authority has no owner mapping yet.
-  // Choose earliest-created running terminal as owner, bind it, clear duplicates.
+  // Choose earliest-created running terminal as owner, bind it.
+  // For non-canonical duplicates: set terminal.resumeSessionId = undefined,
+  // remove any stale authority mapping, keep process running (no kill), and emit metadata upsert.
 }
 ```
 
@@ -304,6 +337,8 @@ git commit -m "fix: enforce canonical session owner reuse in terminal.create and
 ### Task 5: Add Server Identity to Tab Registry Records and WS Handshake
 
 **Files:**
+- Create: `server/instance-id.ts`
+- Modify: `server/index.ts`
 - Modify: `server/ws-handler.ts`
 - Modify: `server/tabs-registry/types.ts`
 - Modify: `server/tabs-registry/store.ts`
@@ -329,6 +364,12 @@ expect(ready.serverInstanceId).toBeTypeOf('string')
 ```
 
 **Step 2: Extend handshake + record schema**
+
+```ts
+// index.ts bootstrap
+const serverInstanceId = await loadOrCreateServerInstanceId() // persisted under ~/.freshell/instance-id
+const wsHandler = new WsHandler(..., tabsStore, serverInstanceId)
+```
 
 ```ts
 // ws hello response
@@ -377,7 +418,7 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add server/ws-handler.ts server/tabs-registry/types.ts server/tabs-registry/store.ts src/store/tabRegistryTypes.ts src/lib/ws-client.ts src/store/connectionSlice.ts src/App.tsx test/server/ws-tabs-registry.test.ts test/unit/server/tabs-registry/types.test.ts test/unit/client/components/App.ws-bootstrap.test.tsx
+git add server/instance-id.ts server/index.ts server/ws-handler.ts server/tabs-registry/types.ts server/tabs-registry/store.ts src/store/tabRegistryTypes.ts src/lib/ws-client.ts src/store/connectionSlice.ts src/App.tsx test/server/ws-tabs-registry.test.ts test/unit/server/tabs-registry/types.test.ts test/unit/client/components/App.ws-bootstrap.test.tsx
 git commit -m "feat: include server instance identity in tabs sync contract and handshake metadata"
 ```
 
@@ -429,6 +470,7 @@ return {
 Migration note:
 - Keep writing both `sessionRef` and `resumeSessionId` for one compatibility cycle.
 - After migration lands and old records age out, remove `resumeSessionId` from registry snapshot payload writes (runtime state still keeps it in live pane content).
+- Add a tracking TODO + dated note in `src/lib/tab-registry-snapshot.ts` (`remove after 2026-04-30`) so cleanup is scheduled, not open-ended.
 
 **Step 3: Gate rehydration in `TabsView.sanitizePaneSnapshot`**
 
@@ -447,6 +489,12 @@ function extractSessionRef(content: PaneContent): SessionLocator | undefined {
   }
   // legacy fallback continues to read resumeSessionId
 }
+```
+
+```ts
+// Update callers to tolerate extended shape but keep provider/sessionId contract.
+// Existing helpers (findTabIdForSession/findPaneForSession/getSessionsForHello)
+// continue reading provider+sessionId only.
 ```
 
 **Step 4: Update `TerminalView` association mirroring to preserve sessionRef**
@@ -481,7 +529,7 @@ git commit -m "refactor: separate portable session references from local resume 
 ### Task 7: End-to-End Regression Coverage + Observability
 
 **Files:**
-- Modify: `test/integration/server/codex-session-flow.test.ts`
+- Create: `test/integration/server/codex-session-rebind-regression.test.ts`
 - Modify: `test/e2e/tabs-view-flow.test.tsx`
 - Modify: `server/index.ts`
 - Modify: `server/terminal-registry.ts`
@@ -516,7 +564,7 @@ log.info({ provider, sessionId, repairedTerminalId }, 'session_bind_repair_appli
 
 Run:
 ```bash
-npx vitest run --config vitest.server.config.ts test/integration/server/codex-session-flow.test.ts
+npx vitest run --config vitest.server.config.ts test/integration/server/codex-session-rebind-regression.test.ts
 npx vitest run test/e2e/tabs-view-flow.test.tsx
 ```
 Expected: PASS.
@@ -524,7 +572,7 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add test/integration/server/codex-session-flow.test.ts test/e2e/tabs-view-flow.test.tsx server/index.ts server/terminal-registry.ts
+git add test/integration/server/codex-session-rebind-regression.test.ts test/e2e/tabs-view-flow.test.tsx server/index.ts server/terminal-registry.ts
 git commit -m "test: add codex misassignment regressions and tabs cross-machine resume safety coverage"
 ```
 
