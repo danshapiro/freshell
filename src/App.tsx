@@ -28,6 +28,7 @@ import TabContent from '@/components/TabContent'
 import HistoryView from '@/components/HistoryView'
 import SettingsView from '@/components/SettingsView'
 import OverviewView from '@/components/OverviewView'
+import { ErrorBoundary } from '@/components/ui/error-boundary'
 import PaneDivider from '@/components/panes/PaneDivider'
 import { AuthRequiredModal } from '@/components/AuthRequiredModal'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
@@ -405,9 +406,21 @@ export default function App() {
   }, [tabs.length, dispatch])
 
   const content = (() => {
-    if (view === 'sessions') return <HistoryView onOpenSession={() => setView('terminal')} />
-    if (view === 'settings') return <SettingsView />
-    if (view === 'overview') return <OverviewView onOpenTab={() => setView('terminal')} />
+    if (view === 'sessions') return (
+      <ErrorBoundary label="Sessions" onNavigate={() => setView('overview')}>
+        <HistoryView onOpenSession={() => setView('terminal')} />
+      </ErrorBoundary>
+    )
+    if (view === 'settings') return (
+      <ErrorBoundary label="Settings" onNavigate={() => setView('overview')}>
+        <SettingsView />
+      </ErrorBoundary>
+    )
+    if (view === 'overview') return (
+      <ErrorBoundary label="Overview">
+        <OverviewView onOpenTab={() => setView('terminal')} />
+      </ErrorBoundary>
+    )
     return (
       <div className="flex flex-col h-full">
         <TabBar />
