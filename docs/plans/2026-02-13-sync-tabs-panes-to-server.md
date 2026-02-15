@@ -317,18 +317,26 @@ User closes tab on danshapiro-main
   → danshapiro-main sees it in its own greyed section
 ```
 
-### 5.5 Reconnecting to Same Device
+### 5.5 Reconnecting to Same Device (Local Detached Tabs)
 
 ```
 danshapiro-main browser crashes and reopens
   → Connects with deviceName="danshapiro-main"
   → Receives workspace.state including its own device data
   → Client checks: localStorage empty (crash cleared it)
-  → Hydrates from server's devices["danshapiro-main"] data
-  → Tabs restored, terminal panes reattach to still-running PTYs
+  → Server's devices["danshapiro-main"].tabs has 3 tabs from before the crash
+  → These appear as "detached" in the Tabs sidebar panel
+    (they're in the server's tabs[] for this device, but not in local Redux)
+  → User can:
+    a) Click "Reclaim all" on the device header → hydrate all detached tabs at once
+    b) Click individual detached tabs → reclaim one at a time
+    c) Ignore them → they stay detached, terminals keep running until idle timeout
+  → Reclaimed tabs appear in the tab bar, terminal panes reattach to still-running PTYs
 ```
 
-This is the primary "sync to yourself on the same machine" use case — surviving browser crashes/refreshes even when localStorage is lost.
+This is the primary "sync to yourself on the same machine" use case — surviving browser crashes/refreshes. The detached state makes this explicit: the user sees what was running and chooses what to restore, rather than a silent full hydration that might restore 20 tabs they don't need right now.
+
+**Auto-reclaim option:** For users who always want full restore, a setting `workspace.autoReclaimLocalTabs: boolean` (default false) skips the sidebar and hydrates all local detached tabs immediately on connect. This is the "just put everything back" mode.
 
 ---
 
@@ -391,7 +399,24 @@ After initial connect, only `workspace.device-updated` messages are sent (~6 KB 
 
 The tab bar stays clean (only local active tabs). All cross-device browsing, closed tab management, and pane-level drill-down lives in a new **Tabs** sidebar panel — the 5th nav button alongside Terminal, Sessions, Overview, and Settings.
 
-### 8.1 Sidebar Layout
+### 8.1 Tab States
+
+A tab in the sidebar has one of four states, derived from the combination of tab data and device connection status:
+
+| State | Meaning | Visual | Source data |
+|-------|---------|--------|-------------|
+| **active** | Open in this browser right now | Normal text, solid icon | Local Redux `tabs` state |
+| **closed** | Explicitly closed by user | Greyed, italic, "(closed)" label | `closedTabs[]` on any device |
+| **detached** | Was active on a device that's now offline (never explicitly closed) | Dimmed but not italic, "detached" label | `tabs[]` on an offline device |
+| **orphan** | Running terminal with no tab on any device | Dimmed, "(orphan)" label | Server terminal registry with no matching tab |
+
+The key distinction: **closed** = user intentionally closed the tab. **Detached** = the device went away (crashed, browser closed, laptop lid shut) but the tab was never closed — its terminals may still be running.
+
+This matters for both local and remote:
+- **Local detached**: You reconnect after a crash. Server has your old active tabs. Your browser has no localStorage. Those server-side tabs are "detached from your current session" — you probably want to reclaim them.
+- **Remote detached**: Another device went offline. Its "active" tabs are really detached — the device might come back, or you might want to adopt them.
+
+### 8.2 Sidebar Layout
 
 ```
 ┌─────────────────────────────────┐
@@ -403,21 +428,26 @@ The tab bar stays clean (only local active tabs). All cross-device browsing, clo
 ├─────────────────────────────────┤
 │ ▼ This device (dan-laptop)      │  ← collapsible group
 │   ● freshell          3 panes   │  ← active, click = jump
-│   ● api-server        1 pane    │
-│   ○ old-debug (closed) 2 panes  │  ← closed, click = reopen
+│   ● api-server        1 pane    │  ← active
+│   ◐ old-build (detached) 1 pane │  ← detached (from previous session)
+│   ○ old-debug (closed) 2 panes  │  ← explicitly closed
 ├─────────────────────────────────┤
-│ ▼ danshapiro-main  🟢 online    │  ← remote device group
-│   ● freshell          3 panes   │  ← click = adopt
-│   ● api-server        1 pane    │
-│   ○ old-debug (closed) 2 panes  │
+│ ▼ danshapiro-main  🟢 online    │  ← remote, connected
+│   ● freshell          3 panes   │  ← active on that device
+│   ○ old-debug (closed) 2 panes  │  ← closed on that device
 ├─────────────────────────────────┤
-│ ▶ dan-office  ⚫ 3 days ago     │  ← collapsed, stale
+│ ▼ dan-office  ⚫ 3 days ago     │  ← remote, offline
+│   ◐ api-server (detached) 2p   │  ← was active when device went offline
+│   ○ old-test (closed) 1 pane   │  ← was explicitly closed before offline
+├─────────────────────────────────┤
+│ ▼ (server)                      │  ← pseudo-device for orphans
+│   ◐ terminal-abc123   1 pane    │  ← running PTY, no tab anywhere
 └─────────────────────────────────┘
 ```
 
-### 8.2 Item Structure
+### 8.3 Item Structure
 
-Each item in the list is a **tab** (active or closed, local or remote). Follows the same `SidebarItem` pattern as Sessions:
+Each item in the list is a **tab** in one of the four states. Follows the same `SidebarItem` pattern as Sessions:
 
 ```typescript
 interface TabsPanelItem {
@@ -432,9 +462,10 @@ interface TabsPanelItem {
   paneCount: number             // badge: "3 panes"
   createdAt: number
 
-  // State
-  status: 'active' | 'closed'
-  terminalStatuses: Array<{     // for status dots
+  // State (see 8.1 for definitions)
+  status: 'active' | 'closed' | 'detached' | 'orphan'
+  deviceOnline: boolean         // is the owning device currently connected?
+  terminalStatuses: Array<{     // per-terminal liveness
     terminalId: string
     status: 'running' | 'exited' | 'gone'
   }>
@@ -454,17 +485,30 @@ interface TabsPanelPaneItem {
 }
 ```
 
-### 8.3 Interactions
+**Deriving status:**
+- `active` — tab is in `tabs[]` of a device AND that device is the local device with the tab in Redux OR the device is currently connected (online)
+- `detached` — tab is in `tabs[]` of a device that is NOT currently connected (offline). Also: local tabs from server state that aren't in the current browser's Redux (reconnect after crash)
+- `closed` — tab is in `closedTabs[]` of any device (regardless of device online/offline)
+- `orphan` — terminal exists in server registry but has no matching tab in any device's `tabs[]` or `closedTabs[]`
 
-| Action | Local Active Tab | Local Closed Tab | Remote Active Tab | Remote Closed Tab |
-|--------|-----------------|-----------------|-------------------|-------------------|
-| **Click** | Jump to tab | Reopen tab (restore layout, reattach PTYs) | Adopt tab (clone locally, attach to same PTYs) | Adopt closed tab (clone + reopen) |
-| **Expand (▶)** | Show panes | Show pane snapshot | Show panes | Show pane snapshot |
-| **Click pane** | Focus that pane in the tab | Open pane in current tab (split) | Adopt single pane into current tab | Adopt single pane |
-| **Right-click** | Context menu (close, rename) | Dismiss / Reopen | Adopt / Adopt as new tab | Dismiss |
-| **Drag pane** | Reorder (future) | — | Drop into current tab layout | — |
+### 8.4 Interactions
 
-**Pane-level adoption** is key: you don't have to take an entire remote tab. You can grab a single pane (a terminal, browser, editor) and drop it into your current tab's layout. Same pattern as the existing terminals selector — but supporting all pane types.
+| Action | **Active** (local) | **Active** (remote online) | **Detached** (any device) | **Closed** (any device) | **Orphan** |
+|--------|-------------------|---------------------------|--------------------------|------------------------|------------|
+| **Click** | Jump to tab | Adopt (clone locally, attach PTYs) | Reclaim/adopt (open locally, attach PTYs) | Reopen/adopt (restore layout, reattach) | Adopt (create tab for terminal) |
+| **Expand** | Show panes | Show panes | Show pane snapshot | Show pane snapshot | Show terminal |
+| **Click pane** | Focus pane | Adopt single pane | Adopt single pane | Adopt single pane | Adopt terminal pane |
+| **Right-click** | Close, rename | Adopt / Adopt as new tab | Reclaim / Dismiss | Reopen / Dismiss | Adopt / Kill terminal |
+
+**Key interactions by state:**
+
+- **Active local** → jump to it (it's already in your tab bar)
+- **Active remote** → adopt = clone the tab+layout into your local workspace, attach to the same server-side PTYs
+- **Detached** (local or remote) → same as adopt, but these are tabs whose owning device went away. For local detached (your own device after a crash), this is "reclaim" — restore your previous session. The action is identical either way: create a local tab from the server-side data.
+- **Closed** → reopen = move from closedTabs back to active, restore layout, reattach terminals if still running
+- **Orphan** → adopt = create a brand new tab wrapping the orphan terminal
+
+**Pane-level adoption** is key: you don't have to take an entire remote/detached/closed tab. You can grab a single pane (terminal, browser, editor) and add it to your current tab's layout as a split. Same pattern as the existing terminals selector — but supporting all pane types and all tab states.
 
 ### 8.4 Filtering & Sorting
 
@@ -485,8 +529,10 @@ Follows the same patterns as the Sessions panel:
 
 **Visibility toggles** (in sort/filter dropdown):
 - Show/hide closed tabs
+- Show/hide detached tabs (from offline devices)
 - Show/hide remote devices
 - Show/hide stale devices (offline > N days)
+- Show/hide orphan terminals
 
 ### 8.5 Device Groups
 
@@ -643,7 +689,7 @@ New component: `TabsPanel` (in `src/components/TabsPanel.tsx` or similar)
 - Device-grouped sections with collapse/expand
 - Filter/sort using selectors in `tabsPanelSelectors.ts` (same pattern as `sidebarSelectors.ts`)
 - Pane drill-down: expandable items showing pane tree
-- Click handlers: jump (local active), reopen (local closed), adopt (remote)
+- Click handlers: jump (active local), reclaim (detached), reopen (closed), adopt (remote active/detached/closed), adopt (orphan)
 - Context menus following existing `data-context` pattern
 - Tab bar itself unchanged — only local active tabs, no remote/closed
 
@@ -663,11 +709,16 @@ New component: `TabsPanel` (in `src/components/TabsPanel.tsx` or similar)
 
 | Scenario | Behavior |
 |----------|----------|
+| **Local detached: browser crash, reopen** | Server has this device's old active tabs. They appear as "detached" in sidebar. User reclaims individually or all at once. Terminals still running → reattach. Terminals exited → show scrollback or "exited" status. |
+| **Local detached: different browser on same machine** | Same as crash. Device name matches, but new browser has no localStorage. Old tabs show as detached. |
+| **Local detached + localStorage exists** | Both sources present. Local Redux (from localStorage) wins for active tabs. Server-side tabs NOT in local Redux show as detached (they're from a previous session that localStorage doesn't know about). |
+| **Remote detached: device goes offline** | Its active tabs transition from "active (remote)" to "detached" in the sidebar. Terminals may still be running on the server. Fully adoptable. |
+| **Remote detached for weeks** | Device pruned after 30-day stale TTL. Its tabs disappear from sidebar. Terminals likely already reaped by idle timeout. |
+| **Closed tab on offline device** | Stays in that device's `closedTabs[]`. Visible in sidebar under that device's group as "closed". Adoptable if terminals still running. |
 | Two browser tabs, same device name | Both push to same device slot. Last write wins (same as current localStorage behavior). BroadcastChannel keeps them in sync locally. |
 | Device name collision (two machines with same hostname) | Unlikely but handled: last writer wins for that slot. User should rename one device in Settings. |
 | Adopt a tab whose terminals have exited | Panes show `status: 'exited'`. User can see scrollback (if still in server buffer) or close. |
-| Remote device disconnects | Its tabs remain visible. `lastSeenAt` stops updating. Online indicator goes grey. Tabs still adoptable if terminals are running. |
-| Server restart | `workspace.json` on disk survives. All devices' data preserved. |
+| Server restart | `workspace.json` on disk survives. All devices' data preserved. All devices appear as offline/detached until they reconnect. |
 | `workspace.json` corrupted | Server logs error, starts fresh. Each device pushes on next connect. |
 | 20+ devices over time | Oldest by `lastSeenAt` pruned automatically. |
 | Device has 200+ tabs | Server rejects the sync with a warning. Client keeps local state. |
