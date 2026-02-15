@@ -3,6 +3,7 @@ import express, { type Express } from 'express'
 import request from 'supertest'
 import fsp from 'fs/promises'
 import path from 'path'
+import { z } from 'zod'
 import os from 'os'
 
 // Use vi.hoisted to ensure mockState is available before vi.mock runs
@@ -80,13 +81,115 @@ describe('Settings API Integration', () => {
       return patch
     }
 
+    // Keep in sync with SettingsPatchSchema in server/index.ts
+    const CodingCliProviderConfigSchema = z
+      .object({
+        model: z.string().optional(),
+        sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+        permissionMode: z.enum(['default', 'plan', 'acceptEdits', 'bypassPermissions']).optional(),
+        maxTurns: z.coerce.number().optional(),
+        cwd: z.string().optional(),
+      })
+      .strict()
+
+    const SettingsPatchSchema = z
+      .object({
+        theme: z.enum(['system', 'light', 'dark']).optional(),
+        uiScale: z.coerce.number().optional(),
+        terminal: z
+          .object({
+            fontSize: z.coerce.number().optional(),
+            lineHeight: z.coerce.number().optional(),
+            cursorBlink: z.coerce.boolean().optional(),
+            scrollback: z.coerce.number().optional(),
+            theme: z
+              .enum([
+                'auto',
+                'dracula',
+                'one-dark',
+                'solarized-dark',
+                'github-dark',
+                'one-light',
+                'solarized-light',
+                'github-light',
+              ])
+              .optional(),
+            warnExternalLinks: z.coerce.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        defaultCwd: z.string().nullable().optional(),
+        logging: z
+          .object({
+            debug: z.coerce.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        safety: z
+          .object({
+            autoKillIdleMinutes: z.coerce.number().optional(),
+            warnBeforeKillMinutes: z.coerce.number().optional(),
+          })
+          .strict()
+          .optional(),
+        panes: z
+          .object({
+            defaultNewPane: z.enum(['ask', 'shell', 'browser', 'editor']).optional(),
+            snapThreshold: z.coerce.number().optional(),
+            tabAttentionStyle: z.enum(['highlight', 'pulse', 'darken', 'none']).optional(),
+            attentionDismiss: z.enum(['click', 'type']).optional(),
+          })
+          .strict()
+          .optional(),
+        sidebar: z
+          .object({
+            sortMode: z.enum(['recency', 'activity', 'project']).optional(),
+            showProjectBadges: z.coerce.boolean().optional(),
+            showSubagents: z.coerce.boolean().optional(),
+            showNoninteractiveSessions: z.coerce.boolean().optional(),
+            width: z.coerce.number().optional(),
+            collapsed: z.coerce.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        notifications: z
+          .object({
+            soundEnabled: z.coerce.boolean().optional(),
+          })
+          .strict()
+          .optional(),
+        codingCli: z
+          .object({
+            enabledProviders: z
+              .array(z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi']))
+              .optional(),
+            providers: z
+              .record(
+                z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi']),
+                CodingCliProviderConfigSchema,
+              )
+              .optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+
     app.patch('/api/settings', async (req, res) => {
-      const updated = await configStore.patchSettings(normalizeSettingsPatch(req.body || {}))
+      const parsed = SettingsPatchSchema.safeParse(req.body || {})
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
+      }
+      const updated = await configStore.patchSettings(normalizeSettingsPatch(parsed.data as any))
       res.json(updated)
     })
 
     app.put('/api/settings', async (req, res) => {
-      const updated = await configStore.patchSettings(normalizeSettingsPatch(req.body || {}))
+      const parsed = SettingsPatchSchema.safeParse(req.body || {})
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
+      }
+      const updated = await configStore.patchSettings(normalizeSettingsPatch(parsed.data as any))
       res.json(updated)
     })
   })
@@ -404,48 +507,115 @@ describe('Settings API Integration', () => {
   })
 
   describe('Invalid settings handling', () => {
-    // Note: The current server implementation does not validate settings values
-    // These tests document the actual behavior
-
-    it('accepts unknown top-level fields (passes through)', async () => {
+    it('rejects unknown top-level fields', async () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .send({ unknownField: 'value' })
 
-      // Server accepts it (no validation)
-      expect(res.status).toBe(200)
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('Invalid request')
+      expect(res.body.details).toBeDefined()
     })
 
-    it('accepts invalid theme value (no validation)', async () => {
+    it('rejects invalid theme value', async () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .send({ theme: 'invalid-theme' })
 
-      // Server accepts it (no validation in current implementation)
-      expect(res.status).toBe(200)
-      expect(res.body.theme).toBe('invalid-theme')
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('Invalid request')
     })
 
-    it('accepts non-numeric fontSize (no validation)', async () => {
+    it('rejects non-coercible fontSize', async () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .send({ terminal: { fontSize: 'not-a-number' } })
 
-      // Server accepts it (no validation in current implementation)
-      expect(res.status).toBe(200)
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('Invalid request')
     })
 
-    it('accepts negative scrollback (no validation)', async () => {
+    it('accepts negative scrollback (coerced number)', async () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .send({ terminal: { scrollback: -100 } })
 
-      // Server accepts it (no validation in current implementation)
+      // Negative numbers are valid coerced numbers - business logic can restrict range later
       expect(res.status).toBe(200)
+    })
+
+    it('rejects unknown nested terminal field', async () => {
+      const res = await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ terminal: { unknownField: true } })
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('Invalid request')
+    })
+
+    it('rejects invalid sidebar sortMode enum', async () => {
+      const res = await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ sidebar: { sortMode: 'invalid' } })
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('Invalid request')
+    })
+
+    it('rejects non-coercible fontSize object', async () => {
+      const res = await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ terminal: { fontSize: { invalid: true } } })
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('Invalid request')
+    })
+
+    it('coerces string numbers to actual numbers', async () => {
+      const res = await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ terminal: { fontSize: '18' } })
+
+      expect(res.status).toBe(200)
+      expect(res.body.terminal.fontSize).toBe(18)
+    })
+
+    it('rejects invalid panes defaultNewPane enum', async () => {
+      const res = await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ panes: { defaultNewPane: 'invalid' } })
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('Invalid request')
+    })
+
+    it('rejects invalid codingCli provider name', async () => {
+      const res = await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ codingCli: { enabledProviders: ['nonexistent'] } })
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('Invalid request')
+    })
+
+    it('validates PUT endpoint the same as PATCH', async () => {
+      const res = await request(app)
+        .put('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ unknownField: 'value' })
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('Invalid request')
     })
   })
 
@@ -558,11 +728,10 @@ describe('Settings API Integration', () => {
         .send({
           terminal: {
             fontSize: 14,
-            fontFamily: 'monospace',
             lineHeight: 1.5,
             cursorBlink: false,
             scrollback: 3000,
-            theme: 'light',
+            theme: 'one-light',
           },
         })
 
@@ -572,10 +741,9 @@ describe('Settings API Integration', () => {
         lineHeight: 1.5,
         cursorBlink: false,
         scrollback: 3000,
-        theme: 'light',
+        theme: 'one-light',
         warnExternalLinks: true,
       })
-      expect(res.body.terminal).not.toHaveProperty('fontFamily')
     })
   })
 

@@ -292,6 +292,100 @@ async function main() {
     res.json({ directories })
   })
 
+  // Keep in sync with AppSettings type in config-store.ts
+  const CodingCliProviderConfigSchema = z
+    .object({
+      model: z.string().optional(),
+      sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+      permissionMode: z.enum(['default', 'plan', 'acceptEdits', 'bypassPermissions']).optional(),
+      maxTurns: z.coerce.number().optional(),
+      cwd: z.string().optional(),
+    })
+    .strict()
+
+  const SettingsPatchSchema = z
+    .object({
+      theme: z.enum(['system', 'light', 'dark']).optional(),
+      uiScale: z.coerce.number().optional(),
+      terminal: z
+        .object({
+          fontSize: z.coerce.number().optional(),
+          lineHeight: z.coerce.number().optional(),
+          cursorBlink: z.coerce.boolean().optional(),
+          scrollback: z.coerce.number().optional(),
+          theme: z
+            .enum([
+              'auto',
+              'dracula',
+              'one-dark',
+              'solarized-dark',
+              'github-dark',
+              'one-light',
+              'solarized-light',
+              'github-light',
+            ])
+            .optional(),
+          warnExternalLinks: z.coerce.boolean().optional(),
+        })
+        .strict()
+        .optional(),
+      defaultCwd: z.string().nullable().optional(),
+      logging: z
+        .object({
+          debug: z.coerce.boolean().optional(),
+        })
+        .strict()
+        .optional(),
+      safety: z
+        .object({
+          autoKillIdleMinutes: z.coerce.number().optional(),
+          warnBeforeKillMinutes: z.coerce.number().optional(),
+        })
+        .strict()
+        .optional(),
+      panes: z
+        .object({
+          defaultNewPane: z.enum(['ask', 'shell', 'browser', 'editor']).optional(),
+          snapThreshold: z.coerce.number().optional(),
+          tabAttentionStyle: z.enum(['highlight', 'pulse', 'darken', 'none']).optional(),
+          attentionDismiss: z.enum(['click', 'type']).optional(),
+        })
+        .strict()
+        .optional(),
+      sidebar: z
+        .object({
+          sortMode: z.enum(['recency', 'activity', 'project']).optional(),
+          showProjectBadges: z.coerce.boolean().optional(),
+          showSubagents: z.coerce.boolean().optional(),
+          showNoninteractiveSessions: z.coerce.boolean().optional(),
+          width: z.coerce.number().optional(),
+          collapsed: z.coerce.boolean().optional(),
+        })
+        .strict()
+        .optional(),
+      notifications: z
+        .object({
+          soundEnabled: z.coerce.boolean().optional(),
+        })
+        .strict()
+        .optional(),
+      codingCli: z
+        .object({
+          enabledProviders: z
+            .array(z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi']))
+            .optional(),
+          providers: z
+            .record(
+              z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi']),
+              CodingCliProviderConfigSchema,
+            )
+            .optional(),
+        })
+        .strict()
+        .optional(),
+    })
+    .strict()
+
   const normalizeSettingsPatch = (patch: Record<string, any>) => {
     if (Object.prototype.hasOwnProperty.call(patch, 'defaultCwd')) {
       const raw = patch.defaultCwd
@@ -305,7 +399,11 @@ async function main() {
   }
 
   app.patch('/api/settings', async (req, res) => {
-    const patch = normalizeSettingsPatch(migrateSettingsSortMode(req.body || {}) as any)
+    const parsed = SettingsPatchSchema.safeParse(req.body || {})
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
+    }
+    const patch = normalizeSettingsPatch(migrateSettingsSortMode(parsed.data) as any)
     const updated = await configStore.patchSettings(patch)
     const migrated = migrateSettingsSortMode(updated)
     registry.setSettings(migrated)
@@ -328,7 +426,11 @@ async function main() {
 
   // Alias (matches implementation plan)
   app.put('/api/settings', async (req, res) => {
-    const patch = normalizeSettingsPatch(migrateSettingsSortMode(req.body || {}) as any)
+    const parsed = SettingsPatchSchema.safeParse(req.body || {})
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
+    }
+    const patch = normalizeSettingsPatch(migrateSettingsSortMode(parsed.data) as any)
     const updated = await configStore.patchSettings(patch)
     const migrated = migrateSettingsSortMode(updated)
     registry.setSettings(migrated)
