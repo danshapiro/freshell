@@ -177,7 +177,7 @@ export const defaultSettings: AppSettings = {
     configured: false,
     mdns: {
       enabled: false,
-      hostname: os.hostname().replace(/\.local$/, '').toLowerCase(),
+      hostname: os.hostname().replace(/\.local$/, '').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 63) || 'freshell',
     },
   },
 }

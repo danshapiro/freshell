@@ -10,6 +10,14 @@ import sessionsReducer from '@/store/sessionsSlice'
 import { networkReducer } from '@/store/networkSlice'
 import { LOCAL_TERMINAL_FONT_KEY } from '@/lib/terminal-fonts'
 
+// Mock lean-qr for QR code tests
+vi.mock('lean-qr', () => ({
+  generate: () => ({ toDataArray: () => [] }),
+}))
+vi.mock('lean-qr/extras/svg', () => ({
+  toSvgDataURL: () => 'data:image/svg+xml,mock-qr',
+}))
+
 // Mock the api module
 vi.mock('@/lib/api', () => ({
   api: {
@@ -1222,6 +1230,274 @@ describe('SettingsView Component', () => {
       expect(screen.getByRole('alert')).toBeInTheDocument()
       expect(screen.getByText(/dev mode/i)).toBeInTheDocument()
       expect(screen.getByText(/npm run dev/i)).toBeInTheDocument()
+    })
+
+    it('suppresses dev-mode warning on WSL2', () => {
+      const store = configureStore({
+        reducer: {
+          settings: settingsReducer,
+          tabs: tabsReducer,
+          connection: connectionReducer,
+          sessions: sessionsReducer,
+          network: networkReducer,
+        },
+        preloadedState: {
+          settings: {
+            settings: defaultSettings,
+            loaded: true,
+            lastSavedAt: undefined,
+          },
+          network: {
+            status: {
+              configured: true,
+              host: '0.0.0.0' as const,
+              port: 3001,
+              lanIps: ['192.168.1.100'],
+              machineHostname: 'my-laptop',
+              mdns: { enabled: true, hostname: 'freshell' },
+              firewall: { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false },
+              rebinding: false,
+              devMode: true,
+              devPort: 5173,
+              accessUrl: 'http://192.168.1.100:5173/?token=abc',
+            },
+            loading: false,
+            configuring: false,
+            error: null,
+          },
+        },
+      })
+      render(
+        <Provider store={store}>
+          <SettingsView onNavigate={vi.fn()} />
+        </Provider>,
+      )
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    })
+
+    it('disables remote access toggle during rebind', () => {
+      const store = configureStore({
+        reducer: {
+          settings: settingsReducer,
+          tabs: tabsReducer,
+          connection: connectionReducer,
+          sessions: sessionsReducer,
+          network: networkReducer,
+        },
+        preloadedState: {
+          settings: {
+            settings: defaultSettings,
+            loaded: true,
+            lastSavedAt: undefined,
+          },
+          network: {
+            status: {
+              configured: true,
+              host: '0.0.0.0' as const,
+              port: 3001,
+              lanIps: ['192.168.1.100'],
+              machineHostname: 'my-laptop',
+              mdns: { enabled: true, hostname: 'freshell' },
+              firewall: { platform: 'linux-none', active: false, portOpen: null, commands: [], configuring: false },
+              rebinding: true,
+              devMode: false,
+              accessUrl: 'http://192.168.1.100:3001/?token=abc',
+            },
+            loading: false,
+            configuring: false,
+            error: null,
+          },
+        },
+      })
+      render(
+        <Provider store={store}>
+          <SettingsView onNavigate={vi.fn()} />
+        </Provider>,
+      )
+      const toggle = screen.getByRole('switch', { name: /remote access/i })
+      expect(toggle).toBeDisabled()
+    })
+
+    it('disables remote access toggle during configuring', () => {
+      const store = configureStore({
+        reducer: {
+          settings: settingsReducer,
+          tabs: tabsReducer,
+          connection: connectionReducer,
+          sessions: sessionsReducer,
+          network: networkReducer,
+        },
+        preloadedState: {
+          settings: {
+            settings: defaultSettings,
+            loaded: true,
+            lastSavedAt: undefined,
+          },
+          network: {
+            status: {
+              configured: true,
+              host: '0.0.0.0' as const,
+              port: 3001,
+              lanIps: ['192.168.1.100'],
+              machineHostname: 'my-laptop',
+              mdns: { enabled: true, hostname: 'freshell' },
+              firewall: { platform: 'linux-none', active: false, portOpen: null, commands: [], configuring: false },
+              rebinding: false,
+              devMode: false,
+              accessUrl: 'http://192.168.1.100:3001/?token=abc',
+            },
+            loading: false,
+            configuring: true,
+            error: null,
+          },
+        },
+      })
+      render(
+        <Provider store={store}>
+          <SettingsView onNavigate={vi.fn()} />
+        </Provider>,
+      )
+      const toggle = screen.getByRole('switch', { name: /remote access/i })
+      expect(toggle).toBeDisabled()
+    })
+
+    it('renders copy URL and QR code toggle buttons when access URL is present', () => {
+      const store = configureStore({
+        reducer: {
+          settings: settingsReducer,
+          tabs: tabsReducer,
+          connection: connectionReducer,
+          sessions: sessionsReducer,
+          network: networkReducer,
+        },
+        preloadedState: {
+          settings: {
+            settings: defaultSettings,
+            loaded: true,
+            lastSavedAt: undefined,
+          },
+          network: {
+            status: {
+              configured: true,
+              host: '0.0.0.0' as const,
+              port: 3001,
+              lanIps: ['192.168.1.100'],
+              machineHostname: 'my-laptop',
+              mdns: { enabled: true, hostname: 'freshell' },
+              firewall: { platform: 'linux-none', active: false, portOpen: null, commands: [], configuring: false },
+              rebinding: false,
+              devMode: false,
+              accessUrl: 'http://192.168.1.100:3001/?token=abc',
+            },
+            loading: false,
+            configuring: false,
+            error: null,
+          },
+        },
+      })
+      render(
+        <Provider store={store}>
+          <SettingsView onNavigate={vi.fn()} />
+        </Provider>,
+      )
+      expect(screen.getByRole('button', { name: /copy url/i })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /show qr code/i })).toBeInTheDocument()
+    })
+
+    it('toggles QR code button label when clicked', () => {
+      const store = configureStore({
+        reducer: {
+          settings: settingsReducer,
+          tabs: tabsReducer,
+          connection: connectionReducer,
+          sessions: sessionsReducer,
+          network: networkReducer,
+        },
+        preloadedState: {
+          settings: {
+            settings: defaultSettings,
+            loaded: true,
+            lastSavedAt: undefined,
+          },
+          network: {
+            status: {
+              configured: true,
+              host: '0.0.0.0' as const,
+              port: 3001,
+              lanIps: ['192.168.1.100'],
+              machineHostname: 'my-laptop',
+              mdns: { enabled: true, hostname: 'freshell' },
+              firewall: { platform: 'linux-none', active: false, portOpen: null, commands: [], configuring: false },
+              rebinding: false,
+              devMode: false,
+              accessUrl: 'http://192.168.1.100:3001/?token=abc',
+            },
+            loading: false,
+            configuring: false,
+            error: null,
+          },
+        },
+      })
+      render(
+        <Provider store={store}>
+          <SettingsView onNavigate={vi.fn()} />
+        </Provider>,
+      )
+      // Button initially says "Show QR code"
+      const qrButton = screen.getByRole('button', { name: /show qr code/i })
+      expect(qrButton).toHaveAttribute('aria-pressed', 'false')
+
+      // Click the QR toggle
+      fireEvent.click(qrButton)
+
+      // Button should now say "Hide QR code" and be pressed
+      expect(screen.getByRole('button', { name: /hide qr code/i })).toHaveAttribute('aria-pressed', 'true')
+    })
+
+    it('shows access URL with break-all wrapping (no truncation)', () => {
+      const longUrl = 'http://192.168.1.100:3001/?token=very-long-token-that-would-be-truncated'
+      const store = configureStore({
+        reducer: {
+          settings: settingsReducer,
+          tabs: tabsReducer,
+          connection: connectionReducer,
+          sessions: sessionsReducer,
+          network: networkReducer,
+        },
+        preloadedState: {
+          settings: {
+            settings: defaultSettings,
+            loaded: true,
+            lastSavedAt: undefined,
+          },
+          network: {
+            status: {
+              configured: true,
+              host: '0.0.0.0' as const,
+              port: 3001,
+              lanIps: ['192.168.1.100'],
+              machineHostname: 'my-laptop',
+              mdns: { enabled: true, hostname: 'freshell' },
+              firewall: { platform: 'linux-none', active: false, portOpen: null, commands: [], configuring: false },
+              rebinding: false,
+              devMode: false,
+              accessUrl: longUrl,
+            },
+            loading: false,
+            configuring: false,
+            error: null,
+          },
+        },
+      })
+      render(
+        <Provider store={store}>
+          <SettingsView onNavigate={vi.fn()} />
+        </Provider>,
+      )
+      const codeEl = screen.getByText(longUrl)
+      expect(codeEl).toBeInTheDocument()
+      expect(codeEl.className).toContain('break-all')
+      expect(codeEl.className).not.toContain('truncate')
     })
   })
 })

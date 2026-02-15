@@ -668,12 +668,13 @@ describe('ConfigStore', () => {
     it('should include network defaults with host 127.0.0.1 and configured false', async () => {
       const store = new ConfigStore()
       const settings = await store.getSettings()
+      const expectedHostname = os.hostname().replace(/\.local$/, '').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 63) || 'freshell'
       expect(settings.network).toEqual({
         host: '127.0.0.1',
         configured: false,
         mdns: {
           enabled: false,
-          hostname: os.hostname().replace(/\.local$/, '').toLowerCase(),
+          hostname: expectedHostname,
         },
       })
     })

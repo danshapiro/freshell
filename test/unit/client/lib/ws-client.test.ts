@@ -110,6 +110,28 @@ describe('WsClient.connect', () => {
     expect(Math.max(...delays)).toBeGreaterThanOrEqual(5000)
   })
 
+  it('treats SERVER_SHUTDOWN (4009) as transient and resets backoff for fast reconnect', async () => {
+    const setTimeoutSpy = vi.spyOn(window, 'setTimeout')
+
+    const c = new WsClient('ws://example/ws')
+    const p = c.connect()
+    expect(MockWebSocket.instances).toHaveLength(1)
+
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._close(4009, 'Server shutdown')
+
+    await expect(p).rejects.toThrow(/Server restarting/i)
+
+    // Should schedule a reconnect at base delay (1000ms) since backoff is reset.
+    // Filter out the connection timeout (10000ms) which is unrelated.
+    const reconnectDelays = setTimeoutSpy.mock.calls
+      .map((call) => call[1])
+      .filter((d): d is number => typeof d === 'number' && d < 10000)
+    expect(reconnectDelays).toContain(1000)
+    // No exponential backoff — max reconnect delay should be 1000ms
+    expect(Math.max(...reconnectDelays)).toBe(1000)
+  })
+
   it('disconnect clears pending reconnect timers', async () => {
     const c = new WsClient('ws://example/ws')
     const p = c.connect()
