@@ -149,6 +149,16 @@ describe('DirectoryPicker', () => {
     expect(await screen.findByText('directory not found')).toBeInTheDocument()
   })
 
+  it('shows sandbox validation error when path is blocked', async () => {
+    mockApiPost.mockRejectedValueOnce({ status: 403, message: 'Path not allowed' })
+    renderDirectoryPicker()
+    const input = screen.getByLabelText('Starting directory for Claude')
+
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    expect(await screen.findByText('path not allowed')).toBeInTheDocument()
+  })
+
   it('returns to pane picker on Escape', async () => {
     const { onBack } = renderDirectoryPicker()
     const input = screen.getByLabelText('Starting directory for Claude')
