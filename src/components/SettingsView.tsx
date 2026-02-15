@@ -5,7 +5,8 @@ import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { terminalThemes, darkThemes, lightThemes, getTerminalTheme } from '@/lib/terminal-themes'
 import { resolveTerminalFontFamily, saveLocalTerminalFontFamily } from '@/lib/terminal-fonts'
-import type { SidebarSortMode, TerminalTheme, CodexSandboxMode, ClaudePermissionMode, CodingCliProviderName } from '@/store/types'
+import type { AppSettings, SidebarSortMode, TerminalTheme, CodexSandboxMode, ClaudePermissionMode, CodingCliProviderName } from '@/store/types'
+import type { DeepPartial } from '@/lib/type-utils'
 import { configureNetwork, fetchNetworkStatus } from '@/store/networkSlice'
 import { addTab } from '@/store/tabsSlice'
 import { initLayout } from '@/store/panesSlice'
@@ -187,7 +188,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   )
 
   const patch = useMemo(
-    () => async (updates: any) => {
+    () => async (updates: DeepPartial<AppSettings>) => {
       await api.patch('/api/settings', updates)
       dispatch(markSaved())
     },
@@ -222,8 +223,9 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
 
   const commitDefaultCwd = useCallback((nextValue: string | undefined) => {
     if (nextValue === settings.defaultCwd) return
-    dispatch(updateSettingsLocal({ defaultCwd: nextValue } as any))
-    patch({ defaultCwd: nextValue ?? null } as any).catch((err) => console.warn('Failed to save settings', err))
+    dispatch(updateSettingsLocal({ defaultCwd: nextValue }))
+    // Send '' to API when clearing — JSON.stringify strips undefined, but server normalizes '' → undefined
+    patch({ defaultCwd: nextValue ?? '' }).catch((err) => console.warn('Failed to save settings', err))
   }, [dispatch, patch, settings.defaultCwd])
 
   const scheduleDefaultCwdValidation = useCallback((value: string) => {
@@ -308,7 +310,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
         setProviderCwdErrors((prev) => ({ ...prev, [key]: null }))
         dispatch(updateSettingsLocal({
           codingCli: { providers: { [providerName]: { cwd: undefined } } },
-        } as any))
+        }))
         scheduleSave({ codingCli: { providers: { [providerName]: { cwd: undefined } } } })
         return
       }
@@ -320,7 +322,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
             setProviderCwdErrors((prev) => ({ ...prev, [key]: null }))
             dispatch(updateSettingsLocal({
               codingCli: { providers: { [providerName]: { cwd: trimmed } } },
-            } as any))
+            }))
             scheduleSave({ codingCli: { providers: { [providerName]: { cwd: trimmed } } } })
           } else {
             setProviderCwdErrors((prev) => ({ ...prev, [key]: 'directory not found' }))
@@ -337,7 +339,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     const next = enabled
       ? Array.from(new Set([...enabledProviders, provider]))
       : enabledProviders.filter((p) => p !== provider)
-    dispatch(updateSettingsLocal({ codingCli: { enabledProviders: next } } as any))
+    dispatch(updateSettingsLocal({ codingCli: { enabledProviders: next } }))
     scheduleSave({ codingCli: { enabledProviders: next } })
   }, [dispatch, enabledProviders, scheduleSave])
 
@@ -425,7 +427,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     if (isSelectedFontAvailable) return
     if (fallbackFontFamily === settings.terminal.fontFamily) return
 
-    dispatch(updateSettingsLocal({ terminal: { fontFamily: fallbackFontFamily } } as any))
+    dispatch(updateSettingsLocal({ terminal: { fontFamily: fallbackFontFamily } }))
     saveLocalTerminalFontFamily(fallbackFontFamily)
   }, [
     dispatch,
@@ -501,7 +503,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                   { value: 'dark', label: 'Dark' },
                 ]}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ theme: v as any }))
+                  dispatch(updateSettingsLocal({ theme: v as AppSettings['theme'] }))
                   scheduleSave({ theme: v })
                 }}
               />
@@ -531,7 +533,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 value={settings.sidebar?.sortMode || 'recency-pinned'}
                 onChange={(e) => {
                   const v = e.target.value as SidebarSortMode
-                  dispatch(updateSettingsLocal({ sidebar: { sortMode: v } } as any))
+                  dispatch(updateSettingsLocal({ sidebar: { sortMode: v } }))
                   scheduleSave({ sidebar: { sortMode: v } })
                 }}
                 className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
@@ -547,7 +549,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <Toggle
                 checked={settings.sidebar?.showProjectBadges ?? true}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ sidebar: { showProjectBadges: checked } } as any))
+                  dispatch(updateSettingsLocal({ sidebar: { showProjectBadges: checked } }))
                   scheduleSave({ sidebar: { showProjectBadges: checked } })
                 }}
               />
@@ -557,7 +559,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <Toggle
                 checked={settings.sidebar?.showSubagents ?? false}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ sidebar: { showSubagents: checked } } as any))
+                  dispatch(updateSettingsLocal({ sidebar: { showSubagents: checked } }))
                   scheduleSave({ sidebar: { showSubagents: checked } })
                 }}
               />
@@ -567,7 +569,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <Toggle
                 checked={settings.sidebar?.showNoninteractiveSessions ?? false}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ sidebar: { showNoninteractiveSessions: checked } } as any))
+                  dispatch(updateSettingsLocal({ sidebar: { showNoninteractiveSessions: checked } }))
                   scheduleSave({ sidebar: { showNoninteractiveSessions: checked } })
                 }}
               />
@@ -582,7 +584,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 value={settings.panes?.defaultNewPane || 'ask'}
                 onChange={(e) => {
                   const v = e.target.value as 'ask' | 'shell' | 'browser' | 'editor'
-                  dispatch(updateSettingsLocal({ panes: { defaultNewPane: v } } as any))
+                  dispatch(updateSettingsLocal({ panes: { defaultNewPane: v } }))
                   scheduleSave({ panes: { defaultNewPane: v } })
                 }}
                 className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
@@ -603,7 +605,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 labelWidth="w-10"
                 format={(v) => v === 0 ? 'Off' : `${v}%`}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ panes: { snapThreshold: v } } as any))
+                  dispatch(updateSettingsLocal({ panes: { snapThreshold: v } }))
                   scheduleSave({ panes: { snapThreshold: v } })
                 }}
               />
@@ -613,7 +615,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <Toggle
                 checked={settings.panes?.iconsOnTabs ?? true}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ panes: { iconsOnTabs: checked } } as any))
+                  dispatch(updateSettingsLocal({ panes: { iconsOnTabs: checked } }))
                   scheduleSave({ panes: { iconsOnTabs: checked } })
                 }}
               />
@@ -629,7 +631,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                   { value: 'none', label: 'None' },
                 ]}
                 onChange={(v: string) => {
-                  dispatch(updateSettingsLocal({ panes: { tabAttentionStyle: v } } as any))
+                  dispatch(updateSettingsLocal({ panes: { tabAttentionStyle: v } }))
                   scheduleSave({ panes: { tabAttentionStyle: v } })
                 }}
               />
@@ -643,7 +645,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                   { value: 'type', label: 'Typing' },
                 ]}
                 onChange={(v: string) => {
-                  dispatch(updateSettingsLocal({ panes: { attentionDismiss: v } } as any))
+                  dispatch(updateSettingsLocal({ panes: { attentionDismiss: v } }))
                   scheduleSave({ panes: { attentionDismiss: v } })
                 }}
               />
@@ -656,7 +658,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <Toggle
                 checked={settings.notifications?.soundEnabled ?? true}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ notifications: { soundEnabled: checked } } as any))
+                  dispatch(updateSettingsLocal({ notifications: { soundEnabled: checked } }))
                   scheduleSave({ notifications: { soundEnabled: checked } })
                 }}
               />
@@ -670,7 +672,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 value={settings.terminal.theme}
                 onChange={(e) => {
                   const v = e.target.value as TerminalTheme
-                  dispatch(updateSettingsLocal({ terminal: { theme: v } } as any))
+                  dispatch(updateSettingsLocal({ terminal: { theme: v } }))
                   scheduleSave({ terminal: { theme: v } })
                 }}
                 className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
@@ -698,7 +700,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 labelWidth="w-20"
                 format={(v) => `${v}px (${Math.round(v / 16 * 100)}%)`}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ terminal: { fontSize: v } } as any))
+                  dispatch(updateSettingsLocal({ terminal: { fontSize: v } }))
                   scheduleSave({ terminal: { fontSize: v } })
                 }}
               />
@@ -713,7 +715,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 labelWidth="w-10"
                 format={(v) => v.toFixed(2)}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ terminal: { lineHeight: v } } as any))
+                  dispatch(updateSettingsLocal({ terminal: { lineHeight: v } }))
                   scheduleSave({ terminal: { lineHeight: v } })
                 }}
               />
@@ -727,7 +729,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 step={500}
                 format={(v) => v.toLocaleString()}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ terminal: { scrollback: v } } as any))
+                  dispatch(updateSettingsLocal({ terminal: { scrollback: v } }))
                   scheduleSave({ terminal: { scrollback: v } })
                 }}
               />
@@ -737,7 +739,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <Toggle
                 checked={settings.terminal.cursorBlink}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ terminal: { cursorBlink: checked } } as any))
+                  dispatch(updateSettingsLocal({ terminal: { cursorBlink: checked } }))
                   scheduleSave({ terminal: { cursorBlink: checked } })
                 }}
               />
@@ -747,7 +749,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <Toggle
                 checked={settings.terminal.warnExternalLinks}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ terminal: { warnExternalLinks: checked } } as any))
+                  dispatch(updateSettingsLocal({ terminal: { warnExternalLinks: checked } }))
                   scheduleSave({ terminal: { warnExternalLinks: checked } })
                 }}
               />
@@ -757,7 +759,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <select
                 value={isSelectedFontAvailable ? settings.terminal.fontFamily : fallbackFontFamily}
                 onChange={(e) => {
-                  dispatch(updateSettingsLocal({ terminal: { fontFamily: e.target.value } } as any))
+                  dispatch(updateSettingsLocal({ terminal: { fontFamily: e.target.value } }))
                   saveLocalTerminalFontFamily(e.target.value)
                 }}
                 className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
@@ -811,7 +813,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 step={10}
                 format={(v) => String(v)}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ safety: { autoKillIdleMinutes: v } } as any))
+                  dispatch(updateSettingsLocal({ safety: { autoKillIdleMinutes: v } }))
                   scheduleSave({ safety: { autoKillIdleMinutes: v } })
                 }}
               />
@@ -825,7 +827,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 step={1}
                 format={(v) => String(v)}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ safety: { warnBeforeKillMinutes: v } } as any))
+                  dispatch(updateSettingsLocal({ safety: { warnBeforeKillMinutes: v } }))
                   scheduleSave({ safety: { warnBeforeKillMinutes: v } })
                 }}
               />
@@ -863,7 +865,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <Toggle
                 checked={settings.logging?.debug ?? false}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ logging: { debug: checked } } as any))
+                  dispatch(updateSettingsLocal({ logging: { debug: checked } }))
                   scheduleSave({ logging: { debug: checked } })
                 }}
               />
@@ -894,7 +896,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                           const v = e.target.value as ClaudePermissionMode
                           dispatch(updateSettingsLocal({
                             codingCli: { providers: { [provider.name]: { permissionMode: v } } },
-                          } as any))
+                          }))
                           scheduleSave({ codingCli: { providers: { [provider.name]: { permissionMode: v } } } })
                         }}
                         className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
@@ -917,7 +919,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                           const model = e.target.value.trim()
                           dispatch(updateSettingsLocal({
                             codingCli: { providers: { [provider.name]: { model: model || undefined } } },
-                          } as any))
+                          }))
                           scheduleSave({ codingCli: { providers: { [provider.name]: { model: model || undefined } } } })
                         }}
                         className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:max-w-xs"
@@ -934,7 +936,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                           const sandbox = v || undefined
                           dispatch(updateSettingsLocal({
                             codingCli: { providers: { [provider.name]: { sandbox } } },
-                          } as any))
+                          }))
                           scheduleSave({ codingCli: { providers: { [provider.name]: { sandbox } } } })
                         }}
                         className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"

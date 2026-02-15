@@ -1,5 +1,6 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import type { AppSettings, SidebarSortMode } from './types'
+import type { DeepPartial } from '@/lib/type-utils'
 
 export function resolveDefaultLoggingDebug(isDev: boolean = import.meta.env.DEV): boolean {
   return !!isDev
@@ -83,7 +84,7 @@ const initialState: SettingsState = {
   loaded: false,
 }
 
-export function mergeSettings(base: AppSettings, patch: Partial<AppSettings>): AppSettings {
+export function mergeSettings(base: AppSettings, patch: DeepPartial<AppSettings>): AppSettings {
   const baseLogging = base.logging ?? defaultSettings.logging
   const baseCodingCli = base.codingCli ?? defaultSettings.codingCli
   const merged = {
@@ -124,7 +125,7 @@ export const settingsSlice = createSlice({
       state.settings = mergeSettings(defaultSettings, action.payload)
       state.loaded = true
     },
-    updateSettingsLocal: (state, action: PayloadAction<Partial<AppSettings>>) => {
+    updateSettingsLocal: (state, action: PayloadAction<DeepPartial<AppSettings>>) => {
       state.settings = mergeSettings(state.settings, action.payload)
     },
     markSaved: (state) => {

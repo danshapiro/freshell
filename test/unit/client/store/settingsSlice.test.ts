@@ -441,12 +441,12 @@ describe('settingsSlice', () => {
 
   describe('panes mergeSettings', () => {
     it('mergeSettings preserves iconsOnTabs when patching panes', () => {
-      const result = mergeSettings(defaultSettings, { panes: { defaultNewPane: 'shell' } } as any)
+      const result = mergeSettings(defaultSettings, { panes: { defaultNewPane: 'shell' } })
       expect(result.panes.iconsOnTabs).toBe(true)
     })
 
     it('mergeSettings allows overriding iconsOnTabs to false', () => {
-      const result = mergeSettings(defaultSettings, { panes: { iconsOnTabs: false } } as any)
+      const result = mergeSettings(defaultSettings, { panes: { iconsOnTabs: false } })
       expect(result.panes.iconsOnTabs).toBe(false)
     })
 
@@ -458,7 +458,7 @@ describe('settingsSlice', () => {
 
       const state = settingsReducer(
         initialState,
-        updateSettingsLocal({ panes: { iconsOnTabs: false } } as any)
+        updateSettingsLocal({ panes: { iconsOnTabs: false } })
       )
 
       expect(state.settings.panes.iconsOnTabs).toBe(false)
@@ -489,7 +489,7 @@ describe('mergeSettings – panes.snapThreshold', () => {
   it('merges panes.snapThreshold without clobbering defaultNewPane', () => {
     const base = { ...defaultSettings }
     const patch = { panes: { snapThreshold: 6 } }
-    const result = mergeSettings(base, patch as any)
+    const result = mergeSettings(base, patch)
     expect(result.panes.snapThreshold).toBe(6)
     expect(result.panes.defaultNewPane).toBe('ask') // preserved
   })
@@ -501,7 +501,7 @@ describe('mergeSettings – panes.snapThreshold', () => {
   it('preserves snapThreshold when patching defaultNewPane', () => {
     const base = { ...defaultSettings, panes: { ...defaultSettings.panes, snapThreshold: 7 } }
     const patch = { panes: { defaultNewPane: 'shell' as const } }
-    const result = mergeSettings(base, patch as any)
+    const result = mergeSettings(base, patch)
     expect(result.panes.defaultNewPane).toBe('shell')
     expect(result.panes.snapThreshold).toBe(7)
   })
@@ -509,7 +509,7 @@ describe('mergeSettings – panes.snapThreshold', () => {
   it('allows snapThreshold to be set to 0 (off)', () => {
     const base = { ...defaultSettings }
     const patch = { panes: { snapThreshold: 0 } }
-    const result = mergeSettings(base, patch as any)
+    const result = mergeSettings(base, patch)
     expect(result.panes.snapThreshold).toBe(0)
   })
 })
