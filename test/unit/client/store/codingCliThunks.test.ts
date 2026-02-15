@@ -112,6 +112,38 @@ describe('codingCliThunks', () => {
     }
   })
 
+  it('kills a late-created session that arrives after timeout', async () => {
+    vi.useFakeTimers()
+    try {
+      const store = createStore()
+
+      const promise = store.dispatch(
+        createCodingCliTab({ provider: 'codex', prompt: 'Late create' })
+      )
+
+      const tab = store.getState().tabs.tabs[0]
+      const requestId = tab.codingCliSessionId as string
+
+      await vi.advanceTimersByTimeAsync(30_000)
+      await promise
+
+      messageHandler?.({
+        type: 'codingcli.created',
+        requestId,
+        sessionId: 'session-late',
+        provider: 'codex',
+      })
+
+      expect(mockSend).toHaveBeenCalledWith({
+        type: 'codingcli.kill',
+        sessionId: 'session-late',
+      })
+      expect(store.getState().codingCli.sessions['session-late']).toBeUndefined()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('kills created session when request was canceled', async () => {
     const store = createStore()
 
