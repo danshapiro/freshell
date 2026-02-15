@@ -668,6 +668,13 @@ export function ContextMenuProvider({
         const contextId = resolveContextId(contextEl?.dataset.context)
         if (!contextId) return
 
+        // Respect native context menu for inputs, links, iframes, etc.
+        if (contextEl?.dataset.nativeContext === 'true') { touchStartPos = null; return }
+        if (target.closest?.('[data-native-context="true"]')) { touchStartPos = null; return }
+        if (target.tagName === 'IFRAME') { touchStartPos = null; return }
+        if (isTextInputLike(target) && ![ContextIds.Editor, ContextIds.Terminal].includes(contextId as any)) { touchStartPos = null; return }
+        if (target.closest?.('a[href]')) { touchStartPos = null; return }
+
         const dataset = contextEl?.dataset ? copyDataset(contextEl.dataset) : {}
         const parsed = parseContextTarget(contextId as any, dataset)
         const targetObj = parsed || { kind: 'global' as const }

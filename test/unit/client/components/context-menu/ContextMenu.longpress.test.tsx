@@ -289,6 +289,70 @@ describe('ContextMenuProvider long-press', () => {
     expect(screen.getByRole('menu')).toBeInTheDocument()
   })
 
+  it('does NOT open custom menu on text inputs (allows native menu)', () => {
+    renderWithProvider(
+      <div data-context={ContextIds.Global}>
+        <input type="text" data-testid="text-input" />
+      </div>
+    )
+
+    const input = screen.getByTestId('text-input')
+    elementFromPointMock.mockReturnValue(input)
+
+    act(() => {
+      simulateTouch('touchstart', input, 100, 100)
+    })
+
+    act(() => {
+      vi.advanceTimersByTime(500)
+    })
+
+    // Should NOT open custom menu — native text selection should be used
+    expect(screen.queryByRole('menu')).toBeNull()
+  })
+
+  it('does NOT open custom menu on links (allows native menu)', () => {
+    renderWithProvider(
+      <div data-context={ContextIds.Global}>
+        <a href="https://example.com" data-testid="link">Example</a>
+      </div>
+    )
+
+    const link = screen.getByTestId('link')
+    elementFromPointMock.mockReturnValue(link)
+
+    act(() => {
+      simulateTouch('touchstart', link, 100, 100)
+    })
+
+    act(() => {
+      vi.advanceTimersByTime(500)
+    })
+
+    expect(screen.queryByRole('menu')).toBeNull()
+  })
+
+  it('does NOT open custom menu on elements with data-native-context', () => {
+    renderWithProvider(
+      <div data-context={ContextIds.Global}>
+        <div data-native-context="true" data-testid="native">Native context</div>
+      </div>
+    )
+
+    const nativeEl = screen.getByTestId('native')
+    elementFromPointMock.mockReturnValue(nativeEl)
+
+    act(() => {
+      simulateTouch('touchstart', nativeEl, 100, 100)
+    })
+
+    act(() => {
+      vi.advanceTimersByTime(500)
+    })
+
+    expect(screen.queryByRole('menu')).toBeNull()
+  })
+
   it('cancels long-press on touchcancel', () => {
     renderWithProvider(
       <div data-context={ContextIds.Tab} data-tab-id="tab-1">
