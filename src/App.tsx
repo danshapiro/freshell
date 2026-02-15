@@ -173,9 +173,18 @@ export default function App() {
   )
 
   // Swipe gesture: left/right on terminal content area switches tabs
+  const tabSwipeStartXRef = useRef(0)
   const bindTabSwipe = useDrag(
-    ({ movement: [mx], velocity: [vx], direction: [dx], last }) => {
-      if (!isMobile || !last || view !== 'terminal') return
+    ({ movement: [mx], velocity: [vx], direction: [dx], first, last, xy: [x] }) => {
+      if (!isMobile || view !== 'terminal') return
+      if (first) {
+        tabSwipeStartXRef.current = x
+        return
+      }
+      if (!last) return
+
+      // If swipe started from the left edge, the sidebar swipe handler owns it
+      if (tabSwipeStartXRef.current < 30 && sidebarCollapsed) return
 
       const swipedLeft = dx < 0 && (Math.abs(mx) > 50 || vx > 0.5)
       const swipedRight = dx > 0 && (mx > 50 || vx > 0.5)
@@ -183,13 +192,7 @@ export default function App() {
       if (swipedLeft) {
         dispatch(switchToNextTab())
       } else if (swipedRight) {
-        // If on first tab, open sidebar instead
-        const currentIndex = tabs.findIndex(t => t.id === activeTabId)
-        if (currentIndex === 0 && sidebarCollapsed) {
-          toggleSidebarCollapse()
-        } else {
-          dispatch(switchToPrevTab())
-        }
+        dispatch(switchToPrevTab())
       }
     },
     {
