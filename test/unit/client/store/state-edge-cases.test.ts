@@ -40,6 +40,7 @@ import settingsReducer, {
   updateSettingsLocal,
   markSaved,
   defaultSettings,
+  mergeSettings,
   SettingsState,
 } from '@/store/settingsSlice'
 import type { Tab, ProjectGroup, AppSettings } from '@/store/types'
@@ -841,7 +842,7 @@ describe('State Edge Cases', () => {
 
         store.dispatch(setSettings(customSettings))
 
-        expect(store.getState().settings.settings).toEqual(customSettings)
+        expect(store.getState().settings.settings).toEqual(mergeSettings(defaultSettings, customSettings))
         expect(store.getState().settings.loaded).toBe(true)
       })
 

@@ -1,6 +1,7 @@
 import '@testing-library/jest-dom/vitest'
 import { afterEach, beforeEach, vi } from 'vitest'
 import { enableMapSet } from 'immer'
+import { resetWsClientForTests } from '@/lib/ws-client'
 
 enableMapSet()
 
@@ -38,6 +39,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  resetWsClientForTests()
   errorSpy?.mockRestore()
   errorSpy = null
 

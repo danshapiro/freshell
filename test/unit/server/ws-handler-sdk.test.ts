@@ -16,7 +16,24 @@ vi.mock('node-pty', () => ({
   spawn: vi.fn(),
 }))
 
+const TEST_AUTH_TOKEN = 'testtoken-testtoken'
+
 describe('WS Handler SDK Integration', () => {
+  let originalAuthToken: string | undefined
+
+  beforeEach(() => {
+    originalAuthToken = process.env.AUTH_TOKEN
+    process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
+  })
+
+  afterEach(() => {
+    if (originalAuthToken === undefined) {
+      delete process.env.AUTH_TOKEN
+      return
+    }
+    process.env.AUTH_TOKEN = originalAuthToken
+  })
+
   describe('schema parsing', () => {
     it('parses sdk.create message', () => {
       const result = SdkCreateSchema.safeParse({
@@ -209,19 +226,48 @@ describe('WS Handler SDK Integration', () => {
         const addr = server.address()
         const port = typeof addr === 'object' ? addr!.port : 0
         const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
-        ws.on('open', () => {
+        const timeout = setTimeout(() => {
+          cleanup()
+          reject(new Error('Timeout waiting for ready'))
+        }, 5000)
+
+        const cleanup = () => {
+          clearTimeout(timeout)
+          ws.off('open', onOpen)
+          ws.off('message', onMessage)
+          ws.off('error', onError)
+          ws.off('close', onClose)
+        }
+
+        const onOpen = () => {
           ws.send(JSON.stringify({
             type: 'hello',
-            token: process.env.AUTH_TOKEN || '',
+            token: TEST_AUTH_TOKEN,
           }))
-        })
-        ws.on('message', (data) => {
+        }
+
+        const onMessage = (data: WebSocket.RawData) => {
           const msg = JSON.parse(data.toString())
           if (msg.type === 'ready') {
+            cleanup()
             resolve(ws)
           }
-        })
-        ws.on('error', reject)
+        }
+
+        const onError = (err: Error) => {
+          cleanup()
+          reject(err)
+        }
+
+        const onClose = (code: number, reason: Buffer) => {
+          cleanup()
+          reject(new Error(`Socket closed before ready (code=${code}, reason=${reason.toString()})`))
+        }
+
+        ws.on('open', onOpen)
+        ws.on('message', onMessage)
+        ws.on('error', onError)
+        ws.on('close', onClose)
       })
     }
 
@@ -566,19 +612,48 @@ describe('WS Handler SDK Integration', () => {
         const addr = server.address()
         const port = typeof addr === 'object' ? addr!.port : 0
         const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
-        ws.on('open', () => {
+        const timeout = setTimeout(() => {
+          cleanup()
+          reject(new Error('Timeout waiting for ready'))
+        }, 5000)
+
+        const cleanup = () => {
+          clearTimeout(timeout)
+          ws.off('open', onOpen)
+          ws.off('message', onMessage)
+          ws.off('error', onError)
+          ws.off('close', onClose)
+        }
+
+        const onOpen = () => {
           ws.send(JSON.stringify({
             type: 'hello',
-            token: process.env.AUTH_TOKEN || '',
+            token: TEST_AUTH_TOKEN,
           }))
-        })
-        ws.on('message', (data) => {
+        }
+
+        const onMessage = (data: WebSocket.RawData) => {
           const msg = JSON.parse(data.toString())
           if (msg.type === 'ready') {
+            cleanup()
             resolve(ws)
           }
-        })
-        ws.on('error', reject)
+        }
+
+        const onError = (err: Error) => {
+          cleanup()
+          reject(err)
+        }
+
+        const onClose = (code: number, reason: Buffer) => {
+          cleanup()
+          reject(new Error(`Socket closed before ready (code=${code}, reason=${reason.toString()})`))
+        }
+
+        ws.on('open', onOpen)
+        ws.on('message', onMessage)
+        ws.on('error', onError)
+        ws.on('close', onClose)
       })
     }
 

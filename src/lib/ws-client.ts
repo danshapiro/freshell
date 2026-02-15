@@ -27,6 +27,8 @@ export class WsClient {
   private maxQueueSize = 1000
   private connectStartedAt: number | null = null
   private lastQueueLogAt = 0
+  private reconnectTimer: number | null = null
+  private readyTimeout: number | null = null
 
   constructor(private url: string) {}
 
@@ -56,6 +58,8 @@ export class WsClient {
     if (this.connectPromise) return this.connectPromise
 
     this.intentionalClose = false
+    this.clearReconnectTimer()
+    this.clearReadyTimeout()
     this._state = 'connecting'
     if (perfConfig.enabled) {
       this.connectStartedAt = performance.now()
@@ -78,7 +82,7 @@ export class WsClient {
         }
       }
 
-      const timeout = window.setTimeout(() => {
+      this.readyTimeout = window.setTimeout(() => {
         finishReject(new Error('Connection timeout: ready not received'))
         this.ws?.close()
       }, CONNECTION_TIMEOUT_MS)
@@ -110,7 +114,7 @@ export class WsClient {
         }
 
         if (msg.type === 'ready') {
-          window.clearTimeout(timeout)
+          this.clearReadyTimeout()
           const isReconnect = this.wasConnectedOnce
           this.wasConnectedOnce = true
           this._state = 'ready'
@@ -145,7 +149,7 @@ export class WsClient {
         }
 
         if (msg.type === 'error' && msg.code === 'NOT_AUTHENTICATED') {
-          window.clearTimeout(timeout)
+          this.clearReadyTimeout()
           finishReject(new Error('Authentication failed'))
           return
         }
@@ -166,7 +170,7 @@ export class WsClient {
       }
 
       this.ws.onclose = (event) => {
-        window.clearTimeout(timeout)
+        this.clearReadyTimeout()
         const wasConnecting = this._state === 'connecting'
         this._state = 'disconnected'
         this.ws = null
@@ -237,7 +241,9 @@ export class WsClient {
     const delay = Math.max(baseDelay, opts?.minDelayMs ?? 0)
     this.reconnectAttempts++
 
-    window.setTimeout(() => {
+    this.clearReconnectTimer()
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null
       if (!this.intentionalClose) {
         this.connect().catch((err) => console.error('WsClient: reconnect failed', err))
       }
@@ -253,10 +259,28 @@ export class WsClient {
 
   disconnect() {
     this.intentionalClose = true
+    this.clearReconnectTimer()
+    this.clearReadyTimeout()
     this.ws?.close()
     this.ws = null
     this._state = 'disconnected'
     this.pendingMessages = []
+    this.connectPromise = null
+    this.reconnectAttempts = 0
+  }
+
+  private clearReconnectTimer() {
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+  }
+
+  private clearReadyTimeout() {
+    if (this.readyTimeout !== null) {
+      window.clearTimeout(this.readyTimeout)
+      this.readyTimeout = null
+    }
   }
 
   /**
@@ -308,4 +332,9 @@ export function getWsClient(): WsClient {
     wsClient = new WsClient(`${protocol}//${host}/ws`)
   }
   return wsClient
+}
+
+export function resetWsClientForTests(): void {
+  wsClient?.disconnect()
+  wsClient = null
 }

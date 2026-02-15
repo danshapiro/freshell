@@ -682,7 +682,7 @@ git commit -m "docs(terminal): reflect v6 search and advanced OSC52 settings; fi
 - [x] Clipboard write failures are silent.
 - [x] WebGL attempted automatically with robust fallback.
 - [x] Unit + e2e coverage added for all new behaviors.
-- [ ] `npm run test` and `npm run verify` pass.
+- [x] `npm run test` and `npm run verify` pass.
 
 ## Completion Notes (2026-02-14)
 
@@ -694,3 +694,19 @@ git commit -m "docs(terminal): reflect v6 search and advanced OSC52 settings; fi
   - `npm run lint` passes (warnings only; no errors).
   - `npm run test` executes suites but does not terminate cleanly in this environment; after suites complete, the process loops with repeated WebSocket hello-timeout logs (`code: 4002`) every ~30s.
   - `npm run verify` build stage passes (`typecheck`, `build:client`, `build:server`), then enters the same non-terminating `vitest` behavior during its `npm test` phase.
+
+## Completion Notes (2026-02-15)
+
+- Resolved the non-terminating Vitest loop by fixing `test/unit/server/ws-handler-sdk.test.ts`:
+  - test fixture now sets a deterministic `AUTH_TOKEN` for each test and restores prior env state.
+  - `connectAndAuth()` now rejects on close/timeout instead of hanging forever when handshake/ready does not complete.
+- Hardened client test cleanup and reconnection teardown:
+  - `src/lib/ws-client.ts` now clears reconnect/ready timers during connect/disconnect transitions and exposes `resetWsClientForTests()`.
+  - `test/setup/dom.ts` calls `resetWsClientForTests()` in global `afterEach`.
+  - Added regression coverage in `test/unit/client/lib/ws-client.test.ts` for reconnect timer cleanup.
+- Updated `test/unit/client/store/state-edge-cases.test.ts` to assert merged defaults with new terminal setting fields.
+- Stabilized `test/unit/client/components/BackgroundSessions.test.tsx` by triggering explicit refresh before asserting `Attach` button presence.
+- Final validation gate:
+  - `npm run lint` passes (warnings only; no errors).
+  - `npm run test` passes and exits cleanly.
+  - `npm run verify` passes and exits cleanly.
