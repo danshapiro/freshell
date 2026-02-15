@@ -7,6 +7,7 @@ import { getPerfConfig, startPerfTimer } from '../perf-logger.js'
 import { configStore, SessionOverride } from '../config-store.js'
 import type { CodingCliProvider } from './provider.js'
 import { makeSessionKey, type CodingCliSession, type CodingCliProviderName, type ProjectGroup } from './types.js'
+import { diffProjects } from '../sessions-sync/diff.js'
 
 const perfConfig = getPerfConfig()
 const REFRESH_YIELD_EVERY = 200
@@ -428,9 +429,15 @@ export class CodingCliSessionIndexer {
       return 0
     })
 
-    this.projects = groups
-    this.emitUpdate()
-    endRefreshTimer({ projectCount: groups.length, sessionCount, fileCount })
+    const projectsDiff = diffProjects(this.projects, groups)
+    const changed = projectsDiff.upsertProjects.length > 0 || projectsDiff.removeProjectPaths.length > 0
+    if (changed) {
+      this.projects = groups
+      this.emitUpdate()
+    } else {
+      logger.debug({ sessionCount, fileCount }, 'Skipping no-op refresh (no project changes)')
+    }
+    endRefreshTimer({ projectCount: groups.length, sessionCount, fileCount, skipped: !changed })
   }
 
   private emitUpdate() {

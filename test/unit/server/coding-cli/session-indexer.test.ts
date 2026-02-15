@@ -548,6 +548,103 @@ describe('CodingCliSessionIndexer', () => {
     })
   })
 
+  describe('no-op refresh suppression', () => {
+    it('skips emitUpdate when refresh produces identical projects', async () => {
+      const fileA = path.join(tempDir, 'session-a.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')
+
+      const provider = makeProvider([fileA])
+      const indexer = new CodingCliSessionIndexer([provider])
+
+      const handler = vi.fn()
+      indexer.onUpdate(handler)
+
+      // First refresh: should emit
+      await indexer.refresh()
+      expect(handler).toHaveBeenCalledTimes(1)
+
+      // Second refresh: file unchanged, should NOT emit
+      await indexer.refresh()
+      expect(handler).toHaveBeenCalledTimes(1)
+    })
+
+    it('emits update when session metadata changes between refreshes', async () => {
+      const fileA = path.join(tempDir, 'session-a.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')
+
+      const provider = makeProvider([fileA])
+      const indexer = new CodingCliSessionIndexer([provider])
+
+      const handler = vi.fn()
+      indexer.onUpdate(handler)
+
+      await indexer.refresh()
+      expect(handler).toHaveBeenCalledTimes(1)
+
+      // Modify file content (title changes) and mark dirty to simulate watcher
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Updated Title' }) + '\n')
+      ;(indexer as any).markDirty(fileA)
+
+      await indexer.refresh()
+      expect(handler).toHaveBeenCalledTimes(2)
+    })
+
+    it('emits update when project color changes between refreshes', async () => {
+      const fileA = path.join(tempDir, 'session-a.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')
+
+      const provider = makeProvider([fileA])
+      const indexer = new CodingCliSessionIndexer([provider])
+
+      const handler = vi.fn()
+      indexer.onUpdate(handler)
+
+      await indexer.refresh()
+      expect(handler).toHaveBeenCalledTimes(1)
+
+      // Change project color
+      vi.mocked(configStore.getProjectColors).mockResolvedValueOnce({
+        '/project/a': '#ff0000',
+        '/project/b': '#222222',
+      })
+
+      await indexer.refresh()
+      expect(handler).toHaveBeenCalledTimes(2)
+    })
+
+    it('emits update when session override changes between refreshes', async () => {
+      const fileA = path.join(tempDir, 'session-a.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')
+
+      const provider = makeProvider([fileA])
+      const indexer = new CodingCliSessionIndexer([provider])
+
+      const handler = vi.fn()
+      indexer.onUpdate(handler)
+
+      await indexer.refresh()
+      expect(handler).toHaveBeenCalledTimes(1)
+
+      // Add a session override
+      vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+        sessionOverrides: {
+          [makeSessionKey('claude', 'session-a')]: {
+            titleOverride: 'Overridden',
+          },
+        },
+        settings: {
+          codingCli: {
+            enabledProviders: ['claude'],
+            providers: {},
+          },
+        },
+      })
+
+      await indexer.refresh()
+      expect(handler).toHaveBeenCalledTimes(2)
+    })
+  })
+
   it('groups worktree sessions under the parent repo', async () => {
     // Set up a real git repo structure in tempDir
     const repoDir = path.join(tempDir, 'repo')
