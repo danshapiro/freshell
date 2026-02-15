@@ -428,6 +428,78 @@ describe('TerminalView keyboard handling', () => {
     })
   })
 
+  describe('newline shortcut', () => {
+    it('returns false for Shift+Enter and sends newline to terminal', async () => {
+      const { store, tabId, paneId, paneContent } = createTestStore('term-1')
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(capturedKeyHandler).not.toBeNull()
+      })
+
+      const event = createKeyboardEvent('Enter', { shiftKey: true })
+      const result = capturedKeyHandler!(event)
+
+      expect(result).toBe(false)
+      expect(event.preventDefault).toHaveBeenCalled()
+      expect(wsMocks.send).toHaveBeenCalledWith({
+        type: 'terminal.input',
+        terminalId: 'term-1',
+        data: '\n',
+      })
+    })
+
+    it('returns false for Shift+Enter without terminal id and does not send input', async () => {
+      const { store, tabId, paneId, paneContent } = createTestStore(undefined)
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(capturedKeyHandler).not.toBeNull()
+      })
+
+      const event = createKeyboardEvent('Enter', { shiftKey: true })
+      const result = capturedKeyHandler!(event)
+
+      expect(result).toBe(false)
+      expect(event.preventDefault).toHaveBeenCalled()
+      expect(wsMocks.send).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'terminal.input',
+          data: '\n',
+        }),
+      )
+    })
+
+    it('returns true for plain Enter so xterm handles it', async () => {
+      const { store, tabId, paneId, paneContent } = createTestStore('term-1')
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(capturedKeyHandler).not.toBeNull()
+      })
+
+      const event = createKeyboardEvent('Enter')
+      const result = capturedKeyHandler!(event)
+
+      expect(result).toBe(true)
+    })
+  })
+
   describe('search shortcut', () => {
     it('returns false for Ctrl+F to open terminal search', async () => {
       const { store, tabId, paneId, paneContent } = createTestStore('term-1')
