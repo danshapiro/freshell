@@ -477,10 +477,13 @@ async function main() {
             ])
             .optional(),
           warnExternalLinks: z.coerce.boolean().optional(),
+          osc52Clipboard: z.enum(['ask', 'always', 'never']).optional(),
+          renderer: z.enum(['auto', 'webgl', 'canvas']).optional(),
         })
         .strict()
         .optional(),
       defaultCwd: z.string().nullable().optional(),
+      allowedFilePaths: z.array(z.string()).optional(),
       logging: z
         .object({
           debug: z.coerce.boolean().optional(),
@@ -498,6 +501,7 @@ async function main() {
         .object({
           defaultNewPane: z.enum(['ask', 'shell', 'browser', 'editor']).optional(),
           snapThreshold: z.coerce.number().optional(),
+          iconsOnTabs: z.coerce.boolean().optional(),
           tabAttentionStyle: z.enum(['highlight', 'pulse', 'darken', 'none']).optional(),
           attentionDismiss: z.enum(['click', 'type']).optional(),
         })
@@ -505,7 +509,7 @@ async function main() {
         .optional(),
       sidebar: z
         .object({
-          sortMode: z.enum(['recency', 'activity', 'project']).optional(),
+          sortMode: z.enum(['recency', 'recency-pinned', 'activity', 'project']).optional(),
           showProjectBadges: z.coerce.boolean().optional(),
           showSubagents: z.coerce.boolean().optional(),
           showNoninteractiveSessions: z.coerce.boolean().optional(),
@@ -531,6 +535,21 @@ async function main() {
               CodingCliProviderConfigSchema,
             )
             .optional(),
+        })
+        .strict()
+        .optional(),
+      freshclaude: z
+        .object({
+          defaultModel: z.string().optional(),
+          defaultPermissionMode: z.string().optional(),
+          defaultEffort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+        })
+        .strict()
+        .optional(),
+      network: z
+        .object({
+          host: z.enum(['127.0.0.1', '0.0.0.0']).optional(),
+          configured: z.coerce.boolean().optional(),
         })
         .strict()
         .optional(),

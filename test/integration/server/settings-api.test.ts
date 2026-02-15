@@ -115,10 +115,13 @@ describe('Settings API Integration', () => {
               ])
               .optional(),
             warnExternalLinks: z.coerce.boolean().optional(),
+            osc52Clipboard: z.enum(['ask', 'always', 'never']).optional(),
+            renderer: z.enum(['auto', 'webgl', 'canvas']).optional(),
           })
           .strict()
           .optional(),
         defaultCwd: z.string().nullable().optional(),
+        allowedFilePaths: z.array(z.string()).optional(),
         logging: z
           .object({
             debug: z.coerce.boolean().optional(),
@@ -136,6 +139,7 @@ describe('Settings API Integration', () => {
           .object({
             defaultNewPane: z.enum(['ask', 'shell', 'browser', 'editor']).optional(),
             snapThreshold: z.coerce.number().optional(),
+            iconsOnTabs: z.coerce.boolean().optional(),
             tabAttentionStyle: z.enum(['highlight', 'pulse', 'darken', 'none']).optional(),
             attentionDismiss: z.enum(['click', 'type']).optional(),
           })
@@ -143,7 +147,7 @@ describe('Settings API Integration', () => {
           .optional(),
         sidebar: z
           .object({
-            sortMode: z.enum(['recency', 'activity', 'project']).optional(),
+            sortMode: z.enum(['recency', 'recency-pinned', 'activity', 'project']).optional(),
             showProjectBadges: z.coerce.boolean().optional(),
             showSubagents: z.coerce.boolean().optional(),
             showNoninteractiveSessions: z.coerce.boolean().optional(),
@@ -169,6 +173,21 @@ describe('Settings API Integration', () => {
                 CodingCliProviderConfigSchema,
               )
               .optional(),
+          })
+          .strict()
+          .optional(),
+        freshclaude: z
+          .object({
+            defaultModel: z.string().optional(),
+            defaultPermissionMode: z.string().optional(),
+            defaultEffort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+          })
+          .strict()
+          .optional(),
+        network: z
+          .object({
+            host: z.enum(['127.0.0.1', '0.0.0.0']).optional(),
+            configured: z.coerce.boolean().optional(),
           })
           .strict()
           .optional(),
@@ -614,6 +633,20 @@ describe('Settings API Integration', () => {
 
       expect(res.status).toBe(200)
       expect(res.body.terminal.fontSize).toBe(18)
+    })
+
+    it('accepts currently-used sidebar and panes fields', async () => {
+      const res = await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({
+          sidebar: { sortMode: 'recency-pinned' },
+          panes: { iconsOnTabs: false },
+        })
+
+      expect(res.status).toBe(200)
+      expect(res.body.sidebar.sortMode).toBe('recency-pinned')
+      expect(res.body.panes.iconsOnTabs).toBe(false)
     })
 
     it('rejects invalid panes defaultNewPane enum', async () => {
