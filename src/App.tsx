@@ -26,6 +26,7 @@ import { useTurnCompletionNotifications } from '@/hooks/useTurnCompletionNotific
 import { useDrag } from '@use-gesture/react'
 import { installCrossTabSync } from '@/store/crossTabSync'
 import { startTabRegistrySync } from '@/store/tabRegistrySync'
+import { resolveAndPersistDeviceMeta, setTabRegistryDeviceMeta } from '@/store/tabRegistrySlice'
 import Sidebar, { AppView } from '@/components/Sidebar'
 import TabBar from '@/components/TabBar'
 import TabContent from '@/components/TabContent'
@@ -74,6 +75,8 @@ const SettingsView = lazy(() => import('@/components/SettingsView'))
 
 const SIDEBAR_MIN_WIDTH = 200
 const SIDEBAR_MAX_WIDTH = 500
+const CHROME_REVEAL_TOP_EDGE_PX = 48
+const CHROME_REVEAL_SWIPE_PX = 60
 const EMPTY_IDLE_WARNINGS: Record<string, unknown> = {}
 
 function isVersionInfo(value: unknown): value is VersionInfo {
@@ -131,6 +134,7 @@ export default function App() {
   const [copied, setCopied] = useState(false)
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null)
   const [pendingFirewallCommand, setPendingFirewallCommand] = useState<{ tabId: string; command: string } | null>(null)
+  const [landscapeTabBarRevealed, setLandscapeTabBarRevealed] = useState(false)
   const isMobile = useMobile()
   const isMobileRef = useRef(isMobile)
   const { isLandscape } = useOrientation()
@@ -177,6 +181,12 @@ export default function App() {
       void exitFullscreen()
     }
   }, [exitFullscreen, isFullscreen, view])
+
+  useEffect(() => {
+    if (!isLandscapeTerminalView) {
+      setLandscapeTabBarRevealed(false)
+    }
+  }, [isLandscapeTerminalView])
 
   const handleSidebarResize = useCallback((delta: number) => {
     const newWidth = Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, sidebarWidth + delta))
@@ -339,12 +349,20 @@ export default function App() {
       }
 
       try {
-        const platformInfo = await api.get<{ platform: string; availableClis?: Record<string, boolean> }>('/api/platform')
+        const platformInfo = await api.get<{
+          platform: string
+          availableClis?: Record<string, boolean>
+          hostName?: string
+        }>('/api/platform')
         if (!cancelled) {
           dispatch(setPlatform(platformInfo.platform))
           if (platformInfo.availableClis) {
             dispatch(setAvailableClis(platformInfo.availableClis))
           }
+          dispatch(setTabRegistryDeviceMeta(resolveAndPersistDeviceMeta({
+            platform: platformInfo.platform,
+            hostName: platformInfo.hostName,
+          })))
         }
       } catch (err: any) {
         console.warn('Failed to load platform info', err)
@@ -583,29 +601,35 @@ export default function App() {
   }, [tabs.length, dispatch])
 
   const handleTerminalChromeRevealTouchStart = useCallback((event: ReactTouchEvent<HTMLDivElement>) => {
-    if (!isMobile || !isFullscreen || view !== 'terminal') return
+    if (!isMobile || view !== 'terminal') return
     const touch = event.touches[0]
     if (!touch) return
-    if (touch.clientY <= 48) {
+    if (touch.clientY <= CHROME_REVEAL_TOP_EDGE_PX) {
       fullscreenTouchStartYRef.current = touch.clientY
     } else {
       fullscreenTouchStartYRef.current = null
     }
-  }, [isFullscreen, isMobile, view])
+  }, [isMobile, view])
 
   const handleTerminalChromeRevealTouchEnd = useCallback((event: ReactTouchEvent<HTMLDivElement>) => {
     const startY = fullscreenTouchStartYRef.current
     fullscreenTouchStartYRef.current = null
-    if (!isMobile || !isFullscreen || view !== 'terminal') return
+    if (!isMobile || view !== 'terminal') return
     if (startY === null) return
     const touch = event.changedTouches[0]
     if (!touch) return
     const deltaY = touch.clientY - startY
-    if (deltaY > 60) {
+    if (deltaY > CHROME_REVEAL_SWIPE_PX) {
+      if (isLandscapeTerminalView) {
+        triggerHapticFeedback()
+        setLandscapeTabBarRevealed(true)
+        return
+      }
+      if (!isFullscreen) return
       triggerHapticFeedback()
       void exitFullscreen()
     }
-  }, [exitFullscreen, isFullscreen, isMobile, view])
+  }, [exitFullscreen, isFullscreen, isLandscapeTerminalView, isMobile, view])
 
   const content = (() => {
     if (view === 'sessions') {
@@ -642,7 +666,7 @@ export default function App() {
     }
     return (
       <div className="flex flex-col h-full">
-        {!isLandscapeTerminalView && <TabBar />}
+        {(!isLandscapeTerminalView || landscapeTabBarRevealed) && <TabBar />}
         <div
           className="flex-1 min-h-0 relative bg-background"
           data-testid="terminal-work-area"
@@ -735,8 +759,8 @@ export default function App() {
           </div>
         </div>
       ) : (
-        <div className="h-8 px-3 md:px-4 flex items-center justify-between border-b border-border/30 bg-background flex-shrink-0">
-          <div className="flex items-center gap-2">
+        <div className="h-8 px-3 md:px-4 flex items-center justify-between gap-2 border-b border-border/30 bg-background flex-shrink-0">
+          <div className="flex min-w-0 flex-1 items-center gap-1.5 md:gap-2">
             <button
               onClick={toggleSidebarCollapse}
               className="p-1.5 rounded-md hover:bg-muted transition-colors min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center"
@@ -753,7 +777,7 @@ export default function App() {
                 <TooltipTrigger asChild>
                   <button
                     type="button"
-                    className={`font-mono text-base font-semibold tracking-tight rounded px-1 -mx-1 border-0 p-0 bg-transparent inline-flex items-center gap-1 transition-colors ${
+                    className={`font-mono min-w-0 text-sm md:text-base font-semibold tracking-tight whitespace-nowrap rounded px-1 -mx-1 border-0 p-0 bg-transparent inline-flex items-center gap-1 transition-colors ${
                       updateAvailable
                         ? 'text-amber-700 dark:text-amber-400 bg-amber-100/60 dark:bg-amber-950/40 hover:bg-amber-200/70 dark:hover:bg-amber-900/60 cursor-pointer'
                         : 'cursor-default'
@@ -766,7 +790,7 @@ export default function App() {
                     }
                     data-testid="app-brand-status"
                   >
-                    <span>🐚🔥freshell</span>
+                    <span className="truncate">🐚🔥freshell</span>
                     {updateAvailable && <AlertCircle className="h-3.5 w-3.5" aria-hidden="true" />}
                   </button>
                 </TooltipTrigger>
@@ -782,10 +806,10 @@ export default function App() {
                 </TooltipContent>
               </Tooltip>
             ) : (
-              <span className="font-mono text-base font-semibold tracking-tight">🐚🔥freshell</span>
+              <span className="font-mono text-sm md:text-base font-semibold tracking-tight whitespace-nowrap truncate">🐚🔥freshell</span>
             )}
           </div>
-          <div className="flex items-center gap-1">
+          <div className="flex shrink-0 items-center gap-0 md:gap-1">
             {idleWarningCount > 0 && (
               <button
                 onClick={() => setView('overview')}
@@ -905,9 +929,6 @@ export default function App() {
             )}
           </div>
         )}
-        {/* TODO(#5): When fullscreen mode (#29) is implemented, add a vertical swipe-down
-             gesture here to reveal the hidden tab bar. The @use-gesture/react useDrag
-             infrastructure from the sidebar swipe can be extended for this. */}
         <div
           className="flex-1 min-w-0 flex flex-col"
           {...(isMobile ? bindTabSwipe() : {})}

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import App from '@/App'
@@ -62,6 +62,10 @@ vi.mock('@/components/SetupWizard', () => ({
 
 vi.mock('@/hooks/useTheme', () => ({
   useThemeEffect: () => {},
+}))
+
+vi.mock('@use-gesture/react', () => ({
+  useDrag: () => () => ({}),
 }))
 
 function createStore() {
@@ -127,5 +131,26 @@ describe('App mobile landscape mode', () => {
     expect(screen.getByText('freshell')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Enter fullscreen' })).toBeInTheDocument()
     expect(screen.queryByTitle('Hide sidebar')).not.toBeInTheDocument()
+  })
+
+  it('reveals the tab strip when swiping down from the top of terminal work area', () => {
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    expect(screen.queryByLabelText('Open tab switcher')).not.toBeInTheDocument()
+
+    const terminalWorkArea = screen.getByTestId('terminal-work-area')
+    fireEvent.touchStart(terminalWorkArea, {
+      touches: [{ identifier: 1, clientX: 12, clientY: 8 }],
+    })
+    fireEvent.touchEnd(terminalWorkArea, {
+      changedTouches: [{ identifier: 1, clientX: 12, clientY: 96 }],
+    })
+
+    expect(screen.getByLabelText('Open tab switcher')).toBeInTheDocument()
   })
 })

@@ -229,6 +229,27 @@ export function normalizePath(input: string): string {
   return path.normalize(resolved)
 }
 
+function trimTrailingSeparators(input: string): string {
+  const normalized = path.normalize(input)
+  const root = path.parse(normalized).root
+  if (normalized === root) {
+    return normalized
+  }
+  return normalized.replace(/[\\/]+$/u, '')
+}
+
+function resolvePathForSandboxComparison(input: string): string {
+  const { normalizedPath, flavor } = normalizeUserPath(input)
+  const fsPath = toFilesystemPathSync(normalizedPath, flavor)
+  const resolved = path.resolve(fsPath)
+
+  try {
+    return trimTrailingSeparators(fs.realpathSync(resolved))
+  } catch {
+    return trimTrailingSeparators(resolved)
+  }
+}
+
 /**
  * Check whether a target path falls within one of the allowed root directories.
  * Returns true if sandboxing is disabled (allowedRoots is undefined or empty).
@@ -239,23 +260,13 @@ export function isPathAllowed(targetPath: string, allowedRoots: string[] | undef
     return true
   }
 
-  const resolved = path.resolve(targetPath)
-
-  // Try to resolve symlinks; fall back to resolved path if file doesn't exist yet
-  let realTarget: string
-  try {
-    realTarget = fs.realpathSync(resolved)
-  } catch {
-    realTarget = resolved
-  }
-
-  const normalizedTarget = path.normalize(realTarget)
+  const normalizedTarget = resolvePathForSandboxComparison(targetPath)
   const compareTarget = process.platform === 'win32'
     ? normalizedTarget.toLowerCase()
     : normalizedTarget
 
   for (const root of allowedRoots) {
-    const normalizedRoot = normalizePath(root)
+    const normalizedRoot = resolvePathForSandboxComparison(root)
     const compareRoot = process.platform === 'win32'
       ? normalizedRoot.toLowerCase()
       : normalizedRoot

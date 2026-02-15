@@ -1,6 +1,6 @@
-import { ChevronLeft, ChevronRight } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Plus } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
+import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { triggerHapticFeedback } from '@/lib/mobile-haptics'
 
@@ -19,6 +19,15 @@ export function MobileTabStrip({ onOpenSwitcher }: { onOpenSwitcher?: () => void
 
   const isFirst = activeIndex <= 0
   const isLast = activeIndex >= tabs.length - 1
+
+  const handleRightAction = () => {
+    triggerHapticFeedback()
+    if (isLast) {
+      dispatch(addTab({ mode: 'shell' }))
+      return
+    }
+    dispatch(switchToNextTab())
+  }
 
   return (
     <div className="relative z-20 h-12 flex items-center px-2 bg-background border-b border-border/30">
@@ -45,12 +54,11 @@ export function MobileTabStrip({ onOpenSwitcher }: { onOpenSwitcher?: () => void
       </button>
 
       <button
-        className="min-h-11 min-w-11 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground disabled:opacity-30"
-        onClick={() => { triggerHapticFeedback(); dispatch(switchToNextTab()) }}
-        disabled={isLast}
-        aria-label="Next tab"
+        className="min-h-11 min-w-11 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground"
+        onClick={handleRightAction}
+        aria-label={isLast ? 'New tab' : 'Next tab'}
       >
-        <ChevronRight className="h-5 w-5" />
+        {isLast ? <Plus className="h-5 w-5" /> : <ChevronRight className="h-5 w-5" />}
       </button>
     </div>
   )

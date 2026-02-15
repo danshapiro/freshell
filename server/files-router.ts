@@ -2,7 +2,13 @@ import express, { type Request, type Response, type NextFunction } from 'express
 import fsp from 'fs/promises'
 import path from 'path'
 import { spawn } from 'child_process'
-import { getPathModuleForFlavor, isReachableDirectory, normalizeUserPath, toFilesystemPath } from './path-utils.js'
+import {
+  getPathModuleForFlavor,
+  isPathAllowed,
+  isReachableDirectory,
+  normalizeUserPath,
+  toFilesystemPath,
+} from './path-utils.js'
 import { configStore } from './config-store.js'
 
 export const filesRouter = express.Router()

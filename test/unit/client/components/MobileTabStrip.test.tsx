@@ -124,7 +124,7 @@ describe('MobileTabStrip', () => {
     expect(screen.getByText('2 / 3')).toBeInTheDocument()
   })
 
-  it('has previous and next navigation buttons', async () => {
+  it('has previous and next navigation buttons when not on the last tab', async () => {
     const { MobileTabStrip } = await import('@/components/MobileTabStrip')
     const store = createStore(
       [createTab('tab-1', 'Tab 1'), createTab('tab-2', 'Tab 2')],
@@ -156,7 +156,7 @@ describe('MobileTabStrip', () => {
     expect(screen.getByRole('button', { name: /next tab/i })).not.toBeDisabled()
   })
 
-  it('disables next button on last tab', async () => {
+  it('shows new tab action on last tab', async () => {
     const { MobileTabStrip } = await import('@/components/MobileTabStrip')
     const store = createStore(
       [createTab('tab-1', 'Tab 1'), createTab('tab-2', 'Tab 2')],
@@ -169,7 +169,8 @@ describe('MobileTabStrip', () => {
     )
 
     expect(screen.getByRole('button', { name: /previous tab/i })).not.toBeDisabled()
-    expect(screen.getByRole('button', { name: /next tab/i })).toBeDisabled()
+    expect(screen.queryByRole('button', { name: /next tab/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /new tab/i })).toBeInTheDocument()
   })
 
   it('switches to next tab on next button click', async () => {
@@ -216,7 +217,24 @@ describe('MobileTabStrip', () => {
     expect(screen.getByText('Dev Server')).toBeInTheDocument()
     expect(screen.getByText('1 / 1')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /previous tab/i })).toBeDisabled()
-    expect(screen.getByRole('button', { name: /next tab/i })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /new tab/i })).toBeEnabled()
+  })
+
+  it('adds a new tab when right action is tapped on the last tab', async () => {
+    const { MobileTabStrip } = await import('@/components/MobileTabStrip')
+    const store = createStore(
+      [createTab('tab-1', 'Tab 1'), createTab('tab-2', 'Tab 2')],
+      'tab-2'
+    )
+    render(
+      <Provider store={store}>
+        <MobileTabStrip />
+      </Provider>
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /new tab/i }))
+    expect(store.getState().tabs.tabs).toHaveLength(3)
+    expect(store.getState().tabs.activeTabId).toBe(store.getState().tabs.tabs[2].id)
   })
 
   it('has a tab switcher button in the center area', async () => {

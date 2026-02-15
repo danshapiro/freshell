@@ -30,7 +30,6 @@ import { resolveTerminalFontFamily } from '@/lib/terminal-fonts'
 import { useChunkedAttach } from '@/components/terminal/useChunkedAttach'
 import { Osc52PromptModal } from '@/components/terminal/Osc52PromptModal'
 import { TerminalSearchBar } from '@/components/terminal/TerminalSearchBar'
-import { MobileTerminalToolbar } from '@/components/terminal/MobileTerminalToolbar'
 import {
   createTerminalRuntime,
   type TerminalRuntime,
@@ -48,7 +47,6 @@ const RATE_LIMIT_RETRY_MAX_ATTEMPTS = 3
 const RATE_LIMIT_RETRY_BASE_MS = 250
 const RATE_LIMIT_RETRY_MAX_MS = 1000
 const KEYBOARD_INSET_ACTIVATION_PX = 80
-const MOBILE_TOOLBAR_HEIGHT_PX = 56
 const TAP_MULTI_INTERVAL_MS = 350
 const TAP_MAX_DISTANCE_PX = 24
 const TOUCH_SCROLL_PIXELS_PER_LINE = 18
@@ -86,12 +84,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
+  const localServerInstanceId = useAppSelector((s) => s.connection.serverInstanceId)
   const settings = useAppSelector((s) => s.settings.settings)
   const hasAttention = useAppSelector((s) => !!s.turnCompletion?.attentionByTab?.[tabId])
   const hasAttentionRef = useRef(hasAttention)
   const hasPaneAttention = useAppSelector((s) => !!s.turnCompletion?.attentionByPane?.[paneId])
   const hasPaneAttentionRef = useRef(hasPaneAttention)
-  const localServerInstanceId = useAppSelector((s) => s.connection.serverInstanceId)
 
   // All hooks MUST be called before any conditional returns
   const ws = useMemo(() => getWsClient(), [])
@@ -102,7 +100,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState<{ resultIndex: number; resultCount: number } | null>(null)
   const [keyboardInsetPx, setKeyboardInsetPx] = useState(0)
-  const [ctrlModifierActive, setCtrlModifierActive] = useState(false)
   const setPendingLinkUriRef = useRef(setPendingLinkUri)
 
   const containerRef = useRef<HTMLDivElement | null>(null)
@@ -233,12 +230,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       }
       viewport.removeEventListener('resize', updateKeyboardInset)
       viewport.removeEventListener('scroll', updateKeyboardInset)
-    }
-  }, [isMobile])
-
-  useEffect(() => {
-    if (!isMobile) {
-      setCtrlModifierActive(false)
     }
   }, [isMobile])
 
@@ -396,17 +387,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     }
   }, [clearLongPressTimer])
 
-  const applyCtrlModifier = useCallback((input: string, keyId: string) => {
-    if (!ctrlModifierActive || keyId === 'ctrl') return input
-    setCtrlModifierActive(false)
-
-    if (input.length === 1 && /[A-Za-z]/.test(input)) {
-      const upper = input.toUpperCase().charCodeAt(0)
-      return String.fromCharCode(upper - 64)
-    }
-    return input
-  }, [ctrlModifierActive])
-
   // Helper to update pane content - uses ref to avoid recreation on content changes
   // This is CRITICAL: if updateContent depended on terminalContent directly,
   // it would be recreated on every status update, causing the effect to re-run
@@ -549,14 +529,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     ws.send({ type: 'terminal.input', terminalId: tid, data })
   }, [dispatch, tabId, paneId, ws])
 
-  const handleMobileToolbarKey = useCallback((input: string, keyId: string) => {
-    const payload = applyCtrlModifier(input, keyId)
-    sendInput(payload)
-    requestAnimationFrame(() => {
-      termRef.current?.focus()
-    })
-  }, [applyCtrlModifier, sendInput])
-
   const searchOpts = useMemo(() => ({
     caseSensitive: false,
     incremental: true,
@@ -638,7 +610,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     // Register custom link provider for clickable local file paths
     const filePathLinkDisposable = typeof term.registerLinkProvider === 'function'
       ? term.registerLinkProvider({
-        provideLinks(bufferLineNumber: number, callback: (links: import('xterm').ILink[] | undefined) => void) {
+        provideLinks(bufferLineNumber: number, callback: (links: import('@xterm/xterm').ILink[] | undefined) => void) {
           const bufferLine = term.buffer.active.getLine(bufferLineNumber - 1)
           if (!bufferLine) { callback(undefined); return }
           const text = bufferLine.translateToString()
@@ -1010,14 +982,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             dispatch(updateTab({ id: currentTab.id, updates: { terminalId: newId, status: 'running' } }))
           }
           if (msg.effectiveResumeSessionId && msg.effectiveResumeSessionId !== contentRef.current?.resumeSessionId) {
-            const mode = contentRef.current?.mode
-            const sessionRef = mode && mode !== 'shell'
-              ? { provider: mode, sessionId: msg.effectiveResumeSessionId, serverInstanceId: localServerInstanceId }
-              : undefined
-            updateContent({
-              resumeSessionId: msg.effectiveResumeSessionId,
-              ...(sessionRef ? { sessionRef } : {}),
-            })
+            updateContent({ resumeSessionId: msg.effectiveResumeSessionId })
           }
           const isSnapshotChunked = msg.snapshotChunked === true
           if (isSnapshotChunked) {
@@ -1083,7 +1048,11 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           })
           const mode = contentRef.current?.mode
           const sessionRef = mode && mode !== 'shell'
-            ? { provider: mode, sessionId, serverInstanceId: localServerInstanceId }
+            ? {
+              provider: mode,
+              sessionId,
+              ...(localServerInstanceId ? { serverInstanceId: localServerInstanceId } : {}),
+            }
             : undefined
           updateContent({
             resumeSessionId: sessionId,
@@ -1233,7 +1202,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     markSnapshotChunkedCreated,
   ])
 
-  const mobileBottomInsetPx = isMobile ? keyboardInsetPx + MOBILE_TOOLBAR_HEIGHT_PX : 0
+  // NOW we can do the conditional return - after all hooks
+  if (!isTerminal || !terminalContent) {
+    return null
+  }
+
+  const showSpinner = terminalContent.status === 'creating' || isAttaching
+  const mobileBottomInsetPx = isMobile ? keyboardInsetPx : 0
   const terminalContainerStyle = useMemo(() => {
     if (!isMobile) return undefined
 
@@ -1242,13 +1217,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       ...(mobileBottomInsetPx > 0 ? { height: `calc(100% - ${mobileBottomInsetPx}px)` } : {}),
     }
   }, [isMobile, mobileBottomInsetPx])
-
-  // NOW we can do the conditional return - after all hooks
-  if (!isTerminal || !terminalContent) {
-    return null
-  }
-
-  const showSpinner = terminalContent.status === 'creating' || isAttaching
 
   return (
     <div
@@ -1267,14 +1235,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         onTouchEnd={isMobile ? handleMobileTouchEnd : undefined}
         onTouchCancel={isMobile ? handleMobileTouchEnd : undefined}
       />
-      {isMobile && (
-        <MobileTerminalToolbar
-          ctrlActive={ctrlModifierActive}
-          keyboardInsetPx={keyboardInsetPx}
-          onCtrlToggle={() => setCtrlModifierActive((prev) => !prev)}
-          onSendKey={handleMobileToolbarKey}
-        />
-      )}
       {showSpinner && (
         <div className="absolute inset-0 flex items-center justify-center bg-background/80">
           <div className="flex flex-col items-center gap-3">

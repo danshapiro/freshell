@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import tabsReducer from '@/store/tabsSlice'
@@ -8,8 +8,6 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
 import type { TerminalPaneContent } from '@/store/paneTypes'
-
-const mockSend = vi.fn()
 
 vi.mock('@/components/terminal/terminal-runtime', () => ({
   createTerminalRuntime: () => ({
@@ -30,6 +28,7 @@ vi.mock('@xterm/xterm', () => ({
     onData: vi.fn(() => ({ dispose: vi.fn() })),
     onTitleChange: vi.fn(() => ({ dispose: vi.fn() })),
     attachCustomKeyEventHandler: vi.fn(),
+    registerLinkProvider: vi.fn(() => ({ dispose: vi.fn() })),
     write: vi.fn(),
     clear: vi.fn(),
     dispose: vi.fn(),
@@ -43,7 +42,7 @@ vi.mock('@xterm/xterm', () => ({
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: vi.fn(() => ({
-    send: mockSend,
+    send: vi.fn(),
     onMessage: vi.fn(() => vi.fn()),
     onReconnect: vi.fn(() => vi.fn()),
     connect: vi.fn(() => Promise.resolve()),
@@ -170,7 +169,7 @@ describe('TerminalView mobile viewport handling', () => {
 
     const terminalContainer = getByTestId('terminal-xterm-container')
     expect(terminalContainer.style.touchAction).toBe('none')
-    expect(terminalContainer.style.height).toBe('calc(100% - 176px)')
+    expect(terminalContainer.style.height).toBe('calc(100% - 120px)')
 
     act(() => {
       viewport.height = 860 // Inset 40px: below activation threshold
@@ -178,7 +177,7 @@ describe('TerminalView mobile viewport handling', () => {
     })
 
     await waitFor(() => {
-      expect(terminalContainer.style.height).toBe('calc(100% - 56px)')
+      expect(terminalContainer.style.height).toBe('')
     })
   })
 
@@ -200,7 +199,7 @@ describe('TerminalView mobile viewport handling', () => {
     expect(terminalContainer.style.height).toBe('')
   })
 
-  it('renders mobile key toolbar and sends tab input', async () => {
+  it('does not render mobile key toolbar on mobile', () => {
     const viewport = createVisualViewportMock(860, 0)
     Object.defineProperty(window, 'visualViewport', { value: viewport, configurable: true })
     Object.defineProperty(window, 'innerHeight', { value: 900, configurable: true })
@@ -217,12 +216,6 @@ describe('TerminalView mobile viewport handling', () => {
         />
       </Provider>
     )
-
-    expect(screen.getByTestId('mobile-terminal-toolbar')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Send Tab' }))
-
-    await waitFor(() => {
-      expect(mockSend).toHaveBeenCalledWith({ type: 'terminal.input', terminalId: 'term-1', data: '\t' })
-    })
+    expect(screen.queryByTestId('mobile-terminal-toolbar')).not.toBeInTheDocument()
   })
 })

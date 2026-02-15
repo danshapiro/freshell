@@ -203,4 +203,22 @@ describe('server/path-utils cross-platform path handling', () => {
     const fsPath = toFilesystemPathSync('/mnt/d/projects/app', 'posix')
     expect(fsPath).toBe(String.raw`D:\projects\app`)
   })
+
+  it('allows Windows-configured roots against WSL-mapped targets', () => {
+    Object.defineProperty(process, 'platform', {
+      value: 'linux',
+      writable: true,
+      configurable: true,
+    })
+    process.env.WSL_DISTRO_NAME = 'Ubuntu'
+    process.env.WSL_WINDOWS_SYS32 = '/custom-mount/c/Windows/System32'
+
+    const driveRootAllowed = ['C:\\']
+    expect(isPathAllowed('/custom-mount/c', driveRootAllowed)).toBe(true)
+    expect(isPathAllowed('/custom-mount/c/users/alice/project', driveRootAllowed)).toBe(true)
+
+    const allowedRoots = [String.raw`C:\users`]
+    expect(isPathAllowed('/custom-mount/c/users/alice/project', allowedRoots)).toBe(true)
+    expect(isPathAllowed('/custom-mount/d/users/alice/project', allowedRoots)).toBe(false)
+  })
 })

@@ -30,7 +30,7 @@ import { SdkBridge } from './sdk-bridge.js'
 import { createClientLogsRouter } from './client-logs.js'
 import { createStartupState } from './startup-state.js'
 import { getPerfConfig, initPerfLogging, setPerfLoggingEnabled, startPerfTimer, withPerfSpan } from './perf-logger.js'
-import { detectPlatform, detectAvailableClis } from './platform.js'
+import { detectPlatform, detectAvailableClis, detectHostName } from './platform.js'
 import { resolveVisitPort } from './startup-url.js'
 import { NetworkManager } from './network-manager.js'
 import { getNetworkHost } from './get-network-host.js'
@@ -441,11 +441,12 @@ async function main() {
   })
 
   app.get('/api/platform', async (_req, res) => {
-    const [platform, availableClis] = await Promise.all([
+    const [platform, availableClis, hostName] = await Promise.all([
       detectPlatform(),
       detectAvailableClis(),
+      detectHostName(),
     ])
-    res.json({ platform, availableClis })
+    res.json({ platform, availableClis, hostName })
   })
 
   app.get('/api/version', async (_req, res) => {

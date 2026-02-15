@@ -13,6 +13,11 @@ import type { PaneNode } from './paneTypes'
 export const SYNC_INTERVAL_MS = 5000
 
 type AppStore = Store<RootState>
+type TabRegistryWsClient = Pick<WsClient, 'state' | 'onMessage'> & {
+  sendTabsSyncPush?: WsClient['sendTabsSyncPush']
+  sendTabsSyncQuery?: WsClient['sendTabsSyncQuery']
+  onReconnect?: WsClient['onReconnect']
+}
 
 type RevisionState = Map<string, { fingerprint: string; revision: number }>
 
@@ -84,6 +89,8 @@ function buildRecords(state: RootState, now: number, revisions: RevisionState, s
 
 function lifecycleSignature(state: RootState): string {
   return JSON.stringify({
+    deviceId: state.tabRegistry.deviceId,
+    deviceLabel: state.tabRegistry.deviceLabel,
     tabs: state.tabs.tabs.map((tab) => ({
       id: tab.id,
       title: tab.title,
@@ -100,16 +107,13 @@ function lifecycleSignature(state: RootState): string {
   })
 }
 
-export function startTabRegistrySync(store: AppStore, ws: WsClient): () => void {
-  const sendTabsSyncPush = typeof (ws as any).sendTabsSyncPush === 'function'
-    ? (payload: { deviceId: string; deviceLabel: string; records: RegistryTabRecord[] }) => (ws as any).sendTabsSyncPush(payload)
-    : (_payload: { deviceId: string; deviceLabel: string; records: RegistryTabRecord[] }) => {}
-  const sendTabsSyncQuery = typeof (ws as any).sendTabsSyncQuery === 'function'
-    ? (payload: { requestId: string; deviceId: string; rangeDays?: number }) => (ws as any).sendTabsSyncQuery(payload)
-    : (_payload: { requestId: string; deviceId: string; rangeDays?: number }) => {}
-  const onReconnect = typeof (ws as any).onReconnect === 'function'
-    ? (handler: () => void) => (ws as any).onReconnect(handler)
-    : (_handler: () => void) => () => {}
+export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): () => void {
+  const sendTabsSyncPush = ws.sendTabsSyncPush?.bind(ws)
+    ?? ((_payload: { deviceId: string; deviceLabel: string; records: RegistryTabRecord[] }) => {})
+  const sendTabsSyncQuery = ws.sendTabsSyncQuery?.bind(ws)
+    ?? ((_payload: { requestId: string; deviceId: string; rangeDays?: number }) => {})
+  const onReconnect = ws.onReconnect?.bind(ws)
+    ?? ((_handler: () => void) => () => {})
 
   const revisions: RevisionState = new Map()
   const pendingRequests = new Set<string>()

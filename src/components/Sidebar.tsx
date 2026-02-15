@@ -251,7 +251,7 @@ export default function Sidebar({
 
   const nav = [
     { id: 'terminal' as const, label: 'Coding Agents', icon: Terminal, shortcut: 'T' },
-    { id: 'tabs' as const, label: 'Tabs', icon: LayoutGrid, shortcut: 'B' },
+    { id: 'tabs' as const, label: 'Tabs', icon: Archive, shortcut: 'A' },
     { id: 'overview' as const, label: 'Panes', icon: LayoutGrid, shortcut: 'O' },
     { id: 'sessions' as const, label: 'Projects', icon: History, shortcut: 'P' },
     { id: 'settings' as const, label: 'Settings', icon: Settings, shortcut: ',' },

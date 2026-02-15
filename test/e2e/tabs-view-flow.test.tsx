@@ -73,7 +73,7 @@ describe('tabs view flow', () => {
 
     const remoteCard = screen.getByText('remote-device: work item').closest('article')
     expect(remoteCard).toBeTruthy()
-    fireEvent.click(within(remoteCard as HTMLElement).getByRole('button', { name: 'Open copy' }))
+    fireEvent.click(within(remoteCard as HTMLElement).getByRole('button', { name: /Open copy/i }))
     expect(store.getState().tabs.tabs).toHaveLength(1)
     expect(store.getState().tabs.tabs[0]?.title).toBe('work item')
     const tabId = store.getState().tabs.tabs[0]!.id
@@ -131,7 +131,7 @@ describe('tabs view flow', () => {
 
     const remoteCard = screen.getByText('remote-device: codex run').closest('article')
     expect(remoteCard).toBeTruthy()
-    fireEvent.click(within(remoteCard as HTMLElement).getByRole('button', { name: 'Open copy' }))
+    fireEvent.click(within(remoteCard as HTMLElement).getByRole('button', { name: /Open copy/i }))
 
     const copiedTab = store.getState().tabs.tabs[0]
     expect(copiedTab?.title).toBe('codex run')

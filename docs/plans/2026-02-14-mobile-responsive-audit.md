@@ -1,6 +1,12 @@
 # Freshell Mobile & Responsive Design Audit
 
 **Date:** 2026-02-14
+**Status:** Closed on 2026-02-15 (items #1-#40 complete on `main`)
+
+## Closure Notes (2026-02-15)
+
+- Item #5 is now fully implemented in `src/App.tsx` with swipe-down reveal behavior for the hidden tab strip in mobile landscape terminal view.
+- Items #13-#40 from this audit were implemented in `mobile-phase-2`, tested (`npm test`, `npm run verify`), independently reviewed (fresheyes), and landed to `main`.
 
 ## Current State
 

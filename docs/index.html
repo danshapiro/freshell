@@ -110,9 +110,9 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
 
 /* ========== Mobile Responsive ========== */
 /* On mobile (<768px): tab bar is replaced by MobileTabStrip (centered tab name
-   with chevrons + tab switcher grid overlay). Touch targets are 44px min.
+   with chevrons + tab switcher grid overlay). At the right edge, the chevron
+   becomes a + action on the last tab to create a new tab. Touch targets are 44px min.
    Sidebar opens/closes via swipe gesture and uses full-width drawer mode.
-   Terminal includes keyboard-aware resize + a mobile key toolbar (Tab/Ctrl/Esc/arrows/F-keys).
    Pull-to-refresh is disabled, safe-area insets are respected, and fullscreen/landscape
    mode minimizes chrome for terminal-focused use. */
 
@@ -580,7 +580,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
             <span class="sv-count">12 sessions across 3 projects</span>
             <button class="sv-refresh"><i data-lucide="refresh-cw" class="icon"></i></button>
           </div>
-          <div class="sv-search"><div class="sv-search-wrap"><i data-lucide="search" class="icon-md"></i><input type="text" placeholder="Search project sessions, projects…" readonly></div></div>
+          <div class="sv-search"><div class="sv-search-wrap"><i data-lucide="search" class="icon-md"></i><input type="text" placeholder="Search sessions, projects…" readonly></div></div>
           <div class="sv-body">
             <div class="sv-project open">
               <div class="sv-project-header">

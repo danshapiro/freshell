@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
+import type { ApiError } from '@/lib/api'
 import { api } from '@/lib/api'
 import { fuzzyMatch } from '@/lib/fuzzy-match'
 import { rankCandidateDirectories } from '@/lib/tab-directory-preference'
@@ -37,6 +38,12 @@ function dedupeDirectories(values: string[]): string[] {
 
 function isPathInput(value: string): boolean {
   return PATH_INPUT_PATTERN.test(value.trimStart())
+}
+
+function isApiError(error: unknown): error is ApiError {
+  if (!error || typeof error !== 'object') return false
+  const maybe = error as Partial<ApiError>
+  return typeof maybe.status === 'number'
 }
 
 export default function DirectoryPicker({
@@ -178,8 +185,12 @@ export default function DirectoryPicker({
         return
       }
       onConfirm(result.resolvedPath || nextPath)
-    } catch {
+    } catch (error) {
       if (validationRequestIdRef.current !== validationId) return
+      if (isApiError(error) && error.status === 403) {
+        setError('path not allowed')
+        return
+      }
       setError('directory not found')
     } finally {
       if (validationRequestIdRef.current === validationId) {

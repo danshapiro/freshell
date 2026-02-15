@@ -14,6 +14,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - Always check for and use applicable skills
 - This project uses the [superpowers](https://github.com/obra/superpowers) plugin (configured in `.claude/settings.json`). Skills like `superpowers:executing-plans` are referenced throughout plan docs in `docs/plans/`.
 - Always work in a worktree (in \.worktrees\)
+- Many agents may be working in the worktree at the same time. If you see activity from other agents (for example test runs or file changes), respect it.
 - Specific user instructions override ALL other instructions, including the above, and including superpowers or skills
 - Server uses NodeNext/ESM; relative imports must include `.js` extensions
 - Always consider checking logs for debugging; server logs (including client console logs) are in the server process stdout/stderr (e.g., `npm run dev`/`npm start`).
