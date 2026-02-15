@@ -168,10 +168,15 @@ async function main() {
     sessionRepairService,
     async () => {
       const currentSettings = migrateSettingsSortMode(await configStore.getSettings())
+      const lastError = configStore.getLastReadError()
+      const configFallback = lastError
+        ? { reason: lastError, backupExists: await configStore.backupExists() }
+        : undefined
       return {
         settings: currentSettings,
         projects: codingCliIndexer.getProjects(),
         perfLogging: perfConfig.enabled,
+        configFallback,
       }
     },
     () => terminalMetadata.list(),
