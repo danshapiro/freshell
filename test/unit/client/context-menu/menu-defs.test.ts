@@ -28,6 +28,7 @@ function stubActions(): MenuActions {
       clearScrollback: vi.fn(),
       reset: vi.fn(),
       hasSelection: vi.fn(() => false),
+      openSearch: vi.fn(),
     })),
     getEditorActions: vi.fn(() => ({
       cut: vi.fn(),
@@ -173,6 +174,48 @@ describe('buildMenuItems - "Replace pane" item', () => {
     if (replaceItem!.type === 'item') {
       replaceItem!.onSelect()
       expect(actions.replacePane).toHaveBeenCalledWith('tab-1', 'pane-1')
+    }
+  })
+})
+
+describe('buildMenuItems - terminal "Search" item', () => {
+  it('includes "Search" item in terminal context menu', () => {
+    const actions = stubActions()
+    const target: ContextTarget = { kind: 'terminal', tabId: 'tab-1', paneId: 'pane-1' }
+    const items = buildMenuItems(target, makeCtx(actions))
+
+    const searchItem = items.find((i) => i.type === 'item' && i.id === 'terminal-search')
+    expect(searchItem).toBeDefined()
+    expect(searchItem!.type).toBe('item')
+    if (searchItem!.type === 'item') {
+      expect(searchItem!.label).toBe('Search')
+    }
+  })
+
+  it('"Search" appears after "Select all" in terminal menu', () => {
+    const actions = stubActions()
+    const target: ContextTarget = { kind: 'terminal', tabId: 'tab-1', paneId: 'pane-1' }
+    const items = buildMenuItems(target, makeCtx(actions))
+
+    const selectAllIdx = items.findIndex((i) => i.type === 'item' && i.id === 'terminal-select-all')
+    const searchIdx = items.findIndex((i) => i.type === 'item' && i.id === 'terminal-search')
+    expect(selectAllIdx).toBeGreaterThanOrEqual(0)
+    expect(searchIdx).toBeGreaterThan(selectAllIdx)
+  })
+
+  it('calls terminalActions.openSearch when selected', () => {
+    const actions = stubActions()
+    const target: ContextTarget = { kind: 'terminal', tabId: 'tab-1', paneId: 'pane-1' }
+    const items = buildMenuItems(target, makeCtx(actions))
+
+    // buildMenuItems already called getTerminalActions once; grab that return value
+    const terminalActions = (actions.getTerminalActions as ReturnType<typeof vi.fn>).mock.results[0].value
+
+    const searchItem = items.find((i) => i.type === 'item' && i.id === 'terminal-search')
+    expect(searchItem).toBeDefined()
+    if (searchItem!.type === 'item') {
+      searchItem!.onSelect()
+      expect(terminalActions!.openSearch).toHaveBeenCalled()
     }
   })
 })

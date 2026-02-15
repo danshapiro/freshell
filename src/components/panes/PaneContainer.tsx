@@ -12,6 +12,7 @@ import ClaudeChatView from '../claude-chat/ClaudeChatView'
 import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
 import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-utils'
+import { getTerminalActions } from '@/lib/pane-action-registry'
 import { cn } from '@/lib/utils'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'
@@ -346,6 +347,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         onRenameChange={isRenaming ? setRenameValue : undefined}
         onRenameBlur={isRenaming ? commitRename : undefined}
         onRenameKeyDown={isRenaming ? handleRenameKeyDown : undefined}
+        onSearch={node.content.kind === 'terminal' ? () => getTerminalActions(node.id)?.openSearch() : undefined}
         onDoubleClickTitle={() => startRename(node.id, paneTitle)}
       >
         {renderContent(tabId, node.id, node.content, isOnlyPane, hidden)}

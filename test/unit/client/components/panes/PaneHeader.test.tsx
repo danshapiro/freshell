@@ -10,6 +10,9 @@ vi.mock('lucide-react', () => ({
   Circle: ({ className }: { className?: string }) => (
     <svg data-testid="circle-icon" className={className} />
   ),
+  Search: ({ className }: { className?: string }) => (
+    <svg data-testid="search-icon" className={className} />
+  ),
   Maximize2: ({ className }: { className?: string }) => (
     <svg data-testid="maximize-icon" className={className} />
   ),
@@ -504,6 +507,92 @@ describe('PaneHeader', () => {
 
       expect(screen.queryByTitle('Maximize pane')).not.toBeInTheDocument()
       expect(screen.queryByTitle('Restore pane')).not.toBeInTheDocument()
+    })
+  })
+
+  describe('search button', () => {
+    it('renders search button for terminal panes when onSearch is provided', () => {
+      render(
+        <PaneHeader
+          title="My Terminal"
+          status="running"
+          isActive={true}
+          onClose={vi.fn()}
+          content={makeTerminalContent()}
+          onSearch={vi.fn()}
+        />
+      )
+
+      expect(screen.getByTitle('Search in terminal')).toBeInTheDocument()
+      expect(screen.getByTestId('search-icon')).toBeInTheDocument()
+    })
+
+    it('does not render search button when onSearch is not provided', () => {
+      render(
+        <PaneHeader
+          title="My Terminal"
+          status="running"
+          isActive={true}
+          onClose={vi.fn()}
+          content={makeTerminalContent()}
+        />
+      )
+
+      expect(screen.queryByTitle('Search in terminal')).not.toBeInTheDocument()
+    })
+
+    it('does not render search button for non-terminal panes', () => {
+      render(
+        <PaneHeader
+          title="My Browser"
+          status="running"
+          isActive={true}
+          onClose={vi.fn()}
+          content={{ kind: 'browser', url: 'https://example.com', devToolsOpen: false }}
+          onSearch={vi.fn()}
+        />
+      )
+
+      expect(screen.queryByTitle('Search in terminal')).not.toBeInTheDocument()
+    })
+
+    it('calls onSearch when search button is clicked', () => {
+      const onSearch = vi.fn()
+      render(
+        <PaneHeader
+          title="My Terminal"
+          status="running"
+          isActive={true}
+          onClose={vi.fn()}
+          content={makeTerminalContent()}
+          onSearch={onSearch}
+        />
+      )
+
+      fireEvent.click(screen.getByTitle('Search in terminal'))
+      expect(onSearch).toHaveBeenCalledTimes(1)
+    })
+
+    it('stops click propagation on search button', () => {
+      const onSearch = vi.fn()
+      const parentClick = vi.fn()
+
+      render(
+        <div onClick={parentClick}>
+          <PaneHeader
+            title="My Terminal"
+            status="running"
+            isActive={true}
+            onClose={vi.fn()}
+            content={makeTerminalContent()}
+            onSearch={onSearch}
+          />
+        </div>
+      )
+
+      fireEvent.click(screen.getByTitle('Search in terminal'))
+      expect(onSearch).toHaveBeenCalledTimes(1)
+      expect(parentClick).not.toHaveBeenCalled()
     })
   })
 

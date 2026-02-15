@@ -416,6 +416,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       clearScrollback: () => term.clear(),
       reset: () => term.reset(),
       hasSelection: () => term.getSelection().length > 0,
+      openSearch: () => setSearchOpen(true),
     })
 
     requestAnimationFrame(() => {

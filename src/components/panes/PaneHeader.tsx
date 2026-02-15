@@ -1,5 +1,5 @@
 import { useRef, useEffect } from 'react'
-import { X, Maximize2, Minimize2 } from 'lucide-react'
+import { X, Maximize2, Minimize2, Search } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { TerminalStatus } from '@/store/types'
 import type { PaneContent } from '@/store/paneTypes'
@@ -31,6 +31,7 @@ interface PaneHeaderProps {
   onRenameBlur?: () => void
   onRenameKeyDown?: (e: React.KeyboardEvent) => void
   onDoubleClick?: () => void
+  onSearch?: () => void
 }
 
 export default function PaneHeader({
@@ -50,6 +51,7 @@ export default function PaneHeader({
   onRenameBlur,
   onRenameKeyDown,
   onDoubleClick,
+  onSearch,
 }: PaneHeaderProps) {
   const inputRef = useRef<HTMLInputElement>(null)
 
@@ -101,6 +103,20 @@ export default function PaneHeader({
           >
             {metaLabel}
           </span>
+        )}
+
+        {onSearch && content.kind === 'terminal' && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation()
+              onSearch()
+            }}
+            className="p-0.5 rounded opacity-60 hover:opacity-100 transition-opacity"
+            title="Search in terminal"
+            aria-label="Search in terminal"
+          >
+            <Search className="h-3 w-3" />
+          </button>
         )}
 
         {onToggleZoom && (

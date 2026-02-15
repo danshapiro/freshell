@@ -287,6 +287,13 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
         onSelect: () => terminalActions?.selectAll(),
         disabled: !terminalActions,
       },
+      {
+        type: 'item',
+        id: 'terminal-search',
+        label: 'Search',
+        onSelect: () => terminalActions?.openSearch(),
+        disabled: !terminalActions,
+      },
       ...terminalResumeMenuItem,
       { type: 'separator', id: 'terminal-sep' },
       {
