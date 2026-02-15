@@ -51,6 +51,14 @@ npm run serve
 
 On first run, freshell auto-generates a `.env` file with a secure random `AUTH_TOKEN`. The token is printed to the console at startup — open the URL shown to connect.
 
+By default, freshell binds to `127.0.0.1` (localhost only). To access from other devices on your network:
+
+```bash
+npm run serve -- --lan
+```
+
+Or use `--host <address>` to bind to a specific interface. You can also set `HOST=0.0.0.0` in your `.env` file.
+
 ## Prerequisites
 
 Node.js 18+ (20+ recommended) and platform build tools for native modules (`windows-build-tools` on Windows, Xcode CLI Tools on macOS, `build-essential python3` on Linux).
@@ -88,6 +96,7 @@ Freshell checks for new GitHub releases before starting. Accept the prompt to au
 |----------|----------|-------------|
 | `AUTH_TOKEN` | Auto | Authentication token (auto-generated on first run, min 16 chars) |
 | `PORT` | No | Server port (default: 3001) |
+| `HOST` | No | Bind address (default: `127.0.0.1`). Set to `0.0.0.0` for LAN access |
 | `ALLOWED_ORIGINS` | No | Comma-separated allowed CORS origins (auto-detected from LAN) |
 | `CLAUDE_HOME` | No | Path to Claude config directory (default: `~/.claude`) |
 | `CODEX_HOME` | No | Path to Codex config directory (default: `~/.codex`) |

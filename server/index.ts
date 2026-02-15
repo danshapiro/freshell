@@ -31,7 +31,7 @@ import { createClientLogsRouter } from './client-logs.js'
 import { createStartupState } from './startup-state.js'
 import { getPerfConfig, initPerfLogging, setPerfLoggingEnabled, startPerfTimer, withPerfSpan } from './perf-logger.js'
 import { detectPlatform, detectAvailableClis } from './platform.js'
-import { resolveVisitPort } from './startup-url.js'
+import { resolveVisitPort, resolveBindHost } from './startup-url.js'
 import { PortForwardManager } from './port-forward.js'
 import { getRequesterIdentity, parseTrustProxyEnv } from './request-ip.js'
 import { collectCandidateDirectories } from './candidate-dirs.js'
@@ -784,22 +784,31 @@ async function main() {
   }
 
   const port = Number(process.env.PORT || 3001)
-  server.listen(port, '0.0.0.0', () => {
-    log.info({ event: 'server_listening', port, appVersion: APP_VERSION }, 'Server listening')
+  const host = resolveBindHost()
+  server.listen(port, host, () => {
+    log.info({ event: 'server_listening', port, host, appVersion: APP_VERSION }, 'Server listening')
 
     // Print friendly startup message
     const token = process.env.AUTH_TOKEN
-    const lanIps = detectLanIps()
-    const lanIp = lanIps[0] || 'localhost'
     const visitPort = resolveVisitPort(port, process.env)
     const hideToken = process.env.HIDE_STARTUP_TOKEN?.toLowerCase() === 'true'
+    const isLan = host === '0.0.0.0'
+
+    // Use LAN IP for display when binding to all interfaces, localhost otherwise
+    const lanIps = detectLanIps()
+    const displayHost = isLan ? (lanIps[0] || 'localhost') : 'localhost'
     const url = hideToken
-      ? `http://${lanIp}:${visitPort}/`
-      : `http://${lanIp}:${visitPort}/?token=${token}`
+      ? `http://${displayHost}:${visitPort}/`
+      : `http://${displayHost}:${visitPort}/?token=${token}`
 
     console.log('')
     console.log(`\x1b[32m\u{1F41A}\u{1F525} freshell is ready!\x1b[0m`)
-    console.log(`   Visit from anywhere on your network: \x1b[36m${url}\x1b[0m`)
+    if (isLan) {
+      console.log(`   Accessible on LAN: \x1b[36m${url}\x1b[0m`)
+    } else {
+      console.log(`   Local: \x1b[36m${url}\x1b[0m`)
+      console.log(`   Use \x1b[33m--lan\x1b[0m to make accessible on your network`)
+    }
     if (hideToken) {
       console.log('   Auth token is configured in .env (not printed to logs).')
     }
