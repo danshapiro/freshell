@@ -44,6 +44,7 @@ export type AppSettings = {
     warnExternalLinks: boolean
   }
   defaultCwd?: string
+  allowedFilePaths?: string[]
   logging: {
     debug: boolean
   }
@@ -119,6 +120,7 @@ export const defaultSettings: AppSettings = {
     warnExternalLinks: true,
   },
   defaultCwd: undefined,
+  allowedFilePaths: undefined,
   logging: {
     debug: resolveDefaultLoggingDebug(),
   },

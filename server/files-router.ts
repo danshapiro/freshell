@@ -1,12 +1,34 @@
-import express from 'express'
+import express, { type Request, type Response, type NextFunction } from 'express'
 import fsp from 'fs/promises'
 import path from 'path'
 import { spawn } from 'child_process'
-import { isReachableDirectory, resolveUserPath } from './path-utils.js'
+import { isPathAllowed, isReachableDirectory, resolveUserPath } from './path-utils.js'
+import { configStore } from './config-store.js'
 
 export const filesRouter = express.Router()
 
-filesRouter.get('/read', async (req, res) => {
+/**
+ * Middleware that validates file paths against the configured allowedFilePaths sandbox.
+ * Returns 403 if the path is outside all allowed roots.
+ * When allowedFilePaths is empty/undefined, all paths are allowed (backward compatible).
+ */
+async function validatePath(req: Request, res: Response, next: NextFunction) {
+  const filePath = (req.query.path as string) || (req.query.prefix as string) || req.body?.path
+  if (!filePath) {
+    return next()
+  }
+
+  const resolved = path.resolve(resolveUserPath(filePath))
+  const settings = await configStore.getSettings()
+
+  if (!isPathAllowed(resolved, settings.allowedFilePaths)) {
+    return res.status(403).json({ error: 'Path not allowed' })
+  }
+
+  next()
+}
+
+filesRouter.get('/read', validatePath, async (req, res) => {
   const filePath = req.query.path as string
   if (!filePath) {
     return res.status(400).json({ error: 'path query parameter required' })
@@ -34,7 +56,7 @@ filesRouter.get('/read', async (req, res) => {
   }
 })
 
-filesRouter.post('/write', async (req, res) => {
+filesRouter.post('/write', validatePath, async (req, res) => {
   const { path: filePath, content } = req.body
 
   if (!filePath) {
@@ -62,7 +84,7 @@ filesRouter.post('/write', async (req, res) => {
   }
 })
 
-filesRouter.get('/complete', async (req, res) => {
+filesRouter.get('/complete', validatePath, async (req, res) => {
   const prefix = req.query.prefix as string
   const dirsOnly = req.query.dirs === 'true' || req.query.dirs === '1'
   if (!prefix) {
@@ -118,7 +140,7 @@ filesRouter.get('/complete', async (req, res) => {
   }
 })
 
-filesRouter.post('/validate-dir', async (req, res) => {
+filesRouter.post('/validate-dir', validatePath, async (req, res) => {
   const pathInput = req.body?.path
   if (!pathInput || typeof pathInput !== 'string') {
     return res.status(400).json({ error: 'path is required' })
@@ -133,7 +155,7 @@ filesRouter.post('/validate-dir', async (req, res) => {
   return res.json({ valid: ok, resolvedPath })
 })
 
-filesRouter.post('/open', async (req, res) => {
+filesRouter.post('/open', validatePath, async (req, res) => {
   const { path: filePath, reveal } = req.body || {}
   if (!filePath) {
     return res.status(400).json({ error: 'path is required' })
