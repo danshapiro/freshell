@@ -356,6 +356,7 @@ type HandshakeSnapshot = {
   settings?: AppSettings
   projects?: ProjectGroup[]
   perfLogging?: boolean
+  configFallback?: { reason: string; backupExists: boolean }
 }
 
 type HandshakeSnapshotProvider = () => Promise<HandshakeSnapshot>
@@ -955,6 +956,9 @@ export class WsHandler {
       }
       if (typeof snapshot.perfLogging === 'boolean') {
         this.safeSend(ws, { type: 'perf.logging', enabled: snapshot.perfLogging })
+      }
+      if (snapshot.configFallback) {
+        this.safeSend(ws, { type: 'config.fallback', ...snapshot.configFallback })
       }
     } catch (err) {
       logger.warn({ err }, 'Failed to send handshake snapshot')

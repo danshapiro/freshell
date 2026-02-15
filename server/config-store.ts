@@ -162,6 +162,12 @@ function configPath(): string {
   return path.join(configDir(), 'config.json')
 }
 
+function backupPath(): string {
+  return path.join(configDir(), 'config.json.backup')
+}
+
+export type ConfigReadError = 'ENOENT' | 'PARSE_ERROR' | 'VERSION_MISMATCH' | 'READ_ERROR'
+
 const CONFIG_TMP_PREFIX = 'config.json.tmp-'
 const DEFAULT_CONFIG_TMP_MAX_AGE_MS = 24 * 60 * 60 * 1000
 let cleanupPromise: Promise<void> | null = null
@@ -281,14 +287,49 @@ async function atomicWriteFile(filePath: string, data: string) {
   }
 }
 
-async function readConfigFile(): Promise<UserConfig | null> {
+async function readConfigFile(): Promise<{ config: UserConfig | null; error?: ConfigReadError }> {
+  const filePath = configPath()
   try {
-    const raw = await fsp.readFile(configPath(), 'utf-8')
-    const parsed = JSON.parse(raw)
-    if (parsed?.version !== 1) return null
-    return parsed as UserConfig
-  } catch {
-    return null
+    const raw = await fsp.readFile(filePath, 'utf-8')
+    let parsed: any
+    try {
+      parsed = JSON.parse(raw)
+    } catch (parseErr) {
+      logger.error(
+        { err: parseErr, filePath, event: 'config_parse_error' },
+        'Config file corrupted (JSON parse failed)',
+      )
+      logger.warn(
+        { backupPath: backupPath() },
+        'To restore from backup: mv ~/.freshell/config.json.backup ~/.freshell/config.json',
+      )
+      return { config: null, error: 'PARSE_ERROR' }
+    }
+    if (parsed?.version !== 1) {
+      logger.error(
+        { filePath, event: 'config_version_mismatch', found: parsed?.version },
+        'Config file version mismatch',
+      )
+      logger.warn(
+        { backupPath: backupPath() },
+        'To restore from backup: mv ~/.freshell/config.json.backup ~/.freshell/config.json',
+      )
+      return { config: null, error: 'VERSION_MISMATCH' }
+    }
+    return { config: parsed as UserConfig }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { config: null }
+    }
+    logger.error(
+      { err, filePath, event: 'config_read_error' },
+      'Config file read failed',
+    )
+    logger.warn(
+      { backupPath: backupPath() },
+      'To restore from backup: mv ~/.freshell/config.json.backup ~/.freshell/config.json',
+    )
+    return { config: null, error: 'READ_ERROR' }
   }
 }
 
@@ -332,10 +373,28 @@ export class ConfigStore {
   private cache: UserConfig | null = null
   private writeMutex = new Mutex()
 
+  private lastReadError?: ConfigReadError
+
+  getLastReadError(): ConfigReadError | undefined {
+    return this.lastReadError
+  }
+
+  async backupExists(): Promise<boolean> {
+    try {
+      await fsp.access(backupPath())
+      return true
+    } catch {
+      return false
+    }
+  }
+
   async load(): Promise<UserConfig> {
     if (this.cache) return this.cache
     await ensureConfigTmpCleanup()
-    const existing = await readConfigFile()
+    const { config: existing, error } = await readConfigFile()
+    if (error) {
+      this.lastReadError = error
+    }
     if (existing) {
       this.cache = {
         ...existing,
@@ -381,6 +440,12 @@ export class ConfigStore {
     await ensureDir()
     await atomicWriteFile(configPath(), JSON.stringify(cfg, null, 2))
     this.cache = cfg
+    // Create backup after successful save
+    try {
+      await fsp.copyFile(configPath(), backupPath())
+    } catch (err) {
+      logger.warn({ err, event: 'config_backup_failed' }, 'Config backup write failed')
+    }
   }
 
   async getSettings(): Promise<AppSettings> {

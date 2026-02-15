@@ -32,7 +32,7 @@ import PaneDivider from '@/components/panes/PaneDivider'
 import { AuthRequiredModal } from '@/components/AuthRequiredModal'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
-import { Wifi, WifiOff, Moon, Sun, Share2, X, Copy, Check, PanelLeftClose, PanelLeft } from 'lucide-react'
+import { Wifi, WifiOff, Moon, Sun, Share2, X, Copy, Check, PanelLeftClose, PanelLeft, AlertTriangle } from 'lucide-react'
 import { updateSettingsLocal, markSaved } from '@/store/settingsSlice'
 import { clearIdleWarning, recordIdleWarning } from '@/store/idleWarningsSlice'
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
@@ -60,6 +60,7 @@ export default function App() {
   const [shareModalUrl, setShareModalUrl] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
   const [isMobile, setIsMobile] = useState(false)
+  const [configFallback, setConfigFallback] = useState<{ reason: string; backupExists: boolean } | null>(null)
   const mainContentRef = useRef<HTMLDivElement>(null)
   const userOpenedSidebarOnMobileRef = useRef(false)
   const terminalMetaListRequestStartedAtRef = useRef(new Map<string, number>())
@@ -329,6 +330,9 @@ export default function App() {
         if (msg.type === 'perf.logging') {
           setClientPerfEnabled(!!msg.enabled, 'server')
         }
+        if (msg.type === 'config.fallback') {
+          setConfigFallback({ reason: msg.reason, backupExists: !!msg.backupExists })
+        }
 
         // SDK message handling (Claude Web pane)
         handleSdkMessage(dispatch, msg, ws)
@@ -456,6 +460,22 @@ export default function App() {
           <span className="font-mono text-base font-semibold tracking-tight">🐚🔥freshell</span>
         </div>
         <div className="flex items-center gap-1">
+          {configFallback && (
+            <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-red-100 text-red-950 text-xs font-medium">
+              <AlertTriangle className="h-3 w-3 flex-shrink-0" />
+              <span>
+                Config corrupted — using defaults
+                {configFallback.backupExists && ' (backup available)'}
+              </span>
+              <button
+                onClick={() => setConfigFallback(null)}
+                className="ml-1 p-0.5 rounded hover:bg-red-200 transition-colors"
+                aria-label="Dismiss config warning"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </div>
+          )}
           {idleWarningCount > 0 && (
             <button
               onClick={() => setView('overview')}

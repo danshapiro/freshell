@@ -692,4 +692,107 @@ describe('ConfigStore', () => {
       expect(parsed.sessionOverrides['s1'].titleOverride).toBe('T1')
     })
   })
+
+  describe('config backup', () => {
+    it('creates backup after successful save', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      const backupPath = path.join(configDir, 'config.json.backup')
+
+      // Save triggers backup
+      await store.patchSettings({ theme: 'dark' })
+
+      const backupExists = await fsp
+        .access(backupPath)
+        .then(() => true)
+        .catch(() => false)
+      expect(backupExists).toBe(true)
+
+      // Backup content should match the saved config
+      const backupRaw = await fsp.readFile(backupPath, 'utf-8')
+      const backup = JSON.parse(backupRaw)
+      expect(backup.settings.theme).toBe('dark')
+    })
+
+    it('backup failure does not fail the save', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      const backupFilePath = path.join(configDir, 'config.json.backup')
+
+      // Remove any existing backup then replace with a directory so copyFile fails
+      await fsp.rm(backupFilePath, { force: true })
+      await fsp.mkdir(backupFilePath, { recursive: true })
+
+      // Save should still succeed despite backup failure
+      await store.patchSettings({ theme: 'light' })
+
+      const raw = await fsp.readFile(configPath, 'utf-8')
+      const saved = JSON.parse(raw)
+      expect(saved.settings.theme).toBe('light')
+    })
+
+    it('backupExists returns true when backup file exists', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      // Save creates backup
+      await store.patchSettings({ theme: 'dark' })
+
+      expect(await store.backupExists()).toBe(true)
+    })
+
+    it('backupExists returns false when no backup exists', async () => {
+      const store = new ConfigStore()
+      expect(await store.backupExists()).toBe(false)
+    })
+  })
+
+  describe('config read error tracking', () => {
+    it('returns null silently for ENOENT (no error tracked)', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      // First run with no file should not track an error
+      expect(store.getLastReadError()).toBeUndefined()
+    })
+
+    it('tracks PARSE_ERROR for corrupted JSON', async () => {
+      await fsp.mkdir(configDir, { recursive: true })
+      await fsp.writeFile(configPath, 'not valid json {{{')
+
+      const store = new ConfigStore()
+      await store.load()
+
+      expect(store.getLastReadError()).toBe('PARSE_ERROR')
+    })
+
+    it('tracks VERSION_MISMATCH for wrong version', async () => {
+      await fsp.mkdir(configDir, { recursive: true })
+      await fsp.writeFile(configPath, JSON.stringify({ version: 99, settings: {} }))
+
+      const store = new ConfigStore()
+      await store.load()
+
+      expect(store.getLastReadError()).toBe('VERSION_MISMATCH')
+    })
+
+    it('does not track error for valid config', async () => {
+      await fsp.mkdir(configDir, { recursive: true })
+      const validConfig: UserConfig = {
+        version: 1,
+        settings: defaultSettings,
+        sessionOverrides: {},
+        terminalOverrides: {},
+        projectColors: {},
+      }
+      await fsp.writeFile(configPath, JSON.stringify(validConfig))
+
+      const store = new ConfigStore()
+      await store.load()
+
+      expect(store.getLastReadError()).toBeUndefined()
+    })
+  })
 })
