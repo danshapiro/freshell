@@ -1,3 +1,41 @@
+// ---------------------------------------------------------------------------
+// Structured component logger — level-filtered, prefixed output
+// ---------------------------------------------------------------------------
+
+export type ClientLogLevel = 'debug' | 'info' | 'warn' | 'error'
+
+const LEVEL_ORDER: Record<ClientLogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 }
+
+let currentLevel: ClientLogLevel =
+  typeof import.meta !== 'undefined' && import.meta.env?.MODE === 'development' ? 'debug' : 'warn'
+
+export function setClientLogLevel(level: ClientLogLevel): void { currentLevel = level }
+export function getClientLogLevel(): ClientLogLevel { return currentLevel }
+
+function shouldLog(level: ClientLogLevel): boolean {
+  return LEVEL_ORDER[level] >= LEVEL_ORDER[currentLevel]
+}
+
+export type ClientLogger = {
+  debug: (...args: unknown[]) => void
+  info: (...args: unknown[]) => void
+  warn: (...args: unknown[]) => void
+  error: (...args: unknown[]) => void
+}
+
+export function createLogger(component: string): ClientLogger {
+  const prefix = `[${component}]`
+  return {
+    debug: (...args: unknown[]) => { if (shouldLog('debug')) console.debug(prefix, ...args) },
+    info: (...args: unknown[]) => { if (shouldLog('info')) console.log(prefix, ...args) },
+    warn: (...args: unknown[]) => { if (shouldLog('warn')) console.warn(prefix, ...args) },
+    error: (...args: unknown[]) => { if (shouldLog('error')) console.error(prefix, ...args) },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Remote log collection — captures console output, batches to server
+// ---------------------------------------------------------------------------
 type ClientLogSeverity = 'debug' | 'info' | 'warn' | 'error'
 
 type ClientLogEntry = {

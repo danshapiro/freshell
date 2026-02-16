@@ -341,6 +341,7 @@ describe('EditorPane', () => {
       await waitFor(() => {
         // EditorPane uses structured JSON logging
         expect(consoleSpy).toHaveBeenCalledWith(
+          '[EditorPane]',
           expect.stringContaining('"event":"editor_file_load_failed"')
         )
       })
@@ -376,6 +377,7 @@ describe('EditorPane', () => {
       await waitFor(() => {
         // EditorPane uses structured JSON logging
         expect(consoleSpy).toHaveBeenCalledWith(
+          '[EditorPane]',
           expect.stringContaining('"event":"editor_file_load_failed"')
         )
       })

@@ -7,6 +7,10 @@ import { terminalThemes, darkThemes, lightThemes, getTerminalTheme } from '@/lib
 import { resolveTerminalFontFamily, saveLocalTerminalFontFamily } from '@/lib/terminal-fonts'
 import type { SidebarSortMode, TerminalTheme, CodexSandboxMode, ClaudePermissionMode, CodingCliProviderName } from '@/store/types'
 import { CODING_CLI_PROVIDER_CONFIGS } from '@/lib/coding-cli-utils'
+import { createLogger } from '@/lib/client-logger'
+
+
+const log = createLogger('SettingsView')
 
 /** Monospace fonts with good Unicode block element support for terminal use */
 const terminalFonts = [
@@ -198,7 +202,7 @@ export default function SettingsView() {
   const scheduleSave = useCallback((updates: any) => {
     if (pendingRef.current) clearTimeout(pendingRef.current)
     pendingRef.current = setTimeout(() => {
-      patch(updates).catch((err) => console.warn('Failed to save settings', err))
+      patch(updates).catch((err) => log.warn('Failed to save settings', err))
       pendingRef.current = null
     }, 500)
   }, [patch])
@@ -214,7 +218,7 @@ export default function SettingsView() {
   const commitDefaultCwd = useCallback((nextValue: string | undefined) => {
     if (nextValue === settings.defaultCwd) return
     dispatch(updateSettingsLocal({ defaultCwd: nextValue } as any))
-    patch({ defaultCwd: nextValue ?? null } as any).catch((err) => console.warn('Failed to save settings', err))
+    patch({ defaultCwd: nextValue ?? null } as any).catch((err) => log.warn('Failed to save settings', err))
   }, [dispatch, patch, settings.defaultCwd])
 
   const scheduleDefaultCwdValidation = useCallback((value: string) => {

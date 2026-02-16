@@ -7,6 +7,10 @@ import type { PaneNode } from './paneTypes'
 import { findTabIdForSession } from '@/lib/session-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import type { RootState } from './store'
+import { createLogger } from '@/lib/client-logger'
+
+
+const log = createLogger('TabsSlice')
 
 export interface TabsState {
   tabs: Tab[]
@@ -33,9 +37,7 @@ function loadInitialTabsState(): TabsState {
     const tabsState = parsed?.tabs as Partial<TabsState> | undefined
     if (!Array.isArray(tabsState?.tabs)) return defaultState
 
-    if (import.meta.env.MODE === 'development') {
-      console.log('[TabsSlice] Loaded initial state from localStorage:', tabsState.tabs.map((t) => t.id))
-    }
+    log.debug('Loaded initial state from localStorage:', tabsState.tabs.map((t) => t.id))
 
     // Apply same transformations as hydrateTabs to ensure consistency
     const mappedTabs = tabsState.tabs.map((t: Tab) => {
@@ -61,9 +63,7 @@ function loadInitialTabsState(): TabsState {
       renameRequestTabId: null,
     }
   } catch (err) {
-    if (import.meta.env.MODE === 'development') {
-      console.error('[TabsSlice] Failed to load from localStorage:', err)
-    }
+    log.error('Failed to load from localStorage:', err)
     return defaultState
   }
 }

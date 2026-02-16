@@ -5,6 +5,10 @@ import type { Tab } from './types'
 import { nanoid } from 'nanoid'
 import { broadcastPersistedRaw } from './persistBroadcast'
 import { PANES_SCHEMA_VERSION } from './persistedState.js'
+import { createLogger } from '@/lib/client-logger'
+
+
+const log = createLogger('PanesPersist')
 
 const STORAGE_KEY = 'freshell.tabs.v1'
 const PANES_STORAGE_KEY = 'freshell.panes.v1'
@@ -289,7 +293,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
         localStorage.setItem(PANES_STORAGE_KEY, panesJson)
         broadcastPersistedRaw(PANES_STORAGE_KEY, panesJson)
       } catch (err) {
-        console.error('[Panes Persist] Failed to save to localStorage:', err)
+        log.error('Failed to save to localStorage:', err)
       }
     }
 

@@ -1,5 +1,9 @@
 import { getClientPerfConfig, logClientPerf } from '@/lib/perf-logger'
 import { getAuthToken } from '@/lib/auth'
+import { createLogger } from '@/lib/client-logger'
+
+
+const log = createLogger('WsClient')
 
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'ready'
 type MessageHandler = (msg: any) => void
@@ -229,7 +233,7 @@ export class WsClient {
 
   private scheduleReconnect(opts?: { minDelayMs?: number }) {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error('WsClient: max reconnect attempts reached')
+      log.error('max reconnect attempts reached')
       return
     }
 
@@ -239,7 +243,7 @@ export class WsClient {
 
     window.setTimeout(() => {
       if (!this.intentionalClose) {
-        this.connect().catch((err) => console.error('WsClient: reconnect failed', err))
+        this.connect().catch((err) => log.error('reconnect failed', err))
       }
     }, delay)
 

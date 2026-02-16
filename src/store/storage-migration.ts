@@ -12,6 +12,10 @@
 // - Any persisted state shape changes incompatibly
 // ============================================================
 
+import { createLogger } from '@/lib/client-logger'
+
+const log = createLogger('StorageMigration')
+
 const STORAGE_VERSION = 2 // Incremented for multi-CLI architecture
 
 function runStorageMigration() {
@@ -28,17 +32,13 @@ function runStorageMigration() {
 
       localStorage.setItem('freshell_version', String(STORAGE_VERSION))
 
-      if (import.meta.env.MODE === 'development') {
-        console.log(
-          `[Storage Migration] Cleared localStorage (version ${currentVersion} → ${STORAGE_VERSION}) ` +
-          'due to breaking state schema changes.'
-        )
-      }
+      log.info(
+        `Cleared localStorage (version ${currentVersion} → ${STORAGE_VERSION}) ` +
+        'due to breaking state schema changes.'
+      )
     }
   } catch (err) {
-    if (import.meta.env.MODE === 'development') {
-      console.warn('[Storage Migration] Failed:', err)
-    }
+    log.warn('Storage migration failed:', err)
   }
 }
 
