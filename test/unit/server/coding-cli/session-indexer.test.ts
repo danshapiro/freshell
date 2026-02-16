@@ -18,14 +18,28 @@ vi.mock('../../../../server/config-store', () => ({
   },
 }))
 
-function makeProvider(files: string[]): CodingCliProvider {
+type MakeProviderOptions = {
+  name?: CodingCliProvider['name']
+  displayName?: string
+  homeDir?: string
+  listSessionFiles?: CodingCliProvider['listSessionFiles']
+  parseSessionFile?: CodingCliProvider['parseSessionFile']
+  resolveProjectPath?: CodingCliProvider['resolveProjectPath']
+  extractSessionId?: CodingCliProvider['extractSessionId']
+}
+
+function makeProvider(files: string[], options: MakeProviderOptions = {}): CodingCliProvider {
+  const providerName = options.name ?? 'claude'
+  const homeDir = options.homeDir ?? '/tmp'
+  const displayName = options.displayName ?? (providerName === 'claude' ? 'Claude' : providerName)
+
   return {
-    name: 'claude',
-    displayName: 'Claude',
-    homeDir: '/tmp',
-    getSessionGlob: () => path.join('/tmp', '*.jsonl'),
-    listSessionFiles: async () => files,
-    parseSessionFile: async (content: string) => {
+    name: providerName,
+    displayName,
+    homeDir,
+    getSessionGlob: () => path.join(homeDir, '**', '*.jsonl'),
+    listSessionFiles: options.listSessionFiles ?? (async () => files),
+    parseSessionFile: options.parseSessionFile ?? (async (content: string) => {
       const lines = content.split(/\r?\n/).filter(Boolean)
       let cwd: string | undefined
       let title: string | undefined
@@ -35,9 +49,9 @@ function makeProvider(files: string[]): CodingCliProvider {
         if (!title && typeof obj.title === 'string') title = obj.title
       }
       return { cwd, title, messageCount: lines.length }
-    },
-    resolveProjectPath: async (_filePath, meta) => meta.cwd || 'unknown',
-    extractSessionId: (filePath) => path.basename(filePath, '.jsonl'),
+    }),
+    resolveProjectPath: options.resolveProjectPath ?? (async (_filePath, meta) => meta.cwd || 'unknown'),
+    extractSessionId: options.extractSessionId ?? ((filePath) => path.basename(filePath, '.jsonl')),
     getCommand: () => 'claude',
     getStreamArgs: () => [],
     getResumeArgs: () => [],
@@ -245,6 +259,83 @@ describe('CodingCliSessionIndexer', () => {
 
     const sessionId = indexer.getProjects()[0]?.sessions[0]?.sessionId
     expect(sessionId).toBe('canonical-id')
+  })
+
+  it('treats provider + sessionId as the uniqueness key when detecting new sessions', () => {
+    const sessionId = 'shared-session-id'
+    const indexer = new CodingCliSessionIndexer([])
+    const detected: CodingCliSession[] = []
+    indexer.onNewSession((session) => detected.push(session))
+
+    indexer['initialized'] = true
+    indexer['detectNewSessions']([
+      {
+        provider: 'claude',
+        sessionId,
+        projectPath: '/project/a',
+        updatedAt: 100,
+        cwd: '/project/a',
+      },
+      {
+        provider: 'codex',
+        sessionId,
+        projectPath: '/project/a',
+        updatedAt: 101,
+        cwd: '/project/a',
+      },
+    ])
+
+    expect(detected).toHaveLength(2)
+    expect(new Set(detected.map((session) => session.provider))).toEqual(new Set(['claude', 'codex']))
+    expect(indexer['knownSessionIds'].has(makeSessionKey('claude', sessionId))).toBe(true)
+    expect(indexer['knownSessionIds'].has(makeSessionKey('codex', sessionId))).toBe(true)
+  })
+
+  it('stores file path mappings by provider to avoid cross-provider session collisions', async () => {
+    const sharedSessionId = 'shared-session-id'
+    const claudeFile = path.join(tempDir, 'claude-session.jsonl')
+    const codexFile = path.join(tempDir, 'codex-session.jsonl')
+    await fsp.writeFile(claudeFile, JSON.stringify({ cwd: '/project/a', title: 'Claude Session' }) + '\n')
+    await fsp.writeFile(codexFile, JSON.stringify({ cwd: '/project/b', title: 'Codex Session' }) + '\n')
+
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      sessionOverrides: {},
+      settings: {
+        codingCli: {
+          enabledProviders: ['claude', 'codex'],
+          providers: {},
+        },
+      },
+    })
+
+    const claudeProvider = makeProvider([claudeFile], {
+      name: 'claude',
+      homeDir: tempDir,
+      parseSessionFile: async () => ({
+        cwd: '/project/a',
+        title: 'Claude Session',
+        sessionId: sharedSessionId,
+        messageCount: 1,
+      }),
+    })
+    const codexProvider = makeProvider([codexFile], {
+      name: 'codex',
+      displayName: 'Codex',
+      homeDir: tempDir,
+      parseSessionFile: async () => ({
+        cwd: '/project/b',
+        title: 'Codex Session',
+        sessionId: sharedSessionId,
+        messageCount: 1,
+      }),
+    })
+
+    const indexer = new CodingCliSessionIndexer([claudeProvider, codexProvider])
+    await indexer.refresh()
+
+    expect(indexer.getFilePathForSession(sharedSessionId, 'claude')).toBe(claudeFile)
+    expect(indexer.getFilePathForSession(sharedSessionId, 'codex')).toBe(codexFile)
+    expect(indexer.getFilePathForSession(sharedSessionId)).toBe(claudeFile)
   })
 
   it('propagates token and git metadata from ParsedSessionMeta into indexed sessions', async () => {

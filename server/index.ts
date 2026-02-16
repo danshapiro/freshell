@@ -743,7 +743,7 @@ async function main() {
       { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
     )
       .then(() => {
-        sessionRepairService.setFilePathResolver((id) => codingCliIndexer.getFilePathForSession(id))
+        sessionRepairService.setFilePathResolver((id) => codingCliIndexer.getFilePathForSession(id, 'claude'))
         startupState.markReady('codingCliIndexer')
         logger.info({ task: 'codingCliIndexer' }, 'Startup task ready')
       })

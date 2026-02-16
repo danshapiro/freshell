@@ -118,7 +118,7 @@ export class CodingCliSessionIndexer {
   private seenSessionIds = new Map<string, number>()
   private onNewSessionHandlers = new Set<(session: CodingCliSession) => void>()
   private initialized = false
-  private sessionIdToFilePath = new Map<string, string>()
+  private sessionKeyToFilePath = new Map<string, string>()
 
   constructor(private providers: CodingCliProvider[], options: SessionIndexerOptions = {}) {
     this.debounceMs = options.debounceMs ?? DEFAULT_DEBOUNCE_MS
@@ -173,8 +173,26 @@ export class CodingCliSessionIndexer {
     return this.projects
   }
 
-  getFilePathForSession(sessionId: string): string | undefined {
-    return this.sessionIdToFilePath.get(sessionId)
+  getFilePathForSession(sessionId: string, provider?: CodingCliProviderName): string | undefined {
+    if (provider) {
+      return this.sessionKeyToFilePath.get(makeSessionKey(provider, sessionId))
+    }
+
+    // Session repair currently resolves Claude sessions by bare session ID.
+    // Preserve that behavior for existing call sites.
+    const claudePath = this.sessionKeyToFilePath.get(makeSessionKey('claude', sessionId))
+    if (claudePath) return claudePath
+
+    let match: string | undefined
+    const suffix = `:${sessionId}`
+    for (const [key, filePath] of this.sessionKeyToFilePath) {
+      if (!key.endsWith(suffix)) continue
+      if (match && match !== filePath) {
+        return undefined
+      }
+      match = filePath
+    }
+    return match
   }
 
   private markDirty(filePath: string) {
@@ -209,7 +227,7 @@ export class CodingCliSessionIndexer {
   private deleteCacheEntry(cacheKey: string) {
     const cached = this.fileCache.get(cacheKey)
     if (cached?.baseSession?.sessionId) {
-      this.sessionIdToFilePath.delete(cached.baseSession.sessionId)
+      this.sessionKeyToFilePath.delete(makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId))
     }
     this.fileCache.delete(cacheKey)
   }
@@ -231,7 +249,7 @@ export class CodingCliSessionIndexer {
   }
 
   private detectNewSessions(sessions: CodingCliSession[]) {
-    const currentIds = new Set(sessions.map((s) => s.sessionId))
+    const currentIds = new Set<string>(sessions.map((s) => makeSessionKey(s.provider, s.sessionId)))
 
     // Prune knownSessionIds to only contain IDs that still exist
     for (const id of this.knownSessionIds) {
@@ -247,11 +265,12 @@ export class CodingCliSessionIndexer {
     for (const session of sessions) {
       if (!session.cwd) continue
 
-      const wasKnown = this.knownSessionIds.has(session.sessionId)
-      if (!wasKnown) this.knownSessionIds.add(session.sessionId)
+      const sessionKey = makeSessionKey(session.provider, session.sessionId)
+      const wasKnown = this.knownSessionIds.has(sessionKey)
+      if (!wasKnown) this.knownSessionIds.add(sessionKey)
 
-      const seenBefore = this.seenSessionIds.has(session.sessionId)
-      this.seenSessionIds.set(session.sessionId, now)
+      const seenBefore = this.seenSessionIds.has(sessionKey)
+      this.seenSessionIds.set(sessionKey, now)
 
       if (this.initialized && !wasKnown && !seenBefore) {
         newSessions.push(session)
@@ -261,7 +280,9 @@ export class CodingCliSessionIndexer {
     if (this.initialized && newSessions.length > 0) {
       newSessions.sort((a, b) => {
         const diff = a.updatedAt - b.updatedAt
-        return diff !== 0 ? diff : a.sessionId.localeCompare(b.sessionId)
+        return diff !== 0
+          ? diff
+          : makeSessionKey(a.provider, a.sessionId).localeCompare(makeSessionKey(b.provider, b.sessionId))
       })
       for (const session of newSessions) {
         for (const h of this.onNewSessionHandlers) {
@@ -294,7 +315,7 @@ export class CodingCliSessionIndexer {
 
     // Clean up previous session mapping before re-parsing
     if (cached?.baseSession?.sessionId) {
-      this.sessionIdToFilePath.delete(cached.baseSession.sessionId)
+      this.sessionKeyToFilePath.delete(makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId))
     }
 
     const content = await readSessionSnippet(filePath)
@@ -335,7 +356,7 @@ export class CodingCliSessionIndexer {
       size,
       baseSession,
     })
-    this.sessionIdToFilePath.set(sessionId, filePath)
+    this.sessionKeyToFilePath.set(makeSessionKey(provider.name, sessionId), filePath)
   }
 
   scheduleRefresh() {

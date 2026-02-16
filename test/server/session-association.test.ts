@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { TerminalRegistry, modeSupportsResume } from '../../server/terminal-registry'
 import { CodingCliSessionIndexer } from '../../server/coding-cli/session-indexer'
-import type { CodingCliSession } from '../../server/coding-cli/types'
+import { makeSessionKey, type CodingCliSession } from '../../server/coding-cli/types'
 import { TerminalMetadataService } from '../../server/terminal-metadata-service'
 
 vi.mock('node-pty', () => ({
@@ -450,7 +450,7 @@ describe('Session-Terminal Association Integration', () => {
     // Should NOT broadcast - indexer not yet initialized
     expect(broadcasts).toHaveLength(0)
     // But session should be tracked
-    expect(indexer['knownSessionIds'].has(SESSION_ID_FOUR)).toBe(true)
+    expect(indexer['knownSessionIds'].has(makeSessionKey('claude', SESSION_ID_FOUR))).toBe(true)
 
     // Cleanup
     registry.shutdown()
