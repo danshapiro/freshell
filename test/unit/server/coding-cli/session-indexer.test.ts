@@ -338,6 +338,123 @@ describe('CodingCliSessionIndexer', () => {
     expect(indexer.getFilePathForSession(sharedSessionId)).toBe(claudeFile)
   })
 
+  it('applies archived and createdAt overrides from session overrides', async () => {
+    const sessionId = 'session-a'
+    const fileA = path.join(tempDir, `${sessionId}.jsonl`)
+    await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')
+
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      sessionOverrides: {
+        [makeSessionKey('claude', sessionId)]: {
+          archived: true,
+          createdAtOverride: 123456,
+        },
+      },
+      settings: {
+        codingCli: {
+          enabledProviders: ['claude'],
+          providers: {},
+        },
+      },
+    })
+
+    const provider = makeProvider([fileA])
+    const indexer = new CodingCliSessionIndexer([provider])
+    await indexer.refresh()
+
+    const session = indexer.getProjects()[0]?.sessions[0]
+    expect(session?.archived).toBe(true)
+    expect(session?.createdAt).toBe(123456)
+  })
+
+  it('prunes known sessions that are no longer present', () => {
+    const indexer = new CodingCliSessionIndexer([])
+    const staleKey = makeSessionKey('codex', 'stale-session')
+    const activeKey = makeSessionKey('claude', 'active-session')
+    indexer['knownSessionIds'].add(staleKey)
+    indexer['knownSessionIds'].add(activeKey)
+
+    indexer['detectNewSessions']([
+      {
+        provider: 'claude',
+        sessionId: 'active-session',
+        projectPath: '/project/a',
+        updatedAt: 100,
+        cwd: '/project/a',
+      },
+    ])
+
+    expect(indexer['knownSessionIds'].has(activeKey)).toBe(true)
+    expect(indexer['knownSessionIds'].has(staleKey)).toBe(false)
+  })
+
+  it('suppresses reappearing sessions that have already been seen', () => {
+    const indexer = new CodingCliSessionIndexer([])
+    const detected: string[] = []
+    indexer.onNewSession((session) => detected.push(makeSessionKey(session.provider, session.sessionId)))
+    indexer['initialized'] = true
+
+    const session = {
+      provider: 'claude' as const,
+      sessionId: 'reappearing-session',
+      projectPath: '/project/a',
+      updatedAt: 100,
+      cwd: '/project/a',
+    }
+
+    indexer['detectNewSessions']([session])
+    indexer['detectNewSessions']([])
+    indexer['detectNewSessions']([session])
+
+    expect(detected).toEqual([makeSessionKey('claude', 'reappearing-session')])
+  })
+
+  it('calls new-session handlers oldest-first by updatedAt', () => {
+    const indexer = new CodingCliSessionIndexer([])
+    const order: string[] = []
+    indexer.onNewSession((session) => order.push(session.sessionId))
+    indexer['initialized'] = true
+
+    indexer['detectNewSessions']([
+      {
+        provider: 'claude',
+        sessionId: 'newer',
+        projectPath: '/project/a',
+        updatedAt: 200,
+        cwd: '/project/a',
+      },
+      {
+        provider: 'claude',
+        sessionId: 'older',
+        projectPath: '/project/a',
+        updatedAt: 100,
+        cwd: '/project/a',
+      },
+    ])
+
+    expect(order).toEqual(['older', 'newer'])
+  })
+
+  it('supports unsubscribing from onNewSession handlers', () => {
+    const indexer = new CodingCliSessionIndexer([])
+    const handler = vi.fn()
+    const unsubscribe = indexer.onNewSession(handler)
+    unsubscribe()
+
+    indexer['initialized'] = true
+    indexer['detectNewSessions']([
+      {
+        provider: 'claude',
+        sessionId: 'session-a',
+        projectPath: '/project/a',
+        updatedAt: 100,
+        cwd: '/project/a',
+      },
+    ])
+
+    expect(handler).not.toHaveBeenCalled()
+  })
+
   it('propagates token and git metadata from ParsedSessionMeta into indexed sessions', async () => {
     const fileA = path.join(tempDir, 'session-a.jsonl')
     await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')

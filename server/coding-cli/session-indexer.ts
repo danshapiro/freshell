@@ -41,6 +41,8 @@ function applyOverride(session: CodingCliSession, ov: SessionOverride | undefine
     ...session,
     title: ov?.titleOverride || session.title,
     summary: ov?.summaryOverride || session.summary,
+    createdAt: ov?.createdAtOverride ?? session.createdAt,
+    archived: ov?.archived ?? session.archived ?? false,
   }
 }
 
