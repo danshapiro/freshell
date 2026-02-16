@@ -4,10 +4,10 @@ import WebSocket, { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { logger } from './logger.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
-import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed, timingSafeCompare } from './auth.js'
+import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed } from './auth.js'
 import { modeSupportsResume } from './terminal-registry.js'
 import type { TerminalRegistry, TerminalMode } from './terminal-registry.js'
-import { configStore, type AppSettings, type ConfigReadError } from './config-store.js'
+import { configStore, type AppSettings } from './config-store.js'
 import type { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import type { ProjectGroup } from './coding-cli/types.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
@@ -15,39 +15,17 @@ import type { SessionRepairService } from './session-scanner/service.js'
 import type { SessionScanResult, SessionRepairResult } from './session-scanner/types.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
 import type { SdkBridge } from './sdk-bridge.js'
-import type { SdkServerMessage } from '../shared/ws-protocol.js'
-import { TabRegistryRecordBaseSchema, TabRegistryRecordSchema } from './tabs-registry/types.js'
-import type { TabsRegistryStore } from './tabs-registry/store.js'
+import type { SdkServerMessage } from './sdk-bridge-types.js'
 import {
   ErrorCode,
-  ShellSchema,
-  CodingCliProviderSchema,
-  TokenSummarySchema,
-  TerminalMetaRecordSchema,
+  ClientMessageSchema,
   TerminalMetaListResponseSchema,
   TerminalMetaUpdatedSchema,
-  HelloSchema,
-  PingSchema,
-  TerminalCreateSchema,
-  TerminalAttachSchema,
-  TerminalDetachSchema,
-  TerminalInputSchema,
-  TerminalResizeSchema,
-  TerminalKillSchema,
-  TerminalListSchema,
-  TerminalMetaListSchema,
-  CodingCliCreateSchema,
-  CodingCliInputSchema,
-  CodingCliKillSchema,
-  SdkCreateSchema,
-  SdkSendSchema,
-  SdkPermissionRespondSchema,
-  SdkInterruptSchema,
-  SdkKillSchema,
-  SdkAttachSchema,
-  SdkSetModelSchema,
-  SdkSetPermissionModeSchema,
-} from '../shared/ws-protocol.js'
+} from './ws-schemas.js'
+import { chunkProjects, chunkTerminalSnapshot } from './ws-chunking.js'
+
+// Re-export chunking functions for backward compatibility (tests import from ws-handler)
+export { chunkProjects, chunkTerminalSnapshot } from './ws-chunking.js'
 
 const MAX_CONNECTIONS = Number(process.env.MAX_CONNECTIONS || 10)
 const HELLO_TIMEOUT_MS = Number(process.env.HELLO_TIMEOUT_MS || 5_000)
@@ -72,7 +50,6 @@ interface LiveWebSocket extends WebSocket {
   isAlive?: boolean
   connectionId?: string
   connectedAt?: number
-  isMobileClient?: boolean
   // Generation counter for chunked session updates to prevent interleaving
   sessionUpdateGeneration?: number
 }
@@ -85,165 +62,9 @@ const CLOSE_CODES = {
   SERVER_SHUTDOWN: 4009,
 }
 
-
 function nowIso() {
   return new Date().toISOString()
 }
-
-function isMobileUserAgent(userAgent: string | undefined): boolean {
-  if (!userAgent) return false
-  return /Mobi|Android|iPhone|iPad|iPod/i.test(userAgent)
-}
-
-/**
- * Chunk projects array into batches that fit within MAX_CHUNK_BYTES when serialized.
- * This ensures mobile browsers with limited WebSocket buffers can receive the data.
- * Uses Buffer.byteLength for accurate UTF-8 byte counting (not UTF-16 code units).
- */
-export function chunkProjects(projects: ProjectGroup[], maxBytes: number): ProjectGroup[][] {
-  if (projects.length === 0) return [[]]
-
-  const chunks: ProjectGroup[][] = []
-  let currentChunk: ProjectGroup[] = []
-  let currentSize = 0
-  // Base overhead for message wrapper, plus max flag length ('"append":true' is longer than '"clear":true')
-  const baseOverhead = Buffer.byteLength(JSON.stringify({ type: 'sessions.updated', projects: [] }))
-  const flagOverhead = Buffer.byteLength(',"append":true')
-  const overhead = baseOverhead + flagOverhead
-
-  for (const project of projects) {
-    const projectJson = JSON.stringify(project)
-    const projectSize = Buffer.byteLength(projectJson)
-    // Account for comma separator between array elements (except first element)
-    const separatorSize = currentChunk.length > 0 ? 1 : 0
-    if (currentChunk.length > 0 && currentSize + separatorSize + projectSize + overhead > maxBytes) {
-      chunks.push(currentChunk)
-      currentChunk = []
-      currentSize = 0
-    }
-    currentChunk.push(project)
-    currentSize += (currentChunk.length > 1 ? 1 : 0) + projectSize // Add comma for non-first elements
-  }
-
-  if (currentChunk.length > 0) {
-    chunks.push(currentChunk)
-  }
-
-  return chunks
-}
-
-/**
- * Chunk a terminal snapshot into byte-safe frame payloads for terminal.attached.chunk.
- * Uses UTF-8 byte sizing for the full serialized message envelope.
- */
-export function chunkTerminalSnapshot(snapshot: string, maxBytes: number, terminalId: string): string[] {
-  if (!snapshot) return []
-  if (!Number.isFinite(maxBytes) || maxBytes <= 0) {
-    throw new Error('Invalid max byte budget for terminal snapshot chunking')
-  }
-
-  const prefix = `{"type":"terminal.attached.chunk","terminalId":${JSON.stringify(terminalId)},"chunk":`
-  const suffix = '}'
-  const fixedEnvelopeBytes = Buffer.byteLength(prefix) + Buffer.byteLength(suffix)
-  const payloadBytes = (chunk: string): number => fixedEnvelopeBytes + Buffer.byteLength(JSON.stringify(chunk))
-  const isHighSurrogate = (code: number) => code >= 0xd800 && code <= 0xdbff
-  const isLowSurrogate = (code: number) => code >= 0xdc00 && code <= 0xdfff
-
-  if (payloadBytes('') > maxBytes) {
-    throw new Error('Max byte budget too small for terminal.attached.chunk envelope')
-  }
-
-  const chunks: string[] = []
-  let cursor = 0
-
-  while (cursor < snapshot.length) {
-    let lo = cursor + 1
-    let hi = snapshot.length
-    let best = cursor
-
-    while (lo <= hi) {
-      const mid = Math.floor((lo + hi) / 2)
-      const candidate = snapshot.slice(cursor, mid)
-      if (payloadBytes(candidate) <= maxBytes) {
-        best = mid
-        lo = mid + 1
-      } else {
-        hi = mid - 1
-      }
-    }
-
-    if (best < snapshot.length && best > cursor) {
-      const prev = snapshot.charCodeAt(best - 1)
-      const next = snapshot.charCodeAt(best)
-      const prevIsHigh = isHighSurrogate(prev)
-      const nextIsLow = isLowSurrogate(next)
-      if (prevIsHigh && nextIsLow) {
-        best -= 1
-      }
-    }
-
-    if (best === cursor) {
-      const cp = snapshot.codePointAt(cursor)
-      const next = Math.min(snapshot.length, cursor + (cp !== undefined && cp > 0xffff ? 2 : 1))
-      const candidate = snapshot.slice(cursor, next)
-      if (payloadBytes(candidate) > maxBytes) {
-        throw new Error('Unable to advance chunk cursor safely within max byte budget')
-      }
-      best = next
-    }
-
-    chunks.push(snapshot.slice(cursor, best))
-    cursor = best
-  }
-
-  return chunks
-}
-
-const TabsSyncPushRecordSchema = TabRegistryRecordBaseSchema.omit({
-  serverInstanceId: true,
-  deviceId: true,
-  deviceLabel: true,
-})
-
-const TabsSyncPushSchema = z.object({
-  type: z.literal('tabs.sync.push'),
-  deviceId: z.string().min(1),
-  deviceLabel: z.string().min(1),
-  records: z.array(TabsSyncPushRecordSchema),
-})
-
-const TabsSyncQuerySchema = z.object({
-  type: z.literal('tabs.sync.query'),
-  requestId: z.string().min(1),
-  deviceId: z.string().min(1),
-  rangeDays: z.number().int().positive().optional(),
-})
-
-const ClientMessageSchema = z.discriminatedUnion('type', [
-  HelloSchema,
-  PingSchema,
-  TerminalCreateSchema,
-  TerminalAttachSchema,
-  TerminalDetachSchema,
-  TerminalInputSchema,
-  TerminalResizeSchema,
-  TerminalKillSchema,
-  TerminalListSchema,
-  TerminalMetaListSchema,
-  TabsSyncPushSchema,
-  TabsSyncQuerySchema,
-  CodingCliCreateSchema,
-  CodingCliInputSchema,
-  CodingCliKillSchema,
-  SdkCreateSchema,
-  SdkSendSchema,
-  SdkPermissionRespondSchema,
-  SdkInterruptSchema,
-  SdkKillSchema,
-  SdkAttachSchema,
-  SdkSetModelSchema,
-  SdkSetPermissionModeSchema,
-])
 
 type ClientState = {
   authenticated: boolean
@@ -265,10 +86,6 @@ type HandshakeSnapshot = {
   settings?: AppSettings
   projects?: ProjectGroup[]
   perfLogging?: boolean
-  configFallback?: {
-    reason: ConfigReadError
-    backupExists: boolean
-  }
 }
 
 type HandshakeSnapshotProvider = () => Promise<HandshakeSnapshot>
@@ -284,8 +101,6 @@ export class WsHandler {
   private sessionRepairService?: SessionRepairService
   private handshakeSnapshotProvider?: HandshakeSnapshotProvider
   private terminalMetaListProvider?: () => TerminalMeta[]
-  private tabsRegistryStore?: TabsRegistryStore
-  private readonly serverInstanceId: string
   private sessionRepairListeners?: {
     scanned: (result: SessionScanResult) => void
     repaired: (result: SessionRepairResult) => void
@@ -299,17 +114,11 @@ export class WsHandler {
     private sdkBridge?: SdkBridge,
     sessionRepairService?: SessionRepairService,
     handshakeSnapshotProvider?: HandshakeSnapshotProvider,
-    terminalMetaListProvider?: () => TerminalMeta[],
-    tabsRegistryStore?: TabsRegistryStore,
-    serverInstanceId?: string,
+    terminalMetaListProvider?: () => TerminalMeta[]
   ) {
     this.sessionRepairService = sessionRepairService
     this.handshakeSnapshotProvider = handshakeSnapshotProvider
     this.terminalMetaListProvider = terminalMetaListProvider
-    this.tabsRegistryStore = tabsRegistryStore
-    this.serverInstanceId = serverInstanceId && serverInstanceId.trim().length > 0
-      ? serverInstanceId
-      : `srv-${randomUUID()}`
     this.wss = new WebSocketServer({
       server,
       path: '/ws',
@@ -449,7 +258,6 @@ export class WsHandler {
     const connectionId = randomUUID()
     ws.connectionId = connectionId
     ws.connectedAt = Date.now()
-    ws.isMobileClient = isMobileUserAgent(userAgent)
 
     const state: ClientState = {
       authenticated: false,
@@ -572,7 +380,6 @@ export class WsHandler {
   }
 
   private send(ws: LiveWebSocket, msg: unknown) {
-    let messageType: string | undefined
     try {
       // Backpressure guard.
       // @ts-ignore
@@ -580,6 +387,7 @@ export class WsHandler {
       if (this.closeForBackpressureIfNeeded(ws, buffered)) return
       let serialized = ''
       let payloadBytes: number | undefined
+      let messageType: string | undefined
       let serializeMs: number | undefined
       let shouldLogSend = false
 
@@ -625,15 +433,8 @@ export class WsHandler {
           'warn',
         )
       })
-    } catch (err) {
-      log.warn(
-        {
-          err: err instanceof Error ? err : new Error(String(err)),
-          connectionId: ws.connectionId || 'unknown',
-          messageType: messageType || 'unknown',
-        },
-        'WebSocket send failed',
-      )
+    } catch {
+      // ignore
     }
   }
 
@@ -885,9 +686,6 @@ export class WsHandler {
       if (typeof snapshot.perfLogging === 'boolean') {
         this.safeSend(ws, { type: 'perf.logging', enabled: snapshot.perfLogging })
       }
-      if (snapshot.configFallback) {
-        this.safeSend(ws, { type: 'config.fallback', ...snapshot.configFallback })
-      }
     } catch (err) {
       logger.warn({ err }, 'Failed to send handshake snapshot')
     }
@@ -970,7 +768,7 @@ export class WsHandler {
 
       if (m.type === 'hello') {
         const expected = getRequiredAuthToken()
-        if (!m.token || !timingSafeCompare(m.token, expected)) {
+        if (!m.token || m.token !== expected) {
           log.warn({ event: 'ws_auth_failed', connectionId: ws.connectionId }, 'WebSocket auth failed')
           this.sendError(ws, { code: 'NOT_AUTHENTICATED', message: 'Invalid token' })
           ws.close(CLOSE_CODES.NOT_AUTHENTICATED, 'Invalid token')
@@ -979,9 +777,6 @@ export class WsHandler {
         state.authenticated = true
         state.supportsSessionsPatchV1 = !!m.capabilities?.sessionsPatchV1
         state.supportsTerminalAttachChunkV1 = !!m.capabilities?.terminalAttachChunkV1
-        if (typeof m.client?.mobile === 'boolean') {
-          ws.isMobileClient = m.client.mobile
-        }
         if (state.helloTimer) clearTimeout(state.helloTimer)
 
         log.info({ event: 'ws_authenticated', connectionId: ws.connectionId }, 'WebSocket client authenticated')
@@ -1001,7 +796,7 @@ export class WsHandler {
           this.sessionRepairService.prioritizeSessions(m.sessions)
         }
 
-        this.send(ws, { type: 'ready', timestamp: nowIso(), serverInstanceId: this.serverInstanceId })
+        this.send(ws, { type: 'ready', timestamp: nowIso() })
         this.scheduleHandshakeSnapshot(ws, state)
         return
       }
@@ -1081,20 +876,7 @@ export class WsHandler {
           }
 
           if (modeSupportsResume(m.mode as TerminalMode) && effectiveResumeSessionId) {
-            let existing = this.registry.getCanonicalRunningTerminalBySession(
-              m.mode as TerminalMode,
-              effectiveResumeSessionId,
-            )
-            if (!existing) {
-              this.registry.repairLegacySessionOwners(
-                m.mode as TerminalMode,
-                effectiveResumeSessionId,
-              )
-              existing = this.registry.getCanonicalRunningTerminalBySession(
-                m.mode as TerminalMode,
-                effectiveResumeSessionId,
-              )
-            }
+            const existing = this.registry.findRunningTerminalBySession(m.mode as TerminalMode, effectiveResumeSessionId)
             if (existing) {
               this.registry.attach(existing.terminalId, ws, { pendingSnapshot: true })
               state.attachedTerminalIds.add(existing.terminalId)
@@ -1302,47 +1084,6 @@ export class WsHandler {
         return
       }
 
-      case 'tabs.sync.push': {
-        if (!this.tabsRegistryStore) {
-          this.sendError(ws, {
-            code: 'INTERNAL_ERROR',
-            message: 'Tabs registry unavailable',
-          })
-          return
-        }
-        for (const record of m.records) {
-          await this.tabsRegistryStore.upsert({
-            ...record,
-            serverInstanceId: this.serverInstanceId,
-            deviceId: m.deviceId,
-            deviceLabel: m.deviceLabel,
-          })
-        }
-        this.send(ws, { type: 'tabs.sync.ack', updated: m.records.length })
-        return
-      }
-
-      case 'tabs.sync.query': {
-        if (!this.tabsRegistryStore) {
-          this.send(ws, {
-            type: 'tabs.sync.snapshot',
-            requestId: m.requestId,
-            data: { localOpen: [], remoteOpen: [], closed: [] },
-          })
-          return
-        }
-        const data = await this.tabsRegistryStore.query({
-          deviceId: m.deviceId,
-          rangeDays: m.rangeDays,
-        })
-        this.send(ws, {
-          type: 'tabs.sync.snapshot',
-          requestId: m.requestId,
-          data,
-        })
-        return
-      }
-
       case 'codingcli.create': {
         if (!this.codingCliManager) {
           this.sendError(ws, {
@@ -1498,7 +1239,6 @@ export class WsHandler {
             resumeSessionId: m.resumeSessionId,
             model: m.model,
             permissionMode: m.permissionMode,
-            effort: m.effort,
           })
           state.sdkSessions.add(session.sessionId)
 
@@ -1563,12 +1303,8 @@ export class WsHandler {
           return
         }
         const decision: import('./sdk-bridge-types.js').PermissionResult = m.behavior === 'allow'
-          ? {
-              behavior: 'allow',
-              updatedInput: m.updatedInput ?? {},
-              ...(m.updatedPermissions && { updatedPermissions: m.updatedPermissions as import('./sdk-bridge-types.js').PermissionUpdate[] }),
-            }
-          : { behavior: 'deny', message: m.message || 'Denied by user', ...(m.interrupt !== undefined && { interrupt: m.interrupt }) }
+          ? { behavior: 'allow', updatedInput: m.updatedInput, updatedPermissions: m.updatedPermissions as import('./sdk-bridge-types.js').PermissionUpdate[] | undefined }
+          : { behavior: 'deny', message: m.message || 'Denied by user', interrupt: m.interrupt }
         const ok = this.sdkBridge.respondPermission(m.sessionId, m.requestId, decision)
         if (!ok) {
           this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'SDK session not found' })
@@ -1606,32 +1342,6 @@ export class WsHandler {
           state.sdkSubscriptions.delete(m.sessionId)
         }
         this.send(ws, { type: 'sdk.killed', sessionId: m.sessionId, success: killed })
-        return
-      }
-
-      case 'sdk.set-model': {
-        if (!this.sdkBridge) {
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
-          return
-        }
-        if (!state.sdkSessions.has(m.sessionId) && !state.sdkSubscriptions.has(m.sessionId)) {
-          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
-          return
-        }
-        this.sdkBridge.setModel(m.sessionId, m.model)
-        return
-      }
-
-      case 'sdk.set-permission-mode': {
-        if (!this.sdkBridge) {
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
-          return
-        }
-        if (!state.sdkSessions.has(m.sessionId) && !state.sdkSubscriptions.has(m.sessionId)) {
-          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
-          return
-        }
-        this.sdkBridge.setPermissionMode(m.sessionId, m.permissionMode)
         return
       }
 
@@ -1734,53 +1444,6 @@ export class WsHandler {
     }
 
     this.broadcast(parsed.data)
-  }
-
-  /**
-   * Prepare for hot rebind: close all client connections and set the closed
-   * flag so the patched server.close() → this.close() is a no-op.
-   */
-  prepareForRebind(): void {
-    for (const ws of this.connections) {
-      try {
-        ws.close(CLOSE_CODES.SERVER_SHUTDOWN, 'Server rebinding')
-        setTimeout(() => {
-          if (ws.readyState !== ws.CLOSED) {
-            ws.terminate()
-          }
-        }, 5000)
-      } catch {
-        try { ws.terminate() } catch { /* ignore */ }
-      }
-    }
-
-    if (this.pingInterval) {
-      clearInterval(this.pingInterval)
-      this.pingInterval = null
-    }
-
-    this.closed = true
-    log.info('WsHandler prepared for rebind (connections closed, WSS preserved)')
-  }
-
-  /**
-   * Resume after hot rebind: reset the closed flag and restart ping interval.
-   */
-  resumeAfterRebind(): void {
-    this.closed = false
-
-    this.pingInterval = setInterval(() => {
-      for (const ws of this.connections) {
-        if (ws.isAlive === false) {
-          ws.terminate()
-          continue
-        }
-        ws.isAlive = false
-        ws.ping()
-      }
-    }, PING_INTERVAL_MS)
-
-    log.info('WsHandler resumed after rebind')
   }
 
   /**

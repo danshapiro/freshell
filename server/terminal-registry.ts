@@ -2,16 +2,12 @@ import { nanoid } from 'nanoid'
 import type WebSocket from 'ws'
 import * as pty from 'node-pty'
 import os from 'os'
-import path from 'path'
-import fs from 'fs'
 import { EventEmitter } from 'events'
 import { logger } from './logger.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
 import type { AppSettings } from './config-store.js'
-import { convertWindowsPathToWslPath, isReachableDirectorySync } from './path-utils.js'
+import { isReachableDirectorySync } from './path-utils.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
-import type { CodingCliProviderName } from './coding-cli/types.js'
-import { SessionBindingAuthority, type BindResult } from './session-binding-authority.js'
 
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
 const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 64 * 1024)
@@ -20,135 +16,23 @@ const MAX_SCROLLBACK_CHARS = 2 * 1024 * 1024
 const APPROX_CHARS_PER_LINE = 200
 const MAX_TERMINALS = Number(process.env.MAX_TERMINALS || 50)
 const DEFAULT_MAX_PENDING_SNAPSHOT_CHARS = 512 * 1024
-const MOBILE_OUTPUT_FLUSH_MS = Number(process.env.MOBILE_OUTPUT_FLUSH_MS || 40)
-const MAX_MOBILE_OUTPUT_BUFFER_CHARS = Number(process.env.MAX_MOBILE_OUTPUT_BUFFER_CHARS || 256 * 1024)
 const perfConfig = getPerfConfig()
 
-// TerminalMode includes 'shell' for regular terminals, plus coding CLI providers.
-// Provider command defaults are configurable via env vars; resume semantics
-// are only configured for providers that define resume args.
-export type TerminalMode = 'shell' | 'claude' | 'codex' | 'opencode' | 'gemini' | 'kimi'
-export type ShellType = 'system' | 'cmd' | 'powershell' | 'wsl'
+// Re-exported from extracted modules for backward compatibility
+export type { ShellType } from './platform-utils.js'
+export { isWsl, isWindowsLike, getSystemShell, isLinuxPath } from './platform-utils.js'
+export { ChunkRingBuffer } from './chunk-ring-buffer.js'
+export type { TerminalMode } from './spawn-spec.js'
+export { CODING_CLI_COMMANDS, modeSupportsResume, escapeCmdExe, buildSpawnSpec } from './spawn-spec.js'
 
-type CodingCliCommandSpec = {
-  label: string
-  envVar: string
-  defaultCommand: string
-  resumeArgs?: (sessionId: string) => string[]
-}
-
-const CODING_CLI_COMMANDS: Record<Exclude<TerminalMode, 'shell'>, CodingCliCommandSpec> = {
-  claude: {
-    label: 'Claude',
-    envVar: 'CLAUDE_CMD',
-    defaultCommand: 'claude',
-    resumeArgs: (sessionId) => ['--resume', sessionId],
-  },
-  codex: {
-    label: 'Codex',
-    envVar: 'CODEX_CMD',
-    defaultCommand: 'codex',
-    resumeArgs: (sessionId) => ['resume', sessionId],
-  },
-  opencode: {
-    label: 'OpenCode',
-    envVar: 'OPENCODE_CMD',
-    defaultCommand: 'opencode',
-  },
-  gemini: {
-    label: 'Gemini',
-    envVar: 'GEMINI_CMD',
-    defaultCommand: 'gemini',
-  },
-  kimi: {
-    label: 'Kimi',
-    envVar: 'KIMI_CMD',
-    defaultCommand: 'kimi',
-  },
-}
-
-/**
- * Check if a terminal mode supports session resume.
- * Only modes with configured resumeArgs in CODING_CLI_COMMANDS support resume.
- */
-export function modeSupportsResume(mode: TerminalMode): boolean {
-  if (mode === 'shell') return false
-  return !!CODING_CLI_COMMANDS[mode]?.resumeArgs
-}
-
-type ProviderTarget = 'unix' | 'windows'
-
-function providerNotificationArgs(mode: TerminalMode, target: ProviderTarget): string[] {
-  if (mode === 'codex') {
-    return [
-      '-c', 'tui.notification_method=bel',
-      '-c', "tui.notifications=['agent-turn-complete']",
-    ]
-  }
-
-  if (mode === 'claude') {
-    const bellCommand = target === 'windows'
-      ? `powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$bell=[char]7; $ok=$false; try {[System.IO.File]::AppendAllText('\\\\.\\CONOUT$', [string]$bell); $ok=$true} catch {}; if (-not $ok) { try {[Console]::Out.Write($bell); $ok=$true} catch {} }; if (-not $ok) { try {[Console]::Error.Write($bell)} catch {} }"`
-      : `sh -lc "printf '\\a' > /dev/tty 2>/dev/null || true"`
-    const settings = {
-      hooks: {
-        Stop: [
-          {
-            hooks: [
-              {
-                type: 'command',
-                command: bellCommand,
-              },
-            ],
-          },
-        ],
-      },
-    }
-    return ['--settings', JSON.stringify(settings)]
-  }
-
-  return []
-}
-
-function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, target: ProviderTarget = 'unix') {
-  if (mode === 'shell') return null
-  const spec = CODING_CLI_COMMANDS[mode]
-  const command = process.env[spec.envVar] || spec.defaultCommand
-  const providerArgs = providerNotificationArgs(mode, target)
-  let resumeArgs: string[] = []
-  if (resumeSessionId) {
-    if (spec.resumeArgs) {
-      resumeArgs = spec.resumeArgs(resumeSessionId)
-    } else {
-      logger.warn({ mode, resumeSessionId }, 'Resume requested but no resume args configured')
-    }
-  }
-  return { command, args: [...providerArgs, ...resumeArgs], label: spec.label }
-}
-
-function normalizeResumeSessionId(mode: TerminalMode, resumeSessionId?: string): string | undefined {
-  if (!resumeSessionId) return undefined
-  if (mode !== 'claude') return resumeSessionId
-  if (isValidClaudeSessionId(resumeSessionId)) return resumeSessionId
-  logger.warn({ resumeSessionId }, 'Ignoring invalid Claude resumeSessionId')
-  return undefined
-}
-
-function getModeLabel(mode: TerminalMode): string {
-  if (mode === 'shell') return 'Shell'
-  const label = CODING_CLI_COMMANDS[mode]?.label
-  return label || mode.toUpperCase()
-}
+import { ChunkRingBuffer } from './chunk-ring-buffer.js'
+import { isWindows } from './platform-utils.js'
+import { buildSpawnSpec, getModeLabel, normalizeResumeSessionId } from './spawn-spec.js'
+import type { TerminalMode } from './spawn-spec.js'
+import type { ShellType } from './platform-utils.js'
 
 type PendingSnapshotQueue = {
   chunks: string[]
-  queuedChars: number
-}
-
-type PendingMobileOutput = {
-  timer: NodeJS.Timeout | null
-  chunksByTerminal: Map<string, string[]>
-  perfByTerminal: Map<string, TerminalRecord['perf'] | undefined>
   queuedChars: number
 }
 
@@ -186,62 +70,6 @@ export type TerminalRecord = {
   }
 }
 
-export type BindSessionResult =
-  | { ok: true; terminalId: string; sessionId: string }
-  | { ok: false; reason: 'terminal_missing' | 'mode_mismatch' | 'invalid_session_id' }
-  | BindResult
-
-export type RepairLegacySessionOwnersResult = {
-  repaired: boolean
-  canonicalTerminalId?: string
-  clearedTerminalIds: string[]
-}
-
-export class ChunkRingBuffer {
-  private chunks: string[] = []
-  private size = 0
-  constructor(private maxChars: number) {}
-
-  private trimToMax() {
-    const max = this.maxChars
-    if (max <= 0) {
-      this.clear()
-      return
-    }
-    while (this.size > max && this.chunks.length > 1) {
-      const removed = this.chunks.shift()!
-      this.size -= removed.length
-    }
-    // If a single chunk is enormous, truncate it.
-    if (this.size > max && this.chunks.length === 1) {
-      const only = this.chunks[0]
-      this.chunks[0] = only.slice(-max)
-      this.size = this.chunks[0].length
-    }
-  }
-
-  append(chunk: string) {
-    if (!chunk) return
-    this.chunks.push(chunk)
-    this.size += chunk.length
-    this.trimToMax()
-  }
-
-  setMaxChars(next: number) {
-    this.maxChars = Math.max(0, next)
-    this.trimToMax()
-  }
-
-  snapshot(): string {
-    return this.chunks.join('')
-  }
-
-  clear() {
-    this.chunks = []
-    this.size = 0
-  }
-}
-
 function getDefaultCwd(settings?: AppSettings): string | undefined {
   const candidate = settings?.defaultCwd
   if (!candidate) return undefined
@@ -249,428 +77,8 @@ function getDefaultCwd(settings?: AppSettings): string | undefined {
   return ok ? resolvedPath : undefined
 }
 
-function isWindows(): boolean {
-  return process.platform === 'win32'
-}
-
-/**
- * Detect if running inside Windows Subsystem for Linux.
- * Uses environment variables set by WSL.
- */
-export function isWsl(): boolean {
-  return process.platform === 'linux' && (
-    !!process.env.WSL_DISTRO_NAME ||
-    !!process.env.WSL_INTEROP ||
-    !!process.env.WSLENV
-  )
-}
-
-/**
- * Returns true if Windows shells (cmd, powershell) are available.
- * This is true on native Windows and in WSL (via interop).
- */
-export function isWindowsLike(): boolean {
-  return isWindows() || isWsl()
-}
-
-/**
- * Get the executable path for cmd.exe or powershell.exe.
- * On native Windows, uses the simple name (relies on PATH).
- * On WSL, uses full paths since Windows executables may not be on PATH.
- */
-function getWindowsExe(exe: 'cmd' | 'powershell'): string {
-  if (isWindows()) {
-    return exe === 'cmd' ? 'cmd.exe' : (process.env.POWERSHELL_EXE || 'powershell.exe')
-  }
-  // On WSL, use explicit paths since Windows PATH may not be available
-  const systemRoot = process.env.WSL_WINDOWS_SYS32 || '/mnt/c/Windows/System32'
-  if (exe === 'cmd') {
-    return `${systemRoot}/cmd.exe`
-  }
-  return process.env.POWERSHELL_EXE || `${systemRoot}/WindowsPowerShell/v1.0/powershell.exe`
-}
-
-/**
- * Get the WSL mount prefix for Windows drives.
- * Derives from WSL_WINDOWS_SYS32 (e.g., /mnt/c/Windows/System32 → /mnt)
- * or defaults to /mnt for standard WSL configurations.
- *
- * Handles various mount configurations:
- * - /mnt/c/... → /mnt (standard)
- * - /c/... → '' (drives at root)
- * - /win/c/... → /win (custom prefix)
- */
-function getWslMountPrefix(): string {
-  const sys32 = process.env.WSL_WINDOWS_SYS32
-  if (sys32) {
-    // Extract mount prefix from path like /mnt/c/Windows/System32
-    // The drive letter is a single char followed by /
-    const match = sys32.match(/^(.*)\/[a-zA-Z]\//)
-    if (match) {
-      return match[1]
-    }
-  }
-  return '/mnt'
-}
-
-const WINDOWS_DRIVE_PREFIX_RE = /^[A-Za-z]:([\\/]|$)/
-const WINDOWS_UNC_PREFIX_RE = /^\\\\[^\\]+\\[^\\]+/
-const WINDOWS_ROOTED_PREFIX_RE = /^\\(?!\\)/
-
-function isWindowsAbsolutePath(input: string): boolean {
-  return WINDOWS_DRIVE_PREFIX_RE.test(input) || WINDOWS_UNC_PREFIX_RE.test(input) || WINDOWS_ROOTED_PREFIX_RE.test(input)
-}
-
-function escapeRegex(input: string): string {
-  return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
-function convertWslDrivePathToWindows(input: string): string | undefined {
-  const normalized = input.replace(/\\/g, '/')
-  const mountPrefix = getWslMountPrefix()
-  const prefixes = new Set([mountPrefix, '/mnt'])
-
-  for (const prefix of prefixes) {
-    const match = prefix
-      ? normalized.match(new RegExp(`^${escapeRegex(prefix)}/([a-zA-Z])(?:/(.*))?$`))
-      : normalized.match(/^\/([a-zA-Z])(?:\/(.*))?$/)
-    if (!match) continue
-    const drive = `${match[1].toUpperCase()}:`
-    const rest = match[2]?.replace(/\//g, '\\')
-    return rest ? `${drive}\\${rest}` : `${drive}\\`
-  }
-  return undefined
-}
-
-function resolveWindowsShellCwd(cwd: string | undefined): string | undefined {
-  if (!cwd) return undefined
-  const candidate = cwd.trim()
-  if (!candidate) return undefined
-
-  if (isLinuxPath(candidate)) {
-    return convertWslDrivePathToWindows(candidate)
-  }
-
-  if (WINDOWS_UNC_PREFIX_RE.test(candidate)) {
-    return undefined
-  }
-
-  if (isWindowsAbsolutePath(candidate) || !isWsl()) {
-    return path.win32.resolve(candidate)
-  }
-  return undefined
-}
-
-function resolveUnixShellCwd(cwd: string | undefined): string | undefined {
-  if (!cwd) return undefined
-  const candidate = cwd.trim()
-  if (!candidate) return undefined
-
-  // In WSL, Linux processes need POSIX paths. Convert Windows-style cwd inputs
-  // (e.g. D:\users\dan) to WSL mount paths before passing cwd to node-pty.
-  if (isWsl()) {
-    const converted = convertWindowsPathToWslPath(candidate)
-    if (converted) {
-      return converted
-    }
-  }
-
-  return candidate
-}
-
-/**
- * Get a sensible default working directory for Windows shells.
- * On native Windows: user's home directory (C:\Users\<username>)
- * In WSL: a Windows-native drive path (USERPROFILE, HOME drive, or SYSTEMDRIVE root)
- *
- * This avoids UNC paths (\\wsl.localhost\...) which cmd.exe doesn't support.
- */
-function getWindowsDefaultCwd(): string {
-  if (isWindows()) {
-    return os.homedir()
-  }
-
-  const userProfile = process.env.USERPROFILE
-  if (userProfile?.trim()) {
-    const resolved = resolveWindowsShellCwd(userProfile)
-    if (resolved) return resolved
-  }
-
-  const homeDrive = process.env.HOMEDRIVE
-  const homePath = process.env.HOMEPATH
-  if (homeDrive && homePath) {
-    return path.win32.resolve(`${homeDrive}${homePath}`)
-  }
-
-  const systemDrive = process.env.SYSTEMDRIVE || 'C:'
-  return path.win32.resolve(`${systemDrive}\\`)
-}
-
-/**
- * Resolve the effective shell based on platform and requested shell type.
- * - Windows/WSL: 'system' → platform default, others pass through
- * - macOS/Linux (non-WSL): always normalize to 'system' (use $SHELL or fallback)
- */
-function resolveShell(requested: ShellType): ShellType {
-  if (isWindows()) {
-    // On native Windows, 'system' maps to cmd (or ComSpec)
-    return requested === 'system' ? 'cmd' : requested
-  }
-  if (isWsl()) {
-    // On WSL, 'system' and 'wsl' both use the Linux shell
-    // 'cmd' and 'powershell' use Windows executables via interop
-    if (requested === 'system' || requested === 'wsl') {
-      return 'system'
-    }
-    return requested // 'cmd' or 'powershell' pass through
-  }
-  // On macOS/Linux (non-WSL), always use 'system' shell
-  // Windows-specific options are normalized to system
-  return 'system'
-}
-
-/**
- * Get the system shell for macOS/Linux.
- * Priority: $SHELL (if exists) → platform fallback (if exists) → /bin/sh
- */
-export function getSystemShell(): string {
-  const shell = process.env.SHELL
-  // Check if SHELL is set, non-empty, non-whitespace, and exists
-  if (shell && shell.trim() && fs.existsSync(shell)) {
-    return shell
-  }
-
-  if (process.platform === 'darwin') {
-    // macOS: prefer zsh (default since Catalina), then bash, then sh
-    if (fs.existsSync('/bin/zsh')) return '/bin/zsh'
-    if (fs.existsSync('/bin/bash')) return '/bin/bash'
-  } else {
-    // Linux: prefer bash, then sh
-    if (fs.existsSync('/bin/bash')) return '/bin/bash'
-  }
-
-  // Ultimate fallback - /bin/sh should always exist on Unix systems
-  return '/bin/sh'
-}
-
-export function isLinuxPath(p: unknown): boolean {
-  // Detect Linux/WSL paths that won't work on native Windows
-  return typeof p === 'string' && p.startsWith('/') && !p.startsWith('//')
-}
-
-/**
- * Escape special characters for cmd.exe shell commands.
- * cmd.exe uses ^ as its escape character for most special characters.
- * The % character is special and must be doubled (%%).
- */
-export function escapeCmdExe(s: string): string {
-  // Escape ^ first (the escape char itself), then other special chars
-  // Order matters: ^ must be escaped before we add more ^
-  return s
-    .replace(/\^/g, '^^')
-    .replace(/&/g, '^&')
-    .replace(/\|/g, '^|')
-    .replace(/</g, '^<')
-    .replace(/>/g, '^>')
-    .replace(/%/g, '%%')
-    .replace(/"/g, '\\"')
-}
-
-function quoteCmdArg(arg: string): string {
-  // cmd.exe expands %VAR% even inside quotes; double % to preserve literals.
-  const escaped = arg.replace(/%/g, '%%')
-  let quoted = '"'
-  let backslashCount = 0
-  for (const ch of escaped) {
-    if (ch === '\\') {
-      backslashCount += 1
-      continue
-    }
-
-    if (ch === '"') {
-      quoted += '\\'.repeat(backslashCount * 2 + 1)
-      quoted += '"'
-      backslashCount = 0
-      continue
-    }
-
-    if (backslashCount > 0) {
-      quoted += '\\'.repeat(backslashCount)
-      backslashCount = 0
-    }
-    quoted += ch
-  }
-
-  if (backslashCount > 0) {
-    quoted += '\\'.repeat(backslashCount * 2)
-  }
-  quoted += '"'
-  return quoted
-}
-
-function buildCmdCommand(command: string, args: string[]): string {
-  return [command, ...args].map(quoteCmdArg).join(' ')
-}
-
-function quotePowerShellLiteral(arg: string): string {
-  return `'${arg.replace(/'/g, "''")}'`
-}
-
-function buildPowerShellCommand(command: string, args: string[]): string {
-  const invocation = ['&', quotePowerShellLiteral(command), ...args.map(quotePowerShellLiteral)].join(' ')
-  return invocation
-}
-
-export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shell: ShellType, resumeSessionId?: string) {
-  const env = {
-    ...process.env,
-    TERM: process.env.TERM || 'xterm-256color',
-    COLORTERM: process.env.COLORTERM || 'truecolor',
-  }
-
-  const normalizedResume = normalizeResumeSessionId(mode, resumeSessionId)
-
-  // Resolve shell for the current platform
-  const effectiveShell = resolveShell(shell)
-
-  // Debug logging for shell/cwd resolution
-  logger.debug({
-    mode,
-    requestedShell: shell,
-    effectiveShell,
-    cwd,
-    isLinuxPath: cwd ? isLinuxPath(cwd) : false,
-    isWsl: isWsl(),
-    isWindows: isWindows(),
-  }, 'buildSpawnSpec: resolving shell and cwd')
-
-  // In WSL with 'system' shell (which 'wsl' resolves to), use Linux shell directly
-  // For 'cmd' or 'powershell' in WSL, fall through to Windows shell handling
-  const inWslWithLinuxShell = isWsl() && effectiveShell === 'system'
-
-  if (isWindowsLike() && !inWslWithLinuxShell) {
-    // If the cwd is a Linux path, force WSL mode since native Windows shells can't use it
-    // (Only applies on native Windows, not when already in WSL)
-    const forceWsl = isWindows() && isLinuxPath(cwd)
-
-    // Use protocol-specified shell, falling back to env var for backwards compatibility
-    const windowsMode = forceWsl
-      ? 'wsl'
-      : effectiveShell !== 'system'
-        ? effectiveShell
-        : (process.env.WINDOWS_SHELL || 'wsl').toLowerCase()
-
-    // Option A: WSL (from native Windows) — recommended for coding CLIs on Windows.
-    // This path is skipped when already running inside WSL.
-    if (windowsMode === 'wsl') {
-      const wsl = process.env.WSL_EXE || 'wsl.exe'
-      const distro = process.env.WSL_DISTRO // optional
-      const args: string[] = []
-      if (distro) args.push('-d', distro)
-
-      if (cwd) {
-        // cwd must be a Linux path inside WSL.
-        const wslCwd = isLinuxPath(cwd) ? cwd : (convertWindowsPathToWslPath(cwd) || cwd)
-        args.push('--cd', wslCwd)
-      }
-
-      if (mode === 'shell') {
-        args.push('--exec', 'bash', '-l')
-        return { file: wsl, args, cwd: undefined, env }
-      }
-
-      const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix')
-      if (!cli) {
-        args.push('--exec', 'bash', '-l')
-        return { file: wsl, args, cwd: undefined, env }
-      }
-
-      args.push('--exec', cli.command, ...cli.args)
-      return { file: wsl, args, cwd: undefined, env }
-    }
-
-    // Option B: Native Windows shells (PowerShell/cmd)
-
-    if (windowsMode === 'cmd') {
-      const file = getWindowsExe('cmd')
-      // In WSL, we can't pass Linux paths as cwd to Windows executables (they become UNC paths)
-      // Instead, pass no cwd and use cd /d inside the command
-      const inWsl = isWsl()
-      const winCwd = inWsl
-        ? (resolveWindowsShellCwd(cwd) || getWindowsDefaultCwd())
-        : (isLinuxPath(cwd) ? undefined : cwd)
-      // For WSL: don't pass cwd to node-pty, use cd /d in command instead
-      const procCwd = inWsl ? undefined : winCwd
-      logger.debug({
-        shell: 'cmd',
-        inWsl,
-        originalCwd: cwd,
-        winCwd,
-        procCwd,
-        file,
-      }, 'buildSpawnSpec: cmd.exe cwd resolution')
-      if (mode === 'shell') {
-        if (inWsl && winCwd) {
-          // Use /K with cd command to change to Windows directory
-          return { file, args: ['/K', `cd /d ${quoteCmdArg(winCwd)}`], cwd: procCwd, env }
-        }
-        return { file, args: ['/K'], cwd: procCwd, env }
-      }
-      const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows')
-      const cmd = cli?.command || mode
-      const command = buildCmdCommand(cmd, cli?.args || [])
-      const cd = winCwd ? `cd /d ${quoteCmdArg(winCwd)} && ` : ''
-      return { file, args: ['/K', `${cd}${command}`], cwd: procCwd, env }
-    }
-
-    // default to PowerShell
-    const file = getWindowsExe('powershell')
-    // In WSL, we can't pass Linux paths as cwd to Windows executables (they become UNC paths)
-    const inWsl = isWsl()
-    const winCwd = inWsl
-      ? (resolveWindowsShellCwd(cwd) || getWindowsDefaultCwd())
-      : (isLinuxPath(cwd) ? undefined : cwd)
-    const procCwd = inWsl ? undefined : winCwd
-    logger.debug({
-      shell: 'powershell',
-      inWsl,
-      originalCwd: cwd,
-      winCwd,
-      procCwd,
-      file,
-    }, 'buildSpawnSpec: powershell.exe cwd resolution')
-    if (mode === 'shell') {
-      if (inWsl && winCwd) {
-        // Use Set-Location to change to Windows directory
-        return { file, args: ['-NoLogo', '-NoExit', '-Command', `Set-Location -LiteralPath ${quotePowerShellLiteral(winCwd)}`], cwd: procCwd, env }
-      }
-      return { file, args: ['-NoLogo'], cwd: procCwd, env }
-    }
-
-    const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows')
-    const cmd = cli?.command || mode
-    const invocation = buildPowerShellCommand(cmd, cli?.args || [])
-    const cd = winCwd ? `Set-Location -LiteralPath ${quotePowerShellLiteral(winCwd)}; ` : ''
-    const command = `${cd}${invocation}`
-    return { file, args: ['-NoLogo', '-NoExit', '-Command', command], cwd: procCwd, env }
-  }
-// Non-Windows: native spawn using system shell
-  const systemShell = getSystemShell()
-  const unixCwd = resolveUnixShellCwd(cwd)
-
-  if (mode === 'shell') {
-    return { file: systemShell, args: ['-l'], cwd: unixCwd, env }
-  }
-
-  const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix')
-  const cmd = cli?.command || mode
-  const args = cli?.args || []
-  return { file: cmd, args, cwd: unixCwd, env }
-}
-
 export class TerminalRegistry extends EventEmitter {
   private terminals = new Map<string, TerminalRecord>()
-  private bindingAuthority = new SessionBindingAuthority()
   private settings: AppSettings | undefined
   private idleTimer: NodeJS.Timeout | null = null
   private perfTimer: NodeJS.Timeout | null = null
@@ -678,7 +86,6 @@ export class TerminalRegistry extends EventEmitter {
   private maxExitedTerminals: number
   private scrollbackMaxChars: number
   private maxPendingSnapshotChars: number
-  private mobileOutputBuffers = new Map<WebSocket, PendingMobileOutput>()
 
   constructor(settings?: AppSettings, maxTerminals?: number, maxExitedTerminals?: number) {
     super()
@@ -888,7 +295,7 @@ export class TerminalRegistry extends EventEmitter {
       title,
       description: undefined,
       mode: opts.mode,
-      resumeSessionId: undefined,
+      resumeSessionId: normalizedResume,
       createdAt,
       lastActivityAt: createdAt,
       status: 'running',
@@ -974,7 +381,7 @@ export class TerminalRegistry extends EventEmitter {
           pending.queuedChars = nextChars
           continue
         }
-        this.sendTerminalOutput(client, terminalId, data, record.perf)
+        this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf: record.perf })
       }
     })
 
@@ -988,26 +395,15 @@ export class TerminalRegistry extends EventEmitter {
       record.lastActivityAt = now
       record.exitedAt = now
       for (const client of record.clients) {
-        this.flushMobileOutput(client)
         this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: e.exitCode }, { terminalId, perf: record.perf })
       }
       record.clients.clear()
       record.pendingSnapshotClients.clear()
-      this.releaseBinding(terminalId)
       this.emit('terminal.exit', { terminalId, exitCode: e.exitCode })
       this.reapExitedTerminals()
     })
 
     this.terminals.set(terminalId, record)
-    if (modeSupportsResume(opts.mode) && normalizedResume) {
-      const bound = this.bindSession(terminalId, opts.mode as CodingCliProviderName, normalizedResume)
-      if (!bound.ok) {
-        logger.warn(
-          { terminalId, mode: opts.mode, sessionId: normalizedResume, reason: bound.reason },
-          'Failed to bind resume session during terminal create',
-        )
-      }
-    }
     this.emit('terminal.created', record)
     return record
   }
@@ -1028,15 +424,13 @@ export class TerminalRegistry extends EventEmitter {
     if (!queued) return
     term.pendingSnapshotClients.delete(client)
     for (const data of queued.chunks) {
-      this.sendTerminalOutput(client, terminalId, data, term.perf)
+      this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf: term.perf })
     }
   }
 
   detach(terminalId: string, client: WebSocket): boolean {
     const term = this.terminals.get(terminalId)
     if (!term) return false
-    this.flushMobileOutput(client)
-    this.clearMobileOutput(client)
     term.clients.delete(client)
     term.pendingSnapshotClients.delete(client)
     return true
@@ -1090,12 +484,10 @@ export class TerminalRegistry extends EventEmitter {
     term.lastActivityAt = now
     term.exitedAt = now
     for (const client of term.clients) {
-      this.flushMobileOutput(client)
       this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: term.exitCode })
     }
     term.clients.clear()
     term.pendingSnapshotClients.clear()
-    this.releaseBinding(terminalId)
     this.emit('terminal.exit', { terminalId, exitCode: term.exitCode })
     this.reapExitedTerminals()
     return true
@@ -1139,86 +531,6 @@ export class TerminalRegistry extends EventEmitter {
     return this.terminals.get(terminalId)
   }
 
-  private releaseBinding(terminalId: string): void {
-    this.bindingAuthority.unbindTerminal(terminalId)
-    const rec = this.terminals.get(terminalId)
-    if (rec) rec.resumeSessionId = undefined
-  }
-
-  private isMobileClient(client: WebSocket): boolean {
-    return (client as any).isMobileClient === true
-  }
-
-  private clearMobileOutput(client: WebSocket): void {
-    const pending = this.mobileOutputBuffers.get(client)
-    if (!pending) return
-    if (pending.timer) {
-      clearTimeout(pending.timer)
-      pending.timer = null
-    }
-    this.mobileOutputBuffers.delete(client)
-  }
-
-  private flushMobileOutput(client: WebSocket): void {
-    const pending = this.mobileOutputBuffers.get(client)
-    if (!pending) return
-
-    if (pending.timer) {
-      clearTimeout(pending.timer)
-      pending.timer = null
-    }
-
-    if (pending.queuedChars <= 0) {
-      this.mobileOutputBuffers.delete(client)
-      return
-    }
-
-    for (const [terminalId, chunks] of pending.chunksByTerminal) {
-      if (chunks.length === 0) continue
-      const data = chunks.join('')
-      const perf = pending.perfByTerminal.get(terminalId)
-      this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf })
-    }
-    this.mobileOutputBuffers.delete(client)
-  }
-
-  private sendTerminalOutput(client: WebSocket, terminalId: string, data: string, perf?: TerminalRecord['perf']): void {
-    if (!this.isMobileClient(client)) {
-      this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf })
-      return
-    }
-
-    let pending = this.mobileOutputBuffers.get(client)
-    if (!pending) {
-      pending = {
-        timer: null,
-        chunksByTerminal: new Map(),
-        perfByTerminal: new Map(),
-        queuedChars: 0,
-      }
-      this.mobileOutputBuffers.set(client, pending)
-    }
-
-    const nextSize = pending.queuedChars + data.length
-    if (nextSize > MAX_MOBILE_OUTPUT_BUFFER_CHARS) {
-      this.flushMobileOutput(client)
-      this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf })
-      return
-    }
-
-    const chunks = pending.chunksByTerminal.get(terminalId) || []
-    chunks.push(data)
-    pending.chunksByTerminal.set(terminalId, chunks)
-    pending.perfByTerminal.set(terminalId, perf)
-    pending.queuedChars = nextSize
-
-    if (!pending.timer) {
-      pending.timer = setTimeout(() => {
-        this.flushMobileOutput(client)
-      }, MOBILE_OUTPUT_FLUSH_MS)
-    }
-  }
-
   safeSend(client: WebSocket, msg: unknown, context?: { terminalId?: string; perf?: TerminalRecord['perf'] }) {
     // Backpressure guard.
     // @ts-ignore
@@ -1247,22 +559,10 @@ export class TerminalRegistry extends EventEmitter {
       }
       return
     }
-    let messageType: string | undefined
-    if (msg && typeof msg === 'object' && 'type' in msg) {
-      const typeValue = (msg as { type?: unknown }).type
-      if (typeof typeValue === 'string') messageType = typeValue
-    }
     try {
       client.send(JSON.stringify(msg))
-    } catch (err) {
-      logger.warn(
-        {
-          err: err instanceof Error ? err : new Error(String(err)),
-          terminalId: context?.terminalId || 'unknown',
-          messageType: messageType || 'unknown',
-        },
-        'Terminal output send failed',
-      )
+    } catch {
+      // ignore
     }
   }
 
@@ -1307,108 +607,12 @@ export class TerminalRegistry extends EventEmitter {
    * Find a running terminal of the given mode that already owns the given sessionId.
    */
   findRunningTerminalBySession(mode: TerminalMode, sessionId: string): TerminalRecord | undefined {
-    if (modeSupportsResume(mode)) {
-      const owner = this.bindingAuthority.ownerForSession(mode as CodingCliProviderName, sessionId)
-      if (owner) {
-        const rec = this.terminals.get(owner)
-        if (rec && rec.mode === mode && rec.status === 'running' && rec.resumeSessionId === sessionId) {
-          return rec
-        }
-        this.bindingAuthority.unbindTerminal(owner)
-      }
-    }
     for (const term of this.terminals.values()) {
       if (term.mode !== mode) continue
       if (term.status !== 'running') continue
       if (term.resumeSessionId === sessionId) return term
     }
     return undefined
-  }
-
-  getCanonicalRunningTerminalBySession(mode: TerminalMode, sessionId: string): TerminalRecord | undefined {
-    if (!modeSupportsResume(mode)) return undefined
-
-    const owner = this.bindingAuthority.ownerForSession(mode as CodingCliProviderName, sessionId)
-    if (owner) {
-      const rec = this.terminals.get(owner)
-      if (rec && rec.mode === mode && rec.status === 'running' && rec.resumeSessionId === sessionId) {
-        return rec
-      }
-      this.bindingAuthority.unbindTerminal(owner)
-    }
-
-    const matches = Array.from(this.terminals.values())
-      .filter((term) => term.mode === mode && term.status === 'running' && term.resumeSessionId === sessionId)
-      .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))
-
-    return matches[0]
-  }
-
-  repairLegacySessionOwners(mode: TerminalMode, sessionId: string): RepairLegacySessionOwnersResult {
-    if (!modeSupportsResume(mode)) {
-      return { repaired: false, clearedTerminalIds: [] }
-    }
-
-    const matches = Array.from(this.terminals.values())
-      .filter((term) => term.mode === mode && term.status === 'running' && term.resumeSessionId === sessionId)
-      .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))
-    if (matches.length === 0) {
-      return { repaired: false, clearedTerminalIds: [] }
-    }
-
-    const provider = mode as CodingCliProviderName
-    const canonical = matches[0]
-    const owner = this.bindingAuthority.ownerForSession(provider, sessionId)
-    if (owner && owner !== canonical.terminalId) {
-      this.bindingAuthority.clearSessionOwner(provider, sessionId)
-    }
-
-    const bound = this.bindingAuthority.bind({
-      provider,
-      sessionId,
-      terminalId: canonical.terminalId,
-    })
-    if (bound.ok) {
-      canonical.resumeSessionId = sessionId
-    } else {
-      logger.warn(
-        {
-          provider,
-          sessionId,
-          canonicalTerminalId: canonical.terminalId,
-          reason: bound.reason,
-          ...(bound.reason === 'session_already_owned' ? { ownerTerminalId: bound.owner } : {}),
-          ...(bound.reason === 'terminal_already_bound' ? { existingBinding: bound.existing } : {}),
-        },
-        'session_bind_repair_failed',
-      )
-    }
-
-    const clearedTerminalIds: string[] = []
-    for (const duplicate of matches.slice(1)) {
-      this.bindingAuthority.unbindTerminal(duplicate.terminalId)
-      duplicate.resumeSessionId = undefined
-      clearedTerminalIds.push(duplicate.terminalId)
-    }
-
-    const repaired = clearedTerminalIds.length > 0 || bound.ok
-    if (repaired && (clearedTerminalIds.length > 0 || owner !== canonical.terminalId)) {
-      logger.info(
-        {
-          provider,
-          sessionId,
-          canonicalTerminalId: canonical.terminalId,
-          previousOwnerTerminalId: owner,
-          clearedTerminalIds,
-        },
-        'session_bind_repair_applied',
-      )
-    }
-    return {
-      repaired,
-      canonicalTerminalId: canonical.terminalId,
-      clearedTerminalIds,
-    }
   }
 
   /**
@@ -1456,49 +660,15 @@ export class TerminalRegistry extends EventEmitter {
    * Set the resumeSessionId on a terminal (one-time association).
    * Returns false if terminal not found.
    */
-  bindSession(terminalId: string, provider: CodingCliProviderName, sessionId: string): BindSessionResult {
-    const term = this.terminals.get(terminalId)
-    if (!term) return { ok: false, reason: 'terminal_missing' }
-    if (term.mode !== provider) return { ok: false, reason: 'mode_mismatch' }
-
-    const normalized = normalizeResumeSessionId(provider, sessionId)
-    if (!normalized) return { ok: false, reason: 'invalid_session_id' }
-
-    const bound = this.bindingAuthority.bind({ provider, sessionId: normalized, terminalId })
-    if (!bound.ok) {
-      if (bound.reason === 'session_already_owned') {
-        logger.warn(
-          {
-            provider,
-            sessionId: normalized,
-            ownerTerminalId: bound.owner,
-            attemptedTerminalId: terminalId,
-          },
-          'session_bind_conflict',
-        )
-      } else {
-        logger.warn(
-          {
-            provider,
-            sessionId: normalized,
-            terminalId,
-            existingBinding: bound.existing,
-          },
-          'session_terminal_already_bound',
-        )
-      }
-      return bound
-    }
-
-    term.resumeSessionId = normalized
-    return { ok: true, terminalId, sessionId: normalized }
-  }
-
   setResumeSessionId(terminalId: string, sessionId: string): boolean {
     const term = this.terminals.get(terminalId)
     if (!term) return false
-    if (term.mode === 'shell') return false
-    return this.bindSession(terminalId, term.mode as CodingCliProviderName, sessionId).ok
+    if (term.mode === 'claude' && !isValidClaudeSessionId(sessionId)) {
+      logger.warn({ sessionId, terminalId }, 'Ignoring invalid Claude resumeSessionId')
+      return false
+    }
+    term.resumeSessionId = sessionId
+    return true
   }
 
   /**
