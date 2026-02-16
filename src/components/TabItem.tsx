@@ -119,12 +119,12 @@ export default function TabItem({
             )
           : needsAttention && tabAttentionStyle !== 'none'
             ? tabAttentionStyle === 'darken'
-              ? 'bg-foreground/15 text-foreground hover:bg-foreground/20 mt-1 dark:bg-foreground/20 dark:text-foreground dark:hover:bg-foreground/25'
+              ? 'bg-foreground/15 text-foreground hover:bg-foreground/20 dark:bg-foreground/20 dark:text-foreground dark:hover:bg-foreground/25'
               : cn(
-                  'bg-emerald-100 text-emerald-900 hover:bg-emerald-200 mt-1 dark:bg-emerald-900/40 dark:text-emerald-100 dark:hover:bg-emerald-900/55',
+                  'bg-emerald-100 text-emerald-900 hover:bg-emerald-200 dark:bg-emerald-900/40 dark:text-emerald-100 dark:hover:bg-emerald-900/55',
                   tabAttentionStyle === 'pulse' && 'animate-pulse'
                 )
-            : 'bg-muted text-muted-foreground hover:text-foreground hover:bg-muted/90 mt-1',
+            : 'bg-muted text-muted-foreground hover:text-foreground hover:bg-muted/90',
         isDragging && 'opacity-50'
       )}
       role="button"
@@ -157,10 +157,7 @@ export default function TabItem({
         <Tooltip>
           <TooltipTrigger asChild>
             <span
-              className={cn(
-                'whitespace-nowrap truncate text-sm',
-                isActive ? 'max-w-[10rem]' : 'max-w-[5rem]'
-              )}
+              className="whitespace-nowrap truncate text-sm max-w-[5rem]"
             >
               {tab.title}
             </span>

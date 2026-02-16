@@ -166,4 +166,20 @@ describe('TabItem', () => {
     fireEvent.doubleClick(el!)
     expect(onDoubleClick).toHaveBeenCalled()
   })
+
+  it('uses the same title width class for active and inactive tabs', () => {
+    const { rerender } = render(<TabItem {...defaultProps} isActive={false} />)
+    let title = screen.getByText('Test Tab')
+    expect(title.className).toContain('max-w-[5rem]')
+
+    rerender(<TabItem {...defaultProps} isActive={true} />)
+    title = screen.getByText('Test Tab')
+    expect(title.className).toContain('max-w-[5rem]')
+  })
+
+  it('does not vertically offset inactive tabs', () => {
+    render(<TabItem {...defaultProps} isActive={false} />)
+    const el = getTabElement()
+    expect(el?.className).not.toContain('mt-1')
+  })
 })
