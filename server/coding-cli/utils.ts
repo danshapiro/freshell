@@ -4,6 +4,8 @@ import fsp from 'fs/promises'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
 
+export { looksLikePath } from '../../shared/path-utils.js'
+
 /**
  * Resolve a working directory to its git repo root, collapsing worktree paths
  * to their parent repository. Submodules are left as independent repos.
@@ -277,17 +279,3 @@ export function extractFromIdeContext(text: string): string | undefined {
   return undefined
 }
 
-export function looksLikePath(s: string): boolean {
-  // Reject URLs and protocol-based strings (contain :// before any path separator)
-  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s)) {
-    return false
-  }
-
-  // Accept special directory references
-  if (s === '~' || s === '.' || s === '..') {
-    return true
-  }
-
-  // Accept paths with separators or Windows drive letters
-  return s.includes('/') || s.includes('\\') || /^[A-Za-z]:\\/.test(s)
-}

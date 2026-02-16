@@ -8,6 +8,7 @@ import { getPerfConfig, startPerfTimer } from './perf-logger.js'
 import { configStore, SessionOverride } from './config-store.js'
 import { makeSessionKey } from './coding-cli/types.js'
 import { extractTitleFromMessage } from './title-utils.js'
+import { looksLikePath } from '../shared/path-utils.js'
 import { getClaudeProjectsDir } from './claude-home.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
 
@@ -40,20 +41,6 @@ export type ProjectGroup = {
   color?: string
 }
 
-export function looksLikePath(s: string): boolean {
-  // Reject URLs and protocol-based strings (contain :// before any path separator)
-  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s)) {
-    return false
-  }
-
-  // Accept special directory references
-  if (s === '~' || s === '.' || s === '..') {
-    return true
-  }
-
-  // Accept paths with separators or Windows drive letters
-  return s.includes('/') || s.includes('\\') || /^[A-Za-z]:\\/.test(s)
-}
 
 async function tryReadJson(filePath: string): Promise<any | null> {
   try {
