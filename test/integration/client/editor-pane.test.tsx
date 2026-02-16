@@ -572,7 +572,8 @@ describe('Editor Pane Integration', () => {
     await waitFor(() => {
       // EditorPane uses structured JSON logging
       expect(consoleSpy).toHaveBeenCalledWith(
-        expect.stringContaining('"event":"editor_file_load_failed"')
+          '[EditorPane]',
+          expect.stringContaining('"event":"editor_file_load_failed"')
       )
     })
 
