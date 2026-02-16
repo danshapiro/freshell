@@ -3,7 +3,9 @@ import { X, Maximize2, Minimize2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { TerminalStatus } from '@/store/types'
 import type { PaneContent } from '@/store/paneTypes'
+import type { TerminalTokenUsage } from '@/store/terminalMetaSlice'
 import PaneIcon from '@/components/icons/PaneIcon'
+import UsageBar from '@/components/ui/usage-bar'
 
 function statusClassName(status: TerminalStatus): string {
   switch (status) {
@@ -31,6 +33,7 @@ interface PaneHeaderProps {
   onRenameBlur?: () => void
   onRenameKeyDown?: (e: React.KeyboardEvent) => void
   onDoubleClick?: () => void
+  tokenUsage?: TerminalTokenUsage
 }
 
 export default function PaneHeader({
@@ -50,6 +53,7 @@ export default function PaneHeader({
   onRenameBlur,
   onRenameKeyDown,
   onDoubleClick,
+  tokenUsage,
 }: PaneHeaderProps) {
   const inputRef = useRef<HTMLInputElement>(null)
 
@@ -101,6 +105,10 @@ export default function PaneHeader({
           >
             {metaLabel}
           </span>
+        )}
+
+        {typeof tokenUsage?.compactPercent === 'number' && Number.isFinite(tokenUsage.compactPercent) && (
+          <UsageBar percent={tokenUsage.compactPercent} />
         )}
 
         {onToggleZoom && (

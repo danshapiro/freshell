@@ -1,4 +1,4 @@
-import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
+import type { TerminalMetaRecord, TerminalTokenUsage } from '@/store/terminalMetaSlice'
 
 const tokenNumberFormatter = new Intl.NumberFormat('en-US')
 
@@ -32,22 +32,25 @@ export function formatPaneRuntimeLabel(meta: TerminalMetaRecord | undefined): st
   return left ? `${left}  ${percent}` : percent
 }
 
-export function formatPaneRuntimeTooltip(meta: TerminalMetaRecord | undefined): string | undefined {
-  if (!meta) return undefined
+export function formatTokenUsageSummary(tokenUsage: TerminalTokenUsage | undefined): string[] {
+  if (!tokenUsage) return []
 
   const lines: string[] = []
-  const directory = meta.cwd || meta.checkoutRoot || meta.repoRoot
-  if (directory) {
-    lines.push(`Directory: ${directory}`)
+  const fmt = (n: number) => tokenNumberFormatter.format(Math.round(n))
+
+  if (typeof tokenUsage.inputTokens === 'number' && Number.isFinite(tokenUsage.inputTokens)) {
+    lines.push(`Input: ${fmt(tokenUsage.inputTokens)}`)
+  }
+  if (typeof tokenUsage.outputTokens === 'number' && Number.isFinite(tokenUsage.outputTokens)) {
+    lines.push(`Output: ${fmt(tokenUsage.outputTokens)}`)
+  }
+  if (typeof tokenUsage.cachedTokens === 'number' && Number.isFinite(tokenUsage.cachedTokens)) {
+    lines.push(`Cached: ${fmt(tokenUsage.cachedTokens)}`)
   }
 
-  if (meta.branch) {
-    lines.push(`branch: ${meta.branch}${meta.isDirty ? '*' : ''}`)
-  }
-
-  const contextTokens = meta.tokenUsage?.contextTokens
-  const compactThresholdTokens = meta.tokenUsage?.compactThresholdTokens
-  const compactPercent = meta.tokenUsage?.compactPercent
+  const contextTokens = tokenUsage.contextTokens
+  const compactThresholdTokens = tokenUsage.compactThresholdTokens
+  const compactPercent = tokenUsage.compactPercent
   if (
     typeof contextTokens === 'number' &&
     Number.isFinite(contextTokens) &&
@@ -58,9 +61,32 @@ export function formatPaneRuntimeTooltip(meta: TerminalMetaRecord | undefined): 
     const normalizedPercent = typeof compactPercent === 'number' && Number.isFinite(compactPercent)
       ? Math.max(0, Math.min(100, Math.round(compactPercent)))
       : Math.max(0, Math.min(100, Math.round((contextTokens / compactThresholdTokens) * 100)))
-    lines.push(
-      `Tokens: ${tokenNumberFormatter.format(Math.round(contextTokens))}/${tokenNumberFormatter.format(Math.round(compactThresholdTokens))}(${normalizedPercent}% full)`,
-    )
+    lines.push(`Context: ${fmt(contextTokens)} / ${fmt(compactThresholdTokens)} (${normalizedPercent}% full)`)
+  }
+
+  if (typeof tokenUsage.modelContextWindow === 'number' && Number.isFinite(tokenUsage.modelContextWindow)) {
+    lines.push(`Model window: ${fmt(tokenUsage.modelContextWindow)}`)
+  }
+
+  return lines
+}
+
+export function formatPaneRuntimeTooltip(meta: TerminalMetaRecord | undefined): string | undefined {
+  if (!meta) return undefined
+
+  const lines: string[] = []
+  const directory = meta.cwd || meta.checkoutRoot || meta.repoRoot
+  if (directory) {
+    lines.push(`Directory: ${directory}`)
+  }
+
+  if (meta.branch) {
+    lines.push(`Branch: ${meta.branch}${meta.isDirty ? '*' : ''}`)
+  }
+
+  const usageLines = formatTokenUsageSummary(meta.tokenUsage)
+  if (usageLines.length) {
+    lines.push('', ...usageLines)
   }
 
   return lines.length ? lines.join('\n') : undefined

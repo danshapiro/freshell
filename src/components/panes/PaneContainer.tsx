@@ -26,6 +26,10 @@ import { clearPaneAttention, clearTabAttention } from '@/store/turnCompletionSli
 import { clearPendingCreate, removeSession } from '@/store/claudeChatSlice'
 import { cancelCreate } from '@/lib/sdk-message-handler'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
+import { createLogger } from '@/lib/client-logger'
+
+
+const log = createLogger('PaneContainer')
 
 // Stable empty object to avoid selector memoization issues
 const EMPTY_PANE_TITLES: Record<string, string> = {}
@@ -345,6 +349,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         onRenameChange={isRenaming ? setRenameValue : undefined}
         onRenameBlur={isRenaming ? commitRename : undefined}
         onRenameKeyDown={isRenaming ? handleRenameKeyDown : undefined}
+        tokenUsage={paneRuntimeMeta?.tokenUsage}
         onDoubleClickTitle={() => startRename(node.id, paneTitle)}
       >
         {renderContent(tabId, node.id, node.content, isOnlyPane, hidden)}
@@ -505,7 +510,7 @@ function PickerWrapper({
     }
     dispatch(updateSettingsLocal(patch as any))
     void api.patch('/api/settings', patch).catch((err) => {
-      console.warn('Failed to save provider starting directory', err)
+      log.warn('Failed to save provider starting directory', err)
     })
   }, [createContentForType, dispatch, paneId, settings, step, tabId])
 

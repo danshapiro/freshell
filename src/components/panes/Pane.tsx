@@ -2,6 +2,7 @@ import { X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { TerminalStatus } from '@/store/types'
 import type { PaneContent } from '@/store/paneTypes'
+import type { TerminalTokenUsage } from '@/store/terminalMetaSlice'
 import PaneHeader from './PaneHeader'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 
@@ -27,6 +28,7 @@ interface PaneProps {
   onRenameBlur?: () => void
   onRenameKeyDown?: (e: React.KeyboardEvent) => void
   onDoubleClickTitle?: () => void
+  tokenUsage?: TerminalTokenUsage
 }
 
 export default function Pane({
@@ -51,6 +53,7 @@ export default function Pane({
   onRenameBlur,
   onRenameKeyDown,
   onDoubleClickTitle,
+  tokenUsage,
 }: PaneProps) {
   const showHeader = title !== undefined
 
@@ -92,6 +95,7 @@ export default function Pane({
             onRenameBlur={onRenameBlur}
             onRenameKeyDown={onRenameKeyDown}
             onDoubleClick={onDoubleClickTitle}
+            tokenUsage={tokenUsage}
           />
         </div>
       )}
