@@ -700,7 +700,7 @@ export default function EditorPane({
           {filePickerMessage}
         </div>
       )}
-      <div className="flex-1 relative">
+      <div className="flex-1 relative min-h-0 overflow-hidden">
         {isLoading && (
           <div className="absolute inset-0 flex items-center justify-center bg-background/50 z-10">
             <div className="text-sm text-muted-foreground">Loading file...</div>
@@ -725,7 +725,7 @@ export default function EditorPane({
               srcDoc={editorValue}
             />
           ) : (
-            <MarkdownPreview content={editorValue} language="markdown" />
+            <MarkdownPreview content={editorValue} />
           )
         ) : (
           <Editor
