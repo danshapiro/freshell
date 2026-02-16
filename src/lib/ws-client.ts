@@ -1,8 +1,9 @@
 import { getClientPerfConfig, logClientPerf } from '@/lib/perf-logger'
 import { getAuthToken } from '@/lib/auth'
+import type { ServerMessage } from '@shared/ws-protocol'
 
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'ready'
-type MessageHandler = (msg: any) => void
+type MessageHandler = (msg: ServerMessage) => void
 type ReconnectHandler = () => void
 type HelloExtensionProvider = () => {
   sessions?: { active?: string; visible?: string[]; background?: string[] }
@@ -123,9 +124,9 @@ export class WsClient {
       }
 
       this.ws.onmessage = (event) => {
-        let msg: any
+        let msg: ServerMessage
         try {
-          msg = JSON.parse(event.data)
+          msg = JSON.parse(event.data) as ServerMessage
         } catch {
           // Ignore invalid JSON
           return

@@ -13,7 +13,7 @@ import type { PaneNode } from './paneTypes'
 export const SYNC_INTERVAL_MS = 5000
 
 type AppStore = Store<RootState>
-type TabRegistryWsClient = Pick<WsClient, 'state' | 'onMessage'> & {
+type TabRegistryWsClient = Pick<WsClient, 'state' | 'onMessage' | 'serverInstanceId'> & {
   sendTabsSyncPush?: WsClient['sendTabsSyncPush']
   sendTabsSyncQuery?: WsClient['sendTabsSyncQuery']
   onReconnect?: WsClient['onReconnect']
@@ -165,10 +165,15 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
       if (requestId && pendingRequests.has(requestId)) {
         pendingRequests.delete(requestId)
       }
+      const data = (msg.data || {}) as {
+        localOpen?: RegistryTabRecord[]
+        remoteOpen?: RegistryTabRecord[]
+        closed?: RegistryTabRecord[]
+      }
       store.dispatch(setTabRegistrySnapshot({
-        localOpen: msg?.data?.localOpen || [],
-        remoteOpen: msg?.data?.remoteOpen || [],
-        closed: msg?.data?.closed || [],
+        localOpen: data.localOpen || [],
+        remoteOpen: data.remoteOpen || [],
+        closed: data.closed || [],
       }))
       return
     }
