@@ -361,6 +361,23 @@ function resolveWindowsShellCwd(cwd: string | undefined): string | undefined {
   return undefined
 }
 
+function resolveUnixShellCwd(cwd: string | undefined): string | undefined {
+  if (!cwd) return undefined
+  const candidate = cwd.trim()
+  if (!candidate) return undefined
+
+  // In WSL, Linux processes need POSIX paths. Convert Windows-style cwd inputs
+  // (e.g. D:\users\dan) to WSL mount paths before passing cwd to node-pty.
+  if (isWsl()) {
+    const converted = convertWindowsPathToWslPath(candidate)
+    if (converted) {
+      return converted
+    }
+  }
+
+  return candidate
+}
+
 /**
  * Get a sensible default working directory for Windows shells.
  * On native Windows: user's home directory (C:\Users\<username>)
@@ -639,15 +656,16 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
   }
 // Non-Windows: native spawn using system shell
   const systemShell = getSystemShell()
+  const unixCwd = resolveUnixShellCwd(cwd)
 
   if (mode === 'shell') {
-    return { file: systemShell, args: ['-l'], cwd, env }
+    return { file: systemShell, args: ['-l'], cwd: unixCwd, env }
   }
 
   const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix')
   const cmd = cli?.command || mode
   const args = cli?.args || []
-  return { file: cmd, args, cwd, env }
+  return { file: cmd, args, cwd: unixCwd, env }
 }
 
 export class TerminalRegistry extends EventEmitter {

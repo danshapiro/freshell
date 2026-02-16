@@ -1321,6 +1321,27 @@ describe('buildSpawnSpec WSL paths', () => {
       expect(spec.file).toBe('codex')
       expect(spec.cwd).toBe('/home/user/project')
     })
+
+    it('converts Windows cwd to WSL path for codex in WSL system shell', () => {
+      mockWsl()
+      delete process.env.CODEX_CMD
+
+      const spec = buildSpawnSpec('codex', String.raw`D:\users\dan\project`, 'system')
+
+      expect(spec.file).toBe('codex')
+      expect(spec.cwd).toBe('/mnt/d/users/dan/project')
+    })
+
+    it('converts Windows cwd to WSL path for shell mode in WSL system shell', () => {
+      mockWsl()
+      process.env.SHELL = '/bin/bash'
+
+      const spec = buildSpawnSpec('shell', String.raw`C:\Users\dan\workspace`, 'system')
+
+      expect(spec.file).toBe('/bin/bash')
+      expect(spec.args).toEqual(['-l'])
+      expect(spec.cwd).toBe('/mnt/c/Users/dan/workspace')
+    })
   })
 })
 
