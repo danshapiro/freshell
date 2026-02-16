@@ -36,12 +36,11 @@ import PaneDivider from '@/components/panes/PaneDivider'
 import { AuthRequiredModal } from '@/components/AuthRequiredModal'
 import { SetupWizard } from '@/components/SetupWizard'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { fetchNetworkStatus } from '@/store/networkSlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { triggerHapticFeedback } from '@/lib/mobile-haptics'
-import { Wifi, WifiOff, Moon, Sun, Share2, X, Copy, Check, PanelLeftClose, PanelLeft, Loader2, Minimize2, Maximize2, AlertCircle, AlertTriangle } from 'lucide-react'
+import { X, Copy, Check, PanelLeft, AlertTriangle } from 'lucide-react'
 import { updateSettingsLocal, markSaved } from '@/store/settingsSlice'
 import { clearIdleWarning, recordIdleWarning } from '@/store/idleWarningsSlice'
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
@@ -115,16 +114,10 @@ export default function App() {
   const dispatch = useAppDispatch()
   const tabs = useAppSelector((s) => s.tabs.tabs)
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
-  const connection = useAppSelector((s) => s.connection.status)
-  const connectionError = useAppSelector((s) => s.connection.lastError)
   const settings = useAppSelector((s) => s.settings.settings)
   const idleWarnings = useAppSelector((s) => (s as any).idleWarnings?.warnings ?? EMPTY_IDLE_WARNINGS)
   const idleWarningCount = Object.keys(idleWarnings).length
   const networkStatus = useAppSelector((s) => s.network.status)
-
-  const networkLoading = useAppSelector((s) => s.network.loading)
-  const networkConfiguring = useAppSelector((s) => s.network.configuring)
-  const networkBusy = networkLoading || networkConfiguring || !!networkStatus?.rebinding
 
   const [view, setView] = useState<AppView>('terminal')
   const [showSharePanel, setShowSharePanel] = useState(false)
@@ -139,7 +132,7 @@ export default function App() {
   const isMobile = useMobile()
   const isMobileRef = useRef(isMobile)
   const { isLandscape } = useOrientation()
-  const { isFullscreen, toggleFullscreen, exitFullscreen } = useFullscreen()
+  const { isFullscreen, exitFullscreen } = useFullscreen()
   const paneLayouts = useAppSelector((s) => s.panes.layouts)
   const mainContentRef = useRef<HTMLDivElement>(null)
   const userOpenedSidebarOnMobileRef = useRef(false)
@@ -280,17 +273,6 @@ export default function App() {
       pointer: { touch: true },
     }
   )
-
-  const toggleTheme = async () => {
-    const newTheme = settings.theme === 'dark' ? 'light' : settings.theme === 'light' ? 'system' : 'dark'
-    dispatch(updateSettingsLocal({ theme: newTheme }))
-    try {
-      await api.patch('/api/settings', { theme: newTheme })
-      dispatch(markSaved())
-    } catch (err) {
-      console.warn('Failed to save theme setting', err)
-    }
-  }
 
   const handleShare = () => {
     const action = getShareAction(networkStatus)
@@ -660,7 +642,7 @@ export default function App() {
       return (
         <ErrorBoundary label="Settings" onNavigate={() => setView('overview')}>
           <Suspense fallback={<div className="flex h-full items-center justify-center text-sm text-muted-foreground">Loading settings…</div>}>
-            <SettingsView onNavigate={setView} onFirewallTerminal={setPendingFirewallCommand} onSharePanel={() => { setCopied(false); setShowSharePanel(true) }} />
+            <SettingsView onNavigate={setView} onFirewallTerminal={setPendingFirewallCommand} onSharePanel={handleShare} />
           </Suspense>
         </ErrorBoundary>
       )
@@ -712,181 +694,18 @@ export default function App() {
         className="h-full overflow-hidden flex flex-col bg-background text-foreground"
         data-context={ContextIds.Global}
       >
-      {/* Top header bar spanning full width */}
-      {isLandscapeTerminalView ? (
-        <div className="h-6 px-2 flex items-center justify-between border-b border-border/30 bg-background/95 flex-shrink-0 text-xs">
-          {currentVersion ? (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  className={`font-mono text-[11px] rounded px-1 -mx-1 border-0 p-0 bg-transparent inline-flex items-center gap-1 transition-colors ${
-                    updateAvailable
-                      ? 'text-amber-700 dark:text-amber-400 bg-amber-100/60 dark:bg-amber-950/40 hover:bg-amber-200/70 dark:hover:bg-amber-900/60 cursor-pointer'
-                      : 'text-muted-foreground cursor-default'
-                  }`}
-                  onClick={handleBrandClick}
-                  aria-label={
-                    updateAvailable
-                      ? `Freshell v${currentVersion}. Update available${latestVersion ? `: v${latestVersion}` : ''}. Click for update instructions.`
-                      : `Freshell v${currentVersion}. Up to date.`
-                  }
-                  data-testid="app-brand-status"
-                >
-                  <span>freshell</span>
-                  {updateAvailable && <AlertCircle className="h-3 w-3" aria-hidden="true" />}
-                  </button>
-                </TooltipTrigger>
-              <TooltipContent side="bottom">
-                {updateAvailable ? (
-                  <div>
-                    <div>v{currentVersion} - {latestVersion ? `v${latestVersion} available` : 'update available'}</div>
-                    <div className="text-muted-foreground">Click for update instructions</div>
-                  </div>
-                ) : (
-                  <div>v{currentVersion} (up to date)</div>
-                )}
-              </TooltipContent>
-            </Tooltip>
-          ) : (
-            <span className="font-mono text-[11px] text-muted-foreground">freshell</span>
-          )}
-          <div className="flex items-center gap-1">
+        {idleWarningCount > 0 && (
+          <div className="px-3 md:px-4 py-2 border-b border-amber-300/40 bg-amber-100/60 dark:bg-amber-950/40">
             <button
-              onClick={() => { triggerHapticFeedback(); void toggleFullscreen(mainContentRef.current) }}
-              className="min-h-6 rounded px-2 text-[11px] text-muted-foreground hover:text-foreground"
-              aria-label={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
+              onClick={() => setView('overview')}
+              className="rounded-md bg-amber-100 text-amber-950 hover:bg-amber-200 transition-colors text-xs font-medium px-2 py-1 dark:bg-amber-900/70 dark:text-amber-100 dark:hover:bg-amber-900"
+              aria-label={`${idleWarningCount} coding agent terminal(s) will auto-kill soon`}
+              title="View in Panes"
             >
-              {isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+              {idleWarningCount} terminal{idleWarningCount === 1 ? '' : 's'} will auto-kill soon
             </button>
-            <div
-              className="px-1.5"
-              title={connection === 'ready' ? 'Connected' : connection === 'connecting' ? 'Connecting...' : connectionError || 'Disconnected'}
-            >
-              {connection === 'ready' ? (
-                <Wifi className="h-3 w-3 text-muted-foreground" />
-              ) : connection === 'connecting' ? (
-                <Wifi className="h-3 w-3 text-muted-foreground animate-pulse" />
-              ) : (
-                <WifiOff className="h-3 w-3 text-muted-foreground" />
-              )}
-            </div>
           </div>
-        </div>
-      ) : (
-        <div className="h-8 px-3 md:px-4 flex items-center justify-between gap-2 border-b border-border/30 bg-background flex-shrink-0">
-          <div className="flex min-w-0 flex-1 items-center gap-1.5 md:gap-2">
-            <button
-              onClick={toggleSidebarCollapse}
-              className="p-1.5 rounded-md hover:bg-muted transition-colors min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center"
-              title={sidebarCollapsed ? 'Show sidebar' : 'Hide sidebar'}
-            >
-              {sidebarCollapsed ? (
-                <PanelLeft className="h-3.5 w-3.5 text-muted-foreground" />
-              ) : (
-                <PanelLeftClose className="h-3.5 w-3.5 text-muted-foreground" />
-              )}
-            </button>
-            {currentVersion ? (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    className={`font-mono min-w-0 text-sm md:text-base font-semibold tracking-tight whitespace-nowrap rounded px-1 -mx-1 border-0 p-0 bg-transparent inline-flex items-center gap-1 transition-colors ${
-                      updateAvailable
-                        ? 'text-amber-700 dark:text-amber-400 bg-amber-100/60 dark:bg-amber-950/40 hover:bg-amber-200/70 dark:hover:bg-amber-900/60 cursor-pointer'
-                        : 'cursor-default'
-                    }`}
-                    onClick={handleBrandClick}
-                    aria-label={
-                      updateAvailable
-                        ? `Freshell v${currentVersion}. Update available${latestVersion ? `: v${latestVersion}` : ''}. Click for update instructions.`
-                        : `Freshell v${currentVersion}. Up to date.`
-                    }
-                    data-testid="app-brand-status"
-                  >
-                    <span className="truncate">🐚🔥freshell</span>
-                    {updateAvailable && <AlertCircle className="h-3.5 w-3.5" aria-hidden="true" />}
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom">
-                  {updateAvailable ? (
-                    <div>
-                      <div>v{currentVersion} - {latestVersion ? `v${latestVersion} available` : 'update available'}</div>
-                      <div className="text-muted-foreground">Click for update instructions</div>
-                    </div>
-                  ) : (
-                    <div>v{currentVersion} (up to date)</div>
-                  )}
-                </TooltipContent>
-              </Tooltip>
-            ) : (
-              <span className="font-mono text-sm md:text-base font-semibold tracking-tight whitespace-nowrap truncate">🐚🔥freshell</span>
-            )}
-          </div>
-          <div className="flex shrink-0 items-center gap-0 md:gap-1">
-            {idleWarningCount > 0 && (
-              <button
-                onClick={() => setView('overview')}
-                className="px-2 py-1 rounded-md bg-amber-100 text-amber-950 hover:bg-amber-200 transition-colors text-xs font-medium"
-                aria-label={`${idleWarningCount} coding agent terminal(s) will auto-kill soon`}
-                title="View in Panes"
-              >
-                {idleWarningCount} terminal{idleWarningCount === 1 ? '' : 's'} will auto-kill soon
-              </button>
-            )}
-            <button
-              onClick={toggleTheme}
-              className="p-1.5 rounded-md hover:bg-muted transition-colors min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center"
-              title={`Theme: ${settings.theme}`}
-            >
-              {settings.theme === 'dark' ? (
-                <Moon className="h-3.5 w-3.5 text-muted-foreground" />
-              ) : (
-                <Sun className="h-3.5 w-3.5 text-muted-foreground" />
-              )}
-            </button>
-            <button
-              onClick={handleShare}
-              className="p-1.5 rounded-md hover:bg-muted transition-colors min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center"
-              title="Share LAN access"
-              aria-label="Share"
-            >
-              {networkBusy ? (
-                <Loader2 className="h-3.5 w-3.5 text-muted-foreground animate-spin" />
-              ) : (
-                <Share2 className="h-3.5 w-3.5 text-muted-foreground" />
-              )}
-            </button>
-            {isMobile && view === 'terminal' && (
-              <button
-                onClick={() => { triggerHapticFeedback(); void toggleFullscreen(mainContentRef.current) }}
-                className="p-1.5 rounded-md hover:bg-muted transition-colors min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center"
-                title={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
-                aria-label={isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'}
-              >
-                {isFullscreen ? (
-                  <Minimize2 className="h-3.5 w-3.5 text-muted-foreground" />
-                ) : (
-                  <Maximize2 className="h-3.5 w-3.5 text-muted-foreground" />
-                )}
-              </button>
-            )}
-            <div
-              className="p-1.5 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center"
-              title={connection === 'ready' ? 'Connected' : connection === 'connecting' ? 'Connecting...' : connectionError || 'Disconnected'}
-            >
-              {connection === 'ready' ? (
-                <Wifi className="h-3.5 w-3.5 text-muted-foreground" />
-              ) : connection === 'connecting' ? (
-                <Wifi className="h-3.5 w-3.5 text-muted-foreground animate-pulse" />
-              ) : (
-                <WifiOff className="h-3.5 w-3.5 text-muted-foreground" />
-              )}
-            </div>
-          </div>
-        </div>
-      )}
+        )}
       {configFallback && (
         <div className="px-3 md:px-4 py-2 border-b border-destructive/30 bg-destructive/10 text-destructive text-xs">
           <div className="flex items-start gap-2">
@@ -910,7 +729,24 @@ export default function App() {
         </div>
       )}
       {/* Main content area with sidebar */}
-      <div className="flex-1 min-h-0 flex relative" ref={mainContentRef} {...(isMobile ? bindSidebarSwipe() : {})} style={isMobile ? { touchAction: 'pan-y' } : undefined}>
+      <div
+        className="flex-1 min-h-0 flex relative"
+        data-testid="app-main-content"
+        ref={mainContentRef}
+        {...(isMobile ? bindSidebarSwipe() : {})}
+        style={isMobile ? { touchAction: 'pan-y' } : undefined}
+      >
+        {sidebarCollapsed && (
+          <button
+            onClick={toggleSidebarCollapse}
+            className="absolute left-2 top-2 z-30 p-1.5 rounded-md hover:bg-muted transition-colors min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center bg-card/90 border border-border/40"
+            title="Show sidebar"
+            aria-label="Show sidebar"
+            data-testid="show-sidebar-button"
+          >
+            <PanelLeft className="h-3.5 w-3.5 text-muted-foreground" />
+          </button>
+        )}
         {/* Mobile overlay when sidebar is open */}
         {isMobile && !sidebarCollapsed && (
           <div
@@ -930,11 +766,21 @@ export default function App() {
         {/* Sidebar - on mobile it overlays, on desktop it's inline */}
         {!sidebarCollapsed && (
           <div className={isMobile ? 'absolute inset-y-0 left-0 right-0 z-20' : 'contents'}>
-            <Sidebar view={view} onNavigate={(v) => {
-              setView(v)
-              // On mobile, collapse sidebar after navigation
-              if (isMobile) toggleSidebarCollapse()
-            }} width={sidebarWidth} fullWidth={isMobile} />
+            <Sidebar
+              view={view}
+              onNavigate={(v) => {
+                setView(v)
+                // On mobile, collapse sidebar after navigation
+                if (isMobile) toggleSidebarCollapse()
+              }}
+              onToggleSidebar={toggleSidebarCollapse}
+              currentVersion={currentVersion}
+              updateAvailable={updateAvailable}
+              latestVersion={latestVersion}
+              onBrandClick={handleBrandClick}
+              width={sidebarWidth}
+              fullWidth={isMobile}
+            />
             {!isMobile && (
               <PaneDivider
                 direction="horizontal"

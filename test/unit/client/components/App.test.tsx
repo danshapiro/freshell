@@ -48,9 +48,38 @@ vi.mock('@/components/TabContent', () => ({
 }))
 
 vi.mock('@/components/Sidebar', () => ({
-  default: ({ view, onNavigate }: { view: string; onNavigate: (v: string) => void }) => (
+  default: ({
+    view,
+    onNavigate,
+    onToggleSidebar,
+    currentVersion,
+    updateAvailable,
+    onBrandClick,
+  }: {
+    view: string
+    onNavigate: (v: string) => void
+    onToggleSidebar?: () => void
+    currentVersion?: string | null
+    updateAvailable?: boolean
+    onBrandClick?: () => void
+  }) => (
     <div data-testid="mock-sidebar" data-view={view}>
-      Sidebar
+      <button type="button" title="Hide sidebar" onClick={() => onToggleSidebar?.()}>
+        Hide sidebar
+      </button>
+      <button type="button" title="Go settings" onClick={() => onNavigate('settings')}>
+        Go settings
+      </button>
+      {currentVersion ? (
+        <button
+          type="button"
+          data-testid="app-brand-status"
+          className={updateAvailable ? 'text-amber-700' : ''}
+          onClick={() => onBrandClick?.()}
+        >
+          freshell
+        </button>
+      ) : null}
     </div>
   ),
   AppView: {} as any,
@@ -61,7 +90,14 @@ vi.mock('@/components/HistoryView', () => ({
 }))
 
 vi.mock('@/components/SettingsView', () => ({
-  default: () => <div data-testid="mock-settings-view">Settings View</div>,
+  default: ({ onSharePanel }: { onSharePanel?: () => void }) => (
+    <div data-testid="mock-settings-view">
+      Settings View
+      <button type="button" aria-label="Open share panel" onClick={() => onSharePanel?.()}>
+        Open share panel
+      </button>
+    </div>
+  ),
 }))
 
 vi.mock('@/components/OverviewView', () => ({
@@ -197,11 +233,16 @@ describe('App Component - Share Button', () => {
     cleanup()
   })
 
-  it('renders the share button in the header', () => {
-    renderApp()
+  async function openShareFromSettings() {
+    fireEvent.click(screen.getByTitle('Go settings'))
+    const openShareButton = await screen.findByRole('button', { name: 'Open share panel' })
+    fireEvent.click(openShareButton)
+  }
 
-    const shareButton = screen.getByTitle('Share LAN access')
-    expect(shareButton).toBeInTheDocument()
+  it('renders the share action in settings', () => {
+    renderApp()
+    fireEvent.click(screen.getByTitle('Go settings'))
+    expect(screen.getByRole('button', { name: 'Open share panel' })).toBeInTheDocument()
   })
 
   it('renders the outlined terminal work area top border with a thin connector strip', () => {
@@ -216,7 +257,7 @@ describe('App Component - Share Button', () => {
     expect(connector.className).toContain('bg-background')
   })
 
-  it('opens setup wizard when network not configured', () => {
+  it('opens setup wizard when network not configured', async () => {
     const store = createTestStore()
     // Set network to unconfigured localhost
     act(() => {
@@ -227,31 +268,37 @@ describe('App Component - Share Button', () => {
     })
 
     renderApp(store)
-
-    const shareButton = screen.getByTitle('Share LAN access')
-    fireEvent.click(shareButton)
+    await openShareFromSettings()
 
     // Should show the wizard at step 1
     expect(screen.getByTestId('mock-setup-wizard')).toBeInTheDocument()
     expect(screen.getByTestId('mock-setup-wizard').dataset.initialStep).toBe('1')
   })
 
-  it('opens setup wizard at step 2 when configured but localhost-only', () => {
+  it('opens setup wizard at step 2 when configured but localhost-only', async () => {
     const store = createTestStore()
+    const localhostStatus = makeNetworkStatus({
+      configured: true,
+      host: '127.0.0.1',
+    })
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/version') return Promise.resolve(makeVersionInfo())
+      if (url === '/api/sessions') return Promise.resolve([])
+      if (url === '/api/network/status') return Promise.resolve(localhostStatus)
+      return Promise.resolve({})
+    })
     // Set network to configured but localhost
     act(() => {
-      store.dispatch(setNetworkStatus(makeNetworkStatus({
-        configured: true,
-        host: '127.0.0.1',
-      })))
+      store.dispatch(setNetworkStatus(localhostStatus))
     })
 
     renderApp(store)
 
     // Close the auto-opened wizard first (auto-show only triggers for unconfigured)
-    // In this case configured=true so no auto-show, we just click Share
-    const shareButton = screen.getByTitle('Share LAN access')
-    fireEvent.click(shareButton)
+    // In this case configured=true so no auto-show, we trigger share from settings
+    await openShareFromSettings()
 
     expect(screen.getByTestId('mock-setup-wizard')).toBeInTheDocument()
     expect(screen.getByTestId('mock-setup-wizard').dataset.initialStep).toBe('2')
@@ -268,9 +315,7 @@ describe('App Component - Share Button', () => {
     })
 
     renderApp(store)
-
-    const shareButton = screen.getByTitle('Share LAN access')
-    fireEvent.click(shareButton)
+    await openShareFromSettings()
 
     await waitFor(() => {
       expect(screen.getByText('Share Access')).toBeInTheDocument()
@@ -281,18 +326,25 @@ describe('App Component - Share Button', () => {
 
   it('shows share panel for legacy HOST env override (configured=false, host=0.0.0.0)', async () => {
     const store = createTestStore()
+    const legacyStatus = makeNetworkStatus({
+      configured: false,
+      host: '0.0.0.0',
+      accessUrl: 'http://10.0.0.5:3001',
+    })
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/version') return Promise.resolve(makeVersionInfo())
+      if (url === '/api/sessions') return Promise.resolve([])
+      if (url === '/api/network/status') return Promise.resolve(legacyStatus)
+      return Promise.resolve({})
+    })
     act(() => {
-      store.dispatch(setNetworkStatus(makeNetworkStatus({
-        configured: false,
-        host: '0.0.0.0',
-        accessUrl: 'http://10.0.0.5:3001',
-      })))
+      store.dispatch(setNetworkStatus(legacyStatus))
     })
 
     renderApp(store)
-
-    const shareButton = screen.getByTitle('Share LAN access')
-    fireEvent.click(shareButton)
+    await openShareFromSettings()
 
     await waitFor(() => {
       expect(screen.getByText('Share Access')).toBeInTheDocument()
@@ -318,9 +370,7 @@ describe('App Component - Share Button', () => {
     })
 
     renderApp(store)
-
-    const shareButton = screen.getByTitle('Share LAN access')
-    fireEvent.click(shareButton)
+    await openShareFromSettings()
 
     await waitFor(() => {
       expect(screen.getByText('Copy link')).toBeInTheDocument()
@@ -344,9 +394,7 @@ describe('App Component - Share Button', () => {
     })
 
     renderApp(store)
-
-    const shareButton = screen.getByTitle('Share LAN access')
-    fireEvent.click(shareButton)
+    await openShareFromSettings()
 
     await waitFor(() => {
       expect(screen.getByText('Share Access')).toBeInTheDocument()
@@ -360,14 +408,12 @@ describe('App Component - Share Button', () => {
     })
   })
 
-  it('retries network status fetch when clicked with null status', () => {
+  it('retries network status fetch when clicked with null status', async () => {
     const store = createTestStore()
     // network.status starts as null (default)
 
     renderApp(store)
-
-    const shareButton = screen.getByTitle('Share LAN access')
-    fireEvent.click(shareButton)
+    await openShareFromSettings()
 
     // Should have dispatched fetchNetworkStatus (the loading case triggers a retry)
     // The mock API will be called for /api/network/status
@@ -387,16 +433,12 @@ describe('App Component - Version Status', () => {
     })
   })
 
-  it('shows version details in a tooltip instead of always rendering text in header', async () => {
+  it('does not render version text inline while the brand status control is present', async () => {
     renderApp()
 
     const brandStatus = await screen.findByTestId('app-brand-status')
+    expect(brandStatus).toBeInTheDocument()
     expect(screen.queryByText('v0.4.5 (up to date)')).not.toBeInTheDocument()
-
-    fireEvent.mouseEnter(brandStatus)
-    await waitFor(() => {
-      expect(screen.getByText('v0.4.5 (up to date)')).toBeInTheDocument()
-    })
   })
 
   it('highlights brand and opens update instructions when update is available', async () => {

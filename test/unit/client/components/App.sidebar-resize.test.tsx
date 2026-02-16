@@ -44,8 +44,21 @@ vi.mock('@/components/TabContent', () => ({
 }))
 
 vi.mock('@/components/Sidebar', () => ({
-  default: ({ view, onNavigate, width }: { view: string; onNavigate: (v: string) => void; width?: number }) => (
+  default: ({
+    view,
+    onNavigate,
+    onToggleSidebar,
+    width,
+  }: {
+    view: string
+    onNavigate: (v: string) => void
+    onToggleSidebar?: () => void
+    width?: number
+  }) => (
     <div data-testid="mock-sidebar" data-view={view} data-width={width} style={{ width: `${width}px` }}>
+      <button title="Hide sidebar" onClick={() => onToggleSidebar?.()}>
+        Hide sidebar
+      </button>
       Sidebar
     </div>
   ),

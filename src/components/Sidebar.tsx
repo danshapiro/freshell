@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Terminal, History, Settings, LayoutGrid, Search, Loader2, X, Archive } from 'lucide-react'
+import { Terminal, Folder, Settings, LayoutGrid, Search, Loader2, X, Archive, PanelLeftClose, AlertCircle } from 'lucide-react'
 import { List, type RowComponentProps } from 'react-window'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
@@ -45,11 +45,21 @@ function getProjectName(projectPath: string): string {
 export default function Sidebar({
   view,
   onNavigate,
+  onToggleSidebar,
+  currentVersion = null,
+  updateAvailable = false,
+  latestVersion = null,
+  onBrandClick,
   width = 288,
   fullWidth = false,
 }: {
   view: AppView
   onNavigate: (v: AppView) => void
+  onToggleSidebar?: () => void
+  currentVersion?: string | null
+  updateAvailable?: boolean
+  latestVersion?: string | null
+  onBrandClick?: () => void
   width?: number
   fullWidth?: boolean
 }) {
@@ -253,7 +263,7 @@ export default function Sidebar({
     { id: 'terminal' as const, label: 'Coding Agents', icon: Terminal, shortcut: 'T' },
     { id: 'tabs' as const, label: 'Tabs', icon: Archive, shortcut: 'A' },
     { id: 'overview' as const, label: 'Panes', icon: LayoutGrid, shortcut: 'O' },
-    { id: 'sessions' as const, label: 'Projects', icon: History, shortcut: 'P' },
+    { id: 'sessions' as const, label: 'Projects', icon: Folder, shortcut: 'P' },
     { id: 'settings' as const, label: 'Settings', icon: Settings, shortcut: ',' },
   ]
 
@@ -298,8 +308,54 @@ export default function Sidebar({
       style={fullWidth ? undefined : { width: `${width}px` }}
     >
       {/* Header */}
-      <div className="px-4 py-4">
-        <span className="text-sm font-medium tracking-tight">Coding Agents</span>
+      <div className="px-3 py-3">
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={onToggleSidebar}
+            className="p-1.5 rounded-md hover:bg-muted transition-colors min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center"
+            title="Hide sidebar"
+            aria-label="Hide sidebar"
+          >
+            <PanelLeftClose className="h-3.5 w-3.5 text-muted-foreground" />
+          </button>
+          {currentVersion ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  className={cn(
+                    'font-mono min-w-0 text-sm font-semibold tracking-tight whitespace-nowrap rounded px-1 -mx-1 border-0 p-0 bg-transparent inline-flex items-center gap-1 transition-colors',
+                    updateAvailable
+                      ? 'text-amber-700 dark:text-amber-400 bg-amber-100/60 dark:bg-amber-950/40 hover:bg-amber-200/70 dark:hover:bg-amber-900/60 cursor-pointer'
+                      : 'cursor-default'
+                  )}
+                  onClick={onBrandClick}
+                  aria-label={
+                    updateAvailable
+                      ? `Freshell v${currentVersion}. Update available${latestVersion ? `: v${latestVersion}` : ''}. Click for update instructions.`
+                      : `Freshell v${currentVersion}. Up to date.`
+                  }
+                  data-testid="app-brand-status"
+                >
+                  <span className="truncate">🐚🔥freshell</span>
+                  {updateAvailable && <AlertCircle className="h-3.5 w-3.5" aria-hidden="true" />}
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                {updateAvailable ? (
+                  <div>
+                    <div>v{currentVersion} - {latestVersion ? `v${latestVersion} available` : 'update available'}</div>
+                    <div className="text-muted-foreground">Click for update instructions</div>
+                  </div>
+                ) : (
+                  <div>v{currentVersion} (up to date)</div>
+                )}
+              </TooltipContent>
+            </Tooltip>
+          ) : (
+            <span className="font-mono min-w-0 text-sm font-semibold tracking-tight whitespace-nowrap truncate">🐚🔥freshell</span>
+          )}
+        </div>
       </div>
 
       {/* Search */}

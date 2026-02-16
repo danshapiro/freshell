@@ -48,8 +48,23 @@ vi.mock('@/components/TabContent', () => ({
 }))
 
 vi.mock('@/components/Sidebar', () => ({
-  default: ({ view, fullWidth }: { view: string; fullWidth?: boolean }) => (
+  default: ({
+    view,
+    fullWidth,
+    onToggleSidebar,
+  }: {
+    view: string
+    fullWidth?: boolean
+    onToggleSidebar?: () => void
+  }) => (
     <div data-testid="mock-sidebar" data-view={view} data-full-width={fullWidth ? 'true' : 'false'}>
+      <button
+        title="Hide sidebar"
+        onClick={() => onToggleSidebar?.()}
+        className="min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center"
+      >
+        Hide sidebar
+      </button>
       Sidebar
     </div>
   ),
@@ -157,6 +172,7 @@ describe('App Header - Mobile Touch Targets', () => {
 
   afterEach(() => {
     cleanup()
+    ;(globalThis as any).setMobileForTest(false)
   })
 
   it('sidebar toggle button has 44px mobile touch target classes', () => {
@@ -168,19 +184,16 @@ describe('App Header - Mobile Touch Targets', () => {
     expect(sidebarToggle.className).toContain('min-w-11')
   })
 
-  it('all header buttons have mobile touch target and centering classes', () => {
+  it('show-sidebar button has mobile touch target and centering classes when collapsed', async () => {
+    ;(globalThis as any).setMobileForTest(true)
     renderApp()
 
-    const themeButton = screen.getByTitle(/^Theme:/)
-    const shareButton = screen.getByTitle('Share LAN access')
-
-    for (const button of [themeButton, shareButton]) {
-      expect(button.className).toContain('min-h-11')
-      expect(button.className).toContain('min-w-11')
-      expect(button.className).toContain('flex')
-      expect(button.className).toContain('items-center')
-      expect(button.className).toContain('justify-center')
-    }
+    const showButton = await screen.findByTitle('Show sidebar')
+    expect(showButton.className).toContain('min-h-11')
+    expect(showButton.className).toContain('min-w-11')
+    expect(showButton.className).toContain('flex')
+    expect(showButton.className).toContain('items-center')
+    expect(showButton.className).toContain('justify-center')
   })
 
   it('header buttons restore desktop sizing with md: breakpoint classes', () => {

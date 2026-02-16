@@ -176,27 +176,22 @@ describe('App - Swipe Sidebar Gesture', () => {
       expect(screen.getByTitle('Show sidebar')).toBeInTheDocument()
     })
 
-    // The main content area (flex-1 min-h-0 flex relative) should have touch-action style
-    // Find by the data attribute or structure - it's the parent of the mobile overlay area
-    const mainContentArea = screen.getByTitle('Show sidebar')
-      .closest('.h-full')
-      ?.querySelector('.flex-1.min-h-0.flex.relative')
+    // The main content area should have touch-action style on mobile.
+    const mainContentArea = screen.getByTestId('app-main-content')
 
     expect(mainContentArea).toBeTruthy()
-    expect((mainContentArea as HTMLElement).style.touchAction).toBe('pan-y')
+    expect(mainContentArea.style.touchAction).toBe('pan-y')
   })
 
   it('does not apply touch-action on desktop viewport', () => {
     // Default is desktop (matchMedia matches=false)
     renderApp()
 
-    const mainContentArea = screen.getByTitle('Hide sidebar')
-      .closest('.h-full')
-      ?.querySelector('.flex-1.min-h-0.flex.relative')
+    const mainContentArea = screen.getByTestId('app-main-content')
 
     expect(mainContentArea).toBeTruthy()
     // On desktop, no inline style is applied, so touchAction should not be 'pan-y'
-    const touchAction = (mainContentArea as HTMLElement).style?.touchAction
+    const touchAction = mainContentArea.style?.touchAction
     expect(touchAction).not.toBe('pan-y')
   })
 

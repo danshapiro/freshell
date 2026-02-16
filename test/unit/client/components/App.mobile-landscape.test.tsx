@@ -120,7 +120,7 @@ describe('App mobile landscape mode', () => {
     Object.defineProperty(window, 'innerHeight', { value: originalInnerHeight, configurable: true })
   })
 
-  it('uses compact top status bar in mobile landscape terminal view', () => {
+  it('shows the collapsed sidebar opener and no top status bar in mobile landscape terminal view', () => {
     const store = createStore()
     render(
       <Provider store={store}>
@@ -128,8 +128,9 @@ describe('App mobile landscape mode', () => {
       </Provider>
     )
 
-    expect(screen.getByText('freshell')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Enter fullscreen' })).toBeInTheDocument()
+    expect(screen.getByTitle('Show sidebar')).toBeInTheDocument()
+    expect(screen.queryByText('freshell')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Enter fullscreen' })).not.toBeInTheDocument()
     expect(screen.queryByTitle('Hide sidebar')).not.toBeInTheDocument()
   })
 

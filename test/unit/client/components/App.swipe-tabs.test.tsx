@@ -186,14 +186,12 @@ describe('App - Swipe Tab Switching Gesture', () => {
     })
 
     // The inner content wrapper is .flex-1.min-w-0.flex.flex-col inside the main content area
-    const mainContentArea = screen.getByTitle('Show sidebar')
-      .closest('.h-full')
-      ?.querySelector('.flex-1.min-h-0.flex.relative')
+    const mainContentArea = screen.getByTestId('app-main-content')
 
     expect(mainContentArea).toBeTruthy()
 
     // The inner wrapper is the child div with flex-col class
-    const innerContentWrapper = mainContentArea!.querySelector('.flex-1.min-w-0.flex.flex-col')
+    const innerContentWrapper = mainContentArea.querySelector('.flex-1.min-w-0.flex.flex-col')
     expect(innerContentWrapper).toBeTruthy()
     expect((innerContentWrapper as HTMLElement).style.touchAction).toBe('pan-y')
   })
@@ -202,13 +200,11 @@ describe('App - Swipe Tab Switching Gesture', () => {
     const store = createTestStore({ sidebarCollapsed: false })
     renderApp(store)
 
-    const mainContentArea = screen.getByTitle('Hide sidebar')
-      .closest('.h-full')
-      ?.querySelector('.flex-1.min-h-0.flex.relative')
+    const mainContentArea = screen.getByTestId('app-main-content')
 
     expect(mainContentArea).toBeTruthy()
 
-    const innerContentWrapper = mainContentArea!.querySelector('.flex-1.min-w-0.flex.flex-col')
+    const innerContentWrapper = mainContentArea.querySelector('.flex-1.min-w-0.flex.flex-col')
     expect(innerContentWrapper).toBeTruthy()
     const touchAction = (innerContentWrapper as HTMLElement).style?.touchAction
     expect(touchAction).not.toBe('pan-y')
@@ -324,9 +320,7 @@ describe('App - Swipe Tab Switching Gesture', () => {
       expect(screen.getByTitle('Show sidebar')).toBeInTheDocument()
     })
 
-    const mainContentArea = screen.getByTitle('Show sidebar')
-      .closest('.h-full')
-      ?.querySelector('.flex-1.min-h-0.flex.relative') as HTMLElement
+    const mainContentArea = screen.getByTestId('app-main-content') as HTMLElement
 
     const innerContentWrapper = mainContentArea
       ?.querySelector('.flex-1.min-w-0.flex.flex-col') as HTMLElement
