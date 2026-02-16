@@ -313,34 +313,80 @@ function getWslMountPrefix(): string {
   return '/mnt'
 }
 
+const WINDOWS_DRIVE_PREFIX_RE = /^[A-Za-z]:([\\/]|$)/
+const WINDOWS_UNC_PREFIX_RE = /^\\\\[^\\]+\\[^\\]+/
+const WINDOWS_ROOTED_PREFIX_RE = /^\\(?!\\)/
+
+function isWindowsAbsolutePath(input: string): boolean {
+  return WINDOWS_DRIVE_PREFIX_RE.test(input) || WINDOWS_UNC_PREFIX_RE.test(input) || WINDOWS_ROOTED_PREFIX_RE.test(input)
+}
+
+function escapeRegex(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function convertWslDrivePathToWindows(input: string): string | undefined {
+  const normalized = input.replace(/\\/g, '/')
+  const mountPrefix = getWslMountPrefix()
+  const prefixes = new Set([mountPrefix, '/mnt'])
+
+  for (const prefix of prefixes) {
+    const match = prefix
+      ? normalized.match(new RegExp(`^${escapeRegex(prefix)}/([a-zA-Z])(?:/(.*))?$`))
+      : normalized.match(/^\/([a-zA-Z])(?:\/(.*))?$/)
+    if (!match) continue
+    const drive = `${match[1].toUpperCase()}:`
+    const rest = match[2]?.replace(/\//g, '\\')
+    return rest ? `${drive}\\${rest}` : `${drive}\\`
+  }
+  return undefined
+}
+
+function resolveWindowsShellCwd(cwd: string | undefined): string | undefined {
+  if (!cwd) return undefined
+  const candidate = cwd.trim()
+  if (!candidate) return undefined
+
+  if (isLinuxPath(candidate)) {
+    return convertWslDrivePathToWindows(candidate)
+  }
+
+  if (WINDOWS_UNC_PREFIX_RE.test(candidate)) {
+    return undefined
+  }
+
+  if (isWindowsAbsolutePath(candidate) || !isWsl()) {
+    return path.win32.resolve(candidate)
+  }
+  return undefined
+}
+
 /**
  * Get a sensible default working directory for Windows shells.
  * On native Windows: user's home directory (C:\Users\<username>)
- * In WSL: Windows user profile converted to WSL path, falling back to C:\
+ * In WSL: a Windows-native drive path (USERPROFILE, HOME drive, or SYSTEMDRIVE root)
  *
  * This avoids UNC paths (\\wsl.localhost\...) which cmd.exe doesn't support.
- * Respects custom WSL mount configurations via WSL_WINDOWS_SYS32.
  */
 function getWindowsDefaultCwd(): string {
   if (isWindows()) {
     return os.homedir()
   }
-  // In WSL, we need a Windows-accessible path
-  const mountPrefix = getWslMountPrefix()
 
-  // Try USERPROFILE if it's shared via WSLENV, convert to WSL mount path
   const userProfile = process.env.USERPROFILE
-  if (userProfile) {
-    // Convert Windows path (C:\Users\name) to WSL path (/mnt/c/Users/name)
-    const match = userProfile.match(/^([A-Za-z]):\\(.*)$/)
-    if (match) {
-      const drive = match[1].toLowerCase()
-      const rest = match[2].replace(/\\/g, '/')
-      return `${mountPrefix}/${drive}/${rest}`
-    }
+  if (userProfile?.trim()) {
+    const resolved = resolveWindowsShellCwd(userProfile)
+    if (resolved) return resolved
   }
-  // Fallback: use C:\ root
-  return `${mountPrefix}/c`
+
+  const homeDrive = process.env.HOMEDRIVE
+  const homePath = process.env.HOMEPATH
+  if (homeDrive && homePath) {
+    return path.win32.resolve(`${homeDrive}${homePath}`)
+  }
+
+  const systemDrive = process.env.SYSTEMDRIVE || 'C:'
+  return path.win32.resolve(`${systemDrive}\\`)
 }
 
 /**
@@ -533,7 +579,9 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
       // In WSL, we can't pass Linux paths as cwd to Windows executables (they become UNC paths)
       // Instead, pass no cwd and use cd /d inside the command
       const inWsl = isWsl()
-      const winCwd = inWsl ? getWindowsDefaultCwd() : (isLinuxPath(cwd) ? undefined : cwd)
+      const winCwd = inWsl
+        ? (resolveWindowsShellCwd(cwd) || getWindowsDefaultCwd())
+        : (isLinuxPath(cwd) ? undefined : cwd)
       // For WSL: don't pass cwd to node-pty, use cd /d in command instead
       const procCwd = inWsl ? undefined : winCwd
       logger.debug({
@@ -562,7 +610,9 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
     const file = getWindowsExe('powershell')
     // In WSL, we can't pass Linux paths as cwd to Windows executables (they become UNC paths)
     const inWsl = isWsl()
-    const winCwd = inWsl ? getWindowsDefaultCwd() : (isLinuxPath(cwd) ? undefined : cwd)
+    const winCwd = inWsl
+      ? (resolveWindowsShellCwd(cwd) || getWindowsDefaultCwd())
+      : (isLinuxPath(cwd) ? undefined : cwd)
     const procCwd = inWsl ? undefined : winCwd
     logger.debug({
       shell: 'powershell',
