@@ -1157,11 +1157,17 @@ export class WsHandler {
             }
           }
 
+          const cfg = await awaitConfig()
+          const providerSettings = m.mode !== 'shell'
+            ? cfg.settings?.codingCli?.providers?.[m.mode as keyof typeof cfg.settings.codingCli.providers] || {}
+            : undefined
+
           const record = this.registry.create({
             mode: m.mode as TerminalMode,
             shell: m.shell as 'system' | 'cmd' | 'powershell' | 'wsl',
             cwd: m.cwd,
             resumeSessionId: effectiveResumeSessionId,
+            providerSettings: providerSettings ? { permissionMode: providerSettings.permissionMode } : undefined,
           })
 
           if (m.mode !== 'shell' && typeof m.cwd === 'string' && m.cwd.trim()) {

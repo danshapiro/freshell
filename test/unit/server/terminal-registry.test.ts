@@ -779,6 +779,76 @@ describe('buildSpawnSpec Unix paths', () => {
     })
   })
 
+  describe('provider settings in spawn spec', () => {
+    beforeEach(() => {
+      mockPlatform('darwin')
+    })
+
+    it('includes --permission-mode flag for claude when provided', () => {
+      delete process.env.CLAUDE_CMD
+
+      const spec = buildSpawnSpec('claude', '/Users/john/project', 'system', undefined, {
+        permissionMode: 'bypassPermissions',
+      })
+
+      expect(spec.args).toContain('--permission-mode')
+      expect(spec.args).toContain('bypassPermissions')
+      const idx = spec.args.indexOf('--permission-mode')
+      expect(spec.args[idx + 1]).toBe('bypassPermissions')
+    })
+
+    it('includes --permission-mode flag for acceptEdits mode', () => {
+      delete process.env.CLAUDE_CMD
+
+      const spec = buildSpawnSpec('claude', '/Users/john/project', 'system', undefined, {
+        permissionMode: 'acceptEdits',
+      })
+
+      const idx = spec.args.indexOf('--permission-mode')
+      expect(idx).toBeGreaterThan(-1)
+      expect(spec.args[idx + 1]).toBe('acceptEdits')
+    })
+
+    it('omits --permission-mode flag when not provided', () => {
+      delete process.env.CLAUDE_CMD
+
+      const spec = buildSpawnSpec('claude', '/Users/john/project', 'system')
+
+      expect(spec.args).not.toContain('--permission-mode')
+    })
+
+    it('omits --permission-mode flag when set to default', () => {
+      delete process.env.CLAUDE_CMD
+
+      const spec = buildSpawnSpec('claude', '/Users/john/project', 'system', undefined, {
+        permissionMode: 'default',
+      })
+
+      expect(spec.args).not.toContain('--permission-mode')
+    })
+
+    it('omits --permission-mode for shell mode even if provided', () => {
+      const spec = buildSpawnSpec('shell', '/Users/john/project', 'system', undefined, {
+        permissionMode: 'bypassPermissions',
+      })
+
+      expect(spec.args).not.toContain('--permission-mode')
+    })
+
+    it('combines --permission-mode with --resume when both provided', () => {
+      delete process.env.CLAUDE_CMD
+
+      const spec = buildSpawnSpec('claude', '/Users/john/project', 'system', VALID_CLAUDE_SESSION_ID, {
+        permissionMode: 'bypassPermissions',
+      })
+
+      expect(spec.args).toContain('--permission-mode')
+      expect(spec.args).toContain('bypassPermissions')
+      expect(spec.args).toContain('--resume')
+      expect(spec.args).toContain(VALID_CLAUDE_SESSION_ID)
+    })
+  })
+
   describe('environment variables in spawn spec', () => {
     beforeEach(() => {
       mockPlatform('darwin')
