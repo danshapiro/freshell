@@ -182,12 +182,4 @@ describe('TabItem', () => {
     const el = getTabElement()
     expect(el?.className).not.toContain('mt-1')
   })
-
-  it('renders a baseline seam under inactive tabs', () => {
-    render(<TabItem {...defaultProps} isActive={false} />)
-    const el = getTabElement()
-    expect(el?.className).toContain('after:-bottom-px')
-    expect(el?.className).toContain('after:h-px')
-    expect(el?.className).toContain('after:bg-muted-foreground/45')
-  })
 })

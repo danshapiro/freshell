@@ -116,17 +116,14 @@ export default function TabItem({
               ),
               needsAttention && tabAttentionStyle === 'pulse' && 'animate-pulse'
             )
-          : cn(
-              "after:pointer-events-none after:absolute after:inset-x-0 after:-bottom-px after:h-px after:bg-muted-foreground/45 after:content-['']",
-              needsAttention && tabAttentionStyle !== 'none'
-                ? tabAttentionStyle === 'darken'
-                  ? 'bg-foreground/15 text-foreground hover:bg-foreground/20 dark:bg-foreground/20 dark:text-foreground dark:hover:bg-foreground/25'
-                  : cn(
-                      'bg-emerald-100 text-emerald-900 hover:bg-emerald-200 dark:bg-emerald-900/40 dark:text-emerald-100 dark:hover:bg-emerald-900/55',
-                      tabAttentionStyle === 'pulse' && 'animate-pulse'
-                    )
-                : 'bg-muted text-muted-foreground hover:text-foreground hover:bg-muted/90'
-            ),
+          : needsAttention && tabAttentionStyle !== 'none'
+            ? tabAttentionStyle === 'darken'
+              ? 'bg-foreground/15 text-foreground hover:bg-foreground/20 dark:bg-foreground/20 dark:text-foreground dark:hover:bg-foreground/25'
+              : cn(
+                  'bg-emerald-100 text-emerald-900 hover:bg-emerald-200 dark:bg-emerald-900/40 dark:text-emerald-100 dark:hover:bg-emerald-900/55',
+                  tabAttentionStyle === 'pulse' && 'animate-pulse'
+                )
+            : 'bg-muted text-muted-foreground hover:text-foreground hover:bg-muted/90',
         isDragging && 'opacity-50'
       )}
       role="button"
