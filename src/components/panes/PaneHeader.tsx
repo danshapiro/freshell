@@ -65,7 +65,7 @@ export default function PaneHeader({
   return (
     <div
       className={cn(
-        'flex items-center gap-2 h-7 px-2 text-sm border-b border-border shrink-0',
+        'flex items-center gap-2 h-[2.625rem] sm:h-7 px-2 text-sm border-b border-border shrink-0',
         needsAttention
           ? 'bg-emerald-50 border-l-2 border-l-emerald-500 dark:bg-emerald-900/30'
           : isActive ? 'bg-muted' : 'bg-muted/50 text-muted-foreground'
@@ -95,7 +95,7 @@ export default function PaneHeader({
         )}
       </div>
 
-      <div className="ml-auto flex items-center gap-2">
+      <div className="ml-auto flex h-full items-center gap-2">
         {metaLabel && (
           <span
             className="max-w-[18rem] truncate text-xs text-muted-foreground text-right"
@@ -111,11 +111,11 @@ export default function PaneHeader({
               e.stopPropagation()
               onSearch()
             }}
-            className="p-0.5 rounded opacity-60 hover:opacity-100 transition-opacity"
+            className="inline-flex h-6 w-6 items-center justify-center rounded opacity-60 hover:opacity-100 transition-opacity sm:h-4 sm:w-4"
             title="Search in terminal"
             aria-label="Search in terminal"
           >
-            <Search className="h-3 w-3" />
+            <Search className="h-[18px] w-[18px] sm:h-3 sm:w-3" />
           </button>
         )}
 
@@ -125,11 +125,13 @@ export default function PaneHeader({
               e.stopPropagation()
               onToggleZoom()
             }}
-            className="p-0.5 rounded opacity-60 hover:opacity-100 transition-opacity"
+            className="inline-flex h-6 w-6 items-center justify-center rounded opacity-60 hover:opacity-100 transition-opacity sm:h-4 sm:w-4"
             title={isZoomed ? 'Restore pane' : 'Maximize pane'}
             aria-label={isZoomed ? 'Restore pane' : 'Maximize pane'}
           >
-            {isZoomed ? <Minimize2 className="h-3 w-3" /> : <Maximize2 className="h-3 w-3" />}
+            {isZoomed
+              ? <Minimize2 className="h-[18px] w-[18px] sm:h-3 sm:w-3" />
+              : <Maximize2 className="h-[18px] w-[18px] sm:h-3 sm:w-3" />}
           </button>
         )}
 
@@ -139,10 +141,10 @@ export default function PaneHeader({
             e.stopPropagation()
             onClose()
           }}
-          className="p-0.5 rounded opacity-60 hover:opacity-100 hover:bg-background/50 transition-opacity"
+          className="inline-flex h-6 w-6 items-center justify-center rounded opacity-60 hover:opacity-100 hover:bg-background/50 transition-opacity sm:h-4 sm:w-4"
           title="Close pane"
         >
-          <X className="h-3 w-3" />
+          <X className="h-[18px] w-[18px] sm:h-3 sm:w-3" />
         </button>
       </div>
     </div>
