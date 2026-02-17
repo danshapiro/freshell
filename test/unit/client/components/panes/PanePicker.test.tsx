@@ -148,6 +148,21 @@ describe('PanePicker', () => {
       expect(screen.queryByRole('button', { name: 'Codex' })).not.toBeInTheDocument()
     })
 
+    it('renders provider icons as inline SVGs (not img tags)', () => {
+      renderPicker({
+        availableClis: { claude: true, codex: true },
+        enabledProviders: ['claude', 'codex'],
+      })
+      const claudeButton = screen.getByRole('button', { name: 'Claude' })
+      const codexButton = screen.getByRole('button', { name: 'Codex' })
+
+      // Should render inline SVGs that inherit color, not <img> tags
+      expect(claudeButton.querySelector('svg')).toBeInTheDocument()
+      expect(claudeButton.querySelector('img')).not.toBeInTheDocument()
+      expect(codexButton.querySelector('svg')).toBeInTheDocument()
+      expect(codexButton.querySelector('img')).not.toBeInTheDocument()
+    })
+
     it('renders options in correct order: CLIs, Editor, Browser, Shell', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },

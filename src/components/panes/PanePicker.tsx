@@ -1,18 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { ComponentType, SVGProps } from 'react'
 import { Terminal, Globe, FileText } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAppSelector } from '@/store/hooks'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { CODING_CLI_PROVIDER_CONFIGS, type CodingCliProviderConfig } from '@/lib/coding-cli-utils'
+import { ProviderIcon } from '@/components/icons/provider-icons'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 
 export type PanePickerType = 'shell' | 'cmd' | 'powershell' | 'wsl' | 'browser' | 'editor' | CodingCliProviderName
 
+type IconComponent = ComponentType<{ className?: string } & SVGProps<SVGSVGElement>>
+
 interface PickerOption {
   type: PanePickerType
   label: string
-  icon: typeof Terminal | null
-  iconUrl?: string
+  icon: IconComponent | null
+  providerName?: CodingCliProviderName
   shortcut: string
 }
 
@@ -41,8 +45,8 @@ function cliConfigToOption(config: CodingCliProviderConfig): PickerOption {
   return {
     type: config.name,
     label: config.label,
-    icon: config.iconUrl ? null : Terminal,
-    iconUrl: config.iconUrl,
+    icon: null,
+    providerName: config.name,
     shortcut: CLI_SHORTCUTS[config.name] ?? config.name[0].toUpperCase(),
   }
 }
@@ -190,10 +194,9 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
               'opacity-50 hover:scale-105'
             )}
           >
-            {option.iconUrl ? (
-              <img
-                src={option.iconUrl}
-                alt={option.label}
+            {option.providerName ? (
+              <ProviderIcon
+                provider={option.providerName}
                 className="h-6 w-6 @[250px]:h-8 @[250px]:w-8 @[400px]:h-12 @[400px]:w-12"
               />
             ) : option.icon ? (
