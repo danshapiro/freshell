@@ -105,7 +105,9 @@ function resolveMobileToolbarInput(keyId: Exclude<MobileToolbarKeyId, 'ctrl'>, c
   if (keyId === 'up') return '\u001b[A'
   if (keyId === 'down') return '\u001b[B'
   if (keyId === 'right') return '\u001b[C'
-  return '\u001b[D'
+  if (keyId === 'left') return '\u001b[D'
+  const unreachableKey: never = keyId
+  throw new Error(`Unsupported mobile toolbar key: ${unreachableKey}`)
 }
 
 export default function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps) {
@@ -1251,7 +1253,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
     return {
       touchAction: 'none' as const,
-      ...(mobileBottomInsetPx > 0 ? { height: `calc(100% - ${mobileBottomInsetPx}px)` } : {}),
+      height: `calc(100% - ${mobileBottomInsetPx}px)`,
     }
   }, [isMobile, mobileBottomInsetPx])
 
