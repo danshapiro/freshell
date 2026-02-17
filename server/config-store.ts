@@ -204,7 +204,7 @@ const RENAME_RETRY_DELAYS_MS = [10, 25, 50, 100, 200]
 function isRetryableRenameError(err: unknown): err is NodeJS.ErrnoException {
   if (!err || typeof err !== 'object') return false
   const code = (err as NodeJS.ErrnoException).code
-  return code === 'EPERM' || code === 'EACCES' || code === 'EBUSY'
+  return code === 'EPERM' || code === 'EACCES' || code === 'EBUSY' || code === 'ENOENT'
 }
 
 async function delay(ms: number) {

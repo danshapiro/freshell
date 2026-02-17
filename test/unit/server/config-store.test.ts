@@ -339,6 +339,36 @@ describe('ConfigStore', () => {
 
       renameSpy.mockRestore()
     })
+
+    it('retries rename when atomic write hits ENOENT', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      const originalRename = fsp.rename.bind(fsp)
+      let attempts = 0
+      const renameSpy = vi.spyOn(fsp, 'rename').mockImplementation(async (...args) => {
+        attempts += 1
+        if (attempts === 1) {
+          const err = new Error('ENOENT: no such file or directory') as NodeJS.ErrnoException
+          err.code = 'ENOENT'
+          throw err
+        }
+        return originalRename(...(args as Parameters<typeof fsp.rename>))
+      })
+
+      const config: UserConfig = {
+        version: 1,
+        settings: { ...defaultSettings, theme: 'dark' },
+        sessionOverrides: {},
+        terminalOverrides: {},
+        projectColors: {},
+      }
+
+      await store.save(config)
+      expect(attempts).toBeGreaterThan(1)
+
+      renameSpy.mockRestore()
+    })
   })
 
   describe('config backup behavior', () => {
