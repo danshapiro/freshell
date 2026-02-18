@@ -136,7 +136,8 @@ describe('ToolBlock', () => {
           status="running"
         />
       )
-      expect(screen.getByText(SCRIPT_PAYLOAD)).toBeInTheDocument()
+      // The tool name renders as "{name}:" so use substring match
+      expect(screen.getByText(SCRIPT_PAYLOAD, { exact: false })).toBeInTheDocument()
       expect(container.querySelector('script')).toBeNull()
     })
 
