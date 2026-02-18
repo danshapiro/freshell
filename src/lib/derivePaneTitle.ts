@@ -17,6 +17,10 @@ export function derivePaneTitle(content: PaneContent): string {
     return parts[parts.length - 1] || 'Editor'
   }
 
+  if (content.kind === 'claude-chat') {
+    return 'freshclaude'
+  }
+
   if (content.kind === 'browser') {
     if (!content.url) return 'Browser'
     try {

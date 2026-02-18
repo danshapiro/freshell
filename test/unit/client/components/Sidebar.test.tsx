@@ -1476,4 +1476,179 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(mockSearchSessions).not.toHaveBeenCalled()
     })
   })
+
+  describe('sidebar click opens pane', () => {
+    it('splits a new pane in the current tab when clicking a session', async () => {
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: sessionId('session-to-split'),
+              projectPath: '/home/user/project',
+              updatedAt: Date.now(),
+              title: 'Session to split',
+              cwd: '/home/user/project',
+            },
+          ],
+        },
+      ]
+
+      const tabs = [
+        {
+          id: 'tab-1',
+          mode: 'shell' as const,
+        },
+      ]
+
+      const store = createTestStore({ projects, tabs, activeTabId: 'tab-1' })
+      const { onNavigate } = renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const sessionButton = screen.getByText('Session to split').closest('button')
+      fireEvent.click(sessionButton!)
+
+      expect(onNavigate).toHaveBeenCalledWith('terminal')
+
+      // Should NOT create a new tab
+      const state = store.getState()
+      expect(state.tabs.tabs).toHaveLength(1)
+
+      // The layout should now be a split with two panes
+      const layout = state.panes.layouts['tab-1']
+      expect(layout.type).toBe('split')
+      if (layout.type === 'split') {
+        const leaves = [layout.children[0], layout.children[1]]
+        const sessionPane = leaves.find(
+          (child) =>
+            child.type === 'leaf' &&
+            child.content.kind === 'terminal' &&
+            child.content.resumeSessionId === sessionId('session-to-split')
+        )
+        expect(sessionPane).toBeDefined()
+      }
+    })
+
+    it('focuses existing pane when clicking a session already open in another tab', async () => {
+      const targetSessionId = sessionId('session-already-in-pane')
+
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: targetSessionId,
+              projectPath: '/home/user/project',
+              updatedAt: Date.now(),
+              title: 'Already in pane',
+              cwd: '/home/user/project',
+            },
+          ],
+        },
+      ]
+
+      const tabs = [
+        { id: 'tab-1', mode: 'shell' as const },
+        { id: 'tab-2', mode: 'claude' as const },
+      ]
+
+      const panes = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'shell',
+              createRequestId: 'req-1',
+              status: 'running',
+            },
+          },
+          'tab-2': {
+            type: 'leaf',
+            id: 'pane-2',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              createRequestId: 'req-2',
+              status: 'running',
+              resumeSessionId: targetSessionId,
+            },
+          },
+        },
+        activePane: {
+          'tab-1': 'pane-1',
+          'tab-2': 'pane-2',
+        },
+        paneTitles: {},
+      }
+
+      const store = createTestStore({ projects, tabs, panes, activeTabId: 'tab-1' })
+      const { onNavigate } = renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const sessionButton = screen.getByText('Already in pane').closest('button')
+      fireEvent.click(sessionButton!)
+
+      expect(onNavigate).toHaveBeenCalledWith('terminal')
+
+      // Should switch to the tab containing the session, not create a new one
+      const state = store.getState()
+      expect(state.tabs.tabs).toHaveLength(2)
+      expect(state.tabs.activeTabId).toBe('tab-2')
+      expect(state.panes.activePane['tab-2']).toBe('pane-2')
+    })
+
+    it('falls back to creating a new tab when active tab has no layout', async () => {
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: sessionId('session-no-layout'),
+              projectPath: '/home/user/project',
+              updatedAt: Date.now(),
+              title: 'No layout tab',
+              cwd: '/home/user/project',
+            },
+          ],
+        },
+      ]
+
+      const tabs = [
+        { id: 'tab-1', mode: 'claude' as const },
+      ]
+
+      // Active tab exists but has no layout
+      const panes = {
+        layouts: {},
+        activePane: {},
+        paneTitles: {},
+      }
+
+      const store = createTestStore({ projects, tabs, panes, activeTabId: 'tab-1' })
+      const { onNavigate } = renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const sessionButton = screen.getByText('No layout tab').closest('button')
+      fireEvent.click(sessionButton!)
+
+      expect(onNavigate).toHaveBeenCalledWith('terminal')
+
+      // Should create a new tab since active tab has no layout
+      const state = store.getState()
+      expect(state.tabs.tabs).toHaveLength(2)
+      const newTab = state.tabs.tabs.find((t: any) => t.resumeSessionId === sessionId('session-no-layout'))
+      expect(newTab).toBeDefined()
+    })
+  })
 })

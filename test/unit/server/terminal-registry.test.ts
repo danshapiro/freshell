@@ -1300,7 +1300,7 @@ describe('buildSpawnSpec WSL paths', () => {
   describe('cwd handling for Windows shells in WSL', () => {
     // In WSL, we can't pass Linux paths to node-pty for Windows executables
     // (they become UNC paths which cmd.exe rejects). Instead, we pass cwd: undefined
-    // to node-pty and use cd /d or Set-Location commands in the args.
+    // to node-pty and pass a Windows drive path via cd /d or Set-Location.
 
     it('uses cd command for cmd.exe with Linux path in WSL', () => {
       mockWsl()
@@ -1311,7 +1311,7 @@ describe('buildSpawnSpec WSL paths', () => {
       expect(spec.cwd).toBeUndefined()
       // Directory change should be in the command args
       expect(spec.args).toContain('/K')
-      expect(spec.args.some(arg => arg.includes('cd /d "/mnt/c"'))).toBe(true)
+      expect(spec.args.some(arg => arg.includes('cd /d "C:'))).toBe(true)
     })
 
     it('uses Set-Location for powershell.exe with Linux path in WSL', () => {
@@ -1323,7 +1323,7 @@ describe('buildSpawnSpec WSL paths', () => {
       expect(spec.cwd).toBeUndefined()
       // Directory change should be in the command args
       expect(spec.args).toContain('-NoLogo')
-      expect(spec.args.some(arg => arg.includes('Set-Location') && arg.includes('/mnt/c'))).toBe(true)
+      expect(spec.args.some(arg => arg.includes('Set-Location') && arg.includes("'C:\\"))).toBe(true)
     })
 
     it('uses USERPROFILE for Windows default cwd in cmd args when available in WSL', () => {
@@ -1334,38 +1334,40 @@ describe('buildSpawnSpec WSL paths', () => {
 
       // cwd undefined, path in args
       expect(spec.cwd).toBeUndefined()
-      expect(spec.args.some(arg => arg.includes('cd /d "/mnt/c/Users/testuser"'))).toBe(true)
+      expect(spec.args.some(arg => arg.includes('cd /d "C:\\Users\\testuser"'))).toBe(true)
 
       delete process.env.USERPROFILE
     })
 
-    it('respects custom WSL mount prefix from WSL_WINDOWS_SYS32 in cmd args', () => {
+    it('converts standard /mnt drive paths to Windows drive paths for cmd', () => {
       mockWsl()
-      // Custom mount root (drives at root: /c instead of /mnt/c)
-      process.env.WSL_WINDOWS_SYS32 = '/c/Windows/System32'
 
-      const spec = buildSpawnSpec('shell', '/home/user/project', 'cmd')
+      const spec = buildSpawnSpec('shell', '/mnt/d/projects/demo', 'cmd')
 
-      // With drives at root, mount prefix is empty, so C:\ is /c
       expect(spec.cwd).toBeUndefined()
-      expect(spec.args.some(arg => arg.includes('cd /d "/c"'))).toBe(true)
-
-      delete process.env.WSL_WINDOWS_SYS32
+      expect(spec.args.some(arg => arg.includes('cd /d "D:\\projects\\demo"'))).toBe(true)
     })
 
-    it('respects custom WSL mount prefix when converting USERPROFILE in powershell args', () => {
+    it('respects custom WSL mount prefix when converting WSL cwd for powershell args', () => {
       mockWsl()
       process.env.WSL_WINDOWS_SYS32 = '/win/c/Windows/System32'
-      process.env.USERPROFILE = 'D:\\Users\\testuser'
 
-      const spec = buildSpawnSpec('shell', '/home/user/project', 'powershell')
+      const spec = buildSpawnSpec('shell', '/win/d/Users/testuser', 'powershell')
 
-      // Should use custom mount prefix for USERPROFILE conversion in args
       expect(spec.cwd).toBeUndefined()
-      expect(spec.args.some(arg => arg.includes('Set-Location') && arg.includes('/win/d/Users/testuser'))).toBe(true)
+      expect(spec.args.some(arg => arg.includes("Set-Location") && arg.includes("'D:\\Users\\testuser'"))).toBe(true)
 
       delete process.env.WSL_WINDOWS_SYS32
-      delete process.env.USERPROFILE
+    })
+
+    it('uses provided Windows paths directly when shell is cmd in WSL', () => {
+      mockWsl()
+
+      const spec = buildSpawnSpec('codex', 'D:\\users\\dan', 'cmd')
+
+      expect(spec.cwd).toBeUndefined()
+      expect(spec.args).toContain('/K')
+      expect(spec.args.some(arg => arg.includes('cd /d "D:\\users\\dan"'))).toBe(true)
     })
   })
 
@@ -1388,6 +1390,27 @@ describe('buildSpawnSpec WSL paths', () => {
 
       expect(spec.file).toBe('codex')
       expect(spec.cwd).toBe('/home/user/project')
+    })
+
+    it('converts Windows cwd to WSL path for codex in WSL system shell', () => {
+      mockWsl()
+      delete process.env.CODEX_CMD
+
+      const spec = buildSpawnSpec('codex', String.raw`D:\users\dan\project`, 'system')
+
+      expect(spec.file).toBe('codex')
+      expect(spec.cwd).toBe('/mnt/d/users/dan/project')
+    })
+
+    it('converts Windows cwd to WSL path for shell mode in WSL system shell', () => {
+      mockWsl()
+      process.env.SHELL = '/bin/bash'
+
+      const spec = buildSpawnSpec('shell', String.raw`C:\Users\dan\workspace`, 'system')
+
+      expect(spec.file).toBe('/bin/bash')
+      expect(spec.args).toEqual(['-l'])
+      expect(spec.cwd).toBe('/mnt/c/Users/dan/workspace')
     })
   })
 })
@@ -1417,6 +1440,15 @@ describe('buildSpawnSpec resume validation on Windows shells', () => {
     Object.defineProperty(process, 'platform', { value: 'win32' })
     const spec = buildSpawnSpec('claude', 'C:\\tmp', 'wsl', 'not-a-uuid')
     expect(spec.args).not.toContain('--resume')
+  })
+
+  it('converts Windows cwd to WSL mount path when launching with wsl shell on Windows', () => {
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+    const spec = buildSpawnSpec('claude', String.raw`D:\users\words with spaces`, 'wsl')
+    expect(spec.file).toBe('wsl.exe')
+    const cdIndex = spec.args.indexOf('--cd')
+    expect(cdIndex).toBeGreaterThan(-1)
+    expect(spec.args[cdIndex + 1]).toBe('/mnt/d/users/words with spaces')
   })
 
   it('quotes coding-cli args for cmd.exe to preserve JSON and whitespace', () => {
@@ -1550,14 +1582,14 @@ describe('TerminalRegistry', () => {
       expect(record.resumeSessionId).toBeUndefined()
     })
 
-    it('stores resumeSessionId for shell mode terminals', () => {
+    it('ignores resumeSessionId for shell mode terminals', () => {
       const record = registry.create({
         mode: 'shell',
         cwd: '/home/user/project',
         resumeSessionId: 'shell-session-123',
       })
 
-      expect(record.resumeSessionId).toBe('shell-session-123')
+      expect(record.resumeSessionId).toBeUndefined()
       expect(record.mode).toBe('shell')
     })
   })
@@ -1708,13 +1740,13 @@ describe('TerminalRegistry', () => {
       expect(found).toHaveLength(0)
     })
 
-    it('finds multiple terminals with same resumeSessionId', () => {
-      registry.create({
+    it('enforces one-owner invariant for the same provider/sessionId', () => {
+      const first = registry.create({
         mode: 'claude',
         cwd: '/home/user/project1',
         resumeSessionId: VALID_CLAUDE_SESSION_ID,
       })
-      registry.create({
+      const second = registry.create({
         mode: 'claude',
         cwd: '/home/user/project2',
         resumeSessionId: VALID_CLAUDE_SESSION_ID,
@@ -1722,8 +1754,9 @@ describe('TerminalRegistry', () => {
 
       const found = registry.findTerminalsBySession('claude', VALID_CLAUDE_SESSION_ID)
 
-      expect(found).toHaveLength(2)
-      expect(found.every(t => t.resumeSessionId === VALID_CLAUDE_SESSION_ID)).toBe(true)
+      expect(found).toHaveLength(1)
+      expect(found[0].terminalId).toBe(first.terminalId)
+      expect(second.resumeSessionId).toBeUndefined()
     })
   })
 

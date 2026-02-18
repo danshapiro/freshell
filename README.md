@@ -21,7 +21,7 @@
 ## Features
 
 - **Multi-tab terminal sessions** — Run shell, Claude Code, Codex, and other coding CLIs in parallel tabs
-- **Flexible workspaces** — Arrange terminals, browsers, and code editors side by side in split panes within each tab
+- **Flexible workspaces** — Split any pane right or down, zoom to full-tab, replace content, and snap dividers. Layouts are preserved when you close panes
 - **Detach/reattach** — Background terminals persist across browser sessions; reconnect from any device
 - **Search & browse** — Three-tier search across coding CLI sessions: titles, user messages, and full transcript text
 - **Speak with the dead** — Invoke the spirits of ancient Claudes and ask them what they were thinking
@@ -30,7 +30,8 @@
 - **Dark/light themes** — 8 terminal themes (Dracula, One Dark, Solarized, GitHub, and more) plus system/light/dark app themes
 - **Fancy tabs** — Auto-name from terminal content, drag-and-drop reorder, and per-pane type icons so you know what's in each tab
 - **Context menus** — Right-click menus for tabs, terminals, sessions, projects, and messages with 40+ actions
-- **Activity notifications** — Audio bell and tab badge when a coding CLI finishes its turn, plus alerts when terminals exit in background tabs
+- **Live pane headers** — See your active directory, git branch, and context usage in every pane title bar, updating live as you work
+- **Activity notifications** — Configurable attention indicators (highlight, pulse, darken) on tabs and pane headers when a coding CLI finishes its turn, with click or type dismiss modes
 - **Mobile responsive** — Auto-collapsing sidebar and overlay navigation for phones and tablets
 - **Auto-update** — Checks for new releases on startup and offers one-key upgrade
 
@@ -38,7 +39,7 @@
 
 ```bash
 # Clone the repository at the latest stable release
-git clone --branch v0.4.1 https://github.com/danshapiro/freshell.git
+git clone --branch v0.5.0 https://github.com/danshapiro/freshell.git
 cd freshell
 
 # Install dependencies

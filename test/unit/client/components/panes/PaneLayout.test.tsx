@@ -53,6 +53,33 @@ vi.mock('lucide-react', () => ({
   LayoutGrid: ({ className }: { className?: string }) => (
     <svg data-testid="layout-grid-icon" className={className} />
   ),
+  Eye: ({ className }: { className?: string }) => (
+    <svg data-testid="eye-icon" className={className} />
+  ),
+  Pencil: ({ className }: { className?: string }) => (
+    <svg data-testid="pencil-icon" className={className} />
+  ),
+  ChevronRight: ({ className }: { className?: string }) => (
+    <svg data-testid="chevron-right-icon" className={className} />
+  ),
+  Loader2: ({ className }: { className?: string }) => (
+    <svg data-testid="loader-icon" className={className} />
+  ),
+  Check: ({ className }: { className?: string }) => (
+    <svg data-testid="check-icon" className={className} />
+  ),
+  ShieldAlert: ({ className }: { className?: string }) => (
+    <svg data-testid="shield-alert-icon" className={className} />
+  ),
+  Send: ({ className }: { className?: string }) => (
+    <svg data-testid="send-icon" className={className} />
+  ),
+  Square: ({ className }: { className?: string }) => (
+    <svg data-testid="square-icon" className={className} />
+  ),
+  Search: ({ className }: { className?: string }) => (
+    <svg data-testid="search-icon" className={className} />
+  ),
 }))
 
 // Mock PaneIcon to avoid transitive dependency issues
@@ -533,62 +560,6 @@ describe('PaneLayout', () => {
       state = store.getState().panes
       // Should have 3 panes now in a nested structure
       expect(state.activePane['tab-1']).not.toBe(firstNewPaneId)
-    })
-  })
-
-  describe('zoom escape key', () => {
-    it('does not unzoom when tab is hidden (background tab)', () => {
-      const paneId = 'pane-1'
-      const store = createStore({
-        layouts: {
-          'tab-1': {
-            type: 'leaf',
-            id: paneId,
-            content: createTerminalContent(),
-          },
-        },
-        activePane: { 'tab-1': paneId },
-        zoomedPane: { 'tab-1': paneId },
-      })
-
-      renderWithStore(
-        <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} hidden={true} />,
-        store
-      )
-
-      // Press Escape on a hidden (background) tab
-      fireEvent.keyDown(document, { key: 'Escape' })
-
-      // Zoom state should NOT have changed - background tabs ignore Escape
-      const state = store.getState().panes
-      expect(state.zoomedPane['tab-1']).toBe(paneId)
-    })
-
-    it('unzooms when tab is visible (not hidden)', () => {
-      const paneId = 'pane-1'
-      const store = createStore({
-        layouts: {
-          'tab-1': {
-            type: 'leaf',
-            id: paneId,
-            content: createTerminalContent(),
-          },
-        },
-        activePane: { 'tab-1': paneId },
-        zoomedPane: { 'tab-1': paneId },
-      })
-
-      renderWithStore(
-        <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} hidden={false} />,
-        store
-      )
-
-      // Press Escape on a visible tab
-      fireEvent.keyDown(document, { key: 'Escape' })
-
-      // Zoom state should be cleared
-      const state = store.getState().panes
-      expect(state.zoomedPane['tab-1']).toBeUndefined()
     })
   })
 

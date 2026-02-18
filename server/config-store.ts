@@ -24,6 +24,11 @@ class Mutex {
   }
 }
 
+export interface NetworkSettings {
+  host: '127.0.0.1' | '0.0.0.0'
+  configured: boolean
+}
+
 export type AppSettings = {
   theme: 'system' | 'light' | 'dark'
   uiScale: number
@@ -42,8 +47,11 @@ export type AppSettings = {
       | 'solarized-light'
       | 'github-light'
     warnExternalLinks: boolean
+    osc52Clipboard: 'ask' | 'always' | 'never'
+    renderer: 'auto' | 'webgl' | 'canvas'
   }
   defaultCwd?: string
+  allowedFilePaths?: string[]
   logging: {
     debug: boolean
   }
@@ -55,6 +63,7 @@ export type AppSettings = {
     defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor'
     snapThreshold: number // 0-8, % of container's smallest dimension; 0 = off
     tabAttentionStyle: 'highlight' | 'pulse' | 'darken' | 'none'
+    attentionDismiss: 'click' | 'type'
   }
   sidebar: {
     sortMode: 'recency' | 'activity' | 'project'
@@ -63,6 +72,9 @@ export type AppSettings = {
     showNoninteractiveSessions: boolean
     width: number
     collapsed: boolean
+  }
+  notifications: {
+    soundEnabled: boolean
   }
   codingCli: {
     enabledProviders: CodingCliProviderName[]
@@ -74,6 +86,12 @@ export type AppSettings = {
       cwd?: string
     }>>
   }
+  freshclaude?: {
+    defaultModel?: string
+    defaultPermissionMode?: string
+    defaultEffort?: 'low' | 'medium' | 'high' | 'max'
+  }
+  network: NetworkSettings
 }
 
 export type SessionOverride = {
@@ -113,8 +131,11 @@ export const defaultSettings: AppSettings = {
     scrollback: 5000,
     theme: 'auto',
     warnExternalLinks: true,
+    osc52Clipboard: 'ask',
+    renderer: 'auto',
   },
   defaultCwd: undefined,
+  allowedFilePaths: undefined,
   logging: {
     debug: resolveDefaultLoggingDebug(),
   },
@@ -122,10 +143,14 @@ export const defaultSettings: AppSettings = {
     autoKillIdleMinutes: 180,
     warnBeforeKillMinutes: 5,
   },
+  notifications: {
+    soundEnabled: true,
+  },
   panes: {
     defaultNewPane: 'ask',
     snapThreshold: 2,
     tabAttentionStyle: 'highlight',
+    attentionDismiss: 'click',
   },
   sidebar: {
     sortMode: 'activity',
@@ -144,6 +169,11 @@ export const defaultSettings: AppSettings = {
       codex: {},
     },
   },
+  freshclaude: {},
+  network: {
+    host: '127.0.0.1',
+    configured: false,
+  },
 }
 
 function configDir(): string {
@@ -153,6 +183,12 @@ function configDir(): string {
 function configPath(): string {
   return path.join(configDir(), 'config.json')
 }
+
+function backupPath(): string {
+  return path.join(configDir(), 'config.backup.json')
+}
+
+export type ConfigReadError = 'ENOENT' | 'PARSE_ERROR' | 'VERSION_MISMATCH' | 'READ_ERROR'
 
 const CONFIG_TMP_PREFIX = 'config.json.tmp-'
 const DEFAULT_CONFIG_TMP_MAX_AGE_MS = 24 * 60 * 60 * 1000
@@ -168,7 +204,7 @@ const RENAME_RETRY_DELAYS_MS = [10, 25, 50, 100, 200]
 function isRetryableRenameError(err: unknown): err is NodeJS.ErrnoException {
   if (!err || typeof err !== 'object') return false
   const code = (err as NodeJS.ErrnoException).code
-  return code === 'EPERM' || code === 'EACCES' || code === 'EBUSY'
+  return code === 'EPERM' || code === 'EACCES' || code === 'EBUSY' || code === 'ENOENT'
 }
 
 async function delay(ms: number) {
@@ -273,14 +309,61 @@ async function atomicWriteFile(filePath: string, data: string) {
   }
 }
 
-async function readConfigFile(): Promise<UserConfig | null> {
+function logConfigFallback(error: ConfigReadError, details: { err?: unknown; filePath: string; foundVersion?: unknown }) {
+  const backupFile = backupPath()
+  if (error === 'PARSE_ERROR') {
+    logger.error(
+      { err: details.err, filePath: details.filePath, event: 'config_parse_error' },
+      'Config file parse failed; falling back to defaults'
+    )
+  } else if (error === 'VERSION_MISMATCH') {
+    logger.error(
+      {
+        filePath: details.filePath,
+        event: 'config_version_mismatch',
+        found: details.foundVersion,
+      },
+      'Config file version mismatch; falling back to defaults'
+    )
+  } else if (error === 'READ_ERROR') {
+    logger.error(
+      { err: details.err, filePath: details.filePath, event: 'config_read_error' },
+      'Config file read failed; falling back to defaults'
+    )
+  }
+  logger.warn(
+    { backupPath: backupFile, error },
+    'Config fallback in effect; restore backup with: mv ~/.freshell/config.backup.json ~/.freshell/config.json'
+  )
+}
+
+async function readConfigFile(): Promise<{ config: UserConfig | null; error?: ConfigReadError }> {
+  const filePath = configPath()
   try {
-    const raw = await fsp.readFile(configPath(), 'utf-8')
-    const parsed = JSON.parse(raw)
-    if (parsed?.version !== 1) return null
-    return parsed as UserConfig
-  } catch {
-    return null
+    const raw = await fsp.readFile(filePath, 'utf-8')
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch (err) {
+      logConfigFallback('PARSE_ERROR', { err, filePath })
+      return { config: null, error: 'PARSE_ERROR' }
+    }
+
+    if ((parsed as UserConfig)?.version !== 1) {
+      logConfigFallback('VERSION_MISMATCH', {
+        filePath,
+        foundVersion: (parsed as { version?: unknown })?.version,
+      })
+      return { config: null, error: 'VERSION_MISMATCH' }
+    }
+
+    return { config: parsed as UserConfig }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { config: null }
+    }
+    logConfigFallback('READ_ERROR', { err, filePath })
+    return { config: null, error: 'READ_ERROR' }
   }
 }
 
@@ -294,6 +377,8 @@ function mergeSettings(base: AppSettings, patch: Partial<AppSettings>): AppSetti
     scrollback: terminalPatch.scrollback,
     theme: terminalPatch.theme,
     warnExternalLinks: terminalPatch.warnExternalLinks,
+    osc52Clipboard: terminalPatch.osc52Clipboard,
+    renderer: terminalPatch.renderer,
   }
   return {
     ...base,
@@ -306,6 +391,7 @@ function mergeSettings(base: AppSettings, patch: Partial<AppSettings>): AppSetti
     },
     logging: { ...baseLogging, ...(patch.logging || {}) },
     safety: { ...base.safety, ...(patch.safety || {}) },
+    notifications: { ...base.notifications, ...(patch.notifications || {}) },
     panes: { ...base.panes, ...(patch.panes || {}) },
     sidebar: { ...base.sidebar, ...(patch.sidebar || {}) },
     codingCli: {
@@ -316,18 +402,39 @@ function mergeSettings(base: AppSettings, patch: Partial<AppSettings>): AppSetti
         ...(patch.codingCli?.providers || {}),
       },
     },
+    freshclaude: { ...base.freshclaude, ...(patch.freshclaude || {}) },
+    network: {
+      ...base.network,
+      ...(patch.network || {}),
+    },
   }
 }
 
 export class ConfigStore {
   private cache: UserConfig | null = null
   private writeMutex = new Mutex()
+  private lastReadError?: ConfigReadError
+
+  getLastReadError(): ConfigReadError | undefined {
+    return this.lastReadError
+  }
+
+  async backupExists(): Promise<boolean> {
+    try {
+      await fsp.access(backupPath())
+      return true
+    } catch {
+      return false
+    }
+  }
 
   async load(): Promise<UserConfig> {
     if (this.cache) return this.cache
     await ensureConfigTmpCleanup()
-    const existing = await readConfigFile()
+    const { config: existing, error } = await readConfigFile()
+    this.lastReadError = error
     if (existing) {
+      this.lastReadError = undefined
       this.cache = {
         ...existing,
         settings: mergeSettings(defaultSettings, existing.settings || {}),
@@ -359,9 +466,7 @@ export class ConfigStore {
   }
 
   async save(cfg: UserConfig) {
-    await ensureDir()
-    await atomicWriteFile(configPath(), JSON.stringify(cfg, null, 2))
-    this.cache = cfg
+    await this.saveInternal(cfg)
   }
 
   /**
@@ -371,6 +476,11 @@ export class ConfigStore {
   private async saveInternal(cfg: UserConfig) {
     await ensureDir()
     await atomicWriteFile(configPath(), JSON.stringify(cfg, null, 2))
+    try {
+      await fsp.copyFile(configPath(), backupPath())
+    } catch (err) {
+      logger.warn({ err, event: 'config_backup_failed' }, 'Failed to write config backup')
+    }
     this.cache = cfg
   }
 

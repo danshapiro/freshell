@@ -97,4 +97,31 @@ describe('TerminalRegistry.findRunningTerminalBySession', () => {
     expect(found).toBeDefined()
     expect(found!.terminalId).toBe(record.terminalId)
   })
+
+  it('getCanonicalRunningTerminalBySession returns the authoritative owner', () => {
+    const sessionId = 'codex-session-1'
+    const record = registry.create({ mode: 'codex', resumeSessionId: sessionId })
+    const found = registry.getCanonicalRunningTerminalBySession('codex', sessionId)
+    expect(found).toBeDefined()
+    expect(found!.terminalId).toBe(record.terminalId)
+  })
+
+  it('repairLegacySessionOwners keeps canonical owner and clears duplicate records', () => {
+    const sessionId = 'codex-session-legacy'
+    const canonical = registry.create({ mode: 'codex', resumeSessionId: sessionId })
+    const duplicate = registry.create({ mode: 'codex' })
+
+    // Simulate legacy duplicate record that bypassed authority.
+    const dupRecord = registry.get(duplicate.terminalId)
+    if (!dupRecord) throw new Error('Expected duplicate record')
+    dupRecord.resumeSessionId = sessionId
+
+    const repair = registry.repairLegacySessionOwners('codex', sessionId)
+    expect(repair.repaired).toBe(true)
+    expect(repair.canonicalTerminalId).toBe(canonical.terminalId)
+    expect(repair.clearedTerminalIds).toEqual([duplicate.terminalId])
+
+    expect(registry.get(canonical.terminalId)?.resumeSessionId).toBe(sessionId)
+    expect(registry.get(duplicate.terminalId)?.resumeSessionId).toBeUndefined()
+  })
 })

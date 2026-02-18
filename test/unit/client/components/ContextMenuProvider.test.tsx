@@ -229,6 +229,18 @@ describe('ContextMenuProvider', () => {
     expect(screen.queryByRole('menu')).toBeNull()
   })
 
+  it('allows native menu for links inside non-global contexts', async () => {
+    const user = userEvent.setup()
+    renderWithProvider(
+      <div data-context="freshclaude-chat" data-session-id="sess-1">
+        <a href="https://example.com">Example Link</a>
+      </div>
+    )
+
+    await user.pointer({ target: screen.getByText('Example Link'), keys: '[MouseRight]' })
+    expect(screen.queryByRole('menu')).toBeNull()
+  })
+
   it('allows native menu when Shift is held', async () => {
     const user = userEvent.setup()
     renderWithProvider(

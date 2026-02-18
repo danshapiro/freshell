@@ -1,5 +1,7 @@
 # Sessions Delta Sync Implementation Plan
 
+**Status: COMPLETE** — All tasks implemented across multiple branches, now merged to main. The delta sync system is fully operational: `sessions.patch` messages, capability negotiation, client reducers, coalescing (150ms), indexer throttle (2s debounce / 5s throttle), noop suppression via diffing, and size-guard fallback to full snapshots. Key commits: `7255a4f`, `ca5f2c8`, `3d7cee2`, `910740e`, `e29144e`. Worktrees and branches cleaned up 2026-02-12.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Eliminate repeated ~500KB `sessions.updated` WebSocket broadcasts by switching to incremental session updates (`sessions.patch`) while preserving the existing UX and feature set (live sidebar/history updates, mobile chunking, session overrides, project colors, etc).

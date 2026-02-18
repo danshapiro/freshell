@@ -4,6 +4,7 @@ import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import SettingsView from '@/components/SettingsView'
 import settingsReducer from '@/store/settingsSlice'
+import { networkReducer } from '@/store/networkSlice'
 
 // Mock the API
 vi.mock('@/lib/api', () => ({
@@ -16,6 +17,7 @@ function createTestStore(defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor' 
   return configureStore({
     reducer: {
       settings: settingsReducer,
+      network: networkReducer,
     },
     preloadedState: {
       settings: {

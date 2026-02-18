@@ -11,7 +11,7 @@ const ClientLogEntrySchema = z.object({
   consoleMethod: z.string().optional(),
   args: z.array(z.unknown()).optional(),
   stack: z.string().optional(),
-  context: z.record(z.unknown()).optional(),
+  context: z.record(z.string(), z.unknown()).optional(),
 })
 
 const ClientInfoSchema = z.object({

@@ -63,12 +63,13 @@ import { logger } from '../../../server/logger'
 import type { AppSettings } from '../../../server/config-store'
 
 // Mock WebSocket
-function createMockWebSocket(): any {
+function createMockWebSocket(opts?: { isMobileClient?: boolean }): any {
   return {
     send: vi.fn(),
     close: vi.fn(),
     readyState: 1, // OPEN
     bufferedAmount: 0,
+    isMobileClient: opts?.isMobileClient ?? false,
   }
 }
 
@@ -211,6 +212,47 @@ describe('TerminalRegistry Lifecycle', () => {
       const outputs = sent.filter((m) => m.type === 'terminal.output')
       expect(outputs).toHaveLength(1)
       expect(outputs[0].data).toBe('queued output\n')
+    })
+
+    it('batches terminal.output frames for mobile clients', () => {
+      const term = registry.create({ mode: 'shell' })
+      const pty = mockPtyProcess.instances[0]
+      const mobileClient = createMockWebSocket({ isMobileClient: true })
+
+      registry.attach(term.terminalId, mobileClient)
+
+      pty._emitData('hello ')
+      pty._emitData('mobile')
+
+      expect(mobileClient.send).not.toHaveBeenCalled()
+
+      vi.advanceTimersByTime(50)
+
+      const sent = (mobileClient.send as Mock).mock.calls.map((call) => JSON.parse(call[0]))
+      const outputs = sent.filter((m) => m.type === 'terminal.output')
+      expect(outputs).toHaveLength(1)
+      expect(outputs[0].data).toBe('hello mobile')
+    })
+
+    it('tracks dropped output metrics for flushed mobile batches', () => {
+      setPerfLoggingEnabled(true, 'test')
+      try {
+        const local = new TerminalRegistry(settings)
+        const term = local.create({ mode: 'shell' })
+        const pty = mockPtyProcess.instances[mockPtyProcess.instances.length - 1]
+        const mobileClient = createMockWebSocket({ isMobileClient: true })
+        mobileClient.bufferedAmount = 3 * 1024 * 1024
+
+        local.attach(term.terminalId, mobileClient)
+        pty._emitData('mobile batch')
+
+        vi.advanceTimersByTime(50)
+
+        expect(term.perf?.droppedMessages).toBe(1)
+        local.shutdown()
+      } finally {
+        setPerfLoggingEnabled(false, 'test')
+      }
     })
 
     it('closes the client if the pending snapshot queue grows too large (prevents OOM)', () => {
@@ -1229,6 +1271,115 @@ describe('Graceful shutdown', () => {
 
     // Should not throw
     expect(() => registry.shutdown()).not.toThrow()
+  })
+})
+
+describe('shutdownGracefully', () => {
+  let registry: TerminalRegistry
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.useRealTimers()
+    mockPtyProcess.instances = []
+    registry = new TerminalRegistry(createTestSettings())
+  })
+
+  it('should send SIGTERM to running terminals', async () => {
+    registry.create({ mode: 'shell' })
+    registry.create({ mode: 'shell' })
+
+    const ptys = mockPtyProcess.instances
+
+    // Simulate processes that exit when SIGTERM arrives
+    for (const pty of ptys) {
+      pty.kill.mockImplementation(() => {
+        setTimeout(() => pty._emitExit(0), 10)
+      })
+    }
+
+    await registry.shutdownGracefully(5000)
+
+    for (const pty of ptys) {
+      expect(pty.kill).toHaveBeenCalledWith('SIGTERM')
+    }
+  })
+
+  it('should wait for terminals to exit within timeout', async () => {
+    registry.create({ mode: 'shell' })
+    const pty = mockPtyProcess.instances[0]
+
+    pty.kill.mockImplementation(() => {
+      setTimeout(() => pty._emitExit(0), 50)
+    })
+
+    const start = Date.now()
+    await registry.shutdownGracefully(5000)
+    // Should resolve quickly, not wait the full 5s
+    expect(Date.now() - start).toBeLessThan(1000)
+  })
+
+  it('should force-kill terminals after timeout', async () => {
+    registry.create({ mode: 'shell' })
+    const pty = mockPtyProcess.instances[0]
+
+    // Never exits on SIGTERM
+    pty.kill.mockImplementation(() => {})
+
+    await registry.shutdownGracefully(200)
+
+    // Should have been called at least twice: once SIGTERM, once forced
+    expect(pty.kill).toHaveBeenCalledTimes(2)
+    expect(pty.kill).toHaveBeenNthCalledWith(1, 'SIGTERM')
+  })
+
+  it('should handle already exited terminals', async () => {
+    const term = registry.create({ mode: 'shell' })
+    const pty = mockPtyProcess.instances[0]
+    pty._emitExit(0)
+    expect(term.status).toBe('exited')
+
+    await expect(registry.shutdownGracefully(1000)).resolves.toBeUndefined()
+  })
+
+  it('should handle no terminals', async () => {
+    await expect(registry.shutdownGracefully(1000)).resolves.toBeUndefined()
+  })
+
+  it('should use SIGTERM on non-Windows platforms', async () => {
+    const originalPlatform = process.platform
+    Object.defineProperty(process, 'platform', { value: 'linux', configurable: true })
+
+    try {
+      registry.create({ mode: 'shell' })
+      const pty = mockPtyProcess.instances[0]
+      pty.kill.mockImplementation(() => {
+        setTimeout(() => pty._emitExit(0), 10)
+      })
+
+      await registry.shutdownGracefully(1000)
+      expect(pty.kill).toHaveBeenCalledWith('SIGTERM')
+    } finally {
+      Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true })
+    }
+  })
+
+  it('should skip signal argument on Windows', async () => {
+    const originalPlatform = process.platform
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true })
+
+    try {
+      registry.create({ mode: 'shell' })
+      const pty = mockPtyProcess.instances[0]
+      pty.kill.mockImplementation(() => {
+        setTimeout(() => pty._emitExit(0), 10)
+      })
+
+      await registry.shutdownGracefully(1000)
+      // On Windows, kill() is called without a signal argument
+      expect(pty.kill).toHaveBeenCalledWith()
+    } finally {
+      Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true })
+    }
   })
 })
 

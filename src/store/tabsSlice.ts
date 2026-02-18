@@ -1,9 +1,18 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
 import { nanoid } from 'nanoid'
-import { removeLayout } from './panesSlice'
+import { closePane, removeLayout } from './panesSlice'
+import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
+import type { PaneNode } from './paneTypes'
 import { findTabIdForSession } from '@/lib/session-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
+import { recordClosedTabSnapshot } from './tabRegistrySlice'
+import {
+  buildClosedTabRegistryRecord,
+  countPaneLeaves,
+  shouldKeepClosedTab,
+} from '@/lib/tab-registry-snapshot'
+import { UNKNOWN_SERVER_INSTANCE_ID } from './tabRegistryConstants'
 import type { RootState } from './store'
 
 export interface TabsState {
@@ -205,11 +214,76 @@ export const {
   switchToPrevTab,
 } = tabsSlice.actions
 
+function collectPaneIds(node: PaneNode | undefined): string[] {
+  if (!node) return []
+  if (node.type === 'leaf') return [node.id]
+  return [...collectPaneIds(node.children[0]), ...collectPaneIds(node.children[1])]
+}
+
+/**
+ * Close a pane and clean up its attention state.
+ * If the target pane is the tab's only pane, closes the tab instead.
+ * Otherwise only clears attention if closePane actually removed the pane (i.e. layout changed).
+ */
+export const closePaneWithCleanup = createAsyncThunk(
+  'tabs/closePaneWithCleanup',
+  async ({ tabId, paneId }: { tabId: string; paneId: string }, { dispatch, getState }) => {
+    const before = (getState() as RootState).panes.layouts[tabId]
+    if (before?.type === 'leaf' && before.id === paneId) {
+      await dispatch(closeTab(tabId))
+      return
+    }
+    dispatch(closePane({ tabId, paneId }))
+    const after = (getState() as RootState).panes.layouts[tabId]
+    if (before !== after) {
+      dispatch(clearPaneAttention({ paneId }))
+      dispatch(clearTabAttention({ tabId }))
+    }
+  }
+)
+
 export const closeTab = createAsyncThunk(
   'tabs/closeTab',
-  async (tabId: string, { dispatch }) => {
+  async (tabId: string, { dispatch, getState }) => {
+    const stateBeforeClose = getState() as RootState
+    const tab = stateBeforeClose.tabs.tabs.find((item) => item.id === tabId)
+    const layout = stateBeforeClose.panes.layouts[tabId]
+    const tabRegistryState = (stateBeforeClose as { tabRegistry?: RootState['tabRegistry'] }).tabRegistry
+    const serverInstanceId = stateBeforeClose.connection?.serverInstanceId || UNKNOWN_SERVER_INSTANCE_ID
+    if (tab && layout && tabRegistryState) {
+      const paneCount = countPaneLeaves(layout)
+      const openDurationMs = Math.max(0, Date.now() - (tab.createdAt || Date.now()))
+      const keep = shouldKeepClosedTab({
+        openDurationMs,
+        paneCount,
+        titleSetByUser: !!tab.titleSetByUser,
+      })
+      if (keep) {
+        dispatch(recordClosedTabSnapshot(buildClosedTabRegistryRecord({
+          tab,
+          layout,
+          serverInstanceId,
+          paneTitles: stateBeforeClose.panes.paneTitles[tabId],
+          deviceId: tabRegistryState.deviceId,
+          deviceLabel: tabRegistryState.deviceLabel,
+          revision: 0,
+          updatedAt: Date.now(),
+        })))
+      }
+    }
+
+    // Collect all pane IDs before removing the layout
+    const currentLayout = (getState() as RootState).panes.layouts[tabId]
+    const paneIds = collectPaneIds(currentLayout)
+
     dispatch(removeTab(tabId))
     dispatch(removeLayout({ tabId }))
+
+    // Clean up attention for the tab and all its panes
+    dispatch(clearTabAttention({ tabId }))
+    for (const paneId of paneIds) {
+      dispatch(clearPaneAttention({ paneId }))
+    }
   }
 )
 

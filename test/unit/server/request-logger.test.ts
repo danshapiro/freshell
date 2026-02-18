@@ -32,7 +32,7 @@ vi.mock('../../../server/perf-logger', () => ({
   logPerfEvent: mockState.logPerfEvent,
 }))
 
-import { requestLogger } from '../../../server/request-logger'
+import { requestLogger, sanitizeUrl } from '../../../server/request-logger'
 
 class FakeResponse extends EventEmitter {
   statusCode = 200
@@ -46,6 +46,24 @@ class FakeResponse extends EventEmitter {
     return this.#headers.get(String(name).toLowerCase())
   }
 }
+
+describe('sanitizeUrl', () => {
+  it('strips token query parameter', () => {
+    expect(sanitizeUrl('/?token=abc123')).toBe('/')
+  })
+
+  it('preserves other query parameters', () => {
+    expect(sanitizeUrl('/page?foo=bar&token=abc&baz=1')).toBe('/page?foo=bar&baz=1')
+  })
+
+  it('passes through URLs without token', () => {
+    expect(sanitizeUrl('/api/settings')).toBe('/api/settings')
+  })
+
+  it('handles URL with only token param', () => {
+    expect(sanitizeUrl('/path?token=secret')).toBe('/path')
+  })
+})
 
 describe('requestLogger', () => {
   beforeEach(() => {

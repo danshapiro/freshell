@@ -1,6 +1,12 @@
 // test/unit/server/updater/version-checker.test.ts
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { checkForUpdate, parseVersion, isNewerVersion, GitHubReleaseSchema } from '../../../../server/updater/version-checker.js'
+import {
+  checkForUpdate,
+  parseVersion,
+  isNewerVersion,
+  isMinorOrMajorNewer,
+  GitHubReleaseSchema,
+} from '../../../../server/updater/version-checker.js'
 
 describe('version-checker', () => {
   describe('parseVersion', () => {
@@ -66,6 +72,26 @@ describe('version-checker', () => {
     })
   })
 
+  describe('isMinorOrMajorNewer', () => {
+    it('returns true when remote major is newer', () => {
+      expect(isMinorOrMajorNewer('1.2.3', '2.0.0')).toBe(true)
+    })
+
+    it('returns true when remote minor is newer', () => {
+      expect(isMinorOrMajorNewer('1.2.3', '1.3.0')).toBe(true)
+    })
+
+    it('returns false for patch-only updates', () => {
+      expect(isMinorOrMajorNewer('1.2.3', '1.2.4')).toBe(false)
+      expect(isMinorOrMajorNewer('1.2', '1.2.1')).toBe(false)
+    })
+
+    it('returns false when versions are equal or remote is older', () => {
+      expect(isMinorOrMajorNewer('1.2.3', '1.2.3')).toBe(false)
+      expect(isMinorOrMajorNewer('1.3.0', '1.2.9')).toBe(false)
+    })
+  })
+
   describe('checkForUpdate', () => {
     beforeEach(() => {
       vi.stubGlobal('fetch', vi.fn())
@@ -114,6 +140,25 @@ describe('version-checker', () => {
 
       expect(result.updateAvailable).toBe(false)
       expect(result.latestVersion).toBe('0.1.0')
+    })
+
+    it('returns updateAvailable: false for patch-only updates', async () => {
+      const mockRelease = {
+        tag_name: 'v0.1.1',
+        html_url: 'https://github.com/danshapiro/freshell/releases/tag/v0.1.1',
+        published_at: '2026-01-29T00:00:00Z',
+        body: 'Release notes'
+      }
+
+      vi.mocked(global.fetch).mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve(mockRelease)
+      } as Response)
+
+      const result = await checkForUpdate('0.1.0')
+
+      expect(result.updateAvailable).toBe(false)
+      expect(result.latestVersion).toBe('0.1.1')
     })
 
     it('returns error when fetch fails', async () => {

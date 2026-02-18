@@ -1,7 +1,6 @@
 import { X, Circle } from 'lucide-react'
 import { useRef, useEffect } from 'react'
 import { cn } from '@/lib/utils'
-import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import PaneIcon from '@/components/icons/PaneIcon'
 import type { Tab, TabAttentionStyle } from '@/store/types'
 import type { PaneContent } from '@/store/paneTypes'
@@ -109,32 +108,27 @@ export default function TabItem({
         'group relative flex items-center gap-2 h-8 px-3 rounded-t-md border-x border-t border-muted-foreground/45 text-sm cursor-pointer transition-colors',
         isActive
           ? cn(
-              "z-30 -mb-px border-b border-b-background bg-background text-foreground after:pointer-events-none after:absolute after:inset-x-0 after:-bottom-px after:h-[2px] after:bg-background after:content-['']",
+              "z-30 border-b border-b-background bg-background text-foreground after:pointer-events-none after:absolute after:inset-x-0 after:-bottom-px after:h-[2px] after:bg-background after:content-['']",
+              needsAttention && tabAttentionStyle !== 'none' && (
+                tabAttentionStyle === 'darken'
+                  ? 'border-t-[3px] border-t-muted-foreground bg-foreground/[0.08] shadow-[inset_0_4px_8px_hsl(var(--foreground)/0.1)]'
+                  : 'border-t-[3px] border-t-success bg-success/15 shadow-[inset_0_4px_8px_hsl(var(--success)/0.2)]'
+              ),
               needsAttention && tabAttentionStyle === 'pulse' && 'animate-pulse'
             )
-          : needsAttention && tabAttentionStyle !== 'none'
-            ? tabAttentionStyle === 'darken'
-              ? 'border-b border-muted-foreground/45 bg-foreground/15 text-foreground hover:bg-foreground/20 mt-1 dark:bg-foreground/20 dark:text-foreground dark:hover:bg-foreground/25'
-              : cn(
-                  'border-b border-muted-foreground/45 bg-emerald-100 text-emerald-900 hover:bg-emerald-200 mt-1 dark:bg-emerald-900/40 dark:text-emerald-100 dark:hover:bg-emerald-900/55',
-                  tabAttentionStyle === 'pulse' && 'animate-pulse'
-                )
-            : 'border-b border-muted-foreground/45 bg-muted text-muted-foreground hover:text-foreground hover:bg-muted/90 mt-1',
+          : cn(
+              'shadow-[inset_0_-1px_0_hsl(var(--muted-foreground)/0.45)]',
+              needsAttention && tabAttentionStyle !== 'none'
+                ? tabAttentionStyle === 'darken'
+                  ? 'bg-foreground/15 text-foreground hover:bg-foreground/20 dark:bg-foreground/20 dark:text-foreground dark:hover:bg-foreground/25'
+                  : cn(
+                      'bg-emerald-100 text-emerald-900 hover:bg-emerald-200 dark:bg-emerald-900/40 dark:text-emerald-100 dark:hover:bg-emerald-900/55',
+                      tabAttentionStyle === 'pulse' && 'animate-pulse'
+                    )
+                : 'bg-muted text-muted-foreground hover:text-foreground hover:bg-muted/90'
+            ),
         isDragging && 'opacity-50'
       )}
-      style={isActive && needsAttention && tabAttentionStyle !== 'none' ? {
-        borderTopWidth: '3px',
-        borderTopStyle: 'solid',
-        borderTopColor: tabAttentionStyle === 'darken'
-          ? 'hsl(var(--muted-foreground))'
-          : 'hsl(var(--success))',
-        backgroundColor: tabAttentionStyle === 'darken'
-          ? 'hsl(var(--foreground) / 0.08)'
-          : 'hsl(var(--success) / 0.15)',
-        boxShadow: tabAttentionStyle === 'darken'
-          ? 'inset 0 4px 8px hsl(var(--foreground) / 0.1)'
-          : 'inset 0 4px 8px hsl(var(--success) / 0.2)',
-      } : undefined}
       role="button"
       tabIndex={0}
       aria-label={tab.title}
@@ -162,24 +156,14 @@ export default function TabItem({
           onClick={(e) => e.stopPropagation()}
         />
       ) : (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span
-              className={cn(
-                'whitespace-nowrap truncate text-sm',
-                isActive ? 'max-w-[10rem]' : 'max-w-[5rem]'
-              )}
-            >
-              {tab.title}
-            </span>
-          </TooltipTrigger>
-          <TooltipContent>{tab.title}</TooltipContent>
-        </Tooltip>
+        <span className="whitespace-nowrap truncate text-sm max-w-[5rem]">
+          {tab.title}
+        </span>
       )}
 
       <button
         className={cn(
-          'ml-0.5 p-0.5 rounded transition-opacity',
+          'ml-0.5 p-0.5 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded transition-opacity',
           isActive
             ? 'opacity-60 hover:opacity-100'
             : 'opacity-0 group-hover:opacity-60 hover:!opacity-100'

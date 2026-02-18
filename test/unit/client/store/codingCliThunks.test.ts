@@ -81,6 +81,69 @@ describe('codingCliThunks', () => {
     expect(store.getState().codingCli.sessions['session-123']).toBeDefined()
   })
 
+  it('times out after 30s and sets tab to error state', async () => {
+    vi.useFakeTimers()
+    try {
+      const store = createStore()
+
+      const promise = store.dispatch(
+        createCodingCliTab({ provider: 'codex', prompt: 'Slow creation' })
+      )
+
+      const tab = store.getState().tabs.tabs[0]
+      expect(tab.status).toBe('creating')
+
+      // Advance past the 30s timeout
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      const result = await promise
+      expect(result.type).toBe('codingCli/createTab/rejected')
+      expect(result.error?.message).toBe('Coding CLI creation timed out after 30 seconds')
+
+      // Tab should be in error state
+      const updatedTab = store.getState().tabs.tabs[0]
+      expect(updatedTab.status).toBe('error')
+
+      // Pending request should be cleaned up
+      const requestId = tab.codingCliSessionId as string
+      expect(store.getState().codingCli.pendingRequests[requestId]).toBeUndefined()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('kills a late-created session that arrives after timeout', async () => {
+    vi.useFakeTimers()
+    try {
+      const store = createStore()
+
+      const promise = store.dispatch(
+        createCodingCliTab({ provider: 'codex', prompt: 'Late create' })
+      )
+
+      const tab = store.getState().tabs.tabs[0]
+      const requestId = tab.codingCliSessionId as string
+
+      await vi.advanceTimersByTimeAsync(30_000)
+      await promise
+
+      messageHandler?.({
+        type: 'codingcli.created',
+        requestId,
+        sessionId: 'session-late',
+        provider: 'codex',
+      })
+
+      expect(mockSend).toHaveBeenCalledWith({
+        type: 'codingcli.kill',
+        sessionId: 'session-late',
+      })
+      expect(store.getState().codingCli.sessions['session-late']).toBeUndefined()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('kills created session when request was canceled', async () => {
     const store = createStore()
 

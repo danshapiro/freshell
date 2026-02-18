@@ -8,6 +8,8 @@ import tabsReducer from '@/store/tabsSlice'
 import settingsReducer from '@/store/settingsSlice'
 import connectionReducer, { ConnectionState } from '@/store/connectionSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
+import turnCompletionReducer from '@/store/turnCompletionSlice'
+import { markTabAttention, markPaneAttention } from '@/store/turnCompletionSlice'
 import type { PanesState } from '@/store/panesSlice'
 import type { PaneNode, PaneContent, EditorPaneContent } from '@/store/paneTypes'
 
@@ -81,6 +83,30 @@ vi.mock('lucide-react', () => ({
   Minimize2: ({ className }: { className?: string }) => (
     <svg data-testid="minimize-icon" className={className} />
   ),
+  Pencil: ({ className }: { className?: string }) => (
+    <svg data-testid="pencil-icon" className={className} />
+  ),
+  ChevronRight: ({ className }: { className?: string }) => (
+    <svg data-testid="chevron-right-icon" className={className} />
+  ),
+  Loader2: ({ className }: { className?: string }) => (
+    <svg data-testid="loader-icon" className={className} />
+  ),
+  Check: ({ className }: { className?: string }) => (
+    <svg data-testid="check-icon" className={className} />
+  ),
+  ShieldAlert: ({ className }: { className?: string }) => (
+    <svg data-testid="shield-alert-icon" className={className} />
+  ),
+  Send: ({ className }: { className?: string }) => (
+    <svg data-testid="send-icon" className={className} />
+  ),
+  Square: ({ className }: { className?: string }) => (
+    <svg data-testid="square-icon" className={className} />
+  ),
+  Search: ({ className }: { className?: string }) => (
+    <svg data-testid="search-icon" className={className} />
+  ),
 }))
 
 // Mock TerminalView component to avoid xterm.js dependencies
@@ -130,6 +156,7 @@ function createStore(
       settings: settingsReducer,
       connection: connectionReducer,
       terminalMeta: terminalMetaReducer,
+      turnCompletion: turnCompletionReducer,
     },
     preloadedState: {
       panes: {
@@ -943,6 +970,7 @@ describe('PaneContainer', () => {
           settings: settingsReducer,
           connection: connectionReducer,
           terminalMeta: terminalMetaReducer,
+          turnCompletion: turnCompletionReducer,
         },
         preloadedState: {
           panes: {
@@ -1092,6 +1120,256 @@ describe('PaneContainer', () => {
         expect(paneContent.mode).toBe('shell')
         expect(paneContent.status).toBe('creating')
       }
+    })
+
+    it('pre-fills directory picker with tab-preferred cwd instead of global default', () => {
+      // Tab already has a Claude pane working in /code/tab-project
+      const existingClaude: PaneNode = {
+        type: 'leaf',
+        id: 'pane-existing',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          shell: 'system',
+          createRequestId: 'cr-existing',
+          status: 'running',
+          terminalId: 'term-existing',
+          initialCwd: '/code/tab-project',
+        },
+      }
+      const pickerNode: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: { kind: 'picker' },
+      }
+      const splitNode: PaneNode = {
+        type: 'split',
+        id: 'split-1',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [existingClaude, pickerNode],
+      }
+
+      // Global provider default is /code/global-default — should NOT be used
+      const store = createStoreWithClaude(splitNode, { cwd: '/code/global-default' })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={splitNode} />,
+        store
+      )
+
+      // Navigate to directory picker by selecting Claude
+      const container = document.querySelector('[data-context="pane-picker"]')!
+      fireEvent.keyDown(container, { key: 'l' })
+      fireEvent.transitionEnd(container)
+
+      // The input should pre-fill with the tab's directory, not the global default
+      const input = screen.getByLabelText('Starting directory for Claude') as HTMLInputElement
+      expect(input.value).toBe('/code/tab-project')
+    })
+  })
+
+  describe('attention clearing on pane focus (click mode)', () => {
+    function createAttentionStore(opts: {
+      activePane: string
+      attentionPanes?: string[]
+      attentionTabs?: string[]
+      attentionDismiss?: 'click' | 'type'
+    }) {
+      const store = configureStore({
+        reducer: {
+          panes: panesReducer,
+          tabs: tabsReducer,
+          settings: settingsReducer,
+          connection: connectionReducer,
+          terminalMeta: terminalMetaReducer,
+          turnCompletion: turnCompletionReducer,
+        },
+        preloadedState: {
+          panes: {
+            layouts: {
+              'tab-1': {
+                type: 'split',
+                id: 'split-1',
+                direction: 'horizontal',
+                sizes: [50, 50],
+                children: [
+                  { type: 'leaf', id: 'pane-1', content: createTerminalContent() },
+                  { type: 'leaf', id: 'pane-2', content: createTerminalContent() },
+                ],
+              },
+            },
+            activePane: { 'tab-1': opts.activePane },
+            paneTitles: {},
+            paneTitleSetByUser: {},
+            renameRequestTabId: null,
+            renameRequestPaneId: null,
+            zoomedPane: {},
+          },
+          tabs: {
+            tabs: [{ id: 'tab-1', createRequestId: 'tab-1', title: 'Tab 1', mode: 'shell' as const, status: 'running' as const, createdAt: 1 }],
+            activeTabId: 'tab-1',
+          },
+          connection: { status: 'disconnected', platform: null, availableClis: {} },
+          terminalMeta: { byTerminalId: {} },
+          settings: {
+            settings: {
+              ...defaultSettingsForTest(),
+              panes: {
+                defaultNewPane: 'ask' as const,
+                snapThreshold: 2,
+                iconsOnTabs: true,
+                tabAttentionStyle: 'highlight' as const,
+                attentionDismiss: opts.attentionDismiss ?? 'click' as const,
+              },
+            },
+            loaded: true,
+            lastSavedAt: undefined,
+          },
+        },
+      })
+
+      // Set up attention state via dispatches
+      for (const paneId of opts.attentionPanes ?? []) {
+        store.dispatch(markPaneAttention({ paneId }))
+      }
+      for (const tabId of opts.attentionTabs ?? []) {
+        store.dispatch(markTabAttention({ tabId }))
+      }
+
+      return store
+    }
+
+    function defaultSettingsForTest() {
+      return {
+        theme: 'system' as const,
+        uiScale: 1,
+        terminal: {
+          fontSize: 14,
+          fontFamily: 'monospace',
+          lineHeight: 1.2,
+          cursorBlink: true,
+          scrollback: 5000,
+          theme: 'auto' as const,
+        },
+        safety: { autoKillIdleMinutes: 180, warnBeforeKillMinutes: 5 },
+        sidebar: { sortMode: 'activity' as const, showProjectBadges: true, width: 288, collapsed: false },
+        codingCli: { enabledProviders: [] as any[], providers: {} },
+        logging: { debug: false },
+      }
+    }
+
+    it('clicking a non-active pane with attention clears pane attention', () => {
+      // pane-1 is active, pane-2 has attention
+      const store = createAttentionStore({
+        activePane: 'pane-1',
+        attentionPanes: ['pane-2'],
+        attentionTabs: ['tab-1'],
+      })
+
+      const rootNode = store.getState().panes.layouts['tab-1']
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={rootNode} />,
+        store
+      )
+
+      // Verify attention is set
+      expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
+
+      // Click (mouseDown) on the second pane to focus it
+      const secondTerminal = screen.getByTestId('terminal-pane-2')
+      fireEvent.mouseDown(secondTerminal)
+
+      // Pane attention should be cleared
+      expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBeUndefined()
+    })
+
+    it('clicking a non-active pane with attention clears tab attention', () => {
+      const store = createAttentionStore({
+        activePane: 'pane-1',
+        attentionPanes: ['pane-2'],
+        attentionTabs: ['tab-1'],
+      })
+
+      const rootNode = store.getState().panes.layouts['tab-1']
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={rootNode} />,
+        store
+      )
+
+      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
+
+      const secondTerminal = screen.getByTestId('terminal-pane-2')
+      fireEvent.mouseDown(secondTerminal)
+
+      // Tab attention should also be cleared — user is actively engaging with the tab
+      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBeUndefined()
+    })
+
+    it('clicking the already-active pane with attention clears attention', () => {
+      // pane-1 is active AND has attention
+      const store = createAttentionStore({
+        activePane: 'pane-1',
+        attentionPanes: ['pane-1'],
+        attentionTabs: ['tab-1'],
+      })
+
+      const rootNode = store.getState().panes.layouts['tab-1']
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={rootNode} />,
+        store
+      )
+
+      expect(store.getState().turnCompletion.attentionByPane['pane-1']).toBe(true)
+
+      const firstTerminal = screen.getByTestId('terminal-pane-1')
+      fireEvent.mouseDown(firstTerminal)
+
+      expect(store.getState().turnCompletion.attentionByPane['pane-1']).toBeUndefined()
+      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBeUndefined()
+    })
+
+    it('clicking a pane without attention does not touch attention state', () => {
+      const store = createAttentionStore({
+        activePane: 'pane-1',
+        attentionPanes: [],
+        attentionTabs: [],
+      })
+
+      const rootNode = store.getState().panes.layouts['tab-1']
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={rootNode} />,
+        store
+      )
+
+      const secondTerminal = screen.getByTestId('terminal-pane-2')
+      fireEvent.mouseDown(secondTerminal)
+
+      // No attention entries should exist
+      expect(store.getState().turnCompletion.attentionByPane).toEqual({})
+      expect(store.getState().turnCompletion.attentionByTab).toEqual({})
+    })
+
+    it('does not clear attention in type mode', () => {
+      const store = createAttentionStore({
+        activePane: 'pane-1',
+        attentionPanes: ['pane-2'],
+        attentionTabs: ['tab-1'],
+        attentionDismiss: 'type',
+      })
+
+      const rootNode = store.getState().panes.layouts['tab-1']
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={rootNode} />,
+        store
+      )
+
+      const secondTerminal = screen.getByTestId('terminal-pane-2')
+      fireEvent.mouseDown(secondTerminal)
+
+      // In type mode, clicking should NOT clear attention
+      expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
+      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
     })
   })
 })

@@ -195,6 +195,19 @@ class FakeRegistry {
     return this.findRunningTerminalBySession('claude', sessionId)
   }
 
+  getCanonicalRunningTerminalBySession(mode: string, sessionId: string) {
+    return this.findRunningTerminalBySession(mode, sessionId)
+  }
+
+  repairLegacySessionOwners(mode: string, sessionId: string) {
+    const canonical = this.getCanonicalRunningTerminalBySession(mode, sessionId)
+    return {
+      repaired: false,
+      canonicalTerminalId: canonical?.terminalId,
+      clearedTerminalIds: [] as string[],
+    }
+  }
+
   // Simulate terminal output for testing
   simulateOutput(terminalId: string, data: string) {
     const rec = this.records.get(terminalId)

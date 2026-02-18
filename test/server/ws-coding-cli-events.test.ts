@@ -323,6 +323,8 @@ describe('WebSocket Coding CLI Events', () => {
       createdByRequestId: new Map<string, string>(),
       codingCliSessions: new Set<string>(),
       codingCliSubscriptions: new Map<string, () => void>(),
+      sdkSessions: new Set<string>(),
+      sdkSubscriptions: new Map<string, () => void>(),
       interestedSessions: new Set<string>(),
     }
 

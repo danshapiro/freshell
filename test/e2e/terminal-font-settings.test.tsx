@@ -8,6 +8,7 @@ import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
+import { networkReducer } from '@/store/networkSlice'
 import { LOCAL_TERMINAL_FONT_KEY } from '@/lib/terminal-fonts'
 
 const mockSend = vi.fn()
@@ -58,6 +59,9 @@ vi.mock('@/components/OverviewView', () => ({
 vi.mock('@/hooks/useTheme', () => ({
   useThemeEffect: () => {},
 }))
+vi.mock('@/components/SetupWizard', () => ({
+  SetupWizard: () => <div data-testid="mock-setup-wizard">Setup Wizard</div>,
+}))
 
 function createTestStore() {
   return configureStore({
@@ -67,6 +71,7 @@ function createTestStore() {
       connection: connectionReducer,
       sessions: sessionsReducer,
       panes: panesReducer,
+      network: networkReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -98,6 +103,7 @@ function createTestStore() {
         layouts: {},
         activePane: {},
       },
+      network: { status: null, loading: false, configuring: false, error: null },
     },
   })
 }

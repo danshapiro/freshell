@@ -8,8 +8,10 @@ import { EventEmitter } from 'events'
 import { logger } from './logger.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
 import type { AppSettings } from './config-store.js'
-import { isReachableDirectorySync } from './path-utils.js'
+import { convertWindowsPathToWslPath, isReachableDirectorySync } from './path-utils.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
+import type { CodingCliProviderName } from './coding-cli/types.js'
+import { SessionBindingAuthority, type BindResult } from './session-binding-authority.js'
 
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
 const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 64 * 1024)
@@ -18,6 +20,8 @@ const MAX_SCROLLBACK_CHARS = 2 * 1024 * 1024
 const APPROX_CHARS_PER_LINE = 200
 const MAX_TERMINALS = Number(process.env.MAX_TERMINALS || 50)
 const DEFAULT_MAX_PENDING_SNAPSHOT_CHARS = 512 * 1024
+const MOBILE_OUTPUT_FLUSH_MS = Number(process.env.MOBILE_OUTPUT_FLUSH_MS || 40)
+const MAX_MOBILE_OUTPUT_BUFFER_CHARS = Number(process.env.MAX_MOBILE_OUTPUT_BUFFER_CHARS || 256 * 1024)
 const perfConfig = getPerfConfig()
 
 // TerminalMode includes 'shell' for regular terminals, plus coding CLI providers.
@@ -149,6 +153,13 @@ type PendingSnapshotQueue = {
   queuedChars: number
 }
 
+type PendingMobileOutput = {
+  timer: NodeJS.Timeout | null
+  chunksByTerminal: Map<string, string[]>
+  perfByTerminal: Map<string, TerminalRecord['perf'] | undefined>
+  queuedChars: number
+}
+
 export type TerminalRecord = {
   terminalId: string
   title: string
@@ -181,6 +192,17 @@ export type TerminalRecord = {
     lastInputToOutputMs?: number
     maxInputToOutputMs: number
   }
+}
+
+export type BindSessionResult =
+  | { ok: true; terminalId: string; sessionId: string }
+  | { ok: false; reason: 'terminal_missing' | 'mode_mismatch' | 'invalid_session_id' }
+  | BindResult
+
+export type RepairLegacySessionOwnersResult = {
+  repaired: boolean
+  canonicalTerminalId?: string
+  clearedTerminalIds: string[]
 }
 
 export class ChunkRingBuffer {
@@ -299,34 +321,97 @@ function getWslMountPrefix(): string {
   return '/mnt'
 }
 
+const WINDOWS_DRIVE_PREFIX_RE = /^[A-Za-z]:([\\/]|$)/
+const WINDOWS_UNC_PREFIX_RE = /^\\\\[^\\]+\\[^\\]+/
+const WINDOWS_ROOTED_PREFIX_RE = /^\\(?!\\)/
+
+function isWindowsAbsolutePath(input: string): boolean {
+  return WINDOWS_DRIVE_PREFIX_RE.test(input) || WINDOWS_UNC_PREFIX_RE.test(input) || WINDOWS_ROOTED_PREFIX_RE.test(input)
+}
+
+function escapeRegex(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function convertWslDrivePathToWindows(input: string): string | undefined {
+  const normalized = input.replace(/\\/g, '/')
+  const mountPrefix = getWslMountPrefix()
+  const prefixes = new Set([mountPrefix, '/mnt'])
+
+  for (const prefix of prefixes) {
+    const match = prefix
+      ? normalized.match(new RegExp(`^${escapeRegex(prefix)}/([a-zA-Z])(?:/(.*))?$`))
+      : normalized.match(/^\/([a-zA-Z])(?:\/(.*))?$/)
+    if (!match) continue
+    const drive = `${match[1].toUpperCase()}:`
+    const rest = match[2]?.replace(/\//g, '\\')
+    return rest ? `${drive}\\${rest}` : `${drive}\\`
+  }
+  return undefined
+}
+
+function resolveWindowsShellCwd(cwd: string | undefined): string | undefined {
+  if (!cwd) return undefined
+  const candidate = cwd.trim()
+  if (!candidate) return undefined
+
+  if (isLinuxPath(candidate)) {
+    return convertWslDrivePathToWindows(candidate)
+  }
+
+  if (WINDOWS_UNC_PREFIX_RE.test(candidate)) {
+    return undefined
+  }
+
+  if (isWindowsAbsolutePath(candidate) || !isWsl()) {
+    return path.win32.resolve(candidate)
+  }
+  return undefined
+}
+
+function resolveUnixShellCwd(cwd: string | undefined): string | undefined {
+  if (!cwd) return undefined
+  const candidate = cwd.trim()
+  if (!candidate) return undefined
+
+  // In WSL, Linux processes need POSIX paths. Convert Windows-style cwd inputs
+  // (e.g. D:\users\dan) to WSL mount paths before passing cwd to node-pty.
+  if (isWsl()) {
+    const converted = convertWindowsPathToWslPath(candidate)
+    if (converted) {
+      return converted
+    }
+  }
+
+  return candidate
+}
+
 /**
  * Get a sensible default working directory for Windows shells.
  * On native Windows: user's home directory (C:\Users\<username>)
- * In WSL: Windows user profile converted to WSL path, falling back to C:\
+ * In WSL: a Windows-native drive path (USERPROFILE, HOME drive, or SYSTEMDRIVE root)
  *
  * This avoids UNC paths (\\wsl.localhost\...) which cmd.exe doesn't support.
- * Respects custom WSL mount configurations via WSL_WINDOWS_SYS32.
  */
 function getWindowsDefaultCwd(): string {
   if (isWindows()) {
     return os.homedir()
   }
-  // In WSL, we need a Windows-accessible path
-  const mountPrefix = getWslMountPrefix()
 
-  // Try USERPROFILE if it's shared via WSLENV, convert to WSL mount path
   const userProfile = process.env.USERPROFILE
-  if (userProfile) {
-    // Convert Windows path (C:\Users\name) to WSL path (/mnt/c/Users/name)
-    const match = userProfile.match(/^([A-Za-z]):\\(.*)$/)
-    if (match) {
-      const drive = match[1].toLowerCase()
-      const rest = match[2].replace(/\\/g, '/')
-      return `${mountPrefix}/${drive}/${rest}`
-    }
+  if (userProfile?.trim()) {
+    const resolved = resolveWindowsShellCwd(userProfile)
+    if (resolved) return resolved
   }
-  // Fallback: use C:\ root
-  return `${mountPrefix}/c`
+
+  const homeDrive = process.env.HOMEDRIVE
+  const homePath = process.env.HOMEPATH
+  if (homeDrive && homePath) {
+    return path.win32.resolve(`${homeDrive}${homePath}`)
+  }
+
+  const systemDrive = process.env.SYSTEMDRIVE || 'C:'
+  return path.win32.resolve(`${systemDrive}\\`)
 }
 
 /**
@@ -493,7 +578,8 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
 
       if (cwd) {
         // cwd must be a Linux path inside WSL.
-        args.push('--cd', cwd)
+        const wslCwd = isLinuxPath(cwd) ? cwd : (convertWindowsPathToWslPath(cwd) || cwd)
+        args.push('--cd', wslCwd)
       }
 
       if (mode === 'shell') {
@@ -518,7 +604,9 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
       // In WSL, we can't pass Linux paths as cwd to Windows executables (they become UNC paths)
       // Instead, pass no cwd and use cd /d inside the command
       const inWsl = isWsl()
-      const winCwd = inWsl ? getWindowsDefaultCwd() : (isLinuxPath(cwd) ? undefined : cwd)
+      const winCwd = inWsl
+        ? (resolveWindowsShellCwd(cwd) || getWindowsDefaultCwd())
+        : (isLinuxPath(cwd) ? undefined : cwd)
       // For WSL: don't pass cwd to node-pty, use cd /d in command instead
       const procCwd = inWsl ? undefined : winCwd
       logger.debug({
@@ -547,7 +635,9 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
     const file = getWindowsExe('powershell')
     // In WSL, we can't pass Linux paths as cwd to Windows executables (they become UNC paths)
     const inWsl = isWsl()
-    const winCwd = inWsl ? getWindowsDefaultCwd() : (isLinuxPath(cwd) ? undefined : cwd)
+    const winCwd = inWsl
+      ? (resolveWindowsShellCwd(cwd) || getWindowsDefaultCwd())
+      : (isLinuxPath(cwd) ? undefined : cwd)
     const procCwd = inWsl ? undefined : winCwd
     logger.debug({
       shell: 'powershell',
@@ -574,19 +664,21 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
   }
 // Non-Windows: native spawn using system shell
   const systemShell = getSystemShell()
+  const unixCwd = resolveUnixShellCwd(cwd)
 
   if (mode === 'shell') {
-    return { file: systemShell, args: ['-l'], cwd, env }
+    return { file: systemShell, args: ['-l'], cwd: unixCwd, env }
   }
 
   const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings)
   const cmd = cli?.command || mode
   const args = cli?.args || []
-  return { file: cmd, args, cwd, env }
+  return { file: cmd, args, cwd: unixCwd, env }
 }
 
 export class TerminalRegistry extends EventEmitter {
   private terminals = new Map<string, TerminalRecord>()
+  private bindingAuthority = new SessionBindingAuthority()
   private settings: AppSettings | undefined
   private idleTimer: NodeJS.Timeout | null = null
   private perfTimer: NodeJS.Timeout | null = null
@@ -594,6 +686,7 @@ export class TerminalRegistry extends EventEmitter {
   private maxExitedTerminals: number
   private scrollbackMaxChars: number
   private maxPendingSnapshotChars: number
+  private mobileOutputBuffers = new Map<WebSocket, PendingMobileOutput>()
 
   constructor(settings?: AppSettings, maxTerminals?: number, maxExitedTerminals?: number) {
     super()
@@ -803,7 +896,7 @@ export class TerminalRegistry extends EventEmitter {
       title,
       description: undefined,
       mode: opts.mode,
-      resumeSessionId: normalizedResume,
+      resumeSessionId: undefined,
       createdAt,
       lastActivityAt: createdAt,
       status: 'running',
@@ -889,7 +982,7 @@ export class TerminalRegistry extends EventEmitter {
           pending.queuedChars = nextChars
           continue
         }
-        this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf: record.perf })
+        this.sendTerminalOutput(client, terminalId, data, record.perf)
       }
     })
 
@@ -903,15 +996,26 @@ export class TerminalRegistry extends EventEmitter {
       record.lastActivityAt = now
       record.exitedAt = now
       for (const client of record.clients) {
+        this.flushMobileOutput(client)
         this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: e.exitCode }, { terminalId, perf: record.perf })
       }
       record.clients.clear()
       record.pendingSnapshotClients.clear()
+      this.releaseBinding(terminalId)
       this.emit('terminal.exit', { terminalId, exitCode: e.exitCode })
       this.reapExitedTerminals()
     })
 
     this.terminals.set(terminalId, record)
+    if (modeSupportsResume(opts.mode) && normalizedResume) {
+      const bound = this.bindSession(terminalId, opts.mode as CodingCliProviderName, normalizedResume)
+      if (!bound.ok) {
+        logger.warn(
+          { terminalId, mode: opts.mode, sessionId: normalizedResume, reason: bound.reason },
+          'Failed to bind resume session during terminal create',
+        )
+      }
+    }
     this.emit('terminal.created', record)
     return record
   }
@@ -932,13 +1036,15 @@ export class TerminalRegistry extends EventEmitter {
     if (!queued) return
     term.pendingSnapshotClients.delete(client)
     for (const data of queued.chunks) {
-      this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf: term.perf })
+      this.sendTerminalOutput(client, terminalId, data, term.perf)
     }
   }
 
   detach(terminalId: string, client: WebSocket): boolean {
     const term = this.terminals.get(terminalId)
     if (!term) return false
+    this.flushMobileOutput(client)
+    this.clearMobileOutput(client)
     term.clients.delete(client)
     term.pendingSnapshotClients.delete(client)
     return true
@@ -992,10 +1098,12 @@ export class TerminalRegistry extends EventEmitter {
     term.lastActivityAt = now
     term.exitedAt = now
     for (const client of term.clients) {
+      this.flushMobileOutput(client)
       this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: term.exitCode })
     }
     term.clients.clear()
     term.pendingSnapshotClients.clear()
+    this.releaseBinding(terminalId)
     this.emit('terminal.exit', { terminalId, exitCode: term.exitCode })
     this.reapExitedTerminals()
     return true
@@ -1039,6 +1147,86 @@ export class TerminalRegistry extends EventEmitter {
     return this.terminals.get(terminalId)
   }
 
+  private releaseBinding(terminalId: string): void {
+    this.bindingAuthority.unbindTerminal(terminalId)
+    const rec = this.terminals.get(terminalId)
+    if (rec) rec.resumeSessionId = undefined
+  }
+
+  private isMobileClient(client: WebSocket): boolean {
+    return (client as any).isMobileClient === true
+  }
+
+  private clearMobileOutput(client: WebSocket): void {
+    const pending = this.mobileOutputBuffers.get(client)
+    if (!pending) return
+    if (pending.timer) {
+      clearTimeout(pending.timer)
+      pending.timer = null
+    }
+    this.mobileOutputBuffers.delete(client)
+  }
+
+  private flushMobileOutput(client: WebSocket): void {
+    const pending = this.mobileOutputBuffers.get(client)
+    if (!pending) return
+
+    if (pending.timer) {
+      clearTimeout(pending.timer)
+      pending.timer = null
+    }
+
+    if (pending.queuedChars <= 0) {
+      this.mobileOutputBuffers.delete(client)
+      return
+    }
+
+    for (const [terminalId, chunks] of pending.chunksByTerminal) {
+      if (chunks.length === 0) continue
+      const data = chunks.join('')
+      const perf = pending.perfByTerminal.get(terminalId)
+      this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf })
+    }
+    this.mobileOutputBuffers.delete(client)
+  }
+
+  private sendTerminalOutput(client: WebSocket, terminalId: string, data: string, perf?: TerminalRecord['perf']): void {
+    if (!this.isMobileClient(client)) {
+      this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf })
+      return
+    }
+
+    let pending = this.mobileOutputBuffers.get(client)
+    if (!pending) {
+      pending = {
+        timer: null,
+        chunksByTerminal: new Map(),
+        perfByTerminal: new Map(),
+        queuedChars: 0,
+      }
+      this.mobileOutputBuffers.set(client, pending)
+    }
+
+    const nextSize = pending.queuedChars + data.length
+    if (nextSize > MAX_MOBILE_OUTPUT_BUFFER_CHARS) {
+      this.flushMobileOutput(client)
+      this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf })
+      return
+    }
+
+    const chunks = pending.chunksByTerminal.get(terminalId) || []
+    chunks.push(data)
+    pending.chunksByTerminal.set(terminalId, chunks)
+    pending.perfByTerminal.set(terminalId, perf)
+    pending.queuedChars = nextSize
+
+    if (!pending.timer) {
+      pending.timer = setTimeout(() => {
+        this.flushMobileOutput(client)
+      }, MOBILE_OUTPUT_FLUSH_MS)
+    }
+  }
+
   safeSend(client: WebSocket, msg: unknown, context?: { terminalId?: string; perf?: TerminalRecord['perf'] }) {
     // Backpressure guard.
     // @ts-ignore
@@ -1067,10 +1255,22 @@ export class TerminalRegistry extends EventEmitter {
       }
       return
     }
+    let messageType: string | undefined
+    if (msg && typeof msg === 'object' && 'type' in msg) {
+      const typeValue = (msg as { type?: unknown }).type
+      if (typeof typeValue === 'string') messageType = typeValue
+    }
     try {
       client.send(JSON.stringify(msg))
-    } catch {
-      // ignore
+    } catch (err) {
+      logger.warn(
+        {
+          err: err instanceof Error ? err : new Error(String(err)),
+          terminalId: context?.terminalId || 'unknown',
+          messageType: messageType || 'unknown',
+        },
+        'Terminal output send failed',
+      )
     }
   }
 
@@ -1115,12 +1315,108 @@ export class TerminalRegistry extends EventEmitter {
    * Find a running terminal of the given mode that already owns the given sessionId.
    */
   findRunningTerminalBySession(mode: TerminalMode, sessionId: string): TerminalRecord | undefined {
+    if (modeSupportsResume(mode)) {
+      const owner = this.bindingAuthority.ownerForSession(mode as CodingCliProviderName, sessionId)
+      if (owner) {
+        const rec = this.terminals.get(owner)
+        if (rec && rec.mode === mode && rec.status === 'running' && rec.resumeSessionId === sessionId) {
+          return rec
+        }
+        this.bindingAuthority.unbindTerminal(owner)
+      }
+    }
     for (const term of this.terminals.values()) {
       if (term.mode !== mode) continue
       if (term.status !== 'running') continue
       if (term.resumeSessionId === sessionId) return term
     }
     return undefined
+  }
+
+  getCanonicalRunningTerminalBySession(mode: TerminalMode, sessionId: string): TerminalRecord | undefined {
+    if (!modeSupportsResume(mode)) return undefined
+
+    const owner = this.bindingAuthority.ownerForSession(mode as CodingCliProviderName, sessionId)
+    if (owner) {
+      const rec = this.terminals.get(owner)
+      if (rec && rec.mode === mode && rec.status === 'running' && rec.resumeSessionId === sessionId) {
+        return rec
+      }
+      this.bindingAuthority.unbindTerminal(owner)
+    }
+
+    const matches = Array.from(this.terminals.values())
+      .filter((term) => term.mode === mode && term.status === 'running' && term.resumeSessionId === sessionId)
+      .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))
+
+    return matches[0]
+  }
+
+  repairLegacySessionOwners(mode: TerminalMode, sessionId: string): RepairLegacySessionOwnersResult {
+    if (!modeSupportsResume(mode)) {
+      return { repaired: false, clearedTerminalIds: [] }
+    }
+
+    const matches = Array.from(this.terminals.values())
+      .filter((term) => term.mode === mode && term.status === 'running' && term.resumeSessionId === sessionId)
+      .sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0))
+    if (matches.length === 0) {
+      return { repaired: false, clearedTerminalIds: [] }
+    }
+
+    const provider = mode as CodingCliProviderName
+    const canonical = matches[0]
+    const owner = this.bindingAuthority.ownerForSession(provider, sessionId)
+    if (owner && owner !== canonical.terminalId) {
+      this.bindingAuthority.clearSessionOwner(provider, sessionId)
+    }
+
+    const bound = this.bindingAuthority.bind({
+      provider,
+      sessionId,
+      terminalId: canonical.terminalId,
+    })
+    if (bound.ok) {
+      canonical.resumeSessionId = sessionId
+    } else {
+      logger.warn(
+        {
+          provider,
+          sessionId,
+          canonicalTerminalId: canonical.terminalId,
+          reason: bound.reason,
+          ...(bound.reason === 'session_already_owned' ? { ownerTerminalId: bound.owner } : {}),
+          ...(bound.reason === 'terminal_already_bound' ? { existingBinding: bound.existing } : {}),
+        },
+        'session_bind_repair_failed',
+      )
+    }
+
+    const clearedTerminalIds: string[] = []
+    for (const duplicate of matches.slice(1)) {
+      this.bindingAuthority.unbindTerminal(duplicate.terminalId)
+      duplicate.resumeSessionId = undefined
+      clearedTerminalIds.push(duplicate.terminalId)
+    }
+
+    const repaired = clearedTerminalIds.length > 0 || bound.ok
+    if (repaired && (clearedTerminalIds.length > 0 || owner !== canonical.terminalId)) {
+      logger.info(
+        {
+          provider,
+          sessionId,
+          canonicalTerminalId: canonical.terminalId,
+          previousOwnerTerminalId: owner,
+          clearedTerminalIds,
+        },
+        'session_bind_repair_applied',
+      )
+    }
+    return {
+      repaired,
+      canonicalTerminalId: canonical.terminalId,
+      clearedTerminalIds,
+    }
   }
 
   /**
@@ -1168,15 +1464,49 @@ export class TerminalRegistry extends EventEmitter {
    * Set the resumeSessionId on a terminal (one-time association).
    * Returns false if terminal not found.
    */
+  bindSession(terminalId: string, provider: CodingCliProviderName, sessionId: string): BindSessionResult {
+    const term = this.terminals.get(terminalId)
+    if (!term) return { ok: false, reason: 'terminal_missing' }
+    if (term.mode !== provider) return { ok: false, reason: 'mode_mismatch' }
+
+    const normalized = normalizeResumeSessionId(provider, sessionId)
+    if (!normalized) return { ok: false, reason: 'invalid_session_id' }
+
+    const bound = this.bindingAuthority.bind({ provider, sessionId: normalized, terminalId })
+    if (!bound.ok) {
+      if (bound.reason === 'session_already_owned') {
+        logger.warn(
+          {
+            provider,
+            sessionId: normalized,
+            ownerTerminalId: bound.owner,
+            attemptedTerminalId: terminalId,
+          },
+          'session_bind_conflict',
+        )
+      } else {
+        logger.warn(
+          {
+            provider,
+            sessionId: normalized,
+            terminalId,
+            existingBinding: bound.existing,
+          },
+          'session_terminal_already_bound',
+        )
+      }
+      return bound
+    }
+
+    term.resumeSessionId = normalized
+    return { ok: true, terminalId, sessionId: normalized }
+  }
+
   setResumeSessionId(terminalId: string, sessionId: string): boolean {
     const term = this.terminals.get(terminalId)
     if (!term) return false
-    if (term.mode === 'claude' && !isValidClaudeSessionId(sessionId)) {
-      logger.warn({ sessionId, terminalId }, 'Ignoring invalid Claude resumeSessionId')
-      return false
-    }
-    term.resumeSessionId = sessionId
-    return true
+    if (term.mode === 'shell') return false
+    return this.bindSession(terminalId, term.mode as CodingCliProviderName, sessionId).ok
   }
 
   /**
@@ -1201,5 +1531,88 @@ export class TerminalRegistry extends EventEmitter {
     }
 
     logger.info({ count: terminalIds.length }, 'All terminals shut down')
+  }
+
+  /**
+   * Gracefully shutdown all terminals. Sends SIGTERM (or plain kill on Windows)
+   * and waits for processes to exit, giving them time to flush writes.
+   * Falls back to forced kill after timeout.
+   */
+  async shutdownGracefully(timeoutMs: number = 5000): Promise<void> {
+    // Stop timers
+    if (this.idleTimer) {
+      clearInterval(this.idleTimer)
+      this.idleTimer = null
+    }
+    if (this.perfTimer) {
+      clearInterval(this.perfTimer)
+      this.perfTimer = null
+    }
+
+    const running: TerminalRecord[] = []
+    for (const term of this.terminals.values()) {
+      if (term.status === 'running') running.push(term)
+    }
+
+    if (running.length === 0) {
+      logger.info('No running terminals to shut down')
+      return
+    }
+
+    // Set up exit listeners BEFORE sending signals (avoid race)
+    const exitPromises = running.map(term =>
+      new Promise<void>(resolve => {
+        if (term.status === 'exited') { resolve(); return }
+        const handler = (evt: { terminalId: string }) => {
+          if (evt.terminalId === term.terminalId) {
+            this.off('terminal.exit', handler)
+            resolve()
+          }
+        }
+        this.on('terminal.exit', handler)
+        // Re-check after listener setup (TOCTOU guard — status may mutate between filter and here)
+        if ((term.status as string) === 'exited') {
+          this.off('terminal.exit', handler)
+          resolve()
+        }
+      })
+    )
+
+    // Send SIGTERM (or plain kill on Windows where signal args are unsupported)
+    const isWindows = process.platform === 'win32'
+    for (const term of running) {
+      try {
+        if (isWindows) {
+          term.pty.kill()
+        } else {
+          term.pty.kill('SIGTERM')
+        }
+      } catch {
+        // Already gone — will be cleaned up below
+      }
+    }
+
+    logger.info({ count: running.length }, 'Sent SIGTERM to running terminals, waiting for exit...')
+
+    // Wait for all to exit, or timeout
+    await Promise.race([
+      Promise.all(exitPromises),
+      new Promise<void>(r => setTimeout(r, timeoutMs)),
+    ])
+
+    // Force kill any that didn't exit in time
+    let forceKilled = 0
+    for (const term of running) {
+      if (term.status !== 'exited') {
+        this.kill(term.terminalId)
+        forceKilled++
+      }
+    }
+
+    if (forceKilled > 0) {
+      logger.warn({ forceKilled }, 'Force-killed terminals after graceful timeout')
+    }
+
+    logger.info({ count: running.length, forceKilled }, 'All terminals shut down')
   }
 }

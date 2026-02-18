@@ -1,5 +1,6 @@
 import cp from 'child_process'
 import fsPromises from 'fs/promises'
+import os from 'os'
 
 /**
  * Detect the platform, including WSL detection.
@@ -22,6 +23,33 @@ export async function detectPlatform(): Promise<string> {
   }
 
   return process.platform
+}
+
+async function detectWslWindowsHostName(): Promise<string | null> {
+  return new Promise((resolve) => {
+    cp.execFile(
+      'powershell.exe',
+      ['-NoProfile', '-Command', '$env:COMPUTERNAME'],
+      { timeout: 3000 },
+      (err, stdout) => {
+        if (err) {
+          resolve(null)
+          return
+        }
+        const value = stdout.trim()
+        resolve(value || null)
+      },
+    )
+  })
+}
+
+export async function detectHostName(): Promise<string> {
+  const platform = await detectPlatform()
+  if (platform === 'wsl') {
+    const windowsHostName = await detectWslWindowsHostName()
+    if (windowsHostName) return windowsHostName
+  }
+  return os.hostname()
 }
 
 async function isCommandAvailable(command: string): Promise<boolean> {

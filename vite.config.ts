@@ -3,6 +3,7 @@ import type { HttpProxy } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { getNetworkHost } from './server/get-network-host.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -23,6 +24,9 @@ export default defineConfig(({ mode }) => {
   const backendHost = env.VITE_BACKEND_HOST || env.BACKEND_HOST || '127.0.0.1'
   const backendUrl = `http://${backendHost}:${backendPort}`
   const vitePort = parseInt(env.VITE_PORT || '5173', 10)
+  const allowedHosts = env.VITE_ALLOWED_HOSTS
+    ? env.VITE_ALLOWED_HOSTS.split(',').map((h) => h.trim()).filter(Boolean)
+    : undefined // Vite's default behavior (localhost + host value)
 
   return {
     plugins: [react()],
@@ -33,6 +37,7 @@ export default defineConfig(({ mode }) => {
       alias: {
         '@': path.resolve(__dirname, './src'),
         '@test': path.resolve(__dirname, './test'),
+        '@shared': path.resolve(__dirname, './shared'),
       },
     },
     build: {
@@ -40,7 +45,8 @@ export default defineConfig(({ mode }) => {
       sourcemap: mode === 'development',
     },
     server: {
-      host: true,
+      host: getNetworkHost(),
+      allowedHosts,
       port: vitePort,
       watch: {
         ignored: ['**/.worktrees/**', '**/demo-projects/**'],

@@ -41,32 +41,67 @@ class FakeBuffer {
   snapshot() { return 'codex session output' }
 }
 
+type FakeTerminal = {
+  terminalId: string
+  createdAt: number
+  buffer: FakeBuffer
+  mode: 'codex'
+  shell: 'system'
+  status: 'running'
+  resumeSessionId?: string
+  clients: Set<WebSocket>
+}
+
 class FakeRegistry {
-  record: any
+  records: FakeTerminal[]
   attachCalls: Array<{ terminalId: string; opts?: any }> = []
   finishAttachSnapshotCalls: Array<{ terminalId: string }> = []
   createCalls: any[] = []
+  repairCalls: Array<{ mode: string; sessionId: string }> = []
 
-  constructor(terminalId: string) {
-    this.record = {
+  constructor(terminalIds: string[]) {
+    const createdAt = Date.now()
+    this.records = terminalIds.map((terminalId, idx) => ({
       terminalId,
-      createdAt: Date.now(),
+      createdAt: createdAt + idx,
       buffer: new FakeBuffer(),
-      mode: 'codex',
-      shell: 'system',
-      status: 'running',
+      mode: 'codex' as const,
+      shell: 'system' as const,
+      status: 'running' as const,
       resumeSessionId: CODEX_SESSION_ID,
       clients: new Set<WebSocket>(),
-    }
+    }))
+  }
+
+  private findById(terminalId: string): FakeTerminal | undefined {
+    return this.records.find((record) => record.terminalId === terminalId)
   }
 
   get(terminalId: string) {
-    return this.record.terminalId === terminalId ? this.record : null
+    return this.findById(terminalId) ?? null
   }
 
+  // Legacy non-canonical lookup returns newest matching record first.
   findRunningTerminalBySession(mode: string, sessionId: string) {
-    if (mode === this.record.mode && sessionId === CODEX_SESSION_ID) return this.record
-    return undefined
+    if (mode !== 'codex' || sessionId !== CODEX_SESSION_ID) return undefined
+    return this.records.slice().reverse().find((record) => record.status === 'running')
+  }
+
+  getCanonicalRunningTerminalBySession(mode: string, sessionId: string) {
+    if (mode !== 'codex' || sessionId !== CODEX_SESSION_ID) return undefined
+    return this.records.find((record) => record.status === 'running' && record.resumeSessionId === CODEX_SESSION_ID)
+  }
+
+  repairLegacySessionOwners(mode: string, sessionId: string) {
+    this.repairCalls.push({ mode, sessionId })
+    if (mode !== 'codex' || sessionId !== CODEX_SESSION_ID) return
+    const canonical = this.records[0]
+    this.records = this.records.map((record) => {
+      if (record.terminalId === canonical?.terminalId) {
+        return { ...record, resumeSessionId: CODEX_SESSION_ID }
+      }
+      return { ...record, resumeSessionId: undefined }
+    })
   }
 
   findRunningClaudeTerminalBySession(sessionId: string) {
@@ -75,22 +110,26 @@ class FakeRegistry {
 
   attach(terminalId: string, ws: WebSocket, opts?: any) {
     this.attachCalls.push({ terminalId, opts })
-    this.record.clients.add(ws)
-    return this.record
+    const record = this.findById(terminalId)
+    if (!record) return null
+    record.clients.add(ws)
+    return record
   }
 
   finishAttachSnapshot(terminalId: string, _ws: WebSocket) {
     this.finishAttachSnapshotCalls.push({ terminalId })
   }
 
-  detach(_terminalId: string, ws: WebSocket) {
-    this.record.clients.delete(ws)
+  detach(terminalId: string, ws: WebSocket) {
+    const record = this.findById(terminalId)
+    if (!record) return false
+    record.clients.delete(ws)
     return true
   }
 
   create(opts: any) {
     this.createCalls.push(opts)
-    return this.record
+    return this.records[0]
   }
 
   list() { return [] }
@@ -108,7 +147,7 @@ describe('terminal.create reuse running codex terminal', () => {
 
     const { WsHandler } = await import('../../server/ws-handler')
     server = http.createServer((_req, res) => { res.statusCode = 404; res.end() })
-    registry = new FakeRegistry('term-codex-existing')
+    registry = new FakeRegistry(['term-codex-existing'])
     new WsHandler(server, registry as any)
     const info = await listen(server)
     port = info.port
@@ -118,6 +157,7 @@ describe('terminal.create reuse running codex terminal', () => {
     registry.attachCalls = []
     registry.finishAttachSnapshotCalls = []
     registry.createCalls = []
+    registry.repairCalls = []
   })
 
   afterAll(async () => {
@@ -174,6 +214,51 @@ describe('terminal.create reuse running codex terminal', () => {
       expect(created.effectiveResumeSessionId).toBe(CODEX_SESSION_ID)
     } finally {
       ws.close()
+    }
+  })
+
+  it('reuses canonical owner and repairs duplicate session records before reuse', async () => {
+    const { WsHandler } = await import('../../server/ws-handler')
+    const dupeServer = http.createServer((_req, res) => { res.statusCode = 404; res.end() })
+    const dupeRegistry = new FakeRegistry(['term-canonical', 'term-duplicate'])
+    new WsHandler(dupeServer, dupeRegistry as any)
+    const info = await listen(dupeServer)
+
+    const ws = new WebSocket(`ws://127.0.0.1:${info.port}/ws`)
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+      await waitForMessage(ws, (m) => m.type === 'ready')
+
+      // Make canonical lookup fail initially so handler must invoke repair and retry.
+      const originalGetCanonical = dupeRegistry.getCanonicalRunningTerminalBySession.bind(dupeRegistry)
+      let firstLookup = true
+      dupeRegistry.getCanonicalRunningTerminalBySession = ((mode: string, sessionId: string) => {
+        if (firstLookup) {
+          firstLookup = false
+          return undefined
+        }
+        return originalGetCanonical(mode, sessionId)
+      }) as any
+
+      const requestId = 'codex-reuse-repair'
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'codex',
+        resumeSessionId: CODEX_SESSION_ID,
+      }))
+
+      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+
+      expect(created.terminalId).toBe('term-canonical')
+      expect(dupeRegistry.createCalls).toHaveLength(0)
+      expect(dupeRegistry.repairCalls).toHaveLength(1)
+      expect(dupeRegistry.repairCalls[0]).toEqual({ mode: 'codex', sessionId: CODEX_SESSION_ID })
+      expect(dupeRegistry.attachCalls[0]?.terminalId).toBe('term-canonical')
+    } finally {
+      ws.close()
+      await new Promise<void>((resolve) => dupeServer.close(() => resolve()))
     }
   })
 })

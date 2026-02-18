@@ -1,9 +1,20 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+  type TouchEvent as ReactTouchEvent,
+} from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
-import { updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
+import { addTab, updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
+import { initLayout, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
+import { updateSettingsLocal } from '@/store/settingsSlice'
 import { recordTurnComplete, clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
+import { api } from '@/lib/api'
 import { getWsClient } from '@/lib/ws-client'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import { getResumeSessionIdFromRef } from '@/components/terminal-view-utils'
@@ -11,25 +22,66 @@ import { copyText, readText } from '@/lib/clipboard'
 import { registerTerminalActions } from '@/lib/pane-action-registry'
 import { consumeTerminalRestoreRequestId, addTerminalRestoreRequestId } from '@/lib/terminal-restore'
 import { isTerminalPasteShortcut } from '@/lib/terminal-input-policy'
+import { useMobile } from '@/hooks/useMobile'
+import { findLocalFilePaths } from '@/lib/path-utils'
 import {
   createTurnCompleteSignalParserState,
   extractTurnCompleteSignals,
 } from '@/lib/turn-complete-signal'
+import {
+  createOsc52ParserState,
+  extractOsc52Events,
+  type Osc52Event,
+  type Osc52Policy,
+} from '@/lib/terminal-osc52'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { resolveTerminalFontFamily } from '@/lib/terminal-fonts'
 import { useChunkedAttach } from '@/components/terminal/useChunkedAttach'
+import { Osc52PromptModal } from '@/components/terminal/Osc52PromptModal'
+import { TerminalSearchBar } from '@/components/terminal/TerminalSearchBar'
+import {
+  createTerminalRuntime,
+  type TerminalRuntime,
+} from '@/components/terminal/terminal-runtime'
 import { nanoid } from 'nanoid'
 import { cn } from '@/lib/utils'
-import { Terminal } from 'xterm'
-import { FitAddon } from 'xterm-addon-fit'
+import { Terminal } from '@xterm/xterm'
 import { Loader2 } from 'lucide-react'
+import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { PaneContent, TerminalPaneContent } from '@/store/paneTypes'
-import 'xterm/css/xterm.css'
+import '@xterm/xterm/css/xterm.css'
 
 const SESSION_ACTIVITY_THROTTLE_MS = 5000
 const RATE_LIMIT_RETRY_MAX_ATTEMPTS = 3
 const RATE_LIMIT_RETRY_BASE_MS = 250
 const RATE_LIMIT_RETRY_MAX_MS = 1000
+const KEYBOARD_INSET_ACTIVATION_PX = 80
+const MOBILE_KEYBAR_HEIGHT_PX = 40
+const MOBILE_KEY_REPEAT_INITIAL_DELAY_MS = 320
+const MOBILE_KEY_REPEAT_INTERVAL_MS = 70
+const TAP_MULTI_INTERVAL_MS = 350
+const TAP_MAX_DISTANCE_PX = 24
+const TOUCH_SCROLL_PIXELS_PER_LINE = 18
+
+const SEARCH_DECORATIONS = {
+  matchBackground: '#515C6A',
+  matchOverviewRuler: '#D4AA00',
+  activeMatchBackground: '#EEB04A',
+  activeMatchColorOverviewRuler: '#EEB04A',
+} as const
+
+function createNoopRuntime(): TerminalRuntime {
+  return {
+    attachAddons: () => {},
+    fit: () => {},
+    findNext: () => false,
+    findPrevious: () => false,
+    clearDecorations: () => {},
+    onDidChangeResults: () => ({ dispose: () => {} }),
+    dispose: () => {},
+    webglActive: () => false,
+  }
+}
 
 interface TerminalViewProps {
   tabId: string
@@ -38,11 +90,49 @@ interface TerminalViewProps {
   hidden?: boolean
 }
 
+type MobileToolbarKeyId = 'esc' | 'tab' | 'ctrl' | 'up' | 'down' | 'left' | 'right'
+type RepeatableMobileToolbarKeyId = Extract<MobileToolbarKeyId, 'up' | 'down' | 'left' | 'right'>
+
+const MOBILE_TOOLBAR_KEYS: Array<{ id: MobileToolbarKeyId; label: string; ariaLabel: string; isArrow?: boolean }> = [
+  { id: 'esc', label: 'Esc', ariaLabel: 'Esc key' },
+  { id: 'tab', label: 'Tab', ariaLabel: 'Tab key' },
+  { id: 'ctrl', label: 'Ctrl', ariaLabel: 'Toggle Ctrl modifier' },
+  { id: 'up', label: '↑', ariaLabel: 'Up key', isArrow: true },
+  { id: 'down', label: '↓', ariaLabel: 'Down key', isArrow: true },
+  { id: 'left', label: '←', ariaLabel: 'Left key', isArrow: true },
+  { id: 'right', label: '→', ariaLabel: 'Right key', isArrow: true },
+]
+
+function isRepeatableMobileToolbarKey(keyId: MobileToolbarKeyId): keyId is RepeatableMobileToolbarKeyId {
+  return keyId === 'up' || keyId === 'down' || keyId === 'left' || keyId === 'right'
+}
+
+function resolveMobileToolbarInput(keyId: Exclude<MobileToolbarKeyId, 'ctrl'>, ctrlActive: boolean): string {
+  if (ctrlActive) {
+    if (keyId === 'up') return '\u001b[1;5A'
+    if (keyId === 'down') return '\u001b[1;5B'
+    if (keyId === 'right') return '\u001b[1;5C'
+    if (keyId === 'left') return '\u001b[1;5D'
+    // Ctrl+Esc and Ctrl+Tab do not have canonical terminal sequences; send plain key input.
+  }
+
+  if (keyId === 'esc') return '\u001b'
+  if (keyId === 'tab') return '\t'
+  if (keyId === 'up') return '\u001b[A'
+  if (keyId === 'down') return '\u001b[B'
+  if (keyId === 'right') return '\u001b[C'
+  if (keyId === 'left') return '\u001b[D'
+  const unreachableKey: never = keyId
+  throw new Error(`Unsupported mobile toolbar key: ${unreachableKey}`)
+}
+
 export default function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps) {
   const dispatch = useAppDispatch()
+  const isMobile = useMobile()
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
+  const localServerInstanceId = useAppSelector((s) => s.connection.serverInstanceId)
   const settings = useAppSelector((s) => s.settings.settings)
   const hasAttention = useAppSelector((s) => !!s.turnCompletion?.attentionByTab?.[tabId])
   const hasAttentionRef = useRef(hasAttention)
@@ -52,10 +142,19 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   // All hooks MUST be called before any conditional returns
   const ws = useMemo(() => getWsClient(), [])
   const [isAttaching, setIsAttaching] = useState(false)
+  const [pendingLinkUri, setPendingLinkUri] = useState<string | null>(null)
+  const [pendingOsc52Event, setPendingOsc52Event] = useState<Osc52Event | null>(null)
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchResults, setSearchResults] = useState<{ resultIndex: number; resultCount: number } | null>(null)
+  const [keyboardInsetPx, setKeyboardInsetPx] = useState(0)
+  const [mobileCtrlActive, setMobileCtrlActive] = useState(false)
+  const setPendingLinkUriRef = useRef(setPendingLinkUri)
+  const mobileCtrlActiveRef = useRef(false)
 
   const containerRef = useRef<HTMLDivElement | null>(null)
   const termRef = useRef<Terminal | null>(null)
-  const fitRef = useRef<FitAddon | null>(null)
+  const runtimeRef = useRef<TerminalRuntime | null>(null)
   const mountedRef = useRef(false)
   const hiddenRef = useRef(hidden)
   const lastSessionActivityAtRef = useRef(0)
@@ -63,7 +162,26 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const restoreRequestIdRef = useRef<string | null>(null)
   const restoreFlagRef = useRef(false)
   const turnCompleteSignalStateRef = useRef(createTurnCompleteSignalParserState())
+  const osc52ParserRef = useRef(createOsc52ParserState())
+  const osc52PolicyRef = useRef<Osc52Policy>(settings.terminal.osc52Clipboard)
+  const pendingOsc52EventRef = useRef<Osc52Event | null>(null)
+  const osc52QueueRef = useRef<Osc52Event[]>([])
   const warnExternalLinksRef = useRef(settings.terminal.warnExternalLinks)
+  const debugRef = useRef(!!settings.logging?.debug)
+  const attentionDismissRef = useRef(settings.panes?.attentionDismiss ?? 'click')
+  const touchActiveRef = useRef(false)
+  const touchSelectionModeRef = useRef(false)
+  const touchStartYRef = useRef(0)
+  const touchLastYRef = useRef(0)
+  const touchScrollAccumulatorRef = useRef(0)
+  const touchStartXRef = useRef(0)
+  const touchMovedRef = useRef(false)
+  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const mobileKeyRepeatDelayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const mobileKeyRepeatIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const lastTapAtRef = useRef(0)
+  const lastTapPointRef = useRef<{ x: number; y: number } | null>(null)
+  const tapCountRef = useRef(0)
 
   // Extract terminal-specific fields (safe because we check kind later)
   const isTerminal = paneContent.kind === 'terminal'
@@ -78,11 +196,20 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   // Keep refs in sync with props
   useEffect(() => {
     if (terminalContent) {
+      const prev = contentRef.current
+      if (prev && terminalContent.resumeSessionId !== prev.resumeSessionId) {
+        if (debugRef.current) console.log('[TRACE resumeSessionId] ref sync from props CHANGED resumeSessionId', {
+          paneId,
+          from: prev.resumeSessionId,
+          to: terminalContent.resumeSessionId,
+          createRequestId: terminalContent.createRequestId,
+        })
+      }
       terminalIdRef.current = terminalContent.terminalId
       requestIdRef.current = terminalContent.createRequestId
       contentRef.current = terminalContent
     }
-  }, [terminalContent])
+  }, [terminalContent, paneId])
 
   useEffect(() => {
     hiddenRef.current = hidden
@@ -92,11 +219,19 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     warnExternalLinksRef.current = settings.terminal.warnExternalLinks
   }, [settings.terminal.warnExternalLinks])
 
-  // Sync ref during render (not in useEffect) so sendInput always sees the
-  // latest value — avoids a stale-ref window where the first keystroke after
-  // attention is set wouldn't clear it.
+  useEffect(() => {
+    osc52PolicyRef.current = settings.terminal.osc52Clipboard
+  }, [settings.terminal.osc52Clipboard])
+
+  useEffect(() => {
+    pendingOsc52EventRef.current = pendingOsc52Event
+  }, [pendingOsc52Event])
+
+  // Sync during render (not in useEffect) so refs always have latest values
   hasAttentionRef.current = hasAttention
   hasPaneAttentionRef.current = hasPaneAttention
+  attentionDismissRef.current = settings.panes?.attentionDismiss ?? 'click'
+  debugRef.current = !!settings.logging?.debug
 
   const shouldFocusActiveTerminal = !hidden && activeTabId === tabId && activePaneId === paneId
 
@@ -117,6 +252,194 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     lastSessionActivityAtRef.current = 0
   }, [terminalContent?.resumeSessionId])
 
+  useEffect(() => {
+    if (!isMobile || typeof window === 'undefined' || !window.visualViewport) {
+      setKeyboardInsetPx(0)
+      return
+    }
+
+    const viewport = window.visualViewport
+    let rafId: number | null = null
+
+    const updateKeyboardInset = () => {
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId)
+      }
+      rafId = requestAnimationFrame(() => {
+        const rawInset = Math.max(0, window.innerHeight - (viewport.height + viewport.offsetTop))
+        const nextInset = rawInset >= KEYBOARD_INSET_ACTIVATION_PX ? Math.round(rawInset) : 0
+        setKeyboardInsetPx((prev) => (prev === nextInset ? prev : nextInset))
+      })
+    }
+
+    updateKeyboardInset()
+    viewport.addEventListener('resize', updateKeyboardInset)
+    viewport.addEventListener('scroll', updateKeyboardInset)
+
+    return () => {
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId)
+      }
+      viewport.removeEventListener('resize', updateKeyboardInset)
+      viewport.removeEventListener('scroll', updateKeyboardInset)
+    }
+  }, [isMobile])
+
+  const clearLongPressTimer = useCallback(() => {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current)
+      longPressTimerRef.current = null
+    }
+  }, [])
+
+  const getCellFromClientPoint = useCallback((clientX: number, clientY: number) => {
+    const term = termRef.current
+    const container = containerRef.current
+    if (!term || !container) return null
+    if (term.cols <= 0 || term.rows <= 0) return null
+
+    const rect = container.getBoundingClientRect()
+    const relativeX = clientX - rect.left
+    const relativeY = clientY - rect.top
+    if (relativeX < 0 || relativeY < 0 || relativeX > rect.width || relativeY > rect.height) return null
+
+    const columnWidth = rect.width / term.cols
+    const rowHeight = rect.height / term.rows
+    if (columnWidth <= 0 || rowHeight <= 0) return null
+
+    const col = Math.max(0, Math.min(term.cols - 1, Math.floor(relativeX / columnWidth)))
+    const viewportRow = Math.max(0, Math.min(term.rows - 1, Math.floor(relativeY / rowHeight)))
+    const baseRow = term.buffer.active?.viewportY ?? 0
+    const row = baseRow + viewportRow
+    return { col, row }
+  }, [])
+
+  const selectWordAtPoint = useCallback((clientX: number, clientY: number) => {
+    const term = termRef.current
+    if (!term) return
+    const cell = getCellFromClientPoint(clientX, clientY)
+    if (!cell) return
+
+    const line = term.buffer.active?.getLine(cell.row)
+    const text = line?.translateToString(true) ?? ''
+    if (!text) return
+
+    const isWordChar = (char: string | undefined) => !!char && /[A-Za-z0-9_$./-]/.test(char)
+    let start = Math.min(cell.col, Math.max(0, text.length - 1))
+    let end = start
+
+    if (!isWordChar(text[start])) {
+      term.select(start, cell.row, 1)
+      return
+    }
+
+    while (start > 0 && isWordChar(text[start - 1])) start -= 1
+    while (end < text.length && isWordChar(text[end])) end += 1
+
+    term.select(start, cell.row, Math.max(1, end - start))
+  }, [getCellFromClientPoint])
+
+  const selectLineAtPoint = useCallback((clientX: number, clientY: number) => {
+    const term = termRef.current
+    if (!term) return
+    const cell = getCellFromClientPoint(clientX, clientY)
+    if (!cell) return
+    term.selectLines(cell.row, cell.row)
+  }, [getCellFromClientPoint])
+
+  const handleMobileTouchStart = useCallback((event: ReactTouchEvent<HTMLDivElement>) => {
+    if (!isMobile) return
+    const touch = event.touches[0]
+    if (!touch) return
+
+    touchActiveRef.current = true
+    touchSelectionModeRef.current = false
+    touchMovedRef.current = false
+    touchStartYRef.current = touch.clientY
+    touchLastYRef.current = touch.clientY
+    touchStartXRef.current = touch.clientX
+    touchScrollAccumulatorRef.current = 0
+    clearLongPressTimer()
+    longPressTimerRef.current = setTimeout(() => {
+      touchSelectionModeRef.current = true
+    }, 350)
+  }, [clearLongPressTimer, isMobile])
+
+  const handleMobileTouchMove = useCallback((event: ReactTouchEvent<HTMLDivElement>) => {
+    if (!isMobile || !touchActiveRef.current) return
+    const touch = event.touches[0]
+    if (!touch) return
+
+    const deltaX = Math.abs(touch.clientX - touchStartXRef.current)
+    const deltaYFromStart = Math.abs(touch.clientY - touchStartYRef.current)
+    if (!touchMovedRef.current && (deltaX > 8 || deltaYFromStart > 8)) {
+      touchMovedRef.current = true
+      clearLongPressTimer()
+    }
+
+    if (touchSelectionModeRef.current) return
+
+    const deltaY = touch.clientY - touchLastYRef.current
+    touchLastYRef.current = touch.clientY
+    // Match native touch behavior: content follows drag direction.
+    touchScrollAccumulatorRef.current -= deltaY
+
+    const rawLines = touchScrollAccumulatorRef.current / TOUCH_SCROLL_PIXELS_PER_LINE
+    const lines = rawLines > 0 ? Math.floor(rawLines) : Math.ceil(rawLines)
+    if (lines !== 0) {
+      termRef.current?.scrollLines(lines)
+      touchScrollAccumulatorRef.current -= lines * TOUCH_SCROLL_PIXELS_PER_LINE
+    }
+  }, [clearLongPressTimer, isMobile])
+
+  const handleMobileTouchEnd = useCallback((event: ReactTouchEvent<HTMLDivElement>) => {
+    if (!isMobile) return
+    clearLongPressTimer()
+
+    const changed = event.changedTouches[0]
+    const wasSelectionMode = touchSelectionModeRef.current
+    const moved = touchMovedRef.current
+
+    touchActiveRef.current = false
+    touchSelectionModeRef.current = false
+    touchMovedRef.current = false
+    touchScrollAccumulatorRef.current = 0
+
+    if (!changed || wasSelectionMode || moved) return
+
+    const now = Date.now()
+    const lastTapPoint = lastTapPointRef.current
+    const lastTapAt = lastTapAtRef.current
+    const withinInterval = now - lastTapAt <= TAP_MULTI_INTERVAL_MS
+    const withinDistance = !!lastTapPoint
+      && Math.abs(changed.clientX - lastTapPoint.x) <= TAP_MAX_DISTANCE_PX
+      && Math.abs(changed.clientY - lastTapPoint.y) <= TAP_MAX_DISTANCE_PX
+
+    if (withinInterval && withinDistance) {
+      tapCountRef.current += 1
+    } else {
+      tapCountRef.current = 1
+    }
+
+    lastTapAtRef.current = now
+    lastTapPointRef.current = { x: changed.clientX, y: changed.clientY }
+
+    if (tapCountRef.current === 2) {
+      selectWordAtPoint(changed.clientX, changed.clientY)
+      return
+    }
+    if (tapCountRef.current >= 3) {
+      selectLineAtPoint(changed.clientX, changed.clientY)
+      tapCountRef.current = 0
+    }
+  }, [clearLongPressTimer, isMobile, selectLineAtPoint, selectWordAtPoint])
+
+  useEffect(() => {
+    return () => {
+      clearLongPressTimer()
+    }
+  }, [clearLongPressTimer])
+
   // Helper to update pane content - uses ref to avoid recreation on content changes
   // This is CRITICAL: if updateContent depended on terminalContent directly,
   // it would be recreated on every status update, causing the effect to re-run
@@ -124,6 +447,15 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     const current = contentRef.current
     if (!current) return
     const next = { ...current, ...updates }
+    // Trace resumeSessionId changes
+    if ('resumeSessionId' in updates && updates.resumeSessionId !== current.resumeSessionId) {
+      if (debugRef.current) console.log('[TRACE resumeSessionId] updateContent CHANGING resumeSessionId', {
+        paneId,
+        from: current.resumeSessionId,
+        to: updates.resumeSessionId,
+        stack: new Error().stack?.split('\n').slice(1, 5).join('\n'),
+      })
+    }
     contentRef.current = next
     dispatch(updatePaneContent({
       tabId,
@@ -136,14 +468,84 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     ws.send(msg)
   }, [ws])
 
+  const attemptOsc52ClipboardWrite = useCallback((text: string) => {
+    void copyText(text).catch(() => {})
+  }, [])
+
+  const persistOsc52Policy = useCallback((policy: Osc52Policy) => {
+    osc52PolicyRef.current = policy
+    dispatch(updateSettingsLocal({ terminal: { osc52Clipboard: policy } } as any))
+    void api.patch('/api/settings', {
+      terminal: { osc52Clipboard: policy },
+    }).catch(() => {})
+  }, [dispatch])
+
+  const advanceOsc52Prompt = useCallback(() => {
+    const next = osc52QueueRef.current.shift() ?? null
+    pendingOsc52EventRef.current = next
+    setPendingOsc52Event(next)
+  }, [])
+
+  const closeOsc52Prompt = useCallback(() => {
+    pendingOsc52EventRef.current = null
+    setPendingOsc52Event(null)
+  }, [])
+
+  const handleOsc52Event = useCallback((event: Osc52Event) => {
+    const policy = osc52PolicyRef.current
+    if (policy === 'always') {
+      attemptOsc52ClipboardWrite(event.text)
+      return
+    }
+    if (policy === 'never') {
+      return
+    }
+    if (pendingOsc52EventRef.current) {
+      osc52QueueRef.current.push(event)
+      return
+    }
+    pendingOsc52EventRef.current = event
+    setPendingOsc52Event(event)
+  }, [attemptOsc52ClipboardWrite])
+
+  const handleTerminalSnapshot = useCallback((snapshot: string | undefined, term: Terminal) => {
+    const osc = extractOsc52Events(snapshot ?? '', createOsc52ParserState())
+    try { term.clear() } catch { /* disposed */ }
+    if (osc.cleaned) {
+      try { term.write(osc.cleaned) } catch { /* disposed */ }
+    }
+    for (const event of osc.events) {
+      handleOsc52Event(event)
+    }
+  }, [handleOsc52Event])
+
+  const handleTerminalOutput = useCallback((raw: string, mode: TerminalPaneContent['mode'], term: Terminal, tid?: string) => {
+    const osc = extractOsc52Events(raw, osc52ParserRef.current)
+    const { cleaned, count } = extractTurnCompleteSignals(osc.cleaned, mode, turnCompleteSignalStateRef.current)
+
+    if (count > 0 && tid) {
+      dispatch(recordTurnComplete({
+        tabId,
+        paneId: paneIdRef.current,
+        terminalId: tid,
+        at: Date.now(),
+      }))
+    }
+
+    if (cleaned) {
+      term.write(cleaned)
+    }
+
+    for (const event of osc.events) {
+      handleOsc52Event(event)
+    }
+  }, [dispatch, handleOsc52Event, tabId])
+
   const applyChunkedSnapshot = useCallback((snapshot: string) => {
     const term = termRef.current
     if (!term) return
-    try { term.clear() } catch { /* disposed */ }
-    if (snapshot) {
-      try { term.write(snapshot) } catch { /* disposed */ }
-    }
-  }, [])
+    handleTerminalSnapshot(snapshot, term)
+  }, [handleTerminalSnapshot])
 
   const markChunkedRunning = useCallback(() => {
     updateContent({ status: 'running' })
@@ -167,14 +569,116 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const sendInput = useCallback((data: string) => {
     const tid = terminalIdRef.current
     if (!tid) return
-    if (hasAttentionRef.current) {
-      dispatch(clearTabAttention({ tabId }))
-    }
-    if (hasPaneAttentionRef.current) {
-      dispatch(clearPaneAttention({ paneId }))
+    // In 'type' mode, clear attention when user sends input.
+    // In 'click' mode, attention is cleared by the notification hook on tab switch.
+    if (attentionDismissRef.current === 'type') {
+      if (hasAttentionRef.current) {
+        dispatch(clearTabAttention({ tabId }))
+      }
+      if (hasPaneAttentionRef.current) {
+        dispatch(clearPaneAttention({ paneId }))
+      }
     }
     ws.send({ type: 'terminal.input', terminalId: tid, data })
   }, [dispatch, tabId, paneId, ws])
+
+  const searchOpts = useMemo(() => ({
+    caseSensitive: false,
+    incremental: true,
+    decorations: SEARCH_DECORATIONS,
+  }), [])
+
+  const findNext = useCallback((value: string = searchQuery) => {
+    if (!value) return
+    runtimeRef.current?.findNext(value, searchOpts)
+  }, [searchQuery, searchOpts])
+
+  const findPrevious = useCallback((value: string = searchQuery) => {
+    if (!value) return
+    runtimeRef.current?.findPrevious(value, searchOpts)
+  }, [searchQuery, searchOpts])
+
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false)
+    setSearchResults(null)
+    runtimeRef.current?.clearDecorations()
+    requestAnimationFrame(() => {
+      termRef.current?.focus()
+    })
+  }, [])
+
+  const sendMobileToolbarKey = useCallback((keyId: MobileToolbarKeyId) => {
+    if (keyId === 'ctrl') {
+      setMobileCtrlActive((prev) => {
+        const next = !prev
+        mobileCtrlActiveRef.current = next
+        return next
+      })
+      return
+    }
+
+    const input = resolveMobileToolbarInput(keyId, mobileCtrlActiveRef.current)
+    sendInput(input)
+    termRef.current?.focus()
+  }, [sendInput])
+
+  const clearMobileToolbarRepeat = useCallback(() => {
+    if (mobileKeyRepeatDelayTimerRef.current) {
+      clearTimeout(mobileKeyRepeatDelayTimerRef.current)
+      mobileKeyRepeatDelayTimerRef.current = null
+    }
+    if (mobileKeyRepeatIntervalRef.current) {
+      clearInterval(mobileKeyRepeatIntervalRef.current)
+      mobileKeyRepeatIntervalRef.current = null
+    }
+  }, [])
+
+  const handleMobileToolbarPointerDown = useCallback((event: ReactPointerEvent<HTMLButtonElement>, keyId: MobileToolbarKeyId) => {
+    if (!isRepeatableMobileToolbarKey(keyId)) return
+
+    event.preventDefault()
+    event.stopPropagation()
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId)
+    } catch {
+      // Ignore capture failures (e.g. unsupported pointer source)
+    }
+    sendMobileToolbarKey(keyId)
+    clearMobileToolbarRepeat()
+    mobileKeyRepeatDelayTimerRef.current = setTimeout(() => {
+      mobileKeyRepeatIntervalRef.current = setInterval(() => {
+        sendMobileToolbarKey(keyId)
+      }, MOBILE_KEY_REPEAT_INTERVAL_MS)
+    }, MOBILE_KEY_REPEAT_INITIAL_DELAY_MS)
+  }, [clearMobileToolbarRepeat, sendMobileToolbarKey])
+
+  const handleMobileToolbarPointerEnd = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+    clearMobileToolbarRepeat()
+  }, [clearMobileToolbarRepeat])
+
+  const handleMobileToolbarClick = useCallback((event: ReactMouseEvent<HTMLButtonElement>, keyId: MobileToolbarKeyId) => {
+    // Pointer interactions are handled via pointerdown to support press-and-hold repeat.
+    // Keep click handling for non-repeatable keys and keyboard activation (detail === 0).
+    if (isRepeatableMobileToolbarKey(keyId) && event.detail !== 0) return
+    sendMobileToolbarKey(keyId)
+  }, [sendMobileToolbarKey])
+
+  const handleMobileToolbarContextMenu = useCallback((event: ReactMouseEvent<HTMLButtonElement>, keyId: MobileToolbarKeyId) => {
+    if (!isRepeatableMobileToolbarKey(keyId)) return
+    event.preventDefault()
+    event.stopPropagation()
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      clearMobileToolbarRepeat()
+    }
+  }, [clearMobileToolbarRepeat])
 
   // Init xterm once
   useEffect(() => {
@@ -184,12 +688,14 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     mountedRef.current = true
 
     if (termRef.current) {
+      runtimeRef.current?.dispose()
+      runtimeRef.current = null
       termRef.current.dispose()
       termRef.current = null
-      fitRef.current = null
     }
 
     const term = new Terminal({
+      allowProposedApi: true,
       convertEol: true,
       cursorBlink: settings.terminal.cursorBlink,
       fontSize: settings.terminal.fontSize,
@@ -200,22 +706,67 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       linkHandler: {
         activate: (_event: MouseEvent, uri: string) => {
           if (warnExternalLinksRef.current !== false) {
-            if (confirm(`Do you want to navigate to ${uri}?\n\nWARNING: This link could potentially be dangerous`)) {
-              window.open(uri, '_blank', 'noopener,noreferrer')
-            }
+            setPendingLinkUriRef.current(uri)
           } else {
             window.open(uri, '_blank', 'noopener,noreferrer')
           }
         },
       },
     })
-    const fit = new FitAddon()
-    term.loadAddon(fit)
+    const rendererMode = settings.terminal.renderer ?? 'auto'
+    const enableWebgl = rendererMode === 'auto' || rendererMode === 'webgl'
+    let runtime = createNoopRuntime()
+    try {
+      runtime = createTerminalRuntime({ terminal: term, enableWebgl })
+      runtime.attachAddons()
+    } catch {
+      // Renderer/addon failures should not prevent terminal availability.
+      runtime = createNoopRuntime()
+    }
 
     termRef.current = term
-    fitRef.current = fit
+    runtimeRef.current = runtime
+
+    const searchResultsDisposable = runtime.onDidChangeResults((event) => {
+      setSearchResults({ resultIndex: event.resultIndex, resultCount: event.resultCount })
+    })
 
     term.open(containerRef.current)
+
+    // Register custom link provider for clickable local file paths
+    const filePathLinkDisposable = typeof term.registerLinkProvider === 'function'
+      ? term.registerLinkProvider({
+        provideLinks(bufferLineNumber: number, callback: (links: import('@xterm/xterm').ILink[] | undefined) => void) {
+          const bufferLine = term.buffer.active.getLine(bufferLineNumber - 1)
+          if (!bufferLine) { callback(undefined); return }
+          const text = bufferLine.translateToString()
+          const matches = findLocalFilePaths(text)
+          if (matches.length === 0) { callback(undefined); return }
+          callback(matches.map((m) => ({
+            range: {
+              start: { x: m.startIndex + 1, y: bufferLineNumber },
+              end: { x: m.endIndex, y: bufferLineNumber },
+            },
+            text: m.path,
+            activate: () => {
+              const id = nanoid()
+              dispatch(addTab({ id, mode: 'shell' }))
+              dispatch(initLayout({
+                tabId: id,
+                content: {
+                  kind: 'editor',
+                  filePath: m.path,
+                  language: null,
+                  readOnly: false,
+                  content: '',
+                  viewMode: 'source',
+                },
+              }))
+            },
+          })))
+        },
+      })
+      : { dispose: () => {} }
 
     const unregisterActions = registerTerminalActions(paneId, {
       copySelection: async () => {
@@ -233,11 +784,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       clearScrollback: () => term.clear(),
       reset: () => term.reset(),
       hasSelection: () => term.getSelection().length > 0,
+      openSearch: () => setSearchOpen(true),
     })
 
     requestAnimationFrame(() => {
       if (termRef.current === term) {
-        try { fit.fit() } catch { /* disposed */ }
+        try { runtime.fit() } catch { /* disposed */ }
         term.focus()
       }
     })
@@ -261,6 +813,19 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     })
 
     term.attachCustomKeyEventHandler((event) => {
+      if (
+        event.ctrlKey &&
+        !event.shiftKey &&
+        !event.altKey &&
+        !event.metaKey &&
+        event.type === 'keydown' &&
+        event.key.toLowerCase() === 'f'
+      ) {
+        event.preventDefault()
+        setSearchOpen(true)
+        return false
+      }
+
       // Ctrl+Shift+C to copy (ignore key repeat)
       if (event.ctrlKey && event.shiftKey && event.key === 'C' && event.type === 'keydown' && !event.repeat) {
         const selection = term.getSelection()
@@ -290,13 +855,23 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         }
       }
 
+      // Shift+Enter -> send newline (same as Ctrl+J)
+      if (event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && event.key === 'Enter' && event.type === 'keydown' && !event.repeat) {
+        event.preventDefault()
+        const tid = terminalIdRef.current
+        if (tid) {
+          ws.send({ type: 'terminal.input', terminalId: tid, data: '\n' })
+        }
+        return false
+      }
+
       return true
     })
 
     const ro = new ResizeObserver(() => {
       if (hiddenRef.current || termRef.current !== term) return
       try {
-        fit.fit()
+        runtime.fit()
         const tid = terminalIdRef.current
         if (tid) {
           ws.send({ type: 'terminal.resize', terminalId: tid, cols: term.cols, rows: term.rows })
@@ -306,12 +881,15 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     ro.observe(containerRef.current)
 
     return () => {
+      filePathLinkDisposable?.dispose()
       ro.disconnect()
       unregisterActions()
+      searchResultsDisposable.dispose()
       if (termRef.current === term) {
+        runtime.dispose()
+        runtimeRef.current = null
         term.dispose()
         termRef.current = null
-        fitRef.current = null
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -381,7 +959,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     term.options.lineHeight = settings.terminal.lineHeight
     term.options.scrollback = settings.terminal.scrollback
     term.options.theme = getTerminalTheme(settings.terminal.theme, settings.theme)
-    if (!hidden) fitRef.current?.fit()
+    if (!hidden) runtimeRef.current?.fit()
   }, [isTerminal, settings, hidden])
 
   // When becoming visible, fit and send size
@@ -389,7 +967,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   useEffect(() => {
     if (!isTerminal) return
     if (!hidden) {
-      fitRef.current?.fit()
+      runtimeRef.current?.fit()
       const term = termRef.current
       const tid = terminalIdRef.current
       if (term && tid) {
@@ -405,6 +983,10 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     if (!termCandidate) return
     const term = termCandidate
     turnCompleteSignalStateRef.current = createTurnCompleteSignalParserState()
+    osc52ParserRef.current = createOsc52ParserState()
+    osc52QueueRef.current = []
+    pendingOsc52EventRef.current = null
+    setPendingOsc52Event(null)
 
     // NOTE: We intentionally don't destructure terminalId here.
     // We read it from terminalIdRef.current to avoid stale closures.
@@ -432,13 +1014,21 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
     const sendCreate = (requestId: string) => {
       const restore = getRestoreFlag(requestId)
+      const resumeId = getResumeSessionIdFromRef(contentRef)
+      if (debugRef.current) console.log('[TRACE resumeSessionId] sendCreate', {
+        paneId: paneIdRef.current,
+        requestId,
+        resumeSessionId: resumeId,
+        contentRefResumeSessionId: contentRef.current?.resumeSessionId,
+        mode,
+      })
       ws.send({
         type: 'terminal.create',
         requestId,
         mode,
         shell: shell || 'system',
         cwd: initialCwd,
-        resumeSessionId: getResumeSessionIdFromRef(contentRef),
+        resumeSessionId: resumeId,
         ...(restore ? { restore: true } : {}),
       })
     }
@@ -492,32 +1082,24 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         if (msg.type === 'terminal.output' && msg.terminalId === tid) {
           const raw = msg.data || ''
           const mode = contentRef.current?.mode || 'shell'
-          const { cleaned, count } = extractTurnCompleteSignals(raw, mode, turnCompleteSignalStateRef.current)
-
-          if (count > 0 && tid) {
-            dispatch(recordTurnComplete({
-              tabId,
-              paneId: paneIdRef.current,
-              terminalId: tid,
-              at: Date.now(),
-            }))
-          }
-
-          if (cleaned) {
-            term.write(cleaned)
-          }
+          handleTerminalOutput(raw, mode, term, tid)
         }
 
         if (msg.type === 'terminal.snapshot' && msg.terminalId === tid) {
-          try { term.clear() } catch { /* disposed */ }
-          if (msg.snapshot) {
-            try { term.write(msg.snapshot) } catch { /* disposed */ }
-          }
+          handleTerminalSnapshot(msg.snapshot, term)
         }
 
         if (msg.type === 'terminal.created' && msg.requestId === reqId) {
           clearRateLimitRetry()
           const newId = msg.terminalId as string
+          if (debugRef.current) console.log('[TRACE resumeSessionId] terminal.created received', {
+            paneId: paneIdRef.current,
+            requestId: reqId,
+            terminalId: newId,
+            effectiveResumeSessionId: msg.effectiveResumeSessionId,
+            currentResumeSessionId: contentRef.current?.resumeSessionId,
+            willUpdate: !!(msg.effectiveResumeSessionId && msg.effectiveResumeSessionId !== contentRef.current?.resumeSessionId),
+          })
           terminalIdRef.current = newId
           updateContent({ terminalId: newId, status: 'running' })
           // Also update tab for title purposes
@@ -531,8 +1113,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           const isSnapshotChunked = msg.snapshotChunked === true
           if (isSnapshotChunked) {
             markSnapshotChunkedCreated()
-          } else if (msg.snapshot) {
-            try { term.clear(); term.write(msg.snapshot) } catch { /* disposed */ }
+          } else {
+            handleTerminalSnapshot(msg.snapshot, term)
           }
           // Creator is already attached server-side for this terminal.
           // Avoid sending terminal.attach here: it can race with terminal.output and lead to
@@ -546,9 +1128,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         if (msg.type === 'terminal.attached' && msg.terminalId === tid) {
           clearRateLimitRetry()
           setIsAttaching(false)
-          if (msg.snapshot) {
-            try { term.clear(); term.write(msg.snapshot) } catch { /* disposed */ }
-          }
+          handleTerminalSnapshot(msg.snapshot, term)
           updateContent({ status: 'running' })
         }
 
@@ -586,7 +1166,24 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         // Message type: { type: 'terminal.session.associated', terminalId: string, sessionId: string }
         if (msg.type === 'terminal.session.associated' && msg.terminalId === tid) {
           const sessionId = msg.sessionId as string
-          updateContent({ resumeSessionId: sessionId })
+          if (debugRef.current) console.log('[TRACE resumeSessionId] terminal.session.associated', {
+            paneId: paneIdRef.current,
+            terminalId: tid,
+            oldResumeSessionId: contentRef.current?.resumeSessionId,
+            newResumeSessionId: sessionId,
+          })
+          const mode = contentRef.current?.mode
+          const sessionRef = mode && mode !== 'shell'
+            ? {
+              provider: mode,
+              sessionId,
+              ...(localServerInstanceId ? { serverInstanceId: localServerInstanceId } : {}),
+            }
+            : undefined
+          updateContent({
+            resumeSessionId: sessionId,
+            ...(sessionRef ? { sessionRef } : {}),
+          })
           // Mirror to tab so TabContent can reconstruct correct default
           // content if pane layout is lost (e.g., localStorage quota error)
           const currentTab = tabRef.current
@@ -611,6 +1208,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         if (msg.type === 'error' && msg.code === 'INVALID_TERMINAL_ID' && !msg.requestId) {
           const currentTerminalId = terminalIdRef.current
           const current = contentRef.current
+          if (debugRef.current) console.log('[TRACE resumeSessionId] INVALID_TERMINAL_ID received', {
+            paneId: paneIdRef.current,
+            msgTerminalId: msg.terminalId,
+            currentTerminalId,
+            currentResumeSessionId: current?.resumeSessionId,
+            currentStatus: current?.status,
+          })
           if (msg.terminalId && msg.terminalId !== currentTerminalId) {
             // Show feedback if the terminal already exited (the ID was cleared by
             // the exit handler, so msg.terminalId no longer matches the ref)
@@ -625,6 +1229,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           if (currentTerminalId && current?.status !== 'exited') {
             term.writeln('\r\n[Reconnecting...]\r\n')
             const newRequestId = nanoid()
+            if (debugRef.current) console.log('[TRACE resumeSessionId] INVALID_TERMINAL_ID reconnecting', {
+              paneId: paneIdRef.current,
+              oldRequestId: requestIdRef.current,
+              newRequestId,
+              resumeSessionId: current?.resumeSessionId,
+            })
             // Preserve the restore flag so the re-creation bypasses rate limiting.
             // The original createRequestId's flag was never consumed (we went
             // through attach, not sendCreate), so check the old ID first.
@@ -650,6 +1260,11 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       unsubReconnect = ws.onReconnect(() => {
         bumpConnectionGeneration()
         const tid = terminalIdRef.current
+        if (debugRef.current) console.log('[TRACE resumeSessionId] onReconnect', {
+          paneId: paneIdRef.current,
+          terminalId: tid,
+          resumeSessionId: contentRef.current?.resumeSessionId,
+        })
         if (tid) attach(tid)
       })
 
@@ -659,6 +1274,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       // not re-run when terminalId changes from undefined to defined
       const currentTerminalId = terminalIdRef.current
 
+      if (debugRef.current) console.log('[TRACE resumeSessionId] effect initial decision', {
+        paneId: paneIdRef.current,
+        currentTerminalId,
+        createRequestId,
+        resumeSessionId: contentRef.current?.resumeSessionId,
+        action: currentTerminalId ? 'attach' : 'sendCreate',
+      })
       if (currentTerminalId) {
         attach(currentTerminalId)
       } else {
@@ -701,8 +1323,21 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     bumpConnectionGeneration,
     clearChunkedAttachState,
     handleChunkLifecycleMessage,
+    handleTerminalOutput,
+    handleTerminalSnapshot,
     markSnapshotChunkedCreated,
   ])
+
+  const mobileToolbarBottomPx = isMobile ? keyboardInsetPx : 0
+  const mobileBottomInsetPx = isMobile ? keyboardInsetPx + MOBILE_KEYBAR_HEIGHT_PX : 0
+  const terminalContainerStyle = useMemo(() => {
+    if (!isMobile) return undefined
+
+    return {
+      touchAction: 'none' as const,
+      height: `calc(100% - ${mobileBottomInsetPx}px)`,
+    }
+  }, [isMobile, mobileBottomInsetPx])
 
   // NOW we can do the conditional return - after all hooks
   if (!isTerminal || !terminalContent) {
@@ -718,7 +1353,51 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       data-pane-id={paneId}
       data-tab-id={tabId}
     >
-      <div ref={containerRef} className="h-full w-full" />
+      <div
+        ref={containerRef}
+        data-testid="terminal-xterm-container"
+        className="h-full w-full"
+        style={terminalContainerStyle}
+        onTouchStart={isMobile ? handleMobileTouchStart : undefined}
+        onTouchMove={isMobile ? handleMobileTouchMove : undefined}
+        onTouchEnd={isMobile ? handleMobileTouchEnd : undefined}
+        onTouchCancel={isMobile ? handleMobileTouchEnd : undefined}
+      />
+      {isMobile && (
+        <div
+          data-testid="mobile-terminal-toolbar"
+          className="absolute inset-x-0 z-20 px-1 pb-1"
+          style={{ bottom: `${mobileToolbarBottomPx}px` }}
+        >
+          <div className="flex h-8 w-full items-center gap-1 rounded-md border border-border/70 bg-background/95 p-1 shadow-sm">
+            {MOBILE_TOOLBAR_KEYS.map((key) => {
+              const isCtrl = key.id === 'ctrl'
+              const ctrlPressed = isCtrl && mobileCtrlActive
+              return (
+                <button
+                  key={key.id}
+                  type="button"
+                  className={cn(
+                    'h-full min-w-0 flex-1 rounded-sm border border-border/60 px-1 text-[11px] font-medium leading-none touch-manipulation select-none',
+                    key.isArrow ? 'text-[19px] font-bold' : '',
+                    ctrlPressed ? 'bg-primary/20 text-primary border-primary/40' : 'bg-muted/80 text-foreground',
+                  )}
+                  aria-label={key.ariaLabel}
+                  aria-pressed={isCtrl ? ctrlPressed : undefined}
+                  onClick={(event) => handleMobileToolbarClick(event, key.id)}
+                  onPointerDown={key.isArrow ? (event) => handleMobileToolbarPointerDown(event, key.id) : undefined}
+                  onPointerUp={key.isArrow ? handleMobileToolbarPointerEnd : undefined}
+                  onPointerCancel={key.isArrow ? handleMobileToolbarPointerEnd : undefined}
+                  onPointerLeave={key.isArrow ? handleMobileToolbarPointerEnd : undefined}
+                  onContextMenu={(event) => handleMobileToolbarContextMenu(event, key.id)}
+                >
+                  {key.label}
+                </button>
+              )
+            })}
+          </div>
+        </div>
+      )}
       {showSpinner && (
         <div className="absolute inset-0 flex items-center justify-center bg-background/80">
           <div className="flex flex-col items-center gap-3">
@@ -729,11 +1408,71 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           </div>
         </div>
       )}
+      {searchOpen && (
+        <TerminalSearchBar
+          query={searchQuery}
+          onQueryChange={(value) => {
+            setSearchQuery(value)
+            findNext(value)
+          }}
+          onFindNext={() => findNext()}
+          onFindPrevious={() => findPrevious()}
+          onClose={closeSearch}
+          resultIndex={searchResults?.resultIndex}
+          resultCount={searchResults?.resultCount}
+        />
+      )}
       {snapshotWarning && (
         <div className="pointer-events-none absolute inset-x-2 bottom-2 rounded border border-amber-300 bg-amber-50/95 px-2 py-1 text-xs text-amber-900">
           {snapshotWarning}
         </div>
       )}
+      <Osc52PromptModal
+        open={pendingOsc52Event !== null}
+        onYes={() => {
+          if (pendingOsc52EventRef.current) {
+            attemptOsc52ClipboardWrite(pendingOsc52EventRef.current.text)
+          }
+          advanceOsc52Prompt()
+        }}
+        onNo={() => {
+          advanceOsc52Prompt()
+        }}
+        onAlways={() => {
+          if (pendingOsc52EventRef.current) {
+            attemptOsc52ClipboardWrite(pendingOsc52EventRef.current.text)
+          }
+          for (const queued of osc52QueueRef.current) {
+            attemptOsc52ClipboardWrite(queued.text)
+          }
+          osc52QueueRef.current = []
+          persistOsc52Policy('always')
+          closeOsc52Prompt()
+        }}
+        onNever={() => {
+          osc52QueueRef.current = []
+          persistOsc52Policy('never')
+          closeOsc52Prompt()
+        }}
+      />
+      <ConfirmModal
+        open={pendingLinkUri !== null}
+        title="Open external link?"
+        body={
+          <>
+            <p className="break-all font-mono text-xs bg-muted rounded px-2 py-1 mb-2">{pendingLinkUri}</p>
+            <p>Links from terminal output could be dangerous. Only open links you trust.</p>
+          </>
+        }
+        confirmLabel="Open link"
+        onConfirm={() => {
+          if (pendingLinkUri) {
+            window.open(pendingLinkUri, '_blank', 'noopener,noreferrer')
+          }
+          setPendingLinkUri(null)
+        }}
+        onCancel={() => setPendingLinkUri(null)}
+      />
     </div>
   )
 }

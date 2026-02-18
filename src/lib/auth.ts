@@ -5,8 +5,14 @@ export function getAuthToken(): string | undefined {
   return localStorage.getItem(AUTH_KEY) || undefined
 }
 
+function setAuthCookie(token: string): void {
+  const secure = window.location.protocol === 'https:' ? '; Secure' : ''
+  document.cookie = `freshell-auth=${encodeURIComponent(token)}; path=/; SameSite=Strict${secure}`
+}
+
 export function setAuthToken(token: string): void {
   localStorage.setItem(AUTH_KEY, token)
+  setAuthCookie(token)
 }
 
 /**
@@ -26,10 +32,17 @@ export function initializeAuthToken(): void {
   const urlToken = params.get('token')
   if (urlToken) {
     localStorage.setItem(AUTH_KEY, urlToken)
+    setAuthCookie(urlToken)
     params.delete('token')
     const newUrl = params.toString()
       ? `${window.location.pathname}?${params.toString()}`
       : window.location.pathname
     window.history.replaceState({}, '', newUrl)
+  }
+
+  // Set cookie from existing localStorage token (for sessions that already have a token)
+  const stored = localStorage.getItem(AUTH_KEY)
+  if (stored) {
+    setAuthCookie(stored)
   }
 }

@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Terminal, History, Settings, LayoutGrid, Search, Loader2, X, Archive } from 'lucide-react'
+import { Terminal, Folder, Settings, LayoutGrid, Search, Loader2, X, Archive, PanelLeftClose, AlertCircle } from 'lucide-react'
 import { List, type RowComponentProps } from 'react-window'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
-import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { openSessionTab } from '@/store/tabsSlice'
+import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
+import { openSessionTab, setActiveTab } from '@/store/tabsSlice'
+import { addPane, setActivePane } from '@/store/panesSlice'
+import { findPaneForSession } from '@/lib/session-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { searchSessions, type SearchResult } from '@/lib/api'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
@@ -14,7 +16,7 @@ import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { ProviderIcon } from '@/components/icons/provider-icons'
 import { getActiveSessionRefForTab } from '@/lib/session-utils'
 
-export type AppView = 'terminal' | 'sessions' | 'overview' | 'settings'
+export type AppView = 'terminal' | 'tabs' | 'sessions' | 'overview' | 'settings'
 
 type SessionItem = SidebarSessionItem
 
@@ -43,13 +45,26 @@ function getProjectName(projectPath: string): string {
 export default function Sidebar({
   view,
   onNavigate,
+  onToggleSidebar,
+  currentVersion = null,
+  updateAvailable = false,
+  latestVersion = null,
+  onBrandClick,
   width = 288,
+  fullWidth = false,
 }: {
   view: AppView
   onNavigate: (v: AppView) => void
+  onToggleSidebar?: () => void
+  currentVersion?: string | null
+  updateAvailable?: boolean
+  latestVersion?: string | null
+  onBrandClick?: () => void
   width?: number
+  fullWidth?: boolean
 }) {
   const dispatch = useAppDispatch()
+  const store = useAppStore()
   const settings = useAppSelector((s) => s.settings.settings)
   const tabs = useAppSelector((s) => s.tabs.tabs)
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
@@ -201,20 +216,54 @@ export default function Sidebar({
 
   const handleItemClick = useCallback((item: SessionItem) => {
     const provider = item.provider as CodingCliProviderName
-    dispatch(openSessionTab({
-      sessionId: item.sessionId,
-      title: item.title,
-      cwd: item.cwd,
-      provider,
-      terminalId: item.isRunning ? item.runningTerminalId : undefined,
+    const state = store.getState()
+    const runningTerminalId = item.isRunning ? item.runningTerminalId : undefined
+
+    // 1. Dedup: if session is already open in a pane, focus it
+    const existing = findPaneForSession(state, provider, item.sessionId)
+    if (existing) {
+      dispatch(setActiveTab(existing.tabId))
+      if (existing.paneId) {
+        dispatch(setActivePane({ tabId: existing.tabId, paneId: existing.paneId }))
+      }
+      onNavigate('terminal')
+      return
+    }
+
+    // 2. Fallback: no active tab or active tab has no layout → create new tab
+    const activeLayout = activeTabId ? state.panes.layouts[activeTabId] : undefined
+    if (!activeTabId || !activeLayout) {
+      dispatch(openSessionTab({
+        sessionId: item.sessionId,
+        title: item.title,
+        cwd: item.cwd,
+        provider,
+        terminalId: runningTerminalId,
+      }))
+      onNavigate('terminal')
+      return
+    }
+
+    // 3. Normal: split a new pane in the current tab
+    dispatch(addPane({
+      tabId: activeTabId,
+      newContent: {
+        kind: 'terminal',
+        mode: provider,
+        resumeSessionId: item.sessionId,
+        initialCwd: item.cwd,
+        terminalId: runningTerminalId,
+        status: runningTerminalId ? 'running' : 'creating',
+      },
     }))
     onNavigate('terminal')
-  }, [dispatch, onNavigate])
+  }, [dispatch, onNavigate, activeTabId, store])
 
   const nav = [
-    { id: 'terminal' as const, label: 'Terminal', icon: Terminal, shortcut: 'T' },
-    { id: 'sessions' as const, label: 'Sessions', icon: History, shortcut: 'S' },
-    { id: 'overview' as const, label: 'Overview', icon: LayoutGrid, shortcut: 'O' },
+    { id: 'terminal' as const, label: 'Coding Agents', icon: Terminal, shortcut: 'T' },
+    { id: 'tabs' as const, label: 'Tabs', icon: Archive, shortcut: 'A' },
+    { id: 'overview' as const, label: 'Panes', icon: LayoutGrid, shortcut: 'O' },
+    { id: 'sessions' as const, label: 'Projects', icon: Folder, shortcut: 'P' },
     { id: 'settings' as const, label: 'Settings', icon: Settings, shortcut: ',' },
   ]
 
@@ -252,12 +301,61 @@ export default function Sidebar({
 
   return (
     <div
-      className="h-full flex flex-col bg-card flex-shrink-0 transition-[width] duration-150"
-      style={{ width: `${width}px` }}
+      className={cn(
+        'h-full flex flex-col bg-card flex-shrink-0 transition-[width] duration-150',
+        fullWidth && 'w-full'
+      )}
+      style={fullWidth ? undefined : { width: `${width}px` }}
     >
       {/* Header */}
-      <div className="px-4 py-4">
-        <span className="text-sm font-medium tracking-tight">Coding Agents</span>
+      <div className="px-3 py-3">
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={onToggleSidebar}
+            className="p-1.5 rounded-md hover:bg-muted transition-colors min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center"
+            title="Hide sidebar"
+            aria-label="Hide sidebar"
+          >
+            <PanelLeftClose className="h-3.5 w-3.5 text-muted-foreground" />
+          </button>
+          {currentVersion ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  className={cn(
+                    'font-mono min-w-0 text-sm font-semibold tracking-tight whitespace-nowrap rounded px-1 -mx-1 border-0 p-0 bg-transparent inline-flex items-center gap-1 transition-colors',
+                    updateAvailable
+                      ? 'text-amber-700 dark:text-amber-400 bg-amber-100/60 dark:bg-amber-950/40 hover:bg-amber-200/70 dark:hover:bg-amber-900/60 cursor-pointer'
+                      : 'cursor-default'
+                  )}
+                  onClick={onBrandClick}
+                  aria-label={
+                    updateAvailable
+                      ? `Freshell v${currentVersion}. Update available${latestVersion ? `: v${latestVersion}` : ''}. Click for update instructions.`
+                      : `Freshell v${currentVersion}. Up to date.`
+                  }
+                  data-testid="app-brand-status"
+                >
+                  <span className="truncate">🐚🔥freshell</span>
+                  {updateAvailable && <AlertCircle className="h-3.5 w-3.5" aria-hidden="true" />}
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                {updateAvailable ? (
+                  <div>
+                    <div>v{currentVersion} - {latestVersion ? `v${latestVersion} available` : 'update available'}</div>
+                    <div className="text-muted-foreground">Click for update instructions</div>
+                  </div>
+                ) : (
+                  <div>v{currentVersion} (up to date)</div>
+                )}
+              </TooltipContent>
+            </Tooltip>
+          ) : (
+            <span className="font-mono min-w-0 text-sm font-semibold tracking-tight whitespace-nowrap truncate">🐚🔥freshell</span>
+          )}
+        </div>
       </div>
 
       {/* Search */}
@@ -275,7 +373,7 @@ export default function Sidebar({
             <button
               aria-label="Clear search"
               onClick={() => setFilter('')}
-              className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground"
+              className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-foreground"
             >
               <X className="h-3.5 w-3.5" />
             </button>
@@ -308,7 +406,7 @@ export default function Sidebar({
                 key={item.id}
                 onClick={() => onNavigate(item.id)}
                 className={cn(
-                  'flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-md text-xs transition-colors',
+                  'flex-1 flex items-center justify-center gap-1.5 py-2.5 md:py-1.5 min-h-11 md:min-h-0 rounded-md text-xs transition-colors',
                   active
                     ? 'bg-foreground text-background font-medium'
                     : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
@@ -372,7 +470,7 @@ function SidebarItem({
         <button
           onClick={onClick}
           className={cn(
-            'w-full flex items-center gap-2 px-2 py-2 rounded-md text-left transition-colors group',
+            'w-full flex items-center gap-2 px-2 py-3 md:py-2 rounded-md text-left transition-colors group',
             isActiveTab
               ? 'bg-muted'
               : 'hover:bg-muted/50'

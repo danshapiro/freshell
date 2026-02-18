@@ -1,0 +1,998 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>freshell — Browser Terminal Multiplexer for Coding CLIs</title>
+<meta name="description" content="Self-hosted browser terminal multiplexer for Claude Code, Codex, and more.">
+<link rel="icon" type="image/x-icon" href="favicon.ico">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/lucide@0.469.0/dist/umd/lucide.min.js"></script>
+<style>
+/* ========== Theme Variables ========== */
+:root {
+  --background: 0 0% 100%; --foreground: 240 10% 10%;
+  --card: 0 0% 98%; --card-foreground: 240 10% 10%;
+  --muted: 240 5% 96%; --muted-foreground: 240 4% 46%;
+  --border: 240 6% 92%; --success: 142 71% 45%;
+  --destructive: 0 72% 51%; --warning: 38 92% 50%;
+  /* Terminal (One Light) */
+  --t-bg: #fafafa; --t-fg: #383a42; --t-green: #50a14f; --t-red: #e45649;
+  --t-yellow: #986801; --t-blue: #4078f2; --t-magenta: #a626a4;
+  --t-cyan: #0184bc; --t-dim: #a0a1a7; --t-bold: #2a2a2a; --t-success: #26a941;
+  --t-cursor: #383a42;
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.04); --shadow-md: 0 2px 8px rgba(0,0,0,.06);
+}
+:root.dark {
+  --background: 240 10% 4%; --foreground: 0 0% 98%;
+  --card: 240 6% 10%; --card-foreground: 0 0% 98%;
+  --muted: 240 4% 16%; --muted-foreground: 240 5% 65%;
+  --border: 240 4% 16%; --success: 142 71% 45%;
+  --destructive: 0 62% 50%; --warning: 38 92% 50%;
+  /* Terminal (One Dark) */
+  --t-bg: #12131a; --t-fg: #abb2bf; --t-green: #98c379; --t-red: #e06c75;
+  --t-yellow: #e5c07b; --t-blue: #61afef; --t-magenta: #c678dd;
+  --t-cyan: #56b6c2; --t-dim: #5c6370; --t-bold: #ddd; --t-success: #26a941;
+  --t-cursor: #abb2bf;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.2); --shadow-md: 0 2px 8px rgba(0,0,0,.3);
+}
+
+/* ========== Reset & Base ========== */
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; font-size: 13px; overflow: hidden; -webkit-font-smoothing: antialiased; }
+body { background: hsl(var(--background)); color: hsl(var(--foreground)); transition: background-color .2s, color .2s; }
+::selection { background: hsl(var(--foreground) / .1); }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: hsl(var(--muted-foreground) / .3); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: hsl(var(--muted-foreground) / .5); }
+
+/* ========== App Shell ========== */
+.app { display: flex; flex-direction: column; height: 100vh; }
+.icon { width: 14px; height: 14px; stroke-width: 2; flex-shrink: 0; }
+.icon-xs { width: 12px; height: 12px; stroke-width: 2; flex-shrink: 0; }
+.icon-md { width: 16px; height: 16px; stroke-width: 2; flex-shrink: 0; }
+
+/* ========== Snark Overlay ========== */
+.snark-overlay {
+  position: fixed; inset: 0; z-index: 200; display: flex; align-items: center;
+  justify-content: center; pointer-events: none; opacity: 0; transition: opacity .25s;
+  background: rgba(0,0,0,.4); backdrop-filter: blur(2px);
+}
+.snark-overlay.show { opacity: 1; pointer-events: auto; }
+.snark-overlay .snark-dismiss { position: absolute; inset: 0; cursor: default; }
+.snark-box {
+  position: relative; z-index: 1; max-width: 520px; width: 90%;
+  font-family: 'JetBrains Mono', monospace; cursor: pointer;
+  border: 1px solid var(--t-green); border-radius: 2px;
+  background: var(--t-bg); padding: 20px 24px;
+  box-shadow: 0 0 30px rgba(152,195,121,.12), 0 0 80px rgba(152,195,121,.05), inset 0 0 60px rgba(0,0,0,.2);
+  transform: scale(.92); opacity: 0;
+  transition: transform .25s cubic-bezier(.34,1.4,.64,1), opacity .2s;
+}
+.snark-overlay.show .snark-box { transform: scale(1); opacity: 1; }
+:root:not(.dark) .snark-box {
+  border-color: var(--t-blue);
+  box-shadow: 0 0 30px rgba(64,120,242,.1), 0 0 80px rgba(64,120,242,.04), inset 0 0 60px rgba(0,0,0,.03);
+}
+.snark-msg {
+  color: var(--t-fg); font-size: 26px; line-height: 1.55; text-align: center;
+}
+.snark-msg a { color: var(--t-cyan); text-decoration: none; }
+.snark-msg a:hover { text-decoration: underline; }
+
+/* ========== Mobile Responsive ========== */
+/* On mobile (<768px): tab bar is replaced by MobileTabStrip (centered tab name
+   with chevrons + tab switcher grid overlay). At the right edge, the chevron
+   becomes a + action on the last tab to create a new tab. Touch targets are 44px min.
+   Sidebar opens/closes via swipe gesture and uses full-width drawer mode.
+   Pull-to-refresh is disabled, safe-area insets are respected, and fullscreen/landscape
+   mode minimizes chrome for terminal-focused use. */
+
+/* ========== Tab Bar ========== */
+.tabbar {
+  height: 40px; display: flex; align-items: flex-end; padding: 0 8px;
+  background: hsl(var(--background)); flex-shrink: 0; position: relative; z-index: 20;
+  transition: background-color .2s; gap: 2px;
+}
+.tabbar::after {
+  content: ''; position: absolute; inset: auto 0 0 0; height: 1px;
+  background: hsl(var(--muted-foreground) / .45); z-index: 0;
+}
+.tab {
+  height: 32px; padding: 0 12px; display: flex; align-items: center; gap: 8px;
+  border: 1px solid hsl(var(--muted-foreground) / .45); border-bottom: 1px solid hsl(var(--muted-foreground) / .45);
+  border-radius: 6px 6px 0 0; cursor: pointer; white-space: nowrap;
+  font-size: 14px; color: hsl(var(--muted-foreground)); background: hsl(var(--muted));
+  transition: all .15s; user-select: none; position: relative; z-index: 1; margin-top: 4px;
+}
+.tab:hover { color: hsl(var(--foreground)); background: hsl(var(--muted) / .9); }
+.tab.active {
+  color: hsl(var(--foreground)); background: hsl(var(--background));
+  border-color: hsl(var(--muted-foreground) / .45);
+  border-bottom-color: hsl(var(--background)); z-index: 30; margin-top: 0; margin-bottom: -1px;
+}
+.tab.active::after {
+  content: ''; position: absolute; bottom: -1px; left: 0; right: 0;
+  height: 2px; background: hsl(var(--background));
+}
+.tab-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.tab-dot.running { background: hsl(var(--success)); }
+.tab-dot.idle { background: hsl(var(--muted-foreground) / .4); }
+.tab-icons { display: flex; gap: 2px; align-items: center; }
+.tab-icons .icon-xs { width: 12px; height: 12px; color: hsl(var(--muted-foreground)); }
+.tab.active .tab-icons .icon-xs { color: hsl(var(--success)); }
+.tab-label { max-width: 5rem; overflow: hidden; text-overflow: ellipsis; font-size: 14px; }
+.tab.active .tab-label { max-width: 10rem; }
+.tab-close {
+  padding: 2px; border-radius: 3px; line-height: 0;
+  opacity: 0; transition: opacity .1s, background .1s; margin-left: 2px;
+}
+.tab-close .icon-xs { width: 12px; height: 12px; }
+.tab-close:hover { background: hsl(var(--foreground) / .1); }
+.tab:hover .tab-close, .tab.active .tab-close { opacity: .6; }
+.tab-close:hover { opacity: 1 !important; }
+.tab-add {
+  height: 26px; width: 28px; margin: 0 0 7px 4px; display: flex; align-items: center;
+  justify-content: center; border: 1px dashed hsl(var(--muted-foreground) / .4);
+  border-radius: 6px; color: hsl(var(--muted-foreground)); cursor: pointer; transition: all .15s;
+}
+.tab-add:hover {
+  color: hsl(var(--foreground)); border-color: hsl(var(--foreground) / .5);
+  background: hsl(var(--muted) / .3);
+}
+
+/* ========== Sidebar ========== */
+.sidebar {
+  width: 288px; background: hsl(var(--card)); border-right: 1px solid hsl(var(--border));
+  display: flex; flex-direction: column; flex-shrink: 0; transition: background-color .2s, border-color .2s;
+}
+.sb-header { padding: 12px; display: flex; align-items: center; gap: 8px; }
+.sb-collapse {
+  border: none; background: none; color: hsl(var(--muted-foreground)); border-radius: 6px;
+  width: 28px; height: 28px; display: flex; align-items: center; justify-content: center;
+  cursor: pointer; transition: all .15s;
+}
+.sb-collapse:hover { color: hsl(var(--foreground)); background: hsl(var(--muted)); }
+.sb-logo { font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 600; letter-spacing: -0.02em; }
+.sb-search { padding: 0 12px 12px; }
+.sb-search-wrap { position: relative; }
+.sb-search-wrap .icon { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: hsl(var(--muted-foreground)); opacity: .6; }
+.sb-search input {
+  width: 100%; height: 32px; padding: 0 12px 0 32px;
+  background: hsl(var(--muted) / .5); border: none; border-radius: 6px;
+  color: hsl(var(--foreground)); font-size: 13px; outline: none; transition: background-color .2s;
+}
+.sb-search input::placeholder { color: hsl(var(--muted-foreground) / .6); }
+.sb-search input:focus { outline: 1px solid hsl(var(--border)); background: hsl(var(--muted) / .8); }
+.sb-nav { display: flex; gap: 4px; padding: 0 12px 12px; }
+.sb-nav-btn {
+  flex: 1; display: flex; align-items: center; justify-content: center; gap: 5px;
+  padding: 6px 0; border-radius: 6px; font-size: 11px; cursor: pointer;
+  border: none; transition: all .12s; color: hsl(var(--muted-foreground)); background: none;
+}
+.sb-nav-btn:hover { color: hsl(var(--foreground)); background: hsl(var(--muted) / .5); }
+.sb-nav-btn.active { color: hsl(var(--background)); background: hsl(var(--foreground)); font-weight: 500; }
+.sb-nav-btn .icon { pointer-events: none; }
+.sb-list { flex: 1; overflow-y: auto; padding: 0 8px; }
+.sb-item {
+  width: 100%; padding: 8px 10px; border-radius: 6px; display: flex; gap: 10px;
+  cursor: pointer; transition: background .1s; align-items: flex-start;
+}
+.sb-item:hover { background: hsl(var(--muted) / .5); }
+.sb-item-icon {
+  width: 14px; height: 14px; flex-shrink: 0; margin-top: 3px; color: hsl(var(--muted-foreground));
+}
+.sb-item-icon svg { width: 14px; height: 14px; fill: currentColor; }
+.sb-item-body { flex: 1; min-width: 0; }
+.sb-item-title {
+  font-size: 13px; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; line-height: 1.4;
+}
+.sb-item-meta { font-size: 11px; color: hsl(var(--muted-foreground)); margin-top: 1px; display: flex; gap: 6px; }
+.sb-footer { padding: 12px 16px; border-top: 1px solid hsl(var(--border)); transition: border-color .2s; }
+.sb-footer a {
+  color: hsl(var(--muted-foreground)); text-decoration: none; font-size: 12px;
+  display: flex; align-items: center; gap: 6px; transition: color .15s;
+}
+.sb-footer a:hover { color: hsl(var(--foreground)); }
+
+/* ========== Main Layout ========== */
+.main { display: flex; flex: 1; min-height: 0; position: relative; }
+.sb-open-btn {
+  position: absolute; top: 8px; left: 8px; z-index: 30;
+  border: 1px solid hsl(var(--border) / .6); background: hsl(var(--card) / .95);
+  color: hsl(var(--muted-foreground)); border-radius: 8px; width: 32px; height: 32px;
+  display: flex; align-items: center; justify-content: center; cursor: pointer;
+  transition: all .15s;
+}
+.sb-open-btn:hover { color: hsl(var(--foreground)); background: hsl(var(--muted)); }
+
+/* ========== Content ========== */
+.content { flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; }
+.tab-panel { display: none; flex: 1; min-height: 0; }
+.tab-panel.active { display: flex; }
+
+/* ========== Panes ========== */
+.pane { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.pane-header {
+  height: 28px; padding: 0 8px; display: flex; align-items: center; gap: 6px;
+  border-bottom: 1px solid hsl(var(--border)); flex-shrink: 0;
+  font-size: 13px; color: hsl(var(--muted-foreground)); transition: background-color .2s, border-color .2s;
+}
+.pane-header.active { background: hsl(var(--muted)); }
+.pane-header.inactive { background: hsl(var(--muted) / .5); opacity: .85; }
+.pane-header .icon { opacity: .6; }
+.pane-header-title { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pane-header-meta { font-size: 11px; color: hsl(var(--muted-foreground)); max-width: 14rem; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pane-btns { display: flex; gap: 1px; align-items: center; }
+.pane-btn {
+  padding: 2px; border-radius: 3px; opacity: .5; cursor: pointer;
+  transition: opacity .1s, background .1s; display: flex; line-height: 0;
+}
+.pane-btn:hover { opacity: 1; background: hsl(var(--foreground) / .08); }
+.split-h { display: flex; flex: 1; min-height: 0; }
+.split-v { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; }
+.divider-v {
+  width: 12px; flex-shrink: 0; cursor: col-resize; position: relative;
+  display: flex; align-items: center; justify-content: center;
+}
+.divider-v::before {
+  content: ''; position: absolute; left: 50%; top: 0; bottom: 0; width: 1px;
+  background: hsl(var(--border)); transform: translateX(-50%); transition: all .15s;
+}
+.divider-v:hover::before { width: 3px; background: hsl(var(--muted-foreground) / .5); }
+.divider-v .dots { display: flex; flex-direction: column; gap: 3px; opacity: 0; transition: opacity .15s; z-index: 1; }
+.divider-v:hover .dots { opacity: .5; }
+.divider-v .dots span { width: 3px; height: 3px; border-radius: 50%; background: hsl(var(--muted-foreground)); }
+.divider-h {
+  height: 12px; flex-shrink: 0; cursor: row-resize; position: relative;
+  display: flex; align-items: center; justify-content: center;
+}
+.divider-h::before {
+  content: ''; position: absolute; top: 50%; left: 0; right: 0; height: 1px;
+  background: hsl(var(--border)); transform: translateY(-50%); transition: all .15s;
+}
+.divider-h:hover::before { height: 3px; background: hsl(var(--muted-foreground) / .5); }
+.divider-h .dots { display: flex; gap: 3px; opacity: 0; transition: opacity .15s; z-index: 1; }
+.divider-h:hover .dots { opacity: .5; }
+.divider-h .dots span { width: 3px; height: 3px; border-radius: 50%; background: hsl(var(--muted-foreground)); }
+
+/* ========== Terminal ========== */
+.terminal {
+  flex: 1; background: var(--t-bg); padding: 10px 14px;
+  font-family: 'JetBrains Mono', monospace; font-size: 13px; line-height: 1.55;
+  color: var(--t-fg); overflow-y: auto; overflow-x: hidden;
+  white-space: pre-wrap; word-break: break-word; transition: background-color .2s;
+}
+.term-line { min-height: 1.55em; }
+.term-cursor {
+  display: inline-block; width: 7.5px; height: 16px;
+  background: var(--t-cursor); animation: blink 1s step-end infinite;
+  vertical-align: text-bottom; margin-left: 1px;
+}
+@keyframes blink { 50% { opacity: 0; } }
+.t-green { color: var(--t-green); } .t-red { color: var(--t-red); }
+.t-yellow { color: var(--t-yellow); } .t-blue { color: var(--t-blue); }
+.t-magenta { color: var(--t-magenta); } .t-cyan { color: var(--t-cyan); }
+.t-dim { color: var(--t-dim); } .t-bold { font-weight: 600; color: var(--t-bold); }
+.term a, .pane-body a { color: inherit; text-decoration: none; }
+.term a:hover, .pane-body a:hover { text-decoration: underline; }
+.t-success { color: var(--t-success); }
+
+/* ========== Browser Pane ========== */
+.browser-pane { flex: 1; display: flex; flex-direction: column; background: var(--t-bg); transition: background-color .2s; }
+.browser-bar {
+  height: 32px; display: flex; align-items: center; gap: 8px; padding: 0 10px;
+  background: hsl(var(--muted)); border-bottom: 1px solid hsl(var(--border));
+  flex-shrink: 0; transition: background-color .2s, border-color .2s;
+}
+.browser-dots { display: flex; gap: 6px; }
+.browser-dots span { width: 10px; height: 10px; border-radius: 50%; }
+.browser-dots .rd { background: #ec6a5e; } .browser-dots .yw { background: #f4bf4f; } .browser-dots .gn { background: #62c554; }
+.browser-url {
+  flex: 1; height: 22px; background: hsl(var(--background) / .5);
+  border: 1px solid hsl(var(--border)); border-radius: 4px; padding: 0 8px;
+  font-size: 12px; color: hsl(var(--muted-foreground)); display: flex; align-items: center;
+  transition: background-color .2s, border-color .2s;
+}
+.browser-body { flex: 1; padding: 24px; overflow: auto; }
+.sim-app { max-width: 480px; }
+.sim-app h2 { font-size: 18px; font-weight: 600; color: var(--t-bold); margin-bottom: 4px; }
+.sim-app .subtitle { font-size: 12px; color: var(--t-dim); margin-bottom: 16px; }
+.sim-card {
+  background: hsl(var(--muted) / .4); border: 1px solid hsl(var(--border) / .6);
+  border-radius: 8px; padding: 12px 14px; margin-bottom: 8px; transition: background-color .2s, border-color .2s;
+}
+.sim-card-title { font-size: 13px; color: var(--t-fg); font-weight: 500; }
+.sim-card-meta { font-size: 11px; color: var(--t-dim); margin-top: 4px; }
+.sim-badge { display: inline-block; padding: 2px 8px; border-radius: 9px; font-size: 10px; font-weight: 500; }
+.sim-badge.done { background: hsl(var(--success) / .15); color: hsl(var(--success)); }
+.sim-badge.prog { background: hsl(207 82% 66% / .12); color: #61afef; }
+.sim-badge.todo { background: hsl(var(--muted-foreground) / .1); color: hsl(var(--muted-foreground)); }
+
+/* ========== Pane Picker ========== */
+.pane-picker {
+  flex: 1; display: flex; align-items: center; justify-content: center;
+  background: hsl(var(--background)); transition: background-color .2s;
+}
+.picker-grid {
+  display: flex; flex-wrap: wrap; justify-content: center; gap: 32px; padding: 16px;
+}
+.picker-option {
+  display: flex; flex-direction: column; align-items: center; gap: 12px;
+  padding: 24px; border-radius: 8px; border: none; background: none;
+  color: hsl(var(--foreground)); cursor: pointer; opacity: .5;
+  transition: all .15s;
+}
+.picker-option:hover { opacity: 1; transform: scale(1.05); }
+.picker-icon { width: 48px; height: 48px; }
+.picker-lucide { width: 48px; height: 48px; stroke-width: 1.5; }
+.picker-label { font-size: 14px; font-weight: 500; }
+.picker-shortcut {
+  font-size: 12px; opacity: 0; transition: opacity .15s;
+  color: hsl(var(--muted-foreground));
+}
+.picker-option:hover .picker-shortcut { opacity: .4; }
+
+/* ========== Projects View ========== */
+.sessions-view { flex: 1; overflow-y: auto; background: hsl(var(--background)); transition: background-color .2s; }
+.sv-header {
+  padding: 20px 24px 16px; border-bottom: 1px solid hsl(var(--border) / .3);
+  display: flex; align-items: center; gap: 12px; transition: border-color .2s;
+}
+.sv-title { font-size: 18px; font-weight: 600; letter-spacing: -0.02em; }
+.sv-count { font-size: 13px; color: hsl(var(--muted-foreground)); }
+.sv-refresh {
+  margin-left: auto; padding: 6px; border-radius: 6px; border: none; background: none;
+  color: hsl(var(--muted-foreground)); cursor: pointer; display: flex; transition: all .15s;
+}
+.sv-refresh:hover { color: hsl(var(--foreground)); background: hsl(var(--muted)); }
+.sv-search { padding: 12px 24px; }
+.sv-search-wrap { position: relative; display: inline-block; width: 100%; max-width: 400px; }
+.sv-search-wrap .icon { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: hsl(var(--muted-foreground)); opacity: .5; }
+.sv-search input {
+  width: 100%; height: 40px; padding: 0 16px 0 38px;
+  background: hsl(var(--muted) / .5); border: none; border-radius: 8px;
+  color: hsl(var(--foreground)); font-size: 13px; outline: none; transition: background-color .2s;
+}
+.sv-search input:focus { outline: 2px solid hsl(var(--border)); }
+.sv-body { padding: 8px 24px 24px; }
+.sv-project {
+  border: 1px solid hsl(var(--border) / .5); border-radius: 8px;
+  background: hsl(var(--card)); margin-bottom: 8px; overflow: hidden; transition: background-color .2s, border-color .2s;
+}
+.sv-project-header { padding: 12px 16px; display: flex; align-items: center; gap: 12px; cursor: pointer; transition: background-color .15s; }
+.sv-project-header:hover { background: hsl(var(--muted) / .5); }
+.sv-project-dot { width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0; }
+.sv-project-name { font-size: 13px; font-weight: 500; flex: 1; }
+.sv-project-count { font-size: 12px; color: hsl(var(--muted-foreground)); }
+.sv-project-chevron { transition: transform .2s; color: hsl(var(--muted-foreground)); }
+.sv-project.open .sv-project-chevron { transform: rotate(90deg); }
+.sv-sessions { border-top: 1px solid hsl(var(--border)); display: none; }
+.sv-project.open .sv-sessions { display: block; }
+.sv-session { padding: 12px 16px 12px 40px; border-bottom: 1px solid hsl(var(--border) / .3); transition: background-color .15s; }
+.sv-session:last-child { border-bottom: none; }
+.sv-session:hover { background: hsl(var(--muted) / .3); }
+.sv-session-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sv-session-title { font-size: 13px; font-weight: 500; }
+.sv-session-provider { font-size: 10px; padding: 1px 7px; border-radius: 9px; font-weight: 600; }
+.sv-session-provider.claude { background: hsl(271 91% 65% / .15); color: #a78bfa; }
+.sv-session-provider.codex { background: hsl(217 91% 60% / .12); color: #60a5fa; }
+.sv-session-time { font-size: 12px; color: hsl(var(--muted-foreground)); margin-left: auto; }
+.sv-session-summary { font-size: 12px; color: hsl(var(--muted-foreground)); margin-top: 4px; line-height: 1.5; }
+.sv-session-cwd { font-size: 11px; color: var(--t-dim); margin-top: 3px; font-family: 'JetBrains Mono', monospace; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="main">
+    <button class="sb-open-btn" title="Show sidebar" id="sidebar-open" style="display:none">
+      <i data-lucide="panel-left" class="icon"></i>
+    </button>
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sb-header">
+        <button class="sb-collapse" title="Hide sidebar" id="sidebar-toggle"><i data-lucide="panel-left-close" class="icon"></i></button>
+        <span class="sb-logo">🐚🔥freshell</span>
+      </div>
+      <div class="sb-search">
+        <div class="sb-search-wrap">
+          <i data-lucide="search" class="icon"></i>
+          <input type="text" placeholder="Search coding agents, tabs, projects…" readonly>
+        </div>
+      </div>
+      <div class="sb-nav">
+        <button class="sb-nav-btn active" title="Coding Agents"><i data-lucide="terminal" class="icon"></i></button>
+        <button class="sb-nav-btn" title="Tabs"><i data-lucide="rows-3" class="icon"></i></button>
+        <button class="sb-nav-btn" title="Panes"><i data-lucide="layout-grid" class="icon"></i></button>
+        <button class="sb-nav-btn" title="Projects"><i data-lucide="folder" class="icon"></i></button>
+        <button class="sb-nav-btn" title="Settings"><i data-lucide="settings" class="icon"></i></button>
+      </div>
+      <div class="sb-list">
+        <div class="sb-item"><div class="sb-item-icon"><svg viewBox="75.73 64.08 872.25 872.25"><path d="M616.9,649.5h-209.7c0,0,0,104.7,0,104.7h-56.6c0,0,.2-104.5.2-104.5h-48.6s.2,104.5.2,104.5h-56.7c0,0,.2-104.4.2-104.4l-48.6-.7v-96.4c.1,0-104.8,0-104.8,0v-104.9s104.9,0,104.9,0v-201.6c0,0,628.9,0,628.9,0v201.6c0,0,104.9,0,104.9,0v104.9s-104.9,0-104.9,0v96.6c.1,0-56.5.4-56.5.4l.2,104.5h-48.6s.2-104.6.2-104.6h-56.6s.2,104.6.2,104.6h-48.6s.2-104.6.2-104.6ZM351.1,447.5l-.5-96.4h-48.4c0,0,0,96.6,0,96.6l48.8-.2ZM722,447.7l-.4-96.7h-56.5c0,0,0,96.8,0,96.8h56.9Z"/></svg></div><div class="sb-item-body"><div class="sb-item-title">Add dark mode toggle</div><div class="sb-item-meta"><span>freshell</span><span>2m</span></div></div></div>
+        <div class="sb-item"><div class="sb-item-icon"><svg viewBox="75.73 64.08 872.25 872.25"><path d="M616.9,649.5h-209.7c0,0,0,104.7,0,104.7h-56.6c0,0,.2-104.5.2-104.5h-48.6s.2,104.5.2,104.5h-56.7c0,0,.2-104.4.2-104.4l-48.6-.7v-96.4c.1,0-104.8,0-104.8,0v-104.9s104.9,0,104.9,0v-201.6c0,0,628.9,0,628.9,0v201.6c0,0,104.9,0,104.9,0v104.9s-104.9,0-104.9,0v96.6c.1,0-56.5.4-56.5.4l.2,104.5h-48.6s.2-104.6.2-104.6h-56.6s.2,104.6.2,104.6h-48.6s.2-104.6.2-104.6ZM351.1,447.5l-.5-96.4h-48.4c0,0,0,96.6,0,96.6l48.8-.2ZM722,447.7l-.4-96.7h-56.5c0,0,0,96.8,0,96.8h56.9Z"/></svg></div><div class="sb-item-body"><div class="sb-item-title">Fix WebSocket reconnection</div><div class="sb-item-meta"><span>freshell</span><span>1h</span></div></div></div>
+        <div class="sb-item"><div class="sb-item-icon"><svg viewBox="-0.27 -0.23 16.55 16.55"><path d="M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z"/></svg></div><div class="sb-item-body"><div class="sb-item-title">Refactor auth middleware</div><div class="sb-item-meta"><span>api-server</span><span>3h</span></div></div></div>
+        <div class="sb-item"><div class="sb-item-icon"><svg viewBox="75.73 64.08 872.25 872.25"><path d="M616.9,649.5h-209.7c0,0,0,104.7,0,104.7h-56.6c0,0,.2-104.5.2-104.5h-48.6s.2,104.5.2,104.5h-56.7c0,0,.2-104.4.2-104.4l-48.6-.7v-96.4c.1,0-104.8,0-104.8,0v-104.9s104.9,0,104.9,0v-201.6c0,0,628.9,0,628.9,0v201.6c0,0,104.9,0,104.9,0v104.9s-104.9,0-104.9,0v96.6c.1,0-56.5.4-56.5.4l.2,104.5h-48.6s.2-104.6.2-104.6h-56.6s.2,104.6.2,104.6h-48.6s.2-104.6.2-104.6ZM351.1,447.5l-.5-96.4h-48.4c0,0,0,96.6,0,96.6l48.8-.2ZM722,447.7l-.4-96.7h-56.5c0,0,0,96.8,0,96.8h56.9Z"/></svg></div><div class="sb-item-body"><div class="sb-item-title">Build landing page</div><div class="sb-item-meta"><span>freshell-web</span><span>5h</span></div></div></div>
+        <div class="sb-item"><div class="sb-item-icon"><svg viewBox="75.73 64.08 872.25 872.25"><path d="M616.9,649.5h-209.7c0,0,0,104.7,0,104.7h-56.6c0,0,.2-104.5.2-104.5h-48.6s.2,104.5.2,104.5h-56.7c0,0,.2-104.4.2-104.4l-48.6-.7v-96.4c.1,0-104.8,0-104.8,0v-104.9s104.9,0,104.9,0v-201.6c0,0,628.9,0,628.9,0v201.6c0,0,104.9,0,104.9,0v104.9s-104.9,0-104.9,0v96.6c.1,0-56.5.4-56.5.4l.2,104.5h-48.6s.2-104.6.2-104.6h-56.6s.2,104.6.2,104.6h-48.6s.2-104.6.2-104.6ZM351.1,447.5l-.5-96.4h-48.4c0,0,0,96.6,0,96.6l48.8-.2ZM722,447.7l-.4-96.7h-56.5c0,0,0,96.8,0,96.8h56.9Z"/></svg></div><div class="sb-item-body"><div class="sb-item-title">Update test coverage</div><div class="sb-item-meta"><span>freshell</span><span>1d</span></div></div></div>
+        <div class="sb-item"><div class="sb-item-icon"><svg viewBox="-0.27 -0.23 16.55 16.55"><path d="M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z"/></svg></div><div class="sb-item-body"><div class="sb-item-title">Setup CI pipeline</div><div class="sb-item-meta"><span>freshell</span><span>2d</span></div></div></div>
+        <div class="sb-item"><div class="sb-item-icon"><svg viewBox="75.73 64.08 872.25 872.25"><path d="M616.9,649.5h-209.7c0,0,0,104.7,0,104.7h-56.6c0,0,.2-104.5.2-104.5h-48.6s.2,104.5.2,104.5h-56.7c0,0,.2-104.4.2-104.4l-48.6-.7v-96.4c.1,0-104.8,0-104.8,0v-104.9s104.9,0,104.9,0v-201.6c0,0,628.9,0,628.9,0v201.6c0,0,104.9,0,104.9,0v104.9s-104.9,0-104.9,0v96.6c.1,0-56.5.4-56.5.4l.2,104.5h-48.6s.2-104.6.2-104.6h-56.6s.2,104.6.2,104.6h-48.6s.2-104.6.2-104.6ZM351.1,447.5l-.5-96.4h-48.4c0,0,0,96.6,0,96.6l48.8-.2ZM722,447.7l-.4-96.7h-56.5c0,0,0,96.8,0,96.8h56.9Z"/></svg></div><div class="sb-item-body"><div class="sb-item-title">Add pane resize shortcuts</div><div class="sb-item-meta"><span>freshell</span><span>3d</span></div></div></div>
+      </div>
+      <div class="sb-footer"><a href="https://github.com/danshapiro/freshell" target="_blank"><span style="color:hsl(39 92% 50%)">★</span> Star on GitHub</a></div>
+    </aside>
+
+    <!-- Content (TabBar + Panels) -->
+    <div class="content">
+      <!-- Tab Bar -->
+      <div class="tabbar">
+        <div class="tab active" data-tab="welcome">
+          <span class="tab-icons">
+            <i data-lucide="terminal" class="icon-xs"></i>
+            <i data-lucide="plus" class="icon-xs"></i>
+          </span>
+          <span class="tab-label">freshell</span>
+          <span class="tab-close"><i data-lucide="x" class="icon-xs"></i></span>
+        </div>
+        <div class="tab" data-tab="claude">
+          <span class="tab-dot running"></span>
+          <span class="tab-label">Claude Code</span>
+          <span class="tab-close"><i data-lucide="x" class="icon-xs"></i></span>
+        </div>
+        <div class="tab" data-tab="workspace">
+          <span class="tab-icons">
+            <i data-lucide="terminal" class="icon-xs"></i>
+            <i data-lucide="terminal" class="icon-xs"></i>
+            <i data-lucide="globe" class="icon-xs"></i>
+          </span>
+          <span class="tab-label">workspace</span>
+          <span class="tab-close"><i data-lucide="x" class="icon-xs"></i></span>
+        </div>
+        <div class="tab" data-tab="sessions">
+          <span class="tab-dot idle"></span>
+          <span class="tab-label">Projects</span>
+          <span class="tab-close"><i data-lucide="x" class="icon-xs"></i></span>
+        </div>
+        <div class="tab" data-tab="start">
+          <span class="tab-dot running"></span>
+          <span class="tab-label">Get Started</span>
+          <span class="tab-close"><i data-lucide="x" class="icon-xs"></i></span>
+        </div>
+        <div class="tab-add" title="New shell tab"><i data-lucide="plus" class="icon"></i></div>
+      </div>
+      <!-- Welcome -->
+      <div class="tab-panel active" id="panel-welcome">
+        <div class="split-h">
+          <div class="pane" style="flex:.48">
+            <div class="pane-header active"><i data-lucide="terminal" class="icon"></i><span class="pane-header-title">Terminal — zsh</span><span class="pane-header-meta">~/code/freshell</span><div class="pane-btns"><span class="pane-btn"><i data-lucide="maximize-2" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="x" class="icon-xs"></i></span></div></div>
+            <div class="terminal" id="term-welcome"></div>
+          </div>
+          <div class="divider-v"><div class="dots"><span></span><span></span><span></span></div></div>
+          <div class="pane" style="flex:.52">
+            <div class="pane-header inactive"><i data-lucide="plus" class="icon"></i><span class="pane-header-title">New Pane</span><div class="pane-btns"><span class="pane-btn"><i data-lucide="maximize-2" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="x" class="icon-xs"></i></span></div></div>
+            <div class="pane-picker">
+              <div class="picker-grid">
+                <button class="picker-option">
+                  <svg class="picker-icon" viewBox="75.73 64.08 872.25 872.25" fill="currentColor"><path d="M616.9,649.5h-209.7c0,0,0,104.7,0,104.7h-56.6c0,0,.2-104.5.2-104.5h-48.6s.2,104.5.2,104.5h-56.7c0,0,.2-104.4.2-104.4l-48.6-.7v-96.4c.1,0-104.8,0-104.8,0v-104.9s104.9,0,104.9,0v-201.6c0,0,628.9,0,628.9,0v201.6c0,0,104.9,0,104.9,0v104.9s-104.9,0-104.9,0v96.6c.1,0-56.5.4-56.5.4l.2,104.5h-48.6s.2-104.6.2-104.6h-56.6s.2,104.6.2,104.6h-48.6s.2-104.6.2-104.6ZM351.1,447.5l-.5-96.4h-48.4c0,0,0,96.6,0,96.6l48.8-.2ZM722,447.7l-.4-96.7h-56.5c0,0,0,96.8,0,96.8h56.9Z"/></svg>
+                  <span class="picker-label">Claude</span>
+                  <span class="picker-shortcut">L</span>
+                </button>
+                <button class="picker-option">
+                  <svg class="picker-icon" viewBox="-0.27 -0.23 16.55 16.55" fill="currentColor"><path d="M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z"/></svg>
+                  <span class="picker-label">Codex</span>
+                  <span class="picker-shortcut">X</span>
+                </button>
+                <button class="picker-option">
+                  <i data-lucide="file-text" class="picker-lucide"></i>
+                  <span class="picker-label">Editor</span>
+                  <span class="picker-shortcut">E</span>
+                </button>
+                <button class="picker-option">
+                  <i data-lucide="globe" class="picker-lucide"></i>
+                  <span class="picker-label">Browser</span>
+                  <span class="picker-shortcut">B</span>
+                </button>
+                <button class="picker-option">
+                  <i data-lucide="terminal" class="picker-lucide"></i>
+                  <span class="picker-label">Shell</span>
+                  <span class="picker-shortcut">S</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Claude Code -->
+      <div class="tab-panel" id="panel-claude">
+        <div class="pane">
+          <div class="pane-header active"><i data-lucide="terminal" class="icon"></i><span class="pane-header-title">Terminal — Claude Code</span><span class="pane-header-meta">~/code/freshell</span><div class="pane-btns"><span class="pane-btn"><i data-lucide="maximize-2" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="x" class="icon-xs"></i></span></div></div>
+          <div class="terminal" id="term-claude"></div>
+        </div>
+      </div>
+
+      <!-- Workspace (3 panes) -->
+      <div class="tab-panel" id="panel-workspace">
+        <div class="split-h">
+          <div class="split-v" style="flex:.52">
+            <div class="pane" style="flex:.55">
+              <div class="pane-header active"><i data-lucide="terminal" class="icon"></i><span class="pane-header-title">Terminal — Claude Code</span><span class="pane-header-meta">~/code/freshell</span><div class="pane-btns"><span class="pane-btn"><i data-lucide="maximize-2" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="x" class="icon-xs"></i></span></div></div>
+              <div class="terminal" id="term-ws-top"></div>
+            </div>
+            <div class="divider-h"><div class="dots"><span></span><span></span><span></span></div></div>
+            <div class="pane" style="flex:.45">
+              <div class="pane-header inactive"><i data-lucide="terminal" class="icon"></i><span class="pane-header-title">Terminal — vitest</span><span class="pane-header-meta">~/code/freshell</span><div class="pane-btns"><span class="pane-btn"><i data-lucide="maximize-2" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="x" class="icon-xs"></i></span></div></div>
+              <div class="terminal" id="term-ws-bottom"></div>
+            </div>
+          </div>
+          <div class="divider-v"><div class="dots"><span></span><span></span><span></span></div></div>
+          <div class="pane" style="flex:.48">
+            <div class="pane-header inactive"><i data-lucide="globe" class="icon"></i><span class="pane-header-title">Browser — localhost:5173</span><div class="pane-btns"><span class="pane-btn"><i data-lucide="maximize-2" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="x" class="icon-xs"></i></span></div></div>
+            <div class="browser-pane">
+              <div class="browser-bar">
+                <div class="browser-dots"><span class="rd"></span><span class="yw"></span><span class="gn"></span></div>
+                <div class="browser-url">http://localhost:5173</div>
+              </div>
+              <div class="browser-body">
+                <div class="sim-app">
+                  <h2>Task Board</h2>
+                  <div class="subtitle">3 active · 5 completed</div>
+                  <div class="sim-card"><div style="display:flex;justify-content:space-between;align-items:center"><span class="sim-card-title">Fix auth test</span><span class="sim-badge done">Done</span></div><div class="sim-card-meta">Server → Auth · just now</div></div>
+                  <div class="sim-card"><div style="display:flex;justify-content:space-between;align-items:center"><span class="sim-card-title">Dark mode toggle</span><span class="sim-badge prog">In Progress</span></div><div class="sim-card-meta">Settings → Appearance · @dan</div></div>
+                  <div class="sim-card"><div style="display:flex;justify-content:space-between;align-items:center"><span class="sim-card-title">WebSocket reconnect</span><span class="sim-badge prog">In Progress</span></div><div class="sim-card-meta">Core → Networking · @dan</div></div>
+                  <div class="sim-card"><div style="display:flex;justify-content:space-between;align-items:center"><span class="sim-card-title">Rate limiting</span><span class="sim-badge todo">To Do</span></div><div class="sim-card-meta">Server → API · unassigned</div></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Projects -->
+      <div class="tab-panel" id="panel-sessions">
+        <div class="sessions-view">
+          <div class="sv-header">
+            <span class="sv-title">Projects</span>
+            <span class="sv-count">12 sessions across 3 projects</span>
+            <button class="sv-refresh"><i data-lucide="refresh-cw" class="icon"></i></button>
+          </div>
+          <div class="sv-search"><div class="sv-search-wrap"><i data-lucide="search" class="icon-md"></i><input type="text" placeholder="Search sessions, projects…" readonly></div></div>
+          <div class="sv-body">
+            <div class="sv-project open">
+              <div class="sv-project-header">
+                <div class="sv-project-dot" style="background:#34d399"></div>
+                <span class="sv-project-name">freshell</span>
+                <span class="sv-project-count">4 sessions</span>
+                <i data-lucide="chevron-right" class="icon sv-project-chevron"></i>
+              </div>
+              <div class="sv-sessions">
+                <div class="sv-session"><div class="sv-session-body"><div class="sv-session-top"><span class="sv-session-title">Add dark mode toggle</span><span class="sv-session-provider claude">Claude Code</span><span class="sv-session-time">2 min ago</span></div><div class="sv-session-summary">Added ThemeSelector with system/light/dark options. CSS variables switch themes. Persists to localStorage, respects OS preference via media query listener.</div><div class="sv-session-cwd">~/code/freshell</div></div></div>
+                <div class="sv-session"><div class="sv-session-body"><div class="sv-session-top"><span class="sv-session-title">Fix WebSocket reconnection</span><span class="sv-session-provider claude">Claude Code</span><span class="sv-session-time">1 hour ago</span></div><div class="sv-session-summary">Fixed race condition in reconnect logic — multiple simultaneous reconnect attempts caused duplicate sessions. Added exponential backoff with jitter, max 5 retries.</div><div class="sv-session-cwd">~/code/freshell</div></div></div>
+                <div class="sv-session"><div class="sv-session-body"><div class="sv-session-top"><span class="sv-session-title">Pane resize keyboard shortcuts</span><span class="sv-session-provider codex">Codex CLI</span><span class="sv-session-time">yesterday</span></div><div class="sv-session-summary">Added arrow key support for pane resizing. 10px increments with Shift modifier for 50px jumps. Respects min pane width/height constraints.</div><div class="sv-session-cwd">~/code/freshell</div></div></div>
+                <div class="sv-session"><div class="sv-session-body"><div class="sv-session-top"><span class="sv-session-title">Update test coverage</span><span class="sv-session-provider claude">Claude Code</span><span class="sv-session-time">2 days ago</span></div><div class="sv-session-summary">Increased test coverage from 72% to 89%. Added missing tests for WebSocket handler, terminal registry, and pane split logic. 14 new test cases.</div><div class="sv-session-cwd">~/code/freshell</div></div></div>
+              </div>
+            </div>
+            <div class="sv-project">
+              <div class="sv-project-header"><div class="sv-project-dot" style="background:#60a5fa"></div><span class="sv-project-name">api-server</span><span class="sv-project-count">2 sessions</span><i data-lucide="chevron-right" class="icon sv-project-chevron"></i></div>
+            </div>
+            <div class="sv-project">
+              <div class="sv-project-header"><div class="sv-project-dot" style="background:#f97316"></div><span class="sv-project-name">freshell-web</span><span class="sv-project-count">1 session</span><i data-lucide="chevron-right" class="icon sv-project-chevron"></i></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Get Started -->
+      <div class="tab-panel" id="panel-start">
+        <div class="pane">
+          <div class="pane-header active"><i data-lucide="terminal" class="icon"></i><span class="pane-header-title">Terminal — zsh</span><span class="pane-header-meta">~</span><div class="pane-btns"><span class="pane-btn"><i data-lucide="maximize-2" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="x" class="icon-xs"></i></span></div></div>
+          <div class="terminal" id="term-start"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ========== Initialize Lucide Icons ==========
+lucide.createIcons();
+
+// ========== Sidebar Toggle ==========
+const sidebarToggle = document.getElementById('sidebar-toggle');
+const sidebarOpen = document.getElementById('sidebar-open');
+const sidebar = document.getElementById('sidebar');
+let sidebarVisible = window.innerWidth > 768;
+if (!sidebarVisible) {
+  sidebar.style.display = 'none';
+  sidebarOpen.style.display = '';
+}
+
+function updateSidebarVisibility() {
+  sidebar.style.display = sidebarVisible ? '' : 'none';
+  sidebarOpen.style.display = sidebarVisible ? 'none' : '';
+}
+
+sidebarToggle.addEventListener('click', () => {
+  sidebarVisible = false;
+  updateSidebarVisibility();
+});
+
+sidebarOpen.addEventListener('click', () => {
+  sidebarVisible = true;
+  updateSidebarVisibility();
+});
+
+window.addEventListener('resize', () => {
+  if (window.innerWidth <= 768 && sidebarVisible) return
+  if (window.innerWidth > 768) {
+    sidebarVisible = true
+  }
+  if (window.innerWidth <= 768 && !sidebarVisible) {
+    sidebarVisible = false
+  }
+  updateSidebarVisibility()
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape') return
+  if (!sidebarVisible) return
+  sidebarVisible = !sidebarVisible;
+  updateSidebarVisibility();
+});
+
+// ========== Sidebar Nav ==========
+document.querySelectorAll('.sb-nav-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.sb-nav-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  });
+});
+
+// ========== Tab Switching ==========
+const allTabs = document.querySelectorAll('.tab[data-tab]');
+const allPanels = document.querySelectorAll('.tab-panel');
+let activeAnimations = [];
+
+allTabs.forEach(tab => {
+  tab.addEventListener('click', () => {
+    const id = tab.dataset.tab;
+    allTabs.forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    allPanels.forEach(p => p.classList.remove('active'));
+    document.getElementById('panel-' + id).classList.add('active');
+    cancelAnimations();
+    startAnimation(id);
+  });
+});
+
+function cancelAnimations() {
+  activeAnimations.forEach(id => clearTimeout(id));
+  activeAnimations = [];
+}
+
+// ========== Terminal Animation Engine ==========
+function animateTerminal(containerId, lines, callback) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  el.innerHTML = '';
+  let i = 0;
+
+  function addCursor() {
+    const existing = el.querySelector('.term-cursor');
+    if (existing) existing.remove();
+    const c = document.createElement('span');
+    c.className = 'term-cursor';
+    // Append cursor inside the last term-line so it sits next to the prompt
+    const lastLine = el.querySelector('.term-line:last-of-type');
+    if (lastLine) lastLine.appendChild(c);
+    else el.appendChild(c);
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function next() {
+    if (i >= lines.length) { addCursor(); if (callback) callback(); return; }
+    const line = lines[i]; i++;
+
+    if (line.typed) {
+      const div = document.createElement('div');
+      div.className = 'term-line';
+      div.innerHTML = line.prompt || '';
+      el.querySelector('.term-cursor')?.remove();
+      el.appendChild(div);
+      typeText(div, line.command, 0, () => {
+        const tid = setTimeout(next, line.delay || 300);
+        activeAnimations.push(tid);
+      });
+    } else {
+      const div = document.createElement('div');
+      div.className = 'term-line';
+      div.innerHTML = line.html || '';
+      el.querySelector('.term-cursor')?.remove();
+      el.appendChild(div);
+      addCursor();
+      const tid = setTimeout(next, line.delay || 40);
+      activeAnimations.push(tid);
+    }
+  }
+  addCursor();
+  const tid = setTimeout(next, 400);
+  activeAnimations.push(tid);
+}
+
+function typeText(el, text, pos, callback) {
+  if (pos >= text.length) { callback(); return; }
+  el.innerHTML += text[pos] === ' ' ? ' ' : escapeHtml(text[pos]);
+  el.closest('.terminal').scrollTop = el.closest('.terminal').scrollHeight;
+  const speed = 11 + Math.random() * 15;
+  const tid = setTimeout(() => typeText(el, text, pos + 1, callback), speed);
+  activeAnimations.push(tid);
+}
+
+function escapeHtml(c) {
+  if (c === '<') return '&lt;'; if (c === '>') return '&gt;';
+  if (c === '&') return '&amp;'; return c;
+}
+
+// ========== Content Definitions ==========
+const P = '<span class="t-green">&#10095; </span>';
+const FP = '<span class="t-green">freshell</span> <span class="t-magenta">(main)</span> <span class="t-dim">|</span> ' + P;
+
+const content = {
+  welcome: [
+    { typed: true, prompt: P, command: 'freshell', delay: 700 },
+    { html: '' },
+    { html: '  🐚🔥 <span class="t-bold">freshell</span> <span class="t-dim">v0.4.1</span>', delay: 60 },
+    { html: '  <span class="t-dim">Self-hosted browser terminal multiplexer</span>', delay: 60 },
+    { html: '', delay: 200 },
+    { html: '  <span class="t-success">✓</span> Multi-tab terminal management', delay: 50 },
+    { html: '  <span class="t-success">✓</span> Claude Code, Codex &amp; more', delay: 50 },
+    { html: '  <span class="t-success">✓</span> Split panes with browser views', delay: 50 },
+    { html: '  <span class="t-success">✓</span> In-pane terminal search with Ctrl+F', delay: 50 },
+    { html: '  <span class="t-success">✓</span> Advanced OSC52 clipboard policy (Ask/Always/Never)', delay: 50 },
+    { html: '  <span class="t-success">✓</span> Session history &amp; AI summaries', delay: 50 },
+    { html: '  <span class="t-success">✓</span> Remote tab copies keep layout and reconnect safely on this machine', delay: 50 },
+    { html: '  <span class="t-success">✓</span> Remote access with setup wizard &amp; QR code', delay: 50 },
+    { html: '', delay: 300 },
+    { html: '  <span class="t-dim">Your coding CLIs, organized in the browser.</span>', delay: 80 },
+    { html: '  <span class="t-dim">GitHub:</span> <a href="https://github.com/danshapiro/freshell" target="_blank" class="t-blue">https://github.com/danshapiro/freshell</a>', delay: 80 },
+    { html: '' },
+    { html: '  <span class="t-dim">Try the tabs at the top to learn more.</span>', delay: 80 },
+    { html: '' },
+    { typed: true, prompt: FP, command: '', delay: 0 },
+  ],
+
+  claude: [
+    { typed: true, prompt: P, command: 'claude', delay: 700 },
+    { html: '', delay: 300 },
+    { html: '<span class="t-dim">╭───────────────────────────────────────────╮</span>', delay: 30 },
+    { html: '<span class="t-dim">│</span> <span class="t-magenta">✻</span> <span class="t-bold">Claude Code</span>          <span class="t-dim">Press ? for help │</span>', delay: 30 },
+    { html: '<span class="t-dim">╰───────────────────────────────────────────╯</span>', delay: 200 },
+    { html: '' },
+    { typed: true, prompt: '<span class="t-blue">&#10095; </span>', command: 'Add a dark mode toggle to the settings page', delay: 600 },
+    { html: '' },
+    { html: 'I\'ll add a dark mode toggle. Let me check the current', delay: 40 },
+    { html: 'implementation first.', delay: 200 },
+    { html: '' },
+    { html: '  <span class="t-dim">Read</span> <span class="t-cyan">src/components/Settings.tsx</span>', delay: 80 },
+    { html: '  <span class="t-dim">Read</span> <span class="t-cyan">src/lib/theme.ts</span>', delay: 300 },
+    { html: '' },
+    { html: 'The settings page uses a card-based layout. I\'ll add a', delay: 40 },
+    { html: 'theme selector with system/light/dark options.', delay: 200 },
+    { html: '' },
+    { html: '  <span class="t-dim">Edit</span> <span class="t-cyan">src/components/Settings.tsx</span>', delay: 60 },
+    { html: '   <span class="t-success">+</span> Added <span class="t-bold">ThemeSelector</span> component', delay: 40 },
+    { html: '   <span class="t-success">+</span> Three-way toggle: System | Light | Dark', delay: 40 },
+    { html: '   <span class="t-success">+</span> Reads OS preference for "system" mode', delay: 150 },
+    { html: '' },
+    { html: '  <span class="t-dim">Write</span> <span class="t-cyan">src/lib/theme.ts</span>', delay: 60 },
+    { html: '   <span class="t-success">+</span> CSS variable switching utility', delay: 40 },
+    { html: '   <span class="t-success">+</span> localStorage persistence', delay: 40 },
+    { html: '   <span class="t-success">+</span> Media query listener for OS changes', delay: 200 },
+    { html: '' },
+    { html: '<span class="t-success">✓</span> Dark mode toggle added. The component respects the', delay: 40 },
+    { html: '  OS theme preference by default and allows manual override.', delay: 300 },
+    { html: '' },
+    { html: '<span class="t-green">freshell</span> <span class="t-magenta">(main)</span> <span class="t-dim">|</span> <span class="t-yellow">55,872</span>' },
+    { html: '<span class="t-yellow">** bypass permissions on</span> <span class="t-dim">(shift+tab to cycle)</span>' },
+  ],
+
+  'ws-top': [
+    { typed: true, prompt: '<span class="t-blue">&#10095; </span>', command: 'Fix the failing test in auth.test.ts', delay: 500 },
+    { html: '' },
+    { html: 'Let me look at the test and the auth module.', delay: 200 },
+    { html: '' },
+    { html: '  <span class="t-dim">Read</span> <span class="t-cyan">server/auth.test.ts</span>', delay: 80 },
+    { html: '  <span class="t-dim">Read</span> <span class="t-cyan">server/auth.ts</span>', delay: 300 },
+    { html: '' },
+    { html: 'The test expects <span class="t-cyan">validateToken</span> to throw on expired', delay: 40 },
+    { html: 'tokens, but it returns <span class="t-cyan">null</span> instead.', delay: 200 },
+    { html: '' },
+    { html: '  <span class="t-dim">Edit</span> <span class="t-cyan">server/auth.ts</span>', delay: 60 },
+    { html: '   <span class="t-success">+</span> Line 42: <span class="t-red">throw new</span> <span class="t-yellow">TokenExpiredError</span>()', delay: 40 },
+    { html: '   <span class="t-success">+</span> Export <span class="t-yellow">TokenExpiredError</span> class', delay: 200 },
+    { html: '' },
+    { html: '<span class="t-success">✓</span> Fixed. Run the tests to verify.', delay: 60 },
+    { html: '' },
+    { html: '<span class="t-green">freshell</span> <span class="t-magenta">(main)</span> <span class="t-dim">|</span> <span class="t-yellow">55,872</span>' },
+  ],
+
+  'ws-bottom': [
+    { typed: true, prompt: P, command: 'npm test', delay: 400 },
+    { html: '', delay: 600 },
+    { html: ' <span class="t-success">✓</span> server/auth.test.ts <span class="t-dim">(4)</span> <span class="t-dim">12ms</span>', delay: 60 },
+    { html: '   <span class="t-success">✓</span> <span class="t-dim">validates correct tokens</span>', delay: 30 },
+    { html: '   <span class="t-success">✓</span> <span class="t-dim">rejects invalid tokens</span>', delay: 30 },
+    { html: '   <span class="t-success">✓</span> <span class="t-dim">throws on expired tokens</span>', delay: 30 },
+    { html: '   <span class="t-success">✓</span> <span class="t-dim">handles missing auth header</span>', delay: 80 },
+    { html: ' <span class="t-success">✓</span> server/ws-handler.test.ts <span class="t-dim">(8)</span> <span class="t-dim">45ms</span>', delay: 60 },
+    { html: ' <span class="t-success">✓</span> src/store/tabs.test.ts <span class="t-dim">(6)</span> <span class="t-dim">23ms</span>', delay: 60 },
+    { html: ' <span class="t-success">✓</span> src/store/panes.test.ts <span class="t-dim">(5)</span> <span class="t-dim">18ms</span>', delay: 60 },
+    { html: ' <span class="t-success">✓</span> server/terminal-registry.test.ts <span class="t-dim">(7)</span> <span class="t-dim">31ms</span>', delay: 150 },
+    { html: '' },
+    { html: ' <span class="t-bold">Tests</span>  <span class="t-success">30 passed</span> <span class="t-dim">(30)</span>', delay: 60 },
+    { html: ' <span class="t-bold">Time</span>   <span class="t-dim">1.24s</span>', delay: 60 },
+    { html: '' },
+  ],
+
+  start: [
+    { html: '<span class="t-dim"># Install freshell</span>', delay: 100 },
+    { typed: true, prompt: P, command: 'npm install -g freshell', delay: 600 },
+    { html: '', delay: 500 },
+    { html: '<span class="t-dim">added 142 packages in 4.2s</span>', delay: 300 },
+    { html: '' },
+    { html: '<span class="t-dim"># Start the server</span>', delay: 100 },
+    { typed: true, prompt: P, command: 'freshell --port 3000', delay: 600 },
+    { html: '', delay: 400 },
+    { html: '🐚🔥 <span class="t-bold">freshell</span> <span class="t-dim">v0.4.1</span>', delay: 60 },
+    { html: '', delay: 200 },
+    { html: '<span class="t-dim">Open your browser to connect.</span>', delay: 80 },
+    { html: '<span class="t-dim">Run</span> <span class="t-cyan">freshell --help</span> <span class="t-dim">for more options.</span>', delay: 100 },
+    { html: '' },
+    { html: '<span class="t-dim"># Or clone and run from source</span>', delay: 100 },
+    { typed: true, prompt: P, command: 'git clone <a href="https://github.com/danshapiro/freshell" target="_blank" class="t-blue">https://github.com/danshapiro/freshell</a>', delay: 500 },
+    { typed: true, prompt: P, command: 'cd freshell && npm install && npm run dev', delay: 400 },
+    { html: '', delay: 400 },
+    { html: '<span class="t-success">✓</span> <span class="t-dim">Client:</span> <span class="t-cyan">http://localhost:5173</span>', delay: 60 },
+    { html: '<span class="t-success">✓</span> <span class="t-dim">Server:</span> <span class="t-cyan">http://localhost:3000</span>', delay: 60 },
+    { html: '' },
+  ],
+};
+
+// ========== Start Animation ==========
+function startAnimation(tabId) {
+  if (tabId === 'workspace') {
+    animateTerminal('term-ws-top', content['ws-top']);
+    animateTerminal('term-ws-bottom', content['ws-bottom']);
+  } else if (content[tabId]) {
+    animateTerminal('term-' + tabId, content[tabId]);
+  }
+}
+
+// ========== Project Card Expand/Collapse ==========
+document.querySelectorAll('.sv-project-header').forEach(header => {
+  header.addEventListener('click', () => {
+    header.closest('.sv-project').classList.toggle('open');
+  });
+});
+
+// ========== Boot ==========
+startAnimation('welcome');
+
+// ========== Fourth Wall Breaker (WarGames WOPR style) ==========
+const GITHUB_URL = 'https://github.com/danshapiro/freshell';
+const GH = `<a href="${GITHUB_URL}" target="_blank">github.com/danshapiro/freshell</a>`;
+
+const quips = [
+  `This is just a webpage pretending to be a terminal. The real thing is at ${GH} — and it actually works.`,
+  `You're clicking around a fake terminal right now. Go get the real one at ${GH} before someone sees you.`,
+  `None of these buttons do anything. For buttons that do things, visit ${GH}.`,
+  `This is a glorified screenshot with delusions of grandeur. The actual app lives at ${GH}.`,
+  `You've been typing into a div. The real terminal is at ${GH}.`,
+  `Impressive, right? Now imagine if it actually did something. ${GH}`,
+  `This page has the energy of a concept car at an auto show. Drive the real thing: ${GH}`,
+  `No terminals were harmed in the making of this webpage. Get the real ones at ${GH}.`,
+  `Fun fact: this entire page is one HTML file cosplaying as a terminal multiplexer. The genuine article: ${GH}`,
+  `You just watched CSS pretend to be a shell. For an actual shell, there's ${GH}.`,
+  `Sir, this is a webpage. The real freshell is at ${GH}.`,
+  `Everything you see here is a lie. A beautiful, CSS-powered lie. Truth: ${GH}`,
+  `This page runs zero PTY processes. Zero! Fix that at ${GH}.`,
+  `Your cursor is blinking but nobody's home. Move in at ${GH}.`,
+  `If you squint, this almost looks real. For the non-squinting version: ${GH}`,
+  `This terminal has never executed a single command and it's not about to start. ${GH}`,
+  `You're admiring the menu. The kitchen is at ${GH}.`,
+  `Somewhere, a real terminal is waiting for you. It's at ${GH} and it's getting impatient.`,
+  `This demo has all the features of freshell except the part where it works. ${GH}`,
+  `You wouldn't download a car, but you should <code>git clone</code> a terminal multiplexer: ${GH}`,
+];
+
+// Shuffle bag so we don't repeat until all shown
+let quipBag = [];
+function nextQuip() {
+  if (quipBag.length === 0) {
+    quipBag = [...quips];
+    for (let i = quipBag.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [quipBag[i], quipBag[j]] = [quipBag[j], quipBag[i]];
+    }
+  }
+  return quipBag.pop();
+}
+
+const snarkOverlay = document.createElement('div');
+snarkOverlay.className = 'snark-overlay';
+snarkOverlay.innerHTML = `
+  <div class="snark-dismiss"></div>
+  <div class="snark-box">
+    <div class="snark-msg"></div>
+  </div>`;
+document.body.appendChild(snarkOverlay);
+const snarkBox = snarkOverlay.querySelector('.snark-box');
+const snarkMsg = snarkOverlay.querySelector('.snark-msg');
+const snarkDismiss = snarkOverlay.querySelector('.snark-dismiss');
+
+function showSnark() {
+  snarkMsg.innerHTML = nextQuip();
+  snarkOverlay.classList.add('show');
+}
+
+function cycleSnark() {
+  snarkMsg.innerHTML = nextQuip();
+}
+
+function hideSnark() {
+  snarkOverlay.classList.remove('show');
+}
+
+// Click on box → GitHub
+snarkBox.addEventListener('click', (e) => {
+  if (e.target.tagName === 'A') return;
+  e.stopPropagation();
+  window.open(GITHUB_URL, '_blank');
+});
+
+// Click backdrop → dismiss
+snarkDismiss.addEventListener('click', (e) => {
+  e.stopPropagation();
+  hideSnark();
+});
+
+// Trigger: keypress anywhere (someone trying to type)
+document.addEventListener('keydown', (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.key === 'Escape') { hideSnark(); return; }
+  if (e.key === 'Tab') return; // let tab switching work
+  if (e.key === 'Enter' && snarkOverlay.classList.contains('show')) {
+    e.preventDefault();
+    window.open(GITHUB_URL, '_blank');
+    return;
+  }
+  // Printable character or arrow
+  if (e.key.length > 1 && !e.key.startsWith('Arrow')) return;
+  if (snarkOverlay.classList.contains('show')) {
+    cycleSnark(); // Update message on each keypress
+  } else {
+    showSnark();
+  }
+});
+
+// Trigger: clicks on inert UI elements
+const inertSelectors = [
+  '.sb-item',
+  '.sb-search input',
+  '.tab-close',
+  '.tab-add',
+  '.pane-btn',
+  '.picker-option',
+  '.sv-search input',
+  '.sv-refresh',
+];
+
+document.addEventListener('click', (e) => {
+  for (const sel of inertSelectors) {
+    if (e.target.closest(sel)) { showSnark(); return; }
+  }
+});
+</script>
+</body>
+</html>

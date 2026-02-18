@@ -33,6 +33,8 @@ describe('settingsSlice', () => {
         scrollback: 5000,
         theme: 'auto',
         warnExternalLinks: true,
+        osc52Clipboard: 'ask',
+        renderer: 'auto',
       })
       expect(state.settings.defaultCwd).toBeUndefined()
       expect(state.settings.safety).toEqual({
@@ -52,6 +54,10 @@ describe('settingsSlice', () => {
         snapThreshold: 2,
         iconsOnTabs: true,
         tabAttentionStyle: 'highlight',
+        attentionDismiss: 'click',
+      })
+      expect(state.settings.notifications).toEqual({
+        soundEnabled: true,
       })
       expect(state.settings.codingCli).toEqual({
         enabledProviders: ['claude', 'codex'],
@@ -94,8 +100,10 @@ describe('settingsSlice', () => {
           lineHeight: 1.4,
           cursorBlink: false,
           scrollback: 10000,
-          theme: 'light',
+          theme: 'one-light',
           warnExternalLinks: true,
+          osc52Clipboard: 'ask',
+          renderer: 'auto',
         },
         defaultCwd: '/home/user',
         safety: {
@@ -109,6 +117,9 @@ describe('settingsSlice', () => {
           showNoninteractiveSessions: false,
           width: 320,
           collapsed: false,
+        },
+        notifications: {
+          soundEnabled: false,
         },
         codingCli: {
           enabledProviders: ['codex'],
@@ -124,6 +135,11 @@ describe('settingsSlice', () => {
           snapThreshold: 2,
           iconsOnTabs: true,
           tabAttentionStyle: 'highlight',
+          attentionDismiss: 'click' as const,
+        },
+        network: {
+          host: '127.0.0.1' as const,
+          configured: false,
         },
       }
 
@@ -138,6 +154,7 @@ describe('settingsSlice', () => {
             ...newSettings.codingCli.providers,
           },
         },
+        freshclaude: {},
       })
     })
 
@@ -218,6 +235,8 @@ describe('settingsSlice', () => {
       expect(state.settings.terminal.cursorBlink).toBe(defaultSettings.terminal.cursorBlink)
       expect(state.settings.terminal.scrollback).toBe(defaultSettings.terminal.scrollback)
       expect(state.settings.terminal.theme).toBe(defaultSettings.terminal.theme)
+      expect(state.settings.terminal.osc52Clipboard).toBe(defaultSettings.terminal.osc52Clipboard)
+      expect(state.settings.terminal.renderer).toBe(defaultSettings.terminal.renderer)
     })
 
     it('deep merges safety settings', () => {
@@ -299,6 +318,8 @@ describe('settingsSlice', () => {
       expect(state.settings.terminal.fontSize).toBe(16)
       expect(state.settings.terminal.cursorBlink).toBe(false)
       expect(state.settings.terminal.fontFamily).toBe(defaultSettings.terminal.fontFamily)
+      expect(state.settings.terminal.osc52Clipboard).toBe(defaultSettings.terminal.osc52Clipboard)
+      expect(state.settings.terminal.renderer).toBe(defaultSettings.terminal.renderer)
       expect(state.settings.safety.warnBeforeKillMinutes).toBe(10)
       expect(state.settings.safety.autoKillIdleMinutes).toBe(defaultSettings.safety.autoKillIdleMinutes)
       expect(state.settings.sidebar.showProjectBadges).toBe(false)
@@ -420,12 +441,12 @@ describe('settingsSlice', () => {
 
   describe('panes mergeSettings', () => {
     it('mergeSettings preserves iconsOnTabs when patching panes', () => {
-      const result = mergeSettings(defaultSettings, { panes: { defaultNewPane: 'shell' } } as any)
+      const result = mergeSettings(defaultSettings, { panes: { defaultNewPane: 'shell' } })
       expect(result.panes.iconsOnTabs).toBe(true)
     })
 
     it('mergeSettings allows overriding iconsOnTabs to false', () => {
-      const result = mergeSettings(defaultSettings, { panes: { iconsOnTabs: false } } as any)
+      const result = mergeSettings(defaultSettings, { panes: { iconsOnTabs: false } })
       expect(result.panes.iconsOnTabs).toBe(false)
     })
 
@@ -437,11 +458,29 @@ describe('settingsSlice', () => {
 
       const state = settingsReducer(
         initialState,
-        updateSettingsLocal({ panes: { iconsOnTabs: false } } as any)
+        updateSettingsLocal({ panes: { iconsOnTabs: false } })
       )
 
       expect(state.settings.panes.iconsOnTabs).toBe(false)
       expect(state.settings.panes.defaultNewPane).toBe('ask')
+    })
+  })
+
+  describe('terminal mergeSettings', () => {
+    it('preserves terminal policy fields when patching terminal settings', () => {
+      const base = {
+        ...defaultSettings,
+        terminal: {
+          ...defaultSettings.terminal,
+          osc52Clipboard: 'never' as const,
+          renderer: 'canvas' as const,
+        },
+      }
+
+      const result = mergeSettings(base, { terminal: { fontSize: 18 } } as any)
+      expect(result.terminal.fontSize).toBe(18)
+      expect(result.terminal.osc52Clipboard).toBe('never')
+      expect(result.terminal.renderer).toBe('canvas')
     })
   })
 })
@@ -450,7 +489,7 @@ describe('mergeSettings – panes.snapThreshold', () => {
   it('merges panes.snapThreshold without clobbering defaultNewPane', () => {
     const base = { ...defaultSettings }
     const patch = { panes: { snapThreshold: 6 } }
-    const result = mergeSettings(base, patch as any)
+    const result = mergeSettings(base, patch)
     expect(result.panes.snapThreshold).toBe(6)
     expect(result.panes.defaultNewPane).toBe('ask') // preserved
   })
@@ -462,7 +501,7 @@ describe('mergeSettings – panes.snapThreshold', () => {
   it('preserves snapThreshold when patching defaultNewPane', () => {
     const base = { ...defaultSettings, panes: { ...defaultSettings.panes, snapThreshold: 7 } }
     const patch = { panes: { defaultNewPane: 'shell' as const } }
-    const result = mergeSettings(base, patch as any)
+    const result = mergeSettings(base, patch)
     expect(result.panes.defaultNewPane).toBe('shell')
     expect(result.panes.snapThreshold).toBe(7)
   })
@@ -470,7 +509,7 @@ describe('mergeSettings – panes.snapThreshold', () => {
   it('allows snapThreshold to be set to 0 (off)', () => {
     const base = { ...defaultSettings }
     const patch = { panes: { snapThreshold: 0 } }
-    const result = mergeSettings(base, patch as any)
+    const result = mergeSettings(base, patch)
     expect(result.panes.snapThreshold).toBe(0)
   })
 })

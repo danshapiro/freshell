@@ -47,6 +47,29 @@ function deriveDisplaySubdir(cwd?: string, checkoutRoot?: string): string | unde
   return base || source
 }
 
+function isSameOrInside(parent: string, child: string): boolean {
+  // Use path.relative so we correctly handle worktrees where the session cwd is nested
+  // under the terminal spawn cwd (or vice versa).
+  const rel = path.relative(parent, child)
+  if (!rel) return true
+  return !rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel)
+}
+
+function selectMoreSpecificCwd(currentCwd?: string, sessionCwd?: string): string | undefined {
+  const normalizedCurrent = normalizePathForDisplay(currentCwd)
+  const normalizedSession = normalizePathForDisplay(sessionCwd)
+  if (!normalizedCurrent) return normalizedSession
+  if (!normalizedSession) return normalizedCurrent
+
+  // If one path contains the other, prefer the deeper (more specific) directory.
+  if (isSameOrInside(normalizedCurrent, normalizedSession)) return normalizedSession
+  if (isSameOrInside(normalizedSession, normalizedCurrent)) return normalizedCurrent
+
+  // If they are unrelated, prefer the coding-CLI session cwd; it reflects where the
+  // provider is actually operating (spawn cwd can be a generic default).
+  return normalizedSession
+}
+
 function tokenUsageEquals(a?: TokenSummary, b?: TokenSummary): boolean {
   if (!a && !b) return true
   if (!a || !b) return false
@@ -129,12 +152,14 @@ export class TerminalMetadataService {
     const current = this.byTerminalId.get(terminalId)
     if (!current) return undefined
 
+    const resolvedCwd = selectMoreSpecificCwd(current.cwd, session.cwd)
     const next = await this.enrichFromCwd({
       ...current,
       provider: session.provider,
       sessionId: session.sessionId,
-      // Keep live terminal cwd authoritative; session snapshots can lag after cd/worktree switches.
-      cwd: current.cwd ?? session.cwd,
+      // Prefer the most specific cwd we can infer. For coding CLIs, the session
+      // snapshot is often the only reliable source of worktree/subdir context.
+      cwd: resolvedCwd,
       branch: session.gitBranch ?? current.branch,
       isDirty: session.isDirty ?? current.isDirty,
       tokenUsage: session.tokenUsage ?? current.tokenUsage,

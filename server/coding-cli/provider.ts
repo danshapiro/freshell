@@ -19,7 +19,7 @@ export interface CodingCliProvider {
 
   getSessionGlob(): string
   listSessionFiles(): Promise<string[]>
-  parseSessionFile(content: string, filePath: string): ParsedSessionMeta
+  parseSessionFile(content: string, filePath: string): Promise<ParsedSessionMeta>
   resolveProjectPath(filePath: string, meta: ParsedSessionMeta): Promise<string>
   extractSessionId(filePath: string, meta?: ParsedSessionMeta): string
 

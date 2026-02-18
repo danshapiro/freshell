@@ -1,32 +1,40 @@
 import { useRef, useCallback, useMemo, useState, useEffect } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { closePane, setActivePane, resizePanes, updatePaneContent, updatePaneTitle, clearPaneRenameRequest, toggleZoom } from '@/store/panesSlice'
-import { updateTab } from '@/store/tabsSlice'
+import { setActivePane, resizePanes, updatePaneContent, updatePaneTitle, clearPaneRenameRequest, toggleZoom } from '@/store/panesSlice'
+import { updateTab, closePaneWithCleanup } from '@/store/tabsSlice'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
 import Pane from './Pane'
 import PaneDivider from './PaneDivider'
 import TerminalView from '../TerminalView'
 import BrowserPane from './BrowserPane'
 import EditorPane from './EditorPane'
+import ClaudeChatView from '../claude-chat/ClaudeChatView'
 import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
 import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-utils'
+import { getTerminalActions } from '@/lib/pane-action-registry'
 import { cn } from '@/lib/utils'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
+import { getTabDirectoryPreference } from '@/lib/tab-directory-preference'
 import { formatPaneRuntimeLabel, formatPaneRuntimeTooltip } from '@/lib/format-terminal-title-meta'
 import { snap1D, collectCollinearSnapTargets, convertThresholdToLocal } from '@/lib/pane-snap'
 import { nanoid } from 'nanoid'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import { updateSettingsLocal } from '@/store/settingsSlice'
+import { clearPaneAttention, clearTabAttention } from '@/store/turnCompletionSlice'
+import { clearPendingCreate, removeSession } from '@/store/claudeChatSlice'
+import { cancelCreate } from '@/lib/sdk-message-handler'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
+import { ErrorBoundary } from '@/components/ui/error-boundary'
 
 // Stable empty object to avoid selector memoization issues
 const EMPTY_PANE_TITLES: Record<string, string> = {}
 const EMPTY_TERMINAL_META_BY_ID: Record<string, TerminalMetaRecord> = {}
 const EMPTY_ATTENTION_BY_PANE: Record<string, boolean> = {}
+const EMPTY_PENDING_CREATES: Record<string, string> = {}
 
 interface PaneContainerProps {
   tabId: string
@@ -108,9 +116,15 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const tabAttentionStyle = useAppSelector(
     (s) => s.settings?.settings?.panes?.tabAttentionStyle ?? 'highlight'
   )
+  const attentionDismiss = useAppSelector(
+    (s) => s.settings?.settings?.panes?.attentionDismiss ?? 'click'
+  )
   const containerRef = useRef<HTMLDivElement>(null)
   const ws = useMemo(() => getWsClient(), [])
   const snapThreshold = useAppSelector((s) => s.settings?.settings?.panes?.snapThreshold ?? 2)
+  const sdkPendingCreates = useAppSelector(
+    (s) => s.claudeChat?.pendingCreates ?? EMPTY_PENDING_CREATES
+  )
 
   // Drag state for snapping: track the original size and accumulated delta
   const dragStartSizeRef = useRef<number>(0)
@@ -176,12 +190,32 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         dispatch(updateTab({ id: tabId, updates: { terminalId: undefined } }))
       }
     }
-    dispatch(closePane({ tabId, paneId }))
-  }, [dispatch, tabId, tabTerminalId, ws])
+    // Clean up SDK session if this pane has one
+    if (content.kind === 'claude-chat') {
+      const sessionId = content.sessionId || sdkPendingCreates[content.createRequestId]
+      if (sessionId) {
+        ws.send({ type: 'sdk.kill', sessionId })
+      } else {
+        // No sessionId yet — sdk.created hasn't arrived. Mark the createRequestId as
+        // cancelled so the message handler will kill the orphan when it does arrive.
+        cancelCreate(content.createRequestId)
+      }
+      // Clean up Redux state for orphaned pending creates
+      if (!content.sessionId && sdkPendingCreates[content.createRequestId]) {
+        dispatch(removeSession({ sessionId: sdkPendingCreates[content.createRequestId] }))
+        dispatch(clearPendingCreate({ requestId: content.createRequestId }))
+      }
+    }
+    dispatch(closePaneWithCleanup({ tabId, paneId }))
+  }, [dispatch, tabId, tabTerminalId, ws, sdkPendingCreates])
 
   const handleFocus = useCallback((paneId: string) => {
+    if (attentionDismiss === 'click' && attentionByPane[paneId]) {
+      dispatch(clearPaneAttention({ paneId }))
+      dispatch(clearTabAttention({ tabId }))
+    }
     dispatch(setActivePane({ tabId, paneId }))
-  }, [dispatch, tabId])
+  }, [dispatch, tabId, attentionDismiss, attentionByPane])
 
   const handleToggleZoom = useCallback((paneId: string) => {
     dispatch(toggleZoom({ tabId, paneId }))
@@ -249,7 +283,11 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   if (node.type === 'leaf') {
     const explicitTitle = paneTitles[node.id]
     const paneTitle = explicitTitle ?? derivePaneTitle(node.content)
-    const paneStatus = node.content.kind === 'terminal' ? node.content.status : 'running'
+    const paneStatus = node.content.kind === 'terminal'
+      ? node.content.status
+      : node.content.kind === 'claude-chat'
+        ? (node.content.status === 'exited' ? 'exited' : 'running')
+        : 'running'
     const isRenaming = renamingPaneId === node.id
     const paneProvider: CodingCliProviderName | undefined =
       node.content.kind === 'terminal'
@@ -310,6 +348,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         onRenameChange={isRenaming ? setRenameValue : undefined}
         onRenameBlur={isRenaming ? commitRename : undefined}
         onRenameKeyDown={isRenaming ? handleRenameKeyDown : undefined}
+        onSearch={node.content.kind === 'terminal' ? () => getTerminalActions(node.id)?.openSearch() : undefined}
         onDoubleClickTitle={() => startRename(node.id, paneTitle)}
       >
         {renderContent(tabId, node.id, node.content, isOnlyPane, hidden)}
@@ -360,12 +399,31 @@ function PickerWrapper({
 }) {
   const dispatch = useAppDispatch()
   const settings = useAppSelector((s) => s.settings?.settings)
+  const paneLayout = useAppSelector((s) => s.panes.layouts[tabId])
+  const tabPref = useMemo(
+    () => paneLayout ? getTabDirectoryPreference(paneLayout) : { defaultCwd: undefined, tabDirectories: [] },
+    [paneLayout],
+  )
   const [step, setStep] = useState<
     | { step: 'type' }
     | { step: 'directory'; providerType: CodingCliProviderName }
+    | { step: 'directory'; providerType: 'claude-web' }
   >({ step: 'type' })
 
   const createContentForType = useCallback((type: PanePickerType, cwd?: string): PaneContent => {
+    if (type === 'claude-web') {
+      const defaults = settings?.freshclaude
+      return {
+        kind: 'claude-chat',
+        createRequestId: nanoid(),
+        status: 'creating',
+        model: defaults?.defaultModel,
+        permissionMode: defaults?.defaultPermissionMode,
+        effort: defaults?.defaultEffort,
+        ...(cwd ? { initialCwd: cwd } : {}),
+      }
+    }
+
     if (isCodingCliProviderName(type)) {
       return {
         kind: 'terminal',
@@ -431,6 +489,11 @@ function PickerWrapper({
   }, [])
 
   const handleSelect = useCallback((type: PanePickerType) => {
+    if (type === 'claude-web') {
+      setStep({ step: 'directory', providerType: 'claude-web' })
+      return
+    }
+
     if (isCodingCliProviderName(type)) {
       setStep({ step: 'directory', providerType: type })
       return
@@ -447,9 +510,11 @@ function PickerWrapper({
     const newContent = createContentForType(providerType, cwd)
     dispatch(updatePaneContent({ tabId, paneId, content: newContent }))
 
-    const existingProviderSettings = settings?.codingCli?.providers?.[providerType] || {}
+    // Save the selected directory for the provider (use 'claude' key for claude-web)
+    const settingsKey = providerType === 'claude-web' ? 'claude' : providerType
+    const existingProviderSettings = settings?.codingCli?.providers?.[settingsKey] || {}
     const patch = {
-      codingCli: { providers: { [providerType]: { ...existingProviderSettings, cwd } } },
+      codingCli: { providers: { [settingsKey]: { ...existingProviderSettings, cwd } } },
     }
     dispatch(updateSettingsLocal(patch as any))
     void api.patch('/api/settings', patch).catch((err) => {
@@ -458,18 +523,22 @@ function PickerWrapper({
   }, [createContentForType, dispatch, paneId, settings, step, tabId])
 
   const handleCancel = useCallback(() => {
-    dispatch(closePane({ tabId, paneId }))
+    dispatch(closePaneWithCleanup({ tabId, paneId }))
   }, [dispatch, tabId, paneId])
 
   if (step.step === 'directory') {
     const providerType = step.providerType
-    const providerLabel = getProviderLabel(providerType)
-    const defaultCwd = settings?.codingCli?.providers?.[providerType]?.cwd
+    const providerLabel = providerType === 'claude-web' ? 'freshclaude' : getProviderLabel(providerType)
+    const settingsKey = providerType === 'claude-web' ? 'claude' : providerType
+    const globalDefault = settings?.codingCli?.providers?.[settingsKey]?.cwd
+    const defaultCwd = tabPref.defaultCwd ?? globalDefault
     return (
       <DirectoryPicker
         providerType={providerType}
         providerLabel={providerLabel}
         defaultCwd={defaultCwd}
+        tabDirectories={tabPref.tabDirectories}
+        globalDefault={globalDefault}
         onConfirm={handleDirectoryConfirm}
         onBack={() => setStep({ step: 'type' })}
       />
@@ -489,26 +558,42 @@ function PickerWrapper({
 
 function renderContent(tabId: string, paneId: string, content: PaneContent, isOnlyPane: boolean, hidden?: boolean) {
   if (content.kind === 'terminal') {
-    // Terminal panes need a unique key based on paneId for proper lifecycle
-    // Pass paneContent directly to avoid redundant tree traversal in TerminalView
-    return <TerminalView key={paneId} tabId={tabId} paneId={paneId} paneContent={content} hidden={hidden} />
+    return (
+      <ErrorBoundary key={paneId} label="Terminal">
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={content} hidden={hidden} />
+      </ErrorBoundary>
+    )
   }
 
   if (content.kind === 'browser') {
-    return <BrowserPane paneId={paneId} tabId={tabId} url={content.url} devToolsOpen={content.devToolsOpen} />
+    return (
+      <ErrorBoundary key={paneId} label="Browser">
+        <BrowserPane paneId={paneId} tabId={tabId} url={content.url} devToolsOpen={content.devToolsOpen} />
+      </ErrorBoundary>
+    )
   }
 
   if (content.kind === 'editor') {
     return (
-      <EditorPane
-        paneId={paneId}
-        tabId={tabId}
-        filePath={content.filePath}
-        language={content.language}
-        readOnly={content.readOnly}
-        content={content.content}
-        viewMode={content.viewMode}
-      />
+      <ErrorBoundary key={paneId} label="Editor">
+        <EditorPane
+          paneId={paneId}
+          tabId={tabId}
+          filePath={content.filePath}
+          language={content.language}
+          readOnly={content.readOnly}
+          content={content.content}
+          viewMode={content.viewMode}
+        />
+      </ErrorBoundary>
+    )
+  }
+
+  if (content.kind === 'claude-chat') {
+    return (
+      <ErrorBoundary key={paneId} label="Chat">
+        <ClaudeChatView tabId={tabId} paneId={paneId} paneContent={content} hidden={hidden} />
+      </ErrorBoundary>
     )
   }
 

@@ -90,6 +90,8 @@ export type DefaultNewPane = 'ask' | 'shell' | 'browser' | 'editor'
 
 export type TabAttentionStyle = 'highlight' | 'pulse' | 'darken' | 'none'
 
+export type AttentionDismiss = 'click' | 'type'
+
 export type TerminalTheme =
   | 'auto'           // Follow app theme (dark/light)
   | 'dracula'
@@ -99,6 +101,9 @@ export type TerminalTheme =
   | 'one-light'
   | 'solarized-light'
   | 'github-light'
+
+export type Osc52ClipboardPolicy = 'ask' | 'always' | 'never'
+export type TerminalRendererMode = 'auto' | 'webgl' | 'canvas'
 
 export type CodexSandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
 
@@ -126,6 +131,8 @@ export interface AppSettings {
     scrollback: number
     theme: TerminalTheme
     warnExternalLinks: boolean
+    osc52Clipboard: Osc52ClipboardPolicy
+    renderer: TerminalRendererMode
   }
   defaultCwd?: string
   logging: {
@@ -143,11 +150,30 @@ export interface AppSettings {
     width: number // pixels, default 288 (equivalent to w-72)
     collapsed: boolean // for mobile/responsive use
   }
+  notifications: {
+    soundEnabled: boolean
+  }
   codingCli: CodingCliSettings
   panes: {
     defaultNewPane: DefaultNewPane
     snapThreshold: number // 0-8, % of container's smallest dimension; 0 = off
     iconsOnTabs: boolean
     tabAttentionStyle: TabAttentionStyle
+    attentionDismiss: AttentionDismiss
+  }
+  freshclaude?: {
+    defaultModel?: string
+    defaultPermissionMode?: string
+    defaultEffort?: 'low' | 'medium' | 'high' | 'max'
+  }
+  network: {
+    host: '127.0.0.1' | '0.0.0.0'
+    configured: boolean
   }
 }
+
+export type {
+  RegistryPaneSnapshot,
+  RegistryTabRecord,
+  RegistryTabStatus,
+} from './tabRegistryTypes'

@@ -60,7 +60,7 @@ describe('TabItem', () => {
     const el = getTabElement()
     expect(el?.className).toContain('bg-background')
     expect(el?.className).toContain('border-b-background')
-    expect(el?.className).toContain('-mb-px')
+    expect(el?.className).not.toContain('-mb-px')
   })
 
   it('applies dragging opacity when isDragging is true', () => {
@@ -99,25 +99,28 @@ describe('TabItem', () => {
     expect(el?.className).toContain('bg-muted')
   })
 
-  it('applies inline attention styles on active tab with highlight', () => {
+  it('applies attention classes on active tab with highlight', () => {
     render(<TabItem {...defaultProps} isActive={true} needsAttention={true} tabAttentionStyle="highlight" />)
-    const el = getTabElement() as HTMLElement
-    expect(el.style.borderTopWidth).toBe('3px')
-    expect(el.style.borderTopColor).toBe('hsl(var(--success))')
-    expect(el.style.backgroundColor).toBe('hsl(var(--success) / 0.15)')
+    const el = getTabElement()
+    expect(el?.className).toContain('border-t-[3px]')
+    expect(el?.className).toContain('border-t-success')
+    expect(el?.className).toContain('bg-success/15')
   })
 
-  it('applies inline attention styles on active tab with darken', () => {
+  it('applies attention classes on active tab with darken', () => {
     render(<TabItem {...defaultProps} isActive={true} needsAttention={true} tabAttentionStyle="darken" />)
-    const el = getTabElement() as HTMLElement
-    expect(el.style.borderTopColor).toBe('hsl(var(--muted-foreground))')
-    expect(el.style.backgroundColor).toBe('hsl(var(--foreground) / 0.08)')
+    const el = getTabElement()
+    expect(el?.className).toContain('border-t-[3px]')
+    expect(el?.className).toContain('border-t-muted-foreground')
+    expect(el?.className).toContain('bg-foreground/[0.08]')
   })
 
-  it('does not apply inline attention styles on active tab with none', () => {
+  it('does not apply attention classes on active tab with none', () => {
     render(<TabItem {...defaultProps} isActive={true} needsAttention={true} tabAttentionStyle="none" />)
-    const el = getTabElement() as HTMLElement
-    expect(el.style.borderTopWidth).toBe('')
+    const el = getTabElement()
+    expect(el?.className).not.toContain('border-t-[3px]')
+    expect(el?.className).not.toContain('border-t-success')
+    expect(el?.className).not.toContain('border-t-muted-foreground')
   })
 
   it('applies animate-pulse on active tab with pulse style and attention', () => {
@@ -162,5 +165,21 @@ describe('TabItem', () => {
     const el = getTabElement()
     fireEvent.doubleClick(el!)
     expect(onDoubleClick).toHaveBeenCalled()
+  })
+
+  it('uses the same title width class for active and inactive tabs', () => {
+    const { rerender } = render(<TabItem {...defaultProps} isActive={false} />)
+    let title = screen.getByText('Test Tab')
+    expect(title.className).toContain('max-w-[5rem]')
+
+    rerender(<TabItem {...defaultProps} isActive={true} />)
+    title = screen.getByText('Test Tab')
+    expect(title.className).toContain('max-w-[5rem]')
+  })
+
+  it('does not vertically offset inactive tabs', () => {
+    render(<TabItem {...defaultProps} isActive={false} />)
+    const el = getTabElement()
+    expect(el?.className).not.toContain('mt-1')
   })
 })

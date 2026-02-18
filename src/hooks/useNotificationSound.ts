@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef } from 'react'
 import type { MutableRefObject } from 'react'
+import { useAppSelector } from '@/store/hooks'
 
 const NOTIFICATION_SOUND_SRC = '/your-code-is-ready.mp3'
 
@@ -31,6 +32,7 @@ function createFallbackTone(ctxRef: MutableRefObject<AudioContext | null>) {
 }
 
 export function useNotificationSound() {
+  const soundEnabled = useAppSelector((s) => s.settings.settings.notifications?.soundEnabled ?? true)
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
 
@@ -53,6 +55,7 @@ export function useNotificationSound() {
 
   const play = useCallback(() => {
     if (typeof window === 'undefined') return
+    if (!soundEnabled) return
 
     try {
       if (!audioRef.current) {
@@ -71,7 +74,7 @@ export function useNotificationSound() {
     } catch {
       createFallbackTone(audioContextRef)
     }
-  }, [])
+  }, [soundEnabled])
 
   return { play }
 }

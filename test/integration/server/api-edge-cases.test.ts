@@ -144,6 +144,12 @@ describe('API Edge Cases - Security Testing', () => {
   // 1. MALFORMED JSON IN REQUEST BODY
   // =============================================================================
   describe('Malformed JSON Handling', () => {
+    beforeEach(() => {
+      // These tests intentionally send malformed JSON, which triggers
+      // console.error from Express's built-in JSON parser. That's expected.
+      ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true
+    })
+
     it('rejects completely invalid JSON with 400', async () => {
       const res = await request(app)
         .patch('/api/settings')
@@ -310,6 +316,10 @@ describe('API Edge Cases - Security Testing', () => {
   // 3. EXTREMELY LARGE PAYLOADS
   // =============================================================================
   describe('Payload Size Limits', () => {
+    beforeEach(() => {
+      ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true
+    })
+
     it('rejects payload larger than 1MB', async () => {
       const largeString = 'a'.repeat(1.5 * 1024 * 1024) // 1.5MB
       const res = await request(app)
@@ -844,27 +854,48 @@ describe('API Edge Cases - Security Testing', () => {
     })
 
     it('timing-safe: response time similar for wrong vs no token', async () => {
-      const iterations = 10
+      const iterations = 25
       const noTokenTimes: number[] = []
       const wrongTokenTimes: number[] = []
 
-      for (let i = 0; i < iterations; i++) {
-        const start1 = performance.now()
-        await request(app).get('/api/settings')
-        noTokenTimes.push(performance.now() - start1)
-
-        const start2 = performance.now()
-        await request(app).get('/api/settings').set('x-auth-token', 'wrong-token')
-        wrongTokenTimes.push(performance.now() - start2)
+      const sample = async (withWrongToken: boolean): Promise<number> => {
+        const start = performance.now()
+        const req = request(app).get('/api/settings')
+        if (withWrongToken) {
+          await req.set('x-auth-token', 'wrong-token')
+        } else {
+          await req
+        }
+        return performance.now() - start
       }
 
-      const avgNoToken = noTokenTimes.reduce((a, b) => a + b, 0) / iterations
-      const avgWrongToken = wrongTokenTimes.reduce((a, b) => a + b, 0) / iterations
+      for (let i = 0; i < iterations; i++) {
+        // Interleave order to avoid warm-up bias from always measuring one path first.
+        if (i % 2 === 0) {
+          noTokenTimes.push(await sample(false))
+          wrongTokenTimes.push(await sample(true))
+        } else {
+          wrongTokenTimes.push(await sample(true))
+          noTokenTimes.push(await sample(false))
+        }
+      }
 
-      // Response times should be within same order of magnitude
-      // (This is a weak test - real timing attacks need many more samples)
-      const ratio = Math.max(avgNoToken, avgWrongToken) / Math.min(avgNoToken, avgWrongToken)
-      expect(ratio).toBeLessThan(10)
+      const median = (values: number[]): number => {
+        const sorted = [...values].sort((a, b) => a - b)
+        const mid = Math.floor(sorted.length / 2)
+        return sorted.length % 2 === 0
+          ? (sorted[mid - 1] + sorted[mid]) / 2
+          : sorted[mid]
+      }
+
+      const medianNoToken = median(noTokenTimes)
+      const medianWrongToken = median(wrongTokenTimes)
+
+      // Compare medians to reduce the impact of occasional scheduling spikes.
+      // Add a 1ms floor so sub-ms jitter does not create huge, meaningless ratios.
+      const ratio = (Math.max(medianNoToken, medianWrongToken) + 1) / (Math.min(medianNoToken, medianWrongToken) + 1)
+      expect(ratio).toBeLessThan(4)
+      expect(Math.abs(medianNoToken - medianWrongToken)).toBeLessThan(25)
     })
   })
 
@@ -1198,6 +1229,10 @@ describe('API Edge Cases - Security Testing', () => {
   // 12. CONTENT-TYPE EDGE CASES
   // =============================================================================
   describe('Content-Type Edge Cases', () => {
+    beforeEach(() => {
+      ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true
+    })
+
     it('rejects non-JSON content type', async () => {
       const res = await request(app)
         .patch('/api/settings')

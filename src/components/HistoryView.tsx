@@ -1,11 +1,12 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import type { CodingCliProviderName } from '@/store/types'
+import type { CodingCliProviderName, CodingCliSession, ProjectGroup } from '@/store/types'
 import { toggleProjectExpanded, setProjects } from '@/store/sessionsSlice'
 import { api } from '@/lib/api'
 import { openSessionTab } from '@/store/tabsSlice'
 import { cn } from '@/lib/utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
+import { useMobile } from '@/hooks/useMobile'
 import { Search, ChevronRight, Play, Pencil, Trash2, RefreshCw } from 'lucide-react'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 
@@ -28,11 +29,20 @@ function getProjectName(path: string): string {
   return parts[parts.length - 1] || path
 }
 
+type MobileSessionSheetState = {
+  session: CodingCliSession
+  onOpen: () => void
+  onRename: (title?: string, summary?: string) => void
+  onDelete: () => void
+}
+
 export default function HistoryView({ onOpenSession }: { onOpenSession?: () => void }) {
   const dispatch = useAppDispatch()
+  const isMobile = useMobile()
   const { projects, expandedProjects } = useAppSelector((s) => s.sessions)
   const [filter, setFilter] = useState('')
   const [loading, setLoading] = useState(false)
+  const [mobileSessionSheet, setMobileSessionSheet] = useState<MobileSessionSheetState | null>(null)
 
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase()
@@ -72,21 +82,21 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
     await refresh()
   }
 
-  async function renameSession(provider: string | undefined, sessionId: string, titleOverride?: string, summaryOverride?: string) {
+  async function renameSession(provider: CodingCliProviderName | undefined, sessionId: string, titleOverride?: string, summaryOverride?: string) {
     // Use composite key format: provider:sessionId
     const compositeKey = `${provider || 'claude'}:${sessionId}`
     await api.patch(`/api/sessions/${encodeURIComponent(compositeKey)}`, { titleOverride, summaryOverride })
     await refresh()
   }
 
-  async function deleteSession(provider: string | undefined, sessionId: string) {
+  async function deleteSession(provider: CodingCliProviderName | undefined, sessionId: string) {
     // Use composite key format: provider:sessionId
     const compositeKey = `${provider || 'claude'}:${sessionId}`
     await api.delete(`/api/sessions/${encodeURIComponent(compositeKey)}`)
     await refresh()
   }
 
-  function openSession(cwd: string | undefined, sessionId: string, title: string, provider: string | undefined) {
+  function openSession(cwd: string | undefined, sessionId: string, title: string, provider: CodingCliProviderName | undefined) {
     // cwd might be undefined if session metadata didn't include it
     const label = getProviderLabel(provider)
     // TabMode now includes all CodingCliProviderName values, so this is type-safe
@@ -97,15 +107,21 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
 
   const totalSessions = (projects ?? []).reduce((acc, p) => acc + p.sessions.length, 0)
 
+  useEffect(() => {
+    if (!isMobile) {
+      setMobileSessionSheet(null)
+    }
+  }, [isMobile])
+
   return (
     <div className="h-full flex flex-col">
       {/* Header */}
-      <div className="px-6 py-5 border-b border-border/30">
+      <div className="border-b border-border/30 px-3 py-4 md:px-6 md:py-5">
         <div className="flex items-center justify-between mb-4">
           <div>
-            <h1 className="text-xl font-semibold tracking-tight">Sessions</h1>
+            <h1 className="text-xl font-semibold tracking-tight">Projects</h1>
             <p className="text-sm text-muted-foreground">
-              {totalSessions} session{totalSessions !== 1 ? 's' : ''} across {(projects ?? []).length} project{(projects ?? []).length !== 1 ? 's' : ''}
+              {totalSessions} project session{totalSessions !== 1 ? 's' : ''} across {(projects ?? []).length} project{(projects ?? []).length !== 1 ? 's' : ''}
             </p>
           </div>
           <button
@@ -136,7 +152,7 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto">
-        <div className="px-6 py-4 space-y-2">
+        <div className="space-y-2 px-3 py-4 md:px-6">
           {filtered.length === 0 ? (
             <div className="py-12 text-center">
               <p className="text-muted-foreground">No sessions found</p>
@@ -155,16 +171,33 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
                 key={project.projectPath}
                 project={project}
                 expanded={expandedProjects.has(project.projectPath)}
+                isMobile={isMobile}
                 onToggle={() => dispatch(toggleProjectExpanded(project.projectPath))}
                 onColorChange={(color) => setProjectColor(project.projectPath, color)}
                   onOpenSession={(sessionId, title, cwd, provider) => openSession(cwd, sessionId, title, provider)}
                 onRenameSession={(provider, sessionId, title, summary) => renameSession(provider, sessionId, title, summary)}
                 onDeleteSession={(provider, sessionId) => deleteSession(provider, sessionId)}
+                onShowSessionDetails={(sheetState) => setMobileSessionSheet(sheetState)}
               />
             ))
           )}
         </div>
       </div>
+      {isMobile && mobileSessionSheet && (
+        <MobileSessionDetailsSheet
+          session={mobileSessionSheet.session}
+          onClose={() => setMobileSessionSheet(null)}
+          onOpen={() => {
+            mobileSessionSheet.onOpen()
+            setMobileSessionSheet(null)
+          }}
+          onRename={mobileSessionSheet.onRename}
+          onDelete={() => {
+            mobileSessionSheet.onDelete()
+            setMobileSessionSheet(null)
+          }}
+        />
+      )}
     </div>
   )
 }
@@ -172,19 +205,23 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
 function ProjectCard({
   project,
   expanded,
+  isMobile,
   onToggle,
   onColorChange,
   onOpenSession,
   onRenameSession,
   onDeleteSession,
+  onShowSessionDetails,
 }: {
-  project: { projectPath: string; sessions: any[]; color?: string }
+  project: ProjectGroup
   expanded: boolean
+  isMobile: boolean
   onToggle: () => void
   onColorChange: (color: string) => void
-  onOpenSession: (sessionId: string, title: string, cwd?: string, provider?: string) => void
-  onRenameSession: (provider: string | undefined, sessionId: string, title?: string, summary?: string) => void
-  onDeleteSession: (provider: string | undefined, sessionId: string) => void
+  onOpenSession: (sessionId: string, title: string, cwd?: string, provider?: CodingCliProviderName) => void
+  onRenameSession: (provider: CodingCliProviderName | undefined, sessionId: string, title?: string, summary?: string) => void
+  onDeleteSession: (provider: CodingCliProviderName | undefined, sessionId: string) => void
+  onShowSessionDetails: (sheetState: MobileSessionSheetState) => void
 }) {
   const color = project.color || '#6b7280'
   const [showColorPicker, setShowColorPicker] = useState(false)
@@ -254,10 +291,17 @@ function ProjectCard({
               .map((session) => (
                 <SessionRow
                   key={session.sessionId}
+                  isMobile={isMobile}
                   session={session}
                   onOpen={() => onOpenSession(session.sessionId, session.title || session.sessionId.slice(0, 8), session.cwd, session.provider)}
                   onRename={(title, summary) => onRenameSession(session.provider, session.sessionId, title, summary)}
                   onDelete={() => onDeleteSession(session.provider, session.sessionId)}
+                  onShowDetails={() => onShowSessionDetails({
+                    session,
+                    onOpen: () => onOpenSession(session.sessionId, session.title || session.sessionId.slice(0, 8), session.cwd, session.provider),
+                    onRename: (title, summary) => onRenameSession(session.provider, session.sessionId, title, summary),
+                    onDelete: () => onDeleteSession(session.provider, session.sessionId),
+                  })}
                 />
               ))}
           </div>
@@ -268,15 +312,19 @@ function ProjectCard({
 }
 
 function SessionRow({
+  isMobile,
   session,
   onOpen,
   onRename,
   onDelete,
+  onShowDetails,
 }: {
-  session: any
+  isMobile: boolean
+  session: CodingCliSession
   onOpen: () => void
   onRename: (title?: string, summary?: string) => void
   onDelete: () => void
+  onShowDetails: () => void
 }) {
   const [editing, setEditing] = useState(false)
   const [title, setTitle] = useState(session.title || '')
@@ -335,7 +383,7 @@ function SessionRow({
         <button
           type="button"
           className="flex-1 min-w-0 text-left cursor-pointer"
-          onClick={onOpen}
+          onClick={isMobile ? onShowDetails : onOpen}
           aria-label={`Open session ${session.title || session.sessionId.slice(0, 8)}`}
         >
           <div className="flex items-center gap-2">
@@ -364,14 +412,15 @@ function SessionRow({
         {/* Actions */}
         <div
           className={cn(
-            'flex items-center gap-1 transition-opacity opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'
+            'flex items-center gap-2 transition-opacity',
+            isMobile ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100',
           )}
           role="presentation"
         >
           <button
             type="button"
             onClick={onOpen}
-            className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+            className="min-h-11 min-w-11 rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground md:min-h-0 md:min-w-0"
             aria-label="Open session"
           >
             <Play className="h-3.5 w-3.5" aria-hidden="true" />
@@ -379,7 +428,7 @@ function SessionRow({
           <button
             type="button"
             onClick={() => setEditing(true)}
-            className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+            className="min-h-11 min-w-11 rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground md:min-h-0 md:min-w-0"
             aria-label="Edit session"
           >
             <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
@@ -387,7 +436,7 @@ function SessionRow({
           <button
             type="button"
             onClick={onDelete}
-            className="p-1.5 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
+            className="min-h-11 min-w-11 rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive md:min-h-0 md:min-w-0"
             aria-label="Delete session"
           >
             <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
@@ -395,5 +444,103 @@ function SessionRow({
         </div>
       </div>
     </div>
+  )
+}
+
+function MobileSessionDetailsSheet({
+  session,
+  onClose,
+  onOpen,
+  onRename,
+  onDelete,
+}: {
+  session: CodingCliSession
+  onClose: () => void
+  onOpen: () => void
+  onRename: (title?: string, summary?: string) => void
+  onDelete: () => void
+}) {
+  const [title, setTitle] = useState(session.title || '')
+  const [summary, setSummary] = useState(session.summary || '')
+
+  useEffect(() => {
+    setTitle(session.title || '')
+    setSummary(session.summary || '')
+  }, [session])
+
+  return (
+    <>
+      <button
+        type="button"
+        className="fixed inset-0 z-40 bg-black/50"
+        aria-label="Close session details"
+        onClick={onClose}
+      />
+      <div className="fixed inset-x-0 bottom-0 z-50 rounded-t-xl border border-border bg-background p-4 shadow-xl safe-area-bottom">
+        <div className="mb-2 flex items-center justify-between">
+          <h2 className="text-sm font-semibold">Session details</h2>
+          <button
+            type="button"
+            className="min-h-11 rounded-md px-3 text-sm text-muted-foreground"
+            onClick={onClose}
+          >
+            Close
+          </button>
+        </div>
+        <div className="space-y-2 text-xs text-muted-foreground">
+          <div>{getProviderLabel(session.provider)}</div>
+          <div>{formatTime(session.updatedAt)}</div>
+          {session.cwd && <div className="truncate">{session.cwd}</div>}
+        </div>
+        <div className="mt-3 space-y-2">
+          <input
+            type="text"
+            value={title}
+            onChange={(event) => setTitle(event.target.value)}
+            placeholder="Session title"
+            className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm"
+            aria-label="Session details title"
+          />
+          <input
+            type="text"
+            value={summary}
+            onChange={(event) => setSummary(event.target.value)}
+            placeholder="Session summary"
+            className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm"
+            aria-label="Session details summary"
+          />
+        </div>
+        <div className="mt-4 grid grid-cols-2 gap-2">
+          <button
+            type="button"
+            className="min-h-11 rounded-md border border-border px-3 text-sm font-medium"
+            onClick={onOpen}
+          >
+            Open
+          </button>
+          <button
+            type="button"
+            className="min-h-11 rounded-md border border-border px-3 text-sm font-medium"
+            onClick={() => onRename(title || undefined, summary || undefined)}
+          >
+            Save
+          </button>
+          <button
+            type="button"
+            className="min-h-11 rounded-md border border-destructive/50 px-3 text-sm font-medium text-destructive"
+            onClick={onDelete}
+          >
+            Delete
+          </button>
+          <button
+            type="button"
+            className="min-h-11 rounded-md border border-border px-3 text-sm font-medium"
+            onClick={onClose}
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    </>
   )
 }

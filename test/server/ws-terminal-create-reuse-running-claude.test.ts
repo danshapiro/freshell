@@ -79,6 +79,18 @@ class FakeRegistry {
     return undefined
   }
 
+  getCanonicalRunningTerminalBySession(mode: string, sessionId: string) {
+    return this.findRunningTerminalBySession(mode, sessionId)
+  }
+
+  repairLegacySessionOwners(_mode: string, _sessionId: string) {
+    return {
+      repaired: false,
+      canonicalTerminalId: this.record.terminalId,
+      clearedTerminalIds: [] as string[],
+    }
+  }
+
   findRunningClaudeTerminalBySession(sessionId: string) {
     return this.findRunningTerminalBySession('claude', sessionId)
   }

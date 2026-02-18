@@ -1,13 +1,17 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
+import type { ApiError } from '@/lib/api'
 import { api } from '@/lib/api'
 import { fuzzyMatch } from '@/lib/fuzzy-match'
+import { rankCandidateDirectories } from '@/lib/tab-directory-preference'
 import { cn } from '@/lib/utils'
 
 type DirectoryPickerProps = {
-  providerType: CodingCliProviderName
+  providerType: CodingCliProviderName | 'claude-web'
   providerLabel: string
   defaultCwd?: string
+  tabDirectories?: string[]
+  globalDefault?: string
   onConfirm: (cwd: string) => void
   onBack: () => void
 }
@@ -17,7 +21,7 @@ type CompletionSuggestion = {
   isDirectory: boolean
 }
 
-const PATH_INPUT_PATTERN = /^([/~]|[a-zA-Z]:)/
+const PATH_INPUT_PATTERN = /^(['"])?([/~]|[a-zA-Z]:|\\\\|\\(?!\\))/
 
 function dedupeDirectories(values: string[]): string[] {
   const next: string[] = []
@@ -36,10 +40,18 @@ function isPathInput(value: string): boolean {
   return PATH_INPUT_PATTERN.test(value.trimStart())
 }
 
+function isApiError(error: unknown): error is ApiError {
+  if (!error || typeof error !== 'object') return false
+  const maybe = error as Partial<ApiError>
+  return typeof maybe.status === 'number'
+}
+
 export default function DirectoryPicker({
   providerType,
   providerLabel,
   defaultCwd,
+  tabDirectories,
+  globalDefault,
   onConfirm,
   onBack,
 }: DirectoryPickerProps) {
@@ -71,17 +83,20 @@ export default function DirectoryPicker({
     api.get<{ directories?: string[] }>('/api/files/candidate-dirs')
       .then((result) => {
         if (cancelled) return
-        const merged = dedupeDirectories([...(result.directories || []), defaultCwd || ''])
-        setCandidates(merged)
+        const raw = dedupeDirectories([...(result.directories || []), defaultCwd || ''])
+        const ranked = rankCandidateDirectories(raw, tabDirectories ?? [], globalDefault)
+        setCandidates(ranked)
       })
       .catch(() => {
         if (cancelled) return
-        setCandidates(dedupeDirectories([defaultCwd || '']))
+        const fallback = dedupeDirectories([defaultCwd || ''])
+        const ranked = rankCandidateDirectories(fallback, tabDirectories ?? [], globalDefault)
+        setCandidates(ranked)
       })
     return () => {
       cancelled = true
     }
-  }, [defaultCwd])
+  }, [defaultCwd, tabDirectories, globalDefault])
 
   const fuzzySuggestions = useMemo(() => {
     if (pathMode) return []
@@ -170,8 +185,12 @@ export default function DirectoryPicker({
         return
       }
       onConfirm(result.resolvedPath || nextPath)
-    } catch {
+    } catch (error) {
       if (validationRequestIdRef.current !== validationId) return
+      if (isApiError(error) && error.status === 403) {
+        setError('path not allowed')
+        return
+      }
       setError('directory not found')
     } finally {
       if (validationRequestIdRef.current === validationId) {

@@ -11,12 +11,15 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - We fix the system over the symptom.
 
 ## Repo Rules
-- Always check for an use applicable skills
+- Always check for and use applicable skills
+- This project uses the [superpowers](https://github.com/obra/superpowers) plugin (configured in `.claude/settings.json`). Skills like `superpowers:executing-plans` are referenced throughout plan docs in `docs/plans/`.
 - Always work in a worktree (in \.worktrees\)
+- Many agents may be working in the worktree at the same time. If you see activity from other agents (for example test runs or file changes), respect it.
 - Specific user instructions override ALL other instructions, including the above, and including superpowers or skills
 - Server uses NodeNext/ESM; relative imports must include `.js` extensions
 - Always consider checking logs for debugging; server logs (including client console logs) are in the server process stdout/stderr (e.g., `npm run dev`/`npm start`).
 - Debug logging toggle (UI Settings → Debugging → Debug logging) enables debug-level logs and perf logging; keep OFF outside perf investigations.
+- When adding new user-facing features or making significant UI changes, update `docs/index.html` to reflect them. It's a nonfunctional mock of the default experience, so only major changes need to be added.
 
 ## Merging to Main (CRITICAL - Read This)
 
@@ -57,6 +60,7 @@ npm run serve               # Build and run production server
 ### Testing
 ```bash
 npm test                    # Run all tests (client + server)
+npm run verify              # Build + test (catches type errors that vitest misses)
 npm run test:coverage       # Generate coverage report
 ```
 

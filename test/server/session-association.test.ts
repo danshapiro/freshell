@@ -1,7 +1,7 @@
-import { describe, it, expect, vi, afterEach } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { TerminalRegistry, modeSupportsResume } from '../../server/terminal-registry'
-import { ClaudeSessionIndexer, ClaudeSession } from '../../server/claude-indexer'
-import type { CodingCliSession } from '../../server/coding-cli/types'
+import { CodingCliSessionIndexer } from '../../server/coding-cli/session-indexer'
+import { makeSessionKey, type CodingCliSession } from '../../server/coding-cli/types'
 import { TerminalMetadataService } from '../../server/terminal-metadata-service'
 
 vi.mock('node-pty', () => ({
@@ -36,6 +36,10 @@ function createMetadataService() {
       resolveBranchAndDirty: async () => ({ branch: 'main', isDirty: false }),
     },
   })
+}
+
+function createIndexer(): CodingCliSessionIndexer {
+  return new CodingCliSessionIndexer([])
 }
 
 describe('Session-Terminal metadata broadcasts', () => {
@@ -122,7 +126,7 @@ describe('Session-Terminal metadata broadcasts', () => {
   it('broadcasts terminal.session.associated and terminal.meta.updated for Claude new-session association flow', async () => {
     const registry = new TerminalRegistry()
     const metadata = createMetadataService()
-    const indexer = new ClaudeSessionIndexer()
+    const indexer = createIndexer()
     const broadcasts: any[] = []
     const pending: Promise<void>[] = []
 
@@ -151,6 +155,7 @@ describe('Session-Terminal metadata broadcasts', () => {
     const latestSessions = new Map([[SESSION_ID_TWO, claudeSession]])
 
     indexer.onNewSession((session) => {
+      if (session.provider !== 'claude') return
       if (!session.cwd) return
       const unassociated = registry.findUnassociatedClaudeTerminals(session.cwd)
       if (unassociated.length === 0) return
@@ -188,6 +193,7 @@ describe('Session-Terminal metadata broadcasts', () => {
 
     indexer['initialized'] = true
     indexer['detectNewSessions']([{
+      provider: 'claude',
       sessionId: SESSION_ID_TWO,
       projectPath: '/home/user/project',
       updatedAt: Date.now(),
@@ -223,20 +229,18 @@ describe('Session-Terminal metadata broadcasts', () => {
 describe('Session-Terminal Association Integration', () => {
   it('should associate terminal with session when session is created', () => {
     const registry = new TerminalRegistry()
-    const indexer = new ClaudeSessionIndexer()
+    const indexer = createIndexer()
     const broadcasts: any[] = []
-
-    // Simulate wsHandler.broadcast
-    const mockBroadcast = (msg: any) => broadcasts.push(msg)
 
     // Wire up like in index.ts
     indexer.onNewSession((session) => {
+      if (session.provider !== 'claude') return
       if (!session.cwd) return
       const unassociated = registry.findUnassociatedClaudeTerminals(session.cwd)
       if (unassociated.length === 0) return
       const term = unassociated[0] // Only oldest
       registry.setResumeSessionId(term.terminalId, session.sessionId)
-      mockBroadcast({
+      broadcasts.push({
         type: 'terminal.session.associated',
         terminalId: term.terminalId,
         sessionId: session.sessionId,
@@ -251,7 +255,8 @@ describe('Session-Terminal Association Integration', () => {
     expect(term.resumeSessionId).toBeUndefined()
 
     // Simulate new session detection
-    const newSession: ClaudeSession = {
+    const newSession: CodingCliSession = {
+      provider: 'claude',
       sessionId: SESSION_ID_ONE,
       projectPath: '/home/user/project',
       updatedAt: Date.now(),
@@ -274,10 +279,11 @@ describe('Session-Terminal Association Integration', () => {
 
   it('should not associate already-associated terminals', () => {
     const registry = new TerminalRegistry()
-    const indexer = new ClaudeSessionIndexer()
+    const indexer = createIndexer()
     const broadcasts: any[] = []
 
     indexer.onNewSession((session) => {
+      if (session.provider !== 'claude') return
       if (!session.cwd) return
       const unassociated = registry.findUnassociatedClaudeTerminals(session.cwd)
       if (unassociated.length === 0) return
@@ -293,6 +299,7 @@ describe('Session-Terminal Association Integration', () => {
 
     // Simulate new session
     indexer['detectNewSessions']([{
+      provider: 'claude',
       sessionId: SESSION_ID_TWO,
       projectPath: '/home/user/project',
       updatedAt: Date.now(),
@@ -308,10 +315,11 @@ describe('Session-Terminal Association Integration', () => {
 
   it('should only associate the oldest terminal when multiple match same cwd', () => {
     const registry = new TerminalRegistry()
-    const indexer = new ClaudeSessionIndexer()
+    const indexer = createIndexer()
     const broadcasts: any[] = []
 
     indexer.onNewSession((session) => {
+      if (session.provider !== 'claude') return
       if (!session.cwd) return
       const unassociated = registry.findUnassociatedClaudeTerminals(session.cwd)
       if (unassociated.length === 0) return
@@ -332,6 +340,7 @@ describe('Session-Terminal Association Integration', () => {
 
     // Simulate new session
     indexer['detectNewSessions']([{
+      provider: 'claude',
       sessionId: SESSION_ID_TWO,
       projectPath: '/home/user/project',
       updatedAt: Date.now(),
@@ -350,10 +359,11 @@ describe('Session-Terminal Association Integration', () => {
 
   it('should correctly associate two terminals when two sessions are created in sequence', () => {
     const registry = new TerminalRegistry()
-    const indexer = new ClaudeSessionIndexer()
+    const indexer = createIndexer()
     const broadcasts: any[] = []
 
     indexer.onNewSession((session) => {
+      if (session.provider !== 'claude') return
       if (!session.cwd) return
       const unassociated = registry.findUnassociatedClaudeTerminals(session.cwd)
       if (unassociated.length === 0) return
@@ -374,6 +384,7 @@ describe('Session-Terminal Association Integration', () => {
 
     // First Claude (term1) creates its session
     indexer['detectNewSessions']([{
+      provider: 'claude',
       sessionId: SESSION_ID_ONE,
       projectPath: '/home/user/project',
       updatedAt: Date.now(),
@@ -386,6 +397,7 @@ describe('Session-Terminal Association Integration', () => {
 
     // Second Claude (term2) creates its session
     indexer['detectNewSessions']([{
+      provider: 'claude',
       sessionId: SESSION_ID_THREE,
       projectPath: '/home/user/project',
       updatedAt: Date.now(),
@@ -409,10 +421,11 @@ describe('Session-Terminal Association Integration', () => {
 
   it('should not fire handlers on server startup (before initialized)', () => {
     const registry = new TerminalRegistry()
-    const indexer = new ClaudeSessionIndexer()
+    const indexer = createIndexer()
     const broadcasts: any[] = []
 
     indexer.onNewSession((session) => {
+      if (session.provider !== 'claude') return
       if (!session.cwd) return
       const unassociated = registry.findUnassociatedClaudeTerminals(session.cwd)
       if (unassociated.length === 0) return
@@ -427,6 +440,7 @@ describe('Session-Terminal Association Integration', () => {
     // Simulate startup: detectNewSessions called BEFORE initialized = true
     // This simulates what happens during start() before initialized flag is set
     indexer['detectNewSessions']([{
+      provider: 'claude',
       sessionId: SESSION_ID_FOUR,
       projectPath: '/home/user/project',
       updatedAt: Date.now(),
@@ -436,7 +450,7 @@ describe('Session-Terminal Association Integration', () => {
     // Should NOT broadcast - indexer not yet initialized
     expect(broadcasts).toHaveLength(0)
     // But session should be tracked
-    expect(indexer['knownSessionIds'].has(SESSION_ID_FOUR)).toBe(true)
+    expect(indexer['knownSessionIds'].has(makeSessionKey('claude', SESSION_ID_FOUR))).toBe(true)
 
     // Cleanup
     registry.shutdown()
@@ -444,10 +458,11 @@ describe('Session-Terminal Association Integration', () => {
 
   it('should skip sessions without cwd', () => {
     const registry = new TerminalRegistry()
-    const indexer = new ClaudeSessionIndexer()
+    const indexer = createIndexer()
     const broadcasts: any[] = []
 
     indexer.onNewSession((session) => {
+      if (session.provider !== 'claude') return
       if (!session.cwd) return
       const unassociated = registry.findUnassociatedClaudeTerminals(session.cwd!)
       if (unassociated.length === 0) return
@@ -463,6 +478,7 @@ describe('Session-Terminal Association Integration', () => {
 
     // Simulate session with NO cwd (orphaned session)
     indexer['detectNewSessions']([{
+      provider: 'claude',
       sessionId: SESSION_ID_FIVE,
       projectPath: '/home/user/project',
       updatedAt: Date.now(),
@@ -478,10 +494,11 @@ describe('Session-Terminal Association Integration', () => {
 
   it('should not associate shell-mode terminals', () => {
     const registry = new TerminalRegistry()
-    const indexer = new ClaudeSessionIndexer()
+    const indexer = createIndexer()
     const broadcasts: any[] = []
 
     indexer.onNewSession((session) => {
+      if (session.provider !== 'claude') return
       if (!session.cwd) return
       const unassociated = registry.findUnassociatedClaudeTerminals(session.cwd)
       if (unassociated.length === 0) return
@@ -497,6 +514,7 @@ describe('Session-Terminal Association Integration', () => {
 
     // Simulate new session
     indexer['detectNewSessions']([{
+      provider: 'claude',
       sessionId: SESSION_ID_SIX,
       projectPath: '/home/user/project',
       updatedAt: Date.now(),
@@ -512,16 +530,13 @@ describe('Session-Terminal Association Integration', () => {
 })
 
 describe('Session-Terminal Association Platform-specific', () => {
-  // These tests verify the path normalization logic in findUnassociatedClaudeTerminals
-  // by testing the normalize function behavior directly through findUnassociatedClaudeTerminals.
-  // The actual platform-dependent behavior is tested in terminal-registry.test.ts.
-
   it('should normalize backslashes and trailing slashes when matching paths', () => {
     const registry = new TerminalRegistry()
-    const indexer = new ClaudeSessionIndexer()
+    const indexer = createIndexer()
     const broadcasts: any[] = []
 
     indexer.onNewSession((session) => {
+      if (session.provider !== 'claude') return
       if (!session.cwd) return
       const unassociated = registry.findUnassociatedClaudeTerminals(session.cwd)
       if (unassociated.length === 0) return
@@ -541,6 +556,7 @@ describe('Session-Terminal Association Platform-specific', () => {
 
     // Simulate session with trailing slash (should still match)
     indexer['detectNewSessions']([{
+      provider: 'claude',
       sessionId: SESSION_ID_SEVEN,
       projectPath: '/home/user/project/',
       updatedAt: Date.now(),
@@ -557,10 +573,11 @@ describe('Session-Terminal Association Platform-specific', () => {
 
   it('should match mixed separator styles (backslash vs forward slash)', () => {
     const registry = new TerminalRegistry()
-    const indexer = new ClaudeSessionIndexer()
+    const indexer = createIndexer()
     const broadcasts: any[] = []
 
     indexer.onNewSession((session) => {
+      if (session.provider !== 'claude') return
       if (!session.cwd) return
       const unassociated = registry.findUnassociatedClaudeTerminals(session.cwd)
       if (unassociated.length === 0) return
@@ -580,6 +597,7 @@ describe('Session-Terminal Association Platform-specific', () => {
 
     // Session also has forward slashes
     indexer['detectNewSessions']([{
+      provider: 'claude',
       sessionId: SESSION_ID_EIGHT,
       projectPath: '/home/user/project',
       updatedAt: Date.now(),
@@ -596,13 +614,10 @@ describe('Session-Terminal Association Platform-specific', () => {
 describe('Codex Session-Terminal Association via onUpdate', () => {
   /**
    * Simulates the association logic in the codingCliIndexer.onUpdate handler.
-   * This mirrors the pattern from server/index.ts: on every indexer update,
-   * try to associate each session with an unassociated terminal of matching mode/cwd.
+   * After consolidation, onUpdate handles ALL providers (including Claude).
    * Association is idempotent — already-associated terminals are excluded by
    * findUnassociatedTerminals, and setResumeSessionId rejects duplicates.
    */
-  // Max age difference (ms) between a session's updatedAt and a terminal's createdAt
-  // for association to be considered valid. Prevents binding to stale sessions.
   const ASSOCIATION_MAX_AGE_MS = 30_000
 
   function associateOnUpdate(
@@ -612,20 +627,17 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
   ) {
     for (const project of projects) {
       for (const session of project.sessions) {
-        if (session.provider === 'claude') continue
         if (!modeSupportsResume(session.provider)) continue
         if (!session.cwd) continue
-
         const unassociated = registry.findUnassociatedTerminals(session.provider, session.cwd)
         if (unassociated.length === 0) continue
 
         const term = unassociated[0]
-        // Only associate if the session is recent relative to the terminal —
-        // prevents binding to old sessions from previous server runs
         if (session.updatedAt < term.createdAt - ASSOCIATION_MAX_AGE_MS) continue
 
         const associated = registry.setResumeSessionId(term.terminalId, session.sessionId)
         if (!associated) continue
+
         broadcasts.push({
           type: 'terminal.session.associated',
           terminalId: term.terminalId,
@@ -642,7 +654,6 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
     const term = registry.create({ mode: 'codex', cwd: '/home/user/project' })
     expect(term.resumeSessionId).toBeUndefined()
 
-    // Simulate onUpdate delivering projects with a codex session
     associateOnUpdate(registry, [{
       projectPath: '/home/user/project',
       sessions: [{
@@ -682,14 +693,43 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
       }],
     }]
 
-    // First update — associates
     associateOnUpdate(registry, projects, broadcasts)
     expect(broadcasts).toHaveLength(1)
 
-    // Second update with same data — no-op
     associateOnUpdate(registry, projects, broadcasts)
     expect(broadcasts).toHaveLength(1) // Still 1
     expect(registry.get(term.terminalId)?.resumeSessionId).toBe('codex-session-abc-123')
+
+    registry.shutdown()
+  })
+
+  it('does not associate one codex session to multiple terminals across repeated updates', () => {
+    const registry = new TerminalRegistry()
+    const broadcasts: any[] = []
+
+    const term1 = registry.create({ mode: 'codex', cwd: '/home/user/project' })
+    const term2 = registry.create({ mode: 'codex', cwd: '/home/user/project' })
+    const term3 = registry.create({ mode: 'codex', cwd: '/home/user/project' })
+
+    const projects = [{
+      projectPath: '/home/user/project',
+      sessions: [{
+        provider: 'codex' as const,
+        sessionId: 'codex-session-abc-123',
+        projectPath: '/home/user/project',
+        updatedAt: Date.now(),
+        cwd: '/home/user/project',
+      }],
+    }]
+
+    associateOnUpdate(registry, projects, broadcasts)
+    associateOnUpdate(registry, projects, broadcasts)
+    associateOnUpdate(registry, projects, broadcasts)
+
+    expect(registry.get(term1.terminalId)?.resumeSessionId).toBe('codex-session-abc-123')
+    expect(registry.get(term2.terminalId)?.resumeSessionId).toBeUndefined()
+    expect(registry.get(term3.terminalId)?.resumeSessionId).toBeUndefined()
+    expect(broadcasts).toHaveLength(1)
 
     registry.shutdown()
   })
@@ -764,12 +804,13 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
     registry.shutdown()
   })
 
-  it('skips claude sessions (handled by claudeIndexer)', () => {
+  it('handles claude sessions in unified onUpdate flow (post-consolidation)', () => {
     const registry = new TerminalRegistry()
     const broadcasts: any[] = []
 
-    registry.create({ mode: 'claude', cwd: '/home/user/project' })
+    const term = registry.create({ mode: 'claude', cwd: '/home/user/project' })
 
+    // After consolidation, Claude sessions are handled by onUpdate too
     associateOnUpdate(registry, [{
       projectPath: '/home/user/project',
       sessions: [{
@@ -781,7 +822,9 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
       }],
     }], broadcasts)
 
-    expect(broadcasts).toHaveLength(0)
+    // Should associate — Claude is now handled in the unified flow
+    expect(broadcasts).toHaveLength(1)
+    expect(registry.get(term.terminalId)?.resumeSessionId).toBe(SESSION_ID_ONE)
 
     registry.shutdown()
   })
@@ -815,7 +858,6 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
 
     const term = registry.create({ mode: 'codex', cwd: '/home/user/project' })
 
-    // Old session from hours ago — should NOT match the new terminal
     const hoursAgo = Date.now() - 3 * 60 * 60 * 1000
     associateOnUpdate(registry, [{
       projectPath: '/home/user/project',
@@ -840,7 +882,6 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
 
     const term = registry.create({ mode: 'codex', cwd: '/home/user/project' })
 
-    // Session created 2 seconds after terminal — should match
     const shortly = term.createdAt + 2000
     associateOnUpdate(registry, [{
       projectPath: '/home/user/project',

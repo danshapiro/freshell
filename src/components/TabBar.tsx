@@ -1,12 +1,16 @@
 import { Plus } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, closeTab, setActiveTab, updateTab, reorderTabs, clearTabRenameRequest } from '@/store/tabsSlice'
+import { clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { collectTerminalIds, collectPaneContents } from '@/lib/pane-utils'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import TabItem from './TabItem'
 import { cancelCodingCliRequest } from '@/store/codingCliSlice'
+import { useMobile } from '@/hooks/useMobile'
+import { MobileTabStrip } from './MobileTabStrip'
+import { TabSwitcher } from './TabSwitcher'
 import {
   DndContext,
   closestCenter,
@@ -123,6 +127,9 @@ export default function TabBar() {
   const renameRequestTabId = tabsState?.renameRequestTabId ?? null
   const paneLayouts = useAppSelector((s) => s.panes?.layouts) ?? EMPTY_LAYOUTS
   const attentionByTab = useAppSelector((s) => s.turnCompletion?.attentionByTab) ?? EMPTY_ATTENTION
+  const attentionByPane = useAppSelector((s) => s.turnCompletion?.attentionByPane) ?? EMPTY_ATTENTION
+  const activePaneMap = useAppSelector((s) => s.panes?.activePane)
+  const attentionDismiss = useAppSelector((s) => s.settings?.settings?.panes?.attentionDismiss ?? 'click')
   const iconsOnTabs = useAppSelector((s) => s.settings?.settings?.panes?.iconsOnTabs ?? true)
   const tabAttentionStyle = useAppSelector((s) => s.settings?.settings?.panes?.tabAttentionStyle ?? 'highlight')
 
@@ -167,6 +174,7 @@ export default function TabBar() {
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const [activeId, setActiveId] = useState<string | null>(null)
+  const [showSwitcher, setShowSwitcher] = useState(false)
 
   useEffect(() => {
     if (!renameRequestTabId) return
@@ -230,10 +238,21 @@ export default function TabBar() {
 
   const activeTab = activeId ? tabs.find((t: Tab) => t.id === activeId) : null
 
+  const isMobile = useMobile()
+
   if (tabs.length === 0) return null
 
+  if (isMobile) {
+    return (
+      <>
+        <MobileTabStrip onOpenSwitcher={() => setShowSwitcher(true)} />
+        {showSwitcher && <TabSwitcher onClose={() => setShowSwitcher(false)} />}
+      </>
+    )
+  }
+
   return (
-    <div className="relative z-20 h-10 flex items-end px-2 bg-background" data-context={ContextIds.Global}>
+    <div className="relative z-20 h-12 md:h-10 shrink-0 flex items-end px-2 bg-background" data-context={ContextIds.Global}>
       <div
         className="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-muted-foreground/45"
         aria-hidden="true"
@@ -248,7 +267,7 @@ export default function TabBar() {
           items={tabs.map((t: Tab) => t.id)}
           strategy={horizontalListSortingStrategy}
         >
-          <div className="relative z-10 flex items-end gap-0.5 overflow-x-auto flex-1">
+          <div className="relative z-10 flex items-end gap-0.5 overflow-x-auto overflow-y-hidden pt-px flex-1">
             {tabs.map((tab: Tab) => (
               <SortableTab
                 key={tab.id}
@@ -300,7 +319,16 @@ export default function TabBar() {
                   }
                   dispatch(closeTab(tab.id))
                 }}
-                onClick={() => dispatch(setActiveTab(tab.id))}
+                onClick={() => {
+                  if (attentionDismiss === 'click' && attentionByTab[tab.id]) {
+                    dispatch(clearTabAttention({ tabId: tab.id }))
+                    const activePaneId = activePaneMap?.[tab.id]
+                    if (activePaneId && attentionByPane[activePaneId]) {
+                      dispatch(clearPaneAttention({ paneId: activePaneId }))
+                    }
+                  }
+                  dispatch(setActiveTab(tab.id))
+                }}
                 onDoubleClick={() => {
                   setRenamingId(tab.id)
                   setRenameValue(getDisplayTitle(tab))
@@ -308,7 +336,7 @@ export default function TabBar() {
               />
             ))}
             <button
-              className="flex-shrink-0 ml-1 mb-1 p-1 rounded-md border border-dashed border-muted-foreground/40 text-muted-foreground hover:text-foreground hover:border-foreground/50 hover:bg-muted/30 transition-colors"
+              className="flex-shrink-0 ml-1 mb-1 p-1 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded-md border border-dashed border-muted-foreground/40 text-muted-foreground hover:text-foreground hover:border-foreground/50 hover:bg-muted/30 transition-colors"
               title="New shell tab"
               aria-label="New shell tab"
               onClick={() => dispatch(addTab({ mode: 'shell' }))}

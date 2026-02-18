@@ -41,6 +41,11 @@ describe('auth', () => {
       expect(localStorage.getItem(AUTH_KEY)).toBe('abc')
     })
 
+    it('sets freshell-auth cookie', () => {
+      auth.setAuthToken('abc')
+      expect(document.cookie).toContain('freshell-auth=abc')
+    })
+
     it('overwrites a previous token', () => {
       auth.setAuthToken('first')
       auth.setAuthToken('second')
@@ -158,6 +163,38 @@ describe('auth', () => {
       expect(localStorage.getItem(AUTH_KEY)).toBeNull()
       expect(replaceStateSpy).not.toHaveBeenCalled()
       replaceStateSpy.mockRestore()
+    })
+
+    it('sets freshell-auth cookie when token extracted from URL', () => {
+      const original = window.location
+      const replaceStateSpy = vi.spyOn(window.history, 'replaceState')
+
+      Object.defineProperty(window, 'location', {
+        value: {
+          ...original,
+          search: '?token=url-cookie-test',
+          pathname: '/',
+          protocol: 'http:',
+        },
+        writable: true,
+        configurable: true,
+      })
+
+      auth.initializeAuthToken()
+      expect(document.cookie).toContain('freshell-auth=url-cookie-test')
+
+      Object.defineProperty(window, 'location', {
+        value: original,
+        writable: true,
+        configurable: true,
+      })
+      replaceStateSpy.mockRestore()
+    })
+
+    it('sets freshell-auth cookie from existing localStorage token', () => {
+      localStorage.setItem(AUTH_KEY, 'stored-token')
+      auth.initializeAuthToken()
+      expect(document.cookie).toContain('freshell-auth=stored-token')
     })
   })
 })

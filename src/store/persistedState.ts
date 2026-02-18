@@ -58,15 +58,15 @@ export function parsePersistedTabsRaw(raw: string): ParsedPersistedTabs | null {
   }
 }
 
-const zPaneTitles = z.record(z.record(z.string()))
-const zPaneTitleSetByUser = z.record(z.record(z.boolean()))
+const zPaneTitles = z.record(z.string(), z.record(z.string(), z.string()))
+const zPaneTitleSetByUser = z.record(z.string(), z.record(z.string(), z.boolean()))
 
 const zPersistedPanesPayload = z.object({
   version: z.number().optional(),
   // Layout nodes can be partially corrupted; migrations and runtime code should tolerate malformed nodes.
   // We validate only that layouts is a plain object and leave deeper repairs to higher-level logic.
-  layouts: z.record(z.unknown()).optional(),
-  activePane: z.record(z.string()).optional(),
+  layouts: z.record(z.string(), z.unknown()).optional(),
+  activePane: z.record(z.string(), z.string()).optional(),
   paneTitles: zPaneTitles.optional(),
   paneTitleSetByUser: zPaneTitleSetByUser.optional(),
 }).passthrough()

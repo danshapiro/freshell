@@ -46,13 +46,14 @@ vi.mock('lucide-react', () => ({
 
 const terminalInstances: any[] = []
 
-vi.mock('xterm', () => {
+vi.mock('@xterm/xterm', () => {
   class MockTerminal {
     options: Record<string, unknown> = {}
     cols = 80
     rows = 24
     open = vi.fn()
     loadAddon = vi.fn()
+    registerLinkProvider = vi.fn(() => ({ dispose: vi.fn() }))
     write = vi.fn()
     writeln = vi.fn()
     clear = vi.fn()
@@ -68,13 +69,13 @@ vi.mock('xterm', () => {
   return { Terminal: MockTerminal }
 })
 
-vi.mock('xterm-addon-fit', () => ({
+vi.mock('@xterm/addon-fit', () => ({
   FitAddon: class {
     fit = vi.fn()
   },
 }))
 
-vi.mock('xterm/css/xterm.css', () => ({}))
+vi.mock('@xterm/xterm/css/xterm.css', () => ({}))
 
 import TerminalView from '@/components/TerminalView'
 
@@ -163,7 +164,7 @@ describe('TerminalView lifecycle updates', () => {
           paneTitles: {},
         },
         settings: { settings: defaultSettings, status: 'loaded' },
-        connection: { status: 'connected', error: null },
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
       },
     })
 
@@ -247,7 +248,7 @@ describe('TerminalView lifecycle updates', () => {
           paneTitles: {},
         },
         settings: { settings: defaultSettings, status: 'loaded' },
-        connection: { status: 'connected', error: null },
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
       },
     })
 
@@ -475,7 +476,7 @@ describe('TerminalView lifecycle updates', () => {
           paneTitles: {},
         },
         settings: { settings: defaultSettings, status: 'loaded' },
-        connection: { status: 'connected', error: null },
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
       },
     })
 
@@ -539,7 +540,7 @@ describe('TerminalView lifecycle updates', () => {
           paneTitles: {},
         },
         settings: { settings: defaultSettings, status: 'loaded' },
-        connection: { status: 'connected', error: null },
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
       },
     })
 
@@ -1176,7 +1177,7 @@ describe('TerminalView lifecycle updates', () => {
           paneTitles: {},
         },
         settings: { settings: defaultSettings, status: 'loaded' },
-        connection: { status: 'connected', error: null },
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
       },
     })
 
@@ -1206,9 +1207,14 @@ describe('TerminalView lifecycle updates', () => {
       sessionId: 'session-abc-123',
     })
 
-    // Verify pane content has resumeSessionId
+    // Verify pane content has resumeSessionId + sessionRef
     const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
     expect(layout.content.resumeSessionId).toBe('session-abc-123')
+    expect(layout.content.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: 'session-abc-123',
+      serverInstanceId: 'srv-local',
+    })
 
     // Verify tab also has resumeSessionId mirrored
     const tab = store.getState().tabs.tabs.find(t => t.id === tabId)
@@ -1322,6 +1328,7 @@ describe('TerminalView lifecycle updates', () => {
           panes: panesReducer,
           settings: settingsReducer,
           connection: connectionReducer,
+          turnCompletion: turnCompletionReducer,
         },
         preloadedState: {
           tabs: {
@@ -1521,6 +1528,247 @@ describe('TerminalView lifecycle updates', () => {
       })
       const afterReconnect = wsMocks.send.mock.calls.filter((call) => call[0]?.type === 'terminal.attach' && call[0]?.terminalId === terminalId)
       expect(afterReconnect).toHaveLength(1)
+    })
+  })
+
+  describe('xterm clear on terminal creation/attach', () => {
+    function setupTerminal() {
+      const tabId = 'tab-1'
+      const paneId = 'pane-1'
+      const paneContent: TerminalPaneContent = {
+        kind: 'terminal',
+        createRequestId: 'req-clear-1',
+        status: 'creating',
+        mode: 'claude',
+        shell: 'system',
+        initialCwd: '/tmp',
+      }
+      const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+          settings: settingsReducer,
+          connection: connectionReducer,
+          turnCompletion: turnCompletionReducer,
+        },
+        preloadedState: {
+          tabs: {
+            tabs: [{
+              id: tabId,
+              mode: 'claude',
+              status: 'running',
+              title: 'Claude',
+              titleSetByUser: false,
+              createRequestId: 'req-clear-1',
+            }],
+            activeTabId: tabId,
+          },
+          panes: {
+            layouts: { [tabId]: root },
+            activePane: { [tabId]: paneId },
+            paneTitles: {},
+          },
+          settings: {
+            settings: {
+              ...defaultSettings,
+              terminal: {
+                ...defaultSettings.terminal,
+                osc52Clipboard: 'never',
+              },
+            },
+            status: 'loaded',
+          },
+          connection: { status: 'connected', error: null },
+          turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {}, attentionByPane: {} },
+        },
+      })
+      return { tabId, paneId, paneContent, store }
+    }
+
+    it('clears xterm on terminal.created with empty snapshot', async () => {
+      const { tabId, paneId, paneContent, store } = setupTerminal()
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+      })
+
+      const term = terminalInstances[terminalInstances.length - 1]
+      term.clear.mockClear()
+      term.write.mockClear()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.created',
+          requestId: 'req-clear-1',
+          terminalId: 'term-1',
+        })
+      })
+
+      // term.clear() should be called even with no snapshot
+      expect(term.clear).toHaveBeenCalled()
+      // term.write() should NOT be called (no snapshot to write)
+      expect(term.write).not.toHaveBeenCalled()
+    })
+
+    it('clears xterm on terminal.created with non-empty snapshot', async () => {
+      const { tabId, paneId, paneContent, store } = setupTerminal()
+      const osc52 = '\u001b]52;c;Y29weQ==\u0007'
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+      })
+
+      const term = terminalInstances[terminalInstances.length - 1]
+      term.clear.mockClear()
+      term.write.mockClear()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.created',
+          requestId: 'req-clear-1',
+          terminalId: 'term-1',
+          snapshot: `hello${osc52} world`,
+        })
+      })
+
+      expect(term.clear).toHaveBeenCalled()
+      expect(term.write).toHaveBeenCalledWith('hello world')
+      expect(store.getState().turnCompletion.lastEvent).toBeNull()
+    })
+
+    it('sanitizes terminal.snapshot replay and does not emit turn completion', async () => {
+      const { tabId, paneId, paneContent, store } = setupTerminal()
+      const osc52 = '\u001b]52;c;Y29weQ==\u0007'
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.created',
+          requestId: 'req-clear-1',
+          terminalId: 'term-1',
+          snapshot: '',
+        })
+      })
+
+      const term = terminalInstances[terminalInstances.length - 1]
+      term.clear.mockClear()
+      term.write.mockClear()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.snapshot',
+          terminalId: 'term-1',
+          snapshot: `snap${osc52}shot`,
+        })
+      })
+
+      expect(term.clear).toHaveBeenCalled()
+      expect(term.write).toHaveBeenCalledWith('snapshot')
+      expect(store.getState().turnCompletion.lastEvent).toBeNull()
+    })
+
+    it('clears xterm on terminal.attached with empty snapshot', async () => {
+      const { tabId, paneId, paneContent, store } = setupTerminal()
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+      })
+
+      // First, create the terminal so it has a terminalId
+      act(() => {
+        messageHandler!({
+          type: 'terminal.created',
+          requestId: 'req-clear-1',
+          terminalId: 'term-1',
+          snapshot: '',
+        })
+      })
+
+      const term = terminalInstances[terminalInstances.length - 1]
+      term.clear.mockClear()
+      term.write.mockClear()
+
+      // Then receive terminal.attached with empty snapshot
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attached',
+          terminalId: 'term-1',
+        })
+      })
+
+      // term.clear() should be called even with no snapshot
+      expect(term.clear).toHaveBeenCalled()
+      expect(term.write).not.toHaveBeenCalled()
+    })
+
+    it('clears xterm on terminal.attached with non-empty snapshot', async () => {
+      const { tabId, paneId, paneContent, store } = setupTerminal()
+      const osc52 = '\u001b]52;c;Y29weQ==\u0007'
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+      })
+
+      // Create terminal first
+      act(() => {
+        messageHandler!({
+          type: 'terminal.created',
+          requestId: 'req-clear-1',
+          terminalId: 'term-1',
+          snapshot: '',
+        })
+      })
+
+      const term = terminalInstances[terminalInstances.length - 1]
+      term.clear.mockClear()
+      term.write.mockClear()
+
+      // Receive terminal.attached with a snapshot
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attached',
+          terminalId: 'term-1',
+          snapshot: `attached ${osc52}content`,
+        })
+      })
+
+      expect(term.clear).toHaveBeenCalled()
+      expect(term.write).toHaveBeenCalledWith('attached content')
+      expect(store.getState().turnCompletion.lastEvent).toBeNull()
     })
   })
 })

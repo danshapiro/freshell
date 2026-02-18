@@ -105,14 +105,21 @@ cd .worktrees/release-vX.Y.Z
 npm install
 ```
 
-### 2. Run the full test suite
+### 2. Verify from a clean install
 
 ```bash
-# In the worktree
+# In the worktree — start from a clean slate to catch peer dep issues
+rm -rf node_modules
+npm install
+
+# Type-check AND build (catches errors vitest misses because it transpiles with esbuild)
+npm run build
+
+# Run the full test suite
 npm test
 ```
 
-All tests must pass. If any fail, fix them on the release branch before proceeding.
+All three commands must succeed. `npm install` must complete without `--force` or `--legacy-peer-deps`. `npm run build` catches TypeScript errors that `npm test` alone does not (vitest uses esbuild for transpilation, skipping type checking). If any step fails, fix the issue on the release branch before proceeding.
 
 ### 3. Prepare the release (on the release branch)
 

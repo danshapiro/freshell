@@ -71,6 +71,7 @@ function createStore(layout: PaneNode, opts?: { paneTitleSetByUser?: Record<stri
         lastEvent: null,
         pendingEvents: [],
         attentionByTab: {},
+        attentionByPane: {},
       },
     },
   })

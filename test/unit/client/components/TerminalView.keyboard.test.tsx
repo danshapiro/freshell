@@ -37,14 +37,28 @@ vi.mock('lucide-react', () => ({
 let capturedKeyHandler: ((event: KeyboardEvent) => boolean) | null = null
 let capturedOnData: ((data: string) => void) | null = null
 let capturedTerminal: { paste: ReturnType<typeof vi.fn> } | null = null
+let capturedLinkProvider: {
+  provideLinks: (line: number, callback: (links: any[] | undefined) => void) => void
+} | null = null
 
-vi.mock('xterm', () => {
+vi.mock('@xterm/xterm', () => {
   class MockTerminal {
     options: Record<string, unknown> = {}
     cols = 80
     rows = 24
+    buffer = {
+      active: {
+        getLine: vi.fn(() => ({
+          translateToString: () => '/tmp/example.txt',
+        })),
+      },
+    }
     open = vi.fn()
     loadAddon = vi.fn()
+    registerLinkProvider = vi.fn((provider: any) => {
+      capturedLinkProvider = provider
+      return { dispose: vi.fn() }
+    })
     write = vi.fn()
     writeln = vi.fn()
     clear = vi.fn()
@@ -72,13 +86,13 @@ vi.mock('xterm', () => {
   return { Terminal: MockTerminal }
 })
 
-vi.mock('xterm-addon-fit', () => ({
+vi.mock('@xterm/addon-fit', () => ({
   FitAddon: class {
     fit = vi.fn()
   },
 }))
 
-vi.mock('xterm/css/xterm.css', () => ({}))
+vi.mock('@xterm/xterm/css/xterm.css', () => ({}))
 
 // Mock clipboard
 const clipboardMocks = vi.hoisted(() => ({
@@ -178,6 +192,7 @@ describe('TerminalView keyboard handling', () => {
     capturedKeyHandler = null
     capturedOnData = null
     capturedTerminal = null
+    capturedLinkProvider = null
     wsMocks.send.mockClear()
     clipboardMocks.readText.mockClear()
     clipboardMocks.copyText.mockClear()
@@ -428,6 +443,100 @@ describe('TerminalView keyboard handling', () => {
     })
   })
 
+  describe('newline shortcut', () => {
+    it('returns false for Shift+Enter and sends newline to terminal', async () => {
+      const { store, tabId, paneId, paneContent } = createTestStore('term-1')
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(capturedKeyHandler).not.toBeNull()
+      })
+
+      const event = createKeyboardEvent('Enter', { shiftKey: true })
+      const result = capturedKeyHandler!(event)
+
+      expect(result).toBe(false)
+      expect(event.preventDefault).toHaveBeenCalled()
+      expect(wsMocks.send).toHaveBeenCalledWith({
+        type: 'terminal.input',
+        terminalId: 'term-1',
+        data: '\n',
+      })
+    })
+
+    it('returns false for Shift+Enter without terminal id and does not send input', async () => {
+      const { store, tabId, paneId, paneContent } = createTestStore(undefined)
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(capturedKeyHandler).not.toBeNull()
+      })
+
+      const event = createKeyboardEvent('Enter', { shiftKey: true })
+      const result = capturedKeyHandler!(event)
+
+      expect(result).toBe(false)
+      expect(event.preventDefault).toHaveBeenCalled()
+      expect(wsMocks.send).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'terminal.input',
+          data: '\n',
+        }),
+      )
+    })
+
+    it('returns true for plain Enter so xterm handles it', async () => {
+      const { store, tabId, paneId, paneContent } = createTestStore('term-1')
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(capturedKeyHandler).not.toBeNull()
+      })
+
+      const event = createKeyboardEvent('Enter')
+      const result = capturedKeyHandler!(event)
+
+      expect(result).toBe(true)
+    })
+  })
+
+  describe('search shortcut', () => {
+    it('returns false for Ctrl+F to open terminal search', async () => {
+      const { store, tabId, paneId, paneContent } = createTestStore('term-1')
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(capturedKeyHandler).not.toBeNull()
+      })
+
+      const event = createKeyboardEvent('f', { ctrlKey: true })
+      const result = capturedKeyHandler!(event)
+
+      expect(result).toBe(false)
+      expect(event.preventDefault).toHaveBeenCalled()
+    })
+  })
+
   describe('terminal actions paste', () => {
     it('context-menu paste uses term.paste and emits exactly one terminal.input via onData', async () => {
       clipboardMocks.readText.mockResolvedValue('pasted content')
@@ -484,6 +593,45 @@ describe('TerminalView keyboard handling', () => {
       const result = capturedKeyHandler!(event)
 
       expect(result).toBe(true)
+    })
+  })
+
+  describe('local file path links', () => {
+    it('opens an editor tab when a detected local file link is activated', async () => {
+      const { store, tabId, paneId, paneContent } = createTestStore('term-1')
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(capturedLinkProvider).not.toBeNull()
+      })
+
+      let links: any[] | undefined
+      capturedLinkProvider!.provideLinks(1, (provided) => {
+        links = provided
+      })
+
+      expect(links).toBeDefined()
+      expect(links).toHaveLength(1)
+      expect(links![0].text).toBe('/tmp/example.txt')
+
+      links![0].activate()
+
+      const nextTab = store.getState().tabs.tabs[1]
+      expect(nextTab).toBeDefined()
+      const layout = store.getState().panes.layouts[nextTab.id]
+      expect(layout).toBeDefined()
+      expect(layout.type).toBe('leaf')
+      if (layout.type === 'leaf') {
+        expect(layout.content.kind).toBe('editor')
+        if (layout.content.kind === 'editor') {
+          expect(layout.content.filePath).toBe('/tmp/example.txt')
+        }
+      }
     })
   })
 })

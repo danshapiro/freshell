@@ -1,5 +1,6 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
-import type { AppSettings, SidebarSortMode } from './types'
+import type { AppSettings, SidebarSortMode, CodingCliProviderName } from './types'
+import type { DeepPartial } from '@/lib/type-utils'
 
 export function resolveDefaultLoggingDebug(isDev: boolean = import.meta.env.DEV): boolean {
   return !!isDev
@@ -16,6 +17,8 @@ export const defaultSettings: AppSettings = {
     scrollback: 5000,
     theme: 'auto',
     warnExternalLinks: true,
+    osc52Clipboard: 'ask',
+    renderer: 'auto',
   },
   defaultCwd: undefined,
   logging: {
@@ -33,11 +36,15 @@ export const defaultSettings: AppSettings = {
     width: 288,
     collapsed: false,
   },
+  notifications: {
+    soundEnabled: true,
+  },
   panes: {
     defaultNewPane: 'ask' as const,
     snapThreshold: 2,
     iconsOnTabs: true,
     tabAttentionStyle: 'highlight' as const,
+    attentionDismiss: 'click' as const,
   },
   codingCli: {
     enabledProviders: ['claude', 'codex'],
@@ -47,6 +54,11 @@ export const defaultSettings: AppSettings = {
       },
       codex: {},
     },
+  },
+  freshclaude: {},
+  network: {
+    host: '127.0.0.1' as const,
+    configured: false,
   },
 }
 
@@ -72,7 +84,7 @@ const initialState: SettingsState = {
   loaded: false,
 }
 
-export function mergeSettings(base: AppSettings, patch: Partial<AppSettings>): AppSettings {
+export function mergeSettings(base: AppSettings, patch: DeepPartial<AppSettings>): AppSettings {
   const baseLogging = base.logging ?? defaultSettings.logging
   const baseCodingCli = base.codingCli ?? defaultSettings.codingCli
   const merged = {
@@ -82,6 +94,7 @@ export function mergeSettings(base: AppSettings, patch: Partial<AppSettings>): A
     logging: { ...baseLogging, ...(patch.logging || {}) },
     safety: { ...base.safety, ...(patch.safety || {}) },
     sidebar: { ...base.sidebar, ...(patch.sidebar || {}) },
+    notifications: { ...base.notifications, ...(patch.notifications || {}) },
     panes: { ...base.panes, ...(patch.panes || {}) },
     codingCli: {
       ...baseCodingCli,
@@ -91,6 +104,8 @@ export function mergeSettings(base: AppSettings, patch: Partial<AppSettings>): A
         ...(patch.codingCli?.providers || {}),
       },
     },
+    freshclaude: { ...base.freshclaude, ...(patch.freshclaude || {}) },
+    network: { ...base.network, ...(patch.network || {}) },
   }
 
   return {
@@ -98,6 +113,12 @@ export function mergeSettings(base: AppSettings, patch: Partial<AppSettings>): A
     sidebar: {
       ...merged.sidebar,
       sortMode: migrateSortMode(merged.sidebar?.sortMode),
+    },
+    codingCli: {
+      ...merged.codingCli,
+      enabledProviders: (merged.codingCli.enabledProviders ?? []).filter(
+        (provider): provider is CodingCliProviderName => provider === 'claude' || provider === 'codex' || provider === 'opencode',
+      ),
     },
   }
 }
@@ -110,7 +131,7 @@ export const settingsSlice = createSlice({
       state.settings = mergeSettings(defaultSettings, action.payload)
       state.loaded = true
     },
-    updateSettingsLocal: (state, action: PayloadAction<Partial<AppSettings>>) => {
+    updateSettingsLocal: (state, action: PayloadAction<DeepPartial<AppSettings>>) => {
       state.settings = mergeSettings(state.settings, action.payload)
     },
     markSaved: (state) => {

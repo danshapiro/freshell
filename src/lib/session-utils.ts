@@ -8,9 +8,24 @@ import type { CodingCliProviderName } from '@/store/types'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 
 /**
- * Extract all session IDs from a pane tree.
+ * Extract a session reference from a single pane's content.
+ * Handles both terminal panes (claude/codex mode) and claude-chat (freshclaude) panes.
  */
 function extractSessionRef(content: PaneContent): { provider: CodingCliProviderName; sessionId: string } | undefined {
+  const explicit = (content as { sessionRef?: { provider?: unknown; sessionId?: unknown } }).sessionRef
+  if (explicit && typeof explicit.provider === 'string' && typeof explicit.sessionId === 'string') {
+    if (explicit.provider === 'claude' && !isValidClaudeSessionId(explicit.sessionId)) return undefined
+    return {
+      provider: explicit.provider as CodingCliProviderName,
+      sessionId: explicit.sessionId,
+    }
+  }
+
+  if (content.kind === 'claude-chat') {
+    const sessionId = content.resumeSessionId
+    if (!sessionId || !isValidClaudeSessionId(sessionId)) return undefined
+    return { provider: 'claude', sessionId }
+  }
   if (content.kind !== 'terminal') return undefined
   if (content.mode === 'shell') return undefined
   const sessionId = content.resumeSessionId
@@ -75,6 +90,51 @@ export function findTabIdForSession(state: RootState, provider: CodingCliProvide
     if (tabSessionId === sessionId) return tab.id
   }
   return undefined
+}
+
+/**
+ * Find the tab and pane that contain a specific session.
+ * Walks all tabs' pane trees looking for a pane (terminal or claude-chat) matching the provider + sessionId.
+ * Falls back to tab-level resumeSessionId when no layout exists (early boot/rehydration).
+ */
+export function findPaneForSession(
+  state: RootState,
+  provider: CodingCliProviderName,
+  sessionId: string
+): { tabId: string; paneId: string | undefined } | undefined {
+  for (const tab of state.tabs.tabs) {
+    const layout = state.panes.layouts[tab.id]
+    if (layout) {
+      const paneId = findPaneInNode(layout, provider, sessionId)
+      if (paneId) return { tabId: tab.id, paneId }
+      continue
+    }
+
+    // Fallback: tab has resumeSessionId but no pane layout yet (early boot)
+    const tabProvider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
+    if (tabProvider !== provider) continue
+    const tabSessionId = tab.resumeSessionId
+    if (!tabSessionId) continue
+    if (provider === 'claude' && !isValidClaudeSessionId(tabSessionId)) continue
+    if (tabSessionId === sessionId) return { tabId: tab.id, paneId: undefined }
+  }
+  return undefined
+}
+
+function findPaneInNode(
+  node: PaneNode,
+  provider: CodingCliProviderName,
+  sessionId: string
+): string | undefined {
+  if (node.type === 'leaf') {
+    const ref = extractSessionRef(node.content)
+    if (ref && ref.provider === provider && ref.sessionId === sessionId) {
+      return node.id
+    }
+    return undefined
+  }
+  return findPaneInNode(node.children[0], provider, sessionId)
+    ?? findPaneInNode(node.children[1], provider, sessionId)
 }
 
 /**

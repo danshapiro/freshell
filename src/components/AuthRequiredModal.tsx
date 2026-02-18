@@ -45,6 +45,7 @@ export function AuthRequiredModal() {
 
   const isAuthError = status === 'disconnected' && !!lastError?.includes('Authentication failed')
   const shouldShow = isAuthError && !dismissed
+  const currentOrigin = typeof window !== 'undefined' ? window.location.origin : ''
 
   // Focus input when modal opens
   useEffect(() => {
@@ -134,12 +135,29 @@ export function AuthRequiredModal() {
         </div>
 
         <p className="text-sm text-muted-foreground mb-3">
-          You need a magic token to connect to your freshell. You can find it in:
+          This browser is missing a valid auth token for this Freshell server.
         </p>
-        <ul className="text-sm text-muted-foreground mb-4 list-disc pl-5 space-y-1">
-          <li>Your server console output (the URL printed at startup)</li>
-          <li>Your <code className="text-xs bg-muted px-1 rounded">.env</code> file (<code className="text-xs bg-muted px-1 rounded">AUTH_TOKEN</code>)</li>
-        </ul>
+        <div className="text-sm text-muted-foreground mb-4 space-y-2">
+          <p>
+            Open Freshell using a token URL, like:
+          </p>
+          <pre className="text-xs bg-muted px-3 py-2 rounded overflow-auto">
+            <code>{currentOrigin}/?token=YOUR_AUTH_TOKEN</code>
+          </pre>
+          <p>
+            You can get <code className="text-xs bg-muted px-1 rounded">YOUR_AUTH_TOKEN</code> from:
+          </p>
+          <ul className="list-disc pl-5 space-y-1">
+            <li>The server console output (it prints a URL on startup)</li>
+            <li>
+              Your <code className="text-xs bg-muted px-1 rounded">.env</code> file (
+              <code className="text-xs bg-muted px-1 rounded">AUTH_TOKEN</code>)
+            </li>
+          </ul>
+          <p>
+            Tip: if you switch between <code className="text-xs bg-muted px-1 rounded">localhost</code> and a VPN/LAN IP, you may need to re-authenticate for the new address.
+          </p>
+        </div>
 
         <div className="space-y-3">
           <div>
@@ -153,7 +171,7 @@ export function AuthRequiredModal() {
               value={tokenInput}
               onChange={(e) => setTokenInput(e.target.value)}
               onKeyDown={handleInputKeyDown}
-              placeholder="Paste token or freshell URL here"
+              placeholder="Paste token (or a token URL) here"
               className="w-full px-3 py-2 text-sm border border-border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-ring"
               autoComplete="off"
             />

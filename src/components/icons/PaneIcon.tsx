@@ -1,5 +1,5 @@
 import { Terminal, Globe, FileText, LayoutGrid } from 'lucide-react'
-import { ProviderIcon } from '@/components/icons/provider-icons'
+import { ProviderIcon, FreshclaudeIcon } from '@/components/icons/provider-icons'
 import { isCodingCliMode } from '@/lib/coding-cli-utils'
 import type { PaneContent } from '@/store/paneTypes'
 
@@ -22,6 +22,10 @@ export default function PaneIcon({ content, className }: PaneIconProps) {
 
   if (content.kind === 'editor') {
     return <FileText className={className} />
+  }
+
+  if (content.kind === 'claude-chat') {
+    return <FreshclaudeIcon className={className} />
   }
 
   // Picker

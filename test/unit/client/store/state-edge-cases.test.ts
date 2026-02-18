@@ -40,6 +40,7 @@ import settingsReducer, {
   updateSettingsLocal,
   markSaved,
   defaultSettings,
+  mergeSettings,
   SettingsState,
 } from '@/store/settingsSlice'
 import type { Tab, ProjectGroup, AppSettings } from '@/store/types'
@@ -804,7 +805,7 @@ describe('State Edge Cases', () => {
             lineHeight: 1.8,
             cursorBlink: false,
             scrollback: 100000,
-            theme: 'light',
+            theme: 'one-light',
             warnExternalLinks: true,
           },
           defaultCwd: '/custom/path',
@@ -820,11 +821,15 @@ describe('State Edge Cases', () => {
             width: 400,
             collapsed: true,
           },
+          notifications: {
+            soundEnabled: false,
+          },
           panes: {
             defaultNewPane: 'shell',
             snapThreshold: 3,
             iconsOnTabs: true,
             tabAttentionStyle: 'highlight' as const,
+            attentionDismiss: 'click' as const,
           },
           codingCli: {
             enabledProviders: ['claude', 'codex'],
@@ -833,11 +838,15 @@ describe('State Edge Cases', () => {
               codex: { model: 'gpt-5-codex' },
             },
           },
+          network: {
+            host: '127.0.0.1',
+            configured: false,
+          },
         }
 
         store.dispatch(setSettings(customSettings))
 
-        expect(store.getState().settings.settings).toEqual(customSettings)
+        expect(store.getState().settings.settings).toEqual(mergeSettings(defaultSettings, customSettings))
         expect(store.getState().settings.loaded).toBe(true)
       })
 

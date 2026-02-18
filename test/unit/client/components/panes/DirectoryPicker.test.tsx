@@ -149,6 +149,16 @@ describe('DirectoryPicker', () => {
     expect(await screen.findByText('directory not found')).toBeInTheDocument()
   })
 
+  it('shows sandbox validation error when path is blocked', async () => {
+    mockApiPost.mockRejectedValueOnce({ status: 403, message: 'Path not allowed' })
+    renderDirectoryPicker()
+    const input = screen.getByLabelText('Starting directory for Claude')
+
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    expect(await screen.findByText('path not allowed')).toBeInTheDocument()
+  })
+
   it('returns to pane picker on Escape', async () => {
     const { onBack } = renderDirectoryPicker()
     const input = screen.getByLabelText('Starting directory for Claude')
@@ -180,5 +190,61 @@ describe('DirectoryPicker', () => {
     expect(input).toHaveAttribute('aria-expanded', 'false')
     expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
     expect(screen.getByText('No suggestions')).toBeInTheDocument()
+  })
+
+  describe('tab-aware candidate re-ranking', () => {
+    it('renders candidates from API in original order without tab context', async () => {
+      mockApiGet.mockResolvedValueOnce({
+        directories: ['/code/gamma', '/code/alpha', '/code/beta'],
+      })
+
+      renderDirectoryPicker({ defaultCwd: '' })
+
+      await waitFor(() => {
+        expect(screen.getByRole('listbox')).toBeInTheDocument()
+      })
+
+      const options = screen.getAllByRole('option')
+      expect(options.map(o => o.textContent)).toEqual([
+        '/code/gamma',
+        '/code/alpha',
+        '/code/beta',
+      ])
+    })
+
+    it('boosts tab directories and global default above API candidates', async () => {
+      mockApiGet.mockResolvedValueOnce({
+        directories: ['/code/gamma', '/code/alpha', '/code/beta', '/code/delta'],
+      })
+
+      renderDirectoryPicker({
+        defaultCwd: '',
+        tabDirectories: ['/code/beta', '/code/alpha'],
+        globalDefault: '/code/delta',
+      })
+
+      await waitFor(() => {
+        const options = screen.getAllByRole('option')
+        expect(options.length).toBeGreaterThanOrEqual(4)
+      })
+
+      const options = screen.getAllByRole('option')
+      // Tab dirs first (in provided order), then global default, then rest
+      expect(options.map(o => o.textContent)).toEqual([
+        '/code/beta',
+        '/code/alpha',
+        '/code/delta',
+        '/code/gamma',
+      ])
+    })
+
+    it('pre-fills input with tab-preferred defaultCwd', () => {
+      mockApiGet.mockResolvedValueOnce({ directories: [] })
+
+      renderDirectoryPicker({ defaultCwd: '/code/tab-preferred' })
+
+      const input = screen.getByRole('combobox')
+      expect(input).toHaveValue('/code/tab-preferred')
+    })
   })
 })

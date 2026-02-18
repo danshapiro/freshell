@@ -1,4 +1,4 @@
-export const STARTUP_TASKS = ['sessionRepairService', 'codingCliIndexer', 'claudeIndexer'] as const
+export const STARTUP_TASKS = ['sessionRepairService', 'codingCliIndexer'] as const
 export type StartupTask = typeof STARTUP_TASKS[number]
 
 export class StartupState<T extends string> {

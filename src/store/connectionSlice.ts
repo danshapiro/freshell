@@ -6,6 +6,7 @@ export interface ConnectionState {
   status: ConnectionStatus
   lastError?: string
   lastReadyAt?: number
+  serverInstanceId?: string
   platform: string | null
   availableClis: Record<string, boolean>
 }
@@ -27,6 +28,9 @@ export const connectionSlice = createSlice({
     setError: (state, action: PayloadAction<string | undefined>) => {
       state.lastError = action.payload
     },
+    setServerInstanceId: (state, action: PayloadAction<string | undefined>) => {
+      state.serverInstanceId = action.payload
+    },
     setPlatform: (state, action: PayloadAction<string>) => {
       state.platform = action.payload
     },
@@ -36,5 +40,5 @@ export const connectionSlice = createSlice({
   },
 })
 
-export const { setStatus, setError, setPlatform, setAvailableClis } = connectionSlice.actions
+export const { setStatus, setError, setServerInstanceId, setPlatform, setAvailableClis } = connectionSlice.actions
 export default connectionSlice.reducer

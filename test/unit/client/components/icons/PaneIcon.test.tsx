@@ -8,6 +8,9 @@ vi.mock('@/components/icons/provider-icons', () => ({
   ProviderIcon: ({ provider, ...props }: any) => (
     <svg data-testid={`provider-icon-${provider}`} {...props} />
   ),
+  FreshclaudeIcon: (props: any) => (
+    <svg data-testid="freshclaude-icon" {...props} />
+  ),
 }))
 
 // Mock lucide-react
@@ -80,6 +83,19 @@ describe('PaneIcon', () => {
       />
     )
     expect(screen.getByTestId('file-text-icon')).toBeInTheDocument()
+  })
+
+  it('renders freshclaude icon for claude-chat panes', () => {
+    render(
+      <PaneIcon
+        content={{
+          kind: 'claude-chat',
+          createRequestId: 'req-1',
+          status: 'idle',
+        }}
+      />
+    )
+    expect(screen.getByTestId('freshclaude-icon')).toBeInTheDocument()
   })
 
   it('renders layout-grid icon for picker panes', () => {

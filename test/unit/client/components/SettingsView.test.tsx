@@ -7,6 +7,7 @@ import settingsReducer, { defaultSettings, SettingsState } from '@/store/setting
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
+import { networkReducer } from '@/store/networkSlice'
 import { LOCAL_TERMINAL_FONT_KEY } from '@/lib/terminal-fonts'
 
 // Mock the api module
@@ -32,6 +33,7 @@ function createTestStore(settingsState?: Partial<SettingsState>) {
       tabs: tabsReducer,
       connection: connectionReducer,
       sessions: sessionsReducer,
+      network: networkReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -118,11 +120,14 @@ describe('SettingsView Component', () => {
       expect(screen.getByText('Debugging')).toBeInTheDocument()
       expect(screen.getByText('Debug-level logs and perf instrumentation')).toBeInTheDocument()
 
+      expect(screen.getByText('Notifications')).toBeInTheDocument()
+      expect(screen.getByText('Sound and alert preferences')).toBeInTheDocument()
+
       expect(screen.getByText('Coding CLIs')).toBeInTheDocument()
       expect(screen.getByText('Providers and defaults for coding sessions')).toBeInTheDocument()
 
       expect(screen.getByText('Keyboard shortcuts')).toBeInTheDocument()
-      expect(screen.getByText('Tab navigation')).toBeInTheDocument()
+      expect(screen.getByText('Navigation and terminal')).toBeInTheDocument()
     })
 
     it('renders a terminal preview above Appearance', () => {
@@ -174,6 +179,9 @@ describe('SettingsView Component', () => {
       expect(screen.getByText('Auto-kill idle (minutes)')).toBeInTheDocument()
       expect(screen.getByText('Warn before kill (minutes)')).toBeInTheDocument()
       expect(screen.getByText('Default working directory')).toBeInTheDocument()
+
+      // Notifications section
+      expect(screen.getByText('Sound on completion')).toBeInTheDocument()
 
       // Coding CLI section
       expect(screen.getByText('Enable Claude')).toBeInTheDocument()
@@ -712,10 +720,35 @@ describe('SettingsView Component', () => {
 
       const showBadgesRow = screen.getByText('Show project badges').closest('div')
       expect(showBadgesRow).toBeTruthy()
-      const showBadgesToggle = within(showBadgesRow!).getByRole('button')
+      const showBadgesToggle = within(showBadgesRow!).getByRole('switch')
       fireEvent.click(showBadgesToggle)
 
       expect(store.getState().settings.settings.sidebar.showProjectBadges).toBe(false)
+    })
+
+    it('toggles notification sound', async () => {
+      const store = createTestStore({
+        settings: {
+          ...defaultSettings,
+          notifications: { soundEnabled: true },
+        },
+      })
+      renderWithStore(store)
+
+      const soundRow = screen.getByText('Sound on completion').closest('div')
+      expect(soundRow).toBeTruthy()
+      const soundToggle = within(soundRow!).getByRole('switch')
+      fireEvent.click(soundToggle)
+
+      expect(store.getState().settings.settings.notifications.soundEnabled).toBe(false)
+
+      await act(async () => {
+        vi.advanceTimersByTime(500)
+      })
+
+      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
+        notifications: { soundEnabled: false },
+      })
     })
 
     it('toggles cursor blink', async () => {
@@ -729,7 +762,7 @@ describe('SettingsView Component', () => {
 
       const cursorBlinkRow = screen.getByText('Cursor blink').closest('div')
       expect(cursorBlinkRow).toBeTruthy()
-      const cursorBlinkToggle = within(cursorBlinkRow!).getByRole('button')
+      const cursorBlinkToggle = within(cursorBlinkRow!).getByRole('switch')
       fireEvent.click(cursorBlinkToggle)
 
       expect(store.getState().settings.settings.terminal.cursorBlink).toBe(false)
@@ -754,7 +787,7 @@ describe('SettingsView Component', () => {
 
       const debugRow = screen.getByText('Debug logging').closest('div')
       expect(debugRow).toBeTruthy()
-      const debugToggle = within(debugRow!).getByRole('button')
+      const debugToggle = within(debugRow!).getByRole('switch')
       fireEvent.click(debugToggle)
 
       expect(store.getState().settings.settings.logging.debug).toBe(true)
@@ -972,7 +1005,7 @@ describe('SettingsView Component', () => {
         path: '/missing/path',
       })
       expect(api.patch).toHaveBeenCalledWith('/api/settings', {
-        defaultCwd: null,
+        defaultCwd: '',
       })
       expect(store.getState().settings.settings.defaultCwd).toBeUndefined()
       expect(screen.getByText('directory not found')).toBeInTheDocument()
@@ -996,7 +1029,7 @@ describe('SettingsView Component', () => {
 
       expect(api.post).not.toHaveBeenCalled()
       expect(api.patch).toHaveBeenCalledWith('/api/settings', {
-        defaultCwd: null,
+        defaultCwd: '',
       })
       expect(store.getState().settings.settings.defaultCwd).toBeUndefined()
     })
@@ -1009,6 +1042,8 @@ describe('SettingsView Component', () => {
 
       expect(screen.getByText('Previous tab')).toBeInTheDocument()
       expect(screen.getByText('Next tab')).toBeInTheDocument()
+      expect(screen.getByText('Newline (same as Ctrl+J)')).toBeInTheDocument()
+      expect(screen.getByText('Newline')).toBeInTheDocument()
     })
 
     it('displays keyboard shortcut keys', () => {
@@ -1048,6 +1083,313 @@ describe('SettingsView Component', () => {
     it('API mocks are reset between tests', () => {
       // This test verifies that vi.clearAllMocks() in beforeEach works
       expect(api.patch).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('Network Access settings', () => {
+    it('renders remote access toggle', () => {
+      const store = createTestStore()
+      render(
+        <Provider store={store}>
+          <SettingsView onNavigate={vi.fn()} />
+        </Provider>,
+      )
+      expect(screen.getByText(/remote access/i)).toBeInTheDocument()
+    })
+
+    it('shows firewall Fix button for WSL2 even with empty commands', () => {
+      const store = configureStore({
+        reducer: {
+          settings: settingsReducer,
+          tabs: tabsReducer,
+          connection: connectionReducer,
+          sessions: sessionsReducer,
+          network: networkReducer,
+        },
+        preloadedState: {
+          settings: {
+            settings: defaultSettings,
+            loaded: true,
+            lastSavedAt: undefined,
+          },
+          network: {
+            status: {
+              configured: true,
+              host: '0.0.0.0' as const,
+              port: 3001,
+              lanIps: ['192.168.1.100'],
+              machineHostname: 'my-laptop',
+              firewall: { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false },
+              rebinding: false,
+              devMode: false,
+              accessUrl: 'http://192.168.1.100:3001/?token=abc',
+            },
+            loading: false,
+            configuring: false,
+            error: null,
+          },
+        },
+      })
+      render(
+        <Provider store={store}>
+          <SettingsView onNavigate={vi.fn()} />
+        </Provider>,
+      )
+      expect(screen.getByRole('button', { name: /fix firewall/i })).toBeInTheDocument()
+    })
+
+    it('shows dev-mode restart warning when devMode is true', () => {
+      const store = configureStore({
+        reducer: {
+          settings: settingsReducer,
+          tabs: tabsReducer,
+          connection: connectionReducer,
+          sessions: sessionsReducer,
+          network: networkReducer,
+        },
+        preloadedState: {
+          settings: {
+            settings: defaultSettings,
+            loaded: true,
+            lastSavedAt: undefined,
+          },
+          network: {
+            status: {
+              configured: true,
+              host: '0.0.0.0' as const,
+              port: 3001,
+              lanIps: ['192.168.1.100'],
+              machineHostname: 'my-laptop',
+              firewall: { platform: 'linux-none', active: false, portOpen: null, commands: [], configuring: false },
+              rebinding: false,
+              devMode: true,
+              devPort: 5173,
+              accessUrl: 'http://192.168.1.100:5173/?token=abc',
+            },
+            loading: false,
+            configuring: false,
+            error: null,
+          },
+        },
+      })
+      render(
+        <Provider store={store}>
+          <SettingsView onNavigate={vi.fn()} />
+        </Provider>,
+      )
+      expect(screen.getByRole('alert')).toBeInTheDocument()
+      expect(screen.getByText(/dev mode/i)).toBeInTheDocument()
+      expect(screen.getByText(/npm run dev/i)).toBeInTheDocument()
+    })
+
+    it('suppresses dev-mode warning on WSL2', () => {
+      const store = configureStore({
+        reducer: {
+          settings: settingsReducer,
+          tabs: tabsReducer,
+          connection: connectionReducer,
+          sessions: sessionsReducer,
+          network: networkReducer,
+        },
+        preloadedState: {
+          settings: {
+            settings: defaultSettings,
+            loaded: true,
+            lastSavedAt: undefined,
+          },
+          network: {
+            status: {
+              configured: true,
+              host: '0.0.0.0' as const,
+              port: 3001,
+              lanIps: ['192.168.1.100'],
+              machineHostname: 'my-laptop',
+              firewall: { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false },
+              rebinding: false,
+              devMode: true,
+              devPort: 5173,
+              accessUrl: 'http://192.168.1.100:5173/?token=abc',
+            },
+            loading: false,
+            configuring: false,
+            error: null,
+          },
+        },
+      })
+      render(
+        <Provider store={store}>
+          <SettingsView onNavigate={vi.fn()} />
+        </Provider>,
+      )
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    })
+
+    it('disables remote access toggle during rebind', () => {
+      const store = configureStore({
+        reducer: {
+          settings: settingsReducer,
+          tabs: tabsReducer,
+          connection: connectionReducer,
+          sessions: sessionsReducer,
+          network: networkReducer,
+        },
+        preloadedState: {
+          settings: {
+            settings: defaultSettings,
+            loaded: true,
+            lastSavedAt: undefined,
+          },
+          network: {
+            status: {
+              configured: true,
+              host: '0.0.0.0' as const,
+              port: 3001,
+              lanIps: ['192.168.1.100'],
+              machineHostname: 'my-laptop',
+              firewall: { platform: 'linux-none', active: false, portOpen: null, commands: [], configuring: false },
+              rebinding: true,
+              devMode: false,
+              accessUrl: 'http://192.168.1.100:3001/?token=abc',
+            },
+            loading: false,
+            configuring: false,
+            error: null,
+          },
+        },
+      })
+      render(
+        <Provider store={store}>
+          <SettingsView onNavigate={vi.fn()} />
+        </Provider>,
+      )
+      const toggle = screen.getByRole('switch', { name: /remote access/i })
+      expect(toggle).toBeDisabled()
+    })
+
+    it('disables remote access toggle during configuring', () => {
+      const store = configureStore({
+        reducer: {
+          settings: settingsReducer,
+          tabs: tabsReducer,
+          connection: connectionReducer,
+          sessions: sessionsReducer,
+          network: networkReducer,
+        },
+        preloadedState: {
+          settings: {
+            settings: defaultSettings,
+            loaded: true,
+            lastSavedAt: undefined,
+          },
+          network: {
+            status: {
+              configured: true,
+              host: '0.0.0.0' as const,
+              port: 3001,
+              lanIps: ['192.168.1.100'],
+              machineHostname: 'my-laptop',
+              firewall: { platform: 'linux-none', active: false, portOpen: null, commands: [], configuring: false },
+              rebinding: false,
+              devMode: false,
+              accessUrl: 'http://192.168.1.100:3001/?token=abc',
+            },
+            loading: false,
+            configuring: true,
+            error: null,
+          },
+        },
+      })
+      render(
+        <Provider store={store}>
+          <SettingsView onNavigate={vi.fn()} />
+        </Provider>,
+      )
+      const toggle = screen.getByRole('switch', { name: /remote access/i })
+      expect(toggle).toBeDisabled()
+    })
+
+    it('renders Get link button when access URL is present', () => {
+      const store = configureStore({
+        reducer: {
+          settings: settingsReducer,
+          tabs: tabsReducer,
+          connection: connectionReducer,
+          sessions: sessionsReducer,
+          network: networkReducer,
+        },
+        preloadedState: {
+          settings: {
+            settings: defaultSettings,
+            loaded: true,
+            lastSavedAt: undefined,
+          },
+          network: {
+            status: {
+              configured: true,
+              host: '0.0.0.0' as const,
+              port: 3001,
+              lanIps: ['192.168.1.100'],
+              machineHostname: 'my-laptop',
+              firewall: { platform: 'linux-none', active: false, portOpen: null, commands: [], configuring: false },
+              rebinding: false,
+              devMode: false,
+              accessUrl: 'http://192.168.1.100:3001/?token=abc',
+            },
+            loading: false,
+            configuring: false,
+            error: null,
+          },
+        },
+      })
+      render(
+        <Provider store={store}>
+          <SettingsView onNavigate={vi.fn()} />
+        </Provider>,
+      )
+      expect(screen.getByText('Get link')).toBeInTheDocument()
+    })
+
+    it('calls onSharePanel when Get link is clicked', () => {
+      const onSharePanel = vi.fn()
+      const store = configureStore({
+        reducer: {
+          settings: settingsReducer,
+          tabs: tabsReducer,
+          connection: connectionReducer,
+          sessions: sessionsReducer,
+          network: networkReducer,
+        },
+        preloadedState: {
+          settings: {
+            settings: defaultSettings,
+            loaded: true,
+            lastSavedAt: undefined,
+          },
+          network: {
+            status: {
+              configured: true,
+              host: '0.0.0.0' as const,
+              port: 3001,
+              lanIps: ['192.168.1.100'],
+              machineHostname: 'my-laptop',
+              firewall: { platform: 'linux-none', active: false, portOpen: null, commands: [], configuring: false },
+              rebinding: false,
+              devMode: false,
+              accessUrl: 'http://192.168.1.100:3001/?token=abc',
+            },
+            loading: false,
+            configuring: false,
+            error: null,
+          },
+        },
+      })
+      render(
+        <Provider store={store}>
+          <SettingsView onNavigate={vi.fn()} onSharePanel={onSharePanel} />
+        </Provider>,
+      )
+      fireEvent.click(screen.getByText('Get link'))
+      expect(onSharePanel).toHaveBeenCalledOnce()
     })
   })
 })

@@ -5,10 +5,10 @@ import { cn } from '@/lib/utils'
 import { useAppSelector } from '@/store/hooks'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { CODING_CLI_PROVIDER_CONFIGS, type CodingCliProviderConfig } from '@/lib/coding-cli-utils'
-import { ProviderIcon } from '@/components/icons/provider-icons'
+import { ClaudeIcon, ProviderIcon } from '@/components/icons/provider-icons'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 
-export type PanePickerType = 'shell' | 'cmd' | 'powershell' | 'wsl' | 'browser' | 'editor' | CodingCliProviderName
+export type PanePickerType = 'shell' | 'cmd' | 'powershell' | 'wsl' | 'browser' | 'editor' | 'claude-web' | CodingCliProviderName
 
 type IconComponent = ComponentType<{ className?: string } & SVGProps<SVGSVGElement>>
 
@@ -39,6 +39,34 @@ const CLI_SHORTCUTS: Record<string, string> = {
   opencode: 'O',
   gemini: 'G',
   kimi: 'K',
+}
+
+const MAX_OPTIONS_PER_ROW = 3
+
+interface PickerRowOption {
+  option: PickerOption
+  index: number
+}
+
+function buildBalancedOptionRows(options: PickerOption[]): PickerRowOption[][] {
+  if (options.length === 0) return []
+
+  const rowCount = Math.ceil(options.length / MAX_OPTIONS_PER_ROW)
+  const baseRowSize = Math.floor(options.length / rowCount)
+  const rowsWithExtra = options.length % rowCount
+  const rowSizes = Array.from({ length: rowCount }, (_, rowIndex) => (
+    baseRowSize + (rowIndex < rowsWithExtra ? 1 : 0)
+  ))
+
+  let cursor = 0
+  return rowSizes.map((size) => {
+    const row = options.slice(cursor, cursor + size).map((option, offset) => ({
+      option,
+      index: cursor + offset,
+    }))
+    cursor += size
+    return row
+  })
 }
 
 function cliConfigToOption(config: CodingCliProviderConfig): PickerOption {
@@ -77,8 +105,13 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
     // Shell options depend on platform
     const shellOptions = isWindowsLike(platform) ? windowsShellOptions : [shellOption]
 
-    // Order: CLIs, Editor, Browser, Shell(s)
-    return [...cliOptions, ...nonShellOptions, ...shellOptions]
+    // freshclaude option: only show if claude CLI is available and enabled
+    const claudeWebOption: PickerOption[] = (availableClis['claude'] && enabledProviders.includes('claude'))
+      ? [{ type: 'claude-web' as PanePickerType, label: 'freshclaude', icon: ClaudeIcon, shortcut: 'A' }]
+      : []
+
+    // Order: CLIs, freshclaude, Editor, Browser, Shell(s)
+    return [...cliOptions, ...claudeWebOption, ...nonShellOptions, ...shellOptions]
   }, [platform, availableClis, enabledProviders])
 
   const [focusedIndex, setFocusedIndex] = useState<number | null>(null)
@@ -154,6 +187,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
   }, [])
 
   const showHint = (index: number) => focusedIndex === index || hoveredIndex === index
+  const optionRows = useMemo(() => buildBalancedOptionRows(options), [options])
 
   return (
     <div
@@ -174,42 +208,53 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
       onTransitionEnd={handleTransitionEnd}
       onKeyDown={handleContainerKeyDown}
     >
-      <div className="flex flex-wrap justify-center gap-2 @[250px]:gap-4 @[400px]:gap-8">
-        {options.map((option, index) => (
-          <button
-            key={option.type}
-            ref={(el) => { buttonRefs.current[index] = el }}
-            aria-label={option.label}
-            onClick={() => handleSelect(option.type)}
-            onKeyDown={(e) => handleArrowNav(e, index)}
-            onFocus={() => setFocusedIndex(index)}
-            onBlur={() => setFocusedIndex(null)}
-            onMouseEnter={() => setHoveredIndex(index)}
-            onMouseLeave={() => setHoveredIndex(null)}
-            className={cn(
-              'flex flex-col items-center gap-2 @[250px]:gap-3',
-              'p-2 @[250px]:p-3 @[400px]:p-6 rounded-lg',
-              'transition-all duration-150',
-              'hover:opacity-100 focus:opacity-100 focus:outline-none',
-              'opacity-50 hover:scale-105'
-            )}
+      <div
+        className="flex flex-col items-center gap-2 @[250px]:gap-4 @[400px]:gap-8"
+        data-testid="pane-picker-options"
+      >
+        {optionRows.map((row, rowIndex) => (
+          <div
+            key={`row-${rowIndex}`}
+            className="flex justify-center gap-2 @[250px]:gap-4 @[400px]:gap-8"
+            data-testid="pane-picker-option-row"
           >
-            {option.providerName ? (
-              <ProviderIcon
-                provider={option.providerName}
-                className="h-6 w-6 @[250px]:h-8 @[250px]:w-8 @[400px]:h-12 @[400px]:w-12"
-              />
-            ) : option.icon ? (
-              <option.icon className="h-6 w-6 @[250px]:h-8 @[250px]:w-8 @[400px]:h-12 @[400px]:w-12" />
-            ) : null}
-            <span className="text-xs @[400px]:text-sm font-medium">{option.label}</span>
-            <span className={cn(
-              'shortcut-hint text-xs -mt-1 transition-opacity duration-150',
-              showHint(index) ? 'opacity-40' : 'opacity-0'
-            )}>
-              {option.shortcut}
-            </span>
-          </button>
+            {row.map(({ option, index }) => (
+              <button
+                key={option.type}
+                ref={(el) => { buttonRefs.current[index] = el }}
+                aria-label={option.label}
+                onClick={() => handleSelect(option.type)}
+                onKeyDown={(e) => handleArrowNav(e, index)}
+                onFocus={() => setFocusedIndex(index)}
+                onBlur={() => setFocusedIndex(null)}
+                onMouseEnter={() => setHoveredIndex(index)}
+                onMouseLeave={() => setHoveredIndex(null)}
+                className={cn(
+                  'flex flex-col items-center gap-2 @[250px]:gap-3',
+                  'p-2 @[250px]:p-3 @[400px]:p-6 rounded-lg',
+                  'transition-all duration-150',
+                  'hover:opacity-100 focus:opacity-100 focus:outline-none',
+                  'opacity-50 hover:scale-105'
+                )}
+              >
+                {option.providerName ? (
+                  <ProviderIcon
+                    provider={option.providerName}
+                    className="h-6 w-6 @[250px]:h-8 @[250px]:w-8 @[400px]:h-12 @[400px]:w-12"
+                  />
+                ) : option.icon ? (
+                  <option.icon className="h-6 w-6 @[250px]:h-8 @[250px]:w-8 @[400px]:h-12 @[400px]:w-12" />
+                ) : null}
+                <span className="text-xs @[400px]:text-sm font-medium">{option.label}</span>
+                <span className={cn(
+                  'shortcut-hint text-xs -mt-1 transition-opacity duration-150',
+                  showHint(index) ? 'opacity-40' : 'opacity-0'
+                )}>
+                  {option.shortcut}
+                </span>
+              </button>
+            ))}
+          </div>
         ))}
       </div>
     </div>

@@ -77,7 +77,9 @@ describe('AuthRequiredModal', () => {
     const dialog = screen.getByRole('dialog')
     expect(dialog).toBeInTheDocument()
     expect(dialog).toHaveAttribute('aria-modal', 'true')
-    expect(screen.getByText(/magic token/i)).toBeInTheDocument()
+    expect(screen.getByText(/missing a valid auth token/i)).toBeInTheDocument()
+    expect(screen.getByText(/\/\?token=YOUR_AUTH_TOKEN/i)).toBeInTheDocument()
+    expect(screen.getByText('AUTH_TOKEN')).toBeInTheDocument()
   })
 
   it('renders when disconnected with auth failure code error', () => {

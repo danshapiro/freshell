@@ -5,7 +5,6 @@ const IPV4_REGEX = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/
 const NETSH_PATH = '/mnt/c/Windows/System32/netsh.exe'
 const POWERSHELL_PATH = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
 const DEFAULT_PORT = 3001
-const DEV_PORT = 5173
 
 export type PortProxyRule = {
   connectAddress: string
@@ -99,7 +98,7 @@ export function getExistingPortProxyRules(): Map<number, PortProxyRule> {
  * Includes dev port 5173 unless NODE_ENV is 'production'.
  * Validates port and deduplicates to avoid invalid/duplicate netsh commands.
  */
-export function getRequiredPorts(): number[] {
+export function getRequiredPorts(devPort?: number): number[] {
   const portEnv = process.env.PORT
   const serverPort = portEnv ? parseInt(portEnv, 10) : DEFAULT_PORT
 
@@ -110,9 +109,12 @@ export function getRequiredPorts(): number[] {
 
   const ports = new Set<number>([validServerPort])
 
-  // Include dev server port unless in production
-  if (process.env.NODE_ENV !== 'production') {
-    ports.add(DEV_PORT)
+  // Include dev server port unless in production.
+  // Validate range — invalid devPort could generate invalid netsh commands.
+  if (process.env.NODE_ENV !== 'production' && devPort) {
+    if (Number.isInteger(devPort) && devPort >= 1 && devPort <= 65535) {
+      ports.add(devPort)
+    }
   }
 
   return Array.from(ports)
@@ -204,7 +206,7 @@ export type SetupResult = 'success' | 'skipped' | 'failed' | 'not-wsl2'
  * - 'success': Rules were added/updated and verified
  * - 'failed': Failed to configure (UAC dismissed, error, or verification failed)
  */
-export function setupWslPortForwarding(): SetupResult {
+export function setupWslPortForwarding(devPort?: number): SetupResult {
   if (!isWSL2()) {
     return 'not-wsl2'
   }
@@ -215,7 +217,7 @@ export function setupWslPortForwarding(): SetupResult {
     return 'failed'
   }
 
-  const requiredPorts = getRequiredPorts()
+  const requiredPorts = getRequiredPorts(devPort)
   const existingRules = getExistingPortProxyRules()
 
   if (!needsPortForwardingUpdate(wslIp, requiredPorts, existingRules)) {

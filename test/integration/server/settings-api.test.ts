@@ -24,6 +24,7 @@ vi.mock('os', async () => {
 
 // Import after mocking
 import { ConfigStore, defaultSettings, type AppSettings } from '../../../server/config-store'
+import { SettingsPatchSchema } from '../../../server/settings-schema'
 
 const TEST_AUTH_TOKEN = 'test-auth-token-12345678'
 
@@ -81,12 +82,20 @@ describe('Settings API Integration', () => {
     }
 
     app.patch('/api/settings', async (req, res) => {
-      const updated = await configStore.patchSettings(normalizeSettingsPatch(req.body || {}))
+      const parsed = SettingsPatchSchema.safeParse(req.body || {})
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
+      }
+      const updated = await configStore.patchSettings(normalizeSettingsPatch(parsed.data as any))
       res.json(updated)
     })
 
     app.put('/api/settings', async (req, res) => {
-      const updated = await configStore.patchSettings(normalizeSettingsPatch(req.body || {}))
+      const parsed = SettingsPatchSchema.safeParse(req.body || {})
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
+      }
+      const updated = await configStore.patchSettings(normalizeSettingsPatch(parsed.data as any))
       res.json(updated)
     })
   })
@@ -182,6 +191,8 @@ describe('Settings API Integration', () => {
       expect(res.body.terminal).toHaveProperty('cursorBlink')
       expect(res.body.terminal).toHaveProperty('scrollback')
       expect(res.body.terminal).toHaveProperty('theme')
+      expect(res.body.terminal).toHaveProperty('osc52Clipboard')
+      expect(res.body.terminal).toHaveProperty('renderer')
       expect(res.body.safety).toHaveProperty('autoKillIdleMinutes')
       expect(res.body.safety).toHaveProperty('warnBeforeKillMinutes')
       expect(res.body.sidebar).toHaveProperty('sortMode')
@@ -270,6 +281,32 @@ describe('Settings API Integration', () => {
       expect(res.body.terminal.cursorBlink).toBe(false)
       // Other terminal settings preserved
       expect(res.body.terminal.lineHeight).toBe(defaultSettings.terminal.lineHeight)
+    })
+
+    it('persists terminal policy fields and preserves them during partial terminal patches', async () => {
+      await request(app)
+        .put('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({
+          terminal: {
+            osc52Clipboard: 'never',
+            renderer: 'canvas',
+          },
+        })
+
+      const res = await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({
+          terminal: {
+            fontSize: 18,
+          },
+        })
+
+      expect(res.status).toBe(200)
+      expect(res.body.terminal.fontSize).toBe(18)
+      expect(res.body.terminal.osc52Clipboard).toBe('never')
+      expect(res.body.terminal.renderer).toBe('canvas')
     })
 
     it('handles nested safety settings', async () => {
@@ -404,48 +441,129 @@ describe('Settings API Integration', () => {
   })
 
   describe('Invalid settings handling', () => {
-    // Note: The current server implementation does not validate settings values
-    // These tests document the actual behavior
-
-    it('accepts unknown top-level fields (passes through)', async () => {
+    it('rejects unknown top-level fields', async () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .send({ unknownField: 'value' })
 
-      // Server accepts it (no validation)
-      expect(res.status).toBe(200)
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('Invalid request')
+      expect(res.body.details).toBeDefined()
     })
 
-    it('accepts invalid theme value (no validation)', async () => {
+    it('rejects invalid theme value', async () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .send({ theme: 'invalid-theme' })
 
-      // Server accepts it (no validation in current implementation)
-      expect(res.status).toBe(200)
-      expect(res.body.theme).toBe('invalid-theme')
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('Invalid request')
     })
 
-    it('accepts non-numeric fontSize (no validation)', async () => {
+    it('rejects non-coercible fontSize', async () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .send({ terminal: { fontSize: 'not-a-number' } })
 
-      // Server accepts it (no validation in current implementation)
-      expect(res.status).toBe(200)
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('Invalid request')
     })
 
-    it('accepts negative scrollback (no validation)', async () => {
+    it('accepts negative scrollback (coerced number)', async () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .send({ terminal: { scrollback: -100 } })
 
-      // Server accepts it (no validation in current implementation)
+      // Negative numbers are valid coerced numbers - business logic can restrict range later
       expect(res.status).toBe(200)
+    })
+
+    it('rejects unknown nested terminal field', async () => {
+      const res = await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ terminal: { unknownField: true } })
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('Invalid request')
+    })
+
+    it('rejects invalid sidebar sortMode enum', async () => {
+      const res = await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ sidebar: { sortMode: 'invalid' } })
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('Invalid request')
+    })
+
+    it('rejects non-coercible fontSize object', async () => {
+      const res = await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ terminal: { fontSize: { invalid: true } } })
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('Invalid request')
+    })
+
+    it('coerces string numbers to actual numbers', async () => {
+      const res = await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ terminal: { fontSize: '18' } })
+
+      expect(res.status).toBe(200)
+      expect(res.body.terminal.fontSize).toBe(18)
+    })
+
+    it('accepts currently-used sidebar and panes fields', async () => {
+      const res = await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({
+          sidebar: { sortMode: 'recency-pinned' },
+          panes: { iconsOnTabs: false },
+        })
+
+      expect(res.status).toBe(200)
+      expect(res.body.sidebar.sortMode).toBe('recency-pinned')
+      expect(res.body.panes.iconsOnTabs).toBe(false)
+    })
+
+    it('rejects invalid panes defaultNewPane enum', async () => {
+      const res = await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ panes: { defaultNewPane: 'invalid' } })
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('Invalid request')
+    })
+
+    it('rejects invalid codingCli provider name', async () => {
+      const res = await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ codingCli: { enabledProviders: ['nonexistent'] } })
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('Invalid request')
+    })
+
+    it('validates PUT endpoint the same as PATCH', async () => {
+      const res = await request(app)
+        .put('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ unknownField: 'value' })
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('Invalid request')
     })
   })
 
@@ -558,11 +676,10 @@ describe('Settings API Integration', () => {
         .send({
           terminal: {
             fontSize: 14,
-            fontFamily: 'monospace',
             lineHeight: 1.5,
             cursorBlink: false,
             scrollback: 3000,
-            theme: 'light',
+            theme: 'one-light',
           },
         })
 
@@ -572,10 +689,11 @@ describe('Settings API Integration', () => {
         lineHeight: 1.5,
         cursorBlink: false,
         scrollback: 3000,
-        theme: 'light',
+        theme: 'one-light',
         warnExternalLinks: true,
+        osc52Clipboard: 'ask',
+        renderer: 'auto',
       })
-      expect(res.body.terminal).not.toHaveProperty('fontFamily')
     })
   })
 

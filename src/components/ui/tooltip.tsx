@@ -60,10 +60,12 @@ export function TooltipTrigger({
 export function TooltipContent({
   children,
   className,
+  side = 'top',
   sideOffset = 4,
 }: {
   children: React.ReactNode
   className?: string
+  side?: 'top' | 'bottom'
   sideOffset?: number
 }) {
   const ctx = React.useContext(TooltipContext)
@@ -76,11 +78,13 @@ export function TooltipContent({
       const rect = ctx.triggerRef.current.getBoundingClientRect()
       const contentHeight = contentRef.current?.offsetHeight || 24
       setPosition({
-        top: rect.top - contentHeight - sideOffset,
+        top: side === 'bottom'
+          ? rect.bottom + sideOffset
+          : rect.top - contentHeight - sideOffset,
         left: rect.left,
       })
     }
-  }, [ctx?.open, ctx?.triggerRef, sideOffset])
+  }, [ctx?.open, ctx?.triggerRef, side, sideOffset])
 
   if (!ctx?.open) return null
 

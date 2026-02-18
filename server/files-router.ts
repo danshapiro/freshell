@@ -1,18 +1,51 @@
-import express from 'express'
+import express, { type Request, type Response, type NextFunction } from 'express'
 import fsp from 'fs/promises'
 import path from 'path'
 import { spawn } from 'child_process'
-import { isReachableDirectory, resolveUserPath } from './path-utils.js'
+import {
+  getPathModuleForFlavor,
+  isPathAllowed,
+  isReachableDirectory,
+  normalizeUserPath,
+  toFilesystemPath,
+} from './path-utils.js'
+import { configStore } from './config-store.js'
 
 export const filesRouter = express.Router()
 
-filesRouter.get('/read', async (req, res) => {
+async function resolveUserFilesystemPath(input: string): Promise<string> {
+  const { normalizedPath, flavor } = normalizeUserPath(input)
+  return toFilesystemPath(normalizedPath, flavor)
+}
+
+/**
+ * Middleware that validates file paths against the configured allowedFilePaths sandbox.
+ * Returns 403 if the path is outside all allowed roots.
+ * When allowedFilePaths is empty/undefined, all paths are allowed (backward compatible).
+ */
+async function validatePath(req: Request, res: Response, next: NextFunction) {
+  const filePath = (req.query.path as string) || (req.query.prefix as string) || req.body?.path
+  if (!filePath) {
+    return next()
+  }
+
+  const resolved = await resolveUserFilesystemPath(filePath)
+  const settings = await configStore.getSettings()
+
+  if (!isPathAllowed(resolved, settings.allowedFilePaths)) {
+    return res.status(403).json({ error: 'Path not allowed' })
+  }
+
+  next()
+}
+
+filesRouter.get('/read', validatePath, async (req, res) => {
   const filePath = req.query.path as string
   if (!filePath) {
     return res.status(400).json({ error: 'path query parameter required' })
   }
 
-  const resolved = path.resolve(filePath)
+  const resolved = await resolveUserFilesystemPath(filePath)
 
   try {
     const stat = await fsp.stat(resolved)
@@ -34,7 +67,7 @@ filesRouter.get('/read', async (req, res) => {
   }
 })
 
-filesRouter.post('/write', async (req, res) => {
+filesRouter.post('/write', validatePath, async (req, res) => {
   const { path: filePath, content } = req.body
 
   if (!filePath) {
@@ -44,7 +77,7 @@ filesRouter.post('/write', async (req, res) => {
     return res.status(400).json({ error: 'content is required' })
   }
 
-  const resolved = path.resolve(filePath)
+  const resolved = await resolveUserFilesystemPath(filePath)
 
   try {
     // Create parent directories if needed
@@ -62,42 +95,48 @@ filesRouter.post('/write', async (req, res) => {
   }
 })
 
-filesRouter.get('/complete', async (req, res) => {
+filesRouter.get('/complete', validatePath, async (req, res) => {
   const prefix = req.query.prefix as string
   const dirsOnly = req.query.dirs === 'true' || req.query.dirs === '1'
   if (!prefix) {
     return res.status(400).json({ error: 'prefix query parameter required' })
   }
 
-  const resolved = resolveUserPath(prefix)
+  const { normalizedPath, flavor } = normalizeUserPath(prefix)
+  const pathModule = getPathModuleForFlavor(flavor)
+  const resolvedFsPath = await toFilesystemPath(normalizedPath, flavor)
 
   try {
     // Check if prefix is a directory - if so, list all files in it
-    let dir: string
+    let dirDisplayPath: string
+    let dirFsPath: string
     let basename: string
 
     try {
-      const stat = await fsp.stat(resolved)
+      const stat = await fsp.stat(resolvedFsPath)
       if (stat.isDirectory()) {
-        dir = resolved
+        dirDisplayPath = normalizedPath
+        dirFsPath = resolvedFsPath
         basename = ''
       } else {
-        dir = path.dirname(resolved)
-        basename = path.basename(resolved)
+        dirDisplayPath = pathModule.dirname(normalizedPath)
+        dirFsPath = await toFilesystemPath(dirDisplayPath, flavor)
+        basename = pathModule.basename(normalizedPath)
       }
     } catch {
       // Path doesn't exist, treat as partial path
-      dir = path.dirname(resolved)
-      basename = path.basename(resolved)
+      dirDisplayPath = pathModule.dirname(normalizedPath)
+      dirFsPath = await toFilesystemPath(dirDisplayPath, flavor)
+      basename = pathModule.basename(normalizedPath)
     }
 
-    const entries = await fsp.readdir(dir, { withFileTypes: true })
+    const entries = await fsp.readdir(dirFsPath, { withFileTypes: true })
 
     const matches = entries
       .filter((entry) => entry.name.startsWith(basename))
       .filter((entry) => !dirsOnly || entry.isDirectory())
       .map((entry) => ({
-        path: path.join(dir, entry.name),
+        path: pathModule.join(dirDisplayPath, entry.name),
         isDirectory: entry.isDirectory(),
       }))
       // Sort: directories first, then alphabetically
@@ -118,7 +157,7 @@ filesRouter.get('/complete', async (req, res) => {
   }
 })
 
-filesRouter.post('/validate-dir', async (req, res) => {
+filesRouter.post('/validate-dir', validatePath, async (req, res) => {
   const pathInput = req.body?.path
   if (!pathInput || typeof pathInput !== 'string') {
     return res.status(400).json({ error: 'path is required' })
@@ -133,13 +172,13 @@ filesRouter.post('/validate-dir', async (req, res) => {
   return res.json({ valid: ok, resolvedPath })
 })
 
-filesRouter.post('/open', async (req, res) => {
+filesRouter.post('/open', validatePath, async (req, res) => {
   const { path: filePath, reveal } = req.body || {}
   if (!filePath) {
     return res.status(400).json({ error: 'path is required' })
   }
 
-  const resolved = path.resolve(filePath)
+  const resolved = await resolveUserFilesystemPath(filePath)
 
   try {
     await fsp.stat(resolved)

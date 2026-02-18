@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { initLayout, addPane, toggleZoom } from '@/store/panesSlice'
+import { initLayout, addPane } from '@/store/panesSlice'
 import type { PaneContentInput, PaneNode } from '@/store/paneTypes'
 import PaneContainer from './PaneContainer'
 import FloatingActionButton from './FloatingActionButton'
@@ -31,29 +31,6 @@ export default function PaneLayout({ tabId, defaultContent, hidden }: PaneLayout
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dispatch, tabId, layout])
-
-  // Escape key handler: unzoom when a pane is zoomed.
-  // Only active when zoom is engaged and the tab is visible. Ignores Escape
-  // from inside terminals (xterm.js textarea) to avoid conflicting with
-  // vim/other TUI Escape usage.
-  useEffect(() => {
-    if (!zoomedPaneId || hidden) return
-
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') return
-
-      // Don't intercept Escape from terminal textareas (xterm.js input)
-      const target = e.target as HTMLElement | null
-      if (target?.closest?.('.xterm')) return
-
-      dispatch(toggleZoom({ tabId, paneId: zoomedPaneId }))
-    }
-
-    document.addEventListener('keydown', handleKeyDown)
-    return () => {
-      document.removeEventListener('keydown', handleKeyDown)
-    }
-  }, [dispatch, tabId, zoomedPaneId, hidden])
 
   const handleAddPane = useCallback(() => {
     dispatch(addPane({

@@ -44,6 +44,7 @@ describe('ConfigStore', () => {
   let tempDir: string
   let configDir: string
   let configPath: string
+  let backupConfigPath: string
 
   beforeEach(async () => {
     // Create a unique temp directory for each test
@@ -51,6 +52,7 @@ describe('ConfigStore', () => {
     mockState.homeDir = tempDir
     configDir = path.join(tempDir, '.freshell')
     configPath = path.join(configDir, 'config.json')
+    backupConfigPath = path.join(configDir, 'config.backup.json')
   })
 
   afterEach(async () => {
@@ -72,6 +74,7 @@ describe('ConfigStore', () => {
       expect(config.sessionOverrides).toEqual({})
       expect(config.terminalOverrides).toEqual({})
       expect(config.projectColors).toEqual({})
+      expect(store.getLastReadError()).toBeUndefined()
     })
 
     it('creates config file when none exists', async () => {
@@ -149,6 +152,7 @@ describe('ConfigStore', () => {
       expect(config.sessionOverrides['session-1']?.titleOverride).toBe('Custom Title')
       expect(config.terminalOverrides['term-1']?.deleted).toBe(true)
       expect(config.projectColors['/projects/foo']).toBe('#ff0000')
+      expect(store.getLastReadError()).toBeUndefined()
     })
 
     it('merges partial settings with defaults', async () => {
@@ -187,6 +191,7 @@ describe('ConfigStore', () => {
       // Should return defaults since version doesn't match
       expect(config.version).toBe(1)
       expect(config.settings).toEqual(defaultSettings)
+      expect(store.getLastReadError()).toBe('VERSION_MISMATCH')
     })
 
     it('returns defaults for malformed JSON', async () => {
@@ -198,6 +203,7 @@ describe('ConfigStore', () => {
 
       expect(config.version).toBe(1)
       expect(config.settings).toEqual(defaultSettings)
+      expect(store.getLastReadError()).toBe('PARSE_ERROR')
     })
 
     it('uses cached value on subsequent calls', async () => {
@@ -332,6 +338,77 @@ describe('ConfigStore', () => {
       expect(attempts).toBeGreaterThan(1)
 
       renameSpy.mockRestore()
+    })
+
+    it('retries rename when atomic write hits ENOENT', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      const originalRename = fsp.rename.bind(fsp)
+      let attempts = 0
+      const renameSpy = vi.spyOn(fsp, 'rename').mockImplementation(async (...args) => {
+        attempts += 1
+        if (attempts === 1) {
+          const err = new Error('ENOENT: no such file or directory') as NodeJS.ErrnoException
+          err.code = 'ENOENT'
+          throw err
+        }
+        return originalRename(...(args as Parameters<typeof fsp.rename>))
+      })
+
+      const config: UserConfig = {
+        version: 1,
+        settings: { ...defaultSettings, theme: 'dark' },
+        sessionOverrides: {},
+        terminalOverrides: {},
+        projectColors: {},
+      }
+
+      await store.save(config)
+      expect(attempts).toBeGreaterThan(1)
+
+      renameSpy.mockRestore()
+    })
+  })
+
+  describe('config backup behavior', () => {
+    it('writes backup file after config save', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      await store.patchSettings({ theme: 'dark' })
+
+      const backupExists = await fsp
+        .access(backupConfigPath)
+        .then(() => true)
+        .catch(() => false)
+      expect(backupExists).toBe(true)
+
+      const raw = await fsp.readFile(backupConfigPath, 'utf-8')
+      const parsed = JSON.parse(raw)
+      expect(parsed.settings.theme).toBe('dark')
+    })
+
+    it('does not fail config save when backup write fails', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      await fsp.rm(backupConfigPath, { recursive: true, force: true })
+      await fsp.mkdir(backupConfigPath, { recursive: true })
+
+      await expect(store.patchSettings({ theme: 'light' })).resolves.toMatchObject({ theme: 'light' })
+
+      const raw = await fsp.readFile(configPath, 'utf-8')
+      const parsed = JSON.parse(raw)
+      expect(parsed.settings.theme).toBe('light')
+    })
+
+    it('reports backup existence correctly', async () => {
+      const store = new ConfigStore()
+      expect(await store.backupExists()).toBe(false)
+
+      await store.load()
+      expect(await store.backupExists()).toBe(true)
     })
   })
 
@@ -628,6 +705,80 @@ describe('ConfigStore', () => {
       })
 
       expect(updated.terminal.scrollback).toBe(10000)
+    })
+  })
+
+  describe('freshclaude defaults', () => {
+    it('patchSettings merges freshclaude key', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      const updated = await store.patchSettings({
+        freshclaude: { defaultModel: 'claude-sonnet-4-5-20250929' },
+      })
+
+      expect(updated.freshclaude?.defaultModel).toBe('claude-sonnet-4-5-20250929')
+    })
+
+    it('patchSettings deep-merges freshclaude without clobbering other keys', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      await store.patchSettings({
+        freshclaude: { defaultModel: 'claude-opus-4-6', defaultEffort: 'high' },
+      })
+      const updated = await store.patchSettings({
+        freshclaude: { defaultPermissionMode: 'default' },
+      })
+
+      expect(updated.freshclaude?.defaultModel).toBe('claude-opus-4-6')
+      expect(updated.freshclaude?.defaultPermissionMode).toBe('default')
+      expect(updated.freshclaude?.defaultEffort).toBe('high')
+    })
+
+    it('defaultSettings includes empty freshclaude object', () => {
+      expect(defaultSettings.freshclaude).toEqual({})
+    })
+  })
+
+  describe('network settings', () => {
+    it('should include network defaults with host 127.0.0.1 and configured false', async () => {
+      const store = new ConfigStore()
+      const settings = await store.getSettings()
+      expect(settings.network).toEqual({
+        host: '127.0.0.1',
+        configured: false,
+      })
+    })
+
+    it('should persist network settings through patch', async () => {
+      const store = new ConfigStore()
+      await store.patchSettings({
+        network: {
+          host: '0.0.0.0',
+          configured: true,
+        },
+      })
+      const settings = await store.getSettings()
+      expect(settings.network).toEqual({
+        host: '0.0.0.0',
+        configured: true,
+      })
+    })
+
+    it('should merge partial network settings with existing values', async () => {
+      const store = new ConfigStore()
+      // First: set all network fields explicitly
+      await store.patchSettings({
+        network: { host: '0.0.0.0', configured: true },
+      })
+      // Second: patch ONLY host — configured should be preserved
+      await store.patchSettings({
+        network: { host: '127.0.0.1' },
+      } as any)
+      const settings = await store.getSettings()
+      expect(settings.network.host).toBe('127.0.0.1')
+      expect(settings.network.configured).toBe(true)
     })
   })
 
