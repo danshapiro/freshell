@@ -43,6 +43,7 @@ describe('NetworkManager', () => {
   let savedAllowedOrigins: string | undefined
   let savedExtraAllowedOrigins: string | undefined
   let savedAuthToken: string | undefined
+  let savedHost: string | undefined
 
   beforeEach(() => {
     server = http.createServer()
@@ -50,7 +51,10 @@ describe('NetworkManager', () => {
     savedAllowedOrigins = process.env.ALLOWED_ORIGINS
     savedExtraAllowedOrigins = process.env.EXTRA_ALLOWED_ORIGINS
     savedAuthToken = process.env.AUTH_TOKEN
+    savedHost = process.env.HOST
+    delete process.env.ALLOWED_ORIGINS
     delete process.env.EXTRA_ALLOWED_ORIGINS
+    delete process.env.HOST
   })
 
   afterEach(async () => {
@@ -70,6 +74,11 @@ describe('NetworkManager', () => {
       process.env.AUTH_TOKEN = savedAuthToken
     } else {
       delete process.env.AUTH_TOKEN
+    }
+    if (savedHost !== undefined) {
+      process.env.HOST = savedHost
+    } else {
+      delete process.env.HOST
     }
   })
 
