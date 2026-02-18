@@ -6,6 +6,17 @@ const GITHUB_RELEASES_URL = 'https://api.github.com/repos/danshapiro/freshell/re
 
 /** Number of parts in a semantic version (major.minor.patch) */
 const SEMVER_PARTS = 3
+const MAJOR_INDEX = 0
+const MINOR_INDEX = 1
+
+function parseSemverParts(version: string): number[] {
+  const parsePartSafe = (part: string | undefined): number => {
+    const num = Number(part)
+    return Number.isNaN(num) ? 0 : num
+  }
+
+  return version.split('.').map(parsePartSafe)
+}
 
 /** Zod schema for validating GitHub release API response */
 export const GitHubReleaseSchema = z.object({
@@ -31,13 +42,8 @@ export function parseVersion(version: string): string {
  * - Malformed versions are handled gracefully by treating invalid parts as 0
  */
 export function isNewerVersion(current: string, remote: string): boolean {
-  const parsePartSafe = (part: string | undefined): number => {
-    const num = Number(part)
-    return Number.isNaN(num) ? 0 : num
-  }
-
-  const currentParts = current.split('.').map(parsePartSafe)
-  const remoteParts = remote.split('.').map(parsePartSafe)
+  const currentParts = parseSemverParts(current)
+  const remoteParts = parseSemverParts(remote)
 
   for (let i = 0; i < SEMVER_PARTS; i++) {
     const c = currentParts[i] ?? 0
@@ -47,6 +53,24 @@ export function isNewerVersion(current: string, remote: string): boolean {
   }
 
   return false
+}
+
+/**
+ * Returns true only when remote is at least a minor-version bump.
+ * Patch-only increments (x.y.z -> x.y.z+1) are intentionally ignored.
+ */
+export function isMinorOrMajorNewer(current: string, remote: string): boolean {
+  const currentParts = parseSemverParts(current)
+  const remoteParts = parseSemverParts(remote)
+
+  const currentMajor = currentParts[MAJOR_INDEX] ?? 0
+  const remoteMajor = remoteParts[MAJOR_INDEX] ?? 0
+  if (remoteMajor > currentMajor) return true
+  if (remoteMajor < currentMajor) return false
+
+  const currentMinor = currentParts[MINOR_INDEX] ?? 0
+  const remoteMinor = remoteParts[MINOR_INDEX] ?? 0
+  return remoteMinor > currentMinor
 }
 
 export async function checkForUpdate(currentVersion: string): Promise<UpdateCheckResult> {
@@ -85,7 +109,7 @@ export async function checkForUpdate(currentVersion: string): Promise<UpdateChec
     const latestVersion = parseVersion(release.tag_name)
 
     return {
-      updateAvailable: isNewerVersion(currentVersion, latestVersion),
+      updateAvailable: isMinorOrMajorNewer(currentVersion, latestVersion),
       currentVersion,
       latestVersion,
       releaseUrl: release.html_url,
