@@ -55,6 +55,10 @@ export const defaultSettings: AppSettings = {
       codex: {},
     },
   },
+  activityPanel: {
+    defaultOpen: false,
+    width: 320,
+  },
   freshclaude: {},
   network: {
     host: '127.0.0.1' as const,
@@ -104,6 +108,7 @@ export function mergeSettings(base: AppSettings, patch: DeepPartial<AppSettings>
         ...(patch.codingCli?.providers || {}),
       },
     },
+    activityPanel: { ...base.activityPanel, ...(patch.activityPanel || {}) },
     freshclaude: { ...base.freshclaude, ...(patch.freshclaude || {}) },
     network: { ...base.network, ...(patch.network || {}) },
   }

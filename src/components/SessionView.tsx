@@ -26,7 +26,10 @@ export default function SessionView({ sessionId, hidden }: SessionViewProps) {
     ws.connect().catch(() => {})
     const unsub = ws.onMessage((msg) => {
       if (msg.type === 'codingcli.event' && msg.sessionId === sessionId) {
-        dispatch(addCodingCliEvent({ sessionId, event: msg.event as NormalizedEvent }))
+        const event = msg.event as NormalizedEvent
+        dispatch(addCodingCliEvent({ sessionId, event }))
+        // Activity panel fan-out is handled globally by handleSdkMessage
+        // in sdk-message-handler.ts — no need to dispatch here.
       }
       if (msg.type === 'codingcli.exit' && msg.sessionId === sessionId) {
         dispatch(

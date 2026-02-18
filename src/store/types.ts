@@ -166,6 +166,10 @@ export interface AppSettings {
     defaultPermissionMode?: string
     defaultEffort?: 'low' | 'medium' | 'high' | 'max'
   }
+  activityPanel: {
+    defaultOpen: boolean
+    width: number
+  }
   network: {
     host: '127.0.0.1' | '0.0.0.0'
     configured: boolean

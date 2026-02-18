@@ -155,6 +155,7 @@ describe('settingsSlice', () => {
           },
         },
         freshclaude: {},
+        activityPanel: defaultSettings.activityPanel,
       })
     })
 

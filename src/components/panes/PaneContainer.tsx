@@ -29,6 +29,8 @@ import { clearPendingCreate, removeSession } from '@/store/claudeChatSlice'
 import { cancelCreate } from '@/lib/sdk-message-handler'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
+import { togglePanel } from '@/store/activityPanelSlice'
+import ActivityPanel from '@/components/activity-panel/ActivityPanel'
 
 // Stable empty object to avoid selector memoization issues
 const EMPTY_PANE_TITLES: Record<string, string> = {}
@@ -124,6 +126,9 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const snapThreshold = useAppSelector((s) => s.settings?.settings?.panes?.snapThreshold ?? 2)
   const sdkPendingCreates = useAppSelector(
     (s) => s.claudeChat?.pendingCreates ?? EMPTY_PENDING_CREATES
+  )
+  const activityPanelVisibility = useAppSelector(
+    (s) => s.activityPanel?.visibility ?? {}
   )
 
   // Drag state for snapping: track the original size and accumulated delta
@@ -327,6 +332,42 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
 
     const needsAttention = tabAttentionStyle !== 'none' && !!attentionByPane[node.id]
 
+    // Activity panel: only for coding CLI terminal panes (not shell, not browser/editor)
+    const isCodingCliPane =
+      node.content.kind === 'terminal' && node.content.mode !== 'shell'
+    const codingCliSessionId = isCodingCliPane
+      ? (tab?.codingCliSessionId || paneRuntimeMeta?.sessionId)
+      : undefined
+    const activityPanelOpen = codingCliSessionId
+      ? !!activityPanelVisibility[codingCliSessionId]
+      : false
+
+    const handleToggleActivityPanel = codingCliSessionId
+      ? () => dispatch(togglePanel({ sessionId: codingCliSessionId }))
+      : undefined
+
+    const handleApprovePermission = codingCliSessionId
+      ? (requestId: string) => {
+          ws.send({ type: 'codingcli.approval', sessionId: codingCliSessionId, requestId, approved: true })
+        }
+      : undefined
+
+    const handleDenyPermission = codingCliSessionId
+      ? (requestId: string) => {
+          ws.send({ type: 'codingcli.approval', sessionId: codingCliSessionId, requestId, approved: false })
+        }
+      : undefined
+
+    const activityPanelContent = (isCodingCliPane && codingCliSessionId) ? (
+      <ActivityPanel
+        sessionId={codingCliSessionId}
+        isOpen={activityPanelOpen}
+        onClose={() => dispatch(togglePanel({ sessionId: codingCliSessionId }))}
+        onApprovePermission={handleApprovePermission}
+        onDenyPermission={handleDenyPermission}
+      />
+    ) : undefined
+
     return (
       <Pane
         tabId={tabId}
@@ -350,6 +391,9 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         onRenameKeyDown={isRenaming ? handleRenameKeyDown : undefined}
         onSearch={node.content.kind === 'terminal' ? () => getTerminalActions(node.id)?.openSearch() : undefined}
         onDoubleClickTitle={() => startRename(node.id, paneTitle)}
+        onToggleActivityPanel={handleToggleActivityPanel}
+        activityPanelOpen={activityPanelOpen}
+        activityPanelContent={activityPanelContent}
       >
         {renderContent(tabId, node.id, node.content, isOnlyPane, hidden)}
       </Pane>

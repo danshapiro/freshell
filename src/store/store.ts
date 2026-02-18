@@ -17,6 +17,7 @@ import terminalMetaReducer from './terminalMetaSlice'
 import claudeChatReducer from './claudeChatSlice'
 import { networkReducer } from './networkSlice'
 import tabRegistryReducer from './tabRegistrySlice'
+import activityPanelReducer from './activityPanelSlice'
 import { perfMiddleware } from './perfMiddleware'
 import { persistMiddleware } from './persistMiddleware'
 import { sessionActivityPersistMiddleware } from './sessionActivityPersistence'
@@ -39,6 +40,7 @@ export const store = configureStore({
     claudeChat: claudeChatReducer,
     network: networkReducer,
     tabRegistry: tabRegistryReducer,
+    activityPanel: activityPanelReducer,
   },
   middleware: (getDefault) =>
     getDefault({

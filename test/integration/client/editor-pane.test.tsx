@@ -94,6 +94,9 @@ vi.mock('lucide-react', () => ({
   Search: ({ className }: { className?: string }) => (
     <svg data-testid="search-icon" className={className} />
   ),
+  PanelRight: ({ className }: { className?: string }) => (
+    <svg data-testid="panel-right-icon" className={className} />
+  ),
 }))
 
 // Mock TerminalView component to avoid xterm.js dependencies

@@ -1,5 +1,5 @@
 import { useRef, useEffect } from 'react'
-import { X, Maximize2, Minimize2, Search } from 'lucide-react'
+import { X, Maximize2, Minimize2, Search, PanelRight } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { TerminalStatus } from '@/store/types'
 import type { PaneContent } from '@/store/paneTypes'
@@ -32,6 +32,8 @@ interface PaneHeaderProps {
   onRenameKeyDown?: (e: React.KeyboardEvent) => void
   onDoubleClick?: () => void
   onSearch?: () => void
+  onToggleActivityPanel?: () => void
+  activityPanelOpen?: boolean
 }
 
 export default function PaneHeader({
@@ -52,6 +54,8 @@ export default function PaneHeader({
   onRenameKeyDown,
   onDoubleClick,
   onSearch,
+  onToggleActivityPanel,
+  activityPanelOpen,
 }: PaneHeaderProps) {
   const inputRef = useRef<HTMLInputElement>(null)
 
@@ -116,6 +120,23 @@ export default function PaneHeader({
             aria-label="Search in terminal"
           >
             <Search className="h-[18px] w-[18px] sm:h-3 sm:w-3" />
+          </button>
+        )}
+
+        {onToggleActivityPanel && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation()
+              onToggleActivityPanel()
+            }}
+            className={cn(
+              'inline-flex h-6 w-6 items-center justify-center rounded transition-opacity sm:h-4 sm:w-4',
+              activityPanelOpen ? 'opacity-100 text-blue-500' : 'opacity-60 hover:opacity-100',
+            )}
+            title={activityPanelOpen ? 'Hide activity panel' : 'Show activity panel'}
+            aria-label={activityPanelOpen ? 'Hide activity panel' : 'Show activity panel'}
+          >
+            <PanelRight className="h-[18px] w-[18px] sm:h-3 sm:w-3" />
           </button>
         )}
 
