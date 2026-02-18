@@ -608,6 +608,10 @@ describe('buildSpawnSpec Unix paths', () => {
     vi.resetAllMocks()
     // Reset env to a clean state before each test
     process.env = { ...originalEnv }
+    // Clear WSL-related env vars so mocking platform to 'linux' doesn't trigger WSL detection
+    delete process.env.WSL_DISTRO_NAME
+    delete process.env.WSL_INTEROP
+    delete process.env.WSLENV
     // Default: all shells exist (so getSystemShell() works as expected)
     vi.mocked(fs.existsSync).mockReturnValue(true)
   })
@@ -1172,6 +1176,10 @@ describe('buildSpawnSpec WSL paths', () => {
   beforeEach(() => {
     vi.resetAllMocks()
     process.env = { ...originalEnv }
+    // Clear WSL-related env vars so mocking platform to 'linux' doesn't trigger WSL detection
+    delete process.env.WSL_DISTRO_NAME
+    delete process.env.WSL_INTEROP
+    delete process.env.WSLENV
     vi.mocked(fs.existsSync).mockReturnValue(true)
   })
 
@@ -2008,6 +2016,10 @@ describe('buildSpawnSpec Unix paths', () => {
     vi.resetAllMocks()
     // Reset env to a clean state before each test
     process.env = { ...originalEnv }
+    // Clear WSL-related env vars so mocking platform to 'linux' doesn't trigger WSL detection
+    delete process.env.WSL_DISTRO_NAME
+    delete process.env.WSL_INTEROP
+    delete process.env.WSLENV
     // Default: all shells exist (so getSystemShell() works as expected)
     vi.mocked(fs.existsSync).mockReturnValue(true)
   })
@@ -2550,6 +2562,10 @@ describe('buildSpawnSpec Unix paths', () => {
     beforeEach(() => {
       vi.resetAllMocks()
       process.env = { ...originalEnv }
+      // Clear WSL-related env vars so mocking platform to 'linux' doesn't trigger WSL detection
+      delete process.env.WSL_DISTRO_NAME
+      delete process.env.WSL_INTEROP
+      delete process.env.WSLENV
       vi.mocked(fs.existsSync).mockReturnValue(true)
     })
 

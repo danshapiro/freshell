@@ -287,6 +287,7 @@ describe('Files API Integration', () => {
     it('supports Windows drive prefixes when running in WSL', async () => {
       const originalWslDistro = process.env.WSL_DISTRO_NAME
       const originalWslSys32 = process.env.WSL_WINDOWS_SYS32
+      const originalPlatform = process.platform
       const fakeSys32 = path.join(tempDir, 'wsl-mount', 'c', 'Windows', 'System32')
       const mappedDir = path.join(tempDir, 'wsl-mount', 'd', 'users', 'words with spaces')
       const mappedMatch = path.join(mappedDir, 'alpha')
@@ -294,6 +295,7 @@ describe('Files API Integration', () => {
       try {
         process.env.WSL_DISTRO_NAME = 'Ubuntu'
         process.env.WSL_WINDOWS_SYS32 = fakeSys32
+        Object.defineProperty(process, 'platform', { value: 'linux', configurable: true })
         await fsp.mkdir(fakeSys32, { recursive: true })
         await fsp.mkdir(mappedMatch, { recursive: true })
 
@@ -306,6 +308,7 @@ describe('Files API Integration', () => {
         const paths = res.body.suggestions.map((s: any) => s.path)
         expect(paths).toContain(String.raw`D:\users\words with spaces\alpha`)
       } finally {
+        Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true })
         if (originalWslDistro === undefined) {
           delete process.env.WSL_DISTRO_NAME
         } else {
@@ -373,11 +376,13 @@ describe('Files API Integration', () => {
     it('validates Windows drive paths when running in WSL', async () => {
       const originalWslDistro = process.env.WSL_DISTRO_NAME
       const originalWslSys32 = process.env.WSL_WINDOWS_SYS32
+      const originalPlatform = process.platform
       const fakeSys32 = path.join(tempDir, 'wsl-mount', 'c', 'Windows', 'System32')
       const mappedDir = path.join(tempDir, 'wsl-mount', 'd', 'users', 'words with spaces')
 
       process.env.WSL_DISTRO_NAME = 'Ubuntu'
       process.env.WSL_WINDOWS_SYS32 = fakeSys32
+      Object.defineProperty(process, 'platform', { value: 'linux', configurable: true })
       await fsp.mkdir(fakeSys32, { recursive: true })
       await fsp.mkdir(mappedDir, { recursive: true })
 
@@ -391,6 +396,7 @@ describe('Files API Integration', () => {
         expect(res.body.valid).toBe(true)
         expect(res.body.resolvedPath).toBe(String.raw`D:\users\words with spaces`)
       } finally {
+        Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true })
         if (originalWslDistro === undefined) {
           delete process.env.WSL_DISTRO_NAME
         } else {

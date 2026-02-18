@@ -368,7 +368,8 @@ function resolveUnixShellCwd(cwd: string | undefined): string | undefined {
 
   // In WSL, Linux processes need POSIX paths. Convert Windows-style cwd inputs
   // (e.g. D:\users\dan) to WSL mount paths before passing cwd to node-pty.
-  if (isWsl()) {
+  // Skip conversion for paths already in Linux/POSIX format.
+  if (isWsl() && !isLinuxPath(candidate)) {
     const converted = convertWindowsPathToWslPath(candidate)
     if (converted) {
       return converted
