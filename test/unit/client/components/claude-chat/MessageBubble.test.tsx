@@ -68,6 +68,63 @@ describe('MessageBubble', () => {
     )
     expect(screen.getByText('claude-sonnet-4-5')).toBeInTheDocument()
   })
+
+  describe('XSS sanitization', () => {
+    const SCRIPT_PAYLOAD = '<script>alert("xss")</script>'
+    const IMG_PAYLOAD = '<img src=x onerror=alert(1)>'
+
+    it('escapes script tags in user text messages', () => {
+      const { container } = render(
+        <MessageBubble
+          role="user"
+          content={[{ type: 'text', text: SCRIPT_PAYLOAD }]}
+        />
+      )
+      expect(screen.getByText(SCRIPT_PAYLOAD)).toBeInTheDocument()
+      expect(container.querySelector('script')).toBeNull()
+    })
+
+    it('sanitizes HTML in assistant markdown messages', () => {
+      const { container } = render(
+        <MessageBubble
+          role="assistant"
+          content={[{ type: 'text', text: SCRIPT_PAYLOAD }]}
+        />
+      )
+      // react-markdown strips script tags entirely
+      expect(container.querySelector('script')).toBeNull()
+    })
+
+    it('sanitizes img onerror in assistant markdown messages', () => {
+      const { container } = render(
+        <MessageBubble
+          role="assistant"
+          content={[{ type: 'text', text: IMG_PAYLOAD }]}
+        />
+      )
+      expect(container.querySelector('img[onerror]')).toBeNull()
+    })
+
+    it('escapes XSS in thinking blocks', () => {
+      const { container } = render(
+        <MessageBubble
+          role="assistant"
+          content={[{ type: 'thinking', thinking: SCRIPT_PAYLOAD }]}
+        />
+      )
+      expect(container.querySelector('script')).toBeNull()
+    })
+
+    it('escapes XSS in tool result content', () => {
+      const { container } = render(
+        <MessageBubble
+          role="assistant"
+          content={[{ type: 'tool_result', tool_use_id: 't1', content: SCRIPT_PAYLOAD }]}
+        />
+      )
+      expect(container.querySelector('script')).toBeNull()
+    })
+  })
 })
 
 describe('MessageBubble display toggles', () => {

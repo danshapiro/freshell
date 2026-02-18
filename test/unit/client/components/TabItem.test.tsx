@@ -182,4 +182,24 @@ describe('TabItem', () => {
     const el = getTabElement()
     expect(el?.className).not.toContain('mt-1')
   })
+
+  describe('XSS sanitization', () => {
+    const XSS_PAYLOADS = [
+      '<script>alert("xss")</script>',
+      '<img src=x onerror=alert(1)>',
+      '"><svg onload=alert(1)>',
+    ]
+
+    it.each(XSS_PAYLOADS)('escapes XSS payload in tab title: %s', (payload) => {
+      const { container } = render(
+        <TabItem {...defaultProps} tab={createTab({ title: payload })} />
+      )
+      // Payload should appear as visible escaped text, not parsed HTML
+      expect(screen.getByText(payload)).toBeInTheDocument()
+      // No script or img elements should be injected
+      expect(container.querySelector('script')).toBeNull()
+      expect(container.querySelector('img[onerror]')).toBeNull()
+      expect(container.querySelector('svg[onload]')).toBeNull()
+    })
+  })
 })

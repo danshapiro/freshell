@@ -76,13 +76,19 @@ describe('detectAvailableClis', () => {
   })
 
   it('uses "which" as the finder command on non-Windows', async () => {
-    stubExecFile(() => true)
-    await detectAvailableClis()
-    expect(mockExecFile).toHaveBeenCalledWith(
-      'which',
-      expect.any(Array),
-      expect.objectContaining({ timeout: 3000 }),
-      expect.any(Function)
-    )
+    const originalPlatform = process.platform
+    Object.defineProperty(process, 'platform', { value: 'linux', configurable: true })
+    try {
+      stubExecFile(() => true)
+      await detectAvailableClis()
+      expect(mockExecFile).toHaveBeenCalledWith(
+        'which',
+        expect.any(Array),
+        expect.objectContaining({ timeout: 3000 }),
+        expect.any(Function)
+      )
+    } finally {
+      Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true })
+    }
   })
 })

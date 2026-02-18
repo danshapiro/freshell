@@ -2,6 +2,15 @@ import { describe, it, expect, afterEach, vi } from 'vitest'
 import path from 'path'
 import os from 'os'
 import fsp from 'fs/promises'
+
+vi.mock('../../../../server/coding-cli/utils', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../../server/coding-cli/utils')>()
+  return {
+    ...actual,
+    resolveGitCheckoutRoot: vi.fn(async (cwd: string) => cwd),
+  }
+})
+
 import { claudeProvider, parseSessionContent } from '../../../../server/coding-cli/providers/claude'
 import { getClaudeHome } from '../../../../server/claude-home'
 import { looksLikePath } from '../../../../server/coding-cli/utils'

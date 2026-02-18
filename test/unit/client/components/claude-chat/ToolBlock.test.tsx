@@ -125,4 +125,47 @@ describe('ToolBlock', () => {
       expect(outputEl).not.toBeNull()
     })
   })
+
+  describe('XSS sanitization', () => {
+    const SCRIPT_PAYLOAD = '<script>alert("xss")</script>'
+
+    it('escapes XSS in tool name', () => {
+      const { container } = render(
+        <ToolBlock
+          name={SCRIPT_PAYLOAD}
+          status="running"
+        />
+      )
+      // The tool name renders as "{name}:" so use substring match
+      expect(screen.getByText(SCRIPT_PAYLOAD, { exact: false })).toBeInTheDocument()
+      expect(container.querySelector('script')).toBeNull()
+    })
+
+    it('escapes XSS in tool output', async () => {
+      const user = userEvent.setup()
+      const { container } = render(
+        <ToolBlock
+          name="Bash"
+          input={{ command: 'echo test' }}
+          output={SCRIPT_PAYLOAD}
+          status="complete"
+        />
+      )
+      // Expand to show output
+      await user.click(screen.getByRole('button', { name: 'Bash tool call' }))
+      expect(screen.getByText(SCRIPT_PAYLOAD)).toBeInTheDocument()
+      expect(container.querySelector('script')).toBeNull()
+    })
+
+    it('escapes XSS in command preview', () => {
+      const { container } = render(
+        <ToolBlock
+          name="Bash"
+          input={{ command: SCRIPT_PAYLOAD }}
+          status="running"
+        />
+      )
+      expect(container.querySelector('script')).toBeNull()
+    })
+  })
 })
