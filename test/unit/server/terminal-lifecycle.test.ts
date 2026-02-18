@@ -234,6 +234,32 @@ describe('TerminalRegistry Lifecycle', () => {
       expect(outputs[0].data).toBe('hello mobile')
     })
 
+    it('batches terminal.output frames for non-mobile clients under send backpressure', () => {
+      const term = registry.create({ mode: 'shell' })
+      const pty = mockPtyProcess.instances[0]
+      const client = createMockWebSocket()
+      let buffered = 1024
+      Object.defineProperty(client, 'bufferedAmount', {
+        configurable: true,
+        get: () => buffered,
+      })
+
+      registry.attach(term.terminalId, client)
+
+      pty._emitData('hello ')
+      pty._emitData('desktop')
+
+      expect(client.send).not.toHaveBeenCalled()
+
+      buffered = 0
+      vi.advanceTimersByTime(50)
+
+      const sent = (client.send as Mock).mock.calls.map((call) => JSON.parse(call[0]))
+      const outputs = sent.filter((m) => m.type === 'terminal.output')
+      expect(outputs).toHaveLength(1)
+      expect(outputs[0].data).toBe('hello desktop')
+    })
+
     it('tracks dropped output metrics for flushed mobile batches', () => {
       setPerfLoggingEnabled(true, 'test')
       try {

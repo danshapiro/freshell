@@ -20,8 +20,8 @@ const MAX_SCROLLBACK_CHARS = 2 * 1024 * 1024
 const APPROX_CHARS_PER_LINE = 200
 const MAX_TERMINALS = Number(process.env.MAX_TERMINALS || 50)
 const DEFAULT_MAX_PENDING_SNAPSHOT_CHARS = 512 * 1024
-const MOBILE_OUTPUT_FLUSH_MS = Number(process.env.MOBILE_OUTPUT_FLUSH_MS || 40)
-const MAX_MOBILE_OUTPUT_BUFFER_CHARS = Number(process.env.MAX_MOBILE_OUTPUT_BUFFER_CHARS || 256 * 1024)
+const OUTPUT_FLUSH_MS = Number(process.env.OUTPUT_FLUSH_MS || process.env.MOBILE_OUTPUT_FLUSH_MS || 40)
+const MAX_OUTPUT_BUFFER_CHARS = Number(process.env.MAX_OUTPUT_BUFFER_CHARS || process.env.MAX_MOBILE_OUTPUT_BUFFER_CHARS || 256 * 1024)
 const perfConfig = getPerfConfig()
 
 // TerminalMode includes 'shell' for regular terminals, plus coding CLI providers.
@@ -155,7 +155,7 @@ type PendingSnapshotQueue = {
   queuedChars: number
 }
 
-type PendingMobileOutput = {
+type PendingOutput = {
   timer: NodeJS.Timeout | null
   chunksByTerminal: Map<string, string[]>
   perfByTerminal: Map<string, TerminalRecord['perf'] | undefined>
@@ -689,7 +689,7 @@ export class TerminalRegistry extends EventEmitter {
   private maxExitedTerminals: number
   private scrollbackMaxChars: number
   private maxPendingSnapshotChars: number
-  private mobileOutputBuffers = new Map<WebSocket, PendingMobileOutput>()
+  private outputBuffers = new Map<WebSocket, PendingOutput>()
 
   constructor(settings?: AppSettings, maxTerminals?: number, maxExitedTerminals?: number) {
     super()
@@ -999,7 +999,7 @@ export class TerminalRegistry extends EventEmitter {
       record.lastActivityAt = now
       record.exitedAt = now
       for (const client of record.clients) {
-        this.flushMobileOutput(client)
+        this.flushOutputBuffer(client)
         this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: e.exitCode }, { terminalId, perf: record.perf })
       }
       record.clients.clear()
@@ -1046,8 +1046,8 @@ export class TerminalRegistry extends EventEmitter {
   detach(terminalId: string, client: WebSocket): boolean {
     const term = this.terminals.get(terminalId)
     if (!term) return false
-    this.flushMobileOutput(client)
-    this.clearMobileOutput(client)
+    this.flushOutputBuffer(client)
+    this.clearOutputBuffer(client)
     term.clients.delete(client)
     term.pendingSnapshotClients.delete(client)
     return true
@@ -1101,7 +1101,7 @@ export class TerminalRegistry extends EventEmitter {
     term.lastActivityAt = now
     term.exitedAt = now
     for (const client of term.clients) {
-      this.flushMobileOutput(client)
+      this.flushOutputBuffer(client)
       this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: term.exitCode })
     }
     term.clients.clear()
@@ -1160,18 +1160,23 @@ export class TerminalRegistry extends EventEmitter {
     return (client as any).isMobileClient === true
   }
 
-  private clearMobileOutput(client: WebSocket): void {
-    const pending = this.mobileOutputBuffers.get(client)
+  private hasClientBacklog(client: WebSocket): boolean {
+    const buffered = (client as any).bufferedAmount as number | undefined
+    return typeof buffered === 'number' && buffered > 0
+  }
+
+  private clearOutputBuffer(client: WebSocket): void {
+    const pending = this.outputBuffers.get(client)
     if (!pending) return
     if (pending.timer) {
       clearTimeout(pending.timer)
       pending.timer = null
     }
-    this.mobileOutputBuffers.delete(client)
+    this.outputBuffers.delete(client)
   }
 
-  private flushMobileOutput(client: WebSocket): void {
-    const pending = this.mobileOutputBuffers.get(client)
+  private flushOutputBuffer(client: WebSocket): void {
+    const pending = this.outputBuffers.get(client)
     if (!pending) return
 
     if (pending.timer) {
@@ -1180,7 +1185,7 @@ export class TerminalRegistry extends EventEmitter {
     }
 
     if (pending.queuedChars <= 0) {
-      this.mobileOutputBuffers.delete(client)
+      this.outputBuffers.delete(client)
       return
     }
 
@@ -1190,16 +1195,27 @@ export class TerminalRegistry extends EventEmitter {
       const perf = pending.perfByTerminal.get(terminalId)
       this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf })
     }
-    this.mobileOutputBuffers.delete(client)
+    this.outputBuffers.delete(client)
   }
 
   private sendTerminalOutput(client: WebSocket, terminalId: string, data: string, perf?: TerminalRecord['perf']): void {
-    if (!this.isMobileClient(client)) {
+    // Preserve immediate hard-stop behavior when the socket buffer is already over limit.
+    // This avoids queueing additional data for clients that need explicit resync.
+    const buffered = (client as any).bufferedAmount as number | undefined
+    if (typeof buffered === 'number' && buffered > MAX_WS_BUFFERED_AMOUNT) {
       this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf })
       return
     }
 
-    let pending = this.mobileOutputBuffers.get(client)
+    const pendingExisting = this.outputBuffers.get(client)
+    const shouldBatch = this.isMobileClient(client) || !!pendingExisting || this.hasClientBacklog(client)
+
+    if (!shouldBatch) {
+      this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf })
+      return
+    }
+
+    let pending = pendingExisting
     if (!pending) {
       pending = {
         timer: null,
@@ -1207,12 +1223,12 @@ export class TerminalRegistry extends EventEmitter {
         perfByTerminal: new Map(),
         queuedChars: 0,
       }
-      this.mobileOutputBuffers.set(client, pending)
+      this.outputBuffers.set(client, pending)
     }
 
     const nextSize = pending.queuedChars + data.length
-    if (nextSize > MAX_MOBILE_OUTPUT_BUFFER_CHARS) {
-      this.flushMobileOutput(client)
+    if (nextSize > MAX_OUTPUT_BUFFER_CHARS) {
+      this.flushOutputBuffer(client)
       this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf })
       return
     }
@@ -1225,8 +1241,8 @@ export class TerminalRegistry extends EventEmitter {
 
     if (!pending.timer) {
       pending.timer = setTimeout(() => {
-        this.flushMobileOutput(client)
-      }, MOBILE_OUTPUT_FLUSH_MS)
+        this.flushOutputBuffer(client)
+      }, OUTPUT_FLUSH_MS)
     }
   }
 
