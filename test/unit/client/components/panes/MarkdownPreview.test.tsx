@@ -41,4 +41,38 @@ const x = 1
 
     expect(screen.getByRole('table')).toBeInTheDocument()
   })
+
+  describe('XSS sanitization', () => {
+    it('strips script tags from markdown content', () => {
+      const { container } = render(
+        <MarkdownPreview content='<script>alert("xss")</script>' language="md" />
+      )
+      expect(container.querySelector('script')).toBeNull()
+    })
+
+    it('strips event handler attributes from HTML in markdown', () => {
+      const { container } = render(
+        <MarkdownPreview content='<img src=x onerror=alert(1)>' language="md" />
+      )
+      expect(container.querySelector('img[onerror]')).toBeNull()
+    })
+
+    it('strips iframe tags from markdown content', () => {
+      const { container } = render(
+        <MarkdownPreview content='<iframe src="https://evil.com"></iframe>' language="md" />
+      )
+      expect(container.querySelector('iframe')).toBeNull()
+    })
+
+    it('renders javascript: protocol links safely', () => {
+      const { container } = render(
+        <MarkdownPreview content='[click me](javascript:alert(1))' language="md" />
+      )
+      const link = container.querySelector('a')
+      // react-markdown should either strip the link or neutralize the protocol
+      if (link) {
+        expect(link.getAttribute('href')).not.toContain('javascript:')
+      }
+    })
+  })
 })
