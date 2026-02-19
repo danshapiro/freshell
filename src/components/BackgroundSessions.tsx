@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { getWsClient } from '@/lib/ws-client'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { useAppDispatch, useAppSelector } from '@/store/hooks'
+import { useAppDispatch } from '@/store/hooks'
 import { addTab } from '@/store/tabsSlice'
 
 type BackgroundTerminal = {
@@ -28,7 +28,6 @@ function formatAge(ms: number): string {
 
 export default function BackgroundSessions() {
   const dispatch = useAppDispatch()
-  const settings = useAppSelector((s) => s.settings.settings)
 
   const ws = useMemo(() => getWsClient(), [])
   const [terminals, setTerminals] = useState<BackgroundTerminal[]>([])
