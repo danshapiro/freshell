@@ -653,7 +653,7 @@ Action:                               Allow
 
     it('self-repairs when port forwarding is correct but firewall has stale ports', () => {
       vi.spyOn(console, 'log').mockImplementation(() => {})
-      vi.mocked(fs.readFileSync).mockReturnValue('Linux version 5.15.0-microsoft-standard-WSL2')
+      vi.mocked(isWSL2).mockReturnValue(true)
 
       vi.mocked(execSync)
         .mockReturnValueOnce('inet 172.30.149.249/20 scope global eth0\n') // getWslIp

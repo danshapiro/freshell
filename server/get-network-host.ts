@@ -30,7 +30,7 @@ export function getNetworkHost(): string {
   // import 'dotenv/config') can still see HOST from .env.
   dotenv.config()
 
-  // On WSL2, binding to 127.0.0.1 makes the server unreachable from the
+  // On WSL, binding to 127.0.0.1 makes the server unreachable from the
   // Windows host browser. Always bind to 0.0.0.0 so Windows can connect.
   if (isWSL()) return '0.0.0.0'
 
