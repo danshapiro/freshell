@@ -68,7 +68,7 @@ const log = logger.child({ component: 'ws' })
 const perfConfig = getPerfConfig()
 
 // Extended WebSocket with liveness tracking for keepalive
-interface LiveWebSocket extends WebSocket {
+export interface LiveWebSocket extends WebSocket {
   isAlive?: boolean
   connectionId?: string
   connectedAt?: number
