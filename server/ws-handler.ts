@@ -425,24 +425,26 @@ export class WsHandler {
     const remoteAddr = (req.socket.remoteAddress as string | undefined) || undefined
     const userAgent = req.headers['user-agent'] as string | undefined
 
-    // Trust loopback connections (e.g., Vite dev proxy) regardless of Origin header.
-    // In dev mode, Vite proxies WebSocket requests from remote clients but the connection
-    // arrives from localhost. The original client's Origin header is preserved but may not
-    // match the Host header due to changeOrigin, so we skip origin validation for loopback.
+    // Origin validation is advisory-only — the auth token in the hello message
+    // is the real security gate.  We log mismatches for diagnostics but never
+    // reject connections based on Origin, because:
+    // - VPNs may strip or rewrite the Origin header
+    // - Some mobile browsers omit Origin on WebSocket upgrades
+    // - In dev mode Vite's changeOrigin proxy masked this entirely
     const isLoopback = isLoopbackAddress(remoteAddr)
 
     if (!isLoopback) {
-      // Remote connections must have a valid Origin
-      if (!origin) {
-        ws.close(CLOSE_CODES.NOT_AUTHENTICATED, 'Origin required')
-        return
-      }
       const host = req.headers.host as string | undefined
-      const hostOrigins = host ? [`http://${host}`, `https://${host}`] : []
-      const allowed = isOriginAllowed(origin) || hostOrigins.includes(origin)
-      if (!allowed) {
-        ws.close(CLOSE_CODES.NOT_AUTHENTICATED, 'Origin not allowed')
-        return
+      if (!origin) {
+        log.warn({ event: 'ws_origin_missing', remoteAddr, host, userAgent },
+          'WebSocket connection without Origin header (VPN or mobile browser) — allowing, auth token required')
+      } else {
+        const hostOrigins = host ? [`http://${host}`, `https://${host}`] : []
+        const allowed = isOriginAllowed(origin) || hostOrigins.includes(origin)
+        if (!allowed) {
+          log.warn({ event: 'ws_origin_mismatch', origin, host, remoteAddr, userAgent },
+            'WebSocket Origin does not match Host — allowing, auth token required')
+        }
       }
     }
 
