@@ -1,4 +1,5 @@
-export type CodingCliProviderName = 'claude' | 'codex' | 'opencode' | 'gemini' | 'kimi'
+import type { CodingCliProviderName } from '../../shared/ws-protocol.js'
+export type { CodingCliProviderName }
 
 /**
  * Sessions are uniquely identified by provider + sessionId.

@@ -6,6 +6,10 @@ import path from 'path'
 // Mock fs and os modules before importing the module under test
 vi.mock('fs')
 vi.mock('os')
+// Mock platform module — WSL detection is now centralized in platform.ts
+vi.mock('../../../server/platform.js', () => ({
+  isWSL: vi.fn(() => false),
+}))
 
 // Import the module under test after mocking
 import {

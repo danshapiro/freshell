@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
-import { readFileSync } from 'node:fs'
 import { promisify } from 'node:util'
+import { isWSL2 } from './platform.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -21,21 +21,6 @@ export interface FirewallInfo {
 export interface FirewallDeps {
   isWSL2: () => boolean
   tryExec: (cmd: string, args: string[]) => Promise<string | null>
-}
-
-function isWSL2(): boolean {
-  // readFileSync is acceptable here — /proc/version is a virtual filesystem
-  // that returns instantly (no disk I/O). This runs once and the result is
-  // cached by NetworkManager.
-  try {
-    const version = readFileSync('/proc/version', 'utf-8').toLowerCase()
-    // WSL2 has "microsoft-standard" or "wsl2" in the version string.
-    // WSL1 has "Microsoft" but not these patterns.
-    // This matches the detection logic in server/wsl-port-forward.ts:179-184.
-    return version.includes('wsl2') || version.includes('microsoft-standard')
-  } catch {
-    return false
-  }
 }
 
 /** Run a command asynchronously and return stdout, or null on failure. */

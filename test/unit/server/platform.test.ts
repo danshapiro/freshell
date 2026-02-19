@@ -1,11 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { readFileSync } from 'fs'
 import fsPromises from 'fs/promises'
 
-// Mock fs/promises
+// Mock fs (sync) and fs/promises (async) separately
+vi.mock('fs')
 vi.mock('fs/promises')
 
 // Import after mocking
-import { detectPlatform } from '../../../server/platform.js'
+import { detectPlatform, isWSL2, isWSL } from '../../../server/platform.js'
 
 describe('detectPlatform', () => {
   const mockReadFile = vi.mocked(fsPromises.readFile)
@@ -88,5 +90,75 @@ describe('detectPlatform', () => {
     const result = await detectPlatform()
 
     expect(result).toBe('linux')
+  })
+})
+
+describe('isWSL2', () => {
+  const mockReadFileSync = vi.mocked(readFileSync)
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('returns true when /proc/version contains "microsoft-standard"', () => {
+    mockReadFileSync.mockReturnValue('Linux version 5.15.167.4-microsoft-standard-WSL2')
+
+    expect(isWSL2()).toBe(true)
+  })
+
+  it('returns true when /proc/version contains "wsl2"', () => {
+    mockReadFileSync.mockReturnValue('Linux version 5.15.0-WSL2 (gcc version 9.3.0)')
+
+    expect(isWSL2()).toBe(true)
+  })
+
+  it('returns false for WSL1 (has "Microsoft" but not WSL2 patterns)', () => {
+    mockReadFileSync.mockReturnValue('Linux version 4.4.0-18362-Microsoft')
+
+    expect(isWSL2()).toBe(false)
+  })
+
+  it('returns false for non-WSL Linux', () => {
+    mockReadFileSync.mockReturnValue('Linux version 5.15.0-generic (buildd@lcy02-amd64-047)')
+
+    expect(isWSL2()).toBe(false)
+  })
+
+  it('returns false when /proc/version cannot be read', () => {
+    mockReadFileSync.mockImplementation(() => { throw new Error('ENOENT') })
+
+    expect(isWSL2()).toBe(false)
+  })
+})
+
+describe('isWSL', () => {
+  const mockReadFileSync = vi.mocked(readFileSync)
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('returns true for WSL2', () => {
+    mockReadFileSync.mockReturnValue('Linux version 5.15.167.4-microsoft-standard-WSL2')
+
+    expect(isWSL()).toBe(true)
+  })
+
+  it('returns true for WSL1', () => {
+    mockReadFileSync.mockReturnValue('Linux version 4.4.0-18362-Microsoft')
+
+    expect(isWSL()).toBe(true)
+  })
+
+  it('returns false for non-WSL Linux', () => {
+    mockReadFileSync.mockReturnValue('Linux version 5.15.0-generic (buildd@lcy02-amd64-047)')
+
+    expect(isWSL()).toBe(false)
+  })
+
+  it('returns false when /proc/version cannot be read', () => {
+    mockReadFileSync.mockImplementation(() => { throw new Error('ENOENT') })
+
+    expect(isWSL()).toBe(false)
   })
 })

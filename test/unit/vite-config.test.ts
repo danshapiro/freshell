@@ -11,6 +11,12 @@ vi.mock('dotenv', () => ({
   default: { config: vi.fn() },
   config: vi.fn(),
 }))
+// Mock platform module — WSL detection is now centralized in platform.ts
+vi.mock('../../server/platform.js', () => ({
+  isWSL: vi.fn(() => false),
+}))
+
+import { isWSL } from '../../server/platform.js'
 
 const TEST_TIMEOUT_MS = 20_000
 
@@ -73,13 +79,8 @@ describe('getNetworkHost', () => {
     expect(getNetworkHost()).toBe('0.0.0.0')
   })
 
-  it('always returns 0.0.0.0 on WSL2 regardless of config', async () => {
-    vi.mocked(readFileSync).mockImplementation((path: any) => {
-      if (String(path) === '/proc/version') return 'Linux version 5.15.167.4-microsoft-standard-WSL2'
-      return JSON.stringify({
-        settings: { network: { host: '127.0.0.1', configured: true } },
-      })
-    })
+  it('always returns 0.0.0.0 on WSL regardless of config', async () => {
+    vi.mocked(isWSL).mockReturnValue(true)
     const { getNetworkHost } = await import('../../server/get-network-host.js')
     expect(getNetworkHost()).toBe('0.0.0.0')
   })
