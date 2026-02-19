@@ -12,6 +12,7 @@ import {
   detectLanIps,
   generateAuthToken,
   buildAllowedOrigins,
+  readConfigHost,
   parseEnvFile,
   checkNeedsAuthToken,
   ensureEnvFile,
@@ -157,6 +158,51 @@ describe('bootstrap module', () => {
       // Should be a comma-separated string
       expect(typeof origins).toBe('string')
       expect(origins.includes(',')).toBe(true)
+    })
+  })
+
+  describe('readConfigHost', () => {
+    it('returns 0.0.0.0 when config.json has remote access configured', () => {
+      vi.mocked(os.homedir).mockReturnValue('/home/testuser')
+      vi.mocked(fs.readFileSync).mockReturnValue(
+        JSON.stringify({ settings: { network: { host: '0.0.0.0' } } })
+      )
+
+      expect(readConfigHost()).toBe('0.0.0.0')
+    })
+
+    it('returns 127.0.0.1 when config.json has localhost', () => {
+      vi.mocked(os.homedir).mockReturnValue('/home/testuser')
+      vi.mocked(fs.readFileSync).mockReturnValue(
+        JSON.stringify({ settings: { network: { host: '127.0.0.1' } } })
+      )
+
+      expect(readConfigHost()).toBe('127.0.0.1')
+    })
+
+    it('returns 127.0.0.1 when config.json does not exist', () => {
+      vi.mocked(os.homedir).mockReturnValue('/home/testuser')
+      vi.mocked(fs.readFileSync).mockImplementation(() => {
+        throw new Error('ENOENT')
+      })
+
+      expect(readConfigHost()).toBe('127.0.0.1')
+    })
+
+    it('returns 127.0.0.1 when config has invalid host value', () => {
+      vi.mocked(os.homedir).mockReturnValue('/home/testuser')
+      vi.mocked(fs.readFileSync).mockReturnValue(
+        JSON.stringify({ settings: { network: { host: '10.0.0.1' } } })
+      )
+
+      expect(readConfigHost()).toBe('127.0.0.1')
+    })
+
+    it('returns 127.0.0.1 when config has no network settings', () => {
+      vi.mocked(os.homedir).mockReturnValue('/home/testuser')
+      vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify({ settings: {} }))
+
+      expect(readConfigHost()).toBe('127.0.0.1')
     })
   })
 
@@ -332,8 +378,13 @@ describe('bootstrap module', () => {
       expect(writtenContent).toContain('AUTH_TOKEN=')
     })
 
-    it('generated .env includes ALLOWED_ORIGINS with LAN IPs', () => {
+    it('generated .env includes ALLOWED_ORIGINS with LAN IPs when config host is 0.0.0.0', () => {
+      vi.mocked(os.homedir).mockReturnValue('/home/testuser')
       vi.mocked(fs.existsSync).mockReturnValue(false)
+      // readConfigHost reads config.json, ensureEnvFile reads .env (but existsSync is false)
+      vi.mocked(fs.readFileSync).mockReturnValue(
+        JSON.stringify({ settings: { network: { host: '0.0.0.0' } } })
+      )
       let writtenContent = ''
       vi.mocked(fs.writeFileSync).mockImplementation((_, data) => {
         writtenContent = data as string
@@ -343,6 +394,25 @@ describe('bootstrap module', () => {
 
       expect(writtenContent).toContain('ALLOWED_ORIGINS=')
       expect(writtenContent).toContain('192.168.1.100')
+    })
+
+    it('generated .env includes only localhost origins when config host is 127.0.0.1', () => {
+      vi.mocked(os.homedir).mockReturnValue('/home/testuser')
+      vi.mocked(fs.existsSync).mockReturnValue(false)
+      // readConfigHost throws (no config.json) → defaults to 127.0.0.1
+      vi.mocked(fs.readFileSync).mockImplementation(() => {
+        throw new Error('ENOENT')
+      })
+      let writtenContent = ''
+      vi.mocked(fs.writeFileSync).mockImplementation((_, data) => {
+        writtenContent = data as string
+      })
+
+      ensureEnvFile(mockEnvPath)
+
+      expect(writtenContent).toContain('ALLOWED_ORIGINS=')
+      expect(writtenContent).toContain('localhost')
+      expect(writtenContent).not.toContain('192.168.1.100')
     })
 
     it('generated .env includes PORT default', () => {
@@ -369,7 +439,12 @@ describe('bootstrap module', () => {
 
     it('handles localhost-only when no LAN interfaces', () => {
       vi.mocked(os.networkInterfaces).mockReturnValue({})
+      vi.mocked(os.homedir).mockReturnValue('/home/testuser')
       vi.mocked(fs.existsSync).mockReturnValue(false)
+      // readConfigHost returns 0.0.0.0, but no LAN IPs available
+      vi.mocked(fs.readFileSync).mockReturnValue(
+        JSON.stringify({ settings: { network: { host: '0.0.0.0' } } })
+      )
       let writtenContent = ''
       vi.mocked(fs.writeFileSync).mockImplementation((_, data) => {
         writtenContent = data as string

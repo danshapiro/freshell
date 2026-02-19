@@ -2,9 +2,17 @@ import { describe, it, expect, afterEach, vi } from 'vitest'
 import path from 'path'
 import os from 'os'
 import fsp from 'fs/promises'
+
+vi.mock('../../../../server/coding-cli/utils', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../../server/coding-cli/utils')>()
+  return {
+    ...actual,
+    resolveGitCheckoutRoot: vi.fn(async (cwd: string) => cwd),
+  }
+})
+
 import { claudeProvider, parseSessionContent } from '../../../../server/coding-cli/providers/claude'
 import { getClaudeHome } from '../../../../server/claude-home'
-import { ClaudeSessionIndexer, applyOverride } from '../../../../server/claude-indexer'
 import { looksLikePath } from '../../../../server/coding-cli/utils'
 
 const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
@@ -22,9 +30,11 @@ const SESSION_REAPPEAR = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
 
 describe('claudeProvider.resolveProjectPath()', () => {
   it('returns cwd from session metadata (like Codex)', async () => {
-    const meta = { cwd: '/home/user/my-project' }
+    // Use a platform-appropriate absolute path since path.resolve normalizes differently
+    const cwd = process.platform === 'win32' ? 'C:\\Users\\test\\my-project' : '/home/user/my-project'
+    const meta = { cwd }
     const result = await claudeProvider.resolveProjectPath('/some/file.jsonl', meta)
-    expect(result).toBe('/home/user/my-project')
+    expect(result).toBe(cwd)
   })
 
   it('returns "unknown" when cwd is not present', async () => {
@@ -365,124 +375,6 @@ describe('claude provider cross-platform tests', () => {
 
       expect(events).toHaveLength(1)
       expect('raw' in events[0]).toBe(false)
-    })
-  })
-
-  describe('looksLikePath()', () => {
-    describe('Unix paths', () => {
-      it('should recognize absolute Unix paths', () => {
-        expect(looksLikePath('/home/user')).toBe(true)
-        expect(looksLikePath('/usr/local/bin')).toBe(true)
-        expect(looksLikePath('/var/log/app.log')).toBe(true)
-        expect(looksLikePath('/')).toBe(true)
-      })
-
-      it('should recognize home directory paths with tilde', () => {
-        expect(looksLikePath('~/projects')).toBe(true)
-        expect(looksLikePath('~/.config')).toBe(true)
-        expect(looksLikePath('~/Documents/file.txt')).toBe(true)
-      })
-
-      it('should recognize relative paths', () => {
-        expect(looksLikePath('./relative')).toBe(true)
-        expect(looksLikePath('../parent')).toBe(true)
-        expect(looksLikePath('./src/index.ts')).toBe(true)
-        expect(looksLikePath('../../../up/three/levels')).toBe(true)
-      })
-    })
-
-    describe('Windows paths', () => {
-      it('should recognize Windows drive letter paths', () => {
-        expect(looksLikePath('C:\\')).toBe(true)
-        expect(looksLikePath('C:\\Users')).toBe(true)
-        expect(looksLikePath('D:\\Projects')).toBe(true)
-        expect(looksLikePath('C:\\Users\\Dan\\Documents')).toBe(true)
-      })
-
-      it('should recognize Windows paths with forward slashes', () => {
-        expect(looksLikePath('C:/Users')).toBe(true)
-        expect(looksLikePath('D:/Projects/app')).toBe(true)
-      })
-
-      it('should recognize UNC paths (network shares)', () => {
-        expect(looksLikePath('\\\\server\\share')).toBe(true)
-        expect(looksLikePath('\\\\192.168.1.1\\folder')).toBe(true)
-        expect(looksLikePath('\\\\wsl$\\Ubuntu\\home')).toBe(true)
-      })
-
-      it('should recognize Windows relative paths', () => {
-        expect(looksLikePath('.\\relative')).toBe(true)
-        expect(looksLikePath('..\\parent')).toBe(true)
-        expect(looksLikePath('.\\src\\index.ts')).toBe(true)
-      })
-    })
-
-    describe('non-paths (should return false)', () => {
-      it('should reject plain strings without path separators', () => {
-        expect(looksLikePath('hello')).toBe(false)
-        expect(looksLikePath('project-name')).toBe(false)
-        expect(looksLikePath('MyApp')).toBe(false)
-        expect(looksLikePath('')).toBe(false)
-      })
-
-      it('should reject URLs', () => {
-        expect(looksLikePath('https://example.com')).toBe(false)
-        expect(looksLikePath('http://localhost:3000')).toBe(false)
-        expect(looksLikePath('https://github.com/user/repo')).toBe(false)
-        expect(looksLikePath('ftp://files.example.com/doc')).toBe(false)
-        expect(looksLikePath('file://localhost/path')).toBe(false)
-      })
-
-      it('should reject email addresses', () => {
-        // Email addresses don't have slashes typically, but just to be safe
-        expect(looksLikePath('user@example.com')).toBe(false)
-      })
-
-      it('should reject strings that look like paths but are protocol-based', () => {
-        expect(looksLikePath('s3://bucket/key')).toBe(false)
-        expect(looksLikePath('gs://bucket/object')).toBe(false)
-        expect(looksLikePath('ssh://user@host/path')).toBe(false)
-      })
-    })
-
-    describe('edge cases', () => {
-      it('should handle paths with spaces', () => {
-        expect(looksLikePath('/home/user/My Documents')).toBe(true)
-        expect(looksLikePath('C:\\Users\\Dan\\My Documents')).toBe(true)
-        expect(looksLikePath('/path/with spaces/file name.txt')).toBe(true)
-      })
-
-      it('should handle paths with special characters', () => {
-        expect(looksLikePath('/path/with-dashes/file_underscore.ts')).toBe(true)
-        expect(looksLikePath('/path/with.dots/file.name.ext')).toBe(true)
-        expect(looksLikePath("C:\\path\\with'quotes")).toBe(true)
-        expect(looksLikePath('/path/with(parens)/file')).toBe(true)
-      })
-
-      it('should handle paths with unicode characters', () => {
-        expect(looksLikePath('/home/用户/文档')).toBe(true)
-        expect(looksLikePath('C:\\Users\\José\\Documents')).toBe(true)
-      })
-
-      it('should handle root-only paths', () => {
-        expect(looksLikePath('/')).toBe(true)
-        expect(looksLikePath('C:\\')).toBe(true)
-      })
-
-      it('should handle tilde alone (home directory)', () => {
-        // Just tilde by itself should be considered a path as it refers to home directory
-        expect(looksLikePath('~')).toBe(true)
-      })
-
-      it('should handle dot alone (current directory)', () => {
-        // Single dot is the current directory
-        expect(looksLikePath('.')).toBe(true)
-      })
-
-      it('should handle double dot alone (parent directory)', () => {
-        // Double dot is parent directory
-        expect(looksLikePath('..')).toBe(true)
-      })
     })
   })
 
@@ -925,185 +817,6 @@ describe('claude provider cross-platform tests', () => {
 
       expect(meta.cwd).toBe('/home/user/project')
       expect(meta.title).toBe('Fix the login bug')
-    })
-  })
-})
-
-describe('ClaudeSessionIndexer new session detection', () => {
-  it('should call onNewSession handler only for newly discovered sessions after initialization', async () => {
-    const indexer = new ClaudeSessionIndexer()
-    const newSessionHandler = vi.fn()
-
-    indexer.onNewSession(newSessionHandler)
-
-    // Simulate indexer has been initialized (start() completed)
-    indexer['initialized'] = true
-
-    // Add session A to known set (simulating it was seen before)
-    indexer['knownSessionIds'].add(SESSION_A)
-
-    // Simulate detecting sessions A and B
-    const sessions: ClaudeSession[] = [
-      { sessionId: SESSION_A, projectPath: '/proj', updatedAt: Date.now(), cwd: '/proj' },
-      { sessionId: SESSION_B, projectPath: '/proj', updatedAt: Date.now(), cwd: '/proj' },
-    ]
-
-    indexer['detectNewSessions'](sessions)
-
-    expect(newSessionHandler).toHaveBeenCalledTimes(1)
-    expect(newSessionHandler).toHaveBeenCalledWith(expect.objectContaining({ sessionId: SESSION_B }))
-  })
-
-  it('should not call handlers before initialization (startup scenario)', () => {
-    const indexer = new ClaudeSessionIndexer()
-    const handler = vi.fn()
-
-    indexer.onNewSession(handler)
-
-    // initialized is false by default (before start() completes)
-    // Simulate first refresh detecting existing sessions
-    indexer['detectNewSessions']([
-      { sessionId: SESSION_EXISTING, projectPath: '/proj', updatedAt: Date.now(), cwd: '/proj' },
-    ])
-
-    // Handler should NOT fire - we're still initializing
-    expect(handler).not.toHaveBeenCalled()
-    // But session should be tracked
-    expect(indexer['knownSessionIds'].has(SESSION_EXISTING)).toBe(true)
-  })
-
-  it('should skip sessions without cwd', () => {
-    const indexer = new ClaudeSessionIndexer()
-    const handler = vi.fn()
-
-    indexer.onNewSession(handler)
-    indexer['initialized'] = true
-
-    indexer['detectNewSessions']([
-      { sessionId: SESSION_NO_CWD, projectPath: '/proj', updatedAt: Date.now(), cwd: undefined },
-    ])
-
-    expect(handler).not.toHaveBeenCalled()
-  })
-
-  it('should unsubscribe handler when returned function is called', () => {
-    const indexer = new ClaudeSessionIndexer()
-    const handler = vi.fn()
-
-    const unsubscribe = indexer.onNewSession(handler)
-    unsubscribe()
-    indexer['initialized'] = true
-
-    indexer['detectNewSessions']([
-      { sessionId: SESSION_NEW, projectPath: '/proj', updatedAt: Date.now(), cwd: '/proj' },
-    ])
-
-    expect(handler).not.toHaveBeenCalled()
-  })
-
-  it('should prune stale session IDs from knownSessionIds (memory leak prevention)', () => {
-    const indexer = new ClaudeSessionIndexer()
-    indexer['initialized'] = true
-
-    // First detection adds sessions A, B, C
-    indexer['detectNewSessions']([
-      { sessionId: SESSION_A, projectPath: '/proj', updatedAt: Date.now(), cwd: '/proj' },
-      { sessionId: SESSION_B, projectPath: '/proj', updatedAt: Date.now(), cwd: '/proj' },
-      { sessionId: SESSION_C, projectPath: '/proj', updatedAt: Date.now(), cwd: '/proj' },
-    ])
-
-    expect(indexer['knownSessionIds'].size).toBe(3)
-    expect(indexer['knownSessionIds'].has(SESSION_A)).toBe(true)
-    expect(indexer['knownSessionIds'].has(SESSION_B)).toBe(true)
-    expect(indexer['knownSessionIds'].has(SESSION_C)).toBe(true)
-
-    // Second detection: B was deleted, D was added
-    indexer['detectNewSessions']([
-      { sessionId: SESSION_A, projectPath: '/proj', updatedAt: Date.now(), cwd: '/proj' },
-      { sessionId: SESSION_C, projectPath: '/proj', updatedAt: Date.now(), cwd: '/proj' },
-      { sessionId: SESSION_D, projectPath: '/proj', updatedAt: Date.now(), cwd: '/proj' },
-    ])
-
-    // B should be pruned, D should be added
-    expect(indexer['knownSessionIds'].size).toBe(3)
-    expect(indexer['knownSessionIds'].has(SESSION_A)).toBe(true)
-    expect(indexer['knownSessionIds'].has(SESSION_B)).toBe(false) // Pruned
-    expect(indexer['knownSessionIds'].has(SESSION_C)).toBe(true)
-    expect(indexer['knownSessionIds'].has(SESSION_D)).toBe(true) // Added
-  })
-
-  it('should call handlers in oldest-first order when multiple new sessions are detected', () => {
-    const indexer = new ClaudeSessionIndexer()
-    const calls: string[] = []
-    indexer.onNewSession((session) => calls.push(session.sessionId))
-    indexer['initialized'] = true
-
-    indexer['detectNewSessions']([
-      { sessionId: SESSION_NEWEST, projectPath: '/proj', updatedAt: 200, cwd: '/proj' },
-      { sessionId: SESSION_OLDEST, projectPath: '/proj', updatedAt: 100, cwd: '/proj' },
-      { sessionId: SESSION_MIDDLE, projectPath: '/proj', updatedAt: 150, cwd: '/proj' },
-    ])
-
-    expect(calls).toEqual([SESSION_OLDEST, SESSION_MIDDLE, SESSION_NEWEST])
-  })
-
-  it('should not fire handlers for sessions that reappear after being seen', () => {
-    const indexer = new ClaudeSessionIndexer()
-    const handler = vi.fn()
-    indexer.onNewSession(handler)
-    indexer['initialized'] = true
-
-    // First appearance - should fire
-    indexer['detectNewSessions']([
-      { sessionId: SESSION_REAPPEAR, projectPath: '/proj', updatedAt: 100, cwd: '/proj' },
-    ])
-    expect(handler).toHaveBeenCalledTimes(1)
-
-    // Simulate session removed (known list pruned)
-    indexer['detectNewSessions']([])
-
-    // Reappearance with same sessionId should NOT fire again
-    indexer['detectNewSessions']([
-      { sessionId: SESSION_REAPPEAR, projectPath: '/proj', updatedAt: 200, cwd: '/proj' },
-    ])
-
-    expect(handler).toHaveBeenCalledTimes(1)
-  })
-
-  describe('applyOverride()', () => {
-    it('returns null when override marks deleted', () => {
-      const session: ClaudeSession = {
-        sessionId: 's1',
-        projectPath: '/proj',
-        createdAt: 100,
-        updatedAt: 200,
-      }
-
-      expect(applyOverride(session, { deleted: true })).toBeNull()
-    })
-
-    it('applies title/summary/archived and createdAt overrides', () => {
-      const session: ClaudeSession = {
-        sessionId: 's1',
-        projectPath: '/proj',
-        createdAt: 100,
-        updatedAt: 200,
-        title: 'Original',
-        summary: 'Summary',
-        archived: false,
-      }
-
-      const merged = applyOverride(session, {
-        titleOverride: 'New title',
-        summaryOverride: 'New summary',
-        archived: true,
-        createdAtOverride: 999,
-      })
-
-      expect(merged?.title).toBe('New title')
-      expect(merged?.summary).toBe('New summary')
-      expect(merged?.archived).toBe(true)
-      expect(merged?.createdAt).toBe(999)
     })
   })
 })

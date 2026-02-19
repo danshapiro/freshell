@@ -16,6 +16,7 @@ import claudeChatReducer, {
   sessionError,
   clearPendingCreate,
   removeSession,
+  setAvailableModels,
 } from '../../../src/store/claudeChatSlice'
 
 describe('claudeChatSlice', () => {
@@ -23,6 +24,7 @@ describe('claudeChatSlice', () => {
 
   it('has empty initial state', () => {
     expect(initial.sessions).toEqual({})
+    expect(initial.availableModels).toEqual([])
   })
 
   it('creates a session', () => {
@@ -191,6 +193,16 @@ describe('claudeChatSlice', () => {
     let state = claudeChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
     state = claudeChatReducer(state, removeSession({ sessionId: 's1' }))
     expect(state.sessions['s1']).toBeUndefined()
+  })
+
+  it('setAvailableModels populates models', () => {
+    const models = [
+      { value: 'claude-opus-4-6', displayName: 'Opus 4.6', description: 'Most capable' },
+      { value: 'claude-sonnet-4-5-20250929', displayName: 'Sonnet 4.5', description: 'Fast' },
+    ]
+    const state = claudeChatReducer(initial, setAvailableModels({ models }))
+    expect(state.availableModels).toEqual(models)
+    expect(state.availableModels).toHaveLength(2)
   })
 
   it('accumulates cost when costUsd is 0', () => {

@@ -6,6 +6,18 @@ import { getPerfConfig, logPerfEvent } from './perf-logger.js'
 type RequestWithId = Request & { id?: string }
 const perfConfig = getPerfConfig()
 
+/** Strip `token` query parameter from URLs to prevent credential leakage in logs. */
+export function sanitizeUrl(url: string): string {
+  try {
+    const parsed = new URL(url, 'http://localhost')
+    parsed.searchParams.delete('token')
+    const search = parsed.searchParams.toString()
+    return parsed.pathname + (search ? `?${search}` : '')
+  } catch {
+    return url
+  }
+}
+
 function getRequestId(req: Request): string {
   const headerId = req.headers['x-request-id']
   if (typeof headerId === 'string' && headerId.trim()) return headerId
@@ -23,7 +35,7 @@ export function requestLogger(req: RequestWithId, res: Response, next: NextFunct
     {
       requestId,
       requestMethod: req.method,
-      requestPath: req.originalUrl,
+      requestPath: sanitizeUrl(req.originalUrl),
       ip: req.ip,
       userAgent: req.headers['user-agent'],
     },
@@ -49,7 +61,7 @@ export function requestLogger(req: RequestWithId, res: Response, next: NextFunct
             'http_request_slow',
             {
               method: req.method,
-              path: req.originalUrl,
+              path: sanitizeUrl(req.originalUrl),
               statusCode,
               durationMs: Number(durationMs.toFixed(2)),
               requestBytes: req.headers['content-length'],

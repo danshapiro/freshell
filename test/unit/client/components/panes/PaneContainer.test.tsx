@@ -104,6 +104,9 @@ vi.mock('lucide-react', () => ({
   Square: ({ className }: { className?: string }) => (
     <svg data-testid="square-icon" className={className} />
   ),
+  Search: ({ className }: { className?: string }) => (
+    <svg data-testid="search-icon" className={className} />
+  ),
 }))
 
 // Mock TerminalView component to avoid xterm.js dependencies
@@ -1117,6 +1120,52 @@ describe('PaneContainer', () => {
         expect(paneContent.mode).toBe('shell')
         expect(paneContent.status).toBe('creating')
       }
+    })
+
+    it('pre-fills directory picker with tab-preferred cwd instead of global default', () => {
+      // Tab already has a Claude pane working in /code/tab-project
+      const existingClaude: PaneNode = {
+        type: 'leaf',
+        id: 'pane-existing',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          shell: 'system',
+          createRequestId: 'cr-existing',
+          status: 'running',
+          terminalId: 'term-existing',
+          initialCwd: '/code/tab-project',
+        },
+      }
+      const pickerNode: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: { kind: 'picker' },
+      }
+      const splitNode: PaneNode = {
+        type: 'split',
+        id: 'split-1',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [existingClaude, pickerNode],
+      }
+
+      // Global provider default is /code/global-default — should NOT be used
+      const store = createStoreWithClaude(splitNode, { cwd: '/code/global-default' })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={splitNode} />,
+        store
+      )
+
+      // Navigate to directory picker by selecting Claude
+      const container = document.querySelector('[data-context="pane-picker"]')!
+      fireEvent.keyDown(container, { key: 'l' })
+      fireEvent.transitionEnd(container)
+
+      // The input should pre-fill with the tab's directory, not the global default
+      const input = screen.getByLabelText('Starting directory for Claude') as HTMLInputElement
+      expect(input.value).toBe('/code/tab-project')
     })
   })
 

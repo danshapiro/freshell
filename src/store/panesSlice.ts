@@ -18,6 +18,16 @@ function normalizeContent(input: PaneContentInput): PaneContent {
         : mode === 'claude'
           ? undefined
           : input.resumeSessionId
+    const explicitSessionRef = input.sessionRef
+      && typeof input.sessionRef.provider === 'string'
+      && typeof input.sessionRef.sessionId === 'string'
+      && (input.sessionRef.provider !== 'claude' || isValidClaudeSessionId(input.sessionRef.sessionId))
+      ? input.sessionRef
+      : undefined
+    const sessionRef = explicitSessionRef
+      ?? (resumeSessionId && mode !== 'shell'
+        ? { provider: mode, sessionId: resumeSessionId }
+        : undefined)
     return {
       kind: 'terminal',
       terminalId: input.terminalId,
@@ -26,16 +36,28 @@ function normalizeContent(input: PaneContentInput): PaneContent {
       mode,
       shell: input.shell || 'system',
       resumeSessionId,
+      ...(sessionRef ? { sessionRef } : {}),
       initialCwd: input.initialCwd,
     }
   }
   if (input.kind === 'claude-chat') {
+    const explicitSessionRef = input.sessionRef
+      && typeof input.sessionRef.provider === 'string'
+      && typeof input.sessionRef.sessionId === 'string'
+      && (input.sessionRef.provider !== 'claude' || isValidClaudeSessionId(input.sessionRef.sessionId))
+      ? input.sessionRef
+      : undefined
+    const sessionRef = explicitSessionRef
+      ?? (input.resumeSessionId && isValidClaudeSessionId(input.resumeSessionId)
+        ? { provider: 'claude' as const, sessionId: input.resumeSessionId }
+        : undefined)
     return {
       kind: 'claude-chat',
       sessionId: input.sessionId,
       createRequestId: input.createRequestId || nanoid(),
       status: input.status || 'creating',
       resumeSessionId: input.resumeSessionId,
+      ...(sessionRef ? { sessionRef } : {}),
       initialCwd: input.initialCwd,
     }
   }

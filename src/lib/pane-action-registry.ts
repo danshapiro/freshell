@@ -5,6 +5,7 @@ export type TerminalActions = {
   clearScrollback: () => void
   reset: () => void
   hasSelection: () => boolean
+  openSearch: () => void
 }
 
 export type EditorActions = {

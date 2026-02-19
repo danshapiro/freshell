@@ -1,4 +1,6 @@
-export type CodingCliProviderName = 'claude' | 'codex' | 'opencode' | 'gemini' | 'kimi'
+import type { CodingCliProviderName } from '@shared/ws-protocol'
+
+export type { CodingCliProviderName } from '@shared/ws-protocol'
 
 export type NormalizedEventType =
   | 'session.start'       // Session initialized (was session.init)
@@ -85,32 +87,11 @@ export interface NormalizedEvent {
   tokenUsage?: { input: number; output: number; total: number }
 }
 
-export interface CodingCliWsEvent {
-  type: 'codingcli.event'
-  sessionId: string
-  provider: CodingCliProviderName
-  event: NormalizedEvent
-}
-
-export interface CodingCliWsCreated {
-  type: 'codingcli.created'
-  requestId: string
-  sessionId: string
-  provider: CodingCliProviderName
-}
-
-export interface CodingCliWsExit {
-  type: 'codingcli.exit'
-  sessionId: string
-  provider: CodingCliProviderName
-  exitCode: number
-}
-
-export interface CodingCliWsStderr {
-  type: 'codingcli.stderr'
-  sessionId: string
-  provider: CodingCliProviderName
-  text: string
-}
-
-export type CodingCliWsMessage = CodingCliWsEvent | CodingCliWsCreated | CodingCliWsExit | CodingCliWsStderr
+// WS message types re-exported from shared protocol
+export type {
+  CodingCliEventMessage as CodingCliWsEvent,
+  CodingCliCreatedMessage as CodingCliWsCreated,
+  CodingCliExitMessage as CodingCliWsExit,
+  CodingCliStderrMessage as CodingCliWsStderr,
+  CodingCliWsMessage,
+} from '@shared/ws-protocol'

@@ -219,21 +219,40 @@ Address         Port        Address         Port
       expect(ports).not.toContain(3001)
     })
 
-    it('includes dev port 5173 when not in production', () => {
+    it('includes provided devPort when not in production', () => {
+      delete process.env.NODE_ENV
+      delete process.env.PORT
+
+      const ports = getRequiredPorts(5173)
+
+      expect(ports).toContain(5173)
+    })
+
+    it('excludes devPort in production', () => {
+      process.env.NODE_ENV = 'production'
+
+      const ports = getRequiredPorts(5173)
+
+      expect(ports).not.toContain(5173)
+    })
+
+    it('uses provided devPort instead of hardcoded 5173', () => {
+      delete process.env.NODE_ENV
+      delete process.env.PORT
+
+      const ports = getRequiredPorts(4000)
+
+      expect(ports).toContain(4000)
+      expect(ports).not.toContain(5173)
+    })
+
+    it('does not include dev port when devPort is not provided', () => {
       delete process.env.NODE_ENV
       delete process.env.PORT
 
       const ports = getRequiredPorts()
 
-      expect(ports).toContain(5173)
-    })
-
-    it('excludes dev port 5173 in production', () => {
-      process.env.NODE_ENV = 'production'
-
-      const ports = getRequiredPorts()
-
-      expect(ports).not.toContain(5173)
+      expect(ports).toEqual([3001])
     })
 
     it('falls back to default port when PORT is invalid (NaN)', () => {
@@ -254,11 +273,11 @@ Address         Port        Address         Port
       expect(ports).not.toContain(99999)
     })
 
-    it('deduplicates when PORT equals dev port', () => {
+    it('deduplicates when PORT equals devPort', () => {
       process.env.PORT = '5173'
       delete process.env.NODE_ENV
 
-      const ports = getRequiredPorts()
+      const ports = getRequiredPorts(5173)
 
       // Should only contain 5173 once
       expect(ports).toEqual([5173])

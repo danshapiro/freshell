@@ -60,7 +60,7 @@ describe('TabItem', () => {
     const el = getTabElement()
     expect(el?.className).toContain('bg-background')
     expect(el?.className).toContain('border-b-background')
-    expect(el?.className).toContain('-mb-px')
+    expect(el?.className).not.toContain('-mb-px')
   })
 
   it('applies dragging opacity when isDragging is true', () => {
@@ -165,5 +165,41 @@ describe('TabItem', () => {
     const el = getTabElement()
     fireEvent.doubleClick(el!)
     expect(onDoubleClick).toHaveBeenCalled()
+  })
+
+  it('uses the same title width class for active and inactive tabs', () => {
+    const { rerender } = render(<TabItem {...defaultProps} isActive={false} />)
+    let title = screen.getByText('Test Tab')
+    expect(title.className).toContain('max-w-[5rem]')
+
+    rerender(<TabItem {...defaultProps} isActive={true} />)
+    title = screen.getByText('Test Tab')
+    expect(title.className).toContain('max-w-[5rem]')
+  })
+
+  it('does not vertically offset inactive tabs', () => {
+    render(<TabItem {...defaultProps} isActive={false} />)
+    const el = getTabElement()
+    expect(el?.className).not.toContain('mt-1')
+  })
+
+  describe('XSS sanitization', () => {
+    const XSS_PAYLOADS = [
+      '<script>alert("xss")</script>',
+      '<img src=x onerror=alert(1)>',
+      '"><svg onload=alert(1)>',
+    ]
+
+    it.each(XSS_PAYLOADS)('escapes XSS payload in tab title: %s', (payload) => {
+      const { container } = render(
+        <TabItem {...defaultProps} tab={createTab({ title: payload })} />
+      )
+      // Payload should appear as visible escaped text, not parsed HTML
+      expect(screen.getByText(payload)).toBeInTheDocument()
+      // No script or img elements should be injected
+      expect(container.querySelector('script')).toBeNull()
+      expect(container.querySelector('img[onerror]')).toBeNull()
+      expect(container.querySelector('svg[onload]')).toBeNull()
+    })
   })
 })

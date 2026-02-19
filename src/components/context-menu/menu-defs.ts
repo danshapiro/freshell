@@ -50,6 +50,12 @@ export type MenuActions = {
   copyTerminalCwd: (terminalId: string) => void
   copyMessageText: (contextEl: HTMLElement | null) => void
   copyMessageCode: (contextEl: HTMLElement | null) => void
+  copyFreshclaudeCodeBlock: (clickTarget: HTMLElement | null) => void
+  copyFreshclaudeToolInput: (clickTarget: HTMLElement | null) => void
+  copyFreshclaudeToolOutput: (clickTarget: HTMLElement | null) => void
+  copyFreshclaudeDiffNew: (clickTarget: HTMLElement | null) => void
+  copyFreshclaudeDiffOld: (clickTarget: HTMLElement | null) => void
+  copyFreshclaudeFilePath: (clickTarget: HTMLElement | null) => void
 }
 
 export type MenuBuildContext = {
@@ -60,6 +66,7 @@ export type MenuBuildContext = {
   sessions: ProjectGroup[]
   expandedProjects: Set<string>
   contextElement: HTMLElement | null
+  clickTarget: HTMLElement | null
   actions: MenuActions
   platform: string | null
 }
@@ -121,7 +128,7 @@ function buildCopyResumeMenuItem(id: string, candidate: ResumeCommandCandidate, 
 }
 
 export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): MenuItem[] {
-  const { actions, tabs, paneLayouts, sessions, view, sidebarCollapsed, expandedProjects, contextElement, platform } = ctx
+  const { actions, tabs, paneLayouts, sessions, view, sidebarCollapsed, expandedProjects, contextElement, clickTarget, platform } = ctx
   const isSessionOpen = (sessionId: string, provider?: string) => {
     const keyProvider = provider || 'claude'
     for (const tab of tabs) {
@@ -137,9 +144,10 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
 
   if (target.kind === 'global') {
     const views: Array<{ id: AppView; label: string }> = [
-      { id: 'terminal', label: 'Terminal' },
-      { id: 'sessions', label: 'Sessions' },
-      { id: 'overview', label: 'Overview' },
+      { id: 'terminal', label: 'Coding Agents' },
+      { id: 'tabs', label: 'Tabs' },
+      { id: 'overview', label: 'Panes' },
+      { id: 'sessions', label: 'Projects' },
       { id: 'settings', label: 'Settings' },
     ]
 
@@ -278,6 +286,13 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
         id: 'terminal-select-all',
         label: 'Select all',
         onSelect: () => terminalActions?.selectAll(),
+        disabled: !terminalActions,
+      },
+      {
+        type: 'item',
+        id: 'terminal-search',
+        label: 'Search',
+        onSelect: () => terminalActions?.openSearch(),
         disabled: !terminalActions,
       },
       ...terminalResumeMenuItem,
@@ -445,6 +460,116 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       { type: 'item', id: 'claude-copy-session', label: 'Copy session ID', onSelect: () => actions.copySessionId(target.sessionId) },
       { type: 'item', id: 'claude-open-session', label: 'Open session in new tab', onSelect: () => actions.openSessionInNewTab(target.sessionId, target.provider) },
     ]
+  }
+
+  if (target.kind === 'freshclaude-chat') {
+    const selection = window.getSelection()
+    const hasSelection = !!(selection && selection.toString().trim())
+
+    // Detect sub-region from click target using closest()
+    const codeBlock = clickTarget?.closest?.('.prose pre code') as HTMLElement | null
+    const toolInput = clickTarget?.closest?.('[data-tool-input]') as HTMLElement | null
+    const toolOutput = clickTarget?.closest?.('[data-tool-output]') as HTMLElement | null
+    const diffView = clickTarget?.closest?.('[data-diff]') as HTMLElement | null
+
+    const items: MenuItem[] = [
+      {
+        type: 'item',
+        id: 'fc-copy',
+        label: 'Copy',
+        onSelect: () => {
+          if (hasSelection) document.execCommand('copy')
+        },
+        disabled: !hasSelection,
+      },
+      {
+        type: 'item',
+        id: 'fc-select-all',
+        label: 'Select all',
+        onSelect: () => {
+          if (contextElement) {
+            const range = document.createRange()
+            range.selectNodeContents(contextElement)
+            const sel = window.getSelection()
+            sel?.removeAllRanges()
+            sel?.addRange(range)
+          }
+        },
+      },
+    ]
+
+    // Context-sensitive items
+    if (codeBlock) {
+      items.push(
+        { type: 'separator', id: 'fc-code-sep' },
+        {
+          type: 'item',
+          id: 'fc-copy-code-block',
+          label: 'Copy code block',
+          onSelect: () => actions.copyFreshclaudeCodeBlock(codeBlock),
+        },
+      )
+    }
+
+    if (toolInput) {
+      const toolName = toolInput.getAttribute('data-tool-name')
+      const isBash = toolName === 'Bash'
+      items.push(
+        { type: 'separator', id: 'fc-tool-input-sep' },
+        {
+          type: 'item',
+          id: isBash ? 'fc-copy-command' : 'fc-copy-input',
+          label: isBash ? 'Copy command' : 'Copy input',
+          onSelect: () => actions.copyFreshclaudeToolInput(toolInput),
+        },
+      )
+    }
+
+    if (toolOutput) {
+      // Don't add separator if we just added one for toolInput
+      if (!toolInput) items.push({ type: 'separator', id: 'fc-tool-output-sep' })
+      items.push({
+        type: 'item',
+        id: 'fc-copy-output',
+        label: 'Copy output',
+        onSelect: () => actions.copyFreshclaudeToolOutput(toolOutput),
+      })
+    }
+
+    if (diffView) {
+      const filePath = diffView.getAttribute('data-file-path')
+      items.push(
+        { type: 'separator', id: 'fc-diff-sep' },
+        {
+          type: 'item',
+          id: 'fc-copy-new-version',
+          label: 'Copy new version',
+          onSelect: () => actions.copyFreshclaudeDiffNew(diffView),
+        },
+        {
+          type: 'item',
+          id: 'fc-copy-old-version',
+          label: 'Copy old version',
+          onSelect: () => actions.copyFreshclaudeDiffOld(diffView),
+        },
+      )
+      if (filePath) {
+        items.push({
+          type: 'item',
+          id: 'fc-copy-file-path',
+          label: 'Copy file path',
+          onSelect: () => actions.copyFreshclaudeFilePath(diffView),
+        })
+      }
+    }
+
+    // Session metadata at the bottom
+    items.push(
+      { type: 'separator', id: 'fc-session-sep' },
+      { type: 'item', id: 'fc-copy-session', label: 'Copy session ID', onSelect: () => actions.copySessionId(target.sessionId) },
+    )
+
+    return items
   }
 
   return []

@@ -10,12 +10,11 @@ import rateLimit from 'express-rate-limit'
 import { z } from 'zod'
 import { logger, setLogLevel } from './logger.js'
 import { requestLogger } from './request-logger.js'
-import { validateStartupSecurity, httpAuthMiddleware } from './auth.js'
+import { validateStartupSecurity, httpAuthMiddleware, timingSafeCompare } from './auth.js'
 import { configStore } from './config-store.js'
-import { TerminalRegistry, modeSupportsResume } from './terminal-registry.js'
+import { TerminalRegistry } from './terminal-registry.js'
 import { WsHandler } from './ws-handler.js'
 import { SessionsSyncService } from './sessions-sync/service.js'
-import { claudeIndexer } from './claude-indexer.js'
 import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
 import { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { claudeProvider } from './coding-cli/providers/claude.js'
@@ -30,11 +29,19 @@ import { SdkBridge } from './sdk-bridge.js'
 import { createClientLogsRouter } from './client-logs.js'
 import { createStartupState } from './startup-state.js'
 import { getPerfConfig, initPerfLogging, setPerfLoggingEnabled, startPerfTimer, withPerfSpan } from './perf-logger.js'
-import { detectPlatform, detectAvailableClis } from './platform.js'
+import { detectPlatform, detectAvailableClis, detectHostName } from './platform.js'
 import { resolveVisitPort } from './startup-url.js'
+import { NetworkManager } from './network-manager.js'
+import { getNetworkHost } from './get-network-host.js'
+import cookieParser from 'cookie-parser'
 import { PortForwardManager } from './port-forward.js'
 import { getRequesterIdentity, parseTrustProxyEnv } from './request-ip.js'
 import { collectCandidateDirectories } from './candidate-dirs.js'
+import { createTabsRegistryStore } from './tabs-registry/store.js'
+import { checkForUpdate } from './updater/version-checker.js'
+import { SessionAssociationCoordinator } from './session-association-coordinator.js'
+import { loadOrCreateServerInstanceId } from './instance-id.js'
+import { SettingsPatchSchema } from './settings-schema.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -65,14 +72,8 @@ const ASSOCIATION_MAX_AGE_MS = 30_000
 async function main() {
   validateStartupSecurity()
 
-  // WSL2 port forwarding - must run AFTER security validation passes
-  // and AFTER dotenv loads so PORT/NODE_ENV from .env are available
-  const wslPortForwardResult = setupWslPortForwarding()
-  if (wslPortForwardResult === 'success') {
-    console.log('[server] WSL2 port forwarding configured')
-  } else if (wslPortForwardResult === 'failed') {
-    console.warn('[server] WSL2 port forwarding failed - LAN access may not work')
-  }
+  // WSL2 port forwarding is deferred until bindHost is known (after config load).
+  // See the conditional call before server.listen() below.
 
   initPerfLogging()
 
@@ -83,8 +84,21 @@ async function main() {
   app.use(express.json({ limit: '1mb' }))
   app.use(requestLogger)
 
-  // --- Local file serving for browser pane (no auth required, same-origin only) ---
-  app.get('/local-file', (req, res) => {
+  // --- Local file serving for browser pane (cookie auth for iframes) ---
+  app.get('/local-file', cookieParser(), (req, res, next) => {
+    const headerToken = typeof req.headers['x-auth-token'] === 'string'
+      ? req.headers['x-auth-token']
+      : undefined
+    const cookieToken = typeof req.cookies?.['freshell-auth'] === 'string'
+      ? req.cookies['freshell-auth']
+      : undefined
+    const token = headerToken || cookieToken
+    const expectedToken = process.env.AUTH_TOKEN
+    if (!expectedToken || !token || !timingSafeCompare(token, expectedToken)) {
+      return res.status(401).json({ error: 'Unauthorized' })
+    }
+    next()
+  }, (req, res) => {
     const filePath = req.query.path as string
     if (!filePath) {
       return res.status(400).json({ error: 'path query parameter required' })
@@ -137,6 +151,7 @@ async function main() {
   const codingCliProviders = [claudeProvider, codexProvider]
   const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders)
   const codingCliSessionManager = new CodingCliSessionManager(codingCliProviders)
+  const tabsRegistryStore = createTabsRegistryStore()
 
   app.get('/api/debug', async (_req, res) => {
     const cfg = await configStore.snapshot()
@@ -146,6 +161,10 @@ async function main() {
       wsConnections: wsHandler.connectionCount(),
       settings: cfg.settings,
       sessionsProjects: codingCliIndexer.getProjects(),
+      tabsRegistry: {
+        recordCount: tabsRegistryStore.count(),
+        deviceCount: tabsRegistryStore.listDevices().length,
+      },
       terminals: registry.list(),
       time: new Date().toISOString(),
     })
@@ -156,6 +175,7 @@ async function main() {
   const terminalMetadata = new TerminalMetadataService()
 
   const sessionRepairService = getSessionRepairService()
+  const serverInstanceId = await loadOrCreateServerInstanceId()
 
   const sdkBridge = new SdkBridge()
 
@@ -168,15 +188,29 @@ async function main() {
     sessionRepairService,
     async () => {
       const currentSettings = migrateSettingsSortMode(await configStore.getSettings())
+      const readError = configStore.getLastReadError()
+      const configFallback = readError
+        ? { reason: readError, backupExists: await configStore.backupExists() }
+        : undefined
       return {
         settings: currentSettings,
         projects: codingCliIndexer.getProjects(),
         perfLogging: perfConfig.enabled,
+        configFallback,
       }
     },
     () => terminalMetadata.list(),
+    tabsRegistryStore,
+    serverInstanceId,
   )
+  const port = Number(process.env.PORT || 3001)
+  const isDev = process.env.NODE_ENV !== 'production'
+  const vitePort = isDev ? Number(process.env.VITE_PORT || 5173) : undefined
+  const networkManager = new NetworkManager(server, configStore, port, isDev, vitePort)
+  networkManager.setWsHandler(wsHandler)
+
   const sessionsSync = new SessionsSyncService(wsHandler)
+  const associationCoordinator = new SessionAssociationCoordinator(registry, ASSOCIATION_MAX_AGE_MS)
 
   const broadcastTerminalMetaUpserts = (upsert: ReturnType<TerminalMetadataService['list']>) => {
     if (upsert.length === 0) return
@@ -271,12 +305,158 @@ async function main() {
     res.json({ ips: detectLanIps() })
   })
 
+  // --- Network management endpoints ---
+  app.get('/api/network/status', async (_req, res) => {
+    try {
+      const status = await networkManager.getStatus()
+      res.json(status)
+    } catch (err) {
+      log.error({ err }, 'Failed to get network status')
+      res.status(500).json({ error: 'Failed to get network status' })
+    }
+  })
+
+  const NetworkConfigureSchema = z.object({
+    host: z.enum(['127.0.0.1', '0.0.0.0']),
+    configured: z.boolean(),
+  })
+
+  app.post('/api/network/configure', async (req, res) => {
+    const parsed = NetworkConfigureSchema.safeParse(req.body || {})
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
+    }
+    try {
+      const { rebindScheduled } = await networkManager.configure(parsed.data)
+      const status = await networkManager.getStatus()
+      res.json({ ...status, rebindScheduled })
+    } catch (err) {
+      log.error({ err }, 'Failed to configure network')
+      res.status(500).json({ error: 'Failed to configure network' })
+      return
+    }
+    try {
+      const fullSettings = await configStore.getSettings()
+      wsHandler.broadcast({ type: 'settings.updated', settings: fullSettings })
+    } catch (broadcastErr) {
+      log.error({ err: broadcastErr }, 'Failed to broadcast settings after network configure')
+    }
+  })
+
+  app.post('/api/network/configure-firewall', async (_req, res) => {
+    try {
+      const status = await networkManager.getStatus()
+
+      // In-flight guard: prevent concurrent elevated firewall processes
+      if (status.firewall.configuring) {
+        return res.status(409).json({
+          error: 'Firewall configuration already in progress',
+          method: 'in-progress',
+        })
+      }
+
+      const commands = status.firewall.commands
+
+      if (commands.length === 0) {
+        if (status.firewall.platform === 'wsl2') {
+          const { execFile } = await import('node:child_process')
+          const { buildPortForwardingScript, getWslIp } = await import('./wsl-port-forward.js')
+          const POWERSHELL_PATH = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
+          try {
+            const wslIp = getWslIp()
+            if (!wslIp) {
+              log.error('Failed to detect WSL2 IP address')
+              return res.status(500).json({ error: 'Could not detect WSL2 IP address' })
+            }
+            const ports = networkManager.getRelevantPorts()
+            const rawScript = buildPortForwardingScript(wslIp, ports)
+            const script = rawScript.replace(/\\\$/g, '$')
+            const escapedScript = script.replace(/'/g, "''")
+            networkManager.setFirewallConfiguring(true)
+            const child = execFile(POWERSHELL_PATH, [
+              '-Command',
+              `Start-Process powershell -Verb RunAs -Wait -ArgumentList '-Command', '${escapedScript}'`,
+            ], { timeout: 120000 }, (err, _stdout, stderr) => {
+              if (err) {
+                log.error({ err, stderr }, 'WSL2 port forwarding failed')
+              } else {
+                log.info('WSL2 port forwarding completed successfully')
+              }
+              networkManager.resetFirewallCache()
+              networkManager.setFirewallConfiguring(false)
+            })
+            child.on('error', (err) => {
+              log.error({ err }, 'Failed to spawn PowerShell for WSL2 port forwarding')
+              networkManager.resetFirewallCache()
+              networkManager.setFirewallConfiguring(false)
+            })
+            return res.json({ method: 'wsl2', status: 'started' })
+          } catch (err) {
+            log.error({ err }, 'WSL2 port forwarding setup error')
+            networkManager.setFirewallConfiguring(false)
+            return res.status(500).json({ error: 'WSL2 port forwarding failed to start' })
+          }
+        }
+        return res.json({ method: 'none', message: 'No firewall detected' })
+      }
+
+      if (status.firewall.platform === 'windows') {
+        const { execFile } = await import('node:child_process')
+        const script = commands.join('; ')
+        const escapedScript = script.replace(/'/g, "''")
+        try {
+          networkManager.setFirewallConfiguring(true)
+          const child = execFile('powershell.exe', [
+            '-Command',
+            `Start-Process powershell -Verb RunAs -Wait -ArgumentList '-Command', '${escapedScript}'`,
+          ], { timeout: 120000 }, (err, _stdout, stderr) => {
+            if (err) {
+              log.error({ err, stderr }, 'Windows firewall configuration failed')
+            } else {
+              log.info('Windows firewall configured successfully')
+            }
+            networkManager.resetFirewallCache()
+            networkManager.setFirewallConfiguring(false)
+          })
+          child.on('error', (err) => {
+            log.error({ err }, 'Failed to spawn PowerShell for Windows firewall')
+            networkManager.resetFirewallCache()
+            networkManager.setFirewallConfiguring(false)
+          })
+          return res.json({ method: 'windows-elevated', status: 'started' })
+        } catch (err) {
+          log.error({ err }, 'Windows firewall setup error')
+          networkManager.setFirewallConfiguring(false)
+          return res.status(500).json({ error: 'Windows firewall configuration failed to start' })
+        }
+      }
+
+      // Linux/macOS: return command for client to run in a terminal pane
+      const command = commands.join(' && ')
+      res.json({ method: 'terminal', command })
+    } catch (err) {
+      log.error({ err }, 'Firewall configuration error')
+      res.status(500).json({ error: 'Firewall configuration failed' })
+    }
+  })
+
   app.get('/api/platform', async (_req, res) => {
-    const [platform, availableClis] = await Promise.all([
+    const [platform, availableClis, hostName] = await Promise.all([
       detectPlatform(),
       detectAvailableClis(),
+      detectHostName(),
     ])
-    res.json({ platform, availableClis })
+    res.json({ platform, availableClis, hostName })
+  })
+
+  app.get('/api/version', async (_req, res) => {
+    try {
+      const updateCheck = await checkForUpdate(APP_VERSION)
+      res.json({ currentVersion: APP_VERSION, updateCheck })
+    } catch (err) {
+      log.warn({ err }, 'Version check failed')
+      res.json({ currentVersion: APP_VERSION, updateCheck: null })
+    }
   })
 
   app.get('/api/files/candidate-dirs', async (_req, res) => {
@@ -305,7 +485,11 @@ async function main() {
   }
 
   app.patch('/api/settings', async (req, res) => {
-    const patch = normalizeSettingsPatch(migrateSettingsSortMode(req.body || {}) as any)
+    const parsed = SettingsPatchSchema.safeParse(req.body || {})
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
+    }
+    const patch = normalizeSettingsPatch(migrateSettingsSortMode(parsed.data) as any)
     const updated = await configStore.patchSettings(patch)
     const migrated = migrateSettingsSortMode(updated)
     registry.setSettings(migrated)
@@ -317,18 +501,16 @@ async function main() {
 	      {},
 	      { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
 	    )
-	    await withPerfSpan(
-	      'claude_refresh',
-	      () => claudeIndexer.refresh(),
-	      {},
-	      { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
-    )
     res.json(migrated)
   })
 
   // Alias (matches implementation plan)
   app.put('/api/settings', async (req, res) => {
-    const patch = normalizeSettingsPatch(migrateSettingsSortMode(req.body || {}) as any)
+    const parsed = SettingsPatchSchema.safeParse(req.body || {})
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
+    }
+    const patch = normalizeSettingsPatch(migrateSettingsSortMode(parsed.data) as any)
     const updated = await configStore.patchSettings(patch)
     const migrated = migrateSettingsSortMode(updated)
     registry.setSettings(migrated)
@@ -340,12 +522,6 @@ async function main() {
 	      {},
 	      { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
 	    )
-	    await withPerfSpan(
-	      'claude_refresh',
-	      () => claudeIndexer.refresh(),
-	      {},
-	      { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
-    )
     res.json(migrated)
   })
 
@@ -435,7 +611,6 @@ async function main() {
 	      createdAtOverride,
 	    })
 	    await codingCliIndexer.refresh()
-	    await claudeIndexer.refresh()
 	    res.json(next)
 	  })
 
@@ -445,7 +620,6 @@ async function main() {
 	    const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
 	    await configStore.deleteSession(compositeKey)
 	    await codingCliIndexer.refresh()
-	    await claudeIndexer.refresh()
 	    res.json({ ok: true })
 	  })
 
@@ -454,7 +628,6 @@ async function main() {
 	    if (!projectPath || !color) return res.status(400).json({ error: 'projectPath and color required' })
 	    await configStore.setProjectColor(projectPath, color)
 	    await codingCliIndexer.refresh()
-	    await claudeIndexer.refresh()
 	    res.json({ ok: true })
 	  })
 
@@ -538,7 +711,7 @@ async function main() {
       const result = await generateText({
         model,
         prompt,
-        maxOutputTokens: promptConfig.maxTokens,
+        maxOutputTokens: promptConfig.maxOutputTokens,
       })
 
       const description = (result.text || '').trim().slice(0, 240) || heuristic()
@@ -608,42 +781,38 @@ async function main() {
     sessionsSync.publish(projects)
     const associationMetaUpserts: ReturnType<TerminalMetadataService['list']> = []
     const pendingMetadataSync = new Map<string, CodingCliSession>()
+    const nonClaudeProjects = projects.map((project) => ({
+      ...project,
+      sessions: project.sessions.filter((session) => session.provider !== 'claude'),
+    }))
+    for (const session of associationCoordinator.collectNewOrAdvanced(nonClaudeProjects)) {
+      const result = associationCoordinator.associateSingleSession(session)
+      if (!result.associated || !result.terminalId) continue
+      log.info({
+        event: 'session_bind_applied',
+        terminalId: result.terminalId,
+        sessionId: session.sessionId,
+        provider: session.provider,
+      }, 'session_bind_applied')
+      try {
+        wsHandler.broadcast({
+          type: 'terminal.session.associated' as const,
+          terminalId: result.terminalId,
+          sessionId: session.sessionId,
+        })
+        const metaUpsert = terminalMetadata.associateSession(
+          result.terminalId,
+          session.provider,
+          session.sessionId,
+        )
+        if (metaUpsert) associationMetaUpserts.push(metaUpsert)
+      } catch (err) {
+        log.warn({ err, terminalId: result.terminalId }, 'Failed to broadcast session association')
+      }
+    }
 
     for (const project of projects) {
       for (const session of project.sessions) {
-        // Session association for non-Claude providers (e.g. Codex).
-        // Runs on every update — idempotent because findUnassociatedTerminals
-        // excludes already-associated terminals.
-        // Time guard: only associate if the session is recent relative to the terminal,
-        // preventing stale sessions from previous server runs from being matched.
-        if (session.provider !== 'claude' && modeSupportsResume(session.provider) && session.cwd) {
-          const unassociated = registry.findUnassociatedTerminals(session.provider, session.cwd)
-          if (unassociated.length > 0) {
-            const term = unassociated[0]
-            if (session.updatedAt >= term.createdAt - ASSOCIATION_MAX_AGE_MS) {
-              log.info({ terminalId: term.terminalId, sessionId: session.sessionId, provider: session.provider }, 'Associating terminal with coding CLI session')
-              const associated = registry.setResumeSessionId(term.terminalId, session.sessionId)
-              if (associated) {
-                try {
-                  wsHandler.broadcast({
-                    type: 'terminal.session.associated' as const,
-                    terminalId: term.terminalId,
-                    sessionId: session.sessionId,
-                  })
-                  const metaUpsert = terminalMetadata.associateSession(
-                    term.terminalId,
-                    session.provider,
-                    session.sessionId,
-                  )
-                  if (metaUpsert) associationMetaUpserts.push(metaUpsert)
-                } catch (err) {
-                  log.warn({ err, terminalId: term.terminalId }, 'Failed to broadcast session association')
-                }
-              }
-            }
-          }
-        }
-
         const matchingTerminals = registry.findTerminalsBySession(session.provider, session.sessionId, session.cwd)
         for (const term of matchingTerminals) {
           pendingMetadataSync.set(term.terminalId, session)
@@ -689,52 +858,61 @@ async function main() {
     }
   })
 
-  // Claude watcher hooks (for search + session association)
-
-  // One-time session association for new Claude sessions
-  // When Claude creates a session file, associate it with the oldest unassociated
-  // claude-mode terminal matching the session's cwd. This allows the terminal to
-  // resume the session after server restart.
+  // One-time session association for newly discovered Claude sessions.
+  // When the indexer first discovers a session file, associate it with the oldest
+  // unassociated claude-mode terminal matching the session's cwd. This allows the
+  // terminal to resume the session after server restart.
   //
   // Broadcast message type: { type: 'terminal.session.associated', terminalId: string, sessionId: string }
-  claudeIndexer.onNewSession((session) => {
+  codingCliIndexer.onNewSession((session) => {
+    if (session.provider !== 'claude') return
     if (!session.cwd) return
-
-    const unassociated = registry.findUnassociatedClaudeTerminals(session.cwd)
-    if (unassociated.length === 0) return
-
-    // Only associate the oldest terminal (first in sorted list)
-    // This prevents incorrect associations when multiple terminals share the same cwd
-    const term = unassociated[0]
-    log.info({ terminalId: term.terminalId, sessionId: session.sessionId }, 'Associating terminal with new Claude session')
-    const associated = registry.setResumeSessionId(term.terminalId, session.sessionId)
-    if (!associated) {
-      log.warn({ terminalId: term.terminalId, sessionId: session.sessionId }, 'Skipping invalid Claude session association')
-      return
-    }
+    const shouldAssociate = associationCoordinator.noteSession({
+      provider: 'claude',
+      sessionId: session.sessionId,
+      projectPath: session.projectPath,
+      updatedAt: session.updatedAt,
+      cwd: session.cwd,
+    })
+    if (!shouldAssociate) return
+    const result = associationCoordinator.associateSingleSession({
+      provider: 'claude',
+      sessionId: session.sessionId,
+      projectPath: session.projectPath,
+      updatedAt: session.updatedAt,
+      cwd: session.cwd,
+    })
+    if (!result.associated || !result.terminalId) return
+    const terminalId = result.terminalId
+    log.info({
+      event: 'session_bind_applied',
+      provider: 'claude',
+      terminalId,
+      sessionId: session.sessionId,
+    }, 'session_bind_applied')
     try {
       wsHandler.broadcast({
         type: 'terminal.session.associated' as const,
-        terminalId: term.terminalId,
+        terminalId,
         sessionId: session.sessionId,
       })
-      const metaUpsert = terminalMetadata.associateSession(term.terminalId, 'claude', session.sessionId)
+      const metaUpsert = terminalMetadata.associateSession(terminalId, 'claude', session.sessionId)
       if (metaUpsert) {
         broadcastTerminalMetaUpserts([metaUpsert])
       }
     } catch (err) {
-      log.warn({ err, terminalId: term.terminalId }, 'Failed to broadcast session association')
+      log.warn({ err, terminalId, sessionId: session.sessionId }, 'Failed to broadcast session association')
     }
 
     void (async () => {
       const latestClaudeSession = findCodingCliSession('claude', session.sessionId)
       if (!latestClaudeSession) return
-      const upsert = await terminalMetadata.applySessionMetadata(term.terminalId, latestClaudeSession)
+      const upsert = await terminalMetadata.applySessionMetadata(terminalId, latestClaudeSession)
       if (upsert) {
         broadcastTerminalMetaUpserts([upsert])
       }
     })().catch((err) => {
-      log.warn({ err, terminalId: term.terminalId, sessionId: session.sessionId }, 'Failed to apply Claude terminal metadata after association')
+      log.warn({ err, terminalId, sessionId: session.sessionId }, 'Failed to apply Claude terminal metadata after association')
     })
   })
 
@@ -760,32 +938,39 @@ async function main() {
       { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
     )
       .then(() => {
+        sessionRepairService.setFilePathResolver((id) => codingCliIndexer.getFilePathForSession(id, 'claude'))
         startupState.markReady('codingCliIndexer')
         logger.info({ task: 'codingCliIndexer' }, 'Startup task ready')
       })
       .catch((err) => {
         logger.error({ err }, 'Coding CLI indexer failed to start')
       })
-
-    void withPerfSpan(
-      'claude_indexer_start',
-      () => claudeIndexer.start(),
-      {},
-      { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
-    )
-      .then(() => {
-        sessionRepairService.setFilePathResolver((id) => claudeIndexer.getFilePathForSession(id))
-        startupState.markReady('claudeIndexer')
-        logger.info({ task: 'claudeIndexer' }, 'Startup task ready')
-      })
-      .catch((err) => {
-        logger.error({ err }, 'Claude indexer failed to start')
-      })
   }
 
-  const port = Number(process.env.PORT || 3001)
-  server.listen(port, '0.0.0.0', () => {
-    log.info({ event: 'server_listening', port, appVersion: APP_VERSION }, 'Server listening')
+  // Determine bind host from config (shared logic with vite.config.ts)
+  const currentSettings = await configStore.getSettings()
+  const bindHost = getNetworkHost()
+
+  // WSL2 port forwarding — only when bound to 0.0.0.0 (remote access active)
+  if (bindHost === '0.0.0.0') {
+    const wslPortForwardResult = setupWslPortForwarding(vitePort)
+    if (wslPortForwardResult === 'success') {
+      console.log('[server] WSL2 port forwarding configured')
+    } else if (wslPortForwardResult === 'failed') {
+      console.warn('[server] WSL2 port forwarding failed - LAN access may not work')
+    }
+  }
+
+  // Initialize NetworkManager (ALLOWED_ORIGINS) before accepting connections
+  if (currentSettings.network.configured || bindHost === '0.0.0.0') {
+    await networkManager.initializeFromStartup(
+      bindHost as '127.0.0.1' | '0.0.0.0',
+      currentSettings.network,
+    )
+  }
+
+  server.listen(port, bindHost, () => {
+    log.info({ event: 'server_listening', port, host: bindHost, appVersion: APP_VERSION }, 'Server listening')
 
     // Print friendly startup message
     const token = process.env.AUTH_TOKEN
@@ -799,9 +984,20 @@ async function main() {
 
     console.log('')
     console.log(`\x1b[32m\u{1F41A}\u{1F525} freshell is ready!\x1b[0m`)
-    console.log(`   Visit from anywhere on your network: \x1b[36m${url}\x1b[0m`)
-    if (hideToken) {
-      console.log('   Auth token is configured in .env (not printed to logs).')
+    if (bindHost === '127.0.0.1') {
+      const localUrl = hideToken
+        ? `http://localhost:${visitPort}/`
+        : `http://localhost:${visitPort}/?token=${token}`
+      console.log(`   Local only: \x1b[36m${localUrl}\x1b[0m`)
+      if (hideToken) {
+        console.log('   Auth token is configured in .env (not printed to logs).')
+      }
+      console.log(`   Run the setup wizard to enable remote access.`)
+    } else {
+      console.log(`   Visit from anywhere on your network: \x1b[36m${url}\x1b[0m`)
+      if (hideToken) {
+        console.log('   Auth token is configured in .env (not printed to logs).')
+      }
     }
     console.log('')
 
@@ -835,15 +1031,17 @@ async function main() {
     // 5. Close SDK bridge sessions
     sdkBridge.close()
 
-    // 6. Close WebSocket connections gracefully
+    // 6. Stop NetworkManager
+    await networkManager.stop()
+
+    // 7. Close WebSocket connections gracefully
     wsHandler.close()
 
     // 7. Close port forwards
     portForwardManager.closeAll()
 
-    // 8. Stop session indexers
+    // 8. Stop session indexer
     codingCliIndexer.stop()
-    claudeIndexer.stop()
 
     // 9. Stop session repair service
     await sessionRepairService.stop()

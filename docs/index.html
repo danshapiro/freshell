@@ -55,31 +55,6 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
 .icon-xs { width: 12px; height: 12px; stroke-width: 2; flex-shrink: 0; }
 .icon-md { width: 16px; height: 16px; stroke-width: 2; flex-shrink: 0; }
 
-/* ========== Header ========== */
-.header {
-  height: 32px; display: flex; align-items: center; justify-content: space-between;
-  padding: 0 16px; border-bottom: 1px solid hsl(var(--border) / .3);
-  background: hsl(var(--background)); flex-shrink: 0; transition: background-color .2s, border-color .2s;
-}
-.header-left { display: flex; align-items: center; gap: 8px; }
-.header-logo { font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 600; letter-spacing: -0.02em; }
-.header-right { display: flex; align-items: center; gap: 1px; }
-.hdr-btn {
-  background: none; border: none; color: hsl(var(--muted-foreground)); padding: 6px;
-  border-radius: 6px; cursor: pointer; display: flex; align-items: center; transition: all .15s;
-}
-.hdr-btn:hover { color: hsl(var(--foreground)); background: hsl(var(--muted)); }
-.hdr-btn.wifi-on { color: hsl(var(--success)); }
-.hdr-btn .icon { pointer-events: none; }
-.toast {
-  position: fixed; top: 44px; right: 16px; padding: 6px 14px; border-radius: 6px;
-  font-size: 12px; font-weight: 500; z-index: 100;
-  background: hsl(var(--foreground)); color: hsl(var(--background));
-  box-shadow: var(--shadow-md); opacity: 0; transform: translateY(-4px);
-  transition: opacity .15s, transform .15s; pointer-events: none;
-}
-.toast.show { opacity: 1; transform: translateY(0); }
-
 /* ========== Snark Overlay ========== */
 .snark-overlay {
   position: fixed; inset: 0; z-index: 200; display: flex; align-items: center;
@@ -107,6 +82,14 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
 }
 .snark-msg a { color: var(--t-cyan); text-decoration: none; }
 .snark-msg a:hover { text-decoration: underline; }
+
+/* ========== Mobile Responsive ========== */
+/* On mobile (<768px): tab bar is replaced by MobileTabStrip (centered tab name
+   with chevrons + tab switcher grid overlay). At the right edge, the chevron
+   becomes a + action on the last tab to create a new tab. Touch targets are 44px min.
+   Sidebar opens/closes via swipe gesture and uses full-width drawer mode.
+   Pull-to-refresh is disabled, safe-area insets are respected, and fullscreen/landscape
+   mode minimizes chrome for terminal-focused use. */
 
 /* ========== Tab Bar ========== */
 .tabbar {
@@ -166,7 +149,14 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
   width: 288px; background: hsl(var(--card)); border-right: 1px solid hsl(var(--border));
   display: flex; flex-direction: column; flex-shrink: 0; transition: background-color .2s, border-color .2s;
 }
-.sb-header { padding: 16px 16px 12px; font-size: 13px; font-weight: 500; letter-spacing: -0.01em; }
+.sb-header { padding: 12px; display: flex; align-items: center; gap: 8px; }
+.sb-collapse {
+  border: none; background: none; color: hsl(var(--muted-foreground)); border-radius: 6px;
+  width: 28px; height: 28px; display: flex; align-items: center; justify-content: center;
+  cursor: pointer; transition: all .15s;
+}
+.sb-collapse:hover { color: hsl(var(--foreground)); background: hsl(var(--muted)); }
+.sb-logo { font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 600; letter-spacing: -0.02em; }
 .sb-search { padding: 0 12px 12px; }
 .sb-search-wrap { position: relative; }
 .sb-search-wrap .icon { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: hsl(var(--muted-foreground)); opacity: .6; }
@@ -210,7 +200,15 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
 .sb-footer a:hover { color: hsl(var(--foreground)); }
 
 /* ========== Main Layout ========== */
-.main { display: flex; flex: 1; min-height: 0; }
+.main { display: flex; flex: 1; min-height: 0; position: relative; }
+.sb-open-btn {
+  position: absolute; top: 8px; left: 8px; z-index: 30;
+  border: 1px solid hsl(var(--border) / .6); background: hsl(var(--card) / .95);
+  color: hsl(var(--muted-foreground)); border-radius: 8px; width: 32px; height: 32px;
+  display: flex; align-items: center; justify-content: center; cursor: pointer;
+  transition: all .15s;
+}
+.sb-open-btn:hover { color: hsl(var(--foreground)); background: hsl(var(--muted)); }
 
 /* ========== Content ========== */
 .content { flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; }
@@ -339,7 +337,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
 }
 .picker-option:hover .picker-shortcut { opacity: .4; }
 
-/* ========== Sessions View ========== */
+/* ========== Projects View ========== */
 .sessions-view { flex: 1; overflow-y: auto; background: hsl(var(--background)); transition: background-color .2s; }
 .sv-header {
   padding: 20px 24px 16px; border-bottom: 1px solid hsl(var(--border) / .3);
@@ -390,40 +388,28 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
 </head>
 <body>
 <div class="app">
-  <!-- Header -->
-  <header class="header">
-    <div class="header-left">
-      <button class="hdr-btn" title="Toggle sidebar" id="sidebar-toggle"><i data-lucide="panel-left" class="icon"></i></button>
-      <span class="header-logo">🐚🔥freshell</span>
-    </div>
-    <div class="header-right">
-      <button class="hdr-btn" id="theme-toggle" title="Toggle theme">
-        <i data-lucide="moon" class="icon moon-icon"></i>
-        <i data-lucide="sun" class="icon sun-icon" style="display:none"></i>
-      </button>
-      <button class="hdr-btn" id="share-btn" title="Share">
-        <i data-lucide="share-2" class="icon share-icon"></i>
-        <i data-lucide="check" class="icon check-icon" style="display:none"></i>
-      </button>
-      <span class="hdr-btn wifi-on" title="Connected"><i data-lucide="wifi" class="icon"></i></span>
-    </div>
-  </header>
-
   <div class="main">
+    <button class="sb-open-btn" title="Show sidebar" id="sidebar-open" style="display:none">
+      <i data-lucide="panel-left" class="icon"></i>
+    </button>
     <!-- Sidebar -->
     <aside class="sidebar" id="sidebar">
-      <div class="sb-header">Coding Agents</div>
+      <div class="sb-header">
+        <button class="sb-collapse" title="Hide sidebar" id="sidebar-toggle"><i data-lucide="panel-left-close" class="icon"></i></button>
+        <span class="sb-logo">🐚🔥freshell</span>
+      </div>
       <div class="sb-search">
         <div class="sb-search-wrap">
           <i data-lucide="search" class="icon"></i>
-          <input type="text" placeholder="Search sessions…" readonly>
+          <input type="text" placeholder="Search coding agents, tabs, projects…" readonly>
         </div>
       </div>
       <div class="sb-nav">
-        <button class="sb-nav-btn active"><i data-lucide="terminal" class="icon"></i></button>
-        <button class="sb-nav-btn"><i data-lucide="history" class="icon"></i></button>
-        <button class="sb-nav-btn"><i data-lucide="layout-grid" class="icon"></i></button>
-        <button class="sb-nav-btn"><i data-lucide="settings" class="icon"></i></button>
+        <button class="sb-nav-btn active" title="Coding Agents"><i data-lucide="terminal" class="icon"></i></button>
+        <button class="sb-nav-btn" title="Tabs"><i data-lucide="rows-3" class="icon"></i></button>
+        <button class="sb-nav-btn" title="Panes"><i data-lucide="layout-grid" class="icon"></i></button>
+        <button class="sb-nav-btn" title="Projects"><i data-lucide="folder" class="icon"></i></button>
+        <button class="sb-nav-btn" title="Settings"><i data-lucide="settings" class="icon"></i></button>
       </div>
       <div class="sb-list">
         <div class="sb-item"><div class="sb-item-icon"><svg viewBox="75.73 64.08 872.25 872.25"><path d="M616.9,649.5h-209.7c0,0,0,104.7,0,104.7h-56.6c0,0,.2-104.5.2-104.5h-48.6s.2,104.5.2,104.5h-56.7c0,0,.2-104.4.2-104.4l-48.6-.7v-96.4c.1,0-104.8,0-104.8,0v-104.9s104.9,0,104.9,0v-201.6c0,0,628.9,0,628.9,0v201.6c0,0,104.9,0,104.9,0v104.9s-104.9,0-104.9,0v96.6c.1,0-56.5.4-56.5.4l.2,104.5h-48.6s.2-104.6.2-104.6h-56.6s.2,104.6.2,104.6h-48.6s.2-104.6.2-104.6ZM351.1,447.5l-.5-96.4h-48.4c0,0,0,96.6,0,96.6l48.8-.2ZM722,447.7l-.4-96.7h-56.5c0,0,0,96.8,0,96.8h56.9Z"/></svg></div><div class="sb-item-body"><div class="sb-item-title">Add dark mode toggle</div><div class="sb-item-meta"><span>freshell</span><span>2m</span></div></div></div>
@@ -465,7 +451,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
         </div>
         <div class="tab" data-tab="sessions">
           <span class="tab-dot idle"></span>
-          <span class="tab-label">Sessions</span>
+          <span class="tab-label">Projects</span>
           <span class="tab-close"><i data-lucide="x" class="icon-xs"></i></span>
         </div>
         <div class="tab" data-tab="start">
@@ -563,11 +549,11 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
         </div>
       </div>
 
-      <!-- Sessions -->
+      <!-- Projects -->
       <div class="tab-panel" id="panel-sessions">
         <div class="sessions-view">
           <div class="sv-header">
-            <span class="sv-title">Sessions</span>
+            <span class="sv-title">Projects</span>
             <span class="sv-count">12 sessions across 3 projects</span>
             <button class="sv-refresh"><i data-lucide="refresh-cw" class="icon"></i></button>
           </div>
@@ -608,45 +594,51 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
   </div>
 </div>
 
-<div class="toast" id="toast">Copied link!</div>
-
 <script>
 // ========== Initialize Lucide Icons ==========
 lucide.createIcons();
 
-// ========== Theme Toggle ==========
-const themeBtn = document.getElementById('theme-toggle');
-themeBtn.addEventListener('click', () => {
-  const html = document.documentElement;
-  const isDark = html.classList.toggle('dark');
-  themeBtn.querySelector('.moon-icon').style.display = isDark ? '' : 'none';
-  themeBtn.querySelector('.sun-icon').style.display = isDark ? 'none' : '';
-  themeBtn.title = isDark ? 'Switch to light mode' : 'Switch to dark mode';
-});
-
-// ========== Share Button ==========
-const shareBtn = document.getElementById('share-btn');
-shareBtn.addEventListener('click', () => {
-  navigator.clipboard.writeText(window.location.href).catch(() => {});
-  shareBtn.querySelector('.share-icon').style.display = 'none';
-  shareBtn.querySelector('.check-icon').style.display = '';
-  const toast = document.getElementById('toast');
-  toast.classList.add('show');
-  setTimeout(() => {
-    shareBtn.querySelector('.share-icon').style.display = '';
-    shareBtn.querySelector('.check-icon').style.display = 'none';
-    toast.classList.remove('show');
-  }, 1500);
-});
-
 // ========== Sidebar Toggle ==========
 const sidebarToggle = document.getElementById('sidebar-toggle');
+const sidebarOpen = document.getElementById('sidebar-open');
 const sidebar = document.getElementById('sidebar');
 let sidebarVisible = window.innerWidth > 768;
-if (!sidebarVisible) sidebar.style.display = 'none';
-sidebarToggle.addEventListener('click', () => {
-  sidebarVisible = !sidebarVisible;
+if (!sidebarVisible) {
+  sidebar.style.display = 'none';
+  sidebarOpen.style.display = '';
+}
+
+function updateSidebarVisibility() {
   sidebar.style.display = sidebarVisible ? '' : 'none';
+  sidebarOpen.style.display = sidebarVisible ? 'none' : '';
+}
+
+sidebarToggle.addEventListener('click', () => {
+  sidebarVisible = false;
+  updateSidebarVisibility();
+});
+
+sidebarOpen.addEventListener('click', () => {
+  sidebarVisible = true;
+  updateSidebarVisibility();
+});
+
+window.addEventListener('resize', () => {
+  if (window.innerWidth <= 768 && sidebarVisible) return
+  if (window.innerWidth > 768) {
+    sidebarVisible = true
+  }
+  if (window.innerWidth <= 768 && !sidebarVisible) {
+    sidebarVisible = false
+  }
+  updateSidebarVisibility()
+});
+
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape') return
+  if (!sidebarVisible) return
+  sidebarVisible = !sidebarVisible;
+  updateSidebarVisibility();
 });
 
 // ========== Sidebar Nav ==========
@@ -756,8 +748,11 @@ const content = {
     { html: '  <span class="t-success">✓</span> Multi-tab terminal management', delay: 50 },
     { html: '  <span class="t-success">✓</span> Claude Code, Codex &amp; more', delay: 50 },
     { html: '  <span class="t-success">✓</span> Split panes with browser views', delay: 50 },
+    { html: '  <span class="t-success">✓</span> In-pane terminal search with Ctrl+F', delay: 50 },
+    { html: '  <span class="t-success">✓</span> Advanced OSC52 clipboard policy (Ask/Always/Never)', delay: 50 },
     { html: '  <span class="t-success">✓</span> Session history &amp; AI summaries', delay: 50 },
-    { html: '  <span class="t-success">✓</span> Secure remote access over LAN/VPN', delay: 50 },
+    { html: '  <span class="t-success">✓</span> Remote tab copies keep layout and reconnect safely on this machine', delay: 50 },
+    { html: '  <span class="t-success">✓</span> Remote access with setup wizard &amp; QR code', delay: 50 },
     { html: '', delay: 300 },
     { html: '  <span class="t-dim">Your coding CLIs, organized in the browser.</span>', delay: 80 },
     { html: '  <span class="t-dim">GitHub:</span> <a href="https://github.com/danshapiro/freshell" target="_blank" class="t-blue">https://github.com/danshapiro/freshell</a>', delay: 80 },

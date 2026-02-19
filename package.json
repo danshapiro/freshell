@@ -1,7 +1,7 @@
 {
   "name": "freshell",
   "private": true,
-  "version": "0.4.5",
+  "version": "0.5.0",
   "type": "module",
   "scripts": {
     "predev": "tsx scripts/precheck.ts",
@@ -40,12 +40,21 @@
     "@dnd-kit/utilities": "^3.2.2",
     "@monaco-editor/react": "^4.6.0",
     "@reduxjs/toolkit": "^2.3.0",
+    "@use-gesture/react": "^10.3.1",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-search": "^0.16.0",
+    "@xterm/addon-webgl": "^0.19.0",
+    "@xterm/xterm": "^6.0.0",
     "ai": "^6.0.86",
     "chokidar": "^3.6.0",
+    "cookie-parser": "^1.4.7",
+    "diff": "^8.0.3",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "express-rate-limit": "^7.4.0",
     "glob": "^13.0.0",
+    "is-port-reachable": "^4.0.0",
+    "lean-qr": "^2.7.1",
     "lucide-react": "^0.469.0",
     "monaco-editor": "^0.52.0",
     "nanoid": "^5.0.7",
@@ -59,8 +68,6 @@
     "remark-gfm": "^4.0.0",
     "rotating-file-stream": "^3.2.8",
     "ws": "^8.18.0",
-    "xterm": "^5.3.0",
-    "xterm-addon-fit": "^0.8.0",
     "zod": "^4.0.0"
   },
   "devDependencies": {
@@ -70,6 +77,7 @@
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.1.0",
     "@testing-library/user-event": "^14.5.2",
+    "@types/cookie-parser": "^1.4.10",
     "@types/express": "^4.17.21",
     "@types/node": "^22.10.2",
     "@types/react": "^18.3.18",
@@ -79,7 +87,7 @@
     "@types/ws": "^8.5.12",
     "@typescript-eslint/eslint-plugin": "^8.54.0",
     "@typescript-eslint/parser": "^8.54.0",
-    "@vitejs/plugin-react": "^4.3.4",
+    "@vitejs/plugin-react": "^4.7.0",
     "autoprefixer": "^10.4.20",
     "concurrently": "^9.1.2",
     "cross-env": "^7.0.3",
@@ -96,7 +104,7 @@
     "tailwindcss": "^3.4.17",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
-    "vite": "^5.4.11",
-    "vitest": "^2.1.8"
+    "vite": "^6.4.1",
+    "vitest": "^3.2.4"
   }
 }

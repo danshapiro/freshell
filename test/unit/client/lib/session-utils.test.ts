@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
-import { getSessionsForHello, findTabIdForSession, findPaneForSession } from '@/lib/session-utils'
+import { getSessionsForHello, findTabIdForSession, findPaneForSession, collectSessionRefsFromNode, getActiveSessionRefForTab } from '@/lib/session-utils'
 import type { RootState } from '@/store/store'
-import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
+import type { PaneNode, TerminalPaneContent, ClaudeChatPaneContent, PaneContent } from '@/store/paneTypes'
 
 const VALID_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 const OTHER_SESSION_ID = '6f1c2b3a-4d5e-6f70-8a9b-0c1d2e3f4a5b'
@@ -16,7 +16,16 @@ function terminalContent(mode: TerminalPaneContent['mode'], resumeSessionId: str
   }
 }
 
-function leaf(id: string, content: TerminalPaneContent): PaneNode {
+function claudeChatContent(resumeSessionId?: string): ClaudeChatPaneContent {
+  return {
+    kind: 'claude-chat',
+    status: 'idle',
+    createRequestId: `req-chat-${resumeSessionId}`,
+    resumeSessionId,
+  }
+}
+
+function leaf(id: string, content: PaneContent): PaneNode {
   return {
     type: 'leaf',
     id,
@@ -272,5 +281,219 @@ describe('findPaneForSession', () => {
       tabId: 'tab-1',
       paneId: undefined,
     })
+  })
+})
+
+// === claude-chat (freshclaude) pane support ===
+
+describe('collectSessionRefsFromNode — claude-chat panes', () => {
+  it('prefers explicit sessionRef over legacy resumeSessionId', () => {
+    const node = leaf('p1', {
+      kind: 'terminal',
+      mode: 'shell',
+      status: 'running',
+      createRequestId: 'req-explicit',
+      resumeSessionId: 'legacy-shell-resume',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: 'codex-explicit-session',
+      },
+    })
+    expect(collectSessionRefsFromNode(node)).toEqual([
+      { provider: 'codex', sessionId: 'codex-explicit-session' },
+    ])
+  })
+
+  it('extracts session ref from a claude-chat pane', () => {
+    const node = leaf('p1', claudeChatContent(VALID_SESSION_ID))
+    expect(collectSessionRefsFromNode(node)).toEqual([
+      { provider: 'claude', sessionId: VALID_SESSION_ID },
+    ])
+  })
+
+  it('returns empty for a claude-chat pane without resumeSessionId', () => {
+    const node = leaf('p1', claudeChatContent(undefined))
+    expect(collectSessionRefsFromNode(node)).toEqual([])
+  })
+
+  it('returns empty for a claude-chat pane with invalid session ID', () => {
+    const node = leaf('p1', claudeChatContent('not-a-uuid'))
+    expect(collectSessionRefsFromNode(node)).toEqual([])
+  })
+
+  it('collects from split with terminal and claude-chat children', () => {
+    const node: PaneNode = {
+      type: 'split',
+      id: 'split-1',
+      direction: 'horizontal',
+      sizes: [50, 50],
+      children: [
+        leaf('p1', terminalContent('claude', VALID_SESSION_ID)),
+        leaf('p2', claudeChatContent(OTHER_SESSION_ID)),
+      ],
+    }
+    expect(collectSessionRefsFromNode(node)).toEqual([
+      { provider: 'claude', sessionId: VALID_SESSION_ID },
+      { provider: 'claude', sessionId: OTHER_SESSION_ID },
+    ])
+  })
+})
+
+describe('findPaneForSession — claude-chat panes', () => {
+  it('finds a claude-chat pane by session ID', () => {
+    const state = {
+      tabs: {
+        activeTabId: 'tab-1',
+        tabs: [{ id: 'tab-1' }],
+      },
+      panes: {
+        layouts: {
+          'tab-1': leaf('pane-chat', claudeChatContent(VALID_SESSION_ID)),
+        },
+        activePane: { 'tab-1': 'pane-chat' },
+      },
+    } as unknown as RootState
+
+    expect(findPaneForSession(state, 'claude', VALID_SESSION_ID)).toEqual({
+      tabId: 'tab-1',
+      paneId: 'pane-chat',
+    })
+  })
+
+  it('finds claude-chat pane in a split alongside a terminal pane', () => {
+    const layout: PaneNode = {
+      type: 'split',
+      id: 'split-1',
+      direction: 'horizontal',
+      sizes: [50, 50],
+      children: [
+        leaf('pane-term', terminalContent('shell' as TerminalPaneContent['mode'], '')),
+        leaf('pane-chat', claudeChatContent(VALID_SESSION_ID)),
+      ],
+    }
+
+    const state = {
+      tabs: {
+        activeTabId: 'tab-1',
+        tabs: [{ id: 'tab-1' }],
+      },
+      panes: {
+        layouts: { 'tab-1': layout },
+        activePane: { 'tab-1': 'pane-term' },
+      },
+    } as unknown as RootState
+
+    expect(findPaneForSession(state, 'claude', VALID_SESSION_ID)).toEqual({
+      tabId: 'tab-1',
+      paneId: 'pane-chat',
+    })
+  })
+})
+
+describe('findTabIdForSession — claude-chat panes', () => {
+  it('finds tab containing a claude-chat pane with matching session', () => {
+    const state = {
+      tabs: {
+        activeTabId: 'tab-1',
+        tabs: [{ id: 'tab-1' }],
+      },
+      panes: {
+        layouts: {
+          'tab-1': leaf('pane-chat', claudeChatContent(VALID_SESSION_ID)),
+        },
+        activePane: {},
+      },
+    } as unknown as RootState
+
+    expect(findTabIdForSession(state, 'claude', VALID_SESSION_ID)).toBe('tab-1')
+  })
+})
+
+describe('getActiveSessionRefForTab — claude-chat panes', () => {
+  it('returns session ref when active pane is a claude-chat pane', () => {
+    const state = {
+      tabs: {
+        activeTabId: 'tab-1',
+        tabs: [{ id: 'tab-1' }],
+      },
+      panes: {
+        layouts: {
+          'tab-1': leaf('pane-chat', claudeChatContent(VALID_SESSION_ID)),
+        },
+        activePane: { 'tab-1': 'pane-chat' },
+      },
+    } as unknown as RootState
+
+    expect(getActiveSessionRefForTab(state, 'tab-1')).toEqual({
+      provider: 'claude',
+      sessionId: VALID_SESSION_ID,
+    })
+  })
+})
+
+describe('getSessionsForHello — claude-chat panes', () => {
+  it('includes claude-chat pane session as active', () => {
+    const state = {
+      tabs: {
+        activeTabId: 'tab-1',
+        tabs: [{ id: 'tab-1' }],
+      },
+      panes: {
+        layouts: {
+          'tab-1': leaf('pane-chat', claudeChatContent(VALID_SESSION_ID)),
+        },
+        activePane: { 'tab-1': 'pane-chat' },
+      },
+    } as unknown as RootState
+
+    const result = getSessionsForHello(state)
+    expect(result.active).toBe(VALID_SESSION_ID)
+  })
+
+  it('includes claude-chat session as visible when not active pane', () => {
+    const layout: PaneNode = {
+      type: 'split',
+      id: 'split-1',
+      direction: 'horizontal',
+      sizes: [50, 50],
+      children: [
+        leaf('pane-term', terminalContent('claude', VALID_SESSION_ID)),
+        leaf('pane-chat', claudeChatContent(OTHER_SESSION_ID)),
+      ],
+    }
+
+    const state = {
+      tabs: {
+        activeTabId: 'tab-1',
+        tabs: [{ id: 'tab-1' }],
+      },
+      panes: {
+        layouts: { 'tab-1': layout },
+        activePane: { 'tab-1': 'pane-term' },
+      },
+    } as unknown as RootState
+
+    const result = getSessionsForHello(state)
+    expect(result.active).toBe(VALID_SESSION_ID)
+    expect(result.visible).toEqual([OTHER_SESSION_ID])
+  })
+
+  it('includes claude-chat session in background tabs', () => {
+    const state = {
+      tabs: {
+        activeTabId: 'tab-1',
+        tabs: [{ id: 'tab-1' }, { id: 'tab-2' }],
+      },
+      panes: {
+        layouts: {
+          'tab-1': leaf('pane-term', terminalContent('claude', VALID_SESSION_ID)),
+          'tab-2': leaf('pane-chat', claudeChatContent(OTHER_SESSION_ID)),
+        },
+        activePane: { 'tab-1': 'pane-term' },
+      },
+    } as unknown as RootState
+
+    const result = getSessionsForHello(state)
+    expect(result.background).toEqual([OTHER_SESSION_ID])
   })
 })

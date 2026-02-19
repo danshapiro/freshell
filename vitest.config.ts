@@ -17,6 +17,7 @@ export default defineConfig({
     alias: {
       '@': path.resolve(__dirname, './src'),
       '@test': path.resolve(__dirname, './test'),
+      '@shared': path.resolve(__dirname, './shared'),
     },
     // Maximum parallelization settings
     pool: 'threads',

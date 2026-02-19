@@ -4,10 +4,10 @@ import WebSocket, { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { logger } from './logger.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
-import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed } from './auth.js'
+import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed, timingSafeCompare } from './auth.js'
 import { modeSupportsResume } from './terminal-registry.js'
 import type { TerminalRegistry, TerminalMode } from './terminal-registry.js'
-import { configStore, type AppSettings } from './config-store.js'
+import { configStore, type AppSettings, type ConfigReadError } from './config-store.js'
 import type { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import type { ProjectGroup } from './coding-cli/types.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
@@ -15,15 +15,39 @@ import type { SessionRepairService } from './session-scanner/service.js'
 import type { SessionScanResult, SessionRepairResult } from './session-scanner/types.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
 import type { SdkBridge } from './sdk-bridge.js'
-import type { SdkServerMessage } from './sdk-bridge-types.js'
+import type { SdkServerMessage } from '../shared/ws-protocol.js'
+import { TabRegistryRecordBaseSchema, TabRegistryRecordSchema } from './tabs-registry/types.js'
+import type { TabsRegistryStore } from './tabs-registry/store.js'
 import {
+  ErrorCode,
+  ShellSchema,
+  CodingCliProviderSchema,
+  TokenSummarySchema,
+  TerminalMetaRecordSchema,
+  TerminalMetaListResponseSchema,
+  TerminalMetaUpdatedSchema,
+  HelloSchema,
+  PingSchema,
+  TerminalCreateSchema,
+  TerminalAttachSchema,
+  TerminalDetachSchema,
+  TerminalInputSchema,
+  TerminalResizeSchema,
+  TerminalKillSchema,
+  TerminalListSchema,
+  TerminalMetaListSchema,
+  CodingCliCreateSchema,
+  CodingCliInputSchema,
+  CodingCliKillSchema,
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
   SdkInterruptSchema,
   SdkKillSchema,
   SdkAttachSchema,
-} from './sdk-bridge-types.js'
+  SdkSetModelSchema,
+  SdkSetPermissionModeSchema,
+} from '../shared/ws-protocol.js'
 
 const MAX_CONNECTIONS = Number(process.env.MAX_CONNECTIONS || 10)
 const HELLO_TIMEOUT_MS = Number(process.env.HELLO_TIMEOUT_MS || 5_000)
@@ -48,6 +72,7 @@ interface LiveWebSocket extends WebSocket {
   isAlive?: boolean
   connectionId?: string
   connectedAt?: number
+  isMobileClient?: boolean
   // Generation counter for chunked session updates to prevent interleaving
   sessionUpdateGeneration?: number
 }
@@ -60,21 +85,14 @@ const CLOSE_CODES = {
   SERVER_SHUTDOWN: 4009,
 }
 
-const ErrorCode = z.enum([
-  'NOT_AUTHENTICATED',
-  'INVALID_MESSAGE',
-  'UNKNOWN_MESSAGE',
-  'INVALID_TERMINAL_ID',
-  'INVALID_SESSION_ID',
-  'PTY_SPAWN_FAILED',
-  'FILE_WATCHER_ERROR',
-  'INTERNAL_ERROR',
-  'RATE_LIMITED',
-  'UNAUTHORIZED',
-])
 
 function nowIso() {
   return new Date().toISOString()
+}
+
+function isMobileUserAgent(userAgent: string | undefined): boolean {
+  if (!userAgent) return false
+  return /Mobi|Android|iPhone|iPad|iPod/i.test(userAgent)
 }
 
 /**
@@ -181,137 +199,24 @@ export function chunkTerminalSnapshot(snapshot: string, maxBytes: number, termin
   return chunks
 }
 
-const HelloSchema = z.object({
-  type: z.literal('hello'),
-  token: z.string().optional(),
-  capabilities: z.object({
-    sessionsPatchV1: z.boolean().optional(),
-    terminalAttachChunkV1: z.boolean().optional(),
-  }).optional(),
-  sessions: z.object({
-    active: z.string().optional(),
-    visible: z.array(z.string()).optional(),
-    background: z.array(z.string()).optional(),
-  }).optional(),
+const TabsSyncPushRecordSchema = TabRegistryRecordBaseSchema.omit({
+  serverInstanceId: true,
+  deviceId: true,
+  deviceLabel: true,
 })
 
-const PingSchema = z.object({
-  type: z.literal('ping'),
+const TabsSyncPushSchema = z.object({
+  type: z.literal('tabs.sync.push'),
+  deviceId: z.string().min(1),
+  deviceLabel: z.string().min(1),
+  records: z.array(TabsSyncPushRecordSchema),
 })
 
-const ShellSchema = z.enum(['system', 'cmd', 'powershell', 'wsl'])
-
-const TerminalCreateSchema = z.object({
-  type: z.literal('terminal.create'),
+const TabsSyncQuerySchema = z.object({
+  type: z.literal('tabs.sync.query'),
   requestId: z.string().min(1),
-  // Mode supports shell and all coding CLI providers (future providers need spawn logic)
-  mode: z.enum(['shell', 'claude', 'codex', 'opencode', 'gemini', 'kimi']).default('shell'),
-  shell: ShellSchema.default('system'),
-  cwd: z.string().optional(),
-  resumeSessionId: z.string().optional(),
-  restore: z.boolean().optional(),
-})
-
-const TerminalAttachSchema = z.object({
-  type: z.literal('terminal.attach'),
-  terminalId: z.string().min(1),
-})
-
-const TerminalDetachSchema = z.object({
-  type: z.literal('terminal.detach'),
-  terminalId: z.string().min(1),
-})
-
-const TerminalInputSchema = z.object({
-  type: z.literal('terminal.input'),
-  terminalId: z.string().min(1),
-  data: z.string(),
-})
-
-const TerminalResizeSchema = z.object({
-  type: z.literal('terminal.resize'),
-  terminalId: z.string().min(1),
-  cols: z.number().int().min(2).max(1000),
-  rows: z.number().int().min(2).max(500),
-})
-
-const TerminalKillSchema = z.object({
-  type: z.literal('terminal.kill'),
-  terminalId: z.string().min(1),
-})
-
-const TerminalListSchema = z.object({
-  type: z.literal('terminal.list'),
-  requestId: z.string().min(1),
-})
-
-const TerminalMetaListSchema = z.object({
-  type: z.literal('terminal.meta.list'),
-  requestId: z.string().min(1),
-})
-
-const CodingCliProviderSchema = z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
-
-const TokenSummarySchema = z.object({
-  inputTokens: z.number().int().nonnegative(),
-  outputTokens: z.number().int().nonnegative(),
-  cachedTokens: z.number().int().nonnegative(),
-  totalTokens: z.number().int().nonnegative(),
-  contextTokens: z.number().int().nonnegative().optional(),
-  modelContextWindow: z.number().int().positive().optional(),
-  compactThresholdTokens: z.number().int().positive().optional(),
-  compactPercent: z.number().int().min(0).max(100).optional(),
-})
-
-const TerminalMetaRecordSchema = z.object({
-  terminalId: z.string().min(1),
-  cwd: z.string().optional(),
-  checkoutRoot: z.string().optional(),
-  repoRoot: z.string().optional(),
-  displaySubdir: z.string().optional(),
-  branch: z.string().optional(),
-  isDirty: z.boolean().optional(),
-  provider: CodingCliProviderSchema.optional(),
-  sessionId: z.string().optional(),
-  tokenUsage: TokenSummarySchema.optional(),
-  updatedAt: z.number().int().nonnegative(),
-})
-
-const TerminalMetaListResponseSchema = z.object({
-  type: z.literal('terminal.meta.list.response'),
-  requestId: z.string().min(1),
-  terminals: z.array(TerminalMetaRecordSchema),
-})
-
-const TerminalMetaUpdatedSchema = z.object({
-  type: z.literal('terminal.meta.updated'),
-  upsert: z.array(TerminalMetaRecordSchema),
-  remove: z.array(z.string().min(1)),
-})
-
-// Coding CLI session schemas
-const CodingCliCreateSchema = z.object({
-  type: z.literal('codingcli.create'),
-  requestId: z.string().min(1),
-  provider: CodingCliProviderSchema,
-  prompt: z.string().min(1),
-  cwd: z.string().optional(),
-  resumeSessionId: z.string().optional(),
-  model: z.string().optional(),
-  maxTurns: z.number().int().positive().optional(),
-  permissionMode: z.enum(['default', 'plan', 'acceptEdits', 'bypassPermissions']).optional(),
-  sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
-})
-
-const CodingCliInputSchema = z.object({
-  type: z.literal('codingcli.input'),
-  sessionId: z.string().min(1),
-  data: z.string(),
-})
-
-const CodingCliKillSchema = z.object({
-  type: z.literal('codingcli.kill'),
-  sessionId: z.string().min(1),
+  deviceId: z.string().min(1),
+  rangeDays: z.number().int().positive().optional(),
 })
 
 const ClientMessageSchema = z.discriminatedUnion('type', [
@@ -325,6 +230,8 @@ const ClientMessageSchema = z.discriminatedUnion('type', [
   TerminalKillSchema,
   TerminalListSchema,
   TerminalMetaListSchema,
+  TabsSyncPushSchema,
+  TabsSyncQuerySchema,
   CodingCliCreateSchema,
   CodingCliInputSchema,
   CodingCliKillSchema,
@@ -334,6 +241,8 @@ const ClientMessageSchema = z.discriminatedUnion('type', [
   SdkInterruptSchema,
   SdkKillSchema,
   SdkAttachSchema,
+  SdkSetModelSchema,
+  SdkSetPermissionModeSchema,
 ])
 
 type ClientState = {
@@ -356,6 +265,10 @@ type HandshakeSnapshot = {
   settings?: AppSettings
   projects?: ProjectGroup[]
   perfLogging?: boolean
+  configFallback?: {
+    reason: ConfigReadError
+    backupExists: boolean
+  }
 }
 
 type HandshakeSnapshotProvider = () => Promise<HandshakeSnapshot>
@@ -371,6 +284,8 @@ export class WsHandler {
   private sessionRepairService?: SessionRepairService
   private handshakeSnapshotProvider?: HandshakeSnapshotProvider
   private terminalMetaListProvider?: () => TerminalMeta[]
+  private tabsRegistryStore?: TabsRegistryStore
+  private readonly serverInstanceId: string
   private sessionRepairListeners?: {
     scanned: (result: SessionScanResult) => void
     repaired: (result: SessionRepairResult) => void
@@ -384,11 +299,17 @@ export class WsHandler {
     private sdkBridge?: SdkBridge,
     sessionRepairService?: SessionRepairService,
     handshakeSnapshotProvider?: HandshakeSnapshotProvider,
-    terminalMetaListProvider?: () => TerminalMeta[]
+    terminalMetaListProvider?: () => TerminalMeta[],
+    tabsRegistryStore?: TabsRegistryStore,
+    serverInstanceId?: string,
   ) {
     this.sessionRepairService = sessionRepairService
     this.handshakeSnapshotProvider = handshakeSnapshotProvider
     this.terminalMetaListProvider = terminalMetaListProvider
+    this.tabsRegistryStore = tabsRegistryStore
+    this.serverInstanceId = serverInstanceId && serverInstanceId.trim().length > 0
+      ? serverInstanceId
+      : `srv-${randomUUID()}`
     this.wss = new WebSocketServer({
       server,
       path: '/ws',
@@ -528,6 +449,7 @@ export class WsHandler {
     const connectionId = randomUUID()
     ws.connectionId = connectionId
     ws.connectedAt = Date.now()
+    ws.isMobileClient = isMobileUserAgent(userAgent)
 
     const state: ClientState = {
       authenticated: false,
@@ -650,6 +572,7 @@ export class WsHandler {
   }
 
   private send(ws: LiveWebSocket, msg: unknown) {
+    let messageType: string | undefined
     try {
       // Backpressure guard.
       // @ts-ignore
@@ -657,7 +580,6 @@ export class WsHandler {
       if (this.closeForBackpressureIfNeeded(ws, buffered)) return
       let serialized = ''
       let payloadBytes: number | undefined
-      let messageType: string | undefined
       let serializeMs: number | undefined
       let shouldLogSend = false
 
@@ -703,8 +625,15 @@ export class WsHandler {
           'warn',
         )
       })
-    } catch {
-      // ignore
+    } catch (err) {
+      log.warn(
+        {
+          err: err instanceof Error ? err : new Error(String(err)),
+          connectionId: ws.connectionId || 'unknown',
+          messageType: messageType || 'unknown',
+        },
+        'WebSocket send failed',
+      )
     }
   }
 
@@ -956,6 +885,9 @@ export class WsHandler {
       if (typeof snapshot.perfLogging === 'boolean') {
         this.safeSend(ws, { type: 'perf.logging', enabled: snapshot.perfLogging })
       }
+      if (snapshot.configFallback) {
+        this.safeSend(ws, { type: 'config.fallback', ...snapshot.configFallback })
+      }
     } catch (err) {
       logger.warn({ err }, 'Failed to send handshake snapshot')
     }
@@ -1038,7 +970,7 @@ export class WsHandler {
 
       if (m.type === 'hello') {
         const expected = getRequiredAuthToken()
-        if (!m.token || m.token !== expected) {
+        if (!m.token || !timingSafeCompare(m.token, expected)) {
           log.warn({ event: 'ws_auth_failed', connectionId: ws.connectionId }, 'WebSocket auth failed')
           this.sendError(ws, { code: 'NOT_AUTHENTICATED', message: 'Invalid token' })
           ws.close(CLOSE_CODES.NOT_AUTHENTICATED, 'Invalid token')
@@ -1047,6 +979,9 @@ export class WsHandler {
         state.authenticated = true
         state.supportsSessionsPatchV1 = !!m.capabilities?.sessionsPatchV1
         state.supportsTerminalAttachChunkV1 = !!m.capabilities?.terminalAttachChunkV1
+        if (typeof m.client?.mobile === 'boolean') {
+          ws.isMobileClient = m.client.mobile
+        }
         if (state.helloTimer) clearTimeout(state.helloTimer)
 
         log.info({ event: 'ws_authenticated', connectionId: ws.connectionId }, 'WebSocket client authenticated')
@@ -1066,7 +1001,7 @@ export class WsHandler {
           this.sessionRepairService.prioritizeSessions(m.sessions)
         }
 
-        this.send(ws, { type: 'ready', timestamp: nowIso() })
+        this.send(ws, { type: 'ready', timestamp: nowIso(), serverInstanceId: this.serverInstanceId })
         this.scheduleHandshakeSnapshot(ws, state)
         return
       }
@@ -1095,6 +1030,13 @@ export class WsHandler {
         let error = false
         let rateLimited = false
         try {
+          // Load config before the synchronous idempotency check to avoid
+          // async yield points between the check and registration.
+          const cfg = await awaitConfig()
+          const providerSettings = m.mode !== 'shell'
+            ? cfg.settings?.codingCli?.providers?.[m.mode as keyof typeof cfg.settings.codingCli.providers] || {}
+            : undefined
+
           const existingId = state.createdByRequestId.get(m.requestId)
           if (existingId) {
             if (existingId === REPAIR_PENDING_SENTINEL) {
@@ -1146,7 +1088,20 @@ export class WsHandler {
           }
 
           if (modeSupportsResume(m.mode as TerminalMode) && effectiveResumeSessionId) {
-            const existing = this.registry.findRunningTerminalBySession(m.mode as TerminalMode, effectiveResumeSessionId)
+            let existing = this.registry.getCanonicalRunningTerminalBySession(
+              m.mode as TerminalMode,
+              effectiveResumeSessionId,
+            )
+            if (!existing) {
+              this.registry.repairLegacySessionOwners(
+                m.mode as TerminalMode,
+                effectiveResumeSessionId,
+              )
+              existing = this.registry.getCanonicalRunningTerminalBySession(
+                m.mode as TerminalMode,
+                effectiveResumeSessionId,
+              )
+            }
             if (existing) {
               this.registry.attach(existing.terminalId, ws, { pendingSnapshot: true })
               state.attachedTerminalIds.add(existing.terminalId)
@@ -1214,11 +1169,13 @@ export class WsHandler {
             originalResumeSessionId: m.resumeSessionId,
             effectiveResumeSessionId,
           }, '[TRACE resumeSessionId] about to create terminal')
+
           const record = this.registry.create({
             mode: m.mode as TerminalMode,
             shell: m.shell as 'system' | 'cmd' | 'powershell' | 'wsl',
             cwd: m.cwd,
             resumeSessionId: effectiveResumeSessionId,
+            providerSettings: providerSettings ? { permissionMode: providerSettings.permissionMode } : undefined,
           })
 
           if (m.mode !== 'shell' && typeof m.cwd === 'string' && m.cwd.trim()) {
@@ -1351,6 +1308,47 @@ export class WsHandler {
           return
         }
         this.send(ws, response.data)
+        return
+      }
+
+      case 'tabs.sync.push': {
+        if (!this.tabsRegistryStore) {
+          this.sendError(ws, {
+            code: 'INTERNAL_ERROR',
+            message: 'Tabs registry unavailable',
+          })
+          return
+        }
+        for (const record of m.records) {
+          await this.tabsRegistryStore.upsert({
+            ...record,
+            serverInstanceId: this.serverInstanceId,
+            deviceId: m.deviceId,
+            deviceLabel: m.deviceLabel,
+          })
+        }
+        this.send(ws, { type: 'tabs.sync.ack', updated: m.records.length })
+        return
+      }
+
+      case 'tabs.sync.query': {
+        if (!this.tabsRegistryStore) {
+          this.send(ws, {
+            type: 'tabs.sync.snapshot',
+            requestId: m.requestId,
+            data: { localOpen: [], remoteOpen: [], closed: [] },
+          })
+          return
+        }
+        const data = await this.tabsRegistryStore.query({
+          deviceId: m.deviceId,
+          rangeDays: m.rangeDays,
+        })
+        this.send(ws, {
+          type: 'tabs.sync.snapshot',
+          requestId: m.requestId,
+          data,
+        })
         return
       }
 
@@ -1509,6 +1507,7 @@ export class WsHandler {
             resumeSessionId: m.resumeSessionId,
             model: m.model,
             permissionMode: m.permissionMode,
+            effort: m.effort,
           })
           state.sdkSessions.add(session.sessionId)
 
@@ -1573,8 +1572,12 @@ export class WsHandler {
           return
         }
         const decision: import('./sdk-bridge-types.js').PermissionResult = m.behavior === 'allow'
-          ? { behavior: 'allow', updatedInput: m.updatedInput, updatedPermissions: m.updatedPermissions as import('./sdk-bridge-types.js').PermissionUpdate[] | undefined }
-          : { behavior: 'deny', message: m.message || 'Denied by user', interrupt: m.interrupt }
+          ? {
+              behavior: 'allow',
+              updatedInput: m.updatedInput ?? {},
+              ...(m.updatedPermissions && { updatedPermissions: m.updatedPermissions as import('./sdk-bridge-types.js').PermissionUpdate[] }),
+            }
+          : { behavior: 'deny', message: m.message || 'Denied by user', ...(m.interrupt !== undefined && { interrupt: m.interrupt }) }
         const ok = this.sdkBridge.respondPermission(m.sessionId, m.requestId, decision)
         if (!ok) {
           this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'SDK session not found' })
@@ -1612,6 +1615,32 @@ export class WsHandler {
           state.sdkSubscriptions.delete(m.sessionId)
         }
         this.send(ws, { type: 'sdk.killed', sessionId: m.sessionId, success: killed })
+        return
+      }
+
+      case 'sdk.set-model': {
+        if (!this.sdkBridge) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
+          return
+        }
+        if (!state.sdkSessions.has(m.sessionId) && !state.sdkSubscriptions.has(m.sessionId)) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
+          return
+        }
+        this.sdkBridge.setModel(m.sessionId, m.model)
+        return
+      }
+
+      case 'sdk.set-permission-mode': {
+        if (!this.sdkBridge) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
+          return
+        }
+        if (!state.sdkSessions.has(m.sessionId) && !state.sdkSubscriptions.has(m.sessionId)) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
+          return
+        }
+        this.sdkBridge.setPermissionMode(m.sessionId, m.permissionMode)
         return
       }
 
@@ -1714,6 +1743,53 @@ export class WsHandler {
     }
 
     this.broadcast(parsed.data)
+  }
+
+  /**
+   * Prepare for hot rebind: close all client connections and set the closed
+   * flag so the patched server.close() → this.close() is a no-op.
+   */
+  prepareForRebind(): void {
+    for (const ws of this.connections) {
+      try {
+        ws.close(CLOSE_CODES.SERVER_SHUTDOWN, 'Server rebinding')
+        setTimeout(() => {
+          if (ws.readyState !== ws.CLOSED) {
+            ws.terminate()
+          }
+        }, 5000)
+      } catch {
+        try { ws.terminate() } catch { /* ignore */ }
+      }
+    }
+
+    if (this.pingInterval) {
+      clearInterval(this.pingInterval)
+      this.pingInterval = null
+    }
+
+    this.closed = true
+    log.info('WsHandler prepared for rebind (connections closed, WSS preserved)')
+  }
+
+  /**
+   * Resume after hot rebind: reset the closed flag and restart ping interval.
+   */
+  resumeAfterRebind(): void {
+    this.closed = false
+
+    this.pingInterval = setInterval(() => {
+      for (const ws of this.connections) {
+        if (ws.isAlive === false) {
+          ws.terminate()
+          continue
+        }
+        ws.isAlive = false
+        ws.ping()
+      }
+    }, PING_INTERVAL_MS)
+
+    log.info('WsHandler resumed after rebind')
   }
 
   /**

@@ -18,7 +18,7 @@ export function derivePaneTitle(content: PaneContent): string {
   }
 
   if (content.kind === 'claude-chat') {
-    return 'Claude Web'
+    return 'freshclaude'
   }
 
   if (content.kind === 'browser') {

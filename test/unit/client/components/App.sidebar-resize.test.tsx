@@ -9,6 +9,7 @@ import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
 import idleWarningsReducer from '@/store/idleWarningsSlice'
+import { networkReducer } from '@/store/networkSlice'
 
 // Mock the WebSocket client
 const mockSend = vi.fn()
@@ -43,8 +44,21 @@ vi.mock('@/components/TabContent', () => ({
 }))
 
 vi.mock('@/components/Sidebar', () => ({
-  default: ({ view, onNavigate, width }: { view: string; onNavigate: (v: string) => void; width?: number }) => (
+  default: ({
+    view,
+    onNavigate,
+    onToggleSidebar,
+    width,
+  }: {
+    view: string
+    onNavigate: (v: string) => void
+    onToggleSidebar?: () => void
+    width?: number
+  }) => (
     <div data-testid="mock-sidebar" data-view={view} data-width={width} style={{ width: `${width}px` }}>
+      <button title="Hide sidebar" onClick={() => onToggleSidebar?.()}>
+        Hide sidebar
+      </button>
       Sidebar
     </div>
   ),
@@ -67,6 +81,9 @@ vi.mock('@/components/OverviewView', () => ({
 vi.mock('@/hooks/useTheme', () => ({
   useThemeEffect: () => {},
 }))
+vi.mock('@/components/SetupWizard', () => ({
+  SetupWizard: () => <div data-testid="mock-setup-wizard">Setup Wizard</div>,
+}))
 
 function createTestStore(options?: {
   sidebarWidth?: number
@@ -80,6 +97,7 @@ function createTestStore(options?: {
       sessions: sessionsReducer,
       panes: panesReducer,
       idleWarnings: idleWarningsReducer,
+      network: networkReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -121,6 +139,7 @@ function createTestStore(options?: {
       idleWarnings: {
         warnings: {},
       },
+      network: { status: null, loading: false, configuring: false, error: null },
     },
   })
 }
@@ -137,8 +156,7 @@ describe('App Component - Sidebar Resize', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     localStorage.clear()
-    // Mock window.innerWidth for desktop
-    Object.defineProperty(window, 'innerWidth', { value: 1024, writable: true })
+    // Default: desktop viewport (matchMedia matches=false is the default)
 
     mockApiGet.mockImplementation((url: string) => {
       if (url === '/api/settings') return Promise.resolve(defaultSettings)
@@ -150,6 +168,7 @@ describe('App Component - Sidebar Resize', () => {
 
   afterEach(() => {
     cleanup()
+    ;(globalThis as any).setMobileForTest(false)
   })
 
   describe('sidebar toggle button', () => {
@@ -234,21 +253,19 @@ describe('App Component - Sidebar Resize', () => {
   })
 
   describe('mobile responsive behavior', () => {
-    beforeEach(() => {
-      // Mock window.innerWidth for mobile
-      Object.defineProperty(window, 'innerWidth', { value: 600, writable: true })
+    afterEach(() => {
+      ;(globalThis as any).setMobileForTest(false)
     })
 
     it('auto-collapses sidebar on mobile viewport', async () => {
       const store = createTestStore({ sidebarCollapsed: false })
 
-      // Trigger the resize event after render
-      renderApp(store)
-
-      // Dispatch resize event to trigger mobile detection
+      // Simulate mobile viewport via matchMedia mock
       act(() => {
-        window.dispatchEvent(new Event('resize'))
+        ;(globalThis as any).setMobileForTest(true)
       })
+
+      renderApp(store)
 
       // Sidebar should auto-collapse on mobile
       await waitFor(() => {

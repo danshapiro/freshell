@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, within } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import PanePicker from '@/components/panes/PanePicker'
@@ -148,7 +148,22 @@ describe('PanePicker', () => {
       expect(screen.queryByRole('button', { name: 'Codex' })).not.toBeInTheDocument()
     })
 
-    it('renders options in correct order: CLIs, Claude Web, Editor, Browser, Shell', () => {
+    it('renders provider icons as inline SVGs (not img tags)', () => {
+      renderPicker({
+        availableClis: { claude: true, codex: true },
+        enabledProviders: ['claude', 'codex'],
+      })
+      const claudeButton = screen.getByRole('button', { name: 'Claude' })
+      const codexButton = screen.getByRole('button', { name: 'Codex' })
+
+      // Should render inline SVGs that inherit color, not <img> tags
+      expect(claudeButton.querySelector('svg')).toBeInTheDocument()
+      expect(claudeButton.querySelector('img')).not.toBeInTheDocument()
+      expect(codexButton.querySelector('svg')).toBeInTheDocument()
+      expect(codexButton.querySelector('img')).not.toBeInTheDocument()
+    })
+
+    it('renders options in correct order: CLIs, freshclaude, Editor, Browser, Shell', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
@@ -157,7 +172,7 @@ describe('PanePicker', () => {
       const labels = buttons.map(b => b.getAttribute('aria-label'))
       expect(labels[0]).toBe('Claude')
       expect(labels[1]).toBe('Codex')
-      expect(labels[2]).toBe('Claude Web')
+      expect(labels[2]).toBe('freshclaude')
       expect(labels[3]).toBe('Editor')
       expect(labels[4]).toBe('Browser')
       expect(labels[5]).toBe('Shell')
@@ -416,7 +431,7 @@ describe('PanePicker', () => {
 
     it('applies responsive gap classes to button container', () => {
       renderPicker()
-      const buttonContainer = getContainer().querySelector('.flex.flex-wrap')!
+      const buttonContainer = screen.getByTestId('pane-picker-options')
       expect(buttonContainer).toHaveClass('gap-2')
     })
 
@@ -424,6 +439,20 @@ describe('PanePicker', () => {
       renderPicker()
       const shellButton = screen.getByText('Shell').closest('button')!
       expect(shellButton).toHaveClass('p-2')
+    })
+  })
+
+  describe('balanced icon layout', () => {
+    it('prefers a balanced 3+2 arrangement when five options are visible', () => {
+      renderPicker({
+        availableClis: { claude: true },
+        enabledProviders: ['claude'],
+      })
+
+      const rows = screen.getAllByTestId('pane-picker-option-row')
+      expect(rows).toHaveLength(2)
+      expect(within(rows[0]).getAllByRole('button')).toHaveLength(3)
+      expect(within(rows[1]).getAllByRole('button')).toHaveLength(2)
     })
   })
 })

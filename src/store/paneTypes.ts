@@ -1,4 +1,10 @@
-import type { TerminalStatus, TabMode, ShellType } from './types'
+import type { TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
+
+export type SessionLocator = {
+  provider: CodingCliProviderName
+  sessionId: string
+  serverInstanceId?: string
+}
 
 /**
  * Terminal pane content with full lifecycle management.
@@ -18,6 +24,8 @@ export type TerminalPaneContent = {
   shell?: ShellType
   /** Claude session to resume */
   resumeSessionId?: string
+  /** Portable session reference for cross-device tab snapshots */
+  sessionRef?: SessionLocator
   /** Initial working directory */
   initialCwd?: string
 }
@@ -59,7 +67,7 @@ export type PickerPaneContent = {
 export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited'
 
 /**
- * Claude Web chat pane — rich chat UI powered by Claude Code SDK mode.
+ * freshclaude chat pane — rich chat UI powered by Claude Code SDK mode.
  */
 export type ClaudeChatPaneContent = {
   kind: 'claude-chat'
@@ -71,8 +79,24 @@ export type ClaudeChatPaneContent = {
   status: SdkSessionStatus
   /** Claude session to resume */
   resumeSessionId?: string
+  /** Portable session reference for cross-device tab snapshots */
+  sessionRef?: SessionLocator
   /** Working directory */
   initialCwd?: string
+  /** Model to use (default: claude-opus-4-6) */
+  model?: string
+  /** Permission mode (default: bypassPermissions) */
+  permissionMode?: string
+  /** Effort level (default: high, creation-time only) */
+  effort?: 'low' | 'medium' | 'high' | 'max'
+  /** Show thinking blocks in message feed (default: true) */
+  showThinking?: boolean
+  /** Show tool-use blocks in message feed (default: true) */
+  showTools?: boolean
+  /** Show timestamps on messages (default: false) */
+  showTimecodes?: boolean
+  /** Whether the user has dismissed the first-launch settings popover */
+  settingsDismissed?: boolean
 }
 
 /**

@@ -133,7 +133,7 @@ export const ContextMenu = forwardRef<HTMLDivElement, ContextMenuProps>(function
             aria-disabled={item.disabled || undefined}
             disabled={item.disabled}
             className={cn(
-              'flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors',
+              'flex w-full items-center gap-2 px-4 py-3 md:px-3 md:py-2 text-left text-sm transition-colors',
               item.disabled
                 ? 'text-muted-foreground/60 cursor-not-allowed'
                 : 'hover:bg-muted',

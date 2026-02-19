@@ -32,13 +32,14 @@ vi.mock('@/lib/terminal-themes', () => ({
 
 const terminalInstances: any[] = []
 
-vi.mock('xterm', () => {
+vi.mock('@xterm/xterm', () => {
   class MockTerminal {
     options: Record<string, unknown> = {}
     cols = 80
     rows = 24
     open = vi.fn()
     loadAddon = vi.fn()
+    registerLinkProvider = vi.fn(() => ({ dispose: vi.fn() }))
     write = vi.fn()
     writeln = vi.fn()
     clear = vi.fn()
@@ -59,13 +60,13 @@ vi.mock('xterm', () => {
   return { Terminal: MockTerminal }
 })
 
-vi.mock('xterm-addon-fit', () => ({
+vi.mock('@xterm/addon-fit', () => ({
   FitAddon: class {
     fit = vi.fn()
   },
 }))
 
-vi.mock('xterm/css/xterm.css', () => ({}))
+vi.mock('@xterm/xterm/css/xterm.css', () => ({}))
 
 class MockResizeObserver {
   observe = vi.fn()

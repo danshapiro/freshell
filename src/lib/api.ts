@@ -8,6 +8,15 @@ export type ApiError = {
   details?: unknown
 }
 
+export function isApiUnauthorizedError(error: unknown): error is ApiError {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'status' in error &&
+    (error as { status?: unknown }).status === 401
+  )
+}
+
 async function request<T = any>(path: string, options: RequestInit = {}): Promise<T> {
   const perfEnabled = isClientPerfLoggingEnabled() && typeof performance !== 'undefined'
   const perfConfig = getClientPerfConfig()
@@ -112,6 +121,17 @@ export const api = {
   delete<T = any>(path: string): Promise<T> {
     return request<T>(path, { method: 'DELETE' })
   },
+}
+
+export type VersionInfo = {
+  currentVersion: string
+  updateCheck: {
+    updateAvailable: boolean
+    currentVersion: string
+    latestVersion: string | null
+    releaseUrl: string | null
+    error: string | null
+  } | null
 }
 
 export type SearchResult = {

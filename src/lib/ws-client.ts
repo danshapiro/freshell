@@ -1,10 +1,24 @@
 import { getClientPerfConfig, logClientPerf } from '@/lib/perf-logger'
 import { getAuthToken } from '@/lib/auth'
+import type { ServerMessage } from '@shared/ws-protocol'
 
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'ready'
-type MessageHandler = (msg: any) => void
+type MessageHandler = (msg: ServerMessage) => void
 type ReconnectHandler = () => void
-type HelloExtensionProvider = () => { sessions?: { active?: string; visible?: string[]; background?: string[] } }
+type HelloExtensionProvider = () => {
+  sessions?: { active?: string; visible?: string[]; background?: string[] }
+  client?: { mobile?: boolean }
+}
+type TabsSyncPushPayload = {
+  deviceId: string
+  deviceLabel: string
+  records: unknown[]
+}
+type TabsSyncQueryPayload = {
+  requestId: string
+  deviceId: string
+  rangeDays?: number
+}
 
 const CONNECTION_TIMEOUT_MS = 10_000
 const perfConfig = getClientPerfConfig()
@@ -12,6 +26,7 @@ const perfConfig = getClientPerfConfig()
 export class WsClient {
   private ws: WebSocket | null = null
   private _state: ConnectionState = 'disconnected'
+  private _serverInstanceId: string | undefined
   private connectPromise: Promise<void> | null = null
   private messageHandlers = new Set<MessageHandler>()
   private reconnectHandlers = new Set<ReconnectHandler>()
@@ -27,6 +42,8 @@ export class WsClient {
   private maxQueueSize = 1000
   private connectStartedAt: number | null = null
   private lastQueueLogAt = 0
+  private reconnectTimer: number | null = null
+  private readyTimeout: number | null = null
 
   constructor(private url: string) {}
 
@@ -46,6 +63,10 @@ export class WsClient {
     return this._state === 'ready'
   }
 
+  get serverInstanceId(): string | undefined {
+    return this._serverInstanceId
+  }
+
   connect(): Promise<void> {
     // StrictMode / double-mount safe: callers can call connect() multiple times and should
     // receive the same in-flight promise until the socket is "ready".
@@ -56,6 +77,8 @@ export class WsClient {
     if (this.connectPromise) return this.connectPromise
 
     this.intentionalClose = false
+    this.clearReconnectTimer()
+    this.clearReadyTimeout()
     this._state = 'connecting'
     if (perfConfig.enabled) {
       this.connectStartedAt = performance.now()
@@ -78,7 +101,7 @@ export class WsClient {
         }
       }
 
-      const timeout = window.setTimeout(() => {
+      this.readyTimeout = window.setTimeout(() => {
         finishReject(new Error('Connection timeout: ready not received'))
         this.ws?.close()
       }, CONNECTION_TIMEOUT_MS)
@@ -101,16 +124,19 @@ export class WsClient {
       }
 
       this.ws.onmessage = (event) => {
-        let msg: any
+        let msg: ServerMessage
         try {
-          msg = JSON.parse(event.data)
+          msg = JSON.parse(event.data) as ServerMessage
         } catch {
           // Ignore invalid JSON
           return
         }
 
         if (msg.type === 'ready') {
-          window.clearTimeout(timeout)
+          this._serverInstanceId = typeof msg.serverInstanceId === 'string' && msg.serverInstanceId.trim()
+            ? msg.serverInstanceId
+            : undefined
+          this.clearReadyTimeout()
           const isReconnect = this.wasConnectedOnce
           this.wasConnectedOnce = true
           this._state = 'ready'
@@ -145,7 +171,7 @@ export class WsClient {
         }
 
         if (msg.type === 'error' && msg.code === 'NOT_AUTHENTICATED') {
-          window.clearTimeout(timeout)
+          this.clearReadyTimeout()
           finishReject(new Error('Authentication failed'))
           return
         }
@@ -166,7 +192,7 @@ export class WsClient {
       }
 
       this.ws.onclose = (event) => {
-        window.clearTimeout(timeout)
+        this.clearReadyTimeout()
         const wasConnecting = this._state === 'connecting'
         this._state = 'disconnected'
         this.ws = null
@@ -195,6 +221,15 @@ export class WsClient {
           // Backpressure close - surface as warning, but don't reconnect aggressively.
           finishReject(new Error('Connection too slow (backpressure)'))
           this.scheduleReconnect({ minDelayMs: 5000 })
+          return
+        }
+
+        if (event.code === 4009) {
+          // SERVER_SHUTDOWN — server is rebinding and will be back shortly.
+          // Reset backoff for a fast ~1s reconnect.
+          this.reconnectAttempts = 0
+          finishReject(new Error('Server restarting (rebind)'))
+          this.scheduleReconnect()
           return
         }
 
@@ -237,7 +272,9 @@ export class WsClient {
     const delay = Math.max(baseDelay, opts?.minDelayMs ?? 0)
     this.reconnectAttempts++
 
-    window.setTimeout(() => {
+    this.clearReconnectTimer()
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null
       if (!this.intentionalClose) {
         this.connect().catch((err) => console.error('WsClient: reconnect failed', err))
       }
@@ -253,10 +290,29 @@ export class WsClient {
 
   disconnect() {
     this.intentionalClose = true
+    this.clearReconnectTimer()
+    this.clearReadyTimeout()
     this.ws?.close()
     this.ws = null
     this._state = 'disconnected'
     this.pendingMessages = []
+    this._serverInstanceId = undefined
+    this.connectPromise = null
+    this.reconnectAttempts = 0
+  }
+
+  private clearReconnectTimer() {
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+  }
+
+  private clearReadyTimeout() {
+    if (this.readyTimeout !== null) {
+      window.clearTimeout(this.readyTimeout)
+      this.readyTimeout = null
+    }
   }
 
   /**
@@ -288,6 +344,20 @@ export class WsClient {
     }
   }
 
+  sendTabsSyncPush(payload: TabsSyncPushPayload) {
+    this.send({
+      type: 'tabs.sync.push',
+      ...payload,
+    })
+  }
+
+  sendTabsSyncQuery(payload: TabsSyncQueryPayload) {
+    this.send({
+      type: 'tabs.sync.query',
+      ...payload,
+    })
+  }
+
   onMessage(handler: MessageHandler): () => void {
     this.messageHandlers.add(handler)
     return () => this.messageHandlers.delete(handler)
@@ -308,4 +378,9 @@ export function getWsClient(): WsClient {
     wsClient = new WsClient(`${protocol}//${host}/ws`)
   }
   return wsClient
+}
+
+export function resetWsClientForTests(): void {
+  wsClient?.disconnect()
+  wsClient = null
 }

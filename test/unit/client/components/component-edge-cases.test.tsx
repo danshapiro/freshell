@@ -74,7 +74,16 @@ vi.mock('lucide-react', () => ({
   Circle: ({ className }: { className?: string }) => <svg data-testid="circle-icon" className={className} />,
   Terminal: ({ className }: { className?: string }) => <svg data-testid="terminal-icon" className={className} />,
   History: ({ className }: { className?: string }) => <svg data-testid="history-icon" className={className} />,
+  Folder: ({ className }: { className?: string }) => <svg data-testid="folder-icon" className={className} />,
+  PanelLeftClose: ({ className }: { className?: string }) => <svg data-testid="panel-left-close-icon" className={className} />,
+  AlertCircle: ({ className }: { className?: string }) => <svg data-testid="alert-circle-icon" className={className} />,
+  Archive: ({ className }: { className?: string }) => <svg data-testid="archive-icon" className={className} />,
   Settings: ({ className }: { className?: string }) => <svg data-testid="settings-icon" className={className} />,
+  Monitor: ({ className }: { className?: string }) => <svg data-testid="monitor-icon" className={className} />,
+  TerminalSquare: ({ className }: { className?: string }) => <svg data-testid="terminal-square-icon" className={className} />,
+  FileCode2: ({ className }: { className?: string }) => <svg data-testid="file-code-icon" className={className} />,
+  Bot: ({ className }: { className?: string }) => <svg data-testid="bot-icon" className={className} />,
+  Square: ({ className }: { className?: string }) => <svg data-testid="square-icon" className={className} />,
   LayoutGrid: ({ className }: { className?: string }) => <svg data-testid="layout-icon" className={className} />,
   Globe: ({ className }: { className?: string }) => <svg data-testid="globe-icon" className={className} />,
   FileText: ({ className }: { className?: string }) => <svg data-testid="file-text-icon" className={className} />,
@@ -137,6 +146,7 @@ import sessionsReducer, { SessionsState } from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import codingCliReducer from '@/store/codingCliSlice'
 import panesReducer from '@/store/panesSlice'
+import { networkReducer } from '@/store/networkSlice'
 import type { Tab, AppSettings, ProjectGroup, BackgroundTerminal } from '@/store/types'
 
 // Import the mocked api to get access to the mocks
@@ -162,6 +172,7 @@ function createTestStore(state: TestStoreState = {}) {
       connection: connectionReducer,
       codingCli: codingCliReducer,
       panes: panesReducer,
+      network: networkReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -1083,6 +1094,7 @@ describe('Component Edge Cases', () => {
         const store = configureStore({
           reducer: {
             settings: (state = { settings: undefined, loaded: false }) => state,
+            network: networkReducer,
           },
           preloadedState: {
             settings: { settings: undefined, loaded: false } as any,

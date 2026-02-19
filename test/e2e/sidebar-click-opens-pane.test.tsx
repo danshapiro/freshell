@@ -342,6 +342,83 @@ describe('sidebar click opens pane (e2e)', () => {
     expect(state.panes.layouts['tab-2'].type).toBe('leaf')
   })
 
+  it('clicking a session already open in a claude-chat pane focuses it', async () => {
+    const targetId = sessionId('freshclaude-open')
+
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/home/user/project',
+        sessions: [
+          {
+            sessionId: targetId,
+            projectPath: '/home/user/project',
+            updatedAt: Date.now(),
+            title: 'Freshclaude session',
+            cwd: '/home/user/project',
+          },
+        ],
+      },
+    ]
+
+    const store = createStore({
+      projects,
+      tabs: [
+        { id: 'tab-1', mode: 'shell' },
+        { id: 'tab-2', mode: 'claude' },
+      ],
+      activeTabId: 'tab-1',
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'shell',
+              createRequestId: 'req-1',
+              status: 'running',
+            },
+          },
+          'tab-2': {
+            type: 'leaf',
+            id: 'pane-chat',
+            content: {
+              kind: 'claude-chat',
+              createRequestId: 'req-chat',
+              status: 'idle',
+              resumeSessionId: targetId,
+            },
+          },
+        },
+        activePane: {
+          'tab-1': 'pane-1',
+          'tab-2': 'pane-chat',
+        },
+        paneTitles: {},
+      },
+    })
+
+    renderSidebar(store)
+
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    const sessionButton = screen.getByText('Freshclaude session').closest('button')
+    fireEvent.click(sessionButton!)
+
+    const state = store.getState()
+
+    // Should not create any new tabs or panes
+    expect(state.tabs.tabs).toHaveLength(2)
+    // Should switch to tab-2 where the freshclaude session lives
+    expect(state.tabs.activeTabId).toBe('tab-2')
+    // Should focus the existing claude-chat pane
+    expect(state.panes.activePane['tab-2']).toBe('pane-chat')
+    // Layout should be unchanged (still a leaf, no split)
+    expect(state.panes.layouts['tab-2'].type).toBe('leaf')
+  })
+
   it('clicking a session with no active tab creates a new tab', async () => {
     const projects: ProjectGroup[] = [
       {

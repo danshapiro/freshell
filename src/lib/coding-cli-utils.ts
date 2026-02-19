@@ -1,11 +1,8 @@
 import type { CodingCliProviderName } from './coding-cli-types'
-import claudeIconUrl from '../../assets/icons/claude-code.svg'
-import codexIconUrl from '../../assets/icons/codex_openai.svg'
 
 export type CodingCliProviderConfig = {
   name: CodingCliProviderName
   label: string
-  iconUrl?: string
   supportsModel?: boolean
   supportsSandbox?: boolean
   supportsPermissionMode?: boolean
@@ -31,13 +28,11 @@ export const CODING_CLI_PROVIDER_CONFIGS: CodingCliProviderConfig[] = [
   {
     name: 'claude',
     label: CODING_CLI_PROVIDER_LABELS.claude,
-    iconUrl: claudeIconUrl,
     supportsPermissionMode: true,
   },
   {
     name: 'codex',
     label: CODING_CLI_PROVIDER_LABELS.codex,
-    iconUrl: codexIconUrl,
     supportsModel: true,
     supportsSandbox: true,
   },

@@ -10,6 +10,8 @@ vi.setConfig({ testTimeout: TEST_TIMEOUT_MS, hookTimeout: HOOK_TIMEOUT_MS })
 type Snapshot = {
   settings: any
   projects: any[]
+  perfLogging?: boolean
+  configFallback?: { reason: string; backupExists: boolean }
 }
 
 function listen(server: http.Server, timeoutMs = HOOK_TIMEOUT_MS): Promise<{ port: number }> {
@@ -206,6 +208,44 @@ describe('ws handshake snapshot', () => {
 
       expect(settingsMsg.settings).toEqual(snapshot.settings)
       expect(sessionsMsg.projects).toEqual(snapshot.projects)
+    } finally {
+      await closeWs()
+    }
+  })
+
+  it('sends config fallback snapshot payload when available', async () => {
+    snapshot = {
+      ...snapshot,
+      configFallback: {
+        reason: 'PARSE_ERROR',
+        backupExists: true,
+      },
+    }
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const closeWs = async () => {
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.terminate()
+      }
+      await new Promise<void>((resolve) => ws.on('close', () => resolve()))
+    }
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+
+      const MSG_TIMEOUT = 10_000
+      const readyPromise = waitForMessage(ws, (m) => m.type === 'ready', MSG_TIMEOUT)
+      const fallbackPromise = waitForMessage(ws, (m) => m.type === 'config.fallback', MSG_TIMEOUT)
+
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+
+      await readyPromise
+      const fallbackMsg = await fallbackPromise
+      expect(fallbackMsg).toEqual({
+        type: 'config.fallback',
+        reason: 'PARSE_ERROR',
+        backupExists: true,
+      })
     } finally {
       await closeWs()
     }

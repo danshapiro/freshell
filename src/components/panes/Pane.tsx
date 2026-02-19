@@ -27,6 +27,7 @@ interface PaneProps {
   onRenameBlur?: () => void
   onRenameKeyDown?: (e: React.KeyboardEvent) => void
   onDoubleClickTitle?: () => void
+  onSearch?: () => void
 }
 
 export default function Pane({
@@ -51,6 +52,7 @@ export default function Pane({
   onRenameBlur,
   onRenameKeyDown,
   onDoubleClickTitle,
+  onSearch,
 }: PaneProps) {
   const showHeader = title !== undefined
 
@@ -92,6 +94,7 @@ export default function Pane({
             onRenameBlur={onRenameBlur}
             onRenameKeyDown={onRenameKeyDown}
             onDoubleClick={onDoubleClickTitle}
+            onSearch={onSearch}
           />
         </div>
       )}
@@ -112,7 +115,7 @@ export default function Pane({
       )}
 
       {/* Content */}
-      <div className="h-full w-full min-h-0">
+      <div className="flex-1 w-full min-h-0">
         {children}
       </div>
     </div>

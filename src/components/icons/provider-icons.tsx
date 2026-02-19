@@ -71,6 +71,10 @@ export function GeminiIcon(props: IconProps) {
   )
 }
 
+export function FreshclaudeIcon(props: IconProps) {
+  return <ClaudeIcon {...props} />
+}
+
 // Fallback for unknown providers
 export function DefaultProviderIcon(props: IconProps) {
   return (

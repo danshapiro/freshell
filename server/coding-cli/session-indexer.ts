@@ -7,10 +7,13 @@ import { getPerfConfig, startPerfTimer } from '../perf-logger.js'
 import { configStore, SessionOverride } from '../config-store.js'
 import type { CodingCliProvider } from './provider.js'
 import { makeSessionKey, type CodingCliSession, type CodingCliProviderName, type ProjectGroup } from './types.js'
+import { diffProjects } from '../sessions-sync/diff.js'
 
 const perfConfig = getPerfConfig()
 const REFRESH_YIELD_EVERY = 200
 const SESSION_SNIPPET_BYTES = 256 * 1024
+const SEEN_SESSION_RETENTION_MS = Number(process.env.CODING_CLI_SEEN_SESSION_RETENTION_MS || 7 * 24 * 60 * 60 * 1000)
+const MAX_SEEN_SESSION_IDS = Number(process.env.CODING_CLI_SEEN_SESSION_MAX || 10_000)
 
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve))
 const IS_WINDOWS = process.platform === 'win32'
@@ -39,6 +42,8 @@ function applyOverride(session: CodingCliSession, ov: SessionOverride | undefine
     ...session,
     title: ov?.titleOverride || session.title,
     summary: ov?.summaryOverride || session.summary,
+    createdAt: ov?.createdAtOverride ?? session.createdAt,
+    archived: ov?.archived ?? session.archived ?? false,
   }
 }
 
@@ -112,6 +117,11 @@ export class CodingCliSessionIndexer {
   private lastRefreshAt = 0
   private readonly debounceMs: number
   private readonly throttleMs: number
+  private knownSessionIds = new Set<string>()
+  private seenSessionIds = new Map<string, number>()
+  private onNewSessionHandlers = new Set<(session: CodingCliSession) => void>()
+  private initialized = false
+  private sessionKeyToFilePath = new Map<string, string>()
 
   constructor(private providers: CodingCliProvider[], options: SessionIndexerOptions = {}) {
     this.debounceMs = options.debounceMs ?? DEFAULT_DEBOUNCE_MS
@@ -121,6 +131,7 @@ export class CodingCliSessionIndexer {
   async start() {
     this.needsFullScan = true
     await this.refresh()
+    this.initialized = true
     const globs = this.providers.map((p) => p.getSessionGlob())
     logger.info({ globs, debounceMs: this.debounceMs, throttleMs: this.throttleMs }, 'Starting coding CLI sessions watcher')
 
@@ -156,8 +167,35 @@ export class CodingCliSessionIndexer {
     return () => this.onUpdateHandlers.delete(handler)
   }
 
+  onNewSession(handler: (session: CodingCliSession) => void): () => void {
+    this.onNewSessionHandlers.add(handler)
+    return () => this.onNewSessionHandlers.delete(handler)
+  }
+
   getProjects(): ProjectGroup[] {
     return this.projects
+  }
+
+  getFilePathForSession(sessionId: string, provider?: CodingCliProviderName): string | undefined {
+    if (provider) {
+      return this.sessionKeyToFilePath.get(makeSessionKey(provider, sessionId))
+    }
+
+    // Session repair currently resolves Claude sessions by bare session ID.
+    // Preserve that behavior for existing call sites.
+    const claudePath = this.sessionKeyToFilePath.get(makeSessionKey('claude', sessionId))
+    if (claudePath) return claudePath
+
+    let match: string | undefined
+    const suffix = `:${sessionId}`
+    for (const [key, filePath] of this.sessionKeyToFilePath) {
+      if (!key.endsWith(suffix)) continue
+      if (match && match !== filePath) {
+        return undefined
+      }
+      match = filePath
+    }
+    return match
   }
 
   private markDirty(filePath: string) {
@@ -189,12 +227,84 @@ export class CodingCliSessionIndexer {
     return matched
   }
 
+  private deleteCacheEntry(cacheKey: string) {
+    const cached = this.fileCache.get(cacheKey)
+    if (cached?.baseSession?.sessionId) {
+      this.sessionKeyToFilePath.delete(makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId))
+    }
+    this.fileCache.delete(cacheKey)
+  }
+
+  private pruneSeenSessions(now: number) {
+    const cutoff = now - SEEN_SESSION_RETENTION_MS
+    for (const [id, lastSeen] of this.seenSessionIds) {
+      if (lastSeen < cutoff) {
+        this.seenSessionIds.delete(id)
+      }
+    }
+
+    if (this.seenSessionIds.size <= MAX_SEEN_SESSION_IDS) return
+    const ordered = Array.from(this.seenSessionIds.entries()).sort((a, b) => a[1] - b[1])
+    const overflow = this.seenSessionIds.size - MAX_SEEN_SESSION_IDS
+    for (let i = 0; i < overflow; i++) {
+      this.seenSessionIds.delete(ordered[i][0])
+    }
+  }
+
+  private detectNewSessions(sessions: CodingCliSession[]) {
+    const currentIds = new Set<string>(sessions.map((s) => makeSessionKey(s.provider, s.sessionId)))
+
+    // Prune knownSessionIds to only contain IDs that still exist
+    for (const id of this.knownSessionIds) {
+      if (!currentIds.has(id)) {
+        this.knownSessionIds.delete(id)
+      }
+    }
+
+    const now = Date.now()
+    this.pruneSeenSessions(now)
+
+    const newSessions: CodingCliSession[] = []
+    for (const session of sessions) {
+      if (!session.cwd) continue
+
+      const sessionKey = makeSessionKey(session.provider, session.sessionId)
+      const wasKnown = this.knownSessionIds.has(sessionKey)
+      if (!wasKnown) this.knownSessionIds.add(sessionKey)
+
+      const seenBefore = this.seenSessionIds.has(sessionKey)
+      this.seenSessionIds.set(sessionKey, now)
+
+      if (this.initialized && !wasKnown && !seenBefore) {
+        newSessions.push(session)
+      }
+    }
+
+    if (this.initialized && newSessions.length > 0) {
+      newSessions.sort((a, b) => {
+        const diff = a.updatedAt - b.updatedAt
+        return diff !== 0
+          ? diff
+          : makeSessionKey(a.provider, a.sessionId).localeCompare(makeSessionKey(b.provider, b.sessionId))
+      })
+      for (const session of newSessions) {
+        for (const h of this.onNewSessionHandlers) {
+          try {
+            h(session)
+          } catch (err) {
+            logger.warn({ err }, 'onNewSession handler failed')
+          }
+        }
+      }
+    }
+  }
+
   private async updateCacheEntry(provider: CodingCliProvider, filePath: string, cacheKey: string) {
     let stat: Stats
     try {
       stat = await fsp.stat(filePath)
     } catch {
-      this.fileCache.delete(cacheKey)
+      this.deleteCacheEntry(cacheKey)
       return
     }
 
@@ -204,6 +314,11 @@ export class CodingCliSessionIndexer {
     const cached = this.fileCache.get(cacheKey)
     if (cached && cached.mtimeMs === mtimeMs && cached.size === size) {
       return
+    }
+
+    // Clean up previous session mapping before re-parsing
+    if (cached?.baseSession?.sessionId) {
+      this.sessionKeyToFilePath.delete(makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId))
     }
 
     const content = await readSessionSnippet(filePath)
@@ -244,6 +359,7 @@ export class CodingCliSessionIndexer {
       size,
       baseSession,
     })
+    this.sessionKeyToFilePath.set(makeSessionKey(provider.name, sessionId), filePath)
   }
 
   scheduleRefresh() {
@@ -340,7 +456,7 @@ export class CodingCliSessionIndexer {
         }
         const cached = this.fileCache.get(cachedFile)
         if (!cached || !enabledSet.has(cached.provider) || !seenFiles.has(cachedFile)) {
-          this.fileCache.delete(cachedFile)
+          this.deleteCacheEntry(cachedFile)
         }
       }
     } else {
@@ -350,7 +466,7 @@ export class CodingCliSessionIndexer {
       this.dirtyFiles.clear()
 
       for (const file of deletedFiles) {
-        this.fileCache.delete(file)
+        this.deleteCacheEntry(file)
       }
 
       for (const file of dirtyFiles) {
@@ -367,7 +483,7 @@ export class CodingCliSessionIndexer {
           continue
         }
         if (!enabledSet.has(provider.name)) {
-          this.fileCache.delete(file)
+          this.deleteCacheEntry(file)
           continue
         }
         await this.updateCacheEntry(provider, file, file)
@@ -385,7 +501,7 @@ export class CodingCliSessionIndexer {
         await yieldToEventLoop()
       }
       if (!enabledSet.has(cached.provider)) {
-        this.fileCache.delete(cachedFile)
+        this.deleteCacheEntry(cachedFile)
         continue
       }
       if (!cached.baseSession) continue
@@ -428,9 +544,18 @@ export class CodingCliSessionIndexer {
       return 0
     })
 
-    this.projects = groups
-    this.emitUpdate()
-    endRefreshTimer({ projectCount: groups.length, sessionCount, fileCount })
+    const allSessions = groups.flatMap((g) => g.sessions)
+    this.detectNewSessions(allSessions)
+
+    const projectsDiff = diffProjects(this.projects, groups)
+    const changed = projectsDiff.upsertProjects.length > 0 || projectsDiff.removeProjectPaths.length > 0
+    if (changed) {
+      this.projects = groups
+      this.emitUpdate()
+    } else {
+      logger.debug({ sessionCount, fileCount }, 'Skipping no-op refresh (no project changes)')
+    }
+    endRefreshTimer({ projectCount: groups.length, sessionCount, fileCount, skipped: !changed })
   }
 
   private emitUpdate() {

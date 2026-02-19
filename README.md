@@ -39,7 +39,7 @@
 
 ```bash
 # Clone the repository at the latest stable release
-git clone --branch v0.4.5 https://github.com/danshapiro/freshell.git
+git clone --branch v0.5.0 https://github.com/danshapiro/freshell.git
 cd freshell
 
 # Install dependencies

@@ -1,11 +1,33 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updateSettingsLocal, markSaved, defaultSettings, mergeSettings } from '@/store/settingsSlice'
+import {
+  persistDeviceAlias,
+  persistOwnDeviceLabel,
+  setTabRegistryDeviceAliases,
+  setTabRegistryDeviceLabel,
+} from '@/store/tabRegistrySlice'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { terminalThemes, darkThemes, lightThemes, getTerminalTheme } from '@/lib/terminal-themes'
 import { resolveTerminalFontFamily, saveLocalTerminalFontFamily } from '@/lib/terminal-fonts'
-import type { SidebarSortMode, TerminalTheme, CodexSandboxMode, ClaudePermissionMode, CodingCliProviderName } from '@/store/types'
+import type {
+  AppSettings,
+  SidebarSortMode,
+  TerminalTheme,
+  CodexSandboxMode,
+  ClaudePermissionMode,
+  CodingCliProviderName,
+  TabAttentionStyle,
+  AttentionDismiss,
+} from '@/store/types'
+import type { DeepPartial } from '@/lib/type-utils'
+import { configureNetwork, fetchNetworkStatus } from '@/store/networkSlice'
+import { addTab } from '@/store/tabsSlice'
+import { initLayout } from '@/store/panesSlice'
+import { fetchFirewallConfig } from '@/lib/firewall-configure'
+import { nanoid } from '@reduxjs/toolkit'
+import type { AppView } from '@/components/Sidebar'
 import { CODING_CLI_PROVIDER_CONFIGS } from '@/lib/coding-cli-utils'
 
 /** Monospace fonts with good Unicode block element support for terminal use */
@@ -133,7 +155,7 @@ function normalizePreviewLine(tokens: PreviewToken[], width: number): PreviewTok
   return normalized
 }
 
-export default function SettingsView() {
+export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePanel }: { onNavigate?: (view: AppView) => void; onFirewallTerminal?: (cmd: { tabId: string; command: string }) => void; onSharePanel?: () => void } = {}) {
   const dispatch = useAppDispatch()
   const rawSettings = useAppSelector((s) => s.settings.settings)
   const settings = useMemo(
@@ -141,16 +163,29 @@ export default function SettingsView() {
     [rawSettings],
   )
   const lastSavedAt = useAppSelector((s) => s.settings.lastSavedAt)
+  const networkStatus = useAppSelector((s) => s.network.status)
+  const configuring = useAppSelector((s) => s.network.configuring)
   const enabledProviders = useMemo(
     () => settings.codingCli?.enabledProviders ?? [],
     [settings.codingCli?.enabledProviders],
   )
+  const tabRegistryState = useAppSelector((s) => (s as any).tabRegistry)
+  const tabRegistry = tabRegistryState ?? {
+    deviceId: 'local-device',
+    deviceLabel: 'local-device',
+    deviceAliases: {} as Record<string, string>,
+    localOpen: [],
+    remoteOpen: [],
+    closed: [],
+  }
 
   const [availableTerminalFonts, setAvailableTerminalFonts] = useState(terminalFonts)
   const [fontsReady, setFontsReady] = useState(false)
+  const [terminalAdvancedOpen, setTerminalAdvancedOpen] = useState(false)
   const [defaultCwdInput, setDefaultCwdInput] = useState(settings.defaultCwd ?? '')
   const [defaultCwdError, setDefaultCwdError] = useState<string | null>(null)
-
+  const [deviceNameInputs, setDeviceNameInputs] = useState<Record<string, string>>({})
+  const terminalAdvancedId = useId()
   const pendingRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const defaultCwdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const defaultCwdValidationRef = useRef(0)
@@ -178,7 +213,7 @@ export default function SettingsView() {
   )
 
   const patch = useMemo(
-    () => async (updates: any) => {
+    () => async (updates: DeepPartial<AppSettings>) => {
       await api.patch('/api/settings', updates)
       dispatch(markSaved())
     },
@@ -213,8 +248,9 @@ export default function SettingsView() {
 
   const commitDefaultCwd = useCallback((nextValue: string | undefined) => {
     if (nextValue === settings.defaultCwd) return
-    dispatch(updateSettingsLocal({ defaultCwd: nextValue } as any))
-    patch({ defaultCwd: nextValue ?? null } as any).catch((err) => console.warn('Failed to save settings', err))
+    dispatch(updateSettingsLocal({ defaultCwd: nextValue }))
+    // Send '' to API when clearing — JSON.stringify strips undefined, but server normalizes '' → undefined
+    patch({ defaultCwd: nextValue ?? '' }).catch((err) => console.warn('Failed to save settings', err))
   }, [dispatch, patch, settings.defaultCwd])
 
   const scheduleDefaultCwdValidation = useCallback((value: string) => {
@@ -299,7 +335,7 @@ export default function SettingsView() {
         setProviderCwdErrors((prev) => ({ ...prev, [key]: null }))
         dispatch(updateSettingsLocal({
           codingCli: { providers: { [providerName]: { cwd: undefined } } },
-        } as any))
+        }))
         scheduleSave({ codingCli: { providers: { [providerName]: { cwd: undefined } } } })
         return
       }
@@ -311,7 +347,7 @@ export default function SettingsView() {
             setProviderCwdErrors((prev) => ({ ...prev, [key]: null }))
             dispatch(updateSettingsLocal({
               codingCli: { providers: { [providerName]: { cwd: trimmed } } },
-            } as any))
+            }))
             scheduleSave({ codingCli: { providers: { [providerName]: { cwd: trimmed } } } })
           } else {
             setProviderCwdErrors((prev) => ({ ...prev, [key]: 'directory not found' }))
@@ -328,9 +364,71 @@ export default function SettingsView() {
     const next = enabled
       ? Array.from(new Set([...enabledProviders, provider]))
       : enabledProviders.filter((p) => p !== provider)
-    dispatch(updateSettingsLocal({ codingCli: { enabledProviders: next } } as any))
+    dispatch(updateSettingsLocal({ codingCli: { enabledProviders: next } }))
     scheduleSave({ codingCli: { enabledProviders: next } })
   }, [dispatch, enabledProviders, scheduleSave])
+
+  const knownDevices = useMemo(() => {
+    const entries = new Map<string, { deviceId: string; baseLabel: string; isOwn: boolean }>()
+    entries.set(tabRegistry.deviceId, {
+      deviceId: tabRegistry.deviceId,
+      baseLabel: tabRegistry.deviceLabel,
+      isOwn: true,
+    })
+
+    const addRecord = (record: { deviceId: string; deviceLabel: string }) => {
+      if (!entries.has(record.deviceId)) {
+        entries.set(record.deviceId, {
+          deviceId: record.deviceId,
+          baseLabel: record.deviceLabel,
+          isOwn: record.deviceId === tabRegistry.deviceId,
+        })
+      }
+    }
+
+    tabRegistry.localOpen.forEach(addRecord)
+    tabRegistry.remoteOpen.forEach(addRecord)
+    tabRegistry.closed.forEach(addRecord)
+
+    return [...entries.values()]
+      .map((entry) => ({
+        ...entry,
+        effectiveLabel: entry.isOwn
+          ? tabRegistry.deviceLabel
+          : (tabRegistry.deviceAliases[entry.deviceId] || entry.baseLabel),
+      }))
+      .sort((a, b) => Number(b.isOwn) - Number(a.isOwn) || a.effectiveLabel.localeCompare(b.effectiveLabel))
+  }, [tabRegistry])
+
+  useEffect(() => {
+    setDeviceNameInputs((current) => {
+      const next: Record<string, string> = {}
+      for (const device of knownDevices) {
+        next[device.deviceId] = current[device.deviceId] ?? device.effectiveLabel
+      }
+      const changed =
+        Object.keys(current).length !== Object.keys(next).length ||
+        Object.entries(next).some(([key, value]) => current[key] !== value)
+      return changed ? next : current
+    })
+  }, [knownDevices])
+
+  const saveDeviceName = useCallback((deviceId: string, isOwn: boolean) => {
+    const nextValue = (deviceNameInputs[deviceId] || '').trim()
+    if (isOwn) {
+      const persisted = persistOwnDeviceLabel(nextValue || tabRegistry.deviceLabel)
+      dispatch(setTabRegistryDeviceLabel(persisted))
+      setDeviceNameInputs((current) => ({ ...current, [deviceId]: persisted }))
+      return
+    }
+    const aliases = persistDeviceAlias(deviceId, nextValue || undefined)
+    dispatch(setTabRegistryDeviceAliases(aliases))
+    const fallbackLabel = knownDevices.find((d) => d.deviceId === deviceId)?.baseLabel || ''
+    setDeviceNameInputs((current) => ({
+      ...current,
+      [deviceId]: aliases[deviceId] || fallbackLabel,
+    }))
+  }, [deviceNameInputs, dispatch, knownDevices, tabRegistry.deviceLabel])
 
   useEffect(() => {
     let cancelled = false
@@ -416,7 +514,7 @@ export default function SettingsView() {
     if (isSelectedFontAvailable) return
     if (fallbackFontFamily === settings.terminal.fontFamily) return
 
-    dispatch(updateSettingsLocal({ terminal: { fontFamily: fallbackFontFamily } } as any))
+    dispatch(updateSettingsLocal({ terminal: { fontFamily: fallbackFontFamily } }))
     saveLocalTerminalFontFamily(fallbackFontFamily)
   }, [
     dispatch,
@@ -429,7 +527,7 @@ export default function SettingsView() {
   return (
     <div className="h-full flex flex-col">
       {/* Header */}
-      <div className="px-6 py-5 border-b border-border/30">
+      <div className="border-b border-border/30 px-3 py-4 md:px-6 md:py-5">
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-xl font-semibold tracking-tight">Settings</h1>
@@ -442,7 +540,7 @@ export default function SettingsView() {
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto">
-        <div className="max-w-2xl mx-auto px-6 py-6 space-y-8">
+        <div className="mx-auto w-full max-w-2xl space-y-8 px-3 py-4 md:px-6 md:py-6">
 
           {/* Terminal preview */}
           <div className="space-y-2" data-testid="terminal-preview">
@@ -454,7 +552,7 @@ export default function SettingsView() {
               aria-label="Terminal preview"
               className="rounded-md border border-border/40 shadow-sm overflow-hidden font-mono"
               style={{
-                width: '40ch',
+                width: 'min(100%, 40ch)',
                 height: `${terminalPreviewHeight * settings.terminal.lineHeight}em`,
                 fontFamily: resolveTerminalFontFamily(settings.terminal.fontFamily),
                 fontSize: `${settings.terminal.fontSize}px`,
@@ -492,7 +590,7 @@ export default function SettingsView() {
                   { value: 'dark', label: 'Dark' },
                 ]}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ theme: v as any }))
+                  dispatch(updateSettingsLocal({ theme: v as AppSettings['theme'] }))
                   scheduleSave({ theme: v })
                 }}
               />
@@ -515,6 +613,40 @@ export default function SettingsView() {
 
           </SettingsSection>
 
+          <SettingsSection
+            title="Devices"
+            description="Rename devices for the Tabs workspace. Remote device aliases apply only on this machine."
+          >
+            {knownDevices.map((device) => (
+              <SettingsRow
+                key={device.deviceId}
+                label={device.isOwn ? 'This machine' : device.baseLabel}
+                description={device.isOwn ? 'Renaming this updates what other machines see.' : 'Alias stored locally on this machine only.'}
+              >
+                <div className="flex w-full items-center gap-2 md:w-auto">
+                  <input
+                    type="text"
+                    value={deviceNameInputs[device.deviceId] ?? device.effectiveLabel}
+                    onChange={(event) => setDeviceNameInputs((current) => ({
+                      ...current,
+                      [device.deviceId]: event.target.value,
+                    }))}
+                    className="h-10 w-full min-w-[14rem] px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-[20rem]"
+                    aria-label={`Device name for ${device.effectiveLabel}`}
+                    placeholder={device.baseLabel}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => saveDeviceName(device.deviceId, device.isOwn)}
+                    className="h-10 px-3 text-sm rounded-md border border-border hover:bg-muted md:h-8"
+                  >
+                    Save
+                  </button>
+                </div>
+              </SettingsRow>
+            ))}
+          </SettingsSection>
+
           {/* Sidebar */}
           <SettingsSection title="Sidebar" description="Session list and navigation">
             <SettingsRow label="Sort mode">
@@ -522,10 +654,10 @@ export default function SettingsView() {
                 value={settings.sidebar?.sortMode || 'recency-pinned'}
                 onChange={(e) => {
                   const v = e.target.value as SidebarSortMode
-                  dispatch(updateSettingsLocal({ sidebar: { sortMode: v } } as any))
+                  dispatch(updateSettingsLocal({ sidebar: { sortMode: v } }))
                   scheduleSave({ sidebar: { sortMode: v } })
                 }}
-                className="h-8 px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border"
+                className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
               >
                 <option value="recency">Recency</option>
                 <option value="recency-pinned">Recency (pinned)</option>
@@ -538,7 +670,7 @@ export default function SettingsView() {
               <Toggle
                 checked={settings.sidebar?.showProjectBadges ?? true}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ sidebar: { showProjectBadges: checked } } as any))
+                  dispatch(updateSettingsLocal({ sidebar: { showProjectBadges: checked } }))
                   scheduleSave({ sidebar: { showProjectBadges: checked } })
                 }}
               />
@@ -548,7 +680,7 @@ export default function SettingsView() {
               <Toggle
                 checked={settings.sidebar?.showSubagents ?? false}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ sidebar: { showSubagents: checked } } as any))
+                  dispatch(updateSettingsLocal({ sidebar: { showSubagents: checked } }))
                   scheduleSave({ sidebar: { showSubagents: checked } })
                 }}
               />
@@ -558,7 +690,7 @@ export default function SettingsView() {
               <Toggle
                 checked={settings.sidebar?.showNoninteractiveSessions ?? false}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ sidebar: { showNoninteractiveSessions: checked } } as any))
+                  dispatch(updateSettingsLocal({ sidebar: { showNoninteractiveSessions: checked } }))
                   scheduleSave({ sidebar: { showNoninteractiveSessions: checked } })
                 }}
               />
@@ -573,10 +705,10 @@ export default function SettingsView() {
                 value={settings.panes?.defaultNewPane || 'ask'}
                 onChange={(e) => {
                   const v = e.target.value as 'ask' | 'shell' | 'browser' | 'editor'
-                  dispatch(updateSettingsLocal({ panes: { defaultNewPane: v } } as any))
+                  dispatch(updateSettingsLocal({ panes: { defaultNewPane: v } }))
                   scheduleSave({ panes: { defaultNewPane: v } })
                 }}
-                className="h-8 px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border"
+                className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
               >
                 <option value="ask">Ask</option>
                 <option value="shell">Shell</option>
@@ -594,7 +726,7 @@ export default function SettingsView() {
                 labelWidth="w-10"
                 format={(v) => v === 0 ? 'Off' : `${v}%`}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ panes: { snapThreshold: v } } as any))
+                  dispatch(updateSettingsLocal({ panes: { snapThreshold: v } }))
                   scheduleSave({ panes: { snapThreshold: v } })
                 }}
               />
@@ -604,7 +736,7 @@ export default function SettingsView() {
               <Toggle
                 checked={settings.panes?.iconsOnTabs ?? true}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ panes: { iconsOnTabs: checked } } as any))
+                  dispatch(updateSettingsLocal({ panes: { iconsOnTabs: checked } }))
                   scheduleSave({ panes: { iconsOnTabs: checked } })
                 }}
               />
@@ -620,8 +752,9 @@ export default function SettingsView() {
                   { value: 'none', label: 'None' },
                 ]}
                 onChange={(v: string) => {
-                  dispatch(updateSettingsLocal({ panes: { tabAttentionStyle: v } } as any))
-                  scheduleSave({ panes: { tabAttentionStyle: v } })
+                  const tabAttentionStyle = v as TabAttentionStyle
+                  dispatch(updateSettingsLocal({ panes: { tabAttentionStyle } }))
+                  scheduleSave({ panes: { tabAttentionStyle } })
                 }}
               />
             </SettingsRow>
@@ -634,8 +767,9 @@ export default function SettingsView() {
                   { value: 'type', label: 'Typing' },
                 ]}
                 onChange={(v: string) => {
-                  dispatch(updateSettingsLocal({ panes: { attentionDismiss: v } } as any))
-                  scheduleSave({ panes: { attentionDismiss: v } })
+                  const attentionDismiss = v as AttentionDismiss
+                  dispatch(updateSettingsLocal({ panes: { attentionDismiss } }))
+                  scheduleSave({ panes: { attentionDismiss } })
                 }}
               />
             </SettingsRow>
@@ -647,7 +781,7 @@ export default function SettingsView() {
               <Toggle
                 checked={settings.notifications?.soundEnabled ?? true}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ notifications: { soundEnabled: checked } } as any))
+                  dispatch(updateSettingsLocal({ notifications: { soundEnabled: checked } }))
                   scheduleSave({ notifications: { soundEnabled: checked } })
                 }}
               />
@@ -661,10 +795,10 @@ export default function SettingsView() {
                 value={settings.terminal.theme}
                 onChange={(e) => {
                   const v = e.target.value as TerminalTheme
-                  dispatch(updateSettingsLocal({ terminal: { theme: v } } as any))
+                  dispatch(updateSettingsLocal({ terminal: { theme: v } }))
                   scheduleSave({ terminal: { theme: v } })
                 }}
-                className="h-8 px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border"
+                className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
               >
                 <option value="auto">Auto (follow app theme)</option>
                 <optgroup label="Dark themes">
@@ -689,7 +823,7 @@ export default function SettingsView() {
                 labelWidth="w-20"
                 format={(v) => `${v}px (${Math.round(v / 16 * 100)}%)`}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ terminal: { fontSize: v } } as any))
+                  dispatch(updateSettingsLocal({ terminal: { fontSize: v } }))
                   scheduleSave({ terminal: { fontSize: v } })
                 }}
               />
@@ -704,7 +838,7 @@ export default function SettingsView() {
                 labelWidth="w-10"
                 format={(v) => v.toFixed(2)}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ terminal: { lineHeight: v } } as any))
+                  dispatch(updateSettingsLocal({ terminal: { lineHeight: v } }))
                   scheduleSave({ terminal: { lineHeight: v } })
                 }}
               />
@@ -718,7 +852,7 @@ export default function SettingsView() {
                 step={500}
                 format={(v) => v.toLocaleString()}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ terminal: { scrollback: v } } as any))
+                  dispatch(updateSettingsLocal({ terminal: { scrollback: v } }))
                   scheduleSave({ terminal: { scrollback: v } })
                 }}
               />
@@ -728,7 +862,7 @@ export default function SettingsView() {
               <Toggle
                 checked={settings.terminal.cursorBlink}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ terminal: { cursorBlink: checked } } as any))
+                  dispatch(updateSettingsLocal({ terminal: { cursorBlink: checked } }))
                   scheduleSave({ terminal: { cursorBlink: checked } })
                 }}
               />
@@ -738,7 +872,7 @@ export default function SettingsView() {
               <Toggle
                 checked={settings.terminal.warnExternalLinks}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ terminal: { warnExternalLinks: checked } } as any))
+                  dispatch(updateSettingsLocal({ terminal: { warnExternalLinks: checked } }))
                   scheduleSave({ terminal: { warnExternalLinks: checked } })
                 }}
               />
@@ -748,16 +882,48 @@ export default function SettingsView() {
               <select
                 value={isSelectedFontAvailable ? settings.terminal.fontFamily : fallbackFontFamily}
                 onChange={(e) => {
-                  dispatch(updateSettingsLocal({ terminal: { fontFamily: e.target.value } } as any))
+                  dispatch(updateSettingsLocal({ terminal: { fontFamily: e.target.value } }))
                   saveLocalTerminalFontFamily(e.target.value)
                 }}
-                className="h-8 px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border"
+                className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
               >
                 {availableTerminalFonts.map((font) => (
                   <option key={font.value} value={font.value}>{font.label}</option>
                 ))}
               </select>
             </SettingsRow>
+
+            <div className="pt-1 border-t border-border/40">
+              <button
+                type="button"
+                aria-expanded={terminalAdvancedOpen}
+                aria-controls={terminalAdvancedId}
+                className="h-10 w-full px-3 text-sm bg-muted rounded-md hover:bg-muted/80 focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
+                onClick={() => setTerminalAdvancedOpen((open) => !open)}
+              >
+                Advanced
+              </button>
+              <div
+                id={terminalAdvancedId}
+                hidden={!terminalAdvancedOpen}
+                className="mt-3 space-y-4"
+              >
+                <SettingsRow label="OSC52 clipboard access">
+                  <SegmentedControl
+                    value={settings.terminal.osc52Clipboard}
+                    options={[
+                      { value: 'ask', label: 'Ask' },
+                      { value: 'always', label: 'Always' },
+                      { value: 'never', label: 'Never' },
+                    ]}
+                    onChange={(v: string) => {
+                      dispatch(updateSettingsLocal({ terminal: { osc52Clipboard: v as 'ask' | 'always' | 'never' } } as any))
+                      scheduleSave({ terminal: { osc52Clipboard: v as 'ask' | 'always' | 'never' } })
+                    }}
+                  />
+                </SettingsRow>
+              </div>
+            </div>
           </SettingsSection>
 
           {/* Safety */}
@@ -770,7 +936,7 @@ export default function SettingsView() {
                 step={10}
                 format={(v) => String(v)}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ safety: { autoKillIdleMinutes: v } } as any))
+                  dispatch(updateSettingsLocal({ safety: { autoKillIdleMinutes: v } }))
                   scheduleSave({ safety: { autoKillIdleMinutes: v } })
                 }}
               />
@@ -784,14 +950,14 @@ export default function SettingsView() {
                 step={1}
                 format={(v) => String(v)}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ safety: { warnBeforeKillMinutes: v } } as any))
+                  dispatch(updateSettingsLocal({ safety: { warnBeforeKillMinutes: v } }))
                   scheduleSave({ safety: { warnBeforeKillMinutes: v } })
                 }}
               />
             </SettingsRow>
 
             <SettingsRow label="Default working directory">
-              <div className="relative w-full max-w-xs">
+              <div className="relative w-full md:max-w-xs">
                 <input
                   type="text"
                   value={defaultCwdInput}
@@ -803,7 +969,7 @@ export default function SettingsView() {
                     setDefaultCwdError(null)
                     scheduleDefaultCwdValidation(nextValue)
                   }}
-                  className="w-full h-8 px-3 text-sm bg-muted border-0 rounded-md placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-border"
+                  className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-border md:h-8"
                 />
                 {defaultCwdError && (
                   <span
@@ -822,7 +988,7 @@ export default function SettingsView() {
               <Toggle
                 checked={settings.logging?.debug ?? false}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ logging: { debug: checked } } as any))
+                  dispatch(updateSettingsLocal({ logging: { debug: checked } }))
                   scheduleSave({ logging: { debug: checked } })
                 }}
               />
@@ -853,10 +1019,10 @@ export default function SettingsView() {
                           const v = e.target.value as ClaudePermissionMode
                           dispatch(updateSettingsLocal({
                             codingCli: { providers: { [provider.name]: { permissionMode: v } } },
-                          } as any))
+                          }))
                           scheduleSave({ codingCli: { providers: { [provider.name]: { permissionMode: v } } } })
                         }}
-                        className="h-8 px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border"
+                        className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
                       >
                         <option value="default">Default</option>
                         <option value="plan">Plan</option>
@@ -876,10 +1042,10 @@ export default function SettingsView() {
                           const model = e.target.value.trim()
                           dispatch(updateSettingsLocal({
                             codingCli: { providers: { [provider.name]: { model: model || undefined } } },
-                          } as any))
+                          }))
                           scheduleSave({ codingCli: { providers: { [provider.name]: { model: model || undefined } } } })
                         }}
-                        className="w-full max-w-xs h-8 px-3 text-sm bg-muted border-0 rounded-md placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-border"
+                        className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:max-w-xs"
                       />
                     </SettingsRow>
                   )}
@@ -893,10 +1059,10 @@ export default function SettingsView() {
                           const sandbox = v || undefined
                           dispatch(updateSettingsLocal({
                             codingCli: { providers: { [provider.name]: { sandbox } } },
-                          } as any))
+                          }))
                           scheduleSave({ codingCli: { providers: { [provider.name]: { sandbox } } } })
                         }}
-                        className="h-8 px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border"
+                        className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
                       >
                         <option value="">Default</option>
                         <option value="read-only">Read-only</option>
@@ -907,7 +1073,7 @@ export default function SettingsView() {
                   )}
 
                   <SettingsRow label={`${provider.label} starting directory`}>
-                    <div className="relative w-full max-w-xs">
+                    <div className="relative w-full md:max-w-xs">
                       <input
                         type="text"
                         aria-label={`${provider.label} starting directory`}
@@ -920,7 +1086,7 @@ export default function SettingsView() {
                           setProviderCwdErrors((prev) => ({ ...prev, [provider.name]: null }))
                           scheduleProviderCwdValidation(provider.name, nextValue)
                         }}
-                        className="w-full h-8 px-3 text-sm bg-muted border-0 rounded-md placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-border"
+                        className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-border md:h-8"
                       />
                       {providerCwdErrors[provider.name] && (
                         <span className="pointer-events-none absolute right-2 -bottom-4 text-[10px] text-destructive">
@@ -935,11 +1101,93 @@ export default function SettingsView() {
           </SettingsSection>
 
           {/* Keyboard shortcuts */}
-          <SettingsSection title="Keyboard shortcuts" description="Tab navigation">
+          <SettingsSection title="Keyboard shortcuts" description="Navigation and terminal">
             <div className="space-y-2 text-sm">
               <ShortcutRow keys={['Ctrl', 'Shift', '[']} description="Previous tab" />
               <ShortcutRow keys={['Ctrl', 'Shift', ']']} description="Next tab" />
+              <ShortcutRow keys={['Shift', 'Enter']} description="Newline (same as Ctrl+J)" />
+              <ShortcutRow keys={['Ctrl', 'J']} description="Newline" />
             </div>
+          </SettingsSection>
+
+          {/* Network Access */}
+          <SettingsSection title="Network Access" description="Control how Freshell is accessible on your network">
+            <SettingsRow label="Remote access" description="Allow connections from other devices on your network">
+              <Toggle
+                checked={networkStatus?.host === '0.0.0.0'}
+                disabled={configuring || networkStatus?.rebinding}
+                aria-label="Remote access"
+                onChange={async (checked) => {
+                  await dispatch(configureNetwork({
+                    host: checked ? '0.0.0.0' : '127.0.0.1',
+                    configured: true,
+                  })).unwrap()
+                }}
+              />
+            </SettingsRow>
+
+            {networkStatus?.host === '0.0.0.0' && (
+              <>
+                {networkStatus.firewall && (
+                  <SettingsRow
+                    label="Firewall"
+                    description={
+                      !networkStatus.firewall.active ? 'No firewall detected'
+                        : networkStatus.firewall.portOpen === true ? 'Port is open'
+                        : networkStatus.firewall.portOpen === false ? 'Port may be blocked'
+                        : 'Firewall detected'
+                    }
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-muted-foreground">{networkStatus.firewall.platform}</span>
+                      {networkStatus.firewall.active && networkStatus.firewall.portOpen !== true && (
+                        <button
+                          onClick={async () => {
+                            try {
+                              const result = await fetchFirewallConfig()
+                              if (result.method === 'terminal') {
+                                const tabId = nanoid()
+                                dispatch(addTab({ id: tabId, title: 'Firewall Setup', mode: 'shell', shell: 'system' }))
+                                dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
+                                onFirewallTerminal?.({ tabId, command: result.command })
+                                onNavigate?.('terminal')
+                              } else if (result.method === 'wsl2' || result.method === 'windows-elevated') {
+                                // Server handles it; re-fetch status after a delay
+                                setTimeout(() => dispatch(fetchNetworkStatus()), 2000)
+                              }
+                            } catch {
+                              // Silently fail — user can retry
+                            }
+                          }}
+                          className="rounded border px-2 py-0.5 text-xs font-medium transition-colors hover:bg-muted"
+                          aria-label="Fix firewall configuration"
+                        >
+                          Fix
+                        </button>
+                      )}
+                    </div>
+                  </SettingsRow>
+                )}
+
+                {networkStatus.accessUrl && (
+                  <SettingsRow label="Device access" description="Get a link to use from your phone or other computers">
+                    <button
+                      onClick={() => onSharePanel?.()}
+                      className="rounded border px-3 py-1.5 text-xs font-medium transition-colors hover:bg-muted"
+                      aria-label="Get link for your devices"
+                    >
+                      Get link
+                    </button>
+                  </SettingsRow>
+                )}
+
+                {networkStatus.devMode && networkStatus.firewall?.platform !== 'wsl2' && (
+                  <div className="rounded border border-yellow-200 bg-yellow-50 p-3 text-sm text-yellow-800 dark:border-yellow-800 dark:bg-yellow-950 dark:text-yellow-300" role="alert">
+                    Dev mode: restart <code className="font-mono text-xs">npm run dev</code> for the Vite server to bind to the new address.
+                  </div>
+                )}
+              </>
+            )}
           </SettingsSection>
 
         </div>
@@ -974,15 +1222,24 @@ function SettingsSection({
 
 function SettingsRow({
   label,
+  description,
   children,
 }: {
   label: string
+  description?: string
   children: React.ReactNode
 }) {
   return (
-    <div className="flex items-center justify-between gap-4">
-      <span className="text-sm text-muted-foreground">{label}</span>
-      {children}
+    <div className="flex w-full flex-col items-start gap-2 md:flex-row md:items-center md:justify-between md:gap-4">
+      {description ? (
+        <div className="flex flex-col gap-0.5">
+          <span className="text-sm text-muted-foreground">{label}</span>
+          <span className="text-xs text-muted-foreground/60">{description}</span>
+        </div>
+      ) : (
+        <span className="text-sm text-muted-foreground">{label}</span>
+      )}
+      <div className="w-full md:w-auto">{children}</div>
     </div>
   )
 }
@@ -997,13 +1254,13 @@ function SegmentedControl({
   onChange: (value: string) => void
 }) {
   return (
-    <div className="flex bg-muted rounded-md p-0.5">
+    <div className="flex w-full flex-wrap bg-muted rounded-md p-0.5 md:w-auto">
       {options.map((opt) => (
         <button
           key={opt.value}
           onClick={() => onChange(opt.value)}
           className={cn(
-            'px-3 py-1 text-xs rounded-md transition-colors',
+            'min-h-10 flex-1 px-3 py-1 text-xs rounded-md transition-colors md:min-h-0 md:flex-none',
             value === opt.value
               ? 'bg-background text-foreground shadow-sm'
               : 'text-muted-foreground hover:text-foreground'
@@ -1019,18 +1276,25 @@ function SegmentedControl({
 function Toggle({
   checked,
   onChange,
+  disabled,
+  'aria-label': ariaLabel,
 }: {
   checked: boolean
   onChange: (checked: boolean) => void
+  disabled?: boolean
+  'aria-label'?: string
 }) {
   return (
     <button
-      onClick={() => onChange(!checked)}
-      aria-label={checked ? 'Toggle off' : 'Toggle on'}
-      aria-pressed={checked}
+      role="switch"
+      onClick={() => { if (!disabled) onChange(!checked) }}
+      disabled={disabled}
+      aria-label={ariaLabel ?? (checked ? 'Toggle off' : 'Toggle on')}
+      aria-checked={checked}
       className={cn(
         'relative w-9 h-5 rounded-full transition-colors',
-        checked ? 'bg-foreground' : 'bg-muted'
+        checked ? 'bg-foreground' : 'bg-muted',
+        disabled && 'opacity-50 cursor-not-allowed'
       )}
     >
       <div
@@ -1075,7 +1339,7 @@ function RangeSlider({
   step,
   onChange,
   format,
-  width = 'w-32',
+  width = 'w-full md:w-32',
   labelWidth = 'w-14',
 }: {
   value: number
@@ -1091,7 +1355,7 @@ function RangeSlider({
   const displayValue = dragging ?? value
 
   return (
-    <div className="flex items-center gap-3">
+    <div className="flex w-full items-center gap-3 md:w-auto">
       <input
         type="range"
         min={min}

@@ -4,6 +4,7 @@ import type { ClaudeChatState, ChatContentBlock, ChatSessionState } from './clau
 const initialState: ClaudeChatState = {
   sessions: {},
   pendingCreates: {},
+  availableModels: [],
 }
 
 /** Create a default empty session if one doesn't already exist. */
@@ -181,6 +182,12 @@ const claudeChatSlice = createSlice({
     removeSession(state, action: PayloadAction<{ sessionId: string }>) {
       delete state.sessions[action.payload.sessionId]
     },
+
+    setAvailableModels(state, action: PayloadAction<{
+      models: Array<{ value: string; displayName: string; description: string }>
+    }>) {
+      state.availableModels = action.payload.models
+    },
   },
 })
 
@@ -201,6 +208,7 @@ export const {
   sessionError,
   clearPendingCreate,
   removeSession,
+  setAvailableModels,
 } = claudeChatSlice.actions
 
 export default claudeChatSlice.reducer

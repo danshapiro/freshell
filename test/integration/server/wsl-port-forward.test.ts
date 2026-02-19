@@ -16,22 +16,20 @@ describe('WSL port forwarding bootstrap integration', () => {
     expect(typeof wslModule.buildPortForwardingScript).toBe('function')
   })
 
-  it('server/index.ts imports and calls setupWslPortForwarding after security validation', async () => {
-    // Verify the integration by checking that server/index.ts:
-    // 1. Imports setupWslPortForwarding from wsl-port-forward
-    // 2. Calls it AFTER validateStartupSecurity() (inside main())
+  it('server/index.ts calls setupWslPortForwarding conditionally when bindHost is 0.0.0.0', async () => {
     const indexPath = path.resolve(__dirname, '../../../server/index.ts')
     const indexContent = fs.readFileSync(indexPath, 'utf-8')
 
     // Check import exists
     expect(indexContent).toContain("import { setupWslPortForwarding } from './wsl-port-forward.js'")
 
-    // Check call exists inside main() after validateStartupSecurity
-    expect(indexContent).toContain('setupWslPortForwarding()')
+    // Check conditional call exists — only when bound to all interfaces
+    expect(indexContent).toContain("if (bindHost === '0.0.0.0')")
+    expect(indexContent).toMatch(/setupWslPortForwarding\(/)
 
     // Verify ordering: validateStartupSecurity must come before setupWslPortForwarding
     const validatePos = indexContent.indexOf('validateStartupSecurity()')
-    const setupCallPos = indexContent.indexOf('setupWslPortForwarding()')
+    const setupCallPos = indexContent.indexOf('setupWslPortForwarding(')
 
     expect(validatePos).toBeGreaterThan(-1)
     expect(setupCallPos).toBeGreaterThan(-1)

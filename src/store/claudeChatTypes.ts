@@ -52,4 +52,6 @@ export interface ClaudeChatState {
   sessions: Record<string, ChatSessionState>
   /** Maps createRequestId -> sessionId for correlating sdk.created responses */
   pendingCreates: Record<string, string>
+  /** Available models from SDK supportedModels() */
+  availableModels: Array<{ value: string; displayName: string; description: string }>
 }

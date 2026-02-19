@@ -54,4 +54,24 @@ describe('ChatComposer', () => {
     render(<ChatComposer onSend={() => {}} onInterrupt={() => {}} />)
     expect(screen.getByRole('button', { name: 'Send message' })).toBeDisabled()
   })
+
+  it('calls onInterrupt when Escape is pressed while running', async () => {
+    const onInterrupt = vi.fn()
+    const user = userEvent.setup()
+    render(<ChatComposer onSend={() => {}} onInterrupt={onInterrupt} isRunning />)
+    const textarea = screen.getByRole('textbox')
+    await user.click(textarea)
+    await user.keyboard('{Escape}')
+    expect(onInterrupt).toHaveBeenCalledOnce()
+  })
+
+  it('does not call onInterrupt when Escape is pressed while not running', async () => {
+    const onInterrupt = vi.fn()
+    const user = userEvent.setup()
+    render(<ChatComposer onSend={() => {}} onInterrupt={onInterrupt} />)
+    const textarea = screen.getByRole('textbox')
+    await user.click(textarea)
+    await user.keyboard('{Escape}')
+    expect(onInterrupt).not.toHaveBeenCalled()
+  })
 })

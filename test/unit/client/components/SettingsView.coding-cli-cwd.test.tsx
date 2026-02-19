@@ -4,6 +4,7 @@ import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import SettingsView from '@/components/SettingsView'
 import settingsReducer, { updateSettingsLocal } from '@/store/settingsSlice'
+import { networkReducer } from '@/store/networkSlice'
 
 vi.mock('@/lib/api', () => ({
   api: {
@@ -16,6 +17,7 @@ function createTestStore() {
   return configureStore({
     reducer: {
       settings: settingsReducer,
+      network: networkReducer,
     },
     preloadedState: {
       settings: {
@@ -79,7 +81,7 @@ describe('SettingsView coding CLI cwd', () => {
 
   it('shows initial cwd value from settings', () => {
     const store = configureStore({
-      reducer: { settings: settingsReducer },
+      reducer: { settings: settingsReducer, network: networkReducer },
       preloadedState: {
         settings: {
           settings: {

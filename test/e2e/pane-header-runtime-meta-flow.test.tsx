@@ -11,6 +11,7 @@ import panesReducer from '@/store/panesSlice'
 import idleWarningsReducer from '@/store/idleWarningsSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
+import { networkReducer } from '@/store/networkSlice'
 import type { Tab } from '@/store/types'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 
@@ -85,6 +86,9 @@ vi.mock('@/components/OverviewView', () => ({
 vi.mock('@/components/AuthRequiredModal', () => ({
   AuthRequiredModal: () => null,
 }))
+vi.mock('@/components/SetupWizard', () => ({
+  SetupWizard: () => <div data-testid="mock-setup-wizard">Setup Wizard</div>,
+}))
 
 vi.mock('@/components/TerminalView', () => ({
   default: ({ paneId }: { paneId: string }) => <div data-testid={`terminal-${paneId}`}>Terminal</div>,
@@ -157,6 +161,7 @@ function createStore(options?: {
       idleWarnings: idleWarningsReducer,
       turnCompletion: turnCompletionReducer,
       terminalMeta: terminalMetaReducer,
+      network: networkReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -196,6 +201,7 @@ function createStore(options?: {
       idleWarnings: {
         warnings: {},
       },
+      network: { status: null, loading: false, configuring: false, error: null },
     },
   })
 }

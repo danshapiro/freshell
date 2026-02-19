@@ -26,9 +26,9 @@ export function buildShareUrl(options: BuildShareUrlOptions): string {
   const { currentUrl, lanIp, token, isDev } = options
   const url = new URL(currentUrl)
 
-  // In dev mode, always use port 5173 (Vite dev server) for remote access
+  // In dev mode, use VITE_PORT (defaulting to 5173) for remote access
   if (isDev) {
-    url.port = '5173'
+    url.port = import.meta.env.VITE_PORT || '5173'
   }
 
   // Use LAN IP if provided, otherwise keep current hostname

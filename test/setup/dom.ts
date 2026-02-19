@@ -1,6 +1,7 @@
 import '@testing-library/jest-dom/vitest'
 import { afterEach, beforeEach, vi } from 'vitest'
 import { enableMapSet } from 'immer'
+import { resetWsClientForTests } from '@/lib/ws-client'
 
 enableMapSet()
 
@@ -13,6 +14,54 @@ if (typeof globalThis.ResizeObserver === 'undefined') {
     constructor(_cb: ResizeObserverCallback) {}
   } as unknown as typeof globalThis.ResizeObserver
 }
+
+// ── matchMedia polyfill for useMobile() hook ────────────────────────
+// The useMobile hook caches a module-level MediaQueryList singleton, so
+// we need a single mock object whose `matches` getter is dynamically
+// controlled.  Tests can set `(globalThis as any).__MOBILE_MATCHES__`
+// and fire `setMobileForTest(true/false)` to trigger change listeners.
+const _mqlChangeListeners: Set<(e: { matches: boolean }) => void> = new Set()
+;(globalThis as any).__MOBILE_MATCHES__ = false
+;(globalThis as any).__MQL_CHANGE_LISTENERS__ = _mqlChangeListeners
+
+/**
+ * Call from tests to simulate a viewport change detected by useMobile().
+ * This updates the matches value AND fires change listeners so that
+ * useSyncExternalStore re-renders.
+ */
+;(globalThis as any).setMobileForTest = (mobile: boolean) => {
+  ;(globalThis as any).__MOBILE_MATCHES__ = mobile
+  for (const cb of _mqlChangeListeners) {
+    cb({ matches: mobile })
+  }
+}
+
+if (typeof globalThis.window !== 'undefined' && typeof window.matchMedia !== 'function') {
+  Object.defineProperty(window, 'matchMedia', {
+    writable: true,
+    configurable: true,
+    value: vi.fn((_query: string) => ({
+      get matches() { return (globalThis as any).__MOBILE_MATCHES__ as boolean },
+      media: _query,
+      addEventListener: (_event: string, cb: (e: { matches: boolean }) => void) => {
+        _mqlChangeListeners.add(cb)
+      },
+      removeEventListener: (_event: string, cb: (e: { matches: boolean }) => void) => {
+        _mqlChangeListeners.delete(cb)
+      },
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      onchange: null,
+      dispatchEvent: vi.fn(),
+    })),
+  })
+}
+
+// Reset mobile state between tests
+beforeEach(() => {
+  ;(globalThis as any).__MOBILE_MATCHES__ = false
+})
+// ── end matchMedia polyfill ─────────────────────────────────────────
 
 let errorSpy: ReturnType<typeof vi.spyOn> | null = null
 let consoleErrorCalls: Array<{ args: unknown[]; stack?: string }> = []
@@ -38,6 +87,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  resetWsClientForTests()
   errorSpy?.mockRestore()
   errorSpy = null
 

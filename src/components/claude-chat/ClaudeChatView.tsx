@@ -1,12 +1,23 @@
-import { useCallback, useEffect, useRef } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef } from 'react'
 import type { ClaudeChatPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updatePaneContent } from '@/store/panesSlice'
 import { addUserMessage, clearPendingCreate, removePermission } from '@/store/claudeChatSlice'
 import { getWsClient } from '@/lib/ws-client'
+import { cn } from '@/lib/utils'
 import MessageBubble from './MessageBubble'
 import PermissionBanner from './PermissionBanner'
-import ChatComposer from './ChatComposer'
+import ChatComposer, { type ChatComposerHandle } from './ChatComposer'
+import FreshclaudeSettings from './FreshclaudeSettings'
+import ThinkingIndicator from './ThinkingIndicator'
+import { useStreamDebounce } from './useStreamDebounce'
+import CollapsedTurn from './CollapsedTurn'
+import type { ChatMessage } from '@/store/claudeChatTypes'
+import { api } from '@/lib/api'
+
+const DEFAULT_MODEL = 'claude-opus-4-6'
+const DEFAULT_PERMISSION_MODE = 'bypassPermissions'
+const DEFAULT_EFFORT = 'high'
 
 interface ClaudeChatViewProps {
   tabId: string
@@ -19,7 +30,10 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
   const dispatch = useAppDispatch()
   const ws = getWsClient()
   const createSentRef = useRef(false)
+  const composerRef = useRef<ChatComposerHandle>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const isAtBottomRef = useRef(true)
   // Keep a ref to the latest paneContent to avoid stale closures in effects
   // while using only primitive deps for triggering.
   const paneContentRef = useRef(paneContent)
@@ -32,6 +46,7 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
   const session = useAppSelector(
     (s) => paneContent.sessionId ? s.claudeChat.sessions[paneContent.sessionId] : undefined,
   )
+  const availableModels = useAppSelector((s) => s.claudeChat.availableModels)
 
   // Wire sessionId from pendingCreates back into the pane content
   useEffect(() => {
@@ -71,6 +86,9 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
     ws.send({
       type: 'sdk.create',
       requestId: paneContent.createRequestId,
+      model: paneContent.model ?? DEFAULT_MODEL,
+      permissionMode: paneContent.permissionMode ?? DEFAULT_PERMISSION_MODE,
+      effort: paneContent.effort ?? DEFAULT_EFFORT,
       ...(paneContent.initialCwd ? { cwd: paneContent.initialCwd } : {}),
       ...(paneContent.resumeSessionId ? { resumeSessionId: paneContent.resumeSessionId } : {}),
     })
@@ -102,9 +120,11 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
     })
   }, [paneContent.sessionId, ws])
 
-  // Auto-scroll on new messages
+  // Smart auto-scroll: only scroll if user is already at/near the bottom
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    if (isAtBottomRef.current) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
   }, [session?.messages.length, session?.streamingActive])
 
   const handleSend = useCallback((text: string) => {
@@ -130,55 +150,264 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
     ws.send({ type: 'sdk.permission.respond', sessionId: paneContent.sessionId, requestId, behavior: 'deny' })
   }, [paneContent.sessionId, dispatch, ws])
 
-  if (hidden) return null
+  const handleContainerPointerUp = useCallback((e: React.PointerEvent) => {
+    // Don't steal focus from interactive elements or text selections
+    const target = e.target as HTMLElement
+    if (
+      target.closest('button, a, input, textarea, select, details, [role="button"], pre')
+    ) return
+    if (window.getSelection()?.toString()) return
+    composerRef.current?.focus()
+  }, [])
+
+  const handleScroll = useCallback(() => {
+    const el = scrollContainerRef.current
+    if (!el) return
+    const threshold = 50
+    isAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < threshold
+  }, [])
+
+  const handleSettingsChange = useCallback((changes: Record<string, unknown>) => {
+    dispatch(updatePaneContent({
+      tabId,
+      paneId,
+      content: { ...paneContentRef.current, ...changes },
+    }))
+
+    const pc = paneContentRef.current
+
+    // Mid-session model change
+    if (changes.model && pc.sessionId && pc.status !== 'creating') {
+      ws.send({ type: 'sdk.set-model', sessionId: pc.sessionId, model: changes.model as string })
+    }
+
+    // Mid-session permission mode change
+    if (changes.permissionMode && pc.sessionId && pc.status !== 'creating') {
+      ws.send({ type: 'sdk.set-permission-mode', sessionId: pc.sessionId, permissionMode: changes.permissionMode as string })
+    }
+
+    // Persist as defaults
+    const defaultsPatch: Record<string, string> = {}
+    if (changes.model) defaultsPatch.defaultModel = changes.model as string
+    if (changes.permissionMode) defaultsPatch.defaultPermissionMode = changes.permissionMode as string
+    if (changes.effort) defaultsPatch.defaultEffort = changes.effort as string
+    if (Object.keys(defaultsPatch).length > 0) {
+      void api.patch('/api/settings', { freshclaude: defaultsPatch }).catch(() => {})
+    }
+  }, [tabId, paneId, dispatch, ws])
+
+  const handleSettingsDismiss = useCallback(() => {
+    dispatch(updatePaneContent({
+      tabId,
+      paneId,
+      content: { ...paneContentRef.current, settingsDismissed: true },
+    }))
+  }, [tabId, paneId, dispatch])
+
+  // Effort is locked once sdk.create has been sent (no mid-session setter in SDK).
+  // Model and permission mode can be changed mid-session via sdk.set-model / sdk.set-permission-mode.
+  const sessionStarted = paneContent.status !== 'creating'
 
   const isInteractive = paneContent.status === 'idle' || paneContent.status === 'connected'
   const isRunning = paneContent.status === 'running'
   const pendingPermissions = session ? Object.values(session.pendingPermissions) : []
 
+  // Auto-expand: count completed tools across all messages, expand the most recent N
+  const RECENT_TOOLS_EXPANDED = 3
+  const messages = useMemo(() => session?.messages ?? [], [session?.messages])
+  const { completedToolOffsets, autoExpandAbove } = useMemo(() => {
+    let totalCompletedTools = 0
+    const offsets: number[] = []
+    for (const msg of messages) {
+      offsets.push(totalCompletedTools)
+      for (const b of msg.content) {
+        if (b.type === 'tool_use' && b.id) {
+          const hasResult = msg.content.some(
+            r => r.type === 'tool_result' && r.tool_use_id === b.id
+          )
+          if (hasResult) totalCompletedTools++
+        }
+      }
+    }
+    return {
+      completedToolOffsets: offsets,
+      autoExpandAbove: Math.max(0, totalCompletedTools - RECENT_TOOLS_EXPANDED),
+    }
+  }, [messages])
+
+  // Debounce streaming text to limit markdown re-parsing to ~20x/sec
+  const debouncedStreamingText = useStreamDebounce(
+    session?.streamingText ?? '',
+    session?.streamingActive ?? false,
+  )
+
+  // Memoize the content array so React.memo on MessageBubble works.
+  // Without this, a new array reference is created every render, defeating memo.
+  const streamingContent = useMemo(
+    () => debouncedStreamingText
+      ? [{ type: 'text' as const, text: debouncedStreamingText }]
+      : [],
+    [debouncedStreamingText],
+  )
+
+  // Build render items: pair adjacent user→assistant into turns, everything else standalone.
+  const RECENT_TURNS_FULL = 3
+  type RenderItem =
+    | { kind: 'turn'; user: ChatMessage; assistant: ChatMessage; msgIndices: [number, number] }
+    | { kind: 'standalone'; message: ChatMessage; msgIndex: number }
+
+  const renderItems = useMemo(() => {
+    const items: RenderItem[] = []
+    let mi = 0
+    while (mi < messages.length) {
+      const msg = messages[mi]
+      if (
+        msg.role === 'user' &&
+        mi + 1 < messages.length &&
+        messages[mi + 1].role === 'assistant'
+      ) {
+        items.push({ kind: 'turn', user: msg, assistant: messages[mi + 1], msgIndices: [mi, mi + 1] })
+        mi += 2
+      } else {
+        items.push({ kind: 'standalone', message: msg, msgIndex: mi })
+        mi++
+      }
+    }
+    return items
+  }, [messages])
+
+  const turnItems = renderItems.filter(r => r.kind === 'turn')
+  const collapseThreshold = Math.max(0, turnItems.length - RECENT_TURNS_FULL)
+
   return (
-    <div className="h-full w-full flex flex-col" role="region" aria-label="Claude Web Chat">
+    <div className={cn('h-full w-full flex flex-col', hidden ? 'tab-hidden' : 'tab-visible')} role="region" aria-label="freshclaude Chat" onPointerUp={handleContainerPointerUp}>
       {/* Status bar */}
       <div className="flex items-center justify-between px-3 py-1.5 border-b text-xs text-muted-foreground">
         <span>
-          {paneContent.status === 'creating' && 'Creating session...'}
-          {paneContent.status === 'starting' && 'Starting Claude Code...'}
-          {paneContent.status === 'connected' && 'Connected'}
-          {paneContent.status === 'running' && 'Running...'}
-          {paneContent.status === 'idle' && 'Ready'}
-          {paneContent.status === 'compacting' && 'Compacting context...'}
-          {paneContent.status === 'exited' && 'Session ended'}
+          {pendingPermissions.length > 0 && 'Waiting for answer...'}
+          {pendingPermissions.length === 0 && paneContent.status === 'creating' && 'Creating session...'}
+          {pendingPermissions.length === 0 && paneContent.status === 'starting' && 'Starting Claude Code...'}
+          {pendingPermissions.length === 0 && paneContent.status === 'connected' && 'Connected'}
+          {pendingPermissions.length === 0 && paneContent.status === 'running' && 'Running...'}
+          {pendingPermissions.length === 0 && paneContent.status === 'idle' && 'Ready'}
+          {pendingPermissions.length === 0 && paneContent.status === 'compacting' && 'Compacting context...'}
+          {pendingPermissions.length === 0 && paneContent.status === 'exited' && 'Session ended'}
         </span>
-        {paneContent.initialCwd && (
-          <span className="truncate ml-2">{paneContent.initialCwd}</span>
-        )}
+        <div className="flex items-center gap-2">
+          {paneContent.initialCwd && (
+            <span className="truncate">{paneContent.initialCwd}</span>
+          )}
+          <FreshclaudeSettings
+            model={paneContent.model ?? DEFAULT_MODEL}
+            permissionMode={paneContent.permissionMode ?? DEFAULT_PERMISSION_MODE}
+            effort={paneContent.effort ?? DEFAULT_EFFORT}
+            showThinking={paneContent.showThinking ?? true}
+            showTools={paneContent.showTools ?? true}
+            showTimecodes={paneContent.showTimecodes ?? false}
+            sessionStarted={sessionStarted}
+            defaultOpen={!paneContent.settingsDismissed}
+            modelOptions={availableModels.length > 0 ? availableModels : undefined}
+            onChange={handleSettingsChange}
+            onDismiss={handleSettingsDismiss}
+          />
+        </div>
       </div>
 
       {/* Message area */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-3">
+      <div ref={scrollContainerRef} onScroll={handleScroll} className="flex-1 overflow-y-auto p-4 space-y-3" data-context="freshclaude-chat" data-session-id={paneContent.sessionId}>
         {!session?.messages.length && (
           <div className="text-center text-muted-foreground text-sm py-8">
-            <p className="font-medium mb-2">Claude Web Chat</p>
+            <p className="font-medium mb-2">freshclaude</p>
             <p>Rich chat UI for Claude Code sessions.</p>
             <p className="text-xs mt-2">Session: {paneContent.sessionId ?? 'pending'}</p>
           </div>
         )}
 
-        {session?.messages.map((msg, i) => (
-          <MessageBubble
-            key={i}
-            role={msg.role}
-            content={msg.content}
-            timestamp={msg.timestamp}
-            model={msg.model}
-          />
-        ))}
+        {(() => {
+          let turnIndex = 0
+          return renderItems.map((item, i) => {
+            const isLast = i === renderItems.length - 1
+            if (item.kind === 'turn') {
+              const isOld = turnIndex < collapseThreshold
+              turnIndex++
+              if (isOld) {
+                return (
+                  <CollapsedTurn
+                    key={`turn-${i}`}
+                    userMessage={item.user}
+                    assistantMessage={item.assistant}
+                    showThinking={paneContent.showThinking ?? true}
+                    showTools={paneContent.showTools ?? true}
+                    showTimecodes={paneContent.showTimecodes ?? false}
+                  />
+                )
+              }
+              return (
+                <React.Fragment key={`turn-${i}`}>
+                  <MessageBubble
+                    role={item.user.role}
+                    content={item.user.content}
+                    timestamp={item.user.timestamp}
+                    showThinking={paneContent.showThinking ?? true}
+                    showTools={paneContent.showTools ?? true}
+                    showTimecodes={paneContent.showTimecodes ?? false}
+                  />
+                  <MessageBubble
+                    role={item.assistant.role}
+                    content={item.assistant.content}
+                    timestamp={item.assistant.timestamp}
+                    model={item.assistant.model}
+                    isLastMessage={isLast}
+                    showThinking={paneContent.showThinking ?? true}
+                    showTools={paneContent.showTools ?? true}
+                    showTimecodes={paneContent.showTimecodes ?? false}
+                    completedToolOffset={completedToolOffsets[item.msgIndices[1]]}
+                    autoExpandAbove={autoExpandAbove}
+                  />
+                </React.Fragment>
+              )
+            }
+            // Standalone messages
+            return (
+              <MessageBubble
+                key={`msg-${i}`}
+                role={item.message.role}
+                content={item.message.content}
+                timestamp={item.message.timestamp}
+                model={item.message.model}
+                isLastMessage={isLast}
+                showThinking={paneContent.showThinking ?? true}
+                showTools={paneContent.showTools ?? true}
+                showTimecodes={paneContent.showTimecodes ?? false}
+                completedToolOffset={completedToolOffsets[item.msgIndex]}
+                autoExpandAbove={autoExpandAbove}
+              />
+            )
+          })
+        })()}
 
-        {session?.streamingActive && session.streamingText && (
+        {session?.streamingActive && streamingContent.length > 0 && (
           <MessageBubble
             role="assistant"
-            content={[{ type: 'text', text: session.streamingText }]}
+            content={streamingContent}
+            showThinking={paneContent.showThinking ?? true}
+            showTools={paneContent.showTools ?? true}
+            showTimecodes={paneContent.showTimecodes ?? false}
           />
+        )}
+
+        {/* Thinking indicator — shown when running but no response content yet.
+            Three guards prevent false positives:
+            1. status === 'running' — Claude is actively processing
+            2. !streamingActive — no text currently streaming
+            3. lastMessage.role === 'user' — no assistant content committed yet
+            The component self-debounces with a 200ms render delay to prevent
+            flash during brief SDK gaps (content_block_stop → sdk.assistant). */}
+        {session?.status === 'running' &&
+          !session.streamingActive &&
+          messages.length > 0 &&
+          messages[messages.length - 1].role === 'user' && (
+          <ThinkingIndicator />
         )}
 
         {/* Permission banners */}
@@ -203,11 +432,18 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
 
       {/* Composer */}
       <ChatComposer
+        ref={composerRef}
         onSend={handleSend}
         onInterrupt={handleInterrupt}
         disabled={!isInteractive && !isRunning}
         isRunning={isRunning}
-        placeholder={isInteractive ? 'Message Claude...' : 'Waiting for connection...'}
+        placeholder={
+          pendingPermissions.length > 0
+            ? 'Waiting for answer...'
+            : isInteractive
+              ? 'Message Claude...'
+              : 'Waiting for connection...'
+        }
       />
     </div>
   )

@@ -9,6 +9,7 @@ import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
 import idleWarningsReducer from '@/store/idleWarningsSlice'
+import { networkReducer } from '@/store/networkSlice'
 
 // Mock heavy child components to avoid xterm/canvas issues
 vi.mock('@/components/TabContent', () => ({
@@ -29,6 +30,9 @@ vi.mock('@/components/OverviewView', () => ({
 }))
 vi.mock('@/hooks/useTheme', () => ({
   useThemeEffect: () => {},
+}))
+vi.mock('@/components/SetupWizard', () => ({
+  SetupWizard: () => <div data-testid="mock-setup-wizard">Setup Wizard</div>,
 }))
 
 const wsMocks = vi.hoisted(() => ({
@@ -58,6 +62,7 @@ vi.mock('@/lib/api', () => ({
     patch: vi.fn().mockResolvedValue({}),
     post: vi.fn().mockResolvedValue({}),
   },
+  isApiUnauthorizedError: (err: any) => !!err && typeof err === 'object' && err.status === 401,
 }))
 
 function createStore() {
@@ -69,6 +74,7 @@ function createStore() {
       sessions: sessionsReducer,
       panes: panesReducer,
       idleWarnings: idleWarningsReducer,
+      network: networkReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -77,10 +83,16 @@ function createStore() {
     preloadedState: {
       settings: { settings: defaultSettings, loaded: true, lastSavedAt: undefined },
       tabs: { tabs: [{ id: 'tab-1', mode: 'shell' }], activeTabId: 'tab-1' },
-      connection: { status: 'disconnected' as const, lastError: undefined, platform: null },
+      connection: {
+        status: 'disconnected' as const,
+        lastError: undefined,
+        platform: null,
+        availableClis: {},
+      },
       sessions: { projects: [], expandedProjects: new Set<string>(), isLoading: false, error: null },
       panes: { layouts: {}, activePane: {} },
       idleWarnings: { warnings: {} },
+      network: { status: null, loading: false, configuring: false, error: null },
     },
   })
 }
@@ -109,6 +121,29 @@ describe('App WS bootstrap recovery', () => {
     cleanup()
   })
 
+  it('marks connection as auth-required and skips websocket connect when bootstrap settings request returns 401', async () => {
+    const store = createStore()
+    apiGet.mockImplementation((url: string) => {
+      if (url === '/api/settings') {
+        return Promise.reject({ status: 401, message: 'Unauthorized' })
+      }
+      return Promise.resolve({})
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(store.getState().connection.status).toBe('disconnected')
+      expect(store.getState().connection.lastError).toBe('Authentication failed')
+    })
+
+    expect(wsMocks.connect).not.toHaveBeenCalled()
+  })
+
   it('keeps the WS message handler registered after an initial connect failure, so a later ready can recover state', async () => {
     const store = createStore()
 
@@ -128,13 +163,40 @@ describe('App WS bootstrap recovery', () => {
     // Simulate a later successful auto-reconnect completing its handshake.
     expect(messageHandler).toBeTypeOf('function')
     act(() => {
-      messageHandler?.({ type: 'ready' })
+      messageHandler?.({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-test',
+      })
     })
 
     await waitFor(() => {
       expect(store.getState().connection.status).toBe('ready')
       expect(store.getState().connection.lastError).toBeUndefined()
+      expect(store.getState().connection.serverInstanceId).toBe('srv-test')
     })
   })
-})
 
+  it('includes current mobile state in hello extensions', async () => {
+    const store = createStore()
+    ;(globalThis as any).setMobileForTest(true)
+    wsMocks.connect.mockResolvedValueOnce(undefined)
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.setHelloExtensionProvider).toHaveBeenCalled()
+    })
+
+    const provider = wsMocks.setHelloExtensionProvider.mock.calls.at(-1)?.[0] as (() => any) | undefined
+    expect(provider).toBeTypeOf('function')
+
+    const extension = provider?.()
+    expect(extension?.sessions).toBeDefined()
+    expect(extension?.client?.mobile).toBe(true)
+  })
+})

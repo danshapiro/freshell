@@ -17,7 +17,7 @@ export const AI_CONFIG = {
 export const PROMPTS = {
   terminalSummary: {
     model: AI_CONFIG.model,
-    maxTokens: 120,
+    maxOutputTokens: 120,
     build: (terminalOutput: string) => {
       const cleaned = stripAnsi(terminalOutput)
       return [

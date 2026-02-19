@@ -12,10 +12,12 @@ import ClaudeChatView from '../claude-chat/ClaudeChatView'
 import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
 import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-utils'
+import { getTerminalActions } from '@/lib/pane-action-registry'
 import { cn } from '@/lib/utils'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
+import { getTabDirectoryPreference } from '@/lib/tab-directory-preference'
 import { formatPaneRuntimeLabel, formatPaneRuntimeTooltip } from '@/lib/format-terminal-title-meta'
 import { snap1D, collectCollinearSnapTargets, convertThresholdToLocal } from '@/lib/pane-snap'
 import { nanoid } from 'nanoid'
@@ -26,6 +28,7 @@ import { clearPaneAttention, clearTabAttention } from '@/store/turnCompletionSli
 import { clearPendingCreate, removeSession } from '@/store/claudeChatSlice'
 import { cancelCreate } from '@/lib/sdk-message-handler'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
+import { ErrorBoundary } from '@/components/ui/error-boundary'
 
 // Stable empty object to avoid selector memoization issues
 const EMPTY_PANE_TITLES: Record<string, string> = {}
@@ -345,6 +348,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         onRenameChange={isRenaming ? setRenameValue : undefined}
         onRenameBlur={isRenaming ? commitRename : undefined}
         onRenameKeyDown={isRenaming ? handleRenameKeyDown : undefined}
+        onSearch={node.content.kind === 'terminal' ? () => getTerminalActions(node.id)?.openSearch() : undefined}
         onDoubleClickTitle={() => startRename(node.id, paneTitle)}
       >
         {renderContent(tabId, node.id, node.content, isOnlyPane, hidden)}
@@ -395,6 +399,11 @@ function PickerWrapper({
 }) {
   const dispatch = useAppDispatch()
   const settings = useAppSelector((s) => s.settings?.settings)
+  const paneLayout = useAppSelector((s) => s.panes.layouts[tabId])
+  const tabPref = useMemo(
+    () => paneLayout ? getTabDirectoryPreference(paneLayout) : { defaultCwd: undefined, tabDirectories: [] },
+    [paneLayout],
+  )
   const [step, setStep] = useState<
     | { step: 'type' }
     | { step: 'directory'; providerType: CodingCliProviderName }
@@ -403,10 +412,14 @@ function PickerWrapper({
 
   const createContentForType = useCallback((type: PanePickerType, cwd?: string): PaneContent => {
     if (type === 'claude-web') {
+      const defaults = settings?.freshclaude
       return {
         kind: 'claude-chat',
         createRequestId: nanoid(),
         status: 'creating',
+        model: defaults?.defaultModel,
+        permissionMode: defaults?.defaultPermissionMode,
+        effort: defaults?.defaultEffort,
         ...(cwd ? { initialCwd: cwd } : {}),
       }
     }
@@ -515,14 +528,17 @@ function PickerWrapper({
 
   if (step.step === 'directory') {
     const providerType = step.providerType
-    const providerLabel = providerType === 'claude-web' ? 'Claude Web' : getProviderLabel(providerType)
+    const providerLabel = providerType === 'claude-web' ? 'freshclaude' : getProviderLabel(providerType)
     const settingsKey = providerType === 'claude-web' ? 'claude' : providerType
-    const defaultCwd = settings?.codingCli?.providers?.[settingsKey]?.cwd
+    const globalDefault = settings?.codingCli?.providers?.[settingsKey]?.cwd
+    const defaultCwd = tabPref.defaultCwd ?? globalDefault
     return (
       <DirectoryPicker
         providerType={providerType}
         providerLabel={providerLabel}
         defaultCwd={defaultCwd}
+        tabDirectories={tabPref.tabDirectories}
+        globalDefault={globalDefault}
         onConfirm={handleDirectoryConfirm}
         onBack={() => setStep({ step: 'type' })}
       />
@@ -542,31 +558,43 @@ function PickerWrapper({
 
 function renderContent(tabId: string, paneId: string, content: PaneContent, isOnlyPane: boolean, hidden?: boolean) {
   if (content.kind === 'terminal') {
-    // Terminal panes need a unique key based on paneId for proper lifecycle
-    // Pass paneContent directly to avoid redundant tree traversal in TerminalView
-    return <TerminalView key={paneId} tabId={tabId} paneId={paneId} paneContent={content} hidden={hidden} />
+    return (
+      <ErrorBoundary key={paneId} label="Terminal">
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={content} hidden={hidden} />
+      </ErrorBoundary>
+    )
   }
 
   if (content.kind === 'browser') {
-    return <BrowserPane paneId={paneId} tabId={tabId} url={content.url} devToolsOpen={content.devToolsOpen} />
+    return (
+      <ErrorBoundary key={paneId} label="Browser">
+        <BrowserPane paneId={paneId} tabId={tabId} url={content.url} devToolsOpen={content.devToolsOpen} />
+      </ErrorBoundary>
+    )
   }
 
   if (content.kind === 'editor') {
     return (
-      <EditorPane
-        paneId={paneId}
-        tabId={tabId}
-        filePath={content.filePath}
-        language={content.language}
-        readOnly={content.readOnly}
-        content={content.content}
-        viewMode={content.viewMode}
-      />
+      <ErrorBoundary key={paneId} label="Editor">
+        <EditorPane
+          paneId={paneId}
+          tabId={tabId}
+          filePath={content.filePath}
+          language={content.language}
+          readOnly={content.readOnly}
+          content={content.content}
+          viewMode={content.viewMode}
+        />
+      </ErrorBoundary>
     )
   }
 
   if (content.kind === 'claude-chat') {
-    return <ClaudeChatView key={paneId} tabId={tabId} paneId={paneId} paneContent={content} hidden={hidden} />
+    return (
+      <ErrorBoundary key={paneId} label="Chat">
+        <ClaudeChatView tabId={tabId} paneId={paneId} paneContent={content} hidden={hidden} />
+      </ErrorBoundary>
+    )
   }
 
   if (content.kind === 'picker') {

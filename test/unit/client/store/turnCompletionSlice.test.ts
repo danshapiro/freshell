@@ -169,7 +169,7 @@ describe('turnCompletionSlice', () => {
       expect(store.getState().turnCompletion.attentionByPane['pane-1']).toBeUndefined()
     })
 
-    it('closePaneWithCleanup does not clear attention when pane close is a no-op (single pane)', async () => {
+    it('closePaneWithCleanup closes tab and clears attention when closing the only pane', async () => {
       const singleLayout: PaneNode = {
         type: 'leaf',
         id: 'pane-1',
@@ -177,9 +177,10 @@ describe('turnCompletionSlice', () => {
       }
       const store = createFullStore(singleLayout)
       await store.dispatch(closePaneWithCleanup({ tabId: 'tab-1', paneId: 'pane-1' }))
-      // Pane close was a no-op (can't close the only pane), so attention persists
-      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
-      expect(store.getState().turnCompletion.attentionByPane['pane-1']).toBe(true)
+      expect(store.getState().tabs.tabs).toHaveLength(0)
+      expect(store.getState().panes.layouts['tab-1']).toBeUndefined()
+      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBeUndefined()
+      expect(store.getState().turnCompletion.attentionByPane['pane-1']).toBeUndefined()
     })
 
     it('closeTab clears tab and all pane attention entries', async () => {

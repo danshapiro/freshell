@@ -75,11 +75,12 @@ describe('detectAvailableClis', () => {
     expect(result.claude).toBe(true)
   })
 
-  it('uses "which" as the finder command on non-Windows', async () => {
+  it('uses the correct finder command for the current platform', async () => {
     stubExecFile(() => true)
     await detectAvailableClis()
+    const expectedFinder = process.platform === 'win32' ? 'where.exe' : 'which'
     expect(mockExecFile).toHaveBeenCalledWith(
-      'which',
+      expectedFinder,
       expect.any(Array),
       expect.objectContaining({ timeout: 3000 }),
       expect.any(Function)

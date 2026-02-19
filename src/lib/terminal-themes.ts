@@ -1,4 +1,4 @@
-import type { ITheme } from 'xterm'
+import type { ITheme } from '@xterm/xterm'
 import type { TerminalTheme } from '@/store/types'
 
 // Full xterm theme with ANSI colors for proper syntax highlighting

@@ -1,4 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import type {
+  TerminalAttachedStartMessage,
+  TerminalAttachedChunkMessage,
+  TerminalAttachedEndMessage,
+  TerminalExitMessage,
+} from '@shared/ws-protocol'
 
 export const ATTACH_FRAME_SEND_TIMEOUT_MS = 30_000
 export const ATTACH_RECONNECT_MIN_DELAY_MS = 5_000
@@ -6,32 +12,7 @@ export const ATTACH_CHUNK_TIMEOUT_MS = 35_000
 
 type SnapshotState = 'idle' | 'pending' | 'complete' | 'degraded'
 
-type AttachStartMessage = {
-  type: 'terminal.attached.start'
-  terminalId: string
-  totalCodeUnits: number
-  totalChunks: number
-}
-
-type AttachChunkMessage = {
-  type: 'terminal.attached.chunk'
-  terminalId: string
-  chunk: string
-}
-
-type AttachEndMessage = {
-  type: 'terminal.attached.end'
-  terminalId: string
-  totalCodeUnits: number
-  totalChunks: number
-}
-
-type TerminalExitMessage = {
-  type: 'terminal.exit'
-  terminalId: string
-}
-
-type ChunkLifecycleMessage = AttachStartMessage | AttachChunkMessage | AttachEndMessage | TerminalExitMessage
+type ChunkLifecycleMessage = TerminalAttachedStartMessage | TerminalAttachedChunkMessage | TerminalAttachedEndMessage | TerminalExitMessage
 
 type InflightSequence = {
   chunks: string[]

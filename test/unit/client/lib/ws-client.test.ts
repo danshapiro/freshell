@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { WsClient } from '../../../../src/lib/ws-client'
+import { WsClient, getWsClient, resetWsClientForTests } from '../../../../src/lib/ws-client'
 
 class MockWebSocket {
   static OPEN = 1
@@ -51,6 +51,7 @@ describe('WsClient.connect', () => {
   })
 
   afterEach(() => {
+    resetWsClientForTests()
     vi.clearAllTimers()
     vi.useRealTimers()
   })
@@ -107,5 +108,62 @@ describe('WsClient.connect', () => {
 
     const delays = setTimeoutSpy.mock.calls.map((call) => call[1]).filter((d): d is number => typeof d === 'number')
     expect(Math.max(...delays)).toBeGreaterThanOrEqual(5000)
+  })
+
+  it('treats SERVER_SHUTDOWN (4009) as transient and resets backoff for fast reconnect', async () => {
+    const setTimeoutSpy = vi.spyOn(window, 'setTimeout')
+
+    const c = new WsClient('ws://example/ws')
+    const p = c.connect()
+    expect(MockWebSocket.instances).toHaveLength(1)
+
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._close(4009, 'Server shutdown')
+
+    await expect(p).rejects.toThrow(/Server restarting/i)
+
+    // Should schedule a reconnect at base delay (1000ms) since backoff is reset.
+    // Filter out the connection timeout (10000ms) which is unrelated.
+    const reconnectDelays = setTimeoutSpy.mock.calls
+      .map((call) => call[1])
+      .filter((d): d is number => typeof d === 'number' && d < 10000)
+    expect(reconnectDelays).toContain(1000)
+    // No exponential backoff — max reconnect delay should be 1000ms
+    expect(Math.max(...reconnectDelays)).toBe(1000)
+  })
+
+  it('disconnect clears pending reconnect timers', async () => {
+    const c = new WsClient('ws://example/ws')
+    const p = c.connect()
+    expect(MockWebSocket.instances).toHaveLength(1)
+
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._close(4002, 'Hello timeout')
+
+    await expect(p).rejects.toThrow(/Handshake timeout/i)
+    expect(MockWebSocket.instances).toHaveLength(1)
+
+    c.disconnect()
+
+    vi.advanceTimersByTime(5000)
+    expect(MockWebSocket.instances).toHaveLength(1)
+  })
+
+  it('resetWsClientForTests tears down singleton reconnect state', async () => {
+    const c = getWsClient()
+    const p = c.connect()
+    expect(MockWebSocket.instances).toHaveLength(1)
+
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._close(4002, 'Hello timeout')
+
+    await expect(p).rejects.toThrow(/Handshake timeout/i)
+    expect(MockWebSocket.instances).toHaveLength(1)
+
+    resetWsClientForTests()
+
+    vi.advanceTimersByTime(5000)
+    expect(MockWebSocket.instances).toHaveLength(1)
+    expect(getWsClient()).not.toBe(c)
   })
 })

@@ -3,6 +3,7 @@ import type { HttpProxy } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { getNetworkHost } from './server/get-network-host.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -36,6 +37,7 @@ export default defineConfig(({ mode }) => {
       alias: {
         '@': path.resolve(__dirname, './src'),
         '@test': path.resolve(__dirname, './test'),
+        '@shared': path.resolve(__dirname, './shared'),
       },
     },
     build: {
@@ -43,7 +45,7 @@ export default defineConfig(({ mode }) => {
       sourcemap: mode === 'development',
     },
     server: {
-      host: true,
+      host: getNetworkHost(),
       allowedHosts,
       port: vitePort,
       watch: {

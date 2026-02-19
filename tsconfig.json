@@ -25,11 +25,15 @@
       ],
       "@test/*": [
         "test/*"
+      ],
+      "@shared/*": [
+        "shared/*"
       ]
     }
   },
   "include": [
     "src",
+    "shared",
     "vite.config.ts"
   ]
 }

@@ -70,7 +70,11 @@ describe('BackgroundSessions', () => {
       </Provider>
     )
 
-    // Wait for the list to load and render
+    // Trigger an explicit refresh after mount to avoid races between
+    // initial request dispatch and mock onMessage registration.
+    await user.click(screen.getByRole('button', { name: 'Refresh' }))
+
+    // Wait for the list to load and render.
     const attachBtn = await screen.findByRole('button', { name: 'Attach' })
     await user.click(attachBtn)
 

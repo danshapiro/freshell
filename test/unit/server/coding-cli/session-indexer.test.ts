@@ -18,14 +18,28 @@ vi.mock('../../../../server/config-store', () => ({
   },
 }))
 
-function makeProvider(files: string[]): CodingCliProvider {
+type MakeProviderOptions = {
+  name?: CodingCliProvider['name']
+  displayName?: string
+  homeDir?: string
+  listSessionFiles?: CodingCliProvider['listSessionFiles']
+  parseSessionFile?: CodingCliProvider['parseSessionFile']
+  resolveProjectPath?: CodingCliProvider['resolveProjectPath']
+  extractSessionId?: CodingCliProvider['extractSessionId']
+}
+
+function makeProvider(files: string[], options: MakeProviderOptions = {}): CodingCliProvider {
+  const providerName = options.name ?? 'claude'
+  const homeDir = options.homeDir ?? '/tmp'
+  const displayName = options.displayName ?? (providerName === 'claude' ? 'Claude' : providerName)
+
   return {
-    name: 'claude',
-    displayName: 'Claude',
-    homeDir: '/tmp',
-    getSessionGlob: () => path.join('/tmp', '*.jsonl'),
-    listSessionFiles: async () => files,
-    parseSessionFile: async (content: string) => {
+    name: providerName,
+    displayName,
+    homeDir,
+    getSessionGlob: () => path.join(homeDir, '**', '*.jsonl'),
+    listSessionFiles: options.listSessionFiles ?? (async () => files),
+    parseSessionFile: options.parseSessionFile ?? (async (content: string) => {
       const lines = content.split(/\r?\n/).filter(Boolean)
       let cwd: string | undefined
       let title: string | undefined
@@ -35,9 +49,9 @@ function makeProvider(files: string[]): CodingCliProvider {
         if (!title && typeof obj.title === 'string') title = obj.title
       }
       return { cwd, title, messageCount: lines.length }
-    },
-    resolveProjectPath: async (_filePath, meta) => meta.cwd || 'unknown',
-    extractSessionId: (filePath) => path.basename(filePath, '.jsonl'),
+    }),
+    resolveProjectPath: options.resolveProjectPath ?? (async (_filePath, meta) => meta.cwd || 'unknown'),
+    extractSessionId: options.extractSessionId ?? ((filePath) => path.basename(filePath, '.jsonl')),
     getCommand: () => 'claude',
     getStreamArgs: () => [],
     getResumeArgs: () => [],
@@ -245,6 +259,200 @@ describe('CodingCliSessionIndexer', () => {
 
     const sessionId = indexer.getProjects()[0]?.sessions[0]?.sessionId
     expect(sessionId).toBe('canonical-id')
+  })
+
+  it('treats provider + sessionId as the uniqueness key when detecting new sessions', () => {
+    const sessionId = 'shared-session-id'
+    const indexer = new CodingCliSessionIndexer([])
+    const detected: CodingCliSession[] = []
+    indexer.onNewSession((session) => detected.push(session))
+
+    indexer['initialized'] = true
+    indexer['detectNewSessions']([
+      {
+        provider: 'claude',
+        sessionId,
+        projectPath: '/project/a',
+        updatedAt: 100,
+        cwd: '/project/a',
+      },
+      {
+        provider: 'codex',
+        sessionId,
+        projectPath: '/project/a',
+        updatedAt: 101,
+        cwd: '/project/a',
+      },
+    ])
+
+    expect(detected).toHaveLength(2)
+    expect(new Set(detected.map((session) => session.provider))).toEqual(new Set(['claude', 'codex']))
+    expect(indexer['knownSessionIds'].has(makeSessionKey('claude', sessionId))).toBe(true)
+    expect(indexer['knownSessionIds'].has(makeSessionKey('codex', sessionId))).toBe(true)
+  })
+
+  it('stores file path mappings by provider to avoid cross-provider session collisions', async () => {
+    const sharedSessionId = 'shared-session-id'
+    const claudeFile = path.join(tempDir, 'claude-session.jsonl')
+    const codexFile = path.join(tempDir, 'codex-session.jsonl')
+    await fsp.writeFile(claudeFile, JSON.stringify({ cwd: '/project/a', title: 'Claude Session' }) + '\n')
+    await fsp.writeFile(codexFile, JSON.stringify({ cwd: '/project/b', title: 'Codex Session' }) + '\n')
+
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      sessionOverrides: {},
+      settings: {
+        codingCli: {
+          enabledProviders: ['claude', 'codex'],
+          providers: {},
+        },
+      },
+    })
+
+    const claudeProvider = makeProvider([claudeFile], {
+      name: 'claude',
+      homeDir: tempDir,
+      parseSessionFile: async () => ({
+        cwd: '/project/a',
+        title: 'Claude Session',
+        sessionId: sharedSessionId,
+        messageCount: 1,
+      }),
+    })
+    const codexProvider = makeProvider([codexFile], {
+      name: 'codex',
+      displayName: 'Codex',
+      homeDir: tempDir,
+      parseSessionFile: async () => ({
+        cwd: '/project/b',
+        title: 'Codex Session',
+        sessionId: sharedSessionId,
+        messageCount: 1,
+      }),
+    })
+
+    const indexer = new CodingCliSessionIndexer([claudeProvider, codexProvider])
+    await indexer.refresh()
+
+    expect(indexer.getFilePathForSession(sharedSessionId, 'claude')).toBe(claudeFile)
+    expect(indexer.getFilePathForSession(sharedSessionId, 'codex')).toBe(codexFile)
+    expect(indexer.getFilePathForSession(sharedSessionId)).toBe(claudeFile)
+  })
+
+  it('applies archived and createdAt overrides from session overrides', async () => {
+    const sessionId = 'session-a'
+    const fileA = path.join(tempDir, `${sessionId}.jsonl`)
+    await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')
+
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      sessionOverrides: {
+        [makeSessionKey('claude', sessionId)]: {
+          archived: true,
+          createdAtOverride: 123456,
+        },
+      },
+      settings: {
+        codingCli: {
+          enabledProviders: ['claude'],
+          providers: {},
+        },
+      },
+    })
+
+    const provider = makeProvider([fileA])
+    const indexer = new CodingCliSessionIndexer([provider])
+    await indexer.refresh()
+
+    const session = indexer.getProjects()[0]?.sessions[0]
+    expect(session?.archived).toBe(true)
+    expect(session?.createdAt).toBe(123456)
+  })
+
+  it('prunes known sessions that are no longer present', () => {
+    const indexer = new CodingCliSessionIndexer([])
+    const staleKey = makeSessionKey('codex', 'stale-session')
+    const activeKey = makeSessionKey('claude', 'active-session')
+    indexer['knownSessionIds'].add(staleKey)
+    indexer['knownSessionIds'].add(activeKey)
+
+    indexer['detectNewSessions']([
+      {
+        provider: 'claude',
+        sessionId: 'active-session',
+        projectPath: '/project/a',
+        updatedAt: 100,
+        cwd: '/project/a',
+      },
+    ])
+
+    expect(indexer['knownSessionIds'].has(activeKey)).toBe(true)
+    expect(indexer['knownSessionIds'].has(staleKey)).toBe(false)
+  })
+
+  it('suppresses reappearing sessions that have already been seen', () => {
+    const indexer = new CodingCliSessionIndexer([])
+    const detected: string[] = []
+    indexer.onNewSession((session) => detected.push(makeSessionKey(session.provider, session.sessionId)))
+    indexer['initialized'] = true
+
+    const session = {
+      provider: 'claude' as const,
+      sessionId: 'reappearing-session',
+      projectPath: '/project/a',
+      updatedAt: 100,
+      cwd: '/project/a',
+    }
+
+    indexer['detectNewSessions']([session])
+    indexer['detectNewSessions']([])
+    indexer['detectNewSessions']([session])
+
+    expect(detected).toEqual([makeSessionKey('claude', 'reappearing-session')])
+  })
+
+  it('calls new-session handlers oldest-first by updatedAt', () => {
+    const indexer = new CodingCliSessionIndexer([])
+    const order: string[] = []
+    indexer.onNewSession((session) => order.push(session.sessionId))
+    indexer['initialized'] = true
+
+    indexer['detectNewSessions']([
+      {
+        provider: 'claude',
+        sessionId: 'newer',
+        projectPath: '/project/a',
+        updatedAt: 200,
+        cwd: '/project/a',
+      },
+      {
+        provider: 'claude',
+        sessionId: 'older',
+        projectPath: '/project/a',
+        updatedAt: 100,
+        cwd: '/project/a',
+      },
+    ])
+
+    expect(order).toEqual(['older', 'newer'])
+  })
+
+  it('supports unsubscribing from onNewSession handlers', () => {
+    const indexer = new CodingCliSessionIndexer([])
+    const handler = vi.fn()
+    const unsubscribe = indexer.onNewSession(handler)
+    unsubscribe()
+
+    indexer['initialized'] = true
+    indexer['detectNewSessions']([
+      {
+        provider: 'claude',
+        sessionId: 'session-a',
+        projectPath: '/project/a',
+        updatedAt: 100,
+        cwd: '/project/a',
+      },
+    ])
+
+    expect(handler).not.toHaveBeenCalled()
   })
 
   it('propagates token and git metadata from ParsedSessionMeta into indexed sessions', async () => {
@@ -545,6 +753,103 @@ describe('CodingCliSessionIndexer', () => {
       } finally {
         vi.useRealTimers()
       }
+    })
+  })
+
+  describe('no-op refresh suppression', () => {
+    it('skips emitUpdate when refresh produces identical projects', async () => {
+      const fileA = path.join(tempDir, 'session-a.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')
+
+      const provider = makeProvider([fileA])
+      const indexer = new CodingCliSessionIndexer([provider])
+
+      const handler = vi.fn()
+      indexer.onUpdate(handler)
+
+      // First refresh: should emit
+      await indexer.refresh()
+      expect(handler).toHaveBeenCalledTimes(1)
+
+      // Second refresh: file unchanged, should NOT emit
+      await indexer.refresh()
+      expect(handler).toHaveBeenCalledTimes(1)
+    })
+
+    it('emits update when session metadata changes between refreshes', async () => {
+      const fileA = path.join(tempDir, 'session-a.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')
+
+      const provider = makeProvider([fileA])
+      const indexer = new CodingCliSessionIndexer([provider])
+
+      const handler = vi.fn()
+      indexer.onUpdate(handler)
+
+      await indexer.refresh()
+      expect(handler).toHaveBeenCalledTimes(1)
+
+      // Modify file content (title changes) and mark dirty to simulate watcher
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Updated Title' }) + '\n')
+      ;(indexer as any).markDirty(fileA)
+
+      await indexer.refresh()
+      expect(handler).toHaveBeenCalledTimes(2)
+    })
+
+    it('emits update when project color changes between refreshes', async () => {
+      const fileA = path.join(tempDir, 'session-a.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')
+
+      const provider = makeProvider([fileA])
+      const indexer = new CodingCliSessionIndexer([provider])
+
+      const handler = vi.fn()
+      indexer.onUpdate(handler)
+
+      await indexer.refresh()
+      expect(handler).toHaveBeenCalledTimes(1)
+
+      // Change project color
+      vi.mocked(configStore.getProjectColors).mockResolvedValueOnce({
+        '/project/a': '#ff0000',
+        '/project/b': '#222222',
+      })
+
+      await indexer.refresh()
+      expect(handler).toHaveBeenCalledTimes(2)
+    })
+
+    it('emits update when session override changes between refreshes', async () => {
+      const fileA = path.join(tempDir, 'session-a.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')
+
+      const provider = makeProvider([fileA])
+      const indexer = new CodingCliSessionIndexer([provider])
+
+      const handler = vi.fn()
+      indexer.onUpdate(handler)
+
+      await indexer.refresh()
+      expect(handler).toHaveBeenCalledTimes(1)
+
+      // Add a session override
+      vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+        sessionOverrides: {
+          [makeSessionKey('claude', 'session-a')]: {
+            titleOverride: 'Overridden',
+          },
+        },
+        settings: {
+          codingCli: {
+            enabledProviders: ['claude'],
+            providers: {},
+          },
+        },
+      })
+
+      await indexer.refresh()
+      expect(handler).toHaveBeenCalledTimes(2)
     })
   })
 

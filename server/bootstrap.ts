@@ -104,6 +104,28 @@ function scoreLanIp(ip: string, netmask: string): number {
 }
 
 /**
+ * Read the network host from ~/.freshell/config.json directly.
+ *
+ * This MUST NOT use dotenv or getNetworkHost() because bootstrap runs
+ * before dotenv/config loads. Reading from config.json directly is safe
+ * because config.json is written atomically by the server.
+ *
+ * The HOST env var is intentionally ignored here — dotenv hasn't loaded yet,
+ * so process.env.HOST may be stale or missing. NetworkManager.initializeFromStartup()
+ * rebuilds origins with the correct effective host shortly after server startup.
+ */
+export function readConfigHost(): '127.0.0.1' | '0.0.0.0' {
+  try {
+    const configPath = path.join(os.homedir(), '.freshell', 'config.json')
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
+    const host = config.settings?.network?.host
+    return (host === '0.0.0.0' || host === '127.0.0.1') ? host : '127.0.0.1'
+  } catch {
+    return '127.0.0.1'
+  }
+}
+
+/**
  * Detect all non-loopback IPv4 addresses from network interfaces.
  * Returns IPs sorted by LAN likelihood (most likely first).
  * In WSL2, queries Windows host for physical LAN IPs.
@@ -244,7 +266,8 @@ export function ensureEnvFile(envPath: string): BootstrapResult {
 
     // Generate new token and detect LAN IPs
     const token = generateAuthToken()
-    const lanIps = detectLanIps()
+    const configHost = readConfigHost()
+    const lanIps = configHost === '0.0.0.0' ? detectLanIps() : []
     const origins = buildAllowedOrigins(lanIps)
 
     if (!exists) {

@@ -8,6 +8,7 @@ import { api } from '@/lib/api'
 import { getAuthToken } from '@/lib/auth'
 import { buildShareUrl } from '@/lib/utils'
 import { copyText } from '@/lib/clipboard'
+import { triggerHapticFeedback } from '@/lib/mobile-haptics'
 import { collectTerminalIds, findPaneContent } from '@/lib/pane-utils'
 import { collectSessionRefsFromNode } from '@/lib/session-utils'
 import { getTabDisplayTitle } from '@/lib/tab-title'
@@ -22,6 +23,14 @@ import { ContextMenu } from './ContextMenu'
 import { ContextIds } from './context-menu-constants'
 import { buildMenuItems } from './menu-defs'
 import { copyDataset, isTextInputLike, parseContextTarget } from './context-menu-utils'
+import {
+  copyFreshclaudeCodeBlock,
+  copyFreshclaudeToolInput,
+  copyFreshclaudeToolOutput,
+  copyFreshclaudeDiffNew,
+  copyFreshclaudeDiffOld,
+  copyFreshclaudeFilePath,
+} from './freshclaude-chat-copy'
 import { nanoid } from 'nanoid'
 
 const CONTEXT_MENU_KEYS = ['ContextMenu']
@@ -31,6 +40,7 @@ type MenuState = {
   position: { x: number; y: number }
   target: ContextTarget
   contextElement: HTMLElement | null
+  clickTarget: HTMLElement | null
   dataset: Record<string, string | undefined>
 }
 
@@ -591,7 +601,7 @@ export function ContextMenuProvider({
     if (inputLike && ![ContextIds.Editor, ContextIds.Terminal].includes(contextId as any)) return true
 
     const link = targetEl?.closest?.('a[href]')
-    if (link && (contextId === ContextIds.Global || !contextEl)) return true
+    if (link) return true
 
     return false
   }, [])
@@ -612,6 +622,7 @@ export function ContextMenuProvider({
         position: { x: e.clientX, y: e.clientY },
         target: targetObj,
         contextElement: contextEl,
+        clickTarget: target,
         dataset,
       })
     }
@@ -635,15 +646,88 @@ export function ContextMenuProvider({
         position: { x: rect.left + 8, y: rect.bottom + 4 },
         target: targetObj,
         contextElement: contextEl,
+        clickTarget: target,
         dataset,
       })
     }
 
+    // --- Long-press (touch hold) detection for mobile ---
+    let longPressTimer: ReturnType<typeof setTimeout> | null = null
+    let touchStartPos: { x: number; y: number } | null = null
+
+    const handleTouchStart = (e: TouchEvent) => {
+      const touch = e.touches[0]
+      if (!touch) return
+      touchStartPos = { x: touch.clientX, y: touch.clientY }
+
+      longPressTimer = setTimeout(() => {
+        if (!touchStartPos) return
+        const target = document.elementFromPoint(touchStartPos.x, touchStartPos.y) as HTMLElement | null
+        if (!target) return
+
+        const contextEl = findContextElement(target)
+        const contextId = resolveContextId(contextEl?.dataset.context)
+        if (!contextId) return
+
+        // Respect native context menu for inputs, links, iframes, etc.
+        if (contextEl?.dataset.nativeContext === 'true') { touchStartPos = null; return }
+        if (target.closest?.('[data-native-context="true"]')) { touchStartPos = null; return }
+        if (target.tagName === 'IFRAME') { touchStartPos = null; return }
+        if (isTextInputLike(target) && ![ContextIds.Editor, ContextIds.Terminal].includes(contextId as any)) { touchStartPos = null; return }
+        if (target.closest?.('a[href]')) { touchStartPos = null; return }
+
+        const dataset = contextEl?.dataset ? copyDataset(contextEl.dataset) : {}
+        const parsed = parseContextTarget(contextId as any, dataset)
+        const targetObj = parsed || { kind: 'global' as const }
+
+        triggerHapticFeedback()
+        openMenu({
+          position: { x: touchStartPos.x, y: touchStartPos.y },
+          target: targetObj,
+          contextElement: contextEl,
+          clickTarget: target,
+          dataset,
+        })
+        touchStartPos = null
+      }, 500)
+    }
+
+    const handleTouchMove = (e: TouchEvent) => {
+      if (!touchStartPos || !longPressTimer) return
+      const touch = e.touches[0]
+      if (!touch) return
+      const dx = Math.abs(touch.clientX - touchStartPos.x)
+      const dy = Math.abs(touch.clientY - touchStartPos.y)
+      if (dx > 10 || dy > 10) {
+        clearTimeout(longPressTimer)
+        longPressTimer = null
+        touchStartPos = null
+      }
+    }
+
+    const handleTouchEnd = () => {
+      if (longPressTimer) {
+        clearTimeout(longPressTimer)
+        longPressTimer = null
+      }
+      touchStartPos = null
+    }
+
     document.addEventListener('contextmenu', handleContextMenu, true)
     document.addEventListener('keydown', handleKeyDown, true)
+    document.addEventListener('touchstart', handleTouchStart, { passive: true })
+    document.addEventListener('touchmove', handleTouchMove, { passive: true })
+    document.addEventListener('touchend', handleTouchEnd)
+    document.addEventListener('touchcancel', handleTouchEnd)
+
     return () => {
       document.removeEventListener('contextmenu', handleContextMenu, true)
       document.removeEventListener('keydown', handleKeyDown, true)
+      document.removeEventListener('touchstart', handleTouchStart)
+      document.removeEventListener('touchmove', handleTouchMove)
+      document.removeEventListener('touchend', handleTouchEnd)
+      document.removeEventListener('touchcancel', handleTouchEnd)
+      if (longPressTimer) clearTimeout(longPressTimer)
     }
   }, [openMenu, shouldUseNativeMenu])
 
@@ -689,6 +773,7 @@ export function ContextMenuProvider({
       sessions,
       expandedProjects,
       contextElement: menuState.contextElement,
+      clickTarget: menuState.clickTarget,
       platform,
       actions: {
         newDefaultTab,
@@ -742,6 +827,12 @@ export function ContextMenuProvider({
         copyTerminalCwd,
         copyMessageText,
         copyMessageCode,
+        copyFreshclaudeCodeBlock,
+        copyFreshclaudeToolInput,
+        copyFreshclaudeToolOutput,
+        copyFreshclaudeDiffNew,
+        copyFreshclaudeDiffOld,
+        copyFreshclaudeFilePath,
       },
     })
   }, [
