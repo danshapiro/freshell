@@ -5,6 +5,9 @@ import type {
   TerminalAttachedEndMessage,
   TerminalExitMessage,
 } from '@shared/ws-protocol'
+import { createLogger } from '@/lib/client-logger'
+
+const log = createLogger('ChunkedAttach')
 
 export const ATTACH_FRAME_SEND_TIMEOUT_MS = 30_000
 export const ATTACH_RECONNECT_MIN_DELAY_MS = 5_000
@@ -70,7 +73,7 @@ export function useChunkedAttach({
 
   useEffect(() => {
     if (ATTACH_CHUNK_TIMEOUT_MS < ATTACH_FRAME_SEND_TIMEOUT_MS + ATTACH_RECONNECT_MIN_DELAY_MS) {
-      console.warn('[chunked-attach] timeout invariant violated')
+      log.warn('[chunked-attach] timeout invariant violated')
     }
   }, [])
 
@@ -183,7 +186,7 @@ export function useChunkedAttach({
       const inflight = inflightChunksRef.current.get(msg.terminalId)
       if (!inflight) {
         if (inflightChunksRef.current.has(currentTerminalId) && msg.terminalId !== currentTerminalId) {
-          console.warn('[chunked-attach] ignoring chunk for mismatched terminal', msg.terminalId)
+          log.warn('[chunked-attach] ignoring chunk for mismatched terminal', msg.terminalId)
           return true
         }
         return false
@@ -198,7 +201,7 @@ export function useChunkedAttach({
       const inflight = inflightChunksRef.current.get(msg.terminalId)
       if (!inflight) {
         if (inflightChunksRef.current.has(currentTerminalId) && msg.terminalId !== currentTerminalId) {
-          console.warn('[chunked-attach] ignoring end for mismatched terminal', msg.terminalId)
+          log.warn('[chunked-attach] ignoring end for mismatched terminal', msg.terminalId)
           return true
         }
         return false

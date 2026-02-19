@@ -15,6 +15,10 @@ import { makeSelectSortedSessionItems, type SidebarSessionItem } from '@/store/s
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { ProviderIcon } from '@/components/icons/provider-icons'
 import { getActiveSessionRefForTab } from '@/lib/session-utils'
+import { createLogger } from '@/lib/client-logger'
+
+
+const log = createLogger('Sidebar')
 
 export type AppView = 'terminal' | 'tabs' | 'sessions' | 'overview' | 'settings'
 
@@ -135,7 +139,7 @@ export default function Sidebar({
           setSearchResults(response.results)
         }
       } catch (err) {
-        console.error('Search failed:', err)
+        log.error('Search failed:', err)
         if (!controller.signal.aborted) {
           setSearchResults([])
         }
