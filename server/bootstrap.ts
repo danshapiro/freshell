@@ -13,23 +13,12 @@ import fs from 'fs'
 import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { isWSL } from './platform.js'
 
 export type BootstrapResult = {
   action: 'created' | 'patched' | 'skipped' | 'error'
   token?: string
   error?: string
-}
-
-/**
- * Check if running inside WSL2.
- */
-function isWSL2(): boolean {
-  try {
-    const version = fs.readFileSync('/proc/version', 'utf-8')
-    return version.toLowerCase().includes('microsoft')
-  } catch {
-    return false
-  }
 }
 
 /**
@@ -128,11 +117,11 @@ export function readConfigHost(): '127.0.0.1' | '0.0.0.0' {
 /**
  * Detect all non-loopback IPv4 addresses from network interfaces.
  * Returns IPs sorted by LAN likelihood (most likely first).
- * In WSL2, queries Windows host for physical LAN IPs.
+ * In WSL, queries Windows host for physical LAN IPs.
  */
 export function detectLanIps(): string[] {
-  // In WSL2, get Windows host's physical LAN IPs instead of WSL's virtual IPs
-  if (isWSL2()) {
+  // In WSL, get Windows host's physical LAN IPs instead of WSL's virtual IPs
+  if (isWSL()) {
     const windowsIps = getWindowsHostIps()
     if (windowsIps.length > 0) {
       // Score and sort Windows IPs (using /24 as assumed netmask)

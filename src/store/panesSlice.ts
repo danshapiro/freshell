@@ -4,6 +4,10 @@ import type { PanesState, PaneContent, PaneContentInput, PaneNode } from './pane
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { loadPersistedPanes } from './persistMiddleware.js'
+import { createLogger } from '@/lib/client-logger'
+
+
+const log = createLogger('PanesSlice')
 
 /**
  * Normalize terminal input to full PaneContent with defaults.
@@ -164,9 +168,7 @@ function cleanOrphanedLayouts(state: PanesState): PanesState {
 
     if (orphaned.length === 0) return state
 
-    if (import.meta.env.MODE === 'development') {
-      console.log('[PanesSlice] Cleaning orphaned pane layouts:', orphaned)
-    }
+    log.debug('Cleaning orphaned pane layouts:', orphaned)
 
     const nextLayouts = { ...state.layouts }
     const nextActivePane = { ...state.activePane }
@@ -211,9 +213,7 @@ function loadInitialPanesState(): PanesState {
     const loaded = loadPersistedPanes()
     if (!loaded) return defaultState
 
-    if (import.meta.env.MODE === 'development') {
-      console.log('[PanesSlice] Loaded initial state from localStorage:', Object.keys(loaded.layouts || {}))
-    }
+    log.debug('Loaded initial state from localStorage:', Object.keys(loaded.layouts || {}))
     let state: PanesState = {
       layouts: loaded.layouts || {},
       activePane: loaded.activePane || {},
@@ -227,9 +227,7 @@ function loadInitialPanesState(): PanesState {
     state = cleanOrphanedLayouts(state)
     return state
   } catch (err) {
-    if (import.meta.env.MODE === 'development') {
-      console.error('[PanesSlice] Failed to load from localStorage:', err)
-    }
+    log.error('Failed to load from localStorage:', err)
     return defaultState
   }
 }

@@ -1,6 +1,6 @@
 import fs from 'fs'
 import fsp from 'fs/promises'
-import { execFile } from 'child_process'
+import { execFile, execFileSync } from 'child_process'
 import os from 'os'
 import path from 'path'
 import { promisify } from 'util'
@@ -102,6 +102,10 @@ function convertWslMountPathToWindows(posixPath: string): string | undefined {
 export function convertWindowsPathToWslPath(input: string): string | undefined {
   const cleaned = sanitizeUserPathInput(input)
   if (!cleaned) return undefined
+  // POSIX absolute paths are already native Linux paths, not Windows paths to convert.
+  // Skipping early avoids path.win32.resolve prepending a drive letter on Windows
+  // (e.g. /home/user -> C:\home\user), which would cause a false-positive conversion.
+  if (POSIX_ABSOLUTE_PREFIX_RE.test(cleaned)) return undefined
   const normalized = path.win32.resolve(cleaned)
 
   const driveMatch = normalized.match(/^([a-zA-Z]):(?:\\(.*))?$/)
@@ -127,12 +131,42 @@ export function convertWindowsPathToWslPath(input: string): string | undefined {
   return undefined
 }
 
+let _hasWslDistros: boolean | undefined
+
+/**
+ * Check if WSL has at least one distribution installed by querying the registry.
+ * This avoids calling wsl.exe directly, which triggers a Windows Store dialog
+ * on machines where WSL is not installed or has no distributions.
+ * Result is cached after the first call.
+ */
+function hasWslDistributions(): boolean {
+  if (_hasWslDistros !== undefined) return _hasWslDistros
+  if (process.platform !== 'win32') {
+    _hasWslDistros = false
+    return false
+  }
+  try {
+    execFileSync('reg.exe', [
+      'query',
+      'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss',
+    ], { windowsHide: true, timeout: 2000, stdio: 'pipe' })
+    _hasWslDistros = true
+  } catch {
+    _hasWslDistros = false
+  }
+  return _hasWslDistros
+}
+
 async function convertWslPathToWindows(posixPath: string): Promise<string | undefined> {
   if (process.platform !== 'win32') return undefined
   if (!posixPath.startsWith('/')) return undefined
 
   const mountMapped = convertWslMountPathToWindows(posixPath)
   if (mountMapped) return mountMapped
+
+  // Skip wsl.exe calls if no WSL distributions are installed —
+  // calling wsl.exe without distributions triggers a Windows Store dialog
+  if (!hasWslDistributions()) return undefined
 
   const cached = wslPathToWindowsCache.get(posixPath)
   if (cached) return cached

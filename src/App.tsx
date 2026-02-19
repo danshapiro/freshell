@@ -45,8 +45,11 @@ import { updateSettingsLocal, markSaved } from '@/store/settingsSlice'
 
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
+import { createLogger } from '@/lib/client-logger'
 import type { ProjectGroup, AppSettings } from '@/store/types'
 import { z } from 'zod'
+
+const log = createLogger('App')
 
 // Lazy QR code component to avoid loading lean-qr until the share panel opens
 function ShareQrCode({ url }: { url: string }) {
@@ -190,7 +193,7 @@ export default function App() {
       await api.patch('/api/settings', { sidebar: settings.sidebar })
       dispatch(markSaved())
     } catch (err) {
-      console.warn('Failed to save sidebar settings', err)
+      log.warn('Failed to save sidebar settings', err)
     }
   }, [settings.sidebar, dispatch])
 
@@ -207,7 +210,7 @@ export default function App() {
       await api.patch('/api/settings', { sidebar: { ...settings.sidebar, collapsed: newCollapsed } })
       dispatch(markSaved())
     } catch (err) {
-      console.warn('Failed to save sidebar settings', err)
+      log.warn('Failed to save sidebar settings', err)
     }
   }, [isMobile, sidebarCollapsed, settings.sidebar, dispatch])
 
@@ -299,7 +302,7 @@ export default function App() {
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     } catch (err) {
-      console.warn('Clipboard write failed:', err)
+      log.warn('Clipboard write failed:', err)
     }
   }
 
@@ -336,7 +339,7 @@ export default function App() {
         if (!cancelled) dispatch(setSettings(applyLocalTerminalFontFamily(settings)))
       } catch (err: any) {
         if (handleBootstrapAuthFailure(err)) return
-        console.warn('Failed to load settings', err)
+        log.warn('Failed to load settings', err)
       }
 
       try {
@@ -357,7 +360,7 @@ export default function App() {
         }
       } catch (err: any) {
         if (handleBootstrapAuthFailure(err)) return
-        console.warn('Failed to load platform info', err)
+        log.warn('Failed to load platform info', err)
       }
 
       try {
@@ -367,7 +370,7 @@ export default function App() {
         }
       } catch (err: any) {
         if (handleBootstrapAuthFailure(err)) return
-        console.warn('Failed to load version info', err)
+        log.warn('Failed to load version info', err)
       }
 
       try {
@@ -375,7 +378,7 @@ export default function App() {
         if (!cancelled) dispatch(setProjects(projects))
       } catch (err: any) {
         if (handleBootstrapAuthFailure(err)) return
-        console.warn('Failed to load sessions', err)
+        log.warn('Failed to load sessions', err)
       }
 
       // Load network status for remote access wizard/settings
@@ -460,7 +463,7 @@ export default function App() {
         if (msg.type === 'terminal.exit') {
           const terminalId = msg.terminalId
           const code = msg.exitCode
-          if (import.meta.env.MODE === 'development') console.log('terminal exit', terminalId, code)
+          log.debug('terminal exit', terminalId, code)
           if (terminalId) {
             dispatch(removeTerminalMeta(terminalId))
           }
@@ -469,9 +472,9 @@ export default function App() {
           // Log session repair status (silent for healthy/repaired, visible for problems)
           const { sessionId, status, orphansFixed } = msg
           if (status === 'missing') {
-            if (import.meta.env.MODE === 'development') console.warn(`Session ${sessionId.slice(0, 8)}... file is missing`)
+            log.warn(`Session ${sessionId.slice(0, 8)}... file is missing`)
           } else if (status === 'repaired') {
-            if (import.meta.env.MODE === 'development') console.log(`Session ${sessionId.slice(0, 8)}... repaired (${orphansFixed} orphans fixed)`)
+            log.debug(`Session ${sessionId.slice(0, 8)}... repaired (${orphansFixed} orphans fixed)`)
           }
           // For 'healthy' status, no logging needed
         }

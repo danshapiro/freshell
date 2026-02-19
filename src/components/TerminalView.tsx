@@ -50,6 +50,9 @@ import { Loader2 } from 'lucide-react'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { PaneContent, TerminalPaneContent } from '@/store/paneTypes'
 import '@xterm/xterm/css/xterm.css'
+import { createLogger } from '@/lib/client-logger'
+
+const log = createLogger('TerminalView')
 
 const SESSION_ACTIVITY_THROTTLE_MS = 5000
 const RATE_LIMIT_RETRY_MAX_ATTEMPTS = 3
@@ -198,7 +201,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     if (terminalContent) {
       const prev = contentRef.current
       if (prev && terminalContent.resumeSessionId !== prev.resumeSessionId) {
-        if (debugRef.current) console.log('[TRACE resumeSessionId] ref sync from props CHANGED resumeSessionId', {
+        if (debugRef.current) log.debug('[TRACE resumeSessionId] ref sync from props CHANGED resumeSessionId', {
           paneId,
           from: prev.resumeSessionId,
           to: terminalContent.resumeSessionId,
@@ -449,7 +452,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     const next = { ...current, ...updates }
     // Trace resumeSessionId changes
     if ('resumeSessionId' in updates && updates.resumeSessionId !== current.resumeSessionId) {
-      if (debugRef.current) console.log('[TRACE resumeSessionId] updateContent CHANGING resumeSessionId', {
+      if (debugRef.current) log.debug('[TRACE resumeSessionId] updateContent CHANGING resumeSessionId', {
         paneId,
         from: current.resumeSessionId,
         to: updates.resumeSessionId,
@@ -1015,7 +1018,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     const sendCreate = (requestId: string) => {
       const restore = getRestoreFlag(requestId)
       const resumeId = getResumeSessionIdFromRef(contentRef)
-      if (debugRef.current) console.log('[TRACE resumeSessionId] sendCreate', {
+      if (debugRef.current) log.debug('[TRACE resumeSessionId] sendCreate', {
         paneId: paneIdRef.current,
         requestId,
         resumeSessionId: resumeId,
@@ -1092,7 +1095,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         if (msg.type === 'terminal.created' && msg.requestId === reqId) {
           clearRateLimitRetry()
           const newId = msg.terminalId as string
-          if (debugRef.current) console.log('[TRACE resumeSessionId] terminal.created received', {
+          if (debugRef.current) log.debug('[TRACE resumeSessionId] terminal.created received', {
             paneId: paneIdRef.current,
             requestId: reqId,
             terminalId: newId,
@@ -1166,7 +1169,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         // Message type: { type: 'terminal.session.associated', terminalId: string, sessionId: string }
         if (msg.type === 'terminal.session.associated' && msg.terminalId === tid) {
           const sessionId = msg.sessionId as string
-          if (debugRef.current) console.log('[TRACE resumeSessionId] terminal.session.associated', {
+          if (debugRef.current) log.debug('[TRACE resumeSessionId] terminal.session.associated', {
             paneId: paneIdRef.current,
             terminalId: tid,
             oldResumeSessionId: contentRef.current?.resumeSessionId,
@@ -1208,7 +1211,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         if (msg.type === 'error' && msg.code === 'INVALID_TERMINAL_ID' && !msg.requestId) {
           const currentTerminalId = terminalIdRef.current
           const current = contentRef.current
-          if (debugRef.current) console.log('[TRACE resumeSessionId] INVALID_TERMINAL_ID received', {
+          if (debugRef.current) log.debug('[TRACE resumeSessionId] INVALID_TERMINAL_ID received', {
             paneId: paneIdRef.current,
             msgTerminalId: msg.terminalId,
             currentTerminalId,
@@ -1229,7 +1232,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           if (currentTerminalId && current?.status !== 'exited') {
             term.writeln('\r\n[Reconnecting...]\r\n')
             const newRequestId = nanoid()
-            if (debugRef.current) console.log('[TRACE resumeSessionId] INVALID_TERMINAL_ID reconnecting', {
+            if (debugRef.current) log.debug('[TRACE resumeSessionId] INVALID_TERMINAL_ID reconnecting', {
               paneId: paneIdRef.current,
               oldRequestId: requestIdRef.current,
               newRequestId,
@@ -1260,7 +1263,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       unsubReconnect = ws.onReconnect(() => {
         bumpConnectionGeneration()
         const tid = terminalIdRef.current
-        if (debugRef.current) console.log('[TRACE resumeSessionId] onReconnect', {
+        if (debugRef.current) log.debug('[TRACE resumeSessionId] onReconnect', {
           paneId: paneIdRef.current,
           terminalId: tid,
           resumeSessionId: contentRef.current?.resumeSessionId,
@@ -1274,7 +1277,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       // not re-run when terminalId changes from undefined to defined
       const currentTerminalId = terminalIdRef.current
 
-      if (debugRef.current) console.log('[TRACE resumeSessionId] effect initial decision', {
+      if (debugRef.current) log.debug('[TRACE resumeSessionId] effect initial decision', {
         paneId: paneIdRef.current,
         currentTerminalId,
         createRequestId,

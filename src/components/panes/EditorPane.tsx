@@ -12,6 +12,10 @@ import { isAbsolutePath, joinPath } from '@/lib/path-utils'
 import { copyText } from '@/lib/clipboard'
 import { registerEditorActions } from '@/lib/pane-action-registry'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
+import { createLogger } from '@/lib/client-logger'
+
+
+const log = createLogger('EditorPane')
 
 const AUTO_SAVE_DELAY = 5000
 
@@ -220,7 +224,7 @@ export default function EditorPane({
       } catch (err) {
         if (cancelled) return
         const message = err instanceof Error ? err.message : String(err)
-        console.error(
+        log.error(
           JSON.stringify({
             severity: 'error',
             event: 'editor_terminal_list_fetch_failed',
@@ -270,7 +274,7 @@ export default function EditorPane({
         } catch (err) {
           if (!mountedRef.current) return
           const message = err instanceof Error ? err.message : String(err)
-          console.error(
+          log.error(
             JSON.stringify({
               severity: 'error',
               event: 'editor_autocomplete_failed',
@@ -372,7 +376,7 @@ export default function EditorPane({
       } catch (err) {
         if (!mountedRef.current) return
         const message = err instanceof Error ? err.message : String(err)
-        console.error(
+        log.error(
           JSON.stringify({
             severity: 'error',
             event: 'editor_file_load_failed',
@@ -444,7 +448,7 @@ export default function EditorPane({
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
-        console.error(
+        log.error(
           JSON.stringify({
             severity: 'error',
             event: 'editor_file_picker_failed',
@@ -465,7 +469,7 @@ export default function EditorPane({
 
     if (!picker) {
       setFilePickerMessage('Native file picker is unavailable. Use the path field instead.')
-      console.warn(
+      log.warn(
         JSON.stringify({
           severity: 'warn',
           event: 'editor_file_picker_unavailable',
@@ -533,7 +537,7 @@ export default function EditorPane({
         return
       }
       const message = err instanceof Error ? err.message : String(err)
-      console.error(
+      log.error(
         JSON.stringify({
           severity: 'error',
           event: 'editor_file_picker_failed',
@@ -575,7 +579,7 @@ export default function EditorPane({
           }
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err)
-          console.error(
+          log.error(
             JSON.stringify({
               severity: 'error',
               event: 'editor_autosave_failed',
@@ -610,7 +614,7 @@ export default function EditorPane({
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      console.error(
+      log.error(
         JSON.stringify({
           severity: 'error',
           event: 'editor_manual_save_failed',
@@ -627,7 +631,7 @@ export default function EditorPane({
       await api.post('/api/files/open', { path: resolved, reveal })
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      console.error(
+      log.error(
         JSON.stringify({
           severity: 'error',
           event: 'editor_open_external_failed',
@@ -700,7 +704,7 @@ export default function EditorPane({
           {filePickerMessage}
         </div>
       )}
-      <div className="flex-1 relative">
+      <div className="flex-1 relative min-h-0 overflow-hidden">
         {isLoading && (
           <div className="absolute inset-0 flex items-center justify-center bg-background/50 z-10">
             <div className="text-sm text-muted-foreground">Loading file...</div>
@@ -725,7 +729,7 @@ export default function EditorPane({
               srcDoc={editorValue}
             />
           ) : (
-            <MarkdownPreview content={editorValue} language="markdown" />
+            <MarkdownPreview content={editorValue} />
           )
         ) : (
           <Editor

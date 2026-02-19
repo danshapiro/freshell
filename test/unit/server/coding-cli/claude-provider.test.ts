@@ -30,9 +30,11 @@ const SESSION_REAPPEAR = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
 
 describe('claudeProvider.resolveProjectPath()', () => {
   it('returns cwd from session metadata (like Codex)', async () => {
-    const meta = { cwd: '/home/user/my-project' }
+    // Use a platform-appropriate absolute path since path.resolve normalizes differently
+    const cwd = process.platform === 'win32' ? 'C:\\Users\\test\\my-project' : '/home/user/my-project'
+    const meta = { cwd }
     const result = await claudeProvider.resolveProjectPath('/some/file.jsonl', meta)
-    expect(result).toBe('/home/user/my-project')
+    expect(result).toBe(cwd)
   })
 
   it('returns "unknown" when cwd is not present', async () => {

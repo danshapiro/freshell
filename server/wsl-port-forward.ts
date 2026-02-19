@@ -1,5 +1,5 @@
 import { execSync } from 'child_process'
-import fs from 'fs'
+import { isWSL2 } from './platform.js'
 
 const IPV4_REGEX = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/
 const NETSH_PATH = '/mnt/c/Windows/System32/netsh.exe'
@@ -235,20 +235,6 @@ export function buildPortForwardingScript(wslIp: string, ports: number[]): strin
   )
 
   return commands.join('; ')
-}
-
-/**
- * Check if running inside WSL2.
- */
-function isWSL2(): boolean {
-  try {
-    const version = fs.readFileSync('/proc/version', 'utf-8').toLowerCase()
-    // WSL2 has "microsoft-standard" or "wsl2" in version string
-    // WSL1 has "Microsoft" but not these patterns
-    return version.includes('wsl2') || version.includes('microsoft-standard')
-  } catch {
-    return false
-  }
 }
 
 export type SetupResult = 'success' | 'skipped' | 'failed' | 'not-wsl2'

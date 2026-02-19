@@ -40,13 +40,20 @@ vi.mock('fs/promises', () => ({
   },
 }))
 
-// Mock child_process.spawn
+// Mock child_process.spawn AND execFile (path-utils uses execFile for wsl.exe calls;
+// without this mock the real wsl.exe is invoked on Windows, triggering error dialogs)
 const mockSpawn = vi.fn()
 vi.mock('child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('child_process')>()
   return {
     ...actual,
     spawn: (...args: unknown[]) => mockSpawn(...args),
+    execFile: vi.fn((...args: unknown[]) => {
+      const cb = args[args.length - 1]
+      if (typeof cb === 'function') {
+        (cb as (err: Error) => void)(Object.assign(new Error('mocked: no wsl'), { code: 'ENOENT' }))
+      }
+    }),
   }
 })
 

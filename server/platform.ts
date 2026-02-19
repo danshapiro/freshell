@@ -1,6 +1,35 @@
 import cp from 'child_process'
+import { readFileSync } from 'fs'
 import fsPromises from 'fs/promises'
 import os from 'os'
+
+/**
+ * Check if running inside WSL2 (Windows Subsystem for Linux 2).
+ * Uses synchronous /proc/version check for WSL2-specific markers.
+ * WSL2 has "microsoft-standard" or "wsl2" in the version string.
+ * WSL1 has "Microsoft" but not these patterns.
+ */
+export function isWSL2(): boolean {
+  try {
+    const version = readFileSync('/proc/version', 'utf-8').toLowerCase()
+    return version.includes('wsl2') || version.includes('microsoft-standard')
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Check if running inside any version of WSL (WSL1 or WSL2).
+ * Uses synchronous /proc/version check for broad "microsoft" marker.
+ */
+export function isWSL(): boolean {
+  try {
+    const version = readFileSync('/proc/version', 'utf-8').toLowerCase()
+    return version.includes('microsoft')
+  } catch {
+    return false
+  }
+}
 
 /**
  * Detect the platform, including WSL detection.

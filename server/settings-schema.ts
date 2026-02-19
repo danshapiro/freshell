@@ -110,3 +110,5 @@ export const SettingsPatchSchema = z
       .optional(),
   })
   .strict()
+
+export type SettingsPatch = z.infer<typeof SettingsPatchSchema>

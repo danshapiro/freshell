@@ -1,5 +1,6 @@
 import { nanoid } from 'nanoid'
 import type WebSocket from 'ws'
+import type { LiveWebSocket } from './ws-handler.js'
 import * as pty from 'node-pty'
 import os from 'os'
 import path from 'path'
@@ -953,7 +954,7 @@ export class TerminalRegistry extends EventEmitter {
             // If a terminal spews output while we're sending a snapshot, queueing unboundedly can OOM the server.
             // Prefer explicit resync: drop the client and let it reconnect/reattach for a fresh snapshot.
             try {
-              ;(client as any).close?.(4008, 'Attach snapshot queue overflow')
+              client.close(4008, 'Attach snapshot queue overflow')
             } catch {
               // ignore
             }
@@ -1135,7 +1136,7 @@ export class TerminalRegistry extends EventEmitter {
   }
 
   private isMobileClient(client: WebSocket): boolean {
-    return (client as any).isMobileClient === true
+    return (client as LiveWebSocket).isMobileClient === true
   }
 
   private hasClientBacklog(client: WebSocket): boolean {
@@ -1226,7 +1227,6 @@ export class TerminalRegistry extends EventEmitter {
 
   safeSend(client: WebSocket, msg: unknown, context?: { terminalId?: string; perf?: TerminalRecord['perf'] }) {
     // Backpressure guard.
-    // @ts-ignore
     const buffered = client.bufferedAmount as number | undefined
     if (typeof buffered === 'number' && buffered > MAX_WS_BUFFERED_AMOUNT) {
       if (context?.perf) context.perf.droppedMessages += 1
@@ -1246,7 +1246,7 @@ export class TerminalRegistry extends EventEmitter {
       }
       // Prefer explicit resync over silent corruption.
       try {
-        ;(client as any).close?.(4008, 'Backpressure')
+        client.close(4008, 'Backpressure')
       } catch {
         // ignore
       }

@@ -1,6 +1,7 @@
 export type TerminalStatus = 'creating' | 'running' | 'exited' | 'error'
 
-export type CodingCliProviderName = 'claude' | 'codex' | 'opencode' | 'gemini' | 'kimi'
+import type { CodingCliProviderName } from '@shared/ws-protocol'
+export type { CodingCliProviderName }
 
 // TabMode includes 'shell' for regular terminals, plus all coding CLI providers
 // This allows future providers (opencode, gemini, kimi) to work as tab modes

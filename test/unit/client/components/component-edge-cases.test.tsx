@@ -792,7 +792,7 @@ describe('Component Edge Cases', () => {
         })
 
         // Should log warning but not crash
-        expect(consoleSpy).toHaveBeenCalledWith('Failed to save settings', expect.any(Error))
+        expect(consoleSpy).toHaveBeenCalledWith('[SettingsView]', 'Failed to save settings', expect.any(Error))
 
         consoleSpy.mockRestore()
       })

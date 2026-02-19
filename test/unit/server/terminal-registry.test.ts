@@ -602,6 +602,11 @@ describe('buildSpawnSpec Unix paths', () => {
       writable: true,
       configurable: true,
     })
+    // Clear WSL env vars to avoid isWsl() returning true on native Windows
+    // when WSLENV is set by Windows Terminal
+    delete process.env.WSL_DISTRO_NAME
+    delete process.env.WSL_INTEROP
+    delete process.env.WSLENV
   }
 
   beforeEach(() => {
@@ -2080,6 +2085,11 @@ describe('buildSpawnSpec Unix paths', () => {
       writable: true,
       configurable: true,
     })
+    // Clear WSL env vars to avoid isWsl() returning true on native Windows
+    // when WSLENV is set by Windows Terminal
+    delete process.env.WSL_DISTRO_NAME
+    delete process.env.WSL_INTEROP
+    delete process.env.WSLENV
   }
 
   beforeEach(() => {

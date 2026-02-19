@@ -68,7 +68,7 @@ const log = logger.child({ component: 'ws' })
 const perfConfig = getPerfConfig()
 
 // Extended WebSocket with liveness tracking for keepalive
-interface LiveWebSocket extends WebSocket {
+export interface LiveWebSocket extends WebSocket {
   isAlive?: boolean
   connectionId?: string
   connectedAt?: number
@@ -575,7 +575,6 @@ export class WsHandler {
     let messageType: string | undefined
     try {
       // Backpressure guard.
-      // @ts-ignore
       const buffered = ws.bufferedAmount as number | undefined
       if (this.closeForBackpressureIfNeeded(ws, buffered)) return
       let serialized = ''
@@ -660,7 +659,6 @@ export class WsHandler {
   private queueAttachFrame(ws: LiveWebSocket, msg: unknown): Promise<boolean> {
     if (ws.readyState !== WebSocket.OPEN) return Promise.resolve(false)
 
-    // @ts-ignore
     const buffered = ws.bufferedAmount as number | undefined
     if (this.closeForBackpressureIfNeeded(ws, buffered)) return Promise.resolve(false)
 

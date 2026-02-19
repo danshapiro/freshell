@@ -12,7 +12,7 @@ import { logger, setLogLevel } from './logger.js'
 import { requestLogger } from './request-logger.js'
 import { validateStartupSecurity, httpAuthMiddleware, timingSafeCompare } from './auth.js'
 import { configStore } from './config-store.js'
-import { TerminalRegistry } from './terminal-registry.js'
+import { TerminalRegistry, type TerminalRecord } from './terminal-registry.js'
 import { WsHandler } from './ws-handler.js'
 import { SessionsSyncService } from './sessions-sync/service.js'
 import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
@@ -41,7 +41,7 @@ import { createTabsRegistryStore } from './tabs-registry/store.js'
 import { checkForUpdate } from './updater/version-checker.js'
 import { SessionAssociationCoordinator } from './session-association-coordinator.js'
 import { loadOrCreateServerInstanceId } from './instance-id.js'
-import { SettingsPatchSchema } from './settings-schema.js'
+import { SettingsPatchSchema, type SettingsPatch } from './settings-schema.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -233,17 +233,17 @@ async function main() {
 
   await Promise.all(
     registry.list().map(async (terminal) => {
-      await terminalMetadata.seedFromTerminal(terminal as any)
+      await terminalMetadata.seedFromTerminal(terminal)
     }),
   )
 
-  registry.on('terminal.created', (record) => {
-    void terminalMetadata.seedFromTerminal(record as any)
+  registry.on('terminal.created', (record: TerminalRecord) => {
+    void terminalMetadata.seedFromTerminal(record)
       .then((upsert) => {
         if (upsert) broadcastTerminalMetaUpserts([upsert])
       })
       .catch((err) => {
-        log.warn({ err, terminalId: (record as any)?.terminalId }, 'Failed to seed terminal metadata')
+        log.warn({ err, terminalId: record?.terminalId }, 'Failed to seed terminal metadata')
       })
   })
 
@@ -468,7 +468,7 @@ async function main() {
     res.json({ directories })
   })
 
-  const normalizeSettingsPatch = (patch: Record<string, any>) => {
+  const normalizeSettingsPatch = (patch: SettingsPatch) => {
     if (Object.prototype.hasOwnProperty.call(patch, 'defaultCwd')) {
       const raw = patch.defaultCwd
       if (raw === null) {
@@ -485,28 +485,7 @@ async function main() {
     if (!parsed.success) {
       return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
     }
-    const patch = normalizeSettingsPatch(migrateSettingsSortMode(parsed.data) as any)
-    const updated = await configStore.patchSettings(patch)
-    const migrated = migrateSettingsSortMode(updated)
-    registry.setSettings(migrated)
-    applyDebugLogging(!!migrated.logging?.debug, 'settings')
-    wsHandler.broadcast({ type: 'settings.updated', settings: migrated })
-	    await withPerfSpan(
-	      'coding_cli_refresh',
-	      () => codingCliIndexer.refresh(),
-	      {},
-	      { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
-	    )
-    res.json(migrated)
-  })
-
-  // Alias (matches implementation plan)
-  app.put('/api/settings', async (req, res) => {
-    const parsed = SettingsPatchSchema.safeParse(req.body || {})
-    if (!parsed.success) {
-      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
-    }
-    const patch = normalizeSettingsPatch(migrateSettingsSortMode(parsed.data) as any)
+    const patch = normalizeSettingsPatch(migrateSettingsSortMode(parsed.data))
     const updated = await configStore.patchSettings(patch)
     const migrated = migrateSettingsSortMode(updated)
     registry.setSettings(migrated)

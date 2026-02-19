@@ -20,8 +20,11 @@ import tabRegistryReducer from './tabRegistrySlice'
 import { perfMiddleware } from './perfMiddleware'
 import { persistMiddleware } from './persistMiddleware'
 import { sessionActivityPersistMiddleware } from './sessionActivityPersistence'
+import { createLogger } from '@/lib/client-logger'
 
 enableMapSet()
+
+const log = createLogger('Store')
 
 export const store = configureStore({
   reducer: {
@@ -55,25 +58,23 @@ export const store = configureStore({
 // The hydration code below is kept for backward compatibility and logging,
 // but the slices already have the persisted data by this point.
 
-if (import.meta.env.MODE === 'development') {
-  const deferLog = typeof queueMicrotask === 'function'
-    ? queueMicrotask
-    : (fn: () => void) => setTimeout(fn, 0)
+const deferLog = typeof queueMicrotask === 'function'
+  ? queueMicrotask
+  : (fn: () => void) => setTimeout(fn, 0)
 
-  deferLog(() => {
-    console.log('[Store] Initial state loaded from localStorage:')
-    console.log('[Store] Tab IDs:', store.getState().tabs.tabs.map(t => t.id))
-    console.log('[Store] Pane layout keys:', Object.keys(store.getState().panes.layouts))
+deferLog(() => {
+  log.debug('Initial state loaded from localStorage:')
+  log.debug('Tab IDs:', store.getState().tabs.tabs.map(t => t.id))
+  log.debug('Pane layout keys:', Object.keys(store.getState().panes.layouts))
 
-    // Verify tabs and panes match
-    const tabIds = new Set(store.getState().tabs.tabs.map(t => t.id))
-    const paneTabIds = Object.keys(store.getState().panes.layouts)
-    const orphanedPanes = paneTabIds.filter(id => !tabIds.has(id))
-    if (orphanedPanes.length > 0) {
-      console.warn('[Store] Found pane layouts for non-existent tabs:', orphanedPanes)
-    }
-  })
-}
+  // Verify tabs and panes match
+  const tabIds = new Set(store.getState().tabs.tabs.map(t => t.id))
+  const paneTabIds = Object.keys(store.getState().panes.layouts)
+  const orphanedPanes = paneTabIds.filter(id => !tabIds.has(id))
+  if (orphanedPanes.length > 0) {
+    log.warn('Found pane layouts for non-existent tabs:', orphanedPanes)
+  }
+})
 
 export type RootState = ReturnType<typeof store.getState>
 export type AppDispatch = typeof store.dispatch

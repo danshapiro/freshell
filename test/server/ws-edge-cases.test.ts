@@ -238,7 +238,6 @@ class FakeRegistry {
 
   // Simulate backpressure by checking buffered amount
   safeSend(client: WebSocket, msg: unknown) {
-    // @ts-ignore - bufferedAmount may not be typed
     const buffered = client.bufferedAmount as number | undefined
     if (typeof buffered === 'number' && buffered > 2 * 1024 * 1024) {
       return // Drop message under backpressure
