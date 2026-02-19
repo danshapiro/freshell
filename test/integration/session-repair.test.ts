@@ -79,16 +79,23 @@ describe('SessionRepairService Integration', () => {
         sessionFile
       )
 
+      const scanned: SessionScanResult[] = []
       const repaired: SessionRepairResult[] = []
+      service.on('scanned', (r) => scanned.push(r))
       service.on('repaired', (r) => repaired.push(r))
 
       const queue = (service as any).queue
       queue.enqueue([{ sessionId, filePath: sessionFile, priority: 'active' }])
       queue.start()
 
-      await new Promise((r) => setTimeout(r, 200))
+      // Poll for scan completion rather than fixed timeout
+      const deadline = Date.now() + 5000
+      while (scanned.length === 0 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50))
+      }
 
-      // Should not have repaired anything
+      // Session was scanned but should not have been repaired
+      expect(scanned.length).toBeGreaterThan(0)
       expect(repaired.length).toBe(0)
     })
   })
