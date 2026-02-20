@@ -134,6 +134,23 @@ describe('WsHandler.waitForDrain', () => {
     // After resolving, no close listener should remain from waitForDrain
     expect(ws.listenerCount('close')).toBe(0)
   })
+
+  it('resolves false immediately when shouldCancel returns true', async () => {
+    const ws = createMockWs({ bufferedAmount: 1_000_000 })
+    const result = await (handler as any).waitForDrain(ws, 512 * 1024, 5000, () => true)
+    expect(result).toBe(false)
+  })
+
+  it('resolves false when shouldCancel becomes true during polling', async () => {
+    const ws = createMockWs({ bufferedAmount: 1_000_000 })
+    let cancelled = false
+
+    // Cancel after 100ms (before the 5s timeout)
+    setTimeout(() => { cancelled = true }, 100)
+
+    const result = await (handler as any).waitForDrain(ws, 512 * 1024, 5000, () => cancelled)
+    expect(result).toBe(false)
+  })
 })
 
 describe('WsHandler.sendChunkedSessions drain-aware sending', () => {
@@ -264,6 +281,48 @@ describe('WsHandler.sendChunkedSessions drain-aware sending', () => {
 
     expect(result).toBe(false)
     expect(ws.send).toHaveBeenCalledTimes(1)
+  })
+
+  it('returns false when connection closes on final chunk send (backpressure kill)', async () => {
+    // Single-chunk scenario: safeSend triggers backpressure close on the only chunk
+    const projects = [{ projectPath: '/tmp/p', sessions: [{ provider: 'claude' as const, sessionId: 's1', projectPath: '/tmp/p', updatedAt: Date.now() }] }]
+
+    const ws = createMockWs()
+    ws.send = vi.fn().mockImplementation(() => {
+      // Simulate backpressure close triggered by send()
+      ws.readyState = WebSocket.CLOSING
+    })
+
+    const result = await (handler as any).sendChunkedSessions(ws, projects)
+
+    // Should return false because connection died during final send
+    expect(result).toBe(false)
+  })
+
+  it('returns false when generation is superseded during drain wait', async () => {
+    const projects = createLargeProjects(100)
+    const chunks = chunkProjects(projects, 500 * 1024)
+    expect(chunks.length).toBeGreaterThanOrEqual(2)
+
+    const ws = createMockWs()
+    ws.send = vi.fn().mockImplementation(() => {
+      ws.bufferedAmount = 1_000_000
+    })
+
+    // Let waitForDrain use the real implementation (with shouldCancel)
+    // but simulate a generation change during the wait
+    const origWaitForDrain = (handler as any).waitForDrain.bind(handler)
+    vi.spyOn(handler as any, 'waitForDrain').mockImplementation(
+      async (wsArg: any, threshold: number, timeout: number, shouldCancel?: () => boolean) => {
+        // Simulate a new sendChunkedSessions call superseding this one
+        wsArg.sessionUpdateGeneration = (wsArg.sessionUpdateGeneration || 0) + 1
+        // The shouldCancel predicate should detect the generation change
+        return origWaitForDrain(wsArg, threshold, timeout, shouldCancel)
+      }
+    )
+
+    const result = await (handler as any).sendChunkedSessions(ws, projects)
+    expect(result).toBe(false)
   })
 })
 

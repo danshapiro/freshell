@@ -664,12 +664,19 @@ export class WsHandler {
 
   /**
    * Wait for ws.bufferedAmount to drop below threshold.
-   * Returns true if drained, false if timed out or connection closed.
+   * Returns true if drained, false if timed out, connection closed, or cancelled.
    * Uses polling because the ws library does not emit 'drain' on WebSocket instances.
+   * Optional shouldCancel predicate enables early exit (e.g. when a newer generation supersedes).
    */
-  private waitForDrain(ws: LiveWebSocket, thresholdBytes: number, timeoutMs: number): Promise<boolean> {
+  private waitForDrain(
+    ws: LiveWebSocket,
+    thresholdBytes: number,
+    timeoutMs: number,
+    shouldCancel?: () => boolean,
+  ): Promise<boolean> {
     if (ws.readyState !== WebSocket.OPEN) return Promise.resolve(false)
     if ((ws.bufferedAmount ?? 0) <= thresholdBytes) return Promise.resolve(true)
+    if (shouldCancel?.()) return Promise.resolve(false)
 
     return new Promise<boolean>((resolve) => {
       let settled = false
@@ -684,6 +691,7 @@ export class WsHandler {
       const onClose = () => settle(false)
       const timer = setTimeout(() => settle(false), timeoutMs)
       const poller = setInterval(() => {
+        if (shouldCancel?.()) { settle(false); return }
         if (ws.readyState !== WebSocket.OPEN) { settle(false); return }
         if ((ws.bufferedAmount ?? 0) <= thresholdBytes) settle(true)
       }, DRAIN_POLL_INTERVAL_MS)
@@ -934,12 +942,13 @@ export class WsHandler {
   private async sendChunkedSessions(ws: LiveWebSocket, projects: ProjectGroup[]): Promise<boolean> {
     // Increment generation to cancel any in-flight sends for this connection
     const generation = (ws.sessionUpdateGeneration = (ws.sessionUpdateGeneration || 0) + 1)
+    const isSuperseded = () => ws.sessionUpdateGeneration !== generation
     const chunks = chunkProjects(projects, MAX_CHUNK_BYTES)
 
     for (let i = 0; i < chunks.length; i++) {
       // Bail out if connection closed or a newer update has started
       if (ws.readyState !== WebSocket.OPEN) return false
-      if (ws.sessionUpdateGeneration !== generation) return false
+      if (isSuperseded()) return false
 
       const isFirst = i === 0
       let msg: { type: 'sessions.updated'; projects: ProjectGroup[]; clear?: true; append?: true }
@@ -961,13 +970,14 @@ export class WsHandler {
       if (i < chunks.length - 1) {
         const buffered = ws.bufferedAmount as number | undefined
         if (typeof buffered === 'number' && buffered > DRAIN_THRESHOLD_BYTES) {
-          if (!await this.waitForDrain(ws, DRAIN_THRESHOLD_BYTES, DRAIN_TIMEOUT_MS)) return false
+          if (!await this.waitForDrain(ws, DRAIN_THRESHOLD_BYTES, DRAIN_TIMEOUT_MS, isSuperseded)) return false
         } else {
           await new Promise<void>((resolve) => setImmediate(resolve))
         }
       }
     }
-    return true
+    // Verify connection survived the final send (safeSend can trigger backpressure close)
+    return ws.readyState === WebSocket.OPEN && !isSuperseded()
   }
   private async onMessage(ws: LiveWebSocket, state: ClientState, data: WebSocket.RawData) {
     const endMessageTimer = startPerfTimer(
