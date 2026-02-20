@@ -1764,7 +1764,13 @@ export class WsHandler {
       const state = this.clientStates.get(ws)
       if (!state?.authenticated) continue
       if (state.supportsSessionsPatchV1 && state.sessionsSnapshotSent) continue
-      void this.sendChunkedSessions(ws, projects)
+      // Update sessionsSnapshotSent on success so patch-capable clients
+      // can transition to patch mode after a successful full snapshot.
+      void this.sendChunkedSessions(ws, projects).then((allSent) => {
+        if (allSent && state.supportsSessionsPatchV1) {
+          state.sessionsSnapshotSent = true
+        }
+      })
     }
   }
 

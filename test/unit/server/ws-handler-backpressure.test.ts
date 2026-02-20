@@ -326,8 +326,57 @@ describe('WsHandler.sendChunkedSessions drain-aware sending', () => {
   })
 })
 
-describe('WsHandler integration: handshake completes under backpressure', () => {
-  it('sends all chunked sessions without backpressure close on a real WS connection', async () => {
+describe('WsHandler.broadcastSessionsUpdatedToLegacy patch-mode transition', () => {
+  let server: http.Server
+  let handler: WsHandler
+  let registry: TerminalRegistry
+
+  beforeEach(async () => {
+    server = http.createServer()
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+    registry = new TerminalRegistry()
+    handler = new WsHandler(server, registry)
+  })
+
+  afterEach(async () => {
+    handler.close()
+    registry.shutdown()
+    if (server.listening) {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('sets sessionsSnapshotSent after successful broadcast for patch-capable clients', async () => {
+    const ws = createMockWs()
+    ws.send = vi.fn()
+
+    // Register the connection and create client state (simulating a post-handshake client)
+    const connections = (handler as any).connections as Set<any>
+    const clientStates = (handler as any).clientStates as Map<any, any>
+    connections.add(ws)
+    clientStates.set(ws, {
+      authenticated: true,
+      supportsSessionsPatchV1: true,
+      sessionsSnapshotSent: false, // handshake failed, flag not set
+      attachedTerminalIds: new Set(),
+      createdByRequestId: new Map(),
+      terminalCreateTimestamps: [],
+      codingCliSubscriptions: new Map(),
+    })
+
+    const projects = [{ projectPath: '/tmp/p', sessions: [] }]
+    handler.broadcastSessionsUpdatedToLegacy(projects)
+
+    // Wait for the async .then() to execute
+    await new Promise<void>((resolve) => setImmediate(resolve))
+
+    const state = clientStates.get(ws)
+    expect(state.sessionsSnapshotSent).toBe(true)
+  })
+})
+
+describe('WsHandler integration: chunked handshake snapshot delivery', () => {
+  it('delivers all session chunks over a real WS connection', async () => {
     // Use small chunk size to force multiple chunks
     process.env.MAX_WS_CHUNK_BYTES = '500'
     process.env.AUTH_TOKEN = 'testtoken-testtoken'
