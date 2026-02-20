@@ -55,11 +55,15 @@ npm run build               # Full build (client + server)
 npm run build:client        # Vite build → dist/client
 npm run build:server        # TypeScript compile → dist/server
 npm run serve               # Build and run production server
+# Note: `npm run build` is guarded — it will refuse to overwrite dist/
+# if a production server is detected on the configured PORT. Use
+# `npm run check` for safe verification, or build from a worktree.
 ```
 
 ### Testing
 ```bash
 npm test                    # Run all tests (client + server)
+npm run check               # Typecheck + test without building (safe while prod runs)
 npm run verify              # Build + test (catches type errors that vitest misses)
 npm run test:coverage       # Generate coverage report
 ```
