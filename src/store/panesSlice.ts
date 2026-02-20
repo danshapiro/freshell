@@ -853,6 +853,10 @@ export const panesSlice = createSlice({
         if (paneId) {
           if (!state.paneTitles[tabId]) state.paneTitles[tabId] = {}
           state.paneTitles[tabId][paneId] = title
+          // Mark as user-set so programmatic updates don't overwrite it
+          if (!state.paneTitleSetByUser) state.paneTitleSetByUser = {}
+          if (!state.paneTitleSetByUser[tabId]) state.paneTitleSetByUser[tabId] = {}
+          state.paneTitleSetByUser[tabId][paneId] = true
         }
       }
     },
