@@ -26,16 +26,12 @@ let webglAddonModulePromise: Promise<typeof import('@xterm/addon-webgl')> | null
 
 function loadWebglAddonModule() {
   if (!webglAddonModulePromise) {
-    webglAddonModulePromise = import('@xterm/addon-webgl')
+    webglAddonModulePromise = import('@xterm/addon-webgl').catch((error) => {
+      webglAddonModulePromise = null
+      throw error
+    })
   }
   return webglAddonModulePromise
-}
-
-function supportsWebglRuntime() {
-  if (typeof navigator !== 'undefined' && /jsdom/i.test(navigator.userAgent)) {
-    return false
-  }
-  return true
 }
 
 export function createTerminalRuntime({
@@ -76,7 +72,7 @@ export function createTerminalRuntime({
     searchAddon = new SearchAddon()
     terminal.loadAddon(searchAddon)
 
-    if (!enableWebgl || !supportsWebglRuntime()) return
+    if (!enableWebgl) return
     void loadWebglAddonModule()
       .then(({ WebglAddon }) => {
         if (disposed || webglAddon) return

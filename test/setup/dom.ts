@@ -5,6 +5,19 @@ import { resetWsClientForTests } from '@/lib/ws-client'
 
 enableMapSet()
 
+if (typeof globalThis.HTMLCanvasElement !== 'undefined') {
+  if (typeof globalThis.HTMLCanvasElement.prototype.getContext === 'function') {
+    Object.defineProperty(globalThis.HTMLCanvasElement.prototype, 'getContext', {
+      configurable: true,
+      value() {
+        // jsdom emits a console.error for every getContext call; return null so
+        // callers follow their normal "context unavailable" fallback paths.
+        return null
+      },
+    })
+  }
+}
+
 // Provide a minimal ResizeObserver stub for jsdom environments
 if (typeof globalThis.ResizeObserver === 'undefined') {
   globalThis.ResizeObserver = class ResizeObserver {

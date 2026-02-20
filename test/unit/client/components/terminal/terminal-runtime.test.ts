@@ -9,7 +9,6 @@ const findPreviousSpy = vi.fn()
 const webglDisposeSpy = vi.fn()
 
 let contextLossHandler: (() => void) | null = null
-let throwWebglLoad = false
 
 vi.mock('@xterm/addon-fit', () => ({
   FitAddon: class {
@@ -38,7 +37,6 @@ vi.mock('@xterm/addon-webgl', () => ({
 describe('terminal runtime', () => {
   beforeEach(() => {
     contextLossHandler = null
-    throwWebglLoad = false
     fitSpy.mockClear()
     findNextSpy.mockClear()
     findPreviousSpy.mockClear()
@@ -47,11 +45,7 @@ describe('terminal runtime', () => {
 
   it('loads fit and search addons', () => {
     const terminal = {
-      loadAddon: vi.fn((addon: unknown) => {
-        if (throwWebglLoad && typeof addon === 'object' && addon && 'onContextLoss' in addon) {
-          throw new Error('webgl failure')
-        }
-      }),
+      loadAddon: vi.fn(),
     }
 
     const runtime = createTerminalRuntime({ terminal: terminal as any, enableWebgl: false })
@@ -74,8 +68,7 @@ describe('terminal runtime', () => {
     })
   })
 
-  it('attempts webgl and continues when addon load throws', () => {
-    throwWebglLoad = true
+  it('attempts webgl and continues when addon load throws', async () => {
     const terminal = {
       loadAddon: vi.fn((addon: unknown) => {
         if (typeof addon === 'object' && addon && 'onContextLoss' in addon) {
@@ -86,8 +79,10 @@ describe('terminal runtime', () => {
 
     const runtime = createTerminalRuntime({ terminal: terminal as any, enableWebgl: true })
     expect(() => runtime.attachAddons()).not.toThrow()
+    await vi.waitFor(() => {
+      expect(terminal.loadAddon).toHaveBeenCalledTimes(3)
+    })
     expect(runtime.webglActive()).toBe(false)
-    throwWebglLoad = false
   })
 
   it('marks runtime as non-webgl on context loss and stays usable', async () => {
