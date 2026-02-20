@@ -75,8 +75,10 @@ function loadEnv(): Record<string, string> {
 }
 
 const env = loadEnv()
-const VITE_PORT = parseInt(env.VITE_PORT || '5173', 10)
-const SERVER_PORT = parseInt(env.PORT || '3001', 10)
+// process.env takes precedence over .env file so CLI overrides work:
+//   PORT=3002 VITE_PORT=5174 npm run dev
+const VITE_PORT = parseInt(process.env.VITE_PORT || env.VITE_PORT || '5173', 10)
+const SERVER_PORT = parseInt(process.env.PORT || env.PORT || '3001', 10)
 
 interface PortCheckResult {
   status: 'freshell' | 'other' | 'free'
