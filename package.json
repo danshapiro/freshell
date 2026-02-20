@@ -19,6 +19,7 @@
     "serve": "npm run build && npm run start",
     "test": "vitest run",
     "verify": "npm run build && npm test",
+    "check": "npm run typecheck && npm test",
     "test:watch": "vitest",
     "test:ui": "vitest --ui",
     "test:server": "vitest --config vitest.server.config.ts",
