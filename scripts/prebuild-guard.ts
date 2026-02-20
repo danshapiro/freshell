@@ -7,6 +7,32 @@
  * If so, blocks the build and suggests safe alternatives.
  */
 
+import { readFileSync } from 'fs'
+import { resolve, dirname } from 'path'
+import { fileURLToPath } from 'url'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+
+// Load .env file manually (dotenv not available at this stage)
+function loadEnv(): Record<string, string> {
+  try {
+    const envPath = resolve(__dirname, '..', '.env')
+    const content = readFileSync(envPath, 'utf-8')
+    const env: Record<string, string> = {}
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim()
+      if (!trimmed || trimmed.startsWith('#')) continue
+      const match = trimmed.match(/^([^=]+)=(.*)$/)
+      if (match) {
+        env[match[1]] = match[2]
+      }
+    }
+    return env
+  } catch {
+    return {}
+  }
+}
+
 export interface ProdCheckResult {
   status: 'running' | 'not-running'
   version?: string
@@ -38,7 +64,26 @@ export async function checkProdRunning(port: number): Promise<ProdCheckResult> {
 }
 
 export async function main(): Promise<void> {
-  throw new Error('Not implemented')
+  const env = loadEnv()
+  const port = parseInt(process.env.PORT || env.PORT || '3001', 10)
+
+  const result = await checkProdRunning(port)
+
+  if (result.status !== 'running') {
+    // No production server detected — build is safe
+    process.exit(0)
+  }
+
+  const version = result.version ? ` (v${result.version})` : ''
+  console.error(`\n\x1b[31m✖ Freshell production server${version} is running on port ${port}.\x1b[0m`)
+  console.error(`  Building would overwrite dist/ and break the live server.\n`)
+  console.error(`\x1b[33mSafe alternatives:\x1b[0m`)
+  console.error(`  1. \x1b[36mnpm run check\x1b[0m        Typecheck + tests without building (safe while prod is live)`)
+  console.error(`  2. Kill production, then build:`)
+  console.error(`     \x1b[36mkill {PID} && npm run build\x1b[0m`)
+  console.error(`  3. Build in a worktree:`)
+  console.error(`     \x1b[36mcd .worktrees/{branch} && npm run build\x1b[0m\n`)
+  process.exit(1)
 }
 
 // Only run when executed directly (not imported by tests)
