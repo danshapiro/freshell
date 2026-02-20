@@ -194,14 +194,15 @@ describe('WsHandler.sendChunkedSessions drain-aware sending', () => {
     // Make waitForDrain resolve true (buffer drained)
     waitForDrainSpy.mockResolvedValue(true)
 
-    await (handler as any).sendChunkedSessions(ws, projects)
+    const result = await (handler as any).sendChunkedSessions(ws, projects)
 
     expect(waitForDrainSpy).toHaveBeenCalled()
     // All chunks should still be sent since drain resolves true
     expect(ws.send).toHaveBeenCalledTimes(chunks.length)
+    expect(result).toBe(true)
   })
 
-  it('stops sending chunks when waitForDrain returns false (timeout)', async () => {
+  it('stops sending and returns false when waitForDrain times out', async () => {
     const projects = createLargeProjects(100)
     const chunks = chunkProjects(projects, 500 * 1024)
     expect(chunks.length).toBeGreaterThanOrEqual(2)
@@ -216,13 +217,15 @@ describe('WsHandler.sendChunkedSessions drain-aware sending', () => {
     const waitForDrainSpy = vi.spyOn(handler as any, 'waitForDrain')
     waitForDrainSpy.mockResolvedValue(false)
 
-    await (handler as any).sendChunkedSessions(ws, projects)
+    const result = await (handler as any).sendChunkedSessions(ws, projects)
 
     // Should have sent only the first chunk, then stopped
     expect(ws.send).toHaveBeenCalledTimes(1)
+    // Must return false so caller knows snapshot is incomplete
+    expect(result).toBe(false)
   })
 
-  it('uses setImmediate yield when bufferedAmount is low (fast client path)', async () => {
+  it('uses setImmediate yield and returns true when bufferedAmount is low (fast client path)', async () => {
     const projects = createLargeProjects(100)
     const chunks = chunkProjects(projects, 500 * 1024)
     expect(chunks.length).toBeGreaterThanOrEqual(2)
@@ -233,12 +236,34 @@ describe('WsHandler.sendChunkedSessions drain-aware sending', () => {
 
     const waitForDrainSpy = vi.spyOn(handler as any, 'waitForDrain')
 
-    await (handler as any).sendChunkedSessions(ws, projects)
+    const result = await (handler as any).sendChunkedSessions(ws, projects)
 
     // waitForDrain should NOT have been called since buffer is always low
     expect(waitForDrainSpy).not.toHaveBeenCalled()
     // All chunks should be sent
     expect(ws.send).toHaveBeenCalledTimes(chunks.length)
+    expect(result).toBe(true)
+  })
+
+  it('returns false when connection closes mid-send', async () => {
+    const projects = createLargeProjects(100)
+    const chunks = chunkProjects(projects, 500 * 1024)
+    expect(chunks.length).toBeGreaterThanOrEqual(2)
+
+    const ws = createMockWs()
+    let sendCount = 0
+    ws.send = vi.fn().mockImplementation(() => {
+      sendCount++
+      if (sendCount >= 1) {
+        // Simulate connection closing after first send
+        ws.readyState = WebSocket.CLOSED
+      }
+    })
+
+    const result = await (handler as any).sendChunkedSessions(ws, projects)
+
+    expect(result).toBe(false)
+    expect(ws.send).toHaveBeenCalledTimes(1)
   })
 })
 
