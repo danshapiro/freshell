@@ -24,6 +24,7 @@ import { TerminalMetadataService } from './terminal-metadata-service.js'
 import { AI_CONFIG, PROMPTS, stripAnsi } from './ai-prompts.js'
 import { migrateSettingsSortMode } from './settings-migrate.js'
 import { filesRouter } from './files-router.js'
+import { createPlatformRouter } from './platform-router.js'
 import { getSessionRepairService } from './session-scanner/service.js'
 import { SdkBridge } from './sdk-bridge.js'
 import { createClientLogsRouter } from './client-logs.js'
@@ -442,24 +443,13 @@ async function main() {
     }
   })
 
-  app.get('/api/platform', async (_req, res) => {
-    const [platform, availableClis, hostName] = await Promise.all([
-      detectPlatform(),
-      detectAvailableClis(),
-      detectHostName(),
-    ])
-    res.json({ platform, availableClis, hostName })
-  })
-
-  app.get('/api/version', async (_req, res) => {
-    try {
-      const updateCheck = await checkForUpdate(APP_VERSION)
-      res.json({ currentVersion: APP_VERSION, updateCheck })
-    } catch (err) {
-      log.warn({ err }, 'Version check failed')
-      res.json({ currentVersion: APP_VERSION, updateCheck: null })
-    }
-  })
+  app.use('/api', createPlatformRouter({
+    detectPlatform,
+    detectAvailableClis,
+    detectHostName,
+    checkForUpdate,
+    appVersion: APP_VERSION,
+  }))
 
   app.get('/api/files/candidate-dirs', async (_req, res) => {
     const cfg = await configStore.snapshot()
