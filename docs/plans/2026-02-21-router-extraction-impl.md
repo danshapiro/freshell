@@ -184,9 +184,37 @@ export function createPlatformRouter(deps: PlatformRouterDeps): Router {
 Run: `npm test`
 Expected: All tests pass
 
-**Step 5: Commit**
+**Step 5: Add version endpoint test**
+
+The existing `platform-api.test.ts` tests `/api/platform` but not `/api/version`. Add a test for the version endpoint and its error fallback:
+
+```typescript
+describe('GET /api/version', () => {
+  it('returns current version and update check', async () => {
+    const res = await request(app)
+      .get('/api/version')
+      .set('x-auth-token', AUTH_TOKEN)
+    expect(res.status).toBe(200)
+    expect(res.body.currentVersion).toBe('1.0.0-test')
+    expect(res.body.updateCheck).toBeDefined()
+  })
+
+  it('returns null updateCheck when check fails', async () => {
+    deps.checkForUpdate.mockRejectedValueOnce(new Error('network error'))
+    const res = await request(app)
+      .get('/api/version')
+      .set('x-auth-token', AUTH_TOKEN)
+    expect(res.status).toBe(200)
+    expect(res.body.currentVersion).toBe('1.0.0-test')
+    expect(res.body.updateCheck).toBeNull()
+  })
+})
+```
+
+**Step 6: Run tests, commit**
 
 ```bash
+npm test
 git add server/platform-router.ts server/index.ts test/integration/server/platform-api.test.ts
 git commit -m "refactor: extract platform routes to platform-router.ts"
 ```
@@ -262,10 +290,12 @@ In `test/integration/server/port-forward-api.test.ts`, replace inline route defi
 ```typescript
 import { createProxyRouter } from '../../../server/proxy-router.js'
 // ...
-app.use('/api/proxy', createProxyRouter({ portForwardManager: mockPortForwardManager }))
+// NOTE: This test uses a REAL PortForwardManager (not a mock) with an echo server
+// for true integration testing. Pass the real manager through the factory.
+app.use('/api/proxy', createProxyRouter({ portForwardManager: manager }))
 ```
 
-Remove all duplicated route handler code.
+Remove all duplicated route handler code. Keep the real PortForwardManager and echo server setup.
 
 **Step 3: Update server/index.ts**
 
@@ -791,10 +821,16 @@ Note: Copy the **complete** firewall handler code from `server/index.ts` lines 3
 
 **Step 2: Update tests**
 
-In `network-api.test.ts`, replace inline route handlers with:
+In `network-api.test.ts`, replace inline network route handlers with:
 ```typescript
 import { createNetworkRouter } from '../../../server/network-router.js'
 app.use('/api', createNetworkRouter({ networkManager: mockNetworkManager, configStore: mockConfigStore, wsHandler: mockWsHandler, detectLanIps: mockDetectLanIps }))
+```
+
+**IMPORTANT**: Task 4 already converted the `/local-file` route in this file to use `createLocalFileRouter`. Preserve that mount — only replace the network-specific route handlers. The test app should have both:
+```typescript
+app.use('/local-file', createLocalFileRouter())  // From Task 4
+app.use('/api', createNetworkRouter({ ... }))    // This task
 ```
 
 In `lan-info-api.test.ts`, replace inline handler with the same router import.
@@ -920,17 +956,68 @@ export function createPerfRouter(deps: PerfRouterDeps): Router {
 }
 ```
 
-**Step 2: Update server/index.ts**
+**Step 2: Write tests for perf route**
+
+Create `test/server/perf-api.test.ts`:
+
+```typescript
+import { describe, it, expect, vi, beforeAll } from 'vitest'
+import express, { type Express } from 'express'
+import request from 'supertest'
+import { createPerfRouter } from '../../server/perf-router.js'
+
+describe('POST /api/perf', () => {
+  let app: Express
+  const mockConfigStore = { patchSettings: vi.fn() }
+  const mockRegistry = { setSettings: vi.fn() }
+  const mockWsHandler = { broadcast: vi.fn() }
+  const mockApplyDebugLogging = vi.fn()
+
+  beforeAll(() => {
+    app = express()
+    app.use(express.json())
+    app.use('/api/perf', createPerfRouter({
+      configStore: mockConfigStore,
+      registry: mockRegistry,
+      wsHandler: mockWsHandler,
+      applyDebugLogging: mockApplyDebugLogging,
+    }))
+  })
+
+  it('enables debug logging', async () => {
+    mockConfigStore.patchSettings.mockResolvedValue({ logging: { debug: true } })
+    const res = await request(app)
+      .post('/api/perf')
+      .send({ enabled: true })
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ ok: true, enabled: true })
+    expect(mockApplyDebugLogging).toHaveBeenCalledWith(true, 'api')
+    expect(mockWsHandler.broadcast).toHaveBeenCalled()
+  })
+
+  it('disables debug logging', async () => {
+    mockConfigStore.patchSettings.mockResolvedValue({ logging: { debug: false } })
+    const res = await request(app)
+      .post('/api/perf')
+      .send({ enabled: false })
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ ok: true, enabled: false })
+    expect(mockApplyDebugLogging).toHaveBeenCalledWith(false, 'api')
+  })
+})
+```
+
+**Step 3: Update server/index.ts**
 
 - Remove `app.post('/api/perf', ...)` handler
 - Add mount: `app.use('/api/perf', createPerfRouter({ configStore, registry, wsHandler, applyDebugLogging }))`
 
-**Step 3: Run tests, commit**
+**Step 4: Run tests, commit**
 
 ```bash
 npm test
-git add server/perf-router.ts server/index.ts
-git commit -m "refactor: extract perf route to perf-router.ts"
+git add server/perf-router.ts test/server/perf-api.test.ts server/index.ts
+git commit -m "refactor: extract perf route to perf-router.ts with tests"
 ```
 
 ---
@@ -972,12 +1059,65 @@ export function createAiRouter(deps: AiRouterDeps): Router {
 }
 ```
 
-**Step 2: Update server/index.ts, run tests, commit**
+**Step 2: Write tests for AI summary route**
+
+Create `test/server/ai-api.test.ts`:
+
+```typescript
+import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest'
+import express, { type Express } from 'express'
+import request from 'supertest'
+import { createAiRouter } from '../../server/ai-router.js'
+
+// Mock AI modules to avoid real API calls
+vi.mock('ai', () => ({ generateText: vi.fn() }))
+vi.mock('@ai-sdk/google', () => ({ google: vi.fn(() => 'mock-model') }))
+
+describe('POST /api/ai/terminals/:terminalId/summary', () => {
+  let app: Express
+  const mockBuffer = { snapshot: vi.fn().mockReturnValue('$ npm test\nAll 42 tests passed') }
+  const mockRegistry = {
+    get: vi.fn().mockReturnValue({ buffer: mockBuffer }),
+  }
+
+  beforeAll(() => {
+    app = express()
+    app.use(express.json())
+    app.use('/api/ai', createAiRouter({
+      registry: mockRegistry,
+      perfConfig: { slowAiSummaryMs: 5000 },
+    }))
+  })
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mockRegistry.get.mockReturnValue({ buffer: mockBuffer })
+  })
+
+  it('returns 404 for unknown terminal', async () => {
+    mockRegistry.get.mockReturnValue(null)
+    const res = await request(app)
+      .post('/api/ai/terminals/unknown/summary')
+    expect(res.status).toBe(404)
+  })
+
+  it('returns heuristic summary when AI is not configured', async () => {
+    // AI_CONFIG.enabled() returns false by default in test env (no GOOGLE_GENERATIVE_AI_API_KEY)
+    const res = await request(app)
+      .post('/api/ai/terminals/term_1/summary')
+    expect(res.status).toBe(200)
+    expect(res.body.source).toBe('heuristic')
+    expect(res.body.description).toBeTruthy()
+  })
+})
+```
+
+**Step 3: Update server/index.ts, run tests, commit**
 
 ```bash
 npm test
-git add server/ai-router.ts server/index.ts
-git commit -m "refactor: extract AI routes to ai-router.ts"
+git add server/ai-router.ts test/server/ai-api.test.ts server/index.ts
+git commit -m "refactor: extract AI routes to ai-router.ts with tests"
 ```
 
 ---
