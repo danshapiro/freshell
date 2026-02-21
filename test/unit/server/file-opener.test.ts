@@ -155,6 +155,18 @@ describe('resolveOpenCommand', () => {
       expect(result.args).toEqual(['--file', '/home/user/file.ts'])
     })
 
+    it('handles quoted command paths with spaces', async () => {
+      const result = await resolveOpenCommand({
+        filePath: '/home/user/file.ts',
+        line: 10,
+        editorSetting: 'custom',
+        customEditorCommand: '"/usr/local/My Editor/editor" -g {file}:{line}',
+        platform: 'linux',
+      })
+      expect(result.command).toBe('/usr/local/My Editor/editor')
+      expect(result.args).toEqual(['-g', '/home/user/file.ts:10'])
+    })
+
     it('falls back to auto when custom is set but command is empty', async () => {
       const result = await resolveOpenCommand({
         filePath: '/home/user/file.ts',
@@ -236,6 +248,22 @@ describe('spawnAndMonitor', () => {
     await resultPromise
     // Should have removed both 'error' and 'exit' listeners
     expect(mockRemoveListener).toHaveBeenCalledTimes(2)
+  })
+
+  it('returns error when process is killed by signal', async () => {
+    mockSpawn.mockReturnValue({
+      unref: vi.fn(),
+      on: vi.fn((event: string, cb: (code: null, signal: string) => void) => {
+        if (event === 'exit') setTimeout(() => cb(null, 'SIGKILL'), 10)
+      }),
+      removeListener: vi.fn(),
+    })
+    const { spawnAndMonitor } = await import('../../../server/file-opener')
+    const resultPromise = spawnAndMonitor({ command: 'editor', args: [] })
+    await vi.advanceTimersByTimeAsync(10)
+    const result = await resultPromise
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('killed by signal SIGKILL')
   })
 
   it('does not double-resolve when exit fires after error', async () => {

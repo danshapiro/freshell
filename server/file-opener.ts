@@ -1,6 +1,14 @@
 import path from 'path'
 import { spawn } from 'child_process'
 
+/**
+ * Editor preset for file opening.
+ * - 'auto': Use the platform's default opener (open, xdg-open, cmd start).
+ *           Does NOT auto-detect installed editors.
+ * - 'cursor': Open in Cursor with -r -g flags.
+ * - 'code': Open in VS Code with -g flag.
+ * - 'custom': User-defined command template with {file}/{line}/{col} placeholders.
+ */
 export type EditorPreset = 'auto' | 'cursor' | 'code' | 'custom'
 
 export interface ResolveOpenCommandOptions {
@@ -39,6 +47,17 @@ function resolveEditorPreset(
   }
 }
 
+/** Tokenize a command string respecting single and double quotes. */
+function tokenize(input: string): string[] {
+  const tokens: string[] = []
+  const regex = /"([^"]*)"| '([^']*)'|(\S+)/g
+  let match
+  while ((match = regex.exec(input)) !== null) {
+    tokens.push(match[1] ?? match[2] ?? match[3])
+  }
+  return tokens
+}
+
 function parseCustomTemplate(
   template: string,
   filePath: string,
@@ -47,7 +66,7 @@ function parseCustomTemplate(
 ): OpenCommand | null {
   if (!template.trim()) return null
 
-  const parts = template.trim().split(/\s+/)
+  const parts = tokenize(template.trim())
   const command = parts[0]
   const substituted = parts
     .slice(1)
@@ -174,16 +193,18 @@ export function spawnAndMonitor(cmd: OpenCommand): Promise<SpawnResult> {
         resolve({ ok: false, error: `Failed to launch "${cmd.command}": ${err.message}` })
       }
 
-      const onExit = (code: number | null) => {
+      const onExit = (code: number | null, signal: string | null) => {
         if (settled) return
         settled = true
         if (timer) clearTimeout(timer)
         child.removeListener('error', onError)
-        if (code !== null && code !== 0) {
+        if (code === 0) {
+          resolve({ ok: true })
+        } else if (code !== null) {
           resolve({ ok: false, error: `"${cmd.command}" exited with code ${code}` })
         } else {
-          // code === 0 or null (still running) — both fine
-          resolve({ ok: true })
+          // code === null means killed by signal
+          resolve({ ok: false, error: `"${cmd.command}" was killed by signal ${signal}` })
         }
       }
 
