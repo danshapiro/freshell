@@ -25,6 +25,7 @@ import { AI_CONFIG, PROMPTS, stripAnsi } from './ai-prompts.js'
 import { migrateSettingsSortMode } from './settings-migrate.js'
 import { filesRouter } from './files-router.js'
 import { createPlatformRouter } from './platform-router.js'
+import { createProxyRouter } from './proxy-router.js'
 import { getSessionRepairService } from './session-scanner/service.js'
 import { SdkBridge } from './sdk-bridge.js'
 import { createClientLogsRouter } from './client-logs.js'
@@ -721,40 +722,7 @@ async function main() {
 
   // --- API: port forwarding (for browser pane remote access) ---
   const portForwardManager = new PortForwardManager()
-
-  app.post('/api/proxy/forward', async (req, res) => {
-    const { port: targetPort } = req.body || {}
-
-    if (!Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) {
-      return res.status(400).json({ error: 'Invalid port number' })
-    }
-
-    try {
-      const requester = getRequesterIdentity(req)
-      const result = await portForwardManager.forward(targetPort, requester)
-      res.json({ forwardedPort: result.port })
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err)
-      log.error({ err, targetPort }, 'Port forward failed')
-      res.status(500).json({ error: `Failed to create port forward: ${msg}` })
-    }
-  })
-
-  app.delete('/api/proxy/forward/:port', (req, res) => {
-    const targetPort = parseInt(req.params.port, 10)
-    if (!Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) {
-      return res.status(400).json({ error: 'Invalid port number' })
-    }
-    try {
-      const requester = getRequesterIdentity(req)
-      portForwardManager.close(targetPort, requester.key)
-      res.json({ ok: true })
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err)
-      log.error({ err, targetPort }, 'Port forward close failed')
-      res.status(500).json({ error: `Failed to close port forward: ${msg}` })
-    }
-  })
+  app.use('/api/proxy', createProxyRouter({ portForwardManager }))
 
   // --- Static client in production ---
   const distRoot = path.resolve(__dirname, '..')

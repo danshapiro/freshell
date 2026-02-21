@@ -1,9 +1,26 @@
-import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest'
+// @vitest-environment node
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest'
 import express, { type Express } from 'express'
 import request from 'supertest'
 import * as net from 'net'
 import { PortForwardManager } from '../../../server/port-forward.js'
-import { getRequesterIdentity, parseTrustProxyEnv } from '../../../server/request-ip.js'
+import { parseTrustProxyEnv } from '../../../server/request-ip.js'
+import { createProxyRouter } from '../../../server/proxy-router.js'
+
+// Mock logger to avoid pino setup in test
+vi.mock('../../../server/logger', () => {
+  const logger = {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+    trace: vi.fn(),
+    fatal: vi.fn(),
+    child: vi.fn(),
+  }
+  logger.child.mockReturnValue(logger)
+  return { logger }
+})
 
 const TEST_AUTH_TOKEN = 'test-auth-token-12345678'
 
@@ -44,33 +61,8 @@ describe('Port Forward API Integration', () => {
       next()
     })
 
-    // Register the endpoint under test
-    app.post('/api/proxy/forward', async (req, res) => {
-      const { port } = req.body || {}
-
-      if (!Number.isInteger(port) || port < 1 || port > 65535) {
-        return res.status(400).json({ error: 'Invalid port number' })
-      }
-
-      try {
-        const requester = getRequesterIdentity(req)
-        const result = await manager.forward(port, requester)
-        res.json({ forwardedPort: result.port })
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err)
-        res.status(500).json({ error: `Failed to create port forward: ${msg}` })
-      }
-    })
-
-    app.delete('/api/proxy/forward/:port', (req, res) => {
-      const port = parseInt(req.params.port, 10)
-      if (!Number.isInteger(port) || port < 1 || port > 65535) {
-        return res.status(400).json({ error: 'Invalid port number' })
-      }
-      const requester = getRequesterIdentity(req)
-      manager.close(port, requester.key)
-      res.json({ ok: true })
-    })
+    // Mount the real proxy router with the real PortForwardManager
+    app.use('/api/proxy', createProxyRouter({ portForwardManager: manager }))
   })
 
   afterEach(() => {
