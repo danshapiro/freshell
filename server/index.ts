@@ -38,6 +38,7 @@ import { PortForwardManager } from './port-forward.js'
 import { getRequesterIdentity, parseTrustProxyEnv } from './request-ip.js'
 import { collectCandidateDirectories } from './candidate-dirs.js'
 import { createTabsRegistryStore } from './tabs-registry/store.js'
+import { cleanString } from './utils.js'
 import { checkForUpdate } from './updater/version-checker.js'
 import { SessionAssociationCoordinator } from './session-association-coordinator.js'
 import { loadOrCreateServerInstanceId } from './instance-id.js'
@@ -316,11 +317,6 @@ async function main() {
     }
   })
 
-  /** Normalize nullable string overrides: null/empty/whitespace → undefined */
-  const cleanString = (value: string | null | undefined) => {
-    const trimmed = typeof value === 'string' ? value.trim() : value
-    return trimmed ? trimmed : undefined
-  }
 
   const NetworkConfigureSchema = z.object({
     host: z.enum(['127.0.0.1', '0.0.0.0']),
