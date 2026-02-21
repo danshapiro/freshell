@@ -4,6 +4,7 @@ import request from 'supertest'
 import fsp from 'fs/promises'
 import path from 'path'
 import os from 'os'
+import { z } from 'zod'
 
 // Use vi.hoisted to ensure mockState is available before vi.mock runs
 const mockState = vi.hoisted(() => ({
@@ -102,9 +103,25 @@ describe('API Edge Cases - Security Testing', () => {
     })
 
     // Terminal routes
+    const TerminalPatchSchema = z.object({
+      titleOverride: z.string().max(500).optional().nullable(),
+      descriptionOverride: z.string().max(2000).optional().nullable(),
+      deleted: z.boolean().optional(),
+    })
+
     app.patch('/api/terminals/:terminalId', async (req, res) => {
       const terminalId = req.params.terminalId
-      const { titleOverride, descriptionOverride, deleted } = req.body || {}
+      const parsed = TerminalPatchSchema.safeParse(req.body || {})
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
+      }
+      const cleanString = (value: string | null | undefined) => {
+        const trimmed = typeof value === 'string' ? value.trim() : value
+        return trimmed ? trimmed : undefined
+      }
+      const { titleOverride: rawTitle, descriptionOverride: rawDesc, deleted } = parsed.data
+      const titleOverride = rawTitle !== undefined ? cleanString(rawTitle) : undefined
+      const descriptionOverride = rawDesc !== undefined ? cleanString(rawDesc) : undefined
       const next = await configStore.patchTerminalOverride(terminalId, {
         titleOverride,
         descriptionOverride,
@@ -120,9 +137,17 @@ describe('API Edge Cases - Security Testing', () => {
     })
 
     // Project colors route
+    const ProjectColorSchema = z.object({
+      projectPath: z.string().min(1).max(1024),
+      color: z.string().min(1).max(64),
+    })
+
     app.put('/api/project-colors', async (req, res) => {
-      const { projectPath, color } = req.body || {}
-      if (!projectPath || !color) return res.status(400).json({ error: 'projectPath and color required' })
+      const parsed = ProjectColorSchema.safeParse(req.body || {})
+      if (!parsed.success) {
+        return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
+      }
+      const { projectPath, color } = parsed.data
       await configStore.setProjectColor(projectPath, color)
       res.json({ ok: true })
     })
@@ -244,7 +269,8 @@ describe('API Edge Cases - Security Testing', () => {
         .send({ color: '#ff0000' })
 
       expect(res.status).toBe(400)
-      expect(res.body.error).toContain('projectPath')
+      expect(res.body.error).toBe('Invalid request')
+      expect(res.body.details).toBeDefined()
     })
 
     it('project-colors rejects missing color', async () => {
@@ -254,7 +280,8 @@ describe('API Edge Cases - Security Testing', () => {
         .send({ projectPath: '/some/path' })
 
       expect(res.status).toBe(400)
-      expect(res.body.error).toContain('color')
+      expect(res.body.error).toBe('Invalid request')
+      expect(res.body.details).toBeDefined()
     })
 
     it('project-colors rejects empty body', async () => {

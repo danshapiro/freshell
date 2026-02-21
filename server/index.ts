@@ -316,6 +316,12 @@ async function main() {
     }
   })
 
+  /** Normalize nullable string overrides: null/empty/whitespace → undefined */
+  const cleanString = (value: string | null | undefined) => {
+    const trimmed = typeof value === 'string' ? value.trim() : value
+    return trimmed ? trimmed : undefined
+  }
+
   const NetworkConfigureSchema = z.object({
     host: z.enum(['127.0.0.1', '0.0.0.0']),
     configured: z.boolean(),
@@ -598,10 +604,6 @@ async function main() {
     if (!parsed.success) {
       return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
     }
-    const cleanString = (value: string | null | undefined) => {
-      const trimmed = typeof value === 'string' ? value.trim() : value
-      return trimmed ? trimmed : undefined
-    }
     const { titleOverride, summaryOverride, deleted, archived, createdAtOverride } = parsed.data
 	    const next = await configStore.patchSessionOverride(compositeKey, {
 	      titleOverride: cleanString(titleOverride),
@@ -623,13 +625,27 @@ async function main() {
 	    res.json({ ok: true })
 	  })
 
+  const ProjectColorSchema = z.object({
+    projectPath: z.string().min(1).max(1024),
+    color: z.string().min(1).max(64),
+  })
+
   app.put('/api/project-colors', async (req, res) => {
-	    const { projectPath, color } = req.body || {}
-	    if (!projectPath || !color) return res.status(400).json({ error: 'projectPath and color required' })
-	    await configStore.setProjectColor(projectPath, color)
-	    await codingCliIndexer.refresh()
-	    res.json({ ok: true })
-	  })
+    const parsed = ProjectColorSchema.safeParse(req.body || {})
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
+    }
+    const { projectPath, color } = parsed.data
+    await configStore.setProjectColor(projectPath, color)
+    await codingCliIndexer.refresh()
+    res.json({ ok: true })
+  })
+
+  const TerminalPatchSchema = z.object({
+    titleOverride: z.string().max(500).optional().nullable(),
+    descriptionOverride: z.string().max(2000).optional().nullable(),
+    deleted: z.boolean().optional(),
+  })
 
   // --- API: terminals ---
   app.get('/api/terminals', async (_req, res) => {
@@ -648,7 +664,13 @@ async function main() {
 
   app.patch('/api/terminals/:terminalId', async (req, res) => {
     const terminalId = req.params.terminalId
-    const { titleOverride, descriptionOverride, deleted } = req.body || {}
+    const parsed = TerminalPatchSchema.safeParse(req.body || {})
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
+    }
+    const { titleOverride: rawTitle, descriptionOverride: rawDesc, deleted } = parsed.data
+    const titleOverride = rawTitle !== undefined ? cleanString(rawTitle) : undefined
+    const descriptionOverride = rawDesc !== undefined ? cleanString(rawDesc) : undefined
 
     const next = await configStore.patchTerminalOverride(terminalId, {
       titleOverride,

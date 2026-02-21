@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest'
 import express, { type Express } from 'express'
 import request from 'supertest'
+import { z } from 'zod'
 
 const SLOW_TEST_TIMEOUT_MS = 20000
 
@@ -123,9 +124,25 @@ function createTestApp(registry: FakeRegistry): Express {
   })
 
   // PATCH /api/terminals/:terminalId - update terminal
+  const TerminalPatchSchema = z.object({
+    titleOverride: z.string().max(500).optional().nullable(),
+    descriptionOverride: z.string().max(2000).optional().nullable(),
+    deleted: z.boolean().optional(),
+  })
+
   app.patch('/api/terminals/:terminalId', async (req, res) => {
     const terminalId = req.params.terminalId
-    const { titleOverride, descriptionOverride, deleted } = req.body || {}
+    const parsed = TerminalPatchSchema.safeParse(req.body || {})
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
+    }
+    const cleanString = (value: string | null | undefined) => {
+      const trimmed = typeof value === 'string' ? value.trim() : value
+      return trimmed ? trimmed : undefined
+    }
+    const { titleOverride: rawTitle, descriptionOverride: rawDesc, deleted } = parsed.data
+    const titleOverride = rawTitle !== undefined ? cleanString(rawTitle) : undefined
+    const descriptionOverride = rawDesc !== undefined ? cleanString(rawDesc) : undefined
 
     const next = await configStore.patchTerminalOverride(terminalId, {
       titleOverride,
@@ -437,6 +454,65 @@ describe('Terminals API', () => {
         titleOverride: undefined,
         descriptionOverride: undefined,
         deleted: true,
+      })
+    })
+
+    it('rejects non-boolean deleted field', async () => {
+      const response = await request(app)
+        .patch('/api/terminals/term_123')
+        .set('x-auth-token', AUTH_TOKEN)
+        .send({ deleted: 'true' })
+        .expect(400)
+
+      expect(response.body.error).toBe('Invalid request')
+      expect(response.body.details).toBeDefined()
+    })
+
+    it('rejects titleOverride exceeding 500 characters', async () => {
+      const response = await request(app)
+        .patch('/api/terminals/term_123')
+        .set('x-auth-token', AUTH_TOKEN)
+        .send({ titleOverride: 'a'.repeat(501) })
+        .expect(400)
+
+      expect(response.body.error).toBe('Invalid request')
+      expect(response.body.details).toBeDefined()
+    })
+
+    it('rejects descriptionOverride exceeding 2000 characters', async () => {
+      const response = await request(app)
+        .patch('/api/terminals/term_123')
+        .set('x-auth-token', AUTH_TOKEN)
+        .send({ descriptionOverride: 'a'.repeat(2001) })
+        .expect(400)
+
+      expect(response.body.error).toBe('Invalid request')
+      expect(response.body.details).toBeDefined()
+    })
+
+    it('accepts empty body as no-op', async () => {
+      vi.mocked(configStore.patchTerminalOverride).mockResolvedValue({})
+
+      await request(app)
+        .patch('/api/terminals/term_123')
+        .set('x-auth-token', AUTH_TOKEN)
+        .send({})
+        .expect(200)
+    })
+
+    it('accepts null titleOverride to clear override', async () => {
+      vi.mocked(configStore.patchTerminalOverride).mockResolvedValue({})
+
+      await request(app)
+        .patch('/api/terminals/term_123')
+        .set('x-auth-token', AUTH_TOKEN)
+        .send({ titleOverride: null })
+        .expect(200)
+
+      expect(configStore.patchTerminalOverride).toHaveBeenCalledWith('term_123', {
+        titleOverride: undefined,
+        descriptionOverride: undefined,
+        deleted: undefined,
       })
     })
   })
