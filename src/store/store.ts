@@ -1,6 +1,3 @@
-// Storage migration MUST be imported first (before slices load from localStorage)
-import './storage-migration'
-
 import { enableMapSet } from 'immer'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer from './tabsSlice'
