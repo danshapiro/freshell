@@ -7,7 +7,7 @@ export type GapEvent = {
   reason: 'queue_overflow'
 }
 
-function isGapEvent(entry: ReplayFrame | GapEvent): entry is GapEvent {
+export function isGapEvent(entry: ReplayFrame | GapEvent): entry is GapEvent {
   return 'type' in entry && entry.type === 'gap'
 }
 

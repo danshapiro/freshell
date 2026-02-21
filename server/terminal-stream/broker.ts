@@ -4,7 +4,7 @@ import type { TerminalRegistry } from '../terminal-registry.js'
 import { logger } from '../logger.js'
 import { logTerminalStreamPerfEvent, type TerminalStreamPerfEvent } from '../perf-logger.js'
 import type { TerminalOutputRawEvent } from './registry-events.js'
-import { ClientOutputQueue, type GapEvent } from './client-output-queue.js'
+import { ClientOutputQueue, isGapEvent, type GapEvent } from './client-output-queue.js'
 import { ReplayRing, type ReplayFrame } from './replay-ring.js'
 import {
   TERMINAL_STREAM_BATCH_MAX_BYTES,
@@ -29,10 +29,6 @@ type PerfEventLogger = (
   context: Record<string, unknown>,
   level?: PerfLevel,
 ) => void
-
-function isGapEvent(item: ReplayFrame | GapEvent): item is GapEvent {
-  return 'type' in item && item.type === 'gap'
-}
 
 export class TerminalStreamBroker {
   private terminals = new Map<string, BrokerTerminalState>()
@@ -166,7 +162,7 @@ export class TerminalStreamBroker {
             fromSeq: replay.missedFromSeq,
             toSeq: missedToSeq,
             reason: 'replay_window_exceeded',
-          })
+          }, 'warn')
 
           if (!this.safeSend(ws, {
             type: 'terminal.output.gap',
