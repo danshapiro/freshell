@@ -242,6 +242,46 @@ describe('files-router path validation', () => {
       expect(res.status).toBe(403)
       expect(res.body.error).toBe('Path not allowed')
     })
+
+    it('passes line and column to the opener', async () => {
+      mockGetSettings.mockResolvedValue({
+        allowedFilePaths: undefined,
+        editor: { externalEditor: 'cursor' },
+      })
+      mockStat.mockResolvedValue({ isFile: () => true })
+      mockSpawn.mockReturnValue({ unref: vi.fn() })
+
+      const res = await request(app)
+        .post('/api/files/open')
+        .send({ path: '/home/user/file.ts', line: 42, column: 10 })
+
+      expect(res.status).toBe(200)
+      expect(mockSpawn).toHaveBeenCalledWith(
+        'cursor',
+        ['-r', '-g', '/home/user/file.ts:42:10'],
+        expect.any(Object),
+      )
+    })
+
+    it('uses configured editor setting', async () => {
+      mockGetSettings.mockResolvedValue({
+        allowedFilePaths: undefined,
+        editor: { externalEditor: 'code' },
+      })
+      mockStat.mockResolvedValue({ isFile: () => true })
+      mockSpawn.mockReturnValue({ unref: vi.fn() })
+
+      const res = await request(app)
+        .post('/api/files/open')
+        .send({ path: '/home/user/file.ts' })
+
+      expect(res.status).toBe(200)
+      expect(mockSpawn).toHaveBeenCalledWith(
+        'code',
+        ['-g', '/home/user/file.ts'],
+        expect.any(Object),
+      )
+    })
   })
 
   describe('GET /api/files/complete', () => {
