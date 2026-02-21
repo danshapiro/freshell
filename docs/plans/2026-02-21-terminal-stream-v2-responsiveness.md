@@ -76,6 +76,7 @@ Add tests that require:
 - server closes with `PROTOCOL_MISMATCH` when version missing/mismatched (including old clients with no version field)
 - client treats mismatch as fatal upgrade-required state (no reconnect loop)
 - legacy `capabilities.terminalAttachChunkV1` is removed from hello payload construction
+- `terminal.created` no longer contains snapshot payload fields in v2
 
 ```ts
 expect(close.code).toBe(4010)
@@ -127,6 +128,15 @@ export const TerminalAttachSchema = z.object({
 Add/replace server message types with V2 stream messages:
 
 ```ts
+type TerminalCreatedMessage = {
+  type: 'terminal.created'
+  requestId: string
+  terminalId: string
+  createdAt: number
+  effectiveResumeSessionId?: string
+  // no snapshot payload in protocol v2
+}
+
 type TerminalAttachReadyMessage = {
   type: 'terminal.attach.ready'
   terminalId: string
@@ -153,6 +163,13 @@ type TerminalOutputGapMessage = {
   reason: 'queue_overflow' | 'replay_window_exceeded'
 }
 ```
+
+Also update `ServerMessage` union in `shared/ws-protocol.ts` to:
+- replace old `TerminalOutputMessage` shape with sequenced v2 shape
+- include `TerminalAttachReadyMessage` and `TerminalOutputGapMessage`
+- update `TerminalCreatedMessage` to the snapshot-free v2 shape
+
+In `server/ws-handler.ts`, add `CLOSE_CODES.PROTOCOL_MISMATCH = 4010`.
 
 In `server/ws-handler.ts`, reject mismatched `protocolVersion` with close code `4010` and typed error.
 
@@ -219,6 +236,15 @@ In `src/store/storage-migration.ts`:
 ```ts
 const STORAGE_VERSION = 3
 const AUTH_STORAGE_KEY = 'freshell.auth-token'
+
+function clearFreshellKeysExcept(keep: string[]): void {
+  const keepSet = new Set(keep)
+  for (const key of Object.keys(localStorage)) {
+    if ((key.startsWith('freshell.') || key === 'freshell_version') && !keepSet.has(key)) {
+      localStorage.removeItem(key)
+    }
+  }
+}
 
 export function runStorageMigration(): void {
   const currentVersion = readStorageVersion()
@@ -595,6 +621,7 @@ Add tests requiring:
 - emits `terminal.output.gap` on bounded overflow instead of close
 - attach boundary ordering: output produced during attach replay is delivered after replay (no loss/reorder)
 - catastrophic breaker: `4008` only when `bufferedAmount` exceeds hard threshold for sustained stall window
+- `terminal.create` path auto-attaches creator via broker without snapshot payload fields
 
 ```ts
 expect(closeCode).not.toBe(4008)
@@ -617,6 +644,7 @@ Expected: FAIL.
 - subscribe/unsubscribe websocket clients to terminal IDs
 - route registry output events into replay ring + client queues
 - handle `terminal.attach` replay (`sinceSeq`)
+- handle `terminal.create` auto-attach (`sinceSeq=0`) for creator websocket
 - emit `terminal.attach.ready`, `terminal.output`, `terminal.output.gap`
 - maintain per-terminal attachment counts for list metadata
 - enforce per-terminal attach critical section and attach-staging queue flush (replaces `pendingSnapshotClients`)
@@ -624,7 +652,9 @@ Expected: FAIL.
   - do not close for ordinary queue overflow
   - close with `4008` only when `ws.bufferedAmount > TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES` continuously for `TERMINAL_WS_CATASTROPHIC_STALL_MS`
 
-In `server/ws-handler.ts`, remove attach call sites/wiring for legacy snapshot flow (including `terminal.attach` branches, `attachSendChains` usage, and calls into `sendAttachSnapshotAndFinalize`) and delegate attach to broker APIs.
+In `server/ws-handler.ts`, remove attach call sites/wiring for legacy snapshot flow (including `terminal.attach` branches, `attachSendChains` usage, and calls into `sendAttachSnapshotAndFinalize`) and delegate both:
+- explicit reattach (`terminal.attach`) to broker replay APIs
+- create-time attach (after `terminal.create`) to broker auto-attach APIs
 Leave only dead helper definitions/constants/types cleanup for Task 10.
 
 **Step 4: Run tests to verify pass**
@@ -664,6 +694,7 @@ Require:
 - `terminal.output.gap` renders system marker
 - reconnect no longer depends on `terminal.attached.start/chunk/end`
 - preserve existing RAF-based `term.write` batching (no synchronous write in WS handler)
+- `terminal.created` handling does not expect/consume snapshot payload in v2
 
 ```ts
 expect(ws.send).toHaveBeenCalledWith({
@@ -693,9 +724,13 @@ In `src/components/TerminalView.tsx`:
 - on `terminal.output.gap`: write explicit marker line
 - keep existing `enqueueTerminalWrite` + RAF queue behavior to avoid WS message-loop blocking
 - assume broker emits strictly increasing, non-overlapping sequence ranges
+- on `terminal.created`: set terminal state only (no snapshot parsing), rely on broker auto-attach stream
 
 ```ts
 if (msg.type === 'terminal.output' && msg.terminalId === tid) {
+  if (import.meta.env.DEV && msg.seqStart <= lastSeqRef.current) {
+    console.warn('Unexpected overlapping sequence range', msg.seqStart, msg.seqEnd, lastSeqRef.current)
+  }
   if (msg.seqEnd <= lastSeqRef.current) return
   enqueueTerminalWrite(msg.data)
   lastSeqRef.current = msg.seqEnd
@@ -830,6 +865,7 @@ Expected: FAIL.
 
 Remove/replace:
 - remaining `terminal.attached*` supporting code after Task 7 cutover (legacy message types/schemas/constants/helpers)
+- remove deprecated `terminal.snapshot` type/message definitions in `shared/ws-protocol.ts`
 - remove dead helpers: `sendAttachSnapshotAndFinalize`, `enqueueAttachSnapshotSend`, local `chunkTerminalSnapshot` path in `server/ws-handler.ts`
 - attach chunk constants and timeouts
 - remove terminal snapshot chunking export from `server/ws-chunking.ts`; retain non-terminal sessions chunking only if still used
@@ -964,6 +1000,11 @@ Document operational guidance and env knobs in `README.md`:
 - `TERMINAL_CLIENT_QUEUE_MAX_BYTES` (default `131072`)
 - `TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES` (default `16777216`)
 - `TERMINAL_WS_CATASTROPHIC_STALL_MS` (default `10000`)
+
+Include memory budgeting formula and examples:
+- per-terminal baseline: `TERMINAL_REPLAY_RING_MAX_BYTES`
+- per attached client overhead: `TERMINAL_CLIENT_QUEUE_MAX_BYTES`
+- approximate per-terminal total: `ring + (attachedClients * queue)`
 
 **Step 4: Full verification run**
 
