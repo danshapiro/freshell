@@ -100,6 +100,11 @@ In `shared/ws-protocol.ts`:
 ```ts
 export const WS_PROTOCOL_VERSION = 2
 
+export const ErrorCode = z.enum([
+  ...,
+  'PROTOCOL_MISMATCH',
+])
+
 export const HelloSchema = z.object({
   type: z.literal('hello'),
   token: z.string().optional(),
@@ -322,6 +327,8 @@ Update broadcast channel constant to `freshell.persist.v2` in `src/store/persist
 
 Add migration note in comments/docs: storage key namespace suffix (`.v1`, `.v2`) is independent from `freshell_version` migration counter (`STORAGE_VERSION`).
 
+In `src/store/panesSlice.ts`, remove or refactor legacy `.v1` recovery helpers (`applyLegacyResumeSessionIds`, `cleanOrphanedLayouts`) that become dead after Task 2's full storage reset on version bump.
+
 **Step 4: Run tests to verify pass**
 
 Run:
@@ -470,7 +477,15 @@ export class ReplayRing {
 }
 ```
 
-Use UTF-8 byte sizing (`Buffer.byteLength`) for memory budget enforcement. Define `DEFAULT_TERMINAL_REPLAY_RING_MAX_BYTES = 256 * 1024` (configurable by env) and document rationale: enough reconnect delta room while keeping per-terminal memory bounded.
+Use UTF-8 byte sizing (`Buffer.byteLength`) for memory budget enforcement. Define `DEFAULT_TERMINAL_REPLAY_RING_MAX_BYTES = 256 * 1024` and apply env override `TERMINAL_REPLAY_RING_MAX_BYTES` when set.
+
+Handle `sinceSeq` normalization explicitly (avoid truthy/falsy mistakes):
+
+```ts
+const normalizedSinceSeq = sinceSeq === undefined || sinceSeq === 0 ? 0 : sinceSeq
+```
+
+Document rationale: enough reconnect delta room while keeping per-terminal memory bounded.
 
 **Step 4: Run tests to verify pass**
 
@@ -717,7 +732,6 @@ git commit -m "feat(client): switch terminal view to v2 sequence stream and remo
 - Modify: `src/components/TerminalView.tsx`
 - Modify: `src/store/connectionSlice.ts`
 - Modify: `src/components/terminal/ConnectionErrorOverlay.tsx`
-- Modify: `src/lib/ws-client.ts`
 - Test: `test/unit/client/components/TerminalView.lifecycle.test.tsx`
 - Test: `test/unit/client/lib/ws-client.test.ts`
 - Update: `docs/index.html`
@@ -744,7 +758,7 @@ npm test -- test/unit/client/components/TerminalView.lifecycle.test.tsx -t "non-
 npm test -- test/unit/client/lib/ws-client.test.ts -t "queues input while disconnected"
 ```
 
-Expected: FAIL.
+Expected: TerminalView reconnect UX assertions FAIL. WsClient queueing test may already PASS (existing behavior), and should be kept as a guardrail.
 
 **Step 3: Implement non-blocking status treatment**
 
@@ -759,20 +773,7 @@ Separate state presentation:
 - `connection.status === 'ready'` + attach replay in progress: inline "recovering output" status (non-blocking).
 - keep `ConnectionErrorOverlay` only for fatal limits (`4003`, protocol mismatch fatal, auth fatal).
 
-In `src/lib/ws-client.ts`, make queueing behavior explicit for disconnected/connecting states:
-
-```ts
-if (this._state !== 'ready') {
-  // queue terminal.input and control messages; flush after ready
-  if (this.pendingMessages.length >= this.maxQueueSize) {
-    this.pendingMessages.shift()
-  }
-  this.pendingMessages.push(msg)
-  return
-}
-```
-
-Use `maxQueueSize = 1000` (existing default in `ws-client.ts`) and keep it bounded to avoid unbounded client memory during long disconnects.
+In `test/unit/client/lib/ws-client.test.ts`, add/keep regression coverage for existing queue semantics (`_state !== 'ready'` queues bounded pending messages with `maxQueueSize = 1000`). Do not change ws-client runtime behavior unless tests show a real gap.
 
 Update `docs/index.html` mock to reflect inline degraded status treatment.
 
@@ -790,7 +791,7 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add src/components/TerminalView.tsx src/store/connectionSlice.ts src/components/terminal/ConnectionErrorOverlay.tsx src/lib/ws-client.ts docs/index.html test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/lib/ws-client.test.ts
+git add src/components/TerminalView.tsx src/store/connectionSlice.ts src/components/terminal/ConnectionErrorOverlay.tsx docs/index.html test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/lib/ws-client.test.ts
 git commit -m "feat(ui): make terminal reconnect state non-blocking and align mock docs with degraded-stream status"
 ```
 
