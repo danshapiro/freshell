@@ -16,6 +16,7 @@ import type { SessionScanResult, SessionRepairResult } from './session-scanner/t
 import { isValidClaudeSessionId } from './claude-session-id.js'
 import type { SdkBridge } from './sdk-bridge.js'
 import type { SdkServerMessage } from '../shared/ws-protocol.js'
+import { TerminalStreamBroker } from './terminal-stream/broker.js'
 import { TabRegistryRecordBaseSchema, TabRegistryRecordSchema } from './tabs-registry/types.js'
 import type { TabsRegistryStore } from './tabs-registry/store.js'
 import {
@@ -291,6 +292,7 @@ export class WsHandler {
   private handshakeSnapshotProvider?: HandshakeSnapshotProvider
   private terminalMetaListProvider?: () => TerminalMeta[]
   private tabsRegistryStore?: TabsRegistryStore
+  private terminalStreamBroker: TerminalStreamBroker
   private readonly serverInstanceId: string
   private sessionRepairListeners?: {
     scanned: (result: SessionScanResult) => void
@@ -316,6 +318,7 @@ export class WsHandler {
     this.serverInstanceId = serverInstanceId && serverInstanceId.trim().length > 0
       ? serverInstanceId
       : `srv-${randomUUID()}`
+    this.terminalStreamBroker = new TerminalStreamBroker(this.registry)
     this.wss = new WebSocketServer({
       server,
       path: '/ws',
@@ -522,10 +525,8 @@ export class WsHandler {
       }
     }
 
-    // Detach from any terminals
-    for (const terminalId of state.attachedTerminalIds) {
-      this.registry.detach(terminalId, ws)
-    }
+    // Detach from any terminals (broker-managed stream path).
+    this.terminalStreamBroker.detachAllForSocket(ws)
     state.attachedTerminalIds.clear()
     for (const off of state.codingCliSubscriptions.values()) {
       off()
@@ -1102,19 +1103,19 @@ export class WsHandler {
             }
             const existing = this.registry.get(existingId)
             if (existing) {
-              this.registry.attach(existingId, ws, { pendingSnapshot: true })
+              const attached = await this.terminalStreamBroker.sendCreatedAndAttach(ws, {
+                requestId: m.requestId,
+                terminalId: existingId,
+                createdAt: existing.createdAt,
+                effectiveResumeSessionId: existing.resumeSessionId,
+              })
+              if (!attached) {
+                this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Unknown terminalId', terminalId: existingId })
+                return
+              }
               state.attachedTerminalIds.add(existingId)
               terminalId = existingId
               reused = true
-              this.enqueueAttachSnapshotSend(ws, state, {
-                terminalId: existingId,
-                snapshot: existing.buffer.snapshot(),
-                created: {
-                  requestId: m.requestId,
-                  createdAt: existing.createdAt,
-                  effectiveResumeSessionId: existing.resumeSessionId,
-                },
-              })
               this.broadcast({ type: 'terminal.list.updated' })
               return
             }
@@ -1159,20 +1160,24 @@ export class WsHandler {
               )
             }
             if (existing) {
-              this.registry.attach(existing.terminalId, ws, { pendingSnapshot: true })
+              const attached = await this.terminalStreamBroker.sendCreatedAndAttach(ws, {
+                requestId: m.requestId,
+                terminalId: existing.terminalId,
+                createdAt: existing.createdAt,
+                effectiveResumeSessionId: existing.resumeSessionId,
+              })
+              if (!attached) {
+                this.sendError(ws, {
+                  code: 'INVALID_TERMINAL_ID',
+                  message: 'Unknown terminalId',
+                  terminalId: existing.terminalId,
+                })
+                return
+              }
               state.attachedTerminalIds.add(existing.terminalId)
               state.createdByRequestId.set(m.requestId, existing.terminalId)
               terminalId = existing.terminalId
               reused = true
-              this.enqueueAttachSnapshotSend(ws, state, {
-                terminalId: existing.terminalId,
-                snapshot: existing.buffer.snapshot(),
-                created: {
-                  requestId: m.requestId,
-                  createdAt: existing.createdAt,
-                  effectiveResumeSessionId: existing.resumeSessionId,
-                },
-              })
               this.broadcast({ type: 'terminal.list.updated' })
               return
             }
@@ -1244,19 +1249,16 @@ export class WsHandler {
           state.createdByRequestId.set(m.requestId, record.terminalId)
           terminalId = record.terminalId
 
-          // Attach creator immediately
-          this.registry.attach(record.terminalId, ws, { pendingSnapshot: true })
-          state.attachedTerminalIds.add(record.terminalId)
-
-          this.enqueueAttachSnapshotSend(ws, state, {
+          // Attach creator immediately through broker (snapshot-free v2 flow).
+          const attached = await this.terminalStreamBroker.sendCreatedAndAttach(ws, {
+            requestId: m.requestId,
             terminalId: record.terminalId,
-            snapshot: record.buffer.snapshot(),
-            created: {
-              requestId: m.requestId,
-              createdAt: record.createdAt,
-              effectiveResumeSessionId,
-            },
+            createdAt: record.createdAt,
+            effectiveResumeSessionId,
           })
+          if (attached) {
+            state.attachedTerminalIds.add(record.terminalId)
+          }
 
           // Notify all clients that list changed
           this.broadcast({ type: 'terminal.list.updated' })
@@ -1279,22 +1281,18 @@ export class WsHandler {
       }
 
       case 'terminal.attach': {
-        const rec = this.registry.attach(m.terminalId, ws, { pendingSnapshot: true })
-        if (!rec) {
+        const attached = await this.terminalStreamBroker.attach(ws, m.terminalId, m.sinceSeq)
+        if (!attached) {
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Unknown terminalId', terminalId: m.terminalId })
           return
         }
         state.attachedTerminalIds.add(m.terminalId)
-        this.enqueueAttachSnapshotSend(ws, state, {
-          terminalId: m.terminalId,
-          snapshot: rec.buffer.snapshot(),
-        })
         this.broadcast({ type: 'terminal.list.updated' })
         return
       }
 
       case 'terminal.detach': {
-        const ok = this.registry.detach(m.terminalId, ws)
+        const ok = this.terminalStreamBroker.detach(m.terminalId, ws)
         state.attachedTerminalIds.delete(m.terminalId)
         if (!ok) {
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Unknown terminalId', terminalId: m.terminalId })
@@ -1873,6 +1871,8 @@ export class WsHandler {
       clearInterval(this.pingInterval)
       this.pingInterval = null
     }
+
+    this.terminalStreamBroker.close()
 
     // Close all client connections
     for (const ws of this.connections) {

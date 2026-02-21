@@ -6,6 +6,7 @@ import WebSocket from 'ws'
 import { WsHandler, chunkProjects } from '../../../server/ws-handler'
 import { TerminalRegistry } from '../../../server/terminal-registry'
 import type { ProjectGroup } from '../../../server/coding-cli/types'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol'
 
 vi.mock('node-pty', () => ({
   spawn: vi.fn(),
@@ -429,7 +430,7 @@ describe('WsHandler integration: chunked handshake snapshot delivery', () => {
       })
 
       // Start handshake
-      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
 
       // Wait for all messages to arrive (with idle timeout)
       await new Promise<void>((resolve) => {

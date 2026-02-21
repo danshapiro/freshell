@@ -180,6 +180,7 @@ export type TerminalRecord = {
   cols: number
   rows: number
   clients: Set<WebSocket>
+  suppressedOutputClients: Set<WebSocket>
   pendingSnapshotClients: Map<WebSocket, PendingSnapshotQueue>
   warnedIdle?: boolean
   buffer: ChunkRingBuffer
@@ -912,6 +913,7 @@ export class TerminalRegistry extends EventEmitter {
       cols,
       rows,
       clients: new Set(),
+      suppressedOutputClients: new Set(),
       pendingSnapshotClients: new Map(),
       warnedIdle: false,
       buffer: new ChunkRingBuffer(this.scrollbackMaxChars),
@@ -976,6 +978,7 @@ export class TerminalRegistry extends EventEmitter {
         }
       }
       for (const client of record.clients) {
+        if (record.suppressedOutputClients.has(client)) continue
         // Legacy snapshot ordering path. Broker cutover destination:
         // - pendingSnapshotClients ordering -> broker attach-staging queue.
         const pending = record.pendingSnapshotClients.get(client)
@@ -1015,6 +1018,7 @@ export class TerminalRegistry extends EventEmitter {
         this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: e.exitCode }, { terminalId, perf: record.perf })
       }
       record.clients.clear()
+      record.suppressedOutputClients.clear()
       record.pendingSnapshotClients.clear()
       this.releaseBinding(terminalId)
       this.emit('terminal.exit', { terminalId, exitCode: e.exitCode })
@@ -1035,12 +1039,13 @@ export class TerminalRegistry extends EventEmitter {
     return record
   }
 
-  attach(terminalId: string, client: WebSocket, opts?: { pendingSnapshot?: boolean }): TerminalRecord | null {
+  attach(terminalId: string, client: WebSocket, opts?: { pendingSnapshot?: boolean; suppressOutput?: boolean }): TerminalRecord | null {
     const term = this.terminals.get(terminalId)
     if (!term) return null
     term.clients.add(client)
     term.warnedIdle = false
     if (opts?.pendingSnapshot) term.pendingSnapshotClients.set(client, { chunks: [], queuedChars: 0 })
+    if (opts?.suppressOutput) term.suppressedOutputClients.add(client)
     return term
   }
 
@@ -1061,6 +1066,7 @@ export class TerminalRegistry extends EventEmitter {
     this.flushOutputBuffer(client)
     this.clearOutputBuffer(client)
     term.clients.delete(client)
+    term.suppressedOutputClients.delete(client)
     term.pendingSnapshotClients.delete(client)
     return true
   }
@@ -1117,6 +1123,7 @@ export class TerminalRegistry extends EventEmitter {
       this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: term.exitCode })
     }
     term.clients.clear()
+    term.suppressedOutputClients.clear()
     term.pendingSnapshotClients.clear()
     this.releaseBinding(terminalId)
     this.emit('terminal.exit', { terminalId, exitCode: term.exitCode })
