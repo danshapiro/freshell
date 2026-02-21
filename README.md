@@ -35,6 +35,13 @@
 - **Mobile responsive** — Auto-collapsing sidebar and overlay navigation for phones and tablets
 - **Auto-update** — Checks for new releases on startup and offers one-key upgrade
 
+### Terminal Streaming (Protocol v2)
+
+- Terminal attach/reconnect uses sequence replay (`sinceSeq`) instead of snapshot/chunk handshakes.
+- Server streams `terminal.output` frames with monotonic `seqStart`/`seqEnd` ranges.
+- If output must be dropped under pressure, server emits `terminal.output.gap` and keeps the socket alive.
+- Terminal create/attach no longer emits `terminal.attached*` or `terminal.snapshot` messages.
+
 ## Quick Start
 
 ```bash

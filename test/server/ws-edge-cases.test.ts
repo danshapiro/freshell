@@ -245,7 +245,6 @@ describe('WebSocket edge cases', () => {
     process.env.AUTH_TOKEN = 'testtoken-testtoken'
     process.env.HELLO_TIMEOUT_MS = '500' // Longer timeout for edge case tests
     process.env.MAX_CONNECTIONS = '5'
-    process.env.MAX_WS_ATTACH_CHUNK_BYTES = '16384'
 
     ;({ WsHandler } = await import('../../server/ws-handler'))
     server = http.createServer((_req, res) => {
@@ -934,7 +933,7 @@ describe('WebSocket edge cases', () => {
   })
 
   describe('Attach replay protocol v2', () => {
-    it('replays buffered output without legacy terminal.attached frames', async () => {
+    it('no legacy attach chunk messages are emitted during replay', async () => {
       const { ws: ws1, close: close1 } = await createAuthenticatedConnection()
       const terminalId = await createTerminal(ws1, 'attach-v2-replay')
       registry.simulateOutput(terminalId, 'x'.repeat(70_000))

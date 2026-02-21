@@ -370,32 +370,6 @@ export type TerminalAttachReadyMessage = {
   replayToSeq: number
 }
 
-export type TerminalAttachedMessage = {
-  type: 'terminal.attached'
-  terminalId: string
-  snapshot: string
-}
-
-export type TerminalAttachedStartMessage = {
-  type: 'terminal.attached.start'
-  terminalId: string
-  totalCodeUnits: number
-  totalChunks: number
-}
-
-export type TerminalAttachedChunkMessage = {
-  type: 'terminal.attached.chunk'
-  terminalId: string
-  chunk: string
-}
-
-export type TerminalAttachedEndMessage = {
-  type: 'terminal.attached.end'
-  terminalId: string
-  totalCodeUnits: number
-  totalChunks: number
-}
-
 export type TerminalDetachedMessage = {
   type: 'terminal.detached'
   terminalId: string
@@ -421,15 +395,6 @@ export type TerminalOutputGapMessage = {
   fromSeq: number
   toSeq: number
   reason: 'queue_overflow' | 'replay_window_exceeded'
-}
-
-export type TerminalSnapshotMessage = {
-  // Reserved for compatibility with older/experimental clients that expect
-  // a standalone snapshot frame. Current server flow uses terminal.attached*
-  // and terminal.created snapshot payloads instead.
-  type: 'terminal.snapshot'
-  terminalId: string
-  snapshot: string
 }
 
 export type TerminalTitleUpdatedMessage = {
@@ -627,15 +592,10 @@ export type ServerMessage =
   | ErrorMessage
   | TerminalCreatedMessage
   | TerminalAttachReadyMessage
-  | TerminalAttachedMessage
-  | TerminalAttachedStartMessage
-  | TerminalAttachedChunkMessage
-  | TerminalAttachedEndMessage
   | TerminalDetachedMessage
   | TerminalExitMessage
   | TerminalOutputMessage
   | TerminalOutputGapMessage
-  | TerminalSnapshotMessage
   | TerminalTitleUpdatedMessage
   | TerminalSessionAssociatedMessage
   | TerminalListUpdatedMessage

@@ -593,28 +593,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     setPendingOsc52Event(event)
   }, [attemptOsc52ClipboardWrite])
 
-  const handleTerminalSnapshot = useCallback((snapshot: string | undefined, term: Terminal) => {
-    const osc = extractOsc52Events(snapshot ?? '', createOsc52ParserState())
-    const queue = writeQueueRef.current
-    if (queue) {
-      queue.enqueueTask(() => {
-        try { term.clear() } catch { /* disposed */ }
-      })
-    } else {
-      try { term.clear() } catch { /* disposed */ }
-    }
-    if (osc.cleaned) {
-      enqueueTerminalWrite(osc.cleaned, () => {
-        requestTerminalLayout({ scrollToBottom: true })
-      })
-    } else {
-      requestTerminalLayout({ scrollToBottom: true })
-    }
-    for (const event of osc.events) {
-      handleOsc52Event(event)
-    }
-  }, [enqueueTerminalWrite, handleOsc52Event, requestTerminalLayout])
-
   const handleTerminalOutput = useCallback((raw: string, mode: TerminalPaneContent['mode'], tid?: string) => {
     const osc = extractOsc52Events(raw, osc52ParserRef.current)
     const { cleaned, count } = extractTurnCompleteSignals(osc.cleaned, mode, turnCompleteSignalStateRef.current)
@@ -1215,10 +1193,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           updateContent({ status: 'running' })
         }
 
-        if (msg.type === 'terminal.snapshot' && msg.terminalId === tid) {
-          handleTerminalSnapshot(msg.snapshot, term)
-        }
-
         if (msg.type === 'terminal.created' && msg.requestId === reqId) {
           clearRateLimitRetry()
           const newId = msg.terminalId as string
@@ -1435,7 +1409,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     ws,
     dispatch,
     handleTerminalOutput,
-    handleTerminalSnapshot,
   ])
 
   const mobileToolbarBottomPx = isMobile ? keyboardInsetPx : 0

@@ -106,7 +106,7 @@ export default function Sidebar({
       if (msg.type === 'terminal.list.response' && msg.requestId === requestIdRef.current) {
         setTerminals(msg.terminals || [])
       }
-      if (['terminal.detached', 'terminal.attached', 'terminal.exit', 'terminal.list.updated'].includes(msg.type)) {
+      if (['terminal.detached', 'terminal.attach.ready', 'terminal.exit', 'terminal.list.updated'].includes(msg.type)) {
         refresh()
       }
     })

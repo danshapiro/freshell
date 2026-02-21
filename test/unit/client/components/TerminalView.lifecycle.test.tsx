@@ -1684,9 +1684,8 @@ describe('TerminalView lifecycle updates', () => {
       expect(store.getState().turnCompletion.lastEvent).toBeNull()
     })
 
-    it('sanitizes terminal.snapshot replay and does not emit turn completion', async () => {
+    it('ignores legacy terminal.snapshot frames', async () => {
       const { tabId, paneId, paneContent, store } = setupTerminal()
-      const osc52 = '\u001b]52;c;Y29weQ==\u0007'
 
       render(
         <Provider store={store}>
@@ -1715,12 +1714,12 @@ describe('TerminalView lifecycle updates', () => {
         messageHandler!({
           type: 'terminal.snapshot',
           terminalId: 'term-1',
-          snapshot: `snap${osc52}shot`,
+          snapshot: 'legacy snapshot payload',
         })
       })
 
-      expect(term.clear).toHaveBeenCalled()
-      expect(term.write).toHaveBeenCalledWith('snapshot', expect.any(Function))
+      expect(term.clear).not.toHaveBeenCalled()
+      expect(term.write).not.toHaveBeenCalled()
       expect(store.getState().turnCompletion.lastEvent).toBeNull()
     })
   })

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from 'vitest'
 import http from 'http'
 import WebSocket from 'ws'
+import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol.js'
 
 const TEST_TIMEOUT_MS = 30_000
 const HOOK_TIMEOUT_MS = 30_000
@@ -265,7 +266,7 @@ describe('ws protocol', () => {
       ws.on('close', (code) => resolve({ code }))
     })
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({ type: 'hello', token: 'wrong' }))
+    ws.send(JSON.stringify({ type: 'hello', token: 'wrong', protocolVersion: WS_PROTOCOL_VERSION }))
     const result = await close
     expect(result.code).toBe(4001)
   })
@@ -273,7 +274,7 @@ describe('ws protocol', () => {
   it('accepts valid hello and responds ready', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
 
     const ready = await new Promise<any>((resolve) => {
       ws.on('message', (data) => {
@@ -292,6 +293,7 @@ describe('ws protocol', () => {
     ws.send(JSON.stringify({
       type: 'hello',
       token: 'testtoken-testtoken',
+      protocolVersion: WS_PROTOCOL_VERSION,
       capabilities: { sessionsPatchV1: true },
     }))
 
@@ -316,6 +318,7 @@ describe('ws protocol', () => {
     ws.send(JSON.stringify({
       type: 'hello',
       token: 'testtoken-testtoken',
+      protocolVersion: WS_PROTOCOL_VERSION,
       client: { mobile: true },
     }))
     await waitForMessage(ws, (msg) => msg.type === 'ready', 5000)
@@ -340,7 +343,7 @@ describe('ws protocol', () => {
   it('creates a terminal and returns terminal.created', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
 
     await new Promise<void>((resolve) => {
       ws.on('message', (data) => {
@@ -366,7 +369,7 @@ describe('ws protocol', () => {
   it('accepts shell parameter with system default', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
 
     await new Promise<void>((resolve) => {
       ws.on('message', (data) => {
@@ -393,7 +396,7 @@ describe('ws protocol', () => {
   it('accepts explicit shell parameter', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
 
     await new Promise<void>((resolve) => {
       ws.on('message', (data) => {
@@ -422,7 +425,7 @@ describe('ws protocol', () => {
   async function createAuthenticatedConnection(): Promise<{ ws: WebSocket; close: () => Promise<void> }> {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
 
     await waitForMessage(ws, (msg) => msg.type === 'ready', 5000)
 
@@ -478,16 +481,17 @@ describe('ws protocol', () => {
 
     ws2.send(JSON.stringify({ type: 'terminal.attach', terminalId }))
 
-    const attached = await new Promise<any>((resolve) => {
+    const ready = await new Promise<any>((resolve) => {
       ws2.on('message', (data) => {
         const msg = JSON.parse(data.toString())
-        if (msg.type === 'terminal.attached') resolve(msg)
+        if (msg.type === 'terminal.attach.ready' && msg.terminalId === terminalId) resolve(msg)
       })
     })
 
-    expect(attached.type).toBe('terminal.attached')
-    expect(attached.terminalId).toBe(terminalId)
-    expect(attached.snapshot).toBeDefined()
+    expect(ready.type).toBe('terminal.attach.ready')
+    expect(ready.terminalId).toBe(terminalId)
+    expect(typeof ready.replayFromSeq).toBe('number')
+    expect(typeof ready.replayToSeq).toBe('number')
 
     await close()
     await close2()
@@ -796,7 +800,7 @@ describe('ws protocol', () => {
   it('rate limits terminal.create after too many requests', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
 
     await new Promise<void>((resolve) => {
       ws.on('message', (data) => {
@@ -834,7 +838,7 @@ describe('ws protocol', () => {
   it('does not rate limit restored terminal.create requests', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
 
     await new Promise<void>((resolve) => {
       ws.on('message', (data) => {
@@ -872,7 +876,7 @@ describe('ws protocol', () => {
   it('does not rate-count deduped terminal.create requests', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
 
     await new Promise<void>((resolve) => {
       ws.on('message', (data) => {
