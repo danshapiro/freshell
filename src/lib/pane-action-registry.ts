@@ -18,7 +18,7 @@ export type EditorActions = {
   togglePreview: () => void
   copyPath: () => Promise<void> | void
   revealInExplorer: () => Promise<void> | void
-  openWithSystemViewer: () => Promise<void> | void
+  openInEditor: () => Promise<void> | void
 }
 
 export type BrowserActions = {

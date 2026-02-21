@@ -85,6 +85,10 @@ const DEFAULT_OPTIONS: ClientLoggerOptions = {
 }
 
 const CONSOLE_METHODS = ['log', 'info', 'warn', 'error', 'debug', 'trace', 'table', 'dir'] as const
+const DEDUPE_WINDOW_MS = 5000
+const MAX_DEDUPE_FINGERPRINTS = 2000
+const SLOW_FLUSH_THRESHOLD_MS = 1500
+const SLOW_FLUSH_BACKOFF_MS = 5000
 
 type ConsoleMethod = typeof CONSOLE_METHODS[number]
 
@@ -194,6 +198,59 @@ function buildClientInfo(): ClientInfo {
   }
 }
 
+function isPerfFlaggedObject(value: unknown): boolean {
+  return !!value
+    && typeof value === 'object'
+    && (value as { perf?: unknown }).perf === true
+}
+
+function isPerfTelemetryEntry(entry: ClientLogEntry): boolean {
+  if (!entry.event?.startsWith('console.')) return false
+  return (entry.args || []).some((arg) => isPerfFlaggedObject(arg))
+}
+
+function fingerprintForEntry(entry: ClientLogEntry): string {
+  const eventKey = entry.event || entry.consoleMethod || 'unknown'
+  const messageKey = entry.message || ''
+  const primaryArg = entry.args?.[0]
+  const primaryArgKey = typeof primaryArg === 'string'
+    ? primaryArg
+    : JSON.stringify(primaryArg ?? null)
+  return `${entry.severity}:${eventKey}:${messageKey}:${primaryArgKey}`
+}
+
+function shouldDropDuplicateEntry(entry: ClientLogEntry, recentByFingerprint: Map<string, number>): boolean {
+  const now = Date.now()
+  const staleFingerprints: string[] = []
+  for (const [fingerprint, lastSeenAt] of recentByFingerprint) {
+    if (now - lastSeenAt >= DEDUPE_WINDOW_MS) {
+      staleFingerprints.push(fingerprint)
+    }
+  }
+  for (const fingerprint of staleFingerprints) {
+    recentByFingerprint.delete(fingerprint)
+  }
+
+  const fingerprint = fingerprintForEntry(entry)
+  const previousSeenAt = recentByFingerprint.get(fingerprint)
+  recentByFingerprint.set(fingerprint, now)
+
+  while (recentByFingerprint.size > MAX_DEDUPE_FINGERPRINTS) {
+    let oldestFingerprint: string | null = null
+    let oldestSeenAt = Number.POSITIVE_INFINITY
+    for (const [seenFingerprint, seenAt] of recentByFingerprint) {
+      if (seenAt < oldestSeenAt) {
+        oldestSeenAt = seenAt
+        oldestFingerprint = seenFingerprint
+      }
+    }
+    if (!oldestFingerprint) break
+    recentByFingerprint.delete(oldestFingerprint)
+  }
+
+  return typeof previousSeenAt === 'number' && now - previousSeenAt < DEDUPE_WINDOW_MS
+}
+
 export function createClientLogger(options: Partial<ClientLoggerOptions> = {}) {
   const settings = { ...DEFAULT_OPTIONS, ...options }
   const client = buildClientInfo()
@@ -203,8 +260,13 @@ export function createClientLogger(options: Partial<ClientLoggerOptions> = {}) {
   let droppedCount = 0
   let uninstallHandlers: Array<() => void> = []
   let consoleInstalled = false
+  let nextFlushAllowedAt = 0
+  const recentByFingerprint = new Map<string, number>()
 
   function enqueue(entry: ClientLogEntry) {
+    if (isPerfTelemetryEntry(entry)) return
+    if (shouldDropDuplicateEntry(entry, recentByFingerprint)) return
+
     if (queue.length >= settings.maxQueueSize) {
       queue.shift()
       droppedCount += 1
@@ -283,6 +345,10 @@ export function createClientLogger(options: Partial<ClientLoggerOptions> = {}) {
   async function flush(options: FlushOptions = {}) {
     if (flushing) return
     if (queue.length === 0) return
+    if (!options.useBeacon && Date.now() < nextFlushAllowedAt) {
+      scheduleFlush(Math.max(0, nextFlushAllowedAt - Date.now()))
+      return
+    }
 
     flushing = true
     enqueueDropNotice()
@@ -290,7 +356,12 @@ export function createClientLogger(options: Partial<ClientLoggerOptions> = {}) {
     const batch = queue.splice(0, settings.maxBatchSize)
 
     try {
+      const startedAt = performance.now()
       await sendBatch(batch, options)
+      const durationMs = performance.now() - startedAt
+      if (!options.useBeacon && durationMs >= SLOW_FLUSH_THRESHOLD_MS) {
+        nextFlushAllowedAt = Date.now() + SLOW_FLUSH_BACKOFF_MS
+      }
     } catch {
       // On failure, re-queue and try again later.
       queue.unshift(...batch)

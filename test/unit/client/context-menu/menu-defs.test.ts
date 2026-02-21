@@ -37,7 +37,7 @@ function createActions(): MenuActions {
       copy: vi.fn(),
       paste: vi.fn(),
       selectAll: vi.fn(),
-      openWithSystemViewer: vi.fn(),
+      openInEditor: vi.fn(),
       saveNow: vi.fn(),
       togglePreview: vi.fn(),
       copyPath: vi.fn(),

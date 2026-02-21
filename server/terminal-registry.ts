@@ -23,6 +23,7 @@ const MAX_TERMINALS = Number(process.env.MAX_TERMINALS || 50)
 const DEFAULT_MAX_PENDING_SNAPSHOT_CHARS = 512 * 1024
 const OUTPUT_FLUSH_MS = Number(process.env.OUTPUT_FLUSH_MS || process.env.MOBILE_OUTPUT_FLUSH_MS || 40)
 const MAX_OUTPUT_BUFFER_CHARS = Number(process.env.MAX_OUTPUT_BUFFER_CHARS || process.env.MAX_MOBILE_OUTPUT_BUFFER_CHARS || 256 * 1024)
+const MAX_OUTPUT_FRAME_CHARS = Math.max(1, Number(process.env.MAX_OUTPUT_FRAME_CHARS || 8192))
 const perfConfig = getPerfConfig()
 
 // TerminalMode includes 'shell' for regular terminals, plus coding CLI providers.
@@ -1194,9 +1195,29 @@ export class TerminalRegistry extends EventEmitter {
       if (chunks.length === 0) continue
       const data = chunks.join('')
       const perf = pending.perfByTerminal.get(terminalId)
-      this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf })
+      this.safeSendOutputFrames(client, terminalId, data, perf)
     }
     this.outputBuffers.delete(client)
+  }
+
+  private safeSendOutputFrames(
+    client: WebSocket,
+    terminalId: string,
+    data: string,
+    perf?: TerminalRecord['perf'],
+  ): void {
+    if (!data) return
+    for (let offset = 0; offset < data.length; offset += MAX_OUTPUT_FRAME_CHARS) {
+      this.safeSend(
+        client,
+        {
+          type: 'terminal.output',
+          terminalId,
+          data: data.slice(offset, offset + MAX_OUTPUT_FRAME_CHARS),
+        },
+        { terminalId, perf },
+      )
+    }
   }
 
   private sendTerminalOutput(client: WebSocket, terminalId: string, data: string, perf?: TerminalRecord['perf']): void {
@@ -1204,7 +1225,7 @@ export class TerminalRegistry extends EventEmitter {
     // This avoids queueing additional data for clients that need explicit resync.
     const buffered = (client as any).bufferedAmount as number | undefined
     if (typeof buffered === 'number' && buffered > MAX_WS_BUFFERED_AMOUNT) {
-      this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf })
+      this.safeSendOutputFrames(client, terminalId, data, perf)
       return
     }
 
@@ -1212,7 +1233,7 @@ export class TerminalRegistry extends EventEmitter {
     const shouldBatch = this.isMobileClient(client) || !!pendingExisting || this.hasClientBacklog(client)
 
     if (!shouldBatch) {
-      this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf })
+      this.safeSendOutputFrames(client, terminalId, data, perf)
       return
     }
 
@@ -1230,7 +1251,7 @@ export class TerminalRegistry extends EventEmitter {
     const nextSize = pending.queuedChars + data.length
     if (nextSize > MAX_OUTPUT_BUFFER_CHARS) {
       this.flushOutputBuffer(client)
-      this.safeSend(client, { type: 'terminal.output', terminalId, data }, { terminalId, perf })
+      this.safeSendOutputFrames(client, terminalId, data, perf)
       return
     }
 

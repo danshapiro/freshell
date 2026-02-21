@@ -234,6 +234,90 @@ describe('TerminalRegistry Lifecycle', () => {
       expect(outputs[0].data).toBe('hello mobile')
     })
 
+    it('splits oversized terminal.output payloads into bounded frames while preserving order', () => {
+      const term = registry.create({ mode: 'shell' })
+      const pty = mockPtyProcess.instances[0]
+      const client = createMockWebSocket()
+
+      registry.attach(term.terminalId, client)
+
+      const payload = 'x'.repeat(20_000)
+      pty._emitData(payload)
+
+      const sent = (client.send as Mock).mock.calls.map((call) => JSON.parse(call[0]))
+      const outputs = sent.filter((m) => m.type === 'terminal.output')
+      expect(outputs.length).toBeGreaterThan(1)
+      expect(outputs.every((m) => typeof m.data === 'string' && m.data.length <= 8192)).toBe(true)
+      expect(outputs.map((m) => m.data).join('')).toBe(payload)
+    })
+
+    it('splits oversized output frames on the immediate backpressure path', () => {
+      const term = registry.create({ mode: 'shell' })
+      const pty = mockPtyProcess.instances[0]
+      const client = createMockWebSocket()
+      let readCount = 0
+      Object.defineProperty(client, 'bufferedAmount', {
+        configurable: true,
+        get: () => {
+          readCount += 1
+          return readCount === 1 ? 3 * 1024 * 1024 : 0
+        },
+      })
+
+      registry.attach(term.terminalId, client)
+
+      const payload = 'p'.repeat(20_000)
+      pty._emitData(payload)
+
+      const sent = (client.send as Mock).mock.calls.map((call) => JSON.parse(call[0]))
+      const outputs = sent.filter((m) => m.type === 'terminal.output')
+      expect(outputs.length).toBeGreaterThan(1)
+      expect(outputs.every((m) => typeof m.data === 'string' && m.data.length <= 8192)).toBe(true)
+      expect(outputs.map((m) => m.data).join('')).toBe(payload)
+    })
+
+    it('splits joined mobile flush payloads into bounded output frames', () => {
+      const term = registry.create({ mode: 'shell' })
+      const pty = mockPtyProcess.instances[0]
+      const mobileClient = createMockWebSocket({ isMobileClient: true })
+
+      registry.attach(term.terminalId, mobileClient)
+
+      const first = 'a'.repeat(10_000)
+      const second = 'b'.repeat(10_000)
+      pty._emitData(first)
+      pty._emitData(second)
+
+      expect(mobileClient.send).not.toHaveBeenCalled()
+
+      vi.advanceTimersByTime(50)
+
+      const sent = (mobileClient.send as Mock).mock.calls.map((call) => JSON.parse(call[0]))
+      const outputs = sent.filter((m) => m.type === 'terminal.output')
+      expect(outputs.length).toBeGreaterThan(1)
+      expect(outputs.every((m) => typeof m.data === 'string' && m.data.length <= 8192)).toBe(true)
+      expect(outputs.map((m) => m.data).join('')).toBe(first + second)
+    })
+
+    it('splits overflow-path output frames after flushing pending batches', () => {
+      const term = registry.create({ mode: 'shell' })
+      const pty = mockPtyProcess.instances[0]
+      const mobileClient = createMockWebSocket({ isMobileClient: true })
+
+      registry.attach(term.terminalId, mobileClient)
+
+      const first = 'f'.repeat(200_000)
+      const second = 's'.repeat(100_000)
+      pty._emitData(first)
+      pty._emitData(second)
+
+      const sent = (mobileClient.send as Mock).mock.calls.map((call) => JSON.parse(call[0]))
+      const outputs = sent.filter((m) => m.type === 'terminal.output')
+      expect(outputs.length).toBeGreaterThan(1)
+      expect(outputs.every((m) => typeof m.data === 'string' && m.data.length <= 8192)).toBe(true)
+      expect(outputs.map((m) => m.data).join('')).toBe(first + second)
+    })
+
     it('batches terminal.output frames for non-mobile clients under send backpressure', () => {
       const term = registry.create({ mode: 'shell' })
       const pty = mockPtyProcess.instances[0]

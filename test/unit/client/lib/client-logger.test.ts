@@ -48,4 +48,42 @@ describe('client logger', () => {
     expect(body.entries[0].severity).toBe('warn')
     expect(body.entries[0].message).toContain('Heads up')
   })
+
+  it('does not enqueue perf telemetry payloads for remote transport', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: true })
+
+    const logger = createClientLogger({
+      flushIntervalMs: 0,
+      maxBatchSize: 10,
+      enableNetwork: true,
+    })
+    const uninstall = logger.installConsoleCapture()
+
+    console.warn({ event: 'perf.longtask', perf: true, durationMs: 120 })
+    await logger.flush()
+
+    uninstall()
+    expect(mockFetch).not.toHaveBeenCalled()
+  })
+
+  it('drops duplicate warning entries within the dedupe window', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: true })
+
+    const logger = createClientLogger({
+      flushIntervalMs: 0,
+      maxBatchSize: 10,
+      enableNetwork: true,
+    })
+    const uninstall = logger.installConsoleCapture()
+
+    console.warn('[ChunkedAttach] noisy warning')
+    console.warn('[ChunkedAttach] noisy warning')
+    await logger.flush()
+    uninstall()
+
+    expect(mockFetch).toHaveBeenCalledTimes(1)
+    const [, options] = mockFetch.mock.calls[0]
+    const body = JSON.parse(options.body as string)
+    expect(body.entries).toHaveLength(1)
+  })
 })

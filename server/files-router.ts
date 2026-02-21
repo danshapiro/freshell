@@ -1,7 +1,6 @@
 import express, { type Request, type Response, type NextFunction } from 'express'
 import fsp from 'fs/promises'
 import path from 'path'
-import { spawn } from 'child_process'
 import {
   getPathModuleForFlavor,
   isPathAllowed,
@@ -10,6 +9,8 @@ import {
   toFilesystemPath,
 } from './path-utils.js'
 import { configStore } from './config-store.js'
+import { detectPlatform } from './platform.js'
+import { resolveOpenCommand, spawnAndMonitor } from './file-opener.js'
 
 export const filesRouter = express.Router()
 
@@ -173,7 +174,7 @@ filesRouter.post('/validate-dir', validatePath, async (req, res) => {
 })
 
 filesRouter.post('/open', validatePath, async (req, res) => {
-  const { path: filePath, reveal } = req.body || {}
+  const { path: filePath, reveal, line, column } = req.body || {}
   if (!filePath) {
     return res.status(400).json({ error: 'path is required' })
   }
@@ -189,32 +190,22 @@ filesRouter.post('/open', validatePath, async (req, res) => {
     return res.status(500).json({ error: err.message })
   }
 
-  const platform = process.platform
-  let command: string
-  let args: string[] = []
+  const settings = await configStore.getSettings()
+  const platform = await detectPlatform()
 
-  if (platform === 'win32') {
-    if (reveal) {
-      command = 'explorer.exe'
-      args = ['/select,', resolved]
-    } else {
-      command = 'cmd'
-      args = ['/c', 'start', '', resolved]
-    }
-  } else if (platform === 'darwin') {
-    command = 'open'
-    args = reveal ? ['-R', resolved] : [resolved]
-  } else {
-    command = 'xdg-open'
-    const target = reveal ? path.dirname(resolved) : resolved
-    args = [target]
-  }
+  const cmd = await resolveOpenCommand({
+    filePath: resolved,
+    reveal,
+    line: typeof line === 'number' ? line : undefined,
+    column: typeof column === 'number' ? column : undefined,
+    editorSetting: settings.editor?.externalEditor,
+    customEditorCommand: settings.editor?.customEditorCommand,
+    platform,
+  })
 
-  try {
-    const child = spawn(command, args, { detached: true, stdio: 'ignore' })
-    child.unref()
-    return res.json({ ok: true })
-  } catch (err: any) {
-    return res.status(500).json({ error: err.message })
+  const result = await spawnAndMonitor(cmd)
+  if (!result.ok) {
+    return res.status(502).json({ error: result.error })
   }
+  return res.json({ ok: true })
 })

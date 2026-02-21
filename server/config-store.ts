@@ -87,6 +87,10 @@ export type AppSettings = {
       cwd?: string
     }>>
   }
+  editor: {
+    externalEditor: 'auto' | 'cursor' | 'code' | 'custom'
+    customEditorCommand?: string
+  }
   freshclaude?: {
     defaultModel?: string
     defaultPermissionMode?: string
@@ -178,6 +182,9 @@ export const defaultSettings: AppSettings = {
       },
       codex: {},
     },
+  },
+  editor: {
+    externalEditor: 'auto',
   },
   freshclaude: {},
   network: {
@@ -412,6 +419,7 @@ function mergeSettings(base: AppSettings, patch: AppSettingsPatch): AppSettings 
         ...(patch.codingCli?.providers || {}),
       },
     },
+    editor: { ...base.editor, ...(patch.editor || {}) },
     freshclaude: { ...base.freshclaude, ...(patch.freshclaude || {}) },
     network: {
       ...base.network,

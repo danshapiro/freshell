@@ -162,6 +162,10 @@ export interface AppSettings {
     tabAttentionStyle: TabAttentionStyle
     attentionDismiss: AttentionDismiss
   }
+  editor: {
+    externalEditor: 'auto' | 'cursor' | 'code' | 'custom'
+    customEditorCommand?: string
+  }
   freshclaude?: {
     defaultModel?: string
     defaultPermissionMode?: string
