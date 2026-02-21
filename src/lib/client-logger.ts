@@ -235,9 +235,17 @@ function shouldDropDuplicateEntry(entry: ClientLogEntry, recentByFingerprint: Ma
   const previousSeenAt = recentByFingerprint.get(fingerprint)
   recentByFingerprint.set(fingerprint, now)
 
-  if (recentByFingerprint.size > MAX_DEDUPE_FINGERPRINTS) {
-    const oldest = recentByFingerprint.keys().next().value
-    if (typeof oldest === 'string') recentByFingerprint.delete(oldest)
+  while (recentByFingerprint.size > MAX_DEDUPE_FINGERPRINTS) {
+    let oldestFingerprint: string | null = null
+    let oldestSeenAt = Number.POSITIVE_INFINITY
+    for (const [seenFingerprint, seenAt] of recentByFingerprint) {
+      if (seenAt < oldestSeenAt) {
+        oldestSeenAt = seenAt
+        oldestFingerprint = seenFingerprint
+      }
+    }
+    if (!oldestFingerprint) break
+    recentByFingerprint.delete(oldestFingerprint)
   }
 
   return typeof previousSeenAt === 'number' && now - previousSeenAt < DEDUPE_WINDOW_MS

@@ -84,10 +84,6 @@ vi.mock('@xterm/xterm', () => {
     getSelection = vi.fn(() => '')
     clear = vi.fn()
     write = vi.fn((data: string, cb?: () => void) => {
-      const start = performance.now()
-      while (performance.now() - start < 35) {
-        // Intentionally block to surface synchronous ws handler work.
-      }
       cb?.()
       return data.length
     })

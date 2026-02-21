@@ -501,21 +501,23 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
     const runtime = runtimeRef.current
     const pending = pendingLayoutWorkRef.current
-    pendingLayoutWorkRef.current = {
-      fit: false,
-      resize: false,
-      scrollToBottom: false,
-      focus: false,
-    }
+    const shouldFit = pending.fit
+    const shouldResize = pending.resize
+    const shouldScrollToBottom = pending.scrollToBottom
+    const shouldFocus = pending.focus
+    pending.fit = false
+    pending.resize = false
+    pending.scrollToBottom = false
+    pending.focus = false
 
-    if (pending.fit && !hiddenRef.current && runtime) {
+    if (shouldFit && !hiddenRef.current && runtime) {
       try {
         runtime.fit()
       } catch {
         // disposed
       }
 
-      if (pending.resize) {
+      if (shouldResize) {
         const tid = terminalIdRef.current
         if (tid) {
           ws.send({ type: 'terminal.resize', terminalId: tid, cols: term.cols, rows: term.rows })
@@ -523,10 +525,10 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       }
     }
 
-    if (pending.scrollToBottom) {
+    if (shouldScrollToBottom) {
       try { term.scrollToBottom() } catch { /* disposed */ }
     }
-    if (pending.focus) {
+    if (shouldFocus) {
       term.focus()
     }
   }, [ws])
