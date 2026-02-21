@@ -16,17 +16,27 @@ const wsMocks = vi.hoisted(() => ({
   onReconnect: vi.fn(() => vi.fn()),
 }))
 
+const runtimeMocks = vi.hoisted(() => ({
+  instances: [] as Array<{
+    fit: ReturnType<typeof vi.fn>
+  }>,
+}))
+
 vi.mock('@/components/terminal/terminal-runtime', () => ({
-  createTerminalRuntime: () => ({
-    attachAddons: vi.fn(),
-    fit: vi.fn(),
-    findNext: vi.fn(() => false),
-    findPrevious: vi.fn(() => false),
-    clearDecorations: vi.fn(),
-    onDidChangeResults: vi.fn(() => ({ dispose: vi.fn() })),
-    dispose: vi.fn(),
-    webglActive: vi.fn(() => false),
-  }),
+  createTerminalRuntime: () => {
+    const runtime = {
+      attachAddons: vi.fn(),
+      fit: vi.fn(),
+      findNext: vi.fn(() => false),
+      findPrevious: vi.fn(() => false),
+      clearDecorations: vi.fn(),
+      onDidChangeResults: vi.fn(() => ({ dispose: vi.fn() })),
+      dispose: vi.fn(),
+      webglActive: vi.fn(() => false),
+    }
+    runtimeMocks.instances.push(runtime)
+    return runtime
+  },
 }))
 
 vi.mock('@xterm/xterm', () => ({
@@ -146,6 +156,7 @@ describe('TerminalView mobile viewport handling', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    runtimeMocks.instances.length = 0
     ;(globalThis as any).setMobileForTest(false)
     originalVisualViewport = window.visualViewport
     originalInnerHeight = window.innerHeight
@@ -339,5 +350,69 @@ describe('TerminalView mobile viewport handling', () => {
     const contextMenuEvent = new MouseEvent('contextmenu', { bubbles: true, cancelable: true })
     const dispatchResult = up.dispatchEvent(contextMenuEvent)
     expect(dispatchResult).toBe(false)
+  })
+
+  it('coalesces resize bursts into one fit/resize operation per frame', async () => {
+    const resizeObserverCallbacks: Array<() => void> = []
+    class MockResizeObserver {
+      constructor(cb: ResizeObserverCallback) {
+        resizeObserverCallbacks.push(() => cb([], this as unknown as ResizeObserver))
+      }
+      observe = vi.fn()
+      disconnect = vi.fn()
+      unobserve = vi.fn()
+    }
+    vi.stubGlobal('ResizeObserver', MockResizeObserver)
+
+    const pendingRaf: FrameRequestCallback[] = []
+    requestAnimationFrameSpy?.mockImplementation((cb: FrameRequestCallback) => {
+      pendingRaf.push(cb)
+      return pendingRaf.length
+    })
+
+    const viewport = createVisualViewportMock(860, 0)
+    Object.defineProperty(window, 'visualViewport', { value: viewport, configurable: true })
+    Object.defineProperty(window, 'innerHeight', { value: 900, configurable: true })
+    ;(globalThis as any).setMobileForTest(true)
+
+    const store = createStore()
+    render(
+      <Provider store={store}>
+        <TerminalView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{ ...createTerminalContent(), terminalId: 'term-1' }}
+          hidden={false}
+        />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(runtimeMocks.instances.length).toBeGreaterThan(0)
+      expect(resizeObserverCallbacks.length).toBeGreaterThan(0)
+    })
+
+    const runtime = runtimeMocks.instances[0]
+    while (pendingRaf.length > 0) {
+      pendingRaf.shift()?.(0)
+    }
+    runtime.fit.mockClear()
+    wsMocks.send.mockClear()
+
+    resizeObserverCallbacks[0]()
+    resizeObserverCallbacks[0]()
+    resizeObserverCallbacks[0]()
+
+    expect(runtime.fit).not.toHaveBeenCalled()
+
+    while (pendingRaf.length > 0) {
+      pendingRaf.shift()?.(16)
+    }
+
+    expect(runtime.fit).toHaveBeenCalledTimes(1)
+    const resizeMessages = wsMocks.send.mock.calls
+      .map((call) => call[0] as { type?: string; terminalId?: string })
+      .filter((msg) => msg.type === 'terminal.resize' && msg.terminalId === 'term-1')
+    expect(resizeMessages).toHaveLength(1)
   })
 })
