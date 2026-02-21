@@ -582,10 +582,11 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
         payload?.terminalId === 'term-replay' &&
         level === 'warn',
       )).toBe(true)
-      expect(perfSpy.mock.calls.some(([event, payload]) =>
+      expect(perfSpy.mock.calls.some(([event, payload, level]) =>
         event === 'terminal_stream_gap' &&
         payload?.terminalId === 'term-replay' &&
-        payload?.reason === 'replay_window_exceeded',
+        payload?.reason === 'replay_window_exceeded' &&
+        level === 'warn',
       )).toBe(true)
 
       broker.close()
