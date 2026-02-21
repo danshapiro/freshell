@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import express from 'express'
 import request from 'supertest'
@@ -14,7 +15,7 @@ vi.mock('../../../server/logger', () => ({
   },
 }))
 
-// Mock configStore
+// Mock configStore (still needed as fallback for any transitive imports)
 const mockGetSettings = vi.fn()
 vi.mock('../../../server/config-store', () => ({
   configStore: {
@@ -58,12 +59,28 @@ vi.mock('child_process', async (importOriginal) => {
 })
 
 // Import after mocks are set up
-const { filesRouter } = await import('../../../server/files-router')
+const { createFilesRouter } = await import('../../../server/files-router')
+
+/** Returns a mock ChildProcess that stays alive (exit with code 0 after next tick) */
+function mockChildProcess() {
+  return {
+    unref: vi.fn(),
+    on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+      // Simulate successful process: exit with code 0 after microtask
+      if (event === 'exit') Promise.resolve().then(() => cb(0, null))
+    }),
+    removeListener: vi.fn(),
+  }
+}
 
 function createApp() {
   const app = express()
   app.use(express.json())
-  app.use('/api/files', filesRouter)
+  app.use('/api/files', createFilesRouter({
+    configStore: { getSettings: () => mockGetSettings(), snapshot: vi.fn() },
+    codingCliIndexer: { getProjects: () => [] },
+    registry: { list: () => [] },
+  }))
   return app
 }
 
@@ -198,7 +215,7 @@ describe('files-router path validation', () => {
     it('allows opening when allowedFilePaths is undefined', async () => {
       mockGetSettings.mockResolvedValue({ allowedFilePaths: undefined })
       mockStat.mockResolvedValue({ isFile: () => true })
-      mockSpawn.mockReturnValue({ unref: vi.fn() })
+      mockSpawn.mockReturnValue(mockChildProcess())
 
       const res = await request(app)
         .post('/api/files/open')
@@ -211,7 +228,7 @@ describe('files-router path validation', () => {
     it('allows opening file inside allowed directory', async () => {
       mockGetSettings.mockResolvedValue({ allowedFilePaths: ['/home/user/projects'] })
       mockStat.mockResolvedValue({ isFile: () => true })
-      mockSpawn.mockReturnValue({ unref: vi.fn() })
+      mockSpawn.mockReturnValue(mockChildProcess())
 
       const res = await request(app)
         .post('/api/files/open')
@@ -241,6 +258,46 @@ describe('files-router path validation', () => {
 
       expect(res.status).toBe(403)
       expect(res.body.error).toBe('Path not allowed')
+    })
+
+    it('passes line and column to the opener', async () => {
+      mockGetSettings.mockResolvedValue({
+        allowedFilePaths: undefined,
+        editor: { externalEditor: 'cursor' },
+      })
+      mockStat.mockResolvedValue({ isFile: () => true })
+      mockSpawn.mockReturnValue(mockChildProcess())
+
+      const res = await request(app)
+        .post('/api/files/open')
+        .send({ path: '/home/user/file.ts', line: 42, column: 10 })
+
+      expect(res.status).toBe(200)
+      expect(mockSpawn).toHaveBeenCalledWith(
+        'cursor',
+        ['-r', '-g', '/home/user/file.ts:42:10'],
+        expect.any(Object),
+      )
+    })
+
+    it('uses configured editor setting', async () => {
+      mockGetSettings.mockResolvedValue({
+        allowedFilePaths: undefined,
+        editor: { externalEditor: 'code' },
+      })
+      mockStat.mockResolvedValue({ isFile: () => true })
+      mockSpawn.mockReturnValue(mockChildProcess())
+
+      const res = await request(app)
+        .post('/api/files/open')
+        .send({ path: '/home/user/file.ts' })
+
+      expect(res.status).toBe(200)
+      expect(mockSpawn).toHaveBeenCalledWith(
+        'code',
+        ['-g', '/home/user/file.ts'],
+        expect.any(Object),
+      )
     })
   })
 

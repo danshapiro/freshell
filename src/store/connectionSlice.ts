@@ -5,6 +5,7 @@ export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 're
 export interface ConnectionState {
   status: ConnectionStatus
   lastError?: string
+  lastErrorCode?: number
   lastReadyAt?: number
   serverInstanceId?: string
   platform: string | null
@@ -23,10 +24,17 @@ export const connectionSlice = createSlice({
   reducers: {
     setStatus: (state, action: PayloadAction<ConnectionStatus>) => {
       state.status = action.payload
-      if (action.payload === 'ready') state.lastReadyAt = Date.now()
+      if (action.payload === 'ready') {
+        state.lastReadyAt = Date.now()
+        state.lastErrorCode = undefined
+        state.lastError = undefined
+      }
     },
     setError: (state, action: PayloadAction<string | undefined>) => {
       state.lastError = action.payload
+    },
+    setErrorCode: (state, action: PayloadAction<number | undefined>) => {
+      state.lastErrorCode = action.payload
     },
     setServerInstanceId: (state, action: PayloadAction<string | undefined>) => {
       state.serverInstanceId = action.payload
@@ -40,5 +48,5 @@ export const connectionSlice = createSlice({
   },
 })
 
-export const { setStatus, setError, setServerInstanceId, setPlatform, setAvailableClis } = connectionSlice.actions
+export const { setStatus, setError, setErrorCode, setServerInstanceId, setPlatform, setAvailableClis } = connectionSlice.actions
 export default connectionSlice.reducer

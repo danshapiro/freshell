@@ -9,6 +9,17 @@ import connectionReducer from '@/store/connectionSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
 import type { TerminalPaneContent } from '@/store/paneTypes'
 
+const wsMocks = vi.hoisted(() => ({
+  send: vi.fn(),
+  connect: vi.fn(() => Promise.resolve()),
+  onMessage: vi.fn(() => vi.fn()),
+  onReconnect: vi.fn(() => vi.fn()),
+}))
+
+const runtimeMocks = vi.hoisted(() => ({
+  instances: [] as Array<{ fit: ReturnType<typeof vi.fn> }>,
+}))
+
 // Mock ResizeObserver (not available in jsdom)
 global.ResizeObserver = vi.fn().mockImplementation(() => ({
   observe: vi.fn(),
@@ -46,11 +57,28 @@ vi.mock('@xterm/addon-fit', () => ({
 // Mock ws-client
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: vi.fn(() => ({
-    send: vi.fn(),
-    onMessage: vi.fn(() => vi.fn()),
-    onReconnect: vi.fn(() => vi.fn()),
-    connect: vi.fn(() => Promise.resolve()),
+    send: wsMocks.send,
+    onMessage: wsMocks.onMessage,
+    onReconnect: wsMocks.onReconnect,
+    connect: wsMocks.connect,
   })),
+}))
+
+vi.mock('@/components/terminal/terminal-runtime', () => ({
+  createTerminalRuntime: () => {
+    const runtime = {
+      attachAddons: vi.fn(),
+      fit: vi.fn(),
+      findNext: vi.fn(() => false),
+      findPrevious: vi.fn(() => false),
+      clearDecorations: vi.fn(),
+      onDidChangeResults: vi.fn(() => ({ dispose: vi.fn() })),
+      dispose: vi.fn(),
+      webglActive: vi.fn(() => false),
+    }
+    runtimeMocks.instances.push(runtime)
+    return runtime
+  },
 }))
 
 // Must import after mocks
@@ -101,6 +129,7 @@ function createTerminalContent(): TerminalPaneContent {
 describe('TerminalView visibility CSS classes', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    runtimeMocks.instances.length = 0
   })
 
   afterEach(() => {
@@ -149,5 +178,50 @@ describe('TerminalView visibility CSS classes', () => {
 
     const wrapper = container.firstChild as HTMLElement
     expect(wrapper.className).toContain('tab-visible')
+  })
+
+  it('coalesces hidden->visible layout work into one fit/resize frame', () => {
+    const pendingRaf: FrameRequestCallback[] = []
+    const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
+      pendingRaf.push(cb)
+      return pendingRaf.length
+    })
+    const cancelRafSpy = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {})
+
+    try {
+      const store = createStore()
+      const content = { ...createTerminalContent(), terminalId: 'term-1' }
+      const { rerender } = render(
+        <Provider store={store}>
+          <TerminalView tabId="tab-1" paneId="pane-1" paneContent={content} hidden={true} />
+        </Provider>
+      )
+
+      while (pendingRaf.length > 0) {
+        pendingRaf.shift()?.(16)
+      }
+
+      const runtime = runtimeMocks.instances[0]
+      runtime.fit.mockClear()
+      wsMocks.send.mockClear()
+
+      rerender(
+        <Provider store={store}>
+          <TerminalView tabId="tab-1" paneId="pane-1" paneContent={content} hidden={false} />
+        </Provider>
+      )
+
+      expect(pendingRaf.length).toBe(1)
+      pendingRaf.shift()?.(32)
+
+      expect(runtime.fit).toHaveBeenCalledTimes(1)
+      const resizeMessages = wsMocks.send.mock.calls
+        .map((call) => call[0] as { type?: string; terminalId?: string })
+        .filter((msg) => msg.type === 'terminal.resize' && msg.terminalId === 'term-1')
+      expect(resizeMessages).toHaveLength(1)
+    } finally {
+      rafSpy.mockRestore()
+      cancelRafSpy.mockRestore()
+    }
   })
 })

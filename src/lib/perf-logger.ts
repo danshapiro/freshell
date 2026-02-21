@@ -137,6 +137,7 @@ function observeResources() {
   try {
     const observer = new PerformanceObserver((list) => {
       for (const entry of list.getEntries() as PerformanceResourceTiming[]) {
+        if (entry.name.includes('/api/logs/client')) continue
         if (entry.duration < perfConfig.resourceSlowMs) continue
         logClientPerf('perf.resource_slow', {
           name: entry.name,

@@ -184,13 +184,7 @@ export function useChunkedAttach({
 
     if (msg.type === 'terminal.attached.chunk') {
       const inflight = inflightChunksRef.current.get(msg.terminalId)
-      if (!inflight) {
-        if (inflightChunksRef.current.has(currentTerminalId) && msg.terminalId !== currentTerminalId) {
-          log.warn('[chunked-attach] ignoring chunk for mismatched terminal', msg.terminalId)
-          return true
-        }
-        return false
-      }
+      if (!inflight) return false
       if (inflight.generation !== connectionGenerationRef.current) return true
       inflight.chunks.push(msg.chunk)
       inflight.receivedChunks += 1
@@ -199,13 +193,7 @@ export function useChunkedAttach({
 
     if (msg.type === 'terminal.attached.end') {
       const inflight = inflightChunksRef.current.get(msg.terminalId)
-      if (!inflight) {
-        if (inflightChunksRef.current.has(currentTerminalId) && msg.terminalId !== currentTerminalId) {
-          log.warn('[chunked-attach] ignoring end for mismatched terminal', msg.terminalId)
-          return true
-        }
-        return false
-      }
+      if (!inflight) return false
 
       clearTerminalState(msg.terminalId)
 

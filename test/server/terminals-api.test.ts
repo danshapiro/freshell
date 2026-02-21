@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest'
 import express, { type Express } from 'express'
 import request from 'supertest'
@@ -37,6 +38,7 @@ vi.mock('../../server/logger', () => {
 // Import after mocks are set up
 import { httpAuthMiddleware } from '../../server/auth'
 import { configStore } from '../../server/config-store'
+import { createTerminalsRouter } from '../../server/terminals-router'
 
 /** Fake registry that returns controlled terminal data without spawning real PTYs */
 class FakeRegistry {
@@ -101,54 +103,17 @@ class FakeRegistry {
 }
 
 /** Create a minimal Express app with terminal routes for testing */
-function createTestApp(registry: FakeRegistry): Express {
+function createTestApp(registry: FakeRegistry, wsHandler: { broadcast: ReturnType<typeof vi.fn> }): Express {
   const app = express()
   app.disable('x-powered-by')
   app.use(express.json())
   app.use('/api', httpAuthMiddleware)
 
-  // GET /api/terminals - list all terminals
-  app.get('/api/terminals', async (_req, res) => {
-    const cfg = await configStore.snapshot()
-    const list = registry.list().filter((t) => !cfg.terminalOverrides?.[t.terminalId]?.deleted)
-    const merged = list.map((t) => {
-      const ov = cfg.terminalOverrides?.[t.terminalId]
-      return {
-        ...t,
-        title: ov?.titleOverride || t.title,
-        description: ov?.descriptionOverride || t.description,
-      }
-    })
-    res.json(merged)
-  })
-
-  // PATCH /api/terminals/:terminalId - update terminal
-  app.patch('/api/terminals/:terminalId', async (req, res) => {
-    const terminalId = req.params.terminalId
-    const { titleOverride, descriptionOverride, deleted } = req.body || {}
-
-    const next = await configStore.patchTerminalOverride(terminalId, {
-      titleOverride,
-      descriptionOverride,
-      deleted,
-    })
-
-    if (typeof titleOverride === 'string' && titleOverride.trim()) {
-      registry.updateTitle(terminalId, titleOverride.trim())
-    }
-    if (typeof descriptionOverride === 'string') {
-      registry.updateDescription(terminalId, descriptionOverride)
-    }
-
-    res.json(next)
-  })
-
-  // DELETE /api/terminals/:terminalId - mark terminal as deleted
-  app.delete('/api/terminals/:terminalId', async (req, res) => {
-    const terminalId = req.params.terminalId
-    await configStore.deleteTerminal(terminalId)
-    res.json({ ok: true })
-  })
+  app.use('/api/terminals', createTerminalsRouter({
+    configStore,
+    registry,
+    wsHandler,
+  }))
 
   return app
 }
@@ -157,6 +122,7 @@ describe('Terminals API', () => {
   const AUTH_TOKEN = 'test-auth-token-16chars'
   let app: Express
   let registry: FakeRegistry
+  let wsHandler: { broadcast: ReturnType<typeof vi.fn> }
 
   beforeAll(() => {
     process.env.AUTH_TOKEN = AUTH_TOKEN
@@ -165,7 +131,8 @@ describe('Terminals API', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     registry = new FakeRegistry()
-    app = createTestApp(registry)
+    wsHandler = { broadcast: vi.fn() }
+    app = createTestApp(registry, wsHandler)
 
     // Reset config store mock to default behavior
     vi.mocked(configStore.snapshot).mockResolvedValue({
@@ -439,6 +406,77 @@ describe('Terminals API', () => {
         deleted: true,
       })
     })
+
+    it('broadcasts terminal.list.updated after successful patch', async () => {
+      vi.mocked(configStore.patchTerminalOverride).mockResolvedValue({})
+
+      await request(app)
+        .patch('/api/terminals/term_123')
+        .set('x-auth-token', AUTH_TOKEN)
+        .send({ titleOverride: 'Test' })
+        .expect(200)
+
+      expect(wsHandler.broadcast).toHaveBeenCalledWith({ type: 'terminal.list.updated' })
+    })
+
+    it('rejects non-boolean deleted field', async () => {
+      const response = await request(app)
+        .patch('/api/terminals/term_123')
+        .set('x-auth-token', AUTH_TOKEN)
+        .send({ deleted: 'true' })
+        .expect(400)
+
+      expect(response.body.error).toBe('Invalid request')
+      expect(response.body.details).toBeDefined()
+    })
+
+    it('rejects titleOverride exceeding 500 characters', async () => {
+      const response = await request(app)
+        .patch('/api/terminals/term_123')
+        .set('x-auth-token', AUTH_TOKEN)
+        .send({ titleOverride: 'a'.repeat(501) })
+        .expect(400)
+
+      expect(response.body.error).toBe('Invalid request')
+      expect(response.body.details).toBeDefined()
+    })
+
+    it('rejects descriptionOverride exceeding 2000 characters', async () => {
+      const response = await request(app)
+        .patch('/api/terminals/term_123')
+        .set('x-auth-token', AUTH_TOKEN)
+        .send({ descriptionOverride: 'a'.repeat(2001) })
+        .expect(400)
+
+      expect(response.body.error).toBe('Invalid request')
+      expect(response.body.details).toBeDefined()
+    })
+
+    it('accepts empty body as no-op', async () => {
+      vi.mocked(configStore.patchTerminalOverride).mockResolvedValue({})
+
+      await request(app)
+        .patch('/api/terminals/term_123')
+        .set('x-auth-token', AUTH_TOKEN)
+        .send({})
+        .expect(200)
+    })
+
+    it('accepts null titleOverride to clear override', async () => {
+      vi.mocked(configStore.patchTerminalOverride).mockResolvedValue({})
+
+      await request(app)
+        .patch('/api/terminals/term_123')
+        .set('x-auth-token', AUTH_TOKEN)
+        .send({ titleOverride: null })
+        .expect(200)
+
+      expect(configStore.patchTerminalOverride).toHaveBeenCalledWith('term_123', {
+        titleOverride: undefined,
+        descriptionOverride: undefined,
+        deleted: undefined,
+      })
+    })
   })
 
   describe('DELETE /api/terminals/:terminalId', () => {
@@ -458,6 +496,15 @@ describe('Terminals API', () => {
 
       expect(configStore.deleteTerminal).toHaveBeenCalledWith('term_to_remove')
       expect(response.body).toEqual({ ok: true })
+    })
+
+    it('broadcasts terminal.list.updated after successful delete', async () => {
+      await request(app)
+        .delete('/api/terminals/term_123')
+        .set('x-auth-token', AUTH_TOKEN)
+        .expect(200)
+
+      expect(wsHandler.broadcast).toHaveBeenCalledWith({ type: 'terminal.list.updated' })
     })
   })
 })

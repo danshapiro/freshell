@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest'
 import express, { type Express } from 'express'
 import request from 'supertest'
@@ -34,8 +35,15 @@ describe('Files API Integration', () => {
     })
 
     // Import and mount files routes
-    const { filesRouter } = await import('../../../server/files-router')
-    app.use('/api/files', filesRouter)
+    const { createFilesRouter } = await import('../../../server/files-router')
+    app.use('/api/files', createFilesRouter({
+      configStore: {
+        getSettings: async () => ({}),
+        snapshot: async () => ({ settings: {}, recentDirectories: [] }),
+      },
+      codingCliIndexer: { getProjects: () => [] },
+      registry: { list: () => [] },
+    }))
   })
 
   afterEach(async () => {

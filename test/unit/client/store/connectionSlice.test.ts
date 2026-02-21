@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import connectionReducer, {
   setStatus,
   setError,
+  setErrorCode,
   setPlatform,
   setAvailableClis,
   ConnectionState,
@@ -15,6 +16,7 @@ describe('connectionSlice', () => {
 
       expect(state.status).toBe('disconnected')
       expect(state.lastError).toBeUndefined()
+      expect(state.lastErrorCode).toBeUndefined()
       expect(state.lastReadyAt).toBeUndefined()
     })
   })
@@ -225,6 +227,113 @@ describe('connectionSlice', () => {
       state = connectionReducer(state, setPlatform('linux'))
       expect(state.platform).toBe('linux')
       expect(state.availableClis).toEqual({ claude: true })
+    })
+  })
+
+  describe('setErrorCode', () => {
+    it('stores lastErrorCode via setErrorCode', () => {
+      const initialState: ConnectionState = {
+        status: 'disconnected',
+      }
+
+      const state = connectionReducer(initialState, setErrorCode(4003))
+
+      expect(state.lastErrorCode).toBe(4003)
+    })
+
+    it('clears lastErrorCode when set to undefined', () => {
+      const initialState: ConnectionState = {
+        status: 'disconnected',
+        lastErrorCode: 4003,
+      }
+
+      const state = connectionReducer(initialState, setErrorCode(undefined))
+
+      expect(state.lastErrorCode).toBeUndefined()
+    })
+
+    it('replaces existing error code', () => {
+      const initialState: ConnectionState = {
+        status: 'disconnected',
+        lastErrorCode: 4001,
+      }
+
+      const state = connectionReducer(initialState, setErrorCode(4003))
+
+      expect(state.lastErrorCode).toBe(4003)
+    })
+
+    it('preserves connection status when setting error code', () => {
+      const initialState: ConnectionState = {
+        status: 'connecting',
+      }
+
+      const state = connectionReducer(initialState, setErrorCode(4003))
+
+      expect(state.status).toBe('connecting')
+      expect(state.lastErrorCode).toBe(4003)
+    })
+
+    it('preserves lastError when setting error code', () => {
+      const initialState: ConnectionState = {
+        status: 'disconnected',
+        lastError: 'Too many connections',
+      }
+
+      const state = connectionReducer(initialState, setErrorCode(4003))
+
+      expect(state.lastError).toBe('Too many connections')
+      expect(state.lastErrorCode).toBe(4003)
+    })
+  })
+
+  describe('setStatus clears error state on ready', () => {
+    it('clears lastErrorCode when status becomes ready', () => {
+      const initialState: ConnectionState = {
+        status: 'disconnected',
+        lastErrorCode: 4003,
+      }
+
+      const state = connectionReducer(initialState, setStatus('ready'))
+
+      expect(state.lastErrorCode).toBeUndefined()
+    })
+
+    it('clears lastError when status becomes ready', () => {
+      const initialState: ConnectionState = {
+        status: 'disconnected',
+        lastError: 'Too many connections',
+      }
+
+      const state = connectionReducer(initialState, setStatus('ready'))
+
+      expect(state.lastError).toBeUndefined()
+    })
+
+    it('clears both lastError and lastErrorCode when status becomes ready', () => {
+      const initialState: ConnectionState = {
+        status: 'disconnected',
+        lastError: 'Too many connections',
+        lastErrorCode: 4003,
+      }
+
+      const state = connectionReducer(initialState, setStatus('ready'))
+
+      expect(state.lastError).toBeUndefined()
+      expect(state.lastErrorCode).toBeUndefined()
+    })
+
+    it('does not clear error state on non-ready status', () => {
+      const initialState: ConnectionState = {
+        status: 'disconnected',
+        lastError: 'Too many connections',
+        lastErrorCode: 4003,
+      }
+
+      const state = connectionReducer(initialState, setStatus('connecting'))
+
+      expect(state.lastError).toBe('Too many connections')
+      expect(state.lastErrorCode).toBe(4003)
     })
   })
 

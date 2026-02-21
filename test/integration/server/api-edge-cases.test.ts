@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect, beforeEach, afterEach, vi, beforeAll, afterAll } from 'vitest'
 import express, { type Express, type Request, type Response, type NextFunction } from 'express'
 import request from 'supertest'
@@ -23,7 +24,11 @@ vi.mock('os', async () => {
 })
 
 // Import after mocking
-import { ConfigStore, defaultSettings, type AppSettings } from '../../../server/config-store'
+import { ConfigStore, defaultSettings } from '../../../server/config-store'
+import { createSettingsRouter } from '../../../server/settings-router'
+import { createSessionsRouter } from '../../../server/sessions-router'
+import { createTerminalsRouter } from '../../../server/terminals-router'
+import { createProjectColorsRouter } from '../../../server/project-colors-router'
 
 const TEST_AUTH_TOKEN = 'test-auth-token-12345678'
 const WEAK_TOKEN = 'short'
@@ -67,65 +72,33 @@ describe('API Edge Cases - Security Testing', () => {
       res.json({ ok: true })
     })
 
-    // Settings routes
-    app.get('/api/settings', async (_req, res) => {
-      const s = await configStore.getSettings()
-      res.json(s)
-    })
+    // Mount real routers
+    app.use('/api/settings', createSettingsRouter({
+      configStore,
+      registry: { setSettings: vi.fn() },
+      wsHandler: { broadcast: vi.fn() },
+      codingCliIndexer: { refresh: vi.fn().mockResolvedValue(undefined) },
+      perfConfig: { slowSessionRefreshMs: 500 },
+      applyDebugLogging: vi.fn(),
+    }))
 
-    app.patch('/api/settings', async (req, res) => {
-      const updated = await configStore.patchSettings(req.body || {})
-      res.json(updated)
-    })
+    app.use('/api', createSessionsRouter({
+      configStore,
+      codingCliIndexer: { getProjects: vi.fn().mockReturnValue([]), refresh: vi.fn().mockResolvedValue(undefined) },
+      codingCliProviders: [],
+      perfConfig: { slowSessionRefreshMs: 500 },
+    }))
 
-    app.put('/api/settings', async (req, res) => {
-      const updated = await configStore.patchSettings(req.body || {})
-      res.json(updated)
-    })
+    app.use('/api/terminals', createTerminalsRouter({
+      configStore,
+      registry: { list: vi.fn().mockReturnValue([]), updateTitle: vi.fn(), updateDescription: vi.fn() },
+      wsHandler: { broadcast: vi.fn() },
+    }))
 
-    // Session routes
-    app.patch('/api/sessions/:sessionId', async (req, res) => {
-      const sessionId = req.params.sessionId
-      const { titleOverride, summaryOverride, deleted } = req.body || {}
-      const next = await configStore.patchSessionOverride(sessionId, {
-        titleOverride,
-        summaryOverride,
-        deleted,
-      })
-      res.json(next)
-    })
-
-    app.delete('/api/sessions/:sessionId', async (req, res) => {
-      const sessionId = req.params.sessionId
-      await configStore.deleteSession(sessionId)
-      res.json({ ok: true })
-    })
-
-    // Terminal routes
-    app.patch('/api/terminals/:terminalId', async (req, res) => {
-      const terminalId = req.params.terminalId
-      const { titleOverride, descriptionOverride, deleted } = req.body || {}
-      const next = await configStore.patchTerminalOverride(terminalId, {
-        titleOverride,
-        descriptionOverride,
-        deleted,
-      })
-      res.json(next)
-    })
-
-    app.delete('/api/terminals/:terminalId', async (req, res) => {
-      const terminalId = req.params.terminalId
-      await configStore.deleteTerminal(terminalId)
-      res.json({ ok: true })
-    })
-
-    // Project colors route
-    app.put('/api/project-colors', async (req, res) => {
-      const { projectPath, color } = req.body || {}
-      if (!projectPath || !color) return res.status(400).json({ error: 'projectPath and color required' })
-      await configStore.setProjectColor(projectPath, color)
-      res.json({ ok: true })
-    })
+    app.use('/api', createProjectColorsRouter({
+      configStore,
+      codingCliIndexer: { refresh: vi.fn().mockResolvedValue(undefined) },
+    }))
   })
 
   afterEach(async () => {
@@ -244,7 +217,8 @@ describe('API Edge Cases - Security Testing', () => {
         .send({ color: '#ff0000' })
 
       expect(res.status).toBe(400)
-      expect(res.body.error).toContain('projectPath')
+      expect(res.body.error).toBe('Invalid request')
+      expect(res.body.details).toBeDefined()
     })
 
     it('project-colors rejects missing color', async () => {
@@ -254,7 +228,8 @@ describe('API Edge Cases - Security Testing', () => {
         .send({ projectPath: '/some/path' })
 
       expect(res.status).toBe(400)
-      expect(res.body.error).toContain('color')
+      expect(res.body.error).toBe('Invalid request')
+      expect(res.body.details).toBeDefined()
     })
 
     it('project-colors rejects empty body', async () => {
@@ -354,11 +329,11 @@ describe('API Edge Cases - Security Testing', () => {
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .send({ terminal: nested })
 
-      // Should not crash - may accept or reject
-      expect([200, 400]).toContain(res.status)
+      // Real router uses .strict() schema — unknown keys in terminal are rejected
+      expect(res.status).toBe(400)
     })
 
-    it('handles very long key names', async () => {
+    it('rejects very long unknown key names (strict schema)', async () => {
       const longKey = 'k'.repeat(10000)
       const body: any = {}
       body[longKey] = 'value'
@@ -368,10 +343,11 @@ describe('API Edge Cases - Security Testing', () => {
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .send(body)
 
-      expect(res.status).toBe(200)
+      // Real router uses .strict() — unknown top-level keys rejected
+      expect(res.status).toBe(400)
     })
 
-    it('handles many keys in object', async () => {
+    it('rejects many unknown keys in object (strict schema)', async () => {
       const body: any = {}
       for (let i = 0; i < 10000; i++) {
         body[`key_${i}`] = `value_${i}`
@@ -382,10 +358,11 @@ describe('API Edge Cases - Security Testing', () => {
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .send(body)
 
-      expect(res.status).toBe(200)
+      // Real router uses .strict() — unknown top-level keys rejected
+      expect(res.status).toBe(400)
     })
 
-    it('handles array with many elements', async () => {
+    it('rejects array field not in schema (strict schema)', async () => {
       const largeArray = Array.from({ length: 10000 }, (_, i) => i)
 
       const res = await request(app)
@@ -393,7 +370,8 @@ describe('API Edge Cases - Security Testing', () => {
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .send({ arrayField: largeArray })
 
-      expect(res.status).toBe(200)
+      // Real router uses .strict() — unknown top-level keys rejected
+      expect(res.status).toBe(400)
     })
   })
 
@@ -644,10 +622,10 @@ describe('API Edge Cases - Security Testing', () => {
         expect(res.status).toBe(200)
       }
 
-      // Verify all were written
+      // Verify all were written (real router prefixes keys with 'claude:')
       const cfg = await configStore.snapshot()
       sessionIds.forEach((id) => {
-        expect(cfg.sessionOverrides[id]?.titleOverride).toBe(`Title for ${id}`)
+        expect(cfg.sessionOverrides[`claude:${id}`]?.titleOverride).toBe(`Title for ${id}`)
       })
     })
 
@@ -703,8 +681,9 @@ describe('API Edge Cases - Security Testing', () => {
       expect(res.status).toBe(200)
 
       const cfg = await configStore.snapshot()
-      expect(cfg.sessionOverrides['s1']?.titleOverride).toBe('S1')
-      expect(cfg.sessionOverrides['s2']?.titleOverride).toBe('S2')
+      // Real sessions router prefixes keys with 'claude:'
+      expect(cfg.sessionOverrides['claude:s1']?.titleOverride).toBe('S1')
+      expect(cfg.sessionOverrides['claude:s2']?.titleOverride).toBe('S2')
       expect(cfg.terminalOverrides['t1']?.titleOverride).toBe('T1')
       expect(cfg.terminalOverrides['t2']?.titleOverride).toBe('T2')
     })
@@ -903,26 +882,28 @@ describe('API Edge Cases - Security Testing', () => {
   // 8. TYPE COERCION AND PROTOTYPE POLLUTION
   // =============================================================================
   describe('Type Coercion and Prototype Pollution', () => {
-    it('handles __proto__ in request body', async () => {
+    it('rejects __proto__ in request body (strict schema)', async () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .set('Content-Type', 'application/json')
         .send('{"__proto__": {"polluted": true}}')
 
-      expect(res.status).toBe(200)
-      // Verify Object prototype is not polluted
+      // Real router uses .strict() — __proto__ is an unrecognized key
+      expect(res.status).toBe(400)
+      // Verify Object prototype is not polluted regardless
       expect(({} as any).polluted).toBeUndefined()
     })
 
-    it('handles constructor pollution attempt', async () => {
+    it('rejects constructor pollution attempt (strict schema)', async () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .set('Content-Type', 'application/json')
         .send('{"constructor": {"prototype": {"polluted": true}}}')
 
-      expect(res.status).toBe(200)
+      // Real router uses .strict() — constructor is an unrecognized key
+      expect(res.status).toBe(400)
       expect(({} as any).polluted).toBeUndefined()
     })
 
@@ -936,45 +917,48 @@ describe('API Edge Cases - Security Testing', () => {
       expect(({} as any).polluted).toBeUndefined()
     })
 
-    it('handles array where object expected', async () => {
+    it('rejects array where object expected (strict schema)', async () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .send({ terminal: ['not', 'an', 'object'] })
 
-      expect(res.status).toBe(200)
+      // Real router validates terminal as a strict object schema
+      expect(res.status).toBe(400)
     })
 
-    it('handles number where string expected', async () => {
+    it('rejects number where enum expected (strict schema)', async () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .send({ theme: 12345 })
 
-      expect(res.status).toBe(200)
-      expect(res.body.theme).toBe(12345)
+      // Real router validates theme as enum('system','light','dark')
+      expect(res.status).toBe(400)
     })
 
-    it('handles object where string expected', async () => {
+    it('rejects object where enum expected (strict schema)', async () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .send({ theme: { nested: 'object' } })
 
-      expect(res.status).toBe(200)
+      // Real router validates theme as enum('system','light','dark')
+      expect(res.status).toBe(400)
     })
 
-    it('handles boolean coercion', async () => {
+    it('handles boolean coercion via z.coerce.boolean()', async () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .send({ terminal: { cursorBlink: 'true' } }) // string instead of boolean
 
       expect(res.status).toBe(200)
-      expect(res.body.terminal.cursorBlink).toBe('true')
+      // z.coerce.boolean() coerces 'true' to boolean true
+      expect(res.body.terminal.cursorBlink).toBe(true)
     })
 
-    it('handles NaN and Infinity', async () => {
+    it('handles extreme numeric values via z.coerce.number()', async () => {
       // JSON does not support NaN/Infinity, but test what happens
       const res = await request(app)
         .patch('/api/settings')
@@ -984,17 +968,18 @@ describe('API Edge Cases - Security Testing', () => {
       expect(res.status).toBe(200)
     })
 
-    it('handles undefined vs null', async () => {
+    it('handles null defaultCwd (normalized to undefined)', async () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .send({ defaultCwd: null })
 
       expect(res.status).toBe(200)
-      expect(res.body.defaultCwd).toBeNull()
+      // Real router normalizes null defaultCwd to undefined (omitted from JSON)
+      expect(res.body.defaultCwd).toBeUndefined()
     })
 
-    it('handles toString/valueOf overrides in object', async () => {
+    it('rejects toString/valueOf overrides in strict schema', async () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
@@ -1005,7 +990,8 @@ describe('API Edge Cases - Security Testing', () => {
           },
         })
 
-      expect(res.status).toBe(200)
+      // Real router uses .strict() on terminal object — unknown keys rejected
+      expect(res.status).toBe(400)
     })
   })
 

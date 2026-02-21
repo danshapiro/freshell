@@ -624,11 +624,20 @@ export default function EditorPane({
     }
   }, [filePath, readOnly, resolvePath])
 
-  const openSystemViewer = useCallback(async (reveal: boolean) => {
+  const openInEditor = useCallback(async (reveal: boolean) => {
     const resolved = resolvePath(filePath)
     if (!resolved) return
+
+    // Read cursor position from Monaco editor
+    const position = editorRef.current?.getPosition()
+
     try {
-      await api.post('/api/files/open', { path: resolved, reveal })
+      await api.post('/api/files/open', {
+        path: resolved,
+        reveal,
+        line: position?.lineNumber,
+        column: position?.column,
+      })
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       log.error(
@@ -670,10 +679,10 @@ export default function EditorPane({
         const resolved = resolvePath(filePath)
         if (resolved) await copyText(resolved)
       },
-      revealInExplorer: () => openSystemViewer(true),
-      openWithSystemViewer: () => openSystemViewer(false),
+      revealInExplorer: () => openInEditor(true),
+      openInEditor: () => openInEditor(false),
     })
-  }, [paneId, performSave, handleToggleViewMode, filePath, resolvePath, openSystemViewer])
+  }, [paneId, performSave, handleToggleViewMode, filePath, resolvePath, openInEditor])
 
   return (
     <div

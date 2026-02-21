@@ -1,4 +1,9 @@
+import { Router } from 'express'
 import { z } from 'zod'
+import { migrateSettingsSortMode } from './settings-migrate.js'
+import { withPerfSpan } from './perf-logger.js'
+
+// --- SettingsPatchSchema (moved from settings-schema.ts) ---
 
 const CodingCliProviderConfigSchema = z
   .object({
@@ -102,6 +107,13 @@ export const SettingsPatchSchema = z
       })
       .strict()
       .optional(),
+    editor: z
+      .object({
+        externalEditor: z.enum(['auto', 'cursor', 'code', 'custom']).optional(),
+        customEditorCommand: z.string().optional(),
+      })
+      .strict()
+      .optional(),
     network: z
       .object({
         host: z.enum(['127.0.0.1', '0.0.0.0']).optional(),
@@ -113,3 +125,66 @@ export const SettingsPatchSchema = z
   .strict()
 
 export type SettingsPatch = z.infer<typeof SettingsPatchSchema>
+
+// --- normalizeSettingsPatch (moved from server/index.ts) ---
+
+export const normalizeSettingsPatch = (patch: Record<string, any>) => {
+  if (Object.prototype.hasOwnProperty.call(patch, 'defaultCwd')) {
+    const raw = patch.defaultCwd
+    if (raw === null) {
+      patch.defaultCwd = undefined
+    } else if (typeof raw === 'string' && raw.trim() === '') {
+      patch.defaultCwd = undefined
+    }
+  }
+  return patch
+}
+
+// --- Router ---
+
+export interface SettingsRouterDeps {
+  configStore: {
+    getSettings: () => Promise<any>
+    patchSettings: (patch: any) => Promise<any>
+  }
+  registry: { setSettings: (s: any) => void }
+  wsHandler: { broadcast: (msg: any) => void }
+  codingCliIndexer: { refresh: () => Promise<void> }
+  perfConfig: { slowSessionRefreshMs: number }
+  applyDebugLogging: (enabled: boolean, source: string) => void
+}
+
+export function createSettingsRouter(deps: SettingsRouterDeps): Router {
+  const { configStore, registry, wsHandler, codingCliIndexer, perfConfig, applyDebugLogging } = deps
+  const router = Router()
+
+  router.get('/', async (_req, res) => {
+    const s = await configStore.getSettings()
+    res.json(migrateSettingsSortMode(s))
+  })
+
+  const handleSettingsPatch = async (req: any, res: any) => {
+    const parsed = SettingsPatchSchema.safeParse(req.body || {})
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
+    }
+    const patch = normalizeSettingsPatch(migrateSettingsSortMode(parsed.data) as any)
+    const updated = await configStore.patchSettings(patch)
+    const migrated = migrateSettingsSortMode(updated)
+    registry.setSettings(migrated)
+    applyDebugLogging(!!migrated.logging?.debug, 'settings')
+    wsHandler.broadcast({ type: 'settings.updated', settings: migrated })
+    await withPerfSpan(
+      'coding_cli_refresh',
+      () => codingCliIndexer.refresh(),
+      {},
+      { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
+    )
+    res.json(migrated)
+  }
+
+  router.patch('/', handleSettingsPatch)
+  router.put('/', handleSettingsPatch)
+
+  return router
+}

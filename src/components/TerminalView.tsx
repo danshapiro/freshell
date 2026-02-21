@@ -36,6 +36,7 @@ import {
 } from '@/lib/terminal-osc52'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { resolveTerminalFontFamily } from '@/lib/terminal-fonts'
+import { ConnectionErrorOverlay } from '@/components/terminal/ConnectionErrorOverlay'
 import { useChunkedAttach } from '@/components/terminal/useChunkedAttach'
 import { Osc52PromptModal } from '@/components/terminal/Osc52PromptModal'
 import { TerminalSearchBar } from '@/components/terminal/TerminalSearchBar'
@@ -43,6 +44,8 @@ import {
   createTerminalRuntime,
   type TerminalRuntime,
 } from '@/components/terminal/terminal-runtime'
+import { createLayoutScheduler } from '@/components/terminal/layout-scheduler'
+import { createTerminalWriteQueue, type TerminalWriteQueue } from '@/components/terminal/terminal-write-queue'
 import { nanoid } from 'nanoid'
 import { cn } from '@/lib/utils'
 import { Terminal } from '@xterm/xterm'
@@ -136,6 +139,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
   const localServerInstanceId = useAppSelector((s) => s.connection.serverInstanceId)
+  const connectionErrorCode = useAppSelector((s) => s.connection.lastErrorCode)
   const settings = useAppSelector((s) => s.settings.settings)
   const hasAttention = useAppSelector((s) => !!s.turnCompletion?.attentionByTab?.[tabId])
   const hasAttentionRef = useRef(hasAttention)
@@ -158,6 +162,14 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const containerRef = useRef<HTMLDivElement | null>(null)
   const termRef = useRef<Terminal | null>(null)
   const runtimeRef = useRef<TerminalRuntime | null>(null)
+  const writeQueueRef = useRef<TerminalWriteQueue | null>(null)
+  const layoutSchedulerRef = useRef<ReturnType<typeof createLayoutScheduler> | null>(null)
+  const pendingLayoutWorkRef = useRef({
+    fit: false,
+    resize: false,
+    scrollToBottom: false,
+    focus: false,
+  })
   const mountedRef = useRef(false)
   const hiddenRef = useRef(hidden)
   const lastSessionActivityAtRef = useRef(0)
@@ -471,6 +483,74 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     ws.send(msg)
   }, [ws])
 
+  const requestTerminalLayout = useCallback((options: {
+    fit?: boolean
+    resize?: boolean
+    scrollToBottom?: boolean
+    focus?: boolean
+  }) => {
+    const pending = pendingLayoutWorkRef.current
+    if (options.fit || options.resize) pending.fit = true
+    if (options.resize) pending.resize = true
+    if (options.scrollToBottom) pending.scrollToBottom = true
+    if (options.focus) pending.focus = true
+    layoutSchedulerRef.current?.request()
+  }, [])
+
+  const flushScheduledLayout = useCallback(() => {
+    const term = termRef.current
+    if (!term) return
+
+    const runtime = runtimeRef.current
+    const pending = pendingLayoutWorkRef.current
+    const shouldFit = pending.fit
+    const shouldResize = pending.resize
+    const shouldScrollToBottom = pending.scrollToBottom
+    const shouldFocus = pending.focus
+    pending.fit = false
+    pending.resize = false
+    pending.scrollToBottom = false
+    pending.focus = false
+
+    if (shouldFit && !hiddenRef.current && runtime) {
+      try {
+        runtime.fit()
+      } catch {
+        // disposed
+      }
+
+      if (shouldResize) {
+        const tid = terminalIdRef.current
+        if (tid) {
+          ws.send({ type: 'terminal.resize', terminalId: tid, cols: term.cols, rows: term.rows })
+        }
+      }
+    }
+
+    if (shouldScrollToBottom) {
+      try { term.scrollToBottom() } catch { /* disposed */ }
+    }
+    if (shouldFocus) {
+      term.focus()
+    }
+  }, [ws])
+
+  const enqueueTerminalWrite = useCallback((data: string, onWritten?: () => void) => {
+    if (!data) return
+    const queue = writeQueueRef.current
+    if (queue) {
+      queue.enqueue(data, onWritten)
+      return
+    }
+    const term = termRef.current
+    if (!term) return
+    try {
+      term.write(data, onWritten)
+    } catch {
+      // disposed
+    }
+  }, [])
+
   const attemptOsc52ClipboardWrite = useCallback((text: string) => {
     void copyText(text).catch(() => {})
   }, [])
@@ -513,20 +593,27 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
   const handleTerminalSnapshot = useCallback((snapshot: string | undefined, term: Terminal) => {
     const osc = extractOsc52Events(snapshot ?? '', createOsc52ParserState())
-    try { term.clear() } catch { /* disposed */ }
-    if (osc.cleaned) {
-      try {
-        term.write(osc.cleaned, () => { try { term.scrollToBottom() } catch { /* disposed */ } })
-      } catch { /* disposed */ }
+    const queue = writeQueueRef.current
+    if (queue) {
+      queue.enqueueTask(() => {
+        try { term.clear() } catch { /* disposed */ }
+      })
     } else {
-      try { term.scrollToBottom() } catch { /* disposed */ }
+      try { term.clear() } catch { /* disposed */ }
+    }
+    if (osc.cleaned) {
+      enqueueTerminalWrite(osc.cleaned, () => {
+        requestTerminalLayout({ scrollToBottom: true })
+      })
+    } else {
+      requestTerminalLayout({ scrollToBottom: true })
     }
     for (const event of osc.events) {
       handleOsc52Event(event)
     }
-  }, [handleOsc52Event])
+  }, [enqueueTerminalWrite, handleOsc52Event, requestTerminalLayout])
 
-  const handleTerminalOutput = useCallback((raw: string, mode: TerminalPaneContent['mode'], term: Terminal, tid?: string) => {
+  const handleTerminalOutput = useCallback((raw: string, mode: TerminalPaneContent['mode'], tid?: string) => {
     const osc = extractOsc52Events(raw, osc52ParserRef.current)
     const { cleaned, count } = extractTurnCompleteSignals(osc.cleaned, mode, turnCompleteSignalStateRef.current)
 
@@ -540,13 +627,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     }
 
     if (cleaned) {
-      term.write(cleaned)
+      enqueueTerminalWrite(cleaned)
     }
 
     for (const event of osc.events) {
       handleOsc52Event(event)
     }
-  }, [dispatch, handleOsc52Event, tabId])
+  }, [dispatch, enqueueTerminalWrite, handleOsc52Event, tabId])
 
   const applyChunkedSnapshot = useCallback((snapshot: string) => {
     const term = termRef.current
@@ -733,6 +820,18 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
     termRef.current = term
     runtimeRef.current = runtime
+    const writeQueue = createTerminalWriteQueue({
+      write: (data, onWritten) => {
+        try {
+          term.write(data, onWritten)
+        } catch {
+          // disposed
+        }
+      },
+    })
+    writeQueueRef.current = writeQueue
+    const layoutScheduler = createLayoutScheduler(flushScheduledLayout)
+    layoutSchedulerRef.current = layoutScheduler
 
     const searchResultsDisposable = runtime.onDidChangeResults((event) => {
       setSearchResults({ resultIndex: event.resultIndex, resultCount: event.resultCount })
@@ -795,12 +894,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       openSearch: () => setSearchOpen(true),
     })
 
-    requestAnimationFrame(() => {
-      if (termRef.current === term) {
-        try { runtime.fit() } catch { /* disposed */ }
-        term.focus()
-      }
-    })
+    requestTerminalLayout({ fit: true, focus: true })
 
     term.onData((data) => {
       sendInput(data)
@@ -885,13 +979,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
     const ro = new ResizeObserver(() => {
       if (hiddenRef.current || termRef.current !== term) return
-      try {
-        runtime.fit()
-        const tid = terminalIdRef.current
-        if (tid) {
-          ws.send({ type: 'terminal.resize', terminalId: tid, cols: term.cols, rows: term.rows })
-        }
-      } catch { /* disposed */ }
+      requestTerminalLayout({ fit: true, resize: true })
     })
     ro.observe(containerRef.current)
 
@@ -900,6 +988,20 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       ro.disconnect()
       unregisterActions()
       searchResultsDisposable.dispose()
+      if (writeQueueRef.current === writeQueue) {
+        writeQueue.clear()
+        writeQueueRef.current = null
+      }
+      if (layoutSchedulerRef.current === layoutScheduler) {
+        layoutScheduler.cancel()
+        layoutSchedulerRef.current = null
+      }
+      pendingLayoutWorkRef.current = {
+        fit: false,
+        resize: false,
+        scrollToBottom: false,
+        focus: false,
+      }
       if (termRef.current === term) {
         runtime.dispose()
         runtimeRef.current = null
@@ -974,22 +1076,17 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     term.options.lineHeight = settings.terminal.lineHeight
     term.options.scrollback = settings.terminal.scrollback
     term.options.theme = getTerminalTheme(settings.terminal.theme, settings.theme)
-    if (!hidden) runtimeRef.current?.fit()
-  }, [isTerminal, settings, hidden])
+    if (!hidden) requestTerminalLayout({ fit: true, resize: true })
+  }, [isTerminal, settings, hidden, requestTerminalLayout])
 
   // When becoming visible, fit and send size
   // Note: With visibility:hidden CSS, dimensions are always stable, so no RAF needed
   useEffect(() => {
     if (!isTerminal) return
     if (!hidden) {
-      runtimeRef.current?.fit()
-      const term = termRef.current
-      const tid = terminalIdRef.current
-      if (term && tid) {
-        ws.send({ type: 'terminal.resize', terminalId: tid, cols: term.cols, rows: term.rows })
-      }
+      requestTerminalLayout({ fit: true, resize: true })
     }
-  }, [isTerminal, hidden, ws])
+  }, [hidden, isTerminal, requestTerminalLayout])
 
   // Create or attach to backend terminal
   useEffect(() => {
@@ -1090,6 +1187,18 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         const tid = terminalIdRef.current
         const reqId = requestIdRef.current
 
+        const msgTerminalId = typeof (msg as { terminalId?: unknown }).terminalId === 'string'
+          ? (msg as { terminalId: string }).terminalId
+          : undefined
+        const isChunkLifecycleType =
+          msg.type === 'terminal.attached.start'
+          || msg.type === 'terminal.attached.chunk'
+          || msg.type === 'terminal.attached.end'
+
+        if (isChunkLifecycleType && msgTerminalId && tid && msgTerminalId !== tid) {
+          return
+        }
+
         if (handleChunkLifecycleMessage(msg)) {
           return
         }
@@ -1097,7 +1206,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         if (msg.type === 'terminal.output' && msg.terminalId === tid) {
           const raw = msg.data || ''
           const mode = contentRef.current?.mode || 'shell'
-          handleTerminalOutput(raw, mode, term, tid)
+          handleTerminalOutput(raw, mode, tid)
         }
 
         if (msg.type === 'terminal.snapshot' && msg.terminalId === tid) {
@@ -1359,7 +1468,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     return null
   }
 
-  const showSpinner = terminalContent.status === 'creating' || isAttaching
+  const showSpinner = (terminalContent.status === 'creating' || isAttaching) && connectionErrorCode !== 4003
 
   return (
     <div
@@ -1423,6 +1532,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           </div>
         </div>
       )}
+      <ConnectionErrorOverlay />
       {searchOpen && (
         <TerminalSearchBar
           query={searchQuery}

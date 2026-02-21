@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type TouchEvent as ReactTouchEvent } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { setStatus, setError, setServerInstanceId, setPlatform, setAvailableClis } from '@/store/connectionSlice'
+import { setStatus, setError, setErrorCode, setServerInstanceId, setPlatform, setAvailableClis } from '@/store/connectionSlice'
 import { setSettings } from '@/store/settingsSlice'
 import {
   setProjects,
@@ -510,6 +510,7 @@ export default function App() {
       if (cleanedUp) cleanup()
 
       dispatch(setError(undefined))
+      dispatch(setErrorCode(undefined))
       dispatch(setStatus('connecting'))
       try {
         await ws.connect()
@@ -518,6 +519,9 @@ export default function App() {
         if (!cancelled) {
           dispatch(setStatus('disconnected'))
           dispatch(setError(err?.message || 'WebSocket connection failed'))
+          if (typeof err?.wsCloseCode === 'number') {
+            dispatch(setErrorCode(err.wsCloseCode))
+          }
         }
       }
     }

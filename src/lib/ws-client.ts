@@ -175,7 +175,10 @@ export class WsClient {
 
         if (msg.type === 'error' && msg.code === 'NOT_AUTHENTICATED') {
           this.clearReadyTimeout()
-          finishReject(new Error('Authentication failed'))
+          this.intentionalClose = true
+          const err = new Error('Authentication failed')
+          ;(err as any).wsCloseCode = 4001
+          finishReject(err)
           return
         }
 
@@ -205,7 +208,9 @@ export class WsClient {
         // 4002 HELLO_TIMEOUT: transient (handshake timeout), do reconnect.
         if (event.code === 4001) {
           this.intentionalClose = true
-          finishReject(new Error(`Authentication failed (code ${event.code})`))
+          const err = new Error(`Authentication failed (code ${event.code})`)
+          ;(err as any).wsCloseCode = 4001
+          finishReject(err)
           return
         }
         if (event.code === 4002) {
@@ -216,7 +221,9 @@ export class WsClient {
 
         if (event.code === 4003) {
           this.intentionalClose = true
-          finishReject(new Error('Server busy: max connections reached'))
+          const err = new Error('Server busy: max connections reached')
+          ;(err as any).wsCloseCode = 4003
+          finishReject(err)
           return
         }
 

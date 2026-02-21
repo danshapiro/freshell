@@ -7,10 +7,9 @@ import http from 'http'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import rateLimit from 'express-rate-limit'
-import { z } from 'zod'
 import { logger, setLogLevel } from './logger.js'
 import { requestLogger } from './request-logger.js'
-import { validateStartupSecurity, httpAuthMiddleware, timingSafeCompare } from './auth.js'
+import { validateStartupSecurity, httpAuthMiddleware } from './auth.js'
 import { configStore } from './config-store.js'
 import { TerminalRegistry, type TerminalRecord } from './terminal-registry.js'
 import { WsHandler } from './ws-handler.js'
@@ -19,30 +18,36 @@ import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
 import { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { claudeProvider } from './coding-cli/providers/claude.js'
 import { codexProvider } from './coding-cli/providers/codex.js'
-import { makeSessionKey, type CodingCliProviderName, type CodingCliSession } from './coding-cli/types.js'
+import { type CodingCliProviderName, type CodingCliSession } from './coding-cli/types.js'
 import { TerminalMetadataService } from './terminal-metadata-service.js'
-import { AI_CONFIG, PROMPTS, stripAnsi } from './ai-prompts.js'
 import { migrateSettingsSortMode } from './settings-migrate.js'
-import { filesRouter } from './files-router.js'
+import { createFilesRouter } from './files-router.js'
+import { createPlatformRouter } from './platform-router.js'
+import { createProxyRouter } from './proxy-router.js'
+import { createLocalFileRouter } from './local-file-router.js'
+import { createTerminalsRouter } from './terminals-router.js'
+import { createProjectColorsRouter } from './project-colors-router.js'
+import { createSessionsRouter } from './sessions-router.js'
+import { createNetworkRouter } from './network-router.js'
 import { getSessionRepairService } from './session-scanner/service.js'
-import { cascadeTerminalRenameToSession, cascadeSessionRenameToTerminal } from './rename-cascade.js'
 import { SdkBridge } from './sdk-bridge.js'
 import { createClientLogsRouter } from './client-logs.js'
 import { createStartupState } from './startup-state.js'
-import { getPerfConfig, initPerfLogging, setPerfLoggingEnabled, startPerfTimer, withPerfSpan } from './perf-logger.js'
+import { getPerfConfig, initPerfLogging, setPerfLoggingEnabled, withPerfSpan } from './perf-logger.js'
 import { detectPlatform, detectAvailableClis, detectHostName } from './platform.js'
 import { resolveVisitPort } from './startup-url.js'
 import { NetworkManager } from './network-manager.js'
 import { getNetworkHost } from './get-network-host.js'
-import cookieParser from 'cookie-parser'
 import { PortForwardManager } from './port-forward.js'
-import { getRequesterIdentity, parseTrustProxyEnv } from './request-ip.js'
-import { collectCandidateDirectories } from './candidate-dirs.js'
+import { parseTrustProxyEnv } from './request-ip.js'
 import { createTabsRegistryStore } from './tabs-registry/store.js'
 import { checkForUpdate } from './updater/version-checker.js'
 import { SessionAssociationCoordinator } from './session-association-coordinator.js'
 import { loadOrCreateServerInstanceId } from './instance-id.js'
-import { SettingsPatchSchema, type SettingsPatch } from './settings-schema.js'
+import { createSettingsRouter } from './settings-router.js'
+import { createPerfRouter } from './perf-router.js'
+import { createAiRouter } from './ai-router.js'
+import { createDebugRouter } from './debug-router.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -86,42 +91,7 @@ async function main() {
   app.use(requestLogger)
 
   // --- Local file serving for browser pane (cookie auth for iframes) ---
-  app.get('/local-file', cookieParser(), (req, res, next) => {
-    const headerToken = typeof req.headers['x-auth-token'] === 'string'
-      ? req.headers['x-auth-token']
-      : undefined
-    const cookieToken = typeof req.cookies?.['freshell-auth'] === 'string'
-      ? req.cookies['freshell-auth']
-      : undefined
-    const token = headerToken || cookieToken
-    const expectedToken = process.env.AUTH_TOKEN
-    if (!expectedToken || !token || !timingSafeCompare(token, expectedToken)) {
-      return res.status(401).json({ error: 'Unauthorized' })
-    }
-    next()
-  }, (req, res) => {
-    const filePath = req.query.path as string
-    if (!filePath) {
-      return res.status(400).json({ error: 'path query parameter required' })
-    }
-
-    // Normalize and resolve the path
-    const resolved = path.resolve(filePath)
-
-    // Check if file exists
-    if (!fs.existsSync(resolved)) {
-      return res.status(404).json({ error: 'File not found' })
-    }
-
-    // Check if it's a file (not a directory)
-    const stat = fs.statSync(resolved)
-	    if (stat.isDirectory()) {
-	      return res.status(400).json({ error: 'Cannot serve directories' })
-	    }
-
-	    // Send the file with appropriate content type
-	    res.sendFile(resolved)
-	  })
+  app.use('/local-file', createLocalFileRouter())
 
   const startupState = createStartupState()
 
@@ -153,23 +123,6 @@ async function main() {
   const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders)
   const codingCliSessionManager = new CodingCliSessionManager(codingCliProviders)
   const tabsRegistryStore = createTabsRegistryStore()
-
-  app.get('/api/debug', async (_req, res) => {
-    const cfg = await configStore.snapshot()
-    res.json({
-      version: 1,
-      appVersion: APP_VERSION,
-      wsConnections: wsHandler.connectionCount(),
-      settings: cfg.settings,
-      sessionsProjects: codingCliIndexer.getProjects(),
-      tabsRegistry: {
-        recordCount: tabsRegistryStore.count(),
-        deviceCount: tabsRegistryStore.listDevices().length,
-      },
-      terminals: registry.list(),
-      time: new Date().toISOString(),
-    })
-  })
 
   const settings = migrateSettingsSortMode(await configStore.getSettings())
   const registry = new TerminalRegistry(settings)
@@ -269,522 +222,75 @@ async function main() {
 
   applyDebugLogging(!!settings.logging?.debug, 'settings')
 
-  app.post('/api/perf', async (req, res) => {
-    const enabled = req.body?.enabled === true
-    const updated = await configStore.patchSettings({ logging: { debug: enabled } })
-    const migrated = migrateSettingsSortMode(updated)
-    registry.setSettings(migrated)
-    applyDebugLogging(!!migrated.logging?.debug, 'api')
-    wsHandler.broadcast({ type: 'settings.updated', settings: migrated })
-    res.json({ ok: true, enabled })
-  })
+  app.use('/api/perf', createPerfRouter({
+    configStore,
+    registry,
+    wsHandler,
+    applyDebugLogging,
+  }))
 
   // --- API: settings ---
-  //
-  // SECURITY NOTE (XSS Prevention):
-  // User-provided strings (tab titles, descriptions, settings values) are stored
-  // as-is without server-side sanitization. This is intentional because:
-  //
-  // 1. The frontend uses React, which automatically escapes all interpolated
-  //    values in JSX (e.g., {title}, {description}), preventing XSS attacks.
-  //
-  // 2. CRITICAL: `dangerouslySetInnerHTML` must NEVER be used with any user
-  //    data from these APIs. If rich text rendering is ever needed, use a
-  //    sanitization library like DOMPurify on the frontend.
-  //
-  // 3. The same applies to session overrides, terminal overrides, and project
-  //    colors - all user input flows through React's automatic escaping.
-  //
-  // Verified: No dangerouslySetInnerHTML or innerHTML usage exists in src/components/.
-  //
-  app.get('/api/settings', async (_req, res) => {
-    const s = await configStore.getSettings()
-    res.json(migrateSettingsSortMode(s))
-  })
-
-  app.get('/api/lan-info', (_req, res) => {
-    res.json({ ips: detectLanIps() })
-  })
+  app.use('/api/settings', createSettingsRouter({
+    configStore,
+    registry,
+    wsHandler,
+    codingCliIndexer,
+    perfConfig,
+    applyDebugLogging,
+  }))
 
   // --- Network management endpoints ---
-  app.get('/api/network/status', async (_req, res) => {
-    try {
-      const status = await networkManager.getStatus()
-      res.json(status)
-    } catch (err) {
-      log.error({ err }, 'Failed to get network status')
-      res.status(500).json({ error: 'Failed to get network status' })
-    }
-  })
+  app.use('/api', createNetworkRouter({
+    networkManager,
+    configStore,
+    wsHandler,
+    detectLanIps,
+  }))
 
-  const NetworkConfigureSchema = z.object({
-    host: z.enum(['127.0.0.1', '0.0.0.0']),
-    configured: z.boolean(),
-  })
+  app.use('/api', createPlatformRouter({
+    detectPlatform,
+    detectAvailableClis,
+    detectHostName,
+    checkForUpdate,
+    appVersion: APP_VERSION,
+  }))
 
-  app.post('/api/network/configure', async (req, res) => {
-    const parsed = NetworkConfigureSchema.safeParse(req.body || {})
-    if (!parsed.success) {
-      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
-    }
-    try {
-      const { rebindScheduled } = await networkManager.configure(parsed.data)
-      const status = await networkManager.getStatus()
-      res.json({ ...status, rebindScheduled })
-    } catch (err) {
-      log.error({ err }, 'Failed to configure network')
-      res.status(500).json({ error: 'Failed to configure network' })
-      return
-    }
-    try {
-      const fullSettings = await configStore.getSettings()
-      wsHandler.broadcast({ type: 'settings.updated', settings: fullSettings })
-    } catch (broadcastErr) {
-      log.error({ err: broadcastErr }, 'Failed to broadcast settings after network configure')
-    }
-  })
-
-  app.post('/api/network/configure-firewall', async (_req, res) => {
-    try {
-      const status = await networkManager.getStatus()
-
-      // In-flight guard: prevent concurrent elevated firewall processes
-      if (status.firewall.configuring) {
-        return res.status(409).json({
-          error: 'Firewall configuration already in progress',
-          method: 'in-progress',
-        })
-      }
-
-      const commands = status.firewall.commands
-
-      if (commands.length === 0) {
-        if (status.firewall.platform === 'wsl2') {
-          const { execFile } = await import('node:child_process')
-          const { buildPortForwardingScript, getWslIp } = await import('./wsl-port-forward.js')
-          const POWERSHELL_PATH = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
-          try {
-            const wslIp = getWslIp()
-            if (!wslIp) {
-              log.error('Failed to detect WSL2 IP address')
-              return res.status(500).json({ error: 'Could not detect WSL2 IP address' })
-            }
-            const ports = networkManager.getRelevantPorts()
-            const rawScript = buildPortForwardingScript(wslIp, ports)
-            const script = rawScript.replace(/\\\$/g, '$')
-            const escapedScript = script.replace(/'/g, "''")
-            networkManager.setFirewallConfiguring(true)
-            const child = execFile(POWERSHELL_PATH, [
-              '-Command',
-              `Start-Process powershell -Verb RunAs -Wait -ArgumentList '-Command', '${escapedScript}'`,
-            ], { timeout: 120000 }, (err, _stdout, stderr) => {
-              if (err) {
-                log.error({ err, stderr }, 'WSL2 port forwarding failed')
-              } else {
-                log.info('WSL2 port forwarding completed successfully')
-              }
-              networkManager.resetFirewallCache()
-              networkManager.setFirewallConfiguring(false)
-            })
-            child.on('error', (err) => {
-              log.error({ err }, 'Failed to spawn PowerShell for WSL2 port forwarding')
-              networkManager.resetFirewallCache()
-              networkManager.setFirewallConfiguring(false)
-            })
-            return res.json({ method: 'wsl2', status: 'started' })
-          } catch (err) {
-            log.error({ err }, 'WSL2 port forwarding setup error')
-            networkManager.setFirewallConfiguring(false)
-            return res.status(500).json({ error: 'WSL2 port forwarding failed to start' })
-          }
-        }
-        return res.json({ method: 'none', message: 'No firewall detected' })
-      }
-
-      if (status.firewall.platform === 'windows') {
-        const { execFile } = await import('node:child_process')
-        const script = commands.join('; ')
-        const escapedScript = script.replace(/'/g, "''")
-        try {
-          networkManager.setFirewallConfiguring(true)
-          const child = execFile('powershell.exe', [
-            '-Command',
-            `Start-Process powershell -Verb RunAs -Wait -ArgumentList '-Command', '${escapedScript}'`,
-          ], { timeout: 120000 }, (err, _stdout, stderr) => {
-            if (err) {
-              log.error({ err, stderr }, 'Windows firewall configuration failed')
-            } else {
-              log.info('Windows firewall configured successfully')
-            }
-            networkManager.resetFirewallCache()
-            networkManager.setFirewallConfiguring(false)
-          })
-          child.on('error', (err) => {
-            log.error({ err }, 'Failed to spawn PowerShell for Windows firewall')
-            networkManager.resetFirewallCache()
-            networkManager.setFirewallConfiguring(false)
-          })
-          return res.json({ method: 'windows-elevated', status: 'started' })
-        } catch (err) {
-          log.error({ err }, 'Windows firewall setup error')
-          networkManager.setFirewallConfiguring(false)
-          return res.status(500).json({ error: 'Windows firewall configuration failed to start' })
-        }
-      }
-
-      // Linux/macOS: return command for client to run in a terminal pane
-      const command = commands.join(' && ')
-      res.json({ method: 'terminal', command })
-    } catch (err) {
-      log.error({ err }, 'Firewall configuration error')
-      res.status(500).json({ error: 'Firewall configuration failed' })
-    }
-  })
-
-  app.get('/api/platform', async (_req, res) => {
-    const [platform, availableClis, hostName] = await Promise.all([
-      detectPlatform(),
-      detectAvailableClis(),
-      detectHostName(),
-    ])
-    res.json({ platform, availableClis, hostName })
-  })
-
-  app.get('/api/version', async (_req, res) => {
-    try {
-      const updateCheck = await checkForUpdate(APP_VERSION)
-      res.json({ currentVersion: APP_VERSION, updateCheck })
-    } catch (err) {
-      log.warn({ err }, 'Version check failed')
-      res.json({ currentVersion: APP_VERSION, updateCheck: null })
-    }
-  })
-
-  app.get('/api/files/candidate-dirs', async (_req, res) => {
-    const cfg = await configStore.snapshot()
-    const providerCwds = Object.values(cfg.settings?.codingCli?.providers || {}).map((provider) => provider?.cwd)
-    const directories = collectCandidateDirectories({
-      projects: codingCliIndexer.getProjects(),
-      terminals: registry.list(),
-      recentDirectories: cfg.recentDirectories || [],
-      providerCwds,
-      defaultCwd: cfg.settings?.defaultCwd,
-    })
-    res.json({ directories })
-  })
-
-  type NormalizedSettingsPatch = Omit<SettingsPatch, 'defaultCwd'> & { defaultCwd?: string }
-
-  const normalizeSettingsPatch = (patch: SettingsPatch): NormalizedSettingsPatch => {
-    const normalized = { ...patch }
-    if (Object.prototype.hasOwnProperty.call(normalized, 'defaultCwd')) {
-      const raw = patch.defaultCwd
-      if (raw === null) {
-        delete normalized.defaultCwd
-      } else if (typeof raw === 'string' && raw.trim() === '') {
-        delete normalized.defaultCwd
-      }
-    }
-    return normalized as NormalizedSettingsPatch
-  }
-
-  app.patch('/api/settings', async (req, res) => {
-    const parsed = SettingsPatchSchema.safeParse(req.body || {})
-    if (!parsed.success) {
-      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
-    }
-    const patch = normalizeSettingsPatch(migrateSettingsSortMode(parsed.data))
-    const updated = await configStore.patchSettings(patch)
-    const migrated = migrateSettingsSortMode(updated)
-    registry.setSettings(migrated)
-    applyDebugLogging(!!migrated.logging?.debug, 'settings')
-    wsHandler.broadcast({ type: 'settings.updated', settings: migrated })
-	    await withPerfSpan(
-	      'coding_cli_refresh',
-	      () => codingCliIndexer.refresh(),
-	      {},
-	      { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
-	    )
-    res.json(migrated)
-  })
 
   // --- API: sessions ---
-  // Search endpoint must come BEFORE the generic /api/sessions route
-  app.get('/api/sessions/search', async (req, res) => {
-    try {
-      const { SearchRequestSchema, searchSessions } = await import('./session-search.js')
+  app.use('/api', createSessionsRouter({
+    configStore,
+    codingCliIndexer,
+    codingCliProviders,
+    perfConfig,
+    terminalMetadata,
+    registry,
+    wsHandler,
+  }))
 
-      const parsed = SearchRequestSchema.safeParse({
-        query: req.query.q,
-        tier: req.query.tier || 'title',
-        limit: req.query.limit ? Number(req.query.limit) : undefined,
-        maxFiles: req.query.maxFiles ? Number(req.query.maxFiles) : undefined,
-      })
-
-      if (!parsed.success) {
-        return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
-      }
-
-      const endSearchTimer = startPerfTimer(
-        'sessions_search',
-        {
-          queryLength: parsed.data.query.length,
-          tier: parsed.data.tier,
-          limit: parsed.data.limit,
-        },
-        { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
-      )
-
-      try {
-        const response = await searchSessions({
-          projects: codingCliIndexer.getProjects(),
-          providers: codingCliProviders,
-          query: parsed.data.query,
-          tier: parsed.data.tier,
-          limit: parsed.data.limit,
-          maxFiles: parsed.data.maxFiles,
-        })
-
-        endSearchTimer({ resultCount: response.results.length, totalScanned: response.totalScanned })
-
-        res.json(response)
-      } catch (err: any) {
-        endSearchTimer({
-          error: true,
-          errorName: err?.name,
-          errorMessage: err?.message,
-        })
-        throw err
-      }
-    } catch (err: any) {
-      log.error({ err }, 'Session search failed')
-      res.status(500).json({ error: 'Search failed' })
-    }
-  })
-
-  app.get('/api/sessions', async (_req, res) => {
-    res.json(codingCliIndexer.getProjects())
-  })
-
-  app.patch('/api/sessions/:sessionId', async (req, res) => {
-    const rawId = req.params.sessionId
-    const provider = (req.query.provider as CodingCliProviderName) || 'claude'
-    const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
-    const SessionPatchSchema = z.object({
-      titleOverride: z.string().optional().nullable(),
-      summaryOverride: z.string().optional().nullable(),
-      deleted: z.coerce.boolean().optional(),
-      archived: z.coerce.boolean().optional(),
-      createdAtOverride: z.coerce.number().optional(),
-    })
-    const parsed = SessionPatchSchema.safeParse(req.body || {})
-    if (!parsed.success) {
-      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
-    }
-    const cleanString = (value: string | null | undefined) => {
-      const trimmed = typeof value === 'string' ? value.trim() : value
-      return trimmed ? trimmed : undefined
-    }
-    const { titleOverride, summaryOverride, deleted, archived, createdAtOverride } = parsed.data
-	    const next = await configStore.patchSessionOverride(compositeKey, {
-	      titleOverride: cleanString(titleOverride),
-	      summaryOverride: cleanString(summaryOverride),
-	      deleted,
-	      archived,
-	      createdAtOverride,
-	    })
-
-    // Cascade: if this session is running in a terminal, also rename the terminal
-    const cleanTitle = cleanString(titleOverride)
-    let cascadedTerminalId: string | undefined
-    if (cleanTitle) {
-      try {
-        const parts = compositeKey.split(':')
-        const sessionProvider = (parts.length >= 2 ? parts[0] : provider) as CodingCliProviderName
-        const sessionId = parts.length >= 2 ? parts.slice(1).join(':') : rawId
-        cascadedTerminalId = await cascadeSessionRenameToTerminal(
-          terminalMetadata.list(),
-          sessionProvider,
-          sessionId,
-          cleanTitle,
-        )
-        if (cascadedTerminalId) {
-          registry.updateTitle(cascadedTerminalId, cleanTitle)
-          wsHandler.broadcast({ type: 'terminal.list.updated' })
-        }
-      } catch (err) {
-        log.warn({ err, compositeKey }, 'Cascade rename to terminal failed (non-fatal)')
-      }
-    }
-
-	    await codingCliIndexer.refresh()
-	    res.json({ ...next, cascadedTerminalId })
-	  })
-
-  app.delete('/api/sessions/:sessionId', async (req, res) => {
-    const rawId = req.params.sessionId
-    const provider = (req.query.provider as CodingCliProviderName) || 'claude'
-	    const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
-	    await configStore.deleteSession(compositeKey)
-	    await codingCliIndexer.refresh()
-	    res.json({ ok: true })
-	  })
-
-  app.put('/api/project-colors', async (req, res) => {
-	    const { projectPath, color } = req.body || {}
-	    if (!projectPath || !color) return res.status(400).json({ error: 'projectPath and color required' })
-	    await configStore.setProjectColor(projectPath, color)
-	    await codingCliIndexer.refresh()
-	    res.json({ ok: true })
-	  })
+  app.use('/api', createProjectColorsRouter({ configStore, codingCliIndexer }))
 
   // --- API: terminals ---
-  app.get('/api/terminals', async (_req, res) => {
-    const cfg = await configStore.snapshot()
-    const list = registry.list().filter((t) => !cfg.terminalOverrides?.[t.terminalId]?.deleted)
-    const merged = list.map((t) => {
-      const ov = cfg.terminalOverrides?.[t.terminalId]
-      return {
-        ...t,
-        title: ov?.titleOverride || t.title,
-        description: ov?.descriptionOverride || t.description,
-      }
-    })
-    res.json(merged)
-  })
-
-  app.patch('/api/terminals/:terminalId', async (req, res) => {
-    const terminalId = req.params.terminalId
-    const { titleOverride, descriptionOverride, deleted } = req.body || {}
-
-    const next = await configStore.patchTerminalOverride(terminalId, {
-      titleOverride,
-      descriptionOverride,
-      deleted,
-    })
-
-    // Update live registry copies for immediate UI update.
-    if (typeof titleOverride === 'string' && titleOverride.trim()) registry.updateTitle(terminalId, titleOverride.trim())
-    if (typeof descriptionOverride === 'string') registry.updateDescription(terminalId, descriptionOverride)
-
-    // Cascade: if this terminal has a coding CLI session, also rename the session
-    if (typeof titleOverride === 'string' && titleOverride.trim()) {
-      try {
-        const meta = terminalMetadata.list().find((m) => m.terminalId === terminalId)
-        await cascadeTerminalRenameToSession(meta, titleOverride.trim())
-        if (meta?.provider && meta?.sessionId) {
-          await codingCliIndexer.refresh()
-        }
-      } catch (err) {
-        log.warn({ err, terminalId }, 'Cascade rename to session failed (non-fatal)')
-      }
-    }
-
-    wsHandler.broadcast({ type: 'terminal.list.updated' })
-    res.json(next)
-  })
-
-  app.delete('/api/terminals/:terminalId', async (req, res) => {
-    const terminalId = req.params.terminalId
-    await configStore.deleteTerminal(terminalId)
-    wsHandler.broadcast({ type: 'terminal.list.updated' })
-    res.json({ ok: true })
-  })
+  app.use('/api/terminals', createTerminalsRouter({ configStore, registry, wsHandler, terminalMetadata, codingCliIndexer }))
 
   // --- API: AI ---
-  app.post('/api/ai/terminals/:terminalId/summary', async (req, res) => {
-    const terminalId = req.params.terminalId
-    const term = registry.get(terminalId)
-    if (!term) return res.status(404).json({ error: 'Terminal not found' })
-
-    const snapshot = term.buffer.snapshot().slice(-20_000)
-
-    // Fallback heuristic if AI not configured or fails.
-    const heuristic = () => {
-      const cleaned = stripAnsi(snapshot)
-      const lines = cleaned.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
-      const first = lines[0] || 'Terminal session'
-      const second = lines[1] || ''
-      const desc = [first, second].filter(Boolean).join(' - ').slice(0, 240)
-      return desc || 'Terminal session'
-    }
-
-    if (!AI_CONFIG.enabled()) {
-      return res.json({ description: heuristic(), source: 'heuristic' })
-    }
-
-    const endSummaryTimer = startPerfTimer(
-      'ai_summary',
-      { terminalId, snapshotChars: snapshot.length },
-      { minDurationMs: perfConfig.slowAiSummaryMs, level: 'warn' },
-    )
-    let summarySource: 'ai' | 'heuristic' = 'ai'
-    let summaryError = false
-
-    try {
-      const { generateText } = await import('ai')
-      const { google } = await import('@ai-sdk/google')
-      const promptConfig = PROMPTS.terminalSummary
-      const model = google(promptConfig.model)
-      const prompt = promptConfig.build(snapshot)
-
-      const result = await generateText({
-        model,
-        prompt,
-        maxOutputTokens: promptConfig.maxOutputTokens,
-      })
-
-      const description = (result.text || '').trim().slice(0, 240) || heuristic()
-      res.json({ description, source: 'ai' })
-    } catch (err: any) {
-      summarySource = 'heuristic'
-      summaryError = true
-      log.warn({ err }, 'AI summary failed; using heuristic')
-      res.json({ description: heuristic(), source: 'heuristic' })
-    } finally {
-      endSummaryTimer({ source: summarySource, error: summaryError })
-    }
-  })
+  app.use('/api/ai', createAiRouter({ registry, perfConfig }))
 
   // --- API: files (for editor pane) ---
-  app.use('/api/files', filesRouter)
+  app.use('/api/files', createFilesRouter({ configStore, codingCliIndexer, registry }))
+
+  // --- API: debug ---
+  app.use('/api/debug', createDebugRouter({
+    appVersion: APP_VERSION,
+    configStore,
+    wsHandler,
+    codingCliIndexer,
+    tabsRegistryStore,
+    registry,
+  }))
 
   // --- API: port forwarding (for browser pane remote access) ---
   const portForwardManager = new PortForwardManager()
-
-  app.post('/api/proxy/forward', async (req, res) => {
-    const { port: targetPort } = req.body || {}
-
-    if (!Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) {
-      return res.status(400).json({ error: 'Invalid port number' })
-    }
-
-    try {
-      const requester = getRequesterIdentity(req)
-      const result = await portForwardManager.forward(targetPort, requester)
-      res.json({ forwardedPort: result.port })
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err)
-      log.error({ err, targetPort }, 'Port forward failed')
-      res.status(500).json({ error: `Failed to create port forward: ${msg}` })
-    }
-  })
-
-  app.delete('/api/proxy/forward/:port', (req, res) => {
-    const targetPort = parseInt(req.params.port, 10)
-    if (!Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) {
-      return res.status(400).json({ error: 'Invalid port number' })
-    }
-    try {
-      const requester = getRequesterIdentity(req)
-      portForwardManager.close(targetPort, requester.key)
-      res.json({ ok: true })
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err)
-      log.error({ err, targetPort }, 'Port forward close failed')
-      res.status(500).json({ error: `Failed to close port forward: ${msg}` })
-    }
-  })
+  app.use('/api/proxy', createProxyRouter({ portForwardManager }))
 
   // --- Static client in production ---
   const distRoot = path.resolve(__dirname, '..')

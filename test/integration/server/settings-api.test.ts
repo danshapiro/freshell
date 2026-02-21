@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect, beforeEach, afterEach, vi, beforeAll, afterAll } from 'vitest'
 import express, { type Express } from 'express'
 import request from 'supertest'
@@ -24,7 +25,7 @@ vi.mock('os', async () => {
 
 // Import after mocking
 import { ConfigStore, defaultSettings, type AppSettings } from '../../../server/config-store'
-import { SettingsPatchSchema } from '../../../server/settings-schema'
+import { createSettingsRouter } from '../../../server/settings-router'
 
 const TEST_AUTH_TOKEN = 'test-auth-token-12345678'
 
@@ -63,41 +64,15 @@ describe('Settings API Integration', () => {
       next()
     })
 
-    // Settings routes matching server/index.ts
-    app.get('/api/settings', async (_req, res) => {
-      const s = await configStore.getSettings()
-      res.json(s)
-    })
-
-    const normalizeSettingsPatch = (patch: Record<string, any>) => {
-      if (Object.prototype.hasOwnProperty.call(patch, 'defaultCwd')) {
-        const raw = patch.defaultCwd
-        if (raw === null) {
-          patch.defaultCwd = undefined
-        } else if (typeof raw === 'string' && raw.trim() === '') {
-          patch.defaultCwd = undefined
-        }
-      }
-      return patch
-    }
-
-    app.patch('/api/settings', async (req, res) => {
-      const parsed = SettingsPatchSchema.safeParse(req.body || {})
-      if (!parsed.success) {
-        return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
-      }
-      const updated = await configStore.patchSettings(normalizeSettingsPatch(parsed.data as any))
-      res.json(updated)
-    })
-
-    app.put('/api/settings', async (req, res) => {
-      const parsed = SettingsPatchSchema.safeParse(req.body || {})
-      if (!parsed.success) {
-        return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
-      }
-      const updated = await configStore.patchSettings(normalizeSettingsPatch(parsed.data as any))
-      res.json(updated)
-    })
+    // Mount settings router
+    app.use('/api/settings', createSettingsRouter({
+      configStore,
+      registry: { setSettings: vi.fn() },
+      wsHandler: { broadcast: vi.fn() },
+      codingCliIndexer: { refresh: vi.fn().mockResolvedValue(undefined) },
+      perfConfig: { slowSessionRefreshMs: 500 },
+      applyDebugLogging: vi.fn(),
+    }))
   })
 
   afterEach(async () => {

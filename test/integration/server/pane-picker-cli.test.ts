@@ -1,9 +1,11 @@
+// @vitest-environment node
 import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from 'vitest'
 import http from 'http'
 import WebSocket from 'ws'
 import express, { type Express } from 'express'
 import request from 'supertest'
 import { detectPlatform, detectAvailableClis } from '../../../server/platform.js'
+import { createPlatformRouter } from '../../../server/platform-router'
 
 const TEST_TIMEOUT_MS = 30_000
 const HOOK_TIMEOUT_MS = 30_000
@@ -171,14 +173,14 @@ describe('Pane Picker CLI Integration', () => {
         next()
       })
 
-      // Mirror the actual server/index.ts implementation
-      app.get('/api/platform', async (_req, res) => {
-        const [platform, availableClis] = await Promise.all([
-          detectPlatform(),
-          detectAvailableClis(),
-        ])
-        res.json({ platform, availableClis })
-      })
+      // Mount real platform router
+      app.use('/api', createPlatformRouter({
+        detectPlatform,
+        detectAvailableClis,
+        detectHostName: vi.fn().mockResolvedValue('test-host'),
+        checkForUpdate: vi.fn().mockResolvedValue(null),
+        appVersion: '0.0.0-test',
+      }))
     })
 
     afterAll(() => {

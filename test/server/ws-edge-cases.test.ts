@@ -1422,6 +1422,37 @@ describe('WebSocket edge cases', () => {
         await new Promise((r) => setTimeout(r, 200))
       }
     })
+
+    it('includes close code 4003 in the reason when max connections exceeded', async () => {
+      await new Promise((r) => setTimeout(r, 300))
+      const connections: WebSocket[] = []
+      const closes: (() => void)[] = []
+
+      try {
+        // Fill up all 5 connection slots
+        for (let i = 0; i < 5; i++) {
+          const { ws, close } = await createAuthenticatedConnection()
+          connections.push(ws)
+          closes.push(close)
+        }
+
+        // 6th connection gets rejected with close code and reason
+        const wsExtra = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+        const closeEvent = await new Promise<{ code: number; reason: string }>((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error('Timeout')), 5000)
+          wsExtra.on('close', (code, reason) => {
+            clearTimeout(timeout)
+            resolve({ code, reason: reason.toString() })
+          })
+        })
+
+        expect(closeEvent.code).toBe(4003)
+        expect(closeEvent.reason).toBe('Too many connections')
+      } finally {
+        closes.forEach((c) => c())
+        await new Promise((r) => setTimeout(r, 200))
+      }
+    })
   })
 
   describe('Race conditions', () => {

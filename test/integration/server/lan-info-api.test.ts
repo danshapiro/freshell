@@ -1,6 +1,8 @@
+// @vitest-environment node
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import express, { type Express } from 'express'
 import request from 'supertest'
+import { createNetworkRouter } from '../../../server/network-router.js'
 
 const TEST_AUTH_TOKEN = 'test-auth-token-12345678'
 
@@ -27,12 +29,23 @@ describe('LAN Info API', () => {
       next()
     })
 
-    // Mock detectLanIps for testing
-    const mockDetectLanIps = () => ['192.168.1.100', '10.0.0.50']
-
-    app.get('/api/lan-info', (_req, res) => {
-      res.json({ ips: mockDetectLanIps() })
-    })
+    // Mount network router with mock deps (only lan-info matters here)
+    app.use('/api', createNetworkRouter({
+      networkManager: {
+        getStatus: async () => ({}),
+        configure: async () => ({ rebindScheduled: false }),
+        getRelevantPorts: () => [],
+        setFirewallConfiguring: () => {},
+        resetFirewallCache: () => {},
+      },
+      configStore: {
+        getSettings: async () => ({}),
+      },
+      wsHandler: {
+        broadcast: () => {},
+      },
+      detectLanIps: () => ['192.168.1.100', '10.0.0.50'],
+    }))
   })
 
   afterAll(() => {

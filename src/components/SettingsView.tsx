@@ -930,6 +930,47 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
             </div>
           </SettingsSection>
 
+          {/* Editor */}
+          <SettingsSection title="Editor" description="External editor for file opening">
+            <SettingsRow label="External editor" description="Which editor to use when opening files from the editor pane">
+              <select
+                value={settings.editor?.externalEditor ?? 'auto'}
+                onChange={(e) => {
+                  const v = e.target.value as 'auto' | 'cursor' | 'code' | 'custom'
+                  dispatch(updateSettingsLocal({ editor: { externalEditor: v } }))
+                  scheduleSave({ editor: { externalEditor: v } })
+                }}
+                className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
+              >
+                <option value="auto">Auto (system default)</option>
+                <option value="cursor">Cursor</option>
+                <option value="code">VS Code</option>
+                <option value="custom">Custom command</option>
+              </select>
+            </SettingsRow>
+            {settings.editor?.externalEditor === 'custom' && (
+              <SettingsRow
+                label="Custom command"
+                description="Command template. Use {file}, {line}, {col} as placeholders."
+              >
+                <input
+                  type="text"
+                  value={settings.editor?.customEditorCommand ?? ''}
+                  placeholder="nvim +{line} {file}"
+                  onChange={(e) => {
+                    dispatch(updateSettingsLocal({
+                      editor: { customEditorCommand: e.target.value },
+                    }))
+                    scheduleSave({
+                      editor: { customEditorCommand: e.target.value },
+                    })
+                  }}
+                  className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:max-w-xs"
+                />
+              </SettingsRow>
+            )}
+          </SettingsSection>
+
           {/* Safety */}
           <SettingsSection title="Safety" description="Auto-kill and idle terminal management">
             <SettingsRow label="Auto-kill idle (minutes)">
