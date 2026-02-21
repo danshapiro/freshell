@@ -48,6 +48,7 @@ import { checkForUpdate } from './updater/version-checker.js'
 import { SessionAssociationCoordinator } from './session-association-coordinator.js'
 import { loadOrCreateServerInstanceId } from './instance-id.js'
 import { createSettingsRouter } from './settings-router.js'
+import { createPerfRouter } from './perf-router.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -239,15 +240,12 @@ async function main() {
 
   applyDebugLogging(!!settings.logging?.debug, 'settings')
 
-  app.post('/api/perf', async (req, res) => {
-    const enabled = req.body?.enabled === true
-    const updated = await configStore.patchSettings({ logging: { debug: enabled } })
-    const migrated = migrateSettingsSortMode(updated)
-    registry.setSettings(migrated)
-    applyDebugLogging(!!migrated.logging?.debug, 'api')
-    wsHandler.broadcast({ type: 'settings.updated', settings: migrated })
-    res.json({ ok: true, enabled })
-  })
+  app.use('/api/perf', createPerfRouter({
+    configStore,
+    registry,
+    wsHandler,
+    applyDebugLogging,
+  }))
 
   // --- API: settings ---
   app.use('/api/settings', createSettingsRouter({
