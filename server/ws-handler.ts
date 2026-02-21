@@ -49,7 +49,7 @@ import {
   SdkSetPermissionModeSchema,
 } from '../shared/ws-protocol.js'
 
-const MAX_CONNECTIONS = Number(process.env.MAX_CONNECTIONS || 10)
+const MAX_CONNECTIONS = Number(process.env.MAX_CONNECTIONS || 50)
 const HELLO_TIMEOUT_MS = Number(process.env.HELLO_TIMEOUT_MS || 5_000)
 const PING_INTERVAL_MS = Number(process.env.PING_INTERVAL_MS || 30_000)
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
