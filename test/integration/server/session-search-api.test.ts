@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll, vi } from 'vitest'
 import express, { type Express } from 'express'
 import request from 'supertest'
@@ -18,8 +19,8 @@ vi.mock('os', async () => {
   }
 })
 
-import { searchSessions, SearchRequestSchema } from '../../../server/session-search.js'
 import { claudeProvider } from '../../../server/coding-cli/providers/claude.js'
+import { createSessionsRouter } from '../../../server/sessions-router.js'
 import type { ProjectGroup } from '../../../server/coding-cli/types.js'
 
 const TEST_AUTH_TOKEN = 'test-auth-token'
@@ -89,34 +90,19 @@ describe('Session Search API', () => {
       next()
     })
 
-    // Search endpoint
-    app.get('/api/sessions/search', async (req, res) => {
-      try {
-        const parsed = SearchRequestSchema.safeParse({
-          query: req.query.q,
-          tier: req.query.tier || 'title',
-          limit: req.query.limit ? Number(req.query.limit) : undefined,
-          maxFiles: req.query.maxFiles ? Number(req.query.maxFiles) : undefined,
-        })
-
-        if (!parsed.success) {
-          return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
-        }
-
-        const response = await searchSessions({
-          projects: mockProjects,
-          providers: [claudeProvider],
-          query: parsed.data.query,
-          tier: parsed.data.tier,
-          limit: parsed.data.limit,
-          maxFiles: parsed.data.maxFiles,
-        })
-
-        res.json(response)
-      } catch (err: any) {
-        res.status(500).json({ error: err.message })
-      }
-    })
+    // Mount sessions router
+    app.use('/api', createSessionsRouter({
+      configStore: {
+        patchSessionOverride: vi.fn().mockResolvedValue({}),
+        deleteSession: vi.fn().mockResolvedValue(undefined),
+      },
+      codingCliIndexer: {
+        getProjects: () => mockProjects,
+        refresh: vi.fn().mockResolvedValue(undefined),
+      },
+      codingCliProviders: [claudeProvider],
+      perfConfig: { slowSessionRefreshMs: 500 },
+    }))
   })
 
   afterEach(async () => {

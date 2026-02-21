@@ -19,7 +19,7 @@ import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
 import { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { claudeProvider } from './coding-cli/providers/claude.js'
 import { codexProvider } from './coding-cli/providers/codex.js'
-import { makeSessionKey, type CodingCliProviderName, type CodingCliSession } from './coding-cli/types.js'
+import { type CodingCliProviderName, type CodingCliSession } from './coding-cli/types.js'
 import { TerminalMetadataService } from './terminal-metadata-service.js'
 import { AI_CONFIG, PROMPTS, stripAnsi } from './ai-prompts.js'
 import { migrateSettingsSortMode } from './settings-migrate.js'
@@ -29,6 +29,7 @@ import { createProxyRouter } from './proxy-router.js'
 import { createLocalFileRouter } from './local-file-router.js'
 import { createTerminalsRouter } from './terminals-router.js'
 import { createProjectColorsRouter } from './project-colors-router.js'
+import { createSessionsRouter } from './sessions-router.js'
 import { getSessionRepairService } from './session-scanner/service.js'
 import { SdkBridge } from './sdk-bridge.js'
 import { createClientLogsRouter } from './client-logs.js'
@@ -43,7 +44,6 @@ import { PortForwardManager } from './port-forward.js'
 import { getRequesterIdentity, parseTrustProxyEnv } from './request-ip.js'
 import { collectCandidateDirectories } from './candidate-dirs.js'
 import { createTabsRegistryStore } from './tabs-registry/store.js'
-import { cleanString } from './utils.js'
 import { checkForUpdate } from './updater/version-checker.js'
 import { SessionAssociationCoordinator } from './session-association-coordinator.js'
 import { loadOrCreateServerInstanceId } from './instance-id.js'
@@ -469,98 +469,12 @@ async function main() {
   })
 
   // --- API: sessions ---
-  // Search endpoint must come BEFORE the generic /api/sessions route
-  app.get('/api/sessions/search', async (req, res) => {
-    try {
-      const { SearchRequestSchema, searchSessions } = await import('./session-search.js')
-
-      const parsed = SearchRequestSchema.safeParse({
-        query: req.query.q,
-        tier: req.query.tier || 'title',
-        limit: req.query.limit ? Number(req.query.limit) : undefined,
-        maxFiles: req.query.maxFiles ? Number(req.query.maxFiles) : undefined,
-      })
-
-      if (!parsed.success) {
-        return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
-      }
-
-      const endSearchTimer = startPerfTimer(
-        'sessions_search',
-        {
-          queryLength: parsed.data.query.length,
-          tier: parsed.data.tier,
-          limit: parsed.data.limit,
-        },
-        { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
-      )
-
-      try {
-        const response = await searchSessions({
-          projects: codingCliIndexer.getProjects(),
-          providers: codingCliProviders,
-          query: parsed.data.query,
-          tier: parsed.data.tier,
-          limit: parsed.data.limit,
-          maxFiles: parsed.data.maxFiles,
-        })
-
-        endSearchTimer({ resultCount: response.results.length, totalScanned: response.totalScanned })
-
-        res.json(response)
-      } catch (err: any) {
-        endSearchTimer({
-          error: true,
-          errorName: err?.name,
-          errorMessage: err?.message,
-        })
-        throw err
-      }
-    } catch (err: any) {
-      log.error({ err }, 'Session search failed')
-      res.status(500).json({ error: 'Search failed' })
-    }
-  })
-
-  app.get('/api/sessions', async (_req, res) => {
-    res.json(codingCliIndexer.getProjects())
-  })
-
-  app.patch('/api/sessions/:sessionId', async (req, res) => {
-    const rawId = req.params.sessionId
-    const provider = (req.query.provider as CodingCliProviderName) || 'claude'
-    const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
-    const SessionPatchSchema = z.object({
-      titleOverride: z.string().optional().nullable(),
-      summaryOverride: z.string().optional().nullable(),
-      deleted: z.coerce.boolean().optional(),
-      archived: z.coerce.boolean().optional(),
-      createdAtOverride: z.coerce.number().optional(),
-    })
-    const parsed = SessionPatchSchema.safeParse(req.body || {})
-    if (!parsed.success) {
-      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
-    }
-    const { titleOverride, summaryOverride, deleted, archived, createdAtOverride } = parsed.data
-	    const next = await configStore.patchSessionOverride(compositeKey, {
-	      titleOverride: cleanString(titleOverride),
-	      summaryOverride: cleanString(summaryOverride),
-	      deleted,
-	      archived,
-	      createdAtOverride,
-	    })
-	    await codingCliIndexer.refresh()
-	    res.json(next)
-	  })
-
-  app.delete('/api/sessions/:sessionId', async (req, res) => {
-    const rawId = req.params.sessionId
-    const provider = (req.query.provider as CodingCliProviderName) || 'claude'
-	    const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
-	    await configStore.deleteSession(compositeKey)
-	    await codingCliIndexer.refresh()
-	    res.json({ ok: true })
-	  })
+  app.use('/api', createSessionsRouter({
+    configStore,
+    codingCliIndexer,
+    codingCliProviders,
+    perfConfig,
+  }))
 
   app.use('/api', createProjectColorsRouter({ configStore, codingCliIndexer }))
 
