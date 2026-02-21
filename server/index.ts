@@ -48,6 +48,7 @@ import { loadOrCreateServerInstanceId } from './instance-id.js'
 import { createSettingsRouter } from './settings-router.js'
 import { createPerfRouter } from './perf-router.js'
 import { createAiRouter } from './ai-router.js'
+import { createDebugRouter } from './debug-router.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -124,22 +125,14 @@ async function main() {
   const codingCliSessionManager = new CodingCliSessionManager(codingCliProviders)
   const tabsRegistryStore = createTabsRegistryStore()
 
-  app.get('/api/debug', async (_req, res) => {
-    const cfg = await configStore.snapshot()
-    res.json({
-      version: 1,
-      appVersion: APP_VERSION,
-      wsConnections: wsHandler.connectionCount(),
-      settings: cfg.settings,
-      sessionsProjects: codingCliIndexer.getProjects(),
-      tabsRegistry: {
-        recordCount: tabsRegistryStore.count(),
-        deviceCount: tabsRegistryStore.listDevices().length,
-      },
-      terminals: registry.list(),
-      time: new Date().toISOString(),
-    })
-  })
+  app.use('/api/debug', createDebugRouter({
+    appVersion: APP_VERSION,
+    configStore,
+    wsHandler,
+    codingCliIndexer,
+    tabsRegistryStore,
+    registry,
+  }))
 
   const settings = migrateSettingsSortMode(await configStore.getSettings())
   const registry = new TerminalRegistry(settings)

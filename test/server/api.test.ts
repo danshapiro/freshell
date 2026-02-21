@@ -1,7 +1,9 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+// @vitest-environment node
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest'
 import express, { type Express } from 'express'
 import request from 'supertest'
 import { createRequire } from 'module'
+import { createDebugRouter } from '../../server/debug-router.js'
 
 const require = createRequire(import.meta.url)
 const packageJson = require('../../package.json')
@@ -37,18 +39,15 @@ describe('API Endpoints', () => {
       res.json({ app: 'freshell', ok: true, version: APP_VERSION, ready: true })
     })
 
-    // Debug endpoint - mirrors server/index.ts
-    app.get('/api/debug', async (_req, res) => {
-      res.json({
-        version: 1,
-        appVersion: APP_VERSION,
-        wsConnections: 0,
-        settings: {},
-        sessionsProjects: [],
-        terminals: [],
-        time: new Date().toISOString(),
-      })
-    })
+    // Debug endpoint - using real router
+    app.use('/api/debug', createDebugRouter({
+      appVersion: APP_VERSION,
+      configStore: { snapshot: vi.fn().mockResolvedValue({ settings: {} }) },
+      wsHandler: { connectionCount: () => 0 },
+      codingCliIndexer: { getProjects: () => [] },
+      tabsRegistryStore: { count: () => 0, listDevices: () => [] },
+      registry: { list: () => [] },
+    }))
   })
 
   afterAll(() => {
