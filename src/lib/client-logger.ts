@@ -221,10 +221,14 @@ function fingerprintForEntry(entry: ClientLogEntry): string {
 
 function shouldDropDuplicateEntry(entry: ClientLogEntry, recentByFingerprint: Map<string, number>): boolean {
   const now = Date.now()
+  const staleFingerprints: string[] = []
   for (const [fingerprint, lastSeenAt] of recentByFingerprint) {
     if (now - lastSeenAt >= DEDUPE_WINDOW_MS) {
-      recentByFingerprint.delete(fingerprint)
+      staleFingerprints.push(fingerprint)
     }
+  }
+  for (const fingerprint of staleFingerprints) {
+    recentByFingerprint.delete(fingerprint)
   }
 
   const fingerprint = fingerprintForEntry(entry)
