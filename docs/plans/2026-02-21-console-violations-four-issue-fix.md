@@ -4,7 +4,7 @@
 
 **Goal:** Eliminate the four high-impact console issues by fixing chunked-attach routing noise, reducing WebSocket message-handler main-thread cost, removing forced reflow/slow RAF hotspots, and bounding `/api/logs/client` overhead.
 
-**Architecture:** Split terminal data handling into a fast ingest path and a scheduled render path so `ws.onmessage` only routes/enqueues work. Tighten chunked-attach routing so non-owning panes ignore attach frames without warning spam. Coalesce terminal layout writes (`fit`, `resize`, `scrollToBottom`) into a single frame scheduler, and add client-log transport guards to prevent perf-log feedback loops.
+**Architecture:** Split terminal data handling into a fast ingest path and a scheduled render path so `ws.onmessage` only routes/enqueues work. Tighten chunked-attach routing so non-owning panes ignore attach frames without warning spam. Coalesce terminal layout writes (`fit`, `resize`) and snapshot replay scroll work into a single frame scheduler (without changing live-output scroll behavior), and add client-log transport guards to prevent perf-log feedback loops.
 
 **Tech Stack:** React 18, TypeScript, xterm.js, ws WebSocket protocol, Vitest (unit + e2e), superwstest integration tests.
 
@@ -22,7 +22,7 @@
 
 3. Forced reflow + slow `requestAnimationFrame`
 - Introduce frame-coalesced terminal layout scheduler (single RAF for `fit` + `resize` + optional scroll).
-- Remove repeated immediate `scrollToBottom()` calls from per-message handlers.
+- Move snapshot replay scroll work behind the same RAF scheduler; do not alter live output scrolling semantics.
 
 4. Slow `/api/logs/client` fetch overhead
 - Add client-log dedupe/sampling/backoff.
@@ -106,7 +106,6 @@ git commit -m "test(perf): add failing regression coverage for chunked-attach sp
 
 **Files:**
 - Modify: `src/components/TerminalView.tsx`
-- Modify: `src/components/terminal/useChunkedAttach.ts`
 - Modify: `test/unit/client/components/TerminalView.lifecycle.test.tsx`
 - Test: `test/e2e/terminal-console-violations-regression.test.tsx`
 
@@ -144,8 +143,7 @@ const currentTerminalId = terminalIdRef.current
 const isChunkLifecycleType =
   msg.type === 'terminal.attached.start' ||
   msg.type === 'terminal.attached.chunk' ||
-  msg.type === 'terminal.attached.end' ||
-  msg.type === 'terminal.exit'
+  msg.type === 'terminal.attached.end'
 
 if (isChunkLifecycleType && msgTerminalId && currentTerminalId && msgTerminalId !== currentTerminalId) {
   return
@@ -154,15 +152,7 @@ if (isChunkLifecycleType && msgTerminalId && currentTerminalId && msgTerminalId 
 if (handleChunkLifecycleMessage(msg)) return
 ```
 
-In `src/components/terminal/useChunkedAttach.ts`, replace warn-paths with no-op ignore:
-
-```ts
-if (!inflight) {
-  return msg.terminalId === currentTerminalId
-}
-```
-
-(Or rate-limit to `debug` only if telemetry is still needed.)
+Keep mismatch filtering in `TerminalView.tsx` only. Do not duplicate equivalent routing logic inside `useChunkedAttach.ts`; that would create dead/duplicated behavior paths.
 
 **Step 4: Run tests to verify pass**
 
@@ -177,7 +167,7 @@ Expected: PASS for mismatch-warning assertions.
 **Step 5: Commit**
 
 ```bash
-git add src/components/TerminalView.tsx src/components/terminal/useChunkedAttach.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/e2e/terminal-console-violations-regression.test.tsx
+git add src/components/TerminalView.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/e2e/terminal-console-violations-regression.test.tsx
 git commit -m "fix(terminal): route chunked attach lifecycle by owning terminal and remove mismatched warning spam"
 ```
 
@@ -202,10 +192,14 @@ Create `test/unit/client/components/terminal/terminal-write-queue.test.ts`:
 ```ts
 it('processes queued writes in slices and preserves order', async () => {
   const writes: string[] = []
+  const rafCallbacks: FrameRequestCallback[] = []
   const queue = createTerminalWriteQueue({
     write: (chunk) => writes.push(chunk),
-    now: mockNow,
-    schedule: (cb) => setTimeout(cb, 0),
+    requestFrame: (cb) => {
+      rafCallbacks.push(cb)
+      return rafCallbacks.length
+    },
+    cancelFrame: () => {},
     budgetMs: 4,
   })
 
@@ -213,7 +207,8 @@ it('processes queued writes in slices and preserves order', async () => {
   queue.enqueue('B')
   queue.enqueue('C')
 
-  await flushTimers()
+  rafCallbacks.shift()?.(16)
+  rafCallbacks.shift()?.(32)
   expect(writes.join('')).toBe('ABC')
 })
 ```
@@ -239,21 +234,24 @@ export function createTerminalWriteQueue(params: {
   write: (data: string) => void
   onDrain?: () => void
   budgetMs?: number
+  requestFrame?: (cb: FrameRequestCallback) => number
+  cancelFrame?: (id: number) => void
 }) {
   const queue: string[] = []
-  let scheduled = false
+  let rafId: number | null = null
   const budgetMs = params.budgetMs ?? 8
+  const requestFrame = params.requestFrame ?? requestAnimationFrame
+  const cancelFrame = params.cancelFrame ?? cancelAnimationFrame
 
-  const flush = () => {
-    scheduled = false
-    const deadline = performance.now() + budgetMs
+  const flush = (startedAt: number) => {
+    rafId = null
+    const deadline = startedAt + budgetMs
     while (queue.length > 0 && performance.now() < deadline) {
       const next = queue.shift()!
       params.write(next)
     }
     if (queue.length > 0) {
-      scheduled = true
-      setTimeout(flush, 0)
+      rafId = requestFrame(flush)
       return
     }
     params.onDrain?.()
@@ -263,13 +261,16 @@ export function createTerminalWriteQueue(params: {
     enqueue(data: string) {
       if (!data) return
       queue.push(data)
-      if (!scheduled) {
-        scheduled = true
-        setTimeout(flush, 0)
+      if (rafId === null) {
+        rafId = requestFrame(flush)
       }
     },
     clear() {
       queue.length = 0
+      if (rafId !== null) {
+        cancelFrame(rafId)
+        rafId = null
+      }
     },
   }
 }
@@ -296,7 +297,10 @@ private safeSendOutputFrames(client: WebSocket, terminalId: string, data: string
 }
 ```
 
-Use `safeSendOutputFrames(...)` in both immediate and buffered flush paths.
+Apply `safeSendOutputFrames(...)` in all three server send sites:
+- `flushOutputBuffer` after `chunks.join('')` (split after join, not before).
+- `sendTerminalOutput` immediate path (`!shouldBatch`).
+- `sendTerminalOutput` overflow path (`nextSize > MAX_OUTPUT_BUFFER_CHARS` after flush).
 
 Add unit tests in `test/unit/server/terminal-lifecycle.test.ts`:
 
@@ -380,7 +384,7 @@ In `TerminalView.tsx`, use one scheduler instance for:
 - `ResizeObserver` callback,
 - "became visible" effect,
 - initial post-open fit,
-- scroll-to-bottom after queued writes drain.
+- snapshot replay completion scroll (not live output writes).
 
 Replace direct inline fit/resize calls with scheduler requests.
 
@@ -455,7 +459,9 @@ const recentByFingerprint = new Map<string, number>()
 const DEDUPE_WINDOW_MS = 5000
 
 function shouldDropDuplicate(entry: ClientLogEntry): boolean {
-  const fingerprint = `${entry.severity}:${entry.event}:${entry.message}`
+  const eventKey = entry.event ?? entry.consoleMethod ?? 'unknown'
+  const messageKey = entry.message ?? JSON.stringify(entry.args?.[0] ?? '')
+  const fingerprint = `${entry.severity}:${eventKey}:${messageKey}`
   const now = Date.now()
   const last = recentByFingerprint.get(fingerprint)
   recentByFingerprint.set(fingerprint, now)
@@ -589,11 +595,3 @@ git commit -m "chore(perf-plan): record verification outcomes for console violat
 - Follow strict Red-Green-Refactor for every task.
 - Keep commits small and task-scoped.
 - Run targeted tests after each step, then full `npm test` before merge.
-
-Plan complete and saved to `docs/plans/2026-02-21-console-violations-four-issue-fix.md`. Two execution options:
-
-**1. Subagent-Driven (this session)** - I dispatch fresh subagent per task, review between tasks, fast iteration
-
-**2. Parallel Session (separate)** - Open new session with executing-plans, batch execution with checkpoints
-
-Which approach?
