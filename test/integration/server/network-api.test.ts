@@ -6,13 +6,12 @@ import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import request from 'supertest'
-import { z } from 'zod'
 import { NetworkManager } from '../../../server/network-manager.js'
 import { createLocalFileRouter } from '../../../server/local-file-router.js'
+import { createNetworkRouter } from '../../../server/network-router.js'
 import { ConfigStore } from '../../../server/config-store.js'
 import { httpAuthMiddleware } from '../../../server/auth.js'
 import { detectFirewall } from '../../../server/firewall.js'
-import { firewallCommands } from '../../../server/firewall.js'
 
 // Mock firewall detection to avoid real system calls
 vi.mock('../../../server/firewall.js', async () => {
@@ -63,109 +62,13 @@ describe('Network API integration', () => {
     app.use(express.json())
     app.use('/api', httpAuthMiddleware)
 
-    // Register the same route handlers as server/index.ts
-    app.get('/api/network/status', async (_req, res) => {
-      try {
-        const status = await networkManager.getStatus()
-        res.json(status)
-      } catch (err) {
-        res.status(500).json({ error: 'Failed to get network status' })
-      }
-    })
-
-    const NetworkConfigureSchema = z.object({
-      host: z.enum(['127.0.0.1', '0.0.0.0']),
-      configured: z.boolean(),
-    })
-
-    app.post('/api/network/configure', async (req, res) => {
-      const parsed = NetworkConfigureSchema.safeParse(req.body || {})
-      if (!parsed.success) {
-        return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
-      }
-      try {
-        const { rebindScheduled } = await networkManager.configure(parsed.data)
-        const status = await networkManager.getStatus()
-        res.json({ ...status, rebindScheduled })
-      } catch (err) {
-        res.status(500).json({ error: 'Failed to configure network' })
-      }
-    })
-
-    // Firewall configuration endpoint (mirrors server/index.ts)
-    app.post('/api/network/configure-firewall', async (_req, res) => {
-      try {
-        const status = await networkManager.getStatus()
-        if (status.firewall.configuring) {
-          return res.status(409).json({
-            error: 'Firewall configuration already in progress',
-            method: 'in-progress',
-          })
-        }
-        const commands = status.firewall.commands
-        if (commands.length === 0) {
-          if (status.firewall.platform === 'wsl2') {
-            const { execFile } = await import('node:child_process')
-            const { buildPortForwardingScript, getWslIp } = await import('../../../server/wsl-port-forward.js')
-            const POWERSHELL_PATH = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
-            try {
-              const wslIp = getWslIp()
-              if (!wslIp) {
-                return res.status(500).json({ error: 'Could not detect WSL2 IP address' })
-              }
-              const ports = networkManager.getRelevantPorts()
-              const rawScript = buildPortForwardingScript(wslIp, ports)
-              const script = rawScript.replace(/\\\$/g, '$')
-              const escapedScript = script.replace(/'/g, "''")
-              networkManager.setFirewallConfiguring(true)
-              const child = execFile(POWERSHELL_PATH, [
-                '-Command',
-                `Start-Process powershell -Verb RunAs -Wait -ArgumentList '-Command', '${escapedScript}'`,
-              ], { timeout: 120000 }, (err: any) => {
-                networkManager.resetFirewallCache()
-                networkManager.setFirewallConfiguring(false)
-              })
-              child.on('error', () => {
-                networkManager.resetFirewallCache()
-                networkManager.setFirewallConfiguring(false)
-              })
-              return res.json({ method: 'wsl2', status: 'started' })
-            } catch {
-              networkManager.setFirewallConfiguring(false)
-              return res.status(500).json({ error: 'WSL2 port forwarding failed to start' })
-            }
-          }
-          return res.json({ method: 'none', message: 'No firewall detected' })
-        }
-        if (status.firewall.platform === 'windows') {
-          const { execFile } = await import('node:child_process')
-          const script = commands.join('; ')
-          const escapedScript = script.replace(/'/g, "''")
-          try {
-            networkManager.setFirewallConfiguring(true)
-            const child = execFile('powershell.exe', [
-              '-Command',
-              `Start-Process powershell -Verb RunAs -Wait -ArgumentList '-Command', '${escapedScript}'`,
-            ], { timeout: 120000 }, (err: any) => {
-              networkManager.resetFirewallCache()
-              networkManager.setFirewallConfiguring(false)
-            })
-            child.on('error', () => {
-              networkManager.resetFirewallCache()
-              networkManager.setFirewallConfiguring(false)
-            })
-            return res.json({ method: 'windows-elevated', status: 'started' })
-          } catch {
-            networkManager.setFirewallConfiguring(false)
-            return res.status(500).json({ error: 'Windows firewall configuration failed to start' })
-          }
-        }
-        const command = commands.join(' && ')
-        res.json({ method: 'terminal', command })
-      } catch (err) {
-        res.status(500).json({ error: 'Firewall configuration failed' })
-      }
-    })
+    // Mount the network router
+    app.use('/api', createNetworkRouter({
+      networkManager,
+      configStore,
+      wsHandler: { broadcast: vi.fn() },
+      detectLanIps: () => ['192.168.1.100'],
+    }))
 
     // Mount the real local-file router
     app.use('/local-file', createLocalFileRouter())
