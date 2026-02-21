@@ -501,7 +501,8 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
 
   it('does not close the socket for short-lived catastrophic bufferedAmount spikes', async () => {
     const registry = new FakeBrokerRegistry()
-    const broker = new TerminalStreamBroker(registry as any)
+    const perfSpy = vi.fn()
+    const broker = new TerminalStreamBroker(registry as any, perfSpy)
     registry.createTerminal('term-spike')
 
     const ws = createMockWs({
@@ -522,13 +523,15 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     ws.bufferedAmount = 0
     vi.advanceTimersByTime(100)
     expect(ws.send).toHaveBeenCalledWith(expect.stringContaining('"type":"terminal.output"'))
+    expect(perfSpy).not.toHaveBeenCalledWith('terminal_stream_catastrophic_close', expect.any(Object), expect.anything())
 
     broker.close()
   })
 
   it('closes the socket with 4008 after sustained catastrophic bufferedAmount', async () => {
     const registry = new FakeBrokerRegistry()
-    const broker = new TerminalStreamBroker(registry as any)
+    const perfSpy = vi.fn()
+    const broker = new TerminalStreamBroker(registry as any, perfSpy)
     registry.createTerminal('term-stalled')
 
     const ws = createMockWs({
@@ -545,6 +548,91 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     vi.advanceTimersByTime(11_000)
 
     expect(closeSpy).toHaveBeenCalledWith(4008, 'Catastrophic backpressure')
+    expect(closeSpy).toHaveBeenCalledTimes(1)
+    expect(perfSpy).toHaveBeenCalledWith(
+      'terminal_stream_catastrophic_close',
+      expect.objectContaining({ terminalId: 'term-stalled' }),
+      'warn',
+    )
+
+    broker.close()
+  })
+
+  it('emits terminal_stream_replay_miss and terminal_stream_gap events when replay window is exceeded', async () => {
+    const originalRingMax = process.env.TERMINAL_REPLAY_RING_MAX_BYTES
+    process.env.TERMINAL_REPLAY_RING_MAX_BYTES = '8'
+    try {
+      const registry = new FakeBrokerRegistry()
+      const perfSpy = vi.fn()
+      const broker = new TerminalStreamBroker(registry as any, perfSpy)
+      registry.createTerminal('term-replay')
+
+      const wsSeed = createMockWs()
+      await broker.attach(wsSeed as any, 'term-replay', 0)
+
+      registry.emit('terminal.output.raw', { terminalId: 'term-replay', data: 'aaaa', at: Date.now() })
+      registry.emit('terminal.output.raw', { terminalId: 'term-replay', data: 'bbbb', at: Date.now() })
+      registry.emit('terminal.output.raw', { terminalId: 'term-replay', data: 'cccc', at: Date.now() })
+
+      const wsReplay = createMockWs()
+      await broker.attach(wsReplay as any, 'term-replay', 0)
+
+      expect(perfSpy.mock.calls.some(([event, payload, level]) =>
+        event === 'terminal_stream_replay_miss' &&
+        payload?.terminalId === 'term-replay' &&
+        level === 'warn',
+      )).toBe(true)
+      expect(perfSpy.mock.calls.some(([event, payload]) =>
+        event === 'terminal_stream_gap' &&
+        payload?.terminalId === 'term-replay' &&
+        payload?.reason === 'replay_window_exceeded',
+      )).toBe(true)
+
+      broker.close()
+    } finally {
+      if (originalRingMax === undefined) delete process.env.TERMINAL_REPLAY_RING_MAX_BYTES
+      else process.env.TERMINAL_REPLAY_RING_MAX_BYTES = originalRingMax
+    }
+  })
+
+  it('emits terminal_stream_replay_hit, terminal_stream_queue_pressure, and terminal_stream_gap on overflow', async () => {
+    const registry = new FakeBrokerRegistry()
+    const perfSpy = vi.fn()
+    const broker = new TerminalStreamBroker(registry as any, perfSpy)
+    registry.createTerminal('term-overflow')
+
+    const wsSeed = createMockWs()
+    await broker.attach(wsSeed as any, 'term-overflow', 0)
+    registry.emit('terminal.output.raw', { terminalId: 'term-overflow', data: 'seed-1', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-overflow', data: 'seed-2', at: Date.now() })
+
+    const wsReplay = createMockWs()
+    await broker.attach(wsReplay as any, 'term-overflow', 1)
+    expect(perfSpy.mock.calls.some(([event, payload]) =>
+      event === 'terminal_stream_replay_hit' &&
+      payload?.terminalId === 'term-overflow' &&
+      payload?.sinceSeq === 1,
+    )).toBe(true)
+
+    const wsOverflow = createMockWs()
+    await broker.attach(wsOverflow as any, 'term-overflow', 0)
+
+    for (let i = 0; i < 220; i += 1) {
+      registry.emit('terminal.output.raw', { terminalId: 'term-overflow', data: 'x'.repeat(1024), at: Date.now() })
+    }
+    vi.advanceTimersByTime(5)
+
+    expect(perfSpy.mock.calls.some(([event, payload, level]) =>
+      event === 'terminal_stream_queue_pressure' &&
+      payload?.terminalId === 'term-overflow' &&
+      level === 'warn',
+    )).toBe(true)
+    expect(perfSpy.mock.calls.some(([event, payload, level]) =>
+      event === 'terminal_stream_gap' &&
+      payload?.terminalId === 'term-overflow' &&
+      payload?.reason === 'queue_overflow' &&
+      level === 'warn',
+    )).toBe(true)
 
     broker.close()
   })

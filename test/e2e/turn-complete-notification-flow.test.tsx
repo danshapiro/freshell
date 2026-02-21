@@ -201,7 +201,7 @@ function createStore(attentionDismiss: AttentionDismiss = 'click') {
         loaded: true,
       },
       connection: {
-        status: 'connected' as const,
+        status: 'ready' as const,
         error: null,
       },
       turnCompletion: {
@@ -275,6 +275,8 @@ describe('turn complete notification flow (e2e)', () => {
       wsMocks.emitMessage({
         type: 'terminal.output',
         terminalId: 'term-2',
+        seqStart: 1,
+        seqEnd: 1,
         data: '\x07',
       })
     })
@@ -319,6 +321,8 @@ describe('turn complete notification flow (e2e)', () => {
       wsMocks.emitMessage({
         type: 'terminal.output',
         terminalId: 'term-2',
+        seqStart: 1,
+        seqEnd: 1,
         data: '\x07',
       })
     })
@@ -369,6 +373,8 @@ describe('turn complete notification flow (e2e)', () => {
       wsMocks.emitMessage({
         type: 'terminal.output',
         terminalId: 'term-2',
+        seqStart: 1,
+        seqEnd: 1,
         data: '\x07',
       })
     })
@@ -405,6 +411,8 @@ describe('turn complete notification flow (e2e)', () => {
       wsMocks.emitMessage({
         type: 'terminal.output',
         terminalId: 'term-2',
+        seqStart: 1,
+        seqEnd: 1,
         data: '\x07',
       })
     })

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest'
 import http from 'http'
 import WebSocket from 'ws'
+import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
 
 vi.mock('../../server/config-store', () => ({
   configStore: {
@@ -117,7 +118,7 @@ describe('ws terminal metadata protocol', () => {
   it('returns terminal.meta.list.response for terminal.meta.list requests', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({ type: 'hello', token: 'terminal-meta-token' }))
+    ws.send(JSON.stringify({ type: 'hello', token: 'terminal-meta-token', protocolVersion: WS_PROTOCOL_VERSION }))
     await waitForMessage(ws, (msg) => msg.type === 'ready')
 
     ws.send(JSON.stringify({ type: 'terminal.meta.list', requestId: 'req-meta-1' }))
@@ -133,7 +134,7 @@ describe('ws terminal metadata protocol', () => {
   it('broadcasts terminal.meta.updated payloads', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({ type: 'hello', token: 'terminal-meta-token' }))
+    ws.send(JSON.stringify({ type: 'hello', token: 'terminal-meta-token', protocolVersion: WS_PROTOCOL_VERSION }))
     await waitForMessage(ws, (msg) => msg.type === 'ready')
 
     wsHandler.broadcastTerminalMetaUpdated({

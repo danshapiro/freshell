@@ -5,6 +5,7 @@ import { WsHandler } from '../../../server/ws-handler'
 import { TerminalRegistry } from '../../../server/terminal-registry'
 import { SessionAssociationCoordinator } from '../../../server/session-association-coordinator'
 import type { CodingCliSession, ProjectGroup } from '../../../server/coding-cli/types'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol'
 
 const TEST_TIMEOUT_MS = 30_000
 const HOOK_TIMEOUT_MS = 30_000
@@ -73,7 +74,11 @@ async function createAuthenticatedWs(port: number): Promise<WebSocket> {
     ws.once('error', reject)
   })
 
-  ws.send(JSON.stringify({ type: 'hello', token: process.env.AUTH_TOKEN || 'testtoken-testtoken' }))
+  ws.send(JSON.stringify({
+    type: 'hello',
+    token: process.env.AUTH_TOKEN || 'testtoken-testtoken',
+    protocolVersion: WS_PROTOCOL_VERSION,
+  }))
   await waitForMessage(ws, (msg) => msg.type === 'ready')
   return ws
 }

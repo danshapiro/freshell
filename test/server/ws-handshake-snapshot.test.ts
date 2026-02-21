@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest'
 import http from 'http'
 import WebSocket from 'ws'
+import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
 
 const TEST_TIMEOUT_MS = 30_000
 const HOOK_TIMEOUT_MS = 30_000
@@ -199,7 +200,7 @@ describe('ws handshake snapshot', () => {
       const settingsPromise = waitForMessage(ws, (m) => m.type === 'settings.updated', MSG_TIMEOUT)
       const sessionsPromise = waitForMessage(ws, (m) => m.type === 'sessions.updated', MSG_TIMEOUT)
 
-      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
 
       await readyPromise
 
@@ -237,7 +238,7 @@ describe('ws handshake snapshot', () => {
       const readyPromise = waitForMessage(ws, (m) => m.type === 'ready', MSG_TIMEOUT)
       const fallbackPromise = waitForMessage(ws, (m) => m.type === 'config.fallback', MSG_TIMEOUT)
 
-      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
 
       await readyPromise
       const fallbackMsg = await fallbackPromise
@@ -324,7 +325,7 @@ describe('ws handshake snapshot with chunking', () => {
       // Collect all sessions.updated messages (wait for idle to detect end of stream)
       const sessionsPromise = collectAllMessages(ws, (m) => m.type === 'sessions.updated', 500, 5000)
 
-      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
 
       await readyPromise
 

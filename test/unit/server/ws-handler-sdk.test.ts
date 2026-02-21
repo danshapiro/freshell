@@ -11,6 +11,7 @@ import {
   SdkKillSchema,
   SdkAttachSchema,
 } from '../../../server/sdk-bridge-types.js'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 vi.mock('node-pty', () => ({
   spawn: vi.fn(),
@@ -243,6 +244,7 @@ describe('WS Handler SDK Integration', () => {
           ws.send(JSON.stringify({
             type: 'hello',
             token: TEST_AUTH_TOKEN,
+            protocolVersion: WS_PROTOCOL_VERSION,
           }))
         }
 
@@ -726,6 +728,7 @@ describe('WS Handler SDK Integration', () => {
           ws.send(JSON.stringify({
             type: 'hello',
             token: TEST_AUTH_TOKEN,
+            protocolVersion: WS_PROTOCOL_VERSION,
           }))
         }
 

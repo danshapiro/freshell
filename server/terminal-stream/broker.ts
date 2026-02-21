@@ -2,6 +2,7 @@ import WebSocket from 'ws'
 import type { LiveWebSocket } from '../ws-handler.js'
 import type { TerminalRegistry } from '../terminal-registry.js'
 import { logger } from '../logger.js'
+import { logTerminalStreamPerfEvent, type TerminalStreamPerfEvent } from '../perf-logger.js'
 import type { TerminalOutputRawEvent } from './registry-events.js'
 import { ClientOutputQueue, type GapEvent } from './client-output-queue.js'
 import { ReplayRing, type ReplayFrame } from './replay-ring.js'
@@ -22,6 +23,17 @@ type CreatedEnvelope = {
   effectiveResumeSessionId?: string
 }
 
+type PerfLevel = 'debug' | 'info' | 'warn' | 'error'
+type PerfEventLogger = (
+  event: TerminalStreamPerfEvent,
+  context: Record<string, unknown>,
+  level?: PerfLevel,
+) => void
+
+function isGapEvent(item: ReplayFrame | GapEvent): item is GapEvent {
+  return 'type' in item && item.type === 'gap'
+}
+
 export class TerminalStreamBroker {
   private terminals = new Map<string, BrokerTerminalState>()
   private wsToTerminals = new Map<LiveWebSocket, Set<string>>()
@@ -38,7 +50,10 @@ export class TerminalStreamBroker {
     }
   }
 
-  constructor(private registry: TerminalRegistry) {
+  constructor(
+    private registry: TerminalRegistry,
+    private perfEventLogger: PerfEventLogger = logTerminalStreamPerfEvent,
+  ) {
     const eventSource = this.registry as unknown as {
       on?: (event: string, listener: (...args: any[]) => void) => void
     }
@@ -111,6 +126,17 @@ export class TerminalStreamBroker {
       const replayFromSeq = replayFrames.length > 0 ? replayFrames[0].seqStart : headSeq + 1
       const replayToSeq = replayFrames.length > 0 ? replayFrames[replayFrames.length - 1].seqEnd : headSeq
 
+      if (replayFrames.length > 0 && replay.missedFromSeq === undefined) {
+        this.perfEventLogger('terminal_stream_replay_hit', {
+          terminalId,
+          connectionId: ws.connectionId,
+          sinceSeq: normalizedSinceSeq,
+          replayFromSeq,
+          replayToSeq,
+          replayFrameCount: replayFrames.length,
+        })
+      }
+
       if (!this.safeSend(ws, {
         type: 'terminal.attach.ready',
         terminalId,
@@ -124,6 +150,24 @@ export class TerminalStreamBroker {
       if (replay.missedFromSeq !== undefined) {
         const missedToSeq = replayFromSeq - 1
         if (missedToSeq >= replay.missedFromSeq) {
+          this.perfEventLogger('terminal_stream_replay_miss', {
+            terminalId,
+            connectionId: ws.connectionId,
+            sinceSeq: normalizedSinceSeq,
+            missedFromSeq: replay.missedFromSeq,
+            missedToSeq,
+            replayFromSeq,
+            replayToSeq,
+          }, 'warn')
+
+          this.perfEventLogger('terminal_stream_gap', {
+            terminalId,
+            connectionId: ws.connectionId,
+            fromSeq: replay.missedFromSeq,
+            toSeq: missedToSeq,
+            reason: 'replay_window_exceeded',
+          })
+
           if (!this.safeSend(ws, {
             type: 'terminal.output.gap',
             terminalId,
@@ -220,6 +264,7 @@ export class TerminalStreamBroker {
         attachStaging: [],
         lastSeq: 0,
         flushTimer: null,
+        catastrophicClosed: false,
       }
       terminalState.clients.set(ws, attachment)
       this.registerWsTerminal(ws, terminalId)
@@ -274,18 +319,33 @@ export class TerminalStreamBroker {
       return
     }
 
-    if (this.catastrophicBlocked(attachment)) {
+    if (this.catastrophicBlocked(terminalId, attachment)) {
+      if (attachment.catastrophicClosed) {
+        this.detach(terminalId, ws)
+        return
+      }
       if (attachment.queue.pendingBytes() > 0) {
         this.scheduleFlush(terminalId, attachment, TERMINAL_STREAM_RETRY_FLUSH_MS)
       }
       return
     }
 
+    const pendingBytes = attachment.queue.pendingBytes()
+    if (pendingBytes > TERMINAL_STREAM_BATCH_MAX_BYTES) {
+      this.perfEventLogger('terminal_stream_queue_pressure', {
+        terminalId,
+        connectionId: ws.connectionId,
+        pendingBytes,
+        batchMaxBytes: TERMINAL_STREAM_BATCH_MAX_BYTES,
+        bufferedAmount: ws.bufferedAmount,
+      }, 'warn')
+    }
+
     const batch = attachment.queue.nextBatch(TERMINAL_STREAM_BATCH_MAX_BYTES)
     if (batch.length === 0) return
 
     for (const item of batch) {
-      if (item.type === 'gap') {
+      if (isGapEvent(item)) {
         if (!this.sendGap(ws, terminalId, item)) return
         attachment.lastSeq = Math.max(attachment.lastSeq, item.toSeq)
         continue
@@ -300,13 +360,16 @@ export class TerminalStreamBroker {
     }
   }
 
-  private catastrophicBlocked(attachment: BrokerClientAttachment): boolean {
+  private catastrophicBlocked(terminalId: string, attachment: BrokerClientAttachment): boolean {
+    if (attachment.catastrophicClosed) return true
+
     const wsBuffered = attachment.ws.bufferedAmount as number | undefined
     const buffered = typeof wsBuffered === 'number' ? wsBuffered : 0
     const now = Date.now()
 
     if (buffered <= TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES) {
       attachment.catastrophicSince = undefined
+      attachment.catastrophicClosed = false
       return false
     }
 
@@ -318,6 +381,15 @@ export class TerminalStreamBroker {
     if (now - attachment.catastrophicSince < TERMINAL_WS_CATASTROPHIC_STALL_MS) {
       return true
     }
+
+    attachment.catastrophicClosed = true
+    this.perfEventLogger('terminal_stream_catastrophic_close', {
+      terminalId,
+      connectionId: attachment.ws.connectionId,
+      bufferedAmount: buffered,
+      threshold: TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES,
+      stallMs: now - attachment.catastrophicSince,
+    }, 'warn')
 
     try {
       attachment.ws.close(4008, 'Catastrophic backpressure')
@@ -344,6 +416,14 @@ export class TerminalStreamBroker {
   }
 
   private sendGap(ws: LiveWebSocket, terminalId: string, gap: GapEvent): boolean {
+    this.perfEventLogger('terminal_stream_gap', {
+      terminalId,
+      connectionId: ws.connectionId,
+      fromSeq: gap.fromSeq,
+      toSeq: gap.toSeq,
+      reason: gap.reason,
+    }, gap.reason === 'queue_overflow' ? 'warn' : 'info')
+
     return this.safeSend(ws, {
       type: 'terminal.output.gap',
       terminalId,

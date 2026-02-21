@@ -103,6 +103,12 @@ function toMs(ns: number): number {
 }
 
 type PerfSeverity = 'debug' | 'info' | 'warn' | 'error'
+export type TerminalStreamPerfEvent =
+  | 'terminal_stream_replay_hit'
+  | 'terminal_stream_replay_miss'
+  | 'terminal_stream_gap'
+  | 'terminal_stream_queue_pressure'
+  | 'terminal_stream_catastrophic_close'
 
 function withPerfSeverity(level: PerfSeverity, payload: Record<string, unknown>) {
   if ((level === 'warn' || level === 'error') && payload.perfSeverity === undefined) {
@@ -118,6 +124,14 @@ export function logPerfEvent(
 ) {
   if (!perfConfig.enabled) return
   perfLogger.debug(withPerfSeverity(level, { event, ...context }), 'Perf event')
+}
+
+export function logTerminalStreamPerfEvent(
+  event: TerminalStreamPerfEvent,
+  context: Record<string, unknown>,
+  level: PerfSeverity = 'info',
+): void {
+  logPerfEvent(event, context, level)
 }
 
 export function startPerfTimer(

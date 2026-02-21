@@ -7,6 +7,10 @@ export type GapEvent = {
   reason: 'queue_overflow'
 }
 
+function isGapEvent(entry: ReplayFrame | GapEvent): entry is GapEvent {
+  return 'type' in entry && entry.type === 'gap'
+}
+
 export const DEFAULT_TERMINAL_CLIENT_QUEUE_MAX_BYTES = 128 * 1024
 
 function resolveMaxBytes(explicitMaxBytes?: number): number {
@@ -53,7 +57,7 @@ export class ClientOutputQueue {
 
     while (this.frames.length > 0) {
       const first = this.frames[0]
-      if (first.bytes > budget && out.some((item) => item.type !== 'gap')) break
+      if (first.bytes > budget && out.some((item) => !isGapEvent(item))) break
 
       const frame = this.frames.shift()
       if (!frame) break

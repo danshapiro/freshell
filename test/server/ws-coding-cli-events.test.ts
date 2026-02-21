@@ -8,6 +8,7 @@ import { CodingCliSessionManager } from '../../server/coding-cli/session-manager
 import { claudeProvider } from '../../server/coding-cli/providers/claude'
 import { configStore } from '../../server/config-store'
 import { EventEmitter } from 'events'
+import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
 
 vi.mock('node-pty', () => ({
   spawn: vi.fn(() => ({
@@ -84,7 +85,7 @@ describe('WebSocket Coding CLI Events', () => {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
       ws.on('open', () => {
-        ws.send(JSON.stringify({ type: 'hello', token: 'test-token' }))
+        ws.send(JSON.stringify({ type: 'hello', token: 'test-token', protocolVersion: WS_PROTOCOL_VERSION }))
       })
       ws.on('message', (data) => {
         const msg = JSON.parse(data.toString())
@@ -379,7 +380,7 @@ describe('WebSocket Coding CLI Events - Without Manager', () => {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
       ws.on('open', () => {
-        ws.send(JSON.stringify({ type: 'hello', token: 'test-token' }))
+        ws.send(JSON.stringify({ type: 'hello', token: 'test-token', protocolVersion: WS_PROTOCOL_VERSION }))
       })
       ws.on('message', (data) => {
         const msg = JSON.parse(data.toString())

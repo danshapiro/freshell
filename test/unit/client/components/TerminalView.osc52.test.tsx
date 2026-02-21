@@ -155,7 +155,7 @@ function createStore(policy: 'ask' | 'always' | 'never') {
           },
         },
       },
-      connection: { status: 'connected', error: null },
+      connection: { status: 'ready', error: null },
       turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {}, attentionByPane: {} },
     } as any,
   })
@@ -201,18 +201,22 @@ describe('TerminalView OSC52 policy handling', () => {
 
   it('always policy copies silently without prompt', async () => {
     const { terminalId } = await renderView('always')
-    messageHandler!({ type: 'terminal.output', terminalId, data: `before${OSC52_COPY}after` })
+    messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: `before${OSC52_COPY}after` })
 
-    expect(terminalInstances[0].write).toHaveBeenCalledWith('beforeafter')
+    await waitFor(() => {
+      expect(terminalInstances[0].write).toHaveBeenCalledWith('beforeafter', undefined)
+    })
     expect(clipboardMocks.copyText).toHaveBeenCalledWith('copy')
     expect(screen.queryByRole('dialog', { name: 'Clipboard access request' })).not.toBeInTheDocument()
   })
 
   it('never policy does not copy and does not prompt', async () => {
     const { terminalId } = await renderView('never')
-    messageHandler!({ type: 'terminal.output', terminalId, data: `before${OSC52_COPY}after` })
+    messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: `before${OSC52_COPY}after` })
 
-    expect(terminalInstances[0].write).toHaveBeenCalledWith('beforeafter')
+    await waitFor(() => {
+      expect(terminalInstances[0].write).toHaveBeenCalledWith('beforeafter', undefined)
+    })
     expect(clipboardMocks.copyText).not.toHaveBeenCalled()
     expect(screen.queryByRole('dialog', { name: 'Clipboard access request' })).not.toBeInTheDocument()
   })
@@ -220,7 +224,7 @@ describe('TerminalView OSC52 policy handling', () => {
   it('ask + Yes copies once and keeps ask policy', async () => {
     const { store, terminalId } = await renderView('ask')
     act(() => {
-      messageHandler!({ type: 'terminal.output', terminalId, data: `before${OSC52_COPY}after` })
+      messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: `before${OSC52_COPY}after` })
     })
     await screen.findByRole('button', { name: 'Yes' })
 
@@ -233,7 +237,7 @@ describe('TerminalView OSC52 policy handling', () => {
   it('ask + No does not copy and keeps ask policy', async () => {
     const { store, terminalId } = await renderView('ask')
     act(() => {
-      messageHandler!({ type: 'terminal.output', terminalId, data: `before${OSC52_COPY}after` })
+      messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: `before${OSC52_COPY}after` })
     })
     await screen.findByRole('button', { name: 'No' })
 
@@ -246,7 +250,7 @@ describe('TerminalView OSC52 policy handling', () => {
   it('ask + Always copies and persists always policy', async () => {
     const { store, terminalId } = await renderView('ask')
     act(() => {
-      messageHandler!({ type: 'terminal.output', terminalId, data: `before${OSC52_COPY}after` })
+      messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: `before${OSC52_COPY}after` })
     })
     await screen.findByRole('button', { name: 'Always' })
 
@@ -262,7 +266,7 @@ describe('TerminalView OSC52 policy handling', () => {
   it('ask + Never does not copy and persists never policy', async () => {
     const { store, terminalId } = await renderView('ask')
     act(() => {
-      messageHandler!({ type: 'terminal.output', terminalId, data: `before${OSC52_COPY}after` })
+      messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: `before${OSC52_COPY}after` })
     })
     await screen.findByRole('button', { name: 'Never' })
 
@@ -279,7 +283,7 @@ describe('TerminalView OSC52 policy handling', () => {
     clipboardMocks.copyText.mockRejectedValueOnce(new Error('clipboard blocked'))
     const { terminalId } = await renderView('ask')
     act(() => {
-      messageHandler!({ type: 'terminal.output', terminalId, data: `before${OSC52_COPY}after` })
+      messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: `before${OSC52_COPY}after` })
     })
     await screen.findByRole('button', { name: 'Yes' })
 

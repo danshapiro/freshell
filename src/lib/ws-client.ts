@@ -1,4 +1,9 @@
-import { getClientPerfConfig, logClientPerf } from '@/lib/perf-logger'
+import {
+  getClientPerfConfig,
+  logClientPerf,
+  markTerminalInputSent,
+  markTerminalOutputSeen,
+} from '@/lib/perf-logger'
 import { getAuthToken } from '@/lib/auth'
 import type { ServerMessage } from '@shared/ws-protocol'
 import { createLogger } from '@/lib/client-logger'
@@ -23,9 +28,23 @@ type TabsSyncQueryPayload = {
   rangeDays?: number
 }
 
+type TerminalInputClientMessage = {
+  type: 'terminal.input'
+  terminalId: string
+  data: string
+}
+
 const CONNECTION_TIMEOUT_MS = 10_000
 const WS_PROTOCOL_VERSION = 2
 const perfConfig = getClientPerfConfig()
+
+function isTerminalInputMessage(msg: unknown): msg is TerminalInputClientMessage {
+  if (!msg || typeof msg !== 'object') return false
+  const candidate = msg as { type?: unknown; terminalId?: unknown; data?: unknown }
+  return candidate.type === 'terminal.input'
+    && typeof candidate.terminalId === 'string'
+    && typeof candidate.data === 'string'
+}
 
 export class WsClient {
   private ws: WebSocket | null = null
@@ -173,6 +192,10 @@ export class WsClient {
           }
 
           finishResolve()
+        }
+
+        if (msg.type === 'terminal.output' && typeof msg.terminalId === 'string') {
+          markTerminalOutputSeen(msg.terminalId)
         }
 
         if (msg.type === 'error' && msg.code === 'NOT_AUTHENTICATED') {
@@ -350,6 +373,10 @@ export class WsClient {
    */
   send(msg: unknown) {
     if (this.intentionalClose) return
+
+    if (isTerminalInputMessage(msg)) {
+      markTerminalInputSent(msg.terminalId)
+    }
 
     if (this._state === 'ready' && this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(msg))

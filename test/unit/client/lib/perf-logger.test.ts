@@ -84,4 +84,26 @@ describe('client perf logger config', () => {
     ;(globalThis as { PerformanceObserver?: unknown }).PerformanceObserver = originalObserver
     warnSpy.mockRestore()
   })
+
+  it('logs terminal input-to-first-output latency samples with percentiles', async () => {
+    const { setClientPerfEnabled, markTerminalInputSent, markTerminalOutputSeen } = await loadPerfLoggerModule()
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
+
+    setClientPerfEnabled(true, 'test')
+    markTerminalInputSent('term-1', 100)
+    markTerminalOutputSeen('term-1', 145)
+
+    const latencyPayload = infoSpy.mock.calls
+      .map((call) => call[0] as { event?: string; latencyMs?: number; p50Ms?: number; p90Ms?: number; p99Ms?: number })
+      .find((payload) => payload?.event === 'perf.terminal_input_to_output')
+
+    expect(latencyPayload).toBeDefined()
+    expect(latencyPayload?.latencyMs).toBe(45)
+    expect(latencyPayload?.p50Ms).toBe(45)
+    expect(latencyPayload?.p90Ms).toBe(45)
+    expect(latencyPayload?.p99Ms).toBe(45)
+
+    setClientPerfEnabled(false, 'test')
+    infoSpy.mockRestore()
+  })
 })

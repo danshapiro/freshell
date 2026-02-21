@@ -1,5 +1,4 @@
 import { z } from 'zod'
-import { PANES_STORAGE_KEY, TABS_STORAGE_KEY } from './storage-keys'
 
 export { TABS_STORAGE_KEY, PANES_STORAGE_KEY } from './storage-keys'
 

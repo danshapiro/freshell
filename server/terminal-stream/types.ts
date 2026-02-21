@@ -12,6 +12,7 @@ export type BrokerClientAttachment = {
   lastSeq: number
   flushTimer: NodeJS.Timeout | null
   catastrophicSince?: number
+  catastrophicClosed?: boolean
 }
 
 export type BrokerTerminalState = {
