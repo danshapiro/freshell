@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll } from 'vitest'
 import express from 'express'
 import http from 'node:http'
@@ -5,9 +6,9 @@ import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import request from 'supertest'
-import cookieParser from 'cookie-parser'
 import { z } from 'zod'
 import { NetworkManager } from '../../../server/network-manager.js'
+import { createLocalFileRouter } from '../../../server/local-file-router.js'
 import { ConfigStore } from '../../../server/config-store.js'
 import { httpAuthMiddleware } from '../../../server/auth.js'
 import { detectFirewall } from '../../../server/firewall.js'
@@ -166,27 +167,8 @@ describe('Network API integration', () => {
       }
     })
 
-    // /local-file with cookie auth (matches server/index.ts pattern)
-    app.get('/local-file', cookieParser(), (req, res, next) => {
-      const headerToken = req.headers['x-auth-token'] as string | undefined
-      const cookieToken = req.cookies?.['freshell-auth']
-      const authToken = headerToken || cookieToken
-      const expectedToken = process.env.AUTH_TOKEN
-      if (!expectedToken || authToken !== expectedToken) {
-        return res.status(401).json({ error: 'Unauthorized' })
-      }
-      next()
-    }, (req, res) => {
-      const filePath = req.query.path as string
-      if (!filePath) {
-        return res.status(400).json({ error: 'path query parameter required' })
-      }
-      const resolved = path.resolve(filePath)
-      if (!fs.existsSync(resolved)) {
-        return res.status(404).json({ error: 'File not found' })
-      }
-      res.sendFile(resolved)
-    })
+    // Mount the real local-file router
+    app.use('/local-file', createLocalFileRouter())
   })
 
   afterEach(async () => {

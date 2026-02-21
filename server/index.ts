@@ -26,6 +26,7 @@ import { migrateSettingsSortMode } from './settings-migrate.js'
 import { filesRouter } from './files-router.js'
 import { createPlatformRouter } from './platform-router.js'
 import { createProxyRouter } from './proxy-router.js'
+import { createLocalFileRouter } from './local-file-router.js'
 import { getSessionRepairService } from './session-scanner/service.js'
 import { SdkBridge } from './sdk-bridge.js'
 import { createClientLogsRouter } from './client-logs.js'
@@ -88,42 +89,7 @@ async function main() {
   app.use(requestLogger)
 
   // --- Local file serving for browser pane (cookie auth for iframes) ---
-  app.get('/local-file', cookieParser(), (req, res, next) => {
-    const headerToken = typeof req.headers['x-auth-token'] === 'string'
-      ? req.headers['x-auth-token']
-      : undefined
-    const cookieToken = typeof req.cookies?.['freshell-auth'] === 'string'
-      ? req.cookies['freshell-auth']
-      : undefined
-    const token = headerToken || cookieToken
-    const expectedToken = process.env.AUTH_TOKEN
-    if (!expectedToken || !token || !timingSafeCompare(token, expectedToken)) {
-      return res.status(401).json({ error: 'Unauthorized' })
-    }
-    next()
-  }, (req, res) => {
-    const filePath = req.query.path as string
-    if (!filePath) {
-      return res.status(400).json({ error: 'path query parameter required' })
-    }
-
-    // Normalize and resolve the path
-    const resolved = path.resolve(filePath)
-
-    // Check if file exists
-    if (!fs.existsSync(resolved)) {
-      return res.status(404).json({ error: 'File not found' })
-    }
-
-    // Check if it's a file (not a directory)
-    const stat = fs.statSync(resolved)
-	    if (stat.isDirectory()) {
-	      return res.status(400).json({ error: 'Cannot serve directories' })
-	    }
-
-	    // Send the file with appropriate content type
-	    res.sendFile(resolved)
-	  })
+  app.use('/local-file', createLocalFileRouter())
 
   const startupState = createStartupState()
 
