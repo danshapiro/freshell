@@ -1,3 +1,4 @@
+// @vitest-environment node
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import express from 'express'
 import request from 'supertest'
@@ -59,6 +60,18 @@ vi.mock('child_process', async (importOriginal) => {
 
 // Import after mocks are set up
 const { filesRouter } = await import('../../../server/files-router')
+
+/** Returns a mock ChildProcess that stays alive (exit with code 0 after next tick) */
+function mockChildProcess() {
+  return {
+    unref: vi.fn(),
+    on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+      // Simulate successful process: exit with code 0 after microtask
+      if (event === 'exit') Promise.resolve().then(() => cb(0, null))
+    }),
+    removeListener: vi.fn(),
+  }
+}
 
 function createApp() {
   const app = express()
@@ -198,7 +211,7 @@ describe('files-router path validation', () => {
     it('allows opening when allowedFilePaths is undefined', async () => {
       mockGetSettings.mockResolvedValue({ allowedFilePaths: undefined })
       mockStat.mockResolvedValue({ isFile: () => true })
-      mockSpawn.mockReturnValue({ unref: vi.fn() })
+      mockSpawn.mockReturnValue(mockChildProcess())
 
       const res = await request(app)
         .post('/api/files/open')
@@ -211,7 +224,7 @@ describe('files-router path validation', () => {
     it('allows opening file inside allowed directory', async () => {
       mockGetSettings.mockResolvedValue({ allowedFilePaths: ['/home/user/projects'] })
       mockStat.mockResolvedValue({ isFile: () => true })
-      mockSpawn.mockReturnValue({ unref: vi.fn() })
+      mockSpawn.mockReturnValue(mockChildProcess())
 
       const res = await request(app)
         .post('/api/files/open')
@@ -249,7 +262,7 @@ describe('files-router path validation', () => {
         editor: { externalEditor: 'cursor' },
       })
       mockStat.mockResolvedValue({ isFile: () => true })
-      mockSpawn.mockReturnValue({ unref: vi.fn() })
+      mockSpawn.mockReturnValue(mockChildProcess())
 
       const res = await request(app)
         .post('/api/files/open')
@@ -269,7 +282,7 @@ describe('files-router path validation', () => {
         editor: { externalEditor: 'code' },
       })
       mockStat.mockResolvedValue({ isFile: () => true })
-      mockSpawn.mockReturnValue({ unref: vi.fn() })
+      mockSpawn.mockReturnValue(mockChildProcess())
 
       const res = await request(app)
         .post('/api/files/open')

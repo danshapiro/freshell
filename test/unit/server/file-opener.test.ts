@@ -1,5 +1,18 @@
-import { describe, it, expect } from 'vitest'
-import { resolveOpenCommand } from '../../../server/file-opener'
+// @vitest-environment node
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+
+// Mock child_process for spawnAndMonitor tests (hoisted above all imports)
+const mockSpawn = vi.fn()
+vi.mock('child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('child_process')>()
+  return {
+    ...actual,
+    spawn: (...args: unknown[]) => mockSpawn(...args),
+  }
+})
+
+// Dynamic import so the mock is in place when file-opener loads
+const { resolveOpenCommand } = await import('../../../server/file-opener')
 
 describe('resolveOpenCommand', () => {
   describe('with no custom editor configured (auto)', () => {
@@ -151,5 +164,100 @@ describe('resolveOpenCommand', () => {
       })
       expect(result.command).toBe('open')
     })
+  })
+})
+
+describe('spawnAndMonitor', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.clearAllMocks()
+    vi.resetModules()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('returns ok when process does not exit within timeout', async () => {
+    mockSpawn.mockReturnValue({
+      unref: vi.fn(),
+      on: vi.fn(), // never calls the 'error' or 'exit' callback
+      removeListener: vi.fn(),
+    })
+    const { spawnAndMonitor } = await import('../../../server/file-opener')
+    const resultPromise = spawnAndMonitor({ command: 'cursor', args: ['-g', 'file.ts'] })
+    await vi.advanceTimersByTimeAsync(2000)
+    const result = await resultPromise
+    expect(result.ok).toBe(true)
+  })
+
+  it('returns error when process exits immediately with non-zero', async () => {
+    mockSpawn.mockReturnValue({
+      unref: vi.fn(),
+      on: vi.fn((event: string, cb: (code: number) => void) => {
+        if (event === 'exit') setTimeout(() => cb(127), 10)
+      }),
+      removeListener: vi.fn(),
+    })
+    const { spawnAndMonitor } = await import('../../../server/file-opener')
+    const resultPromise = spawnAndMonitor({ command: 'nonexistent', args: [] })
+    await vi.advanceTimersByTimeAsync(10)
+    const result = await resultPromise
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('exited')
+  })
+
+  it('returns error when spawn emits error event', async () => {
+    mockSpawn.mockReturnValue({
+      unref: vi.fn(),
+      on: vi.fn((event: string, cb: (err: Error) => void) => {
+        if (event === 'error') setTimeout(() => cb(new Error('ENOENT')), 10)
+      }),
+      removeListener: vi.fn(),
+    })
+    const { spawnAndMonitor } = await import('../../../server/file-opener')
+    const resultPromise = spawnAndMonitor({ command: 'nonexistent', args: [] })
+    await vi.advanceTimersByTimeAsync(10)
+    const result = await resultPromise
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('ENOENT')
+  })
+
+  it('cleans up listeners after timeout resolves', async () => {
+    const mockRemoveListener = vi.fn()
+    mockSpawn.mockReturnValue({
+      unref: vi.fn(),
+      on: vi.fn(),
+      removeListener: mockRemoveListener,
+    })
+    const { spawnAndMonitor } = await import('../../../server/file-opener')
+    const resultPromise = spawnAndMonitor({ command: 'cursor', args: [] })
+    await vi.advanceTimersByTimeAsync(2000)
+    await resultPromise
+    // Should have removed both 'error' and 'exit' listeners
+    expect(mockRemoveListener).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not double-resolve when exit fires after error', async () => {
+    let errorCb: ((err: Error) => void) | undefined
+    let exitCb: ((code: number) => void) | undefined
+    mockSpawn.mockReturnValue({
+      unref: vi.fn(),
+      on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+        if (event === 'error') errorCb = cb as (err: Error) => void
+        if (event === 'exit') exitCb = cb as (code: number) => void
+      }),
+      removeListener: vi.fn(),
+    })
+    const { spawnAndMonitor } = await import('../../../server/file-opener')
+    const resultPromise = spawnAndMonitor({ command: 'nonexistent', args: [] })
+
+    // Fire error first, then exit — should only resolve once
+    errorCb!(new Error('ENOENT'))
+    exitCb!(1)
+
+    const result = await resultPromise
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('ENOENT')
   })
 })

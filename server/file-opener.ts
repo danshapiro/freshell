@@ -1,4 +1,5 @@
 import path from 'path'
+import { spawn } from 'child_process'
 
 export type EditorPreset = 'auto' | 'cursor' | 'code' | 'custom'
 
@@ -140,4 +141,65 @@ export async function resolveOpenCommand(
 
   // Auto / fallback: platform default
   return platformOpen(platform, filePath)
+}
+
+// --- Spawn health check ---
+
+export interface SpawnResult {
+  ok: boolean
+  error?: string
+}
+
+const HEALTH_CHECK_TIMEOUT_MS = 2000
+
+/**
+ * Spawns a detached process and monitors it for early failure.
+ * If the process exits with a non-zero code or emits an error within
+ * HEALTH_CHECK_TIMEOUT_MS, returns a failure result. Otherwise returns ok.
+ */
+export function spawnAndMonitor(cmd: OpenCommand): Promise<SpawnResult> {
+  return new Promise((resolve) => {
+    try {
+      const child = spawn(cmd.command, cmd.args, { detached: true, stdio: 'ignore' })
+      child.unref()
+
+      let settled = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+
+      const onError = (err: Error) => {
+        if (settled) return
+        settled = true
+        if (timer) clearTimeout(timer)
+        child.removeListener('exit', onExit)
+        resolve({ ok: false, error: `Failed to launch "${cmd.command}": ${err.message}` })
+      }
+
+      const onExit = (code: number | null) => {
+        if (settled) return
+        settled = true
+        if (timer) clearTimeout(timer)
+        child.removeListener('error', onError)
+        if (code !== null && code !== 0) {
+          resolve({ ok: false, error: `"${cmd.command}" exited with code ${code}` })
+        } else {
+          // code === 0 or null (still running) — both fine
+          resolve({ ok: true })
+        }
+      }
+
+      child.on('error', onError)
+      child.on('exit', onExit)
+
+      // If no error/exit within timeout, assume success
+      timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        child.removeListener('error', onError)
+        child.removeListener('exit', onExit)
+        resolve({ ok: true })
+      }, HEALTH_CHECK_TIMEOUT_MS)
+    } catch (err: unknown) {
+      resolve({ ok: false, error: err instanceof Error ? err.message : String(err) })
+    }
+  })
 }

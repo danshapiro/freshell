@@ -1,7 +1,6 @@
 import express, { type Request, type Response, type NextFunction } from 'express'
 import fsp from 'fs/promises'
 import path from 'path'
-import { spawn } from 'child_process'
 import {
   getPathModuleForFlavor,
   isPathAllowed,
@@ -11,7 +10,7 @@ import {
 } from './path-utils.js'
 import { configStore } from './config-store.js'
 import { detectPlatform } from './platform.js'
-import { resolveOpenCommand } from './file-opener.js'
+import { resolveOpenCommand, spawnAndMonitor } from './file-opener.js'
 
 export const filesRouter = express.Router()
 
@@ -194,7 +193,7 @@ filesRouter.post('/open', validatePath, async (req, res) => {
   const settings = await configStore.getSettings()
   const platform = await detectPlatform()
 
-  const { command, args } = await resolveOpenCommand({
+  const cmd = await resolveOpenCommand({
     filePath: resolved,
     reveal,
     line: typeof line === 'number' ? line : undefined,
@@ -204,11 +203,9 @@ filesRouter.post('/open', validatePath, async (req, res) => {
     platform,
   })
 
-  try {
-    const child = spawn(command, args, { detached: true, stdio: 'ignore' })
-    child.unref()
-    return res.json({ ok: true })
-  } catch (err: any) {
-    return res.status(500).json({ error: err.message })
+  const result = await spawnAndMonitor(cmd)
+  if (!result.ok) {
+    return res.status(502).json({ error: result.error })
   }
+  return res.json({ ok: true })
 })
