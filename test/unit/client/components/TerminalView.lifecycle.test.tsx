@@ -1825,7 +1825,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(writes).toContain('LIVE')
     })
 
-    it('updates attach sequence from terminal.attach.ready after terminal.created', async () => {
+    it('updates attach sequence from terminal.attach.ready after terminal.created (broker no-replay sentinel)', async () => {
       const { requestId, term } = await renderTerminalHarness({ status: 'creating' })
 
       act(() => {
@@ -1847,6 +1847,7 @@ describe('TerminalView lifecycle updates', () => {
         messageHandler!({
           type: 'terminal.attach.ready',
           terminalId: 'term-v2-created',
+          // Broker emits replayFrom=head+1 and replayTo=head when no replay frames exist.
           headSeq: 7,
           replayFromSeq: 8,
           replayToSeq: 7,
