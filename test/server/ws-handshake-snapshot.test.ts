@@ -250,6 +250,37 @@ describe('ws handshake snapshot', () => {
       await closeWs()
     }
   })
+
+  it('sends an explicit empty sessions snapshot when no projects exist', async () => {
+    snapshot = {
+      ...snapshot,
+      projects: [],
+    }
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const closeWs = async () => {
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.terminate()
+      }
+      await new Promise<void>((resolve) => ws.on('close', () => resolve()))
+    }
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+
+      const MSG_TIMEOUT = 10_000
+      const readyPromise = waitForMessage(ws, (m) => m.type === 'ready', MSG_TIMEOUT)
+      const sessionsPromise = waitForMessage(ws, (m) => m.type === 'sessions.updated', MSG_TIMEOUT)
+
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+
+      await readyPromise
+      const sessionsMsg = await sessionsPromise
+      expect(sessionsMsg.projects).toEqual([])
+    } finally {
+      await closeWs()
+    }
+  })
 })
 
 describe('ws handshake snapshot with chunking', () => {

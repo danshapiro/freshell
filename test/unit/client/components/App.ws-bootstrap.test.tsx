@@ -40,6 +40,8 @@ const wsMocks = vi.hoisted(() => ({
   onMessage: vi.fn(),
   onReconnect: vi.fn().mockReturnValue(() => {}),
   setHelloExtensionProvider: vi.fn(),
+  isReady: false,
+  serverInstanceId: undefined as string | undefined,
 }))
 
 let messageHandler: ((msg: any) => void) | null = null
@@ -51,6 +53,12 @@ vi.mock('@/lib/ws-client', () => ({
     onMessage: wsMocks.onMessage,
     onReconnect: wsMocks.onReconnect,
     setHelloExtensionProvider: wsMocks.setHelloExtensionProvider,
+    get isReady() {
+      return wsMocks.isReady
+    },
+    get serverInstanceId() {
+      return wsMocks.serverInstanceId
+    },
   }),
 }))
 
@@ -87,7 +95,7 @@ function createStore() {
         platform: null,
         availableClis: {},
       },
-      sessions: { projects: [], expandedProjects: new Set<string>(), isLoading: false, error: null },
+      sessions: { projects: [], expandedProjects: new Set<string>(), wsSnapshotReceived: false, isLoading: false, error: null },
       panes: { layouts: {}, activePane: {} },
       network: { status: null, loading: false, configuring: false, error: null },
     },
@@ -99,6 +107,8 @@ describe('App WS bootstrap recovery', () => {
     cleanup()
     vi.resetAllMocks()
     wsMocks.onReconnect.mockReturnValue(() => {})
+    wsMocks.isReady = false
+    wsMocks.serverInstanceId = undefined
     messageHandler = null
 
     wsMocks.onMessage.mockImplementation((cb: (msg: any) => void) => {
@@ -253,5 +263,52 @@ describe('App WS bootstrap recovery', () => {
     const extension = provider?.()
     expect(extension?.sessions).toBeDefined()
     expect(extension?.client?.mobile).toBe(true)
+  })
+
+  it('promotes a recent HTTP sessions baseline when socket is already ready before App bootstrap connects', async () => {
+    const store = createStore()
+    wsMocks.isReady = true
+    wsMocks.serverInstanceId = 'srv-preconnected'
+
+    apiGet.mockImplementation((url: string) => {
+      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/sessions') {
+        return Promise.resolve([
+          {
+            projectPath: '/p1',
+            sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', updatedAt: 1 }],
+          },
+        ])
+      }
+      return Promise.resolve({})
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(store.getState().connection.status).toBe('ready')
+      expect(store.getState().connection.serverInstanceId).toBe('srv-preconnected')
+      expect(store.getState().sessions.wsSnapshotReceived).toBe(true)
+    })
+
+    expect(wsMocks.connect).not.toHaveBeenCalled()
+    expect(store.getState().sessions.projects.map((p: any) => p.projectPath)).toEqual(['/p1'])
+
+    act(() => {
+      messageHandler?.({
+        type: 'sessions.patch',
+        upsertProjects: [{ projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', updatedAt: 2 }] }],
+        removeProjectPaths: [],
+      })
+    })
+
+    await waitFor(() => {
+      expect(store.getState().sessions.projects.map((p: any) => p.projectPath).sort()).toEqual(['/p1', '/p2'])
+    })
   })
 })

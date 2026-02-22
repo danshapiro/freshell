@@ -80,6 +80,7 @@ const SIDEBAR_MIN_WIDTH = 200
 const SIDEBAR_MAX_WIDTH = 500
 const CHROME_REVEAL_TOP_EDGE_PX = 48
 const CHROME_REVEAL_SWIPE_PX = 60
+const RECENT_HTTP_SESSIONS_BASELINE_MS = 30_000
 
 
 function isVersionInfo(value: unknown): value is VersionInfo {
@@ -393,6 +394,24 @@ export default function App() {
         client: { mobile: isMobileRef.current },
       }))
 
+      const requestTerminalMetaList = () => {
+        terminalMetaListRequestStartedAtRef.current.clear()
+        const requestId = `terminal-meta-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+        terminalMetaListRequestStartedAtRef.current.set(requestId, Date.now())
+        ws.send({
+          type: 'terminal.meta.list',
+          requestId,
+        })
+      }
+
+      const promoteRecentHttpSessionsBaseline = () => {
+        const lastLoadedAt = store.getState().sessions.lastLoadedAt
+        if (typeof lastLoadedAt !== 'number') return false
+        if (Date.now() - lastLoadedAt > RECENT_HTTP_SESSIONS_BASELINE_MS) return false
+        dispatch(markWsSnapshotReceived())
+        return true
+      }
+
       const unsubscribe = ws.onMessage((msg) => {
         if (!msg?.type) return
         if (msg.type === 'ready') {
@@ -403,13 +422,10 @@ export default function App() {
           dispatch(setStatus('ready'))
           dispatch(setServerInstanceId(ready.success ? ready.data.serverInstanceId : undefined))
           dispatch(resetWsSnapshotReceived())
-          terminalMetaListRequestStartedAtRef.current.clear()
-          const requestId = `terminal-meta-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-          terminalMetaListRequestStartedAtRef.current.set(requestId, Date.now())
-          ws.send({
-            type: 'terminal.meta.list',
-            requestId,
-          })
+          // If App registered late and missed a prior snapshot, a fresh HTTP baseline
+          // from this bootstrap cycle is still safe for enabling patch application.
+          promoteRecentHttpSessionsBaseline()
+          requestTerminalMetaList()
         }
         if (msg.type === 'sessions.updated') {
           // Support chunked sessions for mobile browsers with limited WebSocket buffers
@@ -496,6 +512,32 @@ export default function App() {
         unsubscribe()
       }
       if (cleanedUp) cleanup()
+
+      // Another component may have connected before App finished bootstrap.
+      // Reconcile state for the already-ready socket so sessions patches do not stay blocked.
+      if (ws.isReady) {
+        dispatch(setError(undefined))
+        dispatch(setStatus('ready'))
+        dispatch(setServerInstanceId(ws.serverInstanceId))
+        dispatch(resetWsSnapshotReceived())
+
+        const promoted = promoteRecentHttpSessionsBaseline()
+        if (!promoted) {
+          try {
+            const projects = await api.get('/api/sessions')
+            if (!cancelled) {
+              dispatch(setProjects(projects))
+              dispatch(markWsSnapshotReceived())
+            }
+          } catch (err: any) {
+            if (handleBootstrapAuthFailure(err)) return
+            log.warn('Failed to refresh sessions for pre-connected websocket', err)
+          }
+        }
+
+        requestTerminalMetaList()
+        return
+      }
 
       dispatch(setError(undefined))
       dispatch(setErrorCode(undefined))
