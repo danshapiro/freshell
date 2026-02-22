@@ -753,6 +753,81 @@ describe('WebSocket edge cases', () => {
       close2()
     })
 
+    it('emits replay_window_exceeded gap before replay tail, then continues with live output', async () => {
+      const previousReplayRingMaxBytes = process.env.TERMINAL_REPLAY_RING_MAX_BYTES
+      process.env.TERMINAL_REPLAY_RING_MAX_BYTES = '48'
+      try {
+        const { ws: ws1, close: close1 } = await createAuthenticatedConnection()
+        const terminalId = await createTerminal(ws1, 'replay-gap-order')
+
+        for (let i = 1; i <= 12; i += 1) {
+          registry.simulateOutput(terminalId, `frame-${i}-xxxxx|`)
+        }
+        await waitForMessage(
+          ws1,
+          (m) => m.type === 'terminal.output' && m.terminalId === terminalId && m.seqEnd >= 12,
+        )
+
+        close1()
+        await new Promise((resolve) => setTimeout(resolve, 25))
+
+        const { ws: ws2, close: close2 } = await createAuthenticatedConnection()
+        const orderedEvents: Array<{ type: string; data?: string }> = []
+        const eventListener = (data: WebSocket.Data) => {
+          const msg = JSON.parse(data.toString())
+          if (msg.terminalId !== terminalId) return
+          if (
+            msg.type === 'terminal.attach.ready'
+            || msg.type === 'terminal.output.gap'
+            || msg.type === 'terminal.output'
+          ) {
+            orderedEvents.push({ type: msg.type, data: msg.data })
+          }
+        }
+        ws2.on('message', eventListener)
+
+        const pending = waitForMessages(ws2, [
+          (m) => m.type === 'terminal.attach.ready' && m.terminalId === terminalId,
+          (m) => m.type === 'terminal.output.gap' && m.terminalId === terminalId && m.reason === 'replay_window_exceeded',
+          (m) => m.type === 'terminal.output' && m.terminalId === terminalId,
+        ], 5000)
+        ws2.send(JSON.stringify({ type: 'terminal.attach', terminalId, sinceSeq: 1 }))
+        const [ready, gap, replayTail] = await pending
+
+        registry.simulateOutput(terminalId, 'live-after-gap-tail')
+        const live = await waitForMessage(
+          ws2,
+          (m) => m.type === 'terminal.output' && m.terminalId === terminalId && String(m.data).includes('live-after-gap-tail'),
+        )
+
+        ws2.off('message', eventListener)
+
+        expect(gap.fromSeq).toBe(2)
+        expect(gap.toSeq).toBe(ready.replayFromSeq - 1)
+        expect(gap.reason).toBe('replay_window_exceeded')
+        expect(replayTail.seqStart).toBeGreaterThanOrEqual(ready.replayFromSeq)
+        expect(replayTail.seqEnd).toBeLessThanOrEqual(ready.replayToSeq)
+        expect(live.seqStart).toBeGreaterThan(ready.replayToSeq)
+
+        const readyIndex = orderedEvents.findIndex((event) => event.type === 'terminal.attach.ready')
+        const gapIndex = orderedEvents.findIndex((event) => event.type === 'terminal.output.gap')
+        const replayIndex = orderedEvents.findIndex((event) => event.type === 'terminal.output')
+        const liveIndex = orderedEvents.findIndex(
+          (event) => event.type === 'terminal.output' && event.data?.includes('live-after-gap-tail'),
+        )
+
+        expect(readyIndex).toBeGreaterThanOrEqual(0)
+        expect(gapIndex).toBeGreaterThan(readyIndex)
+        expect(replayIndex).toBeGreaterThan(gapIndex)
+        expect(liveIndex).toBeGreaterThan(replayIndex)
+
+        close2()
+      } finally {
+        if (previousReplayRingMaxBytes === undefined) delete process.env.TERMINAL_REPLAY_RING_MAX_BYTES
+        else process.env.TERMINAL_REPLAY_RING_MAX_BYTES = previousReplayRingMaxBytes
+      }
+    })
+
     it('emits terminal.output.gap on queue overflow instead of closing', async () => {
       const previousQueueMaxBytes = process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES
       process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES = '64'

@@ -322,6 +322,61 @@ describe('terminal stream v2 replay', () => {
     await close2()
   })
 
+  it('attach replay from sinceSeq emits ready first and replays an exact range above sequence 1', async () => {
+    const { ws: ws1, close: close1 } = await createAuthenticatedConnection(port)
+    const { terminalId } = await createTerminal(ws1, 'stream-range-create')
+
+    for (let i = 1; i <= 12; i += 1) {
+      registry.simulateOutput(terminalId, `f${i}|`)
+    }
+    await waitForMessage(
+      ws1,
+      (msg) => msg.type === 'terminal.output' && msg.terminalId === terminalId && msg.seqEnd >= 12,
+    )
+    await close1()
+
+    const { ws: ws2, close: close2 } = await createAuthenticatedConnection(port)
+    const received: Array<{ type: string; seqStart?: number; seqEnd?: number }> = []
+    const listener = (data: WebSocket.Data) => {
+      const msg = JSON.parse(data.toString())
+      if (msg.terminalId !== terminalId) return
+      if (msg.type === 'terminal.attach.ready' || msg.type === 'terminal.output') {
+        received.push({ type: msg.type, seqStart: msg.seqStart, seqEnd: msg.seqEnd })
+      }
+    }
+    ws2.on('message', listener)
+
+    const readyPromise = waitForMessage(
+      ws2,
+      (msg) => msg.type === 'terminal.attach.ready' && msg.terminalId === terminalId,
+    )
+    const replayTailPromise = waitForMessage(
+      ws2,
+      (msg) => msg.type === 'terminal.output' && msg.terminalId === terminalId && msg.seqEnd === 12,
+    )
+
+    ws2.send(JSON.stringify({ type: 'terminal.attach', terminalId, sinceSeq: 5 }))
+
+    const ready = await readyPromise
+    await replayTailPromise
+    ws2.off('message', listener)
+
+    expect(ready.replayFromSeq).toBe(6)
+    expect(ready.replayToSeq).toBe(12)
+    expect(received[0]?.type).toBe('terminal.attach.ready')
+
+    const replayed = received.filter((msg) => msg.type === 'terminal.output')
+    expect(replayed).toHaveLength(7)
+    expect(replayed[0]?.seqStart).toBe(6)
+    expect(replayed[replayed.length - 1]?.seqEnd).toBe(12)
+    for (let i = 0; i < replayed.length; i += 1) {
+      expect(replayed[i]?.seqStart).toBe(6 + i)
+      expect(replayed[i]?.seqEnd).toBe(6 + i)
+    }
+
+    await close2()
+  })
+
   it('emits terminal.output.gap under queue overflow and keeps streaming without routine 4008 close', async () => {
     const { ws, close } = await createAuthenticatedConnection(port)
     const { terminalId } = await createTerminal(ws, 'stream-gap-create')
