@@ -9,6 +9,8 @@ import connectionReducer from '@/store/connectionSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import { useAppSelector } from '@/store/hooks'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
+import { __resetTerminalCursorCacheForTests } from '@/lib/terminal-cursor'
+import { TERMINAL_CURSOR_STORAGE_KEY } from '@/store/storage-keys'
 
 const wsMocks = vi.hoisted(() => ({
   send: vi.fn(),
@@ -102,6 +104,8 @@ describe('TerminalView lifecycle updates', () => {
   let cancelAnimationFrameSpy: ReturnType<typeof vi.spyOn> | null = null
 
   beforeEach(() => {
+    localStorage.clear()
+    __resetTerminalCursorCacheForTests()
     wsMocks.send.mockClear()
     restoreMocks.consumeTerminalRestoreRequestId.mockReset()
     restoreMocks.consumeTerminalRestoreRequestId.mockReturnValue(false)
@@ -128,6 +132,8 @@ describe('TerminalView lifecycle updates', () => {
     cleanup()
     vi.useRealTimers()
     vi.unstubAllGlobals()
+    localStorage.clear()
+    __resetTerminalCursorCacheForTests()
     requestAnimationFrameSpy?.mockRestore()
     cancelAnimationFrameSpy?.mockRestore()
     requestAnimationFrameSpy = null
@@ -1487,6 +1493,8 @@ describe('TerminalView lifecycle updates', () => {
       return {
         ...view,
         store,
+        tabId,
+        paneId,
         term: terminalInstances[terminalInstances.length - 1],
         requestId,
         terminalId: terminalId || 'term-v2-stream',
@@ -1520,6 +1528,51 @@ describe('TerminalView lifecycle updates', () => {
         type: 'terminal.attach',
         terminalId,
         sinceSeq: 3,
+      })
+    })
+
+    it('reattaches with latest rendered sequence after terminal view remount', async () => {
+      const { store, tabId, paneId, terminalId, unmount } = await renderTerminalHarness({ status: 'running', terminalId: 'term-v2-remount' })
+
+      messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 3, data: 'abc' })
+      unmount()
+      wsMocks.send.mockClear()
+
+      render(
+        <Provider store={store}>
+          <TerminalViewFromStore tabId={tabId} paneId={paneId} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith({
+          type: 'terminal.attach',
+          terminalId,
+          sinceSeq: 3,
+        })
+      })
+    })
+
+    it('uses max(persisted cursor, in-memory sequence) for reconnect attach requests', async () => {
+      localStorage.setItem(TERMINAL_CURSOR_STORAGE_KEY, JSON.stringify({
+        'term-v2-max-cursor': {
+          seq: 8,
+          updatedAt: Date.now(),
+        },
+      }))
+      __resetTerminalCursorCacheForTests()
+
+      const { terminalId } = await renderTerminalHarness({ status: 'running', terminalId: 'term-v2-max-cursor' })
+
+      messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 3, data: 'abc' })
+      wsMocks.send.mockClear()
+
+      reconnectHandler?.()
+
+      expect(wsMocks.send).toHaveBeenCalledWith({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 8,
       })
     })
 

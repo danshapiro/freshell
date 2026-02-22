@@ -23,6 +23,7 @@ import { copyText, readText } from '@/lib/clipboard'
 import { registerTerminalActions } from '@/lib/pane-action-registry'
 import { consumeTerminalRestoreRequestId, addTerminalRestoreRequestId } from '@/lib/terminal-restore'
 import { isTerminalPasteShortcut } from '@/lib/terminal-input-policy'
+import { clearTerminalCursor, loadTerminalCursor, saveTerminalCursor } from '@/lib/terminal-cursor'
 import { useMobile } from '@/hooks/useMobile'
 import { findLocalFilePaths } from '@/lib/path-utils'
 import {
@@ -225,7 +226,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       }
       terminalIdRef.current = terminalContent.terminalId
       if (terminalContent.terminalId !== prevTerminalId) {
-        lastSeqRef.current = 0
+        lastSeqRef.current = terminalContent.terminalId
+          ? loadTerminalCursor(terminalContent.terminalId)
+          : 0
       }
       requestIdRef.current = terminalContent.createRequestId
       contentRef.current = terminalContent
@@ -1122,10 +1125,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
     function attach(tid: string) {
       setIsAttaching(true)
+      const persistedSeq = loadTerminalCursor(tid)
+      const sinceSeq = Math.max(lastSeqRef.current, persistedSeq)
+      lastSeqRef.current = sinceSeq
       ws.send({
         type: 'terminal.attach',
         terminalId: tid,
-        sinceSeq: lastSeqRef.current,
+        sinceSeq,
       })
       // NOTE: Do NOT send terminal.resize here. At this point fit() hasn't run yet,
       // so term.cols/rows are xterm defaults (80×24), not the actual viewport size.
@@ -1174,6 +1180,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           const mode = contentRef.current?.mode || 'shell'
           handleTerminalOutput(raw, mode, tid)
           lastSeqRef.current = msg.seqEnd
+          saveTerminalCursor(tid, lastSeqRef.current)
         }
 
         if (msg.type === 'terminal.output.gap' && msg.terminalId === tid) {
@@ -1186,11 +1193,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             // disposed
           }
           lastSeqRef.current = Math.max(lastSeqRef.current, msg.toSeq)
+          saveTerminalCursor(tid, lastSeqRef.current)
           setIsAttaching(false)
         }
 
         if (msg.type === 'terminal.attach.ready' && msg.terminalId === tid) {
           lastSeqRef.current = Math.max(lastSeqRef.current, msg.replayToSeq)
+          saveTerminalCursor(tid, lastSeqRef.current)
           setIsAttaching(false)
           updateContent({ status: 'running' })
         }
@@ -1207,6 +1216,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             willUpdate: !!(msg.effectiveResumeSessionId && msg.effectiveResumeSessionId !== contentRef.current?.resumeSessionId),
           })
           terminalIdRef.current = newId
+          clearTerminalCursor(newId)
           lastSeqRef.current = 0
           updateContent({ terminalId: newId, status: 'running' })
           // Also update tab for title purposes
@@ -1223,6 +1233,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         }
 
         if (msg.type === 'terminal.exit' && msg.terminalId === tid) {
+          clearTerminalCursor(tid)
           // Clear terminalIdRef AND the stored terminalId to prevent any subsequent
           // operations (resize, input) from sending commands to the dead terminal,
           // which would trigger INVALID_TERMINAL_ID and cause a reconnection loop.
@@ -1334,6 +1345,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
               addTerminalRestoreRequestId(newRequestId)
             }
             requestIdRef.current = newRequestId
+            clearTerminalCursor(currentTerminalId)
             terminalIdRef.current = undefined
             lastSeqRef.current = 0
             updateContent({ terminalId: undefined, createRequestId: newRequestId, status: 'creating' })
