@@ -28,19 +28,31 @@ export function onAttachReady(
 ): AttachSeqState {
   const hasReplayWindow = ready.replayFromSeq > 0
     && ready.replayFromSeq <= ready.replayToSeq
-  const replayAlreadyCovered = hasReplayWindow && ready.replayToSeq <= state.lastSeq
+
+  // Overlapping attaches (for example viewport hydrate + reconnect) can leave
+  // a newer attach's high-water cursor in state before an older replay window arrives.
+  // If we're still awaiting fresh attach data and the replay starts at/before
+  // our cursor, rewind to replayFromSeq-1 so those replay frames are accepted.
+  const shouldRewindCursorForReplay = hasReplayWindow
+    && state.awaitingFreshSequence
+    && ready.replayFromSeq <= state.lastSeq
+  const replayBaseline = shouldRewindCursorForReplay
+    ? Math.max(0, ready.replayFromSeq - 1)
+    : state.lastSeq
+  const replayAlreadyCovered = hasReplayWindow && ready.replayToSeq <= replayBaseline
 
   if (hasReplayWindow && !replayAlreadyCovered) {
     // Keep awaitingFreshSequence true until replay/live output is actually accepted.
     // attach.ready arrives before replay frames, so clearing it here is premature.
     return {
       ...state,
+      lastSeq: replayBaseline,
       pendingReplay: { fromSeq: ready.replayFromSeq, toSeq: ready.replayToSeq },
     }
   }
   return {
     ...state,
-    lastSeq: Math.max(state.lastSeq, ready.headSeq),
+    lastSeq: Math.max(replayBaseline, ready.headSeq),
     awaitingFreshSequence: false,
     pendingReplay: null,
   }
