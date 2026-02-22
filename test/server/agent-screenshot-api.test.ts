@@ -1,0 +1,116 @@
+import { afterEach, it, expect, vi } from 'vitest'
+import express from 'express'
+import request from 'supertest'
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { createAgentApiRouter } from '../../server/agent-api/router'
+
+const createdPaths = new Set<string>()
+
+afterEach(async () => {
+  await Promise.all(
+    [...createdPaths].map(async (targetPath) => {
+      await fs.rm(targetPath, { force: true })
+    }),
+  )
+  createdPaths.clear()
+})
+
+it('writes screenshot to temp dir by default and returns metadata JSON', async () => {
+  const app = express()
+  app.use(express.json())
+
+  const wsHandler = {
+    requestUiScreenshot: vi.fn().mockResolvedValue({
+      ok: true,
+      mimeType: 'image/png',
+      imageBase64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO2M7nQAAAAASUVORK5CYII=',
+      width: 1,
+      height: 1,
+      changedFocus: false,
+      restoredFocus: true,
+    }),
+  }
+
+  app.use('/api', createAgentApiRouter({ layoutStore: {} as any, registry: {} as any, wsHandler: wsHandler as any }))
+
+  const expectedPath = path.join(os.tmpdir(), 'api-view-smoke.png')
+  await fs.rm(expectedPath, { force: true })
+  createdPaths.add(expectedPath)
+
+  const res = await request(app)
+    .post('/api/screenshots')
+    .send({ scope: 'view', name: 'api-view-smoke' })
+
+  expect(res.status).toBe(200)
+  expect(res.body.status).toBe('ok')
+  expect(res.body.data.path).toBe(expectedPath)
+  await expect(fs.stat(res.body.data.path)).resolves.toBeTruthy()
+})
+
+it('returns 409 when output file exists and overwrite is not set', async () => {
+  const app = express()
+  app.use(express.json())
+
+  const wsHandler = {
+    requestUiScreenshot: vi.fn().mockResolvedValue({
+      ok: true,
+      mimeType: 'image/png',
+      imageBase64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO2M7nQAAAAASUVORK5CYII=',
+      width: 1,
+      height: 1,
+    }),
+  }
+
+  app.use('/api', createAgentApiRouter({ layoutStore: {} as any, registry: {} as any, wsHandler: wsHandler as any }))
+
+  const conflictPath = path.join(os.tmpdir(), `api-shot-conflict-${Date.now()}.png`)
+  await fs.writeFile(conflictPath, Buffer.from([0x89, 0x50, 0x4e, 0x47]))
+  createdPaths.add(conflictPath)
+
+  const res = await request(app)
+    .post('/api/screenshots')
+    .send({ scope: 'view', name: 'ignored', path: conflictPath })
+
+  expect(res.status).toBe(409)
+  expect(res.body.status).toBe('error')
+  expect(res.body.message).toContain('already exists')
+})
+
+it('returns 400 when name is missing', async () => {
+  const app = express()
+  app.use(express.json())
+
+  const wsHandler = {
+    requestUiScreenshot: vi.fn(),
+  }
+
+  app.use('/api', createAgentApiRouter({ layoutStore: {} as any, registry: {} as any, wsHandler: wsHandler as any }))
+
+  const res = await request(app)
+    .post('/api/screenshots')
+    .send({ scope: 'view' })
+
+  expect(res.status).toBe(400)
+  expect(res.body.status).toBe('error')
+})
+
+it('returns 400 when scope is pane and paneId is missing', async () => {
+  const app = express()
+  app.use(express.json())
+
+  const wsHandler = {
+    requestUiScreenshot: vi.fn(),
+  }
+
+  app.use('/api', createAgentApiRouter({ layoutStore: {} as any, registry: {} as any, wsHandler: wsHandler as any }))
+
+  const res = await request(app)
+    .post('/api/screenshots')
+    .send({ scope: 'pane', name: 'pane-shot' })
+
+  expect(res.status).toBe(400)
+  expect(res.body.status).toBe('error')
+  expect(res.body.message).toContain('paneId')
+})

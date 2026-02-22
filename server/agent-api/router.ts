@@ -1,8 +1,11 @@
 import { Router } from 'express'
+import fs from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { nanoid } from 'nanoid'
 import { ok, approx, fail } from './response.js'
 import { renderCapture } from './capture.js'
 import { waitForMatch } from './wait-for.js'
+import { resolveScreenshotOutputPath } from './screenshot-path.js'
 
 const truthy = (value: unknown) => value === true || value === 'true' || value === '1' || value === 'yes'
 
@@ -19,6 +22,12 @@ const parseRegex = (raw: string) => {
 const looksLikePrompt = (text: string) => {
   const lastLine = text.split(/\r?\n/).filter(Boolean).pop() || ''
   return /[#$>] ?$/.test(lastLine.trimEnd())
+}
+
+async function writeFileAtomic(filePath: string, content: Buffer) {
+  const tempPath = `${filePath}.tmp-${randomUUID()}`
+  await fs.writeFile(tempPath, content)
+  await fs.rename(tempPath, filePath)
 }
 
 export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { layoutStore: any; registry: any; wsHandler?: any }) {
@@ -233,6 +242,80 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
       }
       if (Date.now() - start >= timeoutMs) return res.json(approx({ matched: false }, 'timeout'))
       await new Promise((resolve) => setTimeout(resolve, 200))
+    }
+  })
+
+  router.post('/screenshots', async (req, res) => {
+    const rawScope = req.body?.scope
+    const nameRaw = req.body?.name
+    const pathInput = typeof req.body?.path === 'string' ? req.body.path : undefined
+    const overwrite = truthy(req.body?.overwrite)
+    const paneId = typeof req.body?.paneId === 'string' ? req.body.paneId : undefined
+    const tabId = typeof req.body?.tabId === 'string' ? req.body.tabId : undefined
+
+    if (rawScope !== 'pane' && rawScope !== 'tab' && rawScope !== 'view') {
+      return res.status(400).json(fail('scope must be pane, tab, or view'))
+    }
+
+    const scope: 'pane' | 'tab' | 'view' = rawScope
+
+    if (scope === 'pane' && !paneId) {
+      return res.status(400).json(fail('paneId required for pane scope'))
+    }
+
+    if (scope === 'tab' && !tabId) {
+      return res.status(400).json(fail('tabId required for tab scope'))
+    }
+
+    if (!wsHandler?.requestUiScreenshot) {
+      return res.status(503).json(fail('ui screenshot channel unavailable'))
+    }
+
+    let outputPath: string
+    try {
+      outputPath = await resolveScreenshotOutputPath({
+        name: String(nameRaw || ''),
+        pathInput,
+      })
+    } catch (err: any) {
+      return res.status(400).json(fail(err?.message || 'invalid screenshot options'))
+    }
+
+    try {
+      if (!overwrite) {
+        try {
+          await fs.access(outputPath)
+          return res.status(409).json(fail('output file already exists (use --overwrite)'))
+        } catch {
+          // File does not exist, continue.
+        }
+      }
+
+      const ui = await wsHandler.requestUiScreenshot({ scope, tabId, paneId })
+      if (!ui?.ok || !ui?.imageBase64) {
+        return res.status(422).json(fail(ui?.error || 'ui screenshot failed'))
+      }
+
+      await writeFileAtomic(outputPath, Buffer.from(ui.imageBase64, 'base64'))
+
+      return res.json(
+        ok(
+          {
+            path: outputPath,
+            scope,
+            tabId,
+            paneId,
+            width: ui.width,
+            height: ui.height,
+            changedFocus: !!ui.changedFocus,
+            restoredFocus: !!ui.restoredFocus,
+            timestamp: Date.now(),
+          },
+          'screenshot saved',
+        ),
+      )
+    } catch (err: any) {
+      return res.status(500).json(fail(err?.message || 'failed to capture screenshot'))
     }
   })
 
