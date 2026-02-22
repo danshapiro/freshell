@@ -24,6 +24,14 @@ import { registerTerminalActions } from '@/lib/pane-action-registry'
 import { consumeTerminalRestoreRequestId, addTerminalRestoreRequestId } from '@/lib/terminal-restore'
 import { isTerminalPasteShortcut } from '@/lib/terminal-input-policy'
 import { clearTerminalCursor, loadTerminalCursor, saveTerminalCursor } from '@/lib/terminal-cursor'
+import {
+  beginAttach,
+  createAttachSeqState,
+  onAttachReady,
+  onOutputFrame,
+  onOutputGap,
+  type AttachSeqState,
+} from '@/lib/terminal-attach-seq-state'
 import { useMobile } from '@/hooks/useMobile'
 import { findLocalFilePaths } from '@/lib/path-utils'
 import {
@@ -211,11 +219,22 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const requestIdRef = useRef<string>(terminalContent?.createRequestId || '')
   const terminalIdRef = useRef<string | undefined>(terminalContent?.terminalId)
   const lastSeqRef = useRef(0)
-  const awaitingFreshSequenceRef = useRef(false)
+  const seqStateRef = useRef<AttachSeqState>(createAttachSeqState())
   const needsViewportHydrationRef = useRef(true)
   const pendingDeferredHydrationRef = useRef(false)
   const awaitingViewportHydrationRef = useRef(false)
   const contentRef = useRef<TerminalPaneContent | null>(terminalContent)
+
+  const applySeqState = useCallback((
+    nextState: AttachSeqState,
+    options?: { terminalId?: string; persistCursor?: boolean },
+  ) => {
+    seqStateRef.current = nextState
+    lastSeqRef.current = nextState.lastSeq
+    if (options?.persistCursor && options.terminalId && nextState.lastSeq > 0) {
+      saveTerminalCursor(options.terminalId, nextState.lastSeq)
+    }
+  }, [])
 
   // Keep refs in sync with props
   useEffect(() => {
@@ -232,14 +251,15 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       }
       terminalIdRef.current = terminalContent.terminalId
       if (terminalContent.terminalId !== prevTerminalId) {
-        lastSeqRef.current = terminalContent.terminalId
+        const initialSeq = terminalContent.terminalId
           ? loadTerminalCursor(terminalContent.terminalId)
           : 0
+        applySeqState(createAttachSeqState({ lastSeq: initialSeq }))
       }
       requestIdRef.current = terminalContent.createRequestId
       contentRef.current = terminalContent
     }
-  }, [terminalContent, paneId])
+  }, [terminalContent, paneId, applySeqState])
 
   useEffect(() => {
     hiddenRef.current = hidden
@@ -1041,10 +1061,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     opts?: { clearViewportFirst?: boolean },
   ) => {
     setIsAttaching(true)
-    awaitingFreshSequenceRef.current = true
 
     const persistedSeq = loadTerminalCursor(tid)
-    const deltaSeq = Math.max(lastSeqRef.current, persistedSeq)
+    const deltaSeq = Math.max(seqStateRef.current.lastSeq, persistedSeq)
     const sinceSeq = intent === 'viewport_hydrate' ? 0 : deltaSeq
 
     if (intent === 'viewport_hydrate') {
@@ -1056,12 +1075,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         }
       }
       // Keep persisted cursor untouched so transport reconnect can still use high-water.
-      lastSeqRef.current = 0
+      applySeqState(beginAttach(createAttachSeqState({ lastSeq: 0 })))
       needsViewportHydrationRef.current = false
       pendingDeferredHydrationRef.current = false
       awaitingViewportHydrationRef.current = true
     } else {
-      lastSeqRef.current = deltaSeq
+      applySeqState(beginAttach(createAttachSeqState({ lastSeq: deltaSeq })))
       awaitingViewportHydrationRef.current = false
       if (intent === 'keepalive_delta' && needsViewportHydrationRef.current) {
         pendingDeferredHydrationRef.current = true
@@ -1080,7 +1099,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     // putting the text input at the top of the pane). The correct resize is sent by:
     // - ResizeObserver callback (for visible tabs, after fit() runs)
     // - Visibility effect (for hidden tabs, when they become visible)
-  }, [ws])
+  }, [ws, applySeqState])
 
   // Apply settings changes
   useEffect(() => {
@@ -1208,37 +1227,39 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             }
             return
           }
-          if (msg.seqStart <= lastSeqRef.current) {
-            // If a terminal sequence restarted (for example after a server restart) while we had
-            // a persisted cursor for the same terminalId, accept the fresh stream from sequence 1.
-            const shouldResetSequence =
-              awaitingFreshSequenceRef.current
-              && msg.seqStart === 1
-              && lastSeqRef.current > 0
-
-            if (shouldResetSequence) {
-              lastSeqRef.current = 0
-              clearTerminalCursor(tid)
-            } else {
-              if (import.meta.env.DEV) {
-                log.warn('Ignoring overlapping terminal.output sequence range', {
-                  paneId: paneIdRef.current,
-                  terminalId: tid,
-                  seqStart: msg.seqStart,
-                  seqEnd: msg.seqEnd,
-                  lastSeq: lastSeqRef.current,
-                })
-              }
-              return
+          const previousSeqState = seqStateRef.current
+          const frameDecision = onOutputFrame(previousSeqState, {
+            seqStart: msg.seqStart,
+            seqEnd: msg.seqEnd,
+          })
+          if (!frameDecision.accept) {
+            if (import.meta.env.DEV) {
+              log.warn('Ignoring overlapping terminal.output sequence range', {
+                paneId: paneIdRef.current,
+                terminalId: tid,
+                seqStart: msg.seqStart,
+                seqEnd: msg.seqEnd,
+                lastSeq: previousSeqState.lastSeq,
+              })
             }
+            return
+          }
+
+          if (
+            tid
+            && msg.seqStart === 1
+            && frameDecision.state.lastSeq < previousSeqState.lastSeq
+          ) {
+            clearTerminalCursor(tid)
           }
           const raw = msg.data || ''
           const mode = contentRef.current?.mode || 'shell'
           handleTerminalOutput(raw, mode, tid)
-          lastSeqRef.current = msg.seqEnd
-          saveTerminalCursor(tid, lastSeqRef.current)
-          awaitingFreshSequenceRef.current = false
-          markViewportHydrationComplete()
+          applySeqState(frameDecision.state, { terminalId: tid, persistCursor: true })
+          if (!frameDecision.state.pendingReplay) {
+            setIsAttaching(false)
+            markViewportHydrationComplete()
+          }
         }
 
         if (msg.type === 'terminal.output.gap' && msg.terminalId === tid) {
@@ -1250,19 +1271,28 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           } catch {
             // disposed
           }
-          lastSeqRef.current = Math.max(lastSeqRef.current, msg.toSeq)
-          saveTerminalCursor(tid, lastSeqRef.current)
-          setIsAttaching(false)
-          awaitingFreshSequenceRef.current = false
-          markViewportHydrationComplete()
+          const nextSeqState = onOutputGap(seqStateRef.current, { fromSeq: msg.fromSeq, toSeq: msg.toSeq })
+          applySeqState(nextSeqState, { terminalId: tid, persistCursor: true })
+          if (!nextSeqState.pendingReplay) {
+            setIsAttaching(false)
+            markViewportHydrationComplete()
+          }
         }
 
         if (msg.type === 'terminal.attach.ready' && msg.terminalId === tid) {
-          lastSeqRef.current = Math.max(lastSeqRef.current, msg.replayToSeq)
-          saveTerminalCursor(tid, lastSeqRef.current)
-          setIsAttaching(false)
+          const nextSeqState = onAttachReady(seqStateRef.current, {
+            replayFromSeq: msg.replayFromSeq,
+            replayToSeq: msg.replayToSeq,
+          })
+          applySeqState(nextSeqState, {
+            terminalId: tid,
+            persistCursor: !nextSeqState.pendingReplay,
+          })
+          setIsAttaching(Boolean(nextSeqState.pendingReplay))
           updateContent({ status: 'running' })
-          markViewportHydrationComplete()
+          if (!nextSeqState.pendingReplay) {
+            markViewportHydrationComplete()
+          }
         }
 
         if (msg.type === 'terminal.created' && msg.requestId === reqId) {
@@ -1277,7 +1307,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             willUpdate: !!(msg.effectiveResumeSessionId && msg.effectiveResumeSessionId !== contentRef.current?.resumeSessionId),
           })
           terminalIdRef.current = newId
-          lastSeqRef.current = 0
+          applySeqState(beginAttach(createAttachSeqState({ lastSeq: 0 })))
           updateContent({ terminalId: newId, status: 'running' })
           // Also update tab for title purposes
           const currentTab = tabRef.current
@@ -1290,7 +1320,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           // Creator is already attached server-side for this terminal through v2 broker.
           ws.send({ type: 'terminal.resize', terminalId: newId, cols: term.cols, rows: term.rows })
           setIsAttaching(true)
-          awaitingFreshSequenceRef.current = true
           needsViewportHydrationRef.current = false
           pendingDeferredHydrationRef.current = false
           awaitingViewportHydrationRef.current = false
@@ -1304,8 +1333,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           // We must clear both the ref AND the Redux state because the ref sync effect
           // would otherwise reset the ref from the Redux state on re-render.
           terminalIdRef.current = undefined
-          lastSeqRef.current = 0
-          awaitingFreshSequenceRef.current = false
+          applySeqState(createAttachSeqState())
           updateContent({ terminalId: undefined, status: 'exited' })
           const exitTab = tabRef.current
           if (exitTab) {
@@ -1412,8 +1440,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             requestIdRef.current = newRequestId
             clearTerminalCursor(currentTerminalId)
             terminalIdRef.current = undefined
-            lastSeqRef.current = 0
-            awaitingFreshSequenceRef.current = false
+            applySeqState(createAttachSeqState())
             updateContent({ terminalId: undefined, createRequestId: newRequestId, status: 'creating' })
             // Also clear the tab's terminalId to keep it in sync.
             // This prevents openSessionTab from using the stale terminalId for dedup.

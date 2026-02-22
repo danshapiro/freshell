@@ -1847,8 +1847,8 @@ describe('TerminalView lifecycle updates', () => {
         messageHandler!({
           type: 'terminal.attach.ready',
           terminalId: 'term-v2-created',
-          headSeq: 0,
-          replayFromSeq: 0,
+          headSeq: 7,
+          replayFromSeq: 8,
           replayToSeq: 7,
         })
       })
