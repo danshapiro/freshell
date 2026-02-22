@@ -20,6 +20,22 @@
 
 ---
 
+## Preflight: Worktree Safety and Scope Lock
+
+Before Task 1, execute all work in a dedicated worktree branch (not `main`), because this running terminal is served from `main`.
+
+1. Create/switch to a feature branch in a worktree under `.worktrees/`.
+2. Confirm the branch tip and target plan file:
+   - `git status -sb`
+   - `git log --oneline -n 3`
+3. Scope all edits/tests in this plan to:
+   - `src/components/TerminalView.tsx`
+   - `server/terminal-stream/*`
+   - `server/terminal-registry.ts`
+   - listed test files only
+
+---
+
 ### Task 1: Add Failing Client Tests for Visibility-Aware Remount Attach
 
 **Files:**
@@ -65,13 +81,22 @@ it('performs one deferred viewport hydration attach when a remounted hidden pane
 
 Retain/extend existing reconnect tests proving `onReconnect` still uses high-water delta attach.
 
-**Step 5: Run focused tests (expect fail first)**
+**Step 5: Add failing reconnect-during-hydration cursor test**
+
+Add a regression test for this edge case:
+- remount visible terminal (first attach `sinceSeq: 0`),
+- trigger reconnect before replay output arrives,
+- assert reconnect attach still uses prior persisted high-water cursor (not `0`).
+
+This test prevents accidental `clearTerminalCursor()` in viewport hydration path.
+
+**Step 6: Run focused tests (expect fail first)**
 
 Run: `npm run test -- test/unit/client/components/TerminalView.lifecycle.test.tsx`
 
 Expected: new remount tests fail before implementation.
 
-**Step 6: Commit failing tests**
+**Step 7: Commit failing tests**
 
 ```bash
 git add test/unit/client/components/TerminalView.lifecycle.test.tsx
@@ -108,6 +133,7 @@ Rules:
 - Fresh xterm mount starts with `needsViewportHydrationRef=true`.
 - Visible remount hydration clears it.
 - Hidden remount keepalive leaves it true and marks deferred hydration pending.
+- Do not clear persisted cursor during viewport hydration request; reconnect fallback depends on that high-water value until new replay/output arrives.
 
 **Step 3: Make attach behavior intent-aware**
 
@@ -125,7 +151,7 @@ function attach(tid: string, intent: AttachIntent, opts?: { clearViewportFirst?:
       try { termRef.current?.clear() } catch { /* disposed */ }
     }
     lastSeqRef.current = 0
-    clearTerminalCursor(tid)
+    // Keep persisted cursor intact so an immediate transport reconnect can still attach at high-water.
   } else {
     lastSeqRef.current = deltaSeq
   }
@@ -146,6 +172,7 @@ function attach(tid: string, intent: AttachIntent, opts?: { clearViewportFirst?:
 **Step 5: Ensure hydration completion bookkeeping is correct**
 
 When hydration attach is satisfied (`terminal.output` and/or `terminal.attach.ready` after hydration request), clear deferred flags so we do not repeatedly rehydrate on every visibility toggle.
+Update persisted cursor only from actual replay/output events (`saveTerminalCursor`) as today.
 
 **Step 6: Run focused client tests**
 
@@ -200,7 +227,22 @@ it('retains truncated tail bytes when a single append exceeds maxBytes', () => {
 })
 ```
 
-**Step 3: Add failing broker test for settings-sized budget**
+**Step 3: Add failing UTF-8 boundary retention test**
+
+Add a test that appends multi-byte content larger than budget and asserts replay frame bytes are capped while decoded text remains valid UTF-8 tail content.
+
+```ts
+it('truncates oversized multi-byte frames on UTF-8 boundaries', () => {
+  const ring = new ReplayRing(7)
+  ring.append('🙂🙂🙂') // 12 bytes total
+  const replay = ring.replaySince(0)
+  expect(replay.frames).toHaveLength(1)
+  expect(replay.frames[0].bytes).toBeLessThanOrEqual(7)
+  expect(replay.frames[0].data).not.toContain('\uFFFD')
+})
+```
+
+**Step 4: Add failing broker test for settings-sized budget**
 
 In `FakeBrokerRegistry`, add budget setter/getter used by broker.
 
@@ -211,11 +253,11 @@ await broker.attach(wsReplay as any, 'term-replay-budget', 0)
 expect(wsReplay.send).not.toHaveBeenCalledWith(expect.stringContaining('"type":"terminal.output.gap"'))
 ```
 
-**Step 4: Add failing broker test for oversized single frame**
+**Step 5: Add failing broker test for oversized single frame**
 
 Assert that attaching after one oversized frame yields replay output (truncated frame) and does not emit `replay_window_exceeded`.
 
-**Step 5: Run focused server tests (expect fail first)**
+**Step 6: Run focused server tests (expect fail first)**
 
 Run:
 - `npm run test -- test/unit/server/terminal-stream/replay-ring.test.ts`
@@ -223,7 +265,7 @@ Run:
 
 Expected: FAIL before implementation.
 
-**Step 6: Commit failing tests**
+**Step 7: Commit failing tests**
 
 ```bash
 git add test/unit/server/terminal-stream/replay-ring.test.ts test/unit/server/ws-handler-backpressure.test.ts
@@ -254,11 +296,23 @@ If needed, remove `readonly` from `maxBytes`.
 
 **Step 2: Truncate oversized append frames instead of dropping all data**
 
-Add a helper that byte-caps large frame payloads to the tail of the output before insertion.
+Add a helper that byte-caps large frame payloads to the tail of the output before insertion, while preserving UTF-8 boundaries.
 
 ```ts
 private normalizeFrameData(data: string): string {
-  // Keep the newest bytes up to maxBytes, preserving replayability for sinceSeq=0 attaches.
+  const max = this.maxBytes
+  if (max <= 0) return ''
+  const encoded = Buffer.from(data, 'utf8')
+  if (encoded.byteLength <= max) return data
+
+  // Keep newest bytes, then trim leading partial UTF-8 bytes.
+  let tail = encoded.subarray(encoded.byteLength - max)
+  while (tail.length > 0) {
+    const decoded = tail.toString('utf8')
+    if (!decoded.includes('\uFFFD')) return decoded
+    tail = tail.subarray(1)
+  }
+  return ''
 }
 ```
 
@@ -344,6 +398,7 @@ git commit -m "test(e2e): cover settings remount hydration without hidden-tab re
 **Step 2: Run verification in safe order**
 
 Run:
+- `npm run lint`
 - `npm test`
 - `npm run check`
 
@@ -372,6 +427,8 @@ git commit -m "chore(terminal-stream): finalize remount hydration and replay ret
   Guardrail: clear viewport before deferred hydrate attach and guard with one-shot hydration flag.
 - Risk: replay retention still misses after large single append.
   Guardrail: truncate oversized frame data to byte budget rather than evicting to empty.
+- Risk: reconnect triggered during viewport hydration regresses to full replay.
+  Guardrail: never clear persisted cursor during hydration request; only update cursor from actual replay/output sequence advancement.
 - Risk: memory growth from larger retention budget.
   Guardrail: derive budget from existing scrollback clamp (`TerminalRegistry.computeScrollbackMaxChars`) and keep min/max bounds.
 - Risk: build step disrupts live instance.
@@ -385,5 +442,6 @@ git commit -m "chore(terminal-stream): finalize remount hydration and replay ret
 - Warm transport reconnect remains delta/high-water and does not duplicate history.
 - Initial remount does not full-replay all hidden tabs.
 - A remounted hidden tab hydrates history once when first shown.
+- If reconnect occurs before hydration replay arrives, reconnect attach still uses high-water cursor (not forced zero).
 - Oversized single output frames remain replayable (truncated to budget) rather than causing immediate replay-window gaps.
-- `npm test` and `npm run check` pass; `npm run build` passes in worktree before fast-forwarding `main`.
+- `npm run lint`, `npm test`, and `npm run check` pass; `npm run build` passes in worktree before fast-forwarding `main`.
