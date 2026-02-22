@@ -34,7 +34,7 @@ function createMockWs(overrides: Record<string, unknown> = {}) {
 
 class FakeBrokerRegistry extends EventEmitter {
   private records = new Map<string, { terminalId: string; buffer: { snapshot: () => string } }>()
-  private replayRingMaxBytes: number | undefined
+  private replayRingMaxChars: number | undefined
 
   createTerminal(terminalId: string) {
     this.records.set(terminalId, {
@@ -52,11 +52,11 @@ class FakeBrokerRegistry extends EventEmitter {
   }
 
   setReplayRingMaxBytes(next: number | undefined) {
-    this.replayRingMaxBytes = next
+    this.replayRingMaxChars = next
   }
 
-  getReplayRingMaxBytes() {
-    return this.replayRingMaxBytes
+  getReplayRingMaxChars() {
+    return this.replayRingMaxChars
   }
 }
 

@@ -27,13 +27,16 @@ export class ReplayRing {
   private nextSeq = 1
   private head = 0
   private maxBytes: number
+  private readonly utf8FatalDecoder = new TextDecoder('utf-8', { fatal: true })
 
   constructor(maxBytes?: number) {
     this.maxBytes = resolveMaxBytes(maxBytes)
   }
 
   setMaxBytes(nextMaxBytes?: number): void {
-    this.maxBytes = resolveMaxBytes(nextMaxBytes)
+    const resolved = resolveMaxBytes(nextMaxBytes)
+    if (resolved === this.maxBytes) return
+    this.maxBytes = resolved
     this.evictIfNeeded()
   }
 
@@ -96,7 +99,7 @@ export class ReplayRing {
 
   private decodeUtf8Fatal(bytes: Uint8Array): string | null {
     try {
-      return new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+      return this.utf8FatalDecoder.decode(bytes)
     } catch {
       return null
     }

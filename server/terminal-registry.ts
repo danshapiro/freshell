@@ -726,7 +726,7 @@ export class TerminalRegistry extends EventEmitter {
     }
   }
 
-  getReplayRingMaxBytes(): number {
+  getReplayRingMaxChars(): number {
     return this.scrollbackMaxChars
   }
 

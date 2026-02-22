@@ -250,15 +250,9 @@ export class TerminalStreamBroker {
   }
 
   private resolveReplayRingMaxBytes(): number | undefined {
-    const maxBytesGetter = this.registry as unknown as {
-      getReplayRingMaxBytes?: () => number | undefined
-    }
-
-    if (typeof maxBytesGetter.getReplayRingMaxBytes !== 'function') {
-      return undefined
-    }
-
-    const value = maxBytesGetter.getReplayRingMaxBytes()
+    // TerminalRegistry clamp is character-based; reusing the same numeric
+    // budget as bytes keeps replay retention conservative.
+    const value = this.registry.getReplayRingMaxChars()
     if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
       return undefined
     }
