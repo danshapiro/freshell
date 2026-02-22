@@ -239,4 +239,83 @@ describe('terminal flaky-network responsiveness (e2e)', () => {
     })
     expect(screen.queryByText('Starting terminal...')).not.toBeInTheDocument()
   })
+
+  it('renders replayFrom>1 frames and live output while recovering status clears', async () => {
+    const store = createStore()
+
+    render(
+      <Provider store={store}>
+        <TerminalView
+          tabId="tab-flaky"
+          paneId="pane-flaky"
+          paneContent={{
+            kind: 'terminal',
+            createRequestId: 'req-flaky',
+            status: 'running',
+            mode: 'shell',
+            shell: 'system',
+            terminalId: 'term-flaky',
+          }}
+          hidden={false}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(terminalInstances.length).toBe(1)
+      expect(wsHarness.onMessage).toHaveBeenCalled()
+    })
+
+    store.dispatch(setStatus('ready'))
+    await waitFor(() => {
+      expect(screen.getByText('Recovering terminal output...')).toBeInTheDocument()
+    })
+
+    wsHarness.emit({
+      type: 'terminal.attach.ready',
+      terminalId: 'term-flaky',
+      headSeq: 9,
+      replayFromSeq: 7,
+      replayToSeq: 9,
+    })
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId: 'term-flaky',
+      seqStart: 7,
+      seqEnd: 7,
+      data: 'replay-7',
+    })
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId: 'term-flaky',
+      seqStart: 8,
+      seqEnd: 8,
+      data: 'replay-8',
+    })
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId: 'term-flaky',
+      seqStart: 9,
+      seqEnd: 9,
+      data: 'replay-9',
+    })
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId: 'term-flaky',
+      seqStart: 10,
+      seqEnd: 10,
+      data: 'live-10',
+    })
+
+    flushRafQueue(rafCallbacks)
+
+    const writes = terminalInstances[0].write.mock.calls.map(([data]) => String(data)).join('')
+    expect(writes).toContain('replay-7')
+    expect(writes).toContain('replay-9')
+    expect(writes).toContain('live-10')
+    await waitFor(() => {
+      expect(screen.queryByText('Recovering terminal output...')).not.toBeInTheDocument()
+    })
+    expect(screen.queryByText('Offline: input will queue until reconnected.')).not.toBeInTheDocument()
+  })
 })

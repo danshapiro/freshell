@@ -311,4 +311,112 @@ describe('settings remount scrollback hydration (e2e)', () => {
     const allGapLines = terminalInstances.flatMap((instance) => instance.writeln.mock.calls.map(([data]) => String(data)))
     expect(allGapLines.some((line) => line.includes('reconnect window exceeded'))).toBe(false)
   })
+
+  it('hydrates hidden remount replay tails when replayFromSeq is above 1', async () => {
+    localStorage.setItem(TERMINAL_CURSOR_STORAGE_KEY, JSON.stringify({
+      'term-active': {
+        seq: 5,
+        updatedAt: Date.now(),
+      },
+      'term-hidden': {
+        seq: 8,
+        updatedAt: Date.now(),
+      },
+    }))
+    __resetTerminalCursorCacheForTests()
+
+    const store = createStore()
+    const view = render(
+      <Provider store={store}>
+        <TerminalWorkspace showSettings={false} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      const attachCalls = wsHarness.send.mock.calls
+        .map(([msg]) => msg)
+        .filter((msg) => msg?.type === 'terminal.attach')
+      expect(attachCalls.length).toBeGreaterThanOrEqual(2)
+    })
+
+    view.rerender(
+      <Provider store={store}>
+        <TerminalWorkspace showSettings />
+      </Provider>,
+    )
+    expect(screen.getByTestId('settings-view')).toBeInTheDocument()
+
+    wsHarness.send.mockClear()
+    view.rerender(
+      <Provider store={store}>
+        <TerminalWorkspace showSettings={false} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      const remountAttachCalls = wsHarness.send.mock.calls
+        .map(([msg]) => msg)
+        .filter((msg) => msg?.type === 'terminal.attach')
+      const activeAttach = remountAttachCalls.find((msg) => msg.terminalId === 'term-active')
+      const hiddenAttach = remountAttachCalls.find((msg) => msg.terminalId === 'term-hidden')
+      expect(activeAttach?.sinceSeq).toBe(0)
+      expect(hiddenAttach?.sinceSeq).toBeGreaterThan(0)
+    })
+
+    wsHarness.send.mockClear()
+    act(() => {
+      store.dispatch(setActiveTab('tab-2'))
+    })
+
+    await waitFor(() => {
+      expect(wsHarness.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId: 'term-hidden',
+        sinceSeq: 0,
+      }))
+    })
+
+    wsHarness.emit({
+      type: 'terminal.attach.ready',
+      terminalId: 'term-hidden',
+      headSeq: 8,
+      replayFromSeq: 6,
+      replayToSeq: 8,
+    })
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId: 'term-hidden',
+      seqStart: 6,
+      seqEnd: 6,
+      data: 'hidden-r6',
+    })
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId: 'term-hidden',
+      seqStart: 7,
+      seqEnd: 7,
+      data: 'hidden-r7',
+    })
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId: 'term-hidden',
+      seqStart: 8,
+      seqEnd: 8,
+      data: 'hidden-r8',
+    })
+    wsHarness.emit({
+      type: 'terminal.output',
+      terminalId: 'term-hidden',
+      seqStart: 9,
+      seqEnd: 9,
+      data: 'hidden-live',
+    })
+
+    const allWrites = terminalInstances.flatMap((instance) => instance.write.mock.calls.map(([data]) => String(data)))
+    expect(allWrites).toContain('hidden-r6')
+    expect(allWrites).toContain('hidden-r8')
+    expect(allWrites).toContain('hidden-live')
+    const allGapLines = terminalInstances.flatMap((instance) => instance.writeln.mock.calls.map(([data]) => String(data)))
+    expect(allGapLines.some((line) => line.includes('reconnect window exceeded'))).toBe(false)
+  })
 })
