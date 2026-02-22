@@ -1751,6 +1751,13 @@ describe('TerminalView lifecycle updates', () => {
         messageHandler!({
           type: 'terminal.output',
           terminalId,
+          seqStart: 6,
+          seqEnd: 6,
+          data: 'history-6',
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
           seqStart: 12,
           seqEnd: 12,
           data: 'history-12',
@@ -1759,6 +1766,7 @@ describe('TerminalView lifecycle updates', () => {
 
       const writes = term.write.mock.calls.map(([data]: [string]) => String(data)).join('')
       expect(writes).toContain('history-1')
+      expect(writes).toContain('history-6')
       expect(writes).toContain('history-12')
     })
 
