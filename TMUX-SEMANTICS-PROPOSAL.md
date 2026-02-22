@@ -164,7 +164,7 @@ client polling loops.
 
 - `sdk.create/send/interrupt/kill/attach`
 - `codingcli.create/input/kill`
-- CLI aliases (`session-send`, `session-wait`, etc.)
+- CLI aliases (`session-create`, `session-send`, `session-wait`, etc.)
 
 ### 6.4 Class H: Hybrid Ops (Layout + Process)
 
@@ -395,6 +395,17 @@ Format grammar:
 - Unknown tokens return `INVALID_ARGUMENT`.
 - Missing values render as empty string.
 
+### 8.8 `session-create`
+
+`session-create` maps directly to existing server message contracts:
+
+- `--provider sdk` -> `sdk.create` (`cwd`, `resumeSessionId`, `model`,
+  `permissionMode`, `effort`).
+- `--provider codingcli` -> `codingcli.create` and requires:
+  `--coding-provider <claude|codex|opencode|gemini|kimi>` and `--prompt <text>`.
+
+If required provider-specific arguments are missing, return `INVALID_ARGUMENT`.
+
 ---
 
 ## 9. RPC Protocol (Layout Plane)
@@ -437,6 +448,8 @@ Error payload includes `stage: relay|owner`.
 - at-most-once relay delivery
 - idempotency keys required for owner-routed mutating commands (`new-tab`,
   `split-pane --shell`, `attach-terminal`, `respawn-pane`)
+- CLI auto-generates idempotency keys when omitted; `--idempotency-key` allows
+  caller-specified stable retry identity.
 - no queued replay after reconnect
 
 ---
@@ -517,6 +530,9 @@ SDK/CodingCLI session fields:
 - Tab/pane entities do not maintain independent revision counters.
 - Every successful layout mutation increments `workspaceRevision` by 1.
 - RPC mutation must provide `expectedRevision`.
+- CLI supports `--expected-revision` on layout-mutating commands; when omitted, CLI
+  performs a live owner read and injects current `workspaceRevision`.
+- If owner is offline, revision preflight fails with `DEVICE_OFFLINE`.
 - Mismatch returns `REVISION_CONFLICT` with `currentRevision` (`workspaceRevision`).
 - Successful mutation responses include `appliedRevision`.
 - Initial revision after migration: `1`.
@@ -592,6 +608,13 @@ On first cutover startup, each device:
 
 ### 13.3 Capability Gate
 
+Cutover prerequisite:
+
+- extend `HelloSchema.capabilities` in `shared/ws-protocol.ts` and handshake parsing
+  in `server/ws-handler.ts` with cutover fields below.
+- existing capability fields (`sessionsPatchV1`, `terminalAttachChunkV1`) remain
+  supported and orthogonal.
+
 `hello.capabilities` must include:
 
 - `layoutOwnershipV1: true`
@@ -604,7 +627,7 @@ No compatibility path for old capability sets.
 
 ## 14. Error Model
 
-Canonical errors:
+Canonical command/operation errors (post-cutover):
 
 - `DEVICE_OFFLINE`
 - `RPC_TIMEOUT`
@@ -622,6 +645,14 @@ Canonical errors:
 - `INCONSISTENT_STATE`
 - `INTERNAL_ERROR`
 
+Protocol alignment requirement:
+
+- `shared/ws-protocol.ts` `ErrorCode` enum must be extended with all command/operation
+  codes above before enabling cutover.
+- Client and server error handlers must be updated to support the expanded union.
+- Existing transport/auth errors (`NOT_AUTHENTICATED`, `INVALID_MESSAGE`,
+  `UNKNOWN_MESSAGE`, etc.) remain valid and unchanged.
+
 CLI contract:
 
 - non-zero exit on error
@@ -636,6 +667,12 @@ Selector note:
 - `--target` and `--tab` accept selector forms from section 5.2 unless narrowed.
 - `pane-index:<n>` requires `--tab ...`.
 
+Mutation concurrency note:
+
+- all Class L/H mutating commands accept `--expected-revision N` (or auto-resolve per section 11.3).
+- commands requiring protocol idempotency (`new-tab`, `split-pane --shell`,
+  `attach-terminal`, `respawn-pane`) accept `--idempotency-key KEY` (auto-generated if omitted).
+
 ```bash
 # Device, presence, and auth
 freshell list-devices
@@ -646,22 +683,22 @@ freshell auth refresh
 freshell auth logout
 
 # Layout (Class L/H)
-freshell new-tab [--device DEVICE] [-n NAME] [--shell SHELL] [--cwd DIR]
+freshell new-tab [--device DEVICE] [-n NAME] [--shell SHELL] [--cwd DIR] [--expected-revision N] [--idempotency-key KEY]
 freshell list-tabs [--device DEVICE] [--allow-stale]
-freshell select-tab --device DEVICE --target tab:ID|tab-name:NAME|tab-index:N
-freshell kill-tab --device DEVICE --target tab:ID|tab-name:NAME|tab-index:N
-freshell rename-tab --device DEVICE --target tab:ID|tab-name:NAME|tab-index:N NAME
+freshell select-tab --device DEVICE --target tab:ID|tab-name:NAME|tab-index:N [--expected-revision N]
+freshell kill-tab --device DEVICE --target tab:ID|tab-name:NAME|tab-index:N [--expected-revision N]
+freshell rename-tab --device DEVICE --target tab:ID|tab-name:NAME|tab-index:N NAME [--expected-revision N]
 
-freshell split-pane --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] --direction horizontal|vertical [--shell SHELL|--browser URL|--editor FILE]
+freshell split-pane --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] --direction horizontal|vertical [--shell SHELL|--browser URL|--editor FILE] [--expected-revision N] [--idempotency-key KEY]
 freshell list-panes [--device DEVICE] [--tab tab:ID|tab-name:NAME|tab-index:N] [--allow-stale]
-freshell select-pane --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N]
-freshell kill-pane --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N]
-freshell resize-pane --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] [-x WIDTH] [-y HEIGHT]
-freshell swap-pane --device DEVICE --source pane:SRC|pane-index:SRC_IDX --target pane:DST|pane-index:DST_IDX [--tab tab:ID|tab-name:NAME|tab-index:N]
+freshell select-pane --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] [--expected-revision N]
+freshell kill-pane --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] [--expected-revision N]
+freshell resize-pane --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] [-x WIDTH] [-y HEIGHT] [--expected-revision N]
+freshell swap-pane --device DEVICE --source pane:SRC|pane-index:SRC_IDX --target pane:DST|pane-index:DST_IDX [--tab tab:ID|tab-name:NAME|tab-index:N] [--expected-revision N]
 
-freshell open-browser --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] URL
-freshell navigate --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] URL
-freshell open-editor --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] FILE
+freshell open-browser --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] URL [--expected-revision N]
+freshell navigate --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] URL [--expected-revision N]
+freshell open-editor --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] FILE [--expected-revision N]
 
 # Terminal process (Class P/H by target type)
 freshell list-terminals
@@ -669,12 +706,13 @@ freshell send-keys --target terminal:ID|pane:ID|pane-index:N [--tab tab:ID|tab-n
 freshell capture-pane --target terminal:ID|pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] [--device DEVICE] [-S START] [-J] [-e]
 freshell wait-for --target terminal:ID|pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] [--device DEVICE] [--from now|tail:N] [-p PATTERN] [--literal|--regex] [--stable N] [--exit] [--prompt] [-T TIMEOUT]
 freshell respawn-terminal --target terminal:ID
-freshell respawn-pane --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] --device DEVICE --expected-revision N --idempotency-key KEY
+freshell respawn-pane --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] --device DEVICE [--expected-revision N] [--idempotency-key KEY]
 freshell kill-terminal --target terminal:ID
-freshell attach-terminal --target terminal:ID --to pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] --device DEVICE --expected-revision N --idempotency-key KEY
+freshell attach-terminal --target terminal:ID --to pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] --device DEVICE [--expected-revision N] [--idempotency-key KEY]
 
 # SDK/CodingCLI sessions (Class S)
-freshell session-create --provider sdk|codingcli [--cwd DIR] [--profile PROFILE]
+freshell session-create --provider sdk [--cwd DIR] [--resume-session-id ID] [--model MODEL] [--permission-mode MODE] [--effort low|medium|high|max]
+freshell session-create --provider codingcli --coding-provider claude|codex|opencode|gemini|kimi --prompt TEXT [--cwd DIR] [--resume-session-id ID] [--model MODEL] [--max-turns N] [--permission-mode default|plan|acceptEdits|bypassPermissions] [--sandbox read-only|workspace-write|danger-full-access]
 freshell session-list [--provider PROVIDER]
 freshell session-send --target session:PROVIDER:ID TEXT
 freshell session-wait --target session:PROVIDER:ID [--from now|tail:N] [-p PATTERN] [--literal|--regex] [--stable N] [-T TIMEOUT]
@@ -699,11 +737,11 @@ All items required before merge:
 5. No server-side layout surrogate execution and no replay queue.
 6. Explicit selector parser implemented; ambiguous shorthand removed.
 7. `send-keys` / `capture-pane` / `wait-for` route by resolved target (`terminal/session` server-direct, `pane` hybrid owner-resolved).
-8. SDK/CodingCLI command path integrated and documented (including `session-create` surface).
+8. SDK/CodingCLI command path integrated and documented (including protocol-aligned `session-create` parameters).
 9. Revision conflict handling implemented with workspace-level `expectedRevision` and `currentRevision`.
 10. Security token flow, auth command lifecycle, and credential permission checks implemented.
 11. Migration implemented for owner metadata and revision initialization.
-12. Capability gate enabled; legacy clients rejected.
+12. Capability gate enabled with schema/handler support (`shared/ws-protocol.ts` `HelloSchema.capabilities` + `server/ws-handler.ts` parsing); legacy clients rejected.
 13. Unit/integration/e2e coverage updated for routing, offline behavior, and hybrid rollback.
 14. Docs reflect only cutover semantics; no phased/back-compat language remains.
 15. Server `WaitManager` implemented as event-driven incremental matcher (no polling, no repeated full-buffer scans).
@@ -711,6 +749,7 @@ All items required before merge:
 17. Performance telemetry implemented for waits (`wait_active`, `wait_match_latency_ms`, `wait_eval_ms`, `wait_timeouts_total`, `wait_resource_limit_total`, `wait_backlog_depth`).
 18. SLOs defined and validated under load: no terminal-stream regression with waits enabled, and bounded p99 wait match latency.
 19. Load tests added for high-output terminals, many concurrent waits, regex-heavy/adversarial patterns, and timeout churn.
+20. Shared `ErrorCode` union expanded and validated end-to-end for all cutover command errors.
 
 ---
 
