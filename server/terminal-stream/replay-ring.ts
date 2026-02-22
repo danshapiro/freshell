@@ -26,22 +26,28 @@ export class ReplayRing {
   private totalBytes = 0
   private nextSeq = 1
   private head = 0
-  private readonly maxBytes: number
+  private maxBytes: number
 
   constructor(maxBytes?: number) {
     this.maxBytes = resolveMaxBytes(maxBytes)
+  }
+
+  setMaxBytes(nextMaxBytes?: number): void {
+    this.maxBytes = resolveMaxBytes(nextMaxBytes)
+    this.evictIfNeeded()
   }
 
   append(data: string): ReplayFrame {
     const seq = this.nextSeq
     this.nextSeq += 1
     this.head = seq
+    const normalizedData = this.normalizeFrameData(data)
 
     const frame: ReplayFrame = {
       seqStart: seq,
       seqEnd: seq,
-      data,
-      bytes: Buffer.byteLength(data, 'utf8'),
+      data: normalizedData,
+      bytes: Buffer.byteLength(normalizedData, 'utf8'),
       at: Date.now(),
     }
 
@@ -86,5 +92,30 @@ export class ReplayRing {
       if (!removed) break
       this.totalBytes -= removed.bytes
     }
+  }
+
+  private decodeUtf8Fatal(bytes: Uint8Array): string | null {
+    try {
+      return new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    } catch {
+      return null
+    }
+  }
+
+  private normalizeFrameData(data: string): string {
+    if (!data) return ''
+    if (this.maxBytes <= 0) return ''
+
+    const encoded = Buffer.from(data, 'utf8')
+    if (encoded.byteLength <= this.maxBytes) {
+      return data
+    }
+
+    const startOffset = Math.max(0, encoded.byteLength - this.maxBytes)
+    for (let start = startOffset; start <= encoded.byteLength; start += 1) {
+      const decoded = this.decodeUtf8Fatal(encoded.subarray(start))
+      if (decoded !== null) return decoded
+    }
+    return ''
   }
 }

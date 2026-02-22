@@ -235,15 +235,34 @@ export class TerminalStreamBroker {
   }
 
   private getOrCreateTerminalState(terminalId: string): BrokerTerminalState {
+    const replayRingMaxBytes = this.resolveReplayRingMaxBytes()
     let state = this.terminals.get(terminalId)
     if (!state) {
       state = {
-        replayRing: new ReplayRing(),
+        replayRing: new ReplayRing(replayRingMaxBytes),
         clients: new Map(),
       }
       this.terminals.set(terminalId, state)
+    } else {
+      state.replayRing.setMaxBytes(replayRingMaxBytes)
     }
     return state
+  }
+
+  private resolveReplayRingMaxBytes(): number | undefined {
+    const maxBytesGetter = this.registry as unknown as {
+      getReplayRingMaxBytes?: () => number | undefined
+    }
+
+    if (typeof maxBytesGetter.getReplayRingMaxBytes !== 'function') {
+      return undefined
+    }
+
+    const value = maxBytesGetter.getReplayRingMaxBytes()
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      return undefined
+    }
+    return Math.floor(value)
   }
 
   private getOrCreateAttachment(
