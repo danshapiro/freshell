@@ -227,9 +227,11 @@ it('retains truncated tail bytes when a single append exceeds maxBytes', () => {
 })
 ```
 
-**Step 3: Add failing UTF-8 boundary retention test**
+**Step 3: Add failing UTF-8 boundary retention tests**
 
-Add a test that appends multi-byte content larger than budget and asserts replay frame bytes are capped while decoded text remains valid UTF-8 tail content.
+Add tests that:
+- verify oversized multi-byte content truncates to the expected valid UTF-8 tail boundary, and
+- verify literal `U+FFFD` content from the source stream is preserved (not treated as a decode error).
 
 ```ts
 it('truncates oversized multi-byte frames on UTF-8 boundaries', () => {
@@ -238,7 +240,16 @@ it('truncates oversized multi-byte frames on UTF-8 boundaries', () => {
   const replay = ring.replaySince(0)
   expect(replay.frames).toHaveLength(1)
   expect(replay.frames[0].bytes).toBeLessThanOrEqual(7)
-  expect(replay.frames[0].data).not.toContain('\uFFFD')
+  expect(replay.frames[0].data).toBe('🙂')
+})
+
+it('preserves literal U+FFFD characters emitted by the source output', () => {
+  const ring = new ReplayRing(4)
+  ring.append(`A\uFFFDB`) // 5 bytes; tail 4 bytes should decode to "\uFFFDB"
+  const replay = ring.replaySince(0)
+  expect(replay.frames).toHaveLength(1)
+  expect(replay.frames[0].bytes).toBeLessThanOrEqual(4)
+  expect(replay.frames[0].data).toBe('\uFFFDB')
 })
 ```
 
@@ -296,21 +307,27 @@ If needed, remove `readonly` from `maxBytes`.
 
 **Step 2: Truncate oversized append frames instead of dropping all data**
 
-Add a helper that byte-caps large frame payloads to the tail of the output before insertion, while preserving UTF-8 boundaries.
+Add a helper that byte-caps large frame payloads to the tail of the output before insertion, while preserving UTF-8 boundaries via fatal decoding (not by searching for `\uFFFD`).
 
 ```ts
+private decodeUtf8Fatal(bytes: Uint8Array): string | null {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+  } catch {
+    return null
+  }
+}
+
 private normalizeFrameData(data: string): string {
   const max = this.maxBytes
-  if (max <= 0) return ''
+  if (max <= 0 || !data) return ''
   const encoded = Buffer.from(data, 'utf8')
   if (encoded.byteLength <= max) return data
 
-  // Keep newest bytes, then trim leading partial UTF-8 bytes.
-  let tail = encoded.subarray(encoded.byteLength - max)
-  while (tail.length > 0) {
-    const decoded = tail.toString('utf8')
-    if (!decoded.includes('\uFFFD')) return decoded
-    tail = tail.subarray(1)
+  // Keep newest bytes and advance start until the slice is valid UTF-8.
+  for (let start = encoded.byteLength - max; start < encoded.byteLength; start += 1) {
+    const decoded = this.decodeUtf8Fatal(encoded.subarray(start))
+    if (decoded !== null) return decoded
   }
   return ''
 }
@@ -427,6 +444,8 @@ git commit -m "chore(terminal-stream): finalize remount hydration and replay ret
   Guardrail: clear viewport before deferred hydrate attach and guard with one-shot hydration flag.
 - Risk: replay retention still misses after large single append.
   Guardrail: truncate oversized frame data to byte budget rather than evicting to empty.
+- Risk: valid source output containing literal `U+FFFD` gets dropped by false-positive decode checks.
+  Guardrail: use fatal UTF-8 decode validation and add a preservation test for literal `U+FFFD`.
 - Risk: reconnect triggered during viewport hydration regresses to full replay.
   Guardrail: never clear persisted cursor during hydration request; only update cursor from actual replay/output sequence advancement.
 - Risk: memory growth from larger retention budget.
