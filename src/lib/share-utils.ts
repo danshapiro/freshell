@@ -3,6 +3,17 @@ export type ShareAction =
   | { type: 'panel' }
   | { type: 'loading' }
 
+export function ensureShareUrlToken(url: string, token: string | null | undefined): string {
+  if (!token) return url
+  try {
+    const parsed = new URL(url)
+    parsed.searchParams.set('token', token)
+    return parsed.toString()
+  } catch {
+    return url
+  }
+}
+
 export function getShareAction(status: { configured: boolean; host: string } | null): ShareAction {
   // When network status hasn't loaded yet, return loading to prevent
   // incorrectly routing already-configured users to the setup wizard

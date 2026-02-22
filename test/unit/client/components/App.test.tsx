@@ -41,6 +41,15 @@ vi.mock('@/lib/api', () => ({
   },
 }))
 
+const mockGenerateQr = vi.fn().mockReturnValue({ size: 21 })
+const mockToSvgDataURL = vi.fn().mockReturnValue('data:image/svg+xml;base64,mock')
+vi.mock('lean-qr', () => ({
+  generate: (...args: any[]) => mockGenerateQr(...args),
+}))
+vi.mock('lean-qr/extras/svg', () => ({
+  toSvgDataURL: (...args: any[]) => mockToSvgDataURL(...args),
+}))
+
 // Mock heavy child components to avoid xterm/canvas issues
 vi.mock('@/components/TabContent', () => ({
   default: () => <div data-testid="mock-tab-content">Tab Content</div>,
@@ -314,9 +323,32 @@ describe('App Component - Share Button', () => {
 
     await waitFor(() => {
       expect(screen.getByText('Share Access')).toBeInTheDocument()
-      expect(screen.getByText('http://192.168.1.100:3001')).toBeInTheDocument()
+      expect(screen.getByText('http://192.168.1.100:3001/?token=test-token-abc123')).toBeInTheDocument()
       expect(screen.getByText('Copy link')).toBeInTheDocument()
     })
+  })
+
+  it('renders share-panel QR with explicit dark-on-light colors', async () => {
+    const store = createTestStore()
+    act(() => {
+      store.dispatch(setNetworkStatus(makeNetworkStatus({
+        configured: true,
+        host: '0.0.0.0',
+        accessUrl: 'http://192.168.1.100:3001',
+      })))
+    })
+
+    renderApp(store)
+    await openShareFromSettings()
+
+    await waitFor(() => {
+      expect(screen.getByRole('img', { name: /qr code for access url/i })).toBeInTheDocument()
+    })
+
+    expect(mockToSvgDataURL).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ on: 'black', off: 'white' }),
+    )
   })
 
   it('shows share panel for legacy HOST env override (configured=false, host=0.0.0.0)', async () => {
@@ -343,7 +375,7 @@ describe('App Component - Share Button', () => {
 
     await waitFor(() => {
       expect(screen.getByText('Share Access')).toBeInTheDocument()
-      expect(screen.getByText('http://10.0.0.5:3001')).toBeInTheDocument()
+      expect(screen.getByText('http://10.0.0.5:3001/?token=test-token-abc123')).toBeInTheDocument()
     })
   })
 
@@ -374,7 +406,7 @@ describe('App Component - Share Button', () => {
     fireEvent.click(screen.getByText('Copy link'))
 
     await waitFor(() => {
-      expect(mockWriteText).toHaveBeenCalledWith('http://192.168.1.100:3001')
+      expect(mockWriteText).toHaveBeenCalledWith('http://192.168.1.100:3001/?token=test-token-abc123')
     })
   })
 

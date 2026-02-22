@@ -7,11 +7,13 @@ import { networkReducer, type NetworkState } from '@/store/networkSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 
 // Mock lean-qr to avoid canvas issues in jsdom
+const mockGenerateQr = vi.fn().mockReturnValue({ size: 21 })
+const mockToSvgDataURL = vi.fn().mockReturnValue('data:image/svg+xml;base64,mock')
 vi.mock('lean-qr', () => ({
-  generate: vi.fn().mockReturnValue({ size: 21 }),
+  generate: (...args: any[]) => mockGenerateQr(...args),
 }))
 vi.mock('lean-qr/extras/svg', () => ({
-  toSvgDataURL: vi.fn().mockReturnValue('data:image/svg+xml;base64,mock'),
+  toSvgDataURL: (...args: any[]) => mockToSvgDataURL(...args),
 }))
 
 // Mock the api module
@@ -77,7 +79,11 @@ function createTestStore(networkOverrides: Partial<NetworkState> = {}) {
 }
 
 describe('SetupWizard', () => {
-  afterEach(() => cleanup())
+  afterEach(() => {
+    cleanup()
+    vi.clearAllMocks()
+    localStorage.clear()
+  })
   it('renders step 1 with setup prompt by default', () => {
     const store = createTestStore()
     render(
@@ -133,7 +139,7 @@ describe('SetupWizard', () => {
     expect(dialog).toHaveAttribute('aria-modal', 'true')
   })
 
-  it('renders QR code on step 3', () => {
+  it('renders a high-contrast QR code on step 3', async () => {
     const store = createTestStore({
       status: {
         ...defaultNetworkStatus,
@@ -144,12 +150,56 @@ describe('SetupWizard', () => {
     })
     render(
       <Provider store={store}>
-        {/* Render at step 3 by re-implementing — but we test via the component directly */}
         <SetupWizard onComplete={vi.fn()} />
       </Provider>,
     )
-    // Step 1 renders by default, but we can verify the component exists
-    expect(screen.getByText(/from your phone and other computers/i)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /yes, set it up/i }))
+
+    await waitFor(() => {
+      expect(screen.getByRole('img', { name: /qr code for access url/i })).toBeInTheDocument()
+    })
+
+    expect(mockToSvgDataURL).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ on: 'black', off: 'white' }),
+    )
+  })
+
+  it('copies a tokenized access URL on step 3', async () => {
+    localStorage.setItem('freshell.auth-token', 'setup-token-123')
+    const mockWriteText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText: mockWriteText },
+      writable: true,
+      configurable: true,
+    })
+
+    const store = createTestStore({
+      status: {
+        ...defaultNetworkStatus,
+        configured: true,
+        host: '0.0.0.0',
+        accessUrl: 'http://192.168.1.100:3001',
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <SetupWizard onComplete={vi.fn()} />
+      </Provider>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /yes, set it up/i }))
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /copy url/i })).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /copy url/i }))
+
+    await waitFor(() => {
+      expect(mockWriteText).toHaveBeenCalledWith('http://192.168.1.100:3001/?token=setup-token-123')
+    })
   })
 
   it('auto-triggers bind when initialStep=2 (re-enable remote access)', async () => {
