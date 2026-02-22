@@ -462,6 +462,14 @@ export type SettingsUpdatedMessage = {
   settings: unknown
 }
 
+// -- UI commands --
+
+export type UiCommandMessage = {
+  type: 'ui.command'
+  command: string
+  payload?: unknown
+}
+
 // -- Performance logging --
 
 export type PerfLoggingMessage = {
@@ -597,6 +605,7 @@ export type ServerMessage =
   | SessionsUpdatedMessage
   | SessionsPatchMessage
   | SettingsUpdatedMessage
+  | UiCommandMessage
   | PerfLoggingMessage
   | ConfigFallbackMessage
   | TabsSyncAckMessage

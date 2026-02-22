@@ -603,11 +603,13 @@ export const panesSlice = createSlice({
       const a = findLeaf(root, paneId)
       const b = findLeaf(root, otherId)
       if (!a || !b) return
+      const paneContent = a.content
+      const otherContent = b.content
 
       function update(node: PaneNode): PaneNode {
         if (node.type === 'leaf') {
-          if (node.id === paneId) return { ...node, content: b.content }
-          if (node.id === otherId) return { ...node, content: a.content }
+          if (node.id === paneId) return { ...node, content: otherContent }
+          if (node.id === otherId) return { ...node, content: paneContent }
           return node
         }
         return {
