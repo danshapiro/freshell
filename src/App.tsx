@@ -516,6 +516,7 @@ export default function App() {
       // Another component may have connected before App finished bootstrap.
       // Reconcile state for the already-ready socket so sessions patches do not stay blocked.
       if (ws.isReady) {
+        if (cancelled) return
         dispatch(setError(undefined))
         dispatch(setStatus('ready'))
         dispatch(setServerInstanceId(ws.serverInstanceId))
@@ -535,7 +536,7 @@ export default function App() {
           }
         }
 
-        requestTerminalMetaList()
+        if (!cancelled) requestTerminalMetaList()
         return
       }
 

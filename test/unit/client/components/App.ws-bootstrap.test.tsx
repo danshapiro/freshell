@@ -297,6 +297,7 @@ describe('App WS bootstrap recovery', () => {
     })
 
     expect(wsMocks.connect).not.toHaveBeenCalled()
+    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
     expect(store.getState().sessions.projects.map((p: any) => p.projectPath)).toEqual(['/p1'])
 
     act(() => {
@@ -310,5 +311,47 @@ describe('App WS bootstrap recovery', () => {
     await waitFor(() => {
       expect(store.getState().sessions.projects.map((p: any) => p.projectPath).sort()).toEqual(['/p1', '/p2'])
     })
+  })
+
+  it('falls back to refetch sessions when pre-connected socket has no recent baseline', async () => {
+    const store = createStore()
+    wsMocks.isReady = true
+    wsMocks.serverInstanceId = 'srv-preconnected-fallback'
+
+    let sessionsCalls = 0
+    apiGet.mockImplementation((url: string) => {
+      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/sessions') {
+        sessionsCalls += 1
+        if (sessionsCalls === 1) {
+          return Promise.reject(new Error('initial sessions load failed'))
+        }
+        return Promise.resolve([
+          {
+            projectPath: '/p-fallback',
+            sessions: [{ provider: 'codex', sessionId: 's-fallback', projectPath: '/p-fallback', updatedAt: 3 }],
+          },
+        ])
+      }
+      return Promise.resolve({})
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(store.getState().connection.status).toBe('ready')
+      expect(store.getState().connection.serverInstanceId).toBe('srv-preconnected-fallback')
+      expect(store.getState().sessions.wsSnapshotReceived).toBe(true)
+      expect(store.getState().sessions.projects.map((p: any) => p.projectPath)).toEqual(['/p-fallback'])
+    })
+
+    expect(sessionsCalls).toBeGreaterThanOrEqual(2)
+    expect(wsMocks.connect).not.toHaveBeenCalled()
+    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
   })
 })
