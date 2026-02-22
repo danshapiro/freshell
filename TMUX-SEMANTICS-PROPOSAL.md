@@ -149,6 +149,8 @@ Never routed through owner device:
 - `list-terminals`, `respawn-terminal`, `kill-terminal`, `attach-terminal`
 
 These remain deterministic when no browser is connected.
+`wait-for` uses a shared server `WaitManager` and stream events; it never relies on
+client polling loops.
 
 ### 6.3 Class S: SDK/CodingCLI Ops (Server-Direct)
 
@@ -232,7 +234,10 @@ Targets terminal or SDK session references.
 
 Predicates:
 
-- `--pattern <regex>`
+- `--pattern <text-or-regex>`
+- `--literal` (default when `--pattern` is provided)
+- `--regex` (opt-in)
+- `--from now|tail:N` (default: `now`)
 - `--stable <seconds>`
 - `--exit`
 - `--prompt` (terminal mode only; heuristic)
@@ -242,17 +247,50 @@ Combination rule:
 - multiple predicates are **AND** conditions
 - no predicates provided is `INVALID_ARGUMENT`
 
-Evaluation model:
+Execution model (performance-critical):
 
-- server-side streaming subscription (no client polling loop)
-- each predicate latches true when satisfied
-- command succeeds when all requested predicates are true
-- timeout returns `TIMEOUT` with predicate progress
+- All waits are managed by one server `WaitManager` keyed by terminal/session target.
+- No polling against `capture-pane`; no full `buffer.snapshot()` rescans in steady state.
+- Each target stream has a monotonic `outputSeq`.
+- Each wait records `startSeq`, `lastSeqChecked`, and a small carry buffer for
+  cross-chunk pattern boundaries.
+- Matching evaluates only incremental chunks `> lastSeqChecked`.
+- Each predicate latches true when satisfied.
+- Command succeeds when all requested predicates are true.
+- Timeout returns `TIMEOUT` with predicate progress.
+
+Pattern engine contract:
+
+- `--literal` uses incremental substring search and is the default.
+- `--regex` is allowed only with a safe linear-time regex engine (RE2 class).
+- Regex compilation happens once per wait request, never per chunk.
+- If safe regex engine is unavailable, return `UNSUPPORTED_PATTERN_ENGINE`.
+
+Timer/scheduler contract:
+
+- Stable/timeout checks use central scheduler structures (timer wheel or min-heap),
+  not ad-hoc per-chunk polling loops.
+- Wait evaluation runs with per-tick CPU budget; overflow work is deferred by
+  `setImmediate`/equivalent to protect event loop responsiveness.
+
+Resource limits and load-shedding:
+
+- `WAIT_MAX_GLOBAL`: max active waits across server.
+- `WAIT_MAX_PER_TARGET`: max active waits per terminal/session target.
+- `WAIT_MAX_TIMEOUT_SEC`: hard upper bound on timeout duration.
+- `WAIT_MAX_PATTERN_BYTES`: max pattern size.
+- `WAIT_MAX_REGEX_PER_TARGET`: regex wait budget per target.
+- Excess wait requests fail fast with `RESOURCE_LIMIT`.
+- Under overload, reject new regex waits before literal waits.
+- Deduplicate identical active waits on the same target and fan out one matcher
+  result to multiple callers.
+- Backpressure or wait overload must not degrade terminal output fanout.
 
 Prompt heuristic contract:
 
 - explicitly best-effort
 - never sole correctness guarantee for destructive operations
+- should be treated as advisory signal unless combined with stronger predicates
 
 ### 8.4 `attach-terminal`
 
@@ -481,6 +519,8 @@ Canonical errors:
 - `INVALID_TARGET`
 - `INVALID_ARGUMENT`
 - `UNAUTHORIZED`
+- `RESOURCE_LIMIT`
+- `UNSUPPORTED_PATTERN_ENGINE`
 - `UNSUPPORTED_CAPTURE_MODE`
 - `TIMEOUT`
 - `INCONSISTENT_STATE`
@@ -522,7 +562,7 @@ freshell open-editor --device DEVICE --target pane:ID FILE
 freshell list-terminals
 freshell send-keys --target terminal:ID [-l] [KEYS...]
 freshell capture-pane --target terminal:ID [-S START] [-J] [-e]
-freshell wait-for --target terminal:ID [-p PATTERN] [--stable N] [--exit] [--prompt] [-T TIMEOUT]
+freshell wait-for --target terminal:ID [--from now|tail:N] [-p PATTERN] [--literal|--regex] [--stable N] [--exit] [--prompt] [-T TIMEOUT]
 freshell respawn-terminal --target terminal:ID
 freshell kill-terminal --target terminal:ID
 freshell attach-terminal --target terminal:ID --to pane:ID --device DEVICE
@@ -530,7 +570,7 @@ freshell attach-terminal --target terminal:ID --to pane:ID --device DEVICE
 # SDK/CodingCLI sessions (Class S)
 freshell session-list [--provider PROVIDER]
 freshell session-send --target session:PROVIDER:ID TEXT
-freshell session-wait --target session:PROVIDER:ID [-p PATTERN] [-T TIMEOUT]
+freshell session-wait --target session:PROVIDER:ID [--from now|tail:N] [-p PATTERN] [--literal|--regex] [--stable N] [-T TIMEOUT]
 freshell session-kill --target session:PROVIDER:ID
 
 # Utility
@@ -559,6 +599,11 @@ All items required before merge:
 12. Capability gate enabled; legacy clients rejected.
 13. Unit/integration/e2e coverage updated for routing, offline behavior, and hybrid rollback.
 14. Docs reflect only cutover semantics; no phased/back-compat language remains.
+15. Server `WaitManager` implemented as event-driven incremental matcher (no polling, no repeated full-buffer scans).
+16. Wait resource caps and load-shedding implemented (`WAIT_MAX_*`, `RESOURCE_LIMIT`) with tests.
+17. Performance telemetry implemented for waits (`wait_active`, `wait_match_latency_ms`, `wait_eval_ms`, `wait_timeouts_total`, `wait_resource_limit_total`, `wait_backlog_depth`).
+18. SLOs defined and validated under load: no terminal-stream regression with waits enabled, and bounded p99 wait match latency.
+19. Load tests added for high-output terminals, many concurrent waits, regex-heavy/adversarial patterns, and timeout churn.
 
 ---
 
@@ -581,4 +626,3 @@ resolving operational contradictions:
 - Remote layout mutation remains explicit and fail-fast (`DEVICE_OFFLINE`) when owner
   is unavailable.
 - The CLI has a first-class device identity, so "local" is deterministic.
-
