@@ -12,12 +12,13 @@ import {
 } from '@/store/sessionsSlice'
 import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { api, isApiUnauthorizedError, type VersionInfo } from '@/lib/api'
-import { getShareAction } from '@/lib/share-utils'
+import { getShareAction, ensureShareUrlToken } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { getSessionsForHello } from '@/lib/session-utils'
 import { setClientPerfEnabled } from '@/lib/perf-logger'
 import { applyLocalTerminalFontFamily } from '@/lib/terminal-fonts'
 import { handleUiCommand } from '@/lib/ui-commands'
+import { getAuthToken } from '@/lib/auth'
 import { store } from '@/store/store'
 import { useThemeEffect } from '@/hooks/useTheme'
 import { useMobile } from '@/hooks/useMobile'
@@ -63,7 +64,7 @@ function ShareQrCode({ url }: { url: string }) {
         const { toSvgDataURL } = await import('lean-qr/extras/svg')
         if (cancelled) return
         const code = generate(url)
-        setSvgUrl(toSvgDataURL(code))
+        setSvgUrl(toSvgDataURL(code, { on: 'black', off: 'white' }))
       } catch {
         // QR generation failed — panel still shows URL text
       }
@@ -142,6 +143,9 @@ export default function App() {
   const terminalMetaListRequestStartedAtRef = useRef(new Map<string, number>())
   const fullscreenTouchStartYRef = useRef<number | null>(null)
   const isLandscapeTerminalView = isMobile && isLandscape && view === 'terminal'
+  const shareAccessUrl = networkStatus?.accessUrl
+    ? ensureShareUrlToken(networkStatus.accessUrl, getAuthToken())
+    : null
 
   // Keep this tab's Redux state in sync with persisted writes from other browser tabs.
   useEffect(() => {
@@ -298,9 +302,9 @@ export default function App() {
   }
 
   const handleCopyAccessUrl = async () => {
-    if (!networkStatus?.accessUrl) return
+    if (!shareAccessUrl) return
     try {
-      await navigator.clipboard.writeText(networkStatus.accessUrl)
+      await navigator.clipboard.writeText(shareAccessUrl)
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     } catch (err) {
@@ -922,13 +926,13 @@ npm run serve`}</pre>
             <p className="text-sm text-muted-foreground mb-4">
               Share this link with devices on your local network or VPN.
             </p>
-            {networkStatus.accessUrl && (
+            {shareAccessUrl && (
               <div className="flex justify-center mb-4">
-                <ShareQrCode url={networkStatus.accessUrl} />
+                <ShareQrCode url={shareAccessUrl} />
               </div>
             )}
             <div className="bg-muted rounded-md p-3 mb-4">
-              <code className="text-sm break-all select-all">{networkStatus.accessUrl}</code>
+              <code className="text-sm break-all select-all">{shareAccessUrl ?? networkStatus.accessUrl}</code>
             </div>
             <button
               onClick={handleCopyAccessUrl}
