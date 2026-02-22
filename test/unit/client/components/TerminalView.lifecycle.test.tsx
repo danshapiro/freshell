@@ -4,7 +4,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import tabsReducer, { setActiveTab } from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
-import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
+import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import { useAppSelector } from '@/store/hooks'
@@ -221,6 +221,31 @@ describe('TerminalView lifecycle updates', () => {
 
     await waitFor(() => {
       expect(terminalInstances[0]?.options.minimumContrastRatio).toBe(1)
+    })
+  })
+
+  it('updates minimum contrast ratio when switching from dark to light theme at runtime', async () => {
+    terminalThemeMocks.getTerminalTheme.mockImplementation((_, appTheme: unknown) => (
+      appTheme === 'light' ? { isDark: false } : { isDark: true }
+    ))
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal()
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(terminalInstances[0]?.options.minimumContrastRatio).toBe(1)
+    })
+
+    act(() => {
+      store.dispatch(updateSettingsLocal({ theme: 'light' }))
+    })
+
+    await waitFor(() => {
+      expect(terminalInstances[0]?.options.minimumContrastRatio).toBe(4.5)
     })
   })
 

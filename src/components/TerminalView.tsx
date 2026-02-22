@@ -87,10 +87,8 @@ const SEARCH_DECORATIONS = {
   activeMatchColorOverviewRuler: '#EEB04A',
 } as const
 
-function resolveMinimumContrastRatio(theme: unknown): number {
-  if (typeof theme !== 'object' || theme === null) return DEFAULT_MIN_CONTRAST_RATIO
-  const isDark = (theme as { isDark?: unknown }).isDark
-  return isDark === false ? LIGHT_THEME_MIN_CONTRAST_RATIO : DEFAULT_MIN_CONTRAST_RATIO
+function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): number {
+  return theme?.isDark === false ? LIGHT_THEME_MIN_CONTRAST_RATIO : DEFAULT_MIN_CONTRAST_RATIO
 }
 
 function createNoopRuntime(): TerminalRuntime {
