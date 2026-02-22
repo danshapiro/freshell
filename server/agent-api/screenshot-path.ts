@@ -16,16 +16,16 @@ function normalizeScreenshotBaseName(name: string): string {
     throw new Error('name required')
   }
 
+  if (trimmed.includes('\0')) {
+    throw new Error('name must not contain null bytes')
+  }
+
   if (trimmed.includes('/') || trimmed.includes('\\')) {
     throw new Error('name must not contain path separators')
   }
 
   if (trimmed === '.' || trimmed === '..') {
     throw new Error('invalid screenshot name')
-  }
-
-  if (trimmed.includes('\0')) {
-    throw new Error('name must not contain null bytes')
   }
 
   return ensurePngExtension(trimmed)
