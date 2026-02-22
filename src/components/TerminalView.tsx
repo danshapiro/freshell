@@ -228,8 +228,14 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     nextState: AttachSeqState,
     options?: { terminalId?: string; persistCursor?: boolean },
   ) => {
+    const previousLastSeq = seqStateRef.current.lastSeq
     seqStateRef.current = nextState
-    if (options?.persistCursor && options.terminalId && nextState.lastSeq > 0) {
+    if (
+      options?.persistCursor
+      && options.terminalId
+      && nextState.lastSeq > 0
+      && nextState.lastSeq > previousLastSeq
+    ) {
       saveTerminalCursor(options.terminalId, nextState.lastSeq)
     }
   }, [])

@@ -96,6 +96,18 @@ describe('terminal-attach-seq-state', () => {
     expect(state.awaitingFreshSequence).toBe(false)
   })
 
+  it('sanitizes negative gap ranges before applying cursor updates', () => {
+    const state = createAttachSeqState({
+      lastSeq: 3,
+      pendingReplay: { fromSeq: 4, toSeq: 6 },
+      awaitingFreshSequence: true,
+    })
+    const next = onOutputGap(state, { fromSeq: -5, toSeq: -1 })
+    expect(next.lastSeq).toBe(3)
+    expect(next.pendingReplay).toEqual({ fromSeq: 4, toSeq: 6 })
+    expect(next.awaitingFreshSequence).toBe(false)
+  })
+
   it('allows single fresh restart at seq=1 while awaitingFreshSequence', () => {
     let state = createAttachSeqState({ lastSeq: 22, awaitingFreshSequence: true })
     const first = expectAcceptedFrame(onOutputFrame(state, { seqStart: 1, seqEnd: 1 }))
