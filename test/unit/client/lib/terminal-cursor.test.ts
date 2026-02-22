@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   __resetTerminalCursorCacheForTests,
   clearTerminalCursor,
@@ -10,8 +10,13 @@ import { TERMINAL_CURSOR_STORAGE_KEY } from '@/store/storage-keys'
 
 describe('terminal-cursor', () => {
   beforeEach(() => {
+    vi.useRealTimers()
     localStorage.clear()
     __resetTerminalCursorCacheForTests()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
   })
 
   it('loads and saves terminal cursor sequence values', () => {
@@ -69,5 +74,22 @@ describe('terminal-cursor', () => {
 
     expect(loadTerminalCursor('term-bad')).toBe(0)
     expect(getCursorMapSize()).toBe(0)
+  })
+
+  it('debounces localStorage persistence for rapid cursor updates', () => {
+    vi.useFakeTimers()
+    const setItemSpy = vi.spyOn(Storage.prototype, 'setItem')
+
+    saveTerminalCursor('term-rapid', 1)
+    saveTerminalCursor('term-rapid', 2)
+    saveTerminalCursor('term-rapid', 3)
+
+    expect(loadTerminalCursor('term-rapid')).toBe(3)
+    expect(setItemSpy).not.toHaveBeenCalled()
+
+    vi.advanceTimersByTime(250)
+    expect(setItemSpy).toHaveBeenCalledTimes(1)
+
+    setItemSpy.mockRestore()
   })
 })

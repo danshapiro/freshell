@@ -12,8 +12,13 @@ type CursorMap = Record<string, CursorEntry>
 
 const MAX_ENTRIES = 500
 const MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000
+const PERSIST_DEBOUNCE_MS = 200
+const PRUNE_INTERVAL_MS = 60 * 1000
 
 let cache: CursorMap | null = null
+let lastPruneAt = 0
+let pendingPersist = false
+let persistTimer: ReturnType<typeof setTimeout> | null = null
 
 function canUseStorage(): boolean {
   return typeof window !== 'undefined' && typeof localStorage !== 'undefined'
@@ -80,6 +85,27 @@ function persistMap(map: CursorMap): void {
   }
 }
 
+function flushPersist(): void {
+  if (!pendingPersist) return
+  if (!cache) {
+    pendingPersist = false
+    return
+  }
+  pendingPersist = false
+  persistMap(cache)
+}
+
+function schedulePersist(): void {
+  if (!canUseStorage()) return
+  pendingPersist = true
+  if (persistTimer) return
+
+  persistTimer = setTimeout(() => {
+    persistTimer = null
+    flushPersist()
+  }, PERSIST_DEBOUNCE_MS)
+}
+
 function ensureLoaded(): CursorMap {
   if (cache) return cache
   if (!canUseStorage()) {
@@ -97,7 +123,9 @@ function ensureLoaded(): CursorMap {
     log.warn('Failed to load terminal cursor map:', error)
   }
 
-  const pruned = pruneCursorMap(parsed, Date.now())
+  const now = Date.now()
+  const pruned = pruneCursorMap(parsed, now)
+  lastPruneAt = now
   cache = pruned
 
   const changed = JSON.stringify(parsed) !== JSON.stringify(pruned)
@@ -122,15 +150,21 @@ export function saveTerminalCursor(terminalId: string, seq: number): void {
   const map = ensureLoaded()
   const now = Date.now()
   const existing = map[terminalId]
+  const nextSeq = Math.max(existing?.seq ?? 0, normalizedSeq)
+  if (existing && existing.seq === nextSeq) return
 
-  if (existing && existing.seq > normalizedSeq) {
-    map[terminalId] = { seq: existing.seq, updatedAt: now }
+  map[terminalId] = { seq: nextSeq, updatedAt: now }
+
+  const shouldPrune = Object.keys(map).length > MAX_ENTRIES
+    || now - lastPruneAt >= PRUNE_INTERVAL_MS
+  if (shouldPrune) {
+    cache = pruneCursorMap(map, now)
+    lastPruneAt = now
   } else {
-    map[terminalId] = { seq: Math.max(existing?.seq ?? 0, normalizedSeq), updatedAt: now }
+    cache = map
   }
 
-  cache = pruneCursorMap(map, now)
-  persistMap(cache)
+  schedulePersist()
 }
 
 export function clearTerminalCursor(terminalId: string): void {
@@ -139,6 +173,11 @@ export function clearTerminalCursor(terminalId: string): void {
   if (!map[terminalId]) return
   delete map[terminalId]
   cache = map
+  if (persistTimer) {
+    clearTimeout(persistTimer)
+    persistTimer = null
+  }
+  pendingPersist = false
   persistMap(cache)
 }
 
@@ -148,4 +187,10 @@ export function getCursorMapSize(): number {
 
 export function __resetTerminalCursorCacheForTests(): void {
   cache = null
+  lastPruneAt = 0
+  pendingPersist = false
+  if (persistTimer) {
+    clearTimeout(persistTimer)
+    persistTimer = null
+  }
 }
