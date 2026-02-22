@@ -1772,6 +1772,59 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
+    it('renders replay frames after attach.ready when replay starts above 1', async () => {
+      const { terminalId, term } = await renderTerminalHarness({ status: 'running', terminalId: 'term-v2-ready-then-replay' })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 8,
+          replayFromSeq: 6,
+          replayToSeq: 8,
+        })
+      })
+
+      act(() => {
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 6, seqEnd: 6, data: 'R6' })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 7, seqEnd: 7, data: 'R7' })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 8, seqEnd: 8, data: 'R8' })
+      })
+
+      const writes = term.write.mock.calls.map(([data]: [string]) => String(data)).join('')
+      expect(writes).toContain('R6')
+      expect(writes).toContain('R7')
+      expect(writes).toContain('R8')
+    })
+
+    it('keeps continuity through gap + replay tail + live output', async () => {
+      const { terminalId, term } = await renderTerminalHarness({ status: 'running', terminalId: 'term-v2-gap-tail' })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 12,
+          replayFromSeq: 9,
+          replayToSeq: 12,
+        })
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 1,
+          toSeq: 8,
+          reason: 'replay_window_exceeded',
+        })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 9, seqEnd: 12, data: 'TAIL' })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 13, seqEnd: 13, data: 'LIVE' })
+      })
+
+      expect(term.writeln).toHaveBeenCalledWith(expect.stringContaining('Output gap 1-8: reconnect window exceeded'))
+      const writes = term.write.mock.calls.map(([data]: [string]) => String(data)).join('')
+      expect(writes).toContain('TAIL')
+      expect(writes).toContain('LIVE')
+    })
+
     it('updates attach sequence from terminal.attach.ready after terminal.created', async () => {
       const { requestId, term } = await renderTerminalHarness({ status: 'creating' })
 
