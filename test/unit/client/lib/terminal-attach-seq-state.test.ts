@@ -36,6 +36,7 @@ describe('terminal-attach-seq-state', () => {
     state = onAttachReady(state, { replayFromSeq: 6, replayToSeq: 8 })
     const d6 = onOutputFrame(state, { seqStart: 6, seqEnd: 6 })
     expect(d6.accept).toBe(true)
+    expect(d6.freshReset).toBe(false)
     state = d6.state
     const d7 = onOutputFrame(state, { seqStart: 7, seqEnd: 7 })
     expect(d7.accept).toBe(true)
@@ -72,6 +73,7 @@ describe('terminal-attach-seq-state', () => {
     state = onOutputGap(state, { fromSeq: 1, toSeq: 5 })
     const frame = onOutputFrame(state, { seqStart: 6, seqEnd: 8 })
     expect(frame.accept).toBe(true)
+    expect(frame.freshReset).toBe(false)
     expect(frame.state.lastSeq).toBe(8)
     expect(frame.state.pendingReplay).toBeNull()
   })
@@ -80,6 +82,7 @@ describe('terminal-attach-seq-state', () => {
     let state = createAttachSeqState({ lastSeq: 22, awaitingFreshSequence: true })
     const first = onOutputFrame(state, { seqStart: 1, seqEnd: 1 })
     expect(first.accept).toBe(true)
+    expect(first.freshReset).toBe(true)
     expect(first.state.lastSeq).toBe(1)
     state = first.state
     const overlap = onOutputFrame(state, { seqStart: 1, seqEnd: 1 })

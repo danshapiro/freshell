@@ -1243,11 +1243,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             return
           }
 
-          if (
-            tid
-            && msg.seqStart === 1
-            && frameDecision.state.lastSeq < previousSeqState.lastSeq
-          ) {
+          if (tid && frameDecision.freshReset) {
             clearTerminalCursor(tid)
           }
           const raw = msg.data || ''

@@ -1,5 +1,12 @@
 export type PendingReplay = { fromSeq: number; toSeq: number } | null
 
+export type OutputFrameDecision = {
+  accept: boolean
+  reason?: 'overlap'
+  freshReset: boolean
+  state: AttachSeqState
+}
+
 export type AttachSeqState = {
   lastSeq: number
   awaitingFreshSequence: boolean
@@ -60,7 +67,7 @@ export function onOutputGap(
 export function onOutputFrame(
   state: AttachSeqState,
   frame: { seqStart: number; seqEnd: number },
-): { accept: boolean; reason?: 'overlap'; state: AttachSeqState } {
+): OutputFrameDecision {
   const overlapsExisting = frame.seqStart <= state.lastSeq
   const offersNewData = frame.seqEnd > state.lastSeq
   // We treat any overlap with pendingReplay as replay-context data. Server stream-v2
@@ -79,11 +86,12 @@ export function onOutputFrame(
       state.awaitingFreshSequence
       && frame.seqStart === 1
       && state.lastSeq > 0
-    if (!freshReset) return { accept: false, reason: 'overlap', state }
+    if (!freshReset) return { accept: false, reason: 'overlap', freshReset: false, state }
     // A fresh reset means we are treating this as a new stream root; any stale replay
     // window from the previous stream is intentionally discarded.
     const resetState = { ...state, lastSeq: 0, pendingReplay: null }
-    return onOutputFrame(resetState, frame)
+    const resetDecision = onOutputFrame(resetState, frame)
+    return { ...resetDecision, freshReset: true }
   }
 
   const nextLastSeq = Math.max(state.lastSeq, frame.seqEnd)
@@ -93,6 +101,7 @@ export function onOutputFrame(
 
   return {
     accept: true,
+    freshReset: false,
     state: {
       ...state,
       lastSeq: nextLastSeq,
