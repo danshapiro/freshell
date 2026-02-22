@@ -447,7 +447,7 @@ Error payload includes `stage: relay|owner`.
 
 - at-most-once relay delivery
 - idempotency keys required for owner-routed mutating commands (`new-tab`,
-  `split-pane --shell`, `attach-terminal`, `respawn-pane`)
+  `split-pane` (all content forms), `attach-terminal`, `respawn-pane`)
 - CLI auto-generates idempotency keys when omitted; `--idempotency-key` allows
   caller-specified stable retry identity.
 - no queued replay after reconnect
@@ -670,7 +670,7 @@ Selector note:
 Mutation concurrency note:
 
 - all Class L/H mutating commands accept `--expected-revision N` (or auto-resolve per section 11.3).
-- commands requiring protocol idempotency (`new-tab`, `split-pane --shell`,
+- commands requiring protocol idempotency (`new-tab`, `split-pane` (all forms),
   `attach-terminal`, `respawn-pane`) accept `--idempotency-key KEY` (auto-generated if omitted).
 
 ```bash
