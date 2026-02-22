@@ -1,6 +1,6 @@
 ---
 name: using-freshell
-description: Use when operating Freshell itself from this repo, especially to open files in editor panes, create/split tabs and panes, launch parallel Claude or Codex panes, wait for runs to settle, and compare outcomes.
+description: Use when operating Freshell itself to open files in editor panes, create or split tabs and panes, launch parallel Claude or Codex panes, and drive freshell UI features programmatically.
 ---
 
 # Using Freshell
@@ -23,50 +23,128 @@ $FSH health
 
 Use absolute paths for `--cwd` and `--editor`.
 
+## How Freshell Works
+
+- Freshell is a web app plus server: the UI you see in the browser is backed by an HTTP/WebSocket server process.
+- Core state store `layoutStore` tracks tabs, pane trees, active selection, and pane content type.
+- Core state store `terminalRegistry` tracks terminal processes, scrollback buffers, and runtime status.
+- Pane types are `terminal` (shell/claude/codex), `editor` (file view/edit), and `browser` (URL view).
+- The CLI (`npx tsx server/cli/index.ts`) is an HTTP client over `/api/*`, not an in-process tmux client.
+- Most automation flows are: create/select tab or pane -> send input (`send-keys`) -> wait (`wait-for`) -> inspect (`capture-pane`).
+- Session endpoints (`list-sessions`, `search-sessions`) come from indexed coding-CLI histories (for example Claude/Codex), separate from live terminal buffers.
+
 ## Supported Commands
 
-This list reflects the commands currently implemented in `server/cli/index.ts`.
+This reference reflects `server/cli/index.ts`.
+
+Output behavior:
+- Most commands print JSON.
+- `list-tabs` and `list-panes` print tab-separated text unless `--json` is set.
+- `capture-pane` and `display` print plain text.
+
+Target behavior:
+- Tab targets accept tab id or exact tab title.
+- Pane targets accept pane id, pane index in the active tab, or `tabRef.paneIndex`.
+- If a pane target is omitted for commands that allow it, Freshell falls back to active pane in active tab.
 
 Tab commands:
-- `new-tab`: Create a tab with a terminal (default), browser pane, or editor pane.
-- `list-tabs`: List tabs and each tab's active pane.
-- `select-tab`: Activate a tab by id/title/target.
-- `kill-tab`: Close a tab.
-- `rename-tab`: Rename a tab.
-- `has-tab`: Check whether a tab target exists.
-- `next-tab`: Select the next tab.
-- `prev-tab`: Select the previous tab.
+- `new-tab`:
+  Usage: ``$FSH new-tab [-n NAME] [--claude|--codex|--mode MODE] [--shell SHELL] [--cwd DIR] [--browser URL] [--editor FILE] [--resume SESSION_ID] [--prompt TEXT]``
+  Creates a tab. Default is a shell terminal; `--browser` and `--editor` create non-terminal panes.
+- `list-tabs`:
+  Usage: ``$FSH list-tabs [--json]``
+  Lists tab ids, titles, and active pane ids.
+- `select-tab`:
+  Usage: ``$FSH select-tab [TARGET]`` or ``$FSH select-tab -t TARGET``
+  Activates the target tab.
+- `kill-tab`:
+  Usage: ``$FSH kill-tab [TARGET]`` or ``$FSH kill-tab -t TARGET``
+  Closes the target tab.
+- `rename-tab`:
+  Usage: ``$FSH rename-tab [TARGET] [NEW_NAME]`` or ``$FSH rename-tab -t TARGET -n NEW_NAME``
+  Renames a tab.
+- `has-tab`:
+  Usage: ``$FSH has-tab TARGET`` or ``$FSH has-tab -t TARGET``
+  Returns whether target tab exists.
+- `next-tab`:
+  Usage: ``$FSH next-tab``
+  Moves selection forward one tab.
+- `prev-tab`:
+  Usage: ``$FSH prev-tab``
+  Moves selection backward one tab.
 
 Pane/layout commands:
-- `split-pane`: Split a pane horizontally/vertically and create a new terminal/browser/editor pane.
-- `list-panes`: List panes globally or for one tab.
-- `select-pane`: Focus a pane.
-- `kill-pane`: Close a pane.
-- `resize-pane`: Resize a pane (or its parent split) with `x`/`y` percentages.
-- `swap-pane`: Swap two panes in the same tab layout.
-- `respawn-pane`: Replace a pane with a freshly spawned terminal.
-- `attach`: Attach an existing terminal id into a pane.
+- `split-pane`:
+  Usage: ``$FSH split-pane [-t PANE_TARGET] [-v] [--mode MODE] [--shell SHELL] [--cwd DIR] [--browser URL] [--editor FILE]``
+  Splits target pane horizontally (default) or vertically (`-v`) and fills new pane.
+- `list-panes`:
+  Usage: ``$FSH list-panes [-t TAB_TARGET] [--json]``
+  Lists pane ids, indexes, kinds, and terminal ids.
+- `select-pane`:
+  Usage: ``$FSH select-pane PANE_TARGET`` or ``$FSH select-pane -t PANE_TARGET``
+  Focuses a pane.
+- `kill-pane`:
+  Usage: ``$FSH kill-pane PANE_TARGET`` or ``$FSH kill-pane -t PANE_TARGET``
+  Closes a pane.
+- `resize-pane`:
+  Usage: ``$FSH resize-pane PANE_TARGET [--x X_PCT] [--y Y_PCT]``
+  Requests resize; percentages are passed to the parent split.
+- `swap-pane`:
+  Usage: ``$FSH swap-pane PANE_TARGET --other OTHER_PANE_TARGET``
+  Swaps pane positions in the same layout tree.
+- `respawn-pane`:
+  Usage: ``$FSH respawn-pane PANE_TARGET [--mode MODE] [--shell SHELL] [--cwd DIR]``
+  Replaces pane content with a newly spawned terminal.
+- `attach`:
+  Usage: ``$FSH attach TERMINAL_ID [PANE_TARGET]`` or ``$FSH attach -t TERMINAL_ID -p PANE_TARGET``
+  Binds an existing terminal id to a pane.
 
 Terminal interaction commands:
-- `send-keys`: Send key sequences or literal text to a pane's terminal.
-- `capture-pane`: Read terminal buffer text with optional slicing/join/ANSI retention.
-- `wait-for`: Poll until pattern match, prompt, exit, or stable output.
-- `display`: Render a format string with tab/pane context tokens.
-- `run`: Create a tab, run a command, optionally capture output, optionally detach.
-- `summarize`: Request AI summary for the pane's terminal.
-- `list-terminals`: List server-side terminals and status.
+- `send-keys`:
+  Usage: ``$FSH send-keys [-t PANE_TARGET] [-l] KEYS...``
+  Sends input. With `-l`, text is sent literally. Without `-l`, key names like `ENTER`, `C-C`, `UP` are translated.
+- `capture-pane`:
+  Usage: ``$FSH capture-pane [-t PANE_TARGET] [-S START] [-J] [-e]``
+  Dumps pane buffer text. `-S -120` means last ~120 lines. `-J` joins lines. `-e` keeps ANSI escapes.
+- `wait-for`:
+  Usage: ``$FSH wait-for [-t PANE_TARGET] [-p PATTERN] [--stable SECONDS] [--exit] [--prompt] [-T TIMEOUT_SECONDS]``
+  Polls until condition is met. `-p` accepts regex text; `/.../flags` style is supported.
+- `display`:
+  Usage: ``$FSH display -p FORMAT [-t PANE_TARGET]`` or ``$FSH display FORMAT [PANE_TARGET]``
+  Renders tokens like `#S`, `#I`, `#P`, and `#{tab_name}` using resolved tab/pane context.
+- `run`:
+  Usage: ``$FSH run [--capture|-c] [--detach|-d] [-T TIMEOUT_SECONDS] [-n NAME] [--cwd DIR] COMMAND...``
+  Creates a tab, runs command, optionally captures output until sentinel/timeout.
+- `summarize`:
+  Usage: ``$FSH summarize PANE_TARGET`` or ``$FSH summarize -t PANE_TARGET``
+  Requests AI summary for pane terminal.
+- `list-terminals`:
+  Usage: ``$FSH list-terminals``
+  Lists terminal registry entries.
 
 Browser/navigation commands:
-- `open-browser`: Create a new browser tab and navigate to URL.
-- `navigate`: Navigate an existing pane to URL (converts pane to browser content).
+- `open-browser`:
+  Usage: ``$FSH open-browser URL [-n NAME]``
+  Creates a new browser tab and navigates to URL.
+- `navigate`:
+  Usage: ``$FSH navigate URL [PANE_TARGET]`` or ``$FSH navigate --url URL -t PANE_TARGET``
+  Navigates target pane as browser content.
 
 Session commands:
-- `list-sessions`: Return indexed coding-CLI sessions.
-- `search-sessions`: Search indexed sessions by query string.
+- `list-sessions`:
+  Usage: ``$FSH list-sessions``
+  Returns indexed coding-CLI sessions.
+- `search-sessions`:
+  Usage: ``$FSH search-sessions QUERY`` or ``$FSH search-sessions -q QUERY``
+  Searches indexed sessions.
 
 Service/diagnostic commands:
-- `health`: Check server health/readiness.
-- `lan-info`: Show LAN binding and network access info.
+- `health`:
+  Usage: ``$FSH health``
+  Checks server health/readiness.
+- `lan-info`:
+  Usage: ``$FSH lan-info``
+  Shows network binding and LAN access details.
 
 tmux-style aliases supported by this CLI:
 - `new-window`, `new-session` -> `new-tab`
@@ -79,14 +157,6 @@ tmux-style aliases supported by this CLI:
 - `split-window` -> `split-pane`
 - `display-message` -> `display`
 
-Important command flags:
-- `new-tab`: `--claude`, `--codex`, `--mode`, `--shell`, `--cwd`, `--browser`, `--editor`, `--resume`, `--prompt`
-- `split-pane`: `-t/--target`, `-v/--vertical`, `--mode`, `--shell`, `--cwd`, `--browser`, `--editor`
-- `send-keys`: `-t/--target`, `-l/--literal`
-- `capture-pane`: `-t/--target`, `-S`, `-J`, `-e`
-- `wait-for`: `-t/--target`, `-p/--pattern`, `--stable`, `--exit`, `--prompt`, `-T/--timeout`
-- `run`: `-c/--capture`, `-d/--detach`, `-T/--timeout`, `-n/--name`, `--cwd`
-
 ## System Differences from tmux
 
 - Transport/auth model: tmux commands talk to a local tmux server socket; Freshell CLI talks to an HTTP API (`FRESHELL_URL`) with token auth (`FRESHELL_TOKEN`).
@@ -95,42 +165,6 @@ Important command flags:
 - Remote model: tmux is usually local TTY-first; Freshell is browser-first and designed for LAN/remote multi-device access.
 - Semantics model: Freshell borrows tmux verbs, but many commands are higher-level workflows over HTTP state (layout store + terminal registry), not direct terminal multiplexer primitives.
 - AI/session features: Freshell includes coding-session indexing/search and terminal summarization; tmux has no built-in equivalent.
-
-## Command Deltas vs tmux
-
-Each row shows the closest tmux equivalent and the key behavioral delta.
-
-| Freshell command | Closest tmux command | Key differences from tmux |
-|---|---|---|
-| `new-tab` | `new-window` | Can create terminal, browser, or editor panes; supports `--claude`/`--codex` modes and `--resume`. |
-| `list-tabs` | `list-windows` | Returns tab records from Freshell layout API, not tmux window objects. |
-| `select-tab` | `select-window` | Selects by id/title through API resolution, not tmux target parsing. |
-| `kill-tab` | `kill-window` | Closes Freshell tab state via API; behavior is coupled to pane/layout store. |
-| `rename-tab` | `rename-window` | Renames tab metadata in layout store, not tmux window name metadata. |
-| `has-tab` | none | Existence probe helper; no direct tmux built-in analog. |
-| `next-tab` | `next-window` | Same intent, but operates on Freshell tab order. |
-| `prev-tab` | `previous-window` | Same intent, but operates on Freshell tab order. |
-| `split-pane` | `split-window` | Can spawn terminal/browser/editor panes; target resolution is API-based and defaults differ. |
-| `list-panes` | `list-panes` | Lists pane records from layout store (including non-terminal panes). |
-| `select-pane` | `select-pane` | Focuses pane via API, not direct tmux client focus command. |
-| `kill-pane` | `kill-pane` | Closes pane through layout API; pane tree updates are explicit app-state mutations. |
-| `resize-pane` | `resize-pane` | Uses `x/y` percentages and can resolve parent split from pane target. |
-| `swap-pane` | `swap-pane` | Swaps pane nodes in layout tree rather than tmux pane slots. |
-| `respawn-pane` | `respawn-pane` | Rebinds pane to a newly created terminal through registry + layout store. |
-| `attach` | `join-pane` (closest) | Attaches an existing terminal id into a pane; this is terminal-to-pane rebinding, not pane migration between tmux windows. |
-| `send-keys` | `send-keys` | Same intent; literal mode (`-l`) and key translation are implemented in CLI before API send. |
-| `capture-pane` | `capture-pane` | Similar intent, but output comes from Freshell terminal buffer snapshots exposed by API. |
-| `wait-for` | `wait-for` (name only) | Waits on terminal text/prompt/stability conditions; tmux `wait-for` is lock/signal oriented. |
-| `display` | `display-message` | Token set is Freshell tab/pane fields, not tmux format variables. |
-| `run` | none (composed from several tmux ops) | One-shot helper to create tab, run command, optionally capture and detach. |
-| `summarize` | none | Requests AI summary for terminal output. |
-| `list-terminals` | none | Lists Freshell terminal registry objects, independent of panes/tabs. |
-| `open-browser` | none | Creates/navigates browser pane; tmux has no browser pane type. |
-| `navigate` | none | Converts/updates a pane to browser content with URL navigation. |
-| `list-sessions` | none | Lists indexed coding-CLI sessions (Claude/Codex session history). |
-| `search-sessions` | none | Full-text-style search over indexed coding sessions. |
-| `health` | none | HTTP health/readiness endpoint probe. |
-| `lan-info` | none | Returns Freshell network exposure/LAN information. |
 
 ## Playbook: Open a File in an Editor Pane
 
