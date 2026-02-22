@@ -82,4 +82,48 @@ describe('ReplayRing', () => {
     expect(ring.headSeq()).toBe(3)
     expect(ring.tailSeq()).toBe(2)
   })
+
+  it('supports runtime max-byte resize and re-evicts to the new budget', () => {
+    const ring = new ReplayRing(1024)
+    ring.append('x'.repeat(300))
+    ring.append('y'.repeat(300))
+    ring.append('z'.repeat(300))
+
+    ring.setMaxBytes(400)
+
+    const replay = ring.replaySince(0)
+    const total = replay.frames.reduce((sum, frame) => sum + frame.bytes, 0)
+    expect(total).toBeLessThanOrEqual(400)
+  })
+
+  it('retains truncated tail bytes when a single append exceeds maxBytes', () => {
+    const ring = new ReplayRing(8)
+    ring.append('0123456789')
+
+    const replay = ring.replaySince(0)
+    expect(replay.frames).toHaveLength(1)
+    expect(replay.frames[0].seqStart).toBe(1)
+    expect(replay.frames[0].bytes).toBeLessThanOrEqual(8)
+    expect(replay.missedFromSeq).toBeUndefined()
+  })
+
+  it('truncates oversized multi-byte frames on UTF-8 boundaries', () => {
+    const ring = new ReplayRing(7)
+    ring.append('🙂🙂🙂')
+
+    const replay = ring.replaySince(0)
+    expect(replay.frames).toHaveLength(1)
+    expect(replay.frames[0].bytes).toBeLessThanOrEqual(7)
+    expect(replay.frames[0].data).toBe('🙂')
+  })
+
+  it('preserves literal U+FFFD characters emitted by the source output', () => {
+    const ring = new ReplayRing(4)
+    ring.append(`A\uFFFDB`)
+
+    const replay = ring.replaySince(0)
+    expect(replay.frames).toHaveLength(1)
+    expect(replay.frames[0].bytes).toBeLessThanOrEqual(4)
+    expect(replay.frames[0].data).toBe('\uFFFDB')
+  })
 })

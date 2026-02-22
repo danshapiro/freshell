@@ -726,6 +726,10 @@ export class TerminalRegistry extends EventEmitter {
     }
   }
 
+  getReplayRingMaxChars(): number {
+    return this.scrollbackMaxChars
+  }
+
   private computeScrollbackMaxChars(settings?: AppSettings): number {
     const lines = settings?.terminal?.scrollback
     if (typeof lines !== 'number' || !Number.isFinite(lines)) return DEFAULT_MAX_SCROLLBACK_CHARS

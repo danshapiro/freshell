@@ -97,6 +97,8 @@ interface TerminalViewProps {
   hidden?: boolean
 }
 
+type AttachIntent = 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect'
+
 type MobileToolbarKeyId = 'esc' | 'tab' | 'ctrl' | 'up' | 'down' | 'left' | 'right'
 type RepeatableMobileToolbarKeyId = Extract<MobileToolbarKeyId, 'up' | 'down' | 'left' | 'right'>
 
@@ -210,6 +212,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const terminalIdRef = useRef<string | undefined>(terminalContent?.terminalId)
   const lastSeqRef = useRef(0)
   const awaitingFreshSequenceRef = useRef(false)
+  const needsViewportHydrationRef = useRef(true)
+  const pendingDeferredHydrationRef = useRef(false)
+  const awaitingViewportHydrationRef = useRef(false)
   const contentRef = useRef<TerminalPaneContent | null>(terminalContent)
 
   // Keep refs in sync with props
@@ -1024,6 +1029,59 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     return () => disposable.dispose()
   }, [isTerminal, dispatch, tabId])
 
+  const markViewportHydrationComplete = useCallback(() => {
+    if (!awaitingViewportHydrationRef.current) return
+    awaitingViewportHydrationRef.current = false
+    pendingDeferredHydrationRef.current = false
+  }, [])
+
+  const attachTerminal = useCallback((
+    tid: string,
+    intent: AttachIntent,
+    opts?: { clearViewportFirst?: boolean },
+  ) => {
+    setIsAttaching(true)
+    awaitingFreshSequenceRef.current = true
+
+    const persistedSeq = loadTerminalCursor(tid)
+    const deltaSeq = Math.max(lastSeqRef.current, persistedSeq)
+    const sinceSeq = intent === 'viewport_hydrate' ? 0 : deltaSeq
+
+    if (intent === 'viewport_hydrate') {
+      if (opts?.clearViewportFirst) {
+        try {
+          termRef.current?.clear()
+        } catch {
+          // disposed
+        }
+      }
+      // Keep persisted cursor untouched so transport reconnect can still use high-water.
+      lastSeqRef.current = 0
+      needsViewportHydrationRef.current = false
+      pendingDeferredHydrationRef.current = false
+      awaitingViewportHydrationRef.current = true
+    } else {
+      lastSeqRef.current = deltaSeq
+      awaitingViewportHydrationRef.current = false
+      if (intent === 'keepalive_delta' && needsViewportHydrationRef.current) {
+        pendingDeferredHydrationRef.current = true
+      }
+    }
+
+    ws.send({
+      type: 'terminal.attach',
+      terminalId: tid,
+      sinceSeq,
+    })
+    // NOTE: Do NOT send terminal.resize here. At this point fit() hasn't run yet,
+    // so term.cols/rows are xterm defaults (80×24), not the actual viewport size.
+    // Sending a resize with wrong dimensions causes the PTY to resize, triggering
+    // a TUI redraw at the wrong size (e.g., Codex renders 24 rows in a 40-row viewport,
+    // putting the text input at the top of the pane). The correct resize is sent by:
+    // - ResizeObserver callback (for visible tabs, after fit() runs)
+    // - Visibility effect (for hidden tabs, when they become visible)
+  }, [ws])
+
   // Apply settings changes
   useEffect(() => {
     if (!isTerminal) return
@@ -1044,8 +1102,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     if (!isTerminal) return
     if (!hidden) {
       requestTerminalLayout({ fit: true, resize: true })
+      const tid = terminalIdRef.current
+      if (tid && needsViewportHydrationRef.current && pendingDeferredHydrationRef.current) {
+        attachTerminal(tid, 'viewport_hydrate', { clearViewportFirst: true })
+      }
     }
-  }, [hidden, isTerminal, requestTerminalLayout])
+  }, [hidden, isTerminal, requestTerminalLayout, attachTerminal])
 
   // Create or attach to backend terminal
   useEffect(() => {
@@ -1124,26 +1186,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       return true
     }
 
-    function attach(tid: string) {
-      setIsAttaching(true)
-      awaitingFreshSequenceRef.current = true
-      const persistedSeq = loadTerminalCursor(tid)
-      const sinceSeq = Math.max(lastSeqRef.current, persistedSeq)
-      lastSeqRef.current = sinceSeq
-      ws.send({
-        type: 'terminal.attach',
-        terminalId: tid,
-        sinceSeq,
-      })
-      // NOTE: Do NOT send terminal.resize here. At this point fit() hasn't run yet,
-      // so term.cols/rows are xterm defaults (80×24), not the actual viewport size.
-      // Sending a resize with wrong dimensions causes the PTY to resize, triggering
-      // a TUI redraw at the wrong size (e.g., Codex renders 24 rows in a 40-row viewport,
-      // putting the text input at the top of the pane). The correct resize is sent by:
-      // - ResizeObserver callback (for visible tabs, after fit() runs)
-      // - Visibility effect (for hidden tabs, when they become visible)
-    }
-
     async function ensure() {
       clearRateLimitRetry()
       try {
@@ -1196,6 +1238,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           lastSeqRef.current = msg.seqEnd
           saveTerminalCursor(tid, lastSeqRef.current)
           awaitingFreshSequenceRef.current = false
+          markViewportHydrationComplete()
         }
 
         if (msg.type === 'terminal.output.gap' && msg.terminalId === tid) {
@@ -1211,6 +1254,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           saveTerminalCursor(tid, lastSeqRef.current)
           setIsAttaching(false)
           awaitingFreshSequenceRef.current = false
+          markViewportHydrationComplete()
         }
 
         if (msg.type === 'terminal.attach.ready' && msg.terminalId === tid) {
@@ -1218,6 +1262,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           saveTerminalCursor(tid, lastSeqRef.current)
           setIsAttaching(false)
           updateContent({ status: 'running' })
+          markViewportHydrationComplete()
         }
 
         if (msg.type === 'terminal.created' && msg.requestId === reqId) {
@@ -1246,6 +1291,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           ws.send({ type: 'terminal.resize', terminalId: newId, cols: term.cols, rows: term.rows })
           setIsAttaching(true)
           awaitingFreshSequenceRef.current = true
+          needsViewportHydrationRef.current = false
+          pendingDeferredHydrationRef.current = false
+          awaitingViewportHydrationRef.current = false
         }
 
         if (msg.type === 'terminal.exit' && msg.terminalId === tid) {
@@ -1386,7 +1434,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           terminalId: tid,
           resumeSessionId: contentRef.current?.resumeSessionId,
         })
-        if (tid) attach(tid)
+        if (tid) attachTerminal(tid, 'transport_reconnect')
       })
 
       // Use paneContent for terminal lifecycle - NOT tab
@@ -1400,11 +1448,19 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         currentTerminalId,
         createRequestId,
         resumeSessionId: contentRef.current?.resumeSessionId,
-        action: currentTerminalId ? 'attach' : 'sendCreate',
+        action: currentTerminalId
+          ? (!hiddenRef.current && needsViewportHydrationRef.current ? 'viewport_hydrate' : 'keepalive_delta')
+          : 'sendCreate',
       })
       if (currentTerminalId) {
-        attach(currentTerminalId)
+        const intent: AttachIntent = !hiddenRef.current && needsViewportHydrationRef.current
+          ? 'viewport_hydrate'
+          : 'keepalive_delta'
+        attachTerminal(currentTerminalId, intent)
       } else {
+        needsViewportHydrationRef.current = false
+        pendingDeferredHydrationRef.current = false
+        awaitingViewportHydrationRef.current = false
         sendCreate(createRequestId)
       }
     }
@@ -1441,6 +1497,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     ws,
     dispatch,
     handleTerminalOutput,
+    attachTerminal,
+    markViewportHydrationComplete,
   ])
 
   const mobileToolbarBottomPx = isMobile ? keyboardInsetPx : 0

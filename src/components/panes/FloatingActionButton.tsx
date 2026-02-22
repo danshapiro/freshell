@@ -56,7 +56,7 @@ export default function FloatingActionButton({ onAdd, onSplitHorizontal, onSplit
         onKeyDown={handleKeyDown}
         aria-label="Add pane"
         className={cn(
-          'h-12 w-12 rounded-full bg-foreground text-background',
+          'h-12 w-12 rounded-full bg-foreground/70 text-background',
           'flex items-center justify-center',
           'shadow-lg hover:shadow-xl transition-all',
           'hover:scale-105 active:scale-95',

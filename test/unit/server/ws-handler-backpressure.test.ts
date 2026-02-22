@@ -34,6 +34,7 @@ function createMockWs(overrides: Record<string, unknown> = {}) {
 
 class FakeBrokerRegistry extends EventEmitter {
   private records = new Map<string, { terminalId: string; buffer: { snapshot: () => string } }>()
+  private replayRingMaxChars: number | undefined
 
   createTerminal(terminalId: string) {
     this.records.set(terminalId, {
@@ -48,6 +49,14 @@ class FakeBrokerRegistry extends EventEmitter {
 
   detach(_terminalId: string) {
     return true
+  }
+
+  setReplayRingMaxBytes(next: number | undefined) {
+    this.replayRingMaxChars = next
+  }
+
+  getReplayRingMaxChars() {
+    return this.replayRingMaxChars
   }
 }
 
@@ -634,6 +643,70 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
       payload?.reason === 'queue_overflow' &&
       level === 'warn',
     )).toBe(true)
+
+    broker.close()
+  })
+
+  it('uses registry replay budget to avoid replay-window gaps for moderate retained history', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(1_000_000)
+    const perfSpy = vi.fn()
+    const broker = new TerminalStreamBroker(registry as any, perfSpy)
+    registry.createTerminal('term-replay-budget')
+
+    const wsSeed = createMockWs()
+    await broker.attach(wsSeed as any, 'term-replay-budget', 0)
+    registry.emit('terminal.output.raw', {
+      terminalId: 'term-replay-budget',
+      data: 'a'.repeat(400 * 1024),
+      at: Date.now(),
+    })
+
+    const wsReplay = createMockWs()
+    await broker.attach(wsReplay as any, 'term-replay-budget', 0)
+
+    const payloads = wsReplay.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .filter((payload): payload is Record<string, any> => !!payload && typeof payload === 'object')
+
+    expect(payloads.some((payload) =>
+      payload.type === 'terminal.output.gap' &&
+      payload.reason === 'replay_window_exceeded'
+    )).toBe(false)
+    expect(payloads.some((payload) => payload.type === 'terminal.output')).toBe(true)
+
+    broker.close()
+  })
+
+  it('replays a truncated frame tail for single oversized output without replay-window gaps', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(8)
+    const perfSpy = vi.fn()
+    const broker = new TerminalStreamBroker(registry as any, perfSpy)
+    registry.createTerminal('term-oversized-tail')
+
+    const wsSeed = createMockWs()
+    await broker.attach(wsSeed as any, 'term-oversized-tail', 0)
+    registry.emit('terminal.output.raw', {
+      terminalId: 'term-oversized-tail',
+      data: '0123456789',
+      at: Date.now(),
+    })
+
+    const wsReplay = createMockWs()
+    await broker.attach(wsReplay as any, 'term-oversized-tail', 0)
+
+    const payloads = wsReplay.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .filter((payload): payload is Record<string, any> => !!payload && typeof payload === 'object')
+
+    const replayOutput = payloads.find((payload) => payload.type === 'terminal.output')
+    expect(replayOutput).toBeDefined()
+    expect(Buffer.byteLength(replayOutput?.data ?? '', 'utf8')).toBeLessThanOrEqual(8)
+    expect(payloads.some((payload) =>
+      payload.type === 'terminal.output.gap' &&
+      payload.reason === 'replay_window_exceeded'
+    )).toBe(false)
 
     broker.close()
   })

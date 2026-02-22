@@ -235,15 +235,37 @@ export class TerminalStreamBroker {
   }
 
   private getOrCreateTerminalState(terminalId: string): BrokerTerminalState {
+    const replayRingMaxBytes = this.resolveReplayRingMaxBytes()
     let state = this.terminals.get(terminalId)
     if (!state) {
       state = {
-        replayRing: new ReplayRing(),
+        replayRing: new ReplayRing(replayRingMaxBytes),
         clients: new Map(),
       }
       this.terminals.set(terminalId, state)
+    } else {
+      state.replayRing.setMaxBytes(replayRingMaxBytes)
     }
     return state
+  }
+
+  private resolveReplayRingMaxBytes(): number | undefined {
+    // Some tests inject lightweight registry doubles that may omit this method.
+    // Fall back to ReplayRing defaults when no budget provider is available.
+    const getReplayRingMaxChars = (
+      this.registry as Partial<{ getReplayRingMaxChars: () => number | undefined }>
+    ).getReplayRingMaxChars
+    if (typeof getReplayRingMaxChars !== 'function') {
+      return undefined
+    }
+
+    // TerminalRegistry clamp is character-based; reusing the same numeric
+    // budget as bytes keeps replay retention conservative.
+    const value = getReplayRingMaxChars.call(this.registry)
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      return undefined
+    }
+    return Math.floor(value)
   }
 
   private getOrCreateAttachment(
