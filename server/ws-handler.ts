@@ -61,7 +61,9 @@ const PING_INTERVAL_MS = Number(process.env.PING_INTERVAL_MS || 30_000)
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
 const WS_MAX_PAYLOAD_BYTES = Number(process.env.WS_MAX_PAYLOAD_BYTES || 16 * 1024 * 1024)
 const MAX_SCREENSHOT_BASE64_BYTES = Number(process.env.MAX_SCREENSHOT_BASE64_BYTES || 12 * 1024 * 1024)
-const DEFAULT_WS_MESSAGE_BYTES = Number(process.env.DEFAULT_WS_MESSAGE_BYTES || 1 * 1024 * 1024)
+const MAX_REGULAR_WS_MESSAGE_BYTES = Number(
+  process.env.MAX_REGULAR_WS_MESSAGE_BYTES || process.env.DEFAULT_WS_MESSAGE_BYTES || 1 * 1024 * 1024,
+)
 // Max payload size per WebSocket message for mobile browser compatibility (500KB)
 const MAX_CHUNK_BYTES = Number(process.env.MAX_WS_CHUNK_BYTES || 500 * 1024)
 // Drain-aware sending: wait for buffer to drop below threshold between chunks
@@ -780,7 +782,7 @@ export class WsHandler {
       const m = parsed.data
       messageType = m.type
 
-      if (rawBytes > DEFAULT_WS_MESSAGE_BYTES && m.type !== 'ui.screenshot.result') {
+      if (rawBytes > MAX_REGULAR_WS_MESSAGE_BYTES && m.type !== 'ui.screenshot.result') {
         ws.close(1009, 'Message too large')
         return
       }

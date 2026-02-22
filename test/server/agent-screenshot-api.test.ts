@@ -9,6 +9,7 @@ import { createAgentApiRouter } from '../../server/agent-api/router'
 const createdPaths = new Set<string>()
 
 afterEach(async () => {
+  vi.restoreAllMocks()
   await Promise.all(
     [...createdPaths].map(async (targetPath) => {
       await fs.rm(targetPath, { force: true })
@@ -113,4 +114,35 @@ it('returns 400 when scope is pane and paneId is missing', async () => {
   expect(res.status).toBe(400)
   expect(res.body.status).toBe('error')
   expect(res.body.message).toContain('paneId')
+})
+
+it('cleans up temporary files when atomic rename fails', async () => {
+  const app = express()
+  app.use(express.json())
+
+  const wsHandler = {
+    requestUiScreenshot: vi.fn().mockResolvedValue({
+      ok: true,
+      mimeType: 'image/png',
+      imageBase64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO2M7nQAAAAASUVORK5CYII=',
+      width: 1,
+      height: 1,
+    }),
+  }
+
+  app.use('/api', createAgentApiRouter({ layoutStore: {} as any, registry: {} as any, wsHandler: wsHandler as any }))
+
+  const outputPath = path.join(os.tmpdir(), `api-shot-rename-fail-${Date.now()}.png`)
+  createdPaths.add(outputPath)
+
+  vi.spyOn(fs, 'rename').mockRejectedValueOnce(new Error('rename failed'))
+
+  const res = await request(app)
+    .post('/api/screenshots')
+    .send({ scope: 'view', name: 'ignored', path: outputPath, overwrite: true })
+
+  expect(res.status).toBe(500)
+  const dirEntries = await fs.readdir(path.dirname(outputPath))
+  const tmpPrefix = `${path.basename(outputPath)}.tmp-`
+  expect(dirEntries.some((entry) => entry.startsWith(tmpPrefix))).toBe(false)
 })

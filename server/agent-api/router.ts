@@ -27,7 +27,12 @@ const looksLikePrompt = (text: string) => {
 async function writeFileAtomic(filePath: string, content: Buffer) {
   const tempPath = `${filePath}.tmp-${randomUUID()}`
   await fs.writeFile(tempPath, content)
-  await fs.rename(tempPath, filePath)
+  try {
+    await fs.rename(tempPath, filePath)
+  } catch (err) {
+    await fs.unlink(tempPath).catch(() => undefined)
+    throw err
+  }
 }
 
 export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { layoutStore: any; registry: any; wsHandler?: any }) {

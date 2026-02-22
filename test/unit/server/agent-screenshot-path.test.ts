@@ -44,4 +44,16 @@ describe('resolveScreenshotOutputPath', () => {
       resolveScreenshotOutputPath({ name: '../escape', pathInput: os.tmpdir() }),
     ).rejects.toThrow(/path separators/i)
   })
+
+  it('rejects empty path values', async () => {
+    await expect(
+      resolveScreenshotOutputPath({ name: 'pane-a', pathInput: '   ' }),
+    ).rejects.toThrow(/path must not be empty/i)
+  })
+
+  it('rejects path values containing null bytes', async () => {
+    await expect(
+      resolveScreenshotOutputPath({ name: 'pane-a', pathInput: 'bad\0path' }),
+    ).rejects.toThrow(/null bytes/i)
+  })
 })
