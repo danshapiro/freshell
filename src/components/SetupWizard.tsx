@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { configureNetwork, fetchNetworkStatus } from '@/store/networkSlice'
 import { addTab } from '@/store/tabsSlice'
@@ -67,6 +67,23 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
   const [firewallDetail, setFirewallDetail] = useState<string | undefined>()
   const [copied, setCopied] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const mountedRef = useRef(true)
+  const copyResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const firewallPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    return () => {
+      mountedRef.current = false
+      if (copyResetTimerRef.current) {
+        clearTimeout(copyResetTimerRef.current)
+        copyResetTimerRef.current = null
+      }
+      if (firewallPollTimerRef.current) {
+        clearTimeout(firewallPollTimerRef.current)
+        firewallPollTimerRef.current = null
+      }
+    }
+  }, [])
 
   // Watch for rebinding completion when on step 2
   useEffect(() => {
@@ -157,7 +174,14 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
     try {
       await navigator.clipboard.writeText(url)
       setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
+      if (copyResetTimerRef.current) {
+        clearTimeout(copyResetTimerRef.current)
+      }
+      copyResetTimerRef.current = setTimeout(() => {
+        copyResetTimerRef.current = null
+        if (!mountedRef.current) return
+        setCopied(false)
+      }, 2000)
     } catch {
       // Clipboard may not be available
     }
@@ -181,6 +205,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
         setFirewallStatus('active')
         setFirewallDetail('Configuring firewall...')
         const pollFirewall = async (attempts = 0) => {
+          if (!mountedRef.current) return
           if (attempts >= 10) {
             setFirewallStatus('error')
             setFirewallDetail('Firewall configuration timed out')
@@ -202,9 +227,15 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
               return
             }
           } catch { /* ignore */ }
-          setTimeout(() => pollFirewall(attempts + 1), 1000)
+          firewallPollTimerRef.current = setTimeout(() => {
+            firewallPollTimerRef.current = null
+            void pollFirewall(attempts + 1)
+          }, 1000)
         }
-        setTimeout(() => pollFirewall(), 1000)
+        firewallPollTimerRef.current = setTimeout(() => {
+          firewallPollTimerRef.current = null
+          void pollFirewall()
+        }, 1000)
       }
       // method === 'none' or 'in-progress': do nothing
     } catch (err: any) {
