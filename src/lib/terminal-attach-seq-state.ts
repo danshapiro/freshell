@@ -22,7 +22,10 @@ export function onAttachReady(
   state: AttachSeqState,
   ready: { replayFromSeq: number; replayToSeq: number },
 ): AttachSeqState {
-  if (ready.replayFromSeq <= ready.replayToSeq) {
+  const hasReplayWindow = ready.replayFromSeq > 0
+    && ready.replayFromSeq <= ready.replayToSeq
+
+  if (hasReplayWindow) {
     // Keep awaitingFreshSequence true until replay/live output is actually accepted.
     // attach.ready arrives before replay frames, so clearing it here is premature.
     return {
