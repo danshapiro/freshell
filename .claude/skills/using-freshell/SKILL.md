@@ -1,5 +1,5 @@
 ---
-name: using-freshell
+name: freshell-automation-tmux-style
 description: Use when operating Freshell itself to open files in editor panes, create or split tabs and panes, launch parallel Claude or Codex panes, and drive freshell UI features programmatically.
 ---
 
