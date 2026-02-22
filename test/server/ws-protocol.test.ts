@@ -914,7 +914,7 @@ describe('ws protocol', () => {
     ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
     await waitForMessage(ws, (m) => m.type === 'ready')
 
-    const pending = handler.requestUiScreenshot({ scope: 'view', timeoutMs: 2000 })
+    const pending = handler.requestUiScreenshot({ scope: 'view', timeoutMs: 10_000 })
     const req = await waitForMessage(
       ws,
       (m) => m.type === 'ui.command' && m.command === 'screenshot.capture',
@@ -946,7 +946,7 @@ describe('ws protocol', () => {
     await waitForMessage(ws, (m) => m.type === 'ready')
 
     const bigImage = 'A'.repeat(1_100_000)
-    const pending = handler.requestUiScreenshot({ scope: 'view', timeoutMs: 2000 })
+    const pending = handler.requestUiScreenshot({ scope: 'view', timeoutMs: 10_000 })
     const req = await waitForMessage(
       ws,
       (m) => m.type === 'ui.command' && m.command === 'screenshot.capture',

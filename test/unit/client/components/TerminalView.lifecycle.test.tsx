@@ -1818,6 +1818,66 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
+    it('keeps viewport replay output when reconnect attach starts before the viewport replay arrives', async () => {
+      localStorage.setItem(TERMINAL_CURSOR_STORAGE_KEY, JSON.stringify({
+        'term-v2-overlapping-attach-ready': {
+          seq: 12,
+          updatedAt: Date.now(),
+        },
+      }))
+      __resetTerminalCursorCacheForTests()
+
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-overlapping-attach-ready',
+      })
+
+      // Simulate a reconnect attach racing ahead of the first viewport replay.
+      wsMocks.send.mockClear()
+      reconnectHandler?.()
+      expect(wsMocks.send).toHaveBeenCalledWith({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 12,
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 12,
+          replayFromSeq: 1,
+          replayToSeq: 12,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'history-1',
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 6,
+          seqEnd: 6,
+          data: 'history-6',
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 12,
+          seqEnd: 12,
+          data: 'history-12',
+        })
+      })
+
+      const writes = term.write.mock.calls.map(([data]: [string]) => String(data)).join('')
+      expect(writes).toContain('history-1')
+      expect(writes).toContain('history-6')
+      expect(writes).toContain('history-12')
+    })
+
     it('preserves persisted high-water when a hydration replay starts at sequence 1', async () => {
       localStorage.setItem(TERMINAL_CURSOR_STORAGE_KEY, JSON.stringify({
         'term-v2-seq-reset': {
