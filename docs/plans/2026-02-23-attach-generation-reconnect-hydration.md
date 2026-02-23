@@ -38,7 +38,8 @@
 
 **Step 1: Write the failing unit test for attachRequestId echo on ready/output/gap**
 
-Add a new test in `test/unit/server/ws-handler-backpressure.test.ts` that directly exercises `TerminalStreamBroker.attach` with a request ID.
+Add a new test in `test/unit/server/ws-handler-backpressure.test.ts` under the existing `describe('TerminalStreamBroker catastrophic bufferedAmount handling', ...)` block so you reuse `FakeBrokerRegistry` + fake-timer setup.
+The test should directly exercise `TerminalStreamBroker.attach` with a request ID.
 If the surrounding describe block does not already use fake timers, wrap this test with `vi.useFakeTimers()` / `vi.useRealTimers()` because it depends on `vi.advanceTimersByTime(5)`:
 
 ```ts
@@ -236,6 +237,8 @@ git commit -m "feat(terminal-stream): tag attach replay/output payloads with att
 
 Add a test proving reattach to same terminal/socket replaces the active generation and does not re-flush stale queued frames (duplicate delivery bug):
 
+Place this test in the same fake-timer broker describe block used in Task 1 (`TerminalStreamBroker catastrophic bufferedAmount handling`) because it also uses `vi.advanceTimersByTime(5)`.
+
 ```ts
 it('superseding attach on same socket clears stale queued frames and avoids duplicate old-frame delivery', async () => {
   const registry = new FakeBrokerRegistry()
@@ -337,7 +340,11 @@ Example test skeleton:
 
 ```ts
 it('drops stale terminal.output from an older attachRequestId generation', async () => {
-  const { terminalId, term } = await renderTerminalHarness({ status: 'running', terminalId: 'term-attach-gen' })
+  const { terminalId, term } = await renderTerminalHarness({
+    status: 'running',
+    terminalId: 'term-attach-gen',
+    clearSends: false,
+  })
 
   const firstAttach = wsMocks.send.mock.calls
     .map(([msg]) => msg)
@@ -389,10 +396,10 @@ expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
 }))
 ```
 
-Apply this to every strict `terminal.attach` equality assertion. Do not rely on static line numbers; locate sites with:
+Apply this to every strict `terminal.attach` equality assertion. Do not rely on static line numbers; locate candidate sites with:
 
 ```bash
-rg -n "toHaveBeenCalledWith\\(\\{[[:space:]]*type:[[:space:]]*'terminal\\.attach'" test/unit/client/components/TerminalView.lifecycle.test.tsx
+rg -n "type: 'terminal\\.attach'" test/unit/client/components/TerminalView.lifecycle.test.tsx
 ```
 
 Add a regression test for create-path untagged messages:
@@ -548,7 +555,11 @@ Add a unit test in `test/unit/client/components/TerminalView.lifecycle.test.tsx`
 
 ```ts
 it('suppresses replay_window_exceeded banner during viewport_hydrate attach generation', async () => {
-  const { terminalId, term } = await renderTerminalHarness({ status: 'running', terminalId: 'term-hydrate-gap' })
+  const { terminalId, term } = await renderTerminalHarness({
+    status: 'running',
+    terminalId: 'term-hydrate-gap',
+    clearSends: false,
+  })
 
   const attach = wsMocks.send.mock.calls
     .map(([msg]) => msg)
