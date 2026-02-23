@@ -4,7 +4,7 @@
 
 **Goal:** Eliminate stale attach/replay races and stop noisy `reconnect window exceeded` warnings during visible refresh hydration while preserving forward-only sequence correctness.
 
-**Architecture:** Add an `attachRequestId` to each `terminal.attach` request and have the server echo that ID on `terminal.attach.ready`, `terminal.output`, and `terminal.output.gap` for that attachment. On the client, treat `attachRequestId` as the attach generation token and drop stale messages from older generations. Keep gap sequence advancement behavior, but suppress the hydration-only replay miss banner (`replay_window_exceeded`) for `viewport_hydrate` attaches.
+**Architecture:** Add an `attachRequestId` to each `terminal.attach` request and have the server echo that ID on `terminal.attach.ready`, `terminal.output`, and `terminal.output.gap` for that attachment. On the client, treat `attachRequestId` as the attach generation token and drop stale messages from older generations, scoped per terminal ID so one terminal's attach generation cannot suppress another terminal's messages. Because `terminal.created` auto-attach currently does not originate from `attachTerminal`, explicitly clear client attach-generation state in the `terminal.created` handler so untagged create-path replay/output is accepted. Keep gap sequence advancement behavior, but suppress the hydration-only replay miss banner (`replay_window_exceeded`) for `viewport_hydrate` attaches.
 
 **Tech Stack:** React 18 + Redux Toolkit + xterm.js, Node.js + ws, Zod shared protocol types, Vitest (unit + server integration + e2e-style client tests).
 
@@ -148,6 +148,13 @@ Update broker + ws handler signatures:
 
 ```ts
 // server/terminal-stream/broker.ts
+async sendCreatedAndAttach(
+  ws: LiveWebSocket,
+  created: CreatedEnvelope,
+  sinceSeq: number | undefined = 0,
+  attachRequestId?: string,
+): Promise<boolean> { ... }
+
 async attach(
   ws: LiveWebSocket,
   terminalId: string,
@@ -157,6 +164,12 @@ async attach(
 
 // server/ws-handler.ts
 const attached = await this.terminalStreamBroker.attach(ws, m.terminalId, m.sinceSeq, m.attachRequestId)
+```
+
+Keep `sendCreatedAndAttach(...)` call sites in `server/ws-handler.ts` unchanged for now (no client-provided `attachRequestId` on create path), and pass through optional attach ID if a future caller provides one:
+
+```ts
+return await this.attach(ws, created.terminalId, sinceSeq, attachRequestId)
 ```
 
 Send echoed ID from broker:
@@ -174,7 +187,28 @@ this.safeSend(ws, {
 })
 ```
 
-And in `sendFrame` / `sendGap` include `attachRequestId` from the active attachment.
+And in `sendFrame` / `sendGap` include `attachRequestId` from the active attachment at every send call site (not just helper signatures):
+
+```ts
+const attachRequestId = attachment.activeAttachRequestId
+
+// attach() replay-miss path
+this.safeSend(ws, {
+  type: 'terminal.output.gap',
+  terminalId,
+  fromSeq: replay.missedFromSeq,
+  toSeq: missedToSeq,
+  reason: 'replay_window_exceeded',
+  ...(attachRequestId ? { attachRequestId } : {}),
+})
+
+// attach() replay + staged loops
+this.sendFrame(ws, terminalId, frame, attachRequestId)
+
+// flushAttachment() batch loop
+this.sendGap(ws, terminalId, item, attachRequestId)
+this.sendFrame(ws, terminalId, item, attachRequestId)
+```
 
 **Step 4: Run tests to verify pass**
 
@@ -256,6 +290,11 @@ clear(): void {
 At the start of `attach()` lock section in `server/terminal-stream/broker.ts`, reset per-client transient state:
 
 ```ts
+if (attachment.flushTimer) {
+  clearTimeout(attachment.flushTimer)
+  attachment.flushTimer = null
+}
+
 attachment.mode = 'attaching'
 attachment.activeAttachRequestId = attachRequestId
 attachment.attachStaging = []
@@ -294,6 +333,8 @@ git commit -m "fix(terminal-stream): clear stale queue state when a newer attach
 Add tests that verify:
 1. `TerminalView` sends `attachRequestId` on every `terminal.attach`.
 2. Messages from an older attach generation are ignored.
+3. Existing exact-match `terminal.attach` assertions are updated for the new field.
+4. `terminal.created` auto-attach messages (which may not carry `attachRequestId`) are still accepted after a prior attach generation existed.
 
 Example test skeleton:
 
@@ -340,6 +381,62 @@ it('drops stale terminal.output from an older attachRequestId generation', async
 })
 ```
 
+Also update all legacy exact attach assertions in this file from strict object equality to partial matching so `attachRequestId` does not break unrelated assertions:
+
+```ts
+expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+  type: 'terminal.attach',
+  terminalId,
+  sinceSeq: 0,
+  attachRequestId: expect.any(String),
+}))
+```
+
+Apply this at the current assertion sites around:
+- lines `1501`, `1523`, `1622`, `1642`, `1663`, `1685`, `1707`, `1722`, `1773`, `1804`, `1814`, `1838`, `1898`, `1936`, `2026`.
+
+Add a regression test for create-path untagged messages:
+
+```ts
+it('accepts terminal.created auto-attach messages without attachRequestId after prior attach generation state', async () => {
+  const { requestId, term } = await renderTerminalHarness({
+    status: 'running',
+    terminalId: 'term-old-generation',
+  })
+
+  // Establish prior attach generation state.
+  reconnectHandler?.()
+  wsMocks.send.mockClear()
+
+  // Simulate create path switching to a new terminal.
+  messageHandler!({
+    type: 'terminal.created',
+    requestId,
+    terminalId: 'term-created-no-id',
+    createdAt: Date.now(),
+  } as any)
+
+  messageHandler!({
+    type: 'terminal.attach.ready',
+    terminalId: 'term-created-no-id',
+    headSeq: 1,
+    replayFromSeq: 2,
+    replayToSeq: 1,
+  } as any)
+
+  messageHandler!({
+    type: 'terminal.output',
+    terminalId: 'term-created-no-id',
+    seqStart: 2,
+    seqEnd: 2,
+    data: 'created-live',
+  } as any)
+
+  const writes = term.write.mock.calls.map(([d]) => String(d)).join('')
+  expect(writes).toContain('created-live')
+})
+```
+
 **Step 2: Run test to verify it fails**
 
 Run:
@@ -356,11 +453,16 @@ Add attach context refs near existing sequence refs:
 
 ```ts
 const attachCounterRef = useRef(0)
-const currentAttachRef = useRef<{ requestId: string; intent: AttachIntent } | null>(null)
+const currentAttachRef = useRef<{
+  requestId: string
+  intent: AttachIntent
+  terminalId: string
+} | null>(null)
 
-const isCurrentAttachMessage = (msg: { attachRequestId?: string }) => {
+const isCurrentAttachMessage = (msg: { terminalId?: string; attachRequestId?: string }) => {
   const current = currentAttachRef.current
   if (!current) return true
+  if (msg.terminalId && msg.terminalId !== current.terminalId) return true
   if (!msg.attachRequestId) return false
   return msg.attachRequestId === current.requestId
 }
@@ -370,7 +472,7 @@ When sending an attach:
 
 ```ts
 const requestId = `${paneIdRef.current}:${++attachCounterRef.current}:${nanoid(6)}`
-currentAttachRef.current = { requestId, intent }
+currentAttachRef.current = { requestId, intent, terminalId: tid }
 
 ws.send({
   type: 'terminal.attach',
@@ -392,6 +494,20 @@ if (!isCurrentAttachMessage(msg)) {
     type: msg.type,
   })
   return
+}
+```
+
+And clear stale attach-generation context on lifecycle boundaries where the terminal ID changes or terminates:
+
+```ts
+if (msg.type === 'terminal.created' && msg.requestId === reqId) {
+  currentAttachRef.current = null
+  // ...existing created handling...
+}
+
+if (msg.type === 'terminal.exit' && msg.terminalId === tid) {
+  currentAttachRef.current = null
+  // ...existing exit handling...
 }
 ```
 
@@ -468,7 +584,8 @@ In `terminal.output.gap` handler:
 const currentAttach = currentAttachRef.current
 const suppressHydrationReplayMiss =
   msg.reason === 'replay_window_exceeded'
-  && currentAttach?.intent === 'viewport_hydrate'
+  && currentAttach?.terminalId === msg.terminalId
+  && currentAttach.intent === 'viewport_hydrate'
   && awaitingViewportHydrationRef.current
 
 if (!suppressHydrationReplayMiss) {
@@ -558,7 +675,23 @@ private sendFrame(ws: LiveWebSocket, terminalId: string, frame: ReplayFrame, att
 }
 ```
 
-Do the same for `sendGap` and all call sites.
+Do the same for `sendGap` and all call sites, including:
+- both replay frame loops in `attach()`
+- replay miss `terminal.output.gap` send in `attach()`
+- both branches in `flushAttachment()`
+
+Concrete `flushAttachment()` shape:
+
+```ts
+const attachRequestId = attachment.activeAttachRequestId
+for (const item of batch) {
+  if (isGapEvent(item)) {
+    if (!this.sendGap(ws, terminalId, item, attachRequestId)) return
+    continue
+  }
+  if (!this.sendFrame(ws, terminalId, item, attachRequestId)) return
+}
+```
 
 **Step 4: Re-run integration tests**
 
@@ -680,4 +813,3 @@ Expected: no matches.
 4. Merge safety reminder:
 - Merge/rebase `main` into this worktree branch first.
 - Then fast-forward `main` only with `git merge --ff-only`.
-
