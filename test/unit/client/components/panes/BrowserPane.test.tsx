@@ -150,9 +150,28 @@ describe('BrowserPane', () => {
 
       const iframe = document.querySelector('iframe')
       expect(iframe).toBeTruthy()
-      // The existing regex strips the leading slash after file:///
       expect(iframe!.getAttribute('src')).toBe(
-        '/local-file?path=' + encodeURIComponent('home/user/index.html'),
+        '/local-file?path=' + encodeURIComponent('/home/user/index.html'),
+      )
+    })
+
+    it('keeps Windows drive file URLs compatible with local-file path resolution', () => {
+      renderBrowserPane({ url: 'file:///C:/Users/user/index.html' })
+
+      const iframe = document.querySelector('iframe')
+      expect(iframe).toBeTruthy()
+      expect(iframe!.getAttribute('src')).toBe(
+        '/local-file?path=' + encodeURIComponent('C:/Users/user/index.html'),
+      )
+    })
+
+    it('maps non-localhost file URL hostnames to UNC-style paths', () => {
+      renderBrowserPane({ url: 'file://server/share/index.html' })
+
+      const iframe = document.querySelector('iframe')
+      expect(iframe).toBeTruthy()
+      expect(iframe!.getAttribute('src')).toBe(
+        '/local-file?path=' + encodeURIComponent('//server/share/index.html'),
       )
     })
   })
@@ -257,9 +276,8 @@ describe('BrowserPane', () => {
 
       const iframe = document.querySelector('iframe')
       expect(iframe).toBeTruthy()
-      // file:// should still go through /local-file endpoint (existing regex strips leading /)
       expect(iframe!.getAttribute('src')).toBe(
-        '/local-file?path=' + encodeURIComponent('home/user/index.html'),
+        '/local-file?path=' + encodeURIComponent('/home/user/index.html'),
       )
     })
 

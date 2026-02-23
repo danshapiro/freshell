@@ -21,8 +21,28 @@ const MAX_HISTORY_SIZE = 50
 // Convert file:// URLs to the /local-file API endpoint for iframe loading
 function toIframeSrc(url: string): string {
   if (url.startsWith('file://')) {
-    const filePath = url.replace(/^file:\/\/\/?/, '')
-    return `/local-file?path=${encodeURIComponent(filePath)}`
+    try {
+      const parsed = new URL(url)
+      if (parsed.protocol !== 'file:') return url
+
+      let filePath = decodeURIComponent(parsed.pathname)
+      const hasWindowsDrivePrefix = /^\/[a-zA-Z]:\//.test(filePath)
+      if (hasWindowsDrivePrefix) {
+        // file:///C:/path -> C:/path (Windows local drive path)
+        filePath = filePath.slice(1)
+      }
+
+      // file://server/share/path -> //server/share/path (UNC path)
+      if (parsed.hostname && parsed.hostname !== 'localhost') {
+        filePath = `//${parsed.hostname}${filePath}`
+      }
+
+      return `/local-file?path=${encodeURIComponent(filePath)}`
+    } catch {
+      // Fall back to legacy conversion when URL parsing fails.
+      const filePath = url.replace(/^file:\/\/\/?/, '')
+      return `/local-file?path=${encodeURIComponent(filePath)}`
+    }
   }
   return url
 }
