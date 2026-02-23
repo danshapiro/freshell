@@ -11,6 +11,7 @@ export type BrokerClientAttachment = {
   attachStaging: ReplayFrame[]
   lastSeq: number
   flushTimer: NodeJS.Timeout | null
+  activeAttachRequestId?: string
   catastrophicSince?: number
   catastrophicClosed?: boolean
 }

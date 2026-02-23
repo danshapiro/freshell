@@ -322,6 +322,55 @@ describe('terminal stream v2 replay', () => {
     await close2()
   })
 
+  it('echoes attachRequestId on attach.ready and replay_window_exceeded gaps', async () => {
+    const originalReplayRingMaxBytes = process.env.TERMINAL_REPLAY_RING_MAX_BYTES
+    process.env.TERMINAL_REPLAY_RING_MAX_BYTES = '8'
+
+    try {
+      const { ws: ws1, close: close1 } = await createAuthenticatedConnection(port)
+      const { terminalId } = await createTerminal(ws1, 'stream-attach-id-create')
+
+      for (const chunk of ['aaaa', 'bbbb', 'cccc']) {
+        registry.simulateOutput(terminalId, chunk)
+      }
+      await waitForMessage(
+        ws1,
+        (msg) => msg.type === 'terminal.output' && msg.terminalId === terminalId && msg.seqEnd >= 3,
+      )
+      await close1()
+
+      const { ws: ws2, close: close2 } = await createAuthenticatedConnection(port)
+      const readyPromise = waitForMessage(
+        ws2,
+        (msg) => msg.type === 'terminal.attach.ready' && msg.terminalId === terminalId,
+      )
+      const gapPromise = waitForMessage(
+        ws2,
+        (msg) =>
+          msg.type === 'terminal.output.gap'
+          && msg.terminalId === terminalId
+          && msg.reason === 'replay_window_exceeded',
+      )
+
+      ws2.send(JSON.stringify({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 0,
+        attachRequestId: 'attach-replay-1',
+      }))
+
+      const ready = await readyPromise
+      const gap = await gapPromise
+      expect(ready.attachRequestId).toBe('attach-replay-1')
+      expect(gap.attachRequestId).toBe('attach-replay-1')
+
+      await close2()
+    } finally {
+      if (originalReplayRingMaxBytes === undefined) delete process.env.TERMINAL_REPLAY_RING_MAX_BYTES
+      else process.env.TERMINAL_REPLAY_RING_MAX_BYTES = originalReplayRingMaxBytes
+    }
+  })
+
   it('attach replay from sinceSeq emits ready first and replays an exact range above sequence 1', async () => {
     const { ws: ws1, close: close1 } = await createAuthenticatedConnection(port)
     const { terminalId } = await createTerminal(ws1, 'stream-range-create')

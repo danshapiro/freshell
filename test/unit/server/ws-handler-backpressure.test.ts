@@ -605,6 +605,32 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     }
   })
 
+  it('echoes attachRequestId on attach.ready, output, and output.gap for a client attachment', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-attach-id')
+
+    const ws = createMockWs()
+    const attached = await broker.attach(ws as any, 'term-attach-id', 0, 'attach-1')
+    expect(attached).toBe(true)
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-attach-id', data: 'seed', at: Date.now() })
+    for (let i = 0; i < 240; i += 1) {
+      registry.emit('terminal.output.raw', { terminalId: 'term-attach-id', data: 'x'.repeat(1024), at: Date.now() })
+    }
+    vi.advanceTimersByTime(5)
+
+    const payloads = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .filter((payload): payload is Record<string, any> => !!payload && typeof payload === 'object')
+
+    expect(payloads.some((m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'attach-1')).toBe(true)
+    expect(payloads.some((m) => m.type === 'terminal.output' && m.attachRequestId === 'attach-1')).toBe(true)
+    expect(payloads.some((m) => m.type === 'terminal.output.gap' && m.attachRequestId === 'attach-1')).toBe(true)
+
+    broker.close()
+  })
+
   it('emits terminal_stream_replay_hit, terminal_stream_queue_pressure, and terminal_stream_gap on overflow', async () => {
     const registry = new FakeBrokerRegistry()
     const perfSpy = vi.fn()

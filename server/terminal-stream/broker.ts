@@ -96,6 +96,7 @@ export class TerminalStreamBroker {
     ws: LiveWebSocket,
     terminalId: string,
     sinceSeq: number | undefined,
+    attachRequestId?: string,
   ): Promise<boolean> {
     const record = this.registry.attach(terminalId, ws, { suppressOutput: true })
     if (!record) return false
@@ -106,6 +107,7 @@ export class TerminalStreamBroker {
 
     await this.withTerminalLock(terminalId, async () => {
       attachment.mode = 'attaching'
+      attachment.activeAttachRequestId = attachRequestId
       attachment.attachStaging = []
 
       // Seed from the existing terminal buffer if this terminal predates broker wiring.
@@ -139,6 +141,7 @@ export class TerminalStreamBroker {
         headSeq,
         replayFromSeq,
         replayToSeq,
+        ...(attachment.activeAttachRequestId ? { attachRequestId: attachment.activeAttachRequestId } : {}),
       })) {
         return
       }
@@ -170,6 +173,7 @@ export class TerminalStreamBroker {
             fromSeq: replay.missedFromSeq,
             toSeq: missedToSeq,
             reason: 'replay_window_exceeded',
+            ...(attachment.activeAttachRequestId ? { attachRequestId: attachment.activeAttachRequestId } : {}),
           })) {
             return
           }
@@ -178,14 +182,14 @@ export class TerminalStreamBroker {
       }
 
       for (const frame of replayFrames) {
-        if (!this.sendFrame(ws, terminalId, frame)) return
+        if (!this.sendFrame(ws, terminalId, frame, attachment.activeAttachRequestId)) return
         attachment.lastSeq = Math.max(attachment.lastSeq, frame.seqEnd)
       }
 
       const staged = attachment.attachStaging.filter((frame) => frame.seqStart > replayToSeq)
       attachment.attachStaging = []
       for (const frame of staged) {
-        if (!this.sendFrame(ws, terminalId, frame)) return
+        if (!this.sendFrame(ws, terminalId, frame, attachment.activeAttachRequestId)) return
         attachment.lastSeq = Math.max(attachment.lastSeq, frame.seqEnd)
       }
 
@@ -362,14 +366,15 @@ export class TerminalStreamBroker {
     const batch = attachment.queue.nextBatch(TERMINAL_STREAM_BATCH_MAX_BYTES)
     if (batch.length === 0) return
 
+    const attachRequestId = attachment.activeAttachRequestId
     for (const item of batch) {
       if (isGapEvent(item)) {
-        if (!this.sendGap(ws, terminalId, item)) return
+        if (!this.sendGap(ws, terminalId, item, attachRequestId)) return
         attachment.lastSeq = Math.max(attachment.lastSeq, item.toSeq)
         continue
       }
 
-      if (!this.sendFrame(ws, terminalId, item)) return
+      if (!this.sendFrame(ws, terminalId, item, attachRequestId)) return
       attachment.lastSeq = Math.max(attachment.lastSeq, item.seqEnd)
     }
 
@@ -423,17 +428,28 @@ export class TerminalStreamBroker {
     return true
   }
 
-  private sendFrame(ws: LiveWebSocket, terminalId: string, frame: ReplayFrame): boolean {
+  private sendFrame(
+    ws: LiveWebSocket,
+    terminalId: string,
+    frame: ReplayFrame,
+    attachRequestId?: string,
+  ): boolean {
     return this.safeSend(ws, {
       type: 'terminal.output',
       terminalId,
       seqStart: frame.seqStart,
       seqEnd: frame.seqEnd,
       data: frame.data,
+      ...(attachRequestId ? { attachRequestId } : {}),
     })
   }
 
-  private sendGap(ws: LiveWebSocket, terminalId: string, gap: GapEvent): boolean {
+  private sendGap(
+    ws: LiveWebSocket,
+    terminalId: string,
+    gap: GapEvent,
+    attachRequestId?: string,
+  ): boolean {
     this.perfEventLogger('terminal_stream_gap', {
       terminalId,
       connectionId: ws.connectionId,
@@ -448,6 +464,7 @@ export class TerminalStreamBroker {
       fromSeq: gap.fromSeq,
       toSeq: gap.toSeq,
       reason: gap.reason,
+      ...(attachRequestId ? { attachRequestId } : {}),
     })
   }
 

@@ -1077,7 +1077,7 @@ export class WsHandler {
       }
 
       case 'terminal.attach': {
-        const attached = await this.terminalStreamBroker.attach(ws, m.terminalId, m.sinceSeq)
+        const attached = await this.terminalStreamBroker.attach(ws, m.terminalId, m.sinceSeq, m.attachRequestId)
         if (!attached) {
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Unknown terminalId', terminalId: m.terminalId })
           return

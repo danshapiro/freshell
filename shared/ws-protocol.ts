@@ -168,6 +168,7 @@ export const TerminalAttachSchema = z.object({
   type: z.literal('terminal.attach'),
   terminalId: z.string().min(1),
   sinceSeq: z.number().int().nonnegative().optional(),
+  attachRequestId: z.string().min(1).optional(),
 })
 
 export const TerminalDetachSchema = z.object({
@@ -398,6 +399,7 @@ export type TerminalAttachReadyMessage = {
   headSeq: number
   replayFromSeq: number
   replayToSeq: number
+  attachRequestId?: string
 }
 
 export type TerminalDetachedMessage = {
@@ -417,6 +419,7 @@ export type TerminalOutputMessage = {
   seqStart: number
   seqEnd: number
   data: string
+  attachRequestId?: string
 }
 
 export type TerminalOutputGapMessage = {
@@ -425,6 +428,7 @@ export type TerminalOutputGapMessage = {
   fromSeq: number
   toSeq: number
   reason: 'queue_overflow' | 'replay_window_exceeded'
+  attachRequestId?: string
 }
 
 export type TerminalTitleUpdatedMessage = {
