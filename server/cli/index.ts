@@ -5,6 +5,7 @@ import { writeError, writeJson, writeText } from './output.js'
 import { resolveConfig } from './config.js'
 import { resolveTarget } from './targets.js'
 import { runCommand as sendKeysCommand } from './commands/sendKeys.js'
+import { partitionSendKeysArgs } from './send-keys-args.js'
 
 type Flags = Record<string, string | boolean>
 
@@ -376,9 +377,11 @@ async function main() {
       return
     }
     case 'send-keys': {
-      let target: string | undefined = (getFlag(flags, 't', 'target', 'pane') as string | undefined) || args[0]
+      const targetFromFlag = getFlag(flags, 't', 'target', 'pane') as string | undefined
+      const parsedSendKeys = partitionSendKeysArgs(args, targetFromFlag)
+      let target: string | undefined = parsedSendKeys.target
       const literal = isTruthy(getFlag(flags, 'l', 'literal'))
-      const keyArgs = target ? args.slice(1) : args
+      const keyArgs = parsedSendKeys.keyArgs
       if (!target) {
         const resolved = await resolvePaneTarget(client, undefined)
         target = resolved.pane?.id

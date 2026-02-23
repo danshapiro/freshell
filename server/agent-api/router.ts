@@ -157,22 +157,42 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
   })
 
   router.get('/panes/:id/capture', (req, res) => {
-    const paneId = req.params.id
-    let terminalId = layoutStore.resolvePaneToTerminal?.(paneId)
-    if (!terminalId && layoutStore.resolveTarget) {
-      const target = layoutStore.resolveTarget(paneId)
-      if (target?.paneId) terminalId = layoutStore.resolvePaneToTerminal?.(target.paneId)
-    }
+    const rawTarget = req.params.id
+    const resolved = resolvePaneTarget(rawTarget)
+    const paneId = resolved.paneId || rawTarget
+    const paneSnapshot = layoutStore.getPaneSnapshot?.(paneId)
+    let terminalId = paneSnapshot?.terminalId || layoutStore.resolvePaneToTerminal?.(paneId)
     const term = terminalId ? registry.get?.(terminalId) : undefined
-    if (!term) return res.status(404).json(fail('terminal not found'))
 
     const rawStart = req.query.S
     const start = typeof rawStart === 'string' ? Number(rawStart) : undefined
     const joinLines = req.query.J === 'true' || req.query.J === '1'
     const includeAnsi = req.query.e === 'true' || req.query.e === '1'
 
-    const output = renderCapture(term.buffer.snapshot(), { includeAnsi, joinLines, start })
-    res.type('text/plain').send(output)
+    if (term) {
+      const output = renderCapture(term.buffer.snapshot(), { includeAnsi, joinLines, start })
+      return res.type('text/plain').send(output)
+    }
+
+    if (paneSnapshot?.kind === 'editor') {
+      const editorBuffer = typeof paneSnapshot.paneContent?.content === 'string'
+        ? paneSnapshot.paneContent.content
+        : ''
+      const output = renderCapture(editorBuffer, { includeAnsi, joinLines, start })
+      return res.type('text/plain').send(output)
+    }
+
+    if (paneSnapshot?.kind && paneSnapshot.kind !== 'terminal') {
+      return res.status(422).json(
+        fail(`pane kind "${paneSnapshot.kind}" does not support capture-pane; use screenshot-pane`),
+      )
+    }
+
+    if (terminalId || paneSnapshot?.kind === 'terminal') {
+      return res.status(404).json(fail('terminal not found'))
+    }
+
+    return res.status(404).json(fail('pane not found'))
   })
 
   router.get('/panes/:id/wait-for', async (req, res) => {

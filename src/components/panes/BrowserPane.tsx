@@ -18,6 +18,50 @@ interface BrowserPaneProps {
 
 const MAX_HISTORY_SIZE = 50
 
+type BrowserNavigationState = {
+  history: string[]
+  index: number
+}
+
+function appendHistoryEntry(
+  history: string[],
+  historyIndex: number,
+  nextUrl: string,
+): BrowserNavigationState {
+  let nextHistory = [...history.slice(0, historyIndex + 1), nextUrl]
+  let nextIndex = nextHistory.length - 1
+
+  if (nextHistory.length > MAX_HISTORY_SIZE) {
+    const excess = nextHistory.length - MAX_HISTORY_SIZE
+    nextHistory = nextHistory.slice(excess)
+    nextIndex = nextIndex - excess
+  }
+
+  return { history: nextHistory, index: nextIndex }
+}
+
+function syncNavigationToUrl(
+  history: string[],
+  historyIndex: number,
+  nextUrl: string,
+): BrowserNavigationState {
+  if (!nextUrl) {
+    return { history: [], index: -1 }
+  }
+
+  const activeUrl = history[historyIndex] || ''
+  if (activeUrl === nextUrl) {
+    return { history, index: historyIndex }
+  }
+
+  const existingIndex = history.lastIndexOf(nextUrl)
+  if (existingIndex >= 0) {
+    return { history, index: existingIndex }
+  }
+
+  return appendHistoryEntry(history, historyIndex, nextUrl)
+}
+
 // Convert file:// URLs to the /local-file API endpoint for iframe loading
 function toIframeSrc(url: string): string {
   if (url.startsWith('file://')) {
@@ -97,8 +141,13 @@ export default function BrowserPane({ paneId, tabId, url, devToolsOpen }: Browse
   const [inputUrl, setInputUrl] = useState(url)
   const [isLoading, setIsLoading] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
-  const [history, setHistory] = useState<string[]>(url ? [url] : [])
-  const [historyIndex, setHistoryIndex] = useState(url ? 0 : -1)
+  const [navigation, setNavigation] = useState<BrowserNavigationState>(() => ({
+    history: url ? [url] : [],
+    index: url ? 0 : -1,
+  }))
+
+  const history = navigation.history
+  const historyIndex = navigation.index
 
   // Port forwarding state
   const [resolvedSrc, setResolvedSrc] = useState<string | null>(null)
@@ -107,6 +156,28 @@ export default function BrowserPane({ paneId, tabId, url, devToolsOpen }: Browse
   const [forwardRetryKey, setForwardRetryKey] = useState(0)
 
   const currentUrl = history[historyIndex] || ''
+
+  useEffect(() => {
+    const previousUrl = currentUrl
+    const { history: syncedHistory, index: syncedIndex } = syncNavigationToUrl(history, historyIndex, url)
+
+    if (syncedHistory !== history || syncedIndex !== historyIndex) {
+      setNavigation({ history: syncedHistory, index: syncedIndex })
+    }
+
+    setInputUrl(url)
+
+    if (!url) {
+      setLoadError(null)
+      setIsLoading(false)
+      return
+    }
+
+    if (url !== previousUrl) {
+      setLoadError(null)
+      setIsLoading(true)
+    }
+  }, [url])
 
   // Resolve the iframe src: port-forward localhost URLs when remote, else direct
   useEffect(() => {
@@ -173,19 +244,8 @@ export default function BrowserPane({ paneId, tabId, url, devToolsOpen }: Browse
     setIsLoading(true)
     setLoadError(null)
 
-    // Update history, limiting to MAX_HISTORY_SIZE entries
-    let newHistory = [...history.slice(0, historyIndex + 1), fullUrl]
-    let newIndex = newHistory.length - 1
-
-    // Truncate old entries if history exceeds max size
-    if (newHistory.length > MAX_HISTORY_SIZE) {
-      const excess = newHistory.length - MAX_HISTORY_SIZE
-      newHistory = newHistory.slice(excess)
-      newIndex = newIndex - excess
-    }
-
-    setHistory(newHistory)
-    setHistoryIndex(newIndex)
+    const { history: nextHistory, index: nextIndex } = appendHistoryEntry(history, historyIndex, fullUrl)
+    setNavigation({ history: nextHistory, index: nextIndex })
 
     // Persist to Redux
     dispatch(updatePaneContent({
@@ -198,7 +258,7 @@ export default function BrowserPane({ paneId, tabId, url, devToolsOpen }: Browse
   const goBack = useCallback(() => {
     if (historyIndex > 0) {
       const newIndex = historyIndex - 1
-      setHistoryIndex(newIndex)
+      setNavigation({ history, index: newIndex })
       setInputUrl(history[newIndex])
       setLoadError(null)
       dispatch(updatePaneContent({
@@ -212,7 +272,7 @@ export default function BrowserPane({ paneId, tabId, url, devToolsOpen }: Browse
   const goForward = useCallback(() => {
     if (historyIndex < history.length - 1) {
       const newIndex = historyIndex + 1
-      setHistoryIndex(newIndex)
+      setNavigation({ history, index: newIndex })
       setInputUrl(history[newIndex])
       setLoadError(null)
       dispatch(updatePaneContent({

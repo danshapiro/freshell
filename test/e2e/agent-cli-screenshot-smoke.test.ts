@@ -185,6 +185,14 @@ describe('agent cli screenshot smoke', () => {
       ])
       expect(editorSplit.status).toBe('ok')
       const editorPaneId = editorSplit.data.paneId
+      server.layoutStore.attachPaneContent(tabId, editorPaneId, {
+        kind: 'editor',
+        filePath: editorPath,
+        language: 'plaintext',
+        readOnly: false,
+        content: `${editorCanary}\nline 2\n`,
+        viewMode: 'source',
+      })
 
       const browserSplit = await runCliJson<{ status: string; data: { paneId: string } }>(server.url, [
         'split-pane',
@@ -206,8 +214,9 @@ describe('agent cli screenshot smoke', () => {
 
       const literalSend = await runCliJson<{ status: string }>(server.url, [
         'send-keys',
+        '-t',
         terminalPaneId,
-        '--literal=true',
+        '-l',
         `echo ${termCanary}`,
       ])
       expect(literalSend.status).toBe('ok')
@@ -221,6 +230,9 @@ describe('agent cli screenshot smoke', () => {
       const captured = await runCli(server.url, ['capture-pane', '-t', terminalPaneId, '-S', '-20'])
       expect(captured.code).toBe(0)
       expect(captured.stdout).toContain(termCanary)
+      const capturedEditor = await runCli(server.url, ['capture-pane', '-t', editorPaneId, '-S', '-20'])
+      expect(capturedEditor.code).toBe(0)
+      expect(capturedEditor.stdout).toContain(editorCanary)
 
       const layoutSnapshot = (server.layoutStore as any).snapshot
       const root = layoutSnapshot.layouts[tabId]
