@@ -175,6 +175,9 @@ const explicitY = parseOptionalNumber(req.body?.y)
 const boundedX = explicitX === undefined ? undefined : clampPercent(explicitX)
 const boundedY = explicitY === undefined ? undefined : clampPercent(explicitY)
 const hasExplicitTuple = Array.isArray(req.body?.sizes)
+const explicitSizes = hasExplicitTuple
+  ? [parseOptionalNumber(req.body.sizes[0]), parseOptionalNumber(req.body.sizes[1])] as const
+  : undefined
 
 if (!hasExplicitTuple && boundedX === undefined && boundedY === undefined) {
   return res.status(400).json(fail('x or y required when sizes[] is not provided'))
@@ -189,7 +192,10 @@ const nextX = boundedX
 const nextY = boundedY
   ?? (boundedX !== undefined ? (current?.[1] ?? (100 - boundedX)) : (current?.[1] ?? 50))
 
-const normalizedSizes: [number, number] = [nextX, nextY]
+const normalizedSizes: [number, number] =
+  hasExplicitTuple
+    ? [clampPercent(explicitSizes?.[0] ?? current?.[0] ?? 50), clampPercent(explicitSizes?.[1] ?? current?.[1] ?? 50)]
+    : [nextX, nextY]
 const result = layoutStore.resizePane(resolved.tabId, resolved.splitId, normalizedSizes)
 ```
 
@@ -307,6 +313,11 @@ type ClientState = {
   supportsUiScreenshotV1: boolean
 }
 
+const state: ClientState = {
+  // ...existing fields
+  supportsUiScreenshotV1: false,
+}
+
 state.supportsUiScreenshotV1 = !!m.capabilities?.uiScreenshotV1
 
 private findTargetUiSocket(
@@ -362,7 +373,7 @@ Expected: PASS.
 
 ```bash
 git add shared/ws-protocol.ts src/lib/ws-client.ts server/ws-handler.ts server/agent-api/router.ts test/server/ws-protocol.test.ts test/server/agent-screenshot-api.test.ts test/unit/client/lib/ws-client.test.ts
-git commit -m "fix(screenshot): fail fast without capture-capable ui client"
+git commit -m "fix(screenshot): negotiate ui capture capability and map api errors"
 ```
 
 ## Chunk 4: End-to-end verification, manual validation, and review gates
