@@ -12,6 +12,17 @@ const KEYMAP: Record<string, string> = {
   SPACE: ' ',
 }
 
+function translateCtrlLetterChord(token: string): string | undefined {
+  const match = /^C-([A-Z])$/.exec(token)
+  if (!match) return undefined
+  return String.fromCharCode(match[1].charCodeAt(0) - 64)
+}
+
 export function translateKeys(keys: string[]) {
-  return keys.map((key) => KEYMAP[key.toUpperCase()] ?? key).join('')
+  return keys.map((key) => {
+    const upper = key.toUpperCase()
+    const mapped = KEYMAP[upper]
+    if (mapped) return mapped
+    return translateCtrlLetterChord(upper) ?? key
+  }).join('')
 }
