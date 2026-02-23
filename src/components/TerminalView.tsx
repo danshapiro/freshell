@@ -1346,13 +1346,21 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             return
           }
 
-          const reason = msg.reason === 'replay_window_exceeded'
-            ? 'reconnect window exceeded'
-            : 'slow link backlog'
-          try {
-            term.writeln(`\r\n[Output gap ${msg.fromSeq}-${msg.toSeq}: ${reason}]\r\n`)
-          } catch {
-            // disposed
+          const currentAttach = currentAttachRef.current
+          const suppressHydrationReplayMiss =
+            msg.reason === 'replay_window_exceeded'
+            && currentAttach?.terminalId === msg.terminalId
+            && currentAttach.intent === 'viewport_hydrate'
+
+          if (!suppressHydrationReplayMiss) {
+            const reason = msg.reason === 'replay_window_exceeded'
+              ? 'reconnect window exceeded'
+              : 'slow link backlog'
+            try {
+              term.writeln(`\r\n[Output gap ${msg.fromSeq}-${msg.toSeq}: ${reason}]\r\n`)
+            } catch {
+              // disposed
+            }
           }
           const previousSeqState = seqStateRef.current
           const nextSeqState = onOutputGap(previousSeqState, { fromSeq: msg.fromSeq, toSeq: msg.toSeq })

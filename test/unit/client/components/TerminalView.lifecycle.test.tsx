@@ -2016,6 +2016,40 @@ describe('TerminalView lifecycle updates', () => {
       expect(writes).not.toContain('overlap')
     })
 
+    it('suppresses replay_window_exceeded banner during viewport_hydrate attach generation', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-hydrate-gap',
+        clearSends: false,
+      })
+
+      const attach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      term.writeln.mockClear()
+      messageHandler!({
+        type: 'terminal.output.gap',
+        terminalId,
+        fromSeq: 1,
+        toSeq: 50,
+        reason: 'replay_window_exceeded',
+        attachRequestId: attach!.attachRequestId,
+      } as any)
+
+      expect(term.writeln).not.toHaveBeenCalled()
+
+      wsMocks.send.mockClear()
+      reconnectHandler?.()
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 50,
+        attachRequestId: expect.any(String),
+      }))
+    })
+
     it('renders terminal.output.gap marker and advances sinceSeq for subsequent attach', async () => {
       const { terminalId, term } = await renderTerminalHarness({ status: 'running', terminalId: 'term-v2-gap' })
 
@@ -2089,7 +2123,7 @@ describe('TerminalView lifecycle updates', () => {
         messageHandler!({ type: 'terminal.output', terminalId, seqStart: 13, seqEnd: 13, data: 'LIVE' })
       })
 
-      expect(term.writeln).toHaveBeenCalledWith(expect.stringContaining('Output gap 1-8: reconnect window exceeded'))
+      expect(term.writeln).not.toHaveBeenCalled()
       const writes = term.write.mock.calls.map(([data]: [string]) => String(data)).join('')
       expect(writes).toContain('TAIL')
       expect(writes).toContain('LIVE')

@@ -283,14 +283,25 @@ describe('settings remount scrollback hydration (e2e)', () => {
       store.dispatch(setActiveTab('tab-2'))
     })
 
+    let hiddenHydrationAttachRequestId: string | undefined
     await waitFor(() => {
-      expect(wsHarness.send).toHaveBeenCalledWith(expect.objectContaining({
-        type: 'terminal.attach',
-        terminalId: 'term-hidden',
-        sinceSeq: 0,
-      }))
+      const attachCalls = wsHarness.send.mock.calls
+        .map(([msg]) => msg)
+        .filter((msg) => msg?.type === 'terminal.attach')
+      const hiddenHydrationAttach = attachCalls.find((msg) => msg?.terminalId === 'term-hidden' && msg?.sinceSeq === 0)
+      expect(hiddenHydrationAttach).toBeDefined()
+      expect(hiddenHydrationAttach?.attachRequestId).toEqual(expect.any(String))
+      hiddenHydrationAttachRequestId = hiddenHydrationAttach?.attachRequestId
     })
 
+    wsHarness.emit({
+      type: 'terminal.output.gap',
+      terminalId: 'term-hidden',
+      fromSeq: 1,
+      toSeq: 8,
+      reason: 'replay_window_exceeded',
+      attachRequestId: hiddenHydrationAttachRequestId,
+    })
     wsHarness.emit({
       type: 'terminal.attach.ready',
       terminalId: 'term-hidden',
@@ -373,6 +384,7 @@ describe('settings remount scrollback hydration (e2e)', () => {
         type: 'terminal.attach',
         terminalId: 'term-hidden',
         sinceSeq: 0,
+        attachRequestId: expect.any(String),
       }))
     })
 
