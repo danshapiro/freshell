@@ -133,16 +133,18 @@ Update broker attachment tracking in `server/terminal-stream/types.ts`:
 ```ts
 export type BrokerClientAttachment = {
   ws: LiveWebSocket
-  mode: 'attaching' | 'live'
+  mode: BrokerClientMode
   queue: ClientOutputQueue
   attachStaging: ReplayFrame[]
   lastSeq: number
   flushTimer: NodeJS.Timeout | null
-  catastrophicClosed: boolean
-  activeAttachRequestId?: string
   catastrophicSince?: number
+  catastrophicClosed?: boolean
+  activeAttachRequestId?: string
 }
 ```
+
+Do not broaden this type beyond adding `activeAttachRequestId`; keep existing optionality/aliases to avoid unrelated refactor churn.
 
 Update broker + ws handler signatures:
 
@@ -238,10 +240,10 @@ git commit -m "feat(terminal-stream): tag attach replay/output payloads with att
 
 **Step 1: Write failing test for same-socket reattach supersession**
 
-Add a test proving reattach to same terminal/socket replaces the active generation and does not keep stale queued frames:
+Add a test proving reattach to same terminal/socket replaces the active generation and does not re-flush stale queued frames (duplicate delivery bug):
 
 ```ts
-it('superseding attach on same socket clears stale queued frames and switches attachRequestId', async () => {
+it('superseding attach on same socket clears stale queued frames and avoids duplicate old-frame delivery', async () => {
   const registry = new FakeBrokerRegistry()
   const broker = new TerminalStreamBroker(registry as any, vi.fn())
   registry.createTerminal('term-supersede')
@@ -259,7 +261,8 @@ it('superseding attach on same socket clears stale queued frames and switches at
     .filter((m) => m?.type === 'terminal.output')
 
   expect(outputs.some((m) => m.data.includes('new-frame') && m.attachRequestId === 'attach-new')).toBe(true)
-  expect(outputs.some((m) => m.data.includes('old-frame') && m.attachRequestId === 'attach-old')).toBe(false)
+  expect(outputs.filter((m) => String(m.data).includes('old-frame'))).toHaveLength(1)
+  expect(outputs.some((m) => String(m.data).includes('old-frame') && m.attachRequestId === 'attach-new')).toBe(true)
 
   broker.close()
 })
@@ -273,7 +276,7 @@ Run:
 npm run test -- test/unit/server/ws-handler-backpressure.test.ts -t "superseding attach"
 ```
 
-Expected: FAIL because queue/reset behavior is not implemented.
+Expected: FAIL before the fix because stale queued `old-frame` is delivered a second time after superseding attach.
 
 **Step 3: Implement queue reset support and call it on attach start**
 
@@ -463,7 +466,12 @@ const isCurrentAttachMessage = (msg: { terminalId?: string; attachRequestId?: st
   const current = currentAttachRef.current
   if (!current) return true
   if (msg.terminalId && msg.terminalId !== current.terminalId) return true
-  if (!msg.attachRequestId) return false
+  if (!msg.attachRequestId) {
+    // Contract: same-terminal stream messages must carry attachRequestId once
+    // attach generation filtering is active (except immediately after terminal.created
+    // where currentAttachRef is cleared).
+    return false
+  }
   return msg.attachRequestId === current.requestId
 }
 ```
@@ -550,6 +558,7 @@ it('suppresses replay_window_exceeded banner during viewport_hydrate attach gene
     .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
 
   term.writeln.mockClear()
+  const writelnCallsBefore = term.writeln.mock.calls.length
 
   messageHandler!({
     type: 'terminal.output.gap',
@@ -560,7 +569,7 @@ it('suppresses replay_window_exceeded banner during viewport_hydrate attach gene
     attachRequestId: attach!.attachRequestId,
   } as any)
 
-  expect(term.writeln).not.toHaveBeenCalledWith(expect.stringContaining('reconnect window exceeded'))
+  expect(term.writeln.mock.calls.length).toBe(writelnCallsBefore)
 })
 ```
 
@@ -712,14 +721,14 @@ git commit -m "test(terminal-stream): lock attachRequestId generation continuity
 
 ---
 
-### Task 6: Full Verification + Cleanup Refactor
+### Task 6: Full Verification + Coverage Hardening Refactor
 
 **Files:**
 - Modify: `test/unit/client/lib/terminal-attach-seq-state.test.ts`
 - Modify: `src/lib/terminal-attach-seq-state.ts` (if needed for test clarity/hardening)
 - Modify: `src/components/TerminalView.tsx` (small cleanup only)
 
-**Step 1: Add failing unit test documenting replay-window overlap assumptions**
+**Step 1: Add coverage-hardening unit test documenting replay-window overlap assumptions**
 
 Add a unit test for merged frame behavior so the assumption is explicit and guarded:
 
@@ -736,7 +745,7 @@ it('accepts merged frames that overlap pending replay when they advance lastSeq'
 })
 ```
 
-**Step 2: Run test to verify current behavior (red or flaky expectation mismatch)**
+**Step 2: Run test and record baseline behavior**
 
 Run:
 
@@ -744,7 +753,7 @@ Run:
 npm run test -- test/unit/client/lib/terminal-attach-seq-state.test.ts
 ```
 
-Expected: If failing, adjust implementation; if passing, keep as coverage hardening.
+Expected: This test may already pass. That is acceptable here because this task is explicit coverage hardening, not initial behavior discovery.
 
 **Step 3: Refactor for clarity without behavior change**
 
