@@ -131,25 +131,55 @@ const parseOptionalNumber = (value: unknown): number | undefined => {
   return Number.isFinite(n) ? n : undefined
 }
 
+const clampPercent = (value: number) => Math.min(99, Math.max(1, value))
+
+type ResolvedResizeTarget = {
+  tabId?: string
+  splitId: string
+  message?: string
+}
+
+function resolveResizeTarget(layoutStore: any, rawTarget: string, requestedTabId?: string): ResolvedResizeTarget {
+  const directSizes = layoutStore.getSplitSizes?.(requestedTabId, rawTarget)
+  if (Array.isArray(directSizes)) {
+    return { tabId: requestedTabId, splitId: rawTarget }
+  }
+
+  if (layoutStore.resolveTarget && layoutStore.findSplitForPane) {
+    const resolved = layoutStore.resolveTarget(rawTarget)
+    if (resolved?.paneId) {
+      const parent = layoutStore.findSplitForPane(resolved.paneId)
+      if (parent?.splitId) {
+        return { tabId: parent.tabId, splitId: parent.splitId, message: 'pane matched; resized parent split' }
+      }
+    }
+  }
+
+  return { tabId: requestedTabId, splitId: rawTarget, message: 'split not found' }
+}
+
 // 1) Resolve target split first (same flow as existing route):
 //    a) treat raw target as split id
 //    b) if not found, resolve target -> pane -> parent split
 const resolved = resolveResizeTarget(layoutStore, rawTarget, req.body?.tabId)
 // resolved => { tabId?: string, splitId: string, message?: string }
+if (resolved.message === 'split not found') return res.json(approx(undefined, 'split not found'))
 
 // 2) Read current split sizes from the resolved split id (not raw target).
 const current = layoutStore.getSplitSizes?.(resolved.tabId, resolved.splitId)
 const explicitX = parseOptionalNumber(req.body?.x)
 const explicitY = parseOptionalNumber(req.body?.y)
+const boundedX = explicitX === undefined ? undefined : clampPercent(explicitX)
+const boundedY = explicitY === undefined ? undefined : clampPercent(explicitY)
 
 // 3) Normalize missing axis:
 //    - preserve existing axis when available
 //    - otherwise derive complement to 100 when only one axis provided
 //    - final fallback remains 50/50
-const nextX = explicitX
-  ?? (explicitY !== undefined ? (current?.[0] ?? (100 - explicitY)) : (current?.[0] ?? 50))
-const nextY = explicitY
-  ?? (explicitX !== undefined ? (current?.[1] ?? (100 - explicitX)) : (current?.[1] ?? 50))
+const nextX = boundedX
+  ?? (boundedY !== undefined ? (current?.[0] ?? (100 - boundedY)) : (current?.[0] ?? 50))
+const nextY = boundedY
+  ?? (boundedX !== undefined ? (current?.[1] ?? (100 - boundedX)) : (current?.[1] ?? 50))
 
 const normalizedSizes: [number, number] = [nextX, nextY]
 const result = layoutStore.resizePane(resolved.tabId, resolved.splitId, normalizedSizes)
@@ -255,11 +285,23 @@ function createScreenshotError(code: ScreenshotErrorCode, message: string): Erro
   return err
 }
 
-type ClientState = {
-  supportsUiScreenshotV1: boolean
-}
-
+// Add this field to the existing ClientState type in ws-handler.ts.
+// Do not replace the full type.
 state.supportsUiScreenshotV1 = !!m.capabilities?.uiScreenshotV1
+
+private findTargetUiSocket(
+  preferredConnectionId?: string,
+  opts?: { requireScreenshotCapability?: boolean },
+) {
+  const authenticated = [...this.connections].filter((conn) => {
+    if (conn.readyState !== WebSocket.OPEN) return false
+    const state = this.clientStates.get(conn)
+    if (!state?.authenticated) return false
+    if (opts?.requireScreenshotCapability && !state.supportsUiScreenshotV1) return false
+    return true
+  })
+  // keep existing preferred-id and newest-connection tie-break behavior
+}
 
 const targetWs = this.findTargetUiSocket(preferredConnectionId, {
   requireScreenshotCapability: true,
@@ -281,6 +323,9 @@ const code = (err as { code?: string })?.code
 if (code === 'NO_SCREENSHOT_CLIENT') return res.status(503).json(fail(err.message))
 if (code === 'SCREENSHOT_TIMEOUT') {
   return res.status(504).json(fail('Timed out waiting for UI screenshot response; ensure a browser UI tab is connected and retry.'))
+}
+if (code === 'SCREENSHOT_CONNECTION_CLOSED') {
+  return res.status(503).json(fail('UI connection closed before screenshot response; ensure a browser UI tab is connected and retry.'))
 }
 ```
 
