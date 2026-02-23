@@ -46,6 +46,58 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
     return { paneId: raw }
   }
 
+  const parseOptionalNumber = (value: unknown): number | undefined => {
+    const n = Number(value)
+    return Number.isFinite(n) ? n : undefined
+  }
+
+  const isValidPercent = (value: number) => Number.isFinite(value) && value >= 0 && value <= 100
+  const clampPercent = (value: number) => Math.min(99, Math.max(1, value))
+  const normalizePairToHundred = (a: number, b: number): [number, number] => {
+    const left = clampPercent(a)
+    const right = clampPercent(b)
+    const total = left + right
+    const normalizedLeft = clampPercent(Math.round((left / total) * 100))
+    return [normalizedLeft, 100 - normalizedLeft]
+  }
+
+  type ResizeLayoutStore = {
+    getSplitSizes?: (tabId: string | undefined, splitId: string) => [number, number] | undefined
+    resolveTarget?: (target: string) => { paneId?: string }
+    findSplitForPane?: (paneId: string) => { tabId: string; splitId: string } | undefined
+  }
+
+  type ResolvedResizeTarget = {
+    tabId?: string
+    splitId: string
+    message?: string
+  }
+
+  const resolveResizeTarget = (store: ResizeLayoutStore, rawTarget: string, requestedTabId?: string): ResolvedResizeTarget => {
+    // Backward compatibility for simple mocks in tests: if we cannot inspect splits,
+    // assume the provided target is already a split id.
+    if (!store.getSplitSizes) {
+      return { tabId: requestedTabId, splitId: rawTarget }
+    }
+
+    const directSizes = store.getSplitSizes(requestedTabId, rawTarget)
+    if (Array.isArray(directSizes)) {
+      return { tabId: requestedTabId, splitId: rawTarget }
+    }
+
+    if (store.resolveTarget && store.findSplitForPane) {
+      const resolved = store.resolveTarget(rawTarget)
+      if (resolved?.paneId) {
+        const parent = store.findSplitForPane(resolved.paneId)
+        if (parent?.splitId) {
+          return { tabId: parent.tabId, splitId: parent.splitId, message: 'pane matched; resized parent split' }
+        }
+      }
+    }
+
+    return { tabId: requestedTabId, splitId: rawTarget, message: 'split not found' }
+  }
+
   router.post('/tabs', (req, res) => {
     const { name, mode, shell, cwd, browser, editor, resumeSessionId } = req.body || {}
     const wantsBrowser = !!browser
@@ -471,28 +523,71 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
 
   router.post('/panes/:id/resize', (req, res) => {
     const rawTarget = req.params.id
-    const sizes = Array.isArray(req.body?.sizes) ? req.body.sizes : [req.body?.x ?? 50, req.body?.y ?? 50]
-    const values = sizes.map((v: any) => Number(v))
-    const normalizedSizes: [number, number] = [values[0] || 50, values[1] || 50]
-
-    let splitId = rawTarget
-    let result = layoutStore.resizePane(req.body?.tabId, splitId, normalizedSizes)
-    let message = result?.message
-
-    if (message === 'split not found' && layoutStore.findSplitForPane && layoutStore.resolveTarget) {
-      const resolved = layoutStore.resolveTarget(rawTarget)
-      if (resolved?.paneId) {
-        const parent = layoutStore.findSplitForPane(resolved.paneId)
-        if (parent?.splitId) {
-          splitId = parent.splitId
-          result = layoutStore.resizePane(parent.tabId, splitId, normalizedSizes)
-          message = 'pane matched; resized parent split'
-        }
-      }
+    const resolved = resolveResizeTarget(layoutStore as ResizeLayoutStore, rawTarget, req.body?.tabId)
+    if (resolved.message === 'split not found') {
+      return res.json(ok({ message: 'split not found' }, 'split not found'))
     }
 
+    const current = layoutStore.getSplitSizes?.(resolved.tabId, resolved.splitId)
+    const body = req.body || {}
+    const explicitX = parseOptionalNumber(body.x)
+    const explicitY = parseOptionalNumber(body.y)
+    const hasExplicitTuple = Array.isArray(body.sizes)
+
+    if (hasExplicitTuple && body.sizes.length !== 2) {
+      return res.status(400).json(fail('sizes must contain exactly two values'))
+    }
+
+    const explicitTuple = hasExplicitTuple
+      ? [parseOptionalNumber(body.sizes[0]), parseOptionalNumber(body.sizes[1])] as const
+      : undefined
+
+    if (hasExplicitTuple && (explicitTuple?.[0] === undefined || explicitTuple?.[1] === undefined)) {
+      return res.status(400).json(fail('sizes values must be numeric'))
+    }
+    if (hasExplicitTuple && (!isValidPercent(explicitTuple[0] as number) || !isValidPercent(explicitTuple[1] as number))) {
+      return res.status(400).json(fail('sizes values must be within 0..100'))
+    }
+
+    const hasX = Object.prototype.hasOwnProperty.call(body, 'x')
+    const hasY = Object.prototype.hasOwnProperty.call(body, 'y')
+
+    if (hasX && explicitX === undefined) {
+      return res.status(400).json(fail('x must be numeric'))
+    }
+    if (hasY && explicitY === undefined) {
+      return res.status(400).json(fail('y must be numeric'))
+    }
+    if (explicitX !== undefined && !isValidPercent(explicitX)) {
+      return res.status(400).json(fail('x must be within 0..100'))
+    }
+    if (explicitY !== undefined && !isValidPercent(explicitY)) {
+      return res.status(400).json(fail('y must be within 0..100'))
+    }
+
+    const boundedX = explicitX === undefined ? undefined : clampPercent(explicitX)
+    const boundedY = explicitY === undefined ? undefined : clampPercent(explicitY)
+
+    const normalizedSizes: [number, number] = hasExplicitTuple
+      ? normalizePairToHundred(
+          explicitTuple?.[0] ?? current?.[0] ?? 50,
+          explicitTuple?.[1] ?? current?.[1] ?? 50,
+        )
+      : boundedX !== undefined && boundedY !== undefined
+        ? normalizePairToHundred(boundedX, boundedY)
+        : boundedX !== undefined
+          ? normalizePairToHundred(boundedX, 100 - boundedX)
+          : boundedY !== undefined
+            ? normalizePairToHundred(100 - boundedY, boundedY)
+            : normalizePairToHundred(current?.[0] ?? 50, current?.[1] ?? 50)
+
+    const result = layoutStore.resizePane(resolved.tabId, resolved.splitId, normalizedSizes)
+    const message = resolved.message || result?.message
     if (result?.tabId) {
-      wsHandler?.broadcastUiCommand({ command: 'pane.resize', payload: { tabId: result.tabId, splitId, sizes: normalizedSizes } })
+      wsHandler?.broadcastUiCommand({
+        command: 'pane.resize',
+        payload: { tabId: result.tabId, splitId: resolved.splitId, sizes: normalizedSizes },
+      })
     }
     res.json(ok(result, message || result?.message || 'pane resized'))
   })

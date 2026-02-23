@@ -69,6 +69,12 @@ export class LayoutStore {
     return this.findParentSplitId(left, paneId) || this.findParentSplitId(right, paneId)
   }
 
+  private findSplitById(node: any, splitId: string): any | undefined {
+    if (!node || node.type !== 'split') return undefined
+    if (node.id === splitId) return node
+    return this.findSplitById(node.children?.[0], splitId) || this.findSplitById(node.children?.[1], splitId)
+  }
+
   private buildHorizontalRow(leaves: Leaf[]): any {
     if (leaves.length === 1) return leaves[0]
     if (leaves.length === 2) {
@@ -209,6 +215,23 @@ export class LayoutStore {
       const root = this.snapshot.layouts?.[tab.id]
       const splitId = this.findParentSplitId(root, paneId)
       if (splitId) return { tabId: tab.id, splitId }
+    }
+    return undefined
+  }
+
+  getSplitSizes(tabId: string | undefined, splitId: string): [number, number] | undefined {
+    if (!this.snapshot) return undefined
+    const candidateTabs = tabId ? [tabId] : this.snapshot.tabs.map((tab) => tab.id)
+    for (const candidateTabId of candidateTabs) {
+      const root = this.snapshot.layouts?.[candidateTabId]
+      const splitNode = this.findSplitById(root, splitId)
+      if (!splitNode) continue
+      const sizes = splitNode.sizes
+      if (!Array.isArray(sizes) || sizes.length !== 2) return undefined
+      const first = Number(sizes[0])
+      const second = Number(sizes[1])
+      if (!Number.isFinite(first) || !Number.isFinite(second)) return undefined
+      return [first, second]
     }
     return undefined
   }

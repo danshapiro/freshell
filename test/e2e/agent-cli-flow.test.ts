@@ -114,6 +114,34 @@ describe('cli e2e flow', () => {
     }
   })
 
+  it('normalizes resize-pane single-axis values to complementary split percentages', async () => {
+    const resizePaneCalls: Array<{ tabId?: string; splitId: string; sizes: [number, number] }> = []
+    const { url, close } = await startTestServer({
+      resolveTarget: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+      findSplitForPane: () => ({ tabId: 'tab_1', splitId: 'split_1' }),
+      getSplitSizes: (_tabId: string | undefined, splitId: string) => (
+        splitId === 'split_1' ? [72, 28] as [number, number] : undefined
+      ),
+      resizePane: (tabId: string | undefined, splitId: string, sizes: [number, number]) => {
+        resizePaneCalls.push({ tabId, splitId, sizes })
+        return { tabId: tabId || 'tab_1' }
+      },
+    })
+    try {
+      const output = await runCli(url, ['resize-pane', '-t', 'pane_1', '--y', '33'])
+      const parsed = JSON.parse(output.stdout) as { status: string }
+      expect(parsed.status).toBe('ok')
+      expect(resizePaneCalls).toHaveLength(1)
+      expect(resizePaneCalls[0]).toEqual({
+        tabId: 'tab_1',
+        splitId: 'split_1',
+        sizes: [67, 33],
+      })
+    } finally {
+      await close()
+    }
+  })
+
   it('runs screenshot-view end-to-end with required name', async () => {
     const tinyPngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO6r7gkAAAAASUVORK5CYII='
     const { url, close } = await startTestServer({}, {
