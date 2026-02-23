@@ -4,7 +4,7 @@
 
 **Goal:** Fix three operator-facing tmux-ergonomics bugs together: control-key translation in `send-keys`, single-axis `resize-pane` semantics, and screenshot API availability/timeouts when no capture-capable UI is present.
 
-**Architecture:** Keep behavior changes at protocol/command boundaries so existing UI state shape remains stable. Add explicit WebSocket screenshot capability negotiation and route-level error mapping so screenshot failures are immediate and actionable instead of timing out. For resize semantics, normalize single-axis and tuple inputs into deterministic 100-sum split percentages so automation has predictable outcomes.
+**Architecture:** Keep behavior changes at protocol/command boundaries so existing UI state shape remains stable and preserve existing non-error API envelope behavior where practical. Add explicit WebSocket screenshot capability negotiation and route-level error mapping so screenshot failures are immediate and actionable instead of timing out. For resize semantics, normalize single-value and tuple inputs into deterministic 100-sum split percentages while keeping backward-compatible `x -> sizes[0]` and `y -> sizes[1]` mapping.
 
 **Tech Stack:** TypeScript, Node/Express, WebSocket (`ws`), React WS client handshake, Vitest + supertest + e2e CLI tests.
 
@@ -144,7 +144,6 @@ const normalizePairToHundred = (a: number, b: number): [number, number] => {
   const left = clampPercent(a)
   const right = clampPercent(b)
   const total = left + right
-  if (total <= 0) return [50, 50]
   const normalizedLeft = clampPercent(Math.round((left / total) * 100))
   return [normalizedLeft, 100 - normalizedLeft]
 }
@@ -185,7 +184,7 @@ function resolveResizeTarget(layoutStore: ResizeLayoutStore, rawTarget: string, 
 //    b) if not found, resolve target -> pane -> parent split
 const resolved = resolveResizeTarget(layoutStore, rawTarget, req.body?.tabId)
 // resolved => { tabId?: string, splitId: string, message?: string }
-if (resolved.message === 'split not found') return res.status(404).json(fail('split not found'))
+if (resolved.message === 'split not found') return res.json(approx(undefined, 'split not found'))
 
 // 2) Read current split sizes from the resolved split id (not raw target).
 const current = layoutStore.getSplitSizes?.(resolved.tabId, resolved.splitId)
@@ -204,6 +203,7 @@ if (hasExplicitTuple && req.body.sizes.length !== 2) {
 
 // 3) Normalize missing axis:
 //    - always keep pair sum normalized to 100
+//    - keep legacy parameter contract: x == sizes[0], y == sizes[1]
 //    - preserve existing API compatibility when no x/y/sizes are provided
 const normalizedSizes: [number, number] = hasExplicitTuple
   ? normalizePairToHundred(
@@ -219,6 +219,8 @@ const normalizedSizes: [number, number] = hasExplicitTuple
         : normalizePairToHundred(current?.[0] ?? 50, current?.[1] ?? 50)
 const result = layoutStore.resizePane(resolved.tabId, resolved.splitId, normalizedSizes)
 ```
+
+Note: this intentionally changes single-value behavior from `[..., 50]` defaults to complementary `100 - value` normalization for issue #5.
 
 - [ ] **Step 5: Add CLI flow coverage for `resize-pane --y`**
 
@@ -365,6 +367,8 @@ const timeout = setTimeout(() => {
 
 // on connection close while waiting:
 pending.reject(createScreenshotError('SCREENSHOT_CONNECTION_CLOSED', 'UI connection closed before screenshot response'))
+// Apply the same code in ws-handler connection-close cleanup paths
+// (both socket close and server close loops), not only inside requestUiScreenshot().
 ```
 
 - [ ] **Step 8: Return clearer status codes in screenshot API route**
