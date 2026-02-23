@@ -631,6 +631,29 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
+  it('superseding attach on same socket clears stale queued frames and avoids duplicate old-frame delivery', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-supersede')
+
+    const ws = createMockWs()
+    await broker.attach(ws as any, 'term-supersede', 0, 'attach-old')
+    registry.emit('terminal.output.raw', { terminalId: 'term-supersede', data: 'old-frame', at: Date.now() })
+
+    await broker.attach(ws as any, 'term-supersede', 1, 'attach-new')
+    registry.emit('terminal.output.raw', { terminalId: 'term-supersede', data: 'new-frame', at: Date.now() })
+    vi.advanceTimersByTime(5)
+
+    const outputs = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .filter((m) => m?.type === 'terminal.output')
+
+    expect(outputs.some((m) => String(m.data).includes('new-frame') && m.attachRequestId === 'attach-new')).toBe(true)
+    expect(outputs.some((m) => String(m.data).includes('old-frame'))).toBe(false)
+
+    broker.close()
+  })
+
   it('emits terminal_stream_replay_hit, terminal_stream_queue_pressure, and terminal_stream_gap on overflow', async () => {
     const registry = new FakeBrokerRegistry()
     const perfSpy = vi.fn()

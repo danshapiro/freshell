@@ -106,9 +106,15 @@ export class TerminalStreamBroker {
     const normalizedSinceSeq = sinceSeq === undefined || sinceSeq === 0 ? 0 : sinceSeq
 
     await this.withTerminalLock(terminalId, async () => {
+      if (attachment.flushTimer) {
+        clearTimeout(attachment.flushTimer)
+        attachment.flushTimer = null
+      }
+
       attachment.mode = 'attaching'
       attachment.activeAttachRequestId = attachRequestId
       attachment.attachStaging = []
+      attachment.queue.clear()
 
       // Seed from the existing terminal buffer if this terminal predates broker wiring.
       if (terminalState.replayRing.headSeq() === 0) {

@@ -91,6 +91,12 @@ export class ClientOutputQueue {
     return this.totalBytes
   }
 
+  clear(): void {
+    this.frames = []
+    this.totalBytes = 0
+    this.pendingGap = null
+  }
+
   private evictOverflow(): void {
     while (this.totalBytes > this.maxBytes && this.frames.length > 0) {
       const dropped = this.frames.shift()
