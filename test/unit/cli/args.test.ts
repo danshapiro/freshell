@@ -42,5 +42,6 @@ it('does not treat dash-prefixed values as -p arguments outside attach', () => {
   const parsed = parseArgs(['display', '-p', '-ABC123'])
   expect(parsed.command).toBe('display')
   expect(parsed.flags.p).toBe(true)
+  // Single-dash multi-char tokens are parsed as one short key in this parser.
   expect(parsed.flags.ABC123).toBe(true)
 })
