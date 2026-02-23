@@ -107,6 +107,11 @@ it('keeps explicit sizes[] path and normalizes tuple totals to 100', async () =>
   // call POST /api/panes/<split-or-pane>/resize with { sizes: [80, 30] }
   // expect resizePane called with normalized [73, 27] (or equivalent normalized pair summing to 100)
 })
+
+it('returns 400 for non-numeric or out-of-range x/y/sizes values', async () => {
+  // examples: { x: 200 }, { y: -5 }, { sizes: ['bad', 30] }
+  // expect HTTP 400 with validation message
+})
 ```
 
 - [ ] **Step 2: Run test to verify failure**
@@ -139,6 +144,7 @@ const parseOptionalNumber = (value: unknown): number | undefined => {
   return Number.isFinite(n) ? n : undefined
 }
 
+const isValidPercent = (value: number) => Number.isFinite(value) && value >= 0 && value <= 100
 const clampPercent = (value: number) => Math.min(99, Math.max(1, value))
 const normalizePairToHundred = (a: number, b: number): [number, number] => {
   const left = clampPercent(a)
@@ -193,16 +199,31 @@ if (resolved.message === 'split not found') {
 const current = layoutStore.getSplitSizes?.(resolved.tabId, resolved.splitId)
 const explicitX = parseOptionalNumber(req.body?.x)
 const explicitY = parseOptionalNumber(req.body?.y)
-const boundedX = explicitX === undefined ? undefined : clampPercent(explicitX)
-const boundedY = explicitY === undefined ? undefined : clampPercent(explicitY)
 const hasExplicitTuple = Array.isArray(req.body?.sizes)
-const explicitTuple = hasExplicitTuple
-  ? [parseOptionalNumber(req.body.sizes[0]), parseOptionalNumber(req.body.sizes[1])]
-  : undefined
 
 if (hasExplicitTuple && req.body.sizes.length !== 2) {
   return res.status(400).json(fail('sizes must contain exactly two values'))
 }
+
+const explicitTuple = hasExplicitTuple
+  ? [parseOptionalNumber(req.body.sizes[0]), parseOptionalNumber(req.body.sizes[1])]
+  : undefined
+
+if (hasExplicitTuple && (explicitTuple?.[0] === undefined || explicitTuple?.[1] === undefined)) {
+  return res.status(400).json(fail('sizes values must be numeric'))
+}
+if (hasExplicitTuple && (!isValidPercent(explicitTuple[0] as number) || !isValidPercent(explicitTuple[1] as number))) {
+  return res.status(400).json(fail('sizes values must be within 0..100'))
+}
+if (explicitX !== undefined && !isValidPercent(explicitX)) {
+  return res.status(400).json(fail('x must be within 0..100'))
+}
+if (explicitY !== undefined && !isValidPercent(explicitY)) {
+  return res.status(400).json(fail('y must be within 0..100'))
+}
+
+const boundedX = explicitX === undefined ? undefined : clampPercent(explicitX)
+const boundedY = explicitY === undefined ? undefined : clampPercent(explicitY)
 
 // 3) Normalize missing axis:
 //    - always keep pair sum normalized to 100
@@ -216,9 +237,9 @@ const normalizedSizes: [number, number] = hasExplicitTuple
   : boundedX !== undefined && boundedY !== undefined
     ? normalizePairToHundred(boundedX, boundedY)
     : boundedX !== undefined
-      ? [boundedX, 100 - boundedX]
+      ? normalizePairToHundred(boundedX, 100 - boundedX)
       : boundedY !== undefined
-        ? [100 - boundedY, boundedY]
+        ? normalizePairToHundred(100 - boundedY, boundedY)
         : normalizePairToHundred(current?.[0] ?? 50, current?.[1] ?? 50)
 const result = layoutStore.resizePane(resolved.tabId, resolved.splitId, normalizedSizes)
 ```
@@ -413,7 +434,7 @@ git commit -m "fix(screenshot): negotiate ui capture capability and map api erro
 
 - [ ] **Step 1: Run focused e2e smoke for CLI automation path**
 
-Run: `npx vitest run test/e2e/agent-cli-screenshot-smoke.test.ts`
+Run: `test -f test/e2e/agent-cli-screenshot-smoke.test.ts && npx vitest run test/e2e/agent-cli-screenshot-smoke.test.ts test/e2e/agent-cli-flow.test.ts`
 Expected: PASS.
 
 - [ ] **Step 2: Run complete test suite**
