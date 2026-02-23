@@ -30,6 +30,11 @@ const aliases: Record<string, string> = {
   'screenshot-view': 'screenshot',
 }
 
+const aliasNotices: Partial<Record<string, string>> = {
+  'new-window': 'new-window maps to new-tab in Freshell (creates a new tab). Use split-pane to create a pane in the current tab.',
+  'new-session': 'new-session maps to new-tab in Freshell (creates a new tab). Use split-pane to create a pane in the current tab.',
+}
+
 const getFlag = (flags: Flags, ...names: string[]) => {
   for (const name of names) {
     if (flags[name] !== undefined) return flags[name]
@@ -146,6 +151,9 @@ async function main() {
     process.exitCode = 1
     return
   }
+
+  const aliasNotice = aliasNotices[parsed.command]
+  if (aliasNotice) writeError(aliasNotice)
 
   const command = aliases[parsed.command] || parsed.command
   const flags = parsed.flags

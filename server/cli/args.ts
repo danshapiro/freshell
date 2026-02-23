@@ -13,13 +13,24 @@ const SHORT_BOOLEAN_FLAGS = new Set([
   'v', // split-pane --vertical
 ])
 
+const FLAGS_ALLOWING_DASH_PREFIX_VALUES = new Set([
+  'other',
+  'pane',
+  's',
+  'swap',
+  't',
+  'tab',
+  'target',
+])
+
 function isNegativeNumericToken(token: string): boolean {
   return /^-\d+(?:\.\d+)?(?:[eE][-+]?\d+)?$/.test(token)
 }
 
-function canUseAsFlagValue(token: string | undefined): token is string {
+function canUseAsFlagValue(token: string | undefined, key: string): token is string {
   if (!token) return false
-  return !token.startsWith('-') || isNegativeNumericToken(token)
+  if (token === '--') return false
+  return !token.startsWith('-') || isNegativeNumericToken(token) || FLAGS_ALLOWING_DASH_PREFIX_VALUES.has(key)
 }
 
 export function parseArgs(argv: string[]): ParsedArgs {
@@ -53,7 +64,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
       }
       const key = raw
       const next = argv[i + 1]
-      if (canUseAsFlagValue(next)) {
+      if (canUseAsFlagValue(next, key)) {
         flags[key] = next
         i += 2
         continue
@@ -71,7 +82,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
         continue
       }
       const next = argv[i + 1]
-      if (canUseAsFlagValue(next)) {
+      if (canUseAsFlagValue(next, key)) {
         flags[key] = next
         i += 2
         continue

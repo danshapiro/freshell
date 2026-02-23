@@ -23,3 +23,10 @@ it('parses negative numeric values for short value flags', () => {
   expect(parsed.flags.S).toBe('-20')
   expect(parsed.args).toEqual([])
 })
+
+it('parses dash-prefixed pane ids for target flags', () => {
+  const parsed = parseArgs(['split-pane', '-t', '-FFH7C5JAoRTjK8Qu8RXR', '--editor', '/tmp/sample.txt'])
+  expect(parsed.command).toBe('split-pane')
+  expect(parsed.flags.t).toBe('-FFH7C5JAoRTjK8Qu8RXR')
+  expect(parsed.flags.editor).toBe('/tmp/sample.txt')
+})

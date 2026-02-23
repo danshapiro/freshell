@@ -36,32 +36,42 @@ function startTestServer(
   })
 }
 
+function resolveCliPaths() {
+  const require = createRequire(import.meta.url)
+  const tsxRoot = path.dirname(require.resolve('tsx/package.json'))
+  return {
+    tsxPath: path.join(tsxRoot, 'dist', 'cli.mjs'),
+    cliPath: path.resolve(__dirname, '../../server/cli/index.ts'),
+  }
+}
+
+async function runCli(url: string, args: string[]) {
+  const { tsxPath, cliPath } = resolveCliPaths()
+  const proc = spawn(process.execPath, [tsxPath, cliPath, ...args], {
+    env: { ...process.env, FRESHELL_URL: url, FRESHELL_TOKEN: 'test-token' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+
+  return await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    let stdout = ''
+    let stderr = ''
+    proc.stdout.on('data', (chunk) => { stdout += chunk.toString() })
+    proc.stderr.on('data', (chunk) => { stderr += chunk.toString() })
+    proc.on('error', reject)
+    proc.on('close', (code) => {
+      if (code !== 0) return reject(new Error(`cli exited ${code}: ${stderr}`))
+      resolve({ stdout, stderr })
+    })
+  })
+}
+
 describe('cli e2e flow', () => {
   it('runs list-tabs end-to-end', async () => {
     const { url, close } = await startTestServer()
     try {
-      const require = createRequire(import.meta.url)
-      const tsxRoot = path.dirname(require.resolve('tsx/package.json'))
-      const tsxPath = path.join(tsxRoot, 'dist', 'cli.mjs')
-      const cliPath = path.resolve(__dirname, '../../server/cli/index.ts')
-      const proc = spawn(process.execPath, [tsxPath, cliPath, 'list-tabs', '--json'], {
-        env: { ...process.env, FRESHELL_URL: url, FRESHELL_TOKEN: 'test-token' },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
+      const output = await runCli(url, ['list-tabs', '--json'])
 
-      const output = await new Promise<string>((resolve, reject) => {
-        let data = ''
-        let err = ''
-        proc.stdout.on('data', (chunk) => { data += chunk.toString() })
-        proc.stderr.on('data', (chunk) => { err += chunk.toString() })
-        proc.on('error', reject)
-        proc.on('close', (code) => {
-          if (code !== 0) return reject(new Error(`cli exited ${code}: ${err}`))
-          resolve(data)
-        })
-      })
-
-      expect(output).toContain('tabs')
+      expect(output.stdout).toContain('tabs')
     } finally {
       await close()
     }
@@ -80,28 +90,25 @@ describe('cli e2e flow', () => {
       getActiveTabId: () => 'tab_2',
     })
     try {
-      const require = createRequire(import.meta.url)
-      const tsxRoot = path.dirname(require.resolve('tsx/package.json'))
-      const tsxPath = path.join(tsxRoot, 'dist', 'cli.mjs')
-      const cliPath = path.resolve(__dirname, '../../server/cli/index.ts')
-      const proc = spawn(process.execPath, [tsxPath, cliPath, 'display', '-p', '#I'], {
-        env: { ...process.env, FRESHELL_URL: url, FRESHELL_TOKEN: 'test-token' },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
+      const output = await runCli(url, ['display', '-p', '#I'])
 
-      const output = await new Promise<string>((resolve, reject) => {
-        let data = ''
-        let err = ''
-        proc.stdout.on('data', (chunk) => { data += chunk.toString() })
-        proc.stderr.on('data', (chunk) => { err += chunk.toString() })
-        proc.on('error', reject)
-        proc.on('close', (code) => {
-          if (code !== 0) return reject(new Error(`cli exited ${code}: ${err}`))
-          resolve(data.trim())
-        })
-      })
+      expect(output.stdout.trim()).toBe('tab_2')
+    } finally {
+      await close()
+    }
+  })
 
-      expect(output).toBe('tab_2')
+  it('prints tab-vs-pane guidance for new-window alias', async () => {
+    const { url, close } = await startTestServer({
+      createTab: () => ({ tabId: 'tab_new', paneId: 'pane_new' }),
+      attachPaneContent: () => {},
+    })
+    try {
+      const output = await runCli(url, ['new-window', '--name', 'Alias Test'])
+
+      expect(output.stderr).toContain('new-window maps to new-tab')
+      expect(output.stderr).toContain('Use split-pane')
+      expect(output.stdout).toContain('"tabId": "tab_new"')
     } finally {
       await close()
     }
@@ -125,28 +132,8 @@ describe('cli e2e flow', () => {
 
     let screenshotPath: string | undefined
     try {
-      const require = createRequire(import.meta.url)
-      const tsxRoot = path.dirname(require.resolve('tsx/package.json'))
-      const tsxPath = path.join(tsxRoot, 'dist', 'cli.mjs')
-      const cliPath = path.resolve(__dirname, '../../server/cli/index.ts')
-      const proc = spawn(process.execPath, [tsxPath, cliPath, 'screenshot-view', '--name', 'cli-e2e-shot', '--overwrite'], {
-        env: { ...process.env, FRESHELL_URL: url, FRESHELL_TOKEN: 'test-token' },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
-
-      const output = await new Promise<string>((resolve, reject) => {
-        let data = ''
-        let err = ''
-        proc.stdout.on('data', (chunk) => { data += chunk.toString() })
-        proc.stderr.on('data', (chunk) => { err += chunk.toString() })
-        proc.on('error', reject)
-        proc.on('close', (code) => {
-          if (code !== 0) return reject(new Error(`cli exited ${code}: ${err}`))
-          resolve(data)
-        })
-      })
-
-      const parsed = JSON.parse(output) as { status: string; data: { path: string; scope: string } }
+      const output = await runCli(url, ['screenshot-view', '--name', 'cli-e2e-shot', '--overwrite'])
+      const parsed = JSON.parse(output.stdout) as { status: string; data: { path: string; scope: string } }
       expect(parsed.status).toBe('ok')
       expect(parsed.data.scope).toBe('view')
       expect(parsed.data.path.endsWith('cli-e2e-shot.png')).toBe(true)
