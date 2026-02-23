@@ -81,6 +81,17 @@ describe('terminal-attach-seq-state', () => {
     expect(duplicate.reason).toBe('overlap')
   })
 
+  it('accepts merged frames that overlap pending replay when they advance lastSeq', () => {
+    let state = beginAttach(createAttachSeqState({ lastSeq: 0 }))
+    state = onAttachReady(state, { headSeq: 12, replayFromSeq: 8, replayToSeq: 10 })
+
+    const decision = onOutputFrame(state, { seqStart: 8, seqEnd: 11 })
+    expect(decision.accept).toBe(true)
+    if (decision.accept) {
+      expect(decision.state.lastSeq).toBe(11)
+    }
+  })
+
   it('drops overlap outside pending replay window', () => {
     const state = createAttachSeqState({ lastSeq: 8 })
     const decision = onOutputFrame(state, { seqStart: 7, seqEnd: 8 })

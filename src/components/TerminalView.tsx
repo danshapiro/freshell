@@ -899,9 +899,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       openSearch: () => setSearchOpen(true),
     })
     const unregisterCaptureHandler = registerTerminalCaptureHandler(paneId, {
-      suspendWebgl: () => runtimeRef.current?.suspendWebgl() ?? false,
+      suspendWebgl: () => runtimeRef.current?.suspendWebgl?.() ?? false,
       resumeWebgl: () => {
-        runtimeRef.current?.resumeWebgl()
+        runtimeRef.current?.resumeWebgl?.()
       },
     })
 

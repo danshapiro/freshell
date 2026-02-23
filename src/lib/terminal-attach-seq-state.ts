@@ -80,16 +80,25 @@ export function onOutputFrame(
   state: AttachSeqState,
   frame: { seqStart: number; seqEnd: number },
 ): OutputFrameDecision {
-  const overlapsExisting = frame.seqStart <= state.lastSeq
-  const offersNewData = frame.seqEnd > state.lastSeq
+  const shouldFreshReset =
+    state.awaitingFreshSequence
+    && frame.seqStart === 1
+    && state.lastSeq > 0
+
+  const effectiveState = shouldFreshReset
+    ? { ...state, lastSeq: 0, pendingReplay: null }
+    : state
+
+  const overlapsExisting = frame.seqStart <= effectiveState.lastSeq
+  const offersNewData = frame.seqEnd > effectiveState.lastSeq
   // We treat any overlap with pendingReplay as replay-context data. Server stream-v2
   // currently emits per-sequence frames, so partial-range replays that would duplicate
   // already-rendered bytes are not expected in practice. This assumption is load-bearing
   // for overlap acceptance inside pending replay windows.
   const inPendingReplay = Boolean(
-    state.pendingReplay
-      && frame.seqEnd >= state.pendingReplay.fromSeq
-      && frame.seqStart <= state.pendingReplay.toSeq,
+    effectiveState.pendingReplay
+      && frame.seqEnd >= effectiveState.pendingReplay.fromSeq
+      && frame.seqStart <= effectiveState.pendingReplay.toSeq,
   )
   const allowsReplayAdvance = inPendingReplay && offersNewData
   const isDuplicateOrStaleOverlap = overlapsExisting && !allowsReplayAdvance
@@ -97,31 +106,19 @@ export function onOutputFrame(
   // Replay windows can legally overlap the current high-water mark. However, if a frame
   // is entirely at-or-below lastSeq, it is a duplicate and should still be dropped.
   if (isDuplicateOrStaleOverlap) {
-    const freshReset =
-      state.awaitingFreshSequence
-      && frame.seqStart === 1
-      && state.lastSeq > 0
-    if (!freshReset) return { accept: false, reason: 'overlap' }
-    // A fresh reset means we are treating this as a new stream root; any stale replay
-    // window from the previous stream is intentionally discarded.
-    const resetState = { ...state, lastSeq: 0, pendingReplay: null }
-    // Bounded recursion: lastSeq resets to 0, so the follow-up call cannot hit
-    // this overlap branch again for a seqStart=1 frame.
-    const resetDecision = onOutputFrame(resetState, frame)
-    if (!resetDecision.accept) return resetDecision
-    return { ...resetDecision, freshReset: true }
+    return { accept: false, reason: 'overlap' }
   }
 
-  const nextLastSeq = Math.max(state.lastSeq, frame.seqEnd)
-  const pendingReplay = state.pendingReplay && frame.seqEnd >= state.pendingReplay.toSeq
+  const nextLastSeq = Math.max(effectiveState.lastSeq, frame.seqEnd)
+  const pendingReplay = effectiveState.pendingReplay && frame.seqEnd >= effectiveState.pendingReplay.toSeq
     ? null
-    : state.pendingReplay
+    : effectiveState.pendingReplay
 
   return {
     accept: true,
-    freshReset: false,
+    freshReset: shouldFreshReset,
     state: {
-      ...state,
+      ...effectiveState,
       lastSeq: nextLastSeq,
       pendingReplay,
       awaitingFreshSequence: false,
