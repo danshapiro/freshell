@@ -10,7 +10,16 @@ type UiSnapshot = {
   timestamp?: number
 }
 
-type Leaf = { id: string; content?: { kind?: string; terminalId?: string } }
+type Leaf = { id: string; content?: Record<string, unknown> & { kind?: string; terminalId?: string } }
+
+type PaneSnapshot = {
+  tabId: string
+  paneId: string
+  index: number
+  kind?: string
+  terminalId?: string
+  paneContent?: Record<string, unknown> & { kind?: string; terminalId?: string }
+}
 
 export class LayoutStore {
   private snapshot: UiSnapshot | null = null
@@ -168,6 +177,26 @@ export class LayoutStore {
       const leaves = this.collectLeaves(root, [])
       const match = leaves.find((leaf) => leaf.id === paneId)
       if (match?.content?.terminalId) return match.content.terminalId
+    }
+    return undefined
+  }
+
+  getPaneSnapshot(paneId: string): PaneSnapshot | undefined {
+    if (!this.snapshot) return undefined
+    for (const tab of this.snapshot.tabs) {
+      const root = this.snapshot.layouts?.[tab.id]
+      const leaves = this.collectLeaves(root, [])
+      const index = leaves.findIndex((leaf) => leaf.id === paneId)
+      if (index < 0) continue
+      const leaf = leaves[index]
+      return {
+        tabId: tab.id,
+        paneId: leaf.id,
+        index,
+        kind: leaf.content?.kind,
+        terminalId: leaf.content?.terminalId,
+        paneContent: leaf.content,
+      }
     }
     return undefined
   }
