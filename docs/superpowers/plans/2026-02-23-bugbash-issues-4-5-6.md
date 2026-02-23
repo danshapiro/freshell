@@ -58,7 +58,7 @@ Expected: FAIL on missing `C-u`/generic ctrl mappings.
 function translateCtrlChord(token: string): string | undefined {
   const m = /^C-([A-Za-z])$/.exec(token)
   if (!m) return undefined
-  return String.fromCharCode(m[1].toUpperCase().charCodeAt(0) - 64)
+  return String.fromCharCode(m[1].charCodeAt(0) - 64)
 }
 
 export function translateKeys(keys: string[]) {
@@ -126,21 +126,33 @@ getSplitSizes(tabId: string | undefined, splitId: string): [number, number] | un
 - [ ] **Step 4: Refactor resize route to resolve target split first, then normalize sizes**
 
 ```ts
-const explicitX = parseNumber(req.body?.x)
-const explicitY = parseNumber(req.body?.y)
-const current = layoutStore.getSplitSizes?.(resolvedTabId, splitId)
+const parseOptionalNumber = (value: unknown): number | undefined => {
+  const n = Number(value)
+  return Number.isFinite(n) ? n : undefined
+}
 
-const nextX = Number.isFinite(explicitX)
-  ? explicitX
-  : Number.isFinite(explicitY)
-    ? (Number.isFinite(current?.[0]) ? current![0] : 100 - explicitY)
-    : Number.isFinite(current?.[0]) ? current![0] : 50
+// 1) Resolve target split first (same flow as existing route):
+//    a) treat raw target as split id
+//    b) if not found, resolve target -> pane -> parent split
+const resolved = resolveResizeTarget(layoutStore, rawTarget, req.body?.tabId)
+// resolved => { tabId?: string, splitId: string, message?: string }
 
-const nextY = Number.isFinite(explicitY)
-  ? explicitY
-  : Number.isFinite(explicitX)
-    ? (Number.isFinite(current?.[1]) ? current![1] : 100 - explicitX)
-    : Number.isFinite(current?.[1]) ? current![1] : 50
+// 2) Read current split sizes from the resolved split id (not raw target).
+const current = layoutStore.getSplitSizes?.(resolved.tabId, resolved.splitId)
+const explicitX = parseOptionalNumber(req.body?.x)
+const explicitY = parseOptionalNumber(req.body?.y)
+
+// 3) Normalize missing axis:
+//    - preserve existing axis when available
+//    - otherwise derive complement to 100 when only one axis provided
+//    - final fallback remains 50/50
+const nextX = explicitX
+  ?? (explicitY !== undefined ? (current?.[0] ?? (100 - explicitY)) : (current?.[0] ?? 50))
+const nextY = explicitY
+  ?? (explicitX !== undefined ? (current?.[1] ?? (100 - explicitX)) : (current?.[1] ?? 50))
+
+const normalizedSizes: [number, number] = [nextX, nextY]
+const result = layoutStore.resizePane(resolved.tabId, resolved.splitId, normalizedSizes)
 ```
 
 - [ ] **Step 5: Add CLI flow coverage for `resize-pane --y`**
@@ -235,6 +247,14 @@ Expected: FAIL before implementation.
 - [ ] **Step 7: Track screenshot capability in WS server client state and target selection**
 
 ```ts
+type ScreenshotErrorCode = 'NO_SCREENSHOT_CLIENT' | 'SCREENSHOT_TIMEOUT' | 'SCREENSHOT_CONNECTION_CLOSED'
+
+function createScreenshotError(code: ScreenshotErrorCode, message: string): Error & { code: ScreenshotErrorCode } {
+  const err = new Error(message) as Error & { code: ScreenshotErrorCode }
+  err.code = code
+  return err
+}
+
 type ClientState = {
   supportsUiScreenshotV1: boolean
 }
@@ -244,14 +264,24 @@ state.supportsUiScreenshotV1 = !!m.capabilities?.uiScreenshotV1
 const targetWs = this.findTargetUiSocket(preferredConnectionId, {
   requireScreenshotCapability: true,
 })
-if (!targetWs) throw screenshotError('NO_SCREENSHOT_CLIENT', 'No screenshot-capable UI client connected')
+if (!targetWs) throw createScreenshotError('NO_SCREENSHOT_CLIENT', 'No screenshot-capable UI client connected')
+
+const timeout = setTimeout(() => {
+  reject(createScreenshotError('SCREENSHOT_TIMEOUT', 'Timed out waiting for UI screenshot response'))
+}, timeoutMs)
+
+// on connection close while waiting:
+pending.reject(createScreenshotError('SCREENSHOT_CONNECTION_CLOSED', 'UI connection closed before screenshot response'))
 ```
 
 - [ ] **Step 8: Return clearer status codes in screenshot API route**
 
 ```ts
-if (err.code === 'NO_SCREENSHOT_CLIENT') return res.status(503).json(fail(err.message))
-if (err.code === 'SCREENSHOT_TIMEOUT') return res.status(504).json(fail('Timed out waiting for UI screenshot response; ensure a browser UI tab is connected and retry.'))
+const code = (err as { code?: string })?.code
+if (code === 'NO_SCREENSHOT_CLIENT') return res.status(503).json(fail(err.message))
+if (code === 'SCREENSHOT_TIMEOUT') {
+  return res.status(504).json(fail('Timed out waiting for UI screenshot response; ensure a browser UI tab is connected and retry.'))
+}
 ```
 
 - [ ] **Step 9: Re-run targeted tests**
@@ -314,4 +344,3 @@ Expected: No unresolved findings; fix and re-run until clean.
 git add <files>
 git commit -m "fix: address fresheyes review findings"
 ```
-
