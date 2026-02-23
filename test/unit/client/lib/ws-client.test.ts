@@ -88,7 +88,7 @@ describe('WsClient.connect', () => {
     const hello = JSON.parse(MockWebSocket.instances[0].sent[0])
     expect(hello.type).toBe('hello')
     expect(hello.protocolVersion).toBe(WS_PROTOCOL_VERSION)
-    expect(hello.capabilities).toEqual({ sessionsPatchV1: true })
+    expect(hello.capabilities).toEqual({ sessionsPatchV1: true, uiScreenshotV1: true })
 
     MockWebSocket.instances[0]._message({ type: 'ready' })
     await p

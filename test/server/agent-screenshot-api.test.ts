@@ -146,3 +146,47 @@ it('cleans up temporary files when atomic rename fails', async () => {
   const tmpPrefix = `${path.basename(outputPath)}.tmp-`
   expect(dirEntries.some((entry) => entry.startsWith(tmpPrefix))).toBe(false)
 })
+
+it('returns 503 when screenshot-capable UI client is unavailable', async () => {
+  const app = express()
+  app.use(express.json())
+
+  const error = Object.assign(new Error('No screenshot-capable UI client connected'), {
+    code: 'NO_SCREENSHOT_CLIENT',
+  })
+  const wsHandler = {
+    requestUiScreenshot: vi.fn().mockRejectedValue(error),
+  }
+
+  app.use('/api', createAgentApiRouter({ layoutStore: {} as any, registry: {} as any, wsHandler: wsHandler as any }))
+
+  const res = await request(app)
+    .post('/api/screenshots')
+    .send({ scope: 'view', name: 'needs-ui' })
+
+  expect(res.status).toBe(503)
+  expect(res.body.status).toBe('error')
+  expect(res.body.message).toContain('screenshot-capable')
+})
+
+it('returns 504 when UI screenshot request times out', async () => {
+  const app = express()
+  app.use(express.json())
+
+  const error = Object.assign(new Error('Timed out waiting for UI screenshot response'), {
+    code: 'SCREENSHOT_TIMEOUT',
+  })
+  const wsHandler = {
+    requestUiScreenshot: vi.fn().mockRejectedValue(error),
+  }
+
+  app.use('/api', createAgentApiRouter({ layoutStore: {} as any, registry: {} as any, wsHandler: wsHandler as any }))
+
+  const res = await request(app)
+    .post('/api/screenshots')
+    .send({ scope: 'view', name: 'timed-out' })
+
+  expect(res.status).toBe(504)
+  expect(res.body.status).toBe('error')
+  expect(res.body.message).toContain('Timed out waiting for UI screenshot response')
+})

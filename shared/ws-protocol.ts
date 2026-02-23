@@ -137,6 +137,7 @@ export const HelloSchema = z.object({
   protocolVersion: z.literal(WS_PROTOCOL_VERSION),
   capabilities: z.object({
     sessionsPatchV1: z.boolean().optional(),
+    uiScreenshotV1: z.boolean().optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),

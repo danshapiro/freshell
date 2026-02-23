@@ -142,7 +142,7 @@ export class WsClient {
           type: 'hello',
           token,
           protocolVersion: WS_PROTOCOL_VERSION,
-          capabilities: { sessionsPatchV1: true },
+          capabilities: { sessionsPatchV1: true, uiScreenshotV1: true },
           ...extensions,
         }))
       }

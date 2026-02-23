@@ -392,6 +392,16 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
         ),
       )
     } catch (err: any) {
+      const code = (err as { code?: string })?.code
+      if (code === 'NO_SCREENSHOT_CLIENT') {
+        return res.status(503).json(fail(err?.message || 'No screenshot-capable UI client connected'))
+      }
+      if (code === 'SCREENSHOT_TIMEOUT') {
+        return res.status(504).json(fail(err?.message || 'Timed out waiting for UI screenshot response'))
+      }
+      if (code === 'SCREENSHOT_CONNECTION_CLOSED') {
+        return res.status(503).json(fail(err?.message || 'UI connection closed before screenshot response'))
+      }
       return res.status(500).json(fail(err?.message || 'failed to capture screenshot'))
     }
   })

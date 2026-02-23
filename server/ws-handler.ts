@@ -159,6 +159,7 @@ const ClientMessageSchema = z.discriminatedUnion('type', [
 type ClientState = {
   authenticated: boolean
   supportsSessionsPatchV1: boolean
+  supportsUiScreenshotV1: boolean
   sessionsSnapshotSent: boolean
   attachedTerminalIds: Set<string>
   createdByRequestId: Map<string, string>
@@ -188,6 +189,14 @@ type PendingScreenshot = {
   reject: (err: Error) => void
   timeout: NodeJS.Timeout
   connectionId?: string
+}
+
+type ScreenshotErrorCode = 'NO_SCREENSHOT_CLIENT' | 'SCREENSHOT_TIMEOUT' | 'SCREENSHOT_CONNECTION_CLOSED'
+
+function createScreenshotError(code: ScreenshotErrorCode, message: string): Error & { code: ScreenshotErrorCode } {
+  const err = new Error(message) as Error & { code: ScreenshotErrorCode }
+  err.code = code
+  return err
 }
 
 export class WsHandler {
@@ -336,10 +345,16 @@ export class WsHandler {
     return this.connections.size
   }
 
-  private findTargetUiSocket(preferredConnectionId?: string): LiveWebSocket | undefined {
+  private findTargetUiSocket(
+    preferredConnectionId?: string,
+    opts?: { requireScreenshotCapability?: boolean },
+  ): LiveWebSocket | undefined {
     const authenticated = [...this.connections].filter((conn) => {
       if (conn.readyState !== WebSocket.OPEN) return false
-      return !!this.clientStates.get(conn)?.authenticated
+      const state = this.clientStates.get(conn)
+      if (!state?.authenticated) return false
+      if (opts?.requireScreenshotCapability && !state.supportsUiScreenshotV1) return false
+      return true
     })
     if (!authenticated.length) return undefined
 
@@ -364,16 +379,16 @@ export class WsHandler {
   }): Promise<z.infer<typeof UiScreenshotResultSchema>> {
     const timeoutMs = opts.timeoutMs ?? 10_000
     const preferredConnectionId = this.layoutStore?.getSourceConnectionId() || undefined
-    const targetWs = this.findTargetUiSocket(preferredConnectionId)
+    const targetWs = this.findTargetUiSocket(preferredConnectionId, { requireScreenshotCapability: true })
     if (!targetWs) {
-      return Promise.reject(new Error('No UI client connected for screenshot'))
+      return Promise.reject(createScreenshotError('NO_SCREENSHOT_CLIENT', 'No screenshot-capable UI client connected'))
     }
 
     const requestId = randomUUID()
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.screenshotRequests.delete(requestId)
-        reject(new Error('Timed out waiting for UI screenshot response'))
+        reject(createScreenshotError('SCREENSHOT_TIMEOUT', 'Timed out waiting for UI screenshot response'))
       }, timeoutMs)
 
       this.screenshotRequests.set(requestId, {
@@ -437,6 +452,7 @@ export class WsHandler {
     const state: ClientState = {
       authenticated: false,
       supportsSessionsPatchV1: false,
+      supportsUiScreenshotV1: false,
       sessionsSnapshotSent: false,
       attachedTerminalIds: new Set(),
       createdByRequestId: new Map(),
@@ -501,7 +517,7 @@ export class WsHandler {
       if (pending.connectionId !== ws.connectionId) continue
       clearTimeout(pending.timeout)
       this.screenshotRequests.delete(requestId)
-      pending.reject(new Error('UI connection closed before screenshot response'))
+      pending.reject(createScreenshotError('SCREENSHOT_CONNECTION_CLOSED', 'UI connection closed before screenshot response'))
     }
 
     const durationMs = ws.connectedAt ? Date.now() - ws.connectedAt : undefined
@@ -808,6 +824,7 @@ export class WsHandler {
         }
         state.authenticated = true
         state.supportsSessionsPatchV1 = !!m.capabilities?.sessionsPatchV1
+        state.supportsUiScreenshotV1 = !!m.capabilities?.uiScreenshotV1
         if (typeof m.client?.mobile === 'boolean') {
           ws.isMobileClient = m.client.mobile
         }
@@ -1676,7 +1693,7 @@ export class WsHandler {
 
     for (const [requestId, pending] of this.screenshotRequests) {
       clearTimeout(pending.timeout)
-      pending.reject(new Error('WebSocket server closed before screenshot response'))
+      pending.reject(createScreenshotError('SCREENSHOT_CONNECTION_CLOSED', 'WebSocket server closed before screenshot response'))
       this.screenshotRequests.delete(requestId)
     }
 
