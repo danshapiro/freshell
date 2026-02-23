@@ -38,7 +38,8 @@
 
 **Step 1: Write the failing unit test for attachRequestId echo on ready/output/gap**
 
-Add a new test in `test/unit/server/ws-handler-backpressure.test.ts` that directly exercises `TerminalStreamBroker.attach` with a request ID:
+Add a new test in `test/unit/server/ws-handler-backpressure.test.ts` that directly exercises `TerminalStreamBroker.attach` with a request ID.
+If the surrounding describe block does not already use fake timers, wrap this test with `vi.useFakeTimers()` / `vi.useRealTimers()` because it depends on `vi.advanceTimersByTime(5)`:
 
 ```ts
 it('echoes attachRequestId on attach.ready, output, and output.gap for a client attachment', async () => {
@@ -150,13 +151,6 @@ Update broker + ws handler signatures:
 
 ```ts
 // server/terminal-stream/broker.ts
-async sendCreatedAndAttach(
-  ws: LiveWebSocket,
-  created: CreatedEnvelope,
-  sinceSeq: number | undefined = 0,
-  attachRequestId?: string,
-): Promise<boolean> { ... }
-
 async attach(
   ws: LiveWebSocket,
   terminalId: string,
@@ -168,10 +162,10 @@ async attach(
 const attached = await this.terminalStreamBroker.attach(ws, m.terminalId, m.sinceSeq, m.attachRequestId)
 ```
 
-Keep `sendCreatedAndAttach(...)` call sites in `server/ws-handler.ts` unchanged for now (no client-provided `attachRequestId` on create path), and pass through optional attach ID if a future caller provides one:
+Keep `sendCreatedAndAttach(...)` unchanged for now (no client-provided `attachRequestId` on create path). The client-side `terminal.created` reset in Task 3 is what makes untagged create-path messages safe:
 
 ```ts
-return await this.attach(ws, created.terminalId, sinceSeq, attachRequestId)
+return await this.attach(ws, created.terminalId, sinceSeq)
 ```
 
 Send echoed ID from broker:
@@ -395,8 +389,11 @@ expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
 }))
 ```
 
-Apply this at the current assertion sites around:
-- lines `1501`, `1523`, `1622`, `1642`, `1663`, `1685`, `1707`, `1722`, `1773`, `1804`, `1814`, `1838`, `1898`, `1936`, `2026`.
+Apply this to every strict `terminal.attach` equality assertion. Do not rely on static line numbers; locate sites with:
+
+```bash
+rg -n "toHaveBeenCalledWith\\(\\{[[:space:]]*type:[[:space:]]*'terminal\\.attach'" test/unit/client/components/TerminalView.lifecycle.test.tsx
+```
 
 Add a regression test for create-path untagged messages:
 
@@ -558,7 +555,6 @@ it('suppresses replay_window_exceeded banner during viewport_hydrate attach gene
     .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
 
   term.writeln.mockClear()
-  const writelnCallsBefore = term.writeln.mock.calls.length
 
   messageHandler!({
     type: 'terminal.output.gap',
@@ -569,7 +565,7 @@ it('suppresses replay_window_exceeded banner during viewport_hydrate attach gene
     attachRequestId: attach!.attachRequestId,
   } as any)
 
-  expect(term.writeln.mock.calls.length).toBe(writelnCallsBefore)
+  expect(term.writeln).not.toHaveBeenCalled()
 })
 ```
 
