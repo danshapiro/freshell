@@ -46,7 +46,7 @@ export function createHttpClient(config = resolveConfig()) : HttpClient {
 
     const data = await parseResponse(res)
     if (!res.ok) {
-      const message = (data && data.error) || res.statusText
+      const message = (data && (data.error || data.message)) || res.statusText
       const err = new Error(message)
       ;(err as any).status = res.status
       ;(err as any).details = data
