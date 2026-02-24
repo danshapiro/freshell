@@ -54,10 +54,24 @@ function expectCodexTurnCompleteArgs(args: string[]) {
   expect(args).toContain('-c')
   expect(args).toContain('tui.notification_method=bel')
   expect(args).toContain("tui.notifications=['agent-turn-complete']")
-  const skillConfigArg = args.find((arg) => arg.startsWith('skills.config=[{path="'))
-  expect(skillConfigArg).toBeDefined()
-  expect(skillConfigArg).toContain('freshell-orchestration')
-  expect(skillConfigArg).toContain('enabled=true')
+  const skillConfigArgs = args.filter((arg) => arg.startsWith('skills.config.'))
+  expect(skillConfigArgs.length).toBeGreaterThan(0)
+
+  const orchestrationPathArg = skillConfigArgs.find((arg) =>
+    arg.includes('.path=') && arg.includes('freshell-orchestration'))
+  expect(orchestrationPathArg).toBeDefined()
+  const orchestrationIndexMatch = orchestrationPathArg?.match(/^skills\.config\.(\d+)\.path=/)
+  expect(orchestrationIndexMatch).toBeTruthy()
+  const orchestrationIndex = orchestrationIndexMatch?.[1]
+  expect(skillConfigArgs).toContain(`skills.config.${orchestrationIndex}.enabled=true`)
+
+  const demoPathArg = skillConfigArgs.find((arg) =>
+    arg.includes('.path=') && (arg.includes('freshell-demo-creation') || arg.includes('demo-creating')))
+  expect(demoPathArg).toBeDefined()
+  const demoIndexMatch = demoPathArg?.match(/^skills\.config\.(\d+)\.path=/)
+  expect(demoIndexMatch).toBeTruthy()
+  const demoIndex = demoIndexMatch?.[1]
+  expect(skillConfigArgs).toContain(`skills.config.${demoIndex}.enabled=false`)
 }
 
 function expectClaudeTurnCompleteArgs(args: string[]) {
