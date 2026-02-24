@@ -54,9 +54,16 @@ function expectCodexTurnCompleteArgs(args: string[]) {
   expect(args).toContain('-c')
   expect(args).toContain('tui.notification_method=bel')
   expect(args).toContain("tui.notifications=['agent-turn-complete']")
+  const skillConfigArg = args.find((arg) => arg.startsWith('skills.config=[{path="'))
+  expect(skillConfigArg).toBeDefined()
+  expect(skillConfigArg).toContain('freshell-orchestration')
+  expect(skillConfigArg).toContain('enabled=true')
 }
 
 function expectClaudeTurnCompleteArgs(args: string[]) {
+  const pluginDirIndex = args.indexOf('--plugin-dir')
+  expect(pluginDirIndex).toBeGreaterThan(-1)
+  expect(args[pluginDirIndex + 1]).toContain('freshell-orchestration')
   const command = getClaudeStopHookCommand(args)
   expect(command).toContain("printf '\\a'")
 }

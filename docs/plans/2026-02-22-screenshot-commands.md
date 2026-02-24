@@ -1290,7 +1290,7 @@ git commit -m "test+fix(screenshot): add integration coverage for focus-preservi
 
 **Files:**
 - Modify: `docs/index.html`
-- Rewrite: `.claude/skills/freshell-automation-tmux-style/SKILL.md` (or the canonical skill path used in this repo/session)
+- Rewrite: `.claude/skills/freshell-orchestration/SKILL.md` (or the canonical skill path used in this repo/session)
 
 **Step 1: Write the failing doc check (manual checklist)**
 
@@ -1322,7 +1322,7 @@ Required sections:
 **Step 3: Commit**
 
 ```bash
-git add docs/index.html .claude/skills/freshell-automation-tmux-style/SKILL.md
+git add docs/index.html .claude/skills/freshell-orchestration/SKILL.md
 git commit -m "docs: update screenshot command guidance in mock UI and tmux-style skill"
 ```
 

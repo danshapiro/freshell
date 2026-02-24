@@ -1,5 +1,5 @@
 ---
-name: freshell-automation-tmux-style
+name: freshell-orchestration
 description: "Use when interacting with Freshell panes, panels, or tabs from the CLI for tmux-style automation and multi-pane workflows, outside external-browser automation tasks."
 ---
 
