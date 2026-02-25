@@ -923,6 +923,38 @@ describe('buildSpawnSpec Unix paths', () => {
 
       expect(spec.env.MY_CUSTOM_VAR).toBe('test-value')
     })
+
+    it('strips CI so child terminals are treated as interactive', () => {
+      process.env.CI = '1'
+
+      const spec = buildSpawnSpec('claude', '/Users/john', 'system')
+
+      expect(spec.env.CI).toBeUndefined()
+    })
+
+    it('strips NO_COLOR so child terminals can render color', () => {
+      process.env.NO_COLOR = '1'
+
+      const spec = buildSpawnSpec('claude', '/Users/john', 'system')
+
+      expect(spec.env.NO_COLOR).toBeUndefined()
+    })
+
+    it('strips FORCE_COLOR inherited from host process', () => {
+      process.env.FORCE_COLOR = '0'
+
+      const spec = buildSpawnSpec('claude', '/Users/john', 'system')
+
+      expect(spec.env.FORCE_COLOR).toBeUndefined()
+    })
+
+    it('strips COLOR inherited from host process', () => {
+      process.env.COLOR = '0'
+
+      const spec = buildSpawnSpec('claude', '/Users/john', 'system')
+
+      expect(spec.env.COLOR).toBeUndefined()
+    })
   })
 
   describe('cwd handling on Unix', () => {
@@ -2317,6 +2349,38 @@ describe('buildSpawnSpec Unix paths', () => {
       const spec = buildSpawnSpec('shell', '/Users/john', 'system')
 
       expect(spec.env.MY_CUSTOM_VAR).toBe('test-value')
+    })
+
+    it('strips CI so child terminals are treated as interactive', () => {
+      process.env.CI = '1'
+
+      const spec = buildSpawnSpec('claude', '/Users/john', 'system')
+
+      expect(spec.env.CI).toBeUndefined()
+    })
+
+    it('strips NO_COLOR so child terminals can render color', () => {
+      process.env.NO_COLOR = '1'
+
+      const spec = buildSpawnSpec('claude', '/Users/john', 'system')
+
+      expect(spec.env.NO_COLOR).toBeUndefined()
+    })
+
+    it('strips FORCE_COLOR inherited from host process', () => {
+      process.env.FORCE_COLOR = '0'
+
+      const spec = buildSpawnSpec('claude', '/Users/john', 'system')
+
+      expect(spec.env.FORCE_COLOR).toBeUndefined()
+    })
+
+    it('strips COLOR inherited from host process', () => {
+      process.env.COLOR = '0'
+
+      const spec = buildSpawnSpec('claude', '/Users/john', 'system')
+
+      expect(spec.env.COLOR).toBeUndefined()
     })
   })
 

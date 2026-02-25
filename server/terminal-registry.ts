@@ -631,9 +631,17 @@ export function buildSpawnSpec(
   providerSettings?: ProviderSettings,
   envOverrides?: Record<string, string>,
 ) {
-  // CLAUDECODE is set by parent Claude Code sessions and causes child
-  // claude processes to refuse to start ("nested session" error). Strip it.
-  const { CLAUDECODE: _, ...parentEnv } = process.env
+  // Strip inherited env vars that interfere with child terminal behaviour:
+  // - CLAUDECODE: causes child Claude processes to refuse to start ("nested session" error)
+  // - CI/NO_COLOR/FORCE_COLOR/COLOR: disables interactive color in user PTYs
+  const {
+    CLAUDECODE: _claudecode,
+    CI: _ci,
+    NO_COLOR: _noColor,
+    FORCE_COLOR: _forceColor,
+    COLOR: _color,
+    ...parentEnv
+  } = process.env
   const env = {
     ...parentEnv,
     TERM: process.env.TERM || 'xterm-256color',
