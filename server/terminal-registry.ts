@@ -90,7 +90,6 @@ const LEGACY_FRESHELL_DEMO_SKILL_DIR = path.join(process.cwd(), '.claude', 'skil
 const DEFAULT_FRESHELL_CLAUDE_PLUGIN_DIR = path.join(process.cwd(), '.claude', 'plugins', 'freshell-orchestration')
 const LEGACY_FRESHELL_CLAUDE_PLUGIN_DIR = path.join(process.cwd(), '.claude', 'plugins', 'freshell-automation-tmux-style')
 const DEFAULT_CODEX_HOME = path.join(os.homedir(), '.codex')
-const FRESHELL_CODEX_SKILL_CONFIG_BASE_INDEX = Number(process.env.FRESHELL_CODEX_SKILL_CONFIG_BASE_INDEX || 400_000)
 
 function firstExistingPath(candidates: Array<string | undefined>): string | undefined {
   for (const candidate of candidates) {
@@ -146,17 +145,14 @@ function codexOrchestrationSkillArgs(): string[] {
     path.join(skillsDir, 'freshell-automation-tmux-style'),
   ]).filter((entryPath) => entryPath !== skillPath)
 
-  const args: string[] = []
   const entries: Array<{ path: string; enabled: boolean }> = [
     { path: skillPath, enabled: true },
     ...disablePaths.map((entryPath) => ({ path: entryPath, enabled: false })),
   ]
-  for (const [index, entry] of entries.entries()) {
-    const configIndex = FRESHELL_CODEX_SKILL_CONFIG_BASE_INDEX + index
-    args.push('-c', `skills.config.${configIndex}.path=${encodeTomlString(entry.path)}`)
-    args.push('-c', `skills.config.${configIndex}.enabled=${entry.enabled ? 'true' : 'false'}`)
-  }
-  return args
+  const tomlEntries = entries.map(
+    (entry) => `{path = ${encodeTomlString(entry.path)}, enabled = ${entry.enabled}}`
+  )
+  return ['-c', `skills.config=[${tomlEntries.join(', ')}]`]
 }
 
 function claudePluginArgs(): string[] {

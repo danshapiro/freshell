@@ -54,24 +54,28 @@ function expectCodexTurnCompleteArgs(args: string[]) {
   expect(args).toContain('-c')
   expect(args).toContain('tui.notification_method=bel')
   expect(args).toContain("tui.notifications=['agent-turn-complete']")
-  const skillConfigArgs = args.filter((arg) => arg.startsWith('skills.config.'))
-  expect(skillConfigArgs.length).toBeGreaterThan(0)
 
-  const orchestrationPathArg = skillConfigArgs.find((arg) =>
-    arg.includes('.path=') && arg.includes('freshell-orchestration'))
-  expect(orchestrationPathArg).toBeDefined()
-  const orchestrationIndexMatch = orchestrationPathArg?.match(/^skills\.config\.(\d+)\.path=/)
-  expect(orchestrationIndexMatch).toBeTruthy()
-  const orchestrationIndex = orchestrationIndexMatch?.[1]
-  expect(skillConfigArgs).toContain(`skills.config.${orchestrationIndex}.enabled=true`)
+  // skills.config must be passed as a single TOML array literal (not dotted map keys)
+  // to satisfy Codex's config parser which expects a sequence, not a map.
+  const skillsConfigArg = args.find((arg) => arg.startsWith('skills.config='))
+  expect(skillsConfigArg).toBeDefined()
 
-  const demoPathArg = skillConfigArgs.find((arg) =>
-    arg.includes('.path=') && (arg.includes('freshell-demo-creation') || arg.includes('demo-creating')))
-  expect(demoPathArg).toBeDefined()
-  const demoIndexMatch = demoPathArg?.match(/^skills\.config\.(\d+)\.path=/)
-  expect(demoIndexMatch).toBeTruthy()
-  const demoIndex = demoIndexMatch?.[1]
-  expect(skillConfigArgs).toContain(`skills.config.${demoIndex}.enabled=false`)
+  // Must NOT use dotted key format (skills.config.N.path=...) — that creates a TOML map
+  const dottedKeyArgs = args.filter((arg) => /^skills\.config\.\d+\./.test(arg))
+  expect(dottedKeyArgs).toHaveLength(0)
+
+  // Parse the TOML array literal to verify contents
+  const arrayLiteral = skillsConfigArg!.replace('skills.config=', '')
+  expect(arrayLiteral).toMatch(/^\[.*\]$/)
+
+  // Verify orchestration skill is present and enabled
+  expect(arrayLiteral).toMatch(/path\s*=\s*"[^"]*freshell-orchestration[^"]*"/)
+  expect(arrayLiteral).toMatch(/freshell-orchestration[^}]*enabled\s*=\s*true/)
+
+  // Verify demo/legacy skills are present and disabled
+  const hasDemoDisabled = /(?:freshell-demo-creation|demo-creating)[^}]*enabled\s*=\s*false/.test(arrayLiteral)
+    || /enabled\s*=\s*false[^}]*(?:freshell-demo-creation|demo-creating)/.test(arrayLiteral)
+  expect(hasDemoDisabled).toBe(true)
 }
 
 function expectClaudeTurnCompleteArgs(args: string[]) {
