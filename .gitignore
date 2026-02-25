@@ -8,6 +8,7 @@ nul
 .worktrees
 
 .worktrees/
+.claude/worktrees/
 
 # Python (browser_use smoke runner)
 .venv/
