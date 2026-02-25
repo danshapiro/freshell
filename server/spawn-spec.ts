@@ -276,8 +276,11 @@ function buildPowerShellCommand(command: string, args: string[]): string {
 }
 
 export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shell: ShellType, resumeSessionId?: string) {
+  // CLAUDECODE is set by parent Claude Code sessions and causes child
+  // claude processes to refuse to start ("nested session" error). Strip it.
+  const { CLAUDECODE: _, ...parentEnv } = process.env
   const env = {
-    ...process.env,
+    ...parentEnv,
     TERM: process.env.TERM || 'xterm-256color',
     COLORTERM: process.env.COLORTERM || 'truecolor',
   }

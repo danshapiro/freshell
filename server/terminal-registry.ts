@@ -622,6 +622,7 @@ function buildPowerShellCommand(command: string, args: string[]): string {
   const invocation = ['&', quotePowerShellLiteral(command), ...args.map(quotePowerShellLiteral)].join(' ')
   return invocation
 }
+
 export function buildSpawnSpec(
   mode: TerminalMode,
   cwd: string | undefined,
@@ -630,8 +631,19 @@ export function buildSpawnSpec(
   providerSettings?: ProviderSettings,
   envOverrides?: Record<string, string>,
 ) {
+  // Strip inherited env vars that interfere with child terminal behaviour:
+  // - CLAUDECODE: causes child Claude processes to refuse to start ("nested session" error)
+  // - CI/NO_COLOR/FORCE_COLOR/COLOR: disables interactive color in user PTYs
+  const {
+    CLAUDECODE: _claudecode,
+    CI: _ci,
+    NO_COLOR: _noColor,
+    FORCE_COLOR: _forceColor,
+    COLOR: _color,
+    ...parentEnv
+  } = process.env
   const env = {
-    ...process.env,
+    ...parentEnv,
     TERM: process.env.TERM || 'xterm-256color',
     COLORTERM: process.env.COLORTERM || 'truecolor',
     ...envOverrides,
