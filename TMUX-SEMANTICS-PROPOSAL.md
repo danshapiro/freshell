@@ -1,680 +1,774 @@
 # Freshell Agent API: tmux-Compatible Semantics
 
-## 1. Background & Motivation
+## 1. Goal
 
-AI coding agents (Claude Code, Codex, Devin, etc.) have converged on **tmux as their
-standard interface for terminal multiplexing**. When agents need to run background
-processes, monitor servers, orchestrate sub-agents, or manage multiple workstreams,
-they reach for tmux commands via their Bash tool.
+Provide a `freshell` CLI that agents can drive from Bash with tmux-like ergonomics,
+while preserving Freshell's multi-device model.
 
-The ecosystem includes:
-
-- **Direct tmux usage**: Agents call `tmux send-keys`, `tmux capture-pane`, etc.
-  through their Bash tool when running inside a tmux session.
-- **MCP servers**: Tools like `claude-tmux`, `nickgnd/tmux-mcp`, `lox/tmux-mcp-server`,
-  and `t-pane` wrap tmux commands in structured tool interfaces.
-- **Orchestration frameworks**: `claude-code-tools`, `codex-orchestrator`,
-  `aws-cli-agent-orchestrator`, and `multi-agent-shogun` all build on tmux for
-  multi-agent coordination.
-- **Claude Code's built-in TeammateTool**: Uses tmux as a spawn backend when
-  available, creating panes/windows in a `claude-swarm` session.
-
-Freshell already provides everything tmux does—persistent terminals, panes, tabs,
-scrollback buffers, remote access—plus features tmux lacks (browser panes, editor
-panes, AI session indexing, rich UI). But agents can't use any of it, because
-Freshell doesn't speak the language agents know.
-
-**Goal**: Provide a CLI tool (`freshell`) that agents can use with tmux-like
-semantics, so any agent that knows how to use tmux can use Freshell instead—while
-also exposing Freshell-unique capabilities that tmux can't offer.
+This document is a **unified cutover** design. There is no phased rollout and no
+backward-compatibility path.
 
 ---
 
-## 2. Conceptual Model Mapping
+## 2. Locked Product Decisions
 
-### tmux → Freshell Concept Translation
+The following decisions are fixed:
 
-| tmux Concept | Freshell Equivalent | Notes |
-|---|---|---|
-| **Server** | Freshell server process | Already persistent, already multiplexing |
-| **Session** | The Freshell server itself | tmux sessions are named groups of windows; Freshell is a single always-on session. We flatten this: all tabs are in one "session." |
-| **Window** | **Tab** | A named container. Each tab has a pane layout. |
-| **Pane** | **Pane** | A leaf in the pane tree. Can be terminal, browser, or editor. |
-| **Client** | Browser tab / WebSocket connection | Multiple clients can attach to the same Freshell instance |
-
-### Why Flatten Sessions
-
-tmux's multi-session model exists because tmux is a system utility shared by
-multiple users and use cases. Freshell is a single-user application. The "session"
-layer adds complexity without value. Instead:
-
-- `tmux new-session -s work` → `freshell new-tab -n work` (a new tab)
-- `tmux list-sessions` → `freshell list-tabs`
-- `tmux attach -t work` → `freshell select-tab -t work`
-
-If multi-session support becomes needed later, it can be added as a grouping layer
-on top of tabs without breaking the command interface.
+- **Client-owned layout state**: each device is the source of truth for its own tab/pane/layout state.
+- **Server as relay/cache for layout**: server forwards commands/events between devices and stores last-known snapshots; it is not global authority for live per-device layout.
+- **Remote control = owner-device RPC**: layout mutations targeting another device are sent to that owner device and applied there.
+- **Offline behavior**: if owner device is offline, default to explicit `DEVICE_OFFLINE`.
+- **No deferred queueing / surrogate execution**: no server-side queued replay; no server-side substitute owner behavior.
+- **Accepted consequence**: deterministic remote layout mutation exists only while owner device is online.
+- **Unified cutover**: no legacy parser/shim compatibility mode.
 
 ---
 
-## 3. Command Mapping: tmux → freshell
+## 3. Authority Boundaries (Critical)
 
-### 3.1 Session/Window Management (→ Tab Management)
+The previous draft mixed ownership domains. This cutover defines them explicitly.
 
-| tmux Command | freshell Command | Behavior |
-|---|---|---|
-| `tmux new-session -d -s NAME` | `freshell new-tab -n NAME [-d]` | Create a new tab with a shell pane. `-d` creates without switching to it. Returns tab ID. |
-| `tmux new-window -t SESSION` | `freshell new-tab [-n NAME]` | Create a new tab (tabs replace windows). |
-| `tmux kill-session -t NAME` | `freshell kill-tab -t NAME` | Close tab and kill all its terminals. |
-| `tmux kill-window -t SESSION:WINDOW` | `freshell kill-tab -t ID` | Same as above (windows = tabs). |
-| `tmux list-sessions` | `freshell list-tabs` | List all tabs with IDs, titles, status, pane count. |
-| `tmux list-windows -t SESSION` | `freshell list-tabs` | Same (flattened model). |
-| `tmux select-window -t SESSION:WINDOW` | `freshell select-tab -t ID\|NAME` | Switch to tab by ID or name. |
-| `tmux rename-window NAME` | `freshell rename-tab -t ID NAME` | Rename a tab. |
-| `tmux rename-session NAME` | `freshell rename-tab -t ID NAME` | Same (flattened). |
-| `tmux has-session -t NAME` | `freshell has-tab -t NAME` | Exit 0 if tab exists, 1 otherwise. |
-| `tmux next-window` | `freshell next-tab` | Switch to next tab. |
-| `tmux previous-window` | `freshell prev-tab` | Switch to previous tab. |
+### 3.1 Domain A: Layout Authority (Device-Owned)
 
-### 3.2 Pane Management
+Owned by one device (`ownerDeviceId`) and mutated only by that owner device runtime:
 
-| tmux Command | freshell Command | Behavior |
-|---|---|---|
-| `tmux split-window -h` | `freshell split-pane [-t PANE]` | Split active (or specified) pane. Direction follows Freshell's layout algorithm. (See §3.2.1.) |
-| `tmux split-window -v` | `freshell split-pane [-t PANE]` | Same command—Freshell chooses optimal direction. |
-| `tmux list-panes [-t TAB]` | `freshell list-panes [-t TAB]` | List panes in active or specified tab. Shows pane ID, type (terminal/browser/editor), terminal ID, status, dimensions. |
-| `tmux select-pane -t PANE` | `freshell select-pane -t PANE` | Set active pane. |
-| `tmux kill-pane -t PANE` | `freshell kill-pane -t PANE` | Close pane (kills its terminal). |
-| `tmux resize-pane -t PANE -x W -y H` | `freshell resize-pane -t PANE [-x W] [-y H]` | Resize pane (percentage-based, since Freshell uses flex layout). |
-| `tmux swap-pane -s SRC -t DST` | `freshell swap-pane` | Swap the two panes in the current split. |
-| `tmux display-panes` | N/A | No equivalent needed (panes are always visible in the UI). |
+- tab list/order
+- pane tree structure (split/close/swap/resize)
+- active tab and active pane pointers
+- pane metadata that is UI-owned (titles, browser URL, editor path)
+- mapping from pane IDs to content types and process/session references
 
-#### 3.2.1 Split Direction
+### 3.2 Domain B: Terminal Process Authority (Server-Owned)
 
-tmux has explicit `-h` (horizontal) and `-v` (vertical) split flags. Freshell's
-pane layout algorithm automatically chooses direction based on pane count and
-available space. The `freshell split-pane` command does **not** guarantee a specific
-direction.
+Authoritative on server, independent of browser presence:
 
-**Proposed**: Accept optional `-h`/`-v` flags for forward compatibility, but
-initially both map to Freshell's default split behavior. A future enhancement
-can honor the requested direction when feasible.
+- PTY spawn/kill/resize/input
+- terminal output stream
+- terminal ring buffer / capture source
+- terminal exit status and lifecycle events
 
-### 3.3 Terminal I/O (The Critical Path for Agents)
+### 3.3 Domain C: SDK/CodingCLI Session Authority (Server-Owned)
 
-| tmux Command | freshell Command | Behavior |
-|---|---|---|
-| `tmux send-keys -t TARGET "text" Enter` | `freshell send-keys -t PANE "text" Enter` | Send keystrokes to a pane's terminal. `Enter`, `C-c`, `C-d`, `Escape`, `Tab`, `Up`, `Down`, etc. are translated to control sequences. |
-| `tmux send-keys -t TARGET -l "literal"` | `freshell send-keys -t PANE -l "literal"` | Send literal text (no key translation). |
-| `tmux capture-pane -p -t TARGET` | `freshell capture-pane -t PANE` | Print pane's visible content to stdout. |
-| `tmux capture-pane -p -t TARGET -S -200` | `freshell capture-pane -t PANE -S -200` | Capture last 200 lines of scrollback. |
-| `tmux capture-pane -p -J -t TARGET -S -` | `freshell capture-pane -t PANE -S - [-J]` | Full scrollback, optionally joining wrapped lines. |
+Authoritative on server:
 
-#### 3.3.1 send-keys Semantics (Critical)
+- `sdk.create/send/interrupt/kill/attach`
+- `codingcli.create/input/kill`
+- provider session state and event stream
 
-The `send-keys` command is the most important interface for agents. tmux has a
-well-known race condition where `Enter` can be lost if sent too quickly after text.
-Freshell's WebSocket protocol doesn't have this issue (input is queued server-side),
-but the CLI must match tmux's argument conventions exactly.
+### 3.4 Hard Invariant
 
-**Key name translation table:**
+- Layout mutations are owner-device RPC.
+- Process/session operations are server-direct.
+- Hybrid operations do both, in that order, with rollback rules.
 
-| Key Name | Bytes Sent | tmux Equivalent |
-|---|---|---|
-| `Enter` | `\r` | `Enter` |
-| `C-c` | `\x03` | `C-c` |
-| `C-d` | `\x04` | `C-d` |
-| `C-z` | `\x1a` | `C-z` |
-| `C-l` | `\x0c` | `C-l` |
-| `C-a` | `\x01` | `C-a` |
-| `Escape` / `C-[` | `\x1b` | `Escape` |
-| `Tab` | `\t` | `Tab` |
-| `BSpace` | `\x7f` | `BSpace` |
-| `Up` | `\x1b[A` | `Up` |
-| `Down` | `\x1b[B` | `Down` |
-| `Right` | `\x1b[C` | `Right` |
-| `Left` | `\x1b[D` | `Left` |
-| `Space` | ` ` | `Space` |
-
-**Behavior**: Each argument is processed left-to-right. Plain strings are sent as
-literal UTF-8 bytes. Recognized key names (case-sensitive) are translated to their
-control sequences. This matches tmux's behavior.
-
-#### 3.3.2 capture-pane Output
-
-Freshell's terminal registry maintains a 64KB scrollback buffer per terminal. The
-`capture-pane` command reads from this buffer via a new REST endpoint.
-
-**Flags:**
-
-| Flag | Behavior |
-|---|---|
-| `-p` | Print to stdout (default, always on—there's no paste buffer) |
-| `-t PANE` | Target pane (default: active pane in active tab) |
-| `-S LINES` | Start from LINES before current position. `-S -` = full scrollback. Default: visible area only. |
-| `-J` | Join wrapped lines (strip soft line breaks from terminal width wrapping) |
-| `-e` | Include ANSI escape sequences (default: strip them) |
-
-### 3.4 Terminal Lifecycle
-
-| tmux Command | freshell Command | Behavior |
-|---|---|---|
-| `tmux respawn-pane -t PANE` | `freshell respawn-pane -t PANE` | Kill current terminal in pane and start a new one. |
-| N/A | `freshell list-terminals` | List all terminals (including detached/background). Maps to `GET /api/terminals`. |
-| N/A | `freshell attach -t TERMINAL` | Attach a background terminal to the active pane. |
-
-### 3.5 Introspection & Display
-
-| tmux Command | freshell Command | Behavior |
-|---|---|---|
-| `tmux display-message -p '#S'` | `freshell display -p '#{tab_name}'` | Print tab name. |
-| `tmux display-message -p '#I'` | `freshell display -p '#{tab_id}'` | Print tab ID. |
-| `tmux display-message -p '#P'` | `freshell display -p '#{pane_id}'` | Print active pane ID. |
-| `tmux display-message -p '#{pane_current_command}'` | `freshell display -p '#{pane_mode}'` | Print pane mode (shell/claude/codex/etc). |
-| `tmux display-message -p '#{pane_pid}'` | `freshell display -p '#{terminal_id}'` | Print pane's terminal ID. |
-| N/A | `freshell display -p '#{pane_type}'` | Print pane type (terminal/browser/editor). |
-
-### 3.6 Commands Without Direct Mapping
-
-These tmux commands have no exact Freshell equivalent. Proposed alternatives:
-
-| tmux Command | Status | Proposal |
-|---|---|---|
-| `tmux attach-session` | **Not applicable** | Freshell is always "attached" (browser-based). No action needed. |
-| `tmux detach-client` | **Not applicable** | Agents don't detach from Freshell (they're using CLI, not a GUI session). |
-| `tmux copy-mode` | **Not needed** | Scrollback is accessed via `capture-pane`. |
-| `tmux set-option` | **Deferred** | Could map to `PATCH /api/settings` for server-wide settings. |
-| `tmux bind-key` / `unbind-key` | **Not applicable** | Freshell keybindings are in the browser UI, not relevant to agents. |
-| `tmux source-file` | **Not applicable** | No config file to source. |
-| `tmux command-prompt` | **Not applicable** | Interactive prompts don't apply to CLI usage. |
-| `tmux clock-mode` | **Not applicable** | Novelty. |
-| `tmux pipe-pane` | **Deferred** | Could be useful for logging terminal output to a file. Worth considering. |
-| `tmux wait-for` | **See §4.2** | Freshell can offer a better version. |
-| `tmux run-shell` | **Not needed** | Agents already have Bash. |
+This preserves your client-owned layout requirement without breaking PTY/session
+correctness.
 
 ---
 
-## 4. Freshell-Unique Features (Beyond tmux)
+## 4. Device Identity and Presence
 
-These are capabilities Freshell offers that tmux cannot. They follow the same CLI
-conventions so agents familiar with tmux will find them natural.
+### 4.1 Device Types
 
-### 4.1 Browser Panes
+- `browser`: interactive UI device.
+- `cli`: headless control device used by `freshell` CLI.
 
-```bash
-# Open a URL in a pane
-freshell open-browser -t PANE "https://localhost:3000"
+Both are first-class devices for layout ownership.
 
-# Open a URL in a new pane (splitting current)
-freshell split-pane --browser "https://localhost:3000"
+### 4.2 CLI Local Device Model
 
-# Open a URL in a new tab
-freshell new-tab --browser "https://localhost:3000" -n "Dev Server"
+`freshell` must have stable local identity.
 
-# Get current URL of a browser pane
-freshell display -p '#{pane_url}' -t PANE
+- Device ID stored at `~/.freshell/cli-device.json`.
+- On first run, generate `deviceId` and `deviceLabel` (hostname + username + suffix).
+- Omitted `--device` means this CLI device.
+- Tabs created by CLI default to `ownerDeviceId = <cli deviceId>`.
 
-# Navigate browser pane to new URL
-freshell navigate -t PANE "https://localhost:3000/admin"
-```
+This resolves the "local device" ambiguity.
 
-This is a first-class feature no tmux-based tool can offer. Agents that need to
-verify web UI behavior (e.g., "open the app and check if the login form renders")
-can do so programmatically.
+### 4.3 Presence Contract
 
-### 4.2 Wait-for-Output (Better than `tmux wait-for`)
-
-tmux's `wait-for` is a channel-based synchronization primitive—useful but low-level.
-Freshell can offer output-aware waiting.
-
-```bash
-# Wait until pane output matches a pattern (regex)
-freshell wait-for -t PANE -p "Server listening on port" [-T 30]
-
-# Wait until pane output stabilizes (no new output for N seconds)
-freshell wait-for -t PANE --stable 5 [-T 60]
-
-# Wait until terminal exits
-freshell wait-for -t PANE --exit [-T 120]
-
-# Wait until prompt is detected (shell returns to prompt)
-freshell wait-for -t PANE --prompt [-T 30]
-```
-
-**Flags:**
-- `-t PANE` — target pane
-- `-p PATTERN` — regex pattern to match against output
-- `-T TIMEOUT` — timeout in seconds (default: 30). Exit code 1 on timeout.
-- `--stable N` — wait until output hasn't changed for N seconds
-- `--exit` — wait until the terminal process exits
-- `--prompt` — wait until a shell prompt is detected (heuristic)
-
-This directly addresses the #1 reliability problem in agent-tmux interactions:
-**completion detection**. Instead of crude `sleep 90` or polling with
-`capture-pane`, agents can use a single blocking call.
-
-### 4.3 Coding CLI Integration
-
-```bash
-# Start a Claude Code session in a new tab
-freshell new-tab --claude [-n NAME] [--cwd DIR] [--prompt "initial prompt"]
-
-# Start a Codex session
-freshell new-tab --codex [-n NAME] [--cwd DIR]
-
-# Start any supported coding CLI
-freshell new-tab --coding-cli PROVIDER [-n NAME]
-
-# Resume a previous coding CLI session
-freshell new-tab --claude --resume SESSION_ID
-
-# List coding CLI sessions (not just terminals)
-freshell list-sessions [--provider claude|codex]
-
-# Search session history
-freshell search-sessions "authentication bug fix"
-```
-
-### 4.4 Editor Panes
-
-```bash
-# Open a file in an editor pane
-freshell split-pane --editor "/path/to/file.ts"
-
-# Open a file in a new tab
-freshell new-tab --editor "/path/to/file.ts" -n "config"
-
-# Read file content from editor pane
-freshell display -p '#{pane_file}' -t PANE
-```
-
-### 4.5 AI Summaries
-
-```bash
-# Get an AI summary of a terminal's recent output
-freshell summarize -t PANE
-
-# Get a summary of a coding CLI session
-freshell summarize --session SESSION_ID
-```
-
-### 4.6 Server Info
-
-```bash
-# Health check
-freshell health
-
-# Get LAN IP addresses (for sharing access)
-freshell lan-info
-
-# Get server URL
-freshell display -p '#{server_url}'
-```
-
-### 4.7 Multi-Pane Run (Orchestration Primitive)
-
-```bash
-# Run a command in a new pane and wait for it to complete
-freshell run -n "tests" "npm test"
-
-# Run in background (new tab, don't switch to it)
-freshell run -d -n "server" "npm run dev"
-
-# Run and capture output (blocking, returns stdout)
-freshell run --capture "npm test" [-T 120]
-```
-
-This combines `new-tab` + `send-keys` + `wait-for --exit` + `capture-pane` into a
-single command. It's the pattern agents use most frequently, packaged as a
-first-class operation.
+- Presence comes from active WS connection + heartbeat.
+- Server marks device offline after `presenceTtlMs` expiration.
+- RPC routing to offline owner returns `DEVICE_OFFLINE` immediately.
+- No offline replay queue.
 
 ---
 
-## 5. Target Addressing
+## 5. Targeting Model
 
-### tmux Target Format
+Ambiguous shorthand is removed.
 
-tmux uses `session:window.pane` addressing:
-```
-my-session:0.0     # session "my-session", window 0, pane 0
-:1.2               # current session, window 1, pane 2
-```
+### 5.1 Device Selector
 
-### Freshell Target Format
+- `--device <device-id>`: target specific owner device.
+- Missing `--device`: current CLI device.
 
-Since sessions are flattened, Freshell uses `tab.pane` or just `pane`:
+### 5.2 Entity Selectors
 
-```
--t my-tab.0        # tab named "my-tab", pane 0
--t my-tab           # tab named "my-tab", active pane
--t .0               # active tab, pane 0
--t 0                # active tab, pane 0 (shorthand)
--t abc123           # pane by unique ID (unambiguous)
-```
+Allowed selectors:
 
-**Resolution rules** (in order):
-1. If target matches a pane ID exactly → that pane
-2. If target contains `.` → split as `tab.pane` (tab by name or index, pane by index)
-3. If target is numeric → pane index in active tab
-4. If target matches a tab name → active pane in that tab
-5. If target matches a tab ID → active pane in that tab
+- `tab:<tab-id>`
+- `tab-name:<name>`
+- `tab-index:<n>`
+- `pane:<pane-id>`
+- `pane-index:<n>` (requires explicit tab selector)
+- `terminal:<terminal-id>`
+- `session:<provider>:<session-id>`
 
-For backward compatibility with agents that use tmux's `session:window.pane` format,
-the parser also accepts colons: `session:window.pane` → ignore session, use window
-as tab name, pane as pane index.
+### 5.3 Resolution Rules
+
+1. Parse selector type.
+2. Resolve against owner live state for layout selectors.
+3. Resolve against server live registries for `terminal:` / `session:` selectors.
+4. Multiple matches are hard errors (`AMBIGUOUS_TARGET`).
+
+No tmux `session:window.pane` compatibility parser.
+
+### 5.4 Selector Support by Command
+
+- Any command argument documented as `--target` or `--tab` accepts relevant selectors
+  from this section unless the command explicitly narrows target type.
+- `pane-index:<n>` is valid only when a tab selector is also provided (`--tab ...`).
+- Class for dual-plane commands is determined after selector resolution:
+  `terminal:` / `session:` -> server-direct (`P` / `S`), `pane:` / `pane-index:` -> hybrid (`H`).
 
 ---
 
-## 6. Implementation Architecture
+## 6. Command Routing Classes
 
-### 6.1 CLI Tool (`freshell`)
+### 6.1 Class L: Layout Mutations (Owner RPC)
 
-A standalone Node.js CLI script (or compiled binary via `pkg`/`bun compile`). It
-communicates with the Freshell server over its existing REST API and WebSocket
-protocol.
+Require online owner device:
 
-```
-┌──────────────┐     HTTP/WS      ┌──────────────────┐
-│  freshell    │ ◄──────────────► │  Freshell Server  │
-│  CLI tool    │                  │  (already running) │
-└──────────────┘                  └──────────────────────┘
-```
+- `new-tab`, `kill-tab`, `rename-tab`, `select-tab`
+- `split-pane --browser|--editor`, `kill-pane`, `resize-pane`, `swap-pane`, `select-pane`
+- `open-browser`, `navigate`, `open-editor`
 
-**Discovery**: The CLI finds the server via:
-1. `FRESHELL_URL` environment variable
-2. `FRESHELL_TOKEN` environment variable
-3. `~/.freshell/cli.json` config file (written by server on startup)
-4. Default: `http://localhost:3000`
+If target owner offline: `DEVICE_OFFLINE`.
 
-### 6.2 New REST Endpoints Required
+### 6.2 Class P: Terminal Process Ops (Server-Direct)
 
-The existing REST API covers settings and sessions but lacks terminal control.
-New endpoints needed:
+Never routed through owner device:
 
-| Endpoint | Method | Purpose |
+- `send-keys --target terminal:...`
+- `capture-pane --target terminal:...`
+- `wait-for --target terminal:...`
+- `list-terminals`, `respawn-terminal`, `kill-terminal`
+
+These remain deterministic when no browser is connected.
+`wait-for` uses a shared server `WaitManager` and stream events; it never relies on
+client polling loops.
+
+### 6.3 Class S: SDK/CodingCLI Ops (Server-Direct)
+
+- `sdk.create/send/interrupt/kill/attach`
+- `codingcli.create/input/kill`
+- CLI aliases (`session-create`, `session-send`, `session-wait`, etc.)
+
+### 6.4 Class H: Hybrid Ops (Layout + Process)
+
+Example: `split-pane --shell`.
+
+Hybrid command forms include:
+
+- `split-pane --shell` (or default terminal split form)
+- `respawn-pane --target pane:...`
+- `attach-terminal --target terminal:... --to pane:...`
+- `send-keys` / `capture-pane` / `wait-for` when target is `pane:...` or `pane-index:...`
+
+Execution order depends on hybrid subtype:
+
+Mutation hybrids (`split-pane --shell`, `attach-terminal`, `respawn-pane`):
+
+1. Owner RPC applies/validates layout mutation and reserves or validates pane reference.
+2. Server spawns/attaches/respawns process or terminal binding.
+3. Owner RPC finalizes pane content reference (`terminalId` or `sessionRef`).
+
+Resolution hybrids (`send-keys` / `capture-pane` / `wait-for` with pane selectors):
+
+1. Owner RPC resolves pane selector to stable process/session reference.
+2. Server executes process/session operation on resolved reference (no layout mutation).
+
+Failure handling:
+
+- Mutation hybrid step 1 fails: no side effects.
+- Mutation hybrid step 2 fails: owner receives compensating mutation to remove orphan pane.
+- Mutation hybrid step 3 fails: operation returns `INCONSISTENT_STATE`; server retains process and emits remediation guidance.
+- Resolution hybrid step 1 fails: return `DEVICE_OFFLINE`, `NOT_FOUND`, or `INVALID_TARGET`.
+- Resolution hybrid step 2 fails: return server operation error; no layout side effects.
+
+### 6.5 Routing Matrix (Authoritative)
+
+| command form | class | owner online required | notes |
+|---|---|---|---|
+| `new-tab` / `kill-tab` / `rename-tab` / `select-tab` | L | yes | layout-only mutation |
+| `split-pane --browser|--editor` | L | yes | layout-only pane creation |
+| `split-pane --shell` (or default terminal split) | H | yes | owner reserve/finalize + server create/attach |
+| `send-keys --target terminal:...` | P | no | server-direct PTY input |
+| `send-keys --target pane:...|pane-index:...` | H | yes | owner resolves pane -> terminal, then server input |
+| `capture-pane --target terminal:...` | P | no | server buffer read |
+| `capture-pane --target pane:...|pane-index:...` | H | yes | owner resolves pane -> terminal, then server read |
+| `wait-for --target terminal:...` | P | no | server `WaitManager` on PTY stream |
+| `wait-for --target session:...` | S | no | server `WaitManager` on session stream |
+| `wait-for --target pane:...|pane-index:...` | H | yes | owner resolves pane ref, then server wait |
+| `attach-terminal --target terminal:... --to pane:...` | H | yes | owner layout mutation binding pane contentRef |
+| `respawn-terminal --target terminal:...` | P | no | server process lifecycle |
+| `respawn-pane --target pane:...|pane-index:...` | H | yes | owner resolution + server respawn + owner finalize |
+| `sdk.create/send/interrupt/kill/attach` | S | no | server session authority |
+| `codingcli.create/input/kill` | S | no | server session authority |
+
+---
+
+## 7. tmux Mapping (Constrained)
+
+This proposal is tmux-like, not byte-for-byte tmux emulation.
+
+| tmux intent | freshell command | route |
 |---|---|---|
-| `/api/tabs` | GET | List all tabs with pane info |
-| `/api/tabs` | POST | Create a new tab |
-| `/api/tabs/:id` | DELETE | Kill tab and its terminals |
-| `/api/tabs/:id/select` | POST | Switch active tab |
-| `/api/panes` | GET | List all panes (or panes for a tab) |
-| `/api/panes/:id/split` | POST | Split a pane |
-| `/api/panes/:id/close` | POST | Close a pane |
-| `/api/panes/:id/select` | POST | Set active pane |
-| `/api/panes/:id/send-keys` | POST | Send input to pane's terminal |
-| `/api/panes/:id/capture` | GET | Capture pane output |
-| `/api/panes/:id/wait-for` | GET | Long-poll until condition met |
-| `/api/panes/:id/navigate` | POST | Navigate browser pane |
-| `/api/run` | POST | Create tab + send command + wait |
+| create window/session | `new-tab` | L |
+| list windows | `list-tabs` | live owner or cache if `--allow-stale` |
+| split pane | `split-pane --direction ...` | L/H |
+| send keys | `send-keys` | P (`terminal:` target) / H (`pane:` target) |
+| capture output | `capture-pane` | P (`terminal:` target) / H (`pane:` target) |
+| wait for completion | `wait-for` | P (`terminal:`), S (`session:`), H (`pane:`) |
+| kill pane/window | `kill-pane` / `kill-tab` | L |
 
-Most of these are thin wrappers around existing WebSocket messages and Redux
-actions. The WebSocket protocol already supports `terminal.create`,
-`terminal.input`, `terminal.attach`, etc. The REST endpoints formalize these
-as stateless request/response operations.
+Explicitly not supported:
 
-### 6.3 Scrollback Buffer Access
+- tmux target grammar (`session:window.pane`)
+- transparent tmux wrapper shim
 
-`capture-pane` requires reading the terminal scrollback buffer. Currently, the
-buffer is only sent as a snapshot on `terminal.attach`. A new endpoint exposes it
-directly:
+---
 
-```
-GET /api/terminals/:id/buffer?start=-200&join=true&strip_ansi=true
-```
+## 8. Critical Command Semantics
 
-This reads from the existing 64KB ring buffer in `TerminalRegistry`.
+### 8.1 `send-keys`
 
-### 6.4 MCP Server (Optional, Complementary)
+Target forms:
 
-In addition to the CLI tool, an MCP server can expose the same operations as
-structured tools. This lets agents use Freshell through their native tool interface
-rather than Bash.
+- `--target terminal:<id>` (Class P, server-direct)
+- `--target pane:<id>|pane-index:<n>` (Class H, requires owner-online pane->terminal resolution)
+- `pane-index:<n>` requires `--tab` selector context
+
+Behavior:
+
+- left-to-right token processing
+- key token translation (`Enter`, `C-c`, arrows, etc.)
+- `-l` means literal mode
+
+If pane target owner offline: `DEVICE_OFFLINE`.
+If resolved pane content is not terminal-backed: `INVALID_TARGET`.
+
+### 8.2 `capture-pane`
+
+Target forms mirror `send-keys`:
+
+- `terminal:` target -> Class P
+- `pane:` / `pane-index:` target -> Class H
+- `pane-index:<n>` requires `--tab` selector context
+
+Semantics:
+
+- `-S <line>` follows tmux-style line indexing against retained history
+- `-S -` means full retained history
+- `-J` joins wrapped soft-lines only when wrap metadata is available
+- `-e` includes ANSI; default strips ANSI
+
+If requested semantics cannot be satisfied exactly (e.g. missing wrap metadata),
+return `UNSUPPORTED_CAPTURE_MODE` instead of silently changing meaning.
+
+### 8.3 `wait-for`
+
+Targets `terminal:`, `session:`, or pane selectors (`pane:` / `pane-index:`).
+
+Predicates:
+
+- `--pattern <text-or-regex>`
+- `--literal` (default when `--pattern` is provided)
+- `--regex` (opt-in)
+- `--from now|tail:N` (default: `now`)
+- `--stable <seconds>`
+- `--exit`
+- `--prompt` (terminal mode only; heuristic)
+
+Combination rule:
+
+- multiple predicates are **AND** conditions
+- no predicates provided is `INVALID_ARGUMENT`
+- `--stable` is non-latching and must be true at completion time
+
+Execution model (performance-critical):
+
+- All waits are managed by one server `WaitManager` keyed by terminal/session target.
+- No polling against `capture-pane`; no full `buffer.snapshot()` rescans in steady state.
+- Each target stream has a monotonic `outputSeq`.
+- Each wait records `startSeq`, `lastSeqChecked`, and a small carry buffer for
+  cross-chunk pattern boundaries.
+- Matching evaluates only incremental chunks `> lastSeqChecked`.
+- Pattern/exit/prompt predicates latch true when satisfied.
+- `stable` is evaluated as a level condition and resets on every new output event.
+- Command succeeds when all requested predicates are true.
+- Timeout returns `TIMEOUT` with predicate progress.
+
+Pattern engine contract:
+
+- `--literal` uses incremental substring search and is the default.
+- `--regex` is allowed only with a safe linear-time regex engine (RE2 class).
+- Regex compilation happens once per wait request, never per chunk.
+- If safe regex engine is unavailable, return `UNSUPPORTED_PATTERN_ENGINE`.
+
+Timer/scheduler contract:
+
+- Stable/timeout checks use central scheduler structures (timer wheel or min-heap),
+  not ad-hoc per-chunk polling loops.
+- Wait evaluation runs with per-tick CPU budget; overflow work is deferred by
+  `setImmediate`/equivalent to protect event loop responsiveness.
+
+`--stable` contract:
+
+- `--stable N` means: no output events for `N` continuous seconds on target stream.
+- Stable timer resets whenever new output is observed.
+- `--stable` observes stream activity from wait registration time forward
+  (`--from` affects pattern scan window only).
+- With `--exit`, success requires exit observed and stable window satisfied after
+  the later of (exit event time, last output time).
+
+Resource limits and load-shedding:
+
+- `WAIT_MAX_GLOBAL`: max active waits across server.
+- `WAIT_MAX_PER_TARGET`: max active waits per terminal/session target.
+- `WAIT_MAX_TIMEOUT_SEC`: hard upper bound on timeout duration.
+- `WAIT_MAX_PATTERN_BYTES`: max pattern size.
+- `WAIT_MAX_REGEX_PER_TARGET`: regex wait budget per target.
+- Excess wait requests fail fast with `RESOURCE_LIMIT`.
+- Under overload, reject new regex waits before literal waits.
+- Deduplicate identical active waits on the same target and fan out one matcher
+  result to multiple callers.
+- Backpressure or wait overload must not degrade terminal output fanout.
+
+Prompt heuristic contract:
+
+- explicitly best-effort
+- never sole correctness guarantee for destructive operations
+- should be treated as advisory signal unless combined with stronger predicates
+- baseline heuristic: shell-like prompt token at end-of-line after ANSI-stripping
+  (`$`, `#`, `>`, `%`); implementation may extend but must document false-positive risk
+
+### 8.4 `attach-terminal`
+
+`attach-terminal --target terminal:<id> --to pane:<id>|pane-index:<n>`:
+
+- owner RPC updates pane mapping to referenced terminal
+- no process transfer; only pane binding change
+- requires owner online
+- `pane-index:<n>` requires `--tab` selector context
+- class is `H` (layout mutation + process reference rebind)
+- request must include `expectedRevision` and `idempotencyKey`
+- revision mismatch returns `REVISION_CONFLICT` with `currentRevision`
+
+### 8.5 `navigate`
+
+`navigate --target pane:<id> <url>`:
+
+- layout/UI metadata mutation owned by pane owner device
+- routed via owner RPC
+- validates URL before apply
+
+### 8.6 `respawn`
+
+Two explicit forms:
+
+- `respawn-terminal --target terminal:<id>` (P)
+- `respawn-pane --target pane:<id>|pane-index:<n>` (H: owner resolves pane, server respawns bound process, owner updates refs)
+
+### 8.7 `display`
+
+`display` is a pure read command; it never mutates layout/process state.
+
+Format grammar:
+
+- `-p FORMAT` is a token template rendered once.
+- Supported tokens: `%deviceId`, `%tabId`, `%tabTitle`, `%paneId`, `%paneKind`,
+  `%terminalId`, `%sessionRef`, `%ownerOnline`, `%workspaceRevision`.
+- `%%` escapes to literal `%`.
+- Unknown tokens return `INVALID_ARGUMENT`.
+- Missing values render as empty string.
+
+### 8.8 `session-create`
+
+`session-create` maps directly to existing server message contracts:
+
+- `--provider sdk` -> `sdk.create` (`cwd`, `resumeSessionId`, `model`,
+  `permissionMode`, `effort`).
+- `--provider codingcli` -> `codingcli.create` and requires:
+  `--coding-provider <claude|codex|opencode|gemini|kimi>` and `--prompt <text>`.
+
+If required provider-specific arguments are missing, return `INVALID_ARGUMENT`.
+
+---
+
+## 9. RPC Protocol (Layout Plane)
+
+### 9.1 Messages
+
+- `layout.rpc.request`
+- `layout.rpc.ack`
+- `layout.rpc.result`
+- `device.presence`
+- `layout.snapshot.updated`
+
+### 9.2 Request Envelope
 
 ```json
 {
-  "tools": [
-    {"name": "freshell_new_tab",      "description": "Create a new tab"},
-    {"name": "freshell_send_keys",    "description": "Send keystrokes to a pane"},
-    {"name": "freshell_capture_pane", "description": "Read terminal output"},
-    {"name": "freshell_wait_for",     "description": "Wait for output pattern"},
-    {"name": "freshell_list_tabs",    "description": "List all tabs"},
-    {"name": "freshell_list_panes",   "description": "List panes in a tab"},
-    {"name": "freshell_open_browser", "description": "Open URL in browser pane"},
-    {"name": "freshell_run",          "description": "Run command and capture output"},
-    {"name": "freshell_split_pane",   "description": "Split a pane"},
-    {"name": "freshell_kill_pane",    "description": "Close a pane"},
-    {"name": "freshell_kill_tab",     "description": "Close a tab"},
-    {"name": "freshell_summarize",    "description": "AI summary of terminal output"}
-  ]
+  "type": "layout.rpc.request",
+  "requestId": "req_123",
+  "callerDeviceId": "cli_dev_1",
+  "targetDeviceId": "dandesktop",
+  "command": "split-pane",
+  "args": {
+    "target": "pane:p_abc",
+    "direction": "horizontal"
+  },
+  "expectedRevision": 42,
+  "idempotencyKey": "idem_123"
 }
 ```
 
-The MCP server calls the same REST endpoints as the CLI, keeping a single source
-of truth.
+### 9.3 Timeout/Error Stages
+
+- `RPC_TIMEOUT`: relay-level failure before owner ack (delivery stage).
+- `OWNER_TIMEOUT`: owner acked but did not complete before deadline (execution stage).
+
+Error payload includes `stage: relay|owner`.
+
+### 9.4 Delivery Contract
+
+- at-most-once relay delivery
+- idempotency keys required for owner-routed mutating commands (`new-tab`,
+  `split-pane` (all content forms), `attach-terminal`, `respawn-pane`)
+- CLI auto-generates idempotency keys when omitted; `--idempotency-key` allows
+  caller-specified stable retry identity.
+- no queued replay after reconnect
 
 ---
 
-## 7. Agent Discovery & Environment
+## 10. Cache and Read Semantics
 
-### 7.1 How Agents Know They're in Freshell
+Server cache is last-known snapshot only.
 
-When Freshell spawns a terminal, it should set environment variables:
+### 10.1 Read Modes
 
-```bash
-FRESHELL=1
-FRESHELL_URL=http://localhost:3000
-FRESHELL_TOKEN=abc123
-FRESHELL_TAB_ID=tab_xyz
-FRESHELL_TAB_NAME=my-tab
-FRESHELL_PANE_ID=pane_abc
-FRESHELL_TERMINAL_ID=term_123
-```
+- default: live owner required for layout reads
+- `--allow-stale`: permit cached layout snapshot
 
-Agents (and their skills/tools) can check `FRESHELL=1` to detect they're inside
-Freshell, just as they check `TMUX` to detect they're inside tmux.
+### 10.2 Freshness Fields
 
-### 7.2 CLI Auto-Configuration
+Any cache-backed result includes:
 
-When `FRESHELL` is set, the CLI reads URL and token from environment variables.
-No configuration file needed. The agent simply runs `freshell list-tabs` and it
-works.
+- `source: "cache" | "live"`
+- `capturedAt`
+- `ownerOnline`
+- `ownerLastSeenAt`
 
-### 7.3 Compatibility Shim (Optional, Low Priority)
-
-For maximum compatibility, a `tmux` wrapper script could be provided that translates
-tmux commands to freshell commands. This would let existing tmux-based agent tools
-work without modification:
-
-```bash
-#!/bin/bash
-# ~/.local/bin/tmux (higher priority than system tmux)
-if [ -n "$FRESHELL" ]; then
-  exec freshell --tmux-compat "$@"
-else
-  exec /usr/bin/tmux "$@"
-fi
-```
-
-This is a stretch goal—most agents should learn to use `freshell` directly via
-skills/instructions. But it could enable zero-config compatibility with existing
-MCP servers and orchestration tools.
+Process/session reads (`terminal:` / `session:`) are live server reads and do not
+require owner presence.
 
 ---
 
-## 8. Full Command Reference Summary
+## 11. Data Model
 
-### Tab Commands
-```
-freshell new-tab [-n NAME] [-d] [--shell SHELL] [--cwd DIR]
-                 [--claude|--codex|--coding-cli PROVIDER] [--prompt TEXT]
-                 [--resume SESSION_ID]
-                 [--browser URL] [--editor FILE]
-freshell list-tabs
-freshell select-tab -t TAB
-freshell kill-tab -t TAB
-freshell rename-tab -t TAB NAME
-freshell has-tab -t TAB
-freshell next-tab
-freshell prev-tab
-```
+### 11.1 Layout Entities (Authoritative on Owner Device)
 
-### Pane Commands
-```
-freshell split-pane [-t PANE] [-h|-v]
-                    [--shell SHELL] [--cwd DIR]
-                    [--claude|--codex|--coding-cli PROVIDER]
-                    [--browser URL] [--editor FILE]
-freshell list-panes [-t TAB]
-freshell select-pane -t PANE
-freshell kill-pane -t PANE
-freshell resize-pane -t PANE [-x WIDTH] [-y HEIGHT]
-freshell swap-pane
-freshell respawn-pane -t PANE
-```
+Tab minimum fields:
 
-### I/O Commands
-```
-freshell send-keys -t PANE [-l] [KEYS...]
-freshell capture-pane [-t PANE] [-S LINES] [-J] [-e]
-freshell wait-for -t PANE [-p PATTERN] [--stable N] [--exit] [--prompt] [-T TIMEOUT]
-```
+- `id`
+- `ownerDeviceId`
+- `title`
+- `status`
+- `createdAt`
+- `updatedAt`
 
-### Browser Commands
-```
-freshell open-browser -t PANE URL
-freshell navigate -t PANE URL
-freshell new-tab --browser URL [-n NAME]
-freshell split-pane --browser URL [-t PANE]
-```
+Pane minimum fields:
 
-### Coding CLI Commands
-```
-freshell new-tab --claude [--prompt TEXT] [--cwd DIR] [--resume ID]
-freshell new-tab --codex [--cwd DIR]
-freshell list-sessions [--provider PROVIDER]
-freshell search-sessions QUERY
-```
+- `id`
+- `tabId`
+- `ownerDeviceId`
+- `kind` (`terminal|browser|editor|claude-chat|picker`)
+- `status`
+- `contentRef` (`terminalId` or `sessionRef` where applicable)
+- `updatedAt`
 
-### Utility Commands
-```
-freshell display -p FORMAT [-t PANE]
-freshell run [-d] [-n NAME] [--capture] [-T TIMEOUT] COMMAND
-freshell summarize [-t PANE] [--session ID]
+Owner workspace metadata minimum fields:
+
+- `ownerDeviceId`
+- `workspaceRevision`
+- `updatedAt`
+
+### 11.2 Process/Session Entities (Authoritative on Server)
+
+Terminal fields:
+
+- `terminalId`
+- `mode`
+- `status`
+- `createdAt`
+- `lastActivityAt`
+- `bufferRef`
+
+SDK/CodingCLI session fields:
+
+- `provider`
+- `sessionId`
+- `status`
+- `updatedAt`
+
+### 11.3 Revision Rules
+
+- Revision scope is per owner workspace (`workspaceRevision` monotonic per `ownerDeviceId`).
+- Tab/pane entities do not maintain independent revision counters.
+- Every successful layout mutation increments `workspaceRevision` by 1.
+- RPC mutation must provide `expectedRevision`.
+- CLI supports `--expected-revision` on layout-mutating commands; when omitted, CLI
+  performs a live owner read and injects current `workspaceRevision`.
+- If owner is offline, revision preflight fails with `DEVICE_OFFLINE`.
+- Mismatch returns `REVISION_CONFLICT` with `currentRevision` (`workspaceRevision`).
+- Successful mutation responses include `appliedRevision`.
+- Initial revision after migration: `1`.
+
+---
+
+## 12. Security Model
+
+### 12.1 Token Flow
+
+- `AUTH_TOKEN` remains bootstrap auth for server access.
+- CLI exchanges bootstrap auth for short-lived device session token via `POST /api/device-sessions`.
+- Device token TTL: 15 minutes; renewable via refresh endpoint.
+- Device token scopes include device-bound layout write scope.
+- CLI mutating commands auto-refresh device token when expiry is near; refresh failure
+  returns `UNAUTHORIZED` with re-login guidance.
+
+### 12.2 Credential Storage
+
+- CLI credential path: `~/.freshell/cli-auth.json`.
+- File mode must be `0600`; refuse startup if broader.
+- Child process env must never include long-lived auth tokens.
+
+### 12.3 Authorization Rules
+
+For cross-device layout mutation:
+
+- same authenticated principal required
+- caller must have remote-control scope for target device
+- deny by default without explicit permission
+
+### 12.4 Audit Log
+
+Server writes JSONL at `~/.freshell/audit/remote-control.jsonl`:
+
+- `requestId`
+- `callerDeviceId`
+- `targetDeviceId`
+- `command`
+- `result`
+- `errorCode`
+- `stage`
+- `timestamp`
+
+### 12.5 CLI Auth Command Contract
+
+- `freshell auth login`: exchange bootstrap credentials for device session token.
+- `freshell auth status`: show token expiry and active device binding.
+- `freshell auth refresh`: proactively renew device token.
+- `freshell auth logout`: remove local credential file and invalidate refresh token.
+
+---
+
+## 13. Migration and Cutover
+
+Unified cutover still requires deterministic migration.
+
+### 13.1 Client-Side Layout Migration
+
+On first cutover startup, each device:
+
+1. loads local tabs/panes
+2. stamps missing `ownerDeviceId` with local `deviceId`
+3. initializes `workspaceRevision = 1`
+4. writes migrated local state
+5. publishes `layout.snapshot.updated` to server
+
+### 13.2 Server Migration
+
+- Existing cached snapshots without owner metadata are rejected after cutover.
+- Server accepts only `layoutOwnershipV1` clients.
+- Legacy clients are denied with explicit version error.
+
+### 13.3 Capability Gate
+
+Cutover prerequisite:
+
+- extend `HelloSchema.capabilities` in `shared/ws-protocol.ts` and handshake parsing
+  in `server/ws-handler.ts` with cutover fields below.
+- existing capability fields (`sessionsPatchV1`, `terminalAttachChunkV1`) remain
+  supported and orthogonal.
+
+`hello.capabilities` must include:
+
+- `layoutOwnershipV1: true`
+- `layoutRpcV1: true`
+- `devicePresenceV1: true`
+
+No compatibility path for old capability sets.
+
+---
+
+## 14. Error Model
+
+Canonical command/operation errors (post-cutover):
+
+- `DEVICE_OFFLINE`
+- `RPC_TIMEOUT`
+- `OWNER_TIMEOUT`
+- `REVISION_CONFLICT`
+- `NOT_FOUND`
+- `AMBIGUOUS_TARGET`
+- `INVALID_TARGET`
+- `INVALID_ARGUMENT`
+- `UNAUTHORIZED`
+- `RESOURCE_LIMIT`
+- `UNSUPPORTED_PATTERN_ENGINE`
+- `UNSUPPORTED_CAPTURE_MODE`
+- `TIMEOUT`
+- `INCONSISTENT_STATE`
+- `INTERNAL_ERROR`
+
+Protocol alignment requirement:
+
+- `shared/ws-protocol.ts` `ErrorCode` enum must be extended with all command/operation
+  codes above before enabling cutover.
+- Client and server error handlers must be updated to support the expanded union.
+- Existing transport/auth errors (`NOT_AUTHENTICATED`, `INVALID_MESSAGE`,
+  `UNKNOWN_MESSAGE`, etc.) remain valid and unchanged.
+
+CLI contract:
+
+- non-zero exit on error
+- `--json` output includes `code`, `message`, `details`, and (when relevant) `stage`
+
+---
+
+## 15. Command Surface (Cutover)
+
+Selector note:
+
+- `--target` and `--tab` accept selector forms from section 5.2 unless narrowed.
+- `pane-index:<n>` requires `--tab ...`.
+
+Mutation concurrency note:
+
+- all Class L/H mutating commands accept `--expected-revision N` (or auto-resolve per section 11.3).
+- commands requiring protocol idempotency (`new-tab`, `split-pane` (all forms),
+  `attach-terminal`, `respawn-pane`) accept `--idempotency-key KEY` (auto-generated if omitted).
+
+```bash
+# Device, presence, and auth
+freshell list-devices
+freshell device-status --device DEVICE
+freshell auth login [--auth-token TOKEN|--from-env AUTH_TOKEN]
+freshell auth status
+freshell auth refresh
+freshell auth logout
+
+# Layout (Class L/H)
+freshell new-tab [--device DEVICE] [-n NAME] [--shell SHELL] [--cwd DIR] [--expected-revision N] [--idempotency-key KEY]
+freshell list-tabs [--device DEVICE] [--allow-stale]
+freshell select-tab --device DEVICE --target tab:ID|tab-name:NAME|tab-index:N [--expected-revision N]
+freshell kill-tab --device DEVICE --target tab:ID|tab-name:NAME|tab-index:N [--expected-revision N]
+freshell rename-tab --device DEVICE --target tab:ID|tab-name:NAME|tab-index:N NAME [--expected-revision N]
+
+freshell split-pane --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] --direction horizontal|vertical [--shell SHELL|--browser URL|--editor FILE] [--expected-revision N] [--idempotency-key KEY]
+freshell list-panes [--device DEVICE] [--tab tab:ID|tab-name:NAME|tab-index:N] [--allow-stale]
+freshell select-pane --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] [--expected-revision N]
+freshell kill-pane --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] [--expected-revision N]
+freshell resize-pane --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] [-x WIDTH] [-y HEIGHT] [--expected-revision N]
+freshell swap-pane --device DEVICE --source pane:SRC|pane-index:SRC_IDX --target pane:DST|pane-index:DST_IDX [--tab tab:ID|tab-name:NAME|tab-index:N] [--expected-revision N]
+
+freshell open-browser --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] URL [--expected-revision N]
+freshell navigate --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] URL [--expected-revision N]
+freshell open-editor --device DEVICE --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] FILE [--expected-revision N]
+
+# Terminal process (Class P/H by target type)
+freshell list-terminals
+freshell send-keys --target terminal:ID|pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] [--device DEVICE] [-l] [KEYS...]
+freshell capture-pane --target terminal:ID|pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] [--device DEVICE] [-S START] [-J] [-e]
+freshell wait-for --target terminal:ID|pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] [--device DEVICE] [--from now|tail:N] [-p PATTERN] [--literal|--regex] [--stable N] [--exit] [--prompt] [-T TIMEOUT]
+freshell respawn-terminal --target terminal:ID
+freshell respawn-pane --target pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] --device DEVICE [--expected-revision N] [--idempotency-key KEY]
+freshell kill-terminal --target terminal:ID
+freshell attach-terminal --target terminal:ID --to pane:ID|pane-index:N [--tab tab:ID|tab-name:NAME|tab-index:N] --device DEVICE [--expected-revision N] [--idempotency-key KEY]
+
+# SDK/CodingCLI sessions (Class S)
+freshell session-create --provider sdk [--cwd DIR] [--resume-session-id ID] [--model MODEL] [--permission-mode MODE] [--effort low|medium|high|max]
+freshell session-create --provider codingcli --coding-provider claude|codex|opencode|gemini|kimi --prompt TEXT [--cwd DIR] [--resume-session-id ID] [--model MODEL] [--max-turns N] [--permission-mode default|plan|acceptEdits|bypassPermissions] [--sandbox read-only|workspace-write|danger-full-access]
+freshell session-list [--provider PROVIDER]
+freshell session-send --target session:PROVIDER:ID TEXT
+freshell session-wait --target session:PROVIDER:ID [--from now|tail:N] [-p PATTERN] [--literal|--regex] [--stable N] [-T TIMEOUT]
+freshell session-kill --target session:PROVIDER:ID
+
+# Utility
+freshell display --device DEVICE -p FORMAT [--target pane:ID|pane-index:N] [--tab tab:ID|tab-name:NAME|tab-index:N]
 freshell health
 freshell lan-info
-freshell list-terminals
-freshell attach -t TERMINAL
 ```
 
 ---
 
-## 9. Priority & Phasing
+## 16. Unified Cutover Acceptance Checklist
 
-### Phase 1: Core Agent Operations (MVP)
+All items required before merge:
 
-The minimum viable set for agents to operate Freshell:
-
-1. `send-keys` — send input to terminals
-2. `capture-pane` — read terminal output
-3. `list-tabs` / `list-panes` — discover what's running
-4. `new-tab` — create terminals
-5. `kill-tab` / `kill-pane` — clean up
-6. `display` — introspection (pane ID, terminal ID, mode)
-7. Environment variables (`FRESHELL`, `FRESHELL_URL`, etc.)
-8. REST endpoints for the above
-9. Scrollback buffer access endpoint
-
-### Phase 2: Reliability & Orchestration
-
-Features that make multi-agent workflows robust:
-
-1. `wait-for` — output pattern matching, stability detection, exit waiting
-2. `run` — combined create + execute + wait + capture
-3. `split-pane` — multi-pane layouts
-4. `select-tab` / `select-pane` — navigation
-5. `rename-tab` — labeling for discoverability
-
-### Phase 3: Freshell-Unique Features
-
-Capabilities that differentiate Freshell from tmux:
-
-1. `open-browser` / `navigate` — browser pane control
-2. `--claude` / `--codex` — coding CLI integration
-3. `summarize` — AI summaries
-4. `search-sessions` — session history search
-5. `--editor` — editor pane control
-6. MCP server
-
-### Phase 4: Compatibility
-
-Polish for ecosystem integration:
-
-1. tmux compatibility shim (`--tmux-compat`)
-2. Split direction flags (`-h`/`-v`)
-3. `pipe-pane` equivalent for output logging
-4. Configurable pane layout algorithms
+1. Authority boundaries implemented (layout owner-routed; process/session server-direct).
+2. CLI stable device identity implemented (`~/.freshell/cli-device.json`).
+3. Layout RPC protocol implemented with relay/owner stage errors.
+4. Presence + `DEVICE_OFFLINE` behavior enforced for Class L/H commands.
+5. No server-side layout surrogate execution and no replay queue.
+6. Explicit selector parser implemented; ambiguous shorthand removed.
+7. `send-keys` / `capture-pane` / `wait-for` route by resolved target (`terminal/session` server-direct, `pane` hybrid owner-resolved).
+8. SDK/CodingCLI command path integrated and documented (including protocol-aligned `session-create` parameters).
+9. Revision conflict handling implemented with workspace-level `expectedRevision` and `currentRevision`.
+10. Security token flow, auth command lifecycle, and credential permission checks implemented.
+11. Migration implemented for owner metadata and revision initialization.
+12. Capability gate enabled with schema/handler support (`shared/ws-protocol.ts` `HelloSchema.capabilities` + `server/ws-handler.ts` parsing); legacy clients rejected.
+13. Unit/integration/e2e coverage updated for routing, offline behavior, and hybrid rollback.
+14. Docs reflect only cutover semantics; no phased/back-compat language remains.
+15. Server `WaitManager` implemented as event-driven incremental matcher (no polling, no repeated full-buffer scans).
+16. Wait resource caps and load-shedding implemented (`WAIT_MAX_*`, `RESOURCE_LIMIT`) with tests.
+17. Performance telemetry implemented for waits (`wait_active`, `wait_match_latency_ms`, `wait_eval_ms`, `wait_timeouts_total`, `wait_resource_limit_total`, `wait_backlog_depth`).
+18. SLOs defined and validated under load: no terminal-stream regression with waits enabled, and bounded p99 wait match latency.
+19. Load tests added for high-output terminals, many concurrent waits, regex-heavy/adversarial patterns, and timeout churn.
+20. Shared `ErrorCode` union expanded and validated end-to-end for all cutover command errors.
 
 ---
 
-## 10. Design Decisions & Rationale
+## 17. Non-Goals
 
-### Why a CLI tool rather than just REST API / MCP?
-
-Agents' most common tool is Bash. Every agent can run shell commands. Not every
-agent has MCP support. The CLI is the universal interface. REST and MCP are
-secondary access patterns built on the same endpoints.
-
-### Why flatten tmux sessions?
-
-Freshell is single-user. Adding a session layer would force agents to manage
-session names, increasing the API surface without adding value. Tabs are the
-natural unit of organization. If multi-user support is added later, sessions
-can be introduced as a grouping layer above tabs.
-
-### Why not just implement a tmux compatibility shim from day one?
-
-A shim would provide instant compatibility but would hide Freshell's unique
-features (browser panes, coding CLI integration, AI summaries, `wait-for`).
-Agents should learn Freshell's native interface through skills/instructions.
-The shim is a convenience fallback, not the primary interface.
-
-### Why `wait-for` is the killer feature
-
-The #1 reliability problem in agent-tmux interactions is completion detection.
-Every orchestration framework invents its own solution: fixed sleeps, output
-polling, marker-based capture, prompt regex. `wait-for` solves this at the
-platform level. An agent that can say `freshell wait-for -t 0 -p "Tests passed"
--T 60` instead of writing a polling loop is dramatically more reliable.
-
-### Why server-side implementation over client-side?
-
-Tab/pane state currently lives in the browser (Redux + localStorage). For the
-agent API to work, the server must be the source of truth for tab/pane layout.
-This requires promoting tab/pane state from client-only to server-managed.
-This is the largest architectural change in this proposal, but it's necessary:
-agents don't have access to browser localStorage.
+- tmux command parser compatibility shim
+- server-authoritative global live layout state
+- offline queue/replay for remote layout mutation
+- CRDT/OT collaborative layout merge in this cutover
 
 ---
 
-## 11. Open Questions
+## 18. Rationale
 
-1. **Tab/pane state ownership**: Currently client-side (Redux + localStorage).
-   Must move server-side for agent API to work. What's the migration path?
-   Should the server broadcast layout changes so all clients stay in sync?
+This design keeps your core constraint intact (device-owned layout authority) while
+resolving operational contradictions:
 
-2. **Multi-client coordination**: If multiple browser tabs and CLI agents are
-   manipulating tabs/panes simultaneously, how do we handle conflicts? Last-write-wins?
-   CRDTs? Operational transforms?
-
-3. **Active pane/tab concept for CLI**: tmux has a clear "active" pane per session.
-   Freshell's "active" pane is per-browser-tab. Should the server maintain a
-   canonical "active" state, or should each CLI invocation specify its target
-   explicitly?
-
-4. **CLI distribution**: Should `freshell` be bundled with the server, installed
-   separately via npm, or downloaded as a standalone binary? The server could
-   serve the CLI at `GET /api/cli` for self-bootstrapping.
-
-5. **Authentication for CLI**: The server uses token auth. Should the CLI support
-   short-lived tokens, or use the same long-lived token? Should there be an
-   `freshell login` flow?
+- Browser/device ownership governs layout semantics.
+- Server-owned PTY and SDK authorities preserve reliability for agent automation.
+- Remote layout mutation remains explicit and fail-fast (`DEVICE_OFFLINE`) when owner
+  is unavailable.
+- The CLI has a first-class device identity, so "local" is deterministic.

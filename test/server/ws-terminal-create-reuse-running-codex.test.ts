@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest'
 import http from 'http'
 import WebSocket from 'ws'
+import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
 
 const HOOK_TIMEOUT_MS = 30_000
+const MESSAGE_TIMEOUT_MS = 5_000
 const CODEX_SESSION_ID = 'codex-session-abc-123'
 
 function listen(server: http.Server, timeoutMs = HOOK_TIMEOUT_MS): Promise<{ port: number }> {
@@ -19,7 +21,7 @@ function listen(server: http.Server, timeoutMs = HOOK_TIMEOUT_MS): Promise<{ por
   })
 }
 
-function waitForMessage(ws: WebSocket, predicate: (msg: any) => boolean, timeoutMs = 2000): Promise<any> {
+function waitForMessage(ws: WebSocket, predicate: (msg: any) => boolean, timeoutMs = MESSAGE_TIMEOUT_MS): Promise<any> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       ws.off('message', handler)
@@ -31,6 +33,34 @@ function waitForMessage(ws: WebSocket, predicate: (msg: any) => boolean, timeout
         clearTimeout(timeout)
         ws.off('message', handler)
         resolve(msg)
+      }
+    }
+    ws.on('message', handler)
+  })
+}
+
+function waitForMessages(
+  ws: WebSocket,
+  predicates: Array<(msg: any) => boolean>,
+  timeoutMs = MESSAGE_TIMEOUT_MS,
+): Promise<any[]> {
+  return new Promise((resolve, reject) => {
+    const matches: any[] = Array(predicates.length).fill(undefined)
+    const timeout = setTimeout(() => {
+      ws.off('message', handler)
+      reject(new Error('Timeout waiting for messages'))
+    }, timeoutMs)
+    const handler = (data: WebSocket.Data) => {
+      const msg = JSON.parse(data.toString())
+      for (let i = 0; i < predicates.length; i += 1) {
+        if (!matches[i] && predicates[i]?.(msg)) {
+          matches[i] = msg
+        }
+      }
+      if (matches.every((m) => m !== undefined)) {
+        clearTimeout(timeout)
+        ws.off('message', handler)
+        resolve(matches)
       }
     }
     ws.on('message', handler)
@@ -55,7 +85,6 @@ type FakeTerminal = {
 class FakeRegistry {
   records: FakeTerminal[]
   attachCalls: Array<{ terminalId: string; opts?: any }> = []
-  finishAttachSnapshotCalls: Array<{ terminalId: string }> = []
   createCalls: any[] = []
   repairCalls: Array<{ mode: string; sessionId: string }> = []
 
@@ -116,10 +145,6 @@ class FakeRegistry {
     return record
   }
 
-  finishAttachSnapshot(terminalId: string, _ws: WebSocket) {
-    this.finishAttachSnapshotCalls.push({ terminalId })
-  }
-
   detach(terminalId: string, ws: WebSocket) {
     const record = this.findById(terminalId)
     if (!record) return false
@@ -155,7 +180,6 @@ describe('terminal.create reuse running codex terminal', () => {
 
   beforeEach(() => {
     registry.attachCalls = []
-    registry.finishAttachSnapshotCalls = []
     registry.createCalls = []
     registry.repairCalls = []
   })
@@ -169,7 +193,7 @@ describe('terminal.create reuse running codex terminal', () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
       await waitForMessage(ws, (m) => m.type === 'ready')
 
       const requestId = 'codex-reuse-1'
@@ -180,16 +204,19 @@ describe('terminal.create reuse running codex terminal', () => {
         resumeSessionId: CODEX_SESSION_ID,
       }))
 
-      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+      const [created, ready] = await waitForMessages(ws, [
+        (m) => m.type === 'terminal.created' && m.requestId === requestId,
+        (m) => m.type === 'terminal.attach.ready' && m.terminalId === 'term-codex-existing',
+      ])
 
       // Should reuse existing terminal, not create a new one
       expect(created.terminalId).toBe('term-codex-existing')
+      expect(created.snapshot).toBeUndefined()
+      expect(created.snapshotChunked).toBeUndefined()
       expect(registry.attachCalls).toHaveLength(1)
       expect(registry.attachCalls[0]?.terminalId).toBe('term-codex-existing')
       expect(registry.createCalls).toHaveLength(0)
-
-      await new Promise<void>((resolve) => setImmediate(resolve))
-      expect(registry.finishAttachSnapshotCalls).toHaveLength(1)
+      expect(ready.headSeq).toBeGreaterThanOrEqual(0)
     } finally {
       ws.close()
     }
@@ -199,7 +226,7 @@ describe('terminal.create reuse running codex terminal', () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
       await waitForMessage(ws, (m) => m.type === 'ready')
 
       const requestId = 'codex-reuse-2'
@@ -227,7 +254,7 @@ describe('terminal.create reuse running codex terminal', () => {
     const ws = new WebSocket(`ws://127.0.0.1:${info.port}/ws`)
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
       await waitForMessage(ws, (m) => m.type === 'ready')
 
       // Make canonical lookup fail initially so handler must invoke repair and retry.

@@ -1,5 +1,8 @@
 import { logger } from './logger.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
+import fs from 'fs'
+import path from 'path'
+import os from 'os'
 import {
   isWindows, isWsl, isWindowsLike,
   getWindowsExe, getWindowsDefaultCwd,
@@ -60,11 +63,98 @@ export function modeSupportsResume(mode: TerminalMode): boolean {
 
 type ProviderTarget = 'unix' | 'windows'
 
+const DEFAULT_FRESHELL_ORCHESTRATION_SKILL_DIR = path.join(process.cwd(), '.claude', 'skills', 'freshell-orchestration')
+const LEGACY_FRESHELL_ORCHESTRATION_SKILL_DIR = path.join(process.cwd(), '.claude', 'skills', 'freshell-automation-tmux-style')
+const DEFAULT_FRESHELL_DEMO_SKILL_DIR = path.join(process.cwd(), '.claude', 'skills', 'freshell-demo-creation')
+const LEGACY_FRESHELL_DEMO_SKILL_DIR = path.join(process.cwd(), '.claude', 'skills', 'demo-creating')
+const DEFAULT_FRESHELL_CLAUDE_PLUGIN_DIR = path.join(process.cwd(), '.claude', 'plugins', 'freshell-orchestration')
+const LEGACY_FRESHELL_CLAUDE_PLUGIN_DIR = path.join(process.cwd(), '.claude', 'plugins', 'freshell-automation-tmux-style')
+const DEFAULT_CODEX_HOME = path.join(os.homedir(), '.codex')
+const FRESHELL_CODEX_SKILL_CONFIG_BASE_INDEX = Number(process.env.FRESHELL_CODEX_SKILL_CONFIG_BASE_INDEX || 400_000)
+
+function firstExistingPath(candidates: Array<string | undefined>): string | undefined {
+  for (const candidate of candidates) {
+    if (!candidate) continue
+    try {
+      if (fs.existsSync(candidate)) return candidate
+    } catch {
+      // Ignore filesystem errors and fall through to the next candidate.
+    }
+  }
+  return undefined
+}
+
+function encodeTomlString(value: string): string {
+  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+}
+
+function firstExistingPaths(candidates: Array<string | undefined>): string[] {
+  const unique = new Set<string>()
+  for (const candidate of candidates) {
+    if (!candidate || unique.has(candidate)) continue
+    try {
+      if (fs.existsSync(candidate)) unique.add(candidate)
+    } catch {
+      // Ignore filesystem errors and continue collecting matches.
+    }
+  }
+  return Array.from(unique)
+}
+
+function codexSkillsDir(): string {
+  const codexHome = process.env.CODEX_HOME || DEFAULT_CODEX_HOME
+  return path.join(codexHome, 'skills')
+}
+
+function codexOrchestrationSkillArgs(): string[] {
+  const skillsDir = codexSkillsDir()
+  const skillPath = firstExistingPath([
+    process.env.FRESHELL_ORCHESTRATION_SKILL_DIR,
+    DEFAULT_FRESHELL_ORCHESTRATION_SKILL_DIR,
+    LEGACY_FRESHELL_ORCHESTRATION_SKILL_DIR,
+    path.join(skillsDir, 'freshell-orchestration'),
+    path.join(skillsDir, 'freshell-automation-tmux-style'),
+  ])
+  if (!skillPath) return []
+  const disablePaths = firstExistingPaths([
+    process.env.FRESHELL_DEMO_SKILL_DIR,
+    DEFAULT_FRESHELL_DEMO_SKILL_DIR,
+    LEGACY_FRESHELL_DEMO_SKILL_DIR,
+    path.join(skillsDir, 'demo-creating'),
+    path.join(skillsDir, 'freshell-demo-creation'),
+    LEGACY_FRESHELL_ORCHESTRATION_SKILL_DIR,
+    path.join(skillsDir, 'freshell-automation-tmux-style'),
+  ]).filter((entryPath) => entryPath !== skillPath)
+
+  const args: string[] = []
+  const entries: Array<{ path: string; enabled: boolean }> = [
+    { path: skillPath, enabled: true },
+    ...disablePaths.map((entryPath) => ({ path: entryPath, enabled: false })),
+  ]
+  for (const [index, entry] of entries.entries()) {
+    const configIndex = FRESHELL_CODEX_SKILL_CONFIG_BASE_INDEX + index
+    args.push('-c', `skills.config.${configIndex}.path=${encodeTomlString(entry.path)}`)
+    args.push('-c', `skills.config.${configIndex}.enabled=${entry.enabled ? 'true' : 'false'}`)
+  }
+  return args
+}
+
+function claudePluginArgs(): string[] {
+  const pluginDir = firstExistingPath([
+    process.env.FRESHELL_CLAUDE_PLUGIN_DIR,
+    DEFAULT_FRESHELL_CLAUDE_PLUGIN_DIR,
+    LEGACY_FRESHELL_CLAUDE_PLUGIN_DIR,
+  ])
+  if (!pluginDir) return []
+  return ['--plugin-dir', pluginDir]
+}
+
 function providerNotificationArgs(mode: TerminalMode, target: ProviderTarget): string[] {
   if (mode === 'codex') {
     return [
       '-c', 'tui.notification_method=bel',
       '-c', "tui.notifications=['agent-turn-complete']",
+      ...codexOrchestrationSkillArgs(),
     ]
   }
 
@@ -86,7 +176,7 @@ function providerNotificationArgs(mode: TerminalMode, target: ProviderTarget): s
         ],
       },
     }
-    return ['--settings', JSON.stringify(settings)]
+    return [...claudePluginArgs(), '--settings', JSON.stringify(settings)]
   }
 
   return []

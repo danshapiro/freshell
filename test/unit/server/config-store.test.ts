@@ -485,7 +485,6 @@ describe('ConfigStore', () => {
       })
 
       expect(updated.safety.autoKillIdleMinutes).toBe(60)
-      expect(updated.safety.warnBeforeKillMinutes).toBe(defaultSettings.safety.warnBeforeKillMinutes)
     })
 
     it('can set defaultCwd', async () => {

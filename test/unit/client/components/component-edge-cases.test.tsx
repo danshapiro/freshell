@@ -1465,7 +1465,7 @@ describe('Component Edge Cases', () => {
                 terminals: [],
               })
               messageHandler({ type: 'terminal.detached' })
-              messageHandler({ type: 'terminal.attached' })
+              messageHandler({ type: 'terminal.attach.ready' })
               messageHandler({ type: 'terminal.exit' })
             }
           }

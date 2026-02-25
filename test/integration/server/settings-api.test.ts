@@ -169,7 +169,6 @@ describe('Settings API Integration', () => {
       expect(res.body.terminal).toHaveProperty('osc52Clipboard')
       expect(res.body.terminal).toHaveProperty('renderer')
       expect(res.body.safety).toHaveProperty('autoKillIdleMinutes')
-      expect(res.body.safety).toHaveProperty('warnBeforeKillMinutes')
       expect(res.body.sidebar).toHaveProperty('sortMode')
       expect(res.body.sidebar).toHaveProperty('showProjectBadges')
       expect(res.body.sidebar).toHaveProperty('width')
@@ -296,7 +295,6 @@ describe('Settings API Integration', () => {
 
       expect(res.status).toBe(200)
       expect(res.body.safety.autoKillIdleMinutes).toBe(60)
-      expect(res.body.safety.warnBeforeKillMinutes).toBe(defaultSettings.safety.warnBeforeKillMinutes)
     })
 
     it('handles empty body', async () => {
@@ -406,12 +404,12 @@ describe('Settings API Integration', () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
-        .send({ safety: { warnBeforeKillMinutes: 10 } })
+        .send({ safety: { autoKillIdleMinutes: 90 } })
 
       expect(res.status).toBe(200)
       expect(res.body.theme).toBe('dark')
       expect(res.body.terminal.fontSize).toBe(15)
-      expect(res.body.safety.warnBeforeKillMinutes).toBe(10)
+      expect(res.body.safety.autoKillIdleMinutes).toBe(90)
     })
   })
 

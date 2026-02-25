@@ -1,11 +1,12 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import type { RegistryTabRecord } from './tabRegistryTypes'
-
-const DEVICE_ID_KEY = 'freshell.device-id.v1'
-const DEVICE_LABEL_KEY = 'freshell.device-label.v1'
-const DEVICE_LABEL_CUSTOM_KEY = 'freshell.device-label-custom.v1'
-const DEVICE_FINGERPRINT_KEY = 'freshell.device-fingerprint.v1'
-const DEVICE_ALIASES_KEY = 'freshell.device-aliases.v1'
+import {
+  DEVICE_ALIASES_STORAGE_KEY,
+  DEVICE_FINGERPRINT_STORAGE_KEY,
+  DEVICE_ID_STORAGE_KEY,
+  DEVICE_LABEL_CUSTOM_STORAGE_KEY,
+  DEVICE_LABEL_STORAGE_KEY,
+} from './storage-keys'
 
 type DeviceMetaHints = {
   platform?: string
@@ -29,7 +30,7 @@ function safeStorage(): Storage | null {
   try {
     if (typeof localStorage === 'undefined') return null
     // Probe access in browsers that expose the object but block usage.
-    localStorage.getItem(DEVICE_ID_KEY)
+    localStorage.getItem(DEVICE_ID_STORAGE_KEY)
     return localStorage
   } catch {
     return null
@@ -60,7 +61,7 @@ function buildDeviceFingerprint(hints: DeviceMetaHints = {}): string {
 function loadDeviceAliases(storage: Storage | null): Record<string, string> {
   if (!storage) return {}
   try {
-    const raw = storage.getItem(DEVICE_ALIASES_KEY)
+    const raw = storage.getItem(DEVICE_ALIASES_STORAGE_KEY)
     if (!raw) return {}
     const parsed = JSON.parse(raw)
     if (!parsed || typeof parsed !== 'object') return {}
@@ -76,7 +77,7 @@ function loadDeviceAliases(storage: Storage | null): Record<string, string> {
 function persistDeviceAliases(storage: Storage | null, aliases: Record<string, string>): void {
   if (!storage) return
   try {
-    storage.setItem(DEVICE_ALIASES_KEY, JSON.stringify(aliases))
+    storage.setItem(DEVICE_ALIASES_STORAGE_KEY, JSON.stringify(aliases))
   } catch {
     // Ignore storage write failures; aliases remain in-memory for this session.
   }
@@ -93,9 +94,9 @@ function loadDeviceMeta(hints: DeviceMetaHints = {}): { deviceId: string; device
     return ephemeralDeviceMeta
   }
 
-  let deviceId = storage.getItem(DEVICE_ID_KEY) || ''
+  let deviceId = storage.getItem(DEVICE_ID_STORAGE_KEY) || ''
   const fingerprint = buildDeviceFingerprint(hints)
-  const storedFingerprint = storage.getItem(DEVICE_FINGERPRINT_KEY) || ''
+  const storedFingerprint = storage.getItem(DEVICE_FINGERPRINT_STORAGE_KEY) || ''
   const shouldRotateDeviceId =
     !deviceId ||
     deviceId === 'device-unknown' ||
@@ -105,24 +106,24 @@ function loadDeviceMeta(hints: DeviceMetaHints = {}): { deviceId: string; device
   }
   if (shouldRotateDeviceId) {
     deviceId = randomId()
-    storage.setItem(DEVICE_ID_KEY, deviceId)
-    storage.setItem(DEVICE_FINGERPRINT_KEY, fingerprint)
+    storage.setItem(DEVICE_ID_STORAGE_KEY, deviceId)
+    storage.setItem(DEVICE_FINGERPRINT_STORAGE_KEY, fingerprint)
   } else if (!storedFingerprint) {
-    storage.setItem(DEVICE_FINGERPRINT_KEY, fingerprint)
+    storage.setItem(DEVICE_FINGERPRINT_STORAGE_KEY, fingerprint)
   }
 
-  let deviceLabel = storage.getItem(DEVICE_LABEL_KEY) || ''
-  const isCustomLabel = storage.getItem(DEVICE_LABEL_CUSTOM_KEY) === '1'
+  let deviceLabel = storage.getItem(DEVICE_LABEL_STORAGE_KEY) || ''
+  const isCustomLabel = storage.getItem(DEVICE_LABEL_CUSTOM_STORAGE_KEY) === '1'
   const defaultLabel = buildDefaultDeviceLabel(hints)
   if (!deviceLabel) {
     deviceLabel = defaultLabel
-    storage.setItem(DEVICE_LABEL_KEY, deviceLabel)
-    storage.setItem(DEVICE_LABEL_CUSTOM_KEY, '0')
+    storage.setItem(DEVICE_LABEL_STORAGE_KEY, deviceLabel)
+    storage.setItem(DEVICE_LABEL_CUSTOM_STORAGE_KEY, '0')
   } else if (!isCustomLabel) {
     const normalizedCurrent = normalizeDeviceLabel(deviceLabel)
     if (normalizedCurrent !== defaultLabel) {
       deviceLabel = defaultLabel
-      storage.setItem(DEVICE_LABEL_KEY, deviceLabel)
+      storage.setItem(DEVICE_LABEL_STORAGE_KEY, deviceLabel)
     } else {
       deviceLabel = normalizedCurrent
     }
@@ -145,8 +146,8 @@ export function persistOwnDeviceLabel(deviceLabel: string): string {
   const storage = safeStorage()
   if (!storage) return normalized
   try {
-    storage.setItem(DEVICE_LABEL_KEY, normalized)
-    storage.setItem(DEVICE_LABEL_CUSTOM_KEY, '1')
+    storage.setItem(DEVICE_LABEL_STORAGE_KEY, normalized)
+    storage.setItem(DEVICE_LABEL_CUSTOM_STORAGE_KEY, '1')
   } catch {
     // no-op
   }

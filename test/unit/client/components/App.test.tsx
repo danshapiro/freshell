@@ -8,7 +8,6 @@ import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
-import idleWarningsReducer from '@/store/idleWarningsSlice'
 import { networkReducer, setNetworkStatus, type NetworkStatusResponse } from '@/store/networkSlice'
 
 // Ensure DOM is clean even if another test file forgot cleanup.
@@ -40,6 +39,15 @@ vi.mock('@/lib/api', () => ({
     patch: vi.fn().mockResolvedValue({}),
     post: vi.fn().mockResolvedValue({}),
   },
+}))
+
+const mockGenerateQr = vi.fn().mockReturnValue({ size: 21 })
+const mockToSvgDataURL = vi.fn().mockReturnValue('data:image/svg+xml;base64,mock')
+vi.mock('lean-qr', () => ({
+  generate: (...args: any[]) => mockGenerateQr(...args),
+}))
+vi.mock('lean-qr/extras/svg', () => ({
+  toSvgDataURL: (...args: any[]) => mockToSvgDataURL(...args),
 }))
 
 // Mock heavy child components to avoid xterm/canvas issues
@@ -123,7 +131,6 @@ function createTestStore() {
       connection: connectionReducer,
       sessions: sessionsReducer,
       panes: panesReducer,
-      idleWarnings: idleWarningsReducer,
       network: networkReducer,
     },
     middleware: (getDefault) =>
@@ -156,9 +163,6 @@ function createTestStore() {
       panes: {
         layouts: {},
         activePane: {},
-      },
-      idleWarnings: {
-        warnings: {},
       },
       network: {
         status: null,
@@ -319,9 +323,32 @@ describe('App Component - Share Button', () => {
 
     await waitFor(() => {
       expect(screen.getByText('Share Access')).toBeInTheDocument()
-      expect(screen.getByText('http://192.168.1.100:3001')).toBeInTheDocument()
+      expect(screen.getByText('http://192.168.1.100:3001/?token=test-token-abc123')).toBeInTheDocument()
       expect(screen.getByText('Copy link')).toBeInTheDocument()
     })
+  })
+
+  it('renders share-panel QR with explicit dark-on-light colors', async () => {
+    const store = createTestStore()
+    act(() => {
+      store.dispatch(setNetworkStatus(makeNetworkStatus({
+        configured: true,
+        host: '0.0.0.0',
+        accessUrl: 'http://192.168.1.100:3001',
+      })))
+    })
+
+    renderApp(store)
+    await openShareFromSettings()
+
+    await waitFor(() => {
+      expect(screen.getByRole('img', { name: /qr code for access url/i })).toBeInTheDocument()
+    })
+
+    expect(mockToSvgDataURL).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ on: 'black', off: 'white' }),
+    )
   })
 
   it('shows share panel for legacy HOST env override (configured=false, host=0.0.0.0)', async () => {
@@ -348,7 +375,7 @@ describe('App Component - Share Button', () => {
 
     await waitFor(() => {
       expect(screen.getByText('Share Access')).toBeInTheDocument()
-      expect(screen.getByText('http://10.0.0.5:3001')).toBeInTheDocument()
+      expect(screen.getByText('http://10.0.0.5:3001/?token=test-token-abc123')).toBeInTheDocument()
     })
   })
 
@@ -379,7 +406,7 @@ describe('App Component - Share Button', () => {
     fireEvent.click(screen.getByText('Copy link'))
 
     await waitFor(() => {
-      expect(mockWriteText).toHaveBeenCalledWith('http://192.168.1.100:3001')
+      expect(mockWriteText).toHaveBeenCalledWith('http://192.168.1.100:3001/?token=test-token-abc123')
     })
   })
 
@@ -476,7 +503,7 @@ describe('App Component - Version Status', () => {
   })
 })
 
-describe('App Component - Idle Warnings', () => {
+describe('App Component - WS Notifications', () => {
   let messageHandler: ((msg: any) => void) | null = null
 
   beforeEach(() => {
@@ -497,26 +524,6 @@ describe('App Component - Idle Warnings', () => {
   afterEach(() => {
     cleanup()
     messageHandler = null
-  })
-
-  it('shows an indicator when the server warns an idle terminal will auto-kill soon', async () => {
-    renderApp()
-
-    await waitFor(() => {
-      expect(messageHandler).not.toBeNull()
-    })
-
-    messageHandler!({
-      type: 'terminal.idle.warning',
-      terminalId: 'term-idle',
-      killMinutes: 10,
-      warnMinutes: 3,
-      lastActivityAt: Date.now(),
-    })
-
-    await waitFor(() => {
-      expect(screen.getByRole('button', { name: /auto-kill soon/i })).toBeInTheDocument()
-    })
   })
 
   it('shows and dismisses config fallback warning when server reports corrupted config', async () => {

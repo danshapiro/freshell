@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest'
-import { render, screen, cleanup } from '@testing-library/react'
+import { render, screen, cleanup, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import MessageBubble from '../../../../../src/components/claude-chat/MessageBubble'
 import type { ChatContentBlock } from '@/store/claudeChatTypes'
@@ -23,7 +23,11 @@ describe('MessageBubble', () => {
     const { container } = render(
       <MessageBubble role="assistant" content={[{ type: 'text', text: '**Bold text**' }]} />
     )
-    expect(await screen.findByText('Bold text')).toBeInTheDocument()
+    await waitFor(() => {
+      const strong = container.querySelector('strong')
+      expect(strong).toBeInTheDocument()
+      expect(strong).toHaveTextContent('Bold text')
+    }, { timeout: 5000 })
     const article = container.querySelector('[role="article"]')!
     expect(article.className).toContain('border-l-2')
   })

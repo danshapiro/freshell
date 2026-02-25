@@ -26,7 +26,6 @@ export const defaultSettings: AppSettings = {
   },
   safety: {
     autoKillIdleMinutes: 180,
-    warnBeforeKillMinutes: 5,
   },
   sidebar: {
     sortMode: 'recency-pinned',

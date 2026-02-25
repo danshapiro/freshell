@@ -49,8 +49,9 @@ describe('TerminalView connection error wiring', () => {
     expect(terminalViewSource).toMatch(/useAppSelector\(.*lastErrorCode/)
   })
 
-  it('suppresses spinner when error code is 4003', () => {
-    expect(terminalViewSource).toMatch(/connectionErrorCode\s*!==\s*4003/)
+  it('uses fatal error guard for blocking spinner behavior', () => {
+    expect(terminalViewSource).toContain('isFatalConnectionErrorCode')
+    expect(terminalViewSource).toContain('showBlockingSpinner')
   })
 
   it('renders ConnectionErrorOverlay in JSX', () => {
@@ -64,8 +65,8 @@ describe('ConnectionErrorOverlay', () => {
     expect(container.firstChild).toBeNull()
   })
 
-  it('renders nothing for non-4003 error codes', () => {
-    const { container } = renderWithStore(4001, 'Authentication failed')
+  it('renders nothing for non-fatal error codes', () => {
+    const { container } = renderWithStore(4002, 'Handshake timeout')
     expect(container.firstChild).toBeNull()
   })
 
@@ -78,5 +79,17 @@ describe('ConnectionErrorOverlay', () => {
   it('has accessible role and label', () => {
     renderWithStore(4003, 'Server busy: max connections reached')
     expect(screen.getByRole('alert')).toBeInTheDocument()
+  })
+
+  it('renders authentication guidance for code 4001', () => {
+    renderWithStore(4001, 'Authentication failed')
+    expect(screen.getByText(/authentication required/i)).toBeInTheDocument()
+    expect(screen.getByText(/sign in again/i)).toBeInTheDocument()
+  })
+
+  it('renders protocol mismatch guidance for code 4010', () => {
+    renderWithStore(4010, 'Protocol version mismatch')
+    expect(screen.getByText(/version mismatch/i)).toBeInTheDocument()
+    expect(screen.getByText(/refresh the page/i)).toBeInTheDocument()
   })
 })

@@ -811,7 +811,6 @@ describe('State Edge Cases', () => {
           defaultCwd: '/custom/path',
           safety: {
             autoKillIdleMinutes: 10,
-            warnBeforeKillMinutes: 2,
           },
           sidebar: {
             sortMode: 'activity',
@@ -874,7 +873,7 @@ describe('State Edge Cases', () => {
           updateSettingsLocal({
             uiScale: -1,
             terminal: { fontSize: -10, scrollback: -1000 },
-            safety: { autoKillIdleMinutes: -5, warnBeforeKillMinutes: -1 },
+            safety: { autoKillIdleMinutes: -5 },
           })
         )
 

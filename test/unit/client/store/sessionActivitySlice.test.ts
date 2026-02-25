@@ -50,7 +50,7 @@ describe('sessionActivitySlice - ratchet persistence', () => {
 
   it('loads from localStorage on slice initialization', async () => {
     const timestamp = Date.now()
-    localStorage.setItem('freshell.sessionActivity.v1', JSON.stringify({ 'claude:session-1': timestamp }))
+    localStorage.setItem('freshell.sessionActivity.v2', JSON.stringify({ 'claude:session-1': timestamp }))
 
     vi.resetModules()
     const {
@@ -67,7 +67,7 @@ describe('sessionActivitySlice - ratchet persistence', () => {
   })
 
   it('handles corrupted localStorage gracefully', () => {
-    localStorage.setItem('freshell.sessionActivity.v1', 'not-valid-json')
+    localStorage.setItem('freshell.sessionActivity.v2', 'not-valid-json')
 
     const store = createStore()
     const state = store.getState()
@@ -77,7 +77,7 @@ describe('sessionActivitySlice - ratchet persistence', () => {
   it('drops non-numeric entries loaded from localStorage', async () => {
     const now = Date.now()
     localStorage.setItem(
-      'freshell.sessionActivity.v1',
+      'freshell.sessionActivity.v2',
       JSON.stringify({ 'claude:session-1': 'bad-value', 'codex:session-2': now })
     )
 

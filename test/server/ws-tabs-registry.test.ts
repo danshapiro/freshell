@@ -5,6 +5,7 @@ import os from 'os'
 import path from 'path'
 import { promises as fs } from 'fs'
 import { createTabsRegistryStore } from '../../server/tabs-registry/store.js'
+import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
 
 vi.mock('../../server/config-store', () => ({
   configStore: {
@@ -124,7 +125,7 @@ describe('ws tabs registry protocol', () => {
   it('accepts tabs.sync.push and returns tabs.sync.snapshot (default 24h)', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({ type: 'hello', token: 'tabs-sync-token' }))
+    ws.send(JSON.stringify({ type: 'hello', token: 'tabs-sync-token', protocolVersion: WS_PROTOCOL_VERSION }))
     const ready = await waitForMessage(ws, (msg) => msg.type === 'ready')
     expect(typeof ready.serverInstanceId).toBe('string')
     expect(ready.serverInstanceId.length).toBeGreaterThan(0)

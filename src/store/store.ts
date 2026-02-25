@@ -1,6 +1,3 @@
-// Storage migration MUST be imported first (before slices load from localStorage)
-import './storage-migration'
-
 import { enableMapSet } from 'immer'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer from './tabsSlice'
@@ -11,7 +8,7 @@ import codingCliReducer from './codingCliSlice'
 import panesReducer from './panesSlice'
 import sessionActivityReducer from './sessionActivitySlice'
 import terminalActivityReducer from './terminalActivitySlice'
-import idleWarningsReducer from './idleWarningsSlice'
+
 import turnCompletionReducer from './turnCompletionSlice'
 import terminalMetaReducer from './terminalMetaSlice'
 import claudeChatReducer from './claudeChatSlice'
@@ -21,6 +18,7 @@ import { perfMiddleware } from './perfMiddleware'
 import { persistMiddleware } from './persistMiddleware'
 import { sessionActivityPersistMiddleware } from './sessionActivityPersistence'
 import { createLogger } from '@/lib/client-logger'
+import { layoutMirrorMiddleware } from './layoutMirrorMiddleware'
 
 enableMapSet()
 
@@ -36,7 +34,7 @@ export const store = configureStore({
     panes: panesReducer,
     sessionActivity: sessionActivityReducer,
     terminalActivity: terminalActivityReducer,
-    idleWarnings: idleWarningsReducer,
+
     turnCompletion: turnCompletionReducer,
     terminalMeta: terminalMetaReducer,
     claudeChat: claudeChatReducer,
@@ -48,7 +46,7 @@ export const store = configureStore({
       serializableCheck: {
         ignoredPaths: ['sessions.expandedProjects'],
       },
-    }).concat(perfMiddleware, persistMiddleware, sessionActivityPersistMiddleware),
+    }).concat(perfMiddleware, persistMiddleware, layoutMirrorMiddleware, sessionActivityPersistMiddleware),
 })
 
 // Note: Tabs and Panes are now loaded from localStorage directly in their slice

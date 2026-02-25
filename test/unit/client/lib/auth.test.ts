@@ -4,7 +4,7 @@ const AUTH_KEY = 'freshell.auth-token'
 const LEGACY_KEY = 'auth-token'
 
 // Dynamic import so we can reset module state between tests.
-let auth: typeof import('@/lib/auth')
+let auth: typeof import('@/lib/auth') & { clearAuthCookie?: () => void }
 
 describe('auth', () => {
   beforeEach(async () => {
@@ -50,6 +50,10 @@ describe('auth', () => {
       auth.setAuthToken('first')
       auth.setAuthToken('second')
       expect(localStorage.getItem(AUTH_KEY)).toBe('second')
+    })
+
+    it('exports clearAuthCookie helper', () => {
+      expect(typeof auth.clearAuthCookie).toBe('function')
     })
   })
 
@@ -163,6 +167,13 @@ describe('auth', () => {
       expect(localStorage.getItem(AUTH_KEY)).toBeNull()
       expect(replaceStateSpy).not.toHaveBeenCalled()
       replaceStateSpy.mockRestore()
+    })
+
+    it('clears stale freshell-auth cookie when no token exists', () => {
+      document.cookie = 'freshell-auth=stale-cookie; path=/'
+      auth.initializeAuthToken()
+      expect(localStorage.getItem(AUTH_KEY)).toBeNull()
+      expect(document.cookie).not.toContain('freshell-auth=')
     })
 
     it('sets freshell-auth cookie when token extracted from URL', () => {

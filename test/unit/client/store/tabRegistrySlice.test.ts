@@ -5,6 +5,14 @@ import reducer, {
   setTabRegistrySyncError,
   recordClosedTabSnapshot,
 } from '../../../../src/store/tabRegistrySlice'
+import {
+  STORAGE_KEYS,
+  DEVICE_ALIASES_STORAGE_KEY,
+  DEVICE_FINGERPRINT_STORAGE_KEY,
+  DEVICE_ID_STORAGE_KEY,
+  DEVICE_LABEL_CUSTOM_STORAGE_KEY,
+  DEVICE_LABEL_STORAGE_KEY,
+} from '../../../../src/store/storage-keys'
 import type { RegistryTabRecord } from '../../../../src/store/tabRegistryTypes'
 
 function makeRecord(overrides: Partial<RegistryTabRecord>): RegistryTabRecord {
@@ -27,6 +35,20 @@ function makeRecord(overrides: Partial<RegistryTabRecord>): RegistryTabRecord {
 }
 
 describe('tabRegistrySlice', () => {
+  it('uses v2 namespaced device storage keys', () => {
+    expect(STORAGE_KEYS.deviceId).toBe('freshell.device-id.v2')
+    expect(STORAGE_KEYS.deviceLabel).toBe('freshell.device-label.v2')
+    expect(STORAGE_KEYS.deviceLabelCustom).toBe('freshell.device-label-custom.v2')
+    expect(STORAGE_KEYS.deviceFingerprint).toBe('freshell.device-fingerprint.v2')
+    expect(STORAGE_KEYS.deviceAliases).toBe('freshell.device-aliases.v2')
+
+    expect(DEVICE_ID_STORAGE_KEY).toBe('freshell.device-id.v2')
+    expect(DEVICE_LABEL_STORAGE_KEY).toBe('freshell.device-label.v2')
+    expect(DEVICE_LABEL_CUSTOM_STORAGE_KEY).toBe('freshell.device-label-custom.v2')
+    expect(DEVICE_FINGERPRINT_STORAGE_KEY).toBe('freshell.device-fingerprint.v2')
+    expect(DEVICE_ALIASES_STORAGE_KEY).toBe('freshell.device-aliases.v2')
+  })
+
   it('stores snapshot groups and clears loading/error', () => {
     let state = reducer(undefined, setTabRegistryLoading(true))
     state = reducer(state, setTabRegistrySyncError('boom'))

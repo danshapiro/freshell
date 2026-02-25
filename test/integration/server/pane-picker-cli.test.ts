@@ -5,6 +5,7 @@ import WebSocket from 'ws'
 import express, { type Express } from 'express'
 import request from 'supertest'
 import { detectPlatform, detectAvailableClis } from '../../../server/platform.js'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol'
 import { createPlatformRouter } from '../../../server/platform-router'
 
 const TEST_TIMEOUT_MS = 30_000
@@ -259,7 +260,7 @@ describe('Pane Picker CLI Integration', () => {
     async function connectAndAuth(): Promise<WebSocket> {
       const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-      ws.send(JSON.stringify({ type: 'hello', token: TEST_AUTH_TOKEN }))
+      ws.send(JSON.stringify({ type: 'hello', token: TEST_AUTH_TOKEN, protocolVersion: WS_PROTOCOL_VERSION }))
 
       await new Promise<void>((resolve) => {
         ws.on('message', (data) => {

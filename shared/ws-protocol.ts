@@ -23,9 +23,12 @@ export const ErrorCode = z.enum([
   'INTERNAL_ERROR',
   'RATE_LIMITED',
   'UNAUTHORIZED',
+  'PROTOCOL_MISMATCH',
 ])
 
 export type ErrorCode = z.infer<typeof ErrorCode>
+
+export const WS_PROTOCOL_VERSION = 2 as const
 
 export const ShellSchema = z.enum(['system', 'cmd', 'powershell', 'wsl'])
 
@@ -131,9 +134,10 @@ export type Usage = z.infer<typeof UsageSchema>
 export const HelloSchema = z.object({
   type: z.literal('hello'),
   token: z.string().optional(),
+  protocolVersion: z.literal(WS_PROTOCOL_VERSION),
   capabilities: z.object({
     sessionsPatchV1: z.boolean().optional(),
-    terminalAttachChunkV1: z.boolean().optional(),
+    uiScreenshotV1: z.boolean().optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),
@@ -157,11 +161,15 @@ export const TerminalCreateSchema = z.object({
   cwd: z.string().optional(),
   resumeSessionId: z.string().optional(),
   restore: z.boolean().optional(),
+  tabId: z.string().min(1).optional(),
+  paneId: z.string().min(1).optional(),
 })
 
 export const TerminalAttachSchema = z.object({
   type: z.literal('terminal.attach'),
   terminalId: z.string().min(1),
+  sinceSeq: z.number().int().nonnegative().optional(),
+  attachRequestId: z.string().min(1).optional(),
 })
 
 export const TerminalDetachSchema = z.object({
@@ -195,6 +203,32 @@ export const TerminalListSchema = z.object({
 export const TerminalMetaListSchema = z.object({
   type: z.literal('terminal.meta.list'),
   requestId: z.string().min(1),
+})
+
+export const UiLayoutSyncSchema = z.object({
+  type: z.literal('ui.layout.sync'),
+  tabs: z.array(z.object({
+    id: z.string(),
+    title: z.string().optional(),
+  })),
+  activeTabId: z.string().nullable().optional(),
+  layouts: z.record(z.string(), z.unknown()),
+  activePane: z.record(z.string(), z.string()),
+  paneTitles: z.record(z.string(), z.record(z.string(), z.string())).optional(),
+  timestamp: z.number(),
+})
+
+export const UiScreenshotResultSchema = z.object({
+  type: z.literal('ui.screenshot.result'),
+  requestId: z.string().min(1),
+  ok: z.boolean(),
+  mimeType: z.literal('image/png').optional(),
+  imageBase64: z.string().optional(),
+  width: z.number().int().positive().optional(),
+  height: z.number().int().positive().optional(),
+  changedFocus: z.boolean().optional(),
+  restoredFocus: z.boolean().optional(),
+  error: z.string().optional(),
 })
 
 // Coding CLI session schemas
@@ -307,6 +341,8 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   TerminalKillSchema,
   TerminalListSchema,
   TerminalMetaListSchema,
+  UiLayoutSyncSchema,
+  UiScreenshotResultSchema,
   CodingCliCreateSchema,
   CodingCliInputSchema,
   CodingCliKillSchema,
@@ -356,32 +392,15 @@ export type TerminalCreatedMessage = {
   terminalId: string
   createdAt: number
   effectiveResumeSessionId?: string
-} & ({ snapshot: string; snapshotChunked?: never } | { snapshotChunked: true; snapshot?: never })
-
-export type TerminalAttachedMessage = {
-  type: 'terminal.attached'
-  terminalId: string
-  snapshot: string
 }
 
-export type TerminalAttachedStartMessage = {
-  type: 'terminal.attached.start'
+export type TerminalAttachReadyMessage = {
+  type: 'terminal.attach.ready'
   terminalId: string
-  totalCodeUnits: number
-  totalChunks: number
-}
-
-export type TerminalAttachedChunkMessage = {
-  type: 'terminal.attached.chunk'
-  terminalId: string
-  chunk: string
-}
-
-export type TerminalAttachedEndMessage = {
-  type: 'terminal.attached.end'
-  terminalId: string
-  totalCodeUnits: number
-  totalChunks: number
+  headSeq: number
+  replayFromSeq: number
+  replayToSeq: number
+  attachRequestId?: string
 }
 
 export type TerminalDetachedMessage = {
@@ -398,16 +417,19 @@ export type TerminalExitMessage = {
 export type TerminalOutputMessage = {
   type: 'terminal.output'
   terminalId: string
+  seqStart: number
+  seqEnd: number
   data: string
+  attachRequestId?: string
 }
 
-export type TerminalSnapshotMessage = {
-  // Reserved for compatibility with older/experimental clients that expect
-  // a standalone snapshot frame. Current server flow uses terminal.attached*
-  // and terminal.created snapshot payloads instead.
-  type: 'terminal.snapshot'
+export type TerminalOutputGapMessage = {
+  type: 'terminal.output.gap'
   terminalId: string
-  snapshot: string
+  fromSeq: number
+  toSeq: number
+  reason: 'queue_overflow' | 'replay_window_exceeded'
+  attachRequestId?: string
 }
 
 export type TerminalTitleUpdatedMessage = {
@@ -447,14 +469,6 @@ export type TerminalMetaListResponseMessage = z.infer<typeof TerminalMetaListRes
 
 export type TerminalMetaUpdatedMessage = z.infer<typeof TerminalMetaUpdatedSchema>
 
-export type TerminalIdleWarningMessage = {
-  type: 'terminal.idle.warning'
-  terminalId: string
-  killMinutes: number
-  warnMinutes: number
-  lastActivityAt: number
-}
-
 // -- Sessions --
 
 export type SessionsUpdatedMessage = {
@@ -481,6 +495,14 @@ export type SettingsUpdatedMessage = {
   // Intentionally unknown to avoid coupling this shared protocol package to
   // client-only AppSettings types.
   settings: unknown
+}
+
+// -- UI commands --
+
+export type UiCommandMessage = {
+  type: 'ui.command'
+  command: string
+  payload?: unknown
 }
 
 // -- Performance logging --
@@ -604,24 +626,21 @@ export type ServerMessage =
   | PongMessage
   | ErrorMessage
   | TerminalCreatedMessage
-  | TerminalAttachedMessage
-  | TerminalAttachedStartMessage
-  | TerminalAttachedChunkMessage
-  | TerminalAttachedEndMessage
+  | TerminalAttachReadyMessage
   | TerminalDetachedMessage
   | TerminalExitMessage
   | TerminalOutputMessage
-  | TerminalSnapshotMessage
+  | TerminalOutputGapMessage
   | TerminalTitleUpdatedMessage
   | TerminalSessionAssociatedMessage
   | TerminalListUpdatedMessage
   | TerminalListResponseMessage
   | TerminalMetaListResponseMessage
   | TerminalMetaUpdatedMessage
-  | TerminalIdleWarningMessage
   | SessionsUpdatedMessage
   | SessionsPatchMessage
   | SettingsUpdatedMessage
+  | UiCommandMessage
   | PerfLoggingMessage
   | ConfigFallbackMessage
   | TabsSyncAckMessage

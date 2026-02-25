@@ -12,11 +12,13 @@ import {
 } from '@/store/sessionsSlice'
 import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { api, isApiUnauthorizedError, type VersionInfo } from '@/lib/api'
-import { getShareAction } from '@/lib/share-utils'
+import { getShareAction, ensureShareUrlToken } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { getSessionsForHello } from '@/lib/session-utils'
 import { setClientPerfEnabled } from '@/lib/perf-logger'
 import { applyLocalTerminalFontFamily } from '@/lib/terminal-fonts'
+import { handleUiCommand } from '@/lib/ui-commands'
+import { getAuthToken } from '@/lib/auth'
 import { store } from '@/store/store'
 import { useThemeEffect } from '@/hooks/useTheme'
 import { useMobile } from '@/hooks/useMobile'
@@ -42,7 +44,7 @@ import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { triggerHapticFeedback } from '@/lib/mobile-haptics'
 import { X, Copy, Check, PanelLeft, AlertTriangle } from 'lucide-react'
 import { updateSettingsLocal, markSaved } from '@/store/settingsSlice'
-import { clearIdleWarning, recordIdleWarning } from '@/store/idleWarningsSlice'
+
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
 import { createLogger } from '@/lib/client-logger'
@@ -62,7 +64,7 @@ function ShareQrCode({ url }: { url: string }) {
         const { toSvgDataURL } = await import('lean-qr/extras/svg')
         if (cancelled) return
         const code = generate(url)
-        setSvgUrl(toSvgDataURL(code))
+        setSvgUrl(toSvgDataURL(code, { on: 'black', off: 'white' }))
       } catch {
         // QR generation failed — panel still shows URL text
       }
@@ -80,7 +82,8 @@ const SIDEBAR_MIN_WIDTH = 200
 const SIDEBAR_MAX_WIDTH = 500
 const CHROME_REVEAL_TOP_EDGE_PX = 48
 const CHROME_REVEAL_SWIPE_PX = 60
-const EMPTY_IDLE_WARNINGS: Record<string, unknown> = {}
+const RECENT_HTTP_SESSIONS_BASELINE_MS = 30_000
+
 
 function isVersionInfo(value: unknown): value is VersionInfo {
   return !!value && typeof value === 'object' && typeof (value as { currentVersion?: unknown }).currentVersion === 'string'
@@ -118,8 +121,6 @@ export default function App() {
   const tabs = useAppSelector((s) => s.tabs.tabs)
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
   const settings = useAppSelector((s) => s.settings.settings)
-  const idleWarnings = useAppSelector((s) => (s as any).idleWarnings?.warnings ?? EMPTY_IDLE_WARNINGS)
-  const idleWarningCount = Object.keys(idleWarnings).length
   const networkStatus = useAppSelector((s) => s.network.status)
 
   const [view, setView] = useState<AppView>('terminal')
@@ -142,6 +143,9 @@ export default function App() {
   const terminalMetaListRequestStartedAtRef = useRef(new Map<string, number>())
   const fullscreenTouchStartYRef = useRef<number | null>(null)
   const isLandscapeTerminalView = isMobile && isLandscape && view === 'terminal'
+  const shareAccessUrl = networkStatus?.accessUrl
+    ? ensureShareUrlToken(networkStatus.accessUrl, getAuthToken())
+    : null
 
   // Keep this tab's Redux state in sync with persisted writes from other browser tabs.
   useEffect(() => {
@@ -298,9 +302,9 @@ export default function App() {
   }
 
   const handleCopyAccessUrl = async () => {
-    if (!networkStatus?.accessUrl) return
+    if (!shareAccessUrl) return
     try {
-      await navigator.clipboard.writeText(networkStatus.accessUrl)
+      await navigator.clipboard.writeText(shareAccessUrl)
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     } catch (err) {
@@ -395,6 +399,24 @@ export default function App() {
         client: { mobile: isMobileRef.current },
       }))
 
+      const requestTerminalMetaList = () => {
+        terminalMetaListRequestStartedAtRef.current.clear()
+        const requestId = `terminal-meta-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+        terminalMetaListRequestStartedAtRef.current.set(requestId, Date.now())
+        ws.send({
+          type: 'terminal.meta.list',
+          requestId,
+        })
+      }
+
+      const promoteRecentHttpSessionsBaseline = () => {
+        const lastLoadedAt = store.getState().sessions.lastLoadedAt
+        if (typeof lastLoadedAt !== 'number') return false
+        if (Date.now() - lastLoadedAt > RECENT_HTTP_SESSIONS_BASELINE_MS) return false
+        dispatch(markWsSnapshotReceived())
+        return true
+      }
+
       const unsubscribe = ws.onMessage((msg) => {
         if (!msg?.type) return
         if (msg.type === 'ready') {
@@ -405,13 +427,10 @@ export default function App() {
           dispatch(setStatus('ready'))
           dispatch(setServerInstanceId(ready.success ? ready.data.serverInstanceId : undefined))
           dispatch(resetWsSnapshotReceived())
-          terminalMetaListRequestStartedAtRef.current.clear()
-          const requestId = `terminal-meta-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-          terminalMetaListRequestStartedAtRef.current.set(requestId, Date.now())
-          ws.send({
-            type: 'terminal.meta.list',
-            requestId,
-          })
+          // If App registered late and missed a prior snapshot, a fresh HTTP baseline
+          // from this bootstrap cycle is still safe for enabling patch application.
+          promoteRecentHttpSessionsBaseline()
+          requestTerminalMetaList()
         }
         if (msg.type === 'sessions.updated') {
           // Support chunked sessions for mobile browsers with limited WebSocket buffers
@@ -437,6 +456,13 @@ export default function App() {
         }
         if (msg.type === 'settings.updated') {
           dispatch(setSettings(applyLocalTerminalFontFamily(msg.settings as AppSettings)))
+        }
+        if (msg.type === 'ui.command') {
+          handleUiCommand(msg as Record<string, unknown>, {
+            dispatch,
+            getState: store.getState,
+            send: (payload) => ws.send(payload),
+          })
         }
         if (msg.type === 'terminal.meta.list.response') {
           const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''
@@ -467,18 +493,8 @@ export default function App() {
           const code = msg.exitCode
           log.debug('terminal exit', terminalId, code)
           if (terminalId) {
-            dispatch(clearIdleWarning(terminalId))
             dispatch(removeTerminalMeta(terminalId))
           }
-        }
-        if (msg.type === 'terminal.idle.warning') {
-          if (!msg.terminalId) return
-          dispatch(recordIdleWarning({
-            terminalId: msg.terminalId,
-            killMinutes: Number(msg.killMinutes) || 0,
-            warnMinutes: Number(msg.warnMinutes) || 0,
-            lastActivityAt: typeof msg.lastActivityAt === 'number' ? msg.lastActivityAt : undefined,
-          }))
         }
         if (msg.type === 'session.status') {
           // Log session repair status (silent for healthy/repaired, visible for problems)
@@ -509,6 +525,32 @@ export default function App() {
       }
       if (cleanedUp) cleanup()
 
+      // Another component may have connected before App finished bootstrap.
+      // Reconcile state for the already-ready socket so sessions patches do not stay blocked.
+      if (ws.isReady) {
+        if (cancelled) return
+        dispatch(setError(undefined))
+        dispatch(setStatus('ready'))
+        dispatch(setServerInstanceId(ws.serverInstanceId))
+        dispatch(resetWsSnapshotReceived())
+
+        const promoted = promoteRecentHttpSessionsBaseline()
+        if (!promoted) {
+          try {
+            const projects = await api.get('/api/sessions')
+            if (!cancelled) {
+              dispatch(setProjects(projects))
+              dispatch(markWsSnapshotReceived())
+            }
+          } catch (err: any) {
+            if (handleBootstrapAuthFailure(err)) return
+            log.warn('Failed to refresh sessions for pre-connected websocket', err)
+          }
+        }
+
+        if (!cancelled) requestTerminalMetaList()
+        return
+      }
       dispatch(setError(undefined))
       dispatch(setErrorCode(undefined))
       dispatch(setStatus('connecting'))
@@ -701,18 +743,6 @@ export default function App() {
         className="h-full min-h-0 overflow-hidden flex flex-col bg-background text-foreground"
         data-context={ContextIds.Global}
       >
-        {idleWarningCount > 0 && (
-          <div className="px-3 md:px-4 py-2 border-b border-amber-300/40 bg-amber-100/60 dark:bg-amber-950/40">
-            <button
-              onClick={() => setView('overview')}
-              className="rounded-md bg-amber-100 text-amber-950 hover:bg-amber-200 transition-colors text-xs font-medium px-2 py-1 dark:bg-amber-900/70 dark:text-amber-100 dark:hover:bg-amber-900"
-              aria-label={`${idleWarningCount} coding agent terminal(s) will auto-kill soon`}
-              title="View in Panes"
-            >
-              {idleWarningCount} terminal{idleWarningCount === 1 ? '' : 's'} will auto-kill soon
-            </button>
-          </div>
-        )}
       {configFallback && (
         <div className="px-3 md:px-4 py-2 border-b border-destructive/30 bg-destructive/10 text-destructive text-xs">
           <div className="flex items-start gap-2">
@@ -900,13 +930,13 @@ npm run serve`}</pre>
             <p className="text-sm text-muted-foreground mb-4">
               Share this link with devices on your local network or VPN.
             </p>
-            {networkStatus.accessUrl && (
+            {shareAccessUrl && (
               <div className="flex justify-center mb-4">
-                <ShareQrCode url={networkStatus.accessUrl} />
+                <ShareQrCode url={shareAccessUrl} />
               </div>
             )}
             <div className="bg-muted rounded-md p-3 mb-4">
-              <code className="text-sm break-all select-all">{networkStatus.accessUrl}</code>
+              <code className="text-sm break-all select-all">{shareAccessUrl ?? networkStatus.accessUrl}</code>
             </div>
             <button
               onClick={handleCopyAccessUrl}

@@ -14,6 +14,7 @@ import {
 } from '@/lib/tab-registry-snapshot'
 import { UNKNOWN_SERVER_INSTANCE_ID } from './tabRegistryConstants'
 import type { RootState } from './store'
+import { TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 
 
@@ -37,7 +38,7 @@ function loadInitialTabsState(): TabsState {
   }
 
   try {
-    const raw = localStorage.getItem('freshell.tabs.v1')
+    const raw = localStorage.getItem(TABS_STORAGE_KEY)
     if (!raw) return defaultState
     const parsed = JSON.parse(raw)
     // The persisted format is { tabs: TabsState }

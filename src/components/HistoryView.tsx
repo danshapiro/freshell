@@ -4,6 +4,7 @@ import type { CodingCliProviderName, CodingCliSession, ProjectGroup } from '@/st
 import { toggleProjectExpanded, setProjects } from '@/store/sessionsSlice'
 import { api } from '@/lib/api'
 import { openSessionTab } from '@/store/tabsSlice'
+import { syncPaneTitleByTerminalId } from '@/store/paneTitleSync'
 import { cn } from '@/lib/utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { useMobile } from '@/hooks/useMobile'
@@ -85,7 +86,10 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
   async function renameSession(provider: CodingCliProviderName | undefined, sessionId: string, titleOverride?: string, summaryOverride?: string) {
     // Use composite key format: provider:sessionId
     const compositeKey = `${provider || 'claude'}:${sessionId}`
-    await api.patch(`/api/sessions/${encodeURIComponent(compositeKey)}`, { titleOverride, summaryOverride })
+    const result = await api.patch<{ cascadedTerminalId?: string }>(`/api/sessions/${encodeURIComponent(compositeKey)}`, { titleOverride, summaryOverride })
+    if (result.cascadedTerminalId && titleOverride) {
+      dispatch(syncPaneTitleByTerminalId({ terminalId: result.cascadedTerminalId, title: titleOverride }))
+    }
     await refresh()
   }
 

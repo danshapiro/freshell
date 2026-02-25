@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest'
 import http from 'http'
 import WebSocket from 'ws'
+import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
 
 const TEST_TIMEOUT_MS = 30_000
 const HOOK_TIMEOUT_MS = 30_000
@@ -128,7 +129,6 @@ describe('ws handshake snapshot', () => {
         },
         safety: {
           autoKillIdleMinutes: 180,
-          warnBeforeKillMinutes: 5,
         },
         panes: {
           defaultNewPane: 'ask',
@@ -199,7 +199,7 @@ describe('ws handshake snapshot', () => {
       const settingsPromise = waitForMessage(ws, (m) => m.type === 'settings.updated', MSG_TIMEOUT)
       const sessionsPromise = waitForMessage(ws, (m) => m.type === 'sessions.updated', MSG_TIMEOUT)
 
-      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
 
       await readyPromise
 
@@ -237,7 +237,7 @@ describe('ws handshake snapshot', () => {
       const readyPromise = waitForMessage(ws, (m) => m.type === 'ready', MSG_TIMEOUT)
       const fallbackPromise = waitForMessage(ws, (m) => m.type === 'config.fallback', MSG_TIMEOUT)
 
-      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
 
       await readyPromise
       const fallbackMsg = await fallbackPromise
@@ -246,6 +246,37 @@ describe('ws handshake snapshot', () => {
         reason: 'PARSE_ERROR',
         backupExists: true,
       })
+    } finally {
+      await closeWs()
+    }
+  })
+
+  it('sends an explicit empty sessions snapshot when no projects exist', async () => {
+    snapshot = {
+      ...snapshot,
+      projects: [],
+    }
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const closeWs = async () => {
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.terminate()
+      }
+      await new Promise<void>((resolve) => ws.on('close', () => resolve()))
+    }
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+
+      const MSG_TIMEOUT = 10_000
+      const readyPromise = waitForMessage(ws, (m) => m.type === 'ready', MSG_TIMEOUT)
+      const sessionsPromise = waitForMessage(ws, (m) => m.type === 'sessions.updated', MSG_TIMEOUT)
+
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+
+      await readyPromise
+      const sessionsMsg = await sessionsPromise
+      expect(sessionsMsg.projects).toEqual([])
     } finally {
       await closeWs()
     }
@@ -324,7 +355,7 @@ describe('ws handshake snapshot with chunking', () => {
       // Collect all sessions.updated messages (wait for idle to detect end of stream)
       const sessionsPromise = collectAllMessages(ws, (m) => m.type === 'sessions.updated', 500, 5000)
 
-      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
 
       await readyPromise
 

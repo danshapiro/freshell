@@ -37,7 +37,6 @@ function createTestStore(defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor' 
           },
           safety: {
             autoKillIdleMinutes: 180,
-            warnBeforeKillMinutes: 5,
           },
           sidebar: {
             sortMode: 'activity',

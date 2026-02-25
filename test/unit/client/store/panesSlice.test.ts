@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import panesReducer, {
   initLayout,
   splitPane,
+  swapPanes,
   addPane,
   closePane,
   setActivePane,
@@ -12,6 +13,7 @@ import panesReducer, {
   removeLayout,
   hydratePanes,
   updatePaneTitle,
+  updatePaneTitleByTerminalId,
   requestPaneRename,
   clearPaneRenameRequest,
   toggleZoom,
@@ -72,6 +74,17 @@ describe('panesSlice', () => {
 
       const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
       expect(state.activePane['tab-1']).toBe(leaf.id)
+    })
+
+    it('uses the provided paneId when supplied', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-1', paneId: 'pane-fixed', content: { kind: 'terminal', mode: 'shell' } })
+      )
+
+      const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.id).toBe('pane-fixed')
+      expect(state.activePane['tab-1']).toBe('pane-fixed')
     })
 
     it('does not overwrite existing layout for a tab', () => {
@@ -249,7 +262,7 @@ describe('panesSlice', () => {
       }
     })
 
-    it('does not auto-assign resumeSessionId for claude panes created by splitPane', () => {
+    it('uses the provided newPaneId when supplied', () => {
       let state = panesReducer(
         initialState,
         initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
@@ -262,12 +275,15 @@ describe('panesSlice', () => {
           tabId: 'tab-1',
           paneId: originalPaneId,
           direction: 'horizontal',
+          newPaneId: 'pane-fixed',
           newContent: { kind: 'terminal', mode: 'claude' },
         })
       )
 
       const split = state.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
       const claudeLeaf = split.children[1] as Extract<PaneNode, { type: 'leaf' }>
+      expect(claudeLeaf.id).toBe('pane-fixed')
+      expect(state.activePane['tab-1']).toBe('pane-fixed')
       if (claudeLeaf.content.kind === 'terminal') {
         expect(claudeLeaf.content.resumeSessionId).toBeUndefined()
       }
@@ -508,6 +524,45 @@ describe('panesSlice', () => {
         expect(newPane.content.url).toBe('https://example.com')
         expect(newPane.content.devToolsOpen).toBe(true)
       }
+    })
+  })
+
+  describe('swapPanes', () => {
+    it('swaps pane content by pane id', () => {
+      let state = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'shell' } })
+      )
+      const originalPaneId = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).id
+
+      state = panesReducer(
+        state,
+        splitPane({
+          tabId: 'tab-1',
+          paneId: originalPaneId,
+          direction: 'horizontal',
+          newContent: { kind: 'browser', url: 'https://example.com', devToolsOpen: false },
+        })
+      )
+
+      const split = state.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
+      const left = split.children[0] as Extract<PaneNode, { type: 'leaf' }>
+      const right = split.children[1] as Extract<PaneNode, { type: 'leaf' }>
+
+      expect(left.content.kind).toBe('terminal')
+      expect(right.content.kind).toBe('browser')
+
+      state = panesReducer(
+        state,
+        swapPanes({ tabId: 'tab-1', paneId: left.id, otherId: right.id })
+      )
+
+      const swapped = state.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
+      const swappedLeft = swapped.children[0] as Extract<PaneNode, { type: 'leaf' }>
+      const swappedRight = swapped.children[1] as Extract<PaneNode, { type: 'leaf' }>
+
+      expect(swappedLeft.content.kind).toBe('browser')
+      expect(swappedRight.content.kind).toBe('terminal')
     })
   })
 
@@ -2495,6 +2550,167 @@ describe('panesSlice', () => {
 
       // Zoom should be cleared so the new pane is visible
       expect(result.zoomedPane[tabId]).toBeUndefined()
+    })
+  })
+
+  describe('updatePaneTitleByTerminalId', () => {
+    it('updates paneTitles when a leaf has matching terminalId', () => {
+      const leaf: PaneNode = {
+        type: 'leaf',
+        id: 'pane-a',
+        content: { kind: 'terminal', terminalId: 'term-42', createRequestId: 'req-1', status: 'running', mode: 'claude' },
+      }
+      const state: PanesState = {
+        layouts: { 'tab-1': leaf },
+        activePane: { 'tab-1': 'pane-a' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+      }
+
+      const result = panesReducer(state, updatePaneTitleByTerminalId({ terminalId: 'term-42', title: 'My Session' }))
+
+      expect(result.paneTitles['tab-1']['pane-a']).toBe('My Session')
+    })
+
+    it('does nothing when no pane matches the terminalId', () => {
+      const leaf: PaneNode = {
+        type: 'leaf',
+        id: 'pane-a',
+        content: { kind: 'terminal', terminalId: 'term-99', createRequestId: 'req-1', status: 'running', mode: 'shell' },
+      }
+      const state: PanesState = {
+        layouts: { 'tab-1': leaf },
+        activePane: { 'tab-1': 'pane-a' },
+        paneTitles: { 'tab-1': { 'pane-a': 'Original Title' } },
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+      }
+
+      const result = panesReducer(state, updatePaneTitleByTerminalId({ terminalId: 'term-42', title: 'New Title' }))
+
+      expect(result.paneTitles['tab-1']['pane-a']).toBe('Original Title')
+    })
+
+    it('updates pane title in a nested split tree', () => {
+      const leaf1: PaneNode = {
+        type: 'leaf',
+        id: 'pane-a',
+        content: { kind: 'terminal', terminalId: 'term-1', createRequestId: 'req-1', status: 'running', mode: 'shell' },
+      }
+      const leaf2: PaneNode = {
+        type: 'leaf',
+        id: 'pane-b',
+        content: { kind: 'terminal', terminalId: 'term-target', createRequestId: 'req-2', status: 'running', mode: 'claude' },
+      }
+      const leaf3: PaneNode = {
+        type: 'leaf',
+        id: 'pane-c',
+        content: { kind: 'terminal', terminalId: 'term-3', createRequestId: 'req-3', status: 'running', mode: 'shell' },
+      }
+      const innerSplit: PaneNode = {
+        type: 'split',
+        id: 'split-inner',
+        direction: 'vertical',
+        sizes: [50, 50],
+        children: [leaf2, leaf3],
+      }
+      const root: PaneNode = {
+        type: 'split',
+        id: 'split-root',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [leaf1, innerSplit],
+      }
+      const state: PanesState = {
+        layouts: { 'tab-1': root },
+        activePane: { 'tab-1': 'pane-a' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+      }
+
+      const result = panesReducer(state, updatePaneTitleByTerminalId({ terminalId: 'term-target', title: 'Deep Rename' }))
+
+      expect(result.paneTitles['tab-1']['pane-b']).toBe('Deep Rename')
+      // Other panes should not be affected
+      expect(result.paneTitles['tab-1']['pane-a']).toBeUndefined()
+      expect(result.paneTitles['tab-1']['pane-c']).toBeUndefined()
+    })
+
+    it('updates across multiple tabs when both have matching terminalId', () => {
+      const leaf1: PaneNode = {
+        type: 'leaf',
+        id: 'pane-a',
+        content: { kind: 'terminal', terminalId: 'term-shared', createRequestId: 'req-1', status: 'running', mode: 'claude' },
+      }
+      const leaf2: PaneNode = {
+        type: 'leaf',
+        id: 'pane-b',
+        content: { kind: 'terminal', terminalId: 'term-shared', createRequestId: 'req-2', status: 'running', mode: 'claude' },
+      }
+      const state: PanesState = {
+        layouts: { 'tab-1': leaf1, 'tab-2': leaf2 },
+        activePane: { 'tab-1': 'pane-a', 'tab-2': 'pane-b' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+      }
+
+      const result = panesReducer(state, updatePaneTitleByTerminalId({ terminalId: 'term-shared', title: 'Shared Title' }))
+
+      expect(result.paneTitles['tab-1']['pane-a']).toBe('Shared Title')
+      expect(result.paneTitles['tab-2']['pane-b']).toBe('Shared Title')
+    })
+
+    it('skips non-terminal panes', () => {
+      const leaf: PaneNode = {
+        type: 'leaf',
+        id: 'pane-a',
+        content: { kind: 'browser', url: 'https://example.com', devToolsOpen: false },
+      }
+      const state: PanesState = {
+        layouts: { 'tab-1': leaf },
+        activePane: { 'tab-1': 'pane-a' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+      }
+
+      const result = panesReducer(state, updatePaneTitleByTerminalId({ terminalId: 'term-42', title: 'Title' }))
+
+      expect(result.paneTitles['tab-1']).toBeUndefined()
+    })
+
+    it('skips panes where terminalId is undefined', () => {
+      const leaf: PaneNode = {
+        type: 'leaf',
+        id: 'pane-a',
+        content: { kind: 'terminal', createRequestId: 'req-1', status: 'creating', mode: 'claude' },
+      }
+      const state: PanesState = {
+        layouts: { 'tab-1': leaf },
+        activePane: { 'tab-1': 'pane-a' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+      }
+
+      const result = panesReducer(state, updatePaneTitleByTerminalId({ terminalId: 'term-42', title: 'Title' }))
+
+      expect(result.paneTitles['tab-1']).toBeUndefined()
     })
   })
 })

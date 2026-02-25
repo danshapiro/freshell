@@ -4,6 +4,8 @@ import { cleanString } from './utils.js'
 import { makeSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
 import { startPerfTimer } from './perf-logger.js'
 import { logger } from './logger.js'
+import { cascadeSessionRenameToTerminal } from './rename-cascade.js'
+import type { TerminalMeta } from './terminal-metadata-service.js'
 
 const log = logger.child({ component: 'sessions-router' })
 
@@ -26,6 +28,9 @@ export interface SessionsRouterDeps {
   }
   codingCliProviders: any[]
   perfConfig: { slowSessionRefreshMs: number }
+  terminalMetadata?: { list: () => TerminalMeta[] }
+  registry?: { updateTitle: (id: string, title: string) => void }
+  wsHandler?: { broadcast: (msg: any) => void }
 }
 
 export function createSessionsRouter(deps: SessionsRouterDeps): Router {
@@ -105,8 +110,32 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
       archived,
       createdAtOverride,
     })
+
+    // Cascade: if this session is running in a terminal, also rename the terminal
+    const cleanTitle = cleanString(titleOverride)
+    let cascadedTerminalId: string | undefined
+    if (cleanTitle && deps.terminalMetadata) {
+      try {
+        const parts = compositeKey.split(':')
+        const sessionProvider = (parts.length >= 2 ? parts[0] : provider) as CodingCliProviderName
+        const sessionId = parts.length >= 2 ? parts.slice(1).join(':') : rawId
+        cascadedTerminalId = await cascadeSessionRenameToTerminal(
+          deps.terminalMetadata.list(),
+          sessionProvider,
+          sessionId,
+          cleanTitle,
+        )
+        if (cascadedTerminalId) {
+          deps.registry?.updateTitle(cascadedTerminalId, cleanTitle)
+          deps.wsHandler?.broadcast({ type: 'terminal.list.updated' })
+        }
+      } catch (err) {
+        log.warn({ err, compositeKey }, 'Cascade rename to terminal failed (non-fatal)')
+      }
+    }
+
     await codingCliIndexer.refresh()
-    res.json(next)
+    res.json({ ...next, cascadedTerminalId })
   })
 
   router.delete('/sessions/:sessionId', async (req, res) => {

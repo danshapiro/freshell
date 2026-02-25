@@ -8,7 +8,6 @@ import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
-import idleWarningsReducer from '@/store/idleWarningsSlice'
 import { networkReducer } from '@/store/networkSlice'
 
 // Ensure DOM is clean even if another test file forgot cleanup.
@@ -96,7 +95,6 @@ function createTestStore(options?: {
       connection: connectionReducer,
       sessions: sessionsReducer,
       panes: panesReducer,
-      idleWarnings: idleWarningsReducer,
       network: networkReducer,
     },
     middleware: (getDefault) =>
@@ -135,9 +133,6 @@ function createTestStore(options?: {
       panes: {
         layouts: {},
         activePane: {},
-      },
-      idleWarnings: {
-        warnings: {},
       },
       network: {
         status: null,

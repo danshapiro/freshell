@@ -267,6 +267,16 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
   color: var(--t-fg); overflow-y: auto; overflow-x: hidden;
   white-space: pre-wrap; word-break: break-word; transition: background-color .2s;
 }
+.terminal-inline-status {
+  margin: 8px 12px 0;
+  align-self: flex-start;
+  border: 1px solid hsl(var(--border) / .8);
+  background: hsl(var(--background) / .9);
+  color: hsl(var(--muted-foreground));
+  border-radius: 999px;
+  padding: 2px 9px;
+  font-size: 11px;
+}
 .term-line { min-height: 1.55em; }
 .term-cursor {
   display: inline-block; width: 7.5px; height: 16px;
@@ -466,6 +476,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
         <div class="split-h">
           <div class="pane" style="flex:.48">
             <div class="pane-header active"><i data-lucide="terminal" class="icon"></i><span class="pane-header-title">Terminal — zsh</span><span class="pane-header-meta">~/code/freshell</span><div class="pane-btns"><span class="pane-btn"><i data-lucide="maximize-2" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="x" class="icon-xs"></i></span></div></div>
+            <div class="terminal-inline-status">Recovering terminal output... typing is still enabled.</div>
             <div class="terminal" id="term-welcome"></div>
           </div>
           <div class="divider-v"><div class="dots"><span></span><span></span><span></span></div></div>

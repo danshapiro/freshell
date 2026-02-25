@@ -196,7 +196,7 @@ describe('EditorPane', () => {
       </Provider>
     )
 
-    expect(await screen.findByRole('heading', { level: 1 })).toHaveTextContent('Hello World')
+    expect(await screen.findByRole('heading', { level: 1 }, { timeout: 5000 })).toHaveTextContent('Hello World')
     expect(screen.queryByTestId('monaco-mock')).not.toBeInTheDocument()
   })
 

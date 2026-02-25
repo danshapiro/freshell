@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest'
 import http from 'http'
 import WebSocket from 'ws'
 import { SessionsSyncService } from '../../server/sessions-sync/service.js'
+import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
 
 const TEST_TIMEOUT_MS = 30_000
 vi.setConfig({ testTimeout: TEST_TIMEOUT_MS })
@@ -77,6 +78,7 @@ describe('ws sessions.patch broadcast', () => {
     ws.send(JSON.stringify({
       type: 'hello',
       token: 'testtoken-testtoken',
+      protocolVersion: WS_PROTOCOL_VERSION,
       capabilities: { sessionsPatchV1: true },
     }))
 

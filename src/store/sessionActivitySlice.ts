@@ -1,6 +1,8 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
+import { SESSION_ACTIVITY_STORAGE_KEY } from './storage-keys'
 
-export const SESSION_ACTIVITY_STORAGE_KEY = 'freshell.sessionActivity.v1'
+export { SESSION_ACTIVITY_STORAGE_KEY } from './storage-keys'
+
 const MAX_SESSION_ACTIVITY_ENTRIES = 2000
 const SESSION_ACTIVITY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
 

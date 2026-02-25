@@ -160,7 +160,7 @@ function createStore(renderer: 'auto' | 'webgl' | 'canvas') {
         },
         status: 'loaded',
       },
-      connection: { status: 'connected', error: null },
+      connection: { status: 'ready', error: null },
     },
   })
 
@@ -247,7 +247,15 @@ describe('TerminalView renderer mode', () => {
     runtimeMockState.lastRuntime!.emitContextLoss()
     expect(runtimeMockState.lastRuntime!.webglActive()).toBe(false)
 
-    messageHandler!({ type: 'terminal.output', terminalId, data: 'still works' })
-    expect(terminalInstances[0].write).toHaveBeenCalledWith('still works')
+    messageHandler!({
+      type: 'terminal.output',
+      terminalId,
+      seqStart: 1,
+      seqEnd: 1,
+      data: 'still works',
+    })
+    await waitFor(() => {
+      expect(terminalInstances[0].write).toHaveBeenCalledWith('still works', undefined)
+    })
   })
 })

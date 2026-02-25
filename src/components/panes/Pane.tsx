@@ -58,6 +58,9 @@ export default function Pane({
 
   return (
     <div
+      data-pane-shell="true"
+      data-tab-id={tabId}
+      data-pane-id={paneId}
       className={cn(
         'relative h-full w-full overflow-hidden flex flex-col',
         !isActive && 'opacity-[0.85]'

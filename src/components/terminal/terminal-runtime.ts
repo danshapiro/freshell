@@ -15,6 +15,8 @@ export type TerminalRuntime = {
   onDidChangeResults: (callback: (event: SearchResultChangeEvent) => void) => IDisposable
   dispose: () => void
   webglActive: () => boolean
+  suspendWebgl?: () => boolean
+  resumeWebgl?: () => void
 }
 
 type CreateTerminalRuntimeParams = {
@@ -62,17 +64,8 @@ export function createTerminalRuntime({
     }
   }
 
-  const attachAddons = () => {
-    if (attached || disposed) return
-    attached = true
-
-    fitAddon = new FitAddon()
-    terminal.loadAddon(fitAddon)
-
-    searchAddon = new SearchAddon()
-    terminal.loadAddon(searchAddon)
-
-    if (!enableWebgl) return
+  const enableWebglAddon = () => {
+    if (!enableWebgl || disposed || webglAddon) return
     void loadWebglAddonModule()
       .then(({ WebglAddon }) => {
         if (disposed || webglAddon) return
@@ -95,6 +88,20 @@ export function createTerminalRuntime({
       .catch(() => {
         disableWebgl()
       })
+  }
+
+  const attachAddons = () => {
+    if (attached || disposed) return
+    attached = true
+
+    fitAddon = new FitAddon()
+    terminal.loadAddon(fitAddon)
+
+    searchAddon = new SearchAddon()
+    terminal.loadAddon(searchAddon)
+
+    if (!enableWebgl) return
+    enableWebglAddon()
   }
 
   return {
@@ -124,5 +131,14 @@ export function createTerminalRuntime({
       searchAddon = null
     },
     webglActive: () => isWebglActive,
+    suspendWebgl: () => {
+      if (!isWebglActive && !webglAddon) return false
+      disableWebgl()
+      return true
+    },
+    resumeWebgl: () => {
+      if (disposed || !enableWebgl || webglAddon) return
+      enableWebglAddon()
+    },
   }
 }

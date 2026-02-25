@@ -74,7 +74,7 @@ function renderPickerFlow() {
             scrollback: 5000,
             theme: 'auto' as const,
           },
-          safety: { autoKillIdleMinutes: 180, warnBeforeKillMinutes: 5 },
+          safety: { autoKillIdleMinutes: 180 },
           sidebar: { sortMode: 'activity' as const, showProjectBadges: true, width: 288, collapsed: false },
           panes: { defaultNewPane: 'ask' as const },
           codingCli: {
@@ -158,7 +158,7 @@ function renderTabAwarePickerFlow() {
             scrollback: 5000,
             theme: 'auto' as const,
           },
-          safety: { autoKillIdleMinutes: 180, warnBeforeKillMinutes: 5 },
+          safety: { autoKillIdleMinutes: 180 },
           sidebar: { sortMode: 'activity' as const, showProjectBadges: true, width: 288, collapsed: false },
           panes: { defaultNewPane: 'ask' as const },
           codingCli: {

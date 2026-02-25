@@ -177,7 +177,6 @@ describe('SettingsView Component', () => {
 
       // Safety section
       expect(screen.getByText('Auto-kill idle (minutes)')).toBeInTheDocument()
-      expect(screen.getByText('Warn before kill (minutes)')).toBeInTheDocument()
       expect(screen.getByText('Default working directory')).toBeInTheDocument()
 
       // Notifications section
@@ -362,13 +361,12 @@ describe('SettingsView Component', () => {
       const store = createTestStore({
         settings: {
           ...defaultSettings,
-          safety: { autoKillIdleMinutes: 120, warnBeforeKillMinutes: 15 },
+          safety: { autoKillIdleMinutes: 120 },
         },
       })
       renderWithStore(store)
 
       expect(screen.getByText('120')).toBeInTheDocument()
-      expect(screen.getByText('15')).toBeInTheDocument()
     })
 
     it('shows lastSavedAt timestamp when available', () => {
@@ -941,23 +939,6 @@ describe('SettingsView Component', () => {
       fireEvent.pointerUp(autoKillSlider)
 
       expect(store.getState().settings.settings.safety.autoKillIdleMinutes).toBe(300)
-    })
-
-    it('updates warn before kill slider', () => {
-      const store = createTestStore()
-      renderWithStore(store)
-
-      const sliders = screen.getAllByRole('slider')
-      const warnSlider = sliders.find((slider) => {
-        const min = slider.getAttribute('min')
-        const max = slider.getAttribute('max')
-        return min === '1' && max === '60'
-      })!
-
-      fireEvent.change(warnSlider, { target: { value: '10' } })
-      fireEvent.pointerUp(warnSlider)
-
-      expect(store.getState().settings.settings.safety.warnBeforeKillMinutes).toBe(10)
     })
 
     it('validates default working directory before saving', async () => {

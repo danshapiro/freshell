@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { initLayout, addPane } from '@/store/panesSlice'
+import { initLayout, addPane, splitPane } from '@/store/panesSlice'
 import type { PaneContentInput, PaneNode } from '@/store/paneTypes'
 import PaneContainer from './PaneContainer'
 import FloatingActionButton from './FloatingActionButton'
@@ -22,6 +22,8 @@ export default function PaneLayout({ tabId, defaultContent, hidden }: PaneLayout
   const dispatch = useAppDispatch()
   const layout = useAppSelector((s) => s.panes.layouts[tabId])
   const zoomedPaneId = useAppSelector((s) => s.panes.zoomedPane?.[tabId])
+  const settings = useAppSelector((s) => s.settings.settings)
+  const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
   const containerRef = useRef<HTMLDivElement>(null)
 
   // Initialize layout if not exists
@@ -39,6 +41,16 @@ export default function PaneLayout({ tabId, defaultContent, hidden }: PaneLayout
     }))
   }, [dispatch, tabId])
 
+  const handleSplit = useCallback((direction: 'horizontal' | 'vertical') => {
+    if (!activePaneId) return
+    dispatch(splitPane({
+      tabId,
+      paneId: activePaneId,
+      direction,
+      newContent: { kind: 'terminal', mode: 'shell', shell: 'system', initialCwd: settings.defaultCwd },
+    }))
+  }, [dispatch, tabId, activePaneId, settings.defaultCwd])
+
   if (!layout) {
     return <div className="h-full w-full" /> // Loading state
   }
@@ -53,7 +65,11 @@ export default function PaneLayout({ tabId, defaultContent, hidden }: PaneLayout
       {!zoomedPaneId && (
         <IntersectionDragOverlay tabId={tabId} containerRef={containerRef} />
       )}
-      <FloatingActionButton onAdd={handleAddPane} />
+      <FloatingActionButton
+        onAdd={handleAddPane}
+        onSplitHorizontal={() => handleSplit('horizontal')}
+        onSplitVertical={() => handleSplit('vertical')}
+      />
     </div>
   )
 }

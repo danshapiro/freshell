@@ -4,6 +4,7 @@ import type { PanesState, PaneContent, PaneContentInput, PaneNode } from './pane
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { loadPersistedPanes } from './persistMiddleware.js'
+import { TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 
 
@@ -69,94 +70,13 @@ function normalizeContent(input: PaneContentInput): PaneContent {
   return input
 }
 
-function applyLegacyResumeSessionIds(state: PanesState): PanesState {
-  if (typeof localStorage === 'undefined') return state
-  const rawTabs = localStorage.getItem('freshell.tabs.v1')
-  if (!rawTabs) return state
-
-  let parsedTabs: any
-  try {
-    parsedTabs = JSON.parse(rawTabs)
-  } catch {
-    return state
-  }
-
-  const tabsState = parsedTabs?.tabs
-  if (!tabsState?.tabs) return state
-
-  const resumeByTabId = new Map<string, string>()
-  for (const tab of tabsState.tabs) {
-    // Legacy tabs may not have mode persisted; resumeSessionId is the signal.
-    if (isValidClaudeSessionId(tab?.resumeSessionId)) {
-      resumeByTabId.set(tab.id, tab.resumeSessionId)
-    }
-  }
-
-  if (resumeByTabId.size === 0) return state
-
-  const nextLayouts: Record<string, PaneNode> = {}
-  let changed = false
-
-  const findLeaf = (node: PaneNode, targetId: string): Extract<PaneNode, { type: 'leaf' }> | null => {
-    if (node.type === 'leaf') return node.id === targetId ? node : null
-    return findLeaf(node.children[0], targetId) || findLeaf(node.children[1], targetId)
-  }
-
-  const findFirstClaudeLeaf = (node: PaneNode): Extract<PaneNode, { type: 'leaf' }> | null => {
-    if (node.type === 'leaf') {
-      if (node.content.kind === 'terminal' && node.content.mode === 'claude') return node
-      return null
-    }
-    return findFirstClaudeLeaf(node.children[0]) || findFirstClaudeLeaf(node.children[1])
-  }
-
-  const assignToTarget = (node: PaneNode, targetId: string, resumeSessionId: string): PaneNode => {
-    if (node.type === 'leaf') {
-      if (node.id !== targetId) return node
-      if (node.content.kind !== 'terminal' || node.content.mode !== 'claude') return node
-      if (node.content.resumeSessionId) return node
-      changed = true
-      return { ...node, content: { ...node.content, resumeSessionId } }
-    }
-
-    const left = assignToTarget(node.children[0], targetId, resumeSessionId)
-    const right = assignToTarget(node.children[1], targetId, resumeSessionId)
-    if (left === node.children[0] && right === node.children[1]) return node
-    return { ...node, children: [left, right] }
-  }
-
-  for (const [tabId, node] of Object.entries(state.layouts)) {
-    const resume = resumeByTabId.get(tabId)
-    if (!resume) {
-      nextLayouts[tabId] = node as PaneNode
-      continue
-    }
-
-    const activeId = state.activePane[tabId]
-    const activeLeaf = activeId ? findLeaf(node as PaneNode, activeId) : null
-    const targetLeaf =
-      activeLeaf && activeLeaf.content.kind === 'terminal' && activeLeaf.content.mode === 'claude'
-        ? activeLeaf
-        : findFirstClaudeLeaf(node as PaneNode)
-
-    if (!targetLeaf) {
-      nextLayouts[tabId] = node as PaneNode
-      continue
-    }
-
-    nextLayouts[tabId] = assignToTarget(node as PaneNode, targetLeaf.id, resume)
-  }
-
-  return changed ? { ...state, layouts: nextLayouts } : state
-}
-
 /**
  * Remove pane layouts/activePane/paneTitles for tabs that no longer exist.
  * Reads the tab list from localStorage (already loaded by tabsSlice at this point).
  */
 function cleanOrphanedLayouts(state: PanesState): PanesState {
   try {
-    const rawTabs = localStorage.getItem('freshell.tabs.v1')
+    const rawTabs = localStorage.getItem(TABS_STORAGE_KEY)
     if (!rawTabs) return state
     const parsedTabs = JSON.parse(rawTabs)
     const tabs = parsedTabs?.tabs?.tabs
@@ -223,7 +143,6 @@ function loadInitialPanesState(): PanesState {
       renameRequestPaneId: null,
       zoomedPane: {},
     }
-    state = applyLegacyResumeSessionIds(state)
     state = cleanOrphanedLayouts(state)
     return state
   } catch (err) {
@@ -233,6 +152,21 @@ function loadInitialPanesState(): PanesState {
 }
 
 const initialState: PanesState = loadInitialPanesState()
+
+/**
+ * Recursively walk a pane tree to find the leaf pane ID whose terminal
+ * content has the given terminalId. Returns undefined if no match.
+ */
+function findPaneIdByTerminalId(node: PaneNode, terminalId: string): string | undefined {
+  if (node.type === 'leaf') {
+    if (node.content.kind === 'terminal' && node.content.terminalId === terminalId) {
+      return node.id
+    }
+    return undefined
+  }
+  return findPaneIdByTerminalId(node.children[0], terminalId)
+    ?? findPaneIdByTerminalId(node.children[1], terminalId)
+}
 
 // Helper to find and replace a node (leaf or split) in the tree
 function findAndReplace(
@@ -344,17 +278,18 @@ export const panesSlice = createSlice({
   reducers: {
     initLayout: (
       state,
-      action: PayloadAction<{ tabId: string; content: PaneContentInput }>
+      action: PayloadAction<{ tabId: string; content: PaneContentInput; paneId?: string }>
     ) => {
-      const { tabId, content } = action.payload
+      const { tabId, content, paneId: providedPaneId } = action.payload
       // Don't overwrite existing layout
       if (state.layouts[tabId]) return
 
-      const paneId = nanoid()
+      const paneId = providedPaneId ?? nanoid()
+      const normalized = normalizeContent(content)
       state.layouts[tabId] = {
         type: 'leaf',
         id: paneId,
-        content: normalizeContent(content),
+        content: normalized,
       }
       state.activePane[tabId] = paneId
     },
@@ -382,13 +317,14 @@ export const panesSlice = createSlice({
         paneId: string
         direction: 'horizontal' | 'vertical'
         newContent: PaneContentInput
+        newPaneId?: string
       }>
     ) => {
-      const { tabId, paneId, direction, newContent } = action.payload
+      const { tabId, paneId, direction, newContent, newPaneId: providedPaneId } = action.payload
       const root = state.layouts[tabId]
       if (!root) return
 
-      const newPaneId = nanoid()
+      const newPaneId = providedPaneId ?? nanoid()
       const normalizedContent = normalizeContent(newContent)
 
       const targetPane = findLeaf(root, paneId)
@@ -651,6 +587,47 @@ export const panesSlice = createSlice({
       state.layouts[tabId] = update(root)
     },
 
+    swapPanes: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string; otherId: string }>
+    ) => {
+      const { tabId, paneId, otherId } = action.payload
+      const root = state.layouts[tabId]
+      if (!root) return
+
+      function findLeaf(node: PaneNode, id: string): Extract<PaneNode, { type: 'leaf' }> | null {
+        if (node.type === 'leaf') return node.id === id ? node : null
+        return findLeaf(node.children[0], id) || findLeaf(node.children[1], id)
+      }
+
+      const a = findLeaf(root, paneId)
+      const b = findLeaf(root, otherId)
+      if (!a || !b) return
+      const paneContent = a.content
+      const otherContent = b.content
+
+      function update(node: PaneNode): PaneNode {
+        if (node.type === 'leaf') {
+          if (node.id === paneId) return { ...node, content: otherContent }
+          if (node.id === otherId) return { ...node, content: paneContent }
+          return node
+        }
+        return {
+          ...node,
+          children: [update(node.children[0]), update(node.children[1])],
+        }
+      }
+
+      state.layouts[tabId] = update(root)
+
+      if (state.paneTitles[tabId]) {
+        const titles = state.paneTitles[tabId]
+        const temp = titles[paneId]
+        titles[paneId] = titles[otherId]
+        titles[otherId] = temp
+      }
+    },
+
     replacePane: (
       state,
       action: PayloadAction<{ tabId: string; paneId: string }>
@@ -822,6 +799,29 @@ export const panesSlice = createSlice({
         state.zoomedPane[tabId] = paneId
       }
     },
+
+    /**
+     * Walk all tabs' pane trees and update the title for any pane whose
+     * terminal content has the given terminalId. Used when a session rename
+     * from the history view should cascade to the pane title bar.
+     */
+    updatePaneTitleByTerminalId: (
+      state,
+      action: PayloadAction<{ terminalId: string; title: string }>
+    ) => {
+      const { terminalId, title } = action.payload
+      for (const tabId of Object.keys(state.layouts)) {
+        const paneId = findPaneIdByTerminalId(state.layouts[tabId], terminalId)
+        if (paneId) {
+          if (!state.paneTitles[tabId]) state.paneTitles[tabId] = {}
+          state.paneTitles[tabId][paneId] = title
+          // Mark as user-set so programmatic updates don't overwrite it
+          if (!state.paneTitleSetByUser) state.paneTitleSetByUser = {}
+          if (!state.paneTitleSetByUser[tabId]) state.paneTitleSetByUser[tabId] = {}
+          state.paneTitleSetByUser[tabId][paneId] = true
+        }
+      }
+    },
   },
 })
 
@@ -837,10 +837,12 @@ export const {
   resetSplit,
   swapSplit,
   replacePane,
+  swapPanes,
   updatePaneContent,
   removeLayout,
   hydratePanes,
   updatePaneTitle,
+  updatePaneTitleByTerminalId,
   requestPaneRename,
   clearPaneRenameRequest,
   toggleZoom,

@@ -5,6 +5,7 @@ import { Provider } from 'react-redux'
 import PaneLayout from '@/components/panes/PaneLayout'
 import panesReducer from '@/store/panesSlice'
 import tabsReducer from '@/store/tabsSlice'
+import settingsReducer from '@/store/settingsSlice'
 import type { PanesState } from '@/store/panesSlice'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
 
@@ -31,6 +32,12 @@ vi.mock('lucide-react', () => ({
   ),
   Plus: ({ className }: { className?: string }) => (
     <svg data-testid="plus-icon" className={className} />
+  ),
+  SplitSquareHorizontal: ({ className }: { className?: string }) => (
+    <svg data-testid="split-horizontal-icon" className={className} />
+  ),
+  SplitSquareVertical: ({ className }: { className?: string }) => (
+    <svg data-testid="split-vertical-icon" className={className} />
   ),
   Globe: ({ className }: { className?: string }) => (
     <svg data-testid="globe-icon" className={className} />
@@ -121,6 +128,7 @@ function createStore(initialPanesState: Partial<PanesState> = {}) {
     reducer: {
       panes: panesReducer,
       tabs: tabsReducer,
+      settings: settingsReducer,
     },
     preloadedState: {
       panes: {

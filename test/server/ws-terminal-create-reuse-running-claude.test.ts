@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest'
 import http from 'http'
 import WebSocket from 'ws'
+import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
 
 const HOOK_TIMEOUT_MS = 30_000
 const VALID_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
@@ -54,8 +55,7 @@ class FakeBuffer {
 
 class FakeRegistry {
   record: any
-  attachCalls: Array<{ terminalId: string; opts?: { pendingSnapshot?: boolean } }> = []
-  finishAttachSnapshotCalls: Array<{ terminalId: string }> = []
+  attachCalls: Array<{ terminalId: string; opts?: { suppressOutput?: boolean } }> = []
 
   constructor(terminalId: string) {
     this.record = {
@@ -95,14 +95,10 @@ class FakeRegistry {
     return this.findRunningTerminalBySession('claude', sessionId)
   }
 
-  attach(terminalId: string, ws: WebSocket, opts?: { pendingSnapshot?: boolean }) {
+  attach(terminalId: string, ws: WebSocket, opts?: { suppressOutput?: boolean }) {
     this.attachCalls.push({ terminalId, opts })
     this.record.clients.add(ws)
     return this.record
-  }
-
-  finishAttachSnapshot(terminalId: string, _ws: WebSocket) {
-    this.finishAttachSnapshotCalls.push({ terminalId })
   }
 
   detach(_terminalId: string, ws: WebSocket) {
@@ -141,7 +137,6 @@ describe('terminal.create reuse running claude terminal', () => {
 
   beforeEach(() => {
     registry.attachCalls = []
-    registry.finishAttachSnapshotCalls = []
   })
 
   afterAll(async () => {
@@ -149,14 +144,21 @@ describe('terminal.create reuse running claude terminal', () => {
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }, HOOK_TIMEOUT_MS)
 
-  it('attaches with pendingSnapshot and flushes snapshot queue', async () => {
+  it('reuses running terminal via broker auto-attach without snapshot pipeline', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
       await waitForMessage(ws, (m) => m.type === 'ready')
 
       const requestId = 'reuse-1'
+      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+      const readyPromise = waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.attach.ready' && m.terminalId === 'term-existing',
+      )
+      const listUpdatedPromise = waitForMessage(ws, (m) => m.type === 'terminal.list.updated')
+
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId,
@@ -164,17 +166,16 @@ describe('terminal.create reuse running claude terminal', () => {
         resumeSessionId: VALID_SESSION_ID,
       }))
 
-      const listUpdated = waitForMessage(ws, (m) => m.type === 'terminal.list.updated')
-      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+      const created = await createdPromise
+      const ready = await readyPromise
       expect(created.terminalId).toBe('term-existing')
-      await listUpdated
+      expect(created.snapshot).toBeUndefined()
+      expect(created.snapshotChunked).toBeUndefined()
+      expect(ready.type).toBe('terminal.attach.ready')
+      await listUpdatedPromise
 
       expect(registry.attachCalls).toHaveLength(1)
-      expect(registry.attachCalls[0]?.opts?.pendingSnapshot).toBe(true)
-
-      await new Promise<void>((resolve) => setImmediate(resolve))
-      expect(registry.finishAttachSnapshotCalls).toHaveLength(1)
-      expect(registry.finishAttachSnapshotCalls[0]?.terminalId).toBe('term-existing')
+      expect(registry.attachCalls[0]?.opts?.suppressOutput).toBe(true)
     } finally {
       ws.close()
     }

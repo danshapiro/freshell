@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { getWsClient } from '@/lib/ws-client'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { useAppDispatch, useAppSelector } from '@/store/hooks'
+import { useAppDispatch } from '@/store/hooks'
 import { addTab } from '@/store/tabsSlice'
 
 type BackgroundTerminal = {
@@ -28,7 +28,6 @@ function formatAge(ms: number): string {
 
 export default function BackgroundSessions() {
   const dispatch = useAppDispatch()
-  const settings = useAppSelector((s) => s.settings.settings)
 
   const ws = useMemo(() => getWsClient(), [])
   const [terminals, setTerminals] = useState<BackgroundTerminal[]>([])
@@ -55,7 +54,7 @@ export default function BackgroundSessions() {
       if (msg.type === 'terminal.detached') {
         refresh()
       }
-      if (msg.type === 'terminal.attached') {
+      if (msg.type === 'terminal.attach.ready') {
         refresh()
       }
       if (msg.type === 'terminal.exit') {
@@ -74,10 +73,6 @@ export default function BackgroundSessions() {
 
   const detachedRunning = terminals.filter((t) => t.status === 'running' && !t.hasClients)
 
-  const killMinutesRaw = Number(settings.safety.autoKillIdleMinutes) || 0
-  const warnMinutesRaw = Number(settings.safety.warnBeforeKillMinutes) || 0
-  const killMinutes = killMinutesRaw > 0 ? killMinutesRaw : 0
-  const warnMinutes = warnMinutesRaw > 0 && warnMinutesRaw < killMinutes ? warnMinutesRaw : 0
   const now = Date.now()
 
   return (
@@ -103,10 +98,6 @@ export default function BackgroundSessions() {
             .sort((a, b) => b.lastActivityAt - a.lastActivityAt)
             .map((t) => {
               const idleMs = now - (t.lastActivityAt || t.createdAt)
-              const idleMinutes = idleMs / 60000
-              const warnAtMinutes = warnMinutes > 0 ? killMinutes - warnMinutes : Number.POSITIVE_INFINITY
-              const warn = warnMinutes > 0 && idleMinutes >= warnAtMinutes && idleMinutes < killMinutes
-              const over = killMinutes > 0 && idleMinutes >= killMinutes
 
               return (
                 <div
@@ -117,8 +108,6 @@ export default function BackgroundSessions() {
                     <div className="text-sm font-medium truncate">{t.title}</div>
                     <div className="text-xs text-muted-foreground truncate">
                       {t.cwd ? t.cwd + ' • ' : ''}idle {formatAge(idleMs)}
-                      {warn ? ' • will auto-kill soon' : ''}
-                      {over ? ' • overdue' : ''}
                     </div>
                   </div>
                   <Button

@@ -35,6 +35,26 @@
 - **Mobile responsive** — Auto-collapsing sidebar and overlay navigation for phones and tablets
 - **Auto-update** — Checks for new releases on startup and offers one-key upgrade
 
+### Terminal Streaming (Protocol v2)
+
+- Terminal attach/reconnect uses sequence replay (`sinceSeq`) instead of snapshot/chunk handshakes.
+- Server streams `terminal.output` frames with monotonic `seqStart`/`seqEnd` ranges.
+- If output must be dropped under pressure, server emits `terminal.output.gap` and keeps the socket alive.
+- Terminal create/attach no longer emits `terminal.attached*` or `terminal.snapshot` messages.
+
+#### Terminal Stream Tuning
+
+- `TERMINAL_REPLAY_RING_MAX_BYTES` (default `262144`) controls per-terminal replay window memory.
+- `TERMINAL_CLIENT_QUEUE_MAX_BYTES` (default `131072`) controls per-attached-client pending output memory.
+- `TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES` (default `16777216`) sets the hard bufferedAmount breaker threshold.
+- `TERMINAL_WS_CATASTROPHIC_STALL_MS` (default `10000`) sets how long the hard threshold must be exceeded before a `4008` close.
+
+Approximate memory budget per active terminal:
+
+`TERMINAL_REPLAY_RING_MAX_BYTES + (attachedClients * TERMINAL_CLIENT_QUEUE_MAX_BYTES)`
+
+Example: with 3 attached clients at defaults, budget is `262144 + (3 * 131072) = 655360` bytes (~640 KiB) before WS transport buffers.
+
 ## Quick Start
 
 ```bash

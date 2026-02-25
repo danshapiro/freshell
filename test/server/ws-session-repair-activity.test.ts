@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest'
 import http from 'http'
 import WebSocket from 'ws'
 import { EventEmitter } from 'events'
+import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
 
 const TEST_TIMEOUT_MS = 30_000
 const HOOK_TIMEOUT_MS = 30_000
@@ -74,7 +75,7 @@ describe('ws session repair activity', () => {
   it('broadcasts session repair activity on scan events', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken' }))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
 
     await new Promise<void>((resolve) => {
       ws.on('message', (data) => {

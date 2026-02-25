@@ -3,7 +3,13 @@ import { defineConfig } from 'vitest/config'
 export default defineConfig({
   test: {
     environment: 'node',
-    include: ['test/server/**/*.test.ts', 'test/unit/server/**/*.test.ts', 'test/integration/server/**/*.test.ts'],
+    include: [
+      'test/server/**/*.test.ts',
+      'test/unit/server/**/*.test.ts',
+      'test/integration/server/**/*.test.ts',
+      'test/integration/session-repair.test.ts',
+      'test/integration/session-search-e2e.test.ts',
+    ],
     exclude: ['docs/plans/**'],
     testTimeout: 30000,
     hookTimeout: 30000,

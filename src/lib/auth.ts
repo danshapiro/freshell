@@ -1,13 +1,21 @@
 const AUTH_KEY = 'freshell.auth-token'
 const LEGACY_KEY = 'auth-token'
 
+function buildAuthCookie(value: string, extraDirectives = ''): string {
+  const secure = window.location.protocol === 'https:' ? '; Secure' : ''
+  return `freshell-auth=${value}; path=/; SameSite=Strict${secure}${extraDirectives}`
+}
+
 export function getAuthToken(): string | undefined {
   return localStorage.getItem(AUTH_KEY) || undefined
 }
 
 function setAuthCookie(token: string): void {
-  const secure = window.location.protocol === 'https:' ? '; Secure' : ''
-  document.cookie = `freshell-auth=${encodeURIComponent(token)}; path=/; SameSite=Strict${secure}`
+  document.cookie = buildAuthCookie(encodeURIComponent(token))
+}
+
+export function clearAuthCookie(): void {
+  document.cookie = buildAuthCookie('', '; Max-Age=0')
 }
 
 export function setAuthToken(token: string): void {
@@ -44,5 +52,7 @@ export function initializeAuthToken(): void {
   const stored = localStorage.getItem(AUTH_KEY)
   if (stored) {
     setAuthCookie(stored)
+  } else {
+    clearAuthCookie()
   }
 }

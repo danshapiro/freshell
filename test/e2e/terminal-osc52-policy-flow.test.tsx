@@ -133,7 +133,7 @@ function createStore(policy: 'ask' | 'always' | 'never') {
           },
         },
       },
-      connection: { status: 'connected' as const, error: null },
+      connection: { status: 'ready' as const, error: null },
       turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {}, attentionByPane: {} },
     } as any,
   })
@@ -173,7 +173,13 @@ describe('terminal OSC52 policy flow (e2e)', () => {
       expect(messageHandler).not.toBeNull()
     })
 
-    messageHandler!({ type: 'terminal.output', terminalId: 'term-osc52', data: `before${OSC52_COPY}after` })
+    messageHandler!({
+      type: 'terminal.output',
+      terminalId: 'term-osc52',
+      seqStart: 1,
+      seqEnd: 1,
+      data: `before${OSC52_COPY}after`,
+    })
     await screen.findByRole('button', { name: 'Always' })
     fireEvent.click(screen.getByRole('button', { name: 'Always' }))
 
@@ -197,7 +203,13 @@ describe('terminal OSC52 policy flow (e2e)', () => {
       expect(messageHandler).not.toBeNull()
     })
 
-    messageHandler!({ type: 'terminal.output', terminalId: 'term-osc52', data: `before${OSC52_COPY}after` })
+    messageHandler!({
+      type: 'terminal.output',
+      terminalId: 'term-osc52',
+      seqStart: 1,
+      seqEnd: 1,
+      data: `before${OSC52_COPY}after`,
+    })
     expect(screen.queryByRole('dialog', { name: 'Clipboard access request' })).not.toBeInTheDocument()
     expect(clipboardMocks.copyText).not.toHaveBeenCalled()
     expect(store.getState().settings.settings.terminal.osc52Clipboard).toBe('never')

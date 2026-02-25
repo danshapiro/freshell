@@ -8,7 +8,6 @@ import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
-import idleWarningsReducer from '@/store/idleWarningsSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import { networkReducer } from '@/store/networkSlice'
@@ -158,7 +157,6 @@ function createStore(options?: {
       connection: connectionReducer,
       sessions: sessionsReducer,
       panes: panesReducer,
-      idleWarnings: idleWarningsReducer,
       turnCompletion: turnCompletionReducer,
       terminalMeta: terminalMetaReducer,
       network: networkReducer,
@@ -197,9 +195,6 @@ function createStore(options?: {
       },
       terminalMeta: {
         byTerminalId: {},
-      },
-      idleWarnings: {
-        warnings: {},
       },
       network: { status: null, loading: false, configuring: false, error: null },
     },

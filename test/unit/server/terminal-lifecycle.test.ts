@@ -89,7 +89,6 @@ function createTestSettings(overrides?: Partial<AppSettings>): AppSettings {
     },
     safety: {
       autoKillIdleMinutes: 30,
-      warnBeforeKillMinutes: 5,
     },
     sidebar: {
       sortMode: 'hybrid',
@@ -146,6 +145,39 @@ describe('TerminalRegistry Lifecycle', () => {
       const events = logger.debug.mock.calls.map((call) => call[0]?.event)
       expect(events).toContain('terminal_input_lag')
 
+    })
+  })
+
+  describe('transport agnostic registry seam', () => {
+    it('emits terminal.output.raw for each PTY output chunk', () => {
+      const term = registry.create({ mode: 'shell' })
+      const pty = mockPtyProcess.instances[0]
+      const onOutput = vi.fn()
+
+      registry.on('terminal.output.raw', onOutput)
+      pty._emitData('hello')
+
+      expect(onOutput).toHaveBeenCalledWith(
+        expect.objectContaining({
+          terminalId: term.terminalId,
+          data: 'hello',
+          at: expect.any(Number),
+        }),
+      )
+    })
+
+    it('exposes attached client count and connection ids for broker metadata', () => {
+      const term = registry.create({ mode: 'shell' })
+      const clientA = createMockWebSocket()
+      const clientB = createMockWebSocket()
+      clientA.connectionId = 'conn-a'
+      clientB.connectionId = 'conn-b'
+
+      registry.attach(term.terminalId, clientA)
+      registry.attach(term.terminalId, clientB)
+
+      expect(registry.getAttachedClientCount(term.terminalId)).toBe(2)
+      expect(registry.listAttachedClientIds(term.terminalId)).toEqual(['conn-a', 'conn-b'])
     })
   })
 
@@ -655,54 +687,8 @@ describe('TerminalRegistry Lifecycle', () => {
   })
 
   describe('Idle timeout edge cases', () => {
-    it('emits an idle warning before auto-kill (once per idle period)', async () => {
-      registry = new TerminalRegistry(createTestSettings({ safety: { autoKillIdleMinutes: 10, warnBeforeKillMinutes: 3 } }))
-      const term = registry.create({ mode: 'shell' })
-
-      const onWarn = vi.fn()
-      registry.on('terminal.idle.warning', onWarn)
-
-      // Detached terminal idle long enough to warn (>= 7 minutes) but not kill (< 10).
-      term.lastActivityAt = Date.now() - 8 * 60 * 1000
-
-      await registry.enforceIdleKillsForTest()
-
-      expect(term.status).toBe('running')
-      expect(onWarn).toHaveBeenCalledTimes(1)
-      expect(onWarn.mock.calls[0][0]).toMatchObject({
-        terminalId: term.terminalId,
-        killMinutes: 10,
-        warnMinutes: 3,
-      })
-
-      // Subsequent checks should not spam warnings without new activity.
-      onWarn.mockClear()
-      await registry.enforceIdleKillsForTest()
-      expect(onWarn).not.toHaveBeenCalled()
-
-      // Any activity should reset warnedIdle so the next idle period warns again.
-      registry.input(term.terminalId, 'x')
-      term.lastActivityAt = Date.now() - 8 * 60 * 1000
-      await registry.enforceIdleKillsForTest()
-      expect(onWarn).toHaveBeenCalledTimes(1)
-    })
-
-    it('does not emit an idle warning when warnBeforeKillMinutes >= autoKillIdleMinutes', async () => {
-      registry = new TerminalRegistry(createTestSettings({ safety: { autoKillIdleMinutes: 10, warnBeforeKillMinutes: 10 } }))
-      const term = registry.create({ mode: 'shell' })
-
-      const onWarn = vi.fn()
-      registry.on('terminal.idle.warning', onWarn)
-
-      term.lastActivityAt = Date.now() - 9 * 60 * 1000
-      await registry.enforceIdleKillsForTest()
-
-      expect(term.status).toBe('running')
-      expect(onWarn).not.toHaveBeenCalled()
-    })
-
     it('should kill terminal exactly at threshold', () => {
-      registry = new TerminalRegistry(createTestSettings({ safety: { autoKillIdleMinutes: 30, warnBeforeKillMinutes: 5 } }))
+      registry = new TerminalRegistry(createTestSettings({ safety: { autoKillIdleMinutes: 30 } }))
       registry.create({ mode: 'shell' })
 
       // Advance to exactly 30 minutes
@@ -713,7 +699,7 @@ describe('TerminalRegistry Lifecycle', () => {
     })
 
     it('should not kill terminal just before threshold', () => {
-      registry = new TerminalRegistry(createTestSettings({ safety: { autoKillIdleMinutes: 30, warnBeforeKillMinutes: 5 } }))
+      registry = new TerminalRegistry(createTestSettings({ safety: { autoKillIdleMinutes: 30 } }))
       registry.create({ mode: 'shell' })
 
       // Advance to just under 30 minutes (29:59)
@@ -724,7 +710,7 @@ describe('TerminalRegistry Lifecycle', () => {
     })
 
     it('should not kill terminal with attached clients', () => {
-      registry = new TerminalRegistry(createTestSettings({ safety: { autoKillIdleMinutes: 1, warnBeforeKillMinutes: 0 } }))
+      registry = new TerminalRegistry(createTestSettings({ safety: { autoKillIdleMinutes: 1 } }))
       const term = registry.create({ mode: 'shell' })
       const client = createMockWebSocket()
 
@@ -738,7 +724,7 @@ describe('TerminalRegistry Lifecycle', () => {
     })
 
     it('should reset idle timer on activity', () => {
-      registry = new TerminalRegistry(createTestSettings({ safety: { autoKillIdleMinutes: 1, warnBeforeKillMinutes: 0 } }))
+      registry = new TerminalRegistry(createTestSettings({ safety: { autoKillIdleMinutes: 1 } }))
       const term = registry.create({ mode: 'shell' })
       const pty = mockPtyProcess.instances[0]
 
@@ -756,7 +742,7 @@ describe('TerminalRegistry Lifecycle', () => {
     })
 
     it('should handle zero idle timeout (disabled)', () => {
-      registry = new TerminalRegistry(createTestSettings({ safety: { autoKillIdleMinutes: 0, warnBeforeKillMinutes: 0 } }))
+      registry = new TerminalRegistry(createTestSettings({ safety: { autoKillIdleMinutes: 0 } }))
       registry.create({ mode: 'shell' })
 
       // Advance a long time
@@ -767,7 +753,7 @@ describe('TerminalRegistry Lifecycle', () => {
     })
 
     it('should handle negative idle timeout (disabled)', () => {
-      registry = new TerminalRegistry(createTestSettings({ safety: { autoKillIdleMinutes: -1, warnBeforeKillMinutes: 0 } }))
+      registry = new TerminalRegistry(createTestSettings({ safety: { autoKillIdleMinutes: -1 } }))
       registry.create({ mode: 'shell' })
 
       vi.advanceTimersByTime(24 * 60 * 60 * 1000)
@@ -777,7 +763,7 @@ describe('TerminalRegistry Lifecycle', () => {
     })
 
     it('should kill terminal after client detaches and goes idle', () => {
-      registry = new TerminalRegistry(createTestSettings({ safety: { autoKillIdleMinutes: 1, warnBeforeKillMinutes: 0 } }))
+      registry = new TerminalRegistry(createTestSettings({ safety: { autoKillIdleMinutes: 1 } }))
       const term = registry.create({ mode: 'shell' })
       const client = createMockWebSocket()
 
@@ -1131,7 +1117,7 @@ describe('TerminalRegistry Lifecycle', () => {
       const term = registry.create({ mode: 'shell' })
 
       // Update settings to shorter timeout
-      registry.setSettings(createTestSettings({ safety: { autoKillIdleMinutes: 1, warnBeforeKillMinutes: 0 } }))
+      registry.setSettings(createTestSettings({ safety: { autoKillIdleMinutes: 1 } }))
 
       // Advance past new timeout
       vi.advanceTimersByTime(61 * 1000)

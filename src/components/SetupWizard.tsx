@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { configureNetwork, fetchNetworkStatus } from '@/store/networkSlice'
 import { addTab } from '@/store/tabsSlice'
 import { initLayout } from '@/store/panesSlice'
 import { fetchFirewallConfig } from '@/lib/firewall-configure'
+import { ensureShareUrlToken } from '@/lib/share-utils'
+import { getAuthToken } from '@/lib/auth'
 import { generate } from 'lean-qr'
 import { toSvgDataURL } from 'lean-qr/extras/svg'
 import { nanoid } from '@reduxjs/toolkit'
@@ -40,7 +42,7 @@ function QrCode({ url }: { url: string }) {
   const dataUrl = useMemo(() => {
     try {
       const code = generate(url)
-      return toSvgDataURL(code, { on: 'currentColor', off: 'transparent' })
+      return toSvgDataURL(code, { on: 'black', off: 'white' })
     } catch {
       return null
     }
@@ -54,6 +56,9 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
   const dispatch = useAppDispatch()
   const networkStatus = useAppSelector((s) => s.network.status)
   const configuring = useAppSelector((s) => s.network.configuring)
+  const shareAccessUrl = networkStatus?.accessUrl
+    ? ensureShareUrlToken(networkStatus.accessUrl, getAuthToken())
+    : null
 
   const [step, setStep] = useState<1 | 2 | 3>(initialStep)
   const [bindStatus, setBindStatus] = useState<ChecklistItemStatus>('pending')
@@ -62,6 +67,23 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
   const [firewallDetail, setFirewallDetail] = useState<string | undefined>()
   const [copied, setCopied] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const mountedRef = useRef(true)
+  const copyResetTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const firewallPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    return () => {
+      mountedRef.current = false
+      if (copyResetTimerRef.current) {
+        clearTimeout(copyResetTimerRef.current)
+        copyResetTimerRef.current = null
+      }
+      if (firewallPollTimerRef.current) {
+        clearTimeout(firewallPollTimerRef.current)
+        firewallPollTimerRef.current = null
+      }
+    }
+  }, [])
 
   // Watch for rebinding completion when on step 2
   useEffect(() => {
@@ -147,16 +169,23 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
   }, [dispatch, onComplete])
 
   const handleCopy = useCallback(async () => {
-    const url = networkStatus?.accessUrl
+    const url = shareAccessUrl
     if (!url) return
     try {
       await navigator.clipboard.writeText(url)
       setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
+      if (copyResetTimerRef.current) {
+        clearTimeout(copyResetTimerRef.current)
+      }
+      copyResetTimerRef.current = setTimeout(() => {
+        copyResetTimerRef.current = null
+        if (!mountedRef.current) return
+        setCopied(false)
+      }, 2000)
     } catch {
       // Clipboard may not be available
     }
-  }, [networkStatus?.accessUrl])
+  }, [shareAccessUrl])
 
   const handleConfigureFirewall = useCallback(async () => {
     try {
@@ -176,6 +205,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
         setFirewallStatus('active')
         setFirewallDetail('Configuring firewall...')
         const pollFirewall = async (attempts = 0) => {
+          if (!mountedRef.current) return
           if (attempts >= 10) {
             setFirewallStatus('error')
             setFirewallDetail('Firewall configuration timed out')
@@ -197,9 +227,15 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
               return
             }
           } catch { /* ignore */ }
-          setTimeout(() => pollFirewall(attempts + 1), 1000)
+          firewallPollTimerRef.current = setTimeout(() => {
+            firewallPollTimerRef.current = null
+            void pollFirewall(attempts + 1)
+          }, 1000)
         }
-        setTimeout(() => pollFirewall(), 1000)
+        firewallPollTimerRef.current = setTimeout(() => {
+          firewallPollTimerRef.current = null
+          void pollFirewall()
+        }, 1000)
       }
       // method === 'none' or 'in-progress': do nothing
     } catch (err: any) {
@@ -316,12 +352,12 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
               </p>
             </div>
 
-            {networkStatus?.accessUrl && (
+            {shareAccessUrl && (
               <div className="flex flex-col items-center gap-4">
-                <QrCode url={networkStatus.accessUrl} />
+                <QrCode url={shareAccessUrl} />
                 <div className="flex w-full items-center gap-2">
                   <code className="flex-1 truncate rounded bg-muted px-3 py-2 text-xs">
-                    {networkStatus.accessUrl}
+                    {shareAccessUrl}
                   </code>
                   <button
                     onClick={handleCopy}

@@ -142,6 +142,69 @@ describe('BrowserPane', () => {
       expect(iframe).toBeTruthy()
       expect(iframe!.getAttribute('src')).toContain('localhost:3000')
     })
+
+    it('syncs input and history when url prop changes externally', () => {
+      const store = createMockStore()
+      const baseProps = {
+        paneId: 'pane-1',
+        tabId: 'tab-1',
+        devToolsOpen: false,
+      }
+
+      const { rerender } = render(
+        <Provider store={store}>
+          <BrowserPane {...baseProps} url="https://first.example.com" />
+        </Provider>,
+      )
+
+      const input = screen.getByPlaceholderText('Enter URL...') as HTMLInputElement
+      expect(input.value).toBe('https://first.example.com')
+      expect(screen.getByTitle('Back')).toBeDisabled()
+
+      rerender(
+        <Provider store={store}>
+          <BrowserPane {...baseProps} url="https://second.example.com" />
+        </Provider>,
+      )
+
+      expect((screen.getByPlaceholderText('Enter URL...') as HTMLInputElement).value).toBe('https://second.example.com')
+      const iframe = document.querySelector('iframe')
+      expect(iframe).toBeTruthy()
+      expect(iframe!.getAttribute('src')).toBe('https://second.example.com')
+      expect(screen.getByTitle('Back')).not.toBeDisabled()
+
+      fireEvent.click(screen.getByTitle('Back'))
+
+      expect((screen.getByPlaceholderText('Enter URL...') as HTMLInputElement).value).toBe('https://first.example.com')
+      expect(iframe!.getAttribute('src')).toBe('https://first.example.com')
+    })
+
+    it('clears navigation state when url prop is externally cleared', () => {
+      const store = createMockStore()
+      const baseProps = {
+        paneId: 'pane-1',
+        tabId: 'tab-1',
+        devToolsOpen: false,
+      }
+
+      const { rerender } = render(
+        <Provider store={store}>
+          <BrowserPane {...baseProps} url="https://example.com" />
+        </Provider>,
+      )
+
+      rerender(
+        <Provider store={store}>
+          <BrowserPane {...baseProps} url="" />
+        </Provider>,
+      )
+
+      const input = screen.getByPlaceholderText('Enter URL...') as HTMLInputElement
+      expect(input.value).toBe('')
+      expect(screen.getByText('Enter a URL to browse')).toBeInTheDocument()
+      expect(screen.getByTitle('Back')).toBeDisabled()
+      expect(screen.getByTitle('Forward')).toBeDisabled()
+    })
   })
 
   describe('file:// URL handling', () => {
@@ -150,9 +213,28 @@ describe('BrowserPane', () => {
 
       const iframe = document.querySelector('iframe')
       expect(iframe).toBeTruthy()
-      // The existing regex strips the leading slash after file:///
       expect(iframe!.getAttribute('src')).toBe(
-        '/local-file?path=' + encodeURIComponent('home/user/index.html'),
+        '/local-file?path=' + encodeURIComponent('/home/user/index.html'),
+      )
+    })
+
+    it('keeps Windows drive file URLs compatible with local-file path resolution', () => {
+      renderBrowserPane({ url: 'file:///C:/Users/user/index.html' })
+
+      const iframe = document.querySelector('iframe')
+      expect(iframe).toBeTruthy()
+      expect(iframe!.getAttribute('src')).toBe(
+        '/local-file?path=' + encodeURIComponent('C:/Users/user/index.html'),
+      )
+    })
+
+    it('maps non-localhost file URL hostnames to UNC-style paths', () => {
+      renderBrowserPane({ url: 'file://server/share/index.html' })
+
+      const iframe = document.querySelector('iframe')
+      expect(iframe).toBeTruthy()
+      expect(iframe!.getAttribute('src')).toBe(
+        '/local-file?path=' + encodeURIComponent('//server/share/index.html'),
       )
     })
   })
@@ -257,9 +339,8 @@ describe('BrowserPane', () => {
 
       const iframe = document.querySelector('iframe')
       expect(iframe).toBeTruthy()
-      // file:// should still go through /local-file endpoint (existing regex strips leading /)
       expect(iframe!.getAttribute('src')).toBe(
-        '/local-file?path=' + encodeURIComponent('home/user/index.html'),
+        '/local-file?path=' + encodeURIComponent('/home/user/index.html'),
       )
     })
 

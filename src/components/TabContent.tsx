@@ -63,7 +63,7 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
 
   // Use PaneLayout for all terminal-based tabs
   return (
-    <div className={hidden ? 'tab-hidden' : 'tab-visible h-full w-full'}>
+    <div data-tab-content-id={tabId} className={hidden ? 'tab-hidden' : 'tab-visible h-full w-full'}>
       <ErrorBoundary key={tabId} label="Tab">
         <PaneLayout tabId={tabId} defaultContent={defaultContent} hidden={hidden} />
       </ErrorBoundary>

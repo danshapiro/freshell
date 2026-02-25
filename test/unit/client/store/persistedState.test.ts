@@ -3,11 +3,22 @@ import { describe, it, expect } from 'vitest'
 import {
   parsePersistedTabsRaw,
   parsePersistedPanesRaw,
+  TABS_STORAGE_KEY,
+  PANES_STORAGE_KEY,
   TABS_SCHEMA_VERSION,
   PANES_SCHEMA_VERSION,
 } from '../../../../src/store/persistedState'
+import { PERSIST_BROADCAST_CHANNEL_NAME } from '../../../../src/store/persistBroadcast'
+import { STORAGE_KEYS } from '../../../../src/store/storage-keys'
 
 describe('persistedState parsers', () => {
+  it('uses v2 namespaced storage and broadcast keys', () => {
+    expect(TABS_STORAGE_KEY).toBe('freshell.tabs.v2')
+    expect(PANES_STORAGE_KEY).toBe('freshell.panes.v2')
+    expect(STORAGE_KEYS.sessionActivity).toBe('freshell.sessionActivity.v2')
+    expect(PERSIST_BROADCAST_CHANNEL_NAME).toBe('freshell.persist.v2')
+  })
+
   describe('parsePersistedTabsRaw', () => {
     it('returns null for invalid JSON', () => {
       expect(parsePersistedTabsRaw('{')).toBeNull()
@@ -63,4 +74,3 @@ describe('persistedState parsers', () => {
     })
   })
 })
-

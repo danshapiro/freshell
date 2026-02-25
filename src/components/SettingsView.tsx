@@ -987,20 +987,6 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               />
             </SettingsRow>
 
-            <SettingsRow label="Warn before kill (minutes)">
-              <RangeSlider
-                value={settings.safety.warnBeforeKillMinutes}
-                min={1}
-                max={60}
-                step={1}
-                format={(v) => String(v)}
-                onChange={(v) => {
-                  dispatch(updateSettingsLocal({ safety: { warnBeforeKillMinutes: v } }))
-                  scheduleSave({ safety: { warnBeforeKillMinutes: v } })
-                }}
-              />
-            </SettingsRow>
-
             <SettingsRow label="Default working directory">
               <div className="relative w-full md:max-w-xs">
                 <input

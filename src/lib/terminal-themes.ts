@@ -2,12 +2,12 @@ import type { ITheme } from '@xterm/xterm'
 import type { TerminalTheme } from '@/store/types'
 
 // Full xterm theme with ANSI colors for proper syntax highlighting
-interface FullTheme extends ITheme {
+export interface TerminalThemeDefinition extends ITheme {
   name: string
   isDark: boolean
 }
 
-const dracula: FullTheme = {
+const dracula: TerminalThemeDefinition = {
   name: 'Dracula',
   isDark: true,
   background: '#282a36',
@@ -34,7 +34,7 @@ const dracula: FullTheme = {
   brightWhite: '#ffffff',
 }
 
-const oneDark: FullTheme = {
+const oneDark: TerminalThemeDefinition = {
   name: 'One Dark',
   isDark: true,
   background: '#282c34',
@@ -61,7 +61,7 @@ const oneDark: FullTheme = {
   brightWhite: '#ffffff',
 }
 
-const solarizedDark: FullTheme = {
+const solarizedDark: TerminalThemeDefinition = {
   name: 'Solarized Dark',
   isDark: true,
   background: '#002b36',
@@ -88,7 +88,7 @@ const solarizedDark: FullTheme = {
   brightWhite: '#fdf6e3',
 }
 
-const githubDark: FullTheme = {
+const githubDark: TerminalThemeDefinition = {
   name: 'GitHub Dark',
   isDark: true,
   background: '#0d1117',
@@ -115,7 +115,7 @@ const githubDark: FullTheme = {
   brightWhite: '#f0f6fc',
 }
 
-const oneLight: FullTheme = {
+const oneLight: TerminalThemeDefinition = {
   name: 'One Light',
   isDark: false,
   background: '#fafafa',
@@ -142,7 +142,7 @@ const oneLight: FullTheme = {
   brightWhite: '#fafafa',
 }
 
-const solarizedLight: FullTheme = {
+const solarizedLight: TerminalThemeDefinition = {
   name: 'Solarized Light',
   isDark: false,
   background: '#fdf6e3',
@@ -169,7 +169,7 @@ const solarizedLight: FullTheme = {
   brightWhite: '#fdf6e3',
 }
 
-const githubLight: FullTheme = {
+const githubLight: TerminalThemeDefinition = {
   name: 'GitHub Light',
   isDark: false,
   background: '#ffffff',
@@ -198,7 +198,7 @@ const githubLight: FullTheme = {
 
 export type ConcreteTerminalTheme = Exclude<TerminalTheme, 'auto'>
 
-export const terminalThemes: Record<ConcreteTerminalTheme, FullTheme> = {
+export const terminalThemes: Record<ConcreteTerminalTheme, TerminalThemeDefinition> = {
   'dracula': dracula,
   'one-dark': oneDark,
   'solarized-dark': solarizedDark,
@@ -214,7 +214,7 @@ export const lightThemes: ConcreteTerminalTheme[] = ['one-light', 'solarized-lig
 export function getTerminalTheme(
   themeSetting: TerminalTheme | string | undefined,
   appTheme: 'dark' | 'light' | 'system'
-): ITheme {
+): TerminalThemeDefinition {
   // Handle 'auto', undefined, or legacy 'default'/'dark'/'light' values
   const shouldFollowApp = !themeSetting || themeSetting === 'auto' ||
     themeSetting === 'default' || !(themeSetting in terminalThemes)

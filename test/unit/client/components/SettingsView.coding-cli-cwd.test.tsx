@@ -32,7 +32,7 @@ function createTestStore() {
             scrollback: 5000,
             theme: 'auto',
           },
-          safety: { autoKillIdleMinutes: 180, warnBeforeKillMinutes: 5 },
+          safety: { autoKillIdleMinutes: 180 },
           sidebar: { sortMode: 'activity', showProjectBadges: true, width: 288, collapsed: false },
           panes: { defaultNewPane: 'ask' },
           codingCli: {
@@ -95,7 +95,7 @@ describe('SettingsView coding CLI cwd', () => {
               scrollback: 5000,
               theme: 'auto',
             },
-            safety: { autoKillIdleMinutes: 180, warnBeforeKillMinutes: 5 },
+            safety: { autoKillIdleMinutes: 180 },
             sidebar: { sortMode: 'activity', showProjectBadges: true, width: 288, collapsed: false },
             panes: { defaultNewPane: 'ask' },
             codingCli: {

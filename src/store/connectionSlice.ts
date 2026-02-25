@@ -12,6 +12,12 @@ export interface ConnectionState {
   availableClis: Record<string, boolean>
 }
 
+const FATAL_CONNECTION_ERROR_CODES = new Set([4001, 4003, 4010])
+
+export function isFatalConnectionErrorCode(code?: number): boolean {
+  return typeof code === 'number' && FATAL_CONNECTION_ERROR_CODES.has(code)
+}
+
 const initialState: ConnectionState = {
   status: 'disconnected',
   platform: null,

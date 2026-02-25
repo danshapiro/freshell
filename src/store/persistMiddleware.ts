@@ -5,13 +5,12 @@ import type { Tab } from './types'
 import { nanoid } from 'nanoid'
 import { broadcastPersistedRaw } from './persistBroadcast'
 import { PANES_SCHEMA_VERSION } from './persistedState.js'
+import { PANES_STORAGE_KEY, TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 
 
 const log = createLogger('PanesPersist')
 
-const STORAGE_KEY = 'freshell.tabs.v1'
-const PANES_STORAGE_KEY = 'freshell.panes.v1'
 export const PERSIST_DEBOUNCE_MS = 500
 
 const flushCallbacks = new Set<() => void>()
@@ -69,7 +68,7 @@ export function resetPersistedPanesCacheForTests() {
 
 export function loadPersistedTabs(): any | null {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
+    const raw = localStorage.getItem(TABS_STORAGE_KEY)
     if (!raw) return null
     const parsed = JSON.parse(raw)
     return parsed
@@ -265,8 +264,8 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
 
       try {
         const raw = JSON.stringify(tabsPayload)
-        localStorage.setItem(STORAGE_KEY, raw)
-        broadcastPersistedRaw(STORAGE_KEY, raw)
+        localStorage.setItem(TABS_STORAGE_KEY, raw)
+        broadcastPersistedRaw(TABS_STORAGE_KEY, raw)
       } catch {
         // ignore quota
       }

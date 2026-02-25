@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.5.0",
   "type": "module",
+  "bin": {
+    "freshell": "dist/server/cli/index.js"
+  },
   "scripts": {
     "predev": "tsx scripts/precheck.ts",
     "preserve": "tsx scripts/precheck.ts",
@@ -18,7 +21,7 @@
     "build:server": "tsc -p tsconfig.server.json",
     "start": "cross-env NODE_ENV=production node dist/server/index.js",
     "serve": "npm run build && npm run start",
-    "test": "vitest run",
+    "test": "vitest run && vitest run --config vitest.server.config.ts",
     "verify": "npm run build && npm test",
     "check": "npm run typecheck && npm test",
     "test:watch": "vitest",
@@ -55,6 +58,7 @@
     "express": "^4.19.2",
     "express-rate-limit": "^7.4.0",
     "glob": "^13.0.0",
+    "html2canvas": "^1.4.1",
     "is-port-reachable": "^4.0.0",
     "lean-qr": "^2.7.1",
     "lucide-react": "^0.469.0",

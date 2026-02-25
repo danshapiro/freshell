@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { SettingsPatchSchema } from '../../../server/settings-schema'
+import { SettingsPatchSchema } from '../../../server/settings-router'
 
 describe('editor settings schema', () => {
   it('accepts valid editor preset', () => {

@@ -45,8 +45,11 @@ const perfFlag = typeof __PERF_LOGGING__ !== 'undefined' && __PERF_LOGGING__
   : import.meta.env.VITE_PERF_LOGGING
 const perfConfig = resolveClientPerfConfig(perfFlag)
 const lastLogByKey = new Map<string, number>()
+const terminalInputSentAtById = new Map<string, number>()
+const terminalInputToOutputSamplesMs: number[] = []
 let perfInitialized = false
 let memoryTimer: number | null = null
+const MAX_TERMINAL_INPUT_TO_OUTPUT_SAMPLES = 200
 
 export function getClientPerfConfig(): ClientPerfConfig {
   return perfConfig
@@ -68,6 +71,8 @@ export function setClientPerfEnabled(enabled: boolean, source?: string): void {
   // Log before disabling to ensure it is recorded.
   logClientPerf('perf_logging_toggled', { enabled: false, source })
   perfConfig.enabled = false
+  terminalInputSentAtById.clear()
+  terminalInputToOutputSamplesMs.length = 0
   if (memoryTimer !== null && typeof window !== 'undefined') {
     window.clearInterval(memoryTimer)
     memoryTimer = null
@@ -94,6 +99,52 @@ export function logClientPerf(
   else if (level === 'warn') console.warn(payload)
   else if (level === 'debug') console.debug(payload)
   else console.info(payload)
+}
+
+function perfNowMs(): number {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+    return performance.now()
+  }
+  return Date.now()
+}
+
+function percentile(samples: number[], ratio: number): number {
+  if (samples.length === 0) return 0
+  const clamped = Math.min(Math.max(ratio, 0), 1)
+  const index = Math.min(samples.length - 1, Math.floor(clamped * (samples.length - 1)))
+  return samples[index] || 0
+}
+
+export function markTerminalInputSent(terminalId: string, atMs = perfNowMs()): void {
+  if (!perfConfig.enabled) return
+  if (!terminalId) return
+  terminalInputSentAtById.set(terminalId, atMs)
+}
+
+export function markTerminalOutputSeen(terminalId: string, atMs = perfNowMs()): void {
+  if (!perfConfig.enabled) return
+  if (!terminalId) return
+
+  const inputAt = terminalInputSentAtById.get(terminalId)
+  if (inputAt === undefined) return
+  terminalInputSentAtById.delete(terminalId)
+
+  const latencyMs = Math.max(0, atMs - inputAt)
+  terminalInputToOutputSamplesMs.push(latencyMs)
+  if (terminalInputToOutputSamplesMs.length > MAX_TERMINAL_INPUT_TO_OUTPUT_SAMPLES) {
+    terminalInputToOutputSamplesMs.shift()
+  }
+
+  if (!shouldLog('perf.terminal_input_to_output', perfConfig.rateLimitMs)) return
+
+  const sorted = [...terminalInputToOutputSamplesMs].sort((a, b) => a - b)
+  logClientPerf('perf.terminal_input_to_output', {
+    latencyMs: Number(latencyMs.toFixed(2)),
+    sampleCount: sorted.length,
+    p50Ms: Number(percentile(sorted, 0.5).toFixed(2)),
+    p90Ms: Number(percentile(sorted, 0.9).toFixed(2)),
+    p99Ms: Number(percentile(sorted, 0.99).toFixed(2)),
+  })
 }
 
 function logNavigationTiming() {

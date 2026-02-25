@@ -1,7 +1,6 @@
 import { z } from 'zod'
 
-export const TABS_STORAGE_KEY = 'freshell.tabs.v1'
-export const PANES_STORAGE_KEY = 'freshell.panes.v1'
+export { TABS_STORAGE_KEY, PANES_STORAGE_KEY } from './storage-keys'
 
 export const TABS_SCHEMA_VERSION = 1
 export const PANES_SCHEMA_VERSION = 4
@@ -102,4 +101,3 @@ export function parsePersistedPanesRaw(raw: string): ParsedPersistedPanes | null
     paneTitleSetByUser: (res.data.paneTitleSetByUser || {}) as Record<string, Record<string, boolean>>,
   }
 }
-

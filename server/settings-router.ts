@@ -54,7 +54,6 @@ export const SettingsPatchSchema = z
     safety: z
       .object({
         autoKillIdleMinutes: z.coerce.number().optional(),
-        warnBeforeKillMinutes: z.coerce.number().optional(),
       })
       .strict()
       .optional(),

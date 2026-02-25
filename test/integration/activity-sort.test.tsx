@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import settingsReducer, { defaultSettings, setSettings } from '@/store/settingsSlice'
-import sessionActivityReducer from '@/store/sessionActivitySlice'
+import { SESSION_ACTIVITY_STORAGE_KEY } from '@/store/sessionActivitySlice'
 
 describe('Activity sort integration', () => {
   beforeEach(() => {
@@ -16,7 +16,7 @@ describe('Activity sort integration', () => {
   it('persists session activity across page reloads', async () => {
     const timestamp = Date.now()
 
-    localStorage.setItem('freshell.sessionActivity.v1', JSON.stringify({
+    localStorage.setItem(SESSION_ACTIVITY_STORAGE_KEY, JSON.stringify({
       'session-123': timestamp,
     }))
 

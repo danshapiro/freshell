@@ -1,6 +1,11 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { cleanString } from './utils.js'
+import { logger } from './logger.js'
+import { cascadeTerminalRenameToSession } from './rename-cascade.js'
+import type { TerminalMeta } from './terminal-metadata-service.js'
+
+const log = logger.child({ component: 'terminals-router' })
 
 export const TerminalPatchSchema = z.object({
   titleOverride: z.string().max(500).optional().nullable(),
@@ -22,6 +27,8 @@ export interface TerminalsRouterDeps {
   wsHandler: {
     broadcast: (msg: any) => void
   }
+  terminalMetadata?: { list: () => TerminalMeta[] }
+  codingCliIndexer?: { refresh: () => Promise<void> }
 }
 
 export function createTerminalsRouter(deps: TerminalsRouterDeps): Router {
@@ -60,6 +67,19 @@ export function createTerminalsRouter(deps: TerminalsRouterDeps): Router {
 
     if (typeof titleOverride === 'string' && titleOverride.trim()) registry.updateTitle(terminalId, titleOverride.trim())
     if (typeof descriptionOverride === 'string') registry.updateDescription(terminalId, descriptionOverride)
+
+    // Cascade: if this terminal has a coding CLI session, also rename the session
+    if (typeof titleOverride === 'string' && titleOverride.trim() && deps.terminalMetadata) {
+      try {
+        const meta = deps.terminalMetadata.list().find((m) => m.terminalId === terminalId)
+        await cascadeTerminalRenameToSession(meta, titleOverride.trim())
+        if (meta?.provider && meta?.sessionId) {
+          await deps.codingCliIndexer?.refresh()
+        }
+      } catch (err) {
+        log.warn({ err, terminalId }, 'Cascade rename to session failed (non-fatal)')
+      }
+    }
 
     wsHandler.broadcast({ type: 'terminal.list.updated' })
     res.json(next)

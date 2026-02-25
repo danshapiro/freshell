@@ -14,14 +14,25 @@ import { initLayout, updatePaneContent, updatePaneTitle } from '@/store/panesSli
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 import { recordTurnComplete, clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
+import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
 import { api } from '@/lib/api'
 import { getWsClient } from '@/lib/ws-client'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import { getResumeSessionIdFromRef } from '@/components/terminal-view-utils'
 import { copyText, readText } from '@/lib/clipboard'
 import { registerTerminalActions } from '@/lib/pane-action-registry'
+import { registerTerminalCaptureHandler } from '@/lib/screenshot-capture-env'
 import { consumeTerminalRestoreRequestId, addTerminalRestoreRequestId } from '@/lib/terminal-restore'
 import { isTerminalPasteShortcut } from '@/lib/terminal-input-policy'
+import { clearTerminalCursor, loadTerminalCursor, saveTerminalCursor } from '@/lib/terminal-cursor'
+import {
+  beginAttach,
+  createAttachSeqState,
+  onAttachReady,
+  onOutputFrame,
+  onOutputGap,
+  type AttachSeqState,
+} from '@/lib/terminal-attach-seq-state'
 import { useMobile } from '@/hooks/useMobile'
 import { findLocalFilePaths } from '@/lib/path-utils'
 import {
@@ -37,7 +48,6 @@ import {
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { resolveTerminalFontFamily } from '@/lib/terminal-fonts'
 import { ConnectionErrorOverlay } from '@/components/terminal/ConnectionErrorOverlay'
-import { useChunkedAttach } from '@/components/terminal/useChunkedAttach'
 import { Osc52PromptModal } from '@/components/terminal/Osc52PromptModal'
 import { TerminalSearchBar } from '@/components/terminal/TerminalSearchBar'
 import {
@@ -68,6 +78,8 @@ const MOBILE_KEY_REPEAT_INTERVAL_MS = 70
 const TAP_MULTI_INTERVAL_MS = 350
 const TAP_MAX_DISTANCE_PX = 24
 const TOUCH_SCROLL_PIXELS_PER_LINE = 18
+const LIGHT_THEME_MIN_CONTRAST_RATIO = 4.5
+const DEFAULT_MIN_CONTRAST_RATIO = 1
 
 const SEARCH_DECORATIONS = {
   matchBackground: '#515C6A',
@@ -75,6 +87,10 @@ const SEARCH_DECORATIONS = {
   activeMatchBackground: '#EEB04A',
   activeMatchColorOverviewRuler: '#EEB04A',
 } as const
+
+function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): number {
+  return theme?.isDark === false ? LIGHT_THEME_MIN_CONTRAST_RATIO : DEFAULT_MIN_CONTRAST_RATIO
+}
 
 function createNoopRuntime(): TerminalRuntime {
   return {
@@ -86,6 +102,8 @@ function createNoopRuntime(): TerminalRuntime {
     onDidChangeResults: () => ({ dispose: () => {} }),
     dispose: () => {},
     webglActive: () => false,
+    suspendWebgl: () => false,
+    resumeWebgl: () => {},
   }
 }
 
@@ -95,6 +113,8 @@ interface TerminalViewProps {
   paneContent: PaneContent
   hidden?: boolean
 }
+
+type AttachIntent = 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect'
 
 type MobileToolbarKeyId = 'esc' | 'tab' | 'ctrl' | 'up' | 'down' | 'left' | 'right'
 type RepeatableMobileToolbarKeyId = Extract<MobileToolbarKeyId, 'up' | 'down' | 'left' | 'right'>
@@ -135,6 +155,7 @@ function resolveMobileToolbarInput(keyId: Exclude<MobileToolbarKeyId, 'ctrl'>, c
 export default function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps) {
   const dispatch = useAppDispatch()
   const isMobile = useMobile()
+  const connectionStatus = useAppSelector((s) => s.connection.status)
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
@@ -206,12 +227,40 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   // CRITICAL: Use refs to avoid callback/effect dependency on changing content
   const requestIdRef = useRef<string>(terminalContent?.createRequestId || '')
   const terminalIdRef = useRef<string | undefined>(terminalContent?.terminalId)
+  const seqStateRef = useRef<AttachSeqState>(createAttachSeqState())
+  const attachCounterRef = useRef(0)
+  const currentAttachRef = useRef<{
+    requestId: string
+    intent: AttachIntent
+    terminalId: string
+    sinceSeq: number
+  } | null>(null)
+  const needsViewportHydrationRef = useRef(true)
+  const pendingDeferredHydrationRef = useRef(false)
+  const awaitingViewportHydrationRef = useRef(false)
   const contentRef = useRef<TerminalPaneContent | null>(terminalContent)
+
+  const applySeqState = useCallback((
+    nextState: AttachSeqState,
+    options?: { terminalId?: string; persistCursor?: boolean },
+  ) => {
+    const previousLastSeq = seqStateRef.current.lastSeq
+    seqStateRef.current = nextState
+    if (
+      options?.persistCursor
+      && options.terminalId
+      && nextState.lastSeq > 0
+      && nextState.lastSeq > previousLastSeq
+    ) {
+      saveTerminalCursor(options.terminalId, nextState.lastSeq)
+    }
+  }, [])
 
   // Keep refs in sync with props
   useEffect(() => {
     if (terminalContent) {
       const prev = contentRef.current
+      const prevTerminalId = terminalIdRef.current
       if (prev && terminalContent.resumeSessionId !== prev.resumeSessionId) {
         if (debugRef.current) log.debug('[TRACE resumeSessionId] ref sync from props CHANGED resumeSessionId', {
           paneId,
@@ -221,10 +270,16 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         })
       }
       terminalIdRef.current = terminalContent.terminalId
+      if (terminalContent.terminalId !== prevTerminalId) {
+        const initialSeq = terminalContent.terminalId
+          ? loadTerminalCursor(terminalContent.terminalId)
+          : 0
+        applySeqState(createAttachSeqState({ lastSeq: initialSeq }))
+      }
       requestIdRef.current = terminalContent.createRequestId
       contentRef.current = terminalContent
     }
-  }, [terminalContent, paneId])
+  }, [terminalContent, paneId, applySeqState])
 
   useEffect(() => {
     hiddenRef.current = hidden
@@ -479,10 +534,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     }))
   }, [dispatch, tabId, paneId]) // NO terminalContent dependency - uses ref
 
-  const sendWsMessage = useCallback((msg: { type: 'terminal.attach'; terminalId: string }) => {
-    ws.send(msg)
-  }, [ws])
-
   const requestTerminalLayout = useCallback((options: {
     fit?: boolean
     resize?: boolean
@@ -591,28 +642,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     setPendingOsc52Event(event)
   }, [attemptOsc52ClipboardWrite])
 
-  const handleTerminalSnapshot = useCallback((snapshot: string | undefined, term: Terminal) => {
-    const osc = extractOsc52Events(snapshot ?? '', createOsc52ParserState())
-    const queue = writeQueueRef.current
-    if (queue) {
-      queue.enqueueTask(() => {
-        try { term.clear() } catch { /* disposed */ }
-      })
-    } else {
-      try { term.clear() } catch { /* disposed */ }
-    }
-    if (osc.cleaned) {
-      enqueueTerminalWrite(osc.cleaned, () => {
-        requestTerminalLayout({ scrollToBottom: true })
-      })
-    } else {
-      requestTerminalLayout({ scrollToBottom: true })
-    }
-    for (const event of osc.events) {
-      handleOsc52Event(event)
-    }
-  }, [enqueueTerminalWrite, handleOsc52Event, requestTerminalLayout])
-
   const handleTerminalOutput = useCallback((raw: string, mode: TerminalPaneContent['mode'], tid?: string) => {
     const osc = extractOsc52Events(raw, osc52ParserRef.current)
     const { cleaned, count } = extractTurnCompleteSignals(osc.cleaned, mode, turnCompleteSignalStateRef.current)
@@ -634,31 +663,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       handleOsc52Event(event)
     }
   }, [dispatch, enqueueTerminalWrite, handleOsc52Event, tabId])
-
-  const applyChunkedSnapshot = useCallback((snapshot: string) => {
-    const term = termRef.current
-    if (!term) return
-    handleTerminalSnapshot(snapshot, term)
-  }, [handleTerminalSnapshot])
-
-  const markChunkedRunning = useCallback(() => {
-    updateContent({ status: 'running' })
-  }, [updateContent])
-
-  const {
-    snapshotWarning,
-    handleChunkLifecycleMessage,
-    markSnapshotChunkedCreated,
-    bumpConnectionGeneration,
-    clearChunkedAttachState,
-  } = useChunkedAttach({
-    activeTerminalId: terminalContent?.terminalId,
-    activeTerminalIdRef: terminalIdRef,
-    setIsAttaching,
-    applySnapshot: applyChunkedSnapshot,
-    markRunning: markChunkedRunning,
-    wsSend: sendWsMessage,
-  })
 
   const sendInput = useCallback((data: string) => {
     const tid = terminalIdRef.current
@@ -788,6 +792,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       termRef.current = null
     }
 
+    const resolvedTheme = getTerminalTheme(settings.terminal.theme, settings.theme)
     const term = new Terminal({
       allowProposedApi: true,
       convertEol: true,
@@ -796,7 +801,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       fontFamily: resolveTerminalFontFamily(settings.terminal.fontFamily),
       lineHeight: settings.terminal.lineHeight,
       scrollback: settings.terminal.scrollback,
-      theme: getTerminalTheme(settings.terminal.theme, settings.theme),
+      theme: resolvedTheme,
+      minimumContrastRatio: resolveMinimumContrastRatio(resolvedTheme),
       linkHandler: {
         activate: (_event: MouseEvent, uri: string) => {
           if (warnExternalLinksRef.current !== false) {
@@ -893,6 +899,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       hasSelection: () => term.getSelection().length > 0,
       openSearch: () => setSearchOpen(true),
     })
+    const unregisterCaptureHandler = registerTerminalCaptureHandler(paneId, {
+      suspendWebgl: () => runtimeRef.current?.suspendWebgl?.() ?? false,
+      resumeWebgl: () => {
+        runtimeRef.current?.resumeWebgl?.()
+      },
+    })
 
     requestTerminalLayout({ fit: true, focus: true })
 
@@ -987,6 +999,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       filePathLinkDisposable?.dispose()
       ro.disconnect()
       unregisterActions()
+      unregisterCaptureHandler()
       searchResultsDisposable.dispose()
       if (writeQueueRef.current === writeQueue) {
         writeQueue.clear()
@@ -1065,17 +1078,101 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     return () => disposable.dispose()
   }, [isTerminal, dispatch, tabId])
 
+  const markViewportHydrationComplete = useCallback(() => {
+    if (!awaitingViewportHydrationRef.current) return
+    awaitingViewportHydrationRef.current = false
+    pendingDeferredHydrationRef.current = false
+  }, [])
+
+  const isCurrentAttachMessage = useCallback((msg: {
+    type: string
+    terminalId: string
+    attachRequestId?: string
+  }) => {
+    const current = currentAttachRef.current
+    if (!current) return true
+    if (!msg.attachRequestId) {
+      if (debugRef.current) {
+        log.debug('Accepting untagged same-terminal stream message', {
+          paneId: paneIdRef.current,
+          terminalId: msg.terminalId,
+          type: msg.type,
+          currentAttachRequestId: current.requestId,
+        })
+      }
+      return true
+    }
+    return msg.attachRequestId === current.requestId
+  }, [])
+
+  const attachTerminal = useCallback((
+    tid: string,
+    intent: AttachIntent,
+    opts?: { clearViewportFirst?: boolean },
+  ) => {
+    setIsAttaching(true)
+
+    const persistedSeq = loadTerminalCursor(tid)
+    const deltaSeq = Math.max(seqStateRef.current.lastSeq, persistedSeq)
+    const sinceSeq = intent === 'viewport_hydrate' ? 0 : deltaSeq
+
+    if (intent === 'viewport_hydrate') {
+      if (opts?.clearViewportFirst) {
+        try {
+          termRef.current?.clear()
+        } catch {
+          // disposed
+        }
+      }
+      // Keep persisted cursor untouched so transport reconnect can still use high-water.
+      applySeqState(beginAttach(createAttachSeqState({ lastSeq: 0 })))
+      needsViewportHydrationRef.current = false
+      pendingDeferredHydrationRef.current = false
+      awaitingViewportHydrationRef.current = true
+    } else {
+      applySeqState(beginAttach(createAttachSeqState({ lastSeq: deltaSeq })))
+      awaitingViewportHydrationRef.current = false
+      if (intent === 'keepalive_delta' && needsViewportHydrationRef.current) {
+        pendingDeferredHydrationRef.current = true
+      }
+    }
+
+    const attachRequestId = `${paneIdRef.current}:${++attachCounterRef.current}:${nanoid(6)}`
+    currentAttachRef.current = {
+      requestId: attachRequestId,
+      intent,
+      terminalId: tid,
+      sinceSeq,
+    }
+
+    ws.send({
+      type: 'terminal.attach',
+      terminalId: tid,
+      sinceSeq,
+      attachRequestId,
+    })
+    // NOTE: Do NOT send terminal.resize here. At this point fit() hasn't run yet,
+    // so term.cols/rows are xterm defaults (80×24), not the actual viewport size.
+    // Sending a resize with wrong dimensions causes the PTY to resize, triggering
+    // a TUI redraw at the wrong size (e.g., Codex renders 24 rows in a 40-row viewport,
+    // putting the text input at the top of the pane). The correct resize is sent by:
+    // - ResizeObserver callback (for visible tabs, after fit() runs)
+    // - Visibility effect (for hidden tabs, when they become visible)
+  }, [ws, applySeqState])
+
   // Apply settings changes
   useEffect(() => {
     if (!isTerminal) return
     const term = termRef.current
     if (!term) return
+    const resolvedTheme = getTerminalTheme(settings.terminal.theme, settings.theme)
     term.options.cursorBlink = settings.terminal.cursorBlink
     term.options.fontSize = settings.terminal.fontSize
     term.options.fontFamily = resolveTerminalFontFamily(settings.terminal.fontFamily)
     term.options.lineHeight = settings.terminal.lineHeight
     term.options.scrollback = settings.terminal.scrollback
-    term.options.theme = getTerminalTheme(settings.terminal.theme, settings.theme)
+    term.options.theme = resolvedTheme
+    term.options.minimumContrastRatio = resolveMinimumContrastRatio(resolvedTheme)
     if (!hidden) requestTerminalLayout({ fit: true, resize: true })
   }, [isTerminal, settings, hidden, requestTerminalLayout])
 
@@ -1085,8 +1182,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     if (!isTerminal) return
     if (!hidden) {
       requestTerminalLayout({ fit: true, resize: true })
+      const tid = terminalIdRef.current
+      if (tid && needsViewportHydrationRef.current && pendingDeferredHydrationRef.current) {
+        attachTerminal(tid, 'viewport_hydrate', { clearViewportFirst: true })
+      }
     }
-  }, [hidden, isTerminal, requestTerminalLayout])
+  }, [hidden, isTerminal, requestTerminalLayout, attachTerminal])
 
   // Create or attach to backend terminal
   useEffect(() => {
@@ -1141,6 +1242,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         shell: shell || 'system',
         cwd: initialCwd,
         resumeSessionId: resumeId,
+        tabId,
+        paneId: paneIdRef.current,
         ...(restore ? { restore: true } : {}),
       })
     }
@@ -1163,18 +1266,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       return true
     }
 
-    function attach(tid: string) {
-      setIsAttaching(true)
-      ws.send({ type: 'terminal.attach', terminalId: tid })
-      // NOTE: Do NOT send terminal.resize here. At this point fit() hasn't run yet,
-      // so term.cols/rows are xterm defaults (80×24), not the actual viewport size.
-      // Sending a resize with wrong dimensions causes the PTY to resize, triggering
-      // a TUI redraw at the wrong size (e.g., Codex renders 24 rows in a 40-row viewport,
-      // putting the text input at the top of the pane). The correct resize is sent by:
-      // - ResizeObserver callback (for visible tabs, after fit() runs)
-      // - Visibility effect (for hidden tabs, when they become visible)
-    }
-
     async function ensure() {
       clearRateLimitRetry()
       try {
@@ -1187,35 +1278,137 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         const tid = terminalIdRef.current
         const reqId = requestIdRef.current
 
-        const msgTerminalId = typeof (msg as { terminalId?: unknown }).terminalId === 'string'
-          ? (msg as { terminalId: string }).terminalId
-          : undefined
-        const isChunkLifecycleType =
-          msg.type === 'terminal.attached.start'
-          || msg.type === 'terminal.attached.chunk'
-          || msg.type === 'terminal.attached.end'
-
-        if (isChunkLifecycleType && msgTerminalId && tid && msgTerminalId !== tid) {
-          return
-        }
-
-        if (handleChunkLifecycleMessage(msg)) {
-          return
-        }
-
         if (msg.type === 'terminal.output' && msg.terminalId === tid) {
+          if (!isCurrentAttachMessage(msg)) {
+            if (debugRef.current) {
+              log.debug('Ignoring stale attach generation message', {
+                paneId: paneIdRef.current,
+                terminalId: msg.terminalId,
+                attachRequestId: msg.attachRequestId,
+                currentAttachRequestId: currentAttachRef.current?.requestId,
+                type: msg.type,
+              })
+            }
+            return
+          }
+
+          if (typeof msg.seqStart !== 'number' || typeof msg.seqEnd !== 'number') {
+            if (import.meta.env.DEV) {
+              log.warn('Ignoring terminal.output without sequence range', {
+                paneId: paneIdRef.current,
+                terminalId: tid,
+              })
+            }
+            return
+          }
+          const previousSeqState = seqStateRef.current
+          const frameDecision = onOutputFrame(previousSeqState, {
+            seqStart: msg.seqStart,
+            seqEnd: msg.seqEnd,
+          })
+          if (!frameDecision.accept) {
+            if (import.meta.env.DEV) {
+              log.warn('Ignoring overlapping terminal.output sequence range', {
+                paneId: paneIdRef.current,
+                terminalId: tid,
+                seqStart: msg.seqStart,
+                seqEnd: msg.seqEnd,
+                lastSeq: previousSeqState.lastSeq,
+              })
+            }
+            return
+          }
+
+          if (tid && frameDecision.freshReset) {
+            clearTerminalCursor(tid)
+          }
           const raw = msg.data || ''
           const mode = contentRef.current?.mode || 'shell'
           handleTerminalOutput(raw, mode, tid)
+          applySeqState(frameDecision.state, { terminalId: tid, persistCursor: true })
+          const completedAttachOnFrame = !frameDecision.state.pendingReplay
+            && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
+          if (completedAttachOnFrame) {
+            setIsAttaching(false)
+            markViewportHydrationComplete()
+          }
         }
 
-        if (msg.type === 'terminal.snapshot' && msg.terminalId === tid) {
-          handleTerminalSnapshot(msg.snapshot, term)
+        if (msg.type === 'terminal.output.gap' && msg.terminalId === tid) {
+          if (!isCurrentAttachMessage(msg)) {
+            if (debugRef.current) {
+              log.debug('Ignoring stale attach generation message', {
+                paneId: paneIdRef.current,
+                terminalId: msg.terminalId,
+                attachRequestId: msg.attachRequestId,
+                currentAttachRequestId: currentAttachRef.current?.requestId,
+                type: msg.type,
+              })
+            }
+            return
+          }
+
+          const currentAttach = currentAttachRef.current
+          const suppressReplayWindowBanner =
+            msg.reason === 'replay_window_exceeded'
+            && currentAttach?.terminalId === msg.terminalId
+            && (currentAttach.intent === 'viewport_hydrate' || currentAttach.sinceSeq === 0)
+
+          if (!suppressReplayWindowBanner) {
+            const reason = msg.reason === 'replay_window_exceeded'
+              ? 'reconnect window exceeded'
+              : 'slow link backlog'
+            try {
+              term.writeln(`\r\n[Output gap ${msg.fromSeq}-${msg.toSeq}: ${reason}]\r\n`)
+            } catch {
+              // disposed
+            }
+          }
+          const previousSeqState = seqStateRef.current
+          const nextSeqState = onOutputGap(previousSeqState, { fromSeq: msg.fromSeq, toSeq: msg.toSeq })
+          applySeqState(nextSeqState, { terminalId: tid, persistCursor: true })
+          const completedAttachOnGap = !nextSeqState.pendingReplay
+            && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
+          if (completedAttachOnGap) {
+            setIsAttaching(false)
+            markViewportHydrationComplete()
+          }
+        }
+
+        if (msg.type === 'terminal.attach.ready' && msg.terminalId === tid) {
+          if (!isCurrentAttachMessage(msg)) {
+            if (debugRef.current) {
+              log.debug('Ignoring stale attach generation message', {
+                paneId: paneIdRef.current,
+                terminalId: msg.terminalId,
+                attachRequestId: msg.attachRequestId,
+                currentAttachRequestId: currentAttachRef.current?.requestId,
+                type: msg.type,
+              })
+            }
+            return
+          }
+
+          const nextSeqState = onAttachReady(seqStateRef.current, {
+            headSeq: msg.headSeq,
+            replayFromSeq: msg.replayFromSeq,
+            replayToSeq: msg.replayToSeq,
+          })
+          applySeqState(nextSeqState, {
+            terminalId: tid,
+            persistCursor: !nextSeqState.pendingReplay,
+          })
+          setIsAttaching(Boolean(nextSeqState.pendingReplay))
+          updateContent({ status: 'running' })
+          if (!nextSeqState.pendingReplay) {
+            markViewportHydrationComplete()
+          }
         }
 
         if (msg.type === 'terminal.created' && msg.requestId === reqId) {
           clearRateLimitRetry()
           const newId = msg.terminalId as string
+          currentAttachRef.current = null
           if (debugRef.current) log.debug('[TRACE resumeSessionId] terminal.created received', {
             paneId: paneIdRef.current,
             requestId: reqId,
@@ -1225,6 +1418,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             willUpdate: !!(msg.effectiveResumeSessionId && msg.effectiveResumeSessionId !== contentRef.current?.resumeSessionId),
           })
           terminalIdRef.current = newId
+          applySeqState(beginAttach(createAttachSeqState({ lastSeq: 0 })))
           updateContent({ terminalId: newId, status: 'running' })
           // Also update tab for title purposes
           const currentTab = tabRef.current
@@ -1234,35 +1428,24 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           if (msg.effectiveResumeSessionId && msg.effectiveResumeSessionId !== contentRef.current?.resumeSessionId) {
             updateContent({ resumeSessionId: msg.effectiveResumeSessionId })
           }
-          const isSnapshotChunked = msg.snapshotChunked === true
-          if (isSnapshotChunked) {
-            markSnapshotChunkedCreated()
-          } else {
-            handleTerminalSnapshot(msg.snapshot, term)
-          }
-          // Creator is already attached server-side for this terminal.
-          // Avoid sending terminal.attach here: it can race with terminal.output and lead to
-          // the later terminal.attached snapshot wiping already-rendered output.
+          // Creator is already attached server-side for this terminal through v2 broker.
           ws.send({ type: 'terminal.resize', terminalId: newId, cols: term.cols, rows: term.rows })
-          if (!isSnapshotChunked) {
-            setIsAttaching(false)
-          }
-        }
-
-        if (msg.type === 'terminal.attached' && msg.terminalId === tid) {
-          clearRateLimitRetry()
-          setIsAttaching(false)
-          handleTerminalSnapshot(msg.snapshot, term)
-          updateContent({ status: 'running' })
+          setIsAttaching(true)
+          needsViewportHydrationRef.current = false
+          pendingDeferredHydrationRef.current = false
+          awaitingViewportHydrationRef.current = false
         }
 
         if (msg.type === 'terminal.exit' && msg.terminalId === tid) {
+          currentAttachRef.current = null
+          clearTerminalCursor(tid)
           // Clear terminalIdRef AND the stored terminalId to prevent any subsequent
           // operations (resize, input) from sending commands to the dead terminal,
           // which would trigger INVALID_TERMINAL_ID and cause a reconnection loop.
           // We must clear both the ref AND the Redux state because the ref sync effect
           // would otherwise reset the ref from the Redux state on re-render.
           terminalIdRef.current = undefined
+          applySeqState(createAttachSeqState())
           updateContent({ terminalId: undefined, status: 'exited' })
           const exitTab = tabRef.current
           if (exitTab) {
@@ -1367,7 +1550,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
               addTerminalRestoreRequestId(newRequestId)
             }
             requestIdRef.current = newRequestId
+            clearTerminalCursor(currentTerminalId)
             terminalIdRef.current = undefined
+            applySeqState(createAttachSeqState())
             updateContent({ terminalId: undefined, createRequestId: newRequestId, status: 'creating' })
             // Also clear the tab's terminalId to keep it in sync.
             // This prevents openSessionTab from using the stale terminalId for dedup.
@@ -1382,14 +1567,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       })
 
       unsubReconnect = ws.onReconnect(() => {
-        bumpConnectionGeneration()
         const tid = terminalIdRef.current
         if (debugRef.current) log.debug('[TRACE resumeSessionId] onReconnect', {
           paneId: paneIdRef.current,
           terminalId: tid,
           resumeSessionId: contentRef.current?.resumeSessionId,
         })
-        if (tid) attach(tid)
+        if (tid) attachTerminal(tid, 'transport_reconnect')
       })
 
       // Use paneContent for terminal lifecycle - NOT tab
@@ -1403,11 +1587,19 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         currentTerminalId,
         createRequestId,
         resumeSessionId: contentRef.current?.resumeSessionId,
-        action: currentTerminalId ? 'attach' : 'sendCreate',
+        action: currentTerminalId
+          ? (!hiddenRef.current && needsViewportHydrationRef.current ? 'viewport_hydrate' : 'keepalive_delta')
+          : 'sendCreate',
       })
       if (currentTerminalId) {
-        attach(currentTerminalId)
+        const intent: AttachIntent = !hiddenRef.current && needsViewportHydrationRef.current
+          ? 'viewport_hydrate'
+          : 'keepalive_delta'
+        attachTerminal(currentTerminalId, intent)
       } else {
+        needsViewportHydrationRef.current = false
+        pendingDeferredHydrationRef.current = false
+        awaitingViewportHydrationRef.current = false
         sendCreate(createRequestId)
       }
     }
@@ -1418,7 +1610,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       clearRateLimitRetry()
       unsub()
       unsubReconnect()
-      clearChunkedAttachState()
     }
   // Dependencies explanation:
   // - isTerminal: skip effect for non-terminal panes
@@ -1444,12 +1635,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     updateContent,
     ws,
     dispatch,
-    bumpConnectionGeneration,
-    clearChunkedAttachState,
-    handleChunkLifecycleMessage,
     handleTerminalOutput,
-    handleTerminalSnapshot,
-    markSnapshotChunkedCreated,
+    attachTerminal,
+    markViewportHydrationComplete,
   ])
 
   const mobileToolbarBottomPx = isMobile ? keyboardInsetPx : 0
@@ -1468,7 +1656,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     return null
   }
 
-  const showSpinner = (terminalContent.status === 'creating' || isAttaching) && connectionErrorCode !== 4003
+  const hasFatalConnectionError = isFatalConnectionErrorCode(connectionErrorCode)
+  const showBlockingSpinner = terminalContent.status === 'creating' && !hasFatalConnectionError
+  const showInlineOfflineStatus = connectionStatus !== 'ready' && !hasFatalConnectionError
+  const showInlineRecoveringStatus = connectionStatus === 'ready' && isAttaching && terminalContent.status !== 'creating'
+  const inlineStatusMessage = showInlineOfflineStatus
+    ? 'Offline: input will queue until reconnected.'
+    : (showInlineRecoveringStatus ? 'Recovering terminal output...' : null)
 
   return (
     <div
@@ -1522,14 +1716,19 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           </div>
         </div>
       )}
-      {showSpinner && (
+      {showBlockingSpinner && (
         <div className="absolute inset-0 flex items-center justify-center bg-background/80">
           <div className="flex flex-col items-center gap-3">
             <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
-            <span className="text-sm text-muted-foreground">
-              {terminalContent.status === 'creating' ? 'Starting terminal...' : 'Reconnecting...'}
-            </span>
+            <span className="text-sm text-muted-foreground">Starting terminal...</span>
           </div>
+        </div>
+      )}
+      {inlineStatusMessage && (
+        <div className="pointer-events-none absolute right-2 top-2 z-10" role="status" aria-live="polite">
+          <span className="rounded bg-background/90 px-2 py-1 text-xs text-muted-foreground shadow-sm ring-1 ring-border/60">
+            {inlineStatusMessage}
+          </span>
         </div>
       )}
       <ConnectionErrorOverlay />
@@ -1546,11 +1745,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           resultIndex={searchResults?.resultIndex}
           resultCount={searchResults?.resultCount}
         />
-      )}
-      {snapshotWarning && (
-        <div className="pointer-events-none absolute inset-x-2 bottom-2 rounded border border-amber-300 bg-amber-50/95 px-2 py-1 text-xs text-amber-900">
-          {snapshotWarning}
-        </div>
       )}
       <Osc52PromptModal
         open={pendingOsc52Event !== null}

@@ -76,7 +76,7 @@ describe('tabs persistence - skipPersist + strip volatile fields', () => {
     store.dispatch(updateTab({ id: 'tab-1', updates: { lastInputAt: 999 } }))
     vi.runAllTimers()
 
-    const raw = localStorage.getItem('freshell.tabs.v1')
+    const raw = localStorage.getItem('freshell.tabs.v2')
     expect(raw).not.toBeNull()
     const parsed = JSON.parse(raw!)
     expect(parsed.tabs.tabs[0].lastInputAt).toBeUndefined()

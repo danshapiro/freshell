@@ -190,7 +190,7 @@ describe('terminal console violations regression (e2e)', () => {
     cancelRafSpy = null
   })
 
-  it('avoids chunked-attach mismatch warning spam and keeps ws message handlers off synchronous writes', async () => {
+  it('uses v2 sequence output without warning spam and keeps ws handlers off synchronous writes', async () => {
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
 
     const { store, pane1, pane2 } = createStore()
@@ -208,25 +208,25 @@ describe('terminal console violations regression (e2e)', () => {
       expect(wsHarness.onMessage).toHaveBeenCalled()
     })
 
-    wsHarness.emit({ type: 'terminal.attached.start', terminalId: 'term-1', totalCodeUnits: 3, totalChunks: 1 })
-    wsHarness.emit({ type: 'terminal.attached.start', terminalId: 'term-2', totalCodeUnits: 3, totalChunks: 1 })
-    wsHarness.emit({ type: 'terminal.attached.chunk', terminalId: 'term-2', chunk: 'two' })
-    wsHarness.emit({ type: 'terminal.attached.chunk', terminalId: 'term-1', chunk: 'one' })
-    wsHarness.emit({ type: 'terminal.attached.end', terminalId: 'term-1', totalCodeUnits: 3, totalChunks: 1 })
-    wsHarness.emit({ type: 'terminal.attached.end', terminalId: 'term-2', totalCodeUnits: 3, totalChunks: 1 })
+    wsHarness.emit({ type: 'terminal.output', terminalId: 'term-2', seqStart: 1, seqEnd: 1, data: 'two' })
+    wsHarness.emit({ type: 'terminal.output', terminalId: 'term-1', seqStart: 1, seqEnd: 1, data: 'one' })
 
-    const mismatchWarnings = warnSpy.mock.calls.flat().filter((arg) =>
-      typeof arg === 'string' && arg.includes('mismatched terminal')
+    flushRafQueue(rafCallbacks)
+    expect(terminalInstances[0].write).toHaveBeenCalled()
+    expect(terminalInstances[1].write).toHaveBeenCalled()
+
+    const overlapWarnings = warnSpy.mock.calls.flat().filter((arg) =>
+      typeof arg === 'string' && arg.includes('overlapping terminal.output sequence range')
     )
-    expect(mismatchWarnings).toHaveLength(0)
+    expect(overlapWarnings).toHaveLength(0)
 
     terminalInstances[0].write.mockClear()
     terminalInstances[1].write.mockClear()
-    wsHarness.reset()
+    wsHarness.clearDurations()
 
-    wsHarness.emit({ type: 'terminal.output', terminalId: 'term-1', data: 'A' })
-    wsHarness.emit({ type: 'terminal.output', terminalId: 'term-1', data: 'B' })
-    wsHarness.emit({ type: 'terminal.output', terminalId: 'term-1', data: 'C' })
+    wsHarness.emit({ type: 'terminal.output', terminalId: 'term-1', seqStart: 2, seqEnd: 2, data: 'A' })
+    wsHarness.emit({ type: 'terminal.output', terminalId: 'term-1', seqStart: 3, seqEnd: 3, data: 'B' })
+    wsHarness.emit({ type: 'terminal.output', terminalId: 'term-1', seqStart: 4, seqEnd: 4, data: 'C' })
 
     expect(terminalInstances[0].write).not.toHaveBeenCalled()
     const wsHandlerDurationSamples = wsHarness.durations()
@@ -234,6 +234,47 @@ describe('terminal console violations regression (e2e)', () => {
 
     flushRafQueue(rafCallbacks)
     expect(terminalInstances[0].write).toHaveBeenCalled()
+
+    warnSpy.mockRestore()
+  })
+
+  it('does not log overlap warnings when replay frames arrive after attach.ready', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const { store, pane1 } = createStore()
+    render(
+      <Provider store={store}>
+        <TerminalView tabId="tab-1" paneId="pane-1" paneContent={pane1} hidden={false} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(terminalInstances.length).toBe(1)
+      expect(wsHarness.onMessage).toHaveBeenCalled()
+    })
+
+    wsHarness.emit({
+      type: 'terminal.attach.ready',
+      terminalId: 'term-1',
+      headSeq: 8,
+      replayFromSeq: 6,
+      replayToSeq: 8,
+    })
+    wsHarness.emit({ type: 'terminal.output', terminalId: 'term-1', seqStart: 6, seqEnd: 6, data: 'R6' })
+    wsHarness.emit({ type: 'terminal.output', terminalId: 'term-1', seqStart: 7, seqEnd: 7, data: 'R7' })
+    wsHarness.emit({ type: 'terminal.output', terminalId: 'term-1', seqStart: 8, seqEnd: 8, data: 'R8' })
+
+    flushRafQueue(rafCallbacks)
+
+    const writes = terminalInstances[0].write.mock.calls.map(([data]) => String(data)).join('')
+    expect(writes).toContain('R6')
+    expect(writes).toContain('R7')
+    expect(writes).toContain('R8')
+
+    const overlapWarnings = warnSpy.mock.calls.flat().filter((arg) =>
+      typeof arg === 'string' && arg.includes('overlapping terminal.output sequence range')
+    )
+    expect(overlapWarnings).toHaveLength(0)
 
     warnSpy.mockRestore()
   })

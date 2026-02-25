@@ -1,6 +1,6 @@
 import { nanoid } from 'nanoid'
 
-export const PERSIST_BROADCAST_CHANNEL_NAME = 'freshell.persist.v1'
+export const PERSIST_BROADCAST_CHANNEL_NAME = 'freshell.persist.v2'
 
 let sourceId: string | null = null
 export function getPersistBroadcastSourceId(): string {
@@ -64,4 +64,3 @@ export function resetPersistBroadcastForTests(): void {
   sourceId = null
   listeners.clear()
 }
-

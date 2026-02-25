@@ -1,4 +1,9 @@
-import { getClientPerfConfig, logClientPerf } from '@/lib/perf-logger'
+import {
+  getClientPerfConfig,
+  logClientPerf,
+  markTerminalInputSent,
+  markTerminalOutputSeen,
+} from '@/lib/perf-logger'
 import { getAuthToken } from '@/lib/auth'
 import type { ServerMessage } from '@shared/ws-protocol'
 import { createLogger } from '@/lib/client-logger'
@@ -23,8 +28,23 @@ type TabsSyncQueryPayload = {
   rangeDays?: number
 }
 
+type TerminalInputClientMessage = {
+  type: 'terminal.input'
+  terminalId: string
+  data: string
+}
+
 const CONNECTION_TIMEOUT_MS = 10_000
+const WS_PROTOCOL_VERSION = 2
 const perfConfig = getClientPerfConfig()
+
+function isTerminalInputMessage(msg: unknown): msg is TerminalInputClientMessage {
+  if (!msg || typeof msg !== 'object') return false
+  const candidate = msg as { type?: unknown; terminalId?: unknown; data?: unknown }
+  return candidate.type === 'terminal.input'
+    && typeof candidate.terminalId === 'string'
+    && typeof candidate.data === 'string'
+}
 
 export class WsClient {
   private ws: WebSocket | null = null
@@ -121,7 +141,8 @@ export class WsClient {
         this.ws?.send(JSON.stringify({
           type: 'hello',
           token,
-          capabilities: { sessionsPatchV1: true, terminalAttachChunkV1: true },
+          protocolVersion: WS_PROTOCOL_VERSION,
+          capabilities: { sessionsPatchV1: true, uiScreenshotV1: true },
           ...extensions,
         }))
       }
@@ -173,11 +194,24 @@ export class WsClient {
           finishResolve()
         }
 
+        if (msg.type === 'terminal.output' && typeof msg.terminalId === 'string') {
+          markTerminalOutputSeen(msg.terminalId)
+        }
+
         if (msg.type === 'error' && msg.code === 'NOT_AUTHENTICATED') {
           this.clearReadyTimeout()
           this.intentionalClose = true
           const err = new Error('Authentication failed')
           ;(err as any).wsCloseCode = 4001
+          finishReject(err)
+          return
+        }
+
+        if (msg.type === 'error' && msg.code === 'PROTOCOL_MISMATCH') {
+          this.clearReadyTimeout()
+          this.intentionalClose = true
+          const err = new Error('Protocol version mismatch')
+          ;(err as any).wsCloseCode = 4010
           finishReject(err)
           return
         }
@@ -199,7 +233,8 @@ export class WsClient {
 
       this.ws.onclose = (event) => {
         this.clearReadyTimeout()
-        const wasConnecting = this._state === 'connecting'
+        const wasReady = this._state === 'ready'
+        const closedBeforeReady = !wasReady
         this._state = 'disconnected'
         this.ws = null
 
@@ -227,6 +262,14 @@ export class WsClient {
           return
         }
 
+        if (event.code === 4010) {
+          this.intentionalClose = true
+          const err = new Error('Protocol version mismatch')
+          ;(err as any).wsCloseCode = 4010
+          finishReject(err)
+          return
+        }
+
         if (event.code === 4008) {
           // Backpressure close - surface as warning, but don't reconnect aggressively.
           finishReject(new Error('Connection too slow (backpressure)'))
@@ -243,7 +286,7 @@ export class WsClient {
           return
         }
 
-        if (wasConnecting) {
+        if (closedBeforeReady) {
           finishReject(new Error('Connection closed before ready'))
         }
 
@@ -251,7 +294,7 @@ export class WsClient {
           logClientPerf('perf.ws_closed', {
             code: event.code,
             reason: event.reason,
-            wasConnecting,
+            closedBeforeReady,
           }, 'warn')
         }
 
@@ -330,6 +373,10 @@ export class WsClient {
    */
   send(msg: unknown) {
     if (this.intentionalClose) return
+
+    if (isTerminalInputMessage(msg)) {
+      markTerminalInputSent(msg.terminalId)
+    }
 
     if (this._state === 'ready' && this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(msg))

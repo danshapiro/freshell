@@ -1,0 +1,4 @@
+interface:
+  display_name: "Demo Creator"
+  short_description: "Record polished build-and-show demos"
+  default_prompt: "Use $demo-creating to build, stage, and timecode a polished screen demo with a layout chosen for this specific scenario."

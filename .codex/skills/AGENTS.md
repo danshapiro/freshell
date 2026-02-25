@@ -1,0 +1,1 @@
+Only use the writing-plans skill when asked. When you use it, do not ask for reviews until the work is finished, then check the work with the fresheyes skill and fix whatever it identifies.  

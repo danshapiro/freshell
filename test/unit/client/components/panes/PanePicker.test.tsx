@@ -48,7 +48,7 @@ function createStore(overrides?: {
             scrollback: 5000,
             theme: 'auto' as TerminalTheme,
           },
-          safety: { autoKillIdleMinutes: 180, warnBeforeKillMinutes: 5 },
+          safety: { autoKillIdleMinutes: 180 },
           sidebar: {
             sortMode: 'activity' as SidebarSortMode,
             showProjectBadges: true,

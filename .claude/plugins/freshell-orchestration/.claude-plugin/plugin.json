@@ -1,0 +1,5 @@
+{
+  "name": "freshell-orchestration",
+  "version": "1.0.0",
+  "description": "Session-scoped Freshell orchestration skill plugin for pane/tab/panel automation."
+}

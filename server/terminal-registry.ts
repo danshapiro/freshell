@@ -13,6 +13,7 @@ import { convertWindowsPathToWslPath, isReachableDirectorySync } from './path-ut
 import { isValidClaudeSessionId } from './claude-session-id.js'
 import type { CodingCliProviderName } from './coding-cli/types.js'
 import { SessionBindingAuthority, type BindResult } from './session-binding-authority.js'
+import type { TerminalOutputRawEvent } from './terminal-stream/registry-events.js'
 
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
 const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 64 * 1024)
@@ -82,11 +83,98 @@ export function modeSupportsResume(mode: TerminalMode): boolean {
 
 type ProviderTarget = 'unix' | 'windows'
 
+const DEFAULT_FRESHELL_ORCHESTRATION_SKILL_DIR = path.join(process.cwd(), '.claude', 'skills', 'freshell-orchestration')
+const LEGACY_FRESHELL_ORCHESTRATION_SKILL_DIR = path.join(process.cwd(), '.claude', 'skills', 'freshell-automation-tmux-style')
+const DEFAULT_FRESHELL_DEMO_SKILL_DIR = path.join(process.cwd(), '.claude', 'skills', 'freshell-demo-creation')
+const LEGACY_FRESHELL_DEMO_SKILL_DIR = path.join(process.cwd(), '.claude', 'skills', 'demo-creating')
+const DEFAULT_FRESHELL_CLAUDE_PLUGIN_DIR = path.join(process.cwd(), '.claude', 'plugins', 'freshell-orchestration')
+const LEGACY_FRESHELL_CLAUDE_PLUGIN_DIR = path.join(process.cwd(), '.claude', 'plugins', 'freshell-automation-tmux-style')
+const DEFAULT_CODEX_HOME = path.join(os.homedir(), '.codex')
+const FRESHELL_CODEX_SKILL_CONFIG_BASE_INDEX = Number(process.env.FRESHELL_CODEX_SKILL_CONFIG_BASE_INDEX || 400_000)
+
+function firstExistingPath(candidates: Array<string | undefined>): string | undefined {
+  for (const candidate of candidates) {
+    if (!candidate) continue
+    try {
+      if (fs.existsSync(candidate)) return candidate
+    } catch {
+      // Ignore filesystem errors and fall through to the next candidate.
+    }
+  }
+  return undefined
+}
+
+function encodeTomlString(value: string): string {
+  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+}
+
+function firstExistingPaths(candidates: Array<string | undefined>): string[] {
+  const unique = new Set<string>()
+  for (const candidate of candidates) {
+    if (!candidate || unique.has(candidate)) continue
+    try {
+      if (fs.existsSync(candidate)) unique.add(candidate)
+    } catch {
+      // Ignore filesystem errors and continue collecting matches.
+    }
+  }
+  return Array.from(unique)
+}
+
+function codexSkillsDir(): string {
+  const codexHome = process.env.CODEX_HOME || DEFAULT_CODEX_HOME
+  return path.join(codexHome, 'skills')
+}
+
+function codexOrchestrationSkillArgs(): string[] {
+  const skillsDir = codexSkillsDir()
+  const skillPath = firstExistingPath([
+    process.env.FRESHELL_ORCHESTRATION_SKILL_DIR,
+    DEFAULT_FRESHELL_ORCHESTRATION_SKILL_DIR,
+    LEGACY_FRESHELL_ORCHESTRATION_SKILL_DIR,
+    path.join(skillsDir, 'freshell-orchestration'),
+    path.join(skillsDir, 'freshell-automation-tmux-style'),
+  ])
+  if (!skillPath) return []
+  const disablePaths = firstExistingPaths([
+    process.env.FRESHELL_DEMO_SKILL_DIR,
+    DEFAULT_FRESHELL_DEMO_SKILL_DIR,
+    LEGACY_FRESHELL_DEMO_SKILL_DIR,
+    path.join(skillsDir, 'demo-creating'),
+    path.join(skillsDir, 'freshell-demo-creation'),
+    LEGACY_FRESHELL_ORCHESTRATION_SKILL_DIR,
+    path.join(skillsDir, 'freshell-automation-tmux-style'),
+  ]).filter((entryPath) => entryPath !== skillPath)
+
+  const args: string[] = []
+  const entries: Array<{ path: string; enabled: boolean }> = [
+    { path: skillPath, enabled: true },
+    ...disablePaths.map((entryPath) => ({ path: entryPath, enabled: false })),
+  ]
+  for (const [index, entry] of entries.entries()) {
+    const configIndex = FRESHELL_CODEX_SKILL_CONFIG_BASE_INDEX + index
+    args.push('-c', `skills.config.${configIndex}.path=${encodeTomlString(entry.path)}`)
+    args.push('-c', `skills.config.${configIndex}.enabled=${entry.enabled ? 'true' : 'false'}`)
+  }
+  return args
+}
+
+function claudePluginArgs(): string[] {
+  const pluginDir = firstExistingPath([
+    process.env.FRESHELL_CLAUDE_PLUGIN_DIR,
+    DEFAULT_FRESHELL_CLAUDE_PLUGIN_DIR,
+    LEGACY_FRESHELL_CLAUDE_PLUGIN_DIR,
+  ])
+  if (!pluginDir) return []
+  return ['--plugin-dir', pluginDir]
+}
+
 function providerNotificationArgs(mode: TerminalMode, target: ProviderTarget): string[] {
   if (mode === 'codex') {
     return [
       '-c', 'tui.notification_method=bel',
       '-c', "tui.notifications=['agent-turn-complete']",
+      ...codexOrchestrationSkillArgs(),
     ]
   }
 
@@ -108,7 +196,7 @@ function providerNotificationArgs(mode: TerminalMode, target: ProviderTarget): s
         ],
       },
     }
-    return ['--settings', JSON.stringify(settings)]
+    return [...claudePluginArgs(), '--settings', JSON.stringify(settings)]
   }
 
   return []
@@ -179,8 +267,9 @@ export type TerminalRecord = {
   cols: number
   rows: number
   clients: Set<WebSocket>
+  suppressedOutputClients: Set<WebSocket>
   pendingSnapshotClients: Map<WebSocket, PendingSnapshotQueue>
-  warnedIdle?: boolean
+
   buffer: ChunkRingBuffer
   pty: pty.IPty
   perf?: {
@@ -534,7 +623,14 @@ function buildPowerShellCommand(command: string, args: string[]): string {
   return invocation
 }
 
-export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shell: ShellType, resumeSessionId?: string, providerSettings?: ProviderSettings) {
+export function buildSpawnSpec(
+  mode: TerminalMode,
+  cwd: string | undefined,
+  shell: ShellType,
+  resumeSessionId?: string,
+  providerSettings?: ProviderSettings,
+  envOverrides?: Record<string, string>,
+) {
   // CLAUDECODE is set by parent Claude Code sessions and causes child
   // claude processes to refuse to start ("nested session" error). Strip it.
   const { CLAUDECODE: _, ...parentEnv } = process.env
@@ -542,6 +638,7 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
     ...parentEnv,
     TERM: process.env.TERM || 'xterm-256color',
     COLORTERM: process.env.COLORTERM || 'truecolor',
+    ...envOverrides,
   }
 
   const normalizedResume = normalizeResumeSessionId(mode, resumeSessionId)
@@ -694,6 +791,8 @@ export class TerminalRegistry extends EventEmitter {
   private maxExitedTerminals: number
   private scrollbackMaxChars: number
   private maxPendingSnapshotChars: number
+  // Legacy transport batching path. Broker cutover destination:
+  // - outputBuffers/flush timers/mobile batching -> broker client-output queue.
   private outputBuffers = new Map<WebSocket, PendingOutput>()
 
   constructor(settings?: AppSettings, maxTerminals?: number, maxExitedTerminals?: number) {
@@ -716,6 +815,10 @@ export class TerminalRegistry extends EventEmitter {
     for (const t of this.terminals.values()) {
       t.buffer.setMaxChars(this.scrollbackMaxChars)
     }
+  }
+
+  getReplayRingMaxChars(): number {
+    return this.scrollbackMaxChars
   }
 
   private computeScrollbackMaxChars(settings?: AppSettings): number {
@@ -801,12 +904,6 @@ export class TerminalRegistry extends EventEmitter {
     if (!settings) return
     const killMinutes = settings.safety.autoKillIdleMinutes
     if (!killMinutes || killMinutes <= 0) return
-    const rawWarnMinutes = settings.safety.warnBeforeKillMinutes
-    const warnMinutes =
-      typeof rawWarnMinutes === 'number' && Number.isFinite(rawWarnMinutes) && rawWarnMinutes > 0 && rawWarnMinutes < killMinutes
-        ? rawWarnMinutes
-        : 0
-
     const now = Date.now()
 
     for (const term of this.terminals.values()) {
@@ -816,19 +913,6 @@ export class TerminalRegistry extends EventEmitter {
       const idleMs = now - term.lastActivityAt
       const idleMinutes = idleMs / 60000
 
-      if (warnMinutes > 0) {
-        const warnAtMinutes = killMinutes - warnMinutes
-        if (idleMinutes >= warnAtMinutes && idleMinutes < killMinutes && !term.warnedIdle) {
-          term.warnedIdle = true
-          this.emit('terminal.idle.warning', {
-            terminalId: term.terminalId,
-            killMinutes,
-            warnMinutes,
-            lastActivityAt: term.lastActivityAt,
-          })
-        }
-      }
-
       if (idleMinutes >= killMinutes) {
         logger.info({ terminalId: term.terminalId }, 'Auto-killing idle detached terminal')
         this.kill(term.terminalId)
@@ -836,7 +920,7 @@ export class TerminalRegistry extends EventEmitter {
     }
   }
 
-  // Exposed for unit tests to validate idle warning/kill behavior without relying on timers.
+  // Exposed for unit tests to validate idle kill behavior without relying on timers.
   async enforceIdleKillsForTest(): Promise<void> {
     await this.enforceIdleKills()
   }
@@ -864,7 +948,16 @@ export class TerminalRegistry extends EventEmitter {
     }
   }
 
-  create(opts: { mode: TerminalMode; shell?: ShellType; cwd?: string; cols?: number; rows?: number; resumeSessionId?: string; providerSettings?: ProviderSettings }): TerminalRecord {
+  create(opts: {
+    mode: TerminalMode
+    shell?: ShellType
+    cwd?: string
+    cols?: number
+    rows?: number
+    resumeSessionId?: string
+    providerSettings?: ProviderSettings
+    envContext?: { tabId?: string; paneId?: string }
+  }): TerminalRecord {
     this.reapExitedTerminals()
     if (this.runningCount() >= this.maxTerminals) {
       throw new Error(`Maximum terminal limit (${this.maxTerminals}) reached. Please close some terminals before creating new ones.`)
@@ -878,7 +971,24 @@ export class TerminalRegistry extends EventEmitter {
     const cwd = opts.cwd || getDefaultCwd(this.settings) || (isWindows() ? undefined : os.homedir())
     const normalizedResume = normalizeResumeSessionId(opts.mode, opts.resumeSessionId)
 
-    const { file, args, env, cwd: procCwd } = buildSpawnSpec(opts.mode, cwd, opts.shell || 'system', normalizedResume, opts.providerSettings)
+    const port = Number(process.env.PORT || 3001)
+    const baseEnv = {
+      FRESHELL: '1',
+      FRESHELL_URL: process.env.FRESHELL_URL || `http://localhost:${port}`,
+      FRESHELL_TOKEN: process.env.AUTH_TOKEN || '',
+      FRESHELL_TERMINAL_ID: terminalId,
+      ...(opts.envContext?.tabId ? { FRESHELL_TAB_ID: opts.envContext.tabId } : {}),
+      ...(opts.envContext?.paneId ? { FRESHELL_PANE_ID: opts.envContext.paneId } : {}),
+    }
+
+    const { file, args, env, cwd: procCwd } = buildSpawnSpec(
+      opts.mode,
+      cwd,
+      opts.shell || 'system',
+      normalizedResume,
+      opts.providerSettings,
+      baseEnv,
+    )
 
     const endSpawnTimer = startPerfTimer(
       'terminal_spawn',
@@ -912,8 +1022,9 @@ export class TerminalRegistry extends EventEmitter {
       cols,
       rows,
       clients: new Set(),
+      suppressedOutputClients: new Set(),
       pendingSnapshotClients: new Map(),
-      warnedIdle: false,
+
       buffer: new ChunkRingBuffer(this.scrollbackMaxChars),
       pty: ptyProc,
       perf: perfConfig.enabled
@@ -936,8 +1047,12 @@ export class TerminalRegistry extends EventEmitter {
     ptyProc.onData((data) => {
       const now = Date.now()
       record.lastActivityAt = now
-      record.warnedIdle = false
       record.buffer.append(data)
+      this.emit('terminal.output.raw', {
+        terminalId,
+        data,
+        at: now,
+      } satisfies TerminalOutputRawEvent)
       if (record.perf) {
         record.perf.outBytes += data.length
         record.perf.outChunks += 1
@@ -971,6 +1086,9 @@ export class TerminalRegistry extends EventEmitter {
         }
       }
       for (const client of record.clients) {
+        if (record.suppressedOutputClients.has(client)) continue
+        // Legacy snapshot ordering path. Broker cutover destination:
+        // - pendingSnapshotClients ordering -> broker attach-staging queue.
         const pending = record.pendingSnapshotClients.get(client)
         if (pending) {
           const nextChars = pending.queuedChars + data.length
@@ -1008,6 +1126,7 @@ export class TerminalRegistry extends EventEmitter {
         this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: e.exitCode }, { terminalId, perf: record.perf })
       }
       record.clients.clear()
+      record.suppressedOutputClients.clear()
       record.pendingSnapshotClients.clear()
       this.releaseBinding(terminalId)
       this.emit('terminal.exit', { terminalId, exitCode: e.exitCode })
@@ -1028,12 +1147,12 @@ export class TerminalRegistry extends EventEmitter {
     return record
   }
 
-  attach(terminalId: string, client: WebSocket, opts?: { pendingSnapshot?: boolean }): TerminalRecord | null {
+  attach(terminalId: string, client: WebSocket, opts?: { pendingSnapshot?: boolean; suppressOutput?: boolean }): TerminalRecord | null {
     const term = this.terminals.get(terminalId)
     if (!term) return null
     term.clients.add(client)
-    term.warnedIdle = false
     if (opts?.pendingSnapshot) term.pendingSnapshotClients.set(client, { chunks: [], queuedChars: 0 })
+    if (opts?.suppressOutput) term.suppressedOutputClients.add(client)
     return term
   }
 
@@ -1054,6 +1173,7 @@ export class TerminalRegistry extends EventEmitter {
     this.flushOutputBuffer(client)
     this.clearOutputBuffer(client)
     term.clients.delete(client)
+    term.suppressedOutputClients.delete(client)
     term.pendingSnapshotClients.delete(client)
     return true
   }
@@ -1063,7 +1183,6 @@ export class TerminalRegistry extends EventEmitter {
     if (!term || term.status !== 'running') return false
     const now = Date.now()
     term.lastActivityAt = now
-    term.warnedIdle = false
     if (term.perf) {
       term.perf.inBytes += data.length
       term.perf.inChunks += 1
@@ -1110,6 +1229,7 @@ export class TerminalRegistry extends EventEmitter {
       this.safeSend(client, { type: 'terminal.exit', terminalId, exitCode: term.exitCode })
     }
     term.clients.clear()
+    term.suppressedOutputClients.clear()
     term.pendingSnapshotClients.clear()
     this.releaseBinding(terminalId)
     this.emit('terminal.exit', { terminalId, exitCode: term.exitCode })
@@ -1153,6 +1273,22 @@ export class TerminalRegistry extends EventEmitter {
 
   get(terminalId: string): TerminalRecord | undefined {
     return this.terminals.get(terminalId)
+  }
+
+  getAttachedClientCount(terminalId: string): number {
+    const term = this.terminals.get(terminalId)
+    return term ? term.clients.size : 0
+  }
+
+  listAttachedClientIds(terminalId: string): string[] {
+    const term = this.terminals.get(terminalId)
+    if (!term) return []
+    const ids: string[] = []
+    for (const client of term.clients) {
+      const connectionId = (client as LiveWebSocket).connectionId
+      if (connectionId) ids.push(connectionId)
+    }
+    return ids
   }
 
   private releaseBinding(terminalId: string): void {
@@ -1210,6 +1346,8 @@ export class TerminalRegistry extends EventEmitter {
     perf?: TerminalRecord['perf'],
   ): void {
     if (!data) return
+    // Legacy framing path. Broker cutover destination:
+    // - safeSendOutputFrames + safeSend backpressure guards -> broker scheduler + catastrophic breaker.
     for (let offset = 0; offset < data.length; offset += MAX_OUTPUT_FRAME_CHARS) {
       this.safeSend(
         client,

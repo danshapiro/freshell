@@ -32,6 +32,14 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - Then fast-forward main: `git merge --ff-only feature/branch` - this is atomic (pointer move, no intermediate states)
 - If `--ff-only` fails, go back to the worktree and rebase/merge until it can fast-forward
 
+## Process Safety (CRITICAL)
+
+- Never use broad kill patterns (for example `pkill -f "tsx watch server/index.ts"`, `pkill -f vite`, `pkill node`).
+- Start manual worktree servers on a unique port and record their PID, then stop only that PID.
+- Example start: `PORT=3344 npm run dev:server > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid`
+- Example stop: `kill "$(cat /tmp/freshell-3344.pid)" && rm -f /tmp/freshell-3344.pid`
+- Before stopping any process, verify it belongs to the worktree (`ps -fp <pid>` and confirm cwd/path includes `.worktrees/...`).
+
 ## Codex Agent in CMD Instructions (Codex agents only; only when running in CMD on windows; all other agents must ignore)
 - Prefer bash/WSL over PowerShell; Windows paths map like `D:\...` -> `/mnt/d/...`.
 - Use `bash -lc "<cmd>"` for non-interactive commands; avoid interactive shells so commands return control.

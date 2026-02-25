@@ -13,30 +13,49 @@
 // ============================================================
 
 import { createLogger } from '@/lib/client-logger'
+import { clearAuthCookie } from '@/lib/auth'
 
 const log = createLogger('StorageMigration')
 
-const STORAGE_VERSION = 2 // Incremented for multi-CLI architecture
+const STORAGE_VERSION = 3
+const STORAGE_VERSION_KEY = 'freshell_version'
+const AUTH_STORAGE_KEY = 'freshell.auth-token'
 
-function runStorageMigration() {
-  try {
-    const stored = localStorage.getItem('freshell_version')
-    const currentVersion = stored ? parseInt(stored, 10) : 0
+function readStorageVersion(): number {
+  const stored = localStorage.getItem(STORAGE_VERSION_KEY)
+  if (!stored) return 0
+  const parsed = Number.parseInt(stored, 10)
+  return Number.isFinite(parsed) ? parsed : 0
+}
 
-    if (currentVersion < STORAGE_VERSION) {
-      // Clear all Freshell data
-      const keysToRemove = Object.keys(localStorage).filter(
-        (k) => k.startsWith('freshell.') || k === 'freshell_version'
-      )
-      keysToRemove.forEach((k) => localStorage.removeItem(k))
-
-      localStorage.setItem('freshell_version', String(STORAGE_VERSION))
-
-      log.info(
-        `Cleared localStorage (version ${currentVersion} → ${STORAGE_VERSION}) ` +
-        'due to breaking state schema changes.'
-      )
+function clearFreshellKeysExcept(keep: string[]): void {
+  const keepSet = new Set(keep)
+  for (const key of Object.keys(localStorage)) {
+    if ((key.startsWith('freshell.') || key === STORAGE_VERSION_KEY) && !keepSet.has(key)) {
+      localStorage.removeItem(key)
     }
+  }
+}
+
+export function runStorageMigration(): void {
+  try {
+    const currentVersion = readStorageVersion()
+    if (currentVersion >= STORAGE_VERSION) return
+
+    const preservedAuthToken = localStorage.getItem(AUTH_STORAGE_KEY)
+    clearFreshellKeysExcept([AUTH_STORAGE_KEY])
+
+    if (preservedAuthToken) {
+      localStorage.setItem(AUTH_STORAGE_KEY, preservedAuthToken)
+    } else {
+      clearAuthCookie()
+    }
+
+    localStorage.setItem(STORAGE_VERSION_KEY, String(STORAGE_VERSION))
+    log.info(
+      `Cleared localStorage (version ${currentVersion} → ${STORAGE_VERSION}) ` +
+      'while preserving auth token continuity.'
+    )
   } catch (err) {
     log.warn('Storage migration failed:', err)
   }
