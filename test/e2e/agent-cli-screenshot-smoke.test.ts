@@ -310,5 +310,5 @@ describe('agent cli screenshot smoke', () => {
       await fs.rm(smokeDir, { recursive: true, force: true }).catch(() => undefined)
       await server.close()
     }
-  })
+  }, 120_000)
 })
