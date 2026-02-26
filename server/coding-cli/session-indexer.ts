@@ -409,6 +409,7 @@ export class CodingCliSessionIndexer {
       messageCount: meta.messageCount,
       title: meta.title,
       summary: meta.summary,
+      ...(meta.firstUserMessage ? { firstUserMessage: meta.firstUserMessage } : {}),
       cwd: meta.cwd,
       gitBranch: meta.gitBranch,
       isDirty: meta.isDirty,

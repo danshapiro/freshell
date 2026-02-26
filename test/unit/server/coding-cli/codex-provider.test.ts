@@ -49,6 +49,7 @@ describe('codex-provider', () => {
     expect(meta.sessionId).toBe('session-xyz')
     expect(meta.cwd).toBe('/project/a')
     expect(meta.title).toBe('Build the feature')
+    expect(meta.firstUserMessage).toBe('Build the feature')
     expect(meta.messageCount).toBe(2)
   })
 

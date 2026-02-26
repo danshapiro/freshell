@@ -58,6 +58,7 @@ export interface CodingCliSession {
   messageCount?: number
   title?: string
   summary?: string
+  firstUserMessage?: string
   cwd?: string
   archived?: boolean
   sourceFile?: string
@@ -148,6 +149,8 @@ export interface AppSettings {
     showProjectBadges: boolean
     showSubagents: boolean
     showNoninteractiveSessions: boolean
+    excludeFirstChatSubstrings: string[]
+    excludeFirstChatMustStart: boolean
     width: number // pixels, default 288 (equivalent to w-72)
     collapsed: boolean // for mobile/responsive use
   }

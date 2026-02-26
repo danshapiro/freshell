@@ -45,6 +45,8 @@ describe('settingsSlice', () => {
         showProjectBadges: true,
         showSubagents: false,
         showNoninteractiveSessions: false,
+        excludeFirstChatSubstrings: [],
+        excludeFirstChatMustStart: false,
         width: 288,
         collapsed: false,
       })
@@ -113,6 +115,8 @@ describe('settingsSlice', () => {
           showProjectBadges: false,
           showSubagents: false,
           showNoninteractiveSessions: false,
+          excludeFirstChatSubstrings: [],
+          excludeFirstChatMustStart: false,
           width: 320,
           collapsed: false,
         },
@@ -272,6 +276,24 @@ describe('settingsSlice', () => {
 
       expect(state.settings.sidebar.sortMode).toBe('activity')
       expect(state.settings.sidebar.showProjectBadges).toBe(defaultSettings.sidebar.showProjectBadges)
+    })
+
+    it('normalizes first-chat exclusion substrings', () => {
+      const initialState: SettingsState = {
+        settings: defaultSettings,
+        loaded: true,
+      }
+
+      const state = settingsReducer(
+        initialState,
+        updateSettingsLocal({
+          sidebar: {
+            excludeFirstChatSubstrings: ['  __AUTO__  ', '', '__AUTO__', 'canary'],
+          },
+        })
+      )
+
+      expect(state.settings.sidebar.excludeFirstChatSubstrings).toEqual(['__AUTO__', 'canary'])
     })
 
     it('deep merges coding CLI settings', () => {

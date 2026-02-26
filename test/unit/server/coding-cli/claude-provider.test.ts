@@ -817,6 +817,7 @@ describe('claude provider cross-platform tests', () => {
 
       expect(meta.cwd).toBe('/home/user/project')
       expect(meta.title).toBe('Fix the login bug')
+      expect(meta.firstUserMessage).toBe('Fix the login bug')
     })
   })
 

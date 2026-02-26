@@ -160,6 +160,16 @@ export default function Sidebar({
   // Build session list with selector for local filtering (title tier)
   const localFilteredItems = useAppSelector((state) => selectSortedItems(state, terminals, filter))
   const allItems = useAppSelector((state) => selectSortedItems(state, terminals, ''))
+  const knownSessionKeys = useAppSelector((state) => {
+    const keys = new Set<string>()
+    for (const project of state.sessions.projects || []) {
+      for (const session of project.sessions || []) {
+        const provider = session.provider || 'claude'
+        keys.add(`${provider}:${session.sessionId}`)
+      }
+    }
+    return keys
+  })
   const itemsByKey = useMemo(() => {
     const map = new Map<string, SidebarSessionItem>()
     for (const item of allItems) {
@@ -172,32 +182,55 @@ export default function Sidebar({
   const sortedItems = useMemo(() => {
     // If we have backend search results, convert them to SessionItems
     if (searchResults !== null) {
-      return searchResults.map((result): SessionItem => {
+      const items: SessionItem[] = []
+      for (const result of searchResults) {
         const provider = (result.provider || 'claude') as CodingCliProviderName
         const key = `${provider}:${result.sessionId}`
         const existing = itemsByKey.get(key)
-        return {
+        // Keep visibility filtering consistent with the normal sidebar list.
+        if (!existing && knownSessionKeys.has(key)) continue
+        if (!existing) {
+          items.push({
+            id: `search-${provider}-${result.sessionId}`,
+            sessionId: result.sessionId,
+            provider,
+            title: result.title || result.sessionId.slice(0, 8),
+            subtitle: getProjectName(result.projectPath),
+            projectPath: result.projectPath,
+            timestamp: result.updatedAt,
+            archived: result.archived,
+            cwd: result.cwd,
+            hasTab: false,
+            isRunning: false,
+          })
+          continue
+        }
+        items.push({
           id: `search-${provider}-${result.sessionId}`,
           sessionId: result.sessionId,
           provider,
-          title: result.title || result.sessionId.slice(0, 8),
+          title: result.title || existing.title || result.sessionId.slice(0, 8),
           subtitle: getProjectName(result.projectPath),
           projectPath: result.projectPath,
           projectColor: existing?.projectColor,
           timestamp: result.updatedAt,
           archived: result.archived,
           cwd: result.cwd,
-          hasTab: existing?.hasTab ?? false,
-          ratchetedActivity: existing?.ratchetedActivity,
-          isRunning: existing?.isRunning ?? false,
-          runningTerminalId: existing?.runningTerminalId,
-        }
-      })
+          hasTab: existing.hasTab,
+          ratchetedActivity: existing.ratchetedActivity,
+          isRunning: existing.isRunning,
+          runningTerminalId: existing.runningTerminalId,
+          isSubagent: existing.isSubagent,
+          isNonInteractive: existing.isNonInteractive,
+          firstUserMessage: existing.firstUserMessage,
+        })
+      }
+      return items
     }
 
     // Otherwise use local filtering for title tier
     return localFilteredItems
-  }, [itemsByKey, localFilteredItems, searchResults])
+  }, [itemsByKey, knownSessionKeys, localFilteredItems, searchResults])
 
   useEffect(() => {
     const container = listContainerRef.current

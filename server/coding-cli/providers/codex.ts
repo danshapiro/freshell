@@ -12,6 +12,7 @@ const CODEX_MAX_PLAUSIBLE_CONTEXT_TOKENS_WITHOUT_WINDOW = 5_000_000
 // explicit auto-compact limit, approximate it by scaling from the effective window.
 const CODEX_AUTO_COMPACT_DEFAULT_PERCENT = 90
 const CODEX_EFFECTIVE_CONTEXT_WINDOW_DEFAULT_PERCENT = 95
+const FIRST_USER_MESSAGE_MAX_CHARS = 4000
 
 export function defaultCodexHome(): string {
   return process.env.CODEX_HOME || path.join(os.homedir(), '.codex')
@@ -38,6 +39,13 @@ function normalizeCompactPercent(numerator: number, denominator?: number): numbe
   if (!denominator || denominator <= 0) return undefined
   const ratio = Math.round((numerator / denominator) * 100)
   return Math.max(0, Math.min(100, ratio))
+}
+
+function normalizeFirstUserMessage(content: string): string | undefined {
+  const trimmed = content.trim()
+  if (!trimmed) return undefined
+  if (trimmed.length <= FIRST_USER_MESSAGE_MAX_CHARS) return trimmed
+  return trimmed.slice(0, FIRST_USER_MESSAGE_MAX_CHARS)
 }
 
 function deriveCodexCompactThresholdTokens(
@@ -202,6 +210,7 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
   let cwd: string | undefined
   let title: string | undefined
   let summary: string | undefined
+  let firstUserMessage: string | undefined
   let isNonInteractive: boolean | undefined
   let gitBranch: string | undefined
   let isDirty: boolean | undefined
@@ -242,9 +251,13 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
       }
     }
 
-    if (!title && obj?.type === 'response_item' && obj?.payload?.type === 'message' && obj?.payload?.role === 'user') {
+    if (obj?.type === 'response_item' && obj?.payload?.type === 'message' && obj?.payload?.role === 'user') {
       const text = extractTextContent(obj.payload.content)
-      if (text.trim()) {
+      const normalized = normalizeFirstUserMessage(text)
+      if (!firstUserMessage && normalized) {
+        firstUserMessage = normalized
+      }
+      if (!title && text.trim()) {
         // Try to extract user request from IDE-formatted context first
         const ideRequest = extractFromIdeContext(text)
         if (ideRequest) {
@@ -278,6 +291,7 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
     cwd,
     title,
     summary,
+    firstUserMessage,
     messageCount: lines.length,
     isNonInteractive,
     gitBranch,

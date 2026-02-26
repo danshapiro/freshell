@@ -73,6 +73,8 @@ export const SettingsPatchSchema = z
         showProjectBadges: z.coerce.boolean().optional(),
         showSubagents: z.coerce.boolean().optional(),
         showNoninteractiveSessions: z.coerce.boolean().optional(),
+        excludeFirstChatSubstrings: z.array(z.string()).optional(),
+        excludeFirstChatMustStart: z.coerce.boolean().optional(),
         width: z.coerce.number().optional(),
         collapsed: z.coerce.boolean().optional(),
       })

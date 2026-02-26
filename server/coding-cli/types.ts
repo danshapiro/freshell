@@ -130,6 +130,7 @@ export interface ParsedSessionMeta {
   cwd?: string
   title?: string
   summary?: string
+  firstUserMessage?: string
   messageCount?: number
   projectPath?: string
   isNonInteractive?: boolean
@@ -161,6 +162,7 @@ export interface CodingCliSession {
   messageCount?: number
   title?: string
   summary?: string
+  firstUserMessage?: string
   cwd?: string
   gitBranch?: string
   isDirty?: boolean

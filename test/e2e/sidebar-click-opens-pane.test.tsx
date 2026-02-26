@@ -76,6 +76,8 @@ function createStore(options: {
     paneTitles?: Record<string, Record<string, string>>
   }
   terminals?: BackgroundTerminal[]
+  excludeFirstChatSubstrings?: string[]
+  excludeFirstChatMustStart?: boolean
 }) {
   const projects = options.projects.map((project) => ({
     ...project,
@@ -128,6 +130,8 @@ function createStore(options: {
             ...defaultSettings.sidebar,
             sortMode: 'activity',
             showProjectBadges: true,
+            excludeFirstChatSubstrings: options.excludeFirstChatSubstrings ?? defaultSettings.sidebar.excludeFirstChatSubstrings,
+            excludeFirstChatMustStart: options.excludeFirstChatMustStart ?? defaultSettings.sidebar.excludeFirstChatMustStart,
           },
         },
         loaded: true,
@@ -206,6 +210,48 @@ describe('sidebar click opens pane (e2e)', () => {
   afterEach(() => {
     cleanup()
     vi.useRealTimers()
+  })
+
+  it('hides sessions that match first chat exclusion substrings', async () => {
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/home/user/project',
+        sessions: [
+          {
+            sessionId: sessionId('hidden-session'),
+            projectPath: '/home/user/project',
+            updatedAt: Date.now(),
+            title: 'Hidden canary session',
+            firstUserMessage: '__AUTO__ run helper flow',
+            cwd: '/home/user/project',
+          },
+          {
+            sessionId: sessionId('visible-session'),
+            projectPath: '/home/user/project',
+            updatedAt: Date.now() - 1000,
+            title: 'Visible manual session',
+            firstUserMessage: 'please fix tests',
+            cwd: '/home/user/project',
+          },
+        ],
+      },
+    ]
+
+    const store = createStore({
+      projects,
+      tabs: [{ id: 'tab-1', mode: 'shell' }],
+      activeTabId: 'tab-1',
+      excludeFirstChatSubstrings: ['__AUTO__'],
+    })
+
+    renderSidebar(store)
+
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    expect(screen.queryByText('Hidden canary session')).not.toBeInTheDocument()
+    expect(screen.getByText('Visible manual session')).toBeInTheDocument()
   })
 
   it('clicking a session splits a pane in the current tab', async () => {

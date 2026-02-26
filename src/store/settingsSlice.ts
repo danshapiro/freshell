@@ -6,6 +6,20 @@ export function resolveDefaultLoggingDebug(isDev: boolean = import.meta.env.DEV)
   return !!isDev
 }
 
+function normalizeExcludeFirstChatSubstrings(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string') continue
+    const trimmed = item.trim()
+    if (!trimmed || seen.has(trimmed)) continue
+    seen.add(trimmed)
+    out.push(trimmed)
+  }
+  return out
+}
+
 export const defaultSettings: AppSettings = {
   theme: 'system',
   uiScale: 1.0, // 100% = UI text matches terminal font size
@@ -32,6 +46,8 @@ export const defaultSettings: AppSettings = {
     showProjectBadges: true,
     showSubagents: false,
     showNoninteractiveSessions: false,
+    excludeFirstChatSubstrings: [],
+    excludeFirstChatMustStart: false,
     width: 288,
     collapsed: false,
   },
@@ -116,6 +132,8 @@ export function mergeSettings(base: AppSettings, patch: DeepPartial<AppSettings>
     sidebar: {
       ...merged.sidebar,
       sortMode: migrateSortMode(merged.sidebar?.sortMode),
+      excludeFirstChatSubstrings: normalizeExcludeFirstChatSubstrings(merged.sidebar?.excludeFirstChatSubstrings),
+      excludeFirstChatMustStart: !!merged.sidebar?.excludeFirstChatMustStart,
     },
     codingCli: {
       ...merged.codingCli,

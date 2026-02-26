@@ -21,9 +21,11 @@ export interface SidebarSessionItem {
   runningTerminalId?: string
   isSubagent?: boolean
   isNonInteractive?: boolean
+  firstUserMessage?: string
 }
 
 const EMPTY_ACTIVITY: Record<string, number> = {}
+const EMPTY_STRINGS: string[] = []
 
 const selectProjects = (state: RootState) => state.sessions.projects
 const selectTabs = (state: RootState) => state.tabs.tabs
@@ -36,6 +38,8 @@ const selectSessionActivityForSort = (state: RootState) => {
 }
 const selectShowSubagents = (state: RootState) => state.settings.settings.sidebar?.showSubagents ?? false
 const selectShowNoninteractiveSessions = (state: RootState) => state.settings.settings.sidebar?.showNoninteractiveSessions ?? false
+const selectExcludeFirstChatSubstrings = (state: RootState) => state.settings.settings.sidebar?.excludeFirstChatSubstrings ?? EMPTY_STRINGS
+const selectExcludeFirstChatMustStart = (state: RootState) => state.settings.settings.sidebar?.excludeFirstChatMustStart ?? false
 const selectTerminals = (_state: RootState, terminals: BackgroundTerminal[]) => terminals
 const selectFilter = (_state: RootState, _terminals: BackgroundTerminal[], filter: string) => filter
 
@@ -110,6 +114,7 @@ function buildSessionItems(
         runningTerminalId,
         isSubagent: session.isSubagent,
         isNonInteractive: session.isNonInteractive,
+        firstUserMessage: session.firstUserMessage,
       })
     }
   }
@@ -132,15 +137,27 @@ function filterSessionItems(items: SidebarSessionItem[], filter: string): Sideba
 export interface VisibilitySettings {
   showSubagents: boolean
   showNoninteractiveSessions: boolean
+  excludeFirstChatSubstrings: string[]
+  excludeFirstChatMustStart: boolean
 }
 
 export function filterSessionItemsByVisibility(
   items: SidebarSessionItem[],
   settings: VisibilitySettings,
 ): SidebarSessionItem[] {
+  const exclusions = settings.excludeFirstChatSubstrings
   return items.filter((item) => {
     if (!settings.showSubagents && item.isSubagent) return false
     if (!settings.showNoninteractiveSessions && item.isNonInteractive) return false
+    const firstUserMessage = item.firstUserMessage
+    if (firstUserMessage && exclusions.length > 0) {
+      const shouldHide = exclusions.some((term) =>
+        settings.excludeFirstChatMustStart
+          ? firstUserMessage.startsWith(term)
+          : firstUserMessage.includes(term)
+      )
+      if (shouldHide) return false
+    }
     return true
   })
 }
@@ -208,10 +225,39 @@ export function sortSessionItems(items: SidebarSessionItem[], sortMode: string):
 
 export const makeSelectSortedSessionItems = () =>
   createSelector(
-    [selectProjects, selectTabs, selectPanes, selectSessionActivityForSort, selectSortMode, selectShowSubagents, selectShowNoninteractiveSessions, selectTerminals, selectFilter],
-    (projects, tabs, panes, sessionActivity, sortMode, showSubagents, showNoninteractiveSessions, terminals, filter) => {
+    [
+      selectProjects,
+      selectTabs,
+      selectPanes,
+      selectSessionActivityForSort,
+      selectSortMode,
+      selectShowSubagents,
+      selectShowNoninteractiveSessions,
+      selectExcludeFirstChatSubstrings,
+      selectExcludeFirstChatMustStart,
+      selectTerminals,
+      selectFilter,
+    ],
+    (
+      projects,
+      tabs,
+      panes,
+      sessionActivity,
+      sortMode,
+      showSubagents,
+      showNoninteractiveSessions,
+      excludeFirstChatSubstrings,
+      excludeFirstChatMustStart,
+      terminals,
+      filter
+    ) => {
       const items = buildSessionItems(projects, tabs, panes, terminals, sessionActivity)
-      const visible = filterSessionItemsByVisibility(items, { showSubagents, showNoninteractiveSessions })
+      const visible = filterSessionItemsByVisibility(items, {
+        showSubagents,
+        showNoninteractiveSessions,
+        excludeFirstChatSubstrings,
+        excludeFirstChatMustStart,
+      })
       const filtered = filterSessionItems(visible, filter)
       return sortSessionItems(filtered, sortMode)
     }

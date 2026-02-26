@@ -159,6 +159,18 @@ function normalizePreviewLine(tokens: PreviewToken[], width: number): PreviewTok
   return normalized
 }
 
+function parseSidebarExcludeFirstChatInput(input: string): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const line of input.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed || seen.has(trimmed)) continue
+    seen.add(trimmed)
+    out.push(trimmed)
+  }
+  return out
+}
+
 export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePanel }: { onNavigate?: (view: AppView) => void; onFirewallTerminal?: (cmd: { tabId: string; command: string }) => void; onSharePanel?: () => void } = {}) {
   const dispatch = useAppDispatch()
   const rawSettings = useAppSelector((s) => s.settings.settings)
@@ -188,12 +200,18 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   const [terminalAdvancedOpen, setTerminalAdvancedOpen] = useState(false)
   const [defaultCwdInput, setDefaultCwdInput] = useState(settings.defaultCwd ?? '')
   const [defaultCwdError, setDefaultCwdError] = useState<string | null>(null)
+  const [excludeFirstChatInput, setExcludeFirstChatInput] = useState(
+    () => (settings.sidebar?.excludeFirstChatSubstrings ?? []).join('\n'),
+  )
   const [deviceNameInputs, setDeviceNameInputs] = useState<Record<string, string>>({})
   const terminalAdvancedId = useId()
   const pendingRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const defaultCwdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const defaultCwdValidationRef = useRef(0)
   const lastSettingsDefaultCwdRef = useRef(settings.defaultCwd ?? '')
+  const lastSettingsExcludeFirstChatRef = useRef(
+    (settings.sidebar?.excludeFirstChatSubstrings ?? []).join('\n'),
+  )
   const previewTheme = useMemo(
     () => getTerminalTheme(settings.terminal.theme, settings.theme),
     [settings.terminal.theme, settings.theme],
@@ -249,6 +267,14 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     }
     lastSettingsDefaultCwdRef.current = next
   }, [defaultCwdInput, settings.defaultCwd])
+
+  useEffect(() => {
+    const next = (settings.sidebar?.excludeFirstChatSubstrings ?? []).join('\n')
+    if (excludeFirstChatInput === lastSettingsExcludeFirstChatRef.current) {
+      setExcludeFirstChatInput(next)
+    }
+    lastSettingsExcludeFirstChatRef.current = next
+  }, [excludeFirstChatInput, settings.sidebar?.excludeFirstChatSubstrings])
 
   const commitDefaultCwd = useCallback((nextValue: string | undefined) => {
     if (nextValue === settings.defaultCwd) return
@@ -697,6 +723,36 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                   dispatch(updateSettingsLocal({ sidebar: { showNoninteractiveSessions: checked } }))
                   scheduleSave({ sidebar: { showNoninteractiveSessions: checked } })
                 }}
+              />
+            </SettingsRow>
+
+            <SettingsRow
+              label="Hide sessions by first chat"
+              description="One substring per line. Matching sessions are hidden from the sidebar."
+            >
+              <textarea
+                value={excludeFirstChatInput}
+                onChange={(event) => {
+                  const nextInput = event.target.value
+                  setExcludeFirstChatInput(nextInput)
+                  const excludeFirstChatSubstrings = parseSidebarExcludeFirstChatInput(nextInput)
+                  dispatch(updateSettingsLocal({ sidebar: { excludeFirstChatSubstrings } }))
+                  scheduleSave({ sidebar: { excludeFirstChatSubstrings } })
+                }}
+                className="min-h-20 w-full rounded-md bg-muted border-0 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-border md:w-[24rem]"
+                placeholder="__AUTO__"
+                aria-label="Sidebar first chat exclusion substrings"
+              />
+            </SettingsRow>
+
+            <SettingsRow label="First chat must start with match">
+              <Toggle
+                checked={settings.sidebar?.excludeFirstChatMustStart ?? false}
+                onChange={(checked) => {
+                  dispatch(updateSettingsLocal({ sidebar: { excludeFirstChatMustStart: checked } }))
+                  scheduleSave({ sidebar: { excludeFirstChatMustStart: checked } })
+                }}
+                aria-label="Require first chat exclusion substring at start"
               />
             </SettingsRow>
           </SettingsSection>

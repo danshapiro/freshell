@@ -14,6 +14,7 @@ export type JsonlMeta = {
   cwd?: string
   title?: string
   summary?: string
+  firstUserMessage?: string
   messageCount?: number
   gitBranch?: string
   isDirty?: boolean
@@ -203,6 +204,15 @@ type ParseSessionOptions = {
   contextTokens?: number
 }
 
+const FIRST_USER_MESSAGE_MAX_CHARS = 4000
+
+function normalizeFirstUserMessage(content: string): string | undefined {
+  const trimmed = content.trim()
+  if (!trimmed) return undefined
+  if (trimmed.length <= FIRST_USER_MESSAGE_MAX_CHARS) return trimmed
+  return trimmed.slice(0, FIRST_USER_MESSAGE_MAX_CHARS)
+}
+
 /** Parse session metadata from jsonl content (pure function for testing) */
 export function parseSessionContent(content: string, options: ParseSessionOptions = {}): JsonlMeta {
   const lines = content.split(/\r?\n/).filter(Boolean)
@@ -210,6 +220,7 @@ export function parseSessionContent(content: string, options: ParseSessionOption
   let cwd: string | undefined
   let title: string | undefined
   let summary: string | undefined
+  let firstUserMessage: string | undefined
   let gitBranch: string | undefined
   let isDirty: boolean | undefined
   let model: string | undefined
@@ -278,6 +289,18 @@ export function parseSessionContent(content: string, options: ParseSessionOption
           // Store up to 200 chars - UI truncates visually, tooltip shows full text
           title = extractTitleFromMessage(t, 200)
         }
+      }
+    }
+
+    if (!firstUserMessage) {
+      const rawUserMessage =
+        (obj?.role === 'user' && typeof obj?.content === 'string' ? obj.content : undefined) ||
+        (obj?.message?.role === 'user' && typeof obj?.message?.content === 'string'
+          ? obj.message.content
+          : undefined)
+      if (typeof rawUserMessage === 'string') {
+        const normalized = normalizeFirstUserMessage(rawUserMessage)
+        if (normalized) firstUserMessage = normalized
       }
     }
 
@@ -357,6 +380,7 @@ export function parseSessionContent(content: string, options: ParseSessionOption
     cwd,
     title,
     summary,
+    firstUserMessage,
     messageCount: lines.length,
     gitBranch,
     isDirty,

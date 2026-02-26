@@ -171,6 +171,8 @@ describe('Settings API Integration', () => {
       expect(res.body.safety).toHaveProperty('autoKillIdleMinutes')
       expect(res.body.sidebar).toHaveProperty('sortMode')
       expect(res.body.sidebar).toHaveProperty('showProjectBadges')
+      expect(res.body.sidebar).toHaveProperty('excludeFirstChatSubstrings')
+      expect(res.body.sidebar).toHaveProperty('excludeFirstChatMustStart')
       expect(res.body.sidebar).toHaveProperty('width')
       expect(res.body.sidebar).toHaveProperty('collapsed')
     })
@@ -378,6 +380,22 @@ describe('Settings API Integration', () => {
       expect(res.status).toBe(200)
       expect(res.body.terminal.fontSize).toBe(16) // Updated
       expect(res.body.terminal.scrollback).toBe(10000) // Preserved from previous patch
+    })
+
+    it('persists first-chat exclusion settings and normalizes substring values', async () => {
+      const res = await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({
+          sidebar: {
+            excludeFirstChatSubstrings: [' __AUTO__ ', '', '__AUTO__', 'canary'],
+            excludeFirstChatMustStart: true,
+          },
+        })
+
+      expect(res.status).toBe(200)
+      expect(res.body.sidebar.excludeFirstChatSubstrings).toEqual(['__AUTO__', 'canary'])
+      expect(res.body.sidebar.excludeFirstChatMustStart).toBe(true)
     })
 
     it('handles empty body', async () => {

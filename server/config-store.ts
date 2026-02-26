@@ -70,6 +70,8 @@ export type AppSettings = {
     showProjectBadges: boolean
     showSubagents: boolean
     showNoninteractiveSessions: boolean
+    excludeFirstChatSubstrings: string[]
+    excludeFirstChatMustStart: boolean
     width: number
     collapsed: boolean
   }
@@ -169,6 +171,8 @@ export const defaultSettings: AppSettings = {
     showProjectBadges: true,
     showSubagents: false,
     showNoninteractiveSessions: false,
+    excludeFirstChatSubstrings: [],
+    excludeFirstChatMustStart: false,
     width: 288,
     collapsed: false,
   },
@@ -383,6 +387,20 @@ async function readConfigFile(): Promise<{ config: UserConfig | null; error?: Co
 }
 
 function mergeSettings(base: AppSettings, patch: AppSettingsPatch): AppSettings {
+  const normalizeExcludeFirstChatSubstrings = (value: unknown): string[] => {
+    if (!Array.isArray(value)) return []
+    const seen = new Set<string>()
+    const out: string[] = []
+    for (const item of value) {
+      if (typeof item !== 'string') continue
+      const trimmed = item.trim()
+      if (!trimmed || seen.has(trimmed)) continue
+      seen.add(trimmed)
+      out.push(trimmed)
+    }
+    return out
+  }
+
   const baseLogging = base.logging ?? defaultSettings.logging
   const terminalPatch: Partial<AppSettings['terminal']> = patch.terminal ?? {}
   const terminalUpdates = {
@@ -408,7 +426,18 @@ function mergeSettings(base: AppSettings, patch: AppSettingsPatch): AppSettings 
     safety: { ...base.safety, ...(patch.safety || {}) },
     notifications: { ...base.notifications, ...(patch.notifications || {}) },
     panes: { ...base.panes, ...(patch.panes || {}) },
-    sidebar: { ...base.sidebar, ...(patch.sidebar || {}) },
+    sidebar: {
+      ...base.sidebar,
+      ...(patch.sidebar || {}),
+      excludeFirstChatSubstrings: normalizeExcludeFirstChatSubstrings(
+        (patch.sidebar && Object.prototype.hasOwnProperty.call(patch.sidebar, 'excludeFirstChatSubstrings'))
+          ? patch.sidebar.excludeFirstChatSubstrings
+          : base.sidebar.excludeFirstChatSubstrings
+      ),
+      excludeFirstChatMustStart: (patch.sidebar && Object.prototype.hasOwnProperty.call(patch.sidebar, 'excludeFirstChatMustStart'))
+        ? !!patch.sidebar.excludeFirstChatMustStart
+        : !!base.sidebar.excludeFirstChatMustStart,
+    },
     codingCli: {
       ...base.codingCli,
       ...(patch.codingCli || {}),
