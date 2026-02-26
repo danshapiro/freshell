@@ -196,6 +196,12 @@ function parseCodexTokenEnvelope(payload: any): {
   }
 }
 
+function isCodexSubagentSource(source: unknown): boolean {
+  if (!source || typeof source !== 'object') return false
+  const candidate = source as { subagent?: { thread_spawn?: unknown } }
+  return !!candidate.subagent?.thread_spawn
+}
+
 export function parseCodexSessionContent(content: string): ParsedSessionMeta {
   const lines = content.split(/\r?\n/).filter(Boolean)
   let sessionId: string | undefined
@@ -203,6 +209,7 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
   let title: string | undefined
   let summary: string | undefined
   let firstUserMessage: string | undefined
+  let isSubagent: boolean | undefined
   let isNonInteractive: boolean | undefined
   let gitBranch: string | undefined
   let isDirty: boolean | undefined
@@ -230,6 +237,9 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
       }
       if (isDirty === undefined && typeof payload?.git?.isDirty === 'boolean') {
         isDirty = payload.git.isDirty
+      }
+      if (isSubagent === undefined && isCodexSubagentSource(payload.source)) {
+        isSubagent = true
       }
       if (payload.source === 'exec') {
         isNonInteractive = true
@@ -285,6 +295,7 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
     summary,
     firstUserMessage,
     messageCount: lines.length,
+    isSubagent,
     isNonInteractive,
     gitBranch,
     isDirty,

@@ -415,7 +415,7 @@ export class CodingCliSessionIndexer {
       isDirty: meta.isDirty,
       tokenUsage: meta.tokenUsage,
       sourceFile: filePath,
-      isSubagent: isSubagentSession(filePath) || undefined,
+      isSubagent: meta.isSubagent || isSubagentSession(filePath) || undefined,
       isNonInteractive: meta.isNonInteractive || undefined,
     }
 

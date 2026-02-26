@@ -5,6 +5,28 @@ import { resetWsClientForTests } from '@/lib/ws-client'
 
 enableMapSet()
 
+if (typeof globalThis.window !== 'undefined') {
+  const storage = (globalThis as { localStorage?: unknown }).localStorage as {
+    getItem?: unknown
+    setItem?: unknown
+    removeItem?: unknown
+    clear?: unknown
+  } | undefined
+
+  if (
+    !storage ||
+    typeof storage.getItem !== 'function' ||
+    typeof storage.setItem !== 'function' ||
+    typeof storage.removeItem !== 'function' ||
+    typeof storage.clear !== 'function'
+  ) {
+    Object.defineProperty(globalThis, 'localStorage', {
+      configurable: true,
+      value: window.localStorage,
+    })
+  }
+}
+
 if (typeof globalThis.HTMLCanvasElement !== 'undefined') {
   if (typeof globalThis.HTMLCanvasElement.prototype.getContext === 'function') {
     Object.defineProperty(globalThis.HTMLCanvasElement.prototype, 'getContext', {

@@ -148,6 +148,7 @@ export interface AppSettings {
     sortMode: SidebarSortMode
     showProjectBadges: boolean
     showSubagents: boolean
+    ignoreCodexSubagentSessions: boolean
     showNoninteractiveSessions: boolean
     excludeFirstChatSubstrings: string[]
     excludeFirstChatMustStart: boolean

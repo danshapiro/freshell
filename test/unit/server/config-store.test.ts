@@ -497,6 +497,17 @@ describe('ConfigStore', () => {
 
       expect(updated.defaultCwd).toBe('/custom/path')
     })
+
+    it('can update codex subagent sidebar visibility setting', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      const updated = await store.patchSettings({
+        sidebar: { ignoreCodexSubagentSessions: false },
+      })
+
+      expect(updated.sidebar.ignoreCodexSubagentSessions).toBe(false)
+    })
   })
 
   describe('recent directories', () => {

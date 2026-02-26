@@ -53,6 +53,32 @@ describe('codex-provider', () => {
     expect(meta.messageCount).toBe(2)
   })
 
+  it('flags spawned subagent sessions from session_meta source', () => {
+    const content = [
+      JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          id: 'session-subagent',
+          cwd: '/project/a',
+          source: {
+            subagent: {
+              thread_spawn: {
+                parent_thread_id: 'session-parent',
+                depth: 1,
+                agent_nickname: 'Maple',
+                agent_role: 'explorer',
+              },
+            },
+          },
+        },
+      }),
+    ].join('\n')
+
+    const meta = parseCodexSessionContent(content)
+
+    expect(meta.isSubagent).toBe(true)
+  })
+
   it('does not include raw payload in normalized events', () => {
     const line = JSON.stringify({
       type: 'response_item',

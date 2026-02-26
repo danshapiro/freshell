@@ -705,6 +705,20 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               />
             </SettingsRow>
 
+            <SettingsRow
+              label="Ignore Codex subagent sessions"
+              description="Hide Codex spawned subagent sessions, even when subagent sessions are shown."
+            >
+              <Toggle
+                checked={settings.sidebar?.ignoreCodexSubagentSessions ?? true}
+                onChange={(checked) => {
+                  dispatch(updateSettingsLocal({ sidebar: { ignoreCodexSubagentSessions: checked } }))
+                  scheduleSave({ sidebar: { ignoreCodexSubagentSessions: checked } })
+                }}
+                aria-label="Ignore Codex subagent sessions"
+              />
+            </SettingsRow>
+
             <SettingsRow label="Show non-interactive sessions">
               <Toggle
                 checked={settings.sidebar?.showNoninteractiveSessions ?? false}

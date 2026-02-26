@@ -167,6 +167,7 @@ describe('SettingsView Component', () => {
       // Sidebar section
       expect(screen.getByText('Sort mode')).toBeInTheDocument()
       expect(screen.getByText('Show project badges')).toBeInTheDocument()
+      expect(screen.getByText('Ignore Codex subagent sessions')).toBeInTheDocument()
       expect(screen.getByText('Hide sessions by first chat')).toBeInTheDocument()
       expect(screen.getByText('First chat must start with match')).toBeInTheDocument()
 
@@ -769,6 +770,32 @@ describe('SettingsView Component', () => {
 
       expect(api.patch).toHaveBeenCalledWith('/api/settings', {
         sidebar: { excludeFirstChatMustStart: true },
+      })
+    })
+
+    it('toggles codex subagent ignore setting', async () => {
+      const store = createTestStore({
+        settings: {
+          ...defaultSettings,
+          sidebar: {
+            ...defaultSettings.sidebar,
+            ignoreCodexSubagentSessions: true,
+          },
+        },
+      })
+      renderWithStore(store)
+
+      const toggle = screen.getByRole('switch', { name: 'Ignore Codex subagent sessions' })
+      fireEvent.click(toggle)
+
+      expect(store.getState().settings.settings.sidebar.ignoreCodexSubagentSessions).toBe(false)
+
+      await act(async () => {
+        vi.advanceTimersByTime(500)
+      })
+
+      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
+        sidebar: { ignoreCodexSubagentSessions: false },
       })
     })
 
