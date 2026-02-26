@@ -694,4 +694,11 @@ describe('codex-provider', () => {
       expect(meta.title).toBe('Fix the authentication bug in the login form')
     })
   })
+
+  describe('getSessionRoots()', () => {
+    it('returns the sessions directory under homeDir', () => {
+      const roots = codexProvider.getSessionRoots()
+      expect(roots).toEqual([path.join(codexProvider.homeDir, 'sessions')])
+    })
+  })
 })

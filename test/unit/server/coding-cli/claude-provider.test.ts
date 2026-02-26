@@ -819,4 +819,11 @@ describe('claude provider cross-platform tests', () => {
       expect(meta.title).toBe('Fix the login bug')
     })
   })
+
+  describe('getSessionRoots()', () => {
+    it('returns the projects directory under homeDir', () => {
+      const roots = claudeProvider.getSessionRoots()
+      expect(roots).toEqual([path.join(claudeProvider.homeDir, 'projects')])
+    })
+  })
 })

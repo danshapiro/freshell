@@ -18,6 +18,7 @@ export interface CodingCliProvider {
   readonly homeDir: string
 
   getSessionGlob(): string
+  getSessionRoots(): string[]
   listSessionFiles(): Promise<string[]>
   parseSessionFile(content: string, filePath: string): Promise<ParsedSessionMeta>
   resolveProjectPath(filePath: string, meta: ParsedSessionMeta): Promise<string>

@@ -373,6 +373,10 @@ export const claudeProvider: CodingCliProvider = {
     return path.join(this.homeDir, 'projects', '**', '*.jsonl')
   },
 
+  getSessionRoots() {
+    return [path.join(this.homeDir, 'projects')]
+  },
+
   async listSessionFiles() {
     const projectsDir = path.join(this.homeDir, 'projects')
     let projectDirs: string[] = []

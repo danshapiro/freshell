@@ -97,13 +97,17 @@ type CachedSessionEntry = {
 export type SessionIndexerOptions = {
   debounceMs?: number
   throttleMs?: number
+  fullScanIntervalMs?: number
 }
 
 const DEFAULT_DEBOUNCE_MS = 2_000
 const DEFAULT_THROTTLE_MS = 5_000
+const DEFAULT_FULL_SCAN_INTERVAL_MS = 10 * 60 * 1000 // 10 minutes
 
 export class CodingCliSessionIndexer {
   private watcher: chokidar.FSWatcher | null = null
+  private rootWatcher: chokidar.FSWatcher | null = null
+  private fullScanTimer: NodeJS.Timeout | null = null
   private projects: ProjectGroup[] = []
   private onUpdateHandlers = new Set<(projects: ProjectGroup[]) => void>()
   private refreshTimer: NodeJS.Timeout | null = null
@@ -117,6 +121,7 @@ export class CodingCliSessionIndexer {
   private lastRefreshAt = 0
   private readonly debounceMs: number
   private readonly throttleMs: number
+  private readonly fullScanIntervalMs: number
   private knownSessionIds = new Set<string>()
   private seenSessionIds = new Map<string, number>()
   private onNewSessionHandlers = new Set<(session: CodingCliSession) => void>()
@@ -126,6 +131,8 @@ export class CodingCliSessionIndexer {
   constructor(private providers: CodingCliProvider[], options: SessionIndexerOptions = {}) {
     this.debounceMs = options.debounceMs ?? DEFAULT_DEBOUNCE_MS
     this.throttleMs = options.throttleMs ?? DEFAULT_THROTTLE_MS
+    this.fullScanIntervalMs = options.fullScanIntervalMs ??
+      Number(process.env.CODING_CLI_FULL_SCAN_INTERVAL_MS || DEFAULT_FULL_SCAN_INTERVAL_MS)
   }
 
   async start() {
@@ -153,13 +160,71 @@ export class CodingCliSessionIndexer {
       schedule()
     })
     this.watcher.on('error', (err) => logger.warn({ err }, 'Coding CLI watcher error'))
+
+    // Watch parent directories of provider roots for late directory creation/removal.
+    // When a provider root (e.g. ~/.codex/sessions) doesn't exist at startup, chokidar's
+    // glob watcher silently ignores it. This root watcher detects when the directory
+    // appears and triggers a full rescan.
+    this.startRootWatcher()
+
+    // Periodic safety full-scan to catch anything the file watchers might miss.
+    if (this.fullScanIntervalMs > 0) {
+      this.fullScanTimer = setInterval(() => {
+        this.needsFullScan = true
+        this.scheduleRefresh()
+      }, this.fullScanIntervalMs)
+    }
   }
 
   stop() {
     this.watcher?.close().catch(() => {})
     this.watcher = null
+    this.rootWatcher?.close().catch(() => {})
+    this.rootWatcher = null
     if (this.refreshTimer) clearTimeout(this.refreshTimer)
     this.refreshTimer = null
+    if (this.fullScanTimer) clearInterval(this.fullScanTimer)
+    this.fullScanTimer = null
+  }
+
+  private startRootWatcher() {
+    const rootSet = new Set<string>()
+    for (const provider of this.providers) {
+      for (const root of provider.getSessionRoots()) {
+        rootSet.add(normalizeFilePath(root))
+      }
+    }
+
+    if (rootSet.size === 0) return
+
+    // Watch the parent directory of each root so we detect when the root itself is created.
+    const parentDirs = new Set<string>()
+    for (const root of rootSet) {
+      parentDirs.add(path.dirname(root))
+    }
+
+    this.rootWatcher = chokidar.watch(Array.from(parentDirs), {
+      ignoreInitial: true,
+      depth: 0,
+    })
+
+    this.rootWatcher.on('addDir', (dirPath) => {
+      if (rootSet.has(normalizeFilePath(dirPath))) {
+        logger.info({ dirPath }, 'Provider session root created, scheduling full scan')
+        this.needsFullScan = true
+        this.scheduleRefresh()
+      }
+    })
+
+    this.rootWatcher.on('unlinkDir', (dirPath) => {
+      if (rootSet.has(normalizeFilePath(dirPath))) {
+        logger.info({ dirPath }, 'Provider session root removed, scheduling full scan')
+        this.needsFullScan = true
+        this.scheduleRefresh()
+      }
+    })
+
+    this.rootWatcher.on('error', (err) => logger.warn({ err }, 'Root watcher error'))
   }
 
   onUpdate(handler: (projects: ProjectGroup[]) => void): () => void {
