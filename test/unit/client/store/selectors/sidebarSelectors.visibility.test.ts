@@ -8,6 +8,7 @@ function createSessionItem(overrides: Partial<SidebarSessionItem>): SidebarSessi
     sessionId: 'test',
     provider: 'claude',
     title: 'Test Session',
+    hasTitle: true,
     timestamp: 1000,
     hasTab: false,
     isRunning: false,
@@ -20,6 +21,7 @@ describe('filterSessionItemsByVisibility', () => {
     excludeFirstChatSubstrings: [],
     excludeFirstChatMustStart: false,
     ignoreCodexSubagentSessions: true,
+    hideEmptySessions: false,
   }
 
   describe('subagent filtering', () => {
@@ -217,6 +219,77 @@ describe('filterSessionItemsByVisibility', () => {
       })
 
       expect(result.map((i) => i.id)).toEqual(['1', '2'])
+    })
+  })
+
+  describe('empty session filtering', () => {
+    it('hides sessions without a title when hideEmptySessions is true', () => {
+      const items = [
+        createSessionItem({ id: '1', title: 'a7f3b2c1', hasTitle: false }),
+        createSessionItem({ id: '2', title: 'Real conversation', hasTitle: true }),
+      ]
+
+      const result = filterSessionItemsByVisibility(items, {
+        ...baseSettings,
+        showSubagents: true,
+        showNoninteractiveSessions: true,
+        hideEmptySessions: true,
+      })
+
+      expect(result.map((i) => i.id)).toEqual(['2'])
+    })
+
+    it('shows empty sessions when hideEmptySessions is false', () => {
+      const items = [
+        createSessionItem({ id: '1', title: 'a7f3b2c1', hasTitle: false }),
+        createSessionItem({ id: '2', title: 'Real conversation', hasTitle: true }),
+      ]
+
+      const result = filterSessionItemsByVisibility(items, {
+        ...baseSettings,
+        showSubagents: true,
+        showNoninteractiveSessions: true,
+        hideEmptySessions: false,
+      })
+
+      expect(result.map((i) => i.id)).toEqual(['1', '2'])
+    })
+
+    it('hides sessions with system-only firstUserMessage and no title', () => {
+      const items = [
+        createSessionItem({
+          id: '1',
+          title: '63f567a2',
+          hasTitle: false,
+          firstUserMessage: '<local-command-caveat>system content</local-command-caveat>',
+        }),
+        createSessionItem({ id: '2', title: 'Real session', hasTitle: true, firstUserMessage: 'Hello' }),
+      ]
+
+      const result = filterSessionItemsByVisibility(items, {
+        ...baseSettings,
+        showSubagents: true,
+        showNoninteractiveSessions: true,
+        hideEmptySessions: true,
+      })
+
+      expect(result.map((i) => i.id)).toEqual(['2'])
+    })
+
+    it('keeps sessions with a real title even without firstUserMessage', () => {
+      const items = [
+        createSessionItem({ id: '1', title: 'Manually titled', hasTitle: true, firstUserMessage: undefined }),
+        createSessionItem({ id: '2', title: 'deadbeef', hasTitle: false, firstUserMessage: undefined }),
+      ]
+
+      const result = filterSessionItemsByVisibility(items, {
+        ...baseSettings,
+        showSubagents: true,
+        showNoninteractiveSessions: true,
+        hideEmptySessions: true,
+      })
+
+      expect(result.map((i) => i.id)).toEqual(['1'])
     })
   })
 })

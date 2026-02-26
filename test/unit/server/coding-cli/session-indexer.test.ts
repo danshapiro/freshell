@@ -1050,6 +1050,111 @@ describe('CodingCliSessionIndexer', () => {
     })
   })
 
+  describe('urgent refresh for titleless sessions', () => {
+    it('uses shorter delay when a dirty file has a cached session with no title', async () => {
+      const fileA = path.join(tempDir, 'session-a.jsonl')
+      // Start with no title (simulates brand new Claude session)
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
+
+      const provider = makeProvider([fileA])
+      const indexer = new CodingCliSessionIndexer([provider], {
+        debounceMs: 2000,
+        throttleMs: 5000,
+        fullScanIntervalMs: 0,
+      })
+
+      // Initial refresh populates cache with titleless session
+      await indexer.refresh()
+      const projects = indexer.getProjects()
+      expect(projects).toHaveLength(1)
+      expect(projects[0].sessions[0].title).toBeUndefined()
+
+      const handler = vi.fn()
+      indexer.onUpdate(handler)
+
+      // Simulate file change: session gets a title (user typed first message)
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Hello world' }) + '\n')
+      ;(indexer as any).markDirty(fileA)
+      indexer.scheduleRefresh()
+
+      // Urgent refresh should fire within the urgent throttle window (~1s),
+      // not after the normal 2-5s debounce/throttle window
+      await vi.waitFor(
+        () => { expect(handler).toHaveBeenCalledTimes(1) },
+        { timeout: 2000, interval: 50 },
+      )
+
+      indexer.stop()
+    })
+
+    it('does not throttle urgent refreshes when throttleMs is 0', async () => {
+      const fileA = path.join(tempDir, 'session-a.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
+
+      const provider = makeProvider([fileA])
+      const indexer = new CodingCliSessionIndexer([provider], {
+        debounceMs: 50,
+        throttleMs: 0,
+        fullScanIntervalMs: 0,
+      })
+
+      await indexer.refresh()
+      expect(indexer.getProjects()[0].sessions[0].title).toBeUndefined()
+
+      const handler = vi.fn()
+      indexer.onUpdate(handler)
+
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Hello' }) + '\n')
+      ;(indexer as any).markDirty(fileA)
+      indexer.scheduleRefresh()
+
+      // With throttleMs: 0, urgent refresh should fire at the URGENT_REFRESH_MS
+      // delay (300ms) without any additional throttle
+      await vi.waitFor(
+        () => { expect(handler).toHaveBeenCalledTimes(1) },
+        { timeout: 800, interval: 50 },
+      )
+
+      indexer.stop()
+    })
+
+    it('uses normal delay when dirty files all have titles already', async () => {
+      const fileA = path.join(tempDir, 'session-a.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Has title' }) + '\n')
+
+      const provider = makeProvider([fileA])
+      // Use short debounce so the test doesn't take too long, but long enough
+      // to prove it doesn't fire as urgently as the titleless case
+      const indexer = new CodingCliSessionIndexer([provider], {
+        debounceMs: 800,
+        throttleMs: 800,
+        fullScanIntervalMs: 0,
+      })
+
+      await indexer.refresh()
+
+      const handler = vi.fn()
+      indexer.onUpdate(handler)
+
+      // Simulate file change for a session that already has a title
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Updated title' }) + '\n')
+      ;(indexer as any).markDirty(fileA)
+      indexer.scheduleRefresh()
+
+      // Should NOT have fired within 300ms (no urgency)
+      await new Promise((r) => setTimeout(r, 300))
+      expect(handler).not.toHaveBeenCalled()
+
+      // Should fire after the normal debounce period
+      await vi.waitFor(
+        () => { expect(handler).toHaveBeenCalledTimes(1) },
+        { timeout: 2000, interval: 50 },
+      )
+
+      indexer.stop()
+    })
+  })
+
   it('groups worktree sessions under the parent repo', async () => {
     // Set up a real git repo structure in tempDir
     const repoDir = path.join(tempDir, 'repo')

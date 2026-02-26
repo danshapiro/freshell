@@ -730,6 +730,20 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
             </SettingsRow>
 
             <SettingsRow
+              label="Hide empty sessions"
+              description="Hide sessions that have no messages yet (e.g. newly started Claude Code sessions)."
+            >
+              <Toggle
+                checked={settings.sidebar?.hideEmptySessions ?? true}
+                onChange={(checked) => {
+                  dispatch(updateSettingsLocal({ sidebar: { hideEmptySessions: checked } }))
+                  scheduleSave({ sidebar: { hideEmptySessions: checked } })
+                }}
+                aria-label="Hide empty sessions"
+              />
+            </SettingsRow>
+
+            <SettingsRow
               label="Hide sessions by first chat"
               description="One substring per line. Matching sessions are hidden from the sidebar."
             >

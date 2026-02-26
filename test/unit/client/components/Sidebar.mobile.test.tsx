@@ -95,6 +95,7 @@ function createTestStore(options?: { projects?: ProjectGroup[] }) {
             ...defaultSettings.sidebar,
             sortMode: 'activity' as const,
             showProjectBadges: true,
+            hideEmptySessions: false,
           },
         },
         loaded: true,

@@ -133,6 +133,7 @@ function createStore(options: {
             sortMode: 'activity',
             showProjectBadges: true,
             showSubagents: options.showSubagents ?? defaultSettings.sidebar.showSubagents,
+            hideEmptySessions: false,
             excludeFirstChatSubstrings: options.excludeFirstChatSubstrings ?? defaultSettings.sidebar.excludeFirstChatSubstrings,
             excludeFirstChatMustStart: options.excludeFirstChatMustStart ?? defaultSettings.sidebar.excludeFirstChatMustStart,
             ignoreCodexSubagentSessions: options.ignoreCodexSubagentSessions ?? defaultSettings.sidebar.ignoreCodexSubagentSessions,

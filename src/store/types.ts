@@ -150,6 +150,7 @@ export interface AppSettings {
     showSubagents: boolean
     ignoreCodexSubagentSessions: boolean
     showNoninteractiveSessions: boolean
+    hideEmptySessions: boolean
     excludeFirstChatSubstrings: string[]
     excludeFirstChatMustStart: boolean
     width: number // pixels, default 288 (equivalent to w-72)

@@ -34,6 +34,7 @@ export const defaultSettings: AppSettings = {
     showSubagents: false,
     ignoreCodexSubagentSessions: true,
     showNoninteractiveSessions: false,
+    hideEmptySessions: true,
     excludeFirstChatSubstrings: [],
     excludeFirstChatMustStart: false,
     width: 288,

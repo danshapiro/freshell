@@ -140,6 +140,7 @@ function createTestStore(options?: {
             ...defaultSettings.sidebar,
             sortMode: options?.sortMode ?? 'activity',
             showProjectBadges: options?.showProjectBadges ?? true,
+            hideEmptySessions: false,
           },
         },
         loaded: true,

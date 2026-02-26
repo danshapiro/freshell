@@ -103,6 +103,8 @@ export type SessionIndexerOptions = {
 const DEFAULT_DEBOUNCE_MS = 2_000
 const DEFAULT_THROTTLE_MS = 5_000
 const DEFAULT_FULL_SCAN_INTERVAL_MS = 10 * 60 * 1000 // 10 minutes
+const URGENT_REFRESH_MS = 300 // Fast refresh when a titleless session might have just gained content
+const URGENT_THROTTLE_MS = 1000 // Minimum spacing between urgent refreshes to cap worst-case frequency
 
 export class CodingCliSessionIndexer {
   private watcher: chokidar.FSWatcher | null = null
@@ -127,6 +129,7 @@ export class CodingCliSessionIndexer {
   private onNewSessionHandlers = new Set<(session: CodingCliSession) => void>()
   private initialized = false
   private sessionKeyToFilePath = new Map<string, string>()
+  private urgentRefreshNeeded = false
 
   constructor(private providers: CodingCliProvider[], options: SessionIndexerOptions = {}) {
     this.debounceMs = options.debounceMs ?? DEFAULT_DEBOUNCE_MS
@@ -267,6 +270,14 @@ export class CodingCliSessionIndexer {
     const normalized = normalizeFilePath(filePath)
     this.deletedFiles.delete(normalized)
     this.dirtyFiles.add(normalized)
+
+    // If the cached session has no title, this change might be the first user
+    // message arriving. Flag for urgent refresh so the session appears in the
+    // sidebar without the normal debounce/throttle delay.
+    const cached = this.fileCache.get(normalized)
+    if (cached?.baseSession && !cached.baseSession.title) {
+      this.urgentRefreshNeeded = true
+    }
   }
 
   private markDeleted(filePath: string) {
@@ -430,19 +441,26 @@ export class CodingCliSessionIndexer {
 
   scheduleRefresh() {
     if (this.refreshTimer) clearTimeout(this.refreshTimer)
+    const urgent = this.urgentRefreshNeeded
+    this.urgentRefreshNeeded = false
     const elapsed = Date.now() - this.lastRefreshAt
-    const delay = Math.max(this.debounceMs, this.throttleMs - elapsed)
+    const delay = urgent ? URGENT_REFRESH_MS : Math.max(this.debounceMs, this.throttleMs - elapsed)
     this.refreshTimer = setTimeout(() => {
       this.refreshTimer = null
       // Re-check throttle at fire-time: an in-flight refresh may have completed
       // since scheduling, updating lastRefreshAt. Without this, a timer scheduled
       // during an in-flight refresh would fire too soon after it completes.
+      // Urgent refreshes use a shorter throttle floor to stay responsive while
+      // capping worst-case frequency for sessions that stay titleless under load.
+      const effectiveThrottle = urgent
+        ? (this.throttleMs > 0 ? Math.min(URGENT_THROTTLE_MS, this.throttleMs) : 0)
+        : this.throttleMs
       const fireElapsed = Date.now() - this.lastRefreshAt
-      if (this.throttleMs > 0 && fireElapsed < this.throttleMs) {
+      if (effectiveThrottle > 0 && fireElapsed < effectiveThrottle) {
         this.refreshTimer = setTimeout(() => {
           this.refreshTimer = null
           this.refresh().catch((err) => logger.warn({ err }, 'Refresh failed'))
-        }, this.throttleMs - fireElapsed)
+        }, effectiveThrottle - fireElapsed)
         return
       }
       this.refresh().catch((err) => logger.warn({ err }, 'Refresh failed'))
