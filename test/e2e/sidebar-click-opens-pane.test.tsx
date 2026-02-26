@@ -79,7 +79,6 @@ function createStore(options: {
   excludeFirstChatSubstrings?: string[]
   excludeFirstChatMustStart?: boolean
   showSubagents?: boolean
-  ignoreCodexSubagentSessions?: boolean
 }) {
   const projects = options.projects.map((project) => ({
     ...project,
@@ -136,7 +135,6 @@ function createStore(options: {
             hideEmptySessions: false,
             excludeFirstChatSubstrings: options.excludeFirstChatSubstrings ?? defaultSettings.sidebar.excludeFirstChatSubstrings,
             excludeFirstChatMustStart: options.excludeFirstChatMustStart ?? defaultSettings.sidebar.excludeFirstChatMustStart,
-            ignoreCodexSubagentSessions: options.ignoreCodexSubagentSessions ?? defaultSettings.sidebar.ignoreCodexSubagentSessions,
           },
         },
         loaded: true,

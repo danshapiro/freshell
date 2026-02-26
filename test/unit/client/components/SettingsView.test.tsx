@@ -773,31 +773,6 @@ describe('SettingsView Component', () => {
       })
     })
 
-    it('toggles codex subagent ignore setting', async () => {
-      const store = createTestStore({
-        settings: {
-          ...defaultSettings,
-          sidebar: {
-            ...defaultSettings.sidebar,
-            ignoreCodexSubagentSessions: true,
-          },
-        },
-      })
-      renderWithStore(store)
-
-      const toggle = screen.getByRole('switch', { name: 'Ignore Codex subagent sessions' })
-      fireEvent.click(toggle)
-
-      expect(store.getState().settings.settings.sidebar.ignoreCodexSubagentSessions).toBe(false)
-
-      await act(async () => {
-        vi.advanceTimersByTime(500)
-      })
-
-      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
-        sidebar: { ignoreCodexSubagentSessions: false },
-      })
-    })
 
     it('toggles notification sound', async () => {
       const store = createTestStore({

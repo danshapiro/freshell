@@ -32,7 +32,6 @@ export const defaultSettings: AppSettings = {
     sortMode: 'recency-pinned',
     showProjectBadges: true,
     showSubagents: false,
-    ignoreCodexSubagentSessions: true,
     showNoninteractiveSessions: false,
     hideEmptySessions: true,
     excludeFirstChatSubstrings: [],
@@ -121,7 +120,6 @@ export function mergeSettings(base: AppSettings, patch: DeepPartial<AppSettings>
     sidebar: {
       ...merged.sidebar,
       sortMode: migrateSortMode(merged.sidebar?.sortMode),
-      ignoreCodexSubagentSessions: merged.sidebar?.ignoreCodexSubagentSessions ?? true,
       excludeFirstChatSubstrings: normalizeTrimmedStringList(merged.sidebar?.excludeFirstChatSubstrings),
       excludeFirstChatMustStart: !!merged.sidebar?.excludeFirstChatMustStart,
     },

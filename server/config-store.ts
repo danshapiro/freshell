@@ -70,7 +70,6 @@ export type AppSettings = {
     sortMode: 'recency' | 'recency-pinned' | 'activity' | 'project'
     showProjectBadges: boolean
     showSubagents: boolean
-    ignoreCodexSubagentSessions: boolean
     showNoninteractiveSessions: boolean
     hideEmptySessions: boolean
     excludeFirstChatSubstrings: string[]
@@ -173,7 +172,6 @@ export const defaultSettings: AppSettings = {
     sortMode: 'activity',
     showProjectBadges: true,
     showSubagents: false,
-    ignoreCodexSubagentSessions: true,
     showNoninteractiveSessions: false,
     hideEmptySessions: true,
     excludeFirstChatSubstrings: [],

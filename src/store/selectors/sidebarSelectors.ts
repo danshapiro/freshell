@@ -38,7 +38,6 @@ const selectSessionActivityForSort = (state: RootState) => {
   return state.sessionActivity?.sessions || EMPTY_ACTIVITY
 }
 const selectShowSubagents = (state: RootState) => state.settings.settings.sidebar?.showSubagents ?? false
-const selectIgnoreCodexSubagentSessions = (state: RootState) => state.settings.settings.sidebar?.ignoreCodexSubagentSessions ?? true
 const selectShowNoninteractiveSessions = (state: RootState) => state.settings.settings.sidebar?.showNoninteractiveSessions ?? false
 const selectHideEmptySessions = (state: RootState) => state.settings.settings.sidebar?.hideEmptySessions ?? true
 const selectExcludeFirstChatSubstrings = (state: RootState) => state.settings.settings.sidebar?.excludeFirstChatSubstrings ?? EMPTY_STRINGS
@@ -141,7 +140,6 @@ function filterSessionItems(items: SidebarSessionItem[], filter: string): Sideba
 
 export interface VisibilitySettings {
   showSubagents: boolean
-  ignoreCodexSubagentSessions: boolean
   showNoninteractiveSessions: boolean
   hideEmptySessions: boolean
   excludeFirstChatSubstrings: string[]
@@ -171,7 +169,6 @@ export function filterSessionItemsByVisibility(
 
   return items.filter((item) => {
     if (!settings.showSubagents && item.isSubagent) return false
-    if (settings.ignoreCodexSubagentSessions && item.provider === 'codex' && item.isSubagent) return false
     if (!settings.showNoninteractiveSessions && item.isNonInteractive) return false
     if (settings.hideEmptySessions && !item.hasTitle) return false
     if (isExcludedByFirstUserMessage(item.firstUserMessage, exclusions, settings.excludeFirstChatMustStart)) return false
@@ -249,7 +246,6 @@ export const makeSelectSortedSessionItems = () =>
       selectSessionActivityForSort,
       selectSortMode,
       selectShowSubagents,
-      selectIgnoreCodexSubagentSessions,
       selectShowNoninteractiveSessions,
       selectHideEmptySessions,
       selectExcludeFirstChatSubstrings,
@@ -264,7 +260,6 @@ export const makeSelectSortedSessionItems = () =>
       sessionActivity,
       sortMode,
       showSubagents,
-      ignoreCodexSubagentSessions,
       showNoninteractiveSessions,
       hideEmptySessions,
       excludeFirstChatSubstrings,
@@ -275,7 +270,6 @@ export const makeSelectSortedSessionItems = () =>
       const items = buildSessionItems(projects, tabs, panes, terminals, sessionActivity)
       const visible = filterSessionItemsByVisibility(items, {
         showSubagents,
-        ignoreCodexSubagentSessions,
         showNoninteractiveSessions,
         hideEmptySessions,
         excludeFirstChatSubstrings,

@@ -20,7 +20,6 @@ describe('filterSessionItemsByVisibility', () => {
   const baseSettings = {
     excludeFirstChatSubstrings: [],
     excludeFirstChatMustStart: false,
-    ignoreCodexSubagentSessions: true,
     hideEmptySessions: false,
   }
 
@@ -122,11 +121,12 @@ describe('filterSessionItemsByVisibility', () => {
     })
   })
 
-  describe('codex subagent filtering', () => {
-    it('hides codex subagent sessions when ignore setting is enabled', () => {
+  describe('subagent filtering treats all providers equally', () => {
+    it('shows subagents from all providers when showSubagents is true', () => {
       const items = [
         createSessionItem({ id: '1', provider: 'codex', isSubagent: true }),
         createSessionItem({ id: '2', provider: 'claude', isSubagent: true }),
+        createSessionItem({ id: '3', provider: 'claude' }),
       ]
 
       const result = filterSessionItemsByVisibility(items, {
@@ -135,23 +135,23 @@ describe('filterSessionItemsByVisibility', () => {
         ...baseSettings,
       })
 
-      expect(result.map((i) => i.id)).toEqual(['2'])
+      expect(result.map((i) => i.id)).toEqual(['1', '2', '3'])
     })
 
-    it('shows codex subagent sessions when ignore setting is disabled', () => {
+    it('hides subagents from all providers when showSubagents is false', () => {
       const items = [
         createSessionItem({ id: '1', provider: 'codex', isSubagent: true }),
         createSessionItem({ id: '2', provider: 'claude', isSubagent: true }),
+        createSessionItem({ id: '3', provider: 'claude' }),
       ]
 
       const result = filterSessionItemsByVisibility(items, {
-        showSubagents: true,
+        showSubagents: false,
         showNoninteractiveSessions: true,
         ...baseSettings,
-        ignoreCodexSubagentSessions: false,
       })
 
-      expect(result.map((i) => i.id)).toEqual(['1', '2'])
+      expect(result.map((i) => i.id)).toEqual(['3'])
     })
   })
 
