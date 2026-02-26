@@ -101,6 +101,61 @@ class MockResizeObserver {
   unobserve = vi.fn()
 }
 
+function ensureLocalStorageApiForTest() {
+  const storage = globalThis.localStorage as Partial<Storage> | undefined
+  if (
+    storage &&
+    typeof storage.getItem === 'function' &&
+    typeof storage.setItem === 'function' &&
+    typeof storage.removeItem === 'function' &&
+    typeof storage.clear === 'function' &&
+    typeof storage.key === 'function'
+  ) {
+    return
+  }
+
+  const backing = new Map<string, string>()
+  const memoryStorage: Storage = {
+    get length() {
+      return backing.size
+    },
+    clear() {
+      backing.clear()
+    },
+    getItem(key: string) {
+      return backing.has(key) ? backing.get(key)! : null
+    },
+    key(index: number) {
+      return Array.from(backing.keys())[index] ?? null
+    },
+    removeItem(key: string) {
+      backing.delete(key)
+    },
+    setItem(key: string, value: string) {
+      backing.set(key, String(value))
+    },
+  }
+
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: memoryStorage,
+  })
+}
+
+function clearLocalStorageForTest() {
+  ensureLocalStorageApiForTest()
+  const storage = globalThis.localStorage as Storage | undefined
+  if (!storage) return
+  storage.clear()
+}
+
+function setLocalStorageItemForTest(key: string, value: string) {
+  ensureLocalStorageApiForTest()
+  const storage = globalThis.localStorage as Storage | undefined
+  if (!storage) return
+  storage.setItem(key, value)
+}
+
 describe('TerminalView lifecycle updates', () => {
   let messageHandler: ((msg: any) => void) | null = null
   let reconnectHandler: (() => void) | null = null
@@ -108,7 +163,7 @@ describe('TerminalView lifecycle updates', () => {
   let cancelAnimationFrameSpy: ReturnType<typeof vi.spyOn> | null = null
 
   beforeEach(() => {
-    localStorage.clear()
+    clearLocalStorageForTest()
     __resetTerminalCursorCacheForTests()
     wsMocks.send.mockClear()
     terminalThemeMocks.getTerminalTheme.mockReset()
@@ -138,7 +193,7 @@ describe('TerminalView lifecycle updates', () => {
     cleanup()
     vi.useRealTimers()
     vi.unstubAllGlobals()
-    localStorage.clear()
+    clearLocalStorageForTest()
     __resetTerminalCursorCacheForTests()
     requestAnimationFrameSpy?.mockRestore()
     cancelAnimationFrameSpy?.mockRestore()
@@ -1851,7 +1906,7 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     it('uses max(persisted cursor, in-memory sequence) for reconnect attach requests', async () => {
-      localStorage.setItem(TERMINAL_CURSOR_STORAGE_KEY, JSON.stringify({
+      setLocalStorageItemForTest(TERMINAL_CURSOR_STORAGE_KEY, JSON.stringify({
         'term-v2-max-cursor': {
           seq: 8,
           updatedAt: Date.now(),
@@ -1875,7 +1930,7 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     it('keeps reconnect attach on high-water cursor when reconnect fires during remount hydration', async () => {
-      localStorage.setItem(TERMINAL_CURSOR_STORAGE_KEY, JSON.stringify({
+      setLocalStorageItemForTest(TERMINAL_CURSOR_STORAGE_KEY, JSON.stringify({
         'term-v2-reconnect-during-hydration': {
           seq: 11,
           updatedAt: Date.now(),
@@ -1918,7 +1973,7 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     it('keeps viewport replay output when reconnect attach starts before the viewport replay arrives', async () => {
-      localStorage.setItem(TERMINAL_CURSOR_STORAGE_KEY, JSON.stringify({
+      setLocalStorageItemForTest(TERMINAL_CURSOR_STORAGE_KEY, JSON.stringify({
         'term-v2-overlapping-attach-ready': {
           seq: 12,
           updatedAt: Date.now(),
@@ -1979,7 +2034,7 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     it('preserves persisted high-water when a hydration replay starts at sequence 1', async () => {
-      localStorage.setItem(TERMINAL_CURSOR_STORAGE_KEY, JSON.stringify({
+      setLocalStorageItemForTest(TERMINAL_CURSOR_STORAGE_KEY, JSON.stringify({
         'term-v2-seq-reset': {
           seq: 12,
           updatedAt: Date.now(),
@@ -2016,7 +2071,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(writes).not.toContain('overlap')
     })
 
-    it('suppresses replay_window_exceeded banner during viewport_hydrate attach generation', async () => {
+    it('renders replay_window_exceeded banner during viewport_hydrate attach generation', async () => {
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',
         terminalId: 'term-hydrate-gap',
@@ -2038,7 +2093,7 @@ describe('TerminalView lifecycle updates', () => {
         attachRequestId: attach!.attachRequestId,
       } as any)
 
-      expect(term.writeln).not.toHaveBeenCalled()
+      expect(term.writeln).toHaveBeenCalledWith(expect.stringContaining('Output gap 1-50: reconnect window exceeded'))
 
       wsMocks.send.mockClear()
       reconnectHandler?.()
@@ -2050,7 +2105,7 @@ describe('TerminalView lifecycle updates', () => {
       }))
     })
 
-    it('suppresses replay_window_exceeded banner for bootstrap keepalive attach generation (sinceSeq=0)', async () => {
+    it('renders replay_window_exceeded banner for bootstrap keepalive attach generation (sinceSeq=0)', async () => {
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',
         terminalId: 'term-bootstrap-gap',
@@ -2074,7 +2129,7 @@ describe('TerminalView lifecycle updates', () => {
         attachRequestId: attach!.attachRequestId,
       } as any)
 
-      expect(term.writeln).not.toHaveBeenCalled()
+      expect(term.writeln).toHaveBeenCalledWith(expect.stringContaining('Output gap 1-402944: reconnect window exceeded'))
     })
 
     it('renders terminal.output.gap marker and advances sinceSeq for subsequent attach', async () => {
@@ -2150,7 +2205,7 @@ describe('TerminalView lifecycle updates', () => {
         messageHandler!({ type: 'terminal.output', terminalId, seqStart: 13, seqEnd: 13, data: 'LIVE' })
       })
 
-      expect(term.writeln).not.toHaveBeenCalled()
+      expect(term.writeln).toHaveBeenCalledWith(expect.stringContaining('Output gap 1-8: reconnect window exceeded'))
       const writes = term.write.mock.calls.map(([data]: [string]) => String(data)).join('')
       expect(writes).toContain('TAIL')
       expect(writes).toContain('LIVE')

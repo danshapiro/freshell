@@ -33,12 +33,13 @@ function createMockWs(overrides: Record<string, unknown> = {}) {
 }
 
 class FakeBrokerRegistry extends EventEmitter {
-  private records = new Map<string, { terminalId: string; buffer: { snapshot: () => string } }>()
+  private records = new Map<string, { terminalId: string; mode: string; buffer: { snapshot: () => string } }>()
   private replayRingMaxChars: number | undefined
 
-  createTerminal(terminalId: string) {
+  createTerminal(terminalId: string, mode = 'shell') {
     this.records.set(terminalId, {
       terminalId,
+      mode,
       buffer: { snapshot: () => '' },
     })
   }
@@ -57,6 +58,10 @@ class FakeBrokerRegistry extends EventEmitter {
 
   getReplayRingMaxChars() {
     return this.replayRingMaxChars
+  }
+
+  get(terminalId: string) {
+    return this.records.get(terminalId)
   }
 }
 
@@ -713,6 +718,37 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
 
     const wsReplay = createMockWs()
     await broker.attach(wsReplay as any, 'term-replay-budget', 0)
+
+    const payloads = wsReplay.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .filter((payload): payload is Record<string, any> => !!payload && typeof payload === 'object')
+
+    expect(payloads.some((payload) =>
+      payload.type === 'terminal.output.gap' &&
+      payload.reason === 'replay_window_exceeded'
+    )).toBe(false)
+    expect(payloads.some((payload) => payload.type === 'terminal.output')).toBe(true)
+
+    broker.close()
+  })
+
+  it('enforces a larger replay floor for coding-cli terminals to reduce history loss on attach', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(8)
+    const perfSpy = vi.fn()
+    const broker = new TerminalStreamBroker(registry as any, perfSpy)
+    registry.createTerminal('term-coding-floor', 'codex')
+
+    const wsSeed = createMockWs()
+    await broker.attach(wsSeed as any, 'term-coding-floor', 0)
+    registry.emit('terminal.output.raw', {
+      terminalId: 'term-coding-floor',
+      data: 'x'.repeat(96 * 1024),
+      at: Date.now(),
+    })
+
+    const wsReplay = createMockWs()
+    await broker.attach(wsReplay as any, 'term-coding-floor', 0)
 
     const payloads = wsReplay.send.mock.calls
       .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))

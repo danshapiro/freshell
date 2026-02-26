@@ -59,12 +59,16 @@ function buildSessionItems(
   sessionActivity: Record<string, number>
 ): SidebarSessionItem[] {
   const items: SidebarSessionItem[] = []
-  const runningSessionMap = new Map<string, string>()
+  const runningSessionMap = new Map<string, { terminalId: string; createdAt: number }>()
   const tabSessionMap = new Map<string, { hasTab: boolean }>()
 
   for (const terminal of terminals || []) {
     if (terminal.mode && terminal.mode !== 'shell' && terminal.status === 'running' && terminal.resumeSessionId) {
-      runningSessionMap.set(`${terminal.mode}:${terminal.resumeSessionId}`, terminal.terminalId)
+      const sessionKey = `${terminal.mode}:${terminal.resumeSessionId}`
+      const existing = runningSessionMap.get(sessionKey)
+      if (!existing || terminal.createdAt < existing.createdAt) {
+        runningSessionMap.set(sessionKey, { terminalId: terminal.terminalId, createdAt: terminal.createdAt })
+      }
     }
   }
 
@@ -97,7 +101,8 @@ function buildSessionItems(
     for (const session of project.sessions || []) {
       const provider = session.provider || 'claude'
       const key = `${provider}:${session.sessionId}`
-      const runningTerminalId = runningSessionMap.get(key)
+      const runningTerminal = runningSessionMap.get(key)
+      const runningTerminalId = runningTerminal?.terminalId
       const tabInfo = tabSessionMap.get(key)
       const ratchetedActivity = sessionActivity[key]
       const hasTitle = !!session.title

@@ -15,6 +15,9 @@ import {
 import type { BrokerClientAttachment, BrokerTerminalState } from './types.js'
 
 const log = logger.child({ component: 'terminal-stream-broker' })
+const CODING_CLI_MIN_REPLAY_RING_MAX_BYTES = Number(
+  process.env.CODING_CLI_MIN_REPLAY_RING_MAX_BYTES || 8 * 1024 * 1024,
+)
 
 type CreatedEnvelope = {
   requestId: string
@@ -245,7 +248,7 @@ export class TerminalStreamBroker {
   }
 
   private getOrCreateTerminalState(terminalId: string): BrokerTerminalState {
-    const replayRingMaxBytes = this.resolveReplayRingMaxBytes()
+    const replayRingMaxBytes = this.resolveReplayRingMaxBytes(terminalId)
     let state = this.terminals.get(terminalId)
     if (!state) {
       state = {
@@ -259,7 +262,7 @@ export class TerminalStreamBroker {
     return state
   }
 
-  private resolveReplayRingMaxBytes(): number | undefined {
+  private resolveReplayRingMaxBytes(terminalId: string): number | undefined {
     // Some tests inject lightweight registry doubles that may omit this method.
     // Fall back to ReplayRing defaults when no budget provider is available.
     const getReplayRingMaxChars = (
@@ -272,10 +275,24 @@ export class TerminalStreamBroker {
     // TerminalRegistry clamp is character-based; reusing the same numeric
     // budget as bytes keeps replay retention conservative.
     const value = getReplayRingMaxChars.call(this.registry)
-    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
-      return undefined
+    let replayBudget = typeof value === 'number' && Number.isFinite(value) && value > 0
+      ? Math.floor(value)
+      : undefined
+
+    const getRecord = (
+      this.registry as Partial<{ get: (id: string) => { mode?: string } | undefined }>
+    ).get
+    const terminalRecord = typeof getRecord === 'function' ? getRecord.call(this.registry, terminalId) : undefined
+    const isCodingCliTerminal = terminalRecord?.mode && terminalRecord.mode !== 'shell'
+    const codingCliFloor = Number.isFinite(CODING_CLI_MIN_REPLAY_RING_MAX_BYTES) && CODING_CLI_MIN_REPLAY_RING_MAX_BYTES > 0
+      ? Math.floor(CODING_CLI_MIN_REPLAY_RING_MAX_BYTES)
+      : undefined
+
+    if (isCodingCliTerminal && codingCliFloor) {
+      replayBudget = Math.max(replayBudget ?? 0, codingCliFloor)
     }
-    return Math.floor(value)
+
+    return replayBudget
   }
 
   private getOrCreateAttachment(
