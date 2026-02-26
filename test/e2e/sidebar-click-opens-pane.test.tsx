@@ -2,7 +2,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
-import { createHash } from 'crypto'
 import Sidebar from '@/components/Sidebar'
 import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
@@ -54,7 +53,8 @@ vi.mock('@/lib/api', async () => {
 })
 
 const sessionId = (label: string) => {
-  const hex = createHash('md5').update(label).digest('hex')
+  const chars = Array.from(label).map((ch, idx) => ((ch.charCodeAt(0) + idx) % 16).toString(16))
+  const hex = chars.join('').padEnd(32, '0').slice(0, 32)
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`
 }
 
@@ -78,6 +78,8 @@ function createStore(options: {
   terminals?: BackgroundTerminal[]
   excludeFirstChatSubstrings?: string[]
   excludeFirstChatMustStart?: boolean
+  showSubagents?: boolean
+  ignoreCodexSubagentSessions?: boolean
 }) {
   const projects = options.projects.map((project) => ({
     ...project,
@@ -130,8 +132,10 @@ function createStore(options: {
             ...defaultSettings.sidebar,
             sortMode: 'activity',
             showProjectBadges: true,
+            showSubagents: options.showSubagents ?? defaultSettings.sidebar.showSubagents,
             excludeFirstChatSubstrings: options.excludeFirstChatSubstrings ?? defaultSettings.sidebar.excludeFirstChatSubstrings,
             excludeFirstChatMustStart: options.excludeFirstChatMustStart ?? defaultSettings.sidebar.excludeFirstChatMustStart,
+            ignoreCodexSubagentSessions: options.ignoreCodexSubagentSessions ?? defaultSettings.sidebar.ignoreCodexSubagentSessions,
           },
         },
         loaded: true,
@@ -252,6 +256,50 @@ describe('sidebar click opens pane (e2e)', () => {
 
     expect(screen.queryByText('Hidden canary session')).not.toBeInTheDocument()
     expect(screen.getByText('Visible manual session')).toBeInTheDocument()
+  })
+
+  it('hides codex subagent sessions by default even when subagents are shown', async () => {
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/home/user/project',
+        sessions: [
+          {
+            provider: 'codex',
+            sessionId: sessionId('codex-subagent'),
+            projectPath: '/home/user/project',
+            updatedAt: Date.now(),
+            title: 'Codex subagent session',
+            isSubagent: true,
+            cwd: '/home/user/project',
+          },
+          {
+            provider: 'claude',
+            sessionId: sessionId('claude-subagent'),
+            projectPath: '/home/user/project',
+            updatedAt: Date.now() - 1000,
+            title: 'Claude subagent session',
+            isSubagent: true,
+            cwd: '/home/user/project',
+          },
+        ],
+      },
+    ]
+
+    const store = createStore({
+      projects,
+      tabs: [{ id: 'tab-1', mode: 'shell' }],
+      activeTabId: 'tab-1',
+      showSubagents: true,
+    })
+
+    renderSidebar(store)
+
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    expect(screen.queryByText('Codex subagent session')).not.toBeInTheDocument()
+    expect(screen.getByText('Claude subagent session')).toBeInTheDocument()
   })
 
   it('clicking a session splits a pane in the current tab', async () => {

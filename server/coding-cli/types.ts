@@ -133,6 +133,7 @@ export interface ParsedSessionMeta {
   firstUserMessage?: string
   messageCount?: number
   projectPath?: string
+  isSubagent?: boolean
   isNonInteractive?: boolean
   gitBranch?: string
   isDirty?: boolean

@@ -72,6 +72,7 @@ export const SettingsPatchSchema = z
         sortMode: z.enum(['recency', 'recency-pinned', 'activity', 'project']).optional(),
         showProjectBadges: z.coerce.boolean().optional(),
         showSubagents: z.coerce.boolean().optional(),
+        ignoreCodexSubagentSessions: z.coerce.boolean().optional(),
         showNoninteractiveSessions: z.coerce.boolean().optional(),
         excludeFirstChatSubstrings: z.array(z.string()).optional(),
         excludeFirstChatMustStart: z.coerce.boolean().optional(),
