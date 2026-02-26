@@ -5,6 +5,8 @@ import { withPerfSpan } from './perf-logger.js'
 
 // --- SettingsPatchSchema (moved from settings-schema.ts) ---
 
+const CODING_CLI_PROVIDER_NAMES = ['claude', 'codex', 'opencode', 'gemini', 'kimi'] as const
+
 const CodingCliProviderConfigSchema = z
   .object({
     model: z.string().optional(),
@@ -93,9 +95,10 @@ export const SettingsPatchSchema = z
           .array(z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi']))
           .optional(),
         providers: z
-          .record(
-            z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi']),
-            CodingCliProviderConfigSchema,
+          .record(z.string(), CodingCliProviderConfigSchema)
+          .refine(
+            (obj) => Object.keys(obj).every((k) => (CODING_CLI_PROVIDER_NAMES as readonly string[]).includes(k)),
+            { message: 'Unknown provider name' },
           )
           .optional(),
       })

@@ -688,6 +688,55 @@ describe('Settings API Integration', () => {
     })
   })
 
+  describe('codingCli provider settings', () => {
+    it('accepts a single provider permissionMode change', async () => {
+      const res = await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ codingCli: { providers: { claude: { permissionMode: 'plan' } } } })
+
+      expect(res.status).toBe(200)
+      expect(res.body.codingCli.providers.claude.permissionMode).toBe('plan')
+    })
+
+    it('accepts a single provider model change without affecting other providers', async () => {
+      // Set up existing provider settings first
+      await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ codingCli: { providers: { claude: { permissionMode: 'plan' } } } })
+
+      // Patch a different provider
+      const res = await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ codingCli: { providers: { codex: { model: 'o3' } } } })
+
+      expect(res.status).toBe(200)
+      expect(res.body.codingCli.providers.codex.model).toBe('o3')
+      // Existing provider settings must be preserved
+      expect(res.body.codingCli.providers.claude.permissionMode).toBe('plan')
+    })
+
+    it('accepts multiple providers in a single patch', async () => {
+      const res = await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({
+          codingCli: {
+            providers: {
+              claude: { permissionMode: 'bypassPermissions' },
+              gemini: { sandbox: 'read-only' },
+            },
+          },
+        })
+
+      expect(res.status).toBe(200)
+      expect(res.body.codingCli.providers.claude.permissionMode).toBe('bypassPermissions')
+      expect(res.body.codingCli.providers.gemini.sandbox).toBe('read-only')
+    })
+  })
+
   describe('PATCH /api/settings', () => {
     it('clears defaultCwd when null is provided', async () => {
       await configStore.patchSettings({ defaultCwd: '/tmp' })
