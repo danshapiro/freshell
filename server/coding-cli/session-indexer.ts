@@ -191,7 +191,7 @@ export class CodingCliSessionIndexer {
     const rootSet = new Set<string>()
     for (const provider of this.providers) {
       for (const root of provider.getSessionRoots()) {
-        rootSet.add(root)
+        rootSet.add(normalizeFilePath(root))
       }
     }
 
@@ -209,7 +209,7 @@ export class CodingCliSessionIndexer {
     })
 
     this.rootWatcher.on('addDir', (dirPath) => {
-      if (rootSet.has(dirPath)) {
+      if (rootSet.has(normalizeFilePath(dirPath))) {
         logger.info({ dirPath }, 'Provider session root created, scheduling full scan')
         this.needsFullScan = true
         this.scheduleRefresh()
@@ -217,7 +217,7 @@ export class CodingCliSessionIndexer {
     })
 
     this.rootWatcher.on('unlinkDir', (dirPath) => {
-      if (rootSet.has(dirPath)) {
+      if (rootSet.has(normalizeFilePath(dirPath))) {
         logger.info({ dirPath }, 'Provider session root removed, scheduling full scan')
         this.needsFullScan = true
         this.scheduleRefresh()
