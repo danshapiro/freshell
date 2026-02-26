@@ -3,6 +3,7 @@ import path from 'path'
 import os from 'os'
 import { logger } from './logger.js'
 import type { CodingCliProviderName } from './coding-cli/types.js'
+import { normalizeTrimmedStringList } from '../shared/string-list.js'
 
 /**
  * Simple promise-based mutex to serialize write operations.
@@ -387,20 +388,6 @@ async function readConfigFile(): Promise<{ config: UserConfig | null; error?: Co
 }
 
 function mergeSettings(base: AppSettings, patch: AppSettingsPatch): AppSettings {
-  const normalizeExcludeFirstChatSubstrings = (value: unknown): string[] => {
-    if (!Array.isArray(value)) return []
-    const seen = new Set<string>()
-    const out: string[] = []
-    for (const item of value) {
-      if (typeof item !== 'string') continue
-      const trimmed = item.trim()
-      if (!trimmed || seen.has(trimmed)) continue
-      seen.add(trimmed)
-      out.push(trimmed)
-    }
-    return out
-  }
-
   const baseLogging = base.logging ?? defaultSettings.logging
   const terminalPatch: Partial<AppSettings['terminal']> = patch.terminal ?? {}
   const terminalUpdates = {
@@ -429,7 +416,7 @@ function mergeSettings(base: AppSettings, patch: AppSettingsPatch): AppSettings 
     sidebar: {
       ...base.sidebar,
       ...(patch.sidebar || {}),
-      excludeFirstChatSubstrings: normalizeExcludeFirstChatSubstrings(
+      excludeFirstChatSubstrings: normalizeTrimmedStringList(
         (patch.sidebar && Object.prototype.hasOwnProperty.call(patch.sidebar, 'excludeFirstChatSubstrings'))
           ? patch.sidebar.excludeFirstChatSubstrings
           : base.sidebar.excludeFirstChatSubstrings

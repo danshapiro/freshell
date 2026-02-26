@@ -30,6 +30,7 @@ import { nanoid } from '@reduxjs/toolkit'
 import type { AppView } from '@/components/Sidebar'
 import { CODING_CLI_PROVIDER_CONFIGS } from '@/lib/coding-cli-utils'
 import { createLogger } from '@/lib/client-logger'
+import { parseNormalizedLineList } from '@shared/string-list'
 
 
 const log = createLogger('SettingsView')
@@ -157,18 +158,6 @@ function normalizePreviewLine(tokens: PreviewToken[], width: number): PreviewTok
   }
 
   return normalized
-}
-
-function parseSidebarExcludeFirstChatInput(input: string): string[] {
-  const seen = new Set<string>()
-  const out: string[] = []
-  for (const line of input.split(/\r?\n/)) {
-    const trimmed = line.trim()
-    if (!trimmed || seen.has(trimmed)) continue
-    seen.add(trimmed)
-    out.push(trimmed)
-  }
-  return out
 }
 
 export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePanel }: { onNavigate?: (view: AppView) => void; onFirewallTerminal?: (cmd: { tabId: string; command: string }) => void; onSharePanel?: () => void } = {}) {
@@ -735,7 +724,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 onChange={(event) => {
                   const nextInput = event.target.value
                   setExcludeFirstChatInput(nextInput)
-                  const excludeFirstChatSubstrings = parseSidebarExcludeFirstChatInput(nextInput)
+                  const excludeFirstChatSubstrings = parseNormalizedLineList(nextInput)
                   dispatch(updateSettingsLocal({ sidebar: { excludeFirstChatSubstrings } }))
                   scheduleSave({ sidebar: { excludeFirstChatSubstrings } })
                 }}

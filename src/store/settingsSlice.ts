@@ -1,23 +1,10 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import type { AppSettings, SidebarSortMode, CodingCliProviderName } from './types'
 import type { DeepPartial } from '@/lib/type-utils'
+import { normalizeTrimmedStringList } from '@shared/string-list'
 
 export function resolveDefaultLoggingDebug(isDev: boolean = import.meta.env.DEV): boolean {
   return !!isDev
-}
-
-function normalizeExcludeFirstChatSubstrings(value: unknown): string[] {
-  if (!Array.isArray(value)) return []
-  const seen = new Set<string>()
-  const out: string[] = []
-  for (const item of value) {
-    if (typeof item !== 'string') continue
-    const trimmed = item.trim()
-    if (!trimmed || seen.has(trimmed)) continue
-    seen.add(trimmed)
-    out.push(trimmed)
-  }
-  return out
 }
 
 export const defaultSettings: AppSettings = {
@@ -132,7 +119,7 @@ export function mergeSettings(base: AppSettings, patch: DeepPartial<AppSettings>
     sidebar: {
       ...merged.sidebar,
       sortMode: migrateSortMode(merged.sidebar?.sortMode),
-      excludeFirstChatSubstrings: normalizeExcludeFirstChatSubstrings(merged.sidebar?.excludeFirstChatSubstrings),
+      excludeFirstChatSubstrings: normalizeTrimmedStringList(merged.sidebar?.excludeFirstChatSubstrings),
       excludeFirstChatMustStart: !!merged.sidebar?.excludeFirstChatMustStart,
     },
     codingCli: {
