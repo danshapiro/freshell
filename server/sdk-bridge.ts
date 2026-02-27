@@ -47,6 +47,7 @@ export class SdkBridge extends EventEmitter {
     model?: string
     permissionMode?: string
     effort?: 'low' | 'medium' | 'high' | 'max'
+    plugins?: string[]
   }): Promise<SdkSessionState> {
     const sessionId = nanoid()
     const state: SdkSessionState = {
@@ -92,6 +93,7 @@ export class SdkBridge extends EventEmitter {
           return this.handlePermissionRequest(sessionId, toolName, input as Record<string, unknown>, ctx)
         },
         settingSources: ['user', 'project', 'local'],
+        ...(options.plugins && { plugins: options.plugins.map(p => ({ type: 'local' as const, path: p })) }),
       },
     })
 

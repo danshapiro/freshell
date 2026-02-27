@@ -516,6 +516,29 @@ describe('SdkBridge', () => {
     })
   })
 
+  describe('plugins option', () => {
+    it('passes plugins to SDK query options as SdkPluginConfig array', async () => {
+      await bridge.createSession({
+        cwd: '/tmp',
+        plugins: ['/path/to/plugin-a', '/path/to/plugin-b'],
+      })
+      expect(mockQueryOptions?.plugins).toEqual([
+        { type: 'local', path: '/path/to/plugin-a' },
+        { type: 'local', path: '/path/to/plugin-b' },
+      ])
+    })
+
+    it('omits plugins from SDK query options when not set', async () => {
+      await bridge.createSession({ cwd: '/tmp' })
+      expect(mockQueryOptions?.plugins).toBeUndefined()
+    })
+
+    it('passes empty plugins array when given empty array', async () => {
+      await bridge.createSession({ cwd: '/tmp', plugins: [] })
+      expect(mockQueryOptions?.plugins).toEqual([])
+    })
+  })
+
   describe('setModel', () => {
     it('returns false for nonexistent session', () => {
       expect(bridge.setModel('nonexistent', 'claude-sonnet-4-5-20250929')).toBe(false)
