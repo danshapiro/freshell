@@ -526,6 +526,9 @@ async function main() {
         console.log('   Auth token is configured in .env (not printed to logs).')
       }
     }
+    if (isDev) {
+      console.log(`   \x1b[33m(dev mode: Vite client on port ${visitPort}, Express server on port ${port})\x1b[0m`)
+    }
     console.log('')
 
     startBackgroundTasks()

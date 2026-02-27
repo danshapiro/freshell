@@ -4,6 +4,6 @@
  * In production, the Express server serves everything on the server port.
  */
 export function resolveVisitPort(serverPort: number, env: NodeJS.ProcessEnv): number {
-  const isDev = env.NODE_ENV === 'development'
-  return isDev ? Number(env.VITE_PORT || 5173) : serverPort
+  const isProduction = env.NODE_ENV === 'production'
+  return isProduction ? serverPort : Number(env.VITE_PORT || 5173)
 }
