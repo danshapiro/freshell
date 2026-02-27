@@ -1561,6 +1561,17 @@ export class WsHandler {
           sessionId: m.sessionId,
           status: session.status,
         })
+
+        // Replay pending questions so reconnecting clients can answer them
+        for (const [requestId, pending] of session.pendingQuestions ?? []) {
+          this.send(ws, {
+            type: 'sdk.question.request',
+            sessionId: m.sessionId,
+            requestId,
+            toolUseId: pending.toolUseId,
+            questions: pending.questions,
+          })
+        }
         return
       }
 

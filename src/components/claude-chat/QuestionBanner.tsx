@@ -44,9 +44,9 @@ function QuestionBanner({ question, onAnswer, disabled }: QuestionBannerProps) {
     })
   }, [])
 
-  const handleOtherChange = useCallback((header: string, value: string) => {
+  const handleOtherChange = useCallback((header: string, value: string, multiSelect: boolean) => {
     setOtherInputs(prev => ({ ...prev, [header]: value }))
-    setSelections(prev => ({ ...prev, [header]: value }))
+    setSelections(prev => ({ ...prev, [header]: multiSelect ? [value] : value }))
   }, [])
 
   const allAnswered = question.questions.every(q => {
@@ -140,7 +140,7 @@ function QuestionBanner({ question, onAnswer, disabled }: QuestionBannerProps) {
             <input
               type="text"
               value={otherInputs[q.header] || ''}
-              onChange={(e) => handleOtherChange(q.header, e.target.value)}
+              onChange={(e) => handleOtherChange(q.header, e.target.value, q.multiSelect)}
               placeholder="Type your answer..."
               disabled={disabled}
               className="w-full px-2 py-1 text-xs rounded border border-border bg-background focus:border-blue-500 focus:outline-none"

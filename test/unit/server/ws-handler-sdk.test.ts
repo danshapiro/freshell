@@ -247,6 +247,7 @@ describe('WS Handler SDK Integration', () => {
           sessionId: 'sdk-sess-1',
           status: 'idle',
           messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' }],
+          pendingQuestions: new Map(),
         }),
       }
 
@@ -508,6 +509,58 @@ describe('WS Handler SDK Integration', () => {
         expect(statusMsg.status).toBe('idle')
         expect(mockSdkBridge.getSession).toHaveBeenCalledWith('sdk-sess-1')
         expect(mockSdkBridge.subscribe).toHaveBeenCalledWith('sdk-sess-1', expect.any(Function))
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('replays pending questions on sdk.attach', async () => {
+      const pendingQuestions = new Map([
+        ['q-pending-1', {
+          toolUseId: 'tool-q1',
+          questions: [{ question: 'Pick one?', header: 'Choice', options: [{ label: 'A', description: 'Option A' }], multiSelect: false }],
+          resolve: () => {},
+        }],
+      ])
+      mockSdkBridge.getSession.mockReturnValue({
+        sessionId: 'sdk-sess-1',
+        status: 'idle',
+        messages: [],
+        pendingQuestions,
+      })
+
+      const ws = await connectAndAuth()
+      try {
+        const messages: any[] = []
+        const collectDone = new Promise<void>((resolve) => {
+          let count = 0
+          const onMessage = (data: WebSocket.RawData) => {
+            const parsed = JSON.parse(data.toString())
+            if (parsed.type === 'sdk.history' || parsed.type === 'sdk.status' || parsed.type === 'sdk.question.request') {
+              messages.push(parsed)
+              count++
+              if (count >= 3) {
+                ws.off('message', onMessage)
+                resolve()
+              }
+            }
+          }
+          ws.on('message', onMessage)
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.attach',
+          sessionId: 'sdk-sess-1',
+        }))
+
+        await collectDone
+
+        const questionMsg = messages.find((m) => m.type === 'sdk.question.request')
+        expect(questionMsg).toBeDefined()
+        expect(questionMsg.requestId).toBe('q-pending-1')
+        expect(questionMsg.toolUseId).toBe('tool-q1')
+        expect(questionMsg.questions).toHaveLength(1)
+        expect(questionMsg.questions[0].header).toBe('Choice')
       } finally {
         ws.close()
       }

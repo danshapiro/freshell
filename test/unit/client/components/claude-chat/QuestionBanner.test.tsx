@@ -96,6 +96,33 @@ describe('QuestionBanner', () => {
     expect(screen.getByPlaceholderText('Type your answer...')).toBeInTheDocument()
   })
 
+  it('submits multi-select Other answer as array', async () => {
+    const multiQuestion: QuestionRequest = {
+      requestId: 'q-3',
+      toolUseId: 'tool-q3',
+      questions: [{
+        question: 'Which features?',
+        header: 'Features',
+        options: [
+          { label: 'Dark mode', description: 'Add dark theme' },
+          { label: 'Notifications', description: 'Push notifications' },
+        ],
+        multiSelect: true,
+      }],
+    }
+    const onAnswer = vi.fn()
+    const user = userEvent.setup()
+    render(
+      <QuestionBanner question={multiQuestion} onAnswer={onAnswer} />
+    )
+
+    await user.click(screen.getByRole('button', { name: 'Provide a custom answer' }))
+    await user.type(screen.getByPlaceholderText('Type your answer...'), 'Custom feature')
+    await user.click(screen.getByRole('button', { name: 'Submit answers' }))
+
+    expect(onAnswer).toHaveBeenCalledWith('q-3', { 'Features': ['Custom feature'] })
+  })
+
   it('submits with custom Other answer', async () => {
     const onAnswer = vi.fn()
     const user = userEvent.setup()
