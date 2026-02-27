@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import { render, screen, cleanup } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MarkdownRenderer } from '@/components/markdown/MarkdownRenderer'
@@ -46,6 +46,26 @@ echo hello
       // in jsdom threads, so we verify copy via the "Copied!" feedback state change.
       // If writeText rejects, the catch block prevents setCopied(true).
       await screen.findByText('Copied!')
+    })
+
+    it('copies code without trailing newline (no accidental shell execution)', async () => {
+      const user = userEvent.setup()
+      const writeText = vi.fn().mockResolvedValue(undefined)
+      Object.defineProperty(navigator, 'clipboard', {
+        value: { writeText },
+        configurable: true,
+      })
+      render(
+        <MarkdownRenderer
+          content={`\`\`\`bash
+echo hello
+\`\`\``}
+        />
+      )
+      const copyBtn = await screen.findByRole('button', { name: /copy code/i })
+      await user.click(copyBtn)
+      await screen.findByText('Copied!')
+      expect(writeText).toHaveBeenCalledWith('echo hello')
     })
 
     it('shows "Copied!" feedback after clicking copy', async () => {

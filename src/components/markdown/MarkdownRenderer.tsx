@@ -92,6 +92,7 @@ function PreBlock({ children, ...props }: React.ComponentProps<'pre'>) {
 
   const language = extractLanguage(codeChild)
   const codeText = extractCode(codeChild.props?.children as ReactNode)
+  const normalizedCode = codeText.replace(/\n$/, '')
 
   return (
     <div className="rounded-md border border-border overflow-hidden my-2">
@@ -99,7 +100,7 @@ function PreBlock({ children, ...props }: React.ComponentProps<'pre'>) {
         <span className="text-xs text-muted-foreground font-mono">
           {language ?? ''}
         </span>
-        <CopyButton code={codeText} />
+        <CopyButton code={normalizedCode} />
       </div>
       <SyntaxHighlighter
         language={language ?? 'text'}
@@ -107,7 +108,7 @@ function PreBlock({ children, ...props }: React.ComponentProps<'pre'>) {
         customStyle={{ margin: 0, borderRadius: 0, border: 'none' }}
         showLineNumbers={false}
       >
-        {codeText.replace(/\n$/, '')}
+        {normalizedCode}
       </SyntaxHighlighter>
     </div>
   )
