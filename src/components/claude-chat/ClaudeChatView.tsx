@@ -109,6 +109,7 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
       effort: paneContent.effort ?? DEFAULT_EFFORT,
       ...(paneContent.initialCwd ? { cwd: paneContent.initialCwd } : {}),
       ...(paneContent.resumeSessionId ? { resumeSessionId: paneContent.resumeSessionId } : {}),
+      ...(paneContent.plugins ? { plugins: paneContent.plugins } : {}),
     })
 
     // Update status to 'starting'

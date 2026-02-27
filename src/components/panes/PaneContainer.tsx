@@ -437,6 +437,7 @@ function PickerWrapper({
         model: defaults?.defaultModel,
         permissionMode: defaults?.defaultPermissionMode,
         effort: defaults?.defaultEffort,
+        plugins: defaults?.defaultPlugins,
         ...(cwd ? { initialCwd: cwd } : {}),
       }
     }
