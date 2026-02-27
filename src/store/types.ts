@@ -174,6 +174,7 @@ export interface AppSettings {
     defaultModel?: string
     defaultPermissionMode?: string
     defaultEffort?: 'low' | 'medium' | 'high' | 'max'
+    defaultPlugins?: string[]
   }
   network: {
     host: '127.0.0.1' | '0.0.0.0'

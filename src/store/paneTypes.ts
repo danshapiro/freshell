@@ -89,6 +89,8 @@ export type ClaudeChatPaneContent = {
   permissionMode?: string
   /** Effort level (default: high, creation-time only) */
   effort?: 'low' | 'medium' | 'high' | 'max'
+  /** Plugin paths to load into this session (absolute paths to plugin directories) */
+  plugins?: string[]
   /** Show thinking blocks in message feed (default: true) */
   showThinking?: boolean
   /** Show tool-use blocks in message feed (default: true) */

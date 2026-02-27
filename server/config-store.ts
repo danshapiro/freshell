@@ -98,6 +98,7 @@ export type AppSettings = {
     defaultModel?: string
     defaultPermissionMode?: string
     defaultEffort?: 'low' | 'medium' | 'high' | 'max'
+    defaultPlugins?: string[]
   }
   network: NetworkSettings
 }
