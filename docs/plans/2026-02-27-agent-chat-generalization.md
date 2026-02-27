@@ -4,7 +4,7 @@
 
 **Goal:** Generalize the `claude-chat` pane type into a provider-configurable `agent-chat` pane, making freshclaude the first provider in a registry that supports different defaults, chrome, and (eventually) harnesses.
 
-**Architecture:** Rename `claude-chat` → `agent-chat` everywhere, add a `provider` field to the pane content, and introduce an `AGENT_CHAT_PROVIDER_CONFIGS` registry (mirroring the terminal pane's `CODING_CLI_PROVIDER_CONFIGS` pattern). Each provider config defines label, defaults, which settings to expose, and the underlying coding CLI provider for directory preferences. No persistence migration — old `claude-chat` panes are dropped on load. The SDK bridge and WS protocol stay unchanged — they're transport-layer concerns.
+**Architecture:** Rename `claude-chat` → `agent-chat` everywhere, add a `provider` field to the pane content, and introduce an `AGENT_CHAT_PROVIDER_CONFIGS` registry (mirroring the terminal pane's `CODING_CLI_PROVIDER_CONFIGS` pattern). Each provider config defines label, defaults (including display toggles), which settings to expose, and the underlying coding CLI provider for directory preferences. User settings are per-provider under `agentChat.providers[name]` (mirroring `codingCli.providers`). No persistence migration — old `claude-chat` panes are dropped on load. The tabs-registry schema accepts both `claude-chat` and `agent-chat` for back-compat with existing JSONL entries. Snapshot payloads include `provider` for round-tripping. The SDK bridge and WS protocol stay unchanged — they're transport-layer concerns.
 
 **Tech Stack:** TypeScript, React, Redux Toolkit, Zod, Vitest
 
@@ -26,7 +26,7 @@
 | `src/components/claude-chat/` | `src/components/agent-chat/` |
 | `freshclaude-chat-copy.ts` | `agent-chat-copy.ts` |
 | `FreshclaudeChat` (context menu constant) | `AgentChat` |
-| `freshclaude` (settings key) | `agentChat` |
+| `freshclaude` (settings key) | `agentChat` (with `providers` sub-object keyed by provider name) |
 | `'claude-web'` (picker type) | removed; providers come from config |
 | `test/.../claude-chat/` | `test/.../agent-chat/` |
 
@@ -339,7 +339,7 @@ In `AgentChatView.tsx`:
 - Update import: `from '@/store/claudeChatTypes'` → `from '@/store/agentChatTypes'`
 - Update import: `FreshclaudeSettings` → `AgentChatSettings`
 - Update Redux selector: `s.claudeChat.` → `s.agentChat.`
-- Update settings API call: `{ freshclaude: defaultsPatch }` → `{ agentChat: defaultsPatch }`
+- Update settings API call: `{ freshclaude: defaultsPatch }` → `{ agentChat: { providers: { [provider]: defaultsPatch } } }`
 - Update aria-label: `"freshclaude Chat"` → use provider label
 - Update data-context: `"freshclaude-chat"` → `"agent-chat"`
 - Update welcome text: read from provider config instead of hardcoded "freshclaude"
@@ -384,7 +384,7 @@ This task fixes all the files that import from or reference the old names. Work 
 - `src/lib/derivePaneTitle.ts` — `kind === 'claude-chat'` → `'agent-chat'`, return provider label instead of hardcoded `'freshclaude'`
 - `src/lib/session-utils.ts` — `kind === 'claude-chat'` → `'agent-chat'`
 - `src/lib/tab-directory-preference.ts` — `kind === 'claude-chat'` → `'agent-chat'`
-- `src/lib/tab-registry-snapshot.ts` — `kind === 'claude-chat'` → `'agent-chat'`
+- `src/lib/tab-registry-snapshot.ts` — rename `case 'claude-chat'` → `case 'agent-chat'`; **also persist `provider` in `stripPanePayload`** so snapshots round-trip correctly (see detail below)
 - `src/lib/sdk-message-handler.ts` — `s.claudeChat` → `s.agentChat`, import path update
 
 **Store:**
@@ -402,11 +402,11 @@ This task fixes all the files that import from or reference the old names. Work 
 - `src/App.tsx` — update comment if any
 
 **Settings:**
-- `src/store/types.ts` — `freshclaude?:` → `agentChat?:`
-- `src/store/settingsSlice.ts` — `freshclaude: {}` → `agentChat: {}`
+- `src/store/types.ts` — `freshclaude?:` → `agentChat?: { providers?: ... }` (per-provider structure)
+- `src/store/settingsSlice.ts` — `freshclaude: {}` → `agentChat: { providers: {} }`, update `mergeSettings()` to deep-merge providers
 
 **Server:**
-- `server/tabs-registry/types.ts` — `'claude-chat'` → `'agent-chat'` in `RegistryPaneKindSchema`
+- `server/tabs-registry/types.ts` — **ADD** `'agent-chat'` to `RegistryPaneKindSchema` while **keeping** `'claude-chat'` for back-compat with existing JSONL log entries (Zod strict parsing drops records with unknown enum values)
 
 **Step 1: Do a global find-and-replace pass for each pattern**
 
@@ -460,15 +460,15 @@ const agentChatOptions: PickerOption[] = AGENT_CHAT_PROVIDER_CONFIGS
 ```typescript
 if (isAgentChatProviderName(type)) {
   const providerConfig = getAgentChatProviderConfig(type)!
-  const defaults = settings?.agentChat
+  const providerSettings = settings?.agentChat?.providers?.[type]
   return {
     kind: 'agent-chat',
     provider: type,
     createRequestId: nanoid(),
     status: 'creating',
-    model: defaults?.defaultModel ?? providerConfig.defaultModel,
-    permissionMode: defaults?.defaultPermissionMode ?? providerConfig.defaultPermissionMode,
-    effort: defaults?.defaultEffort ?? providerConfig.defaultEffort,
+    model: providerSettings?.defaultModel ?? providerConfig.defaultModel,
+    permissionMode: providerSettings?.defaultPermissionMode ?? providerConfig.defaultPermissionMode,
+    effort: providerSettings?.defaultEffort ?? providerConfig.defaultEffort,
     ...(cwd ? { initialCwd: cwd } : {}),
   }
 }
@@ -487,7 +487,32 @@ Similarly update the label derivation:
 // NEW:
 const providerLabel = agentConfig ? agentConfig.label : getProviderLabel(providerType)
 ```
+
+**Key detail in `tab-registry-snapshot.ts` `stripPanePayload()`**: The `provider` field must be persisted in the snapshot payload so that restored agent-chat panes know which provider to use:
+```typescript
+case 'agent-chat':
+  {
+    const sessionRef = content.sessionRef
+      || (content.resumeSessionId
+        ? {
+            provider: 'claude',
+            sessionId: content.resumeSessionId,
+            serverInstanceId,
+          }
+        : undefined)
+    return {
+      provider: content.provider,  // REQUIRED: round-trip the provider
+      resumeSessionId: content.resumeSessionId,
+      sessionRef,
+      initialCwd: content.initialCwd,
+      model: content.model,
+      permissionMode: content.permissionMode,
+      effort: content.effort,
+    }
+  }
 ```
+
+Consumers that restore panes from snapshots (e.g. `TabsView.tsx` remote tab restore) must read `payload.provider` when constructing `AgentChatPaneContent`. If `payload.provider` is missing (from old `claude-chat` snapshots), default to `'freshclaude'`.
 
 **Step 2: Run typecheck**
 
@@ -616,21 +641,40 @@ The settings key changes from `freshclaude` to `agentChat`. Without updating the
 
 **Step 1: Update `AppSettings` in `types.ts`**
 
+Settings are **per-provider** to prevent defaults from one provider bleeding into another. This mirrors how `codingCli.providers` works:
+
 ```typescript
-agentChat?: {
+import type { AgentChatProviderName } from '@/lib/agent-chat-types'
+
+interface AgentChatProviderSettings {
   defaultModel?: string
   defaultPermissionMode?: string
   defaultEffort?: 'low' | 'medium' | 'high' | 'max'
+}
+
+// In AppSettings:
+agentChat?: {
+  providers?: Partial<Record<AgentChatProviderName, AgentChatProviderSettings>>
 }
 ```
 
 **Step 2: Update `defaultSettings` in `settingsSlice.ts`**
 
 ```typescript
-agentChat: {},  // was: freshclaude: {}
+agentChat: { providers: {} },  // was: freshclaude: {}
 ```
 
-Also update `mergeSettings()` to spread `agentChat` instead of `freshclaude`.
+Update `mergeSettings()` to deep-merge `agentChat.providers` (same pattern as `codingCli.providers`):
+```typescript
+agentChat: {
+  ...baseAgentChat,
+  ...(patch.agentChat || {}),
+  providers: {
+    ...baseAgentChat.providers,
+    ...(patch.agentChat?.providers || {}),
+  },
+},
+```
 
 **Step 3: Update `SettingsPatchSchema` in `server/settings-router.ts`**
 
@@ -649,9 +693,14 @@ With:
 ```typescript
     agentChat: z
       .object({
-        defaultModel: z.string().optional(),
-        defaultPermissionMode: z.string().optional(),
-        defaultEffort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+        providers: z.record(
+          z.string(),
+          z.object({
+            defaultModel: z.string().optional(),
+            defaultPermissionMode: z.string().optional(),
+            defaultEffort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+          }).strict(),
+        ).optional(),
       })
       .strict()
       .optional(),
@@ -659,7 +708,15 @@ With:
 
 **Step 4: Add migration in config loading**
 
-In `server/config-store.ts`, when loading `~/.freshell/config.json`, if the loaded config has a `freshclaude` key but no `agentChat` key, copy `freshclaude` → `agentChat` and delete the old key. This is a one-time migration.
+In `server/config-store.ts`, when loading `~/.freshell/config.json`, if the loaded config has a `freshclaude` key but no `agentChat` key, migrate:
+```typescript
+// Migrate flat freshclaude → nested agentChat.providers.freshclaude
+if (config.freshclaude && !config.agentChat) {
+  config.agentChat = { providers: { freshclaude: config.freshclaude } }
+  delete config.freshclaude
+}
+```
+This is a one-time migration — the old flat settings become the freshclaude provider's defaults.
 
 **Step 5: Update the settings PATCH handler in `AgentChatView`**
 
@@ -667,8 +724,8 @@ Already done in Task 5 (`{ freshclaude: ... }` → `{ agentChat: ... }`).
 
 **Step 6: Run tests**
 
-Run: `cd /home/user/code/freshell/.worktrees/agent-chat && npx vitest run test/unit/client/store/settingsSlice.test.ts test/unit/server/config-store.test.ts test/unit/server/settings-router.test.ts`
-Expected: PASS (update test expectations as needed)
+Run: `cd /home/user/code/freshell/.worktrees/agent-chat && npx vitest run test/unit/client/store/settingsSlice.test.ts test/unit/server/config-store.test.ts test/integration/server/settings-api.test.ts`
+Expected: PASS (update test expectations as needed — the integration test validates that the PATCH endpoint accepts the new `agentChat` key and rejects the old `freshclaude` key)
 
 **Step 7: Commit**
 
@@ -714,6 +771,15 @@ const defaultModel = providerConfig?.defaultModel ?? 'claude-opus-4-6'
 const defaultPermissionMode = providerConfig?.defaultPermissionMode ?? 'bypassPermissions'
 const defaultEffort = providerConfig?.defaultEffort ?? 'high'
 ```
+
+Also wire display defaults from the provider config. These are used to initialize display toggles when no per-pane override exists:
+```typescript
+const defaultShowThinking = providerConfig?.defaultShowThinking ?? true
+const defaultShowTools = providerConfig?.defaultShowTools ?? true
+const defaultShowTimecodes = providerConfig?.defaultShowTimecodes ?? false
+```
+
+Use these as fallbacks when the pane content's `showThinking`/`showTools`/`showTimecodes` fields are `undefined`.
 
 Update welcome message to use provider label:
 ```typescript
