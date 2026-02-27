@@ -1,5 +1,6 @@
 import type { AppDispatch } from '@/store/store'
 import type { ChatContentBlock } from '@/store/claudeChatTypes'
+import type { QuestionDefinition } from '@/store/claudeChatTypes'
 import {
   sessionCreated,
   sessionInit,
@@ -9,6 +10,7 @@ import {
   clearStreaming,
   addPermissionRequest,
   removePermission,
+  addQuestionRequest,
   setSessionStatus,
   turnResult,
   sessionExited,
@@ -118,6 +120,14 @@ export function handleSdkMessage(dispatch: AppDispatch, msg: Record<string, unkn
       dispatch(removePermission({
         sessionId: msg.sessionId as string,
         requestId: msg.requestId as string,
+      }))
+      return true
+
+    case 'sdk.question.request':
+      dispatch(addQuestionRequest({
+        sessionId: msg.sessionId as string,
+        requestId: msg.requestId as string,
+        questions: msg.questions as QuestionDefinition[],
       }))
       return true
 

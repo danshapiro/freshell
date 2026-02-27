@@ -1,5 +1,5 @@
 import { createSlice, type PayloadAction } from '@reduxjs/toolkit'
-import type { ClaudeChatState, ChatContentBlock, ChatSessionState } from './claudeChatTypes'
+import type { ClaudeChatState, ChatContentBlock, ChatSessionState, QuestionDefinition } from './claudeChatTypes'
 
 const initialState: ClaudeChatState = {
   sessions: {},
@@ -17,6 +17,7 @@ function ensureSession(state: ClaudeChatState, sessionId: string): ChatSessionSt
       streamingText: '',
       streamingActive: false,
       pendingPermissions: {},
+      pendingQuestions: {},
       totalCostUsd: 0,
       totalInputTokens: 0,
       totalOutputTokens: 0,
@@ -126,6 +127,25 @@ const claudeChatSlice = createSlice({
       delete session.pendingPermissions[action.payload.requestId]
     },
 
+    addQuestionRequest(state, action: PayloadAction<{
+      sessionId: string
+      requestId: string
+      questions: QuestionDefinition[]
+    }>) {
+      const session = state.sessions[action.payload.sessionId]
+      if (!session) return
+      session.pendingQuestions[action.payload.requestId] = {
+        requestId: action.payload.requestId,
+        questions: action.payload.questions,
+      }
+    },
+
+    removeQuestion(state, action: PayloadAction<{ sessionId: string; requestId: string }>) {
+      const session = state.sessions[action.payload.sessionId]
+      if (!session) return
+      delete session.pendingQuestions[action.payload.requestId]
+    },
+
     setSessionStatus(state, action: PayloadAction<{
       sessionId: string
       status: ChatSessionState['status']
@@ -205,6 +225,8 @@ export const {
   clearStreaming,
   addPermissionRequest,
   removePermission,
+  addQuestionRequest,
+  removeQuestion,
   setSessionStatus,
   turnResult,
   sessionExited,

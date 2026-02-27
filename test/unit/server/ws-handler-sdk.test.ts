@@ -193,7 +193,7 @@ describe('WS Handler SDK Integration', () => {
 
       mockSdkBridge = {
         createSession: vi.fn().mockReturnValue({ sessionId: 'sdk-sess-1', status: 'starting', messages: [] }),
-        subscribe: vi.fn().mockReturnValue(() => {}),
+        subscribe: vi.fn().mockReturnValue({ off: () => {}, replayed: false }),
         sendUserMessage: vi.fn().mockReturnValue(true),
         respondPermission: vi.fn().mockReturnValue(true),
         interrupt: vi.fn().mockReturnValue(true),
@@ -496,7 +496,7 @@ describe('WS Handler SDK Integration', () => {
           cwd: '/tmp',
           tools: [],
         })
-        return () => {}
+        return { off: () => {}, replayed: true }
       })
       mockSdkBridge.subscribe = subscribeFn
 

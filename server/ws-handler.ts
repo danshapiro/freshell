@@ -44,6 +44,7 @@ import {
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
+  SdkQuestionRespondSchema,
   SdkInterruptSchema,
   SdkKillSchema,
   SdkAttachSchema,
@@ -147,6 +148,7 @@ const ClientMessageSchema = z.discriminatedUnion('type', [
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
+  SdkQuestionRespondSchema,
   SdkInterruptSchema,
   SdkKillSchema,
   SdkAttachSchema,
@@ -1396,10 +1398,10 @@ export class WsHandler {
           })
 
           // Subscribe this client to session events (replays buffered messages)
-          const off = this.sdkBridge.subscribe(session.sessionId, (msg: SdkServerMessage) => {
+          const sub = this.sdkBridge.subscribe(session.sessionId, (msg: SdkServerMessage) => {
             this.safeSend(ws, msg)
           })
-          if (off) state.sdkSubscriptions.set(session.sessionId, off)
+          if (sub) state.sdkSubscriptions.set(session.sessionId, sub.off)
 
           if (m.cwd?.trim()) {
             void configStore.pushRecentDirectory(m.cwd.trim()).catch((err) => {
@@ -1448,6 +1450,22 @@ export class WsHandler {
         const ok = this.sdkBridge.respondPermission(m.sessionId, m.requestId, decision)
         if (!ok) {
           this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'SDK session not found' })
+        }
+        return
+      }
+
+      case 'sdk.question.respond': {
+        if (!this.sdkBridge) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
+          return
+        }
+        if (!state.sdkSessions.has(m.sessionId) && !state.sdkSubscriptions.has(m.sessionId)) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
+          return
+        }
+        const ok = this.sdkBridge.respondQuestion(m.sessionId, m.requestId, m.answers)
+        if (!ok) {
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'SDK session or question not found' })
         }
         return
       }
@@ -1523,11 +1541,15 @@ export class WsHandler {
         }
 
         // Subscribe this client to session events if not already
+        let bufferReplayed = false
         if (!state.sdkSubscriptions.has(m.sessionId)) {
-          const off = this.sdkBridge.subscribe(m.sessionId, (msg: SdkServerMessage) => {
+          const sub = this.sdkBridge.subscribe(m.sessionId, (msg: SdkServerMessage) => {
             this.safeSend(ws, msg)
           })
-          if (off) state.sdkSubscriptions.set(m.sessionId, off)
+          if (sub) {
+            state.sdkSubscriptions.set(m.sessionId, sub.off)
+            bufferReplayed = sub.replayed
+          }
         }
 
         // Send history replay
@@ -1543,6 +1565,38 @@ export class WsHandler {
           sessionId: m.sessionId,
           status: session.status,
         })
+
+        // Replay pending permissions and questions for re-attaching clients.
+        // Skip if subscribe() already replayed the buffer (first subscriber),
+        // since buffered messages already include these requests.
+        if (!bufferReplayed) {
+          if (session.pendingPermissions) {
+            for (const [requestId, perm] of session.pendingPermissions) {
+              this.send(ws, {
+                type: 'sdk.permission.request',
+                sessionId: m.sessionId,
+                requestId,
+                subtype: 'can_use_tool',
+                tool: { name: perm.toolName, input: perm.input },
+                toolUseID: perm.toolUseID,
+                suggestions: perm.suggestions,
+                blockedPath: perm.blockedPath,
+                decisionReason: perm.decisionReason,
+              } as SdkServerMessage)
+            }
+          }
+
+          if (session.pendingQuestions) {
+            for (const [requestId, q] of session.pendingQuestions) {
+              this.send(ws, {
+                type: 'sdk.question.request',
+                sessionId: m.sessionId,
+                requestId,
+                questions: q.questions,
+              } as SdkServerMessage)
+            }
+          }
+        }
         return
       }
 

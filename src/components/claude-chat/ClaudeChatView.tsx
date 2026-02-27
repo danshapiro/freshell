@@ -2,12 +2,13 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ClaudeChatPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updatePaneContent } from '@/store/panesSlice'
-import { addUserMessage, clearPendingCreate, removePermission } from '@/store/claudeChatSlice'
+import { addUserMessage, clearPendingCreate, removePermission, removeQuestion } from '@/store/claudeChatSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { cn } from '@/lib/utils'
 import { ChevronDown } from 'lucide-react'
 import MessageBubble from './MessageBubble'
 import PermissionBanner from './PermissionBanner'
+import QuestionBanner from './QuestionBanner'
 import ChatComposer, { type ChatComposerHandle } from './ChatComposer'
 import FreshclaudeSettings from './FreshclaudeSettings'
 import ThinkingIndicator from './ThinkingIndicator'
@@ -180,6 +181,12 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
     ws.send({ type: 'sdk.permission.respond', sessionId: paneContent.sessionId, requestId, behavior: 'deny' })
   }, [paneContent.sessionId, dispatch, ws])
 
+  const handleQuestionAnswer = useCallback((requestId: string, answers: Record<string, string>) => {
+    if (!paneContent.sessionId) return
+    dispatch(removeQuestion({ sessionId: paneContent.sessionId, requestId }))
+    ws.send({ type: 'sdk.question.respond', sessionId: paneContent.sessionId, requestId, answers })
+  }, [paneContent.sessionId, dispatch, ws])
+
   const handleContainerPointerUp = useCallback((e: React.PointerEvent) => {
     // Don't steal focus from interactive elements or text selections
     const target = e.target as HTMLElement
@@ -244,6 +251,8 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
   const isInteractive = paneContent.status === 'idle' || paneContent.status === 'connected'
   const isRunning = paneContent.status === 'running'
   const pendingPermissions = session ? Object.values(session.pendingPermissions) : []
+  const pendingQuestions = session ? Object.values(session.pendingQuestions) : []
+  const hasWaitingItems = pendingPermissions.length > 0 || pendingQuestions.length > 0
 
   // Auto-expand: count completed tools across all messages, expand the most recent N
   const RECENT_TOOLS_EXPANDED = 3
@@ -317,14 +326,14 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
       {/* Status bar */}
       <div className="flex items-center justify-between px-3 py-1.5 border-b text-xs text-muted-foreground">
         <span>
-          {pendingPermissions.length > 0 && 'Waiting for answer...'}
-          {pendingPermissions.length === 0 && paneContent.status === 'creating' && 'Creating session...'}
-          {pendingPermissions.length === 0 && paneContent.status === 'starting' && 'Starting Claude Code...'}
-          {pendingPermissions.length === 0 && paneContent.status === 'connected' && 'Connected'}
-          {pendingPermissions.length === 0 && paneContent.status === 'running' && 'Running...'}
-          {pendingPermissions.length === 0 && paneContent.status === 'idle' && 'Ready'}
-          {pendingPermissions.length === 0 && paneContent.status === 'compacting' && 'Compacting context...'}
-          {pendingPermissions.length === 0 && paneContent.status === 'exited' && 'Session ended'}
+          {hasWaitingItems && 'Waiting for answer...'}
+          {!hasWaitingItems && paneContent.status === 'creating' && 'Creating session...'}
+          {!hasWaitingItems && paneContent.status === 'starting' && 'Starting Claude Code...'}
+          {!hasWaitingItems && paneContent.status === 'connected' && 'Connected'}
+          {!hasWaitingItems && paneContent.status === 'running' && 'Running...'}
+          {!hasWaitingItems && paneContent.status === 'idle' && 'Ready'}
+          {!hasWaitingItems && paneContent.status === 'compacting' && 'Compacting context...'}
+          {!hasWaitingItems && paneContent.status === 'exited' && 'Session ended'}
         </span>
         <div className="flex items-center gap-2">
           {paneContent.initialCwd && (
@@ -462,6 +471,15 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
           />
         ))}
 
+        {/* Question banners */}
+        {pendingQuestions.map((q) => (
+          <QuestionBanner
+            key={q.requestId}
+            question={q}
+            onAnswer={(answers) => handleQuestionAnswer(q.requestId, answers)}
+          />
+        ))}
+
         {/* Error display */}
         {session?.lastError && (
           <div className="text-sm text-red-500 bg-red-500/10 rounded-lg p-3" role="alert">
@@ -498,7 +516,7 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
         disabled={!isInteractive && !isRunning}
         isRunning={isRunning}
         placeholder={
-          pendingPermissions.length > 0
+          hasWaitingItems
             ? 'Waiting for answer...'
             : isInteractive
               ? 'Message Claude...'
