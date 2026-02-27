@@ -12,7 +12,7 @@ import FreshclaudeSettings from './FreshclaudeSettings'
 import ThinkingIndicator from './ThinkingIndicator'
 import { useStreamDebounce } from './useStreamDebounce'
 import CollapsedTurn from './CollapsedTurn'
-import type { ChatMessage } from '@/store/claudeChatTypes'
+import type { ChatMessage, ChatSessionState } from '@/store/claudeChatTypes'
 import { api } from '@/lib/api'
 
 const DEFAULT_MODEL = 'claude-opus-4-6'
@@ -43,8 +43,9 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
   const pendingSessionId = useAppSelector(
     (s) => s.claudeChat.pendingCreates[paneContent.createRequestId],
   )
+  const sessionId = paneContent.sessionId
   const session = useAppSelector(
-    (s) => paneContent.sessionId ? s.claudeChat.sessions[paneContent.sessionId] : undefined,
+    (s) => sessionId ? s.claudeChat.sessions[sessionId] : undefined,
   )
   const availableModels = useAppSelector((s) => s.claudeChat.availableModels)
 

@@ -340,56 +340,13 @@ export default function App() {
         return true
       }
 
-      try {
-        const settings = await api.get('/api/settings')
-        if (!cancelled) dispatch(setSettings(applyLocalTerminalFontFamily(settings)))
-      } catch (err: any) {
-        if (handleBootstrapAuthFailure(err)) return
-        log.warn('Failed to load settings', err)
-      }
-
-      try {
-        const platformInfo = await api.get<{
-          platform: string
-          availableClis?: Record<string, boolean>
-          hostName?: string
-        }>('/api/platform')
-        if (!cancelled) {
-          dispatch(setPlatform(platformInfo.platform))
-          if (platformInfo.availableClis) {
-            dispatch(setAvailableClis(platformInfo.availableClis))
-          }
-          dispatch(setTabRegistryDeviceMeta(resolveAndPersistDeviceMeta({
-            platform: platformInfo.platform,
-            hostName: platformInfo.hostName,
-          })))
-        }
-      } catch (err: any) {
-        if (handleBootstrapAuthFailure(err)) return
-        log.warn('Failed to load platform info', err)
-      }
-
-      try {
-        const nextVersionInfo = await api.get<VersionInfo>('/api/version')
-        if (!cancelled && isVersionInfo(nextVersionInfo)) {
-          setVersionInfo(nextVersionInfo)
-        }
-      } catch (err: any) {
-        if (handleBootstrapAuthFailure(err)) return
-        log.warn('Failed to load version info', err)
-      }
-
-      try {
-        const projects = await api.get('/api/sessions')
-        if (!cancelled) dispatch(setProjects(projects))
-      } catch (err: any) {
-        if (handleBootstrapAuthFailure(err)) return
-        log.warn('Failed to load sessions', err)
-      }
-
-      // Load network status for remote access wizard/settings
-      if (!cancelled) dispatch(fetchNetworkStatus())
-
+      // ── WebSocket setup (synchronous) ─────────────────────────────
+      // Register the message handler BEFORE any async work.  Child components
+      // (Sidebar, TerminalView, etc.) call ws.connect() in their own effects,
+      // so the WebSocket may become ready while we await the HTTP fetches
+      // below.  If the handler isn't registered yet, sdk.history (and other
+      // early messages) are silently lost — causing the "chat history lost on
+      // reload" bug.
       const ws = getWsClient()
       stopTabRegistrySync = startTabRegistrySync(store, ws)
 
@@ -525,6 +482,58 @@ export default function App() {
       }
       if (cleanedUp) cleanup()
 
+      // ── HTTP bootstrap (async) ────────────────────────────────────
+      try {
+        const settings = await api.get('/api/settings')
+        if (!cancelled) dispatch(setSettings(applyLocalTerminalFontFamily(settings)))
+      } catch (err: any) {
+        if (handleBootstrapAuthFailure(err)) return
+        log.warn('Failed to load settings', err)
+      }
+
+      try {
+        const platformInfo = await api.get<{
+          platform: string
+          availableClis?: Record<string, boolean>
+          hostName?: string
+        }>('/api/platform')
+        if (!cancelled) {
+          dispatch(setPlatform(platformInfo.platform))
+          if (platformInfo.availableClis) {
+            dispatch(setAvailableClis(platformInfo.availableClis))
+          }
+          dispatch(setTabRegistryDeviceMeta(resolveAndPersistDeviceMeta({
+            platform: platformInfo.platform,
+            hostName: platformInfo.hostName,
+          })))
+        }
+      } catch (err: any) {
+        if (handleBootstrapAuthFailure(err)) return
+        log.warn('Failed to load platform info', err)
+      }
+
+      try {
+        const nextVersionInfo = await api.get<VersionInfo>('/api/version')
+        if (!cancelled && isVersionInfo(nextVersionInfo)) {
+          setVersionInfo(nextVersionInfo)
+        }
+      } catch (err: any) {
+        if (handleBootstrapAuthFailure(err)) return
+        log.warn('Failed to load version info', err)
+      }
+
+      try {
+        const projects = await api.get('/api/sessions')
+        if (!cancelled) dispatch(setProjects(projects))
+      } catch (err: any) {
+        if (handleBootstrapAuthFailure(err)) return
+        log.warn('Failed to load sessions', err)
+      }
+
+      // Load network status for remote access wizard/settings
+      if (!cancelled) dispatch(fetchNetworkStatus())
+
+      // ── WebSocket connection / reconciliation ─────────────────────
       // Another component may have connected before App finished bootstrap.
       // Reconcile state for the already-ready socket so sessions patches do not stay blocked.
       if (ws.isReady) {
