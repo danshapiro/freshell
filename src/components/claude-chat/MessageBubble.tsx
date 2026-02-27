@@ -52,6 +52,18 @@ function MessageBubble({
     return map
   }, [content])
 
+  // Check if any blocks will be visible after applying toggle filters.
+  // If not, skip rendering the wrapper entirely to avoid empty bordered divs.
+  const hasVisibleContent = useMemo(() => {
+    return content.some((block) => {
+      if (block.type === 'text' && block.text) return true
+      if (block.type === 'thinking' && block.thinking && showThinking) return true
+      if (block.type === 'tool_use' && block.name && showTools) return true
+      if (block.type === 'tool_result' && showTools) return true
+      return false
+    })
+  }, [content, showThinking, showTools])
+
   // Pre-compute which tool_use blocks should auto-expand based on global index.
   // Only completed tools (those with a matching result) consume expand slots.
   const expandSet = useMemo(() => {
@@ -66,6 +78,8 @@ function MessageBubble({
     }
     return set
   }, [content, resultMap, completedToolOffset, autoExpandAbove])
+
+  if (!hasVisibleContent) return null
 
   return (
     <div

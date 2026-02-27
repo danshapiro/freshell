@@ -223,6 +223,65 @@ describe('MessageBubble display toggles', () => {
   })
 })
 
+describe('MessageBubble empty message hiding', () => {
+  afterEach(cleanup)
+
+  it('hides entire message when all content is tools and showTools is false', () => {
+    const { container } = render(
+      <MessageBubble
+        role="assistant"
+        content={[
+          { type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } },
+          { type: 'tool_result', tool_use_id: 't1', content: 'output' },
+        ]}
+        showTools={false}
+      />
+    )
+    expect(container.querySelector('[role="article"]')).not.toBeInTheDocument()
+  })
+
+  it('hides entire message when all content is thinking and showThinking is false', () => {
+    const { container } = render(
+      <MessageBubble
+        role="assistant"
+        content={[{ type: 'thinking', thinking: 'Internal thoughts...' }]}
+        showThinking={false}
+      />
+    )
+    expect(container.querySelector('[role="article"]')).not.toBeInTheDocument()
+  })
+
+  it('hides message when mixed tools+thinking and both toggles are off', () => {
+    const { container } = render(
+      <MessageBubble
+        role="assistant"
+        content={[
+          { type: 'thinking', thinking: 'thoughts' },
+          { type: 'tool_use', id: 't1', name: 'Bash', input: {} },
+        ]}
+        showThinking={false}
+        showTools={false}
+      />
+    )
+    expect(container.querySelector('[role="article"]')).not.toBeInTheDocument()
+  })
+
+  it('still shows message when it has text alongside hidden tools', () => {
+    render(
+      <MessageBubble
+        role="assistant"
+        content={[
+          { type: 'text', text: 'Here is some text' },
+          { type: 'tool_use', id: 't1', name: 'Bash', input: {} },
+        ]}
+        showTools={false}
+      />
+    )
+    expect(screen.getByRole('article')).toBeInTheDocument()
+    expect(screen.getByText('Here is some text')).toBeInTheDocument()
+  })
+})
+
 describe('MessageBubble system-reminder stripping', () => {
   afterEach(cleanup)
 
