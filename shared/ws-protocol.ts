@@ -315,10 +315,18 @@ export const SdkSetPermissionModeSchema = z.object({
   permissionMode: z.string().min(1),
 })
 
+export const SdkQuestionRespondSchema = z.object({
+  type: z.literal('sdk.question.respond'),
+  sessionId: z.string().min(1),
+  requestId: z.string().min(1),
+  answers: z.record(z.string(), z.string()),
+})
+
 export const BrowserSdkMessageSchema = z.discriminatedUnion('type', [
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
+  SdkQuestionRespondSchema,
   SdkInterruptSchema,
   SdkKillSchema,
   SdkAttachSchema,
@@ -349,6 +357,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
+  SdkQuestionRespondSchema,
   SdkInterruptSchema,
   SdkKillSchema,
   SdkAttachSchema,
@@ -618,6 +627,7 @@ export type SdkServerMessage =
   | { type: 'sdk.exit'; sessionId: string; exitCode?: number }
   | { type: 'sdk.killed'; sessionId: string; success: boolean }
   | { type: 'sdk.models'; sessionId: string; models: Array<{ value: string; displayName: string; description: string }> }
+  | { type: 'sdk.question.request'; sessionId: string; requestId: string; questions: Array<{ question: string; header: string; options: Array<{ label: string; description: string }>; multiSelect: boolean }> }
 
 // ── Server message discriminated union ──
 

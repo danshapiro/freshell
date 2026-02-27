@@ -46,6 +46,7 @@ describe('SDK Protocol Types', () => {
         createdAt: Date.now(),
         messages: [],
         pendingPermissions: new Map(),
+        pendingQuestions: new Map(),
         costUsd: 0,
         totalInputTokens: 0,
         totalOutputTokens: 0,
@@ -60,6 +61,35 @@ describe('SDK Protocol Types', () => {
       const pending = state.pendingPermissions.get('req-1')!
       pending.resolve({ behavior: 'allow' })
       expect(resolveFn).toHaveBeenCalledWith({ behavior: 'allow' })
+    })
+
+    it('pendingQuestions stores resolve function that returns PermissionResult', () => {
+      const state: SdkSessionState = {
+        sessionId: 'test',
+        status: 'connected',
+        createdAt: Date.now(),
+        messages: [],
+        pendingPermissions: new Map(),
+        pendingQuestions: new Map(),
+        costUsd: 0,
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+      }
+      const resolveFn = vi.fn()
+      state.pendingQuestions.set('q-1', {
+        questions: [{ question: 'Which option?', header: 'Choice', options: [], multiSelect: false }],
+        resolve: resolveFn,
+      })
+      const pending = state.pendingQuestions.get('q-1')!
+      const result = {
+        behavior: 'allow' as const,
+        updatedInput: {
+          questions: pending.questions,
+          answers: { 'Which option?': 'Option A' },
+        },
+      }
+      pending.resolve(result)
+      expect(resolveFn).toHaveBeenCalledWith(result)
     })
   })
 
@@ -185,6 +215,25 @@ describe('SDK Protocol Types', () => {
         type: 'sdk.set-permission-mode',
         sessionId: 'sess-1',
         permissionMode: '',
+      })
+      expect(result.success).toBe(false)
+    })
+
+    it('validates sdk.question.respond message', () => {
+      const result = BrowserSdkMessageSchema.safeParse({
+        type: 'sdk.question.respond',
+        sessionId: 'sess-1',
+        requestId: 'q-1',
+        answers: { 'Which option?': 'Option A' },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    it('rejects sdk.question.respond with missing answers', () => {
+      const result = BrowserSdkMessageSchema.safeParse({
+        type: 'sdk.question.respond',
+        sessionId: 'sess-1',
+        requestId: 'q-1',
       })
       expect(result.success).toBe(false)
     })

@@ -31,6 +31,23 @@ export interface PermissionRequest {
   }
 }
 
+export interface QuestionOption {
+  label: string
+  description: string
+}
+
+export interface QuestionDefinition {
+  question: string
+  header: string
+  options: QuestionOption[]
+  multiSelect: boolean
+}
+
+export interface QuestionRequest {
+  requestId: string
+  questions: QuestionDefinition[]
+}
+
 export interface ChatSessionState {
   sessionId: string
   cliSessionId?: string
@@ -41,6 +58,7 @@ export interface ChatSessionState {
   streamingText: string
   streamingActive: boolean
   pendingPermissions: Record<string, PermissionRequest>
+  pendingQuestions: Record<string, QuestionRequest>
   totalCostUsd: number
   totalInputTokens: number
   totalOutputTokens: number
