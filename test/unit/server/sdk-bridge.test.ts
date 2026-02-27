@@ -629,6 +629,103 @@ describe('SdkBridge', () => {
     })
   })
 
+  describe('question round-trip', () => {
+    it('detects AskUserQuestion in assistant message and broadcasts request', async () => {
+      mockKeepStreamOpen = true
+      mockMessages.push({
+        type: 'assistant',
+        message: {
+          content: [{
+            type: 'tool_use',
+            id: 'tool-q1',
+            name: 'AskUserQuestion',
+            input: {
+              questions: [{
+                question: 'Which auth method?',
+                header: 'Auth',
+                options: [
+                  { label: 'OAuth', description: 'Use OAuth 2.0' },
+                  { label: 'JWT', description: 'Use JSON Web Tokens' },
+                ],
+                multiSelect: false,
+              }],
+            },
+          }],
+        },
+        parent_tool_use_id: null,
+        uuid: 'test-uuid',
+        session_id: 'cli-123',
+      })
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      const questionMsg = received.find(m => m.type === 'sdk.question.request')
+      expect(questionMsg).toBeDefined()
+      expect(questionMsg.toolUseId).toBe('tool-q1')
+      expect(questionMsg.questions).toHaveLength(1)
+      expect(questionMsg.questions[0].header).toBe('Auth')
+    })
+
+    it('respondQuestion resolves and injects synthetic tool_result', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      bridge.subscribe(session.sessionId, () => {})
+
+      // Manually add a pending question (simulating what handleQuestionRequest does)
+      const state = bridge.getSession(session.sessionId)!
+      state.pendingQuestions.set('q-req-1', {
+        toolUseId: 'tool-q1',
+        questions: [],
+        resolve: () => {},
+      })
+
+      const ok = bridge.respondQuestion(session.sessionId, 'q-req-1', { 'Auth': 'OAuth' })
+      expect(ok).toBe(true)
+      expect(state.pendingQuestions.has('q-req-1')).toBe(false)
+    })
+
+    it('respondQuestion returns false for nonexistent request', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      expect(bridge.respondQuestion(session.sessionId, 'nonexistent', {})).toBe(false)
+    })
+
+    it('respondQuestion returns false for nonexistent session', () => {
+      expect(bridge.respondQuestion('nonexistent', 'q-1', {})).toBe(false)
+    })
+
+    it('ignores non-AskUserQuestion tool_use blocks', async () => {
+      mockKeepStreamOpen = true
+      mockMessages.push({
+        type: 'assistant',
+        message: {
+          content: [{
+            type: 'tool_use',
+            id: 'tool-bash',
+            name: 'Bash',
+            input: { command: 'ls' },
+          }],
+        },
+        parent_tool_use_id: null,
+        uuid: 'test-uuid',
+        session_id: 'cli-123',
+      })
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+
+      await new Promise(resolve => setTimeout(resolve, 100))
+
+      const questionMsg = received.find(m => m.type === 'sdk.question.request')
+      expect(questionMsg).toBeUndefined()
+    })
+  })
+
   describe('environment handling', () => {
     it('passes CLAUDE_CMD env var as pathToClaudeCodeExecutable', async () => {
       const original = process.env.CLAUDE_CMD

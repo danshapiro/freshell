@@ -288,6 +288,13 @@ export const SdkPermissionRespondSchema = z.object({
   interrupt: z.boolean().optional(),
 })
 
+export const SdkQuestionRespondSchema = z.object({
+  type: z.literal('sdk.question.respond'),
+  sessionId: z.string().min(1),
+  requestId: z.string().min(1),
+  answers: z.record(z.string(), z.union([z.string(), z.array(z.string())])),
+})
+
 export const SdkInterruptSchema = z.object({
   type: z.literal('sdk.interrupt'),
   sessionId: z.string().min(1),
@@ -319,6 +326,7 @@ export const BrowserSdkMessageSchema = z.discriminatedUnion('type', [
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
+  SdkQuestionRespondSchema,
   SdkInterruptSchema,
   SdkKillSchema,
   SdkAttachSchema,
@@ -349,6 +357,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
+  SdkQuestionRespondSchema,
   SdkInterruptSchema,
   SdkKillSchema,
   SdkAttachSchema,
@@ -612,6 +621,7 @@ export type SdkServerMessage =
   | { type: 'sdk.result'; sessionId: string; result?: string; durationMs?: number; costUsd?: number; usage?: Usage }
   | { type: 'sdk.permission.request'; sessionId: string; requestId: string; subtype: string; tool?: { name: string; input?: Record<string, unknown> }; toolUseID?: string; suggestions?: unknown[]; blockedPath?: string; decisionReason?: string }
   | { type: 'sdk.permission.cancelled'; sessionId: string; requestId: string }
+  | { type: 'sdk.question.request'; sessionId: string; requestId: string; toolUseId: string; questions: Array<{ question: string; header: string; options: Array<{ label: string; description: string }>; multiSelect: boolean }> }
   | { type: 'sdk.status'; sessionId: string; status: SdkSessionStatus }
   | { type: 'sdk.error'; sessionId: string; message: string }
   | { type: 'sdk.history'; sessionId: string; messages: Array<{ role: 'user' | 'assistant'; content: ContentBlock[]; timestamp?: string }> }

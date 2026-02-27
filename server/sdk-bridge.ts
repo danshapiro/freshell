@@ -57,6 +57,7 @@ export class SdkBridge extends EventEmitter {
       createdAt: Date.now(),
       messages: [],
       pendingPermissions: new Map(),
+      pendingQuestions: new Map(),
       costUsd: 0,
       totalInputTokens: 0,
       totalOutputTokens: 0,
@@ -259,6 +260,13 @@ export class SdkBridge extends EventEmitter {
           content: blocks,
           model: (aMsg.message as any)?.model,
         })
+
+        // Intercept AskUserQuestion tool calls for interactive UI
+        for (const block of blocks) {
+          if (block.type === 'tool_use' && block.name === 'AskUserQuestion') {
+            this.handleQuestionRequest(sessionId, block.id, block.input as Record<string, unknown>)
+          }
+        }
         break
       }
 
@@ -349,6 +357,37 @@ export class SdkBridge extends EventEmitter {
         decisionReason: options.decisionReason,
       })
     })
+  }
+
+  private handleQuestionRequest(
+    sessionId: string,
+    toolUseId: string,
+    input: Record<string, unknown>,
+  ): void {
+    const state = this.sessions.get(sessionId)
+    if (!state) return
+
+    const requestId = nanoid()
+    const questions = (input.questions as Array<{
+      question: string
+      header: string
+      options: Array<{ label: string; description: string }>
+      multiSelect: boolean
+    }>) || []
+
+    state.pendingQuestions.set(requestId, {
+      toolUseId,
+      questions,
+      resolve: () => {},  // placeholder -- resolved by respondQuestion
+    })
+
+    this.broadcastToSession(sessionId, {
+      type: 'sdk.question.request',
+      sessionId,
+      requestId,
+      toolUseId,
+      questions,
+    } as any)
   }
 
   getSession(sessionId: string): SdkSessionState | undefined {
@@ -444,6 +483,44 @@ export class SdkBridge extends EventEmitter {
     state!.pendingPermissions.delete(requestId)
     pending.resolve(decision)
     return true
+  }
+
+  respondQuestion(
+    sessionId: string,
+    requestId: string,
+    answers: Record<string, string | string[]>,
+  ): boolean {
+    const state = this.sessions.get(sessionId)
+    const pending = state?.pendingQuestions.get(requestId)
+    if (!pending) return false
+
+    state!.pendingQuestions.delete(requestId)
+    this.injectQuestionAnswer(sessionId, pending.toolUseId, answers)
+    return true
+  }
+
+  private injectQuestionAnswer(
+    sessionId: string,
+    toolUseId: string,
+    answers: Record<string, string | string[]>,
+  ): void {
+    const sp = this.processes.get(sessionId)
+    const state = this.sessions.get(sessionId)
+    if (!sp || !state) return
+
+    sp.inputStream.push({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: toolUseId,
+          content: JSON.stringify({ type: 'tool_result', answers }),
+        }],
+      },
+      parent_tool_use_id: null,
+      session_id: state.cliSessionId || 'default',
+    })
   }
 
   interrupt(sessionId: string): boolean {

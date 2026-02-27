@@ -9,6 +9,8 @@ import claudeChatReducer, {
   clearStreaming,
   addPermissionRequest,
   removePermission,
+  addQuestionRequest,
+  removeQuestion,
   setSessionStatus,
   turnResult,
   sessionExited,
@@ -99,6 +101,34 @@ describe('claudeChatSlice', () => {
     expect(state.sessions['s1'].pendingPermissions['perm-1']).toBeDefined()
     state = claudeChatReducer(state, removePermission({ sessionId: 's1', requestId: 'perm-1' }))
     expect(state.sessions['s1'].pendingPermissions['perm-1']).toBeUndefined()
+  })
+
+  it('tracks question requests', () => {
+    let state = claudeChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+    state = claudeChatReducer(state, addQuestionRequest({
+      sessionId: 's1',
+      requestId: 'q-1',
+      toolUseId: 'tool-q1',
+      questions: [{
+        question: 'Which auth method?',
+        header: 'Auth',
+        options: [
+          { label: 'OAuth', description: 'Use OAuth 2.0' },
+          { label: 'JWT', description: 'Use JSON Web Tokens' },
+        ],
+        multiSelect: false,
+      }],
+    }))
+    expect(state.sessions['s1'].pendingQuestions['q-1']).toBeDefined()
+    expect(state.sessions['s1'].pendingQuestions['q-1'].toolUseId).toBe('tool-q1')
+    expect(state.sessions['s1'].pendingQuestions['q-1'].questions).toHaveLength(1)
+    state = claudeChatReducer(state, removeQuestion({ sessionId: 's1', requestId: 'q-1' }))
+    expect(state.sessions['s1'].pendingQuestions['q-1']).toBeUndefined()
+  })
+
+  it('initializes pendingQuestions as empty object', () => {
+    const state = claudeChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+    expect(state.sessions['s1'].pendingQuestions).toEqual({})
   })
 
   it('accumulates cost on result', () => {

@@ -99,6 +99,43 @@ describe('sdk-message-handler', () => {
     expect(calls[0].type).toBe('claudeChat/turnResult')
   })
 
+  it('dispatches addQuestionRequest for sdk.question.request', () => {
+    const { dispatch, calls } = createMockDispatch()
+    const handled = handleSdkMessage(dispatch, {
+      type: 'sdk.question.request',
+      sessionId: 'sess-1',
+      requestId: 'q-1',
+      toolUseId: 'tool-q1',
+      questions: [{
+        question: 'Which auth method?',
+        header: 'Auth',
+        options: [
+          { label: 'OAuth', description: 'Use OAuth 2.0' },
+          { label: 'JWT', description: 'Use JSON Web Tokens' },
+        ],
+        multiSelect: false,
+      }],
+    })
+    expect(handled).toBe(true)
+    expect(dispatch).toHaveBeenCalledOnce()
+    const action = calls[0]
+    expect(action.type).toBe('claudeChat/addQuestionRequest')
+    expect(action.payload).toEqual({
+      sessionId: 'sess-1',
+      requestId: 'q-1',
+      toolUseId: 'tool-q1',
+      questions: [{
+        question: 'Which auth method?',
+        header: 'Auth',
+        options: [
+          { label: 'OAuth', description: 'Use OAuth 2.0' },
+          { label: 'JWT', description: 'Use JSON Web Tokens' },
+        ],
+        multiSelect: false,
+      }],
+    })
+  })
+
   it('returns false for unknown message types', () => {
     const { dispatch } = createMockDispatch()
 

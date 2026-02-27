@@ -44,6 +44,7 @@ import {
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
+  SdkQuestionRespondSchema,
   SdkInterruptSchema,
   SdkKillSchema,
   SdkAttachSchema,
@@ -147,6 +148,7 @@ const ClientMessageSchema = z.discriminatedUnion('type', [
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
+  SdkQuestionRespondSchema,
   SdkInterruptSchema,
   SdkKillSchema,
   SdkAttachSchema,
@@ -1448,6 +1450,22 @@ export class WsHandler {
         const ok = this.sdkBridge.respondPermission(m.sessionId, m.requestId, decision)
         if (!ok) {
           this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'SDK session not found' })
+        }
+        return
+      }
+
+      case 'sdk.question.respond': {
+        if (!this.sdkBridge) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
+          return
+        }
+        if (!state.sdkSessions.has(m.sessionId) && !state.sdkSubscriptions.has(m.sessionId)) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
+          return
+        }
+        const ok = this.sdkBridge.respondQuestion(m.sessionId, m.requestId, m.answers)
+        if (!ok) {
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'SDK session or question not found' })
         }
         return
       }

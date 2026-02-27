@@ -7,6 +7,7 @@ import {
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
+  SdkQuestionRespondSchema,
   SdkInterruptSchema,
   SdkKillSchema,
   SdkAttachSchema,
@@ -147,6 +148,49 @@ describe('WS Handler SDK Integration', () => {
       expect(result.success).toBe(false)
     })
 
+    it('parses sdk.question.respond message', () => {
+      const result = SdkQuestionRespondSchema.safeParse({
+        type: 'sdk.question.respond',
+        sessionId: 'sess-1',
+        requestId: 'q-1',
+        answers: { 'Auth method': 'OAuth' },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    it('parses sdk.question.respond with array answers (multi-select)', () => {
+      const result = SdkQuestionRespondSchema.safeParse({
+        type: 'sdk.question.respond',
+        sessionId: 'sess-1',
+        requestId: 'q-1',
+        answers: { 'Features': ['Dark mode', 'Notifications'] },
+      })
+      expect(result.success).toBe(true)
+      if (result.success) {
+        expect(result.data.answers['Features']).toEqual(['Dark mode', 'Notifications'])
+      }
+    })
+
+    it('rejects sdk.question.respond with empty sessionId', () => {
+      const result = SdkQuestionRespondSchema.safeParse({
+        type: 'sdk.question.respond',
+        sessionId: '',
+        requestId: 'q-1',
+        answers: { 'Auth method': 'OAuth' },
+      })
+      expect(result.success).toBe(false)
+    })
+
+    it('rejects sdk.question.respond with empty requestId', () => {
+      const result = SdkQuestionRespondSchema.safeParse({
+        type: 'sdk.question.respond',
+        sessionId: 'sess-1',
+        requestId: '',
+        answers: { 'Auth method': 'OAuth' },
+      })
+      expect(result.success).toBe(false)
+    })
+
     it('parses sdk.interrupt message', () => {
       const result = SdkInterruptSchema.safeParse({
         type: 'sdk.interrupt',
@@ -196,6 +240,7 @@ describe('WS Handler SDK Integration', () => {
         subscribe: vi.fn().mockReturnValue(() => {}),
         sendUserMessage: vi.fn().mockReturnValue(true),
         respondPermission: vi.fn().mockReturnValue(true),
+        respondQuestion: vi.fn().mockReturnValue(true),
         interrupt: vi.fn().mockReturnValue(true),
         killSession: vi.fn().mockReturnValue(true),
         getSession: vi.fn().mockReturnValue({
@@ -624,6 +669,48 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
+    it('routes sdk.question.respond to sdkBridge.respondQuestion', async () => {
+      const ws = await connectAndAuth()
+      try {
+        // First create a session so client owns it
+        await sendAndWaitForResponse(ws, {
+          type: 'sdk.create',
+          requestId: 'req-q',
+        }, 'sdk.created')
+
+        ws.send(JSON.stringify({
+          type: 'sdk.question.respond',
+          sessionId: 'sdk-sess-1',
+          requestId: 'q-1',
+          answers: { 'Auth': 'OAuth' },
+        }))
+
+        await new Promise((resolve) => setTimeout(resolve, 100))
+
+        expect(mockSdkBridge.respondQuestion).toHaveBeenCalledWith(
+          'sdk-sess-1', 'q-1', { 'Auth': 'OAuth' },
+        )
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('rejects sdk.question.respond for unowned session', async () => {
+      const ws = await connectAndAuth()
+      try {
+        const response = await sendAndWaitForResponse(ws, {
+          type: 'sdk.question.respond',
+          sessionId: 'not-my-session',
+          requestId: 'q-1',
+          answers: { 'Auth': 'OAuth' },
+        }, 'error')
+
+        expect(response.code).toBe('UNAUTHORIZED')
+      } finally {
+        ws.close()
+      }
+    })
+
     it('sends preliminary sdk.session.init to break init deadlock', async () => {
       // The SDK subprocess only emits system/init after the first user message,
       // but the UI waits for sdk.session.init before showing the chat input.
@@ -797,6 +884,23 @@ describe('WS Handler SDK Integration', () => {
           type: 'sdk.send',
           sessionId: 'sess-1',
           text: 'hello',
+        }, 'error')
+
+        expect(response.type).toBe('error')
+        expect(response.code).toBe('INTERNAL_ERROR')
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('returns INTERNAL_ERROR for sdk.question.respond when bridge not enabled', async () => {
+      const ws = await connectAndAuth()
+      try {
+        const response = await sendAndWaitForResponse(ws, {
+          type: 'sdk.question.respond',
+          sessionId: 'sess-1',
+          requestId: 'q-1',
+          answers: { 'Auth': 'OAuth' },
         }, 'error')
 
         expect(response.type).toBe('error')

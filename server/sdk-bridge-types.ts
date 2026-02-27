@@ -10,6 +10,7 @@ export {
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
+  SdkQuestionRespondSchema,
   SdkInterruptSchema,
   SdkKillSchema,
   SdkAttachSchema,
@@ -72,6 +73,11 @@ export interface SdkSessionState {
     blockedPath?: string
     decisionReason?: string
     resolve: (result: PermissionResult) => void
+  }>
+  pendingQuestions: Map<string, {
+    toolUseId: string
+    questions: Array<{ question: string; header: string; options: Array<{ label: string; description: string }>; multiSelect: boolean }>
+    resolve: () => void
   }>
   costUsd: number
   totalInputTokens: number
