@@ -62,6 +62,30 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
+    it('parses sdk.create with plugins array', () => {
+      const result = SdkCreateSchema.safeParse({
+        type: 'sdk.create',
+        requestId: 'req-1',
+        cwd: '/home/user/project',
+        plugins: ['/path/to/.claude/plugins/my-skill'],
+      })
+      expect(result.success).toBe(true)
+      if (result.success) {
+        expect(result.data.plugins).toEqual(['/path/to/.claude/plugins/my-skill'])
+      }
+    })
+
+    it('parses sdk.create without plugins (optional)', () => {
+      const result = SdkCreateSchema.safeParse({
+        type: 'sdk.create',
+        requestId: 'req-1',
+      })
+      expect(result.success).toBe(true)
+      if (result.success) {
+        expect(result.data.plugins).toBeUndefined()
+      }
+    })
+
     it('rejects sdk.create with empty requestId', () => {
       const result = SdkCreateSchema.safeParse({
         type: 'sdk.create',

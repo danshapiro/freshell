@@ -265,6 +265,7 @@ export const SdkCreateSchema = z.object({
   model: z.string().optional(),
   permissionMode: z.string().optional(),
   effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+  plugins: z.array(z.string()).optional(),
 })
 
 export const SdkSendSchema = z.object({
