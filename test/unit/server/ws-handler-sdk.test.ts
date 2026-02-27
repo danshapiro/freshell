@@ -11,7 +11,7 @@ import {
   SdkKillSchema,
   SdkAttachSchema,
 } from '../../../server/sdk-bridge-types.js'
-import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
+import { BrowserSdkMessageSchema, WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
 vi.mock('node-pty', () => ({
   spawn: vi.fn(),
@@ -201,6 +201,16 @@ describe('WS Handler SDK Integration', () => {
         sessionId: '',
       })
       expect(result.success).toBe(false)
+    })
+
+    it('sdk.create with plugins field is valid in BrowserSdkMessageSchema', () => {
+      const result = BrowserSdkMessageSchema.safeParse({
+        type: 'sdk.create',
+        requestId: 'req-1',
+        cwd: '/tmp',
+        plugins: ['/path/to/plugin'],
+      })
+      expect(result.success).toBe(true)
     })
   })
 
@@ -546,6 +556,24 @@ describe('WS Handler SDK Integration', () => {
         // sdk.created MUST arrive before sdk.session.init
         expect(received[0].type).toBe('sdk.created')
         expect(received[1].type).toBe('sdk.session.init')
+      } finally {
+        ws.close()
+      }
+    })
+
+    it('routes sdk.create with plugins to sdkBridge.createSession', async () => {
+      const ws = await connectAndAuth()
+      try {
+        await sendAndWaitForResponse(ws, {
+          type: 'sdk.create',
+          requestId: 'req-plugins',
+          cwd: '/tmp',
+          plugins: ['/path/to/plugin-a', '/path/to/plugin-b'],
+        }, 'sdk.created')
+
+        expect(mockSdkBridge.createSession).toHaveBeenCalledWith(
+          expect.objectContaining({ plugins: ['/path/to/plugin-a', '/path/to/plugin-b'] }),
+        )
       } finally {
         ws.close()
       }
