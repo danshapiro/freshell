@@ -87,6 +87,7 @@ export interface SdkSessionState {
     resolve: (result: PermissionResult) => void
   }>
   pendingQuestions: Map<string, {
+    originalInput: Record<string, unknown>
     questions: QuestionDefinition[]
     resolve: (result: PermissionResult) => void
   }>

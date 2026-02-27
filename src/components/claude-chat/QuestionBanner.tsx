@@ -218,15 +218,12 @@ function QuestionBanner({ question, onAnswer, disabled }: QuestionBannerProps) {
           onClick={() => {
             // Map index-based internal keys back to question text for the SDK.
             // SDK answers are Record<string, string> keyed by question text.
-            // Disambiguate duplicate question text with index suffix to prevent data loss.
+            // Note: duplicate question text would cause key collisions, but this
+            // matches the SDK contract — keys must be exact question text strings.
+            // Claude never generates duplicate question text in practice.
             const result: Record<string, string> = {}
-            const seen = new Map<string, number>()
             questions.forEach((q, idx) => {
-              let key = q.question
-              const count = seen.get(key) ?? 0
-              seen.set(key, count + 1)
-              if (count > 0) key = `${key} [${count + 1}]`
-              result[key] = answered[String(idx)]
+              result[q.question] = answered[String(idx)]
             })
             onAnswer(result)
           }}

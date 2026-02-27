@@ -607,6 +607,41 @@ describe('SdkBridge', () => {
       expect(bridge.respondQuestion(session.sessionId, 'q-nonexistent', {})).toBe(false)
     })
 
+    it('preserves extra root-level fields from original input', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      bridge.subscribe(session.sessionId, () => {})
+
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      const questions = [
+        { question: 'Pick one', header: 'H', options: [{ label: 'A', description: '' }], multiSelect: false },
+      ]
+      // Original input has extra root fields beyond just "questions"
+      const canUseToolPromise = mockCanUseTool('AskUserQuestion', {
+        questions,
+        metadata: { source: 'test' },
+        annotations: { foo: 'bar' },
+      }, {
+        signal: new AbortController().signal,
+        toolUseID: 'tool-preserve',
+      })
+
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      const state = bridge.getSession(session.sessionId)!
+      const requestId = Array.from(state.pendingQuestions.keys())[0]
+
+      bridge.respondQuestion(session.sessionId, requestId, { 'Pick one': 'A' })
+
+      const result = await canUseToolPromise
+      expect(result.behavior).toBe('allow')
+      // Extra fields should be preserved in updatedInput
+      expect(result.updatedInput.metadata).toEqual({ source: 'test' })
+      expect(result.updatedInput.annotations).toEqual({ foo: 'bar' })
+      expect(result.updatedInput.answers).toEqual({ 'Pick one': 'A' })
+    })
+
     it('formats multi-select answers as comma-separated strings', async () => {
       mockKeepStreamOpen = true
       const session = await bridge.createSession({ cwd: '/tmp' })

@@ -405,6 +405,7 @@ export class SdkBridge extends EventEmitter {
 
     return new Promise((resolve) => {
       state.pendingQuestions.set(requestId, {
+        originalInput: input,
         questions,
         resolve,
       })
@@ -431,6 +432,7 @@ export class SdkBridge extends EventEmitter {
     pending.resolve({
       behavior: 'allow',
       updatedInput: {
+        ...pending.originalInput,
         questions: pending.questions,
         answers,
       },
