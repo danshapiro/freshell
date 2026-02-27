@@ -891,6 +891,37 @@ describe('SdkBridge', () => {
       expect(modelsMsg.models[0].value).toBe('claude-opus-4-6')
     })
 
+    it('formats raw model IDs into human-readable display names', async () => {
+      mockKeepStreamOpen = true
+      // Simulate SDK returning raw model IDs as displayName
+      mockSupportedModels = [
+        { value: 'claude-opus-4-6', displayName: 'claude-opus-4-6', description: '' },
+        { value: 'claude-sonnet-4-5-20250929', displayName: 'claude-sonnet-4-5-20250929', description: '' },
+        { value: 'claude-haiku-4-5-20251001', displayName: 'claude-haiku-4-5-20251001', description: '' },
+      ]
+      mockMessages.push({
+        type: 'system',
+        subtype: 'init',
+        session_id: 'cli-123',
+        model: 'claude-sonnet-4-5-20250929',
+        cwd: '/tmp',
+        tools: ['Bash'],
+        uuid: 'test-uuid',
+      })
+
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+
+      await new Promise(resolve => setTimeout(resolve, 200))
+
+      const modelsMsg = received.find(m => m.type === 'sdk.models')
+      expect(modelsMsg).toBeDefined()
+      expect(modelsMsg.models[0].displayName).toBe('Opus 4.6')
+      expect(modelsMsg.models[1].displayName).toBe('Sonnet 4.5')
+      expect(modelsMsg.models[2].displayName).toBe('Haiku 4.5')
+    })
+
     it('handles supportedModels() failure gracefully', async () => {
       mockKeepStreamOpen = true
       mockSupportedModelsError = new Error('Not supported')

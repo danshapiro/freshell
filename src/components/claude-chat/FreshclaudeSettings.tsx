@@ -4,6 +4,7 @@ import { cn } from '@/lib/utils'
 import { Switch } from '@/components/ui/switch'
 import { useMobile } from '@/hooks/useMobile'
 import type { ClaudeChatPaneContent } from '@/store/paneTypes'
+import { formatModelDisplayName } from '../../../shared/format-model-name'
 
 type SettingsFields = Pick<ClaudeChatPaneContent, 'model' | 'permissionMode' | 'effort' | 'showThinking' | 'showTools' | 'showTimecodes'>
 
@@ -23,8 +24,10 @@ interface FreshclaudeSettingsProps {
 
 const MODEL_OPTIONS = [
   { value: 'claude-opus-4-6', label: 'Opus 4.6' },
-  { value: 'claude-sonnet-4-5-20250929', label: 'Sonnet 4.5' },
+  { value: 'claude-sonnet-4-6', label: 'Sonnet 4.6' },
   { value: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
+  { value: 'claude-sonnet-4-5-20250929', label: 'Sonnet 4.5' },
+  { value: 'claude-opus-4-5', label: 'Opus 4.5' },
 ]
 
 const PERMISSION_OPTIONS = [
@@ -100,10 +103,42 @@ export default function FreshclaudeSettings({
     return () => document.removeEventListener('keydown', handleEscape)
   }, [open, handleClose])
 
-  // Use dynamic model options when available, fall back to hardcoded
-  const resolvedModelOptions = modelOptions
-    ? modelOptions.map((m) => ({ value: m.value, label: m.displayName }))
-    : MODEL_OPTIONS
+  // Start with the hardcoded list, then append any dynamic models not already present.
+  // When the SDK provides a model whose normalized label matches a hardcoded entry
+  // (e.g. a newer dated ID like claude-sonnet-4-5-20251101 → "Sonnet 4.5"), replace
+  // the hardcoded value so users get the current model ID without duplicates.
+  const resolvedModelOptions = (() => {
+    if (!modelOptions) return MODEL_OPTIONS
+
+    // Map normalized label → SDK value for models with full claude-* IDs.
+    // When multiple dated IDs map to the same label, keep the latest one.
+    const sdkByLabel = new Map<string, string>()
+    for (const m of modelOptions) {
+      if (m.value.startsWith('claude-')) {
+        const label = formatModelDisplayName(m.displayName)
+        const existing = sdkByLabel.get(label)
+        if (!existing || m.value > existing) {
+          sdkByLabel.set(label, m.value)
+        }
+      }
+    }
+
+    // Replace hardcoded values with SDK values when labels match
+    const usedLabels = new Set<string>()
+    const base = MODEL_OPTIONS.map((m) => {
+      usedLabels.add(m.label)
+      const sdkValue = sdkByLabel.get(m.label)
+      return sdkValue ? { value: sdkValue, label: m.label } : m
+    })
+
+    // Append genuinely new SDK models not matching any hardcoded label
+    const extras = modelOptions
+      .filter((m) => m.value.startsWith('claude-'))
+      .map((m) => ({ value: m.value, label: formatModelDisplayName(m.displayName) }))
+      .filter((m) => !usedLabels.has(m.label))
+
+    return [...base, ...extras]
+  })()
 
   return (
     <div className="relative">

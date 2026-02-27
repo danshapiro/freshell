@@ -32,7 +32,10 @@ const claudeChatSlice = createSlice({
   reducers: {
     sessionCreated(state, action: PayloadAction<{ requestId: string; sessionId: string }>) {
       const { requestId, sessionId } = action.payload
-      ensureSession(state, sessionId)
+      const session = ensureSession(state, sessionId)
+      // Fresh creates have no history to load — mark as loaded so the UI doesn't
+      // show "Restoring session..." for newly created sessions.
+      session.historyLoaded = true
       state.pendingCreates[requestId] = sessionId
     },
 
@@ -187,6 +190,7 @@ const claudeChatSlice = createSlice({
         content: msg.content,
         timestamp: msg.timestamp || new Date().toISOString(),
       }))
+      session.historyLoaded = true
     },
 
     sessionError(state, action: PayloadAction<{ sessionId: string; message: string }>) {

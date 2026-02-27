@@ -145,6 +145,32 @@ describe('claudeChatSlice', () => {
     expect(state.sessions['s1'].messages[1].role).toBe('assistant')
   })
 
+  it('sets historyLoaded on sessionCreated (fresh create)', () => {
+    const state = claudeChatReducer(initial, sessionCreated({
+      requestId: 'req-1',
+      sessionId: 'sess-1',
+    }))
+    expect(state.sessions['sess-1'].historyLoaded).toBe(true)
+  })
+
+  it('sets historyLoaded on replayHistory (attach/reconnect)', () => {
+    const state = claudeChatReducer(initial, replayHistory({
+      sessionId: 'sess-attach',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'hi' }], timestamp: '2026-01-01T00:00:00Z' },
+      ],
+    }))
+    expect(state.sessions['sess-attach'].historyLoaded).toBe(true)
+  })
+
+  it('does not set historyLoaded on setSessionStatus alone', () => {
+    const state = claudeChatReducer(initial, setSessionStatus({
+      sessionId: 'sess-status',
+      status: 'idle',
+    }))
+    expect(state.sessions['sess-status'].historyLoaded).toBeUndefined()
+  })
+
   it('bootstraps session on replayHistory for unknown sessionId', () => {
     const state = claudeChatReducer(initial, replayHistory({
       sessionId: 'unknown-sess',

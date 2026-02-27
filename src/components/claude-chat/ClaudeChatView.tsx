@@ -1,10 +1,11 @@
-import React, { useCallback, useEffect, useMemo, useRef } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ClaudeChatPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updatePaneContent } from '@/store/panesSlice'
 import { addUserMessage, clearPendingCreate, removePermission, removeQuestion } from '@/store/claudeChatSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { cn } from '@/lib/utils'
+import { ChevronDown } from 'lucide-react'
 import MessageBubble from './MessageBubble'
 import PermissionBanner from './PermissionBanner'
 import QuestionBanner from './QuestionBanner'
@@ -13,7 +14,7 @@ import FreshclaudeSettings from './FreshclaudeSettings'
 import ThinkingIndicator from './ThinkingIndicator'
 import { useStreamDebounce } from './useStreamDebounce'
 import CollapsedTurn from './CollapsedTurn'
-import type { ChatMessage } from '@/store/claudeChatTypes'
+import type { ChatMessage, ChatSessionState } from '@/store/claudeChatTypes'
 import { api } from '@/lib/api'
 
 const DEFAULT_MODEL = 'claude-opus-4-6'
@@ -35,6 +36,8 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const isAtBottomRef = useRef(true)
+  const [showScrollButton, setShowScrollButton] = useState(false)
+  const [hasNewMessages, setHasNewMessages] = useState(false)
   // Keep a ref to the latest paneContent to avoid stale closures in effects
   // while using only primitive deps for triggering.
   const paneContentRef = useRef(paneContent)
@@ -44,10 +47,25 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
   const pendingSessionId = useAppSelector(
     (s) => s.claudeChat.pendingCreates[paneContent.createRequestId],
   )
+  const sessionId = paneContent.sessionId
   const session = useAppSelector(
-    (s) => paneContent.sessionId ? s.claudeChat.sessions[paneContent.sessionId] : undefined,
+    (s) => sessionId ? s.claudeChat.sessions[sessionId] : undefined,
   )
   const availableModels = useAppSelector((s) => s.claudeChat.availableModels)
+
+  // Track whether we're waiting for a session restore (persisted sessionId, history not yet loaded).
+  // Fresh creates set historyLoaded=true immediately; reloads wait for sdk.history.
+  // Times out after 5s to handle stale sessionIds from server restarts.
+  const isRestoring = !!paneContent.sessionId && !session?.historyLoaded
+  const [restoreTimedOut, setRestoreTimedOut] = useState(false)
+  useEffect(() => {
+    if (!isRestoring) {
+      setRestoreTimedOut(false)
+      return
+    }
+    const timer = setTimeout(() => setRestoreTimedOut(true), 5_000)
+    return () => clearTimeout(timer)
+  }, [isRestoring])
 
   // Wire sessionId from pendingCreates back into the pane content
   useEffect(() => {
@@ -125,14 +143,26 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
   useEffect(() => {
     if (isAtBottomRef.current) {
       messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    } else if (session?.messages.length) {
+      // New message arrived while scrolled up — show badge
+      setHasNewMessages(true)
     }
   }, [session?.messages.length, session?.streamingActive])
+
+  const scrollToBottom = useCallback(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    setHasNewMessages(false)
+    setShowScrollButton(false)
+    isAtBottomRef.current = true
+  }, [])
 
   const handleSend = useCallback((text: string) => {
     if (!paneContent.sessionId) return
     dispatch(addUserMessage({ sessionId: paneContent.sessionId, text }))
     ws.send({ type: 'sdk.send', sessionId: paneContent.sessionId, text })
-  }, [paneContent.sessionId, dispatch, ws])
+    // Always scroll to bottom when the user sends a message
+    scrollToBottom()
+  }, [paneContent.sessionId, dispatch, ws, scrollToBottom])
 
   const handleInterrupt = useCallback(() => {
     if (!paneContent.sessionId) return
@@ -171,7 +201,10 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
     const el = scrollContainerRef.current
     if (!el) return
     const threshold = 50
-    isAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < threshold
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < threshold
+    isAtBottomRef.current = atBottom
+    setShowScrollButton(!atBottom)
+    if (atBottom) setHasNewMessages(false)
   }, [])
 
   const handleSettingsChange = useCallback((changes: Record<string, unknown>) => {
@@ -322,13 +355,22 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
         </div>
       </div>
 
-      {/* Message area */}
-      <div ref={scrollContainerRef} onScroll={handleScroll} className="flex-1 overflow-y-auto p-4 space-y-3" data-context="freshclaude-chat" data-session-id={paneContent.sessionId}>
-        {!session?.messages.length && (
+      {/* Message area wrapper (relative for scroll-to-bottom button positioning) */}
+      <div className="relative flex-1 min-h-0">
+      <div ref={scrollContainerRef} onScroll={handleScroll} className="h-full overflow-y-auto p-4 space-y-3" data-context="freshclaude-chat" data-session-id={paneContent.sessionId}>
+        {/* Restoring: persisted sessionId but history not yet loaded (reload/back-nav).
+             Falls back to welcome screen after timeout (e.g. server restarted, session lost). */}
+        {isRestoring && !restoreTimedOut && (
+          <div className="text-center text-muted-foreground text-sm py-8">
+            <p>Restoring session...</p>
+          </div>
+        )}
+
+        {/* Welcome: no sessionId, session exists but empty, or restore timed out */}
+        {!session?.messages.length && (!isRestoring || restoreTimedOut) && (
           <div className="text-center text-muted-foreground text-sm py-8">
             <p className="font-medium mb-2">freshclaude</p>
             <p>Rich chat UI for Claude Code sessions.</p>
-            <p className="text-xs mt-2">Session: {paneContent.sessionId ?? 'pending'}</p>
           </div>
         )}
 
@@ -446,6 +488,24 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
         )}
 
         <div ref={messagesEndRef} />
+      </div>
+
+      {/* Scroll-to-bottom button */}
+      {showScrollButton && (
+        <button
+          onClick={scrollToBottom}
+          aria-label="Scroll to bottom"
+          className="absolute bottom-3 left-1/2 -translate-x-1/2 z-10 rounded-full bg-background border shadow-md p-2 hover:bg-muted transition-colors"
+        >
+          <ChevronDown className="h-4 w-4" />
+          {hasNewMessages && (
+            <span
+              data-testid="new-message-badge"
+              className="absolute -top-1 -right-1 h-3 w-3 rounded-full bg-blue-500"
+            />
+          )}
+        </button>
+      )}
       </div>
 
       {/* Composer */}

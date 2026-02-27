@@ -11,6 +11,7 @@ import {
   type Query as SdkQuery,
 } from '@anthropic-ai/claude-agent-sdk'
 import type { PermissionResult, PermissionUpdate } from '@anthropic-ai/claude-agent-sdk'
+import { formatModelDisplayName } from '../shared/format-model-name.js'
 import { logger } from './logger.js'
 import type {
   SdkSessionState,
@@ -581,11 +582,15 @@ export class SdkBridge extends EventEmitter {
     if (!sp) return
 
     sp.query.supportedModels().then((models) => {
-      const mapped = models.map((m: any) => ({
-        value: m.value ?? m.id ?? String(m),
-        displayName: m.displayName ?? m.display_name ?? m.value ?? String(m),
-        description: m.description ?? '',
-      }))
+      const mapped = models.map((m: any) => {
+        const value = m.value ?? m.id ?? String(m)
+        const rawName = m.displayName ?? m.display_name ?? value
+        return {
+          value,
+          displayName: formatModelDisplayName(rawName),
+          description: m.description ?? '',
+        }
+      })
       this.cachedModels = mapped
       this.broadcastToSession(sessionId, {
         type: 'sdk.models',

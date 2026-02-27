@@ -146,4 +146,98 @@ describe('FreshclaudeSettings', () => {
     fireEvent.click(screen.getByRole('button', { name: /settings/i }))
     expect(onDismiss).toHaveBeenCalled()
   })
+
+  describe('model display names', () => {
+    it('shows human-readable names for dynamic model options with raw IDs', () => {
+      render(
+        <FreshclaudeSettings
+          {...defaults}
+          sessionStarted={false}
+          defaultOpen={true}
+          modelOptions={[
+            { value: 'claude-opus-4-6', displayName: 'claude-opus-4-6' },
+            { value: 'claude-sonnet-4-5-20250929', displayName: 'claude-sonnet-4-5-20250929' },
+          ]}
+          onChange={vi.fn()}
+        />
+      )
+      const modelSelect = screen.getByLabelText('Model')
+      const options = modelSelect.querySelectorAll('option')
+      const labels = Array.from(options).map((o) => o.textContent)
+      // All hardcoded entries present with human-readable names
+      expect(labels).toContain('Opus 4.6')
+      expect(labels).toContain('Sonnet 4.6')
+      expect(labels).toContain('Sonnet 4.5')
+      expect(labels).toContain('Haiku 4.5')
+      expect(labels).toContain('Opus 4.5')
+    })
+
+    it('deduplicates SDK models whose normalized label matches a hardcoded entry', () => {
+      render(
+        <FreshclaudeSettings
+          {...defaults}
+          sessionStarted={false}
+          defaultOpen={true}
+          modelOptions={[
+            { value: 'claude-opus-4-6', displayName: 'claude-opus-4-6' },
+            // A newer dated ID for sonnet 4.5 — should replace the hardcoded one, not duplicate it
+            { value: 'claude-sonnet-4-5-20251101', displayName: 'claude-sonnet-4-5-20251101' },
+          ]}
+          onChange={vi.fn()}
+        />
+      )
+      const modelSelect = screen.getByLabelText('Model')
+      const options = modelSelect.querySelectorAll('option')
+      const labels = Array.from(options).map((o) => o.textContent)
+      // "Sonnet 4.5" should appear exactly once
+      expect(labels.filter((l) => l === 'Sonnet 4.5')).toHaveLength(1)
+      // And its value should be the SDK's newer ID
+      const sonnet45 = Array.from(options).find((o) => o.textContent === 'Sonnet 4.5')
+      expect(sonnet45?.getAttribute('value')).toBe('claude-sonnet-4-5-20251101')
+    })
+
+    it('picks the latest dated ID when SDK returns multiple candidates for the same label', () => {
+      render(
+        <FreshclaudeSettings
+          {...defaults}
+          sessionStarted={false}
+          defaultOpen={true}
+          modelOptions={[
+            // Two dated IDs for the same model — older one listed first
+            { value: 'claude-sonnet-4-5-20250929', displayName: 'claude-sonnet-4-5-20250929' },
+            { value: 'claude-sonnet-4-5-20251101', displayName: 'claude-sonnet-4-5-20251101' },
+          ]}
+          onChange={vi.fn()}
+        />
+      )
+      const modelSelect = screen.getByLabelText('Model')
+      const options = modelSelect.querySelectorAll('option')
+      const labels = Array.from(options).map((o) => o.textContent)
+      expect(labels.filter((l) => l === 'Sonnet 4.5')).toHaveLength(1)
+      const sonnet45 = Array.from(options).find((o) => o.textContent === 'Sonnet 4.5')
+      expect(sonnet45?.getAttribute('value')).toBe('claude-sonnet-4-5-20251101')
+    })
+
+    it('preserves already-formatted display names from SDK', () => {
+      render(
+        <FreshclaudeSettings
+          {...defaults}
+          sessionStarted={false}
+          defaultOpen={true}
+          modelOptions={[
+            { value: 'claude-opus-4-6', displayName: 'Opus 4.6' },
+            { value: 'claude-sonnet-4-5-20250929', displayName: 'Sonnet 4.5' },
+          ]}
+          onChange={vi.fn()}
+        />
+      )
+      const modelSelect = screen.getByLabelText('Model')
+      const options = modelSelect.querySelectorAll('option')
+      const labels = Array.from(options).map((o) => o.textContent)
+      expect(labels).toContain('Opus 4.6')
+      expect(labels).toContain('Sonnet 4.5')
+      // No duplicate labels
+      expect(new Set(labels).size).toBe(labels.length)
+    })
+  })
 })

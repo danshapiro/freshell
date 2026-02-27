@@ -64,6 +64,8 @@ export interface ChatSessionState {
   totalOutputTokens: number
   tools?: Array<{ name: string }>
   lastError?: string
+  /** True after sdk.history has been received (even if messages are empty) */
+  historyLoaded?: boolean
 }
 
 export interface ClaudeChatState {
