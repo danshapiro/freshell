@@ -57,6 +57,7 @@ import type { ContentBlock, SdkSessionStatus } from '../shared/ws-protocol.js'
 export interface SdkSessionState {
   sessionId: string
   cliSessionId?: string
+  resumeSessionId?: string
   cwd?: string
   model?: string
   permissionMode?: string

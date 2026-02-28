@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { nanoid } from 'nanoid'
 import type { ClaudeChatPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updatePaneContent } from '@/store/panesSlice'
@@ -31,6 +32,7 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
   const dispatch = useAppDispatch()
   const ws = getWsClient()
   const createSentRef = useRef(false)
+  const attachSentRef = useRef(false)
   const composerRef = useRef<ChatComposerHandle>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
@@ -66,6 +68,26 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
     return () => clearTimeout(timer)
   }, [isRestoring])
 
+  // Auto-recover when restore times out (e.g. server restarted, SDK session lost).
+  // Clears the stale sessionId and resets to 'creating' so a new SDK session is spawned.
+  // Preserves resumeSessionId so the new session can resume the old Claude Code session.
+  useEffect(() => {
+    if (!restoreTimedOut || !isRestoring) return
+    const newRequestId = nanoid()
+    dispatch(updatePaneContent({
+      tabId,
+      paneId,
+      content: {
+        ...paneContentRef.current,
+        sessionId: undefined,
+        createRequestId: newRequestId,
+        status: 'creating' as const,
+      },
+    }))
+    createSentRef.current = false
+    attachSentRef.current = false
+  }, [restoreTimedOut, isRestoring, tabId, paneId, dispatch])
+
   // Wire sessionId from pendingCreates back into the pane content
   useEffect(() => {
     if (paneContent.sessionId || !pendingSessionId) return
@@ -87,6 +109,19 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
       content: { ...paneContentRef.current, status: sessionStatus },
     }))
   }, [sessionStatus, paneContent.status, tabId, paneId, dispatch])
+
+  // Persist cliSessionId as resumeSessionId so we can resume the Claude Code session
+  // after a server restart (pane content survives in localStorage, Redux state does not).
+  const cliSessionId = session?.cliSessionId
+  useEffect(() => {
+    if (!cliSessionId) return
+    if (paneContentRef.current.resumeSessionId === cliSessionId) return
+    dispatch(updatePaneContent({
+      tabId,
+      paneId,
+      content: { ...paneContentRef.current, resumeSessionId: cliSessionId },
+    }))
+  }, [cliSessionId, tabId, paneId, dispatch])
 
   // Reset createSentRef when createRequestId changes
   const prevCreateRequestIdRef = useRef(paneContent.createRequestId)
@@ -120,7 +155,6 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
   }, [paneContent.createRequestId, paneContent.sessionId, paneContent.status, tabId, paneId, dispatch, ws])
 
   // Attach to existing session on mount (e.g. after page refresh with persisted pane)
-  const attachSentRef = useRef(false)
   useEffect(() => {
     if (!paneContent.sessionId || attachSentRef.current) return
     // Only attach if we didn't just create this session ourselves
@@ -188,6 +222,20 @@ export default function ClaudeChatView({ tabId, paneId, paneContent, hidden }: C
     ) return
     if (window.getSelection()?.toString()) return
     composerRef.current?.focus()
+  }, [])
+
+  // When the pane resizes (e.g. split), text reflows and scrollHeight changes.
+  // If the user was at the bottom, keep them at the bottom after the reflow.
+  useEffect(() => {
+    const el = scrollContainerRef.current
+    if (!el) return
+    const ro = new ResizeObserver(() => {
+      if (isAtBottomRef.current) {
+        el.scrollTop = el.scrollHeight - el.clientHeight
+      }
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
   }, [])
 
   const handleScroll = useCallback(() => {

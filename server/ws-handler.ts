@@ -18,6 +18,7 @@ import type { SdkBridge } from './sdk-bridge.js'
 import type { SdkServerMessage } from '../shared/ws-protocol.js'
 import { TerminalStreamBroker } from './terminal-stream/broker.js'
 import { chunkProjects } from './ws-chunking.js'
+import { loadSessionHistory } from './session-history-loader.js'
 import { TabRegistryRecordBaseSchema, TabRegistryRecordSchema } from './tabs-registry/types.js'
 import type { TabsRegistryStore } from './tabs-registry/store.js'
 import {
@@ -1382,6 +1383,25 @@ export class WsHandler {
           // before any buffered messages (sdk.session.init, sdk.error) arrive.
           this.send(ws, { type: 'sdk.created', requestId: m.requestId, sessionId: session.sessionId })
 
+          // When resuming a previous Claude Code session, load chat history
+          // from the .jsonl file on disk so the UI can display past messages.
+          // Sent before sdk.session.init so history is loaded before the UI
+          // becomes interactive, preventing user messages from being overwritten.
+          if (m.resumeSessionId) {
+            try {
+              const messages = await loadSessionHistory(m.resumeSessionId)
+              if (messages && messages.length > 0) {
+                this.send(ws, {
+                  type: 'sdk.history',
+                  sessionId: session.sessionId,
+                  messages,
+                })
+              }
+            } catch (err) {
+              log.warn({ err, resumeSessionId: m.resumeSessionId }, 'Failed to load session history from .jsonl')
+            }
+          }
+
           // Send preliminary sdk.session.init so the client can start interacting.
           // The SDK subprocess only emits system/init after the first user message,
           // which deadlocks with the UI waiting for init before showing the input.
@@ -1530,11 +1550,24 @@ export class WsHandler {
           if (off) state.sdkSubscriptions.set(m.sessionId, off)
         }
 
-        // Send history replay
+        // Send history replay. For resumed sessions, use the .jsonl file when it
+        // has more messages than in-memory (covers the post-restart case where
+        // in-memory is empty). For active sessions, in-memory is more current.
+        let historyMessages = session.messages
+        if (session.resumeSessionId) {
+          try {
+            const jsonlMessages = await loadSessionHistory(session.resumeSessionId)
+            if (jsonlMessages && jsonlMessages.length > session.messages.length) {
+              historyMessages = jsonlMessages
+            }
+          } catch (err) {
+            log.warn({ err, resumeSessionId: session.resumeSessionId }, 'Failed to load .jsonl history for attach')
+          }
+        }
         this.send(ws, {
           type: 'sdk.history',
           sessionId: m.sessionId,
-          messages: session.messages,
+          messages: historyMessages,
         })
 
         // Send current status
