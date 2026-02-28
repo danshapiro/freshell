@@ -28,24 +28,24 @@ describe('derivePaneTitle', () => {
     expect(derivePaneTitle(content)).toBe('Shell')
   })
 
-  it('returns "claude cli" for claude mode terminal', () => {
+  it('returns "Claude CLI" for claude mode terminal', () => {
     const content: PaneContent = {
       kind: 'terminal',
       mode: 'claude',
       status: 'running',
       createRequestId: 'test',
     }
-    expect(derivePaneTitle(content)).toBe('claude cli')
+    expect(derivePaneTitle(content)).toBe('Claude CLI')
   })
 
-  it('returns "codex cli" for codex mode terminal', () => {
+  it('returns "Codex CLI" for codex mode terminal', () => {
     const content: PaneContent = {
       kind: 'terminal',
       mode: 'codex',
       status: 'running',
       createRequestId: 'test',
     }
-    expect(derivePaneTitle(content)).toBe('codex cli')
+    expect(derivePaneTitle(content)).toBe('Codex CLI')
   })
 
   it('returns "Gemini" for gemini mode terminal', () => {
@@ -58,12 +58,12 @@ describe('derivePaneTitle', () => {
     expect(derivePaneTitle(content)).toBe('Gemini')
   })
 
-  it('returns "freshclaude" for agent-chat content', () => {
+  it('returns "Freshclaude" for agent-chat content', () => {
     const content: PaneContent = {
       kind: 'agent-chat', provider: 'freshclaude',
       createRequestId: 'test',
       status: 'idle',
     }
-    expect(derivePaneTitle(content)).toBe('freshclaude')
+    expect(derivePaneTitle(content)).toBe('Freshclaude')
   })
 })

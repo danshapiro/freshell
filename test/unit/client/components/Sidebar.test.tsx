@@ -337,10 +337,10 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(rowButton).toBeTruthy()
 
       fireEvent.mouseEnter(rowButton!)
-      expect(screen.getByText('claude cli: Implement user authentication')).toBeInTheDocument()
+      expect(screen.getByText('Claude CLI: Implement user authentication')).toBeInTheDocument()
 
       fireEvent.mouseLeave(rowButton!)
-      expect(screen.queryByText('claude cli: Implement user authentication')).not.toBeInTheDocument()
+      expect(screen.queryByText('Claude CLI: Implement user authentication')).not.toBeInTheDocument()
     })
   })
 

@@ -25,7 +25,7 @@ describe('agent-chat-utils', () => {
   it('returns config for freshclaude', () => {
     const config = getAgentChatProviderConfig('freshclaude')
     expect(config).toBeDefined()
-    expect(config!.label).toBe('freshclaude')
+    expect(config!.label).toBe('Freshclaude')
     expect(config!.defaultModel).toBe('claude-opus-4-6')
     expect(config!.defaultPermissionMode).toBe('bypassPermissions')
     expect(config!.defaultEffort).toBe('high')
@@ -36,7 +36,7 @@ describe('agent-chat-utils', () => {
   })
 
   it('returns label for known provider', () => {
-    expect(getAgentChatProviderLabel('freshclaude')).toBe('freshclaude')
+    expect(getAgentChatProviderLabel('freshclaude')).toBe('Freshclaude')
   })
 
   it('returns fallback label for unknown provider', () => {

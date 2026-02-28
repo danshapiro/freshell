@@ -820,7 +820,7 @@ describe('PaneContainer', () => {
         store
       )
 
-      expect(screen.getByText('claude cli')).toBeInTheDocument()
+      expect(screen.getByText('Claude CLI')).toBeInTheDocument()
       expect(screen.getByText('Shell')).toBeInTheDocument()
     })
   })
@@ -1035,7 +1035,7 @@ describe('PaneContainer', () => {
       fireEvent.keyDown(container, { key: 'l' })
       fireEvent.transitionEnd(container)
 
-      const input = screen.getByLabelText('Starting directory for claude cli') as HTMLInputElement
+      const input = screen.getByLabelText('Starting directory for Claude CLI') as HTMLInputElement
       expect(input.value).toBe('/home/user/projects')
 
       const state = store.getState().panes
@@ -1057,7 +1057,7 @@ describe('PaneContainer', () => {
       fireEvent.keyDown(container, { key: 'l' })
       fireEvent.transitionEnd(container)
 
-      const input = screen.getByLabelText('Starting directory for claude cli')
+      const input = screen.getByLabelText('Starting directory for Claude CLI')
       fireEvent.change(input, { target: { value: '/home/user/new-project' } })
       fireEvent.keyDown(input, { key: 'Enter' })
 
@@ -1123,7 +1123,7 @@ describe('PaneContainer', () => {
     })
 
     it('pre-fills directory picker with tab-preferred cwd instead of global default', () => {
-      // Tab already has a claude cli pane working in /code/tab-project
+      // Tab already has a Claude CLI pane working in /code/tab-project
       const existingClaude: PaneNode = {
         type: 'leaf',
         id: 'pane-existing',
@@ -1158,13 +1158,13 @@ describe('PaneContainer', () => {
         store
       )
 
-      // Navigate to directory picker by selecting claude cli
+      // Navigate to directory picker by selecting Claude CLI
       const container = document.querySelector('[data-context="pane-picker"]')!
       fireEvent.keyDown(container, { key: 'l' })
       fireEvent.transitionEnd(container)
 
       // The input should pre-fill with the tab's directory, not the global default
-      const input = screen.getByLabelText('Starting directory for claude cli') as HTMLInputElement
+      const input = screen.getByLabelText('Starting directory for Claude CLI') as HTMLInputElement
       expect(input.value).toBe('/code/tab-project')
     })
   })

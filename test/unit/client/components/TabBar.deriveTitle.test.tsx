@@ -97,9 +97,9 @@ describe('TabBar tab title derivation', () => {
       </Provider>
     )
 
-    // Should show user's custom title, not derived "claude cli"
+    // Should show user's custom title, not derived "Claude CLI"
     expect(screen.getByText('My Custom Title')).toBeInTheDocument()
-    expect(screen.queryByText('claude cli')).not.toBeInTheDocument()
+    expect(screen.queryByText('Claude CLI')).not.toBeInTheDocument()
   })
 
   it('derives title from CLI pane when titleSetByUser is false', () => {
@@ -142,8 +142,8 @@ describe('TabBar tab title derivation', () => {
       </Provider>
     )
 
-    // Should derive "claude cli" from pane content
-    expect(screen.getByText('claude cli')).toBeInTheDocument()
+    // Should derive "Claude CLI" from pane content
+    expect(screen.getByText('Claude CLI')).toBeInTheDocument()
   })
 
   it('derives title from browser pane', () => {
@@ -286,8 +286,8 @@ describe('TabBar tab title derivation', () => {
       </Provider>
     )
 
-    // Should show "codex cli" not "example.com"
-    expect(screen.getByText('codex cli')).toBeInTheDocument()
+    // Should show "Codex CLI" not "example.com"
+    expect(screen.getByText('Codex CLI')).toBeInTheDocument()
     expect(screen.queryByText('example.com')).not.toBeInTheDocument()
   })
 

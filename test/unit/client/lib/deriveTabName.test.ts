@@ -15,7 +15,7 @@ describe('deriveTabName', () => {
       },
     }
 
-    expect(deriveTabName(layout)).toBe('codex cli')
+    expect(deriveTabName(layout)).toBe('Codex CLI')
   })
 
   it('returns provider label for gemini terminal', () => {

@@ -186,11 +186,11 @@ describe('SettingsView Component', () => {
       expect(screen.getByText('Sound on completion')).toBeInTheDocument()
 
       // Coding CLI section
-      expect(screen.getByText('Enable claude cli')).toBeInTheDocument()
-      expect(screen.getByText('Enable codex cli')).toBeInTheDocument()
-      expect(screen.getByText('claude cli permission mode')).toBeInTheDocument()
-      expect(screen.getByText('codex cli model')).toBeInTheDocument()
-      expect(screen.getByText('codex cli sandbox')).toBeInTheDocument()
+      expect(screen.getByText('Enable Claude CLI')).toBeInTheDocument()
+      expect(screen.getByText('Enable Codex CLI')).toBeInTheDocument()
+      expect(screen.getByText('Claude CLI permission mode')).toBeInTheDocument()
+      expect(screen.getByText('Codex CLI model')).toBeInTheDocument()
+      expect(screen.getByText('Codex CLI sandbox')).toBeInTheDocument()
     })
   })
 
@@ -853,7 +853,7 @@ describe('SettingsView Component', () => {
       const store = createTestStore()
       renderWithStore(store)
 
-      const row = screen.getByText('Enable codex cli').closest('div')!
+      const row = screen.getByText('Enable Codex CLI').closest('div')!
       const toggle = row.querySelector('button')!
       fireEvent.click(toggle)
 

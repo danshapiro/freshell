@@ -631,7 +631,7 @@ describe('tabsSlice', () => {
 
       const tabs = store.getState().tabs.tabs
       expect(tabs).toHaveLength(1)
-      expect(tabs[0].title).toBe('codex cli')
+      expect(tabs[0].title).toBe('Codex CLI')
     })
 
     it('uses provider label for codex tab with terminalId', async () => {
@@ -650,7 +650,7 @@ describe('tabsSlice', () => {
 
       const tabs = store.getState().tabs.tabs
       expect(tabs).toHaveLength(1)
-      expect(tabs[0].title).toBe('codex cli')
+      expect(tabs[0].title).toBe('Codex CLI')
     })
   })
 

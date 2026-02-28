@@ -185,7 +185,7 @@ describe('Terminals API', () => {
       })
       registry.addTerminal({
         terminalId: 'term_456',
-        title: 'claude cli',
+        title: 'Claude CLI',
         mode: 'claude',
         status: 'running',
       })
@@ -211,7 +211,7 @@ describe('Terminals API', () => {
       const secondTerminal = response.body.find((t: any) => t.terminalId === 'term_456')
       expect(secondTerminal).toBeDefined()
       expect(secondTerminal.terminalId).toBe('term_456')
-      expect(secondTerminal.title).toBe('claude cli')
+      expect(secondTerminal.title).toBe('Claude CLI')
       expect(secondTerminal.mode).toBe('claude')
     })
 
@@ -305,8 +305,8 @@ describe('Terminals API', () => {
 
     it('includes all terminal modes: shell, claude, codex', async () => {
       registry.addTerminal({ terminalId: 'shell_term', title: 'Shell', mode: 'shell' })
-      registry.addTerminal({ terminalId: 'claude_term', title: 'claude cli', mode: 'claude' })
-      registry.addTerminal({ terminalId: 'codex_term', title: 'codex cli', mode: 'codex' })
+      registry.addTerminal({ terminalId: 'claude_term', title: 'Claude CLI', mode: 'claude' })
+      registry.addTerminal({ terminalId: 'codex_term', title: 'Codex CLI', mode: 'codex' })
 
       const response = await request(app)
         .get('/api/terminals')
