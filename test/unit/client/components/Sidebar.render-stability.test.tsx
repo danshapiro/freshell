@@ -104,14 +104,109 @@ describe('Sidebar render stability', () => {
       expect((SidebarItem as any).$$typeof).toBe(Symbol.for('react.memo'))
     })
 
-    it('accepts timestampTick prop to bust memo cache for timestamp freshness', async () => {
+    it('has a custom comparator (not default shallow equality)', async () => {
       const { SidebarItem } = await import('@/components/Sidebar')
-      // The inner component wrapped by React.memo is accessible via .type
-      const inner = (SidebarItem as any).type || (SidebarItem as any).render
-      expect(inner).toBeDefined()
-      // The inner function should accept props including timestampTick;
-      // we verify the memo wrapper exists (type is a function that React calls)
-      expect(typeof inner).toBe('function')
+      // React.memo with a custom comparator sets .compare on the memo object
+      expect((SidebarItem as any).compare).toBeTypeOf('function')
+    })
+
+    it('custom comparator returns true when item data is unchanged despite new references', async () => {
+      const { SidebarItem } = await import('@/components/Sidebar')
+      const compare = (SidebarItem as any).compare as (a: any, b: any) => boolean
+
+      const item = {
+        sessionId: 'abc', provider: 'claude', title: 'Test',
+        subtitle: 'project', timestamp: 1000, hasTab: false,
+        isRunning: false, archived: false, hasTitle: true,
+        id: 'session-claude-abc',
+      }
+      const prevProps = { item, isActiveTab: false, showProjectBadge: true, onClick: () => {}, timestampTick: 1 }
+      // New object references for item and onClick, but same values
+      const nextProps = { item: { ...item }, isActiveTab: false, showProjectBadge: true, onClick: () => {}, timestampTick: 1 }
+
+      expect(compare(prevProps, nextProps)).toBe(true)
+    })
+
+    it('custom comparator returns false when item title changes', async () => {
+      const { SidebarItem } = await import('@/components/Sidebar')
+      const compare = (SidebarItem as any).compare as (a: any, b: any) => boolean
+
+      const item = {
+        sessionId: 'abc', provider: 'claude', title: 'Test',
+        subtitle: 'project', timestamp: 1000, hasTab: false,
+        isRunning: false, archived: false, hasTitle: true,
+        id: 'session-claude-abc',
+      }
+      const prevProps = { item, isActiveTab: false, showProjectBadge: true, onClick: () => {}, timestampTick: 1 }
+      const nextProps = { item: { ...item, title: 'Changed' }, isActiveTab: false, showProjectBadge: true, onClick: () => {}, timestampTick: 1 }
+
+      expect(compare(prevProps, nextProps)).toBe(false)
+    })
+
+    it('custom comparator returns false when timestampTick changes', async () => {
+      const { SidebarItem } = await import('@/components/Sidebar')
+      const compare = (SidebarItem as any).compare as (a: any, b: any) => boolean
+
+      const item = {
+        sessionId: 'abc', provider: 'claude', title: 'Test',
+        subtitle: 'project', timestamp: 1000, hasTab: false,
+        isRunning: false, archived: false, hasTitle: true,
+        id: 'session-claude-abc',
+      }
+      const prevProps = { item, isActiveTab: false, showProjectBadge: true, onClick: () => {}, timestampTick: 1 }
+      const nextProps = { item, isActiveTab: false, showProjectBadge: true, onClick: () => {}, timestampTick: 2 }
+
+      expect(compare(prevProps, nextProps)).toBe(false)
+    })
+
+    it('custom comparator ignores onClick reference changes', async () => {
+      const { SidebarItem } = await import('@/components/Sidebar')
+      const compare = (SidebarItem as any).compare as (a: any, b: any) => boolean
+
+      const item = {
+        sessionId: 'abc', provider: 'claude', title: 'Test',
+        subtitle: 'project', timestamp: 1000, hasTab: false,
+        isRunning: false, archived: false, hasTitle: true,
+        id: 'session-claude-abc',
+      }
+      const fn1 = () => {}
+      const fn2 = () => {}
+      const prevProps = { item, isActiveTab: false, showProjectBadge: true, onClick: fn1, timestampTick: 1 }
+      const nextProps = { item, isActiveTab: false, showProjectBadge: true, onClick: fn2, timestampTick: 1 }
+
+      expect(compare(prevProps, nextProps)).toBe(true)
+    })
+
+    it('custom comparator returns false when cwd changes (affects click handler)', async () => {
+      const { SidebarItem } = await import('@/components/Sidebar')
+      const compare = (SidebarItem as any).compare as (a: any, b: any) => boolean
+
+      const item = {
+        sessionId: 'abc', provider: 'claude', title: 'Test',
+        subtitle: 'project', timestamp: 1000, hasTab: false,
+        isRunning: false, archived: false, hasTitle: true,
+        id: 'session-claude-abc', cwd: '/home/user/project',
+      }
+      const prevProps = { item, isActiveTab: false, showProjectBadge: true, onClick: () => {}, timestampTick: 1 }
+      const nextProps = { item: { ...item, cwd: '/home/user/other' }, isActiveTab: false, showProjectBadge: true, onClick: () => {}, timestampTick: 1 }
+
+      expect(compare(prevProps, nextProps)).toBe(false)
+    })
+
+    it('custom comparator returns false when isActiveTab changes', async () => {
+      const { SidebarItem } = await import('@/components/Sidebar')
+      const compare = (SidebarItem as any).compare as (a: any, b: any) => boolean
+
+      const item = {
+        sessionId: 'abc', provider: 'claude', title: 'Test',
+        subtitle: 'project', timestamp: 1000, hasTab: false,
+        isRunning: false, archived: false, hasTitle: true,
+        id: 'session-claude-abc',
+      }
+      const prevProps = { item, isActiveTab: false, showProjectBadge: true, onClick: () => {}, timestampTick: 1 }
+      const nextProps = { item, isActiveTab: true, showProjectBadge: true, onClick: () => {}, timestampTick: 1 }
+
+      expect(compare(prevProps, nextProps)).toBe(false)
     })
   })
 

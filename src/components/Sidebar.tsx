@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject } from 'react'
 import { Terminal, Folder, Settings, LayoutGrid, Search, Loader2, X, Archive, PanelLeftClose, AlertCircle } from 'lucide-react'
 import { List, type RowComponentProps } from 'react-window'
 import { cn } from '@/lib/utils'
@@ -82,17 +82,32 @@ export const SidebarRow = ({ index, style, ariaAttributes, ...data }: RowCompone
   const isActive = item.isRunning
     ? item.runningTerminalId === data.activeTerminalId
     : `${item.provider}:${item.sessionId}` === data.activeSessionKey
+
+  // Stable click handler: store latest callback + item in a ref so the
+  // onClick function identity never changes, but always invokes current data.
+  // This avoids breaking SidebarItem's React.memo on every parent re-render.
+  const callbackRef = useRef({ onItemClick: data.onItemClick, item })
+  callbackRef.current = { onItemClick: data.onItemClick, item }
+  const onClick = useStableCallback(callbackRef)
+
   return (
     <div style={{ ...style, paddingBottom: 2 }} {...ariaAttributes}>
       <SidebarItem
         item={item}
         isActiveTab={isActive}
         showProjectBadge={data.showProjectBadge}
-        onClick={() => data.onItemClick(item)}
+        onClick={onClick}
         timestampTick={data.timestampTick}
       />
     </div>
   )
+}
+
+/** Returns a stable function that always calls the latest onItemClick(item) from the ref. */
+function useStableCallback(
+  ref: MutableRefObject<{ onItemClick: (item: SessionItem) => void; item: SessionItem }>
+) {
+  return useCallback(() => ref.current.onItemClick(ref.current.item), [ref])
 }
 
 export default function Sidebar({
@@ -306,9 +321,13 @@ export default function Sidebar({
     return () => ro.disconnect()
   }, [])
 
+  // Read activeTabId from the store at call time (not closure) so that
+  // handleItemClick has a stable reference and doesn't cause SidebarItem
+  // re-renders when the active tab changes.
   const handleItemClick = useCallback((item: SessionItem) => {
     const provider = item.provider as CodingCliProviderName
     const state = store.getState()
+    const currentActiveTabId = state.tabs.activeTabId
     const runningTerminalId = item.isRunning ? item.runningTerminalId : undefined
 
     // 1. Dedup: if session is already open in a pane, focus it
@@ -323,8 +342,8 @@ export default function Sidebar({
     }
 
     // 2. Fallback: no active tab or active tab has no layout → create new tab
-    const activeLayout = activeTabId ? state.panes.layouts[activeTabId] : undefined
-    if (!activeTabId || !activeLayout) {
+    const activeLayout = currentActiveTabId ? state.panes.layouts[currentActiveTabId] : undefined
+    if (!currentActiveTabId || !activeLayout) {
       dispatch(openSessionTab({
         sessionId: item.sessionId,
         title: item.title,
@@ -338,7 +357,7 @@ export default function Sidebar({
 
     // 3. Normal: split a new pane in the current tab
     dispatch(addPane({
-      tabId: activeTabId,
+      tabId: currentActiveTabId,
       newContent: {
         kind: 'terminal',
         mode: provider,
@@ -349,7 +368,7 @@ export default function Sidebar({
       },
     }))
     onNavigate('terminal')
-  }, [dispatch, onNavigate, activeTabId, store])
+  }, [dispatch, onNavigate, store])
 
   const nav = [
     { id: 'terminal' as const, label: 'Coding Agents', icon: Terminal, shortcut: 'T' },
@@ -529,14 +548,42 @@ export default function Sidebar({
   )
 }
 
-export const SidebarItem = memo(function SidebarItem(props: {
+interface SidebarItemProps {
   item: SessionItem
   isActiveTab?: boolean
   showProjectBadge?: boolean
   onClick: () => void
-  /** Changing tick value breaks React.memo equality to refresh relative timestamps. */
+  /** Changing tick value breaks memo equality to refresh relative timestamps. */
   timestampTick?: number
-}) {
+}
+
+/** Custom comparator for React.memo: compares item fields by value instead of
+ *  reference. Ignores `onClick` because: (1) handleItemClick is stable (reads
+ *  activeTabId from store at call time), and (2) all item fields used by the
+ *  click handler are compared here (sessionId, provider, title, cwd, etc.). */
+function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps): boolean {
+  if (prev.isActiveTab !== next.isActiveTab) return false
+  if (prev.showProjectBadge !== next.showProjectBadge) return false
+  if (prev.timestampTick !== next.timestampTick) return false
+
+  const a = prev.item, b = next.item
+  return (
+    a.sessionId === b.sessionId &&
+    a.provider === b.provider &&
+    a.title === b.title &&
+    a.subtitle === b.subtitle &&
+    a.timestamp === b.timestamp &&
+    a.hasTab === b.hasTab &&
+    a.isRunning === b.isRunning &&
+    a.runningTerminalId === b.runningTerminalId &&
+    a.archived === b.archived &&
+    a.projectColor === b.projectColor &&
+    a.cwd === b.cwd &&
+    a.projectPath === b.projectPath
+  )
+}
+
+export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
   const { item, isActiveTab, showProjectBadge, onClick } = props
   return (
     <Tooltip>
@@ -602,4 +649,4 @@ export const SidebarItem = memo(function SidebarItem(props: {
       </TooltipContent>
     </Tooltip>
   )
-})
+}, areSidebarItemPropsEqual)
