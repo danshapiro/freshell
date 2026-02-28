@@ -10,7 +10,7 @@ export const AGENT_CHAT_PROVIDERS: AgentChatProviderName[] = [
 export const AGENT_CHAT_PROVIDER_CONFIGS: AgentChatProviderConfig[] = [
   {
     name: 'freshclaude',
-    label: 'freshclaude',
+    label: 'Freshclaude',
     codingCliProvider: 'claude',
     icon: FreshclaudeIcon,
     defaultModel: 'claude-opus-4-6',

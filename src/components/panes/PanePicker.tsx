@@ -112,8 +112,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
       .map((config) => ({
         type: config.name as PanePickerType,
         label: config.label,
-        icon: null,
-        providerName: config.codingCliProvider,
+        icon: config.icon,
         shortcut: config.pickerShortcut,
       }))
 
