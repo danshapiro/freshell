@@ -508,14 +508,6 @@
     background: var(--accent-dim);
     outline: 1px solid rgba(74,158,255,0.15);
   }
-  .cmd-item-icon {
-    width: 20px; height: 20px;
-    display: flex; align-items: center; justify-content: center;
-    flex-shrink: 0;
-    color: var(--fg-dim);
-    font-size: 13px;
-  }
-  .cmd-item.highlighted .cmd-item-icon { color: var(--accent); }
   .cmd-item-text {
     flex: 1;
     min-width: 0;
@@ -804,42 +796,42 @@
 // ─── Command Data ───────────────────────────────────────────
 const COMMANDS = [
   // Pinned
-  { name: 'config',         desc: 'Open settings',                          icon: '⚙', pinned: true },
-  { name: 'help',           desc: 'Get usage help',                         icon: '?', pinned: true },
+  { name: 'config',         desc: 'Open settings',                          pinned: true },
+  { name: 'help',           desc: 'Get usage help',                         pinned: true },
 
   // All commands alphabetical
-  { name: 'clear',          desc: 'Clear conversation history',             icon: '🗑' },
-  { name: 'compact',        desc: 'Compact conversation context',           icon: '📦', hasArgs: true },
-  { name: 'config',         desc: 'Open settings',                          icon: '⚙' },
-  { name: 'context',        desc: 'Visualize context usage',                icon: '📊' },
-  { name: 'copy',           desc: 'Copy last response to clipboard',        icon: '📋' },
-  { name: 'cost',           desc: 'Show token usage statistics',            icon: '💰' },
-  { name: 'debug',          desc: 'Troubleshoot current session',           icon: '🔍', hasArgs: true },
-  { name: 'desktop',        desc: 'Hand off to Claude Desktop',             icon: '🖥' },
-  { name: 'doctor',         desc: 'Check installation health',              icon: '🩺' },
-  { name: 'exit',           desc: 'Exit the session',                       icon: '🚪' },
-  { name: 'export',         desc: 'Export conversation to file',            icon: '📤', hasArgs: true },
-  { name: 'help',           desc: 'Get usage help',                         icon: '?' },
-  { name: 'init',           desc: 'Initialize project with CLAUDE.md',      icon: '📝' },
-  { name: 'mcp',            desc: 'Manage MCP server connections',          icon: '🔌' },
-  { name: 'memory',         desc: 'Edit CLAUDE.md memory files',            icon: '🧠' },
-  { name: 'model',          desc: 'Select or change AI model',              icon: '🤖', subOptions: ['claude-sonnet-4-20250514', 'claude-opus-4-20250514', 'claude-haiku-3-5'] },
-  { name: 'output-style',   desc: 'Change output style',                    icon: '🎨', subOptions: ['concise', 'normal', 'verbose', 'xml'] },
-  { name: 'permissions',    desc: 'View or update permissions',             icon: '🔒' },
-  { name: 'plan',           desc: 'Enter plan mode',                        icon: '📐' },
-  { name: 'rename',         desc: 'Rename current session',                 icon: '✏️', hasArgs: true },
-  { name: 'resume',         desc: 'Resume a previous conversation',         icon: '⏩', hasArgs: true },
-  { name: 'rewind',         desc: 'Rewind conversation or code',            icon: '⏪' },
-  { name: 'stats',          desc: 'Visualize daily usage & streaks',        icon: '📈' },
-  { name: 'status',         desc: 'Show version, model & account info',     icon: 'ℹ' },
-  { name: 'statusline',     desc: 'Set up status line UI',                  icon: '▬' },
-  { name: 'tasks',          desc: 'List and manage background tasks',       icon: '📋' },
-  { name: 'teleport',       desc: 'Resume remote session from claude.ai',   icon: '🌐' },
-  { name: 'terminal-setup', desc: 'Configure terminal shortcuts',           icon: '⌨' },
-  { name: 'theme',          desc: 'Change color theme',                     icon: '🎭', subOptions: ['dark', 'light', 'light-daltonized', 'dark-daltonized'] },
-  { name: 'todos',          desc: 'List current TODO items',                icon: '✅' },
-  { name: 'usage',          desc: 'Show plan usage & rate limits',          icon: '📉' },
-  { name: 'vim',            desc: 'Enable vim-style editing',               icon: '✦' },
+  { name: 'clear',          desc: 'Clear conversation history'             },
+  { name: 'compact',        desc: 'Compact conversation context',           hasArgs: true },
+  { name: 'config',         desc: 'Open settings'                          },
+  { name: 'context',        desc: 'Visualize context usage'                },
+  { name: 'copy',           desc: 'Copy last response to clipboard'        },
+  { name: 'cost',           desc: 'Show token usage statistics'            },
+  { name: 'debug',          desc: 'Troubleshoot current session',           hasArgs: true },
+  { name: 'desktop',        desc: 'Hand off to Claude Desktop'             },
+  { name: 'doctor',         desc: 'Check installation health'              },
+  { name: 'exit',           desc: 'Exit the session'                       },
+  { name: 'export',         desc: 'Export conversation to file',            hasArgs: true },
+  { name: 'help',           desc: 'Get usage help'                         },
+  { name: 'init',           desc: 'Initialize project with CLAUDE.md'      },
+  { name: 'mcp',            desc: 'Manage MCP server connections'          },
+  { name: 'memory',         desc: 'Edit CLAUDE.md memory files'            },
+  { name: 'model',          desc: 'Select or change AI model',              subOptions: ['claude-sonnet-4-20250514', 'claude-opus-4-20250514', 'claude-haiku-3-5'] },
+  { name: 'output-style',   desc: 'Change output style',                    subOptions: ['concise', 'normal', 'verbose', 'xml'] },
+  { name: 'permissions',    desc: 'View or update permissions'             },
+  { name: 'plan',           desc: 'Enter plan mode'                        },
+  { name: 'rename',         desc: 'Rename current session',                 hasArgs: true },
+  { name: 'resume',         desc: 'Resume a previous conversation',         hasArgs: true },
+  { name: 'rewind',         desc: 'Rewind conversation or code'            },
+  { name: 'stats',          desc: 'Visualize daily usage & streaks'        },
+  { name: 'status',         desc: 'Show version, model & account info'     },
+  { name: 'statusline',     desc: 'Set up status line UI'                  },
+  { name: 'tasks',          desc: 'List and manage background tasks'       },
+  { name: 'teleport',       desc: 'Resume remote session from claude.ai'   },
+  { name: 'terminal-setup', desc: 'Configure terminal shortcuts'           },
+  { name: 'theme',          desc: 'Change color theme',                     subOptions: ['dark', 'light', 'light-daltonized', 'dark-daltonized'] },
+  { name: 'todos',          desc: 'List current TODO items'                },
+  { name: 'usage',          desc: 'Show plan usage & rate limits'          },
+  { name: 'vim',            desc: 'Enable vim-style editing'               },
 ];
 
 // ─── State ──────────────────────────────────────────────────
@@ -944,7 +936,6 @@ function renderItem(cmd, index, query, isPinned) {
 
   return `
     <div class="cmd-item" data-index="${index}" role="menuitem" tabindex="-1">
-      <div class="cmd-item-icon">${cmd.icon}</div>
       <div class="cmd-item-text">
         <div class="cmd-item-name">${nameHtml}</div>
         <div class="cmd-item-desc">${cmd.desc}</div>
