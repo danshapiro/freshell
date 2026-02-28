@@ -174,6 +174,7 @@ export interface AppSettings {
     customEditorCommand?: string
   }
   agentChat?: {
+    initialSetupDone?: boolean
     providers?: Partial<Record<AgentChatProviderName, {
       defaultModel?: string
       defaultPermissionMode?: string

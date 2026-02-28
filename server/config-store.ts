@@ -95,6 +95,7 @@ export type AppSettings = {
     customEditorCommand?: string
   }
   agentChat?: {
+    initialSetupDone?: boolean
     providers?: Partial<Record<string, {
       defaultModel?: string
       defaultPermissionMode?: string

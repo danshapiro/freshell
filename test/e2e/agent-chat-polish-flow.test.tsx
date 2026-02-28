@@ -18,6 +18,7 @@ import agentChatReducer, {
   setSessionStatus,
 } from '@/store/agentChatSlice'
 import panesReducer from '@/store/panesSlice'
+import settingsReducer from '@/store/settingsSlice'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import type { ChatContentBlock } from '@/store/agentChatTypes'
 
@@ -49,6 +50,7 @@ function makeStore() {
     reducer: {
       agentChat: agentChatReducer,
       panes: panesReducer,
+      settings: settingsReducer,
     },
   })
 }

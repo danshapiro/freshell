@@ -10,6 +10,7 @@ import agentChatReducer, {
   setSessionStatus,
 } from '@/store/agentChatSlice'
 import panesReducer from '@/store/panesSlice'
+import settingsReducer from '@/store/settingsSlice'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import type { ChatContentBlock } from '@/store/agentChatTypes'
 
@@ -25,11 +26,21 @@ vi.mock('@/lib/ws-client', () => ({
   }),
 }))
 
-function makeStore() {
+function makeStore(settingsOverrides?: Record<string, unknown>) {
   return configureStore({
     reducer: {
       agentChat: agentChatReducer,
       panes: panesReducer,
+      settings: settingsReducer,
+    },
+    preloadedState: {
+      settings: {
+        settings: {
+          ...(settingsOverrides || {}),
+        } as any,
+        loaded: true,
+        lastSavedAt: 0,
+      },
     },
   })
 }
@@ -267,5 +278,109 @@ describe('AgentChatView auto-expand', () => {
     expect(toolButtons[2]).toHaveAttribute('aria-expanded', 'true')
     expect(toolButtons[3]).toHaveAttribute('aria-expanded', 'true')
     expect(toolButtons[4]).toHaveAttribute('aria-expanded', 'true')
+  })
+})
+
+describe('AgentChatView composer focus', () => {
+  afterEach(cleanup)
+
+  it('auto-focuses composer on mount when settings are already dismissed', () => {
+    const store = makeStore()
+    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
+
+    const pane: AgentChatPaneContent = { ...BASE_PANE, settingsDismissed: true }
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={pane} />
+      </Provider>,
+    )
+
+    expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveFocus()
+  })
+
+  it('does not auto-focus composer when settings panel is open', () => {
+    const store = makeStore()
+    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
+
+    // settingsDismissed is undefined/false, so settings panel opens
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+      </Provider>,
+    )
+
+    expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toHaveFocus()
+  })
+})
+
+describe('AgentChatView settings auto-open (#110)', () => {
+  afterEach(cleanup)
+
+  it('opens settings on first-ever launch (no global flag, no pane flag)', () => {
+    const store = makeStore()
+    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+      </Provider>,
+    )
+
+    expect(screen.getByRole('dialog', { name: 'Agent chat settings' })).toBeInTheDocument()
+  })
+
+  it('does not open settings on new pane when global initialSetupDone is true', () => {
+    const store = makeStore({ agentChat: { initialSetupDone: true, providers: {} } })
+    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
+
+    // Fresh pane (no settingsDismissed), but global flag is set
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+      </Provider>,
+    )
+
+    expect(screen.queryByRole('dialog', { name: 'Agent chat settings' })).not.toBeInTheDocument()
+  })
+
+  it('does not open settings while global settings are still loading', () => {
+    // Simulates a returning user: settings haven't loaded from server yet,
+    // so initialSetupDone is still false. We should NOT flash the settings panel.
+    const store = configureStore({
+      reducer: {
+        agentChat: agentChatReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+      },
+      preloadedState: {
+        settings: {
+          settings: {} as any,
+          loaded: false,
+          lastSavedAt: 0,
+        },
+      },
+    })
+    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+      </Provider>,
+    )
+
+    expect(screen.queryByRole('dialog', { name: 'Agent chat settings' })).not.toBeInTheDocument()
+  })
+
+  it('auto-focuses composer when global initialSetupDone skips settings', () => {
+    const store = makeStore({ agentChat: { initialSetupDone: true, providers: {} } })
+    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+      </Provider>,
+    )
+
+    expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveFocus()
   })
 })

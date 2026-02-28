@@ -64,6 +64,11 @@ export default function AgentChatSettings({
   const popoverRef = useRef<HTMLDivElement>(null)
   const buttonRef = useRef<HTMLButtonElement>(null)
 
+  // Sync open state when defaultOpen transitions to true (e.g. after settings load)
+  useEffect(() => {
+    if (defaultOpen) setOpen(true)
+  }, [defaultOpen])
+
   const handleClose = useCallback(() => {
     setOpen(false)
     onDismiss?.()
