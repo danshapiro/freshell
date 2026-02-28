@@ -167,7 +167,7 @@ describe('SettingsView Component', () => {
       // Sidebar section
       expect(screen.getByText('Sort mode')).toBeInTheDocument()
       expect(screen.getByText('Show project badges')).toBeInTheDocument()
-      expect(screen.getByText('Ignore Codex subagent sessions')).toBeInTheDocument()
+      expect(screen.getByText('Show subagent sessions')).toBeInTheDocument()
       expect(screen.getByText('Hide sessions by first chat')).toBeInTheDocument()
       expect(screen.getByText('First chat must start with match')).toBeInTheDocument()
 
@@ -188,9 +188,9 @@ describe('SettingsView Component', () => {
       // Coding CLI section
       expect(screen.getByText('Enable Claude')).toBeInTheDocument()
       expect(screen.getByText('Enable Codex')).toBeInTheDocument()
-      expect(screen.getByText('Claude permission mode')).toBeInTheDocument()
-      expect(screen.getByText('Codex model')).toBeInTheDocument()
-      expect(screen.getByText('Codex sandbox')).toBeInTheDocument()
+      expect(screen.getByText('claude cli permission mode')).toBeInTheDocument()
+      expect(screen.getByText('codex cli model')).toBeInTheDocument()
+      expect(screen.getByText('codex cli sandbox')).toBeInTheDocument()
     })
   })
 

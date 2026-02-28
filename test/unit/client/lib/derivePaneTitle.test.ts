@@ -28,24 +28,24 @@ describe('derivePaneTitle', () => {
     expect(derivePaneTitle(content)).toBe('Shell')
   })
 
-  it('returns "Claude" for claude mode terminal', () => {
+  it('returns "claude cli" for claude mode terminal', () => {
     const content: PaneContent = {
       kind: 'terminal',
       mode: 'claude',
       status: 'running',
       createRequestId: 'test',
     }
-    expect(derivePaneTitle(content)).toBe('Claude')
+    expect(derivePaneTitle(content)).toBe('claude cli')
   })
 
-  it('returns "Codex" for codex mode terminal', () => {
+  it('returns "codex cli" for codex mode terminal', () => {
     const content: PaneContent = {
       kind: 'terminal',
       mode: 'codex',
       status: 'running',
       createRequestId: 'test',
     }
-    expect(derivePaneTitle(content)).toBe('Codex')
+    expect(derivePaneTitle(content)).toBe('codex cli')
   })
 
   it('returns "Gemini" for gemini mode terminal', () => {

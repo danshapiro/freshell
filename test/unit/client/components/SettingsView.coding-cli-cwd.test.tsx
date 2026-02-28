@@ -64,8 +64,8 @@ describe('SettingsView coding CLI cwd', () => {
         <SettingsView />
       </Provider>
     )
-    expect(screen.getByLabelText('Claude starting directory')).toBeInTheDocument()
-    expect(screen.getByLabelText('Codex starting directory')).toBeInTheDocument()
+    expect(screen.getByLabelText('claude cli starting directory')).toBeInTheDocument()
+    expect(screen.getByLabelText('codex cli starting directory')).toBeInTheDocument()
   })
 
   it('starting directory inputs have correct placeholder', () => {
@@ -75,7 +75,7 @@ describe('SettingsView coding CLI cwd', () => {
         <SettingsView />
       </Provider>
     )
-    const claudeInput = screen.getByLabelText('Claude starting directory')
+    const claudeInput = screen.getByLabelText('claude cli starting directory')
     expect(claudeInput).toHaveAttribute('placeholder', 'e.g. ~/projects/my-app')
   })
 
@@ -118,7 +118,7 @@ describe('SettingsView coding CLI cwd', () => {
       </Provider>
     )
 
-    const claudeInput = screen.getByLabelText('Claude starting directory') as HTMLInputElement
+    const claudeInput = screen.getByLabelText('claude cli starting directory') as HTMLInputElement
     expect(claudeInput.value).toBe('/home/user/work')
   })
 
@@ -130,7 +130,7 @@ describe('SettingsView coding CLI cwd', () => {
       </Provider>
     )
 
-    const claudeInput = screen.getByLabelText('Claude starting directory') as HTMLInputElement
+    const claudeInput = screen.getByLabelText('claude cli starting directory') as HTMLInputElement
     expect(claudeInput.value).toBe('')
 
     // Simulate external settings update (e.g. from WebSocket broadcast)

@@ -1322,7 +1322,7 @@ describe('panesSlice', () => {
       const state: PanesState = {
         layouts: { 'tab-1': layout },
         activePane: { 'tab-1': 'pane-1' },
-        paneTitles: { 'tab-1': { 'pane-1': 'Shell', 'pane-2': 'Claude' } },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell', 'pane-2': 'claude cli' } },
         paneTitleSetByUser: { 'tab-1': { 'pane-2': true } },
         renameRequestTabId: null,
         renameRequestPaneId: null,
@@ -2150,7 +2150,7 @@ describe('panesSlice', () => {
 
       // Find the new pane ID (it's the active pane after split)
       const newPaneId = result.activePane['tab-1']
-      expect(result.paneTitles['tab-1'][newPaneId]).toBe('Claude')
+      expect(result.paneTitles['tab-1'][newPaneId]).toBe('claude cli')
     })
   })
 
@@ -2173,7 +2173,7 @@ describe('panesSlice', () => {
       }))
 
       const newPaneId = result.activePane['tab-1']
-      expect(result.paneTitles['tab-1'][newPaneId]).toBe('Codex')
+      expect(result.paneTitles['tab-1'][newPaneId]).toBe('codex cli')
     })
   })
 
@@ -2212,8 +2212,8 @@ describe('panesSlice', () => {
         content: { kind: 'terminal', createRequestId: 'req-1', status: 'running', mode: 'claude' },
       }))
 
-      // derivePaneTitle for claude mode returns 'Claude'
-      expect(result.paneTitles['tab-1']['pane-1']).toBe('Claude')
+      // derivePaneTitle for claude mode returns 'claude cli'
+      expect(result.paneTitles['tab-1']['pane-1']).toBe('claude cli')
     })
 
     it('updatePaneTitle sets paneTitleSetByUser to true', () => {
@@ -2269,7 +2269,7 @@ describe('panesSlice', () => {
           },
         },
         activePane: { 'tab-1': 'pane-1' },
-        paneTitles: { 'tab-1': { 'pane-1': 'Shell', 'pane-2': 'Claude' } },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell', 'pane-2': 'claude cli' } },
         paneTitleSetByUser: { 'tab-1': { 'pane-1': true, 'pane-2': true } },
         renameRequestTabId: null,
         renameRequestPaneId: null,
