@@ -17,8 +17,8 @@ export const CODING_CLI_PROVIDERS: CodingCliProviderName[] = [
 ]
 
 export const CODING_CLI_PROVIDER_LABELS: Record<CodingCliProviderName, string> = {
-  claude: 'Claude',
-  codex: 'Codex',
+  claude: 'claude cli',
+  codex: 'codex cli',
   opencode: 'OpenCode',
   gemini: 'Gemini',
   kimi: 'Kimi',

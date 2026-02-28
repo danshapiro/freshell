@@ -117,8 +117,8 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
         shortcut: config.pickerShortcut,
       }))
 
-    // Order: CLIs, agent chat, Editor, Browser, Shell(s)
-    return [...cliOptions, ...agentChatOptions, ...nonShellOptions, ...shellOptions]
+    // Order: agent chat, CLIs, Editor, Browser, Shell(s)
+    return [...agentChatOptions, ...cliOptions, ...nonShellOptions, ...shellOptions]
   }, [platform, availableClis, enabledProviders])
 
   const [focusedIndex, setFocusedIndex] = useState<number | null>(null)
