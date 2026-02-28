@@ -44,6 +44,31 @@ export type AppView = 'terminal' | 'tabs' | 'sessions' | 'overview' | 'settings'
 
 type SessionItem = SidebarSessionItem
 
+/** Compare two SessionItem arrays by sidebar-relevant fields, ignoring timestamp.
+ *  Timestamps change on every session update but don't affect the DOM between
+ *  timestampTick intervals — the tick mechanism handles freshness.  By excluding
+ *  timestamp we avoid re-rendering the entire virtual list on every session patch. */
+export function areSessionItemsEqual(a: SessionItem[], b: SessionItem[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    const ai = a[i], bi = b[i]
+    if (
+      ai.sessionId !== bi.sessionId ||
+      ai.provider !== bi.provider ||
+      ai.title !== bi.title ||
+      ai.subtitle !== bi.subtitle ||
+      ai.hasTab !== bi.hasTab ||
+      ai.isRunning !== bi.isRunning ||
+      ai.runningTerminalId !== bi.runningTerminalId ||
+      ai.archived !== bi.archived ||
+      ai.projectColor !== bi.projectColor ||
+      ai.cwd !== bi.cwd ||
+      ai.projectPath !== bi.projectPath
+    ) return false
+  }
+  return true
+}
+
 const SESSION_ITEM_HEIGHT = 56
 const SESSION_LIST_MAX_HEIGHT = 600
 
@@ -144,6 +169,10 @@ export default function Sidebar({
     return `${ref.provider}:${ref.sessionId}`
   })
   const selectSortedItems = useMemo(() => makeSelectSortedSessionItems(), [])
+  // Separate selector instance for allItems: createSelector caches only one
+  // result, so calling the same instance with different filter args would thrash
+  // the cache and cause both to recompute on every render during search.
+  const selectAllItems = useMemo(() => makeSelectSortedSessionItems(), [])
   const selectKnownSessionKeys = useMemo(() => makeSelectKnownSessionKeys(), [])
 
   const ws = useMemo(() => getWsClient(), [])
@@ -236,7 +265,7 @@ export default function Sidebar({
 
   // Build session list with selector for local filtering (title tier)
   const localFilteredItems = useAppSelector((state) => selectSortedItems(state, terminals, filter))
-  const allItems = useAppSelector((state) => selectSortedItems(state, terminals, ''))
+  const allItems = useAppSelector((state) => selectAllItems(state, terminals, ''))
   const knownSessionKeys = useAppSelector((state) => selectKnownSessionKeys(state))
   const itemsByKey = useMemo(() => {
     const map = new Map<string, SidebarSessionItem>()
@@ -247,7 +276,7 @@ export default function Sidebar({
   }, [allItems])
 
   // Combine local and backend search results
-  const sortedItems = useMemo(() => {
+  const computedItems = useMemo(() => {
     // If we have backend search results, convert them to SessionItems
     if (searchResults !== null) {
       const items: SessionItem[] = []
@@ -301,6 +330,18 @@ export default function Sidebar({
     // Otherwise use local filtering for title tier
     return localFilteredItems
   }, [itemsByKey, knownSessionKeys, localFilteredItems, searchResults])
+
+  // Stabilize sortedItems: the selector creates new objects for ALL items on
+  // every recompute (even when only one session's timestamp changed).  We compare
+  // by sidebar-relevant fields (excluding timestamp, which the timestampTick
+  // mechanism handles) and return the previous reference when nothing meaningful
+  // changed.  This prevents react-window from re-rendering all visible rows on
+  // every session patch.
+  const stableItemsRef = useRef(computedItems)
+  if (!areSessionItemsEqual(stableItemsRef.current, computedItems)) {
+    stableItemsRef.current = computedItems
+  }
+  const sortedItems = stableItemsRef.current
 
   useEffect(() => {
     const container = listContainerRef.current
