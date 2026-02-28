@@ -1,3 +1,5 @@
+import fs from 'fs'
+import path from 'path'
 import { nanoid } from 'nanoid'
 import { EventEmitter } from 'events'
 import {
@@ -18,6 +20,12 @@ import type {
   ContentBlock,
   SdkServerMessage,
 } from './sdk-bridge-types.js'
+
+/** Default plugins resolved from cwd. Only includes paths that exist on disk. */
+const DEFAULT_PLUGIN_CANDIDATES = [
+  path.join(process.cwd(), '.claude', 'plugins', 'freshell-orchestration'),
+]
+const DEFAULT_PLUGINS = DEFAULT_PLUGIN_CANDIDATES.filter(p => fs.existsSync(p))
 
 const log = logger.child({ component: 'sdk-bridge' })
 
@@ -93,7 +101,13 @@ export class SdkBridge extends EventEmitter {
           return this.handlePermissionRequest(sessionId, toolName, input as Record<string, unknown>, ctx)
         },
         settingSources: ['user', 'project', 'local'],
-        ...(options.plugins && { plugins: options.plugins.map(p => ({ type: 'local' as const, path: p })) }),
+        // Explicit plugins override defaults; omit entirely when no defaults exist
+        // to avoid suppressing SDK's own plugin discovery with an empty array.
+        ...(options.plugins !== undefined
+          ? { plugins: options.plugins.map(p => ({ type: 'local' as const, path: p })) }
+          : DEFAULT_PLUGINS.length > 0
+            ? { plugins: DEFAULT_PLUGINS.map(p => ({ type: 'local' as const, path: p })) }
+            : {}),
       },
     })
 
