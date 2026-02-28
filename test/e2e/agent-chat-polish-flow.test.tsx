@@ -112,6 +112,7 @@ describe('freshclaude polish e2e: left-border message layout', () => {
       </Provider>,
     )
 
+    await vi.dynamicImportSettled()
     expect(await screen.findByRole('heading', { level: 1 }, { timeout: 5000 })).toHaveTextContent('Hello Markdown')
   })
 })

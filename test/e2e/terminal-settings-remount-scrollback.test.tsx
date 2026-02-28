@@ -319,6 +319,7 @@ describe('settings remount scrollback hydration (e2e)', () => {
 
     const allWrites = terminalInstances.flatMap((instance) => instance.write.mock.calls.map(([data]) => data))
     expect(allWrites).toContain('hidden-replayed-after-settings')
+    // Gap messages are written to the terminal for all gap types including replay_window_exceeded
     const allGapLines = terminalInstances.flatMap((instance) => instance.writeln.mock.calls.map(([data]) => String(data)))
     expect(allGapLines.some((line) => line.includes('reconnect window exceeded'))).toBe(true)
   })

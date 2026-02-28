@@ -207,6 +207,7 @@ describe('EditorPane', () => {
       </Provider>
     )
 
+    await vi.dynamicImportSettled()
     expect(await screen.findByRole('heading', { level: 1 }, { timeout: 5000 })).toHaveTextContent('Hello World')
     expect(screen.queryByTestId('monaco-mock')).not.toBeInTheDocument()
   })

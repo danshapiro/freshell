@@ -34,6 +34,7 @@ describe('MessageBubble', () => {
     const { container } = render(
       <MessageBubble role="assistant" content={[{ type: 'text', text: '**Bold text**' }]} />
     )
+    await vi.dynamicImportSettled()
     await waitFor(() => {
       const strong = container.querySelector('strong')
       expect(strong).toBeInTheDocument()

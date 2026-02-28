@@ -79,6 +79,7 @@ function createStore(options: {
   excludeFirstChatSubstrings?: string[]
   excludeFirstChatMustStart?: boolean
   showSubagents?: boolean
+  ignoreCodexSubagents?: boolean
 }) {
   const projects = options.projects.map((project) => ({
     ...project,
@@ -132,6 +133,7 @@ function createStore(options: {
             sortMode: 'activity',
             showProjectBadges: true,
             showSubagents: options.showSubagents ?? defaultSettings.sidebar.showSubagents,
+            ignoreCodexSubagents: options.ignoreCodexSubagents ?? defaultSettings.sidebar.ignoreCodexSubagents,
             hideEmptySessions: false,
             excludeFirstChatSubstrings: options.excludeFirstChatSubstrings ?? defaultSettings.sidebar.excludeFirstChatSubstrings,
             excludeFirstChatMustStart: options.excludeFirstChatMustStart ?? defaultSettings.sidebar.excludeFirstChatMustStart,
@@ -289,6 +291,7 @@ describe('sidebar click opens pane (e2e)', () => {
       tabs: [{ id: 'tab-1', mode: 'shell' }],
       activeTabId: 'tab-1',
       showSubagents: true,
+      ignoreCodexSubagents: false,
     })
 
     renderSidebar(store)
