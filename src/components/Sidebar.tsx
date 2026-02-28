@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Terminal, Folder, Settings, LayoutGrid, Search, Loader2, X, Archive, PanelLeftClose, AlertCircle } from 'lucide-react'
 import { List, type RowComponentProps } from 'react-window'
 import { cn } from '@/lib/utils'
@@ -19,6 +19,26 @@ import { createLogger } from '@/lib/client-logger'
 
 
 const log = createLogger('Sidebar')
+
+/** Compare two BackgroundTerminal arrays by sidebar-relevant fields only.
+ *  Ignores lastActivityAt since it changes frequently but doesn't affect rendering. */
+export function areTerminalsEqual(a: BackgroundTerminal[], b: BackgroundTerminal[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    const ai = a[i], bi = b[i]
+    if (
+      ai.terminalId !== bi.terminalId ||
+      ai.title !== bi.title ||
+      ai.createdAt !== bi.createdAt ||
+      ai.cwd !== bi.cwd ||
+      ai.status !== bi.status ||
+      ai.hasClients !== bi.hasClients ||
+      ai.mode !== bi.mode ||
+      ai.resumeSessionId !== bi.resumeSessionId
+    ) return false
+  }
+  return true
+}
 
 export type AppView = 'terminal' | 'tabs' | 'sessions' | 'overview' | 'settings'
 
@@ -44,6 +64,35 @@ function formatRelativeTime(timestamp: number): string {
 function getProjectName(projectPath: string): string {
   const parts = projectPath.replace(/\\/g, '/').split('/')
   return parts[parts.length - 1] || projectPath
+}
+
+interface SidebarRowProps {
+  items: SessionItem[]
+  activeSessionKey: string | null
+  activeTerminalId: string | undefined
+  showProjectBadge: boolean | undefined
+  onItemClick: (item: SessionItem) => void
+  timestampTick: number
+}
+
+/** Row component defined at module scope for stable identity — prevents react-window
+ *  from unmounting/remounting all visible rows on every parent re-render. */
+export const SidebarRow = ({ index, style, ariaAttributes, ...data }: RowComponentProps<SidebarRowProps>) => {
+  const item = data.items[index]
+  const isActive = item.isRunning
+    ? item.runningTerminalId === data.activeTerminalId
+    : `${item.provider}:${item.sessionId}` === data.activeSessionKey
+  return (
+    <div style={{ ...style, paddingBottom: 2 }} {...ariaAttributes}>
+      <SidebarItem
+        item={item}
+        isActiveTab={isActive}
+        showProjectBadge={data.showProjectBadge}
+        onClick={() => data.onItemClick(item)}
+        timestampTick={data.timestampTick}
+      />
+    </div>
+  )
 }
 
 export default function Sidebar({
@@ -92,6 +141,15 @@ export default function Sidebar({
   const listContainerRef = useRef<HTMLDivElement | null>(null)
   const [listHeight, setListHeight] = useState(0)
 
+  // Tick counter that increments every 60s to keep relative timestamps fresh
+  // without requiring a full data refresh. This replaces the previous implicit
+  // "refresh" from the 10-second terminal poll replacing the entire list.
+  const [timestampTick, setTimestampTick] = useState(0)
+  useEffect(() => {
+    const id = window.setInterval(() => setTimestampTick((t) => t + 1), 60_000)
+    return () => window.clearInterval(id)
+  }, [])
+
   // Fetch background terminals
   const refresh = useCallback(() => {
     const requestId = `list-${Date.now()}`
@@ -105,7 +163,10 @@ export default function Sidebar({
     // Register message handler BEFORE calling refresh to avoid race condition
     const unsub = ws.onMessage((msg) => {
       if (msg.type === 'terminal.list.response' && msg.requestId === requestIdRef.current) {
-        setTerminals(msg.terminals || [])
+        const incoming = msg.terminals || []
+        // Only update state when terminal data has actually changed to avoid
+        // unnecessary re-renders that cause the sidebar list to blink/flash.
+        setTerminals((prev) => areTerminalsEqual(prev, incoming) ? prev : incoming)
       }
       if (['terminal.detached', 'terminal.attach.ready', 'terminal.exit', 'terminal.list.updated'].includes(msg.type)) {
         refresh()
@@ -305,30 +366,14 @@ export default function Sidebar({
     ? listHeight
     : Math.min(sortedItems.length * SESSION_ITEM_HEIGHT, SESSION_LIST_MAX_HEIGHT)
 
-  const rowProps = useMemo(() => ({
+  const rowProps: SidebarRowProps = useMemo(() => ({
     items: sortedItems,
     activeSessionKey,
     activeTerminalId,
     showProjectBadge: settings.sidebar?.showProjectBadges,
     onItemClick: handleItemClick,
-  }), [sortedItems, activeSessionKey, activeTerminalId, settings.sidebar?.showProjectBadges, handleItemClick])
-
-  const Row = ({ index, style, ariaAttributes, ...data }: RowComponentProps<typeof rowProps>) => {
-    const item = data.items[index]
-    const isActive = item.isRunning
-      ? item.runningTerminalId === data.activeTerminalId
-      : `${item.provider}:${item.sessionId}` === data.activeSessionKey
-    return (
-      <div style={{ ...style, paddingBottom: 2 }} {...ariaAttributes}>
-        <SidebarItem
-          item={item}
-          isActiveTab={isActive}
-          showProjectBadge={data.showProjectBadge}
-          onClick={() => data.onItemClick(item)}
-        />
-      </div>
-    )
-  }
+    timestampTick,
+  }), [sortedItems, activeSessionKey, activeTerminalId, settings.sidebar?.showProjectBadges, handleItemClick, timestampTick])
 
   return (
     <div
@@ -472,7 +517,7 @@ export default function Sidebar({
             defaultHeight={effectiveListHeight}
             rowCount={sortedItems.length}
             rowHeight={SESSION_ITEM_HEIGHT}
-            rowComponent={Row}
+            rowComponent={SidebarRow}
             rowProps={rowProps}
             className="overflow-y-auto"
             style={{ height: effectiveListHeight, width: '100%' }}
@@ -484,17 +529,15 @@ export default function Sidebar({
   )
 }
 
-function SidebarItem({
-  item,
-  isActiveTab,
-  showProjectBadge,
-  onClick,
-}: {
+export const SidebarItem = memo(function SidebarItem(props: {
   item: SessionItem
   isActiveTab?: boolean
   showProjectBadge?: boolean
   onClick: () => void
+  /** Changing tick value breaks React.memo equality to refresh relative timestamps. */
+  timestampTick?: number
 }) {
+  const { item, isActiveTab, showProjectBadge, onClick } = props
   return (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -559,4 +602,4 @@ function SidebarItem({
       </TooltipContent>
     </Tooltip>
   )
-}
+})
