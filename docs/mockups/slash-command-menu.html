@@ -1,0 +1,1203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Freshclaude — Slash Command Menu Mockup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0b10;
+    --bg-card: #12141c;
+    --bg-muted: #1a1d28;
+    --bg-hover: #222536;
+    --bg-active: #2a2e42;
+    --fg: #e8eaf0;
+    --fg-muted: #8b90a8;
+    --fg-dim: #5c6180;
+    --border: #262a3a;
+    --border-subtle: #1e2130;
+    --accent: #4a9eff;
+    --accent-glow: rgba(74, 158, 255, 0.12);
+    --accent-dim: rgba(74, 158, 255, 0.06);
+    --orange: #e8944a;
+    --orange-dim: rgba(232, 148, 74, 0.15);
+    --green: #4ade80;
+    --green-dim: rgba(74, 222, 128, 0.1);
+    --red: #f87171;
+    --yellow: #facc15;
+    --menu-bg: #141722;
+    --menu-shadow: 0 8px 40px rgba(0,0,0,0.55), 0 2px 12px rgba(0,0,0,0.35), 0 0 0 1px rgba(255,255,255,0.04);
+    --font-mono: 'JetBrains Mono', monospace;
+    --font-ui: 'IBM Plex Sans', -apple-system, system-ui, sans-serif;
+    --radius: 6px;
+    --radius-lg: 10px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: var(--font-ui);
+    background: var(--bg);
+    color: var(--fg);
+    height: 100vh;
+    overflow: hidden;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+
+  /* ── Layout ── */
+  .app {
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    grid-template-rows: 36px 1fr;
+    height: 100vh;
+  }
+
+  /* ── Tab Bar ── */
+  .tab-bar {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: flex-end;
+    background: var(--bg);
+    padding: 0 8px;
+    gap: 2px;
+    border-bottom: 1px solid var(--border);
+    -webkit-app-region: drag;
+  }
+  .tab {
+    height: 30px;
+    padding: 0 14px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12px;
+    font-family: var(--font-mono);
+    font-weight: 500;
+    color: var(--fg-muted);
+    background: var(--bg-muted);
+    border: 1px solid var(--border-subtle);
+    border-bottom: none;
+    border-radius: var(--radius) var(--radius) 0 0;
+    cursor: pointer;
+    transition: all 150ms;
+    white-space: nowrap;
+    -webkit-app-region: no-drag;
+  }
+  .tab:hover { color: var(--fg); background: var(--bg-hover); }
+  .tab.active {
+    color: var(--fg);
+    background: var(--bg-card);
+    border-color: var(--border);
+    position: relative;
+  }
+  .tab.active::after {
+    content: '';
+    position: absolute;
+    bottom: -1px;
+    left: 0; right: 0;
+    height: 1px;
+    background: var(--bg-card);
+  }
+  .tab-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .tab-dot.green { background: var(--green); box-shadow: 0 0 6px rgba(74,222,128,0.4); }
+  .tab-dot.orange { background: var(--orange); }
+  .tab-dot.dim { background: var(--fg-dim); }
+  .tab-close {
+    width: 14px; height: 14px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 3px;
+    opacity: 0;
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 120ms;
+  }
+  .tab:hover .tab-close { opacity: 0.5; }
+  .tab-close:hover { opacity: 1 !important; background: rgba(255,255,255,0.08); }
+
+  /* ── Sidebar ── */
+  .sidebar {
+    background: var(--bg-card);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .sidebar-header {
+    padding: 12px 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    color: var(--fg);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .sidebar-header svg { color: var(--accent); flex-shrink: 0; }
+  .sidebar-nav {
+    display: flex;
+    gap: 2px;
+    padding: 8px 10px;
+  }
+  .sidebar-nav button {
+    flex: 1;
+    height: 28px;
+    background: transparent;
+    border: none;
+    color: var(--fg-muted);
+    font-family: var(--font-ui);
+    font-size: 12px;
+    font-weight: 500;
+    border-radius: var(--radius);
+    cursor: pointer;
+    transition: all 120ms;
+  }
+  .sidebar-nav button:hover { color: var(--fg); background: var(--bg-muted); }
+  .sidebar-nav button.active { color: var(--bg); background: var(--fg); font-weight: 600; }
+  .sidebar-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 4px 8px;
+  }
+  .sidebar-item {
+    padding: 8px 10px;
+    font-size: 13px;
+    border-radius: var(--radius);
+    cursor: pointer;
+    transition: background 100ms;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .sidebar-item:hover { background: var(--bg-hover); }
+  .sidebar-item.active { background: var(--bg-active); }
+  .sidebar-item-title {
+    font-weight: 500;
+    color: var(--fg);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .sidebar-item-meta {
+    font-size: 11px;
+    color: var(--fg-dim);
+    font-family: var(--font-mono);
+  }
+  .sidebar-footer {
+    padding: 8px 14px;
+    border-top: 1px solid var(--border-subtle);
+    font-size: 11px;
+    color: var(--fg-dim);
+    display: flex;
+    gap: 12px;
+  }
+  .sidebar-footer a {
+    color: var(--fg-muted);
+    text-decoration: none;
+    transition: color 100ms;
+  }
+  .sidebar-footer a:hover { color: var(--fg); }
+
+  /* ── Main Pane ── */
+  .main-pane {
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+    overflow: hidden;
+  }
+
+  /* ── Title / Status Bar (unified) ── */
+  .title-bar {
+    height: 34px;
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    gap: 10px;
+    background: var(--bg-muted);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .title-bar-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .title-bar-icon {
+    width: 14px; height: 14px;
+    color: var(--accent);
+  }
+  .title-bar-label {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--fg);
+    white-space: nowrap;
+  }
+  .title-bar-separator {
+    width: 1px;
+    height: 14px;
+    background: var(--border);
+  }
+  .title-bar-pwd {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--fg-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .title-bar-center { flex: 1; }
+  .title-bar-search {
+    position: relative;
+    max-width: 240px;
+    width: 100%;
+  }
+  .title-bar-search input {
+    width: 100%;
+    height: 24px;
+    padding: 0 8px 0 28px;
+    background: var(--bg);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    color: var(--fg);
+    font-family: var(--font-ui);
+    font-size: 12px;
+    outline: none;
+    transition: all 150ms;
+  }
+  .title-bar-search input::placeholder { color: var(--fg-dim); }
+  .title-bar-search input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-glow);
+  }
+  .title-bar-search-icon {
+    position: absolute;
+    left: 8px; top: 50%;
+    transform: translateY(-50%);
+    width: 12px; height: 12px;
+    color: var(--fg-dim);
+    pointer-events: none;
+  }
+  .title-bar-right {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+  .title-bar-tokens {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--fg-dim);
+    white-space: nowrap;
+  }
+  .title-bar-tokens .pct { color: var(--green); font-weight: 600; }
+  .title-bar-btn {
+    width: 24px; height: 24px;
+    display: flex; align-items: center; justify-content: center;
+    background: transparent;
+    border: none;
+    color: var(--fg-muted);
+    border-radius: var(--radius);
+    cursor: pointer;
+    transition: all 120ms;
+    position: relative;
+  }
+  .title-bar-btn:hover { background: var(--bg-hover); color: var(--fg); }
+  .title-bar-btn svg { width: 14px; height: 14px; }
+
+  /* ── Chat Area ── */
+  .chat-area {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .msg {
+    max-width: 680px;
+    padding: 4px 0 4px 12px;
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  .msg.user {
+    border-left: 3px solid var(--orange);
+    color: var(--fg);
+  }
+  .msg.assistant {
+    border-left: 2px solid var(--accent);
+    color: var(--fg);
+  }
+  .msg-role {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 2px;
+  }
+  .msg.user .msg-role { color: var(--orange); }
+  .msg.assistant .msg-role { color: var(--accent); }
+  .msg code {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    background: var(--bg-muted);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+  .msg-tool {
+    margin: 4px 0;
+    padding: 8px 12px;
+    background: var(--bg-muted);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    font-size: 12px;
+    font-family: var(--font-mono);
+    color: var(--fg-muted);
+  }
+  .msg-tool-status { color: var(--green); }
+
+  /* ── Composer ── */
+  .composer {
+    padding: 12px 16px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+    position: relative;
+  }
+  .composer-input-wrap {
+    flex: 1;
+    position: relative;
+  }
+  .composer textarea {
+    width: 100%;
+    min-height: 38px;
+    max-height: 200px;
+    padding: 8px 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--fg);
+    font-family: var(--font-ui);
+    font-size: 13px;
+    line-height: 1.5;
+    resize: none;
+    outline: none;
+    transition: border-color 150ms, box-shadow 150ms;
+  }
+  .composer textarea::placeholder { color: var(--fg-dim); }
+  .composer textarea:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-glow);
+  }
+  .composer-send {
+    width: 34px; height: 34px;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--fg);
+    border: none;
+    border-radius: var(--radius);
+    color: var(--bg);
+    cursor: pointer;
+    transition: all 120ms;
+    flex-shrink: 0;
+  }
+  .composer-send:hover { background: #fff; }
+  .composer-send svg { width: 16px; height: 16px; }
+
+  /* ── Slash Command Menu ── */
+  .cmd-menu-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 999;
+    display: none;
+  }
+  .cmd-menu-overlay.open { display: block; }
+
+  .cmd-menu {
+    position: absolute;
+    z-index: 1000;
+    width: 320px;
+    max-height: 420px;
+    background: var(--menu-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--menu-shadow);
+    display: none;
+    flex-direction: column;
+    overflow: hidden;
+    animation: menuIn 150ms cubic-bezier(.34,1.4,.64,1);
+  }
+  .cmd-menu.open { display: flex; }
+
+  @keyframes menuIn {
+    from { opacity: 0; transform: translateY(6px) scale(0.97); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
+
+  .cmd-menu-header {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border-subtle);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .cmd-menu-filter {
+    flex: 1;
+    height: 28px;
+    padding: 0 8px;
+    background: var(--bg);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    color: var(--fg);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    outline: none;
+    transition: border-color 150ms;
+  }
+  .cmd-menu-filter:focus { border-color: var(--accent); }
+  .cmd-menu-filter::placeholder { color: var(--fg-dim); }
+
+  .cmd-menu-section {
+    padding: 4px 6px;
+  }
+  .cmd-menu-section-label {
+    padding: 4px 8px 2px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--fg-dim);
+    font-family: var(--font-mono);
+  }
+
+  .cmd-menu-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 4px 6px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--bg-hover) transparent;
+  }
+  .cmd-menu-list::-webkit-scrollbar { width: 5px; }
+  .cmd-menu-list::-webkit-scrollbar-track { background: transparent; }
+  .cmd-menu-list::-webkit-scrollbar-thumb { background: var(--bg-hover); border-radius: 3px; }
+
+  .cmd-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 10px;
+    border-radius: var(--radius);
+    cursor: pointer;
+    transition: background 80ms;
+    position: relative;
+  }
+  .cmd-item:hover, .cmd-item.highlighted {
+    background: var(--bg-hover);
+  }
+  .cmd-item.highlighted {
+    background: var(--accent-dim);
+    outline: 1px solid rgba(74,158,255,0.15);
+  }
+  .cmd-item-icon {
+    width: 20px; height: 20px;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+    color: var(--fg-dim);
+    font-size: 13px;
+  }
+  .cmd-item.highlighted .cmd-item-icon { color: var(--accent); }
+  .cmd-item-text {
+    flex: 1;
+    min-width: 0;
+  }
+  .cmd-item-name {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--fg);
+  }
+  .cmd-item-name .slash { color: var(--fg-dim); }
+  .cmd-item-name .match { color: var(--accent); }
+  .cmd-item-desc {
+    font-size: 11px;
+    color: var(--fg-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .cmd-item-badge {
+    font-size: 9px;
+    font-family: var(--font-mono);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 1px 5px;
+    border-radius: 3px;
+    flex-shrink: 0;
+  }
+  .cmd-item-badge.pinned {
+    background: var(--orange-dim);
+    color: var(--orange);
+  }
+
+  .cmd-menu-footer {
+    padding: 6px 12px;
+    border-top: 1px solid var(--border-subtle);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 10px;
+    color: var(--fg-dim);
+    font-family: var(--font-mono);
+  }
+  .cmd-menu-footer kbd {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 4px;
+    background: var(--bg-muted);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    font-size: 10px;
+    font-family: var(--font-mono);
+    color: var(--fg-muted);
+  }
+
+  /* ── Sub-popup (e.g., /output-style picker) ── */
+  .sub-popup {
+    position: fixed;
+    z-index: 1100;
+    width: 240px;
+    background: var(--menu-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--menu-shadow);
+    display: none;
+    flex-direction: column;
+    overflow: hidden;
+    animation: menuIn 150ms cubic-bezier(.34,1.4,.64,1);
+  }
+  .sub-popup.open { display: flex; }
+  .sub-popup-header {
+    padding: 8px 12px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--fg-muted);
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .sub-popup-item {
+    padding: 8px 14px;
+    font-size: 13px;
+    cursor: pointer;
+    transition: background 80ms;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .sub-popup-item:hover, .sub-popup-item.highlighted {
+    background: var(--bg-hover);
+  }
+  .sub-popup-item.highlighted { background: var(--accent-dim); }
+  .sub-popup-item-check {
+    width: 14px;
+    color: var(--accent);
+    font-size: 12px;
+  }
+
+  /* ── Toast notification ── */
+  .toast {
+    position: fixed;
+    bottom: 80px;
+    left: 50%;
+    transform: translateX(-50%) translateY(20px);
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--menu-shadow);
+    padding: 8px 16px;
+    font-size: 12px;
+    font-family: var(--font-mono);
+    color: var(--fg);
+    opacity: 0;
+    pointer-events: none;
+    transition: all 250ms cubic-bezier(.34,1.4,.64,1);
+    z-index: 1200;
+  }
+  .toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+
+  /* ── Scrollbar for chat ── */
+  .chat-area::-webkit-scrollbar { width: 6px; }
+  .chat-area::-webkit-scrollbar-track { background: transparent; }
+  .chat-area::-webkit-scrollbar-thumb { background: var(--bg-hover); border-radius: 3px; }
+  .sidebar-list::-webkit-scrollbar { width: 5px; }
+  .sidebar-list::-webkit-scrollbar-track { background: transparent; }
+  .sidebar-list::-webkit-scrollbar-thumb { background: var(--bg-hover); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<div class="app">
+  <!-- Tab Bar -->
+  <div class="tab-bar">
+    <div class="tab">
+      <span class="tab-dot dim"></span>
+      <span>terminal</span>
+      <span class="tab-close">×</span>
+    </div>
+    <div class="tab active">
+      <span class="tab-dot green"></span>
+      <span>claude — freshell</span>
+      <span class="tab-close">×</span>
+    </div>
+    <div class="tab">
+      <span class="tab-dot orange"></span>
+      <span>claude — api-server</span>
+      <span class="tab-close">×</span>
+    </div>
+  </div>
+
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M4 17l6-6-6-6M12 19h8"/></svg>
+      freshell
+    </div>
+    <div class="sidebar-nav">
+      <button>Sessions</button>
+      <button class="active">History</button>
+    </div>
+    <div class="sidebar-list">
+      <div class="sidebar-item active">
+        <span class="sidebar-item-title">Slash command menu UI</span>
+        <span class="sidebar-item-meta">2 min ago · 12 msgs</span>
+      </div>
+      <div class="sidebar-item">
+        <span class="sidebar-item-title">Sidebar refresh optimization</span>
+        <span class="sidebar-item-meta">14 min ago · 8 msgs</span>
+      </div>
+      <div class="sidebar-item">
+        <span class="sidebar-item-title">Fix terminal resize flicker</span>
+        <span class="sidebar-item-meta">1 hr ago · 23 msgs</span>
+      </div>
+      <div class="sidebar-item">
+        <span class="sidebar-item-title">Auth token rotation</span>
+        <span class="sidebar-item-meta">3 hr ago · 45 msgs</span>
+      </div>
+      <div class="sidebar-item">
+        <span class="sidebar-item-title">PWD tracking in title bar</span>
+        <span class="sidebar-item-meta">5 hr ago · 17 msgs</span>
+      </div>
+      <div class="sidebar-item">
+        <span class="sidebar-item-title">Settings persistence bug</span>
+        <span class="sidebar-item-meta">Yesterday · 31 msgs</span>
+      </div>
+    </div>
+    <div class="sidebar-footer">
+      <a href="#">Settings</a>
+      <a href="#">Help</a>
+    </div>
+  </div>
+
+  <!-- Main Pane -->
+  <div class="main-pane">
+    <!-- Unified Title / Status Bar -->
+    <div class="title-bar">
+      <div class="title-bar-left">
+        <svg class="title-bar-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>
+        <span class="title-bar-label">Claude Code</span>
+        <div class="title-bar-separator"></div>
+        <span class="title-bar-pwd">~/code/freshell</span>
+      </div>
+      <div class="title-bar-center">
+        <div class="title-bar-search">
+          <svg class="title-bar-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+          <input type="text" placeholder="Search conversation…" />
+        </div>
+      </div>
+      <div class="title-bar-right">
+        <span class="title-bar-tokens"><span class="pct">23%</span> tokens</span>
+        <div class="title-bar-separator"></div>
+        <!-- The Gear → Slash Command Menu button -->
+        <button class="title-bar-btn" id="gearBtn" aria-label="Slash commands" title="Slash commands (/)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- Chat Messages -->
+    <div class="chat-area" id="chatArea">
+      <div class="msg user">
+        <div class="msg-role">You</div>
+        Add slash command support to the gear menu. It should open when I type <code>/</code> in the chat box.
+      </div>
+      <div class="msg assistant">
+        <div class="msg-role">Claude</div>
+        I'll implement the slash command menu. Let me start by exploring the existing ChatComposer component and the Claude Code SDK integration.
+        <div class="msg-tool">
+          <span class="msg-tool-status">✓</span> Read src/components/agent-chat/ChatComposer.tsx
+        </div>
+        The gear icon will become the menu trigger. Typing <code>/</code> in the text box will open the same menu. Pinned commands (Settings, Skills) appear at the top, followed by the full alphabetical list.
+      </div>
+      <div class="msg user">
+        <div class="msg-role">You</div>
+        Looks good. Try typing <code>/</code> below or clicking the ⚙ gear icon in the title bar to see the menu.
+      </div>
+    </div>
+
+    <!-- Composer -->
+    <div class="composer">
+      <div class="composer-input-wrap">
+        <textarea id="chatInput" rows="1" placeholder="Message Claude… (type / for commands)" autofocus></textarea>
+      </div>
+      <button class="composer-send" aria-label="Send message">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Slash Command Menu (anchored near gear / above composer) -->
+<div class="cmd-menu-overlay" id="cmdOverlay"></div>
+<div class="cmd-menu" id="cmdMenu" role="menu" aria-label="Slash commands">
+  <div class="cmd-menu-header">
+    <input class="cmd-menu-filter" id="cmdFilter" type="text" placeholder="Filter commands…" autocomplete="off" />
+  </div>
+  <div class="cmd-menu-list" id="cmdList"></div>
+  <div class="cmd-menu-footer">
+    <span><kbd>↑↓</kbd> navigate</span>
+    <span><kbd>↵</kbd> execute</span>
+    <span><kbd>esc</kbd> close</span>
+  </div>
+</div>
+
+<!-- Sub-popup for param selection (e.g. /output-style) -->
+<div class="sub-popup" id="subPopup" role="listbox" aria-label="Select option">
+  <div class="sub-popup-header" id="subPopupHeader">Select option</div>
+  <div id="subPopupList"></div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script>
+// ─── Command Data ───────────────────────────────────────────
+const COMMANDS = [
+  // Pinned
+  { name: 'config',         desc: 'Open settings',                          icon: '⚙', pinned: true },
+  { name: 'help',           desc: 'Get usage help',                         icon: '?', pinned: true },
+
+  // All commands alphabetical
+  { name: 'clear',          desc: 'Clear conversation history',             icon: '🗑' },
+  { name: 'compact',        desc: 'Compact conversation context',           icon: '📦', hasArgs: true },
+  { name: 'config',         desc: 'Open settings',                          icon: '⚙' },
+  { name: 'context',        desc: 'Visualize context usage',                icon: '📊' },
+  { name: 'copy',           desc: 'Copy last response to clipboard',        icon: '📋' },
+  { name: 'cost',           desc: 'Show token usage statistics',            icon: '💰' },
+  { name: 'debug',          desc: 'Troubleshoot current session',           icon: '🔍', hasArgs: true },
+  { name: 'desktop',        desc: 'Hand off to Claude Desktop',             icon: '🖥' },
+  { name: 'doctor',         desc: 'Check installation health',              icon: '🩺' },
+  { name: 'exit',           desc: 'Exit the session',                       icon: '🚪' },
+  { name: 'export',         desc: 'Export conversation to file',            icon: '📤', hasArgs: true },
+  { name: 'help',           desc: 'Get usage help',                         icon: '?' },
+  { name: 'init',           desc: 'Initialize project with CLAUDE.md',      icon: '📝' },
+  { name: 'mcp',            desc: 'Manage MCP server connections',          icon: '🔌' },
+  { name: 'memory',         desc: 'Edit CLAUDE.md memory files',            icon: '🧠' },
+  { name: 'model',          desc: 'Select or change AI model',              icon: '🤖', subOptions: ['claude-sonnet-4-20250514', 'claude-opus-4-20250514', 'claude-haiku-3-5'] },
+  { name: 'output-style',   desc: 'Change output style',                    icon: '🎨', subOptions: ['concise', 'normal', 'verbose', 'xml'] },
+  { name: 'permissions',    desc: 'View or update permissions',             icon: '🔒' },
+  { name: 'plan',           desc: 'Enter plan mode',                        icon: '📐' },
+  { name: 'rename',         desc: 'Rename current session',                 icon: '✏️', hasArgs: true },
+  { name: 'resume',         desc: 'Resume a previous conversation',         icon: '⏩', hasArgs: true },
+  { name: 'rewind',         desc: 'Rewind conversation or code',            icon: '⏪' },
+  { name: 'stats',          desc: 'Visualize daily usage & streaks',        icon: '📈' },
+  { name: 'status',         desc: 'Show version, model & account info',     icon: 'ℹ' },
+  { name: 'statusline',     desc: 'Set up status line UI',                  icon: '▬' },
+  { name: 'tasks',          desc: 'List and manage background tasks',       icon: '📋' },
+  { name: 'teleport',       desc: 'Resume remote session from claude.ai',   icon: '🌐' },
+  { name: 'terminal-setup', desc: 'Configure terminal shortcuts',           icon: '⌨' },
+  { name: 'theme',          desc: 'Change color theme',                     icon: '🎭', subOptions: ['dark', 'light', 'light-daltonized', 'dark-daltonized'] },
+  { name: 'todos',          desc: 'List current TODO items',                icon: '✅' },
+  { name: 'usage',          desc: 'Show plan usage & rate limits',          icon: '📉' },
+  { name: 'vim',            desc: 'Enable vim-style editing',               icon: '✦' },
+];
+
+// ─── State ──────────────────────────────────────────────────
+let menuOpen = false;
+let highlightedIndex = -1;
+let filteredItems = [];
+let subPopupOpen = false;
+let subHighlightedIndex = -1;
+let subItems = [];
+let openedFromGear = false;
+
+const cmdMenu = document.getElementById('cmdMenu');
+const cmdOverlay = document.getElementById('cmdOverlay');
+const cmdFilter = document.getElementById('cmdFilter');
+const cmdList = document.getElementById('cmdList');
+const chatInput = document.getElementById('chatInput');
+const gearBtn = document.getElementById('gearBtn');
+const subPopup = document.getElementById('subPopup');
+const subPopupHeader = document.getElementById('subPopupHeader');
+const subPopupList = document.getElementById('subPopupList');
+const toast = document.getElementById('toast');
+
+// ─── Render Commands ────────────────────────────────────────
+function renderMenu(filter = '') {
+  const q = filter.toLowerCase().replace(/^\//, '');
+  const pinned = COMMANDS.filter(c => c.pinned);
+  const all = COMMANDS.filter(c => !c.pinned);
+
+  let pinnedFiltered = pinned;
+  let allFiltered = all;
+
+  if (q) {
+    pinnedFiltered = pinned.filter(c => c.name.includes(q));
+    allFiltered = all.filter(c => c.name.includes(q));
+  }
+
+  filteredItems = [...pinnedFiltered, ...allFiltered];
+
+  let html = '';
+
+  if (pinnedFiltered.length > 0) {
+    html += `<div class="cmd-menu-section"><div class="cmd-menu-section-label">Pinned</div>`;
+    pinnedFiltered.forEach((cmd, i) => {
+      html += renderItem(cmd, i, q, true);
+    });
+    html += `</div>`;
+  }
+
+  if (allFiltered.length > 0) {
+    const offset = pinnedFiltered.length;
+    html += `<div class="cmd-menu-section"><div class="cmd-menu-section-label">All Commands</div>`;
+    allFiltered.forEach((cmd, i) => {
+      html += renderItem(cmd, offset + i, q, false);
+    });
+    html += `</div>`;
+  }
+
+  if (filteredItems.length === 0) {
+    html = `<div style="padding: 20px; text-align: center; color: var(--fg-dim); font-size: 12px;">No matching commands</div>`;
+  }
+
+  cmdList.innerHTML = html;
+
+  // Attach click handlers
+  cmdList.querySelectorAll('.cmd-item').forEach(el => {
+    el.addEventListener('click', () => {
+      const idx = parseInt(el.dataset.index);
+      executeItem(idx);
+    });
+    el.addEventListener('mouseenter', () => {
+      highlightedIndex = parseInt(el.dataset.index);
+      updateHighlight();
+    });
+  });
+
+  if (highlightedIndex >= filteredItems.length) {
+    highlightedIndex = filteredItems.length - 1;
+  }
+  if (highlightedIndex < 0 && filteredItems.length > 0) {
+    highlightedIndex = 0;
+  }
+  updateHighlight();
+}
+
+function renderItem(cmd, index, query, isPinned) {
+  let nameHtml = `<span class="slash">/</span>`;
+  if (query) {
+    const qIdx = cmd.name.indexOf(query);
+    if (qIdx >= 0) {
+      nameHtml += cmd.name.slice(0, qIdx);
+      nameHtml += `<span class="match">${cmd.name.slice(qIdx, qIdx + query.length)}</span>`;
+      nameHtml += cmd.name.slice(qIdx + query.length);
+    } else {
+      nameHtml += cmd.name;
+    }
+  } else {
+    nameHtml += cmd.name;
+  }
+
+  const badge = isPinned ? `<span class="cmd-item-badge pinned">pinned</span>` : '';
+
+  return `
+    <div class="cmd-item" data-index="${index}" role="menuitem" tabindex="-1">
+      <div class="cmd-item-icon">${cmd.icon}</div>
+      <div class="cmd-item-text">
+        <div class="cmd-item-name">${nameHtml}</div>
+        <div class="cmd-item-desc">${cmd.desc}</div>
+      </div>
+      ${badge}
+    </div>`;
+}
+
+function updateHighlight() {
+  cmdList.querySelectorAll('.cmd-item').forEach(el => {
+    el.classList.toggle('highlighted', parseInt(el.dataset.index) === highlightedIndex);
+    if (parseInt(el.dataset.index) === highlightedIndex) {
+      el.scrollIntoView({ block: 'nearest' });
+    }
+  });
+}
+
+// ─── Open / Close Menu ──────────────────────────────────────
+function openMenu(fromGear = false) {
+  if (menuOpen) return;
+  menuOpen = true;
+  openedFromGear = fromGear;
+  highlightedIndex = 0;
+
+  cmdMenu.classList.add('open');
+  cmdOverlay.classList.add('open');
+
+  // Position: above composer if from text, below gear if from gear
+  if (fromGear) {
+    const rect = gearBtn.getBoundingClientRect();
+    cmdMenu.style.top = (rect.bottom + 6) + 'px';
+    cmdMenu.style.right = (window.innerWidth - rect.right) + 'px';
+    cmdMenu.style.left = 'auto';
+    cmdMenu.style.bottom = 'auto';
+  } else {
+    const rect = chatInput.getBoundingClientRect();
+    cmdMenu.style.bottom = (window.innerHeight - rect.top + 8) + 'px';
+    cmdMenu.style.left = rect.left + 'px';
+    cmdMenu.style.right = 'auto';
+    cmdMenu.style.top = 'auto';
+  }
+
+  renderMenu('');
+  cmdFilter.value = '';
+  cmdFilter.focus();
+}
+
+function closeMenu() {
+  if (!menuOpen) return;
+  menuOpen = false;
+  cmdMenu.classList.remove('open');
+  cmdOverlay.classList.remove('open');
+
+  // Clear the / from the chat input if it was opened from there
+  if (!openedFromGear && chatInput.value.startsWith('/')) {
+    chatInput.value = '';
+  }
+
+  chatInput.focus();
+}
+
+function closeSubPopup() {
+  subPopupOpen = false;
+  subPopup.classList.remove('open');
+  chatInput.focus();
+}
+
+// ─── Execute Command ────────────────────────────────────────
+function executeItem(index) {
+  if (index < 0 || index >= filteredItems.length) return;
+  const cmd = filteredItems[index];
+
+  if (cmd.subOptions) {
+    closeMenu();
+    openSubPopup(cmd);
+    return;
+  }
+
+  closeMenu();
+  showToast(`Executed /${cmd.name}`);
+}
+
+function openSubPopup(cmd) {
+  subPopupOpen = true;
+  subItems = cmd.subOptions;
+  subHighlightedIndex = 0;
+
+  subPopupHeader.textContent = `/${cmd.name}`;
+
+  let html = '';
+  subItems.forEach((opt, i) => {
+    html += `<div class="sub-popup-item${i === 0 ? ' highlighted' : ''}" data-index="${i}">
+      <span class="sub-popup-item-check">&nbsp;</span>
+      <span>${opt}</span>
+    </div>`;
+  });
+  subPopupList.innerHTML = html;
+
+  // Position near center of screen
+  subPopup.style.left = '50%';
+  subPopup.style.top = '40%';
+  subPopup.style.transform = 'translate(-50%, -50%)';
+  subPopup.classList.add('open');
+
+  subPopupList.querySelectorAll('.sub-popup-item').forEach(el => {
+    el.addEventListener('click', () => {
+      const idx = parseInt(el.dataset.index);
+      selectSubOption(idx, cmd);
+    });
+    el.addEventListener('mouseenter', () => {
+      subHighlightedIndex = parseInt(el.dataset.index);
+      updateSubHighlight();
+    });
+  });
+}
+
+function updateSubHighlight() {
+  subPopupList.querySelectorAll('.sub-popup-item').forEach(el => {
+    const idx = parseInt(el.dataset.index);
+    el.classList.toggle('highlighted', idx === subHighlightedIndex);
+    // Update check mark
+    el.querySelector('.sub-popup-item-check').textContent = idx === subHighlightedIndex ? '›' : ' ';
+  });
+}
+
+function selectSubOption(index, cmd) {
+  const opt = subItems[index];
+  closeSubPopup();
+  showToast(`/${cmd.name} → ${opt}`);
+}
+
+// ─── Toast ──────────────────────────────────────────────────
+let toastTimer;
+function showToast(msg) {
+  toast.textContent = msg;
+  toast.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.remove('show'), 2000);
+}
+
+// ─── Event Handlers ─────────────────────────────────────────
+
+// Gear button opens menu
+gearBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (menuOpen) { closeMenu(); } else { openMenu(true); }
+});
+
+// Clicking overlay closes menu
+cmdOverlay.addEventListener('click', closeMenu);
+
+// Filter input in menu
+cmdFilter.addEventListener('input', () => {
+  highlightedIndex = 0;
+  renderMenu(cmdFilter.value);
+});
+
+// Keyboard in filter
+cmdFilter.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    highlightedIndex = Math.min(highlightedIndex + 1, filteredItems.length - 1);
+    updateHighlight();
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    highlightedIndex = Math.max(highlightedIndex - 1, 0);
+    updateHighlight();
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    executeItem(highlightedIndex);
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    closeMenu();
+  }
+});
+
+// Chat input: detect /
+chatInput.addEventListener('input', () => {
+  const val = chatInput.value;
+  if (val === '/' && !menuOpen) {
+    openMenu(false);
+  } else if (menuOpen && !openedFromGear && val.startsWith('/')) {
+    // Forward typing to the filter
+    cmdFilter.value = val.slice(1);
+    cmdFilter.dispatchEvent(new Event('input'));
+    cmdFilter.focus();
+  }
+});
+
+// Chat input: handle /command with Enter
+chatInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    const val = chatInput.value.trim();
+    if (val.startsWith('/')) {
+      e.preventDefault();
+      const parts = val.slice(1).split(/\s+/);
+      const cmdName = parts[0];
+      const args = parts.slice(1).join(' ');
+      const cmd = COMMANDS.find(c => c.name === cmdName);
+      if (cmd) {
+        if (cmd.subOptions && !args) {
+          chatInput.value = '';
+          openSubPopup(cmd);
+        } else {
+          chatInput.value = '';
+          showToast(args ? `/${cmdName} ${args}` : `Executed /${cmdName}`);
+        }
+      } else {
+        chatInput.value = '';
+        showToast(`Unknown command: /${cmdName}`);
+      }
+      return;
+    }
+  }
+  if (e.key === 'Escape' && menuOpen) {
+    e.preventDefault();
+    closeMenu();
+  }
+});
+
+// Sub-popup keyboard handling
+document.addEventListener('keydown', (e) => {
+  if (!subPopupOpen) return;
+
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    subHighlightedIndex = Math.min(subHighlightedIndex + 1, subItems.length - 1);
+    updateSubHighlight();
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    subHighlightedIndex = Math.max(subHighlightedIndex - 1, 0);
+    updateSubHighlight();
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    // Find the command that opened this popup
+    const cmdName = subPopupHeader.textContent.slice(1);
+    const cmd = COMMANDS.find(c => c.name === cmdName);
+    selectSubOption(subHighlightedIndex, cmd || { name: cmdName });
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    closeSubPopup();
+  }
+});
+
+// Click outside sub-popup closes it
+document.addEventListener('click', (e) => {
+  if (subPopupOpen && !subPopup.contains(e.target)) {
+    closeSubPopup();
+  }
+});
+
+// Auto-resize textarea
+chatInput.addEventListener('input', function() {
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 200) + 'px';
+});
+
+// Focus the chat input on load
+chatInput.focus();
+</script>
+
+</body>
+</html>
