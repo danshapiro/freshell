@@ -270,6 +270,7 @@ async function main() {
     terminalMetadata,
     registry,
     wsHandler,
+    sessionMetadataStore,
   }))
 
   app.use('/api', createProjectColorsRouter({ configStore, codingCliIndexer }))
