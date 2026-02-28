@@ -450,6 +450,7 @@
     align-items: center;
     gap: 6px;
   }
+  .cmd-menu-header.hidden { display: none; }
   .cmd-menu-filter {
     flex: 1;
     height: 28px;
@@ -755,7 +756,12 @@
       </div>
       <div class="msg user">
         <div class="msg-role">You</div>
-        Looks good. Try typing <code>/</code> below or clicking the ⚙ gear icon in the title bar to see the menu.
+        Try it out:<br>
+        • Type <code>/</code> in the chat box — text stays in the box, menu floats above as autocomplete<br>
+        • Keep typing e.g. <code>/com</code> — menu filters, text shows in the chat box<br>
+        • Type <code>/compact foobar</code> and hit Enter — executes the command<br>
+        • Click the ⚙ gear — menu opens with its own filter field<br>
+        • Click a menu item — executes immediately
       </div>
     </div>
 
@@ -774,7 +780,7 @@
 <!-- Slash Command Menu (anchored near gear / above composer) -->
 <div class="cmd-menu-overlay" id="cmdOverlay"></div>
 <div class="cmd-menu" id="cmdMenu" role="menu" aria-label="Slash commands">
-  <div class="cmd-menu-header">
+  <div class="cmd-menu-header" id="cmdMenuHeader">
     <input class="cmd-menu-filter" id="cmdFilter" type="text" placeholder="Filter commands…" autocomplete="off" />
   </div>
   <div class="cmd-menu-list" id="cmdList"></div>
@@ -846,6 +852,7 @@ let subItems = [];
 let openedFromGear = false;
 
 const cmdMenu = document.getElementById('cmdMenu');
+const cmdMenuHeader = document.getElementById('cmdMenuHeader');
 const cmdOverlay = document.getElementById('cmdOverlay');
 const cmdFilter = document.getElementById('cmdFilter');
 const cmdList = document.getElementById('cmdList');
@@ -955,6 +962,17 @@ function updateHighlight() {
   });
 }
 
+// ─── Helpers ────────────────────────────────────────────────
+// Extract the command-name portion from the chat input (text after / up to first space)
+function getSlashPrefix() {
+  const val = chatInput.value;
+  if (!val.startsWith('/')) return '';
+  const spaceIdx = val.indexOf(' ');
+  // Only filter by prefix before the first space; once there's a space the user is typing args
+  if (spaceIdx >= 0) return val.slice(1, spaceIdx);
+  return val.slice(1);
+}
+
 // ─── Open / Close Menu ──────────────────────────────────────
 function openMenu(fromGear = false) {
   if (menuOpen) return;
@@ -962,10 +980,17 @@ function openMenu(fromGear = false) {
   openedFromGear = fromGear;
   highlightedIndex = 0;
 
+  // Show/hide the filter field: only gear mode gets one
+  if (fromGear) {
+    cmdMenuHeader.classList.remove('hidden');
+  } else {
+    cmdMenuHeader.classList.add('hidden');
+  }
+
   cmdMenu.classList.add('open');
   cmdOverlay.classList.add('open');
 
-  // Position: above composer if from text, below gear if from gear
+  // Position: below gear if from gear, above composer if from text
   if (fromGear) {
     const rect = gearBtn.getBoundingClientRect();
     cmdMenu.style.top = (rect.bottom + 6) + 'px';
@@ -980,9 +1005,16 @@ function openMenu(fromGear = false) {
     cmdMenu.style.top = 'auto';
   }
 
-  renderMenu('');
-  cmdFilter.value = '';
-  cmdFilter.focus();
+  if (fromGear) {
+    renderMenu('');
+    cmdFilter.value = '';
+    cmdFilter.focus();
+  } else {
+    // Filter by whatever is already typed after /
+    renderMenu(getSlashPrefix());
+    // Keep focus in the chat input — no filter field in this mode
+    chatInput.focus();
+  }
 }
 
 function closeMenu() {
@@ -990,12 +1022,6 @@ function closeMenu() {
   menuOpen = false;
   cmdMenu.classList.remove('open');
   cmdOverlay.classList.remove('open');
-
-  // Clear the / from the chat input if it was opened from there
-  if (!openedFromGear && chatInput.value.startsWith('/')) {
-    chatInput.value = '';
-  }
-
   chatInput.focus();
 }
 
@@ -1011,11 +1037,14 @@ function executeItem(index) {
   const cmd = filteredItems[index];
 
   if (cmd.subOptions) {
+    // When opened from chat, clear the input
+    if (!openedFromGear) chatInput.value = '';
     closeMenu();
     openSubPopup(cmd);
     return;
   }
 
+  if (!openedFromGear) chatInput.value = '';
   closeMenu();
   showToast(`Executed /${cmd.name}`);
 }
@@ -1058,7 +1087,6 @@ function updateSubHighlight() {
   subPopupList.querySelectorAll('.sub-popup-item').forEach(el => {
     const idx = parseInt(el.dataset.index);
     el.classList.toggle('highlighted', idx === subHighlightedIndex);
-    // Update check mark
     el.querySelector('.sub-popup-item-check').textContent = idx === subHighlightedIndex ? '›' : ' ';
   });
 }
@@ -1089,13 +1117,13 @@ gearBtn.addEventListener('click', (e) => {
 // Clicking overlay closes menu
 cmdOverlay.addEventListener('click', closeMenu);
 
-// Filter input in menu
+// Filter input in menu (gear mode only)
 cmdFilter.addEventListener('input', () => {
   highlightedIndex = 0;
   renderMenu(cmdFilter.value);
 });
 
-// Keyboard in filter
+// Keyboard in gear-mode filter
 cmdFilter.addEventListener('keydown', (e) => {
   if (e.key === 'ArrowDown') {
     e.preventDefault();
@@ -1114,49 +1142,107 @@ cmdFilter.addEventListener('keydown', (e) => {
   }
 });
 
-// Chat input: detect /
+// Chat input: detect / and update menu as user types
 chatInput.addEventListener('input', () => {
   const val = chatInput.value;
+
+  // Auto-resize
+  chatInput.style.height = 'auto';
+  chatInput.style.height = Math.min(chatInput.scrollHeight, 200) + 'px';
+
   if (val === '/' && !menuOpen) {
+    // Just typed the initial /
     openMenu(false);
-  } else if (menuOpen && !openedFromGear && val.startsWith('/')) {
-    // Forward typing to the filter
-    cmdFilter.value = val.slice(1);
-    cmdFilter.dispatchEvent(new Event('input'));
-    cmdFilter.focus();
+  } else if (menuOpen && !openedFromGear) {
+    if (!val.startsWith('/')) {
+      // User deleted the / — close the menu
+      closeMenu();
+    } else {
+      // Update the menu filter based on the command prefix in the chat box
+      const prefix = getSlashPrefix();
+      highlightedIndex = 0;
+      renderMenu(prefix);
+    }
   }
 });
 
-// Chat input: handle /command with Enter
+// Chat input: keyboard navigation when menu is open, and /command execution
 chatInput.addEventListener('keydown', (e) => {
+  // When the menu is open in chat mode, handle arrow keys and Enter/Escape
+  if (menuOpen && !openedFromGear) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      highlightedIndex = Math.min(highlightedIndex + 1, filteredItems.length - 1);
+      updateHighlight();
+      return;
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      highlightedIndex = Math.max(highlightedIndex - 1, 0);
+      updateHighlight();
+      return;
+    } else if (e.key === 'Tab') {
+      // Tab completes the highlighted command into the chat box
+      e.preventDefault();
+      if (highlightedIndex >= 0 && highlightedIndex < filteredItems.length) {
+        const cmd = filteredItems[highlightedIndex];
+        chatInput.value = '/' + cmd.name + ' ';
+        // Re-render menu to show it's selected, but keep menu open for args
+        highlightedIndex = 0;
+        renderMenu(cmd.name);
+      }
+      return;
+    } else if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      const val = chatInput.value.trim();
+      // If user typed just /prefix with no space and a single match, execute highlighted
+      const spaceIdx = val.indexOf(' ');
+      if (spaceIdx < 0 && highlightedIndex >= 0 && highlightedIndex < filteredItems.length) {
+        // No args yet — execute the highlighted item
+        executeItem(highlightedIndex);
+        return;
+      }
+      // Otherwise, fall through to the /command args handler below
+      // (close menu first)
+      closeMenu();
+      handleSlashCommand(val);
+      return;
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      closeMenu();
+      return;
+    }
+    // All other keys: let the input event handler update the filter
+    return;
+  }
+
+  // Not in menu mode — handle Enter for /command args submission
   if (e.key === 'Enter' && !e.shiftKey) {
     const val = chatInput.value.trim();
     if (val.startsWith('/')) {
       e.preventDefault();
-      const parts = val.slice(1).split(/\s+/);
-      const cmdName = parts[0];
-      const args = parts.slice(1).join(' ');
-      const cmd = COMMANDS.find(c => c.name === cmdName);
-      if (cmd) {
-        if (cmd.subOptions && !args) {
-          chatInput.value = '';
-          openSubPopup(cmd);
-        } else {
-          chatInput.value = '';
-          showToast(args ? `/${cmdName} ${args}` : `Executed /${cmdName}`);
-        }
-      } else {
-        chatInput.value = '';
-        showToast(`Unknown command: /${cmdName}`);
-      }
-      return;
+      handleSlashCommand(val);
     }
   }
-  if (e.key === 'Escape' && menuOpen) {
-    e.preventDefault();
-    closeMenu();
-  }
 });
+
+function handleSlashCommand(val) {
+  const parts = val.slice(1).split(/\s+/);
+  const cmdName = parts[0];
+  const args = parts.slice(1).join(' ');
+  const cmd = COMMANDS.find(c => c.name === cmdName);
+  if (cmd) {
+    if (cmd.subOptions && !args) {
+      chatInput.value = '';
+      openSubPopup(cmd);
+    } else {
+      chatInput.value = '';
+      showToast(args ? `/${cmdName} ${args}` : `Executed /${cmdName}`);
+    }
+  } else {
+    chatInput.value = '';
+    showToast(`Unknown command: /${cmdName}`);
+  }
+}
 
 // Sub-popup keyboard handling
 document.addEventListener('keydown', (e) => {
@@ -1172,7 +1258,6 @@ document.addEventListener('keydown', (e) => {
     updateSubHighlight();
   } else if (e.key === 'Enter') {
     e.preventDefault();
-    // Find the command that opened this popup
     const cmdName = subPopupHeader.textContent.slice(1);
     const cmd = COMMANDS.find(c => c.name === cmdName);
     selectSubOption(subHighlightedIndex, cmd || { name: cmdName });
@@ -1187,12 +1272,6 @@ document.addEventListener('click', (e) => {
   if (subPopupOpen && !subPopup.contains(e.target)) {
     closeSubPopup();
   }
-});
-
-// Auto-resize textarea
-chatInput.addEventListener('input', function() {
-  this.style.height = 'auto';
-  this.style.height = Math.min(this.scrollHeight, 200) + 'px';
 });
 
 // Focus the chat input on load
