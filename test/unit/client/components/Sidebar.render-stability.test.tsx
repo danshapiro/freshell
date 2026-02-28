@@ -258,10 +258,10 @@ describe('Sidebar render stability', () => {
       expect(areSessionItemsEqual([item1], [item1, item2])).toBe(false)
     })
 
-    it('ignores timestamp changes (handled by timestampTick)', () => {
+    it('detects timestamp changes (session activity updates)', () => {
       const a = [item1]
       const b = [{ ...item1, timestamp: 9999 }]
-      expect(areSessionItemsEqual(a, b)).toBe(true)
+      expect(areSessionItemsEqual(a, b)).toBe(false)
     })
 
     it('returns false when sessionId changes', () => {

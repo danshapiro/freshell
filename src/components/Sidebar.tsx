@@ -44,10 +44,8 @@ export type AppView = 'terminal' | 'tabs' | 'sessions' | 'overview' | 'settings'
 
 type SessionItem = SidebarSessionItem
 
-/** Compare two SessionItem arrays by sidebar-relevant fields, ignoring timestamp.
- *  Timestamps change on every session update but don't affect the DOM between
- *  timestampTick intervals — the tick mechanism handles freshness.  By excluding
- *  timestamp we avoid re-rendering the entire virtual list on every session patch. */
+/** Compare two SessionItem arrays by sidebar-relevant fields.
+ *  Used by tests to verify render stability guarantees. */
 export function areSessionItemsEqual(a: SessionItem[], b: SessionItem[]): boolean {
   if (a.length !== b.length) return false
   for (let i = 0; i < a.length; i++) {
@@ -63,7 +61,8 @@ export function areSessionItemsEqual(a: SessionItem[], b: SessionItem[]): boolea
       ai.archived !== bi.archived ||
       ai.projectColor !== bi.projectColor ||
       ai.cwd !== bi.cwd ||
-      ai.projectPath !== bi.projectPath
+      ai.projectPath !== bi.projectPath ||
+      ai.timestamp !== bi.timestamp
     ) return false
   }
   return true
@@ -212,7 +211,6 @@ export default function Sidebar({
         // unnecessary re-renders that cause the sidebar list to blink/flash.
         setTerminals((prev) => {
           if (areTerminalsEqual(prev, incoming)) return prev
-          log.debug('[DIAG] terminals changed', { prevLen: prev.length, nextLen: incoming.length })
           return incoming
         })
       }
@@ -335,23 +333,12 @@ export default function Sidebar({
     return localFilteredItems
   }, [itemsByKey, knownSessionKeys, localFilteredItems, searchResults])
 
-  // Stabilize sortedItems: the selector creates new objects for ALL items on
-  // every recompute (even when only one session's timestamp changed).  We compare
-  // by sidebar-relevant fields (excluding timestamp, which the timestampTick
-  // mechanism handles) and return the previous reference when nothing meaningful
-  // changed.  This prevents react-window from re-rendering all visible rows on
-  // every session patch.
-  const stableItemsRef = useRef(computedItems)
-  if (!areSessionItemsEqual(stableItemsRef.current, computedItems)) {
-    log.debug('[DIAG] sortedItems changed', {
-      prevLen: stableItemsRef.current.length,
-      nextLen: computedItems.length,
-      prevIds: stableItemsRef.current.slice(0, 3).map(i => i.sessionId),
-      nextIds: computedItems.slice(0, 3).map(i => i.sessionId),
-    })
-    stableItemsRef.current = computedItems
-  }
-  const sortedItems = stableItemsRef.current
+  // Pass computedItems directly to the list.  SidebarItem's React.memo
+  // comparator already prevents DOM updates for unchanged rows, so
+  // stabilizing the array reference here is unnecessary and was blocking
+  // timestamp updates from reaching the UI.  The chunked buffer in App.tsx
+  // prevents the sidebar from collapsing during full session reloads.
+  const sortedItems = computedItems
 
   useEffect(() => {
     const container = listContainerRef.current
@@ -360,12 +347,7 @@ export default function Sidebar({
     const updateHeight = () => {
       const nextHeight = container.clientHeight
       if (nextHeight > 0) {
-        setListHeight((prev) => {
-          if (prev !== nextHeight) {
-            log.debug('[DIAG] listHeight changed', { prev, next: nextHeight })
-          }
-          return nextHeight
-        })
+        setListHeight(() => nextHeight)
       }
     }
 
@@ -440,18 +422,6 @@ export default function Sidebar({
   const effectiveListHeight = listHeight > 0
     ? listHeight
     : Math.min(sortedItems.length * SESSION_ITEM_HEIGHT, SESSION_LIST_MAX_HEIGHT)
-
-  // DIAG: track every render with key state
-  const prevRenderRef = useRef({ itemCount: 0, listHeight: 0, effectiveHeight: 0 })
-  const cur = { itemCount: sortedItems.length, listHeight, effectiveHeight: effectiveListHeight }
-  if (
-    cur.itemCount !== prevRenderRef.current.itemCount ||
-    cur.listHeight !== prevRenderRef.current.listHeight ||
-    cur.effectiveHeight !== prevRenderRef.current.effectiveHeight
-  ) {
-    log.debug('[DIAG] Sidebar render', cur, 'prev:', prevRenderRef.current)
-    prevRenderRef.current = cur
-  }
 
   const rowProps: SidebarRowProps = useMemo(() => ({
     items: sortedItems,
