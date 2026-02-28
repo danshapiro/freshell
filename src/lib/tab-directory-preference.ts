@@ -9,7 +9,7 @@ export type TabDirectoryPreference = {
 
 /**
  * Walk a pane tree and compute directory preference for the tab.
- * Counts initialCwd occurrences across terminal and claude-chat panes.
+ * Counts initialCwd occurrences across terminal and agent-chat panes.
  * Returns the most-used directory (alphabetical tiebreaker) and a
  * frequency-sorted list of all tab directories.
  */
@@ -19,7 +19,7 @@ export function getTabDirectoryPreference(root: PaneNode): TabDirectoryPreferenc
   function walk(node: PaneNode): void {
     if (node.type === 'leaf') {
       const content = node.content
-      if (content.kind === 'terminal' || content.kind === 'claude-chat') {
+      if (content.kind === 'terminal' || content.kind === 'agent-chat') {
         const cwd = content.initialCwd?.trim()
         if (cwd) {
           counts.set(cwd, (counts.get(cwd) ?? 0) + 1)

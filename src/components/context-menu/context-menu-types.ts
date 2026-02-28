@@ -16,7 +16,7 @@ export type ContextTarget =
   | { kind: 'history-session'; sessionId: string; provider?: string }
   | { kind: 'overview-terminal'; terminalId: string }
   | { kind: 'claude-message'; sessionId: string; provider?: string }
-  | { kind: 'freshclaude-chat'; sessionId: string }
+  | { kind: 'agent-chat'; sessionId: string }
 
 export type ParsedContext = {
   id: ContextId

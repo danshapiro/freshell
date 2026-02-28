@@ -45,7 +45,7 @@ function normalizeContent(input: PaneContentInput): PaneContent {
       initialCwd: input.initialCwd,
     }
   }
-  if (input.kind === 'claude-chat') {
+  if (input.kind === 'agent-chat') {
     const explicitSessionRef = input.sessionRef
       && typeof input.sessionRef.provider === 'string'
       && typeof input.sessionRef.sessionId === 'string'
@@ -57,7 +57,8 @@ function normalizeContent(input: PaneContentInput): PaneContent {
         ? { provider: 'claude' as const, sessionId: input.resumeSessionId }
         : undefined)
     return {
-      kind: 'claude-chat',
+      kind: 'agent-chat',
+      provider: input.provider,
       sessionId: input.sessionId,
       createRequestId: input.createRequestId || nanoid(),
       status: input.status || 'creating',

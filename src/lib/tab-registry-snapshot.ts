@@ -42,7 +42,7 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
         readOnly: content.readOnly,
         viewMode: content.viewMode,
       }
-    case 'claude-chat':
+    case 'agent-chat':
       {
         const sessionRef = content.sessionRef
           || (content.resumeSessionId
@@ -53,6 +53,7 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
               }
             : undefined)
         return {
+          provider: content.provider,
           resumeSessionId: content.resumeSessionId,
           sessionRef,
           initialCwd: content.initialCwd,

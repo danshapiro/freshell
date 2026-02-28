@@ -104,11 +104,20 @@ export const SettingsPatchSchema = z
       })
       .strict()
       .optional(),
-    freshclaude: z
+    agentChat: z
       .object({
-        defaultModel: z.string().optional(),
-        defaultPermissionMode: z.string().optional(),
-        defaultEffort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+        providers: z
+          .record(
+            z.string(),
+            z
+              .object({
+                defaultModel: z.string().optional(),
+                defaultPermissionMode: z.string().optional(),
+                defaultEffort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+              })
+              .strict(),
+          )
+          .optional(),
       })
       .strict()
       .optional(),

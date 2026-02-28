@@ -1,4 +1,5 @@
 import type { TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
+import type { AgentChatProviderName } from '@/lib/agent-chat-types'
 
 export type SessionLocator = {
   provider: CodingCliProviderName
@@ -67,10 +68,12 @@ export type PickerPaneContent = {
 export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited'
 
 /**
- * freshclaude chat pane — rich chat UI powered by Claude Code SDK mode.
+ * Agent chat pane — rich chat UI powered by a configurable provider.
  */
-export type ClaudeChatPaneContent = {
-  kind: 'claude-chat'
+export type AgentChatPaneContent = {
+  kind: 'agent-chat'
+  /** Which agent chat provider this pane uses */
+  provider: AgentChatProviderName
   /** SDK session ID (undefined until created) */
   sessionId?: string
   /** Idempotency key for sdk.create */
@@ -83,17 +86,17 @@ export type ClaudeChatPaneContent = {
   sessionRef?: SessionLocator
   /** Working directory */
   initialCwd?: string
-  /** Model to use (default: claude-opus-4-6) */
+  /** Model to use (default from provider config) */
   model?: string
-  /** Permission mode (default: bypassPermissions) */
+  /** Permission mode (default from provider config) */
   permissionMode?: string
-  /** Effort level (default: high, creation-time only) */
+  /** Effort level (default from provider config, creation-time only) */
   effort?: 'low' | 'medium' | 'high' | 'max'
-  /** Show thinking blocks in message feed (default: true) */
+  /** Show thinking blocks in message feed */
   showThinking?: boolean
-  /** Show tool-use blocks in message feed (default: true) */
+  /** Show tool-use blocks in message feed */
   showTools?: boolean
-  /** Show timestamps on messages (default: false) */
+  /** Show timestamps on messages */
   showTimecodes?: boolean
   /** Whether the user has dismissed the first-launch settings popover */
   settingsDismissed?: boolean
@@ -102,7 +105,7 @@ export type ClaudeChatPaneContent = {
 /**
  * Union type for all pane content types.
  */
-export type PaneContent = TerminalPaneContent | BrowserPaneContent | EditorPaneContent | PickerPaneContent | ClaudeChatPaneContent
+export type PaneContent = TerminalPaneContent | BrowserPaneContent | EditorPaneContent | PickerPaneContent | AgentChatPaneContent
 
 /**
  * Input type for creating terminal panes.
@@ -124,15 +127,15 @@ export type EditorPaneInput = EditorPaneContent
  * Accepts either full content or partial terminal input.
  */
 /**
- * Input type for Claude Chat panes.
+ * Input type for Agent Chat panes.
  * Lifecycle fields (createRequestId, status) are optional - reducer generates defaults.
  */
-export type ClaudeChatPaneInput = Omit<ClaudeChatPaneContent, 'createRequestId' | 'status'> & {
+export type AgentChatPaneInput = Omit<AgentChatPaneContent, 'createRequestId' | 'status'> & {
   createRequestId?: string
   status?: SdkSessionStatus
 }
 
-export type PaneContentInput = TerminalPaneInput | BrowserPaneContent | EditorPaneInput | PickerPaneContent | ClaudeChatPaneInput
+export type PaneContentInput = TerminalPaneInput | BrowserPaneContent | EditorPaneInput | PickerPaneContent | AgentChatPaneInput
 
 /**
  * Recursive tree structure for pane layouts.

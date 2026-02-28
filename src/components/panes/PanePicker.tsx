@@ -5,10 +5,11 @@ import { cn } from '@/lib/utils'
 import { useAppSelector } from '@/store/hooks'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { CODING_CLI_PROVIDER_CONFIGS, type CodingCliProviderConfig } from '@/lib/coding-cli-utils'
+import { AGENT_CHAT_PROVIDER_CONFIGS, type AgentChatProviderName } from '@/lib/agent-chat-utils'
 import { ProviderIcon } from '@/components/icons/provider-icons'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 
-export type PanePickerType = 'shell' | 'cmd' | 'powershell' | 'wsl' | 'browser' | 'editor' | 'claude-web' | CodingCliProviderName
+export type PanePickerType = 'shell' | 'cmd' | 'powershell' | 'wsl' | 'browser' | 'editor' | AgentChatProviderName | CodingCliProviderName
 
 type IconComponent = ComponentType<{ className?: string } & SVGProps<SVGSVGElement>>
 
@@ -18,6 +19,7 @@ interface PickerOption {
   icon: IconComponent | null
   providerName?: CodingCliProviderName
   shortcut: string
+  afterCli?: boolean
 }
 
 const shellOption: PickerOption = { type: 'shell', label: 'Shell', icon: Terminal, shortcut: 'S' }
@@ -105,13 +107,22 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
     // Shell options depend on platform
     const shellOptions = isWindowsLike(platform) ? windowsShellOptions : [shellOption]
 
-    // freshclaude option: only show if claude CLI is available and enabled
-    const claudeWebOption: PickerOption[] = (availableClis['claude'] && enabledProviders.includes('claude'))
-      ? [{ type: 'claude-web' as PanePickerType, label: 'freshclaude', icon: null, providerName: 'claude' as CodingCliProviderName, shortcut: 'A' }]
-      : []
+    // Agent chat options: only show if underlying CLI is available and enabled
+    const allAgentChatOptions: PickerOption[] = AGENT_CHAT_PROVIDER_CONFIGS
+      .filter((config) => availableClis[config.codingCliProvider] && enabledProviders.includes(config.codingCliProvider))
+      .map((config) => ({
+        type: config.name as PanePickerType,
+        label: config.label,
+        icon: config.icon,
+        shortcut: config.pickerShortcut,
+        afterCli: config.pickerAfterCli,
+      }))
 
-    // Order: CLIs, freshclaude, Editor, Browser, Shell(s)
-    return [...cliOptions, ...claudeWebOption, ...nonShellOptions, ...shellOptions]
+    const agentChatBefore = allAgentChatOptions.filter((o) => !o.afterCli)
+    const agentChatAfter = allAgentChatOptions.filter((o) => o.afterCli)
+
+    // Order: agent chat (before), CLIs, agent chat (after), Editor, Browser, Shell(s)
+    return [...agentChatBefore, ...cliOptions, ...agentChatAfter, ...nonShellOptions, ...shellOptions]
   }, [platform, availableClis, enabledProviders])
 
   const [focusedIndex, setFocusedIndex] = useState<number | null>(null)

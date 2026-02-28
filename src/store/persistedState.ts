@@ -3,7 +3,7 @@ import { z } from 'zod'
 export { TABS_STORAGE_KEY, PANES_STORAGE_KEY } from './storage-keys'
 
 export const TABS_SCHEMA_VERSION = 1
-export const PANES_SCHEMA_VERSION = 4
+export const PANES_SCHEMA_VERSION = 5
 
 const zTabMode = z.enum(['shell', 'claude', 'codex', 'opencode', 'gemini', 'kimi'])
 const zCodingCliProvider = z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi'])

@@ -94,10 +94,12 @@ export type AppSettings = {
     externalEditor: 'auto' | 'cursor' | 'code' | 'custom'
     customEditorCommand?: string
   }
-  freshclaude?: {
-    defaultModel?: string
-    defaultPermissionMode?: string
-    defaultEffort?: 'low' | 'medium' | 'high' | 'max'
+  agentChat?: {
+    providers?: Partial<Record<string, {
+      defaultModel?: string
+      defaultPermissionMode?: string
+      defaultEffort?: 'low' | 'medium' | 'high' | 'max'
+    }>>
   }
   network: NetworkSettings
 }
@@ -191,7 +193,7 @@ export const defaultSettings: AppSettings = {
   editor: {
     externalEditor: 'auto',
   },
-  freshclaude: {},
+  agentChat: { providers: {} },
   network: {
     host: '127.0.0.1',
     configured: false,
@@ -389,6 +391,17 @@ async function readConfigFile(): Promise<{ config: UserConfig | null; error?: Co
   }
 }
 
+function mergeProviderRecords(
+  base?: Partial<Record<string, Record<string, unknown>>>,
+  patch?: Partial<Record<string, Record<string, unknown>>>,
+): Record<string, Record<string, unknown>> {
+  const merged: Record<string, Record<string, unknown>> = { ...(base || {}) } as any
+  for (const [key, value] of Object.entries(patch || {})) {
+    merged[key] = { ...(merged[key] || {}), ...(value || {}) }
+  }
+  return merged
+}
+
 function mergeSettings(base: AppSettings, patch: AppSettingsPatch): AppSettings {
   const baseLogging = base.logging ?? defaultSettings.logging
   const terminalPatch: Partial<AppSettings['terminal']> = patch.terminal ?? {}
@@ -436,7 +449,11 @@ function mergeSettings(base: AppSettings, patch: AppSettingsPatch): AppSettings 
       },
     },
     editor: { ...base.editor, ...(patch.editor || {}) },
-    freshclaude: { ...base.freshclaude, ...(patch.freshclaude || {}) },
+    agentChat: {
+      ...base.agentChat,
+      ...(patch.agentChat || {}),
+      providers: mergeProviderRecords(base.agentChat?.providers, patch.agentChat?.providers),
+    },
     network: {
       ...base.network,
       ...(patch.network || {}),
@@ -469,9 +486,25 @@ export class ConfigStore {
     this.lastReadError = error
     if (existing) {
       this.lastReadError = undefined
+      // Migrate flat freshclaude → nested agentChat.providers.freshclaude
+      const rawSettings = (existing.settings || {}) as AppSettings & Record<string, unknown>
+      if (rawSettings.freshclaude) {
+        if (!rawSettings.agentChat) {
+          rawSettings.agentChat = { providers: { freshclaude: rawSettings.freshclaude } }
+        } else {
+          // Mixed case: merge legacy values under agentChat.providers.freshclaude
+          rawSettings.agentChat = rawSettings.agentChat || {}
+          rawSettings.agentChat.providers = rawSettings.agentChat.providers || {}
+          rawSettings.agentChat.providers.freshclaude = {
+            ...rawSettings.freshclaude,
+            ...(rawSettings.agentChat.providers.freshclaude || {}),
+          }
+        }
+        delete rawSettings.freshclaude
+      }
       this.cache = {
         ...existing,
-        settings: mergeSettings(defaultSettings, existing.settings || {}),
+        settings: mergeSettings(defaultSettings, rawSettings),
         sessionOverrides: existing.sessionOverrides || {},
         terminalOverrides: existing.terminalOverrides || {},
         projectColors: existing.projectColors || {},

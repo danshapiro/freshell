@@ -22,6 +22,7 @@ import { selectTabsRegistryGroups } from '@/store/selectors/tabsRegistrySelector
 import { CODING_CLI_PROVIDERS } from '@/lib/coding-cli-utils'
 import type { PaneContentInput, SessionLocator } from '@/store/paneTypes'
 import type { CodingCliProviderName, TabMode } from '@/store/types'
+import type { AgentChatProviderName } from '@/lib/agent-chat-types'
 
 type FilterMode = 'all' | 'open' | 'closed'
 type ScopeMode = 'all' | 'local' | 'remote'
@@ -102,7 +103,7 @@ function sanitizePaneSnapshot(
       viewMode: (payload.viewMode as 'source' | 'preview') || 'source',
     }
   }
-  if (snapshot.kind === 'claude-chat') {
+  if (snapshot.kind === 'agent-chat') {
     const resumeSessionId = payload.resumeSessionId as string | undefined
     const sessionRef = resolveSessionRef({
       payload,
@@ -111,7 +112,8 @@ function sanitizePaneSnapshot(
       fallbackServerInstanceId: record.serverInstanceId,
     })
     return {
-      kind: 'claude-chat',
+      kind: 'agent-chat',
+      provider: ((payload.provider as string | undefined) || 'freshclaude') as AgentChatProviderName,
       resumeSessionId: sameServer ? resumeSessionId : undefined,
       sessionRef,
       initialCwd: payload.initialCwd as string | undefined,
@@ -130,7 +132,7 @@ function deriveModeFromRecord(record: RegistryTabRecord): TabMode {
     if (typeof mode === 'string') return mode as TabMode
     return 'shell'
   }
-  if (firstKind === 'claude-chat') return 'claude'
+  if (firstKind === 'agent-chat') return 'claude'
   return 'shell'
 }
 
@@ -138,7 +140,7 @@ function paneKindIcon(kind: RegistryPaneSnapshot['kind']): LucideIcon {
   if (kind === 'terminal') return TerminalSquare
   if (kind === 'browser') return Globe
   if (kind === 'editor') return FileCode2
-  if (kind === 'claude-chat') return Bot
+  if (kind === 'agent-chat') return Bot
   return Square
 }
 

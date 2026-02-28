@@ -52,6 +52,7 @@ export class SdkBridge extends EventEmitter {
     const sessionId = nanoid()
     const state: SdkSessionState = {
       sessionId,
+      resumeSessionId: options.resumeSessionId,
       cwd: options.cwd,
       model: options.model,
       permissionMode: options.permissionMode,

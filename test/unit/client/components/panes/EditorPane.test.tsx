@@ -7,6 +7,17 @@ import EditorPane from '@/components/panes/EditorPane'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 
+// Render MarkdownRenderer synchronously to avoid React.lazy timing issues
+// when running in the full test suite (dynamic import may not resolve in time)
+vi.mock('@/components/markdown/LazyMarkdown', async () => {
+  const { MarkdownRenderer } = await import('@/components/markdown/MarkdownRenderer')
+  return {
+    LazyMarkdown: ({ content }: { content: string }) => (
+      <MarkdownRenderer content={content} />
+    ),
+  }
+})
+
 // Mock Monaco to avoid loading issues in tests
 vi.mock('@monaco-editor/react', () => {
   const MonacoMock = ({ value, onChange }: any) => (
@@ -196,6 +207,7 @@ describe('EditorPane', () => {
       </Provider>
     )
 
+    await vi.dynamicImportSettled()
     expect(await screen.findByRole('heading', { level: 1 }, { timeout: 5000 })).toHaveTextContent('Hello World')
     expect(screen.queryByTestId('monaco-mock')).not.toBeInTheDocument()
   })

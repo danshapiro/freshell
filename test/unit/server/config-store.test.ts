@@ -708,36 +708,86 @@ describe('ConfigStore', () => {
     })
   })
 
-  describe('freshclaude defaults', () => {
-    it('patchSettings merges freshclaude key', async () => {
+  describe('agentChat defaults', () => {
+    it('patchSettings merges agentChat providers', async () => {
       const store = new ConfigStore()
       await store.load()
 
       const updated = await store.patchSettings({
-        freshclaude: { defaultModel: 'claude-sonnet-4-5-20250929' },
+        agentChat: { providers: { freshclaude: { defaultModel: 'claude-sonnet-4-5-20250929' } } },
       })
 
-      expect(updated.freshclaude?.defaultModel).toBe('claude-sonnet-4-5-20250929')
+      expect(updated.agentChat?.providers?.freshclaude?.defaultModel).toBe('claude-sonnet-4-5-20250929')
     })
 
-    it('patchSettings deep-merges freshclaude without clobbering other keys', async () => {
+    it('patchSettings deep-merges agentChat providers without clobbering other keys', async () => {
       const store = new ConfigStore()
       await store.load()
 
       await store.patchSettings({
-        freshclaude: { defaultModel: 'claude-opus-4-6', defaultEffort: 'high' },
+        agentChat: { providers: { freshclaude: { defaultModel: 'claude-opus-4-6', defaultEffort: 'high' } } },
       })
       const updated = await store.patchSettings({
-        freshclaude: { defaultPermissionMode: 'default' },
+        agentChat: { providers: { freshclaude: { defaultPermissionMode: 'default' } } },
       })
 
-      expect(updated.freshclaude?.defaultModel).toBe('claude-opus-4-6')
-      expect(updated.freshclaude?.defaultPermissionMode).toBe('default')
-      expect(updated.freshclaude?.defaultEffort).toBe('high')
+      expect(updated.agentChat?.providers?.freshclaude?.defaultModel).toBe('claude-opus-4-6')
+      expect(updated.agentChat?.providers?.freshclaude?.defaultPermissionMode).toBe('default')
+      expect(updated.agentChat?.providers?.freshclaude?.defaultEffort).toBe('high')
     })
 
-    it('defaultSettings includes empty freshclaude object', () => {
-      expect(defaultSettings.freshclaude).toEqual({})
+    it('defaultSettings includes empty agentChat providers', () => {
+      expect(defaultSettings.agentChat).toEqual({ providers: {} })
+    })
+
+    it('migrates legacy flat freshclaude settings to agentChat.providers.freshclaude on load', async () => {
+      await fsp.mkdir(configDir, { recursive: true })
+      const legacyConfig: UserConfig = {
+        version: 1,
+        settings: {
+          ...defaultSettings,
+          freshclaude: { defaultModel: 'claude-opus-4-6', defaultEffort: 'high' },
+        } as any,
+        sessionOverrides: {},
+        terminalOverrides: {},
+        projectColors: {},
+      }
+      delete (legacyConfig.settings as any).agentChat
+      await fsp.writeFile(configPath, JSON.stringify(legacyConfig, null, 2))
+
+      const store = new ConfigStore()
+      const loaded = await store.load()
+
+      expect(loaded.settings.agentChat?.providers?.freshclaude?.defaultModel).toBe('claude-opus-4-6')
+      expect(loaded.settings.agentChat?.providers?.freshclaude?.defaultEffort).toBe('high')
+      expect((loaded.settings as any).freshclaude).toBeUndefined()
+    })
+
+    it('merges legacy freshclaude into existing agentChat.providers.freshclaude on load', async () => {
+      await fsp.mkdir(configDir, { recursive: true })
+      const mixedConfig: UserConfig = {
+        version: 1,
+        settings: {
+          ...defaultSettings,
+          freshclaude: { defaultModel: 'claude-opus-4-6', defaultEffort: 'high' },
+          agentChat: { providers: { freshclaude: { defaultPermissionMode: 'normal' } } },
+        } as any,
+        sessionOverrides: {},
+        terminalOverrides: {},
+        projectColors: {},
+      }
+      await fsp.writeFile(configPath, JSON.stringify(mixedConfig, null, 2))
+
+      const store = new ConfigStore()
+      const loaded = await store.load()
+
+      // agentChat value wins over legacy for overlapping keys
+      expect(loaded.settings.agentChat?.providers?.freshclaude?.defaultPermissionMode).toBe('normal')
+      // Legacy-only keys are preserved
+      expect(loaded.settings.agentChat?.providers?.freshclaude?.defaultModel).toBe('claude-opus-4-6')
+      expect(loaded.settings.agentChat?.providers?.freshclaude?.defaultEffort).toBe('high')
+      // Legacy key removed
+      expect((loaded.settings as any).freshclaude).toBeUndefined()
     })
   })
 

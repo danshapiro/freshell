@@ -3,6 +3,8 @@ export type TerminalStatus = 'creating' | 'running' | 'exited' | 'error'
 import type { CodingCliProviderName } from '@shared/ws-protocol'
 export type { CodingCliProviderName }
 
+import type { AgentChatProviderName } from '@/lib/agent-chat-types'
+
 // TabMode includes 'shell' for regular terminals, plus all coding CLI providers
 // This allows future providers (opencode, gemini, kimi) to work as tab modes
 export type TabMode = 'shell' | CodingCliProviderName
@@ -148,6 +150,7 @@ export interface AppSettings {
     sortMode: SidebarSortMode
     showProjectBadges: boolean
     showSubagents: boolean
+    ignoreCodexSubagents: boolean
     showNoninteractiveSessions: boolean
     hideEmptySessions: boolean
     excludeFirstChatSubstrings: string[]
@@ -170,10 +173,12 @@ export interface AppSettings {
     externalEditor: 'auto' | 'cursor' | 'code' | 'custom'
     customEditorCommand?: string
   }
-  freshclaude?: {
-    defaultModel?: string
-    defaultPermissionMode?: string
-    defaultEffort?: 'low' | 'medium' | 'high' | 'max'
+  agentChat?: {
+    providers?: Partial<Record<AgentChatProviderName, {
+      defaultModel?: string
+      defaultPermissionMode?: string
+      defaultEffort?: 'low' | 'medium' | 'high' | 'max'
+    }>>
   }
   network: {
     host: '127.0.0.1' | '0.0.0.0'

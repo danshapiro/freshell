@@ -1,11 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
-import claudeChatReducer, { sessionCreated } from '@/store/claudeChatSlice'
+import agentChatReducer, { sessionCreated } from '@/store/agentChatSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
 
 function createTestStore() {
   return configureStore({
-    reducer: { claudeChat: claudeChatReducer },
+    reducer: { agentChat: agentChatReducer },
   })
 }
 
@@ -36,7 +36,7 @@ describe('handleSdkMessage', () => {
     })
 
     expect(handled).toBe(true)
-    const session = store.getState().claudeChat.sessions['sess-1']
+    const session = store.getState().agentChat.sessions['sess-1']
     expect(session.pendingQuestions['q-1']).toBeDefined()
     expect(session.pendingQuestions['q-1'].questions).toEqual(questions)
   })
@@ -56,7 +56,7 @@ describe('handleSdkMessage', () => {
     })
 
     expect(handled).toBe(true)
-    const session = store.getState().claudeChat.sessions['sess-1']
+    const session = store.getState().agentChat.sessions['sess-1']
     expect(session.pendingPermissions['perm-1']).toBeDefined()
   })
 })

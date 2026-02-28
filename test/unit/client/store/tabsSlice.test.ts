@@ -631,10 +631,10 @@ describe('tabsSlice', () => {
 
       const tabs = store.getState().tabs.tabs
       expect(tabs).toHaveLength(1)
-      expect(tabs[0].title).toBe('Codex')
+      expect(tabs[0].title).toBe('Codex CLI')
     })
 
-    it('uses capitalized provider label for codex tab with terminalId', async () => {
+    it('uses provider label for codex tab with terminalId', async () => {
       const store = configureStore({
         reducer: {
           tabs: tabsReducer,
@@ -650,7 +650,7 @@ describe('tabsSlice', () => {
 
       const tabs = store.getState().tabs.tabs
       expect(tabs).toHaveLength(1)
-      expect(tabs[0].title).toBe('Codex')
+      expect(tabs[0].title).toBe('Codex CLI')
     })
   })
 

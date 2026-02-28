@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { handleSdkMessage, cancelCreate, _resetCancelledCreates } from '../../../src/lib/sdk-message-handler'
-import * as claudeChatSlice from '../../../src/store/claudeChatSlice'
+import * as agentChatSlice from '../../../src/store/agentChatSlice'
 
 describe('SDK Message Handler', () => {
   const dispatch = vi.fn()
@@ -18,7 +18,7 @@ describe('SDK Message Handler', () => {
     })
     expect(handled).toBe(true)
     expect(dispatch).toHaveBeenCalledWith(
-      claudeChatSlice.sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' })
+      agentChatSlice.sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' })
     )
   })
 
@@ -47,7 +47,7 @@ describe('SDK Message Handler', () => {
     }, wsMock)
     expect(handled).toBe(true)
     expect(dispatch).toHaveBeenCalledWith(
-      claudeChatSlice.sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' })
+      agentChatSlice.sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' })
     )
     expect(wsMock.send).not.toHaveBeenCalled()
   })
@@ -63,7 +63,7 @@ describe('SDK Message Handler', () => {
     })
     expect(handled).toBe(true)
     expect(dispatch).toHaveBeenCalledWith(
-      claudeChatSlice.sessionInit({
+      agentChatSlice.sessionInit({
         sessionId: 'sess-1',
         cliSessionId: 'cli-123',
         model: 'claude-sonnet-4-5-20250929',
@@ -82,7 +82,7 @@ describe('SDK Message Handler', () => {
     })
     expect(handled).toBe(true)
     expect(dispatch).toHaveBeenCalledWith(
-      claudeChatSlice.addAssistantMessage({
+      agentChatSlice.addAssistantMessage({
         sessionId: 'sess-1',
         content: [{ type: 'text', text: 'Hello' }],
         model: 'claude-sonnet-4-5-20250929',
@@ -98,7 +98,7 @@ describe('SDK Message Handler', () => {
     })
     expect(handled).toBe(true)
     expect(dispatch).toHaveBeenCalledWith(
-      claudeChatSlice.setStreaming({ sessionId: 'sess-1', active: true })
+      agentChatSlice.setStreaming({ sessionId: 'sess-1', active: true })
     )
   })
 
@@ -110,7 +110,7 @@ describe('SDK Message Handler', () => {
     })
     expect(handled).toBe(true)
     expect(dispatch).toHaveBeenCalledWith(
-      claudeChatSlice.appendStreamDelta({ sessionId: 'sess-1', text: 'Hello' })
+      agentChatSlice.appendStreamDelta({ sessionId: 'sess-1', text: 'Hello' })
     )
   })
 
@@ -122,7 +122,7 @@ describe('SDK Message Handler', () => {
     })
     expect(handled).toBe(true)
     expect(dispatch).toHaveBeenCalledWith(
-      claudeChatSlice.clearStreaming({ sessionId: 'sess-1' })
+      agentChatSlice.clearStreaming({ sessionId: 'sess-1' })
     )
   })
 
@@ -146,7 +146,7 @@ describe('SDK Message Handler', () => {
     })
     expect(handled).toBe(true)
     expect(dispatch).toHaveBeenCalledWith(
-      claudeChatSlice.turnResult({
+      agentChatSlice.turnResult({
         sessionId: 'sess-1',
         costUsd: 0.05,
         durationMs: 3000,
@@ -165,7 +165,7 @@ describe('SDK Message Handler', () => {
     })
     expect(handled).toBe(true)
     expect(dispatch).toHaveBeenCalledWith(
-      claudeChatSlice.addPermissionRequest({
+      agentChatSlice.addPermissionRequest({
         sessionId: 'sess-1',
         requestId: 'perm-1',
         subtype: 'can_use_tool',
@@ -182,7 +182,7 @@ describe('SDK Message Handler', () => {
     })
     expect(handled).toBe(true)
     expect(dispatch).toHaveBeenCalledWith(
-      claudeChatSlice.removePermission({
+      agentChatSlice.removePermission({
         sessionId: 'sess-1',
         requestId: 'perm-1',
       })
@@ -197,7 +197,7 @@ describe('SDK Message Handler', () => {
     })
     expect(handled).toBe(true)
     expect(dispatch).toHaveBeenCalledWith(
-      claudeChatSlice.setSessionStatus({
+      agentChatSlice.setSessionStatus({
         sessionId: 'sess-1',
         status: 'idle',
       })
@@ -212,7 +212,7 @@ describe('SDK Message Handler', () => {
     })
     expect(handled).toBe(true)
     expect(dispatch).toHaveBeenCalledWith(
-      claudeChatSlice.sessionExited({
+      agentChatSlice.sessionExited({
         sessionId: 'sess-1',
         exitCode: 0,
       })
@@ -231,7 +231,7 @@ describe('SDK Message Handler', () => {
     })
     expect(handled).toBe(true)
     expect(dispatch).toHaveBeenCalledWith(
-      claudeChatSlice.replayHistory({ sessionId: 'sess-1', messages })
+      agentChatSlice.replayHistory({ sessionId: 'sess-1', messages })
     )
   })
 
@@ -243,7 +243,7 @@ describe('SDK Message Handler', () => {
     })
     expect(handled).toBe(true)
     expect(dispatch).toHaveBeenCalledWith(
-      claudeChatSlice.sessionError({ sessionId: 'sess-1', message: 'Something went wrong' })
+      agentChatSlice.sessionError({ sessionId: 'sess-1', message: 'Something went wrong' })
     )
   })
 
@@ -255,7 +255,7 @@ describe('SDK Message Handler', () => {
     })
     expect(handled).toBe(true)
     expect(dispatch).toHaveBeenCalledWith(
-      claudeChatSlice.sessionError({ sessionId: 'sess-1', message: 'Legacy error' })
+      agentChatSlice.sessionError({ sessionId: 'sess-1', message: 'Legacy error' })
     )
   })
 
@@ -267,7 +267,7 @@ describe('SDK Message Handler', () => {
     })
     expect(handled).toBe(true)
     expect(dispatch).toHaveBeenCalledWith(
-      claudeChatSlice.removeSession({ sessionId: 'sess-1' })
+      agentChatSlice.removeSession({ sessionId: 'sess-1' })
     )
   })
 

@@ -32,6 +32,7 @@ export const defaultSettings: AppSettings = {
     sortMode: 'recency-pinned',
     showProjectBadges: true,
     showSubagents: false,
+    ignoreCodexSubagents: true,
     showNoninteractiveSessions: false,
     hideEmptySessions: true,
     excludeFirstChatSubstrings: [],
@@ -61,7 +62,7 @@ export const defaultSettings: AppSettings = {
   editor: {
     externalEditor: 'auto' as const,
   },
-  freshclaude: {},
+  agentChat: { providers: {} },
   network: {
     host: '127.0.0.1' as const,
     configured: false,
@@ -111,7 +112,14 @@ export function mergeSettings(base: AppSettings, patch: DeepPartial<AppSettings>
       },
     },
     editor: { ...base.editor, ...(patch.editor || {}) },
-    freshclaude: { ...base.freshclaude, ...(patch.freshclaude || {}) },
+    agentChat: {
+      ...(base.agentChat || defaultSettings.agentChat),
+      ...(patch.agentChat || {}),
+      providers: {
+        ...(base.agentChat || defaultSettings.agentChat)?.providers,
+        ...(patch.agentChat?.providers || {}),
+      },
+    },
     network: { ...base.network, ...(patch.network || {}) },
   }
 

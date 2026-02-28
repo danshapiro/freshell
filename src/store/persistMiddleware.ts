@@ -169,6 +169,26 @@ function migrateNode(node: any): any {
   return node
 }
 
+function dropClaudeChatNodes(node: any): any {
+  if (!node) return node
+  if (node.type === 'leaf') {
+    if (node.content?.kind === 'claude-chat') {
+      return { ...node, content: { kind: 'picker' } }
+    }
+    return node
+  }
+  if (node.type === 'split' && Array.isArray(node.children) && node.children.length >= 2) {
+    return {
+      ...node,
+      children: [
+        dropClaudeChatNodes(node.children[0]),
+        dropClaudeChatNodes(node.children[1]),
+      ],
+    }
+  }
+  return node
+}
+
 let cachedPersistedPanes: any | null | undefined
 
 export function loadPersistedPanes(): any | null {
@@ -216,6 +236,15 @@ function loadPersistedPanesUncached(): any | null {
 
     // Version 2 -> 3: add paneTitles (already defaulted to {} above)
     // No additional migration needed, just ensure the field exists
+
+    // Version 4 -> 5: drop claude-chat panes (renamed to agent-chat; no data migration)
+    if (currentVersion < 5) {
+      const droppedLayouts: Record<string, any> = {}
+      for (const [tabId, node] of Object.entries(layouts)) {
+        droppedLayouts[tabId] = dropClaudeChatNodes(node)
+      }
+      layouts = droppedLayouts
+    }
 
     const sanitizedLayouts: Record<string, any> = {}
     for (const [tabId, node] of Object.entries(layouts)) {

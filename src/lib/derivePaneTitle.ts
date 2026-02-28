@@ -1,5 +1,6 @@
 import type { PaneContent } from '@/store/paneTypes'
 import { getProviderLabel, isCodingCliMode } from '@/lib/coding-cli-utils'
+import { getAgentChatProviderLabel } from '@/lib/agent-chat-utils'
 
 /**
  * Derives a default title for a pane based on its content.
@@ -17,8 +18,8 @@ export function derivePaneTitle(content: PaneContent): string {
     return parts[parts.length - 1] || 'Editor'
   }
 
-  if (content.kind === 'claude-chat') {
-    return 'freshclaude'
+  if (content.kind === 'agent-chat') {
+    return getAgentChatProviderLabel(content.provider)
   }
 
   if (content.kind === 'browser') {

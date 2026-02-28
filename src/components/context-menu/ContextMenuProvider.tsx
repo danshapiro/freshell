@@ -24,13 +24,13 @@ import { ContextIds } from './context-menu-constants'
 import { buildMenuItems } from './menu-defs'
 import { copyDataset, isTextInputLike, parseContextTarget } from './context-menu-utils'
 import {
-  copyFreshclaudeCodeBlock,
-  copyFreshclaudeToolInput,
-  copyFreshclaudeToolOutput,
-  copyFreshclaudeDiffNew,
-  copyFreshclaudeDiffOld,
-  copyFreshclaudeFilePath,
-} from './freshclaude-chat-copy'
+  copyAgentChatCodeBlock,
+  copyAgentChatToolInput,
+  copyAgentChatToolOutput,
+  copyAgentChatDiffNew,
+  copyAgentChatDiffOld,
+  copyAgentChatFilePath,
+} from './agent-chat-copy'
 import { nanoid } from 'nanoid'
 
 const CONTEXT_MENU_KEYS = ['ContextMenu']
@@ -827,12 +827,12 @@ export function ContextMenuProvider({
         copyTerminalCwd,
         copyMessageText,
         copyMessageCode,
-        copyFreshclaudeCodeBlock,
-        copyFreshclaudeToolInput,
-        copyFreshclaudeToolOutput,
-        copyFreshclaudeDiffNew,
-        copyFreshclaudeDiffOld,
-        copyFreshclaudeFilePath,
+        copyAgentChatCodeBlock: copyAgentChatCodeBlock,
+        copyAgentChatToolInput: copyAgentChatToolInput,
+        copyAgentChatToolOutput: copyAgentChatToolOutput,
+        copyAgentChatDiffNew: copyAgentChatDiffNew,
+        copyAgentChatDiffOld: copyAgentChatDiffOld,
+        copyAgentChatFilePath: copyAgentChatFilePath,
       },
     })
   }, [

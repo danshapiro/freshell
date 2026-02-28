@@ -43,14 +43,14 @@ type CodingCliCommandSpec = {
 
 const CODING_CLI_COMMANDS: Record<Exclude<TerminalMode, 'shell'>, CodingCliCommandSpec> = {
   claude: {
-    label: 'Claude',
+    label: 'Claude CLI',
     envVar: 'CLAUDE_CMD',
     defaultCommand: 'claude',
     resumeArgs: (sessionId) => ['--resume', sessionId],
     supportsPermissionMode: true,
   },
   codex: {
-    label: 'Codex',
+    label: 'Codex CLI',
     envVar: 'CODEX_CMD',
     defaultCommand: 'codex',
     resumeArgs: (sessionId) => ['resume', sessionId],

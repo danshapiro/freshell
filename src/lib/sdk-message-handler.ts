@@ -1,6 +1,6 @@
 import type { AppDispatch } from '@/store/store'
-import type { ChatContentBlock } from '@/store/claudeChatTypes'
-import type { QuestionDefinition } from '@/store/claudeChatTypes'
+import type { ChatContentBlock } from '@/store/agentChatTypes'
+import type { QuestionDefinition } from '@/store/agentChatTypes'
 import {
   sessionCreated,
   sessionInit,
@@ -18,7 +18,7 @@ import {
   sessionError,
   removeSession,
   setAvailableModels,
-} from '@/store/claudeChatSlice'
+} from '@/store/agentChatSlice'
 
 /**
  * Tracks createRequestIds whose owning pane was closed before sdk.created arrived.

@@ -533,6 +533,87 @@ describe('orphaned layout cleanup', () => {
   })
 })
 
+describe('version 5 migration (drop claude-chat panes)', () => {
+  beforeEach(() => {
+    localStorageMock.clear()
+    resetPersistedPanesCacheForTests()
+  })
+
+  it('drops claude-chat leaf panes during v4→v5 migration', () => {
+    const v4Data = {
+      version: 4,
+      layouts: {
+        tab1: {
+          type: 'leaf',
+          id: 'pane1',
+          content: {
+            kind: 'claude-chat',
+            createRequestId: 'req1',
+            status: 'idle',
+            sessionId: 'sess1',
+          },
+        },
+      },
+      activePane: { tab1: 'pane1' },
+      paneTitles: {},
+      paneTitleSetByUser: {},
+    }
+    localStorage.setItem('freshell.panes.v2', JSON.stringify(v4Data))
+
+    const result = loadPersistedPanes()
+    // The claude-chat leaf should be replaced with a picker pane
+    expect(result!.layouts.tab1.content.kind).toBe('picker')
+    expect(result!.version).toBe(PANES_SCHEMA_VERSION)
+  })
+
+  it('drops claude-chat panes inside splits', () => {
+    const v4Data = {
+      version: 4,
+      layouts: {
+        tab1: {
+          type: 'split',
+          id: 'split1',
+          direction: 'horizontal',
+          sizes: [50, 50],
+          children: [
+            { type: 'leaf', id: 'pane1', content: { kind: 'terminal', createRequestId: 'req1', status: 'running', mode: 'shell' } },
+            { type: 'leaf', id: 'pane2', content: { kind: 'claude-chat', createRequestId: 'req2', status: 'idle' } },
+          ],
+        },
+      },
+      activePane: { tab1: 'pane1' },
+      paneTitles: {},
+      paneTitleSetByUser: {},
+    }
+    localStorage.setItem('freshell.panes.v2', JSON.stringify(v4Data))
+
+    const result = loadPersistedPanes()
+    const layout = result!.layouts.tab1 as any
+    expect(layout.children[0].content.kind).toBe('terminal')
+    expect(layout.children[1].content.kind).toBe('picker')
+  })
+
+  it('preserves non-claude-chat panes during migration', () => {
+    const v4Data = {
+      version: 4,
+      layouts: {
+        tab1: {
+          type: 'leaf',
+          id: 'pane1',
+          content: { kind: 'terminal', createRequestId: 'req1', status: 'running', mode: 'shell' },
+        },
+      },
+      activePane: { tab1: 'pane1' },
+      paneTitles: {},
+      paneTitleSetByUser: {},
+    }
+    localStorage.setItem('freshell.panes.v2', JSON.stringify(v4Data))
+
+    const result = loadPersistedPanes()
+    expect(result!.layouts.tab1.content.kind).toBe('terminal')
+  })
+})
+
 describe('schema version consistency', () => {
   beforeEach(() => {
     localStorageMock.clear()
