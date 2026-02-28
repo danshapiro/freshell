@@ -1,8 +1,19 @@
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import { render, screen, cleanup, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import MessageBubble from '../../../../../src/components/agent-chat/MessageBubble'
 import type { ChatContentBlock } from '@/store/agentChatTypes'
+
+// Render MarkdownRenderer synchronously to avoid React.lazy timing issues
+// when running in the full test suite (dynamic import may not resolve in time)
+vi.mock('@/components/markdown/LazyMarkdown', async () => {
+  const { MarkdownRenderer } = await import('@/components/markdown/MarkdownRenderer')
+  return {
+    LazyMarkdown: ({ content }: { content: string }) => (
+      <MarkdownRenderer content={content} />
+    ),
+  }
+})
 
 describe('MessageBubble', () => {
   afterEach(() => {

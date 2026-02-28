@@ -26,6 +26,17 @@ beforeAll(() => {
   Element.prototype.scrollIntoView = vi.fn()
 })
 
+// Render MarkdownRenderer synchronously to avoid React.lazy timing issues
+// when running in the full test suite (dynamic import may not resolve in time)
+vi.mock('@/components/markdown/LazyMarkdown', async () => {
+  const { MarkdownRenderer } = await import('@/components/markdown/MarkdownRenderer')
+  return {
+    LazyMarkdown: ({ content }: { content: string }) => (
+      <MarkdownRenderer content={content} />
+    ),
+  }
+})
+
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: vi.fn(),
