@@ -210,7 +210,11 @@ export default function Sidebar({
         const incoming = msg.terminals || []
         // Only update state when terminal data has actually changed to avoid
         // unnecessary re-renders that cause the sidebar list to blink/flash.
-        setTerminals((prev) => areTerminalsEqual(prev, incoming) ? prev : incoming)
+        setTerminals((prev) => {
+          if (areTerminalsEqual(prev, incoming)) return prev
+          log.debug('[DIAG] terminals changed', { prevLen: prev.length, nextLen: incoming.length })
+          return incoming
+        })
       }
       if (['terminal.detached', 'terminal.attach.ready', 'terminal.exit', 'terminal.list.updated'].includes(msg.type)) {
         refresh()
@@ -339,6 +343,12 @@ export default function Sidebar({
   // every session patch.
   const stableItemsRef = useRef(computedItems)
   if (!areSessionItemsEqual(stableItemsRef.current, computedItems)) {
+    log.debug('[DIAG] sortedItems changed', {
+      prevLen: stableItemsRef.current.length,
+      nextLen: computedItems.length,
+      prevIds: stableItemsRef.current.slice(0, 3).map(i => i.sessionId),
+      nextIds: computedItems.slice(0, 3).map(i => i.sessionId),
+    })
     stableItemsRef.current = computedItems
   }
   const sortedItems = stableItemsRef.current
@@ -350,7 +360,12 @@ export default function Sidebar({
     const updateHeight = () => {
       const nextHeight = container.clientHeight
       if (nextHeight > 0) {
-        setListHeight(nextHeight)
+        setListHeight((prev) => {
+          if (prev !== nextHeight) {
+            log.debug('[DIAG] listHeight changed', { prev, next: nextHeight })
+          }
+          return nextHeight
+        })
       }
     }
 
@@ -425,6 +440,18 @@ export default function Sidebar({
   const effectiveListHeight = listHeight > 0
     ? listHeight
     : Math.min(sortedItems.length * SESSION_ITEM_HEIGHT, SESSION_LIST_MAX_HEIGHT)
+
+  // DIAG: track every render with key state
+  const prevRenderRef = useRef({ itemCount: 0, listHeight: 0, effectiveHeight: 0 })
+  const cur = { itemCount: sortedItems.length, listHeight, effectiveHeight: effectiveListHeight }
+  if (
+    cur.itemCount !== prevRenderRef.current.itemCount ||
+    cur.listHeight !== prevRenderRef.current.listHeight ||
+    cur.effectiveHeight !== prevRenderRef.current.effectiveHeight
+  ) {
+    log.debug('[DIAG] Sidebar render', cur, 'prev:', prevRenderRef.current)
+    prevRenderRef.current = cur
+  }
 
   const rowProps: SidebarRowProps = useMemo(() => ({
     items: sortedItems,

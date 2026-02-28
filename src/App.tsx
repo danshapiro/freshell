@@ -396,6 +396,8 @@ export default function App() {
         if (msg.type === 'sessions.updated') {
           // Support chunked sessions for mobile browsers with limited WebSocket buffers
           const projects = (msg.projects || []) as ProjectGroup[]
+          const totalSessions = projects.reduce((n, p) => n + (p.sessions?.length || 0), 0)
+          log.debug('[DIAG] sessions.updated', { clear: !!msg.clear, append: !!msg.append, projects: projects.length, sessions: totalSessions })
           if (msg.clear) {
             // First chunk: clear existing, then merge
             dispatch(clearProjects())
@@ -410,8 +412,11 @@ export default function App() {
           dispatch(markWsSnapshotReceived())
         }
         if (msg.type === 'sessions.patch') {
+          const upsertProjects = (msg.upsertProjects || []) as ProjectGroup[]
+          const totalSessions = upsertProjects.reduce((n, p) => n + (p.sessions?.length || 0), 0)
+          log.debug('[DIAG] sessions.patch', { upsertProjects: upsertProjects.length, sessions: totalSessions, removeProjectPaths: (msg.removeProjectPaths || []).length })
           dispatch(applySessionsPatch({
-            upsertProjects: (msg.upsertProjects || []) as ProjectGroup[],
+            upsertProjects,
             removeProjectPaths: msg.removeProjectPaths || [],
           }))
         }
