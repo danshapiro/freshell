@@ -20,6 +20,8 @@
 
 ## Features
 
+- **Freshclaude** — An alternative to Claude CLI that works with your Anthropic subscription. Fully interactive: answer Claude's questions inline, see thinking and tool use, and pick your model and effort level — all inside a Freshell pane
+- **Self-configuring workspace** — Claude and Codex agents running in Freshell can open panes, windows, subagents, and browsers for you. As you work, Freshell configures itself around what you're doing
 - **Multi-tab terminal sessions** — Run shell, Claude Code, Codex, and other coding CLIs in parallel tabs
 - **Flexible workspaces** — Split any pane right or down, zoom to full-tab, replace content, and snap dividers. Layouts are preserved when you close panes
 - **Detach/reattach** — Background terminals persist across browser sessions; reconnect from any device
@@ -59,7 +61,7 @@ Example: with 3 attached clients at defaults, budget is `262144 + (3 * 131072) =
 
 ```bash
 # Clone the repository at the latest stable release
-git clone --branch v0.5.0 https://github.com/danshapiro/freshell.git
+git clone --branch v0.6.0 https://github.com/danshapiro/freshell.git
 cd freshell
 
 # Install dependencies
