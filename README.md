@@ -7,11 +7,11 @@
 <h1 align="center">🐚🔥freshell</h1>
 
 <p align="center">
-  Claudes Code, terminals, and other CLI friends in your browser. Speak with the dead, jump to your phone, and lots more
+  Claudes Code, Codex, shells, and editors in joyful harmony. Speak with the dead, jump to your phone, and more.
 </p>
 
 <p align="center">
-  <strong>Run multiple terminals in tabs | Detach & reattach sessions | Browse coding CLI history | What if tmux and Claude fell in love?</strong>
+  <strong>CLIs in tabs and panes | Forever coding agent history | What if tmux and Claude fell in love?</strong>
 </p>
 
 ---
@@ -20,42 +20,15 @@
 
 ## Features
 
-- **Freshclaude** — An alternative to Claude CLI that works with your Anthropic subscription. Fully interactive: answer Claude's questions inline, see thinking and tool use, and pick your model and effort level — all inside a Freshell pane
-- **Self-configuring workspace** — Claude and Codex agents running in Freshell can open panes, windows, subagents, and browsers for you. As you work, Freshell configures itself around what you're doing
-- **Multi-tab terminal sessions** — Run shell, Claude Code, Codex, and other coding CLIs in parallel tabs
-- **Flexible workspaces** — Split any pane right or down, zoom to full-tab, replace content, and snap dividers. Layouts are preserved when you close panes
-- **Detach/reattach** — Background terminals persist across browser sessions; reconnect from any device
-- **Search & browse** — Three-tier search across coding CLI sessions: titles, user messages, and full transcript text
-- **Speak with the dead** — Invoke the spirits of ancient Claudes and ask them what they were thinking
-- **Keep it tidy** — AI-powered terminal summaries (via Gemini), custom session titles, archiving, and project color-coding
-- **Overview dashboard** — See all running and exited terminals at a glance with status, idle time, and AI summaries
-- **Dark/light themes** — 8 terminal themes (Dracula, One Dark, Solarized, GitHub, and more) plus system/light/dark app themes
+- **Tabs and panes** — Organize projects with multiple coding agents, shells, browsers, editors, and more on a tab - and as many tabs as you want. 
+- **Desktop, laptop, phone** — Run on your main machine, then work on your project anywhere via VPN or Tailscale.
+- **Speak with the dead** — Resume any Claude or Codex session from any device (even if you weren't using freshell to run it)
 - **Fancy tabs** — Auto-name from terminal content, drag-and-drop reorder, and per-pane type icons so you know what's in each tab
-- **Context menus** — Right-click menus for tabs, terminals, sessions, projects, and messages with 40+ actions
+- **Freshclaude** — An interactive alternative to Claude CLI that works with your Anthropic subscription.
+- **Self-configuring workspace** — Just ask Claude or Codex to open a browser in a pane, or create a tab with four subagents. Built-in tmux-like API and skill makes it simple.
 - **Live pane headers** — See your active directory, git branch, and context usage in every pane title bar, updating live as you work
 - **Activity notifications** — Configurable attention indicators (highlight, pulse, darken) on tabs and pane headers when a coding CLI finishes its turn, with click or type dismiss modes
 - **Mobile responsive** — Auto-collapsing sidebar and overlay navigation for phones and tablets
-- **Auto-update** — Checks for new releases on startup and offers one-key upgrade
-
-### Terminal Streaming (Protocol v2)
-
-- Terminal attach/reconnect uses sequence replay (`sinceSeq`) instead of snapshot/chunk handshakes.
-- Server streams `terminal.output` frames with monotonic `seqStart`/`seqEnd` ranges.
-- If output must be dropped under pressure, server emits `terminal.output.gap` and keeps the socket alive.
-- Terminal create/attach no longer emits `terminal.attached*` or `terminal.snapshot` messages.
-
-#### Terminal Stream Tuning
-
-- `TERMINAL_REPLAY_RING_MAX_BYTES` (default `262144`) controls per-terminal replay window memory.
-- `TERMINAL_CLIENT_QUEUE_MAX_BYTES` (default `131072`) controls per-attached-client pending output memory.
-- `TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES` (default `16777216`) sets the hard bufferedAmount breaker threshold.
-- `TERMINAL_WS_CATASTROPHIC_STALL_MS` (default `10000`) sets how long the hard threshold must be exceeded before a `4008` close.
-
-Approximate memory budget per active terminal:
-
-`TERMINAL_REPLAY_RING_MAX_BYTES + (attachedClients * TERMINAL_CLIENT_QUEUE_MAX_BYTES)`
-
-Example: with 3 attached clients at defaults, budget is `262144 + (3 * 131072) = 655360` bytes (~640 KiB) before WS transport buffers.
 
 ## Quick Start
 
@@ -85,10 +58,6 @@ Node.js 18+ (20+ recommended) and platform build tools for native modules (`wind
 npm run dev     # Development with hot reload
 npm run serve   # Production build and run
 ```
-
-## Auto-Update
-
-Freshell checks for new GitHub releases before starting. Accept the prompt to auto-pull, install, and rebuild. Disable with `SKIP_UPDATE_CHECK=true`.
 
 ## Keyboard Shortcuts
 
@@ -122,17 +91,6 @@ Freshell checks for new GitHub releases before starting. Accept the prompt to au
 | `KIMI_CMD` | No | Kimi CLI command override |
 | `GOOGLE_GENERATIVE_AI_API_KEY` | No | Gemini API key for AI-powered terminal summaries |
 
-### Windows + WSL
-
-Freshell defaults to WSL for terminals on Windows. If your Claude Code sessions live inside WSL at `~/.claude`, you may need to configure `CLAUDE_HOME` so the server can find them from Windows:
-
-```bash
-CLAUDE_HOME=\\wsl$\Ubuntu\home\your-username\.claude
-WSL_DISTRO=Ubuntu
-```
-
-On WSL2, freshell automatically sets up port forwarding and firewall rules so you can access it from other devices on your LAN.
-
 ### Coding CLI Providers
 
 Freshell indexes local session history and can launch terminals for these coding CLIs:
@@ -147,14 +105,6 @@ Freshell indexes local session history and can launch terminals for these coding
 
 Enable/disable providers and set defaults in the Settings UI or via `~/.freshell/config.json`.
 
-## Security
-
-- **AUTH_TOKEN is mandatory** — Auto-generated on first run (64 hex chars); server refuses to start without one (min 16 chars, rejects known weak values)
-- **API authentication** — All `/api/*` routes require `x-auth-token` header (except `/api/health`)
-- **WebSocket handshake** — Connections must send a valid token in the `hello` message
-- **Origin restriction** — WebSocket and CORS limited to allowed origins (auto-detected from LAN, configurable via `ALLOWED_ORIGINS`)
-- **Rate limiting** — API routes are rate-limited to 300 requests per minute
-
 ## Tech Stack
 
 - **Frontend**: React 18, Redux Toolkit, Tailwind CSS, xterm.js, Monaco Editor, Zod, lucide-react
@@ -163,23 +113,9 @@ Enable/disable providers and set defaults in the Settings UI or via `~/.freshell
 - **Testing**: Vitest, Testing Library, supertest, superwstest
 - **AI**: Vercel AI SDK with Google Gemini
 
-## Project Structure
-
-```
-src/          React frontend (components, Redux store, hooks)
-server/       Express backend (PTY management, WebSocket, coding CLI providers, session search, auto-updater)
-test/         Vitest suites (unit, integration, e2e)
-```
-
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
 
 ## License
 
