@@ -1,6 +1,6 @@
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 
-export type AgentChatProviderName = 'freshclaude'
+export type AgentChatProviderName = 'freshclaude' | 'kilroy'
 
 export interface AgentChatProviderConfig {
   /** Unique identifier for this agent chat provider */
@@ -32,4 +32,6 @@ export interface AgentChatProviderConfig {
   }
   /** Keyboard shortcut in pane picker */
   pickerShortcut: string
+  /** If true, show after CLI options in the picker instead of before */
+  pickerAfterCli?: boolean
 }

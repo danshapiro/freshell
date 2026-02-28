@@ -1,10 +1,11 @@
 import type { AgentChatProviderName, AgentChatProviderConfig } from './agent-chat-types'
-import { FreshclaudeIcon } from '@/components/icons/provider-icons'
+import { FreshclaudeIcon, KilroyIcon } from '@/components/icons/provider-icons'
 
 export type { AgentChatProviderName, AgentChatProviderConfig }
 
 export const AGENT_CHAT_PROVIDERS: AgentChatProviderName[] = [
   'freshclaude',
+  'kilroy',
 ]
 
 export const AGENT_CHAT_PROVIDER_CONFIGS: AgentChatProviderConfig[] = [
@@ -28,6 +29,28 @@ export const AGENT_CHAT_PROVIDER_CONFIGS: AgentChatProviderConfig[] = [
       timecodes: true,
     },
     pickerShortcut: 'A',
+  },
+  {
+    name: 'kilroy',
+    label: 'Kilroy',
+    codingCliProvider: 'claude',
+    icon: KilroyIcon,
+    defaultModel: 'claude-opus-4-6',
+    defaultPermissionMode: 'bypassPermissions',
+    defaultEffort: 'high',
+    defaultShowThinking: true,
+    defaultShowTools: true,
+    defaultShowTimecodes: false,
+    settingsVisibility: {
+      model: true,
+      permissionMode: true,
+      effort: true,
+      thinking: true,
+      tools: true,
+      timecodes: true,
+    },
+    pickerShortcut: 'K',
+    pickerAfterCli: true,
   },
 ]
 

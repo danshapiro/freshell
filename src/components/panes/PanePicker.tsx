@@ -19,6 +19,7 @@ interface PickerOption {
   icon: IconComponent | null
   providerName?: CodingCliProviderName
   shortcut: string
+  afterCli?: boolean
 }
 
 const shellOption: PickerOption = { type: 'shell', label: 'Shell', icon: Terminal, shortcut: 'S' }
@@ -107,17 +108,21 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
     const shellOptions = isWindowsLike(platform) ? windowsShellOptions : [shellOption]
 
     // Agent chat options: only show if underlying CLI is available and enabled
-    const agentChatOptions: PickerOption[] = AGENT_CHAT_PROVIDER_CONFIGS
+    const allAgentChatOptions: PickerOption[] = AGENT_CHAT_PROVIDER_CONFIGS
       .filter((config) => availableClis[config.codingCliProvider] && enabledProviders.includes(config.codingCliProvider))
       .map((config) => ({
         type: config.name as PanePickerType,
         label: config.label,
         icon: config.icon,
         shortcut: config.pickerShortcut,
+        afterCli: config.pickerAfterCli,
       }))
 
-    // Order: agent chat, CLIs, Editor, Browser, Shell(s)
-    return [...agentChatOptions, ...cliOptions, ...nonShellOptions, ...shellOptions]
+    const agentChatBefore = allAgentChatOptions.filter((o) => !o.afterCli)
+    const agentChatAfter = allAgentChatOptions.filter((o) => o.afterCli)
+
+    // Order: agent chat (before), CLIs, agent chat (after), Editor, Browser, Shell(s)
+    return [...agentChatBefore, ...cliOptions, ...agentChatAfter, ...nonShellOptions, ...shellOptions]
   }, [platform, availableClis, enabledProviders])
 
   const [focusedIndex, setFocusedIndex] = useState<number | null>(null)

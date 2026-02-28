@@ -84,6 +84,10 @@ export function FreshclaudeIcon(props: IconProps) {
   )
 }
 
+export function KilroyIcon(props: IconProps) {
+  return <ClaudeIcon {...props} />
+}
+
 // Fallback for unknown providers
 export function DefaultProviderIcon(props: IconProps) {
   return (

@@ -42,4 +42,29 @@ describe('agent-chat-utils', () => {
   it('returns fallback label for unknown provider', () => {
     expect(getAgentChatProviderLabel('nope')).toBe('Agent Chat')
   })
+
+  it('kilroy is a valid provider', () => {
+    expect(isAgentChatProviderName('kilroy')).toBe(true)
+  })
+
+  it('returns config for kilroy', () => {
+    const config = getAgentChatProviderConfig('kilroy')
+    expect(config).toBeDefined()
+    expect(config!.name).toBe('kilroy')
+    expect(config!.label).toBe('Kilroy')
+    expect(config!.codingCliProvider).toBe('claude')
+    expect(config!.defaultModel).toBe('claude-opus-4-6')
+    expect(config!.defaultPermissionMode).toBe('bypassPermissions')
+    expect(config!.defaultEffort).toBe('high')
+    expect(config!.pickerShortcut).not.toBe('A') // must differ from freshclaude
+  })
+
+  it('returns label for kilroy provider', () => {
+    expect(getAgentChatProviderLabel('kilroy')).toBe('Kilroy')
+  })
+
+  it('all providers have unique picker shortcuts', () => {
+    const shortcuts = AGENT_CHAT_PROVIDER_CONFIGS.map((c) => c.pickerShortcut)
+    expect(new Set(shortcuts).size).toBe(shortcuts.length)
+  })
 })
