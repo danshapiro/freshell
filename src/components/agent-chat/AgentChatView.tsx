@@ -17,10 +17,7 @@ import { useStreamDebounce } from './useStreamDebounce'
 import CollapsedTurn from './CollapsedTurn'
 import type { ChatMessage, ChatSessionState } from '@/store/agentChatTypes'
 import { api } from '@/lib/api'
-
-const DEFAULT_MODEL = 'claude-opus-4-6'
-const DEFAULT_PERMISSION_MODE = 'bypassPermissions'
-const DEFAULT_EFFORT = 'high'
+import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 
 interface AgentChatViewProps {
   tabId: string
@@ -32,6 +29,14 @@ interface AgentChatViewProps {
 export default function AgentChatView({ tabId, paneId, paneContent, hidden }: AgentChatViewProps) {
   const dispatch = useAppDispatch()
   const ws = getWsClient()
+  const providerConfig = getAgentChatProviderConfig(paneContent.provider)
+  const defaultModel = providerConfig?.defaultModel ?? 'claude-opus-4-6'
+  const defaultPermissionMode = providerConfig?.defaultPermissionMode ?? 'bypassPermissions'
+  const defaultEffort = providerConfig?.defaultEffort ?? 'high'
+  const defaultShowThinking = providerConfig?.defaultShowThinking ?? true
+  const defaultShowTools = providerConfig?.defaultShowTools ?? true
+  const defaultShowTimecodes = providerConfig?.defaultShowTimecodes ?? false
+  const providerLabel = providerConfig?.label ?? 'Agent Chat'
   const createSentRef = useRef(false)
   const attachSentRef = useRef(false)
   const composerRef = useRef<ChatComposerHandle>(null)
@@ -140,9 +145,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     ws.send({
       type: 'sdk.create',
       requestId: paneContent.createRequestId,
-      model: paneContent.model ?? DEFAULT_MODEL,
-      permissionMode: paneContent.permissionMode ?? DEFAULT_PERMISSION_MODE,
-      effort: paneContent.effort ?? DEFAULT_EFFORT,
+      model: paneContent.model ?? defaultModel,
+      permissionMode: paneContent.permissionMode ?? defaultPermissionMode,
+      effort: paneContent.effort ?? defaultEffort,
       ...(paneContent.initialCwd ? { cwd: paneContent.initialCwd } : {}),
       ...(paneContent.resumeSessionId ? { resumeSessionId: paneContent.resumeSessionId } : {}),
     })
@@ -280,7 +285,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     if (changes.permissionMode) defaultsPatch.defaultPermissionMode = changes.permissionMode as string
     if (changes.effort) defaultsPatch.defaultEffort = changes.effort as string
     if (Object.keys(defaultsPatch).length > 0) {
-      void api.patch('/api/settings', { freshclaude: defaultsPatch }).catch(() => {})
+      void api.patch('/api/settings', { agentChat: { providers: { [paneContent.provider]: defaultsPatch } } }).catch(() => {})
     }
   }, [tabId, paneId, dispatch, ws])
 
@@ -370,7 +375,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const collapseThreshold = Math.max(0, turnItems.length - RECENT_TURNS_FULL)
 
   return (
-    <div className={cn('h-full w-full flex flex-col', hidden ? 'tab-hidden' : 'tab-visible')} role="region" aria-label="freshclaude Chat" onPointerUp={handleContainerPointerUp}>
+    <div className={cn('h-full w-full flex flex-col', hidden ? 'tab-hidden' : 'tab-visible')} role="region" aria-label={`${providerLabel} Chat`} onPointerUp={handleContainerPointerUp}>
       {/* Status bar */}
       <div className="flex items-center justify-between px-3 py-1.5 border-b text-xs text-muted-foreground">
         <span>
@@ -388,15 +393,16 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
             <span className="truncate">{paneContent.initialCwd}</span>
           )}
           <AgentChatSettings
-            model={paneContent.model ?? DEFAULT_MODEL}
-            permissionMode={paneContent.permissionMode ?? DEFAULT_PERMISSION_MODE}
-            effort={paneContent.effort ?? DEFAULT_EFFORT}
-            showThinking={paneContent.showThinking ?? true}
-            showTools={paneContent.showTools ?? true}
-            showTimecodes={paneContent.showTimecodes ?? false}
+            model={paneContent.model ?? defaultModel}
+            permissionMode={paneContent.permissionMode ?? defaultPermissionMode}
+            effort={paneContent.effort ?? defaultEffort}
+            showThinking={paneContent.showThinking ?? defaultShowThinking}
+            showTools={paneContent.showTools ?? defaultShowTools}
+            showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
             sessionStarted={sessionStarted}
             defaultOpen={!paneContent.settingsDismissed}
             modelOptions={availableModels.length > 0 ? availableModels : undefined}
+            settingsVisibility={providerConfig?.settingsVisibility}
             onChange={handleSettingsChange}
             onDismiss={handleSettingsDismiss}
           />
@@ -417,8 +423,8 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         {/* Welcome: no sessionId, session exists but empty, or restore timed out */}
         {!session?.messages.length && (!isRestoring || restoreTimedOut) && (
           <div className="text-center text-muted-foreground text-sm py-8">
-            <p className="font-medium mb-2">freshclaude</p>
-            <p>Rich chat UI for Claude Code sessions.</p>
+            <p className="font-medium mb-2">{providerLabel}</p>
+            <p>Rich chat UI for AI agent sessions.</p>
           </div>
         )}
 
@@ -435,9 +441,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
                     key={`turn-${i}`}
                     userMessage={item.user}
                     assistantMessage={item.assistant}
-                    showThinking={paneContent.showThinking ?? true}
-                    showTools={paneContent.showTools ?? true}
-                    showTimecodes={paneContent.showTimecodes ?? false}
+                    showThinking={paneContent.showThinking ?? defaultShowThinking}
+                    showTools={paneContent.showTools ?? defaultShowTools}
+                    showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
                   />
                 )
               }
@@ -447,9 +453,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
                     role={item.user.role}
                     content={item.user.content}
                     timestamp={item.user.timestamp}
-                    showThinking={paneContent.showThinking ?? true}
-                    showTools={paneContent.showTools ?? true}
-                    showTimecodes={paneContent.showTimecodes ?? false}
+                    showThinking={paneContent.showThinking ?? defaultShowThinking}
+                    showTools={paneContent.showTools ?? defaultShowTools}
+                    showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
                   />
                   <MessageBubble
                     role={item.assistant.role}
@@ -457,9 +463,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
                     timestamp={item.assistant.timestamp}
                     model={item.assistant.model}
                     isLastMessage={isLast}
-                    showThinking={paneContent.showThinking ?? true}
-                    showTools={paneContent.showTools ?? true}
-                    showTimecodes={paneContent.showTimecodes ?? false}
+                    showThinking={paneContent.showThinking ?? defaultShowThinking}
+                    showTools={paneContent.showTools ?? defaultShowTools}
+                    showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
                     completedToolOffset={completedToolOffsets[item.msgIndices[1]]}
                     autoExpandAbove={autoExpandAbove}
                   />
@@ -475,9 +481,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
                 timestamp={item.message.timestamp}
                 model={item.message.model}
                 isLastMessage={isLast}
-                showThinking={paneContent.showThinking ?? true}
-                showTools={paneContent.showTools ?? true}
-                showTimecodes={paneContent.showTimecodes ?? false}
+                showThinking={paneContent.showThinking ?? defaultShowThinking}
+                showTools={paneContent.showTools ?? defaultShowTools}
+                showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
                 completedToolOffset={completedToolOffsets[item.msgIndex]}
                 autoExpandAbove={autoExpandAbove}
               />
@@ -489,9 +495,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
           <MessageBubble
             role="assistant"
             content={streamingContent}
-            showThinking={paneContent.showThinking ?? true}
-            showTools={paneContent.showTools ?? true}
-            showTimecodes={paneContent.showTimecodes ?? false}
+            showThinking={paneContent.showThinking ?? defaultShowThinking}
+            showTools={paneContent.showTools ?? defaultShowTools}
+            showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
           />
         )}
 
@@ -567,7 +573,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
           hasWaitingItems
             ? 'Waiting for answer...'
             : isInteractive
-              ? 'Message Claude...'
+              ? `Message ${providerLabel}...`
               : 'Waiting for connection...'
         }
       />

@@ -4,6 +4,7 @@ import { cn } from '@/lib/utils'
 import { Switch } from '@/components/ui/switch'
 import { useMobile } from '@/hooks/useMobile'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
+import type { AgentChatProviderConfig } from '@/lib/agent-chat-types'
 import { formatModelDisplayName } from '../../../shared/format-model-name'
 
 type SettingsFields = Pick<AgentChatPaneContent, 'model' | 'permissionMode' | 'effort' | 'showThinking' | 'showTools' | 'showTimecodes'>
@@ -18,6 +19,7 @@ interface AgentChatSettingsProps {
   sessionStarted: boolean
   defaultOpen?: boolean
   modelOptions?: Array<{ value: string; displayName: string }>
+  settingsVisibility?: AgentChatProviderConfig['settingsVisibility']
   onChange: (changes: Partial<SettingsFields>) => void
   onDismiss?: () => void
 }
@@ -52,6 +54,7 @@ export default function AgentChatSettings({
   sessionStarted,
   defaultOpen = false,
   modelOptions,
+  settingsVisibility,
   onChange,
   onDismiss,
 }: AgentChatSettingsProps) {
@@ -179,6 +182,7 @@ export default function AgentChatSettings({
           >
             <div className="space-y-3">
             {/* Model */}
+            {settingsVisibility?.model !== false && (
             <div className="space-y-1">
               <label htmlFor={`${instanceId}-model`} className="text-xs font-medium">Model</label>
               <select
@@ -193,8 +197,10 @@ export default function AgentChatSettings({
                 ))}
               </select>
             </div>
+            )}
 
             {/* Permission mode */}
+            {settingsVisibility?.permissionMode !== false && (
             <div className="space-y-1">
               <label htmlFor={`${instanceId}-permissions`} className="text-xs font-medium">Permissions</label>
               <select
@@ -209,8 +215,10 @@ export default function AgentChatSettings({
                 ))}
               </select>
             </div>
+            )}
 
             {/* Effort — locked after session starts */}
+            {settingsVisibility?.effort !== false && (
             <div className="space-y-1">
               <label htmlFor={`${instanceId}-effort`} className="text-xs font-medium">Effort</label>
               <select
@@ -226,25 +234,32 @@ export default function AgentChatSettings({
                 ))}
               </select>
             </div>
+            )}
 
             <hr className="border-border" />
 
             {/* Display toggles using existing Switch component */}
+            {settingsVisibility?.thinking !== false && (
             <ToggleRow
               label="Show thinking"
               checked={showThinking}
               onChange={(v) => onChange({ showThinking: v })}
             />
+            )}
+            {settingsVisibility?.tools !== false && (
             <ToggleRow
               label="Show tools"
               checked={showTools}
               onChange={(v) => onChange({ showTools: v })}
             />
+            )}
+            {settingsVisibility?.timecodes !== false && (
             <ToggleRow
               label="Show timecodes & model"
               checked={showTimecodes}
               onChange={(v) => onChange({ showTimecodes: v })}
             />
+            )}
             {isMobile && (
               <button
                 type="button"
