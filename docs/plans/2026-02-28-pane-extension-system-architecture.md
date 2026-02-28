@@ -20,7 +20,18 @@ Decisions made during architectural review (2026-02-28):
 
 Freshell currently has 5 hardcoded pane types (terminal, browser, editor, picker, agent-chat). Adding a new pane type requires modifying 10+ files across the codebase: type definitions, Redux reducers, render switches, picker options, icons, titles, action registries, and server-side types.
 
-Dan's vision (from 2026-02-26 meeting): a folder you drop into an extensions directory that defines a new pane type — icon, server process (optional), HTML to render, and metadata. This enables the ecosystem to grow without modifying freshell core.
+### Vision (from 2026-02-26 team meeting)
+
+The meta feature we want is **a folder where you can drop a zip file and that zip file has a new pane type**. You define what a pane is — it's an icon and it's a server that gets run that serves HTML, with inputs and outputs. This way we can add a DOT/Graphviz viewer, a Mermaid chart viewer, a LibreChat viewer, or whatever else as a pane — just a little extension library.
+
+There are essentially **three types of panes**:
+1. **Client-only panes** — pure frontend, no server needed
+2. **Server panes** — like freshclaude, they have their own server process
+3. **CLI panes** — a subset of server panes that wrap a specific CLI tool
+
+The goal is to formalize and abstract the interfaces so that **anyone can extend freshell** by dropping folders into an extensions directory. All the core pane types should eventually be refactored to follow this same pattern.
+
+The immediate motivator is Kilroy integration: a Kilroy pane in the picker would start a session with Kilroy skills preloaded (agent-chat), while a separate Kilroy Run Viewer pane (server extension) would show pipeline execution progress. A user could have both open side-by-side — the orchestrator and the viewer. The live viewer connects to Kilroy's output on disk and streams updates as the pipeline runs, while a static graph viewer could just display a DOT file for explanation purposes.
 
 ### Motivating use cases
 
