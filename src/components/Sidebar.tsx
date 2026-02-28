@@ -156,12 +156,12 @@ export default function Sidebar({
   const listContainerRef = useRef<HTMLDivElement | null>(null)
   const [listHeight, setListHeight] = useState(0)
 
-  // Tick counter that increments every 60s to keep relative timestamps fresh
-  // without requiring a full data refresh. This replaces the previous implicit
-  // "refresh" from the 10-second terminal poll replacing the entire list.
+  // Tick counter that increments every 15s to keep relative timestamps fresh.
+  // The custom comparator on SidebarItem ensures only the timestamp text node
+  // updates — no DOM flicker despite the frequent ticks.
   const [timestampTick, setTimestampTick] = useState(0)
   useEffect(() => {
-    const id = window.setInterval(() => setTimestampTick((t) => t + 1), 60_000)
+    const id = window.setInterval(() => setTimestampTick((t) => t + 1), 15_000)
     return () => window.clearInterval(id)
   }, [])
 
