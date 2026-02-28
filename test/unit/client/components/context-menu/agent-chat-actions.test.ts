@@ -1,52 +1,52 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import {
-  copyFreshclaudeCodeBlock,
-  copyFreshclaudeToolInput,
-  copyFreshclaudeToolOutput,
-  copyFreshclaudeDiffNew,
-  copyFreshclaudeDiffOld,
-  copyFreshclaudeFilePath,
-} from '@/components/context-menu/freshclaude-chat-copy'
+  copyAgentChatCodeBlock,
+  copyAgentChatToolInput,
+  copyAgentChatToolOutput,
+  copyAgentChatDiffNew,
+  copyAgentChatDiffOld,
+  copyAgentChatFilePath,
+} from '@/components/context-menu/agent-chat-copy'
 
-// These tests verify the copy logic in freshclaude-chat-copy.ts.
+// These tests verify the copy logic in agent-chat-copy.ts.
 // We test the extraction functions directly since the full Provider render
 // is expensive and already covered by e2e tests.
 //
 // navigator.clipboard is mocked globally by test/setup/dom.ts, so we just
 // clear the mock between tests.
 
-describe('freshclaude chat copy helpers', () => {
+describe('agent-chat copy helpers', () => {
   beforeEach(() => {
     vi.mocked(navigator.clipboard.writeText).mockClear()
   })
 
-  it('copyFreshclaudeCodeBlock copies the code element textContent', async () => {
+  it('copyAgentChatCodeBlock copies the code element textContent', async () => {
     const code = document.createElement('code')
     code.textContent = 'const x = 1'
-    await copyFreshclaudeCodeBlock(code)
+    await copyAgentChatCodeBlock(code)
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('const x = 1')
   })
 
-  it('copyFreshclaudeCodeBlock is a no-op when el is null', async () => {
-    await copyFreshclaudeCodeBlock(null)
+  it('copyAgentChatCodeBlock is a no-op when el is null', async () => {
+    await copyAgentChatCodeBlock(null)
     expect(navigator.clipboard.writeText).not.toHaveBeenCalled()
   })
 
-  it('copyFreshclaudeToolInput copies the pre textContent', async () => {
+  it('copyAgentChatToolInput copies the pre textContent', async () => {
     const pre = document.createElement('pre')
     pre.textContent = 'echo hello'
-    await copyFreshclaudeToolInput(pre)
+    await copyAgentChatToolInput(pre)
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('echo hello')
   })
 
-  it('copyFreshclaudeToolOutput copies the pre textContent', async () => {
+  it('copyAgentChatToolOutput copies the pre textContent', async () => {
     const pre = document.createElement('pre')
     pre.textContent = 'file1\nfile2'
-    await copyFreshclaudeToolOutput(pre)
+    await copyAgentChatToolOutput(pre)
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('file1\nfile2')
   })
 
-  it('copyFreshclaudeDiffNew extracts only added and context lines', async () => {
+  it('copyAgentChatDiffNew extracts only added and context lines', async () => {
     // Build DOM matching DiffView.tsx: outer div > .leading-relaxed > line divs
     const diff = document.createElement('div')
     const wrapper = document.createElement('div')
@@ -87,12 +87,12 @@ describe('freshclaude chat copy helpers', () => {
     contextLine.appendChild(ctxText)
     wrapper.appendChild(contextLine)
 
-    await copyFreshclaudeDiffNew(diff)
+    await copyAgentChatDiffNew(diff)
     // New version = added lines + context lines (skip removed)
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('new line\nunchanged')
   })
 
-  it('copyFreshclaudeDiffOld extracts only removed and context lines', async () => {
+  it('copyAgentChatDiffOld extracts only removed and context lines', async () => {
     const diff = document.createElement('div')
     const wrapper = document.createElement('div')
     wrapper.className = 'leading-relaxed'
@@ -132,12 +132,12 @@ describe('freshclaude chat copy helpers', () => {
     contextLine.appendChild(ctxText)
     wrapper.appendChild(contextLine)
 
-    await copyFreshclaudeDiffOld(diff)
+    await copyAgentChatDiffOld(diff)
     // Old version = removed lines + context lines (skip added)
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('old line\nunchanged')
   })
 
-  it('copyFreshclaudeDiffNew skips removed lines', async () => {
+  it('copyAgentChatDiffNew skips removed lines', async () => {
     const diff = document.createElement('div')
     const wrapper = document.createElement('div')
     wrapper.className = 'leading-relaxed'
@@ -165,11 +165,11 @@ describe('freshclaude chat copy helpers', () => {
     addedLine.appendChild(addText)
     wrapper.appendChild(addedLine)
 
-    await copyFreshclaudeDiffNew(diff)
+    await copyAgentChatDiffNew(diff)
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('inserted')
   })
 
-  it('copyFreshclaudeDiffOld skips added lines', async () => {
+  it('copyAgentChatDiffOld skips added lines', async () => {
     const diff = document.createElement('div')
     const wrapper = document.createElement('div')
     wrapper.className = 'leading-relaxed'
@@ -197,30 +197,30 @@ describe('freshclaude chat copy helpers', () => {
     removedLine.appendChild(rmText)
     wrapper.appendChild(removedLine)
 
-    await copyFreshclaudeDiffOld(diff)
+    await copyAgentChatDiffOld(diff)
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('deleted')
   })
 
-  it('copyFreshclaudeFilePath copies data-file-path attribute', async () => {
+  it('copyAgentChatFilePath copies data-file-path attribute', async () => {
     const diff = document.createElement('div')
     diff.setAttribute('data-file-path', '/tmp/test.ts')
-    await copyFreshclaudeFilePath(diff)
+    await copyAgentChatFilePath(diff)
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('/tmp/test.ts')
   })
 
-  it('copyFreshclaudeFilePath is a no-op when data-file-path is missing', async () => {
+  it('copyAgentChatFilePath is a no-op when data-file-path is missing', async () => {
     const diff = document.createElement('div')
-    await copyFreshclaudeFilePath(diff)
+    await copyAgentChatFilePath(diff)
     expect(navigator.clipboard.writeText).not.toHaveBeenCalled()
   })
 
-  it('copyFreshclaudeDiffNew is a no-op when el is null', async () => {
-    await copyFreshclaudeDiffNew(null)
+  it('copyAgentChatDiffNew is a no-op when el is null', async () => {
+    await copyAgentChatDiffNew(null)
     expect(navigator.clipboard.writeText).not.toHaveBeenCalled()
   })
 
-  it('copyFreshclaudeDiffOld is a no-op when el is null', async () => {
-    await copyFreshclaudeDiffOld(null)
+  it('copyAgentChatDiffOld is a no-op when el is null', async () => {
+    await copyAgentChatDiffOld(null)
     expect(navigator.clipboard.writeText).not.toHaveBeenCalled()
   })
 })

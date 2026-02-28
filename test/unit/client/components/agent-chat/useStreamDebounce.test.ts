@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
-import { useStreamDebounce } from '../../../../../src/components/claude-chat/useStreamDebounce'
+import { useStreamDebounce } from '../../../../../src/components/agent-chat/useStreamDebounce'
 
 describe('useStreamDebounce', () => {
   beforeEach(() => {

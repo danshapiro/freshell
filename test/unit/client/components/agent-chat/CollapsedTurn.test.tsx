@@ -1,8 +1,8 @@
 import { describe, it, expect, afterEach } from 'vitest'
 import { render, screen, cleanup } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import CollapsedTurn from '../../../../../src/components/claude-chat/CollapsedTurn'
-import type { ChatMessage } from '@/store/claudeChatTypes'
+import CollapsedTurn from '../../../../../src/components/agent-chat/CollapsedTurn'
+import type { ChatMessage } from '@/store/agentChatTypes'
 
 const userMsg: ChatMessage = {
   role: 'user',

@@ -58,9 +58,9 @@ describe('derivePaneTitle', () => {
     expect(derivePaneTitle(content)).toBe('Gemini')
   })
 
-  it('returns "freshclaude" for claude-chat content', () => {
+  it('returns "freshclaude" for agent-chat content', () => {
     const content: PaneContent = {
-      kind: 'claude-chat',
+      kind: 'agent-chat', provider: 'freshclaude',
       createRequestId: 'test',
       status: 'idle',
     }

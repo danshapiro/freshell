@@ -32,7 +32,7 @@ describe('sdk-message-handler', () => {
     expect(handled).toBe(true)
     expect(dispatch).toHaveBeenCalledOnce()
     const action = calls[0]
-    expect(action.type).toBe('claudeChat/setAvailableModels')
+    expect(action.type).toBe('agentChat/setAvailableModels')
     expect(action.payload.models).toEqual(models)
   })
 
@@ -47,7 +47,7 @@ describe('sdk-message-handler', () => {
 
     expect(handled).toBe(true)
     expect(dispatch).toHaveBeenCalledOnce()
-    expect(calls[0].type).toBe('claudeChat/sessionCreated')
+    expect(calls[0].type).toBe('agentChat/sessionCreated')
     expect(calls[0].payload).toEqual({ requestId: 'req-1', sessionId: 'sess-1' })
   })
 
@@ -81,7 +81,7 @@ describe('sdk-message-handler', () => {
     })
 
     expect(handled).toBe(true)
-    expect(calls[0].type).toBe('claudeChat/sessionInit')
+    expect(calls[0].type).toBe('agentChat/sessionInit')
   })
 
   it('dispatches turnResult on sdk.result', () => {
@@ -96,7 +96,7 @@ describe('sdk-message-handler', () => {
     })
 
     expect(handled).toBe(true)
-    expect(calls[0].type).toBe('claudeChat/turnResult')
+    expect(calls[0].type).toBe('agentChat/turnResult')
   })
 
   it('returns false for unknown message types', () => {

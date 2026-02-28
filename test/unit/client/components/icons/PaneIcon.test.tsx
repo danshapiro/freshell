@@ -85,11 +85,11 @@ describe('PaneIcon', () => {
     expect(screen.getByTestId('file-text-icon')).toBeInTheDocument()
   })
 
-  it('renders freshclaude icon for claude-chat panes', () => {
+  it('renders freshclaude icon for agent-chat panes', () => {
     render(
       <PaneIcon
         content={{
-          kind: 'claude-chat',
+          kind: 'agent-chat', provider: 'freshclaude',
           createRequestId: 'req-1',
           status: 'idle',
         }}

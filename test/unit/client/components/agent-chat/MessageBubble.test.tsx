@@ -1,8 +1,8 @@
 import { describe, it, expect, afterEach } from 'vitest'
 import { render, screen, cleanup, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import MessageBubble from '../../../../../src/components/claude-chat/MessageBubble'
-import type { ChatContentBlock } from '@/store/claudeChatTypes'
+import MessageBubble from '../../../../../src/components/agent-chat/MessageBubble'
+import type { ChatContentBlock } from '@/store/agentChatTypes'
 
 describe('MessageBubble', () => {
   afterEach(() => {

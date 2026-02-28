@@ -1,12 +1,12 @@
 import { describe, it, expect, afterEach, vi } from 'vitest'
 import { render, screen, fireEvent, cleanup } from '@testing-library/react'
-import FreshclaudeSettings from '@/components/claude-chat/FreshclaudeSettings'
+import AgentChatSettings from '@/components/agent-chat/AgentChatSettings'
 
 vi.mock('lucide-react', () => ({
   Settings: (props: any) => <svg data-testid="settings-icon" {...props} />,
 }))
 
-describe('FreshclaudeSettings mobile layout', () => {
+describe('AgentChatSettings mobile layout', () => {
   const defaults = {
     model: 'claude-opus-4-6',
     permissionMode: 'default',
@@ -25,7 +25,7 @@ describe('FreshclaudeSettings mobile layout', () => {
     ;(globalThis as any).setMobileForTest(true)
 
     render(
-      <FreshclaudeSettings
+      <AgentChatSettings
         {...defaults}
         sessionStarted={false}
         defaultOpen={true}
@@ -33,7 +33,7 @@ describe('FreshclaudeSettings mobile layout', () => {
       />
     )
 
-    const dialog = screen.getByRole('dialog', { name: 'freshclaude settings' })
+    const dialog = screen.getByRole('dialog', { name: 'Agent chat settings' })
     expect(dialog.className).toContain('fixed')
     expect(dialog.className).toContain('inset-x-0')
     expect(screen.getByRole('button', { name: 'Done' })).toBeInTheDocument()
@@ -43,7 +43,7 @@ describe('FreshclaudeSettings mobile layout', () => {
     ;(globalThis as any).setMobileForTest(true)
 
     render(
-      <FreshclaudeSettings
+      <AgentChatSettings
         {...defaults}
         sessionStarted={false}
         defaultOpen={true}
@@ -52,6 +52,6 @@ describe('FreshclaudeSettings mobile layout', () => {
     )
 
     fireEvent.click(screen.getByRole('button', { name: 'Close settings' }))
-    expect(screen.queryByRole('dialog', { name: 'freshclaude settings' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('dialog', { name: 'Agent chat settings' })).not.toBeInTheDocument()
   })
 })

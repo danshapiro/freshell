@@ -232,7 +232,7 @@ describe('ContextMenuProvider', () => {
   it('allows native menu for links inside non-global contexts', async () => {
     const user = userEvent.setup()
     renderWithProvider(
-      <div data-context="freshclaude-chat" data-session-id="sess-1">
+      <div data-context="agent-chat" data-session-id="sess-1">
         <a href="https://example.com">Example Link</a>
       </div>
     )

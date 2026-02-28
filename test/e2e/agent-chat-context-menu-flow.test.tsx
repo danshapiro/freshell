@@ -1,7 +1,7 @@
 /**
  * E2E integration test for the freshclaude context menu flow.
  *
- * Renders ClaudeChatView with realistic tool blocks and diffs, queries the
+ * Renders AgentChatView with realistic tool blocks and diffs, queries the
  * actual DOM for data-* attributes, and feeds those DOM elements into
  * buildMenuItems to verify the full pipeline:
  *   component rendering -> data attributes -> context-sensitive menu items.
@@ -10,15 +10,15 @@ import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest'
 import { render, cleanup } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
-import ClaudeChatView from '@/components/claude-chat/ClaudeChatView'
-import claudeChatReducer, {
+import AgentChatView from '@/components/agent-chat/AgentChatView'
+import agentChatReducer, {
   sessionCreated,
   addUserMessage,
   addAssistantMessage,
   setSessionStatus,
-} from '@/store/claudeChatSlice'
+} from '@/store/agentChatSlice'
 import panesReducer from '@/store/panesSlice'
-import type { ClaudeChatPaneContent } from '@/store/paneTypes'
+import type { AgentChatPaneContent } from '@/store/paneTypes'
 import { buildMenuItems, type MenuActions, type MenuBuildContext } from '@/components/context-menu/menu-defs'
 import type { ContextTarget } from '@/components/context-menu/context-menu-types'
 
@@ -37,14 +37,14 @@ vi.mock('@/lib/ws-client', () => ({
 function makeStore() {
   return configureStore({
     reducer: {
-      claudeChat: claudeChatReducer,
+      agentChat: agentChatReducer,
       panes: panesReducer,
     },
   })
 }
 
-const BASE_PANE: ClaudeChatPaneContent = {
-  kind: 'claude-chat',
+const BASE_PANE: AgentChatPaneContent = {
+  kind: 'agent-chat', provider: 'freshclaude',
   createRequestId: 'req-1',
   sessionId: 'sess-1',
   status: 'idle',
@@ -94,12 +94,12 @@ function createMockActions(): MenuActions {
     copyTerminalCwd: vi.fn(),
     copyMessageText: vi.fn(),
     copyMessageCode: vi.fn(),
-    copyFreshclaudeCodeBlock: vi.fn(),
-    copyFreshclaudeToolInput: vi.fn(),
-    copyFreshclaudeToolOutput: vi.fn(),
-    copyFreshclaudeDiffNew: vi.fn(),
-    copyFreshclaudeDiffOld: vi.fn(),
-    copyFreshclaudeFilePath: vi.fn(),
+    copyAgentChatCodeBlock: vi.fn(),
+    copyAgentChatToolInput: vi.fn(),
+    copyAgentChatToolOutput: vi.fn(),
+    copyAgentChatDiffNew: vi.fn(),
+    copyAgentChatDiffOld: vi.fn(),
+    copyAgentChatFilePath: vi.fn(),
   }
 }
 
@@ -138,7 +138,7 @@ describe('freshclaude context menu integration', () => {
 
     const { container } = render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
@@ -152,7 +152,7 @@ describe('freshclaude context menu integration', () => {
     const ctx = createMockContext(mockActions, {
       clickTarget: toolInputEl as HTMLElement,
     })
-    const target: ContextTarget = { kind: 'freshclaude-chat', sessionId: 'sess-1' }
+    const target: ContextTarget = { kind: 'agent-chat', sessionId: 'sess-1' }
     const items = buildMenuItems(target, ctx)
     const ids = items.filter(i => i.type === 'item').map(i => i.id)
 
@@ -191,7 +191,7 @@ describe('freshclaude context menu integration', () => {
 
     const { container } = render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
@@ -209,7 +209,7 @@ describe('freshclaude context menu integration', () => {
     const ctx = createMockContext(mockActions, {
       clickTarget: clickTarget as HTMLElement,
     })
-    const target: ContextTarget = { kind: 'freshclaude-chat', sessionId: 'sess-1' }
+    const target: ContextTarget = { kind: 'agent-chat', sessionId: 'sess-1' }
     const items = buildMenuItems(target, ctx)
     const ids = items.filter(i => i.type === 'item').map(i => i.id)
 
@@ -237,7 +237,7 @@ describe('freshclaude context menu integration', () => {
 
     const { container } = render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
@@ -250,7 +250,7 @@ describe('freshclaude context menu integration', () => {
     const ctx = createMockContext(mockActions, {
       clickTarget: toolOutputEl as HTMLElement,
     })
-    const target: ContextTarget = { kind: 'freshclaude-chat', sessionId: 'sess-1' }
+    const target: ContextTarget = { kind: 'agent-chat', sessionId: 'sess-1' }
     const items = buildMenuItems(target, ctx)
     const ids = items.filter(i => i.type === 'item').map(i => i.id)
 

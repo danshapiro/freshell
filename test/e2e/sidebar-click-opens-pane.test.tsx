@@ -435,7 +435,7 @@ describe('sidebar click opens pane (e2e)', () => {
     expect(state.panes.layouts['tab-2'].type).toBe('leaf')
   })
 
-  it('clicking a session already open in a claude-chat pane focuses it', async () => {
+  it('clicking a session already open in an agent-chat pane focuses it', async () => {
     const targetId = sessionId('freshclaude-open')
 
     const projects: ProjectGroup[] = [
@@ -476,7 +476,7 @@ describe('sidebar click opens pane (e2e)', () => {
             type: 'leaf',
             id: 'pane-chat',
             content: {
-              kind: 'claude-chat',
+              kind: 'agent-chat', provider: 'freshclaude',
               createRequestId: 'req-chat',
               status: 'idle',
               resumeSessionId: targetId,
@@ -506,7 +506,7 @@ describe('sidebar click opens pane (e2e)', () => {
     expect(state.tabs.tabs).toHaveLength(2)
     // Should switch to tab-2 where the freshclaude session lives
     expect(state.tabs.activeTabId).toBe('tab-2')
-    // Should focus the existing claude-chat pane
+    // Should focus the existing agent-chat pane
     expect(state.panes.activePane['tab-2']).toBe('pane-chat')
     // Layout should be unchanged (still a leaf, no split)
     expect(state.panes.layouts['tab-2'].type).toBe('leaf')

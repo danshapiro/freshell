@@ -2,15 +2,15 @@ import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest'
 import { render, screen, cleanup, fireEvent } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
-import ClaudeChatView from '@/components/claude-chat/ClaudeChatView'
-import claudeChatReducer, {
+import AgentChatView from '@/components/agent-chat/AgentChatView'
+import agentChatReducer, {
   sessionCreated,
   addUserMessage,
   addAssistantMessage,
   setSessionStatus,
-} from '@/store/claudeChatSlice'
+} from '@/store/agentChatSlice'
 import panesReducer from '@/store/panesSlice'
-import type { ClaudeChatPaneContent } from '@/store/paneTypes'
+import type { AgentChatPaneContent } from '@/store/paneTypes'
 
 // jsdom doesn't implement scrollIntoView
 beforeAll(() => {
@@ -27,14 +27,14 @@ vi.mock('@/lib/ws-client', () => ({
 function makeStore() {
   return configureStore({
     reducer: {
-      claudeChat: claudeChatReducer,
+      agentChat: agentChatReducer,
       panes: panesReducer,
     },
   })
 }
 
-const BASE_PANE: ClaudeChatPaneContent = {
-  kind: 'claude-chat',
+const BASE_PANE: AgentChatPaneContent = {
+  kind: 'agent-chat', provider: 'freshclaude',
   createRequestId: 'req-1',
   sessionId: 'sess-1',
   status: 'idle',
@@ -68,7 +68,7 @@ describe('Scroll-to-bottom button', () => {
 
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
@@ -82,12 +82,12 @@ describe('Scroll-to-bottom button', () => {
 
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
     // Find the scroll container
-    const scrollContainer = screen.getByRole('region').querySelector('[data-context="freshclaude-chat"]')!
+    const scrollContainer = screen.getByRole('region').querySelector('[data-context="agent-chat"]')!
     // Simulate being scrolled up (far from bottom)
     simulateScrollPosition(scrollContainer as HTMLElement, {
       scrollTop: 0,
@@ -105,11 +105,11 @@ describe('Scroll-to-bottom button', () => {
 
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
-    const scrollContainer = screen.getByRole('region').querySelector('[data-context="freshclaude-chat"]')!
+    const scrollContainer = screen.getByRole('region').querySelector('[data-context="agent-chat"]')!
 
     // Scroll away from bottom
     simulateScrollPosition(scrollContainer as HTMLElement, {
@@ -136,11 +136,11 @@ describe('Scroll-to-bottom button', () => {
 
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
-    const scrollContainer = screen.getByRole('region').querySelector('[data-context="freshclaude-chat"]')!
+    const scrollContainer = screen.getByRole('region').querySelector('[data-context="agent-chat"]')!
 
     // Scroll away from bottom
     simulateScrollPosition(scrollContainer as HTMLElement, {
@@ -176,11 +176,11 @@ describe('New message indicator badge', () => {
 
     const { rerender } = render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
-    const scrollContainer = screen.getByRole('region').querySelector('[data-context="freshclaude-chat"]')!
+    const scrollContainer = screen.getByRole('region').querySelector('[data-context="agent-chat"]')!
 
     // Scroll away from bottom
     simulateScrollPosition(scrollContainer as HTMLElement, {
@@ -200,7 +200,7 @@ describe('New message indicator badge', () => {
     // Re-render to pick up store changes
     rerender(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
@@ -222,11 +222,11 @@ describe('New message indicator badge', () => {
 
     const { rerender } = render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
-    const scrollContainer = screen.getByRole('region').querySelector('[data-context="freshclaude-chat"]')!
+    const scrollContainer = screen.getByRole('region').querySelector('[data-context="agent-chat"]')!
 
     // Scroll away from bottom
     simulateScrollPosition(scrollContainer as HTMLElement, {
@@ -245,7 +245,7 @@ describe('New message indicator badge', () => {
 
     rerender(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
@@ -270,7 +270,7 @@ describe('New message indicator badge', () => {
 
     const { rerender } = render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
@@ -283,7 +283,7 @@ describe('New message indicator badge', () => {
 
     rerender(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 

@@ -18,13 +18,13 @@ function terminalLeaf(id: string, initialCwd?: string): PaneNode {
   }
 }
 
-// Helper to create a claude-chat leaf
+// Helper to create an agent-chat leaf
 function chatLeaf(id: string, initialCwd?: string): PaneNode {
   return {
     type: 'leaf',
     id,
     content: {
-      kind: 'claude-chat',
+      kind: 'agent-chat', provider: 'freshclaude',
       createRequestId: `cr-${id}`,
       status: 'connected',
       initialCwd,
@@ -100,7 +100,7 @@ describe('getTabDirectoryPreference', () => {
     expect(result.tabDirectories).toEqual(['/code/alpha', '/code/beta'])
   })
 
-  it('includes claude-chat pane directories', () => {
+  it('includes agent-chat pane directories', () => {
     const node = split(
       chatLeaf('c1', '/code/project'),
       terminalLeaf('t1', '/code/project'),

@@ -2,16 +2,16 @@ import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest'
 import { render, screen, cleanup, within, act } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
-import ClaudeChatView from '@/components/claude-chat/ClaudeChatView'
-import claudeChatReducer, {
+import AgentChatView from '@/components/agent-chat/AgentChatView'
+import agentChatReducer, {
   sessionCreated,
   addUserMessage,
   addAssistantMessage,
   setSessionStatus,
-} from '@/store/claudeChatSlice'
+} from '@/store/agentChatSlice'
 import panesReducer from '@/store/panesSlice'
-import type { ClaudeChatPaneContent } from '@/store/paneTypes'
-import type { ChatContentBlock } from '@/store/claudeChatTypes'
+import type { AgentChatPaneContent } from '@/store/paneTypes'
+import type { ChatContentBlock } from '@/store/agentChatTypes'
 
 // jsdom doesn't implement scrollIntoView
 beforeAll(() => {
@@ -28,14 +28,14 @@ vi.mock('@/lib/ws-client', () => ({
 function makeStore() {
   return configureStore({
     reducer: {
-      claudeChat: claudeChatReducer,
+      agentChat: agentChatReducer,
       panes: panesReducer,
     },
   })
 }
 
-const BASE_PANE: ClaudeChatPaneContent = {
-  kind: 'claude-chat',
+const BASE_PANE: AgentChatPaneContent = {
+  kind: 'agent-chat', provider: 'freshclaude',
   createRequestId: 'req-1',
   sessionId: 'sess-1',
   status: 'idle',
@@ -70,7 +70,7 @@ function addTurns(
   store.dispatch(setSessionStatus({ sessionId: 'sess-1', status: 'idle' }))
 }
 
-describe('ClaudeChatView turn collapsing', () => {
+describe('AgentChatView turn collapsing', () => {
   afterEach(cleanup)
 
   it('shows all turns expanded when total turns <= RECENT_TURNS_FULL (3)', () => {
@@ -80,7 +80,7 @@ describe('ClaudeChatView turn collapsing', () => {
 
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
@@ -99,7 +99,7 @@ describe('ClaudeChatView turn collapsing', () => {
 
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
@@ -114,7 +114,7 @@ describe('ClaudeChatView turn collapsing', () => {
   })
 })
 
-describe('ClaudeChatView thinking indicator', () => {
+describe('AgentChatView thinking indicator', () => {
   afterEach(cleanup)
 
   it('shows thinking indicator when running + no streaming + last message is user', () => {
@@ -124,10 +124,10 @@ describe('ClaudeChatView thinking indicator', () => {
     store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'Do something' }))
     // addUserMessage sets status to 'running'
 
-    const pane: ClaudeChatPaneContent = { ...BASE_PANE, status: 'running' }
+    const pane: AgentChatPaneContent = { ...BASE_PANE, status: 'running' }
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={pane} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={pane} />
       </Provider>,
     )
 
@@ -150,10 +150,10 @@ describe('ClaudeChatView thinking indicator', () => {
     }))
     // Status is running, but last message is assistant
 
-    const pane: ClaudeChatPaneContent = { ...BASE_PANE, status: 'running' }
+    const pane: AgentChatPaneContent = { ...BASE_PANE, status: 'running' }
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={pane} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={pane} />
       </Provider>,
     )
 
@@ -164,7 +164,7 @@ describe('ClaudeChatView thinking indicator', () => {
   })
 })
 
-describe('ClaudeChatView turn-pairing edge cases', () => {
+describe('AgentChatView turn-pairing edge cases', () => {
   afterEach(cleanup)
 
   it('handles consecutive user messages without assistant in between', () => {
@@ -187,7 +187,7 @@ describe('ClaudeChatView turn-pairing edge cases', () => {
 
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
@@ -219,10 +219,10 @@ describe('ClaudeChatView turn-pairing edge cases', () => {
     store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'Waiting for reply' }))
     store.dispatch(setSessionStatus({ sessionId: 'sess-1', status: 'running' }))
 
-    const pane: ClaudeChatPaneContent = { ...BASE_PANE, status: 'running' }
+    const pane: AgentChatPaneContent = { ...BASE_PANE, status: 'running' }
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={pane} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={pane} />
       </Provider>,
     )
 
@@ -239,7 +239,7 @@ describe('ClaudeChatView turn-pairing edge cases', () => {
   })
 })
 
-describe('ClaudeChatView auto-expand', () => {
+describe('AgentChatView auto-expand', () => {
   afterEach(cleanup)
 
   it('auto-expands the most recent tool blocks', () => {
@@ -250,7 +250,7 @@ describe('ClaudeChatView auto-expand', () => {
 
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 

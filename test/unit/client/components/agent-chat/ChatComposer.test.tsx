@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, cleanup } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import ChatComposer from '../../../../../src/components/claude-chat/ChatComposer'
+import ChatComposer from '../../../../../src/components/agent-chat/ChatComposer'
 
 describe('ChatComposer', () => {
   afterEach(() => {

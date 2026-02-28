@@ -1,7 +1,7 @@
 /**
  * E2E tests for freshclaude polish features.
  *
- * These tests render ClaudeChatView with a realistic Redux store and validate
+ * These tests render AgentChatView with a realistic Redux store and validate
  * the integrated behavior of: left-border message layout, tool block expand/collapse,
  * auto-collapse, collapsed turn summaries, thinking indicator, diff view, and
  * system-reminder stripping.
@@ -10,16 +10,16 @@ import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest'
 import { render, screen, cleanup, fireEvent, act } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
-import ClaudeChatView from '@/components/claude-chat/ClaudeChatView'
-import claudeChatReducer, {
+import AgentChatView from '@/components/agent-chat/AgentChatView'
+import agentChatReducer, {
   sessionCreated,
   addUserMessage,
   addAssistantMessage,
   setSessionStatus,
-} from '@/store/claudeChatSlice'
+} from '@/store/agentChatSlice'
 import panesReducer from '@/store/panesSlice'
-import type { ClaudeChatPaneContent } from '@/store/paneTypes'
-import type { ChatContentBlock } from '@/store/claudeChatTypes'
+import type { AgentChatPaneContent } from '@/store/paneTypes'
+import type { ChatContentBlock } from '@/store/agentChatTypes'
 
 // jsdom doesn't implement scrollIntoView
 beforeAll(() => {
@@ -36,14 +36,14 @@ vi.mock('@/lib/ws-client', () => ({
 function makeStore() {
   return configureStore({
     reducer: {
-      claudeChat: claudeChatReducer,
+      agentChat: agentChatReducer,
       panes: panesReducer,
     },
   })
 }
 
-const BASE_PANE: ClaudeChatPaneContent = {
-  kind: 'claude-chat',
+const BASE_PANE: AgentChatPaneContent = {
+  kind: 'agent-chat', provider: 'freshclaude',
   createRequestId: 'req-1',
   sessionId: 'sess-1',
   status: 'idle',
@@ -64,7 +64,7 @@ describe('freshclaude polish e2e: left-border message layout', () => {
 
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
@@ -97,7 +97,7 @@ describe('freshclaude polish e2e: left-border message layout', () => {
 
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
@@ -124,7 +124,7 @@ describe('freshclaude polish e2e: tool block expand/collapse', () => {
 
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
@@ -165,7 +165,7 @@ describe('freshclaude polish e2e: auto-collapse old tools', () => {
 
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
@@ -200,7 +200,7 @@ describe('freshclaude polish e2e: collapsed turn summaries', () => {
 
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
@@ -235,10 +235,10 @@ describe('freshclaude polish e2e: thinking indicator', () => {
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'Think about this' }))
 
-    const pane: ClaudeChatPaneContent = { ...BASE_PANE, status: 'running' }
+    const pane: AgentChatPaneContent = { ...BASE_PANE, status: 'running' }
     const { rerender } = render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={pane} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={pane} />
       </Provider>,
     )
 
@@ -256,10 +256,10 @@ describe('freshclaude polish e2e: thinking indicator', () => {
     }))
     store.dispatch(setSessionStatus({ sessionId: 'sess-1', status: 'idle' }))
 
-    const idlePane: ClaudeChatPaneContent = { ...BASE_PANE, status: 'idle' }
+    const idlePane: AgentChatPaneContent = { ...BASE_PANE, status: 'idle' }
     rerender(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={idlePane} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={idlePane} />
       </Provider>,
     )
 
@@ -302,7 +302,7 @@ describe('freshclaude polish e2e: diff view for Edit tool', () => {
 
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
@@ -342,7 +342,7 @@ describe('freshclaude polish e2e: system-reminder stripping', () => {
 
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
@@ -360,7 +360,7 @@ describe('freshclaude polish e2e: system-reminder stripping', () => {
 describe('freshclaude polish e2e: context menu data attribute', () => {
   afterEach(cleanup)
 
-  it('scroll container has data-context="freshclaude-chat" with session ID', () => {
+  it('scroll container has data-context="agent-chat" with session ID', () => {
     const store = makeStore()
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'Hello' }))
@@ -368,11 +368,11 @@ describe('freshclaude polish e2e: context menu data attribute', () => {
 
     const { container } = render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
       </Provider>,
     )
 
-    const scrollArea = container.querySelector('[data-context="freshclaude-chat"]')
+    const scrollArea = container.querySelector('[data-context="agent-chat"]')
     expect(scrollArea).not.toBeNull()
     expect(scrollArea?.getAttribute('data-session-id')).toBe('sess-1')
   })

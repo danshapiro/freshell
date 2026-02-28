@@ -2,10 +2,10 @@ import { describe, it, expect, vi, afterEach, beforeAll, beforeEach } from 'vite
 import { render, screen, cleanup, act } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
-import ClaudeChatView from '@/components/claude-chat/ClaudeChatView'
-import claudeChatReducer, { replayHistory, sessionCreated, sessionInit, setSessionStatus } from '@/store/claudeChatSlice'
+import AgentChatView from '@/components/agent-chat/AgentChatView'
+import agentChatReducer, { replayHistory, sessionCreated, sessionInit, setSessionStatus } from '@/store/agentChatSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
-import type { ClaudeChatPaneContent } from '@/store/paneTypes'
+import type { AgentChatPaneContent } from '@/store/paneTypes'
 import type { PaneNode } from '@/store/paneTypes'
 
 // jsdom doesn't implement scrollIntoView
@@ -25,20 +25,20 @@ vi.mock('@/lib/ws-client', () => ({
 function makeStore() {
   return configureStore({
     reducer: {
-      claudeChat: claudeChatReducer,
+      agentChat: agentChatReducer,
       panes: panesReducer,
     },
   })
 }
 
-const RELOAD_PANE: ClaudeChatPaneContent = {
-  kind: 'claude-chat',
+const RELOAD_PANE: AgentChatPaneContent = {
+  kind: 'agent-chat', provider: 'freshclaude',
   createRequestId: 'req-1',
   sessionId: 'sess-reload-1',
   status: 'idle',
 }
 
-describe('ClaudeChatView reload/restore behavior', () => {
+describe('AgentChatView reload/restore behavior', () => {
   afterEach(() => {
     cleanup()
     wsSend.mockClear()
@@ -48,7 +48,7 @@ describe('ClaudeChatView reload/restore behavior', () => {
     const store = makeStore()
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
       </Provider>,
     )
 
@@ -60,14 +60,14 @@ describe('ClaudeChatView reload/restore behavior', () => {
 
   it('does NOT send sdk.attach when paneContent has no sessionId (new session)', () => {
     const store = makeStore()
-    const newPane: ClaudeChatPaneContent = {
-      kind: 'claude-chat',
+    const newPane: AgentChatPaneContent = {
+      kind: 'agent-chat', provider: 'freshclaude',
       createRequestId: 'req-new',
       status: 'creating',
     }
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={newPane} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={newPane} />
       </Provider>,
     )
 
@@ -81,7 +81,7 @@ describe('ClaudeChatView reload/restore behavior', () => {
     const store = makeStore()
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
       </Provider>,
     )
 
@@ -94,14 +94,14 @@ describe('ClaudeChatView reload/restore behavior', () => {
 
   it('shows welcome screen when no sessionId (brand new session)', () => {
     const store = makeStore()
-    const newPane: ClaudeChatPaneContent = {
-      kind: 'claude-chat',
+    const newPane: AgentChatPaneContent = {
+      kind: 'agent-chat', provider: 'freshclaude',
       createRequestId: 'req-new',
       status: 'creating',
     }
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={newPane} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={newPane} />
       </Provider>,
     )
 
@@ -112,7 +112,7 @@ describe('ClaudeChatView reload/restore behavior', () => {
     const store = makeStore()
     const { rerender } = render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
       </Provider>,
     )
 
@@ -140,7 +140,7 @@ describe('ClaudeChatView reload/restore behavior', () => {
     // Force re-render to pick up store changes
     rerender(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
       </Provider>,
     )
 
@@ -157,15 +157,15 @@ describe('ClaudeChatView reload/restore behavior', () => {
     // Simulate sdk.created — Redux now has the session object
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-fresh' }))
 
-    const freshPane: ClaudeChatPaneContent = {
-      kind: 'claude-chat',
+    const freshPane: AgentChatPaneContent = {
+      kind: 'agent-chat', provider: 'freshclaude',
       createRequestId: 'req-1',
       sessionId: 'sess-fresh',
       status: 'starting',
     }
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={freshPane} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={freshPane} />
       </Provider>,
     )
 
@@ -178,7 +178,7 @@ describe('ClaudeChatView reload/restore behavior', () => {
     const store = makeStore()
     const { rerender } = render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
       </Provider>,
     )
 
@@ -193,7 +193,7 @@ describe('ClaudeChatView reload/restore behavior', () => {
 
     rerender(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
       </Provider>,
     )
 
@@ -212,7 +212,7 @@ describe('ClaudeChatView reload/restore behavior', () => {
 
     const { rerender } = render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
       </Provider>,
     )
 
@@ -234,7 +234,7 @@ describe('ClaudeChatView reload/restore behavior', () => {
 
     rerender(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
       </Provider>,
     )
 
@@ -247,7 +247,7 @@ describe('ClaudeChatView reload/restore behavior', () => {
     const store = makeStore()
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
       </Provider>,
     )
 
@@ -278,7 +278,7 @@ describe('ClaudeChatView reload/restore behavior', () => {
     const store = makeStore()
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
       </Provider>,
     )
 
@@ -314,7 +314,7 @@ describe('ClaudeChatView reload/restore behavior', () => {
     const store = makeStore()
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
       </Provider>,
     )
 
@@ -356,7 +356,7 @@ describe('ClaudeChatView reload/restore behavior', () => {
     const store = makeStore()
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
       </Provider>,
     )
 
@@ -376,10 +376,10 @@ describe('ClaudeChatView reload/restore behavior', () => {
 })
 
 /** Read pane content from the store for a given tab/pane ID. */
-function getPaneContent(store: ReturnType<typeof makeStore>, tabId: string, paneId: string): ClaudeChatPaneContent | undefined {
+function getPaneContent(store: ReturnType<typeof makeStore>, tabId: string, paneId: string): AgentChatPaneContent | undefined {
   const root = store.getState().panes.layouts[tabId]
   if (!root) return undefined
-  function find(node: PaneNode): ClaudeChatPaneContent | undefined {
+  function find(node: PaneNode): AgentChatPaneContent | undefined {
     if (node.type === 'leaf' && node.id === paneId && node.content.kind === 'claude-chat') {
       return node.content
     }
@@ -391,7 +391,7 @@ function getPaneContent(store: ReturnType<typeof makeStore>, tabId: string, pane
   return find(root)
 }
 
-describe('ClaudeChatView server-restart recovery', () => {
+describe('AgentChatView server-restart recovery', () => {
   afterEach(() => {
     cleanup()
     wsSend.mockClear()
@@ -400,8 +400,8 @@ describe('ClaudeChatView server-restart recovery', () => {
 
   it('persists cliSessionId as resumeSessionId in pane content when sessionInit arrives', () => {
     const store = makeStore()
-    const pane: ClaudeChatPaneContent = {
-      kind: 'claude-chat',
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat', provider: 'freshclaude',
       createRequestId: 'req-1',
       sessionId: 'sdk-sess-1',
       status: 'starting',
@@ -412,7 +412,7 @@ describe('ClaudeChatView server-restart recovery', () => {
 
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={pane} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={pane} />
       </Provider>,
     )
 
@@ -434,8 +434,8 @@ describe('ClaudeChatView server-restart recovery', () => {
   it('auto-resets pane on restore timeout to create a new session', () => {
     vi.useFakeTimers()
     const store = makeStore()
-    const pane: ClaudeChatPaneContent = {
-      kind: 'claude-chat',
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat', provider: 'freshclaude',
       createRequestId: 'req-stale',
       sessionId: 'dead-session-id',
       status: 'idle',
@@ -447,7 +447,7 @@ describe('ClaudeChatView server-restart recovery', () => {
 
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={pane} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={pane} />
       </Provider>,
     )
 
@@ -470,8 +470,8 @@ describe('ClaudeChatView server-restart recovery', () => {
   it('sends sdk.create with resumeSessionId after recovery reset', () => {
     vi.useFakeTimers()
     const store = makeStore()
-    const pane: ClaudeChatPaneContent = {
-      kind: 'claude-chat',
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat', provider: 'freshclaude',
       createRequestId: 'req-stale',
       sessionId: 'dead-session-id',
       status: 'idle',
@@ -488,7 +488,7 @@ describe('ClaudeChatView server-restart recovery', () => {
         ? root.content
         : undefined
       if (!content) return null
-      return <ClaudeChatView tabId="t1" paneId="p1" paneContent={content} />
+      return <AgentChatView tabId="t1" paneId="p1" paneContent={content} />
     }
 
     render(

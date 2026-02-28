@@ -2,10 +2,10 @@ import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest'
 import { render, cleanup } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
-import ClaudeChatView from '@/components/claude-chat/ClaudeChatView'
-import claudeChatReducer from '@/store/claudeChatSlice'
+import AgentChatView from '@/components/agent-chat/AgentChatView'
+import agentChatReducer from '@/store/agentChatSlice'
 import panesReducer from '@/store/panesSlice'
-import type { ClaudeChatPaneContent } from '@/store/paneTypes'
+import type { AgentChatPaneContent } from '@/store/paneTypes'
 
 // jsdom doesn't implement scrollIntoView
 beforeAll(() => {
@@ -23,27 +23,27 @@ vi.mock('@/lib/ws-client', () => ({
 function makeStore() {
   return configureStore({
     reducer: {
-      claudeChat: claudeChatReducer,
+      agentChat: agentChatReducer,
       panes: panesReducer,
     },
   })
 }
 
-const basePaneContent: ClaudeChatPaneContent = {
-  kind: 'claude-chat',
+const basePaneContent: AgentChatPaneContent = {
+  kind: 'agent-chat', provider: 'freshclaude',
   createRequestId: 'test-req',
   status: 'idle',
   sessionId: 'test-session',
 }
 
-describe('ClaudeChatView visibility', () => {
+describe('AgentChatView visibility', () => {
   afterEach(cleanup)
 
   it('renders with tab-visible class when not hidden', () => {
     const store = makeStore()
     const { container } = render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={basePaneContent} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={basePaneContent} />
       </Provider>
     )
     const region = container.querySelector('[role="region"]')
@@ -55,7 +55,7 @@ describe('ClaudeChatView visibility', () => {
     const store = makeStore()
     const { container } = render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={basePaneContent} hidden />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={basePaneContent} hidden />
       </Provider>
     )
     const region = container.querySelector('[role="region"]')

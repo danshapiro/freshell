@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import claudeChatReducer, {
+import agentChatReducer, {
   sessionCreated,
   sessionInit,
   addAssistantMessage,
@@ -17,10 +17,10 @@ import claudeChatReducer, {
   clearPendingCreate,
   removeSession,
   setAvailableModels,
-} from '../../../src/store/claudeChatSlice'
+} from '../../../src/store/agentChatSlice'
 
-describe('claudeChatSlice', () => {
-  const initial = claudeChatReducer(undefined, { type: 'init' })
+describe('agentChatSlice', () => {
+  const initial = agentChatReducer(undefined, { type: 'init' })
 
   it('has empty initial state', () => {
     expect(initial.sessions).toEqual({})
@@ -28,7 +28,7 @@ describe('claudeChatSlice', () => {
   })
 
   it('creates a session', () => {
-    const state = claudeChatReducer(initial, sessionCreated({
+    const state = agentChatReducer(initial, sessionCreated({
       requestId: 'req-1',
       sessionId: 'sess-1',
     }))
@@ -38,8 +38,8 @@ describe('claudeChatSlice', () => {
   })
 
   it('initializes session with CLI details', () => {
-    let state = claudeChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
-    state = claudeChatReducer(state, sessionInit({
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+    state = agentChatReducer(state, sessionInit({
       sessionId: 's1',
       cliSessionId: 'cli-abc',
       model: 'claude-opus-4-6',
@@ -52,16 +52,16 @@ describe('claudeChatSlice', () => {
   })
 
   it('stores user messages', () => {
-    let state = claudeChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
-    state = claudeChatReducer(state, addUserMessage({ sessionId: 's1', text: 'Hello' }))
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+    state = agentChatReducer(state, addUserMessage({ sessionId: 's1', text: 'Hello' }))
     expect(state.sessions['s1'].messages).toHaveLength(1)
     expect(state.sessions['s1'].messages[0].role).toBe('user')
     expect(state.sessions['s1'].status).toBe('running')
   })
 
   it('stores assistant messages', () => {
-    let state = claudeChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
-    state = claudeChatReducer(state, addAssistantMessage({
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+    state = agentChatReducer(state, addAssistantMessage({
       sessionId: 's1',
       content: [{ type: 'text', text: 'Hello' }],
       model: 'claude-sonnet-4-5-20250929',
@@ -71,39 +71,39 @@ describe('claudeChatSlice', () => {
   })
 
   it('tracks streaming text', () => {
-    let state = claudeChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
-    state = claudeChatReducer(state, setStreaming({ sessionId: 's1', active: true }))
-    state = claudeChatReducer(state, appendStreamDelta({ sessionId: 's1', text: 'Hel' }))
-    state = claudeChatReducer(state, appendStreamDelta({ sessionId: 's1', text: 'lo' }))
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+    state = agentChatReducer(state, setStreaming({ sessionId: 's1', active: true }))
+    state = agentChatReducer(state, appendStreamDelta({ sessionId: 's1', text: 'Hel' }))
+    state = agentChatReducer(state, appendStreamDelta({ sessionId: 's1', text: 'lo' }))
     expect(state.sessions['s1'].streamingText).toBe('Hello')
     expect(state.sessions['s1'].streamingActive).toBe(true)
   })
 
   it('clears streaming state', () => {
-    let state = claudeChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
-    state = claudeChatReducer(state, setStreaming({ sessionId: 's1', active: true }))
-    state = claudeChatReducer(state, appendStreamDelta({ sessionId: 's1', text: 'Hello' }))
-    state = claudeChatReducer(state, clearStreaming({ sessionId: 's1' }))
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+    state = agentChatReducer(state, setStreaming({ sessionId: 's1', active: true }))
+    state = agentChatReducer(state, appendStreamDelta({ sessionId: 's1', text: 'Hello' }))
+    state = agentChatReducer(state, clearStreaming({ sessionId: 's1' }))
     expect(state.sessions['s1'].streamingText).toBe('')
     expect(state.sessions['s1'].streamingActive).toBe(false)
   })
 
   it('tracks permission requests', () => {
-    let state = claudeChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
-    state = claudeChatReducer(state, addPermissionRequest({
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+    state = agentChatReducer(state, addPermissionRequest({
       sessionId: 's1',
       requestId: 'perm-1',
       subtype: 'can_use_tool',
       tool: { name: 'Bash', input: { command: 'ls' } },
     }))
     expect(state.sessions['s1'].pendingPermissions['perm-1']).toBeDefined()
-    state = claudeChatReducer(state, removePermission({ sessionId: 's1', requestId: 'perm-1' }))
+    state = agentChatReducer(state, removePermission({ sessionId: 's1', requestId: 'perm-1' }))
     expect(state.sessions['s1'].pendingPermissions['perm-1']).toBeUndefined()
   })
 
   it('accumulates cost on result', () => {
-    let state = claudeChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
-    state = claudeChatReducer(state, turnResult({
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+    state = agentChatReducer(state, turnResult({
       sessionId: 's1',
       costUsd: 0.05,
       durationMs: 3000,
@@ -115,24 +115,24 @@ describe('claudeChatSlice', () => {
   })
 
   it('handles session exit', () => {
-    let state = claudeChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
-    state = claudeChatReducer(state, sessionExited({ sessionId: 's1', exitCode: 0 }))
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+    state = agentChatReducer(state, sessionExited({ sessionId: 's1', exitCode: 0 }))
     expect(state.sessions['s1'].status).toBe('exited')
   })
 
   it('ignores actions for unknown sessions', () => {
-    const state = claudeChatReducer(initial, addUserMessage({ sessionId: 'nonexistent', text: 'hello' }))
+    const state = agentChatReducer(initial, addUserMessage({ sessionId: 'nonexistent', text: 'hello' }))
     expect(state).toEqual(initial)
   })
 
   it('replays history messages into session (replaces, not appends)', () => {
-    let state = claudeChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
     // Add an existing message
-    state = claudeChatReducer(state, addUserMessage({ sessionId: 's1', text: 'existing' }))
+    state = agentChatReducer(state, addUserMessage({ sessionId: 's1', text: 'existing' }))
     expect(state.sessions['s1'].messages).toHaveLength(1)
 
     // Replay should replace, not append
-    state = claudeChatReducer(state, replayHistory({
+    state = agentChatReducer(state, replayHistory({
       sessionId: 's1',
       messages: [
         { role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' },
@@ -146,7 +146,7 @@ describe('claudeChatSlice', () => {
   })
 
   it('sets historyLoaded on sessionCreated (fresh create)', () => {
-    const state = claudeChatReducer(initial, sessionCreated({
+    const state = agentChatReducer(initial, sessionCreated({
       requestId: 'req-1',
       sessionId: 'sess-1',
     }))
@@ -154,7 +154,7 @@ describe('claudeChatSlice', () => {
   })
 
   it('sets historyLoaded on replayHistory (attach/reconnect)', () => {
-    const state = claudeChatReducer(initial, replayHistory({
+    const state = agentChatReducer(initial, replayHistory({
       sessionId: 'sess-attach',
       messages: [
         { role: 'user', content: [{ type: 'text', text: 'hi' }], timestamp: '2026-01-01T00:00:00Z' },
@@ -164,7 +164,7 @@ describe('claudeChatSlice', () => {
   })
 
   it('does not set historyLoaded on setSessionStatus alone', () => {
-    const state = claudeChatReducer(initial, setSessionStatus({
+    const state = agentChatReducer(initial, setSessionStatus({
       sessionId: 'sess-status',
       status: 'idle',
     }))
@@ -172,7 +172,7 @@ describe('claudeChatSlice', () => {
   })
 
   it('bootstraps session on replayHistory for unknown sessionId', () => {
-    const state = claudeChatReducer(initial, replayHistory({
+    const state = agentChatReducer(initial, replayHistory({
       sessionId: 'unknown-sess',
       messages: [
         { role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' },
@@ -183,7 +183,7 @@ describe('claudeChatSlice', () => {
   })
 
   it('bootstraps session on setSessionStatus for unknown sessionId', () => {
-    const state = claudeChatReducer(initial, setSessionStatus({
+    const state = agentChatReducer(initial, setSessionStatus({
       sessionId: 'unknown-sess',
       status: 'idle',
     }))
@@ -192,7 +192,7 @@ describe('claudeChatSlice', () => {
   })
 
   it('bootstraps session on sessionInit for unknown sessionId', () => {
-    const state = claudeChatReducer(initial, sessionInit({
+    const state = agentChatReducer(initial, sessionInit({
       sessionId: 'unknown-sess',
       cliSessionId: 'cli-123',
       model: 'claude-opus-4-6',
@@ -203,21 +203,21 @@ describe('claudeChatSlice', () => {
   })
 
   it('sets lastError on sessionError', () => {
-    let state = claudeChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
-    state = claudeChatReducer(state, sessionError({ sessionId: 's1', message: 'CLI crashed' }))
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+    state = agentChatReducer(state, sessionError({ sessionId: 's1', message: 'CLI crashed' }))
     expect(state.sessions['s1'].lastError).toBe('CLI crashed')
   })
 
   it('clears a pendingCreates entry', () => {
-    let state = claudeChatReducer(initial, sessionCreated({ requestId: 'req-1', sessionId: 's1' }))
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'req-1', sessionId: 's1' }))
     expect(state.pendingCreates['req-1']).toBe('s1')
-    state = claudeChatReducer(state, clearPendingCreate({ requestId: 'req-1' }))
+    state = agentChatReducer(state, clearPendingCreate({ requestId: 'req-1' }))
     expect(state.pendingCreates['req-1']).toBeUndefined()
   })
 
   it('removes a session', () => {
-    let state = claudeChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
-    state = claudeChatReducer(state, removeSession({ sessionId: 's1' }))
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+    state = agentChatReducer(state, removeSession({ sessionId: 's1' }))
     expect(state.sessions['s1']).toBeUndefined()
   })
 
@@ -226,19 +226,19 @@ describe('claudeChatSlice', () => {
       { value: 'claude-opus-4-6', displayName: 'Opus 4.6', description: 'Most capable' },
       { value: 'claude-sonnet-4-5-20250929', displayName: 'Sonnet 4.5', description: 'Fast' },
     ]
-    const state = claudeChatReducer(initial, setAvailableModels({ models }))
+    const state = agentChatReducer(initial, setAvailableModels({ models }))
     expect(state.availableModels).toEqual(models)
     expect(state.availableModels).toHaveLength(2)
   })
 
   it('accumulates cost when costUsd is 0', () => {
-    let state = claudeChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
-    state = claudeChatReducer(state, turnResult({
+    let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
+    state = agentChatReducer(state, turnResult({
       sessionId: 's1',
       costUsd: 0.05,
       usage: { input_tokens: 100, output_tokens: 50 },
     }))
-    state = claudeChatReducer(state, turnResult({
+    state = agentChatReducer(state, turnResult({
       sessionId: 's1',
       costUsd: 0,
       usage: { input_tokens: 0, output_tokens: 0 },

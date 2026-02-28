@@ -2,10 +2,10 @@ import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest'
 import { render, screen, cleanup } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
-import ClaudeChatView from '@/components/claude-chat/ClaudeChatView'
-import claudeChatReducer, { sessionCreated, addPermissionRequest } from '@/store/claudeChatSlice'
+import AgentChatView from '@/components/agent-chat/AgentChatView'
+import agentChatReducer, { sessionCreated, addPermissionRequest } from '@/store/agentChatSlice'
 import panesReducer from '@/store/panesSlice'
-import type { ClaudeChatPaneContent } from '@/store/paneTypes'
+import type { AgentChatPaneContent } from '@/store/paneTypes'
 
 // jsdom doesn't implement scrollIntoView
 beforeAll(() => {
@@ -22,13 +22,13 @@ vi.mock('@/lib/ws-client', () => ({
 function makeStore() {
   return configureStore({
     reducer: {
-      claudeChat: claudeChatReducer,
+      agentChat: agentChatReducer,
       panes: panesReducer,
     },
   })
 }
 
-describe('ClaudeChatView status text', () => {
+describe('AgentChatView status text', () => {
   afterEach(cleanup)
 
   it('shows "Waiting for answer..." when permissions are pending', () => {
@@ -42,8 +42,8 @@ describe('ClaudeChatView status text', () => {
       tool: { name: 'Bash', input: { command: 'ls' } },
     }))
 
-    const paneContent: ClaudeChatPaneContent = {
-      kind: 'claude-chat',
+    const paneContent: AgentChatPaneContent = {
+      kind: 'agent-chat', provider: 'freshclaude',
       createRequestId: 'req-1',
       sessionId: 'sess-1',
       status: 'running',
@@ -51,7 +51,7 @@ describe('ClaudeChatView status text', () => {
 
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={paneContent} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={paneContent} />
       </Provider>
     )
 
@@ -62,8 +62,8 @@ describe('ClaudeChatView status text', () => {
     const store = makeStore()
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
 
-    const paneContent: ClaudeChatPaneContent = {
-      kind: 'claude-chat',
+    const paneContent: AgentChatPaneContent = {
+      kind: 'agent-chat', provider: 'freshclaude',
       createRequestId: 'req-1',
       sessionId: 'sess-1',
       status: 'running',
@@ -71,7 +71,7 @@ describe('ClaudeChatView status text', () => {
 
     render(
       <Provider store={store}>
-        <ClaudeChatView tabId="t1" paneId="p1" paneContent={paneContent} />
+        <AgentChatView tabId="t1" paneId="p1" paneContent={paneContent} />
       </Provider>
     )
 

@@ -1,13 +1,13 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent } from '@testing-library/react'
-import FreshclaudeSettings from '@/components/claude-chat/FreshclaudeSettings'
+import AgentChatSettings from '@/components/agent-chat/AgentChatSettings'
 
 // Mock lucide-react
 vi.mock('lucide-react', () => ({
   Settings: (props: any) => <svg data-testid="settings-icon" {...props} />,
 }))
 
-describe('FreshclaudeSettings', () => {
+describe('AgentChatSettings', () => {
   afterEach(cleanup)
 
   const defaults = {
@@ -21,7 +21,7 @@ describe('FreshclaudeSettings', () => {
 
   it('renders the settings gear button', () => {
     render(
-      <FreshclaudeSettings
+      <AgentChatSettings
         {...defaults}
         sessionStarted={false}
         onChange={vi.fn()}
@@ -32,7 +32,7 @@ describe('FreshclaudeSettings', () => {
 
   it('opens popover when gear button is clicked', () => {
     render(
-      <FreshclaudeSettings
+      <AgentChatSettings
         {...defaults}
         sessionStarted={false}
         onChange={vi.fn()}
@@ -45,7 +45,7 @@ describe('FreshclaudeSettings', () => {
 
   it('closes popover on Escape key', () => {
     render(
-      <FreshclaudeSettings
+      <AgentChatSettings
         {...defaults}
         sessionStarted={false}
         defaultOpen={true}
@@ -60,7 +60,7 @@ describe('FreshclaudeSettings', () => {
   it('closes popover on click outside', () => {
     render(
       <div>
-        <FreshclaudeSettings
+        <AgentChatSettings
           {...defaults}
           sessionStarted={false}
           defaultOpen={true}
@@ -76,7 +76,7 @@ describe('FreshclaudeSettings', () => {
 
   it('allows model and permission changes mid-session, disables effort', () => {
     render(
-      <FreshclaudeSettings
+      <AgentChatSettings
         {...defaults}
         effort="high"
         sessionStarted={true}
@@ -95,7 +95,7 @@ describe('FreshclaudeSettings', () => {
   it('calls onChange when a display toggle is changed', () => {
     const onChange = vi.fn()
     render(
-      <FreshclaudeSettings
+      <AgentChatSettings
         {...defaults}
         sessionStarted={false}
         defaultOpen={true}
@@ -109,7 +109,7 @@ describe('FreshclaudeSettings', () => {
   it('calls onChange when model is changed', () => {
     const onChange = vi.fn()
     render(
-      <FreshclaudeSettings
+      <AgentChatSettings
         {...defaults}
         sessionStarted={false}
         defaultOpen={true}
@@ -122,7 +122,7 @@ describe('FreshclaudeSettings', () => {
 
   it('opens automatically when defaultOpen is true', () => {
     render(
-      <FreshclaudeSettings
+      <AgentChatSettings
         {...defaults}
         sessionStarted={false}
         defaultOpen={true}
@@ -135,7 +135,7 @@ describe('FreshclaudeSettings', () => {
   it('calls onDismiss when closed', () => {
     const onDismiss = vi.fn()
     render(
-      <FreshclaudeSettings
+      <AgentChatSettings
         {...defaults}
         sessionStarted={false}
         defaultOpen={true}
@@ -150,7 +150,7 @@ describe('FreshclaudeSettings', () => {
   describe('model display names', () => {
     it('shows human-readable names for dynamic model options with raw IDs', () => {
       render(
-        <FreshclaudeSettings
+        <AgentChatSettings
           {...defaults}
           sessionStarted={false}
           defaultOpen={true}
@@ -174,7 +174,7 @@ describe('FreshclaudeSettings', () => {
 
     it('deduplicates SDK models whose normalized label matches a hardcoded entry', () => {
       render(
-        <FreshclaudeSettings
+        <AgentChatSettings
           {...defaults}
           sessionStarted={false}
           defaultOpen={true}
@@ -198,7 +198,7 @@ describe('FreshclaudeSettings', () => {
 
     it('picks the latest dated ID when SDK returns multiple candidates for the same label', () => {
       render(
-        <FreshclaudeSettings
+        <AgentChatSettings
           {...defaults}
           sessionStarted={false}
           defaultOpen={true}
@@ -220,7 +220,7 @@ describe('FreshclaudeSettings', () => {
 
     it('preserves already-formatted display names from SDK', () => {
       render(
-        <FreshclaudeSettings
+        <AgentChatSettings
           {...defaults}
           sessionStarted={false}
           defaultOpen={true}
