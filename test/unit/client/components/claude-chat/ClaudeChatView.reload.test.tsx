@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, afterEach, beforeAll, beforeEach } from 'vitest'
 import { render, screen, cleanup, act } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
-import { Provider } from 'react-redux'
+import { Provider, useSelector } from 'react-redux'
 import ClaudeChatView from '@/components/claude-chat/ClaudeChatView'
-import claudeChatReducer, { replayHistory, sessionCreated, setSessionStatus } from '@/store/claudeChatSlice'
-import panesReducer from '@/store/panesSlice'
+import claudeChatReducer, { replayHistory, sessionCreated, sessionInit, setSessionStatus } from '@/store/claudeChatSlice'
+import panesReducer, { initLayout } from '@/store/panesSlice'
 import type { ClaudeChatPaneContent } from '@/store/paneTypes'
+import type { PaneNode } from '@/store/paneTypes'
 
 // jsdom doesn't implement scrollIntoView
 beforeAll(() => {
@@ -371,5 +372,141 @@ describe('ClaudeChatView reload/restore behavior', () => {
     expect(screen.getByText('freshclaude')).toBeInTheDocument()
 
     vi.useRealTimers()
+  })
+})
+
+/** Read pane content from the store for a given tab/pane ID. */
+function getPaneContent(store: ReturnType<typeof makeStore>, tabId: string, paneId: string): ClaudeChatPaneContent | undefined {
+  const root = store.getState().panes.layouts[tabId]
+  if (!root) return undefined
+  function find(node: PaneNode): ClaudeChatPaneContent | undefined {
+    if (node.type === 'leaf' && node.id === paneId && node.content.kind === 'claude-chat') {
+      return node.content
+    }
+    if (node.type === 'split') {
+      return find(node.children[0]) || find(node.children[1])
+    }
+    return undefined
+  }
+  return find(root)
+}
+
+describe('ClaudeChatView server-restart recovery', () => {
+  afterEach(() => {
+    cleanup()
+    wsSend.mockClear()
+    vi.useRealTimers()
+  })
+
+  it('persists cliSessionId as resumeSessionId in pane content when sessionInit arrives', () => {
+    const store = makeStore()
+    const pane: ClaudeChatPaneContent = {
+      kind: 'claude-chat',
+      createRequestId: 'req-1',
+      sessionId: 'sdk-sess-1',
+      status: 'starting',
+    }
+
+    // Initialize the pane layout so updatePaneContent can find it
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    render(
+      <Provider store={store}>
+        <ClaudeChatView tabId="t1" paneId="p1" paneContent={pane} />
+      </Provider>,
+    )
+
+    // Simulate sdk.session.init arriving with the Claude Code CLI session ID
+    act(() => {
+      store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sdk-sess-1' }))
+      store.dispatch(sessionInit({
+        sessionId: 'sdk-sess-1',
+        cliSessionId: 'cli-session-abc-123',
+        model: 'claude-opus-4-6',
+      }))
+    })
+
+    // Pane content should now have resumeSessionId persisted
+    const content = getPaneContent(store, 't1', 'p1')
+    expect(content?.resumeSessionId).toBe('cli-session-abc-123')
+  })
+
+  it('auto-resets pane on restore timeout to create a new session', () => {
+    vi.useFakeTimers()
+    const store = makeStore()
+    const pane: ClaudeChatPaneContent = {
+      kind: 'claude-chat',
+      createRequestId: 'req-stale',
+      sessionId: 'dead-session-id',
+      status: 'idle',
+      resumeSessionId: 'cli-session-to-resume',
+    }
+
+    // Initialize pane layout
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    render(
+      <Provider store={store}>
+        <ClaudeChatView tabId="t1" paneId="p1" paneContent={pane} />
+      </Provider>,
+    )
+
+    // Initially shows restoring
+    expect(screen.getByText(/restoring/i)).toBeInTheDocument()
+
+    // Advance past the 5-second timeout
+    act(() => { vi.advanceTimersByTime(5_000) })
+
+    // Pane content should be reset for creating a new session
+    const content = getPaneContent(store, 't1', 'p1')
+    expect(content).toBeDefined()
+    expect(content!.sessionId).toBeUndefined()
+    expect(content!.status).toBe('creating')
+    expect(content!.createRequestId).not.toBe('req-stale')
+    // resumeSessionId should be preserved so the new session resumes the old CLI session
+    expect(content!.resumeSessionId).toBe('cli-session-to-resume')
+  })
+
+  it('sends sdk.create with resumeSessionId after recovery reset', () => {
+    vi.useFakeTimers()
+    const store = makeStore()
+    const pane: ClaudeChatPaneContent = {
+      kind: 'claude-chat',
+      createRequestId: 'req-stale',
+      sessionId: 'dead-session-id',
+      status: 'idle',
+      resumeSessionId: 'cli-session-to-resume',
+    }
+
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    // Wrapper that reads pane content from the store via useSelector, simulating the real parent.
+    // Re-renders when the store changes (unlike getPaneContent which is a plain function).
+    function Wrapper() {
+      const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts['t1'])
+      const content = root?.type === 'leaf' && root.content.kind === 'claude-chat'
+        ? root.content
+        : undefined
+      if (!content) return null
+      return <ClaudeChatView tabId="t1" paneId="p1" paneContent={content} />
+    }
+
+    render(
+      <Provider store={store}>
+        <Wrapper />
+      </Provider>,
+    )
+
+    wsSend.mockClear()
+
+    // Advance past timeout to trigger recovery
+    act(() => { vi.advanceTimersByTime(5_000) })
+
+    // Should have sent sdk.create with the resumeSessionId
+    const createCalls = wsSend.mock.calls.filter(
+      (c: any[]) => c[0]?.type === 'sdk.create',
+    )
+    expect(createCalls).toHaveLength(1)
+    expect(createCalls[0][0].resumeSessionId).toBe('cli-session-to-resume')
   })
 })

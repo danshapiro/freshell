@@ -70,6 +70,7 @@ export interface QuestionDefinition {
 export interface SdkSessionState {
   sessionId: string
   cliSessionId?: string
+  resumeSessionId?: string
   cwd?: string
   model?: string
   permissionMode?: string
