@@ -285,6 +285,7 @@ describe('AgentChatView composer focus', () => {
   afterEach(cleanup)
 
   it('auto-focuses composer on mount when settings are already dismissed', () => {
+    vi.useFakeTimers()
     const store = makeStore()
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
 
@@ -295,7 +296,10 @@ describe('AgentChatView composer focus', () => {
       </Provider>,
     )
 
+    // ChatComposer's autoFocus useEffect uses a 50ms delay
+    act(() => { vi.advanceTimersByTime(60) })
     expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveFocus()
+    vi.useRealTimers()
   })
 
   it('does not auto-focus composer when settings panel is open', () => {
@@ -372,6 +376,7 @@ describe('AgentChatView settings auto-open (#110)', () => {
   })
 
   it('auto-focuses composer when global initialSetupDone skips settings', () => {
+    vi.useFakeTimers()
     const store = makeStore({ agentChat: { initialSetupDone: true, providers: {} } })
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
 
@@ -381,6 +386,8 @@ describe('AgentChatView settings auto-open (#110)', () => {
       </Provider>,
     )
 
+    act(() => { vi.advanceTimersByTime(60) })
     expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveFocus()
+    vi.useRealTimers()
   })
 })

@@ -321,12 +321,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     && !initialSetupDone
     && (settingsLoaded || settingsLoadTimedOut)
 
-  // Auto-focus the composer on mount when settings panel isn't open
-  useEffect(() => {
-    if (!shouldShowSettings) {
-      composerRef.current?.focus()
-    }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  // Auto-focus is handled by the ChatComposer's autoFocus prop below.
+  // When settings are dismissed, focus imperatively via the dismiss callback.
+
 
   // Effort is locked once sdk.create has been sent (no mid-session setter in SDK).
   // Model and permission mode can be changed mid-session via sdk.set-model / sdk.set-permission-mode.
@@ -600,6 +597,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         onInterrupt={handleInterrupt}
         disabled={!isInteractive && !isRunning}
         isRunning={isRunning}
+        autoFocus={!shouldShowSettings}
         placeholder={
           hasWaitingItems
             ? 'Waiting for answer...'
