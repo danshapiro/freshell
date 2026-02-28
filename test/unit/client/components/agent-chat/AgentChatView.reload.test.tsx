@@ -380,7 +380,7 @@ function getPaneContent(store: ReturnType<typeof makeStore>, tabId: string, pane
   const root = store.getState().panes.layouts[tabId]
   if (!root) return undefined
   function find(node: PaneNode): AgentChatPaneContent | undefined {
-    if (node.type === 'leaf' && node.id === paneId && node.content.kind === 'claude-chat') {
+    if (node.type === 'leaf' && node.id === paneId && node.content.kind === 'agent-chat') {
       return node.content
     }
     if (node.type === 'split') {
@@ -484,7 +484,7 @@ describe('AgentChatView server-restart recovery', () => {
     // Re-renders when the store changes (unlike getPaneContent which is a plain function).
     function Wrapper() {
       const root = useSelector((s: ReturnType<typeof store.getState>) => s.panes.layouts['t1'])
-      const content = root?.type === 'leaf' && root.content.kind === 'claude-chat'
+      const content = root?.type === 'leaf' && root.content.kind === 'agent-chat'
         ? root.content
         : undefined
       if (!content) return null

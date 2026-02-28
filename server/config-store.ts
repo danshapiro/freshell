@@ -488,8 +488,18 @@ export class ConfigStore {
       this.lastReadError = undefined
       // Migrate flat freshclaude → nested agentChat.providers.freshclaude
       const rawSettings = existing.settings || {} as any
-      if (rawSettings.freshclaude && !rawSettings.agentChat) {
-        rawSettings.agentChat = { providers: { freshclaude: rawSettings.freshclaude } }
+      if (rawSettings.freshclaude) {
+        if (!rawSettings.agentChat) {
+          rawSettings.agentChat = { providers: { freshclaude: rawSettings.freshclaude } }
+        } else {
+          // Mixed case: merge legacy values under agentChat.providers.freshclaude
+          rawSettings.agentChat = rawSettings.agentChat || {}
+          rawSettings.agentChat.providers = rawSettings.agentChat.providers || {}
+          rawSettings.agentChat.providers.freshclaude = {
+            ...rawSettings.freshclaude,
+            ...(rawSettings.agentChat.providers.freshclaude || {}),
+          }
+        }
         delete rawSettings.freshclaude
       }
       this.cache = {
