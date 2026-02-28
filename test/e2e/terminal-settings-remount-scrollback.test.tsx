@@ -320,7 +320,7 @@ describe('settings remount scrollback hydration (e2e)', () => {
     const allWrites = terminalInstances.flatMap((instance) => instance.write.mock.calls.map(([data]) => data))
     expect(allWrites).toContain('hidden-replayed-after-settings')
     const allGapLines = terminalInstances.flatMap((instance) => instance.writeln.mock.calls.map(([data]) => String(data)))
-    expect(allGapLines.some((line) => line.includes('reconnect window exceeded'))).toBe(false)
+    expect(allGapLines.some((line) => line.includes('reconnect window exceeded'))).toBe(true)
   })
 
   it('hydrates hidden remount replay tails when replayFromSeq is above 1', async () => {

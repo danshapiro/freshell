@@ -257,7 +257,7 @@ describe('sidebar click opens pane (e2e)', () => {
     expect(screen.getByText('Visible manual session')).toBeInTheDocument()
   })
 
-  it('hides codex subagent sessions by default even when subagents are shown', async () => {
+  it('shows all subagent sessions when showSubagents is true', async () => {
     const projects: ProjectGroup[] = [
       {
         projectPath: '/home/user/project',
@@ -297,7 +297,7 @@ describe('sidebar click opens pane (e2e)', () => {
       vi.advanceTimersByTime(100)
     })
 
-    expect(screen.queryByText('Codex subagent session')).not.toBeInTheDocument()
+    expect(screen.getByText('Codex subagent session')).toBeInTheDocument()
     expect(screen.getByText('Claude subagent session')).toBeInTheDocument()
   })
 

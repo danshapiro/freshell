@@ -30,7 +30,12 @@ const x = 1
     )
 
     await vi.dynamicImportSettled()
-    expect(await screen.findByText('const x = 1')).toBeInTheDocument()
+    // Syntax highlighting splits code into multiple <span> elements for tokens,
+    // so we find the <code> element and check its text content.
+    const codeEl = await screen.findByText((_content, element) => {
+      return element?.tagName === 'CODE' && element.textContent === 'const x = 1'
+    })
+    expect(codeEl).toBeInTheDocument()
   })
 
   it('renders empty content without error', () => {
