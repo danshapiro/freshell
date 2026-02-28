@@ -1,6 +1,7 @@
 import { Terminal, Globe, FileText, LayoutGrid } from 'lucide-react'
-import { ProviderIcon, FreshclaudeIcon } from '@/components/icons/provider-icons'
+import { ProviderIcon } from '@/components/icons/provider-icons'
 import { isCodingCliMode } from '@/lib/coding-cli-utils'
+import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import type { PaneContent } from '@/store/paneTypes'
 
 interface PaneIconProps {
@@ -25,7 +26,12 @@ export default function PaneIcon({ content, className }: PaneIconProps) {
   }
 
   if (content.kind === 'agent-chat') {
-    return <FreshclaudeIcon className={className} />
+    const config = getAgentChatProviderConfig(content.provider)
+    if (config) {
+      const Icon = config.icon
+      return <Icon className={className} />
+    }
+    return <LayoutGrid className={className} />
   }
 
   // Picker
