@@ -281,6 +281,49 @@ process.on('SIGTERM', () => { server.close(); process.exit(0) })
       expect(env.apiKey).toBe('default-key-123')
       expect(env.mode).toBe('development')
     })
+
+    it('expands tilde in contentSchema default paths', async () => {
+      const script = `
+const http = require('http')
+const port = process.env.PORT || 3000
+const server = http.createServer((req, res) => {
+  res.end(JSON.stringify({ dataDir: process.env.DATA_DIR }))
+})
+server.listen(port, () => {
+  console.log('Listening on port ' + port)
+})
+process.on('SIGTERM', () => { server.close(); process.exit(0) })
+`
+      const manifest = serverManifest({
+        name: 'tilde-server',
+        contentSchema: {
+          dataDir: { type: 'string', label: 'Data Dir', default: '~/.local/state/myapp/data' },
+        },
+        server: {
+          command: 'node',
+          args: ['server.js'],
+          env: { PORT: '{{port}}', DATA_DIR: '{{dataDir}}' },
+          readyPattern: 'Listening on port',
+          readyTimeout: 5000,
+        },
+      })
+      await writeServerExtension(extDir, 'tilde-server', manifest, script)
+      mgr.scan([extDir])
+
+      const port = await mgr.startServer('tilde-server')
+
+      const response = await new Promise<string>((resolve, reject) => {
+        http.get(`http://127.0.0.1:${port}`, (res) => {
+          let data = ''
+          res.on('data', (chunk) => (data += chunk))
+          res.on('end', () => resolve(data))
+        }).on('error', reject)
+      })
+      const env = JSON.parse(response)
+      // Tilde should be expanded to the actual home directory
+      expect(env.dataDir).toBe(path.join(os.homedir(), '.local/state/myapp/data'))
+      expect(env.dataDir).not.toContain('~')
+    })
   })
 
   // ── stopServer() ──

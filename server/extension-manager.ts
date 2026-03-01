@@ -8,6 +8,7 @@
 import { EventEmitter } from 'events'
 import fs from 'fs'
 import net from 'net'
+import os from 'os'
 import path from 'path'
 import { spawn, type ChildProcess } from 'child_process'
 import { ExtensionManifestSchema, type ExtensionManifest } from './extension-manifest.js'
@@ -315,11 +316,16 @@ export class ExtensionManager extends EventEmitter {
 
     const result: Record<string, string> = {}
     for (const [key, value] of Object.entries(rawEnv)) {
-      result[key] = value.replace(/\{\{(\w+)\}\}/g, (_match, varName: string) => {
+      let interpolated = value.replace(/\{\{(\w+)\}\}/g, (_match, varName: string) => {
         if (varName === 'port') return String(port)
         if (varName in schemaDefaults) return schemaDefaults[varName]
         return `{{${varName}}}` // Leave unresolved templates as-is
       })
+      // Expand leading ~/ to the user's home directory
+      if (interpolated.startsWith('~/')) {
+        interpolated = path.join(os.homedir(), interpolated.slice(2))
+      }
+      result[key] = interpolated
     }
 
     return result
