@@ -65,6 +65,13 @@ function normalizeContent(input: PaneContentInput): PaneContent {
       resumeSessionId: input.resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
       initialCwd: input.initialCwd,
+      model: input.model,
+      permissionMode: input.permissionMode,
+      effort: input.effort,
+      showThinking: input.showThinking,
+      showTools: input.showTools,
+      showTimecodes: input.showTimecodes,
+      settingsDismissed: input.settingsDismissed,
     }
   }
   // Browser/editor/picker content passes through unchanged
