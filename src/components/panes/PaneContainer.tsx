@@ -1,5 +1,4 @@
 import { useRef, useCallback, useMemo, useState, useEffect } from 'react'
-import { createLogger } from '@/lib/client-logger'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { setActivePane, resizePanes, updatePaneContent, updatePaneTitle, clearPaneRenameRequest, toggleZoom } from '@/store/panesSlice'
 import { updateTab, closePaneWithCleanup } from '@/store/tabsSlice'
@@ -32,8 +31,6 @@ import { clearPendingCreate, removeSession } from '@/store/agentChatSlice'
 import { cancelCreate } from '@/lib/sdk-message-handler'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
-
-const log = createLogger('PaneContainer')
 
 // Stable empty object to avoid selector memoization issues
 const EMPTY_PANE_TITLES: Record<string, string> = {}
@@ -231,22 +228,12 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   }, [dispatch, tabId, tabTerminalId, ws, sdkPendingCreates])
 
   const handleFocus = useCallback((paneId: string) => {
-    // Debug: log pane focus with content info for sidebar highlight investigation
-    if (node.type === 'leaf' && node.id === paneId) {
-      const c = node.content
-      const sessionInfo = c.kind === 'terminal'
-        ? `mode=${c.mode} resumeSessionId=${c.resumeSessionId} terminalId=${c.terminalId}`
-        : c.kind === 'agent-chat'
-          ? `provider=${c.provider} resumeSessionId=${c.resumeSessionId}`
-          : `kind=${c.kind}`
-      log.info(`[PaneFocus] paneId=${paneId} tabId=${tabId} ${sessionInfo} tabTerminalId=${tabTerminalId}`)
-    }
     if (attentionDismiss === 'click' && attentionByPane[paneId]) {
       dispatch(clearPaneAttention({ paneId }))
       dispatch(clearTabAttention({ tabId }))
     }
     dispatch(setActivePane({ tabId, paneId }))
-  }, [dispatch, tabId, attentionDismiss, attentionByPane, node, tabTerminalId])
+  }, [dispatch, tabId, attentionDismiss, attentionByPane])
 
   const handleToggleZoom = useCallback((paneId: string) => {
     dispatch(toggleZoom({ tabId, paneId }))
