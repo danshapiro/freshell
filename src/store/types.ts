@@ -53,6 +53,7 @@ export interface BackgroundTerminal {
 
 export interface CodingCliSession {
   provider: CodingCliProviderName
+  sessionType?: string
   sessionId: string
   projectPath: string
   createdAt?: number

@@ -16,7 +16,7 @@ import ThinkingIndicator from './ThinkingIndicator'
 import { useStreamDebounce } from './useStreamDebounce'
 import CollapsedTurn from './CollapsedTurn'
 import type { ChatMessage, ChatSessionState } from '@/store/agentChatTypes'
-import { api } from '@/lib/api'
+import { api, setSessionMetadata } from '@/lib/api'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 
@@ -124,13 +124,34 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const cliSessionId = session?.cliSessionId
   useEffect(() => {
     if (!cliSessionId) return
-    if (paneContentRef.current.resumeSessionId === cliSessionId) return
-    dispatch(updatePaneContent({
-      tabId,
-      paneId,
-      content: { ...paneContentRef.current, resumeSessionId: cliSessionId },
-    }))
+    if (paneContentRef.current.resumeSessionId !== cliSessionId) {
+      dispatch(updatePaneContent({
+        tabId,
+        paneId,
+        content: { ...paneContentRef.current, resumeSessionId: cliSessionId },
+      }))
+    }
   }, [cliSessionId, tabId, paneId, dispatch])
+
+  // Tag this Claude Code session as belonging to this agent-chat provider.
+  // Fires once when cliSessionId first becomes available (including resumes).
+  // Best-effort: errors are logged but do not block the UI.
+  const taggedSessionRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!cliSessionId) return
+    if (taggedSessionRef.current === cliSessionId) return
+    taggedSessionRef.current = cliSessionId
+
+    if (providerConfig?.codingCliProvider) {
+      setSessionMetadata(
+        providerConfig.codingCliProvider,
+        cliSessionId,
+        paneContent.provider,
+      ).catch((err) => {
+        console.warn('Failed to tag session metadata:', err)
+      })
+    }
+  }, [cliSessionId, providerConfig?.codingCliProvider, paneContent.provider])
 
   // Reset createSentRef when createRequestId changes
   const prevCreateRequestIdRef = useRef(paneContent.createRequestId)

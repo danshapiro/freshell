@@ -9,11 +9,10 @@ import { addPane, setActivePane } from '@/store/panesSlice'
 import { findPaneForSession } from '@/lib/session-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { searchSessions, type SearchResult } from '@/lib/api'
-import { getProviderLabel } from '@/lib/coding-cli-utils'
+import { resolveSessionTypeConfig } from '@/lib/session-type-utils'
 import type { BackgroundTerminal, CodingCliProviderName } from '@/store/types'
 import { makeSelectKnownSessionKeys, makeSelectSortedSessionItems, type SidebarSessionItem } from '@/store/selectors/sidebarSelectors'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
-import { ProviderIcon } from '@/components/icons/provider-icons'
 import { getActiveSessionRefForTab } from '@/lib/session-utils'
 import { createLogger } from '@/lib/client-logger'
 
@@ -53,6 +52,7 @@ export function areSessionItemsEqual(a: SessionItem[], b: SessionItem[]): boolea
     if (
       ai.sessionId !== bi.sessionId ||
       ai.provider !== bi.provider ||
+      ai.sessionType !== bi.sessionType ||
       ai.title !== bi.title ||
       ai.subtitle !== bi.subtitle ||
       ai.hasTab !== bi.hasTab ||
@@ -293,6 +293,7 @@ export default function Sidebar({
             id: `search-${provider}-${result.sessionId}`,
             sessionId: result.sessionId,
             provider,
+            sessionType: provider,
             title: result.title || result.sessionId.slice(0, 8),
             hasTitle: !!result.title,
             subtitle: getProjectName(result.projectPath),
@@ -309,6 +310,7 @@ export default function Sidebar({
           id: `search-${provider}-${result.sessionId}`,
           sessionId: result.sessionId,
           provider,
+          sessionType: existing.sessionType,
           title: result.title || existing.title || result.sessionId.slice(0, 8),
           hasTitle: !!(result.title || existing.hasTitle),
           subtitle: getProjectName(result.projectPath),
@@ -608,6 +610,7 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
   return (
     a.sessionId === b.sessionId &&
     a.provider === b.provider &&
+    a.sessionType === b.sessionType &&
     a.title === b.title &&
     a.subtitle === b.subtitle &&
     a.timestamp === b.timestamp &&
@@ -623,6 +626,7 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
 
 export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
   const { item, isActiveTab, showProjectBadge, onClick } = props
+  const { icon: SessionIcon, label: sessionLabel } = resolveSessionTypeConfig(item.sessionType)
   return (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -643,8 +647,7 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
           {/* Provider icon */}
           <div className="flex-shrink-0">
             <div className={cn('relative', item.hasTab && 'animate-pulse-subtle')}>
-              <ProviderIcon
-                provider={item.provider}
+              <SessionIcon
                 className={cn(
                   'h-3.5 w-3.5',
                   item.hasTab ? 'text-success' : 'text-muted-foreground'
@@ -682,8 +685,8 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
         </button>
       </TooltipTrigger>
       <TooltipContent>
-        <div>{getProviderLabel(item.provider)}: {item.title}</div>
-        <div className="text-muted-foreground">{item.subtitle || item.projectPath || getProviderLabel(item.provider)}</div>
+        <div>{sessionLabel}: {item.title}</div>
+        <div className="text-muted-foreground">{item.subtitle || item.projectPath || sessionLabel}</div>
       </TooltipContent>
     </Tooltip>
   )

@@ -4,6 +4,7 @@ import { setupWslPortForwarding } from './wsl-port-forward.js'
 import express from 'express'
 import fs from 'fs'
 import http from 'http'
+import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import rateLimit from 'express-rate-limit'
@@ -50,6 +51,7 @@ import { createAiRouter } from './ai-router.js'
 import { createDebugRouter } from './debug-router.js'
 import { LayoutStore } from './agent-api/layout-store.js'
 import { createAgentApiRouter } from './agent-api/router.js'
+import { SessionMetadataStore } from './session-metadata-store.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -122,7 +124,9 @@ async function main() {
   app.use('/api', createClientLogsRouter())
 
   const codingCliProviders = [claudeProvider, codexProvider]
-  const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders)
+  const freshellConfigDir = path.join(os.homedir(), '.freshell')
+  const sessionMetadataStore = new SessionMetadataStore(freshellConfigDir)
+  const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders, {}, sessionMetadataStore)
   const codingCliSessionManager = new CodingCliSessionManager(codingCliProviders)
   const tabsRegistryStore = createTabsRegistryStore()
 
@@ -266,6 +270,7 @@ async function main() {
     terminalMetadata,
     registry,
     wsHandler,
+    sessionMetadataStore,
   }))
 
   app.use('/api', createProjectColorsRouter({ configStore, codingCliIndexer }))

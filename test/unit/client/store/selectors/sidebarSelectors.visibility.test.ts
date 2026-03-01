@@ -7,6 +7,7 @@ function createSessionItem(overrides: Partial<SidebarSessionItem>): SidebarSessi
     id: 'session-claude-test',
     sessionId: 'test',
     provider: 'claude',
+    sessionType: 'claude',
     title: 'Test Session',
     hasTitle: true,
     timestamp: 1000,
