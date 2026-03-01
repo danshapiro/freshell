@@ -1954,6 +1954,67 @@ describe('panesSlice', () => {
         props: { key: 'value' },
       })
     })
+
+    it('survives hydratePanes round-trip', () => {
+      const savedState: PanesState = {
+        layouts: {
+          'tab-ext': {
+            type: 'leaf',
+            id: 'pane-ext-1',
+            content: { kind: 'extension', extensionName: 'my-widget', props: { theme: 'dark' } },
+          },
+        },
+        activePane: { 'tab-ext': 'pane-ext-1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+      }
+
+      const state = panesReducer(initialState, hydratePanes(savedState))
+      const leaf = state.layouts['tab-ext'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content).toEqual({
+        kind: 'extension',
+        extensionName: 'my-widget',
+        props: { theme: 'dark' },
+      })
+    })
+
+    it('survives mergeTerminalState when extension pane exists locally and remotely', () => {
+      const extensionContent: PaneContent = {
+        kind: 'extension',
+        extensionName: 'my-ext',
+        props: { key: 'value' },
+      }
+
+      // Set up local state with an extension pane
+      const localState = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-ext', content: extensionContent })
+      )
+
+      // Hydrate incoming state with the same extension pane
+      const incoming: PanesState = {
+        layouts: {
+          'tab-ext': {
+            type: 'leaf',
+            id: (localState.layouts['tab-ext'] as any).id,
+            content: extensionContent,
+          },
+        },
+        activePane: localState.activePane,
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+      }
+
+      const merged = panesReducer(localState, hydratePanes(incoming))
+      const leaf = merged.layouts['tab-ext'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content).toEqual(extensionContent)
+    })
   })
 
   describe('addPane', () => {
