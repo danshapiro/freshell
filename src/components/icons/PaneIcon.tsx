@@ -34,6 +34,11 @@ export default function PaneIcon({ content, className }: PaneIconProps) {
     return <LayoutGrid className={className} />
   }
 
+  if (content.kind === 'extension') {
+    // V1: LayoutGrid fallback. Future: load SVG from iconUrl
+    return <LayoutGrid className={className} />
+  }
+
   // Picker
   return <LayoutGrid className={className} />
 }
