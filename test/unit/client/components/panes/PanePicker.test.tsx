@@ -5,6 +5,8 @@ import { Provider } from 'react-redux'
 import PanePicker from '@/components/panes/PanePicker'
 import settingsReducer from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
+import extensionsReducer from '@/store/extensionsSlice'
+import type { ClientExtensionEntry } from '@shared/extension-types'
 import type { DefaultNewPane, SidebarSortMode, TerminalTheme } from '@/store/types'
 
 // Mock lucide-react icons
@@ -18,23 +20,31 @@ vi.mock('lucide-react', () => ({
   FileText: ({ className }: { className?: string }) => (
     <svg data-testid="file-text-icon" className={className} />
   ),
+  LayoutGrid: ({ className }: { className?: string }) => (
+    <svg data-testid="layout-grid-icon" className={className} />
+  ),
 }))
 
 function createStore(overrides?: {
   platform?: string | null
   availableClis?: Record<string, boolean>
   enabledProviders?: string[]
+  extensions?: ClientExtensionEntry[]
 }) {
   return configureStore({
     reducer: {
       settings: settingsReducer,
       connection: connectionReducer,
+      extensions: extensionsReducer,
     },
     preloadedState: {
       connection: {
         status: 'ready' as const,
         platform: overrides?.platform ?? null,
         availableClis: overrides?.availableClis ?? {},
+      },
+      extensions: {
+        entries: overrides?.extensions ?? [],
       },
       settings: {
         settings: {
@@ -454,6 +464,86 @@ describe('PanePicker', () => {
       expect(rows).toHaveLength(2)
       expect(within(rows[0]).getAllByRole('button')).toHaveLength(3)
       expect(within(rows[1]).getAllByRole('button')).toHaveLength(3)
+    })
+  })
+
+  describe('extension options', () => {
+    const sampleExtension: ClientExtensionEntry = {
+      name: 'test-widget',
+      version: '1.0.0',
+      label: 'Test Widget',
+      description: 'A test extension',
+      category: 'client',
+      picker: { shortcut: 'T' },
+    }
+
+    const secondExtension: ClientExtensionEntry = {
+      name: 'another-ext',
+      version: '2.0.0',
+      label: 'Another Extension',
+      description: 'Another test extension',
+      category: 'server',
+    }
+
+    it('shows extension options from the registry', () => {
+      renderPicker({ extensions: [sampleExtension] })
+      expect(screen.getByRole('button', { name: 'Test Widget' })).toBeInTheDocument()
+    })
+
+    it('shows no extension options when registry is empty', () => {
+      renderPicker({ extensions: [] })
+      // Should only show built-in options (Editor, Browser, Shell)
+      const buttons = screen.getAllByRole('button')
+      const labels = buttons.map(b => b.getAttribute('aria-label'))
+      expect(labels).not.toContain('Test Widget')
+    })
+
+    it('shows multiple extension options', () => {
+      renderPicker({ extensions: [sampleExtension, secondExtension] })
+      expect(screen.getByRole('button', { name: 'Test Widget' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Another Extension' })).toBeInTheDocument()
+    })
+
+    it('calls onSelect with ext:<name> when extension option is clicked', () => {
+      const { onSelect } = renderPicker({ extensions: [sampleExtension] })
+      fireEvent.click(screen.getByRole('button', { name: 'Test Widget' }))
+      completeFadeAnimation()
+      expect(onSelect).toHaveBeenCalledWith('ext:test-widget')
+    })
+
+    it('supports keyboard shortcut from extension manifest', () => {
+      const { onSelect } = renderPicker({ extensions: [sampleExtension] })
+      fireEvent.keyDown(getContainer(), { key: 't' })
+      completeFadeAnimation()
+      expect(onSelect).toHaveBeenCalledWith('ext:test-widget')
+    })
+
+    it('uses empty shortcut when extension has no picker.shortcut', () => {
+      renderPicker({ extensions: [secondExtension] })
+      const button = screen.getByRole('button', { name: 'Another Extension' })
+      // The shortcut hint element should be present but empty
+      const hint = button.querySelector('.shortcut-hint')
+      expect(hint).toBeInTheDocument()
+      expect(hint!.textContent).toBe('')
+    })
+
+    it('renders fallback icon for extensions without custom icon', () => {
+      renderPicker({ extensions: [sampleExtension] })
+      const button = screen.getByRole('button', { name: 'Test Widget' })
+      expect(button.querySelector('[data-testid="layout-grid-icon"]')).toBeInTheDocument()
+    })
+
+    it('places extension options after built-in options', () => {
+      renderPicker({ extensions: [sampleExtension] })
+      const buttons = screen.getAllByRole('button')
+      const labels = buttons.map(b => b.getAttribute('aria-label'))
+      // Built-in options come first: Editor, Browser, Shell
+      // Extension options come after
+      const editorIdx = labels.indexOf('Editor')
+      const shellIdx = labels.indexOf('Shell')
+      const extIdx = labels.indexOf('Test Widget')
+      expect(extIdx).toBeGreaterThan(editorIdx)
+      expect(extIdx).toBeGreaterThan(shellIdx)
     })
   })
 })

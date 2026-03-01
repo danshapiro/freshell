@@ -429,6 +429,15 @@ function PickerWrapper({
   >({ step: 'type' })
 
   const createContentForType = useCallback((type: PanePickerType, cwd?: string): PaneContent => {
+    if (typeof type === 'string' && type.startsWith('ext:')) {
+      const extensionName = type.slice(4)
+      return {
+        kind: 'extension' as const,
+        extensionName,
+        props: {},
+      }
+    }
+
     if (isAgentChatProviderName(type)) {
       const providerConfig = getAgentChatProviderConfig(type)!
       const providerSettings = settings?.agentChat?.providers?.[type]
