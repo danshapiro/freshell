@@ -225,6 +225,8 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         dispatch(clearPendingCreate({ requestId: content.createRequestId }))
       }
     }
+    // Extension panes: V1 leaves server extensions running until freshell shutdown.
+    // Future: stop singleton server when its last pane closes.
     dispatch(closePaneWithCleanup({ tabId, paneId }))
   }, [dispatch, tabId, tabTerminalId, ws, sdkPendingCreates])
 
