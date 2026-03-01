@@ -9,7 +9,8 @@ import { addPane, setActivePane } from '@/store/panesSlice'
 import { findPaneForSession } from '@/lib/session-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { searchSessions, type SearchResult } from '@/lib/api'
-import { resolveSessionTypeConfig } from '@/lib/session-type-utils'
+import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type-utils'
+import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import type { BackgroundTerminal, CodingCliProviderName } from '@/store/types'
 import { makeSelectKnownSessionKeys, makeSelectSortedSessionItems, type SidebarSessionItem } from '@/store/selectors/sidebarSelectors'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
@@ -411,6 +412,13 @@ export default function Sidebar({
       return
     }
 
+    // Resolve provider settings for agent-chat panes
+    const sessionType = item.sessionType || provider
+    const agentConfig = getAgentChatProviderConfig(sessionType)
+    const providerSettings = agentConfig
+      ? state.settings.settings.agentChat?.providers?.[agentConfig.name]
+      : undefined
+
     // 2. Fallback: no active tab or active tab has no layout → create new tab
     const activeLayout = currentActiveTabId ? state.panes.layouts[currentActiveTabId] : undefined
     if (!currentActiveTabId || !activeLayout) {
@@ -419,6 +427,7 @@ export default function Sidebar({
         title: item.title,
         cwd: item.cwd,
         provider,
+        sessionType,
         terminalId: runningTerminalId,
       }))
       onNavigate('terminal')
@@ -428,14 +437,13 @@ export default function Sidebar({
     // 3. Normal: split a new pane in the current tab
     dispatch(addPane({
       tabId: currentActiveTabId,
-      newContent: {
-        kind: 'terminal',
-        mode: provider,
-        resumeSessionId: item.sessionId,
-        initialCwd: item.cwd,
+      newContent: buildResumeContent({
+        sessionType,
+        sessionId: item.sessionId,
+        cwd: item.cwd,
         terminalId: runningTerminalId,
-        status: runningTerminalId ? 'running' : 'creating',
-      },
+        agentChatProviderSettings: providerSettings,
+      }),
     }))
     onNavigate('terminal')
   }, [dispatch, onNavigate, store])
@@ -671,6 +679,7 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
           data-context={ContextIds.SidebarSession}
           data-session-id={item.sessionId}
           data-provider={item.provider}
+          data-session-type={item.sessionType}
           data-running-terminal-id={item.runningTerminalId}
           data-has-tab={item.hasTab ? 'true' : 'false'}
         >
