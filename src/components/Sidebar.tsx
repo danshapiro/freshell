@@ -99,13 +99,43 @@ interface SidebarRowProps {
   timestampTick: number
 }
 
+/**
+ * Determine whether a sidebar session item should be highlighted as active.
+ * Prefers activeSessionKey (derived from the active pane's content) when
+ * available. Falls back to activeTerminalId only when no session key exists
+ * (e.g. a fresh terminal not yet associated with a session).
+ * This prevents double-highlighting when activeTerminalId is stale.
+ */
+export function computeIsActive(params: {
+  isRunning: boolean
+  runningTerminalId: string | undefined
+  sessionKey: string
+  activeSessionKey: string | null
+  activeTerminalId: string | undefined
+}): boolean {
+  // When we have a session key from the active pane, use it for all items
+  if (params.activeSessionKey != null) {
+    return params.sessionKey === params.activeSessionKey
+  }
+  // No session key available — fall back to terminal ID matching for running sessions
+  if (params.isRunning) {
+    return params.runningTerminalId === params.activeTerminalId
+  }
+  return false
+}
+
 /** Row component defined at module scope for stable identity — prevents react-window
  *  from unmounting/remounting all visible rows on every parent re-render. */
 export const SidebarRow = ({ index, style, ariaAttributes, ...data }: RowComponentProps<SidebarRowProps>) => {
   const item = data.items[index]
-  const isActive = item.isRunning
-    ? item.runningTerminalId === data.activeTerminalId
-    : `${item.provider}:${item.sessionId}` === data.activeSessionKey
+  const sessionKey = `${item.provider}:${item.sessionId}`
+  const isActive = computeIsActive({
+    isRunning: item.isRunning,
+    runningTerminalId: item.runningTerminalId,
+    sessionKey,
+    activeSessionKey: data.activeSessionKey,
+    activeTerminalId: data.activeTerminalId,
+  })
 
   // Stable click handler: store latest callback + item in a ref so the
   // onClick function identity never changes, but always invokes current data.
