@@ -1,9 +1,10 @@
 import { describe, it, expect, afterEach, vi, beforeEach } from 'vitest'
 import { render, screen, cleanup, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import ExtensionPane from '@/components/panes/ExtensionPane'
-import extensionsReducer from '@/store/extensionsSlice'
+import extensionsReducer, { updateServerStatus } from '@/store/extensionsSlice'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import type { ExtensionPaneContent } from '@/store/paneTypes'
 
@@ -171,7 +172,9 @@ describe('ExtensionPane', () => {
     expect(iframe.src).toBe('http://localhost:9000/page/reports/item/42')
   })
 
-  it('shows error when server extension is not running', () => {
+  it('shows loading state when server extension is not running (auto-start)', () => {
+    mockApiPost.mockReturnValue(new Promise(() => {}))
+
     const ext: ClientExtensionEntry = {
       name: 'stopped-ext',
       version: '1.0.0',
@@ -193,10 +196,7 @@ describe('ExtensionPane', () => {
       [ext],
     )
 
-    expect(screen.getByText('Extension not available')).toBeInTheDocument()
-    expect(
-      screen.getByText('Server extension "Stopped Ext" is not running.'),
-    ).toBeInTheDocument()
+    expect(screen.getByText('Starting extension server...')).toBeInTheDocument()
   })
 
   it('replaces undefined template variables with empty string', () => {
@@ -224,6 +224,259 @@ describe('ExtensionPane', () => {
 
     const iframe = screen.getByTitle('Missing Var') as HTMLIFrameElement
     expect(iframe.src).toBe('http://localhost:3000/path//end')
+  })
+
+  describe('auto-start server extensions', () => {
+    beforeEach(() => {
+      mockApiPost.mockReset()
+      mockApiDelete.mockReset()
+      mockIsLoopback.mockReturnValue(true) // local access
+    })
+
+    afterEach(() => {
+      mockIsLoopback.mockReturnValue(true)
+    })
+
+    it('calls POST /api/extensions/:name/start when server not running', () => {
+      mockApiPost.mockReturnValue(new Promise(() => {}))
+
+      const ext: ClientExtensionEntry = {
+        name: 'my-server-ext',
+        version: '1.0.0',
+        label: 'My Server Ext',
+        description: 'Auto-start test',
+        category: 'server',
+        url: '/app',
+        serverRunning: false,
+      }
+
+      const content: ExtensionPaneContent = {
+        kind: 'extension',
+        extensionName: 'my-server-ext',
+        props: {},
+      }
+
+      renderWithStore(
+        <ExtensionPane tabId="tab-1" paneId="pane-1" content={content} />,
+        [ext],
+      )
+
+      expect(mockApiPost).toHaveBeenCalledWith(
+        '/api/extensions/my-server-ext/start',
+        {},
+      )
+    })
+
+    it('does not call start when server already running', () => {
+      const ext: ClientExtensionEntry = {
+        name: 'running-ext',
+        version: '1.0.0',
+        label: 'Running Ext',
+        description: 'Already running',
+        category: 'server',
+        url: '/app',
+        serverRunning: true,
+        serverPort: 5000,
+      }
+
+      const content: ExtensionPaneContent = {
+        kind: 'extension',
+        extensionName: 'running-ext',
+        props: {},
+      }
+
+      renderWithStore(
+        <ExtensionPane tabId="tab-1" paneId="pane-1" content={content} />,
+        [ext],
+      )
+
+      // Should not have called start endpoint (may call port forwarding, but not start)
+      expect(mockApiPost).not.toHaveBeenCalledWith(
+        expect.stringContaining('/start'),
+        expect.anything(),
+      )
+    })
+
+    it('shows error with retry button on start failure', async () => {
+      mockApiPost.mockRejectedValue(new Error('spawn ENOENT'))
+
+      const ext: ClientExtensionEntry = {
+        name: 'fail-ext',
+        version: '1.0.0',
+        label: 'Fail Ext',
+        description: 'Fails to start',
+        category: 'server',
+        url: '/app',
+        serverRunning: false,
+      }
+
+      const content: ExtensionPaneContent = {
+        kind: 'extension',
+        extensionName: 'fail-ext',
+        props: {},
+      }
+
+      renderWithStore(
+        <ExtensionPane tabId="tab-1" paneId="pane-1" content={content} />,
+        [ext],
+      )
+
+      await waitFor(() => {
+        expect(screen.getByText(/Failed to start "Fail Ext"/)).toBeInTheDocument()
+        expect(screen.getByText(/spawn ENOENT/)).toBeInTheDocument()
+      })
+
+      expect(screen.getByText('Retry')).toBeInTheDocument()
+    })
+
+    it('retries auto-start when Retry button is clicked', async () => {
+      const user = userEvent.setup()
+      // First call rejects, second call stays pending (simulating retry in progress)
+      mockApiPost
+        .mockRejectedValueOnce(new Error('spawn ENOENT'))
+        .mockReturnValueOnce(new Promise(() => {}))
+
+      const ext: ClientExtensionEntry = {
+        name: 'retry-ext',
+        version: '1.0.0',
+        label: 'Retry Ext',
+        description: 'Retry test',
+        category: 'server',
+        url: '/app',
+        serverRunning: false,
+      }
+
+      const content: ExtensionPaneContent = {
+        kind: 'extension',
+        extensionName: 'retry-ext',
+        props: {},
+      }
+
+      renderWithStore(
+        <ExtensionPane tabId="tab-1" paneId="pane-1" content={content} />,
+        [ext],
+      )
+
+      // Wait for error to appear
+      await waitFor(() => {
+        expect(screen.getByText('Retry')).toBeInTheDocument()
+      })
+
+      // Click retry
+      await user.click(screen.getByText('Retry'))
+
+      // Should have called start twice now
+      expect(mockApiPost).toHaveBeenCalledTimes(2)
+      expect(screen.getByText('Starting extension server...')).toBeInTheDocument()
+    })
+
+    it('transitions to iframe after Redux update (simulating WS broadcast)', async () => {
+      mockApiPost.mockResolvedValue({ port: 5000 })
+
+      const ext: ClientExtensionEntry = {
+        name: 'transition-ext',
+        version: '1.0.0',
+        label: 'Transition Ext',
+        description: 'Transition test',
+        category: 'server',
+        url: '/dashboard',
+        serverRunning: false,
+      }
+
+      const content: ExtensionPaneContent = {
+        kind: 'extension',
+        extensionName: 'transition-ext',
+        props: {},
+      }
+
+      const store = createStore([ext])
+      render(
+        <Provider store={store}>
+          <ExtensionPane tabId="tab-1" paneId="pane-1" content={content} />
+        </Provider>,
+      )
+
+      // Initially shows loading
+      expect(screen.getByText('Starting extension server...')).toBeInTheDocument()
+
+      // Simulate WS broadcast updating Redux
+      store.dispatch(
+        updateServerStatus({ name: 'transition-ext', serverRunning: true, serverPort: 5000 }),
+      )
+
+      await waitFor(() => {
+        const iframe = screen.getByTitle('Transition Ext') as HTMLIFrameElement
+        expect(iframe.tagName).toBe('IFRAME')
+        expect(iframe.src).toBe('http://localhost:5000/dashboard')
+      })
+    })
+
+    it('extracts message from ApiError objects (not Error instances)', async () => {
+      // api.post throws ApiError objects: { status, message, details }
+      mockApiPost.mockRejectedValue({ status: 500, message: 'Extension crashed on startup' })
+
+      const ext: ClientExtensionEntry = {
+        name: 'api-err-ext',
+        version: '1.0.0',
+        label: 'Api Err Ext',
+        description: 'ApiError test',
+        category: 'server',
+        url: '/app',
+        serverRunning: false,
+      }
+
+      const content: ExtensionPaneContent = {
+        kind: 'extension',
+        extensionName: 'api-err-ext',
+        props: {},
+      }
+
+      renderWithStore(
+        <ExtensionPane tabId="tab-1" paneId="pane-1" content={content} />,
+        [ext],
+      )
+
+      await waitFor(() => {
+        expect(screen.getByText(/Extension crashed on startup/)).toBeInTheDocument()
+      })
+      // Must NOT show [object Object]
+      expect(screen.queryByText(/\[object Object\]/)).not.toBeInTheDocument()
+    })
+
+    it('falls back to API response when WS broadcast is missed', async () => {
+      // API resolves with port, but no WS broadcast dispatches updateServerStatus
+      mockApiPost.mockResolvedValue({ port: 7777 })
+
+      const ext: ClientExtensionEntry = {
+        name: 'fallback-ext',
+        version: '1.0.0',
+        label: 'Fallback Ext',
+        description: 'Fallback test',
+        category: 'server',
+        url: '/app',
+        serverRunning: false,
+      }
+
+      const content: ExtensionPaneContent = {
+        kind: 'extension',
+        extensionName: 'fallback-ext',
+        props: {},
+      }
+
+      const store = createStore([ext])
+      render(
+        <Provider store={store}>
+          <ExtensionPane tabId="tab-1" paneId="pane-1" content={content} />
+        </Provider>,
+      )
+
+      // Without WS broadcast, the API response should still update Redux as fallback
+      await waitFor(() => {
+        const iframe = screen.getByTitle('Fallback Ext') as HTMLIFrameElement
+        expect(iframe.tagName).toBe('IFRAME')
+        expect(iframe.src).toBe('http://localhost:7777/app')
+      })
+    })
   })
 
   describe('remote access (port forwarding)', () => {

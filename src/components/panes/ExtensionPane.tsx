@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
-import { useAppSelector } from '@/store/hooks'
+import { useAppSelector, useAppDispatch } from '@/store/hooks'
+import { updateServerStatus } from '@/store/extensionsSlice'
 import { isLoopbackHostname } from '@/lib/url-rewrite'
 import { api } from '@/lib/api'
 import type { ExtensionPaneContent } from '@/store/paneTypes'
@@ -23,13 +24,67 @@ function interpolateUrl(template: string, props: Record<string, unknown>): strin
 }
 
 export default function ExtensionPane({ content }: ExtensionPaneProps) {
+  const dispatch = useAppDispatch()
   const extension = useAppSelector((s) =>
     s.extensions.entries.find((e) => e.name === content.extensionName),
   )
 
+  // Auto-start state for server extensions
+  const [startState, setStartState] = useState<'idle' | 'starting' | 'error'>('idle')
+  const [startError, setStartError] = useState<string | null>(null)
+  const [startAttempt, setStartAttempt] = useState(0)
+
   // Port forwarding state for server extensions accessed remotely
   const [forwardedPort, setForwardedPort] = useState<number | null>(null)
   const [forwardError, setForwardError] = useState<string | null>(null)
+
+  // Auto-start server extensions that aren't running
+  useEffect(() => {
+    if (!extension || extension.category !== 'server') return
+    if (extension.serverRunning) {
+      // Server came up (e.g. via WS broadcast) — reset start state
+      setStartState('idle')
+      setStartError(null)
+      return
+    }
+
+    setStartState('starting')
+    let cancelled = false
+
+    api
+      .post<{ port: number }>(`/api/extensions/${encodeURIComponent(extension.name)}/start`, {})
+      .then((result) => {
+        // The WS broadcast normally updates Redux, but as a fallback (e.g. if WS
+        // is disrupted), dispatch from the API response to avoid getting stuck.
+        if (!cancelled) {
+          dispatch(
+            updateServerStatus({
+              name: extension.name,
+              serverRunning: true,
+              serverPort: result.port,
+            }),
+          )
+        }
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          let msg: string
+          if (err instanceof Error) {
+            msg = err.message
+          } else if (err && typeof err === 'object' && 'message' in err) {
+            msg = String((err as { message: unknown }).message)
+          } else {
+            msg = String(err)
+          }
+          setStartState('error')
+          setStartError(msg)
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [extension?.name, extension?.category, extension?.serverRunning, startAttempt, dispatch])
 
   const isRemote = typeof window !== 'undefined' && !isLoopbackHostname(window.location.hostname)
   const serverPort = extension?.serverPort
@@ -87,11 +142,20 @@ export default function ExtensionPane({ content }: ExtensionPaneProps) {
   let src: string
   if (extension.category === 'server') {
     if (!extension.serverRunning || !extension.serverPort) {
+      if (startState === 'error') {
+        return (
+          <ExtensionError
+            name={content.extensionName}
+            message={`Failed to start "${extension.label}": ${startError}`}
+            onRetry={() => setStartAttempt((n) => n + 1)}
+          />
+        )
+      }
+      // Starting or waiting for WS broadcast
       return (
-        <ExtensionError
-          name={content.extensionName}
-          message={`Server extension "${extension.label}" is not running.`}
-        />
+        <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
+          Starting extension server...
+        </div>
       )
     }
 
