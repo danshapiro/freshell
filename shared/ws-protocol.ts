@@ -7,6 +7,7 @@
  * Client MUST use `import type` to avoid bundling Zod runtime code.
  */
 import { z } from 'zod'
+import type { ClientExtensionEntry } from './extension-types.js'
 
 // ──────────────────────────────────────────────────────────────
 // Shared enums and helpers
@@ -629,6 +630,35 @@ export type SdkServerMessage =
   | { type: 'sdk.models'; sessionId: string; models: Array<{ value: string; displayName: string; description: string }> }
   | { type: 'sdk.question.request'; sessionId: string; requestId: string; questions: Array<{ question: string; header: string; options: Array<{ label: string; description: string }>; multiSelect: boolean }> }
 
+// -- Extensions --
+
+export type ExtensionRegistryMessage = {
+  type: 'extensions.registry'
+  extensions: ClientExtensionEntry[]
+}
+
+export type ExtensionServerStartingMessage = {
+  type: 'extension.server.starting'
+  name: string
+}
+
+export type ExtensionServerReadyMessage = {
+  type: 'extension.server.ready'
+  name: string
+  port: number
+}
+
+export type ExtensionServerErrorMessage = {
+  type: 'extension.server.error'
+  name: string
+  error: string
+}
+
+export type ExtensionServerStoppedMessage = {
+  type: 'extension.server.stopped'
+  name: string
+}
+
 // ── Server message discriminated union ──
 
 export type ServerMessage =
@@ -663,3 +693,8 @@ export type ServerMessage =
   | CodingCliStderrMessage
   | CodingCliKilledMessage
   | SdkServerMessage
+  | ExtensionRegistryMessage
+  | ExtensionServerStartingMessage
+  | ExtensionServerReadyMessage
+  | ExtensionServerErrorMessage
+  | ExtensionServerStoppedMessage

@@ -168,6 +168,7 @@ async function main() {
     tabsRegistryStore,
     serverInstanceId,
     layoutStore,
+    extensionManager,
   )
   const port = Number(process.env.PORT || 3001)
   const isDev = process.env.NODE_ENV !== 'production'

@@ -9,8 +9,12 @@ import fs from 'fs'
 import net from 'net'
 import path from 'path'
 import { spawn, type ChildProcess } from 'child_process'
-import { ExtensionManifestSchema, type ExtensionManifest, type ContentSchemaField } from './extension-manifest.js'
+import { ExtensionManifestSchema, type ExtensionManifest } from './extension-manifest.js'
 import { logger } from './logger.js'
+import type { ClientExtensionEntry } from '../shared/extension-types.js'
+
+// Re-export so existing consumers don't break
+export type { ClientExtensionEntry } from '../shared/extension-types.js'
 
 // ──────────────────────────────────────────────────────────────
 // Public types
@@ -20,20 +24,6 @@ export interface ExtensionRegistryEntry {
   manifest: ExtensionManifest
   path: string            // filesystem path to extension dir
   serverPort?: number     // allocated port (server panes, set later)
-}
-
-export interface ClientExtensionEntry {
-  name: string
-  version: string
-  label: string
-  description: string
-  category: 'client' | 'server' | 'cli'
-  iconUrl?: string        // URL to icon served by freshell: /api/extensions/{name}/icon
-  url?: string            // URL template
-  contentSchema?: Record<string, ContentSchemaField>
-  picker?: { shortcut?: string; group?: string }
-  serverRunning?: boolean
-  serverPort?: number
 }
 
 // ──────────────────────────────────────────────────────────────
