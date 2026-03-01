@@ -671,6 +671,7 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
           data-context={ContextIds.SidebarSession}
           data-session-id={item.sessionId}
           data-provider={item.provider}
+          data-session-type={item.sessionType}
           data-running-terminal-id={item.runningTerminalId}
           data-has-tab={item.hasTab ? 'true' : 'false'}
         >
