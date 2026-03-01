@@ -9,6 +9,7 @@ import TerminalView from '../TerminalView'
 import BrowserPane from './BrowserPane'
 import EditorPane from './EditorPane'
 import AgentChatView from '../agent-chat/AgentChatView'
+import ExtensionPane from './ExtensionPane'
 import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
 import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-utils'
@@ -630,9 +631,9 @@ function renderContent(tabId: string, paneId: string, content: PaneContent, isOn
 
   if (content.kind === 'extension') {
     return (
-      <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
-        Extension: {content.extensionName}
-      </div>
+      <ErrorBoundary key={paneId} label="Extension">
+        <ExtensionPane tabId={tabId} paneId={paneId} content={content} />
+      </ErrorBoundary>
     )
   }
 
