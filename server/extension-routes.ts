@@ -61,6 +61,69 @@ export function createExtensionRouter(extensionManager: ExtensionManager): Route
     res.json({ ok: true })
   })
 
+  /** GET /:name/client/* — Serve client extension static files. */
+  router.get('/:name/client/*', (req, res) => {
+    const { name } = req.params
+    const entry = extensionManager.get(name)
+    if (!entry) {
+      return res.status(404).json({ error: `Extension not found: '${name}'` })
+    }
+    if (entry.manifest.category !== 'client') {
+      return res.status(400).json({ error: `Extension '${name}' is not a client extension` })
+    }
+
+    // Scope file serving to the directory of the client entry file.
+    // e.g. if client.entry is "./dist/index.html", publicRoot is "<extDir>/dist"
+    const clientEntry = entry.manifest.client!.entry
+    const publicRoot = path.resolve(entry.path, path.dirname(clientEntry))
+
+    // Validate publicRoot is within the extension directory (blocks absolute entry
+    // paths and symlink escapes). Resolve both sides through realpath so symlinks
+    // in publicRoot or entry.path are handled consistently.
+    let realExtDir: string
+    let realPublicRoot: string
+    try {
+      realExtDir = fs.realpathSync(entry.path)
+      realPublicRoot = fs.realpathSync(publicRoot)
+    } catch {
+      // publicRoot doesn't exist on disk — reject early
+      return res.status(400).json({ error: 'Invalid client entry path' })
+    }
+
+    if (!realPublicRoot.startsWith(realExtDir + path.sep) && realPublicRoot !== realExtDir) {
+      return res.status(400).json({ error: 'Invalid client entry path' })
+    }
+
+    // The wildcard captures everything after /client/
+    const filePath = req.params[0] || path.basename(clientEntry)
+    const resolved = path.resolve(realPublicRoot, filePath)
+
+    // Path traversal protection: resolved path must stay within publicRoot.
+    // Use realpathSync to resolve any symlinks in the requested file path.
+    let realResolved: string
+    try {
+      realResolved = fs.realpathSync(resolved)
+    } catch {
+      // File doesn't exist — fall through to sendFile which will 404
+      realResolved = resolved
+    }
+
+    if (!realResolved.startsWith(realPublicRoot + path.sep) && realResolved !== realPublicRoot) {
+      return res.status(400).json({ error: 'Invalid file path' })
+    }
+
+    res.sendFile(resolved, (err) => {
+      if (err) {
+        if ((err as any).code === 'ENOENT') {
+          return res.status(404).json({ error: 'File not found' })
+        }
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Failed to serve file' })
+        }
+      }
+    })
+  })
+
   /** GET /:name/icon — Serve extension icon SVG. */
   router.get('/:name/icon', (req, res) => {
     const { name } = req.params

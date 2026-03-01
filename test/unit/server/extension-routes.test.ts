@@ -212,6 +212,85 @@ describe('extension-routes', () => {
     })
   })
 
+  // ── GET /:name/client/* — serve client extension files ──
+
+  describe('GET /api/extensions/:name/client/*', () => {
+    it('returns 404 for unknown extension', async () => {
+      mgr.scan([extDir])
+      app = createApp()
+
+      const res = await request(app).get('/api/extensions/nope/client/index.html')
+      expect(res.status).toBe(404)
+    })
+
+    it('returns 400 for non-client extension', async () => {
+      await writeExtension(extDir, 'srv', serverManifest())
+      mgr.scan([extDir])
+      app = createApp()
+
+      const res = await request(app).get('/api/extensions/test-server/client/index.html')
+      expect(res.status).toBe(400)
+      expect(res.body.error).toMatch(/not a client extension/i)
+    })
+
+    it('serves a file from the client extension directory', async () => {
+      const htmlContent = '<html><body>Hello</body></html>'
+      const extPath = await writeExtension(extDir, 'cli', clientManifest())
+      await fsp.writeFile(path.join(extPath, 'index.html'), htmlContent)
+      mgr.scan([extDir])
+      app = createApp()
+
+      const res = await request(app).get('/api/extensions/test-client/client/index.html')
+      expect(res.status).toBe(200)
+      expect(res.text).toBe(htmlContent)
+    })
+
+    it('returns 404 for missing file', async () => {
+      await writeExtension(extDir, 'cli', clientManifest())
+      mgr.scan([extDir])
+      app = createApp()
+
+      const res = await request(app).get('/api/extensions/test-client/client/nonexistent.html')
+      expect(res.status).toBe(404)
+    })
+
+    it('scopes file serving to client entry directory', async () => {
+      // Extension with client.entry in a subdirectory
+      const extPath = await writeExtension(extDir, 'cli-sub', {
+        ...clientManifest({ name: 'test-sub-client' }),
+        client: { entry: './public/index.html' },
+      })
+      await fsp.mkdir(path.join(extPath, 'public'), { recursive: true })
+      await fsp.writeFile(path.join(extPath, 'public', 'index.html'), '<html>OK</html>')
+      await fsp.writeFile(path.join(extPath, 'secret.txt'), 'secret data')
+      mgr.scan([extDir])
+      app = createApp()
+
+      // File in public dir should be accessible
+      const ok = await request(app).get('/api/extensions/test-sub-client/client/index.html')
+      expect(ok.status).toBe(200)
+
+      // File outside public dir (in extension root) should not be accessible
+      const secret = await request(app).get(
+        '/api/extensions/test-sub-client/client/..%2Fsecret.txt',
+      )
+      expect(secret.status).toBe(400)
+    })
+
+    it('prevents path traversal via URL-encoded sequences', async () => {
+      await writeExtension(extDir, 'cli', clientManifest())
+      mgr.scan([extDir])
+      app = createApp()
+
+      // URL-encoded ..%2F bypasses Express's built-in path normalization
+      const res = await request(app).get(
+        '/api/extensions/test-client/client/..%2F..%2F..%2Fetc%2Fpasswd',
+      )
+      expect(res.status).toBe(400)
+      expect(res.body.error).toMatch(/invalid file path/i)
+    })
+  })
+
   // ── GET /:name/icon — serve extension icon ──
 
   describe('GET /api/extensions/:name/icon', () => {
