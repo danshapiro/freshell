@@ -7,6 +7,7 @@ import { CodingCliSessionIndexer } from '../../../../server/coding-cli/session-i
 import { configStore } from '../../../../server/config-store'
 import { makeSessionKey } from '../../../../server/coding-cli/types'
 import { clearRepoRootCache } from '../../../../server/coding-cli/utils'
+import type { SessionMetadataStore } from '../../../../server/session-metadata-store'
 
 vi.mock('../../../../server/config-store', () => ({
   configStore: {
@@ -1152,6 +1153,60 @@ describe('CodingCliSessionIndexer', () => {
       )
 
       indexer.stop()
+    })
+  })
+
+  describe('sessionType merge from metadata store', () => {
+    function mockMetadataStore(entries: Record<string, { sessionType?: string }>): SessionMetadataStore {
+      return {
+        getAll: vi.fn().mockResolvedValue(entries),
+        get: vi.fn(),
+        set: vi.fn(),
+      } as unknown as SessionMetadataStore
+    }
+
+    it('merges sessionType from metadata store into indexed sessions', async () => {
+      const sessionId = 'session-with-type'
+      const fileA = path.join(tempDir, `${sessionId}.jsonl`)
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')
+
+      const provider = makeProvider([fileA])
+      const metadataStore = mockMetadataStore({
+        [makeSessionKey('claude', sessionId)]: { sessionType: 'freshclaude' },
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider], {}, metadataStore)
+      await indexer.refresh()
+
+      const session = indexer.getProjects()[0]?.sessions[0]
+      expect(session?.sessionType).toBe('freshclaude')
+    })
+
+    it('does not set sessionType when metadata store has no entry', async () => {
+      const fileA = path.join(tempDir, 'session-no-type.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')
+
+      const provider = makeProvider([fileA])
+      const metadataStore = mockMetadataStore({})
+
+      const indexer = new CodingCliSessionIndexer([provider], {}, metadataStore)
+      await indexer.refresh()
+
+      const session = indexer.getProjects()[0]?.sessions[0]
+      expect(session?.sessionType).toBeUndefined()
+    })
+
+    it('works without a metadata store (backward compatibility)', async () => {
+      const fileA = path.join(tempDir, 'session-compat.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')
+
+      const provider = makeProvider([fileA])
+      // No metadata store passed — should still work
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+
+      const session = indexer.getProjects()[0]?.sessions[0]
+      expect(session?.sessionType).toBeUndefined()
     })
   })
 

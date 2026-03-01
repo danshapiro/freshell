@@ -66,6 +66,7 @@ export function parseContextTarget(contextId: ContextId, data: ContextDataset): 
             kind: 'sidebar-session',
             sessionId: data.sessionId,
             provider: data.provider,
+            sessionType: data.sessionType,
             runningTerminalId: data.runningTerminalId,
             hasTab: data.hasTab === 'true' ? true : data.hasTab === 'false' ? false : undefined,
           }

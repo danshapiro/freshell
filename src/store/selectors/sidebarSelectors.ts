@@ -8,6 +8,7 @@ export interface SidebarSessionItem {
   id: string
   sessionId: string
   provider: CodingCliProviderName
+  sessionType: string  // Defaults to provider when not explicitly set
   title: string
   subtitle?: string
   projectPath?: string
@@ -51,7 +52,7 @@ function getProjectName(projectPath: string): string {
   return parts[parts.length - 1] || projectPath
 }
 
-function buildSessionItems(
+export function buildSessionItems(
   projects: RootState['sessions']['projects'],
   tabs: RootState['tabs']['tabs'],
   panes: RootState['panes'],
@@ -110,6 +111,7 @@ function buildSessionItems(
         id: `session-${provider}-${session.sessionId}`,
         sessionId: session.sessionId,
         provider,
+        sessionType: session.sessionType || provider,
         title: session.title || session.sessionId.slice(0, 8),
         hasTitle,
         subtitle: getProjectName(project.projectPath),

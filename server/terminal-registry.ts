@@ -630,12 +630,16 @@ export function buildSpawnSpec(
   // Strip inherited env vars that interfere with child terminal behaviour:
   // - CLAUDECODE: causes child Claude processes to refuse to start ("nested session" error)
   // - CI/NO_COLOR/FORCE_COLOR/COLOR: disables interactive color in user PTYs
+  // - NODE_ENV/npm_lifecycle_script: server's production env leaks into child shells,
+  //   breaking tools like React test-utils that check NODE_ENV
   const {
     CLAUDECODE: _claudecode,
     CI: _ci,
     NO_COLOR: _noColor,
     FORCE_COLOR: _forceColor,
     COLOR: _color,
+    NODE_ENV: _nodeEnv,
+    npm_lifecycle_script: _npmLifecycleScript,
     ...parentEnv
   } = process.env
   const env = {

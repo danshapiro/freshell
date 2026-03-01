@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject } from 'react'
 import { Terminal, Folder, Settings, LayoutGrid, Search, Loader2, X, Archive, PanelLeftClose, AlertCircle } from 'lucide-react'
 import { List, type RowComponentProps } from 'react-window'
 import { cn } from '@/lib/utils'
@@ -9,20 +9,65 @@ import { addPane, setActivePane } from '@/store/panesSlice'
 import { findPaneForSession } from '@/lib/session-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { searchSessions, type SearchResult } from '@/lib/api'
-import { getProviderLabel } from '@/lib/coding-cli-utils'
+import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type-utils'
+import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import type { BackgroundTerminal, CodingCliProviderName } from '@/store/types'
 import { makeSelectKnownSessionKeys, makeSelectSortedSessionItems, type SidebarSessionItem } from '@/store/selectors/sidebarSelectors'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
-import { ProviderIcon } from '@/components/icons/provider-icons'
 import { getActiveSessionRefForTab } from '@/lib/session-utils'
 import { createLogger } from '@/lib/client-logger'
 
 
 const log = createLogger('Sidebar')
 
+/** Compare two BackgroundTerminal arrays by sidebar-relevant fields only.
+ *  Ignores lastActivityAt since it changes frequently but doesn't affect rendering. */
+export function areTerminalsEqual(a: BackgroundTerminal[], b: BackgroundTerminal[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    const ai = a[i], bi = b[i]
+    if (
+      ai.terminalId !== bi.terminalId ||
+      ai.title !== bi.title ||
+      ai.createdAt !== bi.createdAt ||
+      ai.cwd !== bi.cwd ||
+      ai.status !== bi.status ||
+      ai.hasClients !== bi.hasClients ||
+      ai.mode !== bi.mode ||
+      ai.resumeSessionId !== bi.resumeSessionId
+    ) return false
+  }
+  return true
+}
+
 export type AppView = 'terminal' | 'tabs' | 'sessions' | 'overview' | 'settings'
 
 type SessionItem = SidebarSessionItem
+
+/** Compare two SessionItem arrays by sidebar-relevant fields.
+ *  Used by tests to verify render stability guarantees. */
+export function areSessionItemsEqual(a: SessionItem[], b: SessionItem[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    const ai = a[i], bi = b[i]
+    if (
+      ai.sessionId !== bi.sessionId ||
+      ai.provider !== bi.provider ||
+      ai.sessionType !== bi.sessionType ||
+      ai.title !== bi.title ||
+      ai.subtitle !== bi.subtitle ||
+      ai.hasTab !== bi.hasTab ||
+      ai.isRunning !== bi.isRunning ||
+      ai.runningTerminalId !== bi.runningTerminalId ||
+      ai.archived !== bi.archived ||
+      ai.projectColor !== bi.projectColor ||
+      ai.cwd !== bi.cwd ||
+      ai.projectPath !== bi.projectPath ||
+      ai.timestamp !== bi.timestamp
+    ) return false
+  }
+  return true
+}
 
 const SESSION_ITEM_HEIGHT = 56
 const SESSION_LIST_MAX_HEIGHT = 600
@@ -44,6 +89,80 @@ function formatRelativeTime(timestamp: number): string {
 function getProjectName(projectPath: string): string {
   const parts = projectPath.replace(/\\/g, '/').split('/')
   return parts[parts.length - 1] || projectPath
+}
+
+interface SidebarRowProps {
+  items: SessionItem[]
+  activeSessionKey: string | null
+  activeTerminalId: string | undefined
+  showProjectBadge: boolean | undefined
+  onItemClick: (item: SessionItem) => void
+  timestampTick: number
+}
+
+/**
+ * Determine whether a sidebar session item should be highlighted as active.
+ * Prefers activeSessionKey (derived from the active pane's content) when
+ * available. Falls back to activeTerminalId only when no session key exists
+ * (e.g. a fresh terminal not yet associated with a session).
+ * This prevents double-highlighting when activeTerminalId is stale.
+ */
+export function computeIsActive(params: {
+  isRunning: boolean
+  runningTerminalId: string | undefined
+  sessionKey: string
+  activeSessionKey: string | null
+  activeTerminalId: string | undefined
+}): boolean {
+  // When we have a session key from the active pane, use it for all items
+  if (params.activeSessionKey != null) {
+    return params.sessionKey === params.activeSessionKey
+  }
+  // No session key available — fall back to terminal ID matching for running sessions
+  if (params.isRunning) {
+    return params.runningTerminalId === params.activeTerminalId
+  }
+  return false
+}
+
+/** Row component defined at module scope for stable identity — prevents react-window
+ *  from unmounting/remounting all visible rows on every parent re-render. */
+export const SidebarRow = ({ index, style, ariaAttributes, ...data }: RowComponentProps<SidebarRowProps>) => {
+  const item = data.items[index]
+  const sessionKey = `${item.provider}:${item.sessionId}`
+  const isActive = computeIsActive({
+    isRunning: item.isRunning,
+    runningTerminalId: item.runningTerminalId,
+    sessionKey,
+    activeSessionKey: data.activeSessionKey,
+    activeTerminalId: data.activeTerminalId,
+  })
+
+  // Stable click handler: store latest callback + item in a ref so the
+  // onClick function identity never changes, but always invokes current data.
+  // This avoids breaking SidebarItem's React.memo on every parent re-render.
+  const callbackRef = useRef({ onItemClick: data.onItemClick, item })
+  callbackRef.current = { onItemClick: data.onItemClick, item }
+  const onClick = useStableCallback(callbackRef)
+
+  return (
+    <div style={{ ...style, paddingBottom: 2 }} {...ariaAttributes}>
+      <SidebarItem
+        item={item}
+        isActiveTab={isActive}
+        showProjectBadge={data.showProjectBadge}
+        onClick={onClick}
+        timestampTick={data.timestampTick}
+      />
+    </div>
+  )
+}
+
+/** Returns a stable function that always calls the latest onItemClick(item) from the ref. */
+function useStableCallback(
+  ref: MutableRefObject<{ onItemClick: (item: SessionItem) => void; item: SessionItem }>
+) {
+  return useCallback(() => ref.current.onItemClick(ref.current.item), [ref])
 }
 
 export default function Sidebar({
@@ -80,6 +199,10 @@ export default function Sidebar({
     return `${ref.provider}:${ref.sessionId}`
   })
   const selectSortedItems = useMemo(() => makeSelectSortedSessionItems(), [])
+  // Separate selector instance for allItems: createSelector caches only one
+  // result, so calling the same instance with different filter args would thrash
+  // the cache and cause both to recompute on every render during search.
+  const selectAllItems = useMemo(() => makeSelectSortedSessionItems(), [])
   const selectKnownSessionKeys = useMemo(() => makeSelectKnownSessionKeys(), [])
 
   const ws = useMemo(() => getWsClient(), [])
@@ -91,6 +214,15 @@ export default function Sidebar({
   const requestIdRef = useRef<string | null>(null)
   const listContainerRef = useRef<HTMLDivElement | null>(null)
   const [listHeight, setListHeight] = useState(0)
+
+  // Tick counter that increments every 15s to keep relative timestamps fresh.
+  // The custom comparator on SidebarItem ensures only the timestamp text node
+  // updates — no DOM flicker despite the frequent ticks.
+  const [timestampTick, setTimestampTick] = useState(0)
+  useEffect(() => {
+    const id = window.setInterval(() => setTimestampTick((t) => t + 1), 15_000)
+    return () => window.clearInterval(id)
+  }, [])
 
   // Fetch background terminals
   const refresh = useCallback(() => {
@@ -105,7 +237,13 @@ export default function Sidebar({
     // Register message handler BEFORE calling refresh to avoid race condition
     const unsub = ws.onMessage((msg) => {
       if (msg.type === 'terminal.list.response' && msg.requestId === requestIdRef.current) {
-        setTerminals(msg.terminals || [])
+        const incoming = msg.terminals || []
+        // Only update state when terminal data has actually changed to avoid
+        // unnecessary re-renders that cause the sidebar list to blink/flash.
+        setTerminals((prev) => {
+          if (areTerminalsEqual(prev, incoming)) return prev
+          return incoming
+        })
       }
       if (['terminal.detached', 'terminal.attach.ready', 'terminal.exit', 'terminal.list.updated'].includes(msg.type)) {
         refresh()
@@ -160,7 +298,7 @@ export default function Sidebar({
 
   // Build session list with selector for local filtering (title tier)
   const localFilteredItems = useAppSelector((state) => selectSortedItems(state, terminals, filter))
-  const allItems = useAppSelector((state) => selectSortedItems(state, terminals, ''))
+  const allItems = useAppSelector((state) => selectAllItems(state, terminals, ''))
   const knownSessionKeys = useAppSelector((state) => selectKnownSessionKeys(state))
   const itemsByKey = useMemo(() => {
     const map = new Map<string, SidebarSessionItem>()
@@ -171,7 +309,7 @@ export default function Sidebar({
   }, [allItems])
 
   // Combine local and backend search results
-  const sortedItems = useMemo(() => {
+  const computedItems = useMemo(() => {
     // If we have backend search results, convert them to SessionItems
     if (searchResults !== null) {
       const items: SessionItem[] = []
@@ -186,6 +324,7 @@ export default function Sidebar({
             id: `search-${provider}-${result.sessionId}`,
             sessionId: result.sessionId,
             provider,
+            sessionType: provider,
             title: result.title || result.sessionId.slice(0, 8),
             hasTitle: !!result.title,
             subtitle: getProjectName(result.projectPath),
@@ -202,6 +341,7 @@ export default function Sidebar({
           id: `search-${provider}-${result.sessionId}`,
           sessionId: result.sessionId,
           provider,
+          sessionType: existing.sessionType,
           title: result.title || existing.title || result.sessionId.slice(0, 8),
           hasTitle: !!(result.title || existing.hasTitle),
           subtitle: getProjectName(result.projectPath),
@@ -226,6 +366,13 @@ export default function Sidebar({
     return localFilteredItems
   }, [itemsByKey, knownSessionKeys, localFilteredItems, searchResults])
 
+  // Pass computedItems directly to the list.  SidebarItem's React.memo
+  // comparator already prevents DOM updates for unchanged rows, so
+  // stabilizing the array reference here is unnecessary and was blocking
+  // timestamp updates from reaching the UI.  The chunked buffer in App.tsx
+  // prevents the sidebar from collapsing during full session reloads.
+  const sortedItems = computedItems
+
   useEffect(() => {
     const container = listContainerRef.current
     if (!container) return
@@ -233,7 +380,7 @@ export default function Sidebar({
     const updateHeight = () => {
       const nextHeight = container.clientHeight
       if (nextHeight > 0) {
-        setListHeight(nextHeight)
+        setListHeight(() => nextHeight)
       }
     }
 
@@ -245,9 +392,13 @@ export default function Sidebar({
     return () => ro.disconnect()
   }, [])
 
+  // Read activeTabId from the store at call time (not closure) so that
+  // handleItemClick has a stable reference and doesn't cause SidebarItem
+  // re-renders when the active tab changes.
   const handleItemClick = useCallback((item: SessionItem) => {
     const provider = item.provider as CodingCliProviderName
     const state = store.getState()
+    const currentActiveTabId = state.tabs.activeTabId
     const runningTerminalId = item.isRunning ? item.runningTerminalId : undefined
 
     // 1. Dedup: if session is already open in a pane, focus it
@@ -261,14 +412,22 @@ export default function Sidebar({
       return
     }
 
+    // Resolve provider settings for agent-chat panes
+    const sessionType = item.sessionType || provider
+    const agentConfig = getAgentChatProviderConfig(sessionType)
+    const providerSettings = agentConfig
+      ? state.settings.settings.agentChat?.providers?.[agentConfig.name]
+      : undefined
+
     // 2. Fallback: no active tab or active tab has no layout → create new tab
-    const activeLayout = activeTabId ? state.panes.layouts[activeTabId] : undefined
-    if (!activeTabId || !activeLayout) {
+    const activeLayout = currentActiveTabId ? state.panes.layouts[currentActiveTabId] : undefined
+    if (!currentActiveTabId || !activeLayout) {
       dispatch(openSessionTab({
         sessionId: item.sessionId,
         title: item.title,
         cwd: item.cwd,
         provider,
+        sessionType,
         terminalId: runningTerminalId,
       }))
       onNavigate('terminal')
@@ -277,18 +436,17 @@ export default function Sidebar({
 
     // 3. Normal: split a new pane in the current tab
     dispatch(addPane({
-      tabId: activeTabId,
-      newContent: {
-        kind: 'terminal',
-        mode: provider,
-        resumeSessionId: item.sessionId,
-        initialCwd: item.cwd,
+      tabId: currentActiveTabId,
+      newContent: buildResumeContent({
+        sessionType,
+        sessionId: item.sessionId,
+        cwd: item.cwd,
         terminalId: runningTerminalId,
-        status: runningTerminalId ? 'running' : 'creating',
-      },
+        agentChatProviderSettings: providerSettings,
+      }),
     }))
     onNavigate('terminal')
-  }, [dispatch, onNavigate, activeTabId, store])
+  }, [dispatch, onNavigate, store])
 
   const nav = [
     { id: 'terminal' as const, label: 'Coding Agents', icon: Terminal, shortcut: 'T' },
@@ -305,30 +463,14 @@ export default function Sidebar({
     ? listHeight
     : Math.min(sortedItems.length * SESSION_ITEM_HEIGHT, SESSION_LIST_MAX_HEIGHT)
 
-  const rowProps = useMemo(() => ({
+  const rowProps: SidebarRowProps = useMemo(() => ({
     items: sortedItems,
     activeSessionKey,
     activeTerminalId,
     showProjectBadge: settings.sidebar?.showProjectBadges,
     onItemClick: handleItemClick,
-  }), [sortedItems, activeSessionKey, activeTerminalId, settings.sidebar?.showProjectBadges, handleItemClick])
-
-  const Row = ({ index, style, ariaAttributes, ...data }: RowComponentProps<typeof rowProps>) => {
-    const item = data.items[index]
-    const isActive = item.isRunning
-      ? item.runningTerminalId === data.activeTerminalId
-      : `${item.provider}:${item.sessionId}` === data.activeSessionKey
-    return (
-      <div style={{ ...style, paddingBottom: 2 }} {...ariaAttributes}>
-        <SidebarItem
-          item={item}
-          isActiveTab={isActive}
-          showProjectBadge={data.showProjectBadge}
-          onClick={() => data.onItemClick(item)}
-        />
-      </div>
-    )
-  }
+    timestampTick,
+  }), [sortedItems, activeSessionKey, activeTerminalId, settings.sidebar?.showProjectBadges, handleItemClick, timestampTick])
 
   return (
     <div
@@ -472,7 +614,7 @@ export default function Sidebar({
             defaultHeight={effectiveListHeight}
             rowCount={sortedItems.length}
             rowHeight={SESSION_ITEM_HEIGHT}
-            rowComponent={Row}
+            rowComponent={SidebarRow}
             rowProps={rowProps}
             className="overflow-y-auto"
             style={{ height: effectiveListHeight, width: '100%' }}
@@ -484,17 +626,45 @@ export default function Sidebar({
   )
 }
 
-function SidebarItem({
-  item,
-  isActiveTab,
-  showProjectBadge,
-  onClick,
-}: {
+interface SidebarItemProps {
   item: SessionItem
   isActiveTab?: boolean
   showProjectBadge?: boolean
   onClick: () => void
-}) {
+  /** Changing tick value breaks memo equality to refresh relative timestamps. */
+  timestampTick?: number
+}
+
+/** Custom comparator for React.memo: compares item fields by value instead of
+ *  reference. Ignores `onClick` because: (1) handleItemClick is stable (reads
+ *  activeTabId from store at call time), and (2) all item fields used by the
+ *  click handler are compared here (sessionId, provider, title, cwd, etc.). */
+function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps): boolean {
+  if (prev.isActiveTab !== next.isActiveTab) return false
+  if (prev.showProjectBadge !== next.showProjectBadge) return false
+  if (prev.timestampTick !== next.timestampTick) return false
+
+  const a = prev.item, b = next.item
+  return (
+    a.sessionId === b.sessionId &&
+    a.provider === b.provider &&
+    a.sessionType === b.sessionType &&
+    a.title === b.title &&
+    a.subtitle === b.subtitle &&
+    a.timestamp === b.timestamp &&
+    a.hasTab === b.hasTab &&
+    a.isRunning === b.isRunning &&
+    a.runningTerminalId === b.runningTerminalId &&
+    a.archived === b.archived &&
+    a.projectColor === b.projectColor &&
+    a.cwd === b.cwd &&
+    a.projectPath === b.projectPath
+  )
+}
+
+export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
+  const { item, isActiveTab, showProjectBadge, onClick } = props
+  const { icon: SessionIcon, label: sessionLabel } = resolveSessionTypeConfig(item.sessionType)
   return (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -509,14 +679,14 @@ function SidebarItem({
           data-context={ContextIds.SidebarSession}
           data-session-id={item.sessionId}
           data-provider={item.provider}
+          data-session-type={item.sessionType}
           data-running-terminal-id={item.runningTerminalId}
           data-has-tab={item.hasTab ? 'true' : 'false'}
         >
           {/* Provider icon */}
           <div className="flex-shrink-0">
             <div className={cn('relative', item.hasTab && 'animate-pulse-subtle')}>
-              <ProviderIcon
-                provider={item.provider}
+              <SessionIcon
                 className={cn(
                   'h-3.5 w-3.5',
                   item.hasTab ? 'text-success' : 'text-muted-foreground'
@@ -554,9 +724,9 @@ function SidebarItem({
         </button>
       </TooltipTrigger>
       <TooltipContent>
-        <div>{getProviderLabel(item.provider)}: {item.title}</div>
-        <div className="text-muted-foreground">{item.subtitle || item.projectPath || getProviderLabel(item.provider)}</div>
+        <div>{sessionLabel}: {item.title}</div>
+        <div className="text-muted-foreground">{item.subtitle || item.projectPath || sessionLabel}</div>
       </TooltipContent>
     </Tooltip>
   )
-}
+}, areSidebarItemPropsEqual)

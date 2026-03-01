@@ -53,6 +53,7 @@ import { LayoutStore } from './agent-api/layout-store.js'
 import { createAgentApiRouter } from './agent-api/router.js'
 import { ExtensionManager } from './extension-manager.js'
 import { createExtensionRouter } from './extension-routes.js'
+import { SessionMetadataStore } from './session-metadata-store.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -125,7 +126,9 @@ async function main() {
   app.use('/api', createClientLogsRouter())
 
   const codingCliProviders = [claudeProvider, codexProvider]
-  const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders)
+  const freshellConfigDir = path.join(os.homedir(), '.freshell')
+  const sessionMetadataStore = new SessionMetadataStore(freshellConfigDir)
+  const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders, {}, sessionMetadataStore)
   const codingCliSessionManager = new CodingCliSessionManager(codingCliProviders)
   const tabsRegistryStore = createTabsRegistryStore()
 
@@ -275,6 +278,7 @@ async function main() {
     terminalMetadata,
     registry,
     wsHandler,
+    sessionMetadataStore,
   }))
 
   app.use('/api', createProjectColorsRouter({ configStore, codingCliIndexer }))

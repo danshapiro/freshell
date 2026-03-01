@@ -53,6 +53,7 @@ export interface BackgroundTerminal {
 
 export interface CodingCliSession {
   provider: CodingCliProviderName
+  sessionType?: string
   sessionId: string
   projectPath: string
   createdAt?: number
@@ -174,6 +175,7 @@ export interface AppSettings {
     customEditorCommand?: string
   }
   agentChat?: {
+    initialSetupDone?: boolean
     providers?: Partial<Record<AgentChatProviderName, {
       defaultModel?: string
       defaultPermissionMode?: string

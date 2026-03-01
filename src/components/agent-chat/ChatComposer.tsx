@@ -12,15 +12,33 @@ interface ChatComposerProps {
   disabled?: boolean
   isRunning?: boolean
   placeholder?: string
+  autoFocus?: boolean
 }
 
-const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function ChatComposer({ onSend, onInterrupt, disabled, isRunning, placeholder }, ref) {
+const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function ChatComposer({ onSend, onInterrupt, disabled, isRunning, placeholder, autoFocus }, ref) {
   const [text, setText] = useState('')
-  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null)
 
   useImperativeHandle(ref, () => ({
     focus: () => textareaRef.current?.focus(),
   }), [])
+
+  // Focus textarea when it's attached to the DOM and autoFocus is requested.
+  // Uses a ref callback + double requestAnimationFrame to ensure the element
+  // is visible and painted before calling focus(). This is more reliable than
+  // setTimeout or the HTML autoFocus attribute for dynamically mounted components.
+  const autoFocusRef = useRef(autoFocus)
+  const textareaCallbackRef = useCallback((node: HTMLTextAreaElement | null) => {
+    textareaRef.current = node
+    if (node && autoFocusRef.current) {
+      autoFocusRef.current = false // only focus once
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          node.focus()
+        })
+      })
+    }
+  }, [])
 
   const handleSend = useCallback(() => {
     const trimmed = text.trim()
@@ -55,7 +73,7 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
     <div className="border-t p-3">
       <div className="flex items-end gap-2">
         <textarea
-          ref={textareaRef}
+          ref={textareaCallbackRef}
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={handleKeyDown}

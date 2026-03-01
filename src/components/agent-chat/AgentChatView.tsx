@@ -16,7 +16,8 @@ import ThinkingIndicator from './ThinkingIndicator'
 import { useStreamDebounce } from './useStreamDebounce'
 import CollapsedTurn from './CollapsedTurn'
 import type { ChatMessage, ChatSessionState } from '@/store/agentChatTypes'
-import { api } from '@/lib/api'
+import { api, setSessionMetadata } from '@/lib/api'
+import { updateSettingsLocal } from '@/store/settingsSlice'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 
 interface AgentChatViewProps {
@@ -59,6 +60,8 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     (s) => sessionId ? s.agentChat.sessions[sessionId] : undefined,
   )
   const availableModels = useAppSelector((s) => s.agentChat.availableModels)
+  const settingsLoaded = useAppSelector((s) => s.settings.loaded)
+  const initialSetupDone = useAppSelector((s) => s.settings.settings.agentChat?.initialSetupDone ?? false)
 
   // Track whether we're waiting for a session restore (persisted sessionId, history not yet loaded).
   // Fresh creates set historyLoaded=true immediately; reloads wait for sdk.history.
@@ -121,13 +124,34 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const cliSessionId = session?.cliSessionId
   useEffect(() => {
     if (!cliSessionId) return
-    if (paneContentRef.current.resumeSessionId === cliSessionId) return
-    dispatch(updatePaneContent({
-      tabId,
-      paneId,
-      content: { ...paneContentRef.current, resumeSessionId: cliSessionId },
-    }))
+    if (paneContentRef.current.resumeSessionId !== cliSessionId) {
+      dispatch(updatePaneContent({
+        tabId,
+        paneId,
+        content: { ...paneContentRef.current, resumeSessionId: cliSessionId },
+      }))
+    }
   }, [cliSessionId, tabId, paneId, dispatch])
+
+  // Tag this Claude Code session as belonging to this agent-chat provider.
+  // Fires once when cliSessionId first becomes available (including resumes).
+  // Best-effort: errors are logged but do not block the UI.
+  const taggedSessionRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!cliSessionId) return
+    if (taggedSessionRef.current === cliSessionId) return
+    taggedSessionRef.current = cliSessionId
+
+    if (providerConfig?.codingCliProvider) {
+      setSessionMetadata(
+        providerConfig.codingCliProvider,
+        cliSessionId,
+        paneContent.provider,
+      ).catch((err) => {
+        console.warn('Failed to tag session metadata:', err)
+      })
+    }
+  }, [cliSessionId, providerConfig?.codingCliProvider, paneContent.provider])
 
   // Reset createSentRef when createRequestId changes
   const prevCreateRequestIdRef = useRef(paneContent.createRequestId)
@@ -295,7 +319,32 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
       paneId,
       content: { ...paneContentRef.current, settingsDismissed: true },
     }))
+    // Persist globally so future panes skip the settings panel.
+    // Update Redux optimistically so immediately-opened panes reflect the change.
+    dispatch(updateSettingsLocal({ agentChat: { initialSetupDone: true } }))
+    void api.patch('/api/settings', { agentChat: { initialSetupDone: true } }).catch(() => {})
+    composerRef.current?.focus()
   }, [tabId, paneId, dispatch])
+
+  // Settings should only auto-open on the very first launch ever.
+  // Once dismissed on any pane (global flag) or this pane, skip it.
+  // When relying on the global initialSetupDone flag, wait for settings
+  // to load to avoid a flash for returning users. Fall back to showing
+  // settings if the load takes too long (e.g. API failure).
+  const [settingsLoadTimedOut, setSettingsLoadTimedOut] = useState(false)
+  useEffect(() => {
+    if (settingsLoaded || paneContent.settingsDismissed) return
+    const timer = setTimeout(() => setSettingsLoadTimedOut(true), 2_000)
+    return () => clearTimeout(timer)
+  }, [settingsLoaded, paneContent.settingsDismissed])
+
+  const shouldShowSettings = !paneContent.settingsDismissed
+    && !initialSetupDone
+    && (settingsLoaded || settingsLoadTimedOut)
+
+  // Auto-focus is handled by the ChatComposer's autoFocus prop below.
+  // When settings are dismissed, focus imperatively via the dismiss callback.
+
 
   // Effort is locked once sdk.create has been sent (no mid-session setter in SDK).
   // Model and permission mode can be changed mid-session via sdk.set-model / sdk.set-permission-mode.
@@ -400,7 +449,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
             showTools={paneContent.showTools ?? defaultShowTools}
             showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
             sessionStarted={sessionStarted}
-            defaultOpen={!paneContent.settingsDismissed}
+            defaultOpen={shouldShowSettings}
             modelOptions={availableModels.length > 0 ? availableModels : undefined}
             settingsVisibility={providerConfig?.settingsVisibility}
             onChange={handleSettingsChange}
@@ -569,6 +618,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         onInterrupt={handleInterrupt}
         disabled={!isInteractive && !isRunning}
         isRunning={isRunning}
+        autoFocus={!shouldShowSettings}
         placeholder={
           hasWaitingItems
             ? 'Waiting for answer...'

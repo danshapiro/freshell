@@ -65,6 +65,13 @@ function normalizeContent(input: PaneContentInput): PaneContent {
       resumeSessionId: input.resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
       initialCwd: input.initialCwd,
+      model: input.model,
+      permissionMode: input.permissionMode,
+      effort: input.effort,
+      showThinking: input.showThinking,
+      showTools: input.showTools,
+      showTimecodes: input.showTimecodes,
+      settingsDismissed: input.settingsDismissed,
     }
   }
   if (input.kind === 'extension') {

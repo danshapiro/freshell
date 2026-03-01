@@ -14,6 +14,8 @@ import { collectSessionRefsFromNode } from '@/lib/session-utils'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { getBrowserActions, getEditorActions, getTerminalActions } from '@/lib/pane-action-registry'
 import { buildResumeCommand, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
+import { buildResumeContent } from '@/lib/session-type-utils'
+import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { AppView } from '@/components/Sidebar'
 import type { CodingCliProviderName } from '@/store/types'
@@ -87,6 +89,7 @@ export function ContextMenuProvider({
   const sessions = useAppSelector((s) => s.sessions.projects)
   const expandedProjects = useAppSelector((s) => s.sessions.expandedProjects)
   const platform = useAppSelector((s) => s.connection?.platform ?? null)
+  const appSettings = useAppSelector((s) => s.settings.settings)
 
   const [menuState, setMenuState] = useState<MenuState | null>(null)
   const [confirmState, setConfirmState] = useState<ConfirmState | null>(null)
@@ -274,15 +277,19 @@ export function ContextMenuProvider({
     if (!info) return
     const { session } = info
     const mode = (provider || session.provider || 'claude') as CodingCliProviderName
+    const target = menuState?.target
+    const sessionType = (target?.kind === 'sidebar-session' ? target.sessionType : undefined)
+      || session.sessionType || mode
     const runningTerminalId =
-      menuState?.target.kind === 'sidebar-session' && menuState?.target.sessionId === sessionId
-        ? menuState?.target.runningTerminalId
+      target?.kind === 'sidebar-session' && target.sessionId === sessionId
+        ? target.runningTerminalId
         : undefined
     dispatch(openSessionTab({
       sessionId: session.sessionId,
       title: session.title || session.sessionId.slice(0, 8),
       cwd: session.cwd,
       provider: mode,
+      sessionType,
       terminalId: runningTerminalId,
       forceNew: true,
     }))
@@ -298,22 +305,28 @@ export function ContextMenuProvider({
     if (!info) return
     const { session } = info
     const mode = (provider || session.provider || 'claude') as CodingCliProviderName
+    const target = menuState?.target
+    const sessionType = (target?.kind === 'sidebar-session' ? target.sessionType : undefined)
+      || session.sessionType || mode
     const runningTerminalId =
-      menuState?.target.kind === 'sidebar-session' && menuState?.target.sessionId === sessionId
-        ? menuState?.target.runningTerminalId
+      target?.kind === 'sidebar-session' && target.sessionId === sessionId
+        ? target.runningTerminalId
         : undefined
+    const agentConfig = getAgentChatProviderConfig(sessionType)
+    const providerSettings = agentConfig
+      ? appSettings.agentChat?.providers?.[agentConfig.name]
+      : undefined
     dispatch(addPane({
       tabId: activeTabId,
-      newContent: {
-        kind: 'terminal',
-        mode,
-        resumeSessionId: session.sessionId,
-        initialCwd: session.cwd,
+      newContent: buildResumeContent({
+        sessionType,
+        sessionId: session.sessionId,
+        cwd: session.cwd,
         terminalId: runningTerminalId || undefined,
-        status: runningTerminalId ? 'running' : 'creating',
-      },
+        agentChatProviderSettings: providerSettings,
+      }),
     }))
-  }, [tabsState.activeTabId, dispatch, getSessionInfo, openSessionInNewTab, menuState?.target])
+  }, [tabsState.activeTabId, dispatch, getSessionInfo, openSessionInNewTab, menuState?.target, appSettings])
 
   const renameSession = useCallback(async (sessionId: string, provider?: string, withSummary?: boolean) => {
     const info = getSessionInfo(sessionId, provider)

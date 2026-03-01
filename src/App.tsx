@@ -4,7 +4,6 @@ import { setStatus, setError, setErrorCode, setServerInstanceId, setPlatform, se
 import { setSettings } from '@/store/settingsSlice'
 import {
   setProjects,
-  clearProjects,
   mergeProjects,
   applySessionsPatch,
   markWsSnapshotReceived,
@@ -331,6 +330,39 @@ export default function App() {
     let cleanedUp = false
     let cleanup: (() => void) | null = null
     let stopTabRegistrySync: (() => void) | null = null
+
+    // Buffer for chunked sessions.updated messages — we accumulate all chunks
+    // and apply them atomically to avoid the sidebar collapsing and rebuilding
+    // (scrollbar "blink") during incremental chunked delivery.
+    //
+    // The debounce timer fires 300ms after the LAST chunk.  Server inter-chunk
+    // delays are normally sub-millisecond (setImmediate yield); the only source
+    // of longer gaps is WebSocket drain backpressure.  300ms is generous enough
+    // for all practical scenarios.  If the timer fires with a partial buffer
+    // (extreme backpressure), setProjects replaces the sidebar briefly; any
+    // late-arriving append chunks merge gracefully via the fallback path.
+    let chunkedBuffer: ProjectGroup[] | null = null
+    let chunkedFlushTimer: ReturnType<typeof setTimeout> | null = null
+    const CHUNK_FLUSH_DELAY_MS = 300
+
+    function clearChunkedState() {
+      if (chunkedFlushTimer) { clearTimeout(chunkedFlushTimer); chunkedFlushTimer = null }
+      chunkedBuffer = null
+    }
+
+    function flushChunkedBuffer() {
+      if (chunkedFlushTimer) { clearTimeout(chunkedFlushTimer); chunkedFlushTimer = null }
+      if (chunkedBuffer) {
+        dispatch(setProjects(chunkedBuffer))
+        dispatch(markWsSnapshotReceived())
+        chunkedBuffer = null
+      }
+    }
+
+    function scheduleChunkedFlush() {
+      if (chunkedFlushTimer) clearTimeout(chunkedFlushTimer)
+      chunkedFlushTimer = setTimeout(flushChunkedBuffer, CHUNK_FLUSH_DELAY_MS)
+    }
     async function bootstrap() {
       const handleBootstrapAuthFailure = (err: unknown): boolean => {
         if (!isApiUnauthorizedError(err)) return false
@@ -389,30 +421,45 @@ export default function App() {
           dispatch(setStatus('ready'))
           dispatch(setServerInstanceId(ready.success ? ready.data.serverInstanceId : undefined))
           dispatch(resetWsSnapshotReceived())
+          // Discard any in-flight chunked buffer from a previous connection
+          // to prevent stale data from overwriting the new session snapshot.
+          clearChunkedState()
           // If App registered late and missed a prior snapshot, a fresh HTTP baseline
           // from this bootstrap cycle is still safe for enabling patch application.
           promoteRecentHttpSessionsBaseline()
           requestTerminalMetaList()
         }
         if (msg.type === 'sessions.updated') {
-          // Support chunked sessions for mobile browsers with limited WebSocket buffers
           const projects = (msg.projects || []) as ProjectGroup[]
           if (msg.clear) {
-            // First chunk: clear existing, then merge
-            dispatch(clearProjects())
-            dispatch(mergeProjects(projects))
+            // First chunk of a multi-chunk update: start buffering instead of
+            // clearing Redux state (which causes the sidebar to collapse).
+            chunkedBuffer = [...projects]
+            scheduleChunkedFlush()
           } else if (msg.append) {
-            // Subsequent chunks: merge with existing
-            dispatch(mergeProjects(projects))
+            if (chunkedBuffer) {
+              // Subsequent chunk while buffering: accumulate
+              chunkedBuffer.push(...projects)
+              scheduleChunkedFlush()
+            } else {
+              // Append without a prior clear (shouldn't happen, but handle gracefully)
+              dispatch(mergeProjects(projects))
+              dispatch(markWsSnapshotReceived())
+            }
           } else {
-            // Full update (broadcasts, legacy): replace all
+            // Single-chunk update (no clear/append flags): apply immediately
+            if (chunkedBuffer) flushChunkedBuffer()
             dispatch(setProjects(projects))
+            dispatch(markWsSnapshotReceived())
           }
-          dispatch(markWsSnapshotReceived())
         }
         if (msg.type === 'sessions.patch') {
+          // If a patch arrives while we're buffering a chunked update, flush
+          // the buffer first so the patch applies against a complete baseline.
+          if (chunkedBuffer) flushChunkedBuffer()
+          const upsertProjects = (msg.upsertProjects || []) as ProjectGroup[]
           dispatch(applySessionsPatch({
-            upsertProjects: (msg.upsertProjects || []) as ProjectGroup[],
+            upsertProjects,
             removeProjectPaths: msg.removeProjectPaths || [],
           }))
         }
@@ -495,6 +542,7 @@ export default function App() {
 
       cleanup = () => {
         unsubscribe()
+        clearChunkedState()
       }
       if (cleanedUp) cleanup()
 
