@@ -102,7 +102,7 @@ export function DefaultProviderIcon(props: IconProps) {
   )
 }
 
-const PROVIDER_ICONS: Record<CodingCliProviderName, React.ComponentType<IconProps>> = {
+export const PROVIDER_ICONS: Record<CodingCliProviderName, React.ComponentType<IconProps>> = {
   claude: ClaudeIcon,
   codex: CodexIcon,
   kimi: KimiIcon,
