@@ -4,6 +4,7 @@ import { setupWslPortForwarding } from './wsl-port-forward.js'
 import express from 'express'
 import fs from 'fs'
 import http from 'http'
+import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import rateLimit from 'express-rate-limit'
@@ -50,6 +51,8 @@ import { createAiRouter } from './ai-router.js'
 import { createDebugRouter } from './debug-router.js'
 import { LayoutStore } from './agent-api/layout-store.js'
 import { createAgentApiRouter } from './agent-api/router.js'
+import { ExtensionManager } from './extension-manager.js'
+import { createExtensionRouter } from './extension-routes.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -135,6 +138,11 @@ async function main() {
   const serverInstanceId = await loadOrCreateServerInstanceId()
 
   const sdkBridge = new SdkBridge()
+
+  const extensionManager = new ExtensionManager()
+  const userExtDir = path.join(os.homedir(), '.freshell', 'extensions')
+  const localExtDir = path.join(process.cwd(), '.freshell', 'extensions')
+  extensionManager.scan([userExtDir, localExtDir])
 
   const server = http.createServer(app)
   const wsHandler = new WsHandler(
@@ -288,6 +296,9 @@ async function main() {
     tabsRegistryStore,
     registry,
   }))
+
+  // --- API: extensions ---
+  app.use('/api/extensions', createExtensionRouter(extensionManager))
 
   // --- API: port forwarding (for browser pane remote access) ---
   const portForwardManager = new PortForwardManager()
@@ -560,6 +571,9 @@ async function main() {
 
     // 5. Close SDK bridge sessions
     sdkBridge.close()
+
+    // 5b. Stop extension servers
+    await extensionManager.stopAll()
 
     // 6. Stop NetworkManager
     await networkManager.stop()

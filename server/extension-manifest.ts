@@ -82,7 +82,7 @@ export const ExtensionManifestSchema = z.strictObject({
     const present = Object.entries(blocks).filter(([, v]) => v !== undefined).map(([k]) => k)
     return present.length === 1 && present[0] === m.category
   },
-  (m) => ({ message: `category '${m.category}' requires exactly its own '${m.category}' config block (no others)` }),
+  { message: 'category must have exactly its own config block (no others)' },
 )
 
 // ──────────────────────────────────────────────────────────────
