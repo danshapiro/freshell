@@ -628,5 +628,13 @@ function renderContent(tabId: string, paneId: string, content: PaneContent, isOn
     )
   }
 
+  if (content.kind === 'extension') {
+    return (
+      <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
+        Extension: {content.extensionName}
+      </div>
+    )
+  }
+
   return null
 }

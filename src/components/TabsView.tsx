@@ -122,6 +122,13 @@ function sanitizePaneSnapshot(
       effort: payload.effort as 'low' | 'medium' | 'high' | 'max' | undefined,
     }
   }
+  if (snapshot.kind === 'extension') {
+    return {
+      kind: 'extension',
+      extensionName: (payload.extensionName as string) || 'unknown',
+      props: (payload.props as Record<string, unknown>) || {},
+    }
+  }
   return { kind: 'picker' }
 }
 

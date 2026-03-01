@@ -103,9 +103,19 @@ export type AgentChatPaneContent = {
 }
 
 /**
+ * Extension pane content — generic catch-all for extension-system panes.
+ */
+export type ExtensionPaneContent = {
+  kind: 'extension'
+  extensionName: string
+  props: Record<string, unknown>
+}
+
+/**
  * Union type for all pane content types.
  */
-export type PaneContent = TerminalPaneContent | BrowserPaneContent | EditorPaneContent | PickerPaneContent | AgentChatPaneContent
+export type PaneContent = TerminalPaneContent | BrowserPaneContent | EditorPaneContent
+  | PickerPaneContent | AgentChatPaneContent | ExtensionPaneContent
 
 /**
  * Input type for creating terminal panes.
@@ -135,7 +145,14 @@ export type AgentChatPaneInput = Omit<AgentChatPaneContent, 'createRequestId' | 
   status?: SdkSessionStatus
 }
 
-export type PaneContentInput = TerminalPaneInput | BrowserPaneContent | EditorPaneInput | PickerPaneContent | AgentChatPaneInput
+/**
+ * Input type for extension panes.
+ * Extension content needs no normalization — passes through unchanged.
+ */
+export type ExtensionPaneInput = ExtensionPaneContent
+
+export type PaneContentInput = TerminalPaneInput | BrowserPaneContent | EditorPaneInput
+  | PickerPaneContent | AgentChatPaneInput | ExtensionPaneInput
 
 /**
  * Recursive tree structure for pane layouts.

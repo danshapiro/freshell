@@ -67,6 +67,9 @@ function normalizeContent(input: PaneContentInput): PaneContent {
       initialCwd: input.initialCwd,
     }
   }
+  if (input.kind === 'extension') {
+    return input  // Extension content passes through unchanged
+  }
   // Browser/editor/picker content passes through unchanged
   return input
 }

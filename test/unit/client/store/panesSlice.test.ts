@@ -19,7 +19,7 @@ import panesReducer, {
   toggleZoom,
   PanesState,
 } from '../../../../src/store/panesSlice'
-import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent, EditorPaneContent } from '../../../../src/store/paneTypes'
+import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent, EditorPaneContent, ExtensionPaneContent } from '../../../../src/store/paneTypes'
 
 const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 
@@ -1914,6 +1914,45 @@ describe('panesSlice', () => {
         viewMode: 'preview',
       }
       expect(editor.kind).toBe('editor')
+    })
+  })
+
+  describe('ExtensionPaneContent type', () => {
+    it('can be created with required fields', () => {
+      const content: ExtensionPaneContent = {
+        kind: 'extension',
+        extensionName: 'my-widget',
+        props: { foo: 'bar', count: 42 },
+      }
+      expect(content.kind).toBe('extension')
+      expect(content.extensionName).toBe('my-widget')
+      expect(content.props).toEqual({ foo: 'bar', count: 42 })
+    })
+
+    it('is part of PaneContent union', () => {
+      const ext: PaneContent = {
+        kind: 'extension',
+        extensionName: 'some-ext',
+        props: {},
+      }
+      expect(ext.kind).toBe('extension')
+    })
+
+    it('passes through normalizeContent unchanged via initLayout', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-ext',
+          content: { kind: 'extension', extensionName: 'my-ext', props: { key: 'value' } },
+        })
+      )
+
+      const leaf = state.layouts['tab-ext'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content).toEqual({
+        kind: 'extension',
+        extensionName: 'my-ext',
+        props: { key: 'value' },
+      })
     })
   })
 
