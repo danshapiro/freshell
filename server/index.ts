@@ -181,6 +181,9 @@ async function main() {
   app.use('/api', createAgentApiRouter({ layoutStore, registry, wsHandler }))
 
   // --- Extension lifecycle broadcasts ---
+  extensionManager.on('server.starting', ({ name }: { name: string }) => {
+    wsHandler.broadcast({ type: 'extension.server.starting', name })
+  })
   extensionManager.on('server.ready', ({ name, port: extPort }: { name: string; port: number }) => {
     wsHandler.broadcast({ type: 'extension.server.ready', name, port: extPort })
   })

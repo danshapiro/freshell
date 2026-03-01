@@ -420,6 +420,19 @@ process.on('SIGTERM', () => { server.close(); process.exit(0) })
   // ── EventEmitter lifecycle events ──
 
   describe('EventEmitter lifecycle events', () => {
+    it('emits server.starting before server.ready', async () => {
+      await writeServerExtension(extDir, 'my-server', serverManifest(), makeServerScript())
+      mgr.scan([extDir])
+
+      const eventOrder: string[] = []
+      mgr.on('server.starting', () => eventOrder.push('starting'))
+      mgr.on('server.ready', () => eventOrder.push('ready'))
+
+      await mgr.startServer('test-server')
+
+      expect(eventOrder).toEqual(['starting', 'ready'])
+    })
+
     it('emits server.ready after successful startServer', async () => {
       await writeServerExtension(extDir, 'my-server', serverManifest(), makeServerScript())
       mgr.scan([extDir])

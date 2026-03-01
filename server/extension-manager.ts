@@ -217,6 +217,8 @@ export class ExtensionManager extends EventEmitter {
     const serverConfig = entry.manifest.server!
     const port = await allocateFreePort()
 
+    this.emit('server.starting', { name })
+
     // Set serverPort on registry entry
     entry.serverPort = port
 
