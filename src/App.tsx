@@ -45,6 +45,7 @@ import { X, Copy, Check, PanelLeft, AlertTriangle } from 'lucide-react'
 import { updateSettingsLocal, markSaved } from '@/store/settingsSlice'
 
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
+import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
 import { createLogger } from '@/lib/client-logger'
 import type { ProjectGroup, AppSettings } from '@/store/types'
@@ -522,6 +523,17 @@ export default function App() {
             reason: parseConfigFallbackReason(msg.reason),
             backupExists: !!msg.backupExists,
           })
+        }
+
+        // Extension registry & lifecycle messages
+        if (msg.type === 'extensions.registry') {
+          dispatch(setRegistry(msg.extensions))
+        }
+        if (msg.type === 'extension.server.ready') {
+          dispatch(updateServerStatus({ name: msg.name, serverRunning: true, serverPort: msg.port }))
+        }
+        if (msg.type === 'extension.server.stopped') {
+          dispatch(updateServerStatus({ name: msg.name, serverRunning: false, serverPort: undefined }))
         }
 
         // SDK message handling (freshclaude pane)

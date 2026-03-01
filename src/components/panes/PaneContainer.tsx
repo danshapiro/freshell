@@ -9,6 +9,7 @@ import TerminalView from '../TerminalView'
 import BrowserPane from './BrowserPane'
 import EditorPane from './EditorPane'
 import AgentChatView from '../agent-chat/AgentChatView'
+import ExtensionPane from './ExtensionPane'
 import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
 import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-utils'
@@ -224,6 +225,8 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         dispatch(clearPendingCreate({ requestId: content.createRequestId }))
       }
     }
+    // Extension panes: V1 leaves server extensions running until freshell shutdown.
+    // Future: stop singleton server when its last pane closes.
     dispatch(closePaneWithCleanup({ tabId, paneId }))
   }, [dispatch, tabId, tabTerminalId, ws, sdkPendingCreates])
 
@@ -428,6 +431,15 @@ function PickerWrapper({
   >({ step: 'type' })
 
   const createContentForType = useCallback((type: PanePickerType, cwd?: string): PaneContent => {
+    if (typeof type === 'string' && type.startsWith('ext:')) {
+      const extensionName = type.slice(4)
+      return {
+        kind: 'extension' as const,
+        extensionName,
+        props: {},
+      }
+    }
+
     if (isAgentChatProviderName(type)) {
       const providerConfig = getAgentChatProviderConfig(type)!
       const providerSettings = settings?.agentChat?.providers?.[type]
@@ -625,6 +637,14 @@ function renderContent(tabId: string, paneId: string, content: PaneContent, isOn
         paneId={paneId}
         isOnlyPane={isOnlyPane}
       />
+    )
+  }
+
+  if (content.kind === 'extension') {
+    return (
+      <ErrorBoundary key={paneId} label="Extension">
+        <ExtensionPane tabId={tabId} paneId={paneId} content={content} />
+      </ErrorBoundary>
     )
   }
 

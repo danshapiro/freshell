@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ComponentType, SVGProps } from 'react'
-import { Terminal, Globe, FileText } from 'lucide-react'
+import { Terminal, Globe, FileText, LayoutGrid } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAppSelector } from '@/store/hooks'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
@@ -9,7 +9,7 @@ import { AGENT_CHAT_PROVIDER_CONFIGS, type AgentChatProviderName } from '@/lib/a
 import { ProviderIcon } from '@/components/icons/provider-icons'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 
-export type PanePickerType = 'shell' | 'cmd' | 'powershell' | 'wsl' | 'browser' | 'editor' | AgentChatProviderName | CodingCliProviderName
+export type PanePickerType = 'shell' | 'cmd' | 'powershell' | 'wsl' | 'browser' | 'editor' | AgentChatProviderName | CodingCliProviderName | `ext:${string}`
 
 type IconComponent = ComponentType<{ className?: string } & SVGProps<SVGSVGElement>>
 
@@ -97,6 +97,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
   const platform = useAppSelector((s) => s.connection?.platform ?? null)
   const availableClis = useAppSelector((s) => s.connection?.availableClis ?? {})
   const enabledProviders = useAppSelector((s) => s.settings?.settings?.codingCli?.enabledProviders ?? [])
+  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? [])
 
   const options = useMemo(() => {
     // CLI options: only show if both available on system and enabled in settings
@@ -121,9 +122,17 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
     const agentChatBefore = allAgentChatOptions.filter((o) => !o.afterCli)
     const agentChatAfter = allAgentChatOptions.filter((o) => o.afterCli)
 
-    // Order: agent chat (before), CLIs, agent chat (after), Editor, Browser, Shell(s)
-    return [...agentChatBefore, ...cliOptions, ...agentChatAfter, ...nonShellOptions, ...shellOptions]
-  }, [platform, availableClis, enabledProviders])
+    // Extension options from the registry
+    const extensionOptions: PickerOption[] = extensionEntries.map((ext) => ({
+      type: `ext:${ext.name}` as PanePickerType,
+      label: ext.label,
+      icon: LayoutGrid,
+      shortcut: ext.picker?.shortcut ?? '',
+    }))
+
+    // Order: agent chat (before), CLIs, agent chat (after), Editor, Browser, Shell(s), Extensions
+    return [...agentChatBefore, ...cliOptions, ...agentChatAfter, ...nonShellOptions, ...shellOptions, ...extensionOptions]
+  }, [platform, availableClis, enabledProviders, extensionEntries])
 
   const [focusedIndex, setFocusedIndex] = useState<number | null>(null)
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null)
