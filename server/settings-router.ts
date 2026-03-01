@@ -106,6 +106,7 @@ export const SettingsPatchSchema = z
       .optional(),
     agentChat: z
       .object({
+        initialSetupDone: z.boolean().optional(),
         providers: z
           .record(
             z.string(),
