@@ -416,4 +416,126 @@ process.on('SIGTERM', () => { server.close(); process.exit(0) })
       expect(entries[0].serverPort).toBeUndefined()
     })
   })
+
+  // ── EventEmitter lifecycle events ──
+
+  describe('EventEmitter lifecycle events', () => {
+    it('emits server.ready after successful startServer', async () => {
+      await writeServerExtension(extDir, 'my-server', serverManifest(), makeServerScript())
+      mgr.scan([extDir])
+
+      const events: Array<{ name: string; port: number }> = []
+      mgr.on('server.ready', (payload) => events.push(payload))
+
+      const port = await mgr.startServer('test-server')
+
+      expect(events).toHaveLength(1)
+      expect(events[0]).toEqual({ name: 'test-server', port })
+    })
+
+    it('emits server.error when waitForReady fails (timeout)', async () => {
+      const manifest = serverManifest({
+        name: 'hang-server',
+        server: {
+          command: 'node',
+          args: ['server.js'],
+          readyPattern: 'Listening on port',
+          readyTimeout: 500, // Very short timeout
+        },
+      })
+      await writeServerExtension(extDir, 'hang-server', manifest, makeHangingScript())
+      mgr.scan([extDir])
+
+      const errors: Array<{ name: string; error: string }> = []
+      mgr.on('server.error', (payload) => errors.push(payload))
+
+      await expect(mgr.startServer('hang-server')).rejects.toThrow()
+
+      expect(errors).toHaveLength(1)
+      expect(errors[0].name).toBe('hang-server')
+      expect(errors[0].error).toMatch(/timeout|ready/i)
+    })
+
+    it('emits server.stopped on stopServer', async () => {
+      await writeServerExtension(extDir, 'my-server', serverManifest(), makeServerScript())
+      mgr.scan([extDir])
+
+      await mgr.startServer('test-server')
+
+      const stops: Array<{ name: string }> = []
+      mgr.on('server.stopped', (payload) => stops.push(payload))
+
+      await mgr.stopServer('test-server')
+
+      expect(stops).toHaveLength(1)
+      expect(stops[0]).toEqual({ name: 'test-server' })
+    })
+
+    it('emits server.stopped on unexpected process exit', async () => {
+      // Use a script that exits immediately after the ready pattern
+      const script = `
+const http = require('http')
+const port = process.env.PORT || 3000
+const server = http.createServer((req, res) => res.end('ok'))
+server.listen(port, () => {
+  console.log('Listening on port ' + port)
+  // Exit after a short delay to simulate unexpected crash
+  setTimeout(() => process.exit(1), 200)
+})
+`
+      await writeServerExtension(extDir, 'my-server', serverManifest(), script)
+      mgr.scan([extDir])
+
+      await mgr.startServer('test-server')
+
+      const stops: Array<{ name: string }> = []
+      mgr.on('server.stopped', (payload) => stops.push(payload))
+
+      // Wait for the process to exit on its own
+      await new Promise<void>((resolve) => {
+        const check = setInterval(() => {
+          if (!mgr.isRunning('test-server')) {
+            clearInterval(check)
+            resolve()
+          }
+        }, 50)
+        // Safety timeout
+        setTimeout(() => {
+          clearInterval(check)
+          resolve()
+        }, 5000)
+      })
+
+      expect(stops).toHaveLength(1)
+      expect(stops[0]).toEqual({ name: 'test-server' })
+    })
+
+    it('does not emit server.ready when returning existing port (already running)', async () => {
+      await writeServerExtension(extDir, 'my-server', serverManifest(), makeServerScript())
+      mgr.scan([extDir])
+
+      await mgr.startServer('test-server')
+
+      const events: Array<{ name: string; port: number }> = []
+      mgr.on('server.ready', (payload) => events.push(payload))
+
+      // Call startServer again — should return existing port, no event
+      await mgr.startServer('test-server')
+
+      expect(events).toHaveLength(0)
+    })
+
+    it('does not emit server.stopped when stopServer is a no-op', async () => {
+      await writeServerExtension(extDir, 'my-server', serverManifest(), makeServerScript())
+      mgr.scan([extDir])
+
+      const stops: Array<{ name: string }> = []
+      mgr.on('server.stopped', (payload) => stops.push(payload))
+
+      // Not running — should be a no-op, no event
+      await mgr.stopServer('test-server')
+
+      expect(stops).toHaveLength(0)
+    })
+  })
 })

@@ -5,6 +5,7 @@
  * validates each manifest against the Zod schema, maintains an in-memory
  * registry, and manages server extension process lifecycles.
  */
+import { EventEmitter } from 'events'
 import fs from 'fs'
 import net from 'net'
 import path from 'path'
@@ -42,7 +43,7 @@ interface RunningProcess {
 const MANIFEST_FILE = 'freshell.json'
 const GRACEFUL_SHUTDOWN_MS = 5000
 
-export class ExtensionManager {
+export class ExtensionManager extends EventEmitter {
   private registry = new Map<string, ExtensionRegistryEntry>()
   private processes = new Map<string, RunningProcess>()
 
@@ -237,6 +238,7 @@ export class ExtensionManager {
       // Kill the process on failure and clean up
       child.kill('SIGKILL')
       entry.serverPort = undefined
+      this.emit('server.error', { name, error: err instanceof Error ? err.message : String(err) })
       throw err
     }
 
@@ -247,10 +249,12 @@ export class ExtensionManager {
       if (this.processes.get(name)?.process === child) {
         this.processes.delete(name)
         entry.serverPort = undefined
+        this.emit('server.stopped', { name })
         logger.info({ name, port }, 'Extension server exited unexpectedly')
       }
     })
 
+    this.emit('server.ready', { name, port })
     logger.info({ name, port, pid: child.pid }, 'Extension server started')
     return port
   }
@@ -276,6 +280,7 @@ export class ExtensionManager {
 
     await killGracefully(child, GRACEFUL_SHUTDOWN_MS)
 
+    this.emit('server.stopped', { name })
     logger.info({ name, port, pid: child.pid }, 'Extension server stopped')
   }
 

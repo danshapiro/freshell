@@ -180,6 +180,17 @@ async function main() {
   networkManager.setWsHandler(wsHandler)
   app.use('/api', createAgentApiRouter({ layoutStore, registry, wsHandler }))
 
+  // --- Extension lifecycle broadcasts ---
+  extensionManager.on('server.ready', ({ name, port: extPort }: { name: string; port: number }) => {
+    wsHandler.broadcast({ type: 'extension.server.ready', name, port: extPort })
+  })
+  extensionManager.on('server.stopped', ({ name }: { name: string }) => {
+    wsHandler.broadcast({ type: 'extension.server.stopped', name })
+  })
+  extensionManager.on('server.error', ({ name, error }: { name: string; error: string }) => {
+    wsHandler.broadcast({ type: 'extension.server.error', name, error })
+  })
+
   const sessionsSync = new SessionsSyncService(wsHandler)
   const associationCoordinator = new SessionAssociationCoordinator(registry, ASSOCIATION_MAX_AGE_MS)
 
