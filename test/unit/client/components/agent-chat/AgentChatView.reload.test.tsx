@@ -5,6 +5,7 @@ import { Provider, useSelector } from 'react-redux'
 import AgentChatView from '@/components/agent-chat/AgentChatView'
 import agentChatReducer, { replayHistory, sessionCreated, sessionInit, setSessionStatus } from '@/store/agentChatSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
+import settingsReducer from '@/store/settingsSlice'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import type { PaneNode } from '@/store/paneTypes'
 
@@ -27,6 +28,7 @@ function makeStore() {
     reducer: {
       agentChat: agentChatReducer,
       panes: panesReducer,
+      settings: settingsReducer,
     },
   })
 }

@@ -431,6 +431,18 @@ describe('Settings API Integration', () => {
     })
   })
 
+  describe('agentChat settings', () => {
+    it('accepts initialSetupDone flag in agentChat patch', async () => {
+      const res = await request(app)
+        .patch('/api/settings')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+        .send({ agentChat: { initialSetupDone: true } })
+
+      expect(res.status).toBe(200)
+      expect(res.body.agentChat?.initialSetupDone).toBe(true)
+    })
+  })
+
   describe('Invalid settings handling', () => {
     it('rejects unknown top-level fields', async () => {
       const res = await request(app)
