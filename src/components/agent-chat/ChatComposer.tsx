@@ -17,7 +17,7 @@ interface ChatComposerProps {
 
 const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function ChatComposer({ onSend, onInterrupt, disabled, isRunning, placeholder, autoFocus }, ref) {
   const [text, setText] = useState('')
-  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null)
 
   useImperativeHandle(ref, () => ({
     focus: () => textareaRef.current?.focus(),
