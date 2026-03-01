@@ -103,9 +103,33 @@ interface SidebarRowProps {
  *  from unmounting/remounting all visible rows on every parent re-render. */
 export const SidebarRow = ({ index, style, ariaAttributes, ...data }: RowComponentProps<SidebarRowProps>) => {
   const item = data.items[index]
+  const sessionKey = `${item.provider}:${item.sessionId}`
+  const matchesByTerminalId = item.isRunning && item.runningTerminalId === data.activeTerminalId
+  const matchesBySessionKey = sessionKey === data.activeSessionKey
   const isActive = item.isRunning
-    ? item.runningTerminalId === data.activeTerminalId
-    : `${item.provider}:${item.sessionId}` === data.activeSessionKey
+    ? matchesByTerminalId
+    : matchesBySessionKey
+
+  // Debug: log when there's a mismatch between the two highlighting paths
+  if (item.isRunning && matchesBySessionKey !== matchesByTerminalId) {
+    log.debug(
+      `[SidebarHighlight] MISMATCH for "${item.title}" (${sessionKey}):`,
+      `isRunning=${item.isRunning}`,
+      `matchesByTerminalId=${matchesByTerminalId} (runningTerminalId=${item.runningTerminalId}, activeTerminalId=${data.activeTerminalId})`,
+      `matchesBySessionKey=${matchesBySessionKey} (activeSessionKey=${data.activeSessionKey})`,
+      `→ isActive=${isActive} (used terminalId path because isRunning=true)`
+    )
+  }
+
+  // Debug: log when any item is highlighted or when activeSessionKey matches but isn't used
+  if (isActive || (matchesBySessionKey && !isActive)) {
+    log.debug(
+      `[SidebarHighlight] "${item.title}" (${sessionKey}):`,
+      `isActive=${isActive}`,
+      `isRunning=${item.isRunning}`,
+      `path=${item.isRunning ? 'terminalId' : 'sessionKey'}`
+    )
+  }
 
   // Stable click handler: store latest callback + item in a ref so the
   // onClick function identity never changes, but always invokes current data.
@@ -167,6 +191,16 @@ export default function Sidebar({
     if (!ref) return null
     return `${ref.provider}:${ref.sessionId}`
   })
+  const activePaneIdForDebug = useAppSelector((s) => {
+    const tabId = s.tabs.activeTabId
+    return tabId ? s.panes.activePane[tabId] : null
+  })
+  useEffect(() => {
+    log.debug('[SidebarHighlight] activeSessionKeyFromPanes:',
+      activeSessionKeyFromPanes,
+      `activeTabId=${activeTabId}`,
+      `activePaneId=${activePaneIdForDebug}`)
+  }, [activeSessionKeyFromPanes, activeTabId, activePaneIdForDebug])
   const selectSortedItems = useMemo(() => makeSelectSortedSessionItems(), [])
   // Separate selector instance for allItems: createSelector caches only one
   // result, so calling the same instance with different filter args would thrash
@@ -367,10 +401,18 @@ export default function Sidebar({
     const state = store.getState()
     const currentActiveTabId = state.tabs.activeTabId
     const runningTerminalId = item.isRunning ? item.runningTerminalId : undefined
+    const sessionKey = `${provider}:${item.sessionId}`
+
+    log.info(`[SidebarClick] Clicked "${item.title}" (${sessionKey})`,
+      `isRunning=${item.isRunning}`,
+      `runningTerminalId=${runningTerminalId}`,
+      `currentActiveTabId=${currentActiveTabId}`)
 
     // 1. Dedup: if session is already open in a pane, focus it
     const existing = findPaneForSession(state, provider, item.sessionId)
     if (existing) {
+      log.info(`[SidebarClick] → Dedup: focusing existing pane`,
+        `tabId=${existing.tabId}`, `paneId=${existing.paneId}`)
       dispatch(setActiveTab(existing.tabId))
       if (existing.paneId) {
         dispatch(setActivePane({ tabId: existing.tabId, paneId: existing.paneId }))
@@ -382,6 +424,7 @@ export default function Sidebar({
     // 2. Fallback: no active tab or active tab has no layout → create new tab
     const activeLayout = currentActiveTabId ? state.panes.layouts[currentActiveTabId] : undefined
     if (!currentActiveTabId || !activeLayout) {
+      log.info(`[SidebarClick] → Creating new tab for session`)
       dispatch(openSessionTab({
         sessionId: item.sessionId,
         title: item.title,
@@ -394,6 +437,9 @@ export default function Sidebar({
     }
 
     // 3. Normal: split a new pane in the current tab
+    log.info(`[SidebarClick] → Adding pane to tab ${currentActiveTabId}`,
+      `activePaneBefore=${state.panes.activePane[currentActiveTabId]}`,
+      `tabTerminalId=${state.tabs.tabs.find(t => t.id === currentActiveTabId)?.terminalId}`)
     dispatch(addPane({
       tabId: currentActiveTabId,
       newContent: {
@@ -419,6 +465,14 @@ export default function Sidebar({
   const activeTab = tabs.find((t) => t.id === activeTabId)
   const activeSessionKey = activeSessionKeyFromPanes
   const activeTerminalId = activeTab?.terminalId
+
+  // Debug: log the key highlight inputs on every render
+  useEffect(() => {
+    log.debug('[SidebarHighlight] Render inputs:',
+      `activeTabId=${activeTabId}`,
+      `activeSessionKey=${activeSessionKey}`,
+      `activeTerminalId(tab-level)=${activeTerminalId}`)
+  }, [activeTabId, activeSessionKey, activeTerminalId])
   const effectiveListHeight = listHeight > 0
     ? listHeight
     : Math.min(sortedItems.length * SESSION_ITEM_HEIGHT, SESSION_LIST_MAX_HEIGHT)
