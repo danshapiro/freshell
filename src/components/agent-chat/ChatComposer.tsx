@@ -38,11 +38,7 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
       e.preventDefault()
       handleSend()
     }
-    if (e.key === 'Escape' && isRunning) {
-      e.preventDefault()
-      onInterrupt()
-    }
-  }, [handleSend, isRunning, onInterrupt])
+  }, [handleSend])
 
   const handleInput = useCallback(() => {
     const el = textareaRef.current
