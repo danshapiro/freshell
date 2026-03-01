@@ -354,4 +354,141 @@ describe('extension-routes', () => {
       expect(res.body.error).toMatch(/invalid icon path/i)
     })
   })
+
+  // ── Security edge cases ──
+
+  describe('Security edge cases', () => {
+    describe('extension name traversal in route params', () => {
+      it('returns 404 for name with encoded ../ traversal', async () => {
+        await writeExtension(extDir, 'srv', serverManifest())
+        mgr.scan([extDir])
+        app = createApp()
+
+        // ..%2F..%2Fetc — URL-encoded path traversal in the :name param
+        const res = await request(app).get('/api/extensions/..%2F..%2Fetc')
+        expect(res.status).toBe(404)
+      })
+
+      it('returns 404 for name with %2e%2e encoded dots', async () => {
+        await writeExtension(extDir, 'srv', serverManifest())
+        mgr.scan([extDir])
+        app = createApp()
+
+        // %2e%2e%2f — dots and slash individually URL-encoded
+        const res = await request(app).get('/api/extensions/%2e%2e%2f%2e%2e%2fserver')
+        expect(res.status).toBe(404)
+      })
+
+      it('returns 404 for name with null byte injection', async () => {
+        await writeExtension(extDir, 'srv', serverManifest())
+        mgr.scan([extDir])
+        app = createApp()
+
+        // Null byte in extension name should not match any real extension
+        const res = await request(app).get('/api/extensions/test%00server')
+        expect(res.status).toBe(404)
+      })
+
+      it('returns 404 for traversal name on start endpoint', async () => {
+        await writeExtension(extDir, 'srv', serverManifest())
+        mgr.scan([extDir])
+        app = createApp()
+
+        const res = await request(app).post('/api/extensions/..%2F..%2Fetc/start')
+        expect(res.status).toBe(404)
+      })
+
+      it('returns 404 for traversal name on stop endpoint', async () => {
+        await writeExtension(extDir, 'srv', serverManifest())
+        mgr.scan([extDir])
+        app = createApp()
+
+        const res = await request(app).post('/api/extensions/..%2F..%2Fetc/stop')
+        expect(res.status).toBe(404)
+      })
+    })
+
+    describe('double-encoded path traversal in client files', () => {
+      it('blocks double-encoded traversal (%252e%252e%252f)', async () => {
+        await writeExtension(extDir, 'cli', clientManifest())
+        mgr.scan([extDir])
+        app = createApp()
+
+        // %252e%252e%252f — double-encoded "../" (Express decodes once → %2e%2e%2f)
+        const res = await request(app).get(
+          '/api/extensions/test-client/client/%252e%252e%252f%252e%252e%252fetc%252fpasswd',
+        )
+        // Should be blocked (400) or simply not found (404) — must NOT serve /etc/passwd
+        expect([400, 404]).toContain(res.status)
+        // Ensure the response is NOT the contents of /etc/passwd
+        expect(res.text).not.toMatch(/root:/)
+      })
+
+      it('blocks double-encoded dot-slash (%252e%252e/)', async () => {
+        await writeExtension(extDir, 'cli', clientManifest())
+        mgr.scan([extDir])
+        app = createApp()
+
+        const res = await request(app).get(
+          '/api/extensions/test-client/client/%252e%252e/%252e%252e/etc/passwd',
+        )
+        expect([400, 404]).toContain(res.status)
+        expect(res.text).not.toMatch(/root:/)
+      })
+
+      it('blocks backslash traversal variants', async () => {
+        await writeExtension(extDir, 'cli', clientManifest())
+        mgr.scan([extDir])
+        app = createApp()
+
+        // Backslash variants (common on Windows, but should be blocked everywhere).
+        // On macOS/Linux, backslashes are literal filename chars, so path.resolve
+        // won't traverse but sendFile may 500 on the non-existent path — that's fine.
+        const res = await request(app).get(
+          '/api/extensions/test-client/client/..%5C..%5C..%5Cetc%5Cpasswd',
+        )
+        expect([400, 404, 500]).toContain(res.status)
+        expect(res.text).not.toMatch(/root:/)
+      })
+
+      it('blocks mixed encoding traversal', async () => {
+        await writeExtension(extDir, 'cli', clientManifest())
+        mgr.scan([extDir])
+        app = createApp()
+
+        // Mix of encoded and literal traversal characters
+        const res = await request(app).get(
+          '/api/extensions/test-client/client/..%2f..%2f..%2fetc/passwd',
+        )
+        expect([400, 404]).toContain(res.status)
+        expect(res.text).not.toMatch(/root:/)
+      })
+    })
+
+    describe('icon path traversal variants', () => {
+      it('blocks URL-encoded traversal in manifest icon field', async () => {
+        // Manifest icon with URL-encoded traversal sequences
+        await writeExtension(extDir, 'srv', serverManifest({ icon: '..%2F..%2F..%2Fetc%2Fpasswd' }))
+        mgr.scan([extDir])
+        app = createApp()
+
+        const res = await request(app).get('/api/extensions/test-server/icon')
+        // The encoded dots remain literal in the filename, so path.resolve won't
+        // traverse — it'll just be a weird filename that doesn't exist (404) or
+        // gets caught by the traversal check (400)
+        expect([400, 404]).toContain(res.status)
+        expect(res.text).not.toMatch(/root:/)
+      })
+
+      it('blocks icon path with backslash traversal', async () => {
+        await writeExtension(extDir, 'srv', serverManifest({ icon: '..\\..\\..\\etc\\passwd' }))
+        mgr.scan([extDir])
+        app = createApp()
+
+        const res = await request(app).get('/api/extensions/test-server/icon')
+        expect([400, 404]).toContain(res.status)
+        expect(res.text).not.toMatch(/root:/)
+      })
+    })
+  })
 })

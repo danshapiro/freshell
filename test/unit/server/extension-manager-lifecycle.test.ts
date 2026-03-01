@@ -40,6 +40,21 @@ setInterval(() => {}, 1000)
 `
 }
 
+/** Write a script that starts, signals ready, then crashes after a short delay */
+function makeCrashingScript(delayMs = 200): string {
+  return `
+const http = require('http')
+const port = process.env.PORT || 3000
+const server = http.createServer((req, res) => res.end('ok'))
+server.listen(port, () => {
+  console.log('Listening on port ' + port)
+  // Crash after ${delayMs}ms
+  setTimeout(() => process.exit(1), ${delayMs})
+})
+process.on('SIGTERM', () => { server.close(); process.exit(0) })
+`
+}
+
 /** Write a freshell.json manifest + optional server.js into a named extension dir */
 async function writeServerExtension(
   parentDir: string,
@@ -485,18 +500,7 @@ process.on('SIGTERM', () => { server.close(); process.exit(0) })
     })
 
     it('emits server.stopped on unexpected process exit', async () => {
-      // Use a script that exits immediately after the ready pattern
-      const script = `
-const http = require('http')
-const port = process.env.PORT || 3000
-const server = http.createServer((req, res) => res.end('ok'))
-server.listen(port, () => {
-  console.log('Listening on port ' + port)
-  // Exit after a short delay to simulate unexpected crash
-  setTimeout(() => process.exit(1), 200)
-})
-`
-      await writeServerExtension(extDir, 'my-server', serverManifest(), script)
+      await writeServerExtension(extDir, 'my-server', serverManifest(), makeCrashingScript())
       mgr.scan([extDir])
 
       await mgr.startServer('test-server')
@@ -549,6 +553,116 @@ server.listen(port, () => {
       await mgr.stopServer('test-server')
 
       expect(stops).toHaveLength(0)
+    })
+  })
+
+  // ── Process crash recovery ──
+
+  describe('Process crash recovery', () => {
+    /** Wait for an extension to stop running (via polling), with a safety timeout */
+    function waitUntilStopped(manager: ExtensionManager, name: string, timeoutMs = 5000): Promise<void> {
+      return new Promise<void>((resolve, reject) => {
+        if (!manager.isRunning(name)) {
+          resolve()
+          return
+        }
+        const check = setInterval(() => {
+          if (!manager.isRunning(name)) {
+            clearInterval(check)
+            clearTimeout(safety)
+            resolve()
+          }
+        }, 50)
+        const safety = setTimeout(() => {
+          clearInterval(check)
+          reject(new Error(`Timed out waiting for '${name}' to stop`))
+        }, timeoutMs)
+      })
+    }
+
+    it('isRunning() returns false and getPort() returns undefined after crash', async () => {
+      await writeServerExtension(extDir, 'my-server', serverManifest(), makeCrashingScript())
+      mgr.scan([extDir])
+
+      const port = await mgr.startServer('test-server')
+      expect(mgr.isRunning('test-server')).toBe(true)
+      expect(mgr.getPort('test-server')).toBe(port)
+
+      // Wait for the process to crash
+      await waitUntilStopped(mgr, 'test-server')
+
+      expect(mgr.isRunning('test-server')).toBe(false)
+      expect(mgr.getPort('test-server')).toBeUndefined()
+    })
+
+    it('startServer() can start a fresh instance after a crash', async () => {
+      // First: start with a crashing script, let it crash
+      await writeServerExtension(extDir, 'my-server', serverManifest(), makeCrashingScript())
+      mgr.scan([extDir])
+
+      await mgr.startServer('test-server')
+      await waitUntilStopped(mgr, 'test-server')
+
+      expect(mgr.isRunning('test-server')).toBe(false)
+
+      // Now overwrite the script with a stable server and restart
+      const extPath = path.join(extDir, 'my-server')
+      await fsp.writeFile(path.join(extPath, 'server.js'), makeServerScript())
+
+      const newPort = await mgr.startServer('test-server')
+
+      expect(newPort).toBeGreaterThan(0)
+      expect(mgr.isRunning('test-server')).toBe(true)
+      expect(mgr.getPort('test-server')).toBe(newPort)
+
+      // Verify the new server is actually serving
+      const response = await new Promise<string>((resolve, reject) => {
+        http.get(`http://127.0.0.1:${newPort}`, (res) => {
+          let data = ''
+          res.on('data', (chunk) => (data += chunk))
+          res.on('end', () => resolve(data))
+        }).on('error', reject)
+      })
+      expect(response).toBe('ok')
+    })
+
+    it('toClientRegistry() reflects crashed state (serverRunning: false)', async () => {
+      await writeServerExtension(extDir, 'my-server', serverManifest(), makeCrashingScript())
+      mgr.scan([extDir])
+
+      // Before start
+      let entries = mgr.toClientRegistry()
+      expect(entries[0].serverRunning).toBe(false)
+      expect(entries[0].serverPort).toBeUndefined()
+
+      // While running
+      const port = await mgr.startServer('test-server')
+      entries = mgr.toClientRegistry()
+      expect(entries[0].serverRunning).toBe(true)
+      expect(entries[0].serverPort).toBe(port)
+
+      // After crash
+      await waitUntilStopped(mgr, 'test-server')
+      entries = mgr.toClientRegistry()
+      expect(entries[0].serverRunning).toBe(false)
+      expect(entries[0].serverPort).toBeUndefined()
+    })
+
+    it('emits server.stopped on unexpected exit (cross-reference with EventEmitter tests)', async () => {
+      // This behavior is already tested in the EventEmitter lifecycle events block,
+      // but we include it here to confirm the crash recovery describe block is complete
+      await writeServerExtension(extDir, 'my-server', serverManifest(), makeCrashingScript())
+      mgr.scan([extDir])
+
+      await mgr.startServer('test-server')
+
+      const stops: Array<{ name: string }> = []
+      mgr.on('server.stopped', (payload) => stops.push(payload))
+
+      await waitUntilStopped(mgr, 'test-server')
+
+      expect(stops).toHaveLength(1)
+      expect(stops[0]).toEqual({ name: 'test-server' })
     })
   })
 })
