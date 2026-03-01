@@ -47,6 +47,7 @@ const GRACEFUL_SHUTDOWN_MS = 5000
 export class ExtensionManager extends EventEmitter {
   private registry = new Map<string, ExtensionRegistryEntry>()
   private processes = new Map<string, RunningProcess>()
+  private starting = new Map<string, Promise<number>>()
 
   /**
    * Scan directories for extensions. Clears existing registry first.
@@ -215,6 +216,23 @@ export class ExtensionManager extends EventEmitter {
       return existing.port
     }
 
+    // Deduplicate concurrent starts — if already starting, return the same promise
+    const inflight = this.starting.get(name)
+    if (inflight) {
+      return inflight
+    }
+
+    const promise = this.doStartServer(name, entry)
+    this.starting.set(name, promise)
+    try {
+      return await promise
+    } finally {
+      this.starting.delete(name)
+    }
+  }
+
+  /** Internal: actually spawn and wait for the server process. */
+  private async doStartServer(name: string, entry: ExtensionRegistryEntry): Promise<number> {
     const serverConfig = entry.manifest.server!
     const port = await allocateFreePort()
 
@@ -232,11 +250,21 @@ export class ExtensionManager extends EventEmitter {
       stdio: ['ignore', 'pipe', 'pipe'],
     })
 
+    // Catch spawn errors (e.g. ENOENT) immediately — without this listener,
+    // an async spawn error becomes an unhandled 'error' event that crashes Node.
+    const spawnError = new Promise<never>((_resolve, reject) => {
+      child.on('error', (err) => reject(err))
+    })
+
     const readyPattern = serverConfig.readyPattern
     const readyTimeout = serverConfig.readyTimeout
 
     try {
-      await waitForReady(child, readyPattern, readyTimeout)
+      // Race: waitForReady vs spawn error (ENOENT fires async, before ready)
+      await Promise.race([
+        waitForReady(child, readyPattern, readyTimeout),
+        spawnError,
+      ])
     } catch (err) {
       // Kill the process on failure and clean up
       child.kill('SIGKILL')
@@ -256,6 +284,10 @@ export class ExtensionManager extends EventEmitter {
         logger.info({ name, port }, 'Extension server exited unexpectedly')
       }
     })
+
+    // Prevent unhandled rejection from the spawnError promise after successful start —
+    // the error listener stays active but spawnError is no longer being awaited.
+    spawnError.catch(() => {})
 
     this.emit('server.ready', { name, port })
     logger.info({ name, port, pid: child.pid }, 'Extension server started')
@@ -362,8 +394,9 @@ function waitForReady(
   readyPattern: string | undefined,
   timeoutMs: number,
 ): Promise<void> {
-  // No pattern to match — resolve immediately
-  if (!readyPattern) return Promise.resolve()
+  // No pattern to match — yield one event loop tick so spawn errors
+  // (e.g. ENOENT) have a chance to fire before the caller continues.
+  if (!readyPattern) return new Promise<void>((resolve) => setImmediate(resolve))
 
   return new Promise<void>((resolve, reject) => {
     const pattern = new RegExp(readyPattern)

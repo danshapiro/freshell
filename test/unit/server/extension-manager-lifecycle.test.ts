@@ -161,6 +161,20 @@ describe('ExtensionManager — Server Process Lifecycle', () => {
       expect(mgr.isRunning('test-server')).toBe(true)
     })
 
+    it('deduplicates concurrent startServer calls (no orphaned processes)', async () => {
+      await writeServerExtension(extDir, 'my-server', serverManifest(), makeServerScript())
+      mgr.scan([extDir])
+
+      // Fire two concurrent starts — both should resolve to the same port
+      const [port1, port2] = await Promise.all([
+        mgr.startServer('test-server'),
+        mgr.startServer('test-server'),
+      ])
+
+      expect(port1).toBe(port2)
+      expect(mgr.isRunning('test-server')).toBe(true)
+    })
+
     it('rejects if extension not found', async () => {
       mgr.scan([extDir])
 
@@ -176,6 +190,22 @@ describe('ExtensionManager — Server Process Lifecycle', () => {
       await expect(mgr.startServer('test-client')).rejects.toThrow(
         /not.*server/i,
       )
+    })
+
+    it('rejects with a clean error when command does not exist (ENOENT)', async () => {
+      const manifest = serverManifest({
+        name: 'bad-cmd',
+        server: {
+          command: 'nonexistent-binary-that-does-not-exist',
+          args: [],
+          // No readyPattern — the bug path
+        },
+      })
+      await writeServerExtension(extDir, 'bad-cmd', manifest)
+      mgr.scan([extDir])
+
+      await expect(mgr.startServer('bad-cmd')).rejects.toThrow()
+      expect(mgr.isRunning('bad-cmd')).toBe(false)
     })
 
     it('rejects if readyPattern not matched within timeout', async () => {
