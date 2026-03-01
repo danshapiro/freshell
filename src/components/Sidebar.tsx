@@ -53,6 +53,7 @@ export function areSessionItemsEqual(a: SessionItem[], b: SessionItem[]): boolea
     if (
       ai.sessionId !== bi.sessionId ||
       ai.provider !== bi.provider ||
+      ai.sessionType !== bi.sessionType ||
       ai.title !== bi.title ||
       ai.subtitle !== bi.subtitle ||
       ai.hasTab !== bi.hasTab ||
@@ -293,6 +294,7 @@ export default function Sidebar({
             id: `search-${provider}-${result.sessionId}`,
             sessionId: result.sessionId,
             provider,
+            sessionType: provider,
             title: result.title || result.sessionId.slice(0, 8),
             hasTitle: !!result.title,
             subtitle: getProjectName(result.projectPath),
@@ -309,6 +311,7 @@ export default function Sidebar({
           id: `search-${provider}-${result.sessionId}`,
           sessionId: result.sessionId,
           provider,
+          sessionType: existing.sessionType,
           title: result.title || existing.title || result.sessionId.slice(0, 8),
           hasTitle: !!(result.title || existing.hasTitle),
           subtitle: getProjectName(result.projectPath),
@@ -608,6 +611,7 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
   return (
     a.sessionId === b.sessionId &&
     a.provider === b.provider &&
+    a.sessionType === b.sessionType &&
     a.title === b.title &&
     a.subtitle === b.subtitle &&
     a.timestamp === b.timestamp &&
