@@ -74,6 +74,22 @@ npm test                    # Run all tests (client + server)
 npm run check               # Typecheck + test without building (safe while prod runs)
 npm run verify              # Build + test (catches type errors that vitest misses)
 npm run test:coverage       # Generate coverage report
+
+# Run a single test file
+npx vitest run test/unit/client/components/TabBar.test.tsx
+# Server tests use a separate config
+npx vitest run --config vitest.server.config.ts test/server/ws-protocol.test.ts
+# Run tests matching a name pattern
+npx vitest run -t "handles resize"
+```
+
+There are **two vitest configs**: `vitest.config.ts` (client, jsdom environment) and `vitest.server.config.ts` (server, node environment). Client tests live in `test/unit/client/`, `test/integration/client/`, and `test/e2e/`. Server tests live in `test/server/`, `test/unit/server/`, and `test/integration/server/`. The default `npm test` runs the client config; `npm run test:all` runs both.
+
+### Linting
+```bash
+npm run lint                # ESLint on src/ (includes jsx-a11y)
+npm run lint:fix            # Auto-fix lint issues
+npm run typecheck           # Typecheck client + server
 ```
 
 ## Architecture
@@ -85,16 +101,23 @@ npm run test:coverage       # Generate coverage report
 
 ### Directory Structure
 - `src/` - React frontend application
-  - `components/` - UI components (TabBar, Sidebar, TerminalView, HistoryView, etc.)
-  - `store/` - Redux slices (tabs, connection, sessions, settings, claude)
-  - `lib/` - Utilities (api.ts, claude-types.ts)
+  - `components/` - UI components (TabBar, Sidebar, TerminalView, panes/, claude-chat/, context-menu/, etc.)
+  - `store/` - Redux slices, middleware, selectors, and persistence
+  - `hooks/` - Custom React hooks (activity monitor, notifications, mobile, theme)
+  - `lib/` - Client utilities (ws-client.ts, api.ts, pane-utils.ts, terminal helpers)
 - `server/` - Node.js/Express backend
-  - `index.ts` - HTTP/REST routes and server entry
+  - `*-router.ts` - Express route modules (terminals, sessions, settings, ai, debug, files, etc.)
   - `ws-handler.ts` - WebSocket protocol handler
   - `terminal-registry.ts` - PTY lifecycle management
-  - `claude-session.ts` - Claude session discovery & indexing
-  - `claude-indexer.ts` - File watcher for ~/.claude directory
-- `test/` - Test suites organized by unit/integration and client/server
+  - `coding-cli/` - Coding CLI provider abstraction (Claude, Codex) with session indexer and manager
+  - `session-scanner/` - File watcher service for session discovery and caching
+  - `sessions-sync/` - Delta sync for session updates to clients
+  - `tabs-registry/` - Persistent tab/pane state store
+  - `updater/` - Auto-update version checking
+- `shared/` - Code shared between client and server
+  - `ws-protocol.ts` - Single source of truth for WebSocket message schemas (Zod)
+  - `path-utils.ts` - Cross-platform path utilities
+- `test/` - Tests organized by scope: `unit/client/`, `unit/server/`, `integration/server/`, `integration/client/`, `server/`, `e2e/`
 
 ### Key Architectural Patterns
 
@@ -146,3 +169,10 @@ All components **must** be accessible for browser-use automation and WCAG compli
 
 - `@/` → `src/`
 - `@test/` → `test/`
+- `@shared/` → `shared/`
+
+## TypeScript Configs
+
+Two separate configs reflect the client/server split:
+- `tsconfig.json` — Client (Bundler resolution, ESNext modules, jsx). Includes `src/` and `shared/`.
+- `tsconfig.server.json` — Server (NodeNext resolution, ESM). Server imports must use `.js` extensions.
