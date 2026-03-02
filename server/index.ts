@@ -4,6 +4,7 @@ import { setupWslPortForwarding } from './wsl-port-forward.js'
 import express from 'express'
 import fs from 'fs'
 import http from 'http'
+import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import rateLimit from 'express-rate-limit'
@@ -50,6 +51,9 @@ import { createAiRouter } from './ai-router.js'
 import { createDebugRouter } from './debug-router.js'
 import { LayoutStore } from './agent-api/layout-store.js'
 import { createAgentApiRouter } from './agent-api/router.js'
+import { ExtensionManager } from './extension-manager.js'
+import { createExtensionRouter } from './extension-routes.js'
+import { SessionMetadataStore } from './session-metadata-store.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -122,7 +126,9 @@ async function main() {
   app.use('/api', createClientLogsRouter())
 
   const codingCliProviders = [claudeProvider, codexProvider]
-  const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders)
+  const freshellConfigDir = path.join(os.homedir(), '.freshell')
+  const sessionMetadataStore = new SessionMetadataStore(freshellConfigDir)
+  const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders, {}, sessionMetadataStore)
   const codingCliSessionManager = new CodingCliSessionManager(codingCliProviders)
   const tabsRegistryStore = createTabsRegistryStore()
 
@@ -135,6 +141,11 @@ async function main() {
   const serverInstanceId = await loadOrCreateServerInstanceId()
 
   const sdkBridge = new SdkBridge()
+
+  const extensionManager = new ExtensionManager()
+  const userExtDir = path.join(os.homedir(), '.freshell', 'extensions')
+  const localExtDir = path.join(process.cwd(), '.freshell', 'extensions')
+  extensionManager.scan([userExtDir, localExtDir])
 
   const server = http.createServer(app)
   const wsHandler = new WsHandler(
@@ -160,6 +171,7 @@ async function main() {
     tabsRegistryStore,
     serverInstanceId,
     layoutStore,
+    extensionManager,
   )
   const port = Number(process.env.PORT || 3001)
   const isDev = process.env.NODE_ENV !== 'production'
@@ -167,6 +179,20 @@ async function main() {
   const networkManager = new NetworkManager(server, configStore, port, isDev, vitePort)
   networkManager.setWsHandler(wsHandler)
   app.use('/api', createAgentApiRouter({ layoutStore, registry, wsHandler }))
+
+  // --- Extension lifecycle broadcasts ---
+  extensionManager.on('server.starting', ({ name }: { name: string }) => {
+    wsHandler.broadcast({ type: 'extension.server.starting', name })
+  })
+  extensionManager.on('server.ready', ({ name, port: extPort }: { name: string; port: number }) => {
+    wsHandler.broadcast({ type: 'extension.server.ready', name, port: extPort })
+  })
+  extensionManager.on('server.stopped', ({ name }: { name: string }) => {
+    wsHandler.broadcast({ type: 'extension.server.stopped', name })
+  })
+  extensionManager.on('server.error', ({ name, error }: { name: string; error: string }) => {
+    wsHandler.broadcast({ type: 'extension.server.error', name, error })
+  })
 
   const sessionsSync = new SessionsSyncService(wsHandler)
   const associationCoordinator = new SessionAssociationCoordinator(registry, ASSOCIATION_MAX_AGE_MS)
@@ -266,6 +292,7 @@ async function main() {
     terminalMetadata,
     registry,
     wsHandler,
+    sessionMetadataStore,
   }))
 
   app.use('/api', createProjectColorsRouter({ configStore, codingCliIndexer }))
@@ -288,6 +315,9 @@ async function main() {
     tabsRegistryStore,
     registry,
   }))
+
+  // --- API: extensions ---
+  app.use('/api/extensions', createExtensionRouter(extensionManager))
 
   // --- API: port forwarding (for browser pane remote access) ---
   const portForwardManager = new PortForwardManager()
@@ -560,6 +590,9 @@ async function main() {
 
     // 5. Close SDK bridge sessions
     sdkBridge.close()
+
+    // 5b. Stop extension servers
+    await extensionManager.stopAll()
 
     // 6. Stop NetworkManager
     await networkManager.stop()

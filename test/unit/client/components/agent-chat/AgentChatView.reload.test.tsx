@@ -5,6 +5,7 @@ import { Provider, useSelector } from 'react-redux'
 import AgentChatView from '@/components/agent-chat/AgentChatView'
 import agentChatReducer, { replayHistory, sessionCreated, sessionInit, setSessionStatus } from '@/store/agentChatSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
+import settingsReducer from '@/store/settingsSlice'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import type { PaneNode } from '@/store/paneTypes'
 
@@ -27,6 +28,7 @@ function makeStore() {
     reducer: {
       agentChat: agentChatReducer,
       panes: panesReducer,
+      settings: settingsReducer,
     },
   })
 }
@@ -85,8 +87,8 @@ describe('AgentChatView reload/restore behavior', () => {
       </Provider>,
     )
 
-    // Should NOT show the freshclaude welcome text
-    expect(screen.queryByText('freshclaude')).not.toBeInTheDocument()
+    // Should NOT show the Freshclaude welcome text
+    expect(screen.queryByText('Freshclaude')).not.toBeInTheDocument()
 
     // Should show a restoring/loading indicator
     expect(screen.getByText(/restoring/i)).toBeInTheDocument()
@@ -105,7 +107,7 @@ describe('AgentChatView reload/restore behavior', () => {
       </Provider>,
     )
 
-    expect(screen.getByText('freshclaude')).toBeInTheDocument()
+    expect(screen.getByText('Freshclaude')).toBeInTheDocument()
   })
 
   it('replaces loading state with messages after replayHistory arrives', () => {
@@ -117,7 +119,7 @@ describe('AgentChatView reload/restore behavior', () => {
     )
 
     // Initially shows loading
-    expect(screen.queryByText('freshclaude')).not.toBeInTheDocument()
+    expect(screen.queryByText('Freshclaude')).not.toBeInTheDocument()
     expect(screen.getByText(/restoring/i)).toBeInTheDocument()
 
     // Simulate server sending sdk.history
@@ -171,7 +173,7 @@ describe('AgentChatView reload/restore behavior', () => {
 
     // Should show welcome, NOT "Restoring session..."
     expect(screen.queryByText(/restoring/i)).not.toBeInTheDocument()
-    expect(screen.getByText('freshclaude')).toBeInTheDocument()
+    expect(screen.getByText('Freshclaude')).toBeInTheDocument()
   })
 
   it('shows welcome screen (not stuck restoring) when replayHistory arrives with empty messages', () => {
@@ -201,7 +203,7 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(screen.queryByText(/restoring/i)).not.toBeInTheDocument()
 
     // Should show the welcome screen since session is empty
-    expect(screen.getByText('freshclaude')).toBeInTheDocument()
+    expect(screen.getByText('Freshclaude')).toBeInTheDocument()
   })
 
   it('stays in restoring state when setSessionStatus arrives before replayHistory (race condition)', () => {
@@ -218,7 +220,7 @@ describe('AgentChatView reload/restore behavior', () => {
 
     // Session exists in Redux but historyLoaded is not set — should still show restoring
     expect(screen.getByText(/restoring/i)).toBeInTheDocument()
-    expect(screen.queryByText('freshclaude')).not.toBeInTheDocument()
+    expect(screen.queryByText('Freshclaude')).not.toBeInTheDocument()
 
     // Now sdk.history arrives
     store.dispatch(replayHistory({
@@ -362,14 +364,14 @@ describe('AgentChatView reload/restore behavior', () => {
 
     // Initially shows restoring
     expect(screen.getByText(/restoring/i)).toBeInTheDocument()
-    expect(screen.queryByText('freshclaude')).not.toBeInTheDocument()
+    expect(screen.queryByText('Freshclaude')).not.toBeInTheDocument()
 
     // Advance past the 5-second timeout
     act(() => { vi.advanceTimersByTime(5_000) })
 
     // Should fall back to welcome screen
     expect(screen.queryByText(/restoring/i)).not.toBeInTheDocument()
-    expect(screen.getByText('freshclaude')).toBeInTheDocument()
+    expect(screen.getByText('Freshclaude')).toBeInTheDocument()
 
     vi.useRealTimers()
   })

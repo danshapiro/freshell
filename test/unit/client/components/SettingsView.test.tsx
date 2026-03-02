@@ -167,7 +167,7 @@ describe('SettingsView Component', () => {
       // Sidebar section
       expect(screen.getByText('Sort mode')).toBeInTheDocument()
       expect(screen.getByText('Show project badges')).toBeInTheDocument()
-      expect(screen.getByText('Ignore Codex subagent sessions')).toBeInTheDocument()
+      expect(screen.getByText('Show subagent sessions')).toBeInTheDocument()
       expect(screen.getByText('Hide sessions by first chat')).toBeInTheDocument()
       expect(screen.getByText('First chat must start with match')).toBeInTheDocument()
 
@@ -186,11 +186,11 @@ describe('SettingsView Component', () => {
       expect(screen.getByText('Sound on completion')).toBeInTheDocument()
 
       // Coding CLI section
-      expect(screen.getByText('Enable Claude')).toBeInTheDocument()
-      expect(screen.getByText('Enable Codex')).toBeInTheDocument()
-      expect(screen.getByText('Claude permission mode')).toBeInTheDocument()
-      expect(screen.getByText('Codex model')).toBeInTheDocument()
-      expect(screen.getByText('Codex sandbox')).toBeInTheDocument()
+      expect(screen.getByText('Enable Claude CLI')).toBeInTheDocument()
+      expect(screen.getByText('Enable Codex CLI')).toBeInTheDocument()
+      expect(screen.getByText('Claude CLI permission mode')).toBeInTheDocument()
+      expect(screen.getByText('Codex CLI model')).toBeInTheDocument()
+      expect(screen.getByText('Codex CLI sandbox')).toBeInTheDocument()
     })
   })
 
@@ -853,7 +853,7 @@ describe('SettingsView Component', () => {
       const store = createTestStore()
       renderWithStore(store)
 
-      const row = screen.getByText('Enable Codex').closest('div')!
+      const row = screen.getByText('Enable Codex CLI').closest('div')!
       const toggle = row.querySelector('button')!
       fireEvent.click(toggle)
 

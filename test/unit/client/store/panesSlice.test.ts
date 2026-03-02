@@ -19,7 +19,7 @@ import panesReducer, {
   toggleZoom,
   PanesState,
 } from '../../../../src/store/panesSlice'
-import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent, EditorPaneContent } from '../../../../src/store/paneTypes'
+import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent, EditorPaneContent, ExtensionPaneContent } from '../../../../src/store/paneTypes'
 
 const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 
@@ -1322,7 +1322,7 @@ describe('panesSlice', () => {
       const state: PanesState = {
         layouts: { 'tab-1': layout },
         activePane: { 'tab-1': 'pane-1' },
-        paneTitles: { 'tab-1': { 'pane-1': 'Shell', 'pane-2': 'Claude' } },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell', 'pane-2': 'Claude CLI' } },
         paneTitleSetByUser: { 'tab-1': { 'pane-2': true } },
         renameRequestTabId: null,
         renameRequestPaneId: null,
@@ -1917,6 +1917,106 @@ describe('panesSlice', () => {
     })
   })
 
+  describe('ExtensionPaneContent type', () => {
+    it('can be created with required fields', () => {
+      const content: ExtensionPaneContent = {
+        kind: 'extension',
+        extensionName: 'my-widget',
+        props: { foo: 'bar', count: 42 },
+      }
+      expect(content.kind).toBe('extension')
+      expect(content.extensionName).toBe('my-widget')
+      expect(content.props).toEqual({ foo: 'bar', count: 42 })
+    })
+
+    it('is part of PaneContent union', () => {
+      const ext: PaneContent = {
+        kind: 'extension',
+        extensionName: 'some-ext',
+        props: {},
+      }
+      expect(ext.kind).toBe('extension')
+    })
+
+    it('passes through normalizeContent unchanged via initLayout', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-ext',
+          content: { kind: 'extension', extensionName: 'my-ext', props: { key: 'value' } },
+        })
+      )
+
+      const leaf = state.layouts['tab-ext'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content).toEqual({
+        kind: 'extension',
+        extensionName: 'my-ext',
+        props: { key: 'value' },
+      })
+    })
+
+    it('survives hydratePanes round-trip', () => {
+      const savedState: PanesState = {
+        layouts: {
+          'tab-ext': {
+            type: 'leaf',
+            id: 'pane-ext-1',
+            content: { kind: 'extension', extensionName: 'my-widget', props: { theme: 'dark' } },
+          },
+        },
+        activePane: { 'tab-ext': 'pane-ext-1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+      }
+
+      const state = panesReducer(initialState, hydratePanes(savedState))
+      const leaf = state.layouts['tab-ext'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content).toEqual({
+        kind: 'extension',
+        extensionName: 'my-widget',
+        props: { theme: 'dark' },
+      })
+    })
+
+    it('survives mergeTerminalState when extension pane exists locally and remotely', () => {
+      const extensionContent: PaneContent = {
+        kind: 'extension',
+        extensionName: 'my-ext',
+        props: { key: 'value' },
+      }
+
+      // Set up local state with an extension pane
+      const localState = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-ext', content: extensionContent })
+      )
+
+      // Hydrate incoming state with the same extension pane
+      const incoming: PanesState = {
+        layouts: {
+          'tab-ext': {
+            type: 'leaf',
+            id: (localState.layouts['tab-ext'] as any).id,
+            content: extensionContent,
+          },
+        },
+        activePane: localState.activePane,
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+      }
+
+      const merged = panesReducer(localState, hydratePanes(incoming))
+      const leaf = merged.layouts['tab-ext'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content).toEqual(extensionContent)
+    })
+  })
+
   describe('addPane', () => {
     // Helper to construct state with explicit layouts and activePane
     function terminalContent(createRequestId: string): PaneContent {
@@ -2150,7 +2250,7 @@ describe('panesSlice', () => {
 
       // Find the new pane ID (it's the active pane after split)
       const newPaneId = result.activePane['tab-1']
-      expect(result.paneTitles['tab-1'][newPaneId]).toBe('Claude')
+      expect(result.paneTitles['tab-1'][newPaneId]).toBe('Claude CLI')
     })
   })
 
@@ -2173,7 +2273,7 @@ describe('panesSlice', () => {
       }))
 
       const newPaneId = result.activePane['tab-1']
-      expect(result.paneTitles['tab-1'][newPaneId]).toBe('Codex')
+      expect(result.paneTitles['tab-1'][newPaneId]).toBe('Codex CLI')
     })
   })
 
@@ -2212,8 +2312,8 @@ describe('panesSlice', () => {
         content: { kind: 'terminal', createRequestId: 'req-1', status: 'running', mode: 'claude' },
       }))
 
-      // derivePaneTitle for claude mode returns 'Claude'
-      expect(result.paneTitles['tab-1']['pane-1']).toBe('Claude')
+      // derivePaneTitle for claude mode returns 'Claude CLI'
+      expect(result.paneTitles['tab-1']['pane-1']).toBe('Claude CLI')
     })
 
     it('updatePaneTitle sets paneTitleSetByUser to true', () => {
@@ -2269,7 +2369,7 @@ describe('panesSlice', () => {
           },
         },
         activePane: { 'tab-1': 'pane-1' },
-        paneTitles: { 'tab-1': { 'pane-1': 'Shell', 'pane-2': 'Claude' } },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell', 'pane-2': 'Claude CLI' } },
         paneTitleSetByUser: { 'tab-1': { 'pane-1': true, 'pane-2': true } },
         renameRequestTabId: null,
         renameRequestPaneId: null,

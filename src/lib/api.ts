@@ -164,6 +164,14 @@ export type SearchOptions = {
   maxFiles?: number
 }
 
+export async function setSessionMetadata(
+  provider: string,
+  sessionId: string,
+  sessionType: string,
+): Promise<void> {
+  await api.post('/api/session-metadata', { provider, sessionId, sessionType })
+}
+
 export async function searchSessions(options: SearchOptions): Promise<SearchResponse> {
   const { query, tier = 'title', limit, maxFiles } = options
   const params = new URLSearchParams({ q: query, tier })

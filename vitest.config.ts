@@ -20,6 +20,7 @@ export default defineConfig({
     exclude: [
       '**/node_modules/**',
       '**/.worktrees/**',
+      '**/.claude/worktrees/**',
       'docs/plans/**',
       // Server tests run under vitest.server.config.ts (node environment)
       'test/server/**',

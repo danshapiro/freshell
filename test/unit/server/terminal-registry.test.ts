@@ -904,6 +904,22 @@ describe('buildSpawnSpec Unix paths', () => {
       expect(spec.env.TERM).toBe('screen-256color')
     })
 
+    it('strips NODE_ENV so child terminals use their own defaults', () => {
+      process.env.NODE_ENV = 'production'
+
+      const spec = buildSpawnSpec('shell', '/Users/john', 'system')
+
+      expect(spec.env.NODE_ENV).toBeUndefined()
+    })
+
+    it('strips npm_lifecycle_script inherited from host process', () => {
+      process.env.npm_lifecycle_script = 'cross-env NODE_ENV=production node dist/server/index.js'
+
+      const spec = buildSpawnSpec('shell', '/Users/john', 'system')
+
+      expect(spec.env.npm_lifecycle_script).toBeUndefined()
+    })
+
     it('includes COLORTERM environment variable', () => {
       delete process.env.COLORTERM
 

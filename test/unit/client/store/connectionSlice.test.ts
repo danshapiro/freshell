@@ -5,6 +5,7 @@ import connectionReducer, {
   setErrorCode,
   setPlatform,
   setAvailableClis,
+  setFeatureFlags,
   ConnectionState,
   ConnectionStatus,
 } from '../../../../src/store/connectionSlice'
@@ -334,6 +335,31 @@ describe('connectionSlice', () => {
 
       expect(state.lastError).toBe('Too many connections')
       expect(state.lastErrorCode).toBe(4003)
+    })
+  })
+
+  describe('featureFlags state', () => {
+    it('has empty featureFlags in initial state', () => {
+      const state = connectionReducer(undefined, { type: 'unknown' })
+      expect(state.featureFlags).toEqual({})
+    })
+
+    it('stores featureFlags via setFeatureFlags', () => {
+      const state = connectionReducer(undefined, setFeatureFlags({ kilroy: true }))
+      expect(state.featureFlags).toEqual({ kilroy: true })
+    })
+
+    it('replaces featureFlags entirely on update', () => {
+      let state = connectionReducer(undefined, setFeatureFlags({ kilroy: true }))
+      state = connectionReducer(state, setFeatureFlags({ kilroy: false }))
+      expect(state.featureFlags).toEqual({ kilroy: false })
+    })
+
+    it('does not interfere with other state', () => {
+      let state = connectionReducer(undefined, setFeatureFlags({ kilroy: true }))
+      state = connectionReducer(state, setPlatform('linux'))
+      expect(state.platform).toBe('linux')
+      expect(state.featureFlags).toEqual({ kilroy: true })
     })
   })
 

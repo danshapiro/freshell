@@ -705,6 +705,15 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               />
             </SettingsRow>
 
+            <SettingsRow label="Ignore Codex subagent sessions">
+              <Toggle
+                checked={settings.sidebar?.ignoreCodexSubagents ?? true}
+                onChange={(checked) => {
+                  dispatch(updateSettingsLocal({ sidebar: { ignoreCodexSubagents: checked } }))
+                  scheduleSave({ sidebar: { ignoreCodexSubagents: checked } })
+                }}
+              />
+            </SettingsRow>
 
             <SettingsRow label="Show non-interactive sessions">
               <Toggle

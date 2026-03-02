@@ -18,6 +18,7 @@ import agentChatReducer, {
   setSessionStatus,
 } from '@/store/agentChatSlice'
 import panesReducer from '@/store/panesSlice'
+import settingsReducer from '@/store/settingsSlice'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import { buildMenuItems, type MenuActions, type MenuBuildContext } from '@/components/context-menu/menu-defs'
 import type { ContextTarget } from '@/components/context-menu/context-menu-types'
@@ -39,6 +40,7 @@ function makeStore() {
     reducer: {
       agentChat: agentChatReducer,
       panes: panesReducer,
+      settings: settingsReducer,
     },
   })
 }

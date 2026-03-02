@@ -5,6 +5,8 @@ import { Provider } from 'react-redux'
 import PanePicker from '@/components/panes/PanePicker'
 import settingsReducer from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
+import extensionsReducer from '@/store/extensionsSlice'
+import type { ClientExtensionEntry } from '@shared/extension-types'
 import type { DefaultNewPane, SidebarSortMode, TerminalTheme } from '@/store/types'
 
 // Mock lucide-react icons
@@ -18,23 +20,33 @@ vi.mock('lucide-react', () => ({
   FileText: ({ className }: { className?: string }) => (
     <svg data-testid="file-text-icon" className={className} />
   ),
+  LayoutGrid: ({ className }: { className?: string }) => (
+    <svg data-testid="layout-grid-icon" className={className} />
+  ),
 }))
 
 function createStore(overrides?: {
   platform?: string | null
   availableClis?: Record<string, boolean>
   enabledProviders?: string[]
+  extensions?: ClientExtensionEntry[]
+  featureFlags?: Record<string, boolean>
 }) {
   return configureStore({
     reducer: {
       settings: settingsReducer,
       connection: connectionReducer,
+      extensions: extensionsReducer,
     },
     preloadedState: {
       connection: {
         status: 'ready' as const,
         platform: overrides?.platform ?? null,
         availableClis: overrides?.availableClis ?? {},
+        featureFlags: overrides?.featureFlags ?? {},
+      },
+      extensions: {
+        entries: overrides?.extensions ?? [],
       },
       settings: {
         settings: {
@@ -121,31 +133,31 @@ describe('PanePicker', () => {
       expect(screen.getByTestId('terminal-icon')).toBeInTheDocument()
     })
 
-    it('shows Claude and Codex buttons when available and enabled', () => {
+    it('shows Claude CLI and Codex CLI buttons when available and enabled', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
       })
-      expect(screen.getByRole('button', { name: 'Claude' })).toBeInTheDocument()
-      expect(screen.getByRole('button', { name: 'Codex' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Claude CLI' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Codex CLI' })).toBeInTheDocument()
     })
 
-    it('hides Claude when not available on system', () => {
+    it('hides Claude CLI when not available on system', () => {
       renderPicker({
         availableClis: { claude: false, codex: true },
         enabledProviders: ['claude', 'codex'],
       })
-      expect(screen.queryByRole('button', { name: 'Claude' })).not.toBeInTheDocument()
-      expect(screen.getByRole('button', { name: 'Codex' })).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Claude CLI' })).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Codex CLI' })).toBeInTheDocument()
     })
 
-    it('hides Codex when disabled in settings', () => {
+    it('hides Codex CLI when disabled in settings', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude'],
       })
-      expect(screen.getByRole('button', { name: 'Claude' })).toBeInTheDocument()
-      expect(screen.queryByRole('button', { name: 'Codex' })).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Claude CLI' })).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Codex CLI' })).not.toBeInTheDocument()
     })
 
     it('renders provider icons as inline SVGs (not img tags)', () => {
@@ -153,8 +165,8 @@ describe('PanePicker', () => {
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
       })
-      const claudeButton = screen.getByRole('button', { name: 'Claude' })
-      const codexButton = screen.getByRole('button', { name: 'Codex' })
+      const claudeButton = screen.getByRole('button', { name: 'Claude CLI' })
+      const codexButton = screen.getByRole('button', { name: 'Codex CLI' })
 
       // Should render inline SVGs that inherit color, not <img> tags
       expect(claudeButton.querySelector('svg')).toBeInTheDocument()
@@ -163,25 +175,45 @@ describe('PanePicker', () => {
       expect(codexButton.querySelector('img')).not.toBeInTheDocument()
     })
 
-    it('renders options in correct order: CLIs, freshclaude, Editor, Browser, Shell', () => {
+    it('renders options in correct order: Freshclaude, CLIs, Editor, Browser, Shell (Kilroy hidden by default)', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
       })
       const buttons = screen.getAllByRole('button')
       const labels = buttons.map(b => b.getAttribute('aria-label'))
-      expect(labels[0]).toBe('Claude')
-      expect(labels[1]).toBe('Codex')
-      expect(labels[2]).toBe('freshclaude')
+      expect(labels[0]).toBe('Freshclaude')
+      expect(labels[1]).toBe('Claude CLI')
+      expect(labels[2]).toBe('Codex CLI')
       expect(labels[3]).toBe('Editor')
       expect(labels[4]).toBe('Browser')
       expect(labels[5]).toBe('Shell')
+      expect(labels).not.toContain('Kilroy')
+    })
+
+    it('shows Kilroy when kilroy feature flag is enabled', () => {
+      renderPicker({
+        availableClis: { claude: true, codex: true },
+        enabledProviders: ['claude', 'codex'],
+        featureFlags: { kilroy: true },
+      })
+      const buttons = screen.getAllByRole('button')
+      const labels = buttons.map(b => b.getAttribute('aria-label'))
+      expect(labels).toContain('Kilroy')
+      // Kilroy should appear after CLIs (it has pickerAfterCli: true)
+      expect(labels[0]).toBe('Freshclaude')
+      expect(labels[1]).toBe('Claude CLI')
+      expect(labels[2]).toBe('Codex CLI')
+      expect(labels[3]).toBe('Kilroy')
+      expect(labels[4]).toBe('Editor')
+      expect(labels[5]).toBe('Browser')
+      expect(labels[6]).toBe('Shell')
     })
 
     it('shows only non-CLI options when no CLIs are available', () => {
       renderPicker({ availableClis: {} })
-      expect(screen.queryByRole('button', { name: 'Claude' })).not.toBeInTheDocument()
-      expect(screen.queryByRole('button', { name: 'Codex' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Claude CLI' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Codex CLI' })).not.toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Editor' })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Browser' })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Shell' })).toBeInTheDocument()
@@ -214,12 +246,12 @@ describe('PanePicker', () => {
       expect(onSelect).toHaveBeenCalledWith('shell')
     })
 
-    it('calls onSelect with claude when Claude button is clicked', () => {
+    it('calls onSelect with claude when Claude CLI button is clicked', () => {
       const { onSelect } = renderPicker({
         availableClis: { claude: true },
         enabledProviders: ['claude'],
       })
-      fireEvent.click(screen.getByRole('button', { name: 'Claude' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Claude CLI' }))
       completeFadeAnimation()
       expect(onSelect).toHaveBeenCalledWith('claude')
     })
@@ -443,16 +475,96 @@ describe('PanePicker', () => {
   })
 
   describe('balanced icon layout', () => {
-    it('prefers a balanced 3+2 arrangement when five options are visible', () => {
+    it('prefers a balanced 3+3 arrangement when six options are visible', () => {
       renderPicker({
-        availableClis: { claude: true },
-        enabledProviders: ['claude'],
+        availableClis: { claude: true, codex: true },
+        enabledProviders: ['claude', 'codex'],
       })
 
       const rows = screen.getAllByTestId('pane-picker-option-row')
       expect(rows).toHaveLength(2)
       expect(within(rows[0]).getAllByRole('button')).toHaveLength(3)
-      expect(within(rows[1]).getAllByRole('button')).toHaveLength(2)
+      expect(within(rows[1]).getAllByRole('button')).toHaveLength(3)
+    })
+  })
+
+  describe('extension options', () => {
+    const sampleExtension: ClientExtensionEntry = {
+      name: 'test-widget',
+      version: '1.0.0',
+      label: 'Test Widget',
+      description: 'A test extension',
+      category: 'client',
+      picker: { shortcut: 'T' },
+    }
+
+    const secondExtension: ClientExtensionEntry = {
+      name: 'another-ext',
+      version: '2.0.0',
+      label: 'Another Extension',
+      description: 'Another test extension',
+      category: 'server',
+    }
+
+    it('shows extension options from the registry', () => {
+      renderPicker({ extensions: [sampleExtension] })
+      expect(screen.getByRole('button', { name: 'Test Widget' })).toBeInTheDocument()
+    })
+
+    it('shows no extension options when registry is empty', () => {
+      renderPicker({ extensions: [] })
+      // Should only show built-in options (Editor, Browser, Shell)
+      const buttons = screen.getAllByRole('button')
+      const labels = buttons.map(b => b.getAttribute('aria-label'))
+      expect(labels).not.toContain('Test Widget')
+    })
+
+    it('shows multiple extension options', () => {
+      renderPicker({ extensions: [sampleExtension, secondExtension] })
+      expect(screen.getByRole('button', { name: 'Test Widget' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Another Extension' })).toBeInTheDocument()
+    })
+
+    it('calls onSelect with ext:<name> when extension option is clicked', () => {
+      const { onSelect } = renderPicker({ extensions: [sampleExtension] })
+      fireEvent.click(screen.getByRole('button', { name: 'Test Widget' }))
+      completeFadeAnimation()
+      expect(onSelect).toHaveBeenCalledWith('ext:test-widget')
+    })
+
+    it('supports keyboard shortcut from extension manifest', () => {
+      const { onSelect } = renderPicker({ extensions: [sampleExtension] })
+      fireEvent.keyDown(getContainer(), { key: 't' })
+      completeFadeAnimation()
+      expect(onSelect).toHaveBeenCalledWith('ext:test-widget')
+    })
+
+    it('uses empty shortcut when extension has no picker.shortcut', () => {
+      renderPicker({ extensions: [secondExtension] })
+      const button = screen.getByRole('button', { name: 'Another Extension' })
+      // The shortcut hint element should be present but empty
+      const hint = button.querySelector('.shortcut-hint')
+      expect(hint).toBeInTheDocument()
+      expect(hint!.textContent).toBe('')
+    })
+
+    it('renders fallback icon for extensions without custom icon', () => {
+      renderPicker({ extensions: [sampleExtension] })
+      const button = screen.getByRole('button', { name: 'Test Widget' })
+      expect(button.querySelector('[data-testid="layout-grid-icon"]')).toBeInTheDocument()
+    })
+
+    it('places extension options after built-in options', () => {
+      renderPicker({ extensions: [sampleExtension] })
+      const buttons = screen.getAllByRole('button')
+      const labels = buttons.map(b => b.getAttribute('aria-label'))
+      // Built-in options come first: Editor, Browser, Shell
+      // Extension options come after
+      const editorIdx = labels.indexOf('Editor')
+      const shellIdx = labels.indexOf('Shell')
+      const extIdx = labels.indexOf('Test Widget')
+      expect(extIdx).toBeGreaterThan(editorIdx)
+      expect(extIdx).toBeGreaterThan(shellIdx)
     })
   })
 })

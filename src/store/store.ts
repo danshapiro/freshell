@@ -14,6 +14,7 @@ import terminalMetaReducer from './terminalMetaSlice'
 import agentChatReducer from './agentChatSlice'
 import { networkReducer } from './networkSlice'
 import tabRegistryReducer from './tabRegistrySlice'
+import extensionsReducer from './extensionsSlice'
 import { perfMiddleware } from './perfMiddleware'
 import { persistMiddleware } from './persistMiddleware'
 import { sessionActivityPersistMiddleware } from './sessionActivityPersistence'
@@ -40,6 +41,7 @@ export const store = configureStore({
     agentChat: agentChatReducer,
     network: networkReducer,
     tabRegistry: tabRegistryReducer,
+    extensions: extensionsReducer,
   },
   middleware: (getDefault) =>
     getDefault({

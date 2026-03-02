@@ -1,10 +1,16 @@
-import { ChevronLeft, ChevronRight, Plus } from 'lucide-react'
+import { ChevronLeft, ChevronRight, PanelLeft, Plus } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { triggerHapticFeedback } from '@/lib/mobile-haptics'
 
-export function MobileTabStrip({ onOpenSwitcher }: { onOpenSwitcher?: () => void }) {
+interface MobileTabStripProps {
+  onOpenSwitcher?: () => void
+  sidebarCollapsed?: boolean
+  onToggleSidebar?: () => void
+}
+
+export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSidebar }: MobileTabStripProps) {
   const dispatch = useAppDispatch()
   const tabs = useAppSelector((s) => s.tabs.tabs)
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
@@ -31,6 +37,16 @@ export function MobileTabStrip({ onOpenSwitcher }: { onOpenSwitcher?: () => void
 
   return (
     <div className="relative z-20 h-12 shrink-0 flex items-center px-2 bg-background border-b border-border/30">
+      {sidebarCollapsed && onToggleSidebar && (
+        <button
+          className="min-h-11 min-w-11 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground"
+          onClick={() => { triggerHapticFeedback(); onToggleSidebar() }}
+          title="Show sidebar"
+          aria-label="Show sidebar"
+        >
+          <PanelLeft className="h-5 w-5" />
+        </button>
+      )}
       <button
         className="min-h-11 min-w-11 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground disabled:opacity-30"
         onClick={() => { triggerHapticFeedback(); dispatch(switchToPrevTab()) }}

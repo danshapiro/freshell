@@ -16,6 +16,7 @@ import type { SessionScanResult, SessionRepairResult } from './session-scanner/t
 import { isValidClaudeSessionId } from './claude-session-id.js'
 import type { SdkBridge } from './sdk-bridge.js'
 import type { SdkServerMessage } from '../shared/ws-protocol.js'
+import type { ExtensionManager } from './extension-manager.js'
 import { TerminalStreamBroker } from './terminal-stream/broker.js'
 import { chunkProjects } from './ws-chunking.js'
 import { loadSessionHistory, type ChatMessage } from './session-history-loader.js'
@@ -213,6 +214,7 @@ export class WsHandler {
   private terminalMetaListProvider?: () => TerminalMeta[]
   private tabsRegistryStore?: TabsRegistryStore
   private layoutStore?: LayoutStore
+  private extensionManager?: ExtensionManager
   private terminalStreamBroker: TerminalStreamBroker
   private screenshotRequests = new Map<string, PendingScreenshot>()
   private readonly serverInstanceId: string
@@ -233,12 +235,14 @@ export class WsHandler {
     tabsRegistryStore?: TabsRegistryStore,
     serverInstanceId?: string,
     layoutStore?: LayoutStore,
+    extensionManager?: ExtensionManager,
   ) {
     this.sessionRepairService = sessionRepairService
     this.handshakeSnapshotProvider = handshakeSnapshotProvider
     this.terminalMetaListProvider = terminalMetaListProvider
     this.tabsRegistryStore = tabsRegistryStore
     this.layoutStore = layoutStore
+    this.extensionManager = extensionManager
     this.serverInstanceId = serverInstanceId && serverInstanceId.trim().length > 0
       ? serverInstanceId
       : `srv-${randomUUID()}`
@@ -851,6 +855,12 @@ export class WsHandler {
         }
 
         this.send(ws, { type: 'ready', timestamp: nowIso(), serverInstanceId: this.serverInstanceId })
+        if (this.extensionManager) {
+          this.safeSend(ws, {
+            type: 'extensions.registry',
+            extensions: this.extensionManager.toClientRegistry(),
+          })
+        }
         this.scheduleHandshakeSnapshot(ws, state)
         return
       }

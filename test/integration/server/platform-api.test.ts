@@ -114,6 +114,76 @@ describe('Platform API', () => {
     })
   })
 
+  describe('featureFlags in platform response', () => {
+    it('includes featureFlags object in platform response', async () => {
+      const res = await request(app)
+        .get('/api/platform')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+
+      expect(res.status).toBe(200)
+      expect(res.body).toHaveProperty('featureFlags')
+      expect(typeof res.body.featureFlags).toBe('object')
+    })
+
+    it('returns kilroy: false when KILROY_ENABLED is not set', async () => {
+      delete process.env.KILROY_ENABLED
+
+      const res = await request(app)
+        .get('/api/platform')
+        .set('x-auth-token', TEST_AUTH_TOKEN)
+
+      expect(res.body.featureFlags.kilroy).toBe(false)
+    })
+
+    it('returns kilroy: true when KILROY_ENABLED is set to "1"', async () => {
+      process.env.KILROY_ENABLED = '1'
+
+      const flagApp = express()
+      flagApp.use(express.json())
+      flagApp.use('/api', (_req, _res, next) => next())
+      flagApp.use('/api', createPlatformRouter(mockDeps))
+
+      const res = await request(flagApp)
+        .get('/api/platform')
+
+      expect(res.body.featureFlags.kilroy).toBe(true)
+
+      delete process.env.KILROY_ENABLED
+    })
+
+    it('returns kilroy: true when KILROY_ENABLED is set to "true"', async () => {
+      process.env.KILROY_ENABLED = 'true'
+
+      const flagApp = express()
+      flagApp.use(express.json())
+      flagApp.use('/api', (_req, _res, next) => next())
+      flagApp.use('/api', createPlatformRouter(mockDeps))
+
+      const res = await request(flagApp)
+        .get('/api/platform')
+
+      expect(res.body.featureFlags.kilroy).toBe(true)
+
+      delete process.env.KILROY_ENABLED
+    })
+
+    it('returns kilroy: false when KILROY_ENABLED is set to "0"', async () => {
+      process.env.KILROY_ENABLED = '0'
+
+      const flagApp = express()
+      flagApp.use(express.json())
+      flagApp.use('/api', (_req, _res, next) => next())
+      flagApp.use('/api', createPlatformRouter(mockDeps))
+
+      const res = await request(flagApp)
+        .get('/api/platform')
+
+      expect(res.body.featureFlags.kilroy).toBe(false)
+
+      delete process.env.KILROY_ENABLED
+    })
+  })
+
   describe('GET /api/version', () => {
     it('returns current version and update check result', async () => {
       const res = await request(app)

@@ -1,11 +1,13 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
 import { nanoid } from 'nanoid'
-import { closePane, removeLayout } from './panesSlice'
+import { closePane, initLayout, removeLayout } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import type { PaneNode } from './paneTypes'
 import { findTabIdForSession } from '@/lib/session-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
+import { buildResumeContent } from '@/lib/session-type-utils'
+import { isAgentChatProviderName, getAgentChatProviderConfig, getAgentChatProviderLabel } from '@/lib/agent-chat-utils'
 import { recordClosedTabSnapshot } from './tabRegistrySlice'
 import {
   buildClosedTabRegistryRecord,
@@ -291,10 +293,19 @@ export const closeTab = createAsyncThunk(
 export const openSessionTab = createAsyncThunk(
   'tabs/openSessionTab',
   async (
-    { sessionId, title, cwd, provider, terminalId, forceNew }: { sessionId: string; title?: string; cwd?: string; provider?: CodingCliProviderName; terminalId?: string; forceNew?: boolean },
+    { sessionId, title, cwd, provider, sessionType, terminalId, forceNew }: {
+      sessionId: string
+      title?: string
+      cwd?: string
+      provider?: CodingCliProviderName
+      sessionType?: string
+      terminalId?: string
+      forceNew?: boolean
+    },
     { dispatch, getState }
   ) => {
     const resolvedProvider = provider || 'claude'
+    const resolvedSessionType = sessionType || resolvedProvider
     const state = getState() as RootState
 
     if (terminalId) {
@@ -305,6 +316,7 @@ export const openSessionTab = createAsyncThunk(
           return
         }
       }
+      // Running terminals are always terminal panes (agent-chat uses SDK, not PTY)
       dispatch(addTab({
         title: title || getProviderLabel(resolvedProvider),
         terminalId,
@@ -324,6 +336,35 @@ export const openSessionTab = createAsyncThunk(
         return
       }
     }
+
+    // For agent-chat sessions, create a tab then immediately set up agent-chat layout
+    // so TabContent's fallback initLayout (which always creates terminal panes) doesn't win
+    if (isAgentChatProviderName(resolvedSessionType)) {
+      const agentConfig = getAgentChatProviderConfig(resolvedSessionType)
+      const providerSettings = agentConfig
+        ? state.settings.settings.agentChat?.providers?.[agentConfig.name]
+        : undefined
+      const tabId = nanoid()
+      dispatch(addTab({
+        id: tabId,
+        title: title || getAgentChatProviderLabel(resolvedSessionType),
+        mode: resolvedProvider,
+        codingCliProvider: resolvedProvider,
+        initialCwd: cwd,
+        resumeSessionId: sessionId,
+      }))
+      dispatch(initLayout({
+        tabId,
+        content: buildResumeContent({
+          sessionType: resolvedSessionType,
+          sessionId,
+          cwd,
+          agentChatProviderSettings: providerSettings,
+        }),
+      }))
+      return
+    }
+
     dispatch(addTab({
       title: title || getProviderLabel(resolvedProvider),
       mode: resolvedProvider,

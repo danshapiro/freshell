@@ -17,7 +17,7 @@ Point commands at the running Freshell server:
 
 ```bash
 export FRESHELL_URL="http://localhost:3001"
-export FRESHELL_TOKEN="<auth-token>"
+export FRESHELL_TOKEN="$(grep AUTH_TOKEN /home/user/code/freshell/.env | cut -d= -f2)"
 $FSH health
 ```
 
@@ -28,7 +28,8 @@ Use absolute paths for `--cwd` and `--editor`.
 - Freshell CLI is an HTTP client over `/api/*`, not a local tmux socket client.
 - Tabs and pane trees live in `layoutStore`.
 - Terminal lifecycle + scrollback live in `terminalRegistry`.
-- Pane kinds: `terminal`, `editor`, `browser`.
+- Pane kinds: `terminal`, `editor`, `browser`, `agent-chat` (Claude/Codex), `picker` (transient).
+- **Picker panes are ephemeral.** A freshly-created tab without `--mode`/`--browser`/`--editor` starts as a `picker` pane while the user chooses what to launch. Once they select, the picker is replaced by the real pane with a **new pane ID**. Never target a `picker` pane for splits or other mutations — wait until it resolves to its final kind, or use `--mode`/`--browser`/`--editor` flags on `new-tab`/`split-pane` to skip the picker entirely.
 - Typical loop: `new-tab/split-pane` -> `send-keys` -> `wait-for` -> `capture-pane`/`screenshot-*`.
 
 ## Command reference

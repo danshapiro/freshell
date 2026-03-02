@@ -43,14 +43,14 @@ type CodingCliCommandSpec = {
 
 const CODING_CLI_COMMANDS: Record<Exclude<TerminalMode, 'shell'>, CodingCliCommandSpec> = {
   claude: {
-    label: 'Claude',
+    label: 'Claude CLI',
     envVar: 'CLAUDE_CMD',
     defaultCommand: 'claude',
     resumeArgs: (sessionId) => ['--resume', sessionId],
     supportsPermissionMode: true,
   },
   codex: {
-    label: 'Codex',
+    label: 'Codex CLI',
     envVar: 'CODEX_CMD',
     defaultCommand: 'codex',
     resumeArgs: (sessionId) => ['resume', sessionId],
@@ -632,6 +632,8 @@ export function buildSpawnSpec(
   // - CI/NO_COLOR/FORCE_COLOR/COLOR: disables interactive color in user PTYs
   // - PORT/VITE_PORT/AUTH_TOKEN/ALLOWED_ORIGINS: server-specific vars that cause
   //   port conflicts and leak credentials into child processes
+  // - NODE_ENV/npm_lifecycle_script: server's production env leaks into child shells,
+  //   breaking tools like React test-utils that check NODE_ENV
   const {
     CLAUDECODE: _claudecode,
     CI: _ci,
@@ -642,6 +644,8 @@ export function buildSpawnSpec(
     VITE_PORT: _vitePort,
     AUTH_TOKEN: _authToken,
     ALLOWED_ORIGINS: _allowedOrigins,
+    NODE_ENV: _nodeEnv,
+    npm_lifecycle_script: _npmLifecycleScript,
     ...parentEnv
   } = process.env
   const env = {

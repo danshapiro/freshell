@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import TabBar from '../../../../src/components/TabBar'
@@ -123,5 +123,59 @@ describe('TabBar mobile touch targets', () => {
     const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
     expect(closeButton.className).toMatch(/min-h-11/)
     expect(closeButton.className).toMatch(/min-w-11/)
+  })
+})
+
+describe('TabBar sidebar toggle integration', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(localStorage.getItem).mockReturnValue(null)
+  })
+
+  afterEach(() => {
+    cleanup()
+    ;(globalThis as any).setMobileForTest?.(false)
+  })
+
+  it('renders show-sidebar button before tabs on desktop when sidebar is collapsed', () => {
+    const onToggleSidebar = vi.fn()
+    const store = createStore(defaultTabsState, defaultPanesState)
+    render(
+      <Provider store={store}>
+        <TabBar sidebarCollapsed onToggleSidebar={onToggleSidebar} />
+      </Provider>
+    )
+
+    const showButton = screen.getByTitle('Show sidebar')
+    expect(showButton).toBeInTheDocument()
+    fireEvent.click(showButton)
+    expect(onToggleSidebar).toHaveBeenCalled()
+  })
+
+  it('does not render show-sidebar button when sidebar is open', () => {
+    const store = createStore(defaultTabsState, defaultPanesState)
+    render(
+      <Provider store={store}>
+        <TabBar sidebarCollapsed={false} onToggleSidebar={() => {}} />
+      </Provider>
+    )
+
+    expect(screen.queryByTitle('Show sidebar')).not.toBeInTheDocument()
+  })
+
+  it('renders show-sidebar button in MobileTabStrip when sidebar is collapsed on mobile', () => {
+    ;(globalThis as any).setMobileForTest(true)
+    const onToggleSidebar = vi.fn()
+    const store = createStore(defaultTabsState, defaultPanesState)
+    render(
+      <Provider store={store}>
+        <TabBar sidebarCollapsed onToggleSidebar={onToggleSidebar} />
+      </Provider>
+    )
+
+    const showButton = screen.getByTitle('Show sidebar')
+    expect(showButton).toBeInTheDocument()
+    fireEvent.click(showButton)
+    expect(onToggleSidebar).toHaveBeenCalled()
   })
 })

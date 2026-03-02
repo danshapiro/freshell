@@ -7,6 +7,7 @@ function createSessionItem(overrides: Partial<SidebarSessionItem>): SidebarSessi
     id: 'session-claude-test',
     sessionId: 'test',
     provider: 'claude',
+    sessionType: 'claude',
     title: 'Test Session',
     hasTitle: true,
     timestamp: 1000,
@@ -16,11 +17,80 @@ function createSessionItem(overrides: Partial<SidebarSessionItem>): SidebarSessi
   }
 }
 
-// Import the sort function for testing
-// We need to export it from the module for unit testing
-import { sortSessionItems } from '@/store/selectors/sidebarSelectors'
+// Import the sort function and buildSessionItems for testing
+import { sortSessionItems, buildSessionItems } from '@/store/selectors/sidebarSelectors'
+import type { CodingCliSession, ProjectGroup } from '@/store/types'
 
 describe('sidebarSelectors', () => {
+  describe('buildSessionItems', () => {
+    const emptyTabs: [] = []
+    const emptyPanes = { layouts: {} } as any
+    const emptyTerminals: [] = []
+    const emptyActivity: Record<string, number> = {}
+
+    function makeProject(sessions: Partial<CodingCliSession>[], projectPath = '/test/project', color?: string): ProjectGroup {
+      return {
+        projectPath,
+        color,
+        sessions: sessions.map((s) => ({
+          provider: 'claude' as const,
+          sessionId: 'sess-1',
+          projectPath,
+          updatedAt: 1000,
+          ...s,
+        })),
+      }
+    }
+
+    it('defaults sessionType to provider when not set on session', () => {
+      const projects = [
+        makeProject([{ sessionId: 'sess-1', provider: 'claude' }]),
+      ]
+
+      const items = buildSessionItems(projects, emptyTabs, emptyPanes, emptyTerminals, emptyActivity)
+
+      expect(items).toHaveLength(1)
+      expect(items[0].sessionType).toBe('claude')
+    })
+
+    it('defaults sessionType to provider for codex sessions', () => {
+      const projects = [
+        makeProject([{ sessionId: 'sess-2', provider: 'codex' }]),
+      ]
+
+      const items = buildSessionItems(projects, emptyTabs, emptyPanes, emptyTerminals, emptyActivity)
+
+      expect(items).toHaveLength(1)
+      expect(items[0].sessionType).toBe('codex')
+    })
+
+    it('uses explicit sessionType when set on session', () => {
+      const projects = [
+        makeProject([{ sessionId: 'sess-3', provider: 'claude', sessionType: 'custom-agent' }]),
+      ]
+
+      const items = buildSessionItems(projects, emptyTabs, emptyPanes, emptyTerminals, emptyActivity)
+
+      expect(items).toHaveLength(1)
+      expect(items[0].sessionType).toBe('custom-agent')
+    })
+
+    it('propagates sessionType for multiple sessions in a project', () => {
+      const projects = [
+        makeProject([
+          { sessionId: 'sess-a', provider: 'claude' },
+          { sessionId: 'sess-b', provider: 'claude', sessionType: 'agent-chat' },
+        ]),
+      ]
+
+      const items = buildSessionItems(projects, emptyTabs, emptyPanes, emptyTerminals, emptyActivity)
+
+      expect(items).toHaveLength(2)
+      expect(items[0].sessionType).toBe('claude')
+      expect(items[1].sessionType).toBe('agent-chat')
+    })
+  })
+
   describe('sortSessionItems', () => {
     describe('recency mode', () => {
       it('sorts by timestamp descending', () => {

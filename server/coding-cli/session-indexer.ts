@@ -8,6 +8,7 @@ import { configStore, SessionOverride } from '../config-store.js'
 import type { CodingCliProvider } from './provider.js'
 import { makeSessionKey, type CodingCliSession, type CodingCliProviderName, type ProjectGroup } from './types.js'
 import { diffProjects } from '../sessions-sync/diff.js'
+import type { SessionMetadataStore, SessionMetadataEntry } from '../session-metadata-store.js'
 
 const perfConfig = getPerfConfig()
 const REFRESH_YIELD_EVERY = 200
@@ -131,7 +132,11 @@ export class CodingCliSessionIndexer {
   private sessionKeyToFilePath = new Map<string, string>()
   private urgentRefreshNeeded = false
 
-  constructor(private providers: CodingCliProvider[], options: SessionIndexerOptions = {}) {
+  constructor(
+    private providers: CodingCliProvider[],
+    options: SessionIndexerOptions = {},
+    private sessionMetadataStore?: SessionMetadataStore,
+  ) {
     this.debounceMs = options.debounceMs ?? DEFAULT_DEBOUNCE_MS
     this.throttleMs = options.throttleMs ?? DEFAULT_THROTTLE_MS
     this.fullScanIntervalMs = options.fullScanIntervalMs ??
@@ -490,7 +495,11 @@ export class CodingCliSessionIndexer {
       {},
       { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
     )
-    const [colors, cfg] = await Promise.all([configStore.getProjectColors(), configStore.snapshot()])
+    const [colors, cfg, sessionMetadata] = await Promise.all([
+      configStore.getProjectColors(),
+      configStore.snapshot(),
+      this.sessionMetadataStore?.getAll() ?? Promise.resolve({} as Record<string, SessionMetadataEntry>),
+    ])
     const enabledProviders = cfg.settings?.codingCli?.enabledProviders
     const enabledSet = new Set(enabledProviders ?? this.providers.map((p) => p.name))
     const enabledKey = Array.from(enabledSet).sort().join(',')
@@ -604,6 +613,12 @@ export class CodingCliSessionIndexer {
       }
       const merged = applyOverride(cached.baseSession, ov)
       if (!merged) continue
+      // Merge sessionType from metadata store
+      const metaKey = makeSessionKey(merged.provider, merged.sessionId)
+      const meta = sessionMetadata[metaKey]
+      if (meta?.sessionType) {
+        merged.sessionType = meta.sessionType
+      }
       const group = groupsByPath.get(merged.projectPath) || {
         projectPath: merged.projectPath,
         sessions: [],

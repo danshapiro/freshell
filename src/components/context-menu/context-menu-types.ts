@@ -11,7 +11,7 @@ export type ContextTarget =
   | { kind: 'browser'; tabId: string; paneId: string }
   | { kind: 'editor'; tabId: string; paneId: string }
   | { kind: 'pane-picker'; tabId: string; paneId: string }
-  | { kind: 'sidebar-session'; sessionId: string; provider?: string; runningTerminalId?: string; hasTab?: boolean }
+  | { kind: 'sidebar-session'; sessionId: string; provider?: string; sessionType?: string; runningTerminalId?: string; hasTab?: boolean }
   | { kind: 'history-project'; projectPath: string }
   | { kind: 'history-session'; sessionId: string; provider?: string }
   | { kind: 'overview-terminal'; terminalId: string }

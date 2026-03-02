@@ -32,6 +32,10 @@ export function derivePaneTitle(content: PaneContent): string {
     }
   }
 
+  if (content.kind === 'extension') {
+    return content.extensionName
+  }
+
   // Terminal content
   if (isCodingCliMode(content.mode)) {
     return getProviderLabel(content.mode)

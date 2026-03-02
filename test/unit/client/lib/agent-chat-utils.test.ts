@@ -5,6 +5,7 @@ import {
   isAgentChatProviderName,
   getAgentChatProviderConfig,
   getAgentChatProviderLabel,
+  getVisibleAgentChatConfigs,
 } from '@/lib/agent-chat-utils'
 
 describe('agent-chat-utils', () => {
@@ -25,7 +26,7 @@ describe('agent-chat-utils', () => {
   it('returns config for freshclaude', () => {
     const config = getAgentChatProviderConfig('freshclaude')
     expect(config).toBeDefined()
-    expect(config!.label).toBe('freshclaude')
+    expect(config!.label).toBe('Freshclaude')
     expect(config!.defaultModel).toBe('claude-opus-4-6')
     expect(config!.defaultPermissionMode).toBe('bypassPermissions')
     expect(config!.defaultEffort).toBe('high')
@@ -36,10 +37,68 @@ describe('agent-chat-utils', () => {
   })
 
   it('returns label for known provider', () => {
-    expect(getAgentChatProviderLabel('freshclaude')).toBe('freshclaude')
+    expect(getAgentChatProviderLabel('freshclaude')).toBe('Freshclaude')
   })
 
   it('returns fallback label for unknown provider', () => {
     expect(getAgentChatProviderLabel('nope')).toBe('Agent Chat')
+  })
+
+  it('kilroy is a valid provider', () => {
+    expect(isAgentChatProviderName('kilroy')).toBe(true)
+  })
+
+  it('returns config for kilroy', () => {
+    const config = getAgentChatProviderConfig('kilroy')
+    expect(config).toBeDefined()
+    expect(config!.name).toBe('kilroy')
+    expect(config!.label).toBe('Kilroy')
+    expect(config!.codingCliProvider).toBe('claude')
+    expect(config!.defaultModel).toBe('claude-opus-4-6')
+    expect(config!.defaultPermissionMode).toBe('bypassPermissions')
+    expect(config!.defaultEffort).toBe('high')
+    expect(config!.pickerShortcut).not.toBe('A') // must differ from freshclaude
+  })
+
+  it('returns label for kilroy provider', () => {
+    expect(getAgentChatProviderLabel('kilroy')).toBe('Kilroy')
+  })
+
+  it('all providers have unique picker shortcuts', () => {
+    const shortcuts = AGENT_CHAT_PROVIDER_CONFIGS.map((c) => c.pickerShortcut)
+    expect(new Set(shortcuts).size).toBe(shortcuts.length)
+  })
+
+  it('kilroy config has hidden flag set to true', () => {
+    const config = getAgentChatProviderConfig('kilroy')
+    expect(config!.hidden).toBe(true)
+  })
+
+  it('freshclaude config does not have hidden flag', () => {
+    const config = getAgentChatProviderConfig('freshclaude')
+    expect(config!.hidden).toBeUndefined()
+  })
+
+  describe('getVisibleAgentChatConfigs', () => {
+    it('excludes hidden providers when no feature flags are set', () => {
+      const visible = getVisibleAgentChatConfigs({})
+      const names = visible.map((c) => c.name)
+      expect(names).toContain('freshclaude')
+      expect(names).not.toContain('kilroy')
+    })
+
+    it('includes hidden providers when their feature flag is true', () => {
+      const visible = getVisibleAgentChatConfigs({ kilroy: true })
+      const names = visible.map((c) => c.name)
+      expect(names).toContain('freshclaude')
+      expect(names).toContain('kilroy')
+    })
+
+    it('still excludes hidden providers when their feature flag is false', () => {
+      const visible = getVisibleAgentChatConfigs({ kilroy: false })
+      const names = visible.map((c) => c.name)
+      expect(names).toContain('freshclaude')
+      expect(names).not.toContain('kilroy')
+    })
   })
 })

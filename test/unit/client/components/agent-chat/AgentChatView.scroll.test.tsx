@@ -5,6 +5,7 @@ import { Provider } from 'react-redux'
 import AgentChatView from '@/components/agent-chat/AgentChatView'
 import agentChatReducer from '@/store/agentChatSlice'
 import panesReducer from '@/store/panesSlice'
+import settingsReducer from '@/store/settingsSlice'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 
 // jsdom doesn't implement scrollIntoView
@@ -25,6 +26,7 @@ function makeStore() {
     reducer: {
       agentChat: agentChatReducer,
       panes: panesReducer,
+      settings: settingsReducer,
     },
   })
 }

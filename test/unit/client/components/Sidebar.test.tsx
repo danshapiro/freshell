@@ -337,10 +337,50 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(rowButton).toBeTruthy()
 
       fireEvent.mouseEnter(rowButton!)
-      expect(screen.getByText('Claude: Implement user authentication')).toBeInTheDocument()
+      expect(screen.getByText('Claude CLI: Implement user authentication')).toBeInTheDocument()
 
       fireEvent.mouseLeave(rowButton!)
-      expect(screen.queryByText('Claude: Implement user authentication')).not.toBeInTheDocument()
+      expect(screen.queryByText('Claude CLI: Implement user authentication')).not.toBeInTheDocument()
+    })
+
+    it('renders freshclaude icon and label for sessions with sessionType freshclaude', () => {
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: 'session-fc',
+              projectPath: '/home/user/project',
+              updatedAt: Date.now(),
+              title: 'Freshclaude session',
+              cwd: '/home/user/project',
+              sessionType: 'freshclaude',
+            },
+          ],
+        },
+      ]
+
+      const store = createTestStore({ projects })
+      renderSidebar(store, [])
+
+      act(() => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const title = screen.getByText('Freshclaude session')
+      const rowButton = title.closest('button')
+      expect(rowButton).toBeTruthy()
+
+      // Tooltip should show "Freshclaude" label (not "Claude CLI")
+      fireEvent.mouseEnter(rowButton!)
+      expect(screen.getByText('Freshclaude: Freshclaude session')).toBeInTheDocument()
+      // Should NOT show "Claude CLI" label
+      expect(screen.queryByText('Claude CLI: Freshclaude session')).not.toBeInTheDocument()
+
+      // The icon SVG should be the FreshclaudeIcon (viewBox 0 0 1024 1024), not ClaudeIcon
+      const svg = rowButton!.querySelector('svg')
+      expect(svg).toBeTruthy()
+      expect(svg!.getAttribute('viewBox')).toBe('0 0 1024 1024')
     })
   })
 

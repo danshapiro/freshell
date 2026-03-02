@@ -1,4 +1,4 @@
-import { Plus } from 'lucide-react'
+import { PanelLeft, Plus } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, closeTab, setActiveTab, updateTab, reorderTabs, clearTabRenameRequest } from '@/store/tabsSlice'
 import { clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
@@ -117,7 +117,12 @@ function SortableTab({
 const EMPTY_LAYOUTS: Record<string, never> = {}
 const EMPTY_ATTENTION: Record<string, boolean> = {}
 
-export default function TabBar() {
+interface TabBarProps {
+  sidebarCollapsed?: boolean
+  onToggleSidebar?: () => void
+}
+
+export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProps = {}) {
   const dispatch = useAppDispatch()
   const tabsState = useAppSelector((s) => s.tabs as any) as
     | { tabs?: Tab[]; activeTabId?: string | null; renameRequestTabId?: string | null }
@@ -245,7 +250,11 @@ export default function TabBar() {
   if (isMobile) {
     return (
       <>
-        <MobileTabStrip onOpenSwitcher={() => setShowSwitcher(true)} />
+        <MobileTabStrip
+          onOpenSwitcher={() => setShowSwitcher(true)}
+          sidebarCollapsed={sidebarCollapsed}
+          onToggleSidebar={onToggleSidebar}
+        />
         {showSwitcher && <TabSwitcher onClose={() => setShowSwitcher(false)} />}
       </>
     )
@@ -268,6 +277,16 @@ export default function TabBar() {
           strategy={horizontalListSortingStrategy}
         >
           <div className="relative z-10 flex items-end gap-0.5 overflow-x-auto overflow-y-hidden pt-px flex-1">
+            {sidebarCollapsed && onToggleSidebar && (
+              <button
+                className="flex-shrink-0 mb-1 p-1 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-colors"
+                title="Show sidebar"
+                aria-label="Show sidebar"
+                onClick={onToggleSidebar}
+              >
+                <PanelLeft className="h-3.5 w-3.5" />
+              </button>
+            )}
             {tabs.map((tab: Tab) => (
               <SortableTab
                 key={tab.id}

@@ -32,6 +32,7 @@ export const defaultSettings: AppSettings = {
     sortMode: 'recency-pinned',
     showProjectBadges: true,
     showSubagents: false,
+    ignoreCodexSubagents: true,
     showNoninteractiveSessions: false,
     hideEmptySessions: true,
     excludeFirstChatSubstrings: [],

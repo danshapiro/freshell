@@ -9,6 +9,7 @@ export default defineConfig({
       'test/integration/server/**/*.test.ts',
       'test/integration/session-repair.test.ts',
       'test/integration/session-search-e2e.test.ts',
+      'test/integration/extension-system.test.ts',
     ],
     exclude: ['docs/plans/**'],
     testTimeout: 30000,

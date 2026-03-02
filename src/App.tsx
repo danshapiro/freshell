@@ -1,10 +1,9 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type TouchEvent as ReactTouchEvent } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { setStatus, setError, setErrorCode, setServerInstanceId, setPlatform, setAvailableClis } from '@/store/connectionSlice'
+import { setStatus, setError, setErrorCode, setServerInstanceId, setPlatform, setAvailableClis, setFeatureFlags } from '@/store/connectionSlice'
 import { setSettings } from '@/store/settingsSlice'
 import {
   setProjects,
-  clearProjects,
   mergeProjects,
   applySessionsPatch,
   markWsSnapshotReceived,
@@ -46,6 +45,7 @@ import { X, Copy, Check, PanelLeft, AlertTriangle } from 'lucide-react'
 import { updateSettingsLocal, markSaved } from '@/store/settingsSlice'
 
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
+import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
 import { createLogger } from '@/lib/client-logger'
 import type { ProjectGroup, AppSettings } from '@/store/types'
@@ -330,6 +330,39 @@ export default function App() {
     let cleanedUp = false
     let cleanup: (() => void) | null = null
     let stopTabRegistrySync: (() => void) | null = null
+
+    // Buffer for chunked sessions.updated messages — we accumulate all chunks
+    // and apply them atomically to avoid the sidebar collapsing and rebuilding
+    // (scrollbar "blink") during incremental chunked delivery.
+    //
+    // The debounce timer fires 300ms after the LAST chunk.  Server inter-chunk
+    // delays are normally sub-millisecond (setImmediate yield); the only source
+    // of longer gaps is WebSocket drain backpressure.  300ms is generous enough
+    // for all practical scenarios.  If the timer fires with a partial buffer
+    // (extreme backpressure), setProjects replaces the sidebar briefly; any
+    // late-arriving append chunks merge gracefully via the fallback path.
+    let chunkedBuffer: ProjectGroup[] | null = null
+    let chunkedFlushTimer: ReturnType<typeof setTimeout> | null = null
+    const CHUNK_FLUSH_DELAY_MS = 300
+
+    function clearChunkedState() {
+      if (chunkedFlushTimer) { clearTimeout(chunkedFlushTimer); chunkedFlushTimer = null }
+      chunkedBuffer = null
+    }
+
+    function flushChunkedBuffer() {
+      if (chunkedFlushTimer) { clearTimeout(chunkedFlushTimer); chunkedFlushTimer = null }
+      if (chunkedBuffer) {
+        dispatch(setProjects(chunkedBuffer))
+        dispatch(markWsSnapshotReceived())
+        chunkedBuffer = null
+      }
+    }
+
+    function scheduleChunkedFlush() {
+      if (chunkedFlushTimer) clearTimeout(chunkedFlushTimer)
+      chunkedFlushTimer = setTimeout(flushChunkedBuffer, CHUNK_FLUSH_DELAY_MS)
+    }
     async function bootstrap() {
       const handleBootstrapAuthFailure = (err: unknown): boolean => {
         if (!isApiUnauthorizedError(err)) return false
@@ -388,30 +421,45 @@ export default function App() {
           dispatch(setStatus('ready'))
           dispatch(setServerInstanceId(ready.success ? ready.data.serverInstanceId : undefined))
           dispatch(resetWsSnapshotReceived())
+          // Discard any in-flight chunked buffer from a previous connection
+          // to prevent stale data from overwriting the new session snapshot.
+          clearChunkedState()
           // If App registered late and missed a prior snapshot, a fresh HTTP baseline
           // from this bootstrap cycle is still safe for enabling patch application.
           promoteRecentHttpSessionsBaseline()
           requestTerminalMetaList()
         }
         if (msg.type === 'sessions.updated') {
-          // Support chunked sessions for mobile browsers with limited WebSocket buffers
           const projects = (msg.projects || []) as ProjectGroup[]
           if (msg.clear) {
-            // First chunk: clear existing, then merge
-            dispatch(clearProjects())
-            dispatch(mergeProjects(projects))
+            // First chunk of a multi-chunk update: start buffering instead of
+            // clearing Redux state (which causes the sidebar to collapse).
+            chunkedBuffer = [...projects]
+            scheduleChunkedFlush()
           } else if (msg.append) {
-            // Subsequent chunks: merge with existing
-            dispatch(mergeProjects(projects))
+            if (chunkedBuffer) {
+              // Subsequent chunk while buffering: accumulate
+              chunkedBuffer.push(...projects)
+              scheduleChunkedFlush()
+            } else {
+              // Append without a prior clear (shouldn't happen, but handle gracefully)
+              dispatch(mergeProjects(projects))
+              dispatch(markWsSnapshotReceived())
+            }
           } else {
-            // Full update (broadcasts, legacy): replace all
+            // Single-chunk update (no clear/append flags): apply immediately
+            if (chunkedBuffer) flushChunkedBuffer()
             dispatch(setProjects(projects))
+            dispatch(markWsSnapshotReceived())
           }
-          dispatch(markWsSnapshotReceived())
         }
         if (msg.type === 'sessions.patch') {
+          // If a patch arrives while we're buffering a chunked update, flush
+          // the buffer first so the patch applies against a complete baseline.
+          if (chunkedBuffer) flushChunkedBuffer()
+          const upsertProjects = (msg.upsertProjects || []) as ProjectGroup[]
           dispatch(applySessionsPatch({
-            upsertProjects: (msg.upsertProjects || []) as ProjectGroup[],
+            upsertProjects,
             removeProjectPaths: msg.removeProjectPaths || [],
           }))
         }
@@ -477,12 +525,24 @@ export default function App() {
           })
         }
 
+        // Extension registry & lifecycle messages
+        if (msg.type === 'extensions.registry') {
+          dispatch(setRegistry(msg.extensions))
+        }
+        if (msg.type === 'extension.server.ready') {
+          dispatch(updateServerStatus({ name: msg.name, serverRunning: true, serverPort: msg.port }))
+        }
+        if (msg.type === 'extension.server.stopped') {
+          dispatch(updateServerStatus({ name: msg.name, serverRunning: false, serverPort: undefined }))
+        }
+
         // SDK message handling (freshclaude pane)
         handleSdkMessage(dispatch, msg as Record<string, unknown>, ws)
       })
 
       cleanup = () => {
         unsubscribe()
+        clearChunkedState()
       }
       if (cleanedUp) cleanup()
 
@@ -500,11 +560,15 @@ export default function App() {
           platform: string
           availableClis?: Record<string, boolean>
           hostName?: string
+          featureFlags?: Record<string, boolean>
         }>('/api/platform')
         if (!cancelled) {
           dispatch(setPlatform(platformInfo.platform))
           if (platformInfo.availableClis) {
             dispatch(setAvailableClis(platformInfo.availableClis))
+          }
+          if (platformInfo.featureFlags) {
+            dispatch(setFeatureFlags(platformInfo.featureFlags))
           }
           dispatch(setTabRegistryDeviceMeta(resolveAndPersistDeviceMeta({
             platform: platformInfo.platform,
@@ -725,7 +789,9 @@ export default function App() {
     }
     return (
       <div className="h-full min-h-0 overflow-hidden flex flex-col">
-        {(!isLandscapeTerminalView || landscapeTabBarRevealed) && <TabBar />}
+        {(!isLandscapeTerminalView || landscapeTabBarRevealed) && (
+          <TabBar sidebarCollapsed={sidebarCollapsed} onToggleSidebar={toggleSidebarCollapse} />
+        )}
         <div
           className="flex-1 min-h-0 relative bg-background"
           data-testid="terminal-work-area"
@@ -786,17 +852,8 @@ export default function App() {
         {...(isMobile ? bindSidebarSwipe() : {})}
         style={isMobile ? { touchAction: 'pan-y' } : undefined}
       >
-        {sidebarCollapsed && (
-          <button
-            onClick={toggleSidebarCollapse}
-            className="absolute left-2 top-2 z-30 p-1.5 rounded-md hover:bg-muted transition-colors min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center bg-card/90 border border-border/40"
-            title="Show sidebar"
-            aria-label="Show sidebar"
-            data-testid="show-sidebar-button"
-          >
-            <PanelLeft className="h-3.5 w-3.5 text-muted-foreground" />
-          </button>
-        )}
+        {/* Show-sidebar toggle is integrated into TabBar for terminal view,
+            and rendered inline below for non-terminal views */}
         {/* Mobile overlay when sidebar is open */}
         {isMobile && !sidebarCollapsed && (
           <div
@@ -815,7 +872,7 @@ export default function App() {
         )}
         {/* Sidebar - on mobile it overlays, on desktop it's inline */}
         {!sidebarCollapsed && (
-          <div className={isMobile ? 'absolute inset-y-0 left-0 right-0 z-20' : 'contents'}>
+          <div className={isMobile ? 'absolute inset-y-0 left-0 right-0 z-30' : 'contents'}>
             <Sidebar
               view={view}
               onNavigate={(v) => {
@@ -846,6 +903,19 @@ export default function App() {
           {...(isMobile ? bindTabSwipe() : {})}
           style={isMobile ? { touchAction: 'pan-y' } : undefined}
         >
+          {sidebarCollapsed && (view !== 'terminal' || (isLandscapeTerminalView && !landscapeTabBarRevealed) || tabs.length === 0) && (
+            <div className="shrink-0 flex items-center px-2 h-10 border-b border-border/30">
+              <button
+                onClick={toggleSidebarCollapse}
+                className="p-1.5 rounded-md hover:bg-muted transition-colors min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center"
+                title="Show sidebar"
+                aria-label="Show sidebar"
+                data-testid="show-sidebar-button"
+              >
+                <PanelLeft className="h-3.5 w-3.5 text-muted-foreground" />
+              </button>
+            </div>
+          )}
           {content}
         </div>
       </div>
