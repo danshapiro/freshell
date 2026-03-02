@@ -624,7 +624,7 @@ export type SdkServerMessage =
   | { type: 'sdk.permission.request'; sessionId: string; requestId: string; subtype: string; tool?: { name: string; input?: Record<string, unknown> }; toolUseID?: string; suggestions?: unknown[]; blockedPath?: string; decisionReason?: string }
   | { type: 'sdk.permission.cancelled'; sessionId: string; requestId: string }
   | { type: 'sdk.status'; sessionId: string; status: SdkSessionStatus }
-  | { type: 'sdk.error'; sessionId: string; message: string }
+  | { type: 'sdk.error'; sessionId: string; message: string; code?: string }
   | { type: 'sdk.history'; sessionId: string; messages: Array<{ role: 'user' | 'assistant'; content: ContentBlock[]; timestamp?: string }> }
   | { type: 'sdk.exit'; sessionId: string; exitCode?: number }
   | { type: 'sdk.killed'; sessionId: string; success: boolean }

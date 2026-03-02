@@ -712,6 +712,41 @@ export const panesSlice = createSlice({
       }
     },
 
+    /** Partially merge fields into existing pane content (avoids stale-ref overwrites
+     *  when multiple effects dispatch in the same render batch). */
+    mergePaneContent: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string; updates: Partial<PaneContent> }>
+    ) => {
+      const { tabId, paneId, updates } = action.payload
+      const root = state.layouts[tabId]
+      if (!root) return
+
+      function mergeContent(node: PaneNode): PaneNode {
+        if (node.type === 'leaf') {
+          if (node.id === paneId) {
+            return { ...node, content: { ...node.content, ...updates } as PaneContent }
+          }
+          return node
+        }
+        return {
+          ...node,
+          children: [mergeContent(node.children[0]), mergeContent(node.children[1])],
+        }
+      }
+
+      state.layouts[tabId] = mergeContent(root)
+
+      // Update pane title if content changed in a way that affects it
+      const leaf = findLeaf(state.layouts[tabId]!, paneId)
+      if (leaf && !state.paneTitleSetByUser?.[tabId]?.[paneId]) {
+        if (!state.paneTitles[tabId]) {
+          state.paneTitles[tabId] = {}
+        }
+        state.paneTitles[tabId][paneId] = derivePaneTitle(leaf.content)
+      }
+    },
+
     removeLayout: (
       state,
       action: PayloadAction<{ tabId: string }>
@@ -850,6 +885,7 @@ export const {
   replacePane,
   swapPanes,
   updatePaneContent,
+  mergePaneContent,
   removeLayout,
   hydratePanes,
   updatePaneTitle,

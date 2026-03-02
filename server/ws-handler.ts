@@ -1567,7 +1567,14 @@ export class WsHandler {
         }
         const session = this.sdkBridge.getSession(m.sessionId)
         if (!session) {
-          this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'SDK session not found' })
+          // Send sdk.error (not generic error) so the client's SDK message handler
+          // can identify the lost session and trigger immediate recovery.
+          this.send(ws, {
+            type: 'sdk.error',
+            sessionId: m.sessionId,
+            code: 'INVALID_SESSION_ID',
+            message: 'SDK session not found',
+          } as SdkServerMessage)
           return
         }
 

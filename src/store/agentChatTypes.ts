@@ -66,6 +66,8 @@ export interface ChatSessionState {
   lastError?: string
   /** True after sdk.history has been received (even if messages are empty) */
   historyLoaded?: boolean
+  /** True when server reports session is gone (INVALID_SESSION_ID). Triggers immediate recovery. */
+  lost?: boolean
 }
 
 export interface AgentChatState {

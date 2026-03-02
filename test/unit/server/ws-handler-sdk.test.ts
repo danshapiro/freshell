@@ -502,17 +502,18 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
-    it('returns error for sdk.attach with unknown session', async () => {
+    it('returns sdk.error for sdk.attach with unknown session', async () => {
       mockSdkBridge.getSession.mockReturnValue(undefined)
       const ws = await connectAndAuth()
       try {
         const response = await sendAndWaitForResponse(ws, {
           type: 'sdk.attach',
           sessionId: 'nonexistent',
-        }, 'error')
+        }, 'sdk.error')
 
-        expect(response.type).toBe('error')
+        expect(response.type).toBe('sdk.error')
         expect(response.code).toBe('INVALID_SESSION_ID')
+        expect(response.sessionId).toBe('nonexistent')
       } finally {
         ws.close()
       }

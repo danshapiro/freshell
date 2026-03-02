@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { nanoid } from 'nanoid'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { updatePaneContent } from '@/store/panesSlice'
+import { updatePaneContent, mergePaneContent } from '@/store/panesSlice'
 import { addUserMessage, clearPendingCreate, removePermission, removeQuestion } from '@/store/agentChatSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { cn } from '@/lib/utils'
@@ -77,11 +77,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     return () => clearTimeout(timer)
   }, [isRestoring])
 
-  // Auto-recover when restore times out (e.g. server restarted, SDK session lost).
-  // Clears the stale sessionId and resets to 'creating' so a new SDK session is spawned.
-  // Preserves resumeSessionId so the new session can resume the old Claude Code session.
-  useEffect(() => {
-    if (!restoreTimedOut || !isRestoring) return
+  // Shared recovery logic: clears stale sessionId and resets to 'creating' so a new
+  // SDK session is spawned. Preserves resumeSessionId for CLI session continuity.
+  const triggerRecovery = useCallback(() => {
     const newRequestId = nanoid()
     dispatch(updatePaneContent({
       tabId,
@@ -95,7 +93,22 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     }))
     createSentRef.current = false
     attachSentRef.current = false
-  }, [restoreTimedOut, isRestoring, tabId, paneId, dispatch])
+  }, [tabId, paneId, dispatch])
+
+  // Immediate recovery when server confirms session is gone (markSessionLost sets
+  // session.lost = true). This avoids the 5-second timeout for known-dead sessions.
+  const sessionLost = !!session?.lost
+  useEffect(() => {
+    if (!sessionLost || !paneContent.sessionId) return
+    triggerRecovery()
+  }, [sessionLost, paneContent.sessionId, triggerRecovery])
+
+  // Fallback: auto-recover when restore times out (e.g. server restarted, error was
+  // not routed through sdk.error). Safety net for the immediate recovery above.
+  useEffect(() => {
+    if (!restoreTimedOut || !isRestoring) return
+    triggerRecovery()
+  }, [restoreTimedOut, isRestoring, triggerRecovery])
 
   // Wire sessionId from pendingCreates back into the pane content
   useEffect(() => {
@@ -108,27 +121,33 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     dispatch(clearPendingCreate({ requestId: paneContent.createRequestId }))
   }, [pendingSessionId, paneContent.sessionId, paneContent.createRequestId, tabId, paneId, dispatch])
 
-  // Update pane status from session state
+  // Update pane status from session state.
+  // Uses mergePaneContent (not updatePaneContent) to avoid stale-ref overwrites when
+  // multiple effects dispatch in the same render batch (e.g. sessionStatus + cliSessionId).
   const sessionStatus = session?.status
   useEffect(() => {
     if (!sessionStatus || sessionStatus === paneContent.status) return
-    dispatch(updatePaneContent({
+    // Don't sync status from a lost session — the recovery effect will clear the
+    // sessionId and start fresh. Syncing here would overwrite the recovery with stale data.
+    if (session?.lost) return
+    dispatch(mergePaneContent({
       tabId,
       paneId,
-      content: { ...paneContentRef.current, status: sessionStatus },
+      updates: { status: sessionStatus },
     }))
-  }, [sessionStatus, paneContent.status, tabId, paneId, dispatch])
+  }, [sessionStatus, paneContent.status, session?.lost, tabId, paneId, dispatch])
 
   // Persist cliSessionId as resumeSessionId so we can resume the Claude Code session
   // after a server restart (pane content survives in localStorage, Redux state does not).
+  // Uses mergePaneContent to avoid stale-ref overwrites when multiple effects fire together.
   const cliSessionId = session?.cliSessionId
   useEffect(() => {
     if (!cliSessionId) return
     if (paneContentRef.current.resumeSessionId !== cliSessionId) {
-      dispatch(updatePaneContent({
+      dispatch(mergePaneContent({
         tabId,
         paneId,
-        content: { ...paneContentRef.current, resumeSessionId: cliSessionId },
+        updates: { resumeSessionId: cliSessionId },
       }))
     }
   }, [cliSessionId, tabId, paneId, dispatch])
