@@ -4,6 +4,7 @@ import remarkGfm from 'remark-gfm'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import { Copy, Check, ExternalLink } from 'lucide-react'
+import { copyText } from '@/lib/clipboard'
 
 type MarkdownRendererProps = {
   content: string
@@ -43,14 +44,11 @@ function CopyButton({ code }: { code: string }) {
   }, [])
 
   const handleCopy = useCallback(async () => {
-    if (!navigator.clipboard?.writeText) return
-    try {
-      await navigator.clipboard.writeText(code)
+    const ok = await copyText(code)
+    if (ok) {
       if (timerRef.current) clearTimeout(timerRef.current)
       setCopied(true)
       timerRef.current = setTimeout(() => setCopied(false), 2000)
-    } catch {
-      // Permission denied or other clipboard error
     }
   }, [code])
 
