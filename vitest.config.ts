@@ -1,3 +1,11 @@
+// Vitest inherits NODE_ENV from the parent process. When running inside a
+// production Freshell server (NODE_ENV=production), React loads its production
+// build which disables act() — breaking all component tests. Override before
+// any imports resolve.
+if (process.env.NODE_ENV === 'production') {
+  process.env.NODE_ENV = 'test'
+}
+
 import { defineConfig } from 'vitest/config'
 import react from '@vitejs/plugin-react'
 import path from 'path'

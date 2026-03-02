@@ -352,6 +352,14 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
   const isInteractive = paneContent.status === 'idle' || paneContent.status === 'connected'
   const isRunning = paneContent.status === 'running'
+
+  const handleContainerKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.key === 'Escape' && isRunning) {
+      e.preventDefault()
+      handleInterrupt()
+    }
+  }, [isRunning, handleInterrupt])
+
   const pendingPermissions = session ? Object.values(session.pendingPermissions) : []
   const pendingQuestions = session ? Object.values(session.pendingQuestions) : []
   const hasWaitingItems = pendingPermissions.length > 0 || pendingQuestions.length > 0
@@ -424,7 +432,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const collapseThreshold = Math.max(0, turnItems.length - RECENT_TURNS_FULL)
 
   return (
-    <div className={cn('h-full w-full flex flex-col', hidden ? 'tab-hidden' : 'tab-visible')} role="region" aria-label={`${providerLabel} Chat`} onPointerUp={handleContainerPointerUp}>
+    <div className={cn('h-full w-full flex flex-col', hidden ? 'tab-hidden' : 'tab-visible')} role="region" aria-label={`${providerLabel} Chat`} tabIndex={-1} onKeyDown={handleContainerKeyDown} onPointerUp={handleContainerPointerUp}>
       {/* Status bar */}
       <div className="flex items-center justify-between px-3 py-1.5 border-b text-xs text-muted-foreground">
         <span>

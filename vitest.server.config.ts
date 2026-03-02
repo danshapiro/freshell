@@ -1,3 +1,9 @@
+// Vitest inherits NODE_ENV from the parent process. Override when running
+// inside a production Freshell server.
+if (process.env.NODE_ENV === 'production') {
+  process.env.NODE_ENV = 'test'
+}
+
 import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
