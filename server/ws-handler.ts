@@ -166,6 +166,7 @@ const ClientMessageSchema = z.discriminatedUnion('type', [
 type ClientState = {
   authenticated: boolean
   supportsSessionsPatchV1: boolean
+  supportsSessionsPaginationV1: boolean
   supportsUiScreenshotV1: boolean
   sessionsSnapshotSent: boolean
   attachedTerminalIds: Set<string>
@@ -468,6 +469,7 @@ export class WsHandler {
     const state: ClientState = {
       authenticated: false,
       supportsSessionsPatchV1: false,
+      supportsSessionsPaginationV1: false,
       supportsUiScreenshotV1: false,
       sessionsSnapshotSent: false,
       attachedTerminalIds: new Set(),
@@ -716,8 +718,19 @@ export class WsHandler {
         this.safeSend(ws, { type: 'settings.updated', settings: snapshot.settings })
       }
       if (snapshot.projects) {
-        const allSent = await this.sendChunkedSessions(ws, snapshot.projects)
-        state.sessionsSnapshotSent = allSent
+        if (state.supportsSessionsPaginationV1) {
+          const paginated = paginateProjects(snapshot.projects, { limit: 100 })
+          const allSent = await this.sendChunkedSessions(ws, paginated.projects, {
+            totalSessions: paginated.totalSessions,
+            oldestIncludedTimestamp: paginated.oldestIncludedTimestamp,
+            oldestIncludedSessionId: paginated.oldestIncludedSessionId,
+            hasMore: paginated.hasMore,
+          })
+          state.sessionsSnapshotSent = allSent
+        } else {
+          const allSent = await this.sendChunkedSessions(ws, snapshot.projects)
+          state.sessionsSnapshotSent = allSent
+        }
       }
       if (typeof snapshot.perfLogging === 'boolean') {
         this.safeSend(ws, { type: 'perf.logging', enabled: snapshot.perfLogging })
@@ -735,7 +748,16 @@ export class WsHandler {
    * Uses a generation counter to cancel in-flight sends when a new update arrives.
    * Returns true if all chunks were sent, false if sending was interrupted.
    */
-  private async sendChunkedSessions(ws: LiveWebSocket, projects: ProjectGroup[]): Promise<boolean> {
+  private async sendChunkedSessions(
+    ws: LiveWebSocket,
+    projects: ProjectGroup[],
+    paginationMeta?: {
+      totalSessions: number
+      oldestIncludedTimestamp: number
+      oldestIncludedSessionId: string
+      hasMore: boolean
+    },
+  ): Promise<boolean> {
     // Increment generation to cancel any in-flight sends for this connection
     const generation = (ws.sessionUpdateGeneration = (ws.sessionUpdateGeneration || 0) + 1)
     const isSuperseded = () => ws.sessionUpdateGeneration !== generation
@@ -751,14 +773,23 @@ export class WsHandler {
       if (isSuperseded()) return false
 
       const isFirst = i === 0
-      let msg: { type: 'sessions.updated'; projects: ProjectGroup[]; clear?: true; append?: true }
+      let msg: {
+        type: 'sessions.updated'
+        projects: ProjectGroup[]
+        clear?: true
+        append?: true
+        totalSessions?: number
+        oldestIncludedTimestamp?: number
+        oldestIncludedSessionId?: string
+        hasMore?: boolean
+      }
 
       if (chunks.length === 1) {
         // Single chunk: no flags needed (backwards compatible)
-        msg = { type: 'sessions.updated', projects: chunks[i] }
+        msg = { type: 'sessions.updated', projects: chunks[i], ...paginationMeta }
       } else if (isFirst) {
-        // First chunk: clear existing data
-        msg = { type: 'sessions.updated', projects: chunks[i], clear: true }
+        // First chunk: clear existing data, include pagination metadata
+        msg = { type: 'sessions.updated', projects: chunks[i], clear: true, ...paginationMeta }
       } else {
         // Subsequent chunks: append to existing
         msg = { type: 'sessions.updated', projects: chunks[i], append: true }
@@ -855,6 +886,7 @@ export class WsHandler {
         }
         state.authenticated = true
         state.supportsSessionsPatchV1 = !!m.capabilities?.sessionsPatchV1
+        state.supportsSessionsPaginationV1 = !!m.capabilities?.sessionsPaginationV1
         state.supportsUiScreenshotV1 = !!m.capabilities?.uiScreenshotV1
         if (typeof m.client?.mobile === 'boolean') {
           ws.isMobileClient = m.client.mobile
@@ -1726,7 +1758,10 @@ export class WsHandler {
   broadcastSessionsUpdated(projects: ProjectGroup[]): void {
     for (const ws of this.connections) {
       if (ws.readyState === WebSocket.OPEN) {
-        // Fire and forget - each client handles its own backpressure
+        // Send full snapshot to all clients. This path is the rare fallback
+        // when patches are too large. Pagination-capable clients will receive
+        // the full list and clear their pagination state, which is correct
+        // since the full dataset replaces any previously loaded pages.
         void this.sendChunkedSessions(ws, projects)
       }
     }

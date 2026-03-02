@@ -50,6 +50,11 @@ export interface SessionsState {
   expandedProjects: Set<string>
   wsSnapshotReceived: boolean
   lastLoadedAt?: number
+  totalSessions?: number
+  oldestLoadedTimestamp?: number
+  oldestLoadedSessionId?: string
+  hasMore?: boolean
+  loadingMore?: boolean
 }
 
 const initialState: SessionsState = {
@@ -78,6 +83,11 @@ export const sessionsSlice = createSlice({
       state.projects = []
       state.expandedProjects = new Set()
       state.wsSnapshotReceived = false
+      state.totalSessions = undefined
+      state.oldestLoadedTimestamp = undefined
+      state.oldestLoadedSessionId = undefined
+      state.hasMore = undefined
+      state.loadingMore = undefined
     },
     mergeProjects: (state, action: PayloadAction<ProjectGroup[]>) => {
       const incoming = normalizeProjects(action.payload)
@@ -110,6 +120,72 @@ export const sessionsSlice = createSlice({
       const valid = new Set(state.projects.map((p) => p.projectPath))
       state.expandedProjects = new Set(Array.from(state.expandedProjects).filter((k) => valid.has(k)))
     },
+    clearPaginationMeta: (state) => {
+      state.totalSessions = undefined
+      state.oldestLoadedTimestamp = undefined
+      state.oldestLoadedSessionId = undefined
+      state.hasMore = undefined
+      state.loadingMore = undefined
+    },
+    setPaginationMeta: (
+      state,
+      action: PayloadAction<{
+        totalSessions: number
+        oldestLoadedTimestamp: number
+        oldestLoadedSessionId: string
+        hasMore: boolean
+      }>,
+    ) => {
+      const { totalSessions, oldestLoadedTimestamp, oldestLoadedSessionId, hasMore } = action.payload
+      state.totalSessions = totalSessions
+      state.oldestLoadedTimestamp = oldestLoadedTimestamp
+      state.oldestLoadedSessionId = oldestLoadedSessionId
+      state.hasMore = hasMore
+    },
+    appendSessionsPage: (state, action: PayloadAction<ProjectGroup[]>) => {
+      const incoming = normalizeProjects(action.payload)
+      // Build a set of existing session keys for deduplication
+      const existingKeys = new Set<string>()
+      for (const project of state.projects) {
+        for (const session of project.sessions) {
+          const s = session as any
+          existingKeys.add(`${s.provider}:${s.sessionId}`)
+        }
+      }
+      // Merge incoming sessions into existing projects, deduplicating
+      const projectMap = new Map(state.projects.map((p) => [p.projectPath, { ...p, sessions: [...p.sessions] }]))
+      for (const project of incoming) {
+        const existing = projectMap.get(project.projectPath)
+        if (existing) {
+          for (const session of project.sessions) {
+            const key = `${(session as any).provider}:${(session as any).sessionId}`
+            if (!existingKeys.has(key)) {
+              existing.sessions.push(session)
+              existingKeys.add(key)
+            }
+          }
+        } else {
+          // New project — filter out any globally duplicate sessions
+          const filtered = project.sessions.filter((s) => {
+            const key = `${(s as any).provider}:${(s as any).sessionId}`
+            if (existingKeys.has(key)) return false
+            existingKeys.add(key)
+            return true
+          })
+          if (filtered.length > 0) {
+            projectMap.set(project.projectPath, { ...project, sessions: filtered })
+          }
+        }
+      }
+      state.projects = sortProjectsByRecency(Array.from(projectMap.values()))
+      state.lastLoadedAt = Date.now()
+      state.loadingMore = false
+      const valid = new Set(state.projects.map((p) => p.projectPath))
+      state.expandedProjects = new Set(Array.from(state.expandedProjects).filter((k) => valid.has(k)))
+    },
+    setLoadingMore: (state, action: PayloadAction<boolean>) => {
+      state.loadingMore = action.payload
+    },
     toggleProjectExpanded: (state, action: PayloadAction<string>) => {
       const key = action.payload
       if (state.expandedProjects.has(key)) state.expandedProjects.delete(key)
@@ -136,6 +212,10 @@ export const {
   clearProjects,
   mergeProjects,
   applySessionsPatch,
+  clearPaginationMeta,
+  setPaginationMeta,
+  appendSessionsPage,
+  setLoadingMore,
   toggleProjectExpanded,
   setProjectExpanded,
   collapseAll,

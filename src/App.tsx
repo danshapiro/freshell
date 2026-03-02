@@ -8,6 +8,9 @@ import {
   applySessionsPatch,
   markWsSnapshotReceived,
   resetWsSnapshotReceived,
+  clearPaginationMeta,
+  setPaginationMeta,
+  appendSessionsPage,
 } from '@/store/sessionsSlice'
 import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { api, isApiUnauthorizedError, type VersionInfo } from '@/lib/api'
@@ -343,11 +346,23 @@ export default function App() {
     // late-arriving append chunks merge gracefully via the fallback path.
     let chunkedBuffer: ProjectGroup[] | null = null
     let chunkedFlushTimer: ReturnType<typeof setTimeout> | null = null
+    // Generation counter: incremented on every sessions.updated snapshot.
+    // sessions.page responses are only applied when the generation matches,
+    // preventing stale page responses from corrupting state after a reset.
+    let snapshotGeneration = 0
+    let activePaginationGeneration = -1
+    let pendingPaginationMeta: {
+      totalSessions: number
+      oldestIncludedTimestamp: number
+      oldestIncludedSessionId: string
+      hasMore: boolean
+    } | null = null
     const CHUNK_FLUSH_DELAY_MS = 300
 
     function clearChunkedState() {
       if (chunkedFlushTimer) { clearTimeout(chunkedFlushTimer); chunkedFlushTimer = null }
       chunkedBuffer = null
+      pendingPaginationMeta = null
     }
 
     function flushChunkedBuffer() {
@@ -355,6 +370,20 @@ export default function App() {
       if (chunkedBuffer) {
         dispatch(setProjects(chunkedBuffer))
         dispatch(markWsSnapshotReceived())
+        if (pendingPaginationMeta) {
+          dispatch(setPaginationMeta({
+            totalSessions: pendingPaginationMeta.totalSessions,
+            oldestLoadedTimestamp: pendingPaginationMeta.oldestIncludedTimestamp,
+            oldestLoadedSessionId: pendingPaginationMeta.oldestIncludedSessionId,
+            hasMore: pendingPaginationMeta.hasMore,
+          }))
+          activePaginationGeneration = snapshotGeneration
+          pendingPaginationMeta = null
+        } else {
+          // Full snapshot without pagination: clear stale pagination state
+          dispatch(clearPaginationMeta())
+          activePaginationGeneration = -1
+        }
         chunkedBuffer = null
       }
     }
@@ -431,10 +460,20 @@ export default function App() {
         }
         if (msg.type === 'sessions.updated') {
           const projects = (msg.projects || []) as ProjectGroup[]
+          // Extract optional pagination metadata from first/single chunk
+          const hasPaginationMeta = typeof msg.totalSessions === 'number'
+          const paginationMeta = hasPaginationMeta ? {
+            totalSessions: msg.totalSessions as number,
+            oldestIncludedTimestamp: msg.oldestIncludedTimestamp as number,
+            oldestIncludedSessionId: msg.oldestIncludedSessionId as string,
+            hasMore: msg.hasMore as boolean,
+          } : null
           if (msg.clear) {
             // First chunk of a multi-chunk update: start buffering instead of
             // clearing Redux state (which causes the sidebar to collapse).
+            snapshotGeneration++
             chunkedBuffer = [...projects]
+            pendingPaginationMeta = paginationMeta
             scheduleChunkedFlush()
           } else if (msg.append) {
             if (chunkedBuffer) {
@@ -448,9 +487,22 @@ export default function App() {
             }
           } else {
             // Single-chunk update (no clear/append flags): apply immediately
+            snapshotGeneration++
             if (chunkedBuffer) flushChunkedBuffer()
             dispatch(setProjects(projects))
             dispatch(markWsSnapshotReceived())
+            if (paginationMeta) {
+              dispatch(setPaginationMeta({
+                totalSessions: paginationMeta.totalSessions,
+                oldestLoadedTimestamp: paginationMeta.oldestIncludedTimestamp,
+                oldestLoadedSessionId: paginationMeta.oldestIncludedSessionId,
+                hasMore: paginationMeta.hasMore,
+              }))
+              activePaginationGeneration = snapshotGeneration
+            } else {
+              dispatch(clearPaginationMeta())
+              activePaginationGeneration = -1
+            }
           }
         }
         if (msg.type === 'sessions.patch') {
@@ -462,6 +514,25 @@ export default function App() {
             upsertProjects,
             removeProjectPaths: msg.removeProjectPaths || [],
           }))
+        }
+        if (msg.type === 'sessions.page') {
+          // Ignore stale page responses from a previous snapshot generation
+          const sessionState = store.getState().sessions
+          if (activePaginationGeneration === snapshotGeneration && sessionState.hasMore != null) {
+            const projects = (msg.projects || []) as ProjectGroup[]
+            dispatch(appendSessionsPage(projects))
+            if (typeof msg.totalSessions === 'number') {
+              const incomingOldest = msg.oldestIncludedTimestamp as number
+              if (sessionState.oldestLoadedTimestamp === undefined || incomingOldest <= sessionState.oldestLoadedTimestamp) {
+                dispatch(setPaginationMeta({
+                  totalSessions: msg.totalSessions as number,
+                  oldestLoadedTimestamp: incomingOldest,
+                  oldestLoadedSessionId: msg.oldestIncludedSessionId as string,
+                  hasMore: msg.hasMore as boolean,
+                }))
+              }
+            }
+          }
         }
         if (msg.type === 'settings.updated') {
           dispatch(setSettings(applyLocalTerminalFontFamily(msg.settings as AppSettings)))
@@ -591,8 +662,24 @@ export default function App() {
       }
 
       try {
-        const projects = await api.get('/api/sessions')
-        if (!cancelled) dispatch(setProjects(projects))
+        const sessionsRes = await api.get('/api/sessions?limit=100')
+        if (!cancelled) {
+          if (sessionsRes && typeof sessionsRes === 'object' && !Array.isArray(sessionsRes)) {
+            // Paginated response
+            dispatch(setProjects(sessionsRes.projects || []))
+            if (typeof sessionsRes.totalSessions === 'number') {
+              dispatch(setPaginationMeta({
+                totalSessions: sessionsRes.totalSessions,
+                oldestLoadedTimestamp: sessionsRes.oldestIncludedTimestamp,
+                oldestLoadedSessionId: sessionsRes.oldestIncludedSessionId,
+                hasMore: sessionsRes.hasMore,
+              }))
+            }
+          } else {
+            // Backward compat: raw array
+            dispatch(setProjects(sessionsRes))
+          }
+        }
       } catch (err: any) {
         if (handleBootstrapAuthFailure(err)) return
         log.warn('Failed to load sessions', err)
@@ -614,10 +701,23 @@ export default function App() {
         const promoted = promoteRecentHttpSessionsBaseline()
         if (!promoted) {
           try {
-            const projects = await api.get('/api/sessions')
+            const sessionsRes = await api.get('/api/sessions?limit=100')
             if (!cancelled) {
-              dispatch(setProjects(projects))
-              dispatch(markWsSnapshotReceived())
+              if (sessionsRes && typeof sessionsRes === 'object' && !Array.isArray(sessionsRes)) {
+                dispatch(setProjects(sessionsRes.projects || []))
+                dispatch(markWsSnapshotReceived())
+                if (typeof sessionsRes.totalSessions === 'number') {
+                  dispatch(setPaginationMeta({
+                    totalSessions: sessionsRes.totalSessions,
+                    oldestLoadedTimestamp: sessionsRes.oldestIncludedTimestamp,
+                    oldestLoadedSessionId: sessionsRes.oldestIncludedSessionId,
+                    hasMore: sessionsRes.hasMore,
+                  }))
+                }
+              } else {
+                dispatch(setProjects(sessionsRes))
+                dispatch(markWsSnapshotReceived())
+              }
             }
           } catch (err: any) {
             if (handleBootstrapAuthFailure(err)) return

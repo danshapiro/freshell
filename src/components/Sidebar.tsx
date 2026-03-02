@@ -6,6 +6,7 @@ import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { openSessionTab, setActiveTab } from '@/store/tabsSlice'
 import { addPane, setActivePane } from '@/store/panesSlice'
+import { setLoadingMore } from '@/store/sessionsSlice'
 import { findPaneForSession } from '@/lib/session-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { searchSessions, type SearchResult } from '@/lib/api'
@@ -206,6 +207,10 @@ export default function Sidebar({
   const selectKnownSessionKeys = useMemo(() => makeSelectKnownSessionKeys(), [])
 
   const ws = useMemo(() => getWsClient(), [])
+  const hasMore = useAppSelector((s) => s.sessions.hasMore)
+  const loadingMore = useAppSelector((s) => s.sessions.loadingMore)
+  const oldestLoadedTimestamp = useAppSelector((s) => s.sessions.oldestLoadedTimestamp)
+  const oldestLoadedSessionId = useAppSelector((s) => s.sessions.oldestLoadedSessionId)
   const [terminals, setTerminals] = useState<BackgroundTerminal[]>([])
   const [filter, setFilter] = useState('')
   const [searchTier, setSearchTier] = useState<'title' | 'userMessages' | 'fullText'>('title')
@@ -463,6 +468,51 @@ export default function Sidebar({
     ? listHeight
     : Math.min(sortedItems.length * SESSION_ITEM_HEIGHT, SESSION_LIST_MAX_HEIGHT)
 
+  const loadMoreSeqRef = useRef(0)
+  const loadMoreInFlightRef = useRef(false)
+  const loadMoreTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const handleRowsRendered = useCallback(
+    (_visibleRows: { startIndex: number; stopIndex: number }, allRows: { startIndex: number; stopIndex: number }) => {
+      if (
+        !hasMore ||
+        loadMoreInFlightRef.current ||
+        oldestLoadedTimestamp == null ||
+        oldestLoadedSessionId == null ||
+        filter.trim() // Don't load more while filtering
+      ) return
+      const nearBottom = allRows.stopIndex >= sortedItems.length - 10
+      if (!nearBottom) return
+      loadMoreInFlightRef.current = true
+      dispatch(setLoadingMore(true))
+      const requestId = `load-more-${++loadMoreSeqRef.current}`
+      ws.send({
+        type: 'sessions.fetch',
+        requestId,
+        before: oldestLoadedTimestamp,
+        beforeId: oldestLoadedSessionId,
+        limit: 100,
+      })
+      // Safety timeout: reset if response never arrives
+      if (loadMoreTimeoutRef.current) clearTimeout(loadMoreTimeoutRef.current)
+      loadMoreTimeoutRef.current = setTimeout(() => {
+        loadMoreInFlightRef.current = false
+        dispatch(setLoadingMore(false))
+      }, 15_000)
+    },
+    [hasMore, oldestLoadedTimestamp, oldestLoadedSessionId, sortedItems.length, filter, dispatch, ws],
+  )
+  // Reset in-flight guard when loadingMore clears (response received)
+  useEffect(() => {
+    if (!loadingMore) {
+      loadMoreInFlightRef.current = false
+      if (loadMoreTimeoutRef.current) { clearTimeout(loadMoreTimeoutRef.current); loadMoreTimeoutRef.current = null }
+    }
+  }, [loadingMore])
+  // Clear timeout on unmount
+  useEffect(() => () => {
+    if (loadMoreTimeoutRef.current) clearTimeout(loadMoreTimeoutRef.current)
+  }, [])
+
   const rowProps: SidebarRowProps = useMemo(() => ({
     items: sortedItems,
     activeSessionKey,
@@ -616,6 +666,7 @@ export default function Sidebar({
             rowHeight={SESSION_ITEM_HEIGHT}
             rowComponent={SidebarRow}
             rowProps={rowProps}
+            onRowsRendered={handleRowsRendered}
             className="overflow-y-auto"
             style={{ height: effectiveListHeight, width: '100%' }}
           />
