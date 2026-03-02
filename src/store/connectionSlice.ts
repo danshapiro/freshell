@@ -10,6 +10,7 @@ export interface ConnectionState {
   serverInstanceId?: string
   platform: string | null
   availableClis: Record<string, boolean>
+  featureFlags: Record<string, boolean>
 }
 
 const FATAL_CONNECTION_ERROR_CODES = new Set([4001, 4003, 4010])
@@ -22,6 +23,7 @@ const initialState: ConnectionState = {
   status: 'disconnected',
   platform: null,
   availableClis: {},
+  featureFlags: {},
 }
 
 export const connectionSlice = createSlice({
@@ -51,8 +53,11 @@ export const connectionSlice = createSlice({
     setAvailableClis: (state, action: PayloadAction<Record<string, boolean>>) => {
       state.availableClis = action.payload
     },
+    setFeatureFlags: (state, action: PayloadAction<Record<string, boolean>>) => {
+      state.featureFlags = action.payload
+    },
   },
 })
 
-export const { setStatus, setError, setErrorCode, setServerInstanceId, setPlatform, setAvailableClis } = connectionSlice.actions
+export const { setStatus, setError, setErrorCode, setServerInstanceId, setPlatform, setAvailableClis, setFeatureFlags } = connectionSlice.actions
 export default connectionSlice.reducer

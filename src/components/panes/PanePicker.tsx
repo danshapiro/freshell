@@ -5,7 +5,7 @@ import { cn } from '@/lib/utils'
 import { useAppSelector } from '@/store/hooks'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { CODING_CLI_PROVIDER_CONFIGS, type CodingCliProviderConfig } from '@/lib/coding-cli-utils'
-import { AGENT_CHAT_PROVIDER_CONFIGS, type AgentChatProviderName } from '@/lib/agent-chat-utils'
+import { getVisibleAgentChatConfigs, type AgentChatProviderName } from '@/lib/agent-chat-utils'
 import { ProviderIcon } from '@/components/icons/provider-icons'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 
@@ -96,6 +96,7 @@ interface PanePickerProps {
 export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, paneId }: PanePickerProps) {
   const platform = useAppSelector((s) => s.connection?.platform ?? null)
   const availableClis = useAppSelector((s) => s.connection?.availableClis ?? {})
+  const featureFlags = useAppSelector((s) => s.connection?.featureFlags ?? {})
   const enabledProviders = useAppSelector((s) => s.settings?.settings?.codingCli?.enabledProviders ?? [])
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? [])
 
@@ -108,8 +109,9 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
     // Shell options depend on platform
     const shellOptions = isWindowsLike(platform) ? windowsShellOptions : [shellOption]
 
-    // Agent chat options: only show if underlying CLI is available and enabled
-    const allAgentChatOptions: PickerOption[] = AGENT_CHAT_PROVIDER_CONFIGS
+    // Agent chat options: only show if underlying CLI is available, enabled, and not hidden by feature flag
+    const visibleAgentChatConfigs = getVisibleAgentChatConfigs(featureFlags)
+    const allAgentChatOptions: PickerOption[] = visibleAgentChatConfigs
       .filter((config) => availableClis[config.codingCliProvider] && enabledProviders.includes(config.codingCliProvider))
       .map((config) => ({
         type: config.name as PanePickerType,
@@ -132,7 +134,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
 
     // Order: agent chat (before), CLIs, agent chat (after), Editor, Browser, Shell(s), Extensions
     return [...agentChatBefore, ...cliOptions, ...agentChatAfter, ...nonShellOptions, ...shellOptions, ...extensionOptions]
-  }, [platform, availableClis, enabledProviders, extensionEntries])
+  }, [platform, availableClis, featureFlags, enabledProviders, extensionEntries])
 
   const [focusedIndex, setFocusedIndex] = useState<number | null>(null)
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null)

@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type TouchEvent as ReactTouchEvent } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { setStatus, setError, setErrorCode, setServerInstanceId, setPlatform, setAvailableClis } from '@/store/connectionSlice'
+import { setStatus, setError, setErrorCode, setServerInstanceId, setPlatform, setAvailableClis, setFeatureFlags } from '@/store/connectionSlice'
 import { setSettings } from '@/store/settingsSlice'
 import {
   setProjects,
@@ -560,11 +560,15 @@ export default function App() {
           platform: string
           availableClis?: Record<string, boolean>
           hostName?: string
+          featureFlags?: Record<string, boolean>
         }>('/api/platform')
         if (!cancelled) {
           dispatch(setPlatform(platformInfo.platform))
           if (platformInfo.availableClis) {
             dispatch(setAvailableClis(platformInfo.availableClis))
+          }
+          if (platformInfo.featureFlags) {
+            dispatch(setFeatureFlags(platformInfo.featureFlags))
           }
           dispatch(setTabRegistryDeviceMeta(resolveAndPersistDeviceMeta({
             platform: platformInfo.platform,

@@ -11,6 +11,17 @@ export interface PlatformRouterDeps {
   appVersion: string
 }
 
+function isTruthy(value: string | undefined): boolean {
+  if (!value) return false
+  return value === '1' || value.toLowerCase() === 'true'
+}
+
+function detectFeatureFlags(): Record<string, boolean> {
+  return {
+    kilroy: isTruthy(process.env.KILROY_ENABLED),
+  }
+}
+
 export function createPlatformRouter(deps: PlatformRouterDeps): Router {
   const { detectPlatform, detectAvailableClis, detectHostName, checkForUpdate, appVersion } = deps
   const router = Router()
@@ -21,7 +32,8 @@ export function createPlatformRouter(deps: PlatformRouterDeps): Router {
       detectAvailableClis(),
       detectHostName(),
     ])
-    res.json({ platform, availableClis, hostName })
+    const featureFlags = detectFeatureFlags()
+    res.json({ platform, availableClis, hostName, featureFlags })
   })
 
   router.get('/version', async (_req, res) => {
