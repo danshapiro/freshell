@@ -55,16 +55,19 @@ export default defineConfig(({ mode }) => {
       proxy: {
         '/api': {
           target: backendUrl,
+          xfwd: true,
           configure: silenceStartupErrors,
         },
         '/local-file': {
           target: backendUrl,
+          xfwd: true,
           configure: silenceStartupErrors,
         },
         '/ws': {
           target: backendUrl,
           ws: true,
           changeOrigin: true,
+          xfwd: true,
           configure: silenceStartupErrors,
         },
       },
