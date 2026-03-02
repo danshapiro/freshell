@@ -20,6 +20,7 @@ import {
   parseEnvFile,
   checkNeedsAuthToken,
   ensureEnvFile,
+  resolveProjectRoot,
   type BootstrapResult,
 } from '../../../server/bootstrap'
 
@@ -471,6 +472,14 @@ describe('bootstrap module', () => {
 
       expect(result.action).toBe('error')
       expect(result.error).toContain('Permission denied')
+    })
+  })
+
+  describe('resolveProjectRoot', () => {
+    it('returns process.cwd() so .env lands where dotenv looks', () => {
+      const root = resolveProjectRoot()
+
+      expect(root).toBe(process.cwd())
     })
   })
 })

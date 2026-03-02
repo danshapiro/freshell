@@ -12,7 +12,6 @@ import crypto from 'crypto'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
-import { fileURLToPath } from 'url'
 import { isWSL } from './platform.js'
 
 export type BootstrapResult = {
@@ -303,11 +302,17 @@ export function ensureEnvFile(envPath: string): BootstrapResult {
   }
 }
 
+/**
+ * Resolve the project root for .env placement.
+ * Uses process.cwd() to match where dotenv/config looks,
+ * so the auto-generated .env is always found on the next import.
+ */
+export function resolveProjectRoot(): string {
+  return process.cwd()
+}
+
 // --- Auto-run on import ---
-// Determine .env path relative to this file (should be project root)
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
-const projectRoot = path.resolve(__dirname, '..')
+const projectRoot = resolveProjectRoot()
 const envPath = path.join(projectRoot, '.env')
 
 const result = ensureEnvFile(envPath)
