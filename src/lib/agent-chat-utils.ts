@@ -51,6 +51,8 @@ export const AGENT_CHAT_PROVIDER_CONFIGS: AgentChatProviderConfig[] = [
     },
     pickerShortcut: 'K',
     pickerAfterCli: true,
+    hidden: true,
+    featureFlag: 'kilroy',
   },
 ]
 
@@ -67,4 +69,13 @@ export function getAgentChatProviderConfig(name?: string): AgentChatProviderConf
 export function getAgentChatProviderLabel(name?: string): string {
   const config = getAgentChatProviderConfig(name)
   return config?.label ?? 'Agent Chat'
+}
+
+/** Returns provider configs visible in the pane picker, filtering out hidden providers unless their feature flag is enabled. */
+export function getVisibleAgentChatConfigs(featureFlags: Record<string, boolean>): AgentChatProviderConfig[] {
+  return AGENT_CHAT_PROVIDER_CONFIGS.filter((config) => {
+    if (!config.hidden) return true
+    const flag = config.featureFlag ?? config.name
+    return featureFlags[flag] === true
+  })
 }

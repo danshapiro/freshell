@@ -30,6 +30,7 @@ function createStore(overrides?: {
   availableClis?: Record<string, boolean>
   enabledProviders?: string[]
   extensions?: ClientExtensionEntry[]
+  featureFlags?: Record<string, boolean>
 }) {
   return configureStore({
     reducer: {
@@ -42,6 +43,7 @@ function createStore(overrides?: {
         status: 'ready' as const,
         platform: overrides?.platform ?? null,
         availableClis: overrides?.availableClis ?? {},
+        featureFlags: overrides?.featureFlags ?? {},
       },
       extensions: {
         entries: overrides?.extensions ?? [],
@@ -173,13 +175,32 @@ describe('PanePicker', () => {
       expect(codexButton.querySelector('img')).not.toBeInTheDocument()
     })
 
-    it('renders options in correct order: Freshclaude, CLIs, Kilroy, Editor, Browser, Shell', () => {
+    it('renders options in correct order: Freshclaude, CLIs, Editor, Browser, Shell (Kilroy hidden by default)', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
       })
       const buttons = screen.getAllByRole('button')
       const labels = buttons.map(b => b.getAttribute('aria-label'))
+      expect(labels[0]).toBe('Freshclaude')
+      expect(labels[1]).toBe('Claude CLI')
+      expect(labels[2]).toBe('Codex CLI')
+      expect(labels[3]).toBe('Editor')
+      expect(labels[4]).toBe('Browser')
+      expect(labels[5]).toBe('Shell')
+      expect(labels).not.toContain('Kilroy')
+    })
+
+    it('shows Kilroy when kilroy feature flag is enabled', () => {
+      renderPicker({
+        availableClis: { claude: true, codex: true },
+        enabledProviders: ['claude', 'codex'],
+        featureFlags: { kilroy: true },
+      })
+      const buttons = screen.getAllByRole('button')
+      const labels = buttons.map(b => b.getAttribute('aria-label'))
+      expect(labels).toContain('Kilroy')
+      // Kilroy should appear after CLIs (it has pickerAfterCli: true)
       expect(labels[0]).toBe('Freshclaude')
       expect(labels[1]).toBe('Claude CLI')
       expect(labels[2]).toBe('Codex CLI')
@@ -456,8 +477,8 @@ describe('PanePicker', () => {
   describe('balanced icon layout', () => {
     it('prefers a balanced 3+3 arrangement when six options are visible', () => {
       renderPicker({
-        availableClis: { claude: true },
-        enabledProviders: ['claude'],
+        availableClis: { claude: true, codex: true },
+        enabledProviders: ['claude', 'codex'],
       })
 
       const rows = screen.getAllByTestId('pane-picker-option-row')

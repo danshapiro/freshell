@@ -5,6 +5,7 @@ import {
   isAgentChatProviderName,
   getAgentChatProviderConfig,
   getAgentChatProviderLabel,
+  getVisibleAgentChatConfigs,
 } from '@/lib/agent-chat-utils'
 
 describe('agent-chat-utils', () => {
@@ -66,5 +67,38 @@ describe('agent-chat-utils', () => {
   it('all providers have unique picker shortcuts', () => {
     const shortcuts = AGENT_CHAT_PROVIDER_CONFIGS.map((c) => c.pickerShortcut)
     expect(new Set(shortcuts).size).toBe(shortcuts.length)
+  })
+
+  it('kilroy config has hidden flag set to true', () => {
+    const config = getAgentChatProviderConfig('kilroy')
+    expect(config!.hidden).toBe(true)
+  })
+
+  it('freshclaude config does not have hidden flag', () => {
+    const config = getAgentChatProviderConfig('freshclaude')
+    expect(config!.hidden).toBeUndefined()
+  })
+
+  describe('getVisibleAgentChatConfigs', () => {
+    it('excludes hidden providers when no feature flags are set', () => {
+      const visible = getVisibleAgentChatConfigs({})
+      const names = visible.map((c) => c.name)
+      expect(names).toContain('freshclaude')
+      expect(names).not.toContain('kilroy')
+    })
+
+    it('includes hidden providers when their feature flag is true', () => {
+      const visible = getVisibleAgentChatConfigs({ kilroy: true })
+      const names = visible.map((c) => c.name)
+      expect(names).toContain('freshclaude')
+      expect(names).toContain('kilroy')
+    })
+
+    it('still excludes hidden providers when their feature flag is false', () => {
+      const visible = getVisibleAgentChatConfigs({ kilroy: false })
+      const names = visible.map((c) => c.name)
+      expect(names).toContain('freshclaude')
+      expect(names).not.toContain('kilroy')
+    })
   })
 })

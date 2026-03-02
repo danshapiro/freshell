@@ -34,4 +34,8 @@ export interface AgentChatProviderConfig {
   pickerShortcut: string
   /** If true, show after CLI options in the picker instead of before */
   pickerAfterCli?: boolean
+  /** If true, hide from pane picker unless corresponding feature flag is enabled */
+  hidden?: boolean
+  /** Feature flag name that unhides this provider (defaults to provider name) */
+  featureFlag?: string
 }
