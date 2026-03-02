@@ -95,7 +95,7 @@ export function createExtensionRouter(extensionManager: ExtensionManager): Route
     }
 
     // The wildcard captures everything after /client/
-    const filePath = req.params[0] || path.basename(clientEntry)
+    const filePath = (req.params as Record<string, string>)[0] || path.basename(clientEntry)
     const resolved = path.resolve(realPublicRoot, filePath)
 
     // Path traversal protection: resolved path must stay within publicRoot.
