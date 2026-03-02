@@ -56,6 +56,7 @@ export default function Pane({
 }: PaneProps) {
   const showHeader = title !== undefined
 
+  /* eslint-disable jsx-a11y/no-noninteractive-element-interactions, jsx-a11y/no-noninteractive-tabindex -- Pane is a composite widget; tabIndex enables keyboard navigation between panes, not click interaction */
   return (
     <div
       data-pane-shell="true"
@@ -65,8 +66,8 @@ export default function Pane({
         'relative h-full w-full overflow-hidden flex flex-col',
         !isActive && 'opacity-[0.85]'
       )}
-      role="button"
-      aria-label={`Focus pane ${title || 'untitled'}`}
+      role="group"
+      aria-label={`Pane: ${title || 'untitled'}`}
       tabIndex={0}
       onMouseDown={onFocus}
       onKeyDown={(e) => {

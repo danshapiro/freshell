@@ -1,4 +1,4 @@
-import { forwardRef, useCallback, useImperativeHandle, useRef, useState, type KeyboardEvent } from 'react'
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState, type KeyboardEvent } from 'react'
 import { Send, Square } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -23,22 +23,23 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
     focus: () => textareaRef.current?.focus(),
   }), [])
 
-  // Focus textarea when it's attached to the DOM and autoFocus is requested.
-  // Uses a ref callback + double requestAnimationFrame to ensure the element
-  // is visible and painted before calling focus(). This is more reliable than
-  // setTimeout or the HTML autoFocus attribute for dynamically mounted components.
-  const autoFocusRef = useRef(autoFocus)
+  // Auto-focus when the textarea becomes enabled (disabled transitions false).
+  // At mount the textarea may be disabled (status='creating'), so we watch
+  // the `disabled` prop and focus once it goes falsy — if autoFocus was requested.
+  const autoFocusFiredRef = useRef(false)
   const textareaCallbackRef = useCallback((node: HTMLTextAreaElement | null) => {
     textareaRef.current = node
-    if (node && autoFocusRef.current) {
-      autoFocusRef.current = false // only focus once
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          node.focus()
-        })
-      })
-    }
   }, [])
+
+  useEffect(() => {
+    if (!autoFocus || disabled || autoFocusFiredRef.current) return
+    autoFocusFiredRef.current = true
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        textareaRef.current?.focus()
+      })
+    })
+  }, [disabled, autoFocus])
 
   const handleSend = useCallback(() => {
     const trimmed = text.trim()
