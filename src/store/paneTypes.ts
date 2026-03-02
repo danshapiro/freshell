@@ -92,6 +92,8 @@ export type AgentChatPaneContent = {
   permissionMode?: string
   /** Effort level (default from provider config, creation-time only) */
   effort?: 'low' | 'medium' | 'high' | 'max'
+  /** Plugin paths to load into this session (absolute paths to plugin directories) */
+  plugins?: string[]
   /** Show thinking blocks in message feed */
   showThinking?: boolean
   /** Show tool-use blocks in message feed */

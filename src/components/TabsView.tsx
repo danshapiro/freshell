@@ -120,6 +120,7 @@ function sanitizePaneSnapshot(
       model: payload.model as string | undefined,
       permissionMode: payload.permissionMode as string | undefined,
       effort: payload.effort as 'low' | 'medium' | 'high' | 'max' | undefined,
+      plugins: payload.plugins as string[] | undefined,
     }
   }
   if (snapshot.kind === 'extension') {

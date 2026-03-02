@@ -174,6 +174,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
       effort: paneContent.effort ?? defaultEffort,
       ...(paneContent.initialCwd ? { cwd: paneContent.initialCwd } : {}),
       ...(paneContent.resumeSessionId ? { resumeSessionId: paneContent.resumeSessionId } : {}),
+      ...(paneContent.plugins ? { plugins: paneContent.plugins } : {}),
     })
 
     // Update status to 'starting'

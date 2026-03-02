@@ -60,6 +60,7 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
           model: content.model,
           permissionMode: content.permissionMode,
           effort: content.effort,
+          plugins: content.plugins,
         }
       }
     case 'extension':
