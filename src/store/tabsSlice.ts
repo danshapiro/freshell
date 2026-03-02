@@ -9,6 +9,7 @@ import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { buildResumeContent } from '@/lib/session-type-utils'
 import { isAgentChatProviderName, getAgentChatProviderConfig, getAgentChatProviderLabel } from '@/lib/agent-chat-utils'
 import { recordClosedTabSnapshot } from './tabRegistrySlice'
+import { clearDraft } from '@/lib/draft-store'
 import {
   buildClosedTabRegistryRecord,
   countPaneLeaves,
@@ -282,10 +283,11 @@ export const closeTab = createAsyncThunk(
     dispatch(removeTab(tabId))
     dispatch(removeLayout({ tabId }))
 
-    // Clean up attention for the tab and all its panes
+    // Clean up attention and drafts for the tab and all its panes
     dispatch(clearTabAttention({ tabId }))
     for (const paneId of paneIds) {
       dispatch(clearPaneAttention({ paneId }))
+      clearDraft(paneId)
     }
   }
 )

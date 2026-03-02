@@ -1,12 +1,14 @@
-import { forwardRef, useCallback, useImperativeHandle, useRef, useState, type KeyboardEvent } from 'react'
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState, type KeyboardEvent } from 'react'
 import { Send, Square } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { getDraft, setDraft, clearDraft } from '@/lib/draft-store'
 
 export interface ChatComposerHandle {
   focus: () => void
 }
 
 interface ChatComposerProps {
+  paneId?: string
   onSend: (text: string) => void
   onInterrupt: () => void
   disabled?: boolean
@@ -15,9 +17,27 @@ interface ChatComposerProps {
   autoFocus?: boolean
 }
 
-const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function ChatComposer({ onSend, onInterrupt, disabled, isRunning, placeholder, autoFocus }, ref) {
-  const [text, setText] = useState('')
+const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function ChatComposer({ paneId, onSend, onInterrupt, disabled, isRunning, placeholder, autoFocus }, ref) {
+  const [text, setText] = useState(() => (paneId ? getDraft(paneId) : ''))
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
+
+  const resizeTextarea = useCallback((el: HTMLTextAreaElement) => {
+    el.style.height = 'auto'
+    el.style.height = `${Math.min(el.scrollHeight, 200)}px`
+  }, [])
+
+  // Resync text state and textarea height if paneId changes (component reused for a different pane)
+  const prevPaneIdRef = useRef(paneId)
+  useEffect(() => {
+    if (paneId !== prevPaneIdRef.current) {
+      prevPaneIdRef.current = paneId
+      setText(paneId ? getDraft(paneId) : '')
+      // Schedule resize after React paints the new text
+      requestAnimationFrame(() => {
+        if (textareaRef.current) resizeTextarea(textareaRef.current)
+      })
+    }
+  }, [paneId, resizeTextarea])
 
   useImperativeHandle(ref, () => ({
     focus: () => textareaRef.current?.focus(),
@@ -40,16 +60,23 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
     }
   }, [])
 
+  // Sync draft store on every text change
+  const handleTextChange = useCallback((value: string) => {
+    setText(value)
+    if (paneId) setDraft(paneId, value)
+  }, [paneId])
+
   const handleSend = useCallback(() => {
     const trimmed = text.trim()
     if (!trimmed) return
     onSend(trimmed)
     setText('')
+    if (paneId) clearDraft(paneId)
     // Reset height
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto'
     }
-  }, [text, onSend])
+  }, [text, onSend, paneId])
 
   const handleKeyDown = useCallback((e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -63,10 +90,16 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
   }, [handleSend, isRunning, onInterrupt])
 
   const handleInput = useCallback(() => {
-    const el = textareaRef.current
-    if (!el) return
-    el.style.height = 'auto'
-    el.style.height = `${Math.min(el.scrollHeight, 200)}px`
+    if (textareaRef.current) resizeTextarea(textareaRef.current)
+  }, [resizeTextarea])
+
+  // Restore textarea height when mounting with a saved draft
+  useEffect(() => {
+    if (text && textareaRef.current) {
+      resizeTextarea(textareaRef.current)
+    }
+    // Only run on mount — text is intentionally excluded
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   return (
@@ -75,7 +108,7 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
         <textarea
           ref={textareaCallbackRef}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => handleTextChange(e.target.value)}
           onKeyDown={handleKeyDown}
           onInput={handleInput}
           disabled={disabled}
