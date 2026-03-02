@@ -879,7 +879,7 @@ export default function App() {
         )}
         {/* Sidebar - on mobile it overlays, on desktop it's inline */}
         {!sidebarCollapsed && (
-          <div className={isMobile ? 'absolute inset-y-0 left-0 right-0 z-20' : 'contents'}>
+          <div className={isMobile ? 'absolute inset-y-0 left-0 right-0 z-30' : 'contents'}>
             <Sidebar
               view={view}
               onNavigate={(v) => {

@@ -250,6 +250,24 @@ describe('App Mobile - Sidebar Backdrop', () => {
     expect(screen.getByTestId('mock-sidebar')).toHaveAttribute('data-full-width', 'true')
   })
 
+  it('renders mobile sidebar overlay above the MobileTabStrip z-index', async () => {
+    renderApp()
+
+    await waitFor(() => {
+      expect(screen.getByTitle('Show sidebar')).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByTitle('Show sidebar'))
+
+    await waitFor(() => {
+      expect(screen.getByTestId('mock-sidebar')).toBeInTheDocument()
+    })
+
+    // The sidebar wrapper must have z-30 to stack above the MobileTabStrip (z-20)
+    const sidebarWrapper = screen.getByTestId('mock-sidebar').parentElement!
+    expect(sidebarWrapper.className).toContain('z-30')
+  })
+
   it('closes sidebar when backdrop is clicked', async () => {
     renderApp()
 
