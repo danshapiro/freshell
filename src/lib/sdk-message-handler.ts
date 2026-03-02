@@ -16,6 +16,7 @@ import {
   sessionExited,
   replayHistory,
   sessionError,
+  markSessionLost,
   removeSession,
   setAvailableModels,
 } from '@/store/agentChatSlice'
@@ -153,10 +154,17 @@ export function handleSdkMessage(dispatch: AppDispatch, msg: Record<string, unkn
       return true
 
     case 'sdk.error':
-      dispatch(sessionError({
-        sessionId: msg.sessionId as string,
-        message: (msg.message as string) || (msg.error as string) || 'Unknown error',
-      }))
+      if (msg.code === 'INVALID_SESSION_ID') {
+        // Session is gone on the server (e.g. server restarted). Mark it as lost
+        // so AgentChatView can detect this and trigger immediate recovery instead
+        // of waiting for the 5-second timeout.
+        dispatch(markSessionLost({ sessionId: msg.sessionId as string }))
+      } else {
+        dispatch(sessionError({
+          sessionId: msg.sessionId as string,
+          message: (msg.message as string) || (msg.error as string) || 'Unknown error',
+        }))
+      }
       return true
 
     case 'sdk.killed':

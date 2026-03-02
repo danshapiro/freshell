@@ -195,6 +195,65 @@ describe('Pane', () => {
     })
   })
 
+  describe('accessibility', () => {
+    it('renders with role="group" (not role="button")', () => {
+      const { container } = render(
+        <Pane
+          tabId="t1"
+          paneId="p1"
+          isActive={true}
+          isOnlyPane={false}
+          onClose={vi.fn()}
+          onFocus={vi.fn()}
+        >
+          <div>Content</div>
+        </Pane>
+      )
+
+      const paneDiv = container.firstChild as HTMLElement
+      expect(paneDiv.getAttribute('role')).toBe('group')
+    })
+
+    it('keeps tabIndex={0} for keyboard accessibility', () => {
+      const { container } = render(
+        <Pane
+          tabId="t1"
+          paneId="p1"
+          isActive={true}
+          isOnlyPane={false}
+          onClose={vi.fn()}
+          onFocus={vi.fn()}
+        >
+          <div>Content</div>
+        </Pane>
+      )
+
+      const paneDiv = container.firstChild as HTMLElement
+      expect(paneDiv.getAttribute('tabindex')).toBe('0')
+    })
+
+    it('uses descriptive aria-label with "Pane:" prefix', () => {
+      const { container } = render(
+        <Pane
+          tabId="t1"
+          paneId="p1"
+          isActive={true}
+          isOnlyPane={false}
+          title="My Terminal"
+          status="running"
+          content={makeTerminalContent()}
+          onClose={vi.fn()}
+          onFocus={vi.fn()}
+        >
+          <div>Content</div>
+        </Pane>
+      )
+
+      const paneDiv = container.firstChild as HTMLElement
+      expect(paneDiv.getAttribute('aria-label')).toBe('Pane: My Terminal')
+    })
+  })
+
   describe('edge cases', () => {
     it('handles multiple rapid clicks on pane', () => {
       const onClose = vi.fn()

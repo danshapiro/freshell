@@ -96,6 +96,7 @@ export type AppSettings = {
   }
   agentChat?: {
     initialSetupDone?: boolean
+    defaultPlugins?: string[]
     providers?: Partial<Record<string, {
       defaultModel?: string
       defaultPermissionMode?: string
