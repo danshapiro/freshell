@@ -171,6 +171,7 @@ export interface CodingCliSession {
   sourceFile?: string
   isSubagent?: boolean
   isNonInteractive?: boolean
+  sessionType?: string
 }
 
 export const FIRST_USER_MESSAGE_MAX_CHARS = 4000

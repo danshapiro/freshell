@@ -18,6 +18,7 @@ import type { SdkBridge } from './sdk-bridge.js'
 import type { SdkServerMessage } from '../shared/ws-protocol.js'
 import { TerminalStreamBroker } from './terminal-stream/broker.js'
 import { chunkProjects } from './ws-chunking.js'
+import { loadSessionHistory, type ChatMessage } from './session-history-loader.js'
 import { TabRegistryRecordBaseSchema, TabRegistryRecordSchema } from './tabs-registry/types.js'
 import type { TabsRegistryStore } from './tabs-registry/store.js'
 import {
@@ -44,6 +45,7 @@ import {
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
+  SdkQuestionRespondSchema,
   SdkInterruptSchema,
   SdkKillSchema,
   SdkAttachSchema,
@@ -147,6 +149,7 @@ const ClientMessageSchema = z.discriminatedUnion('type', [
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
+  SdkQuestionRespondSchema,
   SdkInterruptSchema,
   SdkKillSchema,
   SdkAttachSchema,
@@ -1383,6 +1386,25 @@ export class WsHandler {
           // before any buffered messages (sdk.session.init, sdk.error) arrive.
           this.send(ws, { type: 'sdk.created', requestId: m.requestId, sessionId: session.sessionId })
 
+          // When resuming a previous Claude Code session, load chat history
+          // from the .jsonl file on disk so the UI can display past messages.
+          // Sent before sdk.session.init so history is loaded before the UI
+          // becomes interactive, preventing user messages from being overwritten.
+          if (m.resumeSessionId) {
+            try {
+              const messages = await loadSessionHistory(m.resumeSessionId)
+              if (messages && messages.length > 0) {
+                this.send(ws, {
+                  type: 'sdk.history',
+                  sessionId: session.sessionId,
+                  messages,
+                })
+              }
+            } catch (err) {
+              log.warn({ err, resumeSessionId: m.resumeSessionId }, 'Failed to load session history from .jsonl')
+            }
+          }
+
           // Send preliminary sdk.session.init so the client can start interacting.
           // The SDK subprocess only emits system/init after the first user message,
           // which deadlocks with the UI waiting for init before showing the input.
@@ -1397,10 +1419,10 @@ export class WsHandler {
           })
 
           // Subscribe this client to session events (replays buffered messages)
-          const off = this.sdkBridge.subscribe(session.sessionId, (msg: SdkServerMessage) => {
+          const sub = this.sdkBridge.subscribe(session.sessionId, (msg: SdkServerMessage) => {
             this.safeSend(ws, msg)
           })
-          if (off) state.sdkSubscriptions.set(session.sessionId, off)
+          if (sub) state.sdkSubscriptions.set(session.sessionId, sub.off)
 
           if (m.cwd?.trim()) {
             void configStore.pushRecentDirectory(m.cwd.trim()).catch((err) => {
@@ -1449,6 +1471,22 @@ export class WsHandler {
         const ok = this.sdkBridge.respondPermission(m.sessionId, m.requestId, decision)
         if (!ok) {
           this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'SDK session not found' })
+        }
+        return
+      }
+
+      case 'sdk.question.respond': {
+        if (!this.sdkBridge) {
+          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
+          return
+        }
+        if (!state.sdkSessions.has(m.sessionId) && !state.sdkSubscriptions.has(m.sessionId)) {
+          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
+          return
+        }
+        const ok = this.sdkBridge.respondQuestion(m.sessionId, m.requestId, m.answers)
+        if (!ok) {
+          this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'SDK session or question not found' })
         }
         return
       }
@@ -1524,18 +1562,35 @@ export class WsHandler {
         }
 
         // Subscribe this client to session events if not already
+        let bufferReplayed = false
         if (!state.sdkSubscriptions.has(m.sessionId)) {
-          const off = this.sdkBridge.subscribe(m.sessionId, (msg: SdkServerMessage) => {
+          const sub = this.sdkBridge.subscribe(m.sessionId, (msg: SdkServerMessage) => {
             this.safeSend(ws, msg)
           })
-          if (off) state.sdkSubscriptions.set(m.sessionId, off)
+          if (sub) {
+            state.sdkSubscriptions.set(m.sessionId, sub.off)
+            bufferReplayed = sub.replayed
+          }
         }
 
-        // Send history replay
+        // Send history replay. For resumed sessions, use the .jsonl file when it
+        // has more messages than in-memory (covers the post-restart case where
+        // in-memory is empty). For active sessions, in-memory is more current.
+        let historyMessages: ChatMessage[] = session.messages
+        if (session.resumeSessionId) {
+          try {
+            const jsonlMessages = await loadSessionHistory(session.resumeSessionId)
+            if (jsonlMessages && jsonlMessages.length > session.messages.length) {
+              historyMessages = jsonlMessages
+            }
+          } catch (err) {
+            log.warn({ err, resumeSessionId: session.resumeSessionId }, 'Failed to load .jsonl history for attach')
+          }
+        }
         this.send(ws, {
           type: 'sdk.history',
           sessionId: m.sessionId,
-          messages: session.messages,
+          messages: historyMessages,
         })
 
         // Send current status
@@ -1544,6 +1599,38 @@ export class WsHandler {
           sessionId: m.sessionId,
           status: session.status,
         })
+
+        // Replay pending permissions and questions for re-attaching clients.
+        // Skip if subscribe() already replayed the buffer (first subscriber),
+        // since buffered messages already include these requests.
+        if (!bufferReplayed) {
+          if (session.pendingPermissions) {
+            for (const [requestId, perm] of session.pendingPermissions) {
+              this.send(ws, {
+                type: 'sdk.permission.request',
+                sessionId: m.sessionId,
+                requestId,
+                subtype: 'can_use_tool',
+                tool: { name: perm.toolName, input: perm.input },
+                toolUseID: perm.toolUseID,
+                suggestions: perm.suggestions,
+                blockedPath: perm.blockedPath,
+                decisionReason: perm.decisionReason,
+              } as SdkServerMessage)
+            }
+          }
+
+          if (session.pendingQuestions) {
+            for (const [requestId, q] of session.pendingQuestions) {
+              this.send(ws, {
+                type: 'sdk.question.request',
+                sessionId: m.sessionId,
+                requestId,
+                questions: q.questions,
+              } as SdkServerMessage)
+            }
+          }
+        }
         return
       }
 

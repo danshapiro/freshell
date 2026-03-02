@@ -8,10 +8,11 @@ import PaneDivider from './PaneDivider'
 import TerminalView from '../TerminalView'
 import BrowserPane from './BrowserPane'
 import EditorPane from './EditorPane'
-import ClaudeChatView from '../claude-chat/ClaudeChatView'
+import AgentChatView from '../agent-chat/AgentChatView'
 import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
 import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-utils'
+import { isAgentChatProviderName, getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { getTerminalActions } from '@/lib/pane-action-registry'
 import { cn } from '@/lib/utils'
 import { getWsClient } from '@/lib/ws-client'
@@ -26,7 +27,7 @@ import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 import { clearPaneAttention, clearTabAttention } from '@/store/turnCompletionSlice'
-import { clearPendingCreate, removeSession } from '@/store/claudeChatSlice'
+import { clearPendingCreate, removeSession } from '@/store/agentChatSlice'
 import { cancelCreate } from '@/lib/sdk-message-handler'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
@@ -124,7 +125,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const ws = useMemo(() => getWsClient(), [])
   const snapThreshold = useAppSelector((s) => s.settings?.settings?.panes?.snapThreshold ?? 2)
   const sdkPendingCreates = useAppSelector(
-    (s) => s.claudeChat?.pendingCreates ?? EMPTY_PENDING_CREATES
+    (s) => s.agentChat?.pendingCreates ?? EMPTY_PENDING_CREATES
   )
 
   // Drag state for snapping: track the original size and accumulated delta
@@ -208,7 +209,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       }
     }
     // Clean up SDK session if this pane has one
-    if (content.kind === 'claude-chat') {
+    if (content.kind === 'agent-chat') {
       const sessionId = content.sessionId || sdkPendingCreates[content.createRequestId]
       if (sessionId) {
         ws.send({ type: 'sdk.kill', sessionId })
@@ -302,7 +303,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     const paneTitle = explicitTitle ?? derivePaneTitle(node.content)
     const paneStatus = node.content.kind === 'terminal'
       ? node.content.status
-      : node.content.kind === 'claude-chat'
+      : node.content.kind === 'agent-chat'
         ? (node.content.status === 'exited' ? 'exited' : 'running')
         : 'running'
     const isRenaming = renamingPaneId === node.id
@@ -423,21 +424,22 @@ function PickerWrapper({
   )
   const [step, setStep] = useState<
     | { step: 'type' }
-    | { step: 'directory'; providerType: CodingCliProviderName }
-    | { step: 'directory'; providerType: 'claude-web' }
+    | { step: 'directory'; providerType: PanePickerType }
   >({ step: 'type' })
 
   const createContentForType = useCallback((type: PanePickerType, cwd?: string): PaneContent => {
-    if (type === 'claude-web') {
-      const defaults = settings?.freshclaude
+    if (isAgentChatProviderName(type)) {
+      const providerConfig = getAgentChatProviderConfig(type)!
+      const providerSettings = settings?.agentChat?.providers?.[type]
       return {
-        kind: 'claude-chat',
+        kind: 'agent-chat',
+        provider: type,
         createRequestId: nanoid(),
         status: 'creating',
-        model: defaults?.defaultModel,
-        permissionMode: defaults?.defaultPermissionMode,
-        effort: defaults?.defaultEffort,
-        plugins: defaults?.defaultPlugins,
+        model: providerSettings?.defaultModel ?? providerConfig.defaultModel,
+        permissionMode: providerSettings?.defaultPermissionMode ?? providerConfig.defaultPermissionMode,
+        effort: providerSettings?.defaultEffort ?? providerConfig.defaultEffort,
+        plugins: settings?.agentChat?.defaultPlugins,
         ...(cwd ? { initialCwd: cwd } : {}),
       }
     }
@@ -507,8 +509,8 @@ function PickerWrapper({
   }, [])
 
   const handleSelect = useCallback((type: PanePickerType) => {
-    if (type === 'claude-web') {
-      setStep({ step: 'directory', providerType: 'claude-web' })
+    if (isAgentChatProviderName(type)) {
+      setStep({ step: 'directory', providerType: type })
       return
     }
 
@@ -528,8 +530,9 @@ function PickerWrapper({
     const newContent = createContentForType(providerType, cwd)
     dispatch(updatePaneContent({ tabId, paneId, content: newContent }))
 
-    // Save the selected directory for the provider (use 'claude' key for claude-web)
-    const settingsKey = providerType === 'claude-web' ? 'claude' : providerType
+    // Save the selected directory for the provider
+    const agentConfig = getAgentChatProviderConfig(providerType)
+    const settingsKey = (agentConfig ? agentConfig.codingCliProvider : providerType) as CodingCliProviderName
     const existingProviderSettings = settings?.codingCli?.providers?.[settingsKey] || {}
     const patch = {
       codingCli: { providers: { [settingsKey]: { ...existingProviderSettings, cwd } } },
@@ -546,8 +549,9 @@ function PickerWrapper({
 
   if (step.step === 'directory') {
     const providerType = step.providerType
-    const providerLabel = providerType === 'claude-web' ? 'freshclaude' : getProviderLabel(providerType)
-    const settingsKey = providerType === 'claude-web' ? 'claude' : providerType
+    const agentConfig = getAgentChatProviderConfig(providerType)
+    const providerLabel = agentConfig ? agentConfig.label : getProviderLabel(providerType)
+    const settingsKey = (agentConfig ? agentConfig.codingCliProvider : providerType) as CodingCliProviderName
     const globalDefault = settings?.codingCli?.providers?.[settingsKey]?.cwd
     const defaultCwd = tabPref.defaultCwd ?? globalDefault
     return (
@@ -607,10 +611,10 @@ function renderContent(tabId: string, paneId: string, content: PaneContent, isOn
     )
   }
 
-  if (content.kind === 'claude-chat') {
+  if (content.kind === 'agent-chat') {
     return (
       <ErrorBoundary key={paneId} label="Chat">
-        <ClaudeChatView tabId={tabId} paneId={paneId} paneContent={content} hidden={hidden} />
+        <AgentChatView tabId={tabId} paneId={paneId} paneContent={content} hidden={hidden} />
       </ErrorBoundary>
     )
   }

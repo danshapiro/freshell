@@ -268,8 +268,8 @@ describe('SdkBridge', () => {
 
       const session = await bridge.createSession({ cwd: '/tmp' })
       const received: any[] = []
-      const unsub = bridge.subscribe(session.sessionId, (msg) => received.push(msg))
-      unsub!()
+      const sub = bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+      sub!.off()
 
       await new Promise(resolve => setTimeout(resolve, 100))
       // Messages should be buffered, not sent to unsubscribed listener
@@ -350,6 +350,328 @@ describe('SdkBridge', () => {
       expect(result.behavior).toBe('deny')
       expect(result.message).toBe('Too dangerous')
       expect(result.interrupt).toBe(true)
+    })
+  })
+
+  describe('canUseTool branching', () => {
+    it('blocks on AskUserQuestion and resolves when respondQuestion is called', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+
+      // Wait for stream to start
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      // Simulate canUseTool being called with AskUserQuestion
+      const questions = [
+        { question: 'Which option?', header: 'Choice', options: [{ label: 'A', description: 'Option A' }], multiSelect: false },
+      ]
+      const canUseToolPromise = mockCanUseTool('AskUserQuestion', { questions }, {
+        signal: new AbortController().signal,
+        toolUseID: 'tool-1',
+      })
+
+      // Wait for broadcast
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      // Should have broadcast sdk.question.request
+      const questionMsg = received.find(m => m.type === 'sdk.question.request')
+      expect(questionMsg).toBeDefined()
+      expect(questionMsg.questions).toEqual(questions)
+
+      // Respond to the question
+      const answers = { 'Which option?': 'A' }
+      bridge.respondQuestion(session.sessionId, questionMsg.requestId, answers)
+
+      // canUseTool should resolve with allow + updatedInput
+      const result = await canUseToolPromise
+      expect(result.behavior).toBe('allow')
+      expect(result.updatedInput).toEqual({
+        questions,
+        answers,
+      })
+    })
+
+    it('auto-allows non-AskUserQuestion tools in bypass mode', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp', permissionMode: 'bypassPermissions' })
+      bridge.subscribe(session.sessionId, () => {})
+
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      // Simulate canUseTool for a normal tool
+      const result = await mockCanUseTool('Bash', { command: 'ls' }, {
+        signal: new AbortController().signal,
+        toolUseID: 'tool-2',
+      })
+
+      expect(result.behavior).toBe('allow')
+      expect(result.updatedInput).toEqual({ command: 'ls' })
+    })
+
+    it('still blocks AskUserQuestion even in bypass mode', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp', permissionMode: 'bypassPermissions' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      const questions = [
+        { question: 'Pick one', header: 'Pick', options: [{ label: 'X', description: 'X desc' }], multiSelect: false },
+      ]
+      const canUseToolPromise = mockCanUseTool('AskUserQuestion', { questions }, {
+        signal: new AbortController().signal,
+        toolUseID: 'tool-3',
+      })
+
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      // Should still broadcast sdk.question.request, not auto-allow
+      const questionMsg = received.find(m => m.type === 'sdk.question.request')
+      expect(questionMsg).toBeDefined()
+
+      // No sdk.permission.request should be broadcast
+      const permMsg = received.find(m => m.type === 'sdk.permission.request')
+      expect(permMsg).toBeUndefined()
+
+      // Respond to unblock
+      bridge.respondQuestion(session.sessionId, questionMsg.requestId, { 'Pick one': 'X' })
+      const result = await canUseToolPromise
+      expect(result.behavior).toBe('allow')
+    })
+
+    it('routes non-AskUserQuestion tools through permission request in non-bypass mode', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp', permissionMode: 'default' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      // Fire canUseTool for a normal tool - should go to permission flow
+      const canUseToolPromise = mockCanUseTool('Bash', { command: 'rm -rf /' }, {
+        signal: new AbortController().signal,
+        toolUseID: 'tool-4',
+      })
+
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      const permMsg = received.find(m => m.type === 'sdk.permission.request')
+      expect(permMsg).toBeDefined()
+      expect(permMsg.tool.name).toBe('Bash')
+
+      // Respond to unblock
+      bridge.respondPermission(session.sessionId, permMsg.requestId, { behavior: 'allow', updatedInput: { command: 'rm -rf /' } })
+      const result = await canUseToolPromise
+      expect(result.behavior).toBe('allow')
+    })
+
+    it('does not pass allowDangerouslySkipPermissions to SDK query', async () => {
+      mockKeepStreamOpen = true
+      await bridge.createSession({ cwd: '/tmp', permissionMode: 'bypassPermissions' })
+      expect(mockQueryOptions?.allowDangerouslySkipPermissions).toBeUndefined()
+    })
+
+    it('auto-allows AskUserQuestion with malformed (non-array) questions input', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      bridge.subscribe(session.sessionId, () => {})
+
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      // Malformed input: questions is not an array
+      const result = await mockCanUseTool('AskUserQuestion', { questions: 'not-an-array' }, {
+        signal: new AbortController().signal,
+        toolUseID: 'tool-malformed',
+      })
+
+      // Should pass through without blocking
+      expect(result.behavior).toBe('allow')
+    })
+
+    it('auto-allows AskUserQuestion with empty questions array', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      bridge.subscribe(session.sessionId, () => {})
+
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      const result = await mockCanUseTool('AskUserQuestion', { questions: [] }, {
+        signal: new AbortController().signal,
+        toolUseID: 'tool-empty',
+      })
+
+      expect(result.behavior).toBe('allow')
+    })
+
+    it('auto-allows AskUserQuestion when all entries are null', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      bridge.subscribe(session.sessionId, () => {})
+
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      const result = await mockCanUseTool('AskUserQuestion', { questions: [null, null] }, {
+        signal: new AbortController().signal,
+        toolUseID: 'tool-nulls',
+      })
+
+      expect(result.behavior).toBe('allow')
+    })
+
+    it('filters null options within questions', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      const canUseToolPromise = mockCanUseTool('AskUserQuestion', {
+        questions: [{ question: 'Test?', header: 'H', options: [null, { label: 'A', description: 'ok' }, null], multiSelect: false }],
+      }, {
+        signal: new AbortController().signal,
+        toolUseID: 'tool-null-opts',
+      })
+
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      const questionMsg = received.find(m => m.type === 'sdk.question.request')
+      expect(questionMsg).toBeDefined()
+      // Only non-null option should survive
+      expect(questionMsg.questions[0].options).toEqual([{ label: 'A', description: 'ok' }])
+
+      bridge.respondQuestion(session.sessionId, questionMsg.requestId, { 'Test?': 'A' })
+      await canUseToolPromise
+    })
+
+    it('sanitizes question fields to safe types', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      const received: any[] = []
+      bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      // Malformed question: missing fields, wrong types
+      const canUseToolPromise = mockCanUseTool('AskUserQuestion', {
+        questions: [{ question: 123, options: 'not-an-array' }],
+      }, {
+        signal: new AbortController().signal,
+        toolUseID: 'tool-sanitize',
+      })
+
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      const questionMsg = received.find(m => m.type === 'sdk.question.request')
+      expect(questionMsg).toBeDefined()
+      // Fields should be coerced to safe types
+      expect(questionMsg.questions[0].question).toBe('123')
+      expect(questionMsg.questions[0].header).toBe('')
+      expect(questionMsg.questions[0].options).toEqual([])
+      expect(questionMsg.questions[0].multiSelect).toBe(false)
+
+      // Clean up: respond to unblock
+      bridge.respondQuestion(session.sessionId, questionMsg.requestId, { '123': 'ok' })
+      await canUseToolPromise
+    })
+
+    it('reads live permissionMode from session state for bypass check', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp', permissionMode: 'default' })
+      bridge.subscribe(session.sessionId, () => {})
+
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      // Change to bypass mid-session
+      bridge.setPermissionMode(session.sessionId, 'bypassPermissions')
+
+      // Now canUseTool for a normal tool should auto-allow
+      const result = await mockCanUseTool('Bash', { command: 'ls' }, {
+        signal: new AbortController().signal,
+        toolUseID: 'tool-5',
+      })
+      expect(result.behavior).toBe('allow')
+    })
+  })
+
+  describe('respondQuestion', () => {
+    it('returns false for nonexistent session', () => {
+      expect(bridge.respondQuestion('nonexistent', 'q-1', {})).toBe(false)
+    })
+
+    it('returns false for nonexistent question request', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      expect(bridge.respondQuestion(session.sessionId, 'q-nonexistent', {})).toBe(false)
+    })
+
+    it('preserves extra root-level fields from original input', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      bridge.subscribe(session.sessionId, () => {})
+
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      const questions = [
+        { question: 'Pick one', header: 'H', options: [{ label: 'A', description: '' }], multiSelect: false },
+      ]
+      // Original input has extra root fields beyond just "questions"
+      const canUseToolPromise = mockCanUseTool('AskUserQuestion', {
+        questions,
+        metadata: { source: 'test' },
+        annotations: { foo: 'bar' },
+      }, {
+        signal: new AbortController().signal,
+        toolUseID: 'tool-preserve',
+      })
+
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      const state = bridge.getSession(session.sessionId)!
+      const requestId = Array.from(state.pendingQuestions.keys())[0]
+
+      bridge.respondQuestion(session.sessionId, requestId, { 'Pick one': 'A' })
+
+      const result = await canUseToolPromise
+      expect(result.behavior).toBe('allow')
+      // Extra fields should be preserved in updatedInput
+      expect(result.updatedInput.metadata).toEqual({ source: 'test' })
+      expect(result.updatedInput.annotations).toEqual({ foo: 'bar' })
+      expect(result.updatedInput.answers).toEqual({ 'Pick one': 'A' })
+    })
+
+    it('formats multi-select answers as comma-separated strings', async () => {
+      mockKeepStreamOpen = true
+      const session = await bridge.createSession({ cwd: '/tmp' })
+      bridge.subscribe(session.sessionId, () => {})
+
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      const questions = [
+        { question: 'Pick many', header: 'Multi', options: [{ label: 'A', description: '' }, { label: 'B', description: '' }], multiSelect: true },
+      ]
+      const canUseToolPromise = mockCanUseTool('AskUserQuestion', { questions }, {
+        signal: new AbortController().signal,
+        toolUseID: 'tool-6',
+      })
+
+      await new Promise(resolve => setTimeout(resolve, 50))
+
+      const state = bridge.getSession(session.sessionId)!
+      const requestId = Array.from(state.pendingQuestions.keys())[0]
+
+      // Answers should already be comma-separated strings from client
+      bridge.respondQuestion(session.sessionId, requestId, { 'Pick many': 'A, B' })
+
+      const result = await canUseToolPromise
+      expect(result.behavior).toBe('allow')
+      expect(result.updatedInput).toEqual({
+        questions,
+        answers: { 'Pick many': 'A, B' },
+      })
     })
   })
 

@@ -10,6 +10,7 @@ export {
   SdkCreateSchema,
   SdkSendSchema,
   SdkPermissionRespondSchema,
+  SdkQuestionRespondSchema,
   SdkInterruptSchema,
   SdkKillSchema,
   SdkAttachSchema,
@@ -54,9 +55,22 @@ import type { ContentBlock, SdkSessionStatus } from '../shared/ws-protocol.js'
 
 // ── SDK Session State (server-side, in-memory) ──
 
+export interface QuestionOption {
+  label: string
+  description: string
+}
+
+export interface QuestionDefinition {
+  question: string
+  header: string
+  options: QuestionOption[]
+  multiSelect: boolean
+}
+
 export interface SdkSessionState {
   sessionId: string
   cliSessionId?: string
+  resumeSessionId?: string
   cwd?: string
   model?: string
   permissionMode?: string
@@ -71,6 +85,11 @@ export interface SdkSessionState {
     suggestions?: PermissionUpdate[]
     blockedPath?: string
     decisionReason?: string
+    resolve: (result: PermissionResult) => void
+  }>
+  pendingQuestions: Map<string, {
+    originalInput: Record<string, unknown>
+    questions: QuestionDefinition[]
     resolve: (result: PermissionResult) => void
   }>
   costUsd: number

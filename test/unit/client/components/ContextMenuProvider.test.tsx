@@ -8,6 +8,7 @@ import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
+import settingsReducer from '@/store/settingsSlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import TabBar from '@/components/TabBar'
@@ -51,6 +52,7 @@ function createTestStore(options?: { platform?: string | null }) {
       panes: panesReducer,
       sessions: sessionsReducer,
       connection: connectionReducer,
+      settings: settingsReducer,
     },
     middleware: (getDefaultMiddleware) =>
       getDefaultMiddleware({ serializableCheck: false }),
@@ -119,6 +121,7 @@ function createStoreWithSession() {
       tabs: tabsReducer,
       panes: panesReducer,
       sessions: sessionsReducer,
+      settings: settingsReducer,
     },
     middleware: (getDefaultMiddleware) =>
       getDefaultMiddleware({ serializableCheck: false }),
@@ -232,7 +235,7 @@ describe('ContextMenuProvider', () => {
   it('allows native menu for links inside non-global contexts', async () => {
     const user = userEvent.setup()
     renderWithProvider(
-      <div data-context="freshclaude-chat" data-session-id="sess-1">
+      <div data-context="agent-chat" data-session-id="sess-1">
         <a href="https://example.com">Example Link</a>
       </div>
     )
@@ -392,6 +395,7 @@ describe('ContextMenuProvider', () => {
         panes: panesReducer,
         sessions: sessionsReducer,
         connection: connectionReducer,
+        settings: settingsReducer,
       },
       middleware: (getDefaultMiddleware) =>
         getDefaultMiddleware({ serializableCheck: false }),
@@ -466,6 +470,7 @@ describe('ContextMenuProvider', () => {
         panes: panesReducer,
         sessions: sessionsReducer,
         connection: connectionReducer,
+        settings: settingsReducer,
       },
       middleware: (getDefaultMiddleware) =>
         getDefaultMiddleware({ serializableCheck: false }),
@@ -584,6 +589,7 @@ describe('ContextMenuProvider', () => {
         panes: panesReducer,
         sessions: sessionsReducer,
         connection: connectionReducer,
+        settings: settingsReducer,
       },
       middleware: (getDefaultMiddleware) =>
         getDefaultMiddleware({ serializableCheck: false }),
@@ -760,6 +766,7 @@ describe('ContextMenuProvider', () => {
           panes: panesReducer,
           sessions: sessionsReducer,
           connection: connectionReducer,
+          settings: settingsReducer,
         },
         middleware: (getDefaultMiddleware) =>
           getDefaultMiddleware({ serializableCheck: false }),

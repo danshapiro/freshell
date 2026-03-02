@@ -7,6 +7,7 @@ import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
+import settingsReducer from '@/store/settingsSlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 
@@ -41,6 +42,7 @@ function createTestStore() {
       panes: panesReducer,
       sessions: sessionsReducer,
       connection: connectionReducer,
+      settings: settingsReducer,
     },
     middleware: (getDefaultMiddleware) =>
       getDefaultMiddleware({ serializableCheck: false }),

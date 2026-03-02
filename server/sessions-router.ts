@@ -2,10 +2,12 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { cleanString } from './utils.js'
 import { makeSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
+import { CodingCliProviderSchema } from '../shared/ws-protocol.js'
 import { startPerfTimer } from './perf-logger.js'
 import { logger } from './logger.js'
 import { cascadeSessionRenameToTerminal } from './rename-cascade.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
+import type { SessionMetadataStore } from './session-metadata-store.js'
 
 const log = logger.child({ component: 'sessions-router' })
 
@@ -31,6 +33,7 @@ export interface SessionsRouterDeps {
   terminalMetadata?: { list: () => TerminalMeta[] }
   registry?: { updateTitle: (id: string, title: string) => void }
   wsHandler?: { broadcast: (msg: any) => void }
+  sessionMetadataStore?: SessionMetadataStore
 }
 
 export function createSessionsRouter(deps: SessionsRouterDeps): Router {
@@ -143,6 +146,26 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
     const provider = (req.query.provider as CodingCliProviderName) || 'claude'
     const compositeKey = rawId.includes(':') ? rawId : makeSessionKey(provider, rawId)
     await configStore.deleteSession(compositeKey)
+    await codingCliIndexer.refresh()
+    res.json({ ok: true })
+  })
+
+  const SessionMetadataPostSchema = z.object({
+    provider: CodingCliProviderSchema,
+    sessionId: z.string().min(1),
+    sessionType: z.string().min(1),
+  })
+
+  router.post('/session-metadata', async (req, res) => {
+    if (!deps.sessionMetadataStore) {
+      return res.status(500).json({ error: 'Session metadata store not configured' })
+    }
+    const parsed = SessionMetadataPostSchema.safeParse(req.body ?? {})
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Missing required fields: provider, sessionId, sessionType', details: parsed.error.issues })
+    }
+    const { provider, sessionId, sessionType } = parsed.data
+    await deps.sessionMetadataStore.set(provider, sessionId, { sessionType })
     await codingCliIndexer.refresh()
     res.json({ ok: true })
   })

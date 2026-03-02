@@ -50,7 +50,7 @@ export default defineConfig(({ mode }) => {
       allowedHosts,
       port: vitePort,
       watch: {
-        ignored: ['**/.worktrees/**', '**/demo-projects/**'],
+        ignored: ['**/.worktrees/**', '**/.claude/worktrees/**', '**/demo-projects/**'],
       },
       proxy: {
         '/api': {

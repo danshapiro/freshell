@@ -11,7 +11,7 @@ import terminalActivityReducer from './terminalActivitySlice'
 
 import turnCompletionReducer from './turnCompletionSlice'
 import terminalMetaReducer from './terminalMetaSlice'
-import claudeChatReducer from './claudeChatSlice'
+import agentChatReducer from './agentChatSlice'
 import { networkReducer } from './networkSlice'
 import tabRegistryReducer from './tabRegistrySlice'
 import { perfMiddleware } from './perfMiddleware'
@@ -37,7 +37,7 @@ export const store = configureStore({
 
     turnCompletion: turnCompletionReducer,
     terminalMeta: terminalMetaReducer,
-    claudeChat: claudeChatReducer,
+    agentChat: agentChatReducer,
     network: networkReducer,
     tabRegistry: tabRegistryReducer,
   },

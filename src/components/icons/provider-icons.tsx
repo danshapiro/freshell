@@ -72,6 +72,19 @@ export function GeminiIcon(props: IconProps) {
 }
 
 export function FreshclaudeIcon(props: IconProps) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 1024 1024"
+      fill="currentColor"
+      {...props}
+    >
+      <path d="M853.1,283.1c94.2,0,170.6,76.4,170.6,170.6s-76.4,170.6-170.6,170.6v-341.3h0ZM170.6,283.1C76.4,283.1,0,359.5,0,453.8s76.4,170.6,170.6,170.6v-341.3h0ZM853.1,624.3H170.6c0-188.5,152.8-341.3,341.3-341.3s341.3,152.8,341.3,341.3h-.1ZM410.8,496.4c0-23.6-19-42.6-42.6-42.6s-42.6,19-42.6,42.6,19,42.6,42.6,42.6,42.6-19,42.6-42.6h0ZM698.2,496.4c0-23.6-19-42.6-42.6-42.6s-42.6,19-42.6,42.6,19,42.6,42.6,42.6,42.6-19,42.6-42.6h0ZM234.6,624.3c-35.4,0-64,28.7-64,64s28.7,64,64,64v-127.9h0ZM368.2,624.3c-35.4,0-64,28.7-64,64s28.7,64,64,64v-127.9h0ZM789.1,752.3c35.4,0,64-28.7,64-64s-28.7-64-64-64v127.9h0ZM655.5,752.3c35.4,0,64-28.7,64-64s-28.7-64-64-64v127.9h0Z" />
+    </svg>
+  )
+}
+
+export function KilroyIcon(props: IconProps) {
   return <ClaudeIcon {...props} />
 }
 
@@ -89,7 +102,7 @@ export function DefaultProviderIcon(props: IconProps) {
   )
 }
 
-const PROVIDER_ICONS: Record<CodingCliProviderName, React.ComponentType<IconProps>> = {
+export const PROVIDER_ICONS: Record<CodingCliProviderName, React.ComponentType<IconProps>> = {
   claude: ClaudeIcon,
   codex: CodexIcon,
   kimi: KimiIcon,

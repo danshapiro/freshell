@@ -79,6 +79,7 @@ function createStore(options: {
   excludeFirstChatSubstrings?: string[]
   excludeFirstChatMustStart?: boolean
   showSubagents?: boolean
+  ignoreCodexSubagents?: boolean
 }) {
   const projects = options.projects.map((project) => ({
     ...project,
@@ -132,6 +133,7 @@ function createStore(options: {
             sortMode: 'activity',
             showProjectBadges: true,
             showSubagents: options.showSubagents ?? defaultSettings.sidebar.showSubagents,
+            ignoreCodexSubagents: options.ignoreCodexSubagents ?? defaultSettings.sidebar.ignoreCodexSubagents,
             hideEmptySessions: false,
             excludeFirstChatSubstrings: options.excludeFirstChatSubstrings ?? defaultSettings.sidebar.excludeFirstChatSubstrings,
             excludeFirstChatMustStart: options.excludeFirstChatMustStart ?? defaultSettings.sidebar.excludeFirstChatMustStart,
@@ -257,7 +259,7 @@ describe('sidebar click opens pane (e2e)', () => {
     expect(screen.getByText('Visible manual session')).toBeInTheDocument()
   })
 
-  it('hides codex subagent sessions by default even when subagents are shown', async () => {
+  it('shows all subagent sessions when showSubagents is true', async () => {
     const projects: ProjectGroup[] = [
       {
         projectPath: '/home/user/project',
@@ -289,6 +291,7 @@ describe('sidebar click opens pane (e2e)', () => {
       tabs: [{ id: 'tab-1', mode: 'shell' }],
       activeTabId: 'tab-1',
       showSubagents: true,
+      ignoreCodexSubagents: false,
     })
 
     renderSidebar(store)
@@ -297,7 +300,7 @@ describe('sidebar click opens pane (e2e)', () => {
       vi.advanceTimersByTime(100)
     })
 
-    expect(screen.queryByText('Codex subagent session')).not.toBeInTheDocument()
+    expect(screen.getByText('Codex subagent session')).toBeInTheDocument()
     expect(screen.getByText('Claude subagent session')).toBeInTheDocument()
   })
 
@@ -435,7 +438,7 @@ describe('sidebar click opens pane (e2e)', () => {
     expect(state.panes.layouts['tab-2'].type).toBe('leaf')
   })
 
-  it('clicking a session already open in a claude-chat pane focuses it', async () => {
+  it('clicking a session already open in an agent-chat pane focuses it', async () => {
     const targetId = sessionId('freshclaude-open')
 
     const projects: ProjectGroup[] = [
@@ -476,7 +479,7 @@ describe('sidebar click opens pane (e2e)', () => {
             type: 'leaf',
             id: 'pane-chat',
             content: {
-              kind: 'claude-chat',
+              kind: 'agent-chat', provider: 'freshclaude',
               createRequestId: 'req-chat',
               status: 'idle',
               resumeSessionId: targetId,
@@ -506,7 +509,7 @@ describe('sidebar click opens pane (e2e)', () => {
     expect(state.tabs.tabs).toHaveLength(2)
     // Should switch to tab-2 where the freshclaude session lives
     expect(state.tabs.activeTabId).toBe('tab-2')
-    // Should focus the existing claude-chat pane
+    // Should focus the existing agent-chat pane
     expect(state.panes.activePane['tab-2']).toBe('pane-chat')
     // Layout should be unchanged (still a leaf, no split)
     expect(state.panes.layouts['tab-2'].type).toBe('leaf')

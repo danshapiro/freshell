@@ -204,7 +204,7 @@ describe('directory picker flow (e2e)', () => {
     fireEvent.keyDown(picker, { key: 'l' })
     fireEvent.transitionEnd(picker)
 
-    const input = screen.getByLabelText('Starting directory for Claude')
+    const input = screen.getByLabelText('Starting directory for Claude CLI')
     fireEvent.change(input, { target: { value: '/home/user/next' } })
     fireEvent.keyDown(input, { key: 'Enter' })
 
@@ -239,7 +239,7 @@ describe('directory picker flow (e2e)', () => {
     fireEvent.keyDown(picker, { key: 'l' })
     fireEvent.transitionEnd(picker)
 
-    const input = screen.getByLabelText('Starting directory for Claude')
+    const input = screen.getByLabelText('Starting directory for Claude CLI')
     fireEvent.change(input, { target: { value: String.raw`"D:\users\words with spaces\a"` } })
 
     await waitFor(() => {
@@ -268,7 +268,7 @@ describe('directory picker flow (e2e)', () => {
       fireEvent.transitionEnd(picker)
 
       // Input should pre-fill with tab-preferred directory, not global default
-      const input = screen.getByLabelText('Starting directory for Claude')
+      const input = screen.getByLabelText('Starting directory for Claude CLI')
       expect(input).toHaveValue('/code/tab-project')
     })
 
@@ -284,7 +284,7 @@ describe('directory picker flow (e2e)', () => {
       fireEvent.keyDown(picker, { key: 'l' })
       fireEvent.transitionEnd(picker)
 
-      const input = screen.getByLabelText('Starting directory for Claude')
+      const input = screen.getByLabelText('Starting directory for Claude CLI')
 
       // Clear the input to exit path mode and show all fuzzy candidates
       fireEvent.change(input, { target: { value: '' } })
@@ -320,7 +320,7 @@ describe('directory picker flow (e2e)', () => {
       fireEvent.transitionEnd(picker)
 
       // Input is pre-filled with tab-preferred dir; just press Enter to confirm
-      const input = screen.getByLabelText('Starting directory for Claude')
+      const input = screen.getByLabelText('Starting directory for Claude CLI')
       expect(input).toHaveValue('/code/tab-project')
       fireEvent.keyDown(input, { key: 'Enter' })
 

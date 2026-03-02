@@ -44,6 +44,7 @@ describe('settingsSlice', () => {
         sortMode: 'recency-pinned',
         showProjectBadges: true,
         showSubagents: false,
+        ignoreCodexSubagents: true,
         showNoninteractiveSessions: false,
         hideEmptySessions: true,
         excludeFirstChatSubstrings: [],
@@ -115,6 +116,7 @@ describe('settingsSlice', () => {
           sortMode: 'recency',
           showProjectBadges: false,
           showSubagents: false,
+          ignoreCodexSubagents: true,
           showNoninteractiveSessions: false,
           hideEmptySessions: true,
           excludeFirstChatSubstrings: [],
@@ -162,7 +164,7 @@ describe('settingsSlice', () => {
           ...defaultSettings.editor,
           ...newSettings.editor,
         },
-        freshclaude: {},
+        agentChat: { providers: {} },
       })
     })
 

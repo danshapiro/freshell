@@ -121,31 +121,31 @@ describe('PanePicker', () => {
       expect(screen.getByTestId('terminal-icon')).toBeInTheDocument()
     })
 
-    it('shows Claude and Codex buttons when available and enabled', () => {
+    it('shows Claude CLI and Codex CLI buttons when available and enabled', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
       })
-      expect(screen.getByRole('button', { name: 'Claude' })).toBeInTheDocument()
-      expect(screen.getByRole('button', { name: 'Codex' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Claude CLI' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Codex CLI' })).toBeInTheDocument()
     })
 
-    it('hides Claude when not available on system', () => {
+    it('hides Claude CLI when not available on system', () => {
       renderPicker({
         availableClis: { claude: false, codex: true },
         enabledProviders: ['claude', 'codex'],
       })
-      expect(screen.queryByRole('button', { name: 'Claude' })).not.toBeInTheDocument()
-      expect(screen.getByRole('button', { name: 'Codex' })).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Claude CLI' })).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Codex CLI' })).toBeInTheDocument()
     })
 
-    it('hides Codex when disabled in settings', () => {
+    it('hides Codex CLI when disabled in settings', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude'],
       })
-      expect(screen.getByRole('button', { name: 'Claude' })).toBeInTheDocument()
-      expect(screen.queryByRole('button', { name: 'Codex' })).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Claude CLI' })).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Codex CLI' })).not.toBeInTheDocument()
     })
 
     it('renders provider icons as inline SVGs (not img tags)', () => {
@@ -153,8 +153,8 @@ describe('PanePicker', () => {
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
       })
-      const claudeButton = screen.getByRole('button', { name: 'Claude' })
-      const codexButton = screen.getByRole('button', { name: 'Codex' })
+      const claudeButton = screen.getByRole('button', { name: 'Claude CLI' })
+      const codexButton = screen.getByRole('button', { name: 'Codex CLI' })
 
       // Should render inline SVGs that inherit color, not <img> tags
       expect(claudeButton.querySelector('svg')).toBeInTheDocument()
@@ -163,25 +163,26 @@ describe('PanePicker', () => {
       expect(codexButton.querySelector('img')).not.toBeInTheDocument()
     })
 
-    it('renders options in correct order: CLIs, freshclaude, Editor, Browser, Shell', () => {
+    it('renders options in correct order: Freshclaude, CLIs, Kilroy, Editor, Browser, Shell', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
       })
       const buttons = screen.getAllByRole('button')
       const labels = buttons.map(b => b.getAttribute('aria-label'))
-      expect(labels[0]).toBe('Claude')
-      expect(labels[1]).toBe('Codex')
-      expect(labels[2]).toBe('freshclaude')
-      expect(labels[3]).toBe('Editor')
-      expect(labels[4]).toBe('Browser')
-      expect(labels[5]).toBe('Shell')
+      expect(labels[0]).toBe('Freshclaude')
+      expect(labels[1]).toBe('Claude CLI')
+      expect(labels[2]).toBe('Codex CLI')
+      expect(labels[3]).toBe('Kilroy')
+      expect(labels[4]).toBe('Editor')
+      expect(labels[5]).toBe('Browser')
+      expect(labels[6]).toBe('Shell')
     })
 
     it('shows only non-CLI options when no CLIs are available', () => {
       renderPicker({ availableClis: {} })
-      expect(screen.queryByRole('button', { name: 'Claude' })).not.toBeInTheDocument()
-      expect(screen.queryByRole('button', { name: 'Codex' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Claude CLI' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Codex CLI' })).not.toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Editor' })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Browser' })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Shell' })).toBeInTheDocument()
@@ -214,12 +215,12 @@ describe('PanePicker', () => {
       expect(onSelect).toHaveBeenCalledWith('shell')
     })
 
-    it('calls onSelect with claude when Claude button is clicked', () => {
+    it('calls onSelect with claude when Claude CLI button is clicked', () => {
       const { onSelect } = renderPicker({
         availableClis: { claude: true },
         enabledProviders: ['claude'],
       })
-      fireEvent.click(screen.getByRole('button', { name: 'Claude' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Claude CLI' }))
       completeFadeAnimation()
       expect(onSelect).toHaveBeenCalledWith('claude')
     })
@@ -443,7 +444,7 @@ describe('PanePicker', () => {
   })
 
   describe('balanced icon layout', () => {
-    it('prefers a balanced 3+2 arrangement when five options are visible', () => {
+    it('prefers a balanced 3+3 arrangement when six options are visible', () => {
       renderPicker({
         availableClis: { claude: true },
         enabledProviders: ['claude'],
@@ -452,7 +453,7 @@ describe('PanePicker', () => {
       const rows = screen.getAllByTestId('pane-picker-option-row')
       expect(rows).toHaveLength(2)
       expect(within(rows[0]).getAllByRole('button')).toHaveLength(3)
-      expect(within(rows[1]).getAllByRole('button')).toHaveLength(2)
+      expect(within(rows[1]).getAllByRole('button')).toHaveLength(3)
     })
   })
 })

@@ -7,7 +7,7 @@ import { rankCandidateDirectories } from '@/lib/tab-directory-preference'
 import { cn } from '@/lib/utils'
 
 type DirectoryPickerProps = {
-  providerType: CodingCliProviderName | 'claude-web'
+  providerType: string
   providerLabel: string
   defaultCwd?: string
   tabDirectories?: string[]
