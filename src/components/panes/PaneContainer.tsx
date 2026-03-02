@@ -451,6 +451,7 @@ function PickerWrapper({
         model: providerSettings?.defaultModel ?? providerConfig.defaultModel,
         permissionMode: providerSettings?.defaultPermissionMode ?? providerConfig.defaultPermissionMode,
         effort: providerSettings?.defaultEffort ?? providerConfig.defaultEffort,
+        plugins: settings?.agentChat?.defaultPlugins,
         ...(cwd ? { initialCwd: cwd } : {}),
       }
     }

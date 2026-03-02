@@ -1388,6 +1388,7 @@ export class WsHandler {
             model: m.model,
             permissionMode: m.permissionMode,
             effort: m.effort,
+            plugins: m.plugins,
           })
           state.sdkSessions.add(session.sessionId)
 

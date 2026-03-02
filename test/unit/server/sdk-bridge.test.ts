@@ -1,3 +1,4 @@
+import path from 'path'
 import { EventEmitter } from 'events'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
@@ -835,6 +836,55 @@ describe('SdkBridge', () => {
     it('omits effort from SDK query options when not set', async () => {
       await bridge.createSession({ cwd: '/tmp' })
       expect(mockQueryOptions?.effort).toBeUndefined()
+    })
+  })
+
+  describe('plugins option', () => {
+    it('passes plugins to SDK query options as SdkPluginConfig array', async () => {
+      await bridge.createSession({
+        cwd: '/tmp',
+        plugins: ['/path/to/plugin-a', '/path/to/plugin-b'],
+      })
+      expect(mockQueryOptions?.plugins).toEqual([
+        { type: 'local', path: '/path/to/plugin-a' },
+        { type: 'local', path: '/path/to/plugin-b' },
+      ])
+    })
+
+    it('uses default plugins when not set', async () => {
+      await bridge.createSession({ cwd: '/tmp' })
+      expect(mockQueryOptions?.plugins).toBeDefined()
+      expect(mockQueryOptions?.plugins).toHaveLength(1)
+      expect(mockQueryOptions?.plugins[0].path).toContain('freshell-orchestration')
+    })
+
+    it('passes empty plugins array when given empty array', async () => {
+      await bridge.createSession({ cwd: '/tmp', plugins: [] })
+      expect(mockQueryOptions?.plugins).toEqual([])
+    })
+  })
+
+  describe('default plugins', () => {
+    it('resolves freshell-orchestration as default when no plugins specified', async () => {
+      await bridge.createSession({ cwd: '/tmp' })
+      expect(mockQueryOptions?.plugins).toBeDefined()
+      expect(mockQueryOptions?.plugins).toHaveLength(1)
+      expect(mockQueryOptions?.plugins[0].type).toBe('local')
+      // Must resolve from process.cwd(), not import.meta.url (which would land in dist/)
+      const expectedPath = path.join(process.cwd(), '.claude', 'plugins', 'freshell-orchestration')
+      expect(mockQueryOptions?.plugins[0].path).toBe(expectedPath)
+    })
+
+    it('does not add defaults when plugins are explicitly provided', async () => {
+      await bridge.createSession({ cwd: '/tmp', plugins: ['/custom/plugin'] })
+      expect(mockQueryOptions?.plugins).toEqual([
+        { type: 'local', path: '/custom/plugin' },
+      ])
+    })
+
+    it('does not add defaults when empty plugins array is provided', async () => {
+      await bridge.createSession({ cwd: '/tmp', plugins: [] })
+      expect(mockQueryOptions?.plugins).toEqual([])
     })
   })
 
