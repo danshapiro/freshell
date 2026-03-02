@@ -2,10 +2,14 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, cleanup } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import ChatComposer from '../../../../../src/components/agent-chat/ChatComposer'
+import { getDraft, clearDraft } from '@/lib/draft-store'
 
 describe('ChatComposer', () => {
   afterEach(() => {
     cleanup()
+    clearDraft('test-pane')
+    clearDraft('pane-a')
+    clearDraft('pane-b')
   })
   it('renders textarea and send button', () => {
     render(<ChatComposer onSend={() => {}} onInterrupt={() => {}} />)
@@ -73,5 +77,64 @@ describe('ChatComposer', () => {
     await user.click(textarea)
     await user.keyboard('{Escape}')
     expect(onInterrupt).not.toHaveBeenCalled()
+  })
+
+  describe('draft preservation', () => {
+    it('starts empty when no saved draft exists', () => {
+      render(<ChatComposer paneId="test-pane" onSend={() => {}} onInterrupt={() => {}} />)
+      expect(screen.getByRole('textbox')).toHaveValue('')
+    })
+
+    it('restores draft text after unmount and remount', async () => {
+      const user = userEvent.setup()
+      const { unmount } = render(
+        <ChatComposer paneId="test-pane" onSend={() => {}} onInterrupt={() => {}} />
+      )
+      await user.type(screen.getByRole('textbox'), 'work in progress')
+      unmount()
+
+      // Remount with the same paneId
+      render(<ChatComposer paneId="test-pane" onSend={() => {}} onInterrupt={() => {}} />)
+      expect(screen.getByRole('textbox')).toHaveValue('work in progress')
+    })
+
+    it('clears draft after sending a message', async () => {
+      const user = userEvent.setup()
+      render(<ChatComposer paneId="test-pane" onSend={() => {}} onInterrupt={() => {}} />)
+      await user.type(screen.getByRole('textbox'), 'sent message{Enter}')
+      expect(getDraft('test-pane')).toBe('')
+    })
+
+    it('keeps independent drafts per paneId', async () => {
+      const user = userEvent.setup()
+      const { unmount: unmountA } = render(
+        <ChatComposer paneId="pane-a" onSend={() => {}} onInterrupt={() => {}} />
+      )
+      await user.type(screen.getByRole('textbox'), 'draft A')
+      unmountA()
+
+      const { unmount: unmountB } = render(
+        <ChatComposer paneId="pane-b" onSend={() => {}} onInterrupt={() => {}} />
+      )
+      await user.type(screen.getByRole('textbox'), 'draft B')
+      unmountB()
+
+      // Remount A — should have its own draft
+      render(<ChatComposer paneId="pane-a" onSend={() => {}} onInterrupt={() => {}} />)
+      expect(screen.getByRole('textbox')).toHaveValue('draft A')
+    })
+
+    it('works without paneId (no persistence, backwards compatible)', async () => {
+      const user = userEvent.setup()
+      const { unmount } = render(
+        <ChatComposer onSend={() => {}} onInterrupt={() => {}} />
+      )
+      await user.type(screen.getByRole('textbox'), 'no pane id')
+      unmount()
+
+      // Remount without paneId — starts empty (no crash)
+      render(<ChatComposer onSend={() => {}} onInterrupt={() => {}} />)
+      expect(screen.getByRole('textbox')).toHaveValue('')
+    })
   })
 })

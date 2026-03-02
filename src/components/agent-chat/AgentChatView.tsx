@@ -614,6 +614,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
       {/* Composer */}
       <ChatComposer
         ref={composerRef}
+        paneId={paneId}
         onSend={handleSend}
         onInterrupt={handleInterrupt}
         disabled={!isInteractive && !isRunning}

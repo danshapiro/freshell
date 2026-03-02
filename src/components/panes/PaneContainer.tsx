@@ -14,6 +14,7 @@ import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
 import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-utils'
 import { isAgentChatProviderName, getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { clearDraft } from '@/lib/draft-store'
 import { getTerminalActions } from '@/lib/pane-action-registry'
 import { cn } from '@/lib/utils'
 import { getWsClient } from '@/lib/ws-client'
@@ -209,8 +210,9 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         dispatch(updateTab({ id: tabId, updates: { terminalId: undefined } }))
       }
     }
-    // Clean up SDK session if this pane has one
+    // Clean up agent-chat resources
     if (content.kind === 'agent-chat') {
+      clearDraft(paneId)
       const sessionId = content.sessionId || sdkPendingCreates[content.createRequestId]
       if (sessionId) {
         ws.send({ type: 'sdk.kill', sessionId })
