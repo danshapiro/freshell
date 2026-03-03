@@ -87,6 +87,9 @@ vi.mock('lucide-react', () => ({
   Search: ({ className }: { className?: string }) => (
     <svg data-testid="search-icon" className={className} />
   ),
+  FolderOpen: ({ className }: { className?: string }) => (
+    <svg data-testid="folder-open-icon" className={className} />
+  ),
 }))
 
 // Mock PaneIcon to avoid transitive dependency issues
@@ -105,6 +108,13 @@ vi.mock('@/components/TerminalView', () => ({
 vi.mock('@/components/panes/BrowserPane', () => ({
   default: ({ paneId, url }: { paneId: string; url: string }) => (
     <div data-testid={`browser-${paneId}`}>Browser: {url}</div>
+  ),
+}))
+
+// Mock EditorPane component to avoid fetch side effects in tests
+vi.mock('@/components/panes/EditorPane', () => ({
+  default: ({ paneId }: { paneId: string }) => (
+    <div data-testid={`editor-${paneId}`}>Editor</div>
   ),
 }))
 
@@ -568,6 +578,214 @@ describe('PaneLayout', () => {
       state = store.getState().panes
       // Should have 3 panes now in a nested structure
       expect(state.activePane['tab-1']).not.toBe(firstNewPaneId)
+    })
+  })
+
+  describe('FAB + button respects defaultNewPane setting', () => {
+    function createStoreWithDefaultNewPane(
+      defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor',
+      panesState: Partial<PanesState> = {},
+    ) {
+      const store = createStore(panesState)
+      store.dispatch({
+        type: 'settings/updateSettingsLocal',
+        payload: { panes: { defaultNewPane } },
+      })
+      return store
+    }
+
+    it('creates shell terminal when defaultNewPane is "shell"', () => {
+      const paneId = 'pane-1'
+      const store = createStoreWithDefaultNewPane('shell', {
+        layouts: {
+          'tab-1': { type: 'leaf', id: paneId, content: createTerminalContent() },
+        },
+        activePane: { 'tab-1': paneId },
+      })
+
+      renderWithStore(
+        <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByTitle('Add pane'))
+
+      const state = store.getState().panes
+      const splitNode = state.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
+      const newPane = splitNode.children[1] as Extract<PaneNode, { type: 'leaf' }>
+      expect(newPane.content.kind).toBe('terminal')
+      expect((newPane.content as any).mode).toBe('shell')
+    })
+
+    it('creates browser pane when defaultNewPane is "browser"', () => {
+      const paneId = 'pane-1'
+      const store = createStoreWithDefaultNewPane('browser', {
+        layouts: {
+          'tab-1': { type: 'leaf', id: paneId, content: createTerminalContent() },
+        },
+        activePane: { 'tab-1': paneId },
+      })
+
+      renderWithStore(
+        <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByTitle('Add pane'))
+
+      const state = store.getState().panes
+      const splitNode = state.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
+      const newPane = splitNode.children[1] as Extract<PaneNode, { type: 'leaf' }>
+      expect(newPane.content.kind).toBe('browser')
+    })
+
+    it('creates editor pane when defaultNewPane is "editor"', () => {
+      const paneId = 'pane-1'
+      const store = createStoreWithDefaultNewPane('editor', {
+        layouts: {
+          'tab-1': { type: 'leaf', id: paneId, content: createTerminalContent() },
+        },
+        activePane: { 'tab-1': paneId },
+      })
+
+      renderWithStore(
+        <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByTitle('Add pane'))
+
+      const state = store.getState().panes
+      const splitNode = state.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
+      const newPane = splitNode.children[1] as Extract<PaneNode, { type: 'leaf' }>
+      expect(newPane.content.kind).toBe('editor')
+    })
+  })
+
+  describe('split buttons respect defaultNewPane setting', () => {
+    function createStoreWithDefaultNewPane(
+      defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor',
+      panesState: Partial<PanesState> = {},
+    ) {
+      const store = createStore(panesState)
+      store.dispatch({
+        type: 'settings/updateSettingsLocal',
+        payload: { panes: { defaultNewPane } },
+      })
+      return store
+    }
+
+    it('creates picker pane when defaultNewPane is "ask" and split horizontally is clicked', () => {
+      const paneId = 'pane-1'
+      const store = createStoreWithDefaultNewPane('ask', {
+        layouts: {
+          'tab-1': { type: 'leaf', id: paneId, content: createTerminalContent() },
+        },
+        activePane: { 'tab-1': paneId },
+      })
+
+      renderWithStore(
+        <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByTitle('Split horizontally'))
+
+      const state = store.getState().panes
+      const splitNode = state.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
+      expect(splitNode.direction).toBe('horizontal')
+      const newPane = splitNode.children[1] as Extract<PaneNode, { type: 'leaf' }>
+      expect(newPane.content.kind).toBe('picker')
+    })
+
+    it('creates picker pane when defaultNewPane is "ask" and split vertically is clicked', () => {
+      const paneId = 'pane-1'
+      const store = createStoreWithDefaultNewPane('ask', {
+        layouts: {
+          'tab-1': { type: 'leaf', id: paneId, content: createTerminalContent() },
+        },
+        activePane: { 'tab-1': paneId },
+      })
+
+      renderWithStore(
+        <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByTitle('Split vertically'))
+
+      const state = store.getState().panes
+      const splitNode = state.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
+      expect(splitNode.direction).toBe('vertical')
+      const newPane = splitNode.children[1] as Extract<PaneNode, { type: 'leaf' }>
+      expect(newPane.content.kind).toBe('picker')
+    })
+
+    it('creates shell terminal when defaultNewPane is "shell"', () => {
+      const paneId = 'pane-1'
+      const store = createStoreWithDefaultNewPane('shell', {
+        layouts: {
+          'tab-1': { type: 'leaf', id: paneId, content: createTerminalContent() },
+        },
+        activePane: { 'tab-1': paneId },
+      })
+
+      renderWithStore(
+        <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByTitle('Split horizontally'))
+
+      const state = store.getState().panes
+      const splitNode = state.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
+      const newPane = splitNode.children[1] as Extract<PaneNode, { type: 'leaf' }>
+      expect(newPane.content.kind).toBe('terminal')
+      expect((newPane.content as any).mode).toBe('shell')
+    })
+
+    it('creates browser pane when defaultNewPane is "browser"', () => {
+      const paneId = 'pane-1'
+      const store = createStoreWithDefaultNewPane('browser', {
+        layouts: {
+          'tab-1': { type: 'leaf', id: paneId, content: createTerminalContent() },
+        },
+        activePane: { 'tab-1': paneId },
+      })
+
+      renderWithStore(
+        <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByTitle('Split horizontally'))
+
+      const state = store.getState().panes
+      const splitNode = state.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
+      const newPane = splitNode.children[1] as Extract<PaneNode, { type: 'leaf' }>
+      expect(newPane.content.kind).toBe('browser')
+    })
+
+    it('creates editor pane when defaultNewPane is "editor"', () => {
+      const paneId = 'pane-1'
+      const store = createStoreWithDefaultNewPane('editor', {
+        layouts: {
+          'tab-1': { type: 'leaf', id: paneId, content: createTerminalContent() },
+        },
+        activePane: { 'tab-1': paneId },
+      })
+
+      renderWithStore(
+        <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} />,
+        store,
+      )
+
+      fireEvent.click(screen.getByTitle('Split horizontally'))
+
+      const state = store.getState().panes
+      const splitNode = state.layouts['tab-1'] as Extract<PaneNode, { type: 'split' }>
+      const newPane = splitNode.children[1] as Extract<PaneNode, { type: 'leaf' }>
+      expect(newPane.content.kind).toBe('editor')
     })
   })
 

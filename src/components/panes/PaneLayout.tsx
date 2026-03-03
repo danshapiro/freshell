@@ -34,12 +34,20 @@ export default function PaneLayout({ tabId, defaultContent, hidden }: PaneLayout
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dispatch, tabId, layout])
 
+  const buildNewPaneContent = useCallback((): PaneContentInput => {
+    const defaultNewPane = settings.panes?.defaultNewPane || 'ask'
+    if (defaultNewPane === 'ask') return { kind: 'picker' }
+    if (defaultNewPane === 'browser') return { kind: 'browser', url: '', devToolsOpen: false }
+    if (defaultNewPane === 'editor') return { kind: 'editor', filePath: null, language: null, readOnly: false, content: '', viewMode: 'source' }
+    return { kind: 'terminal', mode: 'shell', shell: 'system', initialCwd: settings.defaultCwd }
+  }, [settings])
+
   const handleAddPane = useCallback(() => {
     dispatch(addPane({
       tabId,
-      newContent: { kind: 'picker' },
+      newContent: buildNewPaneContent(),
     }))
-  }, [dispatch, tabId])
+  }, [dispatch, tabId, buildNewPaneContent])
 
   const handleSplit = useCallback((direction: 'horizontal' | 'vertical') => {
     if (!activePaneId) return
@@ -47,9 +55,9 @@ export default function PaneLayout({ tabId, defaultContent, hidden }: PaneLayout
       tabId,
       paneId: activePaneId,
       direction,
-      newContent: { kind: 'terminal', mode: 'shell', shell: 'system', initialCwd: settings.defaultCwd },
+      newContent: buildNewPaneContent(),
     }))
-  }, [dispatch, tabId, activePaneId, settings.defaultCwd])
+  }, [dispatch, tabId, activePaneId, buildNewPaneContent])
 
   if (!layout) {
     return <div className="h-full w-full" /> // Loading state
