@@ -85,7 +85,41 @@ export function FreshclaudeIcon(props: IconProps) {
 }
 
 export function KilroyIcon(props: IconProps) {
-  return <ClaudeIcon {...props} />
+  const strokeProps = {
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeMiterlimit: 10,
+    strokeWidth: 29,
+  }
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 1024 1024"
+      fill="currentColor"
+      {...props}
+    >
+      {/* Nose */}
+      <path {...strokeProps} d="M460.8,514.5c-11.9,18-19.3,42.7-19.3,70.1,0,54.8,29.6,99.2,66.2,99.2s66.2-44.4,66.2-99.2-7.4-52.1-19.3-70.1" />
+      {/* Eyes */}
+      <ellipse cx="554.5" cy="429.9" rx="12.4" ry="17.5" />
+      <ellipse cx="460.8" cy="429.9" rx="12.4" ry="17.5" />
+      {/* Right fingers */}
+      <ellipse {...strokeProps} cx="913.1" cy="563.7" rx="24.8" ry="35" />
+      <ellipse {...strokeProps} cx="962.7" cy="563.7" rx="24.8" ry="35" />
+      <ellipse {...strokeProps} cx="813.8" cy="563.7" rx="24.8" ry="35" />
+      <ellipse {...strokeProps} cx="863.4" cy="563.7" rx="24.8" ry="35" />
+      {/* Left fingers */}
+      <ellipse {...strokeProps} cx="102.3" cy="563.7" rx="24.8" ry="35" />
+      <ellipse {...strokeProps} cx="52.7" cy="563.7" rx="24.8" ry="35" />
+      <ellipse {...strokeProps} cx="201.6" cy="563.7" rx="24.8" ry="35" />
+      <ellipse {...strokeProps} cx="152" cy="563.7" rx="24.8" ry="35" />
+      {/* Arms */}
+      <line {...strokeProps} x1="309.1" y1="563.7" x2="226.2" y2="563.7" />
+      <line {...strokeProps} x1="706.2" y1="563.7" x2="789.6" y2="563.7" />
+      {/* Head and wall */}
+      <path {...strokeProps} d="M566.9,563.7h139.3c0-154.6-88.9-280-198.5-280s-198.5,125.4-198.5,280h132.4" />
+    </svg>
+  )
 }
 
 // Fallback for unknown providers
