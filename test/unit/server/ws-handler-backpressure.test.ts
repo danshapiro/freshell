@@ -411,6 +411,138 @@ describe('WsHandler.broadcastSessionsUpdatedToLegacy patch-mode transition', () 
   })
 })
 
+describe('WsHandler.broadcastSessionsUpdated pagination for capable clients', () => {
+  let server: http.Server
+  let handler: WsHandler
+  let registry: TerminalRegistry
+
+  beforeEach(async () => {
+    server = http.createServer()
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+    registry = new TerminalRegistry()
+    handler = new WsHandler(server, registry)
+  })
+
+  afterEach(async () => {
+    handler.close()
+    registry.shutdown()
+    if (server.listening) {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('sends paginated snapshot to pagination-capable clients instead of full list', async () => {
+    const ws = createMockWs()
+    const sentMessages: any[] = []
+    ws.send = vi.fn((_data: any, cb?: (err?: Error) => void) => {
+      sentMessages.push(JSON.parse(_data as string))
+      cb?.()
+    })
+
+    const connections = (handler as any).connections as Set<any>
+    const clientStates = (handler as any).clientStates as Map<any, any>
+    connections.add(ws)
+    clientStates.set(ws, {
+      authenticated: true,
+      supportsSessionsPatchV1: true,
+      supportsSessionsPaginationV1: true,
+      sessionsSnapshotSent: true,
+      attachedTerminalIds: new Set(),
+      createdByRequestId: new Map(),
+      terminalCreateTimestamps: [],
+      codingCliSubscriptions: new Map(),
+    })
+
+    // Create 200 sessions across 2 projects
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/a',
+        sessions: Array.from({ length: 120 }, (_, i) => ({
+          provider: 'claude' as const,
+          sessionId: `a${i}`,
+          projectPath: '/a',
+          updatedAt: 1000 + i,
+        })),
+      },
+      {
+        projectPath: '/b',
+        sessions: Array.from({ length: 80 }, (_, i) => ({
+          provider: 'claude' as const,
+          sessionId: `b${i}`,
+          projectPath: '/b',
+          updatedAt: 2000 + i,
+        })),
+      },
+    ]
+
+    handler.broadcastSessionsUpdated(projects)
+
+    // Wait for async send
+    await new Promise<void>((resolve) => setImmediate(resolve))
+
+    // Count total sessions sent across all chunks
+    const clearMsg = sentMessages.find(m => m.type === 'sessions.updated' && m.clear === true)
+    expect(clearMsg).toBeDefined()
+
+    const totalSent = sentMessages
+      .filter(m => m.type === 'sessions.updated' && m.projects)
+      .reduce((sum, m) => sum + m.projects.reduce((s: number, p: any) => s + p.sessions.length, 0), 0)
+
+    // Should be paginated to 100, not the full 200
+    expect(totalSent).toBe(100)
+
+    // Should include pagination metadata on the first chunk
+    expect(clearMsg.totalSessions).toBe(200)
+    expect(clearMsg.hasMore).toBe(true)
+  })
+
+  it('sends full snapshot to legacy clients (no pagination capability)', async () => {
+    const ws = createMockWs()
+    const sentMessages: any[] = []
+    ws.send = vi.fn((_data: any, cb?: (err?: Error) => void) => {
+      sentMessages.push(JSON.parse(_data as string))
+      cb?.()
+    })
+
+    const connections = (handler as any).connections as Set<any>
+    const clientStates = (handler as any).clientStates as Map<any, any>
+    connections.add(ws)
+    clientStates.set(ws, {
+      authenticated: true,
+      supportsSessionsPatchV1: false,
+      supportsSessionsPaginationV1: false,
+      sessionsSnapshotSent: false,
+      attachedTerminalIds: new Set(),
+      createdByRequestId: new Map(),
+      terminalCreateTimestamps: [],
+      codingCliSubscriptions: new Map(),
+    })
+
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/a',
+        sessions: Array.from({ length: 200 }, (_, i) => ({
+          provider: 'claude' as const,
+          sessionId: `a${i}`,
+          projectPath: '/a',
+          updatedAt: 1000 + i,
+        })),
+      },
+    ]
+
+    handler.broadcastSessionsUpdated(projects)
+
+    await new Promise<void>((resolve) => setImmediate(resolve))
+
+    const totalSent = sentMessages
+      .filter(m => m.type === 'sessions.updated' && m.projects)
+      .reduce((sum, m) => sum + m.projects.reduce((s: number, p: any) => s + p.sessions.length, 0), 0)
+
+    // Legacy clients get the full 200
+    expect(totalSent).toBe(200)
+  })
+})
+
 describe('WsHandler integration: chunked handshake snapshot delivery', () => {
   it('delivers all session chunks over a real WS connection', async () => {
     // Use small chunk size to force multiple chunks

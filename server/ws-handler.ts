@@ -757,6 +757,7 @@ export class WsHandler {
       oldestIncludedSessionId: string
       hasMore: boolean
     },
+    forceClear?: boolean,
   ): Promise<boolean> {
     // Increment generation to cancel any in-flight sends for this connection
     const generation = (ws.sessionUpdateGeneration = (ws.sessionUpdateGeneration || 0) + 1)
@@ -785,8 +786,10 @@ export class WsHandler {
       }
 
       if (chunks.length === 1) {
-        // Single chunk: no flags needed (backwards compatible)
+        // Single chunk: no flags needed (backwards compatible), unless forceClear
+        // is set (broadcast replacement path where client must clear existing state)
         msg = { type: 'sessions.updated', projects: chunks[i], ...paginationMeta }
+        if (forceClear) msg.clear = true
       } else if (isFirst) {
         // First chunk: clear existing data, include pagination metadata
         msg = { type: 'sessions.updated', projects: chunks[i], clear: true, ...paginationMeta }
@@ -1764,12 +1767,20 @@ export class WsHandler {
    * This handles backpressure per-client to avoid overwhelming mobile WebSocket buffers.
    */
   broadcastSessionsUpdated(projects: ProjectGroup[]): void {
+    // Compute paginated view once, reuse for all pagination-capable clients
+    let paginated: ReturnType<typeof paginateProjects> | null = null
     for (const ws of this.connections) {
-      if (ws.readyState === WebSocket.OPEN) {
-        // Send full snapshot to all clients. This path is the rare fallback
-        // when patches are too large. Pagination-capable clients will receive
-        // the full list and clear their pagination state, which is correct
-        // since the full dataset replaces any previously loaded pages.
+      if (ws.readyState !== WebSocket.OPEN) continue
+      const state = this.clientStates.get(ws)
+      if (state?.supportsSessionsPaginationV1) {
+        if (!paginated) paginated = paginateProjects(projects, { limit: 100 })
+        void this.sendChunkedSessions(ws, paginated.projects, {
+          totalSessions: paginated.totalSessions,
+          oldestIncludedTimestamp: paginated.oldestIncludedTimestamp,
+          oldestIncludedSessionId: paginated.oldestIncludedSessionId,
+          hasMore: paginated.hasMore,
+        }, true)
+      } else {
         void this.sendChunkedSessions(ws, projects)
       }
     }

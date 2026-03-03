@@ -11,6 +11,7 @@ import {
   clearPaginationMeta,
   setPaginationMeta,
   appendSessionsPage,
+  setLoadingMore,
 } from '@/store/sessionsSlice'
 import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { api, isApiUnauthorizedError, type VersionInfo } from '@/lib/api'
@@ -370,6 +371,8 @@ export default function App() {
       if (chunkedBuffer) {
         dispatch(setProjects(chunkedBuffer))
         dispatch(markWsSnapshotReceived())
+        // Reset any stale load-more guard — the snapshot invalidated it
+        dispatch(setLoadingMore(false))
         if (pendingPaginationMeta) {
           dispatch(setPaginationMeta({
             totalSessions: pendingPaginationMeta.totalSessions,
@@ -491,6 +494,8 @@ export default function App() {
             if (chunkedBuffer) flushChunkedBuffer()
             dispatch(setProjects(projects))
             dispatch(markWsSnapshotReceived())
+            // Reset any stale load-more guard — the snapshot invalidated it
+            dispatch(setLoadingMore(false))
             if (paginationMeta) {
               dispatch(setPaginationMeta({
                 totalSessions: paginationMeta.totalSessions,
