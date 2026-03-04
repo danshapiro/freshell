@@ -1,5 +1,5 @@
-import { addTab, setActiveTab, removeTab, updateTab } from '@/store/tabsSlice'
-import { initLayout, splitPane, closePane, setActivePane, updatePaneContent, resizePanes, swapPanes } from '@/store/panesSlice'
+import { addTab, setActiveTab, closeTab, updateTab, closePaneWithCleanup } from '@/store/tabsSlice'
+import { initLayout, splitPane, setActivePane, updatePaneContent, resizePanes, swapPanes } from '@/store/panesSlice'
 import { captureUiScreenshot } from '@/lib/ui-screenshot'
 import type { AppDispatch, RootState } from '@/store/store'
 
@@ -95,7 +95,7 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
     case 'tab.rename':
       return dispatch(updateTab({ id: msg.payload.id, updates: { title: msg.payload.title } }))
     case 'tab.close':
-      return dispatch(removeTab(msg.payload.id))
+      return dispatch(closeTab(msg.payload.id))
     case 'pane.split':
       return dispatch(splitPane({
         tabId: msg.payload.tabId,
@@ -105,7 +105,7 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
         newPaneId: msg.payload.newPaneId,
       }))
     case 'pane.close':
-      return dispatch(closePane({ tabId: msg.payload.tabId, paneId: msg.payload.paneId }))
+      return dispatch(closePaneWithCleanup({ tabId: msg.payload.tabId, paneId: msg.payload.paneId }))
     case 'pane.select':
       return dispatch(setActivePane({ tabId: msg.payload.tabId, paneId: msg.payload.paneId }))
     case 'pane.attach':

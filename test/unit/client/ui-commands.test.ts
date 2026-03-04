@@ -80,6 +80,42 @@ describe('handleUiCommand', () => {
     expect(actions[1].type).toBe('panes/swapPanes')
   })
 
+  it('dispatches closeTab thunk for tab.close', () => {
+    const actions: any[] = []
+    const dispatch = (action: any) => {
+      actions.push(action)
+      return action
+    }
+
+    handleUiCommand({
+      type: 'ui.command',
+      command: 'tab.close',
+      payload: { id: 't1' },
+    }, dispatch)
+
+    // closeTab is a createAsyncThunk — dispatch receives the thunk function
+    expect(actions).toHaveLength(1)
+    expect(typeof actions[0]).toBe('function')
+  })
+
+  it('dispatches closePaneWithCleanup thunk for pane.close', () => {
+    const actions: any[] = []
+    const dispatch = (action: any) => {
+      actions.push(action)
+      return action
+    }
+
+    handleUiCommand({
+      type: 'ui.command',
+      command: 'pane.close',
+      payload: { tabId: 't1', paneId: 'p1' },
+    }, dispatch)
+
+    // closePaneWithCleanup is a createAsyncThunk — dispatch receives the thunk function
+    expect(actions).toHaveLength(1)
+    expect(typeof actions[0]).toBe('function')
+  })
+
   it('delegates screenshot.capture and sends ui.screenshot.result', async () => {
     const dispatch = vi.fn()
     const send = vi.fn()
