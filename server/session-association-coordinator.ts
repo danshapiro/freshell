@@ -57,7 +57,11 @@ export class SessionAssociationCoordinator {
   }
 
   private isAssociationCandidate(session: CodingCliSession): boolean {
-    return modeSupportsResume(session.provider) && !!session.cwd
+    if (!modeSupportsResume(session.provider)) return false
+    if (!session.cwd) return false
+    if (session.isSubagent) return false
+    if (session.isNonInteractive) return false
+    return true
   }
 
   private trackIfAdvanced(session: CodingCliSession): boolean {

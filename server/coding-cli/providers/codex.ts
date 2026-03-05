@@ -202,6 +202,12 @@ function isCodexSubagentSource(source: unknown): boolean {
   return !!candidate.subagent?.thread_spawn
 }
 
+function hasCodexForkedFromSession(payload: unknown): boolean {
+  if (!payload || typeof payload !== 'object') return false
+  const candidate = payload as { forked_from_id?: unknown }
+  return typeof candidate.forked_from_id === 'string' && candidate.forked_from_id.trim().length > 0
+}
+
 export function parseCodexSessionContent(content: string): ParsedSessionMeta {
   const lines = content.split(/\r?\n/).filter(Boolean)
   let sessionId: string | undefined
@@ -238,7 +244,7 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
       if (isDirty === undefined && typeof payload?.git?.isDirty === 'boolean') {
         isDirty = payload.git.isDirty
       }
-      if (isSubagent === undefined && isCodexSubagentSource(payload.source)) {
+      if (isSubagent === undefined && (isCodexSubagentSource(payload.source) || hasCodexForkedFromSession(payload))) {
         isSubagent = true
       }
       if (payload.source === 'exec') {

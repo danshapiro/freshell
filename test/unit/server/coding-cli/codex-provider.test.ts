@@ -79,6 +79,24 @@ describe('codex-provider', () => {
     expect(meta.isSubagent).toBe(true)
   })
 
+  it('flags forked codex sessions as subagent-like sessions', () => {
+    const content = [
+      JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          id: 'session-fork',
+          forked_from_id: 'session-parent',
+          cwd: '/project/a',
+          source: 'cli',
+        },
+      }),
+    ].join('\n')
+
+    const meta = parseCodexSessionContent(content)
+
+    expect(meta.isSubagent).toBe(true)
+  })
+
   it('does not include raw payload in normalized events', () => {
     const line = JSON.stringify({
       type: 'response_item',
