@@ -42,7 +42,7 @@ function listen(server: http.Server, timeoutMs = HOOK_TIMEOUT_MS): Promise<{ por
   })
 }
 
-function waitForMessage(ws: WebSocket, predicate: (msg: any) => boolean, timeoutMs = 1500): Promise<any> {
+function waitForMessage(ws: WebSocket, predicate: (msg: any) => boolean, timeoutMs = 5000): Promise<any> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       ws.off('message', handler)

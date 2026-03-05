@@ -111,6 +111,12 @@ class FakeRegistry extends EventEmitter {
     return this.records.get(terminalId) || null
   }
 
+  getReplayRingMaxChars() {
+    const override = Number(process.env.TERMINAL_REPLAY_RING_MAX_BYTES)
+    if (Number.isFinite(override) && override > 0) return Math.floor(override)
+    return 64 * 1024
+  }
+
   attach(terminalId: string, ws: WebSocket, opts?: { suppressOutput?: boolean }) {
     const rec = this.records.get(terminalId)
     if (!rec) return null
@@ -701,7 +707,21 @@ describe('WebSocket edge cases', () => {
       const largeData = 'x'.repeat(500_000)
       ws.send(JSON.stringify({ type: 'terminal.input', terminalId, data: largeData }))
 
-      await new Promise((r) => setTimeout(r, 100))
+      await new Promise<void>((resolve, reject) => {
+        const deadline = Date.now() + 2_000
+        const poll = () => {
+          if (registry.inputCalls.length >= 1) {
+            resolve()
+            return
+          }
+          if (Date.now() >= deadline) {
+            reject(new Error('Timed out waiting for terminal.input call'))
+            return
+          }
+          setTimeout(poll, 10)
+        }
+        poll()
+      })
 
       expect(registry.inputCalls).toHaveLength(1)
       expect(registry.inputCalls[0].data.length).toBe(500_000)
@@ -1284,12 +1304,20 @@ describe('WebSocket edge cases', () => {
       const { ws: ws2, close: close2 } = await createAuthenticatedConnection()
       ws2.send(JSON.stringify({ type: 'terminal.attach', terminalId }))
 
-      await waitForMessage(ws2, (m) => m.type === 'terminal.attach.ready' && m.terminalId === terminalId)
-      const replay = await waitForMessage(ws2, (m) => m.type === 'terminal.output' && m.terminalId === terminalId)
+      const [ready, firstReplay] = await waitForMessages(ws2, [
+        (m) => m.type === 'terminal.attach.ready' && m.terminalId === terminalId,
+        (m) => m.type === 'terminal.output' && m.terminalId === terminalId,
+      ], 5000)
+      const replayFrames = await collectMessages(ws2, 150)
+      const replayText = [firstReplay, ...replayFrames]
+        .filter((m) => m.type === 'terminal.output' && m.terminalId === terminalId)
+        .map((m) => m.data as string)
+        .join('')
 
       // Snapshot should contain recent markers but not all
-      expect(/marker-(6|7|8|9)\|/.test(replay.data)).toBe(true)
-      expect(replay.data).not.toContain('marker-0')
+      expect(ready.headSeq).toBeGreaterThan(0)
+      expect(/marker-(6|7|8|9)\|/.test(replayText)).toBe(true)
+      expect(replayText).not.toContain('marker-0')
       // Earlier markers may be evicted depending on buffer size
 
       close2()
