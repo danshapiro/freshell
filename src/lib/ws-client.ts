@@ -265,7 +265,6 @@ export class WsClient {
         if (msg.type === 'terminal.created') {
           const create = this.inFlightCreates.get(msg.requestId)
           if (create) {
-            create.terminalId = msg.terminalId
             this.inFlightCreates.delete(msg.requestId)
           }
         }
@@ -479,7 +478,10 @@ export class WsClient {
     // Queue until ready (handles connecting, connected, and temporary disconnects)
     if (this.pendingMessages.length >= this.maxQueueSize) {
       // Drop oldest to prevent unbounded memory.
-      this.pendingMessages.shift()
+      const dropped = this.pendingMessages.shift()
+      if (isTerminalCreateMessage(dropped)) {
+        this.inFlightCreates.delete(dropped.requestId)
+      }
     }
     this.pendingMessages.push(msg)
 

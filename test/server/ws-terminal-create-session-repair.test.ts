@@ -90,9 +90,11 @@ class FakeBuffer {
 class FakeRegistry {
   records = new Map<string, any>()
   lastCreateOpts: any = null
+  createCallCount = 0
 
   create(opts: any) {
     this.lastCreateOpts = opts
+    this.createCallCount += 1
     const terminalId = 'term_' + Math.random().toString(16).slice(2)
     const rec = {
       terminalId,
@@ -238,6 +240,7 @@ describe('terminal.create session repair wait', () => {
     sessionRepairService.waitForSessionShouldThrow = false
     registry.records.clear()
     registry.lastCreateOpts = null
+    registry.createCallCount = 0
   })
 
   afterAll(async () => {
@@ -462,6 +465,58 @@ describe('terminal.create session repair wait', () => {
     } finally {
       if (ws.readyState !== WebSocket.CLOSED) {
         await closeWebSocket(ws)
+      }
+    }
+  })
+
+  it('reuses requestId across reconnects to avoid duplicate shell create', async () => {
+    const requestId = 'reconnect-idempotent-create-1'
+    const ws1 = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    let ws2: WebSocket | undefined
+
+    try {
+      await new Promise<void>((resolve) => ws1.on('open', () => resolve()))
+      ws1.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+      await waitForMessage(ws1, (m) => m.type === 'ready')
+
+      ws1.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'shell',
+        attachOnCreate: false,
+      }))
+
+      const firstCreated = await waitForMessage(
+        ws1,
+        (m) => m.type === 'terminal.created' && m.requestId === requestId,
+      )
+
+      await closeWebSocket(ws1)
+
+      ws2 = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+      await new Promise<void>((resolve) => ws2.on('open', () => resolve()))
+      ws2.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+      await waitForMessage(ws2, (m) => m.type === 'ready')
+
+      ws2.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'shell',
+        attachOnCreate: false,
+      }))
+
+      const secondCreated = await waitForMessage(
+        ws2,
+        (m) => m.type === 'terminal.created' && m.requestId === requestId,
+      )
+
+      expect(secondCreated.terminalId).toBe(firstCreated.terminalId)
+      expect(registry.records.size).toBe(1)
+      expect(registry.createCallCount).toBe(1)
+    } finally {
+      await closeWebSocket(ws1)
+      if (ws2) {
+        await closeWebSocket(ws2)
       }
     }
   })

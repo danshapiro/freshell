@@ -1559,6 +1559,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
               return
             }
           }
+          createModeByRequestIdRef.current.delete(reqId)
           clearRateLimitRetry()
           setIsAttaching(false)
           updateContent({ status: 'error' })

@@ -80,6 +80,7 @@ const TERMINAL_CREATE_RATE_LIMIT = Number(process.env.TERMINAL_CREATE_RATE_LIMIT
 const TERMINAL_CREATE_RATE_WINDOW_MS = Number(process.env.TERMINAL_CREATE_RATE_WINDOW_MS || 10_000)
 /** Sentinel value reserved in createdByRequestId while awaiting async session repair */
 const REPAIR_PENDING_SENTINEL = '__repair_pending__'
+const TERMINAL_CREATE_IDEMPOTENCY_TTL_MS = Number(process.env.TERMINAL_CREATE_IDEMPOTENCY_TTL_MS || 5 * 60_000)
 
 const log = logger.child({ component: 'ws' })
 const perfConfig = getPerfConfig()
@@ -205,6 +206,11 @@ type PendingScreenshot = {
   connectionId?: string
 }
 
+type CreatedTerminalByRequestIdEntry = {
+  terminalId: string
+  expiresAt: number
+}
+
 type ScreenshotErrorCode = 'NO_SCREENSHOT_CLIENT' | 'SCREENSHOT_TIMEOUT' | 'SCREENSHOT_CONNECTION_CLOSED'
 
 function createScreenshotError(code: ScreenshotErrorCode, message: string): Error & { code: ScreenshotErrorCode } {
@@ -227,11 +233,13 @@ export class WsHandler {
   private extensionManager?: ExtensionManager
   private terminalStreamBroker: TerminalStreamBroker
   private splitAttachTerminalIds = new Set<string>()
+  private createdTerminalByRequestId = new Map<string, CreatedTerminalByRequestIdEntry>()
   private screenshotRequests = new Map<string, PendingScreenshot>()
   private readonly serverInstanceId: string
   private onTerminalExitBound = (payload: { terminalId?: string }) => {
     if (!payload?.terminalId) return
     this.splitAttachTerminalIds.delete(payload.terminalId)
+    this.forgetCreatedRequestIdsForTerminal(payload.terminalId)
   }
   private sessionRepairListeners?: {
     scanned: (result: SessionScanResult) => void
@@ -375,6 +383,48 @@ export class WsHandler {
 
   connectionCount() {
     return this.connections.size
+  }
+
+  private pruneCreatedRequestCache(now = Date.now()): void {
+    for (const [requestId, entry] of this.createdTerminalByRequestId) {
+      if (entry.expiresAt > now) continue
+      this.createdTerminalByRequestId.delete(requestId)
+    }
+  }
+
+  private rememberCreatedRequestId(requestId: string, terminalId: string): void {
+    const now = Date.now()
+    this.pruneCreatedRequestCache(now)
+    this.createdTerminalByRequestId.set(requestId, {
+      terminalId,
+      expiresAt: now + TERMINAL_CREATE_IDEMPOTENCY_TTL_MS,
+    })
+  }
+
+  private forgetCreatedRequestId(requestId: string): void {
+    this.createdTerminalByRequestId.delete(requestId)
+  }
+
+  private forgetCreatedRequestIdsForTerminal(terminalId: string): void {
+    for (const [requestId, entry] of this.createdTerminalByRequestId) {
+      if (entry.terminalId === terminalId) {
+        this.createdTerminalByRequestId.delete(requestId)
+      }
+    }
+  }
+
+  private resolveCreatedTerminalId(requestId: string): string | undefined {
+    const now = Date.now()
+    this.pruneCreatedRequestCache(now)
+    const cached = this.createdTerminalByRequestId.get(requestId)
+    if (!cached) return undefined
+    const record = this.registry.get(cached.terminalId)
+    if (!record) {
+      this.createdTerminalByRequestId.delete(requestId)
+      return undefined
+    }
+    cached.expiresAt = now + TERMINAL_CREATE_IDEMPOTENCY_TTL_MS
+    return cached.terminalId
   }
 
   private findTargetUiSocket(
@@ -994,6 +1044,17 @@ export class WsHandler {
         let error = false
         let rateLimited = false
         try {
+          const resolveExistingRequestTerminalId = (requestId: string): string | undefined => {
+            const local = state.createdByRequestId.get(requestId)
+            if (local === REPAIR_PENDING_SENTINEL) return REPAIR_PENDING_SENTINEL
+            if (local) return local
+            const cached = this.resolveCreatedTerminalId(requestId)
+            if (cached) {
+              state.createdByRequestId.set(requestId, cached)
+            }
+            return cached
+          }
+
           const autoAttach = shouldAutoAttachOnCreate(m)
           // Resolve session metadata before terminal creation.
           let effectiveResumeSessionId = m.resumeSessionId
@@ -1057,13 +1118,14 @@ export class WsHandler {
               return false
             }
             state.createdByRequestId.set(m.requestId, reusedTerminalId)
+            this.rememberCreatedRequestId(m.requestId, reusedTerminalId)
             terminalId = reusedTerminalId
             reused = true
             this.broadcast({ type: 'terminal.list.updated' })
             return true
           }
 
-          const existingId = state.createdByRequestId.get(m.requestId)
+          const existingId = resolveExistingRequestTerminalId(m.requestId)
           if (existingId) {
             if (existingId === REPAIR_PENDING_SENTINEL) {
               log.debug({ requestId: m.requestId, connectionId: ws.connectionId },
@@ -1077,6 +1139,7 @@ export class WsHandler {
             }
             // If it no longer exists, fall through and create a new one.
             state.createdByRequestId.delete(m.requestId)
+            this.forgetCreatedRequestId(m.requestId)
           }
 
           if (modeSupportsResume(m.mode as TerminalMode) && effectiveResumeSessionId) {
@@ -1106,7 +1169,7 @@ export class WsHandler {
             : undefined
 
           // Re-check idempotency after async config loading in case another create won the race.
-          const existingAfterConfigId = state.createdByRequestId.get(m.requestId)
+          const existingAfterConfigId = resolveExistingRequestTerminalId(m.requestId)
           if (existingAfterConfigId) {
             if (existingAfterConfigId === REPAIR_PENDING_SENTINEL) {
               log.debug({ requestId: m.requestId, connectionId: ws.connectionId },
@@ -1119,6 +1182,7 @@ export class WsHandler {
               return
             }
             state.createdByRequestId.delete(m.requestId)
+            this.forgetCreatedRequestId(m.requestId)
           }
 
           // Rate limit: prevent runaway terminal creation (e.g., infinite respawn loops)
@@ -1224,6 +1288,7 @@ export class WsHandler {
           }
 
           state.createdByRequestId.set(m.requestId, record.terminalId)
+          this.rememberCreatedRequestId(m.requestId, record.terminalId)
           terminalId = record.terminalId
 
           const sent = await sendCreateResult({
@@ -2023,6 +2088,7 @@ export class WsHandler {
       pending.reject(createScreenshotError('SCREENSHOT_CONNECTION_CLOSED', 'WebSocket server closed before screenshot response'))
       this.screenshotRequests.delete(requestId)
     }
+    this.createdTerminalByRequestId.clear()
 
     // Close all client connections
     for (const ws of this.connections) {

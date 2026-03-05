@@ -220,6 +220,45 @@ describe('WsClient.connect', () => {
     expect(sent.filter((m) => m.type === 'terminal.create' && m.requestId === 'reconnect-unknown-1')).toHaveLength(1)
   })
 
+  it('evicted queued creates are removed from reconnect resend tracking', async () => {
+    const c = new WsClient('ws://example/ws')
+    c.setLifecycleMode('explicit-only')
+    ;(c as any).maxQueueSize = 1
+
+    c.send({ type: 'terminal.create', requestId: 'evict-older-create', mode: 'shell' } as any)
+    c.send({ type: 'terminal.create', requestId: 'keep-newer-create', mode: 'shell' } as any)
+
+    const p1 = c.connect()
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._message({
+      type: 'ready',
+      capabilities: { createAttachSplitV1: true, attachViewportV1: true },
+    })
+    await p1
+
+    const firstCreates = MockWebSocket.instances[0].sent
+      .map((x) => JSON.parse(x))
+      .filter((m) => m.type === 'terminal.create')
+      .map((m) => m.requestId)
+    expect(firstCreates).toEqual(['keep-newer-create'])
+
+    MockWebSocket.instances[0]._close(1006, 'drop-after-ready')
+
+    const p2 = c.connect()
+    MockWebSocket.instances[1]._open()
+    MockWebSocket.instances[1]._message({
+      type: 'ready',
+      capabilities: { createAttachSplitV1: true, attachViewportV1: true },
+    })
+    await p2
+
+    const secondCreates = MockWebSocket.instances[1].sent
+      .map((x) => JSON.parse(x))
+      .filter((m) => m.type === 'terminal.create')
+      .map((m) => m.requestId)
+    expect(secondCreates).toEqual(['keep-newer-create'])
+  })
+
   it('treats HELLO_TIMEOUT as transient and schedules reconnect', async () => {
     const setTimeoutSpy = vi.spyOn(window, 'setTimeout')
 
