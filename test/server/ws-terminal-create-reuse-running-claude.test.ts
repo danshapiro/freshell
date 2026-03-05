@@ -1,10 +1,26 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest'
 import http from 'http'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
 
 const HOOK_TIMEOUT_MS = 30_000
 const VALID_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
+const { snapshotSpy } = vi.hoisted(() => ({
+  snapshotSpy: vi.fn().mockResolvedValue({
+    version: 1,
+    settings: { codingCli: { providers: {} } },
+    sessionOverrides: {},
+    terminalOverrides: {},
+    projectColors: {},
+    recentDirectories: [],
+  }),
+}))
+
+vi.mock('../../server/config-store', () => ({
+  configStore: {
+    snapshot: snapshotSpy,
+  },
+}))
 
 function listen(server: http.Server, timeoutMs = HOOK_TIMEOUT_MS): Promise<{ port: number }> {
   return new Promise((resolve, reject) => {
@@ -137,6 +153,7 @@ describe('terminal.create reuse running claude terminal', () => {
 
   beforeEach(() => {
     registry.attachCalls = []
+    snapshotSpy.mockClear()
   })
 
   afterAll(async () => {
@@ -176,6 +193,7 @@ describe('terminal.create reuse running claude terminal', () => {
 
       expect(registry.attachCalls).toHaveLength(1)
       expect(registry.attachCalls[0]?.opts?.suppressOutput).toBe(true)
+      expect(snapshotSpy).not.toHaveBeenCalled()
     } finally {
       ws.close()
     }

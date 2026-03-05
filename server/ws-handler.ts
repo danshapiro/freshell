@@ -971,12 +971,35 @@ export class WsHandler {
         let error = false
         let rateLimited = false
         try {
-          // Load config before the synchronous idempotency check to avoid
-          // async yield points between the check and registration.
-          const cfg = await awaitConfig()
-          const providerSettings = m.mode !== 'shell'
-            ? cfg.settings?.codingCli?.providers?.[m.mode as keyof typeof cfg.settings.codingCli.providers] || {}
-            : undefined
+          // Resolve session metadata before terminal creation.
+          let effectiveResumeSessionId = m.resumeSessionId
+          if (m.mode === 'claude' && effectiveResumeSessionId && !isValidClaudeSessionId(effectiveResumeSessionId)) {
+            log.warn({ resumeSessionId: effectiveResumeSessionId, connectionId: ws.connectionId }, 'Ignoring invalid Claude resumeSessionId')
+            effectiveResumeSessionId = undefined
+          }
+
+          const attachReusedTerminal = async (
+            reusedTerminalId: string,
+            createdAt: number,
+            resumeSessionId?: string,
+          ): Promise<boolean> => {
+            const attached = await this.terminalStreamBroker.sendCreatedAndAttach(ws, {
+              requestId: m.requestId,
+              terminalId: reusedTerminalId,
+              createdAt,
+              effectiveResumeSessionId: resumeSessionId,
+            })
+            if (!attached) {
+              this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Unknown terminalId', terminalId: reusedTerminalId })
+              return false
+            }
+            state.attachedTerminalIds.add(reusedTerminalId)
+            state.createdByRequestId.set(m.requestId, reusedTerminalId)
+            terminalId = reusedTerminalId
+            reused = true
+            this.broadcast({ type: 'terminal.list.updated' })
+            return true
+          }
 
           const existingId = state.createdByRequestId.get(m.requestId)
           if (existingId) {
@@ -987,45 +1010,11 @@ export class WsHandler {
             }
             const existing = this.registry.get(existingId)
             if (existing) {
-              const attached = await this.terminalStreamBroker.sendCreatedAndAttach(ws, {
-                requestId: m.requestId,
-                terminalId: existingId,
-                createdAt: existing.createdAt,
-                effectiveResumeSessionId: existing.resumeSessionId,
-              })
-              if (!attached) {
-                this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Unknown terminalId', terminalId: existingId })
-                return
-              }
-              state.attachedTerminalIds.add(existingId)
-              terminalId = existingId
-              reused = true
-              this.broadcast({ type: 'terminal.list.updated' })
+              await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
               return
             }
             // If it no longer exists, fall through and create a new one.
             state.createdByRequestId.delete(m.requestId)
-          }
-
-          // Rate limit: prevent runaway terminal creation (e.g., infinite respawn loops)
-          if (!m.restore) {
-            const now = Date.now()
-            state.terminalCreateTimestamps = state.terminalCreateTimestamps.filter(
-              (t) => now - t < TERMINAL_CREATE_RATE_WINDOW_MS
-            )
-            if (state.terminalCreateTimestamps.length >= TERMINAL_CREATE_RATE_LIMIT) {
-              rateLimited = true
-              log.warn({ connectionId: ws.connectionId, count: state.terminalCreateTimestamps.length }, 'terminal.create rate limited')
-              this.sendError(ws, { code: 'RATE_LIMITED', message: 'Too many terminal.create requests', requestId: m.requestId })
-              return
-            }
-            state.terminalCreateTimestamps.push(now)
-          }
-          // Resolve session repair before terminal creation.
-          let effectiveResumeSessionId = m.resumeSessionId
-          if (m.mode === 'claude' && effectiveResumeSessionId && !isValidClaudeSessionId(effectiveResumeSessionId)) {
-            log.warn({ resumeSessionId: effectiveResumeSessionId, connectionId: ws.connectionId }, 'Ignoring invalid Claude resumeSessionId')
-            effectiveResumeSessionId = undefined
           }
 
           if (modeSupportsResume(m.mode as TerminalMode) && effectiveResumeSessionId) {
@@ -1044,25 +1033,66 @@ export class WsHandler {
               )
             }
             if (existing) {
-              const attached = await this.terminalStreamBroker.sendCreatedAndAttach(ws, {
-                requestId: m.requestId,
-                terminalId: existing.terminalId,
-                createdAt: existing.createdAt,
-                effectiveResumeSessionId: existing.resumeSessionId,
-              })
-              if (!attached) {
-                this.sendError(ws, {
-                  code: 'INVALID_TERMINAL_ID',
-                  message: 'Unknown terminalId',
-                  terminalId: existing.terminalId,
-                })
-                return
-              }
-              state.attachedTerminalIds.add(existing.terminalId)
-              state.createdByRequestId.set(m.requestId, existing.terminalId)
-              terminalId = existing.terminalId
-              reused = true
-              this.broadcast({ type: 'terminal.list.updated' })
+              await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
+              return
+            }
+          }
+
+          const cfg = await awaitConfig()
+          const providerSettings = m.mode !== 'shell'
+            ? cfg.settings?.codingCli?.providers?.[m.mode as keyof typeof cfg.settings.codingCli.providers] || {}
+            : undefined
+
+          // Re-check idempotency after async config loading in case another create won the race.
+          const existingAfterConfigId = state.createdByRequestId.get(m.requestId)
+          if (existingAfterConfigId) {
+            if (existingAfterConfigId === REPAIR_PENDING_SENTINEL) {
+              log.debug({ requestId: m.requestId, connectionId: ws.connectionId },
+                'terminal.create already in progress (repair pending), ignoring duplicate')
+              return
+            }
+            const existing = this.registry.get(existingAfterConfigId)
+            if (existing) {
+              await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
+              return
+            }
+            state.createdByRequestId.delete(m.requestId)
+          }
+
+          // Rate limit: prevent runaway terminal creation (e.g., infinite respawn loops)
+          if (!m.restore) {
+            const now = Date.now()
+            state.terminalCreateTimestamps = state.terminalCreateTimestamps.filter(
+              (t) => now - t < TERMINAL_CREATE_RATE_WINDOW_MS
+            )
+            if (state.terminalCreateTimestamps.length >= TERMINAL_CREATE_RATE_LIMIT) {
+              rateLimited = true
+              log.warn({ connectionId: ws.connectionId, count: state.terminalCreateTimestamps.length }, 'terminal.create rate limited')
+              this.sendError(ws, { code: 'RATE_LIMITED', message: 'Too many terminal.create requests', requestId: m.requestId })
+              return
+            }
+            state.terminalCreateTimestamps.push(now)
+          }
+
+          // Re-check session ownership after async config loading in case another request
+          // created or repaired a matching running session while we were waiting.
+          if (modeSupportsResume(m.mode as TerminalMode) && effectiveResumeSessionId) {
+            let existing = this.registry.getCanonicalRunningTerminalBySession(
+              m.mode as TerminalMode,
+              effectiveResumeSessionId,
+            )
+            if (!existing) {
+              this.registry.repairLegacySessionOwners(
+                m.mode as TerminalMode,
+                effectiveResumeSessionId,
+              )
+              existing = this.registry.getCanonicalRunningTerminalBySession(
+                m.mode as TerminalMode,
+                effectiveResumeSessionId,
+              )
+            }
+            if (existing) {
+              await attachReusedTerminal(existing.terminalId, existing.createdAt, existing.resumeSessionId)
               return
             }
           }
