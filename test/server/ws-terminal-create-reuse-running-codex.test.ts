@@ -67,6 +67,24 @@ function waitForMessages(
   })
 }
 
+function collectMessages(ws: WebSocket, durationMs: number): Promise<any[]> {
+  return new Promise((resolve) => {
+    const messages: any[] = []
+    const handler = (data: WebSocket.Data) => {
+      try {
+        messages.push(JSON.parse(data.toString()))
+      } catch {
+        // ignore malformed test frames
+      }
+    }
+    ws.on('message', handler)
+    setTimeout(() => {
+      ws.off('message', handler)
+      resolve(messages)
+    }, durationMs)
+  })
+}
+
 class FakeBuffer {
   snapshot() { return 'codex session output' }
 }
@@ -78,6 +96,8 @@ type FakeTerminal = {
   mode: 'codex'
   shell: 'system'
   status: 'running'
+  cols: number
+  rows: number
   resumeSessionId?: string
   clients: Set<WebSocket>
 }
@@ -97,6 +117,8 @@ class FakeRegistry {
       mode: 'codex' as const,
       shell: 'system' as const,
       status: 'running' as const,
+      cols: 80,
+      rows: 24,
       resumeSessionId: CODEX_SESSION_ID,
       clients: new Set<WebSocket>(),
     }))
@@ -155,6 +177,14 @@ class FakeRegistry {
   create(opts: any) {
     this.createCalls.push(opts)
     return this.records[0]
+  }
+
+  resize(terminalId: string, cols: number, rows: number) {
+    const record = this.findById(terminalId)
+    if (!record) return false
+    record.cols = cols
+    record.rows = rows
+    return true
   }
 
   list() { return [] }
@@ -217,6 +247,98 @@ describe('terminal.create reuse running codex terminal', () => {
       expect(registry.attachCalls[0]?.terminalId).toBe('term-codex-existing')
       expect(registry.createCalls).toHaveLength(0)
       expect(ready.headSeq).toBeGreaterThanOrEqual(0)
+    } finally {
+      ws.close()
+    }
+  })
+
+  it('canonical reuse branch + attachOnCreate:false returns created only until explicit attach', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+      await waitForMessage(ws, (m) => m.type === 'ready')
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'reuse-canonical-split',
+        mode: 'codex',
+        resumeSessionId: CODEX_SESSION_ID,
+        attachOnCreate: false,
+      }))
+
+      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === 'reuse-canonical-split')
+      const preAttachMsgs = await collectMessages(ws, 150)
+      expect(preAttachMsgs.some((m) => m.type === 'terminal.attach.ready' && m.terminalId === created.terminalId)).toBe(false)
+
+      ws.send(JSON.stringify({
+        type: 'terminal.attach',
+        terminalId: created.terminalId,
+        sinceSeq: 0,
+        cols: 120,
+        rows: 40,
+        attachRequestId: 'reuse-canonical-split-attach',
+      }))
+      const ready = await waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'reuse-canonical-split-attach',
+      )
+      expect(ready.terminalId).toBe(created.terminalId)
+    } finally {
+      ws.close()
+    }
+  })
+
+  it('existingId branch + attachOnCreate:false returns created only and requires explicit attach', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+      await waitForMessage(ws, (m) => m.type === 'ready')
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'reuse-existingId-split',
+        mode: 'codex',
+        resumeSessionId: CODEX_SESSION_ID,
+        attachOnCreate: false,
+      }))
+      const firstCreated = await waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.created' && m.requestId === 'reuse-existingId-split',
+      )
+      const firstMsgs = await collectMessages(ws, 150)
+      expect(firstMsgs.some((m) => m.type === 'terminal.attach.ready' && m.terminalId === firstCreated.terminalId)).toBe(false)
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'reuse-existingId-split',
+        mode: 'codex',
+        resumeSessionId: CODEX_SESSION_ID,
+        attachOnCreate: false,
+      }))
+      const secondCreated = await waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.created' && m.requestId === 'reuse-existingId-split',
+      )
+      expect(secondCreated.terminalId).toBe(firstCreated.terminalId)
+
+      const secondMsgs = await collectMessages(ws, 150)
+      expect(secondMsgs.some((m) => m.type === 'terminal.attach.ready' && m.terminalId === firstCreated.terminalId)).toBe(false)
+
+      ws.send(JSON.stringify({
+        type: 'terminal.attach',
+        terminalId: firstCreated.terminalId,
+        sinceSeq: 0,
+        cols: 120,
+        rows: 40,
+        attachRequestId: 'reuse-existingId-split-attach',
+      }))
+      const ready = await waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'reuse-existingId-split-attach',
+      )
+      expect(ready.terminalId).toBe(firstCreated.terminalId)
     } finally {
       ws.close()
     }

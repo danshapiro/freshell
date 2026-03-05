@@ -63,6 +63,24 @@ function waitForMessage(ws: WebSocket, predicate: (msg: any) => boolean, timeout
   })
 }
 
+function collectMessages(ws: WebSocket, durationMs: number): Promise<any[]> {
+  return new Promise((resolve) => {
+    const messages: any[] = []
+    const handler = (data: WebSocket.Data) => {
+      try {
+        messages.push(JSON.parse(data.toString()))
+      } catch {
+        // ignore malformed test frames
+      }
+    }
+    ws.on('message', handler)
+    setTimeout(() => {
+      ws.off('message', handler)
+      resolve(messages)
+    }, durationMs)
+  })
+}
+
 class FakeBuffer {
   snapshot() {
     return ''
@@ -81,6 +99,8 @@ class FakeRegistry {
       mode: 'claude',
       shell: 'system',
       status: 'running',
+      cols: 80,
+      rows: 24,
       resumeSessionId: VALID_SESSION_ID,
       clients: new Set<WebSocket>(),
     }
@@ -115,6 +135,13 @@ class FakeRegistry {
     this.attachCalls.push({ terminalId, opts })
     this.record.clients.add(ws)
     return this.record
+  }
+
+  resize(terminalId: string, cols: number, rows: number) {
+    if (this.record.terminalId !== terminalId) return false
+    this.record.cols = cols
+    this.record.rows = rows
+    return true
   }
 
   detach(_terminalId: string, ws: WebSocket) {
@@ -194,6 +221,94 @@ describe('terminal.create reuse running claude terminal', () => {
       expect(registry.attachCalls).toHaveLength(1)
       expect(registry.attachCalls[0]?.opts?.suppressOutput).toBe(true)
       expect(snapshotSpy).not.toHaveBeenCalled()
+    } finally {
+      ws.close()
+    }
+  })
+
+  it('existingAfterConfig branch + attachOnCreate:false returns created only until explicit attach', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+      await waitForMessage(ws, (m) => m.type === 'ready')
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'reuse-split-existingAfterConfig',
+        mode: 'claude',
+        resumeSessionId: VALID_SESSION_ID,
+        attachOnCreate: false,
+      }))
+      const created = await waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.created' && m.requestId === 'reuse-split-existingAfterConfig',
+      )
+      const preAttachMsgs = await collectMessages(ws, 150)
+      expect(preAttachMsgs.some((m) => m.type === 'terminal.attach.ready' && m.terminalId === created.terminalId)).toBe(false)
+
+      ws.send(JSON.stringify({
+        type: 'terminal.attach',
+        terminalId: created.terminalId,
+        sinceSeq: 0,
+        cols: 120,
+        rows: 40,
+        attachRequestId: 'reuse-split-existingAfterConfig-attach',
+      }))
+      const ready = await waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'reuse-split-existingAfterConfig-attach',
+      )
+      expect(ready.terminalId).toBe(created.terminalId)
+    } finally {
+      ws.close()
+    }
+  })
+
+  it('duplicate requestId in split mode => one created, no duplicate replay churn', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+      await waitForMessage(ws, (m) => m.type === 'ready')
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'reuse-claude-dup-split',
+        mode: 'claude',
+        resumeSessionId: VALID_SESSION_ID,
+        attachOnCreate: false,
+      }))
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'reuse-claude-dup-split',
+        mode: 'claude',
+        resumeSessionId: VALID_SESSION_ID,
+        attachOnCreate: false,
+      }))
+
+      const created = await waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.created' && m.requestId === 'reuse-claude-dup-split',
+      )
+      const msgs = await collectMessages(ws, 200)
+      const createdCount = msgs.filter((m) => m.type === 'terminal.created' && m.requestId === 'reuse-claude-dup-split').length + 1
+      expect(createdCount).toBe(1)
+      expect(msgs.some((m) => m.type === 'terminal.attach.ready' && m.terminalId === created.terminalId)).toBe(false)
+
+      ws.send(JSON.stringify({
+        type: 'terminal.attach',
+        terminalId: created.terminalId,
+        sinceSeq: 0,
+        cols: 120,
+        rows: 40,
+        attachRequestId: 'reuse-claude-dup-split-attach',
+      }))
+      const ready = await waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'reuse-claude-dup-split-attach',
+      )
+      expect(ready.terminalId).toBe(created.terminalId)
     } finally {
       ws.close()
     }

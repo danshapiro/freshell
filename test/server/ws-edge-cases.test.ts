@@ -83,6 +83,7 @@ class FakeRegistry extends EventEmitter {
   // Control hooks for testing edge cases
   onOutputListeners = new Map<string, (data: string) => void>()
   onExitListeners = new Map<string, (code: number) => void>()
+  onResize?: (terminalId: string, cols: number, rows: number) => void
 
   constructor() {
     super()
@@ -98,6 +99,8 @@ class FakeRegistry extends EventEmitter {
       mode: opts.mode || 'shell',
       shell: opts.shell || 'system',
       status: 'running',
+      cols: 80,
+      rows: 24,
       resumeSessionId: opts.resumeSessionId,
       exitCode: undefined as number | undefined,
       clients: new Set<WebSocket>(),
@@ -144,6 +147,9 @@ class FakeRegistry extends EventEmitter {
     const rec = this.records.get(terminalId)
     if (!rec || rec.status !== 'running') return false
     this.resizeCalls.push({ terminalId, cols, rows })
+    rec.cols = cols
+    rec.rows = rows
+    this.onResize?.(terminalId, cols, rows)
     return true
   }
 
@@ -1581,6 +1587,214 @@ describe('WebSocket edge cases', () => {
       expect(registry.killCalls).toContain(terminalId)
 
       close()
+    })
+  })
+
+  describe('Split create/attach compatibility', () => {
+    it('legacy client path: terminal.create auto-attaches when attachOnCreate is omitted', async () => {
+      const { ws, close } = await createAuthenticatedConnection()
+
+      ws.send(JSON.stringify({ type: 'terminal.create', requestId: 'legacy-auto', mode: 'shell' }))
+      const [created, ready] = await waitForMessages(ws, [
+        (m) => m.type === 'terminal.created' && m.requestId === 'legacy-auto',
+        (m) => m.type === 'terminal.attach.ready',
+      ])
+
+      expect(ready.terminalId).toBe(created.terminalId)
+      close()
+    })
+
+    it('split path request: terminal.create with attachOnCreate:false does not auto-attach', async () => {
+      const { ws, close } = await createAuthenticatedConnection()
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'split-no-auto',
+        mode: 'shell',
+        attachOnCreate: false,
+      }))
+      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === 'split-no-auto')
+      const msgs = await collectMessages(ws, 150)
+      const autoReadySeen = msgs.some((m) => m.type === 'terminal.attach.ready' && m.terminalId === created.terminalId)
+
+      expect(autoReadySeen).toBe(false)
+      close()
+    })
+
+    it('split-capable attach applies resize before replay', async () => {
+      const { ws, close } = await createAuthenticatedConnection()
+
+      ws.send(JSON.stringify({ type: 'terminal.create', requestId: 'split-attach', mode: 'shell', attachOnCreate: false }))
+      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === 'split-attach')
+      ws.send(JSON.stringify({
+        type: 'terminal.attach',
+        terminalId: created.terminalId,
+        sinceSeq: 0,
+        cols: 111,
+        rows: 37,
+        attachRequestId: 'attach-split-1',
+      }))
+
+      const ready = await waitForMessage(ws, (m) => m.type === 'terminal.attach.ready' && m.terminalId === created.terminalId)
+      expect(registry.resizeCalls).toContainEqual({ terminalId: created.terminalId, cols: 111, rows: 37 })
+      expect(ready.attachRequestId).toBe('attach-split-1')
+      close()
+    })
+
+    it('split-mode duplicate requestId is idempotent without duplicate attach.ready churn', async () => {
+      const { ws, close } = await createAuthenticatedConnection()
+      ws.send(JSON.stringify({ type: 'terminal.create', requestId: 'dup-split-1', mode: 'shell', attachOnCreate: false }))
+      ws.send(JSON.stringify({ type: 'terminal.create', requestId: 'dup-split-1', mode: 'shell', attachOnCreate: false }))
+
+      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === 'dup-split-1')
+      const msgs = await collectMessages(ws, 200)
+      const createdCount = msgs.filter((m) => m.type === 'terminal.created' && m.requestId === 'dup-split-1').length + 1
+      const autoReadyCount = msgs.filter((m) => m.type === 'terminal.attach.ready' && m.terminalId === created.terminalId).length
+      expect(createdCount).toBe(1)
+      expect(autoReadyCount).toBe(0)
+
+      ws.send(JSON.stringify({
+        type: 'terminal.attach',
+        terminalId: created.terminalId,
+        sinceSeq: 0,
+        cols: 120,
+        rows: 40,
+        attachRequestId: 'dup-split-attach',
+      }))
+      const ready = await waitForMessage(ws, (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'dup-split-attach')
+      expect(ready.terminalId).toBe(created.terminalId)
+      close()
+    })
+
+    it('split-mode attach retry with same attachRequestId is idempotent and keeps resize-before-replay order', async () => {
+      const { ws, close } = await createAuthenticatedConnection()
+      ws.send(JSON.stringify({ type: 'terminal.create', requestId: 'split-attach-retry', mode: 'shell', attachOnCreate: false }))
+      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === 'split-attach-retry')
+
+      const ordered: string[] = []
+      registry.onResize = () => ordered.push('resize')
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data.toString())
+        if (msg.type === 'terminal.attach.ready') ordered.push('ready')
+        if (msg.type === 'terminal.output') ordered.push('output')
+      })
+
+      ws.send(JSON.stringify({
+        type: 'terminal.attach',
+        terminalId: created.terminalId,
+        sinceSeq: 0,
+        cols: 120,
+        rows: 40,
+        attachRequestId: 'retry-1',
+      }))
+      ws.send(JSON.stringify({
+        type: 'terminal.attach',
+        terminalId: created.terminalId,
+        sinceSeq: 0,
+        cols: 120,
+        rows: 40,
+        attachRequestId: 'retry-1',
+      }))
+
+      const ready = await waitForMessage(ws, (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'retry-1')
+      expect(ready.terminalId).toBe(created.terminalId)
+      registry.simulateOutput(created.terminalId, 'retry-seed')
+      await waitForMessage(ws, (m) => m.type === 'terminal.output' && m.terminalId === created.terminalId)
+      const msgs = await collectMessages(ws, 200)
+      const duplicateReadyCount = msgs.filter((m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'retry-1').length
+      expect(duplicateReadyCount).toBe(0)
+      expect(ordered.indexOf('ready')).toBeGreaterThan(ordered.indexOf('resize'))
+      expect(ordered.indexOf('output')).toBeGreaterThan(ordered.indexOf('ready'))
+      close()
+    })
+
+    it('split attach without viewport remains compatibility-safe and still enforces resize-before-replay', async () => {
+      const { ws, close } = await createAuthenticatedConnection()
+      ws.send(JSON.stringify({ type: 'terminal.create', requestId: 'split-missing-vp', mode: 'shell', attachOnCreate: false }))
+      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === 'split-missing-vp')
+
+      const ordered: string[] = []
+      registry.onResize = () => ordered.push('resize')
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data.toString())
+        if (msg.type === 'terminal.attach.ready') ordered.push('ready')
+        if (msg.type === 'terminal.output') ordered.push('output')
+      })
+
+      registry.simulateOutput(created.terminalId, 'seed-split-missing-vp')
+      ws.send(JSON.stringify({ type: 'terminal.attach', terminalId: created.terminalId, sinceSeq: 0 }))
+      await waitForMessage(ws, (m) => m.type === 'terminal.output' && m.terminalId === created.terminalId)
+      expect(ordered.indexOf('resize')).toBeGreaterThanOrEqual(0)
+      expect(ordered.indexOf('ready')).toBeGreaterThan(ordered.indexOf('resize'))
+      expect(ordered.indexOf('output')).toBeGreaterThan(ordered.indexOf('ready'))
+      close()
+    })
+
+    it('split restore attach ordering: resize happens before attach.ready and replay output', async () => {
+      const { ws, close } = await createAuthenticatedConnection()
+      ws.send(JSON.stringify({ type: 'terminal.create', requestId: 'split-restore-order', mode: 'shell', attachOnCreate: false }))
+      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === 'split-restore-order')
+
+      registry.simulateOutput(created.terminalId, 'seed-1')
+      registry.simulateOutput(created.terminalId, 'seed-2')
+
+      const ordered: string[] = []
+      registry.onResize = () => ordered.push('resize')
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data.toString())
+        if (msg.type === 'terminal.attach.ready') ordered.push('ready')
+        if (msg.type === 'terminal.output') ordered.push('output')
+      })
+
+      ws.send(JSON.stringify({ type: 'terminal.attach', terminalId: created.terminalId, sinceSeq: 0, cols: 120, rows: 40 }))
+      await waitForMessage(ws, (m) => m.type === 'terminal.output' && m.terminalId === created.terminalId)
+
+      expect(ordered.indexOf('resize')).toBeGreaterThanOrEqual(0)
+      expect(ordered.indexOf('ready')).toBeGreaterThan(ordered.indexOf('resize'))
+      expect(ordered.indexOf('output')).toBeGreaterThan(ordered.indexOf('ready'))
+      close()
+    })
+
+    it('split reconnect ordering: transport reconnect resize happens before attach.ready and replay delta', async () => {
+      const { ws, close } = await createAuthenticatedConnection()
+      ws.send(JSON.stringify({ type: 'terminal.create', requestId: 'split-reconnect-order', mode: 'shell', attachOnCreate: false }))
+      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === 'split-reconnect-order')
+      ws.send(JSON.stringify({ type: 'terminal.attach', terminalId: created.terminalId, sinceSeq: 0, cols: 120, rows: 40 }))
+      await waitForMessage(ws, (m) => m.type === 'terminal.attach.ready' && m.terminalId === created.terminalId)
+      registry.simulateOutput(created.terminalId, 'after-initial')
+      const last = await waitForMessage(ws, (m) => m.type === 'terminal.output' && m.terminalId === created.terminalId)
+      const lastSeq = last.seqEnd
+      close()
+
+      const { ws: ws2, close: close2 } = await createAuthenticatedConnection()
+      const ordered: string[] = []
+      registry.onResize = () => ordered.push('resize')
+      ws2.on('message', (data) => {
+        const msg = JSON.parse(data.toString())
+        if (msg.type === 'terminal.attach.ready') ordered.push('ready')
+        if (msg.type === 'terminal.output') ordered.push('output')
+      })
+
+      ws2.send(JSON.stringify({
+        type: 'terminal.attach',
+        terminalId: created.terminalId,
+        sinceSeq: lastSeq,
+        cols: 120,
+        rows: 40,
+        attachRequestId: 'transport-reconnect-1',
+      }))
+      await waitForMessage(ws2, (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'transport-reconnect-1')
+      registry.simulateOutput(created.terminalId, 'after-reconnect')
+      await waitForMessage(
+        ws2,
+        (m) => m.type === 'terminal.output'
+          && m.terminalId === created.terminalId
+          && String(m.data).includes('after-reconnect'),
+      )
+
+      expect(ordered.indexOf('ready')).toBeGreaterThan(ordered.indexOf('resize'))
+      expect(ordered.indexOf('output')).toBeGreaterThan(ordered.indexOf('ready'))
+      close2()
     })
   })
 

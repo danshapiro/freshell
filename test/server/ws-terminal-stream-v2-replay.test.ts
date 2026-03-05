@@ -199,6 +199,24 @@ function waitForMessages(
   })
 }
 
+function collectMessages(ws: WebSocket, durationMs: number): Promise<any[]> {
+  return new Promise((resolve) => {
+    const messages: any[] = []
+    const handler = (data: WebSocket.Data) => {
+      try {
+        messages.push(JSON.parse(data.toString()))
+      } catch {
+        // ignore malformed test frames
+      }
+    }
+    ws.on('message', handler)
+    setTimeout(() => {
+      ws.off('message', handler)
+      resolve(messages)
+    }, durationMs)
+  })
+}
+
 async function createAuthenticatedConnection(port: number): Promise<{ ws: WebSocket; close: () => Promise<void> }> {
   const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
   await new Promise<void>((resolve) => ws.on('open', () => resolve()))
@@ -237,6 +255,24 @@ async function createTerminal(ws: WebSocket, requestId: string): Promise<{ termi
   expect(ready.terminalId).toBe(terminalId)
 
   return { terminalId }
+}
+
+async function createTerminalSplitNoAutoAttach(ws: WebSocket, requestId: string): Promise<{ terminalId: string }> {
+  ws.send(JSON.stringify({
+    type: 'terminal.create',
+    requestId,
+    mode: 'shell',
+    shell: 'system',
+    attachOnCreate: false,
+  }))
+
+  const created = await waitForMessage(ws, (msg) => msg.type === 'terminal.created' && msg.requestId === requestId)
+  const trailing = await collectMessages(ws, 150)
+  const autoAttachReadySeen = trailing.some(
+    (msg) => msg.type === 'terminal.attach.ready' && msg.terminalId === created.terminalId,
+  )
+  expect(autoAttachReadySeen).toBe(false)
+  return { terminalId: created.terminalId as string }
 }
 
 describe('terminal stream v2 replay', () => {
@@ -323,6 +359,28 @@ describe('terminal stream v2 replay', () => {
     expect(replayed.every((frame) => frame.attachRequestId === attachRequestId)).toBe(true)
 
     await close2()
+  })
+
+  it('split-mode create returns created only until explicit attach', async () => {
+    const { ws, close } = await createAuthenticatedConnection(port)
+    const { terminalId } = await createTerminalSplitNoAutoAttach(ws, 'stream-split-create')
+
+    ws.send(JSON.stringify({
+      type: 'terminal.attach',
+      terminalId,
+      sinceSeq: 0,
+      cols: 120,
+      rows: 40,
+      attachRequestId: 'stream-split-create-attach',
+    }))
+
+    const ready = await waitForMessage(
+      ws,
+      (msg) => msg.type === 'terminal.attach.ready' && msg.attachRequestId === 'stream-split-create-attach',
+    )
+    expect(ready.terminalId).toBe(terminalId)
+
+    await close()
   })
 
   it('echoes attachRequestId on attach.ready and replay_window_exceeded gaps', async () => {
