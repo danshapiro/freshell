@@ -1622,7 +1622,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           terminalId: tid,
           resumeSessionId: contentRef.current?.resumeSessionId,
         })
-        if (tid) attachTerminal(tid, 'transport_reconnect')
+        if (!tid) return
+        if (hiddenRef.current && supportsSplitAttachMode()) {
+          deferredHiddenAttachIntentRef.current = 'transport_reconnect'
+          return
+        }
+        attachTerminal(tid, 'transport_reconnect')
       })
 
       // Use paneContent for terminal lifecycle - NOT tab
@@ -1642,8 +1647,8 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       })
       if (currentTerminalId) {
         if (hiddenRef.current && supportsSplitAttachMode()) {
-          deferredHiddenAttachIntentRef.current = 'keepalive_delta'
-          needsViewportHydrationRef.current = false
+          deferredHiddenAttachIntentRef.current = 'viewport_hydrate'
+          needsViewportHydrationRef.current = true
           pendingDeferredHydrationRef.current = false
           awaitingViewportHydrationRef.current = false
           setIsAttaching(false)

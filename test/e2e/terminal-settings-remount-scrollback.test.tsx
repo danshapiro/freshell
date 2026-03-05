@@ -486,7 +486,7 @@ describe('settings remount scrollback hydration (e2e)', () => {
         .map(([msg]) => msg)
         .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === 'term-hidden')
       expect(hiddenAttach).toMatchObject({
-        sinceSeq: 7,
+        sinceSeq: 0,
         cols: expect.any(Number),
         rows: expect.any(Number),
         attachRequestId: expect.any(String),
