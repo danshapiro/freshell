@@ -1300,6 +1300,10 @@ export class WsHandler {
             autoAttach,
           })
           if (!sent) {
+            // Terminal may still exist even if created+attach delivery failed (for
+            // example: socket closed after create). Broadcast inventory so other
+            // clients can discover it.
+            this.broadcast({ type: 'terminal.list.updated' })
             return
           }
 

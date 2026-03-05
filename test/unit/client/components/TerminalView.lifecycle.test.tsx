@@ -1809,6 +1809,52 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
+    it('ignores duplicate terminal.created for a handled split request', async () => {
+      wsMocks.supportsCreateAttachSplitV1.mockReturnValue(true)
+      wsMocks.supportsAttachViewportV1.mockReturnValue(true)
+
+      const { requestId } = await renderTerminalHarness({
+        status: 'creating',
+        hidden: false,
+        requestId: 'req-v2-duplicate-created',
+      })
+
+      wsMocks.send.mockClear()
+      messageHandler!({
+        type: 'terminal.created',
+        requestId,
+        terminalId: 'term-v2-duplicate-created',
+        createdAt: Date.now(),
+      })
+
+      await waitFor(() => {
+        const attachCalls = wsMocks.send.mock.calls
+          .map(([msg]) => msg)
+          .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === 'term-v2-duplicate-created')
+        expect(attachCalls).toHaveLength(1)
+      })
+
+      const countByType = (type: string) => wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .filter((msg) => msg?.type === type && msg?.terminalId === 'term-v2-duplicate-created')
+        .length
+
+      const attachCountAfterFirst = countByType('terminal.attach')
+      const resizeCountAfterFirst = countByType('terminal.resize')
+
+      messageHandler!({
+        type: 'terminal.created',
+        requestId,
+        terminalId: 'term-v2-duplicate-created',
+        createdAt: Date.now(),
+      })
+
+      await waitFor(() => {
+        expect(countByType('terminal.attach')).toBe(attachCountAfterFirst)
+        expect(countByType('terminal.resize')).toBe(resizeCountAfterFirst)
+      })
+    })
+
     it('reconnect downgrade/upgrade changes apply only to future creates, not latched in-flight mode', async () => {
       wsMocks.supportsCreateAttachSplitV1.mockReturnValue(true)
       wsMocks.supportsAttachViewportV1.mockReturnValue(true)

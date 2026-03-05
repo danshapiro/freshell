@@ -91,6 +91,7 @@ class FakeRegistry {
   records = new Map<string, any>()
   lastCreateOpts: any = null
   createCallCount = 0
+  forceAttachFailure = false
 
   create(opts: any) {
     this.lastCreateOpts = opts
@@ -116,6 +117,7 @@ class FakeRegistry {
   }
 
   attach(terminalId: string, ws: any) {
+    if (this.forceAttachFailure) return null
     const rec = this.records.get(terminalId)
     if (!rec) return null
     rec.clients.add(ws)
@@ -241,6 +243,7 @@ describe('terminal.create session repair wait', () => {
     registry.records.clear()
     registry.lastCreateOpts = null
     registry.createCallCount = 0
+    registry.forceAttachFailure = false
   })
 
   afterAll(async () => {
@@ -518,6 +521,45 @@ describe('terminal.create session repair wait', () => {
       if (ws2) {
         await closeWebSocket(ws2)
       }
+    }
+  })
+
+  it('broadcasts terminal.list.updated when create succeeds but auto-attach fails', async () => {
+    registry.forceAttachFailure = true
+
+    const observer = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    let creator: WebSocket | undefined
+
+    try {
+      await new Promise<void>((resolve) => observer.on('open', () => resolve()))
+      observer.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+      await waitForMessage(observer, (m) => m.type === 'ready')
+
+      creator = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+      await new Promise<void>((resolve) => creator.on('open', () => resolve()))
+      creator.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+      await waitForMessage(creator, (m) => m.type === 'ready')
+
+      creator.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'create-attach-fail-list-update',
+        mode: 'shell',
+      }))
+
+      const err = await waitForMessage(
+        creator,
+        (m) => m.type === 'error' && m.code === 'INVALID_TERMINAL_ID' && typeof m.terminalId === 'string',
+      )
+      expect(err.requestId).toBeUndefined()
+      expect(registry.records.size).toBe(1)
+
+      await waitForMessage(observer, (m) => m.type === 'terminal.list.updated')
+    } finally {
+      await closeWebSocket(observer)
+      if (creator) {
+        await closeWebSocket(creator)
+      }
+      registry.forceAttachFailure = false
     }
   })
 

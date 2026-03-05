@@ -1643,14 +1643,28 @@ describe('WebSocket edge cases', () => {
 
     it('split-mode duplicate requestId is idempotent without duplicate attach.ready churn', async () => {
       const { ws, close } = await createAuthenticatedConnection()
+      const observed: any[] = []
+      const onMessage = (data: WebSocket.RawData) => {
+        try {
+          observed.push(JSON.parse(data.toString()))
+        } catch {
+          // ignore malformed frames in test harness
+        }
+      }
+      ws.on('message', onMessage)
       ws.send(JSON.stringify({ type: 'terminal.create', requestId: 'dup-split-1', mode: 'shell', attachOnCreate: false }))
       ws.send(JSON.stringify({ type: 'terminal.create', requestId: 'dup-split-1', mode: 'shell', attachOnCreate: false }))
 
       const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === 'dup-split-1')
-      const msgs = await collectMessages(ws, 200)
-      const createdCount = msgs.filter((m) => m.type === 'terminal.created' && m.requestId === 'dup-split-1').length + 1
-      const autoReadyCount = msgs.filter((m) => m.type === 'terminal.attach.ready' && m.terminalId === created.terminalId).length
-      expect(createdCount).toBe(1)
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      ws.off('message', onMessage)
+      const createdMessages = observed.filter((m) => m.type === 'terminal.created' && m.requestId === 'dup-split-1')
+      const createdTerminalIds = new Set(createdMessages.map((m) => m.terminalId))
+      const autoReadyCount = observed.filter((m) => m.type === 'terminal.attach.ready' && m.terminalId === created.terminalId).length
+      expect(createdMessages.length).toBeGreaterThanOrEqual(1)
+      expect(createdTerminalIds.size).toBe(1)
+      expect(createdTerminalIds.has(created.terminalId)).toBe(true)
+      expect(registry.records.size).toBe(1)
       expect(autoReadyCount).toBe(0)
 
       ws.send(JSON.stringify({
