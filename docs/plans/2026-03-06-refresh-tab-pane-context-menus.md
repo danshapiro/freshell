@@ -4,7 +4,7 @@
 
 **Goal:** Add `Refresh Tab` and `Refresh Pane` to the existing right-click context menus so browser panes reload or recover in place and terminal panes re-establish their frontend connection to the existing pane session, including tabs that are currently zoomed.
 
-**Architecture:** Make refresh state-driven but one-shot. Store at most one pending refresh request per pane in `panesSlice`, keyed by a unique `requestId` plus a target snapshot derived from the pane’s current content; menus dispatch those requests from the stored layout tree, and panes explicitly consume or clear them so refresh never replays across later remounts. Keep request cleanup layout-driven too: after any reducer or hydration path changes leaf content under a pane id, reconcile that tab’s pending requests against the current layout so stale browser URLs and stale terminal `createRequestId`s are dropped automatically. Browser panes must preserve the current live-document reload path when an iframe exists and only fall back to recovery when the pane is actually on an error screen; a pending browser refresh on mount should be satisfied by the normal initial load path instead of triggering a second resolve/load attempt. Terminal refresh must be folded into the existing attach lifecycle so a mount with a pending request performs exactly one detach/attach sequence instead of racing the normal mount attach.
+**Architecture:** Make refresh state-driven but one-shot. Store at most one pending refresh request per pane in `panesSlice`, keyed by a unique `requestId` plus a target snapshot derived from the pane’s current content; menus dispatch those requests from the stored layout tree, and panes explicitly consume or clear them so refresh never replays across later remounts. Browser panes need their own persisted instance identity, analogous to terminal `createRequestId`: add `browserInstanceId` to browser pane content and use that token for refresh matching and stale-request cleanup. Keep request cleanup layout-driven too: after any reducer or hydration path changes leaf content under a pane id, reconcile that tab’s pending requests against the current layout so stale browser instances and stale terminal sessions are dropped automatically. Browser panes must preserve the current live-document reload path when an iframe exists and only fall back to recovery when the pane is actually on an error screen; a pending browser refresh on mount should be satisfied by the normal initial load path instead of triggering a second resolve/load attempt. Terminal refresh must be folded into the existing attach lifecycle so a mount with a pending request performs exactly one detach/attach sequence instead of racing the normal mount attach.
 
 **Tech Stack:** React 18, Redux Toolkit, TypeScript, xterm.js, Vitest, Testing Library
 
@@ -12,36 +12,45 @@
 
 ## Scope Notes
 
-- `Refresh Pane` belongs on the pane chrome context menu (`ContextIds.Pane`), not the inner terminal/browser/editor content menus.
+- `Refresh Pane` must be available anywhere the app already exposes pane-level commands:
+  - the pane chrome/header context menu (`ContextIds.Pane`)
+  - the terminal content context menu (`ContextIds.Terminal`)
+  - the browser content context menu (`ContextIds.Browser`)
 - `Refresh Tab` must iterate the entire stored tab layout tree, not just currently mounted leaves.
 - `PaneLayout` renders only the zoomed leaf when a tab is zoomed (`src/components/panes/PaneLayout.tsx:66-72`), so menu enablement and request creation must come from stored layout state, not mounted-pane registries.
 - Refresh requests must be ephemeral UI/runtime state like `renameRequest*` and `zoomedPane`, not persisted to localStorage.
 - Refresh must be a one-shot consume/ack flow. A request may stay pending while a pane is unmounted, but once a pane claims it, the request must be removed from Redux so later remounts do not replay it.
-- Pane IDs are reused across replacement/content changes, so each refresh request needs a target snapshot specific enough to detect stale requests. For browser panes that means the stored browser URL, not just `kind: 'browser'`.
+- Pane IDs are reused across replacement/content changes, so each refresh request needs a target snapshot specific enough to detect stale requests:
+  - terminals match on `createRequestId`
+  - browsers match on `browserInstanceId`
 - Stale-request cleanup must be layout-driven and comprehensive: after any reducer or hydration path changes leaf content under a pane id, reconcile that tab’s pending requests against the new layout. This includes `swapPanes` and `hydratePanes`, not just direct `updatePaneContent`.
-- Refreshable pane kinds for this issue:
-  - `terminal`
-  - `browser`
-- Non-refreshable pane kinds for now:
+- Refreshable pane states for this issue:
+  - terminal panes with a live `terminalId`
+  - browser panes with a non-empty `url` and a `browserInstanceId`
+- Non-refreshable pane states for this issue:
+  - terminal panes with no `terminalId` (including exited panes)
+  - browser panes with a blank URL / empty state
   - `editor`
   - `picker`
   - `agent-chat`
   - `extension`
-- Browser refresh must preserve the existing `iframe.contentWindow?.location.reload()` behavior when an iframe exists. Recreating or re-resolving from the stored Redux URL is only the recovery path when the iframe is missing because the pane is on an error screen.
+- Same-instance browser navigation should keep a pending refresh attached to that browser instance. Same-url browser-to-browser swaps or hydration replacements must clear the stale request because the browser instance changed.
+- Browser refresh must preserve the existing `iframe.contentWindow?.location.reload()` behavior when an iframe exists. Recreating or re-resolving from Redux state is only the recovery path when the iframe is missing because the pane is on an error screen.
 - Browser refresh must not add a second resolve/load path on mount. A pre-existing pending browser request on mount should be consumed by the normal initial load work for that pane.
 - Terminal refresh must not add a second attach path on mount. A pre-existing pending refresh request on mount must replace the normal mount attach, not run before it.
 - No server-side protocol changes are needed.
 - No `docs/index.html` update is required; this is not a major UI mock change.
 
-### Task 1: Add Shared Pane Refresh Helpers
+### Task 1: Add Browser Instance Identity And Shared Refresh Helpers
 
 **Files:**
+- Modify: `src/store/paneTypes.ts`
 - Modify: `src/lib/pane-utils.ts`
 - Test: `test/unit/client/lib/pane-utils.test.ts`
 
 **Step 1: Write the failing test**
 
-Extend `test/unit/client/lib/pane-utils.test.ts` with helpers that the slice and panes can share:
+Extend `test/unit/client/lib/pane-utils.test.ts`:
 
 ```ts
 import {
@@ -54,7 +63,15 @@ import {
 describe('collectPaneLeaves', () => {
   it('returns leaf ids in tree order', () => {
     const tree = split([
-      split([leaf('p1', shellContent), leaf('p2', browserContent)]),
+      split([
+        leaf('p1', shellContent),
+        leaf('p2', {
+          kind: 'browser',
+          browserInstanceId: 'browser-1',
+          url: 'https://example.test',
+          devToolsOpen: false,
+        }),
+      ]),
       leaf('p3', editorContent),
     ])
 
@@ -63,64 +80,123 @@ describe('collectPaneLeaves', () => {
 })
 
 describe('buildPaneRefreshTarget', () => {
-  it('returns a terminal target keyed by createRequestId', () => {
+  it('returns a terminal target keyed by createRequestId only when the pane has a live terminalId', () => {
     expect(buildPaneRefreshTarget({
       kind: 'terminal',
+      terminalId: 'term-1',
       mode: 'shell',
       createRequestId: 'req-1',
       status: 'running',
     })).toEqual({ kind: 'terminal', createRequestId: 'req-1' })
+
+    expect(buildPaneRefreshTarget({
+      kind: 'terminal',
+      mode: 'shell',
+      createRequestId: 'req-1',
+      status: 'exited',
+    })).toBeNull()
   })
 
-  it('returns a browser target keyed by the stored browser URL', () => {
+  it('returns a browser target keyed by browserInstanceId only when the pane has a URL', () => {
     expect(buildPaneRefreshTarget({
       kind: 'browser',
+      browserInstanceId: 'browser-1',
       url: 'https://example.test/a',
       devToolsOpen: false,
-    })).toEqual({ kind: 'browser', url: 'https://example.test/a' })
+    })).toEqual({ kind: 'browser', browserInstanceId: 'browser-1' })
+
+    expect(buildPaneRefreshTarget({
+      kind: 'browser',
+      browserInstanceId: 'browser-1',
+      url: '',
+      devToolsOpen: false,
+    })).toBeNull()
   })
 
   it('returns null for non-refreshable panes', () => {
     expect(buildPaneRefreshTarget(editorContent)).toBeNull()
+    expect(buildPaneRefreshTarget({ kind: 'picker' })).toBeNull()
+  })
+})
+
+describe('isRefreshablePaneContent', () => {
+  it('returns true only for actionable terminal/browser panes', () => {
+    expect(isRefreshablePaneContent({
+      kind: 'terminal',
+      terminalId: 'term-1',
+      mode: 'shell',
+      createRequestId: 'req-1',
+      status: 'running',
+    })).toBe(true)
+
+    expect(isRefreshablePaneContent({
+      kind: 'browser',
+      browserInstanceId: 'browser-1',
+      url: 'https://example.test/a',
+      devToolsOpen: false,
+    })).toBe(true)
+  })
+
+  it('returns false for empty browser panes and terminals without a live session', () => {
+    expect(isRefreshablePaneContent({
+      kind: 'browser',
+      browserInstanceId: 'browser-1',
+      url: '',
+      devToolsOpen: false,
+    })).toBe(false)
+
+    expect(isRefreshablePaneContent({
+      kind: 'terminal',
+      mode: 'shell',
+      createRequestId: 'req-1',
+      status: 'exited',
+    })).toBe(false)
   })
 })
 
 describe('paneRefreshTargetMatchesContent', () => {
-  it('matches a terminal target only when createRequestId still matches', () => {
+  it('matches a terminal target only when createRequestId still matches and the pane is still actionable', () => {
     expect(
       paneRefreshTargetMatchesContent(
         { kind: 'terminal', createRequestId: 'req-1' },
-        { kind: 'terminal', mode: 'shell', createRequestId: 'req-1', status: 'running' },
+        { kind: 'terminal', terminalId: 'term-1', mode: 'shell', createRequestId: 'req-1', status: 'running' },
       ),
     ).toBe(true)
 
     expect(
       paneRefreshTargetMatchesContent(
         { kind: 'terminal', createRequestId: 'req-1' },
-        { kind: 'terminal', mode: 'shell', createRequestId: 'req-2', status: 'running' },
+        { kind: 'terminal', terminalId: 'term-1', mode: 'shell', createRequestId: 'req-2', status: 'running' },
+      ),
+    ).toBe(false)
+
+    expect(
+      paneRefreshTargetMatchesContent(
+        { kind: 'terminal', createRequestId: 'req-1' },
+        { kind: 'terminal', mode: 'shell', createRequestId: 'req-1', status: 'exited' },
       ),
     ).toBe(false)
   })
 
-  it('matches browser targets only when the current stored URL still matches', () => {
+  it('matches browser targets by browserInstanceId, not by URL equality', () => {
     expect(
       paneRefreshTargetMatchesContent(
-        { kind: 'browser', url: 'https://example.test/a' },
-        { kind: 'browser', url: 'https://example.test/a', devToolsOpen: false },
+        { kind: 'browser', browserInstanceId: 'browser-1' },
+        { kind: 'browser', browserInstanceId: 'browser-1', url: 'https://example.test/a', devToolsOpen: false },
       ),
     ).toBe(true)
 
     expect(
       paneRefreshTargetMatchesContent(
-        { kind: 'browser', url: 'https://example.test/a' },
-        { kind: 'browser', url: 'https://example.test/b', devToolsOpen: false },
+        { kind: 'browser', browserInstanceId: 'browser-1' },
+        { kind: 'browser', browserInstanceId: 'browser-1', url: 'https://example.test/b', devToolsOpen: false },
       ),
-    ).toBe(false)
+    ).toBe(true)
 
     expect(
       paneRefreshTargetMatchesContent(
-        { kind: 'browser', url: 'https://example.test/a' },
-        editorContent,
+        { kind: 'browser', browserInstanceId: 'browser-1' },
+        { kind: 'browser', browserInstanceId: 'browser-2', url: 'https://example.test/a', devToolsOpen: false },
       ),
     ).toBe(false)
   })
@@ -135,11 +211,29 @@ Run:
 npm run test:client -- test/unit/client/lib/pane-utils.test.ts
 ```
 
-Expected: FAIL because the refresh-target helpers are not exported yet.
+Expected: FAIL because browser panes do not yet have `browserInstanceId` and the refresh helpers are not implemented.
 
 **Step 3: Write minimal implementation**
 
-Update `src/lib/pane-utils.ts`:
+First extend `src/store/paneTypes.ts`:
+
+```ts
+export type BrowserPaneContent = {
+  kind: 'browser'
+  url: string
+  devToolsOpen: boolean
+  browserInstanceId: string
+}
+
+export type BrowserPaneInput = Omit<BrowserPaneContent, 'browserInstanceId'> & {
+  browserInstanceId?: string
+}
+
+export type PaneContentInput = TerminalPaneInput | BrowserPaneInput | EditorPaneInput
+  | PickerPaneContent | AgentChatPaneInput | ExtensionPaneInput
+```
+
+Then update `src/lib/pane-utils.ts`:
 
 ```ts
 import type { PaneContent, PaneNode, PaneRefreshTarget } from '@/store/paneTypes'
@@ -149,29 +243,33 @@ export function collectPaneLeaves(node: PaneNode): Array<Extract<PaneNode, { typ
   return [...collectPaneLeaves(node.children[0]), ...collectPaneLeaves(node.children[1])]
 }
 
-export function isRefreshablePaneContent(content: PaneContent): boolean {
-  return content.kind === 'terminal' || content.kind === 'browser'
-}
-
 export function buildPaneRefreshTarget(content: PaneContent): PaneRefreshTarget | null {
   if (content.kind === 'terminal') {
+    if (!content.terminalId) return null
     return { kind: 'terminal', createRequestId: content.createRequestId }
   }
   if (content.kind === 'browser') {
-    return { kind: 'browser', url: content.url }
+    if (!content.url.trim()) return null
+    return { kind: 'browser', browserInstanceId: content.browserInstanceId }
   }
   return null
+}
+
+export function isRefreshablePaneContent(content: PaneContent): boolean {
+  return buildPaneRefreshTarget(content) !== null
 }
 
 export function paneRefreshTargetMatchesContent(
   target: PaneRefreshTarget,
   content: PaneContent | null | undefined,
 ): boolean {
-  if (!content) return false
+  const currentTarget = content ? buildPaneRefreshTarget(content) : null
+  if (!currentTarget) return false
+  if (currentTarget.kind !== target.kind) return false
   if (target.kind === 'terminal') {
-    return content.kind === 'terminal' && content.createRequestId === target.createRequestId
+    return currentTarget.createRequestId === target.createRequestId
   }
-  return content.kind === 'browser' && content.url === target.url
+  return currentTarget.browserInstanceId === target.browserInstanceId
 }
 ```
 
@@ -190,7 +288,7 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add src/lib/pane-utils.ts test/unit/client/lib/pane-utils.test.ts
+git add src/store/paneTypes.ts src/lib/pane-utils.ts test/unit/client/lib/pane-utils.test.ts
 git commit -m "test(panes): add pane refresh target helpers"
 ```
 
@@ -205,7 +303,7 @@ git commit -m "test(panes): add pane refresh target helpers"
 
 **Step 1: Write the failing tests**
 
-Add reducer coverage to `test/unit/client/store/panesSlice.test.ts`:
+Extend `test/unit/client/store/panesSlice.test.ts`:
 
 ```ts
 import {
@@ -219,10 +317,11 @@ import {
 } from '../../../../src/store/panesSlice'
 
 describe('requestPaneRefresh', () => {
-  it('stores a one-shot terminal refresh request keyed by createRequestId', () => {
+  it('stores a one-shot terminal refresh request only for actionable terminal panes', () => {
     const state = panesReducer(
       stateWithLeaf('pane-term', {
         kind: 'terminal',
+        terminalId: 'term-1',
         mode: 'shell',
         createRequestId: 'req-1',
         status: 'running',
@@ -236,18 +335,33 @@ describe('requestPaneRefresh', () => {
     })
   })
 
-  it('does not create refresh state for unsupported panes', () => {
-    const state = panesReducer(
-      stateWithLeaf('pane-editor', editorContent),
-      requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-editor' }),
+  it('does not create refresh state for panes that would guaranteed-no-op', () => {
+    const exited = panesReducer(
+      stateWithLeaf('pane-term', {
+        kind: 'terminal',
+        mode: 'shell',
+        createRequestId: 'req-exited',
+        status: 'exited',
+      }),
+      requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-term' }),
     )
+    expect(exited.refreshRequestsByPane['tab-1']).toBeUndefined()
 
-    expect(state.refreshRequestsByPane['tab-1']).toBeUndefined()
+    const emptyBrowser = panesReducer(
+      stateWithLeaf('pane-browser', {
+        kind: 'browser',
+        browserInstanceId: 'browser-empty',
+        url: '',
+        devToolsOpen: false,
+      }),
+      requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-browser' }),
+    )
+    expect(emptyBrowser.refreshRequestsByPane['tab-1']).toBeUndefined()
   })
 })
 
 describe('requestTabRefresh', () => {
-  it('stores requests for every refreshable leaf in a zoomed layout tree', () => {
+  it('stores requests for every actionable leaf in a zoomed layout tree', () => {
     const state = panesReducer(
       stateWithLayoutAndZoom({
         layout: split([
@@ -255,11 +369,17 @@ describe('requestTabRefresh', () => {
           split([
             leaf('pane-term', {
               kind: 'terminal',
+              terminalId: 'term-1',
               mode: 'shell',
               createRequestId: 'req-term',
               status: 'running',
             }),
-            leaf('pane-browser', browserContent),
+            leaf('pane-browser', {
+              kind: 'browser',
+              browserInstanceId: 'browser-1',
+              url: 'http://localhost:3000',
+              devToolsOpen: false,
+            }),
           ]),
         ]),
         zoomedPaneId: 'pane-editor',
@@ -274,15 +394,44 @@ describe('requestTabRefresh', () => {
     })
     expect(state.refreshRequestsByPane['tab-1']['pane-browser'].target).toEqual({
       kind: 'browser',
-      url: browserContent.url,
+      browserInstanceId: 'browser-1',
     })
+  })
+
+  it('skips leaves that are guaranteed to no-op', () => {
+    const state = panesReducer(
+      stateWithLayout({
+        'tab-1': split([
+          leaf('pane-empty-browser', {
+            kind: 'browser',
+            browserInstanceId: 'browser-empty',
+            url: '',
+            devToolsOpen: false,
+          }),
+          leaf('pane-exited-terminal', {
+            kind: 'terminal',
+            mode: 'shell',
+            createRequestId: 'req-exited',
+            status: 'exited',
+          }),
+        ]),
+      }),
+      requestTabRefresh({ tabId: 'tab-1' }),
+    )
+
+    expect(state.refreshRequestsByPane['tab-1']).toBeUndefined()
   })
 })
 
 describe('consumePaneRefreshRequest', () => {
   it('removes the matching request and ignores stale requestIds', () => {
     const start = panesReducer(
-      stateWithLeaf('pane-browser', browserContent),
+      stateWithLeaf('pane-browser', {
+        kind: 'browser',
+        browserInstanceId: 'browser-1',
+        url: 'https://example.test/a',
+        devToolsOpen: false,
+      }),
       requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-browser' }),
     )
 
@@ -307,6 +456,7 @@ describe('refresh request reconciliation', () => {
     const requested = panesReducer(
       stateWithLeaf('pane-term', {
         kind: 'terminal',
+        terminalId: 'term-1',
         mode: 'shell',
         createRequestId: 'req-1',
         status: 'running',
@@ -321,6 +471,7 @@ describe('refresh request reconciliation', () => {
         paneId: 'pane-term',
         content: {
           kind: 'terminal',
+          terminalId: 'term-1',
           mode: 'shell',
           createRequestId: 'req-2',
           status: 'running',
@@ -331,10 +482,11 @@ describe('refresh request reconciliation', () => {
     expect(next.refreshRequestsByPane['tab-1']?.['pane-term']).toBeUndefined()
   })
 
-  it('clears a pending browser request when the stored browser URL changes', () => {
+  it('keeps a pending browser request across same-instance navigation updates', () => {
     const requested = panesReducer(
       stateWithLeaf('pane-browser', {
         kind: 'browser',
+        browserInstanceId: 'browser-1',
         url: 'https://example.test/a',
         devToolsOpen: false,
       }),
@@ -348,7 +500,38 @@ describe('refresh request reconciliation', () => {
         paneId: 'pane-browser',
         content: {
           kind: 'browser',
+          browserInstanceId: 'browser-1',
           url: 'https://example.test/b',
+          devToolsOpen: false,
+        },
+      }),
+    )
+
+    expect(next.refreshRequestsByPane['tab-1']?.['pane-browser']).toMatchObject({
+      target: { kind: 'browser', browserInstanceId: 'browser-1' },
+    })
+  })
+
+  it('clears a pending browser request when the browser instance token changes under the same pane id', () => {
+    const requested = panesReducer(
+      stateWithLeaf('pane-browser', {
+        kind: 'browser',
+        browserInstanceId: 'browser-1',
+        url: 'https://example.test/a',
+        devToolsOpen: false,
+      }),
+      requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-browser' }),
+    )
+
+    const next = panesReducer(
+      requested,
+      updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-browser',
+        content: {
+          kind: 'browser',
+          browserInstanceId: 'browser-2',
+          url: 'https://example.test/a',
           devToolsOpen: false,
         },
       }),
@@ -357,29 +540,40 @@ describe('refresh request reconciliation', () => {
     expect(next.refreshRequestsByPane['tab-1']?.['pane-browser']).toBeUndefined()
   })
 
-  it('clears a pending request when swapPanes moves different content under the same pane id', () => {
+  it('clears a pending request when swapPanes moves a different same-url browser instance under the same pane id', () => {
     const requested = panesReducer(
       stateWithLayout({
         'tab-1': split([
-          leaf('pane-browser', { kind: 'browser', url: 'https://example.test/a', devToolsOpen: false }),
-          leaf('pane-editor', editorContent),
+          leaf('pane-browser-a', {
+            kind: 'browser',
+            browserInstanceId: 'browser-a',
+            url: 'https://example.test/a',
+            devToolsOpen: false,
+          }),
+          leaf('pane-browser-b', {
+            kind: 'browser',
+            browserInstanceId: 'browser-b',
+            url: 'https://example.test/a',
+            devToolsOpen: false,
+          }),
         ]),
       }),
-      requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-browser' }),
+      requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-browser-a' }),
     )
 
     const next = panesReducer(
       requested,
-      swapPanes({ tabId: 'tab-1', paneId: 'pane-browser', otherId: 'pane-editor' }),
+      swapPanes({ tabId: 'tab-1', paneId: 'pane-browser-a', otherId: 'pane-browser-b' }),
     )
 
-    expect(next.refreshRequestsByPane['tab-1']?.['pane-browser']).toBeUndefined()
+    expect(next.refreshRequestsByPane['tab-1']?.['pane-browser-a']).toBeUndefined()
   })
 
-  it('clears stale requests after hydratePanes merges in new browser content from cross-tab sync', () => {
+  it('clears stale requests after hydratePanes merges in a different same-url browser instance from cross-tab sync', () => {
     const requested = panesReducer(
       stateWithLeaf('pane-browser', {
         kind: 'browser',
+        browserInstanceId: 'browser-a',
         url: 'https://example.test/a',
         devToolsOpen: false,
       }),
@@ -393,7 +587,8 @@ describe('refresh request reconciliation', () => {
         layouts: {
           'tab-1': leaf('pane-browser', {
             kind: 'browser',
-            url: 'https://example.test/b',
+            browserInstanceId: 'browser-b',
+            url: 'https://example.test/a',
             devToolsOpen: false,
           }),
         },
@@ -405,7 +600,12 @@ describe('refresh request reconciliation', () => {
 
   it('clears a pending browser request when the pane is replaced', () => {
     const requested = panesReducer(
-      stateWithLeaf('pane-browser', browserContent),
+      stateWithLeaf('pane-browser', {
+        kind: 'browser',
+        browserInstanceId: 'browser-1',
+        url: 'https://example.test/a',
+        devToolsOpen: false,
+      }),
       requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-browser' }),
     )
 
@@ -435,6 +635,7 @@ it('does not persist refreshRequestsByPane', () => {
     paneId: 'pane-1',
     content: {
       kind: 'terminal',
+      terminalId: 'term-1',
       mode: 'shell',
       createRequestId: 'req-1',
       status: 'running',
@@ -456,7 +657,7 @@ Run:
 npm run test:client -- test/unit/client/store/panesSlice.test.ts test/unit/client/store/panesPersistence.test.ts
 ```
 
-Expected: FAIL because the slice does not yet model one-shot refresh requests.
+Expected: FAIL because the slice does not yet model one-shot refresh requests or browser instance ids.
 
 **Step 3: Write minimal implementation**
 
@@ -465,7 +666,7 @@ First extend `src/store/paneTypes.ts`:
 ```ts
 export type PaneRefreshTarget =
   | { kind: 'terminal'; createRequestId: string }
-  | { kind: 'browser'; url: string }
+  | { kind: 'browser'; browserInstanceId: string }
 
 export interface PaneRefreshRequest {
   requestId: string
@@ -485,7 +686,22 @@ export interface PanesState {
 
 Initialize `refreshRequestsByPane` everywhere the slice creates `PanesState`.
 
-In `src/store/panesSlice.ts`, add reducers:
+Update `normalizeContent()` in `src/store/panesSlice.ts` so every new browser pane gets a stable instance token:
+
+```ts
+if (input.kind === 'browser') {
+  return {
+    kind: 'browser',
+    url: input.url,
+    devToolsOpen: input.devToolsOpen,
+    browserInstanceId: input.browserInstanceId || nanoid(),
+  }
+}
+```
+
+That ensures `initLayout`, `resetLayout`, `splitPane`, and `addPane` all create fresh browser instance ids automatically when they introduce new browser panes.
+
+Add reducers in `src/store/panesSlice.ts`:
 
 ```ts
 requestPaneRefresh: (
@@ -512,10 +728,10 @@ requestTabRefresh: (
   const layout = state.layouts[tabId]
   if (!layout) return
 
-  if (!state.refreshRequestsByPane[tabId]) state.refreshRequestsByPane[tabId] = {}
   for (const leaf of collectPaneLeaves(layout)) {
     const target = buildPaneRefreshTarget(leaf.content)
     if (!target) continue
+    if (!state.refreshRequestsByPane[tabId]) state.refreshRequestsByPane[tabId] = {}
     state.refreshRequestsByPane[tabId][leaf.id] = {
       requestId: nanoid(),
       target,
@@ -537,7 +753,7 @@ consumePaneRefreshRequest: (
 },
 ```
 
-Add slice-local helpers that reconcile pending requests against the current layout, not just against a hand-picked subset of reducers:
+Add slice-local helpers that reconcile pending requests against the current layout:
 
 ```ts
 function reconcileRefreshRequestsForTab(state: PanesState, tabId: string) {
@@ -584,11 +800,10 @@ Call `reconcileRefreshRequestsForTab(state, tabId)` after any reducer that can r
 - `replacePane`
 - `closePane`
 - `removeLayout`
-- `hydratePanes` via `reconcileAllRefreshRequests(state)` after `mergedLayouts` is assigned
+
+Call `reconcileAllRefreshRequests(state)` in `hydratePanes` after `mergedLayouts` is assigned.
 
 Also update `cleanOrphanedLayouts()` so if a future migration or bad state ever contains `refreshRequestsByPane`, orphaned tab entries are deleted there too.
-
-This is intentionally broader than a hand-maintained stale-request list. The rule is: if a reducer can change which content lives under a pane id, reconcile that tab’s refresh requests immediately afterward.
 
 Then update `src/store/persistMiddleware.ts` to strip the new ephemeral field:
 
@@ -619,7 +834,7 @@ git add src/store/paneTypes.ts src/store/panesSlice.ts src/store/persistMiddlewa
 git commit -m "feat(panes): add one-shot pane refresh requests"
 ```
 
-### Task 3: Add Layout-Based Refresh Menu Items In `menu-defs`
+### Task 3: Add Actionable Refresh Items To Tab, Pane, Terminal, And Browser Menus
 
 **Files:**
 - Modify: `src/components/context-menu/menu-defs.ts`
@@ -630,7 +845,7 @@ git commit -m "feat(panes): add one-shot pane refresh requests"
 Extend `test/unit/client/components/context-menu/menu-defs.test.ts`:
 
 ```ts
-it('enables Refresh tab when the stored layout has refreshable leaves even if only non-refreshable panes are mounted', () => {
+it('enables Refresh tab when the stored layout has actionable hidden siblings', () => {
   const actions = createMockActions()
   const ctx = {
     ...createMockContext(actions),
@@ -642,7 +857,16 @@ it('enables Refresh tab when the stored layout has refreshable leaves even if on
         sizes: [50, 50],
         children: [
           { type: 'leaf', id: 'pane-editor', content: editorContent },
-          { type: 'leaf', id: 'pane-browser', content: browserContent },
+          {
+            type: 'leaf',
+            id: 'pane-browser',
+            content: {
+              kind: 'browser',
+              browserInstanceId: 'browser-1',
+              url: 'http://localhost:3000',
+              devToolsOpen: false,
+            },
+          },
         ],
       },
     },
@@ -655,12 +879,39 @@ it('enables Refresh tab when the stored layout has refreshable leaves even if on
   expect(refreshItem?.type === 'item' ? refreshItem.disabled : true).toBe(false)
 })
 
-it('disables Refresh tab when no leaf in the layout is refreshable', () => {
+it('disables Refresh tab when every leaf would guaranteed-no-op', () => {
   const actions = createMockActions()
   const ctx = {
     ...createMockContext(actions),
     paneLayouts: {
-      tab1: { type: 'leaf', id: 'pane-editor', content: editorContent },
+      tab1: {
+        type: 'split',
+        id: 'split-1',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          {
+            type: 'leaf',
+            id: 'pane-empty-browser',
+            content: {
+              kind: 'browser',
+              browserInstanceId: 'browser-empty',
+              url: '',
+              devToolsOpen: false,
+            },
+          },
+          {
+            type: 'leaf',
+            id: 'pane-exited-terminal',
+            content: {
+              kind: 'terminal',
+              mode: 'shell',
+              createRequestId: 'req-exited',
+              status: 'exited',
+            },
+          },
+        ],
+      },
     },
   }
 
@@ -671,7 +922,7 @@ it('disables Refresh tab when no leaf in the layout is refreshable', () => {
   expect(refreshItem?.type === 'item' ? refreshItem.disabled : false).toBe(true)
 })
 
-it('selecting Refresh pane calls refreshPane', () => {
+it('includes Refresh pane in the pane chrome menu', () => {
   const actions = createMockActions()
   const ctx = createMockContext(actions)
   const items = buildMenuItems({ kind: 'pane', tabId: 'tab1', paneId: 'pane1' }, ctx)
@@ -680,6 +931,49 @@ it('selecting Refresh pane calls refreshPane', () => {
   expect(refreshItem).toBeDefined()
   if (refreshItem?.type === 'item') refreshItem.onSelect()
   expect(actions.refreshPane).toHaveBeenCalledWith('tab1', 'pane1')
+})
+
+it('includes Refresh pane in the terminal content menu', () => {
+  const actions = createMockActions()
+  const ctx = createMockContext(actions, {
+    paneLayouts: {
+      tab1: {
+        type: 'leaf',
+        id: 'pane1',
+        content: {
+          kind: 'terminal',
+          terminalId: 'term-1',
+          mode: 'shell',
+          createRequestId: 'req-1',
+          status: 'running',
+        },
+      },
+    },
+  })
+
+  const items = buildMenuItems({ kind: 'terminal', tabId: 'tab1', paneId: 'pane1' }, ctx)
+  expect(items.some((item) => item.type === 'item' && item.id === 'refresh-pane')).toBe(true)
+})
+
+it('includes Refresh pane in the browser content menu', () => {
+  const actions = createMockActions()
+  const ctx = createMockContext(actions, {
+    paneLayouts: {
+      tab1: {
+        type: 'leaf',
+        id: 'pane1',
+        content: {
+          kind: 'browser',
+          browserInstanceId: 'browser-1',
+          url: 'https://example.test',
+          devToolsOpen: false,
+        },
+      },
+    },
+  })
+
+  const items = buildMenuItems({ kind: 'browser', tabId: 'tab1', paneId: 'pane1' }, ctx)
+  expect(items.some((item) => item.type === 'item' && item.id === 'refresh-pane')).toBe(true)
 })
 ```
 
@@ -707,11 +1001,12 @@ export type MenuActions = {
 }
 ```
 
-Use `collectPaneLeaves()` and `isRefreshablePaneContent()` to compute enablement from stored layout content:
+Use `collectPaneLeaves()` and `buildPaneRefreshTarget()` to compute enablement from stored layout content:
 
 ```ts
-const canRefreshTab = !!layout && collectPaneLeaves(layout).some((leaf) => isRefreshablePaneContent(leaf.content))
-const canRefreshPane = !!paneContent && isRefreshablePaneContent(paneContent)
+const canRefreshTab = !!layout && collectPaneLeaves(layout).some((leaf) => !!buildPaneRefreshTarget(leaf.content))
+const paneRefreshTarget = paneContent ? buildPaneRefreshTarget(paneContent) : null
+const canRefreshPane = !!paneRefreshTarget
 ```
 
 Insert:
@@ -729,7 +1024,9 @@ and:
 Placement:
 
 - `Refresh tab` before `Rename tab`
-- `Refresh pane` before the split actions
+- `Refresh pane` before the split actions in the pane chrome menu
+- `Refresh pane` before the split actions in the terminal content menu
+- `Refresh pane` before the split actions in the browser content menu
 
 Do not read `getTerminalActions()` or `getBrowserActions()` for refresh enablement.
 
@@ -747,10 +1044,10 @@ Expected: PASS.
 
 ```bash
 git add src/components/context-menu/menu-defs.ts test/unit/client/components/context-menu/menu-defs.test.ts
-git commit -m "feat(ui): add layout-driven refresh menu items"
+git commit -m "feat(ui): add actionable refresh menu items"
 ```
 
-### Task 4: Dispatch One-Shot Refresh Requests From `ContextMenuProvider`
+### Task 4: Dispatch Refresh Requests From `ContextMenuProvider` And Expose All Entry Points
 
 **Files:**
 - Modify: `src/components/context-menu/ContextMenuProvider.tsx`
@@ -765,13 +1062,34 @@ Add provider tests that use the real store state instead of action-registry stub
 import TabBar from '@/components/TabBar'
 import TabContent from '@/components/TabContent'
 
-it('opens the pane context menu from the focused pane shell with Shift+F10', async () => {
+it('opens the pane chrome context menu from the focused pane shell with Shift+F10', async () => {
   const user = userEvent.setup()
   renderRealPaneHarness()
 
   const pane = screen.getByRole('group', { name: 'Pane: Shell' })
   pane.focus()
   await user.keyboard('{Shift>}{F10}{/Shift}')
+
+  expect(screen.getByRole('menuitem', { name: 'Refresh pane' })).toBeInTheDocument()
+})
+
+it('shows Refresh pane in the terminal content menu', async () => {
+  const user = userEvent.setup()
+  renderRealTerminalHarness()
+
+  await user.pointer({ target: screen.getByTestId('terminal-xterm-container'), keys: '[MouseRight]' })
+
+  expect(screen.getByRole('menuitem', { name: 'Refresh pane' })).toBeInTheDocument()
+})
+
+it('shows Refresh pane in the browser content menu', async () => {
+  const user = userEvent.setup()
+  renderRealBrowserHarness({
+    url: 'https://example.test',
+    browserInstanceId: 'browser-1',
+  })
+
+  await user.pointer({ target: screen.getByTestId('browser-pane-root'), keys: '[MouseRight]' })
 
   expect(screen.getByRole('menuitem', { name: 'Refresh pane' })).toBeInTheDocument()
 })
@@ -789,12 +1107,26 @@ it('Refresh pane stores a one-shot request for the targeted pane', async () => {
   })
 })
 
-it('Refresh tab stores requests for all refreshable leaves in a zoomed tab, including unmounted siblings', async () => {
+it('Refresh tab stores requests for all actionable leaves in a zoomed tab, including unmounted siblings', async () => {
   const user = userEvent.setup()
   const store = createZoomedStore({
     layout: split([
       leaf('pane-editor', editorContent),
-      split([leaf('pane-term', shellContent), leaf('pane-browser', browserContent)]),
+      split([
+        leaf('pane-term', {
+          kind: 'terminal',
+          terminalId: 'term-1',
+          mode: 'shell',
+          createRequestId: 'req-term',
+          status: 'running',
+        }),
+        leaf('pane-browser', {
+          kind: 'browser',
+          browserInstanceId: 'browser-1',
+          url: 'http://localhost:3000',
+          devToolsOpen: false,
+        }),
+      ]),
     ]),
     zoomedPaneId: 'pane-editor',
   })
@@ -817,8 +1149,6 @@ it('Refresh tab stores requests for all refreshable leaves in a zoomed tab, incl
   ])
 })
 ```
-
-That zoomed-tab test must use the real zoomed layout so only the editor leaf is mounted.
 
 **Step 2: Run test to verify it fails**
 
@@ -845,6 +1175,8 @@ Move the pane context metadata onto the focusable pane shell in `src/components/
   aria-label={`Pane: ${title || 'untitled'}`}
 >
 ```
+
+Keep the existing terminal and browser content roots as `data-context={ContextIds.Terminal}` and `data-context={ContextIds.Browser}` so their content menus continue to work.
 
 Then update `src/components/context-menu/ContextMenuProvider.tsx`:
 
@@ -878,19 +1210,20 @@ Run:
 npm run test:client -- test/unit/client/components/ContextMenuProvider.test.tsx
 ```
 
-Expected: PASS, including the zoomed-tab regression.
+Expected: PASS, including the zoomed-tab regression and the terminal/browser content-menu entry points.
 
 **Step 5: Commit**
 
 ```bash
 git add src/components/context-menu/ContextMenuProvider.tsx src/components/panes/Pane.tsx test/unit/client/components/ContextMenuProvider.test.tsx
-git commit -m "feat(ui): dispatch one-shot pane refresh requests"
+git commit -m "feat(ui): dispatch pane refresh requests from all pane menus"
 ```
 
-### Task 5: Refactor `BrowserPane` Refresh To Preserve Live Reload And Recover Error Screens
+### Task 5: Refactor `BrowserPane` Refresh To Preserve Live Reload, Track Browser Instances, And Avoid Mount-Time Double Work
 
 **Files:**
 - Modify: `src/components/panes/BrowserPane.tsx`
+- Modify: `src/components/panes/PaneContainer.tsx`
 - Test: `test/unit/client/components/panes/BrowserPane.test.tsx`
 
 **Step 1: Write the failing tests**
@@ -901,7 +1234,10 @@ Add real BrowserPane tests that verify the component’s actual DOM/API behavior
 import { requestPaneRefresh } from '@/store/panesSlice'
 
 it('toolbar Refresh reloads the live iframe document when an iframe exists', async () => {
-  renderBrowserPane({ url: 'https://example.com' })
+  renderBrowserPane({
+    url: 'https://example.com',
+    browserInstanceId: 'browser-1',
+  })
 
   const iframe = await screen.findByTitle('Browser content')
   const reloadSpy = vi.fn()
@@ -923,7 +1259,10 @@ it('toolbar Refresh retries forwarding when the pane is on a forwardError screen
     .mockRejectedValueOnce(new Error('Connection refused'))
     .mockResolvedValueOnce({ forwardedPort: 45678 })
 
-  renderBrowserPane({ url: 'http://localhost:3000' })
+  renderBrowserPane({
+    url: 'http://localhost:3000',
+    browserInstanceId: 'browser-1',
+  })
 
   await waitFor(() => expect(screen.getByText(/Failed to connect to localhost:3000/i)).toBeInTheDocument())
   expect(document.querySelector('iframe')).toBeNull()
@@ -936,13 +1275,39 @@ it('toolbar Refresh retries forwarding when the pane is on a forwardError screen
   })
 })
 
+it('clears a stale same-url refresh request for a different browser instance on mount', async () => {
+  setWindowHostname('192.168.1.100')
+  vi.mocked(api.post).mockResolvedValue({ forwardedPort: 45678 })
+
+  const store = createStoreWithPendingBrowserRefresh({
+    target: { kind: 'browser', browserInstanceId: 'browser-old' },
+    currentBrowserInstanceId: 'browser-new',
+  })
+
+  renderBrowserPane({
+    url: 'http://localhost:3000',
+    browserInstanceId: 'browser-new',
+  }, store)
+
+  await waitFor(() => {
+    expect(api.post).toHaveBeenCalledTimes(1)
+    expect(store.getState().panes.refreshRequestsByPane['tab-1']?.['pane-1']).toBeUndefined()
+  })
+})
+
 it('a pending refresh request present on first mount is consumed by the initial load path without a second forward attempt', async () => {
   setWindowHostname('192.168.1.100')
   vi.mocked(api.post).mockResolvedValue({ forwardedPort: 45678 })
 
-  const store = createStoreWithPendingBrowserRefresh()
+  const store = createStoreWithPendingBrowserRefresh({
+    target: { kind: 'browser', browserInstanceId: 'browser-1' },
+    currentBrowserInstanceId: 'browser-1',
+  })
 
-  renderBrowserPane({ url: 'http://localhost:3000' }, store)
+  renderBrowserPane({
+    url: 'http://localhost:3000',
+    browserInstanceId: 'browser-1',
+  }, store)
 
   await waitFor(() => {
     expect(api.post).toHaveBeenCalledTimes(1)
@@ -954,14 +1319,22 @@ it('consumed browser refresh requests do not add an extra load after remount', a
   setWindowHostname('192.168.1.100')
   vi.mocked(api.post).mockResolvedValue({ forwardedPort: 45678 })
 
-  const store = createStoreWithPendingBrowserRefresh()
+  const store = createStoreWithPendingBrowserRefresh({
+    target: { kind: 'browser', browserInstanceId: 'browser-1' },
+    currentBrowserInstanceId: 'browser-1',
+  })
 
-  const first = renderBrowserPane({ url: 'http://localhost:3000' }, store)
+  const first = renderBrowserPane({
+    url: 'http://localhost:3000',
+    browserInstanceId: 'browser-1',
+  }, store)
   await waitFor(() => expect(api.post).toHaveBeenCalledTimes(1))
-  expect(store.getState().panes.refreshRequestsByPane['tab-1']?.['pane-1']).toBeUndefined()
 
   first.unmount()
-  renderBrowserPane({ url: 'http://localhost:3000' }, store)
+  renderBrowserPane({
+    url: 'http://localhost:3000',
+    browserInstanceId: 'browser-1',
+  }, store)
 
   await waitFor(() => expect(api.post).toHaveBeenCalledTimes(2))
 })
@@ -972,7 +1345,10 @@ it('dispatching requestPaneRefresh uses the same refresh path as the toolbar but
     .mockRejectedValueOnce(new Error('Connection refused'))
     .mockResolvedValueOnce({ forwardedPort: 45678 })
 
-  const { store } = renderBrowserPane({ url: 'http://localhost:3000' })
+  const { store } = renderBrowserPane({
+    url: 'http://localhost:3000',
+    browserInstanceId: 'browser-1',
+  })
 
   await waitFor(() => expect(screen.getByText(/Failed to connect to localhost:3000/i)).toBeInTheDocument())
 
@@ -987,8 +1363,6 @@ it('dispatching requestPaneRefresh uses the same refresh path as the toolbar but
 })
 ```
 
-These tests must use the real BrowserPane behavior. Do not replace refresh with a fake `browserReload` spy.
-
 **Step 2: Run test to verify it fails**
 
 Run:
@@ -997,19 +1371,60 @@ Run:
 npm run test:client -- test/unit/client/components/panes/BrowserPane.test.tsx
 ```
 
-Expected: FAIL because the current `refresh()` is iframe-only, browser refresh requests are not target-specific enough, and there is no mount-aware consume/clear path for pane refresh requests.
+Expected: FAIL because BrowserPane has no browser instance token, the current `refresh()` is iframe-only, and there is no mount-aware consume/clear path for pane refresh requests.
 
 **Step 3: Write minimal implementation**
 
-Update `src/components/panes/BrowserPane.tsx` with three separate concepts:
+Thread `browserInstanceId` through the real component path:
 
-1. Select the pending refresh request:
+1. Update `PaneContainer.tsx`:
+
+```tsx
+<BrowserPane
+  paneId={paneId}
+  tabId={tabId}
+  url={content.url}
+  devToolsOpen={content.devToolsOpen}
+  browserInstanceId={content.browserInstanceId}
+/>
+```
+
+2. Update `BrowserPaneProps` and component signature:
+
+```ts
+interface BrowserPaneProps {
+  paneId: string
+  tabId: string
+  url: string
+  devToolsOpen: boolean
+  browserInstanceId: string
+}
+```
+
+3. Preserve `browserInstanceId` in every `updatePaneContent()` dispatch inside `BrowserPane`:
+
+```ts
+dispatch(updatePaneContent({
+  tabId,
+  paneId,
+  content: { kind: 'browser', browserInstanceId, url: fullUrl, devToolsOpen },
+}))
+```
+
+Apply the same preservation for:
+
+- `navigate`
+- `goBack`
+- `goForward`
+- `toggleDevTools`
+
+4. Select the pending refresh request:
 
 ```ts
 const pendingRefreshRequest = useAppSelector((s) => s.panes.refreshRequestsByPane[tabId]?.[paneId] ?? null)
 ```
 
-2. Preserve the current live-document reload path for mounted iframes:
+5. Preserve the current live-document reload path for mounted iframes:
 
 ```ts
 const reloadLiveIframe = useCallback(() => {
@@ -1029,7 +1444,7 @@ const reloadLiveIframe = useCallback(() => {
 }, [])
 ```
 
-3. Add a separate recovery path for error-screen states where no iframe exists:
+6. Add a separate recovery path for error-screen states where no iframe exists:
 
 ```ts
 const recoverBrowserPane = useCallback(() => {
@@ -1043,7 +1458,7 @@ const recoverBrowserPane = useCallback(() => {
 }, [currentUrl])
 ```
 
-Then make the single refresh entrypoint choose between them:
+7. Make the single refresh entrypoint choose between them:
 
 ```ts
 const refreshBrowser = useCallback(() => {
@@ -1052,12 +1467,7 @@ const refreshBrowser = useCallback(() => {
 }, [recoverBrowserPane, reloadLiveIframe])
 ```
 
-Keep using `forwardRetryKey` or rename it to `resolveAttemptKey`; either is fine, but the behavior must remain:
-
-- existing iframe -> reload the live document
-- no iframe because of `forwardError`/`loadError` -> clear errors and retry resolution
-
-Finally, add a mount-aware request-consumption effect below the existing resolve/load effect:
+8. Add a mount-aware request-consumption effect below the existing resolve/load effect:
 
 ```ts
 const refreshEffectArmedRef = useRef(false)
@@ -1073,13 +1483,18 @@ useEffect(() => {
   }
 
   if (!request) return
-  if (!paneRefreshTargetMatchesContent(request.target, { kind: 'browser', url, devToolsOpen })) {
+  if (!paneRefreshTargetMatchesContent(request.target, {
+    kind: 'browser',
+    browserInstanceId,
+    url,
+    devToolsOpen,
+  })) {
     dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: request.requestId }))
     return
   }
 
   if (isBrowserLoadInFlight) {
-    // A normal load/resolve path is already in progress for this URL.
+    // A normal load/resolve path is already in progress for this browser instance.
     dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: request.requestId }))
     return
   }
@@ -1092,6 +1507,7 @@ useEffect(() => {
   paneId,
   refreshBrowser,
   tabId,
+  browserInstanceId,
   url,
   devToolsOpen,
   isBrowserLoadInFlight,
@@ -1102,7 +1518,7 @@ Important constraints:
 
 - No `handledRefreshGenerationRef` pattern. The store consume/clear path is what makes the request one-shot.
 - The effect must be declared after the existing URL-resolution/port-forward effect so a pre-existing request on mount is satisfied by the normal first load instead of forcing a second `/api/proxy/forward` call.
-- Browser requests must target the stored browser URL (`{ kind: 'browser', url }`) so navigation/back/forward and cross-tab layout replacement can invalidate stale requests correctly.
+- Browser requests must target `{ kind: 'browser', browserInstanceId }`, not URL equality, so same-url browser-to-browser swaps and cross-tab hydration can invalidate stale requests correctly while same-instance navigation keeps the request attached to the right browser instance.
 - If a request arrives while a normal load is already in flight and there is still no iframe or error screen, consume it without extra work; the in-flight load already satisfies the refresh.
 - Keep the toolbar Refresh button and the registered browser action (`reload`) pointed at the same `refreshBrowser()` helper.
 - Do not force a new iframe from the last saved Redux URL when a live iframe exists. That would regress in-iframe navigation reload behavior.
@@ -1120,8 +1536,8 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add src/components/panes/BrowserPane.tsx test/unit/client/components/panes/BrowserPane.test.tsx
-git commit -m "fix(browser): make pane refresh one-shot and error-safe"
+git add src/components/panes/BrowserPane.tsx src/components/panes/PaneContainer.tsx test/unit/client/components/panes/BrowserPane.test.tsx
+git commit -m "fix(browser): make pane refresh instance-safe and mount-safe"
 ```
 
 ### Task 6: Make `TerminalView` Consume Requests Without Double-Attach On Mount
@@ -1232,8 +1648,6 @@ it('consumed refresh requests do not replay after App view remounts the terminal
 })
 ```
 
-That third test is the mount-order regression: a pre-existing request on mount must not produce `detach -> attach(viewport) -> attach(keepalive)` on the same mount.
-
 **Step 2: Run test to verify it fails**
 
 Run:
@@ -1248,7 +1662,7 @@ Expected: FAIL because `TerminalView` has no request consume/clear path and no m
 
 Update `src/components/TerminalView.tsx` in three parts.
 
-1. Select the pending request and add a small helper for terminal-specific target validation:
+1. Select the pending request:
 
 ```ts
 const pendingRefreshRequest = useAppSelector((s) => s.panes.refreshRequestsByPane[tabId]?.[paneId] ?? null)
@@ -1341,7 +1755,7 @@ git add src/components/TerminalView.tsx test/unit/client/components/TerminalView
 git commit -m "fix(terminals): make pane refresh one-shot and mount-safe"
 ```
 
-### Task 7: Add A Zoomed-Tab One-Shot Refresh Regression Flow
+### Task 7: Add A Zoomed-Tab Refresh Regression Flow
 
 **Files:**
 - Create: `test/e2e/refresh-context-menu-flow.test.tsx`
@@ -1384,7 +1798,7 @@ describe('refresh context menu flow', () => {
 
     expect(store.getState().panes.refreshRequestsByPane['tab-1']['pane-browser']).toMatchObject({
       requestId: expect.any(String),
-      target: { kind: 'browser', url: 'http://localhost:3000' },
+      target: { kind: 'browser', browserInstanceId: 'browser-1' },
     })
 
     store.dispatch(toggleZoom({ tabId: 'tab-1', paneId: 'pane-editor' }))
@@ -1428,7 +1842,7 @@ Expected: FAIL until Tasks 2-6 are complete.
 Finish the test with the real store shape and mocks that the app already uses. The important assertions are:
 
 - `Refresh tab` remains enabled while only the zoomed editor leaf is mounted.
-- Clicking it stores one-shot refresh requests for hidden refreshable siblings.
+- Clicking it stores one-shot refresh requests for hidden actionable siblings.
 - Unzooming later causes the previously skipped browser sibling to claim and consume its request while performing only the single normal mount load for that pane.
 - Remounting the same tab contents afterward performs one normal browser load for the remount, not an extra replay of the already-consumed refresh request.
 
@@ -1471,9 +1885,11 @@ Expected final state:
 
 - Right-clicking a tab shows `Refresh tab`.
 - Right-clicking a pane header shows `Refresh pane`.
-- Menu enablement depends on the stored pane content kinds, not mounted component registries.
-- `Refresh Tab` creates requests for every terminal/browser leaf in the tab’s layout tree, even in zoomed tabs where siblings are currently unmounted.
-- Refresh requests are one-shot: panes explicitly consume them, targets are specific enough to detect stale browser URLs and stale terminal sessions, and layout reconciliation clears invalid requests after content swaps, updates, and hydration.
+- Right-clicking terminal and browser pane content also shows `Refresh pane` alongside the existing pane-level split/replace actions.
+- Menu enablement depends on the stored pane content/actionability, not mounted component registries.
+- `Refresh Tab` creates requests for every actionable terminal/browser leaf in the tab’s layout tree, even in zoomed tabs where siblings are currently unmounted.
+- Menu enablement and request creation only apply to actionable pane states, so empty browser panes and terminals without a live `terminalId` do not surface guaranteed no-op refresh actions.
+- Refresh requests are one-shot: panes explicitly consume them, targets are specific enough to distinguish stale browser instances and stale terminal sessions, and layout reconciliation clears invalid requests after content swaps, updates, and hydration.
 - Browser panes preserve live-document reload when an iframe exists, recover from `forwardError`/`loadError` when no iframe exists, and fold mount-time refresh requests into the normal initial browser load instead of starting redundant retry/load work.
 - Terminal panes refresh through exactly one detach/attach decision per mount, with visible panes using full replay and hidden panes preserving the deferred-hydration path.
 - Refresh bookkeeping is ephemeral and is not persisted to localStorage.
