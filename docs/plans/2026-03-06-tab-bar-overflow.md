@@ -618,7 +618,9 @@ git commit -m "feat(hooks): add useTabBarScroll hook with callback ref, overflow
 
 **Step 1: Write a failing test asserting the "+" button is outside the scroll container**
 
-In `test/unit/client/components/TabBar.test.tsx`, add a new test in the `rendering` describe block:
+In `test/unit/client/components/TabBar.test.tsx`, add a new test in the `rendering` describe block.
+
+The selector must match an element that currently exists in the DOM (before the restructuring) to ensure the test genuinely fails RED first. The current scrollable container uses `.overflow-x-auto`, and the "+" button is inside it. After restructuring, the button moves outside, so `.closest('.overflow-x-auto')` will return `null`.
 
 ```ts
     it('renders the + button outside the scrollable tab container', () => {
@@ -628,9 +630,11 @@ In `test/unit/client/components/TabBar.test.tsx`, add a new test in the `renderi
       renderWithStore(<TabBar />, store)
 
       const addButton = screen.getByTitle('New shell tab')
-      const scrollContainer = addButton.closest('.scrollbar-none')
+      // Use overflow-x-auto to find the scrollable container -- this class exists
+      // on the scroll strip both before and after the change.
+      const scrollContainer = addButton.closest('.overflow-x-auto')
 
-      // The + button should NOT be inside the scrollbar-none container
+      // The + button should NOT be inside the scrollable container
       expect(scrollContainer).toBeNull()
     })
 ```
@@ -641,7 +645,7 @@ Run:
 ```bash
 npx vitest run test/unit/client/components/TabBar.test.tsx
 ```
-Expected: FAIL -- the "+" button is currently inside the scrollable container.
+Expected: FAIL -- the "+" button is currently inside the `.overflow-x-auto` scrollable container, so `.closest('.overflow-x-auto')` returns a non-null element and the `toBeNull()` assertion fails.
 
 **Step 3: Restructure TabBar.tsx**
 
