@@ -226,7 +226,7 @@ describe('useTabBarScroll', () => {
       expect(result.current.canScrollRight).toBe(false)
     })
 
-    it('updates overflow when scroll event fires', () => {
+    it('updates overflow when scroll event fires (rAF-throttled)', async () => {
       const el = createMockScrollContainer({ scrollWidth: 500, clientWidth: 300, scrollLeft: 0 })
 
       const { result } = renderHook(() => useTabBarScroll(null, 5))
@@ -237,10 +237,16 @@ describe('useTabBarScroll', () => {
 
       expect(result.current.canScrollLeft).toBe(false)
 
-      // Simulate scrolling
+      // Simulate scrolling -- the handler is rAF-throttled, so we need to
+      // flush the queued animation frame for the state update to land.
       act(() => {
         Object.defineProperty(el, 'scrollLeft', { value: 50, configurable: true })
         el.dispatchEvent(new Event('scroll'))
+      })
+
+      // Flush the rAF callback that was queued by the scroll handler
+      await act(async () => {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
       })
 
       expect(result.current.canScrollLeft).toBe(true)

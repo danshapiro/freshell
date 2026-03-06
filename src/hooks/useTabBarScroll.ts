@@ -48,8 +48,15 @@ export function useTabBarScroll(activeTabId: string | null, tabCount: number): T
       return
     }
 
-    // Set up scroll listener
-    const handleScroll = () => updateOverflow(node)
+    // Set up rAF-throttled scroll listener so we update at most once per frame
+    let rafId: number | null = null
+    const handleScroll = () => {
+      if (rafId !== null) return
+      rafId = requestAnimationFrame(() => {
+        rafId = null
+        updateOverflow(node)
+      })
+    }
     node.addEventListener('scroll', handleScroll, { passive: true })
 
     // Set up ResizeObserver
@@ -59,6 +66,7 @@ export function useTabBarScroll(activeTabId: string | null, tabCount: number): T
     // Store cleanup function
     cleanupRef.current = () => {
       node.removeEventListener('scroll', handleScroll)
+      if (rafId !== null) cancelAnimationFrame(rafId)
       observer.disconnect()
     }
 
@@ -89,7 +97,7 @@ export function useTabBarScroll(activeTabId: string | null, tabCount: number): T
     const el = nodeRef.current
     if (!el) return
 
-    const tabEl = el.querySelector(`[data-tab-id="${tabId}"]`) as HTMLElement | null
+    const tabEl = el.querySelector(`[data-tab-id="${CSS.escape(tabId)}"]`) as HTMLElement | null
     if (!tabEl) return
 
     const containerRect = el.getBoundingClientRect()
