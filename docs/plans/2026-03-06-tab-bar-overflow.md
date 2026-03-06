@@ -952,67 +952,195 @@ git commit -m "feat(TabBar): restructure layout to pin + button outside scrollab
 ### Task 4: Add tests for overflow indicators in TabBar
 
 **Files:**
-- Modify: `test/unit/client/components/TabBar.test.tsx`
+- Create: `test/unit/client/components/TabBar.overflow.test.tsx`
 
-**Step 1: Write tests for overflow indicator visibility**
+These tests need to **mock `useTabBarScroll`** to force `canScrollLeft` and `canScrollRight` to specific values, because JSDOM does not compute real layout dimensions (`scrollWidth` and `clientWidth` are always 0). Without mocking, the gradient divs never render, and the tests pass vacuously.
 
-Add a new describe block in `TabBar.test.tsx`:
+**Step 1: Write tests for overflow indicator rendering**
+
+Create `test/unit/client/components/TabBar.overflow.test.tsx`:
 
 ```ts
-  describe('overflow indicators', () => {
-    it('does not render overflow indicators when tabs fit', () => {
-      const tab = createTab({ id: 'tab-1', title: 'Tab 1' })
-      const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { render, screen, cleanup } from '@testing-library/react'
+import { configureStore } from '@reduxjs/toolkit'
+import { Provider } from 'react-redux'
+import TabBar from '@/components/TabBar'
+import tabsReducer from '@/store/tabsSlice'
+import codingCliReducer from '@/store/codingCliSlice'
+import panesReducer from '@/store/panesSlice'
+import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
+import turnCompletionReducer from '@/store/turnCompletionSlice'
+import type { Tab } from '@/store/types'
 
-      const { container } = renderWithStore(<TabBar />, store)
+// Mock the ws-client module
+vi.mock('@/lib/ws-client', () => ({
+  getWsClient: () => ({ send: vi.fn() }),
+}))
 
-      // No gradient overlays should be rendered (only the bottom separator is aria-hidden)
-      const gradients = container.querySelectorAll('.bg-gradient-to-r, .bg-gradient-to-l')
-      expect(gradients).toHaveLength(0)
-    })
+// Mock useTabBarScroll to control overflow state
+const mockCallbackRef = vi.fn()
+const mockScrollToTab = vi.fn()
+let mockCanScrollLeft = false
+let mockCanScrollRight = false
 
-    it('overflow indicators are decorative (aria-hidden)', () => {
-      // This test verifies the structure -- the actual overflow state
-      // depends on scrollWidth/clientWidth which JSDOM doesn't compute.
-      // We verify the indicators have aria-hidden when rendered.
-      // Full overflow behavior is covered by useTabBarScroll hook tests.
-      const tab = createTab({ id: 'tab-1', title: 'Tab 1' })
-      const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
+vi.mock('@/hooks/useTabBarScroll', () => ({
+  useTabBarScroll: () => ({
+    callbackRef: mockCallbackRef,
+    canScrollLeft: mockCanScrollLeft,
+    canScrollRight: mockCanScrollRight,
+    scrollToTab: mockScrollToTab,
+  }),
+}))
 
-      const { container } = renderWithStore(<TabBar />, store)
+function createTab(overrides: Partial<Tab> = {}): Tab {
+  return {
+    id: `tab-${Math.random().toString(36).slice(2)}`,
+    createRequestId: 'req-1',
+    title: 'Terminal 1',
+    status: 'running',
+    mode: 'shell',
+    shell: 'system',
+    createdAt: Date.now(),
+    ...overrides,
+  }
+}
 
-      // The bottom separator line should be aria-hidden
-      const separators = container.querySelectorAll('[aria-hidden="true"]')
-      expect(separators.length).toBeGreaterThanOrEqual(1)
-    })
-
-    it('+ button remains keyboard-reachable outside scroll area', () => {
-      const tab = createTab({ id: 'tab-1', title: 'Tab 1' })
-      const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
-
-      renderWithStore(<TabBar />, store)
-
-      const addButton = screen.getByRole('button', { name: 'New shell tab' })
-      expect(addButton).toBeInTheDocument()
-      // Button should be a real <button> element (inherently keyboard-focusable)
-      expect(addButton.tagName).toBe('BUTTON')
-    })
+function createStore(initialState: { tabs: Tab[]; activeTabId: string | null }) {
+  return configureStore({
+    reducer: {
+      tabs: tabsReducer,
+      codingCli: codingCliReducer,
+      panes: panesReducer,
+      settings: settingsReducer,
+      turnCompletion: turnCompletionReducer,
+    },
+    preloadedState: {
+      tabs: { tabs: initialState.tabs, activeTabId: initialState.activeTabId, renameRequestTabId: null },
+      codingCli: { sessions: {}, pendingRequests: {} },
+      panes: { layouts: {}, activePane: {}, paneTitles: {} },
+      settings: { settings: defaultSettings, loaded: true },
+      turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+    },
   })
+}
+
+function renderWithStore(ui: React.ReactElement, store: ReturnType<typeof createStore>) {
+  return render(<Provider store={store}>{ui}</Provider>)
+}
+
+describe('TabBar overflow indicators', () => {
+  beforeEach(() => {
+    mockCanScrollLeft = false
+    mockCanScrollRight = false
+    mockCallbackRef.mockClear()
+    mockScrollToTab.mockClear()
+  })
+
+  afterEach(() => cleanup())
+
+  it('renders no gradient overlays when both canScrollLeft and canScrollRight are false', () => {
+    mockCanScrollLeft = false
+    mockCanScrollRight = false
+
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
+    const { container } = renderWithStore(<TabBar />, store)
+
+    const leftGradient = container.querySelector('.bg-gradient-to-r')
+    const rightGradient = container.querySelector('.bg-gradient-to-l')
+    expect(leftGradient).toBeNull()
+    expect(rightGradient).toBeNull()
+  })
+
+  it('renders right gradient when canScrollRight is true', () => {
+    mockCanScrollLeft = false
+    mockCanScrollRight = true
+
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
+    const { container } = renderWithStore(<TabBar />, store)
+
+    const leftGradient = container.querySelector('.bg-gradient-to-r')
+    const rightGradient = container.querySelector('.bg-gradient-to-l')
+    expect(leftGradient).toBeNull()
+    expect(rightGradient).not.toBeNull()
+    expect(rightGradient?.getAttribute('aria-hidden')).toBe('true')
+    expect(rightGradient?.className).toContain('pointer-events-none')
+  })
+
+  it('renders left gradient when canScrollLeft is true', () => {
+    mockCanScrollLeft = true
+    mockCanScrollRight = false
+
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
+    const { container } = renderWithStore(<TabBar />, store)
+
+    const leftGradient = container.querySelector('.bg-gradient-to-r')
+    const rightGradient = container.querySelector('.bg-gradient-to-l')
+    expect(leftGradient).not.toBeNull()
+    expect(leftGradient?.getAttribute('aria-hidden')).toBe('true')
+    expect(leftGradient?.className).toContain('pointer-events-none')
+    expect(rightGradient).toBeNull()
+  })
+
+  it('renders both gradients when both overflow directions are true', () => {
+    mockCanScrollLeft = true
+    mockCanScrollRight = true
+
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
+    const { container } = renderWithStore(<TabBar />, store)
+
+    const leftGradient = container.querySelector('.bg-gradient-to-r')
+    const rightGradient = container.querySelector('.bg-gradient-to-l')
+    expect(leftGradient).not.toBeNull()
+    expect(rightGradient).not.toBeNull()
+    expect(leftGradient?.getAttribute('aria-hidden')).toBe('true')
+    expect(rightGradient?.getAttribute('aria-hidden')).toBe('true')
+  })
+
+  it('gradient overlays are non-interactive (pointer-events-none)', () => {
+    mockCanScrollLeft = true
+    mockCanScrollRight = true
+
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
+    const { container } = renderWithStore(<TabBar />, store)
+
+    const leftGradient = container.querySelector('.bg-gradient-to-r')
+    const rightGradient = container.querySelector('.bg-gradient-to-l')
+    expect(leftGradient?.className).toContain('pointer-events-none')
+    expect(rightGradient?.className).toContain('pointer-events-none')
+  })
+
+  it('+ button remains keyboard-reachable outside scroll area', () => {
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
+    renderWithStore(<TabBar />, store)
+
+    const addButton = screen.getByRole('button', { name: 'New shell tab' })
+    expect(addButton).toBeInTheDocument()
+    // Button should be a real <button> element (inherently keyboard-focusable)
+    expect(addButton.tagName).toBe('BUTTON')
+  })
+})
 ```
 
 **Step 2: Run test to verify GREEN**
 
 Run:
 ```bash
-npx vitest run test/unit/client/components/TabBar.test.tsx
+npx vitest run test/unit/client/components/TabBar.overflow.test.tsx
 ```
 Expected: PASS
 
 **Step 3: Commit**
 
 ```bash
-git add test/unit/client/components/TabBar.test.tsx
-git commit -m "test(TabBar): add tests for overflow indicators and pinned + button accessibility"
+git add test/unit/client/components/TabBar.overflow.test.tsx
+git commit -m "test(TabBar): add overflow indicator tests with mocked useTabBarScroll"
 ```
 
 ---
@@ -1217,7 +1345,8 @@ git commit -m "refactor(TabBar): clean up overflow hook and indicator implementa
 | `src/hooks/useTabBarScroll.ts` | Create | Hook with callback ref for overflow detection, auto-scroll via getBoundingClientRect |
 | `src/components/TabBar.tsx` | Modify | Restructure layout: scrollable tabs + pinned "+" button + overflow indicators |
 | `test/unit/client/hooks/useTabBarScroll.test.ts` | Create | Unit tests for the scroll hook (callback ref lifecycle, overflow, scrollToTab, auto-scroll) |
-| `test/unit/client/components/TabBar.test.tsx` | Modify | Update structural tests, add overflow/a11y tests |
+| `test/unit/client/components/TabBar.test.tsx` | Modify | Update structural tests (scrollbar-none, + button outside scroll area) |
+| `test/unit/client/components/TabBar.overflow.test.tsx` | Create | Overflow indicator rendering tests with mocked `useTabBarScroll` |
 
 ## Key Design Decisions
 
