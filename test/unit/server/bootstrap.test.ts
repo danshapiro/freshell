@@ -137,15 +137,18 @@ describe('bootstrap module', () => {
 
       expect(origins).toContain('http://localhost:5173')
       expect(origins).toContain('http://localhost:3001')
+      expect(origins).toContain('http://localhost:3002')
       expect(origins).toContain('http://127.0.0.1:5173')
       expect(origins).toContain('http://127.0.0.1:3001')
+      expect(origins).toContain('http://127.0.0.1:3002')
     })
 
-    it('includes LAN IP origins for both ports', () => {
+    it('includes LAN IP origins for all ports', () => {
       const origins = buildAllowedOrigins(['192.168.1.100'])
 
       expect(origins).toContain('http://192.168.1.100:5173')
       expect(origins).toContain('http://192.168.1.100:3001')
+      expect(origins).toContain('http://192.168.1.100:3002')
     })
 
     it('includes multiple LAN IPs', () => {
@@ -153,8 +156,10 @@ describe('bootstrap module', () => {
 
       expect(origins).toContain('http://192.168.1.100:5173')
       expect(origins).toContain('http://192.168.1.100:3001')
+      expect(origins).toContain('http://192.168.1.100:3002')
       expect(origins).toContain('http://10.0.0.5:5173')
       expect(origins).toContain('http://10.0.0.5:3001')
+      expect(origins).toContain('http://10.0.0.5:3002')
     })
 
     it('returns comma-separated string format', () => {

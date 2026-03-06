@@ -158,19 +158,22 @@ export function generateAuthToken(): string {
 
 /**
  * Build ALLOWED_ORIGINS string from localhost + LAN IPs.
- * Includes both dev port (5173) and production port (3001).
+ * Includes dev ports (5173, 3002) and production port (3001).
  */
 export function buildAllowedOrigins(lanIps: string[]): string {
   const origins: string[] = [
     'http://localhost:5173',
     'http://localhost:3001',
+    'http://localhost:3002',
     'http://127.0.0.1:5173',
     'http://127.0.0.1:3001',
+    'http://127.0.0.1:3002',
   ]
 
   for (const ip of lanIps) {
     origins.push(`http://${ip}:5173`)
     origins.push(`http://${ip}:3001`)
+    origins.push(`http://${ip}:3002`)
   }
 
   return origins.join(',')

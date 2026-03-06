@@ -130,6 +130,7 @@ describe('auth module', () => {
       const origins = parseAllowedOrigins()
       expect(origins).toContain('http://localhost:5173')
       expect(origins).toContain('http://localhost:3001')
+      expect(origins).toContain('http://localhost:3002')
     })
 
     it('parses comma-separated ALLOWED_ORIGINS', () => {
