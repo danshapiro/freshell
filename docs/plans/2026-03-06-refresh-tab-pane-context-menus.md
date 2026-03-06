@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task.
 
-**Goal:** Add `Refresh Tab` and `Refresh Pane` to the existing right-click context menus so browser panes reload in place and terminal panes recover by re-establishing the frontend connection to the existing pane session, including tabs that are currently zoomed.
+**Goal:** Add `Refresh Tab` and `Refresh Pane` to the existing right-click context menus so browser panes reload or recover in place and terminal panes re-establish their frontend connection to the existing pane session, including tabs that are currently zoomed.
 
-**Architecture:** Make refresh state-driven, not mounted-component-driven. Add an ephemeral `refreshByPane` generation map to `panesSlice`, plus reducers that mark one pane or every refreshable leaf in a tab’s stored layout tree for refresh regardless of what `PaneLayout` is currently mounting. `TerminalView` and `BrowserPane` will subscribe to their pane’s refresh generation and execute the real recovery logic themselves: terminals send detach plus attach with the existing broker helpers, and browsers use a new state-driven reload primitive that retries both live iframes and error screens. `ContextMenuProvider` and `menu-defs` should only determine whether a pane is refreshable from layout content kinds, then dispatch refresh requests; they must not depend on action registries for correctness.
+**Architecture:** Make refresh state-driven but one-shot. Store at most one pending refresh request per pane in `panesSlice`, keyed by a unique `requestId` plus a target snapshot derived from the pane’s current content; menus dispatch those requests from the stored layout tree, and panes explicitly consume or clear them so refresh never replays across later remounts. Browser panes must preserve the current live-document reload path when an iframe exists and only fall back to state-reset recovery when the pane is already on an error screen; terminal refresh must be folded into the existing attach lifecycle so a mount with a pending request performs exactly one detach/attach sequence instead of racing the normal mount attach.
 
 **Tech Stack:** React 18, Redux Toolkit, TypeScript, xterm.js, Vitest, Testing Library
 
@@ -14,8 +14,10 @@
 
 - `Refresh Pane` belongs on the pane chrome context menu (`ContextIds.Pane`), not the inner terminal/browser/editor content menus.
 - `Refresh Tab` must iterate the entire stored tab layout tree, not just currently mounted leaves.
-- `PaneLayout` renders only the zoomed leaf when a tab is zoomed (`src/components/panes/PaneLayout.tsx:66-72`), so refresh cannot be implemented by asking mounted components what actions they currently expose.
+- `PaneLayout` renders only the zoomed leaf when a tab is zoomed (`src/components/panes/PaneLayout.tsx:66-72`), so menu enablement and request creation must come from stored layout state, not mounted-pane registries.
 - Refresh requests must be ephemeral UI/runtime state like `renameRequest*` and `zoomedPane`, not persisted to localStorage.
+- Refresh must be a one-shot consume/ack flow. A request may stay pending while a pane is unmounted, but once a pane claims it, the request must be removed from Redux so later remounts do not replay it.
+- Pane IDs are reused across replacement/content changes, so each refresh request needs a target snapshot and the slice must clear stale requests when pane content changes enough that the request no longer applies.
 - Refreshable pane kinds for this issue:
   - `terminal`
   - `browser`
@@ -24,24 +26,28 @@
   - `picker`
   - `agent-chat`
   - `extension`
-- Mounted panes should refresh immediately.
-- Unmounted panes in a zoomed tab should receive a pending refresh request and execute it when they next mount; this is how `Refresh Tab` remains correct in zoomed layouts.
-- Browser refresh must use the same robust primitive for the toolbar button, registered browser action, pane context menu, and deferred refresh requests.
+- Browser refresh must preserve the existing `iframe.contentWindow?.location.reload()` behavior when an iframe exists. Recreating the iframe from the stored Redux URL is only the recovery path when the iframe is missing because the pane is on an error screen.
+- Terminal refresh must not add a second attach path on mount. A pre-existing pending refresh request on mount must replace the normal mount attach, not run before it.
 - No server-side protocol changes are needed.
 - No `docs/index.html` update is required; this is not a major UI mock change.
 
-### Task 1: Add Shared Pane Refreshability Helpers
+### Task 1: Add Shared Pane Refresh Helpers
 
 **Files:**
-- Modify: `src/lib/pane-utils.ts:1-54`
-- Test: `test/unit/client/lib/pane-utils.test.ts:1-45`
+- Modify: `src/lib/pane-utils.ts`
+- Test: `test/unit/client/lib/pane-utils.test.ts`
 
 **Step 1: Write the failing test**
 
-Extend `test/unit/client/lib/pane-utils.test.ts` with refreshability coverage alongside the existing leaf traversal tests:
+Extend `test/unit/client/lib/pane-utils.test.ts` with helpers that the slice and panes can share:
 
 ```ts
-import { collectPaneLeaves, isRefreshablePaneContent } from '@/lib/pane-utils'
+import {
+  buildPaneRefreshTarget,
+  collectPaneLeaves,
+  isRefreshablePaneContent,
+  paneRefreshTargetMatchesContent,
+} from '@/lib/pane-utils'
 
 describe('collectPaneLeaves', () => {
   it('returns leaf ids in tree order', () => {
@@ -54,15 +60,45 @@ describe('collectPaneLeaves', () => {
   })
 })
 
-describe('isRefreshablePaneContent', () => {
-  it('returns true for terminal and browser panes', () => {
-    expect(isRefreshablePaneContent(shellContent)).toBe(true)
-    expect(isRefreshablePaneContent(browserContent)).toBe(true)
+describe('buildPaneRefreshTarget', () => {
+  it('returns a terminal target keyed by createRequestId', () => {
+    expect(buildPaneRefreshTarget({
+      kind: 'terminal',
+      mode: 'shell',
+      createRequestId: 'req-1',
+      status: 'running',
+    })).toEqual({ kind: 'terminal', createRequestId: 'req-1' })
   })
 
-  it('returns false for editor and picker panes', () => {
-    expect(isRefreshablePaneContent(editorContent)).toBe(false)
-    expect(isRefreshablePaneContent({ kind: 'picker' })).toBe(false)
+  it('returns a browser target for browser panes', () => {
+    expect(buildPaneRefreshTarget(browserContent)).toEqual({ kind: 'browser' })
+  })
+
+  it('returns null for non-refreshable panes', () => {
+    expect(buildPaneRefreshTarget(editorContent)).toBeNull()
+  })
+})
+
+describe('paneRefreshTargetMatchesContent', () => {
+  it('matches a terminal target only when createRequestId still matches', () => {
+    expect(
+      paneRefreshTargetMatchesContent(
+        { kind: 'terminal', createRequestId: 'req-1' },
+        { kind: 'terminal', mode: 'shell', createRequestId: 'req-1', status: 'running' },
+      ),
+    ).toBe(true)
+
+    expect(
+      paneRefreshTargetMatchesContent(
+        { kind: 'terminal', createRequestId: 'req-1' },
+        { kind: 'terminal', mode: 'shell', createRequestId: 'req-2', status: 'running' },
+      ),
+    ).toBe(false)
+  })
+
+  it('matches browser targets only for browser content', () => {
+    expect(paneRefreshTargetMatchesContent({ kind: 'browser' }, browserContent)).toBe(true)
+    expect(paneRefreshTargetMatchesContent({ kind: 'browser' }, editorContent)).toBe(false)
   })
 })
 ```
@@ -75,13 +111,15 @@ Run:
 npm run test:client -- test/unit/client/lib/pane-utils.test.ts
 ```
 
-Expected: FAIL because `collectPaneLeaves` and `isRefreshablePaneContent` are not exported yet.
+Expected: FAIL because the refresh-target helpers are not exported yet.
 
 **Step 3: Write minimal implementation**
 
 Update `src/lib/pane-utils.ts`:
 
 ```ts
+import type { PaneContent, PaneNode, PaneRefreshTarget } from '@/store/paneTypes'
+
 export function collectPaneLeaves(node: PaneNode): Array<Extract<PaneNode, { type: 'leaf' }>> {
   if (node.type === 'leaf') return [node]
   return [...collectPaneLeaves(node.children[0]), ...collectPaneLeaves(node.children[1])]
@@ -90,9 +128,30 @@ export function collectPaneLeaves(node: PaneNode): Array<Extract<PaneNode, { typ
 export function isRefreshablePaneContent(content: PaneContent): boolean {
   return content.kind === 'terminal' || content.kind === 'browser'
 }
+
+export function buildPaneRefreshTarget(content: PaneContent): PaneRefreshTarget | null {
+  if (content.kind === 'terminal') {
+    return { kind: 'terminal', createRequestId: content.createRequestId }
+  }
+  if (content.kind === 'browser') {
+    return { kind: 'browser' }
+  }
+  return null
+}
+
+export function paneRefreshTargetMatchesContent(
+  target: PaneRefreshTarget,
+  content: PaneContent | null | undefined,
+): boolean {
+  if (!content) return false
+  if (target.kind === 'terminal') {
+    return content.kind === 'terminal' && content.createRequestId === target.createRequestId
+  }
+  return content.kind === 'browser'
+}
 ```
 
-Keep `findPaneContent` and `collectPaneContents` as-is; they are still used elsewhere.
+Keep the existing non-refresh helpers in place.
 
 **Step 4: Run test to verify it passes**
 
@@ -108,33 +167,47 @@ Expected: PASS.
 
 ```bash
 git add src/lib/pane-utils.ts test/unit/client/lib/pane-utils.test.ts
-git commit -m "test(panes): add shared refreshability helpers"
+git commit -m "test(panes): add pane refresh target helpers"
 ```
 
-### Task 2: Add Ephemeral Refresh Requests To `panesSlice`
+### Task 2: Add One-Shot Pane Refresh Requests To `panesSlice`
 
 **Files:**
-- Modify: `src/store/paneTypes.ts:168-205`
+- Modify: `src/store/paneTypes.ts`
 - Modify: `src/store/panesSlice.ts`
-- Modify: `src/store/persistMiddleware.ts:303-321`
-- Test: `test/unit/client/store/panesSlice.test.ts:1-120`
-- Test: `test/unit/client/store/panesPersistence.test.ts:1-120`
+- Modify: `src/store/persistMiddleware.ts`
+- Test: `test/unit/client/store/panesSlice.test.ts`
+- Test: `test/unit/client/store/panesPersistence.test.ts`
 
 **Step 1: Write the failing tests**
 
-Add reducer tests to `test/unit/client/store/panesSlice.test.ts`:
+Add reducer coverage to `test/unit/client/store/panesSlice.test.ts`:
 
 ```ts
-import { requestPaneRefresh, requestTabRefresh } from '../../../../src/store/panesSlice'
+import {
+  consumePaneRefreshRequest,
+  requestPaneRefresh,
+  requestTabRefresh,
+  replacePane,
+  updatePaneContent,
+} from '../../../../src/store/panesSlice'
 
 describe('requestPaneRefresh', () => {
-  it('increments refresh generation for a terminal pane', () => {
+  it('stores a one-shot terminal refresh request keyed by createRequestId', () => {
     const state = panesReducer(
-      stateWithLeaf('pane-term', { kind: 'terminal', mode: 'shell' }),
+      stateWithLeaf('pane-term', {
+        kind: 'terminal',
+        mode: 'shell',
+        createRequestId: 'req-1',
+        status: 'running',
+      }),
       requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-term' }),
     )
 
-    expect(state.refreshByPane['tab-1']['pane-term']).toBe(1)
+    expect(state.refreshRequestsByPane['tab-1']['pane-term']).toMatchObject({
+      requestId: expect.any(String),
+      target: { kind: 'terminal', createRequestId: 'req-1' },
+    })
   })
 
   it('does not create refresh state for unsupported panes', () => {
@@ -143,27 +216,104 @@ describe('requestPaneRefresh', () => {
       requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-editor' }),
     )
 
-    expect(state.refreshByPane['tab-1']).toBeUndefined()
+    expect(state.refreshRequestsByPane['tab-1']).toBeUndefined()
   })
 })
 
 describe('requestTabRefresh', () => {
-  it('increments every refreshable leaf in the stored layout tree', () => {
+  it('stores requests for every refreshable leaf in a zoomed layout tree', () => {
     const state = panesReducer(
       stateWithLayoutAndZoom({
         layout: split([
-          leaf('pane-term', shellContent),
-          split([leaf('pane-browser', browserContent), leaf('pane-editor', editorContent)]),
+          leaf('pane-editor', editorContent),
+          split([
+            leaf('pane-term', {
+              kind: 'terminal',
+              mode: 'shell',
+              createRequestId: 'req-term',
+              status: 'running',
+            }),
+            leaf('pane-browser', browserContent),
+          ]),
         ]),
         zoomedPaneId: 'pane-editor',
       }),
       requestTabRefresh({ tabId: 'tab-1' }),
     )
 
-    expect(state.refreshByPane['tab-1']).toEqual({
-      'pane-term': 1,
-      'pane-browser': 1,
+    expect(Object.keys(state.refreshRequestsByPane['tab-1']).sort()).toEqual(['pane-browser', 'pane-term'])
+    expect(state.refreshRequestsByPane['tab-1']['pane-term'].target).toEqual({
+      kind: 'terminal',
+      createRequestId: 'req-term',
     })
+    expect(state.refreshRequestsByPane['tab-1']['pane-browser'].target).toEqual({ kind: 'browser' })
+  })
+})
+
+describe('consumePaneRefreshRequest', () => {
+  it('removes the matching request and ignores stale requestIds', () => {
+    const start = panesReducer(
+      stateWithLeaf('pane-browser', browserContent),
+      requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-browser' }),
+    )
+
+    const requestId = start.refreshRequestsByPane['tab-1']['pane-browser'].requestId
+
+    const ignored = panesReducer(
+      start,
+      consumePaneRefreshRequest({ tabId: 'tab-1', paneId: 'pane-browser', requestId: 'wrong-id' }),
+    )
+    expect(ignored.refreshRequestsByPane['tab-1']['pane-browser'].requestId).toBe(requestId)
+
+    const consumed = panesReducer(
+      start,
+      consumePaneRefreshRequest({ tabId: 'tab-1', paneId: 'pane-browser', requestId }),
+    )
+    expect(consumed.refreshRequestsByPane['tab-1']?.['pane-browser']).toBeUndefined()
+  })
+})
+
+describe('refresh request reconciliation', () => {
+  it('clears a pending terminal request when the pane gets a new createRequestId', () => {
+    const requested = panesReducer(
+      stateWithLeaf('pane-term', {
+        kind: 'terminal',
+        mode: 'shell',
+        createRequestId: 'req-1',
+        status: 'running',
+      }),
+      requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-term' }),
+    )
+
+    const next = panesReducer(
+      requested,
+      updatePaneContent({
+        tabId: 'tab-1',
+        paneId: 'pane-term',
+        content: {
+          kind: 'terminal',
+          mode: 'shell',
+          createRequestId: 'req-2',
+          status: 'running',
+        },
+      }),
+    )
+
+    expect(next.refreshRequestsByPane['tab-1']?.['pane-term']).toBeUndefined()
+  })
+
+  it('clears a pending browser request when the pane is replaced', () => {
+    const requested = panesReducer(
+      stateWithLeaf('pane-browser', browserContent),
+      requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-browser' }),
+    )
+
+    const next = panesReducer(
+      requested,
+      replacePane({ tabId: 'tab-1', paneId: 'pane-browser' }),
+    )
+
+    expect(next.refreshRequestsByPane['tab-1']?.['pane-browser']).toBeUndefined()
   })
 })
 ```
@@ -171,7 +321,7 @@ describe('requestTabRefresh', () => {
 Add a persistence test to `test/unit/client/store/panesPersistence.test.ts`:
 
 ```ts
-it('does not persist refreshByPane', () => {
+it('does not persist refreshRequestsByPane', () => {
   const store = configureStore({
     reducer: { tabs: tabsReducer, panes: panesReducer },
     middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
@@ -179,12 +329,21 @@ it('does not persist refreshByPane', () => {
 
   store.dispatch(addTab({ mode: 'shell' }))
   const tabId = store.getState().tabs.tabs[0].id
-  store.dispatch(initLayout({ tabId, paneId: 'pane-1', content: { kind: 'terminal', mode: 'shell' } }))
+  store.dispatch(initLayout({
+    tabId,
+    paneId: 'pane-1',
+    content: {
+      kind: 'terminal',
+      mode: 'shell',
+      createRequestId: 'req-1',
+      status: 'running',
+    },
+  }))
   store.dispatch(requestPaneRefresh({ tabId, paneId: 'pane-1' }))
 
   vi.runAllTimers()
   const saved = JSON.parse(localStorage.getItem('freshell.panes.v2')!)
-  expect(saved.refreshByPane).toBeUndefined()
+  expect(saved.refreshRequestsByPane).toBeUndefined()
 })
 ```
 
@@ -196,24 +355,36 @@ Run:
 npm run test:client -- test/unit/client/store/panesSlice.test.ts test/unit/client/store/panesPersistence.test.ts
 ```
 
-Expected: FAIL because `PanesState` and the reducers do not yet support refresh generations.
+Expected: FAIL because the slice does not yet model one-shot refresh requests.
 
 **Step 3: Write minimal implementation**
 
-First extend `PanesState` in `src/store/paneTypes.ts`:
+First extend `src/store/paneTypes.ts`:
 
 ```ts
-/**
- * Ephemeral refresh generations by tab and pane.
- * Incrementing a pane generation requests that pane to repair itself on the next render/mount.
- * Must never be persisted.
- */
-refreshByPane: Record<string, Record<string, number>>
+export type PaneRefreshTarget =
+  | { kind: 'terminal'; createRequestId: string }
+  | { kind: 'browser' }
+
+export interface PaneRefreshRequest {
+  requestId: string
+  target: PaneRefreshTarget
+}
+
+export interface PanesState {
+  // existing fields...
+  /**
+   * Ephemeral one-shot refresh requests keyed by tab and pane.
+   * Requests stay pending while a pane is unmounted, then must be consumed
+   * or cleared exactly once.
+   */
+  refreshRequestsByPane: Record<string, Record<string, PaneRefreshRequest>>
+}
 ```
 
-Initialize it everywhere `PanesState` is created in `src/store/panesSlice.ts`.
+Initialize `refreshRequestsByPane` everywhere the slice creates `PanesState`.
 
-Add reducers in `src/store/panesSlice.ts`:
+In `src/store/panesSlice.ts`, add reducers:
 
 ```ts
 requestPaneRefresh: (
@@ -221,12 +392,15 @@ requestPaneRefresh: (
   action: PayloadAction<{ tabId: string; paneId: string }>
 ) => {
   const { tabId, paneId } = action.payload
-  const layout = state.layouts[tabId]
-  const content = layout ? findLeaf(layout, paneId)?.content : null
-  if (!content || !isRefreshablePaneContent(content)) return
+  const content = findLeaf(state.layouts[tabId], paneId)?.content
+  const target = content ? buildPaneRefreshTarget(content) : null
+  if (!target) return
 
-  if (!state.refreshByPane[tabId]) state.refreshByPane[tabId] = {}
-  state.refreshByPane[tabId][paneId] = (state.refreshByPane[tabId][paneId] ?? 0) + 1
+  if (!state.refreshRequestsByPane[tabId]) state.refreshRequestsByPane[tabId] = {}
+  state.refreshRequestsByPane[tabId][paneId] = {
+    requestId: nanoid(),
+    target,
+  }
 },
 
 requestTabRefresh: (
@@ -237,28 +411,70 @@ requestTabRefresh: (
   const layout = state.layouts[tabId]
   if (!layout) return
 
+  if (!state.refreshRequestsByPane[tabId]) state.refreshRequestsByPane[tabId] = {}
   for (const leaf of collectPaneLeaves(layout)) {
-    if (!isRefreshablePaneContent(leaf.content)) continue
-    if (!state.refreshByPane[tabId]) state.refreshByPane[tabId] = {}
-    state.refreshByPane[tabId][leaf.id] = (state.refreshByPane[tabId][leaf.id] ?? 0) + 1
+    const target = buildPaneRefreshTarget(leaf.content)
+    if (!target) continue
+    state.refreshRequestsByPane[tabId][leaf.id] = {
+      requestId: nanoid(),
+      target,
+    }
+  }
+},
+
+consumePaneRefreshRequest: (
+  state,
+  action: PayloadAction<{ tabId: string; paneId: string; requestId: string }>
+) => {
+  const { tabId, paneId, requestId } = action.payload
+  const request = state.refreshRequestsByPane[tabId]?.[paneId]
+  if (!request || request.requestId !== requestId) return
+  delete state.refreshRequestsByPane[tabId][paneId]
+  if (Object.keys(state.refreshRequestsByPane[tabId]).length === 0) {
+    delete state.refreshRequestsByPane[tabId]
   }
 },
 ```
 
-Also clean up `refreshByPane` in reducers that remove panes/tabs:
+Add a small slice-local helper to reconcile stale requests whenever pane content mutates:
 
+```ts
+function reconcilePaneRefreshRequest(
+  state: PanesState,
+  tabId: string,
+  paneId: string,
+  nextContent: PaneContent | null | undefined,
+) {
+  const request = state.refreshRequestsByPane[tabId]?.[paneId]
+  if (!request) return
+  if (paneRefreshTargetMatchesContent(request.target, nextContent)) return
+
+  delete state.refreshRequestsByPane[tabId][paneId]
+  if (Object.keys(state.refreshRequestsByPane[tabId]).length === 0) {
+    delete state.refreshRequestsByPane[tabId]
+  }
+}
+```
+
+Call that helper from reducers that can invalidate a pending request:
+
+- `updatePaneContent`
+- `mergePaneContent`
+- `replacePane`
 - `closePane`
 - `removeLayout`
 - orphan-layout cleanup during initial state load
 
-Then update `src/store/persistMiddleware.ts` to strip `refreshByPane` alongside the other ephemeral fields:
+For `updatePaneContent` and `mergePaneContent`, reconcile after computing the new content. For `replacePane`, `closePane`, and `removeLayout`, delete the request outright because the old pane content is gone.
+
+Then update `src/store/persistMiddleware.ts` to strip the new ephemeral field:
 
 ```ts
 const {
   renameRequestTabId: _rrt,
   renameRequestPaneId: _rrp,
   zoomedPane: _zp,
-  refreshByPane: _rbp,
+  refreshRequestsByPane: _rrbp,
   ...persistablePanes
 } = state.panes
 ```
@@ -277,21 +493,21 @@ Expected: PASS.
 
 ```bash
 git add src/store/paneTypes.ts src/store/panesSlice.ts src/store/persistMiddleware.ts test/unit/client/store/panesSlice.test.ts test/unit/client/store/panesPersistence.test.ts
-git commit -m "feat(panes): add ephemeral pane refresh generations"
+git commit -m "feat(panes): add one-shot pane refresh requests"
 ```
 
 ### Task 3: Add Layout-Based Refresh Menu Items In `menu-defs`
 
 **Files:**
 - Modify: `src/components/context-menu/menu-defs.ts`
-- Modify: `test/unit/client/components/context-menu/menu-defs.test.ts:1-220`
+- Modify: `test/unit/client/components/context-menu/menu-defs.test.ts`
 
 **Step 1: Write the failing tests**
 
 Extend `test/unit/client/components/context-menu/menu-defs.test.ts`:
 
 ```ts
-it('enables Refresh tab when the stored layout has refreshable leaves even without mounted action registries', () => {
+it('enables Refresh tab when the stored layout has refreshable leaves even if only non-refreshable panes are mounted', () => {
   const actions = createMockActions()
   const ctx = {
     ...createMockContext(actions),
@@ -368,13 +584,10 @@ export type MenuActions = {
 }
 ```
 
-Use `collectPaneLeaves()` and `isRefreshablePaneContent()` to compute enablement from the stored layout itself:
+Use `collectPaneLeaves()` and `isRefreshablePaneContent()` to compute enablement from stored layout content:
 
 ```ts
 const canRefreshTab = !!layout && collectPaneLeaves(layout).some((leaf) => isRefreshablePaneContent(leaf.content))
-```
-
-```ts
 const canRefreshPane = !!paneContent && isRefreshablePaneContent(paneContent)
 ```
 
@@ -414,25 +627,24 @@ git add src/components/context-menu/menu-defs.ts test/unit/client/components/con
 git commit -m "feat(ui): add layout-driven refresh menu items"
 ```
 
-### Task 4: Dispatch Refresh Requests From `ContextMenuProvider`
+### Task 4: Dispatch One-Shot Refresh Requests From `ContextMenuProvider`
 
 **Files:**
 - Modify: `src/components/context-menu/ContextMenuProvider.tsx`
-- Modify: `src/components/panes/Pane.tsx:61-104`
+- Modify: `src/components/panes/Pane.tsx`
 - Test: `test/unit/client/components/ContextMenuProvider.test.tsx`
 
 **Step 1: Write the failing tests**
 
-Add provider tests that exercise the real store state instead of registry stubs:
+Add provider tests that use the real store state instead of action-registry stubs:
 
 ```tsx
 import TabBar from '@/components/TabBar'
 import TabContent from '@/components/TabContent'
-import { toggleZoom } from '@/store/panesSlice'
 
 it('opens the pane context menu from the focused pane shell with Shift+F10', async () => {
   const user = userEvent.setup()
-  const { store } = renderRealPaneHarness()
+  renderRealPaneHarness()
 
   const pane = screen.getByRole('group', { name: 'Pane: Shell' })
   pane.focus()
@@ -441,17 +653,20 @@ it('opens the pane context menu from the focused pane shell with Shift+F10', asy
   expect(screen.getByRole('menuitem', { name: 'Refresh pane' })).toBeInTheDocument()
 })
 
-it('Refresh pane increments refresh generation for the targeted pane', async () => {
+it('Refresh pane stores a one-shot request for the targeted pane', async () => {
   const user = userEvent.setup()
   const { store } = renderRealPaneHarness()
 
   await user.pointer({ target: screen.getByText('Shell'), keys: '[MouseRight]' })
   await user.click(screen.getByRole('menuitem', { name: 'Refresh pane' }))
 
-  expect(store.getState().panes.refreshByPane['tab-1']['pane-1']).toBe(1)
+  expect(store.getState().panes.refreshRequestsByPane['tab-1']['pane-1']).toMatchObject({
+    requestId: expect.any(String),
+    target: { kind: 'terminal', createRequestId: expect.any(String) },
+  })
 })
 
-it('Refresh tab marks all refreshable leaves in a zoomed tab, including unmounted siblings', async () => {
+it('Refresh tab stores requests for all refreshable leaves in a zoomed tab, including unmounted siblings', async () => {
   const user = userEvent.setup()
   const store = createZoomedStore({
     layout: split([
@@ -473,14 +688,14 @@ it('Refresh tab marks all refreshable leaves in a zoomed tab, including unmounte
   await user.pointer({ target: screen.getByText('Tab One'), keys: '[MouseRight]' })
   await user.click(screen.getByRole('menuitem', { name: 'Refresh tab' }))
 
-  expect(store.getState().panes.refreshByPane['tab-1']).toEqual({
-    'pane-term': 1,
-    'pane-browser': 1,
-  })
+  expect(Object.keys(store.getState().panes.refreshRequestsByPane['tab-1']).sort()).toEqual([
+    'pane-browser',
+    'pane-term',
+  ])
 })
 ```
 
-That zoomed-tab test is the key regression: only the editor leaf is mounted, but the hidden terminal and browser siblings must still be marked for refresh.
+That zoomed-tab test must use the real zoomed layout so only the editor leaf is mounted.
 
 **Step 2: Run test to verify it fails**
 
@@ -490,7 +705,7 @@ Run:
 npm run test:client -- test/unit/client/components/ContextMenuProvider.test.tsx
 ```
 
-Expected: FAIL because the provider does not dispatch refresh reducers yet and the pane shell is not yet the keyboard context target.
+Expected: FAIL because the provider does not dispatch refresh-request reducers yet and the pane shell is not yet the keyboard context target.
 
 **Step 3: Write minimal implementation**
 
@@ -530,7 +745,7 @@ actions: {
 }
 ```
 
-Do not call browser or terminal action registries here. The provider’s job is to mark refresh intent in state.
+Do not call browser or terminal action registries here. The provider’s job is to enqueue one-shot refresh requests in slice state.
 
 **Step 4: Run test to verify it passes**
 
@@ -546,10 +761,10 @@ Expected: PASS, including the zoomed-tab regression.
 
 ```bash
 git add src/components/context-menu/ContextMenuProvider.tsx src/components/panes/Pane.tsx test/unit/client/components/ContextMenuProvider.test.tsx
-git commit -m "feat(ui): dispatch pane refresh requests from context menus"
+git commit -m "feat(ui): dispatch one-shot pane refresh requests"
 ```
 
-### Task 5: Refactor `BrowserPane` Refresh To Recover Error Screens
+### Task 5: Refactor `BrowserPane` Refresh To Preserve Live Reload And Recover Error Screens
 
 **Files:**
 - Modify: `src/components/panes/BrowserPane.tsx`
@@ -557,24 +772,40 @@ git commit -m "feat(ui): dispatch pane refresh requests from context menus"
 
 **Step 1: Write the failing tests**
 
-Add real BrowserPane tests that verify behavior, not a fake registry callback:
+Add real BrowserPane tests that verify the component’s actual DOM/API behavior:
 
 ```tsx
 import { requestPaneRefresh } from '@/store/panesSlice'
 
-it('toolbar Refresh retries a forwarded URL after forwardError', async () => {
+it('toolbar Refresh reloads the live iframe document when an iframe exists', async () => {
+  renderBrowserPane({ url: 'https://example.com' })
+
+  const iframe = await screen.findByTitle('Browser content')
+  const reloadSpy = vi.fn()
+  Object.defineProperty(iframe, 'contentWindow', {
+    configurable: true,
+    value: { location: { reload: reloadSpy } },
+  })
+
+  fireEvent.click(screen.getByTitle('Refresh'))
+
+  expect(reloadSpy).toHaveBeenCalledTimes(1)
+  expect(document.querySelectorAll('iframe')).toHaveLength(1)
+  expect(document.querySelector('iframe')).toBe(iframe)
+})
+
+it('toolbar Refresh retries forwarding when the pane is on a forwardError screen with no iframe', async () => {
   setWindowHostname('192.168.1.100')
   vi.mocked(api.post)
     .mockRejectedValueOnce(new Error('Connection refused'))
     .mockResolvedValueOnce({ forwardedPort: 45678 })
 
-  const { store } = renderBrowserPane({ url: 'http://localhost:3000' })
+  renderBrowserPane({ url: 'http://localhost:3000' })
 
-  await waitFor(() => expect(screen.getByText('Failed to connect')).toBeInTheDocument())
+  await waitFor(() => expect(screen.getByText(/Failed to connect to localhost:3000/i)).toBeInTheDocument())
+  expect(document.querySelector('iframe')).toBeNull()
 
-  await act(async () => {
-    fireEvent.click(screen.getByTitle('Refresh'))
-  })
+  fireEvent.click(screen.getByTitle('Refresh'))
 
   await waitFor(() => {
     expect(api.post).toHaveBeenCalledTimes(2)
@@ -582,24 +813,25 @@ it('toolbar Refresh retries a forwarded URL after forwardError', async () => {
   })
 })
 
-it('toolbar Refresh reloads a direct URL even when the iframe src string is unchanged', async () => {
-  setWindowHostname('localhost')
-  renderBrowserPane({ url: 'https://example.com' })
+it('consumes a pending refresh request once and does not replay it after remount', async () => {
+  setWindowHostname('192.168.1.100')
+  vi.mocked(api.post)
+    .mockRejectedValueOnce(new Error('Connection refused'))
+    .mockResolvedValueOnce({ forwardedPort: 45678 })
 
-  const firstIframe = document.querySelector('iframe')
-  expect(firstIframe).toBeTruthy()
+  const store = createStoreWithPendingBrowserRefresh()
 
-  fireEvent.click(screen.getByTitle('Refresh'))
+  const first = renderBrowserPane({ url: 'http://localhost:3000' }, store)
+  await waitFor(() => expect(api.post).toHaveBeenCalledTimes(2))
+  expect(store.getState().panes.refreshRequestsByPane['tab-1']?.['pane-1']).toBeUndefined()
 
-  await waitFor(() => {
-    const nextIframe = document.querySelector('iframe')
-    expect(nextIframe).toBeTruthy()
-    expect(nextIframe).not.toBe(firstIframe)
-    expect(nextIframe!.getAttribute('src')).toBe('https://example.com')
-  })
+  first.unmount()
+  renderBrowserPane({ url: 'http://localhost:3000' }, store)
+
+  await waitFor(() => expect(api.post).toHaveBeenCalledTimes(3))
 })
 
-it('dispatching requestPaneRefresh retries the same browser recovery path', async () => {
+it('dispatching requestPaneRefresh uses the same refresh path as the toolbar button', async () => {
   setWindowHostname('192.168.1.100')
   vi.mocked(api.post)
     .mockRejectedValueOnce(new Error('Connection refused'))
@@ -607,7 +839,7 @@ it('dispatching requestPaneRefresh retries the same browser recovery path', asyn
 
   const { store } = renderBrowserPane({ url: 'http://localhost:3000' })
 
-  await waitFor(() => expect(screen.getByText('Failed to connect')).toBeInTheDocument())
+  await waitFor(() => expect(screen.getByText(/Failed to connect to localhost:3000/i)).toBeInTheDocument())
 
   act(() => {
     store.dispatch(requestPaneRefresh({ tabId: 'tab-1', paneId: 'pane-1' }))
@@ -615,23 +847,12 @@ it('dispatching requestPaneRefresh retries the same browser recovery path', asyn
 
   await waitFor(() => {
     expect(api.post).toHaveBeenCalledTimes(2)
-  })
-})
-
-it('consumes a pre-existing refresh generation on mount', async () => {
-  setWindowHostname('192.168.1.100')
-  vi.mocked(api.post).mockResolvedValue({ forwardedPort: 45678 })
-  const store = createMockStoreWithRefresh({ 'tab-1': { 'pane-1': 1 } })
-
-  renderBrowserPane({ url: 'http://localhost:3000' }, store)
-
-  await waitFor(() => {
-    expect(api.post).toHaveBeenCalledWith('/api/proxy/forward', { port: 3000 })
+    expect(store.getState().panes.refreshRequestsByPane['tab-1']?.['pane-1']).toBeUndefined()
   })
 })
 ```
 
-These tests must inspect real DOM and API behavior; do not replace refresh with a fake `browserReload` spy.
+These tests must use the real BrowserPane behavior. Do not replace refresh with a fake `browserReload` spy.
 
 **Step 2: Run test to verify it fails**
 
@@ -641,55 +862,87 @@ Run:
 npm run test:client -- test/unit/client/components/panes/BrowserPane.test.tsx
 ```
 
-Expected: FAIL because the current `refresh()` returns early when no iframe exists and does not react to `refreshByPane`.
+Expected: FAIL because the current `refresh()` is iframe-only and there is no consume/clear path for pane refresh requests.
 
 **Step 3: Write minimal implementation**
 
-Refactor `src/components/panes/BrowserPane.tsx` so refresh is state-driven instead of DOM-driven:
+Update `src/components/panes/BrowserPane.tsx` with three separate concepts:
 
-1. Select the pane’s refresh generation:
+1. Select the pending refresh request:
 
 ```ts
-const refreshGeneration = useAppSelector((s) => s.panes.refreshByPane[tabId]?.[paneId] ?? 0)
-const handledRefreshGenerationRef = useRef(0)
+const pendingRefreshRequest = useAppSelector((s) => s.panes.refreshRequestsByPane[tabId]?.[paneId] ?? null)
 ```
 
-2. Replace `forwardRetryKey` with a generic resolve attempt key and add an iframe remount key:
+2. Preserve the current live-document reload path for mounted iframes:
 
 ```ts
-const [resolveAttemptKey, setResolveAttemptKey] = useState(0)
-const [iframeInstanceKey, setIframeInstanceKey] = useState(0)
+const reloadLiveIframe = useCallback(() => {
+  const iframe = iframeRef.current
+  if (!iframe) return false
+
+  try {
+    iframe.contentWindow?.location.reload()
+    setIsLoading(true)
+    return true
+  } catch {
+    const src = iframe.src
+    iframe.src = src
+    setIsLoading(true)
+    return true
+  }
+}, [])
 ```
 
-3. Replace the current DOM-only `refresh()` with a state reset:
+3. Add a separate recovery path for error-screen states where no iframe exists:
 
 ```ts
-const refreshBrowser = useCallback(() => {
+const recoverBrowserPane = useCallback(() => {
   if (!currentUrl) return
 
   setLoadError(null)
   setForwardError(null)
   setResolvedSrc(null)
   setIsLoading(true)
-  setResolveAttemptKey((k) => k + 1)
-  setIframeInstanceKey((k) => k + 1)
+  setForwardRetryKey((key) => key + 1)
 }, [currentUrl])
 ```
 
-4. Make the URL-resolution effect depend on `resolveAttemptKey` instead of only `currentUrl`.
-5. Render the iframe with `key={iframeInstanceKey}` so a same-URL refresh produces a real remount.
-6. Reuse `refreshBrowser` for:
-   - the toolbar Refresh button
-   - the registered browser action (`reload`)
-   - a `useEffect` that consumes new refresh generations:
+Then make the single refresh entrypoint choose between them:
+
+```ts
+const refreshBrowser = useCallback(() => {
+  if (reloadLiveIframe()) return
+  recoverBrowserPane()
+}, [recoverBrowserPane, reloadLiveIframe])
+```
+
+Keep using `forwardRetryKey` or rename it to `resolveAttemptKey`; either is fine, but the behavior must remain:
+
+- existing iframe -> reload the live document
+- no iframe because of `forwardError`/`loadError` -> clear errors and retry resolution
+
+Finally, add a request-consumption effect:
 
 ```ts
 useEffect(() => {
-  if (refreshGeneration <= handledRefreshGenerationRef.current) return
-  handledRefreshGenerationRef.current = refreshGeneration
+  const request = pendingRefreshRequest
+  if (!request) return
+  if (!paneRefreshTargetMatchesContent(request.target, { kind: 'browser', url, devToolsOpen })) {
+    dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: request.requestId }))
+    return
+  }
+
+  dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: request.requestId }))
   refreshBrowser()
-}, [refreshGeneration, refreshBrowser])
+}, [pendingRefreshRequest?.requestId, dispatch, paneId, refreshBrowser, tabId, url, devToolsOpen])
 ```
+
+Important constraints:
+
+- No `handledRefreshGenerationRef` pattern. The store consume/clear path is what makes the request one-shot.
+- Keep the toolbar Refresh button and the registered browser action (`reload`) pointed at the same `refreshBrowser()` helper.
+- Do not force a new iframe from the last saved Redux URL when a live iframe exists. That would regress in-iframe navigation reload behavior.
 
 **Step 4: Run test to verify it passes**
 
@@ -705,10 +958,10 @@ Expected: PASS.
 
 ```bash
 git add src/components/panes/BrowserPane.tsx test/unit/client/components/panes/BrowserPane.test.tsx
-git commit -m "fix(browser): make refresh recover iframe and error states"
+git commit -m "fix(browser): make pane refresh one-shot and error-safe"
 ```
 
-### Task 6: Make `TerminalView` Consume Refresh Generations
+### Task 6: Make `TerminalView` Consume Requests Without Double-Attach On Mount
 
 **Files:**
 - Modify: `src/components/TerminalView.tsx`
@@ -716,13 +969,16 @@ git commit -m "fix(browser): make refresh recover iframe and error states"
 
 **Step 1: Write the failing tests**
 
-Add terminal refresh-generation coverage to `test/unit/client/components/TerminalView.lifecycle.test.tsx`:
+Add terminal refresh coverage to `test/unit/client/components/TerminalView.lifecycle.test.tsx`:
 
 ```tsx
 import { requestPaneRefresh } from '@/store/panesSlice'
 
-it('dispatching requestPaneRefresh detaches and viewport-reattaches a visible terminal', async () => {
-  const { store, tabId, paneId, terminalId } = await renderTerminalHarness({ status: 'running', terminalId: 'term-refresh-visible' })
+it('dispatching requestPaneRefresh detaches and performs exactly one visible replay attach', async () => {
+  const { store, tabId, paneId, terminalId } = await renderTerminalHarness({
+    status: 'running',
+    terminalId: 'term-refresh-visible',
+  })
 
   wsMocks.send.mockClear()
 
@@ -730,17 +986,25 @@ it('dispatching requestPaneRefresh detaches and viewport-reattaches a visible te
     store.dispatch(requestPaneRefresh({ tabId, paneId }))
   })
 
-  expect(wsMocks.send).toHaveBeenNthCalledWith(1, { type: 'terminal.detach', terminalId })
-  expect(wsMocks.send).toHaveBeenNthCalledWith(2, expect.objectContaining({
+  const detachCalls = wsMocks.send.mock.calls.filter(([msg]) => msg.type === 'terminal.detach')
+  const attachCalls = wsMocks.send.mock.calls.filter(([msg]) => msg.type === 'terminal.attach')
+
+  expect(detachCalls).toEqual([[{ type: 'terminal.detach', terminalId }]])
+  expect(attachCalls).toHaveLength(1)
+  expect(attachCalls[0][0]).toMatchObject({
     type: 'terminal.attach',
     terminalId,
     sinceSeq: 0,
     attachRequestId: expect.any(String),
-  }))
+  })
 })
 
-it('dispatching requestPaneRefresh while hidden keeps the delta path and defers viewport hydrate', async () => {
-  const { store, tabId, paneId, terminalId } = await renderTerminalHarness({ status: 'running', terminalId: 'term-refresh-hidden', hidden: true })
+it('dispatching requestPaneRefresh while hidden detaches and performs exactly one delta attach', async () => {
+  const { store, tabId, paneId, terminalId } = await renderTerminalHarness({
+    status: 'running',
+    terminalId: 'term-refresh-hidden',
+    hidden: true,
+  })
 
   messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 3, data: 'abc' })
   wsMocks.send.mockClear()
@@ -749,30 +1013,63 @@ it('dispatching requestPaneRefresh while hidden keeps the delta path and defers 
     store.dispatch(requestPaneRefresh({ tabId, paneId }))
   })
 
-  expect(wsMocks.send).toHaveBeenNthCalledWith(1, { type: 'terminal.detach', terminalId })
-  expect(wsMocks.send).toHaveBeenNthCalledWith(2, expect.objectContaining({
+  const attachCalls = wsMocks.send.mock.calls.filter(([msg]) => msg.type === 'terminal.attach')
+
+  expect(wsMocks.send).toHaveBeenCalledWith({ type: 'terminal.detach', terminalId })
+  expect(attachCalls).toHaveLength(1)
+  expect(attachCalls[0][0]).toMatchObject({
     type: 'terminal.attach',
     terminalId,
     sinceSeq: 3,
     attachRequestId: expect.any(String),
-  }))
+  })
 })
 
-it('consumes a pre-existing refresh generation when a terminal mounts after being skipped by zoom', async () => {
-  const { store, tabId, paneId, terminalId } = await renderTerminalHarness({
-    status: 'running',
-    terminalId: 'term-refresh-on-mount',
-    refreshGeneration: 1,
+it('a pending refresh request present on mount replaces the normal mount attach instead of adding a second attach', async () => {
+  const store = createStoreWithPendingTerminalRefresh({
+    terminalId: 'term-on-mount',
+    createRequestId: 'req-1',
   })
 
+  renderTerminalHarnessWithStore(store)
+
   await waitFor(() => {
-    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'terminal.detach',
-      terminalId,
-    }))
+    const attachCalls = wsMocks.send.mock.calls.filter(([msg]) => msg.type === 'terminal.attach')
+    expect(attachCalls).toHaveLength(1)
+    expect(attachCalls[0][0]).toMatchObject({
+      type: 'terminal.attach',
+      terminalId: 'term-on-mount',
+      sinceSeq: 0,
+    })
+  })
+
+  expect(wsMocks.send).toHaveBeenCalledWith({ type: 'terminal.detach', terminalId: 'term-on-mount' })
+  expect(store.getState().panes.refreshRequestsByPane['tab-1']?.['pane-1']).toBeUndefined()
+})
+
+it('consumed refresh requests do not replay after App view remounts the terminal pane', async () => {
+  const store = createStoreWithPendingTerminalRefresh({
+    terminalId: 'term-remount',
+    createRequestId: 'req-1',
+  })
+
+  const first = renderTerminalHarnessWithStore(store)
+  await waitFor(() => {
+    expect(wsMocks.send.mock.calls.filter(([msg]) => msg.type === 'terminal.attach')).toHaveLength(1)
+  })
+
+  wsMocks.send.mockClear()
+  first.unmount()
+  renderTerminalHarnessWithStore(store)
+
+  await waitFor(() => {
+    expect(wsMocks.send.mock.calls.filter(([msg]) => msg.type === 'terminal.detach')).toHaveLength(0)
+    expect(wsMocks.send.mock.calls.filter(([msg]) => msg.type === 'terminal.attach').length).toBeLessThanOrEqual(1)
   })
 })
 ```
+
+That third test is the mount-order regression: a pre-existing request on mount must not produce `detach -> attach(viewport) -> attach(keepalive)` on the same mount.
 
 **Step 2: Run test to verify it fails**
 
@@ -782,27 +1079,23 @@ Run:
 npm run test:client -- test/unit/client/components/TerminalView.lifecycle.test.tsx
 ```
 
-Expected: FAIL because `TerminalView` does not react to `refreshByPane` yet.
+Expected: FAIL because `TerminalView` has no request consume/clear path and no mount-order coordination for refresh.
 
 **Step 3: Write minimal implementation**
 
-In `src/components/TerminalView.tsx`:
+Update `src/components/TerminalView.tsx` in three parts.
 
-1. Select refresh generation:
+1. Select the pending request and add a small helper for terminal-specific target validation:
 
 ```ts
-const refreshGeneration = useAppSelector((s) => s.panes.refreshByPane[tabId]?.[paneId] ?? 0)
-const handledRefreshGenerationRef = useRef(0)
+const pendingRefreshRequest = useAppSelector((s) => s.panes.refreshRequestsByPane[tabId]?.[paneId] ?? null)
 ```
 
-2. Add a dedicated refresh effect after the attach helpers are defined:
+2. Add a shared helper that consumes the request and performs the refresh attach exactly once:
 
 ```ts
-useEffect(() => {
-  if (!isTerminal) return
-  if (refreshGeneration <= handledRefreshGenerationRef.current) return
-
-  handledRefreshGenerationRef.current = refreshGeneration
+const runTerminalRefresh = useCallback((request: PaneRefreshRequest) => {
+  dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: request.requestId }))
 
   const tid = terminalIdRef.current
   if (!tid) return
@@ -817,15 +1110,56 @@ useEffect(() => {
   }
 
   attachTerminal(tid, 'viewport_hydrate', { clearViewportFirst: true })
-}, [refreshGeneration, isTerminal, attachTerminal, ws])
+}, [attachTerminal, dispatch, paneId, tabId, ws])
+```
+
+3. Coordinate mount-time and post-mount refresh separately so the normal mount attach never races a refresh attach.
+
+Keep the existing create/attach lifecycle effect, but before its normal `attachTerminal(currentTerminalId, intent)` branch, inspect the current pending request:
+
+```ts
+const refreshRequest = pendingRefreshRequest
+if (refreshRequest && !paneRefreshTargetMatchesContent(refreshRequest.target, contentRef.current)) {
+  dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: refreshRequest.requestId }))
+} else if (refreshRequest && currentTerminalId) {
+  runTerminalRefresh(refreshRequest)
+  return
+} else if (refreshRequest && !currentTerminalId) {
+  dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: refreshRequest.requestId }))
+}
+```
+
+That makes mount-time pending requests replace the normal attach path.
+
+Then add a second effect for requests that arrive after the initial mount decision, with an arm-once guard so it does not also fire on the first render:
+
+```ts
+const refreshEffectArmedRef = useRef(false)
+
+useEffect(() => {
+  if (!refreshEffectArmedRef.current) {
+    refreshEffectArmedRef.current = true
+    return
+  }
+
+  const request = pendingRefreshRequest
+  if (!request) return
+  if (!paneRefreshTargetMatchesContent(request.target, contentRef.current)) {
+    dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: request.requestId }))
+    return
+  }
+
+  runTerminalRefresh(request)
+}, [pendingRefreshRequest?.requestId, dispatch, paneId, runTerminalRefresh, tabId])
 ```
 
 Key rules:
 
-- Do not add a new server message type.
-- Do not create a separate terminal refresh registry method for menus; refresh comes from slice state now.
-- If there is no `terminalId` yet, do nothing; the existing create flow already yields a fresh frontend connection.
-- Hidden terminals must stay on the delta path so the existing deferred viewport-hydration behavior remains intact.
+- Do not add a new refresh effect before the existing mount attach logic.
+- Do not rely on `handledRefreshGenerationRef`; the request must be removed from Redux when claimed.
+- A pre-existing request on mount must result in exactly one attach cycle.
+- If there is no `terminalId` yet, consume the request and let the existing create flow continue; creating a terminal already establishes a fresh frontend connection.
+- Hidden terminals still use the delta path and deferred viewport hydration. The only change is that refresh goes through the same path exactly once.
 
 **Step 4: Run test to verify it passes**
 
@@ -841,40 +1175,36 @@ Expected: PASS.
 
 ```bash
 git add src/components/TerminalView.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx
-git commit -m "feat(terminals): consume pane refresh generations"
+git commit -m "fix(terminals): make pane refresh one-shot and mount-safe"
 ```
 
-### Task 7: Add A Zoomed-Tab Refresh Regression Flow
+### Task 7: Add A Zoomed-Tab One-Shot Refresh Regression Flow
 
 **Files:**
 - Create: `test/e2e/refresh-context-menu-flow.test.tsx`
 
 **Step 1: Write the failing test**
 
-Create a flow that combines the zoomed-tab state model with the real components:
+Create a flow that exercises the full cross-component behavior with real store state:
 
 ```tsx
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Provider } from 'react-redux'
-import { configureStore } from '@reduxjs/toolkit'
-import tabsReducer from '@/store/tabsSlice'
-import panesReducer, { toggleZoom } from '@/store/panesSlice'
-import sessionsReducer from '@/store/sessionsSlice'
-import connectionReducer from '@/store/connectionSlice'
-import settingsReducer from '@/store/settingsSlice'
+import { toggleZoom } from '@/store/panesSlice'
 import TabBar from '@/components/TabBar'
 import TabContent from '@/components/TabContent'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { api } from '@/lib/api'
 
 describe('refresh context menu flow', () => {
-  it('Refresh tab marks unmounted zoom siblings and they refresh when later mounted', async () => {
+  it('Refresh tab queues hidden zoom siblings, consumes them on mount, and does not replay them after remount', async () => {
     const user = userEvent.setup()
     const store = createZoomedBrowserSiblingStore()
+    vi.mocked(api.post).mockResolvedValue({ forwardedPort: 45678 })
 
-    render(
+    const view = render(
       <Provider store={store}>
         <ContextMenuProvider view="terminal" onViewChange={() => {}} onToggleSidebar={() => {}} sidebarCollapsed={false}>
           <TabBar />
@@ -889,13 +1219,31 @@ describe('refresh context menu flow', () => {
     await user.pointer({ target: screen.getByText('Tab One'), keys: '[MouseRight]' })
     await user.click(screen.getByRole('menuitem', { name: 'Refresh tab' }))
 
-    expect(store.getState().panes.refreshByPane['tab-1']['pane-browser']).toBe(1)
+    expect(store.getState().panes.refreshRequestsByPane['tab-1']['pane-browser']).toMatchObject({
+      requestId: expect.any(String),
+      target: { kind: 'browser' },
+    })
 
     store.dispatch(toggleZoom({ tabId: 'tab-1', paneId: 'pane-editor' }))
 
     await waitFor(() => {
       expect(api.post).toHaveBeenCalled()
+      expect(store.getState().panes.refreshRequestsByPane['tab-1']?.['pane-browser']).toBeUndefined()
     })
+
+    vi.mocked(api.post).mockClear()
+    view.unmount()
+
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider view="terminal" onViewChange={() => {}} onToggleSidebar={() => {}} sidebarCollapsed={false}>
+          <TabBar />
+          <TabContent tabId="tab-1" hidden={false} />
+        </ContextMenuProvider>
+      </Provider>,
+    )
+
+    await waitFor(() => expect(api.post).not.toHaveBeenCalled())
   })
 })
 ```
@@ -917,10 +1265,11 @@ Expected: FAIL until Tasks 2-6 are complete.
 Finish the test with the real store shape and mocks that the app already uses. The important assertions are:
 
 - `Refresh tab` remains enabled while only the zoomed editor leaf is mounted.
-- Clicking it increments refresh generations for hidden refreshable siblings.
-- Unzooming later causes the previously skipped browser sibling to execute its pending refresh.
+- Clicking it stores one-shot refresh requests for hidden refreshable siblings.
+- Unzooming later causes the previously skipped browser sibling to claim and consume its request.
+- Remounting the same tab contents afterward does not replay the old request.
 
-This test should not pre-register hidden pane action registries; that would reintroduce the bug the test is supposed to catch.
+This test must not pre-register hidden pane action registries; that would reintroduce the bug the test is supposed to catch.
 
 **Step 4: Run test to verify it passes**
 
@@ -936,7 +1285,7 @@ Expected: PASS.
 
 ```bash
 git add test/e2e/refresh-context-menu-flow.test.tsx
-git commit -m "test(ui): cover zoomed tab refresh flow"
+git commit -m "test(ui): cover one-shot zoomed refresh flow"
 ```
 
 ## Final Validation
@@ -960,10 +1309,10 @@ Expected final state:
 - Right-clicking a tab shows `Refresh tab`.
 - Right-clicking a pane header shows `Refresh pane`.
 - Menu enablement depends on the stored pane content kinds, not mounted component registries.
-- `Refresh Tab` marks every terminal/browser leaf in the tab’s layout tree, even in zoomed tabs where siblings are currently unmounted.
-- Mounted terminal panes detach plus re-attach to the same PTY.
-- Mounted browser panes retry from both live iframes and error screens.
-- Previously unmounted zoom siblings execute pending refreshes when they later mount.
+- `Refresh Tab` creates requests for every terminal/browser leaf in the tab’s layout tree, even in zoomed tabs where siblings are currently unmounted.
+- Refresh requests are one-shot: panes explicitly consume them, stale requests are cleared when content changes, and old requests do not replay after later remounts.
+- Browser panes preserve live-document reload when an iframe exists and recover from `forwardError`/`loadError` when no iframe exists.
+- Terminal panes refresh through exactly one detach/attach decision per mount, with visible panes using full replay and hidden panes preserving the deferred-hydration path.
 - Refresh bookkeeping is ephemeral and is not persisted to localStorage.
 
 If `npm test` surfaces unrelated failures, stop and fix them before rebasing or merging, per repo policy.
