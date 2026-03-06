@@ -6,6 +6,7 @@ import { getWsClient } from '@/lib/ws-client'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { collectTerminalIds, collectPaneContents } from '@/lib/pane-utils'
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useTabBarScroll } from '@/hooks/useTabBarScroll'
 import TabItem from './TabItem'
 import { cancelCodingCliRequest } from '@/store/codingCliSlice'
 import { useMobile } from '@/hooks/useMobile'
@@ -241,6 +242,8 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [activeTabId, tabs, dispatch])
 
+  const { callbackRef, canScrollLeft, canScrollRight } = useTabBarScroll(activeTabId, tabs.length)
+
   const activeTab = activeId ? tabs.find((t: Tab) => t.id === activeId) : null
 
   const isMobile = useMobile()
@@ -276,95 +279,119 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
           items={tabs.map((t: Tab) => t.id)}
           strategy={horizontalListSortingStrategy}
         >
-          <div className="relative z-10 flex items-end gap-0.5 overflow-x-auto overflow-y-hidden pt-px flex-1">
-            {sidebarCollapsed && onToggleSidebar && (
-              <button
-                className="flex-shrink-0 mb-1 p-1 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-colors"
-                title="Show sidebar"
-                aria-label="Show sidebar"
-                onClick={onToggleSidebar}
-              >
-                <PanelLeft className="h-3.5 w-3.5" />
-              </button>
-            )}
-            {tabs.map((tab: Tab) => (
-              <SortableTab
-                key={tab.id}
-                tab={tab}
-                displayTitle={getDisplayTitle(tab)}
-                isActive={tab.id === activeTabId}
-                needsAttention={!!attentionByTab[tab.id]}
-                isDragging={activeId === tab.id}
-                isRenaming={renamingId === tab.id}
-                renameValue={renameValue}
-                paneContents={getPaneContents(tab)}
-                iconsOnTabs={iconsOnTabs}
-                tabAttentionStyle={tabAttentionStyle}
-                onRenameChange={setRenameValue}
-                onRenameBlur={() => {
-                  dispatch(
-                    updateTab({
-                      id: tab.id,
-                      updates: { title: renameValue || tab.title, titleSetByUser: true },
-                    })
-                  )
-                  setRenamingId(null)
-                }}
-                onRenameKeyDown={(e) => {
-                  e.stopPropagation() // Prevent dnd-kit from intercepting keys (esp. space)
-                  if (e.key === 'Enter' || e.key === 'Escape') {
-                    ;(e.target as HTMLInputElement).blur()
-                  }
-                }}
-                onClose={(e) => {
-                  const terminalIds = getTerminalIdsForTab(tab)
-                  if (terminalIds.length > 0) {
-                    const messageType = e.shiftKey ? 'terminal.kill' : 'terminal.detach'
-                    for (const terminalId of terminalIds) {
-                      ws.send({
-                        type: messageType,
-                        terminalId,
-                      })
-                    }
-                  } else if (tab.codingCliSessionId) {
-                    if (tab.status === 'creating') {
-                      dispatch(cancelCodingCliRequest({ requestId: tab.codingCliSessionId }))
-                    } else {
-                      ws.send({
-                        type: 'codingcli.kill',
-                        sessionId: tab.codingCliSessionId,
-                      })
-                    }
-                  }
-                  dispatch(closeTab(tab.id))
-                }}
-                onClick={() => {
-                  if (attentionDismiss === 'click' && attentionByTab[tab.id]) {
-                    dispatch(clearTabAttention({ tabId: tab.id }))
-                    const activePaneId = activePaneMap?.[tab.id]
-                    if (activePaneId && attentionByPane[activePaneId]) {
-                      dispatch(clearPaneAttention({ paneId: activePaneId }))
-                    }
-                  }
-                  dispatch(setActiveTab(tab.id))
-                }}
-                onDoubleClick={() => {
-                  setRenamingId(tab.id)
-                  setRenameValue(getDisplayTitle(tab))
-                }}
+          <div className="relative z-10 flex items-end flex-1 min-w-0">
+            {/* Overflow indicator: left */}
+            {canScrollLeft && (
+              <div
+                className="pointer-events-none absolute left-0 top-0 bottom-0 w-8 z-20 bg-gradient-to-r from-background to-transparent"
+                aria-hidden="true"
               />
-            ))}
-            <button
-              className="flex-shrink-0 ml-1 mb-1 p-1 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded-md border border-dashed border-muted-foreground/40 text-muted-foreground hover:text-foreground hover:border-foreground/50 hover:bg-muted/30 transition-colors"
-              title="New shell tab"
-              aria-label="New shell tab"
-              onClick={() => dispatch(addTab({ mode: 'shell' }))}
-              data-context={ContextIds.TabAdd}
+            )}
+
+            {/* Scrollable tab strip */}
+            <div
+              ref={callbackRef}
+              className="flex items-end gap-0.5 overflow-x-auto overflow-y-hidden scrollbar-none pt-px flex-1 min-w-0"
             >
-              <Plus className="h-3.5 w-3.5" />
-            </button>
+              {sidebarCollapsed && onToggleSidebar && (
+                <button
+                  className="flex-shrink-0 mb-1 p-1 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-colors"
+                  title="Show sidebar"
+                  aria-label="Show sidebar"
+                  onClick={onToggleSidebar}
+                >
+                  <PanelLeft className="h-3.5 w-3.5" />
+                </button>
+              )}
+              {tabs.map((tab: Tab) => (
+                <SortableTab
+                  key={tab.id}
+                  tab={tab}
+                  displayTitle={getDisplayTitle(tab)}
+                  isActive={tab.id === activeTabId}
+                  needsAttention={!!attentionByTab[tab.id]}
+                  isDragging={activeId === tab.id}
+                  isRenaming={renamingId === tab.id}
+                  renameValue={renameValue}
+                  paneContents={getPaneContents(tab)}
+                  iconsOnTabs={iconsOnTabs}
+                  tabAttentionStyle={tabAttentionStyle}
+                  onRenameChange={setRenameValue}
+                  onRenameBlur={() => {
+                    dispatch(
+                      updateTab({
+                        id: tab.id,
+                        updates: { title: renameValue || tab.title, titleSetByUser: true },
+                      })
+                    )
+                    setRenamingId(null)
+                  }}
+                  onRenameKeyDown={(e) => {
+                    e.stopPropagation() // Prevent dnd-kit from intercepting keys (esp. space)
+                    if (e.key === 'Enter' || e.key === 'Escape') {
+                      ;(e.target as HTMLInputElement).blur()
+                    }
+                  }}
+                  onClose={(e) => {
+                    const terminalIds = getTerminalIdsForTab(tab)
+                    if (terminalIds.length > 0) {
+                      const messageType = e.shiftKey ? 'terminal.kill' : 'terminal.detach'
+                      for (const terminalId of terminalIds) {
+                        ws.send({
+                          type: messageType,
+                          terminalId,
+                        })
+                      }
+                    } else if (tab.codingCliSessionId) {
+                      if (tab.status === 'creating') {
+                        dispatch(cancelCodingCliRequest({ requestId: tab.codingCliSessionId }))
+                      } else {
+                        ws.send({
+                          type: 'codingcli.kill',
+                          sessionId: tab.codingCliSessionId,
+                        })
+                      }
+                    }
+                    dispatch(closeTab(tab.id))
+                  }}
+                  onClick={() => {
+                    if (attentionDismiss === 'click' && attentionByTab[tab.id]) {
+                      dispatch(clearTabAttention({ tabId: tab.id }))
+                      const activePaneId = activePaneMap?.[tab.id]
+                      if (activePaneId && attentionByPane[activePaneId]) {
+                        dispatch(clearPaneAttention({ paneId: activePaneId }))
+                      }
+                    }
+                    dispatch(setActiveTab(tab.id))
+                  }}
+                  onDoubleClick={() => {
+                    setRenamingId(tab.id)
+                    setRenameValue(getDisplayTitle(tab))
+                  }}
+                />
+              ))}
+            </div>
+
+            {/* Overflow indicator: right */}
+            {canScrollRight && (
+              <div
+                className="pointer-events-none absolute right-0 top-0 bottom-0 w-8 z-20 bg-gradient-to-l from-background to-transparent"
+                aria-hidden="true"
+              />
+            )}
           </div>
         </SortableContext>
+
+        {/* Pinned + button -- outside the scrollable area */}
+        <button
+          className="flex-shrink-0 ml-1 mb-1 p-1 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded-md border border-dashed border-muted-foreground/40 text-muted-foreground hover:text-foreground hover:border-foreground/50 hover:bg-muted/30 transition-colors"
+          title="New shell tab"
+          aria-label="New shell tab"
+          onClick={() => dispatch(addTab({ mode: 'shell' }))}
+          data-context={ContextIds.TabAdd}
+        >
+          <Plus className="h-3.5 w-3.5" />
+        </button>
 
         <DragOverlay>
           {activeTab ? (

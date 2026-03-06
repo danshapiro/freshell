@@ -232,15 +232,30 @@ describe('TabBar', () => {
         activeTabId: 'tab-1',
       })
 
-      renderWithStore(<TabBar />, store)
+      const { container } = renderWithStore(<TabBar />, store)
 
-      const addButton = screen.getByTitle('New shell tab')
-      const tabStrip = addButton.parentElement as HTMLDivElement | null
+      // The scrollable tab strip has the scrollbar-none class
+      const tabStrip = container.querySelector('.scrollbar-none') as HTMLDivElement | null
 
       expect(tabStrip).toBeInTheDocument()
       expect(tabStrip?.className).toContain('overflow-x-auto')
       expect(tabStrip?.className).toContain('overflow-y-hidden')
-      expect(tabStrip?.className).toContain('pt-px')
+      expect(tabStrip?.className).toContain('scrollbar-none')
+    })
+
+    it('renders the + button outside the scrollable tab container', () => {
+      const tab = createTab({ id: 'tab-1' })
+      const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
+
+      renderWithStore(<TabBar />, store)
+
+      const addButton = screen.getByTitle('New shell tab')
+      // Use overflow-x-auto to find the scrollable container -- this class exists
+      // on the scroll strip both before and after the change.
+      const scrollContainer = addButton.closest('.overflow-x-auto')
+
+      // The + button should NOT be inside the scrollable container
+      expect(scrollContainer).toBeNull()
     })
   })
 

@@ -100,7 +100,11 @@ export function useTabBarScroll(activeTabId: string | null, tabCount: number): T
     const containerCenter = el.clientWidth / 2
     const targetScroll = Math.max(0, tabCenterInContainer - containerCenter)
 
-    el.scrollTo({ left: targetScroll, behavior: 'smooth' })
+    if (typeof el.scrollTo === 'function') {
+      el.scrollTo({ left: targetScroll, behavior: 'smooth' })
+    } else {
+      el.scrollLeft = targetScroll
+    }
   }, [])
 
   // Auto-scroll when activeTabId changes
