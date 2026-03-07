@@ -60,7 +60,7 @@ export function buildPaneRefreshTarget(content: PaneContent): PaneRefreshTarget 
       : null
   }
   if (content.kind === 'browser') {
-    return content.url.trim()
+    return typeof content.url === 'string' && content.url.trim()
       ? { kind: 'browser', browserInstanceId: content.browserInstanceId }
       : null
   }
@@ -80,6 +80,7 @@ export function paneRefreshTargetMatchesContent(
   }
 
   return content.kind === 'browser'
+    && typeof content.url === 'string'
     && !!content.url.trim()
     && content.browserInstanceId === target.browserInstanceId
 }

@@ -4,6 +4,7 @@ import type { PanesState } from './paneTypes'
 import type { Tab } from './types'
 import { nanoid } from 'nanoid'
 import { broadcastPersistedRaw } from './persistBroadcast'
+import { isWellFormedPaneTree } from './paneTreeValidation.js'
 import { PANES_SCHEMA_VERSION } from './persistedState.js'
 import { PANES_STORAGE_KEY, TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
@@ -87,7 +88,12 @@ function migratePaneContent(content: any): any {
   if (content.kind === 'browser') {
     return {
       ...content,
-      browserInstanceId: content.browserInstanceId || nanoid(),
+      browserInstanceId:
+        typeof content.browserInstanceId === 'string' && content.browserInstanceId
+          ? content.browserInstanceId
+          : nanoid(),
+      url: typeof content.url === 'string' ? content.url : '',
+      devToolsOpen: typeof content.devToolsOpen === 'boolean' ? content.devToolsOpen : false,
     }
   }
   if (content.kind !== 'terminal') {
@@ -209,15 +215,28 @@ function loadPersistedPanesUncached(): any | null {
     const currentVersion = parsed.version || 1
     if (currentVersion >= PANES_SCHEMA_VERSION) {
       const sanitizedLayouts: Record<string, any> = {}
+      const droppedTabIds = new Set<string>()
       for (const [tabId, node] of Object.entries(parsed.layouts || {})) {
-        sanitizedLayouts[tabId] = stripEditorContentFromNode(node)
+        const sanitizedNode = stripEditorContentFromNode(migrateNode(node))
+        if (isWellFormedPaneTree(sanitizedNode)) {
+          sanitizedLayouts[tabId] = sanitizedNode
+        } else {
+          droppedTabIds.add(tabId)
+        }
       }
       // Already up to date, but ensure paneTitles/paneTitleSetByUser exist
       return {
         ...parsed,
         layouts: sanitizedLayouts,
-        paneTitles: parsed.paneTitles || {},
-        paneTitleSetByUser: parsed.paneTitleSetByUser || {},
+        activePane: Object.fromEntries(
+          Object.entries(parsed.activePane || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+        ),
+        paneTitles: Object.fromEntries(
+          Object.entries(parsed.paneTitles || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+        ),
+        paneTitleSetByUser: Object.fromEntries(
+          Object.entries(parsed.paneTitleSetByUser || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+        ),
       }
     }
 
@@ -256,15 +275,27 @@ function loadPersistedPanesUncached(): any | null {
     }
 
     const sanitizedLayouts: Record<string, any> = {}
+    const droppedTabIds = new Set<string>()
     for (const [tabId, node] of Object.entries(layouts)) {
-      sanitizedLayouts[tabId] = stripEditorContentFromNode(node)
+      const sanitizedNode = stripEditorContentFromNode(node)
+      if (isWellFormedPaneTree(sanitizedNode)) {
+        sanitizedLayouts[tabId] = sanitizedNode
+      } else {
+        droppedTabIds.add(tabId)
+      }
     }
 
     return {
       layouts: sanitizedLayouts,
-      activePane: parsed.activePane || {},
-      paneTitles,
-      paneTitleSetByUser: parsed.paneTitleSetByUser || {},
+      activePane: Object.fromEntries(
+        Object.entries(parsed.activePane || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+      ),
+      paneTitles: Object.fromEntries(
+        Object.entries(paneTitles).filter(([tabId]) => !droppedTabIds.has(tabId)),
+      ),
+      paneTitleSetByUser: Object.fromEntries(
+        Object.entries(parsed.paneTitleSetByUser || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+      ),
       version: PANES_SCHEMA_VERSION,
     }
   } catch {

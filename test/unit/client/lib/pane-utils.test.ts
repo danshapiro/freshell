@@ -85,6 +85,22 @@ describe('buildPaneRefreshTarget', () => {
       devToolsOpen: false,
     })).toEqual({ kind: 'browser', browserInstanceId: 'browser-1' })
   })
+
+  it('returns null instead of throwing for malformed browser content', () => {
+    expect(() => buildPaneRefreshTarget({
+      kind: 'browser',
+      browserInstanceId: 'browser-1',
+      url: undefined as any,
+      devToolsOpen: false,
+    } as any)).not.toThrow()
+
+    expect(buildPaneRefreshTarget({
+      kind: 'browser',
+      browserInstanceId: 'browser-1',
+      url: undefined as any,
+      devToolsOpen: false,
+    } as any)).toBeNull()
+  })
 })
 
 describe('paneRefreshTargetMatchesContent', () => {
@@ -112,6 +128,30 @@ describe('paneRefreshTargetMatchesContent', () => {
           url: 'https://example.test/a',
           devToolsOpen: false,
         },
+      ),
+    ).toBe(false)
+  })
+
+  it('returns false instead of throwing for malformed browser content', () => {
+    expect(() => paneRefreshTargetMatchesContent(
+      { kind: 'browser', browserInstanceId: 'browser-1' },
+      {
+        kind: 'browser',
+        browserInstanceId: 'browser-1',
+        url: undefined as any,
+        devToolsOpen: false,
+      } as any,
+    )).not.toThrow()
+
+    expect(
+      paneRefreshTargetMatchesContent(
+        { kind: 'browser', browserInstanceId: 'browser-1' },
+        {
+          kind: 'browser',
+          browserInstanceId: 'browser-1',
+          url: undefined as any,
+          devToolsOpen: false,
+        } as any,
       ),
     ).toBe(false)
   })

@@ -505,6 +505,7 @@ function PickerWrapper({
       case 'browser':
         return {
           kind: 'browser',
+          browserInstanceId: nanoid(),
           url: '',
           devToolsOpen: false,
         }

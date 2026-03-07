@@ -5,6 +5,7 @@ import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { buildPaneRefreshTarget, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { loadPersistedPanes } from './persistMiddleware.js'
+import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 
@@ -19,11 +20,14 @@ function normalizePaneContent(
   previous?: PaneContent,
 ): PaneContent {
   if (input.kind === 'terminal') {
-    const mode = input.mode || 'shell'
+    const mode = typeof input.mode === 'string' ? input.mode : 'shell'
     const hasLifecycleFields = input.createRequestId !== undefined || input.status !== undefined
     // Only validate Claude resume IDs; other providers pass through unchanged.
-    const resumeSessionId = hasLifecycleFields
+    const inputResumeSessionId = typeof input.resumeSessionId === 'string'
       ? input.resumeSessionId
+      : undefined
+    const resumeSessionId = hasLifecycleFields
+      ? inputResumeSessionId
       : mode === 'claude' && isValidClaudeSessionId(input.resumeSessionId)
         ? input.resumeSessionId
         : mode === 'claude'
@@ -41,14 +45,16 @@ function normalizePaneContent(
         : undefined)
     return {
       kind: 'terminal',
-      terminalId: input.terminalId,
-      createRequestId: input.createRequestId || nanoid(),
-      status: input.status || 'creating',
+      terminalId: typeof input.terminalId === 'string' ? input.terminalId : undefined,
+      createRequestId: typeof input.createRequestId === 'string' && input.createRequestId
+        ? input.createRequestId
+        : nanoid(),
+      status: typeof input.status === 'string' ? input.status : 'creating',
       mode,
-      shell: input.shell || 'system',
+      shell: typeof input.shell === 'string' ? input.shell : 'system',
       resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
-      initialCwd: input.initialCwd,
+      initialCwd: typeof input.initialCwd === 'string' ? input.initialCwd : undefined,
     }
   }
   if (input.kind === 'browser') {
@@ -56,9 +62,12 @@ function normalizePaneContent(
       previous?.kind === 'browser' ? previous.browserInstanceId : undefined
     return {
       kind: 'browser',
-      browserInstanceId: input.browserInstanceId || previousBrowserInstanceId || nanoid(),
-      url: input.url,
-      devToolsOpen: input.devToolsOpen,
+      browserInstanceId:
+        typeof input.browserInstanceId === 'string' && input.browserInstanceId
+          ? input.browserInstanceId
+          : previousBrowserInstanceId || nanoid(),
+      url: typeof input.url === 'string' ? input.url : '',
+      devToolsOpen: typeof input.devToolsOpen === 'boolean' ? input.devToolsOpen : false,
     }
   }
   if (input.kind === 'agent-chat') {
@@ -244,21 +253,112 @@ function findLeaf(node: PaneNode, id: string): Extract<PaneNode, { type: 'leaf' 
   return findLeaf(node.children[0], id) || findLeaf(node.children[1], id)
 }
 
-function normalizePaneTree(node: PaneNode, previous?: PaneNode): PaneNode {
+function normalizePaneTree(node: PaneNode, previous?: PaneNode): PaneNode | null {
+  const previousValid = previous && isWellFormedPaneTree(previous) ? previous : null
+  if (!hasPaneTreeShape(node)) {
+    return previousValid
+  }
   if (node.type === 'leaf') {
-    const previousLeaf = previous ? findLeaf(previous, node.id) : null
+    const previousLeaf = previousValid ? findLeaf(previousValid, node.id) : null
     return {
       ...node,
       content: normalizePaneContent(node.content, previousLeaf?.content),
     }
   }
+  const normalizedLeft = normalizePaneTree(node.children[0] as PaneNode, previousValid ?? undefined)
+  const normalizedRight = normalizePaneTree(node.children[1] as PaneNode, previousValid ?? undefined)
+  if (!normalizedLeft || !normalizedRight) {
+    return previousValid
+  }
   return {
     ...node,
-    children: [
-      normalizePaneTree(node.children[0], previous),
-      normalizePaneTree(node.children[1], previous),
-    ],
+    children: [normalizedLeft, normalizedRight],
   }
+}
+
+function collectLeafPaneIds(node: PaneNode): string[] {
+  if (node.type === 'leaf') {
+    return [node.id]
+  }
+  return [
+    ...collectLeafPaneIds(node.children[0]),
+    ...collectLeafPaneIds(node.children[1]),
+  ]
+}
+
+function filterPaneMetadataByLayout<T>(
+  metadata: Record<string, Record<string, T>> | undefined,
+  tabId: string,
+  paneIds: Set<string>,
+): Record<string, T> | undefined {
+  const tabMetadata = metadata?.[tabId]
+  if (!tabMetadata) return undefined
+  const filtered = Object.fromEntries(
+    Object.entries(tabMetadata).filter(([paneId]) => paneIds.has(paneId)),
+  )
+  return Object.keys(filtered).length > 0 ? filtered : undefined
+}
+
+function pickHydratedActivePane(
+  paneIds: string[],
+  incomingActivePaneId: string | undefined,
+  localActivePaneId: string | undefined,
+): string | undefined {
+  const paneIdSet = new Set(paneIds)
+  if (incomingActivePaneId && paneIdSet.has(incomingActivePaneId)) {
+    return incomingActivePaneId
+  }
+  if (localActivePaneId && paneIdSet.has(localActivePaneId)) {
+    return localActivePaneId
+  }
+  return paneIds[paneIds.length - 1]
+}
+
+function mergeHydratedPaneMetadata(
+  state: PanesState,
+  incoming: PanesState,
+  layouts: Record<string, PaneNode>,
+  incomingLayoutTabIds: Set<string>,
+): Pick<PanesState, 'activePane' | 'paneTitles' | 'paneTitleSetByUser'> {
+  const activePane: Record<string, string> = {}
+  const paneTitles: Record<string, Record<string, string>> = {}
+  const paneTitleSetByUser: Record<string, Record<string, boolean>> = {}
+
+  for (const [tabId, layout] of Object.entries(layouts)) {
+    const paneIds = collectLeafPaneIds(layout)
+    const paneIdSet = new Set(paneIds)
+    const preferredTitleSource = incomingLayoutTabIds.has(tabId)
+      ? incoming.paneTitles
+      : state.paneTitles
+    const preferredTitleSetByUserSource = incomingLayoutTabIds.has(tabId)
+      ? incoming.paneTitleSetByUser
+      : state.paneTitleSetByUser
+
+    const nextActivePane = pickHydratedActivePane(
+      paneIds,
+      incoming.activePane?.[tabId],
+      state.activePane?.[tabId],
+    )
+    if (nextActivePane) {
+      activePane[tabId] = nextActivePane
+    }
+
+    const nextPaneTitles = filterPaneMetadataByLayout(preferredTitleSource, tabId, paneIdSet)
+    if (nextPaneTitles) {
+      paneTitles[tabId] = nextPaneTitles
+    }
+
+    const nextPaneTitleSetByUser = filterPaneMetadataByLayout(
+      preferredTitleSetByUserSource,
+      tabId,
+      paneIdSet,
+    )
+    if (nextPaneTitleSetByUser) {
+      paneTitleSetByUser[tabId] = nextPaneTitleSetByUser
+    }
+  }
+
+  return { activePane, paneTitles, paneTitleSetByUser }
 }
 
 function clearPaneRefreshRequest(state: PanesState, tabId: string, paneId: string) {
@@ -305,9 +405,11 @@ function reconcileRefreshRequestsForTab(state: PanesState, tabId: string) {
  * terminal assignments that are more advanced. A local terminal pane
  * with a terminalId beats an incoming pane without one (same createRequestId).
  */
-function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode {
-  // Guard: bail to incoming if either node is malformed (corrupted localStorage)
-  if (!incoming || !local || !incoming.type || !local.type) return incoming
+function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode | null {
+  const incomingValid = hasPaneTreeShape(incoming)
+  const localValid = hasPaneTreeShape(local)
+  if (!incomingValid) return localValid ? local : null
+  if (!localValid) return incoming
 
   // If both leaves, apply smart merge for terminal and agent-chat content
   if (incoming.type === 'leaf' && local.type === 'leaf') {
@@ -370,12 +472,14 @@ function mergeTerminalState(incoming: PaneNode, local: PaneNode): PaneNode {
     Array.isArray(incoming.children) && incoming.children.length === 2 &&
     Array.isArray(local.children) && local.children.length === 2
   ) {
+    const mergedLeft = mergeTerminalState(incoming.children[0], local.children[0])
+    const mergedRight = mergeTerminalState(incoming.children[1], local.children[1])
+    if (!mergedLeft || !mergedRight) {
+      return local
+    }
     return {
       ...incoming,
-      children: [
-        mergeTerminalState(incoming.children[0], local.children[0]),
-        mergeTerminalState(incoming.children[1], local.children[1]),
-      ],
+      children: [mergedLeft, mergedRight],
     }
   }
 
@@ -797,11 +901,14 @@ export const panesSlice = createSlice({
       const { tabId, paneId, content } = action.payload
       const root = state.layouts[tabId]
       if (!root) return
+      let normalizedContentForTitle: PaneContent | null = null
 
       function updateContent(node: PaneNode): PaneNode {
         if (node.type === 'leaf') {
           if (node.id === paneId) {
-            return { ...node, content: normalizePaneContent(content, node.content) }
+            const nextContent = normalizePaneContent(content, node.content)
+            normalizedContentForTitle = nextContent
+            return { ...node, content: nextContent }
           }
           return node
         }
@@ -814,11 +921,11 @@ export const panesSlice = createSlice({
       state.layouts[tabId] = updateContent(root)
 
       // Update pane title when content changes, unless user explicitly set it
-      if (!state.paneTitleSetByUser?.[tabId]?.[paneId]) {
+      if (normalizedContentForTitle && !state.paneTitleSetByUser?.[tabId]?.[paneId]) {
         if (!state.paneTitles[tabId]) {
           state.paneTitles[tabId] = {}
         }
-        state.paneTitles[tabId][paneId] = derivePaneTitle(content)
+        state.paneTitles[tabId][paneId] = derivePaneTitle(normalizedContentForTitle)
       }
 
       reconcileRefreshRequestsForTab(state, tabId)
@@ -963,26 +1070,37 @@ export const panesSlice = createSlice({
       // advanced than the incoming (remote) state. This prevents cross-tab
       // sync from clobbering in-progress terminal creation/attachment.
       const mergedLayouts: Record<string, PaneNode> = {}
+      const incomingLayoutTabIds = new Set<string>()
       for (const [tabId, incomingNode] of Object.entries(incoming.layouts || {})) {
         const localNode = state.layouts[tabId]
+        const incomingHasShape = hasPaneTreeShape(incomingNode)
         const mergedNode = localNode
           ? mergeTerminalState(incomingNode as PaneNode, localNode)
-          : incomingNode as PaneNode
-        mergedLayouts[tabId] = normalizePaneTree(mergedNode, localNode)
+          : (incomingHasShape ? incomingNode as PaneNode : null)
+        const normalizedNode = mergedNode ? normalizePaneTree(mergedNode, localNode) : null
+        if (normalizedNode) {
+          mergedLayouts[tabId] = normalizedNode
+          if (incomingHasShape) {
+            incomingLayoutTabIds.add(tabId)
+          }
+        }
       }
       // Include any local-only tabs not in incoming (shouldn't normally happen,
       // but defensive)
       for (const tabId of Object.keys(state.layouts)) {
         if (!(tabId in mergedLayouts)) {
-          mergedLayouts[tabId] = normalizePaneTree(state.layouts[tabId])
+          const normalizedLocalNode = normalizePaneTree(state.layouts[tabId])
+          if (normalizedLocalNode) {
+            mergedLayouts[tabId] = normalizedLocalNode
+          }
         }
       }
 
       state.layouts = mergedLayouts
-      state.activePane = incoming.activePane || {}
-      state.paneTitles = incoming.paneTitles || {}
-      // paneTitleSetByUser may not be present on old states; default to empty
-      state.paneTitleSetByUser = (incoming as any).paneTitleSetByUser || {}
+      const nextMetadata = mergeHydratedPaneMetadata(state, incoming, mergedLayouts, incomingLayoutTabIds)
+      state.activePane = nextMetadata.activePane
+      state.paneTitles = nextMetadata.paneTitles
+      state.paneTitleSetByUser = nextMetadata.paneTitleSetByUser
       // Ephemeral signals must never be hydrated from remote
       state.renameRequestTabId = null
       state.renameRequestPaneId = null

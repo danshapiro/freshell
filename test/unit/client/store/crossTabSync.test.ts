@@ -159,7 +159,8 @@ describe('crossTabSync', () => {
         } as any,
       },
       activePane: { 'tab-1': 'pane-1' },
-      paneTitles: {},
+      paneTitles: { 'tab-1': { 'pane-1': 'Local shell title' } },
+      paneTitleSetByUser: { 'tab-1': { 'pane-1': true } },
     }))
 
     // Remote state arrives WITHOUT terminalId (stale data from before creation)
@@ -179,7 +180,8 @@ describe('crossTabSync', () => {
         },
       },
       activePane: { 'tab-1': 'pane-1' },
-      paneTitles: {},
+      paneTitles: { 'tab-1': { 'pane-1': 'Remote broken title' } },
+      paneTitleSetByUser: { 'tab-1': { 'pane-1': false } },
 
     })
 
@@ -213,7 +215,8 @@ describe('crossTabSync', () => {
         } as any,
       },
       activePane: { 'tab-1': 'pane-1' },
-      paneTitles: {},
+      paneTitles: { 'tab-1': { 'pane-1': 'Local shell title' } },
+      paneTitleSetByUser: { 'tab-1': { 'pane-1': true } },
     }))
 
     // Remote: stale state with old createRequestId and old terminalId
@@ -233,7 +236,8 @@ describe('crossTabSync', () => {
         },
       },
       activePane: { 'tab-1': 'pane-1' },
-      paneTitles: {},
+      paneTitles: { 'tab-1': { 'pane-1': 'Remote broken title' } },
+      paneTitleSetByUser: { 'tab-1': { 'pane-1': false } },
 
     })
 
@@ -322,7 +326,8 @@ describe('crossTabSync', () => {
         } as any,
       },
       activePane: { 'tab-1': 'pane-1' },
-      paneTitles: {},
+      paneTitles: { 'tab-1': { 'pane-1': 'Local shell title' } },
+      paneTitleSetByUser: { 'tab-1': { 'pane-1': true } },
     }))
 
     // Remote state: malformed split with missing children
@@ -338,19 +343,31 @@ describe('crossTabSync', () => {
         },
       },
       activePane: { 'tab-1': 'pane-1' },
-      paneTitles: {},
+      paneTitles: { 'tab-1': { 'pane-1': 'Remote broken title' } },
+      paneTitleSetByUser: { 'tab-1': { 'pane-1': false } },
 
     })
 
     cleanups.push(installCrossTabSync(store as any))
 
-    // Should not throw — gracefully falls back to incoming
+    // Should not throw — malformed remote data is ignored and local state wins.
     expect(() => {
       window.dispatchEvent(new StorageEvent('storage', { key: PANES_STORAGE_KEY, newValue: remoteRaw }))
     }).not.toThrow()
 
-    // Layout should be updated (to incoming, since merge can't recurse)
-    expect(store.getState().panes.layouts['tab-1']).toBeDefined()
+    expect(store.getState().panes.layouts['tab-1']).toEqual({
+      type: 'leaf',
+      id: 'pane-1',
+      content: expect.objectContaining({
+        kind: 'terminal',
+        terminalId: 'local-terminal-123',
+        createRequestId: 'req-1',
+        status: 'running',
+      }),
+    })
+    expect(store.getState().panes.activePane['tab-1']).toBe('pane-1')
+    expect(store.getState().panes.paneTitles['tab-1']).toEqual({ 'pane-1': 'Local shell title' })
+    expect(store.getState().panes.paneTitleSetByUser['tab-1']).toEqual({ 'pane-1': true })
   })
 
   it('preserves local resumeSessionId when remote has different session for same createRequestId', () => {
@@ -439,4 +456,3 @@ describe('crossTabSync', () => {
     expect(hydrateCalls).toHaveLength(2)
   })
 })
-

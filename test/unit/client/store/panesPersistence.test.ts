@@ -259,6 +259,75 @@ describe('Panes Persistence Integration', () => {
     expect(loaded!.version).toBe(PANES_SCHEMA_VERSION)
   })
 
+  it('repairs missing browserInstanceId in already-current persisted layouts', () => {
+    localStorage.setItem('freshell.panes.v2', JSON.stringify({
+      version: PANES_SCHEMA_VERSION,
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-1',
+          content: { kind: 'browser', url: 'https://example.com', devToolsOpen: false },
+        },
+      },
+      activePane: { 'tab-1': 'pane-1' },
+      paneTitles: {},
+      paneTitleSetByUser: {},
+    }))
+
+    const loaded = loadPersistedPanes()
+    const layout = loaded!.layouts['tab-1'] as any
+
+    expect(layout.content.kind).toBe('browser')
+    expect(layout.content.browserInstanceId).toBeDefined()
+  })
+
+  it('repairs missing browser fields in already-current persisted layouts', () => {
+    localStorage.setItem('freshell.panes.v2', JSON.stringify({
+      version: PANES_SCHEMA_VERSION,
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-1',
+          content: { kind: 'browser', browserInstanceId: 'browser-1' },
+        },
+      },
+      activePane: { 'tab-1': 'pane-1' },
+      paneTitles: {},
+      paneTitleSetByUser: {},
+    }))
+
+    const loaded = loadPersistedPanes()
+    const layout = loaded!.layouts['tab-1'] as any
+
+    expect(layout.content.kind).toBe('browser')
+    expect(layout.content.url).toBe('')
+    expect(layout.content.devToolsOpen).toBe(false)
+  })
+
+  it('drops malformed persisted pane layouts and their per-tab metadata', () => {
+    localStorage.setItem('freshell.panes.v2', JSON.stringify({
+      version: PANES_SCHEMA_VERSION,
+      layouts: {
+        'tab-1': {
+          type: 'split',
+          id: 'split-bad',
+          direction: 'horizontal',
+          sizes: [50, 50],
+        },
+      },
+      activePane: { 'tab-1': 'pane-1' },
+      paneTitles: { 'tab-1': { 'pane-1': 'Broken pane' } },
+      paneTitleSetByUser: { 'tab-1': { 'pane-1': true } },
+    }))
+
+    const loaded = loadPersistedPanes()
+
+    expect(loaded!.layouts['tab-1']).toBeUndefined()
+    expect(loaded!.activePane['tab-1']).toBeUndefined()
+    expect(loaded!.paneTitles['tab-1']).toBeUndefined()
+    expect(loaded!.paneTitleSetByUser['tab-1']).toBeUndefined()
+  })
+
   it('does not persist refreshRequestsByPane', () => {
     const store = configureStore({
       reducer: {
@@ -439,7 +508,7 @@ describe('PaneContent migration', () => {
     expect(layout.content.devToolsOpen).toBe(true)
   })
 
-  it('handles malformed pane content without crashing', () => {
+  it('drops malformed pane content without crashing', () => {
     const corruptedState = {
       layouts: {
         'tab-null': {
@@ -463,8 +532,9 @@ describe('PaneContent migration', () => {
     const loaded = loadPersistedPanes()
 
     expect(loaded).not.toBeNull()
-    expect(loaded.layouts['tab-null']).toBeDefined()
-    expect(loaded.layouts['tab-bad-split']).toBeDefined()
+    expect(loaded.layouts['tab-null']).toBeUndefined()
+    expect(loaded.layouts['tab-bad-split']).toBeUndefined()
+    expect(loaded.activePane['tab-null']).toBeUndefined()
   })
 })
 
