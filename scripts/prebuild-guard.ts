@@ -47,29 +47,51 @@ export interface ProdCheckResult {
   version?: string
 }
 
-export async function checkProdRunning(port: number): Promise<ProdCheckResult> {
+const PROD_CHECK_TIMEOUT_MS = 3000
+const PROD_CHECK_ATTEMPTS = 3
+const PROD_CHECK_RETRY_DELAY_MS = 100
+
+async function probeProdRunning(port: number): Promise<{
+  result: ProdCheckResult
+  transientFailure: boolean
+}> {
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), 2000)
+  const timeout = setTimeout(() => controller.abort(), PROD_CHECK_TIMEOUT_MS)
   try {
     const res = await fetch(`http://127.0.0.1:${port}/api/health`, {
       signal: controller.signal,
     })
 
     if (!res.ok) {
-      return { status: 'not-running' }
+      return { result: { status: 'not-running' }, transientFailure: false }
     }
 
     const data = (await res.json()) as { app?: string; version?: string }
     if (data.app === 'freshell') {
-      return { status: 'running', version: data.version }
+      return { result: { status: 'running', version: data.version }, transientFailure: false }
     }
 
-    return { status: 'not-running' }
+    return { result: { status: 'not-running' }, transientFailure: false }
   } catch {
-    return { status: 'not-running' }
+    return { result: { status: 'not-running' }, transientFailure: true }
   } finally {
     clearTimeout(timeout)
   }
+}
+
+export async function checkProdRunning(port: number): Promise<ProdCheckResult> {
+  for (let attempt = 1; attempt <= PROD_CHECK_ATTEMPTS; attempt += 1) {
+    const { result, transientFailure } = await probeProdRunning(port)
+    if (result.status === 'running') {
+      return result
+    }
+    if (!transientFailure || attempt === PROD_CHECK_ATTEMPTS) {
+      return result
+    }
+    await new Promise((resolve) => setTimeout(resolve, PROD_CHECK_RETRY_DELAY_MS))
+  }
+
+  return { status: 'not-running' }
 }
 
 export async function main(): Promise<void> {

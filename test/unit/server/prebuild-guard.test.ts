@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import http from 'http'
 import { checkProdRunning, parseEnv } from '../../../scripts/prebuild-guard.js'
 
@@ -62,13 +62,30 @@ describe('prebuild-guard', () => {
   })
 
   describe('checkProdRunning', () => {
-    let server: http.Server
+    let server: http.Server | undefined
     let port: number
 
     afterEach(async () => {
+      vi.unstubAllGlobals()
       if (server) {
         await new Promise<void>((resolve) => server.close(() => resolve()))
+        server = undefined
       }
+    })
+
+    it('retries transient probe failures before reporting not-running', async () => {
+      const fetchMock = vi.fn()
+        .mockRejectedValueOnce(new Error('socket hang up'))
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve({ app: 'freshell', ok: true, version: '0.5.0', ready: true }),
+        } as Response)
+      vi.stubGlobal('fetch', fetchMock)
+
+      const result = await checkProdRunning(3001)
+
+      expect(result).toEqual({ status: 'running', version: '0.5.0' })
+      expect(fetchMock).toHaveBeenCalledTimes(2)
     })
 
     it('returns running with version when freshell is on the port', async () => {

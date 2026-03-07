@@ -760,6 +760,8 @@ describe('terminal.create session repair wait', () => {
       creator.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
       await waitForMessage(creator, (m) => m.type === 'ready')
 
+      const listUpdatedPromise = waitForMessage(observer, (m) => m.type === 'terminal.list.updated')
+
       creator.send(JSON.stringify({
         type: 'terminal.create',
         requestId: 'create-attach-fail-list-update',
@@ -772,7 +774,7 @@ describe('terminal.create session repair wait', () => {
       )
       expect(registry.records.size).toBe(1)
 
-      await waitForMessage(observer, (m) => m.type === 'terminal.list.updated')
+      await listUpdatedPromise
 
       creator.send(JSON.stringify({
         type: 'terminal.attach',
