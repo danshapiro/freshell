@@ -2,7 +2,7 @@ import type { MenuItem, ContextTarget } from './context-menu-types'
 import type { AppView } from '@/components/Sidebar'
 import type { Tab, ProjectGroup } from '@/store/types'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
-import { findPaneContent } from '@/lib/pane-utils'
+import { buildPaneRefreshTarget, findPaneContent } from '@/lib/pane-utils'
 import { collectSessionRefsFromNode } from '@/lib/session-utils'
 import type { TerminalActions, EditorActions, BrowserActions } from '@/lib/pane-action-registry'
 import { buildResumeCommand, isResumeCommandProvider, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
@@ -15,12 +15,14 @@ export type MenuActions = {
   copyShareLink: () => void
   openView: (view: AppView) => void
   copyTabName: (tabId: string) => void
+  refreshTab: (tabId: string) => void
   renameTab: (tabId: string) => void
   closeTab: (tabId: string) => void
   closeOtherTabs: (tabId: string) => void
   closeTabsToRight: (tabId: string) => void
   moveTab: (tabId: string, dir: -1 | 1) => void
   renamePane: (tabId: string, paneId: string) => void
+  refreshPane: (tabId: string, paneId: string) => void
   replacePane: (tabId: string, paneId: string) => void
   splitPane: (tabId: string, paneId: string, direction: 'horizontal' | 'vertical') => void
   resetSplit: (tabId: string, splitId: string) => void
@@ -127,6 +129,14 @@ function buildCopyResumeMenuItem(id: string, candidate: ResumeCommandCandidate, 
   }
 }
 
+function collectPaneLeaves(node: PaneNode): Extract<PaneNode, { type: 'leaf' }>[] {
+  if (node.type === 'leaf') return [node]
+  return [
+    ...collectPaneLeaves(node.children[0]),
+    ...collectPaneLeaves(node.children[1]),
+  ]
+}
+
 export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): MenuItem[] {
   const { actions, tabs, paneLayouts, sessions, view, sidebarCollapsed, expandedProjects, contextElement, clickTarget, platform } = ctx
   const isSessionOpen = (sessionId: string, provider?: string) => {
@@ -201,10 +211,19 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     const isFirst = index <= 0
     const isLast = index === tabs.length - 1
     const onlyOne = tabs.length <= 1
+    const canRefreshTab = !!layout
+      && collectPaneLeaves(layout).some((leaf) => !!buildPaneRefreshTarget(leaf.content))
 
     return [
       { type: 'item', id: 'copy-tab-name', label: 'Copy tab name', onSelect: () => actions.copyTabName(target.tabId) },
       ...tabResumeMenuItem,
+      {
+        type: 'item',
+        id: 'refresh-tab',
+        label: 'Refresh tab',
+        onSelect: () => actions.refreshTab(target.tabId),
+        disabled: !canRefreshTab,
+      },
       { type: 'item', id: 'rename-tab', label: 'Rename tab', onSelect: () => actions.renameTab(target.tabId) },
       { type: 'separator', id: 'tab-sep' },
       { type: 'item', id: 'close-tab', label: 'Close tab', onSelect: () => actions.closeTab(target.tabId) },
@@ -238,8 +257,16 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     const paneResumeMenuItem = resumeCandidate
       ? [buildCopyResumeMenuItem('pane-copy-resume-command', resumeCandidate, actions)]
       : []
+    const canRefreshPane = !!paneContent && !!buildPaneRefreshTarget(paneContent)
     return [
       ...paneResumeMenuItem,
+      {
+        type: 'item',
+        id: 'refresh-pane',
+        label: 'Refresh pane',
+        onSelect: () => actions.refreshPane(target.tabId, target.paneId),
+        disabled: !canRefreshPane,
+      },
       { type: 'item', id: 'split-right', label: 'Split right', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'horizontal') },
       { type: 'item', id: 'split-down', label: 'Split down', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'vertical') },
       { type: 'separator', id: 'pane-split-sep' },
@@ -266,7 +293,15 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     const terminalResumeMenuItem = resumeCandidate
       ? [buildCopyResumeMenuItem('terminal-copy-resume-command', resumeCandidate, actions)]
       : []
+    const canRefreshPane = !!paneContent && !!buildPaneRefreshTarget(paneContent)
     return [
+      {
+        type: 'item',
+        id: 'refresh-pane',
+        label: 'Refresh pane',
+        onSelect: () => actions.refreshPane(target.tabId, target.paneId),
+        disabled: !canRefreshPane,
+      },
       { type: 'item', id: 'terminal-split-h', label: 'Split horizontally', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'horizontal') },
       { type: 'item', id: 'terminal-split-v', label: 'Split vertically', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'vertical') },
       { type: 'separator', id: 'terminal-split-sep' },
@@ -328,7 +363,18 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
 
   if (target.kind === 'browser') {
     const browserActions = actions.getBrowserActions(target.paneId)
+    const paneContent = paneLayouts[target.tabId]
+      ? findPaneContent(paneLayouts[target.tabId], target.paneId)
+      : null
+    const canRefreshPane = !!paneContent && !!buildPaneRefreshTarget(paneContent)
     return [
+      {
+        type: 'item',
+        id: 'refresh-pane',
+        label: 'Refresh pane',
+        onSelect: () => actions.refreshPane(target.tabId, target.paneId),
+        disabled: !canRefreshPane,
+      },
       { type: 'item', id: 'browser-split-h', label: 'Split horizontally', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'horizontal') },
       { type: 'item', id: 'browser-split-v', label: 'Split vertically', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'vertical') },
       { type: 'separator', id: 'browser-split-sep' },

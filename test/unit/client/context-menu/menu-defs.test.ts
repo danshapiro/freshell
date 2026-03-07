@@ -11,12 +11,14 @@ function createActions(): MenuActions {
     copyShareLink: vi.fn(),
     openView: vi.fn(),
     copyTabName: vi.fn(),
+    refreshTab: vi.fn(),
     renameTab: vi.fn(),
     closeTab: vi.fn(),
     closeOtherTabs: vi.fn(),
     closeTabsToRight: vi.fn(),
     moveTab: vi.fn(),
     renamePane: vi.fn(),
+    refreshPane: vi.fn(),
     replacePane: vi.fn(),
     splitPane: vi.fn(),
     resetSplit: vi.fn(),
@@ -122,6 +124,137 @@ describe('context menu global view labels', () => {
       'Open Projects',
       'Open Settings',
     ])
+  })
+})
+
+describe('buildMenuItems - refresh items', () => {
+  it('enables Refresh tab only when the stored layout has at least one refresh-capable leaf', () => {
+    const actions = createActions()
+    const items = buildMenuItems(
+      { kind: 'tab', tabId: 'tab-1' },
+      makeCtx(actions, {
+        paneLayouts: {
+          'tab-1': {
+            type: 'split',
+            id: 'split-1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              {
+                type: 'leaf',
+                id: 'pane-live-browser',
+                content: {
+                  kind: 'browser',
+                  browserInstanceId: 'browser-1',
+                  url: 'https://example.com',
+                  devToolsOpen: false,
+                },
+              },
+              {
+                type: 'leaf',
+                id: 'pane-blank-browser',
+                content: {
+                  kind: 'browser',
+                  browserInstanceId: 'browser-2',
+                  url: '',
+                  devToolsOpen: false,
+                },
+              },
+            ],
+          },
+        },
+      }),
+    )
+
+    const refreshItem = items.find((item) => item.type === 'item' && item.id === 'refresh-tab')
+    expect(refreshItem?.type).toBe('item')
+    expect(refreshItem?.type === 'item' ? refreshItem.disabled : true).toBe(false)
+  })
+
+  it('disables Refresh pane for blank browser panes and unattached terminal panes', () => {
+    const blankBrowserItems = buildMenuItems(
+      { kind: 'browser', tabId: 'tab-1', paneId: 'pane-1' },
+      makeCtx(createActions(), {
+        paneLayouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'browser',
+              browserInstanceId: 'browser-1',
+              url: '',
+              devToolsOpen: false,
+            },
+          },
+        },
+      }),
+    )
+    const blankBrowserRefresh = blankBrowserItems.find((item) => item.type === 'item' && item.id === 'refresh-pane')
+    expect(blankBrowserRefresh?.type === 'item' ? blankBrowserRefresh.disabled : false).toBe(true)
+
+    const unattachedTerminalItems = buildMenuItems(
+      { kind: 'terminal', tabId: 'tab-1', paneId: 'pane-1' },
+      makeCtx(createActions(), {
+        paneLayouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'shell',
+              createRequestId: 'req-1',
+              status: 'running',
+            },
+          },
+        },
+      }),
+    )
+    const unattachedTerminalRefresh = unattachedTerminalItems.find((item) => item.type === 'item' && item.id === 'refresh-pane')
+    expect(unattachedTerminalRefresh?.type === 'item' ? unattachedTerminalRefresh.disabled : false).toBe(true)
+  })
+
+  it('includes Refresh pane on pane, terminal, and browser menus', () => {
+    for (const target of [
+      { kind: 'pane', tabId: 'tab-1', paneId: 'pane-1' } as const,
+      { kind: 'terminal', tabId: 'tab-1', paneId: 'pane-1' } as const,
+      { kind: 'browser', tabId: 'tab-1', paneId: 'pane-2' } as const,
+    ]) {
+      const items = buildMenuItems(target, makeCtx(createActions(), {
+        paneLayouts: {
+          'tab-1': {
+            type: 'split',
+            id: 'split-1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              {
+                type: 'leaf',
+                id: 'pane-1',
+                content: {
+                  kind: 'terminal',
+                  mode: 'shell',
+                  createRequestId: 'req-1',
+                  terminalId: 'term-1',
+                  status: 'running',
+                },
+              },
+              {
+                type: 'leaf',
+                id: 'pane-2',
+                content: {
+                  kind: 'browser',
+                  browserInstanceId: 'browser-2',
+                  url: 'https://example.com',
+                  devToolsOpen: false,
+                },
+              },
+            ],
+          },
+        },
+      }))
+
+      expect(items.find((item) => item.type === 'item' && item.id === 'refresh-pane')).toBeDefined()
+    }
   })
 })
 
