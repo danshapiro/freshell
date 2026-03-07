@@ -4,7 +4,7 @@
 
 **Goal:** Ensure any session already open in a local tab is present in the left sidebar at bootstrap and after later local tab/open/restore actions, even when that session is older than the default paginated 100-session window.
 
-**Architecture:** Keep sidebar selection authoritative on the server. Normalize exact open-session locators from local tabs, then teach the server’s first-page session selector to union matching local session keys into page 1 while preserving the real cursor boundary for page 2+. Reuse that same selector in the three places that matter: JSON-bodied HTTP bootstrap/query when open-session locators must be sent, the websocket handshake snapshot, and a per-connection refresh triggered by the existing `ui.layout.sync` stream when the local open-session set changes.
+**Architecture:** Keep sidebar selection authoritative on the server. Normalize exact open-session locators from local tabs, then teach the server’s first-page session selector to union matching local session keys into page 1 while preserving the real cursor boundary for page 2+. Reuse that same selector in the three places that matter: JSON-bodied HTTP bootstrap/query when open-session locators must be sent, the websocket handshake snapshot, and a per-connection refresh triggered by `ui.layout.sync`. To make that later refresh see the same open-session state as bootstrap, extend `ui.layout.sync` so it carries tab-level fallback session locators for tabs that have `resumeSessionId` but do not yet have a pane layout.
 
 **Tech Stack:** React 18, Redux Toolkit, Express, WebSocket (`ws`), Zod, Vitest, Testing Library
 
@@ -17,6 +17,7 @@
 - Do not add count caps like `.max(200)` to websocket hello/session payloads. Existing byte-based HTTP and websocket limits are the correct safety boundary.
 - Do not encode locator JSON into query params. Use JSON request bodies when locators must cross HTTP.
 - Rebuttal to review issue 3: the server already knows which server instance is local. Normalize locators against the authoritative server instance id in `server/index.ts`/`server/ws-handler.ts`; do not depend on the client to tell the server which instance is local.
+- Later websocket refreshes must preserve the same no-layout fallback as bootstrap. Do not recompute only from `m.layouts`; recompute from `m.layouts` plus tab-level fallback session locators mirrored in `ui.layout.sync.tabs`.
 - Only the first page is force-included. Page 2+ must continue to paginate from the normal page-1 cursor boundary.
 - Inclusion is additive. Existing `mergeSnapshotProjects()` behavior can keep an older session visible after its tab closes; that is acceptable for this change.
 - No `docs/index.html` update is needed because the UI surface is unchanged.
@@ -320,9 +321,14 @@ git commit -m "feat: personalize sidebar bootstrap sessions query"
 **Files:**
 - Modify: `shared/ws-protocol.ts`
 - Modify: `src/store/paneTypes.ts`
+- Modify: `src/store/layoutMirrorMiddleware.ts`
 - Modify: `src/lib/ws-client.ts`
 - Modify: `src/App.tsx`
+- Modify: `server/agent-api/layout-schema.ts`
+- Modify: `server/agent-api/layout-store.ts`
 - Modify: `server/ws-handler.ts`
+- Modify: `test/unit/client/layout-mirror-middleware.test.ts`
+- Modify: `test/unit/server/agent-layout-schema.test.ts`
 - Modify: `test/server/ws-handshake-snapshot.test.ts`
 - Create: `test/server/ws-sidebar-snapshot-refresh.test.ts`
 
@@ -334,10 +340,28 @@ Extend `test/server/ws-handshake-snapshot.test.ts` with a paginated-handshake ca
 - the first `sessions.updated` snapshot includes the older open local session even though it is outside the first 100
 - the cursor metadata still points at the normal first-page boundary
 
+Extend `test/unit/client/layout-mirror-middleware.test.ts` so a tab with `resumeSessionId` but no layout still emits:
+
+```typescript
+{
+  type: 'ui.layout.sync',
+  tabs: [{
+    id: 'tab-1',
+    title: 'alpha',
+    fallbackSessionRef: { provider: 'codex', sessionId: 'older-open' },
+  }],
+  layouts: {},
+  // ...
+}
+```
+
+Extend `test/unit/server/agent-layout-schema.test.ts` so the schema accepts `tabs[].fallbackSessionRef`.
+
 Create `test/server/ws-sidebar-snapshot-refresh.test.ts` covering the post-bootstrap invariant:
 - connect and receive the normal paginated first page
-- send `ui.layout.sync` whose layout contains an older local session outside the first page
+- send `ui.layout.sync` for a tab that has no layout entry yet but does have `tabs[].fallbackSessionRef` for an older local session outside the first page
 - assert the same websocket receives a fresh `sessions.updated` snapshot including that older session
+- assert layout-backed sessions and tab-level fallback sessions dedupe cleanly when both identify the same session
 - assert foreign-only copied-session locators do not trigger inclusion
 
 **Step 2: Run the targeted tests to verify failure**
@@ -346,10 +370,12 @@ Run:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/show-open-tab-sessions-in-sidebar
+npx vitest run test/unit/client/layout-mirror-middleware.test.ts
+npx vitest run --config vitest.server.config.ts test/unit/server/agent-layout-schema.test.ts
 npx vitest run --config vitest.server.config.ts test/server/ws-handshake-snapshot.test.ts test/server/ws-sidebar-snapshot-refresh.test.ts
 ```
 
-Expected: FAIL because hello does not carry sidebar locators and `ui.layout.sync` does not refresh sidebar snapshots yet.
+Expected: FAIL because hello does not carry sidebar locators yet, `ui.layout.sync` does not mirror tab-level fallback session refs, and the websocket refresh path cannot currently see no-layout tabs.
 
 **Step 3: Implement websocket personalization**
 
@@ -357,8 +383,23 @@ In `shared/ws-protocol.ts`:
 - add `SessionLocatorSchema`
 - export its inferred type
 - extend `HelloSchema` with an optional `sidebarOpenSessions: z.array(SessionLocatorSchema).optional()`
+- extend `UiLayoutSyncSchema.tabs[]` with an optional `fallbackSessionRef: SessionLocatorSchema`
 
 In `src/store/paneTypes.ts`, alias `SessionLocator` to the shared protocol type so client and server use the same shape.
+
+In `src/store/layoutMirrorMiddleware.ts`, include the tab-level no-layout fallback in the mirrored payload:
+
+```typescript
+tabs: state.tabs.tabs.map((tab: any) => ({
+  id: tab.id,
+  title: tab.title,
+  fallbackSessionRef: buildTabFallbackSessionRef(tab),
+}))
+```
+
+where `buildTabFallbackSessionRef(tab)` returns:
+- `undefined` for shell tabs or tabs without `resumeSessionId`
+- `{ provider, sessionId }` for a local tab-level fallback session
 
 In `src/lib/ws-client.ts`, extend `HelloExtensionProvider` so it can return `sidebarOpenSessions`.
 
@@ -375,10 +416,12 @@ ws.setHelloExtensionProvider(() => ({
 }))
 ```
 
+In `server/agent-api/layout-schema.ts` and `server/agent-api/layout-store.ts`, accept and store the richer `tabs[]` shape with optional `fallbackSessionRef` so websocket validation and the in-memory snapshot stay in sync.
+
 In `server/ws-handler.ts`:
 - add per-connection state for normalized sidebar-open keys/signature
 - on `hello`, normalize `m.sidebarOpenSessions` with `buildSidebarOpenSessionKeys(..., this.serverInstanceId)`
-- on `ui.layout.sync`, extract locators from pane `sessionRef` / `resumeSessionId`, recompute the key set, and if it changed, send a fresh personalized snapshot to that websocket
+- on `ui.layout.sync`, extract locators from pane `sessionRef` / `resumeSessionId` plus `tabs[].fallbackSessionRef` for tabs whose layout is still missing, recompute the key set, and if it changed, send a fresh personalized snapshot to that websocket
 - extract one helper for paginated snapshots, then route handshake snapshots, `sessions.fetch`, and `broadcastSessionsUpdated()` through it so every paginated snapshot uses the same authoritative first-page selector
 
 Use a handler shape like:
@@ -387,7 +430,10 @@ Use a handler shape like:
 case 'ui.layout.sync': {
   this.layoutStore?.updateFromUi(m, ws.connectionId || 'unknown')
   const nextKeys = buildSidebarOpenSessionKeys(
-    collectSessionLocatorsFromUiLayout(m.layouts),
+    [
+      ...collectSessionLocatorsFromUiLayout(m.layouts),
+      ...collectFallbackSessionLocatorsFromUiTabs(m.tabs, m.layouts),
+    ],
     this.serverInstanceId,
   )
   if (!sameKeySet(state.sidebarOpenSessionKeys, nextKeys)) {
@@ -404,6 +450,8 @@ Run:
 
 ```bash
 cd /home/user/code/freshell/.worktrees/show-open-tab-sessions-in-sidebar
+npx vitest run test/unit/client/layout-mirror-middleware.test.ts
+npx vitest run --config vitest.server.config.ts test/unit/server/agent-layout-schema.test.ts
 npx vitest run --config vitest.server.config.ts test/server/ws-handshake-snapshot.test.ts test/server/ws-sidebar-snapshot-refresh.test.ts
 ```
 
@@ -413,7 +461,7 @@ Expected: PASS.
 
 ```bash
 cd /home/user/code/freshell/.worktrees/show-open-tab-sessions-in-sidebar
-git add shared/ws-protocol.ts src/store/paneTypes.ts src/lib/ws-client.ts src/App.tsx server/ws-handler.ts test/server/ws-handshake-snapshot.test.ts test/server/ws-sidebar-snapshot-refresh.test.ts
+git add shared/ws-protocol.ts src/store/paneTypes.ts src/store/layoutMirrorMiddleware.ts src/lib/ws-client.ts src/App.tsx server/agent-api/layout-schema.ts server/agent-api/layout-store.ts server/ws-handler.ts test/unit/client/layout-mirror-middleware.test.ts test/unit/server/agent-layout-schema.test.ts test/server/ws-handshake-snapshot.test.ts test/server/ws-sidebar-snapshot-refresh.test.ts
 git commit -m "feat: personalize websocket sidebar snapshots"
 ```
 
@@ -437,21 +485,22 @@ expect(screen.getByText('Older Open Session')).toBeInTheDocument()
 ```
 after rendering `App` with a restored open tab and a mocked `POST /api/sessions/query` response that contains the older open session.
 
-2. Post-bootstrap path:
+2. Post-bootstrap no-layout path:
 ```typescript
 store.dispatch(openSessionTab({ provider: 'codex', sessionId: 'older-open' }))
-messageHandler?.({
-  type: 'sessions.updated',
-  projects: [{ projectPath: '/repo', sessions: [olderOpenSession, ...recentSessions] }],
-  totalSessions: 300,
-  oldestIncludedTimestamp: recentBoundary,
-  oldestIncludedSessionId: 'codex:boundary',
-  hasMore: true,
-})
+expect(mockSend).toHaveBeenCalledWith(expect.objectContaining({
+  type: 'ui.layout.sync',
+  tabs: expect.arrayContaining([
+    expect.objectContaining({
+      fallbackSessionRef: { provider: 'codex', sessionId: 'older-open' },
+    }),
+  ]),
+}))
+messageHandler?.(personalizedSidebarSnapshot)
 expect(screen.getByText('Older Open Session')).toBeInTheDocument()
 ```
 
-The second test proves the actual sidebar UI updates once the personalized websocket refresh arrives after a later local tab open.
+Keep `TabContent` mocked in this test so the tab remains in the no-layout state long enough to prove the fallback `ui.layout.sync` path, then assert the actual sidebar updates once the personalized websocket refresh arrives.
 
 **Step 2: Run the new e2e file to verify failure**
 
