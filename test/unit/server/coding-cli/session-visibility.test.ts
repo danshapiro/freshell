@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { parseCodexSessionContent } from '../../../../server/coding-cli/providers/codex'
+import { parseSessionContent } from '../../../../server/coding-cli/providers/claude'
 
 describe('session visibility flags', () => {
   describe('Codex isNonInteractive detection', () => {
@@ -44,6 +45,28 @@ describe('session visibility flags', () => {
       ].join('\n')
 
       const meta = parseCodexSessionContent(content)
+      expect(meta.isNonInteractive).toBeFalsy()
+    })
+  })
+
+  describe('Claude isNonInteractive detection', () => {
+    it('sets isNonInteractive when queue-operation events are present', () => {
+      const content = [
+        JSON.stringify({ type: 'queue-operation', subtype: 'enqueue', taskId: 'task-1' }),
+        JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Automated task' } }),
+      ].join('\n')
+
+      const meta = parseSessionContent(content)
+      expect(meta.isNonInteractive).toBe(true)
+    })
+
+    it('does not set isNonInteractive for normal Claude sessions', () => {
+      const content = [
+        JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Help me' } }),
+        JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Sure!' }] } }),
+      ].join('\n')
+
+      const meta = parseSessionContent(content)
       expect(meta.isNonInteractive).toBeFalsy()
     })
   })

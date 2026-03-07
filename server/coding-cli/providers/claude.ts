@@ -18,6 +18,7 @@ export type JsonlMeta = {
   messageCount?: number
   gitBranch?: string
   isDirty?: boolean
+  isNonInteractive?: boolean
   tokenUsage?: TokenSummary
 }
 
@@ -246,6 +247,7 @@ export function parseSessionContent(content: string, options: ParseSessionOption
   let gitBranch: string | undefined
   let isDirty: boolean | undefined
   let model: string | undefined
+  let isNonInteractive: boolean | undefined
   const usageSeen = new Set<string>()
   let latestUsage:
     | {
@@ -262,6 +264,8 @@ export function parseSessionContent(content: string, options: ParseSessionOption
     } catch {
       continue
     }
+
+    if (obj.type === 'queue-operation') isNonInteractive = true
 
     if (!sessionId) {
       const candidates = [
@@ -399,6 +403,7 @@ export function parseSessionContent(content: string, options: ParseSessionOption
     messageCount: lines.length,
     gitBranch,
     isDirty,
+    isNonInteractive,
     tokenUsage,
   }
 }

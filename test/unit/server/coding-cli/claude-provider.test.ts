@@ -839,3 +839,47 @@ describe('claude provider cross-platform tests', () => {
     })
   })
 })
+
+describe('parseSessionContent() - non-interactive detection', () => {
+  it('sets isNonInteractive when content contains a queue-operation event', () => {
+    const content = [
+      JSON.stringify({ type: 'queue-operation', subtype: 'enqueue', taskId: 'task-1' }),
+      JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Do something' } }),
+    ].join('\n')
+
+    const meta = parseSessionContent(content)
+    expect(meta.isNonInteractive).toBe(true)
+  })
+
+  it('does not set isNonInteractive for normal interactive sessions', () => {
+    const content = [
+      JSON.stringify({ type: 'file-history-snapshot', messageId: 'abc', snapshot: {} }),
+      JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Hello' } }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'Hi there' }] } }),
+    ].join('\n')
+
+    const meta = parseSessionContent(content)
+    expect(meta.isNonInteractive).toBeFalsy()
+  })
+
+  it('does not set isNonInteractive for sessions with only file-history-snapshot events', () => {
+    const content = [
+      JSON.stringify({ type: 'file-history-snapshot', messageId: 'a', snapshot: {} }),
+      JSON.stringify({ type: 'file-history-snapshot', messageId: 'b', snapshot: {} }),
+    ].join('\n')
+
+    const meta = parseSessionContent(content)
+    expect(meta.isNonInteractive).toBeFalsy()
+  })
+
+  it('sets isNonInteractive even when queue-operation is not the first line', () => {
+    const content = [
+      JSON.stringify({ type: 'file-history-snapshot', messageId: 'abc', snapshot: {} }),
+      JSON.stringify({ type: 'queue-operation', subtype: 'dequeue', taskId: 'task-2' }),
+      JSON.stringify({ cwd: '/home/user/project', type: 'user', message: { role: 'user', content: 'Run tests' } }),
+    ].join('\n')
+
+    const meta = parseSessionContent(content)
+    expect(meta.isNonInteractive).toBe(true)
+  })
+})
