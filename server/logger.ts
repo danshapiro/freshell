@@ -9,9 +9,13 @@ import { createStream, type RotatingFileStream } from 'rotating-file-stream'
 
 const env = process.env.NODE_ENV || 'development'
 const level = process.env.LOG_LEVEL || 'debug'
-const DEFAULT_DEBUG_LOG_FILE = 'server-debug.jsonl'
+const DEFAULT_DEBUG_LOG_FILE = 'server-debug'
+const DEFAULT_DEBUG_LOG_SUFFIX = '.jsonl'
 const DEFAULT_DEBUG_LOG_SIZE: SizeString = '10M'
 const DEFAULT_DEBUG_LOG_MAX_FILES = 5
+const SOURCE_ENTRY_MATCHERS = [/(^|\/)server\/index\.ts$/i, /(^|\/)server\/index\.js$/i]
+const DIST_ENTRY_MATCHERS = [/(^|\/)dist\/server\/index\.js$/i]
+type LogMode = 'development' | 'production'
 
 type LogContext = {
   requestId?: string
@@ -81,6 +85,7 @@ export function getLogContext(): LogContext | undefined {
 export function resolveDebugLogPath(
   envVars: NodeJS.ProcessEnv = process.env,
   homeDir: string = os.homedir(),
+  argv: string[] = process.argv,
 ): string | null {
   const explicitPath = envVars.LOG_DEBUG_PATH?.trim()
   if (explicitPath) return path.resolve(explicitPath)
@@ -88,7 +93,85 @@ export function resolveDebugLogPath(
 
   const logDirOverride = envVars.FRESHELL_LOG_DIR?.trim()
   const logDir = logDirOverride ? path.resolve(logDirOverride) : path.join(homeDir, '.freshell', 'logs')
-  return path.join(logDir, DEFAULT_DEBUG_LOG_FILE)
+  const filename = resolveDebugLogFilename(envVars, argv)
+  return path.join(logDir, filename)
+}
+
+function normalizeLogMode(value: string | undefined): LogMode | undefined {
+  const normalized = value?.trim().toLowerCase()
+  if (normalized === 'development' || normalized === 'dev') return 'development'
+  if (normalized === 'production' || normalized === 'prod') return 'production'
+  return undefined
+}
+
+function normalizeArgPath(arg: string): string {
+  return path
+    .normalize(arg)
+    .replace(/\\+/g, '/')
+    .replace(/^\.\/+/, '')
+    .toLowerCase()
+}
+
+function sanitizeInstanceTag(value: string | undefined): string | undefined {
+  const trimmed = value?.trim()
+  if (!trimmed) return undefined
+
+  const sanitized = path
+    .basename(trimmed.replace(/\\/g, '/'))
+    .replace(/[^a-zA-Z0-9._-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '')
+
+  return sanitized || undefined
+}
+
+function inferLogModeFromArgv(argv: string[] = process.argv): LogMode | undefined {
+  const normalizedArgv = argv.map(normalizeArgPath)
+  const hasDistEntry = normalizedArgv.some((arg) =>
+    DIST_ENTRY_MATCHERS.some((regex) => regex.test(arg)),
+  )
+  if (hasDistEntry) return 'production'
+
+  const hasSourceEntry = normalizedArgv.some((arg) => {
+    if (arg.includes('dist/server/')) return false
+    return SOURCE_ENTRY_MATCHERS.some((regex) => regex.test(arg))
+  })
+  if (hasSourceEntry) return 'development'
+
+  return undefined
+}
+
+function resolveDebugLogMode(
+  envVars: NodeJS.ProcessEnv = process.env,
+  argv: string[] = process.argv,
+): LogMode {
+  return (
+    normalizeLogMode(envVars.FRESHELL_LOG_MODE) ??
+    inferLogModeFromArgv(argv) ??
+    (envVars.NODE_ENV === 'production' ? 'production' : 'development')
+  )
+}
+
+function resolveDebugInstanceTag(envVars: NodeJS.ProcessEnv = process.env): string {
+  const explicit = sanitizeInstanceTag(envVars.FRESHELL_LOG_INSTANCE_ID)
+  if (explicit) return explicit
+
+  const fallback = [
+    sanitizeInstanceTag(envVars.FRESHELL_DEBUG_STREAM_INSTANCE),
+    sanitizeInstanceTag(envVars.PORT),
+    sanitizeInstanceTag(envVars.VITE_PORT),
+  ].find((value) => value)
+
+  return fallback ?? String(process.pid)
+}
+
+function resolveDebugLogFilename(
+  envVars: NodeJS.ProcessEnv = process.env,
+  argv: string[] = process.argv,
+): string {
+  const mode = resolveDebugLogMode(envVars, argv)
+  const instance = resolveDebugInstanceTag(envVars)
+  return `${DEFAULT_DEBUG_LOG_FILE}.${mode}.${instance}${DEFAULT_DEBUG_LOG_SUFFIX}`
 }
 
 export function createDebugFileStream(filePath: string, options: DebugFileStreamOptions = {}): RotatingFileStream {
@@ -159,9 +242,19 @@ export function createLogger(destination?: DestinationStream) {
   const debugLogPath = resolveDebugLogPath()
   if (debugLogPath) {
     try {
+      const debugMode = resolveDebugLogMode()
+      const debugInstance = resolveDebugInstanceTag()
       const debugStream = createDebugFileStream(debugLogPath)
       streams.push({ stream: debugStream, level: 'debug' })
       attachDebugStreamWarnings(debugStream, consoleLogger, debugLogPath)
+      consoleLogger.info(
+        {
+          filePath: debugLogPath,
+          debugMode,
+          debugInstance,
+        },
+        'Resolved debug log path',
+      )
     } catch (err) {
       consoleLogger.warn({ err, filePath: debugLogPath }, 'Debug log file disabled')
     }

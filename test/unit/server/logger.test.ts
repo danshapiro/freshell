@@ -163,10 +163,193 @@ describe("logger", () => {
         const logDir = path.join(os.tmpdir(), "freshell-logs")
         const { resolveDebugLogPath } = await import("../../../server/logger")
         const resolved = resolveDebugLogPath(
-          { FRESHELL_LOG_DIR: logDir, NODE_ENV: "development" } as NodeJS.ProcessEnv,
+          { FRESHELL_LOG_DIR: logDir, NODE_ENV: "development", PORT: "3001" } as NodeJS.ProcessEnv,
           "/home/test",
         )
-        expect(resolved).toBe(path.join(path.resolve(logDir), "server-debug.jsonl"))
+        expect(resolved).toBe(
+          path.join(
+            path.resolve(logDir),
+            "server-debug.development.3001.jsonl",
+          ),
+        )
+      },
+      TEST_TIMEOUT_MS,
+    )
+
+    it(
+      "uses explicit mode over NODE_ENV when computing defaults",
+      async () => {
+        const { resolveDebugLogPath } = await import("../../../server/logger")
+        const resolved = resolveDebugLogPath(
+          { FRESHELL_LOG_MODE: "development", NODE_ENV: "production", PORT: "3001" } as NodeJS.ProcessEnv,
+          "/home/test",
+        )
+        expect(resolved).toContain("server-debug.development.3001.jsonl")
+      },
+      TEST_TIMEOUT_MS,
+    )
+
+    it(
+      "infers development from source entry in argv",
+      async () => {
+        const { resolveDebugLogPath } = await import("../../../server/logger")
+        const resolved = resolveDebugLogPath(
+          { NODE_ENV: "production", PORT: "3001" } as NodeJS.ProcessEnv,
+          "/home/test",
+          ["node", "node_modules/.bin/tsx", "watch", "server/index.ts"],
+        )
+        expect(resolved).toContain("server-debug.development.3001.jsonl")
+      },
+      TEST_TIMEOUT_MS,
+    )
+
+    it(
+      "infers production from dist entry in argv",
+      async () => {
+        const { resolveDebugLogPath } = await import("../../../server/logger")
+        const resolved = resolveDebugLogPath(
+          { NODE_ENV: "development", PORT: "3001" } as NodeJS.ProcessEnv,
+          "/home/test",
+          ["node", "C:/repo/dist/server/index.js"],
+        )
+        expect(resolved).toContain("server-debug.production.3001.jsonl")
+      },
+      TEST_TIMEOUT_MS,
+    )
+
+    it(
+      "handles windows-style dist args during inference",
+      async () => {
+        const { resolveDebugLogPath } = await import("../../../server/logger")
+        const resolved = resolveDebugLogPath(
+          { NODE_ENV: "development", PORT: "3001" } as NodeJS.ProcessEnv,
+          "/home/test",
+          ["node", "C:\\repo\\dist\\server\\index.js"],
+        )
+        expect(resolved).toContain("server-debug.production.3001.jsonl")
+      },
+      TEST_TIMEOUT_MS,
+    )
+
+    it(
+      "treats unknown FRESHELL_LOG_MODE as invalid and falls back to argv inference",
+      async () => {
+        const { resolveDebugLogPath } = await import("../../../server/logger")
+        const resolved = resolveDebugLogPath(
+          { FRESHELL_LOG_MODE: "staging", NODE_ENV: "production", PORT: "3001" } as NodeJS.ProcessEnv,
+          "/home/test",
+          ["node", "node_modules/.bin/tsx", "watch", "server/index.ts"],
+        )
+        expect(resolved).toContain("server-debug.development.3001.jsonl")
+      },
+      TEST_TIMEOUT_MS,
+    )
+
+    it(
+      "uses explicit FRESHELL_LOG_INSTANCE_ID for filename suffix",
+      async () => {
+        const { resolveDebugLogPath } = await import("../../../server/logger")
+        const alpha = resolveDebugLogPath(
+          { FRESHELL_LOG_INSTANCE_ID: "alpha", PORT: "3001" } as NodeJS.ProcessEnv,
+          "/home/test",
+        )
+        const beta = resolveDebugLogPath(
+          { FRESHELL_LOG_INSTANCE_ID: "beta", PORT: "3001" } as NodeJS.ProcessEnv,
+          "/home/test",
+        )
+        expect(alpha).toContain("server-debug.development.alpha.jsonl")
+        expect(beta).toContain("server-debug.development.beta.jsonl")
+        expect(alpha).not.toBe(beta)
+      },
+      TEST_TIMEOUT_MS,
+    )
+
+    it(
+      "falls back to process PID for instance tag when no instance env vars are set",
+      async () => {
+        const { resolveDebugLogPath } = await import("../../../server/logger")
+        const resolved = resolveDebugLogPath(
+          { NODE_ENV: "production", FRESHELL_LOG_DIR: "/tmp/freshell-logs" } as NodeJS.ProcessEnv,
+          "/home/test",
+        )
+        expect(resolved).toContain(`server-debug.production.${process.pid}.jsonl`)
+      },
+      TEST_TIMEOUT_MS,
+    )
+
+    it(
+      "sanitizes unsafe instance IDs in debug log filenames",
+      async () => {
+        const { resolveDebugLogPath } = await import("../../../server/logger")
+        const resolved = resolveDebugLogPath(
+          {
+            FRESHELL_LOG_INSTANCE_ID: "..\\..\\tmp\\unsafe\\path",
+            FRESHELL_LOG_DIR: "/var/freshell/logs",
+            PORT: "3001",
+          } as NodeJS.ProcessEnv,
+          "/home/test",
+        )
+        expect(resolved).toBe(path.join(path.resolve("/var/freshell/logs"), "server-debug.development.path.jsonl"))
+      },
+      TEST_TIMEOUT_MS,
+    )
+
+    it(
+      "uses legacy instance variable before PORT fallback",
+      async () => {
+        const { resolveDebugLogPath } = await import("../../../server/logger")
+        const resolved = resolveDebugLogPath(
+          { FRESHELL_DEBUG_STREAM_INSTANCE: "ci-run-1", PORT: "3001" } as NodeJS.ProcessEnv,
+          "/home/test",
+        )
+        expect(resolved).toContain("server-debug.development.ci-run-1.jsonl")
+      },
+      TEST_TIMEOUT_MS,
+    )
+
+    it(
+      "falls back to PORT or VITE_PORT for instance suffix deterministically",
+      async () => {
+        const { resolveDebugLogPath } = await import("../../../server/logger")
+        const portBased = resolveDebugLogPath({ PORT: "3001" } as NodeJS.ProcessEnv, "/home/test")
+        const vitePortBased = resolveDebugLogPath({ VITE_PORT: "3101" } as NodeJS.ProcessEnv, "/home/test")
+        expect(portBased).toContain("server-debug.development.3001.jsonl")
+        expect(vitePortBased).toContain("server-debug.development.3101.jsonl")
+      },
+      TEST_TIMEOUT_MS,
+    )
+
+    it(
+      "uses FRESHELL_LOG_INSTANCE_ID over legacy stream instance",
+      async () => {
+        const { resolveDebugLogPath } = await import("../../../server/logger")
+        const resolved = resolveDebugLogPath(
+          {
+            FRESHELL_LOG_INSTANCE_ID: "explicit",
+            FRESHELL_DEBUG_STREAM_INSTANCE: "legacy",
+            PORT: "3001",
+          } as NodeJS.ProcessEnv,
+          "/home/test",
+        )
+        expect(resolved).toContain("server-debug.development.explicit.jsonl")
+      },
+      TEST_TIMEOUT_MS,
+    )
+
+    it(
+      "logs resolved debug path format with mode and instance",
+      async () => {
+        const { resolveDebugLogPath } = await import("../../../server/logger")
+        const resolved = resolveDebugLogPath(
+          {
+            NODE_ENV: "production",
+            FRESHELL_DEBUG_STREAM_INSTANCE: "abc",
+            PORT: "3001",
+          } as NodeJS.ProcessEnv,
+          "/tmp",
+          ["node", "/workspace/dist/server/index.js"],
+        )
+        expect(resolved).toContain("server-debug.production.abc.jsonl")
       },
       TEST_TIMEOUT_MS,
     )
