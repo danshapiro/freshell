@@ -260,10 +260,14 @@ function normalizePaneTree(node: PaneNode, previous?: PaneNode): PaneNode | null
   }
   if (node.type === 'leaf') {
     const previousLeaf = previousValid ? findLeaf(previousValid, node.id) : null
-    return {
+    const normalizedLeaf: Extract<PaneNode, { type: 'leaf' }> = {
       ...node,
       content: normalizePaneContent(node.content, previousLeaf?.content),
     }
+    if (isWellFormedPaneTree(normalizedLeaf)) {
+      return normalizedLeaf
+    }
+    return previousLeaf && isWellFormedPaneTree(previousLeaf) ? previousLeaf : null
   }
   const normalizedLeft = normalizePaneTree(node.children[0] as PaneNode, previousValid ?? undefined)
   const normalizedRight = normalizePaneTree(node.children[1] as PaneNode, previousValid ?? undefined)
@@ -1080,7 +1084,7 @@ export const panesSlice = createSlice({
         const normalizedNode = mergedNode ? normalizePaneTree(mergedNode, localNode) : null
         if (normalizedNode) {
           mergedLayouts[tabId] = normalizedNode
-          if (incomingHasShape) {
+          if (incomingHasShape && normalizedNode !== localNode) {
             incomingLayoutTabIds.add(tabId)
           }
         }

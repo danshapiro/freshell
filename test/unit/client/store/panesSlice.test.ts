@@ -2165,6 +2165,55 @@ describe('panesSlice', () => {
         expect((layout.content as any).browserInstanceId).toBeDefined()
       }
     })
+
+    it('falls back to local state when hydratePanes receives malformed leaf content', () => {
+      const localState: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'shell',
+              createRequestId: 'req-1',
+              status: 'running',
+              terminalId: 'local-terminal-1',
+            },
+          } as any,
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Local title' } },
+        paneTitleSetByUser: { 'tab-1': { 'pane-1': true } },
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      }
+
+      const incoming: PanesState = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: { kind: 'editor' },
+          } as any,
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Remote bad title' } },
+        paneTitleSetByUser: { 'tab-1': { 'pane-1': false } },
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      }
+
+      const next = panesReducer(localState, hydratePanes(incoming))
+
+      expect(next.layouts['tab-1']).toEqual(localState.layouts['tab-1'])
+      expect(next.activePane['tab-1']).toBe('pane-1')
+      expect(next.paneTitles['tab-1']).toEqual({ 'pane-1': 'Local title' })
+      expect(next.paneTitleSetByUser['tab-1']).toEqual({ 'pane-1': true })
+    })
   })
 
   describe('PaneContent types', () => {
