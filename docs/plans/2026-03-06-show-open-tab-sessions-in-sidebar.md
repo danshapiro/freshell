@@ -4,7 +4,7 @@
 
 **Goal:** Ensure any coding session already open in a local Freshell tab is present in the left sidebar at bootstrap and after later local tab/open/restore activity, even when that session is older than the default paginated 100-session window.
 
-**Architecture:** Make the server authoritative for the sidebar snapshot. The client collects exact session locators from tabs and panes, keeps those exact locators for local-vs-foreign dedupe/navigation decisions, and sends them to the server only so the server can personalize the first sidebar page. The server normalizes only the local subset, force-includes those sessions into personalized first-page snapshots, preserves the real page-1 cursor boundary for page 2+, and reuses the same selection path for HTTP bootstrap, websocket handshake/broadcast, and per-connection refreshes triggered by `ui.layout.sync`.
+**Architecture:** Make the server authoritative for the sidebar snapshot. The client collects exact session locators plus intrinsic local fallback locators from open tabs and panes, keeps those richer locators for local-vs-foreign dedupe/navigation decisions, and sends them to the server only so the server can personalize the first sidebar page. The server normalizes only the local subset, force-includes those sessions into personalized first-page snapshots, preserves the real page-1 cursor boundary for page 2+, and reuses the same selection path for HTTP bootstrap, websocket handshake/broadcast, and per-connection refreshes triggered by `ui.layout.sync`.
 
 **Tech Stack:** React 18, Redux Toolkit, Express, WebSocket (`ws`), Zod, Vitest, Testing Library, supertest
 
@@ -16,10 +16,11 @@
 - Work only in `/home/user/code/freshell/.worktrees/show-open-tab-sessions-in-sidebar`.
 - `state.sessions.projects` remains the single sidebar data source. Do not add client-side synthetic sidebar items or a second sidebar-only cache.
 - Keep exact local-vs-foreign session identity authoritative until after match/open decisions are made. Collapse to plain `provider:sessionId` only in display-only selectors such as sidebar `hasTab`.
+- When a local pane has both `sessionRef` and `resumeSessionId`, treat that as two locators: the exact locator and an intrinsic id-less local fallback. Remote copied panes intentionally carry only the explicit foreign locator because their `resumeSessionId` is stripped.
 - The server must own first-page personalization. Do not solve this by fetching a normal page and then hydrating missing items on the client.
 - Only page 1 is personalized. Page 2+ must continue to paginate from the true page-1 cursor boundary, even if page 1 force-includes older extra sessions.
 - Personalized page-1 `hasMore` means “there exists at least one unique session not already present in the returned page,” not “raw filtered count is greater than limit.”
-- Preserve no-layout tab fallback. Bootstrap can happen before websocket `ready`, and local tab/open/restore activity can also happen before `serverInstanceId` is known.
+- Preserve both layout-backed intrinsic local fallbacks (`resumeSessionId`) and no-layout tab fallbacks. Bootstrap can happen before websocket `ready`, and local tab/open/restore activity can also happen before `serverInstanceId` is known.
 - Do not add count caps like `.max(200)` to `sidebarOpenSessions` or `openSessions`. Existing HTTP/WS byte limits are the right safety boundary.
 - Do not encode locator JSON into query params. Use JSON bodies when locators must cross HTTP.
 - The live HTTP router is `server/sessions-router.ts`. Do not accidentally implement this only in `server/routes/sessions.ts`.
@@ -27,7 +28,7 @@
 - Existing `mergeSnapshotProjects()` behavior can keep an older session visible after its tab closes; that is acceptable for this feature.
 - No `docs/index.html` update is needed because the UI surface does not change.
 
-### Task 1: Collect Exact Open-Session Locators On The Client
+### Task 1: Collect Exact And Intrinsic Open-Session Locators On The Client
 
 **Files:**
 - Modify: `src/lib/session-utils.ts`
@@ -37,14 +38,15 @@
 
 **Step 1: Write the failing tests**
 
-In `test/unit/client/lib/session-utils.test.ts`, add coverage for a new exact-locator collection path that preserves mixed local/remote candidates instead of collapsing immediately to `provider:sessionId`.
+In `test/unit/client/lib/session-utils.test.ts`, add coverage for a new locator-collection path that preserves mixed local/remote candidates and intrinsic local fallbacks instead of collapsing immediately to `provider:sessionId`.
 
 Add expectations like:
 
 ```typescript
 expect(collectSessionLocatorsFromTabs(tabs, panes)).toEqual([
-  { provider: 'codex', sessionId: 'shared', serverInstanceId: 'srv-remote' },
+  { provider: 'codex', sessionId: 'shared', serverInstanceId: 'srv-local' },
   { provider: 'codex', sessionId: 'shared' },
+  { provider: 'codex', sessionId: 'shared', serverInstanceId: 'srv-remote' },
   { provider: 'claude', sessionId: VALID_SESSION_ID },
 ])
 
@@ -56,6 +58,8 @@ expect(collectSessionRefsFromTabs(tabs, panes)).toEqual([
 
 Cover:
 - explicit `sessionRef` with `serverInstanceId`
+- terminal and `agent-chat` panes that carry both `sessionRef` and `resumeSessionId`, producing both the exact locator and the intrinsic id-less local fallback
+- remote copied panes with explicit foreign `sessionRef` but no `resumeSessionId`, producing only the explicit foreign locator
 - terminal panes and `agent-chat` panes
 - legacy tab-level `resumeSessionId` fallback when a tab has no layout yet
 - exact duplicate locators deduped by full locator identity
@@ -75,10 +79,12 @@ npx vitest run test/unit/client/lib/session-utils.test.ts test/unit/client/store
 
 Expected: FAIL because the exact-locator helper does not exist yet.
 
-**Step 3: Implement the exact-locator collector and collapsed display wrapper**
+**Step 3: Implement the exact-and-intrinsic locator collector and collapsed display wrapper**
 
 In `src/lib/session-utils.ts`:
-- add `extractSessionLocator(content)` that preserves explicit `sessionRef.serverInstanceId`
+- replace the single-ref extraction path with `extractSessionLocators(content)` that returns:
+  - the explicit `sessionRef` when present and valid
+  - the intrinsic local locator derived from terminal/agent-chat `resumeSessionId`, even when the explicit locator is also present
 - add `collectSessionLocatorsFromNode()` and `collectSessionLocatorsFromTabs()`
 - dedupe exact locators by `provider + sessionId + serverInstanceId ?? ''`
 - add `collectSessionRefsFromTabs()` as the display-only wrapper that collapses exact locators to unique `provider:sessionId`
@@ -132,7 +138,7 @@ git commit -m "refactor: collect exact open session locators"
 In `test/unit/client/lib/session-utils.test.ts`, extend the matcher coverage so exact locators remain authoritative after Task 1:
 - a local target `{ provider, sessionId }` ignores a foreign explicit candidate when that is the only existing tab
 - a local target prefers a local explicit or id-less fallback candidate over a foreign explicit candidate with the same `provider:sessionId`
-- the same local-target behavior still holds before websocket `ready`, when `localServerInstanceId` is still `undefined`
+- the same local-target behavior still holds before websocket `ready`, when `localServerInstanceId` is still `undefined`, because a layout-backed local pane contributes an intrinsic id-less fallback alongside its explicit local locator
 - an explicit foreign target `{ provider, sessionId, serverInstanceId: 'srv-remote' }` still resolves to the foreign copied tab
 
 Add expectations like:
@@ -140,7 +146,8 @@ Add expectations like:
 ```typescript
 expect(findTabIdForSession(localAndForeignState, { provider: 'codex', sessionId: 'shared' }, 'srv-local')).toBe('tab-local')
 expect(findTabIdForSession(foreignOnlyState, { provider: 'codex', sessionId: 'shared' }, 'srv-local')).toBeUndefined()
-expect(findTabIdForSession(preReadyState, { provider: 'codex', sessionId: 'shared' }, undefined)).toBe('tab-local-fallback')
+expect(findTabIdForSession(preReadyState, { provider: 'codex', sessionId: 'shared' }, undefined)).toBe('tab-local')
+expect(findTabIdForSession(noLayoutFallbackState, { provider: 'codex', sessionId: 'shared' }, undefined)).toBe('tab-local-fallback')
 expect(findPaneForSession(
   state,
   { provider: 'codex', sessionId: 'shared', serverInstanceId: 'srv-remote' },
@@ -151,7 +158,8 @@ expect(findPaneForSession(
 Use separate fixtures for:
 - “local + foreign both exist” so preference ordering is explicit
 - “foreign only exists” so the local target returns no match instead of hijacking
-- “pre-ready local fallback exists” so id-less local tabs still win before `serverInstanceId` arrives
+- “pre-ready layout-backed local pane exists” so the intrinsic id-less fallback from `resumeSessionId` still wins before `serverInstanceId` arrives
+- “no-layout fallback exists” so tab-level `resumeSessionId` still wins before `serverInstanceId` arrives
 - no-layout fallback tabs where the local match is present only via tab-level `resumeSessionId`
 
 In `test/unit/client/store/tabsSlice.test.ts`, add a thunk regression with `connection.serverInstanceId = 'srv-local'`:
@@ -182,6 +190,7 @@ Expected: FAIL because the matching helpers still collapse to plain `provider:se
 In `src/lib/session-utils.ts`:
 - change `findTabIdForSession(...)` and `findPaneForSession(...)` to accept a target locator and `localServerInstanceId?: string`
 - stop early-returning on the first `provider:sessionId` match; instead collect candidate locators and choose the best-scoring one
+- make pane traversal use the new `extractSessionLocators(...)` path so layout-backed local panes contribute both their explicit locator and their intrinsic id-less local fallback
 - treat tab-level `resumeSessionId` fallback as an id-less local candidate
 - keep first-in-tab-order behavior only as the tie-breaker among candidates with the same positive score
 
@@ -557,7 +566,7 @@ In `server/agent-api/layout-schema.ts` and `server/agent-api/layout-store.ts`:
 In `server/ws-handler.ts`:
 - add per-connection state for normalized sidebar-open keys/signature
 - on `hello`, normalize `m.sidebarOpenSessions` with `buildSidebarOpenSessionKeys(..., this.serverInstanceId)`
-- on `ui.layout.sync`, extract locators from pane `sessionRef` / `resumeSessionId` plus `tabs[].fallbackSessionRef` for tabs whose layout is still missing, normalize them, and if the key set changed, send a fresh personalized snapshot to that websocket
+- on `ui.layout.sync`, extract locators from pane `sessionRef` and intrinsic local `resumeSessionId` plus `tabs[].fallbackSessionRef` for tabs whose layout is still missing, normalize them, and if the key set changed, send a fresh personalized snapshot to that websocket
 - normalize layout-backed `agent-chat` panes to provider `claude` during server-side locator extraction
 - route handshake snapshots, `broadcastSessionsUpdated()`, and `sessions.fetch` through one shared paginated-sidebar snapshot path so every personalized first page uses the same authoritative selection rules
 
