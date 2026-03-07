@@ -9,8 +9,8 @@ import {
   type TouchEvent as ReactTouchEvent,
 } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { addTab, updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
-import { consumePaneRefreshRequest, initLayout, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
+import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
+import { consumePaneRefreshRequest, splitPane, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 import { recordTurnComplete, clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
@@ -895,11 +895,11 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             },
             text: m.path,
             activate: () => {
-              const id = nanoid()
-              dispatch(addTab({ id, mode: 'shell' }))
-              dispatch(initLayout({
-                tabId: id,
-                content: {
+              dispatch(splitPane({
+                tabId,
+                paneId,
+                direction: 'horizontal',
+                newContent: {
                   kind: 'editor',
                   filePath: m.path,
                   language: null,

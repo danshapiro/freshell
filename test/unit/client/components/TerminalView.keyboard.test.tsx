@@ -165,6 +165,66 @@ function createTestStore(terminalId?: string) {
   }
 }
 
+function createTerminalContent(createRequestId: string, terminalId?: string): TerminalPaneContent {
+  return {
+    kind: 'terminal',
+    createRequestId,
+    status: 'running',
+    mode: 'shell',
+    shell: 'system',
+    terminalId,
+    initialCwd: '/tmp',
+  }
+}
+
+function createFileLinkTestStore(options: {
+  tabId?: string
+  paneId: string
+  paneContent?: TerminalPaneContent
+  layout: PaneNode
+  activePaneId: string
+}) {
+  const tabId = options.tabId ?? 'tab-1'
+  const paneId = options.paneId
+  const paneContent = options.paneContent ?? createTerminalContent('req-1', 'term-1')
+
+  return {
+    store: configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'shell' as const,
+            status: 'running' as const,
+            title: 'Shell',
+            titleSetByUser: false,
+            createRequestId: paneContent.createRequestId,
+            terminalId: paneContent.terminalId,
+            createdAt: 1,
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: options.layout },
+          activePane: { [tabId]: options.activePaneId },
+          paneTitles: {},
+        },
+        settings: { settings: defaultSettings, status: 'loaded' as const },
+        connection: { status: 'connected' as const, error: null },
+      },
+    }),
+    tabId,
+    paneId,
+    paneContent,
+  }
+}
+
 function createKeyboardEvent(key: string, modifiers: { ctrlKey?: boolean; shiftKey?: boolean; altKey?: boolean; metaKey?: boolean } = {}, type = 'keydown'): KeyboardEvent {
   const codeByKey: Record<string, string> = {
     v: 'KeyV',
@@ -597,7 +657,7 @@ describe('TerminalView keyboard handling', () => {
   })
 
   describe('local file path links', () => {
-    it('opens an editor tab when a detected local file link is activated', async () => {
+    it('opens an editor pane on the same tab when a detected local file link is activated', async () => {
       const { store, tabId, paneId, paneContent } = createTestStore('term-1')
 
       render(
@@ -621,17 +681,94 @@ describe('TerminalView keyboard handling', () => {
 
       links![0].activate()
 
-      const nextTab = store.getState().tabs.tabs[1]
-      expect(nextTab).toBeDefined()
-      const layout = store.getState().panes.layouts[nextTab.id]
-      expect(layout).toBeDefined()
-      expect(layout.type).toBe('leaf')
-      if (layout.type === 'leaf') {
-        expect(layout.content.kind).toBe('editor')
-        if (layout.content.kind === 'editor') {
-          expect(layout.content.filePath).toBe('/tmp/example.txt')
-        }
+      const state = store.getState()
+      expect(state.tabs.tabs).toHaveLength(1)
+      expect(state.tabs.activeTabId).toBe(tabId)
+
+      const layout = state.panes.layouts[tabId]
+      expect(layout.type).toBe('split')
+      if (layout.type !== 'split') {
+        throw new Error('expected split layout')
       }
+
+      expect(layout.children[0]).toMatchObject({ type: 'leaf', id: paneId })
+      expect(layout.children[1]).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'editor',
+          filePath: '/tmp/example.txt',
+          language: null,
+          readOnly: false,
+          content: '',
+          viewMode: 'source',
+        },
+      })
+    })
+
+    it('targets the clicked pane instead of the active pane when the clicked terminal is not active', async () => {
+      const activePaneId = 'pane-active'
+      const clickedPaneId = 'pane-clicked'
+
+      const activeContent = createTerminalContent('req-active', 'term-active')
+      const clickedContent = createTerminalContent('req-clicked', 'term-clicked')
+
+      const layout: PaneNode = {
+        type: 'split',
+        id: 'split-root',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          { type: 'leaf', id: activePaneId, content: activeContent },
+          { type: 'leaf', id: clickedPaneId, content: clickedContent },
+        ],
+      }
+
+      const { store, tabId } = createFileLinkTestStore({
+        paneId: clickedPaneId,
+        paneContent: clickedContent,
+        layout,
+        activePaneId,
+      })
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={clickedPaneId} paneContent={clickedContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(capturedLinkProvider).not.toBeNull()
+      })
+
+      let links: any[] | undefined
+      capturedLinkProvider!.provideLinks(1, (provided) => {
+        links = provided
+      })
+
+      links![0].activate()
+
+      const root = store.getState().panes.layouts[tabId]
+      expect(root.type).toBe('split')
+      if (root.type !== 'split') {
+        throw new Error('expected root split layout')
+      }
+
+      expect(root.children[0]).toMatchObject({ type: 'leaf', id: activePaneId })
+
+      const clickedBranch = root.children[1]
+      expect(clickedBranch.type).toBe('split')
+      if (clickedBranch.type !== 'split') {
+        throw new Error('expected clicked branch split layout')
+      }
+
+      expect(clickedBranch.children[0]).toMatchObject({ type: 'leaf', id: clickedPaneId })
+      expect(clickedBranch.children[1]).toMatchObject({
+        type: 'leaf',
+        content: {
+          kind: 'editor',
+          filePath: '/tmp/example.txt',
+        },
+      })
     })
   })
 })
