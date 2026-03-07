@@ -4,7 +4,7 @@
 
 **Goal:** Ensure any session already open in a local tab is present in the left sidebar at bootstrap and after later local tab/open/restore actions, even when that session is older than the default paginated 100-session window.
 
-**Architecture:** Keep sidebar selection authoritative on the server. Normalize exact open-session locators from local tabs, then teach the server’s first-page session selector to union matching local session keys into page 1 while preserving the real cursor boundary for page 2+. Reuse that same selector in the three places that matter: JSON-bodied HTTP bootstrap/query when open-session locators must be sent, the websocket handshake snapshot, and a per-connection refresh triggered by `ui.layout.sync`. To make that later refresh see the same open-session state as bootstrap, extend `ui.layout.sync` so it carries tab-level fallback session locators for tabs that have `resumeSessionId` but do not yet have a pane layout.
+**Architecture:** Keep sidebar selection authoritative on the server, but keep exact session-locator identity authoritative on the client until after match/open decisions are made. Local session opens must prefer local or id-less tab state and must not collapse back to plain `provider:sessionId` early enough for a foreign copied tab to hijack the action. On the server, teach the first-page selector to union matching local session keys into page 1 while preserving the real cursor boundary for page 2+ and computing `hasMore` from the unique sessions not already present in that expanded first page. Reuse that selector in the three places that matter: JSON-bodied HTTP bootstrap/query when open-session locators must be sent, the websocket handshake snapshot, and a per-connection refresh triggered by `ui.layout.sync`. To make that later refresh see the same open-session state as bootstrap, extend `ui.layout.sync` so it carries tab-level fallback session locators for tabs that have `resumeSessionId` but do not yet have a pane layout.
 
 **Tech Stack:** React 18, Redux Toolkit, Express, WebSocket (`ws`), Zod, Vitest, Testing Library
 
@@ -18,7 +18,9 @@
 - Do not encode locator JSON into query params. Use JSON request bodies when locators must cross HTTP.
 - Rebuttal to review issue 3: the server already knows which server instance is local. Normalize locators against the authoritative server instance id in `server/index.ts`/`server/ws-handler.ts`; do not depend on the client to tell the server which instance is local.
 - Later websocket refreshes must preserve the same no-layout fallback as bootstrap. Do not recompute only from `m.layouts`; recompute from `m.layouts` plus tab-level fallback session locators mirrored in `ui.layout.sync.tabs`.
+- Exact locators are authoritative for navigation and dedupe. Collapse to plain `provider:sessionId` only in display-only selectors such as sidebar `hasTab`, not in `findTabIdForSession`, `findPaneForSession`, or `openSessionTab`.
 - Only the first page is force-included. Page 2+ must continue to paginate from the normal page-1 cursor boundary.
+- First-page `hasMore` means “there exists at least one unique session not already present in the expanded page-1 result.” Do not derive it from `primaryPage.length` or raw `allSessions.length > limit`.
 - Inclusion is additive. Existing `mergeSnapshotProjects()` behavior can keep an older session visible after its tab closes; that is acceptable for this change.
 - No `docs/index.html` update is needed because the UI surface is unchanged.
 
@@ -77,6 +79,7 @@ In `src/lib/session-utils.ts`:
 - add `collectSessionLocatorsFromNode()` and `collectSessionLocatorsFromTabs()`
 - dedupe exact locators by `provider + sessionId + serverInstanceId ?? ''`
 - add `collectSessionRefsFromTabs()` as the wrapper that collapses exact locators to unique `provider:sessionId`
+- keep `collectSessionRefsFromTabs()` explicitly display-only so later tasks do not reuse the lossy form for navigation/dedupe matching
 
 Use a structure like:
 
@@ -111,7 +114,119 @@ git add src/lib/session-utils.ts src/store/selectors/sidebarSelectors.ts test/un
 git commit -m "refactor: collect exact open session locators"
 ```
 
-### Task 2: Add One Server-Side Sidebar Selection Path
+### Task 2: Use Exact Locators For Local Session Matching And Open Flows
+
+**Files:**
+- Modify: `src/lib/session-utils.ts`
+- Modify: `src/store/tabsSlice.ts`
+- Modify: `src/components/Sidebar.tsx`
+- Modify: `test/unit/client/lib/session-utils.test.ts`
+- Modify: `test/unit/client/store/tabsSlice.test.ts`
+- Modify: `test/unit/client/components/Sidebar.test.tsx`
+
+**Step 1: Write the failing client-matching tests**
+
+In `test/unit/client/lib/session-utils.test.ts`, extend the matcher coverage so exact locators remain authoritative after Task 1:
+- a local target `{ provider, sessionId }` ignores a foreign explicit candidate when that is the only existing tab
+- a local target prefers a local explicit or id-less fallback candidate over a foreign explicit candidate with the same `provider:sessionId`
+- an explicit foreign target `{ provider, sessionId, serverInstanceId: 'srv-remote' }` still resolves to the foreign copied tab
+
+Add expectations like:
+
+```typescript
+expect(findTabIdForSession(localAndForeignState, { provider: 'codex', sessionId: 'shared' }, 'srv-local')).toBe('tab-local')
+expect(findTabIdForSession(foreignOnlyState, { provider: 'codex', sessionId: 'shared' }, 'srv-local')).toBeUndefined()
+expect(findPaneForSession(
+  state,
+  { provider: 'codex', sessionId: 'shared', serverInstanceId: 'srv-remote' },
+  'srv-local',
+)).toEqual({ tabId: 'tab-remote', paneId: 'pane-remote' })
+```
+
+Use separate fixtures for:
+- “local + foreign both exist” so preference ordering is explicit
+- “foreign only exists” so the local target returns no match instead of hijacking
+- no-layout fallback tabs where the local match is present only via tab-level `resumeSessionId`
+
+In `test/unit/client/store/tabsSlice.test.ts`, add a thunk regression with `connection.serverInstanceId = 'srv-local'`:
+- seed one foreign copied tab whose pane content has `sessionRef = { provider: 'codex', sessionId: 'shared', serverInstanceId: 'srv-remote' }`
+- dispatch `openSessionTab({ provider: 'codex', sessionId: 'shared' })`
+- assert it creates/activates a local tab with `resumeSessionId: 'shared'` instead of activating the foreign copy
+
+In `test/unit/client/components/Sidebar.test.tsx`, add a click-path regression:
+- seed the active tab with a foreign copied pane for `codex:shared`
+- render a sidebar item for the local indexed `codex:shared` session
+- click it and assert the component adds a new local pane/tab instead of focusing the foreign copied pane
+
+**Step 2: Run the targeted tests to verify failure**
+
+Run:
+
+```bash
+cd /home/user/code/freshell/.worktrees/show-open-tab-sessions-in-sidebar
+npx vitest run test/unit/client/lib/session-utils.test.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/components/Sidebar.test.tsx
+```
+
+Expected: FAIL because the matching helpers still collapse to plain `provider:sessionId` and return the first foreign match they encounter.
+
+**Step 3: Implement exact-locator-aware matching**
+
+In `src/lib/session-utils.ts`:
+- change `findTabIdForSession(...)` and `findPaneForSession(...)` to accept a target locator and `localServerInstanceId?: string`
+- stop early-returning on the first `provider:sessionId` match; instead collect candidate locators and choose the best-scoring one
+- score candidates so local session opens cannot be hijacked by foreign explicit copies:
+
+```typescript
+function matchScore(
+  candidate: SessionLocator,
+  target: SessionLocator,
+  localServerInstanceId?: string,
+): number {
+  if (candidate.provider !== target.provider || candidate.sessionId !== target.sessionId) return 0
+  if (target.serverInstanceId) {
+    if (candidate.serverInstanceId === target.serverInstanceId) return 3
+    if (target.serverInstanceId === localServerInstanceId && candidate.serverInstanceId == null) return 2
+    return 0
+  }
+  if (candidate.serverInstanceId === localServerInstanceId) return 3
+  if (candidate.serverInstanceId == null) return 2
+  return 0
+}
+```
+
+- treat tab-level `resumeSessionId` fallback as an id-less local candidate
+- keep first-in-tab-order behavior only as the tie-breaker among candidates with the same positive score
+
+In `src/store/tabsSlice.ts`:
+- derive `const localServerInstanceId = state.connection.serverInstanceId`
+- call `findTabIdForSession(state, { provider: resolvedProvider, sessionId }, localServerInstanceId)` before deduping
+- keep the public thunk API local-session-oriented: `openSessionTab({ provider, sessionId })` still means “open the local session”, but it now resolves against exact locators instead of the collapsed key
+
+In `src/components/Sidebar.tsx`:
+- build the same local target locator from the clicked sidebar item
+- pass `state.connection.serverInstanceId` into `findPaneForSession(...)`
+- leave the rest of the click flow unchanged so the only behavioral change is “foreign copied tabs no longer satisfy local-session dedupe”
+
+**Step 4: Re-run the targeted tests**
+
+Run:
+
+```bash
+cd /home/user/code/freshell/.worktrees/show-open-tab-sessions-in-sidebar
+npx vitest run test/unit/client/lib/session-utils.test.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/components/Sidebar.test.tsx
+```
+
+Expected: PASS.
+
+**Step 5: Commit**
+
+```bash
+cd /home/user/code/freshell/.worktrees/show-open-tab-sessions-in-sidebar
+git add src/lib/session-utils.ts src/store/tabsSlice.ts src/components/Sidebar.tsx test/unit/client/lib/session-utils.test.ts test/unit/client/store/tabsSlice.test.ts test/unit/client/components/Sidebar.test.tsx
+git commit -m "fix: prefer local session matches over foreign copies"
+```
+
+### Task 3: Add One Server-Side Sidebar Selection Path
 
 **Files:**
 - Create: `server/sidebar-session-selection.ts`
@@ -146,6 +261,8 @@ In `test/unit/server/session-pagination.test.ts`, add force-inclusion cases:
 - a forced session already in the normal window is not duplicated
 - page 2 ignores force-inclusion
 - `oldestIncludedTimestamp` / `oldestIncludedSessionId` stay anchored to the primary first-page window, not the oldest forced extra
+- `hasMore` is `false` when the force-included extras already cover every remaining unique session beyond the primary page
+- `hasMore` stays `true` when at least one unseen unique session remains, even if page 2 will naturally include one duplicate forced session that the client later dedupes
 
 **Step 2: Run the targeted tests to verify failure**
 
@@ -181,6 +298,7 @@ In `server/session-pagination.ts`:
 - build `primaryPage = filteredSessions.slice(0, limit)`
 - append `forcedExtras` only when `before` is absent
 - keep cursor metadata derived from `primaryPage.at(-1)`
+- compute `hasMore` from the unique sessions not already present in the returned page, not from raw page size
 
 Use a shape like:
 
@@ -194,6 +312,8 @@ const forcedExtras = isFirstPage && options.forceIncludeSessionKeys?.size
   : []
 
 const page = [...primaryPage, ...forcedExtras].sort(compareSessionsDesc)
+const pageKeys = new Set(page.map(cursorKey))
+const hasMore = allSessions.some((session) => !pageKeys.has(cursorKey(session)))
 const cursorSource = primaryPage.at(-1)
 ```
 
@@ -216,7 +336,7 @@ git add server/sidebar-session-selection.ts server/session-pagination.ts test/un
 git commit -m "feat: add sidebar session selection helper"
 ```
 
-### Task 3: Use A JSON Sessions Query For Bootstrap When Open Tabs Exist
+### Task 4: Use A JSON Sessions Query For Bootstrap When Open Tabs Exist
 
 **Files:**
 - Modify: `server/index.ts`
@@ -233,6 +353,7 @@ In `test/unit/server/sessions-router-pagination.test.ts`, add `POST /sessions/qu
 - returns a paginated first page plus an older forced session from `openSessions`
 - ignores foreign-only locators
 - preserves cursor metadata from the primary page boundary
+- returns `hasMore: false` when the force-included set already covers every unique session beyond the primary window
 - rejects invalid body shapes with `400`
 
 In `test/unit/client/lib/api.test.ts`, add coverage for a helper like `fetchSidebarSessionsSnapshot()`:
@@ -316,7 +437,7 @@ git add server/index.ts server/sessions-router.ts src/lib/api.ts src/App.tsx tes
 git commit -m "feat: personalize sidebar bootstrap sessions query"
 ```
 
-### Task 4: Personalize WebSocket Snapshots And Refresh Them From `ui.layout.sync`
+### Task 5: Personalize WebSocket Snapshots And Refresh Them From `ui.layout.sync`
 
 **Files:**
 - Modify: `shared/ws-protocol.ts`
@@ -339,6 +460,7 @@ Extend `test/server/ws-handshake-snapshot.test.ts` with a paginated-handshake ca
 - the client sends `hello` with `sidebarOpenSessions`
 - the first `sessions.updated` snapshot includes the older open local session even though it is outside the first 100
 - the cursor metadata still points at the normal first-page boundary
+- when the force-included older sessions already cover the full remainder, the snapshot reports `hasMore: false`
 
 Extend `test/unit/client/layout-mirror-middleware.test.ts` so a tab with `resumeSessionId` but no layout still emits:
 
@@ -465,7 +587,7 @@ git add shared/ws-protocol.ts src/store/paneTypes.ts src/store/layoutMirrorMiddl
 git commit -m "feat: personalize websocket sidebar snapshots"
 ```
 
-### Task 5: Add End-To-End Sidebar Visibility Regressions And Run Full Verification
+### Task 6: Add End-To-End Sidebar Visibility Regressions And Run Full Verification
 
 **Files:**
 - Create: `test/e2e/open-tab-session-sidebar-visibility.test.tsx`
