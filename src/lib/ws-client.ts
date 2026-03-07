@@ -13,7 +13,6 @@ const log = createLogger('WsClient')
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'ready'
 type MessageHandler = (msg: ServerMessage) => void
 type ReconnectHandler = () => void
-type LifecycleMode = 'compat' | 'explicit-only'
 type HelloExtensionProvider = () => {
   sessions?: { active?: string; visible?: string[]; background?: string[] }
   client?: { mobile?: boolean }
@@ -42,12 +41,11 @@ type TerminalCreateClientMessage = {
 
 type InFlightCreate = {
   message: unknown
-  terminalId?: string
   lastResendEpoch: number
 }
 
 const CONNECTION_TIMEOUT_MS = 10_000
-const WS_PROTOCOL_VERSION = 2
+const WS_PROTOCOL_VERSION = 3
 const perfConfig = getClientPerfConfig()
 
 function isTerminalInputMessage(msg: unknown): msg is TerminalInputClientMessage {
@@ -85,13 +83,9 @@ export class WsClient {
   private lastQueueLogAt = 0
   private reconnectTimer: number | null = null
   private readyTimeout: number | null = null
-  private lifecycleMode: LifecycleMode = 'compat'
   private reconnectEpoch = 0
   private inFlightCreates = new Map<string, InFlightCreate>()
-  private serverCapabilities = {
-    createAttachSplitV1: false,
-    attachViewportV1: false,
-  }
+  private preReadyCreateQueue = new Map<string, unknown>()
 
   constructor(private url: string) {}
 
@@ -113,18 +107,6 @@ export class WsClient {
 
   get serverInstanceId(): string | undefined {
     return this._serverInstanceId
-  }
-
-  setLifecycleMode(mode: LifecycleMode): void {
-    this.lifecycleMode = mode
-  }
-
-  supportsCreateAttachSplitV1(): boolean {
-    return this.serverCapabilities.createAttachSplitV1
-  }
-
-  supportsAttachViewportV1(): boolean {
-    return this.serverCapabilities.attachViewportV1
   }
 
   connect(): Promise<void> {
@@ -194,10 +176,6 @@ export class WsClient {
         }
 
         if (msg.type === 'ready') {
-          this.serverCapabilities = {
-            createAttachSplitV1: !!msg.capabilities?.createAttachSplitV1,
-            attachViewportV1: !!msg.capabilities?.attachViewportV1,
-          }
           this._serverInstanceId = typeof msg.serverInstanceId === 'string' && msg.serverInstanceId.trim()
             ? msg.serverInstanceId
             : undefined
@@ -225,33 +203,28 @@ export class WsClient {
             }
           }
 
-          // Flush queued messages
           const createRequestIdsFlushed = new Set<string>()
+          for (const [requestId, createMsg] of this.preReadyCreateQueue.entries()) {
+            if (!this.inFlightCreates.has(requestId)) continue
+            this.sendNow(createMsg)
+            createRequestIdsFlushed.add(requestId)
+          }
+          this.preReadyCreateQueue.clear()
+
           while (this.pendingMessages.length > 0) {
             const next = this.pendingMessages.shift()
             if (!next) continue
-            this.ws?.send(JSON.stringify(next))
-            if (isTerminalCreateMessage(next)) {
-              createRequestIdsFlushed.add(next.requestId)
-            }
+            this.sendNow(next)
           }
 
           if (isReconnect) {
             for (const [requestId, entry] of this.inFlightCreates.entries()) {
-              const createAttachOnCreate = isTerminalCreateMessage(entry.message)
-                ? (entry.message as { attachOnCreate?: unknown }).attachOnCreate
-                : undefined
-              const shouldResend = this.lifecycleMode === 'explicit-only'
-                || this.serverCapabilities.createAttachSplitV1
-                || createAttachOnCreate === false
-              if (!shouldResend) continue
-              if (entry.terminalId) continue
               if (entry.lastResendEpoch === this.reconnectEpoch) continue
               if (createRequestIdsFlushed.has(requestId)) {
                 entry.lastResendEpoch = this.reconnectEpoch
                 continue
               }
-              this.ws?.send(JSON.stringify(entry.message))
+              this.sendNow(entry.message)
               entry.lastResendEpoch = this.reconnectEpoch
             }
           }
@@ -271,11 +244,13 @@ export class WsClient {
           const create = this.inFlightCreates.get(msg.requestId)
           if (create) {
             this.inFlightCreates.delete(msg.requestId)
+            this.preReadyCreateQueue.delete(msg.requestId)
           }
         }
 
         if (msg.type === 'error' && typeof msg.requestId === 'string') {
           this.inFlightCreates.delete(msg.requestId)
+          this.preReadyCreateQueue.delete(msg.requestId)
         }
 
         if (msg.type === 'error' && msg.code === 'NOT_AUTHENTICATED') {
@@ -317,10 +292,6 @@ export class WsClient {
         const closedBeforeReady = !wasReady
         this._state = 'disconnected'
         this.ws = null
-        this.serverCapabilities = {
-          createAttachSplitV1: false,
-          attachViewportV1: false,
-        }
 
         // Close codes:
         // 4001 NOT_AUTHENTICATED: fatal, do not reconnect.
@@ -434,11 +405,8 @@ export class WsClient {
     this._state = 'disconnected'
     this.pendingMessages = []
     this.inFlightCreates.clear()
+    this.preReadyCreateQueue.clear()
     this._serverInstanceId = undefined
-    this.serverCapabilities = {
-      createAttachSplitV1: false,
-      attachViewportV1: false,
-    }
     this.connectPromise = null
     this.reconnectAttempts = 0
   }
@@ -470,13 +438,24 @@ export class WsClient {
     if (isTerminalCreateMessage(msg)) {
       this.inFlightCreates.set(msg.requestId, {
         message: msg,
-        terminalId: undefined,
         lastResendEpoch: -1,
       })
     }
 
     if (this._state === 'ready' && this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(msg))
+      this.sendNow(msg)
+      return
+    }
+
+    if (isTerminalCreateMessage(msg)) {
+      if (!this.preReadyCreateQueue.has(msg.requestId) && this.preReadyCreateQueue.size >= this.maxQueueSize) {
+        const oldestRequestId = this.preReadyCreateQueue.keys().next().value
+        if (typeof oldestRequestId === 'string') {
+          this.preReadyCreateQueue.delete(oldestRequestId)
+          this.inFlightCreates.delete(oldestRequestId)
+        }
+      }
+      this.preReadyCreateQueue.set(msg.requestId, msg)
       return
     }
 
@@ -523,6 +502,10 @@ export class WsClient {
   onReconnect(handler: ReconnectHandler): () => void {
     this.reconnectHandlers.add(handler)
     return () => this.reconnectHandlers.delete(handler)
+  }
+
+  private sendNow(msg: unknown) {
+    this.ws?.send(JSON.stringify(msg))
   }
 }
 

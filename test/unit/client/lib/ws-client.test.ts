@@ -94,7 +94,7 @@ describe('WsClient.connect', () => {
     await p
   })
 
-  it('hello payload does not advertise split flags (one-way negotiation)', async () => {
+  it('hello payload does not advertise split flags', async () => {
     const c = new WsClient('ws://example/ws')
     const p = c.connect()
     expect(MockWebSocket.instances).toHaveLength(1)
@@ -109,44 +109,20 @@ describe('WsClient.connect', () => {
     await p
   })
 
-  it('stores ready.capabilities and exposes split support helpers', async () => {
+  it('connect-time queued create flushes after ready without rewriting the payload', async () => {
     const c = new WsClient('ws://example/ws')
-    const p = c.connect()
-    expect(MockWebSocket.instances).toHaveLength(1)
-    MockWebSocket.instances[0]._open()
-    MockWebSocket.instances[0]._message({
-      type: 'ready',
-      capabilities: { createAttachSplitV1: true, attachViewportV1: true },
-    })
-    await p
-    expect(c.supportsCreateAttachSplitV1()).toBe(true)
-    expect(c.supportsAttachViewportV1()).toBe(true)
-  })
-
-  it('defaults capabilities to false when server does not advertise them', async () => {
-    const c = new WsClient('ws://example/ws')
+    c.send({ type: 'terminal.create', requestId: 'queued-1', mode: 'shell' } as any)
     const p = c.connect()
     expect(MockWebSocket.instances).toHaveLength(1)
     MockWebSocket.instances[0]._open()
     MockWebSocket.instances[0]._message({ type: 'ready' })
     await p
-    expect(c.supportsCreateAttachSplitV1()).toBe(false)
-    expect(c.supportsAttachViewportV1()).toBe(false)
-  })
-
-  it('connect-time queued create resolves mode after ready (no stale unknown state)', async () => {
-    const c = new WsClient('ws://example/ws')
-    c.send({ type: 'terminal.create', requestId: 'queued-1', mode: 'shell', attachOnCreate: false } as any)
-    const p = c.connect()
-    expect(MockWebSocket.instances).toHaveLength(1)
-    MockWebSocket.instances[0]._open()
-    MockWebSocket.instances[0]._message({
-      type: 'ready',
-      capabilities: { createAttachSplitV1: true, attachViewportV1: true },
-    })
-    await p
     const flushed = MockWebSocket.instances[0].sent.map((x) => JSON.parse(x))
-    expect(flushed.some((m) => m.type === 'terminal.create' && m.requestId === 'queued-1' && m.attachOnCreate === false)).toBe(true)
+    expect(flushed).toContainEqual(expect.objectContaining({
+      type: 'terminal.create',
+      requestId: 'queued-1',
+      mode: 'shell',
+    }))
   })
 
   it('connect failure then ready flush sends queued create exactly once', async () => {
@@ -160,69 +136,83 @@ describe('WsClient.connect', () => {
 
     const p2 = c.connect()
     MockWebSocket.instances[1]._open()
-    MockWebSocket.instances[1]._message({
-      type: 'ready',
-      capabilities: { createAttachSplitV1: true, attachViewportV1: true },
-    })
+    MockWebSocket.instances[1]._message({ type: 'ready' })
     await p2
 
     const sent = MockWebSocket.instances[1].sent.map((x) => JSON.parse(x))
     expect(sent.filter((m) => m.type === 'terminal.create' && m.requestId === 'queued-fail-then-ready')).toHaveLength(1)
   })
 
-  it('capabilities reset to unknown/false on close and refresh on next ready', async () => {
+  it('resets server instance id across reconnect and refreshes it from the next ready', async () => {
     const c = new WsClient('ws://example/ws')
     const p1 = c.connect()
     MockWebSocket.instances[0]._open()
     MockWebSocket.instances[0]._message({
       type: 'ready',
-      capabilities: { createAttachSplitV1: true, attachViewportV1: true },
+      serverInstanceId: 'srv-1',
     })
     await p1
-    expect(c.supportsCreateAttachSplitV1()).toBe(true)
-    expect(c.supportsAttachViewportV1()).toBe(true)
+    expect(c.serverInstanceId).toBe('srv-1')
 
     MockWebSocket.instances[0]._close(1006, 'reconnect')
     const p2 = c.connect()
     MockWebSocket.instances[1]._open()
     MockWebSocket.instances[1]._message({
       type: 'ready',
-      capabilities: { createAttachSplitV1: false, attachViewportV1: false },
+      serverInstanceId: 'srv-2',
     })
     await p2
-    expect(c.supportsCreateAttachSplitV1()).toBe(false)
-    expect(c.supportsAttachViewportV1()).toBe(false)
+    expect(c.serverInstanceId).toBe('srv-2')
   })
 
-  it('explicit-only reconnect with unknown terminalId resends in-flight create once after ready', async () => {
+  it('reconnect with unknown terminalId resends in-flight create once after ready', async () => {
     const c = new WsClient('ws://example/ws')
-    c.setLifecycleMode('explicit-only')
     c.send({ type: 'terminal.create', requestId: 'reconnect-unknown-1', mode: 'shell' } as any)
 
     const p1 = c.connect()
     MockWebSocket.instances[0]._open()
-    MockWebSocket.instances[0]._message({
-      type: 'ready',
-      capabilities: { createAttachSplitV1: true, attachViewportV1: true },
-    })
+    MockWebSocket.instances[0]._message({ type: 'ready' })
     await p1
     MockWebSocket.instances[0]._close(1006, 'drop-after-create')
 
     const p2 = c.connect()
     MockWebSocket.instances[1]._open()
-    MockWebSocket.instances[1]._message({
-      type: 'ready',
-      capabilities: { createAttachSplitV1: true, attachViewportV1: true },
-    })
+    MockWebSocket.instances[1]._message({ type: 'ready' })
     await p2
 
     const sent = MockWebSocket.instances[1].sent.map((x) => JSON.parse(x))
     expect(sent.filter((m) => m.type === 'terminal.create' && m.requestId === 'reconnect-unknown-1')).toHaveLength(1)
   })
 
+  it('does not resend a create after terminal.created already cleared it', async () => {
+    const c = new WsClient('ws://example/ws')
+    c.send({ type: 'terminal.create', requestId: 'created-before-reconnect', mode: 'shell' } as any)
+
+    const p1 = c.connect()
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p1
+    MockWebSocket.instances[0]._message({
+      type: 'terminal.created',
+      requestId: 'created-before-reconnect',
+      terminalId: 'term-created-before-reconnect',
+      createdAt: Date.now(),
+    })
+    MockWebSocket.instances[0]._close(1006, 'drop-after-created')
+
+    const p2 = c.connect()
+    MockWebSocket.instances[1]._open()
+    MockWebSocket.instances[1]._message({ type: 'ready' })
+    await p2
+
+    const resent = MockWebSocket.instances[1].sent
+      .map((x) => JSON.parse(x))
+      .filter((m) => m.type === 'terminal.create' && m.requestId === 'created-before-reconnect')
+    expect(resent).toHaveLength(0)
+  })
+
   it('evicted queued creates are removed from reconnect resend tracking', async () => {
     const c = new WsClient('ws://example/ws')
-    c.setLifecycleMode('explicit-only')
     ;(c as any).maxQueueSize = 1
 
     c.send({ type: 'terminal.create', requestId: 'evict-older-create', mode: 'shell' } as any)
@@ -230,10 +220,7 @@ describe('WsClient.connect', () => {
 
     const p1 = c.connect()
     MockWebSocket.instances[0]._open()
-    MockWebSocket.instances[0]._message({
-      type: 'ready',
-      capabilities: { createAttachSplitV1: true, attachViewportV1: true },
-    })
+    MockWebSocket.instances[0]._message({ type: 'ready' })
     await p1
 
     const firstCreates = MockWebSocket.instances[0].sent
@@ -246,10 +233,7 @@ describe('WsClient.connect', () => {
 
     const p2 = c.connect()
     MockWebSocket.instances[1]._open()
-    MockWebSocket.instances[1]._message({
-      type: 'ready',
-      capabilities: { createAttachSplitV1: true, attachViewportV1: true },
-    })
+    MockWebSocket.instances[1]._message({ type: 'ready' })
     await p2
 
     const secondCreates = MockWebSocket.instances[1].sent
@@ -259,37 +243,30 @@ describe('WsClient.connect', () => {
     expect(secondCreates).toEqual(['keep-newer-create'])
   })
 
-  it('resends split create after reconnect even if downgraded ready caps omit split flags', async () => {
+  it('resends an in-flight create after reconnect without relying on ready capabilities', async () => {
     const c = new WsClient('ws://example/ws')
     c.send({
       type: 'terminal.create',
-      requestId: 'split-downgrade-1',
+      requestId: 'reconnect-create-1',
       mode: 'shell',
-      attachOnCreate: false,
     } as any)
 
     const p1 = c.connect()
     MockWebSocket.instances[0]._open()
-    MockWebSocket.instances[0]._message({
-      type: 'ready',
-      capabilities: { createAttachSplitV1: true, attachViewportV1: true },
-    })
+    MockWebSocket.instances[0]._message({ type: 'ready' })
     await p1
-    MockWebSocket.instances[0]._close(1006, 'drop-after-split-create')
+    MockWebSocket.instances[0]._close(1006, 'drop-after-create')
 
     const p2 = c.connect()
     MockWebSocket.instances[1]._open()
-    MockWebSocket.instances[1]._message({
-      type: 'ready',
-      capabilities: { createAttachSplitV1: false, attachViewportV1: false },
-    })
+    MockWebSocket.instances[1]._message({ type: 'ready' })
     await p2
 
     const secondCreates = MockWebSocket.instances[1].sent
       .map((x) => JSON.parse(x))
       .filter((m) => m.type === 'terminal.create')
       .map((m) => m.requestId)
-    expect(secondCreates).toEqual(['split-downgrade-1'])
+    expect(secondCreates).toEqual(['reconnect-create-1'])
   })
 
   it('treats HELLO_TIMEOUT as transient and schedules reconnect', async () => {

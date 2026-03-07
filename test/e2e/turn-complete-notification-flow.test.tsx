@@ -18,6 +18,19 @@ const playSound = vi.hoisted(() => vi.fn())
 
 const wsMocks = vi.hoisted(() => {
   const messageHandlers = new Set<(msg: any) => void>()
+  const latestAttachRequestIdByTerminal = new Map<string, string>()
+
+  const withCurrentAttachRequestId = (msg: any) => {
+    if (
+      msg?.attachRequestId
+      || typeof msg?.terminalId !== 'string'
+      || (msg?.type !== 'terminal.attach.ready' && msg?.type !== 'terminal.output' && msg?.type !== 'terminal.output.gap')
+    ) {
+      return msg
+    }
+    const attachRequestId = latestAttachRequestIdByTerminal.get(msg.terminalId)
+    return attachRequestId ? { ...msg, attachRequestId } : msg
+  }
 
   return {
     send: vi.fn(),
@@ -27,9 +40,22 @@ const wsMocks = vi.hoisted(() => {
       return () => messageHandlers.delete(callback)
     }),
     onReconnect: vi.fn(() => () => {}),
-    resetHandlers: () => messageHandlers.clear(),
+    resetHandlers: () => {
+      messageHandlers.clear()
+      latestAttachRequestIdByTerminal.clear()
+    },
     emitMessage: (msg: any) => {
-      for (const callback of messageHandlers) callback(msg)
+      const normalized = withCurrentAttachRequestId(msg)
+      for (const callback of messageHandlers) callback(normalized)
+    },
+    rememberAttach: (msg: any) => {
+      if (
+        msg?.type === 'terminal.attach'
+        && typeof msg?.terminalId === 'string'
+        && typeof msg?.attachRequestId === 'string'
+      ) {
+        latestAttachRequestIdByTerminal.set(msg.terminalId, msg.attachRequestId)
+      }
     },
   }
 })
@@ -224,6 +250,9 @@ describe('turn complete notification flow (e2e)', () => {
   beforeEach(() => {
     playSound.mockClear()
     wsMocks.send.mockClear()
+    wsMocks.send.mockImplementation((msg: any) => {
+      wsMocks.rememberAttach(msg)
+    })
     wsMocks.connect.mockClear()
     wsMocks.onMessage.mockClear()
     wsMocks.resetHandlers()

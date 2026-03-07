@@ -26,6 +26,19 @@ const apiMocks = vi.hoisted(() => ({
 }))
 
 let messageHandler: ((msg: any) => void) | null = null
+const latestAttachRequestIdByTerminal = new Map<string, string>()
+
+function withCurrentAttachRequestId(msg: any) {
+  if (
+    msg?.attachRequestId
+    || typeof msg?.terminalId !== 'string'
+    || (msg?.type !== 'terminal.attach.ready' && msg?.type !== 'terminal.output' && msg?.type !== 'terminal.output.gap')
+  ) {
+    return msg
+  }
+  const attachRequestId = latestAttachRequestIdByTerminal.get(msg.terminalId)
+  return attachRequestId ? { ...msg, attachRequestId } : msg
+}
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => wsMocks,
@@ -143,12 +156,23 @@ function createStore(policy: 'ask' | 'always' | 'never') {
 
 describe('terminal OSC52 policy flow (e2e)', () => {
   beforeEach(() => {
+    latestAttachRequestIdByTerminal.clear()
+    wsMocks.send.mockClear()
+    wsMocks.send.mockImplementation((msg: any) => {
+      if (
+        msg?.type === 'terminal.attach'
+        && typeof msg?.terminalId === 'string'
+        && typeof msg?.attachRequestId === 'string'
+      ) {
+        latestAttachRequestIdByTerminal.set(msg.terminalId, msg.attachRequestId)
+      }
+    })
     clipboardMocks.copyText.mockClear()
     apiMocks.patch.mockClear()
     wsMocks.onMessage.mockImplementation((callback: (msg: any) => void) => {
-      messageHandler = callback
+      messageHandler = (msg: any) => callback(withCurrentAttachRequestId(msg))
       return () => {
-        if (messageHandler === callback) messageHandler = null
+        messageHandler = null
       }
     })
     vi.stubGlobal('ResizeObserver', MockResizeObserver)

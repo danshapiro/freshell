@@ -74,6 +74,19 @@ vi.mock('@/components/terminal/terminal-runtime', () => ({
 
 const terminalInstances: any[] = []
 let messageHandler: ((msg: any) => void) | null = null
+const latestAttachRequestIdByTerminal = new Map<string, string>()
+
+function withCurrentAttachRequestId(msg: any) {
+  if (
+    msg?.attachRequestId
+    || typeof msg?.terminalId !== 'string'
+    || (msg?.type !== 'terminal.attach.ready' && msg?.type !== 'terminal.output' && msg?.type !== 'terminal.output.gap')
+  ) {
+    return msg
+  }
+  const attachRequestId = latestAttachRequestIdByTerminal.get(msg.terminalId)
+  return attachRequestId ? { ...msg, attachRequestId } : msg
+}
 
 vi.mock('@xterm/xterm', () => {
   class MockTerminal {
@@ -170,13 +183,24 @@ function createStore(renderer: 'auto' | 'webgl' | 'canvas') {
 describe('TerminalView renderer mode', () => {
   beforeEach(() => {
     terminalInstances.length = 0
+    latestAttachRequestIdByTerminal.clear()
     runtimeMockState.throwOnAttach = false
     runtimeMockState.lastEnableWebgl = null
     runtimeMockState.lastRuntime = null
+    wsMocks.send.mockClear()
+    wsMocks.send.mockImplementation((msg: any) => {
+      if (
+        msg?.type === 'terminal.attach'
+        && typeof msg?.terminalId === 'string'
+        && typeof msg?.attachRequestId === 'string'
+      ) {
+        latestAttachRequestIdByTerminal.set(msg.terminalId, msg.attachRequestId)
+      }
+    })
     wsMocks.onMessage.mockImplementation((callback: (msg: any) => void) => {
-      messageHandler = callback
+      messageHandler = (msg: any) => callback(withCurrentAttachRequestId(msg))
       return () => {
-        if (messageHandler === callback) messageHandler = null
+        messageHandler = null
       }
     })
     vi.stubGlobal('ResizeObserver', MockResizeObserver)

@@ -11,6 +11,18 @@ import TerminalView from '@/components/TerminalView'
 
 const wsHarness = vi.hoisted(() => {
   const handlers = new Set<(msg: any) => void>()
+  const latestAttachRequestIdByTerminal = new Map<string, string>()
+  const withCurrentAttachRequestId = (msg: any) => {
+    if (
+      msg?.attachRequestId
+      || typeof msg?.terminalId !== 'string'
+      || (msg?.type !== 'terminal.attach.ready' && msg?.type !== 'terminal.output' && msg?.type !== 'terminal.output.gap')
+    ) {
+      return msg
+    }
+    const attachRequestId = latestAttachRequestIdByTerminal.get(msg.terminalId)
+    return attachRequestId ? { ...msg, attachRequestId } : msg
+  }
   return {
     send: vi.fn(),
     connect: vi.fn().mockResolvedValue(undefined),
@@ -19,13 +31,22 @@ const wsHarness = vi.hoisted(() => {
       handlers.add(handler)
       return () => handlers.delete(handler)
     }),
-    supportsCreateAttachSplitV1: vi.fn(() => false),
-    supportsAttachViewportV1: vi.fn(() => false),
     emit(msg: any) {
-      for (const handler of handlers) handler(msg)
+      const normalized = withCurrentAttachRequestId(msg)
+      for (const handler of handlers) handler(normalized)
     },
     reset() {
       handlers.clear()
+      latestAttachRequestIdByTerminal.clear()
+    },
+    rememberAttach(msg: any) {
+      if (
+        msg?.type === 'terminal.attach'
+        && typeof msg?.terminalId === 'string'
+        && typeof msg?.attachRequestId === 'string'
+      ) {
+        latestAttachRequestIdByTerminal.set(msg.terminalId, msg.attachRequestId)
+      }
     },
   }
 })
@@ -36,8 +57,6 @@ vi.mock('@/lib/ws-client', () => ({
     connect: wsHarness.connect,
     onMessage: wsHarness.onMessage,
     onReconnect: wsHarness.onReconnect,
-    supportsCreateAttachSplitV1: wsHarness.supportsCreateAttachSplitV1,
-    supportsAttachViewportV1: wsHarness.supportsAttachViewportV1,
   }),
 }))
 
@@ -153,11 +172,10 @@ describe('terminal flaky-network responsiveness (e2e)', () => {
   beforeEach(() => {
     wsHarness.reset()
     wsHarness.send.mockClear()
+    wsHarness.send.mockImplementation((msg: any) => {
+      wsHarness.rememberAttach(msg)
+    })
     wsHarness.connect.mockClear()
-    wsHarness.supportsCreateAttachSplitV1.mockReset()
-    wsHarness.supportsCreateAttachSplitV1.mockReturnValue(false)
-    wsHarness.supportsAttachViewportV1.mockReset()
-    wsHarness.supportsAttachViewportV1.mockReturnValue(false)
     terminalInstances.length = 0
     rafCallbacks = []
     rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {

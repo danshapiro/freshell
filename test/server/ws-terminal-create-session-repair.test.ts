@@ -3,20 +3,22 @@ import http from 'http'
 import WebSocket from 'ws'
 import { EventEmitter } from 'events'
 import type { SessionScanResult } from '../../server/session-scanner/types.js'
+import { configStore } from '../../server/config-store.js'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
 
 const HOOK_TIMEOUT_MS = 30000
 const VALID_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
+const DEFAULT_CONFIG_SNAPSHOT = vi.hoisted(() => ({
+  version: 1,
+  settings: {},
+  sessionOverrides: {},
+  terminalOverrides: {},
+  projectColors: {},
+}))
 
 vi.mock('../../server/config-store', () => ({
   configStore: {
-    snapshot: vi.fn().mockResolvedValue({
-      version: 1,
-      settings: {},
-      sessionOverrides: {},
-      terminalOverrides: {},
-      projectColors: {},
-    }),
+    snapshot: vi.fn().mockResolvedValue(DEFAULT_CONFIG_SNAPSHOT),
   },
 }))
 
@@ -245,6 +247,8 @@ describe('terminal.create session repair wait', () => {
   }, HOOK_TIMEOUT_MS)
 
   beforeEach(() => {
+    vi.mocked(configStore.snapshot).mockReset()
+    vi.mocked(configStore.snapshot).mockResolvedValue(DEFAULT_CONFIG_SNAPSHOT)
     sessionRepairService.waitForSessionCalls = []
     sessionRepairService.result = undefined
     sessionRepairService.waitForSessionResult = undefined
@@ -478,6 +482,112 @@ describe('terminal.create session repair wait', () => {
     } finally {
       if (ws.readyState !== WebSocket.CLOSED) {
         await closeWebSocket(ws)
+      }
+    }
+  })
+
+  it('does not create shell terminal if client disconnects during config load', async () => {
+    let releaseConfig: (() => void) | undefined
+    let markConfigStarted: (() => void) | undefined
+    const configStarted = new Promise<void>((resolve) => {
+      markConfigStarted = resolve
+    })
+    vi.mocked(configStore.snapshot).mockImplementationOnce(() => {
+      markConfigStarted?.()
+      return new Promise((resolve) => {
+        releaseConfig = () => resolve(DEFAULT_CONFIG_SNAPSHOT)
+      })
+    })
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+      await waitForMessage(ws, (m) => m.type === 'ready')
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'disconnect-during-config-load',
+        mode: 'shell',
+      }))
+
+      await configStarted
+      await closeWebSocket(ws)
+      releaseConfig?.()
+      await new Promise((resolve) => setTimeout(resolve, 50))
+
+      expect(registry.records.size).toBe(0)
+      expect(registry.createCallCount).toBe(0)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('treats cross-socket duplicate creates as one in-flight request during config load', async () => {
+    let releaseConfig: (() => void) | undefined
+    let markConfigStarted: (() => void) | undefined
+    const configStarted = new Promise<void>((resolve) => {
+      markConfigStarted = resolve
+    })
+    vi.mocked(configStore.snapshot).mockImplementationOnce(() => {
+      markConfigStarted?.()
+      return new Promise((resolve) => {
+        releaseConfig = () => resolve(DEFAULT_CONFIG_SNAPSHOT)
+      })
+    })
+
+    const requestId = 'pending-config-cross-socket-dup'
+    const ws1 = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    let ws2: WebSocket | undefined
+
+    try {
+      await new Promise<void>((resolve) => ws1.on('open', () => resolve()))
+      ws1.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+      await waitForMessage(ws1, (m) => m.type === 'ready')
+
+      ws1.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'shell',
+      }))
+
+      await configStarted
+
+      ws2 = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+      await new Promise<void>((resolve) => ws2!.on('open', () => resolve()))
+      ws2.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+      await waitForMessage(ws2, (m) => m.type === 'ready')
+
+      ws2.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'shell',
+      }))
+
+      const createdOnWs2 = waitForMessage(
+        ws2,
+        (m) => m.type === 'terminal.created' && m.requestId === requestId,
+        3000,
+      )
+
+      await new Promise((resolve) => setTimeout(resolve, 50))
+      releaseConfig?.()
+
+      const createdOnWs1 = await waitForMessage(
+        ws1,
+        (m) => m.type === 'terminal.created' && m.requestId === requestId,
+        3000,
+      )
+      const createdOnWs2Resolved = await createdOnWs2
+
+      expect(createdOnWs2Resolved.terminalId).toBe(createdOnWs1.terminalId)
+      expect(registry.records.size).toBe(1)
+      expect(registry.createCallCount).toBe(1)
+    } finally {
+      await closeWebSocket(ws1)
+      if (ws2) {
+        await closeWebSocket(ws2)
       }
     }
   })

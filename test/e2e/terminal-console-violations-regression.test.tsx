@@ -12,6 +12,19 @@ import TerminalView from '@/components/TerminalView'
 const wsHarness = vi.hoisted(() => {
   const handlers = new Set<(msg: any) => void>()
   const durationSamples: number[] = []
+  const latestAttachRequestIdByTerminal = new Map<string, string>()
+
+  const withCurrentAttachRequestId = (msg: any) => {
+    if (
+      msg?.attachRequestId
+      || typeof msg?.terminalId !== 'string'
+      || (msg?.type !== 'terminal.attach.ready' && msg?.type !== 'terminal.output' && msg?.type !== 'terminal.output.gap')
+    ) {
+      return msg
+    }
+    const attachRequestId = latestAttachRequestIdByTerminal.get(msg.terminalId)
+    return attachRequestId ? { ...msg, attachRequestId } : msg
+  }
 
   return {
     send: vi.fn(),
@@ -22,21 +35,32 @@ const wsHarness = vi.hoisted(() => {
       return () => handlers.delete(handler)
     }),
     emit(msg: any) {
+      const normalized = withCurrentAttachRequestId(msg)
       for (const handler of handlers) {
         const startedAt = performance.now()
-        handler(msg)
+        handler(normalized)
         durationSamples.push(performance.now() - startedAt)
       }
     },
     reset() {
       handlers.clear()
       durationSamples.length = 0
+      latestAttachRequestIdByTerminal.clear()
     },
     clearDurations() {
       durationSamples.length = 0
     },
     durations() {
       return [...durationSamples]
+    },
+    rememberAttach(msg: any) {
+      if (
+        msg?.type === 'terminal.attach'
+        && typeof msg?.terminalId === 'string'
+        && typeof msg?.attachRequestId === 'string'
+      ) {
+        latestAttachRequestIdByTerminal.set(msg.terminalId, msg.attachRequestId)
+      }
     },
   }
 })
@@ -170,6 +194,11 @@ describe('terminal console violations regression (e2e)', () => {
   let cancelRafSpy: ReturnType<typeof vi.spyOn> | null = null
 
   beforeEach(() => {
+    wsHarness.reset()
+    wsHarness.send.mockClear()
+    wsHarness.send.mockImplementation((msg: any) => {
+      wsHarness.rememberAttach(msg)
+    })
     wsHarness.clearDurations()
     terminalInstances.length = 0
     rafCallbacks = []

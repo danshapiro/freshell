@@ -14,6 +14,18 @@ import TerminalView from '@/components/TerminalView'
 
 const wsHarness = vi.hoisted(() => {
   const handlers = new Set<(msg: any) => void>()
+  const latestAttachRequestIdByTerminal = new Map<string, string>()
+  const withCurrentAttachRequestId = (msg: any) => {
+    if (
+      msg?.attachRequestId
+      || typeof msg?.terminalId !== 'string'
+      || (msg?.type !== 'terminal.attach.ready' && msg?.type !== 'terminal.output' && msg?.type !== 'terminal.output.gap')
+    ) {
+      return msg
+    }
+    const attachRequestId = latestAttachRequestIdByTerminal.get(msg.terminalId)
+    return attachRequestId ? { ...msg, attachRequestId } : msg
+  }
   return {
     send: vi.fn(),
     connect: vi.fn().mockResolvedValue(undefined),
@@ -22,15 +34,24 @@ const wsHarness = vi.hoisted(() => {
       handlers.add(handler)
       return () => handlers.delete(handler)
     }),
-    supportsCreateAttachSplitV1: vi.fn(() => false),
-    supportsAttachViewportV1: vi.fn(() => false),
     emit(msg: any) {
+      const normalized = withCurrentAttachRequestId(msg)
       for (const handler of handlers) {
-        handler(msg)
+        handler(normalized)
       }
     },
     reset() {
       handlers.clear()
+      latestAttachRequestIdByTerminal.clear()
+    },
+    rememberAttach(msg: any) {
+      if (
+        msg?.type === 'terminal.attach'
+        && typeof msg?.terminalId === 'string'
+        && typeof msg?.attachRequestId === 'string'
+      ) {
+        latestAttachRequestIdByTerminal.set(msg.terminalId, msg.attachRequestId)
+      }
     },
   }
 })
@@ -41,8 +62,6 @@ vi.mock('@/lib/ws-client', () => ({
     connect: wsHarness.connect,
     onMessage: wsHarness.onMessage,
     onReconnect: wsHarness.onReconnect,
-    supportsCreateAttachSplitV1: wsHarness.supportsCreateAttachSplitV1,
-    supportsAttachViewportV1: wsHarness.supportsAttachViewportV1,
   }),
 }))
 
@@ -204,11 +223,10 @@ describe('settings remount scrollback hydration (e2e)', () => {
   beforeEach(() => {
     wsHarness.reset()
     wsHarness.send.mockClear()
+    wsHarness.send.mockImplementation((msg: any) => {
+      wsHarness.rememberAttach(msg)
+    })
     wsHarness.connect.mockClear()
-    wsHarness.supportsCreateAttachSplitV1.mockReset()
-    wsHarness.supportsCreateAttachSplitV1.mockReturnValue(false)
-    wsHarness.supportsAttachViewportV1.mockReset()
-    wsHarness.supportsAttachViewportV1.mockReturnValue(false)
     terminalInstances.length = 0
     localStorage.clear()
     __resetTerminalCursorCacheForTests()
@@ -255,7 +273,10 @@ describe('settings remount scrollback hydration (e2e)', () => {
       const attachCalls = wsHarness.send.mock.calls
         .map(([msg]) => msg)
         .filter((msg) => msg?.type === 'terminal.attach')
-      expect(attachCalls.length).toBeGreaterThanOrEqual(2)
+      const activeAttach = attachCalls.find((msg) => msg?.terminalId === 'term-active')
+      const hiddenAttach = attachCalls.find((msg) => msg?.terminalId === 'term-hidden')
+      expect(activeAttach).toBeDefined()
+      expect(hiddenAttach).toBeUndefined()
     })
 
     wsHarness.emit({ type: 'terminal.output', terminalId: 'term-active', seqStart: 6, seqEnd: 6, data: 'active-before-settings' })
@@ -283,7 +304,7 @@ describe('settings remount scrollback hydration (e2e)', () => {
       const activeAttach = remountAttachCalls.find((msg) => msg.terminalId === 'term-active')
       const hiddenAttach = remountAttachCalls.find((msg) => msg.terminalId === 'term-hidden')
       expect(activeAttach?.sinceSeq).toBe(0)
-      expect(hiddenAttach?.sinceSeq).toBeGreaterThan(0)
+      expect(hiddenAttach).toBeUndefined()
     })
 
     wsHarness.send.mockClear()
@@ -356,7 +377,10 @@ describe('settings remount scrollback hydration (e2e)', () => {
       const attachCalls = wsHarness.send.mock.calls
         .map(([msg]) => msg)
         .filter((msg) => msg?.type === 'terminal.attach')
-      expect(attachCalls.length).toBeGreaterThanOrEqual(2)
+      const activeAttach = attachCalls.find((msg) => msg?.terminalId === 'term-active')
+      const hiddenAttach = attachCalls.find((msg) => msg?.terminalId === 'term-hidden')
+      expect(activeAttach).toBeDefined()
+      expect(hiddenAttach).toBeUndefined()
     })
 
     view.rerender(
@@ -380,7 +404,7 @@ describe('settings remount scrollback hydration (e2e)', () => {
       const activeAttach = remountAttachCalls.find((msg) => msg.terminalId === 'term-active')
       const hiddenAttach = remountAttachCalls.find((msg) => msg.terminalId === 'term-hidden')
       expect(activeAttach?.sinceSeq).toBe(0)
-      expect(hiddenAttach?.sinceSeq).toBeGreaterThan(0)
+      expect(hiddenAttach).toBeUndefined()
     })
 
     wsHarness.send.mockClear()
@@ -442,9 +466,6 @@ describe('settings remount scrollback hydration (e2e)', () => {
   })
 
   it('hidden remount restore sends zero attach while hidden and one viewport attach on visibility', async () => {
-    wsHarness.supportsCreateAttachSplitV1.mockReturnValue(true)
-    wsHarness.supportsAttachViewportV1.mockReturnValue(true)
-
     localStorage.setItem(TERMINAL_CURSOR_STORAGE_KEY, JSON.stringify({
       'term-active': {
         seq: 5,

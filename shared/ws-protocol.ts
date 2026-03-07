@@ -165,7 +165,6 @@ export const TerminalCreateSchema = z.object({
   restore: z.boolean().optional(),
   tabId: z.string().min(1).optional(),
   paneId: z.string().min(1).optional(),
-  attachOnCreate: z.boolean().optional(),
 })
 
 export const TerminalAttachSchema = z.object({

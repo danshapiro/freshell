@@ -115,7 +115,12 @@ interface TerminalViewProps {
 }
 
 type AttachIntent = 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect'
-type CreateAttachMode = 'legacy_auto_attach' | 'split_explicit_attach'
+
+type DeferredAttachState = {
+  mode: 'none' | 'waiting_for_geometry' | 'attaching' | 'live'
+  pendingIntent: AttachIntent | null
+  pendingSinceSeq: number
+}
 
 type MobileToolbarKeyId = 'esc' | 'tab' | 'ctrl' | 'up' | 'down' | 'left' | 'right'
 type RepeatableMobileToolbarKeyId = Extract<MobileToolbarKeyId, 'up' | 'down' | 'left' | 'right'>
@@ -236,16 +241,15 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     terminalId: string
     sinceSeq: number
   } | null>(null)
-  const createModeByRequestIdRef = useRef<Map<string, CreateAttachMode>>(new Map())
   const handledCreatedMessageRef = useRef<{
     requestId: string
     terminalId: string
-    mode: CreateAttachMode
   } | null>(null)
-  const deferredHiddenAttachIntentRef = useRef<AttachIntent | null>(null)
-  const needsViewportHydrationRef = useRef(true)
-  const pendingDeferredHydrationRef = useRef(false)
-  const awaitingViewportHydrationRef = useRef(false)
+  const deferredAttachStateRef = useRef<DeferredAttachState>({
+    mode: 'none',
+    pendingIntent: null,
+    pendingSinceSeq: 0,
+  })
   const contentRef = useRef<TerminalPaneContent | null>(terminalContent)
 
   const applySeqState = useCallback((
@@ -1086,10 +1090,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     return () => disposable.dispose()
   }, [isTerminal, dispatch, tabId])
 
-  const markViewportHydrationComplete = useCallback(() => {
-    if (!awaitingViewportHydrationRef.current) return
-    awaitingViewportHydrationRef.current = false
-    pendingDeferredHydrationRef.current = false
+  const markAttachComplete = useCallback(() => {
+    deferredAttachStateRef.current = {
+      mode: 'live',
+      pendingIntent: null,
+      pendingSinceSeq: 0,
+    }
   }, [])
 
   const isCurrentAttachMessage = useCallback((msg: {
@@ -1101,14 +1107,14 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     if (!current) return true
     if (!msg.attachRequestId) {
       if (debugRef.current) {
-        log.debug('Accepting untagged same-terminal stream message', {
+        log.debug('Ignoring untagged stream message for active attach generation', {
           paneId: paneIdRef.current,
           terminalId: msg.terminalId,
           type: msg.type,
           currentAttachRequestId: current.requestId,
         })
       }
-      return true
+      return false
     }
     return msg.attachRequestId === current.requestId
   }, [])
@@ -1146,15 +1152,14 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       }
       // Keep persisted cursor untouched so transport reconnect can still use high-water.
       applySeqState(beginAttach(createAttachSeqState({ lastSeq: 0 })))
-      needsViewportHydrationRef.current = false
-      pendingDeferredHydrationRef.current = false
-      awaitingViewportHydrationRef.current = true
     } else {
       applySeqState(beginAttach(createAttachSeqState({ lastSeq: deltaSeq })))
-      awaitingViewportHydrationRef.current = false
-      if (intent === 'keepalive_delta' && needsViewportHydrationRef.current) {
-        pendingDeferredHydrationRef.current = true
-      }
+    }
+
+    deferredAttachStateRef.current = {
+      mode: 'attaching',
+      pendingIntent: intent,
+      pendingSinceSeq: sinceSeq,
     }
 
     const attachRequestId = `${paneIdRef.current}:${++attachCounterRef.current}:${nanoid(6)}`
@@ -1198,14 +1203,11 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     if (!hidden) {
       requestTerminalLayout({ fit: true, resize: true })
       const tid = terminalIdRef.current
-      const deferredIntent = deferredHiddenAttachIntentRef.current
-      if (tid && deferredIntent) {
-        deferredHiddenAttachIntentRef.current = null
-        attachTerminal(tid, deferredIntent, { clearViewportFirst: deferredIntent === 'viewport_hydrate' })
-        return
-      }
-      if (tid && needsViewportHydrationRef.current && pendingDeferredHydrationRef.current) {
-        attachTerminal(tid, 'viewport_hydrate', { clearViewportFirst: true })
+      const deferred = deferredAttachStateRef.current
+      if (tid && deferred.mode === 'waiting_for_geometry' && deferred.pendingIntent) {
+        attachTerminal(tid, deferred.pendingIntent, {
+          clearViewportFirst: deferred.pendingIntent === 'viewport_hydrate',
+        })
       }
     }
   }, [hidden, isTerminal, requestTerminalLayout, attachTerminal])
@@ -1246,33 +1248,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       return restoreFlagRef.current
     }
 
-    const supportsSplitAttachMode = () => {
-      try {
-        return Boolean(
-          typeof ws.supportsCreateAttachSplitV1 === 'function'
-          && typeof ws.supportsAttachViewportV1 === 'function'
-          && ws.supportsCreateAttachSplitV1()
-          && ws.supportsAttachViewportV1()
-        )
-      } catch {
-        return false
-      }
-    }
-
-    const resolveCreateAttachMode = (requestId: string): CreateAttachMode => {
-      const existing = createModeByRequestIdRef.current.get(requestId)
-      if (existing) return existing
-      const mode: CreateAttachMode = supportsSplitAttachMode()
-        ? 'split_explicit_attach'
-        : 'legacy_auto_attach'
-      createModeByRequestIdRef.current.set(requestId, mode)
-      return mode
-    }
-
     const sendCreate = (requestId: string) => {
       const restore = getRestoreFlag(requestId)
       const resumeId = getResumeSessionIdFromRef(contentRef)
-      const createAttachMode = resolveCreateAttachMode(requestId)
       if (handledCreatedMessageRef.current?.requestId === requestId) {
         handledCreatedMessageRef.current = null
       }
@@ -1282,7 +1260,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         resumeSessionId: resumeId,
         contentRefResumeSessionId: contentRef.current?.resumeSessionId,
         mode,
-        createAttachMode,
       })
       ws.send({
         type: 'terminal.create',
@@ -1293,7 +1270,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         resumeSessionId: resumeId,
         tabId,
         paneId: paneIdRef.current,
-        ...(createAttachMode === 'split_explicit_attach' ? { attachOnCreate: false } : {}),
         ...(restore ? { restore: true } : {}),
       })
     }
@@ -1380,7 +1356,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           if (completedAttachOnFrame) {
             setIsAttaching(false)
-            markViewportHydrationComplete()
+            markAttachComplete()
           }
         }
 
@@ -1413,7 +1389,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           if (completedAttachOnGap) {
             setIsAttaching(false)
-            markViewportHydrationComplete()
+            markAttachComplete()
           }
         }
 
@@ -1443,7 +1419,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           setIsAttaching(Boolean(nextSeqState.pendingReplay))
           updateContent({ status: 'running' })
           if (!nextSeqState.pendingReplay) {
-            markViewportHydrationComplete()
+            markAttachComplete()
           }
         }
 
@@ -1461,16 +1437,9 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             }
             return
           }
-          const latchedCreateAttachMode = createModeByRequestIdRef.current.get(reqId)
-          if (latchedCreateAttachMode) {
-            createModeByRequestIdRef.current.delete(reqId)
-          }
-          const createAttachMode = latchedCreateAttachMode
-            ?? (handled?.requestId === reqId ? handled.mode : 'legacy_auto_attach')
           handledCreatedMessageRef.current = {
             requestId: reqId,
             terminalId: newId,
-            mode: createAttachMode,
           }
           currentAttachRef.current = null
           if (debugRef.current) log.debug('[TRACE resumeSessionId] terminal.created received', {
@@ -1480,7 +1449,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             effectiveResumeSessionId: msg.effectiveResumeSessionId,
             currentResumeSessionId: contentRef.current?.resumeSessionId,
             willUpdate: !!(msg.effectiveResumeSessionId && msg.effectiveResumeSessionId !== contentRef.current?.resumeSessionId),
-            createAttachMode,
           })
           terminalIdRef.current = newId
           updateContent({ terminalId: newId, status: 'running' })
@@ -1493,32 +1461,26 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             updateContent({ resumeSessionId: msg.effectiveResumeSessionId })
           }
 
-          if (createAttachMode === 'split_explicit_attach') {
-            applySeqState(createAttachSeqState({ lastSeq: 0 }))
-            if (hiddenRef.current) {
-              deferredHiddenAttachIntentRef.current = 'viewport_hydrate'
-              needsViewportHydrationRef.current = true
-              pendingDeferredHydrationRef.current = false
-              awaitingViewportHydrationRef.current = false
-              setIsAttaching(false)
-            } else {
-              deferredHiddenAttachIntentRef.current = null
-              attachTerminal(newId, 'viewport_hydrate', { clearViewportFirst: true })
+          applySeqState(createAttachSeqState({ lastSeq: 0 }))
+          if (hiddenRef.current) {
+            deferredAttachStateRef.current = {
+              mode: 'waiting_for_geometry',
+              pendingIntent: 'viewport_hydrate',
+              pendingSinceSeq: 0,
             }
+            setIsAttaching(false)
           } else {
-            applySeqState(beginAttach(createAttachSeqState({ lastSeq: 0 })))
-            // Legacy auto-attach path: server starts replay immediately after create.
-            ws.send({ type: 'terminal.resize', terminalId: newId, cols: term.cols, rows: term.rows })
-            setIsAttaching(true)
-            needsViewportHydrationRef.current = false
-            pendingDeferredHydrationRef.current = false
-            awaitingViewportHydrationRef.current = false
+            attachTerminal(newId, 'viewport_hydrate', { clearViewportFirst: true })
           }
         }
 
         if (msg.type === 'terminal.exit' && msg.terminalId === tid) {
           currentAttachRef.current = null
-          deferredHiddenAttachIntentRef.current = null
+          deferredAttachStateRef.current = {
+            mode: 'none',
+            pendingIntent: null,
+            pendingSinceSeq: 0,
+          }
           clearTerminalCursor(tid)
           // Clear terminalIdRef AND the stored terminalId to prevent any subsequent
           // operations (resize, input) from sending commands to the dead terminal,
@@ -1587,7 +1549,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
               return
             }
           }
-          createModeByRequestIdRef.current.delete(reqId)
           clearRateLimitRetry()
           setIsAttaching(false)
           updateContent({ status: 'error' })
@@ -1634,7 +1595,11 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
             requestIdRef.current = newRequestId
             clearTerminalCursor(currentTerminalId)
             terminalIdRef.current = undefined
-            deferredHiddenAttachIntentRef.current = null
+            deferredAttachStateRef.current = {
+              mode: 'none',
+              pendingIntent: null,
+              pendingSinceSeq: 0,
+            }
             applySeqState(createAttachSeqState())
             updateContent({ terminalId: undefined, createRequestId: newRequestId, status: 'creating' })
             // Also clear the tab's terminalId to keep it in sync.
@@ -1657,11 +1622,10 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           resumeSessionId: contentRef.current?.resumeSessionId,
         })
         if (!tid) return
-        if (hiddenRef.current && supportsSplitAttachMode()) {
-          // Preserve full viewport hydration if it is already pending for first reveal.
-          if (deferredHiddenAttachIntentRef.current !== 'viewport_hydrate') {
-            deferredHiddenAttachIntentRef.current = 'transport_reconnect'
-          }
+        if (hiddenRef.current) {
+          deferredAttachStateRef.current = deferredAttachStateRef.current.mode === 'live'
+            ? { mode: 'waiting_for_geometry', pendingIntent: 'transport_reconnect', pendingSinceSeq: seqStateRef.current.lastSeq }
+            : { mode: 'waiting_for_geometry', pendingIntent: 'viewport_hydrate', pendingSinceSeq: 0 }
           return
         }
         attachTerminal(tid, 'transport_reconnect')
@@ -1679,28 +1643,27 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         createRequestId,
         resumeSessionId: contentRef.current?.resumeSessionId,
         action: currentTerminalId
-          ? (!hiddenRef.current && needsViewportHydrationRef.current ? 'viewport_hydrate' : 'keepalive_delta')
+          ? (deferredAttachStateRef.current.mode === 'live' ? 'keepalive_delta' : 'viewport_hydrate')
           : 'sendCreate',
       })
       if (currentTerminalId) {
-        if (hiddenRef.current && supportsSplitAttachMode()) {
-          deferredHiddenAttachIntentRef.current = 'viewport_hydrate'
-          needsViewportHydrationRef.current = true
-          pendingDeferredHydrationRef.current = false
-          awaitingViewportHydrationRef.current = false
+        if (hiddenRef.current) {
+          deferredAttachStateRef.current = deferredAttachStateRef.current.mode === 'live'
+            ? { mode: 'waiting_for_geometry', pendingIntent: 'transport_reconnect', pendingSinceSeq: seqStateRef.current.lastSeq }
+            : { mode: 'waiting_for_geometry', pendingIntent: 'viewport_hydrate', pendingSinceSeq: 0 }
           setIsAttaching(false)
         } else {
-          deferredHiddenAttachIntentRef.current = null
-          const intent: AttachIntent = !hiddenRef.current && needsViewportHydrationRef.current
-            ? 'viewport_hydrate'
-            : 'keepalive_delta'
+          const intent: AttachIntent = deferredAttachStateRef.current.mode === 'live'
+            ? 'keepalive_delta'
+            : 'viewport_hydrate'
           attachTerminal(currentTerminalId, intent)
         }
       } else {
-        deferredHiddenAttachIntentRef.current = null
-        needsViewportHydrationRef.current = false
-        pendingDeferredHydrationRef.current = false
-        awaitingViewportHydrationRef.current = false
+        deferredAttachStateRef.current = {
+          mode: 'none',
+          pendingIntent: null,
+          pendingSinceSeq: 0,
+        }
         sendCreate(createRequestId)
       }
     }
@@ -1738,7 +1701,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     dispatch,
     handleTerminalOutput,
     attachTerminal,
-    markViewportHydrationComplete,
+    markAttachComplete,
   ])
 
   const mobileToolbarBottomPx = isMobile ? keyboardInsetPx : 0

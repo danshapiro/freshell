@@ -1631,7 +1631,7 @@ describe('WebSocket edge cases', () => {
       close()
     })
 
-    it('terminal.create ignores attachOnCreate and still does not auto-attach', async () => {
+    it('terminal.create ignores stale attachOnCreate payloads and still does not auto-attach', async () => {
       const { ws, close } = await createAuthenticatedConnection()
 
       ws.send(JSON.stringify({

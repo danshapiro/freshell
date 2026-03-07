@@ -67,6 +67,19 @@ vi.mock('lucide-react', () => ({
 }))
 
 const terminalInstances: any[] = []
+const latestAttachRequestIdByTerminal = new Map<string, string>()
+
+function withCurrentAttachRequestId(msg: any) {
+  if (
+    msg?.attachRequestId
+    || typeof msg?.terminalId !== 'string'
+    || (msg?.type !== 'terminal.attach.ready' && msg?.type !== 'terminal.output' && msg?.type !== 'terminal.output.gap')
+  ) {
+    return msg
+  }
+  const attachRequestId = latestAttachRequestIdByTerminal.get(msg.terminalId)
+  return attachRequestId ? { ...msg, attachRequestId } : msg
+}
 
 vi.mock('@xterm/xterm', () => {
   class MockTerminal {
@@ -168,10 +181,20 @@ describe('TerminalView OSC52 policy handling', () => {
 
   beforeEach(() => {
     terminalInstances.length = 0
+    latestAttachRequestIdByTerminal.clear()
     wsMocks.send.mockClear()
+    wsMocks.send.mockImplementation((msg: any) => {
+      if (
+        msg?.type === 'terminal.attach'
+        && typeof msg?.terminalId === 'string'
+        && typeof msg?.attachRequestId === 'string'
+      ) {
+        latestAttachRequestIdByTerminal.set(msg.terminalId, msg.attachRequestId)
+      }
+    })
     wsMocks.connect.mockClear()
     wsMocks.onMessage.mockImplementation((callback: (msg: any) => void) => {
-      messageHandler = callback
+      messageHandler = (msg: any) => callback(withCurrentAttachRequestId(msg))
       return () => { messageHandler = null }
     })
     clipboardMocks.copyText.mockClear()
