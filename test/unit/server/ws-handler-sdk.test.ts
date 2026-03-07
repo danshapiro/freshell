@@ -363,10 +363,10 @@ describe('WS Handler SDK Integration', () => {
           text: 'Hello Claude',
         }))
 
-        // Give it a moment to process
-        await new Promise((resolve) => setTimeout(resolve, 100))
-
-        expect(mockSdkBridge.sendUserMessage).toHaveBeenCalledWith('sdk-sess-1', 'Hello Claude', undefined)
+        await vi.waitFor(
+          () => expect(mockSdkBridge.sendUserMessage).toHaveBeenCalledWith('sdk-sess-1', 'Hello Claude', undefined),
+          { timeout: 3000 },
+        )
       } finally {
         ws.close()
       }
@@ -388,10 +388,11 @@ describe('WS Handler SDK Integration', () => {
           behavior: 'allow',
         }))
 
-        await new Promise((resolve) => setTimeout(resolve, 100))
-
-        expect(mockSdkBridge.respondPermission).toHaveBeenCalledWith(
-          'sdk-sess-1', 'perm-1', { behavior: 'allow', updatedInput: {} },
+        await vi.waitFor(
+          () => expect(mockSdkBridge.respondPermission).toHaveBeenCalledWith(
+            'sdk-sess-1', 'perm-1', { behavior: 'allow', updatedInput: {} },
+          ),
+          { timeout: 3000 },
         )
       } finally {
         ws.close()
@@ -428,9 +429,10 @@ describe('WS Handler SDK Integration', () => {
           sessionId: 'sdk-sess-1',
         }))
 
-        await new Promise((resolve) => setTimeout(resolve, 100))
-
-        expect(mockSdkBridge.interrupt).toHaveBeenCalledWith('sdk-sess-1')
+        await vi.waitFor(
+          () => expect(mockSdkBridge.interrupt).toHaveBeenCalledWith('sdk-sess-1'),
+          { timeout: 3000 },
+        )
       } finally {
         ws.close()
       }
@@ -614,9 +616,10 @@ describe('WS Handler SDK Integration', () => {
           model: 'claude-sonnet-4-5-20250929',
         }))
 
-        await new Promise((resolve) => setTimeout(resolve, 100))
-
-        expect(mockSdkBridge.setModel).toHaveBeenCalledWith('sdk-sess-1', 'claude-sonnet-4-5-20250929')
+        await vi.waitFor(
+          () => expect(mockSdkBridge.setModel).toHaveBeenCalledWith('sdk-sess-1', 'claude-sonnet-4-5-20250929'),
+          { timeout: 3000 },
+        )
       } finally {
         ws.close()
       }
@@ -653,9 +656,10 @@ describe('WS Handler SDK Integration', () => {
           permissionMode: 'default',
         }))
 
-        await new Promise((resolve) => setTimeout(resolve, 100))
-
-        expect(mockSdkBridge.setPermissionMode).toHaveBeenCalledWith('sdk-sess-1', 'default')
+        await vi.waitFor(
+          () => expect(mockSdkBridge.setPermissionMode).toHaveBeenCalledWith('sdk-sess-1', 'default'),
+          { timeout: 3000 },
+        )
       } finally {
         ws.close()
       }

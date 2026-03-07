@@ -316,6 +316,9 @@ describe('terminal create/attach ordering (e2e)', () => {
         attachRequestId: expect.any(String),
       })
     })
+    expect(wsHarness.send.mock.calls
+      .map(([msg]) => msg)
+      .filter((msg) => msg?.type === 'terminal.resize' && msg?.terminalId === 'term-order-hidden')).toHaveLength(0)
 
     const attach = lastSent('terminal.attach', 'term-order-hidden')
     wsHarness.emit({

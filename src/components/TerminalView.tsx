@@ -240,6 +240,13 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     intent: AttachIntent
     terminalId: string
     sinceSeq: number
+    cols: number
+    rows: number
+  } | null>(null)
+  const suppressNextMatchingResizeRef = useRef<{
+    terminalId: string
+    cols: number
+    rows: number
   } | null>(null)
   const handledCreatedMessageRef = useRef<{
     requestId: string
@@ -585,7 +592,16 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       if (shouldResize) {
         const tid = terminalIdRef.current
         if (tid) {
-          ws.send({ type: 'terminal.resize', terminalId: tid, cols: term.cols, rows: term.rows })
+          const suppressedResize = suppressNextMatchingResizeRef.current
+          const matchesSuppressedViewport = suppressedResize
+            && suppressedResize.terminalId === tid
+            && suppressedResize.cols === term.cols
+            && suppressedResize.rows === term.rows
+          if (matchesSuppressedViewport) {
+            suppressNextMatchingResizeRef.current = null
+          } else {
+            ws.send({ type: 'terminal.resize', terminalId: tid, cols: term.cols, rows: term.rows })
+          }
         }
       }
     }
@@ -1122,7 +1138,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const attachTerminal = useCallback((
     tid: string,
     intent: AttachIntent,
-    opts?: { clearViewportFirst?: boolean },
+    opts?: { clearViewportFirst?: boolean; suppressNextMatchingResize?: boolean },
   ) => {
     const term = termRef.current
     if (!term) return
@@ -1168,7 +1184,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       intent,
       terminalId: tid,
       sinceSeq,
+      cols,
+      rows,
     }
+    suppressNextMatchingResizeRef.current = opts?.suppressNextMatchingResize
+      ? { terminalId: tid, cols, rows }
+      : null
 
     ws.send({
       type: 'terminal.attach',
@@ -1193,7 +1214,14 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     term.options.scrollback = settings.terminal.scrollback
     term.options.theme = resolvedTheme
     term.options.minimumContrastRatio = resolveMinimumContrastRatio(resolvedTheme)
-    if (!hidden) requestTerminalLayout({ fit: true, resize: true })
+    if (!hidden) {
+      const deferred = deferredAttachStateRef.current
+      if (deferred.mode === 'waiting_for_geometry' && deferred.pendingIntent) {
+        requestTerminalLayout({ fit: true })
+      } else {
+        requestTerminalLayout({ fit: true, resize: true })
+      }
+    }
   }, [isTerminal, settings, hidden, requestTerminalLayout])
 
   // When becoming visible, fit and send size
@@ -1201,14 +1229,16 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   useEffect(() => {
     if (!isTerminal) return
     if (!hidden) {
-      requestTerminalLayout({ fit: true, resize: true })
       const tid = terminalIdRef.current
       const deferred = deferredAttachStateRef.current
       if (tid && deferred.mode === 'waiting_for_geometry' && deferred.pendingIntent) {
         attachTerminal(tid, deferred.pendingIntent, {
           clearViewportFirst: deferred.pendingIntent === 'viewport_hydrate',
+          suppressNextMatchingResize: true,
         })
+        return
       }
+      requestTerminalLayout({ fit: true, resize: true })
     }
   }, [hidden, isTerminal, requestTerminalLayout, attachTerminal])
 

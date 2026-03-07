@@ -2226,6 +2226,9 @@ describe('TerminalView lifecycle updates', () => {
           attachRequestId: expect.any(String),
         }))
       })
+      expect(wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .filter((msg) => msg?.type === 'terminal.resize' && msg?.terminalId === terminalId)).toHaveLength(0)
 
       act(() => {
         messageHandler!({

@@ -77,17 +77,37 @@ export class TerminalStreamBroker {
   async attach(
     ws: LiveWebSocket,
     terminalId: string,
+    cols: number,
+    rows: number,
     sinceSeq: number | undefined,
     attachRequestId?: string,
-  ): Promise<boolean> {
-    const record = this.registry.attach(terminalId, ws, { suppressOutput: true })
-    if (!record) return false
-
-    const terminalState = this.getOrCreateTerminalState(terminalId)
-    const attachment = this.getOrCreateAttachment(terminalState, ws, terminalId)
+  ): Promise<'attached' | 'duplicate' | 'missing'> {
     const normalizedSinceSeq = sinceSeq === undefined || sinceSeq === 0 ? 0 : sinceSeq
+    let result: 'attached' | 'duplicate' | 'missing' = 'attached'
 
     await this.withTerminalLock(terminalId, async () => {
+      const existingState = this.terminals.get(terminalId)
+      const existingAttachment = existingState?.clients.get(ws)
+      if (attachRequestId && existingAttachment?.activeAttachRequestId === attachRequestId) {
+        result = 'duplicate'
+        return
+      }
+
+      const record = this.registry.attach(terminalId, ws, { suppressOutput: true })
+      if (!record) {
+        result = 'missing'
+        return
+      }
+
+      if (!this.registry.resize(terminalId, cols, rows)) {
+        this.registry.detach(terminalId, ws)
+        result = 'missing'
+        return
+      }
+
+      const terminalState = existingState ?? this.getOrCreateTerminalState(terminalId)
+      const attachment = existingAttachment ?? this.getOrCreateAttachment(terminalState, ws, terminalId)
+
       if (attachment.flushTimer) {
         clearTimeout(attachment.flushTimer)
         attachment.flushTimer = null
@@ -192,7 +212,13 @@ export class TerminalStreamBroker {
       }
     })
 
-    return true
+    return result
+  }
+
+  hasActiveAttachRequest(ws: LiveWebSocket, terminalId: string, attachRequestId: string): boolean {
+    const state = this.terminals.get(terminalId)
+    const attachment = state?.clients.get(ws)
+    return attachment?.activeAttachRequestId === attachRequestId
   }
 
   detach(terminalId: string, ws: LiveWebSocket): boolean {

@@ -361,7 +361,24 @@ describe('terminal stream v2 replay', () => {
 
   it('terminal.create returns created only until explicit attach', async () => {
     const { ws, close } = await createAuthenticatedConnection(port)
-    const { terminalId } = await createTerminal(ws, 'stream-split-create')
+    const observed: any[] = []
+    const onMessage = (data: WebSocket.Data) => {
+      observed.push(JSON.parse(data.toString()))
+    }
+    ws.on('message', onMessage)
+
+    ws.send(JSON.stringify({
+      type: 'terminal.create',
+      requestId: 'stream-split-create',
+      mode: 'shell',
+      shell: 'system',
+    }))
+
+    const created = await waitForMessage(ws, (msg) => msg.type === 'terminal.created' && msg.requestId === 'stream-split-create')
+    const terminalId = created.terminalId as string
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect(observed.some((msg) => msg.type === 'terminal.attach.ready' && msg.terminalId === terminalId)).toBe(false)
+    expect(observed.some((msg) => msg.type === 'terminal.output' && msg.terminalId === terminalId)).toBe(false)
 
     sendAttach(ws, terminalId, { attachRequestId: 'stream-split-create-attach' })
 
@@ -371,6 +388,7 @@ describe('terminal stream v2 replay', () => {
     )
     expect(ready.terminalId).toBe(terminalId)
 
+    ws.off('message', onMessage)
     await close()
   })
 

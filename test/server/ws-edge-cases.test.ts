@@ -1699,11 +1699,15 @@ describe('WebSocket edge cases', () => {
       const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === 'split-attach-retry')
 
       const ordered: string[] = []
+      const observed: any[] = []
       registry.onResize = () => ordered.push('resize')
       ws.on('message', (data) => {
         const msg = JSON.parse(data.toString())
-        if (msg.type === 'terminal.attach.ready') ordered.push('ready')
-        if (msg.type === 'terminal.output') ordered.push('output')
+        if (msg.attachRequestId === 'retry-1' && (msg.type === 'terminal.attach.ready' || msg.type === 'terminal.output')) {
+          observed.push(msg)
+        }
+        if (msg.type === 'terminal.attach.ready' && msg.attachRequestId === 'retry-1') ordered.push('ready')
+        if (msg.type === 'terminal.output' && msg.attachRequestId === 'retry-1') ordered.push('output')
       })
 
       sendAttach(ws, created.terminalId, { attachRequestId: 'retry-1' })
@@ -1712,10 +1716,10 @@ describe('WebSocket edge cases', () => {
       const ready = await waitForMessage(ws, (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'retry-1')
       expect(ready.terminalId).toBe(created.terminalId)
       registry.simulateOutput(created.terminalId, 'retry-seed')
-      await waitForMessage(ws, (m) => m.type === 'terminal.output' && m.terminalId === created.terminalId)
-      const msgs = await collectMessages(ws, 200)
-      const duplicateReadyCount = msgs.filter((m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'retry-1').length
-      expect(duplicateReadyCount).toBe(0)
+      await waitForMessage(ws, (m) => m.type === 'terminal.output' && m.attachRequestId === 'retry-1')
+      expect(observed.filter((m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'retry-1')).toHaveLength(1)
+      expect(observed.filter((m) => m.type === 'terminal.output' && m.attachRequestId === 'retry-1')).toHaveLength(1)
+      expect(ordered.filter((entry) => entry === 'resize')).toHaveLength(1)
       expect(ordered.indexOf('ready')).toBeGreaterThan(ordered.indexOf('resize'))
       expect(ordered.indexOf('output')).toBeGreaterThan(ordered.indexOf('ready'))
       close()

@@ -269,6 +269,51 @@ describe('WsClient.connect', () => {
     expect(secondCreates).toEqual(['reconnect-create-1'])
   })
 
+  it('drops queued terminal.attach messages on reconnect so recovery only attaches once', async () => {
+    const c = new WsClient('ws://example/ws')
+    const reconnectHandler = vi.fn(() => {
+      c.send({
+        type: 'terminal.attach',
+        terminalId: 'term-reconnect-attach',
+        cols: 120,
+        rows: 40,
+        attachRequestId: 'attach-from-reconnect-handler',
+      } as any)
+    })
+    c.onReconnect(reconnectHandler)
+
+    const p1 = c.connect()
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p1
+    MockWebSocket.instances[0]._close(1006, 'drop-before-recovery-attach')
+
+    c.send({
+      type: 'terminal.attach',
+      terminalId: 'term-reconnect-attach',
+      cols: 80,
+      rows: 24,
+      attachRequestId: 'attach-queued-while-offline',
+    } as any)
+
+    const p2 = c.connect()
+    MockWebSocket.instances[1]._open()
+    MockWebSocket.instances[1]._message({ type: 'ready' })
+    await p2
+
+    expect(reconnectHandler).toHaveBeenCalledTimes(1)
+    const attaches = MockWebSocket.instances[1].sent
+      .map((x) => JSON.parse(x))
+      .filter((m) => m.type === 'terminal.attach')
+    expect(attaches).toEqual([
+      expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId: 'term-reconnect-attach',
+        attachRequestId: 'attach-from-reconnect-handler',
+      }),
+    ])
+  })
+
   it('treats HELLO_TIMEOUT as transient and schedules reconnect', async () => {
     const setTimeoutSpy = vi.spyOn(window, 'setTimeout')
 

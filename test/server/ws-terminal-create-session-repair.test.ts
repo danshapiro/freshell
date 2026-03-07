@@ -451,6 +451,103 @@ describe('terminal.create session repair wait', () => {
     }
   })
 
+  it('treats cross-socket duplicate requestIds as one in-flight claude repair wait', async () => {
+    sessionRepairService.waitForSessionDelay = 300
+
+    const requestId = 'resume-cross-socket-dup-1'
+    const ws1 = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    let ws2: WebSocket | undefined
+
+    try {
+      await new Promise<void>((resolve) => ws1.on('open', () => resolve()))
+      ws1.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+      await waitForMessage(ws1, (m) => m.type === 'ready')
+
+      ws1.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'claude',
+        resumeSessionId: VALID_SESSION_ID,
+      }))
+
+      await new Promise((resolve) => setTimeout(resolve, 50))
+
+      ws2 = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+      await new Promise<void>((resolve) => ws2!.on('open', () => resolve()))
+      ws2.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+      await waitForMessage(ws2, (m) => m.type === 'ready')
+
+      ws2.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'claude',
+        resumeSessionId: VALID_SESSION_ID,
+      }))
+
+      const [createdOnWs1, createdOnWs2] = await Promise.all([
+        waitForMessage(ws1, (m) => m.type === 'terminal.created' && m.requestId === requestId, 3000),
+        waitForMessage(ws2, (m) => m.type === 'terminal.created' && m.requestId === requestId, 3000),
+      ])
+
+      expect(createdOnWs2.terminalId).toBe(createdOnWs1.terminalId)
+      expect(registry.records.size).toBe(1)
+      expect(registry.createCallCount).toBe(1)
+    } finally {
+      await closeWebSocket(ws1)
+      if (ws2) {
+        await closeWebSocket(ws2)
+      }
+    }
+  })
+
+  it('coalesces concurrent claude repair waits by session across sockets', async () => {
+    sessionRepairService.waitForSessionDelay = 300
+
+    const ws1 = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    let ws2: WebSocket | undefined
+
+    try {
+      await new Promise<void>((resolve) => ws1.on('open', () => resolve()))
+      ws1.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+      await waitForMessage(ws1, (m) => m.type === 'ready')
+
+      ws1.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'resume-session-lock-1',
+        mode: 'claude',
+        resumeSessionId: VALID_SESSION_ID,
+      }))
+
+      await new Promise((resolve) => setTimeout(resolve, 50))
+
+      ws2 = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+      await new Promise<void>((resolve) => ws2!.on('open', () => resolve()))
+      ws2.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+      await waitForMessage(ws2, (m) => m.type === 'ready')
+
+      ws2.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId: 'resume-session-lock-2',
+        mode: 'claude',
+        resumeSessionId: VALID_SESSION_ID,
+      }))
+
+      const [createdOnWs1, createdOnWs2] = await Promise.all([
+        waitForMessage(ws1, (m) => m.type === 'terminal.created' && m.requestId === 'resume-session-lock-1', 3000),
+        waitForMessage(ws2, (m) => m.type === 'terminal.created' && m.requestId === 'resume-session-lock-2', 3000),
+      ])
+
+      expect(createdOnWs2.terminalId).toBe(createdOnWs1.terminalId)
+      expect(registry.records.size).toBe(1)
+      expect(registry.createCallCount).toBe(1)
+    } finally {
+      await closeWebSocket(ws1)
+      if (ws2) {
+        await closeWebSocket(ws2)
+      }
+    }
+  })
+
   it('does not create terminal if client disconnects during repair wait', async () => {
     sessionRepairService.waitForSessionDelay = 500
 
@@ -594,6 +691,9 @@ describe('terminal.create session repair wait', () => {
 
   it('reuses requestId across reconnects to avoid duplicate shell create', async () => {
     const requestId = 'reconnect-idempotent-create-1'
+    const baseNow = 1_700_000_000_000
+    let now = baseNow
+    const dateNowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now)
     const ws1 = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     let ws2: WebSocket | undefined
 
@@ -614,6 +714,7 @@ describe('terminal.create session repair wait', () => {
       )
 
       await closeWebSocket(ws1)
+      now += 10 * 60_000
 
       ws2 = new WebSocket(`ws://127.0.0.1:${port}/ws`)
       await new Promise<void>((resolve) => ws2.on('open', () => resolve()))
@@ -635,6 +736,7 @@ describe('terminal.create session repair wait', () => {
       expect(registry.records.size).toBe(1)
       expect(registry.createCallCount).toBe(1)
     } finally {
+      dateNowSpy.mockRestore()
       await closeWebSocket(ws1)
       if (ws2) {
         await closeWebSocket(ws2)

@@ -39,6 +39,11 @@ type TerminalCreateClientMessage = {
   requestId: string
 }
 
+type TerminalAttachClientMessage = {
+  type: 'terminal.attach'
+  terminalId: string
+}
+
 type InFlightCreate = {
   message: unknown
   lastResendEpoch: number
@@ -60,6 +65,14 @@ function isTerminalCreateMessage(msg: unknown): msg is TerminalCreateClientMessa
   if (!msg || typeof msg !== 'object') return false
   const candidate = msg as { type?: unknown; requestId?: unknown }
   return candidate.type === 'terminal.create' && typeof candidate.requestId === 'string' && candidate.requestId.length > 0
+}
+
+function isTerminalAttachMessage(msg: unknown): msg is TerminalAttachClientMessage {
+  if (!msg || typeof msg !== 'object') return false
+  const candidate = msg as { type?: unknown; terminalId?: unknown }
+  return candidate.type === 'terminal.attach'
+    && typeof candidate.terminalId === 'string'
+    && candidate.terminalId.length > 0
 }
 
 export class WsClient {
@@ -211,8 +224,12 @@ export class WsClient {
           }
           this.preReadyCreateQueue.clear()
 
-          while (this.pendingMessages.length > 0) {
-            const next = this.pendingMessages.shift()
+          const pendingMessages = isReconnect
+            ? this.pendingMessages.filter((msg) => !isTerminalAttachMessage(msg))
+            : this.pendingMessages
+          this.pendingMessages = []
+
+          for (const next of pendingMessages) {
             if (!next) continue
             this.sendNow(next)
           }
