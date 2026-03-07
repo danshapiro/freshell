@@ -4,7 +4,7 @@
 
 **Goal:** Ensure any session already open in a tab is present in the left sidebar even when it falls outside the paginated 100-session window.
 
-**Architecture:** Keep `state.sessions.projects` as the canonical sidebar data source and hydrate only local open-tab sessions into that state with exact server lookups. Preserve `sessionRef.serverInstanceId` when collecting open session locators, filter out foreign-machine tabs before hydration, and track unresolved local refs in Redux against a server-driven catalog revision so zero-result resolves do not repost until the session catalog actually changes.
+**Architecture:** Keep `state.sessions.projects` as the canonical sidebar data source and hydrate only local open-tab sessions into that state with exact server lookups, but only after the first server session baseline has landed. Preserve `sessionRef.serverInstanceId` when collecting open session locators, filter out foreign-machine tabs before hydration, batch client resolve requests to match the route cap, and track unresolved/failed local refs in Redux against a server-driven catalog revision so zero-result or error responses do not repost until the session catalog actually changes.
 
 **Tech Stack:** React 18, Redux Toolkit, Express, Zod, Vitest, Testing Library, supertest
 
@@ -13,8 +13,10 @@
 **Notes:**
 - The mounted sessions router is `server/sessions-router.ts`. Do not patch `server/routes/sessions.ts`; it is not used by `server/index.ts`.
 - Pagination semantics stay intact. The first page is still the newest 100 sessions; open-tab sessions are hydrated out-of-band and merged into canonical state.
+- Hydration must stay disabled until the first server-driven session baseline arrives (`setProjects`, `mergeSnapshotProjects`, `appendSessionsPage`, or `applySessionsPatch`). Restored local tabs/panes alone are not evidence that a session is actually missing from the newest 100.
 - Do not use `lastLoadedAt` as the hydration retry gate. `mergeResolvedProjects()` is a local upsert and must not re-arm unresolved open-session requests by itself.
 - Do not drive the network request directly off the same selector that `markOpenTabHydrationRequested()` invalidates. The App orchestration must snapshot the request payload independently so the in-flight state transition does not cancel its own request and strand keys in `inFlight`.
+- Do not clear failed requests back to hydratable state immediately. Persistent `/api/sessions/resolve` failures must be parked on the current server baseline/revision so they do not tight-loop and spam logs.
 - No `docs/index.html` update is needed for this change because the UI layout does not change; only sidebar data hydration changes.
 
 ---
@@ -229,7 +231,7 @@ git commit -m "feat: add exact session resolve API for open tabs"
 
 ---
 
-### Task 3: Add Server-Catalog Revision And Durable Open-Tab Hydration State
+### Task 3: Add Server-Baseline Gating, Server-Catalog Revision, And Durable Open-Tab Hydration State
 
 **Files:**
 - Modify: `src/store/sessionsSlice.ts`
@@ -244,14 +246,15 @@ Add reducer tests covering two concerns:
 - adding a resolved session for a project not yet present in `state.projects`
 - replacing a stale copy of an already-known session by `provider:sessionId`
 - preserving provider collisions (`claude:s1` and `codex:s1` are different sessions)
+- **not** setting the new `serverBaselineReady` flag
 - **not** incrementing the new server-catalog revision counter
 
 2. Durable hydration state:
-- `setProjects`, `mergeSnapshotProjects`, `appendSessionsPage`, and `applySessionsPatch` increment `serverCatalogRevision`
+- `setProjects`, `mergeSnapshotProjects`, `appendSessionsPage`, and `applySessionsPatch` set `serverBaselineReady = true` and increment `serverCatalogRevision`
 - `markOpenTabHydrationRequested()` marks keys as `inFlight`
 - `settleOpenTabHydrationRequest()` clears resolved keys and marks zero-result keys as unresolved for the **current** `serverCatalogRevision`
-- `clearOpenTabHydrationRequest()` clears failed in-flight markers without permanently suppressing retries
-- `clearProjects()` resets both `serverCatalogRevision` and `openTabHydration`
+- `failOpenTabHydrationRequest()` clears `inFlight` and parks failed keys on the **current** `serverCatalogRevision`
+- `clearProjects()` resets `serverBaselineReady`, `serverCatalogRevision`, and `openTabHydration`
 
 Use concrete examples like:
 
@@ -278,6 +281,15 @@ expect(state.openTabHydration['codex:missing-open']).toEqual({
   inFlight: false,
   unresolvedCatalogRevision: state.serverCatalogRevision,
 })
+
+state = sessionsReducer(state, failOpenTabHydrationRequest({
+  sessionKeys: ['codex:failing-open'],
+}))
+
+expect(state.openTabHydration['codex:failing-open']).toEqual({
+  inFlight: false,
+  failedCatalogRevision: state.serverCatalogRevision,
+})
 ```
 
 **Step 2: Run the reducer tests to verify failure**
@@ -296,10 +308,12 @@ Expected: FAIL because the new revision/hydration reducers do not exist yet.
 Extend `SessionsState` with:
 
 ```typescript
+serverBaselineReady: boolean
 serverCatalogRevision: number
 openTabHydration: Record<string, {
   inFlight: boolean
   unresolvedCatalogRevision?: number
+  failedCatalogRevision?: number
 }>
 ```
 
@@ -317,6 +331,7 @@ function knownSessionKeys(projects: ProjectGroup[]): Set<string> {
 }
 
 function bumpServerCatalogRevision(state: SessionsState): void {
+  state.serverBaselineReady = true
   state.serverCatalogRevision += 1
 }
 
@@ -330,8 +345,10 @@ function clearKnownHydrationEntries(state: SessionsState): void {
 
 Then:
 
-- increment `serverCatalogRevision` only in reducers driven by server snapshots/pages/patches (`setProjects`, `mergeSnapshotProjects`, `appendSessionsPage`, `applySessionsPatch`, `clearProjects`)
-- keep `mergeResolvedProjects()` as a **local** partial upsert and do **not** increment `serverCatalogRevision`
+- initialize `serverBaselineReady = false`
+- call `bumpServerCatalogRevision(state)` only in reducers driven by server snapshots/pages/patches (`setProjects`, `mergeSnapshotProjects`, `appendSessionsPage`, `applySessionsPatch`)
+- keep `mergeResolvedProjects()` as a **local** partial upsert and do **not** set `serverBaselineReady` or increment `serverCatalogRevision`
+- make `clearProjects()` reset `serverBaselineReady = false`, `serverCatalogRevision = 0`, and `openTabHydration = {}`
 - implement:
 
 ```typescript
@@ -362,12 +379,15 @@ settleOpenTabHydrationRequest: (
   }
 },
 
-clearOpenTabHydrationRequest: (state, action: PayloadAction<{ sessionKeys: string[] }>) => {
+failOpenTabHydrationRequest: (state, action: PayloadAction<{ sessionKeys: string[] }>) => {
   for (const key of action.payload.sessionKeys) {
     const current = state.openTabHydration[key]
     if (!current) continue
-    if (current.unresolvedCatalogRevision === undefined) delete state.openTabHydration[key]
-    else state.openTabHydration[key] = { ...current, inFlight: false }
+    state.openTabHydration[key] = {
+      ...current,
+      inFlight: false,
+      failedCatalogRevision: state.serverCatalogRevision,
+    }
   }
 },
 ```
@@ -383,7 +403,7 @@ cd /home/user/code/freshell/.worktrees/show-open-tab-sessions-in-sidebar
 npx vitest run test/unit/client/store/sessionsSlice.test.ts test/unit/client/sessionsSlice.pagination.test.ts
 ```
 
-Expected: PASS. In particular, `mergeResolvedProjects()` should not bump `serverCatalogRevision`, and a zero-result settle should park the key on the current revision.
+Expected: PASS. In particular, `mergeResolvedProjects()` should not set `serverBaselineReady` or bump `serverCatalogRevision`, a zero-result settle should park the key on the current revision, and a failure park should prevent immediate same-revision retries.
 
 **Step 5: Commit**
 
@@ -395,7 +415,7 @@ git commit -m "feat: track durable open-tab session hydration state"
 
 ---
 
-### Task 4: Add Local-Only Hydration Selectors And App Orchestration
+### Task 4: Add Baseline-Gated, Batched, Local-Only Hydration Selectors And App Orchestration
 
 **Files:**
 - Create: `src/store/selectors/openSessionSelectors.ts`
@@ -407,21 +427,27 @@ git commit -m "feat: track durable open-tab session hydration state"
 
 Create `test/unit/client/store/selectors/openSessionSelectors.test.ts` covering:
 
+- no refs are hydratable before `serverBaselineReady` is true
 - only open sessions missing from `state.sessions.projects` are returned
 - explicit foreign locators (`sessionRef.serverInstanceId !== state.connection.serverInstanceId`) are excluded
 - explicit locators wait when `sessionRef.serverInstanceId` exists but the local `serverInstanceId` is still unknown
 - keys parked in `openTabHydration` for the current `serverCatalogRevision` are excluded
+- keys parked by `failedCatalogRevision` for the current `serverCatalogRevision` are excluded
 - a later `serverCatalogRevision` makes the same unresolved local key eligible again
 - unrelated state changes return the same memoized array reference
 
 Create `test/unit/client/components/App.open-tab-session-hydration.test.tsx` covering:
 
+- before the first server baseline, restored open local sessions do **not** call `/api/sessions/resolve`
+- if the first baseline page already contains the open session, hydration never fires for it
 - bootstrap loads `/api/sessions?limit=100` without the open session
 - App then calls `POST /api/sessions/resolve` exactly once for the missing open session
 - App dispatches `mergeResolvedProjects()` and the store ends up containing that session
 - the request still settles correctly even though `markOpenTabHydrationRequested()` removes the refs from `selectHydratableOpenSessionRefs` during the same render cycle
+- more than 200 missing open sessions are sent in multiple requests that each respect the route cap
 - a zero-result `/api/sessions/resolve` response marks the key unresolved and does **not** immediately repost on rerender or unrelated local state changes
 - a delayed-index case: first resolve returns zero projects, then a later **server-driven** catalog update re-arms the same key and a second resolve merges it successfully
+- a persistent 500/network failure parks the key on the current revision and does **not** immediately retrigger the same request on the next render
 - a copied remote tab with `sessionRef.serverInstanceId = 'srv-remote'` and local `serverInstanceId = 'srv-local'` never calls `/api/sessions/resolve`
 - the success-path request does not leave keys stuck in `openTabHydration.inFlight` after the promise resolves
 
@@ -446,6 +472,7 @@ Create `src/store/selectors/openSessionSelectors.ts` with stable memoized select
 const selectProjects = (state: RootState) => state.sessions.projects
 const selectTabs = (state: RootState) => state.tabs.tabs
 const selectPanes = (state: RootState) => state.panes
+const selectServerBaselineReady = (state: RootState) => state.sessions.serverBaselineReady
 const selectLocalServerInstanceId = (state: RootState) => state.connection.serverInstanceId
 const selectServerCatalogRevision = (state: RootState) => state.sessions.serverCatalogRevision
 const selectOpenTabHydration = (state: RootState) => state.sessions.openTabHydration
@@ -455,8 +482,10 @@ function toSessionKey(provider: CodingCliProviderName, sessionId: string): strin
 }
 
 export const selectHydratableOpenSessionLocators = createSelector(
-  [selectProjects, selectTabs, selectPanes, selectLocalServerInstanceId, selectOpenTabHydration, selectServerCatalogRevision],
-  (projects, tabs, panes, localServerInstanceId, openTabHydration, serverCatalogRevision) => {
+  [selectProjects, selectTabs, selectPanes, selectServerBaselineReady, selectLocalServerInstanceId, selectOpenTabHydration, selectServerCatalogRevision],
+  (projects, tabs, panes, serverBaselineReady, localServerInstanceId, openTabHydration, serverCatalogRevision) => {
+    if (!serverBaselineReady) return []
+
     const known = new Set<string>()
     for (const project of projects) {
       for (const session of project.sessions) {
@@ -477,6 +506,7 @@ export const selectHydratableOpenSessionLocators = createSelector(
       const hydration = openTabHydration[key]
       if (hydration?.inFlight) return false
       if (hydration?.unresolvedCatalogRevision === serverCatalogRevision) return false
+      if (hydration?.failedCatalogRevision === serverCatalogRevision) return false
       return true
     })
   },
@@ -493,17 +523,22 @@ In `src/App.tsx`, do **not** fire `resolveSessions()` directly from the same eff
 Instead, add a snapshotted local request state:
 
 ```typescript
+type OpenTabHydrationBatch = {
+  requestedKeys: string[]
+  refs: Array<{ provider: CodingCliProviderName; sessionId: string }>
+}
+
 type OpenTabHydrationRequest = {
   requestKey: string
   requestedKeys: string[]
-  refs: Array<{ provider: CodingCliProviderName; sessionId: string }>
+  batches: OpenTabHydrationBatch[]
 }
 ```
 
 Then use two effects:
 
 1. a **queueing** effect that snapshots the current selector output into local component state and marks Redux `inFlight`
-2. a **runner** effect that performs `resolveSessions()` from the stable local snapshot, so selector changes during the in-flight window do not cancel the request
+2. a **runner** effect that performs `resolveSessions()` from the stable local snapshot, batch-by-batch, so selector changes during the in-flight window do not cancel the request and large workspaces still respect the route cap
 
 Sketch:
 
@@ -511,6 +546,7 @@ Sketch:
 const hydratableOpenSessionRefs = useAppSelector(selectHydratableOpenSessionRefs)
 const [activeOpenTabHydrationRequest, setActiveOpenTabHydrationRequest] =
   useState<OpenTabHydrationRequest | null>(null)
+const OPEN_SESSION_RESOLVE_BATCH_SIZE = 200
 
 useEffect(() => {
   if (activeOpenTabHydrationRequest || hydratableOpenSessionRefs.length === 0) return
@@ -523,7 +559,10 @@ useEffect(() => {
   const request = {
     requestKey,
     requestedKeys,
-    refs: hydratableOpenSessionRefs,
+    batches: chunkArray(hydratableOpenSessionRefs, OPEN_SESSION_RESOLVE_BATCH_SIZE).map((refs) => ({
+      refs,
+      requestedKeys: refs.map((ref) => `${ref.provider}:${ref.sessionId}`),
+    })),
   }
 
   dispatch(markOpenTabHydrationRequested({ sessionKeys: requestedKeys }))
@@ -534,33 +573,42 @@ useEffect(() => {
   if (!activeOpenTabHydrationRequest) return
 
   let cancelled = false
-  const { requestedKeys, refs, requestKey } = activeOpenTabHydrationRequest
+  const { requestedKeys, batches, requestKey } = activeOpenTabHydrationRequest
 
-  void resolveSessions(refs)
-    .then((response) => {
-      if (cancelled) return
+  void (async () => {
+    const resolvedKeys: string[] = []
+    try {
+      for (const batch of batches) {
+        const response = await resolveSessions(batch.refs)
+        if (cancelled) return
 
-      const projects = response.projects || []
-      const resolvedKeys = projects.flatMap((project) =>
-        (project.sessions || []).map((session: any) => `${session.provider || 'claude'}:${session.sessionId}`),
-      )
+        const projects = response.projects || []
+        const batchResolvedKeys = projects.flatMap((project) =>
+          (project.sessions || []).map((session: any) => `${session.provider || 'claude'}:${session.sessionId}`),
+        )
+        resolvedKeys.push(...batchResolvedKeys)
 
-      if (projects.length > 0) {
-        dispatch(mergeResolvedProjects(projects))
+        if (projects.length > 0) {
+          dispatch(mergeResolvedProjects(projects))
+        }
       }
+
+      if (cancelled) return
       dispatch(settleOpenTabHydrationRequest({ requestedKeys, resolvedKeys }))
-    })
-    .catch((err) => {
+    } catch (err) {
       if (cancelled) return
       log.warn('Failed to resolve open-tab sessions', err)
-      dispatch(clearOpenTabHydrationRequest({ sessionKeys: requestedKeys }))
-    })
-    .finally(() => {
+
+      const resolved = new Set(resolvedKeys)
+      const failedKeys = requestedKeys.filter((key) => !resolved.has(key))
+      dispatch(failOpenTabHydrationRequest({ sessionKeys: failedKeys }))
+    } finally {
       if (cancelled) return
       setActiveOpenTabHydrationRequest((current) =>
         current?.requestKey === requestKey ? null : current
       )
-    })
+    }
+  })()
 
   return () => { cancelled = true }
 }, [dispatch, activeOpenTabHydrationRequest?.requestKey])
@@ -570,11 +618,15 @@ Key guardrails:
 
 - do not run for copied remote tabs whose explicit `sessionRef.serverInstanceId` points at another server
 - do not guess that a locator with explicit `serverInstanceId` is local before `state.connection.serverInstanceId` is known
+- do not queue anything before `serverBaselineReady` is true
 - do not dispatch placeholder sidebar rows before the canonical payload arrives
 - marking keys `inFlight` must not cancel the request that just claimed them
 - the runner effect must settle or clear the exact snapshotted `requestedKeys` even after `selectHydratableOpenSessionRefs` becomes empty
+- each network call must respect the route cap (`<= 200` refs per request)
 - a zero-result resolve must park the key on the current `serverCatalogRevision`
+- a resolve failure must park the key on the current `serverCatalogRevision`
 - only a later **server-driven** catalog update should make the unresolved key eligible again; `mergeResolvedProjects()` alone must not do that
+- only a later **server-driven** catalog update should make a failed key eligible again; the same failing request must not immediately retrigger on the next render
 
 **Step 4: Re-run the targeted tests**
 
@@ -592,7 +644,7 @@ Expected: PASS.
 ```bash
 cd /home/user/code/freshell/.worktrees/show-open-tab-sessions-in-sidebar
 git add src/store/selectors/openSessionSelectors.ts src/App.tsx test/unit/client/store/selectors/openSessionSelectors.test.ts test/unit/client/components/App.open-tab-session-hydration.test.tsx
-git commit -m "feat: hydrate only local open-tab sessions"
+git commit -m "feat: gate and batch local open-tab hydration"
 ```
 
 ---
