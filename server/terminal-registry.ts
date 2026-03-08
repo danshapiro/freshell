@@ -34,13 +34,12 @@ const MAX_OUTPUT_BUFFER_CHARS = Number(process.env.MAX_OUTPUT_BUFFER_CHARS || pr
 const MAX_OUTPUT_FRAME_CHARS = Math.max(1, Number(process.env.MAX_OUTPUT_FRAME_CHARS || 8192))
 const perfConfig = getPerfConfig()
 
-// TerminalMode includes 'shell' for regular terminals, plus coding CLI providers.
-// Provider command defaults are configurable via env vars; resume semantics
-// are only configured for providers that define resume args.
-export type TerminalMode = 'shell' | 'claude' | 'codex' | 'opencode' | 'gemini' | 'kimi'
+// TerminalMode is now a wider type -- any string is valid as a mode name.
+// 'shell' is the only built-in; all CLI modes come from registered extensions.
+export type TerminalMode = 'shell' | (string & {})
 export type ShellType = 'system' | 'cmd' | 'powershell' | 'wsl'
 
-type CodingCliCommandSpec = {
+export type CodingCliCommandSpec = {
   label: string
   envVar: string
   defaultCommand: string
@@ -48,35 +47,16 @@ type CodingCliCommandSpec = {
   supportsPermissionMode?: boolean
 }
 
-const CODING_CLI_COMMANDS: Record<Exclude<TerminalMode, 'shell'>, CodingCliCommandSpec> = {
-  claude: {
-    label: 'Claude CLI',
-    envVar: 'CLAUDE_CMD',
-    defaultCommand: 'claude',
-    resumeArgs: (sessionId) => ['--resume', sessionId],
-    supportsPermissionMode: true,
-  },
-  codex: {
-    label: 'Codex CLI',
-    envVar: 'CODEX_CMD',
-    defaultCommand: 'codex',
-    resumeArgs: (sessionId) => ['resume', sessionId],
-  },
-  opencode: {
-    label: 'OpenCode',
-    envVar: 'OPENCODE_CMD',
-    defaultCommand: 'opencode',
-  },
-  gemini: {
-    label: 'Gemini',
-    envVar: 'GEMINI_CMD',
-    defaultCommand: 'gemini',
-  },
-  kimi: {
-    label: 'Kimi',
-    envVar: 'KIMI_CMD',
-    defaultCommand: 'kimi',
-  },
+// Mutable map, populated at startup from extension registry.
+// No longer a hardcoded Record -- extensions are the single source of truth.
+let codingCliCommands: Map<string, CodingCliCommandSpec> = new Map()
+
+/**
+ * Populate the CLI commands map from extension data.
+ * Called once at server startup after extensions are scanned.
+ */
+export function registerCodingCliCommands(specs: Map<string, CodingCliCommandSpec>): void {
+  codingCliCommands = specs
 }
 
 /**
@@ -85,7 +65,7 @@ const CODING_CLI_COMMANDS: Record<Exclude<TerminalMode, 'shell'>, CodingCliComma
  */
 export function modeSupportsResume(mode: TerminalMode): boolean {
   if (mode === 'shell') return false
-  return !!CODING_CLI_COMMANDS[mode]?.resumeArgs
+  return !!codingCliCommands.get(mode)?.resumeArgs
 }
 
 type ProviderTarget = 'unix' | 'windows'
@@ -211,8 +191,9 @@ type ProviderSettings = {
 
 function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, target: ProviderTarget = 'unix', providerSettings?: ProviderSettings) {
   if (mode === 'shell') return null
-  const spec = CODING_CLI_COMMANDS[mode]
-  const command = process.env[spec.envVar] || spec.defaultCommand
+  const spec = codingCliCommands.get(mode)
+  if (!spec) return null
+  const command = (spec.envVar && process.env[spec.envVar]) || spec.defaultCommand
   const providerArgs = providerNotificationArgs(mode, target)
   let resumeArgs: string[] = []
   if (resumeSessionId) {
@@ -239,8 +220,8 @@ function normalizeResumeSessionId(mode: TerminalMode, resumeSessionId?: string):
 
 function getModeLabel(mode: TerminalMode): string {
   if (mode === 'shell') return 'Shell'
-  const label = CODING_CLI_COMMANDS[mode]?.label
-  return label || mode.toUpperCase()
+  const label = codingCliCommands.get(mode)?.label
+  return label || mode.charAt(0).toUpperCase() + mode.slice(1)
 }
 
 type PendingSnapshotQueue = {

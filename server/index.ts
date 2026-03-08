@@ -17,7 +17,7 @@ import { logger, setLogLevel } from './logger.js'
 import { requestLogger } from './request-logger.js'
 import { validateStartupSecurity, httpAuthMiddleware } from './auth.js'
 import { configStore } from './config-store.js'
-import { TerminalRegistry, type TerminalRecord } from './terminal-registry.js'
+import { TerminalRegistry, type TerminalRecord, registerCodingCliCommands, type CodingCliCommandSpec } from './terminal-registry.js'
 import { WsHandler } from './ws-handler.js'
 import { SessionsSyncService } from './sessions-sync/service.js'
 import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
@@ -156,6 +156,26 @@ async function main() {
   const localExtDir = path.join(process.cwd(), '.freshell', 'extensions')
   const builtinExtDir = path.join(process.cwd(), 'extensions')
   extensionManager.scan([userExtDir, localExtDir, builtinExtDir])
+
+  // Build CLI commands from extension manifests
+  const cliCommandsMap = new Map<string, CodingCliCommandSpec>()
+  for (const ext of extensionManager.getAll()) {
+    if (ext.manifest.category !== 'cli' || !ext.manifest.cli) continue
+    const cli = ext.manifest.cli
+    const spec: CodingCliCommandSpec = {
+      label: ext.manifest.label,
+      envVar: cli.envVar || '',
+      defaultCommand: cli.command,
+      supportsPermissionMode: cli.supportsPermissionMode,
+    }
+    if (cli.resumeArgs) {
+      const template = cli.resumeArgs
+      spec.resumeArgs = (sessionId: string) =>
+        template.map(arg => arg.replace('{{sessionId}}', sessionId))
+    }
+    cliCommandsMap.set(ext.manifest.name, spec)
+  }
+  registerCodingCliCommands(cliCommandsMap)
 
   const server = http.createServer(app)
   const wsHandler = new WsHandler(
