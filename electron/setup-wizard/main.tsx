@@ -15,8 +15,9 @@ declare global {
   }
 }
 
-function handleComplete(config: WizardConfig): void {
-  void window.freshellDesktop?.completeSetup(config)
+async function handleComplete(config: WizardConfig): Promise<void> {
+  await window.freshellDesktop?.completeSetup(config)
+  window.close()
 }
 
 createRoot(document.getElementById('wizard-root')!).render(

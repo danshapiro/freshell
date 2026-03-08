@@ -33,9 +33,20 @@ async function main(): Promise<void> {
   // Electron APIs that require the app to be initialized.
   await app.whenReady()
 
+  // Prevent default quit-on-all-windows-closed during wizard-to-main transition.
+  // Without this, closing the wizard window on Windows/Linux kills the app before
+  // main() can re-run and create the main window. initMainProcess() later adds
+  // its own handler that calls app.quit() on non-macOS when appropriate.
+  // Guard with listenerCount so we only register once across recursive main() calls.
+  if (!app.listenerCount('window-all-closed')) {
+    app.on('window-all-closed', () => {
+      // Intentionally empty -- keeps app alive during wizard flow.
+    })
+  }
+
   // Read desktop config (or use defaults for first run)
   const desktopConfig = (await readDesktopConfig()) ?? getDefaultDesktopConfig()
-  const port = 3001
+  const port = desktopConfig.port ?? 3001
 
   // Create DI implementations
   const resourcesPath = isDev ? undefined : process.resourcesPath
@@ -151,6 +162,7 @@ async function main(): Promise<void> {
   }) => {
     await patchDesktopConfig({
       serverMode: config.serverMode as 'daemon' | 'app-bound' | 'remote',
+      port: config.port,
       remoteUrl: config.remoteUrl || undefined,
       remoteToken: config.remoteToken || undefined,
       globalHotkey: config.globalHotkey,

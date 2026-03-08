@@ -191,6 +191,50 @@ describe('DesktopConfig', () => {
     })
   })
 
+  describe('port field', () => {
+    it('defaults port to 3001 when not specified', () => {
+      const config = getDefaultDesktopConfig()
+      expect(config.port).toBe(3001)
+    })
+
+    it('schema defaults port to 3001 when not provided', () => {
+      const result = DesktopConfigSchema.parse({
+        serverMode: 'app-bound',
+      })
+      expect(result.port).toBe(3001)
+    })
+
+    it('preserves custom port from config file', async () => {
+      const freshellDir = path.join(tempDir, '.freshell')
+      await fsp.mkdir(freshellDir, { recursive: true })
+      await fsp.writeFile(
+        path.join(freshellDir, 'desktop.json'),
+        JSON.stringify({
+          serverMode: 'daemon',
+          port: 8080,
+          globalHotkey: 'CommandOrControl+`',
+          startOnLogin: false,
+          minimizeToTray: true,
+          setupCompleted: true,
+        }),
+      )
+
+      const config = await readDesktopConfig()
+      expect(config).not.toBeNull()
+      expect(config!.port).toBe(8080)
+    })
+
+    it('patches port correctly', async () => {
+      await writeDesktopConfig(getDefaultDesktopConfig())
+      const patched = await patchDesktopConfig({ port: 9999 })
+      expect(patched.port).toBe(9999)
+
+      // Verify it persisted
+      const reRead = await readDesktopConfig()
+      expect(reRead!.port).toBe(9999)
+    })
+  })
+
   describe('schema validation (invariant)', () => {
     it('rejects invalid serverMode', () => {
       const result = DesktopConfigSchema.safeParse({ serverMode: 'invalid-mode' })

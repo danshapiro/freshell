@@ -16,6 +16,7 @@ function getConfigDir(): string {
 export function getDefaultDesktopConfig(): DesktopConfig {
   return {
     serverMode: 'app-bound',
+    port: 3001,
     globalHotkey: 'CommandOrControl+`',
     startOnLogin: false,
     minimizeToTray: true,

@@ -50,3 +50,14 @@ export function registerPreloadApi(
 
   contextBridge.exposeInMainWorld('freshellDesktop', api)
 }
+
+// Self-invoke when running as an Electron preload script.
+// In test environments, electron isn't available; registerPreloadApi() is called
+// manually with mock dependencies.
+try {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { contextBridge, ipcRenderer } = require('electron')
+  registerPreloadApi(contextBridge, ipcRenderer)
+} catch {
+  // Not running in Electron (e.g., test environment) -- no-op
+}
