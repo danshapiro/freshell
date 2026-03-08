@@ -645,12 +645,12 @@ export class WsHandler {
     return true
   }
 
-  private send(ws: LiveWebSocket, msg: unknown, skipBackpressureCheck = false) {
+  private send(ws: LiveWebSocket, msg: unknown) {
     let messageType: string | undefined
     try {
-      // Backpressure guard (skipped when caller manages its own drain logic).
+      // Backpressure guard.
       const buffered = ws.bufferedAmount as number | undefined
-      if (!skipBackpressureCheck && this.closeForBackpressureIfNeeded(ws, buffered)) return
+      if (this.closeForBackpressureIfNeeded(ws, buffered)) return
       let serialized = ''
       let payloadBytes: number | undefined
       let serializeMs: number | undefined
@@ -710,9 +710,9 @@ export class WsHandler {
     }
   }
 
-  private safeSend(ws: LiveWebSocket, msg: unknown, skipBackpressureCheck = false) {
+  private safeSend(ws: LiveWebSocket, msg: unknown) {
     if (ws.readyState === WebSocket.OPEN) {
-      this.send(ws, msg, skipBackpressureCheck)
+      this.send(ws, msg)
     }
   }
 

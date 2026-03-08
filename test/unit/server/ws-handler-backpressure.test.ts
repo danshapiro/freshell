@@ -303,46 +303,36 @@ describe('WsHandler.sendChunkedSessions drain-aware sending', () => {
   })
 
   it('drains before sending when bufferedAmount is already high at start of chunk iteration', async () => {
-    // This reproduces the real crash: on a slow remote connection, the previous
-    // chunk's data hasn't been flushed to TCP by the time we enter the next
-    // iteration. Without a pre-send drain check, safeSend sees bufferedAmount
-    // above MAX_WS_BUFFERED_AMOUNT (2MB) and kills the connection.
+    // Reproduces the real crash: on a slow remote connection, each send()
+    // leaves bufferedAmount above DRAIN_THRESHOLD_BYTES (512KB). Without
+    // a pre-send drain check, the buffer accumulates across chunks and
+    // eventually exceeds MAX_WS_BUFFERED_AMOUNT (2MB), killing the connection.
     const projects = createLargeProjects(100)
     const chunks = chunkProjects(projects, 500 * 1024)
     expect(chunks.length).toBeGreaterThanOrEqual(2)
 
     const ws = createMockWs()
-    let sendCount = 0
-    // Simulate a slow remote connection: bufferedAmount stays above the
-    // kill threshold (2MB) after every send, because TCP hasn't drained
-    // the previous chunk yet.
+    // Simulate a slow remote connection: each send leaves bufferedAmount
+    // above the drain threshold (512KB), requiring drain before next send
     ws.send = vi.fn().mockImplementation(() => {
-      sendCount++
-      // Every send leaves the buffer above MAX_WS_BUFFERED_AMOUNT (2MB),
-      // simulating a remote connection that drains slowly
-      ws.bufferedAmount = 2_500_000 // above kill threshold
+      ws.bufferedAmount = 600_000 // above DRAIN_THRESHOLD_BYTES (512KB)
     })
 
     const waitForDrainSpy = vi.spyOn(handler as any, 'waitForDrain')
     waitForDrainSpy.mockImplementation(async () => {
-      // Drain "succeeds" but we DON'T reset bufferedAmount — simulating
-      // the kernel buffer refilling before the next synchronous send() check.
-      // bufferedAmount remains at 2_500_000 from the previous ws.send().
+      // Simulate successful drain: buffer drops below threshold
+      ws.bufferedAmount = 0
       return true
     })
 
     const result = await (handler as any).sendChunkedSessions(ws, projects)
 
-    // Connection must NOT be closed — this is the bug we're fixing.
-    // BUG: Without a pre-send drain check, safeSend on chunk 2 sees
-    // bufferedAmount=2.5MB > MAX_WS_BUFFERED_AMOUNT(2MB) and closes
-    // the connection via closeForBackpressureIfNeeded().
+    // Connection must NOT be closed
     expect(ws.close).not.toHaveBeenCalled()
     // All chunks should be sent
     expect(ws.send).toHaveBeenCalledTimes(chunks.length)
     expect(result).toBe(true)
     // waitForDrain should be called before sending chunks 2..N
-    // (at least chunks.length - 1 times since every send leaves buffer high)
     expect(waitForDrainSpy).toHaveBeenCalledTimes(chunks.length - 1)
   })
 
