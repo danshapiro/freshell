@@ -58,10 +58,9 @@ describe('SessionRepairService', () => {
 
     service.prioritizeSessions({ active: sessionId })
 
-    await new Promise((r) => setTimeout(r, 100))
-
-    expect(scanner.scan).toHaveBeenCalled()
-    expect(scanner.scan).toHaveBeenCalledWith(sessionFile)
+    await vi.waitFor(() => {
+      expect(scanner.scan).toHaveBeenCalledWith(sessionFile)
+    })
 
     await service.stop()
   })
@@ -116,7 +115,9 @@ describe('SessionRepairService', () => {
     await (service as any).cache.set(targetFile, cachedResult)
 
     service.prioritizeSessions({ background: [slowSessionId] })
-    await new Promise((r) => setTimeout(r, 10))
+    await vi.waitFor(() => {
+      expect(scan).toHaveBeenCalledWith(slowFile)
+    })
 
     try {
       const result = await service.waitForSession(targetSessionId, 50)
