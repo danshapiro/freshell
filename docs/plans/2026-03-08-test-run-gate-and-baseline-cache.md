@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task.
 
-**Goal:** Serialize broad test runs across repo worktrees, show truthfully who currently holds the gate and why, and publish exact-commit baseline results that other agents can reuse as advisory context without breaking existing focused-test workflows.
+**Goal:** Serialize broad test runs across repo worktrees, show truthfully who currently holds the gate and why, and publish a bounded exact-commit baseline history that other agents can reuse without breaking existing focused-test workflows.
 
 **Architecture:** Add one TypeScript wrapper script that owns kernel-lock acquisition, bounded waiting, holder metadata, last-result caching, and argv passthrough for sanctioned npm test entrypoints. Store shared advisory state in the repo's Git common dir, use `flock` on a repo-shared lock file as the only correctness primitive for broad-run serialization, and make the wrapper classify narrowed invocations (`npm test -- <files> ...`, `npm run test:server -- <files> ...`) so focused TDD runs continue to work through the normal npm scripts without entering the broad-run queue.
 
@@ -20,10 +20,11 @@ User-approved direction:
 Design decisions for implementation:
 - Treat the gate as repo-shared state rooted in `git rev-parse --git-common-dir`, not in an individual worktree.
 - Gate every broad non-interactive npm test entrypoint when it is invoked broadly: `npm test`, `npm run test:all`, `npm run test:unit`, `npm run test:client`, `npm run test:server`, `npm run test:integration`, `npm run test:coverage`, `npm run check`, and `npm run verify`.
-- Preserve existing focused-test ergonomics on those same npm scripts by forwarding arbitrary extra Vitest args and treating narrowed invocations as ungated. `npm test -- test/unit/server/foo.test.ts -t "bar"` and `npm run test:server -- test/server/ws-protocol.test.ts` must keep working through the sanctioned npm entrypoints.
+- Preserve existing focused-test ergonomics on those same npm scripts by forwarding extra Vitest args and treating only explicit file-targeted narrowed invocations as ungated. `npm test -- test/unit/server/foo.test.ts -t "bar"` and `npm run test:server -- test/server/ws-protocol.test.ts` must keep working through the sanctioned npm entrypoints.
 - Keep only explicitly interactive commands (`npm run test:watch`, `npm run test:ui`) outside the wrapper entirely.
 - Make the public npm scripts hard to bypass for broad runs by routing them all through the wrapper and moving the actual raw runners to private underscore-prefixed scripts that only the wrapper invokes.
 - Make baseline results advisory only. Never auto-skip a required fresh landing run.
+- Retain a bounded reusable-history per command keyed by commit so a newer success on `def` does not erase a still-valid reusable baseline for `abc`.
 - Accept summary input from `--summary "..."` and `FRESHELL_TEST_SUMMARY`, but fall back to an automatic placeholder instead of failing if the agent omits it.
 - Make `status` read-only in the sense that it never waits and never starts tests, but it must still perform the same immediate non-blocking `flock` probe as runners so its holder report is truthful.
 - Treat `flock` availability as a required precondition for broad gated runs. If `flock` is unavailable, the wrapper should fail fast with an actionable message rather than silently falling back to a pseudo-lock.
@@ -141,9 +142,10 @@ Create `test/unit/server/test-run-gate.test.ts` with pure-function coverage for:
 - shared-state paths rooted in the git common dir,
 - holder metadata collection,
 - summary fallback behavior,
-- exact-commit reusable baseline detection,
+- exact-commit reusable baseline detection from bounded history,
+- bounded result-history retention keyed by command and commit,
 - dirty-worktree exclusion from reusable results,
-- invocation classification for `broad` versus `narrowed`,
+- invocation classification for `broad` versus tightly-defined `narrowed`,
 - argv passthrough splitting for wrapper options versus forwarded Vitest args,
 - cross-platform npm invocation resolution.
 
@@ -156,8 +158,9 @@ import {
   buildHolderRecord,
   buildGatePaths,
   classifyInvocation,
-  chooseReusableBaseline,
   deriveSummary,
+  findReusableBaseline,
+  pushResultHistory,
   splitWrapperArgs,
   resolveNpmRunner,
   type TestRunResultRecord,
@@ -178,19 +181,36 @@ describe('test-run-gate helpers', () => {
     expect(deriveSummary({ cliSummary: '', envSummary: '', branch: 'feature/x' })).toBe('unspecified task on feature/x')
   })
 
-  it('only reuses successful exact-commit clean baselines', () => {
-    const candidate: TestRunResultRecord = {
-      commandKey: 'full',
-      commit: 'abc123',
+  it('finds an exact-commit reusable baseline even after newer successes are recorded', () => {
+    const history = [
+      { commandKey: 'full', commit: 'def456', cleanWorktree: true, exitCode: 0, finishedAt: '2026-03-08T19:20:00.000Z' },
+      { commandKey: 'full', commit: 'abc123', cleanWorktree: true, exitCode: 0, finishedAt: '2026-03-08T19:10:00.000Z' },
+    ] satisfies TestRunResultRecord[]
+
+    expect(findReusableBaseline(history, { commandKey: 'full', commit: 'abc123' })?.commit).toBe('abc123')
+    expect(findReusableBaseline(history, { commandKey: 'full', commit: 'zzz999' })).toBeUndefined()
+  })
+
+  it('deduplicates by commit and keeps bounded history newest-first', () => {
+    const initial = Array.from({ length: 20 }, (_, index) => ({
+      commandKey: 'full' as const,
+      commit: `sha-${index}`,
       cleanWorktree: true,
       exitCode: 0,
-      finishedAt: '2026-03-08T19:10:00.000Z',
-    }
+      finishedAt: `2026-03-08T19:${String(index).padStart(2, '0')}:00.000Z`,
+    }))
 
-    expect(chooseReusableBaseline(candidate, { commandKey: 'full', commit: 'abc123' })).toBe(candidate)
-    expect(chooseReusableBaseline(candidate, { commandKey: 'check', commit: 'abc123' })).toBeUndefined()
-    expect(chooseReusableBaseline({ ...candidate, cleanWorktree: false }, { commandKey: 'full', commit: 'abc123' })).toBeUndefined()
-    expect(chooseReusableBaseline({ ...candidate, commit: 'def456' }, { commandKey: 'full', commit: 'abc123' })).toBeUndefined()
+    const updated = pushResultHistory(initial, {
+      commandKey: 'full',
+      commit: 'sha-5',
+      cleanWorktree: true,
+      exitCode: 0,
+      finishedAt: '2026-03-08T20:00:00.000Z',
+    })
+
+    expect(updated[0]?.commit).toBe('sha-5')
+    expect(updated).toHaveLength(20)
+    expect(updated.filter((entry) => entry.commit === 'sha-5')).toHaveLength(1)
   })
 
   it('treats no extra selection args as a broad invocation', () => {
@@ -198,9 +218,16 @@ describe('test-run-gate helpers', () => {
     expect(classifyInvocation({ commandKey: 'server', forwardedArgs: ['--run'] })).toEqual({ kind: 'broad' })
   })
 
-  it('treats explicit targets and test-name filters as narrowed invocations', () => {
+  it('treats explicit file targets as narrowed invocations', () => {
     expect(classifyInvocation({ commandKey: 'full', forwardedArgs: ['test/unit/server/foo.test.ts'] })).toEqual({ kind: 'narrowed' })
-    expect(classifyInvocation({ commandKey: 'client', forwardedArgs: ['-t', 'restores pane state'] })).toEqual({ kind: 'narrowed' })
+    expect(classifyInvocation({ commandKey: 'client', forwardedArgs: ['test/unit/client/panesSlice.test.ts', '-t', 'restores pane state'] })).toEqual({ kind: 'narrowed' })
+  })
+
+  it('treats directory targets and broad selectors as broad invocations', () => {
+    expect(classifyInvocation({ commandKey: 'server', forwardedArgs: ['test/server'] })).toEqual({ kind: 'broad' })
+    expect(classifyInvocation({ commandKey: 'unit', forwardedArgs: ['test/unit'] })).toEqual({ kind: 'broad' })
+    expect(classifyInvocation({ commandKey: 'client', forwardedArgs: ['--changed'] })).toEqual({ kind: 'broad' })
+    expect(classifyInvocation({ commandKey: 'full', forwardedArgs: ['-t', 'restores pane state'] })).toEqual({ kind: 'broad' })
   })
 
   it('splits wrapper flags from forwarded Vitest args', () => {
@@ -265,7 +292,15 @@ import fsp from 'fs/promises'
 import os from 'os'
 import path from 'path'
 
-export type CommandKey = 'full' | 'check' | 'verify' | 'coverage'
+export type CommandKey =
+  | 'full'
+  | 'unit'
+  | 'client'
+  | 'server'
+  | 'integration'
+  | 'check'
+  | 'verify'
+  | 'coverage'
 
 export interface HolderRecord {
   commandKey: CommandKey
@@ -312,16 +347,21 @@ export function deriveSummary(input: { cliSummary?: string; envSummary?: string;
   return input.branch ? `unspecified task on ${input.branch}` : 'unspecified task'
 }
 
-export function chooseReusableBaseline(
-  candidate: TestRunResultRecord | undefined,
+export function findReusableBaseline(
+  history: TestRunResultRecord[] | undefined,
   current: { commandKey: CommandKey; commit?: string },
 ): TestRunResultRecord | undefined {
-  if (!candidate) return undefined
-  if (candidate.exitCode !== 0) return undefined
-  if (!candidate.cleanWorktree) return undefined
-  if (!candidate.commit || candidate.commit !== current.commit) return undefined
-  if (candidate.commandKey !== current.commandKey) return undefined
-  return candidate
+  return history?.find((candidate) => (
+    candidate.exitCode === 0 &&
+    candidate.cleanWorktree &&
+    candidate.commit === current.commit &&
+    candidate.commandKey === current.commandKey
+  ))
+}
+
+export function pushResultHistory(history: TestRunResultRecord[], record: TestRunResultRecord): TestRunResultRecord[] {
+  const withoutSameCommit = history.filter((entry) => entry.commit !== record.commit)
+  return [record, ...withoutSameCommit].slice(0, 20)
 }
 
 export function splitWrapperArgs(argv: string[]) {
@@ -339,7 +379,17 @@ export function classifyInvocation(input: { commandKey: CommandKey; forwardedArg
   if (args.every((arg) => arg === '--run' || arg.startsWith('--reporter'))) {
     return { kind: 'broad' as const }
   }
-  return { kind: 'narrowed' as const }
+
+  const positional = args.filter((arg) => !arg.startsWith('-'))
+  const hasExplicitFileTarget = positional.some((arg) => /\.test\.[cm]?[jt]sx?$|\.spec\.[cm]?[jt]sx?$/.test(arg))
+  const hasDirectoryTarget = positional.some((arg) => /(^|\/)(test|src)(\/)?$/.test(arg) || !/\.[cm]?[jt]sx?$/.test(arg))
+  const hasBroadSelector = args.some((arg) => ['--changed', '--related', '--dir'].includes(arg))
+
+  if (hasExplicitFileTarget && !hasDirectoryTarget && !hasBroadSelector) {
+    return { kind: 'narrowed' as const }
+  }
+
+  return { kind: 'broad' as const }
 }
 
 export function resolveNpmRunner(input: { npmExecPath?: string; platform?: NodeJS.Platform }) {
@@ -394,7 +444,7 @@ git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "feat(testing
 - Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/fixtures/test-run-gate/fake-heavy-command.ts`
 - Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/integration/server/test-run-gate.test.ts`
 
-**Step 1: Write the failing integration test for serialization, live-status probing, stale-metadata tolerance, and narrowed passthrough**
+**Step 1: Write the failing integration test for serialization, live-status probing, stale-metadata tolerance, strict narrowed passthrough, and bounded baseline history**
 
 Create a small fixture script that sleeps briefly and exits with a requested code:
 
@@ -513,6 +563,49 @@ it('allows narrowed invocations to bypass the broad-run gate while still using n
   expect(narrowed.output).toContain('Bypassing full-suite gate for narrowed invocation')
   expect(narrowed.output).toContain('test/unit/server/foo.test.ts')
 })
+
+it('keeps directory-wide targeted runs inside the gate', async () => {
+  const holder = spawnGateProcess({
+    cwd: worktreeDir,
+    summary: 'Broad holder',
+    env: {
+      FRESHELL_TEST_GATE_FAKE_COMMAND: fixturePath,
+      FRESHELL_FAKE_HEAVY_SLEEP_MS: '400',
+    },
+  })
+
+  await holder.waitForOutput('Broad holder')
+
+  const stillBroad = spawnGateProcess({
+    cwd: secondWorktreeDir,
+    summary: 'Directory target',
+    forwardedArgs: ['test/server'],
+    env: {
+      FRESHELL_TEST_GATE_FAKE_COMMAND: fixturePath,
+      FRESHELL_FAKE_HEAVY_SLEEP_MS: '50',
+      FRESHELL_TEST_WAIT_TIMEOUT_MS: '5000',
+      FRESHELL_TEST_POLL_INTERVAL_MS: '100',
+    },
+  })
+
+  await stillBroad.waitForOutput('Another heavyweight test run is already active')
+  await expect(holder.exitCode).resolves.toBe(0)
+  await expect(stillBroad.exitCode).resolves.toBe(0)
+})
+
+it('status can find an older exact-commit reusable baseline after newer runs on other commits', async () => {
+  await seedResultsFile({
+    successHistoryByCommand: {
+      full: [
+        { commandKey: 'full', commit: 'def456', cleanWorktree: true, exitCode: 0, finishedAt: '2026-03-08T19:20:00.000Z', summary: 'newer' },
+        { commandKey: 'full', commit: currentCommit, cleanWorktree: true, exitCode: 0, finishedAt: '2026-03-08T19:10:00.000Z', summary: 'matching baseline' },
+      ],
+    },
+  })
+
+  const status = await runGateStatus({ cwd: worktreeDir })
+  expect(status.stdout).toContain('matching baseline')
+})
 ```
 
 Use short poll/wait overrides so the test stays fast. Do not run the real suite in this integration harness.
@@ -539,9 +632,10 @@ Finish `scripts/test-run-gate.ts` with:
 - a `flock`-backed critical section rooted at `buildGatePaths(commonGitDir).lockFile`.
 - a bounded wait loop with minute-scale defaults and test-only env overrides.
 - advisory `holder.json` and `last-results.json` reads/writes.
-- invocation classification that bypasses the gate for narrowed runs while still using the sanctioned npm script entrypoint.
+- invocation classification that bypasses the gate only for explicit file-targeted runs while still using the sanctioned npm script entrypoint.
 - a `status` path that performs the same immediate non-blocking `flock` probe as runners, but never waits and never starts a test command.
 - cross-platform npm execution using `process.execPath` + `process.env.npm_execpath` when available, with `npm.cmd`/`npm` fallback outside npm.
+- wrapper-managed substeps for `full`, `check`, and `verify` so forwarded args are applied deliberately to each underlying test command instead of relying on npm to propagate args through `&&`.
 
 Implement the execution mapping through private raw scripts so every sanctioned broad package-script entrypoint goes through the same gate while preserving forwarded args for the underlying Vitest step:
 
@@ -549,7 +643,10 @@ Implement the execution mapping through private raw scripts so every sanctioned 
 const COMMANDS: Record<CommandKey, { label: string; buildSteps: (forwardedArgs: string[]) => Array<{ npmScript: string; forwardedArgs: string[] }> }> = {
   full: {
     label: 'npm test',
-    buildSteps: (forwardedArgs) => [{ npmScript: '_test:full:raw', forwardedArgs }],
+    buildSteps: (forwardedArgs) => [
+      { npmScript: '_test:client:all:raw', forwardedArgs: forwardedArgs.length > 0 ? [...forwardedArgs, '--passWithNoTests'] : forwardedArgs },
+      { npmScript: '_test:server:all:raw', forwardedArgs: forwardedArgs.length > 0 ? [...forwardedArgs, '--passWithNoTests'] : forwardedArgs },
+    ],
   },
   unit: {
     label: 'npm run test:unit',
@@ -571,14 +668,16 @@ const COMMANDS: Record<CommandKey, { label: string; buildSteps: (forwardedArgs: 
     label: 'npm run check',
     buildSteps: (forwardedArgs) => [
       { npmScript: 'typecheck', forwardedArgs: [] },
-      { npmScript: '_test:full:raw', forwardedArgs },
+      { npmScript: '_test:client:all:raw', forwardedArgs: forwardedArgs.length > 0 ? [...forwardedArgs, '--passWithNoTests'] : forwardedArgs },
+      { npmScript: '_test:server:all:raw', forwardedArgs: forwardedArgs.length > 0 ? [...forwardedArgs, '--passWithNoTests'] : forwardedArgs },
     ],
   },
   verify: {
     label: 'npm run verify',
     buildSteps: (forwardedArgs) => [
       { npmScript: 'build', forwardedArgs: [] },
-      { npmScript: '_test:full:raw', forwardedArgs },
+      { npmScript: '_test:client:all:raw', forwardedArgs: forwardedArgs.length > 0 ? [...forwardedArgs, '--passWithNoTests'] : forwardedArgs },
+      { npmScript: '_test:server:all:raw', forwardedArgs: forwardedArgs.length > 0 ? [...forwardedArgs, '--passWithNoTests'] : forwardedArgs },
     ],
   },
   coverage: {
@@ -625,6 +724,12 @@ if (invocation.kind === 'narrowed') {
 }
 ```
 
+Keep the bypass rule intentionally tight:
+- explicit test file targets such as `test/unit/server/foo.test.ts` or a list of `.test.ts` / `.spec.tsx` files may bypass,
+- file targets plus `-t` / `--testNamePattern` may bypass,
+- directory targets such as `test/server` or `test/unit/client` remain broad and gated,
+- selector-only runs such as `--changed` remain broad and gated.
+
 Use a hidden test-only override so the integration suite can substitute the fixture command instead of running the real tests:
 
 ```ts
@@ -664,12 +769,13 @@ git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "feat(testing
 
 **Step 1: Update the public npm scripts to use the gate while preserving passthrough ergonomics**
 
-Change the public test scripts in `package.json` so every broad non-interactive entrypoint routes through the gate and the raw runners become private:
+Change the public test scripts in `package.json` so every broad non-interactive entrypoint routes through the gate and the raw runners become private single-step scripts:
 
 ```json
 {
   "scripts": {
-    "_test:full:raw": "vitest run && vitest run --config vitest.server.config.ts",
+    "_test:client:all:raw": "vitest run",
+    "_test:server:all:raw": "vitest run --config vitest.server.config.ts",
     "_test:unit:raw": "vitest run test/unit",
     "_test:client:raw": "vitest run test/unit/client",
     "_test:server:raw": "vitest run --config vitest.server.config.ts",
@@ -703,16 +809,25 @@ npm run test:client -- test/unit/client/store/panesSlice.test.ts test/unit/clien
 
 All of those should forward their extra args to the corresponding private raw script and skip the broad-run gate because they are narrowed invocations.
 
+By contrast, these commands must remain gated because they are still broad:
+
+```bash
+npm run test:server -- test/server
+npm run test:unit -- test/unit
+npm run test:client -- --changed
+```
+
 **Step 2: Update agent and testing docs**
 
 Adjust `AGENTS.md` and `docs/skills/testing.md` so they match the new reality:
 - `npm test` is a full gated run, not watch mode.
 - every broad non-interactive npm test script is gated when run broadly, including `test:unit`, `test:client`, `test:server`, and `test:integration`.
-- those same npm scripts still support `--` passthrough for focused TDD runs, and narrowed invocations bypass the broad-run gate automatically.
+- those same npm scripts still support `--` passthrough for focused TDD runs, and only explicit file-targeted narrowed invocations bypass the broad-run gate automatically.
 - `npm run test:status` performs a non-blocking live probe, reports an active holder only when the lease is live, and otherwise reports the latest reusable exact-commit baseline.
 - agents should set `FRESHELL_TEST_SUMMARY` or pass `--summary`.
 - private underscore-prefixed raw scripts are internal plumbing, not agent entrypoints.
 - direct `npx vitest run` is no longer the recommended workaround for focused runs because the sanctioned npm scripts preserve passthrough targeting.
+- the reusable baseline cache is a bounded per-command history keyed by commit, not just the latest run.
 
 Use concrete examples:
 
@@ -756,7 +871,9 @@ Extend the integration test so it checks:
 - failed runs update the "last failure" record but do not present themselves as reusable baselines,
 - holder output includes the wait guidance: poll every minute, be patient for up to one hour, and do not kill a run you did not start,
 - `status` does not report a holder when only stale metadata remains,
-- narrowed invocations continue to bypass the queue and still forward their args.
+- explicit file-targeted narrowed invocations continue to bypass the queue and still forward their args,
+- directory-targeted or selector-only invocations stay in the queue,
+- reusable baseline lookup still finds the current commit after newer successes on other commits.
 
 Add assertions like:
 
@@ -795,20 +912,22 @@ Expected: FAIL until the status/baseline messaging is complete.
 **Step 3: Finish the wrapper output and result bookkeeping**
 
 Update `scripts/test-run-gate.ts` so:
-- every completed run writes a result record keyed by command,
+- every completed run writes a result record into bounded per-command history keyed by commit,
 - a reusable baseline is shown only when `exitCode === 0`, `cleanWorktree === true`, and `commit` matches the current checkout exactly,
 - failures are still recorded and shown as informational history, but never marked reusable,
 - `status` is read-only in the sense that it never waits and never starts tests, but it still runs the same immediate non-blocking `probeGate()` logic as waiters so it can truthfully report `held` versus `free`.
-- narrowed invocations never enter the `flock` wait loop, but they still use the same wrapper, metadata collection, and raw-script dispatch path.
+- only explicit file-targeted narrowed invocations never enter the `flock` wait loop, but they still use the same wrapper, metadata collection, and raw-script dispatch path.
 
-The persisted JSON structure should stay small and explicit:
+The persisted JSON structure should stay bounded and explicit:
 
 ```ts
 interface PersistedResults {
-  lastSuccessByCommand: Partial<Record<CommandKey, TestRunResultRecord>>
-  lastFailureByCommand: Partial<Record<CommandKey, TestRunResultRecord>>
+  successHistoryByCommand: Partial<Record<CommandKey, TestRunResultRecord[]>>
+  failureHistoryByCommand: Partial<Record<CommandKey, TestRunResultRecord[]>>
 }
 ```
+
+Enforce a small cap such as 20 entries per command, newest-first, deduplicated by commit so the cache remains bounded but still useful in a busy multi-agent repo.
 
 **Step 4: Run final verification**
 
