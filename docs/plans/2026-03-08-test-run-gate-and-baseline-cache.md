@@ -1,802 +1,517 @@
-# Test Run Gate And Baseline Cache Implementation Plan
+# Unified Broad One-Shot Test Run Gate Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task.
+> **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task. Keep this unified; do not split it into phased partial measures.
 
-**Goal:** Build a unified broad-test gate that serializes heavyweight test entry points across repo worktrees, reports truthful holder metadata through an explicit status interface, and exposes only exact-checkout reusable baselines without weakening the current verification contract of the public test commands.
+**Goal:** Build one crash-safe `BroadOneShotTestRun` path that serializes only broad one-shot test workloads, reports truthful holder status, and reuses only exact matching reusable baselines without weakening any existing command contract.
 
-**Architecture:** Use a kernel-backed `flock` gate again, because crash semantics are the user’s explicit priority and a live coordinator process is not equivalent. Keep the lock attached to the actual broad-test leader process: public umbrella commands re-exec their locked test phase under `flock`, and raw broad `npx vitest run` is intercepted by patching only Vitest’s installed CLI entrypoint so the leader process itself acquires the lock before invoking upstream Vitest through the programmatic Node API. Holder metadata lives in an advisory file beside the lock; a public `test:status` path always probes the real lock first and only trusts the metadata file when the lock is actually held. Baseline reuse is advisory on every broad invocation and only becomes an early exit when the current checkout is an exact clean match and the suite identity is exact and safe to compare.
+**Architecture:** Every test entrypoint classifies into exactly one of two outcomes: `delegate upstream` or `gated broad run`. `delegate upstream` covers watch, UI, explicit file-targeted, and other non-broad invocations and never touches the gate, holder, or reuse cache. `gated broad run` routes through a single `BroadOneShotTestRun` primitive that discovers repo state from the caller’s checkout, acquires a repo-shared `flock`, writes advisory holder metadata atomically, optionally consults reusable baselines keyed by `suiteKey`, then executes the actual workload. Raw `vitest` interception is implemented as one more adapter via a small `patch-package` patch to `node_modules/vitest/vitest.mjs`, with an explicit non-recursive upstream delegation env var.
 
-**Tech Stack:** Node.js, TypeScript, `tsx`, `child_process`, `fs/promises`, Git CLI, `flock`, `patch-package`, Vitest.
+**Tech Stack:** Node.js, TypeScript, `tsx`, npm scripts, `child_process`, `fs/promises`, Git CLI, Linux/WSL `flock`, `patch-package`, Vitest 3.
 
 ---
 
-## Strategy Gate
+## Frozen Invariants
 
-- The user rejected phased or partial delivery, so the end state must cover both public npm scripts and habitual raw `npx vitest run` broad runs.
-- The lock must inherit the crash-safety property the user explicitly asked for. Use `flock` as the correctness primitive and keep it held by the same process that is actually running the broad test leader.
-- Do not replace the `vitest` package. Patch only the installed CLI entrypoint so the full upstream package shape, exports, and type graph remain intact.
-- Add an explicit public status surface. `npm run test:status` must show whether a broad test run is active and, when one is active, surface summary, cwd/worktree, branch, session/thread id, start time, and suite identity from the live holder record.
-- Baseline reuse is not the default verification path. Every broad command checks for a reusable baseline and reports it, but early exit is allowed only when:
-  - the cached run was clean and successful
-  - the current checkout is also clean
-  - checkout identity and broad-suite identity match exactly
-  - the caller explicitly opts into reuse
-- Freeze broad-vs-narrow rules:
-  - explicit individual test files are narrowed
-  - directories, globs, `-t`, `--changed`, `--project`, config-targeted subset suites, and no-selector runs are broad
-- Preserve current interactive behavior:
-  - `npm run test:server` stays watch-mode by default
-  - `vitest` watch and `vitest --ui` stay ungated
+- `BroadOneShotTestRun` is the only primitive. Public npm scripts and patched raw `vitest` must both route through it for gated broad work.
+- Classification is total and binary. Every entrypoint must end as exactly one of:
+  - `delegate upstream`
+  - `gated broad run`
+- `delegate upstream` means no lock, no holder metadata, no baseline reuse, no status side effects.
+- `gated broad run` means the process goes through `BroadOneShotTestRun`, acquires the repo-wide `flock`, writes holder metadata, and may consult reusable baselines only if the suite is fully classified.
+- `flock` is the only liveness truth. No in-memory coordinator, pid table, or holder file may be treated as proof that a run is live.
+- Holder metadata is advisory only. Missing, corrupt, stale, or partial holder data must never block progress and must never be treated as truth over the lock probe.
+- Status is a small explicit state machine driven by lock first, metadata second:
+  - `idle`: non-blocking probe acquires the lock, then releases it immediately. Ignore any holder file.
+  - `running-described`: probe sees the lock is held and holder metadata parses with all required fields.
+  - `running-undescribed`: probe sees the lock is held but holder metadata is missing, corrupt, unreadable, or missing required fields.
+- Holder writes must be atomic: write to a temp file in the same directory, `fsync` the temp file, rename over the destination, then best-effort `fsync` the directory. Reads must schema-validate and degrade to `running-undescribed` on any failure.
+- Repo discovery must not rely on `process.cwd()` alone. Use the caller’s invocation cwd (`INIT_CWD` when present, otherwise `process.cwd()`), then resolve checkout root and git common-dir from Git.
+- Broad vs narrow is frozen as:
+  - Narrow: watch mode, UI mode, explicit file-targeted runs where every positional selector is a file path and no known broad suite-shaping flag is present.
+  - Broad: any non-interactive one-shot run with no selectors, any directory target, any glob target, any config/project/dir selector, any test-name pattern, `--changed`, `--exclude`, `--environment`, `--coverage`, `--shard`, or any other suite-shaping selector.
+- Unknown broad suite-shaping flags are never reusable. They may still run as gated broad work, but reuse must be disabled instead of guessed.
+- `suiteKey` identifies the reusable workload. `commandKey` is provenance and UX only. `test` and `test:all` may share a `suiteKey` if they truly run the same workload.
+- Reusable baseline identity is exact: newest record matching `(suiteKey, commit, cleanWorktree=true, nodeVersion, platform)` controls reuse. If the newest exact record is a failure, no older success for that same identity may be reused.
+- `check` and `verify` may not silently weaken their contracts. If reuse is enabled for them, it must apply only to an exact prior success of the whole command workload, not just the inner Vitest phase.
+- Whole-command early exit is forbidden unless the plan explicitly defines the full workload identity and proves it remains equivalent. This plan does so for `check` and `verify` by giving them distinct whole-workload `suiteKey`s.
+- Raw `vitest` interception must have a non-recursive upstream path. The patch must set a dedicated env marker before handing off to upstream Vitest so the patched entrypoint can bypass its own gate logic on the second hop.
+- Portability must not be overstated. Supported gated execution is Linux/WSL/bash where `flock` exists. If `flock` is unavailable, broad runs fail fast with an actionable message instead of falling back to a weaker scheme.
+- Summary metadata support is in scope only through explicitly specified mechanisms:
+  - `FRESHELL_TEST_SUMMARY`
+  - `BroadOneShotTestRun --summary <text>`
+  - Explicit `--summary` takes precedence over the env var; otherwise the adapter provides a default summary.
 
-## Design Decisions
+## File Structure
 
-- Shared gate state is rooted in `git rev-parse --git-common-dir`.
-- Shared state contents:
-  - `broad-tests.lock`: the kernel lock file used only through `flock`
-  - `holder.json`: advisory current-holder metadata
-  - `results.json`: bounded newest-first history of recent successful and failed broad runs
-- Lock truth rules:
-  - non-blocking `flock` probe is the source of truth for whether a sanctioned broad run is active
-  - `holder.json` is descriptive only and is ignored when the lock probe says the lock is free
-  - stale `holder.json` after crashes is tolerated because it is never treated as proof of an active lock
-- Status output rules:
-  - `npm run test:status` always performs the same non-blocking lock probe the runners use
-  - when the lock is held, it renders at least `summary`, `cwd`, `checkoutRoot`, `branch`, `sessionId`, `suiteKey`, and `startedAt`
-  - when the lock is free, it prints that no broad test run is active even if `holder.json` still exists
-- Holder metadata includes:
-  - `commandKey`
-  - `suiteKey`
-  - `summary`
-  - `startedAt`
-  - `pid`
-  - `cwd`
-  - `checkoutRoot`
-  - `repoRoot`
-  - `branch`
-  - `currentCleanWorktree`
-  - `nodeVersion`
-  - `platform`
-  - `sessionId` from `CODEX_THREAD_ID` when present
-- Reusable baseline identity is frozen to both checkout identity and suite identity:
-  - cached record: exact `commandKey`, exact `suiteKey`, exact `commit`, `cleanWorktree === true`, exact `nodeVersion`, exact `platform`, `exitCode === 0`
-  - current checkout: exact same `commit`, exact same `suiteKey`, exact same `nodeVersion`, exact same `platform`, and `currentCleanWorktree === true`
-- `suiteKey` rules:
-  - public npm one-shot commands have fixed keys such as `full`, `check`, `verify`, `all`, `coverage`, `unit`, `client`, `integration`, `server-run`
-  - raw broad Vitest runs derive a normalized `suiteKey` from the effective config path plus a normalized representation of every suite-shaping CLI option that can affect the executed test set or runtime semantics
-  - known non-suite-shaping presentation flags such as `--reporter`, `--outputFile`, and color/TTY flags are excluded from `suiteKey`
-  - if raw broad argv includes an unclassified option, baseline reuse for that raw run is disabled instead of guessing
-- Raw broad-run suite-shaping options that must be normalized into `suiteKey` include at minimum:
-  - positional directories and globs
-  - `--config`
-  - `--project`
-  - `--dir`
-  - `--changed`
-  - `-t` / `--testNamePattern`
-  - `--exclude`
-  - `--environment`
-  - `--coverage`
-  - `--shard`
-  - any future option the implementation classifies as changing selected tests or runtime execution
-- Baseline behavior on broad invocations:
-  - always check and print whether a reusable baseline exists
-  - continue to run by default
-  - only exit early when `--reuse-baseline` or `FRESHELL_REUSE_TEST_BASELINE=1` is set and the current checkout is an exact reusable match
-  - `--force-run` or `FRESHELL_FORCE_TEST_RUN=1` suppresses reuse even when a match exists
-  - the latest exact result wins for reuse decisions: if the newest exact record is a failure, no older success for that same identity is advertised as reusable
-- Environment scope:
-  - the gated path is supported in the repo’s bash/WSL execution environment, which is what the current session and Codex CMD guidance already prefer
-  - if `flock` is unavailable, broad runs fail fast with an actionable message to use the supported bash/WSL environment rather than silently falling back to a weaker lock
-- Every current public one-shot test entry point is routed through the unified surface:
-  - `test`
-  - `check`
-  - `verify`
-  - `test:all`
-  - `test:server`
-  - `test:coverage`
-  - `test:unit`
-  - `test:integration`
-  - `test:client`
-- `test:status`
-- `test:watch` and `test:ui` remain direct interactive commands.
+**Modify**
 
-### Task 1: Add shared Git common-dir resolution for repo-wide gate state
+- `package.json`
+  - Repoint broad one-shot scripts through `BroadOneShotTestRun`.
+  - Normalize `test:server` to one-shot semantics.
+  - Add an explicit watch alias for server tests.
+  - Add `test:status`.
+  - Add `patch-package` install hook.
+- `package-lock.json`
+  - Record the `patch-package` dependency and script changes.
+- `server/coding-cli/utils.ts`
+  - Add shared git common-dir resolution and any small invocation-cwd helpers needed by the runner.
+- `test/unit/server/coding-cli/utils.test.ts`
+  - Cover worktree-aware repo/common-dir discovery.
+
+**Create**
+
+- `scripts/testing/broad-one-shot-test-run.ts`
+  - The only primitive: parse adapter inputs, classify, probe status, acquire/release the lock, write holder metadata, consult baselines, run upstream work, persist results.
+- `scripts/testing/test-run-classification.ts`
+  - Exact broad-vs-narrow rules and raw Vitest argv normalization.
+- `scripts/testing/test-run-gate-state.ts`
+  - Lock path resolution, `flock` helpers, holder state machine, atomic holder read/write/delete.
+- `scripts/testing/test-run-baselines.ts`
+  - `suiteKey` generation, results store, exact reuse lookup, latest-result-wins logic.
+- `scripts/testing/test-run-adapters.ts`
+  - Public command manifest, stable `commandKey` naming, whole-workload `suiteKey`s, default summaries, upstream argv/phase definitions.
+- `scripts/testing/test-run-upstream.ts`
+  - Non-recursive spawning helpers for npm/Vitest/upstream child processes and env shaping.
+- `patches/vitest+3.2.4.patch`
+  - Patch `node_modules/vitest/vitest.mjs` so raw `vitest` invocations enter the same adapter path.
+- `test/fixtures/test-run-gate/fake-upstream.ts`
+  - Small controllable Node fixture used by integration tests to simulate success, failure, delay, and env capture without running the real broad suite.
+- `test/unit/server/test-run-classification.test.ts`
+- `test/unit/server/test-run-gate-state.test.ts`
+- `test/unit/server/test-run-baselines.test.ts`
+- `test/unit/server/test-run-adapters.test.ts`
+- `test/integration/server/broad-one-shot-test-run.test.ts`
+- `test/integration/server/vitest-patch-adapter.test.ts`
+
+## Task 1: Classification And Delegation
 
 **Files:**
-- Modify: `/home/user/code/freshell/.worktrees/test-run-gate/server/coding-cli/utils.ts`
-- Modify: `/home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/coding-cli/git-metadata.test.ts`
 
-**Step 1: Write the failing tests for worktree-aware common-dir lookup**
+- Modify: `server/coding-cli/utils.ts`
+- Modify: `test/unit/server/coding-cli/utils.test.ts`
+- Create: `scripts/testing/test-run-classification.ts`
+- Create: `test/unit/server/test-run-classification.test.ts`
 
-Extend `test/unit/server/coding-cli/git-metadata.test.ts`:
+- [ ] **Step 1: Write the failing classification and repo-discovery tests**
 
-```ts
-import {
-  clearRepoRootCache,
-  resolveGitCheckoutRoot,
-  resolveGitCommonDir,
-} from '../../../../server/coding-cli/utils'
+  Cover:
+  - `resolveGitCommonDir()` returns the shared `.git` directory for linked worktrees.
+  - Invocation cwd comes from `INIT_CWD` when present, then falls back to `process.cwd()`.
+  - Raw `vitest` classification returns `delegate upstream` for:
+    - `vitest`
+    - `vitest --ui`
+    - `vitest path/to/file.test.ts`
+    - `vitest run path/to/file.test.ts`
+  - Raw `vitest` classification returns `gated broad run` for:
+    - `vitest run`
+    - `vitest run test/unit`
+    - `vitest run "test/**/*.test.ts"`
+    - `vitest run --config vitest.server.config.ts test/server`
+    - `vitest run -t "name"`
+    - `vitest run --changed`
+  - Unknown suite-shaping flags classify as broad but mark reuse disabled.
 
-it('returns the shared git common dir for linked worktrees', async () => {
-  const repoDir = path.join(tempDir, 'repo')
-  const worktreeDir = path.join(tempDir, 'repo-worktree')
-  await initRepo(repoDir, 'main')
-  await runGit(['worktree', 'add', '-b', 'feature/test-gate', worktreeDir], repoDir)
+- [ ] **Step 2: Run only the targeted tests and verify they fail for the missing helpers**
 
-  const nestedDir = path.join(worktreeDir, 'deep', 'child')
-  await fsp.mkdir(nestedDir, { recursive: true })
+  Run:
 
-  await expect(resolveGitCheckoutRoot(nestedDir)).resolves.toBe(worktreeDir)
-  await expect(resolveGitCommonDir(nestedDir)).resolves.toBe(path.join(repoDir, '.git'))
-})
-```
+  ```bash
+  cd /home/user/code/freshell/.worktrees/test-run-gate
+  npx vitest run test/unit/server/coding-cli/utils.test.ts test/unit/server/test-run-classification.test.ts
+  ```
 
-**Step 2: Run the targeted test and verify failure**
+  Expected:
+  - FAIL for missing `resolveGitCommonDir()`
+  - FAIL for missing classification module and exact broad/narrow rules
 
-Run:
+- [ ] **Step 3: Implement repo discovery and classification**
 
-```bash
-cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run test/unit/server/coding-cli/git-metadata.test.ts
-```
+  Implement:
+  - `resolveGitCommonDir(cwd)` using `git -C <checkoutRoot> rev-parse --git-common-dir`
+  - `resolveInvocationCwd()` using `INIT_CWD ?? process.cwd()`
+  - `classifyVitestInvocation(argv, cwd)` returning a discriminated union with:
+    - `kind: 'delegate-upstream'`
+    - `kind: 'gated-broad-run'`
+  - Explicit broad/narrow logic exactly matching the frozen invariant above
+  - Raw broad results that include:
+    - normalized positional selectors
+    - `baselineReusable: boolean`
+    - `unknownSuiteFlags: string[]`
 
-Expected: FAIL because `resolveGitCommonDir` does not exist.
+- [ ] **Step 4: Re-run the targeted tests and verify pass**
 
-**Step 3: Implement the helper**
+  Run:
 
-Add a cached helper in `server/coding-cli/utils.ts`:
+  ```bash
+  cd /home/user/code/freshell/.worktrees/test-run-gate
+  npx vitest run test/unit/server/coding-cli/utils.test.ts test/unit/server/test-run-classification.test.ts
+  ```
 
-```ts
-const commonDirCache = new Map<string, string | undefined>()
+  Expected: PASS.
 
-export async function resolveGitCommonDir(cwd: string): Promise<string | undefined> {
-  const normalized = normalizeGitPathInput(cwd)
-  if (!normalized) return undefined
+- [ ] **Step 5: Commit the classification foundation**
 
-  const cached = commonDirCache.get(normalized)
-  if (cached !== undefined) return cached
+  ```bash
+  git -C /home/user/code/freshell/.worktrees/test-run-gate add \
+    package.json package-lock.json \
+    server/coding-cli/utils.ts \
+    test/unit/server/coding-cli/utils.test.ts \
+    scripts/testing/test-run-classification.ts \
+    test/unit/server/test-run-classification.test.ts
+  git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "feat(testing): classify broad test runs"
+  ```
 
-  const checkoutRoot = await resolveGitCheckoutRoot(normalized)
-  try {
-    const result = await execFileAsync('git', ['-C', checkoutRoot, 'rev-parse', '--git-common-dir'])
-    const resolved = path.resolve(checkoutRoot, result.stdout.trim())
-    commonDirCache.set(normalized, resolved)
-    return resolved
-  } catch {
-    commonDirCache.set(normalized, undefined)
-    return undefined
+## Task 2: Gate And Status State Machine
+
+**Files:**
+
+- Create: `scripts/testing/test-run-gate-state.ts`
+- Create: `test/unit/server/test-run-gate-state.test.ts`
+- Create: `test/integration/server/broad-one-shot-test-run.test.ts`
+
+- [ ] **Step 1: Write the failing lock and holder state tests**
+
+  Cover:
+  - Gate paths are rooted at `resolveGitCommonDir(invocationCwd)`.
+  - Non-blocking `flock` probe returning success produces `idle` even if `holder.json` exists.
+  - Held lock plus valid holder metadata produces `running-described`.
+  - Held lock plus missing holder file produces `running-undescribed`.
+  - Held lock plus corrupt JSON produces `running-undescribed`.
+  - Held lock plus partial JSON missing required fields produces `running-undescribed`.
+  - Holder writes use temp-file-then-rename behavior in the same directory.
+  - Holder delete failures do not suppress lock release.
+
+- [ ] **Step 2: Add one integration test around real `flock` behavior using the fake upstream fixture**
+
+  Simulate:
+  - Process A acquires the gate and sleeps.
+  - Process B calls `test:status` and sees `running-described`.
+  - Process C attempts another broad run and waits or exits according to the chosen CLI contract, but does not create a second holder.
+  - After Process A exits without explicit cleanup, a fresh status probe returns `idle` even if the old holder file still exists.
+
+- [ ] **Step 3: Implement the gate state module**
+
+  Implement:
+  - `buildGatePaths(commonDir)` returning:
+    - lock file
+    - holder file
+    - results file
+  - `probeBroadRunStatus()`:
+    - try non-blocking `flock`
+    - if acquired: release immediately and return `idle`
+    - if blocked: attempt holder read and schema validation
+    - return `running-described` or `running-undescribed`
+  - `writeHolderAtomically()` using temp file, `fsync`, rename, best-effort dir `fsync`
+  - `readHolderAdvisory()` returning parsed metadata or a typed failure reason
+  - `removeHolderIfPresent()` as best-effort cleanup while still holding the lock
+
+- [ ] **Step 4: Re-run the targeted state tests**
+
+  Run:
+
+  ```bash
+  cd /home/user/code/freshell/.worktrees/test-run-gate
+  npx vitest run test/unit/server/test-run-gate-state.test.ts test/integration/server/broad-one-shot-test-run.test.ts
+  ```
+
+  Expected: PASS without invoking the real full suite.
+
+- [ ] **Step 5: Commit the state machine**
+
+  ```bash
+  git -C /home/user/code/freshell/.worktrees/test-run-gate add \
+    scripts/testing/test-run-gate-state.ts \
+    test/unit/server/test-run-gate-state.test.ts \
+    test/integration/server/broad-one-shot-test-run.test.ts
+  git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "feat(testing): add broad run gate state machine"
+  ```
+
+## Task 3: Suite Identity And Reuse Rules
+
+**Files:**
+
+- Create: `scripts/testing/test-run-baselines.ts`
+- Create: `test/unit/server/test-run-baselines.test.ts`
+
+- [ ] **Step 1: Write the failing baseline and suite identity tests**
+
+  Cover:
+  - `suiteKey` identity ignores `commandKey`.
+  - `test` and `test:all` share a `suiteKey` only because they run the same workload.
+  - `check` has a distinct whole-workload `suiteKey`.
+  - `verify` has a distinct whole-workload `suiteKey`.
+  - Raw broad `suiteKey` includes all classified suite-shaping selectors.
+  - Raw broad `suiteKey` excludes non-suite UX flags such as reporter/color/output formatting.
+  - Unknown suite-shaping flags force `baselineReusable=false`.
+  - Reuse requires:
+    - exact `suiteKey`
+    - exact commit
+    - producer clean worktree
+    - current clean worktree
+    - exact node version
+    - exact platform
+    - prior exit code `0`
+  - Newest exact failure blocks reuse of older exact success.
+  - Corrupt or unreadable results file degrades to “no reusable baseline”.
+
+- [ ] **Step 2: Run the targeted baseline tests and verify failure**
+
+  Run:
+
+  ```bash
+  cd /home/user/code/freshell/.worktrees/test-run-gate
+  npx vitest run test/unit/server/test-run-baselines.test.ts
+  ```
+
+  Expected: FAIL for missing baseline store and exact identity logic.
+
+- [ ] **Step 3: Implement suite keys and results handling**
+
+  Implement:
+  - Stable results record schema including:
+    - `suiteKey`
+    - `commandKey`
+    - `summary`
+    - `commit`
+    - `cleanWorktree`
+    - `nodeVersion`
+    - `platform`
+    - `startedAt`
+    - `finishedAt`
+    - `exitCode`
+  - Results persistence as a bounded newest-first array written atomically through temp-file-then-rename.
+  - `findReusableBaseline()` that selects only the newest exact identity record and rejects older successes after a newer failure.
+  - Raw Vitest `suiteKey` normalization from the full classified broad arg model.
+
+- [ ] **Step 4: Re-run the baseline tests and verify pass**
+
+  Run:
+
+  ```bash
+  cd /home/user/code/freshell/.worktrees/test-run-gate
+  npx vitest run test/unit/server/test-run-baselines.test.ts
+  ```
+
+  Expected: PASS.
+
+- [ ] **Step 5: Commit the reuse rules**
+
+  ```bash
+  git -C /home/user/code/freshell/.worktrees/test-run-gate add \
+    scripts/testing/test-run-baselines.ts \
+    test/unit/server/test-run-baselines.test.ts
+  git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "feat(testing): add exact reusable baseline rules"
+  ```
+
+## Task 4: Command Adapters And Naming
+
+**Files:**
+
+- Create: `scripts/testing/test-run-adapters.ts`
+- Create: `scripts/testing/test-run-upstream.ts`
+- Create: `scripts/testing/broad-one-shot-test-run.ts`
+- Create: `test/unit/server/test-run-adapters.test.ts`
+- Modify: `package.json`
+- Modify: `package-lock.json`
+
+- [ ] **Step 1: Write the failing adapter tests**
+
+  Cover:
+  - Public commands map to exactly one classification outcome.
+  - `test`, `test:all`, `test:coverage`, `test:unit`, `test:integration`, `test:client`, `test:server`, `check`, and `verify` are `gated broad run`.
+  - `test:watch`, `test:ui`, and `test:server:watch` are `delegate upstream`.
+  - `test:server` is renamed to one-shot server-suite semantics.
+  - `check` and `verify` reuse decisions apply to the whole command suite, not to isolated inner phases.
+  - Adapter-provided default summaries are stable.
+  - `--summary` overrides `FRESHELL_TEST_SUMMARY`.
+
+- [ ] **Step 2: Update the package script surface in the tests before implementation**
+
+  Expected target script mapping:
+
+  ```json
+  {
+    "test": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter test",
+    "test:all": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter test:all",
+    "test:coverage": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter test:coverage",
+    "test:unit": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter test:unit",
+    "test:integration": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter test:integration",
+    "test:client": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter test:client",
+    "test:server": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter test:server",
+    "test:server:watch": "vitest --config vitest.server.config.ts",
+    "test:watch": "vitest",
+    "test:ui": "vitest --ui",
+    "check": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter check",
+    "verify": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter verify",
+    "test:status": "tsx scripts/testing/broad-one-shot-test-run.ts --status"
   }
-}
-```
+  ```
 
-**Step 4: Re-run the targeted test and verify pass**
+- [ ] **Step 3: Implement the adapters and the single primitive**
 
-Run:
+  Implement:
+  - Public adapter manifest with stable `commandKey`, `suiteKey`, default summary, and upstream phases.
+  - Whole-workload suites:
+    - `suiteKey: "vitest-all"` for `test` and `test:all`
+    - `suiteKey: "check"` for `check`
+    - `suiteKey: "verify"` for `verify`
+  - `BroadOneShotTestRun` CLI behavior:
+    - `--status`
+    - `--adapter <name>`
+    - `--summary <text>`
+    - `--reuse-baseline`
+    - `--force-run`
+    - raw Vitest passthrough mode for Task 5
+  - Whole-command phase execution for `check` and `verify` while holding the lock so reuse decisions and recorded results cover the whole contract.
 
-```bash
-cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run test/unit/server/coding-cli/git-metadata.test.ts
-```
+- [ ] **Step 4: Re-run the adapter tests and verify pass**
 
-Expected: PASS.
+  Run:
 
-**Step 5: Commit**
+  ```bash
+  cd /home/user/code/freshell/.worktrees/test-run-gate
+  npx vitest run test/unit/server/test-run-adapters.test.ts
+  ```
 
-```bash
-git -C /home/user/code/freshell/.worktrees/test-run-gate add \
-  /home/user/code/freshell/.worktrees/test-run-gate/server/coding-cli/utils.ts \
-  /home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/coding-cli/git-metadata.test.ts
-git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "feat(testing): resolve shared git common dir"
-```
+  Expected: PASS.
 
-### Task 2: Build the gate core with exact suite identity and baseline rules
+- [ ] **Step 5: Commit the adapter layer**
 
-**Files:**
-- Create: `/home/user/code/freshell/.worktrees/test-run-gate/scripts/test-gate-core.ts`
-- Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-gate-core.test.ts`
+  ```bash
+  git -C /home/user/code/freshell/.worktrees/test-run-gate add \
+    package.json package-lock.json \
+    scripts/testing/test-run-adapters.ts \
+    scripts/testing/test-run-upstream.ts \
+    scripts/testing/broad-one-shot-test-run.ts \
+    test/unit/server/test-run-adapters.test.ts
+  git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "feat(testing): route public commands through broad one-shot runner"
+  ```
 
-**Step 1: Write the failing unit tests**
-
-Create `test/unit/server/test-gate-core.test.ts` with coverage for:
-- lock/holder/results path resolution under the Git common dir
-- reusable-baseline acceptance requiring both clean producer and clean current checkout
-- normalized `suiteKey` generation for raw broad runs
-- raw broad runs with unclassified suite-shaping flags becoming non-reusable
-- latest exact failure suppressing reuse of older exact successes
-- public command keys for every current public one-shot script
-- directory/config-targeted subset suites as broad
-
-Seed with cases like:
-
-```ts
-import { describe, expect, it } from 'vitest'
-import {
-  buildGatePaths,
-  buildRawVitestSuiteKey,
-  canReuseBaselineNow,
-  classifyPublicCommand,
-  classifyVitestInvocation,
-} from '../../../scripts/test-gate-core.js'
-
-describe('test-gate-core', () => {
-  it('does not allow reuse when the current checkout is dirty', () => {
-    expect(canReuseBaselineNow({
-      commandKey: 'full',
-      suiteKey: 'full',
-      commit: 'abc123',
-      cleanWorktree: true,
-      nodeVersion: 'v22.10.2',
-      platform: 'linux',
-      exitCode: 0,
-      finishedAt: '2026-03-08T10:00:00.000Z',
-    }, {
-      commandKey: 'full',
-      suiteKey: 'full',
-      commit: 'abc123',
-      currentCleanWorktree: false,
-      nodeVersion: 'v22.10.2',
-      platform: 'linux',
-    })).toBe(false)
-  })
-
-  it('gives different suite keys to different broad raw runs', () => {
-    expect(buildRawVitestSuiteKey(['run', 'test/unit'])).not.toBe(
-      buildRawVitestSuiteKey(['run', '--config', 'vitest.server.config.ts', 'test/server'])
-    )
-  })
-
-  it('includes shard and coverage in raw broad suite identity', () => {
-    expect(buildRawVitestSuiteKey(['run', 'test/unit', '--shard=1/2'])).not.toBe(
-      buildRawVitestSuiteKey(['run', 'test/unit', '--shard=2/2'])
-    )
-    expect(buildRawVitestSuiteKey(['run', 'test/unit', '--coverage'])).not.toBe(
-      buildRawVitestSuiteKey(['run', 'test/unit'])
-    )
-  })
-
-  it('disables raw broad baseline reuse when argv contains an unclassified option', () => {
-    expect(classifyVitestInvocation(['run', 'test/unit', '--mystery-flag'])).toEqual({
-      mode: 'broad-run',
-      baselineReuse: 'disabled',
-    })
-  })
-
-  it('treats the newest exact result as authoritative for reuse', () => {
-    const history = [
-      {
-        commandKey: 'unit',
-        suiteKey: 'raw:cfg=default;targets=test/unit',
-        commit: 'abc123',
-        cleanWorktree: false,
-        nodeVersion: 'v22.10.2',
-        platform: 'linux',
-        exitCode: 1,
-        finishedAt: '2026-03-08T11:00:00.000Z',
-      },
-      {
-        commandKey: 'unit',
-        suiteKey: 'raw:cfg=default;targets=test/unit',
-        commit: 'abc123',
-        cleanWorktree: true,
-        nodeVersion: 'v22.10.2',
-        platform: 'linux',
-        exitCode: 0,
-        finishedAt: '2026-03-08T10:00:00.000Z',
-      },
-    ]
-
-    expect(findReusableBaseline(history, {
-      commandKey: 'unit',
-      suiteKey: 'raw:cfg=default;targets=test/unit',
-      commit: 'abc123',
-      nodeVersion: 'v22.10.2',
-      platform: 'linux',
-    })).toBeUndefined()
-  })
-
-  it('treats directory-targeted subset suites as broad', () => {
-    expect(classifyVitestInvocation(['run', 'test/unit'])).toEqual({ mode: 'broad-run' })
-    expect(classifyVitestInvocation(['run', '--config', 'vitest.server.config.ts', 'test/server'])).toEqual({ mode: 'broad-run' })
-  })
-
-  it('covers every current public one-shot command key', () => {
-    expect(classifyPublicCommand('unit', []).suiteKey).toBe('unit')
-    expect(classifyPublicCommand('client', []).suiteKey).toBe('client')
-    expect(classifyPublicCommand('integration', []).suiteKey).toBe('integration')
-    expect(classifyPublicCommand('coverage', []).suiteKey).toBe('coverage')
-  })
-})
-```
-
-**Step 2: Run the targeted test and verify failure**
-
-Run:
-
-```bash
-cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run test/unit/server/test-gate-core.test.ts
-```
-
-Expected: FAIL because the module does not exist.
-
-**Step 3: Implement the gate core**
-
-Create `scripts/test-gate-core.ts` with:
-- `buildGatePaths(gitCommonDir)`
-- `buildHolderRecord(context)`
-- `findReusableBaseline(history, query)`
-- `canReuseBaselineNow(record, currentIdentity)`
-- `pushResultHistory(history, record, limit = 20)`
-- `classifyVitestInvocation(argv)`
-- `buildRawVitestSuiteKey(argv)`
-- `classifyPublicCommand(commandKey, forwardedArgs)`
-- atomic `readResultHistory()` and `writeResultHistory()`
-
-Use structures like:
-
-```ts
-export type BroadRunIdentity = {
-  commandKey: string
-  suiteKey: string
-  commit: string
-  currentCleanWorktree: boolean
-  nodeVersion: string
-  platform: NodeJS.Platform
-}
-```
-
-`buildRawVitestSuiteKey` must normalize every recognized suite-shaping argument, including:
-- config path
-- directories/globs/selectors
-- `--changed`
-- `--project`
-- `--dir`
-- `-t` / `--testNamePattern`
-- `--exclude`
-- `--environment`
-- `--coverage`
-- `--shard`
-
-It must ignore only recognized presentation flags like `--reporter`, and any unclassified flag must mark the invocation as `baselineReuse: 'disabled'`.
-
-`findReusableBaseline` must first select the newest exact record for the requested identity; it may advertise reuse only if that newest exact record is a success.
-
-**Step 4: Re-run the targeted test and verify pass**
-
-Run:
-
-```bash
-cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run test/unit/server/test-gate-core.test.ts
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git -C /home/user/code/freshell/.worktrees/test-run-gate add \
-  /home/user/code/freshell/.worktrees/test-run-gate/scripts/test-gate-core.ts \
-  /home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-gate-core.test.ts
-git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "feat(testing): add exact suite identity helpers"
-```
-
-### Task 3: Implement the flock-backed broad-run launcher with truthful holder semantics
+## Task 5: Vitest Patch As Another Adapter
 
 **Files:**
-- Create: `/home/user/code/freshell/.worktrees/test-run-gate/scripts/test-gate-runner.ts`
-- Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/server/test-gate-runner.test.ts`
-- Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/fixtures/test-gate/fake-broad-runner.mjs`
 
-**Step 1: Write the failing integration tests**
+- Create: `patches/vitest+3.2.4.patch`
+- Create: `test/fixtures/test-run-gate/fake-upstream.ts`
+- Modify: `package.json`
+- Modify: `package-lock.json`
+- Create: `test/integration/server/vitest-patch-adapter.test.ts`
 
-Create `test/server/test-gate-runner.test.ts` to verify:
-- the actual broad-run leader is re-execed under `flock` and writes holder metadata only after the lock is acquired
-- second broad run waits, polls holder metadata, then starts after the first exits
-- `status` probes the real lock and surfaces `summary`, `cwd`, `checkoutRoot`, `branch`, `sessionId`, `suiteKey`, and `startedAt` when a broad run is active
-- stale `holder.json` is ignored when the lock probe succeeds
-- if the locked leader process is killed, the next run can acquire the lock immediately
-- if `flock` is unavailable, broad runs fail fast with an actionable bash/WSL message
+- [ ] **Step 1: Write the failing patched-Vitest integration tests**
 
-Seed with cases like:
+  Cover:
+  - `npx vitest run` enters the same `BroadOneShotTestRun` path as public broad scripts.
+  - `npx vitest run test/unit` becomes a gated broad run.
+  - `npx vitest run path/to/file.test.ts` delegates upstream with no holder file.
+  - `npx vitest` watch mode delegates upstream with no holder file.
+  - `npx vitest --ui` delegates upstream with no holder file.
+  - The patched entrypoint uses a non-recursive env marker so the second hop bypasses gate interception and imports upstream `./dist/cli.js` directly.
+  - Unknown broad suite flags still gate the run but disable reuse.
 
-```ts
-it('ignores stale holder metadata when the kernel lock is free', async () => {
-  await fs.mkdir(paths.rootDir, { recursive: true })
-  await fs.writeFile(paths.holderFile, JSON.stringify({ summary: 'stale' }), 'utf8')
+- [ ] **Step 2: Add `patch-package` and implement the minimal patch**
 
-  const result = await runStatus()
+  Patch behavior:
+  - Intercept at `node_modules/vitest/vitest.mjs`.
+  - If `FRESHELL_VITEST_UPSTREAM=1`, import `./dist/cli.js` directly and stop.
+  - Otherwise launch `tsx scripts/testing/broad-one-shot-test-run.ts --adapter raw-vitest -- <original argv>`.
+  - Set `FRESHELL_VITEST_UPSTREAM=1` on the upstream handoff from `BroadOneShotTestRun`.
 
-  expect(result.stdout).toContain('No sanctioned broad test run is active')
-})
+- [ ] **Step 3: Re-run the Vitest patch integration tests**
 
-it('releases the gate when the locked leader dies', async () => {
-  const first = await startLockedFixture({ holdMs: 1000 })
-  await waitForOutput(first, 'LOCKED_LEADER_READY')
-  await first.kill('SIGKILL')
+  Run:
 
-  const second = await runLockedFixture({ waitMs: 200, pollMs: 10 })
-  expect(second.exitCode).toBe(0)
-})
+  ```bash
+  cd /home/user/code/freshell/.worktrees/test-run-gate
+  npx vitest run test/integration/server/vitest-patch-adapter.test.ts
+  ```
 
-it('status surfaces required holder metadata while the lock is held', async () => {
-  const first = await startLockedFixture({
-    summary: 'Fix attach race',
-    sessionId: 'thread-123',
-    branch: 'feature/test-run-gate',
-  })
-  await waitForOutput(first, 'LOCKED_LEADER_READY')
+  Expected: PASS, including explicit watch/UI/file-targeted delegation coverage.
 
-  const status = await runStatus()
+- [ ] **Step 4: Commit the raw Vitest adapter**
 
-  expect(status.stdout).toContain('Fix attach race')
-  expect(status.stdout).toContain('feature/test-run-gate')
-  expect(status.stdout).toContain('thread-123')
-  expect(status.stdout).toContain('suiteKey=')
-  expect(status.stdout).toContain('startedAt=')
-})
-```
+  ```bash
+  git -C /home/user/code/freshell/.worktrees/test-run-gate add \
+    package.json package-lock.json \
+    patches/vitest+3.2.4.patch \
+    test/fixtures/test-run-gate/fake-upstream.ts \
+    test/integration/server/vitest-patch-adapter.test.ts
+  git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "feat(testing): intercept raw vitest broad runs"
+  ```
 
-**Step 2: Run the integration test and verify failure**
-
-Run:
-
-```bash
-cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run --config vitest.server.config.ts test/server/test-gate-runner.test.ts
-```
-
-Expected: FAIL because the runner and fixture do not exist.
-
-**Step 3: Implement the runner**
-
-Create `scripts/test-gate-runner.ts` with three modes:
-- outer mode: probe for reusable baseline, probe the real lock, print wait/status messages, and re-exec itself under `flock` for broad runs
-- locked mode: write `holder.json`, run the broad leader work in the same process, update `results.json`, and remove `holder.json` in `finally`
-- status mode: probe the real lock and render user-facing status output from the current holder record
-
-Use a structure like:
-
-```ts
-async function main(): Promise<void> {
-  const cli = parseRunnerCli(process.argv.slice(2))
-
-  if (cli.mode === 'status') {
-    process.exit(await runStatus(cli))
-  }
-
-  if (cli.mode === 'locked') {
-    process.exit(await runLocked(cli))
-  }
-
-  process.exit(await runUnlocked(cli))
-}
-```
-
-`runUnlocked` should use:
-
-```bash
-flock -n <lockFile> node scripts/test-gate-runner.ts --locked ...
-```
-
-so the actual broad-run leader process after `exec` owns the kernel lock.
-
-`runLocked` should:
-- write `holder.json`
-- invoke the broad suite in-process
-- record result history
-- remove `holder.json` in `finally`
-
-`runStatus` must:
-- perform the same non-blocking `flock` probe used by runners
-- print “no broad test run is active” when the lock is free, regardless of stale metadata files
-- when the lock is held, render the holder’s `summary`, `cwd`, `checkoutRoot`, `branch`, `sessionId`, `suiteKey`, and `startedAt`
-
-**Step 4: Re-run the integration test and verify pass**
-
-Run:
-
-```bash
-cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run --config vitest.server.config.ts test/server/test-gate-runner.test.ts
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git -C /home/user/code/freshell/.worktrees/test-run-gate add \
-  /home/user/code/freshell/.worktrees/test-run-gate/scripts/test-gate-runner.ts \
-  /home/user/code/freshell/.worktrees/test-run-gate/test/server/test-gate-runner.test.ts \
-  /home/user/code/freshell/.worktrees/test-run-gate/test/fixtures/test-gate/fake-broad-runner.mjs
-git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "feat(testing): add flock-backed broad test runner"
-```
-
-### Task 4: Patch the installed Vitest CLI entrypoint instead of replacing the package
+## Task 6: Verification And Test Plan
 
 **Files:**
-- Create: `/home/user/code/freshell/.worktrees/test-run-gate/scripts/vitest-gate-entry.mjs`
-- Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/server/vitest-patch.test.ts`
-- Modify: `/home/user/code/freshell/.worktrees/test-run-gate/package.json`
-- Modify: `/home/user/code/freshell/.worktrees/test-run-gate/package-lock.json`
-- Create: `/home/user/code/freshell/.worktrees/test-run-gate/patches/vitest+3.2.4.patch`
-
-**Step 1: Write the failing integration tests**
-
-Create `test/server/vitest-patch.test.ts` to cover:
-- `npx vitest run --reporter=verbose` is broad and routed through the flock runner
-- `npx vitest run test/unit/server/auth.test.ts` stays narrowed and ungated
-- `npx vitest run test/unit` is broad and gated
-- `npx vitest run --config vitest.server.config.ts test/server` is broad and gated
-- `npx vitest run test/unit` launched from a nested repo subdirectory still finds the repo bootstrap and is gated the same way
-- plain `npx vitest` watch mode still delegates to upstream watch behavior without taking the gate
-- `npx vitest --ui` still delegates to upstream UI behavior without taking the gate
-- imports from `vitest`, `vitest/config`, `vitest/node`, `vitest/reporters`, and `vitest/globals` still resolve
-- `node_modules/vitest/vitest.mjs` still exists after install and now bootstraps through the repo entry script
-
-Include a contract assertion like:
-
-```ts
-it('preserves standard vitest subpath imports after patching the CLI only', async () => {
-  const result = await runNodeImport(`
-    await import('vitest')
-    await import('vitest/config')
-    await import('vitest/node')
-    await import('vitest/reporters')
-    await import('vitest/globals')
-  `)
-
-  expect(result.exitCode).toBe(0)
-})
-
-it('finds the repo bootstrap when launched from a nested directory', async () => {
-  const result = await runVitestFrom(path.join(repoDir, 'test', 'unit'), ['run', 'test/unit'])
-  expect(result.stdout).toContain('broad test gate')
-})
-```
-
-**Step 2: Run the integration test and verify failure**
-
-Run:
-
-```bash
-cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run --config vitest.server.config.ts test/server/vitest-patch.test.ts
-```
-
-Expected: FAIL because the CLI patch and bootstrap entry do not exist.
-
-**Step 3: Implement the CLI patch**
-
-Add `patch-package` and a `postinstall` hook in `package.json`:
-
-```json
-{
-  "scripts": {
-    "postinstall": "patch-package"
-  },
-  "devDependencies": {
-    "patch-package": "^8.0.0"
-  }
-}
-```
-
-Create `scripts/vitest-gate-entry.mjs` as the repo-owned bootstrap that:
-- classifies raw Vitest invocation
-- computes `suiteKey`
-- reports reusable baseline availability
-- early-exits only with explicit reuse opt-in
-- sends broad runs through `scripts/test-gate-runner.ts`
-- delegates narrowed/watch/UI runs to the original upstream CLI behavior
-- discovers the repo root from the patched CLI file location or Git metadata, not from `process.cwd()`
-
-Create `patches/vitest+3.2.4.patch` that changes only `node_modules/vitest/vitest.mjs` to import the repo bootstrap by a stable path relative to the patched file itself, leaving the rest of the installed package untouched.
-
-Then run a real install so the patch is actually applied:
-
-```bash
-cd /home/user/code/freshell/.worktrees/test-run-gate
-npm install
-```
-
-Do not replace the `vitest` package dependency.
-
-**Step 4: Re-run the integration test and verify pass**
-
-Run:
-
-```bash
-cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run --config vitest.server.config.ts test/server/vitest-patch.test.ts
-```
-
-Expected: PASS, including `vitest/node`, `vitest/reporters`, `vitest/globals`, and the preserved `node_modules/vitest/vitest.mjs` path.
-
-**Step 5: Commit**
-
-```bash
-git -C /home/user/code/freshell/.worktrees/test-run-gate add \
-  /home/user/code/freshell/.worktrees/test-run-gate/scripts/vitest-gate-entry.mjs \
-  /home/user/code/freshell/.worktrees/test-run-gate/test/server/vitest-patch.test.ts \
-  /home/user/code/freshell/.worktrees/test-run-gate/package.json \
-  /home/user/code/freshell/.worktrees/test-run-gate/package-lock.json \
-  /home/user/code/freshell/.worktrees/test-run-gate/patches/vitest+3.2.4.patch
-git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "feat(testing): patch vitest CLI into broad test gate"
-```
-
-### Task 5: Route every current public one-shot test entry point through the unified wrapper
-
-**Files:**
-- Create: `/home/user/code/freshell/.worktrees/test-run-gate/scripts/test-command.ts`
-- Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/server/test-command.test.ts`
-- Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-script-contract.test.ts`
-- Modify: `/home/user/code/freshell/.worktrees/test-run-gate/package.json`
-
-**Step 1: Write the failing tests**
-
-Create `test/server/test-command.test.ts` to verify:
-- `npm test`, `check`, and `verify` report reusable baseline availability but still run by default
-- `--reuse-baseline` exits early only on an exact clean current checkout
-- `--force-run` suppresses reuse
-- `npm run test:unit`, `npm run test:client`, `npm run test:integration`, and `npm run test:coverage` are all broad one-shot commands with fixed suite keys
-- `npm run test:server` stays watch-mode by default
-- `npm run test:server -- --run` becomes a broad one-shot command
-- `npm run test:status` delegates to the runner status mode and prints the required holder metadata
-
-Create `test/unit/server/test-script-contract.test.ts` asserting every current public one-shot entry point is rewired:
-
-```ts
-it('routes all current public one-shot test commands through the wrapper', () => {
-  expect(pkg.scripts.test).toBe('tsx scripts/test-command.ts full')
-  expect(pkg.scripts.check).toBe('tsx scripts/test-command.ts check')
-  expect(pkg.scripts.verify).toBe('tsx scripts/test-command.ts verify')
-  expect(pkg.scripts['test:all']).toBe('tsx scripts/test-command.ts all')
-  expect(pkg.scripts['test:server']).toBe('tsx scripts/test-command.ts server')
-  expect(pkg.scripts['test:coverage']).toBe('tsx scripts/test-command.ts coverage')
-  expect(pkg.scripts['test:unit']).toBe('tsx scripts/test-command.ts unit')
-  expect(pkg.scripts['test:integration']).toBe('tsx scripts/test-command.ts integration')
-  expect(pkg.scripts['test:client']).toBe('tsx scripts/test-command.ts client')
-  expect(pkg.scripts['test:status']).toBe('tsx scripts/test-command.ts status')
-})
-```
-
-**Step 2: Run the targeted tests and verify failure**
-
-Run:
-
-```bash
-cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run test/unit/server/test-script-contract.test.ts
-npx vitest run --config vitest.server.config.ts test/server/test-command.test.ts
-```
-
-Expected: FAIL because the wrapper and script rewiring do not exist yet.
-
-**Step 3: Implement the wrapper**
-
-Create `scripts/test-command.ts` to:
-- parse `--summary`, `--reuse-baseline`, and `--force-run`
-- compute current checkout identity and fixed public `suiteKey`
-- report reusable baseline availability on every broad invocation
-- continue by default
-- only early-exit when reuse is explicitly requested and safe
-- run `typecheck` or `build` outside the lock for `check` and `verify`
-- re-exec its broad test phase through `scripts/test-gate-runner.ts`
-- delegate `status` directly to `scripts/test-gate-runner.ts --status`
-
-Update `package.json` so all current public one-shot commands route through `test-command.ts`, while `test:watch` and `test:ui` remain direct.
-
-**Step 4: Re-run the targeted tests and verify pass**
-
-Run:
-
-```bash
-cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run test/unit/server/test-script-contract.test.ts
-npx vitest run --config vitest.server.config.ts test/server/test-command.test.ts
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git -C /home/user/code/freshell/.worktrees/test-run-gate add \
-  /home/user/code/freshell/.worktrees/test-run-gate/scripts/test-command.ts \
-  /home/user/code/freshell/.worktrees/test-run-gate/test/server/test-command.test.ts \
-  /home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-script-contract.test.ts \
-  /home/user/code/freshell/.worktrees/test-run-gate/package.json
-git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "feat(testing): route all public test commands through gate"
-```
-
-### Task 6: Update agent guidance and verify the unified end state
-
-**Files:**
-- Modify: `/home/user/code/freshell/.worktrees/test-run-gate/AGENTS.md`
-- Modify: `/home/user/code/freshell/.worktrees/test-run-gate/docs/skills/testing.md`
-- Modify if needed: `/home/user/code/freshell/.worktrees/test-run-gate/scripts/test-command.ts`
-- Modify if needed: `/home/user/code/freshell/.worktrees/test-run-gate/scripts/vitest-gate-entry.mjs`
-
-**Step 1: Update docs to match the new behavior**
-
-Document:
-- broad public one-shot test commands and broad raw `npx vitest run ...` now cooperate through the flock-backed gate
-- `npm run test:status` shows whether a broad run is active and surfaces summary, cwd/worktree, branch, session/thread id, suite identity, and start time
-- matching reusable baselines are always shown, but early exit requires `--reuse-baseline` or `FRESHELL_REUSE_TEST_BASELINE=1`
-- fresh-run override uses `--force-run` or `FRESHELL_FORCE_TEST_RUN=1`
-- `npm run test:server` remains watch-mode by default
-- `npm test` is not watch mode
-- final fresh landing run remains:
-
-```bash
-FRESHELL_FORCE_TEST_RUN=1 npm test
-```
-
-**Step 2: Run focused verification suites**
-
-Run:
-
-```bash
-cd /home/user/code/freshell/.worktrees/test-run-gate
-npx vitest run \
-  test/unit/server/coding-cli/git-metadata.test.ts \
-  test/unit/server/test-gate-core.test.ts \
-  test/unit/server/test-script-contract.test.ts
-npx vitest run --config vitest.server.config.ts \
-  test/server/test-gate-runner.test.ts \
-  test/server/vitest-patch.test.ts \
-  test/server/test-command.test.ts
-```
-
-Expected: PASS.
-
-**Step 3: Verify advisory baseline behavior on the natural command path**
-
-Run:
-
-```bash
-cd /home/user/code/freshell/.worktrees/test-run-gate
-FRESHELL_TEST_SUMMARY="Seed reusable baseline" FRESHELL_FORCE_TEST_RUN=1 npm test
-FRESHELL_TEST_SUMMARY="Show advisory baseline on clean checkout" npm test
-FRESHELL_TEST_SUMMARY="Show live holder metadata" npm run test:status
-```
-
-Expected:
-- first command runs the full suite and records a reusable baseline
-- second command reports the matching reusable baseline, then still runs because reuse was not explicitly requested
-- status shows either the live holder metadata or that no broad run is active
-
-**Step 4: Verify explicit baseline reuse and crash-safe lock release**
-
-Run:
-
-```bash
-cd /home/user/code/freshell/.worktrees/test-run-gate
-FRESHELL_TEST_SUMMARY="Reuse clean exact baseline" FRESHELL_REUSE_TEST_BASELINE=1 npm test
-FRESHELL_TEST_SUMMARY="Crash-safe lock release check" FRESHELL_FORCE_TEST_RUN=1 npm test &
-wrapper_pid=$!
-sleep 5
-leader_pid="$(node -e "const fs=require('fs'); const cp=require('child_process'); const path=require('path'); const common=cp.execFileSync('git',['rev-parse','--git-common-dir'],{cwd:'/home/user/code/freshell/.worktrees/test-run-gate',encoding:'utf8'}).trim(); const holder=path.resolve('/home/user/code/freshell/.worktrees/test-run-gate', common, 'freshell-test-gate', 'holder.json'); const data=JSON.parse(fs.readFileSync(holder,'utf8')); process.stdout.write(String(data.pid));")"
-kill -9 "$leader_pid"
-wait "$wrapper_pid" || true
-FRESHELL_TEST_SUMMARY="Fresh run after crash" FRESHELL_FORCE_TEST_RUN=1 npm test
-```
-
-Expected:
-- first reuse command exits quickly with a baseline reuse message
-- after killing the actual locked leader PID from `holder.json`, the next fresh run can acquire the lock immediately because the kernel lock died with the locked leader process
-
-**Step 5: Commit any verification fixes**
-
-If verification required follow-up edits, commit them:
-
-```bash
-git -C /home/user/code/freshell/.worktrees/test-run-gate add \
-  /home/user/code/freshell/.worktrees/test-run-gate/AGENTS.md \
-  /home/user/code/freshell/.worktrees/test-run-gate/docs/skills/testing.md \
-  /home/user/code/freshell/.worktrees/test-run-gate/scripts/test-command.ts \
-  /home/user/code/freshell/.worktrees/test-run-gate/scripts/vitest-gate-entry.mjs
-git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "fix(testing): finalize flock-backed test gate"
-```
-
-If all verification passes without further edits, leave the worktree clean and do not create an empty commit.
+
+- Modify: `test/integration/server/broad-one-shot-test-run.test.ts`
+- Modify: `test/integration/server/vitest-patch-adapter.test.ts`
+- Modify: `docs/plans/2026-03-08-test-run-gate-and-baseline-cache.md`
+
+- [ ] **Step 1: Expand the integration tests to cover end-to-end command behavior without running the real broad suite**
+
+  Add coverage for:
+  - `test:status` while idle, `running-described`, and `running-undescribed`
+  - `--reuse-baseline` and `--force-run`
+  - `check` whole-command reuse using a fake successful prior `check` record
+  - `verify` whole-command reuse using a fake successful prior `verify` record
+  - Exact failure blocking reuse of older success
+  - `test:server` one-shot semantics and `test:server:watch` delegation
+  - Summary propagation from env and flag
+
+- [ ] **Step 2: Run the targeted verification suite during implementation**
+
+  Until Task 5 is complete, do not run the real full-suite commands. Use only the targeted gate tests:
+
+  ```bash
+  cd /home/user/code/freshell/.worktrees/test-run-gate
+  npx vitest run \
+    test/unit/server/coding-cli/utils.test.ts \
+    test/unit/server/test-run-classification.test.ts \
+    test/unit/server/test-run-gate-state.test.ts \
+    test/unit/server/test-run-baselines.test.ts \
+    test/unit/server/test-run-adapters.test.ts \
+    test/integration/server/broad-one-shot-test-run.test.ts \
+    test/integration/server/vitest-patch-adapter.test.ts
+  ```
+
+  Expected: PASS.
+
+- [ ] **Step 3: Run the real command-contract checks only after the feature exists**
+
+  Once all tasks above pass, run:
+
+  ```bash
+  cd /home/user/code/freshell/.worktrees/test-run-gate
+  npm run check
+  npm run verify
+  ```
+
+  Expected:
+  - Both commands pass in the implemented gate world.
+  - Their contracts remain intact.
+  - No whole-command early exit occurs unless an exact whole-workload reusable baseline is present and explicitly requested.
+
+- [ ] **Step 4: Record any final plan deltas and commit**
+
+  If implementation exposed any necessary naming or contract correction, update this plan before the final commit.
+
+  ```bash
+  git -C /home/user/code/freshell/.worktrees/test-run-gate add \
+    docs/plans/2026-03-08-test-run-gate-and-baseline-cache.md \
+    test/integration/server/broad-one-shot-test-run.test.ts \
+    test/integration/server/vitest-patch-adapter.test.ts
+  git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "test: verify unified broad run gate behavior"
+  ```
+
+## Acceptance Checklist
+
+- `BroadOneShotTestRun` is the single primitive for all gated broad work.
+- Every entrypoint classifies to exactly one outcome: `delegate upstream` or `gated broad run`.
+- `flock` is the only liveness truth.
+- Missing or corrupt holder metadata yields `running-undescribed`, not a deadlock or false idle.
+- Holder and results files are written atomically.
+- `suiteKey` drives reuse; `commandKey` is provenance only.
+- Unknown broad suite flags disable reuse but do not skip gating.
+- `check` and `verify` preserve their full contracts.
+- Raw `vitest` interception has a non-recursive upstream path.
+- `test:server` means one-shot broad server-suite execution; `test:server:watch` is the explicit watch alias.
+- Watch/UI/file-targeted paths are covered and proven to delegate upstream with no gate side effects.
