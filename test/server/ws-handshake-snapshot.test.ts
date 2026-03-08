@@ -45,20 +45,48 @@ class FakeRegistry {
 
 function waitForMessage(ws: WebSocket, predicate: (msg: any) => boolean, timeoutMs = 2000): Promise<any> {
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
+    const cleanup = () => {
+      clearTimeout(timeout)
       ws.off('message', handler)
+      ws.off('close', onClose)
+      ws.off('error', onError)
+    }
+
+    const timeout = setTimeout(() => {
+      cleanup()
       reject(new Error('Timeout waiting for message'))
     }, timeoutMs)
 
     const handler = (data: WebSocket.Data) => {
-      const msg = JSON.parse(data.toString())
-      if (predicate(msg)) {
-        clearTimeout(timeout)
-        ws.off('message', handler)
-        resolve(msg)
+      try {
+        const msg = JSON.parse(data.toString())
+        if (predicate(msg)) {
+          cleanup()
+          resolve(msg)
+        }
+      } catch {
+        // Ignore malformed frames in tests.
       }
     }
+
+    const onClose = () => {
+      cleanup()
+      reject(new Error('Socket closed waiting for message'))
+    }
+
+    const onError = (error: Error) => {
+      cleanup()
+      reject(error)
+    }
+
+    if (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      onClose()
+      return
+    }
+
     ws.on('message', handler)
+    ws.once('close', onClose)
+    ws.once('error', onError)
   })
 }
 
@@ -128,6 +156,7 @@ describe('ws handshake snapshot', () => {
     process.env.AUTH_TOKEN = 'testtoken-testtoken'
     process.env.HELLO_TIMEOUT_MS = '100'
 
+    vi.resetModules()
     const { WsHandler } = await import('../../server/ws-handler')
 
     snapshot = {
