@@ -70,3 +70,12 @@ export async function patchDesktopConfig(patch: Partial<DesktopConfig>): Promise
   await work
   return result!
 }
+
+/**
+ * Reset the internal mutex chain. Only for use in tests to ensure
+ * inter-test isolation -- the module-level mutexChain holds references
+ * from prior calls, which can leak state between test files.
+ */
+export function _resetMutexForTesting(): void {
+  mutexChain = Promise.resolve()
+}

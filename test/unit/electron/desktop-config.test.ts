@@ -27,6 +27,7 @@ import {
   writeDesktopConfig,
   patchDesktopConfig,
   getDefaultDesktopConfig,
+  _resetMutexForTesting,
 } from '../../../electron/desktop-config.js'
 import { DesktopConfigSchema, type DesktopConfig } from '../../../electron/types.js'
 
@@ -36,6 +37,8 @@ describe('DesktopConfig', () => {
   beforeEach(async () => {
     tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'desktop-config-test-'))
     mockState.homeDir = tempDir
+    // Reset the module-level mutex chain so prior test state doesn't leak
+    _resetMutexForTesting()
   })
 
   afterEach(async () => {
@@ -157,6 +160,13 @@ describe('DesktopConfig', () => {
       expect(patched.serverMode).toBe('remote')
       expect(patched.remoteUrl).toBe('http://10.0.0.5:3001')
       expect(patched.minimizeToTray).toBe(true) // default
+    })
+
+    it('mutex is reset between tests (no cross-test state leakage)', async () => {
+      // After _resetMutexForTesting() in beforeEach, a patch should work
+      // immediately without being chained onto a prior test's work
+      const patched = await patchDesktopConfig({ setupCompleted: true })
+      expect(patched.setupCompleted).toBe(true)
     })
 
     it('concurrent patches are serialized by mutex (no lost updates)', async () => {

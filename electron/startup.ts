@@ -112,7 +112,12 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
         return response.ok
       })
 
-      const ok = await fetchFn(`${remoteUrl}/api/health`)
+      let ok: boolean
+      try {
+        ok = await fetchFn(`${remoteUrl}/api/health`)
+      } catch {
+        throw new Error(`Cannot connect to remote server at ${remoteUrl}`)
+      }
       if (!ok) {
         throw new Error(`Cannot connect to remote server at ${remoteUrl}`)
       }

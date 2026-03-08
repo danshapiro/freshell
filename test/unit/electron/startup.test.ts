@@ -210,6 +210,59 @@ describe('runStartup', () => {
         expect(result.serverUrl).toBe('http://10.0.0.5:3001')
       }
     })
+
+    it('throws user-friendly error when health check returns false', async () => {
+      const fetchHealthCheck = vi.fn().mockResolvedValue(false)
+      const ctx = createDefaultContext({
+        desktopConfig: {
+          serverMode: 'remote',
+          remoteUrl: 'http://10.0.0.5:3001',
+          globalHotkey: 'CommandOrControl+`',
+          startOnLogin: false,
+          minimizeToTray: true,
+          setupCompleted: true,
+        },
+        fetchHealthCheck,
+      })
+
+      await expect(runStartup(ctx)).rejects.toThrow('Cannot connect to remote server at http://10.0.0.5:3001')
+    })
+
+    it('catches fetch TypeError and throws user-friendly error for unreachable hosts', async () => {
+      // Simulates what happens when fetch() throws on unreachable host
+      const fetchHealthCheck = vi.fn().mockRejectedValue(new TypeError('fetch failed'))
+      const ctx = createDefaultContext({
+        desktopConfig: {
+          serverMode: 'remote',
+          remoteUrl: 'http://192.168.99.99:3001',
+          globalHotkey: 'CommandOrControl+`',
+          startOnLogin: false,
+          minimizeToTray: true,
+          setupCompleted: true,
+        },
+        fetchHealthCheck,
+      })
+
+      await expect(runStartup(ctx)).rejects.toThrow('Cannot connect to remote server at http://192.168.99.99:3001')
+    })
+
+    it('catches network errors and throws user-friendly error', async () => {
+      // Simulates ECONNREFUSED or similar network error
+      const fetchHealthCheck = vi.fn().mockRejectedValue(new Error('ECONNREFUSED'))
+      const ctx = createDefaultContext({
+        desktopConfig: {
+          serverMode: 'remote',
+          remoteUrl: 'http://10.0.0.5:3001',
+          globalHotkey: 'CommandOrControl+`',
+          startOnLogin: false,
+          minimizeToTray: true,
+          setupCompleted: true,
+        },
+        fetchHealthCheck,
+      })
+
+      await expect(runStartup(ctx)).rejects.toThrow('Cannot connect to remote server at http://10.0.0.5:3001')
+    })
   })
 
   it('registers hotkey with configured accelerator', async () => {

@@ -38,12 +38,21 @@ export interface ServerSpawner {
 export function createServerSpawner(): ServerSpawner {
   let childProcess: ChildProcess | null = null
   let running = false
+  /** Set to true when the spawned process exits (close or error). Checked during health check polling. */
+  let processExited = false
+  /** Reference to the close/error handler registered during start(), so stop() can remove it. */
+  let startCloseHandler: (() => void) | null = null
 
   async function pollHealthCheck(port: number, timeoutMs: number): Promise<void> {
     const startTime = Date.now()
     let delay = 100
 
     while (Date.now() - startTime < timeoutMs) {
+      // If the child process exited before the health check succeeded, fail fast
+      if (processExited) {
+        throw new Error('Server process exited before health check succeeded')
+      }
+
       try {
         await new Promise<void>((resolve, reject) => {
           const req = http.get(`http://localhost:${port}/api/health`, (res) => {
@@ -119,14 +128,15 @@ export function createServerSpawner(): ServerSpawner {
       })
 
       running = true
+      processExited = false
 
-      childProcess.on('close', () => {
+      startCloseHandler = () => {
         running = false
-      })
+        processExited = true
+      }
 
-      childProcess.on('error', () => {
-        running = false
-      })
+      childProcess.on('close', startCloseHandler)
+      childProcess.on('error', startCloseHandler)
 
       // Pipe to log file
       try {
@@ -146,6 +156,14 @@ export function createServerSpawner(): ServerSpawner {
       const proc = childProcess
       childProcess = null
 
+      // Remove the close/error handlers registered during start()
+      // so they don't fire alongside the stop() handler below.
+      if (startCloseHandler) {
+        proc.removeListener('close', startCloseHandler)
+        proc.removeListener('error', startCloseHandler)
+        startCloseHandler = null
+      }
+
       return new Promise<void>((resolve) => {
         // SIGKILL fallback after 5s
         const killTimeout = setTimeout(() => {
@@ -158,8 +176,8 @@ export function createServerSpawner(): ServerSpawner {
           resolve()
         }, 5000)
 
-        // Single close listener that cleans up and resolves
-        proc.on('close', () => {
+        // Use once() so this handler auto-removes after firing
+        proc.once('close', () => {
           clearTimeout(killTimeout)
           running = false
           resolve()

@@ -195,6 +195,63 @@ describe('ServerSpawner', () => {
 
       await expect(promise).rejects.toThrow()
     })
+
+    it('rejects early if process exits before health check succeeds', async () => {
+      const proc = createMockProcess()
+      mockSpawn.mockReturnValue(proc)
+      setupHealthCheckFailure()
+
+      const promise = spawner.start({
+        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js', nativeModulesDir: '/native', serverNodeModulesDir: '/modules' },
+        port: 3001,
+        envFile: '',
+        configDir: '',
+        healthCheckTimeoutMs: 30_000,
+      })
+
+      // Attach the rejection handler BEFORE advancing timers to avoid unhandled rejection
+      const rejection = expect(promise).rejects.toThrow('Server process exited before health check succeeded')
+
+      // Simulate the process crashing before health check succeeds
+      proc.emit('close', 1)
+
+      // Advance timers so the health check retry loop can re-check
+      // and detect the process exit
+      await vi.advanceTimersByTimeAsync(500)
+
+      await rejection
+      expect(spawner.isRunning()).toBe(false)
+    })
+
+    it('sets isRunning() to false when process exits during health check', async () => {
+      const proc = createMockProcess()
+      mockSpawn.mockReturnValue(proc)
+      setupHealthCheckFailure()
+
+      const promise = spawner.start({
+        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js', nativeModulesDir: '/native', serverNodeModulesDir: '/modules' },
+        port: 3001,
+        envFile: '',
+        configDir: '',
+        healthCheckTimeoutMs: 30_000,
+      })
+
+      // Attach the rejection handler BEFORE advancing timers to avoid unhandled rejection
+      const rejection = expect(promise).rejects.toThrow('Server process exited')
+
+      // isRunning is initially true after spawn
+      expect(spawner.isRunning()).toBe(true)
+
+      // Process exits (error event)
+      proc.emit('error', new Error('spawn ENOENT'))
+
+      // isRunning should now be false even though start() hasn't resolved yet
+      expect(spawner.isRunning()).toBe(false)
+
+      // Let the health check loop detect the exit
+      await vi.advanceTimersByTimeAsync(500)
+      await rejection
+    })
   })
 
   describe('stop', () => {
@@ -215,6 +272,38 @@ describe('ServerSpawner', () => {
       await stopPromise
 
       expect(proc.kill).toHaveBeenCalledWith('SIGTERM')
+    })
+
+    it('removes start() close listener and uses once() to avoid listener accumulation', async () => {
+      const proc = createMockProcess()
+      mockSpawn.mockReturnValue(proc)
+      setupHealthCheckSuccess()
+
+      await spawner.start({
+        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js', nativeModulesDir: '/native', serverNodeModulesDir: '/modules' },
+        port: 3001,
+        envFile: '',
+        configDir: '',
+      })
+
+      // After start(), there should be close listeners from start()
+      const closeListenersBefore = proc.listenerCount('close')
+
+      const stopPromise = spawner.stop()
+
+      // After stop() is called (before close fires), the start() listeners
+      // should have been removed and replaced with a single once() listener.
+      // once() still counts as a listener until it fires.
+      const closeListenersDuring = proc.listenerCount('close')
+      // Should have exactly 1 close listener (the once() from stop())
+      expect(closeListenersDuring).toBe(1)
+
+      proc.emit('close', 0)
+      await stopPromise
+
+      // After close fires, the once() listener auto-removes
+      const closeListenersAfter = proc.listenerCount('close')
+      expect(closeListenersAfter).toBe(0)
     })
   })
 
