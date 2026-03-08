@@ -33,7 +33,7 @@ export const WS_PROTOCOL_VERSION = 3 as const
 
 export const ShellSchema = z.enum(['system', 'cmd', 'powershell', 'wsl'])
 
-export const CodingCliProviderSchema = z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
+export const CodingCliProviderSchema = z.string().min(1)
 
 export type CodingCliProviderName = z.infer<typeof CodingCliProviderSchema>
 
@@ -190,7 +190,7 @@ export const PingSchema = z.object({
 export const TerminalCreateSchema = z.object({
   type: z.literal('terminal.create'),
   requestId: z.string().min(1),
-  mode: z.enum(['shell', 'claude', 'codex', 'opencode', 'gemini', 'kimi']).default('shell'),
+  mode: z.string().default('shell'),
   shell: ShellSchema.default('system'),
   cwd: z.string().optional(),
   resumeSessionId: z.string().optional(),

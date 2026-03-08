@@ -28,8 +28,6 @@ import {
   ErrorCode,
   ShellSchema,
   CodingCliProviderSchema,
-  TokenSummarySchema,
-  TerminalMetaRecordSchema,
   TerminalMetaListResponseSchema,
   TerminalMetaUpdatedSchema,
   CodexActivityListResponseSchema,
@@ -254,37 +252,6 @@ const TabsSyncQuerySchema = z.object({
   rangeDays: z.number().int().positive().optional(),
 })
 
-const ClientMessageSchema = z.discriminatedUnion('type', [
-  HelloSchema,
-  PingSchema,
-  TerminalCreateSchema,
-  TerminalAttachSchema,
-  TerminalDetachSchema,
-  TerminalInputSchema,
-  TerminalResizeSchema,
-  TerminalKillSchema,
-  TerminalListSchema,
-  TerminalMetaListSchema,
-  CodexActivityListSchema,
-  TabsSyncPushSchema,
-  TabsSyncQuerySchema,
-  CodingCliCreateSchema,
-  CodingCliInputSchema,
-  CodingCliKillSchema,
-  SdkCreateSchema,
-  SdkSendSchema,
-  SdkPermissionRespondSchema,
-  SdkQuestionRespondSchema,
-  SdkInterruptSchema,
-  SdkKillSchema,
-  SdkAttachSchema,
-  SdkSetModelSchema,
-  SdkSetPermissionModeSchema,
-  UiLayoutSyncSchema,
-  UiScreenshotResultSchema,
-  SessionsFetchSchema,
-])
-
 type ClientState = {
   authenticated: boolean
   supportsSessionsPatchV1: boolean
@@ -350,6 +317,7 @@ export class WsHandler {
   private createdTerminalByRequestId = new Map<string, string>()
   private screenshotRequests = new Map<string, PendingScreenshot>()
   private readonly serverInstanceId: string
+  private clientMessageSchema: z.ZodDiscriminatedUnion<'type', [z.ZodObject<any>, ...z.ZodObject<any>[]]>
   private onTerminalExitBound = (payload: { terminalId?: string }) => {
     if (!payload?.terminalId) return
     this.forgetCreatedRequestIdsForTerminal(payload.terminalId)
@@ -387,6 +355,85 @@ export class WsHandler {
       ? serverInstanceId
       : `srv-${randomUUID()}`
     this.terminalStreamBroker = new TerminalStreamBroker(this.registry)
+
+    // Build the set of valid CLI provider/mode names from extensions
+    const supportsDynamicCliValidation =
+      extensionManager && typeof extensionManager.getAll === 'function'
+    const extensionModes = supportsDynamicCliValidation
+      ? extensionManager.getAll()
+          .filter(e => e.manifest.category === 'cli')
+          .map(e => e.manifest.name)
+      : []
+    const allModes = new Set(['shell', ...extensionModes])
+
+    // Build dynamic schemas for the two process-spawning messages.
+    // All other schemas (SessionLocatorSchema, TerminalMetaRecordSchema, etc.)
+    // already accept any string via the widened CodingCliProviderSchema.
+    const dynamicTerminalCreateSchema = supportsDynamicCliValidation
+      ? z.object({
+          type: z.literal('terminal.create'),
+          requestId: z.string().min(1),
+          mode: z.string().default('shell').refine(
+            (val) => allModes.has(val),
+            (val) => ({ message: `Invalid terminal mode: '${val}'. Valid: ${[...allModes].join(', ')}` }),
+          ),
+          shell: ShellSchema.default('system'),
+          cwd: z.string().optional(),
+          resumeSessionId: z.string().optional(),
+          restore: z.boolean().optional(),
+          tabId: z.string().min(1).optional(),
+          paneId: z.string().min(1).optional(),
+        })
+      : TerminalCreateSchema
+
+    const dynamicCodingCliCreateSchema = supportsDynamicCliValidation
+      ? z.object({
+          type: z.literal('codingcli.create'),
+          requestId: z.string().min(1),
+          provider: z.string().min(1).refine(
+            (val) => extensionModes.includes(val),
+            (val) => ({ message: `Unknown CLI provider: '${val}'` }),
+          ),
+          prompt: z.string().min(1),
+          cwd: z.string().optional(),
+          resumeSessionId: z.string().optional(),
+          model: z.string().optional(),
+          maxTurns: z.number().int().positive().optional(),
+          permissionMode: z.enum(['default', 'plan', 'acceptEdits', 'bypassPermissions']).optional(),
+          sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+        })
+      : CodingCliCreateSchema
+
+    this.clientMessageSchema = z.discriminatedUnion('type', [
+      HelloSchema,
+      PingSchema,
+      dynamicTerminalCreateSchema,
+      TerminalAttachSchema,
+      TerminalDetachSchema,
+      TerminalInputSchema,
+      TerminalResizeSchema,
+      TerminalKillSchema,
+      TerminalListSchema,
+      TerminalMetaListSchema,
+      CodexActivityListSchema,
+      TabsSyncPushSchema,
+      TabsSyncQuerySchema,
+      dynamicCodingCliCreateSchema,
+      CodingCliInputSchema,
+      CodingCliKillSchema,
+      SdkCreateSchema,
+      SdkSendSchema,
+      SdkPermissionRespondSchema,
+      SdkQuestionRespondSchema,
+      SdkInterruptSchema,
+      SdkKillSchema,
+      SdkAttachSchema,
+      SdkSetModelSchema,
+      SdkSetPermissionModeSchema,
+      UiLayoutSyncSchema,
+      UiScreenshotResultSchema,
+      SessionsFetchSchema,
+    ])
     const registryWithEvents = this.registry as unknown as {
       on?: (event: string, listener: (...args: any[]) => void) => void
     }
@@ -1121,7 +1168,7 @@ export class WsHandler {
         return
       }
 
-      const parsed = ClientMessageSchema.safeParse(msg)
+      const parsed = this.clientMessageSchema.safeParse(msg)
       if (!parsed.success) {
         this.sendError(ws, { code: 'INVALID_MESSAGE', message: parsed.error.message, requestId: msg?.requestId })
         return
