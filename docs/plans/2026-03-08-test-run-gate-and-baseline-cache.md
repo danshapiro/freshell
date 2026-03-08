@@ -2,11 +2,11 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task.
 
-**Goal:** Serialize heavyweight test runs across repo worktrees, show who currently holds the test gate and why, and publish exact-commit baseline results that other agents can reuse as advisory context.
+**Goal:** Serialize broad test runs across repo worktrees, show truthfully who currently holds the gate and why, and publish exact-commit baseline results that other agents can reuse as advisory context.
 
-**Architecture:** Add one TypeScript wrapper script that owns lock acquisition, bounded waiting, holder metadata, and last-result caching for heavyweight test entrypoints. Store all advisory state in the repo's shared Git common dir so every worktree sees the same gate, use kernel-backed `flock` as the actual mutex so crashes do not leave a stale lock behind, and route public npm scripts through the wrapper while leaving focused `vitest` runs available for narrow local work.
+**Architecture:** Add one TypeScript wrapper script that owns lease acquisition, bounded waiting, holder metadata, and last-result caching for all broad non-interactive npm test entrypoints. Store shared state in the repo's Git common dir, use an atomic lease directory plus heartbeat and PID-liveness checks so the gate works on Linux, WSL, macOS, and native Windows without depending on `flock`, and make `status` use the same immediate live-probe path as waiters so it only reports an active holder when the lease is actually live.
 
-**Tech Stack:** Node.js, TypeScript, `tsx`, `child_process`, `fs/promises`, Git CLI, `flock`, Vitest.
+**Tech Stack:** Node.js, TypeScript, `tsx`, `child_process`, `fs/promises`, Git CLI, Vitest.
 
 ---
 
@@ -19,10 +19,12 @@ User-approved direction:
 
 Design decisions for implementation:
 - Treat the gate as repo-shared state rooted in `git rev-parse --git-common-dir`, not in an individual worktree.
-- Gate only heavyweight entrypoints: `npm test`, `npm run test:all`, `npm run check`, `npm run verify`, and `npm run test:coverage`.
-- Leave focused commands such as `npm run test:unit`, `npm run test:client`, `npm run test:integration`, and direct scoped `npx vitest run <files>` ungated.
+- Gate every broad non-interactive npm test entrypoint: `npm test`, `npm run test:all`, `npm run test:unit`, `npm run test:client`, `npm run test:server`, `npm run test:integration`, `npm run test:coverage`, `npm run check`, and `npm run verify`.
+- Keep only explicitly interactive commands (`npm run test:watch`, `npm run test:ui`) and explicit file-scoped raw `npx vitest run <files>` outside the gate. The former are local-only workflows; the latter remain possible but are no longer the sanctioned path for broad runs.
+- Make the public npm scripts hard to bypass by routing them all through the wrapper and moving the actual raw runners to private underscore-prefixed scripts that only the wrapper invokes.
 - Make baseline results advisory only. Never auto-skip a required fresh landing run.
 - Accept summary input from `--summary "..."` and `FRESHELL_TEST_SUMMARY`, but fall back to an automatic placeholder instead of failing if the agent omits it.
+- Make `status` read-only in the sense that it never waits and never starts tests, but it must still perform the same immediate lease probe and stale-recovery logic as runners so its holder report is truthful.
 
 ## Task 1: Add shared git/run-context helpers for repo-wide gate state
 
@@ -138,7 +140,9 @@ Create `test/unit/server/test-run-gate.test.ts` with pure-function coverage for:
 - holder metadata collection,
 - summary fallback behavior,
 - exact-commit reusable baseline detection,
-- dirty-worktree exclusion from reusable results.
+- dirty-worktree exclusion from reusable results,
+- lease-state classification for `free` / `held` / `stale`,
+- cross-platform npm invocation resolution.
 
 Seed the new test file with cases like:
 
@@ -148,8 +152,10 @@ import { describe, expect, it } from 'vitest'
 import {
   buildHolderRecord,
   buildGatePaths,
+  classifyLeaseState,
   chooseReusableBaseline,
   deriveSummary,
+  resolveNpmRunner,
   type TestRunResultRecord,
 } from '../../../scripts/test-run-gate.js'
 
@@ -157,8 +163,9 @@ describe('test-run-gate helpers', () => {
   it('roots gate files in the shared common git dir', () => {
     expect(buildGatePaths('/repo/.git')).toEqual({
       rootDir: path.join('/repo/.git', 'freshell-test-gate'),
-      lockFile: path.join('/repo/.git', 'freshell-test-gate', 'full-suite.lock'),
+      leaseDir: path.join('/repo/.git', 'freshell-test-gate', 'lease'),
       holderFile: path.join('/repo/.git', 'freshell-test-gate', 'holder.json'),
+      heartbeatFile: path.join('/repo/.git', 'freshell-test-gate', 'heartbeat.json'),
       resultsFile: path.join('/repo/.git', 'freshell-test-gate', 'last-results.json'),
     })
   })
@@ -183,6 +190,12 @@ describe('test-run-gate helpers', () => {
     expect(chooseReusableBaseline({ ...candidate, commit: 'def456' }, { commandKey: 'full', commit: 'abc123' })).toBeUndefined()
   })
 
+  it('classifies live versus stale leases explicitly', () => {
+    expect(classifyLeaseState({ leaseExists: false })).toEqual({ state: 'free' })
+    expect(classifyLeaseState({ leaseExists: true, pidAlive: true, heartbeatAgeMs: 5_000 })).toEqual({ state: 'held' })
+    expect(classifyLeaseState({ leaseExists: true, pidAlive: false, heartbeatAgeMs: 120_000 })).toEqual({ state: 'stale' })
+  })
+
   it('captures summary, branch, worktree, and session identifiers in holder metadata', () => {
     const holder = buildHolderRecord({
       commandKey: 'check',
@@ -201,6 +214,17 @@ describe('test-run-gate helpers', () => {
     expect(holder.worktreePath).toBe('/repo/.worktrees/test-run-gate')
     expect(holder.branch).toBe('feature/test-run-gate')
     expect(holder.sessionId).toBe('thread-123')
+  })
+
+  it('prefers npm_execpath and falls back safely per platform', () => {
+    expect(resolveNpmRunner({ npmExecPath: '/tmp/npm-cli.js', platform: 'linux' })).toEqual({
+      command: process.execPath,
+      argsPrefix: ['/tmp/npm-cli.js'],
+    })
+    expect(resolveNpmRunner({ platform: 'win32' })).toEqual({
+      command: 'npm.cmd',
+      argsPrefix: [],
+    })
   })
 })
 ```
@@ -262,8 +286,9 @@ export function buildGatePaths(commonGitDir: string) {
   const rootDir = path.join(commonGitDir, 'freshell-test-gate')
   return {
     rootDir,
-    lockFile: path.join(rootDir, 'full-suite.lock'),
+    leaseDir: path.join(rootDir, 'lease'),
     holderFile: path.join(rootDir, 'holder.json'),
+    heartbeatFile: path.join(rootDir, 'heartbeat.json'),
     resultsFile: path.join(rootDir, 'last-results.json'),
   }
 }
@@ -284,6 +309,34 @@ export function chooseReusableBaseline(
   if (!candidate.commit || candidate.commit !== current.commit) return undefined
   if (candidate.commandKey !== current.commandKey) return undefined
   return candidate
+}
+
+export function classifyLeaseState(input: {
+  leaseExists: boolean
+  pidAlive?: boolean
+  heartbeatAgeMs?: number
+}) {
+  if (!input.leaseExists) return { state: 'free' as const }
+  if (input.pidAlive) return { state: 'held' as const }
+  if ((input.heartbeatAgeMs ?? Number.POSITIVE_INFINITY) > 60_000) {
+    return { state: 'stale' as const }
+  }
+  return { state: 'held' as const }
+}
+
+export function resolveNpmRunner(input: { npmExecPath?: string; platform?: NodeJS.Platform }) {
+  const npmExecPath = input.npmExecPath?.trim()
+  if (npmExecPath) {
+    return {
+      command: process.execPath,
+      argsPrefix: [npmExecPath],
+    }
+  }
+
+  return {
+    command: (input.platform ?? process.platform) === 'win32' ? 'npm.cmd' : 'npm',
+    argsPrefix: [],
+  }
 }
 
 export async function writeJsonAtomically(filePath: string, data: unknown): Promise<void> {
@@ -316,14 +369,14 @@ git -C /home/user/code/freshell/.worktrees/test-run-gate add \
 git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "feat(testing): add test gate metadata and baseline helpers"
 ```
 
-## Task 3: Add the lock-aware CLI wrapper and exercise the wait path end-to-end
+## Task 3: Add the cross-platform gate wrapper and exercise live-status probing end-to-end
 
 **Files:**
 - Modify: `/home/user/code/freshell/.worktrees/test-run-gate/scripts/test-run-gate.ts`
 - Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/fixtures/test-run-gate/fake-heavy-command.ts`
 - Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/integration/server/test-run-gate.test.ts`
 
-**Step 1: Write the failing integration test for serialization, status messaging, and stale metadata tolerance**
+**Step 1: Write the failing integration test for serialization, live-status probing, and stale-lease recovery**
 
 Create a small fixture script that sleeps briefly and exits with a requested code:
 
@@ -337,7 +390,7 @@ await new Promise((resolve) => setTimeout(resolve, sleepMs))
 process.exit(exitCode)
 ```
 
-Then add `test/integration/server/test-run-gate.test.ts` that spawns two wrapper processes against a temp git repo and temp state dir:
+Then add `test/integration/server/test-run-gate.test.ts` that spawns wrapper processes against a temp git repo and temp state dir:
 
 ```ts
 it('waits for the active holder, then runs after the lock clears', async () => {
@@ -374,8 +427,35 @@ it('waits for the active holder, then runs after the lock clears', async () => {
   expect(waiter.output).toContain('holder-thread')
 })
 
-it('does not treat a leftover holder.json as an active lock', async () => {
-  await fsp.writeFile(holderFile, JSON.stringify({ summary: 'stale' }))
+it('status reports a holder only while the lease is actually live', async () => {
+  const holder = spawnGateProcess({
+    cwd: worktreeDir,
+    summary: 'Live holder',
+    env: {
+      FRESHELL_TEST_GATE_FAKE_COMMAND: fixturePath,
+      FRESHELL_FAKE_HEAVY_SLEEP_MS: '900',
+      FRESHELL_TEST_POLL_INTERVAL_MS: '100',
+      CODEX_THREAD_ID: 'holder-thread',
+    },
+  })
+
+  await holder.waitForOutput('Live holder')
+
+  const statusWhileHeld = await runGateStatus({ cwd: secondWorktreeDir })
+  expect(statusWhileHeld.stdout).toContain('Active test run')
+  expect(statusWhileHeld.stdout).toContain('Live holder')
+  expect(statusWhileHeld.stdout).toContain('holder-thread')
+
+  await expect(holder.exitCode).resolves.toBe(0)
+
+  const statusAfterRelease = await runGateStatus({ cwd: secondWorktreeDir })
+  expect(statusAfterRelease.stdout).not.toContain('Active test run')
+})
+
+it('reclaims a stale lease instead of reporting a dead holder forever', async () => {
+  await fsp.mkdir(leaseDir, { recursive: true })
+  await fsp.writeFile(holderFile, JSON.stringify({ summary: 'stale', pid: 999999 }))
+  await fsp.writeFile(heartbeatFile, JSON.stringify({ updatedAt: '2026-03-08T00:00:00.000Z' }))
 
   const run = spawnGateProcess({
     cwd: worktreeDir,
@@ -387,7 +467,37 @@ it('does not treat a leftover holder.json as an active lock', async () => {
   })
 
   await expect(run.exitCode).resolves.toBe(0)
-  expect(run.output).not.toContain('stale')
+  expect(run.output).not.toContain('Active test run: stale')
+})
+
+it('serializes broad runs in forced portable-lock mode', async () => {
+  const holder = spawnGateProcess({
+    cwd: worktreeDir,
+    summary: 'Portable holder',
+    env: {
+      FRESHELL_TEST_GATE_FAKE_COMMAND: fixturePath,
+      FRESHELL_FAKE_HEAVY_SLEEP_MS: '400',
+      FRESHELL_TEST_FORCE_PORTABLE_GATE: '1',
+    },
+  })
+
+  await holder.waitForOutput('Portable holder')
+
+  const waiter = spawnGateProcess({
+    cwd: secondWorktreeDir,
+    summary: 'Portable waiter',
+    env: {
+      FRESHELL_TEST_GATE_FAKE_COMMAND: fixturePath,
+      FRESHELL_FAKE_HEAVY_SLEEP_MS: '50',
+      FRESHELL_TEST_FORCE_PORTABLE_GATE: '1',
+      FRESHELL_TEST_WAIT_TIMEOUT_MS: '5000',
+      FRESHELL_TEST_POLL_INTERVAL_MS: '100',
+    },
+  })
+
+  await waiter.waitForOutput('Another heavyweight test run is already active')
+  await expect(holder.exitCode).resolves.toBe(0)
+  await expect(waiter.exitCode).resolves.toBe(0)
 })
 ```
 
@@ -407,52 +517,33 @@ Expected: FAIL because the CLI wrapper and fixture are not implemented yet.
 **Step 3: Implement the CLI wrapper on top of the pure helpers**
 
 Finish `scripts/test-run-gate.ts` with:
-- CLI parsing for `full`, `check`, `verify`, `coverage`, and `status`.
+- CLI parsing for `full`, `unit`, `client`, `server`, `integration`, `check`, `verify`, `coverage`, and `status`.
 - `--summary` parsing with `FRESHELL_TEST_SUMMARY` fallback.
 - session/thread detection from `CODEX_THREAD_ID` first, then other known agent session env vars if present.
 - git context discovery using `resolveGitCheckoutRoot`, `resolveGitRepoRoot`, `resolveGitCommonDir`, and Git `rev-parse HEAD`.
-- a `flock`-backed critical section rooted at `buildGatePaths(commonGitDir).lockFile`.
+- a cross-platform lease rooted at `buildGatePaths(commonGitDir).leaseDir`, acquired with atomic `fs.mkdir`.
+- heartbeat updates for the current holder plus PID-liveness checks for stale recovery.
 - a bounded wait loop with minute-scale defaults and test-only env overrides.
 - advisory `holder.json` and `last-results.json` reads/writes.
-- status output that shows the active holder and the last reusable exact-commit baseline for the current command when present.
+- a `status` path that performs the same immediate lease probe and stale cleanup as runners, but never waits and never starts a test command.
+- cross-platform npm execution using `process.execPath` + `process.env.npm_execpath` when available, with `npm.cmd`/`npm` fallback outside npm.
 
-Implement the execution mapping directly inside the script so the public npm scripts cannot recurse into themselves:
+Implement the execution mapping through private raw scripts so every sanctioned broad package-script entrypoint goes through the same gate:
 
 ```ts
-const COMMANDS: Record<CommandKey, { label: string; steps: Array<{ command: string; args: string[] }> }> = {
-  full: {
-    label: 'npm test',
-    steps: [
-      { command: 'npm', args: ['exec', 'vitest', 'run'] },
-      { command: 'npm', args: ['exec', 'vitest', 'run', '--config', 'vitest.server.config.ts'] },
-    ],
-  },
-  check: {
-    label: 'npm run check',
-    steps: [
-      { command: 'npm', args: ['run', 'typecheck'] },
-      { command: 'npm', args: ['exec', 'vitest', 'run'] },
-      { command: 'npm', args: ['exec', 'vitest', 'run', '--config', 'vitest.server.config.ts'] },
-    ],
-  },
-  verify: {
-    label: 'npm run verify',
-    steps: [
-      { command: 'npm', args: ['run', 'build'] },
-      { command: 'npm', args: ['exec', 'vitest', 'run'] },
-      { command: 'npm', args: ['exec', 'vitest', 'run', '--config', 'vitest.server.config.ts'] },
-    ],
-  },
-  coverage: {
-    label: 'npm run test:coverage',
-    steps: [
-      { command: 'npm', args: ['exec', 'vitest', 'run', '--coverage'] },
-    ],
-  },
+const COMMANDS: Record<CommandKey, { label: string; npmScript: string }> = {
+  full: { label: 'npm test', npmScript: '_test:full:raw' },
+  unit: { label: 'npm run test:unit', npmScript: '_test:unit:raw' },
+  client: { label: 'npm run test:client', npmScript: '_test:client:raw' },
+  server: { label: 'npm run test:server', npmScript: '_test:server:raw' },
+  integration: { label: 'npm run test:integration', npmScript: '_test:integration:raw' },
+  check: { label: 'npm run check', npmScript: '_check:raw' },
+  verify: { label: 'npm run verify', npmScript: '_verify:raw' },
+  coverage: { label: 'npm run test:coverage', npmScript: '_test:coverage:raw' },
 }
 ```
 
-The lock handling should follow this shape:
+The lease handling should follow this shape:
 
 ```ts
 async function waitForGate(paths: GatePaths, holder: HolderRecord): Promise<GateLease> {
@@ -460,14 +551,15 @@ async function waitForGate(paths: GatePaths, holder: HolderRecord): Promise<Gate
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    const lease = await tryAcquireLease(paths.lockFile)
-    if (lease) {
-      await writeJsonAtomically(paths.holderFile, holder)
-      return lease
+    const snapshot = await probeGateState(paths)
+    if (snapshot.state === 'free') {
+      const lease = await tryAcquireLease(paths, holder)
+      if (lease) return lease
+    } else if (snapshot.state === 'held') {
+      renderBusyMessage(snapshot.holder, deadline)
+    } else {
+      await reclaimStaleLease(paths, snapshot)
     }
-
-    const activeHolder = await readJson<HolderRecord>(paths.holderFile)
-    renderBusyMessage(activeHolder, deadline)
 
     if (Date.now() >= deadline) {
       throw new Error('Timed out waiting for the heavyweight test gate after 60 minutes')
@@ -478,14 +570,14 @@ async function waitForGate(paths: GatePaths, holder: HolderRecord): Promise<Gate
 }
 ```
 
-Do not trust `holder.json` as proof of a live lock. Only print it after a failed non-blocking lock attempt.
+`probeGateState()` must be the single source of truth for both waiters and `status`: it checks whether the lease directory exists, reads holder and heartbeat metadata, verifies PID liveness, and classifies the state as `free`, `held`, or `stale`. `status` may use that probe and may reclaim a provably stale lease, but it must never block and never start a test command.
 
 Use a hidden test-only override so the integration suite can substitute the fixture command instead of running the real tests:
 
 ```ts
 const fakeCommand = process.env.FRESHELL_TEST_GATE_FAKE_COMMAND?.trim()
 if (fakeCommand) {
-  return [{ command: process.execPath, args: [tsxBinPath, fakeCommand] }]
+  return { command: process.execPath, args: [tsxBinPath, fakeCommand] }
 }
 ```
 
@@ -519,33 +611,47 @@ git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "feat(testing
 
 **Step 1: Update the public npm scripts to use the gate**
 
-Change the heavyweight public entrypoints in `package.json`:
+Change the public test scripts in `package.json` so every broad non-interactive entrypoint routes through the gate and the raw runners become private:
 
 ```json
 {
   "scripts": {
+    "_test:full:raw": "vitest run && vitest run --config vitest.server.config.ts",
+    "_test:unit:raw": "vitest run test/unit",
+    "_test:client:raw": "vitest run test/unit/client",
+    "_test:server:raw": "vitest run --config vitest.server.config.ts",
+    "_test:integration:raw": "vitest run --config vitest.server.config.ts test/server",
+    "_test:coverage:raw": "vitest run --coverage",
+    "_check:raw": "npm run typecheck && npm run _test:full:raw",
+    "_verify:raw": "npm run build && npm run _test:full:raw",
     "test": "tsx scripts/test-run-gate.ts full",
     "verify": "tsx scripts/test-run-gate.ts verify",
     "check": "tsx scripts/test-run-gate.ts check",
     "test:coverage": "tsx scripts/test-run-gate.ts coverage",
     "test:all": "tsx scripts/test-run-gate.ts full",
+    "test:unit": "tsx scripts/test-run-gate.ts unit",
+    "test:client": "tsx scripts/test-run-gate.ts client",
+    "test:server": "tsx scripts/test-run-gate.ts server",
+    "test:integration": "tsx scripts/test-run-gate.ts integration",
     "test:status": "tsx scripts/test-run-gate.ts status",
-    "test:unit": "vitest run test/unit",
-    "test:integration": "vitest run --config vitest.server.config.ts test/server",
-    "test:client": "vitest run test/unit/client"
+    "test:watch": "vitest",
+    "test:ui": "vitest --ui"
   }
 }
 ```
 
-Leave focused commands ungated.
+This makes every sanctioned broad `npm run test:*` path gated. Only explicit interactive watch/UI workflows and explicit file-scoped raw Vitest commands remain outside the wrapper.
 
 **Step 2: Update agent and testing docs**
 
 Adjust `AGENTS.md` and `docs/skills/testing.md` so they match the new reality:
 - `npm test` is a full gated run, not watch mode.
-- `npm run test:status` shows the active holder plus the last reusable exact-commit baseline.
+- every broad non-interactive npm test script is gated, including `test:unit`, `test:client`, `test:server`, and `test:integration`.
+- `test:server` is normalized to a deterministic gated one-shot server-suite run; `test:watch` and `test:ui` remain the interactive workflows.
+- `npm run test:status` performs a non-blocking live probe, reports an active holder only when the lease is live, and otherwise reports the latest reusable exact-commit baseline.
 - agents should set `FRESHELL_TEST_SUMMARY` or pass `--summary`.
-- direct `npx vitest run` is for narrow targeted test runs only, not for full-suite equivalents.
+- private underscore-prefixed raw scripts are internal plumbing, not agent entrypoints.
+- direct `npx vitest run` is for explicit file-targeted test runs only, not for broad config-or-directory runs.
 
 Use concrete examples:
 
@@ -587,7 +693,8 @@ git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "docs(testing
 Extend the integration test so it checks:
 - `status` prints a matching reusable baseline after a clean successful run,
 - failed runs update the "last failure" record but do not present themselves as reusable baselines,
-- holder output includes the wait guidance: poll every minute, be patient for up to one hour, and do not kill a run you did not start.
+- holder output includes the wait guidance: poll every minute, be patient for up to one hour, and do not kill a run you did not start,
+- `status` does not report a holder after a stale lease has been reclaimed.
 
 Add assertions like:
 
@@ -629,7 +736,7 @@ Update `scripts/test-run-gate.ts` so:
 - every completed run writes a result record keyed by command,
 - a reusable baseline is shown only when `exitCode === 0`, `cleanWorktree === true`, and `commit` matches the current checkout exactly,
 - failures are still recorded and shown as informational history, but never marked reusable,
-- `status` is read-only and never attempts to acquire the gate.
+- `status` is read-only in the sense that it never waits and never starts tests, but it still runs the same immediate `probeGateState()` logic as waiters so it can truthfully report `held` versus `free` and reclaim a provably stale lease.
 
 The persisted JSON structure should stay small and explicit:
 
@@ -655,7 +762,7 @@ npm run test:status
 Expected:
 - targeted unit and integration tests PASS,
 - `npm run check` waits its turn if necessary and then PASSes through the new gate,
-- `npm run test:status` reports either an active holder or the latest exact-commit reusable baseline.
+- `npm run test:status` reports a live active holder only when the lease probe confirms one, otherwise it reports the latest exact-commit reusable baseline.
 
 **Step 5: Commit**
 
