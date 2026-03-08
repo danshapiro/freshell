@@ -24,7 +24,6 @@ import { applyLocalTerminalFontFamily } from '@/lib/terminal-fonts'
 import { handleUiCommand } from '@/lib/ui-commands'
 import { getAuthToken } from '@/lib/auth'
 import { installTestHarness } from '@/lib/test-harness'
-import { store } from '@/store/store'
 import { useThemeEffect } from '@/hooks/useTheme'
 import { useMobile } from '@/hooks/useMobile'
 import { useOrientation } from '@/hooks/useOrientation'
@@ -149,7 +148,7 @@ export default function App() {
 
     const ws = getWsClient()
     installTestHarness(
-      store,
+      appStore,
       () => (ws as any)._state || 'unknown',
       (timeoutMs = 10_000) => new Promise<void>((resolve, reject) => {
         if ((ws as any)._state === 'ready') { resolve(); return }

@@ -192,7 +192,6 @@ describe('fetchSidebarSessionsSnapshot()', () => {
       }),
     )
   })
-
   it('filters invalid open sessions before POSTing the personalized snapshot query', async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
