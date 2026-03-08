@@ -645,12 +645,12 @@ export class WsHandler {
     return true
   }
 
-  private send(ws: LiveWebSocket, msg: unknown) {
+  private send(ws: LiveWebSocket, msg: unknown, skipBackpressureCheck = false) {
     let messageType: string | undefined
     try {
-      // Backpressure guard.
+      // Backpressure guard (skipped when caller manages its own drain logic).
       const buffered = ws.bufferedAmount as number | undefined
-      if (this.closeForBackpressureIfNeeded(ws, buffered)) return
+      if (!skipBackpressureCheck && this.closeForBackpressureIfNeeded(ws, buffered)) return
       let serialized = ''
       let payloadBytes: number | undefined
       let serializeMs: number | undefined
@@ -710,9 +710,9 @@ export class WsHandler {
     }
   }
 
-  private safeSend(ws: LiveWebSocket, msg: unknown) {
+  private safeSend(ws: LiveWebSocket, msg: unknown, skipBackpressureCheck = false) {
     if (ws.readyState === WebSocket.OPEN) {
-      this.send(ws, msg)
+      this.send(ws, msg, skipBackpressureCheck)
     }
   }
 
@@ -837,6 +837,19 @@ export class WsHandler {
       if (ws.readyState !== WebSocket.OPEN) return false
       if (isSuperseded()) return false
 
+      // Wait for buffer to drain BEFORE sending the next chunk (skip first chunk).
+      // On remote connections (Tailscale, SSH tunnels), TCP drain is slower than
+      // chunk sends, so bufferedAmount can accumulate past the backpressure kill
+      // threshold (MAX_WS_BUFFERED_AMOUNT) if we don't drain first.
+      if (i > 0) {
+        const buffered = ws.bufferedAmount as number | undefined
+        if (typeof buffered === 'number' && buffered > DRAIN_THRESHOLD_BYTES) {
+          if (!await this.waitForDrain(ws, DRAIN_THRESHOLD_BYTES, DRAIN_TIMEOUT_MS, isSuperseded)) return false
+        } else {
+          await new Promise<void>((resolve) => setImmediate(resolve))
+        }
+      }
+
       const isFirst = i === 0
       let msg: {
         type: 'sessions.updated'
@@ -863,17 +876,10 @@ export class WsHandler {
       }
 
       totalPayloadBytes += Buffer.byteLength(JSON.stringify(msg))
-      this.safeSend(ws, msg)
-
-      // Wait for buffer to drain before sending next chunk
-      if (i < chunks.length - 1) {
-        const buffered = ws.bufferedAmount as number | undefined
-        if (typeof buffered === 'number' && buffered > DRAIN_THRESHOLD_BYTES) {
-          if (!await this.waitForDrain(ws, DRAIN_THRESHOLD_BYTES, DRAIN_TIMEOUT_MS, isSuperseded)) return false
-        } else {
-          await new Promise<void>((resolve) => setImmediate(resolve))
-        }
-      }
+      // Skip the send() backpressure guard for chunks 2..N — we already
+      // drained above. Keep it for the first chunk in case the buffer is
+      // already near MAX_WS_BUFFERED_AMOUNT from concurrent writes.
+      this.safeSend(ws, msg, /* skipBackpressureCheck */ i > 0)
     }
     // Verify connection survived the final send (safeSend can trigger backpressure close)
     const allSent = ws.readyState === WebSocket.OPEN && !isSuperseded()
