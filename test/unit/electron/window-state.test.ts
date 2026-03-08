@@ -15,7 +15,7 @@ vi.mock('os', async () => {
 })
 
 import { createWindowStatePersistence } from '../../../electron/window-state.js'
-import { writeDesktopConfig, getDefaultDesktopConfig } from '../../../electron/desktop-config.js'
+import { writeDesktopConfig, getDefaultDesktopConfig, _resetMutexForTesting } from '../../../electron/desktop-config.js'
 
 describe('WindowStatePersistence', () => {
   let tempDir: string
@@ -23,6 +23,7 @@ describe('WindowStatePersistence', () => {
   beforeEach(async () => {
     tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'window-state-test-'))
     mockState.homeDir = tempDir
+    _resetMutexForTesting()
   })
 
   afterEach(async () => {
@@ -62,6 +63,20 @@ describe('WindowStatePersistence', () => {
     expect(state.width).toBe(1400)
     expect(state.height).toBe(900)
     expect(state.maximized).toBe(true)
+  })
+
+  it('preserves width=0 and height=0 without replacing with defaults', async () => {
+    // Regression test: using || instead of ?? would replace 0 with defaults
+    // because 0 is falsy. Nullish coalescing (??) only replaces null/undefined.
+    await writeDesktopConfig({
+      ...getDefaultDesktopConfig(),
+      windowState: { x: 0, y: 0, width: 0, height: 0, maximized: false },
+    })
+
+    const persistence = createWindowStatePersistence()
+    const state = await persistence.load()
+    expect(state.width).toBe(0)
+    expect(state.height).toBe(0)
   })
 
   it('saves state via patchDesktopConfig', async () => {

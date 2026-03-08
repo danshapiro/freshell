@@ -6,7 +6,7 @@
   "bin": {
     "freshell": "dist/server/cli/index.js"
   },
-  "main": "dist/electron/electron/main.js",
+  "main": "dist/electron/electron/entry.js",
   "scripts": {
     "predev": "cross-env PORT=3002 tsx scripts/precheck.ts",
     "preserve": "tsx scripts/precheck.ts",

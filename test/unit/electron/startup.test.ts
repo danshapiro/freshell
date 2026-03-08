@@ -188,6 +188,21 @@ describe('runStartup', () => {
   })
 
   describe('remote mode', () => {
+    it('throws when remoteUrl is not configured', async () => {
+      const ctx = createDefaultContext({
+        desktopConfig: {
+          serverMode: 'remote',
+          // remoteUrl intentionally omitted
+          globalHotkey: 'CommandOrControl+`',
+          startOnLogin: false,
+          minimizeToTray: true,
+          setupCompleted: true,
+        },
+      })
+
+      await expect(runStartup(ctx)).rejects.toThrow('Remote URL not configured. Please re-run setup.')
+    })
+
     it('validates connectivity and opens remote URL', async () => {
       const fetchHealthCheck = vi.fn().mockResolvedValue(true)
       const ctx = createDefaultContext({
@@ -386,5 +401,43 @@ describe('runStartup', () => {
     expect(result.type).toBe('main')
     expect(mockWindow.loadURL).toHaveBeenCalledWith('http://localhost:3001')
     expect(mockWindow.show).toHaveBeenCalled()
+  })
+
+  it('returns updateCheckTimer in main result so caller can cancel it', async () => {
+    const ctx = createDefaultContext()
+    const result = await runStartup(ctx)
+    expect(result.type).toBe('main')
+    if (result.type === 'main') {
+      expect(result.updateCheckTimer).toBeDefined()
+      // Timer should be a number (NodeJS.Timeout is assignable to ReturnType<typeof setTimeout>)
+      clearTimeout(result.updateCheckTimer)
+    }
+  })
+
+  it('update check timer fires after 10s delay', async () => {
+    const ctx = createDefaultContext()
+    await runStartup(ctx)
+
+    expect(ctx.updateManager.checkForUpdates).not.toHaveBeenCalled()
+
+    // Advance by 10 seconds
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    expect(ctx.updateManager.checkForUpdates).toHaveBeenCalledTimes(1)
+  })
+
+  it('update check can be cancelled via clearTimeout on the timer', async () => {
+    const ctx = createDefaultContext()
+    const result = await runStartup(ctx)
+
+    if (result.type === 'main') {
+      clearTimeout(result.updateCheckTimer)
+    }
+
+    // Advance past the 10s delay
+    await vi.advanceTimersByTimeAsync(15_000)
+
+    // Should NOT have been called since we cancelled the timer
+    expect(ctx.updateManager.checkForUpdates).not.toHaveBeenCalled()
   })
 })

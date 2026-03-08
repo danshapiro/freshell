@@ -40,7 +40,7 @@ export interface StartupContext {
 
 export type StartupResult =
   | { type: 'wizard' }
-  | { type: 'main'; serverUrl: string; window: BrowserWindowLike }
+  | { type: 'main'; serverUrl: string; window: BrowserWindowLike; updateCheckTimer: ReturnType<typeof setTimeout> }
 
 export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
   const { desktopConfig, isDev, port } = ctx
@@ -164,9 +164,9 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
   ctx.createTray()
 
   // 6. Schedule update check (10s delay)
-  setTimeout(() => {
+  const updateCheckTimer = setTimeout(() => {
     void ctx.updateManager.checkForUpdates()
   }, 10_000)
 
-  return { type: 'main', serverUrl, window }
+  return { type: 'main', serverUrl, window, updateCheckTimer }
 }

@@ -32,8 +32,8 @@ export function createWindowStatePersistence(): WindowStatePersistence {
       return {
         x: config.windowState.x,
         y: config.windowState.y,
-        width: config.windowState.width || DEFAULTS.width,
-        height: config.windowState.height || DEFAULTS.height,
+        width: config.windowState.width ?? DEFAULTS.width,
+        height: config.windowState.height ?? DEFAULTS.height,
         maximized: config.windowState.maximized ?? DEFAULTS.maximized,
       }
     },
