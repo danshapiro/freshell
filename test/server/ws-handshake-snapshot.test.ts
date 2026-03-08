@@ -152,6 +152,10 @@ function waitForReady(ws: WebSocket, timeoutMs = 10_000): Promise<any> {
   return readyPromise
 }
 
+function flattenSessions(projects: Array<{ sessions?: Array<{ sessionId: string }> }>): string[] {
+  return projects.flatMap((project) => (project.sessions || []).map((session) => session.sessionId))
+}
+
 describe('ws handshake snapshot', () => {
   let server: http.Server | undefined
   let port: number
@@ -448,6 +452,165 @@ describe('ws handshake snapshot with chunking', () => {
       expect(totalSessions).toBe(expectedSessions)
     } finally {
       await closeWs(ws)
+    }
+  })
+})
+
+describe('ws handshake snapshot personalization', () => {
+  let server: http.Server | undefined
+  let port: number
+  let snapshot: Snapshot
+
+  beforeAll(async () => {
+    process.env.NODE_ENV = 'test'
+    process.env.AUTH_TOKEN = 'testtoken-testtoken'
+    process.env.HELLO_TIMEOUT_MS = '100'
+    delete process.env.MAX_WS_CHUNK_BYTES
+
+    vi.resetModules()
+    const { WsHandler } = await import('../../server/ws-handler')
+
+    snapshot = {
+      settings: { theme: 'dark' },
+      projects: [],
+    }
+
+    server = http.createServer((_req, res) => {
+      res.statusCode = 404
+      res.end()
+    })
+
+    new (WsHandler as any)(
+      server,
+      new FakeRegistry() as any,
+      undefined,
+      undefined,
+      undefined,
+      async () => snapshot,
+      undefined,
+      undefined,
+      'srv-local',
+    )
+
+    const info = await listen(server)
+    port = info.port
+  }, HOOK_TIMEOUT_MS)
+
+  afterAll(async () => {
+    if (!server) return
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }, HOOK_TIMEOUT_MS)
+
+  it('personalizes paginated handshake snapshots from sidebarOpenSessions while preserving the primary cursor', async () => {
+    snapshot = {
+      settings: { theme: 'dark' },
+      projects: [{
+        projectPath: '/demo',
+        sessions: Array.from({ length: 102 }, (_, index) => ({
+          provider: 'claude',
+          sessionId: `s${index}`,
+          projectPath: '/demo',
+          updatedAt: 1000 + index,
+        })),
+      }],
+    }
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const closeWs = async () => {
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.terminate()
+      }
+      await new Promise<void>((resolve) => ws.on('close', () => resolve()))
+    }
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+
+      const readyPromise = waitForMessage(ws, (m) => m.type === 'ready')
+      const sessionsPromise = waitForMessage(ws, (m) => m.type === 'sessions.updated')
+
+      ws.send(JSON.stringify({
+        type: 'hello',
+        token: 'testtoken-testtoken',
+        protocolVersion: WS_PROTOCOL_VERSION,
+        capabilities: {
+          sessionsPaginationV1: true,
+        },
+        sidebarOpenSessions: [
+          { provider: 'claude', sessionId: 's0', serverInstanceId: 'srv-local' },
+          { provider: 'claude', sessionId: 's0' },
+          { provider: 'claude', sessionId: 's0', serverInstanceId: 'srv-remote' },
+          { provider: 'claude', sessionId: 's1', serverInstanceId: 'srv-remote' },
+        ],
+      }))
+
+      await readyPromise
+      const sessionsMsg = await sessionsPromise
+      const sessionIds = flattenSessions(sessionsMsg.projects)
+
+      expect(sessionIds).toContain('s0')
+      expect(sessionIds.filter((sessionId) => sessionId === 's0')).toHaveLength(1)
+      expect(sessionIds).not.toContain('s1')
+      expect(sessionsMsg.oldestIncludedTimestamp).toBe(1002)
+      expect(sessionsMsg.oldestIncludedSessionId).toBe('claude:s2')
+      expect(sessionsMsg.hasMore).toBe(true)
+    } finally {
+      await closeWs()
+    }
+  })
+
+  it('reports hasMore false when personalized handshake snapshots cover the final unseen session', async () => {
+    snapshot = {
+      settings: { theme: 'dark' },
+      projects: [{
+        projectPath: '/demo',
+        sessions: Array.from({ length: 101 }, (_, index) => ({
+          provider: 'claude',
+          sessionId: `s${index}`,
+          projectPath: '/demo',
+          updatedAt: 1000 + index,
+        })),
+      }],
+    }
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const closeWs = async () => {
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.terminate()
+      }
+      await new Promise<void>((resolve) => ws.on('close', () => resolve()))
+    }
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+
+      const readyPromise = waitForMessage(ws, (m) => m.type === 'ready')
+      const sessionsPromise = waitForMessage(ws, (m) => m.type === 'sessions.updated')
+
+      ws.send(JSON.stringify({
+        type: 'hello',
+        token: 'testtoken-testtoken',
+        protocolVersion: WS_PROTOCOL_VERSION,
+        capabilities: {
+          sessionsPaginationV1: true,
+        },
+        sidebarOpenSessions: [
+          { provider: 'claude', sessionId: 's0' },
+          { provider: 'claude', sessionId: 's0', serverInstanceId: 'srv-local' },
+          { provider: 'claude', sessionId: 's0' },
+        ],
+      }))
+
+      await readyPromise
+      const sessionsMsg = await sessionsPromise
+      const sessionIds = flattenSessions(sessionsMsg.projects)
+
+      expect(sessionIds).toContain('s0')
+      expect(sessionsMsg.oldestIncludedTimestamp).toBe(1001)
+      expect(sessionsMsg.oldestIncludedSessionId).toBe('claude:s1')
+      expect(sessionsMsg.hasMore).toBe(false)
+    } finally {
+      await closeWs()
     }
   })
 })

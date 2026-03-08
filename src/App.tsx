@@ -476,6 +476,10 @@ export default function App() {
       // Set up hello extension to include session IDs for prioritized repair
       ws.setHelloExtensionProvider(() => ({
         sessions: getSessionsForHello(appStore.getState()),
+        sidebarOpenSessions: collectSessionLocatorsFromTabs(
+          appStore.getState().tabs.tabs,
+          appStore.getState().panes,
+        ),
         client: { mobile: isMobileRef.current },
       }))
 

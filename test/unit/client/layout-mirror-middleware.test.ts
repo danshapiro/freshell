@@ -26,6 +26,45 @@ describe('layoutMirrorMiddleware', () => {
     vi.useRealTimers()
   })
 
+  it('includes fallbackSessionRef for no-layout local session tabs', () => {
+    mockSend.mockClear()
+    vi.useFakeTimers()
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+      middleware: (g) => g().concat(layoutMirrorMiddleware),
+    })
+
+    store.dispatch(addTab({
+      id: 'tab-1',
+      title: 'alpha',
+      mode: 'codex',
+      resumeSessionId: 'older-open',
+    }))
+
+    vi.runOnlyPendingTimers()
+
+    expect(mockSend).toHaveBeenCalledWith({
+      type: 'ui.layout.sync',
+      tabs: [
+        {
+          id: 'tab-1',
+          title: 'alpha',
+          fallbackSessionRef: {
+            provider: 'codex',
+            sessionId: 'older-open',
+          },
+        },
+      ],
+      activeTabId: 'tab-1',
+      layouts: {},
+      activePane: {},
+      paneTitles: {},
+      timestamp: expect.any(Number),
+    })
+
+    vi.useRealTimers()
+  })
+
   it('dedupes unchanged layout payloads', () => {
     mockSend.mockClear()
     vi.useFakeTimers()

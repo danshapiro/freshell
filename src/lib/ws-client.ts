@@ -5,7 +5,7 @@ import {
   markTerminalOutputSeen,
 } from '@/lib/perf-logger'
 import { getAuthToken } from '@/lib/auth'
-import type { ServerMessage } from '@shared/ws-protocol'
+import type { ServerMessage, SessionLocator } from '@shared/ws-protocol'
 import { createLogger } from '@/lib/client-logger'
 
 const log = createLogger('WsClient')
@@ -15,6 +15,7 @@ type MessageHandler = (msg: ServerMessage) => void
 type ReconnectHandler = () => void
 type HelloExtensionProvider = () => {
   sessions?: { active?: string; visible?: string[]; background?: string[] }
+  sidebarOpenSessions?: SessionLocator[]
   client?: { mobile?: boolean }
 }
 type TabsSyncPushPayload = {

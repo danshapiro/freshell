@@ -1,8 +1,9 @@
+import type { SessionLocator } from '../../shared/ws-protocol.js'
 import { nanoid } from 'nanoid'
 import { resolveTarget } from './target-resolver.js'
 
 type UiSnapshot = {
-  tabs: Array<{ id: string; title?: string }>
+  tabs: Array<{ id: string; title?: string; fallbackSessionRef?: SessionLocator }>
   activeTabId?: string | null
   layouts: Record<string, any>
   activePane: Record<string, string>

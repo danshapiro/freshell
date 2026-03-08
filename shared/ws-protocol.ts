@@ -37,6 +37,14 @@ export const CodingCliProviderSchema = z.enum(['claude', 'codex', 'opencode', 'g
 
 export type CodingCliProviderName = z.infer<typeof CodingCliProviderSchema>
 
+export const SessionLocatorSchema = z.object({
+  provider: CodingCliProviderSchema,
+  sessionId: z.string().min(1),
+  serverInstanceId: z.string().min(1).optional(),
+})
+
+export type SessionLocator = z.infer<typeof SessionLocatorSchema>
+
 // ──────────────────────────────────────────────────────────────
 // Terminal metadata schemas (used in both directions)
 // ──────────────────────────────────────────────────────────────
@@ -146,6 +154,7 @@ export const HelloSchema = z.object({
   client: z.object({
     mobile: z.boolean().optional(),
   }).optional(),
+  sidebarOpenSessions: z.array(SessionLocatorSchema).optional(),
   sessions: z.object({
     active: z.string().optional(),
     visible: z.array(z.string()).optional(),
@@ -216,6 +225,7 @@ export const UiLayoutSyncSchema = z.object({
   tabs: z.array(z.object({
     id: z.string(),
     title: z.string().optional(),
+    fallbackSessionRef: SessionLocatorSchema.optional(),
   })),
   activeTabId: z.string().nullable().optional(),
   layouts: z.record(z.string(), z.unknown()),

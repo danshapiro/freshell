@@ -20,6 +20,7 @@ import type { ExtensionManager } from './extension-manager.js'
 import { TerminalStreamBroker } from './terminal-stream/broker.js'
 import { chunkProjects } from './ws-chunking.js'
 import { paginateProjects } from './session-pagination.js'
+import { buildSidebarOpenSessionKeys, type SidebarSessionLocator } from './sidebar-session-selection.js'
 import { loadSessionHistory, type ChatMessage } from './session-history-loader.js'
 import { TabRegistryRecordBaseSchema, TabRegistryRecordSchema } from './tabs-registry/types.js'
 import type { TabsRegistryStore } from './tabs-registry/store.js'
@@ -128,6 +129,108 @@ function isMobileUserAgent(userAgent: string | undefined): boolean {
   return /Mobi|Android|iPhone|iPad|iPod/i.test(userAgent)
 }
 
+function sameStringSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a.size !== b.size) return false
+  for (const value of a) {
+    if (!b.has(value)) return false
+  }
+  return true
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0
+}
+
+function normalizeUiSessionLocator(value: unknown): SidebarSessionLocator | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const candidate = value as {
+    provider?: unknown
+    sessionId?: unknown
+    serverInstanceId?: unknown
+  }
+  const provider = CodingCliProviderSchema.safeParse(candidate.provider)
+  if (!provider.success || !isNonEmptyString(candidate.sessionId)) return undefined
+  return {
+    provider: provider.data,
+    sessionId: candidate.sessionId,
+    ...(isNonEmptyString(candidate.serverInstanceId)
+      ? { serverInstanceId: candidate.serverInstanceId }
+      : {}),
+  }
+}
+
+function extractSessionLocatorsFromUiContent(content: Record<string, unknown>): SidebarSessionLocator[] {
+  const locators: SidebarSessionLocator[] = []
+
+  const explicit = normalizeUiSessionLocator(content.sessionRef)
+  if (explicit) {
+    locators.push(explicit)
+  }
+
+  const kind = content.kind
+  if (kind === 'agent-chat') {
+    if (isNonEmptyString(content.resumeSessionId)) {
+      locators.push({ provider: 'claude', sessionId: content.resumeSessionId })
+    }
+    return locators
+  }
+
+  if (kind !== 'terminal') return locators
+
+  const mode = CodingCliProviderSchema.safeParse(content.mode)
+  if (!mode.success || !isNonEmptyString(content.resumeSessionId)) {
+    return locators
+  }
+
+  locators.push({
+    provider: mode.data,
+    sessionId: content.resumeSessionId,
+  })
+  return locators
+}
+
+function collectSessionLocatorsFromUiLayoutNode(node: unknown, locators: SidebarSessionLocator[]): void {
+  if (!node || typeof node !== 'object') return
+  const candidate = node as {
+    type?: unknown
+    content?: unknown
+    children?: unknown
+  }
+
+  if (candidate.type === 'leaf' && candidate.content && typeof candidate.content === 'object') {
+    locators.push(...extractSessionLocatorsFromUiContent(candidate.content as Record<string, unknown>))
+    return
+  }
+
+  if (candidate.type !== 'split' || !Array.isArray(candidate.children)) return
+  for (const child of candidate.children) {
+    collectSessionLocatorsFromUiLayoutNode(child, locators)
+  }
+}
+
+function collectSessionLocatorsFromUiLayouts(layouts: Record<string, unknown>): SidebarSessionLocator[] {
+  const locators: SidebarSessionLocator[] = []
+  for (const node of Object.values(layouts)) {
+    collectSessionLocatorsFromUiLayoutNode(node, locators)
+  }
+  return locators
+}
+
+function collectFallbackSessionLocatorsFromUiTabs(
+  tabs: Array<{ id: string; fallbackSessionRef?: SidebarSessionLocator }>,
+  layouts: Record<string, unknown>,
+): SidebarSessionLocator[] {
+  const locators: SidebarSessionLocator[] = []
+  for (const tab of tabs) {
+    if (layouts[tab.id] != null) continue
+    const fallback = normalizeUiSessionLocator(tab.fallbackSessionRef)
+    if (fallback) {
+      locators.push(fallback)
+    }
+  }
+  return locators
+}
+
 const TabsSyncPushRecordSchema = TabRegistryRecordBaseSchema.omit({
   serverInstanceId: true,
   deviceId: true,
@@ -192,6 +295,7 @@ type ClientState = {
   sdkSessions: Set<string>
   sdkSubscriptions: Map<string, () => void>
   interestedSessions: Set<string>
+  sidebarOpenSessionKeys: Set<string>
   helloTimer?: NodeJS.Timeout
 }
 
@@ -564,6 +668,7 @@ export class WsHandler {
       sdkSessions: new Set(),
       sdkSubscriptions: new Map(),
       interestedSessions: new Set(),
+      sidebarOpenSessionKeys: new Set(),
     }
     this.clientStates.set(ws, state)
 
@@ -794,6 +899,61 @@ export class WsHandler {
     }, 0)
   }
 
+  private paginateSidebarProjects(
+    projects: ProjectGroup[],
+    state: ClientState,
+    options: {
+      limit?: number
+      before?: number
+      beforeId?: string
+    } = {},
+  ) {
+    return paginateProjects(projects, {
+      limit: options.limit,
+      before: options.before,
+      beforeId: options.beforeId,
+      forceIncludeSessionKeys: state.sidebarOpenSessionKeys,
+    })
+  }
+
+  private async sendSidebarSessionsSnapshot(
+    ws: LiveWebSocket,
+    state: ClientState,
+    projects: ProjectGroup[],
+    options: {
+      forceClear?: boolean
+      limit?: number
+      before?: number
+      beforeId?: string
+    } = {},
+  ): Promise<boolean> {
+    const paginated = this.paginateSidebarProjects(projects, state, options)
+    const allSent = await this.sendChunkedSessions(ws, paginated.projects, {
+      totalSessions: paginated.totalSessions,
+      oldestIncludedTimestamp: paginated.oldestIncludedTimestamp,
+      oldestIncludedSessionId: paginated.oldestIncludedSessionId,
+      hasMore: paginated.hasMore,
+    }, options.forceClear)
+    state.sessionsSnapshotSent = allSent
+    return allSent
+  }
+
+  private async refreshSidebarSessionsSnapshot(ws: LiveWebSocket, state: ClientState): Promise<void> {
+    if (!this.handshakeSnapshotProvider) return
+    try {
+      const snapshot = await this.handshakeSnapshotProvider()
+      const projects = snapshot.projects ?? []
+      if (state.supportsSessionsPaginationV1) {
+        await this.sendSidebarSessionsSnapshot(ws, state, projects, { forceClear: true })
+      } else {
+        const allSent = await this.sendChunkedSessions(ws, projects, undefined, true)
+        state.sessionsSnapshotSent = allSent
+      }
+    } catch (err) {
+      logger.warn({ err, connectionId: ws.connectionId }, 'Failed to refresh sidebar sessions snapshot')
+    }
+  }
+
   private async sendHandshakeSnapshot(ws: LiveWebSocket, state: ClientState) {
     if (!this.handshakeSnapshotProvider) return
     try {
@@ -803,14 +963,7 @@ export class WsHandler {
       }
       if (snapshot.projects) {
         if (state.supportsSessionsPaginationV1) {
-          const paginated = paginateProjects(snapshot.projects, { limit: 100 })
-          const allSent = await this.sendChunkedSessions(ws, paginated.projects, {
-            totalSessions: paginated.totalSessions,
-            oldestIncludedTimestamp: paginated.oldestIncludedTimestamp,
-            oldestIncludedSessionId: paginated.oldestIncludedSessionId,
-            hasMore: paginated.hasMore,
-          })
-          state.sessionsSnapshotSent = allSent
+          await this.sendSidebarSessionsSnapshot(ws, state, snapshot.projects)
         } else {
           const allSent = await this.sendChunkedSessions(ws, snapshot.projects)
           state.sessionsSnapshotSent = allSent
@@ -985,6 +1138,10 @@ export class WsHandler {
         state.supportsSessionsPatchV1 = !!m.capabilities?.sessionsPatchV1
         state.supportsSessionsPaginationV1 = !!m.capabilities?.sessionsPaginationV1
         state.supportsUiScreenshotV1 = !!m.capabilities?.uiScreenshotV1
+        state.sidebarOpenSessionKeys = buildSidebarOpenSessionKeys(
+          m.sidebarOpenSessions ?? [],
+          this.serverInstanceId,
+        )
         if (typeof m.client?.mobile === 'boolean') {
           ws.isMobileClient = m.client.mobile
         }
@@ -1049,6 +1206,17 @@ export class WsHandler {
       case 'ui.layout.sync': {
         if (this.layoutStore) {
           this.layoutStore.updateFromUi(m, ws.connectionId || 'unknown')
+        }
+        const nextSidebarOpenSessionKeys = buildSidebarOpenSessionKeys(
+          [
+            ...collectSessionLocatorsFromUiLayouts(m.layouts),
+            ...collectFallbackSessionLocatorsFromUiTabs(m.tabs, m.layouts),
+          ],
+          this.serverInstanceId,
+        )
+        if (!sameStringSet(state.sidebarOpenSessionKeys, nextSidebarOpenSessionKeys)) {
+          state.sidebarOpenSessionKeys = nextSidebarOpenSessionKeys
+          await this.refreshSidebarSessionsSnapshot(ws, state)
         }
         return
       }
@@ -1908,7 +2076,7 @@ export class WsHandler {
         try {
           const snapshot = await this.handshakeSnapshotProvider()
           const allProjects = snapshot.projects ?? []
-          const result = paginateProjects(allProjects, { before, beforeId, limit })
+          const result = this.paginateSidebarProjects(allProjects, state, { before, beforeId, limit })
           this.safeSend(ws, {
             type: 'sessions.page',
             requestId,
@@ -1951,19 +2119,11 @@ export class WsHandler {
    * This handles backpressure per-client to avoid overwhelming mobile WebSocket buffers.
    */
   broadcastSessionsUpdated(projects: ProjectGroup[]): void {
-    // Compute paginated view once, reuse for all pagination-capable clients
-    let paginated: ReturnType<typeof paginateProjects> | null = null
     for (const ws of this.connections) {
       if (ws.readyState !== WebSocket.OPEN) continue
       const state = this.clientStates.get(ws)
       if (state?.supportsSessionsPaginationV1) {
-        if (!paginated) paginated = paginateProjects(projects, { limit: 100 })
-        void this.sendChunkedSessions(ws, paginated.projects, {
-          totalSessions: paginated.totalSessions,
-          oldestIncludedTimestamp: paginated.oldestIncludedTimestamp,
-          oldestIncludedSessionId: paginated.oldestIncludedSessionId,
-          hasMore: paginated.hasMore,
-        }, true)
+        void this.sendSidebarSessionsSnapshot(ws, state, projects, { forceClear: true })
       } else {
         void this.sendChunkedSessions(ws, projects)
       }

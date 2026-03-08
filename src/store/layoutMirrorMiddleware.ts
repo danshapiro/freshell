@@ -1,5 +1,18 @@
 import type { Middleware } from '@reduxjs/toolkit'
 import { getWsClient } from '@/lib/ws-client'
+import { isValidClaudeSessionId } from '@/lib/claude-session-id'
+
+function buildTabFallbackSessionRef(tab: {
+  mode?: string
+  codingCliProvider?: string
+  resumeSessionId?: string
+}): { provider: string; sessionId: string } | undefined {
+  const provider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
+  const sessionId = tab.resumeSessionId
+  if (!provider || !sessionId) return undefined
+  if (provider === 'claude' && !isValidClaudeSessionId(sessionId)) return undefined
+  return { provider, sessionId }
+}
 
 export const layoutMirrorMiddleware: Middleware = (store) => {
   let lastPayload = ''
@@ -10,7 +23,14 @@ export const layoutMirrorMiddleware: Middleware = (store) => {
     const state = store.getState() as any
     const payload = {
       type: 'ui.layout.sync',
-      tabs: state.tabs.tabs.map((t: any) => ({ id: t.id, title: t.title })),
+      tabs: state.tabs.tabs.map((t: any) => {
+        const fallbackSessionRef = buildTabFallbackSessionRef(t)
+        return {
+          id: t.id,
+          title: t.title,
+          ...(fallbackSessionRef ? { fallbackSessionRef } : {}),
+        }
+      }),
       activeTabId: state.tabs.activeTabId,
       layouts: state.panes.layouts,
       activePane: state.panes.activePane,
