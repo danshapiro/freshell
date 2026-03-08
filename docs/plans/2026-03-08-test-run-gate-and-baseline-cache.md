@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task.
 
-**Goal:** Serialize broad test runs across repo worktrees, show truthfully who currently holds the gate and why, and publish a bounded exact-commit baseline history that other agents can reuse without breaking existing focused-test workflows.
+**Goal:** Serialize broad test phases across repo worktrees, show truthfully who currently holds the gate and why, detect unsanctioned broad Vitest runs that bypass the sanctioned path, and publish a bounded exact-commit baseline history that other agents can reuse without breaking existing focused-test workflows.
 
-**Architecture:** Add one TypeScript wrapper script that owns kernel-lock acquisition, bounded waiting, holder metadata, last-result caching, and argv passthrough for sanctioned npm test entrypoints. Store shared advisory state in the repo's Git common dir, use `flock` on a repo-shared lock file as the only correctness primitive for broad-run serialization, and make the wrapper classify narrowed invocations (`npm test -- <files> ...`, `npm run test:server -- <files> ...`) so focused TDD runs continue to work through the normal npm scripts without entering the broad-run queue.
+**Architecture:** Add one TypeScript wrapper script that owns kernel-lock acquisition for heavyweight test phases, bounded waiting, holder metadata, last-result caching, npm-child argv parsing, and focused-run passthrough for sanctioned npm test entrypoints. Store shared advisory state in the repo's Git common dir, use `flock` on a repo-shared lock file as the only correctness primitive for sanctioned broad-test serialization, keep `check`/`verify` pre-steps outside the lock so the holder message means “tests are running,” and add a secondary process-detector for unsanctioned broad `vitest run` leaders in repo worktrees so bypassed runs become visible blockers instead of silent collisions.
 
 **Tech Stack:** Node.js, TypeScript, `tsx`, `child_process`, `fs/promises`, Git CLI, `flock`, Vitest.
 
@@ -28,6 +28,9 @@ Design decisions for implementation:
 - Accept summary input from `--summary "..."` and `FRESHELL_TEST_SUMMARY`, but fall back to an automatic placeholder instead of failing if the agent omits it.
 - Make `status` read-only in the sense that it never waits and never starts tests, but it must still perform the same immediate non-blocking `flock` probe as runners so its holder report is truthful.
 - Treat `flock` availability as a required precondition for broad gated runs. If `flock` is unavailable, the wrapper should fail fast with an actionable message rather than silently falling back to a pseudo-lock.
+- Parse forwarded args the way npm child scripts actually receive them: the wrapper must inspect its raw argv after the command key and peel off wrapper-only flags such as `--summary` directly, not rely on a literal `--` token surviving into `process.argv`.
+- Hold the gate only for heavyweight test phases. `typecheck` and `build` in `check`/`verify` remain outside the gate so an “active test run” message is literally true.
+- Add a secondary blocker for known bypass paths: detect repo-local broad `npx vitest run` / `npm exec vitest run` leaders with no explicit file targets, surface them in `status`, and refuse to start a sanctioned broad run while one is active.
 
 ## Task 1: Add shared git/run-context helpers for repo-wide gate state
 
@@ -146,7 +149,7 @@ Create `test/unit/server/test-run-gate.test.ts` with pure-function coverage for:
 - bounded result-history retention keyed by command and commit,
 - dirty-worktree exclusion from reusable results,
 - invocation classification for `broad` versus tightly-defined `narrowed`,
-- argv passthrough splitting for wrapper options versus forwarded Vitest args,
+- npm-child argv parsing for wrapper options versus forwarded Vitest args,
 - cross-platform npm invocation resolution.
 
 Seed the new test file with cases like:
@@ -160,8 +163,9 @@ import {
   classifyInvocation,
   deriveSummary,
   findReusableBaseline,
+  findUnsanctionedBroadVitest,
+  parseInvocationArgs,
   pushResultHistory,
-  splitWrapperArgs,
   resolveNpmRunner,
   type TestRunResultRecord,
 } from '../../../scripts/test-run-gate.js'
@@ -230,11 +234,20 @@ describe('test-run-gate helpers', () => {
     expect(classifyInvocation({ commandKey: 'full', forwardedArgs: ['-t', 'restores pane state'] })).toEqual({ kind: 'broad' })
   })
 
-  it('splits wrapper flags from forwarded Vitest args', () => {
-    expect(splitWrapperArgs(['--summary', 'Fix restore bug', '--', 'test/unit/server/foo.test.ts', '-t', 'restores'])).toEqual({
+  it('parses npm-child argv without relying on a literal double-dash token', () => {
+    expect(parseInvocationArgs(['--summary', 'Fix restore bug', 'test/unit/server/foo.test.ts', '-t', 'restores'])).toEqual({
       summary: 'Fix restore bug',
       forwardedArgs: ['test/unit/server/foo.test.ts', '-t', 'restores'],
     })
+  })
+
+  it('detects unsanctioned broad vitest leaders but ignores explicit file-targeted runs', () => {
+    expect(findUnsanctionedBroadVitest([
+      { pid: 101, cwd: '/repo/.worktrees/a', cmd: 'node node_modules/vitest/vitest.mjs run' },
+      { pid: 102, cwd: '/repo/.worktrees/b', cmd: 'node node_modules/vitest/vitest.mjs run test/unit/server/foo.test.ts' },
+    ])).toEqual([
+      { pid: 101, cwd: '/repo/.worktrees/a', cmd: 'node node_modules/vitest/vitest.mjs run' },
+    ])
   })
 
   it('captures summary, branch, worktree, and session identifiers in holder metadata', () => {
@@ -364,12 +377,21 @@ export function pushResultHistory(history: TestRunResultRecord[], record: TestRu
   return [record, ...withoutSameCommit].slice(0, 20)
 }
 
-export function splitWrapperArgs(argv: string[]) {
-  const forwardedIdx = argv.indexOf('--')
-  const wrapperArgs = forwardedIdx >= 0 ? argv.slice(0, forwardedIdx) : argv
-  const forwardedArgs = forwardedIdx >= 0 ? argv.slice(forwardedIdx + 1) : []
-  const summaryIdx = wrapperArgs.indexOf('--summary')
-  const summary = summaryIdx >= 0 ? wrapperArgs[summaryIdx + 1] : undefined
+export function parseInvocationArgs(argv: string[]) {
+  const args = [...argv]
+  let summary: string | undefined
+  const forwardedArgs: string[] = []
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]
+    if (arg === '--summary') {
+      summary = args[index + 1]
+      index += 1
+      continue
+    }
+    forwardedArgs.push(arg)
+  }
+
   return { summary, forwardedArgs }
 }
 
@@ -390,6 +412,13 @@ export function classifyInvocation(input: { commandKey: CommandKey; forwardedArg
   }
 
   return { kind: 'broad' as const }
+}
+
+export function findUnsanctionedBroadVitest(processes: Array<{ pid: number; cwd: string; cmd: string }>) {
+  return processes.filter(({ cmd }) => {
+    if (!/vitest(\.mjs)?\s+run\b/.test(cmd)) return false
+    return !(/\.(test|spec)\.[cm]?[jt]sx?\b/.test(cmd))
+  })
 }
 
 export function resolveNpmRunner(input: { npmExecPath?: string; platform?: NodeJS.Platform }) {
@@ -444,7 +473,7 @@ git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "feat(testing
 - Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/fixtures/test-run-gate/fake-heavy-command.ts`
 - Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/integration/server/test-run-gate.test.ts`
 
-**Step 1: Write the failing integration test for serialization, live-status probing, stale-metadata tolerance, strict narrowed passthrough, and bounded baseline history**
+**Step 1: Write the failing integration test for serialization, live-status probing, stale-metadata tolerance, strict narrowed passthrough, bounded baseline history, and unsanctioned-run detection**
 
 Create a small fixture script that sleeps briefly and exits with a requested code:
 
@@ -606,6 +635,29 @@ it('status can find an older exact-commit reusable baseline after newer runs on 
   const status = await runGateStatus({ cwd: worktreeDir })
   expect(status.stdout).toContain('matching baseline')
 })
+
+it('blocks a sanctioned broad run when an unsanctioned broad vitest leader is detected', async () => {
+  const rogue = spawnRawVitestLikeProcess({
+    cwd: secondWorktreeDir,
+    cmdlineLabel: 'npx vitest run',
+    sleepMs: 900,
+  })
+
+  await rogue.waitForOutput('rogue-broad-run-ready')
+
+  const gated = await runGateProcess({
+    cwd: worktreeDir,
+    summary: 'Legit run',
+    env: {
+      FRESHELL_TEST_GATE_FAKE_COMMAND: fixturePath,
+      FRESHELL_FAKE_HEAVY_SLEEP_MS: '50',
+    },
+  })
+
+  expect(gated.exitCode).toBe(1)
+  expect(gated.output).toContain('Unsanctioned broad Vitest run detected')
+  expect(gated.output).toContain('npx vitest run')
+})
 ```
 
 Use short poll/wait overrides so the test stays fast. Do not run the real suite in this integration harness.
@@ -626,7 +678,7 @@ Expected: FAIL because the CLI wrapper and fixture are not implemented yet.
 Finish `scripts/test-run-gate.ts` with:
 - CLI parsing for `full`, `unit`, `client`, `server`, `integration`, `check`, `verify`, `coverage`, and `status`.
 - `--summary` parsing with `FRESHELL_TEST_SUMMARY` fallback.
-- arbitrary extra-arg passthrough after `--`, preserved exactly for the underlying raw npm script.
+- arbitrary extra-arg passthrough from the wrapper’s raw child argv, preserved exactly for the underlying raw npm script.
 - session/thread detection from `CODEX_THREAD_ID` first, then other known agent session env vars if present.
 - git context discovery using `resolveGitCheckoutRoot`, `resolveGitRepoRoot`, `resolveGitCommonDir`, and Git `rev-parse HEAD`.
 - a `flock`-backed critical section rooted at `buildGatePaths(commonGitDir).lockFile`.
@@ -636,53 +688,62 @@ Finish `scripts/test-run-gate.ts` with:
 - a `status` path that performs the same immediate non-blocking `flock` probe as runners, but never waits and never starts a test command.
 - cross-platform npm execution using `process.execPath` + `process.env.npm_execpath` when available, with `npm.cmd`/`npm` fallback outside npm.
 - wrapper-managed substeps for `full`, `check`, and `verify` so forwarded args are applied deliberately to each underlying test command instead of relying on npm to propagate args through `&&`.
+- a secondary process-detector for unsanctioned broad Vitest leaders in repo worktrees, used only as an advisory blocker and status signal, never as the correctness primitive.
 
 Implement the execution mapping through private raw scripts so every sanctioned broad package-script entrypoint goes through the same gate while preserving forwarded args for the underlying Vitest step:
 
 ```ts
-const COMMANDS: Record<CommandKey, { label: string; buildSteps: (forwardedArgs: string[]) => Array<{ npmScript: string; forwardedArgs: string[] }> }> = {
+const COMMANDS: Record<CommandKey, {
+  label: string
+  preGateSteps?: (forwardedArgs: string[]) => Array<{ npmScript: string; forwardedArgs: string[] }>
+  gatedSteps: (forwardedArgs: string[]) => Array<{ npmScript: string; forwardedArgs: string[] }>
+}> = {
   full: {
     label: 'npm test',
-    buildSteps: (forwardedArgs) => [
+    gatedSteps: (forwardedArgs) => [
       { npmScript: '_test:client:all:raw', forwardedArgs: forwardedArgs.length > 0 ? [...forwardedArgs, '--passWithNoTests'] : forwardedArgs },
       { npmScript: '_test:server:all:raw', forwardedArgs: forwardedArgs.length > 0 ? [...forwardedArgs, '--passWithNoTests'] : forwardedArgs },
     ],
   },
   unit: {
     label: 'npm run test:unit',
-    buildSteps: (forwardedArgs) => [{ npmScript: '_test:unit:raw', forwardedArgs }],
+    gatedSteps: (forwardedArgs) => [{ npmScript: '_test:unit:raw', forwardedArgs }],
   },
   client: {
     label: 'npm run test:client',
-    buildSteps: (forwardedArgs) => [{ npmScript: '_test:client:raw', forwardedArgs }],
+    gatedSteps: (forwardedArgs) => [{ npmScript: '_test:client:raw', forwardedArgs }],
   },
   server: {
     label: 'npm run test:server',
-    buildSteps: (forwardedArgs) => [{ npmScript: '_test:server:raw', forwardedArgs }],
+    gatedSteps: (forwardedArgs) => [{ npmScript: '_test:server:raw', forwardedArgs }],
   },
   integration: {
     label: 'npm run test:integration',
-    buildSteps: (forwardedArgs) => [{ npmScript: '_test:integration:raw', forwardedArgs }],
+    gatedSteps: (forwardedArgs) => [{ npmScript: '_test:integration:raw', forwardedArgs }],
   },
   check: {
     label: 'npm run check',
-    buildSteps: (forwardedArgs) => [
+    preGateSteps: () => [
       { npmScript: 'typecheck', forwardedArgs: [] },
+    ],
+    gatedSteps: (forwardedArgs) => [
       { npmScript: '_test:client:all:raw', forwardedArgs: forwardedArgs.length > 0 ? [...forwardedArgs, '--passWithNoTests'] : forwardedArgs },
       { npmScript: '_test:server:all:raw', forwardedArgs: forwardedArgs.length > 0 ? [...forwardedArgs, '--passWithNoTests'] : forwardedArgs },
     ],
   },
   verify: {
     label: 'npm run verify',
-    buildSteps: (forwardedArgs) => [
+    preGateSteps: () => [
       { npmScript: 'build', forwardedArgs: [] },
+    ],
+    gatedSteps: (forwardedArgs) => [
       { npmScript: '_test:client:all:raw', forwardedArgs: forwardedArgs.length > 0 ? [...forwardedArgs, '--passWithNoTests'] : forwardedArgs },
       { npmScript: '_test:server:all:raw', forwardedArgs: forwardedArgs.length > 0 ? [...forwardedArgs, '--passWithNoTests'] : forwardedArgs },
     ],
   },
   coverage: {
     label: 'npm run test:coverage',
-    buildSteps: (forwardedArgs) => [{ npmScript: '_test:coverage:raw', forwardedArgs }],
+    gatedSteps: (forwardedArgs) => [{ npmScript: '_test:coverage:raw', forwardedArgs }],
   },
 }
 ```
@@ -714,13 +775,24 @@ async function waitForGate(paths: GatePaths, holder: HolderRecord): Promise<Gate
 
 `probeGate()` must be the single source of truth for both waiters and `status`: it attempts a non-blocking `flock` probe against the shared lock file. If the probe acquires the kernel lock, it immediately releases it and reports `free`; if the probe fails, it reports `held` and may print advisory holder metadata from `holder.json`. Leftover metadata without a held kernel lock must be ignored.
 
-Gate entry must branch on invocation shape before touching the queue:
+Before any sanctioned broad run acquires the kernel lock, the wrapper should also scan running repo/worktree processes for unsanctioned broad Vitest leaders. If one is present, refuse to start and print the same patience/wait guidance plus the detected PID/cwd/cmd. This does not replace `flock`; it only makes the known bypass path noisy and blocks sanctioned collisions against it.
+
+Gate entry must parse npm-child argv first, then branch on invocation shape before touching the queue:
 
 ```ts
+const { summary, forwardedArgs } = parseInvocationArgs(process.argv.slice(3))
 const invocation = classifyInvocation({ commandKey, forwardedArgs })
 if (invocation.kind === 'narrowed') {
   console.log('Bypassing full-suite gate for narrowed invocation')
-  return runConfiguredSteps(COMMANDS[commandKey].buildSteps(forwardedArgs))
+  return runConfiguredSteps(COMMANDS[commandKey].gatedSteps(forwardedArgs))
+}
+
+await runConfiguredSteps(COMMANDS[commandKey].preGateSteps?.(forwardedArgs) ?? [])
+const lease = await waitForGate(paths, holder)
+try {
+  return runConfiguredSteps(COMMANDS[commandKey].gatedSteps(forwardedArgs))
+} finally {
+  await lease.release()
 }
 ```
 
@@ -823,11 +895,13 @@ Adjust `AGENTS.md` and `docs/skills/testing.md` so they match the new reality:
 - `npm test` is a full gated run, not watch mode.
 - every broad non-interactive npm test script is gated when run broadly, including `test:unit`, `test:client`, `test:server`, and `test:integration`.
 - those same npm scripts still support `--` passthrough for focused TDD runs, and only explicit file-targeted narrowed invocations bypass the broad-run gate automatically.
+- `npm run check` and `npm run verify` only hold the gate during their heavyweight test phases; typecheck/build happen before lock acquisition.
 - `npm run test:status` performs a non-blocking live probe, reports an active holder only when the lease is live, and otherwise reports the latest reusable exact-commit baseline.
 - agents should set `FRESHELL_TEST_SUMMARY` or pass `--summary`.
 - private underscore-prefixed raw scripts are internal plumbing, not agent entrypoints.
 - direct `npx vitest run` is no longer the recommended workaround for focused runs because the sanctioned npm scripts preserve passthrough targeting.
 - the reusable baseline cache is a bounded per-command history keyed by commit, not just the latest run.
+- unsanctioned broad raw `npx vitest run` is now actively detected and shown as a blocker/status finding, even though the kernel lock only governs sanctioned wrapper entrypoints.
 
 Use concrete examples:
 
@@ -873,7 +947,8 @@ Extend the integration test so it checks:
 - `status` does not report a holder when only stale metadata remains,
 - explicit file-targeted narrowed invocations continue to bypass the queue and still forward their args,
 - directory-targeted or selector-only invocations stay in the queue,
-- reusable baseline lookup still finds the current commit after newer successes on other commits.
+- reusable baseline lookup still finds the current commit after newer successes on other commits,
+- unsanctioned broad raw Vitest leaders are surfaced and block sanctioned broad runs.
 
 Add assertions like:
 
@@ -917,6 +992,8 @@ Update `scripts/test-run-gate.ts` so:
 - failures are still recorded and shown as informational history, but never marked reusable,
 - `status` is read-only in the sense that it never waits and never starts tests, but it still runs the same immediate non-blocking `probeGate()` logic as waiters so it can truthfully report `held` versus `free`.
 - only explicit file-targeted narrowed invocations never enter the `flock` wait loop, but they still use the same wrapper, metadata collection, and raw-script dispatch path.
+- `check`/`verify` acquire the gate only around their heavyweight test substeps, not around `typecheck` or `build`.
+- when process detection finds an unsanctioned broad Vitest leader, `status` reports it and sanctioned broad runs refuse to start until it exits.
 
 The persisted JSON structure should stay bounded and explicit:
 
