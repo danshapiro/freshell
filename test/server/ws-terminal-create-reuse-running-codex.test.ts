@@ -271,7 +271,7 @@ describe('terminal.create reuse running codex terminal', () => {
     originalHelloTimeoutMs = process.env.HELLO_TIMEOUT_MS
     process.env.NODE_ENV = 'test'
     process.env.AUTH_TOKEN = 'testtoken-testtoken'
-    process.env.HELLO_TIMEOUT_MS = '100'
+    process.env.HELLO_TIMEOUT_MS = '500'
 
     vi.resetModules()
     const { WsHandler } = await import('../../server/ws-handler')
