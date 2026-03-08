@@ -657,10 +657,13 @@ describe('WsHandler integration: chunked handshake snapshot delivery', () => {
       expect(types).toContain('settings.updated')
       expect(types).toContain('sessions.updated')
 
-      // All session projects should have arrived across all chunks
+      // All sessions should have arrived across all chunks (projects may be split)
       const sessionMsgs = messages.filter((m) => m.type === 'sessions.updated')
-      const allProjects = sessionMsgs.flatMap((m) => m.projects)
-      expect(allProjects.length).toBe(20)
+      const allEntries = sessionMsgs.flatMap((m) => m.projects)
+      const uniquePaths = new Set(allEntries.map((p: any) => p.projectPath))
+      expect(uniquePaths.size).toBe(20)
+      const totalSessions = allEntries.reduce((sum: number, p: any) => sum + p.sessions.length, 0)
+      expect(totalSessions).toBe(100) // 20 projects × 5 sessions
 
       ws.terminate()
     } finally {

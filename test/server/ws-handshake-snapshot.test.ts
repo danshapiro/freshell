@@ -374,9 +374,13 @@ describe('ws handshake snapshot with chunking', () => {
         expect(sessionsMsgs[i].clear).toBeUndefined()
       }
 
-      // Verify all projects are included across chunks
-      const allProjects = sessionsMsgs.flatMap((m) => m.projects)
-      expect(allProjects.length).toBe(largeSnapshot.projects.length)
+      // Verify all sessions are included across chunks (projects may be split into sub-groups)
+      const allEntries = sessionsMsgs.flatMap((m) => m.projects)
+      const uniquePaths = new Set(allEntries.map((p: any) => p.projectPath))
+      expect(uniquePaths.size).toBe(largeSnapshot.projects.length)
+      const totalSessions = allEntries.reduce((sum: number, p: any) => sum + p.sessions.length, 0)
+      const expectedSessions = largeSnapshot.projects.reduce((sum, p) => sum + p.sessions.length, 0)
+      expect(totalSessions).toBe(expectedSessions)
     } finally {
       await closeWs()
     }
