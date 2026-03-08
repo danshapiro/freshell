@@ -2,6 +2,7 @@ import { useState, memo, useMemo } from 'react'
 import { ChevronRight, Loader2, Check, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import DiffView from './DiffView'
+import { getToolPreview } from './tool-preview'
 
 interface ToolBlockProps {
   name: string
@@ -11,38 +12,6 @@ interface ToolBlockProps {
   status: 'running' | 'complete'
   /** When true, tool block starts expanded (used for recent tools). Default: false. */
   initialExpanded?: boolean
-}
-
-/** Generate a context-rich one-line preview for the tool header. */
-function getToolPreview(name: string, input?: Record<string, unknown>): string {
-  if (!input) return ''
-
-  if (name === 'Bash') {
-    // Prefer description over raw command
-    if (typeof input.description === 'string') return input.description
-    if (typeof input.command === 'string') return `$ ${input.command.slice(0, 120)}`
-    return ''
-  }
-
-  if (name === 'Grep') {
-    const pattern = typeof input.pattern === 'string' ? input.pattern : ''
-    const path = typeof input.path === 'string' ? input.path : ''
-    return path ? `${pattern} in ${path}` : pattern
-  }
-
-  if ((name === 'Read' || name === 'Write' || name === 'Edit') && typeof input.file_path === 'string') {
-    return input.file_path
-  }
-
-  if (name === 'Glob' && typeof input.pattern === 'string') {
-    return input.pattern
-  }
-
-  if ((name === 'WebFetch' || name === 'WebSearch') && typeof input.url === 'string') {
-    return input.url
-  }
-
-  return JSON.stringify(input).slice(0, 100)
 }
 
 /** Generate a short result summary (e.g. "143 lines", "5 matches", "error"). */

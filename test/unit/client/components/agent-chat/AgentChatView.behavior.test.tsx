@@ -251,9 +251,14 @@ describe('AgentChatView turn-pairing edge cases', () => {
 })
 
 describe('AgentChatView auto-expand', () => {
-  afterEach(cleanup)
+  afterEach(() => {
+    cleanup()
+    localStorage.removeItem('freshell:toolStripExpanded')
+  })
 
   it('auto-expands the most recent tool blocks', () => {
+    // Tool strips are collapsed by default; set expanded to test auto-expand behavior
+    localStorage.setItem('freshell:toolStripExpanded', 'true')
     const store = makeStore()
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     // Create a turn with 5 completed tools

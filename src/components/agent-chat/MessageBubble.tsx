@@ -2,12 +2,17 @@ import { memo, useMemo } from 'react'
 import { cn } from '@/lib/utils'
 import type { ChatContentBlock } from '@/store/agentChatTypes'
 import { LazyMarkdown } from '@/components/markdown/LazyMarkdown'
-import ToolBlock from './ToolBlock'
+import ToolStrip, { type ToolPair } from './ToolStrip'
 
 /** Strip SDK-injected <system-reminder>...</system-reminder> tags from text. */
 function stripSystemReminders(text: string): string {
   return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
 }
+
+type RenderGroup =
+  | { kind: 'text'; block: ChatContentBlock; index: number }
+  | { kind: 'thinking'; block: ChatContentBlock; index: number }
+  | { kind: 'tools'; pairs: ToolPair[]; startIndex: number; toolGroupIndex: number }
 
 interface MessageBubbleProps {
   role: 'user' | 'assistant'
@@ -39,9 +44,7 @@ function MessageBubble({
   completedToolOffset,
   autoExpandAbove,
 }: MessageBubbleProps) {
-  // Pair tool_use blocks with their tool_result blocks for unified rendering.
-  // This allows ToolBlock to show the tool name, input preview, AND result
-  // summary in one place, instead of rendering them as separate blocks.
+  // Build a map of tool_use_id -> tool_result for pairing
   const resultMap = useMemo(() => {
     const map = new Map<string, ChatContentBlock>()
     for (const block of content) {
@@ -52,32 +55,113 @@ function MessageBubble({
     return map
   }, [content])
 
-  // Check if any blocks will be visible after applying toggle filters.
-  // If not, skip rendering the wrapper entirely to avoid empty bordered divs.
-  const hasVisibleContent = useMemo(() => {
-    return content.some((block) => {
-      if (block.type === 'text' && block.text) return true
-      if (block.type === 'thinking' && block.thinking && showThinking) return true
-      if (block.type === 'tool_use' && block.name && showTools) return true
-      if (block.type === 'tool_result' && showTools) return true
-      return false
-    })
-  }, [content, showThinking, showTools])
+  // Group content blocks into render groups: text, thinking, or contiguous tool runs.
+  const groups = useMemo(() => {
+    const result: RenderGroup[] = []
+    let currentToolPairs: ToolPair[] | null = null
+    let toolStartIndex = 0
+    let toolGroupCount = 0
 
-  // Pre-compute which tool_use blocks should auto-expand based on global index.
-  // Only completed tools (those with a matching result) consume expand slots.
-  const expandSet = useMemo(() => {
-    if (autoExpandAbove == null) return new Set<string>()
-    const set = new Set<string>()
-    let idx = completedToolOffset ?? 0
-    for (const block of content) {
-      if (block.type === 'tool_use' && block.id && resultMap.has(block.id)) {
-        if (idx >= autoExpandAbove) set.add(block.id)
-        idx++
+    const flushTools = () => {
+      if (currentToolPairs && currentToolPairs.length > 0) {
+        result.push({ kind: 'tools', pairs: currentToolPairs, startIndex: toolStartIndex, toolGroupIndex: toolGroupCount++ })
+      }
+      currentToolPairs = null
+    }
+
+    for (let i = 0; i < content.length; i++) {
+      const block = content[i]
+
+      if (block.type === 'tool_use' && block.name) {
+        if (!currentToolPairs) {
+          currentToolPairs = []
+          toolStartIndex = i
+        }
+        // Look up the matching tool_result
+        const resultBlock = block.id ? resultMap.get(block.id) : undefined
+        const rawResult = resultBlock
+          ? (typeof resultBlock.content === 'string' ? resultBlock.content : JSON.stringify(resultBlock.content))
+          : undefined
+        const resultContent = rawResult ? stripSystemReminders(rawResult) : undefined
+
+        currentToolPairs.push({
+          id: block.id || `tool-${i}`,
+          name: block.name,
+          input: block.input,
+          output: resultContent,
+          isError: resultBlock?.is_error,
+          status: resultBlock ? 'complete' : isLastMessage ? 'running' : 'complete',
+        })
+        continue
+      }
+
+      if (block.type === 'tool_result') {
+        // If we're in a tool group, skip (already consumed via resultMap pairing above).
+        if (currentToolPairs) continue
+
+        // If it has a matching tool_use elsewhere in this message, skip (already consumed)
+        if (block.tool_use_id && content.some(b => b.type === 'tool_use' && b.id === block.tool_use_id)) {
+          continue
+        }
+
+        // Orphaned result: render as standalone tool strip
+        const raw = typeof block.content === 'string'
+          ? block.content
+          : block.content != null ? JSON.stringify(block.content) : ''
+        const resultContent = raw ? stripSystemReminders(raw) : undefined
+        result.push({
+          kind: 'tools',
+          pairs: [{
+            id: block.tool_use_id || `orphan-${i}`,
+            name: 'Result',
+            output: resultContent,
+            isError: block.is_error,
+            status: 'complete',
+          }],
+          startIndex: i,
+          toolGroupIndex: toolGroupCount++,
+        })
+        continue
+      }
+
+      // Non-tool block: flush any pending tool group
+      flushTools()
+
+      if (block.type === 'text' && block.text) {
+        result.push({ kind: 'text', block, index: i })
+      } else if (block.type === 'thinking' && block.thinking) {
+        result.push({ kind: 'thinking', block, index: i })
       }
     }
-    return set
-  }, [content, resultMap, completedToolOffset, autoExpandAbove])
+
+    // Flush any trailing tool group
+    flushTools()
+
+    return result
+  }, [content, resultMap, isLastMessage])
+
+  // Check if any blocks will be visible after applying toggle filters.
+  const hasVisibleContent = useMemo(() => {
+    return groups.some((group) => {
+      if (group.kind === 'text') return true
+      if (group.kind === 'thinking' && showThinking) return true
+      if (group.kind === 'tools' && showTools) return true
+      return false
+    })
+  }, [groups, showThinking, showTools])
+
+  // Track completed tool offset across tool groups for auto-expand
+  const toolGroupOffsets = useMemo(() => {
+    const offsets: number[] = []
+    let offset = completedToolOffset ?? 0
+    for (const group of groups) {
+      if (group.kind === 'tools') {
+        offsets.push(offset)
+        offset += group.pairs.filter(p => p.status === 'complete').length
+      }
+    }
+    return offsets
+  }, [groups, completedToolOffset])
 
   if (!hasVisibleContent) return null
 
@@ -92,72 +176,43 @@ function MessageBubble({
       role="article"
       aria-label={`${role} message`}
     >
-      {content.map((block, i) => {
-        if (block.type === 'text' && block.text) {
+      {groups.map((group) => {
+        if (group.kind === 'text') {
           if (role === 'user') {
-            return <p key={i} className="whitespace-pre-wrap">{block.text}</p>
+            return <p key={group.index} className="whitespace-pre-wrap">{group.block.text}</p>
           }
           return (
-            <div key={i} className="prose prose-sm dark:prose-invert max-w-none">
+            <div key={group.index} className="prose prose-sm dark:prose-invert max-w-none">
               <LazyMarkdown
-                content={block.text}
-                fallback={<p className="whitespace-pre-wrap">{block.text}</p>}
+                content={group.block.text!}
+                fallback={<p className="whitespace-pre-wrap">{group.block.text}</p>}
               />
             </div>
           )
         }
 
-        if (block.type === 'thinking' && block.thinking) {
+        if (group.kind === 'thinking') {
           if (!showThinking) return null
           return (
-            <details key={i} className="text-xs text-muted-foreground mt-1">
+            <details key={group.index} className="text-xs text-muted-foreground mt-1">
               <summary className="cursor-pointer select-none">
-                Thinking ({block.thinking.length.toLocaleString()} chars)
+                Thinking ({group.block.thinking!.length.toLocaleString()} chars)
               </summary>
-              <pre className="mt-1 whitespace-pre-wrap text-xs opacity-70">{block.thinking}</pre>
+              <pre className="mt-1 whitespace-pre-wrap text-xs opacity-70">{group.block.thinking}</pre>
             </details>
           )
         }
 
-        if (block.type === 'tool_use' && block.name) {
+        if (group.kind === 'tools') {
           if (!showTools) return null
-          // Look up the matching tool_result to show as a unified block
-          const result = block.id ? resultMap.get(block.id) : undefined
-          const rawResult = result
-            ? (typeof result.content === 'string' ? result.content : JSON.stringify(result.content))
-            : undefined
-          const resultContent = rawResult ? stripSystemReminders(rawResult) : undefined
+          const isStreaming = isLastMessage && group.pairs.some(p => p.status === 'running')
           return (
-            <ToolBlock
-              key={block.id || i}
-              name={block.name}
-              input={block.input}
-              output={resultContent}
-              isError={result?.is_error}
-              status={result ? 'complete' : isLastMessage ? 'running' : 'complete'}
-              initialExpanded={block.id ? expandSet.has(block.id) : false}
-            />
-          )
-        }
-
-        if (block.type === 'tool_result') {
-          if (!showTools) return null
-          // Skip if already merged into a matching tool_use block above
-          if (block.tool_use_id && content.some(b => b.type === 'tool_use' && b.id === block.tool_use_id)) {
-            return null
-          }
-          // Render orphaned results (no matching tool_use) as standalone
-          const raw = typeof block.content === 'string'
-            ? block.content
-            : block.content != null ? JSON.stringify(block.content) : ''
-          const resultContent = raw ? stripSystemReminders(raw) : undefined
-          return (
-            <ToolBlock
-              key={block.tool_use_id || i}
-              name="Result"
-              output={resultContent}
-              isError={block.is_error}
-              status="complete"
+            <ToolStrip
+              key={`tools-${group.startIndex}`}
+              pairs={group.pairs}
+              isStreaming={isStreaming}
+              completedToolOffset={toolGroupOffsets[group.toolGroupIndex]}
+              autoExpandAbove={autoExpandAbove}
             />
           )
         }
