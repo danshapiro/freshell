@@ -3,7 +3,9 @@ import type { ProjectGroup } from './types'
 
 function normalizeProjects(payload: unknown): ProjectGroup[] {
   if (!Array.isArray(payload)) return []
-  const out: ProjectGroup[] = []
+  // Use a Map to merge entries that share a projectPath (happens when the
+  // server splits an oversized project across multiple WebSocket chunks).
+  const merged = new Map<string, ProjectGroup>()
   for (const raw of payload as any[]) {
     if (!raw || typeof raw !== 'object') continue
     const projectPath = (raw as any).projectPath
@@ -13,9 +15,16 @@ function normalizeProjects(payload: unknown): ProjectGroup[] {
       ? sessionsRaw.filter((s) => !!s && typeof s === 'object' && !Array.isArray(s))
       : []
     const color = typeof (raw as any).color === 'string' ? (raw as any).color : undefined
-    out.push({ projectPath, sessions, ...(color ? { color } : {}) } as ProjectGroup)
+    const existing = merged.get(projectPath)
+    if (existing) {
+      const seen = new Set(existing.sessions.map((s: any) => s.sessionId))
+      existing.sessions.push(...sessions.filter((s: any) => !seen.has(s.sessionId)))
+      if (color && !existing.color) existing.color = color
+    } else {
+      merged.set(projectPath, { projectPath, sessions, ...(color ? { color } : {}) } as ProjectGroup)
+    }
   }
-  return out
+  return Array.from(merged.values())
 }
 
 function projectNewestUpdatedAt(project: ProjectGroup): number {

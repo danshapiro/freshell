@@ -523,6 +523,87 @@ describe('sessionsSlice', () => {
       expect(state.expandedProjects.size).toBe(0)
     })
 
+    it('merges duplicate projectPath entries from split chunks', () => {
+      // When chunkProjects splits an oversized project, multiple entries share
+      // the same projectPath. normalizeProjects must merge their sessions.
+      const splitChunks: ProjectGroup[] = [
+        {
+          projectPath: '/large/project',
+          sessions: [
+            { sessionId: 's1', projectPath: '/large/project', updatedAt: 1 },
+            { sessionId: 's2', projectPath: '/large/project', updatedAt: 2 },
+          ],
+        },
+        {
+          projectPath: '/large/project',
+          sessions: [
+            { sessionId: 's3', projectPath: '/large/project', updatedAt: 3 },
+          ],
+        },
+        {
+          projectPath: '/other/project',
+          sessions: [
+            { sessionId: 's4', projectPath: '/other/project', updatedAt: 4 },
+          ],
+        },
+      ]
+
+      const state = sessionsReducer(initialState, setProjects(splitChunks))
+      expect(state.projects).toHaveLength(2)
+
+      const large = state.projects.find(p => p.projectPath === '/large/project')!
+      expect(large.sessions).toHaveLength(3)
+      expect(large.sessions.map((s: any) => s.sessionId)).toEqual(['s1', 's2', 's3'])
+
+      const other = state.projects.find(p => p.projectPath === '/other/project')!
+      expect(other.sessions).toHaveLength(1)
+    })
+
+    it('preserves color from first entry when merging duplicate projectPaths', () => {
+      const splitChunks: ProjectGroup[] = [
+        {
+          projectPath: '/colored/project',
+          sessions: [{ sessionId: 's1', projectPath: '/colored/project', updatedAt: 1 }],
+          color: '#ff0000',
+        },
+        {
+          projectPath: '/colored/project',
+          sessions: [{ sessionId: 's2', projectPath: '/colored/project', updatedAt: 2 }],
+        },
+      ]
+
+      const state = sessionsReducer(initialState, setProjects(splitChunks))
+      expect(state.projects).toHaveLength(1)
+      expect(state.projects[0].color).toBe('#ff0000')
+      expect(state.projects[0].sessions).toHaveLength(2)
+    })
+
+    it('deduplicates sessions by sessionId when merging split chunks', () => {
+      // If overlapping chunks arrive (e.g., reconnect/retry), duplicate
+      // sessionIds should not produce duplicate entries.
+      const overlapping: ProjectGroup[] = [
+        {
+          projectPath: '/project/dup',
+          sessions: [
+            { sessionId: 's1', projectPath: '/project/dup', updatedAt: 1 },
+            { sessionId: 's2', projectPath: '/project/dup', updatedAt: 2 },
+          ],
+        },
+        {
+          projectPath: '/project/dup',
+          sessions: [
+            { sessionId: 's2', projectPath: '/project/dup', updatedAt: 2 },
+            { sessionId: 's3', projectPath: '/project/dup', updatedAt: 3 },
+          ],
+        },
+      ]
+
+      const state = sessionsReducer(initialState, setProjects(overlapping))
+      const project = state.projects.find(p => p.projectPath === '/project/dup')!
+      expect(project.sessions).toHaveLength(3)
+      expect(project.sessions.map((s: any) => s.sessionId)).toEqual(['s1', 's2', 's3'])
+    })
+
     it('filters non-object session entries to prevent downstream crashes', () => {
       const bad: ProjectGroup[] = [
         {
