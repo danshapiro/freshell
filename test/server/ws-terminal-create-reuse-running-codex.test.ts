@@ -227,6 +227,7 @@ describe('terminal.create reuse running codex terminal', () => {
       await waitForMessage(ws, (m) => m.type === 'ready')
 
       const requestId = 'codex-reuse-1'
+      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId,
@@ -234,7 +235,7 @@ describe('terminal.create reuse running codex terminal', () => {
         resumeSessionId: CODEX_SESSION_ID,
       }))
 
-      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+      const created = await createdPromise
       const preAttachMsgs = await collectMessages(ws, 150)
 
       expect(created.terminalId).toBe('term-codex-existing')
@@ -242,6 +243,10 @@ describe('terminal.create reuse running codex terminal', () => {
       expect(registry.attachCalls).toHaveLength(0)
       expect(registry.createCalls).toHaveLength(0)
 
+      const readyPromise = waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'reuse-existing-codex-attach',
+      )
       ws.send(JSON.stringify({
         type: 'terminal.attach',
         terminalId: created.terminalId,
@@ -250,10 +255,7 @@ describe('terminal.create reuse running codex terminal', () => {
         rows: 40,
         attachRequestId: 'reuse-existing-codex-attach',
       }))
-      const ready = await waitForMessage(
-        ws,
-        (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'reuse-existing-codex-attach',
-      )
+      const ready = await readyPromise
       expect(ready.headSeq).toBeGreaterThanOrEqual(0)
       expect(registry.attachCalls).toHaveLength(1)
       expect(registry.attachCalls[0]?.terminalId).toBe('term-codex-existing')
@@ -269,17 +271,24 @@ describe('terminal.create reuse running codex terminal', () => {
       ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
       await waitForMessage(ws, (m) => m.type === 'ready')
 
+      const createdPromise = waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.created' && m.requestId === 'reuse-canonical-split',
+      )
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId: 'reuse-canonical-split',
         mode: 'codex',
         resumeSessionId: CODEX_SESSION_ID,
       }))
-
-      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === 'reuse-canonical-split')
+      const created = await createdPromise
       const preAttachMsgs = await collectMessages(ws, 150)
       expect(preAttachMsgs.some((m) => m.type === 'terminal.attach.ready' && m.terminalId === created.terminalId)).toBe(false)
 
+      const readyPromise = waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'reuse-canonical-split-attach',
+      )
       ws.send(JSON.stringify({
         type: 'terminal.attach',
         terminalId: created.terminalId,
@@ -288,10 +297,7 @@ describe('terminal.create reuse running codex terminal', () => {
         rows: 40,
         attachRequestId: 'reuse-canonical-split-attach',
       }))
-      const ready = await waitForMessage(
-        ws,
-        (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'reuse-canonical-split-attach',
-      )
+      const ready = await readyPromise
       expect(ready.terminalId).toBe(created.terminalId)
     } finally {
       ws.close()
@@ -305,34 +311,40 @@ describe('terminal.create reuse running codex terminal', () => {
       ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
       await waitForMessage(ws, (m) => m.type === 'ready')
 
+      const firstCreatedPromise = waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.created' && m.requestId === 'reuse-existingId-split',
+      )
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId: 'reuse-existingId-split',
         mode: 'codex',
         resumeSessionId: CODEX_SESSION_ID,
       }))
-      const firstCreated = await waitForMessage(
-        ws,
-        (m) => m.type === 'terminal.created' && m.requestId === 'reuse-existingId-split',
-      )
+      const firstCreated = await firstCreatedPromise
       const firstMsgs = await collectMessages(ws, 150)
       expect(firstMsgs.some((m) => m.type === 'terminal.attach.ready' && m.terminalId === firstCreated.terminalId)).toBe(false)
 
+      const secondCreatedPromise = waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.created' && m.requestId === 'reuse-existingId-split',
+      )
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId: 'reuse-existingId-split',
         mode: 'codex',
         resumeSessionId: CODEX_SESSION_ID,
       }))
-      const secondCreated = await waitForMessage(
-        ws,
-        (m) => m.type === 'terminal.created' && m.requestId === 'reuse-existingId-split',
-      )
+      const secondCreated = await secondCreatedPromise
       expect(secondCreated.terminalId).toBe(firstCreated.terminalId)
 
       const secondMsgs = await collectMessages(ws, 150)
       expect(secondMsgs.some((m) => m.type === 'terminal.attach.ready' && m.terminalId === firstCreated.terminalId)).toBe(false)
 
+      const readyPromise = waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'reuse-existingId-split-attach',
+      )
       ws.send(JSON.stringify({
         type: 'terminal.attach',
         terminalId: firstCreated.terminalId,
@@ -341,10 +353,7 @@ describe('terminal.create reuse running codex terminal', () => {
         rows: 40,
         attachRequestId: 'reuse-existingId-split-attach',
       }))
-      const ready = await waitForMessage(
-        ws,
-        (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'reuse-existingId-split-attach',
-      )
+      const ready = await readyPromise
       expect(ready.terminalId).toBe(firstCreated.terminalId)
     } finally {
       ws.close()
@@ -359,14 +368,14 @@ describe('terminal.create reuse running codex terminal', () => {
       await waitForMessage(ws, (m) => m.type === 'ready')
 
       const requestId = 'codex-reuse-2'
+      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId,
         mode: 'codex',
         resumeSessionId: CODEX_SESSION_ID,
       }))
-
-      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+      const created = await createdPromise
       expect(created.effectiveResumeSessionId).toBe(CODEX_SESSION_ID)
     } finally {
       ws.close()
@@ -398,14 +407,14 @@ describe('terminal.create reuse running codex terminal', () => {
       }) as any
 
       const requestId = 'codex-reuse-repair'
+      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId,
         mode: 'codex',
         resumeSessionId: CODEX_SESSION_ID,
       }))
-
-      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+      const created = await createdPromise
 
       expect(created.terminalId).toBe('term-canonical')
       expect(dupeRegistry.createCalls).toHaveLength(0)
