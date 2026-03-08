@@ -1,4 +1,5 @@
-import { PanelLeft, Plus } from 'lucide-react'
+import { ChevronLeft, ChevronRight, PanelLeft, Plus } from 'lucide-react'
+import { cn } from '@/lib/utils'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, closeTab, setActiveTab, updateTab, reorderTabs, clearTabRenameRequest } from '@/store/tabsSlice'
 import { clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
@@ -242,7 +243,15 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [activeTabId, tabs, dispatch])
 
-  const { callbackRef, canScrollLeft, canScrollRight } = useTabBarScroll(activeTabId, tabs.length)
+  const {
+    callbackRef,
+    canScrollLeft,
+    canScrollRight,
+    handleArrowClick,
+    startHoldScroll,
+    stopHoldScroll,
+    cancelHoldScroll,
+  } = useTabBarScroll(activeTabId, tabs.length)
 
   const activeTab = activeId ? tabs.find((t: Tab) => t.id === activeId) : null
 
@@ -280,13 +289,23 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
           strategy={horizontalListSortingStrategy}
         >
           <div className="relative z-10 flex items-end flex-1 min-w-0">
-            {/* Overflow indicator: left */}
-            {canScrollLeft && (
-              <div
-                className="pointer-events-none absolute left-0 top-0 bottom-0 w-8 z-20 bg-gradient-to-r from-background to-transparent"
-                aria-hidden="true"
-              />
-            )}
+            {/* Left arrow button -- always rendered; collapses to w-0 when not needed to reclaim space */}
+            <button
+              className={cn(
+                'flex-shrink-0 flex items-center justify-center h-8 text-muted-foreground hover:text-foreground transition-all duration-150',
+                canScrollLeft ? 'w-6' : 'w-0 overflow-hidden opacity-0 pointer-events-none',
+              )}
+              aria-label="Scroll tabs left"
+              aria-hidden={canScrollLeft ? undefined : true}
+              tabIndex={canScrollLeft ? 0 : -1}
+              onClick={() => handleArrowClick('left')}
+              onPointerDown={() => startHoldScroll('left')}
+              onPointerUp={stopHoldScroll}
+              onPointerLeave={cancelHoldScroll}
+              onPointerCancel={cancelHoldScroll}
+            >
+              <ChevronLeft className="h-4 w-4" />
+            </button>
 
             {/* Scrollable tab strip */}
             <div
@@ -372,13 +391,23 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
               ))}
             </div>
 
-            {/* Overflow indicator: right */}
-            {canScrollRight && (
-              <div
-                className="pointer-events-none absolute right-0 top-0 bottom-0 w-8 z-20 bg-gradient-to-l from-background to-transparent"
-                aria-hidden="true"
-              />
-            )}
+            {/* Right arrow button -- always rendered; collapses to w-0 when not needed to reclaim space */}
+            <button
+              className={cn(
+                'flex-shrink-0 flex items-center justify-center h-8 text-muted-foreground hover:text-foreground transition-all duration-150',
+                canScrollRight ? 'w-6' : 'w-0 overflow-hidden opacity-0 pointer-events-none',
+              )}
+              aria-label="Scroll tabs right"
+              aria-hidden={canScrollRight ? undefined : true}
+              tabIndex={canScrollRight ? 0 : -1}
+              onClick={() => handleArrowClick('right')}
+              onPointerDown={() => startHoldScroll('right')}
+              onPointerUp={stopHoldScroll}
+              onPointerLeave={cancelHoldScroll}
+              onPointerCancel={cancelHoldScroll}
+            >
+              <ChevronRight className="h-4 w-4" />
+            </button>
           </div>
         </SortableContext>
 

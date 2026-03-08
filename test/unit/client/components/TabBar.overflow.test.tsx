@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import TabBar from '@/components/TabBar'
@@ -10,14 +10,18 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import type { Tab } from '@/store/types'
 
-// Mock the ws-client module
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({ send: vi.fn() }),
 }))
 
-// Mock useTabBarScroll to control overflow state
 const mockCallbackRef = vi.fn()
 const mockScrollToTab = vi.fn()
+const mockScrollJumpLeft = vi.fn()
+const mockScrollJumpRight = vi.fn()
+const mockHandleArrowClick = vi.fn()
+const mockStartHoldScroll = vi.fn()
+const mockStopHoldScroll = vi.fn()
+const mockCancelHoldScroll = vi.fn()
 let mockCanScrollLeft = false
 let mockCanScrollRight = false
 
@@ -27,6 +31,12 @@ vi.mock('@/hooks/useTabBarScroll', () => ({
     canScrollLeft: mockCanScrollLeft,
     canScrollRight: mockCanScrollRight,
     scrollToTab: mockScrollToTab,
+    scrollJumpLeft: mockScrollJumpLeft,
+    scrollJumpRight: mockScrollJumpRight,
+    handleArrowClick: mockHandleArrowClick,
+    startHoldScroll: mockStartHoldScroll,
+    stopHoldScroll: mockStopHoldScroll,
+    cancelHoldScroll: mockCancelHoldScroll,
   }),
 }))
 
@@ -66,63 +76,24 @@ function renderWithStore(ui: React.ReactElement, store: ReturnType<typeof create
   return render(<Provider store={store}>{ui}</Provider>)
 }
 
-describe('TabBar overflow indicators', () => {
-  beforeEach(() => {
-    mockCanScrollLeft = false
-    mockCanScrollRight = false
-    mockCallbackRef.mockClear()
-    mockScrollToTab.mockClear()
-  })
+beforeEach(() => {
+  mockCanScrollLeft = false
+  mockCanScrollRight = false
+  mockCallbackRef.mockClear()
+  mockScrollToTab.mockClear()
+  mockScrollJumpLeft.mockClear()
+  mockScrollJumpRight.mockClear()
+  mockHandleArrowClick.mockClear()
+  mockStartHoldScroll.mockClear()
+  mockStopHoldScroll.mockClear()
+  mockCancelHoldScroll.mockClear()
+})
 
-  afterEach(() => cleanup())
+afterEach(() => cleanup())
 
-  it('renders no gradient overlays when both canScrollLeft and canScrollRight are false', () => {
-    mockCanScrollLeft = false
-    mockCanScrollRight = false
+describe('TabBar overflow — hard clip (no gradients)', () => {
 
-    const tab = createTab({ id: 'tab-1' })
-    const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
-    const { container } = renderWithStore(<TabBar />, store)
-
-    const leftGradient = container.querySelector('.bg-gradient-to-r')
-    const rightGradient = container.querySelector('.bg-gradient-to-l')
-    expect(leftGradient).toBeNull()
-    expect(rightGradient).toBeNull()
-  })
-
-  it('renders right gradient when canScrollRight is true', () => {
-    mockCanScrollLeft = false
-    mockCanScrollRight = true
-
-    const tab = createTab({ id: 'tab-1' })
-    const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
-    const { container } = renderWithStore(<TabBar />, store)
-
-    const leftGradient = container.querySelector('.bg-gradient-to-r')
-    const rightGradient = container.querySelector('.bg-gradient-to-l')
-    expect(leftGradient).toBeNull()
-    expect(rightGradient).not.toBeNull()
-    expect(rightGradient?.getAttribute('aria-hidden')).toBe('true')
-    expect(rightGradient?.className).toContain('pointer-events-none')
-  })
-
-  it('renders left gradient when canScrollLeft is true', () => {
-    mockCanScrollLeft = true
-    mockCanScrollRight = false
-
-    const tab = createTab({ id: 'tab-1' })
-    const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
-    const { container } = renderWithStore(<TabBar />, store)
-
-    const leftGradient = container.querySelector('.bg-gradient-to-r')
-    const rightGradient = container.querySelector('.bg-gradient-to-l')
-    expect(leftGradient).not.toBeNull()
-    expect(leftGradient?.getAttribute('aria-hidden')).toBe('true')
-    expect(leftGradient?.className).toContain('pointer-events-none')
-    expect(rightGradient).toBeNull()
-  })
-
-  it('renders both gradients when both overflow directions are true', () => {
+  it('never renders gradient overlays regardless of overflow state', () => {
     mockCanScrollLeft = true
     mockCanScrollRight = true
 
@@ -130,36 +101,168 @@ describe('TabBar overflow indicators', () => {
     const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
     const { container } = renderWithStore(<TabBar />, store)
 
-    const leftGradient = container.querySelector('.bg-gradient-to-r')
-    const rightGradient = container.querySelector('.bg-gradient-to-l')
-    expect(leftGradient).not.toBeNull()
-    expect(rightGradient).not.toBeNull()
-    expect(leftGradient?.getAttribute('aria-hidden')).toBe('true')
-    expect(rightGradient?.getAttribute('aria-hidden')).toBe('true')
+    expect(container.querySelector('.bg-gradient-to-r')).toBeNull()
+    expect(container.querySelector('.bg-gradient-to-l')).toBeNull()
   })
 
-  it('gradient overlays are non-interactive (pointer-events-none)', () => {
-    mockCanScrollLeft = true
-    mockCanScrollRight = true
-
+  it('scrollable container uses overflow-x-auto for hard clip', () => {
     const tab = createTab({ id: 'tab-1' })
     const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
     const { container } = renderWithStore(<TabBar />, store)
 
-    const leftGradient = container.querySelector('.bg-gradient-to-r')
-    const rightGradient = container.querySelector('.bg-gradient-to-l')
-    expect(leftGradient?.className).toContain('pointer-events-none')
-    expect(rightGradient?.className).toContain('pointer-events-none')
+    const scrollContainer = container.querySelector('.overflow-x-auto')
+    expect(scrollContainer).not.toBeNull()
   })
 
-  it('+ button remains keyboard-reachable outside scroll area', () => {
+  it('+ button remains pinned and always visible outside scroll area', () => {
     const tab = createTab({ id: 'tab-1' })
     const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
     renderWithStore(<TabBar />, store)
 
     const addButton = screen.getByRole('button', { name: 'New shell tab' })
     expect(addButton).toBeInTheDocument()
-    // Button should be a real <button> element (inherently keyboard-focusable)
     expect(addButton.tagName).toBe('BUTTON')
+    const scrollContainer = addButton.closest('.overflow-x-auto')
+    expect(scrollContainer).toBeNull()
+  })
+})
+
+describe('TabBar arrow navigation buttons', () => {
+
+  it('hides both arrow buttons when tabs do not overflow', () => {
+    mockCanScrollLeft = false
+    mockCanScrollRight = false
+
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
+    renderWithStore(<TabBar />, store)
+
+    // Buttons are always in the DOM but hidden via aria-hidden + pointer-events-none
+    const leftBtn = screen.getByLabelText('Scroll tabs left')
+    const rightBtn = screen.getByLabelText('Scroll tabs right')
+    expect(leftBtn.getAttribute('aria-hidden')).toBe('true')
+    expect(rightBtn.getAttribute('aria-hidden')).toBe('true')
+    expect(leftBtn.className).toContain('pointer-events-none')
+    expect(rightBtn.className).toContain('pointer-events-none')
+  })
+
+  it('shows right arrow button when tabs overflow to the right', () => {
+    mockCanScrollLeft = false
+    mockCanScrollRight = true
+
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
+    renderWithStore(<TabBar />, store)
+
+    const leftBtn = screen.getByLabelText('Scroll tabs left')
+    const rightBtn = screen.getByLabelText('Scroll tabs right')
+    expect(leftBtn.getAttribute('aria-hidden')).toBe('true')
+    expect(leftBtn.className).toContain('pointer-events-none')
+    expect(rightBtn.getAttribute('aria-hidden')).not.toBe('true')
+    expect(rightBtn.className).not.toContain('pointer-events-none')
+  })
+
+  it('shows left arrow button when tabs overflow to the left', () => {
+    mockCanScrollLeft = true
+    mockCanScrollRight = false
+
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
+    renderWithStore(<TabBar />, store)
+
+    const leftBtn = screen.getByLabelText('Scroll tabs left')
+    const rightBtn = screen.getByLabelText('Scroll tabs right')
+    expect(leftBtn.getAttribute('aria-hidden')).not.toBe('true')
+    expect(leftBtn.className).not.toContain('pointer-events-none')
+    expect(rightBtn.getAttribute('aria-hidden')).toBe('true')
+    expect(rightBtn.className).toContain('pointer-events-none')
+  })
+
+  it('shows both arrow buttons when tabs overflow in both directions', () => {
+    mockCanScrollLeft = true
+    mockCanScrollRight = true
+
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
+    renderWithStore(<TabBar />, store)
+
+    const leftBtn = screen.getByLabelText('Scroll tabs left')
+    const rightBtn = screen.getByLabelText('Scroll tabs right')
+    expect(leftBtn.getAttribute('aria-hidden')).not.toBe('true')
+    expect(rightBtn.getAttribute('aria-hidden')).not.toBe('true')
+    expect(leftBtn.className).not.toContain('pointer-events-none')
+    expect(rightBtn.className).not.toContain('pointer-events-none')
+  })
+
+  it('click on right arrow calls handleArrowClick with right', () => {
+    mockCanScrollRight = true
+
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
+    renderWithStore(<TabBar />, store)
+
+    const rightArrow = screen.getByLabelText('Scroll tabs right')
+    fireEvent.click(rightArrow)
+
+    expect(mockHandleArrowClick).toHaveBeenCalledWith('right')
+  })
+
+  it('click on left arrow calls handleArrowClick with left', () => {
+    mockCanScrollLeft = true
+
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
+    renderWithStore(<TabBar />, store)
+
+    const leftArrow = screen.getByLabelText('Scroll tabs left')
+    fireEvent.click(leftArrow)
+
+    expect(mockHandleArrowClick).toHaveBeenCalledWith('left')
+  })
+
+  it('arrow buttons have accessible aria-labels and are semantic buttons', () => {
+    mockCanScrollLeft = true
+    mockCanScrollRight = true
+
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
+    renderWithStore(<TabBar />, store)
+
+    const leftBtn = screen.getByLabelText('Scroll tabs left')
+    const rightBtn = screen.getByLabelText('Scroll tabs right')
+
+    expect(leftBtn.tagName).toBe('BUTTON')
+    expect(rightBtn.tagName).toBe('BUTTON')
+  })
+
+  it('arrow buttons are outside the scrollable container', () => {
+    mockCanScrollLeft = true
+    mockCanScrollRight = true
+
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
+    renderWithStore(<TabBar />, store)
+
+    const leftBtn = screen.getByLabelText('Scroll tabs left')
+    const rightBtn = screen.getByLabelText('Scroll tabs right')
+
+    // Buttons should not be inside the overflow-x-auto scrollable container
+    expect(leftBtn.closest('.overflow-x-auto')).toBeNull()
+    expect(rightBtn.closest('.overflow-x-auto')).toBeNull()
+  })
+
+  it('hidden arrow buttons are removed from tab order', () => {
+    mockCanScrollLeft = false
+    mockCanScrollRight = true
+
+    const tab = createTab({ id: 'tab-1' })
+    const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
+    renderWithStore(<TabBar />, store)
+
+    const leftBtn = screen.getByLabelText('Scroll tabs left')
+    const rightBtn = screen.getByLabelText('Scroll tabs right')
+
+    expect(leftBtn.getAttribute('tabindex')).toBe('-1')
+    expect(rightBtn.getAttribute('tabindex')).toBe('0')
   })
 })

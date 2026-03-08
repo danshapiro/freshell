@@ -143,6 +143,14 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
   color: hsl(var(--foreground)); border-color: hsl(var(--foreground) / .5);
   background: hsl(var(--muted) / .3);
 }
+/* Overflow arrow buttons (appear when tabs exceed tab bar width) */
+.tab-arrow {
+  width: 24px; height: 32px; display: flex; align-items: center;
+  justify-content: center; flex-shrink: 0; color: hsl(var(--muted-foreground));
+  cursor: pointer; transition: color .15s;
+}
+.tab-arrow:hover { color: hsl(var(--foreground));
+}
 
 /* ========== Sidebar ========== */
 .sidebar {
@@ -469,6 +477,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
           <span class="tab-label">Get Started</span>
           <span class="tab-close"><i data-lucide="x" class="icon-xs"></i></span>
         </div>
+        <!-- Arrow buttons (< >) appear at edges when tabs overflow. Not shown in this mock since tabs fit. -->
         <div class="tab-add" title="New shell tab"><i data-lucide="plus" class="icon"></i></div>
       </div>
       <!-- Welcome -->
