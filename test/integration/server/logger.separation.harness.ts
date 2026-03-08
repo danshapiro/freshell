@@ -134,11 +134,7 @@ async function waitForLogPattern(
   let lastLog = ''
 
   while (Date.now() < deadline) {
-<<<<<<< HEAD
     const content = await readCombinedOutput(handle)
-=======
-    const content = await readCombinedOutput(handle)
->>>>>>> 41f3e605 (test: stabilize logger separation and session indexer timing)
     if (content) {
       lastLog = content
       if (pattern.test(content)) {

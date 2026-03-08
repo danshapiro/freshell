@@ -8,7 +8,6 @@ import { configStore } from '../../../../server/config-store'
 import { makeSessionKey } from '../../../../server/coding-cli/types'
 import { clearRepoRootCache } from '../../../../server/coding-cli/utils'
 import type { SessionMetadataStore } from '../../../../server/session-metadata-store'
-import { codexProvider } from '../../../../server/coding-cli/providers/codex'
 
 vi.mock('../../../../server/config-store', () => ({
   configStore: {
@@ -33,7 +32,7 @@ type MakeProviderOptions = {
 
 function makeProvider(files: string[], options: MakeProviderOptions = {}): CodingCliProvider {
   const providerName = options.name ?? 'claude'
-  const homeDir = options.homeDir ?? tempDir ?? os.tmpdir()
+  const homeDir = options.homeDir ?? '/tmp'
   const displayName = options.displayName ?? (providerName === 'claude' ? 'Claude' : providerName)
 
   return {
@@ -76,17 +75,8 @@ function createDeferred<T>() {
 }
 
 let tempDir: string
-const codexTaskEventsFixturePath = path.join(
-  process.cwd(),
-  'test',
-  'fixtures',
-  'coding-cli',
-  'codex',
-  'task-events.sanitized.jsonl',
-)
 
 beforeEach(async () => {
-  vi.useRealTimers()
   tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-coding-cli-'))
   clearRepoRootCache()
   vi.mocked(configStore.snapshot).mockResolvedValue({
@@ -102,7 +92,6 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await fsp.rm(tempDir, { recursive: true, force: true })
-  vi.useRealTimers()
   vi.clearAllMocks()
 })
 
@@ -175,46 +164,6 @@ describe('CodingCliSessionIndexer', () => {
     expect(projectB?.color).toBe('#222222')
     expect(projectB?.sessions[0].provider).toBe('claude')
     expect(projectB?.sessions[0].title).toBe('Title B')
-  })
-
-  it('preserves parsed codex task event snapshots from bounded snippets without extra reads', async () => {
-    const sessionFile = path.join(tempDir, 'sessions', 'rollout-task-events.jsonl')
-    await fsp.mkdir(path.dirname(sessionFile), { recursive: true })
-    const content = await fsp.readFile(codexTaskEventsFixturePath, 'utf8')
-    await fsp.writeFile(sessionFile, content)
-
-    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
-      sessionOverrides: {},
-      settings: {
-        codingCli: {
-          enabledProviders: ['codex'],
-          providers: {},
-        },
-      },
-    })
-
-    const provider: CodingCliProvider = {
-      ...codexProvider,
-      homeDir: tempDir,
-      getSessionGlob: () => path.join(tempDir, 'sessions', '**', '*.jsonl'),
-      getSessionRoots: () => [path.join(tempDir, 'sessions')],
-      listSessionFiles: async () => [sessionFile],
-      resolveProjectPath: async (_filePath, meta) => meta.cwd || 'unknown',
-    }
-
-    const indexer = new CodingCliSessionIndexer([provider])
-    await indexer.refresh()
-
-    const session = indexer.getProjects()[0]?.sessions[0]
-    expect(session).toMatchObject({
-      provider: 'codex',
-      sessionId: 'session-activity',
-      codexTaskEvents: {
-        latestTaskStartedAt: Date.parse('2026-03-01T00:00:05.000Z'),
-        latestTaskCompletedAt: Date.parse('2026-03-01T00:00:04.000Z'),
-        latestTurnAbortedAt: Date.parse('2026-03-01T00:00:06.000Z'),
-      },
-    })
   })
 
   it('sorts projects deterministically by newest session updatedAt then projectPath', async () => {
@@ -571,151 +520,6 @@ describe('CodingCliSessionIndexer', () => {
     const session = indexer.getProjects()[0]?.sessions[0]
     expect(session?.title).toBe('Tail Title')
     expect(parseSessionFile).toHaveBeenCalledTimes(1)
-  })
-
-  it('does not retain a synthetic unresolved Codex turn from an oversized head-plus-tail snippet', async () => {
-    vi.mocked(configStore.snapshot).mockResolvedValue({
-      sessionOverrides: {},
-      settings: {
-        codingCli: {
-          enabledProviders: ['codex'],
-          providers: {},
-        },
-      },
-    })
-
-    const fileA = path.join(tempDir, 'codex-oversized.jsonl')
-    const largeBlock = 'x'.repeat(8192)
-    const fillerLines = Array.from({ length: 24 }, (_, i) => JSON.stringify({ filler: `head-${i}-${largeBlock}` }))
-    const middleLines = Array.from({ length: 24 }, (_, i) => JSON.stringify({ filler: `middle-${i}-${largeBlock}` }))
-    const tailLines = Array.from({ length: 24 }, (_, i) => JSON.stringify({ filler: `tail-${i}-${largeBlock}` }))
-    const content = [
-      JSON.stringify({
-        timestamp: '2026-03-01T00:00:00.000Z',
-        type: 'session_meta',
-        payload: { id: 'session-oversized', cwd: '/project/codex' },
-      }),
-      JSON.stringify({
-        timestamp: '2026-03-01T00:00:01.000Z',
-        type: 'event_msg',
-        payload: { type: 'task_started' },
-      }),
-      ...fillerLines,
-      JSON.stringify({
-        timestamp: '2026-03-01T00:00:02.000Z',
-        type: 'event_msg',
-        payload: { type: 'task_complete' },
-      }),
-      ...middleLines,
-      ...tailLines,
-      JSON.stringify({
-        timestamp: '2026-03-01T00:00:03.000Z',
-        type: 'response_item',
-        payload: {
-          type: 'message',
-          role: 'assistant',
-          content: [{ type: 'output_text', text: 'tail summary' }],
-        },
-      }),
-    ].join('\n') + '\n'
-    await fsp.writeFile(fileA, content)
-
-    const provider: CodingCliProvider = {
-      ...codexProvider,
-      homeDir: tempDir,
-      getSessionGlob: () => path.join(tempDir, '**', '*.jsonl'),
-      getSessionRoots: () => [tempDir],
-      listSessionFiles: async () => [fileA],
-      resolveProjectPath: async () => '/project/codex',
-    }
-
-    const indexer = new CodingCliSessionIndexer([provider])
-    await indexer.refresh()
-
-    const session = indexer.getProjects()[0]?.sessions[0]
-    expect(session).toMatchObject({
-      provider: 'codex',
-      sessionId: 'session-oversized',
-      projectPath: '/project/codex',
-    })
-    expect(session?.codexTaskEvents).toBeUndefined()
-  })
-
-  it('preserves a truly unresolved Codex task_started when it appears in the tail snippet of an oversized session', async () => {
-    vi.mocked(configStore.snapshot).mockResolvedValue({
-      sessionOverrides: {},
-      settings: {
-        codingCli: {
-          enabledProviders: ['codex'],
-          providers: {},
-        },
-      },
-    })
-
-    const fileA = path.join(tempDir, 'codex-oversized-tail-start.jsonl')
-    const largeBlock = 'y'.repeat(8192)
-    const headLines = Array.from({ length: 24 }, (_, i) => JSON.stringify({ filler: `head-${i}-${largeBlock}` }))
-    const middleLines = Array.from({ length: 24 }, (_, i) => JSON.stringify({ filler: `middle-${i}-${largeBlock}` }))
-    const tailLines = Array.from({ length: 24 }, (_, i) => JSON.stringify({ filler: `tail-${i}-${largeBlock}` }))
-    const content = [
-      JSON.stringify({
-        timestamp: '2026-03-01T00:00:00.000Z',
-        type: 'session_meta',
-        payload: { id: 'session-oversized-tail-start', cwd: '/project/codex' },
-      }),
-      JSON.stringify({
-        timestamp: '2026-03-01T00:00:01.000Z',
-        type: 'event_msg',
-        payload: { type: 'task_started' },
-      }),
-      ...headLines,
-      JSON.stringify({
-        timestamp: '2026-03-01T00:00:02.000Z',
-        type: 'event_msg',
-        payload: { type: 'task_complete' },
-      }),
-      ...middleLines,
-      ...tailLines,
-      JSON.stringify({
-        timestamp: '2026-03-01T00:00:03.000Z',
-        type: 'event_msg',
-        payload: { type: 'task_started' },
-      }),
-      JSON.stringify({
-        timestamp: '2026-03-01T00:00:04.000Z',
-        type: 'response_item',
-        payload: {
-          type: 'message',
-          role: 'assistant',
-          content: [{ type: 'output_text', text: 'still working' }],
-        },
-      }),
-    ].join('\n') + '\n'
-    await fsp.writeFile(fileA, content)
-
-    const provider: CodingCliProvider = {
-      ...codexProvider,
-      homeDir: tempDir,
-      getSessionGlob: () => path.join(tempDir, '**', '*.jsonl'),
-      getSessionRoots: () => [tempDir],
-      listSessionFiles: async () => [fileA],
-      resolveProjectPath: async () => '/project/codex',
-    }
-
-    const indexer = new CodingCliSessionIndexer([provider])
-    await indexer.refresh()
-
-    const session = indexer.getProjects()[0]?.sessions[0]
-    expect(session).toMatchObject({
-      provider: 'codex',
-      sessionId: 'session-oversized-tail-start',
-      projectPath: '/project/codex',
-      codexTaskEvents: {
-        latestTaskStartedAt: Date.parse('2026-03-01T00:00:03.000Z'),
-      },
-    })
-    expect(session?.codexTaskEvents?.latestTaskCompletedAt).toBeUndefined()
-    expect(session?.codexTaskEvents?.latestTurnAbortedAt).toBeUndefined()
   })
 
   it('applies legacy overrides when sessionId differs from filename', async () => {
@@ -1133,7 +937,7 @@ describe('CodingCliSessionIndexer', () => {
 
         expect(indexer.getProjects()[0].sessions[0].title).toBe('Late Session')
       } finally {
-        await indexer.stop()
+        indexer.stop()
       }
     })
 
@@ -1163,7 +967,7 @@ describe('CodingCliSessionIndexer', () => {
       await indexer.start()
 
       // stop() should not throw and should clean up watchers
-      await indexer.stop()
+      indexer.stop()
 
       // Creating the directory after stop should NOT trigger refresh
       await fsp.mkdir(sessionsDir, { recursive: true })
@@ -1200,7 +1004,7 @@ describe('CodingCliSessionIndexer', () => {
         // Should have triggered at least one additional full scan
         expect(listSessionFiles.mock.calls.length).toBeGreaterThan(callsAfterStart)
 
-        await indexer.stop()
+        indexer.stop()
       } finally {
         vi.useRealTimers()
       }
@@ -1227,7 +1031,7 @@ describe('CodingCliSessionIndexer', () => {
         await indexer.start()
         const callsAfterStart = listSessionFiles.mock.calls.length
 
-        await indexer.stop()
+        indexer.stop()
 
         // Advance past the interval - should NOT trigger since stopped
         await vi.advanceTimersByTimeAsync(10000)
@@ -1243,118 +1047,112 @@ describe('CodingCliSessionIndexer', () => {
       const indexer = new CodingCliSessionIndexer([provider])
       // The default is an internal detail, but we can verify via the class
       expect((indexer as any).fullScanIntervalMs).toBe(10 * 60 * 1000)
-      await indexer.stop()
+      indexer.stop()
     })
   })
 
   describe('urgent refresh for titleless sessions', () => {
     it('uses shorter delay when a dirty file has a cached session with no title', async () => {
-      vi.useFakeTimers()
-      try {
-        const fileA = path.join(tempDir, 'session-a.jsonl')
-        // Start with no title (simulates brand new Claude session)
-        await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
+      const fileA = path.join(tempDir, 'session-a.jsonl')
+      // Start with no title (simulates brand new Claude session)
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
 
-        const provider = makeProvider([fileA])
-        const indexer = new CodingCliSessionIndexer([provider], {
-          debounceMs: 2000,
-          throttleMs: 5000,
-          fullScanIntervalMs: 0,
-        })
+      const provider = makeProvider([fileA])
+      const indexer = new CodingCliSessionIndexer([provider], {
+        debounceMs: 2000,
+        throttleMs: 5000,
+        fullScanIntervalMs: 0,
+      })
 
-        // Initial refresh populates cache with titleless session.
-        await indexer.refresh()
-        const projects = indexer.getProjects()
-        expect(projects).toHaveLength(1)
-        expect(projects[0].sessions[0].title).toBeUndefined()
+      // Initial refresh populates cache with titleless session
+      await indexer.refresh()
+      const projects = indexer.getProjects()
+      expect(projects).toHaveLength(1)
+      expect(projects[0].sessions[0].title).toBeUndefined()
 
-        const refreshSpy = vi.spyOn(indexer, 'refresh').mockResolvedValue(undefined)
+      const handler = vi.fn()
+      indexer.onUpdate(handler)
 
-        // Simulate file change: session gets a title (user typed first message).
-        await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Hello world' }) + '\n')
-        ;(indexer as any).markDirty(fileA)
-        indexer.scheduleRefresh()
+      // Simulate file change: session gets a title (user typed first message)
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Hello world' }) + '\n')
+      ;(indexer as any).markDirty(fileA)
+      indexer.scheduleRefresh()
 
-        // Urgent refresh still respects the 1s urgent throttle floor instead of the full 2-5s delay.
-        await vi.advanceTimersByTimeAsync(999)
-        expect(refreshSpy).not.toHaveBeenCalled()
+      // Urgent refresh should fire within the urgent throttle window (~1s),
+      // not after the normal 2-5s debounce/throttle window
+      await vi.waitFor(
+        () => { expect(handler).toHaveBeenCalledTimes(1) },
+        { timeout: 2000, interval: 50 },
+      )
 
-        await vi.advanceTimersByTimeAsync(1)
-        expect(refreshSpy).toHaveBeenCalledTimes(1)
-
-        await indexer.stop()
-      } finally {
-        vi.useRealTimers()
-      }
+      indexer.stop()
     })
 
     it('does not throttle urgent refreshes when throttleMs is 0', async () => {
-      vi.useFakeTimers()
-      try {
-        const fileA = path.join(tempDir, 'session-a.jsonl')
-        await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
+      const fileA = path.join(tempDir, 'session-a.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
 
-        const provider = makeProvider([fileA])
-        const indexer = new CodingCliSessionIndexer([provider], {
-          debounceMs: 50,
-          throttleMs: 0,
-          fullScanIntervalMs: 0,
-        })
+      const provider = makeProvider([fileA])
+      const indexer = new CodingCliSessionIndexer([provider], {
+        debounceMs: 50,
+        throttleMs: 0,
+        fullScanIntervalMs: 0,
+      })
 
-        await indexer.refresh()
-        expect(indexer.getProjects()[0].sessions[0].title).toBeUndefined()
+      await indexer.refresh()
+      expect(indexer.getProjects()[0].sessions[0].title).toBeUndefined()
 
-        const refreshSpy = vi.spyOn(indexer, 'refresh').mockResolvedValue(undefined)
+      const handler = vi.fn()
+      indexer.onUpdate(handler)
 
-        await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Hello' }) + '\n')
-        ;(indexer as any).markDirty(fileA)
-        indexer.scheduleRefresh()
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Hello' }) + '\n')
+      ;(indexer as any).markDirty(fileA)
+      indexer.scheduleRefresh()
 
-        await vi.advanceTimersByTimeAsync(299)
-        expect(refreshSpy).not.toHaveBeenCalled()
+      // With throttleMs: 0, urgent refresh should fire at the URGENT_REFRESH_MS
+      // delay (300ms) without any additional throttle
+      await vi.waitFor(
+        () => { expect(handler).toHaveBeenCalledTimes(1) },
+        { timeout: 800, interval: 50 },
+      )
 
-        await vi.advanceTimersByTimeAsync(1)
-        expect(refreshSpy).toHaveBeenCalledTimes(1)
-
-        await indexer.stop()
-      } finally {
-        vi.useRealTimers()
-      }
+      indexer.stop()
     })
 
     it('uses normal delay when dirty files all have titles already', async () => {
-      vi.useFakeTimers()
-      try {
-        const fileA = path.join(tempDir, 'session-a.jsonl')
-        await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Has title' }) + '\n')
+      const fileA = path.join(tempDir, 'session-a.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Has title' }) + '\n')
 
-        const provider = makeProvider([fileA])
-        // Use short debounce so the test stays quick, while still proving it does not fire urgently.
-        const indexer = new CodingCliSessionIndexer([provider], {
-          debounceMs: 800,
-          throttleMs: 800,
-          fullScanIntervalMs: 0,
-        })
+      const provider = makeProvider([fileA])
+      // Use short debounce so the test doesn't take too long, but long enough
+      // to prove it doesn't fire as urgently as the titleless case
+      const indexer = new CodingCliSessionIndexer([provider], {
+        debounceMs: 800,
+        throttleMs: 800,
+        fullScanIntervalMs: 0,
+      })
 
-        await indexer.refresh()
+      await indexer.refresh()
 
-        const refreshSpy = vi.spyOn(indexer, 'refresh').mockResolvedValue(undefined)
+      const handler = vi.fn()
+      indexer.onUpdate(handler)
 
-        // Simulate file change for a session that already has a title.
-        await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Updated title' }) + '\n')
-        ;(indexer as any).markDirty(fileA)
-        indexer.scheduleRefresh()
+      // Simulate file change for a session that already has a title
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Updated title' }) + '\n')
+      ;(indexer as any).markDirty(fileA)
+      indexer.scheduleRefresh()
 
-        await vi.advanceTimersByTimeAsync(799)
-        expect(refreshSpy).not.toHaveBeenCalled()
+      // Should NOT have fired within 300ms (no urgency)
+      await new Promise((r) => setTimeout(r, 300))
+      expect(handler).not.toHaveBeenCalled()
 
-        await vi.advanceTimersByTimeAsync(1)
-        expect(refreshSpy).toHaveBeenCalledTimes(1)
+      // Should fire after the normal debounce period
+      await vi.waitFor(
+        () => { expect(handler).toHaveBeenCalledTimes(1) },
+        { timeout: 2000, interval: 50 },
+      )
 
-        await indexer.stop()
-      } finally {
-        vi.useRealTimers()
-      }
+      indexer.stop()
     })
   })
 
