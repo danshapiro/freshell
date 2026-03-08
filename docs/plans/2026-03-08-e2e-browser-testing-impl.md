@@ -33,6 +33,22 @@ Environment variables for each test server:
 
 The `HOME` override is the simplest and most complete isolation mechanism: since the server uses `os.homedir()` in config-store, session-scanner, tabs-registry, etc., overriding `HOME` redirects ALL of those paths at once without patching individual modules.
 
+**Config pre-seeding:** On non-WSL systems (including CI), when `config.json` does not exist, the client shows a `SetupWizard` modal that blocks all interaction until the user configures the network. This would break every E2E test. The `TestServer.start()` method pre-seeds `<tmpdir>/.freshell/config.json` with a minimal valid configuration that marks the network as already configured:
+
+```json
+{
+  "version": 1,
+  "settings": {
+    "network": {
+      "configured": true,
+      "host": "127.0.0.1"
+    }
+  }
+}
+```
+
+This bypasses the SetupWizard while keeping all other settings at their defaults. The pre-seeding happens after creating the `.freshell` directory and before spawning the server process.
+
 ### 2. Test Harness Bridge (`window.__FRESHELL_TEST_HARNESS__`)
 
 A small bridge module installed in the client exposes:
@@ -59,10 +75,18 @@ Note: The Vite client uses `import.meta.env.DEV` / `import.meta.env.PROD` for bu
 
 ### 3. Terminal Interaction Model
 
-xterm.js renders into a canvas, making standard Playwright text assertions unreliable. Instead:
+xterm.js renders into a canvas (WebGL by default, canvas fallback), making standard Playwright text assertions unreliable. DOM scraping via `.xterm-rows > div` only works with the DOM renderer and produces empty/incorrect results with WebGL or canvas renderers. Instead, we use the xterm.js buffer API via the test harness:
+
 - **Typing:** Simulate keyboard input via `page.keyboard.type()` and `page.keyboard.press()` targeting the terminal's textarea (xterm.js has a hidden textarea for input)
-- **Reading output:** Use the test harness to access terminal buffer content, or use WebSocket-level assertions (listen for `terminal.output` messages)
-- **Waiting for output:** Poll the terminal buffer or use `waitForFunction` with a predicate that checks the xterm buffer
+- **Reading output:** Use `window.__FRESHELL_TEST_HARNESS__.getTerminalBuffer(terminalId)` which reads from the xterm.js `Terminal.buffer.active` API. This API returns the actual terminal buffer content regardless of which renderer is active (WebGL, canvas, or DOM). The test harness maintains a registry of `{ terminalId -> bufferAccessor }` that TerminalView populates when mounting/unmounting xterm instances.
+- **Waiting for output:** Poll the terminal buffer via `page.waitForFunction()` calling `getTerminalBuffer()` with a text predicate. Since the buffer API is synchronous and always reflects the latest terminal state, polling is reliable.
+
+**Buffer registration flow:**
+1. `src/lib/test-harness.ts` exposes a `registerTerminalBuffer(terminalId, accessor)` and `unregisterTerminalBuffer(terminalId)` on the harness
+2. `src/components/TerminalView.tsx` calls `registerTerminalBuffer` after creating the xterm `Terminal` instance, providing a closure that reads `terminal.buffer.active` lines
+3. `src/components/TerminalView.tsx` calls `unregisterTerminalBuffer` when the terminal is disposed
+4. `getTerminalBuffer(terminalId)` returns the full buffer text by iterating `terminal.buffer.active.getLine(y)` for `y` in `[0, terminal.buffer.active.length)`
+5. When no `terminalId` is passed, `getTerminalBuffer()` returns the buffer of the first registered terminal (convenience for single-terminal tests)
 
 ### 4. WebSocket Assertions
 
@@ -205,7 +229,38 @@ playwright-report/
 blob-report/
 ```
 
-**Step 6: Run the smoke test to verify**
+**Step 6: Exclude test/e2e-browser from vitest**
+
+This must be done immediately so that `npm test` continues to pass throughout development. Later tasks add vitest-format tests (e.g., `test-server.test.ts`) inside `test/e2e-browser/helpers/`, but these are run via explicit vitest invocations, not via `npm test`. Without this exclusion, vitest would try to collect Playwright spec files and fail.
+
+Add `'test/e2e-browser/**'` to the `exclude` array in `vitest.config.ts`:
+
+```ts
+exclude: [
+  '**/node_modules/**',
+  '**/.worktrees/**',
+  '**/.claude/worktrees/**',
+  'docs/plans/**',
+  'test/server/**',
+  'test/unit/server/**',
+  'test/integration/server/**',
+  'test/integration/session-repair.test.ts',
+  'test/integration/session-search-e2e.test.ts',
+  'test/e2e-browser/**',  // <-- ADD THIS
+],
+```
+
+Also add the same exclusion to `vitest.server.config.ts` if it uses an explicit include list (read the file and add the exclusion if needed).
+
+Verify existing tests still pass:
+
+```bash
+npm test
+```
+
+Expected: All existing tests pass (no regressions)
+
+**Step 7: Run the smoke test to verify Playwright**
 
 ```bash
 npx playwright test --config test/e2e-browser/playwright.config.ts
@@ -213,11 +268,11 @@ npx playwright test --config test/e2e-browser/playwright.config.ts
 
 Expected: PASS
 
-**Step 7: Commit**
+**Step 8: Commit**
 
 ```bash
-git add test/e2e-browser/playwright.config.ts test/e2e-browser/specs/smoke.spec.ts package.json package-lock.json .gitignore
-git commit -m "feat: install Playwright and add E2E test configuration"
+git add test/e2e-browser/playwright.config.ts test/e2e-browser/specs/smoke.spec.ts package.json package-lock.json .gitignore vitest.config.ts vitest.server.config.ts
+git commit -m "feat: install Playwright, add E2E test configuration, exclude from vitest"
 ```
 
 ---
@@ -411,6 +466,21 @@ export class TestServer {
     // Create the .freshell config dir inside the temp HOME so the server doesn't error
     const freshellDir = path.join(this.configDir, '.freshell')
     await fsp.mkdir(freshellDir, { recursive: true })
+
+    // Pre-seed config.json so the SetupWizard does not block the UI.
+    // On non-WSL systems (including CI), the client shows a SetupWizard modal
+    // when config.json is missing, blocking all interaction. This minimal config
+    // marks the network as already configured, bypassing the wizard.
+    const configPath = path.join(freshellDir, 'config.json')
+    await fsp.writeFile(configPath, JSON.stringify({
+      version: 1,
+      settings: {
+        network: {
+          configured: true,
+          host: '127.0.0.1',
+        },
+      },
+    }, null, 2))
 
     // Create a logs dir
     const logsDir = path.join(this.configDir, '.freshell', 'logs')
@@ -623,6 +693,7 @@ git commit -m "feat: add E2E global setup (build) and teardown"
 **Files:**
 - Create: `src/lib/test-harness.ts`
 - Modify: `src/App.tsx` (inject harness when URL has `?e2e=1`)
+- Modify: `src/components/TerminalView.tsx` (register terminal buffer accessors with harness)
 - Create: `test/e2e-browser/helpers/test-harness.ts`
 
 **Step 1: Create the client-side test harness module**
@@ -636,7 +707,9 @@ export interface FreshellTestHarness {
   dispatch: typeof appStore.dispatch
   getWsReadyState: () => string
   waitForConnection: (timeoutMs?: number) => Promise<void>
-  getTerminalBuffer: (terminalId: string) => string | null
+  getTerminalBuffer: (terminalId?: string) => string | null
+  registerTerminalBuffer: (terminalId: string, accessor: () => string) => void
+  unregisterTerminalBuffer: (terminalId: string) => void
 }
 
 declare global {
@@ -660,15 +733,30 @@ export function installTestHarness(
 ): void {
   if (typeof window === 'undefined') return
 
+  // Registry of terminal buffer accessors, keyed by terminalId.
+  // TerminalView registers/unregisters accessors as xterm instances mount/unmount.
+  const terminalBuffers = new Map<string, () => string>()
+
   window.__FRESHELL_TEST_HARNESS__ = {
     getState: () => store.getState(),
     dispatch: store.dispatch,
     getWsReadyState: getWsState,
     waitForConnection: waitForWsReady,
-    getTerminalBuffer: (_terminalId: string) => {
-      // Terminal buffers are managed by xterm.js instances, not Redux.
-      // This placeholder will be populated by TerminalView when it mounts.
-      return null
+    getTerminalBuffer: (terminalId?: string) => {
+      if (terminalId) {
+        const accessor = terminalBuffers.get(terminalId)
+        return accessor ? accessor() : null
+      }
+      // No terminalId: return first registered terminal's buffer (convenience)
+      const first = terminalBuffers.values().next()
+      if (first.done) return null
+      return first.value()
+    },
+    registerTerminalBuffer: (terminalId: string, accessor: () => string) => {
+      terminalBuffers.set(terminalId, accessor)
+    },
+    unregisterTerminalBuffer: (terminalId: string) => {
+      terminalBuffers.delete(terminalId)
     },
   }
 }
@@ -721,7 +809,44 @@ const [_harnessInstalled] = useState(() => {
 
 Tests navigate to `http://127.0.0.1:{port}/?token={token}&e2e=1`.
 
-**Step 3: Create the Playwright-side test harness helper**
+**Step 3: Wire up terminal buffer registration in TerminalView**
+
+In `src/components/TerminalView.tsx`, after the xterm `Terminal` instance is created and stored in `termRef.current` (around line 861), add registration with the test harness. This must happen only when the harness is installed (i.e., when `?e2e=1` is in the URL):
+
+```ts
+// Register terminal buffer accessor with test harness (for E2E tests).
+// Uses xterm.js Terminal.buffer.active API which works with all renderers
+// (WebGL, canvas, DOM) — unlike DOM scraping via .xterm-rows which only
+// works with the DOM renderer.
+if (window.__FRESHELL_TEST_HARNESS__ && terminalContent?.terminalId) {
+  window.__FRESHELL_TEST_HARNESS__.registerTerminalBuffer(
+    terminalContent.terminalId,
+    () => {
+      const t = termRef.current
+      if (!t) return ''
+      const buf = t.buffer.active
+      const lines: string[] = []
+      for (let y = 0; y < buf.length; y++) {
+        const line = buf.getLine(y)
+        if (line) lines.push(line.translateToString(true))
+      }
+      return lines.join('\n')
+    },
+  )
+}
+```
+
+In the cleanup/dispose path (where `termRef.current` is disposed), add:
+
+```ts
+if (window.__FRESHELL_TEST_HARNESS__ && terminalContent?.terminalId) {
+  window.__FRESHELL_TEST_HARNESS__.unregisterTerminalBuffer(terminalContent.terminalId)
+}
+```
+
+This ensures the test harness always has access to the latest terminal buffer content regardless of which renderer xterm.js uses.
+
+**Step 4: Create the Playwright-side test harness helper**
 
 ```ts
 // test/e2e-browser/helpers/test-harness.ts
@@ -761,6 +886,40 @@ export class TestHarness {
       if (!harness) throw new Error('Test harness not installed')
       return harness.getState()
     })
+  }
+
+  /**
+   * Get terminal buffer content via the xterm.js buffer API.
+   * This works with all renderers (WebGL, canvas, DOM) unlike DOM scraping.
+   * @param terminalId - specific terminal ID, or omit for first registered terminal
+   */
+  async getTerminalBuffer(terminalId?: string): Promise<string | null> {
+    return this.page.evaluate((id) => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      if (!harness) throw new Error('Test harness not installed')
+      return harness.getTerminalBuffer(id)
+    }, terminalId)
+  }
+
+  /**
+   * Wait for specific text to appear in the terminal buffer.
+   * Uses the xterm.js buffer API via the test harness (renderer-agnostic).
+   */
+  async waitForTerminalText(
+    text: string,
+    options: { terminalId?: string; timeout?: number } = {},
+  ): Promise<void> {
+    const { terminalId, timeout = 10_000 } = options
+    await this.page.waitForFunction(
+      ({ searchText, id }) => {
+        const harness = window.__FRESHELL_TEST_HARNESS__
+        if (!harness) return false
+        const buffer = harness.getTerminalBuffer(id)
+        return buffer !== null && buffer.includes(searchText)
+      },
+      { searchText: text, id: terminalId },
+      { timeout },
+    )
   }
 
   /** Get tab count */
@@ -848,10 +1007,10 @@ export class TestHarness {
 }
 ```
 
-**Step 4: Commit**
+**Step 5: Commit**
 
 ```bash
-git add src/lib/test-harness.ts src/App.tsx test/e2e-browser/helpers/test-harness.ts
+git add src/lib/test-harness.ts src/App.tsx src/components/TerminalView.tsx test/e2e-browser/helpers/test-harness.ts
 git commit -m "feat: add test harness bridge for E2E state assertions"
 ```
 
@@ -919,78 +1078,67 @@ export class TerminalHelper {
 
   /**
    * Wait for specific text to appear in the terminal output.
-   * Uses the terminal's accessible text content, which xterm.js provides
-   * in the .xterm-accessibility-tree element.
+   * Uses the xterm.js buffer API via the test harness, which works reliably
+   * with all renderers (WebGL, canvas, DOM). Does NOT use DOM scraping
+   * (.xterm-rows > div) which only works with the DOM renderer.
    *
-   * Falls back to checking the rows if accessibility tree is not available.
+   * @param terminalId - optional: pass a specific terminalId, or omit to use
+   *   the first registered terminal in the harness
    */
   async waitForOutput(
     text: string,
-    options: { timeout?: number; nth?: number } = {},
+    options: { timeout?: number; nth?: number; terminalId?: string } = {},
   ): Promise<void> {
-    const { timeout = 10_000, nth = 0 } = options
+    const { timeout = 10_000, terminalId } = options
 
     await this.page.waitForFunction(
-      ({ searchText, terminalIndex }) => {
-        // Try accessibility tree first
-        const terms = document.querySelectorAll('.xterm')
-        const term = terms[terminalIndex]
-        if (!term) return false
-
-        // Check all xterm rows for the text
-        const rows = term.querySelectorAll('.xterm-rows > div')
-        for (const row of rows) {
-          if (row.textContent?.includes(searchText)) return true
-        }
-        return false
+      ({ searchText, id }) => {
+        const harness = window.__FRESHELL_TEST_HARNESS__
+        if (!harness) return false
+        const buffer = harness.getTerminalBuffer(id)
+        return buffer !== null && buffer.includes(searchText)
       },
-      { searchText: text, terminalIndex: nth },
+      { searchText: text, id: terminalId },
       { timeout },
     )
   }
 
   /**
-   * Get all visible text from the terminal.
+   * Get all text from the terminal buffer.
+   * Uses the xterm.js buffer API via the test harness (renderer-agnostic).
    */
   async getVisibleText(nth = 0): Promise<string> {
-    return this.page.evaluate((terminalIndex) => {
-      const terms = document.querySelectorAll('.xterm')
-      const term = terms[terminalIndex]
-      if (!term) return ''
-
-      const rows = term.querySelectorAll('.xterm-rows > div')
-      return Array.from(rows)
-        .map((row) => row.textContent ?? '')
-        .join('\n')
-    }, nth)
+    return this.page.evaluate(() => {
+      const harness = window.__FRESHELL_TEST_HARNESS__
+      if (!harness) return ''
+      return harness.getTerminalBuffer() ?? ''
+    })
   }
 
   /**
    * Wait for the terminal to be ready (has rendered and shows a prompt).
    * Looks for common shell prompt characters: $, %, >, #
+   * Uses the xterm.js buffer API via the test harness (renderer-agnostic).
    */
   async waitForPrompt(
     options: { timeout?: number; nth?: number } = {},
   ): Promise<void> {
-    const { timeout = 15_000, nth = 0 } = options
+    const { timeout = 15_000 } = options
 
     await this.page.waitForFunction(
-      (terminalIndex) => {
-        const terms = document.querySelectorAll('.xterm')
-        const term = terms[terminalIndex]
-        if (!term) return false
-
-        const rows = term.querySelectorAll('.xterm-rows > div')
-        for (const row of rows) {
-          const text = row.textContent ?? ''
-          // Match common shell prompts
-          if (/[$%>#]\s*$/.test(text.trimEnd()) && text.trim().length > 0) {
-            return true
-          }
-        }
-        return false
+      () => {
+        const harness = window.__FRESHELL_TEST_HARNESS__
+        if (!harness) return false
+        const buffer = harness.getTerminalBuffer()
+        if (!buffer) return false
+        // Check each line for a shell prompt character at end of line
+        const lines = buffer.split('\n')
+        return lines.some((line: string) => {
+          const trimmed = line.trimEnd()
+          return trimmed.length > 0 && /[$%>#]\s*$/.test(trimmed)
+        })
       },
-      nth,
+      undefined,
       { timeout },
     )
   }
@@ -2482,12 +2630,12 @@ git commit -m "test: add screenshot baseline E2E tests"
 
 ---
 
-## Task 21: Remove Smoke Test and Update vitest.config.ts Exclusions
+## Task 21: Remove Smoke Test
 
 **Files:**
 - Delete: `test/e2e-browser/specs/smoke.spec.ts` (temporary test from Task 1)
-- Modify: `vitest.config.ts` (exclude `test/e2e-browser/**` from vitest)
-- Modify: `vitest.server.config.ts` (exclude `test/e2e-browser/**` from vitest)
+
+Note: The vitest exclusion for `test/e2e-browser/**` was already added in Task 1 (Step 6) to prevent `npm test` from breaking at any point during development. This task only removes the temporary smoke test.
 
 **Step 1: Remove the temporary smoke test**
 
@@ -2495,30 +2643,7 @@ git commit -m "test: add screenshot baseline E2E tests"
 rm test/e2e-browser/specs/smoke.spec.ts
 ```
 
-**Step 2: Update vitest.config.ts to exclude e2e-browser tests**
-
-Add `'test/e2e-browser/**'` to the `exclude` array in `vitest.config.ts`:
-
-```ts
-exclude: [
-  '**/node_modules/**',
-  '**/.worktrees/**',
-  '**/.claude/worktrees/**',
-  'docs/plans/**',
-  'test/server/**',
-  'test/unit/server/**',
-  'test/integration/server/**',
-  'test/integration/session-repair.test.ts',
-  'test/integration/session-search-e2e.test.ts',
-  'test/e2e-browser/**',  // <-- ADD THIS
-],
-```
-
-**Step 3: Update vitest.server.config.ts similarly**
-
-Read the file and add the exclusion if not already present.
-
-**Step 4: Verify existing tests still pass**
+**Step 2: Verify existing tests still pass**
 
 ```bash
 npm test
@@ -2526,12 +2651,11 @@ npm test
 
 Expected: All existing tests pass (no regressions)
 
-**Step 5: Commit**
+**Step 3: Commit**
 
 ```bash
-git add vitest.config.ts vitest.server.config.ts
 git rm test/e2e-browser/specs/smoke.spec.ts
-git commit -m "chore: exclude e2e-browser from vitest, remove smoke test"
+git commit -m "chore: remove temporary Playwright smoke test"
 ```
 
 ---
@@ -2677,6 +2801,10 @@ git commit -m "test: finalize E2E test suite and fix selector issues"
 
 4. **Test harness is opt-in:** The `window.__FRESHELL_TEST_HARNESS__` bridge is only installed when the URL contains `?e2e=1`. It has zero impact on production builds or normal usage.
 
-5. **Existing tests unaffected:** The `test/e2e-browser/` directory is excluded from both vitest configs. The existing `test/e2e/` directory (vitest-based component tests) remains unchanged. The `test/browser_use/` Python smoke test remains unchanged.
+5. **Renderer-agnostic terminal assertions:** Terminal output is read via the xterm.js `Terminal.buffer.active` API through the test harness, NOT via DOM scraping (`.xterm-rows > div`). DOM scraping only works with the DOM renderer; xterm.js defaults to WebGL (with canvas fallback), making DOM scraping produce empty/incorrect results. The buffer API works with all renderers.
 
-6. **Cross-browser in CI only:** Local development defaults to Chromium. CI runs Chromium + Firefox + WebKit.
+6. **Config pre-seeding prevents SetupWizard:** Each test server's temp HOME gets a pre-seeded `config.json` marking the network as configured. Without this, the SetupWizard modal blocks all UI interaction on non-WSL systems.
+
+7. **Existing tests unaffected:** The `test/e2e-browser/` directory is excluded from both vitest configs (added in Task 1 alongside Playwright setup). The existing `test/e2e/` directory (vitest-based component tests) remains unchanged. The `test/browser_use/` Python smoke test remains unchanged.
+
+8. **Cross-browser in CI only:** Local development defaults to Chromium. CI runs Chromium + Firefox + WebKit.
