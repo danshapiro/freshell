@@ -4,7 +4,7 @@
 
 **Goal:** Build an exhaustive Playwright-based E2E browser test suite that tests the full Freshell user experience end-to-end against real server instances, with complete isolation from production installations.
 
-**Architecture:** Each test file spawns its own isolated Freshell server (PORT=0, unique AUTH_TOKEN, unique temp config directory, file watcher disabled). A shared `TestServer` helper manages the server lifecycle (spawn, health-check, teardown). A `TestHarness` exposed via `window.__FRESHELL_TEST_HARNESS__` provides direct access to Redux state and WebSocket connection for precise assertions. Terminal interaction helpers wrap xterm.js DOM access for typing and reading output. Tests cover all user-facing features across 14 spec files with ~80-100 scenarios total.
+**Architecture:** Each test file spawns its own isolated Freshell server (ephemeral port discovered via `net.createServer`, unique AUTH_TOKEN, unique temp HOME directory). A shared `TestServer` helper manages the server lifecycle (find free port, spawn, health-check, teardown). A `TestHarness` exposed via `window.__FRESHELL_TEST_HARNESS__` (activated by `?e2e=1` URL parameter) provides direct access to Redux state and WebSocket connection for precise assertions. Terminal interaction helpers wrap xterm.js DOM access for typing and reading output. Tests cover all user-facing features across 14 spec files with ~80-100 scenarios total.
 
 **Tech Stack:** Playwright, TypeScript, Node.js child_process for server spawning, crypto.randomUUID for token generation, tmp directories for config isolation.
 
@@ -14,26 +14,48 @@
 
 ### 1. Server Isolation Strategy
 
-Each spec file gets its own Freshell server. The server is spawned as a child process running the **source** TypeScript via `tsx` (not a production build), which matches how `npm run dev:server` works. This avoids needing `npm run build` before E2E tests and tests the actual source.
+Each spec file gets its own Freshell server. The server is spawned as a child process running the built production server (`node dist/server/index.js`). The Playwright `globalSetup` ensures the build exists before any tests run.
+
+**Port assignment:** The server code at `server/index.ts:176` sets `const port = Number(process.env.PORT || 3001)` and at line 530 logs this port value directly. It never calls `server.address().port`. This means `PORT=0` would cause the server to log port `0` and the test harness could never discover the real ephemeral port. Instead, the `TestServer` helper finds a free port before spawning the server:
+
+1. Create a temporary `net.Server`, bind it to port `0`, read `server.address().port`, then close it
+2. Pass that discovered port as `PORT=<discovered-port>` to the child process
+3. Health-check `http://127.0.0.1:<discovered-port>/api/health` to confirm startup
+
+This guarantees no conflict with production (3001) or dev (3002) ports while using a known port the test can connect to.
 
 Environment variables for each test server:
-- `PORT=0` — OS assigns an ephemeral port; prevents conflict with production (3001) or dev (3002)
+- `PORT=<ephemeral>` — free port discovered by the TestServer helper (see above)
 - `AUTH_TOKEN=<crypto.randomUUID()>` — unique per test file
 - `HOME=<temp-dir>` — prevents touching real `~/.freshell` or `~/.claude` directories
-- `NODE_ENV=test` — signals test mode
+- `NODE_ENV=production` — serves the built client from `dist/client`
 - `FRESHELL_LOG_DIR=<temp-dir>/logs` — isolates log files
 
 The `HOME` override is the simplest and most complete isolation mechanism: since the server uses `os.homedir()` in config-store, session-scanner, tabs-registry, etc., overriding `HOME` redirects ALL of those paths at once without patching individual modules.
 
 ### 2. Test Harness Bridge (`window.__FRESHELL_TEST_HARNESS__`)
 
-A small bridge module injected into the client (only in non-production builds) exposes:
+A small bridge module installed in the client exposes:
 - `getState()` — returns the full Redux store state
 - `dispatch(action)` — dispatches Redux actions (for test setup)
-- `getWsClient()` — returns the WebSocket client instance
+- `getWsReadyState()` — returns the WebSocket connection state string
 - `waitForConnection()` — resolves when WS is in 'ready' state
 
 This enables precise assertions (e.g., "the Redux store has 3 tabs") without fragile DOM scraping for internal state.
+
+**Activation mechanism:** The harness is gated behind a URL query parameter `?e2e=1`, NOT behind `process.env.NODE_ENV` or `import.meta.env.PROD`. This is because E2E tests run against the production-built client (served by `node dist/server/index.js` with `NODE_ENV=production`), so build-time env gating would exclude the harness code entirely. The URL parameter approach works regardless of build mode:
+
+```ts
+// In App.tsx — check URL parameter, not build-time env
+const params = new URLSearchParams(window.location.search)
+if (params.has('e2e')) {
+  installTestHarness(store, getWsState, waitForWsReady)
+}
+```
+
+The harness code itself is always bundled (it's ~50 lines, negligible size impact) but only activates when the URL explicitly requests it. Tests navigate to `http://127.0.0.1:{port}/?token={token}&e2e=1`.
+
+Note: The Vite client uses `import.meta.env.DEV` / `import.meta.env.PROD` for build-time checks (not `process.env.NODE_ENV`, which is undefined in browser context). This plan does not use either — the URL parameter is a runtime check that works in both dev and production builds.
 
 ### 3. Terminal Interaction Model
 
@@ -48,26 +70,15 @@ For scenarios that need to verify WebSocket messages (terminal I/O, session upda
 - Use `page.evaluate()` to access `window.__FRESHELL_TEST_HARNESS__.getWsClient()` and listen for messages
 - Or use `page.waitForFunction()` to wait for specific Redux state changes caused by WS messages
 
-### 5. No Build Required
+### 5. Production Build Required (Handled Automatically)
 
-Tests run against the dev server (`tsx server/index.ts`), not a production build. This means:
-- No `npm run build` prerequisite
-- Tests execute against the same code that developers work with
-- Vite dev server is NOT needed — Playwright navigates to the Express server which serves the Vite-built client
+E2E tests run against the production-built server and client (`node dist/server/index.js` with `NODE_ENV=production`). This is necessary because in dev mode the Express server does not serve the client — it relies on the separate Vite dev server. Running two processes per test (Vite + Express) would be fragile and slow. Instead:
 
-**Important correction:** In dev mode, the Express server does NOT serve the client — it relies on the Vite dev server. For E2E tests, we need the full stack. Options:
-- Option A: Build the client first, then run the Express server in production mode
-- Option B: Run both Vite dev server and Express server, like `npm run dev`
+1. The Playwright `globalSetup` checks if `dist/client` and `dist/server/index.js` exist
+2. If not, it runs `npm run build:client && npm run build:server` once before all tests
+3. Each spec file spawns `node dist/server/index.js` with isolated env vars
 
-**We choose Option A** — build once before the test suite, then each spec file spawns a production-mode Express server serving the built client. This is simpler and more deterministic. The `webServer` config in `playwright.config.ts` handles this.
-
-Actually, since the build guard (`prebuild-guard.ts`) checks for running production servers on the configured port, and we're in a worktree with no production server, we can safely build. But simpler yet: we configure each test server to run with `NODE_ENV=production` and point it at the existing `dist/` directory. If `dist/` doesn't exist, the Playwright `globalSetup` builds it.
-
-**Final approach:** The Playwright `globalSetup` script:
-1. Checks if `dist/client` exists; if not, runs `npm run build:client` and `npm run build:server`
-2. Each test file spawns `node dist/server/index.js` with isolated env vars
-
-This is the most reliable approach because it tests the actual production code path.
+This tests the actual production code path and is fully deterministic. The build guard (`prebuild-guard.ts`) only blocks if a production server is detected on the configured PORT; since E2E servers use ephemeral ports, there is no conflict.
 
 ### 6. Directory Layout
 
@@ -154,8 +165,8 @@ export default defineConfig({
     screenshot: 'only-on-failure',
     video: 'on-first-retry',
   },
-  globalSetup: require.resolve('./global-setup'),
-  globalTeardown: require.resolve('./global-teardown'),
+  globalSetup: './global-setup.ts',
+  globalTeardown: './global-teardown.ts',
   projects: [
     {
       name: 'chromium',
@@ -297,14 +308,23 @@ Expected: FAIL (module not found)
 
 **Step 3: Write the TestServer implementation**
 
+Note: This project uses ESM (`"type": "module"` in package.json). There is no global `__dirname` in ESM. All modules must derive it from `import.meta.url` using `fileURLToPath` and `path.dirname`, as the existing server code does at `server/index.ts:58-59`.
+
+Note: The server at `server/index.ts:176` evaluates `const port = Number(process.env.PORT || 3001)` and logs this value directly. It never calls `server.address().port` to discover the actual bound port. Therefore `PORT=0` would cause the server to log and report port `0`, making port discovery impossible. Instead, the TestServer discovers a free port before spawning by briefly binding a `net.Server` to port `0`, reading the assigned port, then closing it.
+
 ```ts
 // test/e2e-browser/helpers/test-server.ts
 import { spawn, type ChildProcess } from 'child_process'
 import { randomUUID } from 'crypto'
+import net from 'net'
 import fs from 'fs'
 import fsp from 'fs/promises'
 import os from 'os'
 import path from 'path'
+import { fileURLToPath } from 'url'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
 
 export interface TestServerInfo {
   port: number
@@ -325,10 +345,41 @@ export interface TestServerOptions {
 }
 
 /**
+ * Find an available ephemeral port by briefly binding to port 0.
+ * The OS assigns a free port, we read it, then close immediately.
+ */
+async function findFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer()
+    srv.listen(0, '127.0.0.1', () => {
+      const addr = srv.address()
+      if (!addr || typeof addr === 'string') {
+        srv.close(() => reject(new Error('Could not determine free port')))
+        return
+      }
+      const port = addr.port
+      srv.close(() => resolve(port))
+    })
+    srv.on('error', reject)
+  })
+}
+
+function findProjectRoot(): string {
+  let dir = path.resolve(__dirname)
+  while (dir !== path.dirname(dir)) {
+    if (fs.existsSync(path.join(dir, 'package.json'))) {
+      return dir
+    }
+    dir = path.dirname(dir)
+  }
+  throw new Error('Could not find project root (no package.json found)')
+}
+
+/**
  * Spawns an isolated Freshell server for E2E testing.
  *
  * Each instance gets:
- * - An ephemeral port (PORT=0, read from health check after startup)
+ * - An ephemeral port (discovered via findFreePort, then passed as PORT env var)
  * - A unique AUTH_TOKEN
  * - An isolated HOME directory (prevents touching ~/.freshell or ~/.claude)
  * - Isolated log directory
@@ -337,6 +388,8 @@ export class TestServer {
   private process: ChildProcess | null = null
   private _info: TestServerInfo | null = null
   private configDir: string | null = null
+  private stdoutBuffer = ''
+  private stderrBuffer = ''
   private readonly options: TestServerOptions
 
   constructor(options: TestServerOptions = {}) {
@@ -352,6 +405,7 @@ export class TestServer {
     if (this.process) throw new Error('TestServer already started')
 
     const token = randomUUID()
+    const port = await findFreePort()
     this.configDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-e2e-'))
 
     // Create the .freshell config dir inside the temp HOME so the server doesn't error
@@ -362,7 +416,6 @@ export class TestServer {
     const logsDir = path.join(this.configDir, '.freshell', 'logs')
     await fsp.mkdir(logsDir, { recursive: true })
 
-    // Find the project root (where package.json lives)
     const projectRoot = findProjectRoot()
 
     // We need the built server and client for production mode
@@ -376,12 +429,11 @@ export class TestServer {
 
     const env: Record<string, string> = {
       ...process.env as Record<string, string>,
-      PORT: '0',
+      PORT: String(port),
       AUTH_TOKEN: token,
       HOME: this.configDir,
       NODE_ENV: 'production',
       FRESHELL_LOG_DIR: logsDir,
-      // Suppress the startup token in output since we control it
       HIDE_STARTUP_TOKEN: 'true',
       ...this.options.env,
     }
@@ -397,41 +449,26 @@ export class TestServer {
 
     const pid = this.process.pid!
 
-    // Capture stdout to find the port
-    let stdout = ''
-    let stderr = ''
-
     this.process.stdout!.on('data', (chunk: Buffer) => {
       const text = chunk.toString()
-      stdout += text
+      this.stdoutBuffer += text
       if (this.options.verbose) process.stdout.write(`[test-server:${pid}] ${text}`)
     })
 
     this.process.stderr!.on('data', (chunk: Buffer) => {
       const text = chunk.toString()
-      stderr += text
+      this.stderrBuffer += text
       if (this.options.verbose) process.stderr.write(`[test-server:${pid}] ${text}`)
     })
-
-    // Wait for the server to be healthy
-    const timeoutMs = this.options.startTimeoutMs ?? 30_000
-    const port = await this.waitForPort(stdout, stderr, timeoutMs)
 
     const baseUrl = `http://127.0.0.1:${port}`
     const wsUrl = `ws://127.0.0.1:${port}`
 
-    // Verify health
+    // Wait for health check to pass (confirms server is listening on the port)
+    const timeoutMs = this.options.startTimeoutMs ?? 30_000
     await this.waitForHealth(baseUrl, timeoutMs)
 
-    this._info = {
-      port,
-      baseUrl,
-      wsUrl,
-      token,
-      configDir: this.configDir,
-      pid,
-    }
-
+    this._info = { port, baseUrl, wsUrl, token, configDir: this.configDir, pid }
     return this._info
   }
 
@@ -440,6 +477,8 @@ export class TestServer {
 
     const proc = this.process
     this.process = null
+    this.stdoutBuffer = ''
+    this.stderrBuffer = ''
 
     return new Promise<void>((resolve) => {
       const timeout = setTimeout(() => {
@@ -454,7 +493,6 @@ export class TestServer {
 
       proc.kill('SIGTERM')
     }).finally(async () => {
-      // Clean up temp directory
       if (this.configDir) {
         await fsp.rm(this.configDir, { recursive: true, force: true }).catch(() => {})
         this.configDir = null
@@ -463,53 +501,18 @@ export class TestServer {
     })
   }
 
-  private async waitForPort(
-    stdout: string,
-    stderr: string,
-    timeoutMs: number,
-  ): Promise<number> {
-    const start = Date.now()
-    const portRegex = /Server listening.*?"port":(\d+)/
-
-    // The server logs the port in JSON format via pino
-    // Also check for the "freshell is ready" message which has the URL
-    while (Date.now() - start < timeoutMs) {
-      // Check if the process exited
-      if (this.process?.exitCode !== null && this.process?.exitCode !== undefined) {
-        throw new Error(
-          `Test server exited with code ${this.process.exitCode} before becoming ready.\n` +
-          `stderr: ${stderr}\nstdout: ${stdout}`
-        )
-      }
-
-      // Look for port in pino JSON log output
-      const match = stdout.match(portRegex)
-      if (match) {
-        return parseInt(match[1], 10)
-      }
-
-      // Also try URL pattern from the startup message
-      const urlMatch = stdout.match(/http:\/\/[\w.]+:(\d+)/)
-      if (urlMatch) {
-        return parseInt(urlMatch[1], 10)
-      }
-
-      await new Promise((r) => setTimeout(r, 100))
-      // Re-read accumulated stdout (the event handler keeps appending)
-      // We need a workaround since stdout is a local captured by closure
-      // Actually, we have a reference problem. Let's fix this.
-    }
-
-    throw new Error(
-      `Timed out waiting for test server port after ${timeoutMs}ms.\n` +
-      `stdout: ${stdout}\nstderr: ${stderr}`
-    )
-  }
-
   private async waitForHealth(baseUrl: string, timeoutMs: number): Promise<void> {
     const start = Date.now()
 
     while (Date.now() - start < timeoutMs) {
+      // Check if the process crashed
+      if (this.process?.exitCode !== null && this.process?.exitCode !== undefined) {
+        throw new Error(
+          `Test server exited with code ${this.process.exitCode} before becoming ready.\n` +
+          `stderr: ${this.stderrBuffer}\nstdout: ${this.stdoutBuffer}`
+        )
+      }
+
       try {
         const res = await fetch(`${baseUrl}/api/health`)
         if (res.ok) {
@@ -517,50 +520,17 @@ export class TestServer {
           if (body.ok) return
         }
       } catch {
-        // Server not ready yet
+        // Server not ready yet — connection refused is expected
       }
       await new Promise((r) => setTimeout(r, 200))
     }
 
-    throw new Error(`Timed out waiting for test server health at ${baseUrl}/api/health`)
+    throw new Error(
+      `Timed out waiting for test server health after ${timeoutMs}ms.\n` +
+      `stdout: ${this.stdoutBuffer}\nstderr: ${this.stderrBuffer}`
+    )
   }
 }
-
-function findProjectRoot(): string {
-  let dir = path.resolve(__dirname)
-  while (dir !== path.dirname(dir)) {
-    if (fs.existsSync(path.join(dir, 'package.json'))) {
-      return dir
-    }
-    dir = path.dirname(dir)
-  }
-  throw new Error('Could not find project root (no package.json found)')
-}
-```
-
-**Step 4: Fix the port detection issue**
-
-The `waitForPort` method has a closure capture issue — `stdout` is a primitive string captured by value. Refactor to use a shared mutable buffer object:
-
-```ts
-// Replace the stdout/stderr capture with a shared buffer object:
-private stdoutBuffer = ''
-private stderrBuffer = ''
-
-// In start():
-this.process.stdout!.on('data', (chunk: Buffer) => {
-  const text = chunk.toString()
-  this.stdoutBuffer += text
-  if (this.options.verbose) process.stdout.write(`[test-server:${pid}] ${text}`)
-})
-
-this.process.stderr!.on('data', (chunk: Buffer) => {
-  const text = chunk.toString()
-  this.stderrBuffer += text
-  if (this.options.verbose) process.stderr.write(`[test-server:${pid}] ${text}`)
-})
-
-// waitForPort reads from this.stdoutBuffer and this.stderrBuffer
 ```
 
 **Step 5: Run tests to verify they pass**
@@ -593,6 +563,10 @@ git commit -m "feat: add TestServer helper for isolated E2E server instances"
 import { execSync } from 'child_process'
 import fs from 'fs'
 import path from 'path'
+import { fileURLToPath } from 'url'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
 
 function findProjectRoot(): string {
   let dir = __dirname
@@ -635,16 +609,7 @@ export default async function globalTeardown() {
 }
 ```
 
-**Step 3: Update playwright.config.ts to use proper imports**
-
-The config should use relative paths correctly:
-
-```ts
-globalSetup: './global-setup.ts',
-globalTeardown: './global-teardown.ts',
-```
-
-**Step 4: Commit**
+**Step 3: Commit**
 
 ```bash
 git add test/e2e-browser/global-setup.ts test/e2e-browser/global-teardown.ts
@@ -657,15 +622,14 @@ git commit -m "feat: add E2E global setup (build) and teardown"
 
 **Files:**
 - Create: `src/lib/test-harness.ts`
-- Modify: `src/App.tsx` (inject harness in non-production)
+- Modify: `src/App.tsx` (inject harness when URL has `?e2e=1`)
 - Create: `test/e2e-browser/helpers/test-harness.ts`
 
-**Step 1: Create the client-side test harness**
+**Step 1: Create the client-side test harness module**
 
 ```ts
 // src/lib/test-harness.ts
 import type { store as appStore } from '@/store/store'
-import type { WsClient } from '@/lib/ws-client'
 
 export interface FreshellTestHarness {
   getState: () => ReturnType<typeof appStore.getState>
@@ -683,7 +647,11 @@ declare global {
 
 /**
  * Install the test harness on window.__FRESHELL_TEST_HARNESS__.
- * Only called in non-production builds.
+ *
+ * Activation: This is called when the URL contains `?e2e=1`.
+ * It is NOT gated behind import.meta.env.PROD or process.env.NODE_ENV
+ * because E2E tests run against the production-built client. The URL
+ * parameter is a runtime check that works in all build modes.
  */
 export function installTestHarness(
   store: typeof appStore,
@@ -706,27 +674,40 @@ export function installTestHarness(
 }
 ```
 
-**Step 2: Inject the harness in App.tsx**
+**Step 2: Wire up the harness in App.tsx**
 
-Add to `src/App.tsx`, inside the main App component's first useEffect (or as a top-level call before rendering):
+Add to `src/App.tsx`. The harness is activated by a URL query parameter `?e2e=1`, which E2E tests include when navigating to Freshell. This is a runtime check that works in both dev and production builds.
+
+Add the import at the top of App.tsx alongside the existing imports:
 
 ```ts
-// Near the top of the App function component, after store is available:
 import { installTestHarness } from '@/lib/test-harness'
-import { store } from '@/store/store'
-import { getWsClient } from '@/lib/ws-client'
+```
 
-// In the App component body (NOT in useEffect — needs to run synchronously):
-if (process.env.NODE_ENV !== 'production') {
+Inside the App component function, add a `useState` initializer (runs once on mount, before effects) near the top of the component body:
+
+```ts
+// Install test harness when URL has ?e2e=1 parameter (for Playwright E2E tests).
+// Uses useState initializer to run exactly once. The URL parameter approach is
+// used instead of import.meta.env.PROD because E2E tests run against the
+// production build where PROD=true.
+const [_harnessInstalled] = useState(() => {
+  if (typeof window === 'undefined') return false
+  const params = new URLSearchParams(window.location.search)
+  if (!params.has('e2e')) return false
+
   const ws = getWsClient()
   installTestHarness(
     store,
-    () => ws.state,
+    () => (ws as any)._state || 'unknown',
     (timeoutMs = 10_000) => new Promise<void>((resolve, reject) => {
-      if (ws.state === 'ready') { resolve(); return }
-      const timeout = setTimeout(() => reject(new Error('WS connection timeout')), timeoutMs)
+      if ((ws as any)._state === 'ready') { resolve(); return }
+      const timeout = setTimeout(
+        () => reject(new Error('WS connection timeout')),
+        timeoutMs,
+      )
       const unsub = ws.onMessage(() => {
-        if (ws.state === 'ready') {
+        if ((ws as any)._state === 'ready') {
           clearTimeout(timeout)
           unsub()
           resolve()
@@ -734,21 +715,8 @@ if (process.env.NODE_ENV !== 'production') {
       })
     }),
   )
-}
-```
-
-**Important:** The test harness is gated behind `process.env.NODE_ENV !== 'production'`. But for E2E tests, we run the server in production mode to test the built client. This means the harness won't be installed.
-
-**Resolution:** Gate the harness behind a different flag. Use `window.location.search` to check for `?__test_harness__=1`, or use a build-time flag via Vite's `define`. The cleanest approach: always include the harness code (it's tiny), and gate installation behind a URL query parameter that tests add.
-
-Revised gating:
-
-```ts
-// Install test harness when URL has ?e2e=1 parameter
-const urlParams = new URLSearchParams(window.location.search)
-if (urlParams.has('e2e')) {
-  installTestHarness(/* ... */)
-}
+  return true
+})
 ```
 
 Tests navigate to `http://127.0.0.1:{port}/?token={token}&e2e=1`.
@@ -2607,78 +2575,36 @@ git commit -m "feat: add E2E test npm scripts"
 
 ---
 
-## Task 23: Wire Up Test Harness in App.tsx
+## Task 23: Verify Test Harness Works End-to-End
 
 **Files:**
-- Modify: `src/App.tsx`
-- Modify: `src/lib/test-harness.ts`
+- No new files — verification only
 
-This task integrates the test harness bridge into the actual application. The harness is only activated when the URL contains `?e2e=1`.
+This task verifies that the harness wired up in Task 4 works correctly against the production build.
 
-**Step 1: Write a test verifying the harness is not installed by default**
+**Step 1: Build the client (includes harness code)**
 
-```ts
-// Already covered by auth.spec.ts — the freshellPage fixture navigates with e2e=1
-// and waitForHarness succeeds. A test without e2e=1 should NOT have the harness.
+```bash
+npm run build:client
 ```
 
-**Step 2: Add the import and initialization to App.tsx**
-
-In `src/App.tsx`, add after the existing imports:
-
-```ts
-import { installTestHarness } from '@/lib/test-harness'
-```
-
-Inside the App component function, before the first `useEffect`, add:
-
-```ts
-// Install test harness when URL has e2e parameter (for Playwright E2E tests)
-const [harnessInstalled] = useState(() => {
-  if (typeof window !== 'undefined') {
-    const params = new URLSearchParams(window.location.search)
-    if (params.has('e2e')) {
-      const ws = getWsClient()
-      installTestHarness(
-        store,
-        () => (ws as any)._state || 'unknown',
-        (timeoutMs = 10_000) => new Promise<void>((resolve, reject) => {
-          if ((ws as any)._state === 'ready') { resolve(); return }
-          const timeout = setTimeout(
-            () => reject(new Error('WS connection timeout')),
-            timeoutMs,
-          )
-          const unsub = ws.onMessage(() => {
-            if ((ws as any)._state === 'ready') {
-              clearTimeout(timeout)
-              unsub()
-              resolve()
-            }
-          })
-        }),
-      )
-      return true
-    }
-  }
-  return false
-})
-```
-
-**Step 3: Verify the test harness works**
-
-Run the E2E auth tests:
+**Step 2: Run the auth spec which exercises the harness**
 
 ```bash
 npx playwright test --config test/e2e-browser/playwright.config.ts specs/auth.spec.ts
 ```
 
-Expected: PASS
+Expected: PASS (the `freshellPage` fixture navigates with `?e2e=1`, which activates the harness)
 
-**Step 4: Commit**
+**Step 3: Verify harness is NOT installed without the e2e parameter**
+
+Manually verify by navigating to `http://127.0.0.1:{port}/?token={token}` (no `&e2e=1`) and checking that `window.__FRESHELL_TEST_HARNESS__` is `undefined`. This is implicitly tested by the auth spec's "shows auth modal when no token provided" test, which navigates without `e2e=1`.
+
+**Step 4: Commit any fixes if needed**
 
 ```bash
-git add src/App.tsx src/lib/test-harness.ts
-git commit -m "feat: wire up test harness bridge in App.tsx"
+git add -A
+git commit -m "test: verify test harness works in production build"
 ```
 
 ---
@@ -2743,7 +2669,7 @@ git commit -m "test: finalize E2E test suite and fix selector issues"
 
 ## Key Architecture Invariants
 
-1. **No production interference:** Every test server uses `HOME=<tmpdir>`, `PORT=0`, unique `AUTH_TOKEN`. No test touches `~/.freshell`, `~/.claude`, port 3001, or port 3002.
+1. **No production interference:** Every test server uses `HOME=<tmpdir>`, a pre-discovered ephemeral `PORT` (via `net.createServer` bind-to-0), and a unique `AUTH_TOKEN`. No test touches `~/.freshell`, `~/.claude`, port 3001, or port 3002.
 
 2. **Worker-scoped servers:** The `testServer` fixture uses `{ scope: 'worker' }` so all tests in one spec file share a single server, reducing spawn overhead while maintaining isolation between spec files.
 
