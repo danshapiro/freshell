@@ -10,14 +10,21 @@ const FIXTURES_DIR = path.join(__dirname, '../../fixtures/sessions')
 describe('SessionRepairService', () => {
   let tempDir: string
   let homedirSpy: ReturnType<typeof vi.spyOn>
+  const originalClaudeHome = process.env.CLAUDE_HOME
 
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'session-repair-service-'))
     homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(tempDir)
+    process.env.CLAUDE_HOME = path.join(tempDir, '.claude')
   })
 
   afterEach(async () => {
     homedirSpy.mockRestore()
+    if (originalClaudeHome === undefined) {
+      delete process.env.CLAUDE_HOME
+    } else {
+      process.env.CLAUDE_HOME = originalClaudeHome
+    }
     await fs.rm(tempDir, { recursive: true, force: true })
   })
 
