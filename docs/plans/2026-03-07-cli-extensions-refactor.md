@@ -4,7 +4,7 @@
 
 **Goal:** Create an `extensions/` folder in the repo where dropping a folder with a `freshell.json` manifest adds a new CLI pane type, and refactor Claude Code and Codex CLI to be the first two extensions using this system.
 
-**Architecture:** The extension system infrastructure (ExtensionManager, manifests, routes, ExtensionPane) already exists. CLI extensions currently use a parallel hardcoded system: `TerminalMode` enum in spawn-spec.ts, `CodingCliProviderSchema` in ws-protocol.ts, `CODING_CLI_PROVIDER_CONFIGS` in coding-cli-utils.ts, `CLI_COMMANDS` in platform.ts, `CODING_CLI_COMMANDS` in spawn-spec.ts. This refactoring creates `extensions/claude-code/` and `extensions/codex-cli/` folders with `freshell.json` manifests, then rewires the server to derive CLI availability, spawn commands, picker visibility, and terminal modes from the extension registry instead of hardcoded lists. The frontend PanePicker already renders extension entries; CLI extensions need to create terminal panes (kind: 'terminal') rather than extension panes (kind: 'extension'), which requires a small routing change.
+**Architecture:** The extension system infrastructure (ExtensionManager, manifests, routes, ExtensionPane) already exists. CLI extensions currently use a parallel hardcoded system: `TerminalMode` enum in `server/terminal-registry.ts`, `CodingCliProviderSchema` in `shared/ws-protocol.ts`, `CODING_CLI_PROVIDER_CONFIGS` in `src/lib/coding-cli-utils.ts`, `CLI_COMMANDS` in `server/platform.ts`, and `CODING_CLI_COMMANDS` in `server/terminal-registry.ts`. This refactoring creates `extensions/claude-code/` and `extensions/codex-cli/` folders with `freshell.json` manifests, then rewires the server to derive CLI availability, spawn commands, picker visibility, and terminal modes from the extension registry instead of hardcoded lists. The frontend PanePicker already renders extension entries; CLI extensions need to create terminal panes (kind: 'terminal') rather than extension panes (kind: 'extension'), which requires a small routing change.
 
 **Tech Stack:** TypeScript, Zod (manifest validation), Node.js (server), React/Redux (client), Vitest (testing)
 
@@ -14,31 +14,42 @@
 
 ## Analysis: What Changes and What Stays
 
-### Current hardcoded CLI registrations (to be replaced)
+### The central file: `server/terminal-registry.ts`
 
-1. **`server/platform.ts` - `CLI_COMMANDS` array** -- detects which CLIs are available on the system (e.g., `which claude`). This feeds `availableClis` to the frontend.
+**`server/terminal-registry.ts`** is the authoritative location for PTY lifecycle management and spawn logic. It is imported by `server/ws-handler.ts` and is the only file used in production. It contains:
 
-2. **`server/spawn-spec.ts` - `TerminalMode` type + `CODING_CLI_COMMANDS` record** -- maps mode names to spawn commands, env vars, resume args, and labels. Used by `buildSpawnSpec()` to construct the PTY spawn arguments.
+- `TerminalMode` type (line 33): `'shell' | 'claude' | 'codex' | 'opencode' | 'gemini' | 'kimi'`
+- `CodingCliCommandSpec` type (line 36): includes `label`, `envVar`, `defaultCommand`, `resumeArgs`, and `supportsPermissionMode`
+- `CODING_CLI_COMMANDS` record (line 44): `Record<Exclude<TerminalMode, 'shell'>, CodingCliCommandSpec>` -- maps mode names to spawn specs
+- `resolveCodingCliCommand()` (line 205): accepts `mode`, `resumeSessionId`, `target`, and `providerSettings` params
+- `buildSpawnSpec()` (line 622): constructs PTY spawn arguments from mode, cwd, shell, etc.
+- `TerminalRegistry` class (line 792): manages PTY processes, constructed with `(settings?, maxTerminals?, maxExitedTerminals?)`
+- `modeSupportsResume()` (line 79): checks if a mode has `resumeArgs`
+- `getModeLabel()` (line 233): returns display label for a mode
 
-3. **`shared/ws-protocol.ts` - `CodingCliProviderSchema`** -- Zod enum `['claude', 'codex', 'opencode', 'gemini', 'kimi']` used in `TerminalCreateSchema.mode` field. This is the WS protocol contract.
+**Note:** `server/spawn-spec.ts` exists but is dead code -- it is never imported by any production or test file. All references in this plan target `server/terminal-registry.ts`.
 
-4. **`src/lib/coding-cli-utils.ts` - `CODING_CLI_PROVIDER_CONFIGS`** -- frontend config for picker display, model/sandbox/permission support flags.
+### Other hardcoded CLI registrations
 
-5. **`src/lib/coding-cli-types.ts`** -- re-exports `CodingCliProviderName` from ws-protocol.
+1. **`server/platform.ts` - `CLI_COMMANDS` array** (line 95): detects which CLIs are available on the system (e.g., `which claude`). Feeds `availableClis` to the frontend.
+
+2. **`shared/ws-protocol.ts` - `TerminalCreateSchema.mode`** (line 170): Zod enum `z.enum(['shell', 'claude', 'codex', 'opencode', 'gemini', 'kimi'])` used for WS message validation.
+
+3. **`src/lib/coding-cli-utils.ts` - `CODING_CLI_PROVIDER_CONFIGS`** -- frontend config for picker display.
 
 ### What stays unchanged (session indexing, providers)
 
 The `server/coding-cli/` directory (session-indexer.ts, session-manager.ts, providers/claude.ts, providers/codex.ts, types.ts, utils.ts) handles session file parsing, JSONL indexing, and streaming JSON output. This is **orthogonal** to the extension system -- it's about understanding session history, not about spawning or picking CLI panes. These files stay as-is.
 
-### The refactoring approach
+### Type strategy: preserving type safety
 
-Rather than trying to make the `TerminalMode` type dynamic (which would require changing the Zod schema, WS protocol, and dozens of type assertions), we take a pragmatic approach:
+The `TerminalMode` type is a union of string literals that types the `CODING_CLI_COMMANDS` record via `Record<Exclude<TerminalMode, 'shell'>, CodingCliCommandSpec>`. Widening `TerminalMode` to `string` would break this record's type safety -- `Exclude<string, 'shell'>` is `string`, making the record accept arbitrary keys and lose compile-time exhaustiveness checking.
 
-1. **Create extension manifest files** in `extensions/claude-code/` and `extensions/codex-cli/` with all the metadata needed.
-2. **Add a third scan directory** for the repo-local `extensions/` folder (alongside `~/.freshell/extensions/` and `.freshell/extensions/`).
-3. **Derive `availableClis`** from CLI extension manifests instead of the hardcoded `CLI_COMMANDS` array.
-4. **Derive spawn commands** from CLI extension manifests instead of `CODING_CLI_COMMANDS`.
-5. **Keep the `TerminalMode` type and WS protocol unchanged** -- CLI extensions register their `name` as a valid terminal mode. The Zod schema continues to validate known modes; unknown CLI extension modes pass through validation as the schema evolves.
+**Solution:** Keep `TerminalMode` as the hardcoded union for internal type safety. Introduce a separate wider type, `TerminalModeOrExtension` (= `TerminalMode | string`), for API boundaries where extension modes need to pass through. The functions that can handle extension modes (`resolveCodingCliCommand`, `buildSpawnSpec`, `modeSupportsResume`, `getModeLabel`, `TerminalRegistry.create`) accept the wider type but the `CODING_CLI_COMMANDS` record retains its strict typing.
+
+### WS protocol validation strategy
+
+The `TerminalCreateSchema.mode` field currently uses `z.enum(...)`, which rejects unknown modes at parse time. Changing to `z.string()` would silently accept typos and garbage. Instead, we dynamically build the set of valid modes from the hardcoded list plus registered CLI extensions, and use `z.string().refine()` to validate against it. The ws-handler already builds its own `ClientMessageSchema` at module level (line 238 of ws-handler.ts), so we move the schema construction to a factory that accepts the set of valid modes.
 
 ### Key insight: CLI extensions create terminal panes, not extension panes
 
@@ -114,8 +125,8 @@ Run the existing extension manifest validation in a quick test:
 ```bash
 cd /home/user/code/freshell/.worktrees/extensions-system
 npx tsx -e "
-const fs = require('fs');
-const { ExtensionManifestSchema } = require('./server/extension-manifest.js');
+import fs from 'fs';
+import { ExtensionManifestSchema } from './server/extension-manifest.js';
 for (const dir of ['extensions/claude-code', 'extensions/codex-cli']) {
   const raw = JSON.parse(fs.readFileSync(dir + '/freshell.json', 'utf-8'));
   const result = ExtensionManifestSchema.safeParse(raw);
@@ -183,13 +194,11 @@ Currently, `server/platform.ts` has a hardcoded `CLI_COMMANDS` array. After this
 
 **Files:**
 - Modify: `server/platform.ts` - `detectAvailableClis()` function
-- Modify: `server/index.ts` - pass ExtensionManager to platform detection
+- Modify: `server/index.ts` - pass CLI extension data to platform detection
 
-**Step 1: Export the ExtensionManager reference for platform detection**
+**Step 1: Modify `detectAvailableClis` to accept additional CLI specs**
 
-In `server/index.ts`, the `detectAvailableClis` function is passed to the platform router as a dependency. We need to pass the extension manager so it can check CLI extensions too.
-
-Modify the `detectAvailableClis` call site in `server/index.ts` to pass the extension manager. The simplest approach: make `detectAvailableClis` accept an optional list of additional CLI names/commands from extensions.
+The codebase uses dependency injection via function arguments (see `createPlatformRouter`, `createExtensionRouter`). Follow the same pattern: pass extra CLI specs as a parameter.
 
 In `server/platform.ts`, modify `detectAvailableClis` to accept an optional parameter:
 
@@ -197,7 +206,7 @@ In `server/platform.ts`, modify `detectAvailableClis` to accept an optional para
 export async function detectAvailableClis(
   extraClis?: Array<{ name: string; command: string }>
 ): Promise<AvailableClis> {
-  const allClis = [
+  const allClis: Array<{ name: string; envVar: string; defaultCmd: string }> = [
     ...CLI_COMMANDS,
     ...(extraClis ?? []).map(c => ({ name: c.name, envVar: '', defaultCmd: c.command })),
   ]
@@ -219,7 +228,9 @@ export async function detectAvailableClis(
 }
 ```
 
-In `server/index.ts`, where `detectAvailableClis` is called (in the platform router deps), pass extra CLIs from extensions:
+**Step 2: In `server/index.ts`, build the extra CLIs list from the extension registry**
+
+Where `detectAvailableClis` is passed to the platform router deps, extract CLI extension data and pass it:
 
 ```typescript
 const cliExtensions = extensionManager.getAll()
@@ -230,64 +241,92 @@ const cliExtensions = extensionManager.getAll()
 detectAvailableClis: () => detectAvailableClis(cliExtensions),
 ```
 
-**Step 2: Commit**
+Also do the same where `detectAvailableClis` is called in `server/routes/settings.ts` (line 75).
+
+**Step 3: Commit**
 
 ```bash
-git add server/platform.ts server/index.ts
+git add server/platform.ts server/index.ts server/routes/settings.ts
 git commit -m "feat: derive CLI availability from extension registry"
 ```
 
 ---
 
-### Task 4: Derive spawn commands from CLI extension manifests
+### Task 4: Introduce `TerminalModeOrExtension` type and add extension fallback to spawn resolution
 
-Currently, `server/spawn-spec.ts` has a hardcoded `CODING_CLI_COMMANDS` record that maps mode names to spawn specifications. We need CLI extensions to also provide spawn specs.
+The central file for spawn logic is **`server/terminal-registry.ts`** (not `spawn-spec.ts`, which is dead code). The `CODING_CLI_COMMANDS` record is typed as `Record<Exclude<TerminalMode, 'shell'>, CodingCliCommandSpec>`. We must **not** widen `TerminalMode` to `string` because that would make `Exclude<TerminalMode, 'shell'>` collapse to `string`, breaking the record's type safety.
+
+Instead, introduce a wider type for API boundaries and pass the extension manager as a parameter (following the codebase's dependency injection pattern).
 
 **Files:**
-- Modify: `server/spawn-spec.ts` - add extension-aware command resolution
-- Modify: `server/index.ts` - wire ExtensionManager to spawn spec resolution
+- Modify: `server/terminal-registry.ts` - add `TerminalModeOrExtension` type, modify `resolveCodingCliCommand`, `buildSpawnSpec`, `modeSupportsResume`, `getModeLabel`, and `TerminalRegistry.create` to accept extension CLIs via injected data
 
-**Step 1: Add fallback to extension registry in spawn-spec.ts**
+**Step 1: Add the wider type and CLI extension lookup interface**
 
-The `resolveCodingCliCommand` function currently only checks `CODING_CLI_COMMANDS`. Add a fallback that checks the extension registry for CLI extensions with matching names.
-
-Add a module-level variable that can be set by the server entry point:
+At the top of `server/terminal-registry.ts`, after the existing `TerminalMode` type:
 
 ```typescript
-// Module-level extension registry reference for spawn resolution
-let extensionManagerRef: { get(name: string): { manifest: { cli?: { command: string; args?: string[]; env?: Record<string, string> } } } | undefined } | null = null
+// TerminalMode stays as the hardcoded union for type-safe CODING_CLI_COMMANDS indexing.
+export type TerminalMode = 'shell' | 'claude' | 'codex' | 'opencode' | 'gemini' | 'kimi'
 
-export function setSpawnSpecExtensionManager(mgr: typeof extensionManagerRef) {
-  extensionManagerRef = mgr
+// Wider type for API boundaries where extension-provided modes pass through.
+export type TerminalModeOrExtension = TerminalMode | (string & {})
+
+/**
+ * Minimal CLI extension data needed for spawn resolution.
+ * Decouples terminal-registry from the full ExtensionManager type.
+ */
+export interface CliExtensionSpec {
+  name: string
+  label: string
+  command: string
+  args?: string[]
+  env?: Record<string, string>
 }
 ```
 
-Modify `resolveCodingCliCommand` to fall back to extension manifests:
+**Step 2: Modify `resolveCodingCliCommand` to accept extension fallback data**
+
+Change the function signature to accept `TerminalModeOrExtension` and an optional `cliExtensions` array. Use `CODING_CLI_COMMANDS` for known modes, fall back to extensions for unknown modes:
 
 ```typescript
-function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, target: ProviderTarget = 'unix') {
+function resolveCodingCliCommand(
+  mode: TerminalModeOrExtension,
+  resumeSessionId?: string,
+  target: ProviderTarget = 'unix',
+  providerSettings?: ProviderSettings,
+  cliExtensions?: CliExtensionSpec[],
+) {
   if (mode === 'shell') return null
 
-  // Check hardcoded specs first
-  const spec = CODING_CLI_COMMANDS[mode]
+  // Check hardcoded specs first (type-safe indexing)
+  const knownMode = mode as TerminalMode
+  const spec = mode !== 'shell' ? CODING_CLI_COMMANDS[knownMode as Exclude<TerminalMode, 'shell'>] : undefined
   if (spec) {
     const command = process.env[spec.envVar] || spec.defaultCommand
-    const providerArgs = providerNotificationArgs(mode, target)
+    const providerArgs = providerNotificationArgs(knownMode, target)
     let resumeArgs: string[] = []
-    if (resumeSessionId && spec.resumeArgs) {
-      resumeArgs = spec.resumeArgs(resumeSessionId)
+    if (resumeSessionId) {
+      if (spec.resumeArgs) {
+        resumeArgs = spec.resumeArgs(resumeSessionId)
+      } else {
+        logger.warn({ mode, resumeSessionId }, 'Resume requested but no resume args configured')
+      }
     }
-    return { command, args: [...providerArgs, ...resumeArgs], label: spec.label }
+    const settingsArgs: string[] = []
+    if (spec.supportsPermissionMode && providerSettings?.permissionMode && providerSettings.permissionMode !== 'default') {
+      settingsArgs.push('--permission-mode', providerSettings.permissionMode)
+    }
+    return { command, args: [...providerArgs, ...settingsArgs, ...resumeArgs], label: spec.label }
   }
 
-  // Fall back to extension registry
-  if (extensionManagerRef) {
-    const ext = extensionManagerRef.get(mode)
-    if (ext?.manifest.cli) {
-      const cli = ext.manifest.cli
+  // Fall back to CLI extension specs
+  if (cliExtensions) {
+    const ext = cliExtensions.find(e => e.name === mode)
+    if (ext) {
       const envVarName = `${mode.toUpperCase()}_CMD`
-      const command = process.env[envVarName] || cli.command
-      return { command, args: cli.args || [], label: mode }
+      const command = process.env[envVarName] || ext.command
+      return { command, args: ext.args || [], label: ext.label }
     }
   }
 
@@ -295,63 +334,200 @@ function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, t
 }
 ```
 
-In `server/index.ts`, wire the extension manager:
+**Step 3: Modify `buildSpawnSpec` to accept and pass through extension data**
+
+Change `buildSpawnSpec` signature to use `TerminalModeOrExtension` and accept `cliExtensions`:
 
 ```typescript
-import { setSpawnSpecExtensionManager } from './spawn-spec.js'
-// After extensionManager.scan():
-setSpawnSpecExtensionManager(extensionManager)
+export function buildSpawnSpec(
+  mode: TerminalModeOrExtension,
+  cwd: string | undefined,
+  shell: ShellType,
+  resumeSessionId?: string,
+  providerSettings?: ProviderSettings,
+  envOverrides?: Record<string, string>,
+  cliExtensions?: CliExtensionSpec[],
+) {
+  // ... existing body unchanged, except pass cliExtensions to resolveCodingCliCommand calls:
+  // Change: resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings)
+  // To:     resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings, cliExtensions)
+  // (same for 'windows' calls)
+}
 ```
 
-**Step 2: Commit**
+**Step 4: Modify `modeSupportsResume` and `getModeLabel` to use the wider type**
+
+```typescript
+export function modeSupportsResume(mode: TerminalModeOrExtension): boolean {
+  if (mode === 'shell') return false
+  const spec = CODING_CLI_COMMANDS[mode as Exclude<TerminalMode, 'shell'>]
+  return !!spec?.resumeArgs
+}
+
+function getModeLabel(mode: TerminalModeOrExtension, cliExtensions?: CliExtensionSpec[]): string {
+  if (mode === 'shell') return 'Shell'
+  const spec = CODING_CLI_COMMANDS[mode as Exclude<TerminalMode, 'shell'>]
+  if (spec) return spec.label
+  const ext = cliExtensions?.find(e => e.name === mode)
+  if (ext) return ext.label
+  return mode.charAt(0).toUpperCase() + mode.slice(1)
+}
+```
+
+**Step 5: Modify `TerminalRegistry` to accept CLI extension specs via constructor injection**
+
+Add a `cliExtensions` field to `TerminalRegistry`, populated via the constructor:
+
+```typescript
+export class TerminalRegistry extends EventEmitter {
+  // ... existing fields ...
+  private cliExtensions: CliExtensionSpec[]
+
+  constructor(settings?: AppSettings, maxTerminals?: number, maxExitedTerminals?: number, cliExtensions?: CliExtensionSpec[]) {
+    super()
+    // ... existing init ...
+    this.cliExtensions = cliExtensions ?? []
+  }
+```
+
+In the `create` method, pass `cliExtensions` to `buildSpawnSpec` and `getModeLabel`:
+
+```typescript
+  create(opts: {
+    mode: TerminalModeOrExtension  // was TerminalMode
+    // ... rest unchanged
+  }): TerminalRecord {
+    // ... existing code ...
+    const { file, args, env, cwd: procCwd } = buildSpawnSpec(
+      opts.mode,
+      cwd,
+      opts.shell || 'system',
+      normalizedResume,
+      opts.providerSettings,
+      baseEnv,
+      this.cliExtensions,  // NEW parameter
+    )
+    // ...
+    const title = getModeLabel(opts.mode, this.cliExtensions)  // pass extensions
+    // ...
+  }
+```
+
+**Step 6: Update `server/index.ts` to pass CLI extensions to TerminalRegistry**
+
+```typescript
+const cliExtensions: CliExtensionSpec[] = extensionManager.getAll()
+  .filter(e => e.manifest.category === 'cli')
+  .map(e => ({
+    name: e.manifest.name,
+    label: e.manifest.label,
+    command: e.manifest.cli!.command,
+    args: e.manifest.cli!.args,
+    env: e.manifest.cli!.env,
+  }))
+
+const registry = new TerminalRegistry(settings, undefined, undefined, cliExtensions)
+```
+
+**Step 7: Commit**
 
 ```bash
-git add server/spawn-spec.ts server/index.ts
-git commit -m "feat: resolve spawn commands from CLI extension manifests"
+git add server/terminal-registry.ts server/index.ts
+git commit -m "feat: resolve spawn commands from CLI extension manifests via DI"
 ```
 
 ---
 
-### Task 5: Make TerminalCreateSchema accept dynamic CLI extension modes
+### Task 5: Make TerminalCreateSchema accept dynamic CLI extension modes with validation
 
-Currently, `TerminalCreateSchema.mode` is a hardcoded Zod enum: `z.enum(['shell', 'claude', 'codex', 'opencode', 'gemini', 'kimi'])`. New CLI extensions added via the extensions folder won't pass validation.
+Currently, `TerminalCreateSchema.mode` is a hardcoded Zod enum: `z.enum(['shell', 'claude', 'codex', 'opencode', 'gemini', 'kimi'])`. New CLI extensions added via the extensions folder won't pass validation. Changing to `z.string()` would silently accept typos and garbage.
+
+**Solution:** Use a factory function that builds the `TerminalCreateSchema` with a dynamically-computed set of valid modes. The ws-handler already constructs its own `ClientMessageSchema` at module level; we move this to a factory that runs at `WsHandler` construction time, when the extension manager is available.
 
 **Files:**
-- Modify: `shared/ws-protocol.ts` - relax mode validation to accept any string
+- Modify: `shared/ws-protocol.ts` - export a factory function for building `TerminalCreateSchema` with extra modes
+- Modify: `server/ws-handler.ts` - build `ClientMessageSchema` at construction time using the factory
 
-**Step 1: Change mode from enum to string with fallback**
+**Step 1: Add `createTerminalCreateSchema` factory to `shared/ws-protocol.ts`**
 
-The `mode` field in `TerminalCreateSchema` needs to accept any string (so new CLI extensions work) while defaulting to 'shell'. Change from:
-
-```typescript
-mode: z.enum(['shell', 'claude', 'codex', 'opencode', 'gemini', 'kimi']).default('shell'),
-```
-
-To:
+Keep the existing `TerminalCreateSchema` as-is for backward compatibility (tests, client code). Add a factory:
 
 ```typescript
-mode: z.string().default('shell'),
+/** Built-in terminal modes that are always valid. */
+const BUILTIN_TERMINAL_MODES = ['shell', 'claude', 'codex', 'opencode', 'gemini', 'kimi'] as const
+
+/**
+ * Build a TerminalCreateSchema that accepts the built-in modes plus
+ * any additional modes (e.g., from registered CLI extensions).
+ *
+ * The returned schema uses z.string().refine() to validate that the mode
+ * is in the combined set, rejecting typos and garbage while allowing
+ * dynamically-registered extension names.
+ */
+export function createTerminalCreateSchema(extraModes: string[] = []) {
+  const allModes = new Set<string>([...BUILTIN_TERMINAL_MODES, ...extraModes])
+  return z.object({
+    type: z.literal('terminal.create'),
+    requestId: z.string().min(1),
+    mode: z.string().default('shell').refine(
+      (val) => allModes.has(val),
+      (val) => ({ message: `Invalid terminal mode: '${val}'. Valid modes: ${[...allModes].join(', ')}` }),
+    ),
+    shell: ShellSchema.default('system'),
+    cwd: z.string().optional(),
+    resumeSessionId: z.string().optional(),
+    restore: z.boolean().optional(),
+    tabId: z.string().min(1).optional(),
+    paneId: z.string().min(1).optional(),
+  })
+}
 ```
 
-This is safe because:
-- The server already casts `m.mode as TerminalMode` and passes it to `buildSpawnSpec()` which handles unknown modes by falling back to the extension registry (after Task 4).
-- The `CodingCliProviderSchema` enum stays unchanged for session indexing and other typed uses.
+**Step 2: In `server/ws-handler.ts`, build `ClientMessageSchema` dynamically**
 
-**Step 2: Update the `TerminalMode` type in spawn-spec.ts**
+Currently, `ClientMessageSchema` is a module-level `const` (line 238). Move it to a factory method or build it in the `WsHandler` constructor.
 
-Change `TerminalMode` from a union of string literals to a string type:
+Change the module-level `ClientMessageSchema` to a function:
 
 ```typescript
-export type TerminalMode = 'shell' | string
+function buildClientMessageSchema(extensionModes: string[]) {
+  const terminalCreate = createTerminalCreateSchema(extensionModes)
+  return z.discriminatedUnion('type', [
+    HelloSchema,
+    PingSchema,
+    terminalCreate,
+    TerminalAttachSchema,
+    // ... rest of the schemas unchanged
+  ])
+}
 ```
 
-This preserves the 'shell' sentinel while allowing any extension name.
+In the `WsHandler` constructor (which already receives `extensionManager`), build the schema:
+
+```typescript
+class WsHandler {
+  private clientMessageSchema: z.ZodDiscriminatedUnion<...>
+
+  constructor(
+    // ... existing params including extensionManager ...
+  ) {
+    // ...
+    const extensionModes = extensionManager
+      ? extensionManager.getAll()
+          .filter(e => e.manifest.category === 'cli')
+          .map(e => e.manifest.name)
+      : []
+    this.clientMessageSchema = buildClientMessageSchema(extensionModes)
+  }
+```
+
+Then change the message parsing call (line ~1086) from `ClientMessageSchema.safeParse(msg)` to `this.clientMessageSchema.safeParse(msg)`.
 
 **Step 3: Commit**
 
 ```bash
-git add shared/ws-protocol.ts server/spawn-spec.ts
-git commit -m "feat: accept dynamic CLI extension modes in terminal create protocol"
+git add shared/ws-protocol.ts server/ws-handler.ts
+git commit -m "feat: dynamically validate terminal.create mode against registered CLI extensions"
 ```
 
 ---
@@ -362,11 +538,17 @@ Currently, when a CLI extension (`ext:name`) is selected from the PanePicker, it
 
 **Files:**
 - Modify: `src/components/panes/PaneContainer.tsx` - route CLI extensions to terminal pane creation
-- Modify: `src/components/panes/PanePicker.tsx` - mark CLI extensions for terminal routing
+- Modify: `src/components/panes/PanePicker.tsx` - route CLI extensions through the directory picker
 
 **Step 1: In PaneContainer.tsx, handle CLI extensions in createContentForType**
 
-Before the generic `ext:` handler, add a check for CLI extensions:
+Before the generic `ext:` handler, add a check for CLI extensions. The `extensionEntries` selector is already used in PanePicker; add it to PaneContainer too:
+
+```typescript
+const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? [])
+```
+
+Then in `createContentForType`:
 
 ```typescript
 const createContentForType = useCallback((type: PanePickerType, cwd?: string): PaneContent => {
@@ -390,19 +572,13 @@ const createContentForType = useCallback((type: PanePickerType, cwd?: string): P
       props: {},
     }
   }
-  // ... rest unchanged
+  // ... rest of existing cases unchanged
 }, [extensionEntries, settings])
 ```
 
-Add `extensionEntries` to the component's data by reading from the Redux store:
+**Step 2: In PanePicker.tsx `handleSelect`, route CLI extensions through the directory picker**
 
-```typescript
-const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? [])
-```
-
-**Step 2: In PanePicker.tsx, route CLI extensions through the directory picker**
-
-Currently, extension options are just listed at the end. CLI extensions need to go through the directory picker (just like hardcoded CLI options do). In `handleSelect`:
+Currently, extension options go straight to content creation. CLI extensions need to go through the directory picker (just like hardcoded CLI options do):
 
 ```typescript
 const handleSelect = useCallback((type: PanePickerType) => {
@@ -435,64 +611,40 @@ git commit -m "feat: route CLI extensions through terminal pane creation with di
 
 ### Task 7: Update frontend type system for dynamic CLI modes
 
-The frontend `TabMode` type is currently `'shell' | CodingCliProviderName` which is a fixed enum. For CLI extensions to work, we need `TabMode` to accept any string.
+The frontend `TabMode` type is currently `'shell' | CodingCliProviderName` which is a fixed enum. For CLI extensions to work, the frontend needs a wider type at its API boundaries, but internal code should continue to benefit from the known union.
 
 **Files:**
-- Modify: `src/store/types.ts` - widen TabMode type
-- Modify: `src/lib/coding-cli-utils.ts` - adjust `isCodingCliProviderName` to check extensions
-- Modify: `src/lib/coding-cli-types.ts` - widen type if needed
+- Modify: `src/store/types.ts` - add `TabModeOrExtension` alongside existing `TabMode`
+- Modify: `src/lib/coding-cli-utils.ts` - update `getProviderLabel` fallback
 
-**Step 1: Widen TabMode to accept any string**
+**Step 1: Add the wider type alongside TabMode**
 
 In `src/store/types.ts`:
 ```typescript
-// TabMode includes 'shell' for regular terminals, plus all coding CLI providers
-// (both hardcoded and extension-provided)
-export type TabMode = 'shell' | CodingCliProviderName | string
+// TabMode includes 'shell' for regular terminals, plus known coding CLI providers.
+// This stays as a strict union for type safety in hardcoded provider checks.
+export type TabMode = 'shell' | CodingCliProviderName
+
+// Wider type for pane content and WS messages where extension-provided modes pass through.
+export type TabModeOrExtension = TabMode | (string & {})
 ```
 
-This is technically the same as `string` but the union documents the known values.
-
-**Step 2: Update isCodingCliMode to check extension registry**
-
-In `src/lib/coding-cli-utils.ts`, the `isCodingCliMode` function is used to determine if a mode represents a CLI agent. Update it to also recognize CLI extension names:
+Update the `TerminalPaneContent` type in `src/store/paneTypes.ts` to use the wider type for its `mode` field:
 
 ```typescript
-export function isCodingCliMode(mode?: string): boolean {
-  if (!mode || mode === 'shell') return false
-  if (isCodingCliProviderName(mode)) return true
-  // Dynamic CLI extensions will also be valid modes
-  // The caller should check the extension registry if isCodingCliProviderName returns false
-  return false
+export type TerminalPaneContent = {
+  kind: 'terminal'
+  // ...
+  mode: TabModeOrExtension  // was TabMode -- allows extension CLI modes
+  // ...
 }
 ```
 
-Actually, the better approach is to leave `isCodingCliProviderName` for the hardcoded ones and add a separate check in the components that need to distinguish CLI modes. The components already have access to the extension registry via Redux.
+The `Tab` interface in `src/store/types.ts` also has a `mode: TabMode` field; widen it to `TabModeOrExtension`.
 
-**Step 3: Commit**
+**Step 2: Update `getProviderLabel` to gracefully handle extension modes**
 
-```bash
-git add src/store/types.ts src/lib/coding-cli-utils.ts
-git commit -m "feat: widen TabMode to accept dynamic CLI extension modes"
-```
-
----
-
-### Task 8: Update title derivation and icon rendering for CLI extensions
-
-When a CLI extension pane is created, the title and icon should come from the extension manifest, not the hardcoded `CODING_CLI_PROVIDER_LABELS`.
-
-**Files:**
-- Modify: `src/lib/derivePaneTitle.ts` - check extension registry for CLI modes
-- Modify: `src/components/icons/provider-icons.tsx` or equivalent - render extension icons
-
-**Step 1: Update derivePaneTitle**
-
-In `src/lib/derivePaneTitle.ts`, the terminal case uses `getProviderLabel(content.mode)` for CLI modes. This already works for hardcoded providers. For extension-provided CLIs, the label comes from the extension registry. Since `derivePaneTitle` is a pure function without Redux access, the simplest approach is to pass extension entries as an optional parameter:
-
-Actually, looking at the code more carefully, `getProviderLabel` in coding-cli-utils.ts already has a fallback: `return label || provider.toUpperCase()`. So for an extension named 'gemini' that isn't in `CODING_CLI_PROVIDER_LABELS`, it would show 'GEMINI'. This is acceptable for now. The extension manifest `label` field would be the ideal source, but it requires plumbing the extension registry through.
-
-The better approach: add the extension label to `CODING_CLI_PROVIDER_LABELS` dynamically isn't practical since it's a static object. Instead, update `getProviderLabel` to accept an optional fallback:
+In `src/lib/coding-cli-utils.ts`, `getProviderLabel` currently returns `provider.toUpperCase()` as fallback. Improve for extension modes:
 
 ```typescript
 export function getProviderLabel(provider?: string, extensionLabel?: string): string {
@@ -500,16 +652,55 @@ export function getProviderLabel(provider?: string, extensionLabel?: string): st
   const label = CODING_CLI_PROVIDER_LABELS[provider as CodingCliProviderName]
   if (label) return label
   if (extensionLabel) return extensionLabel
+  // Capitalize first letter for unknown extensions (better than ALL CAPS)
   return provider.charAt(0).toUpperCase() + provider.slice(1)
 }
 ```
 
-The callers that have extension data can pass it. This is a minimal change.
+**Step 3: Commit**
+
+```bash
+git add src/store/types.ts src/store/paneTypes.ts src/lib/coding-cli-utils.ts
+git commit -m "feat: add TabModeOrExtension type for dynamic CLI extension modes"
+```
+
+---
+
+### Task 8: Update title derivation and icon rendering for CLI extensions
+
+When a CLI extension pane is created, the title and icon should come from the extension manifest when available. The hardcoded `CODING_CLI_PROVIDER_LABELS` covers the known providers; for extension-provided CLIs, we fall back to the extension registry data.
+
+**Files:**
+- Modify: `src/lib/derivePaneTitle.ts` - use `getProviderLabel` with extension fallback
+- No icon changes needed: PanePicker already renders extension icons from the registry, and ProviderIcon has a fallback for unknown providers.
+
+**Step 1: Update derivePaneTitle to pass extension label**
+
+In `src/lib/derivePaneTitle.ts`, find where terminal mode label is derived. The function uses `getProviderLabel(content.mode)`. Since `derivePaneTitle` is a pure function without Redux access, add an optional `extensionEntries` parameter so callers with extension data can pass it:
+
+```typescript
+import type { ClientExtensionEntry } from '@shared/extension-types'
+
+export function derivePaneTitle(
+  content: PaneContent,
+  extensionEntries?: ClientExtensionEntry[],
+): string {
+  // ... existing code ...
+  // In the terminal case:
+  if (content.kind === 'terminal' && content.mode !== 'shell') {
+    const ext = extensionEntries?.find(e => e.name === content.mode)
+    return getProviderLabel(content.mode, ext?.label)
+  }
+  // ...
+}
+```
+
+Update callers of `derivePaneTitle` in PaneContainer.tsx to pass extension entries.
 
 **Step 2: Commit**
 
 ```bash
-git add src/lib/derivePaneTitle.ts src/lib/coding-cli-utils.ts
+git add src/lib/derivePaneTitle.ts src/components/panes/PaneContainer.tsx
 git commit -m "feat: support extension-provided labels for CLI pane titles"
 ```
 
@@ -588,11 +779,11 @@ npm test
 **Step 2: Fix any failures**
 
 The most likely failures will be:
-- Tests that assert on the hardcoded `TerminalCreateSchema.mode` enum values
-- Tests that check `availableClis` detection
-- Tests that rely on `TerminalMode` being a specific string literal union
+- Tests that construct `TerminalRegistry` without the new `cliExtensions` parameter (it's optional, so these should still compile but verify)
+- Tests that directly test `TerminalCreateSchema.mode` enum values (these use the original schema which is preserved)
+- Tests that check `availableClis` detection (update to pass empty `extraClis`)
 
-Fix each failure by updating the test expectations to match the new dynamic behavior.
+Fix each failure by updating the test expectations to match the new behavior.
 
 **Step 3: Run typecheck**
 
@@ -616,13 +807,17 @@ git commit -m "fix: update tests for CLI extensions refactor"
 
 1. **CLI extensions create terminal panes, not extension panes.** The `kind: 'terminal'` pane with xterm.js is the right renderer for CLI agents. Extension panes (kind: 'extension') use iframes, which is wrong for CLI tools.
 
-2. **The WS protocol `mode` field becomes a string.** This is the minimal change that allows new CLI extensions without breaking the existing contract. Old clients sending `'claude'` or `'codex'` still work.
+2. **`TerminalMode` stays as a strict union; `TerminalModeOrExtension` is the wider type for API boundaries.** This preserves type safety on `CODING_CLI_COMMANDS` (which is `Record<Exclude<TerminalMode, 'shell'>, ...>`) while allowing extension modes to pass through `buildSpawnSpec`, `TerminalRegistry.create`, and pane content types. Same pattern on the frontend with `TabMode` vs `TabModeOrExtension`.
 
-3. **Hardcoded CLI configs remain as defaults.** The `CODING_CLI_COMMANDS` in spawn-spec.ts and `CLI_COMMANDS` in platform.ts remain as fallbacks. Extension manifests override them if present. This means existing installations without the `extensions/` folder continue to work unchanged.
+3. **WS protocol mode validation uses `z.string().refine()` against a dynamic set.** The `createTerminalCreateSchema(extraModes)` factory builds a schema that accepts the built-in modes plus registered CLI extensions, rejecting typos and garbage. The original `TerminalCreateSchema` export is preserved for backward compatibility in tests and client code.
 
-4. **Session indexing is orthogonal.** The `server/coding-cli/providers/` directory handles session file parsing (JSONL, etc.) and is not part of the extension system. A future task could make session indexers discoverable via extensions, but that's a much larger change.
+4. **Extension data is passed via dependency injection, not module-level setters.** `TerminalRegistry` receives `cliExtensions` via its constructor. `resolveCodingCliCommand` and `buildSpawnSpec` receive it as a parameter. `detectAvailableClis` receives it as an argument. This follows the codebase's existing patterns (`createPlatformRouter`, `createExtensionRouter`, `WsHandler` constructor).
 
-5. **No manifest changes needed.** The existing `freshell.json` manifest schema already supports CLI extensions with the `category: "cli"` and `cli: { command, args, env }` fields.
+5. **All changes target `server/terminal-registry.ts`, not `server/spawn-spec.ts`.** `spawn-spec.ts` is dead code (never imported by production files). `terminal-registry.ts` is the authoritative location for `TerminalMode`, `CODING_CLI_COMMANDS`, `resolveCodingCliCommand`, `buildSpawnSpec`, and the `TerminalRegistry` class.
+
+6. **Hardcoded CLI configs remain as defaults.** The `CODING_CLI_COMMANDS` in `terminal-registry.ts` and `CLI_COMMANDS` in `platform.ts` remain as fallbacks. Extension manifests provide additional modes beyond the hardcoded set. Existing installations without the `extensions/` folder continue to work unchanged.
+
+7. **Session indexing is orthogonal.** The `server/coding-cli/providers/` directory handles session file parsing (JSONL, etc.) and is not part of the extension system. A future task could make session indexers discoverable via extensions, but that's a much larger change.
 
 ## Remember
 - Exact file paths always
