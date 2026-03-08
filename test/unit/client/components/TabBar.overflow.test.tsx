@@ -137,12 +137,14 @@ describe('TabBar arrow navigation buttons', () => {
     const store = createStore({ tabs: [tab], activeTabId: 'tab-1' })
     renderWithStore(<TabBar />, store)
 
-    // Buttons are always in the DOM but hidden via aria-hidden + pointer-events-none
+    // Buttons are always in the DOM but hidden via aria-hidden + opacity-0 + pointer-events-none
     const leftBtn = screen.getByLabelText('Scroll tabs left')
     const rightBtn = screen.getByLabelText('Scroll tabs right')
     expect(leftBtn.getAttribute('aria-hidden')).toBe('true')
     expect(rightBtn.getAttribute('aria-hidden')).toBe('true')
+    expect(leftBtn.className).toContain('opacity-0')
     expect(leftBtn.className).toContain('pointer-events-none')
+    expect(rightBtn.className).toContain('opacity-0')
     expect(rightBtn.className).toContain('pointer-events-none')
   })
 
@@ -235,7 +237,7 @@ describe('TabBar arrow navigation buttons', () => {
     expect(rightBtn.tagName).toBe('BUTTON')
   })
 
-  it('arrow buttons are outside the scrollable container', () => {
+  it('arrow buttons are positioned absolutely outside the scroll flow', () => {
     mockCanScrollLeft = true
     mockCanScrollRight = true
 
@@ -249,6 +251,9 @@ describe('TabBar arrow navigation buttons', () => {
     // Buttons should not be inside the overflow-x-auto scrollable container
     expect(leftBtn.closest('.overflow-x-auto')).toBeNull()
     expect(rightBtn.closest('.overflow-x-auto')).toBeNull()
+    // Buttons are absolutely positioned overlays (no layout impact)
+    expect(leftBtn.className).toContain('absolute')
+    expect(rightBtn.className).toContain('absolute')
   })
 
   it('hidden arrow buttons are removed from tab order', () => {

@@ -289,11 +289,11 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
           strategy={horizontalListSortingStrategy}
         >
           <div className="relative z-10 flex items-end flex-1 min-w-0">
-            {/* Left arrow button -- always rendered; collapses to w-0 when not needed to reclaim space */}
+            {/* Left arrow button -- absolutely positioned overlay to avoid layout shift */}
             <button
               className={cn(
-                'flex-shrink-0 flex items-center justify-center h-8 text-muted-foreground hover:text-foreground transition-all duration-150',
-                canScrollLeft ? 'w-6' : 'w-0 overflow-hidden opacity-0 pointer-events-none',
+                'absolute left-0 z-10 flex items-center justify-center w-6 h-8 bg-background/90 text-muted-foreground hover:text-foreground transition-opacity duration-150',
+                canScrollLeft ? 'opacity-100' : 'opacity-0 pointer-events-none',
               )}
               aria-label="Scroll tabs left"
               aria-hidden={canScrollLeft ? undefined : true}
@@ -391,11 +391,11 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
               ))}
             </div>
 
-            {/* Right arrow button -- always rendered; collapses to w-0 when not needed to reclaim space */}
+            {/* Right arrow button -- absolutely positioned overlay to avoid layout shift */}
             <button
               className={cn(
-                'flex-shrink-0 flex items-center justify-center h-8 text-muted-foreground hover:text-foreground transition-all duration-150',
-                canScrollRight ? 'w-6' : 'w-0 overflow-hidden opacity-0 pointer-events-none',
+                'absolute right-0 z-10 flex items-center justify-center w-6 h-8 bg-background/90 text-muted-foreground hover:text-foreground transition-opacity duration-150',
+                canScrollRight ? 'opacity-100' : 'opacity-0 pointer-events-none',
               )}
               aria-label="Scroll tabs right"
               aria-hidden={canScrollRight ? undefined : true}
