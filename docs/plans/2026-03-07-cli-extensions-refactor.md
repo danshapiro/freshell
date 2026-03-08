@@ -11,9 +11,7 @@ This refactoring creates extension folders (e.g., `extensions/claude-code/freshe
 - `CLI_COMMANDS` in `platform.ts` is replaced by a function parameter from the extension registry
 - `CodingCliProviderSchema` becomes a dynamic `z.string().refine()` instead of a hardcoded `z.enum()`
 - `CODING_CLI_PROVIDER_CONFIGS` and `CODING_CLI_PROVIDER_LABELS` on the frontend are derived from the extension entries in Redux
-- Adding a new CLI (e.g., OpenCode) means dropping a folder in `extensions/` -- zero code changes
-
-The frontend PanePicker already renders extension entries; CLI extensions need to create terminal panes (kind: 'terminal') rather than extension panes (kind: 'extension'), which requires a small routing change.
+- Adding a new CLI (e.g., Aider) means dropping a folder in `extensions/` -- zero code changes
 
 **Tech Stack:** TypeScript, Zod (manifest validation), Node.js (server), React/Redux (client), Vitest (testing)
 
@@ -67,6 +65,17 @@ The ws-handler already constructs its own `ClientMessageSchema` at module level 
 
 `server/ws-schemas.ts` has its own copies of `CodingCliProviderSchema`, `TerminalCreateSchema`, and `ClientMessageSchema`. These must also be made dynamic or replaced with imports from the shared module.
 
+### PanePicker routing: bare names, not `ext:` prefix
+
+CLI extensions use **bare provider names** (e.g., `'claude'`, `'codex'`) as their `PanePickerType`, not the `ext:` prefix. The existing PanePicker flow already handles bare names:
+1. PanePicker builds `cliOptions` using bare names as `type`
+2. PaneContainer's `handleSelect` calls `isCodingCliProviderName(type)` and routes to the directory picker
+3. PaneContainer's `createContentForType` creates `TerminalPaneContent` with `mode: type`
+
+After the refactor, `isCodingCliProviderName` checks against extension entries instead of a hardcoded list, so the same bare-name flow works for new CLI extensions. The `ext:` prefix remains exclusively for non-CLI extensions (category `'client'` or `'server'`).
+
+**Critically, the `extensionOptions` builder in PanePicker must filter out `category === 'cli'` entries.** Otherwise, CLI extensions appear twice: once in `cliOptions` (bare name) and once in `extensionOptions` (`ext:name`).
+
 ### Key insight: CLI extensions create terminal panes, not extension panes
 
 When the user selects a CLI extension from the picker, it should create a `TerminalPaneContent` (kind: 'terminal') with the extension name as the `mode`, NOT an `ExtensionPaneContent` (kind: 'extension'). CLI extensions use the existing terminal infrastructure (xterm.js, PTY, scrollback buffer). This is already how Claude/Codex work -- they're terminal panes with `mode: 'claude'` or `mode: 'codex'`.
@@ -79,11 +88,34 @@ The `server/coding-cli/` directory (session-indexer.ts, session-manager.ts, prov
 
 The existing `CliConfigSchema` in `server/extension-manifest.ts` has `{ command, args?, env? }`. For the migration to be complete, we need additional fields that currently live in `CodingCliCommandSpec`:
 - `envVar`: environment variable that overrides the command (e.g., `CLAUDE_CMD`)
-- `resumeArgs`: template for session resume arguments
+- `resumeArgs`: template for session resume arguments (e.g., `["--resume", "{{sessionId}}"]`)
 - `supportsPermissionMode`: whether the CLI accepts `--permission-mode`
 - `label` is already on the top-level manifest
 
 These will be added as optional fields on the `CliConfigSchema`.
+
+### Enable-by-default for new CLI extensions
+
+Currently, `enabledProviders` in settings determines which CLI options appear in PanePicker (line 100-106 of PanePicker.tsx). The default in `settingsSlice.ts` is `['claude', 'codex']`. Additionally, there is a hardcoded allowlist filter in `mergeSettings()` (line 136-138 of settingsSlice.ts) that strips any provider not literally `'claude'`, `'codex'`, or `'opencode'`:
+
+```typescript
+enabledProviders: (merged.codingCli.enabledProviders ?? []).filter(
+  (provider): provider is CodingCliProviderName => provider === 'claude' || provider === 'codex' || provider === 'opencode',
+),
+```
+
+This is a triple gate: a new CLI extension must be (1) available on the system, (2) in `enabledProviders` settings, and (3) survive the hardcoded allowlist filter. This breaks the "zero code changes" promise for new extensions.
+
+**Solution:** The hardcoded filter in `mergeSettings()` must be removed. Instead, treat any CLI extension that is available on the system but NOT yet mentioned in `enabledProviders` as enabled by default. The PanePicker's filtering logic changes from:
+```
+availableClis[name] && enabledProviders.includes(name)
+```
+to:
+```
+availableClis[name] && (enabledProviders.includes(name) || !isExplicitlyDisabled(name))
+```
+
+Concretely, we track providers the user has explicitly toggled off. If a provider name appears in `enabledProviders`, it's opted in. If it doesn't appear BUT was never explicitly disabled by the user, it defaults to enabled. The simplest implementation: PanePicker considers a CLI extension enabled if `enabledProviders.includes(name)` OR if the extension is newly discovered (not in the settings at all). The `mergeSettings()` function in `settingsSlice.ts` handles this by adding newly-discovered CLI extensions to `enabledProviders` when it merges settings from the server.
 
 ---
 
@@ -94,6 +126,7 @@ The existing `CliConfigSchema` only has `{ command, args?, env? }`. To fully rep
 **Files:**
 - Modify: `server/extension-manifest.ts`
 - Modify: `shared/extension-types.ts`
+- Modify: `server/extension-manager.ts`
 
 **Step 1: Add fields to `CliConfigSchema` in `server/extension-manifest.ts`**
 
@@ -116,17 +149,24 @@ export interface ClientExtensionEntry {
   cli?: {
     supportsPermissionMode?: boolean
     supportsResume?: boolean
+    resumeCommandTemplate?: string[]  // e.g., ["claude", "--resume", "{{sessionId}}"]
   }
 }
 ```
+
+The `resumeCommandTemplate` field gives the frontend enough information to build resume commands without hardcoded `if/else` branches. It is the manifest's `cli.command` followed by `cli.resumeArgs`, with `{{sessionId}}` as a placeholder. This is populated by `toClientRegistry()`.
 
 **Step 3: Update `toClientRegistry()` in `server/extension-manager.ts` to populate `cli` field**
 
 ```typescript
 if (manifest.category === 'cli' && manifest.cli) {
+  const resumeCommandTemplate = manifest.cli.resumeArgs
+    ? [manifest.cli.command, ...manifest.cli.resumeArgs]
+    : undefined
   clientEntry.cli = {
     supportsPermissionMode: manifest.cli.supportsPermissionMode,
     supportsResume: !!manifest.cli.resumeArgs,
+    resumeCommandTemplate,
   }
 }
 ```
@@ -446,7 +486,6 @@ git commit -m "feat: derive CODING_CLI_COMMANDS from extension manifests (single
 **Files:**
 - Modify: `server/platform.ts`
 - Modify: `server/index.ts`
-- Modify: `server/platform-router.ts`
 
 **Step 1: Remove `CLI_COMMANDS` constant and change `detectAvailableClis` to accept the CLI list as a parameter**
 
@@ -549,47 +588,9 @@ export let CodingCliProviderSchema: z.ZodType<string> = z.string().min(1)
 
 // Type is now just string (was a narrow union derived from z.enum)
 export type CodingCliProviderName = string
-
-/**
- * Initialize the shared schemas with the set of valid CLI provider names.
- * Called once at server startup after extensions are scanned.
- */
-export function initWsProtocolSchemas(validProviders: string[]): void {
-  CodingCliProviderSchema = createCodingCliProviderSchema(validProviders)
-}
 ```
 
-Also change `TerminalCreateSchema.mode`:
-```typescript
-// Before: mode: z.enum(['shell', 'claude', 'codex', 'opencode', 'gemini', 'kimi']).default('shell'),
-// After:
-export function createTerminalCreateSchema(validModes: string[]) {
-  const modeSet = new Set(['shell', ...validModes])
-  return z.object({
-    type: z.literal('terminal.create'),
-    requestId: z.string().min(1),
-    mode: z.string().default('shell').refine(
-      (val) => modeSet.has(val),
-      (val) => ({ message: `Invalid terminal mode: '${val}'. Valid modes: ${[...modeSet].join(', ')}` }),
-    ),
-    shell: ShellSchema.default('system'),
-    cwd: z.string().optional(),
-    resumeSessionId: z.string().optional(),
-    restore: z.boolean().optional(),
-    tabId: z.string().min(1).optional(),
-    paneId: z.string().min(1).optional(),
-  })
-}
-
-// Default export kept for backward compatibility (tests, client-side code that doesn't validate)
-export let TerminalCreateSchema = createTerminalCreateSchema([])
-```
-
-Keep `SessionLocatorSchema` and `TerminalMetaRecordSchema` using `CodingCliProviderSchema` -- since `CodingCliProviderSchema` is now a `let` that gets reassigned at startup, these will automatically pick up the dynamic validation.
-
-Wait -- Zod schemas are built eagerly when the module is evaluated. `SessionLocatorSchema` captures `CodingCliProviderSchema` by value at module load time. Reassigning the `let` won't update already-built schemas.
-
-**Revised approach:** The schemas that use `CodingCliProviderSchema` (`SessionLocatorSchema`, `TerminalMetaRecordSchema`, `CodingCliCreateSchema`, `TerminalCreateSchema`) must also be rebuilt dynamically. Export a single `initWsProtocolSchemas()` function that reassigns ALL of them:
+Zod schemas are built eagerly when the module is evaluated. `SessionLocatorSchema` captures `CodingCliProviderSchema` by value at module load time. Reassigning the `let` won't update already-built schemas. Therefore, all schemas that use `CodingCliProviderSchema` (`SessionLocatorSchema`, `TerminalMetaRecordSchema`, `CodingCliCreateSchema`, `TerminalCreateSchema`) must also be rebuilt dynamically. Export a single `initWsProtocolSchemas()` function that reassigns ALL of them:
 
 ```typescript
 // Mutable module-level schemas -- initialized with permissive defaults,
@@ -795,6 +796,24 @@ import type { ClientExtensionEntry } from '@shared/extension-types'
 // REMOVED: CODING_CLI_PROVIDERS, CODING_CLI_PROVIDER_LABELS, CODING_CLI_PROVIDER_CONFIGS
 // These are now derived from extension entries in Redux state.
 
+export type CodingCliProviderConfig = {
+  name: CodingCliProviderName
+  label: string
+  supportsModel?: boolean
+  supportsSandbox?: boolean
+  supportsPermissionMode?: boolean
+}
+
+export function getCliProviderConfigs(extensions: ClientExtensionEntry[]): CodingCliProviderConfig[] {
+  return extensions
+    .filter(e => e.category === 'cli')
+    .map(e => ({
+      name: e.name,
+      label: e.label,
+      supportsPermissionMode: e.cli?.supportsPermissionMode,
+    }))
+}
+
 export function getCliProviders(extensions: ClientExtensionEntry[]): CodingCliProviderName[] {
   return extensions
     .filter(e => e.category === 'cli')
@@ -819,7 +838,6 @@ export function isCodingCliMode(mode?: string, extensions?: ClientExtensionEntry
   return isCodingCliProviderName(mode, extensions)
 }
 
-// Keep resume-related functions -- these are inherently provider-specific
 export type ResumeCommandProvider = string
 
 export function isResumeCommandProvider(value?: string, extensions?: ClientExtensionEntry[]): value is ResumeCommandProvider {
@@ -828,25 +846,43 @@ export function isResumeCommandProvider(value?: string, extensions?: ClientExten
   return !!ext?.cli?.supportsResume
 }
 
-export function buildResumeCommand(provider?: string, sessionId?: string): string | null {
-  if (!sessionId) return null
-  // These are provider-specific command formats -- kept as special cases
-  // since the resume command syntax varies per provider
-  if (provider === 'claude') return `claude --resume ${sessionId}`
-  if (provider === 'codex') return `codex resume ${sessionId}`
-  return null
+/**
+ * Build a resume command string from extension manifest data.
+ * Uses the resumeCommandTemplate from the extension's cli config,
+ * replacing {{sessionId}} with the actual session ID.
+ * Returns null if the provider doesn't support resume or isn't found.
+ */
+export function buildResumeCommand(
+  provider?: string,
+  sessionId?: string,
+  extensions?: ClientExtensionEntry[],
+): string | null {
+  if (!sessionId || !provider) return null
+  const ext = extensions?.find(e => e.name === provider && e.category === 'cli')
+  if (!ext?.cli?.resumeCommandTemplate) return null
+  return ext.cli.resumeCommandTemplate
+    .map(arg => arg.replace('{{sessionId}}', sessionId))
+    .join(' ')
 }
 ```
 
-**Step 3: Update all callers of the removed constants**
+**Step 3: Update all callers of the removed constants and changed function signatures**
 
-Every file that imports `CODING_CLI_PROVIDERS`, `CODING_CLI_PROVIDER_LABELS`, or `CODING_CLI_PROVIDER_CONFIGS` must be updated to get extension entries from Redux and pass them to the new functions. The exact callers need to be found via grep and updated one by one.
+Every file that imports `CODING_CLI_PROVIDERS`, `CODING_CLI_PROVIDER_LABELS`, `CODING_CLI_PROVIDER_CONFIGS`, or calls `buildResumeCommand`, `isCodingCliProviderName`, `isCodingCliMode`, `isResumeCommandProvider`, or `getProviderLabel` must be updated to pass extension entries. The exact callers need to be found via grep and updated one by one.
 
 Key callers to update:
-- `src/components/panes/PanePicker.tsx` -- uses `CODING_CLI_PROVIDER_CONFIGS` to build picker options
-- `src/components/panes/PaneContainer.tsx` -- uses `isCodingCliMode` for content creation
+- `src/components/panes/PanePicker.tsx` -- uses `CODING_CLI_PROVIDER_CONFIGS` to build picker options; change to `getCliProviderConfigs(extensionEntries)`
+- `src/components/panes/PaneContainer.tsx` -- uses `isCodingCliProviderName(type)` for content creation; change to `isCodingCliProviderName(type, extensionEntries)`
+- `src/components/SettingsView.tsx` -- uses `CODING_CLI_PROVIDER_CONFIGS` to render enable toggles; change to `getCliProviderConfigs(extensionEntries)`
 - `src/lib/derivePaneTitle.ts` -- uses `getProviderLabel` for titles
-- `src/store/` slices that reference provider names
+- `src/lib/deriveTabName.ts` -- uses `isCodingCliMode`
+- `src/lib/session-utils.ts` -- uses `isCodingCliProviderName`
+- `src/lib/session-type-utils.ts` -- uses `CODING_CLI_PROVIDER_LABELS`, `isCodingCliMode`
+- `src/components/context-menu/menu-defs.ts` -- uses `buildResumeCommand`, `isResumeCommandProvider`
+- `src/components/context-menu/ContextMenuProvider.tsx` -- uses `buildResumeCommand`
+- `src/components/icons/PaneIcon.tsx` -- uses `isCodingCliMode`
+
+For pure functions that don't have access to Redux (like `derivePaneTitle`, `deriveTabName`), add an `extensions` parameter. For React components, get extension entries from `useAppSelector`.
 
 **Step 4: Commit**
 
@@ -857,74 +893,245 @@ git commit -m "feat: derive CLI provider configs from extension entries instead 
 
 ---
 
-### Task 8: Wire CLI extensions into PanePicker and PaneContainer
+### Task 8: Update PanePicker to use extension-derived CLI options and filter extension list
 
-Currently, when a CLI extension (`ext:name`) is selected from the PanePicker, it creates an `ExtensionPaneContent` (kind: 'extension'). But CLI extensions should create a `TerminalPaneContent` (kind: 'terminal') with the extension name as the `mode`.
+This task replaces the hardcoded `CODING_CLI_PROVIDER_CONFIGS` in PanePicker with extension-derived data, and fixes the duplicate-entry problem by filtering CLI extensions out of the generic extension options list.
+
+**The routing decision:** CLI extensions use **bare provider names** as their `PanePickerType` (e.g., `'claude'`, not `'ext:claude'`). The existing flow -- `handleSelect` checks `isCodingCliProviderName(type)` and routes to directory picker, `createContentForType` creates `TerminalPaneContent` with `mode: type` -- already handles this correctly once `isCodingCliProviderName` checks extension entries.
+
+The `ext:` prefix is exclusively for non-CLI extensions (category `'client'` or `'server'`). The `extensionOptions` builder in PanePicker currently includes ALL extensions without filtering by category. This means every CLI extension would appear twice: once in `cliOptions` (bare name) and once in `extensionOptions` (`ext:name`). Fix by adding a `category !== 'cli'` filter.
 
 **Files:**
-- Modify: `src/components/panes/PaneContainer.tsx` - route CLI extensions to terminal pane creation
-- Modify: `src/components/panes/PanePicker.tsx` - route CLI extensions through the directory picker
+- Modify: `src/components/panes/PanePicker.tsx`
+- Modify: `src/components/panes/PaneContainer.tsx`
 
-**Step 1: In PaneContainer.tsx, handle CLI extensions in createContentForType**
+**Step 1: In PanePicker.tsx, derive `cliOptions` from extension entries and filter `extensionOptions`**
 
-Before the generic `ext:` handler, add a check for CLI extensions:
+Replace the `CODING_CLI_PROVIDER_CONFIGS` import and usage:
+
+```typescript
+// BEFORE:
+// import { CODING_CLI_PROVIDER_CONFIGS, type CodingCliProviderConfig } from '@/lib/coding-cli-utils'
+// ...
+// const cliOptions = CODING_CLI_PROVIDER_CONFIGS
+//   .filter((config) => availableClis[config.name] && enabledProviders.includes(config.name))
+//   .map(cliConfigToOption)
+
+// AFTER:
+import { getCliProviderConfigs } from '@/lib/coding-cli-utils'
+// ...
+const cliConfigs = getCliProviderConfigs(extensionEntries)
+const cliOptions = cliConfigs
+  .filter((config) => availableClis[config.name] && enabledProviders.includes(config.name))
+  .map(cliConfigToOption)
+```
+
+Also update the `CLI_SHORTCUTS` constant to use the extension picker config:
+
+```typescript
+// BEFORE:
+// const CLI_SHORTCUTS: Record<string, string> = {
+//   claude: 'L', codex: 'X', opencode: 'O', gemini: 'G', kimi: 'K',
+// }
+
+// AFTER (inside useMemo, using extension picker config):
+function cliConfigToOption(config: CodingCliProviderConfig, ext?: ClientExtensionEntry): PickerOption {
+  return {
+    type: config.name,
+    label: config.label,
+    icon: null,
+    providerName: config.name,
+    shortcut: ext?.picker?.shortcut ?? config.name[0].toUpperCase(),
+  }
+}
+```
+
+Filter `extensionOptions` to exclude CLI extensions:
+
+```typescript
+// BEFORE:
+// const extensionOptions: PickerOption[] = extensionEntries.map(...)
+
+// AFTER:
+const extensionOptions: PickerOption[] = extensionEntries
+  .filter((ext) => ext.category !== 'cli')  // CLI extensions are in cliOptions, not here
+  .map((ext) => ({
+    type: `ext:${ext.name}` as PanePickerType,
+    label: ext.label,
+    icon: LayoutGrid,
+    shortcut: ext.picker?.shortcut ?? '',
+  }))
+```
+
+**Step 2: In PaneContainer.tsx, update `isCodingCliProviderName` calls to pass extensions**
+
+The `handleSelect` function calls `isCodingCliProviderName(type)` to route CLI options to the directory picker. Update to pass extension entries:
 
 ```typescript
 const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? [])
 
-const createContentForType = useCallback((type: PanePickerType, cwd?: string): PaneContent => {
-  if (typeof type === 'string' && type.startsWith('ext:')) {
-    const extensionName = type.slice(4)
-    const ext = extensionEntries.find(e => e.name === extensionName)
-    if (ext?.category === 'cli') {
-      return {
-        kind: 'terminal' as const,
-        mode: extensionName,
-        shell: 'system' as const,
-        createRequestId: nanoid(),
-        status: 'creating' as const,
-        ...(cwd ? { initialCwd: cwd } : {}),
-      }
-    }
-    return {
-      kind: 'extension' as const,
-      extensionName,
-      props: {},
-    }
+// In handleSelect:
+if (isCodingCliProviderName(type, extensionEntries)) {
+  setStep({ step: 'directory', providerType: type })
+  return
+}
+
+// In createContentForType:
+if (isCodingCliProviderName(type, extensionEntries)) {
+  return {
+    kind: 'terminal',
+    mode: type,
+    shell: 'system',
+    createRequestId: nanoid(),
+    status: 'creating',
+    ...(cwd ? { initialCwd: cwd } : {}),
   }
-  // ... rest of existing cases unchanged
-}, [extensionEntries, settings])
+}
 ```
 
-**Step 2: In PanePicker.tsx `handleSelect`, route CLI extensions through the directory picker**
-
-```typescript
-const handleSelect = useCallback((type: PanePickerType) => {
-  // CLI extensions also go through directory picker
-  if (typeof type === 'string' && type.startsWith('ext:')) {
-    const extensionName = type.slice(4)
-    const ext = extensionEntries.find(e => e.name === extensionName)
-    if (ext?.category === 'cli') {
-      setStep({ step: 'directory', providerType: type })
-      return
-    }
-  }
-
-  const newContent = createContentForType(type)
-  dispatch(updatePaneContent({ tabId, paneId, content: newContent }))
-}, [createContentForType, dispatch, tabId, paneId, extensionEntries])
-```
+No `ext:` prefix routing is needed for CLI extensions since they use bare names.
 
 **Step 3: Commit**
 
 ```bash
-git add src/components/panes/PaneContainer.tsx src/components/panes/PanePicker.tsx
-git commit -m "feat: route CLI extensions through terminal pane creation with directory picker"
+git add src/components/panes/PanePicker.tsx src/components/panes/PaneContainer.tsx
+git commit -m "feat: derive PanePicker CLI options from extensions, filter CLI from extension list"
 ```
 
 ---
 
-### Task 9: Update `settings-router.ts` hardcoded provider names
+### Task 9: Enable-by-default for new CLI extensions
+
+Currently, a new CLI extension won't appear in PanePicker unless the user's `enabledProviders` setting includes it. There are three gates:
+1. The `enabledProviders` default in `settingsSlice.ts` is `['claude', 'codex']`
+2. The hardcoded allowlist filter in `mergeSettings()` (line 136-138 of `settingsSlice.ts`) strips anything not literally `'claude'`, `'codex'`, or `'opencode'`
+3. PanePicker filters `cliOptions` with `enabledProviders.includes(config.name)`
+
+**Files:**
+- Modify: `src/store/settingsSlice.ts`
+- Modify: `src/components/panes/PanePicker.tsx` (minor logic change)
+
+**Step 1: Remove the hardcoded allowlist filter in `mergeSettings()`**
+
+In `src/store/settingsSlice.ts`, the `mergeSettings` function filters `enabledProviders`:
+
+```typescript
+// BEFORE (line 134-138):
+codingCli: {
+  ...merged.codingCli,
+  enabledProviders: (merged.codingCli.enabledProviders ?? []).filter(
+    (provider): provider is CodingCliProviderName => provider === 'claude' || provider === 'codex' || provider === 'opencode',
+  ),
+},
+
+// AFTER: no filtering -- accept any provider name from settings
+codingCli: {
+  ...merged.codingCli,
+  enabledProviders: merged.codingCli.enabledProviders ?? [],
+},
+```
+
+**Step 2: Auto-enable newly-discovered CLI extensions**
+
+The problem: when a user drops a new extension folder, `enabledProviders` in their persisted settings doesn't include it. The user would have to go to Settings and toggle it on. This breaks the "zero code changes" promise.
+
+**Solution:** In PanePicker, treat a CLI extension as enabled if it's in `enabledProviders` OR if it's a CLI extension that has never been explicitly configured in settings. The simplest approach: in `mergeSettings()`, when extension entries are available, add any CLI extension names that aren't already in `enabledProviders`:
+
+Actually, `mergeSettings()` doesn't have access to extension entries. The better approach is in PanePicker's filter logic:
+
+```typescript
+// In PanePicker options useMemo:
+const cliConfigs = getCliProviderConfigs(extensionEntries)
+const cliOptions = cliConfigs
+  .filter((config) => {
+    if (!availableClis[config.name]) return false
+    // Show if explicitly enabled, OR if not mentioned in settings at all
+    // (newly discovered extensions default to enabled)
+    return enabledProviders.includes(config.name) || !allKnownProviders.has(config.name)
+  })
+  .map((config) => cliConfigToOption(config, extensionEntries.find(e => e.name === config.name)))
+```
+
+Wait -- this needs a way to know which providers the user has "seen" (i.e., are in the settings, whether enabled or disabled). The `enabledProviders` list only contains enabled ones. If the user disables "codex", it's removed from the list -- and on next load, it would reappear as "newly discovered."
+
+**Better approach:** Change `enabledProviders` to an explicit allowlist, and add a separate `disabledProviders` list. But that's a settings schema change which adds migration complexity.
+
+**Simplest correct approach:** On the server side, when building the `ready` message settings, merge newly-discovered CLI extension names into `enabledProviders`. This happens in `server/index.ts` where settings are loaded and the extension registry is available:
+
+```typescript
+// After extension scan and before WsHandler construction:
+// Auto-enable newly-discovered CLI extensions
+const allCliNames = extensionManager.getAll()
+  .filter(e => e.manifest.category === 'cli')
+  .map(e => e.manifest.name)
+
+const currentSettings = await configStore.getSettings()
+const currentEnabled = currentSettings.codingCli?.enabledProviders ?? []
+const newProviders = allCliNames.filter(name => !currentEnabled.includes(name))
+if (newProviders.length > 0) {
+  const updatedEnabled = [...currentEnabled, ...newProviders]
+  await configStore.patchSettings({
+    codingCli: { enabledProviders: updatedEnabled },
+  })
+}
+```
+
+This runs at server startup. When a new extension folder is dropped and the server restarts (or hot-reloads), any CLI extension name not already in `enabledProviders` gets added. The user can then disable it in Settings, and it won't be re-enabled because its name IS in the settings (as removed from the list). Wait -- the same problem: if the user disables it, it's removed from `enabledProviders`, and on next startup it would be re-added as "new."
+
+**Actually correct approach:** Store `disabledProviders` OR store `enabledProviders` as a record with an explicit `false` value. But both require a settings schema migration.
+
+**Pragmatic approach for the plan:** Add a `knownProviders` field alongside `enabledProviders` in the settings. `knownProviders` is the set of all CLI extension names the server has seen. At startup, if a CLI extension name is not in `knownProviders`, it's new -- add it to both `knownProviders` and `enabledProviders`. If it IS in `knownProviders` but NOT in `enabledProviders`, the user explicitly disabled it -- don't re-enable.
+
+```typescript
+// Server startup (after extension scan):
+const allCliNames = extensionManager.getAll()
+  .filter(e => e.manifest.category === 'cli')
+  .map(e => e.manifest.name)
+
+const currentSettings = await configStore.getSettings()
+const knownProviders: string[] = currentSettings.codingCli?.knownProviders ?? []
+const enabledProviders: string[] = currentSettings.codingCli?.enabledProviders ?? []
+
+const newProviders = allCliNames.filter(name => !knownProviders.includes(name))
+if (newProviders.length > 0) {
+  await configStore.patchSettings({
+    codingCli: {
+      knownProviders: [...knownProviders, ...newProviders],
+      enabledProviders: [...enabledProviders, ...newProviders],
+    },
+  })
+}
+```
+
+Add `knownProviders` to `SettingsPatchSchema`, `CodingCliSettings` type, and `settingsSlice` defaults.
+
+**Step 3: Update `settingsSlice.ts` defaults**
+
+```typescript
+// BEFORE:
+codingCli: {
+  enabledProviders: ['claude', 'codex'],
+  providers: { claude: { permissionMode: 'default' }, codex: {} },
+},
+
+// AFTER: empty defaults -- server startup populates from extensions
+codingCli: {
+  enabledProviders: [],
+  knownProviders: [],
+  providers: {},
+},
+```
+
+**Step 4: Commit**
+
+```bash
+git add src/store/settingsSlice.ts server/index.ts server/settings-router.ts src/store/types.ts
+git commit -m "feat: auto-enable newly-discovered CLI extensions with knownProviders tracking"
+```
+
+---
+
+### Task 10: Update `settings-router.ts` hardcoded provider names
 
 The `settings-router.ts` has its own hardcoded `CODING_CLI_PROVIDER_NAMES` constant (line 8) and uses it in schema validation for `codingCli.enabledProviders` and `codingCli.providers`. This needs to accept extension-registered providers.
 
@@ -961,10 +1168,15 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
 
   const providerNameSet = new Set(validProviderNames)
 
+  // Build SettingsPatchSchema dynamically with the valid provider names
+  // Remove the module-level CODING_CLI_PROVIDER_NAMES constant
   const settingsPatchSchema = z.object({
-    // ... existing fields ...
+    // ... existing fields unchanged ...
     codingCli: z.object({
       enabledProviders: z.array(
+        z.string().refine(v => providerNameSet.has(v), { message: 'Unknown provider name' })
+      ).optional(),
+      knownProviders: z.array(
         z.string().refine(v => providerNameSet.has(v), { message: 'Unknown provider name' })
       ).optional(),
       providers: z.record(z.string(), CodingCliProviderConfigSchema)
@@ -1003,7 +1215,7 @@ git commit -m "feat: settings schema accepts dynamically-registered CLI provider
 
 ---
 
-### Task 10: End-to-end smoke test via live UI
+### Task 11: End-to-end smoke test via live UI
 
 **Testing approach:** Since the user specified "No unit tests only. You should actually make sure this works", we validate through the live UI on port :5173.
 
@@ -1036,7 +1248,7 @@ curl http://localhost:3344/api/platform | jq '.availableClis'
 Using browser automation or manual testing on port :5173:
 
 1. Open pane picker (click +, or Ctrl+N)
-2. Verify Claude and Codex appear in the picker
+2. Verify Claude and Codex appear in the picker -- each appears ONCE, not twice
 3. Click Claude -- verify directory picker appears
 4. Select a directory -- verify terminal pane opens with Claude Code
 5. Type a message and verify Claude responds
@@ -1044,21 +1256,31 @@ Using browser automation or manual testing on port :5173:
 7. Reopen Claude from picker -- verify it works again
 8. Repeat steps 3-7 for Codex
 9. Open Claude and Codex side by side -- verify both work independently
+10. Verify no CLI extensions appear with `ext:` prefix in the picker
+11. Right-click a Claude session in sidebar -- verify "Copy resume command" works and produces the correct command string
 
-**Step 5: Verify existing tests still pass**
+**Step 5: Test new-extension discovery**
+
+1. Create a dummy extension: `mkdir extensions/test-cli && echo '{"name":"testcli","version":"1.0.0","label":"Test CLI","description":"Test","category":"cli","cli":{"command":"echo"}}' > extensions/test-cli/freshell.json`
+2. Restart the dev server
+3. Verify "testcli" appears in the pane picker (auto-enabled)
+4. Go to Settings, disable it, restart -- verify it stays disabled
+5. Clean up: `rm -rf extensions/test-cli`
+
+**Step 6: Verify existing tests still pass**
 
 ```bash
 cd /home/user/code/freshell/.worktrees/extensions-system
 npm test
 ```
 
-**Step 6: Clean up test server**
+**Step 7: Clean up test server**
 
 ```bash
 kill "$(cat /tmp/freshell-3344.pid)" && rm -f /tmp/freshell-3344.pid
 ```
 
-**Step 7: Commit any fixes found during testing**
+**Step 8: Commit any fixes found during testing**
 
 ```bash
 git add -A
@@ -1067,7 +1289,7 @@ git commit -m "fix: address issues found during E2E testing of CLI extensions"
 
 ---
 
-### Task 11: Run full test suite and fix any regressions
+### Task 12: Run full test suite and fix any regressions
 
 **Step 1: Run all tests**
 
@@ -1083,6 +1305,7 @@ The most likely failures will be:
 - Tests that test `TerminalCreateSchema.mode` or `CodingCliProviderSchema` enum values -- these now use dynamic schemas that need initialization
 - Tests that check `availableClis` detection -- `detectAvailableClis` now requires a parameter
 - Tests that import `CODING_CLI_PROVIDERS` or `CODING_CLI_PROVIDER_LABELS` -- these are removed
+- Tests that call `buildResumeCommand` without extension entries -- signature changed
 
 For test files that need initialized schemas, add a `beforeAll` or test helper that calls `initWsProtocolSchemas([...])` with the expected provider names.
 
@@ -1120,9 +1343,15 @@ git commit -m "fix: update tests for CLI extensions refactor"
 
 6. **Extension data flows via dependency injection.** `registerCodingCliCommands()` is called at startup. `detectAvailableClis()` takes CLI specs as a parameter. `initWsProtocolSchemas()` takes valid providers as a parameter. `createSettingsRouter()` takes `validProviderNames`. This follows the codebase's existing DI patterns.
 
-7. **Session indexing is orthogonal.** The `server/coding-cli/providers/` directory handles session file parsing and is not part of the extension system. A future task could make session indexers discoverable via extensions.
+7. **CLI extensions use bare provider names in PanePicker, not `ext:` prefix.** The existing PanePicker flow uses bare names (`'claude'`, `'codex'`) for CLI options, routes them through the directory picker, and creates `TerminalPaneContent`. This same flow works for extension-registered CLIs once `isCodingCliProviderName` checks extension entries. The `ext:` prefix is exclusively for non-CLI extensions (category `'client'` or `'server'`). The `extensionOptions` list in PanePicker filters out `category === 'cli'` to prevent duplicates.
 
-8. **All changes target `server/terminal-registry.ts`, not `server/spawn-spec.ts`.** `spawn-spec.ts` is dead code (never imported by production files).
+8. **`buildResumeCommand` derives from extension manifest data.** Instead of hardcoded `if (provider === 'claude')` / `if (provider === 'codex')` branches, the function uses the `resumeCommandTemplate` field from `ClientExtensionEntry.cli`, which is built from the manifest's `cli.command` + `cli.resumeArgs`. The `{{sessionId}}` placeholder is replaced at call time. New CLI extensions with `resumeArgs` in their manifest get working resume commands with zero code changes.
+
+9. **New CLI extensions are enabled by default.** A `knownProviders` field in settings tracks which CLI extension names the server has seen before. At startup, any CLI extension name not in `knownProviders` is treated as new and added to both `knownProviders` and `enabledProviders`. If a user explicitly disables a provider (removing it from `enabledProviders`), it stays in `knownProviders` and won't be re-enabled on next startup. The hardcoded allowlist filter in `settingsSlice.ts`'s `mergeSettings()` is removed.
+
+10. **Session indexing is orthogonal.** The `server/coding-cli/providers/` directory handles session file parsing and is not part of the extension system. A future task could make session indexers discoverable via extensions.
+
+11. **All changes target `server/terminal-registry.ts`, not `server/spawn-spec.ts`.** `spawn-spec.ts` is dead code (never imported by production files).
 
 ## Remember
 - Exact file paths always
