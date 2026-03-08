@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task.
 
-**Goal:** Build a unified broad-test gate that serializes heavyweight test entry points across repo worktrees, reports truthful holder metadata, and exposes exact-checkout reusable baselines without weakening the current verification contract of the public test commands.
+**Goal:** Build a unified broad-test gate that serializes heavyweight test entry points across repo worktrees, reports truthful holder metadata through an explicit status interface, and exposes only exact-checkout reusable baselines without weakening the current verification contract of the public test commands.
 
-**Architecture:** Use a kernel-backed `flock` gate again, because crash semantics are the user’s explicit priority and a live coordinator process is not equivalent. Keep the lock attached to the actual broad-test leader process: public umbrella commands re-exec their locked test phase under `flock`, and raw broad `npx vitest run` is intercepted by patching only Vitest’s installed CLI entrypoint so the leader process itself acquires the lock before invoking upstream Vitest through the programmatic Node API. Holder metadata lives in an advisory file beside the lock; status always probes the real lock first and only trusts the metadata file when the lock is actually held. Baseline reuse is advisory on every broad invocation and only becomes an early exit when the current checkout is an exact clean match and the caller explicitly opts into reuse.
+**Architecture:** Use a kernel-backed `flock` gate again, because crash semantics are the user’s explicit priority and a live coordinator process is not equivalent. Keep the lock attached to the actual broad-test leader process: public umbrella commands re-exec their locked test phase under `flock`, and raw broad `npx vitest run` is intercepted by patching only Vitest’s installed CLI entrypoint so the leader process itself acquires the lock before invoking upstream Vitest through the programmatic Node API. Holder metadata lives in an advisory file beside the lock; a public `test:status` path always probes the real lock first and only trusts the metadata file when the lock is actually held. Baseline reuse is advisory on every broad invocation and only becomes an early exit when the current checkout is an exact clean match and the suite identity is exact and safe to compare.
 
 **Tech Stack:** Node.js, TypeScript, `tsx`, `child_process`, `fs/promises`, Git CLI, `flock`, `patch-package`, Vitest.
 
@@ -15,6 +15,7 @@
 - The user rejected phased or partial delivery, so the end state must cover both public npm scripts and habitual raw `npx vitest run` broad runs.
 - The lock must inherit the crash-safety property the user explicitly asked for. Use `flock` as the correctness primitive and keep it held by the same process that is actually running the broad test leader.
 - Do not replace the `vitest` package. Patch only the installed CLI entrypoint so the full upstream package shape, exports, and type graph remain intact.
+- Add an explicit public status surface. `npm run test:status` must show whether a broad test run is active and, when one is active, surface summary, cwd/worktree, branch, session/thread id, start time, and suite identity from the live holder record.
 - Baseline reuse is not the default verification path. Every broad command checks for a reusable baseline and reports it, but early exit is allowed only when:
   - the cached run was clean and successful
   - the current checkout is also clean
@@ -38,6 +39,10 @@
   - non-blocking `flock` probe is the source of truth for whether a sanctioned broad run is active
   - `holder.json` is descriptive only and is ignored when the lock probe says the lock is free
   - stale `holder.json` after crashes is tolerated because it is never treated as proof of an active lock
+- Status output rules:
+  - `npm run test:status` always performs the same non-blocking lock probe the runners use
+  - when the lock is held, it renders at least `summary`, `cwd`, `checkoutRoot`, `branch`, `sessionId`, `suiteKey`, and `startedAt`
+  - when the lock is free, it prints that no broad test run is active even if `holder.json` still exists
 - Holder metadata includes:
   - `commandKey`
   - `suiteKey`
@@ -57,13 +62,27 @@
   - current checkout: exact same `commit`, exact same `suiteKey`, exact same `nodeVersion`, exact same `platform`, and `currentCleanWorktree === true`
 - `suiteKey` rules:
   - public npm one-shot commands have fixed keys such as `full`, `check`, `verify`, `all`, `coverage`, `unit`, `client`, `integration`, `server-run`
-  - raw broad Vitest runs derive a normalized `suiteKey` from the effective config path plus the normalized broad selectors that determine the test set
-  - cosmetic flags like `--reporter` do not change `suiteKey`
+  - raw broad Vitest runs derive a normalized `suiteKey` from the effective config path plus a normalized representation of every suite-shaping CLI option that can affect the executed test set or runtime semantics
+  - known non-suite-shaping presentation flags such as `--reporter`, `--outputFile`, and color/TTY flags are excluded from `suiteKey`
+  - if raw broad argv includes an unclassified option, baseline reuse for that raw run is disabled instead of guessing
+- Raw broad-run suite-shaping options that must be normalized into `suiteKey` include at minimum:
+  - positional directories and globs
+  - `--config`
+  - `--project`
+  - `--dir`
+  - `--changed`
+  - `-t` / `--testNamePattern`
+  - `--exclude`
+  - `--environment`
+  - `--coverage`
+  - `--shard`
+  - any future option the implementation classifies as changing selected tests or runtime execution
 - Baseline behavior on broad invocations:
   - always check and print whether a reusable baseline exists
   - continue to run by default
   - only exit early when `--reuse-baseline` or `FRESHELL_REUSE_TEST_BASELINE=1` is set and the current checkout is an exact reusable match
   - `--force-run` or `FRESHELL_FORCE_TEST_RUN=1` suppresses reuse even when a match exists
+  - the latest exact result wins for reuse decisions: if the newest exact record is a failure, no older success for that same identity is advertised as reusable
 - Environment scope:
   - the gated path is supported in the repo’s bash/WSL execution environment, which is what the current session and Codex CMD guidance already prefer
   - if `flock` is unavailable, broad runs fail fast with an actionable message to use the supported bash/WSL environment rather than silently falling back to a weaker lock
@@ -77,6 +96,7 @@
   - `test:unit`
   - `test:integration`
   - `test:client`
+- `test:status`
 - `test:watch` and `test:ui` remain direct interactive commands.
 
 ### Task 1: Add shared Git common-dir resolution for repo-wide gate state
@@ -180,6 +200,8 @@ Create `test/unit/server/test-gate-core.test.ts` with coverage for:
 - lock/holder/results path resolution under the Git common dir
 - reusable-baseline acceptance requiring both clean producer and clean current checkout
 - normalized `suiteKey` generation for raw broad runs
+- raw broad runs with unclassified suite-shaping flags becoming non-reusable
+- latest exact failure suppressing reuse of older exact successes
 - public command keys for every current public one-shot script
 - directory/config-targeted subset suites as broad
 
@@ -220,6 +242,55 @@ describe('test-gate-core', () => {
     expect(buildRawVitestSuiteKey(['run', 'test/unit'])).not.toBe(
       buildRawVitestSuiteKey(['run', '--config', 'vitest.server.config.ts', 'test/server'])
     )
+  })
+
+  it('includes shard and coverage in raw broad suite identity', () => {
+    expect(buildRawVitestSuiteKey(['run', 'test/unit', '--shard=1/2'])).not.toBe(
+      buildRawVitestSuiteKey(['run', 'test/unit', '--shard=2/2'])
+    )
+    expect(buildRawVitestSuiteKey(['run', 'test/unit', '--coverage'])).not.toBe(
+      buildRawVitestSuiteKey(['run', 'test/unit'])
+    )
+  })
+
+  it('disables raw broad baseline reuse when argv contains an unclassified option', () => {
+    expect(classifyVitestInvocation(['run', 'test/unit', '--mystery-flag'])).toEqual({
+      mode: 'broad-run',
+      baselineReuse: 'disabled',
+    })
+  })
+
+  it('treats the newest exact result as authoritative for reuse', () => {
+    const history = [
+      {
+        commandKey: 'unit',
+        suiteKey: 'raw:cfg=default;targets=test/unit',
+        commit: 'abc123',
+        cleanWorktree: false,
+        nodeVersion: 'v22.10.2',
+        platform: 'linux',
+        exitCode: 1,
+        finishedAt: '2026-03-08T11:00:00.000Z',
+      },
+      {
+        commandKey: 'unit',
+        suiteKey: 'raw:cfg=default;targets=test/unit',
+        commit: 'abc123',
+        cleanWorktree: true,
+        nodeVersion: 'v22.10.2',
+        platform: 'linux',
+        exitCode: 0,
+        finishedAt: '2026-03-08T10:00:00.000Z',
+      },
+    ]
+
+    expect(findReusableBaseline(history, {
+      commandKey: 'unit',
+      suiteKey: 'raw:cfg=default;targets=test/unit',
+      commit: 'abc123',
+      nodeVersion: 'v22.10.2',
+      platform: 'linux',
+    })).toBeUndefined()
   })
 
   it('treats directory-targeted subset suites as broad', () => {
@@ -273,12 +344,21 @@ export type BroadRunIdentity = {
 }
 ```
 
-`buildRawVitestSuiteKey` must normalize only suite-shaping arguments:
+`buildRawVitestSuiteKey` must normalize every recognized suite-shaping argument, including:
 - config path
 - directories/globs/selectors
-- flags like `--changed`, `--project`, `--dir`
+- `--changed`
+- `--project`
+- `--dir`
+- `-t` / `--testNamePattern`
+- `--exclude`
+- `--environment`
+- `--coverage`
+- `--shard`
 
-It must ignore purely presentational flags like `--reporter`.
+It must ignore only recognized presentation flags like `--reporter`, and any unclassified flag must mark the invocation as `baselineReuse: 'disabled'`.
+
+`findReusableBaseline` must first select the newest exact record for the requested identity; it may advertise reuse only if that newest exact record is a success.
 
 **Step 4: Re-run the targeted test and verify pass**
 
@@ -312,6 +392,7 @@ git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "feat(testing
 Create `test/server/test-gate-runner.test.ts` to verify:
 - the actual broad-run leader is re-execed under `flock` and writes holder metadata only after the lock is acquired
 - second broad run waits, polls holder metadata, then starts after the first exits
+- `status` probes the real lock and surfaces `summary`, `cwd`, `checkoutRoot`, `branch`, `sessionId`, `suiteKey`, and `startedAt` when a broad run is active
 - stale `holder.json` is ignored when the lock probe succeeds
 - if the locked leader process is killed, the next run can acquire the lock immediately
 - if `flock` is unavailable, broad runs fail fast with an actionable bash/WSL message
@@ -336,6 +417,23 @@ it('releases the gate when the locked leader dies', async () => {
   const second = await runLockedFixture({ waitMs: 200, pollMs: 10 })
   expect(second.exitCode).toBe(0)
 })
+
+it('status surfaces required holder metadata while the lock is held', async () => {
+  const first = await startLockedFixture({
+    summary: 'Fix attach race',
+    sessionId: 'thread-123',
+    branch: 'feature/test-run-gate',
+  })
+  await waitForOutput(first, 'LOCKED_LEADER_READY')
+
+  const status = await runStatus()
+
+  expect(status.stdout).toContain('Fix attach race')
+  expect(status.stdout).toContain('feature/test-run-gate')
+  expect(status.stdout).toContain('thread-123')
+  expect(status.stdout).toContain('suiteKey=')
+  expect(status.stdout).toContain('startedAt=')
+})
 ```
 
 **Step 2: Run the integration test and verify failure**
@@ -351,15 +449,20 @@ Expected: FAIL because the runner and fixture do not exist.
 
 **Step 3: Implement the runner**
 
-Create `scripts/test-gate-runner.ts` with two modes:
+Create `scripts/test-gate-runner.ts` with three modes:
 - outer mode: probe for reusable baseline, probe the real lock, print wait/status messages, and re-exec itself under `flock` for broad runs
 - locked mode: write `holder.json`, run the broad leader work in the same process, update `results.json`, and remove `holder.json` in `finally`
+- status mode: probe the real lock and render user-facing status output from the current holder record
 
 Use a structure like:
 
 ```ts
 async function main(): Promise<void> {
   const cli = parseRunnerCli(process.argv.slice(2))
+
+  if (cli.mode === 'status') {
+    process.exit(await runStatus(cli))
+  }
 
   if (cli.mode === 'locked') {
     process.exit(await runLocked(cli))
@@ -382,6 +485,11 @@ so the actual broad-run leader process after `exec` owns the kernel lock.
 - invoke the broad suite in-process
 - record result history
 - remove `holder.json` in `finally`
+
+`runStatus` must:
+- perform the same non-blocking `flock` probe used by runners
+- print “no broad test run is active” when the lock is free, regardless of stale metadata files
+- when the lock is held, render the holder’s `summary`, `cwd`, `checkoutRoot`, `branch`, `sessionId`, `suiteKey`, and `startedAt`
 
 **Step 4: Re-run the integration test and verify pass**
 
@@ -420,6 +528,9 @@ Create `test/server/vitest-patch.test.ts` to cover:
 - `npx vitest run test/unit/server/auth.test.ts` stays narrowed and ungated
 - `npx vitest run test/unit` is broad and gated
 - `npx vitest run --config vitest.server.config.ts test/server` is broad and gated
+- `npx vitest run test/unit` launched from a nested repo subdirectory still finds the repo bootstrap and is gated the same way
+- plain `npx vitest` watch mode still delegates to upstream watch behavior without taking the gate
+- `npx vitest --ui` still delegates to upstream UI behavior without taking the gate
 - imports from `vitest`, `vitest/config`, `vitest/node`, `vitest/reporters`, and `vitest/globals` still resolve
 - `node_modules/vitest/vitest.mjs` still exists after install and now bootstraps through the repo entry script
 
@@ -436,6 +547,11 @@ it('preserves standard vitest subpath imports after patching the CLI only', asyn
   `)
 
   expect(result.exitCode).toBe(0)
+})
+
+it('finds the repo bootstrap when launched from a nested directory', async () => {
+  const result = await runVitestFrom(path.join(repoDir, 'test', 'unit'), ['run', 'test/unit'])
+  expect(result.stdout).toContain('broad test gate')
 })
 ```
 
@@ -472,8 +588,9 @@ Create `scripts/vitest-gate-entry.mjs` as the repo-owned bootstrap that:
 - early-exits only with explicit reuse opt-in
 - sends broad runs through `scripts/test-gate-runner.ts`
 - delegates narrowed/watch/UI runs to the original upstream CLI behavior
+- discovers the repo root from the patched CLI file location or Git metadata, not from `process.cwd()`
 
-Create `patches/vitest+3.2.4.patch` that changes only `node_modules/vitest/vitest.mjs` to import the repo bootstrap based on `process.cwd()`, leaving the rest of the installed package untouched.
+Create `patches/vitest+3.2.4.patch` that changes only `node_modules/vitest/vitest.mjs` to import the repo bootstrap by a stable path relative to the patched file itself, leaving the rest of the installed package untouched.
 
 Then run a real install so the patch is actually applied:
 
@@ -524,6 +641,7 @@ Create `test/server/test-command.test.ts` to verify:
 - `npm run test:unit`, `npm run test:client`, `npm run test:integration`, and `npm run test:coverage` are all broad one-shot commands with fixed suite keys
 - `npm run test:server` stays watch-mode by default
 - `npm run test:server -- --run` becomes a broad one-shot command
+- `npm run test:status` delegates to the runner status mode and prints the required holder metadata
 
 Create `test/unit/server/test-script-contract.test.ts` asserting every current public one-shot entry point is rewired:
 
@@ -538,6 +656,7 @@ it('routes all current public one-shot test commands through the wrapper', () =>
   expect(pkg.scripts['test:unit']).toBe('tsx scripts/test-command.ts unit')
   expect(pkg.scripts['test:integration']).toBe('tsx scripts/test-command.ts integration')
   expect(pkg.scripts['test:client']).toBe('tsx scripts/test-command.ts client')
+  expect(pkg.scripts['test:status']).toBe('tsx scripts/test-command.ts status')
 })
 ```
 
@@ -563,6 +682,7 @@ Create `scripts/test-command.ts` to:
 - only early-exit when reuse is explicitly requested and safe
 - run `typecheck` or `build` outside the lock for `check` and `verify`
 - re-exec its broad test phase through `scripts/test-gate-runner.ts`
+- delegate `status` directly to `scripts/test-gate-runner.ts --status`
 
 Update `package.json` so all current public one-shot commands route through `test-command.ts`, while `test:watch` and `test:ui` remain direct.
 
@@ -601,6 +721,7 @@ git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "feat(testing
 
 Document:
 - broad public one-shot test commands and broad raw `npx vitest run ...` now cooperate through the flock-backed gate
+- `npm run test:status` shows whether a broad run is active and surfaces summary, cwd/worktree, branch, session/thread id, suite identity, and start time
 - matching reusable baselines are always shown, but early exit requires `--reuse-baseline` or `FRESHELL_REUSE_TEST_BASELINE=1`
 - fresh-run override uses `--force-run` or `FRESHELL_FORCE_TEST_RUN=1`
 - `npm run test:server` remains watch-mode by default
@@ -637,11 +758,13 @@ Run:
 cd /home/user/code/freshell/.worktrees/test-run-gate
 FRESHELL_TEST_SUMMARY="Seed reusable baseline" FRESHELL_FORCE_TEST_RUN=1 npm test
 FRESHELL_TEST_SUMMARY="Show advisory baseline on clean checkout" npm test
+FRESHELL_TEST_SUMMARY="Show live holder metadata" npm run test:status
 ```
 
 Expected:
 - first command runs the full suite and records a reusable baseline
 - second command reports the matching reusable baseline, then still runs because reuse was not explicitly requested
+- status shows either the live holder metadata or that no broad run is active
 
 **Step 4: Verify explicit baseline reuse and crash-safe lock release**
 
@@ -651,15 +774,17 @@ Run:
 cd /home/user/code/freshell/.worktrees/test-run-gate
 FRESHELL_TEST_SUMMARY="Reuse clean exact baseline" FRESHELL_REUSE_TEST_BASELINE=1 npm test
 FRESHELL_TEST_SUMMARY="Crash-safe lock release check" FRESHELL_FORCE_TEST_RUN=1 npm test &
-leader_pid=$!
+wrapper_pid=$!
 sleep 5
+leader_pid="$(node -e "const fs=require('fs'); const cp=require('child_process'); const path=require('path'); const common=cp.execFileSync('git',['rev-parse','--git-common-dir'],{cwd:'/home/user/code/freshell/.worktrees/test-run-gate',encoding:'utf8'}).trim(); const holder=path.resolve('/home/user/code/freshell/.worktrees/test-run-gate', common, 'freshell-test-gate', 'holder.json'); const data=JSON.parse(fs.readFileSync(holder,'utf8')); process.stdout.write(String(data.pid));")"
 kill -9 "$leader_pid"
+wait "$wrapper_pid" || true
 FRESHELL_TEST_SUMMARY="Fresh run after crash" FRESHELL_FORCE_TEST_RUN=1 npm test
 ```
 
 Expected:
 - first reuse command exits quickly with a baseline reuse message
-- after the forced crash, the next fresh run can acquire the lock immediately because the kernel lock died with the locked leader process
+- after killing the actual locked leader PID from `holder.json`, the next fresh run can acquire the lock immediately because the kernel lock died with the locked leader process
 
 **Step 5: Commit any verification fixes**
 
