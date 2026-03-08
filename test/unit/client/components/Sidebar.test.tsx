@@ -83,6 +83,7 @@ function createTestStore(options?: {
     paneTitles?: Record<string, Record<string, string>>
   }
   activeTabId?: string
+  serverInstanceId?: string
   sortMode?: 'recency' | 'activity' | 'project'
   showProjectBadges?: boolean
   sessionActivity?: Record<string, number>
@@ -164,12 +165,18 @@ function createTestStore(options?: {
       connection: {
         status: 'connected',
         error: null,
+        serverInstanceId: options?.serverInstanceId,
       },
       sessionActivity: {
         sessions: options?.sessionActivity ?? {},
       },
     },
   })
+}
+
+function collectLeafPanes(node: PaneNode): PaneNode[] {
+  if (node.type === 'leaf') return [node]
+  return [...collectLeafPanes(node.children[0]), ...collectLeafPanes(node.children[1])]
 }
 
 function renderSidebar(
@@ -1644,6 +1651,84 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(state.tabs.tabs).toHaveLength(2)
       expect(state.tabs.activeTabId).toBe('tab-2')
       expect(state.panes.activePane['tab-2']).toBe('pane-2')
+    })
+
+    it('does not hijack a foreign copied pane when opening the local session', async () => {
+      const targetSessionId = sessionId('session-foreign-copy')
+
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: targetSessionId,
+              provider: 'codex',
+              projectPath: '/home/user/project',
+              updatedAt: Date.now(),
+              title: 'Local codex session',
+              cwd: '/home/user/project',
+            },
+          ],
+        },
+      ]
+
+      const tabs = [
+        { id: 'tab-foreign', mode: 'codex' as const },
+      ]
+
+      const panes = {
+        layouts: {
+          'tab-foreign': {
+            type: 'leaf',
+            id: 'pane-foreign',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              createRequestId: 'req-foreign',
+              status: 'running',
+              sessionRef: {
+                provider: 'codex',
+                sessionId: targetSessionId,
+                serverInstanceId: 'srv-remote',
+              },
+            },
+          },
+        },
+        activePane: {
+          'tab-foreign': 'pane-foreign',
+        },
+        paneTitles: {},
+      }
+
+      const store = createTestStore({
+        projects,
+        tabs,
+        panes,
+        activeTabId: 'tab-foreign',
+        serverInstanceId: 'srv-local',
+      })
+      const { onNavigate } = renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const sessionButton = screen.getByText('Local codex session').closest('button')
+      fireEvent.click(sessionButton!)
+
+      expect(onNavigate).toHaveBeenCalledWith('terminal')
+
+      const state = store.getState()
+      expect(state.tabs.tabs).toHaveLength(1)
+      expect(state.panes.activePane['tab-foreign']).not.toBe('pane-foreign')
+      const layout = state.panes.layouts['tab-foreign']
+      expect(layout.type).toBe('split')
+      const localPane = collectLeafPanes(layout).find((pane) => (
+        pane.type === 'leaf'
+        && pane.content.kind === 'terminal'
+        && pane.content.resumeSessionId === targetSessionId
+      ))
+      expect(localPane).toBeDefined()
     })
 
     it('falls back to creating a new tab when active tab has no layout', async () => {

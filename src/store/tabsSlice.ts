@@ -310,6 +310,7 @@ export const openSessionTab = createAsyncThunk(
     const resolvedProvider = provider || 'claude'
     const resolvedSessionType = sessionType || resolvedProvider
     const state = getState() as RootState
+    const localServerInstanceId = (state as Partial<RootState>).connection?.serverInstanceId
 
     if (terminalId) {
       if (!forceNew) {
@@ -333,7 +334,11 @@ export const openSessionTab = createAsyncThunk(
     }
 
     if (!forceNew) {
-      const existingTabId = findTabIdForSession(state, resolvedProvider, sessionId)
+      const existingTabId = findTabIdForSession(
+        state,
+        { provider: resolvedProvider, sessionId },
+        localServerInstanceId,
+      )
       if (existingTabId) {
         dispatch(setActiveTab(existingTabId))
         return

@@ -434,9 +434,14 @@ export default function Sidebar({
     const state = store.getState()
     const currentActiveTabId = state.tabs.activeTabId
     const runningTerminalId = item.isRunning ? item.runningTerminalId : undefined
+    const localServerInstanceId = state.connection.serverInstanceId
 
     // 1. Dedup: if session is already open in a pane, focus it
-    const existing = findPaneForSession(state, provider, item.sessionId)
+    const existing = findPaneForSession(
+      state,
+      { provider, sessionId: item.sessionId },
+      localServerInstanceId,
+    )
     if (existing) {
       dispatch(setActiveTab(existing.tabId))
       if (existing.paneId) {

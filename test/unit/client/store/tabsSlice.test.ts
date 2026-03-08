@@ -12,9 +12,29 @@ import tabsReducer, {
   TabsState,
 } from '../../../../src/store/tabsSlice'
 import panesReducer, { initLayout } from '../../../../src/store/panesSlice'
+import connectionReducer from '../../../../src/store/connectionSlice'
 import type { Tab } from '../../../../src/store/types'
 
 const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
+
+function createOpenSessionStore(serverInstanceId?: string) {
+  return configureStore({
+    reducer: {
+      tabs: tabsReducer,
+      panes: panesReducer,
+      connection: connectionReducer,
+    },
+    preloadedState: {
+      connection: {
+        status: serverInstanceId ? 'ready' : 'connected',
+        serverInstanceId,
+        platform: null,
+        availableClis: {},
+        featureFlags: {},
+      },
+    },
+  })
+}
 
 // Mock nanoid to return predictable IDs for testing
 vi.mock('nanoid', () => ({
@@ -539,6 +559,58 @@ describe('tabsSlice', () => {
   })
 
   describe('openSessionTab', () => {
+    it('creates a new local tab instead of activating a foreign copied tab', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      store.dispatch(addTab({ id: 'foreign-tab', mode: 'codex' }))
+      store.dispatch(initLayout({
+        tabId: 'foreign-tab',
+        content: {
+          kind: 'terminal',
+          mode: 'codex',
+          sessionRef: {
+            provider: 'codex',
+            sessionId: 'shared',
+            serverInstanceId: 'srv-remote',
+          },
+        },
+      }))
+
+      await store.dispatch(openSessionTab({ sessionId: 'shared', provider: 'codex' }))
+
+      const state = store.getState()
+      expect(state.tabs.tabs).toHaveLength(2)
+      const localTab = state.tabs.tabs.find((tab) => tab.id !== 'foreign-tab')
+      expect(localTab?.resumeSessionId).toBe('shared')
+      expect(state.tabs.activeTabId).toBe(localTab?.id)
+    })
+
+    it('activates an id-less local fallback before websocket ready instead of a foreign copied tab', async () => {
+      const store = createOpenSessionStore()
+
+      store.dispatch(addTab({ id: 'foreign-tab', mode: 'codex' }))
+      store.dispatch(initLayout({
+        tabId: 'foreign-tab',
+        content: {
+          kind: 'terminal',
+          mode: 'codex',
+          sessionRef: {
+            provider: 'codex',
+            sessionId: 'shared',
+            serverInstanceId: 'srv-remote',
+          },
+        },
+      }))
+      store.dispatch(addTab({ id: 'local-fallback', mode: 'codex', resumeSessionId: 'shared' }))
+      store.dispatch(setActiveTab('foreign-tab'))
+
+      await store.dispatch(openSessionTab({ sessionId: 'shared', provider: 'codex' }))
+
+      const state = store.getState()
+      expect(state.tabs.tabs).toHaveLength(2)
+      expect(state.tabs.activeTabId).toBe('local-fallback')
+    })
+
     it('activates existing tab when a pane already owns the session', async () => {
       const store = configureStore({
         reducer: {

@@ -2,18 +2,23 @@
  * Session utilities for extracting session information from store state.
  */
 
-import type { PaneContent, PaneNode } from '@/store/paneTypes'
+import type { PaneContent, PaneNode, SessionLocator } from '@/store/paneTypes'
 import type { RootState } from '@/store/store'
 import type { CodingCliProviderName } from '@/store/types'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 
-type SessionRef = { provider: CodingCliProviderName; sessionId: string }
+type SessionRef = Pick<SessionLocator, 'provider' | 'sessionId'>
+type SessionMatchCandidate = {
+  tabId: string
+  paneId: string | undefined
+  locator: SessionLocator
+}
 
 function isValidSessionRef(provider: string, sessionId: string): provider is CodingCliProviderName {
   return provider !== 'claude' || isValidClaudeSessionId(sessionId)
 }
 
-function locatorIdentity(locator: { provider: CodingCliProviderName; sessionId: string; serverInstanceId?: string }): string {
+function locatorIdentity(locator: SessionLocator): string {
   return `${locator.provider}:${locator.sessionId}:${locator.serverInstanceId ?? ''}`
 }
 
@@ -84,6 +89,65 @@ function extractSessionLocators(content: PaneContent): Array<{
   if (content.mode === 'claude' && !isValidClaudeSessionId(sessionId)) return dedupeBy(locators, locatorIdentity)
   locators.push({ provider: content.mode as CodingCliProviderName, sessionId })
   return dedupeBy(locators, locatorIdentity)
+}
+
+function buildTabFallbackLocator(tab: RootState['tabs']['tabs'][number]): SessionLocator | undefined {
+  const provider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
+  const sessionId = tab.resumeSessionId
+  if (!provider || !sessionId) return undefined
+  if (!isValidSessionRef(provider, sessionId)) return undefined
+  return { provider, sessionId }
+}
+
+function matchScore(
+  candidate: SessionLocator,
+  target: SessionLocator,
+  localServerInstanceId?: string,
+): number {
+  if (candidate.provider !== target.provider || candidate.sessionId !== target.sessionId) return 0
+  if (target.serverInstanceId) {
+    if (candidate.serverInstanceId === target.serverInstanceId) return 3
+    if (target.serverInstanceId === localServerInstanceId && candidate.serverInstanceId == null) return 2
+    return 0
+  }
+  if (candidate.serverInstanceId === localServerInstanceId) return 3
+  if (candidate.serverInstanceId == null) return 2
+  return 0
+}
+
+function collectPaneSessionMatchCandidates(
+  node: PaneNode,
+  tabId: string,
+  candidates: SessionMatchCandidate[],
+): void {
+  if (node.type === 'leaf') {
+    for (const locator of extractSessionLocators(node.content)) {
+      candidates.push({ tabId, paneId: node.id, locator })
+    }
+    return
+  }
+  collectPaneSessionMatchCandidates(node.children[0], tabId, candidates)
+  collectPaneSessionMatchCandidates(node.children[1], tabId, candidates)
+}
+
+function selectBestSessionMatch(
+  candidates: SessionMatchCandidate[],
+  target: SessionLocator,
+  localServerInstanceId?: string,
+): SessionMatchCandidate | undefined {
+  let bestCandidate: SessionMatchCandidate | undefined
+  let bestScore = 0
+
+  for (const candidate of candidates) {
+    const score = matchScore(candidate.locator, target, localServerInstanceId)
+    if (score <= 0) continue
+    if (score > bestScore) {
+      bestCandidate = candidate
+      bestScore = score
+    }
+  }
+
+  return bestCandidate
 }
 
 export function collectSessionLocatorsFromNode(node: PaneNode): Array<{
@@ -178,27 +242,30 @@ export function getTabSessionRefs(state: RootState, tabId: string): SessionRef[]
   return collectSessionRefsFromNode(layout)
 }
 
-export function findTabIdForSession(state: RootState, provider: CodingCliProviderName, sessionId: string): string | undefined {
-  if (provider === 'claude' && !isValidClaudeSessionId(sessionId)) return undefined
+export function findTabIdForSession(
+  state: RootState,
+  target: SessionLocator,
+  localServerInstanceId?: string,
+): string | undefined {
+  if (!isValidSessionRef(target.provider, target.sessionId)) return undefined
+
+  const candidates: SessionMatchCandidate[] = []
   for (const tab of state.tabs.tabs) {
     const layout = state.panes.layouts[tab.id]
     if (layout) {
-      const refs = getTabSessionRefs(state, tab.id)
-      if (refs.some((ref) => ref.provider === provider && ref.sessionId === sessionId)) {
-        return tab.id
+      for (const locator of collectSessionLocatorsFromNode(layout)) {
+        candidates.push({ tabId: tab.id, paneId: undefined, locator })
       }
       continue
     }
 
-    // Fallback for tabs without pane layout yet (e.g., early boot).
-    const tabProvider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
-    if (tabProvider !== provider) continue
-    const tabSessionId = tab.resumeSessionId
-    if (!tabSessionId) continue
-    if (provider === 'claude' && !isValidClaudeSessionId(tabSessionId)) continue
-    if (tabSessionId === sessionId) return tab.id
+    const locator = buildTabFallbackLocator(tab)
+    if (locator) {
+      candidates.push({ tabId: tab.id, paneId: undefined, locator })
+    }
   }
-  return undefined
+
+  return selectBestSessionMatch(candidates, target, localServerInstanceId)?.tabId
 }
 
 /**
@@ -208,42 +275,27 @@ export function findTabIdForSession(state: RootState, provider: CodingCliProvide
  */
 export function findPaneForSession(
   state: RootState,
-  provider: CodingCliProviderName,
-  sessionId: string
+  target: SessionLocator,
+  localServerInstanceId?: string,
 ): { tabId: string; paneId: string | undefined } | undefined {
+  if (!isValidSessionRef(target.provider, target.sessionId)) return undefined
+
+  const candidates: SessionMatchCandidate[] = []
   for (const tab of state.tabs.tabs) {
     const layout = state.panes.layouts[tab.id]
     if (layout) {
-      const paneId = findPaneInNode(layout, provider, sessionId)
-      if (paneId) return { tabId: tab.id, paneId }
+      collectPaneSessionMatchCandidates(layout, tab.id, candidates)
       continue
     }
 
-    // Fallback: tab has resumeSessionId but no pane layout yet (early boot)
-    const tabProvider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
-    if (tabProvider !== provider) continue
-    const tabSessionId = tab.resumeSessionId
-    if (!tabSessionId) continue
-    if (provider === 'claude' && !isValidClaudeSessionId(tabSessionId)) continue
-    if (tabSessionId === sessionId) return { tabId: tab.id, paneId: undefined }
-  }
-  return undefined
-}
-
-function findPaneInNode(
-  node: PaneNode,
-  provider: CodingCliProviderName,
-  sessionId: string
-): string | undefined {
-  if (node.type === 'leaf') {
-    const refs = collectSessionRefsFromNode(node)
-    if (refs.some((ref) => ref.provider === provider && ref.sessionId === sessionId)) {
-      return node.id
+    const locator = buildTabFallbackLocator(tab)
+    if (locator) {
+      candidates.push({ tabId: tab.id, paneId: undefined, locator })
     }
-    return undefined
   }
-  return findPaneInNode(node.children[0], provider, sessionId)
-    ?? findPaneInNode(node.children[1], provider, sessionId)
+
+  const bestMatch = selectBestSessionMatch(candidates, target, localServerInstanceId)
+  return bestMatch ? { tabId: bestMatch.tabId, paneId: bestMatch.paneId } : undefined
 }
 
 /**
