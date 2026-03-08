@@ -104,6 +104,20 @@ function collectAllMessages(
   })
 }
 
+async function closeWs(ws: WebSocket): Promise<void> {
+  if (ws.readyState === WebSocket.CLOSED) return
+
+  const closed = new Promise<void>((resolve) => {
+    ws.once('close', () => resolve())
+  })
+
+  if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+    ws.terminate()
+  }
+
+  await closed
+}
+
 describe('ws handshake snapshot', () => {
   let server: http.Server | undefined
   let port: number
@@ -184,12 +198,6 @@ describe('ws handshake snapshot', () => {
 
   it('sends settings and sessions snapshot after ready', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
-    const closeWs = async () => {
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-        ws.terminate()
-      }
-      await new Promise<void>((resolve) => ws.on('close', () => resolve()))
-    }
 
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
@@ -209,7 +217,7 @@ describe('ws handshake snapshot', () => {
       expect(settingsMsg.settings).toEqual(snapshot.settings)
       expect(sessionsMsg.projects).toEqual(snapshot.projects)
     } finally {
-      await closeWs()
+      await closeWs(ws)
     }
   })
 
@@ -223,12 +231,6 @@ describe('ws handshake snapshot', () => {
     }
 
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
-    const closeWs = async () => {
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-        ws.terminate()
-      }
-      await new Promise<void>((resolve) => ws.on('close', () => resolve()))
-    }
 
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
@@ -247,7 +249,7 @@ describe('ws handshake snapshot', () => {
         backupExists: true,
       })
     } finally {
-      await closeWs()
+      await closeWs(ws)
     }
   })
 
@@ -258,12 +260,6 @@ describe('ws handshake snapshot', () => {
     }
 
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
-    const closeWs = async () => {
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-        ws.terminate()
-      }
-      await new Promise<void>((resolve) => ws.on('close', () => resolve()))
-    }
 
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
@@ -278,7 +274,7 @@ describe('ws handshake snapshot', () => {
       const sessionsMsg = await sessionsPromise
       expect(sessionsMsg.projects).toEqual([])
     } finally {
-      await closeWs()
+      await closeWs(ws)
     }
   })
 })
@@ -341,12 +337,6 @@ describe('ws handshake snapshot with chunking', () => {
 
   it('sends chunked sessions with clear/append flags for large data', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
-    const closeWs = async () => {
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-        ws.terminate()
-      }
-      await new Promise<void>((resolve) => ws.on('close', () => resolve()))
-    }
 
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
@@ -382,7 +372,7 @@ describe('ws handshake snapshot with chunking', () => {
       const expectedSessions = largeSnapshot.projects.reduce((sum, p) => sum + p.sessions.length, 0)
       expect(totalSessions).toBe(expectedSessions)
     } finally {
-      await closeWs()
+      await closeWs(ws)
     }
   })
 })
