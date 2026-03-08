@@ -911,15 +911,19 @@ directories:
 files:
   - dist/electron/**
   - dist/server/**
-  - dist/server-native/**
   - dist/client/**
   - dist/wizard/**
   - node_modules/**
+  - "!node_modules/node-pty/build/**"
   - package.json
 
 extraResources:
   - from: bundled-node/${os}/${arch}
-    to: bundled-node
+    to: bundled-node/bin
+    filter:
+      - "**/*"
+  - from: bundled-node/native-modules
+    to: bundled-node/native-modules
     filter:
       - "**/*"
 
@@ -966,7 +970,8 @@ Add scripts:
 ```json
 {
   "electron:dev": "npm run build:electron && cross-env ELECTRON_DEV=1 concurrently -n client,wizard,electron \"vite\" \"vite --config vite.wizard.config.ts\" \"electron .\"",
-  "electron:build": "npm run build && npm run build:electron && npm run build:wizard && electron-builder",
+  "electron:build": "npm run build && npm run build:electron && npm run build:wizard && npm run prepare:bundled-node && electron-builder",
+  "prepare:bundled-node": "tsx scripts/prepare-bundled-node.ts",
   "build:electron": "tsc -p tsconfig.electron.json",
   "build:wizard": "vite build --config vite.wizard.config.ts",
   "dev:wizard": "vite --config vite.wizard.config.ts",
@@ -999,43 +1004,159 @@ Add main field:
 
 **File:** `scripts/prepare-bundled-node.ts` (new)
 
-Script that downloads the standalone Node.js binary for the current (or specified) platform and places it in `bundled-node/{os}/{arch}/`. This is run as part of the electron build process, not committed to the repo.
+This script is the critical piece of the Electron packaging pipeline. It performs three sequential tasks: downloading the standalone Node.js binary, downloading its headers, and recompiling `node-pty` against those headers. It is run as a pre-step before `electron-builder` packages the app.
 
-The bundled Node.js is used by both daemon and app-bound modes to run the Freshell server independently of Electron's Node.js.
+**Why this is needed:** The Freshell server runs in a separate process using a bundled standalone Node.js binary (not Electron's embedded Node.js). Native modules like `node-pty` contain compiled C++ code (`.node` files) that are ABI-locked to the specific Node.js version they were compiled against. If `node-pty` is compiled against the wrong Node version, it crashes at startup with `NODE_MODULE_VERSION` mismatch. `@electron/rebuild` compiles against Electron's Node ABI, which is wrong for this architecture. The script below compiles against the bundled standalone Node's ABI.
 
-**Critical: node-pty must be compiled against the bundled Node.js, NOT Electron's Node.js.** The server runs in a separate process using the bundled standalone Node.js binary. If node-pty were compiled against Electron's Node ABI (as `@electron/rebuild` would do), it would crash at runtime with `NODE_MODULE_VERSION` mismatch when loaded by the bundled Node.js.
+#### Step 1: Download standalone Node.js binary
 
-The `prepare-bundled-node.ts` script handles this in a second step after downloading the Node.js binary:
+Downloads the Node.js binary from `https://nodejs.org/dist/v{VERSION}/`:
+
+- **macOS/Linux:** `node-v{VERSION}-{platform}-{arch}.tar.gz` -- extract the `bin/node` binary
+- **Windows:** `node-v{VERSION}-win-{arch}.zip` -- extract `node.exe`
+
+Places the binary at `bundled-node/{platform}/{arch}/node` (or `node.exe` on Windows).
+
+The target Node.js version is pinned in `scripts/bundled-node-version.json`:
+```json
+{ "version": "22.12.0" }
+```
+
+This file is the single source of truth for the bundled Node version. It is checked in to version control so all platforms build against the same version.
+
+#### Step 2: Download Node.js headers
+
+`node-gyp` requires C/C++ header files (`node_api.h`, `v8.h`, etc.) to compile native modules. The standalone Node.js binary tarball does NOT include these headers. They must be downloaded separately.
+
+Downloads `https://nodejs.org/dist/v{VERSION}/node-v{VERSION}-headers.tar.gz` and extracts to `bundled-node/headers/`. This produces the directory structure that `node-gyp` expects when `--nodedir` is specified:
+
+```
+bundled-node/headers/
+  node-v{VERSION}/
+    include/
+      node/
+        node.h
+        node_api.h
+        v8.h
+        uv.h
+        ...
+    src/        # (empty or minimal; node-gyp needs the dir to exist)
+```
+
+#### Step 3: Recompile node-pty against bundled Node headers
+
+Runs `node-gyp rebuild` with the bundled Node's headers as the compilation target:
 
 ```typescript
-// After downloading bundled Node.js to bundled-node/{os}/{arch}/node:
-// 1. Run node-gyp rebuild using the BUNDLED node binary as the target
-//    This compiles node-pty.node against the bundled Node's ABI
-// 2. Copy the resulting .node binary into a known location for packaging
+import { execSync } from 'child_process'
+import { readFileSync, cpSync, mkdirSync } from 'fs'
+import path from 'path'
 
-const bundledNodePath = `bundled-node/${os}/${arch}/node`
-const nodePtyDir = 'node_modules/node-pty'
+const { version } = JSON.parse(readFileSync('scripts/bundled-node-version.json', 'utf-8'))
+const headersDir = path.resolve(`bundled-node/headers/node-v${version}`)
+const nodePtyDir = path.resolve('node_modules/node-pty')
 
-// Use the bundled Node's headers and ABI version for compilation
+// Compile node-pty against the bundled Node's ABI.
+// --nodedir points to the extracted headers directory (must contain include/node/*.h)
+// --target specifies the Node version for ABI compatibility
 execSync(
-  `node-gyp rebuild --target=${bundledNodeVersion} --nodedir=${bundledNodeDir}`,
-  { cwd: nodePtyDir }
+  `npx node-gyp rebuild --target=${version} --nodedir=${headersDir}`,
+  { cwd: nodePtyDir, stdio: 'inherit' }
 )
 
-// Copy the rebuilt native module to dist/server for packaging
-copySync(
-  `${nodePtyDir}/build/Release/pty.node`,
-  `dist/server-native/pty.node`
+// Copy the compiled native module to a staging directory for electron-builder
+mkdirSync('bundled-node/native-modules/node-pty/build/Release', { recursive: true })
+cpSync(
+  path.join(nodePtyDir, 'build/Release/pty.node'),
+  'bundled-node/native-modules/node-pty/build/Release/pty.node'
+)
+// Also copy node-pty's JS files (the package's index.js, lib/*.js) so the module is complete
+cpSync(
+  nodePtyDir,
+  'bundled-node/native-modules/node-pty',
+  { recursive: true, filter: (src) => !src.includes('build') || src.endsWith('Release/pty.node') || src.includes('Release') }
 )
 ```
 
-The electron-builder config (Section 5.1) includes `dist/server-native/` in the `files` list so the correctly-compiled native module is packaged alongside the server code.
+#### Runtime resolution: how the server finds the recompiled node-pty
 
-At runtime, the server's node-pty import resolves to this pre-compiled binary (via a `NODE_PATH` or `--require` override in the spawn options, or by copying the binary into the server's `node_modules` during packaging).
+The server's `import ... from 'node-pty'` must resolve to the recompiled native module, not to the copy in `node_modules/` (which was compiled against the development machine's system Node or Electron's Node).
+
+The server spawner (Section 3.1) sets the `NODE_PATH` environment variable when spawning the server process:
+
+```typescript
+// In server-spawner.ts, production mode spawn:
+const nativeModulesPath = path.join(app.getPath('userData'), '..', 'bundled-node', 'native-modules')
+// electron-builder extraResources places bundled-node/ in the app's resources directory
+const resourcesPath = process.resourcesPath  // Electron's resources dir
+const nativeModulesDir = path.join(resourcesPath, 'bundled-node', 'native-modules')
+
+child_process.spawn(nodeBinary, [serverEntry], {
+  env: {
+    ...processEnv,
+    NODE_PATH: nativeModulesDir,  // node-pty resolves from here FIRST
+    PORT: String(port),
+    NODE_ENV: 'production',
+  },
+})
+```
+
+`NODE_PATH` prepends to Node's module resolution. When the server does `import ... from 'node-pty'`, Node checks `NODE_PATH` directories before `node_modules/`. Since `bundled-node/native-modules/node-pty/` contains the complete package (JS files + correctly-compiled `pty.node`), the import succeeds with the right ABI.
+
+#### electron-builder packaging
+
+The `electron-builder.yml` `extraResources` section (Section 5.1) already packages `bundled-node/` into the app's resources:
+
+```yaml
+extraResources:
+  - from: bundled-node/${os}/${arch}
+    to: bundled-node
+    filter:
+      - "**/*"
+```
+
+This is extended to also package the native modules:
+
+```yaml
+extraResources:
+  - from: bundled-node/${os}/${arch}
+    to: bundled-node/bin
+    filter:
+      - "**/*"
+  - from: bundled-node/native-modules
+    to: bundled-node/native-modules
+    filter:
+      - "**/*"
+```
+
+#### Build script integration
+
+The `electron:build` script is updated to include the preparation step:
+
+```json
+{
+  "prepare:bundled-node": "tsx scripts/prepare-bundled-node.ts",
+  "electron:build": "npm run build && npm run build:electron && npm run build:wizard && npm run prepare:bundled-node && electron-builder"
+}
+```
+
+#### Tests for the preparation script
+
+**Tests:** `test/unit/electron/prepare-bundled-node.test.ts`
+- Verifies the headers directory structure is validated (rejects missing `include/node/node_api.h`)
+- Verifies `node-gyp rebuild` is called with correct `--target` and `--nodedir` flags
+- Verifies the compiled `pty.node` is copied to `bundled-node/native-modules/`
+- Verifies the complete node-pty package (JS + native binary) is staged correctly
+
+**File:** `scripts/bundled-node-version.json` (new)
+
+```json
+{ "version": "22.12.0" }
+```
 
 **File:** `.gitignore` (edit)
 
-Add `bundled-node/`, `dist/server-native/` to .gitignore.
+Add `bundled-node/` to .gitignore (the downloaded binaries, headers, and recompiled native modules are all build artifacts).
 
 ### 5.4 Icons and assets
 
@@ -1207,7 +1328,8 @@ These tests require `electron` to be installed and may be slow. They are marked 
 | `tsconfig.electron.json` | TypeScript config for electron main process (excludes .tsx) |
 | `vitest.electron.config.ts` | Vitest config for electron tests |
 | `electron-builder.yml` | electron-builder packaging config |
-| `scripts/prepare-bundled-node.ts` | Bundled Node.js download script |
+| `scripts/prepare-bundled-node.ts` | Download Node binary + headers, recompile node-pty, stage native modules |
+| `scripts/bundled-node-version.json` | Pinned bundled Node.js version (single source of truth) |
 | `.github/workflows/electron-build.yml` | CI build workflow |
 | `.github/workflows/electron-release.yml` | Release workflow |
 | `assets/electron/` | Icons and tray icons (placeholder) |
@@ -1231,6 +1353,7 @@ These tests require `electron` to be installed and may be slow. They are marked 
 | `test/unit/electron/main.test.ts` | Unit | Main process lifecycle |
 | `test/unit/electron/preload.test.ts` | Unit | Preload API shape |
 | `test/unit/electron/setup-wizard/wizard.test.tsx` | Unit | Setup wizard UI |
+| `test/unit/electron/prepare-bundled-node.test.ts` | Unit | Node download/headers/recompile pipeline |
 | `test/integration/server/server-info-api.test.ts` | Integration | /api/server-info endpoint |
 
 ### Modified files
@@ -1241,7 +1364,7 @@ These tests require `electron` to be installed and may be slow. They are marked 
 | `package.json` | Add electron/electron-builder/electron-updater deps, add scripts, add `main` field |
 | `vitest.config.ts` | Add `test/unit/electron/**` to exclude array (prevent jsdom runner picking up electron tests) |
 | `src/index.css` | Extract `:root`/`.dark` CSS variable blocks into `src/theme-variables.css`, replace with `@import` |
-| `.gitignore` | Add `bundled-node/`, `release/`, `dist/wizard/`, `dist/server-native/` |
+| `.gitignore` | Add `bundled-node/`, `release/`, `dist/wizard/` |
 
 ---
 
@@ -1267,10 +1390,11 @@ Within each phase, the order is file-by-file as listed.
 
 2. **Windows "daemon" via Scheduled Tasks**: Rather than pulling in `node-windows` (heavy native dependency), we use `schtasks` which is built into every Windows installation. This provides "run at logon" and "restart on failure" behavior without native compilation headaches.
 
-3. **Bundled Node.js with native module rebuild**: The daemon and app-bound modes run the server via a standalone Node.js binary bundled in the app's resources. Native modules (specifically `node-pty`) are compiled against this bundled Node.js version using `node-gyp rebuild` with the bundled Node's headers -- NOT via `@electron/rebuild`, which would compile against Electron's Node ABI and crash at runtime with `NODE_MODULE_VERSION` mismatch. This means:
+3. **Bundled Node.js with fully-specified native module pipeline**: The daemon and app-bound modes run the server via a standalone Node.js binary bundled in the app's resources. The pipeline is: (1) download Node.js binary from `nodejs.org/dist/`, (2) download the Node.js headers tarball separately (the binary tarball does not include headers), (3) run `node-gyp rebuild --target={version} --nodedir={headers-dir}` in node-pty's directory, (4) stage the recompiled package in `bundled-node/native-modules/`, (5) at runtime, set `NODE_PATH` to the staged directory so the server's `import 'node-pty'` resolves the correctly-compiled binary. `@electron/rebuild` is NOT used -- it compiles against Electron's Node ABI, which would crash when loaded by the standalone bundled Node. The bundled Node version is pinned in `scripts/bundled-node-version.json` as the single source of truth. This means:
    - No system Node.js dependency for end users
-   - node-pty is compiled against the exact Node version it will run under
+   - node-pty is compiled against the exact Node ABI it will run under
    - The Electron Node.js is completely separate from the server Node.js
+   - The compilation target is explicit and reproducible across platforms
 
 4. **Setup wizard as a separate BrowserWindow with its own Vite build**: The wizard is not a route in the main app -- it works without any server running, which is essential for the first-run experience. It has a dedicated Vite config (`vite.wizard.config.ts`) that produces a self-contained bundle (`dist/wizard/`) with React JSX transform and Tailwind CSS processing. CSS theme variables (`:root`/`.dark` custom properties) are extracted into `src/theme-variables.css` and imported by both the main app's CSS and the wizard's CSS, ensuring semantic Tailwind colors (e.g., `bg-background`, `text-foreground`) render correctly in both contexts. The `tsconfig.electron.json` excludes `.tsx` files; they are handled exclusively by Vite.
 
@@ -1288,7 +1412,7 @@ Within each phase, the order is file-by-file as listed.
 
 ## Risk Assessment
 
-1. **node-pty native compilation**: node-pty must be compiled against the bundled standalone Node.js ABI, not Electron's Node ABI. The `prepare-bundled-node.ts` script handles this by running `node-gyp rebuild` with the bundled Node's headers and version as the target. If this step produces a binary for the wrong ABI, the server will crash on startup with `NODE_MODULE_VERSION` mismatch. This is tested by the CI build matrix (which runs a real build on each platform) but is inherently fragile -- any upgrade to the bundled Node.js version requires re-running this step.
+1. **node-pty native compilation**: node-pty must be compiled against the bundled standalone Node.js ABI, not Electron's Node ABI. The `prepare-bundled-node.ts` script handles this with a three-step pipeline: download the Node.js headers tarball (separate from the binary), run `node-gyp rebuild --target={version} --nodedir={headers-dir}`, and stage the complete recompiled package. At runtime, `NODE_PATH` directs the server's `import 'node-pty'` to the staged copy. If any step fails or targets the wrong version, the server crashes with `NODE_MODULE_VERSION` mismatch. The version is pinned in `scripts/bundled-node-version.json` as a single source of truth. This is tested by the CI build matrix (which runs a real build on each platform) but is inherently fragile -- any upgrade to the bundled Node.js version requires updating the pinned version and re-running the pipeline.
 
 2. **Cross-platform daemon reliability**: Each platform's daemon implementation is relatively simple (write a config file, run a CLI command) but edge cases exist (permissions, systemd user sessions not running without login, etc.). The unit tests mock OS calls; real OS testing is deferred to manual QA.
 
