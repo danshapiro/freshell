@@ -1,11 +1,16 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import type { ProjectGroup } from './types'
 
+function sessionKey(s: any): string {
+  return `${s.provider || 'claude'}:${s.sessionId}`
+}
+
 function normalizeProjects(payload: unknown): ProjectGroup[] {
   if (!Array.isArray(payload)) return []
   // Use a Map to merge entries that share a projectPath (happens when the
   // server splits an oversized project across multiple WebSocket chunks).
   const merged = new Map<string, ProjectGroup>()
+  const seenSessions = new Map<string, Set<string>>()
   for (const raw of payload as any[]) {
     if (!raw || typeof raw !== 'object') continue
     const projectPath = (raw as any).projectPath
@@ -17,11 +22,18 @@ function normalizeProjects(payload: unknown): ProjectGroup[] {
     const color = typeof (raw as any).color === 'string' ? (raw as any).color : undefined
     const existing = merged.get(projectPath)
     if (existing) {
-      const seen = new Set(existing.sessions.map((s: any) => s.sessionId))
-      existing.sessions.push(...sessions.filter((s: any) => !seen.has(s.sessionId)))
+      const seen = seenSessions.get(projectPath)!
+      for (const s of sessions) {
+        const key = sessionKey(s)
+        if (!seen.has(key)) {
+          seen.add(key)
+          existing.sessions.push(s)
+        }
+      }
       if (color && !existing.color) existing.color = color
     } else {
       merged.set(projectPath, { projectPath, sessions, ...(color ? { color } : {}) } as ProjectGroup)
+      seenSessions.set(projectPath, new Set(sessions.map(sessionKey)))
     }
   }
   return Array.from(merged.values())

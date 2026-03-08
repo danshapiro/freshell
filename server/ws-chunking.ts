@@ -1,4 +1,5 @@
 import type { ProjectGroup } from './coding-cli/types.js'
+import { logger } from './logger.js'
 
 /**
  * Chunk projects array into batches that fit within MAX_CHUNK_BYTES when serialized.
@@ -51,16 +52,31 @@ export function chunkProjects(projects: ProjectGroup[], maxBytes: number): Proje
           subSessions = []
           subSize = 0
         }
+        const commaBefore = subSessions.length > 0 ? 1 : 0
         subSessions.push(session)
-        subSize += (subSessions.length > 1 ? 1 : 0) + sessionSize
+        subSize += commaBefore + sessionSize
       }
 
       if (subSessions.length > 0) {
-        // Start a new chunk with the remaining sessions
-        currentChunk = [{ ...shell, sessions: subSessions }]
-        currentSize = subSize + shellOverhead
+        // Carry the last sub-group forward into currentChunk so it can be
+        // coalesced with the next project in the normal path (space-efficient).
+        // Use exact byte size to avoid approximation drift.
+        const carried = { ...shell, sessions: subSessions } as ProjectGroup
+        currentChunk = [carried]
+        currentSize = Buffer.byteLength(JSON.stringify(carried))
       }
       continue
+    }
+
+    // Warn if a single project can't be split further but exceeds the chunk budget
+    if (projectSize + overhead > maxBytes) {
+      logger.warn({
+        event: 'oversized_unsplittable_project',
+        projectPath: project.projectPath,
+        projectBytes: projectSize,
+        maxBytes,
+        sessionCount: project.sessions.length,
+      }, `Project ${project.projectPath} (${project.sessions.length} session(s), ${(projectSize / 1024).toFixed(1)} KB) exceeds chunk limit`)
     }
 
     // Normal path: add whole project to current chunk

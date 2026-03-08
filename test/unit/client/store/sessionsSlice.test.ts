@@ -578,9 +578,10 @@ describe('sessionsSlice', () => {
       expect(state.projects[0].sessions).toHaveLength(2)
     })
 
-    it('deduplicates sessions by sessionId when merging split chunks', () => {
+    it('deduplicates sessions by provider:sessionId when merging split chunks', () => {
       // If overlapping chunks arrive (e.g., reconnect/retry), duplicate
-      // sessionIds should not produce duplicate entries.
+      // sessions should not produce duplicate entries. Dedup uses composite
+      // key provider:sessionId to match mergeSnapshotProjects convention.
       const overlapping: ProjectGroup[] = [
         {
           projectPath: '/project/dup',
@@ -602,6 +603,30 @@ describe('sessionsSlice', () => {
       const project = state.projects.find(p => p.projectPath === '/project/dup')!
       expect(project.sessions).toHaveLength(3)
       expect(project.sessions.map((s: any) => s.sessionId)).toEqual(['s1', 's2', 's3'])
+    })
+
+    it('keeps sessions with same sessionId but different providers', () => {
+      // Two providers can generate sessions with the same sessionId.
+      // normalizeProjects must use provider:sessionId as the dedup key.
+      const multiProvider: ProjectGroup[] = [
+        {
+          projectPath: '/project/multi',
+          sessions: [
+            { sessionId: 's1', projectPath: '/project/multi', updatedAt: 1, provider: 'claude' },
+          ],
+        },
+        {
+          projectPath: '/project/multi',
+          sessions: [
+            { sessionId: 's1', projectPath: '/project/multi', updatedAt: 2, provider: 'codex' },
+          ],
+        },
+      ]
+
+      const state = sessionsReducer(initialState, setProjects(multiProvider))
+      const project = state.projects.find(p => p.projectPath === '/project/multi')!
+      expect(project.sessions).toHaveLength(2)
+      expect(project.sessions.map((s: any) => s.provider)).toEqual(['claude', 'codex'])
     })
 
     it('filters non-object session entries to prevent downstream crashes', () => {
