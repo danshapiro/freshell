@@ -237,7 +237,7 @@ describe('TabBar arrow navigation buttons', () => {
     expect(rightBtn.tagName).toBe('BUTTON')
   })
 
-  it('arrow buttons are positioned absolutely outside the scroll flow', () => {
+  it('arrow buttons are flex siblings outside the scroll container (not absolute overlays)', () => {
     mockCanScrollLeft = true
     mockCanScrollRight = true
 
@@ -251,9 +251,9 @@ describe('TabBar arrow navigation buttons', () => {
     // Buttons should not be inside the overflow-x-auto scrollable container
     expect(leftBtn.closest('.overflow-x-auto')).toBeNull()
     expect(rightBtn.closest('.overflow-x-auto')).toBeNull()
-    // Buttons are absolutely positioned overlays (no layout impact)
-    expect(leftBtn.className).toContain('absolute')
-    expect(rightBtn.className).toContain('absolute')
+    // Buttons should NOT be absolutely positioned (they are flex siblings now)
+    expect(leftBtn.className).not.toContain('absolute')
+    expect(rightBtn.className).not.toContain('absolute')
   })
 
   it('hidden arrow buttons are removed from tab order', () => {
