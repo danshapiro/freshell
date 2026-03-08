@@ -111,6 +111,7 @@ This tests the actual production code path and is fully deterministic. The build
 ```
 test/e2e-browser/
   playwright.config.ts          # Playwright configuration
+  vitest.config.ts              # Vitest config for helper unit tests (test-server.test.ts etc.)
   global-setup.ts               # Build client+server if needed, install browsers
   global-teardown.ts            # Clean up temp dirs
   helpers/
@@ -143,6 +144,8 @@ test/e2e-browser/
 **Files:**
 - Modify: `package.json`
 - Create: `test/e2e-browser/playwright.config.ts`
+- Create: `test/e2e-browser/vitest.config.ts` (dedicated vitest config for helper unit tests)
+- Modify: `vitest.config.ts` (exclude `test/e2e-browser/**`)
 - Create: `.gitignore` entry for Playwright artifacts
 
 **Step 1: Write the test that verifies Playwright is configured**
@@ -254,6 +257,39 @@ exclude: [
 
 Also add the same exclusion to `vitest.server.config.ts` if it uses an explicit include list (read the file and add the exclusion if needed).
 
+**Step 7: Create a dedicated vitest config for E2E helper unit tests**
+
+The e2e-browser helper tests (e.g., `test-server.test.ts`) need their own vitest config because:
+- `vitest.config.ts` excludes `test/e2e-browser/**` (added in Step 6 above)
+- `vitest.server.config.ts` uses an explicit `include` list that only covers `test/server/**`, `test/unit/server/**`, `test/integration/server/**`, and three named files -- it does not match `test/e2e-browser/**`
+- Neither config will collect e2e-browser helper tests
+
+Create `test/e2e-browser/vitest.config.ts`:
+
+```ts
+// test/e2e-browser/vitest.config.ts
+// Dedicated vitest config for E2E helper unit tests (e.g., test-server.test.ts).
+// These tests verify the E2E test infrastructure itself and run in a Node
+// environment. They are NOT run by `npm test` (which uses the root vitest
+// configs); instead, they are run explicitly during E2E helper development.
+import { defineConfig } from 'vitest/config'
+
+export default defineConfig({
+  test: {
+    environment: 'node',
+    include: ['helpers/**/*.test.ts'],
+    testTimeout: 60_000,  // TestServer startup can take a while
+    hookTimeout: 30_000,
+  },
+})
+```
+
+Add an npm script for convenience:
+
+```json
+"test:e2e:helpers": "vitest run --config test/e2e-browser/vitest.config.ts"
+```
+
 Verify existing tests still pass:
 
 ```bash
@@ -262,7 +298,7 @@ npm test
 
 Expected: All existing tests pass (no regressions)
 
-**Step 7: Run the smoke test to verify Playwright**
+**Step 8: Run the smoke test to verify Playwright**
 
 ```bash
 npx playwright test --config test/e2e-browser/playwright.config.ts
@@ -270,10 +306,10 @@ npx playwright test --config test/e2e-browser/playwright.config.ts
 
 Expected: PASS
 
-**Step 8: Commit**
+**Step 9: Commit**
 
 ```bash
-git add test/e2e-browser/playwright.config.ts test/e2e-browser/specs/smoke.spec.ts package.json package-lock.json .gitignore vitest.config.ts vitest.server.config.ts
+git add test/e2e-browser/playwright.config.ts test/e2e-browser/vitest.config.ts test/e2e-browser/specs/smoke.spec.ts package.json package-lock.json .gitignore vitest.config.ts vitest.server.config.ts
 git commit -m "feat: install Playwright, add E2E test configuration, exclude from vitest"
 ```
 
@@ -358,8 +394,10 @@ describe('TestServer', () => {
 **Step 2: Run test to verify it fails**
 
 ```bash
-npx vitest run test/e2e-browser/helpers/test-server.test.ts --config vitest.server.config.ts
+npx vitest run --config test/e2e-browser/vitest.config.ts
 ```
+
+This uses the dedicated `test/e2e-browser/vitest.config.ts` created in Task 1 Step 7, which includes `helpers/**/*.test.ts`. Using `vitest.server.config.ts` would not work because its explicit `include` list does not cover `test/e2e-browser/**`, and `vitest.config.ts` explicitly excludes `test/e2e-browser/**`.
 
 Expected: FAIL (module not found)
 
@@ -608,10 +646,10 @@ export class TestServer {
 **Step 5: Run tests to verify they pass**
 
 ```bash
-npx vitest run test/e2e-browser/helpers/test-server.test.ts --config vitest.server.config.ts
+npx vitest run --config test/e2e-browser/vitest.config.ts
 ```
 
-Expected: PASS (requires built server — may need `npm run build` first)
+Expected: PASS (requires built server -- may need `npm run build` first)
 
 **Step 6: Commit**
 
@@ -3331,10 +3369,13 @@ These scripts should already be in package.json from Task 1, but verify and ensu
     "test:e2e:chromium": "playwright test --config test/e2e-browser/playwright.config.ts --project=chromium",
     "test:e2e:headed": "playwright test --config test/e2e-browser/playwright.config.ts --headed",
     "test:e2e:update-snapshots": "playwright test --config test/e2e-browser/playwright.config.ts --update-snapshots",
-    "test:e2e:debug": "playwright test --config test/e2e-browser/playwright.config.ts --debug"
+    "test:e2e:debug": "playwright test --config test/e2e-browser/playwright.config.ts --debug",
+    "test:e2e:helpers": "vitest run --config test/e2e-browser/vitest.config.ts"
   }
 }
 ```
+
+Note: `test:e2e:helpers` was already added in Task 1 Step 7, but verify it is present.
 
 **Step 2: Verify all scripts work**
 
