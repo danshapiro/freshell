@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest'
 import http from 'http'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
@@ -82,6 +82,38 @@ function collectMessages(ws: WebSocket, durationMs: number): Promise<any[]> {
       ws.off('message', handler)
       resolve(messages)
     }, durationMs)
+  })
+}
+
+function closeWebSocket(ws: WebSocket, timeoutMs = 1_000): Promise<void> {
+  return new Promise((resolve) => {
+    if (ws.readyState === WebSocket.CLOSED) {
+      resolve()
+      return
+    }
+
+    const cleanup = () => {
+      clearTimeout(timeout)
+      ws.off('close', onClose)
+      ws.off('error', onClose)
+    }
+
+    const onClose = () => {
+      cleanup()
+      resolve()
+    }
+
+    const timeout = setTimeout(() => {
+      cleanup()
+      resolve()
+    }, timeoutMs)
+
+    ws.on('close', onClose)
+    ws.on('error', onClose)
+
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      ws.close()
+    }
   })
 }
 
@@ -200,6 +232,7 @@ describe('terminal.create reuse running codex terminal', () => {
     process.env.AUTH_TOKEN = 'testtoken-testtoken'
     process.env.HELLO_TIMEOUT_MS = '100'
 
+    vi.resetModules()
     const { WsHandler } = await import('../../server/ws-handler')
     server = http.createServer((_req, res) => { res.statusCode = 404; res.end() })
     registry = new FakeRegistry(['term-codex-existing'])
@@ -260,7 +293,7 @@ describe('terminal.create reuse running codex terminal', () => {
       expect(registry.attachCalls).toHaveLength(1)
       expect(registry.attachCalls[0]?.terminalId).toBe('term-codex-existing')
     } finally {
-      ws.close()
+      await closeWebSocket(ws)
     }
   })
 
@@ -300,7 +333,7 @@ describe('terminal.create reuse running codex terminal', () => {
       const ready = await readyPromise
       expect(ready.terminalId).toBe(created.terminalId)
     } finally {
-      ws.close()
+      await closeWebSocket(ws)
     }
   })
 
@@ -356,7 +389,7 @@ describe('terminal.create reuse running codex terminal', () => {
       const ready = await readyPromise
       expect(ready.terminalId).toBe(firstCreated.terminalId)
     } finally {
-      ws.close()
+      await closeWebSocket(ws)
     }
   })
 
@@ -378,7 +411,7 @@ describe('terminal.create reuse running codex terminal', () => {
       const created = await createdPromise
       expect(created.effectiveResumeSessionId).toBe(CODEX_SESSION_ID)
     } finally {
-      ws.close()
+      await closeWebSocket(ws)
     }
   })
 
@@ -435,7 +468,7 @@ describe('terminal.create reuse running codex terminal', () => {
       )
       expect(dupeRegistry.attachCalls[0]?.terminalId).toBe('term-canonical')
     } finally {
-      ws.close()
+      await closeWebSocket(ws)
       await new Promise<void>((resolve) => dupeServer.close(() => resolve()))
     }
   })

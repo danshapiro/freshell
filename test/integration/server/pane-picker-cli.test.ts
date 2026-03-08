@@ -277,6 +277,7 @@ describe('Pane Picker CLI Integration', () => {
       process.env.TERMINAL_CREATE_RATE_LIMIT = '10'
       process.env.TERMINAL_CREATE_RATE_WINDOW_MS = '10000'
 
+      vi.resetModules()
       ;({ WsHandler } = await import('../../../server/ws-handler'))
       server = http.createServer((_req, res) => {
         res.statusCode = 404
