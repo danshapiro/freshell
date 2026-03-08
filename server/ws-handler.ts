@@ -930,7 +930,7 @@ export class WsHandler {
   ): Promise<boolean> {
     const paginated = this.paginateSidebarProjects(projects, state, options)
     const allSent = await this.sendChunkedSessions(ws, paginated.projects, {
-      authoritative: options.authoritative,
+      authoritative: options.authoritative ? true : undefined,
       totalSessions: paginated.totalSessions,
       oldestIncludedTimestamp: paginated.oldestIncludedTimestamp,
       oldestIncludedSessionId: paginated.oldestIncludedSessionId,
@@ -994,7 +994,7 @@ export class WsHandler {
     ws: LiveWebSocket,
     projects: ProjectGroup[],
     paginationMeta?: {
-      authoritative?: boolean
+      authoritative?: true
       totalSessions: number
       oldestIncludedTimestamp: number
       oldestIncludedSessionId: string
