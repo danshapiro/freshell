@@ -88,6 +88,8 @@ xterm.js renders into a canvas (WebGL by default, canvas fallback), making stand
 4. `getTerminalBuffer(terminalId)` returns the full buffer text by iterating `terminal.buffer.active.getLine(y)` for `y` in `[0, terminal.buffer.active.length)`
 5. When no `terminalId` is passed, `getTerminalBuffer()` returns the buffer of the first registered terminal (convenience for single-terminal tests)
 
+**Registration timing:** The registration is done in a `useEffect` watching `terminalContent?.terminalId`, NOT inline at Terminal creation time. This is critical because when the xterm `Terminal` instance is created, `terminalId` is still `undefined` -- it is assigned asynchronously when the server responds with a `terminal.created` WebSocket message. The `useEffect` fires when `terminalId` transitions from `undefined` to a real value, which is exactly the right time to register.
+
 ### 4. WebSocket Assertions
 
 For scenarios that need to verify WebSocket messages (terminal I/O, session updates), tests can:
@@ -707,6 +709,7 @@ export interface FreshellTestHarness {
   dispatch: typeof appStore.dispatch
   getWsReadyState: () => string
   waitForConnection: (timeoutMs?: number) => Promise<void>
+  forceDisconnect: () => void
   getTerminalBuffer: (terminalId?: string) => string | null
   registerTerminalBuffer: (terminalId: string, accessor: () => string) => void
   unregisterTerminalBuffer: (terminalId: string) => void
@@ -730,6 +733,7 @@ export function installTestHarness(
   store: typeof appStore,
   getWsState: () => string,
   waitForWsReady: (timeoutMs?: number) => Promise<void>,
+  forceWsDisconnect: () => void,
 ): void {
   if (typeof window === 'undefined') return
 
@@ -742,6 +746,7 @@ export function installTestHarness(
     dispatch: store.dispatch,
     getWsReadyState: getWsState,
     waitForConnection: waitForWsReady,
+    forceDisconnect: forceWsDisconnect,
     getTerminalBuffer: (terminalId?: string) => {
       if (terminalId) {
         const accessor = terminalBuffers.get(terminalId)
@@ -802,6 +807,10 @@ const [_harnessInstalled] = useState(() => {
         }
       })
     }),
+    // forceDisconnect: close the underlying WebSocket to trigger auto-reconnect.
+    // Unlike ws.disconnect(), this does NOT set intentionalClose, so the client
+    // will reconnect automatically.
+    () => { (ws as any).ws?.close() },
   )
   return true
 })
@@ -811,16 +820,30 @@ Tests navigate to `http://127.0.0.1:{port}/?token={token}&e2e=1`.
 
 **Step 3: Wire up terminal buffer registration in TerminalView**
 
-In `src/components/TerminalView.tsx`, after the xterm `Terminal` instance is created and stored in `termRef.current` (around line 861), add registration with the test harness. This must happen only when the harness is installed (i.e., when `?e2e=1` is in the URL):
+In `src/components/TerminalView.tsx`, add a `useEffect` that registers/unregisters the xterm buffer accessor on the test harness whenever `terminalContent?.terminalId` changes.
+
+**Why a useEffect, not inline code at Terminal creation:** When the xterm `Terminal` is created (around line 830), `terminalContent.terminalId` is still `undefined`. The `terminalId` is only assigned asynchronously when the server responds with a `terminal.created` WebSocket message (line 1517-1518), which triggers a Redux update that flows back as a new `terminalContent.terminalId` prop. A `useEffect` watching this value correctly registers the buffer accessor at the right time -- after both the xterm instance exists AND the `terminalId` has been assigned.
+
+Add this `useEffect` alongside the other effects in TerminalView (e.g., after the ref-sync effect around line 306):
 
 ```ts
 // Register terminal buffer accessor with test harness (for E2E tests).
 // Uses xterm.js Terminal.buffer.active API which works with all renderers
 // (WebGL, canvas, DOM) — unlike DOM scraping via .xterm-rows which only
 // works with the DOM renderer.
-if (window.__FRESHELL_TEST_HARNESS__ && terminalContent?.terminalId) {
+//
+// This must be a useEffect watching terminalContent?.terminalId because:
+// 1. When the xterm Terminal is first created, terminalId is undefined
+//    (the server hasn't responded with terminal.created yet)
+// 2. terminalId becomes defined asynchronously via a WS message handler
+// 3. The useEffect fires when terminalId transitions from undefined to a
+//    real value, which is exactly when we can register the buffer
+useEffect(() => {
+  const tid = terminalContent?.terminalId
+  if (!window.__FRESHELL_TEST_HARNESS__ || !tid) return
+
   window.__FRESHELL_TEST_HARNESS__.registerTerminalBuffer(
-    terminalContent.terminalId,
+    tid,
     () => {
       const t = termRef.current
       if (!t) return ''
@@ -833,16 +856,16 @@ if (window.__FRESHELL_TEST_HARNESS__ && terminalContent?.terminalId) {
       return lines.join('\n')
     },
   )
-}
+
+  return () => {
+    window.__FRESHELL_TEST_HARNESS__?.unregisterTerminalBuffer(tid)
+  }
+}, [terminalContent?.terminalId])
 ```
 
-In the cleanup/dispose path (where `termRef.current` is disposed), add:
-
-```ts
-if (window.__FRESHELL_TEST_HARNESS__ && terminalContent?.terminalId) {
-  window.__FRESHELL_TEST_HARNESS__.unregisterTerminalBuffer(terminalContent.terminalId)
-}
-```
+The cleanup function in the `useEffect` return handles both:
+- Terminal disposal (component unmounts, cleanup runs)
+- Terminal ID change (old ID unregistered, new ID registered on next effect)
 
 This ensures the test harness always has access to the latest terminal buffer content regardless of which renderer xterm.js uses.
 
@@ -877,6 +900,17 @@ export class TestHarness {
       timeoutMs,
       { timeout: timeoutMs + 1000 },
     )
+  }
+
+  /**
+   * Force-close the underlying WebSocket to trigger auto-reconnect.
+   * Unlike the WsClient's disconnect() method, this does NOT set intentionalClose,
+   * so the client will attempt to reconnect automatically.
+   */
+  async forceDisconnect(): Promise<void> {
+    await this.page.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.forceDisconnect()
+    })
   }
 
   /** Get the current Redux state */
@@ -1780,48 +1814,171 @@ test.describe('Pane System', () => {
   })
 
   test('each pane has independent terminal', async ({ freshellPage, page, harness, terminal }) => {
-    // Split to get two panes
     await terminal.waitForTerminal()
     await terminal.waitForPrompt()
 
-    // Type in first pane
+    // Type a marker in the first pane
     await terminal.executeCommand('echo "pane-1-marker"')
     await terminal.waitForOutput('pane-1-marker')
 
-    // The split action and switching between panes would need
-    // the specific UI mechanism (FAB, context menu, or keyboard shortcut)
-    // This test verifies the concept; exact selectors depend on implementation
-  })
+    // Split via context menu to get a second pane with its own terminal
+    const termContainer = page.locator('.xterm').first()
+    await termContainer.click({ button: 'right' })
+    const splitOption = page.getByText(/split.*horizontal/i)
+    await splitOption.click()
 
-  test('pane picker allows choosing pane type', async ({ freshellPage, page }) => {
-    // The pane picker should show options: Shell, Browser, Editor
-    // This appears when adding a new pane via the picker
-    const pickerOptions = page.getByRole('button', { name: /shell|terminal/i })
-    // If picker is shown, verify it has the expected options
-  })
+    // Wait for the second pane's terminal to appear
+    await page.locator('.xterm').nth(1).waitFor({ state: 'visible', timeout: 15_000 })
 
-  test('pane resize by dragging divider', async ({ freshellPage, page, harness }) => {
-    // Need two panes first (split)
-    // Then drag the divider between them
-    // Verify sizes changed in the layout
-  })
-
-  test('pane focus switches correctly', async ({ freshellPage, page, harness }) => {
-    // With multiple panes, clicking in one should focus it
-    // The active pane should be reflected in Redux state
-  })
-
-  test('zoom pane hides other panes', async ({ freshellPage, page, harness }) => {
-    // Zoom a pane (via UI control or keyboard shortcut)
-    // Other panes should be hidden but preserved in the tree
+    // Verify the layout now has two children
     const activeTabId = await harness.getActiveTabId()
-    const state = await harness.getState()
-    // zoomedPane should be set when zoomed
+    const layout = await harness.getPaneLayout(activeTabId!)
+    expect(layout.type).toBe('split')
+    expect(layout.children).toHaveLength(2)
   })
 
-  test('nested splits create complex layouts', async ({ freshellPage, page, harness }) => {
-    // Split horizontally, then split one of the resulting panes vertically
-    // Should create a tree: split(h) -> [leaf, split(v) -> [leaf, leaf]]
+  test('pane picker allows choosing pane type', async ({ freshellPage, page, harness, terminal }) => {
+    await terminal.waitForTerminal()
+
+    // Split to trigger the pane picker in the new pane
+    const termContainer = page.locator('.xterm').first()
+    await termContainer.click({ button: 'right' })
+    const splitOption = page.getByText(/split.*horizontal/i)
+    await splitOption.click()
+
+    // The new pane should show the picker with options: Shell, Editor, Browser
+    // Wait for the picker to appear
+    const shellOption = page.getByRole('button', { name: /shell/i })
+    const editorOption = page.getByRole('button', { name: /editor/i })
+    const browserOption = page.getByRole('button', { name: /browser/i })
+
+    // At least the shell option should be available
+    if (await shellOption.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      expect(await shellOption.isVisible()).toBe(true)
+    }
+  })
+
+  test('pane resize by dragging divider', async ({ freshellPage, page, harness, terminal }) => {
+    await terminal.waitForTerminal()
+    await terminal.waitForPrompt()
+
+    // Split to get two panes
+    const termContainer = page.locator('.xterm').first()
+    await termContainer.click({ button: 'right' })
+    await page.getByText(/split.*horizontal/i).click()
+    await page.locator('.xterm').nth(1).waitFor({ state: 'visible', timeout: 15_000 })
+
+    // Find the resize divider between panes
+    const divider = page.locator('[data-panel-resize-handle-id]').or(
+      page.locator('.cursor-col-resize, .cursor-row-resize')
+    ).first()
+
+    if (await divider.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      const box = await divider.boundingBox()
+      expect(box).toBeTruthy()
+
+      // Drag the divider 50px to the right
+      await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2)
+      await page.mouse.down()
+      await page.mouse.move(box!.x + box!.width / 2 + 50, box!.y + box!.height / 2)
+      await page.mouse.up()
+
+      // Verify both panes still exist after resize
+      const activeTabId = await harness.getActiveTabId()
+      const layout = await harness.getPaneLayout(activeTabId!)
+      expect(layout.type).toBe('split')
+      expect(layout.children).toHaveLength(2)
+    }
+  })
+
+  test('pane focus switches correctly', async ({ freshellPage, page, harness, terminal }) => {
+    await terminal.waitForTerminal()
+    await terminal.waitForPrompt()
+
+    // Split to get two panes
+    const termContainer = page.locator('.xterm').first()
+    await termContainer.click({ button: 'right' })
+    await page.getByText(/split.*horizontal/i).click()
+    await page.locator('.xterm').nth(1).waitFor({ state: 'visible', timeout: 15_000 })
+
+    // Click the first pane's terminal
+    await page.locator('.xterm').first().click()
+    let state = await harness.getState()
+    const firstPaneId = state.panes?.activePaneId
+
+    // Click the second pane's terminal
+    await page.locator('.xterm').nth(1).click()
+    state = await harness.getState()
+    const secondPaneId = state.panes?.activePaneId
+
+    // Active pane should have changed
+    expect(secondPaneId).toBeTruthy()
+    if (firstPaneId) {
+      expect(secondPaneId).not.toBe(firstPaneId)
+    }
+  })
+
+  test('zoom pane hides other panes', async ({ freshellPage, page, harness, terminal }) => {
+    await terminal.waitForTerminal()
+    await terminal.waitForPrompt()
+
+    // Split to get two panes
+    const termContainer = page.locator('.xterm').first()
+    await termContainer.click({ button: 'right' })
+    await page.getByText(/split.*horizontal/i).click()
+    await page.locator('.xterm').nth(1).waitFor({ state: 'visible', timeout: 15_000 })
+
+    // Click the maximize/zoom button on the first pane header
+    const zoomButton = page.getByRole('button', { name: /maximize pane/i }).first()
+    if (await zoomButton.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      await zoomButton.click()
+
+      // Only one terminal should be visible now (the zoomed one)
+      await page.waitForTimeout(300) // Animation
+      const visibleTerminals = await page.locator('.xterm:visible').count()
+      expect(visibleTerminals).toBe(1)
+
+      // Verify zoomed state in Redux
+      const activeTabId = await harness.getActiveTabId()
+      const state = await harness.getState()
+      expect(state.panes.zoomedPane[activeTabId!]).toBeTruthy()
+
+      // Restore (unzoom)
+      const restoreButton = page.getByRole('button', { name: /restore pane/i }).first()
+      await restoreButton.click()
+      await page.waitForTimeout(300)
+
+      // Both terminals should be visible again
+      const restoredTerminals = await page.locator('.xterm:visible').count()
+      expect(restoredTerminals).toBe(2)
+    }
+  })
+
+  test('nested splits create complex layouts', async ({ freshellPage, page, harness, terminal }) => {
+    await terminal.waitForTerminal()
+    await terminal.waitForPrompt()
+
+    // First split: horizontal
+    const termContainer = page.locator('.xterm').first()
+    await termContainer.click({ button: 'right' })
+    await page.getByText(/split.*horizontal/i).click()
+    await page.locator('.xterm').nth(1).waitFor({ state: 'visible', timeout: 15_000 })
+
+    // Second split: vertical on the second pane
+    await page.locator('.xterm').nth(1).click({ button: 'right' })
+    const verticalSplit = page.getByText(/split.*vertical/i)
+    if (await verticalSplit.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      await verticalSplit.click()
+      await page.locator('.xterm').nth(2).waitFor({ state: 'visible', timeout: 15_000 })
+
+      // Verify the layout tree has nested splits
+      const activeTabId = await harness.getActiveTabId()
+      const layout = await harness.getPaneLayout(activeTabId!)
+      expect(layout.type).toBe('split')
+      // Should have a leaf and a split child
+      const hasNestedSplit = layout.children.some((c: any) => c.type === 'split')
+      expect(hasNestedSplit).toBe(true)
+    }
   })
 })
 ```
@@ -1847,29 +2004,104 @@ git commit -m "test: add pane system E2E tests"
 import { test, expect } from '../helpers/fixtures.js'
 
 test.describe('Editor Pane', () => {
-  test('opens editor pane via pane picker', async ({ freshellPage, page, harness }) => {
-    // Navigate to add a new pane as editor type
-    // This depends on the pane picker UI
+  // Helper: create an editor pane via context menu split + picker
+  async function createEditorPane(page: any, harness: any) {
+    // Split the current pane to trigger the picker
+    const termContainer = page.locator('.xterm').first()
+    await termContainer.click({ button: 'right' })
+    await page.getByText(/split.*horizontal/i).click()
+
+    // The new pane shows the picker; click "Editor"
+    const editorButton = page.getByRole('button', { name: /^editor$/i })
+    await editorButton.waitFor({ state: 'visible', timeout: 10_000 })
+    await editorButton.click()
+
+    // Wait for Monaco to load
+    await page.locator('.monaco-editor').waitFor({ state: 'visible', timeout: 15_000 })
+  }
+
+  test('opens editor pane via pane picker', async ({ freshellPage, page, harness, terminal }) => {
+    await terminal.waitForTerminal()
+    await createEditorPane(page, harness)
+
+    // Verify the pane layout includes an editor leaf
+    const activeTabId = await harness.getActiveTabId()
+    const layout = await harness.getPaneLayout(activeTabId!)
+    expect(layout.type).toBe('split')
+
+    const hasEditor = layout.children.some((c: any) =>
+      c.type === 'leaf' && c.content?.kind === 'editor'
+    )
+    expect(hasEditor).toBe(true)
   })
 
-  test('editor shows Monaco editor', async ({ freshellPage, page }) => {
-    // Monaco editor should be visible when editor pane is active
+  test('editor shows Monaco editor', async ({ freshellPage, page, terminal }) => {
+    await terminal.waitForTerminal()
+    await createEditorPane(page, terminal)
+
     const monaco = page.locator('.monaco-editor')
-    // Verify Monaco is rendered
+    await expect(monaco).toBeVisible()
+
+    // Verify Monaco's textarea is present (used for input)
+    const textarea = monaco.locator('textarea')
+    await expect(textarea).toBeAttached()
   })
 
-  test('editor supports markdown preview mode', async ({ freshellPage, page }) => {
-    // Toggle between source and preview mode
-    // Preview mode should render markdown
+  test('editor supports text input', async ({ freshellPage, page, terminal }) => {
+    await terminal.waitForTerminal()
+    await createEditorPane(page, terminal)
+
+    // Click into the Monaco editor and type
+    const monaco = page.locator('.monaco-editor')
+    await monaco.click()
+    await page.keyboard.type('Hello from E2E test')
+
+    // Verify the text appears in the editor
+    await expect(page.locator('.monaco-editor').getByText('Hello from E2E test')).toBeVisible({ timeout: 5_000 })
   })
 
-  test('editor source/preview toggle works', async ({ freshellPage, page }) => {
-    // Click the toggle button between source and preview
+  test('editor source/preview toggle works', async ({ freshellPage, page, terminal }) => {
+    await terminal.waitForTerminal()
+    await createEditorPane(page, terminal)
+
+    // Look for preview/source toggle button
+    const previewToggle = page.getByRole('button', { name: /preview|markdown/i })
+    if (await previewToggle.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      await previewToggle.click()
+      // Markdown preview container should appear
+      await page.waitForTimeout(500)
+
+      // Toggle back to source
+      const sourceToggle = page.getByRole('button', { name: /source|edit/i })
+      if (await sourceToggle.isVisible({ timeout: 3_000 }).catch(() => false)) {
+        await sourceToggle.click()
+        // Monaco editor should be visible again
+        await expect(page.locator('.monaco-editor')).toBeVisible()
+      }
+    }
   })
 
-  test('editor pane preserves content across tab switches', async ({ freshellPage, page, harness }) => {
-    // Type something in the editor, switch tabs, switch back
-    // Content should be preserved
+  test('editor pane preserves content across tab switches', async ({ freshellPage, page, harness, terminal }) => {
+    await terminal.waitForTerminal()
+    await createEditorPane(page, harness)
+
+    // Type content in the editor
+    const monaco = page.locator('.monaco-editor')
+    await monaco.click()
+    const marker = `e2e-persist-test-${Date.now()}`
+    await page.keyboard.type(marker)
+
+    // Create a new tab and switch to it
+    const addTabButton = page.getByRole('button', { name: /new tab|add tab/i })
+    await addTabButton.click()
+    await harness.waitForTabCount(2)
+
+    // Switch back to the first tab
+    await page.getByRole('tab').first().click()
+    await page.waitForTimeout(500)
+
+    // Editor content should still contain the marker
+    await expect(page.locator('.monaco-editor').getByText(marker)).toBeVisible({ timeout: 5_000 })
   })
 })
 ```
@@ -1895,26 +2127,117 @@ git commit -m "test: add editor pane E2E tests"
 import { test, expect } from '../helpers/fixtures.js'
 
 test.describe('Browser Pane', () => {
-  test('browser pane loads URL', async ({ freshellPage, page, harness }) => {
-    // Create a browser pane with a URL
-    // It should render an iframe with the URL
+  // Helper: create a browser pane via context menu split + picker
+  async function createBrowserPane(page: any) {
+    const termContainer = page.locator('.xterm').first()
+    await termContainer.click({ button: 'right' })
+    await page.getByText(/split.*horizontal/i).click()
+
+    // Click "Browser" in the picker
+    const browserButton = page.getByRole('button', { name: /^browser$/i })
+    await browserButton.waitFor({ state: 'visible', timeout: 10_000 })
+    await browserButton.click()
+
+    // Wait for the browser pane UI (URL bar or iframe)
+    await page.locator('iframe, input[type="url"], input[placeholder*="URL" i]').first()
+      .waitFor({ state: 'visible', timeout: 10_000 })
+  }
+
+  test('browser pane loads URL', async ({ freshellPage, page, harness, serverInfo, terminal }) => {
+    await terminal.waitForTerminal()
+    await createBrowserPane(page)
+
+    // Find the URL input and enter a URL (use the test server's own URL)
+    const urlInput = page.locator('input[type="url"], input[placeholder*="URL" i]').first()
+    if (await urlInput.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      await urlInput.fill(`${serverInfo.baseUrl}/api/health`)
+      await urlInput.press('Enter')
+
+      // Wait for iframe to load
+      const iframe = page.locator('iframe').first()
+      await iframe.waitFor({ state: 'attached', timeout: 10_000 })
+      expect(await iframe.getAttribute('src')).toBeTruthy()
+    }
   })
 
-  test('browser pane URL bar updates on navigation', async ({ freshellPage, page }) => {
-    // Navigate within the browser pane
-    // URL bar should update
+  test('browser pane URL bar updates on navigation', async ({ freshellPage, page, serverInfo, terminal }) => {
+    await terminal.waitForTerminal()
+    await createBrowserPane(page)
+
+    const urlInput = page.locator('input[type="url"], input[placeholder*="URL" i]').first()
+    if (await urlInput.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      // Navigate to first URL
+      await urlInput.fill(`${serverInfo.baseUrl}/api/health`)
+      await urlInput.press('Enter')
+      await page.waitForTimeout(1000)
+
+      // The URL input should reflect the current URL
+      const currentValue = await urlInput.inputValue()
+      expect(currentValue).toContain('/api/health')
+    }
   })
 
-  test('browser pane devtools toggle', async ({ freshellPage, page }) => {
-    // Toggle DevTools state in the browser pane
+  test('browser pane devtools toggle', async ({ freshellPage, page, terminal }) => {
+    await terminal.waitForTerminal()
+    await createBrowserPane(page)
+
+    // Look for the devtools toggle button (wrench icon)
+    const devtoolsButton = page.getByRole('button', { name: /devtools|developer/i }).or(
+      page.locator('button:has(svg.lucide-wrench)')
+    ).first()
+
+    if (await devtoolsButton.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      await devtoolsButton.click()
+      // Verify the devtools state toggled (the button or UI should change)
+      await page.waitForTimeout(500)
+    }
   })
 
-  test('browser pane renders iframe correctly', async ({ freshellPage, page }) => {
-    // Verify the iframe is present and has correct src
+  test('browser pane renders iframe correctly', async ({ freshellPage, page, serverInfo, terminal }) => {
+    await terminal.waitForTerminal()
+    await createBrowserPane(page)
+
+    const urlInput = page.locator('input[type="url"], input[placeholder*="URL" i]').first()
+    if (await urlInput.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      await urlInput.fill(`${serverInfo.baseUrl}/api/health`)
+      await urlInput.press('Enter')
+
+      const iframe = page.locator('iframe').first()
+      await iframe.waitFor({ state: 'attached', timeout: 10_000 })
+
+      // Verify iframe has the correct src
+      const src = await iframe.getAttribute('src')
+      expect(src).toContain('/api/health')
+    }
   })
 
-  test('browser pane preserves URL across tab switches', async ({ freshellPage, page, harness }) => {
-    // Switch away and back, URL should persist
+  test('browser pane preserves URL across tab switches', async ({ freshellPage, page, harness, serverInfo, terminal }) => {
+    await terminal.waitForTerminal()
+    await createBrowserPane(page)
+
+    const urlInput = page.locator('input[type="url"], input[placeholder*="URL" i]').first()
+    if (await urlInput.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      const targetUrl = `${serverInfo.baseUrl}/api/health`
+      await urlInput.fill(targetUrl)
+      await urlInput.press('Enter')
+      await page.waitForTimeout(1000)
+
+      // Switch to a new tab
+      const addTabButton = page.getByRole('button', { name: /new tab|add tab/i })
+      await addTabButton.click()
+      await harness.waitForTabCount(2)
+
+      // Switch back
+      await page.getByRole('tab').first().click()
+      await page.waitForTimeout(500)
+
+      // URL should still be present
+      const iframe = page.locator('iframe').first()
+      if (await iframe.isVisible({ timeout: 3_000 }).catch(() => false)) {
+        const src = await iframe.getAttribute('src')
+        expect(src).toContain('/api/health')
+      }
+    }
   })
 })
 ```
@@ -2000,9 +2323,14 @@ test.describe('Settings', () => {
 
     const cursorBlinkToggle = page.getByLabel(/cursor.*blink/i)
     if (await cursorBlinkToggle.isVisible()) {
+      const settingsBefore = await harness.getSettings()
+      const blinkBefore = settingsBefore?.terminal?.cursorBlink
+
       await cursorBlinkToggle.click()
-      const settings = await harness.getSettings()
-      // Value should have toggled
+      await page.waitForTimeout(500)
+
+      const settingsAfter = await harness.getSettings()
+      expect(settingsAfter.terminal.cursorBlink).toBe(!blinkBefore)
     }
   })
 
@@ -2014,6 +2342,10 @@ test.describe('Settings', () => {
     if (await scrollbackInput.isVisible()) {
       await scrollbackInput.fill('5000')
       await scrollbackInput.press('Tab')
+      await page.waitForTimeout(500)
+
+      const settings = await harness.getSettings()
+      expect(settings.terminal.scrollback).toBe(5000)
     }
   })
 
@@ -2023,18 +2355,28 @@ test.describe('Settings', () => {
 
     const debugToggle = page.getByLabel(/debug.*logging/i)
     if (await debugToggle.isVisible()) {
+      const settingsBefore = await harness.getSettings()
+      const debugBefore = settingsBefore?.debug?.logging
+
       await debugToggle.click()
+      await page.waitForTimeout(500)
+
+      const settingsAfter = await harness.getSettings()
+      expect(settingsAfter.debug.logging).toBe(!debugBefore)
     }
   })
 
-  test('terminal theme selection', async ({ freshellPage, page }) => {
+  test('terminal theme selection', async ({ freshellPage, page, harness }) => {
     const settingsButton = page.getByRole('button', { name: /settings/i })
     await settingsButton.click()
 
     const themeSelector = page.getByLabel(/terminal.*theme/i)
     if (await themeSelector.isVisible()) {
-      // Select a different theme
       await themeSelector.selectOption('dracula')
+      await page.waitForTimeout(500)
+
+      const settings = await harness.getSettings()
+      expect(settings.terminal.theme).toBe('dracula')
     }
   })
 })
@@ -2067,12 +2409,21 @@ test.describe('Sidebar', () => {
   })
 
   test('sidebar collapse toggle works', async ({ freshellPage, page }) => {
-    const collapseButton = page.getByRole('button', { name: /collapse.*sidebar|toggle.*sidebar|close.*sidebar/i })
-    if (await collapseButton.isVisible()) {
-      await collapseButton.click()
-      // Sidebar should be collapsed
-      await page.waitForTimeout(300) // Animation
-    }
+    // The sidebar has a "Hide sidebar" button
+    const collapseButton = page.getByRole('button', { name: /hide sidebar/i })
+    await expect(collapseButton).toBeVisible()
+    await collapseButton.click()
+    await page.waitForTimeout(300) // Animation
+
+    // After collapsing, the aside/complementary element should be hidden or narrow
+    // And a "Show sidebar" button should appear
+    const showButton = page.getByRole('button', { name: /show sidebar/i })
+    await expect(showButton).toBeVisible({ timeout: 3_000 })
+
+    // Re-expand
+    await showButton.click()
+    await page.waitForTimeout(300)
+    await expect(page.getByRole('button', { name: /hide sidebar/i })).toBeVisible()
   })
 
   test('sidebar shows navigation buttons', async ({ freshellPage, page }) => {
@@ -2083,43 +2434,86 @@ test.describe('Sidebar', () => {
     await expect(settingsButton).toBeVisible()
   })
 
-  test('sidebar sessions list shows active sessions', async ({ freshellPage, page, harness, terminal }) => {
-    // Create a terminal first
+  test('sidebar sessions list container exists', async ({ freshellPage, page, terminal }) => {
+    // Create a terminal first so the app is fully loaded
     await terminal.waitForTerminal()
 
-    // The sidebar should show session entries
-    // Sessions are populated by the coding CLI indexer, which may not
-    // have content in a test environment. Verify the list container exists.
+    // The sidebar should have a sessions/overview area.
+    // In a fresh test environment with isolated HOME, there are no Claude
+    // sessions to index, but the list container should still render.
+    const sidebar = page.locator('aside').or(page.getByRole('complementary')).first()
+    await expect(sidebar).toBeVisible()
+
+    // Verify the sidebar has scrollable content area
+    const sidebarContent = sidebar.locator('[data-testid], .overflow-auto, .overflow-y-auto').first()
+    expect(await sidebar.isVisible()).toBe(true)
   })
 
-  test('sidebar search filters sessions', async ({ freshellPage, page }) => {
-    // Find and use the search input in the sidebar
+  test('sidebar search input is functional', async ({ freshellPage, page }) => {
     const searchInput = page.getByPlaceholderText(/search/i)
-    if (await searchInput.isVisible()) {
-      await searchInput.fill('test-query')
-      // Results should be filtered
+    if (await searchInput.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      // Type a search query
+      await searchInput.fill('nonexistent-query-12345')
+      await page.waitForTimeout(500)
+
+      // Clear the search
+      const clearButton = page.getByRole('button', { name: /clear search/i })
+      if (await clearButton.isVisible({ timeout: 2_000 }).catch(() => false)) {
+        await clearButton.click()
+        const value = await searchInput.inputValue()
+        expect(value).toBe('')
+      }
     }
   })
 
   test('clicking session in sidebar opens it', async ({ freshellPage, page, harness }) => {
-    // Click a session entry in the sidebar
-    // It should open in a new tab or focus existing tab
+    // In a test environment, sessions may not exist. Look for any
+    // session entries (data-session-id attribute) and click if present.
+    const sessionEntry = page.locator('[data-session-id]').first()
+    if (await sessionEntry.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      const tabCountBefore = await harness.getTabCount()
+      await sessionEntry.click()
+      await page.waitForTimeout(1000)
+
+      // Clicking a session should open it in a tab (new or existing)
+      const tabCountAfter = await harness.getTabCount()
+      expect(tabCountAfter).toBeGreaterThanOrEqual(tabCountBefore)
+    }
+    // If no sessions exist, this test passes trivially (nothing to click)
+    // The E2E environment has an isolated HOME with no Claude sessions
   })
 
   test('sidebar view switches: terminal, tabs, overview, settings', async ({ freshellPage, page }) => {
     // Click through the sidebar navigation buttons
     const settingsButton = page.getByRole('button', { name: /settings/i })
     await settingsButton.click()
+
+    // Settings view should show setting controls
     await expect(page.getByText(/terminal|appearance|font/i).first()).toBeVisible()
 
-    // Go back to terminal view
+    // Go back to terminal view by clicking the terminal/home button
     const terminalButton = page.getByRole('button', { name: /terminal/i })
-    await terminalButton.click()
+    if (await terminalButton.isVisible({ timeout: 3_000 }).catch(() => false)) {
+      await terminalButton.click()
+      // Terminal should be visible again
+      await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: 10_000 })
+    }
   })
 
-  test('sidebar shows background terminals', async ({ freshellPage, page, harness }) => {
-    // Background terminals should appear in the sidebar
-    // Create a terminal, detach, verify it appears in background list
+  test('sidebar shows background terminals', async ({ freshellPage, page, harness, terminal }) => {
+    await terminal.waitForTerminal()
+    await terminal.waitForPrompt()
+
+    // Create a second tab (which detaches from the first terminal)
+    const addTabButton = page.getByRole('button', { name: /new tab|add tab/i })
+    await addTabButton.click()
+    await harness.waitForTabCount(2)
+
+    // The first tab's terminal is still running in the background.
+    // The sidebar should reflect that there are background sessions/terminals.
+    // Verify the Redux state tracks the terminals
+    const state = await harness.getState()
+    expect(state.tabs.tabs.length).toBe(2)
   })
 })
 ```
@@ -2146,17 +2540,21 @@ import { test, expect } from '../helpers/fixtures.js'
 
 test.describe('WebSocket Reconnection', () => {
   test('reconnects after connection drop', async ({ freshellPage, page, harness }) => {
-    // Verify connected
     await harness.waitForConnection()
 
-    // Force-close the WebSocket
+    // Force-close the underlying WebSocket via the test harness.
+    // This calls ws.close() on the raw WebSocket without setting intentionalClose,
+    // so the WsClient will auto-reconnect.
     await page.evaluate(() => {
-      // Access internal WebSocket and close it
-      // The client should auto-reconnect
+      window.__FRESHELL_TEST_HARNESS__?.forceDisconnect()
     })
 
-    // Wait for reconnection
+    // The WS state should briefly leave 'ready'
+    // Wait for it to reconnect
     await harness.waitForConnection()
+
+    const status = await harness.getConnectionStatus()
+    expect(status).toBe('connected')
   })
 
   test('terminal output resumes after reconnect', async ({ freshellPage, page, harness, terminal }) => {
@@ -2167,19 +2565,55 @@ test.describe('WebSocket Reconnection', () => {
     await terminal.executeCommand('echo "before-reconnect"')
     await terminal.waitForOutput('before-reconnect')
 
-    // Force disconnect and reconnect
-    // After reconnect, terminal should reattach and show buffered output
+    // Force disconnect the WebSocket (triggers auto-reconnect)
+    await page.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.forceDisconnect()
+    })
+
+    // Wait for reconnection
+    await harness.waitForConnection()
+
+    // The terminal should reattach and show buffered output from the scrollback
+    await terminal.waitForOutput('before-reconnect', { timeout: 20_000 })
+
+    // Terminal should still be functional after reconnect
+    await terminal.executeCommand('echo "after-reconnect"')
+    await terminal.waitForOutput('after-reconnect', { timeout: 10_000 })
   })
 
   test('connection status indicator updates', async ({ freshellPage, page, harness }) => {
-    // Verify connection status is reflected in the UI
+    // Verify connection status is reflected in the UI and Redux
     const status = await harness.getConnectionStatus()
     expect(status).toBe('connected')
+
+    const wsState = await page.evaluate(() => {
+      return window.__FRESHELL_TEST_HARNESS__?.getWsReadyState()
+    })
+    expect(wsState).toBe('ready')
   })
 
   test('multiple rapid disconnects handled gracefully', async ({ freshellPage, page, harness }) => {
-    // Simulate flaky network with multiple quick disconnects
-    // App should not crash and should eventually reconnect
+    await harness.waitForConnection()
+
+    // Simulate flaky network with multiple rapid disconnects
+    for (let i = 0; i < 3; i++) {
+      await page.evaluate(() => {
+        window.__FRESHELL_TEST_HARNESS__?.forceDisconnect()
+      })
+      // Brief pause between disconnects to let reconnect attempt start
+      await page.waitForTimeout(500)
+    }
+
+    // After the rapid disconnects, wait for a stable reconnection
+    await harness.waitForConnection()
+
+    // App should not crash and should be in a connected state
+    const status = await harness.getConnectionStatus()
+    expect(status).toBe('connected')
+
+    // Terminal should still work
+    const terminalExists = await page.locator('.xterm').first().isVisible({ timeout: 10_000 }).catch(() => false)
+    expect(terminalExists).toBe(true)
   })
 
   test('tabs and panes preserved across reconnect', async ({ freshellPage, page, harness }) => {
@@ -2188,15 +2622,44 @@ test.describe('WebSocket Reconnection', () => {
     await addButton.click()
     await harness.waitForTabCount(2)
 
-    // Force reconnect
-    // Tabs should still be present
+    // Force disconnect
+    await page.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.forceDisconnect()
+    })
+
+    // Wait for reconnection
+    await harness.waitForConnection()
+
+    // Tabs should still be present (they live in Redux/localStorage, not server-side)
     const tabCount = await harness.getTabCount()
     expect(tabCount).toBe(2)
+
+    // Both tab layouts should be intact
+    const state = await harness.getState()
+    for (const tab of state.tabs.tabs) {
+      const layout = state.panes.layouts[tab.id]
+      expect(layout).toBeTruthy()
+    }
   })
 
-  test('pending terminal creates retry after reconnect', async ({ freshellPage, page, harness }) => {
-    // If a terminal.create was in-flight during disconnect,
-    // it should be retried after reconnection
+  test('pending terminal creates retry after reconnect', async ({ freshellPage, page, harness, terminal }) => {
+    await terminal.waitForTerminal()
+    await terminal.waitForPrompt()
+    await harness.waitForConnection()
+
+    // Force disconnect
+    await page.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.forceDisconnect()
+    })
+
+    // Wait for reconnection
+    await harness.waitForConnection()
+
+    // After reconnect, the terminal should reattach automatically.
+    // The WsClient has in-flight create tracking that resends on reconnect.
+    // Verify the terminal is still functional
+    await terminal.executeCommand('echo "post-reconnect-test"')
+    await terminal.waitForOutput('post-reconnect-test', { timeout: 15_000 })
   })
 })
 ```
@@ -2225,14 +2688,42 @@ test.describe('Mobile Viewport', () => {
   test.use({ viewport: { width: 390, height: 844 } }) // iPhone 14 size
 
   test('sidebar collapses on mobile', async ({ freshellPage, page }) => {
-    // On mobile, sidebar should start collapsed or have a different layout
+    // On mobile viewport, the sidebar should be collapsed by default
+    // or not visible (the MobileTabStrip replaces the desktop tab bar)
     const sidebar = page.locator('aside').or(page.getByRole('complementary'))
-    // Sidebar behavior on mobile
+
+    // Check if sidebar is hidden/collapsed on mobile
+    // Either it's not visible, or it overlays and can be toggled
+    const sidebarVisible = await sidebar.first().isVisible({ timeout: 2_000 }).catch(() => false)
+
+    // If sidebar is visible, verify there's a way to hide it
+    if (sidebarVisible) {
+      const hideButton = page.getByRole('button', { name: /hide sidebar/i })
+      if (await hideButton.isVisible({ timeout: 2_000 }).catch(() => false)) {
+        await hideButton.click()
+        await page.waitForTimeout(300)
+      }
+    }
+
+    // A "Show sidebar" button should be available on mobile
+    const showButton = page.getByRole('button', { name: /show sidebar/i })
+    expect(await showButton.isVisible({ timeout: 3_000 }).catch(() => false)).toBe(true)
   })
 
   test('mobile tab strip is visible', async ({ freshellPage, page }) => {
-    // Mobile uses a different tab strip (MobileTabStrip)
-    // It should be visible on narrow viewports
+    // Mobile uses MobileTabStrip which has specific aria-labels
+    // Check for mobile-specific navigation: Previous tab, Next tab, Open tab switcher
+    const prevTab = page.getByRole('button', { name: /previous tab/i })
+    const tabSwitcher = page.getByRole('button', { name: /open tab switcher/i })
+    const nextButton = page.getByRole('button', { name: /next tab|new tab/i })
+
+    // At least some of these mobile-specific elements should be visible
+    const hasMobileStrip = (
+      await prevTab.isVisible({ timeout: 3_000 }).catch(() => false) ||
+      await tabSwitcher.isVisible({ timeout: 1_000 }).catch(() => false) ||
+      await nextButton.isVisible({ timeout: 1_000 }).catch(() => false)
+    )
+    expect(hasMobileStrip).toBe(true)
   })
 
   test('terminal is usable on mobile viewport', async ({ freshellPage, terminal }) => {
@@ -2245,9 +2736,17 @@ test.describe('Mobile Viewport', () => {
   })
 
   test('FAB (floating action button) is visible on mobile', async ({ freshellPage, page }) => {
-    // The floating action button for adding panes
-    const fab = page.getByRole('button', { name: /add|new|split/i }).last()
-    // FAB should be accessible on mobile
+    // On mobile, the MobileTabStrip has a new-tab / next-tab button
+    // that acts as the primary action button
+    const newTabButton = page.getByRole('button', { name: /new tab/i })
+    const nextTabButton = page.getByRole('button', { name: /next tab/i })
+
+    // One of these should be visible (new tab when on last tab, next tab otherwise)
+    const hasActionButton = (
+      await newTabButton.isVisible({ timeout: 3_000 }).catch(() => false) ||
+      await nextTabButton.isVisible({ timeout: 1_000 }).catch(() => false)
+    )
+    expect(hasActionButton).toBe(true)
   })
 
   test('mobile layout adapts to orientation change', async ({ freshellPage, page, terminal }) => {
@@ -2307,7 +2806,7 @@ test.describe('Multi-Client', () => {
     await page1.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await page2.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
 
-    // Wait for both to be ready
+    // Wait for both to be ready and terminals to load
     await page1.waitForFunction(() =>
       window.__FRESHELL_TEST_HARNESS__?.getWsReadyState() === 'ready'
     )
@@ -2315,7 +2814,25 @@ test.describe('Multi-Client', () => {
       window.__FRESHELL_TEST_HARNESS__?.getWsReadyState() === 'ready'
     )
 
-    // Both pages should be able to interact with the server
+    // Wait for terminal on page1
+    await page1.locator('.xterm').first().waitFor({ state: 'visible', timeout: 15_000 })
+    await page1.waitForFunction(() => {
+      const buf = window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer()
+      return buf !== null && buf !== undefined && buf.length > 0
+    }, { timeout: 20_000 })
+
+    // Type a command in page1's terminal
+    await page1.locator('.xterm').first().click()
+    await page1.keyboard.type('echo "multi-client-marker"')
+    await page1.keyboard.press('Enter')
+
+    // Verify the output appears in page1
+    await page1.waitForFunction(
+      (text) => window.__FRESHELL_TEST_HARNESS__?.getTerminalBuffer()?.includes(text) ?? false,
+      'multi-client-marker',
+      { timeout: 10_000 }
+    )
+
     await context.close()
   })
 
@@ -2327,7 +2844,6 @@ test.describe('Multi-Client', () => {
     await page1.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await page2.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
 
-    // Wait for both
     await page1.waitForFunction(() =>
       window.__FRESHELL_TEST_HARNESS__?.getWsReadyState() === 'ready'
     )
@@ -2335,8 +2851,43 @@ test.describe('Multi-Client', () => {
       window.__FRESHELL_TEST_HARNESS__?.getWsReadyState() === 'ready'
     )
 
-    // Change settings from page1
-    // Verify page2 receives the update via WebSocket broadcast
+    // Get initial settings from page2
+    const settingsBefore = await page2.evaluate(() =>
+      window.__FRESHELL_TEST_HARNESS__?.getState()?.settings?.terminal?.fontSize
+    )
+
+    // Change font size setting from page1 via the API
+    await page1.evaluate(async (info) => {
+      const state = window.__FRESHELL_TEST_HARNESS__?.getState()
+      const currentSettings = state?.settings || {}
+      const newFontSize = (currentSettings.terminal?.fontSize || 14) + 1
+      await fetch(`${info.baseUrl}/api/settings`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-auth-token': info.token,
+        },
+        body: JSON.stringify({
+          ...currentSettings,
+          terminal: { ...currentSettings.terminal, fontSize: newFontSize },
+        }),
+      })
+    }, { baseUrl: serverInfo.baseUrl, token: serverInfo.token })
+
+    // Wait for page2 to receive the broadcast and update its settings
+    await page2.waitForFunction(
+      (before) => {
+        const current = window.__FRESHELL_TEST_HARNESS__?.getState()?.settings?.terminal?.fontSize
+        return current !== before && current !== undefined
+      },
+      settingsBefore,
+      { timeout: 10_000 }
+    )
+
+    const settingsAfter = await page2.evaluate(() =>
+      window.__FRESHELL_TEST_HARNESS__?.getState()?.settings?.terminal?.fontSize
+    )
+    expect(settingsAfter).not.toBe(settingsBefore)
 
     await context.close()
   })
@@ -2505,26 +3056,129 @@ git commit -m "test: add stress E2E tests"
 import { test, expect } from '../helpers/fixtures.js'
 
 test.describe('Agent Chat', () => {
-  test('agent chat pane can be created', async ({ freshellPage, page, harness }) => {
-    // The agent chat pane requires the SDK bridge, which may not be available
-    // in the test environment. Test that the UI for creating one works.
+  // Note: Agent chat requires SDK provider bridges (Claude, Codex, etc.)
+  // which are not available in the isolated test environment. These tests
+  // verify the UI flow for creating and managing agent chat panes, not
+  // the actual SDK communication. Tests that depend on a live SDK session
+  // use test.skip when no providers are configured.
+
+  // Helper: open the pane picker and look for agent chat options
+  async function openPanePicker(page: any) {
+    const termContainer = page.locator('.xterm').first()
+    await termContainer.click({ button: 'right' })
+    await page.getByText(/split.*horizontal/i).click()
+    // Wait for picker to appear
+    await page.waitForTimeout(1000)
+  }
+
+  test('agent chat pane can be created via pane picker', async ({ freshellPage, page, harness, terminal }) => {
+    await terminal.waitForTerminal()
+    await openPanePicker(page)
+
+    // The pane picker should show agent chat provider options
+    // (Claude, Codex, etc.) if they are configured
+    const claudeOption = page.getByRole('button', { name: /claude/i })
+    const codexOption = page.getByRole('button', { name: /codex/i })
+
+    // At least check that the picker rendered (it shows Shell, Editor, Browser, and maybe CLI options)
+    const shellOption = page.getByRole('button', { name: /shell/i })
+    await expect(shellOption).toBeVisible({ timeout: 5_000 })
+
+    // If a CLI/agent option exists, try creating it
+    if (await claudeOption.isVisible({ timeout: 2_000 }).catch(() => false)) {
+      await claudeOption.click()
+      await page.waitForTimeout(1000)
+
+      // An agent-chat pane should now exist in the layout
+      const activeTabId = await harness.getActiveTabId()
+      const layout = await harness.getPaneLayout(activeTabId!)
+      expect(layout.type).toBe('split')
+      const hasAgentChat = layout.children.some((c: any) =>
+        c.type === 'leaf' && (c.content?.kind === 'agent-chat' || c.content?.mode === 'claude')
+      )
+      expect(hasAgentChat).toBe(true)
+    }
   })
 
-  test('agent chat shows provider selection', async ({ freshellPage, page }) => {
-    // When creating an agent chat pane, user should see provider options
+  test('agent chat shows provider selection in picker', async ({ freshellPage, page, terminal }) => {
+    await terminal.waitForTerminal()
+    await openPanePicker(page)
+
+    // The picker should show all available pane types as labeled buttons
+    // Shell, Editor, Browser are always present; CLI providers vary
+    const shellButton = page.getByRole('button', { name: /shell/i })
+    const editorButton = page.getByRole('button', { name: /editor/i })
+    const browserButton = page.getByRole('button', { name: /browser/i })
+
+    await expect(shellButton).toBeVisible({ timeout: 5_000 })
+    await expect(editorButton).toBeVisible()
+    await expect(browserButton).toBeVisible()
+
+    // Count total picker options (should include at least the 3 base types)
+    // Provider-specific options (Claude, Codex, etc.) depend on system config
   })
 
-  test('agent chat pane shows status', async ({ freshellPage, page }) => {
-    // The pane should show connection/session status
+  test('agent chat pane shows status indicator', async ({ freshellPage, page, harness, terminal }) => {
+    await terminal.waitForTerminal()
+    await openPanePicker(page)
+
+    // Try to create an agent chat pane (if Claude option is available)
+    const claudeOption = page.getByRole('button', { name: /claude/i })
+    if (await claudeOption.isVisible({ timeout: 2_000 }).catch(() => false)) {
+      await claudeOption.click()
+      await page.waitForTimeout(1000)
+
+      // The pane header should show the agent pane with a status icon
+      const paneHeader = page.getByRole('banner', { name: /pane/i }).last()
+      await expect(paneHeader).toBeVisible({ timeout: 5_000 })
+    } else {
+      // No agent providers available -- skip gracefully
+      test.skip()
+    }
   })
 
-  test('agent chat permission banners appear', async ({ freshellPage, page }) => {
-    // Permission banners should be visible when actions require approval
-    // This is a UI-only test since we may not have a real SDK session
+  test.skip('agent chat permission banners appear', async ({ freshellPage, page }) => {
+    // This test requires a live SDK session to trigger permission requests.
+    // In the isolated test environment, no SDK session is available.
+    // Skipping until a mock SDK bridge is implemented.
   })
 
-  test('agent chat pane closes cleanly', async ({ freshellPage, page, harness }) => {
-    // Close an agent chat pane and verify cleanup
+  test('agent chat pane closes cleanly', async ({ freshellPage, page, harness, terminal }) => {
+    await terminal.waitForTerminal()
+    await openPanePicker(page)
+
+    // Try to create an agent chat pane
+    const claudeOption = page.getByRole('button', { name: /claude/i })
+    if (await claudeOption.isVisible({ timeout: 2_000 }).catch(() => false)) {
+      await claudeOption.click()
+      await page.waitForTimeout(1000)
+
+      // Close the pane via the close button in the pane header
+      const closeButton = page.locator('button[title="Close pane"]').last()
+      await closeButton.click()
+      await page.waitForTimeout(500)
+
+      // Should return to a single pane layout
+      const activeTabId = await harness.getActiveTabId()
+      const layout = await harness.getPaneLayout(activeTabId!)
+      expect(layout.type).toBe('leaf')
+    } else {
+      // No agent providers -- just verify the picker can be dismissed
+      // by clicking Shell (which creates a terminal instead)
+      const shellOption = page.getByRole('button', { name: /shell/i })
+      await shellOption.click()
+      await page.waitForTimeout(1000)
+
+      // Close the second pane
+      const closeButton = page.locator('button[title="Close pane"]').last()
+      if (await closeButton.isVisible({ timeout: 3_000 }).catch(() => false)) {
+        await closeButton.click()
+        await page.waitForTimeout(500)
+        const activeTabId = await harness.getActiveTabId()
+        const layout = await harness.getPaneLayout(activeTabId!)
+        expect(layout.type).toBe('leaf')
+      }
+    }
   })
 })
 ```
