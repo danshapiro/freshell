@@ -29,6 +29,8 @@ export default defineConfig({
       'test/integration/session-repair.test.ts',
       'test/integration/session-search-e2e.test.ts',
       'test/e2e-browser/**',
+      // Electron tests run under vitest.electron.config.ts (node environment)
+      'test/unit/electron/**',
     ],
     testTimeout: 30000,
     hookTimeout: 30000,

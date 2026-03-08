@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "outDir": "./dist/electron",
+    "rootDir": ".",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "sourceMap": true
+  },
+  "include": [
+    "electron/**/*"
+  ],
+  "exclude": [
+    "electron/setup-wizard/**/*.tsx",
+    "electron/setup-wizard/index.html"
+  ]
+}

@@ -59,6 +59,7 @@ import { LayoutStore } from './agent-api/layout-store.js'
 import { createAgentApiRouter } from './agent-api/router.js'
 import { ExtensionManager } from './extension-manager.js'
 import { createExtensionRouter } from './extension-routes.js'
+import { createServerInfoRouter } from './server-info-router.js'
 import { SessionMetadataStore } from './session-metadata-store.js'
 
 const __filename = fileURLToPath(import.meta.url)
@@ -79,6 +80,7 @@ function findPackageJson(): string {
 
 const packageJson = JSON.parse(fs.readFileSync(findPackageJson(), 'utf-8'))
 const APP_VERSION: string = packageJson.version
+const SERVER_STARTED_AT = Date.now()
 const log = logger.child({ component: 'server' })
 const perfConfig = getPerfConfig()
 
@@ -335,6 +337,12 @@ async function main() {
     codingCliIndexer,
     tabsRegistryStore,
     registry,
+  }))
+
+  // --- API: server-info ---
+  app.use('/api/server-info', createServerInfoRouter({
+    appVersion: APP_VERSION,
+    startedAt: SERVER_STARTED_AT,
   }))
 
   // --- API: extensions ---
