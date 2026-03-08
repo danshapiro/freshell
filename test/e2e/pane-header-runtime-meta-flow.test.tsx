@@ -10,7 +10,9 @@ import sessionsReducer, { markWsSnapshotReceived } from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
 import agentChatReducer from '@/store/agentChatSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
+import tabRegistryReducer from '@/store/tabRegistrySlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
+import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer } from '@/store/networkSlice'
 import type { Tab } from '@/store/types'
 import type { AgentChatState } from '@/store/agentChatTypes'
@@ -28,7 +30,13 @@ const wsMocks = vi.hoisted(() => {
     }),
     onReconnect: vi.fn(() => () => {}),
     setHelloExtensionProvider: vi.fn(),
+    isReady: false,
+    serverInstanceId: undefined as string | undefined,
     emitMessage: (msg: any) => {
+      if (msg?.type === 'ready') {
+        wsMocks.isReady = true
+        wsMocks.serverInstanceId = typeof msg.serverInstanceId === 'string' ? msg.serverInstanceId : undefined
+      }
       for (const callback of messageHandlers) callback(msg)
     },
     resetHandlers: () => messageHandlers.clear(),
@@ -36,6 +44,7 @@ const wsMocks = vi.hoisted(() => {
 })
 
 const apiGet = vi.hoisted(() => vi.fn())
+const fetchSidebarSessionsSnapshot = vi.hoisted(() => vi.fn())
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -44,6 +53,15 @@ vi.mock('@/lib/ws-client', () => ({
     onMessage: wsMocks.onMessage,
     onReconnect: wsMocks.onReconnect,
     setHelloExtensionProvider: wsMocks.setHelloExtensionProvider,
+    get isReady() {
+      return wsMocks.isReady
+    },
+    get serverInstanceId() {
+      return wsMocks.serverInstanceId
+    },
+    get state() {
+      return wsMocks.isReady ? 'ready' : 'connected'
+    },
   }),
 }))
 
@@ -53,6 +71,8 @@ vi.mock('@/lib/api', () => ({
     patch: vi.fn().mockResolvedValue({}),
     post: vi.fn().mockResolvedValue({}),
   },
+  fetchSidebarSessionsSnapshot: (options?: unknown) => fetchSidebarSessionsSnapshot(options),
+  isApiUnauthorizedError: (err: any) => !!err && typeof err === 'object' && err.status === 401,
 }))
 
 vi.mock('@/hooks/useTheme', () => ({
@@ -193,8 +213,10 @@ function createStore(options?: {
       panes: panesReducer,
       agentChat: agentChatReducer,
       turnCompletion: turnCompletionReducer,
+      tabRegistry: tabRegistryReducer,
       terminalMeta: terminalMetaReducer,
       network: networkReducer,
+      extensions: extensionsReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -216,6 +238,20 @@ function createStore(options?: {
         activeTabId: 'tab-codex',
         renameRequestTabId: null,
       },
+      connection: {
+        status: 'disconnected',
+        lastError: undefined,
+        platform: null,
+        availableClis: {},
+        serverInstanceId: undefined,
+      },
+      sessions: {
+        projects: [],
+        expandedProjects: new Set<string>(),
+        wsSnapshotReceived: false,
+        isLoading: false,
+        error: null,
+      },
       panes: {
         layouts,
         activePane,
@@ -234,7 +270,19 @@ function createStore(options?: {
         availableModels: [],
         ...(options?.agentChatState || {}),
       },
+      tabRegistry: {
+        deviceId: 'device-test',
+        deviceLabel: 'device-test',
+        deviceAliases: {},
+        localOpen: [],
+        remoteOpen: [],
+        closed: [],
+        localClosed: {},
+        searchRangeDays: 30,
+        loading: false,
+      },
       network: { status: null, loading: false, configuring: false, error: null },
+      extensions: { entries: [] },
     },
   })
 }
@@ -244,6 +292,11 @@ describe('pane header runtime metadata flow (e2e)', () => {
     cleanup()
     vi.clearAllMocks()
     wsMocks.resetHandlers()
+    wsMocks.isReady = false
+    wsMocks.serverInstanceId = undefined
+
+    fetchSidebarSessionsSnapshot.mockReset()
+    fetchSidebarSessionsSnapshot.mockResolvedValue([])
 
     apiGet.mockImplementation((url: string) => {
       if (url === '/api/settings') {
@@ -283,7 +336,11 @@ describe('pane header runtime metadata flow (e2e)', () => {
     })
 
     act(() => {
-      wsMocks.emitMessage({ type: 'ready' })
+      wsMocks.emitMessage({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-local',
+      })
     })
 
     let requestId = ''
@@ -404,7 +461,11 @@ describe('pane header runtime metadata flow (e2e)', () => {
     })
 
     act(() => {
-      wsMocks.emitMessage({ type: 'ready' })
+      wsMocks.emitMessage({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-local',
+      })
     })
 
     let requestId = ''
@@ -487,7 +548,11 @@ describe('pane header runtime metadata flow (e2e)', () => {
     })
 
     act(() => {
-      wsMocks.emitMessage({ type: 'ready' })
+      wsMocks.emitMessage({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-local',
+      })
     })
 
     let requestId = ''
