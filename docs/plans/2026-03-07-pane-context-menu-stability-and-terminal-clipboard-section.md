@@ -4,7 +4,7 @@
 
 **Goal:** Fix the pane right-click menu so it does not immediately reclose, and make the terminal context menu start with an iconized `copy` / `Paste` / `Select all` section.
 
-**Architecture:** Do not assume a new pane-activation or dismissal rule up front. Start with the shared pane-shell path the user described: inactive pane header / shell, real `Pane` -> `PaneContainer` -> Redux `activePane`, and the four `ContextMenuProvider` dismissal signals (`pointerdown`, `scroll`, `resize`, `blur`). Use a regression harness that wraps the actual dismiss listeners `ContextMenuProvider` registers after the menu opens, so the trace reflects the real close path instead of generic global events that happened before those listeners existed. Then fix only the traced dismissal path or the pane-activation/focus path that produces it. After the shared pane path is stable, add the terminal-body regression and the requested terminal-menu reorder. Keep `menu-defs.ts` as a `.ts` module by constructing icon nodes with `createElement(...)` instead of JSX.
+**Architecture:** Do not assume a single shared right-click path or a new pane-activation rule up front. Characterize the two real custom-menu surfaces separately: the pane shell (`data-context="pane"`) via the existing `Pane` / `PaneContainer` seam, and terminal content (`data-context="terminal"`) via the real `TerminalView` path. Use a regression harness that wraps the actual dismiss listeners `ContextMenuProvider` registers after the menu opens, so the trace reflects the real close path instead of generic global events that happened before those listeners existed. Then fix only the traced dismissal path or the pane-activation/focus path that produces it on the failing surface(s). Keep `menu-defs.ts` as a `.ts` module by constructing icon nodes with `createElement(...)` instead of JSX.
 
 **Tech Stack:** React 18, Redux Toolkit, TypeScript, lucide-react, Vitest, Testing Library, xterm.js test mocks
 
@@ -16,23 +16,22 @@
 - Preserve existing terminal item ids: `terminal-copy`, `terminal-paste`, `terminal-select-all`, `terminal-search`.
 - `copy` must be labeled exactly `copy`.
 - Keep current enable/disable behavior for copy, paste, select all, search, refresh, split, resume, and maintenance items.
-- The bug fix must first be proven on the shared pane header / pane shell path, not only on terminal content.
-- Add a terminal-body regression after the shared pane path is characterized, because terminal focus may introduce a second close signal.
+- There is not a single custom-menu ingress for “a pane”: pane shell uses `data-context="pane"` and terminal content uses `data-context="terminal"`. Characterize both before choosing the fix.
 - Any diagnostic trace used to choose the fix must observe `ContextMenuProvider`’s own post-open close path, not generic browser events that fired before the dismiss listeners were attached.
 - Tests for the bug should assert only the user-visible requirement: the menu stays open on right-click. They should not lock in whether right-click changes the active pane unless that becomes unavoidable for the final fix.
 - Keep `src/components/context-menu/menu-defs.ts` as `.ts`; do not insert JSX into it.
 - No server, WebSocket protocol, persistence, or `docs/index.html` changes are required.
 
-### Task 1: Characterize The Shared Pane-Shell Failure And Capture The Real Dismiss Signal
+### Task 1: Characterize The Actual Custom-Menu Surfaces And Capture The Real Dismiss Path
 
-**Why:** The user reported right-clicking “a pane,” and the shared path is the pane shell in `Pane.tsx`, not terminal content. Before changing production behavior, prove the bug on that shared path and capture which dismissal signal actually fires.
+**Why:** The user reported right-clicking “a pane,” but the custom menu can be entered through at least two distinct surfaces with different behavior: pane shell and terminal content. Before changing production behavior, prove which surface fails and capture which provider dismissal path actually fires there.
 
 **Files:**
 - Create: `test/e2e/pane-context-menu-flow.test.tsx`
 
-**Step 1: Write the failing shared-pane regression with a provider-dismiss trace**
+**Step 1: Write the pane-shell regression with a provider-dismiss trace**
 
-Create `test/e2e/pane-context-menu-flow.test.tsx` with a real `PaneContainer` + `ContextMenuProvider` harness and two browser panes so the test goes through the shared pane shell / header path without introducing xterm focus yet:
+Create `test/e2e/pane-context-menu-flow.test.tsx` with a real `PaneContainer` + `ContextMenuProvider` harness and two browser panes. Reuse the existing seam from `test/e2e/refresh-context-menu-flow.test.tsx`: target the actual pane shell element via `[data-context="pane"]`, not browser toolbar text or inputs, so the test exercises the custom pane menu instead of a native input context menu:
 
 ```tsx
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
@@ -230,14 +229,17 @@ function renderBrowserFlow() {
   )
 }
 
-it('keeps the pane header context menu open when right-clicking an inactive pane header', async () => {
+it('keeps the pane shell context menu open when right-clicking an inactive pane shell', async () => {
   const user = userEvent.setup()
   const trace = createProviderDismissTrace()
 
   try {
-    renderBrowserFlow()
+    const { container } = renderBrowserFlow()
+    const paneShells = container.querySelectorAll('[data-context="pane"]')
+    const targetPaneShell = paneShells[1] as HTMLElement | undefined
+    expect(targetPaneShell).toBeDefined()
 
-    await user.pointer({ target: screen.getByText('right.example.com'), keys: '[MouseRight]' })
+    await user.pointer({ target: targetPaneShell!, keys: '[MouseRight]' })
 
     await act(async () => {
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
@@ -259,12 +261,12 @@ it('keeps the pane header context menu open when right-clicking an inactive pane
 Run:
 
 ```bash
-npx vitest run test/e2e/pane-context-menu-flow.test.tsx --testNamePattern="pane header context menu"
+npx vitest run test/e2e/pane-context-menu-flow.test.tsx --testNamePattern="pane shell context menu"
 ```
 
-Expected: FAIL if the shared pane-shell path reproduces the bug. Use the assertion message’s `provider dismiss trace=...` payload as the source of truth for the first dismissal path to investigate.
+Expected: FAIL if the pane-shell path reproduces the bug. Use the assertion message’s `provider dismiss trace=...` payload as the source of truth for the first dismissal path to investigate on that surface.
 
-**Step 3: If the shared path already passes, add the terminal-body regression with the same probe**
+**Step 3: Add the terminal-body regression with the same probe**
 
 Extend the same file with a second reproduction that mounts real `TerminalView` panes using the same xterm mocks from `test/unit/client/components/TerminalView.lifecycle.test.tsx`:
 
@@ -395,15 +397,17 @@ npx vitest run test/e2e/pane-context-menu-flow.test.tsx
 ```
 
 Expected:
-- If the header test fails, treat the shared pane-shell path as the primary bug and fix that first.
-- If the header test passes but the terminal-body test fails, treat the bug as terminal-specific and use that provider-trace payload to choose the fix.
+- If the pane-shell test fails, treat that as a pane-shell bug on the `data-context="pane"` path.
+- If the terminal-body test fails, treat that as a terminal-surface bug on the `data-context="terminal"` path.
+- If both fail with the same provider trace, fix the shared dismissal or activation cause once.
+- If only one fails, do not force the other surface to dictate the fix.
 
 **Step 4: Implement only the fix that matches the observed dismissal signal**
 
 Use the failing test’s `provider dismiss trace=...` output to choose the production change before touching app code:
 
-- If `pointerdown` fires on the shared pane-shell path, modify `ContextMenuProvider` to ignore only the opening secondary-click sequence or the specific opening target, not all dismissals for a frame.
-- If `blur` fires on the shared pane-shell path, inspect whether pane activation or a focus transfer is producing it and fix that source before touching unrelated dismissals.
+- If `pointerdown` fires on the pane-shell path, modify `ContextMenuProvider` to ignore only the opening secondary-click sequence or the specific opening target, not all dismissals for a frame.
+- If `blur` fires on the pane-shell path, inspect whether pane activation or a focus transfer is producing it and fix that source before touching unrelated dismissals.
 - If `blur` appears only on the terminal-body path, inspect `TerminalView`’s active-pane autofocus path and suppress only the context-menu-opening focus transfer or the matching blur it produces.
 - If `scroll` or `resize` fires, track down the source of that layout change and fix or suppress only that opening-transition event.
 - If the provider trace stays empty and the menu still closes, instrument the actual `closeMenu` call path next: inspect `ContextMenuProvider` cleanup/unmount effects and any non-dismiss-listener `closeMenu()` callers before editing dismissal listeners.
@@ -411,7 +415,7 @@ Use the failing test’s `provider dismiss trace=...` output to choose the produ
 After the signal is known, add the narrowest possible unit coverage in `test/unit/client/components/ContextMenuProvider.test.tsx` or the relevant component test file. Examples:
 
 - `pointerdown` fix: “opening right-click does not dismiss, but a later outside left-click still does”.
-- shared `blur` fix: “pane-open transition blur does not dismiss, but a later real blur still does”.
+- pane-shell `blur` fix: “pane-open transition blur does not dismiss, but a later real blur still does”.
 - terminal-focus fix: “activating an inactive terminal while its menu opens does not dismiss the menu”.
 
 Do not apply a global one-frame suppression to `pointerdown`, `scroll`, `resize`, and `blur` together.
@@ -654,8 +658,8 @@ Expected:
 
 **Step 4: Manually verify the behavior**
 
-- Right-click an inactive non-terminal pane header.
-- Confirm the pane context menu stays open instead of flashing closed.
+- Right-click an inactive non-terminal pane shell / header area.
+- Confirm the pane-shell context menu stays open instead of flashing closed.
 - Right-click an inactive terminal pane body.
 - Confirm the menu stays open instead of flashing closed.
 - Confirm the first section is `copy`, `Paste`, `Select all`.
