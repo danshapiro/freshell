@@ -7,45 +7,154 @@ import type { RootState } from '@/store/store'
 import type { CodingCliProviderName } from '@/store/types'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 
+type SessionRef = { provider: CodingCliProviderName; sessionId: string }
+
+function isValidSessionRef(provider: string, sessionId: string): provider is CodingCliProviderName {
+  return provider !== 'claude' || isValidClaudeSessionId(sessionId)
+}
+
+function locatorIdentity(locator: { provider: CodingCliProviderName; sessionId: string; serverInstanceId?: string }): string {
+  return `${locator.provider}:${locator.sessionId}:${locator.serverInstanceId ?? ''}`
+}
+
+function sessionKey(locator: SessionRef): string {
+  return `${locator.provider}:${locator.sessionId}`
+}
+
+function dedupeBy<T>(values: T[], getKey: (value: T) => string): T[] {
+  const seen = new Set<string>()
+  const deduped: T[] = []
+  for (const value of values) {
+    const key = getKey(value)
+    if (seen.has(key)) continue
+    seen.add(key)
+    deduped.push(value)
+  }
+  return deduped
+}
+
+function extractExplicitSessionLocator(content: PaneContent): {
+  provider: CodingCliProviderName
+  sessionId: string
+  serverInstanceId?: string
+} | undefined {
+  const explicit = (content as { sessionRef?: { provider?: unknown; sessionId?: unknown; serverInstanceId?: unknown } }).sessionRef
+  if (!explicit || typeof explicit.provider !== 'string' || typeof explicit.sessionId !== 'string') {
+    return undefined
+  }
+  if (!isValidSessionRef(explicit.provider, explicit.sessionId)) return undefined
+  return {
+    provider: explicit.provider,
+    sessionId: explicit.sessionId,
+    ...(typeof explicit.serverInstanceId === 'string' ? { serverInstanceId: explicit.serverInstanceId } : {}),
+  }
+}
+
 /**
- * Extract a session reference from a single pane's content.
- * Handles both terminal panes (claude/codex mode) and agent-chat (freshclaude) panes.
+ * Extract exact and intrinsic session locators from a single pane's content.
+ * Explicit sessionRef preserves cross-device identity; resumeSessionId is kept as an
+ * intrinsic local fallback for local-session matching before serverInstanceId is known.
  */
-function extractSessionRef(content: PaneContent): { provider: CodingCliProviderName; sessionId: string } | undefined {
-  const explicit = (content as { sessionRef?: { provider?: unknown; sessionId?: unknown } }).sessionRef
-  if (explicit && typeof explicit.provider === 'string' && typeof explicit.sessionId === 'string') {
-    if (explicit.provider === 'claude' && !isValidClaudeSessionId(explicit.sessionId)) return undefined
-    return {
-      provider: explicit.provider as CodingCliProviderName,
-      sessionId: explicit.sessionId,
-    }
+function extractSessionLocators(content: PaneContent): Array<{
+  provider: CodingCliProviderName
+  sessionId: string
+  serverInstanceId?: string
+}> {
+  const locators: Array<{
+    provider: CodingCliProviderName
+    sessionId: string
+    serverInstanceId?: string
+  }> = []
+
+  const explicit = extractExplicitSessionLocator(content)
+  if (explicit) {
+    locators.push(explicit)
   }
 
   if (content.kind === 'agent-chat') {
     const sessionId = content.resumeSessionId
-    if (!sessionId || !isValidClaudeSessionId(sessionId)) return undefined
-    return { provider: 'claude', sessionId }
+    if (!sessionId || !isValidClaudeSessionId(sessionId)) return dedupeBy(locators, locatorIdentity)
+    locators.push({ provider: 'claude', sessionId })
+    return dedupeBy(locators, locatorIdentity)
   }
-  if (content.kind !== 'terminal') return undefined
-  if (content.mode === 'shell') return undefined
+  if (content.kind !== 'terminal') return dedupeBy(locators, locatorIdentity)
+  if (content.mode === 'shell') return dedupeBy(locators, locatorIdentity)
   const sessionId = content.resumeSessionId
-  if (!sessionId) return undefined
-  if (content.mode === 'claude' && !isValidClaudeSessionId(sessionId)) return undefined
-  return { provider: content.mode as CodingCliProviderName, sessionId }
+  if (!sessionId) return dedupeBy(locators, locatorIdentity)
+  if (content.mode === 'claude' && !isValidClaudeSessionId(sessionId)) return dedupeBy(locators, locatorIdentity)
+  locators.push({ provider: content.mode as CodingCliProviderName, sessionId })
+  return dedupeBy(locators, locatorIdentity)
 }
 
-export function collectSessionRefsFromNode(node: PaneNode): Array<{ provider: CodingCliProviderName; sessionId: string }> {
+export function collectSessionLocatorsFromNode(node: PaneNode): Array<{
+  provider: CodingCliProviderName
+  sessionId: string
+  serverInstanceId?: string
+}> {
   if (node.type === 'leaf') {
-    const sessionRef = extractSessionRef(node.content)
-    return sessionRef ? [sessionRef] : []
+    return extractSessionLocators(node.content)
   }
-  return [
-    ...collectSessionRefsFromNode(node.children[0]),
-    ...collectSessionRefsFromNode(node.children[1]),
-  ]
+  return dedupeBy([
+    ...collectSessionLocatorsFromNode(node.children[0]),
+    ...collectSessionLocatorsFromNode(node.children[1]),
+  ], locatorIdentity)
 }
 
-export function getActiveSessionRefForTab(state: RootState, tabId: string): { provider: CodingCliProviderName; sessionId: string } | undefined {
+export function collectSessionRefsFromNode(node: PaneNode): SessionRef[] {
+  return dedupeBy(
+    collectSessionLocatorsFromNode(node).map((locator) => ({
+      provider: locator.provider,
+      sessionId: locator.sessionId,
+    })),
+    sessionKey,
+  )
+}
+
+export function collectSessionLocatorsFromTabs(
+  tabs: RootState['tabs']['tabs'],
+  panes: RootState['panes'],
+): Array<{
+  provider: CodingCliProviderName
+  sessionId: string
+  serverInstanceId?: string
+}> {
+  const locators: Array<{
+    provider: CodingCliProviderName
+    sessionId: string
+    serverInstanceId?: string
+  }> = []
+
+  for (const tab of tabs || []) {
+    const layout = panes.layouts[tab.id]
+    if (layout) {
+      locators.push(...collectSessionLocatorsFromNode(layout))
+      continue
+    }
+
+    const provider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
+    const sessionId = tab.resumeSessionId
+    if (!provider || !sessionId) continue
+    if (!isValidSessionRef(provider, sessionId)) continue
+    locators.push({ provider, sessionId })
+  }
+
+  return dedupeBy(locators, locatorIdentity)
+}
+
+export function collectSessionRefsFromTabs(
+  tabs: RootState['tabs']['tabs'],
+  panes: RootState['panes'],
+): SessionRef[] {
+  return dedupeBy(
+    collectSessionLocatorsFromTabs(tabs, panes).map((locator) => ({
+      provider: locator.provider,
+      sessionId: locator.sessionId,
+    })),
+    sessionKey,
+  )
+}
+
+export function getActiveSessionRefForTab(state: RootState, tabId: string): SessionRef | undefined {
   const layout = state.panes.layouts[tabId]
   if (!layout) return undefined
   const activePaneId = state.panes.activePane[tabId]
@@ -58,12 +167,12 @@ export function getActiveSessionRefForTab(state: RootState, tabId: string): { pr
 
   const leaf = findLeaf(layout)
   if (leaf?.type === 'leaf') {
-    return extractSessionRef(leaf.content)
+    return collectSessionRefsFromNode(leaf)[0]
   }
   return undefined
 }
 
-export function getTabSessionRefs(state: RootState, tabId: string): Array<{ provider: CodingCliProviderName; sessionId: string }> {
+export function getTabSessionRefs(state: RootState, tabId: string): SessionRef[] {
   const layout = state.panes.layouts[tabId]
   if (!layout) return []
   return collectSessionRefsFromNode(layout)
@@ -127,8 +236,8 @@ function findPaneInNode(
   sessionId: string
 ): string | undefined {
   if (node.type === 'leaf') {
-    const ref = extractSessionRef(node.content)
-    if (ref && ref.provider === provider && ref.sessionId === sessionId) {
+    const refs = collectSessionRefsFromNode(node)
+    if (refs.some((ref) => ref.provider === provider && ref.sessionId === sessionId)) {
       return node.id
     }
     return undefined

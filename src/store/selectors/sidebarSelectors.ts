@@ -1,8 +1,7 @@
 import { createSelector } from '@reduxjs/toolkit'
 import type { RootState } from '../store'
 import type { BackgroundTerminal, CodingCliProviderName } from '../types'
-import { collectSessionRefsFromNode } from '@/lib/session-utils'
-import { isValidClaudeSessionId } from '@/lib/claude-session-id'
+import { collectSessionRefsFromTabs } from '@/lib/session-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 
 export interface SidebarSessionItem {
@@ -74,28 +73,10 @@ export function buildSessionItems(
     }
   }
 
-  for (const tab of tabs || []) {
-    const layout = panes.layouts[tab.id]
-    if (!layout) {
-      const provider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode as CodingCliProviderName : undefined)
-      const sessionId = tab.resumeSessionId
-      if (provider && sessionId) {
-        // Legacy fallback for tabs without a pane layout. Claude session IDs must be UUIDs.
-        if (provider !== 'claude' || isValidClaudeSessionId(sessionId)) {
-          const key = `${provider}:${sessionId}`
-          if (!tabSessionMap.has(key)) {
-            tabSessionMap.set(key, { hasTab: true })
-          }
-        }
-      }
-      continue
-    }
-    const sessionRefs = collectSessionRefsFromNode(layout)
-    for (const ref of sessionRefs) {
-      const key = `${ref.provider}:${ref.sessionId}`
-      if (!tabSessionMap.has(key)) {
-        tabSessionMap.set(key, { hasTab: true })
-      }
+  for (const ref of collectSessionRefsFromTabs(tabs, panes)) {
+    const key = `${ref.provider}:${ref.sessionId}`
+    if (!tabSessionMap.has(key)) {
+      tabSessionMap.set(key, { hasTab: true })
     }
   }
 

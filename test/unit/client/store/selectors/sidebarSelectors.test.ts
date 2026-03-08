@@ -89,6 +89,90 @@ describe('sidebarSelectors', () => {
       expect(items[0].sessionType).toBe('claude')
       expect(items[1].sessionType).toBe('agent-chat')
     })
+
+    it('keeps hasTab correct for layout-backed and no-layout fallback sessions', () => {
+      const validClaudeSessionId = '550e8400-e29b-41d4-a716-446655440000'
+      const invalidClaudeSessionId = 'not-a-uuid'
+      const projects = [
+        makeProject([
+          { sessionId: 'codex-layout', provider: 'codex' },
+          { sessionId: 'codex-no-layout', provider: 'codex' },
+          { sessionId: validClaudeSessionId, provider: 'claude' },
+          { sessionId: invalidClaudeSessionId, provider: 'claude' },
+        ]),
+      ]
+
+      const tabs = [
+        { id: 'tab-layout' },
+        { id: 'tab-no-layout', mode: 'codex', resumeSessionId: 'codex-no-layout' },
+        { id: 'tab-invalid', mode: 'claude', resumeSessionId: invalidClaudeSessionId },
+      ] as any
+
+      const panes = {
+        layouts: {
+          'tab-layout': {
+            type: 'split',
+            id: 'split-1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              {
+                type: 'leaf',
+                id: 'pane-codex',
+                content: {
+                  kind: 'terminal',
+                  mode: 'codex',
+                  status: 'running',
+                  createRequestId: 'req-codex',
+                  resumeSessionId: 'codex-layout',
+                  sessionRef: {
+                    provider: 'codex',
+                    sessionId: 'codex-layout',
+                    serverInstanceId: 'srv-local',
+                  },
+                },
+              },
+              {
+                type: 'leaf',
+                id: 'pane-claude',
+                content: {
+                  kind: 'agent-chat',
+                  provider: 'freshclaude',
+                  status: 'idle',
+                  createRequestId: 'req-claude',
+                  resumeSessionId: validClaudeSessionId,
+                  sessionRef: {
+                    provider: 'claude',
+                    sessionId: validClaudeSessionId,
+                    serverInstanceId: 'srv-local',
+                  },
+                },
+              },
+            ],
+          },
+          'tab-invalid': {
+            type: 'leaf',
+            id: 'pane-invalid',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              status: 'running',
+              createRequestId: 'req-invalid',
+              resumeSessionId: invalidClaudeSessionId,
+            },
+          },
+        },
+        activePane: {},
+      } as any
+
+      const items = buildSessionItems(projects, tabs, panes, emptyTerminals, emptyActivity)
+      const hasTabBySessionId = new Map(items.map((item) => [item.sessionId, item.hasTab]))
+
+      expect(hasTabBySessionId.get('codex-layout')).toBe(true)
+      expect(hasTabBySessionId.get('codex-no-layout')).toBe(true)
+      expect(hasTabBySessionId.get(validClaudeSessionId)).toBe(true)
+      expect(hasTabBySessionId.get(invalidClaudeSessionId)).toBe(false)
+    })
   })
 
   describe('sortSessionItems', () => {

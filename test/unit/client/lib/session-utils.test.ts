@@ -1,27 +1,50 @@
 import { describe, it, expect } from 'vitest'
-import { getSessionsForHello, findTabIdForSession, findPaneForSession, collectSessionRefsFromNode, getActiveSessionRefForTab } from '@/lib/session-utils'
+import {
+  getSessionsForHello,
+  findTabIdForSession,
+  findPaneForSession,
+  collectSessionLocatorsFromTabs,
+  collectSessionRefsFromNode,
+  collectSessionRefsFromTabs,
+  getActiveSessionRefForTab,
+} from '@/lib/session-utils'
 import type { RootState } from '@/store/store'
-import type { PaneNode, TerminalPaneContent, AgentChatPaneContent, PaneContent } from '@/store/paneTypes'
+import type {
+  PaneNode,
+  TerminalPaneContent,
+  AgentChatPaneContent,
+  PaneContent,
+  SessionLocator,
+} from '@/store/paneTypes'
 
 const VALID_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
 const OTHER_SESSION_ID = '6f1c2b3a-4d5e-6f70-8a9b-0c1d2e3f4a5b'
 
-function terminalContent(mode: TerminalPaneContent['mode'], resumeSessionId: string): TerminalPaneContent {
+function terminalContent(
+  mode: TerminalPaneContent['mode'],
+  resumeSessionId: string,
+  sessionRef?: SessionLocator
+): TerminalPaneContent {
   return {
     kind: 'terminal',
     mode,
     status: 'running',
     createRequestId: `req-${resumeSessionId}`,
     resumeSessionId,
+    ...(sessionRef ? { sessionRef } : {}),
   }
 }
 
-function agentChatContent(resumeSessionId?: string): AgentChatPaneContent {
+function agentChatContent(
+  resumeSessionId?: string,
+  sessionRef?: SessionLocator
+): AgentChatPaneContent {
   return {
     kind: 'agent-chat', provider: 'freshclaude',
     status: 'idle',
     createRequestId: `req-chat-${resumeSessionId}`,
     resumeSessionId,
+    ...(sessionRef ? { sessionRef } : {}),
   }
 }
 
@@ -141,6 +164,67 @@ describe('getSessionsForHello', () => {
     expect(result.active).toBeUndefined()
     expect(result.visible).toEqual([])
     expect(result.background).toBeUndefined()
+  })
+})
+
+describe('collectSessionLocatorsFromTabs', () => {
+  it('preserves exact local and foreign locators, intrinsic local fallbacks, and tab-level fallbacks', () => {
+    const tabs = [
+      { id: 'tab-local' },
+      { id: 'tab-local-duplicate' },
+      { id: 'tab-remote' },
+      { id: 'tab-chat' },
+      { id: 'tab-no-layout', mode: 'codex', resumeSessionId: 'tab-only' },
+      { id: 'tab-invalid-claude' },
+    ] as RootState['tabs']['tabs']
+
+    const panes = {
+      layouts: {
+        'tab-local': leaf('pane-local', terminalContent('codex', 'shared', {
+          provider: 'codex',
+          sessionId: 'shared',
+          serverInstanceId: 'srv-local',
+        })),
+        'tab-local-duplicate': leaf('pane-local-duplicate', terminalContent('codex', 'shared', {
+          provider: 'codex',
+          sessionId: 'shared',
+          serverInstanceId: 'srv-local',
+        })),
+        'tab-remote': leaf('pane-remote', {
+          kind: 'terminal',
+          mode: 'codex',
+          status: 'running',
+          createRequestId: 'req-remote',
+          sessionRef: {
+            provider: 'codex',
+            sessionId: 'shared',
+            serverInstanceId: 'srv-remote',
+          },
+        }),
+        'tab-chat': leaf('pane-chat', agentChatContent(VALID_SESSION_ID, {
+          provider: 'claude',
+          sessionId: VALID_SESSION_ID,
+          serverInstanceId: 'srv-local',
+        })),
+        'tab-invalid-claude': leaf('pane-invalid-claude', terminalContent('claude', 'not-a-uuid')),
+      },
+      activePane: {},
+    } as RootState['panes']
+
+    expect(collectSessionLocatorsFromTabs(tabs, panes)).toEqual([
+      { provider: 'codex', sessionId: 'shared', serverInstanceId: 'srv-local' },
+      { provider: 'codex', sessionId: 'shared' },
+      { provider: 'codex', sessionId: 'shared', serverInstanceId: 'srv-remote' },
+      { provider: 'claude', sessionId: VALID_SESSION_ID, serverInstanceId: 'srv-local' },
+      { provider: 'claude', sessionId: VALID_SESSION_ID },
+      { provider: 'codex', sessionId: 'tab-only' },
+    ])
+
+    expect(collectSessionRefsFromTabs(tabs, panes)).toEqual([
+      { provider: 'codex', sessionId: 'shared' },
+      { provider: 'claude', sessionId: VALID_SESSION_ID },
+      { provider: 'codex', sessionId: 'tab-only' },
+    ])
   })
 })
 
