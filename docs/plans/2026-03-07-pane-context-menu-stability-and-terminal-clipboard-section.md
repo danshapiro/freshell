@@ -4,7 +4,7 @@
 
 **Goal:** Fix the pane right-click menu so it does not immediately reclose, and make the terminal context menu start with an iconized `copy` / `Paste` / `Select all` section.
 
-**Architecture:** Do not assume a new pane-activation or dismissal rule up front. Start with the shared pane-shell path the user described: inactive pane header / shell, real `Pane` -> `PaneContainer` -> Redux `activePane`, and the four `ContextMenuProvider` dismissal signals (`pointerdown`, `scroll`, `resize`, `blur`). Use a regression harness that records which dismissal signal actually fires when the menu disappears, then fix only that signal or the pane-activation/focus path that produces it. After the shared pane path is stable, add the terminal-body regression and the requested terminal-menu reorder. Keep `menu-defs.ts` as a `.ts` module by constructing icon nodes with `createElement(...)` instead of JSX.
+**Architecture:** Do not assume a new pane-activation or dismissal rule up front. Start with the shared pane-shell path the user described: inactive pane header / shell, real `Pane` -> `PaneContainer` -> Redux `activePane`, and the four `ContextMenuProvider` dismissal signals (`pointerdown`, `scroll`, `resize`, `blur`). Use a regression harness that wraps the actual dismiss listeners `ContextMenuProvider` registers after the menu opens, so the trace reflects the real close path instead of generic global events that happened before those listeners existed. Then fix only the traced dismissal path or the pane-activation/focus path that produces it. After the shared pane path is stable, add the terminal-body regression and the requested terminal-menu reorder. Keep `menu-defs.ts` as a `.ts` module by constructing icon nodes with `createElement(...)` instead of JSX.
 
 **Tech Stack:** React 18, Redux Toolkit, TypeScript, lucide-react, Vitest, Testing Library, xterm.js test mocks
 
@@ -18,6 +18,7 @@
 - Keep current enable/disable behavior for copy, paste, select all, search, refresh, split, resume, and maintenance items.
 - The bug fix must first be proven on the shared pane header / pane shell path, not only on terminal content.
 - Add a terminal-body regression after the shared pane path is characterized, because terminal focus may introduce a second close signal.
+- Any diagnostic trace used to choose the fix must observe `ContextMenuProvider`’s own post-open close path, not generic browser events that fired before the dismiss listeners were attached.
 - Tests for the bug should assert only the user-visible requirement: the menu stays open on right-click. They should not lock in whether right-click changes the active pane unless that becomes unavoidable for the final fix.
 - Keep `src/components/context-menu/menu-defs.ts` as `.ts`; do not insert JSX into it.
 - No server, WebSocket protocol, persistence, or `docs/index.html` changes are required.
@@ -29,7 +30,7 @@
 **Files:**
 - Create: `test/e2e/pane-context-menu-flow.test.tsx`
 
-**Step 1: Write the failing shared-pane regression with a dismiss-signal probe**
+**Step 1: Write the failing shared-pane regression with a provider-dismiss trace**
 
 Create `test/e2e/pane-context-menu-flow.test.tsx` with a real `PaneContainer` + `ContextMenuProvider` harness and two browser panes so the test goes through the shared pane shell / header path without introducing xterm focus yet:
 
@@ -140,31 +141,76 @@ function createStore(layout: PaneNode) {
   })
 }
 
-function createDismissSignalProbe() {
+function createProviderDismissTrace() {
   const counts = {
     pointerdown: 0,
     scroll: 0,
     resize: 0,
     blur: 0,
   }
+  const wrappedByOriginal = new WeakMap<EventListenerOrEventListenerObject, EventListener>()
+  const originalDocumentAdd = document.addEventListener.bind(document)
+  const originalDocumentRemove = document.removeEventListener.bind(document)
+  const originalWindowAdd = window.addEventListener.bind(window)
+  const originalWindowRemove = window.removeEventListener.bind(window)
+  const docAddSpy = vi.spyOn(document, 'addEventListener')
+  const docRemoveSpy = vi.spyOn(document, 'removeEventListener')
+  const winAddSpy = vi.spyOn(window, 'addEventListener')
+  const winRemoveSpy = vi.spyOn(window, 'removeEventListener')
 
-  const onPointerDown = () => { counts.pointerdown += 1 }
-  const onScroll = () => { counts.scroll += 1 }
-  const onResize = () => { counts.resize += 1 }
-  const onBlur = () => { counts.blur += 1 }
+  function wrap(type: keyof typeof counts, listener: EventListenerOrEventListenerObject | null) {
+    if (!listener) return listener
+    const wrapped: EventListener = (event) => {
+      counts[type] += 1
+      if (typeof listener === 'function') {
+        listener(event)
+        return
+      }
+      listener.handleEvent(event)
+    }
+    wrappedByOriginal.set(listener, wrapped)
+    return wrapped
+  }
 
-  document.addEventListener('pointerdown', onPointerDown, true)
-  window.addEventListener('scroll', onScroll, true)
-  window.addEventListener('resize', onResize)
-  window.addEventListener('blur', onBlur)
+  docAddSpy.mockImplementation((type, listener, options) => {
+    if (type === 'pointerdown') {
+      originalDocumentAdd(type, wrap('pointerdown', listener), options)
+      return
+    }
+    originalDocumentAdd(type, listener as EventListener, options)
+  })
+
+  docRemoveSpy.mockImplementation((type, listener, options) => {
+    if (type === 'pointerdown' && listener) {
+      originalDocumentRemove(type, wrappedByOriginal.get(listener) ?? (listener as EventListener), options)
+      return
+    }
+    originalDocumentRemove(type, listener as EventListener, options)
+  })
+
+  winAddSpy.mockImplementation((type, listener, options) => {
+    if (type === 'scroll' || type === 'resize' || type === 'blur') {
+      originalWindowAdd(type, wrap(type as keyof typeof counts, listener), options)
+      return
+    }
+    originalWindowAdd(type, listener as EventListener, options)
+  })
+
+  winRemoveSpy.mockImplementation((type, listener, options) => {
+    if ((type === 'scroll' || type === 'resize' || type === 'blur') && listener) {
+      originalWindowRemove(type, wrappedByOriginal.get(listener) ?? (listener as EventListener), options)
+      return
+    }
+    originalWindowRemove(type, listener as EventListener, options)
+  })
 
   return {
     counts,
     cleanup() {
-      document.removeEventListener('pointerdown', onPointerDown, true)
-      window.removeEventListener('scroll', onScroll, true)
-      window.removeEventListener('resize', onResize)
-      window.removeEventListener('blur', onBlur)
+      docAddSpy.mockRestore()
+      docRemoveSpy.mockRestore()
+      winAddSpy.mockRestore()
+      winRemoveSpy.mockRestore()
     },
   }
 }
@@ -186,7 +232,7 @@ function renderBrowserFlow() {
 
 it('keeps the pane header context menu open when right-clicking an inactive pane header', async () => {
   const user = userEvent.setup()
-  const probe = createDismissSignalProbe()
+  const trace = createProviderDismissTrace()
 
   try {
     renderBrowserFlow()
@@ -200,10 +246,10 @@ it('keeps the pane header context menu open when right-clicking an inactive pane
 
     expect(
       screen.queryByRole('menu'),
-      `menu closed early; dismiss signals=${JSON.stringify(probe.counts)}`,
+      `menu closed early; provider dismiss trace=${JSON.stringify(trace.counts)}`,
     ).toBeInTheDocument()
   } finally {
-    probe.cleanup()
+    trace.cleanup()
   }
 })
 ```
@@ -216,7 +262,7 @@ Run:
 npx vitest run test/e2e/pane-context-menu-flow.test.tsx --testNamePattern="pane header context menu"
 ```
 
-Expected: FAIL if the shared pane-shell path reproduces the bug. Use the assertion message’s `dismiss signals=...` payload as the source of truth for the first signal to investigate.
+Expected: FAIL if the shared pane-shell path reproduces the bug. Use the assertion message’s `provider dismiss trace=...` payload as the source of truth for the first dismissal path to investigate.
 
 **Step 3: If the shared path already passes, add the terminal-body regression with the same probe**
 
@@ -319,7 +365,7 @@ function renderTerminalFlow() {
 
 it('keeps the terminal body context menu open when right-clicking an inactive terminal pane', async () => {
   const user = userEvent.setup()
-  const probe = createDismissSignalProbe()
+  const trace = createProviderDismissTrace()
 
   try {
     renderTerminalFlow()
@@ -334,10 +380,10 @@ it('keeps the terminal body context menu open when right-clicking an inactive te
 
     expect(
       screen.queryByRole('menu'),
-      `menu closed early; dismiss signals=${JSON.stringify(probe.counts)}`,
+      `menu closed early; provider dismiss trace=${JSON.stringify(trace.counts)}`,
     ).toBeInTheDocument()
   } finally {
-    probe.cleanup()
+    trace.cleanup()
   }
 })
 ```
@@ -350,17 +396,17 @@ npx vitest run test/e2e/pane-context-menu-flow.test.tsx
 
 Expected:
 - If the header test fails, treat the shared pane-shell path as the primary bug and fix that first.
-- If the header test passes but the terminal-body test fails, treat the bug as terminal-specific and use that signal payload to choose the fix.
+- If the header test passes but the terminal-body test fails, treat the bug as terminal-specific and use that provider-trace payload to choose the fix.
 
 **Step 4: Implement only the fix that matches the observed dismissal signal**
 
-Use the failing test’s `dismiss signals=...` output to choose the production change before touching app code:
+Use the failing test’s `provider dismiss trace=...` output to choose the production change before touching app code:
 
 - If `pointerdown` fires on the shared pane-shell path, modify `ContextMenuProvider` to ignore only the opening secondary-click sequence or the specific opening target, not all dismissals for a frame.
 - If `blur` fires on the shared pane-shell path, inspect whether pane activation or a focus transfer is producing it and fix that source before touching unrelated dismissals.
 - If `blur` appears only on the terminal-body path, inspect `TerminalView`’s active-pane autofocus path and suppress only the context-menu-opening focus transfer or the matching blur it produces.
 - If `scroll` or `resize` fires, track down the source of that layout change and fix or suppress only that opening-transition event.
-- If none of the four signals fire and the menu still closes, inspect `ContextMenuProvider` cleanup/unmount paths before editing dismissal listeners.
+- If the provider trace stays empty and the menu still closes, instrument the actual `closeMenu` call path next: inspect `ContextMenuProvider` cleanup/unmount effects and any non-dismiss-listener `closeMenu()` callers before editing dismissal listeners.
 
 After the signal is known, add the narrowest possible unit coverage in `test/unit/client/components/ContextMenuProvider.test.tsx` or the relevant component test file. Examples:
 
@@ -587,15 +633,24 @@ npm test
 
 Expected: PASS. If anything fails, stop and fix it before merge or rebase work.
 
-**Step 3: Start a worktree dev server on a dedicated port**
+**Step 3: Start isolated worktree server and client processes on dedicated ports**
 
 Run:
 
 ```bash
-PORT=3344 npm run dev > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid
+PORT=3344 VITE_PORT=5174 npm run dev:server > /tmp/freshell-server-3344.log 2>&1 & echo $! > /tmp/freshell-server-3344.pid
+PORT=3344 VITE_PORT=5174 npm run dev:client -- --port 5174 > /tmp/freshell-client-5174.log 2>&1 & echo $! > /tmp/freshell-client-5174.pid
+ps -fp "$(cat /tmp/freshell-server-3344.pid)"
+ps -fp "$(cat /tmp/freshell-client-5174.pid)"
+readlink -f "/proc/$(cat /tmp/freshell-server-3344.pid)/cwd"
+readlink -f "/proc/$(cat /tmp/freshell-client-5174.pid)/cwd"
 ```
 
-Expected: the worktree app is reachable on port `3344`.
+Expected:
+- the server process is the worktree’s `dev:server` on port `3344`
+- the client process is the worktree’s Vite dev server on port `5174`
+- both cwd checks resolve into `.worktrees/trycycle-pane-context-menu-fix`
+- the worktree app is reachable via the Vite URL on port `5174`
 
 **Step 4: Manually verify the behavior**
 
@@ -614,9 +669,13 @@ Do not treat active-pane changes on right-click as a required outcome one way or
 Run:
 
 ```bash
-ps -fp "$(cat /tmp/freshell-3344.pid)"
-kill "$(cat /tmp/freshell-3344.pid)"
-rm -f /tmp/freshell-3344.pid
+ps -fp "$(cat /tmp/freshell-server-3344.pid)"
+ps -fp "$(cat /tmp/freshell-client-5174.pid)"
+readlink -f "/proc/$(cat /tmp/freshell-server-3344.pid)/cwd"
+readlink -f "/proc/$(cat /tmp/freshell-client-5174.pid)/cwd"
+kill "$(cat /tmp/freshell-server-3344.pid)"
+kill "$(cat /tmp/freshell-client-5174.pid)"
+rm -f /tmp/freshell-server-3344.pid /tmp/freshell-client-5174.pid
 ```
 
-Expected: `ps` shows the process belongs to `.worktrees/trycycle-pane-context-menu-fix`, and only that PID is terminated.
+Expected: both cwd checks confirm the processes belong to `.worktrees/trycycle-pane-context-menu-fix`, and only those recorded PIDs are terminated.
