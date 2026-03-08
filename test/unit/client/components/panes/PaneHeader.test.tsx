@@ -241,6 +241,21 @@ describe('PaneHeader', () => {
       expect(paneIcon.getAttribute('class')).toContain('text-blue-500')
       expect(paneIcon.getAttribute('class')).not.toContain('animate-pulse')
     })
+
+    it('applies pulse animation to the icon when activityPulse is true', () => {
+      render(
+        <PaneHeader
+          title="Test"
+          status="running"
+          isActive={true}
+          activityPulse={true}
+          onClose={vi.fn()}
+          content={makeTerminalContent('codex')}
+        />
+      )
+      const paneIcon = screen.getByTestId('pane-icon')
+      expect(paneIcon.getAttribute('class')).toContain('animate-pulse')
+    })
   })
 
   describe('interactions', () => {

@@ -90,6 +90,27 @@ export const TerminalMetaUpdatedSchema = z.object({
   remove: z.array(z.string().min(1)),
 })
 
+export const CodexActivityRecordSchema = z.object({
+  terminalId: z.string().min(1),
+  sessionId: z.string().optional(),
+  phase: z.enum(['idle', 'pending', 'busy', 'unknown']),
+  updatedAt: z.number().int().nonnegative(),
+})
+
+export type CodexActivityRecord = z.infer<typeof CodexActivityRecordSchema>
+
+export const CodexActivityListResponseSchema = z.object({
+  type: z.literal('codex.activity.list.response'),
+  requestId: z.string().min(1),
+  terminals: z.array(CodexActivityRecordSchema),
+})
+
+export const CodexActivityUpdatedSchema = z.object({
+  type: z.literal('codex.activity.updated'),
+  upsert: z.array(CodexActivityRecordSchema),
+  remove: z.array(z.string().min(1)),
+})
+
 // ──────────────────────────────────────────────────────────────
 // SDK content block schemas (from Claude Code NDJSON)
 // ──────────────────────────────────────────────────────────────
@@ -217,6 +238,11 @@ export const TerminalListSchema = z.object({
 
 export const TerminalMetaListSchema = z.object({
   type: z.literal('terminal.meta.list'),
+  requestId: z.string().min(1),
+})
+
+export const CodexActivityListSchema = z.object({
+  type: z.literal('codex.activity.list'),
   requestId: z.string().min(1),
 })
 
@@ -375,6 +401,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   TerminalKillSchema,
   TerminalListSchema,
   TerminalMetaListSchema,
+  CodexActivityListSchema,
   UiLayoutSyncSchema,
   UiScreenshotResultSchema,
   SessionsFetchSchema,
@@ -504,6 +531,10 @@ export type TerminalListResponseMessage = {
 export type TerminalMetaListResponseMessage = z.infer<typeof TerminalMetaListResponseSchema>
 
 export type TerminalMetaUpdatedMessage = z.infer<typeof TerminalMetaUpdatedSchema>
+
+export type CodexActivityListResponseMessage = z.infer<typeof CodexActivityListResponseSchema>
+
+export type CodexActivityUpdatedMessage = z.infer<typeof CodexActivityUpdatedSchema>
 
 // -- Sessions --
 
@@ -718,6 +749,8 @@ export type ServerMessage =
   | TerminalListResponseMessage
   | TerminalMetaListResponseMessage
   | TerminalMetaUpdatedMessage
+  | CodexActivityListResponseMessage
+  | CodexActivityUpdatedMessage
   | SessionsUpdatedMessage
   | SessionsPageMessage
   | SessionsPatchMessage

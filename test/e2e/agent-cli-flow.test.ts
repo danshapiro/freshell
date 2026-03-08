@@ -10,7 +10,7 @@ import { LayoutStore } from '../../server/agent-api/layout-store'
 
 function startTestServer(
   layoutStoreOverrides: Partial<Record<string, any>> = {},
-  options: { wsHandler?: any } = {},
+  options: { wsHandler?: any; registry?: any; codexActivityTracker?: any } = {},
 ) {
   const app = express()
   app.use(express.json())
@@ -19,10 +19,22 @@ function startTestServer(
       listTabs: () => ([{ id: 'tab_1', title: 'Alpha', activePaneId: 'pane_1' }]),
       listPanes: () => ([{ id: 'pane_1', index: 0, kind: 'terminal', terminalId: 'term_1' }]),
       getActiveTabId: () => 'tab_1',
+      resolvePaneToTerminal: () => 'term_1',
       ...layoutStoreOverrides,
     },
-    registry: { create: () => ({ terminalId: 'term_1' }) },
+    registry: {
+      create: () => ({ terminalId: 'term_1' }),
+      get: () => ({
+        mode: 'codex',
+        status: 'running',
+        buffer: {
+          snapshot: () => '$ ',
+        },
+      }),
+      ...options.registry,
+    },
     wsHandler: options.wsHandler,
+    codexActivityTracker: options.codexActivityTracker,
   }))
 
   const server = http.createServer(app)
@@ -280,6 +292,31 @@ describe('cli e2e flow', () => {
       if (screenshotPath) {
         await fs.unlink(screenshotPath).catch(() => undefined)
       }
+      await close()
+    }
+  })
+
+  it('keeps wait-for --prompt blocked across busy polling turns until the codex tracker clears', async () => {
+    let checks = 0
+    const unblockAfterChecks = 3
+
+    const { url, close } = await startTestServer({}, {
+      codexActivityTracker: {
+        isPromptBlocked: () => {
+          checks += 1
+          return checks < unblockAfterChecks
+        },
+      },
+    })
+
+    try {
+      const output = await runCli(url, ['wait-for', '-t', 'pane_1', '--prompt', '--timeout', '1.2'])
+      const parsed = JSON.parse(output.stdout) as { status: string; data: { matched: boolean; reason?: string } }
+
+      expect(parsed.status).toBe('ok')
+      expect(parsed.data).toEqual({ matched: true, reason: 'prompt' })
+      expect(checks).toBeGreaterThanOrEqual(unblockAfterChecks)
+    } finally {
       await close()
     }
   })

@@ -112,6 +112,12 @@ export interface TokenSummary {
   compactPercent?: number
 }
 
+export interface CodexTaskEventSnapshot {
+  latestTaskStartedAt?: number
+  latestTaskCompletedAt?: number
+  latestTurnAbortedAt?: number
+}
+
 export interface ErrorPayload {
   message: string
   code?: string
@@ -138,6 +144,7 @@ export interface ParsedSessionMeta {
   gitBranch?: string
   isDirty?: boolean
   tokenUsage?: TokenSummary
+  codexTaskEvents?: CodexTaskEventSnapshot
 }
 
 export interface CodingCliSessionInfo {
@@ -172,6 +179,7 @@ export interface CodingCliSession {
   isSubagent?: boolean
   isNonInteractive?: boolean
   sessionType?: string
+  codexTaskEvents?: CodexTaskEventSnapshot
 }
 
 export const FIRST_USER_MESSAGE_MAX_CHARS = 4000

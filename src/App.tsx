@@ -51,6 +51,7 @@ import { X, Copy, Check, PanelLeft, AlertTriangle } from 'lucide-react'
 import { updateSettingsLocal, markSaved } from '@/store/settingsSlice'
 
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
+import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
 import { createLogger } from '@/lib/client-logger'
@@ -192,6 +193,8 @@ export default function App() {
   const mainContentRef = useRef<HTMLDivElement>(null)
   const userOpenedSidebarOnMobileRef = useRef(false)
   const terminalMetaListRequestStartedAtRef = useRef(new Map<string, number>())
+  const codexActivityListRequestSeqRef = useRef(new Map<string, number>())
+  const codexActivityOrderRef = useRef(0)
   const fullscreenTouchStartYRef = useRef<number | null>(null)
   const isLandscapeTerminalView = isMobile && isLandscape && view === 'terminal'
   const shareAccessUrl = networkStatus?.accessUrl
@@ -381,6 +384,7 @@ export default function App() {
     let cleanedUp = false
     let cleanup: (() => void) | null = null
     let stopTabRegistrySync: (() => void) | null = null
+    let stopWsDisconnectSync: (() => void) | null = null
 
     // Buffer for chunked sessions.updated messages — we accumulate all chunks
     // and apply them atomically to avoid the sidebar collapsing and rebuilding
@@ -455,6 +459,7 @@ export default function App() {
       const handleBootstrapAuthFailure = (err: unknown): boolean => {
         if (!isApiUnauthorizedError(err)) return false
         if (!cancelled) {
+          resetCodexActivityOverlay()
           dispatch(setStatus('disconnected'))
           dispatch(setError('Authentication failed'))
         }
@@ -495,6 +500,31 @@ export default function App() {
         })
       }
 
+      const requestCodexActivityList = () => {
+        const requestId = `codex-activity-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+        const requestSeq = ++codexActivityOrderRef.current
+        codexActivityListRequestSeqRef.current.set(requestId, requestSeq)
+        ws.send({
+          type: 'codex.activity.list',
+          requestId,
+        })
+      }
+
+      const resetCodexActivityOverlay = () => {
+        codexActivityListRequestSeqRef.current.clear()
+        dispatch(resetCodexActivity())
+      }
+
+      const wsWithOptionalDisconnect = ws as typeof ws & {
+        onDisconnect?: (handler: () => void) => (() => void) | void
+      }
+
+      stopWsDisconnectSync = wsWithOptionalDisconnect.onDisconnect?.(() => {
+        if (cancelled) return
+        resetCodexActivityOverlay()
+        dispatch(setStatus('disconnected'))
+      }) ?? null
+
       const promoteRecentHttpSessionsBaseline = () => {
         const lastLoadedAt = appStore.getState().sessions.lastLoadedAt
         if (typeof lastLoadedAt !== 'number') return false
@@ -517,6 +547,7 @@ export default function App() {
           const ready = ReadyMessageSchema.safeParse(msg)
           // If the initial connect attempt failed before ready, WsClient may still auto-reconnect.
           // Treat 'ready' as the source of truth for connection status.
+          resetCodexActivityOverlay()
           dispatch(setError(undefined))
           dispatch(setStatus('ready'))
           dispatch(setServerInstanceId(ready.success ? ready.data.serverInstanceId : undefined))
@@ -528,6 +559,7 @@ export default function App() {
           // from this bootstrap cycle is still safe for enabling patch application.
           promoteRecentHttpSessionsBaseline()
           requestTerminalMetaList()
+          requestCodexActivityList()
         }
         if (msg.type === 'sessions.updated') {
           const projects = (msg.projects || []) as ProjectGroup[]
@@ -648,6 +680,35 @@ export default function App() {
             dispatch(removeTerminalMeta(terminalId))
           }
         }
+        if (msg.type === 'codex.activity.list.response') {
+          const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''
+          if (!requestId) return
+          const requestSeq = codexActivityListRequestSeqRef.current.get(requestId)
+          codexActivityListRequestSeqRef.current.delete(requestId)
+          if (requestSeq === undefined) return
+          dispatch(setCodexActivitySnapshot({
+            terminals: msg.terminals || [],
+            requestSeq,
+          }))
+        }
+        if (msg.type === 'codex.activity.updated') {
+          const mutationSeq = ++codexActivityOrderRef.current
+          const upsert = Array.isArray(msg.upsert) ? msg.upsert : []
+          if (upsert.length > 0) {
+            dispatch(upsertCodexActivity({
+              terminals: upsert,
+              mutationSeq,
+            }))
+          }
+
+          const remove = Array.isArray(msg.remove) ? msg.remove : []
+          if (remove.length > 0) {
+            dispatch(removeCodexActivity({
+              terminalIds: remove,
+              mutationSeq,
+            }))
+          }
+        }
         if (msg.type === 'terminal.exit') {
           const terminalId = msg.terminalId
           const code = msg.exitCode
@@ -692,6 +753,7 @@ export default function App() {
       })
 
       cleanup = () => {
+        stopWsDisconnectSync?.()
         unsubscribe()
         clearChunkedState()
       }
@@ -773,6 +835,7 @@ export default function App() {
       // Reconcile state for the already-ready socket so sessions patches do not stay blocked.
       if (ws.isReady) {
         if (cancelled) return
+        resetCodexActivityOverlay()
         dispatch(setError(undefined))
         dispatch(setStatus('ready'))
         dispatch(setServerInstanceId(ws.serverInstanceId))
@@ -805,7 +868,10 @@ export default function App() {
           }
         }
 
-        if (!cancelled) requestTerminalMetaList()
+        if (!cancelled) {
+          requestTerminalMetaList()
+          requestCodexActivityList()
+        }
         return
       }
       dispatch(setError(undefined))
@@ -816,6 +882,7 @@ export default function App() {
         if (!cancelled) dispatch(setStatus('ready'))
       } catch (err: any) {
         if (!cancelled) {
+          resetCodexActivityOverlay()
           dispatch(setStatus('disconnected'))
           dispatch(setError(err?.message || 'WebSocket connection failed'))
           if (typeof err?.wsCloseCode === 'number') {
@@ -832,6 +899,7 @@ export default function App() {
       cleanedUp = true
       cleanup?.()
       stopTabRegistrySync?.()
+      stopWsDisconnectSync?.()
       void cleanupPromise
     }
   }, [appStore, dispatch])

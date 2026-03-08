@@ -8,6 +8,7 @@ import { configStore } from '../../../../server/config-store'
 import { makeSessionKey } from '../../../../server/coding-cli/types'
 import { clearRepoRootCache } from '../../../../server/coding-cli/utils'
 import type { SessionMetadataStore } from '../../../../server/session-metadata-store'
+import { codexProvider } from '../../../../server/coding-cli/providers/codex'
 
 vi.mock('../../../../server/config-store', () => ({
   configStore: {
@@ -75,6 +76,14 @@ function createDeferred<T>() {
 }
 
 let tempDir: string
+const codexTaskEventsFixturePath = path.join(
+  process.cwd(),
+  'test',
+  'fixtures',
+  'coding-cli',
+  'codex',
+  'task-events.sanitized.jsonl',
+)
 
 beforeEach(async () => {
   tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-coding-cli-'))
@@ -164,6 +173,46 @@ describe('CodingCliSessionIndexer', () => {
     expect(projectB?.color).toBe('#222222')
     expect(projectB?.sessions[0].provider).toBe('claude')
     expect(projectB?.sessions[0].title).toBe('Title B')
+  })
+
+  it('preserves parsed codex task event snapshots from bounded snippets without extra reads', async () => {
+    const sessionFile = path.join(tempDir, 'sessions', 'rollout-task-events.jsonl')
+    await fsp.mkdir(path.dirname(sessionFile), { recursive: true })
+    const content = await fsp.readFile(codexTaskEventsFixturePath, 'utf8')
+    await fsp.writeFile(sessionFile, content)
+
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      sessionOverrides: {},
+      settings: {
+        codingCli: {
+          enabledProviders: ['codex'],
+          providers: {},
+        },
+      },
+    })
+
+    const provider: CodingCliProvider = {
+      ...codexProvider,
+      homeDir: tempDir,
+      getSessionGlob: () => path.join(tempDir, 'sessions', '**', '*.jsonl'),
+      getSessionRoots: () => [path.join(tempDir, 'sessions')],
+      listSessionFiles: async () => [sessionFile],
+      resolveProjectPath: async (_filePath, meta) => meta.cwd || 'unknown',
+    }
+
+    const indexer = new CodingCliSessionIndexer([provider])
+    await indexer.refresh()
+
+    const session = indexer.getProjects()[0]?.sessions[0]
+    expect(session).toMatchObject({
+      provider: 'codex',
+      sessionId: 'session-activity',
+      codexTaskEvents: {
+        latestTaskStartedAt: Date.parse('2026-03-01T00:00:05.000Z'),
+        latestTaskCompletedAt: Date.parse('2026-03-01T00:00:04.000Z'),
+        latestTurnAbortedAt: Date.parse('2026-03-01T00:00:06.000Z'),
+      },
+    })
   })
 
   it('sorts projects deterministically by newest session updatedAt then projectPath', async () => {
@@ -520,6 +569,151 @@ describe('CodingCliSessionIndexer', () => {
     const session = indexer.getProjects()[0]?.sessions[0]
     expect(session?.title).toBe('Tail Title')
     expect(parseSessionFile).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not retain a synthetic unresolved Codex turn from an oversized head-plus-tail snippet', async () => {
+    vi.mocked(configStore.snapshot).mockResolvedValue({
+      sessionOverrides: {},
+      settings: {
+        codingCli: {
+          enabledProviders: ['codex'],
+          providers: {},
+        },
+      },
+    })
+
+    const fileA = path.join(tempDir, 'codex-oversized.jsonl')
+    const largeBlock = 'x'.repeat(8192)
+    const fillerLines = Array.from({ length: 24 }, (_, i) => JSON.stringify({ filler: `head-${i}-${largeBlock}` }))
+    const middleLines = Array.from({ length: 24 }, (_, i) => JSON.stringify({ filler: `middle-${i}-${largeBlock}` }))
+    const tailLines = Array.from({ length: 24 }, (_, i) => JSON.stringify({ filler: `tail-${i}-${largeBlock}` }))
+    const content = [
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:00.000Z',
+        type: 'session_meta',
+        payload: { id: 'session-oversized', cwd: '/project/codex' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:01.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_started' },
+      }),
+      ...fillerLines,
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:02.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_complete' },
+      }),
+      ...middleLines,
+      ...tailLines,
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'tail summary' }],
+        },
+      }),
+    ].join('\n') + '\n'
+    await fsp.writeFile(fileA, content)
+
+    const provider: CodingCliProvider = {
+      ...codexProvider,
+      homeDir: tempDir,
+      getSessionGlob: () => path.join(tempDir, '**', '*.jsonl'),
+      getSessionRoots: () => [tempDir],
+      listSessionFiles: async () => [fileA],
+      resolveProjectPath: async () => '/project/codex',
+    }
+
+    const indexer = new CodingCliSessionIndexer([provider])
+    await indexer.refresh()
+
+    const session = indexer.getProjects()[0]?.sessions[0]
+    expect(session).toMatchObject({
+      provider: 'codex',
+      sessionId: 'session-oversized',
+      projectPath: '/project/codex',
+    })
+    expect(session?.codexTaskEvents).toBeUndefined()
+  })
+
+  it('preserves a truly unresolved Codex task_started when it appears in the tail snippet of an oversized session', async () => {
+    vi.mocked(configStore.snapshot).mockResolvedValue({
+      sessionOverrides: {},
+      settings: {
+        codingCli: {
+          enabledProviders: ['codex'],
+          providers: {},
+        },
+      },
+    })
+
+    const fileA = path.join(tempDir, 'codex-oversized-tail-start.jsonl')
+    const largeBlock = 'y'.repeat(8192)
+    const headLines = Array.from({ length: 24 }, (_, i) => JSON.stringify({ filler: `head-${i}-${largeBlock}` }))
+    const middleLines = Array.from({ length: 24 }, (_, i) => JSON.stringify({ filler: `middle-${i}-${largeBlock}` }))
+    const tailLines = Array.from({ length: 24 }, (_, i) => JSON.stringify({ filler: `tail-${i}-${largeBlock}` }))
+    const content = [
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:00.000Z',
+        type: 'session_meta',
+        payload: { id: 'session-oversized-tail-start', cwd: '/project/codex' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:01.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_started' },
+      }),
+      ...headLines,
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:02.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_complete' },
+      }),
+      ...middleLines,
+      ...tailLines,
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:03.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_started' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:04.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'still working' }],
+        },
+      }),
+    ].join('\n') + '\n'
+    await fsp.writeFile(fileA, content)
+
+    const provider: CodingCliProvider = {
+      ...codexProvider,
+      homeDir: tempDir,
+      getSessionGlob: () => path.join(tempDir, '**', '*.jsonl'),
+      getSessionRoots: () => [tempDir],
+      listSessionFiles: async () => [fileA],
+      resolveProjectPath: async () => '/project/codex',
+    }
+
+    const indexer = new CodingCliSessionIndexer([provider])
+    await indexer.refresh()
+
+    const session = indexer.getProjects()[0]?.sessions[0]
+    expect(session).toMatchObject({
+      provider: 'codex',
+      sessionId: 'session-oversized-tail-start',
+      projectPath: '/project/codex',
+      codexTaskEvents: {
+        latestTaskStartedAt: Date.parse('2026-03-01T00:00:03.000Z'),
+      },
+    })
+    expect(session?.codexTaskEvents?.latestTaskCompletedAt).toBeUndefined()
+    expect(session?.codexTaskEvents?.latestTurnAbortedAt).toBeUndefined()
   })
 
   it('applies legacy overrides when sessionId differs from filename', async () => {

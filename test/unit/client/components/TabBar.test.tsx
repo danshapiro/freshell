@@ -1,10 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, within } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import TabBar from '@/components/TabBar'
 import tabsReducer, { TabsState } from '@/store/tabsSlice'
 import codingCliReducer, { registerCodingCliRequest } from '@/store/codingCliSlice'
+import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
@@ -50,7 +51,13 @@ vi.mock('lucide-react', () => ({
 // Mock PaneIcon component
 vi.mock('@/components/icons/PaneIcon', () => ({
   default: ({ content, className }: any) => (
-    <svg data-testid="pane-icon" data-content-kind={content?.kind} data-content-mode={content?.mode} className={className} />
+    <svg
+      data-testid="pane-icon"
+      data-content-kind={content?.kind}
+      data-content-mode={content?.mode}
+      data-terminal-id={content?.terminalId}
+      className={className}
+    />
   ),
 }))
 
@@ -110,11 +117,18 @@ function createStore(
     activePane?: Record<string, string>
     paneTitles?: Record<string, Record<string, string>>
   } = {},
+  codexActivityState: CodexActivityState = {
+    byTerminalId: {},
+    lastSnapshotSeq: 0,
+    liveMutationSeqByTerminalId: {},
+    removedMutationSeqByTerminalId: {},
+  },
 ) {
   return configureStore({
     reducer: {
       tabs: tabsReducer,
       codingCli: codingCliReducer,
+      codexActivity: codexActivityReducer,
       panes: panesReducer,
       settings: settingsReducer,
       turnCompletion: turnCompletionReducer,
@@ -130,6 +144,7 @@ function createStore(
         sessions: {},
         pendingRequests: {},
       },
+      codexActivity: codexActivityState,
       panes: {
         layouts: {},
         activePane: {},
@@ -262,6 +277,128 @@ describe('TabBar', () => {
 
       // The + button should NOT be inside the scrollable container
       expect(scrollContainer).toBeNull()
+    })
+
+    it('pulses a tab when any exact terminal id in that tab is busy', () => {
+      const tab = createTab({
+        id: 'tab-codex',
+        title: 'Codex Tab',
+        mode: 'codex',
+        terminalId: 'term-1',
+      })
+      const store = createStore(
+        { tabs: [tab], activeTabId: 'tab-codex' },
+        {},
+        { layouts: { 'tab-codex': createTwoTerminalSplitLayout('term-1', 'term-2') } },
+        {
+          byTerminalId: {
+            'term-1': { terminalId: 'term-1', phase: 'busy', updatedAt: 10 },
+          },
+          lastSnapshotSeq: 0,
+          liveMutationSeqByTerminalId: {},
+          removedMutationSeqByTerminalId: {},
+        },
+      )
+
+      renderWithStore(<TabBar />, store)
+
+      const tabElement = screen.getByLabelText('Codex Tab')
+      const icons = within(tabElement).getAllByTestId('pane-icon')
+      const busyIcon = icons.find((icon) => icon.getAttribute('data-terminal-id') === 'term-1')
+      const idleIcon = icons.find((icon) => icon.getAttribute('data-terminal-id') === 'term-2')
+
+      expect(busyIcon?.getAttribute('class')).toContain('animate-pulse')
+      expect(idleIcon?.getAttribute('class') ?? '').not.toContain('animate-pulse')
+    })
+
+    it('does not pulse a tab when the exact record is only pending', () => {
+      const tab = createTab({
+        id: 'tab-codex',
+        title: 'Codex Pending',
+        mode: 'codex',
+        terminalId: 'term-1',
+      })
+      const store = createStore(
+        { tabs: [tab], activeTabId: 'tab-codex' },
+        {},
+        {
+          layouts: {
+            'tab-codex': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: 'codex',
+                shell: 'system',
+                status: 'running',
+                createRequestId: 'req-pane-1',
+                terminalId: 'term-1',
+              },
+            },
+          },
+        },
+        {
+          byTerminalId: {
+            'term-1': { terminalId: 'term-1', phase: 'pending', updatedAt: 10 },
+          },
+          lastSnapshotSeq: 0,
+          liveMutationSeqByTerminalId: {},
+          removedMutationSeqByTerminalId: {},
+        },
+      )
+
+      renderWithStore(<TabBar />, store)
+
+      const tabElement = screen.getByLabelText('Codex Pending')
+      const pulsingIcons = within(tabElement).getAllByTestId('pane-icon')
+        .filter((icon) => icon.getAttribute('class')?.includes('animate-pulse'))
+
+      expect(pulsingIcons).toHaveLength(0)
+    })
+
+    it('falls back to the exact tab terminal id for a single-pane rehydrate gap', () => {
+      const tab = createTab({
+        id: 'tab-rehydrate',
+        title: 'Rehydrate Gap',
+        mode: 'codex',
+        terminalId: 'term-tab',
+      })
+      const store = createStore(
+        { tabs: [tab], activeTabId: 'tab-rehydrate' },
+        {},
+        {
+          layouts: {
+            'tab-rehydrate': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: 'codex',
+                shell: 'system',
+                status: 'running',
+                createRequestId: 'req-pane-1',
+                terminalId: undefined,
+              },
+            },
+          },
+        },
+        {
+          byTerminalId: {
+            'term-tab': { terminalId: 'term-tab', phase: 'busy', updatedAt: 10 },
+          },
+          lastSnapshotSeq: 0,
+          liveMutationSeqByTerminalId: {},
+          removedMutationSeqByTerminalId: {},
+        },
+      )
+
+      renderWithStore(<TabBar />, store)
+
+      const tabElement = screen.getByLabelText('Rehydrate Gap')
+      const pulsingIcons = within(tabElement).getAllByTestId('pane-icon')
+        .filter((icon) => icon.getAttribute('class')?.includes('animate-pulse'))
+
+      expect(pulsingIcons.length).toBeGreaterThan(0)
     })
   })
 

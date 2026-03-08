@@ -11,6 +11,7 @@ interface PaneHeaderProps {
   metaLabel?: string
   metaTooltip?: string
   needsAttention?: boolean
+  activityPulse?: boolean
   status: TerminalStatus
   isActive: boolean
   onClose: () => void
@@ -32,6 +33,7 @@ export default function PaneHeader({
   metaLabel,
   metaTooltip,
   needsAttention,
+  activityPulse,
   status,
   isActive,
   onClose,
@@ -68,7 +70,14 @@ export default function PaneHeader({
       role="banner"
       aria-label={`Pane: ${title}`}
     >
-      <PaneIcon content={content} className={cn('h-3.5 w-3.5 shrink-0', getTerminalStatusIconClassName(status))} />
+      <PaneIcon
+        content={content}
+        className={cn(
+          'h-3.5 w-3.5 shrink-0',
+          getTerminalStatusIconClassName(status),
+          activityPulse && status === 'running' && 'animate-pulse',
+        )}
+      />
 
       <div className="min-w-0 flex-1">
         {isRenaming ? (

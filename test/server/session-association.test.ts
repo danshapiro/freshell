@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import { TerminalRegistry, modeSupportsResume } from '../../server/terminal-registry'
 import { CodingCliSessionIndexer } from '../../server/coding-cli/session-indexer'
 import { makeSessionKey, type CodingCliSession } from '../../server/coding-cli/types'
+import { SessionAssociationCoordinator } from '../../server/session-association-coordinator'
 import { TerminalMetadataService } from '../../server/terminal-metadata-service'
 
 vi.mock('node-pty', () => ({
@@ -41,6 +42,36 @@ function createMetadataService() {
 function createIndexer(): CodingCliSessionIndexer {
   return new CodingCliSessionIndexer([])
 }
+
+describe('SessionAssociationCoordinator integration', () => {
+  it('keeps Codex association working and emits an association binding event', () => {
+    const registry = new TerminalRegistry()
+    const coordinator = new SessionAssociationCoordinator(registry, 30_000)
+    const onBound = vi.fn()
+
+    const terminal = registry.create({ mode: 'codex', cwd: '/home/user/project' })
+    registry.on('terminal.session.bound', onBound)
+
+    const result = coordinator.associateSingleSession({
+      provider: 'codex',
+      sessionId: 'codex-session-abc-123',
+      projectPath: '/home/user/project',
+      updatedAt: Date.now(),
+      cwd: '/home/user/project',
+    })
+
+    expect(result).toEqual({ associated: true, terminalId: terminal.terminalId })
+    expect(registry.get(terminal.terminalId)?.resumeSessionId).toBe('codex-session-abc-123')
+    expect(onBound).toHaveBeenCalledWith({
+      terminalId: terminal.terminalId,
+      provider: 'codex',
+      sessionId: 'codex-session-abc-123',
+      reason: 'association',
+    })
+
+    registry.shutdown()
+  })
+})
 
 describe('Session-Terminal metadata broadcasts', () => {
   it('broadcasts terminal.session.associated and terminal.meta.updated for Codex association flow', async () => {

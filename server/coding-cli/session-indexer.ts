@@ -7,6 +7,7 @@ import { getPerfConfig, startPerfTimer } from '../perf-logger.js'
 import { configStore, SessionOverride } from '../config-store.js'
 import type { CodingCliProvider } from './provider.js'
 import { makeSessionKey, type CodingCliSession, type CodingCliProviderName, type ProjectGroup } from './types.js'
+import { sanitizeCodexTaskEventsForTruncatedSnippet } from './providers/codex.js'
 import { diffProjects } from '../sessions-sync/diff.js'
 import type { SessionMetadataStore, SessionMetadataEntry } from '../session-metadata-store.js'
 
@@ -48,11 +49,21 @@ function applyOverride(session: CodingCliSession, ov: SessionOverride | undefine
   }
 }
 
-async function readSessionSnippet(filePath: string): Promise<string> {
+type SessionSnippet = {
+  content: string
+  truncated: boolean
+  tailContent?: string
+}
+
+async function readSessionSnippet(filePath: string): Promise<SessionSnippet> {
   try {
     const stat = await fsp.stat(filePath)
     if (stat.size <= SESSION_SNIPPET_BYTES) {
-      return await fsp.readFile(filePath, 'utf-8')
+      return {
+        content: await fsp.readFile(filePath, 'utf-8'),
+        truncated: false,
+        tailContent: undefined,
+      }
     }
 
     const headBytes = Math.floor(SESSION_SNIPPET_BYTES / 2)
@@ -77,14 +88,14 @@ async function readSessionSnippet(filePath: string): Promise<string> {
       const head = headNewline >= 0 ? headRaw.slice(0, headNewline) : headRaw
       const tail = tailNewline >= 0 ? tailRaw.slice(tailNewline + 1) : tailRaw
 
-      if (!head) return tail
-      if (!tail) return head
-      return `${head}\n${tail}`
+      if (!head) return { content: tail, truncated: true, tailContent: tail }
+      if (!tail) return { content: head, truncated: true, tailContent: '' }
+      return { content: `${head}\n${tail}`, truncated: true, tailContent: tail }
     } finally {
       await fd.close()
     }
   } catch {
-    return ''
+    return { content: '', truncated: false, tailContent: undefined }
   }
 }
 
@@ -402,8 +413,17 @@ export class CodingCliSessionIndexer {
       this.sessionKeyToFilePath.delete(makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId))
     }
 
-    const content = await readSessionSnippet(filePath)
-    const meta = await provider.parseSessionFile(content, filePath)
+    const snippet = await readSessionSnippet(filePath)
+    const meta = await provider.parseSessionFile(snippet.content, filePath)
+    if (snippet.truncated && provider.name === 'codex') {
+      const tailMeta = snippet.tailContent
+        ? await provider.parseSessionFile(snippet.tailContent, filePath)
+        : undefined
+      meta.codexTaskEvents = sanitizeCodexTaskEventsForTruncatedSnippet(
+        meta.codexTaskEvents,
+        tailMeta?.codexTaskEvents,
+      )
+    }
     if (!meta.cwd) {
       this.fileCache.set(cacheKey, {
         provider: provider.name,
@@ -433,6 +453,7 @@ export class CodingCliSessionIndexer {
       sourceFile: filePath,
       isSubagent: meta.isSubagent || isSubagentSession(filePath) || undefined,
       isNonInteractive: meta.isNonInteractive || undefined,
+      codexTaskEvents: meta.codexTaskEvents,
     }
 
     this.fileCache.set(cacheKey, {

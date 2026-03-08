@@ -2144,6 +2144,132 @@ describe('TerminalRegistry', () => {
       expect(result).toBe(false)
     })
   })
+
+  describe('session binding events', () => {
+    it('emits terminal.session.unbound with rebind reason before binding a new session', () => {
+      const term = registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+        resumeSessionId: 'codex-session-old',
+      })
+      const onUnbound = vi.fn()
+      const onBound = vi.fn()
+
+      registry.on('terminal.session.unbound', onUnbound)
+      registry.on('terminal.session.bound', onBound)
+
+      const result = registry.bindSession(term.terminalId, 'codex', 'codex-session-new', 'association')
+
+      expect(result).toEqual({
+        ok: true,
+        terminalId: term.terminalId,
+        sessionId: 'codex-session-new',
+      })
+      expect(onUnbound).toHaveBeenCalledWith({
+        terminalId: term.terminalId,
+        provider: 'codex',
+        sessionId: 'codex-session-old',
+        reason: 'rebind',
+      })
+      expect(onBound).toHaveBeenCalledWith({
+        terminalId: term.terminalId,
+        provider: 'codex',
+        sessionId: 'codex-session-new',
+        reason: 'association',
+      })
+    })
+
+    it('emits terminal.session.unbound with stale_owner reason when binding state is stale', () => {
+      const term = registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+        resumeSessionId: 'codex-session-stale',
+      })
+      const onUnbound = vi.fn()
+
+      registry.on('terminal.session.unbound', onUnbound)
+      registry.get(term.terminalId)!.resumeSessionId = undefined
+
+      const found = registry.findRunningTerminalBySession('codex', 'codex-session-stale')
+
+      expect(found).toBeUndefined()
+      expect(onUnbound).toHaveBeenCalledWith({
+        terminalId: term.terminalId,
+        provider: 'codex',
+        sessionId: 'codex-session-stale',
+        reason: 'stale_owner',
+      })
+    })
+
+    it('emits terminal.session.unbound with repair_duplicate reason for legacy duplicate owners', () => {
+      const canonical = registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+        resumeSessionId: 'codex-session-shared',
+      })
+      const duplicate = registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+      })
+      const onUnbound = vi.fn()
+
+      registry.get(duplicate.terminalId)!.resumeSessionId = 'codex-session-shared'
+      registry.on('terminal.session.unbound', onUnbound)
+
+      const repaired = registry.repairLegacySessionOwners('codex', 'codex-session-shared')
+
+      expect(repaired).toEqual({
+        repaired: true,
+        canonicalTerminalId: canonical.terminalId,
+        clearedTerminalIds: [duplicate.terminalId],
+      })
+      expect(onUnbound).toHaveBeenCalledWith({
+        terminalId: duplicate.terminalId,
+        provider: 'codex',
+        sessionId: 'codex-session-shared',
+        reason: 'repair_duplicate',
+      })
+      expect(registry.get(duplicate.terminalId)?.resumeSessionId).toBeUndefined()
+    })
+
+    it('emits terminal.session.bound with resume reason when repair rebinds the canonical owner', () => {
+      const canonical = registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+      })
+      const duplicate = registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+        resumeSessionId: 'codex-session-repaired',
+      })
+      const onBound = vi.fn()
+      const onUnbound = vi.fn()
+
+      registry.get(canonical.terminalId)!.resumeSessionId = 'codex-session-repaired'
+      registry.on('terminal.session.bound', onBound)
+      registry.on('terminal.session.unbound', onUnbound)
+
+      const repaired = registry.repairLegacySessionOwners('codex', 'codex-session-repaired')
+
+      expect(repaired).toEqual({
+        repaired: true,
+        canonicalTerminalId: canonical.terminalId,
+        clearedTerminalIds: [duplicate.terminalId],
+      })
+      expect(onUnbound).toHaveBeenCalledWith({
+        terminalId: duplicate.terminalId,
+        provider: 'codex',
+        sessionId: 'codex-session-repaired',
+        reason: 'repair_duplicate',
+      })
+      expect(onBound).toHaveBeenCalledWith({
+        terminalId: canonical.terminalId,
+        provider: 'codex',
+        sessionId: 'codex-session-repaired',
+        reason: 'resume',
+      })
+    })
+  })
 })
 
 describe('buildSpawnSpec Unix paths', () => {

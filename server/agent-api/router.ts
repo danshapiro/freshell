@@ -24,6 +24,10 @@ type ResolvedResizeTarget = {
   message?: string
 }
 
+type CodexPromptBlocker = {
+  isPromptBlocked: (terminalId: string, at: number) => boolean
+}
+
 const parseRegex = (raw: string) => {
   if (raw.startsWith('/') && raw.lastIndexOf('/') > 0) {
     const last = raw.lastIndexOf('/')
@@ -57,6 +61,7 @@ export function createAgentApiRouter({
   configStore,
   terminalMetadata,
   codingCliIndexer,
+  codexActivityTracker,
 }: {
   layoutStore: any
   registry: any
@@ -64,6 +69,7 @@ export function createAgentApiRouter({
   configStore?: any
   terminalMetadata?: { list: () => Array<{ terminalId: string; provider?: string; sessionId?: string }> }
   codingCliIndexer?: { refresh: () => Promise<void> }
+  codexActivityTracker?: CodexPromptBlocker
 }) {
   const router = Router()
 
@@ -388,6 +394,17 @@ export function createAgentApiRouter({
       }
       if (waitExit && term.status === 'exited') {
         return res.json(ok({ matched: true, reason: 'exit', exitCode: term.exitCode }, 'terminal exited'))
+      }
+      if (
+        waitPrompt
+        && term.mode === 'codex'
+        && codexActivityTracker?.isPromptBlocked(terminalId, Date.now())
+      ) {
+        lastText = text
+        stableSince = Date.now()
+        if (Date.now() - start >= timeoutMs) return res.json(approx({ matched: false }, 'timeout'))
+        await new Promise((resolve) => setTimeout(resolve, 200))
+        continue
       }
       if (waitPrompt && looksLikePrompt(text)) {
         return res.json(ok({ matched: true, reason: 'prompt' }, 'prompt detected'))

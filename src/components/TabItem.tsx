@@ -9,8 +9,8 @@ import type { PaneContent } from '@/store/paneTypes'
 import type { MouseEvent, KeyboardEvent } from 'react'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 
-function StatusDot({ status }: { status: TerminalStatus }) {
-  return <Circle className={cn('h-2 w-2', getTerminalStatusDotClassName(status))} />
+function StatusDot({ status, activityPulse }: { status: TerminalStatus; activityPulse?: boolean }) {
+  return <Circle className={cn('h-2 w-2', getTerminalStatusDotClassName(status), activityPulse && status === 'running' && 'animate-pulse')} />
 }
 
 const MAX_TAB_ICONS = 6
@@ -19,6 +19,8 @@ export interface TabItemProps {
   tab: Tab
   isActive: boolean
   needsAttention: boolean
+  activityPulse?: boolean
+  activityTerminalIds?: string[]
   isDragging: boolean
   isRenaming: boolean
   renameValue: string
@@ -37,6 +39,8 @@ export default function TabItem({
   tab,
   isActive,
   needsAttention,
+  activityPulse,
+  activityTerminalIds = [],
   isDragging,
   isRenaming,
   renameValue,
@@ -60,26 +64,46 @@ export default function TabItem({
 
   const renderIcons = () => {
     if (!iconsOnTabs || !paneContents || paneContents.length === 0) {
-      return <StatusDot status={tab.status} />
+      return <StatusDot status={tab.status} activityPulse={activityPulse && tab.status === 'running'} />
     }
 
     const visible = paneContents.slice(0, MAX_TAB_ICONS)
     const overflow = paneContents.length - MAX_TAB_ICONS
+    const hiddenBusyTerminal = paneContents
+      .slice(MAX_TAB_ICONS)
+      .some((content) => content.kind === 'terminal' && !!content.terminalId && activityTerminalIds.includes(content.terminalId))
+    const runningTerminalContents = visible.filter(
+      (content): content is Extract<PaneContent, { kind: 'terminal' }> =>
+        content.kind === 'terminal' && content.status === 'running',
+    )
+    const pulseUnnamedSingleTerminal = activityPulse
+      && activityTerminalIds.length === 1
+      && runningTerminalContents.length === 1
+      && !runningTerminalContents[0].terminalId
 
     return (
       <span className="flex items-center gap-0.5">
         {visible.map((content, i) => {
           const status: TerminalStatus = content.kind === 'terminal' ? content.status : 'running'
+          const shouldPulse = content.kind === 'terminal'
+            && status === 'running'
+            && (content.terminalId
+              ? activityTerminalIds.includes(content.terminalId)
+              : pulseUnnamedSingleTerminal)
           return (
             <PaneIcon
               key={i}
               content={content}
-              className={cn('h-3 w-3 shrink-0', getTerminalStatusIconClassName(status))}
+              className={cn(
+                'h-3 w-3 shrink-0',
+                getTerminalStatusIconClassName(status),
+                shouldPulse && 'animate-pulse',
+              )}
             />
           )
         })}
         {overflow > 0 && (
-          <span className="text-[10px] text-muted-foreground leading-none">+{overflow}</span>
+          <span className={cn('text-[10px] text-muted-foreground leading-none', hiddenBusyTerminal && 'animate-pulse')}>+{overflow}</span>
         )}
       </span>
     )

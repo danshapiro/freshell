@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
 import TabItem from '@/components/TabItem'
 import type { Tab } from '@/store/types'
+import type { PaneContent } from '@/store/paneTypes'
 
 // Mock lucide-react icons
 vi.mock('lucide-react', () => ({
@@ -10,6 +11,12 @@ vi.mock('lucide-react', () => ({
   ),
   Circle: ({ className }: { className?: string }) => (
     <svg data-testid="circle-icon" className={className} />
+  ),
+}))
+
+vi.mock('@/components/icons/PaneIcon', () => ({
+  default: ({ content, className }: { content: any; className?: string }) => (
+    <svg data-testid="pane-icon" data-terminal-id={content?.terminalId} className={className} />
   ),
 }))
 
@@ -146,6 +153,89 @@ describe('TabItem', () => {
       />
     )
     expect(screen.getByDisplayValue('Editing')).toBeInTheDocument()
+  })
+
+  it('pulses only the exact busy terminal icon in split tabs', () => {
+    const paneContents: PaneContent[] = [
+      {
+        kind: 'terminal',
+        mode: 'codex',
+        shell: 'system',
+        status: 'running',
+        createRequestId: 'req-1',
+        terminalId: 'term-1',
+      },
+      {
+        kind: 'terminal',
+        mode: 'shell',
+        shell: 'system',
+        status: 'running',
+        createRequestId: 'req-2',
+        terminalId: 'term-2',
+      },
+    ]
+
+    render(
+      <TabItem
+        {...defaultProps}
+        paneContents={paneContents}
+        activityPulse={true}
+        activityTerminalIds={['term-1']}
+      />
+    )
+
+    const icons = screen.getAllByTestId('pane-icon')
+    const busyIcon = icons.find((icon) => icon.getAttribute('data-terminal-id') === 'term-1')
+    const idleIcon = icons.find((icon) => icon.getAttribute('data-terminal-id') === 'term-2')
+
+    expect(busyIcon?.getAttribute('class')).toContain('animate-pulse')
+    expect(idleIcon?.getAttribute('class') ?? '').not.toContain('animate-pulse')
+  })
+
+  it('pulses a single unnamed terminal icon during the exact tab-terminal fallback', () => {
+    const paneContents: PaneContent[] = [
+      {
+        kind: 'terminal',
+        mode: 'codex',
+        shell: 'system',
+        status: 'running',
+        createRequestId: 'req-1',
+        terminalId: undefined,
+      },
+    ]
+
+    render(
+      <TabItem
+        {...defaultProps}
+        paneContents={paneContents}
+        activityPulse={true}
+        activityTerminalIds={['term-tab']}
+      />
+    )
+
+    expect(screen.getByTestId('pane-icon').getAttribute('class')).toContain('animate-pulse')
+  })
+
+  it('pulses the overflow indicator when the exact busy terminal is hidden beyond the visible icon cap', () => {
+    const paneContents: PaneContent[] = Array.from({ length: 7 }, (_, index) => ({
+      kind: 'terminal',
+      mode: 'shell',
+      shell: 'system',
+      status: 'running',
+      createRequestId: `req-${index + 1}`,
+      terminalId: `term-${index + 1}`,
+    }))
+
+    render(
+      <TabItem
+        {...defaultProps}
+        paneContents={paneContents}
+        activityPulse={true}
+        activityTerminalIds={['term-7']}
+      />
+    )
+
+    expect(screen.getByText('+1').getAttribute('class')).toContain('animate-pulse')
   })
 
   it('calls onClick when clicked', () => {

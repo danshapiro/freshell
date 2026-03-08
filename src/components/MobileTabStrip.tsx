@@ -2,7 +2,10 @@ import { ChevronLeft, ChevronRight, PanelLeft, Plus } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { getTabDisplayTitle } from '@/lib/tab-title'
+import { getBusyCodexActivityTerminalIdsForTab } from '@/lib/tab-codex-activity'
 import { triggerHapticFeedback } from '@/lib/mobile-haptics'
+
+const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 
 interface MobileTabStripProps {
   onOpenSwitcher?: () => void
@@ -15,6 +18,7 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
   const tabs = useAppSelector((s) => s.tabs.tabs)
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
   const paneLayouts = useAppSelector((s) => s.panes.layouts)
+  const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
 
   const activeIndex = tabs.findIndex((t) => t.id === activeTabId)
   const activeTab = activeIndex >= 0 ? tabs[activeIndex] : null
@@ -22,6 +26,9 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
   const displayTitle = activeTab
     ? getTabDisplayTitle(activeTab, paneLayouts[activeTab.id])
     : ''
+  const isActiveBusy = activeTab
+    ? getBusyCodexActivityTerminalIdsForTab(activeTab, paneLayouts, codexActivityByTerminalId).length > 0
+    : false
 
   const isFirst = activeIndex <= 0
   const isLast = activeIndex >= tabs.length - 1
@@ -61,8 +68,18 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
         onClick={() => { triggerHapticFeedback(); onOpenSwitcher?.() }}
         aria-label="Open tab switcher"
       >
-        <span className="text-sm font-medium truncate max-w-[200px]">
-          {displayTitle || 'Untitled'}
+        <span className="flex min-w-0 items-center gap-2">
+          <span className="text-sm font-medium truncate max-w-[160px]">
+            {displayTitle || 'Untitled'}
+          </span>
+          {isActiveBusy && (
+            <span
+              className="inline-flex shrink-0 items-center rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-700 animate-pulse"
+              data-testid="mobile-tab-busy-badge"
+            >
+              Busy
+            </span>
+          )}
         </span>
         <span className="text-xs text-muted-foreground">
           {activeIndex + 1} / {tabs.length}

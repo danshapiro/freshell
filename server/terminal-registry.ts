@@ -11,9 +11,16 @@ import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-l
 import type { AppSettings } from './config-store.js'
 import { convertWindowsPathToWslPath, isReachableDirectorySync } from './path-utils.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
-import type { CodingCliProviderName } from './coding-cli/types.js'
+import { makeSessionKey, parseSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
 import { SessionBindingAuthority, type BindResult } from './session-binding-authority.js'
-import type { TerminalOutputRawEvent } from './terminal-stream/registry-events.js'
+import type {
+  SessionBindingReason,
+  SessionUnbindReason,
+  TerminalInputRawEvent,
+  TerminalOutputRawEvent,
+  TerminalSessionBoundEvent,
+  TerminalSessionUnboundEvent,
+} from './terminal-stream/registry-events.js'
 
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
 const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 64 * 1024)
@@ -1136,14 +1143,14 @@ export class TerminalRegistry extends EventEmitter {
       record.clients.clear()
       record.suppressedOutputClients.clear()
       record.pendingSnapshotClients.clear()
-      this.releaseBinding(terminalId)
+      this.releaseBinding(terminalId, 'exit')
       this.emit('terminal.exit', { terminalId, exitCode: e.exitCode })
       this.reapExitedTerminals()
     })
 
     this.terminals.set(terminalId, record)
     if (modeSupportsResume(opts.mode) && normalizedResume) {
-      const bound = this.bindSession(terminalId, opts.mode as CodingCliProviderName, normalizedResume)
+      const bound = this.bindSession(terminalId, opts.mode as CodingCliProviderName, normalizedResume, 'resume')
       if (!bound.ok) {
         logger.warn(
           { terminalId, mode: opts.mode, sessionId: normalizedResume, reason: bound.reason },
@@ -1202,6 +1209,11 @@ export class TerminalRegistry extends EventEmitter {
       }
     }
     term.pty.write(data)
+    this.emit('terminal.input.raw', {
+      terminalId,
+      data,
+      at: now,
+    } satisfies TerminalInputRawEvent)
     return true
   }
 
@@ -1239,7 +1251,7 @@ export class TerminalRegistry extends EventEmitter {
     term.clients.clear()
     term.suppressedOutputClients.clear()
     term.pendingSnapshotClients.clear()
-    this.releaseBinding(terminalId)
+    this.releaseBinding(terminalId, 'exit')
     this.emit('terminal.exit', { terminalId, exitCode: term.exitCode })
     this.reapExitedTerminals()
     return true
@@ -1299,10 +1311,30 @@ export class TerminalRegistry extends EventEmitter {
     return ids
   }
 
-  private releaseBinding(terminalId: string): void {
-    this.bindingAuthority.unbindTerminal(terminalId)
+  private releaseBinding(
+    terminalId: string,
+    reason: SessionUnbindReason,
+    explicit?: { provider?: CodingCliProviderName; sessionId?: string },
+  ): void {
     const rec = this.terminals.get(terminalId)
+    const existingBinding = this.bindingAuthority.sessionForTerminal(terminalId)
+    const existing = existingBinding ? parseSessionKey(existingBinding) : undefined
+    const provider = explicit?.provider
+      ?? existing?.provider
+      ?? (rec && modeSupportsResume(rec.mode) ? rec.mode as CodingCliProviderName : undefined)
+    const sessionId = explicit?.sessionId
+      ?? existing?.sessionId
+      ?? rec?.resumeSessionId
+
+    this.bindingAuthority.unbindTerminal(terminalId)
     if (rec) rec.resumeSessionId = undefined
+    if (!provider || !sessionId) return
+    this.emit('terminal.session.unbound', {
+      terminalId,
+      provider,
+      sessionId,
+      reason,
+    } satisfies TerminalSessionUnboundEvent)
   }
 
   private isMobileClient(client: WebSocket): boolean {
@@ -1511,7 +1543,7 @@ export class TerminalRegistry extends EventEmitter {
         if (rec && rec.mode === mode && rec.status === 'running' && rec.resumeSessionId === sessionId) {
           return rec
         }
-        this.bindingAuthority.unbindTerminal(owner)
+        this.releaseBinding(owner, 'stale_owner', { provider: mode as CodingCliProviderName, sessionId })
       }
     }
     for (const term of this.terminals.values()) {
@@ -1531,7 +1563,7 @@ export class TerminalRegistry extends EventEmitter {
       if (rec && rec.mode === mode && rec.status === 'running' && rec.resumeSessionId === sessionId) {
         return rec
       }
-      this.bindingAuthority.unbindTerminal(owner)
+      this.releaseBinding(owner, 'stale_owner', { provider: mode as CodingCliProviderName, sessionId })
     }
 
     const matches = Array.from(this.terminals.values())
@@ -1556,39 +1588,49 @@ export class TerminalRegistry extends EventEmitter {
     const provider = mode as CodingCliProviderName
     const canonical = matches[0]
     const owner = this.bindingAuthority.ownerForSession(provider, sessionId)
-    if (owner && owner !== canonical.terminalId) {
-      this.bindingAuthority.clearSessionOwner(provider, sessionId)
-    }
-
-    const bound = this.bindingAuthority.bind({
-      provider,
-      sessionId,
-      terminalId: canonical.terminalId,
-    })
-    if (bound.ok) {
-      canonical.resumeSessionId = sessionId
-    } else {
-      logger.warn(
-        {
-          provider,
-          sessionId,
-          canonicalTerminalId: canonical.terminalId,
-          reason: bound.reason,
-          ...(bound.reason === 'session_already_owned' ? { ownerTerminalId: bound.owner } : {}),
-          ...(bound.reason === 'terminal_already_bound' ? { existingBinding: bound.existing } : {}),
-        },
-        'session_bind_repair_failed',
-      )
-    }
-
+    const canonicalKey = makeSessionKey(provider, sessionId)
+    const canonicalBinding = this.bindingAuthority.sessionForTerminal(canonical.terminalId)
+    const needsCanonicalBind = owner !== canonical.terminalId || canonicalBinding !== canonicalKey
     const clearedTerminalIds: string[] = []
+    const clearedTerminals = new Set<string>()
+
+    if (owner && owner !== canonical.terminalId) {
+      const ownerIsDuplicate = matches.some((term) => term.terminalId === owner)
+      this.releaseBinding(owner, ownerIsDuplicate ? 'repair_duplicate' : 'stale_owner', { provider, sessionId })
+      if (ownerIsDuplicate) {
+        clearedTerminalIds.push(owner)
+        clearedTerminals.add(owner)
+      }
+    }
+
+    let canonicalBound = true
+    if (needsCanonicalBind) {
+      const bound = this.bindSession(canonical.terminalId, provider, sessionId, 'resume')
+      if (bound.ok) {
+        canonical.resumeSessionId = sessionId
+      } else {
+        canonicalBound = false
+        logger.warn(
+          {
+            provider,
+            sessionId,
+            canonicalTerminalId: canonical.terminalId,
+            reason: bound.reason,
+            ...(bound.reason === 'session_already_owned' ? { ownerTerminalId: bound.owner } : {}),
+            ...(bound.reason === 'terminal_already_bound' ? { existingBinding: bound.existing } : {}),
+          },
+          'session_bind_repair_failed',
+        )
+      }
+    }
+
     for (const duplicate of matches.slice(1)) {
-      this.bindingAuthority.unbindTerminal(duplicate.terminalId)
-      duplicate.resumeSessionId = undefined
+      if (clearedTerminals.has(duplicate.terminalId)) continue
+      this.releaseBinding(duplicate.terminalId, 'repair_duplicate', { provider, sessionId })
       clearedTerminalIds.push(duplicate.terminalId)
     }
 
-    const repaired = clearedTerminalIds.length > 0 || bound.ok
+    const repaired = clearedTerminalIds.length > 0 || (needsCanonicalBind && canonicalBound)
     if (repaired && (clearedTerminalIds.length > 0 || owner !== canonical.terminalId)) {
       logger.info(
         {
@@ -1653,13 +1695,40 @@ export class TerminalRegistry extends EventEmitter {
    * Set the resumeSessionId on a terminal (one-time association).
    * Returns false if terminal not found.
    */
-  bindSession(terminalId: string, provider: CodingCliProviderName, sessionId: string): BindSessionResult {
+  bindSession(
+    terminalId: string,
+    provider: CodingCliProviderName,
+    sessionId: string,
+    reason: SessionBindingReason = 'association',
+  ): BindSessionResult {
     const term = this.terminals.get(terminalId)
     if (!term) return { ok: false, reason: 'terminal_missing' }
     if (term.mode !== provider) return { ok: false, reason: 'mode_mismatch' }
 
     const normalized = normalizeResumeSessionId(provider, sessionId)
     if (!normalized) return { ok: false, reason: 'invalid_session_id' }
+
+    const currentBinding = this.bindingAuthority.sessionForTerminal(terminalId)
+    const currentKey = currentBinding ?? (term.resumeSessionId ? makeSessionKey(provider, term.resumeSessionId) : undefined)
+    const nextKey = makeSessionKey(provider, normalized)
+    const owner = this.bindingAuthority.ownerForSession(provider, normalized)
+    if (owner && owner !== terminalId) {
+      logger.warn(
+        {
+          provider,
+          sessionId: normalized,
+          ownerTerminalId: owner,
+          attemptedTerminalId: terminalId,
+        },
+        'session_bind_conflict',
+      )
+      return { ok: false, reason: 'session_already_owned', owner }
+    }
+
+    if (currentKey && currentKey !== nextKey) {
+      const current = parseSessionKey(currentKey)
+      this.releaseBinding(terminalId, 'rebind', current)
+    }
 
     const bound = this.bindingAuthority.bind({ provider, sessionId: normalized, terminalId })
     if (!bound.ok) {
@@ -1688,6 +1757,12 @@ export class TerminalRegistry extends EventEmitter {
     }
 
     term.resumeSessionId = normalized
+    this.emit('terminal.session.bound', {
+      terminalId,
+      provider,
+      sessionId: normalized,
+      reason,
+    } satisfies TerminalSessionBoundEvent)
     return { ok: true, terminalId, sessionId: normalized }
   }
 
@@ -1695,7 +1770,7 @@ export class TerminalRegistry extends EventEmitter {
     const term = this.terminals.get(terminalId)
     if (!term) return false
     if (term.mode === 'shell') return false
-    return this.bindSession(terminalId, term.mode as CodingCliProviderName, sessionId).ok
+    return this.bindSession(terminalId, term.mode as CodingCliProviderName, sessionId, 'association').ok
   }
 
   /**

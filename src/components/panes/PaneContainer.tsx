@@ -19,6 +19,7 @@ import { getTerminalActions } from '@/lib/pane-action-registry'
 import { cn } from '@/lib/utils'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'
+import { resolveExactCodexActivity } from '@/lib/codex-activity-resolver'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { getTabDirectoryPreference } from '@/lib/tab-directory-preference'
 import {
@@ -45,6 +46,7 @@ const EMPTY_PANE_TITLES: Record<string, string> = {}
 const EMPTY_TERMINAL_META_BY_ID: Record<string, TerminalMetaRecord> = {}
 const EMPTY_PROJECTS: ProjectGroup[] = []
 const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
+const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_ATTENTION_BY_PANE: Record<string, boolean> = {}
 const EMPTY_PENDING_CREATES: Record<string, string> = {}
 
@@ -161,6 +163,9 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   )
   const indexedProjects = useAppSelector((s) => s.sessions?.projects ?? EMPTY_PROJECTS)
   const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
+  const codexActivityByTerminalId = useAppSelector(
+    (s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID
+  )
   const zoomedPaneId = useAppSelector((s) => s.panes.zoomedPane?.[tabId])
   const attentionByPane = useAppSelector(
     (s) => s.turnCompletion?.attentionByPane ?? EMPTY_ATTENTION_BY_PANE
@@ -414,6 +419,18 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       paneRuntimeMeta
         ? formatPaneRuntimeTooltip(paneRuntimeMeta)
         : undefined
+    const paneActivityRecord =
+      node.content.kind === 'terminal'
+        ? resolveExactCodexActivity(codexActivityByTerminalId, {
+          terminalId: node.content.terminalId,
+          tabTerminalId,
+          isOnlyPane,
+        })
+        : undefined
+    const paneActivityPulse =
+      node.content.kind === 'terminal'
+      && node.content.status === 'running'
+      && paneActivityRecord?.phase === 'busy'
 
     const needsAttention = tabAttentionStyle !== 'none' && !!attentionByPane[node.id]
 
@@ -428,6 +445,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         content={node.content}
         metaLabel={paneMetaLabel}
         metaTooltip={paneMetaTooltip}
+        activityPulse={paneActivityPulse}
         needsAttention={needsAttention}
         onClose={() => handleClose(node.id, node.content)}
         onFocus={() => handleFocus(node.id)}

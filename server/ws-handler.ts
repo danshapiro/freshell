@@ -15,7 +15,7 @@ import type { SessionRepairService } from './session-scanner/service.js'
 import type { SessionScanResult, SessionRepairResult } from './session-scanner/types.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
 import type { SdkBridge } from './sdk-bridge.js'
-import type { SdkServerMessage } from '../shared/ws-protocol.js'
+import type { CodexActivityRecord, SdkServerMessage } from '../shared/ws-protocol.js'
 import type { ExtensionManager } from './extension-manager.js'
 import { TerminalStreamBroker } from './terminal-stream/broker.js'
 import { chunkProjects } from './ws-chunking.js'
@@ -32,6 +32,9 @@ import {
   TerminalMetaRecordSchema,
   TerminalMetaListResponseSchema,
   TerminalMetaUpdatedSchema,
+  CodexActivityListResponseSchema,
+  CodexActivityListSchema,
+  CodexActivityUpdatedSchema,
   HelloSchema,
   PingSchema,
   TerminalCreateSchema,
@@ -262,6 +265,7 @@ const ClientMessageSchema = z.discriminatedUnion('type', [
   TerminalKillSchema,
   TerminalListSchema,
   TerminalMetaListSchema,
+  CodexActivityListSchema,
   TabsSyncPushSchema,
   TabsSyncQuerySchema,
   CodingCliCreateSchema,
@@ -337,6 +341,7 @@ export class WsHandler {
   private sessionRepairService?: SessionRepairService
   private handshakeSnapshotProvider?: HandshakeSnapshotProvider
   private terminalMetaListProvider?: () => TerminalMeta[]
+  private codexActivityListProvider?: () => CodexActivityRecord[]
   private tabsRegistryStore?: TabsRegistryStore
   private layoutStore?: LayoutStore
   private extensionManager?: ExtensionManager
@@ -367,12 +372,14 @@ export class WsHandler {
     serverInstanceId?: string,
     layoutStore?: LayoutStore,
     extensionManager?: ExtensionManager,
+    codexActivityListProvider?: () => CodexActivityRecord[],
   ) {
     this.config = readWsHandlerConfig()
     this.authToken = getRequiredAuthToken()
     this.sessionRepairService = sessionRepairService
     this.handshakeSnapshotProvider = handshakeSnapshotProvider
     this.terminalMetaListProvider = terminalMetaListProvider
+    this.codexActivityListProvider = codexActivityListProvider
     this.tabsRegistryStore = tabsRegistryStore
     this.layoutStore = layoutStore
     this.extensionManager = extensionManager
@@ -1609,6 +1616,26 @@ export class WsHandler {
         return
       }
 
+      case 'codex.activity.list': {
+        const terminals = this.codexActivityListProvider ? this.codexActivityListProvider() : []
+        const response = CodexActivityListResponseSchema.safeParse({
+          type: 'codex.activity.list.response',
+          requestId: m.requestId,
+          terminals,
+        })
+        if (!response.success) {
+          log.warn({ issues: response.error.issues }, 'Invalid codex.activity.list.response payload')
+          this.sendError(ws, {
+            code: 'INTERNAL_ERROR',
+            message: 'Codex activity unavailable',
+            requestId: m.requestId,
+          })
+          return
+        }
+        this.send(ws, response.data)
+        return
+      }
+
       case 'tabs.sync.push': {
         if (!this.tabsRegistryStore) {
           this.sendError(ws, {
@@ -2117,6 +2144,15 @@ export class WsHandler {
     }
   }
 
+  broadcastAuthenticated(msg: unknown) {
+    for (const ws of this.connections) {
+      if (ws.readyState !== WebSocket.OPEN) continue
+      const state = this.clientStates.get(ws)
+      if (!state?.authenticated) continue
+      this.send(ws, msg)
+    }
+  }
+
   broadcastUiCommand(command: { command: string; payload?: any }) {
     this.broadcast({ type: 'ui.command', ...command })
   }
@@ -2177,6 +2213,21 @@ export class WsHandler {
     }
 
     this.broadcast(parsed.data)
+  }
+
+  broadcastCodexActivityUpdated(msg: { upsert?: CodexActivityRecord[]; remove?: string[] }): void {
+    const parsed = CodexActivityUpdatedSchema.safeParse({
+      type: 'codex.activity.updated',
+      upsert: msg.upsert || [],
+      remove: msg.remove || [],
+    })
+
+    if (!parsed.success) {
+      log.warn({ issues: parsed.error.issues }, 'Invalid codex.activity.updated payload')
+      return
+    }
+
+    this.broadcastAuthenticated(parsed.data)
   }
 
   /**

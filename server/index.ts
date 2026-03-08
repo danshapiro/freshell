@@ -22,6 +22,7 @@ import { WsHandler } from './ws-handler.js'
 import { SessionsSyncService } from './sessions-sync/service.js'
 import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
 import { CodingCliSessionManager } from './coding-cli/session-manager.js'
+import { wireCodexActivityTracker } from './coding-cli/codex-activity-wiring.js'
 import { claudeProvider } from './coding-cli/providers/claude.js'
 import { codexProvider } from './coding-cli/providers/codex.js'
 import { type CodingCliProviderName, type CodingCliSession } from './coding-cli/types.js'
@@ -141,6 +142,7 @@ async function main() {
   const registry = new TerminalRegistry(settings)
   const terminalMetadata = new TerminalMetadataService()
   const layoutStore = new LayoutStore()
+  const codexActivity = wireCodexActivityTracker({ registry, codingCliIndexer })
 
   const sessionRepairService = getSessionRepairService()
   const serverInstanceId = await loadOrCreateServerInstanceId()
@@ -177,6 +179,7 @@ async function main() {
     serverInstanceId,
     layoutStore,
     extensionManager,
+    () => codexActivity.tracker.list(),
   )
   const port = Number(process.env.PORT || 3001)
   const isDev = process.env.NODE_ENV !== 'production'
@@ -190,6 +193,7 @@ async function main() {
     configStore,
     terminalMetadata,
     codingCliIndexer,
+    codexActivityTracker: codexActivity.tracker,
   }))
 
   // --- Extension lifecycle broadcasts ---
@@ -208,6 +212,10 @@ async function main() {
 
   const sessionsSync = new SessionsSyncService(wsHandler)
   const associationCoordinator = new SessionAssociationCoordinator(registry, ASSOCIATION_MAX_AGE_MS)
+
+  codexActivity.tracker.on('changed', (payload) => {
+    wsHandler.broadcastCodexActivityUpdated(payload)
+  })
 
   const broadcastTerminalMetaUpserts = (upsert: ReturnType<TerminalMetadataService['list']>) => {
     if (upsert.length === 0) return
@@ -624,6 +632,9 @@ async function main() {
 
     // 8. Stop session indexer
     codingCliIndexer.stop()
+
+    // 8b. Stop Codex activity tracker listeners and sweep timer
+    codexActivity.dispose()
 
     // 9. Stop session repair service
     await sessionRepairService.stop()

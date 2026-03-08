@@ -12,6 +12,7 @@ import tabRegistryReducer from '@/store/tabRegistrySlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer } from '@/store/networkSlice'
+import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
 
 // Mock heavy child components to avoid xterm/canvas issues
 vi.mock('@/components/TabContent', () => ({
@@ -42,12 +43,14 @@ const wsMocks = vi.hoisted(() => ({
   connect: vi.fn(),
   onMessage: vi.fn(),
   onReconnect: vi.fn().mockReturnValue(() => {}),
+  onDisconnect: vi.fn().mockReturnValue(() => {}),
   setHelloExtensionProvider: vi.fn(),
   isReady: false,
   serverInstanceId: undefined as string | undefined,
 }))
 
 let messageHandler: ((msg: any) => void) | null = null
+let disconnectHandler: (() => void) | null = null
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -55,6 +58,7 @@ vi.mock('@/lib/ws-client', () => ({
     connect: wsMocks.connect,
     onMessage: wsMocks.onMessage,
     onReconnect: wsMocks.onReconnect,
+    onDisconnect: wsMocks.onDisconnect,
     setHelloExtensionProvider: wsMocks.setHelloExtensionProvider,
     get isReady() {
       return wsMocks.isReady
@@ -88,7 +92,14 @@ function createStore(options?: {
     renameRequestPaneId?: string | null
     zoomedPane?: Record<string, string>
   }
+  codexActivity?: Partial<CodexActivityState>
 }) {
+  const defaultCodexActivity: CodexActivityState = {
+    byTerminalId: {},
+    lastSnapshotSeq: 0,
+    liveMutationSeqByTerminalId: {},
+    removedMutationSeqByTerminalId: {},
+  }
   const tabs = options?.tabs ?? [{ id: 'tab-1', mode: 'shell' }]
   const panes = {
     layouts: options?.panes?.layouts ?? {},
@@ -107,6 +118,7 @@ function createStore(options?: {
       sessions: sessionsReducer,
       panes: panesReducer,
       network: networkReducer,
+      codexActivity: codexActivityReducer,
       tabRegistry: tabRegistryReducer,
       terminalMeta: terminalMetaReducer,
       extensions: extensionsReducer,
@@ -127,6 +139,10 @@ function createStore(options?: {
       sessions: { projects: [], expandedProjects: new Set<string>(), wsSnapshotReceived: false, isLoading: false, error: null },
       panes,
       network: { status: null, loading: false, configuring: false, error: null },
+      codexActivity: {
+        ...defaultCodexActivity,
+        ...(options?.codexActivity ?? {}),
+      },
       tabRegistry: {
         deviceId: 'device-test',
         deviceLabel: 'device-test',
@@ -149,9 +165,14 @@ describe('App WS bootstrap recovery', () => {
     cleanup()
     vi.resetAllMocks()
     wsMocks.onReconnect.mockReturnValue(() => {})
+    wsMocks.onDisconnect.mockImplementation((cb: () => void) => {
+      disconnectHandler = cb
+      return () => { disconnectHandler = null }
+    })
     wsMocks.isReady = false
     wsMocks.serverInstanceId = undefined
     messageHandler = null
+    disconnectHandler = null
 
     wsMocks.onMessage.mockImplementation((cb: (msg: any) => void) => {
       messageHandler = cb
@@ -174,7 +195,20 @@ describe('App WS bootstrap recovery', () => {
   })
 
   it('marks connection as auth-required and skips websocket connect when bootstrap settings request returns 401', async () => {
-    const store = createStore()
+    const store = createStore({
+      codexActivity: {
+        byTerminalId: {
+          'term-stale': {
+            terminalId: 'term-stale',
+            sessionId: 'session-stale',
+            phase: 'busy',
+            updatedAt: 10,
+          },
+        },
+        lastSnapshotSeq: 3,
+        liveMutationSeqByTerminalId: { 'term-stale': 3 },
+      },
+    })
     apiGet.mockImplementation((url: string) => {
       if (url === '/api/settings') {
         return Promise.reject({ status: 401, message: 'Unauthorized' })
@@ -191,9 +225,108 @@ describe('App WS bootstrap recovery', () => {
     await waitFor(() => {
       expect(store.getState().connection.status).toBe('disconnected')
       expect(store.getState().connection.lastError).toBe('Authentication failed')
+      expect(store.getState().codexActivity.byTerminalId).toEqual({})
     })
 
     expect(wsMocks.connect).not.toHaveBeenCalled()
+  })
+
+  it('clears stale codex activity immediately when bootstrap attaches to an already-ready socket', async () => {
+    const store = createStore({
+      codexActivity: {
+        byTerminalId: {
+          'term-stale': {
+            terminalId: 'term-stale',
+            sessionId: 'session-stale',
+            phase: 'busy',
+            updatedAt: 10,
+          },
+        },
+        lastSnapshotSeq: 4,
+        liveMutationSeqByTerminalId: { 'term-stale': 4 },
+      },
+    })
+    wsMocks.isReady = true
+    wsMocks.serverInstanceId = 'srv-preconnected-stale'
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(store.getState().connection.status).toBe('ready')
+      expect(store.getState().connection.serverInstanceId).toBe('srv-preconnected-stale')
+      expect(store.getState().codexActivity.byTerminalId).toEqual({})
+    })
+
+    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))
+  })
+
+  it('mounts with legacy ws clients that do not implement onDisconnect', async () => {
+    const store = createStore()
+    const originalOnDisconnect = wsMocks.onDisconnect
+    ;(wsMocks as { onDisconnect?: unknown }).onDisconnect = undefined
+    wsMocks.isReady = true
+    wsMocks.serverInstanceId = 'srv-legacy-ws'
+
+    try {
+      render(
+        <Provider store={store}>
+          <App />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(store.getState().connection.status).toBe('ready')
+        expect(store.getState().connection.serverInstanceId).toBe('srv-legacy-ws')
+      })
+    } finally {
+      wsMocks.onDisconnect = originalOnDisconnect
+    }
+  })
+
+  it('clears codex activity promptly when the websocket disconnects after readiness', async () => {
+    const store = createStore()
+    wsMocks.isReady = true
+    wsMocks.serverInstanceId = 'srv-preconnected-disconnect'
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(store.getState().connection.status).toBe('ready')
+    })
+
+    act(() => {
+      messageHandler?.({
+        type: 'codex.activity.updated',
+        upsert: [{
+          terminalId: 'term-live',
+          sessionId: 'session-live',
+          phase: 'busy',
+          updatedAt: 20,
+        }],
+        remove: [],
+      })
+    })
+
+    await waitFor(() => {
+      expect(store.getState().codexActivity.byTerminalId['term-live']?.phase).toBe('busy')
+    })
+
+    act(() => {
+      disconnectHandler?.()
+    })
+
+    await waitFor(() => {
+      expect(store.getState().connection.status).toBe('disconnected')
+      expect(store.getState().codexActivity.byTerminalId).toEqual({})
+    })
   })
 
   it('keeps the WS message handler registered after an initial connect failure, so a later ready can recover state', async () => {
@@ -227,6 +360,9 @@ describe('App WS bootstrap recovery', () => {
       expect(store.getState().connection.lastError).toBeUndefined()
       expect(store.getState().connection.serverInstanceId).toBe('srv-test')
     })
+
+    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
+    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))
   })
 
   it('dispatches wsCloseCode to lastErrorCode in Redux when connect rejects with close code', async () => {
@@ -411,6 +547,7 @@ describe('App WS bootstrap recovery', () => {
 
     expect(wsMocks.connect).not.toHaveBeenCalled()
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
+    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))
     expect(store.getState().sessions.projects.map((p: any) => p.projectPath)).toEqual(['/p1'])
 
     act(() => {
@@ -501,5 +638,69 @@ describe('App WS bootstrap recovery', () => {
     })
     expect(wsMocks.connect).not.toHaveBeenCalled()
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
+    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))
+  })
+
+  it('ignores stale codex activity list responses that arrive after a newer snapshot', async () => {
+    const store = createStore()
+    wsMocks.isReady = true
+    wsMocks.serverInstanceId = 'srv-preconnected-race'
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    expect(messageHandler).toBeTypeOf('function')
+    act(() => {
+      messageHandler?.({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-preconnected-race',
+      })
+    })
+
+    await waitFor(() => {
+      const codexRequests = wsMocks.send.mock.calls
+        .map(([payload]) => payload)
+        .filter((payload) => payload?.type === 'codex.activity.list')
+      expect(codexRequests.length).toBeGreaterThanOrEqual(2)
+    })
+
+    const codexRequests = wsMocks.send.mock.calls
+      .map(([payload]) => payload)
+      .filter((payload) => payload?.type === 'codex.activity.list')
+    const olderRequestId = codexRequests[0]?.requestId as string
+    const newerRequestId = codexRequests.at(-1)?.requestId as string
+
+    act(() => {
+      messageHandler?.({
+        type: 'codex.activity.list.response',
+        requestId: newerRequestId,
+        terminals: [
+          {
+            terminalId: 'term-1',
+            sessionId: 'session-1',
+            phase: 'idle',
+            updatedAt: 200,
+          },
+        ],
+      })
+      messageHandler?.({
+        type: 'codex.activity.list.response',
+        requestId: olderRequestId,
+        terminals: [
+          {
+            terminalId: 'term-1',
+            sessionId: 'session-1',
+            phase: 'busy',
+            updatedAt: 100,
+          },
+        ],
+      })
+    })
+
+    expect(store.getState().codexActivity.byTerminalId['term-1']?.phase).toBe('idle')
   })
 })

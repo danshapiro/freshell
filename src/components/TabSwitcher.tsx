@@ -2,9 +2,12 @@ import { Plus, X } from 'lucide-react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, setActiveTab } from '@/store/tabsSlice'
 import { getTabDisplayTitle } from '@/lib/tab-title'
+import { getBusyCodexActivityTerminalIdsForTab } from '@/lib/tab-codex-activity'
 import { useCallback, useMemo } from 'react'
 import type { Tab, TerminalStatus } from '@/store/types'
 import { triggerHapticFeedback } from '@/lib/mobile-haptics'
+
+const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 
 interface TabSwitcherProps {
   onClose: () => void
@@ -30,6 +33,7 @@ export function TabSwitcher({ onClose }: TabSwitcherProps) {
   const tabs = useAppSelector((s) => s.tabs.tabs) as Tab[]
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
   const paneLayouts = useAppSelector((s) => s.panes.layouts)
+  const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
 
   const getDisplayTitle = useCallback(
     (tab: Tab): string => getTabDisplayTitle(tab, paneLayouts[tab.id]),
@@ -77,6 +81,7 @@ export function TabSwitcher({ onClose }: TabSwitcherProps) {
           {tabs.map((tab) => {
             const isActive = tab.id === activeTabId
             const title = getDisplayTitle(tab)
+            const isBusy = getBusyCodexActivityTerminalIdsForTab(tab, paneLayouts, codexActivityByTerminalId).length > 0
             return (
               <button
                 key={tab.id}
@@ -88,9 +93,19 @@ export function TabSwitcher({ onClose }: TabSwitcherProps) {
                 onClick={() => handleCardClick(tab.id)}
                 aria-label={`Switch to ${title}`}
               >
-                <span className="text-sm font-medium truncate w-full">
-                  {title}
-                </span>
+                <div className="flex w-full items-start justify-between gap-2">
+                  <span className="text-sm font-medium truncate flex-1">
+                    {title}
+                  </span>
+                  {isBusy && (
+                    <span
+                      className="inline-flex shrink-0 items-center rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-700 animate-pulse"
+                      data-testid={`tab-switcher-busy-badge-${tab.id}`}
+                    >
+                      Busy
+                    </span>
+                  )}
+                </div>
                 <span
                   className={`text-xs ${
                     tab.status === 'exited' || tab.status === 'error'

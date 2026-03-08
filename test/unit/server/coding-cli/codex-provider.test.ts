@@ -1,7 +1,22 @@
 import { describe, it, expect, afterEach } from 'vitest'
 import path from 'path'
 import os from 'os'
-import { codexProvider, defaultCodexHome, parseCodexSessionContent } from '../../../../server/coding-cli/providers/codex'
+import fsp from 'fs/promises'
+import {
+  codexProvider,
+  defaultCodexHome,
+  parseCodexSessionContent,
+  sanitizeCodexTaskEventsForTruncatedSnippet,
+} from '../../../../server/coding-cli/providers/codex'
+
+const codexTaskEventsFixturePath = path.join(
+  process.cwd(),
+  'test',
+  'fixtures',
+  'coding-cli',
+  'codex',
+  'task-events.sanitized.jsonl',
+)
 
 describe('codex-provider', () => {
   describe('defaultCodexHome()', () => {
@@ -51,6 +66,88 @@ describe('codex-provider', () => {
     expect(meta.title).toBe('Build the feature')
     expect(meta.firstUserMessage).toBe('Build the feature')
     expect(meta.messageCount).toBe(2)
+  })
+
+  it('parses fixture-backed codex task event timestamps', async () => {
+    const content = await fsp.readFile(codexTaskEventsFixturePath, 'utf8')
+
+    const meta = parseCodexSessionContent(content)
+
+    expect(meta).toMatchObject({
+      sessionId: 'session-activity',
+      cwd: '/project/codex',
+      codexTaskEvents: {
+        latestTaskStartedAt: Date.parse('2026-03-01T00:00:05.000Z'),
+        latestTaskCompletedAt: Date.parse('2026-03-01T00:00:04.000Z'),
+        latestTurnAbortedAt: Date.parse('2026-03-01T00:00:06.000Z'),
+      },
+    })
+  })
+
+  it('drops head-only unresolved starts from truncated Codex snippets while preserving clear signals', () => {
+    expect(sanitizeCodexTaskEventsForTruncatedSnippet({
+      latestTaskStartedAt: 100,
+    })).toBeUndefined()
+
+    expect(sanitizeCodexTaskEventsForTruncatedSnippet({
+      latestTaskStartedAt: 100,
+      latestTaskCompletedAt: 90,
+      latestTurnAbortedAt: 110,
+    })).toEqual({
+      latestTaskCompletedAt: 90,
+      latestTurnAbortedAt: 110,
+    })
+  })
+
+  it('preserves an unresolved task_started that is truly present in the tail snippet', () => {
+    expect(sanitizeCodexTaskEventsForTruncatedSnippet(
+      {
+        latestTaskStartedAt: 100,
+        latestTaskCompletedAt: 90,
+      },
+      {
+        latestTaskStartedAt: 200,
+      },
+    )).toEqual({
+      latestTaskStartedAt: 200,
+    })
+
+    expect(sanitizeCodexTaskEventsForTruncatedSnippet(
+      {
+        latestTaskStartedAt: 100,
+        latestTaskCompletedAt: 210,
+      },
+      {
+        latestTaskStartedAt: 200,
+        latestTaskCompletedAt: 210,
+      },
+    )).toEqual({
+      latestTaskCompletedAt: 210,
+    })
+  })
+
+  it('ignores unrelated event_msg payloads when parsing task event timestamps', () => {
+    const content = [
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:00.000Z',
+        type: 'session_meta',
+        payload: { id: 'session-activity', cwd: '/project/codex' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:01.000Z',
+        type: 'event_msg',
+        payload: { type: 'user_message', message: 'Sanitized prompt' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:02.000Z',
+        type: 'event_msg',
+        payload: { type: 'agent_message', message: 'Sanitized response' },
+      }),
+    ].join('\n')
+
+    const meta = parseCodexSessionContent(content)
+
+    expect(meta.codexTaskEvents).toBeUndefined()
   })
 
   it('flags spawned subagent sessions from session_meta source', () => {
