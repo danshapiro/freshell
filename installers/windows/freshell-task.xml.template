@@ -25,6 +25,16 @@
     <Exec>
       <Command>{{NODE_BINARY}}</Command>
       <Arguments>{{SERVER_ENTRY}}</Arguments>
+      <WorkingDirectory>{{CONFIG_DIR}}</WorkingDirectory>
     </Exec>
   </Actions>
+  <!-- Environment variables are set via the Exec action's environment inheritance.
+       The server spawner and daemon manager set NODE_PATH, PORT, NODE_ENV, and
+       FRESHELL_CONFIG_DIR via the process environment when starting the task.
+       Template placeholders for reference:
+         NODE_PATH={{NODE_PATH}}
+         PORT={{PORT}}
+         CONFIG_DIR={{CONFIG_DIR}}
+         LOG_DIR={{LOG_DIR}}
+  -->
 </Task>

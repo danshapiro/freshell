@@ -1,3 +1,4 @@
+import path from 'path'
 import type { DesktopConfig } from './types.js'
 import type { DaemonManager } from './daemon/daemon-manager.js'
 import type { ServerSpawner } from './server-spawner.js'
@@ -24,6 +25,9 @@ export interface StartupContext {
   updateManager: UpdateManager
   isDev: boolean
   port: number
+  /** Electron's process.resourcesPath -- where extraResources live in production */
+  resourcesPath?: string
+  configDir: string  // ~/.freshell
   createBrowserWindow: (options: Record<string, any>) => BrowserWindowLike
   createTray: () => void
   fetchHealthCheck?: (url: string) => Promise<boolean>
@@ -65,21 +69,27 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
             serverSourceEntry: 'server/index.ts',
           },
           port,
-          envFile: '',
-          configDir: '',
+          envFile: path.join(ctx.configDir, '.env'),
+          configDir: ctx.configDir,
         })
         // In dev mode, point at Vite dev server
         serverUrl = 'http://localhost:5173'
       } else {
+        if (!ctx.resourcesPath) {
+          throw new Error('resourcesPath is required for production app-bound mode')
+        }
+        const resourcesPath = ctx.resourcesPath
         await ctx.serverSpawner.start({
           spawn: {
             mode: 'production',
-            nodeBinary: '', // filled by caller
-            serverEntry: '', // filled by caller
+            nodeBinary: path.join(resourcesPath, 'bundled-node', 'bin', 'node'),
+            serverEntry: path.join(resourcesPath, 'server', 'index.js'),
+            nativeModulesDir: path.join(resourcesPath, 'bundled-node', 'native-modules'),
+            serverNodeModulesDir: path.join(resourcesPath, 'server-node-modules'),
           },
           port,
-          envFile: '',
-          configDir: '',
+          envFile: path.join(ctx.configDir, '.env'),
+          configDir: ctx.configDir,
         })
         serverUrl = `http://localhost:${port}`
       }

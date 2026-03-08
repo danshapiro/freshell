@@ -22,4 +22,14 @@ export default defineConfig({
       '@electron': path.resolve(__dirname, './electron'),
     },
   },
+  css: {
+    postcss: {
+      plugins: [
+        (await import('tailwindcss')).default({
+          config: path.resolve(__dirname, 'tailwind.config.wizard.js'),
+        }),
+        (await import('autoprefixer')).default,
+      ],
+    },
+  },
 })

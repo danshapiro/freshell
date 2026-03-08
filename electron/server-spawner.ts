@@ -4,7 +4,13 @@ import fs from 'fs'
 import path from 'path'
 
 export type ServerSpawnMode =
-  | { mode: 'production'; nodeBinary: string; serverEntry: string }
+  | {
+      mode: 'production'
+      nodeBinary: string
+      serverEntry: string
+      nativeModulesDir: string      // recompiled native modules (node-pty)
+      serverNodeModulesDir: string  // pruned production dependencies
+    }
   | { mode: 'dev'; tsxPath: string; serverSourceEntry: string }
 
 export interface ServerSpawnerOptions {
@@ -86,6 +92,11 @@ export function createServerSpawner(): ServerSpawner {
         cmd = spawnMode.nodeBinary
         args = [spawnMode.serverEntry]
         env.NODE_ENV = 'production'
+        // native-modules first so recompiled node-pty wins over server-node-modules copy
+        env.NODE_PATH = [
+          spawnMode.nativeModulesDir,
+          spawnMode.serverNodeModulesDir,
+        ].join(path.delimiter)
       } else {
         cmd = spawnMode.tsxPath
         args = ['tsx', spawnMode.serverSourceEntry]
@@ -136,27 +147,25 @@ export function createServerSpawner(): ServerSpawner {
       childProcess = null
 
       return new Promise<void>((resolve) => {
-        proc.on('close', () => {
-          running = false
-          resolve()
-        })
-
-        proc.kill('SIGTERM')
-
         // SIGKILL fallback after 5s
         const killTimeout = setTimeout(() => {
           try {
             proc.kill('SIGKILL')
           } catch {
-            // Ignore
+            // Ignore -- process may have already exited
           }
           running = false
           resolve()
         }, 5000)
 
+        // Single close listener that cleans up and resolves
         proc.on('close', () => {
           clearTimeout(killTimeout)
+          running = false
+          resolve()
         })
+
+        proc.kill('SIGTERM')
       })
     },
 

@@ -52,6 +52,8 @@ function createDefaultContext(overrides: Partial<StartupContext> = {}): StartupC
     },
     isDev: false,
     port: 3001,
+    resourcesPath: '/app/resources',
+    configDir: '/home/user/.freshell',
     createBrowserWindow: vi.fn().mockReturnValue(createMockWindow()),
     createTray: vi.fn(),
     ...overrides,
@@ -143,15 +145,26 @@ describe('runStartup', () => {
   })
 
   describe('app-bound mode', () => {
-    it('spawns server in production mode', async () => {
-      const ctx = createDefaultContext({ isDev: false })
+    it('spawns server in production mode with paths from resourcesPath', async () => {
+      const ctx = createDefaultContext({ isDev: false, resourcesPath: '/app/resources' })
       const result = await runStartup(ctx)
 
       expect(ctx.serverSpawner.start).toHaveBeenCalledTimes(1)
+      const startArgs = (ctx.serverSpawner.start as ReturnType<typeof vi.fn>).mock.calls[0][0]
+      expect(startArgs.spawn.mode).toBe('production')
+      expect(startArgs.spawn.nodeBinary).toContain('/app/resources/bundled-node/bin/node')
+      expect(startArgs.spawn.serverEntry).toContain('/app/resources/server/index.js')
+      expect(startArgs.spawn.nativeModulesDir).toContain('/app/resources/bundled-node/native-modules')
+      expect(startArgs.spawn.serverNodeModulesDir).toContain('/app/resources/server-node-modules')
       expect(result.type).toBe('main')
       if (result.type === 'main') {
         expect(result.serverUrl).toBe('http://localhost:3001')
       }
+    })
+
+    it('throws if resourcesPath is missing in production mode', async () => {
+      const ctx = createDefaultContext({ isDev: false, resourcesPath: undefined })
+      await expect(runStartup(ctx)).rejects.toThrow('resourcesPath is required')
     })
 
     it('uses tsx in dev mode and points at Vite dev server', async () => {

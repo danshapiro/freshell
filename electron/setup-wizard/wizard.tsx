@@ -1,52 +1,43 @@
 import React, { useState, useCallback } from 'react'
+import {
+  type ServerMode,
+  type WizardConfig,
+  STEPS,
+  DEFAULT_PORT,
+  DEFAULT_HOTKEY,
+  validatePort as validatePortFn,
+  validateUrl as validateUrlFn,
+  buildConfig,
+} from './wizard-logic.js'
 
-export type ServerMode = 'daemon' | 'app-bound' | 'remote'
-
-export interface WizardConfig {
-  serverMode: ServerMode
-  port: number
-  remoteUrl: string
-  remoteToken: string
-  globalHotkey: string
-}
+export type { ServerMode, WizardConfig }
 
 interface WizardProps {
   onComplete?: (config: WizardConfig) => void
 }
 
-const STEPS = ['welcome', 'server-mode', 'configuration', 'hotkey', 'complete'] as const
-type Step = typeof STEPS[number]
-
 export function Wizard({ onComplete }: WizardProps) {
   const [currentStep, setCurrentStep] = useState<number>(0)
   const [serverMode, setServerMode] = useState<ServerMode>('app-bound')
-  const [port, setPort] = useState<number>(3001)
+  const [port, setPort] = useState<number>(DEFAULT_PORT)
   const [remoteUrl, setRemoteUrl] = useState<string>('')
   const [remoteToken, setRemoteToken] = useState<string>('')
-  const [globalHotkey, setGlobalHotkey] = useState<string>('CommandOrControl+`')
+  const [globalHotkey, setGlobalHotkey] = useState<string>(DEFAULT_HOTKEY)
   const [portError, setPortError] = useState<string>('')
   const [urlError, setUrlError] = useState<string>('')
 
   const step = STEPS[currentStep]
 
   const validatePort = useCallback((value: number): boolean => {
-    if (isNaN(value) || value < 1024 || value > 65535) {
-      setPortError('Port must be between 1024 and 65535')
-      return false
-    }
-    setPortError('')
-    return true
+    const error = validatePortFn(value)
+    setPortError(error)
+    return !error
   }, [])
 
   const validateUrl = useCallback((value: string): boolean => {
-    try {
-      new URL(value)
-      setUrlError('')
-      return true
-    } catch {
-      setUrlError('Please enter a valid URL')
-      return false
-    }
+    const error = validateUrlFn(value)
+    setUrlError(error)
+    return !error
   }, [])
 
   const handleNext = useCallback(() => {
@@ -67,13 +58,7 @@ export function Wizard({ onComplete }: WizardProps) {
   }, [currentStep])
 
   const handleComplete = useCallback(() => {
-    onComplete?.({
-      serverMode,
-      port,
-      remoteUrl,
-      remoteToken,
-      globalHotkey,
-    })
+    onComplete?.(buildConfig(serverMode, port, remoteUrl, remoteToken, globalHotkey))
   }, [onComplete, serverMode, port, remoteUrl, remoteToken, globalHotkey])
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {

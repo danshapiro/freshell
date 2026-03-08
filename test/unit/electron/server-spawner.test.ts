@@ -89,6 +89,8 @@ describe('ServerSpawner', () => {
           mode: 'production',
           nodeBinary: '/app/bundled-node/bin/node',
           serverEntry: '/app/server/index.js',
+          nativeModulesDir: '/app/resources/bundled-node/native-modules',
+          serverNodeModulesDir: '/app/resources/server-node-modules',
         },
         port: 3001,
         envFile: '/home/user/.freshell/.env',
@@ -102,6 +104,32 @@ describe('ServerSpawner', () => {
       expect(cmd).toBe('/app/bundled-node/bin/node')
       expect(args).toContain('/app/server/index.js')
       expect(opts.env.NODE_ENV).toBe('production')
+    })
+
+    it('sets NODE_PATH with nativeModulesDir before serverNodeModulesDir', async () => {
+      const proc = createMockProcess()
+      mockSpawn.mockReturnValue(proc)
+      setupHealthCheckSuccess()
+
+      await spawner.start({
+        spawn: {
+          mode: 'production',
+          nodeBinary: '/app/bundled-node/bin/node',
+          serverEntry: '/app/server/index.js',
+          nativeModulesDir: '/app/resources/bundled-node/native-modules',
+          serverNodeModulesDir: '/app/resources/server-node-modules',
+        },
+        port: 3001,
+        envFile: '/home/user/.freshell/.env',
+        configDir: '/home/user/.freshell',
+      })
+
+      const [, , opts] = mockSpawn.mock.calls[0]
+      const nodePath = opts.env.NODE_PATH
+      expect(nodePath).toBeDefined()
+      // native-modules should come first so recompiled node-pty wins
+      expect(nodePath.indexOf('/app/resources/bundled-node/native-modules'))
+        .toBeLessThan(nodePath.indexOf('/app/resources/server-node-modules'))
     })
   })
 
@@ -138,7 +166,7 @@ describe('ServerSpawner', () => {
       setupHealthCheckSuccess()
 
       await spawner.start({
-        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js' },
+        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js', nativeModulesDir: '/native', serverNodeModulesDir: '/modules' },
         port: 3001,
         envFile: '',
         configDir: '',
@@ -155,7 +183,7 @@ describe('ServerSpawner', () => {
       setupHealthCheckFailure()
 
       const promise = spawner.start({
-        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js' },
+        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js', nativeModulesDir: '/native', serverNodeModulesDir: '/modules' },
         port: 3001,
         envFile: '',
         configDir: '',
@@ -176,7 +204,7 @@ describe('ServerSpawner', () => {
       setupHealthCheckSuccess()
 
       await spawner.start({
-        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js' },
+        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js', nativeModulesDir: '/native', serverNodeModulesDir: '/modules' },
         port: 3001,
         envFile: '',
         configDir: '',
@@ -205,7 +233,7 @@ describe('ServerSpawner', () => {
       setupHealthCheckSuccess()
 
       await spawner.start({
-        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js' },
+        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js', nativeModulesDir: '/native', serverNodeModulesDir: '/modules' },
         port: 3001,
         envFile: '',
         configDir: '',
@@ -217,7 +245,7 @@ describe('ServerSpawner', () => {
       })
 
       await spawner.start({
-        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js' },
+        spawn: { mode: 'production', nodeBinary: '/node', serverEntry: '/server.js', nativeModulesDir: '/native', serverNodeModulesDir: '/modules' },
         port: 3001,
         envFile: '',
         configDir: '',
