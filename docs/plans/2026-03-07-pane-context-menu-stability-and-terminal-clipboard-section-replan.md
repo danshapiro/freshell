@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task.
 
-**Goal:** Keep pane right-click menus open on inactive panes, and move terminal `copy` / `Paste` / `Select all` into an iconized top section with `copy` labeled exactly `copy`.
+**Goal:** Keep pane right-click menus open instead of immediately reclosing, and move terminal `copy` / `Paste` / `Select all` into an iconized top section with `copy` labeled exactly `copy`.
 
-**Architecture:** Do not hard-anchor the bug in either `ContextMenuProvider` or pane activation. There are at least three distinct custom-menu paths here: generic pane shell, terminal pane header/shell, and the real xterm body, and the terminal shell path has behavior outside the provider because `Pane` activates on mouse-down and `TerminalView` refocuses the active xterm on the next animation frame. Rebuild the terminal menu in `menu-defs.ts` with a dedicated clipboard section at the top using Lucide icons via `createElement(...)`, and for the reclose bug add regressions that capture both provider dismiss signals and terminal focus churn so the final fix can land in `ContextMenuProvider.tsx`, `Pane.tsx`, `TerminalView.tsx`, or a minimal combination, depending on what the traces actually prove.
+**Architecture:** Do not hard-anchor the bug in either `ContextMenuProvider` or pane activation, and do not narrow it to inactive panes. There are at least three distinct custom-menu paths here: generic pane shell, terminal pane header/shell, and the real xterm body, and each needs coverage on both already-active and inactive panes because that boundary was part of the accepted medium strategy. Rebuild the terminal menu in `menu-defs.ts` with a dedicated clipboard section at the top using Lucide icons via `createElement(...)`; for the reclose bug, first land a user-visible route matrix in the existing e2e harness, then use unit-level provider and terminal-focus traces only to explain whichever active or inactive route actually fails, so the final fix can land in `ContextMenuProvider.tsx`, `Pane.tsx`, `TerminalView.tsx`, or a minimal combination, depending on what the red tests prove.
 
 **Tech Stack:** React 18, TypeScript, Redux Toolkit, lucide-react, Vitest, Testing Library, xterm.js test harnesses
 
@@ -167,190 +167,182 @@ git add src/components/context-menu/menu-defs.ts test/unit/client/context-menu/m
 git commit -m "fix: group terminal clipboard actions at top"
 ```
 
-### Task 2: Characterize The Failing Surface And Fix The Proven Cause
+### Task 2: Lock Down Active And Inactive Routes, Then Fix The Proven Cause
 
 **Files:**
 - Modify: `src/components/context-menu/ContextMenuProvider.tsx`
 - Modify: `src/components/panes/Pane.tsx`
 - Modify: `src/components/TerminalView.tsx`
 - Test: `test/unit/client/components/ContextMenuProvider.test.tsx`
+- Create: `test/unit/client/components/terminal-pane-context-menu-focus.test.tsx`
 - Test: `test/e2e/refresh-context-menu-flow.test.tsx`
 
 **Step 1: Write the failing regressions**
 
-Keep the provider-dismiss trace in `test/unit/client/components/ContextMenuProvider.test.tsx`, but treat it as instrumentation, not as the answer. It should keep covering the generic inactive pane-shell route so failures tell you whether a provider dismiss callback fired:
+In `test/e2e/refresh-context-menu-flow.test.tsx`, make the user-visible route matrix the primary regression harness. Reuse the existing `PaneLayout` helpers and add one shared assertion helper that right-clicks a target, waits two animation frames, and proves the menu is still present:
 
 ```tsx
-it('keeps the pane menu open when right-clicking an inactive browser pane shell', async () => {
+async function expectMenuStaysOpenAfterRightClick(target: HTMLElement) {
+  const user = userEvent.setup()
+  await user.pointer({ target, keys: '[MouseRight]' })
+  await act(async () => {
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+  })
+  expect(screen.queryByRole('menu')).toBeInTheDocument()
+}
+```
+
+Add the active/inactive boundary cases the accepted medium strategy required:
+
+```tsx
+it('keeps the browser pane-shell menu open when right-clicking the already-active pane shell', async () => {
+  const { container } = renderFlow(createStore(createTwoBrowserPaneLayout()))
+  const activeShell = container.querySelector('[data-context="pane"][data-pane-id="pane-1"]') as HTMLElement
+  expect(activeShell).not.toBeNull()
+
+  await expectMenuStaysOpenAfterRightClick(activeShell)
+})
+
+it('keeps the browser pane-shell menu open when right-clicking an inactive pane shell', async () => {
+  const { container } = renderFlow(createStore(createTwoBrowserPaneLayout()))
+  const inactiveShell = container.querySelector('[data-context="pane"][data-pane-id="pane-2"]') as HTMLElement
+  expect(inactiveShell).not.toBeNull()
+
+  await expectMenuStaysOpenAfterRightClick(inactiveShell)
+})
+
+it('keeps the terminal pane-shell menu open when right-clicking the already-active terminal header', async () => {
+  const { container } = renderFlow(createStore(createTwoTerminalPaneLayout()))
+  const activeHeader = container.querySelector(
+    '[data-context="pane"][data-pane-id="pane-1"] [role="banner"]',
+  ) as HTMLElement
+  expect(activeHeader).not.toBeNull()
+
+  await expectMenuStaysOpenAfterRightClick(activeHeader)
+})
+
+it('keeps the terminal pane-shell menu open when right-clicking an inactive terminal header', async () => {
+  const { container } = renderFlow(createStore(createTwoTerminalPaneLayout()))
+  const inactiveHeader = container.querySelector(
+    '[data-context="pane"][data-pane-id="pane-2"] [role="banner"]',
+  ) as HTMLElement
+  expect(inactiveHeader).not.toBeNull()
+
+  await expectMenuStaysOpenAfterRightClick(inactiveHeader)
+})
+
+it('keeps the terminal menu open when right-clicking the already-active terminal body', async () => {
+  const { container } = renderFlow(createStore(createTwoTerminalPaneLayout()))
+  await waitFor(() => {
+    expect(container.querySelectorAll('[data-testid="terminal-xterm-container"]')).toHaveLength(2)
+  })
+  const activeBody = container.querySelector(
+    '[data-context="terminal"][data-pane-id="pane-1"] [data-testid="terminal-xterm-container"]',
+  ) as HTMLElement
+  expect(activeBody).not.toBeNull()
+
+  await expectMenuStaysOpenAfterRightClick(activeBody)
+})
+
+it('keeps the terminal menu open when right-clicking an inactive terminal body', async () => {
+  const { container } = renderFlow(createStore(createTwoTerminalPaneLayout()))
+  await waitFor(() => {
+    expect(container.querySelectorAll('[data-testid="terminal-xterm-container"]')).toHaveLength(2)
+  })
+  const inactiveBody = container.querySelector(
+    '[data-context="terminal"][data-pane-id="pane-2"] [data-testid="terminal-xterm-container"]',
+  ) as HTMLElement
+  expect(inactiveBody).not.toBeNull()
+
+  await expectMenuStaysOpenAfterRightClick(inactiveBody)
+})
+```
+
+Do not introduce a new partial `@xterm/xterm` mock into this e2e file. Keep the existing integration fidelity here and use unit tests for diagnosis only.
+
+In `test/unit/client/components/ContextMenuProvider.test.tsx`, keep a provider-dismiss trace as instrumentation, not as the primary proof. It should cover one pane-shell route and include dismiss counters in the failure message so you can tell whether a provider callback fired on the failing path:
+
+```tsx
+it('keeps the pane menu open when right-clicking a pane shell (provider dismiss trace)', async () => {
   const user = userEvent.setup()
   const trace = createDismissTrace()
 
   try {
     const { container } = renderSplitBrowserPaneLayout()
-    const paneShells = container.querySelectorAll('[data-context="pane"]')
-    await user.pointer({ target: paneShells[1] as HTMLElement, keys: '[MouseRight]' })
-
-    await waitFor(() => {
-      expect(
-        screen.queryByRole('menu'),
-        `menu closed early; dismiss trace=${JSON.stringify(trace.counts)}`,
-      ).toBeInTheDocument()
-    })
-  } finally {
-    trace.restore()
-  }
-})
-```
-
-In `test/e2e/refresh-context-menu-flow.test.tsx`, add the same `createDismissTrace()` helper and reuse the existing terminal pane-shell harness, but mock xterm so the test can also measure focus churn on the inactive terminal pane:
-
-```tsx
-const terminalInstances: Array<{ focus: ReturnType<typeof vi.fn> }> = []
-
-vi.mock('@/lib/terminal-themes', () => ({
-  getTerminalTheme: () => ({}),
-}))
-
-vi.mock('@xterm/xterm', () => {
-  class MockTerminal {
-    options: Record<string, unknown> = {}
-    cols = 80
-    rows = 24
-    open = vi.fn()
-    loadAddon = vi.fn()
-    registerLinkProvider = vi.fn(() => ({ dispose: vi.fn() }))
-    write = vi.fn()
-    writeln = vi.fn()
-    clear = vi.fn()
-    dispose = vi.fn()
-    onData = vi.fn()
-    onTitleChange = vi.fn(() => ({ dispose: vi.fn() }))
-    attachCustomKeyEventHandler = vi.fn()
-    getSelection = vi.fn(() => '')
-    focus = vi.fn()
-    constructor() {
-      terminalInstances.push(this)
-    }
-  }
-
-  return { Terminal: MockTerminal }
-})
-
-vi.mock('@xterm/addon-fit', () => ({
-  FitAddon: class {
-    fit = vi.fn()
-  },
-}))
-
-vi.mock('@xterm/xterm/css/xterm.css', () => ({}))
-```
-
-Then add two integration regressions for the distinct terminal routes:
-
-```tsx
-it('keeps the terminal pane-shell menu open when right-clicking an inactive terminal header', async () => {
-  const layout: PaneNode = {
-    type: 'split',
-    id: 'split-1',
-    direction: 'horizontal',
-    sizes: [50, 50],
-    children: [
-      createTerminalLeaf('pane-1', 'term-1'),
-      createTerminalLeaf('pane-2', 'term-2'),
-    ],
-  }
-  const store = createStore(layout)
-  const user = userEvent.setup()
-  const trace = createDismissTrace()
-
-  try {
-    const { container } = renderFlow(store)
-    await waitFor(() => {
-      expect(terminalInstances).toHaveLength(2)
-    })
-
-    const inactiveHeader = container.querySelector(
-      '[data-context="pane"][data-pane-id="pane-2"] [role="banner"]',
-    ) as HTMLElement
-    expect(inactiveHeader).not.toBeNull()
-
-    const baselineFocusCalls = terminalInstances[1].focus.mock.calls.length
-    await user.pointer({ target: inactiveHeader, keys: '[MouseRight]' })
-    await act(async () => {
-      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
-      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
-    })
+    const paneShell = container.querySelector('[data-context="pane"][data-pane-id="pane-2"]') as HTMLElement
+    await user.pointer({ target: paneShell, keys: '[MouseRight]' })
 
     expect(
       screen.queryByRole('menu'),
-      `menu closed early; dismiss trace=${JSON.stringify(trace.counts)} focusDelta=${terminalInstances[1].focus.mock.calls.length - baselineFocusCalls}`,
+      `menu closed early; dismiss trace=${JSON.stringify(trace.counts)}`,
     ).toBeInTheDocument()
   } finally {
     trace.restore()
   }
 })
+```
 
-it('keeps the terminal menu open when right-clicking an inactive terminal body', async () => {
-  const layout: PaneNode = {
-    type: 'split',
-    id: 'split-1',
-    direction: 'horizontal',
-    sizes: [50, 50],
-    children: [
-      createTerminalLeaf('pane-1', 'term-1'),
-      createTerminalLeaf('pane-2', 'term-2'),
-    ],
-  }
-  const store = createStore(layout)
+Create `test/unit/client/components/terminal-pane-context-menu-focus.test.tsx` as a focused terminal diagnostic harness using the same `@xterm/xterm` mock shape already used in `TerminalView.lifecycle.test.tsx`. Render a split two-terminal `PaneLayout` under `ContextMenuProvider`, right-click the active and inactive terminal headers, and include focus-count deltas in the failure messages. The inactive-header case below is the minimum diagnostic; mirror it for the already-active header if that is the failing e2e route:
+
+```tsx
+it('does not refocus the inactive terminal while its context menu is opening', async () => {
   const user = userEvent.setup()
-  const trace = createDismissTrace()
+  const { container } = renderTerminalPaneContextHarness()
+  await waitFor(() => {
+    expect(terminalInstances).toHaveLength(2)
+  })
 
-  try {
-    const { container } = renderFlow(store)
-    await waitFor(() => {
-      expect(container.querySelectorAll('[data-testid="terminal-xterm-container"]')).toHaveLength(2)
-    })
+  const inactiveHeader = container.querySelector(
+    '[data-context="pane"][data-pane-id="pane-2"] [role="banner"]',
+  ) as HTMLElement
+  const baselineFocusCalls = terminalInstances[1].focus.mock.calls.length
 
-    const terminalBody = container.querySelector(
-      '[data-context="terminal"][data-pane-id="pane-2"] [data-testid="terminal-xterm-container"]',
-    ) as HTMLElement
-    expect(terminalBody).not.toBeNull()
+  await user.pointer({ target: inactiveHeader, keys: '[MouseRight]' })
+  await act(async () => {
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+  })
 
-    await user.pointer({ target: terminalBody, keys: '[MouseRight]' })
-
-    await waitFor(() => {
-      expect(
-        screen.queryByRole('menu'),
-        `menu closed early; dismiss trace=${JSON.stringify(trace.counts)}`,
-      ).toBeInTheDocument()
-    })
-  } finally {
-    trace.restore()
-  }
+  expect(
+    screen.queryByRole('menu'),
+    `menu closed early; terminalFocusDelta=${terminalInstances[1].focus.mock.calls.length - baselineFocusCalls}`,
+  ).toBeInTheDocument()
 })
 ```
 
-The terminal header test is the critical missing regression. Its failure message must expose both provider-dismiss counters and the inactive terminal’s `focusDelta`, so the red phase can tell whether the early close came from provider dismissal, terminal activation/focus churn, or both.
+This unit file is diagnostic coverage for the terminal header/shell path only. It must not replace the user-visible e2e route matrix.
 
 **Step 2: Run the targeted regressions and verify they fail**
 
 Run:
 
 ```bash
-npx vitest run test/unit/client/components/ContextMenuProvider.test.tsx test/e2e/refresh-context-menu-flow.test.tsx --reporter=dot
+npx vitest run \
+  test/e2e/refresh-context-menu-flow.test.tsx \
+  test/unit/client/components/ContextMenuProvider.test.tsx \
+  test/unit/client/components/terminal-pane-context-menu-focus.test.tsx \
+  --reporter=dot
 ```
 
-Expected: FAIL on at least one of the three routes. Read the failure message before changing code:
+Expected: FAIL on at least one user-visible route in the e2e matrix. Use the unit traces to explain why:
 
-- Non-zero dismiss counters on browser shell or terminal body: a provider dismissal path is firing too early.
-- Terminal header/shell failure with `focusDelta > 0` and dismiss counters still zero or secondary: pane activation / terminal refocus is the leading suspect.
+- Non-zero dismiss counters on the matching provider trace: a provider dismissal path is firing too early.
+- Terminal header/shell failure with `terminalFocusDelta > 0`: pane activation / terminal refocus is the leading suspect.
 - Both signals present: fix the earliest proven cause first, rerun, and only layer a second fix if a red test remains.
 
-If all three tests stay green, stop and manually reproduce in the worktree before any production edit; do not ship a guess.
+If the full route matrix stays green:
+
+1. Start the worktree server/client on isolated ports and reproduce the bug manually on both already-active and inactive pane routes.
+2. Identify the exact failing subtarget: browser shell, terminal header/shell, or terminal body.
+3. Add a new automated regression for that exact route before any production edit.
+4. Prefer extending `test/e2e/refresh-context-menu-flow.test.tsx` if the exact route reproduces there once targeted precisely.
+5. If the route depends on terminal focus timing that only appears in a controlled xterm mock, codify that trigger as a red unit test in `test/unit/client/components/terminal-pane-context-menu-focus.test.tsx`, then keep the matching e2e route in the matrix as the user-visible guard even if it remains green.
+6. Re-run until at least one automated test is red. Do not edit production code before that.
 
 **Step 3: Write the minimal production fix**
 
-Change only the code the red traces justify:
+Change only the code the red tests justify:
 
 - If a provider dismiss callback is the first proven cause, patch `src/components/context-menu/ContextMenuProvider.tsx` on that path only.
   Example: if `view` cleanup fires, replace cleanup-only close with explicit view-change comparison:
@@ -366,7 +358,7 @@ useEffect(() => {
 }, [view, menuState, closeMenu])
 ```
 
-  Example: if `blur` fires, re-check focus on the next animation frame before closing instead of masking all early events with a timer:
+  Example: if `blur` fires, re-check focus on the next animation frame before closing:
 
 ```tsx
 const handleBlur = () => {
@@ -387,6 +379,8 @@ onMouseDown={(event) => {
 
   Then rerun the terminal shell/body regressions. Only if the shell/header path still closes because `TerminalView` refocuses the xterm after the menu opens should you add a narrower guard in `src/components/TerminalView.tsx` around the active-pane focus effect.
 
+- If an already-active route fails while the inactive route stays green, do not reuse the inactive-pane explanation. Fix the specific active-route trigger the red tests identified.
+
 - If both a provider dismiss path and terminal focus churn are still red after the first fix, apply the second smallest fix and rerun.
 
 Do not default to a timestamp guard in `ContextMenuProvider.tsx`, and do not change both provider dismissal and pane activation in the same first patch. Let the traces decide the order.
@@ -396,15 +390,19 @@ Do not default to a timestamp guard in `ContextMenuProvider.tsx`, and do not cha
 Run:
 
 ```bash
-npx vitest run test/unit/client/components/ContextMenuProvider.test.tsx test/e2e/refresh-context-menu-flow.test.tsx --reporter=dot
+npx vitest run \
+  test/e2e/refresh-context-menu-flow.test.tsx \
+  test/unit/client/components/ContextMenuProvider.test.tsx \
+  test/unit/client/components/terminal-pane-context-menu-focus.test.tsx \
+  --reporter=dot
 ```
 
-Expected: PASS for the browser pane shell, inactive terminal header/shell, and inactive terminal body routes.
+Expected: PASS for already-active and inactive browser pane shell, terminal pane header/shell, and terminal body routes, with the unit traces also green.
 
 **Step 5: Commit**
 
 ```bash
-git add src/components/context-menu/ContextMenuProvider.tsx src/components/panes/Pane.tsx src/components/TerminalView.tsx test/unit/client/components/ContextMenuProvider.test.tsx test/e2e/refresh-context-menu-flow.test.tsx
+git add src/components/context-menu/ContextMenuProvider.tsx src/components/panes/Pane.tsx src/components/TerminalView.tsx test/unit/client/components/ContextMenuProvider.test.tsx test/unit/client/components/terminal-pane-context-menu-focus.test.tsx test/e2e/refresh-context-menu-flow.test.tsx
 git commit -m "fix: keep pane context menus open on right click"
 ```
 
@@ -420,6 +418,7 @@ Run:
 ```bash
 npx vitest run \
   test/unit/client/context-menu/menu-defs.test.ts \
+  test/unit/client/components/terminal-pane-context-menu-focus.test.tsx \
   test/unit/client/components/ContextMenuProvider.test.tsx \
   test/e2e/refresh-context-menu-flow.test.tsx \
   --reporter=dot
@@ -462,8 +461,9 @@ readlink -f "/proc/$(cat /tmp/freshell-5174-client.pid)/cwd"
 
 Open `http://127.0.0.1:5174` and verify all of the following:
 
-- Right-clicking an inactive terminal pane header or pane shell leaves the custom menu open.
-- Right-clicking inside the actual inactive terminal text area leaves the custom menu open.
+- Right-clicking the already-active and inactive browser pane shell leaves the custom menu open.
+- Right-clicking the already-active and inactive terminal pane header or pane shell leaves the custom menu open.
+- Right-clicking inside the already-active and inactive terminal text area leaves the custom menu open.
 - The first section of the terminal menu is `copy`, `Paste`, `Select all`, each with an icon.
 - The rest of the terminal menu still exposes refresh, split, search, scroll, clear, reset, and replace actions.
 
