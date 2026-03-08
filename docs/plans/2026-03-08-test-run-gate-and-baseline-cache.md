@@ -2,11 +2,11 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task.
 
-**Goal:** Serialize broad test runs across repo worktrees, show truthfully who currently holds the gate and why, and publish exact-commit baseline results that other agents can reuse as advisory context.
+**Goal:** Serialize broad test runs across repo worktrees, show truthfully who currently holds the gate and why, and publish exact-commit baseline results that other agents can reuse as advisory context without breaking existing focused-test workflows.
 
-**Architecture:** Add one TypeScript wrapper script that owns lease acquisition, bounded waiting, holder metadata, and last-result caching for all broad non-interactive npm test entrypoints. Store shared state in the repo's Git common dir, use an atomic lease directory plus heartbeat and PID-liveness checks so the gate works on Linux, WSL, macOS, and native Windows without depending on `flock`, and make `status` use the same immediate live-probe path as waiters so it only reports an active holder when the lease is actually live.
+**Architecture:** Add one TypeScript wrapper script that owns kernel-lock acquisition, bounded waiting, holder metadata, last-result caching, and argv passthrough for sanctioned npm test entrypoints. Store shared advisory state in the repo's Git common dir, use `flock` on a repo-shared lock file as the only correctness primitive for broad-run serialization, and make the wrapper classify narrowed invocations (`npm test -- <files> ...`, `npm run test:server -- <files> ...`) so focused TDD runs continue to work through the normal npm scripts without entering the broad-run queue.
 
-**Tech Stack:** Node.js, TypeScript, `tsx`, `child_process`, `fs/promises`, Git CLI, Vitest.
+**Tech Stack:** Node.js, TypeScript, `tsx`, `child_process`, `fs/promises`, Git CLI, `flock`, Vitest.
 
 ---
 
@@ -19,12 +19,14 @@ User-approved direction:
 
 Design decisions for implementation:
 - Treat the gate as repo-shared state rooted in `git rev-parse --git-common-dir`, not in an individual worktree.
-- Gate every broad non-interactive npm test entrypoint: `npm test`, `npm run test:all`, `npm run test:unit`, `npm run test:client`, `npm run test:server`, `npm run test:integration`, `npm run test:coverage`, `npm run check`, and `npm run verify`.
-- Keep only explicitly interactive commands (`npm run test:watch`, `npm run test:ui`) and explicit file-scoped raw `npx vitest run <files>` outside the gate. The former are local-only workflows; the latter remain possible but are no longer the sanctioned path for broad runs.
-- Make the public npm scripts hard to bypass by routing them all through the wrapper and moving the actual raw runners to private underscore-prefixed scripts that only the wrapper invokes.
+- Gate every broad non-interactive npm test entrypoint when it is invoked broadly: `npm test`, `npm run test:all`, `npm run test:unit`, `npm run test:client`, `npm run test:server`, `npm run test:integration`, `npm run test:coverage`, `npm run check`, and `npm run verify`.
+- Preserve existing focused-test ergonomics on those same npm scripts by forwarding arbitrary extra Vitest args and treating narrowed invocations as ungated. `npm test -- test/unit/server/foo.test.ts -t "bar"` and `npm run test:server -- test/server/ws-protocol.test.ts` must keep working through the sanctioned npm entrypoints.
+- Keep only explicitly interactive commands (`npm run test:watch`, `npm run test:ui`) outside the wrapper entirely.
+- Make the public npm scripts hard to bypass for broad runs by routing them all through the wrapper and moving the actual raw runners to private underscore-prefixed scripts that only the wrapper invokes.
 - Make baseline results advisory only. Never auto-skip a required fresh landing run.
 - Accept summary input from `--summary "..."` and `FRESHELL_TEST_SUMMARY`, but fall back to an automatic placeholder instead of failing if the agent omits it.
-- Make `status` read-only in the sense that it never waits and never starts tests, but it must still perform the same immediate lease probe and stale-recovery logic as runners so its holder report is truthful.
+- Make `status` read-only in the sense that it never waits and never starts tests, but it must still perform the same immediate non-blocking `flock` probe as runners so its holder report is truthful.
+- Treat `flock` availability as a required precondition for broad gated runs. If `flock` is unavailable, the wrapper should fail fast with an actionable message rather than silently falling back to a pseudo-lock.
 
 ## Task 1: Add shared git/run-context helpers for repo-wide gate state
 
@@ -141,7 +143,8 @@ Create `test/unit/server/test-run-gate.test.ts` with pure-function coverage for:
 - summary fallback behavior,
 - exact-commit reusable baseline detection,
 - dirty-worktree exclusion from reusable results,
-- lease-state classification for `free` / `held` / `stale`,
+- invocation classification for `broad` versus `narrowed`,
+- argv passthrough splitting for wrapper options versus forwarded Vitest args,
 - cross-platform npm invocation resolution.
 
 Seed the new test file with cases like:
@@ -152,9 +155,10 @@ import { describe, expect, it } from 'vitest'
 import {
   buildHolderRecord,
   buildGatePaths,
-  classifyLeaseState,
+  classifyInvocation,
   chooseReusableBaseline,
   deriveSummary,
+  splitWrapperArgs,
   resolveNpmRunner,
   type TestRunResultRecord,
 } from '../../../scripts/test-run-gate.js'
@@ -163,9 +167,8 @@ describe('test-run-gate helpers', () => {
   it('roots gate files in the shared common git dir', () => {
     expect(buildGatePaths('/repo/.git')).toEqual({
       rootDir: path.join('/repo/.git', 'freshell-test-gate'),
-      leaseDir: path.join('/repo/.git', 'freshell-test-gate', 'lease'),
+      lockFile: path.join('/repo/.git', 'freshell-test-gate', 'full-suite.lock'),
       holderFile: path.join('/repo/.git', 'freshell-test-gate', 'holder.json'),
-      heartbeatFile: path.join('/repo/.git', 'freshell-test-gate', 'heartbeat.json'),
       resultsFile: path.join('/repo/.git', 'freshell-test-gate', 'last-results.json'),
     })
   })
@@ -190,10 +193,21 @@ describe('test-run-gate helpers', () => {
     expect(chooseReusableBaseline({ ...candidate, commit: 'def456' }, { commandKey: 'full', commit: 'abc123' })).toBeUndefined()
   })
 
-  it('classifies live versus stale leases explicitly', () => {
-    expect(classifyLeaseState({ leaseExists: false })).toEqual({ state: 'free' })
-    expect(classifyLeaseState({ leaseExists: true, pidAlive: true, heartbeatAgeMs: 5_000 })).toEqual({ state: 'held' })
-    expect(classifyLeaseState({ leaseExists: true, pidAlive: false, heartbeatAgeMs: 120_000 })).toEqual({ state: 'stale' })
+  it('treats no extra selection args as a broad invocation', () => {
+    expect(classifyInvocation({ commandKey: 'full', forwardedArgs: [] })).toEqual({ kind: 'broad' })
+    expect(classifyInvocation({ commandKey: 'server', forwardedArgs: ['--run'] })).toEqual({ kind: 'broad' })
+  })
+
+  it('treats explicit targets and test-name filters as narrowed invocations', () => {
+    expect(classifyInvocation({ commandKey: 'full', forwardedArgs: ['test/unit/server/foo.test.ts'] })).toEqual({ kind: 'narrowed' })
+    expect(classifyInvocation({ commandKey: 'client', forwardedArgs: ['-t', 'restores pane state'] })).toEqual({ kind: 'narrowed' })
+  })
+
+  it('splits wrapper flags from forwarded Vitest args', () => {
+    expect(splitWrapperArgs(['--summary', 'Fix restore bug', '--', 'test/unit/server/foo.test.ts', '-t', 'restores'])).toEqual({
+      summary: 'Fix restore bug',
+      forwardedArgs: ['test/unit/server/foo.test.ts', '-t', 'restores'],
+    })
   })
 
   it('captures summary, branch, worktree, and session identifiers in holder metadata', () => {
@@ -286,9 +300,8 @@ export function buildGatePaths(commonGitDir: string) {
   const rootDir = path.join(commonGitDir, 'freshell-test-gate')
   return {
     rootDir,
-    leaseDir: path.join(rootDir, 'lease'),
+    lockFile: path.join(rootDir, 'full-suite.lock'),
     holderFile: path.join(rootDir, 'holder.json'),
-    heartbeatFile: path.join(rootDir, 'heartbeat.json'),
     resultsFile: path.join(rootDir, 'last-results.json'),
   }
 }
@@ -311,17 +324,22 @@ export function chooseReusableBaseline(
   return candidate
 }
 
-export function classifyLeaseState(input: {
-  leaseExists: boolean
-  pidAlive?: boolean
-  heartbeatAgeMs?: number
-}) {
-  if (!input.leaseExists) return { state: 'free' as const }
-  if (input.pidAlive) return { state: 'held' as const }
-  if ((input.heartbeatAgeMs ?? Number.POSITIVE_INFINITY) > 60_000) {
-    return { state: 'stale' as const }
+export function splitWrapperArgs(argv: string[]) {
+  const forwardedIdx = argv.indexOf('--')
+  const wrapperArgs = forwardedIdx >= 0 ? argv.slice(0, forwardedIdx) : argv
+  const forwardedArgs = forwardedIdx >= 0 ? argv.slice(forwardedIdx + 1) : []
+  const summaryIdx = wrapperArgs.indexOf('--summary')
+  const summary = summaryIdx >= 0 ? wrapperArgs[summaryIdx + 1] : undefined
+  return { summary, forwardedArgs }
+}
+
+export function classifyInvocation(input: { commandKey: CommandKey; forwardedArgs: string[] }) {
+  const args = input.forwardedArgs
+  if (args.length === 0) return { kind: 'broad' as const }
+  if (args.every((arg) => arg === '--run' || arg.startsWith('--reporter'))) {
+    return { kind: 'broad' as const }
   }
-  return { state: 'held' as const }
+  return { kind: 'narrowed' as const }
 }
 
 export function resolveNpmRunner(input: { npmExecPath?: string; platform?: NodeJS.Platform }) {
@@ -369,14 +387,14 @@ git -C /home/user/code/freshell/.worktrees/test-run-gate add \
 git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "feat(testing): add test gate metadata and baseline helpers"
 ```
 
-## Task 3: Add the cross-platform gate wrapper and exercise live-status probing end-to-end
+## Task 3: Add the `flock`-backed gate wrapper and exercise live-status probing end-to-end
 
 **Files:**
 - Modify: `/home/user/code/freshell/.worktrees/test-run-gate/scripts/test-run-gate.ts`
 - Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/fixtures/test-run-gate/fake-heavy-command.ts`
 - Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/integration/server/test-run-gate.test.ts`
 
-**Step 1: Write the failing integration test for serialization, live-status probing, and stale-lease recovery**
+**Step 1: Write the failing integration test for serialization, live-status probing, stale-metadata tolerance, and narrowed passthrough**
 
 Create a small fixture script that sleeps briefly and exits with a requested code:
 
@@ -452,10 +470,8 @@ it('status reports a holder only while the lease is actually live', async () => 
   expect(statusAfterRelease.stdout).not.toContain('Active test run')
 })
 
-it('reclaims a stale lease instead of reporting a dead holder forever', async () => {
-  await fsp.mkdir(leaseDir, { recursive: true })
+it('does not treat leftover holder metadata as an active lock', async () => {
   await fsp.writeFile(holderFile, JSON.stringify({ summary: 'stale', pid: 999999 }))
-  await fsp.writeFile(heartbeatFile, JSON.stringify({ updatedAt: '2026-03-08T00:00:00.000Z' }))
 
   const run = spawnGateProcess({
     cwd: worktreeDir,
@@ -470,34 +486,32 @@ it('reclaims a stale lease instead of reporting a dead holder forever', async ()
   expect(run.output).not.toContain('Active test run: stale')
 })
 
-it('serializes broad runs in forced portable-lock mode', async () => {
+it('allows narrowed invocations to bypass the broad-run gate while still using npm scripts', async () => {
   const holder = spawnGateProcess({
     cwd: worktreeDir,
-    summary: 'Portable holder',
+    summary: 'Broad holder',
     env: {
       FRESHELL_TEST_GATE_FAKE_COMMAND: fixturePath,
       FRESHELL_FAKE_HEAVY_SLEEP_MS: '400',
-      FRESHELL_TEST_FORCE_PORTABLE_GATE: '1',
     },
   })
 
-  await holder.waitForOutput('Portable holder')
+  await holder.waitForOutput('Broad holder')
 
-  const waiter = spawnGateProcess({
+  const narrowed = spawnGateProcess({
     cwd: secondWorktreeDir,
-    summary: 'Portable waiter',
+    summary: 'Focused test',
+    forwardedArgs: ['test/unit/server/foo.test.ts', '-t', 'focus'],
     env: {
       FRESHELL_TEST_GATE_FAKE_COMMAND: fixturePath,
       FRESHELL_FAKE_HEAVY_SLEEP_MS: '50',
-      FRESHELL_TEST_FORCE_PORTABLE_GATE: '1',
-      FRESHELL_TEST_WAIT_TIMEOUT_MS: '5000',
-      FRESHELL_TEST_POLL_INTERVAL_MS: '100',
     },
   })
 
-  await waiter.waitForOutput('Another heavyweight test run is already active')
+  await expect(narrowed.exitCode).resolves.toBe(0)
   await expect(holder.exitCode).resolves.toBe(0)
-  await expect(waiter.exitCode).resolves.toBe(0)
+  expect(narrowed.output).toContain('Bypassing full-suite gate for narrowed invocation')
+  expect(narrowed.output).toContain('test/unit/server/foo.test.ts')
 })
 ```
 
@@ -519,31 +533,62 @@ Expected: FAIL because the CLI wrapper and fixture are not implemented yet.
 Finish `scripts/test-run-gate.ts` with:
 - CLI parsing for `full`, `unit`, `client`, `server`, `integration`, `check`, `verify`, `coverage`, and `status`.
 - `--summary` parsing with `FRESHELL_TEST_SUMMARY` fallback.
+- arbitrary extra-arg passthrough after `--`, preserved exactly for the underlying raw npm script.
 - session/thread detection from `CODEX_THREAD_ID` first, then other known agent session env vars if present.
 - git context discovery using `resolveGitCheckoutRoot`, `resolveGitRepoRoot`, `resolveGitCommonDir`, and Git `rev-parse HEAD`.
-- a cross-platform lease rooted at `buildGatePaths(commonGitDir).leaseDir`, acquired with atomic `fs.mkdir`.
-- heartbeat updates for the current holder plus PID-liveness checks for stale recovery.
+- a `flock`-backed critical section rooted at `buildGatePaths(commonGitDir).lockFile`.
 - a bounded wait loop with minute-scale defaults and test-only env overrides.
 - advisory `holder.json` and `last-results.json` reads/writes.
-- a `status` path that performs the same immediate lease probe and stale cleanup as runners, but never waits and never starts a test command.
+- invocation classification that bypasses the gate for narrowed runs while still using the sanctioned npm script entrypoint.
+- a `status` path that performs the same immediate non-blocking `flock` probe as runners, but never waits and never starts a test command.
 - cross-platform npm execution using `process.execPath` + `process.env.npm_execpath` when available, with `npm.cmd`/`npm` fallback outside npm.
 
-Implement the execution mapping through private raw scripts so every sanctioned broad package-script entrypoint goes through the same gate:
+Implement the execution mapping through private raw scripts so every sanctioned broad package-script entrypoint goes through the same gate while preserving forwarded args for the underlying Vitest step:
 
 ```ts
-const COMMANDS: Record<CommandKey, { label: string; npmScript: string }> = {
-  full: { label: 'npm test', npmScript: '_test:full:raw' },
-  unit: { label: 'npm run test:unit', npmScript: '_test:unit:raw' },
-  client: { label: 'npm run test:client', npmScript: '_test:client:raw' },
-  server: { label: 'npm run test:server', npmScript: '_test:server:raw' },
-  integration: { label: 'npm run test:integration', npmScript: '_test:integration:raw' },
-  check: { label: 'npm run check', npmScript: '_check:raw' },
-  verify: { label: 'npm run verify', npmScript: '_verify:raw' },
-  coverage: { label: 'npm run test:coverage', npmScript: '_test:coverage:raw' },
+const COMMANDS: Record<CommandKey, { label: string; buildSteps: (forwardedArgs: string[]) => Array<{ npmScript: string; forwardedArgs: string[] }> }> = {
+  full: {
+    label: 'npm test',
+    buildSteps: (forwardedArgs) => [{ npmScript: '_test:full:raw', forwardedArgs }],
+  },
+  unit: {
+    label: 'npm run test:unit',
+    buildSteps: (forwardedArgs) => [{ npmScript: '_test:unit:raw', forwardedArgs }],
+  },
+  client: {
+    label: 'npm run test:client',
+    buildSteps: (forwardedArgs) => [{ npmScript: '_test:client:raw', forwardedArgs }],
+  },
+  server: {
+    label: 'npm run test:server',
+    buildSteps: (forwardedArgs) => [{ npmScript: '_test:server:raw', forwardedArgs }],
+  },
+  integration: {
+    label: 'npm run test:integration',
+    buildSteps: (forwardedArgs) => [{ npmScript: '_test:integration:raw', forwardedArgs }],
+  },
+  check: {
+    label: 'npm run check',
+    buildSteps: (forwardedArgs) => [
+      { npmScript: 'typecheck', forwardedArgs: [] },
+      { npmScript: '_test:full:raw', forwardedArgs },
+    ],
+  },
+  verify: {
+    label: 'npm run verify',
+    buildSteps: (forwardedArgs) => [
+      { npmScript: 'build', forwardedArgs: [] },
+      { npmScript: '_test:full:raw', forwardedArgs },
+    ],
+  },
+  coverage: {
+    label: 'npm run test:coverage',
+    buildSteps: (forwardedArgs) => [{ npmScript: '_test:coverage:raw', forwardedArgs }],
+  },
 }
 ```
 
-The lease handling should follow this shape:
+The gate handling should follow this shape:
 
 ```ts
 async function waitForGate(paths: GatePaths, holder: HolderRecord): Promise<GateLease> {
@@ -551,14 +596,12 @@ async function waitForGate(paths: GatePaths, holder: HolderRecord): Promise<Gate
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    const snapshot = await probeGateState(paths)
-    if (snapshot.state === 'free') {
-      const lease = await tryAcquireLease(paths, holder)
+    const probe = await probeGate(paths)
+    if (probe.state === 'free') {
+      const lease = await tryAcquireGate(paths.lockFile, holder)
       if (lease) return lease
-    } else if (snapshot.state === 'held') {
-      renderBusyMessage(snapshot.holder, deadline)
     } else {
-      await reclaimStaleLease(paths, snapshot)
+      renderBusyMessage(probe.holder, deadline)
     }
 
     if (Date.now() >= deadline) {
@@ -570,7 +613,17 @@ async function waitForGate(paths: GatePaths, holder: HolderRecord): Promise<Gate
 }
 ```
 
-`probeGateState()` must be the single source of truth for both waiters and `status`: it checks whether the lease directory exists, reads holder and heartbeat metadata, verifies PID liveness, and classifies the state as `free`, `held`, or `stale`. `status` may use that probe and may reclaim a provably stale lease, but it must never block and never start a test command.
+`probeGate()` must be the single source of truth for both waiters and `status`: it attempts a non-blocking `flock` probe against the shared lock file. If the probe acquires the kernel lock, it immediately releases it and reports `free`; if the probe fails, it reports `held` and may print advisory holder metadata from `holder.json`. Leftover metadata without a held kernel lock must be ignored.
+
+Gate entry must branch on invocation shape before touching the queue:
+
+```ts
+const invocation = classifyInvocation({ commandKey, forwardedArgs })
+if (invocation.kind === 'narrowed') {
+  console.log('Bypassing full-suite gate for narrowed invocation')
+  return runConfiguredSteps(COMMANDS[commandKey].buildSteps(forwardedArgs))
+}
+```
 
 Use a hidden test-only override so the integration suite can substitute the fixture command instead of running the real tests:
 
@@ -609,7 +662,7 @@ git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "feat(testing
 - Modify: `/home/user/code/freshell/.worktrees/test-run-gate/AGENTS.md`
 - Modify: `/home/user/code/freshell/.worktrees/test-run-gate/docs/skills/testing.md`
 
-**Step 1: Update the public npm scripts to use the gate**
+**Step 1: Update the public npm scripts to use the gate while preserving passthrough ergonomics**
 
 Change the public test scripts in `package.json` so every broad non-interactive entrypoint routes through the gate and the raw runners become private:
 
@@ -622,8 +675,6 @@ Change the public test scripts in `package.json` so every broad non-interactive 
     "_test:server:raw": "vitest run --config vitest.server.config.ts",
     "_test:integration:raw": "vitest run --config vitest.server.config.ts test/server",
     "_test:coverage:raw": "vitest run --coverage",
-    "_check:raw": "npm run typecheck && npm run _test:full:raw",
-    "_verify:raw": "npm run build && npm run _test:full:raw",
     "test": "tsx scripts/test-run-gate.ts full",
     "verify": "tsx scripts/test-run-gate.ts verify",
     "check": "tsx scripts/test-run-gate.ts check",
@@ -642,16 +693,26 @@ Change the public test scripts in `package.json` so every broad non-interactive 
 
 This makes every sanctioned broad `npm run test:*` path gated. Only explicit interactive watch/UI workflows and explicit file-scoped raw Vitest commands remain outside the wrapper.
 
+The wrapper must preserve npm passthrough behavior. These commands must still work and must be documented as sanctioned:
+
+```bash
+npm test -- test/unit/server/terminal-registry.test.ts -t "reaping exited terminals"
+npm run test:server -- test/unit/server/sessions-sync/diff.test.ts
+npm run test:client -- test/unit/client/store/panesSlice.test.ts test/unit/client/store/panesPersistence.test.ts
+```
+
+All of those should forward their extra args to the corresponding private raw script and skip the broad-run gate because they are narrowed invocations.
+
 **Step 2: Update agent and testing docs**
 
 Adjust `AGENTS.md` and `docs/skills/testing.md` so they match the new reality:
 - `npm test` is a full gated run, not watch mode.
-- every broad non-interactive npm test script is gated, including `test:unit`, `test:client`, `test:server`, and `test:integration`.
-- `test:server` is normalized to a deterministic gated one-shot server-suite run; `test:watch` and `test:ui` remain the interactive workflows.
+- every broad non-interactive npm test script is gated when run broadly, including `test:unit`, `test:client`, `test:server`, and `test:integration`.
+- those same npm scripts still support `--` passthrough for focused TDD runs, and narrowed invocations bypass the broad-run gate automatically.
 - `npm run test:status` performs a non-blocking live probe, reports an active holder only when the lease is live, and otherwise reports the latest reusable exact-commit baseline.
 - agents should set `FRESHELL_TEST_SUMMARY` or pass `--summary`.
 - private underscore-prefixed raw scripts are internal plumbing, not agent entrypoints.
-- direct `npx vitest run` is for explicit file-targeted test runs only, not for broad config-or-directory runs.
+- direct `npx vitest run` is no longer the recommended workaround for focused runs because the sanctioned npm scripts preserve passthrough targeting.
 
 Use concrete examples:
 
@@ -694,7 +755,8 @@ Extend the integration test so it checks:
 - `status` prints a matching reusable baseline after a clean successful run,
 - failed runs update the "last failure" record but do not present themselves as reusable baselines,
 - holder output includes the wait guidance: poll every minute, be patient for up to one hour, and do not kill a run you did not start,
-- `status` does not report a holder after a stale lease has been reclaimed.
+- `status` does not report a holder when only stale metadata remains,
+- narrowed invocations continue to bypass the queue and still forward their args.
 
 Add assertions like:
 
@@ -736,7 +798,8 @@ Update `scripts/test-run-gate.ts` so:
 - every completed run writes a result record keyed by command,
 - a reusable baseline is shown only when `exitCode === 0`, `cleanWorktree === true`, and `commit` matches the current checkout exactly,
 - failures are still recorded and shown as informational history, but never marked reusable,
-- `status` is read-only in the sense that it never waits and never starts tests, but it still runs the same immediate `probeGateState()` logic as waiters so it can truthfully report `held` versus `free` and reclaim a provably stale lease.
+- `status` is read-only in the sense that it never waits and never starts tests, but it still runs the same immediate non-blocking `probeGate()` logic as waiters so it can truthfully report `held` versus `free`.
+- narrowed invocations never enter the `flock` wait loop, but they still use the same wrapper, metadata collection, and raw-script dispatch path.
 
 The persisted JSON structure should stay small and explicit:
 
@@ -755,6 +818,7 @@ Run:
 cd /home/user/code/freshell/.worktrees/test-run-gate
 npx vitest run test/unit/server/test-run-gate.test.ts test/unit/server/coding-cli/git-metadata.test.ts
 npx vitest run --config vitest.server.config.ts test/integration/server/test-run-gate.test.ts
+FRESHELL_TEST_SUMMARY="Focused verification" npm run test:server -- test/unit/server/sessions-sync/diff.test.ts
 FRESHELL_TEST_SUMMARY="Final verification for test gate" npm run check
 npm run test:status
 ```
