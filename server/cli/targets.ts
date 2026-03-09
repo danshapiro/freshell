@@ -6,12 +6,13 @@ export type TargetContext = {
 
 type ResolveResult = { tabId?: string; paneId?: string; message?: string }
 
-function paneIdOf(entry: string | { id: string; title?: string }) {
+function paneIdOf(entry: string | { id: string; title?: string } | undefined) {
+  if (!entry) return undefined
   return typeof entry === 'string' ? entry : entry.id
 }
 
-function paneTitleOf(entry: string | { id: string; title?: string }) {
-  return typeof entry === 'string' ? undefined : entry.title
+function paneTitleOf(entry: string | { id: string; title?: string } | undefined) {
+  return typeof entry === 'string' || !entry ? undefined : entry.title
 }
 
 export function resolveTarget(target: string, ctx: TargetContext): ResolveResult {

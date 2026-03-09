@@ -44,3 +44,28 @@ it('prefers documented index and tab selectors over pane title collisions', () =
   expect(resolveTarget('0', ctx)).toMatchObject({ tabId: 't1', paneId: 'p1' })
   expect(resolveTarget('alpha.1', ctx)).toMatchObject({ tabId: 't2', paneId: 'p3' })
 })
+
+it('returns pane not found for out-of-range pane selectors instead of throwing', () => {
+  const ctx = {
+    activeTabId: 't1',
+    panesByTab: {
+      t1: [{ id: 'p1', title: 'Shell' }],
+    },
+    tabs: [{ id: 't1', title: 'Alpha', activePaneId: 'p1' }],
+  } as any
+
+  expect(resolveTarget('99', ctx)).toEqual({ tabId: 't1', paneId: undefined, message: 'active tab used' })
+  expect(resolveTarget('Alpha.99', ctx)).toEqual({ tabId: 't1', paneId: 'p1', message: 'pane not found; active pane used' })
+})
+
+it('returns a clean tab match when the matched tab has no panes', () => {
+  const ctx = {
+    activeTabId: 't1',
+    panesByTab: {
+      t1: [],
+    },
+    tabs: [{ id: 't1', title: 'Alpha' }],
+  } as any
+
+  expect(resolveTarget('Alpha', ctx)).toEqual({ tabId: 't1', paneId: undefined, message: 'tab matched; active pane used' })
+})

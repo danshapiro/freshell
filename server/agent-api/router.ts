@@ -129,23 +129,27 @@ export function createAgentApiRouter({
       return
     }
 
-    await configStore.patchTerminalOverride?.(terminalId, { titleOverride: title })
-    registry.updateTitle?.(terminalId, title)
+    try {
+      await configStore.patchTerminalOverride?.(terminalId, { titleOverride: title })
+      registry.updateTitle?.(terminalId, title)
 
-    const meta = terminalMetadata?.list?.().find((entry) => entry.terminalId === terminalId)
-    if (meta?.provider && meta?.sessionId) {
-      try {
-        await configStore.patchSessionOverride?.(makeSessionKey(meta.provider as any, meta.sessionId), {
-          titleOverride: title,
-        })
-        await codingCliIndexer?.refresh?.()
-      } catch {
-        // Match terminals-router semantics: terminal rename persistence is authoritative,
-        // but session-title cascade/index refresh is best-effort.
+      const meta = terminalMetadata?.list?.().find((entry) => entry.terminalId === terminalId)
+      if (meta?.provider && meta?.sessionId) {
+        try {
+          await configStore.patchSessionOverride?.(makeSessionKey(meta.provider as any, meta.sessionId), {
+            titleOverride: title,
+          })
+          await codingCliIndexer?.refresh?.()
+        } catch {
+          // Match terminals-router semantics: terminal rename persistence is authoritative,
+          // but session-title cascade/index refresh is best-effort.
+        }
       }
-    }
 
-    wsHandler?.broadcast?.({ type: 'terminal.list.updated' })
+      wsHandler?.broadcast?.({ type: 'terminal.list.updated' })
+    } catch {
+      // Pane rename is authoritative for orchestration; syncable terminal persistence is best-effort.
+    }
   }
 
   router.post('/tabs', (req, res) => {
@@ -580,17 +584,6 @@ export function createAgentApiRouter({
 
       if (result?.tabId) {
         await persistSyncableTerminalRename(paneSnapshot, name)
-
-        const tabPanes = layoutStore.listPanes?.(result.tabId) || []
-        if (tabPanes.length === 1) {
-          const tabRenameResult = layoutStore.renameTab?.(result.tabId, name)
-          if (tabRenameResult?.tabId) {
-            wsHandler?.broadcastUiCommand({
-              command: 'tab.rename',
-              payload: { id: result.tabId, title: name },
-            })
-          }
-        }
 
         wsHandler?.broadcastUiCommand({
           command: 'pane.rename',
