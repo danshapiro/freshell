@@ -16,7 +16,7 @@ test.describe('WebSocket Reconnection', () => {
     await harness.waitForConnection()
 
     const status = await harness.getConnectionStatus()
-    expect(status).toBe('connected')
+    expect(status).toBe('ready')
   })
 
   test('terminal output resumes after reconnect', async ({ freshellPage, page, harness, terminal }) => {
@@ -46,7 +46,7 @@ test.describe('WebSocket Reconnection', () => {
   test('connection status indicator updates', async ({ freshellPage, page, harness }) => {
     // Verify connection status is reflected in the UI and Redux
     const status = await harness.getConnectionStatus()
-    expect(status).toBe('connected')
+    expect(status).toBe('ready')
 
     const wsState = await page.evaluate(() => {
       return window.__FRESHELL_TEST_HARNESS__?.getWsReadyState()
@@ -71,7 +71,7 @@ test.describe('WebSocket Reconnection', () => {
 
     // App should not crash and should be in a connected state
     const status = await harness.getConnectionStatus()
-    expect(status).toBe('connected')
+    expect(status).toBe('ready')
 
     // Terminal should still be visible
     await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 10_000 })
@@ -79,7 +79,7 @@ test.describe('WebSocket Reconnection', () => {
 
   test('tabs and panes preserved across reconnect', async ({ freshellPage, page, harness }) => {
     // Create multiple tabs
-    const addButton = page.getByRole('button', { name: /new tab|add tab/i })
+    const addButton = page.getByRole('button', { name: /new.*tab/i })
     await addButton.click()
     await harness.waitForTabCount(2)
 

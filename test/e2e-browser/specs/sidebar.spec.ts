@@ -84,7 +84,7 @@ test.describe('Sidebar', () => {
     await terminal.waitForPrompt()
 
     // Create a second tab (which detaches from the first terminal)
-    const addTabButton = page.getByRole('button', { name: /new tab|add tab/i })
+    const addTabButton = page.getByRole('button', { name: /new.*tab/i })
     await addTabButton.click()
     await harness.waitForTabCount(2)
 

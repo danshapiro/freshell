@@ -170,12 +170,12 @@ test.describe('Editor Pane', () => {
     await expect(monaco.getByText(marker)).toBeVisible({ timeout: 5_000 })
 
     // Create a new tab and switch to it
-    const addTabButton = page.getByRole('button', { name: /new tab|add tab/i })
+    const addTabButton = page.getByRole('button', { name: /new.*tab/i })
     await addTabButton.click()
     await harness.waitForTabCount(2)
 
     // Switch back to the first tab
-    await page.getByRole('tab').first().click()
+    await page.locator('[data-context="tab"]').first().click()
     await page.waitForTimeout(500)
 
     // Editor content should still contain the marker

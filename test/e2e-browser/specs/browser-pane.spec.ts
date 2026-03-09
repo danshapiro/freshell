@@ -101,12 +101,12 @@ test.describe('Browser Pane', () => {
     await iframe.waitFor({ state: 'attached', timeout: 10_000 })
 
     // Switch to a new tab
-    const addTabButton = page.getByRole('button', { name: /new tab|add tab/i })
+    const addTabButton = page.getByRole('button', { name: /new.*tab/i })
     await addTabButton.click()
     await harness.waitForTabCount(2)
 
     // Switch back to the first tab
-    await page.getByRole('tab').first().click()
+    await page.locator('[data-context="tab"]').first().click()
     await page.waitForTimeout(500)
 
     // Iframe should still have the health URL

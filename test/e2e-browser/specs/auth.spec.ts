@@ -7,7 +7,7 @@ test.describe('Authentication', () => {
     const modal = page.getByRole('dialog')
     await expect(modal).toBeVisible({ timeout: 10_000 })
     // Should have a token input
-    const input = page.getByPlaceholderText(/token/i)
+    const input = page.getByPlaceholder(/token/i)
     await expect(input).toBeVisible()
   })
 
@@ -20,13 +20,13 @@ test.describe('Authentication', () => {
   test('authenticates with correct token via URL', async ({ freshellPage, harness }) => {
     // freshellPage already has the correct token
     const status = await harness.getConnectionStatus()
-    expect(status).toBe('connected')
+    expect(status).toBe('ready')
   })
 
   test('authenticates via auth modal input', async ({ page, serverInfo, harness }) => {
     await page.goto(serverInfo.baseUrl)
     // Wait for the auth modal
-    const input = page.getByPlaceholderText(/token/i)
+    const input = page.getByPlaceholder(/token/i)
     await expect(input).toBeVisible({ timeout: 10_000 })
 
     // Type the correct token
@@ -35,13 +35,15 @@ test.describe('Authentication', () => {
     const submitButton = page.getByRole('button', { name: /connect|submit|go/i })
     await submitButton.click()
 
-    // Wait for connection
+    // After auth, navigate with ?e2e=1 to activate the test harness
+    // (the initial load was without e2e=1, so no harness)
+    await page.goto(`${serverInfo.baseUrl}/?e2e=1`)
     await harness.waitForHarness()
     await harness.waitForConnection()
 
     // Verify connected
     const status = await harness.getConnectionStatus()
-    expect(status).toBe('connected')
+    expect(status).toBe('ready')
   })
 
   test('API rejects requests without auth header', async ({ serverInfo }) => {

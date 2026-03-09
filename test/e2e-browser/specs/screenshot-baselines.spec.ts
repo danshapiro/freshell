@@ -27,7 +27,7 @@ test.describe('Screenshot Baselines', () => {
   })
 
   test('multiple tabs', async ({ freshellPage, page, harness }) => {
-    const addButton = page.getByRole('button', { name: /new tab|add tab/i })
+    const addButton = page.getByRole('button', { name: /new.*tab/i })
     await addButton.click()
     await addButton.click()
     await harness.waitForTabCount(3)

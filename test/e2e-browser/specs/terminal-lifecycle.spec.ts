@@ -54,16 +54,14 @@ test.describe('Terminal Lifecycle', () => {
     await terminal.waitForOutput('before-switch-marker')
 
     // Create a new tab
-    const addTabButton = page.getByRole('button', { name: /new tab|add tab/i })
+    const addTabButton = page.getByRole('button', { name: /new.*tab/i })
     await addTabButton.click()
 
     // Wait for second tab
     await harness.waitForTabCount(2)
 
-    // Switch back to first tab (click first tab)
-    const firstTab = page.locator('[data-tab-index="0"]').or(
-      page.getByRole('tab').first()
-    )
+    // Switch back to first tab (click first tab element)
+    const firstTab = page.locator('[data-context="tab"]').first()
     await firstTab.click()
 
     // Previous output should still be visible (scrollback preserved)
@@ -90,15 +88,15 @@ test.describe('Terminal Lifecycle', () => {
     await terminal.executeCommand('echo "detach-test" && sleep 0.1 && echo "still-running"')
 
     // Create new tab (detaches from current terminal)
-    const addTabButton = page.getByRole('button', { name: /new tab|add tab/i })
+    const addTabButton = page.getByRole('button', { name: /new.*tab/i })
     await addTabButton.click()
     await harness.waitForTabCount(2)
 
-    // Wait a moment
+    // Wait a moment for command to complete
     await page.waitForTimeout(500)
 
     // Switch back to first tab
-    const firstTab = page.getByRole('tab').first()
+    const firstTab = page.locator('[data-context="tab"]').first()
     await firstTab.click()
 
     // Should see the output from the background process
@@ -138,14 +136,15 @@ test.describe('Terminal Lifecycle', () => {
     await terminal.waitForTerminal()
 
     // Create a second tab first
-    const addTabButton = page.getByRole('button', { name: /new tab|add tab/i })
+    const addTabButton = page.getByRole('button', { name: /new.*tab/i })
     await addTabButton.click()
     await harness.waitForTabCount(2)
 
     // Switch back to first tab and close it
-    const firstTab = page.getByRole('tab').first()
+    const firstTab = page.locator('[data-context="tab"]').first()
     await firstTab.click()
-    const closeButton = page.getByRole('button', { name: /close/i }).first()
+    // Close button is inside the tab item (aria-label="Close tab")
+    const closeButton = firstTab.getByRole('button', { name: /close/i })
     await closeButton.click()
 
     // Should now have 1 tab
@@ -176,18 +175,17 @@ test.describe('Terminal Lifecycle', () => {
     await terminal.waitForTerminal()
     await terminal.waitForPrompt()
 
-    // Generate enough output to scroll
-    for (let i = 0; i < 50; i++) {
-      await terminal.executeCommand(`echo "scrollback-line-${i}"`)
-    }
+    // Generate enough output to scroll using a single command
+    await terminal.executeCommand('for i in $(seq 0 49); do echo "scrollback-line-$i"; done')
 
     // Wait for last line
     await terminal.waitForOutput('scrollback-line-49', { timeout: 20_000 })
 
-    // Early lines should still be in the buffer (scrollback)
-    const allText = await terminal.getVisibleText()
-    // Note: visible text only shows what's on screen, not scrollback
-    // The scrollback is preserved in xterm.js buffer, which we verify
-    // by the fact that the terminal still works correctly
+    // Earlier lines should still be in the buffer (scrollback)
+    await terminal.waitForOutput('scrollback-line-0', { timeout: 5_000 })
+
+    // Terminal should still be responsive after all that output
+    await terminal.executeCommand('echo "after-scrollback"')
+    await terminal.waitForOutput('after-scrollback', { timeout: 10_000 })
   })
 })

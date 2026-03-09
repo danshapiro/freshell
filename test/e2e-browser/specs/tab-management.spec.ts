@@ -7,19 +7,19 @@ test.describe('Tab Management', () => {
   })
 
   test('add tab button creates new tab', async ({ freshellPage, page, harness }) => {
-    const addButton = page.getByRole('button', { name: /new tab|add tab/i })
+    const addButton = page.getByRole('button', { name: /new.*tab/i })
     await addButton.click()
     await harness.waitForTabCount(2)
   })
 
   test('clicking tab switches to it', async ({ freshellPage, page, harness }) => {
     // Create second tab
-    const addButton = page.getByRole('button', { name: /new tab|add tab/i })
+    const addButton = page.getByRole('button', { name: /new.*tab/i })
     await addButton.click()
     await harness.waitForTabCount(2)
 
     // Click first tab
-    const firstTab = page.getByRole('tab').first()
+    const firstTab = page.locator('[data-context="tab"]').first()
     await firstTab.click()
 
     // Verify active tab changed
@@ -29,13 +29,14 @@ test.describe('Tab Management', () => {
 
   test('close tab removes it', async ({ freshellPage, page, harness }) => {
     // Create second tab
-    const addButton = page.getByRole('button', { name: /new tab|add tab/i })
+    const addButton = page.getByRole('button', { name: /new.*tab/i })
     await addButton.click()
     await harness.waitForTabCount(2)
 
-    // Close the second tab (close button on tab)
-    const closeButtons = page.getByRole('button', { name: /close tab/i })
-    await closeButtons.last().click()
+    // Close the second tab (close button on tab has title="Close (Shift+Click to kill)")
+    const secondTab = page.locator('[data-context="tab"]').last()
+    const closeButton = secondTab.getByRole('button', { name: /close/i })
+    await closeButton.click()
 
     await harness.waitForTabCount(1)
   })
@@ -54,7 +55,7 @@ test.describe('Tab Management', () => {
 
   test('tab rename via double-click', async ({ freshellPage, page, harness }) => {
     // Double-click the tab to enter rename mode
-    const tab = page.getByRole('tab').first()
+    const tab = page.locator('[data-context="tab"]').first()
     await tab.dblclick()
 
     // Should show an input field
@@ -71,7 +72,7 @@ test.describe('Tab Management', () => {
 
   test('tabs persist across page reload', async ({ freshellPage, page, harness, serverInfo }) => {
     // Create a second tab and rename the first
-    const addButton = page.getByRole('button', { name: /new tab|add tab/i })
+    const addButton = page.getByRole('button', { name: /new.*tab/i })
     await addButton.click()
     await harness.waitForTabCount(2)
 
@@ -96,21 +97,21 @@ test.describe('Tab Management', () => {
 
   test('tab overflow shows scroll controls', async ({ freshellPage, page, harness }) => {
     // Create many tabs to trigger overflow
-    const addButton = page.getByRole('button', { name: /new tab|add tab/i })
+    const addButton = page.getByRole('button', { name: /new.*tab/i })
     for (let i = 0; i < 10; i++) {
       await addButton.click()
     }
     await harness.waitForTabCount(11)
 
     // Check that tabs are still navigable
-    const tabs = page.getByRole('tab')
+    const tabs = page.locator('[data-context="tab"]')
     const tabCount = await tabs.count()
     expect(tabCount).toBe(11)
   })
 
   test('drag and drop reorders tabs', async ({ freshellPage, page, harness }) => {
     // Create tabs
-    const addButton = page.getByRole('button', { name: /new tab|add tab/i })
+    const addButton = page.getByRole('button', { name: /new.*tab/i })
     await addButton.click()
     await addButton.click()
     await harness.waitForTabCount(3)
@@ -120,8 +121,8 @@ test.describe('Tab Management', () => {
     const tabIdsBefore = stateBefore.tabs.tabs.map((t: any) => t.id)
 
     // Drag first tab to last position
-    const firstTab = page.getByRole('tab').first()
-    const lastTab = page.getByRole('tab').last()
+    const firstTab = page.locator('[data-context="tab"]').first()
+    const lastTab = page.locator('[data-context="tab"]').last()
 
     const firstBox = await firstTab.boundingBox()
     const lastBox = await lastTab.boundingBox()
