@@ -1,6 +1,6 @@
 # Issue 163 FreshClaude Token Budget Indicator Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task.
+> **For Claude:** REQUIRED SUB-SKILL: Use `@trycycle-executing` to implement this plan task-by-task.
 
 **Goal:** Add the existing pane-header token budget "% used" indicator to FreshClaude panes, using the same formatting, placement, and Claude session metadata semantics already used for CLI terminal panes.
 
@@ -17,8 +17,13 @@
 - The server and SDK plumbing already provide the required identity chain:
   - `server/sdk-bridge.ts` emits `cliSessionId`
   - `src/lib/sdk-message-handler.ts` stores it in `agentChat`
-  - `AgentChatView` persists it back to `resumeSessionId`
+  - `src/components/agent-chat/AgentChatView.tsx` persists it back to `resumeSessionId`
   No server changes should be made unless a test proves that identity chain is missing.
+- Current code inspection shows the real gap is entirely client-side:
+  - `src/components/panes/PaneContainer.tsx` only resolves runtime metadata for `kind: 'terminal'`
+  - `src/lib/format-terminal-title-meta.ts` already contains the shared percent/tooltip formatting logic we want
+  - `src/store/types.ts` is missing `gitBranch`, `isDirty`, and `tokenUsage` on `CodingCliSession`, even though the indexed-session payload already includes them
+- Because the formatter already does the right display work, the clean path is to adapt FreshClaude onto that existing contract, not to invent a second header formatter and not to infer percentages from SDK totals.
 - Keep scope tight to FreshClaude. This is not a broader token-budget refactor and not a generic agent-chat header project. The only structural cleanup worth doing is the minimum needed to let FreshClaude reuse the existing formatter without type hacks.
 
 ## Key Decisions
@@ -30,6 +35,7 @@
   - `pane.content.resumeSessionId`
   No cwd heuristics and no approximation from SDK totals.
 - Use `getAgentChatProviderConfig('freshclaude')?.codingCliProvider` instead of hardcoding `'claude'`, but only wire this behavior into FreshClaude panes for this issue.
+- Do not extract a new cross-app selector or shared lookup utility for this issue. A small local helper in `PaneContainer` is the right scope until a second consumer exists.
 - `docs/index.html` does not need an update. This is pane-header parity inside an existing UI pattern, not a new feature surface.
 
 ## Task 1: Align Runtime Metadata Typing Before Feature Tests
