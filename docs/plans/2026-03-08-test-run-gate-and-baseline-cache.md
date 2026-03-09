@@ -63,6 +63,7 @@
     - watch or UI mode
     - explicit file-targeted runs where every positional selector resolves to a file and no known broad suite-shaping selector is present
     - explicit file-targeted runs with `--config` or `-c` when every positional selector resolves to a file and no other broad suite-shaping selector is present
+    - public single-phase adapters that forward only file-targeted selectors, where every forwarded positional selector resolves to a file and no known broad suite-shaping selector is present; this includes `test:unit`, `test:integration`, `test:client`, `test:client:all`, and `test:server:without-logger`
     - raw Vitest subcommands `watch`, `dev`, `related`, and `bench`
     - raw non-test operational flags and modes such as `--standalone` and `--mergeReports`
     - public `test:server` and public `test:server:logger-separation`
@@ -459,28 +460,34 @@
   - Current-main public commands map to exactly one outcome.
   - `package.json` matches the frozen script contract exactly for every public test command, for `postinstall`, and for `devDependencies.patch-package`.
   - Trailing argv is forwarded: examples include `npm run test:unit -- <fixture-client-test-file>` and `npm run test:coverage -- --reporter=dot`.
+  - Every file-targeted public-adapter delegation case in this task uses the same real resolved fixture paths or explicit injected resolver seam from Task 1; no synthetic placeholder strings are allowed.
   - Delegated public scripts still classify trailing args through the wrapper:
     - `npm run test:server -- --run --coverage` becomes a gated broad run instead of bypassing the gate
     - `npm run test:watch -- --run` becomes a gated broad run instead of bypassing the gate
+  - File-targeted single-phase public adapters preserve narrow delegation:
+    - `npm run test:unit -- <fixture-client-test-file>` delegates upstream with no gate side effects
+    - `npm run test:client -- <fixture-client-test-file>` delegates upstream with no gate side effects
+    - `npm run test:client:all -- <fixture-client-test-file>` delegates upstream with no gate side effects
+    - `npm run test:integration -- <fixture-server-test-file>` delegates upstream with no gate side effects
+    - `npm run test:server:without-logger -- <fixture-server-test-file>` delegates upstream with no gate side effects
   - Multi-phase trailing argv behavior is explicit:
     - `npm run test -- --reporter=dot` forwards to both split Vitest phases
     - `npm run test -- --silent` forwards to both split Vitest phases
     - `npm run test -- --color`, `--no-color`, `--tty`, and `--clearScreen` are allowed and forwarded to both split Vitest phases
     - `npm run test:server:all -- --reporter=dot` forwards to both server Vitest phases
     - `npm run check -- --reporter=dot` forwards only to the nested test phase, not typecheck
-    - `npm run check -- --silent` forwards only to the nested test phase, not typecheck
-    - `npm run verify -- --reporter=dot` forwards only to the nested test phase, not build
-    - `npm run verify -- --color`, `--no-color`, `--tty`, and `--clearScreen` forward only to the nested test phase, not build
+    - `npm run check -- --silent`, `--color`, `--no-color`, `--tty`, and `--clearScreen` forward only to the nested test phase, not typecheck
+    - `npm run verify -- --reporter=dot`, `--silent`, `--color`, `--no-color`, `--tty`, and `--clearScreen` forward only to the nested test phase, not build
     - `npm run test -- <fixture-client-test-file>` is rejected with an actionable error
     - `npm run test:server:all -- <fixture-server-test-file>` is rejected with an actionable error
     - `npm run check -- <fixture-client-test-file>` is rejected with an actionable error
     - `npm run verify -- <fixture-client-test-file>` is rejected with an actionable error
     - `npm run test -- --project server`, `npm run test:server:all -- --dir test/server`, `npm run check -- -t name`, and `npm run verify -- --changed` are rejected with an actionable error instead of being fanned out across phases
-    - `npm run test -- --outputFile=tmp.json`, `npm run test:server:all -- --outputFile tmp.json`, `npm run check -- --outputFile=tmp.json`, and `npm run verify -- --outputFile tmp.json` are rejected with an actionable error until explicit per-phase remapping or artifact-merge semantics exist
+    - `npm run test -- --outputFile=tmp.json`, `npm run test:server:all -- --outputFile tmp.json`, `npm run check -- --outputFile=tmp.json`, `npm run check -- --outputFile tmp.json`, `npm run verify -- --outputFile=tmp.json`, and `npm run verify -- --outputFile tmp.json` are rejected with an actionable error until explicit per-phase remapping or artifact-merge semantics exist
     - false-valued non-allowlisted suite-shaping forms such as `npm run test -- --coverage=false`, `npm run test:server:all -- --coverage.enabled false`, `npm run check -- --coverage=false`, and `npm run verify -- --coverage.enabled=false` are rejected with the same actionable error instead of being fanned out
     - other non-allowlisted forwarded flags such as `npm run test -- --isolate=false`, `npm run test:server:all -- --bail=0`, `npm run check -- --maxWorkers=1`, and `npm run verify -- --passWithNoTests=false` are rejected with the same actionable error instead of being fanned out
     - `npm run check -- --coverage` and `npm run verify -- --coverage` are rejected with an actionable error
-  - `test`, `test:all`, `test:client:all`, `test:server:all`, `test:server:without-logger`, `test:unit`, `test:integration`, `test:client`, `check`, `verify`, and `test:coverage` are `gated broad run`.
+  - `test`, `test:all`, `test:client:all`, `test:server:all`, `test:server:without-logger`, `test:unit`, `test:integration`, `test:client`, `check`, `verify`, and `test:coverage` are `gated broad run` only when classification does not land in one of the frozen delegated narrow cases above.
   - `test:watch`, `test:ui`, `test:server`, and `test:server:logger-separation` delegate upstream by default, but still pass through wrapper classification first.
   - `test` and `test:all` preserve the split `client-all` then `server-all` phase contract.
   - `test:server:all` preserves the split `without-logger` then `logger-separation` phase contract.
@@ -532,6 +539,8 @@
   - top-level adapters that call underlying phases directly from the manifest instead of recursively invoking other gated npm scripts
   - delegated public scripts implemented as wrapper-backed adapters so trailing args are reclassified before handoff
   - adapter argv forwarding so trailing args after `--` are appended to the adapter’s declared upstream command and also participate in classification/reuse decisions when they are suite-shaping
+  - explicit narrow delegation carve-outs for file-targeted single-phase public adapters:
+    - if `test:unit`, `test:integration`, `test:client`, `test:client:all`, or `test:server:without-logger` receives only resolved file selectors and no broad suite-shaping flags, classify as `delegate upstream` instead of gated broad work
   - explicit multi-phase forwarding rules:
     - duplicate only allowlisted presentation-only flags across each Vitest phase in split aggregates
     - reject any forwarded non-allowlisted flags on aggregate and mixed adapters with a clear error, including suite-shaping, execution-semantic, and false-valued forms
@@ -586,6 +595,7 @@
 - Create: `patches/vitest+3.2.4.patch`
 - Modify: `package.json`
 - Modify: `package-lock.json`
+- Modify: `scripts/testing/test-run-upstream.ts`
 - Create: `test/integration/server/vitest-patch-adapter.test.ts`
 
 - [ ] **Step 1: Write the failing patched-Vitest integration tests**
@@ -655,6 +665,7 @@
   ```bash
   git -C /home/user/code/freshell/.worktrees/test-run-gate add \
     package.json package-lock.json \
+    scripts/testing/test-run-upstream.ts \
     scripts/testing/vitest-patched-entry.mjs \
     patches/vitest+3.2.4.patch \
     test/fixtures/test-run-gate/fake-upstream.ts \
@@ -683,9 +694,12 @@
   - forwarded truthy coverage flags making reusable public adapters such as `test:unit` and `test:client:all` become non-reusable for that invocation
   - forwarded false-valued coverage flags on reusable public adapters such as `test:unit` and `test:client:all` not disabling reuse
   - forwarded `--reporter=json --outputFile=tmp.json` making reusable single-phase public adapters such as `test:unit` execute fresh work instead of reusing a baseline
+  - file-targeted single-phase public adapters such as `test:unit`, `test:client`, `test:client:all`, `test:integration`, and `test:server:without-logger` delegating upstream when trailing args resolve to real fixture files
+  - mixed adapters such as `check` and `verify` forwarding allowlisted presentation flags only to the nested Vitest phase, never to `build` or `typecheck`
   - mixed adapters such as `check` and `verify` rejecting forwarded coverage flags with an actionable error
   - aggregate adapters such as `test`, `test:all`, and `test:server:all` rejecting false-valued non-allowlisted suite-shaping flags such as `--coverage=false` and `--coverage.enabled false`
   - aggregate adapters rejecting `--outputFile` until explicit per-phase remapping or artifact-merge semantics exist
+  - mixed adapters rejecting `--outputFile` in both `--outputFile=tmp.json` and `--outputFile tmp.json` forms
   - aggregate and mixed adapters rejecting other non-allowlisted forwarded flags such as `--isolate=false`, `--bail=0`, and `--maxWorkers=1`
   - `check` whole-workload reuse
   - `verify` gated but never reusable
@@ -717,7 +731,20 @@
 
 - [ ] **Step 2: Run the targeted gate verification suite during implementation**
 
-  Until Task 5 is complete, do not run the real full-suite commands. Use only the targeted gate tests:
+  Until Task 5 is complete, do not run the real full-suite commands. Before Task 5 creates the patched-Vitest integration test, run only:
+
+  ```bash
+  cd /home/user/code/freshell/.worktrees/test-run-gate
+  npx vitest run --config vitest.server.config.ts \
+    test/unit/server/coding-cli/utils.test.ts \
+    test/unit/server/test-run-classification.test.ts \
+    test/unit/server/test-run-gate-state.test.ts \
+    test/unit/server/test-run-baselines.test.ts \
+    test/unit/server/test-run-adapters.test.ts \
+    test/integration/server/broad-one-shot-test-run.test.ts
+  ```
+
+  After Task 5 creates `test/integration/server/vitest-patch-adapter.test.ts`, extend the targeted suite to:
 
   ```bash
   cd /home/user/code/freshell/.worktrees/test-run-gate
@@ -794,10 +821,11 @@
 - Aggregate and mixed adapters reject forwarded suite-shaping flags and positional selectors instead of guessing how to fan them out.
 - Aggregate and mixed adapters also reject other non-allowlisted forwarded semantic flags, including false-valued forms such as `--isolate=false`, `--bail=0`, and `--maxWorkers=1`.
 - Aggregate adapters duplicate only the frozen presentation-flag allowlist: `--reporter`, `--silent`, `--color`, `--no-color`, `--tty`, and `--clearScreen`.
-- Mixed adapters also accept only that same frozen presentation-flag allowlist on their nested Vitest phase, and the plan now proves `--reporter`, `--silent`, `--color`, `--no-color`, `--tty`, and `--clearScreen` with `check`/`verify` examples.
+- Mixed adapters also accept only that same frozen presentation-flag allowlist on their nested Vitest phase, and Task 4 plus Task 6 prove that those flags reach only the nested Vitest phase, never `build` or `typecheck`.
 - Aggregate and mixed adapters reject `--outputFile` and other non-allowlisted forwarded semantic flags, including false-valued coverage forms such as `--coverage=false` and `--coverage.enabled false`.
 - Non-test operational raw Vitest modes and flags bypass the gate instead of being coerced into broad test runs.
 - `--config/-c` plus file-only selectors stay delegated so targeted server one-shots do not hit the broad gate.
+- File-targeted public single-phase adapters stay delegated when trailing args resolve to files and no broad selector is present.
 - `test`, `test:all`, and `test:server:all` preserve the current split phase contracts from `main`.
 - `test:server:logger-separation` keeps its current single-fork isolation flags.
 - `test:coverage` and `verify` are gated but never reusable.
