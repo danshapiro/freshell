@@ -91,13 +91,13 @@ function ToolStrip({ pairs, isStreaming, completedToolOffset, autoExpandAbove, s
     <div
       role="region"
       aria-label="Tool strip"
-      className="my-1"
+      className="my-0.5"
     >
       {/* Collapsed view: single-line reel with tool-colored border + chevron */}
       {!expanded && (
         <div
           className={cn(
-            'flex items-center gap-1 px-2 py-1 text-xs min-w-0 border-l-2',
+            'flex items-center gap-1 px-2 py-0.5 text-xs min-w-0 border-l-2',
             hasErrors
               ? 'border-l-[hsl(var(--claude-error))]'
               : 'border-l-[hsl(var(--claude-tool))]',
@@ -134,7 +134,7 @@ function ToolStrip({ pairs, isStreaming, completedToolOffset, autoExpandAbove, s
           <button
             type="button"
             onClick={handleToggle}
-            className="shrink-0 p-0.5 hover:bg-accent/50 rounded transition-colors ml-2"
+            className="ml-1.5 shrink-0 rounded p-0.5 transition-colors hover:bg-accent/50"
             aria-label="Toggle tool details"
           >
             <ChevronRight className="h-3 w-3 rotate-90 transition-transform" />

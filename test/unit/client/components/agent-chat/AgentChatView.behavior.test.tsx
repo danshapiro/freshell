@@ -175,6 +175,35 @@ describe('AgentChatView thinking indicator', () => {
   })
 })
 
+describe('AgentChatView density', () => {
+  afterEach(cleanup)
+
+  it('uses tighter status and message area spacing', () => {
+    const store = makeStore()
+    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
+    store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'Hello' }))
+    store.dispatch(addAssistantMessage({
+      sessionId: 'sess-1',
+      content: [{ type: 'text', text: 'Hi there' }],
+    }))
+    store.dispatch(setSessionStatus({ sessionId: 'sess-1', status: 'idle' }))
+
+    const { container } = render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+      </Provider>,
+    )
+
+    const statusBar = screen.getByText('Ready').closest('div') as HTMLElement
+    expect(statusBar.className).toContain('py-1')
+
+    const scrollArea = container.querySelector('[data-context="agent-chat"]') as HTMLElement
+    expect(scrollArea.className).toContain('px-3')
+    expect(scrollArea.className).toContain('py-3')
+    expect(scrollArea.className).toContain('space-y-2')
+  })
+})
+
 describe('AgentChatView turn-pairing edge cases', () => {
   afterEach(cleanup)
 

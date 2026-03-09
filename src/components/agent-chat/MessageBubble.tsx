@@ -171,7 +171,7 @@ function MessageBubble({
   return (
     <div
       className={cn(
-        'max-w-prose pl-3 py-1 text-sm',
+        'max-w-prose pl-2.5 py-0.5 text-sm',
         role === 'user'
           ? 'border-l-[3px] border-l-[hsl(var(--claude-user))]'
           : 'border-l-2 border-l-[hsl(var(--claude-assistant))]'
@@ -182,10 +182,13 @@ function MessageBubble({
       {groups.map((group) => {
         if (group.kind === 'text') {
           if (role === 'user') {
-            return <p key={group.index} className="whitespace-pre-wrap">{group.block.text}</p>
+            return <p key={group.index} className="whitespace-pre-wrap leading-5">{group.block.text}</p>
           }
           return (
-            <div key={group.index} className="prose prose-sm dark:prose-invert max-w-none">
+            <div
+              key={group.index}
+              className="prose prose-sm dark:prose-invert max-w-none [&_h1]:my-2 [&_h2]:my-1.5 [&_h3]:my-1.5 [&_p]:my-1 [&_pre]:my-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5"
+            >
               <LazyMarkdown
                 content={group.block.text!}
                 fallback={<p className="whitespace-pre-wrap">{group.block.text}</p>}
@@ -197,11 +200,11 @@ function MessageBubble({
         if (group.kind === 'thinking') {
           if (!showThinking) return null
           return (
-            <details key={group.index} className="text-xs text-muted-foreground mt-1">
+            <details key={group.index} className="text-xs text-muted-foreground mt-0.5">
               <summary className="cursor-pointer select-none">
                 Thinking ({group.block.thinking!.length.toLocaleString()} chars)
               </summary>
-              <pre className="mt-1 whitespace-pre-wrap text-xs opacity-70">{group.block.thinking}</pre>
+              <pre className="mt-0.5 whitespace-pre-wrap text-xs opacity-70">{group.block.thinking}</pre>
             </details>
           )
         }
@@ -224,7 +227,7 @@ function MessageBubble({
       })}
 
       {showTimecodes && (timestamp || model) && (
-        <div className="flex items-center gap-2 text-xs text-muted-foreground mt-1">
+        <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
           {timestamp && (
             <time>{new Date(timestamp).toLocaleTimeString()}</time>
           )}

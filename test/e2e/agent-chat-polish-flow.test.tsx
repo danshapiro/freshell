@@ -119,6 +119,36 @@ describe('freshclaude polish e2e: left-border message layout', () => {
   })
 })
 
+describe('freshclaude polish e2e: compact density', () => {
+  afterEach(cleanup)
+
+  it('uses tighter scroll and bubble spacing to fit more content on screen', () => {
+    const store = makeStore()
+    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
+    store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'Hello Claude' }))
+    store.dispatch(addAssistantMessage({
+      sessionId: 'sess-1',
+      content: [{ type: 'text', text: 'Hello human' }],
+    }))
+    store.dispatch(setSessionStatus({ sessionId: 'sess-1', status: 'idle' }))
+
+    const { container } = render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+      </Provider>,
+    )
+
+    const scrollArea = container.querySelector('[data-context="agent-chat"]') as HTMLElement
+    expect(scrollArea.className).toContain('px-3')
+    expect(scrollArea.className).toContain('py-3')
+    expect(scrollArea.className).toContain('space-y-2')
+
+    const messages = screen.getAllByRole('article')
+    expect(messages[0].className).toContain('py-0.5')
+    expect(messages[1].className).toContain('py-0.5')
+  })
+})
+
 describe('freshclaude polish e2e: tool block expand/collapse', () => {
   afterEach(() => {
     cleanup()

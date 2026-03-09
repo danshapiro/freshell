@@ -46,7 +46,7 @@ function CollapsedTurn({
 
   if (expanded) {
     return (
-      <div className="space-y-3">
+      <div className="space-y-2">
         <button
           type="button"
           onClick={() => setExpanded(false)}

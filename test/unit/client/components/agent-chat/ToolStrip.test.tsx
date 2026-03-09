@@ -44,6 +44,16 @@ describe('ToolStrip', () => {
     expect(screen.getByRole('button', { name: /toggle tool details/i })).toBeInTheDocument()
   })
 
+  it('uses compact spacing in collapsed mode', () => {
+    const pairs = [makePair('Bash', { command: 'ls' }, 'output')]
+    const { container } = render(<ToolStrip pairs={pairs} isStreaming={false} />)
+    const strip = screen.getByRole('region', { name: /tool strip/i })
+    expect(strip.className).toContain('my-0.5')
+
+    const collapsedRow = container.querySelector('[aria-label="Tool strip"] > div') as HTMLElement
+    expect(collapsedRow.className).toContain('py-0.5')
+  })
+
   it('expands on chevron click and persists to localStorage', async () => {
     const user = userEvent.setup()
     const pairs = [
