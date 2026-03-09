@@ -4,7 +4,7 @@
 
 **Goal:** Add the same pane-header token budget percent-used indicator to FreshClaude panes that CLI terminal panes already show.
 
-**Architecture:** Reuse the existing pane-header metadata path instead of inventing a FreshClaude-only widget. Resolve FreshClaude runtime token metadata from the already-indexed Claude session records in `sessions.projects`, keyed by the SDK session's `cliSessionId` first and the persisted `resumeSessionId` second, then feed that metadata through the same formatter and `PaneHeader` props used by CLI panes. Keep the formatter input generic enough for both terminal metadata records and session-index-derived FreshClaude metadata so the percentage text, tooltip math, placement, and styling stay identical.
+**Architecture:** Reuse the existing pane-header metadata path instead of inventing a FreshClaude-only badge. Resolve FreshClaude runtime metadata from the indexed Claude sessions already stored in `sessions.projects`, preferring the live SDK-linked `cliSessionId` and falling back to the persisted `resumeSessionId`, then feed that metadata through the existing pane-header formatter and `PaneHeader` props so label text, tooltip math, placement, and styling stay identical to CLI panes.
 
 **Tech Stack:** TypeScript, React, Redux Toolkit, Vitest, Testing Library.
 
@@ -12,55 +12,84 @@
 
 ## Strategy Gate
 
-- The real requirement is pane-header parity, not “show some token number somewhere in FreshClaude.” The correct landing point is the existing `PaneHeader` `metaLabel`/`metaTooltip` path.
-- Do **not** derive the indicator from `sdk.result` totals in `src/store/agentChatSlice.ts`. Those totals are cumulative turn usage counts, but the existing CLI indicator is based on Claude session metadata that includes `contextTokens`, `compactThresholdTokens`, and `compactPercent`. Recomputing from SDK totals would drift from CLI behavior and violate the acceptance criteria.
-- Do **not** add a parallel FreshClaude token formatter. The existing formatter in `src/lib/format-terminal-title-meta.ts` already defines the visual contract. Reuse it.
-- Do **not** add new server plumbing unless a failing test proves the current client already lacks the needed identifiers. The current path is already sufficient:
+- The actual requirement is header parity with CLI panes, not “show token usage somewhere in the FreshClaude UI.” The correct landing point is the existing `PaneHeader` `metaLabel` / `metaTooltip` path already used by terminals.
+- The user explicitly asked to use the same Claude session metadata semantics that already power CLI token percentages. That means the source of truth is indexed Claude session metadata from `sessions.projects`, not `sdk.result` totals in `agentChatSlice`.
+- The identified seams already provide the identities needed for that lookup:
   - `server/sdk-bridge.ts` emits `sdk.session.init` with `cliSessionId`
   - `src/lib/sdk-message-handler.ts` forwards that into Redux
   - `src/store/agentChatSlice.ts` stores `cliSessionId`
-  - `src/components/agent-chat/AgentChatView.tsx` mirrors that into `resumeSessionId`
-  - `server/coding-cli/session-indexer.ts` already computes Claude `tokenUsage`, `gitBranch`, `isDirty`, and `cwd`
-- Use the existing `codingCliProvider` field in `src/lib/agent-chat-utils.ts` as the source of truth for which indexed provider backs a given agent-chat pane. Do **not** hardcode `freshclaude -> claude` inside `PaneContainer`.
-- Keep the typing change tight and steady-state: share the client-side token summary shape between indexed sessions and terminal metadata, and narrow the formatter input to only the fields it actually uses.
+  - `src/components/agent-chat/AgentChatView.tsx` persists it as `resumeSessionId`
+  - `server/coding-cli/session-indexer.ts` already indexes Claude `gitBranch`, `isDirty`, and `tokenUsage`
+- Do not add a parallel FreshClaude formatter or a FreshClaude-specific header widget. Reuse `formatPaneRuntimeLabel()` and `formatPaneRuntimeTooltip()`.
+- Do not add new server plumbing unless a failing test proves the client cannot see the already-indexed metadata. This issue should land as a client-side integration change.
+- Keep the typing change tight. Introduce one shared runtime token-usage type on the client, and make the formatter accept a minimal pane-runtime metadata shape. Update the existing formatter tests to use that minimal shape so the type narrowing is real, not nominal.
 
 ## Acceptance Mapping
 
-- FreshClaude panes render the percent-used indicator in the pane header because `PaneContainer` now computes runtime metadata for `kind: 'agent-chat'` panes and passes it through the existing `metaLabel`/`metaTooltip` props.
-- The displayed percentage matches CLI terminal panes because both paths use `formatPaneRuntimeLabel()` and `formatPaneRuntimeTooltip()` against the same `compactPercent` / `contextTokens` / `compactThresholdTokens` semantics.
-- Fresh creates and restored panes both work because runtime metadata resolution prefers the live SDK-linked `cliSessionId` and falls back to the persisted `resumeSessionId`.
-- Placement and styling match the CLI implementation because `PaneHeader` is unchanged; only the metadata source expands.
+- FreshClaude panes display the same percent-used indicator in the pane header because `PaneContainer` resolves runtime metadata for `kind: 'agent-chat'` panes and passes it through the existing `metaLabel` / `metaTooltip` props.
+- The displayed percentage matches CLI panes because both paths use the same formatter against the same `compactPercent`, `contextTokens`, and `compactThresholdTokens` semantics.
+- Live FreshClaude panes work because runtime metadata resolution prefers the active SDK session’s `cliSessionId`.
+- Restored FreshClaude panes work before reattach because runtime metadata resolution falls back to `resumeSessionId`.
+- Placement and styling match the existing CLI implementation because `PaneHeader` remains unchanged.
 
 ## Planned Code Changes
 
 - `src/store/types.ts`
-  - Add a shared client-side runtime token usage type for indexed coding-CLI sessions.
-  - Extend `CodingCliSession` with the Claude metadata fields the pane header already needs: `gitBranch`, `isDirty`, and `tokenUsage`.
+  - Add a shared client-side runtime token usage type.
+  - Extend `CodingCliSession` with `gitBranch`, `isDirty`, and `tokenUsage`.
 - `src/store/terminalMetaSlice.ts`
-  - Reuse the shared token usage type so indexed sessions and terminal metadata stay structurally aligned.
+  - Reuse the shared runtime token usage type so terminal metadata and indexed session metadata stay structurally aligned.
 - `src/lib/format-terminal-title-meta.ts`
-  - Narrow the formatter input type from “entire terminal metadata record” to a generic pane-runtime metadata shape containing only the fields the formatter reads.
+  - Export a minimal `PaneRuntimeMeta` shape containing only the fields the formatter actually reads.
+  - Keep formatting behavior unchanged.
 - `src/components/panes/PaneContainer.tsx`
   - Read `sessions.projects` and `agentChat.sessions`.
-  - Resolve FreshClaude runtime metadata from indexed sessions using provider config + `cliSessionId` / `resumeSessionId`.
-  - Pass that resolved metadata through the existing formatter and existing `Pane` props.
+  - Resolve FreshClaude runtime metadata from indexed sessions using provider config plus `cliSessionId` first and `resumeSessionId` second.
+  - Pass the resolved metadata through the existing formatter and existing `Pane` props.
 - `test/unit/client/components/panes/PaneContainer.test.tsx`
-  - Add failing unit coverage for FreshClaude pane headers using indexed Claude metadata.
-  - Cover both live-session (`cliSessionId`) and restored-session (`resumeSessionId`) resolution paths.
+  - Add FreshClaude header resolution coverage for both live and restored lookup paths.
+  - Expand the test store helper to include `sessions` and `agentChat`.
 - `test/unit/client/components/panes/PaneHeader.test.tsx`
-  - Lock the formatter contract to a generic pane-runtime metadata input so FreshClaude cannot regress into a divergent label/tooltip format later.
+  - Update the existing formatter tests to use the new minimal `PaneRuntimeMeta` contract instead of terminal-only records.
+  - Add one explicit parity fixture representing session-index-derived FreshClaude metadata.
 - `test/e2e/pane-header-runtime-meta-flow.test.tsx`
-  - Add an app-level parity test proving a FreshClaude pane renders and updates the same percent-used header indicator as the existing CLI path.
+  - Add app-level parity coverage proving a FreshClaude pane gets the same header indicator and updates when indexed sessions change.
 
-### Task 1: Add Failing FreshClaude Header Resolution Tests
+### Task 1: Add Failing Unit Tests For FreshClaude Header Resolution
 
 **Files:**
 - Modify: `test/unit/client/components/panes/PaneContainer.test.tsx`
 - Modify: `test/unit/client/components/panes/PaneHeader.test.tsx`
 
-**Step 1: Add a failing PaneContainer test for live FreshClaude sessions**
+**Step 1: Expand the unit-test store helper for FreshClaude state**
 
-In `test/unit/client/components/panes/PaneContainer.test.tsx`, expand the test store helper to include `sessions` and `agentChat` reducers, then add:
+In `test/unit/client/components/panes/PaneContainer.test.tsx`, extend `createStore()` so the reducer includes:
+
+```ts
+sessions: sessionsReducer,
+agentChat: agentChatReducer,
+```
+
+and the preloaded state includes:
+
+```ts
+sessions: {
+  projects: [],
+  expandedProjects: new Set(),
+  wsSnapshotReceived: false,
+},
+agentChat: {
+  sessions: {},
+  pendingCreates: {},
+  availableModels: [],
+},
+```
+
+Keep the existing terminal-focused defaults unchanged so current tests stay readable.
+
+**Step 2: Add a failing live-session test keyed by `cliSessionId`**
+
+In `test/unit/client/components/panes/PaneContainer.test.tsx`, add:
 
 ```ts
 it('renders FreshClaude pane header token usage from the indexed Claude session linked by cliSessionId', () => {
@@ -132,9 +161,11 @@ it('renders FreshClaude pane header token usage from the indexed Claude session 
 })
 ```
 
-**Step 2: Add a failing PaneContainer restore-path test**
+This is the primary requirement: the header must be driven by indexed Claude session metadata, keyed by the live SDK session identity.
 
-In `test/unit/client/components/panes/PaneContainer.test.tsx`, add:
+**Step 3: Add a failing restored-pane fallback test keyed by `resumeSessionId`**
+
+In the same file, add:
 
 ```ts
 it('falls back to resumeSessionId for FreshClaude panes before the SDK session reattaches', () => {
@@ -190,38 +221,47 @@ it('falls back to resumeSessionId for FreshClaude panes before the SDK session r
 })
 ```
 
-**Step 3: Add a failing formatter test that codifies generic pane-runtime parity**
+**Step 4: Update the formatter tests to the real generic contract**
 
-In `test/unit/client/components/panes/PaneHeader.test.tsx`, add:
+Do not bolt on a redundant formatter test while leaving the old terminal-only fixtures behind. In `test/unit/client/components/panes/PaneHeader.test.tsx`:
+
+- Replace the existing formatter callsites that pass `terminalId`, `provider`, and `updatedAt` with a shared minimal fixture:
+
+```ts
+const runtimeMeta = {
+  checkoutRoot: '/home/user/freshell',
+  cwd: '/home/user/freshell/.worktrees/issue-163',
+  branch: 'main',
+  isDirty: true,
+  tokenUsage: {
+    inputTokens: 10,
+    outputTokens: 5,
+    cachedTokens: 0,
+    totalTokens: 15,
+    contextTokens: 15,
+    compactThresholdTokens: 60,
+    compactPercent: 25,
+  },
+}
+```
+
+- Keep the existing parity assertions, but run them against that generic shape.
+- Add one explicit assertion naming the FreshClaude source semantics:
 
 ```ts
 it('formats session-index-derived FreshClaude metadata with the same label and tooltip contract as CLI panes', () => {
-  const meta = {
-    checkoutRoot: '/home/user/code/freshell',
-    cwd: '/home/user/code/freshell/.worktrees/issue-163',
-    branch: 'main',
-    isDirty: true,
-    tokenUsage: {
-      inputTokens: 10,
-      outputTokens: 5,
-      cachedTokens: 0,
-      totalTokens: 15,
-      contextTokens: 15,
-      compactThresholdTokens: 60,
-      compactPercent: 25,
-    },
-  }
-
-  expect(formatPaneRuntimeLabel(meta)).toBe('freshell (main*)  25%')
-  expect(formatPaneRuntimeTooltip(meta)).toBe(
-    'Directory: /home/user/code/freshell/.worktrees/issue-163\\n' +
-    'branch: main*\\n' +
+  expect(formatPaneRuntimeLabel(runtimeMeta)).toBe('freshell (main*)  25%')
+  expect(formatPaneRuntimeTooltip(runtimeMeta)).toBe(
+    'Directory: /home/user/freshell/.worktrees/issue-163\n' +
+    'branch: main*\n' +
     'Tokens: 15/60(25% full)',
   )
 })
 ```
 
-**Step 4: Run the targeted unit tests and confirm failure**
+This matters because the implementation will narrow the formatter input type; the tests must validate that narrowed contract instead of accidentally depending on terminal-only fields.
+
+**Step 5: Run the focused unit tests and confirm failure**
 
 Run:
 
@@ -230,9 +270,9 @@ npm test -- test/unit/client/components/panes/PaneContainer.test.tsx test/unit/c
 ```
 
 Expected:
-- FAIL because `PaneContainer` currently only resolves runtime metadata for terminal panes, and the formatter input is still terminal-record-shaped.
+- FAIL because `PaneContainer` currently resolves runtime metadata only for terminal panes.
 
-**Step 5: Commit the failing-test checkpoint**
+**Step 6: Commit the failing-test checkpoint**
 
 ```bash
 git add test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/components/panes/PaneHeader.test.tsx
@@ -247,7 +287,7 @@ git commit -m "test(panes): cover freshclaude token budget header"
 - Modify: `src/lib/format-terminal-title-meta.ts`
 - Modify: `src/components/panes/PaneContainer.tsx`
 
-**Step 1: Share the client-side token usage shape**
+**Step 1: Add a shared runtime token usage type to the client store types**
 
 In `src/store/types.ts`, add:
 
@@ -276,7 +316,11 @@ export interface CodingCliSession {
 }
 ```
 
-In `src/store/terminalMetaSlice.ts`, replace the inline token usage definition with the shared type:
+This is the smallest client typing change that makes indexed session metadata usable without inventing a second shape.
+
+**Step 2: Reuse that type from terminal metadata**
+
+In `src/store/terminalMetaSlice.ts`, replace the inline token type with:
 
 ```ts
 import type { CodingCliProviderName, RuntimeTokenUsage } from './types'
@@ -284,9 +328,11 @@ import type { CodingCliProviderName, RuntimeTokenUsage } from './types'
 export type TerminalTokenUsage = RuntimeTokenUsage
 ```
 
-**Step 2: Narrow the formatter to a generic pane-runtime metadata shape**
+Do not change the runtime shape of terminal metadata.
 
-In `src/lib/format-terminal-title-meta.ts`, export a generic type:
+**Step 3: Narrow the formatter input to a true pane-runtime shape**
+
+In `src/lib/format-terminal-title-meta.ts`, export:
 
 ```ts
 export type PaneRuntimeMeta = {
@@ -300,14 +346,14 @@ export type PaneRuntimeMeta = {
 }
 ```
 
-Update both formatters to accept `PaneRuntimeMeta | undefined` instead of `TerminalMetaRecord | undefined`.
+and update both formatters to accept `PaneRuntimeMeta | undefined`.
 
 Important:
-- Do **not** change formatting behavior.
-- Do **not** move this logic into agent-chat-specific code.
-- Keep `safeBasename()` and token tooltip math exactly as the CLI path uses them today.
+- Do not change formatting behavior.
+- Do not duplicate token math.
+- Keep `safeBasename()` and tooltip percent fallback exactly as they are today.
 
-**Step 3: Resolve FreshClaude runtime metadata from indexed sessions in `PaneContainer`**
+**Step 4: Resolve agent-chat runtime metadata in `PaneContainer`**
 
 In `src/components/panes/PaneContainer.tsx`, add selectors for:
 
@@ -338,12 +384,11 @@ function resolveAgentChatRuntimeMeta(
   content: AgentChatPaneContent,
   session: ChatSessionState | undefined,
 ): PaneRuntimeMeta | undefined {
-  const config = getAgentChatProviderConfig(content.provider)
-  const provider = config?.codingCliProvider
-  const claudeSessionId = session?.cliSessionId || content.resumeSessionId
-  if (!provider || !claudeSessionId) return undefined
+  const provider = getAgentChatProviderConfig(content.provider)?.codingCliProvider
+  const indexedSessionId = session?.cliSessionId || content.resumeSessionId
+  if (!provider || !indexedSessionId) return undefined
 
-  const indexed = findIndexedSession(indexedProjects, provider, claudeSessionId)
+  const indexed = findIndexedSession(indexedProjects, provider, indexedSessionId)
   if (!indexed) return undefined
 
   return {
@@ -356,7 +401,7 @@ function resolveAgentChatRuntimeMeta(
 }
 ```
 
-Then, in the leaf-pane render path, replace the terminal-only runtime metadata branch with a unified one:
+Then replace the terminal-only runtime metadata branch with a unified one:
 
 ```ts
 const paneRuntimeMeta =
@@ -371,13 +416,13 @@ const paneRuntimeMeta =
       : undefined
 ```
 
-Important implementation details:
-- Prefer `session.cliSessionId` over `resumeSessionId`; the live SDK-linked Claude session is the freshest identity.
-- Use `getAgentChatProviderConfig(content.provider)?.codingCliProvider` instead of hardcoding Claude.
-- Reuse the existing `formatPaneRuntimeLabel()` and `formatPaneRuntimeTooltip()` calls unchanged after the metadata object is resolved.
-- Do **not** surface the indicator inside `AgentChatView`; the header already gives the correct placement and styling.
+Important implementation constraints:
+- Prefer `session.cliSessionId` over `resumeSessionId`.
+- Use `codingCliProvider` from provider config instead of hardcoding FreshClaude.
+- Do not move header rendering into `AgentChatView`.
+- Do not add server or websocket changes for this issue.
 
-**Step 4: Re-run the targeted unit tests**
+**Step 5: Re-run the focused unit tests**
 
 Run:
 
@@ -388,63 +433,63 @@ npm test -- test/unit/client/components/panes/PaneContainer.test.tsx test/unit/c
 Expected:
 - PASS
 
-**Step 5: Commit the implementation checkpoint**
+**Step 6: Commit the implementation checkpoint**
 
 ```bash
 git add src/store/types.ts src/store/terminalMetaSlice.ts src/lib/format-terminal-title-meta.ts src/components/panes/PaneContainer.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/components/panes/PaneHeader.test.tsx
 git commit -m "feat(panes): show freshclaude token budget in pane header"
 ```
 
-### Task 3: Add App-Level Parity Coverage for FreshClaude
+### Task 3: Add App-Level Parity Coverage Through The Real Client Message Flow
 
 **Files:**
 - Modify: `test/e2e/pane-header-runtime-meta-flow.test.tsx`
 
-**Step 1: Add a failing app-level FreshClaude parity test**
+**Step 1: Extend the e2e test harness for agent-chat panes**
 
-In `test/e2e/pane-header-runtime-meta-flow.test.tsx`, extend the harness store to include `agentChat` reducer/state and add a FreshClaude tab/pane variant. Add:
+Update the local `createStore()` helper so the reducer includes `agentChat: agentChatReducer`, and allow options for:
 
 ```ts
-it('renders the same percent-used pane header indicator for FreshClaude sessions backed by indexed Claude metadata', async () => {
-  const store = createStore({
-    freshTab: {
-      id: 'tab-fresh',
-      createRequestId: 'req-fresh',
-      title: 'FreshClaude Tab',
-      status: 'running',
-      mode: 'claude',
-      createdAt: Date.now(),
-      codingCliProvider: 'claude',
-    },
-    freshPane: {
-      kind: 'agent-chat',
-      provider: 'freshclaude',
-      createRequestId: 'req-fresh',
-      sessionId: 'sdk-session-1',
-      status: 'idle',
-    },
-    agentChatState: {
-      sessions: {
-        'sdk-session-1': {
-          sessionId: 'sdk-session-1',
-          cliSessionId: 'claude-session-1',
-          status: 'idle',
-          messages: [],
-          streamingText: '',
-          streamingActive: false,
-          pendingPermissions: {},
-          pendingQuestions: {},
-          totalCostUsd: 0,
-          totalInputTokens: 0,
-          totalOutputTokens: 0,
-        },
-      },
-      pendingCreates: {},
-      availableModels: [],
-    },
-  })
+freshTab?: Partial<Tab>
+freshPane?: Partial<AgentChatPaneContent>
+agentChatState?: Partial<AgentChatState>
+```
 
+Preload a FreshClaude pane like:
+
+```ts
+const freshPane: AgentChatPaneContent = {
+  kind: 'agent-chat',
+  provider: 'freshclaude',
+  createRequestId: 'req-fresh',
+  sessionId: 'sdk-session-1',
+  status: 'starting',
+  initialCwd: '/home/user/code/freshell',
+  ...(options?.freshPane || {}),
+}
+```
+
+Keep the existing codex/claude terminal test intact; this file should now cover both terminal and FreshClaude paths.
+
+**Step 2: Add an app-level FreshClaude parity test that exercises `sdk.session.init`**
+
+In `test/e2e/pane-header-runtime-meta-flow.test.tsx`, add:
+
+```ts
+it('renders and updates the same percent-used pane header indicator for FreshClaude sessions backed by indexed Claude metadata', async () => {
   apiGet.mockImplementation((url: string) => {
+    if (url === '/api/settings') {
+      return Promise.resolve({
+        ...defaultSettings,
+        sidebar: { ...defaultSettings.sidebar, collapsed: true },
+      })
+    }
+    if (url === '/api/platform') {
+      return Promise.resolve({
+        platform: 'linux',
+        availableClis: { codex: true, claude: true },
+      })
+    }
     if (url === '/api/sessions?limit=100') {
       return Promise.resolve([
         {
@@ -452,7 +497,6 @@ it('renders the same percent-used pane header indicator for FreshClaude sessions
           sessions: [
             {
               provider: 'claude',
-              sessionType: 'freshclaude',
               sessionId: 'claude-session-1',
               projectPath: '/home/user/code/freshell',
               cwd: '/home/user/code/freshell/.worktrees/issue-163',
@@ -473,64 +517,115 @@ it('renders the same percent-used pane header indicator for FreshClaude sessions
         },
       ])
     }
-    ...
+    return Promise.resolve({})
   })
 
-  render(...)
+  const store = createStore({
+    freshTab: {
+      id: 'tab-fresh',
+      createRequestId: 'req-fresh',
+      title: 'FreshClaude Tab',
+      status: 'running',
+      mode: 'claude',
+      createdAt: Date.now(),
+    },
+    freshPane: {
+      sessionId: 'sdk-session-1',
+      status: 'starting',
+    },
+    agentChatState: {
+      sessions: {
+        'sdk-session-1': {
+          sessionId: 'sdk-session-1',
+          status: 'starting',
+          messages: [],
+          streamingText: '',
+          streamingActive: false,
+          pendingPermissions: {},
+          pendingQuestions: {},
+          totalCostUsd: 0,
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+        },
+      },
+      pendingCreates: {},
+      availableModels: [],
+    },
+  })
+
+  render(
+    <Provider store={store}>
+      <App />
+    </Provider>
+  )
+
+  await waitFor(() => {
+    expect(wsMocks.connect).toHaveBeenCalled()
+  })
+
+  act(() => {
+    wsMocks.emitMessage({ type: 'ready' })
+    wsMocks.emitMessage({
+      type: 'sdk.session.init',
+      sessionId: 'sdk-session-1',
+      cliSessionId: 'claude-session-1',
+      cwd: '/home/user/code/freshell/.worktrees/issue-163',
+    })
+  })
 
   await waitFor(() => {
     expect(screen.getByText(/freshell \(main\*\)\s+25%/)).toBeInTheDocument()
   })
-})
-```
 
-If the existing test file would become noisy by mounting the full real chat UI, mock `@/components/agent-chat/AgentChatView` to a simple placeholder in this file so the test remains focused on header behavior.
-
-**Step 2: Add a failing update-path assertion**
-
-In the same test, after initial render, push a sessions update that changes `compactPercent`:
-
-```ts
-act(() => {
-  wsMocks.emitMessage({
-    type: 'sessions.updated',
-    projects: [
-      {
-        projectPath: '/home/user/code/freshell',
-        sessions: [
-          {
-            provider: 'claude',
-            sessionType: 'freshclaude',
-            sessionId: 'claude-session-1',
-            projectPath: '/home/user/code/freshell',
-            cwd: '/home/user/code/freshell/.worktrees/issue-163',
-            gitBranch: 'main',
-            isDirty: true,
-            updatedAt: 2,
-            tokenUsage: {
-              inputTokens: 10,
-              outputTokens: 5,
-              cachedTokens: 0,
-              totalTokens: 15,
-              contextTokens: 15,
-              compactThresholdTokens: 60,
-              compactPercent: 50,
+  act(() => {
+    wsMocks.emitMessage({
+      type: 'sessions.updated',
+      projects: [
+        {
+          projectPath: '/home/user/code/freshell',
+          sessions: [
+            {
+              provider: 'claude',
+              sessionId: 'claude-session-1',
+              projectPath: '/home/user/code/freshell',
+              cwd: '/home/user/code/freshell/.worktrees/issue-163',
+              gitBranch: 'main',
+              isDirty: true,
+              updatedAt: 2,
+              tokenUsage: {
+                inputTokens: 10,
+                outputTokens: 5,
+                cachedTokens: 0,
+                totalTokens: 15,
+                contextTokens: 15,
+                compactThresholdTokens: 60,
+                compactPercent: 50,
+              },
             },
-          },
-        ],
-      },
-    ],
+          ],
+        },
+      ],
+    })
+  })
+
+  await waitFor(() => {
+    expect(screen.getByText(/freshell \(main\*\)\s+50%/)).toBeInTheDocument()
   })
 })
-
-await waitFor(() => {
-  expect(screen.getByText(/freshell \(main\*\)\s+50%/)).toBeInTheDocument()
-})
 ```
 
-This keeps parity coverage honest: FreshClaude must react to live indexed-session updates the same way terminal panes react to `terminal.meta.updated`.
+This is the right e2e assertion because it exercises the real client path the user asked for:
 
-**Step 3: Run the focused e2e/header test file and confirm it passes**
+1. `sdk.session.init` establishes `cliSessionId`
+2. `sessions.projects` provides indexed Claude token metadata
+3. `PaneContainer` resolves the header metadata
+4. later `sessions.updated` changes refresh the displayed percentage
+
+**Step 3: Keep the test focused if the full chat UI makes it noisy**
+
+If mounting `AgentChatView` makes the harness unstable, mock only `@/components/agent-chat/AgentChatView` to a simple placeholder in this test file. Do not mock `PaneContainer`, `Pane`, or `PaneHeader`; those are the integration surface under test.
+
+**Step 4: Run the focused app-level test**
 
 Run:
 
@@ -541,7 +636,7 @@ npm test -- test/e2e/pane-header-runtime-meta-flow.test.tsx
 Expected:
 - PASS
 
-**Step 4: Commit**
+**Step 5: Commit the parity-test checkpoint**
 
 ```bash
 git add test/e2e/pane-header-runtime-meta-flow.test.tsx
@@ -575,15 +670,17 @@ npm test
 Expected:
 - PASS
 
-**Step 3: Commit the verification checkpoint if any test-only adjustments were needed**
+**Step 3: Commit the verification checkpoint only if verification required code changes**
 
 ```bash
 git add -A
 git commit -m "chore: verify freshclaude token budget indicator"
 ```
 
-## Notes for the Implementer
+Only make this commit if the verification pass forced additional edits. Do not create an empty or redundant commit.
 
-- If a test shows `sessions.projects` does not yet carry `gitBranch`, `isDirty`, or `tokenUsage` on the client even though the server emits them, fix the client typing and normalization only; do not add a new websocket message for this issue.
-- If the app-level test reveals that `AgentChatView` mounting makes the harness noisy, mock only the view component, not `PaneContainer` or `PaneHeader`; the acceptance target is header integration.
-- Keep the plan focused. Do **not** refactor the broader terminal metadata system, the session indexer, or the SDK bridge unless a failing test proves this issue cannot be landed cleanly without it.
+## Notes For The Implementer
+
+- If the unit tests show that `sessions.projects` already contains `gitBranch`, `isDirty`, and `tokenUsage` at runtime but TypeScript does not, fix the client typing only. Do not add server message changes for this issue.
+- If the e2e test exposes stale `/api/sessions?limit=100` mocks in this file, update only the local mock setup needed for this issue; do not refactor the broader app bootstrap.
+- Keep the scope tight. No FreshClaude-specific token math, no new header component, no SDK-total approximation, and no broader terminal/session metadata refactor.
