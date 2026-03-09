@@ -16,11 +16,17 @@
 - The current merge-target public script surface to preserve is:
   - `test = npm run test:client:all && npm run test:server:all`
   - `test:all = npm run test:client:all && npm run test:server:all`
+  - `test:watch = vitest`
+  - `test:ui = vitest --ui`
   - `test:client:all = vitest run --pool forks`
   - `test:server = vitest --config vitest.server.config.ts`
   - `test:server:without-logger = vitest run --config vitest.server.config.ts --exclude test/integration/server/logger.separation.test.ts`
   - `test:server:logger-separation = vitest run --config vitest.server.config.ts --pool forks --poolOptions.forks.singleFork --no-file-parallelism test/integration/server/logger.separation.test.ts`
   - `test:server:all = npm run test:server:without-logger && npm run test:server:logger-separation`
+  - `test:coverage = vitest run --coverage`
+  - `test:unit = vitest run test/unit`
+  - `test:integration = vitest run --config vitest.server.config.ts test/server`
+  - `test:client = vitest run test/unit/client`
   - `verify = npm run build && npm test`
   - `check = npm run typecheck && npm test`
 - `BroadOneShotTestRun` is the only primitive. Every gated broad path, public or raw, must route through it.
@@ -42,6 +48,7 @@
     - watch or UI mode
     - explicit file-targeted runs where every positional selector resolves to a file and no known broad suite-shaping selector is present
     - raw Vitest subcommands `watch`, `dev`, `related`, and `bench`
+    - raw non-test operational flags and modes such as `--standalone` and `--mergeReports`
     - public `test:server` and public `test:server:logger-separation`
   - Broad:
     - any non-interactive one-shot run with no selectors
@@ -58,10 +65,15 @@
 - Bare raw `vitest` is not always watch. Classification must resolve its effective mode from Vitest’s default watch behavior:
   - if effective watch mode is true, `delegate upstream`
   - if effective watch mode is false, classify the same as raw one-shot `vitest run`
+- Bare raw `vitest --run` is equivalent to one-shot raw `vitest run` and must classify through the same broad-vs-narrow rules:
+  - `vitest --run` with no selectors is broad
+  - `vitest --run <file>` is narrow
+  - `vitest --run --coverage` is broad
 - Unknown broad suite-shaping flags are never reusable. They may still run as gated broad work, but reuse must be disabled instead of guessed.
 - Unknown raw Vitest subcommands that are not the default command and are not explicitly classified above must `delegate upstream`. The classifier still returns an explicit outcome; it may not leave any raw entrypoint undefined.
+- Unknown flags on explicitly non-test operational modes must `delegate upstream`, not be coerced into gated broad work.
 - `suiteKey` identifies the reusable workload. `commandKey` is provenance and UX only. Different commands may share a `suiteKey` only if they truly execute the same workload.
-- Reusable baseline identity is exact: the newest record matching `(suiteKey, commit, cleanWorktree=true, nodeVersion, platform)` controls reuse. If the newest exact record is a failure, no older success for that same identity may be reused.
+- Reusable baseline identity is exact: the newest record matching `(suiteKey, commit, cleanWorktree=true, nodeVersion, platform, arch)` controls reuse. If the newest exact record is a failure, no older success for that same identity may be reused.
 - Reuse policy is frozen per adapter:
   - `allow reuse`: `test`, `test:all`, `test:client:all`, `test:server:all`, `test:server:without-logger`, `test:unit`, `test:integration`, `test:client`, and `check`
   - `never reuse`: `verify` and `test:coverage`, because both must perform fresh artifact-producing work (`build` and coverage output)
@@ -112,7 +124,7 @@
 - `scripts/testing/broad-one-shot-test-run.ts`
   - The only primitive: parse adapter inputs, classify, probe status, acquire/release the lock, write holder metadata, consult baselines, run upstream work, persist results, and emit status/contended payloads.
 - `scripts/testing/test-run-classification.ts`
-  - Exact broad-vs-narrow rules, raw Vitest default-mode resolution, and raw argv normalization.
+  - Exact broad-vs-narrow rules, raw Vitest default-mode resolution, operational-mode delegation, and raw argv normalization.
 - `scripts/testing/test-run-gate-state.ts`
   - Lock path resolution, `flock` helpers, holder state machine, atomic holder read/write/delete, and status payload formatting.
 - `scripts/testing/test-run-baselines.ts`
@@ -150,10 +162,14 @@
   - Invocation cwd comes from `INIT_CWD` when present, then falls back to `process.cwd()`.
   - Bare `vitest` delegates when effective watch mode is true.
   - Bare `vitest` becomes `gated broad run` when effective watch mode is false.
+  - Bare `vitest --run` becomes `gated broad run` with no selectors.
+  - Bare `vitest --run path/to/file.test.ts` becomes `delegate upstream`.
+  - Bare `vitest --run --coverage` becomes `gated broad run`.
   - Raw `vitest run` with no selectors is `gated broad run`.
-  - Raw `vitest run test/unit`, `vitest run "test/**/*.test.ts"`, `vitest run --config vitest.server.config.ts test/server`, `vitest run -t name`, and `vitest run --changed` are `gated broad run`.
+  - Raw `vitest run test/unit`, `vitest run "test/**/*.test.ts"`, `vitest run --config vitest.server.config.ts test/server`, `vitest run -c vitest.server.config.ts test/server`, `vitest run --root . test/unit`, `vitest run --dir test`, `vitest run --project client --project server`, `vitest run -t name`, and `vitest run --changed` are `gated broad run`.
   - Raw `vitest path/to/file.test.ts` and `vitest run path/to/file.test.ts` are `delegate upstream`.
   - Raw `vitest --ui`, `vitest watch`, `vitest dev`, `vitest related`, and `vitest bench` are `delegate upstream`.
+  - Raw `vitest --standalone` and `vitest --mergeReports` are `delegate upstream`.
   - Unknown raw Vitest subcommands still get an explicit outcome and default to `delegate upstream`.
   - Unknown broad suite-shaping flags classify as broad but mark reuse disabled.
 
@@ -163,7 +179,7 @@
 
   ```bash
   cd /home/user/code/freshell/.worktrees/test-run-gate
-  npx vitest run test/unit/server/coding-cli/utils.test.ts test/unit/server/test-run-classification.test.ts
+  npx vitest run --config vitest.server.config.ts test/unit/server/coding-cli/utils.test.ts test/unit/server/test-run-classification.test.ts
   ```
 
   Expected:
@@ -179,6 +195,8 @@
     - `kind: 'delegate-upstream'`
     - `kind: 'gated-broad-run'`
   - explicit bare-`vitest` mode resolution using `CI` and `stdin.isTTY`
+  - explicit equivalence between `vitest --run ...` and `vitest run ...`
+  - explicit delegate path for operational/non-test modes and flags
   - normalized broad-run classification results including:
     - normalized positional selectors
     - `baselineReusable: boolean`
@@ -190,7 +208,7 @@
 
   ```bash
   cd /home/user/code/freshell/.worktrees/test-run-gate
-  npx vitest run test/unit/server/coding-cli/utils.test.ts test/unit/server/test-run-classification.test.ts
+  npx vitest run --config vitest.server.config.ts test/unit/server/coding-cli/utils.test.ts test/unit/server/test-run-classification.test.ts
   ```
 
   Expected: PASS.
@@ -257,7 +275,7 @@
 
   ```bash
   cd /home/user/code/freshell/.worktrees/test-run-gate
-  npx vitest run test/unit/server/test-run-gate-state.test.ts test/integration/server/broad-one-shot-test-run.test.ts
+  npx vitest run --config vitest.server.config.ts test/unit/server/test-run-gate-state.test.ts test/integration/server/broad-one-shot-test-run.test.ts
   ```
 
   Expected: PASS without invoking the real full suite.
@@ -291,7 +309,7 @@
   - Raw broad `suiteKey` includes all classified suite-shaping selectors.
   - Raw broad `suiteKey` excludes non-suite UX flags such as reporter/color/output formatting.
   - Unknown suite-shaping flags force `baselineReusable=false`.
-  - Reuse requires exact `suiteKey`, exact commit, producer clean worktree, current clean worktree, exact node version, exact platform, and prior exit code `0`.
+  - Reuse requires exact `suiteKey`, exact commit, producer clean worktree, current clean worktree, exact node version, exact platform, exact arch, and prior exit code `0`.
   - The newest exact failure blocks reuse of older exact success.
   - Corrupt or unreadable results files degrade to “no reusable baseline”.
 
@@ -301,7 +319,7 @@
 
   ```bash
   cd /home/user/code/freshell/.worktrees/test-run-gate
-  npx vitest run test/unit/server/test-run-baselines.test.ts
+  npx vitest run --config vitest.server.config.ts test/unit/server/test-run-baselines.test.ts
   ```
 
   Expected: FAIL for missing suite identity and reuse-policy logic.
@@ -317,6 +335,7 @@
     - `cleanWorktree`
     - `nodeVersion`
     - `platform`
+    - `arch`
     - `startedAt`
     - `finishedAt`
     - `exitCode`
@@ -334,7 +353,7 @@
 
   ```bash
   cd /home/user/code/freshell/.worktrees/test-run-gate
-  npx vitest run test/unit/server/test-run-baselines.test.ts
+  npx vitest run --config vitest.server.config.ts test/unit/server/test-run-baselines.test.ts
   ```
 
   Expected: PASS.
@@ -421,7 +440,7 @@
 
   ```bash
   cd /home/user/code/freshell/.worktrees/test-run-gate
-  npx vitest run test/unit/server/test-run-adapters.test.ts
+  npx vitest run --config vitest.server.config.ts test/unit/server/test-run-adapters.test.ts
   ```
 
   Expected: PASS.
@@ -455,8 +474,12 @@
   Cover:
   - `npx vitest run` enters the same `BroadOneShotTestRun` path as public broad scripts.
   - `npx vitest` with `CI=1` or non-TTY runtime becomes a gated broad run.
+  - `npx vitest --run` enters the same `BroadOneShotTestRun` path as raw `vitest run`.
+  - `npx vitest --run path/to/file.test.ts` delegates upstream with no gate side effects.
+  - `npx vitest --run --coverage` becomes a gated broad run.
   - `npx vitest path/to/file.test.ts` and `npx vitest run path/to/file.test.ts` delegate upstream with no holder file.
   - `npx vitest --ui`, `npx vitest watch`, `npx vitest dev`, `npx vitest related`, and `npx vitest bench` delegate upstream with no gate side effects.
+  - `npx vitest --standalone` and `npx vitest --mergeReports` delegate upstream with no gate side effects.
   - The patched entrypoint works from a nested cwd such as `src/`.
   - The patched entrypoint uses a non-recursive env marker so the second hop bypasses gate interception and imports upstream `node_modules/vitest/dist/cli.js` directly.
   - Unknown broad suite flags still gate the run but disable reuse.
@@ -477,7 +500,7 @@
 
   ```bash
   cd /home/user/code/freshell/.worktrees/test-run-gate
-  npx vitest run test/integration/server/vitest-patch-adapter.test.ts
+  npx vitest run --config vitest.server.config.ts test/integration/server/vitest-patch-adapter.test.ts
   ```
 
   Expected: PASS, including nested-cwd and raw watch/UI delegation coverage.
@@ -514,6 +537,9 @@
   - `test` and `test:all` preserving the split `client-all -> server-all`
   - `test:server:all` preserving the split `without-logger -> logger-separation`
   - raw `npx vitest` default-mode gating in non-interactive execution
+  - raw `npx vitest --run` one-shot classification and delegation cases
+  - `-c`, `--root`, `--dir`, and repeated `--project` feeding `suiteKey`
+  - non-test operational raw Vitest flags bypassing the gate
   - nested-cwd raw Vitest interception
   - summary propagation from env and flag
 
@@ -523,7 +549,7 @@
 
   ```bash
   cd /home/user/code/freshell/.worktrees/test-run-gate
-  npx vitest run \
+  npx vitest run --config vitest.server.config.ts \
     test/unit/server/coding-cli/utils.test.ts \
     test/unit/server/test-run-classification.test.ts \
     test/unit/server/test-run-gate-state.test.ts \
@@ -576,16 +602,20 @@
 - `BroadOneShotTestRun` is the single primitive for all gated broad work.
 - Every entrypoint classifies to exactly one outcome: `delegate upstream` or `gated broad run`.
 - Bare raw `vitest` is classified by effective watch mode, not assumed to be interactive.
+- Bare raw `vitest --run` is covered explicitly and maps through the same one-shot rules as `vitest run`.
 - `flock` is the only liveness truth.
 - Missing or corrupt holder metadata yields `running-undescribed`, not a deadlock or false idle.
 - Holder and results files are written atomically.
 - `suiteKey` drives reuse; `commandKey` is provenance only.
+- Exact reusable identity includes `arch` as well as commit, cleanliness, node version, and platform.
 - The newest exact result wins; a newer failure blocks reuse of older success.
 - Unknown broad suite flags disable reuse but do not skip gating.
+- Non-test operational raw Vitest modes and flags bypass the gate instead of being coerced into broad test runs.
 - `test`, `test:all`, and `test:server:all` preserve the current split phase contracts from `main`.
 - `test:server:logger-separation` keeps its current single-fork isolation flags.
 - `test:coverage` and `verify` are gated but never reusable.
 - `check` preserves its full contract and is reusable only as a whole exact workload.
 - Raw `vitest` interception has a non-recursive upstream path and works from nested directories.
+- All server-side TDD and verification commands run under `vitest.server.config.ts`, so the plan’s test loops are executable.
 - Watch/UI/file-targeted and other delegated paths are covered and proven to avoid gate side effects.
 - Contended broad runs fail fast with exit code `75` and truthful holder status.
