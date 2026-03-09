@@ -67,7 +67,8 @@
     - public single-phase adapters that forward only file-targeted selectors, where every forwarded positional selector resolves to a file and no known broad suite-shaping selector is present; this includes `test:unit`, `test:integration`, `test:client`, `test:client:all`, and `test:server:without-logger`
     - raw Vitest subcommands `watch`, `dev`, `related`, and `bench`
     - raw non-test operational flags and modes such as `--standalone` and `--mergeReports`
-    - default invocations of public `test:server` and public `test:server:logger-separation` when no forwarded trailing args introduce a broad suite-shaping selector; those adapters still reclassify trailing args through the wrapper before delegating or gating
+    - default invocations of public `test:watch` and public `test:server` only when their effective watch mode resolves true; those adapters still reclassify trailing args through the wrapper before delegating or gating
+    - default invocations of public `test:server:logger-separation` when no forwarded trailing args introduce a broad suite-shaping selector; that adapter still reclassifies trailing args through the wrapper before delegating or gating
   - Broad:
     - any non-interactive one-shot run with no selectors
     - any directory target
@@ -98,7 +99,8 @@
 - Reuse policy is frozen per adapter:
   - `allow reuse`: `test`, `test:all`, `test:client:all`, `test:server:all`, `test:server:without-logger`, `test:unit`, `test:integration`, `test:client`, and `check`
   - `never reuse`: `verify` and `test:coverage`, because both must perform fresh artifact-producing work (`build` and coverage output)
-  - `delegate upstream by default`: `test:watch`, `test:ui`, `test:server`, and `test:server:logger-separation`
+  - `delegate upstream by default`: `test:ui` and `test:server:logger-separation`
+  - `delegate when effective watch mode is true, otherwise classify like one-shot broad-or-narrow Vitest`: `test:watch` and `test:server`
 - Raw classified runs also have a frozen reuse policy:
   - any classified raw run containing `--coverage` is `never reuse`
   - otherwise reuse is allowed only when classification remains fully known and does not fall into another `never reuse` or delegated case
@@ -467,7 +469,9 @@
     - `npm run test:server -- --run --coverage` becomes a gated broad run instead of bypassing the gate
     - `npm run test:server:logger-separation -- --run --coverage` becomes a gated broad run instead of bypassing the gate
     - `npm run test:watch -- --run` becomes a gated broad run instead of bypassing the gate
-    - default `npm run test:server` and `npm run test:server:logger-separation` remain delegated only when forwarded trailing args do not introduce a broad suite-shaping selector
+    - plain `npm run test:watch` delegates only when effective watch mode is true, and becomes a gated broad run under `CI=1` or other non-TTY one-shot conditions
+    - plain `npm run test:server` delegates only when effective watch mode is true, and becomes a gated broad run under `CI=1` or other non-TTY one-shot conditions
+    - default `npm run test:server:logger-separation` remains delegated only when forwarded trailing args do not introduce a broad suite-shaping selector
   - File-targeted single-phase public adapters preserve narrow delegation:
     - `npm run test:unit -- <fixture-client-test-file>` delegates upstream with no gate side effects, replacing the adapter’s default `test/unit` selector with the forwarded file target
     - `npm run test:client -- <fixture-client-test-file>` delegates upstream with no gate side effects, replacing the adapter’s default `test/unit/client` selector with the forwarded file target
@@ -495,7 +499,8 @@
     - other non-allowlisted forwarded flags such as `npm run test -- --isolate=false`, `npm run test:server:all -- --bail=0`, `npm run check -- --maxWorkers=1`, and `npm run verify -- --passWithNoTests=false` are rejected with the same actionable error instead of being fanned out
     - `npm run check -- --coverage` and `npm run verify -- --coverage` are rejected with an actionable error
   - `test`, `test:all`, `test:client:all`, `test:server:all`, `test:server:without-logger`, `test:unit`, `test:integration`, `test:client`, `check`, `verify`, and `test:coverage` are `gated broad run` only when classification does not land in one of the frozen delegated narrow cases above.
-  - `test:watch`, `test:ui`, `test:server`, and `test:server:logger-separation` delegate upstream by default, but still pass through wrapper classification first.
+  - `test:ui` and `test:server:logger-separation` delegate upstream by default, but still pass through wrapper classification first.
+  - `test:watch` and `test:server` resolve effective watch mode through the wrapper first: delegate when true, otherwise classify and gate exactly like one-shot Vitest invocations.
   - `test` and `test:all` preserve the split `client-all` then `server-all` phase contract.
   - `test:server:all` preserves the split `without-logger` then `logger-separation` phase contract.
   - `test`/`test:all` stop before `server-all` if `client-all` fails.
@@ -562,7 +567,8 @@
   - explicit fail-fast semantics for split phases:
     - abort remaining phases on first nonzero exit, matching current shell `&&` behavior
   - `test` and `test:all` sharing the same `suiteKey` because they run the same phase list
-  - `test:server`, `test:watch`, `test:ui`, and `test:server:logger-separation` staying upstream-delegated by default, but only after wrapper classification
+  - `test:ui` and `test:server:logger-separation` staying upstream-delegated by default, but only after wrapper classification
+  - `test:watch` and `test:server` resolving effective watch mode inside the wrapper: delegate when true, otherwise classify and gate the resulting one-shot workload the same way as raw Vitest
   - `test:server:all` as the canonical broad one-shot server suite
   - `BroadOneShotTestRun` CLI behavior:
     - `--status`
@@ -702,7 +708,9 @@
   - baseline reuse staying off by default unless `--reuse-baseline` is present
   - trailing argv passthrough from rewritten npm scripts
   - delegated public scripts reclassifying trailing args instead of bypassing the wrapper
-  - default `test:server` and `test:server:logger-separation` remaining delegated only when forwarded trailing args do not introduce a broad suite-shaping selector
+  - plain `test:watch` and `test:server` delegating only when effective watch mode is true, and becoming gated broad runs under `CI=1` or other non-TTY one-shot conditions
+  - default `test:server` remaining delegated only when effective watch mode is true and forwarded trailing args do not introduce a broad suite-shaping selector
+  - default `test:server:logger-separation` remaining delegated only when forwarded trailing args do not introduce a broad suite-shaping selector
   - `test:server -- --run --coverage` and `test:server:logger-separation -- --run --coverage` reclassifying to gated broad runs instead of always delegating
   - forwarded truthy coverage flags making reusable public adapters such as `test:unit` and `test:client:all` become non-reusable for that invocation
   - forwarded false-valued coverage flags on reusable public adapters such as `test:unit` and `test:client:all` not disabling reuse
@@ -840,7 +848,8 @@
 - Mixed adapters also accept only that same frozen presentation-flag allowlist on their nested Vitest phase, and Task 4 plus Task 6 prove that those flags reach only the nested Vitest phase, never `build` or `typecheck`.
 - Aggregate and mixed adapters reject `--outputFile` and other non-allowlisted forwarded semantic flags, including false-valued coverage forms such as `--coverage=false` and `--coverage.enabled false`.
 - Non-test operational raw Vitest modes and flags bypass the gate instead of being coerced into broad test runs.
-- `--config/-c` plus file-only selectors stay delegated so targeted server one-shots do not hit the broad gate, including `test:server` and `test:server:logger-separation` when their trailing args do not reclassify them as broad.
+- `test:watch` and `test:server` resolve effective watch mode through the wrapper and become gated broad runs whenever that mode resolves false in CI or other non-TTY one-shot contexts.
+- `--config/-c` plus file-only selectors stay delegated so targeted server one-shots do not hit the broad gate, including `test:server` and `test:server:logger-separation` when their trailing args do not reclassify them as broad and effective watch mode does not force one-shot gating.
 - File-targeted public single-phase adapters stay delegated when trailing args resolve to files and no broad selector is present.
 - When those public single-phase adapters delegate, forwarded file selectors replace the adapter’s default broad positional selector set while preserving non-selector defaults such as config, pool, and the logger exclusion.
 - Task 3 proves result-store writes use the same temp-file, `fsync`, rename, and directory-`fsync` crash-safety sequence frozen in the invariants.
