@@ -2,182 +2,181 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task.
 
-**Goal:** Build one repo-owned test coordination system that serializes broad one-shot test workloads, shows truthful active-holder status, and records advisory exact-commit baselines without weakening the requirement for a fresh `npm test` before landing.
+**Goal:** Build one repo-owned test coordinator that serializes sanctioned broad one-shot test runs, reports truthful active-holder status, and records exact-match advisory baselines that agents can inspect instead of rerunning unchanged inherited commits.
 
-**Architecture:** Replace the fragile `postinstall` mutation approach with a source-controlled local `vitest` wrapper package plus a single TypeScript coordinator CLI. Public npm test entrypoints and raw local `vitest` invocations both normalize into the same workload classifier, while a dedicated locked-runner subcommand executes coordinated workloads under `flock` so kernel lock state is the only liveness truth and holder JSON remains purely advisory.
+**Architecture:** Route every sanctioned public test entrypoint through a TypeScript coordinator owned by this repo. The coordinator normalizes the requested command into an explicit contract, then either delegates directly to upstream Vitest/build/typecheck behavior or launches a dedicated coordinated runner that owns a repo-specific local socket/pipe. That bound endpoint is the only lock primitive, so liveness is cross-platform and clears automatically when the runner dies. Advisory holder metadata and baseline history live under the Git common-dir shared by all worktrees. Raw `npx vitest` is not intercepted because this repo has no worktree-safe way to hijack it without dependency-graph or shell-environment side effects; instead the repo adds a sanctioned direct entrypoint, `npm run test:vitest -- ...`, and updates agent guidance to use sanctioned commands only.
 
-**Tech Stack:** Node.js, TypeScript, `tsx`, npm, local file dependencies, Linux/WSL `flock`, `child_process`, `fs/promises`, Zod, Vitest.
+**Tech Stack:** Node.js, TypeScript, `tsx`, npm scripts, `child_process`, `net`, `fs/promises`, Zod, Vitest.
 
 ---
 
 ## Strategy Gate
 
-The previous plan kept collapsing back into script-name exceptions and `node_modules` patching. That was the wrong shape.
+The previous plan was solving the wrong problem at the wrong layer:
 
-The actual problem is broader and simpler:
+- `flock` made public repo commands Linux/WSL-only.
+- dependency-based Vitest interception required `npm install` side effects that are unsafe in shared or symlinked worktree setups.
+- composite command behavior was still implicit shell behavior instead of an explicit repo contract.
 
-- agents can start the same heavy repo test workloads through multiple entrypoints
-- the system has no single source of truth for whether one of those workloads is already running
-- baseline knowledge is lost, so agents rerun expensive suites just to learn the inherited commit was already green
+The clean steady-state model is:
 
-The clean steady-state answer is one execution model:
+1. freeze the public CLI contract for every sanctioned test command and forwarded-arg form this repo already uses;
+2. coordinate only sanctioned broad one-shot workloads through one repo-owned runtime;
+3. use a cross-platform socket/pipe endpoint as the only mutual-exclusion primitive;
+4. store advisory holder and baseline records under the Git common-dir;
+5. provide a sanctioned direct Vitest passthrough command so agents have an ergonomic alternative to raw `npx vitest`.
 
-1. every public npm test command expands into a normalized coordinator request
-2. every raw local `vitest` invocation enters the same coordinator through a repo-owned wrapper package
-3. the coordinator classifies the normalized invocation by workload shape, not by script name
-4. coordinated workloads run only through a `flock`-owned locked runner
-5. holder metadata and result history live in the Git common-dir shared by all worktrees
-
-That satisfies the user’s one-shot requirement directly. It does not rely on documentation-only behavior, stale sentinel files, or special-case exemptions for “raw” runs.
+That directly solves the user’s goal without platform narrowing, install-time mutation, or ambiguous shell contracts.
 
 ## Frozen Design Decisions
 
 ### 1. Coordination Boundary
 
-The governing invariant is workload shape after adapter expansion, not the original entrypoint name.
+Only sanctioned repo commands are guaranteed to pass through the repo-owned coordinator. Of those, only broad one-shot workloads are coordinated:
 
-- `delegated`: help/version/status and explicitly interactive flows
-- `coordinated`: canonical one-shot suites and untargeted raw one-shot runs
-- `rejected`: forwarded-arg combinations whose semantics cannot be applied truthfully
+- `npm test`
+- `npm run test:all`
+- `npm run check`
+- `npm run verify`
+- `npm run test:coverage`
+- `npm run test:unit`
+- `npm run test:integration`
+- `npm run test:client`
+- `npm run test:server`
+- `npm run test:watch`
+- `npm run test:ui`
+- `npm run test:status`
+- `npm run test:vitest -- ...`
 
-Canonical coordinated suites in v1:
+Raw `npx vitest ...` and `./node_modules/.bin/vitest ...` remain out of contract in v1. They are documented as unsupported for coordinated broad runs. The sanctioned replacement for direct Vitest usage is `npm run test:vitest -- ...`.
 
-| suiteKey | Normalized workload |
-| --- | --- |
-| `full-suite` | client one-shot suite, then server one-shot suite |
-| `client-all` | `vitest run` with default client config and no narrowing selectors |
-| `server-all` | `vitest run --config vitest.server.config.ts` with no narrowing selectors |
-| `client-coverage` | `vitest run --coverage` with no narrowing selectors |
-| `unit-all` | `vitest run test/unit` with no additional narrowing selectors |
-| `integration-all` | `vitest run --config vitest.server.config.ts test/server` with no additional narrowing selectors |
-| `client-unit-all` | `vitest run test/unit/client` with no additional narrowing selectors |
+### 2. The Lock Primitive Is A Repo-Specific Socket/Pipe
 
-Delegated narrowed forms in v1:
+The coordinated runner binds one repo-specific local endpoint:
 
-- positional file or directory targets that do not exactly match a canonical suite shape
-- `-t`, `--testNamePattern`
-- `--project`
-- `--changed`
-- `--watch`, `-w`
-- `--ui`
+- Unix/WSL/macOS: socket path derived from a hash of the Git common-dir and placed under `os.tmpdir()`
+- Windows: named pipe derived from the same hash
 
-Rejected forwarded forms in v1:
+Rules:
 
-- composite commands (`test`, `test:all`, `check`, `verify`) with Vitest flags that cannot be duplicated truthfully across both phases
-- `--reporter <value>` on composite commands
+- successful bind means the coordinated runner owns the lock;
+- bind failure plus a successful status connection means another coordinated run is active;
+- Unix stale socket files are cleaned only after a failed connection proves there is no live owner;
+- holder JSON is advisory only and never treated as proof of liveness.
 
-### 2. `flock` Is The Only Liveness Truth
+### 3. Shared State Lives Under The Git Common-Dir
 
-- the coordinator never infers liveness from a JSON file
-- active/idle detection comes from non-blocking `flock` acquisition attempts only
-- coordinated work executes in a dedicated locked-runner subprocess launched under `flock`
-- if holder metadata is missing, corrupt, partial, or stale while the lock is held, status must say `running-undescribed`
-- if holder metadata exists while the lock is free, it is advisory garbage and must be ignored or overwritten
+Persist under a repo-owned directory inside the Git common-dir:
 
-### 3. Raw Local Vitest Must Be Repo-Owned
+- `holder.json`
+- `latest-command-runs.json`
+- `latest-suite-runs.json`
+- `latest-reusable-success.json`
 
-Do **not** patch `node_modules/vitest/vitest.mjs` in `postinstall`.
+Every worktree for the same repo sees the same active-holder and baseline state.
 
-Replace the root devDependency on `vitest` with a source-controlled local wrapper package:
-
-- root `package.json` points `vitest` at `file:tools/vitest-wrapper`
-- the wrapper package exposes the `vitest` binary
-- the wrapper package re-exports the upstream library APIs the repo actually consumes:
-  - `vitest`
-  - `vitest/config`
-- the wrapper package depends on the real upstream package through an npm alias such as `@freshell/vitest-upstream`
-
-That keeps the interception mechanism inside source control, recorded in `package-lock.json`, and safe across shared or symlinked worktrees because it no longer mutates a shared dependency installation in place.
-
-### 4. Public CLI Contract Is Explicit
-
-Public commands are adapters, not special cases. They expand into normalized requests, then the classifier decides coordinated/delegated/rejected behavior.
-
-| Public command | Adapter expansion | Classification rules |
-| --- | --- | --- |
-| `npm test` | `full-suite` composite | coordinated |
-| `npm run test:all` | `full-suite` composite | coordinated |
-| `npm run check` | `typecheck`, then `full-suite` | typecheck delegated, test phase coordinated |
-| `npm run verify` | `build`, then `full-suite` | build delegated, test phase coordinated |
-| `npm run test:coverage` | `vitest run --coverage` | coordinated `client-coverage` |
-| `npm run test:unit` | `vitest run test/unit` | coordinated `unit-all` unless further narrowed |
-| `npm run test:integration` | `vitest run --config vitest.server.config.ts test/server` | coordinated `integration-all` unless further narrowed |
-| `npm run test:client` | `vitest run test/unit/client` | coordinated `client-unit-all` unless further narrowed |
-| `npm run test:server` | `vitest --config vitest.server.config.ts` | delegated by default; `--run` with no narrowing becomes coordinated `server-all` |
-| `npm run test:watch` | `vitest` | delegated |
-| `npm run test:ui` | `vitest --ui` | delegated |
-| `npm run test:status` | coordinator status mode | delegated status-only |
-
-Forwarded-arg contract:
-
-- `--summary "<text>"` and `FRESHELL_TEST_SUMMARY` are coordinator-owned and valid on every public coordinated command
-- `--help`, `-h`, `--version`, `-v` always return coordinator help/version for public coordinator entrypoints and upstream Vitest help/version for Vitest-facing entrypoints
-- `npm run test:server -- --run` is valid and becomes `server-all`
-- `npm test -- --run` is accepted as a no-op compatibility alias because `test` already implies one-shot mode
-- composite commands reject forwarded flags that cannot be applied truthfully to both phases
-
-### 5. Advisory Baselines Are Exact-Match And Non-Authoritative
+### 4. Advisory Baselines Are Exact-Match And Non-Authoritative
 
 Reusable baseline identity is frozen to:
 
 - `suiteKey`
 - `repo.commit`
-- `repo.cleanWorktree = true`
+- `repo.cleanWorktree === true`
 - `runtime.nodeVersion`
 - `runtime.platform`
 - `runtime.arch`
 
-Status/history views must keep these records separate:
-
-- `latestCommandRun`
-- `latestCommandFailure`
-- `latestSuiteRun`
-- `latestSuiteFailure`
-- `latestReusableSuccess`
-
 Rules:
 
-- a later failure must not erase an earlier reusable success for the same reusable identity
-- reusable baselines are advisory only
-- the coordinator may show that an inherited exact-match success exists
-- the coordinator must not auto-succeed `test`, `check`, or `verify`
-- the repo rule requiring a fresh `npm test` before landing remains unchanged
+- only successful coordinated suite runs can publish reusable baselines;
+- later failures do not erase an older reusable success for the same identity;
+- the coordinator may surface a matching reusable success in `test:status`;
+- `npm test`, `npm run check`, and `npm run verify` never auto-succeed from cache;
+- the repo rule requiring a fresh `npm test` before landing remains unchanged.
 
-### 6. Wait Semantics Are Fixed
+### 5. Wait Semantics Are Fixed
 
-For coordinated workloads:
+For every coordinated workload:
 
-- try the lock immediately
-- if busy, print holder info when available
-- print the current time and poll once per minute
-- wait up to one hour
-- never kill a run the current process did not start
-- exit nonzero only on timeout or internal failure
+- try the lock immediately;
+- if busy, print current time, holder info if available, and baseline info if relevant;
+- poll once per minute;
+- wait up to one hour;
+- never kill a run the current process did not start;
+- exit nonzero only on timeout or internal failure.
 
-## Data And Runtime Contracts
+## Frozen Public CLI Contract
 
-### Shared Store Location
+### Command Matrix
 
-Store coordination data under the Git common-dir so all linked worktrees see the same state:
+| Command | No forwarded args | Narrowed / interactive forwarded args |
+| --- | --- | --- |
+| `npm test` | coordinated `full-suite` | delegated or rejected by classifier |
+| `npm run test:all` | coordinated `full-suite` | delegated or rejected by classifier |
+| `npm run check` | delegated `typecheck`, then coordinated `full-suite` | delegated or rejected test phase by classifier; `typecheck` still runs |
+| `npm run verify` | delegated `build`, then coordinated `full-suite` | delegated or rejected test phase by classifier; `build` still runs |
+| `npm run test:coverage` | coordinated `client-coverage` | delegated exact upstream invocation |
+| `npm run test:unit` | coordinated `unit-all` | delegated exact upstream invocation |
+| `npm run test:integration` | coordinated `integration-all` | delegated exact upstream invocation |
+| `npm run test:client` | coordinated `client-unit-all` | delegated exact upstream invocation |
+| `npm run test:server` | delegated upstream default watch-capable server command | delegated exact upstream invocation; `--run` with no narrowing becomes coordinated `server-all` |
+| `npm run test:watch` | delegated upstream watch command | delegated upstream watch command |
+| `npm run test:ui` | delegated upstream UI command | delegated upstream UI command |
+| `npm run test:status` | delegated status output | delegated status output |
+| `npm run test:vitest -- ...` | classified from forwarded Vitest argv | classified from forwarded Vitest argv |
 
-- lock file
-- advisory holder record
-- command-history records
-- suite-history records
+### Forwarded-Arg Rules
 
-Use helpers that resolve:
+Coordinator-owned options:
 
-- invocation cwd
-- checkout root
-- repo root
-- Git common-dir
-- branch
-- commit
-- dirty state
+- `--summary "<text>"`
+- `FRESHELL_TEST_SUMMARY`
+
+Unconditional passthrough:
+
+- `--help`
+- `-h`
+- `--version`
+- `-v`
+
+Always delegated:
+
+- `--watch`
+- `-w`
+- `--ui`
+- `-t`, `--testNamePattern`
+- explicit file or directory targets that narrow a single-phase command
+
+Delegated-or-rejected on composite commands (`test`, `test:all`, `check`, `verify`):
+
+- selectors that classify cleanly to one phase are delegated to that single upstream phase;
+- mixed client + server selectors are rejected with an instruction to split the command;
+- `--reporter` is rejected on composite commands because the repo will not fake merged reporter semantics across split phases;
+- `--config vitest.server.config.ts` on a composite command delegates to a single server phase;
+- `--run` on `npm test` / `npm run test:all` is an accepted compatibility no-op.
+
+### Existing Repo Forms That Must Be Preserved Explicitly
+
+These forms are part of the contract and must have tests:
+
+```bash
+npm test -- test/unit/server/terminal-registry.test.ts -t "reaping exited terminals"
+npm test -- --run test/unit/client/store/panesSlice.test.ts
+npm run test:server -- test/unit/server/sessions-sync/diff.test.ts
+npm run test:client -- --run test/unit/client/components/Sidebar.test.tsx
+npm run test:unit -- test/unit/server/coding-cli/utils.test.ts
+npm run test:vitest -- --config vitest.server.config.ts test/server/ws-protocol.test.ts
+```
+
+The classifier must map each of those to either:
+
+- a coordinated suite,
+- one truthful delegated upstream invocation,
+- or an explicit rejection.
+
+## Data Contracts
 
 ### Holder Record
-
-Persist only after the locked runner has acquired `flock`.
 
 Required fields:
 
@@ -188,7 +187,6 @@ Required fields:
 - `pid`
 - `hostname`
 - `username`
-- `entrypoint.kind`
 - `entrypoint.commandKey`
 - `entrypoint.suiteKey`
 - `command.display`
@@ -196,8 +194,8 @@ Required fields:
 - `repo.invocationCwd`
 - `repo.checkoutRoot`
 - `repo.repoRoot`
-- `repo.worktreePath`
 - `repo.commonDir`
+- `repo.worktreePath`
 - `repo.branch`
 - `repo.commit`
 - `repo.cleanWorktree`
@@ -208,17 +206,11 @@ Required fields:
 - `agent.sessionId`
 - `agent.threadId`
 
-Agent metadata precedence:
-
-- Codex: `CODEX_THREAD_ID`
-- Claude: `CLAUDE_SESSION_ID`, then `CLAUDE_THREAD_ID`
-- otherwise `unknown`
+If the socket/pipe is live but `holder.json` is missing, partial, or corrupt, `test:status` must report `running-undescribed`.
 
 ### Result Records
 
-Persist command-scoped and suite-scoped result records separately.
-
-Each record stores:
+Command and suite records are stored separately. Each record includes:
 
 - `status`
 - `exitCode`
@@ -229,338 +221,362 @@ Each record stores:
 - repo identity
 - runtime identity
 
-Suite records additionally store:
+Suite records additionally include:
 
+- `suiteKey`
 - `reusable`
-- `source.kind`
 - `source.commandKey`
 
 ## File Plan
 
 **Modify**
 
-- `package.json`
-- `package-lock.json`
-- `AGENTS.md`
-- `docs/skills/testing.md`
-- `server/coding-cli/utils.ts`
-- `test/unit/server/coding-cli/utils.test.ts`
+- `/home/user/code/freshell/.worktrees/test-run-gate/package.json`
+- `/home/user/code/freshell/.worktrees/test-run-gate/AGENTS.md`
+- `/home/user/code/freshell/.worktrees/test-run-gate/docs/skills/testing.md`
+- `/home/user/code/freshell/.worktrees/test-run-gate/server/coding-cli/utils.ts`
+- `/home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/coding-cli/utils.test.ts`
 
 **Create**
 
-- `scripts/testing/test-coordinator.ts`
-- `scripts/testing/test-coordinator-manifest.ts`
-- `scripts/testing/test-coordinator-store.ts`
-- `scripts/testing/test-coordinator-status.ts`
-- `scripts/testing/test-coordinator-upstream.ts`
-- `scripts/testing/test-coordinator-locked-runner.ts`
-- `tools/vitest-wrapper/package.json`
-- `tools/vitest-wrapper/vitest.mjs`
-- `tools/vitest-wrapper/index.js`
-- `tools/vitest-wrapper/index.d.ts`
-- `tools/vitest-wrapper/config.js`
-- `tools/vitest-wrapper/config.d.ts`
-- `test/fixtures/testing/fake-vitest-upstream.mjs`
-- `test/fixtures/testing/fake-coordinated-workload.mjs`
-- `test/fixtures/testing/temp-test-coordinator-env.ts`
-- `test/unit/server/test-coordinator-manifest.test.ts`
-- `test/unit/server/test-coordinator-store.test.ts`
-- `test/unit/server/test-coordinator-status.test.ts`
-- `test/unit/server/test-coordinator-wrapper.test.ts`
-- `test/integration/server/test-coordinator.test.ts`
+- `/home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator.ts`
+- `/home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-command-matrix.ts`
+- `/home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-store.ts`
+- `/home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-socket.ts`
+- `/home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-status.ts`
+- `/home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-upstream.ts`
+- `/home/user/code/freshell/.worktrees/test-run-gate/test/fixtures/testing/fake-coordinated-workload.mjs`
+- `/home/user/code/freshell/.worktrees/test-run-gate/test/fixtures/testing/temp-test-coordinator-env.ts`
+- `/home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-store.test.ts`
+- `/home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-command-matrix.test.ts`
+- `/home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-socket.test.ts`
+- `/home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-status.test.ts`
+- `/home/user/code/freshell/.worktrees/test-run-gate/test/integration/server/test-coordinator.test.ts`
 
-## Task 1: Lock The Runtime Model And Shared Store
+## Task 1: Build Repo Identity And Shared Store Primitives
 
 **Files:**
 
-- Modify: `server/coding-cli/utils.ts`
-- Modify: `test/unit/server/coding-cli/utils.test.ts`
-- Create: `scripts/testing/test-coordinator-store.ts`
-- Create: `test/unit/server/test-coordinator-store.test.ts`
+- Modify: `/home/user/code/freshell/.worktrees/test-run-gate/server/coding-cli/utils.ts`
+- Modify: `/home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/coding-cli/utils.test.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-store.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-store.test.ts`
 
-- [ ] **Step 1: Write the failing tests**
-  - add coverage for `resolveInvocationCwd()` preferring `INIT_CWD`
-  - add coverage for `resolveGitCommonDir()` in a linked worktree
-  - add coverage for resolving checkout root, repo root, branch, commit, and dirty state from a worktree cwd
-  - add store tests for atomic holder writes, command-result writes, suite-result writes, and corrupt JSON tolerance
-  - add store tests proving `latestReusableSuccess` survives a newer failure for the same reusable identity
+**Step 1: Write the failing tests**
 
-- [ ] **Step 2: Run the targeted tests and verify they fail**
+Add tests for:
 
-  ```bash
-  cd /home/user/code/freshell/.worktrees/test-run-gate
-  npx vitest run --config vitest.server.config.ts test/unit/server/coding-cli/utils.test.ts test/unit/server/test-coordinator-store.test.ts
-  ```
+- `resolveInvocationCwd()` preferring `INIT_CWD` when npm supplies it;
+- `resolveGitCommonDir()` in a linked worktree;
+- resolving checkout root, repo root, branch, commit, and dirty state from a worktree cwd;
+- atomic store writes and corrupt JSON tolerance;
+- reusable success surviving a later failure for the same reusable identity.
 
-- [ ] **Step 3: Write the minimal implementation**
-  - extend `server/coding-cli/utils.ts` with invocation cwd and Git common-dir helpers
-  - implement the shared common-dir store in `scripts/testing/test-coordinator-store.ts`
-  - keep lock state separate from metadata files
-  - keep command history and suite history separate
+**Step 2: Run the targeted tests and verify they fail**
 
-- [ ] **Step 4: Re-run the targeted tests and verify they pass**
+```bash
+cd /home/user/code/freshell/.worktrees/test-run-gate
+npx vitest run --config vitest.server.config.ts test/unit/server/coding-cli/utils.test.ts test/unit/server/test-coordinator-store.test.ts
+```
 
-  ```bash
-  cd /home/user/code/freshell/.worktrees/test-run-gate
-  npx vitest run --config vitest.server.config.ts test/unit/server/coding-cli/utils.test.ts test/unit/server/test-coordinator-store.test.ts
-  ```
+**Step 3: Write the minimal implementation**
 
-- [ ] **Step 5: Commit**
+Extend `server/coding-cli/utils.ts` with repo helpers the coordinator can reuse:
 
-  ```bash
-  git add server/coding-cli/utils.ts test/unit/server/coding-cli/utils.test.ts scripts/testing/test-coordinator-store.ts test/unit/server/test-coordinator-store.test.ts
-  git commit -m "test: add shared test coordination store"
-  ```
+```ts
+export async function resolveGitCommonDir(cwd: string): Promise<string | undefined>
+export function resolveInvocationCwd(envVars: NodeJS.ProcessEnv = process.env): string | undefined
+export async function resolveGitIdentity(cwd: string): Promise<{
+  invocationCwd?: string
+  checkoutRoot?: string
+  repoRoot?: string
+  commonDir?: string
+  branch?: string
+  commit?: string
+  cleanWorktree?: boolean
+}>
+```
 
-## Task 2: Freeze The Command Matrix And Status Contract
+Implement store helpers that keep lock state out of band and write JSON atomically with temp-file-plus-rename semantics.
 
-**Files:**
+**Step 4: Re-run the targeted tests and verify they pass**
 
-- Create: `scripts/testing/test-coordinator-manifest.ts`
-- Create: `scripts/testing/test-coordinator-status.ts`
-- Create: `test/unit/server/test-coordinator-manifest.test.ts`
-- Create: `test/unit/server/test-coordinator-status.test.ts`
+```bash
+cd /home/user/code/freshell/.worktrees/test-run-gate
+npx vitest run --config vitest.server.config.ts test/unit/server/coding-cli/utils.test.ts test/unit/server/test-coordinator-store.test.ts
+```
 
-- [ ] **Step 1: Write the failing tests**
-  - test every public command adapter listed in this plan
-  - test canonical suite classification for `client-all`, `server-all`, `client-coverage`, `unit-all`, `integration-all`, and `client-unit-all`
-  - test `npm run test:server -- --run` normalizing to coordinated `server-all`
-  - test `npm test -- --run` behaving as an accepted compatibility no-op
-  - test `--help`, `-h`, `--version`, `-v` passthrough behavior
-  - test delegated narrowing selectors and interactive flags
-  - test composite rejection of unsafe forwarded flags such as `--reporter`
-  - test status projection for `idle`, `running`, and `running-undescribed`
-  - test separate projection of command history, suite history, and reusable success
+**Step 5: Commit**
 
-- [ ] **Step 2: Run the targeted tests and verify they fail**
+```bash
+git add /home/user/code/freshell/.worktrees/test-run-gate/server/coding-cli/utils.ts /home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/coding-cli/utils.test.ts /home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-store.ts /home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-store.test.ts
+git commit -m "test: add shared test coordination store primitives"
+```
 
-  ```bash
-  cd /home/user/code/freshell/.worktrees/test-run-gate
-  npx vitest run --config vitest.server.config.ts test/unit/server/test-coordinator-manifest.test.ts test/unit/server/test-coordinator-status.test.ts
-  ```
-
-- [ ] **Step 3: Write the minimal implementation**
-  - define the adapter manifest and suite classifier in `scripts/testing/test-coordinator-manifest.ts`
-  - define the status projector and JSON schema validation in `scripts/testing/test-coordinator-status.ts`
-  - make classification depend on normalized workload shape, not source command name
-
-- [ ] **Step 4: Re-run the targeted tests and verify they pass**
-
-  ```bash
-  cd /home/user/code/freshell/.worktrees/test-run-gate
-  npx vitest run --config vitest.server.config.ts test/unit/server/test-coordinator-manifest.test.ts test/unit/server/test-coordinator-status.test.ts
-  ```
-
-- [ ] **Step 5: Commit**
-
-  ```bash
-  git add scripts/testing/test-coordinator-manifest.ts scripts/testing/test-coordinator-status.ts test/unit/server/test-coordinator-manifest.test.ts test/unit/server/test-coordinator-status.test.ts
-  git commit -m "test: define coordinated test command matrix"
-  ```
-
-## Task 3: Replace Raw Vitest With A Repo-Owned Wrapper Package
+## Task 2: Freeze The Command Matrix And Composite Arg Classifier
 
 **Files:**
 
-- Modify: `package.json`
-- Modify: `package-lock.json`
-- Create: `tools/vitest-wrapper/package.json`
-- Create: `tools/vitest-wrapper/vitest.mjs`
-- Create: `tools/vitest-wrapper/index.js`
-- Create: `tools/vitest-wrapper/index.d.ts`
-- Create: `tools/vitest-wrapper/config.js`
-- Create: `tools/vitest-wrapper/config.d.ts`
-- Create: `test/unit/server/test-coordinator-wrapper.test.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-command-matrix.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-command-matrix.test.ts`
 
-- [ ] **Step 1: Write the failing tests**
-  - test that the local wrapper package re-exports `vitest`
-  - test that the local wrapper package re-exports `vitest/config`
-  - test that the wrapper binary forwards raw argv into the coordinator entrypoint
-  - test that help/version and delegated interactive runs reach the preserved upstream path
-  - test that coordinated one-shot raw runs enter the coordinator path
+**Step 1: Write the failing tests**
 
-- [ ] **Step 2: Run the targeted tests and verify they fail**
+Cover:
 
-  ```bash
-  cd /home/user/code/freshell/.worktrees/test-run-gate
-  npx vitest run --config vitest.server.config.ts test/unit/server/test-coordinator-wrapper.test.ts
-  ```
+- every sanctioned command in the matrix above;
+- the exact preserved forms listed earlier;
+- `--watch` / `-w` always delegating, even in CI or non-TTY;
+- `--help`, `-h`, `--version`, and `-v` passthrough behavior;
+- `--reporter` passing only on delegated single-phase runs and rejecting on composites;
+- composite-command classification for client-only selectors, server-only selectors, and mixed selectors;
+- `npm run test:server -- --run` becoming coordinated `server-all`;
+- `npm test -- --run` behaving as a compatibility no-op.
 
-- [ ] **Step 3: Write the minimal implementation**
-  - replace the root `vitest` devDependency with `file:tools/vitest-wrapper`
-  - add the upstream alias dependency for the real Vitest package
-  - implement the wrapper package with source-controlled JS and d.ts proxy files
-  - implement `tools/vitest-wrapper/vitest.mjs` so it calls the repo coordinator without mutating `node_modules`
-  - update `package-lock.json` by running `npm install` inside the worktree only
+**Step 2: Run the targeted tests and verify they fail**
 
-- [ ] **Step 4: Re-run the targeted tests and verify they pass**
+```bash
+cd /home/user/code/freshell/.worktrees/test-run-gate
+npx vitest run --config vitest.server.config.ts test/unit/server/test-coordinator-command-matrix.test.ts
+```
 
-  ```bash
-  cd /home/user/code/freshell/.worktrees/test-run-gate
-  npx vitest run --config vitest.server.config.ts test/unit/server/test-coordinator-wrapper.test.ts
-  ```
+**Step 3: Write the minimal implementation**
 
-- [ ] **Step 5: Commit**
+Implement one pure classifier module:
 
-  ```bash
-  git add package.json package-lock.json tools/vitest-wrapper/package.json tools/vitest-wrapper/vitest.mjs tools/vitest-wrapper/index.js tools/vitest-wrapper/index.d.ts tools/vitest-wrapper/config.js tools/vitest-wrapper/config.d.ts test/unit/server/test-coordinator-wrapper.test.ts
-  git commit -m "build: replace vitest with repo-owned wrapper"
-  ```
+```ts
+export type CommandDisposition =
+  | { kind: 'coordinated'; suiteKey: string; upstreamPhases: UpstreamPhase[] }
+  | { kind: 'delegated'; upstream: UpstreamInvocation }
+  | { kind: 'rejected'; reason: string }
+  | { kind: 'passthrough'; target: 'coordinator-help' | 'upstream-help' | 'upstream-version' }
 
-## Task 4: Implement The Coordinator, Locked Runner, And Status CLI
+export function classifyCommand(input: CoordinatorInput): CommandDisposition
+```
 
-**Files:**
+The module must encode the contract directly instead of depending on npm shell behavior.
 
-- Create: `scripts/testing/test-coordinator.ts`
-- Create: `scripts/testing/test-coordinator-upstream.ts`
-- Create: `scripts/testing/test-coordinator-locked-runner.ts`
-- Create: `test/fixtures/testing/fake-vitest-upstream.mjs`
-- Create: `test/fixtures/testing/fake-coordinated-workload.mjs`
-- Create: `test/fixtures/testing/temp-test-coordinator-env.ts`
-- Create: `test/integration/server/test-coordinator.test.ts`
+**Step 4: Re-run the targeted tests and verify they pass**
 
-- [ ] **Step 1: Write the failing integration tests**
-  - test `test:status` returning `idle` when no coordinated run owns the lock
-  - test `test:status` reporting `running-undescribed` when lock acquisition fails and holder JSON is unreadable
-  - test a coordinated public command acquiring the lock through the locked-runner subprocess
-  - test a raw `vitest run` canonical suite acquiring the same lock through the wrapper package
-  - test one coordinated run waiting behind another with once-per-minute polling output
-  - test timeout after the configured one-hour budget equivalent using shortened fixture timing
-  - test holder cleanup on success, failure, and coordinator exception
-  - test command history vs suite history vs reusable success separation
-  - test that `check` and `verify` only coordinate their test phases, not their build/typecheck phases
-  - test delegated narrowed runs bypassing the lock entirely
-  - test that the coordinator never kills foreign processes
+```bash
+cd /home/user/code/freshell/.worktrees/test-run-gate
+npx vitest run --config vitest.server.config.ts test/unit/server/test-coordinator-command-matrix.test.ts
+```
 
-- [ ] **Step 2: Run the targeted integration tests and verify they fail**
+**Step 5: Commit**
 
-  ```bash
-  cd /home/user/code/freshell/.worktrees/test-run-gate
-  npx vitest run --config vitest.server.config.ts test/integration/server/test-coordinator.test.ts
-  ```
+```bash
+git add /home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-command-matrix.ts /home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-command-matrix.test.ts
+git commit -m "test: freeze coordinated test command contract"
+```
 
-- [ ] **Step 3: Write the minimal implementation**
-  - implement CLI parsing for public-command mode, raw-wrapper mode, locked-runner mode, and status mode
-  - implement non-blocking `flock` polling and the one-hour wait contract
-  - launch a dedicated locked runner under `flock` so the lock lifetime belongs to the kernel-held subprocess
-  - have the locked runner write holder metadata, execute the normalized workload, write results, and clean advisory metadata in `finally`
-  - keep upstream delegation non-recursive
-
-- [ ] **Step 4: Re-run the targeted integration tests and verify they pass**
-
-  ```bash
-  cd /home/user/code/freshell/.worktrees/test-run-gate
-  npx vitest run --config vitest.server.config.ts test/integration/server/test-coordinator.test.ts
-  ```
-
-- [ ] **Step 5: Commit**
-
-  ```bash
-  git add scripts/testing/test-coordinator.ts scripts/testing/test-coordinator-upstream.ts scripts/testing/test-coordinator-locked-runner.ts test/fixtures/testing/fake-vitest-upstream.mjs test/fixtures/testing/fake-coordinated-workload.mjs test/fixtures/testing/temp-test-coordinator-env.ts test/integration/server/test-coordinator.test.ts
-  git commit -m "feat: coordinate broad test workloads"
-  ```
-
-## Task 5: Wire Public Scripts And Document The Contract
+## Task 3: Implement Cross-Platform Coordination Runtime And Status Projection
 
 **Files:**
 
-- Modify: `package.json`
-- Modify: `AGENTS.md`
-- Modify: `docs/skills/testing.md`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-socket.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-status.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-upstream.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/fixtures/testing/fake-coordinated-workload.mjs`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/fixtures/testing/temp-test-coordinator-env.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-socket.test.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-status.test.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/integration/server/test-coordinator.test.ts`
 
-- [ ] **Step 1: Write the failing tests or assertions**
-  - extend the manifest tests to assert every public npm script resolves to the intended adapter
-  - add assertions that `test:status` is present
-  - add assertions that raw local `vitest` still reaches the wrapper after the script rewiring
+**Step 1: Write the failing unit and subprocess-integration tests**
 
-- [ ] **Step 2: Run the targeted tests and verify they fail**
+Cover:
 
-  ```bash
-  cd /home/user/code/freshell/.worktrees/test-run-gate
-  npx vitest run --config vitest.server.config.ts test/unit/server/test-coordinator-manifest.test.ts test/unit/server/test-coordinator-wrapper.test.ts
-  ```
+- endpoint-name derivation from Git common-dir hash on Unix and Windows;
+- stale Unix socket cleanup only after failed connect;
+- `test:status` reporting `idle`, `running`, and `running-undescribed`;
+- coordinated runs waiting behind an active coordinated run with once-per-minute polling output;
+- timeout behavior using shortened fixture time budgets;
+- holder cleanup on success, failure, and coordinator exception;
+- command history vs suite history vs latest reusable success separation;
+- `check` and `verify` only coordinating their test phases;
+- no code path that kills a foreign process.
 
-- [ ] **Step 3: Write the minimal implementation**
-  - rewire public npm scripts to the coordinator entrypoint
-  - add `npm run test:status`
-  - document `--summary` and `FRESHELL_TEST_SUMMARY`
-  - document that coordinated runs wait rather than kill another agent’s run
-  - document that exact-match reusable baselines are advisory only
+**Step 2: Run the targeted tests and verify they fail**
 
-- [ ] **Step 4: Re-run the targeted tests and verify they pass**
+```bash
+cd /home/user/code/freshell/.worktrees/test-run-gate
+npx vitest run --config vitest.server.config.ts test/unit/server/test-coordinator-socket.test.ts test/unit/server/test-coordinator-status.test.ts test/integration/server/test-coordinator.test.ts
+```
 
-  ```bash
-  cd /home/user/code/freshell/.worktrees/test-run-gate
-  npx vitest run --config vitest.server.config.ts test/unit/server/test-coordinator-manifest.test.ts test/unit/server/test-coordinator-wrapper.test.ts
-  ```
+**Step 3: Write the minimal implementation**
 
-- [ ] **Step 5: Commit**
+Implement the runtime in three layers:
 
-  ```bash
-  git add package.json AGENTS.md docs/skills/testing.md
-  git commit -m "docs: publish coordinated test workflow"
-  ```
+```ts
+// test-coordinator-socket.ts
+export async function tryStartCoordinatorServer(identity: RepoIdentity): Promise<StartedServer | undefined>
+export async function readActiveCoordinator(identity: RepoIdentity): Promise<ActiveCoordinator | undefined>
 
-## Task 6: Final Verification
+// test-coordinator-status.ts
+export async function buildStatus(identity: RepoIdentity, requestedSuite?: string): Promise<StatusView>
+
+// test-coordinator.ts
+if (disposition.kind === 'delegated') return runUpstream(disposition.upstream)
+if (disposition.kind === 'coordinated') return runCoordinated(disposition)
+```
+
+`runCoordinated()` must:
+
+- start or connect to the repo-specific server;
+- persist holder metadata only after the server is live;
+- wait/poll up to one hour if another coordinated run is active;
+- execute upstream phases sequentially;
+- persist command and suite results in `finally`;
+- remove advisory holder metadata only if it still belongs to the current pid/run.
+
+**Step 4: Re-run the targeted tests and verify they pass**
+
+```bash
+cd /home/user/code/freshell/.worktrees/test-run-gate
+npx vitest run --config vitest.server.config.ts test/unit/server/test-coordinator-socket.test.ts test/unit/server/test-coordinator-status.test.ts test/integration/server/test-coordinator.test.ts
+```
+
+**Step 5: Commit**
+
+```bash
+git add /home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator.ts /home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-socket.ts /home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-status.ts /home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-upstream.ts /home/user/code/freshell/.worktrees/test-run-gate/test/fixtures/testing/fake-coordinated-workload.mjs /home/user/code/freshell/.worktrees/test-run-gate/test/fixtures/testing/temp-test-coordinator-env.ts /home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-socket.test.ts /home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-status.test.ts /home/user/code/freshell/.worktrees/test-run-gate/test/integration/server/test-coordinator.test.ts
+git commit -m "feat: add cross-platform coordinated test runtime"
+```
+
+## Task 4: Wire Sanctioned Public Commands And Publish The Workflow
 
 **Files:**
 
-- Modify: `package.json`
-- Modify: `package-lock.json`
-- Modify: `AGENTS.md`
-- Modify: `docs/skills/testing.md`
-- Modify: `server/coding-cli/utils.ts`
-- Modify: `test/unit/server/coding-cli/utils.test.ts`
-- Create: `scripts/testing/test-coordinator.ts`
-- Create: `scripts/testing/test-coordinator-manifest.ts`
-- Create: `scripts/testing/test-coordinator-store.ts`
-- Create: `scripts/testing/test-coordinator-status.ts`
-- Create: `scripts/testing/test-coordinator-upstream.ts`
-- Create: `scripts/testing/test-coordinator-locked-runner.ts`
-- Create: `tools/vitest-wrapper/package.json`
-- Create: `tools/vitest-wrapper/vitest.mjs`
-- Create: `tools/vitest-wrapper/index.js`
-- Create: `tools/vitest-wrapper/index.d.ts`
-- Create: `tools/vitest-wrapper/config.js`
-- Create: `tools/vitest-wrapper/config.d.ts`
-- Create: `test/fixtures/testing/fake-vitest-upstream.mjs`
-- Create: `test/fixtures/testing/fake-coordinated-workload.mjs`
-- Create: `test/fixtures/testing/temp-test-coordinator-env.ts`
-- Create: `test/unit/server/test-coordinator-manifest.test.ts`
-- Create: `test/unit/server/test-coordinator-store.test.ts`
-- Create: `test/unit/server/test-coordinator-status.test.ts`
-- Create: `test/unit/server/test-coordinator-wrapper.test.ts`
-- Create: `test/integration/server/test-coordinator.test.ts`
+- Modify: `/home/user/code/freshell/.worktrees/test-run-gate/package.json`
+- Modify: `/home/user/code/freshell/.worktrees/test-run-gate/AGENTS.md`
+- Modify: `/home/user/code/freshell/.worktrees/test-run-gate/docs/skills/testing.md`
 
-- [ ] **Step 1: Run the focused coordinator suite**
+**Step 1: Write the failing assertions or fixture checks**
 
-  ```bash
-  cd /home/user/code/freshell/.worktrees/test-run-gate
-  npx vitest run --config vitest.server.config.ts test/unit/server/coding-cli/utils.test.ts test/unit/server/test-coordinator-store.test.ts test/unit/server/test-coordinator-manifest.test.ts test/unit/server/test-coordinator-status.test.ts test/unit/server/test-coordinator-wrapper.test.ts test/integration/server/test-coordinator.test.ts
-  ```
+Extend command-matrix or integration coverage to assert:
 
-- [ ] **Step 2: Run repo verification without a full-suite collision**
+- every public npm test script points at the repo-owned coordinator entrypoint;
+- `test:status` exists;
+- `test:vitest` exists and is documented as the sanctioned direct Vitest path;
+- `docs/skills/testing.md` no longer claims `npm test` is watch mode.
 
-  ```bash
-  cd /home/user/code/freshell/.worktrees/test-run-gate
-  npm run check
-  npm run lint
-  ```
+**Step 2: Run the targeted tests and verify they fail**
 
-- [ ] **Step 3: Pause before the mandatory fresh landing run if another agent already owns the coordinated test lock**
-  - use `npm run test:status -- --command test`
-  - if the lock is busy, wait per the new contract instead of starting another full run
+```bash
+cd /home/user/code/freshell/.worktrees/test-run-gate
+npx vitest run --config vitest.server.config.ts test/unit/server/test-coordinator-command-matrix.test.ts test/integration/server/test-coordinator.test.ts
+```
 
-- [ ] **Step 4: Run the full suite once the lock is available**
+**Step 3: Write the minimal implementation**
 
-  ```bash
-  cd /home/user/code/freshell/.worktrees/test-run-gate
-  FRESHELL_TEST_SUMMARY="Unified test coordination and advisory baselines" npm test
-  ```
+Rewire scripts so the contract is explicit:
 
-- [ ] **Step 5: Commit the final verification or follow-up fixes**
+```json
+{
+  "test": "tsx scripts/testing/test-coordinator.ts run test",
+  "test:all": "tsx scripts/testing/test-coordinator.ts run test:all",
+  "check": "tsx scripts/testing/test-coordinator.ts run check",
+  "verify": "tsx scripts/testing/test-coordinator.ts run verify",
+  "test:status": "tsx scripts/testing/test-coordinator.ts status",
+  "test:vitest": "tsx scripts/testing/test-coordinator.ts vitest"
+}
+```
 
-  ```bash
-  git add package.json package-lock.json AGENTS.md docs/skills/testing.md server/coding-cli/utils.ts test/unit/server/coding-cli/utils.test.ts scripts/testing/test-coordinator.ts scripts/testing/test-coordinator-manifest.ts scripts/testing/test-coordinator-store.ts scripts/testing/test-coordinator-status.ts scripts/testing/test-coordinator-upstream.ts scripts/testing/test-coordinator-locked-runner.ts tools/vitest-wrapper/package.json tools/vitest-wrapper/vitest.mjs tools/vitest-wrapper/index.js tools/vitest-wrapper/index.d.ts tools/vitest-wrapper/config.js tools/vitest-wrapper/config.d.ts test/fixtures/testing/fake-vitest-upstream.mjs test/fixtures/testing/fake-coordinated-workload.mjs test/fixtures/testing/temp-test-coordinator-env.ts test/unit/server/test-coordinator-manifest.test.ts test/unit/server/test-coordinator-store.test.ts test/unit/server/test-coordinator-status.test.ts test/unit/server/test-coordinator-wrapper.test.ts test/integration/server/test-coordinator.test.ts
-  git commit -m "test: finalize coordinated test workflow"
-  ```
+Document:
+
+- how to pass `--summary` or `FRESHELL_TEST_SUMMARY`;
+- how `test:status` exposes active-holder and reusable baseline info;
+- that agents must wait rather than kill another run;
+- that direct `npx vitest` broad runs are unsupported and `npm run test:vitest -- ...` is the sanctioned replacement.
+
+**Step 4: Re-run the targeted tests and verify they pass**
+
+```bash
+cd /home/user/code/freshell/.worktrees/test-run-gate
+npx vitest run --config vitest.server.config.ts test/unit/server/test-coordinator-command-matrix.test.ts test/integration/server/test-coordinator.test.ts
+```
+
+**Step 5: Commit**
+
+```bash
+git add /home/user/code/freshell/.worktrees/test-run-gate/package.json /home/user/code/freshell/.worktrees/test-run-gate/AGENTS.md /home/user/code/freshell/.worktrees/test-run-gate/docs/skills/testing.md
+git commit -m "docs: publish sanctioned coordinated test entrypoints"
+```
+
+## Task 5: Final Verification And Safety Checks
+
+**Files:**
+
+- Modify: `/home/user/code/freshell/.worktrees/test-run-gate/package.json`
+- Modify: `/home/user/code/freshell/.worktrees/test-run-gate/AGENTS.md`
+- Modify: `/home/user/code/freshell/.worktrees/test-run-gate/docs/skills/testing.md`
+- Modify: `/home/user/code/freshell/.worktrees/test-run-gate/server/coding-cli/utils.ts`
+- Modify: `/home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/coding-cli/utils.test.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-command-matrix.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-store.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-socket.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-status.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-upstream.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/fixtures/testing/fake-coordinated-workload.mjs`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/fixtures/testing/temp-test-coordinator-env.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-store.test.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-command-matrix.test.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-socket.test.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-status.test.ts`
+- Create: `/home/user/code/freshell/.worktrees/test-run-gate/test/integration/server/test-coordinator.test.ts`
+
+**Step 1: Verify targeted coverage before any broad suite**
+
+Do not run `npm test`, `npm run check`, or `npm run verify` until Tasks 1-4 are complete. Before that point, use only the targeted commands listed in the earlier tasks.
+
+Run:
+
+```bash
+cd /home/user/code/freshell/.worktrees/test-run-gate
+npx vitest run --config vitest.server.config.ts test/unit/server/coding-cli/utils.test.ts test/unit/server/test-coordinator-store.test.ts test/unit/server/test-coordinator-command-matrix.test.ts test/unit/server/test-coordinator-socket.test.ts test/unit/server/test-coordinator-status.test.ts test/integration/server/test-coordinator.test.ts
+```
+
+Expected: PASS.
+
+**Step 2: Verify the sanctioned status and direct-entry commands**
+
+Run:
+
+```bash
+cd /home/user/code/freshell/.worktrees/test-run-gate
+npm run test:status
+npm run test:vitest -- --help
+npm run test:server -- --help
+```
+
+Expected:
+
+- `test:status` prints idle or active-holder status plus reusable baseline info without crashing;
+- `test:vitest -- --help` shows upstream Vitest help through the coordinator passthrough;
+- `test:server -- --help` shows truthful upstream server-test help behavior.
+
+**Step 3: Run the full coordinated suite once the coordinator exists**
+
+Run:
+
+```bash
+cd /home/user/code/freshell/.worktrees/test-run-gate
+npm test
+npm run check
+```
+
+Expected:
+
+- the coordinated runner acquires the repo lock or waits behind another active run;
+- broad runs no longer collide when multiple sanctioned commands start at once;
+- `check` still performs typecheck plus a coordinated full-suite test phase.
+
+**Step 4: Commit the verified end state**
+
+```bash
+git add /home/user/code/freshell/.worktrees/test-run-gate/package.json /home/user/code/freshell/.worktrees/test-run-gate/AGENTS.md /home/user/code/freshell/.worktrees/test-run-gate/docs/skills/testing.md /home/user/code/freshell/.worktrees/test-run-gate/server/coding-cli/utils.ts /home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/coding-cli/utils.test.ts /home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator.ts /home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-command-matrix.ts /home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-store.ts /home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-socket.ts /home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-status.ts /home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-upstream.ts /home/user/code/freshell/.worktrees/test-run-gate/test/fixtures/testing/fake-coordinated-workload.mjs /home/user/code/freshell/.worktrees/test-run-gate/test/fixtures/testing/temp-test-coordinator-env.ts /home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-store.test.ts /home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-command-matrix.test.ts /home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-socket.test.ts /home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-status.test.ts /home/user/code/freshell/.worktrees/test-run-gate/test/integration/server/test-coordinator.test.ts
+git commit -m "feat: coordinate sanctioned broad test runs"
+```
