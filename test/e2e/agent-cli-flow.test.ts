@@ -273,9 +273,10 @@ describe('cli e2e flow', () => {
       const first = await runCliJson<{ data: { tabId: string } }>(server.url, ['new-tab', '-n', 'Backlog'])
       const second = await runCliJson<{ data: { tabId: string } }>(server.url, ['new-tab', '-n', 'Active'])
 
-      await runCli(server.url, ['rename-tab', 'Release prep'])
+      const renamed = await runCli(server.url, ['rename-tab', 'Release prep'])
 
       const snapshot = (server.layoutStore as any).snapshot
+      expect(renamed.stderr).toContain('active tab used')
       expect(snapshot.activeTabId).toBe(second.data.tabId)
       expect(snapshot.tabs.find((tab: any) => tab.id === second.data.tabId)?.title).toBe('Release prep')
       expect(snapshot.tabs.find((tab: any) => tab.id === first.data.tabId)?.title).toBe('Backlog')
@@ -348,9 +349,10 @@ describe('cli e2e flow', () => {
         'system',
       ])
 
-      await runCli(server.url, ['rename-pane', 'Main shell'])
+      const renamed = await runCli(server.url, ['rename-pane', 'Main shell'])
 
       const snapshot = (server.layoutStore as any).snapshot
+      expect(renamed.stderr).toContain('active tab used')
       expect(snapshot.paneTitles[created.data.tabId][created.data.paneId]).toBe('Main shell')
       expect(snapshot.tabs.find((tab: any) => tab.id === created.data.tabId)?.title).toBe('Workspace')
     } finally {
@@ -390,8 +392,16 @@ describe('cli e2e flow', () => {
       ]))
 
       const listedText = await runCli(server.url, ['list-panes'])
-      expect(listedText.stdout).toContain('Codex CLI')
-      expect(listedText.stdout).toContain('example.txt')
+      const listedRows = listedText.stdout.split('\n').filter(Boolean).map((line) => line.split('\t'))
+      expect(listedRows).toEqual(expect.arrayContaining([
+        [firstPaneId, '0', 'terminal', 'term_1'],
+        [split.data.paneId, '1', 'editor', ''],
+      ]))
+      expect(listedRows.every((row) => row.length === 4)).toBe(true)
+
+      const listedWithTitles = await runCli(server.url, ['list-panes', '--titles'])
+      expect(listedWithTitles.stdout).toContain('Codex CLI')
+      expect(listedWithTitles.stdout).toContain('example.txt')
 
       await runCli(server.url, ['select-pane', '-t', 'example.txt'])
 
@@ -436,7 +446,15 @@ describe('cli e2e flow', () => {
       ]))
 
       const listedText = await runCli(server.url, ['list-panes'])
-      expect(listedText.stdout).toContain('Editor notes')
+      const listedRows = listedText.stdout.split('\n').filter(Boolean).map((line) => line.split('\t'))
+      expect(listedRows).toEqual(expect.arrayContaining([
+        [firstPaneId, '0', 'terminal', 'term_1'],
+        [secondPaneId, '1', 'editor', ''],
+      ]))
+      expect(listedRows.every((row) => row.length === 4)).toBe(true)
+
+      const listedWithTitles = await runCli(server.url, ['list-panes', '--titles'])
+      expect(listedWithTitles.stdout).toContain('Editor notes')
 
       await runCli(server.url, ['select-pane', '-t', 'Editor notes'])
 

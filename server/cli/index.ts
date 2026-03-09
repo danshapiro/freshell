@@ -65,6 +65,8 @@ function resolveRenameArgs(
     }
   }
 
+  // Issue 166 intentionally adds active-target defaults for rename commands:
+  // a single positional argument is the new name for the active tab/pane.
   if (args.length === 1) {
     return { target: undefined, name: args[0].trim() }
   }
@@ -321,6 +323,7 @@ async function main() {
     case 'list-panes': {
       const target = (getFlag(flags, 't', 'target', 'tab') as string | undefined) || undefined
       let tabId: string | undefined
+      const includeTitles = isTruthy(getFlag(flags, 'titles'))
       if (target) {
         const { tab } = await resolveTabTarget(client, target)
         tabId = tab?.id
@@ -331,7 +334,9 @@ async function main() {
         return
       }
       const panes = unwrap(res)?.panes || []
-      const lines = panes.map((pane: PaneSummary) => `${pane.id}\t${pane.index ?? ''}\t${pane.kind ?? ''}\t${pane.terminalId ?? ''}\t${pane.title ?? ''}`)
+      const lines = panes.map((pane: PaneSummary) => includeTitles
+        ? `${pane.id}\t${pane.index ?? ''}\t${pane.kind ?? ''}\t${pane.terminalId ?? ''}\t${pane.title ?? ''}`
+        : `${pane.id}\t${pane.index ?? ''}\t${pane.kind ?? ''}\t${pane.terminalId ?? ''}`)
       writeText(formatList(lines))
       return
     }

@@ -37,6 +37,7 @@ Use absolute paths for `--cwd` and `--editor`.
 Output behavior:
 - Most commands print JSON.
 - `list-tabs` and `list-panes` print TSV unless `--json`.
+- `list-panes --titles` appends a fifth TSV column with the pane title.
 - `capture-pane` and `display` print plain text.
 
 Targets:
@@ -62,7 +63,7 @@ Tab commands:
 
 Pane/layout commands:
 - `split-pane [-t PANE_TARGET] [-v] [--mode MODE] [--shell SHELL] [--cwd DIR] [--browser URL] [--editor FILE]`
-- `list-panes [-t TAB_TARGET] [--json]`
+- `list-panes [-t TAB_TARGET] [--json] [--titles]`
 - `select-pane PANE_TARGET` or `select-pane -t PANE_TARGET`
 - `rename-pane NEW_NAME` - rename the active pane
 - `rename-pane TARGET NEW_NAME`
