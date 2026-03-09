@@ -30,11 +30,14 @@
   - `verify = npm run build && npm test`
   - `check = npm run typecheck && npm test`
 - `BroadOneShotTestRun` is the only primitive. Every gated broad path, public or raw, must route through it.
+- Public delegated scripts still route through the same wrapper for classification. When they delegate, they must produce no lock/holder/reuse side effects, but they may not bypass classification entirely because trailing args can change mode.
 - Rewritten public npm scripts must preserve trailing-argv behavior. Any args passed after `--` to `npm run <script> -- ...` must be forwarded into classification and then to the eventual upstream command instead of being dropped or misparsed.
+- Aggregate and mixed adapters may not guess at positional-selector routing. For `test`, `test:all`, `test:server:all`, `check`, and `verify`, forwarded positional selectors after `--` must be rejected with an actionable error instead of being copied into every phase or silently dropped.
 - Classification is total and binary. Every test entrypoint must end as exactly one of:
   - `delegate upstream`
   - `gated broad run`
 - `delegate upstream` means no lock, no holder metadata, no baseline reuse, and no status side effects.
+- `delegate upstream` does not mean “skip the wrapper”. It means the wrapper classifies the invocation, then hands off upstream without creating gate state.
 - `gated broad run` means the process goes through `BroadOneShotTestRun`, attempts the repo-wide `flock`, writes holder metadata only after the lock is acquired, and may consult reusable baselines only if the suite is fully classified and the adapter policy allows reuse.
 - Baseline reuse is opt-in only. Allowed suites must still execute normally unless the caller explicitly requests reuse via `--reuse-baseline`.
 - `flock` is the only liveness truth. No pid table, lockfile contents, or holder file may be treated as proof that a run is live.
@@ -74,7 +77,7 @@
   - `vitest --run` with no selectors is broad
   - `vitest --run <file>` is narrow
   - `vitest --run --coverage` is broad
-- Any coverage-bearing run is non-reusable, public or raw. If the classified invocation includes any coverage-enabling flag form such as `--coverage`, `--coverage true`, `--coverage=true`, `--coverage.enabled`, `--coverage.enabled true`, or `--coverage.enabled=true`, baseline reuse must be disabled even when the run is still gated.
+- Any coverage-bearing run is non-reusable, public or raw. If the classified invocation includes any truthy or implicit coverage-enabling flag form such as `--coverage`, `--coverage true`, `--coverage=true`, `--coverage.enabled`, `--coverage.enabled true`, or `--coverage.enabled=true`, baseline reuse must be disabled even when the run is still gated. False-valued forms such as `--coverage false` and `--coverage.enabled false` are not coverage-bearing.
 - Unknown broad suite-shaping flags are never reusable. They may still run as gated broad work, but reuse must be disabled instead of guessed.
 - Unknown raw Vitest subcommands that are not the default command and are not explicitly classified above must `delegate upstream`. The classifier still returns an explicit outcome; it may not leave any raw entrypoint undefined.
 - Unknown flags on explicitly non-test operational modes must `delegate upstream`, not be coerced into gated broad work.
@@ -83,7 +86,7 @@
 - Reuse policy is frozen per adapter:
   - `allow reuse`: `test`, `test:all`, `test:client:all`, `test:server:all`, `test:server:without-logger`, `test:unit`, `test:integration`, `test:client`, and `check`
   - `never reuse`: `verify` and `test:coverage`, because both must perform fresh artifact-producing work (`build` and coverage output)
-  - `delegate upstream`: `test:watch`, `test:ui`, `test:server`, and `test:server:logger-separation`
+  - `delegate upstream by default`: `test:watch`, `test:ui`, `test:server`, and `test:server:logger-separation`
 - Raw classified runs also have a frozen reuse policy:
   - any classified raw run containing `--coverage` is `never reuse`
   - otherwise reuse is allowed only when classification remains fully known and does not fall into another `never reuse` or delegated case
@@ -144,7 +147,7 @@
 - `scripts/testing/test-run-baselines.ts`
   - `suiteKey` generation, results store, exact reuse lookup, newest-record-wins logic, and per-adapter reuse policy checks.
 - `scripts/testing/test-run-adapters.ts`
-  - Public command manifest for the current-main script surface, stable `commandKey` naming, `suiteKey`s, reuse policy, default summaries, and upstream phase definitions.
+  - Public command manifest for the current-main script surface, stable `commandKey` naming, default delegated-vs-broad behavior, `suiteKey`s, reuse policy, default summaries, and upstream phase definitions.
 - `scripts/testing/test-run-upstream.ts`
   - Non-recursive spawning helpers for npm/Vitest/build/typecheck/upstream child processes, trailing-argv forwarding, and env shaping.
 - `scripts/testing/vitest-patched-entry.mjs`
@@ -186,6 +189,8 @@
   - Bare `vitest --run --coverage.enabled` becomes `gated broad run`.
   - Bare `vitest --run --coverage=true` becomes `gated broad run`.
   - Bare `vitest --run --coverage.enabled=true` becomes `gated broad run`.
+  - Bare `vitest --run --coverage false` is not treated as coverage-bearing.
+  - Bare `vitest --run --coverage.enabled false` is not treated as coverage-bearing.
   - Raw `vitest run` with no selectors is `gated broad run`.
   - Raw `vitest run test/unit`, `vitest run "test/**/*.test.ts"`, `vitest run --config vitest.server.config.ts test/server`, `vitest run -c vitest.server.config.ts test/server`, `vitest run --root . test/unit`, `vitest run --dir test`, `vitest run --project client --project server`, `vitest run -t name`, and `vitest run --changed` are `gated broad run`.
   - Raw `vitest run --config vitest.server.config.ts test/unit/server/foo.test.ts` and `vitest run -c vitest.server.config.ts test/integration/server/bar.test.ts` are `delegate upstream`.
@@ -346,7 +351,8 @@
   - `check` has its own whole-workload `suiteKey`.
   - `verify` has its own whole-workload `suiteKey` but `reusePolicy: 'never'`.
   - `test:coverage` has `reusePolicy: 'never'`.
-  - raw classified runs with any coverage-enabling flag form such as `--coverage`, `--coverage true`, `--coverage=true`, `--coverage.enabled`, `--coverage.enabled true`, and `--coverage.enabled=true` have `reusePolicy: 'never'`.
+  - raw classified runs with any truthy coverage-enabling flag form such as `--coverage`, `--coverage true`, `--coverage=true`, `--coverage.enabled`, `--coverage.enabled true`, and `--coverage.enabled=true` have `reusePolicy: 'never'`.
+  - raw classified runs with `--coverage false` and `--coverage.enabled false` are not marked `never reuse` just because the flag token appears.
   - Raw broad `suiteKey` includes all classified suite-shaping selectors.
   - Raw broad `suiteKey` excludes non-suite UX flags such as reporter/color/output formatting.
   - Unknown suite-shaping flags force `baselineReusable=false`.
@@ -428,15 +434,24 @@
   - Current-main public commands map to exactly one outcome.
   - `package.json` matches the frozen script contract exactly for every public test command and for `postinstall`.
   - Trailing argv is forwarded: examples include `npm run test:unit -- test/unit/foo.test.ts` and `npm run test:coverage -- --reporter=dot`.
+  - Delegated public scripts still classify trailing args through the wrapper:
+    - `npm run test:server -- --run --coverage` becomes a gated broad run instead of bypassing the gate
+    - `npm run test:watch -- --run` becomes a gated broad run instead of bypassing the gate
   - Multi-phase trailing argv behavior is explicit:
     - `npm run test -- --reporter=dot` forwards to both split Vitest phases
     - `npm run test:server:all -- --reporter=dot` forwards to both server Vitest phases
     - `npm run check -- --reporter=dot` forwards only to the nested test phase, not typecheck
     - `npm run verify -- --reporter=dot` forwards only to the nested test phase, not build
+    - `npm run test -- test/unit/foo.test.ts` is rejected with an actionable error
+    - `npm run test:server:all -- test/server/foo.test.ts` is rejected with an actionable error
+    - `npm run check -- test/unit/foo.test.ts` is rejected with an actionable error
+    - `npm run verify -- test/unit/foo.test.ts` is rejected with an actionable error
   - `test`, `test:all`, `test:client:all`, `test:server:all`, `test:server:without-logger`, `test:unit`, `test:integration`, `test:client`, `check`, `verify`, and `test:coverage` are `gated broad run`.
-  - `test:watch`, `test:ui`, `test:server`, and `test:server:logger-separation` are `delegate upstream`.
+  - `test:watch`, `test:ui`, `test:server`, and `test:server:logger-separation` delegate upstream by default, but still pass through wrapper classification first.
   - `test` and `test:all` preserve the split `client-all` then `server-all` phase contract.
   - `test:server:all` preserves the split `without-logger` then `logger-separation` phase contract.
+  - `test`/`test:all` stop before `server-all` if `client-all` fails.
+  - `test:server:all` stops before `logger-separation` if `without-logger` fails.
   - `test:server:logger-separation` preserves the exact single-fork and no-file-parallelism flags from current `main`.
   - `check` is whole-workload reusable.
   - `verify` and `test:coverage` are gated but never reusable.
@@ -453,12 +468,12 @@
     "test": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter test",
     "verify": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter verify",
     "check": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter check",
-    "test:watch": "vitest",
-    "test:ui": "vitest --ui",
+    "test:watch": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter test:watch",
+    "test:ui": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter test:ui",
     "test:client:all": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter test:client:all",
-    "test:server": "vitest --config vitest.server.config.ts",
+    "test:server": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter test:server",
     "test:server:without-logger": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter test:server:without-logger",
-    "test:server:logger-separation": "vitest run --config vitest.server.config.ts --pool forks --poolOptions.forks.singleFork --no-file-parallelism test/integration/server/logger.separation.test.ts",
+    "test:server:logger-separation": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter test:server:logger-separation",
     "test:server:all": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter test:server:all",
     "test:coverage": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter test:coverage",
     "test:unit": "tsx scripts/testing/broad-one-shot-test-run.ts --adapter test:unit",
@@ -480,12 +495,16 @@
     - `test:status`
     - `postinstall = patch-package`
   - top-level adapters that call underlying phases directly from the manifest instead of recursively invoking other gated npm scripts
+  - delegated public scripts implemented as wrapper-backed adapters so trailing args are reclassified before handoff
   - adapter argv forwarding so trailing args after `--` are appended to the adapter’s declared upstream command and also participate in classification/reuse decisions when they are suite-shaping
   - explicit multi-phase forwarding rules:
     - duplicate forwarded args across each Vitest phase in split aggregates
     - do not forward trailing args into non-Vitest phases like `build` and `typecheck`
+    - reject positional selectors on aggregate and mixed adapters with a clear error instead of copying them into every phase
+  - explicit fail-fast semantics for split phases:
+    - abort remaining phases on first nonzero exit, matching current shell `&&` behavior
   - `test` and `test:all` sharing the same `suiteKey` because they run the same phase list
-  - `test:server` staying upstream-delegated and watch-biased by design
+  - `test:server`, `test:watch`, `test:ui`, and `test:server:logger-separation` staying upstream-delegated by default, but only after wrapper classification
   - `test:server:all` as the canonical broad one-shot server suite
   - `BroadOneShotTestRun` CLI behavior:
     - `--status`
@@ -543,6 +562,8 @@
   - `npx vitest --run --coverage.enabled true` becomes a gated broad run.
   - `npx vitest --run --coverage=true` becomes a gated broad run.
   - `npx vitest --run --coverage.enabled=true` becomes a gated broad run.
+  - `npx vitest --run --coverage false` is not treated as coverage-bearing.
+  - `npx vitest --run --coverage.enabled false` is not treated as coverage-bearing.
   - `npx vitest --run --coverage --reuse-baseline` does not early-exit from a cached success and still executes fresh upstream work.
   - `npx vitest --run --coverage true --reuse-baseline` does not early-exit from a cached success and still executes fresh upstream work.
   - `npx vitest --run --coverage.enabled --reuse-baseline` does not early-exit from a cached success and still executes fresh upstream work.
@@ -615,6 +636,7 @@
   - `--force-run` bypassing reuse only, not serialization
   - baseline reuse staying off by default unless `--reuse-baseline` is present
   - trailing argv passthrough from rewritten npm scripts
+  - delegated public scripts reclassifying trailing args instead of bypassing the wrapper
   - `check` whole-workload reuse
   - `verify` gated but never reusable
   - `test:coverage` gated but never reusable
@@ -624,8 +646,10 @@
   - raw `npx vitest --run --coverage.enabled true` gated but never reusable
   - raw `npx vitest --run --coverage=true` gated but never reusable
   - raw `npx vitest --run --coverage.enabled=true` gated but never reusable
+  - raw `npx vitest --run --coverage false` and `--coverage.enabled false` not being misclassified as coverage-bearing
   - `test` and `test:all` preserving the split `client-all -> server-all`
   - `test:server:all` preserving the split `without-logger -> logger-separation`
+  - split aggregates aborting remaining phases on first failure
   - raw `npx vitest` default-mode gating in non-interactive execution
   - raw `npx vitest --run` one-shot classification and delegation cases
   - `--config/-c` plus file-only selectors staying delegated for targeted server loops
@@ -635,6 +659,7 @@
   - adapter-owned Vitest child phases bypassing the patched entrypoint instead of self-contenting
   - disposable common-dir isolation so no test touches the live repo `.git`
   - contended output stream split: JSON only on stdout, human message on stderr
+  - aggregate-adapter positional selectors rejecting with a clear error instead of being fanned out ambiguously
   - summary propagation from env and flag
 
 - [ ] **Step 2: Run the targeted gate verification suite during implementation**
@@ -706,7 +731,9 @@
 - Unknown broad suite flags disable reuse but do not skip gating.
 - Coverage-bearing raw runs are gated but never reusable.
 - Coverage-bearing raw runs are non-reusable for all coverage-enabling flag forms, not just literal `--coverage`.
+- False-valued coverage forms such as `--coverage false` and `--coverage.enabled false` are not treated as coverage-bearing.
 - Rewritten broad npm scripts preserve trailing args after `--` and forward them through classification and upstream execution.
+- Delegated public scripts still pass through wrapper classification, so trailing args cannot turn them into ungated broad runs.
 - Non-test operational raw Vitest modes and flags bypass the gate instead of being coerced into broad test runs.
 - `--config/-c` plus file-only selectors stay delegated so targeted server one-shots do not hit the broad gate.
 - `test`, `test:all`, and `test:server:all` preserve the current split phase contracts from `main`.
@@ -721,5 +748,6 @@
 - Contended runs emit machine-readable JSON on stdout and human prose on stderr.
 - Adapter-launched Vitest phases always set the upstream-bypass env marker, so they cannot self-contend against the patched entrypoint.
 - Baseline reuse never happens unless the caller explicitly opts in with `--reuse-baseline`.
+- Split-phase adapters preserve fail-fast `&&` semantics and stop on the first failing phase.
 - Watch/UI/file-targeted and other delegated paths are covered and proven to avoid gate side effects.
 - Contended broad runs fail fast with exit code `75` and truthful holder status.
