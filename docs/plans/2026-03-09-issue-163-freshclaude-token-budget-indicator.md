@@ -14,7 +14,7 @@
 
 - The problem is header parity, not "show some token count somewhere in FreshClaude". The correct landing point is the existing pane-header metadata flow in `PaneContainer`, not `AgentChatView`.
 - The token percentage must come from indexed Claude session metadata, not `sdk.result` totals. The indexed Claude sessions already carry `contextTokens`, `compactThresholdTokens`, and `compactPercent`; the SDK per-turn totals do not.
-- This should remain a client-only change. `server/sdk-bridge.ts` already emits `cliSessionId`, `src/lib/sdk-message-handler.ts` already stores it in `agentChat`, and `AgentChatView` already persists it back to `resumeSessionId`.
+- This should remain a no-runtime-behavior change. `server/sdk-bridge.ts` already emits `cliSessionId`, `src/lib/sdk-message-handler.ts` already stores it in `agentChat`, and `AgentChatView` already persists it back to `resumeSessionId`. The only shared-layer change needed is exporting the existing token-summary type so client state can reuse the same shape.
 - Match FreshClaude to indexed sessions by exact session identity, not by cwd heuristics:
   - first `agentChat.sessions[sessionId].cliSessionId`
   - then `pane.content.resumeSessionId`
@@ -22,7 +22,7 @@
 
 ## Key Decisions
 
-- Add one shared `TokenSummary` type in `src/lib/coding-cli-types.ts` and reuse it from both indexed sessions and terminal metadata. This is the smallest clean type-sharing change.
+- Reuse the existing `TokenSummarySchema` shape from `shared/ws-protocol.ts` by exporting its inferred TypeScript type there, then import that type everywhere on the client. Creating a third local token-summary type would be needless drift.
 - Export a narrow `PaneRuntimeMeta` formatter input type from `src/lib/format-terminal-title-meta.ts`. `TerminalMetaRecord` should remain a richer store type, but the formatter should only accept the fields it actually reads.
 - Keep the FreshClaude lookup helpers local to `PaneContainer`. They are view-integration helpers, not a general store abstraction.
 - Do not add any new usage fields to `agentChatSlice`. The accepted source of truth is the indexed sessions store.
@@ -52,8 +52,8 @@ This keeps the tests focused on `PaneContainer` header metadata resolution inste
 Update `createStore()` so it imports and registers:
 
 ```ts
-import sessionsReducer, { type SessionsState } from '@/store/sessionsSlice'
-import agentChatReducer from '@/store/agentChatSlice'
+import sessionsReducer, { applySessionsPatch, type SessionsState } from '@/store/sessionsSlice'
+import agentChatReducer, { turnResult } from '@/store/agentChatSlice'
 import type { AgentChatState } from '@/store/agentChatTypes'
 ```
 
@@ -85,12 +85,12 @@ agentChat: {
 },
 ```
 
-**Step 3: Add a failing `cliSessionId`-first FreshClaude test**
+**Step 3: Add a failing `cliSessionId`-first FreshClaude test that also rejects SDK-total fallback**
 
 Add:
 
 ```ts
-it('renders FreshClaude header token usage from the indexed Claude session linked by cliSessionId', () => {
+it('renders FreshClaude header token usage from the indexed Claude session linked by cliSessionId and does not approximate from SDK totals', () => {
   const node: PaneNode = {
     type: 'leaf',
     id: 'pane-fresh',
@@ -161,6 +161,17 @@ it('renders FreshClaude header token usage from the indexed Claude session linke
   renderWithStore(<PaneContainer tabId="tab-1" node={node} />, store)
 
   expect(screen.getByText(/freshell \(main\*\)\s+25%/)).toBeInTheDocument()
+
+  store.dispatch(applySessionsPatch({
+    upsertProjects: [],
+    removeProjectPaths: ['/home/user/code/freshell'],
+  }))
+  store.dispatch(turnResult({
+    sessionId: 'sdk-session-1',
+    usage: { input_tokens: 999, output_tokens: 888 },
+  }))
+
+  expect(screen.queryByText(/\d+%/)).not.toBeInTheDocument()
 })
 ```
 
@@ -240,6 +251,7 @@ npm test -- test/unit/client/components/panes/PaneContainer.test.tsx
 Expected:
 - FAIL
 - both new tests fail because `PaneContainer` only resolves runtime metadata for `kind: 'terminal'`
+- the `cliSessionId` test must stay in the red suite because its first assertion requires indexed-session metadata to render
 
 **Step 6: Commit the red checkpoint**
 
@@ -495,7 +507,7 @@ git commit -m "test(app): cover freshclaude header parity"
 ## Task 3: Share the Runtime Metadata Types Cleanly
 
 **Files:**
-- Modify: `src/lib/coding-cli-types.ts`
+- Modify: `shared/ws-protocol.ts`
 - Modify: `src/store/types.ts`
 - Modify: `src/store/terminalMetaSlice.ts`
 - Modify: `src/lib/format-terminal-title-meta.ts`
@@ -503,28 +515,21 @@ git commit -m "test(app): cover freshclaude header parity"
 
 **Step 1: Add the shared `TokenSummary` type**
 
-In `src/lib/coding-cli-types.ts`, add:
+In `shared/ws-protocol.ts`, export the inferred type immediately after `TokenSummarySchema`:
 
 ```ts
-export interface TokenSummary {
-  inputTokens: number
-  outputTokens: number
-  cachedTokens: number
-  totalTokens: number
-  contextTokens?: number
-  modelContextWindow?: number
-  compactThresholdTokens?: number
-  compactPercent?: number
-}
+export type TokenSummary = z.infer<typeof TokenSummarySchema>
 ```
 
-Keep it near the other coding-CLI event/token types.
+This keeps the token-summary contract anchored to the existing shared protocol schema instead of duplicating it on the client.
 
 **Step 2: Reuse `TokenSummary` from indexed sessions and terminal metadata**
 
 In `src/store/types.ts`, extend `CodingCliSession` with:
 
 ```ts
+import type { TokenSummary } from '@shared/ws-protocol'
+
 gitBranch?: string
 isDirty?: boolean
 tokenUsage?: TokenSummary
@@ -533,7 +538,7 @@ tokenUsage?: TokenSummary
 In `src/store/terminalMetaSlice.ts`, replace the inline token type with:
 
 ```ts
-import type { TokenSummary } from '@/lib/coding-cli-types'
+import type { TokenSummary } from '@shared/ws-protocol'
 
 export type TerminalTokenUsage = TokenSummary
 ```
@@ -543,7 +548,7 @@ export type TerminalTokenUsage = TokenSummary
 In `src/lib/format-terminal-title-meta.ts`, add:
 
 ```ts
-import type { TokenSummary } from '@/lib/coding-cli-types'
+import type { TokenSummary } from '@shared/ws-protocol'
 
 export type PaneRuntimeMeta = {
   cwd?: string
@@ -607,7 +612,7 @@ Expected:
 **Step 6: Commit the refactor checkpoint**
 
 ```bash
-git add src/lib/coding-cli-types.ts src/store/types.ts src/store/terminalMetaSlice.ts src/lib/format-terminal-title-meta.ts test/unit/client/components/panes/PaneHeader.test.tsx
+git add shared/ws-protocol.ts src/store/types.ts src/store/terminalMetaSlice.ts src/lib/format-terminal-title-meta.ts test/unit/client/components/panes/PaneHeader.test.tsx
 git commit -m "refactor(panes): share runtime metadata typing"
 ```
 
@@ -783,6 +788,7 @@ git commit -m "chore: verify freshclaude token budget indicator"
 
 - Do not add any new WebSocket messages or server endpoints unless a test proves the required IDs are missing. The current code already provides the needed identifiers.
 - Do not derive the percentage from SDK per-turn usage totals. That would violate the user's required semantics and drift from the existing CLI token display.
+- Keep `TokenSummary` single-sourced from `shared/ws-protocol.ts`. Do not create another client-only copy of the same shape.
 - Do not move pane-header logic into `AgentChatView`. It already persists `resumeSessionId`; the header belongs in `PaneContainer`.
 - Do not broaden this into a general token-budget refactor. The necessary cleanups are:
   - shared `TokenSummary`
