@@ -3,6 +3,7 @@ export type LayoutSnapshot = {
   activeTabId?: string | null
   layouts: Record<string, any>
   activePane: Record<string, string>
+  paneTitles?: Record<string, Record<string, string>>
 }
 
 type ResolveResult = { tabId?: string; paneId?: string; message?: string }
@@ -45,6 +46,11 @@ export function resolveTarget(target: string, snapshot: LayoutSnapshot): Resolve
   // Exact pane ID match
   const paneTabId = paneToTab.get(clean)
   if (paneTabId) return { tabId: paneTabId, paneId: clean }
+
+  for (const [tabId, leaves] of panesByTab.entries()) {
+    const titledPane = leaves.find((leaf) => snapshot.paneTitles?.[tabId]?.[leaf.id] === clean)
+    if (titledPane) return { tabId, paneId: titledPane.id }
+  }
 
   // exact tab id or title
   const tabMatch = snapshot.tabs.find((t) => t.id === clean || t.title === clean)

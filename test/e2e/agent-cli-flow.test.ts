@@ -302,4 +302,49 @@ describe('cli e2e flow', () => {
       await server.close()
     }
   })
+
+  it('lists pane titles publicly and resolves pane targets by title', async () => {
+    const server = await startTestServerWithRealLayoutStore()
+    try {
+      const created = await runCliJson<{ data: { tabId: string; paneId: string } }>(server.url, [
+        'new-tab',
+        '-n',
+        'Workspace',
+        '--codex',
+        '--cwd',
+        process.cwd(),
+      ])
+      const tabId = created.data.tabId
+      const firstPaneId = created.data.paneId
+
+      const split = await runCliJson<{ data: { paneId: string } }>(server.url, [
+        'split-pane',
+        '-t',
+        firstPaneId,
+        '--editor',
+        '/tmp/example.txt',
+      ])
+      const secondPaneId = split.data.paneId
+
+      await runCli(server.url, ['rename-pane', '-t', secondPaneId, '-n', 'Editor notes'])
+
+      const listed = await runCliJson<{ data: { panes: Array<{ id: string; title?: string }> } }>(server.url, [
+        'list-panes',
+        '--json',
+      ])
+      expect(listed.data.panes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: secondPaneId, title: 'Editor notes' }),
+      ]))
+
+      const listedText = await runCli(server.url, ['list-panes'])
+      expect(listedText.stdout).toContain('Editor notes')
+
+      await runCli(server.url, ['select-pane', '-t', 'Editor notes'])
+
+      const snapshot = (server.layoutStore as any).snapshot
+      expect(snapshot.activePane[tabId]).toBe(secondPaneId)
+    } finally {
+      await server.close()
+    }
+  })
 })

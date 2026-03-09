@@ -36,4 +36,16 @@ describe('resolveTarget', () => {
     expect(res.tabId).toBe('tab_dot')
     expect(res.paneId).toBe('pane_dot')
   })
+
+  it('resolves pane titles as pane targets', () => {
+    const res = resolveTarget('Docs review', {
+      ...snapshot,
+      paneTitles: {
+        tab_plain: { pane_1: 'Docs review' },
+      },
+    } as any)
+
+    expect(res.tabId).toBe('tab_plain')
+    expect(res.paneId).toBe('pane_1')
+  })
 })

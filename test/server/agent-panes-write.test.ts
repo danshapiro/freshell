@@ -59,6 +59,58 @@ it('rejects blank pane rename payloads', async () => {
   expect(renamePane).not.toHaveBeenCalled()
 })
 
+it('preserves coding CLI mode across attach so a later rename-pane persists overrides', async () => {
+  const app = express()
+  app.use(express.json())
+  let paneSnapshot: any = {
+    tabId: 'tab_1',
+    paneId: 'pane_1',
+    paneContent: { kind: 'terminal', terminalId: 'term_1', mode: 'shell' },
+  }
+  const renamePane = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
+  const attachPaneContent = vi.fn((_tabId: string, _paneId: string, content: any) => {
+    paneSnapshot = { tabId: 'tab_1', paneId: 'pane_1', paneContent: content }
+  })
+  const patchTerminalOverride = vi.fn().mockResolvedValue({})
+  const patchSessionOverride = vi.fn().mockResolvedValue({})
+  const updateTitle = vi.fn()
+  const refresh = vi.fn().mockResolvedValue(undefined)
+  const broadcast = vi.fn()
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      renamePane,
+      attachPaneContent,
+      resolveTarget: () => ({ tabId: 'tab_1', paneId: 'pane_1' }),
+      listPanes: () => [{ id: 'pane_1' }, { id: 'pane_2' }],
+      getPaneSnapshot: () => paneSnapshot,
+    } as any,
+    registry: {
+      get: () => ({ mode: 'codex' }),
+      updateTitle,
+    } as any,
+    wsHandler: { broadcastUiCommand: vi.fn(), broadcast },
+    configStore: { patchTerminalOverride, patchSessionOverride } as any,
+    terminalMetadata: {
+      list: () => [{ terminalId: 'term_1', provider: 'codex', sessionId: 'session-1' }],
+    } as any,
+    codingCliIndexer: { refresh } as any,
+  }))
+
+  const attachRes = await request(app).post('/api/panes/pane_1/attach').send({ terminalId: 'term_1' })
+  expect(attachRes.status).toBe(200)
+  expect(attachPaneContent).toHaveBeenCalledWith('tab_1', 'pane_1', expect.objectContaining({
+    mode: 'codex',
+    terminalId: 'term_1',
+  }))
+
+  const renameRes = await request(app).patch('/api/panes/pane_1').send({ name: 'Attached agent' })
+
+  expect(renameRes.status).toBe(200)
+  expect(renamePane).toHaveBeenCalledWith('pane_1', 'Attached agent')
+  expect(patchTerminalOverride).toHaveBeenCalledWith('term_1', { titleOverride: 'Attached agent' })
+  expect(patchSessionOverride).toHaveBeenCalledWith('codex:session-1', { titleOverride: 'Attached agent' })
+})
+
 it('renames a resolved pane via PATCH /api/panes/:id', async () => {
   const app = express()
   app.use(express.json())

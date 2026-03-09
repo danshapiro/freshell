@@ -34,3 +34,27 @@ it('renames a pane in its owning tab', () => {
   expect(store.renamePane('pane_1', 'Logs')).toEqual({ tabId: 'tab_a', paneId: 'pane_1' })
   expect((store as any).snapshot.paneTitles.tab_a.pane_1).toBe('Logs')
 })
+
+it('lists pane titles from the public pane snapshot', () => {
+  const store = new LayoutStore()
+  store.updateFromUi({
+    tabs: [{ id: 'tab_a', title: 'Alpha' }],
+    activeTabId: 'tab_a',
+    layouts: {
+      tab_a: { type: 'leaf', id: 'pane_1', content: { kind: 'terminal', terminalId: 'term_1' } },
+    },
+    activePane: { tab_a: 'pane_1' },
+    paneTitles: { tab_a: { pane_1: 'Logs' } },
+    timestamp: Date.now(),
+  }, 'conn-1')
+
+  expect(store.listPanes('tab_a')).toEqual([
+    {
+      id: 'pane_1',
+      index: 0,
+      kind: 'terminal',
+      terminalId: 'term_1',
+      title: 'Logs',
+    },
+  ])
+})

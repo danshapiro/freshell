@@ -11,7 +11,7 @@ type Flags = Record<string, string | boolean>
 
 type TabSummary = { id: string; title?: string; activePaneId?: string }
 
-type PaneSummary = { id: string; index?: number; kind?: string; terminalId?: string }
+type PaneSummary = { id: string; index?: number; kind?: string; terminalId?: string; title?: string }
 
 const aliases: Record<string, string> = {
   'new-window': 'new-tab',
@@ -97,12 +97,12 @@ async function fetchPanes(client: ReturnType<typeof createHttpClient>, tabId?: s
 
 async function buildTargetContext(client: ReturnType<typeof createHttpClient>) {
   const { tabs, activeTabId } = await fetchTabs(client)
-  const panesByTab: Record<string, string[]> = {}
+  const panesByTab: Record<string, PaneSummary[]> = {}
   const paneInfoById: Record<string, PaneSummary> = {}
 
   for (const tab of tabs) {
     const panes = await fetchPanes(client, tab.id)
-    panesByTab[tab.id] = panes.map((p) => p.id)
+    panesByTab[tab.id] = panes
     for (const pane of panes) paneInfoById[pane.id] = pane
   }
 
@@ -331,7 +331,7 @@ async function main() {
         return
       }
       const panes = unwrap(res)?.panes || []
-      const lines = panes.map((pane: PaneSummary) => `${pane.id}\t${pane.index ?? ''}\t${pane.kind ?? ''}\t${pane.terminalId ?? ''}`)
+      const lines = panes.map((pane: PaneSummary) => `${pane.id}\t${pane.index ?? ''}\t${pane.kind ?? ''}\t${pane.terminalId ?? ''}\t${pane.title ?? ''}`)
       writeText(formatList(lines))
       return
     }

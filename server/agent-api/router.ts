@@ -734,7 +734,15 @@ export function createAgentApiRouter({
     const target = layoutStore.resolveTarget(paneId)
     const tabId = target?.tabId
     if (!tabId) return res.status(404).json(fail('pane not found'))
-    const content = { kind: 'terminal', terminalId, status: 'running', mode: req.body?.mode || 'shell', shell: req.body?.shell || 'system', createRequestId: nanoid() }
+    const attachedTerminal = registry.get?.(terminalId)
+    const content = {
+      kind: 'terminal',
+      terminalId,
+      status: 'running',
+      mode: req.body?.mode || attachedTerminal?.mode || 'shell',
+      shell: req.body?.shell || 'system',
+      createRequestId: nanoid(),
+    }
     layoutStore.attachPaneContent(tabId, paneId, content)
     wsHandler?.broadcastUiCommand({ command: 'pane.attach', payload: { tabId, paneId, content } })
     res.json(ok({ terminalId }, 'terminal attached'))

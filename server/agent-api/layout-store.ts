@@ -175,6 +175,7 @@ export class LayoutStore {
       index: idx,
       kind: leaf.content?.kind,
       terminalId: leaf.content?.terminalId,
+      title: this.snapshot?.paneTitles?.[resolvedTabId]?.[leaf.id],
     }))
   }
 
