@@ -20,3 +20,8 @@ __pycache__/
 
 # This repo ignores `*.txt` broadly, but we want to keep this pinned list in git.
 !test/browser_use/requirements.txt
+
+# Playwright
+test-results/
+playwright-report/
+blob-report/

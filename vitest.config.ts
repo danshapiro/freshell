@@ -28,6 +28,7 @@ export default defineConfig({
       'test/integration/server/**',
       'test/integration/session-repair.test.ts',
       'test/integration/session-search-e2e.test.ts',
+      'test/e2e-browser/**',
     ],
     testTimeout: 30000,
     hookTimeout: 30000,
