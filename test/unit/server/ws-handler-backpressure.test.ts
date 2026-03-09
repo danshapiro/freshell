@@ -14,6 +14,8 @@ vi.mock('node-pty', () => ({
   spawn: vi.fn(),
 }))
 
+const TEST_AUTH_TOKEN = 'testtoken-testtoken'
+
 /** Create a mock WebSocket that extends EventEmitter (like real ws WebSockets) */
 function createMockWs(overrides: Record<string, unknown> = {}) {
   const ws = new EventEmitter() as EventEmitter & {
@@ -69,6 +71,21 @@ class FakeBrokerRegistry extends EventEmitter {
   }
 }
 
+let originalAuthToken: string | undefined
+
+beforeEach(() => {
+  originalAuthToken = process.env.AUTH_TOKEN
+  process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
+})
+
+afterEach(() => {
+  if (originalAuthToken === undefined) {
+    delete process.env.AUTH_TOKEN
+    return
+  }
+  process.env.AUTH_TOKEN = originalAuthToken
+})
+
 describe('WsHandler backpressure', () => {
   let server: http.Server
   let handler: WsHandler
@@ -82,7 +99,7 @@ describe('WsHandler backpressure', () => {
   })
 
   afterEach(async () => {
-    handler.close()
+    handler?.close()
     registry.shutdown()
     if (server.listening) {
       await new Promise<void>((resolve) => server.close(() => resolve()))
@@ -117,7 +134,7 @@ describe('WsHandler.waitForDrain', () => {
   })
 
   afterEach(async () => {
-    handler.close()
+    handler?.close()
     registry.shutdown()
     if (server.listening) {
       await new Promise<void>((resolve) => server.close(() => resolve()))
@@ -221,7 +238,7 @@ describe('WsHandler.sendChunkedSessions drain-aware sending', () => {
   })
 
   afterEach(async () => {
-    handler.close()
+    handler?.close()
     registry.shutdown()
     if (server.listening) {
       await new Promise<void>((resolve) => server.close(() => resolve()))
@@ -440,7 +457,7 @@ describe('WsHandler.broadcastSessionsUpdatedToLegacy patch-mode transition', () 
   })
 
   afterEach(async () => {
-    handler.close()
+    handler?.close()
     registry.shutdown()
     if (server.listening) {
       await new Promise<void>((resolve) => server.close(() => resolve()))
@@ -489,7 +506,7 @@ describe('WsHandler.broadcastSessionsUpdated pagination for capable clients', ()
   })
 
   afterEach(async () => {
-    handler.close()
+    handler?.close()
     registry.shutdown()
     if (server.listening) {
       await new Promise<void>((resolve) => server.close(() => resolve()))

@@ -165,6 +165,80 @@ describe('SessionRepairQueue', () => {
   })
 
   describe('start() and processing', () => {
+    it('waits for post-scan repair before resolving queue results', async () => {
+      let releasePostScan: (() => void) | undefined
+      const postScanGate = new Promise<void>((resolve) => {
+        releasePostScan = resolve
+      })
+      const postScan = vi.fn(async () => {
+        await postScanGate
+      })
+
+      const localQueue = new SessionRepairQueue(createSessionScanner(), cache, { postScan })
+      localQueue.enqueue([
+        { sessionId: 'healthy', filePath: path.join(FIXTURES_DIR, 'healthy.jsonl'), priority: 'active' },
+      ])
+
+      localQueue.start()
+
+      let resolved = false
+      const pending = localQueue.waitFor('healthy', 5000).then(() => {
+        resolved = true
+      })
+
+      await vi.waitFor(() => {
+        expect(postScan).toHaveBeenCalledTimes(1)
+      })
+      expect(resolved).toBe(false)
+
+      releasePostScan?.()
+      await pending
+      expect(resolved).toBe(true)
+
+      await localQueue.stop()
+    })
+
+    it('runs post-scan repair for cached results too', async () => {
+      const filePath = path.join(tempDir, 'healthy.jsonl')
+      await fs.copyFile(path.join(FIXTURES_DIR, 'healthy.jsonl'), filePath)
+
+      const scanResult: SessionScanResult = {
+        sessionId: 'healthy',
+        filePath,
+        status: 'healthy',
+        chainDepth: 1,
+        orphanCount: 0,
+        fileSize: 1,
+        messageCount: 1,
+      }
+
+      const scanner = {
+        scan: vi.fn().mockResolvedValue(scanResult),
+        repair: vi.fn(),
+      }
+
+      const localCache = new SessionCache(path.join(tempDir, 'cache.json'))
+      await localCache.set(filePath, scanResult)
+
+      const postScan = vi.fn().mockResolvedValue(undefined)
+      const localQueue = new SessionRepairQueue(scanner as any, localCache, { postScan })
+      localQueue.enqueue([
+        { sessionId: 'healthy', filePath, priority: 'active' },
+      ])
+
+      localQueue.start()
+      await localQueue.waitFor('healthy', 5000)
+
+      expect(scanner.scan).not.toHaveBeenCalled()
+      expect(postScan).toHaveBeenCalledWith(expect.objectContaining({
+        sessionId: 'healthy',
+        filePath,
+        status: 'healthy',
+      }))
+
+      await localQueue.stop()
+    })
+
     it('emits scanned event for each processed item', async () => {
       const scanned: SessionScanResult[] = []
       queue.on('scanned', (result) => scanned.push(result))

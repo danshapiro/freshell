@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { EventEmitter } from 'events'
 import http from 'http'
 import WebSocket from 'ws'
@@ -151,21 +151,47 @@ function listen(server: http.Server, timeoutMs = HOOK_TIMEOUT_MS): Promise<{ por
 function waitForMessage(ws: WebSocket, predicate: (msg: any) => boolean, timeoutMs = 3_000): Promise<any> {
   return new Promise((resolve, reject) => {
     const seenTypes: string[] = []
-    const timeout = setTimeout(() => {
+    const cleanup = () => {
+      clearTimeout(timeout)
       ws.off('message', handler)
+      ws.off('close', onClose)
+      ws.off('error', onError)
+    }
+    const timeout = setTimeout(() => {
+      cleanup()
       reject(new Error(`Timeout waiting for message (seen: ${seenTypes.join(', ') || 'none'})`))
     }, timeoutMs)
 
     const handler = (data: WebSocket.Data) => {
-      const msg = JSON.parse(data.toString())
-      seenTypes.push(String(msg.type ?? 'unknown'))
-      if (!predicate(msg)) return
-      clearTimeout(timeout)
-      ws.off('message', handler)
-      resolve(msg)
+      try {
+        const msg = JSON.parse(data.toString())
+        seenTypes.push(String(msg.type ?? 'unknown'))
+        if (!predicate(msg)) return
+        cleanup()
+        resolve(msg)
+      } catch {
+        // Ignore malformed frames in tests.
+      }
+    }
+
+    const onClose = () => {
+      cleanup()
+      reject(new Error(`Socket closed waiting for message (seen: ${seenTypes.join(', ') || 'none'})`))
+    }
+
+    const onError = (error: Error) => {
+      cleanup()
+      reject(error)
+    }
+
+    if (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      onClose()
+      return
     }
 
     ws.on('message', handler)
+    ws.once('close', onClose)
+    ws.once('error', onError)
   })
 }
 
@@ -221,12 +247,13 @@ async function createAuthenticatedConnection(port: number): Promise<{ ws: WebSoc
   const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
   await new Promise<void>((resolve) => ws.on('open', () => resolve()))
 
+  const readyPromise = waitForMessage(ws, (msg) => msg.type === 'ready')
   ws.send(JSON.stringify({
     type: 'hello',
     token: 'testtoken-testtoken',
     protocolVersion: WS_PROTOCOL_VERSION,
   }))
-  await waitForMessage(ws, (msg) => msg.type === 'ready')
+  await readyPromise
 
   return {
     ws,
@@ -279,12 +306,22 @@ describe('terminal stream v2 replay', () => {
   let handler: any
   let registry: FakeRegistry
   let port: number
+  let originalNodeEnv: string | undefined
+  let originalAuthToken: string | undefined
+  let originalHelloTimeoutMs: string | undefined
+  let originalClientQueueMaxBytes: string | undefined
 
-  beforeAll(async () => {
+  beforeEach(async () => {
+    originalNodeEnv = process.env.NODE_ENV
+    originalAuthToken = process.env.AUTH_TOKEN
+    originalHelloTimeoutMs = process.env.HELLO_TIMEOUT_MS
+    originalClientQueueMaxBytes = process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES
     process.env.NODE_ENV = 'test'
     process.env.AUTH_TOKEN = 'testtoken-testtoken'
     process.env.HELLO_TIMEOUT_MS = '500'
+    process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES = '256'
 
+    vi.resetModules()
     ;({ WsHandler } = await import('../../server/ws-handler'))
     server = http.createServer((_req, res) => {
       res.statusCode = 404
@@ -296,14 +333,34 @@ describe('terminal stream v2 replay', () => {
     port = info.port
   }, HOOK_TIMEOUT_MS)
 
-  beforeEach(() => {
-    process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES = '256'
-  })
-
-  afterAll(async () => {
-    if (handler) handler.close()
-    if (!server) return
-    await new Promise<void>((resolve) => server!.close(() => resolve()))
+  afterEach(async () => {
+    if (server) {
+      await new Promise<void>((resolve) => server!.close(() => resolve()))
+      server = undefined
+    }
+    if (handler) {
+      handler = undefined
+    }
+    if (originalNodeEnv === undefined) {
+      delete process.env.NODE_ENV
+    } else {
+      process.env.NODE_ENV = originalNodeEnv
+    }
+    if (originalAuthToken === undefined) {
+      delete process.env.AUTH_TOKEN
+    } else {
+      process.env.AUTH_TOKEN = originalAuthToken
+    }
+    if (originalHelloTimeoutMs === undefined) {
+      delete process.env.HELLO_TIMEOUT_MS
+    } else {
+      process.env.HELLO_TIMEOUT_MS = originalHelloTimeoutMs
+    }
+    if (originalClientQueueMaxBytes === undefined) {
+      delete process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES
+    } else {
+      process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES = originalClientQueueMaxBytes
+    }
   }, HOOK_TIMEOUT_MS)
 
   it('reconnect replay with sinceSeq sends only the missing delta range', async () => {

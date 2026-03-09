@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import http from 'http'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
@@ -23,19 +23,48 @@ function listen(server: http.Server, timeoutMs = HOOK_TIMEOUT_MS): Promise<{ por
 
 function waitForMessage(ws: WebSocket, predicate: (msg: any) => boolean, timeoutMs = MESSAGE_TIMEOUT_MS): Promise<any> {
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
+    const cleanup = () => {
+      clearTimeout(timeout)
       ws.off('message', handler)
+      ws.off('close', onClose)
+      ws.off('error', onError)
+    }
+
+    const timeout = setTimeout(() => {
+      cleanup()
       reject(new Error('Timeout waiting for message'))
     }, timeoutMs)
+
     const handler = (data: WebSocket.Data) => {
-      const msg = JSON.parse(data.toString())
-      if (predicate(msg)) {
-        clearTimeout(timeout)
-        ws.off('message', handler)
-        resolve(msg)
+      try {
+        const msg = JSON.parse(data.toString())
+        if (predicate(msg)) {
+          cleanup()
+          resolve(msg)
+        }
+      } catch {
+        // Ignore malformed frames in tests.
       }
     }
+
+    const onClose = () => {
+      cleanup()
+      reject(new Error('Socket closed waiting for message'))
+    }
+
+    const onError = (error: Error) => {
+      cleanup()
+      reject(error)
+    }
+
+    if (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      onClose()
+      return
+    }
+
     ws.on('message', handler)
+    ws.once('close', onClose)
+    ws.once('error', onError)
   })
 }
 
@@ -67,6 +96,12 @@ function waitForMessages(
   })
 }
 
+function waitForReady(ws: WebSocket): Promise<any> {
+  const readyPromise = waitForMessage(ws, (m) => m.type === 'ready')
+  ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+  return readyPromise
+}
+
 function collectMessages(ws: WebSocket, durationMs: number): Promise<any[]> {
   return new Promise((resolve) => {
     const messages: any[] = []
@@ -82,6 +117,38 @@ function collectMessages(ws: WebSocket, durationMs: number): Promise<any[]> {
       ws.off('message', handler)
       resolve(messages)
     }, durationMs)
+  })
+}
+
+function closeWebSocket(ws: WebSocket, timeoutMs = 1_000): Promise<void> {
+  return new Promise((resolve) => {
+    if (ws.readyState === WebSocket.CLOSED) {
+      resolve()
+      return
+    }
+
+    const cleanup = () => {
+      clearTimeout(timeout)
+      ws.off('close', onClose)
+      ws.off('error', onClose)
+    }
+
+    const onClose = () => {
+      cleanup()
+      resolve()
+    }
+
+    const timeout = setTimeout(() => {
+      cleanup()
+      resolve()
+    }, timeoutMs)
+
+    ws.on('close', onClose)
+    ws.on('error', onClose)
+
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      ws.close()
+    }
   })
 }
 
@@ -194,39 +261,60 @@ describe('terminal.create reuse running codex terminal', () => {
   let server: http.Server | undefined
   let port: number
   let registry: FakeRegistry
+  let originalNodeEnv: string | undefined
+  let originalAuthToken: string | undefined
+  let originalHelloTimeoutMs: string | undefined
 
-  beforeAll(async () => {
+  beforeEach(async () => {
+    originalNodeEnv = process.env.NODE_ENV
+    originalAuthToken = process.env.AUTH_TOKEN
+    originalHelloTimeoutMs = process.env.HELLO_TIMEOUT_MS
     process.env.NODE_ENV = 'test'
     process.env.AUTH_TOKEN = 'testtoken-testtoken'
-    process.env.HELLO_TIMEOUT_MS = '100'
+    process.env.HELLO_TIMEOUT_MS = '500'
 
+    vi.resetModules()
     const { WsHandler } = await import('../../server/ws-handler')
     server = http.createServer((_req, res) => { res.statusCode = 404; res.end() })
     registry = new FakeRegistry(['term-codex-existing'])
     new WsHandler(server, registry as any)
     const info = await listen(server)
     port = info.port
-  }, HOOK_TIMEOUT_MS)
-
-  beforeEach(() => {
     registry.attachCalls = []
     registry.createCalls = []
     registry.repairCalls = []
-  })
+  }, HOOK_TIMEOUT_MS)
 
-  afterAll(async () => {
-    if (!server) return
-    await new Promise<void>((resolve) => server!.close(() => resolve()))
+  afterEach(async () => {
+    if (server) {
+      await new Promise<void>((resolve) => server!.close(() => resolve()))
+      server = undefined
+    }
+    if (originalNodeEnv === undefined) {
+      delete process.env.NODE_ENV
+    } else {
+      process.env.NODE_ENV = originalNodeEnv
+    }
+    if (originalAuthToken === undefined) {
+      delete process.env.AUTH_TOKEN
+    } else {
+      process.env.AUTH_TOKEN = originalAuthToken
+    }
+    if (originalHelloTimeoutMs === undefined) {
+      delete process.env.HELLO_TIMEOUT_MS
+    } else {
+      process.env.HELLO_TIMEOUT_MS = originalHelloTimeoutMs
+    }
   }, HOOK_TIMEOUT_MS)
 
   it('reuses existing codex terminal and requires an explicit attach', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
-      await waitForMessage(ws, (m) => m.type === 'ready')
+      await waitForReady(ws)
 
       const requestId = 'codex-reuse-1'
+      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId,
@@ -234,7 +322,7 @@ describe('terminal.create reuse running codex terminal', () => {
         resumeSessionId: CODEX_SESSION_ID,
       }))
 
-      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+      const created = await createdPromise
       const preAttachMsgs = await collectMessages(ws, 150)
 
       expect(created.terminalId).toBe('term-codex-existing')
@@ -242,6 +330,10 @@ describe('terminal.create reuse running codex terminal', () => {
       expect(registry.attachCalls).toHaveLength(0)
       expect(registry.createCalls).toHaveLength(0)
 
+      const attachReadyPromise = waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'reuse-existing-codex-attach',
+      )
       ws.send(JSON.stringify({
         type: 'terminal.attach',
         terminalId: created.terminalId,
@@ -250,15 +342,12 @@ describe('terminal.create reuse running codex terminal', () => {
         rows: 40,
         attachRequestId: 'reuse-existing-codex-attach',
       }))
-      const ready = await waitForMessage(
-        ws,
-        (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'reuse-existing-codex-attach',
-      )
+      const ready = await attachReadyPromise
       expect(ready.headSeq).toBeGreaterThanOrEqual(0)
       expect(registry.attachCalls).toHaveLength(1)
       expect(registry.attachCalls[0]?.terminalId).toBe('term-codex-existing')
     } finally {
-      ws.close()
+      await closeWebSocket(ws)
     }
   })
 
@@ -266,20 +355,26 @@ describe('terminal.create reuse running codex terminal', () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
-      await waitForMessage(ws, (m) => m.type === 'ready')
+      await waitForReady(ws)
 
+      const createdPromise = waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.created' && m.requestId === 'reuse-canonical-split',
+      )
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId: 'reuse-canonical-split',
         mode: 'codex',
         resumeSessionId: CODEX_SESSION_ID,
       }))
-
-      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === 'reuse-canonical-split')
+      const created = await createdPromise
       const preAttachMsgs = await collectMessages(ws, 150)
       expect(preAttachMsgs.some((m) => m.type === 'terminal.attach.ready' && m.terminalId === created.terminalId)).toBe(false)
 
+      const attachReadyPromise = waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'reuse-canonical-split-attach',
+      )
       ws.send(JSON.stringify({
         type: 'terminal.attach',
         terminalId: created.terminalId,
@@ -288,13 +383,10 @@ describe('terminal.create reuse running codex terminal', () => {
         rows: 40,
         attachRequestId: 'reuse-canonical-split-attach',
       }))
-      const ready = await waitForMessage(
-        ws,
-        (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'reuse-canonical-split-attach',
-      )
+      const ready = await attachReadyPromise
       expect(ready.terminalId).toBe(created.terminalId)
     } finally {
-      ws.close()
+      await closeWebSocket(ws)
     }
   })
 
@@ -302,37 +394,42 @@ describe('terminal.create reuse running codex terminal', () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
-      await waitForMessage(ws, (m) => m.type === 'ready')
+      await waitForReady(ws)
 
+      const firstCreatedPromise = waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.created' && m.requestId === 'reuse-existingId-split',
+      )
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId: 'reuse-existingId-split',
         mode: 'codex',
         resumeSessionId: CODEX_SESSION_ID,
       }))
-      const firstCreated = await waitForMessage(
-        ws,
-        (m) => m.type === 'terminal.created' && m.requestId === 'reuse-existingId-split',
-      )
+      const firstCreated = await firstCreatedPromise
       const firstMsgs = await collectMessages(ws, 150)
       expect(firstMsgs.some((m) => m.type === 'terminal.attach.ready' && m.terminalId === firstCreated.terminalId)).toBe(false)
 
+      const secondCreatedPromise = waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.created' && m.requestId === 'reuse-existingId-split',
+      )
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId: 'reuse-existingId-split',
         mode: 'codex',
         resumeSessionId: CODEX_SESSION_ID,
       }))
-      const secondCreated = await waitForMessage(
-        ws,
-        (m) => m.type === 'terminal.created' && m.requestId === 'reuse-existingId-split',
-      )
+      const secondCreated = await secondCreatedPromise
       expect(secondCreated.terminalId).toBe(firstCreated.terminalId)
 
       const secondMsgs = await collectMessages(ws, 150)
       expect(secondMsgs.some((m) => m.type === 'terminal.attach.ready' && m.terminalId === firstCreated.terminalId)).toBe(false)
 
+      const attachReadyPromise = waitForMessage(
+        ws,
+        (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'reuse-existingId-split-attach',
+      )
       ws.send(JSON.stringify({
         type: 'terminal.attach',
         terminalId: firstCreated.terminalId,
@@ -341,13 +438,10 @@ describe('terminal.create reuse running codex terminal', () => {
         rows: 40,
         attachRequestId: 'reuse-existingId-split-attach',
       }))
-      const ready = await waitForMessage(
-        ws,
-        (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'reuse-existingId-split-attach',
-      )
+      const ready = await attachReadyPromise
       expect(ready.terminalId).toBe(firstCreated.terminalId)
     } finally {
-      ws.close()
+      await closeWebSocket(ws)
     }
   })
 
@@ -355,21 +449,20 @@ describe('terminal.create reuse running codex terminal', () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
-      await waitForMessage(ws, (m) => m.type === 'ready')
+      await waitForReady(ws)
 
       const requestId = 'codex-reuse-2'
+      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId,
         mode: 'codex',
         resumeSessionId: CODEX_SESSION_ID,
       }))
-
-      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+      const created = await createdPromise
       expect(created.effectiveResumeSessionId).toBe(CODEX_SESSION_ID)
     } finally {
-      ws.close()
+      await closeWebSocket(ws)
     }
   })
 
@@ -383,8 +476,7 @@ describe('terminal.create reuse running codex terminal', () => {
     const ws = new WebSocket(`ws://127.0.0.1:${info.port}/ws`)
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-      ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
-      await waitForMessage(ws, (m) => m.type === 'ready')
+      await waitForReady(ws)
 
       // Make canonical lookup fail initially so handler must invoke repair and retry.
       const originalGetCanonical = dupeRegistry.getCanonicalRunningTerminalBySession.bind(dupeRegistry)
@@ -398,14 +490,14 @@ describe('terminal.create reuse running codex terminal', () => {
       }) as any
 
       const requestId = 'codex-reuse-repair'
+      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
       ws.send(JSON.stringify({
         type: 'terminal.create',
         requestId,
         mode: 'codex',
         resumeSessionId: CODEX_SESSION_ID,
       }))
-
-      const created = await waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+      const created = await createdPromise
 
       expect(created.terminalId).toBe('term-canonical')
       expect(dupeRegistry.createCalls).toHaveLength(0)
@@ -426,7 +518,7 @@ describe('terminal.create reuse running codex terminal', () => {
       )
       expect(dupeRegistry.attachCalls[0]?.terminalId).toBe('term-canonical')
     } finally {
-      ws.close()
+      await closeWebSocket(ws)
       await new Promise<void>((resolve) => dupeServer.close(() => resolve()))
     }
   })

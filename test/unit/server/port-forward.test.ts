@@ -77,7 +77,7 @@ describe('PortForwardManager', () => {
   })
 
   afterEach(async () => {
-    manager.closeAll()
+    await manager.closeAll()
     if (echoServer) {
       echoServer.close()
       echoServer = null
@@ -164,7 +164,7 @@ describe('PortForwardManager', () => {
         limitedManager.forward(echo3.port, createRequesterIdentity('127.0.0.1')),
       ).rejects.toThrow(/Maximum port forwards/)
 
-      limitedManager.closeAll()
+      await limitedManager.closeAll()
       echo1.server.close()
       echo2.server.close()
       echo3.server.close()
@@ -251,7 +251,7 @@ describe('PortForwardManager', () => {
       expect(response).toBe('test')
 
       // Close the forward
-      manager.close(echo.port, createRequesterIdentity('127.0.0.1').key)
+      await manager.close(echo.port, createRequesterIdentity('127.0.0.1').key)
 
       // Verify forward is gone (connection should fail)
       await expect(
@@ -259,9 +259,9 @@ describe('PortForwardManager', () => {
       ).rejects.toThrow()
     })
 
-    it('is a no-op for non-existent forwards', () => {
+    it('is a no-op for non-existent forwards', async () => {
       // Should not throw
-      manager.close(99999)
+      await manager.close(99999)
     })
 
     it('allows re-creating a forward after closing', async () => {
@@ -272,7 +272,7 @@ describe('PortForwardManager', () => {
         echo.port,
         createRequesterIdentity('127.0.0.1'),
       )
-      manager.close(echo.port, createRequesterIdentity('127.0.0.1').key)
+      await manager.close(echo.port, createRequesterIdentity('127.0.0.1').key)
 
       const second = await manager.forward(
         echo.port,
@@ -298,7 +298,7 @@ describe('PortForwardManager', () => {
         createRequesterIdentity('127.0.0.1'),
       )
 
-      manager.closeAll()
+      await manager.closeAll()
 
       await expect(
         tcpExchange('127.0.0.1', f1.port, 'test'),
@@ -346,7 +346,7 @@ describe('PortForwardManager', () => {
 
       expect(shortManager.getForwardedPort(echo.port, requester.key)).toBeUndefined()
 
-      shortManager.closeAll()
+      await shortManager.closeAll()
       vi.useRealTimers()
     })
   })

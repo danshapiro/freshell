@@ -31,14 +31,14 @@ export function createProxyRouter(deps: ProxyRouterDeps): Router {
     }
   })
 
-  router.delete('/forward/:port', (req, res) => {
+  router.delete('/forward/:port', async (req, res) => {
     const targetPort = parseInt(req.params.port, 10)
     if (!Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) {
       return res.status(400).json({ error: 'Invalid port number' })
     }
     try {
       const requester = getRequesterIdentity(req)
-      portForwardManager.close(targetPort, requester.key)
+      await portForwardManager.close(targetPort, requester.key)
       res.json({ ok: true })
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err)

@@ -54,13 +54,16 @@ interface ToolStripProps {
   completedToolOffset?: number
   /** Completed tools at globalIndex >= this value get initialExpanded=true. */
   autoExpandAbove?: number
+  /** When false, strip is locked to collapsed view (no expand chevron). Default true. */
+  showTools?: boolean
 }
 
-function ToolStrip({ pairs, isStreaming, completedToolOffset, autoExpandAbove }: ToolStripProps) {
-  const expanded = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot)
+function ToolStrip({ pairs, isStreaming, completedToolOffset, autoExpandAbove, showTools = true }: ToolStripProps) {
+  const expandedPref = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot)
+  const expanded = showTools && expandedPref
 
   const handleToggle = () => {
-    setExpandedPreference(!expanded)
+    setExpandedPreference(!expandedPref)
   }
 
   const hasErrors = pairs.some(p => p.isError)
@@ -100,14 +103,16 @@ function ToolStrip({ pairs, isStreaming, completedToolOffset, autoExpandAbove }:
               : 'border-l-[hsl(var(--claude-tool))]',
           )}
         >
-          <button
-            type="button"
-            onClick={handleToggle}
-            className="shrink-0 p-0.5 hover:bg-accent/50 rounded transition-colors"
-            aria-label="Toggle tool details"
-          >
-            <ChevronRight className="h-3 w-3" />
-          </button>
+          {showTools && (
+            <button
+              type="button"
+              onClick={handleToggle}
+              className="shrink-0 p-0.5 hover:bg-accent/50 rounded transition-colors"
+              aria-label="Toggle tool details"
+            >
+              <ChevronRight className="h-3 w-3" />
+            </button>
+          )}
           <SlotReel
             toolName={isSettled ? null : (currentTool?.name ?? null)}
             previewText={

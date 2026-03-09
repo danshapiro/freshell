@@ -72,6 +72,36 @@ describe('filterSessionItemsByVisibility', () => {
       expect(result.map((i) => i.id)).toEqual(['2'])
     })
 
+    it('keeps freshclaude sessions visible when showNoninteractiveSessions is false', () => {
+      const items = [
+        createSessionItem({ id: '1', sessionType: 'freshclaude', isNonInteractive: true }),
+        createSessionItem({ id: '2' }),
+      ]
+
+      const result = filterSessionItemsByVisibility(items, {
+        showSubagents: true,
+        showNoninteractiveSessions: false,
+        ...baseSettings,
+      })
+
+      expect(result.map((i) => i.id)).toEqual(['1', '2'])
+    })
+
+    it('keeps other agent-chat sessions visible when showNoninteractiveSessions is false', () => {
+      const items = [
+        createSessionItem({ id: '1', sessionType: 'kilroy', isNonInteractive: true }),
+        createSessionItem({ id: '2' }),
+      ]
+
+      const result = filterSessionItemsByVisibility(items, {
+        showSubagents: true,
+        showNoninteractiveSessions: false,
+        ...baseSettings,
+      })
+
+      expect(result.map((i) => i.id)).toEqual(['1', '2'])
+    })
+
     it('shows non-interactive sessions when showNoninteractiveSessions is true', () => {
       const items = [
         createSessionItem({ id: '1', isNonInteractive: true }),

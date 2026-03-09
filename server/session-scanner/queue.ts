@@ -53,12 +53,21 @@ export class SessionRepairQueue extends EventEmitter {
   private hasStarted = false
   private waiting: Map<string, WaitingPromise[]> = new Map()
   private maxProcessedCache: number
+  private postScan?: (result: SessionScanResult) => Promise<void>
 
-  constructor(scanner: SessionScanner, cache: SessionCache, options?: { maxProcessedCache?: number }) {
+  constructor(
+    scanner: SessionScanner,
+    cache: SessionCache,
+    options?: {
+      maxProcessedCache?: number
+      postScan?: (result: SessionScanResult) => Promise<void>
+    },
+  ) {
     super()
     this.scanner = scanner
     this.cache = cache
     this.maxProcessedCache = options?.maxProcessedCache ?? MAX_PROCESSED_CACHE
+    this.postScan = options?.postScan
   }
 
   /**
@@ -188,6 +197,7 @@ export class SessionRepairQueue extends EventEmitter {
         const normalized = cached.sessionId === item.sessionId
           ? cached
           : { ...cached, sessionId: item.sessionId }
+        await this.postScan?.(normalized)
         this.setProcessed(item.sessionId, normalized)
         this.emit('scanned', normalized)
         this.resolveWaiting(item.sessionId, normalized)
@@ -215,9 +225,11 @@ export class SessionRepairQueue extends EventEmitter {
         const normalizedNew = newResult.sessionId === item.sessionId
           ? newResult
           : { ...newResult, sessionId: item.sessionId }
+        await this.postScan?.(normalizedNew)
         this.setProcessed(item.sessionId, normalizedNew)
         this.resolveWaiting(item.sessionId, normalizedNew)
       } else {
+        await this.postScan?.(normalizedScan)
         this.setProcessed(item.sessionId, normalizedScan)
         this.resolveWaiting(item.sessionId, normalizedScan)
       }

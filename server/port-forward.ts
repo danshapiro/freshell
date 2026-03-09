@@ -178,33 +178,32 @@ export class PortForwardManager {
   }
 
   /** Close a single forward by target port and requester key. */
-  close(targetPort: number, requesterKey?: string): void {
+  async close(targetPort: number, requesterKey?: string): Promise<void> {
     const targetMap = this.forwards.get(targetPort)
     if (!targetMap) return
 
     if (requesterKey) {
       const entry = targetMap.get(requesterKey)
       if (!entry) return
-      this.closeEntry(targetPort, entry, targetMap)
+      await this.closeEntry(targetPort, entry, targetMap)
       if (targetMap.size === 0) {
         this.forwards.delete(targetPort)
       }
       return
     }
 
-    for (const entry of [...targetMap.values()]) {
-      this.closeEntry(targetPort, entry, targetMap)
-    }
+    await Promise.all([...targetMap.values()].map((entry) => this.closeEntry(targetPort, entry, targetMap)))
     if (targetMap.size === 0) {
       this.forwards.delete(targetPort)
     }
   }
 
   /** Close all active forwards and stop the idle-cleanup timer. */
-  closeAll(): void {
+  async closeAll(): Promise<void> {
+    const closePromises: Promise<void>[] = []
     for (const [targetPort, targetMap] of [...this.forwards.entries()]) {
       for (const entry of [...targetMap.values()]) {
-        this.closeEntry(targetPort, entry, targetMap)
+        closePromises.push(this.closeEntry(targetPort, entry, targetMap))
       }
       this.forwards.delete(targetPort)
     }
@@ -213,6 +212,7 @@ export class PortForwardManager {
       clearInterval(this.cleanupTimer)
       this.cleanupTimer = null
     }
+    await Promise.all(closePromises)
   }
 
   private startIdleCleanup(): void {
@@ -227,7 +227,7 @@ export class PortForwardManager {
               { targetPort, localPort: entry.localPort, requesterIp: entry.requesterIp },
               'Port forward idle-closed',
             )
-            this.closeEntry(targetPort, entry, targetMap)
+            void this.closeEntry(targetPort, entry, targetMap)
           }
         }
         if (targetMap.size === 0) {
@@ -242,16 +242,23 @@ export class PortForwardManager {
     }
   }
 
-  private closeEntry(
+  private async closeEntry(
     targetPort: number,
     entry: ForwardEntry,
     targetMap: Map<string, ForwardEntry>,
-  ): void {
+  ): Promise<void> {
+    targetMap.delete(entry.requesterKey)
     for (const conn of entry.connections) {
       conn.destroy()
     }
-    entry.server.close()
-    targetMap.delete(entry.requesterKey)
+    entry.connections.clear()
+    await new Promise<void>((resolve) => {
+      if (!entry.server.listening) {
+        resolve()
+        return
+      }
+      entry.server.close(() => resolve())
+    })
     log.info(
       {
         targetPort,

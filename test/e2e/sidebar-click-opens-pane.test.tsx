@@ -80,6 +80,7 @@ function createStore(options: {
   excludeFirstChatMustStart?: boolean
   showSubagents?: boolean
   ignoreCodexSubagents?: boolean
+  showNoninteractiveSessions?: boolean
 }) {
   const projects = options.projects.map((project) => ({
     ...project,
@@ -134,6 +135,7 @@ function createStore(options: {
             showProjectBadges: true,
             showSubagents: options.showSubagents ?? defaultSettings.sidebar.showSubagents,
             ignoreCodexSubagents: options.ignoreCodexSubagents ?? defaultSettings.sidebar.ignoreCodexSubagents,
+            showNoninteractiveSessions: options.showNoninteractiveSessions ?? defaultSettings.sidebar.showNoninteractiveSessions,
             hideEmptySessions: false,
             excludeFirstChatSubstrings: options.excludeFirstChatSubstrings ?? defaultSettings.sidebar.excludeFirstChatSubstrings,
             excludeFirstChatMustStart: options.excludeFirstChatMustStart ?? defaultSettings.sidebar.excludeFirstChatMustStart,
@@ -513,6 +515,47 @@ describe('sidebar click opens pane (e2e)', () => {
     expect(state.panes.activePane['tab-2']).toBe('pane-chat')
     // Layout should be unchanged (still a leaf, no split)
     expect(state.panes.layouts['tab-2'].type).toBe('leaf')
+  })
+
+  it('shows freshclaude non-interactive sessions while keeping exec-style Claude sessions hidden', async () => {
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/home/user/project',
+        sessions: [
+          {
+            sessionId: sessionId('freshclaude-visible'),
+            projectPath: '/home/user/project',
+            updatedAt: Date.now(),
+            title: 'Freshclaude visible',
+            cwd: '/home/user/project',
+            isNonInteractive: true,
+            sessionType: 'freshclaude',
+          },
+          {
+            sessionId: sessionId('exec-hidden'),
+            projectPath: '/home/user/project',
+            updatedAt: Date.now() - 1000,
+            title: 'Exec hidden',
+            cwd: '/home/user/project',
+            isNonInteractive: true,
+          },
+        ],
+      },
+    ]
+
+    const store = createStore({
+      projects,
+      showNoninteractiveSessions: false,
+    })
+
+    renderSidebar(store)
+
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    expect(screen.getByText('Freshclaude visible')).toBeInTheDocument()
+    expect(screen.queryByText('Exec hidden')).not.toBeInTheDocument()
   })
 
   it('clicking a session with no active tab creates a new tab', async () => {

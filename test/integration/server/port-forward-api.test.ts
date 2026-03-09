@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterAll, afterEach, vi } from 'vitest'
 import express, { type Express } from 'express'
 import request from 'supertest'
 import * as net from 'net'
@@ -37,12 +37,56 @@ function createEchoServer(): Promise<{ server: net.Server; port: number }> {
   })
 }
 
+function waitForForwardedPortToClose(port: number, timeoutMs = 2_000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now()
+
+    const attempt = () => {
+      const socket = net.createConnection({ host: '127.0.0.1', port })
+      let settled = false
+
+      const cleanup = () => {
+        socket.removeAllListeners()
+      }
+
+      socket.once('connect', () => {
+        cleanup()
+        socket.destroy()
+        if (Date.now() - startedAt >= timeoutMs) {
+          reject(new Error(`Forwarded port ${port} was still accepting connections`))
+          return
+        }
+        setTimeout(attempt, 25)
+      })
+
+      socket.once('error', () => {
+        settled = true
+        cleanup()
+        resolve()
+      })
+
+      socket.setTimeout(250, () => {
+        if (settled) return
+        cleanup()
+        socket.destroy(new Error('timeout'))
+        if (Date.now() - startedAt >= timeoutMs) {
+          reject(new Error(`Timed out waiting for forwarded port ${port} to close`))
+          return
+        }
+        setTimeout(attempt, 25)
+      })
+    }
+
+    attempt()
+  })
+}
+
 describe('Port Forward API Integration', () => {
   let app: Express
   let manager: PortForwardManager
   let echoServer: { server: net.Server; port: number } | null = null
 
-  beforeAll(() => {
+  beforeEach(() => {
     process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
     process.env.FRESHELL_TRUST_PROXY = 'loopback'
     manager = new PortForwardManager({ idleTimeoutMs: 60_000 })
@@ -65,7 +109,8 @@ describe('Port Forward API Integration', () => {
     app.use('/api/proxy', createProxyRouter({ portForwardManager: manager }))
   })
 
-  afterEach(() => {
+  afterEach(async () => {
+    await manager.closeAll()
     if (echoServer) {
       echoServer.server.close()
       echoServer = null
@@ -73,7 +118,7 @@ describe('Port Forward API Integration', () => {
   })
 
   afterAll(() => {
-    manager.closeAll()
+    delete process.env.AUTH_TOKEN
     delete process.env.FRESHELL_TRUST_PROXY
   })
 
@@ -233,22 +278,9 @@ describe('Port Forward API Integration', () => {
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .expect(200)
 
-      // Verify the forwarded port is no longer listening
-      await expect(
-        new Promise((resolve, reject) => {
-          const socket = net.createConnection(
-            { host: '127.0.0.1', port: forwardedPort },
-            () => {
-              socket.destroy()
-              resolve('connected')
-            },
-          )
-          socket.on('error', reject)
-          socket.setTimeout(2000, () => {
-            socket.destroy(new Error('timeout'))
-          })
-        }),
-      ).rejects.toThrow()
+      // A connect attempt already queued in the kernel can occasionally race with close.
+      // Wait for the listener to become unavailable rather than assuming a single probe must fail.
+      await waitForForwardedPortToClose(forwardedPort)
     })
 
     it('is a no-op for non-existent forwards', async () => {

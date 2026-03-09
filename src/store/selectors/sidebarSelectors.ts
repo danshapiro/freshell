@@ -3,6 +3,7 @@ import type { RootState } from '../store'
 import type { BackgroundTerminal, CodingCliProviderName } from '../types'
 import { collectSessionRefsFromNode } from '@/lib/session-utils'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
+import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 
 export interface SidebarSessionItem {
   id: string
@@ -168,6 +169,11 @@ function isExcludedByFirstUserMessage(
   ))
 }
 
+function shouldHideAsNonInteractive(item: SidebarSessionItem, showNoninteractiveSessions: boolean): boolean {
+  if (showNoninteractiveSessions || !item.isNonInteractive) return false
+  return !getAgentChatProviderConfig(item.sessionType)
+}
+
 export function filterSessionItemsByVisibility(
   items: SidebarSessionItem[],
   settings: VisibilitySettings,
@@ -179,7 +185,7 @@ export function filterSessionItemsByVisibility(
   return items.filter((item) => {
     if (!settings.showSubagents && item.isSubagent) return false
     if (settings.ignoreCodexSubagents && item.isSubagent && item.provider === 'codex') return false
-    if (!settings.showNoninteractiveSessions && item.isNonInteractive) return false
+    if (shouldHideAsNonInteractive(item, settings.showNoninteractiveSessions)) return false
     if (settings.hideEmptySessions && !item.hasTitle) return false
     if (isExcludedByFirstUserMessage(item.firstUserMessage, exclusions, settings.excludeFirstChatMustStart)) return false
     return true

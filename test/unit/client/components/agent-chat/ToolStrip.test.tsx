@@ -132,6 +132,21 @@ describe('ToolStrip', () => {
     expect(screen.getByRole('region', { name: /tool strip/i })).toBeInTheDocument()
   })
 
+  it('always shows collapsed view when showTools is false, even if localStorage says expanded', () => {
+    localStorage.setItem(STORAGE_KEY, 'true')
+    const pairs = [
+      makePair('Bash', { command: 'ls' }, 'file1\nfile2'),
+      makePair('Read', { file_path: '/path/file.ts' }, 'content'),
+    ]
+    render(<ToolStrip pairs={pairs} isStreaming={false} showTools={false} />)
+    // Should show collapsed summary text
+    expect(screen.getByText('2 tools used')).toBeInTheDocument()
+    // Chevron toggle should NOT be rendered
+    expect(screen.queryByRole('button', { name: /toggle tool details/i })).not.toBeInTheDocument()
+    // Individual ToolBlocks should NOT be rendered
+    expect(screen.queryByRole('button', { name: /Bash tool call/i })).not.toBeInTheDocument()
+  })
+
   it('passes autoExpandAbove props through to ToolBlocks in expanded mode', async () => {
     localStorage.setItem(STORAGE_KEY, 'true')
     const pairs = [

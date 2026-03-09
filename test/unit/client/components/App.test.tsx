@@ -239,7 +239,10 @@ describe('App Component - Share Button', () => {
 
   async function openShareFromSettings() {
     fireEvent.click(screen.getByTitle('Go settings'))
-    const openShareButton = await screen.findByRole('button', { name: 'Open share panel' })
+    await waitFor(() => {
+      expect(screen.queryByText('Loading settings…')).not.toBeInTheDocument()
+    }, { timeout: 5000 })
+    const openShareButton = await screen.findByRole('button', { name: 'Open share panel' }, { timeout: 5000 })
     fireEvent.click(openShareButton)
   }
 

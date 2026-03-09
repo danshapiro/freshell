@@ -9,13 +9,50 @@ export type LoggerServerProcess = {
   process: ChildProcessWithoutNullStreams
   stderrLogPath: string
   stderrLogDir: string
+  readOutput: () => string
 }
+
+const PARENT_LOG_ENV_KEYS = [
+  'LOG_DEBUG_PATH',
+  'FRESHELL_LOG_MODE',
+  'FRESHELL_LOG_INSTANCE_ID',
+  'FRESHELL_DEBUG_STREAM_INSTANCE',
+  'FRESHELL_LOG_DIR',
+] as const
+
+const PARENT_TEST_ENV_KEYS = [
+  'VITEST',
+  'VITEST_POOL_ID',
+  'VITEST_WORKER_ID',
+  'PW_TEST_LOGS_DIR',
+] as const
 
 async function createLogWriter(logPath: string) {
   const directory = path.dirname(logPath)
   await fsp.mkdir(directory, { recursive: true })
   const stream = fs.createWriteStream(logPath, { flags: 'a' })
   return stream
+}
+
+export function buildServerProcessEnv(
+  env: NodeJS.ProcessEnv,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const childEnv: NodeJS.ProcessEnv = { ...baseEnv }
+
+  for (const key of [...PARENT_LOG_ENV_KEYS, ...PARENT_TEST_ENV_KEYS]) {
+    delete childEnv[key]
+  }
+
+  delete childEnv.FRESHELL_DISABLE_WSL_PORT_FORWARD
+
+  Object.assign(childEnv, env)
+
+  if (env.FRESHELL_DISABLE_WSL_PORT_FORWARD === undefined) {
+    childEnv.FRESHELL_DISABLE_WSL_PORT_FORWARD = '1'
+  }
+
+  return childEnv
 }
 
 export async function startServerProcess(
@@ -30,21 +67,7 @@ export async function startServerProcess(
     `server.log`,
   )
   const logStream = await createLogWriter(logPath)
-  const childEnv: NodeJS.ProcessEnv = { ...process.env }
-  for (const key of [
-    'LOG_DEBUG_PATH',
-    'FRESHELL_LOG_MODE',
-    'FRESHELL_LOG_INSTANCE_ID',
-    'FRESHELL_DEBUG_STREAM_INSTANCE',
-    'FRESHELL_LOG_DIR',
-  ]) {
-    delete childEnv[key]
-  }
-  Object.assign(childEnv, env)
-  delete childEnv.VITEST
-  delete childEnv.VITEST_POOL_ID
-  delete childEnv.VITEST_WORKER_ID
-  delete childEnv.PW_TEST_LOGS_DIR
+  const childEnv = buildServerProcessEnv(env)
 
   const child = spawn(args[0], args.slice(1), {
     cwd: resolvedCwd,
@@ -52,8 +75,15 @@ export async function startServerProcess(
     stdio: ['ignore', 'pipe', 'pipe'],
   }) as ChildProcessWithoutNullStreams
 
+  let combinedOutput = ''
+  const appendOutput = (chunk: Buffer) => {
+    combinedOutput += chunk.toString()
+  }
+
   child.stdout?.pipe(logStream)
   child.stderr?.pipe(logStream)
+  child.stdout?.on('data', appendOutput)
+  child.stderr?.on('data', appendOutput)
 
   child.once('error', () => {
     logStream.end()
@@ -62,33 +92,53 @@ export async function startServerProcess(
     logStream.end()
   })
 
-  return { process: child, stderrLogPath: logPath, stderrLogDir }
+  return {
+    process: child,
+    stderrLogPath: logPath,
+    stderrLogDir,
+    readOutput: () => combinedOutput,
+  }
+}
+
+async function readCombinedOutput(handle: LoggerServerProcess): Promise<string> {
+  const fileContent = await fsp.readFile(handle.stderrLogPath, 'utf8').catch(() => '')
+  return `${handle.readOutput()}\n${fileContent}`
 }
 
 export async function waitForResolvedPath(
   handle: LoggerServerProcess,
-  timeoutMs = 5000,
+  timeoutMs = 30000,
 ): Promise<string> {
+  await waitForLogPattern(handle, /([^\s"]+\.jsonl)|"filePath"\s*:\s*"([^"]+\.jsonl)"/, timeoutMs)
+
+  const content = await readCombinedOutput(handle)
+  const jsonMatch = content.match(/"filePath"\s*:\s*"([^"]+\.jsonl)"/)
+  if (jsonMatch && jsonMatch[1]) {
+    return jsonMatch[1]
+  }
+
+  const lineMatch = content.match(/([^\s"]+\.jsonl)/)
+  if (lineMatch && lineMatch[1]) {
+    return lineMatch[1]
+  }
+
+  throw new Error(`Resolved debug path matched, but no path could be parsed. Log: ${content}`)
+}
+
+async function waitForLogPattern(
+  handle: LoggerServerProcess,
+  pattern: RegExp,
+  timeoutMs = 5000,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs
   let lastLog = ''
-  let lastMatch: string | null = null
 
   while (Date.now() < deadline) {
-    const content = await fsp.readFile(handle.stderrLogPath, 'utf8').catch(() => '')
+    const content = await readCombinedOutput(handle)
     if (content) {
       lastLog = content
-      const jsonMatch = content.match(/"filePath"\s*:\s*"([^"]+\.jsonl)"/)
-      if (jsonMatch && jsonMatch[1]) {
-        lastMatch = jsonMatch[1]
-      } else {
-        const lineMatch = content.match(/([^\s"]+\.jsonl)/)
-        if (lineMatch) {
-          lastMatch = lineMatch[1]
-        }
-      }
-
-      if (lastMatch) {
-        return lastMatch
+      if (pattern.test(content)) {
+        return
       }
     }
 
@@ -99,8 +149,14 @@ export async function waitForResolvedPath(
     await new Promise<void>((resolve) => setTimeout(resolve, 120))
   }
 
-  const finalLog = lastLog
-  throw new Error(`Timed out waiting for resolved debug path. Log: ${finalLog}`)
+  throw new Error(`Timed out waiting for ${pattern}. Log: ${lastLog}`)
+}
+
+export async function waitForServerListening(
+  handle: LoggerServerProcess,
+  timeoutMs = 30000,
+): Promise<void> {
+  await waitForLogPattern(handle, /Server listening/, timeoutMs)
 }
 
 export async function stopProcess(proc: ChildProcessWithoutNullStreams): Promise<void> {
@@ -121,32 +177,4 @@ export async function stopProcess(proc: ChildProcessWithoutNullStreams): Promise
       throw err
     }
   }
-}
-
-export async function listCandidateFiles(
-  logDir: string,
-  mode: string,
-  instance: string,
-  timeoutMs = 4000,
-  pollMs = 120,
-): Promise<string[]> {
-  const deadline = Date.now() + timeoutMs
-  const escapedMode = mode.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const escapedInstance = instance.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const candidatePattern = new RegExp(
-    `^server-debug\\.${escapedMode}\\.${escapedInstance}.*\\.jsonl(?:\\.\\d+)?$`,
-  )
-
-  while (Date.now() < deadline) {
-    const entries = await fsp.readdir(logDir, { withFileTypes: true })
-    const files = entries
-      .filter((entry) => entry.isFile() && candidatePattern.test(entry.name))
-      .map((entry) => path.join(logDir, entry.name))
-    if (files.length > 0) {
-      return files
-    }
-    await new Promise<void>((resolve) => setTimeout(resolve, pollMs))
-  }
-
-  return []
 }

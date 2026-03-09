@@ -65,11 +65,13 @@ function createTestStore(defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor' 
 
 describe('SettingsView Panes section', () => {
   beforeEach(() => {
+    vi.useRealTimers()
     localStorage.clear()
   })
 
   afterEach(() => {
     cleanup()
+    vi.useRealTimers()
   })
 
   it('renders Panes section', () => {

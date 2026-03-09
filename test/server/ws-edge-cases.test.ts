@@ -1178,33 +1178,23 @@ describe('WebSocket edge cases', () => {
       sendAttach(ws3, terminalId)
       await waitForMessage(ws3, (m) => m.type === 'terminal.attach.ready' && m.terminalId === terminalId)
 
-      // Set up listeners on all clients
-      const outputs1: string[] = []
-      const outputs2: string[] = []
-      const outputs3: string[] = []
+      const waitForBroadcast = (ws: WebSocket) =>
+        waitForMessage(
+          ws,
+          (m) => m.type === 'terminal.output' && m.terminalId === terminalId && m.data.includes('broadcast test'),
+        )
 
-      ws1.on('message', (data) => {
-        const msg = JSON.parse(data.toString())
-        if (msg.type === 'terminal.output') outputs1.push(msg.data)
-      })
-      ws2.on('message', (data) => {
-        const msg = JSON.parse(data.toString())
-        if (msg.type === 'terminal.output') outputs2.push(msg.data)
-      })
-      ws3.on('message', (data) => {
-        const msg = JSON.parse(data.toString())
-        if (msg.type === 'terminal.output') outputs3.push(msg.data)
-      })
+      const output1 = waitForBroadcast(ws1)
+      const output2 = waitForBroadcast(ws2)
+      const output3 = waitForBroadcast(ws3)
 
       // Simulate output
       registry.simulateOutput(terminalId, 'broadcast test\n')
 
-      await new Promise((r) => setTimeout(r, 100))
-
       // All clients should receive the output
-      expect(outputs1.join('')).toContain('broadcast test')
-      expect(outputs2.join('')).toContain('broadcast test')
-      expect(outputs3.join('')).toContain('broadcast test')
+      await expect(output1).resolves.toMatchObject({ type: 'terminal.output', terminalId })
+      await expect(output2).resolves.toMatchObject({ type: 'terminal.output', terminalId })
+      await expect(output3).resolves.toMatchObject({ type: 'terminal.output', terminalId })
 
       close1()
       close2()

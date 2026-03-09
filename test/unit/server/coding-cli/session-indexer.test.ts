@@ -1053,106 +1053,112 @@ describe('CodingCliSessionIndexer', () => {
 
   describe('urgent refresh for titleless sessions', () => {
     it('uses shorter delay when a dirty file has a cached session with no title', async () => {
-      const fileA = path.join(tempDir, 'session-a.jsonl')
-      // Start with no title (simulates brand new Claude session)
-      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
+      vi.useFakeTimers()
+      try {
+        const fileA = path.join(tempDir, 'session-a.jsonl')
+        // Start with no title (simulates brand new Claude session)
+        await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
 
-      const provider = makeProvider([fileA])
-      const indexer = new CodingCliSessionIndexer([provider], {
-        debounceMs: 2000,
-        throttleMs: 5000,
-        fullScanIntervalMs: 0,
-      })
+        const provider = makeProvider([fileA])
+        const indexer = new CodingCliSessionIndexer([provider], {
+          debounceMs: 2000,
+          throttleMs: 5000,
+          fullScanIntervalMs: 0,
+        })
 
-      // Initial refresh populates cache with titleless session
-      await indexer.refresh()
-      const projects = indexer.getProjects()
-      expect(projects).toHaveLength(1)
-      expect(projects[0].sessions[0].title).toBeUndefined()
+        // Initial refresh populates cache with titleless session.
+        await indexer.refresh()
+        const projects = indexer.getProjects()
+        expect(projects).toHaveLength(1)
+        expect(projects[0].sessions[0].title).toBeUndefined()
 
-      const handler = vi.fn()
-      indexer.onUpdate(handler)
+        const refreshSpy = vi.spyOn(indexer, 'refresh').mockResolvedValue(undefined)
 
-      // Simulate file change: session gets a title (user typed first message)
-      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Hello world' }) + '\n')
-      ;(indexer as any).markDirty(fileA)
-      indexer.scheduleRefresh()
+        // Simulate file change: session gets a title (user typed first message).
+        await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Hello world' }) + '\n')
+        ;(indexer as any).markDirty(fileA)
+        indexer.scheduleRefresh()
 
-      // Urgent refresh should fire within the urgent throttle window (~1s),
-      // not after the normal 2-5s debounce/throttle window
-      await vi.waitFor(
-        () => { expect(handler).toHaveBeenCalledTimes(1) },
-        { timeout: 2000, interval: 50 },
-      )
+        // Urgent refresh still respects the 1s urgent throttle floor instead of the full 2-5s delay.
+        await vi.advanceTimersByTimeAsync(999)
+        expect(refreshSpy).not.toHaveBeenCalled()
 
-      indexer.stop()
+        await vi.advanceTimersByTimeAsync(1)
+        expect(refreshSpy).toHaveBeenCalledTimes(1)
+
+        indexer.stop()
+      } finally {
+        vi.useRealTimers()
+      }
     })
 
     it('does not throttle urgent refreshes when throttleMs is 0', async () => {
-      const fileA = path.join(tempDir, 'session-a.jsonl')
-      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
+      vi.useFakeTimers()
+      try {
+        const fileA = path.join(tempDir, 'session-a.jsonl')
+        await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
 
-      const provider = makeProvider([fileA])
-      const indexer = new CodingCliSessionIndexer([provider], {
-        debounceMs: 50,
-        throttleMs: 0,
-        fullScanIntervalMs: 0,
-      })
+        const provider = makeProvider([fileA])
+        const indexer = new CodingCliSessionIndexer([provider], {
+          debounceMs: 50,
+          throttleMs: 0,
+          fullScanIntervalMs: 0,
+        })
 
-      await indexer.refresh()
-      expect(indexer.getProjects()[0].sessions[0].title).toBeUndefined()
+        await indexer.refresh()
+        expect(indexer.getProjects()[0].sessions[0].title).toBeUndefined()
 
-      const handler = vi.fn()
-      indexer.onUpdate(handler)
+        const refreshSpy = vi.spyOn(indexer, 'refresh').mockResolvedValue(undefined)
 
-      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Hello' }) + '\n')
-      ;(indexer as any).markDirty(fileA)
-      indexer.scheduleRefresh()
+        await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Hello' }) + '\n')
+        ;(indexer as any).markDirty(fileA)
+        indexer.scheduleRefresh()
 
-      // With throttleMs: 0, urgent refresh should fire at the URGENT_REFRESH_MS
-      // delay (300ms) without any additional throttle
-      await vi.waitFor(
-        () => { expect(handler).toHaveBeenCalledTimes(1) },
-        { timeout: 800, interval: 50 },
-      )
+        await vi.advanceTimersByTimeAsync(299)
+        expect(refreshSpy).not.toHaveBeenCalled()
 
-      indexer.stop()
+        await vi.advanceTimersByTimeAsync(1)
+        expect(refreshSpy).toHaveBeenCalledTimes(1)
+
+        indexer.stop()
+      } finally {
+        vi.useRealTimers()
+      }
     })
 
     it('uses normal delay when dirty files all have titles already', async () => {
-      const fileA = path.join(tempDir, 'session-a.jsonl')
-      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Has title' }) + '\n')
+      vi.useFakeTimers()
+      try {
+        const fileA = path.join(tempDir, 'session-a.jsonl')
+        await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Has title' }) + '\n')
 
-      const provider = makeProvider([fileA])
-      // Use short debounce so the test doesn't take too long, but long enough
-      // to prove it doesn't fire as urgently as the titleless case
-      const indexer = new CodingCliSessionIndexer([provider], {
-        debounceMs: 800,
-        throttleMs: 800,
-        fullScanIntervalMs: 0,
-      })
+        const provider = makeProvider([fileA])
+        // Use short debounce so the test stays quick, while still proving it does not fire urgently.
+        const indexer = new CodingCliSessionIndexer([provider], {
+          debounceMs: 800,
+          throttleMs: 800,
+          fullScanIntervalMs: 0,
+        })
 
-      await indexer.refresh()
+        await indexer.refresh()
 
-      const handler = vi.fn()
-      indexer.onUpdate(handler)
+        const refreshSpy = vi.spyOn(indexer, 'refresh').mockResolvedValue(undefined)
 
-      // Simulate file change for a session that already has a title
-      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Updated title' }) + '\n')
-      ;(indexer as any).markDirty(fileA)
-      indexer.scheduleRefresh()
+        // Simulate file change for a session that already has a title.
+        await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Updated title' }) + '\n')
+        ;(indexer as any).markDirty(fileA)
+        indexer.scheduleRefresh()
 
-      // Should NOT have fired within 300ms (no urgency)
-      await new Promise((r) => setTimeout(r, 300))
-      expect(handler).not.toHaveBeenCalled()
+        await vi.advanceTimersByTimeAsync(799)
+        expect(refreshSpy).not.toHaveBeenCalled()
 
-      // Should fire after the normal debounce period
-      await vi.waitFor(
-        () => { expect(handler).toHaveBeenCalledTimes(1) },
-        { timeout: 2000, interval: 50 },
-      )
+        await vi.advanceTimersByTimeAsync(1)
+        expect(refreshSpy).toHaveBeenCalledTimes(1)
 
-      indexer.stop()
+        indexer.stop()
+      } finally {
+        vi.useRealTimers()
+      }
     })
   })
 

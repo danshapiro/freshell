@@ -141,14 +141,17 @@ function MessageBubble({
   }, [content, resultMap, isLastMessage])
 
   // Check if any blocks will be visible after applying toggle filters.
+  // Note: tool groups are unconditionally visible (collapsed summary always shows),
+  // so showTools is intentionally absent from the dependency array. Only thinking
+  // blocks are conditionally hidden via their toggle.
   const hasVisibleContent = useMemo(() => {
     return groups.some((group) => {
       if (group.kind === 'text') return true
       if (group.kind === 'thinking' && showThinking) return true
-      if (group.kind === 'tools' && showTools) return true
+      if (group.kind === 'tools') return true
       return false
     })
-  }, [groups, showThinking, showTools])
+  }, [groups, showThinking])
 
   // Track completed tool offset across tool groups for auto-expand
   const toolGroupOffsets = useMemo(() => {
@@ -204,7 +207,6 @@ function MessageBubble({
         }
 
         if (group.kind === 'tools') {
-          if (!showTools) return null
           const isStreaming = isLastMessage && group.pairs.some(p => p.status === 'running')
           return (
             <ToolStrip
@@ -213,6 +215,7 @@ function MessageBubble({
               isStreaming={isStreaming}
               completedToolOffset={toolGroupOffsets[group.toolGroupIndex]}
               autoExpandAbove={autoExpandAbove}
+              showTools={showTools}
             />
           )
         }
