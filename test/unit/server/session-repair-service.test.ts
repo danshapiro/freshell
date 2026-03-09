@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { promises as fs } from 'fs'
 import path from 'path'
 import os from 'os'
+import { logger } from '../../../server/logger.js'
 import { SessionRepairService } from '../../../server/session-scanner/service.js'
 import type { SessionScanResult } from '../../../server/session-scanner/types.js'
 
@@ -199,6 +200,66 @@ describe('SessionRepairService', () => {
         expect(history).not.toContain(nestedSessionId)
       })
     } finally {
+      await service.stop()
+    }
+  })
+
+  it('treats history backfill failures as best-effort during waitForSession', async () => {
+    const projectDir = path.join(tempDir, '.claude', 'projects', 'test-project')
+    await fs.mkdir(projectDir, { recursive: true })
+
+    const sessionId = 'history-failure-session'
+    const sessionFile = path.join(projectDir, `${sessionId}.jsonl`)
+    await fs.writeFile(sessionFile, createTranscript(sessionId, '/tmp/project'))
+
+    const service = new SessionRepairService({
+      cacheDir: tempDir,
+      scanner: {
+        scan: vi.fn(async (filePath: string): Promise<SessionScanResult> => ({
+          sessionId: path.basename(filePath, '.jsonl'),
+          filePath,
+          status: 'healthy',
+          chainDepth: 1,
+          orphanCount: 0,
+          fileSize: 1,
+          messageCount: 1,
+        })),
+        repair: vi.fn(),
+      } as any,
+    })
+
+    const historyError = new Error('history append failed')
+    ;(service as any).historyRepairer = {
+      ensureHistoryEntryForFile: vi.fn().mockRejectedValue(historyError),
+    }
+
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => logger)
+    const emittedErrors: Array<{ sessionId: string; error: Error }> = []
+    service.on('error', (failedSessionId, error) => {
+      emittedErrors.push({ sessionId: failedSessionId, error })
+    })
+
+    await service.start()
+
+    try {
+      const result = await service.waitForSession(sessionId, 5000)
+
+      expect(result).toMatchObject({
+        sessionId,
+        filePath: sessionFile,
+        status: 'healthy',
+      })
+      expect(emittedErrors).toEqual([])
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          err: historyError,
+          filePath: sessionFile,
+          sessionId,
+        }),
+        'Failed to backfill Claude history entry'
+      )
+    } finally {
+      warnSpy.mockRestore()
       await service.stop()
     }
   })

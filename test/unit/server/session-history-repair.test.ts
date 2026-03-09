@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { promises as fs } from 'fs'
 import path from 'path'
 import os from 'os'
@@ -8,6 +8,30 @@ import {
 } from '../../../server/session-scanner/history-repair.js'
 
 describe('deriveClaudeHistoryEntryFromTranscript', () => {
+  it('derives a history row when the user message content is a plain string', () => {
+    const sessionId = 'test-session'
+    const content = [
+      JSON.stringify({
+        type: 'user',
+        sessionId,
+        cwd: '/tmp/project',
+        timestamp: '2026-03-08T08:38:07.287Z',
+        message: {
+          role: 'user',
+          content: '  Repair   the history backfill  ',
+        },
+      }),
+    ].join('\n')
+
+    expect(deriveClaudeHistoryEntryFromTranscript(sessionId, content)).toEqual({
+      display: 'Repair the history backfill',
+      pastedContents: {},
+      project: '/tmp/project',
+      sessionId,
+      timestamp: Date.parse('2026-03-08T08:38:07.287Z'),
+    })
+  })
+
   it('derives a history row from the first user-facing text prompt', () => {
     const sessionId = 'test-session'
     const content = [
@@ -137,5 +161,42 @@ describe('ClaudeHistoryRepairer', () => {
     expect(result.status).toBe('already_present')
     const historyLines = (await fs.readFile(historyPath, 'utf8')).trim().split('\n')
     expect(historyLines).toHaveLength(1)
+  })
+
+  it('does not reread the transcript file when the session is already present in history', async () => {
+    const sessionId = 'session-3'
+    const sessionFile = path.join(claudeHome, 'projects', 'test-project', `${sessionId}.jsonl`)
+    const historyPath = path.join(claudeHome, 'history.jsonl')
+    await fs.writeFile(sessionFile, JSON.stringify({
+      type: 'user',
+      sessionId,
+      cwd: '/tmp/project',
+      timestamp: '2026-03-08T08:38:07.287Z',
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: 'This should not be reread' }],
+      },
+    }))
+    await fs.writeFile(historyPath, `${JSON.stringify({
+      display: 'Existing row',
+      pastedContents: {},
+      project: '/tmp/project',
+      sessionId,
+      timestamp: Date.parse('2026-03-08T08:38:07.287Z'),
+    })}\n`)
+
+    const readFileSpy = vi.spyOn(fs, 'readFile')
+    const repairer = new ClaudeHistoryRepairer({ claudeHome })
+
+    try {
+      const result = await repairer.ensureHistoryEntryForFile(sessionFile)
+
+      expect(result.status).toBe('already_present')
+      expect(
+        readFileSpy.mock.calls.filter(([filePath]) => filePath === sessionFile)
+      ).toHaveLength(0)
+    } finally {
+      readFileSpy.mockRestore()
+    }
   })
 })
