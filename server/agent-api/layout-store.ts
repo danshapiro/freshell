@@ -503,6 +503,34 @@ export class LayoutStore {
     const temp = a.content
     a.content = b.content
     b.content = temp
+    if (this.snapshot.paneTitles?.[targetTab]) {
+      const titleA = this.snapshot.paneTitles[targetTab][aId]
+      const titleB = this.snapshot.paneTitles[targetTab][bId]
+      if (titleB === undefined) {
+        delete this.snapshot.paneTitles[targetTab][aId]
+      } else {
+        this.snapshot.paneTitles[targetTab][aId] = titleB
+      }
+      if (titleA === undefined) {
+        delete this.snapshot.paneTitles[targetTab][bId]
+      } else {
+        this.snapshot.paneTitles[targetTab][bId] = titleA
+      }
+    }
+    if (this.snapshot.paneTitleSetByUser?.[targetTab]) {
+      const titleSetByUserA = this.snapshot.paneTitleSetByUser[targetTab][aId]
+      const titleSetByUserB = this.snapshot.paneTitleSetByUser[targetTab][bId]
+      if (titleSetByUserB === undefined) {
+        delete this.snapshot.paneTitleSetByUser[targetTab][aId]
+      } else {
+        this.snapshot.paneTitleSetByUser[targetTab][aId] = titleSetByUserB
+      }
+      if (titleSetByUserA === undefined) {
+        delete this.snapshot.paneTitleSetByUser[targetTab][bId]
+      } else {
+        this.snapshot.paneTitleSetByUser[targetTab][bId] = titleSetByUserA
+      }
+    }
     return { tabId: targetTab }
   }
 

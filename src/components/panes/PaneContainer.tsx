@@ -140,6 +140,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   // Inline rename state (local to this PaneContainer instance)
   const [renamingPaneId, setRenamingPaneId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
+  const [renameError, setRenameError] = useState<string | null>(null)
 
   // Listen for rename requests from Redux (context menu trigger)
   const renameRequestTabId = useAppSelector((s) => s.panes.renameRequestTabId)
@@ -154,30 +155,45 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     const currentTitle = paneTitles[node.id] ?? derivePaneTitle(node.content)
     setRenamingPaneId(node.id)
     setRenameValue(currentTitle)
+    setRenameError(null)
     dispatch(clearPaneRenameRequest())
   }, [renameRequestTabId, renameRequestPaneId, tabId, node, paneTitles, dispatch])
 
   const startRename = useCallback((paneId: string, currentTitle: string) => {
     setRenamingPaneId(paneId)
     setRenameValue(currentTitle)
+    setRenameError(null)
   }, [])
+
+  const handleRenameChange = useCallback((value: string) => {
+    setRenameValue(value)
+    if (renameError) setRenameError(null)
+  }, [renameError])
 
   const commitRename = useCallback(() => {
     if (!renamingPaneId) return
     const paneId = renamingPaneId
     const trimmed = renameValue.trim()
-    if (trimmed) {
-      if (node.type === 'leaf') {
-        api.patch(`/api/panes/${encodeURIComponent(paneId)}`, {
-          name: trimmed,
-        }).then(() => {
-          dispatch(updatePaneTitle({ tabId, paneId, title: trimmed }))
-        }).catch(() => {})
-      }
+    if (!trimmed) {
+      setRenameError(null)
+      setRenamingPaneId(null)
+      setRenameValue('')
+      return
     }
-    // Empty value keeps the original title (no dispatch)
-    setRenamingPaneId(null)
-    setRenameValue('')
+    if (node.type !== 'leaf') return
+    api.patch(`/api/panes/${encodeURIComponent(paneId)}`, {
+      name: trimmed,
+    }).then(() => {
+      dispatch(updatePaneTitle({ tabId, paneId, title: trimmed }))
+      setRenameError(null)
+      setRenamingPaneId(null)
+      setRenameValue('')
+    }).catch((error: any) => {
+      const message = typeof error?.message === 'string' && error.message
+        ? error.message
+        : 'Failed to rename pane'
+      setRenameError(message)
+    })
   }, [dispatch, tabId, renamingPaneId, renameValue, node])
 
   const handleRenameKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -358,7 +374,8 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         isZoomed={zoomedPaneId === node.id}
         isRenaming={isRenaming}
         renameValue={isRenaming ? renameValue : undefined}
-        onRenameChange={isRenaming ? setRenameValue : undefined}
+        renameError={isRenaming ? renameError || undefined : undefined}
+        onRenameChange={isRenaming ? handleRenameChange : undefined}
         onRenameBlur={isRenaming ? commitRename : undefined}
         onRenameKeyDown={isRenaming ? handleRenameKeyDown : undefined}
         onSearch={node.content.kind === 'terminal' ? () => getTerminalActions(node.id)?.openSearch() : undefined}

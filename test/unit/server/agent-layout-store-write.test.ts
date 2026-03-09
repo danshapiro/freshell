@@ -132,3 +132,32 @@ it('preserves user-set pane titles across attach, respawn, and navigate updates'
     expect.objectContaining({ id: 'pane_1', kind: 'terminal', terminalId: 'term_3', title: 'Ops desk' }),
   ])
 })
+
+it('swaps pane titles with pane content so title-based targeting stays aligned', () => {
+  const store = new LayoutStore()
+  store.updateFromUi({
+    tabs: [{ id: 'tab_a', title: 'Alpha' }],
+    activeTabId: 'tab_a',
+    layouts: {
+      tab_a: {
+        type: 'split',
+        id: 'split_1',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          { type: 'leaf', id: 'pane_1', content: { kind: 'terminal', terminalId: 'term_1', mode: 'codex', shell: 'system' } },
+          { type: 'leaf', id: 'pane_2', content: { kind: 'editor', filePath: '/tmp/example.txt', readOnly: false, content: '', viewMode: 'source' } },
+        ],
+      },
+    },
+    activePane: { tab_a: 'pane_1' },
+    paneTitles: { tab_a: { pane_1: 'Codex', pane_2: 'Editor' } },
+    timestamp: Date.now(),
+  } as any, 'conn-1')
+
+  expect(store.swapPane('tab_a', 'pane_1', 'pane_2')).toEqual({ tabId: 'tab_a' })
+  expect(store.listPanes('tab_a')).toEqual([
+    expect.objectContaining({ id: 'pane_1', kind: 'editor', title: 'Editor' }),
+    expect.objectContaining({ id: 'pane_2', kind: 'terminal', terminalId: 'term_1', title: 'Codex' }),
+  ])
+})

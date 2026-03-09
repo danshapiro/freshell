@@ -412,6 +412,51 @@ describe('cli e2e flow', () => {
     }
   })
 
+  it('keeps title-based pane targeting aligned after swap-pane', async () => {
+    const server = await startTestServerWithRealLayoutStore()
+    try {
+      const created = await runCliJson<{ data: { tabId: string; paneId: string } }>(server.url, [
+        'new-tab',
+        '-n',
+        'Workspace',
+        '--codex',
+        '--cwd',
+        process.cwd(),
+      ])
+      const tabId = created.data.tabId
+      const firstPaneId = created.data.paneId
+
+      const split = await runCliJson<{ data: { paneId: string } }>(server.url, [
+        'split-pane',
+        '-t',
+        firstPaneId,
+        '--editor',
+        '/tmp/example.txt',
+      ])
+      const secondPaneId = split.data.paneId
+
+      await runCli(server.url, ['rename-pane', '-t', firstPaneId, '-n', 'Codex'])
+      await runCli(server.url, ['rename-pane', '-t', secondPaneId, '-n', 'Editor'])
+      await runCli(server.url, ['swap-pane', '-t', firstPaneId, '-s', secondPaneId])
+
+      const listed = await runCliJson<{ data: { panes: Array<{ id: string; title?: string }> } }>(server.url, [
+        'list-panes',
+        '--json',
+      ])
+      expect(listed.data.panes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: firstPaneId, title: 'Editor' }),
+        expect.objectContaining({ id: secondPaneId, title: 'Codex' }),
+      ]))
+
+      await runCli(server.url, ['select-pane', '-t', 'Editor'])
+
+      const snapshot = (server.layoutStore as any).snapshot
+      expect(snapshot.activePane[tabId]).toBe(firstPaneId)
+    } finally {
+      await server.close()
+    }
+  })
+
   it('lists pane titles publicly and resolves pane targets by title', async () => {
     const server = await startTestServerWithRealLayoutStore()
     try {

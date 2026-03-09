@@ -27,6 +27,7 @@ interface PaneHeaderProps {
   content: PaneContent
   isRenaming?: boolean
   renameValue?: string
+  renameError?: string
   onRenameChange?: (value: string) => void
   onRenameBlur?: () => void
   onRenameKeyDown?: (e: React.KeyboardEvent) => void
@@ -47,6 +48,7 @@ export default function PaneHeader({
   content,
   isRenaming,
   renameValue,
+  renameError,
   onRenameChange,
   onRenameBlur,
   onRenameKeyDown,
@@ -87,6 +89,7 @@ export default function PaneHeader({
             onKeyDown={onRenameKeyDown}
             onClick={(e) => e.stopPropagation()}
             aria-label="Rename pane"
+            aria-invalid={renameError ? true : undefined}
           />
         ) : (
           <span className="block truncate" title={title}>
