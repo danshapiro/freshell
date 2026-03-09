@@ -37,7 +37,10 @@
   - `--reporter`
   - `--outputFile`
   - `--silent`
-  - color / TTY presentation flags
+  - `--color`
+  - `--no-color`
+  - `--tty`
+  - `--clearScreen`
   - no other forwarded flags may be duplicated across aggregate or mixed adapters unless this plan is updated first
 - Classification is total and binary. Every test entrypoint must end as exactly one of:
   - `delegate upstream`
@@ -84,6 +87,7 @@
   - `vitest --run <file>` is narrow
   - `vitest --run --coverage` is broad
 - Any coverage-bearing run is non-reusable, public or raw. If the classified invocation includes any truthy or implicit coverage-enabling flag form such as `--coverage`, `--coverage true`, `--coverage=true`, `--coverage.enabled`, `--coverage.enabled true`, or `--coverage.enabled=true`, baseline reuse must be disabled even when the run is still gated. False-valued forms such as `--coverage false`, `--coverage=false`, `--coverage.enabled false`, and `--coverage.enabled=false` are not coverage-bearing.
+- False-valued coverage forms also do not broaden an otherwise narrow invocation. `--coverage false`, `--coverage=false`, `--coverage.enabled false`, and `--coverage.enabled=false` must be treated the same as “coverage absent” for broad-vs-narrow classification.
 - Unknown broad suite-shaping flags are never reusable. They may still run as gated broad work, but reuse must be disabled instead of guessed.
 - Unknown raw Vitest subcommands that are not the default command and are not explicitly classified above must `delegate upstream`. The classifier still returns an explicit outcome; it may not leave any raw entrypoint undefined.
 - Unknown flags on explicitly non-test operational modes must `delegate upstream`, not be coerced into gated broad work.
@@ -134,7 +138,7 @@
   - Add `test:status`.
   - Add an exact `postinstall` hook for `patch-package`.
 - `package-lock.json`
-  - Record `patch-package` and the final script surface.
+  - Record `patch-package`, the final script surface, and the lockfile update needed for fresh installs.
 - `docs/skills/testing.md`
   - Update the command table to the actual script surface plus `test:status`.
 - `server/coding-cli/utils.ts`
@@ -201,6 +205,7 @@
   - Bare `vitest --run --coverage=false` is not treated as coverage-bearing.
   - Bare `vitest --run --coverage.enabled false` is not treated as coverage-bearing.
   - Bare `vitest --run --coverage.enabled=false` is not treated as coverage-bearing.
+  - `vitest run path/to/file.test.ts --coverage false`, `--coverage=false`, `--coverage.enabled false`, and `--coverage.enabled=false` stay `delegate upstream`.
   - Raw `vitest run` with no selectors is `gated broad run`.
   - Raw `vitest run test/unit`, `vitest run "test/**/*.test.ts"`, `vitest run --config vitest.server.config.ts test/server`, `vitest run -c vitest.server.config.ts test/server`, `vitest run --root . test/unit`, `vitest run --dir test`, `vitest run --project client --project server`, `vitest run -t name`, and `vitest run --changed` are `gated broad run`.
   - Raw `vitest run --config vitest.server.config.ts test/unit/server/foo.test.ts` and `vitest run -c vitest.server.config.ts test/integration/server/bar.test.ts` are `delegate upstream`.
@@ -445,7 +450,7 @@
 
   Cover:
   - Current-main public commands map to exactly one outcome.
-  - `package.json` matches the frozen script contract exactly for every public test command and for `postinstall`.
+  - `package.json` matches the frozen script contract exactly for every public test command, for `postinstall`, and for `devDependencies.patch-package`.
   - Trailing argv is forwarded: examples include `npm run test:unit -- test/unit/foo.test.ts` and `npm run test:coverage -- --reporter=dot`.
   - Delegated public scripts still classify trailing args through the wrapper:
     - `npm run test:server -- --run --coverage` becomes a gated broad run instead of bypassing the gate
@@ -454,6 +459,7 @@
     - `npm run test -- --reporter=dot` forwards to both split Vitest phases
     - `npm run test -- --outputFile=tmp.json` forwards to both split Vitest phases
     - `npm run test -- --silent` forwards to both split Vitest phases
+    - `npm run test -- --color`, `--no-color`, `--tty`, and `--clearScreen` are allowed and forwarded to both split Vitest phases
     - `npm run test:server:all -- --reporter=dot` forwards to both server Vitest phases
     - `npm run check -- --reporter=dot` forwards only to the nested test phase, not typecheck
     - `npm run verify -- --reporter=dot` forwards only to the nested test phase, not build
@@ -511,6 +517,7 @@
     - split aggregate flows
     - `test:status`
     - `postinstall = patch-package`
+    - `devDependencies.patch-package`
   - top-level adapters that call underlying phases directly from the manifest instead of recursively invoking other gated npm scripts
   - delegated public scripts implemented as wrapper-backed adapters so trailing args are reclassified before handoff
   - adapter argv forwarding so trailing args after `--` are appended to the adapter’s declared upstream command and also participate in classification/reuse decisions when they are suite-shaping
@@ -671,6 +678,7 @@
   - raw `npx vitest --run --coverage.enabled=true` gated but never reusable
   - raw `npx vitest --run --coverage false` and `--coverage.enabled false` not being misclassified as coverage-bearing
   - raw `npx vitest --run --coverage=false` and `--coverage.enabled=false` not being misclassified as coverage-bearing
+  - targeted file-only invocations with false-valued coverage flags staying delegated instead of becoming broad
   - `test` and `test:all` preserving the split `client-all -> server-all`
   - `test:server:all` preserving the split `without-logger -> logger-separation`
   - split aggregates aborting remaining phases on first failure
@@ -757,10 +765,11 @@
 - Coverage-bearing raw runs are non-reusable for all coverage-enabling flag forms, not just literal `--coverage`.
 - False-valued coverage forms such as `--coverage false` and `--coverage.enabled false` are not treated as coverage-bearing.
 - False-valued coverage forms such as `--coverage false`, `--coverage=false`, `--coverage.enabled false`, and `--coverage.enabled=false` are not treated as coverage-bearing.
+- False-valued coverage forms such as `--coverage false`, `--coverage=false`, `--coverage.enabled false`, and `--coverage.enabled=false` also do not broaden otherwise narrow/file-targeted invocations.
 - Rewritten broad npm scripts preserve trailing args after `--` and forward them through classification and upstream execution.
 - Delegated public scripts still pass through wrapper classification, so trailing args cannot turn them into ungated broad runs.
 - Aggregate and mixed adapters reject forwarded suite-shaping flags and positional selectors instead of guessing how to fan them out.
-- Aggregate adapters duplicate only the frozen presentation-flag allowlist: `--reporter`, `--outputFile`, `--silent`, and color / TTY presentation flags.
+- Aggregate adapters duplicate only the frozen presentation-flag allowlist: `--reporter`, `--outputFile`, `--silent`, `--color`, `--no-color`, `--tty`, and `--clearScreen`.
 - Non-test operational raw Vitest modes and flags bypass the gate instead of being coerced into broad test runs.
 - `--config/-c` plus file-only selectors stay delegated so targeted server one-shots do not hit the broad gate.
 - `test`, `test:all`, and `test:server:all` preserve the current split phase contracts from `main`.
