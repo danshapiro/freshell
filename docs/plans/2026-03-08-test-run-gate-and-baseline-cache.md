@@ -33,6 +33,12 @@
 - Public delegated scripts still route through the same wrapper for classification. When they delegate, they must produce no lock/holder/reuse side effects, but they may not bypass classification entirely because trailing args can change mode.
 - Rewritten public npm scripts must preserve trailing-argv behavior. Any args passed after `--` to `npm run <script> -- ...` must be forwarded into classification and then to the eventual upstream command instead of being dropped or misparsed.
 - Aggregate and mixed adapters may not guess at forwarded suite-shaping inputs. For `test`, `test:all`, `test:server:all`, `check`, and `verify`, forwarded positional selectors and forwarded suite-shaping flags after `--` must be rejected with an actionable error instead of being copied into every phase or silently dropped. Only a small allowlist of presentation-only flags may be duplicated across split Vitest phases.
+- The aggregate-adapter allowlist is frozen to presentation-only Vitest flags that do not change selected tests or runtime semantics:
+  - `--reporter`
+  - `--outputFile`
+  - `--silent`
+  - color / TTY presentation flags
+  - no other forwarded flags may be duplicated across aggregate or mixed adapters unless this plan is updated first
 - Classification is total and binary. Every test entrypoint must end as exactly one of:
   - `delegate upstream`
   - `gated broad run`
@@ -91,6 +97,7 @@
   - any classified raw run containing `--coverage` is `never reuse`
   - otherwise reuse is allowed only when classification remains fully known and does not fall into another `never reuse` or delegated case
 - Public adapter invocations also inherit coverage-induced non-reuse. If forwarded trailing args make a normally reusable public adapter coverage-bearing, that invocation becomes `never reuse`.
+- Mixed adapters still reject forwarded suite-shaping flags before reuse policy is considered. In particular, `check -- --coverage...` and `verify -- --coverage...` must fail with an actionable error rather than becoming coverage-bearing reusable/non-reusable variants.
 - Even when a suite is reusable, baseline hits may only short-circuit execution when `--reuse-baseline` is present. Without that explicit opt-in, the runner must execute the suite.
 - `check` may only reuse an exact prior success of the whole `check` workload. Reusing just the nested test phase is forbidden.
 - `verify` must remain gated but non-reusable. Skipping a fresh build would weaken its current contract.
@@ -356,7 +363,9 @@
   - `test:coverage` has `reusePolicy: 'never'`.
   - raw classified runs with any truthy coverage-enabling flag form such as `--coverage`, `--coverage true`, `--coverage=true`, `--coverage.enabled`, `--coverage.enabled true`, and `--coverage.enabled=true` have `reusePolicy: 'never'`.
   - raw classified runs with `--coverage false`, `--coverage=false`, `--coverage.enabled false`, and `--coverage.enabled=false` are not marked `never reuse` just because the flag token appears.
-  - forwarded coverage flags make reusable public adapters such as `test:unit`, `test:client:all`, and `check` become `never reuse` for that invocation.
+  - forwarded truthy coverage flags make reusable public adapters such as `test:unit` and `test:client:all` become `never reuse` for that invocation.
+  - forwarded false-valued coverage flags on reusable public adapters such as `test:unit` and `test:client:all` do not disable reuse just because the flag token appears.
+  - mixed adapters such as `check` reject forwarded coverage flags instead of treating them as reusable/non-reusable variants.
   - Raw broad `suiteKey` includes all classified suite-shaping selectors.
   - Raw broad `suiteKey` excludes non-suite UX flags such as reporter/color/output formatting.
   - Unknown suite-shaping flags force `baselineReusable=false`.
@@ -443,6 +452,8 @@
     - `npm run test:watch -- --run` becomes a gated broad run instead of bypassing the gate
   - Multi-phase trailing argv behavior is explicit:
     - `npm run test -- --reporter=dot` forwards to both split Vitest phases
+    - `npm run test -- --outputFile=tmp.json` forwards to both split Vitest phases
+    - `npm run test -- --silent` forwards to both split Vitest phases
     - `npm run test:server:all -- --reporter=dot` forwards to both server Vitest phases
     - `npm run check -- --reporter=dot` forwards only to the nested test phase, not typecheck
     - `npm run verify -- --reporter=dot` forwards only to the nested test phase, not build
@@ -451,6 +462,7 @@
     - `npm run check -- test/unit/foo.test.ts` is rejected with an actionable error
     - `npm run verify -- test/unit/foo.test.ts` is rejected with an actionable error
     - `npm run test -- --project server`, `npm run test:server:all -- --dir test/server`, `npm run check -- -t name`, and `npm run verify -- --changed` are rejected with an actionable error instead of being fanned out across phases
+    - `npm run check -- --coverage` and `npm run verify -- --coverage` are rejected with an actionable error
   - `test`, `test:all`, `test:client:all`, `test:server:all`, `test:server:without-logger`, `test:unit`, `test:integration`, `test:client`, `check`, `verify`, and `test:coverage` are `gated broad run`.
   - `test:watch`, `test:ui`, `test:server`, and `test:server:logger-separation` delegate upstream by default, but still pass through wrapper classification first.
   - `test` and `test:all` preserve the split `client-all` then `server-all` phase contract.
@@ -503,7 +515,7 @@
   - delegated public scripts implemented as wrapper-backed adapters so trailing args are reclassified before handoff
   - adapter argv forwarding so trailing args after `--` are appended to the adapter’s declared upstream command and also participate in classification/reuse decisions when they are suite-shaping
   - explicit multi-phase forwarding rules:
-    - duplicate only presentation-only flags across each Vitest phase in split aggregates
+    - duplicate only allowlisted presentation-only flags across each Vitest phase in split aggregates
     - reject forwarded suite-shaping flags on aggregate and mixed adapters with a clear error
     - do not forward trailing args into non-Vitest phases like `build` and `typecheck`
     - reject positional selectors on aggregate and mixed adapters with a clear error instead of copying them into every phase
@@ -645,7 +657,9 @@
   - baseline reuse staying off by default unless `--reuse-baseline` is present
   - trailing argv passthrough from rewritten npm scripts
   - delegated public scripts reclassifying trailing args instead of bypassing the wrapper
-  - forwarded coverage flags making reusable public adapters such as `test:unit`, `test:client:all`, and `check` become non-reusable for that invocation
+  - forwarded truthy coverage flags making reusable public adapters such as `test:unit` and `test:client:all` become non-reusable for that invocation
+  - forwarded false-valued coverage flags on reusable public adapters such as `test:unit` and `test:client:all` not disabling reuse
+  - mixed adapters such as `check` and `verify` rejecting forwarded coverage flags with an actionable error
   - `check` whole-workload reuse
   - `verify` gated but never reusable
   - `test:coverage` gated but never reusable
@@ -746,6 +760,7 @@
 - Rewritten broad npm scripts preserve trailing args after `--` and forward them through classification and upstream execution.
 - Delegated public scripts still pass through wrapper classification, so trailing args cannot turn them into ungated broad runs.
 - Aggregate and mixed adapters reject forwarded suite-shaping flags and positional selectors instead of guessing how to fan them out.
+- Aggregate adapters duplicate only the frozen presentation-flag allowlist: `--reporter`, `--outputFile`, `--silent`, and color / TTY presentation flags.
 - Non-test operational raw Vitest modes and flags bypass the gate instead of being coerced into broad test runs.
 - `--config/-c` plus file-only selectors stay delegated so targeted server one-shots do not hit the broad gate.
 - `test`, `test:all`, and `test:server:all` preserve the current split phase contracts from `main`.
