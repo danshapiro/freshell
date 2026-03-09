@@ -183,12 +183,12 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     if (node.type !== 'leaf') return
     api.patch(`/api/panes/${encodeURIComponent(paneId)}`, {
       name: trimmed,
-    }).then((response: { data?: { paneId?: string }; message?: string } | null | undefined) => {
+    }).then((response: { data?: { paneId?: string; tabRenamed?: boolean }; message?: string } | null | undefined) => {
       if (response?.data?.paneId !== paneId) {
         throw new Error(response?.message || 'Failed to rename pane')
       }
       dispatch(updatePaneTitle({ tabId, paneId, title: trimmed }))
-      if (isOnlyPane) {
+      if (response.data.tabRenamed === true) {
         dispatch(updateTab({ id: tabId, updates: { title: trimmed } }))
       }
       setRenameError(null)
@@ -200,7 +200,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         : 'Failed to rename pane'
       setRenameError(message)
     })
-  }, [dispatch, isOnlyPane, tabId, renamingPaneId, renameValue, node])
+  }, [dispatch, tabId, renamingPaneId, renameValue, node])
 
   const handleRenameKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === 'Enter' || e.key === 'Escape') {

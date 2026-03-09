@@ -433,7 +433,7 @@ describe('PaneContainer', () => {
     it('commits local pane and tab title changes only after the pane rename API succeeds for a single-pane tab', async () => {
       mockApiPatch.mockResolvedValueOnce({
         status: 'ok',
-        data: { tabId: 'tab-1', paneId: 'pane-1' },
+        data: { tabId: 'tab-1', paneId: 'pane-1', tabRenamed: true },
         message: 'pane renamed',
       })
 
@@ -467,6 +467,45 @@ describe('PaneContainer', () => {
         expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Ops desk')
       })
       expect(store.getState().tabs.tabs[0].title).toBe('Ops desk')
+    })
+
+    it('updates only the local pane title when the server confirms no tab rename happened', async () => {
+      mockApiPatch.mockResolvedValueOnce({
+        status: 'ok',
+        data: { tabId: 'tab-1', paneId: 'pane-1', tabRenamed: false },
+        message: 'pane renamed',
+      })
+
+      const leafNode: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: createTerminalContent({ terminalId: 'term-1' }),
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': leafNode },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+        renameRequestTabId: 'tab-1',
+        renameRequestPaneId: 'pane-1',
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={leafNode} />,
+        store
+      )
+
+      const renameInput = await screen.findByLabelText('Rename pane')
+      fireEvent.change(renameInput, { target: { value: 'Ops desk' } })
+      fireEvent.blur(renameInput)
+
+      await waitFor(() => {
+        expect(mockApiPatch).toHaveBeenCalledWith('/api/panes/pane-1', { name: 'Ops desk' })
+      })
+      await waitFor(() => {
+        expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Ops desk')
+      })
+      expect(store.getState().tabs.tabs[0].title).toBe('Tab 1')
     })
 
     it('keeps the rename editor open and does not update local titles when the server reports pane not found in a 200 response', async () => {

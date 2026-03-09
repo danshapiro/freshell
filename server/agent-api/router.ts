@@ -611,14 +611,17 @@ export function createAgentApiRouter({
       const paneId = resolved.paneId || req.params.id
       const paneSnapshot = layoutStore.getPaneSnapshot?.(paneId)
       const result = layoutStore.renamePane(paneId, name)
+      let responseData = result
 
       if (result?.tabId) {
         await persistSyncableTerminalRename(paneSnapshot, name)
 
+        let tabRenamed = false
         const tabPanes = layoutStore.listPanes?.(result.tabId) || []
         if (tabPanes.length === 1) {
           const tabRenameResult = layoutStore.renameTab?.(result.tabId, name)
           if (tabRenameResult?.tabId) {
+            tabRenamed = true
             wsHandler?.broadcastUiCommand({
               command: 'tab.rename',
               payload: { id: result.tabId, title: name },
@@ -626,13 +629,15 @@ export function createAgentApiRouter({
           }
         }
 
+        responseData = { ...result, tabRenamed }
+
         wsHandler?.broadcastUiCommand({
           command: 'pane.rename',
           payload: { tabId: result.tabId, paneId: result.paneId || paneId, title: name },
         })
       }
 
-      res.json(ok(result, resolved.message || result?.message || 'pane renamed'))
+      res.json(ok(responseData, resolved.message || result?.message || 'pane renamed'))
     } catch (err: any) {
       res.status(500).json(fail(err?.message || 'Failed to rename pane'))
     }

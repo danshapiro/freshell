@@ -223,6 +223,7 @@ it('syncs the tab title when renaming the only pane in a tab', async () => {
   const res = await request(app).patch('/api/panes/pane_1').send({ name: 'Docs' })
 
   expect(res.status).toBe(200)
+  expect(res.body.data).toMatchObject({ tabId: 'tab_1', paneId: 'pane_1', tabRenamed: true })
   expect(renamePane).toHaveBeenCalledWith('pane_1', 'Docs')
   expect(renameTab).toHaveBeenCalledWith('tab_1', 'Docs')
   expect(broadcastUiCommand).toHaveBeenCalledWith({
@@ -230,6 +231,43 @@ it('syncs the tab title when renaming the only pane in a tab', async () => {
     payload: { tabId: 'tab_1', paneId: 'pane_1', title: 'Docs' },
   })
   expect(broadcastUiCommand).toHaveBeenCalledWith({
+    command: 'tab.rename',
+    payload: { id: 'tab_1', title: 'Docs' },
+  })
+})
+
+it('reports when a pane rename does not also rename the tab', async () => {
+  const app = express()
+  app.use(express.json())
+  const renamePane = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
+  const renameTab = vi.fn()
+  const broadcastUiCommand = vi.fn()
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      renamePane,
+      renameTab,
+      listPanes: () => [{ id: 'pane_1' }, { id: 'pane_2' }],
+      getPaneSnapshot: () => ({
+        tabId: 'tab_1',
+        paneId: 'pane_1',
+        paneContent: { kind: 'terminal', mode: 'shell', terminalId: 'term_1' },
+      }),
+    } as any,
+    registry: {} as any,
+    wsHandler: { broadcastUiCommand },
+  }))
+
+  const res = await request(app).patch('/api/panes/pane_1').send({ name: 'Docs' })
+
+  expect(res.status).toBe(200)
+  expect(res.body.data).toMatchObject({ tabId: 'tab_1', paneId: 'pane_1', tabRenamed: false })
+  expect(renamePane).toHaveBeenCalledWith('pane_1', 'Docs')
+  expect(renameTab).not.toHaveBeenCalled()
+  expect(broadcastUiCommand).toHaveBeenCalledWith({
+    command: 'pane.rename',
+    payload: { tabId: 'tab_1', paneId: 'pane_1', title: 'Docs' },
+  })
+  expect(broadcastUiCommand).not.toHaveBeenCalledWith({
     command: 'tab.rename',
     payload: { id: 'tab_1', title: 'Docs' },
   })
