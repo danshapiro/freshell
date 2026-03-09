@@ -21,11 +21,13 @@ The right fix is a direct cutover:
 3. Serve visible windows from server-owned read models.
 4. Make realtime traffic small, prioritized, and bounded.
 
-This revision replaces the earlier draft rather than lightly editing it. The earlier draft had the right architectural direction, but it was not excellent yet for three reasons:
+This revision replaces the earlier draft rather than lightly editing it. The earlier draft had the right architectural direction, but it was not excellent yet for five reasons:
 
 1. The tasks were still too coarse for disciplined red-green-refactor execution.
 2. It treated all ordering/filtering as server-owned, even when some ordering depends on client-only state such as open tabs and local activity pinning.
 3. It did not explicitly simplify websocket ownership on the client, so the startup race that currently forces reconciliation logic could survive the transport rewrite under a different name.
+4. It did not explicitly account for several existing test surfaces that encode the old transport contract, especially `test/unit/client/ws-client-sdk.test.ts`, `test/e2e/auth-required-bootstrap-flow.test.tsx`, `test/unit/server/ws-chunking.test.ts`, and `test/server/ws-sessions-patch.test.ts`.
+5. It reused legacy "session search" naming for the new server-owned directory read model, which makes it too easy for the execution agent to preserve the wrong API shape or keep duplicate endpoints alive.
 
 The direct end state is still correct. What changes here is the execution shape and a sharper boundary:
 
@@ -61,6 +63,10 @@ The direct end state is still correct. What changes here is the execution shape 
 6. **There is dead or overlapping surface area that should not survive the cutover.**
    - `server/routes/sessions.ts` duplicates logic already owned by `server/sessions-router.ts`.
    - `server/ws-chunking.ts`, `server/session-pagination.ts`, `sessions.updated`, `sessions.page`, and `sessions.patch` are compatibility scaffolding for the old transport model.
+
+7. **The current test suite already hardcodes the old behavior in more places than the earlier draft acknowledged.**
+   - `test/unit/client/ws-client-sdk.test.ts`, `test/unit/client/components/App.test.tsx`, `test/unit/client/store/sessionsSlice.test.ts`, `test/unit/server/ws-chunking.test.ts`, `test/server/ws-sessions-patch.test.ts`, and `test/e2e/auth-required-bootstrap-flow.test.tsx` will all need direct rewrites or deletion as part of the cutover.
+   - Leaving those suites outside the plan would create predictable red bars late in execution and invite accidental compatibility shims.
 
 ## End-State Architecture
 
@@ -142,12 +148,17 @@ Every task below follows red-green-refactor and adds coverage at the seam being 
    - sessions state is visible-window oriented, not snapshot oriented
    - agent chat no longer depends on `sdk.history`
    - terminal search no longer depends on `SearchAddon`
+   - `ws-client` SDK handling no longer depends on replay-history messages
 6. Slow-network e2e tests proving:
    - the app becomes interactive before offscreen work completes
    - terminal reconnect shows the current screen without replaying the entire backlog
    - agent chat reload shows recent turns before older bodies
    - background fetches do not delay terminal input or visible updates
-7. Final verification:
+   - token-protected bootstrap still gates first paint correctly
+7. Legacy cleanup tests proving:
+   - no test or runtime path still imports `server/ws-chunking.ts`
+   - no route test still exercises `/api/sessions/search` as the sidebar/history source of truth
+8. Final verification:
 
 ```bash
 npm run lint
@@ -795,7 +806,8 @@ git commit -m "feat(server): add session-directory query service"
 ### Task 15: Write Failing Session Directory Route And Invalidation Tests
 
 **Files:**
-- Modify: `test/integration/server/session-search-api.test.ts`
+- Create: `test/integration/server/session-directory-router.test.ts`
+- Delete: `test/integration/server/session-search-api.test.ts`
 - Create: `test/server/ws-sessions-changed.test.ts`
 
 **Step 1: Write the failing tests**
@@ -805,10 +817,12 @@ Cover:
 - `priority=visible|background` is validated
 - session index updates emit `sessions.changed` with a revision, not bulk data
 
+Start by moving the existing search-route test intent into the new file so the suite names the new architecture correctly.
+
 **Step 2: Run the tests to verify failure**
 
 ```bash
-npm run test:server -- test/integration/server/session-search-api.test.ts test/server/ws-sessions-changed.test.ts
+npm run test:server -- test/integration/server/session-directory-router.test.ts test/server/ws-sessions-changed.test.ts
 ```
 
 Expected: FAIL because the new route and invalidation path do not exist.
@@ -820,7 +834,7 @@ Assert no session project payload is broadcast during invalidation.
 **Step 4: Run the tests again**
 
 ```bash
-npm run test:server -- test/integration/server/session-search-api.test.ts test/server/ws-sessions-changed.test.ts
+npm run test:server -- test/integration/server/session-directory-router.test.ts test/server/ws-sessions-changed.test.ts
 ```
 
 Expected: still FAIL.
@@ -828,7 +842,8 @@ Expected: still FAIL.
 **Step 5: Commit**
 
 ```bash
-git add test/integration/server/session-search-api.test.ts test/server/ws-sessions-changed.test.ts
+git add test/integration/server/session-directory-router.test.ts test/server/ws-sessions-changed.test.ts
+git rm test/integration/server/session-search-api.test.ts
 git commit -m "test(api): define session-directory routing and revision invalidation"
 ```
 
@@ -857,15 +872,19 @@ Run visible work through the read-model scheduler and abort via request signal.
 
 Keep route ownership simple; do not introduce a second sessions router.
 
-**Step 4: Run the tests to verify pass**
+**Step 4: Stop treating `/api/sessions/search` as a first-class browsing route**
+
+Once the session-directory route is wired and covered, remove or dead-end the old sidebar/history search path instead of keeping two server-owned query surfaces with overlapping semantics.
+
+**Step 5: Run the tests to verify pass**
 
 ```bash
-npm run test:server -- test/integration/server/session-search-api.test.ts test/server/ws-sessions-changed.test.ts
+npm run test:server -- test/integration/server/session-directory-router.test.ts test/server/ws-sessions-changed.test.ts
 ```
 
 Expected: PASS.
 
-**Step 5: Commit**
+**Step 6: Commit**
 
 ```bash
 git add server/sessions-router.ts server/sessions-sync/service.ts server/index.ts
@@ -1230,6 +1249,7 @@ git commit -m "feat(agent-chat): serve timelines and snapshot-based attach"
 - Modify: `test/unit/client/agentChatSlice.test.ts`
 - Modify: `test/unit/client/lib/sdk-message-handler.session-lost.test.ts`
 - Modify: `test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx`
+- Modify: `test/unit/client/ws-client-sdk.test.ts`
 
 **Step 1: Write the failing tests**
 
@@ -1238,11 +1258,12 @@ Cover:
 - `sdk.session.snapshot` seeds metadata without `sdk.history`
 - switching sessions aborts stale timeline fetches
 - session loss still triggers immediate recovery handling
+- `ws-client` dispatches snapshot/live events without replay-history fallback
 
 **Step 2: Run the tests to verify failure**
 
 ```bash
-NODE_ENV=test npx vitest run test/unit/client/agentChatSlice.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
+NODE_ENV=test npx vitest run test/unit/client/agentChatSlice.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/ws-client-sdk.test.ts
 ```
 
 Expected: FAIL because the client still expects replay arrays.
@@ -1254,7 +1275,7 @@ Collapsed turns must fetch bodies only when opened.
 **Step 4: Run the tests again**
 
 ```bash
-NODE_ENV=test npx vitest run test/unit/client/agentChatSlice.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
+NODE_ENV=test npx vitest run test/unit/client/agentChatSlice.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/ws-client-sdk.test.ts
 ```
 
 Expected: still FAIL.
@@ -1262,7 +1283,7 @@ Expected: still FAIL.
 **Step 5: Commit**
 
 ```bash
-git add test/unit/client/agentChatSlice.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx
+git add test/unit/client/agentChatSlice.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/ws-client-sdk.test.ts
 git commit -m "test(agent-chat): define visible-first timeline client state"
 ```
 
@@ -1583,6 +1604,9 @@ git commit -m "refactor(terminal): paint viewport before replay and search serve
 - Modify: `test/server/ws-handshake-snapshot.test.ts`
 - Modify: `test/server/ws-edge-cases.test.ts`
 - Modify: `test/unit/server/sessions-sync/service.test.ts`
+- Modify: `test/unit/server/ws-chunking.test.ts`
+- Modify: `test/server/ws-sessions-patch.test.ts`
+- Modify: `test/unit/server/sessions-router-pagination.test.ts`
 
 **Step 1: Write the failing tests**
 
@@ -1590,11 +1614,12 @@ Cover:
 - no v4 path emits `sessions.updated`, `sessions.page`, `sessions.patch`, `sessions.fetch`, or `sdk.history`
 - session sync emits revisions only
 - websocket chunking code is no longer used
+- no route test treats `/api/sessions/search` as the authoritative sidebar/history contract
 
 **Step 2: Run the tests to verify failure**
 
 ```bash
-npm run test:server -- test/server/ws-handshake-snapshot.test.ts test/server/ws-edge-cases.test.ts test/unit/server/sessions-sync/service.test.ts
+npm run test:server -- test/server/ws-handshake-snapshot.test.ts test/server/ws-edge-cases.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/ws-chunking.test.ts test/server/ws-sessions-patch.test.ts test/unit/server/sessions-router-pagination.test.ts
 ```
 
 Expected: FAIL because the legacy paths still exist.
@@ -1606,7 +1631,7 @@ Make the tests fail if old chunking helpers or snapshot broadcasts are reintrodu
 **Step 4: Run the tests again**
 
 ```bash
-npm run test:server -- test/server/ws-handshake-snapshot.test.ts test/server/ws-edge-cases.test.ts test/unit/server/sessions-sync/service.test.ts
+npm run test:server -- test/server/ws-handshake-snapshot.test.ts test/server/ws-edge-cases.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/ws-chunking.test.ts test/server/ws-sessions-patch.test.ts test/unit/server/sessions-router-pagination.test.ts
 ```
 
 Expected: still FAIL.
@@ -1614,7 +1639,7 @@ Expected: still FAIL.
 **Step 5: Commit**
 
 ```bash
-git add test/server/ws-handshake-snapshot.test.ts test/server/ws-edge-cases.test.ts test/unit/server/sessions-sync/service.test.ts
+git add test/server/ws-handshake-snapshot.test.ts test/server/ws-edge-cases.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/ws-chunking.test.ts test/server/ws-sessions-patch.test.ts test/unit/server/sessions-router-pagination.test.ts
 git commit -m "test(transport): forbid legacy bulk websocket flows"
 ```
 
@@ -1640,7 +1665,7 @@ Remove:
 
 **Step 2: Remove dead code and imports**
 
-Delete `server/ws-chunking.ts` and the duplicate unused `server/routes/sessions.ts` module. Reduce `server/session-pagination.ts` to only what still supports HTTP read-model cursoring, or delete the dead parts if nothing remains.
+Delete `server/ws-chunking.ts` and the duplicate unused `server/routes/sessions.ts` module. Remove `/api/sessions/search` if no runtime callers remain. Reduce `server/session-pagination.ts` to only what still supports HTTP read-model cursoring, or delete the dead parts if nothing remains.
 
 **Step 3: Simplify client startup and message handling**
 
@@ -1649,7 +1674,7 @@ Delete `server/ws-chunking.ts` and the duplicate unused `server/routes/sessions.
 **Step 4: Run the tests to verify pass**
 
 ```bash
-npm run test:server -- test/server/ws-handshake-snapshot.test.ts test/server/ws-edge-cases.test.ts test/unit/server/sessions-sync/service.test.ts
+npm run test:server -- test/server/ws-handshake-snapshot.test.ts test/server/ws-edge-cases.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/ws-chunking.test.ts test/server/ws-sessions-patch.test.ts test/unit/server/sessions-router-pagination.test.ts
 ```
 
 Expected: PASS.
@@ -1671,6 +1696,7 @@ git commit -m "refactor(transport): delete legacy bulk websocket architecture"
 - Modify: `test/e2e/agent-chat-polish-flow.test.tsx`
 - Modify: `test/e2e/terminal-search-flow.test.tsx`
 - Modify: `test/e2e/sidebar-click-opens-pane.test.tsx`
+- Modify: `test/e2e/auth-required-bootstrap-flow.test.tsx`
 - Modify: `test/unit/server/perf-logger.test.ts`
 - Modify: `test/unit/client/lib/perf-logger.test.ts`
 
@@ -1682,11 +1708,12 @@ Cover:
 - terminal restore shows current screen without replaying the full backlog
 - agent chat shows recent turns before older bodies
 - background work does not delay terminal input
+- auth-required startup still renders the login path before any protected bootstrap payload is consumed
 
 **Step 2: Run the tests to verify failure**
 
 ```bash
-NODE_ENV=test npx vitest run test/e2e/slow-network-end-to-end.test.tsx test/e2e/agent-chat-polish-flow.test.tsx test/e2e/terminal-search-flow.test.tsx test/e2e/sidebar-click-opens-pane.test.tsx test/unit/server/perf-logger.test.ts test/unit/client/lib/perf-logger.test.ts
+NODE_ENV=test npx vitest run test/e2e/slow-network-end-to-end.test.tsx test/e2e/agent-chat-polish-flow.test.tsx test/e2e/terminal-search-flow.test.tsx test/e2e/sidebar-click-opens-pane.test.tsx test/e2e/auth-required-bootstrap-flow.test.tsx test/unit/server/perf-logger.test.ts test/unit/client/lib/perf-logger.test.ts
 ```
 
 Expected: FAIL until instrumentation and the full cutover are in place.
@@ -1698,7 +1725,7 @@ Do not settle for generic "faster" checks.
 **Step 4: Run the tests again**
 
 ```bash
-NODE_ENV=test npx vitest run test/e2e/slow-network-end-to-end.test.tsx test/e2e/agent-chat-polish-flow.test.tsx test/e2e/terminal-search-flow.test.tsx test/e2e/sidebar-click-opens-pane.test.tsx test/unit/server/perf-logger.test.ts test/unit/client/lib/perf-logger.test.ts
+NODE_ENV=test npx vitest run test/e2e/slow-network-end-to-end.test.tsx test/e2e/agent-chat-polish-flow.test.tsx test/e2e/terminal-search-flow.test.tsx test/e2e/sidebar-click-opens-pane.test.tsx test/e2e/auth-required-bootstrap-flow.test.tsx test/unit/server/perf-logger.test.ts test/unit/client/lib/perf-logger.test.ts
 ```
 
 Expected: still FAIL.
@@ -1706,7 +1733,7 @@ Expected: still FAIL.
 **Step 5: Commit**
 
 ```bash
-git add test/e2e/slow-network-end-to-end.test.tsx test/e2e/agent-chat-polish-flow.test.tsx test/e2e/terminal-search-flow.test.tsx test/e2e/sidebar-click-opens-pane.test.tsx test/unit/server/perf-logger.test.ts test/unit/client/lib/perf-logger.test.ts
+git add test/e2e/slow-network-end-to-end.test.tsx test/e2e/agent-chat-polish-flow.test.tsx test/e2e/terminal-search-flow.test.tsx test/e2e/sidebar-click-opens-pane.test.tsx test/e2e/auth-required-bootstrap-flow.test.tsx test/unit/server/perf-logger.test.ts test/unit/client/lib/perf-logger.test.ts
 git commit -m "test(perf): define slow-network architecture regressions"
 ```
 
@@ -1760,3 +1787,4 @@ git commit -m "test(perf): lock in slow-network visible-first architecture"
 3. Prefer refetching the visible server window over maintaining clever client reconciliation logic.
 4. Treat `version`, network diagnostics, and any other non-visible startup work as background unless a failing test proves they are required for first paint.
 5. If a file becomes dead, delete it instead of leaving the old architecture in place beside the new one.
+6. Rename or replace legacy-named tests when the name encodes the old architecture. Keeping a `session-search` test file around for the new directory contract is a maintenance bug, not a convenience.
