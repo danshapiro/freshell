@@ -22,10 +22,11 @@
 
 ## Acceptance Mapping
 
-- `rename-tab` remains the tab rename orchestration operation, but the CLI grammar is extended so `rename-tab NEW_NAME` renames the active tab and `rename-tab TARGET NEW_NAME` or `rename-tab -t TARGET -n NEW_NAME` renames a specific tab.
+- `rename-tab` remains the tab rename orchestration operation, but the CLI grammar is extended so `rename-tab NEW_NAME` renames the active tab, `rename-tab TARGET NEW_NAME` renames a specific tab, and flagged forms still work when the caller needs to disambiguate target or name.
 - Add `rename-pane` as a first-class pane rename orchestration operation, with active-pane and explicit-target forms.
 - The server agent API gains a pane rename endpoint and a `LayoutStore.renamePane()` primitive so CLI, agents, and future automation all share the same authoritative write path.
 - Connected UIs converge immediately because the server broadcasts `tab.rename` and `pane.rename` `ui.command` events after successful mutations.
+- The CLI test suite proves both active-target rename and explicit identifier rename, including a non-active tab target so the “specific tab or pane identifier” requirement is verified rather than inferred.
 - The Freshell orchestration skill documents both rename verbs and includes a concrete new-tab/split-pane/rename flow that assigns meaningful tab and pane names without any manual UI interaction.
 
 ### Task 1: Lock Down Rename Contracts on the Server
@@ -298,6 +299,9 @@ case 'pane.rename':
   }))
 ```
 
+Important detail:
+- Do **not** pass `setByUser: false` here. A rename coming from orchestration is an intentional title override and should be treated the same as an in-app manual rename so later automatic terminal-title updates do not clobber it.
+
 **Step 4: Re-run the client test**
 
 Run:
@@ -316,7 +320,7 @@ git add test/unit/client/ui-commands.test.ts src/lib/ui-commands.ts
 git commit -m "feat(client): apply pane rename ui commands"
 ```
 
-### Task 3: Extend the CLI Rename Surface to Support Active Targets and Pane Rename
+### Task 3: Extend the CLI Rename Surface to Support Active Targets, Explicit Targets, and Pane Rename
 
 **Files:**
 - Modify: `test/e2e/agent-cli-flow.test.ts`
@@ -363,13 +367,37 @@ async function runCliJson<T>(url: string, args: string[]) {
 }
 ```
 
-Then add one acceptance-level flow and one focused active-pane test:
+Then add three focused rename tests:
 
 ```ts
+it('renames a non-active tab when a target id is provided', async () => {
+  const server = await startTestServerWithRealLayoutStore()
+  try {
+    const first = await runCliJson<{ data: { tabId: string } }>(server.url, ['new-tab', '-n', 'Backlog'])
+    const second = await runCliJson<{ data: { tabId: string } }>(server.url, ['new-tab', '-n', 'Active'])
+
+    await runCli(server.url, ['rename-tab', first.data.tabId, 'Release board'])
+
+    const snapshot = (server.layoutStore as any).snapshot
+    expect(snapshot.activeTabId).toBe(second.data.tabId)
+    expect(snapshot.tabs.find((tab: any) => tab.id === first.data.tabId)?.title).toBe('Release board')
+    expect(snapshot.tabs.find((tab: any) => tab.id === second.data.tabId)?.title).toBe('Active')
+  } finally {
+    await server.close()
+  }
+})
+
 it('renames the active tab and explicit panes in a create split rename flow', async () => {
   const server = await startTestServerWithRealLayoutStore()
   try {
-    const created = await runCliJson<{ data: { tabId: string; paneId: string } }>(server.url, ['new-tab', '-n', 'Workspace'])
+    const created = await runCliJson<{ data: { tabId: string; paneId: string } }>(server.url, [
+      'new-tab',
+      '-n',
+      'Workspace',
+      '--codex',
+      '--cwd',
+      process.cwd(),
+    ])
     const tabId = created.data.tabId
     const firstPaneId = created.data.paneId
 
@@ -383,12 +411,12 @@ it('renames the active tab and explicit panes in a create split rename flow', as
     const secondPaneId = split.data.paneId
 
     await runCli(server.url, ['rename-tab', 'Release prep'])
-    await runCli(server.url, ['rename-pane', '-t', firstPaneId, '-n', 'Shell'])
+    await runCli(server.url, ['rename-pane', '-t', firstPaneId, '-n', 'Codex'])
     await runCli(server.url, ['rename-pane', secondPaneId, 'Editor'])
 
     const snapshot = (server.layoutStore as any).snapshot
     expect(snapshot.tabs.find((tab: any) => tab.id === tabId)?.title).toBe('Release prep')
-    expect(snapshot.paneTitles[tabId][firstPaneId]).toBe('Shell')
+    expect(snapshot.paneTitles[tabId][firstPaneId]).toBe('Codex')
     expect(snapshot.paneTitles[tabId][secondPaneId]).toBe('Editor')
   } finally {
     await server.close()
@@ -398,7 +426,13 @@ it('renames the active tab and explicit panes in a create split rename flow', as
 it('renames the active pane when only a new name is provided', async () => {
   const server = await startTestServerWithRealLayoutStore()
   try {
-    const created = await runCliJson<{ data: { tabId: string; paneId: string } }>(server.url, ['new-tab', '-n', 'Workspace'])
+    const created = await runCliJson<{ data: { tabId: string; paneId: string } }>(server.url, [
+      'new-tab',
+      '-n',
+      'Workspace',
+      '--shell',
+      'system',
+    ])
 
     await runCli(server.url, ['rename-pane', 'Main shell'])
 
@@ -421,6 +455,7 @@ npm test -- test/e2e/agent-cli-flow.test.ts
 Expected:
 - FAIL because `rename-pane` is not implemented
 - FAIL because `rename-tab NAME` currently treats the lone positional argument as a target instead of the new name for the active tab
+- FAIL because there is no code path that preserves an explicit `-t/--target` when the new name is supplied positionally
 
 **Step 3: Implement shared rename parsing and the new `rename-pane` verb**
 
@@ -433,8 +468,15 @@ function resolveRenameArgs(flags: Flags, args: string[]) {
 
   if (typeof explicitName === 'string') {
     return {
-      target: typeof explicitTarget === 'string' ? explicitTarget : undefined,
+      target: typeof explicitTarget === 'string' ? explicitTarget : args[0],
       name: explicitName.trim(),
+    }
+  }
+
+  if (typeof explicitTarget === 'string') {
+    return {
+      target: explicitTarget,
+      name: (args[0] || '').trim(),
     }
   }
 
@@ -507,8 +549,14 @@ case 'rename-pane': {
 ```
 
 Important details:
-- Preserve existing `-t/-n` behavior exactly; those forms remain the escape hatch for ambiguous targets or names with spaces.
+- Preserve all of these forms for both tab and pane rename:
+  - `rename-<kind> NEW_NAME`
+  - `rename-<kind> TARGET NEW_NAME`
+  - `rename-<kind> -t TARGET -n NEW_NAME`
+  - `rename-<kind> -t TARGET NEW_NAME`
+  - `rename-<kind> TARGET -n NEW_NAME`
 - One positional argument means “rename the active target”.
+- A target flag wins over positional target inference; a name flag wins over positional name inference.
 - Two positional arguments mean “rename the explicit target to the provided name”.
 - Trim the final name before validating so whitespace-only input fails locally before the HTTP request is sent.
 
@@ -527,7 +575,7 @@ Expected:
 
 ```bash
 git add test/e2e/agent-cli-flow.test.ts server/cli/index.ts
-git commit -m "feat(cli): add rename-pane and active rename targets"
+git commit -m "feat(cli): add rename-pane and explicit rename targets"
 ```
 
 ### Task 4: Update the Orchestration Skill to Expose the New Surface
@@ -648,4 +696,5 @@ Expected:
 - Keep this cycle tight. Do not expand the read surface with new pane-title listing tokens or unrelated rename unification work unless implementation proves that unavoidable.
 - Reuse existing reducers (`updateTab`, `updatePaneTitle`) instead of inventing parallel client state. This issue is about adding the missing server write path and exposing it through orchestration, not building a second rename system.
 - Preserve the existing tmux-style target resolution rules in `resolveTarget()`. This issue only needs rename verbs to consume those rules.
+- Be strict about rename-argument precedence in the CLI helper. This is the main place a superficially working implementation can still violate the acceptance criteria by renaming the wrong target.
 - The CLI e2e file already has mock-based smoke coverage; the new tests should sit beside that, not replace it, because both levels are useful.
