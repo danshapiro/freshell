@@ -36,6 +36,7 @@
   - `gated broad run`
 - `delegate upstream` means no lock, no holder metadata, no baseline reuse, and no status side effects.
 - `gated broad run` means the process goes through `BroadOneShotTestRun`, attempts the repo-wide `flock`, writes holder metadata only after the lock is acquired, and may consult reusable baselines only if the suite is fully classified and the adapter policy allows reuse.
+- Baseline reuse is opt-in only. Allowed suites must still execute normally unless the caller explicitly requests reuse via `--reuse-baseline`.
 - `flock` is the only liveness truth. No pid table, lockfile contents, or holder file may be treated as proof that a run is live.
 - Holder metadata is advisory only. Missing, corrupt, stale, partial, or unreadable holder data must never block progress and must never override the lock probe.
 - Status is a small explicit state machine driven by lock first, metadata second:
@@ -73,7 +74,7 @@
   - `vitest --run` with no selectors is broad
   - `vitest --run <file>` is narrow
   - `vitest --run --coverage` is broad
-- Any coverage-bearing run is non-reusable, public or raw. If the classified invocation includes any coverage-enabling flag form such as `--coverage`, `--coverage=true`, `--coverage.enabled`, or `--coverage.enabled=true`, baseline reuse must be disabled even when the run is still gated.
+- Any coverage-bearing run is non-reusable, public or raw. If the classified invocation includes any coverage-enabling flag form such as `--coverage`, `--coverage true`, `--coverage=true`, `--coverage.enabled`, `--coverage.enabled true`, or `--coverage.enabled=true`, baseline reuse must be disabled even when the run is still gated.
 - Unknown broad suite-shaping flags are never reusable. They may still run as gated broad work, but reuse must be disabled instead of guessed.
 - Unknown raw Vitest subcommands that are not the default command and are not explicitly classified above must `delegate upstream`. The classifier still returns an explicit outcome; it may not leave any raw entrypoint undefined.
 - Unknown flags on explicitly non-test operational modes must `delegate upstream`, not be coerced into gated broad work.
@@ -86,6 +87,7 @@
 - Raw classified runs also have a frozen reuse policy:
   - any classified raw run containing `--coverage` is `never reuse`
   - otherwise reuse is allowed only when classification remains fully known and does not fall into another `never reuse` or delegated case
+- Even when a suite is reusable, baseline hits may only short-circuit execution when `--reuse-baseline` is present. Without that explicit opt-in, the runner must execute the suite.
 - `check` may only reuse an exact prior success of the whole `check` workload. Reusing just the nested test phase is forbidden.
 - `verify` must remain gated but non-reusable. Skipping a fresh build would weaken its current contract.
 - `test:coverage` must remain gated but non-reusable. Skipping a fresh run would skip coverage artifact generation.
@@ -137,6 +139,8 @@
   - Exact broad-vs-narrow rules, raw Vitest default-mode resolution, operational-mode delegation, and raw argv normalization.
 - `scripts/testing/test-run-gate-state.ts`
   - Lock path resolution, test-only common-dir override seam, `flock` helpers, holder state machine, atomic holder read/write/delete, and status/contended output formatting.
+- `scripts/testing/broad-one-shot-test-run.ts`
+  - Minimal runnable CLI introduced early for Task 2 integration coverage, then expanded in Task 4 into the full adapter surface.
 - `scripts/testing/test-run-baselines.ts`
   - `suiteKey` generation, results store, exact reuse lookup, newest-record-wins logic, and per-adapter reuse policy checks.
 - `scripts/testing/test-run-adapters.ts`
@@ -250,6 +254,7 @@
 **Files:**
 
 - Create: `scripts/testing/test-run-gate-state.ts`
+- Create: `scripts/testing/broad-one-shot-test-run.ts`
 - Create: `test/fixtures/test-run-gate/fake-upstream.ts`
 - Create: `test/fixtures/test-run-gate/temp-gate-env.ts`
 - Create: `test/unit/server/test-run-gate-state.test.ts`
@@ -273,7 +278,7 @@
 
   Simulate:
   - Process A acquires the gate and sleeps inside a disposable temp gate directory.
-  - Process B calls `test:status` and receives `running-described`.
+  - Process B calls the minimal `BroadOneShotTestRun --status` path and receives `running-described`.
   - Process C attempts another broad run, exits `75`, and does not create a second holder.
   - Process C with `--force-run` still exits `75`.
   - After Process A exits without explicit cleanup, a fresh status probe returns `idle` even if the old holder file still exists.
@@ -282,6 +287,10 @@
 - [ ] **Step 3: Implement the gate state module**
 
   Implement:
+  - a minimal `broad-one-shot-test-run.ts` CLI sufficient for Task 2 only:
+    - `--status`
+    - a fixture-backed broad-run execution path that acquires the lock, writes/removes holder metadata, and returns contention `75`
+    - `--force-run` parsing with reuse-disabled semantics only
   - `buildGatePaths(commonDir)` returning:
     - lock file
     - holder file
@@ -313,6 +322,7 @@
   ```bash
   git -C /home/user/code/freshell/.worktrees/test-run-gate add \
     scripts/testing/test-run-gate-state.ts \
+    scripts/testing/broad-one-shot-test-run.ts \
     test/fixtures/test-run-gate/fake-upstream.ts \
     test/fixtures/test-run-gate/temp-gate-env.ts \
     test/unit/server/test-run-gate-state.test.ts \
@@ -336,7 +346,7 @@
   - `check` has its own whole-workload `suiteKey`.
   - `verify` has its own whole-workload `suiteKey` but `reusePolicy: 'never'`.
   - `test:coverage` has `reusePolicy: 'never'`.
-  - raw classified runs with any coverage-enabling flag form such as `--coverage`, `--coverage=true`, `--coverage.enabled`, and `--coverage.enabled=true` have `reusePolicy: 'never'`.
+  - raw classified runs with any coverage-enabling flag form such as `--coverage`, `--coverage true`, `--coverage=true`, `--coverage.enabled`, `--coverage.enabled true`, and `--coverage.enabled=true` have `reusePolicy: 'never'`.
   - Raw broad `suiteKey` includes all classified suite-shaping selectors.
   - Raw broad `suiteKey` excludes non-suite UX flags such as reporter/color/output formatting.
   - Unknown suite-shaping flags force `baselineReusable=false`.
@@ -377,6 +387,7 @@
     - `never`
     - `disabled-by-classification`
   - raw classified-run `reusePolicy` checks that force `never` for any coverage-bearing invocation
+  - explicit opt-in gating for reuse so baseline matches do not short-circuit execution unless `--reuse-baseline` is present
   - raw Vitest `suiteKey` normalization from the full classified broad arg model
 
 - [ ] **Step 4: Re-run the baseline tests and verify pass**
@@ -417,6 +428,11 @@
   - Current-main public commands map to exactly one outcome.
   - `package.json` matches the frozen script contract exactly for every public test command and for `postinstall`.
   - Trailing argv is forwarded: examples include `npm run test:unit -- test/unit/foo.test.ts` and `npm run test:coverage -- --reporter=dot`.
+  - Multi-phase trailing argv behavior is explicit:
+    - `npm run test -- --reporter=dot` forwards to both split Vitest phases
+    - `npm run test:server:all -- --reporter=dot` forwards to both server Vitest phases
+    - `npm run check -- --reporter=dot` forwards only to the nested test phase, not typecheck
+    - `npm run verify -- --reporter=dot` forwards only to the nested test phase, not build
   - `test`, `test:all`, `test:client:all`, `test:server:all`, `test:server:without-logger`, `test:unit`, `test:integration`, `test:client`, `check`, `verify`, and `test:coverage` are `gated broad run`.
   - `test:watch`, `test:ui`, `test:server`, and `test:server:logger-separation` are `delegate upstream`.
   - `test` and `test:all` preserve the split `client-all` then `server-all` phase contract.
@@ -465,6 +481,9 @@
     - `postinstall = patch-package`
   - top-level adapters that call underlying phases directly from the manifest instead of recursively invoking other gated npm scripts
   - adapter argv forwarding so trailing args after `--` are appended to the adapter’s declared upstream command and also participate in classification/reuse decisions when they are suite-shaping
+  - explicit multi-phase forwarding rules:
+    - duplicate forwarded args across each Vitest phase in split aggregates
+    - do not forward trailing args into non-Vitest phases like `build` and `typecheck`
   - `test` and `test:all` sharing the same `suiteKey` because they run the same phase list
   - `test:server` staying upstream-delegated and watch-biased by design
   - `test:server:all` as the canonical broad one-shot server suite
@@ -519,11 +538,15 @@
   - `npx vitest --run` enters the same `BroadOneShotTestRun` path as raw `vitest run`.
   - `npx vitest --run path/to/file.test.ts` delegates upstream with no gate side effects.
   - `npx vitest --run --coverage` becomes a gated broad run.
+  - `npx vitest --run --coverage true` becomes a gated broad run.
   - `npx vitest --run --coverage.enabled` becomes a gated broad run.
+  - `npx vitest --run --coverage.enabled true` becomes a gated broad run.
   - `npx vitest --run --coverage=true` becomes a gated broad run.
   - `npx vitest --run --coverage.enabled=true` becomes a gated broad run.
   - `npx vitest --run --coverage --reuse-baseline` does not early-exit from a cached success and still executes fresh upstream work.
+  - `npx vitest --run --coverage true --reuse-baseline` does not early-exit from a cached success and still executes fresh upstream work.
   - `npx vitest --run --coverage.enabled --reuse-baseline` does not early-exit from a cached success and still executes fresh upstream work.
+  - `npx vitest --run --coverage.enabled true --reuse-baseline` does not early-exit from a cached success and still executes fresh upstream work.
   - `npx vitest --run --coverage=true --reuse-baseline` does not early-exit from a cached success and still executes fresh upstream work.
   - `npx vitest --run --coverage.enabled=true --reuse-baseline` does not early-exit from a cached success and still executes fresh upstream work.
   - `npx vitest path/to/file.test.ts` and `npx vitest run path/to/file.test.ts` delegate upstream with no holder file.
@@ -539,6 +562,13 @@
   Implement:
   - `scripts/testing/vitest-patched-entry.mjs` as a stable repo-owned launcher
   - a minimal `patches/vitest+3.2.4.patch` that changes `node_modules/vitest/vitest.mjs` from importing `./dist/cli.js` to importing `../../scripts/testing/vitest-patched-entry.mjs`
+  - apply the patch in the current worktree before running patched-entry tests:
+
+  ```bash
+  cd /home/user/code/freshell/.worktrees/test-run-gate
+  npx patch-package
+  ```
+
   - launcher behavior:
     - if `FRESHELL_VITEST_UPSTREAM=1`, import `../../node_modules/vitest/dist/cli.js`
     - otherwise spawn `process.execPath` with the absolute `tsx` CLI path and the absolute `broad-one-shot-test-run.ts` path derived from module location
@@ -583,12 +613,15 @@
   - contention exit code `75`
   - `--reuse-baseline` and `--force-run`
   - `--force-run` bypassing reuse only, not serialization
+  - baseline reuse staying off by default unless `--reuse-baseline` is present
   - trailing argv passthrough from rewritten npm scripts
   - `check` whole-workload reuse
   - `verify` gated but never reusable
   - `test:coverage` gated but never reusable
   - raw `npx vitest --run --coverage` gated but never reusable
+  - raw `npx vitest --run --coverage true` gated but never reusable
   - raw `npx vitest --run --coverage.enabled` gated but never reusable
+  - raw `npx vitest --run --coverage.enabled true` gated but never reusable
   - raw `npx vitest --run --coverage=true` gated but never reusable
   - raw `npx vitest --run --coverage.enabled=true` gated but never reusable
   - `test` and `test:all` preserving the split `client-all -> server-all`
@@ -687,5 +720,6 @@
 - `--force-run` bypasses reuse only and never weakens serialization.
 - Contended runs emit machine-readable JSON on stdout and human prose on stderr.
 - Adapter-launched Vitest phases always set the upstream-bypass env marker, so they cannot self-contend against the patched entrypoint.
+- Baseline reuse never happens unless the caller explicitly opts in with `--reuse-baseline`.
 - Watch/UI/file-targeted and other delegated paths are covered and proven to avoid gate side effects.
 - Contended broad runs fail fast with exit code `75` and truthful holder status.
