@@ -8,7 +8,10 @@ import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import { networkReducer } from '@/store/networkSlice'
+import tabRegistryReducer, { type TabRegistryState } from '@/store/tabRegistrySlice'
 import { LOCAL_TERMINAL_FONT_KEY } from '@/lib/terminal-fonts'
+import { DEVICE_DISMISSED_STORAGE_KEY } from '@/store/storage-keys'
+import type { RegistryTabRecord } from '@/store/tabRegistryTypes'
 
 // Mock the api module
 vi.mock('@/lib/api', () => ({
@@ -26,7 +29,41 @@ import { api } from '@/lib/api'
 
 let originalFonts: Document['fonts'] | undefined
 
-function createTestStore(settingsState?: Partial<SettingsState>) {
+function makeRegistryRecord(overrides: Partial<RegistryTabRecord>): RegistryTabRecord {
+  return {
+    tabKey: 'remote-a:tab-1',
+    tabId: 'tab-1',
+    serverInstanceId: 'srv-test',
+    deviceId: 'remote-a',
+    deviceLabel: 'studio-mac',
+    tabName: 'work item',
+    status: 'open',
+    revision: 1,
+    createdAt: 1,
+    updatedAt: 2,
+    paneCount: 1,
+    titleSetByUser: false,
+    panes: [],
+    ...overrides,
+  }
+}
+
+function createTabRegistryState(overrides: Partial<TabRegistryState> = {}): TabRegistryState {
+  return {
+    ...(tabRegistryReducer(undefined, { type: '@@INIT' }) as TabRegistryState),
+    deviceId: 'local-device',
+    deviceLabel: 'local-device',
+    localOpen: [],
+    remoteOpen: [],
+    closed: [],
+    localClosed: {},
+    loading: false,
+    searchRangeDays: 30,
+    ...overrides,
+  }
+}
+
+function createTestStore(settingsState?: Partial<SettingsState>, extraPreloadedState: Record<string, unknown> = {}) {
   return configureStore({
     reducer: {
       settings: settingsReducer,
@@ -34,6 +71,7 @@ function createTestStore(settingsState?: Partial<SettingsState>) {
       connection: connectionReducer,
       sessions: sessionsReducer,
       network: networkReducer,
+      tabRegistry: tabRegistryReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -48,6 +86,8 @@ function createTestStore(settingsState?: Partial<SettingsState>) {
         lastSavedAt: undefined,
         ...settingsState,
       },
+      tabRegistry: createTabRegistryState(),
+      ...extraPreloadedState,
     },
   })
 }
@@ -153,6 +193,16 @@ describe('SettingsView Component', () => {
 
       // Sidebar should come before Terminal (PRECEDING means Terminal comes after Sidebar)
       expect(terminalHeading.compareDocumentPosition(sidebarHeading) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy()
+    })
+
+    it('orders Devices section after Network Access', () => {
+      const store = createTestStore()
+      renderWithStore(store)
+
+      const devicesHeading = screen.getByText('Devices')
+      const networkHeading = screen.getByText('Network Access')
+
+      expect(devicesHeading.compareDocumentPosition(networkHeading) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy()
     })
 
     it('renders all setting labels', () => {
@@ -1091,6 +1141,41 @@ describe('SettingsView Component', () => {
       // Bracket keys
       expect(screen.getByText('[')).toBeInTheDocument()
       expect(screen.getByText(']')).toBeInTheDocument()
+    })
+  })
+
+  describe('Devices section', () => {
+    it('deletes a remote device row and persists dismissed device ids', async () => {
+      const store = createTestStore(undefined, {
+        tabRegistry: createTabRegistryState({
+          remoteOpen: [
+            makeRegistryRecord({ deviceId: 'remote-a', deviceLabel: 'studio-mac', tabKey: 'remote-a:tab-1' }),
+          ],
+          closed: [
+            makeRegistryRecord({
+              deviceId: 'remote-b',
+              deviceLabel: 'studio-mac',
+              tabKey: 'remote-b:tab-2',
+              tabId: 'tab-2',
+              status: 'closed',
+              closedAt: 5,
+              updatedAt: 5,
+            }),
+          ],
+        }),
+      })
+      renderWithStore(store)
+
+      expect(screen.getAllByLabelText('Device name for studio-mac')).toHaveLength(1)
+
+      fireEvent.click(screen.getByRole('button', { name: 'Delete device studio-mac' }))
+
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      expect(screen.queryByLabelText('Device name for studio-mac')).not.toBeInTheDocument()
+      expect(JSON.parse(localStorage.getItem(DEVICE_DISMISSED_STORAGE_KEY) || '[]').sort()).toEqual(['remote-a', 'remote-b'])
     })
   })
 
