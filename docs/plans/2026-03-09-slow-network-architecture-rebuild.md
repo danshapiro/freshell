@@ -21,7 +21,7 @@ The right fix is a direct cutover:
 3. Serve visible windows from server-owned read models.
 4. Make realtime traffic small, prioritized, and bounded.
 
-This revision replaces the earlier draft rather than lightly editing it. The earlier draft had the right architectural direction, but it was not excellent yet for seven reasons:
+This revision replaces the earlier draft rather than lightly editing it. The earlier draft had the right architectural direction, but it was not excellent yet for nine reasons:
 
 1. The tasks were still too coarse for disciplined red-green-refactor execution.
 2. It treated all ordering/filtering as server-owned, even when some ordering depends on client-only state such as open tabs and local activity pinning.
@@ -30,6 +30,8 @@ This revision replaces the earlier draft rather than lightly editing it. The ear
 5. It reused legacy "session search" naming for the new server-owned directory read model, which makes it too easy for the execution agent to preserve the wrong API shape or keep duplicate endpoints alive.
 6. It did not explicitly move read-model fetch ownership out of leaf components and into the store/API layer, which would let client-side orchestration sprawl survive even after the server becomes authoritative.
 7. It did not explicitly carry `server/cli/index.ts` and its tests off `/api/sessions` and `/api/sessions/search`, which means the old routes could remain alive as hidden compatibility debt.
+8. It left the websocket-owned terminal summary paths (`terminal.list`, `terminal.list.response`, and the boot-time `terminal.meta.list` snapshot) alive, which means the app could still overfetch offscreen terminal data at startup and on sidebar/overview refreshes.
+9. It did not define how focused-pane runtime metadata would arrive once the global terminal-meta snapshot is gone, which makes it too easy for execution to preserve the old boot-time terminal snapshot behind a different name.
 
 The direct end state is still correct. What changes here is the execution shape and a sharper boundary:
 
@@ -60,6 +62,7 @@ The direct end state is still correct. What changes here is the execution shape 
 4. **Terminal restore is replay-first instead of viewport-first.**
    - `src/components/TerminalView.tsx`, `src/lib/terminal-attach-seq-state.ts`, `server/terminal-stream/broker.ts`, and `server/terminal-registry.ts` are centered on replay.
    - `src/components/terminal/terminal-runtime.ts` still loads `SearchAddon`, so terminal search work remains client-side.
+   - `src/App.tsx`, `src/components/OverviewView.tsx`, `src/components/BackgroundSessions.tsx`, and `src/components/Sidebar.tsx` also still request websocket terminal lists or a global terminal-meta snapshot, so terminal summary data is still being shipped broadly instead of only to the visible surfaces that need it.
 
 5. **Transport priority exists only in fragments.**
    - `server/terminal-stream/client-output-queue.ts` already bounds queued output, but it is not priority-aware.
@@ -92,8 +95,9 @@ The direct end state is still correct. What changes here is the execution shape 
 2. `GET /api/version` and network diagnostics remain background startup work because they are not required for first paint.
 3. After shell bootstrap, the client hydrates only currently visible surfaces:
    - `GET /api/session-directory` for sidebar/history only when that surface is on-screen
+   - `GET /api/terminals` for overview/background terminal summaries and terminal pickers only when those surfaces are on-screen
    - `GET /api/agent-sessions/:sessionId/timeline` and `GET /api/agent-sessions/:sessionId/turns/:turnId` for the visible agent chat pane
-   - `GET /api/terminals/:terminalId/viewport`, `/scrollback`, and `/search` for the visible terminal pane
+   - `GET /api/terminals/:terminalId/viewport`, `/scrollback`, and `/search` for the visible terminal pane, with viewport responses carrying the runtime metadata needed for pane chrome
 4. Startup fan-out is explicit:
    - finish `GET /api/bootstrap`
    - immediately start focused-pane HTTP hydration in the `critical` lane
@@ -107,8 +111,9 @@ The direct end state is still correct. What changes here is the execution shape 
    - live terminal deltas and lifecycle events
    - lightweight SDK live events and `sdk.session.snapshot`
    - `sessions.changed`
-   - terminal metadata deltas
+   - terminal metadata deltas for already-hydrated visible terminals
    - extension lifecycle
+   - never `terminal.list`, `terminal.list.response`, `terminal.meta.list`, or `terminal.meta.list.response`
 
 ### Priority Rules
 
@@ -130,8 +135,9 @@ The direct end state is still correct. What changes here is the execution shape 
    - expansion UI state in `HistoryView`
 4. The server owns agent turn folding and turn-body hydration.
 5. The server owns terminal viewport serialization, scrollback paging, and terminal search.
-6. `App.tsx` owns websocket lifecycle. Child components and thunks stop calling `ws.connect()`.
-7. Leaf React components dispatch intents and render selectors; they do not build read-model URLs, own fetch cancellation policy, or reconcile revision state locally.
+6. The server also owns terminal directory ordering/filtering and the runtime metadata returned with focused-terminal viewport reads.
+7. `App.tsx` owns websocket lifecycle. Child components and thunks stop calling `ws.connect()`.
+8. Leaf React components dispatch intents and render selectors; they do not build read-model URLs, own fetch cancellation policy, or reconcile revision state locally.
 
 ### Cutover Invariants
 
@@ -142,11 +148,13 @@ The direct end state is still correct. What changes here is the execution shape 
 5. Secondary on-screen surfaces may start after bootstrap in the `visible` lane, but they must not delay focused-pane paint.
 6. `version` and network status no longer block websocket readiness or first paint.
 7. No runtime path emits or consumes `sessions.updated`, `sessions.page`, `sessions.patch`, `sessions.fetch`, or `sdk.history`.
-8. Terminal reconnect paints the current viewport first, then requests only the short missed tail with `sinceSeq`.
-9. Session and terminal search are server-side only.
-10. Session rename/archive/delete flows refetch or invalidate only the active directory window, never a full session snapshot.
-11. When state is uncertain, refetch the active visible window instead of rebuilding large client reconciliation logic.
-12. CLI list/search flows use the same server-owned session-directory read model family rather than keeping `/api/sessions` and `/api/sessions/search` alive as shadow APIs.
+8. No runtime path performs websocket terminal directory or terminal-meta snapshot fetches (`terminal.list`, `terminal.list.response`, `terminal.meta.list`, `terminal.meta.list.response`).
+9. Focused-terminal runtime metadata comes from viewport HTTP reads and targeted deltas, not from a global websocket snapshot.
+10. Terminal reconnect paints the current viewport first, then requests only the short missed tail with `sinceSeq`.
+11. Session and terminal search are server-side only.
+12. Session rename/archive/delete flows refetch or invalidate only the active directory window, never a full session snapshot.
+13. When state is uncertain, refetch the active visible window instead of rebuilding large client reconciliation logic.
+14. CLI list/search flows use the same server-owned session-directory read model family rather than keeping `/api/sessions` and `/api/sessions/search` alive as shadow APIs.
 
 ## Budgets And Invariants
 
@@ -176,9 +184,11 @@ Every task below follows red-green-refactor and adds coverage at the seam being 
    - `App.tsx` performs one shell bootstrap request and then hydrates only the actually visible surfaces
    - focused-pane HTTP hydration starts after bootstrap without waiting for websocket `ready`
    - child components no longer own websocket connection setup
+   - startup does not request `terminal.meta.list` or any websocket terminal directory snapshot
    - sessions state is visible-window oriented, not snapshot oriented
    - agent chat no longer depends on `sdk.history`
    - terminal search no longer depends on `SearchAddon`
+   - overview/background terminal summaries fetch through `GET /api/terminals` only when visible
    - session rename/archive/delete flows never call `GET /api/sessions`
    - `ws-client` SDK handling no longer depends on replay-history messages
 6. Slow-network e2e tests proving:
@@ -186,6 +196,7 @@ Every task below follows red-green-refactor and adds coverage at the seam being 
    - the focused pane can paint from HTTP read models before websocket `ready` under an artificially delayed handshake
    - focused-pane requests in the `critical` lane complete ahead of merely visible or background work
    - terminal reconnect shows the current screen without replaying the entire backlog
+   - runtime pane metadata is available without a global terminal-meta websocket snapshot
    - agent chat reload shows recent turns before older bodies
    - background fetches do not delay terminal input or visible updates
    - token-protected bootstrap still gates first paint correctly
@@ -548,6 +559,9 @@ Include:
 - `SessionDirectoryQuery`
 - `SessionDirectoryItem`
 - `SessionDirectoryPage`
+- `TerminalDirectoryQuery`
+- `TerminalDirectoryItem`
+- `TerminalDirectoryPage`
 - `AgentTimelinePage`
 - `AgentTurnBody`
 - `TerminalViewportSnapshot`
@@ -561,6 +575,7 @@ Add:
 ```ts
 getBootstrap(options?: { signal?: AbortSignal }): Promise<BootstrapResponse>
 getSessionDirectoryPage(...)
+getTerminalDirectoryPage(...)
 getAgentTimelinePage(...)
 getAgentTurnBody(...)
 getTerminalViewport(...)
@@ -645,6 +660,7 @@ Use the new shared contract and return:
 - config fallback/perf flags
 - startup readiness/auth shell state already needed before visible surfaces hydrate
 - no session-directory, agent timeline, terminal viewport, or terminal list payloads
+- data that currently arrives through websocket handshake snapshots (`perf.logging`, `config.fallback`, and similar shell-only flags) must move here so the websocket can stay realtime-only
 
 **Step 2: Keep lower-priority startup work out of bootstrap**
 
@@ -692,6 +708,7 @@ Cover:
 - `version` and network status are demoted to background work
 - `App.tsx` owns websocket connection lifecycle
 - child components no longer need to call `ws.connect()`
+- app no longer requests `terminal.meta.list` during bootstrap
 - all app bootstrap-oriented tests stop treating `/api/sessions` as a startup prerequisite
 
 **Step 2: Run the tests to verify failure**
@@ -754,7 +771,7 @@ await wsReadyPromise
 
 **Step 3: Keep shell bootstrap narrow and move other work to the right lanes**
 
-Run `GET /api/version` and network status in the background after shell bootstrap; do not let them wait on websocket `ready`, and do not let websocket `ready` gate focused-pane paint. Let sidebar/history, terminal viewport, and agent timeline fetch through their own read-model requests based on what is actually visible, with the focused pane dispatched first in the `critical` lane and secondary on-screen surfaces in the `visible` lane.
+Run `GET /api/version` and network status in the background after shell bootstrap; do not let them wait on websocket `ready`, and do not let websocket `ready` gate focused-pane paint. Let sidebar/history, terminal viewport, terminal directory, and agent timeline fetch through their own read-model requests based on what is actually visible, with the focused pane dispatched first in the `critical` lane and secondary on-screen surfaces in the `visible` lane. Remove the bootstrap-time `terminal.meta.list` request and seed config-fallback/perf state from `GET /api/bootstrap` instead of a websocket handshake snapshot.
 
 **Step 4: Remove bootstrap-time `/api/sessions` assumptions from the remaining App surfaces**
 
@@ -1532,9 +1549,11 @@ git commit -m "feat(terminal): mirror viewport server-side and shorten replay"
 **Step 1: Write the failing tests**
 
 Cover:
+- `GET /api/terminals` returns cursorable terminal-directory windows for overview/background/picker surfaces
 - `/api/terminals/:terminalId/viewport` returns visible state and `tailSeq`
 - `/api/terminals/:terminalId/scrollback` returns bounded older pages
 - `/api/terminals/:terminalId/search` performs server-side search
+- viewport responses include the runtime metadata needed for visible pane chrome
 - background search/scrollback work is abortable
 
 **Step 2: Run the tests to verify failure**
@@ -1543,11 +1562,11 @@ Cover:
 npm run test:server -- test/integration/server/terminal-view-router.test.ts test/server/terminals-api.test.ts
 ```
 
-Expected: FAIL because the routes do not exist.
+Expected: FAIL because the terminal read-model contract does not exist yet.
 
 **Step 3: Make search behavior explicit**
 
-Assert that terminal search no longer depends on client-only addons.
+Assert that terminal search no longer depends on client-only addons and that terminal-directory payloads stay separate from viewport payloads.
 
 **Step 4: Run the tests again**
 
@@ -1561,7 +1580,7 @@ Expected: still FAIL.
 
 ```bash
 git add test/integration/server/terminal-view-router.test.ts test/server/terminals-api.test.ts
-git commit -m "test(terminal): define viewport, scrollback, and search routes"
+git commit -m "test(terminal): define directory, viewport, scrollback, and search routes"
 ```
 
 ---
@@ -1578,6 +1597,7 @@ git commit -m "test(terminal): define viewport, scrollback, and search routes"
 Expose:
 
 ```ts
+getTerminalDirectoryPage(...)
 getTerminalViewport(...)
 getTerminalScrollbackPage(...)
 searchTerminalView(...)
@@ -1585,11 +1605,11 @@ searchTerminalView(...)
 
 **Step 2: Extend `server/terminals-router.ts`**
 
-Keep terminal route ownership in the existing router rather than adding a parallel top-level router.
+Keep terminal route ownership in the existing router rather than adding a parallel top-level router. `GET /api/terminals` becomes the server-owned terminal directory read model for overview/background/picker surfaces, while `PATCH` and `DELETE` keep their existing mutation responsibilities.
 
 **Step 3: Route work through the scheduler**
 
-Viewport is `critical` priority. Scrollback is `background`. Search is `visible` only when the user is actively focused in terminal search; otherwise it stays `background`.
+Viewport is `critical` priority. Visible terminal-directory reads are `visible`, background terminal-directory refreshes are `background`. Scrollback is `background`. Search is `visible` only when the user is actively focused in terminal search; otherwise it stays `background`.
 
 **Step 4: Run the tests to verify pass**
 
@@ -1603,7 +1623,7 @@ Expected: PASS.
 
 ```bash
 git add server/terminal-view/service.ts server/terminals-router.ts server/index.ts
-git commit -m "feat(terminal): serve viewport, scrollback, and server-side search"
+git commit -m "feat(terminal): serve terminal directory, viewport, scrollback, and server-side search"
 ```
 
 ---
@@ -1611,23 +1631,30 @@ git commit -m "feat(terminal): serve viewport, scrollback, and server-side searc
 ### Task 31: Write Failing Terminal Client Restore And Search Tests
 
 **Files:**
+- Modify: `test/unit/client/components/App.ws-bootstrap.test.tsx`
+- Create: `test/unit/client/components/OverviewView.test.tsx`
+- Modify: `test/unit/client/components/BackgroundSessions.test.tsx`
 - Modify: `test/unit/client/components/TerminalView.lifecycle.test.tsx`
 - Modify: `test/unit/client/components/TerminalView.search.test.tsx`
 - Modify: `test/unit/client/components/terminal/terminal-runtime.test.ts`
-- Create: `test/e2e/terminal-flaky-network-responsiveness.test.tsx`
+- Modify: `test/unit/client/store/terminalMetaSlice.test.ts`
+- Modify: `test/e2e/terminal-flaky-network-responsiveness.test.tsx`
 
 **Step 1: Write the failing tests**
 
 Cover:
+- bootstrap does not request `terminal.meta.list`
+- overview and background terminal surfaces fetch `GET /api/terminals` only when visible instead of sending websocket `terminal.list`
 - mount or reattach fetches `/viewport` before websocket attach
 - `sinceSeq` uses `tailSeq` from the viewport snapshot
+- viewport responses seed the runtime metadata needed for visible pane chrome without a global websocket terminal-meta snapshot
 - search UI calls the server instead of `SearchAddon`
 - background terminal work does not block live input
 
 **Step 2: Run the tests to verify failure**
 
 ```bash
-NODE_ENV=test npx vitest run test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.search.test.tsx test/unit/client/components/terminal/terminal-runtime.test.ts test/e2e/terminal-flaky-network-responsiveness.test.tsx
+NODE_ENV=test npx vitest run test/unit/client/components/App.ws-bootstrap.test.tsx test/unit/client/components/OverviewView.test.tsx test/unit/client/components/BackgroundSessions.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.search.test.tsx test/unit/client/components/terminal/terminal-runtime.test.ts test/unit/client/store/terminalMetaSlice.test.ts test/e2e/terminal-flaky-network-responsiveness.test.tsx
 ```
 
 Expected: FAIL because restore is still replay-first and search is still client-side.
@@ -1639,7 +1666,7 @@ The dependency removal is part of the architectural end state.
 **Step 4: Run the tests again**
 
 ```bash
-NODE_ENV=test npx vitest run test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.search.test.tsx test/unit/client/components/terminal/terminal-runtime.test.ts test/e2e/terminal-flaky-network-responsiveness.test.tsx
+NODE_ENV=test npx vitest run test/unit/client/components/App.ws-bootstrap.test.tsx test/unit/client/components/OverviewView.test.tsx test/unit/client/components/BackgroundSessions.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.search.test.tsx test/unit/client/components/terminal/terminal-runtime.test.ts test/unit/client/store/terminalMetaSlice.test.ts test/e2e/terminal-flaky-network-responsiveness.test.tsx
 ```
 
 Expected: still FAIL.
@@ -1647,8 +1674,8 @@ Expected: still FAIL.
 **Step 5: Commit**
 
 ```bash
-git add test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.search.test.tsx test/unit/client/components/terminal/terminal-runtime.test.ts test/e2e/terminal-flaky-network-responsiveness.test.tsx
-git commit -m "test(terminal): define viewport-first restore and server search"
+git add test/unit/client/components/App.ws-bootstrap.test.tsx test/unit/client/components/OverviewView.test.tsx test/unit/client/components/BackgroundSessions.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.search.test.tsx test/unit/client/components/terminal/terminal-runtime.test.ts test/unit/client/store/terminalMetaSlice.test.ts test/e2e/terminal-flaky-network-responsiveness.test.tsx
+git commit -m "test(terminal): define visible-only terminal summaries and viewport restore"
 ```
 
 ---
@@ -1656,10 +1683,14 @@ git commit -m "test(terminal): define viewport-first restore and server search"
 ### Task 32: Implement Viewport-First Terminal Restore And Server Search
 
 **Files:**
+- Modify: `src/App.tsx`
+- Modify: `src/components/OverviewView.tsx`
+- Modify: `src/components/BackgroundSessions.tsx`
 - Modify: `src/components/TerminalView.tsx`
 - Modify: `src/components/terminal/terminal-runtime.ts`
 - Modify: `src/lib/terminal-attach-seq-state.ts`
 - Modify: `src/lib/ws-client.ts`
+- Modify: `src/store/terminalMetaSlice.ts`
 
 **Step 1: Remove client-side terminal search ownership**
 
@@ -1676,23 +1707,27 @@ terminal.write(snapshot.serialized)
 ws.send({ type: 'terminal.attach', terminalId, cols, rows, sinceSeq: snapshot.tailSeq })
 ```
 
-**Step 3: Keep background work abortable**
+**Step 3: Move terminal summaries and focused runtime metadata onto HTTP read models**
+
+`OverviewView.tsx` and `BackgroundSessions.tsx` must stop sending websocket `terminal.list` requests and fetch `GET /api/terminals` only when visible. `App.tsx` must stop requesting `terminal.meta.list` on connect. `src/store/terminalMetaSlice.ts` should become a scoped cache fed by viewport responses and delta upserts for already-visible terminals instead of a global startup snapshot.
+
+**Step 4: Keep background work abortable**
 
 Terminal scrollback and search requests must cancel on pane switch or query change.
 
-**Step 4: Run the tests to verify pass**
+**Step 5: Run the tests to verify pass**
 
 ```bash
-NODE_ENV=test npx vitest run test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.search.test.tsx test/unit/client/components/terminal/terminal-runtime.test.ts test/e2e/terminal-flaky-network-responsiveness.test.tsx
+NODE_ENV=test npx vitest run test/unit/client/components/App.ws-bootstrap.test.tsx test/unit/client/components/OverviewView.test.tsx test/unit/client/components/BackgroundSessions.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.search.test.tsx test/unit/client/components/terminal/terminal-runtime.test.ts test/unit/client/store/terminalMetaSlice.test.ts test/e2e/terminal-flaky-network-responsiveness.test.tsx
 ```
 
 Expected: PASS.
 
-**Step 5: Commit**
+**Step 6: Commit**
 
 ```bash
-git add src/components/TerminalView.tsx src/components/terminal/terminal-runtime.ts src/lib/terminal-attach-seq-state.ts src/lib/ws-client.ts
-git commit -m "refactor(terminal): paint viewport before replay and search server-side"
+git add src/App.tsx src/components/OverviewView.tsx src/components/BackgroundSessions.tsx src/components/TerminalView.tsx src/components/terminal/terminal-runtime.ts src/lib/terminal-attach-seq-state.ts src/lib/ws-client.ts src/store/terminalMetaSlice.ts
+git commit -m "refactor(terminal): fetch visible summaries and paint viewport before replay"
 ```
 
 ---
@@ -1715,6 +1750,7 @@ git commit -m "refactor(terminal): paint viewport before replay and search serve
 
 Cover:
 - no v4 path emits `sessions.updated`, `sessions.page`, `sessions.patch`, `sessions.fetch`, or `sdk.history`
+- no runtime path still sends websocket `terminal.list` requests or consumes `terminal.meta.list` snapshots
 - session sync emits revisions only
 - websocket chunking code is no longer used
 - no route test treats `/api/sessions/search` as the authoritative sidebar/history contract
@@ -1758,6 +1794,7 @@ git commit -m "test(transport): forbid legacy bulk websocket flows"
 - Modify: `server/ws-handler.ts`
 - Modify: `src/App.tsx`
 - Modify: `server/cli/index.ts`
+- Modify: `server/index.ts`
 - Delete: `server/ws-chunking.ts`
 - Delete: `server/routes/sessions.ts`
 - Modify: `server/session-pagination.ts`
@@ -1770,10 +1807,11 @@ Remove:
 - `sessions.patch`
 - `sessions.fetch`
 - `sdk.history`
+- websocket terminal-directory request/response flows (`terminal.list`, `terminal.list.response`) and the boot-time terminal-meta snapshot path (`terminal.meta.list`, `terminal.meta.list.response`)
 
 **Step 2: Remove dead code and imports**
 
-Delete `server/ws-chunking.ts` and the duplicate unused `server/routes/sessions.ts` module. Remove `/api/sessions/search` if no runtime callers remain. Reduce `server/session-pagination.ts` to only what still supports HTTP read-model cursoring, or delete the dead parts if nothing remains.
+Delete `server/ws-chunking.ts` and the duplicate unused `server/routes/sessions.ts` module. Remove `/api/sessions/search` if no runtime callers remain. Remove websocket handshake snapshot plumbing from `server/index.ts` and `server/ws-handler.ts` once bootstrap owns shell-only flags. Reduce `server/session-pagination.ts` to only what still supports HTTP read-model cursoring, or delete the dead parts if nothing remains.
 
 **Step 3: Carry the CLI onto the new session-directory contract**
 
@@ -1781,7 +1819,7 @@ Delete `server/ws-chunking.ts` and the duplicate unused `server/routes/sessions.
 
 **Step 4: Simplify client startup and message handling**
 
-`src/App.tsx` must no longer buffer chunked session snapshots or reconcile them after connect.
+`src/App.tsx` must no longer buffer chunked session snapshots or request global terminal-meta websocket snapshots after connect.
 
 **Step 5: Run the tests to verify pass**
 
@@ -1795,7 +1833,7 @@ Expected: PASS.
 **Step 6: Commit**
 
 ```bash
-git add server/ws-handler.ts src/App.tsx server/cli/index.ts server/session-pagination.ts
+git add server/ws-handler.ts src/App.tsx server/cli/index.ts server/index.ts server/session-pagination.ts
 git rm server/ws-chunking.ts server/routes/sessions.ts
 git commit -m "refactor(transport): delete legacy bulk websocket architecture"
 ```
@@ -1905,5 +1943,6 @@ git commit -m "test(perf): lock in slow-network visible-first architecture"
 3. Prefer refetching the visible server window over maintaining clever client reconciliation logic.
 4. Treat `version`, network diagnostics, and any other non-visible startup work as background unless a failing test proves they are required for first paint.
 5. If a file becomes dead, delete it instead of leaving the old architecture in place beside the new one.
-6. Rename or replace legacy-named tests when the name encodes the old architecture. Keeping a `session-search` test file around for the new directory contract is a maintenance bug, not a convenience.
-7. Keep startup choreography honest: a delayed websocket handshake must not prevent the focused pane from painting from its HTTP read model.
+6. Do not reintroduce a global terminal summary or terminal-meta bootstrap snapshot just because a pane-title or overview test is inconvenient; visible-surface reads are the architecture, not an optimization pass.
+7. Rename or replace legacy-named tests when the name encodes the old architecture. Keeping a `session-search` test file around for the new directory contract is a maintenance bug, not a convenience.
+8. Keep startup choreography honest: a delayed websocket handshake must not prevent the focused pane from painting from its HTTP read model.
