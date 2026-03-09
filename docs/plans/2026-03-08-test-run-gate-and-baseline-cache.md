@@ -106,6 +106,7 @@
 - `check` may only reuse an exact prior success of the whole `check` workload. Reusing just the nested test phase is forbidden.
 - `verify` must remain gated but non-reusable. Skipping a fresh build would weaken its current contract.
 - `test:coverage` must remain gated but non-reusable. Skipping a fresh run would skip coverage artifact generation.
+- Any `--outputFile`-bearing invocation is artifact-producing and non-reusable, public or raw. Aggregate and mixed adapters must still reject it, while reusable single-phase adapters and reusable raw broad runs must force fresh execution instead of short-circuiting a baseline hit.
 - Raw `vitest` interception must have a non-recursive upstream path. The patch must use a dedicated env marker before handing off to upstream Vitest so the patched entrypoint can bypass gate logic on the second hop.
 - Every adapter-launched Vitest child must also set the same bypass env marker before spawning `vitest`, otherwise held broad runs can self-contend against the patched entrypoint.
 - The raw Vitest patch may not rely on relative runner paths resolved from the invocation cwd. It must use an absolute path derived from module location so `npx vitest` from `src/` or any nested directory still reaches the runner.
@@ -372,11 +373,13 @@
   - `test:coverage` has `reusePolicy: 'never'`.
   - raw classified runs with any truthy coverage-enabling flag form such as `--coverage`, `--coverage true`, `--coverage=true`, `--coverage.enabled`, `--coverage.enabled true`, and `--coverage.enabled=true` have `reusePolicy: 'never'`.
   - raw classified runs with `--coverage false`, `--coverage=false`, `--coverage.enabled false`, and `--coverage.enabled=false` are not marked `never reuse` just because the flag token appears.
+  - raw classified runs with `--outputFile=<path>` or `--outputFile <path>` have `reusePolicy: 'never'` even when the rest of the run would otherwise be reusable.
   - forwarded truthy coverage flags make reusable public adapters such as `test:unit` and `test:client:all` become `never reuse` for that invocation.
   - forwarded false-valued coverage flags on reusable public adapters such as `test:unit` and `test:client:all` do not disable reuse just because the flag token appears.
+  - forwarded `--outputFile=<path>` and `--outputFile <path>` make reusable single-phase public adapters such as `test:unit` and `test:client` become `never reuse` for that invocation.
   - mixed adapters such as `check` reject forwarded coverage flags instead of treating them as reusable/non-reusable variants.
   - Raw broad `suiteKey` includes all classified suite-shaping selectors.
-  - Raw broad `suiteKey` excludes non-suite UX flags such as reporter/color/output formatting.
+  - Raw broad `suiteKey` excludes non-suite UX flags such as reporter/color formatting, while artifact-producing `--outputFile` still forces `reusePolicy: 'never'`.
   - Unknown suite-shaping flags force `baselineReusable=false`.
   - Reuse requires exact `suiteKey`, exact commit, producer clean worktree, current clean worktree, exact node version, exact platform, exact arch, and prior exit code `0`.
   - The newest exact failure blocks reuse of older exact success.
@@ -455,7 +458,7 @@
   Cover:
   - Current-main public commands map to exactly one outcome.
   - `package.json` matches the frozen script contract exactly for every public test command, for `postinstall`, and for `devDependencies.patch-package`.
-  - Trailing argv is forwarded: examples include `npm run test:unit -- test/unit/foo.test.ts` and `npm run test:coverage -- --reporter=dot`.
+  - Trailing argv is forwarded: examples include `npm run test:unit -- <fixture-client-test-file>` and `npm run test:coverage -- --reporter=dot`.
   - Delegated public scripts still classify trailing args through the wrapper:
     - `npm run test:server -- --run --coverage` becomes a gated broad run instead of bypassing the gate
     - `npm run test:watch -- --run` becomes a gated broad run instead of bypassing the gate
@@ -466,13 +469,14 @@
     - `npm run test:server:all -- --reporter=dot` forwards to both server Vitest phases
     - `npm run check -- --reporter=dot` forwards only to the nested test phase, not typecheck
     - `npm run verify -- --reporter=dot` forwards only to the nested test phase, not build
-    - `npm run test -- test/unit/foo.test.ts` is rejected with an actionable error
-    - `npm run test:server:all -- test/server/foo.test.ts` is rejected with an actionable error
-    - `npm run check -- test/unit/foo.test.ts` is rejected with an actionable error
-    - `npm run verify -- test/unit/foo.test.ts` is rejected with an actionable error
+    - `npm run test -- <fixture-client-test-file>` is rejected with an actionable error
+    - `npm run test:server:all -- <fixture-server-test-file>` is rejected with an actionable error
+    - `npm run check -- <fixture-client-test-file>` is rejected with an actionable error
+    - `npm run verify -- <fixture-client-test-file>` is rejected with an actionable error
     - `npm run test -- --project server`, `npm run test:server:all -- --dir test/server`, `npm run check -- -t name`, and `npm run verify -- --changed` are rejected with an actionable error instead of being fanned out across phases
     - `npm run test -- --outputFile=tmp.json` and `npm run test:server:all -- --outputFile=tmp.json` are rejected with an actionable error until explicit per-phase remapping or artifact-merge semantics exist
     - false-valued non-allowlisted suite-shaping forms such as `npm run test -- --coverage=false`, `npm run test:server:all -- --coverage.enabled false`, `npm run check -- --coverage=false`, and `npm run verify -- --coverage.enabled=false` are rejected with the same actionable error instead of being fanned out
+    - other non-allowlisted forwarded flags such as `npm run test -- --isolate=false`, `npm run test:server:all -- --bail=0`, `npm run check -- --maxWorkers=1`, and `npm run verify -- --passWithNoTests=false` are rejected with the same actionable error instead of being fanned out
     - `npm run check -- --coverage` and `npm run verify -- --coverage` are rejected with an actionable error
   - `test`, `test:all`, `test:client:all`, `test:server:all`, `test:server:without-logger`, `test:unit`, `test:integration`, `test:client`, `check`, `verify`, and `test:coverage` are `gated broad run`.
   - `test:watch`, `test:ui`, `test:server`, and `test:server:logger-separation` delegate upstream by default, but still pass through wrapper classification first.
@@ -528,11 +532,12 @@
   - adapter argv forwarding so trailing args after `--` are appended to the adapter’s declared upstream command and also participate in classification/reuse decisions when they are suite-shaping
   - explicit multi-phase forwarding rules:
     - duplicate only allowlisted presentation-only flags across each Vitest phase in split aggregates
-    - reject forwarded suite-shaping flags on aggregate and mixed adapters with a clear error
+    - reject any forwarded non-allowlisted flags on aggregate and mixed adapters with a clear error, including suite-shaping, execution-semantic, and false-valued forms
     - reject `--outputFile` on aggregate and mixed adapters until the design grows explicit per-phase remapping or artifact-merge semantics
     - reject false-valued non-allowlisted suite-shaping flags on aggregate and mixed adapters the same way as truthy forms
     - do not forward trailing args into non-Vitest phases like `build` and `typecheck`
     - reject positional selectors on aggregate and mixed adapters with a clear error instead of copying them into every phase
+  - reusable single-phase adapters must treat forwarded `--outputFile` as `never reuse` and still execute fresh upstream work when `--reuse-baseline` is requested
   - explicit fail-fast semantics for split phases:
     - abort remaining phases on first nonzero exit, matching current shell `&&` behavior
   - `test` and `test:all` sharing the same `suiteKey` because they run the same phase list
@@ -587,7 +592,7 @@
   - `npx vitest run` enters the same `BroadOneShotTestRun` path as public broad scripts.
   - `npx vitest` with `CI=1` or non-TTY runtime becomes a gated broad run.
   - `npx vitest --run` enters the same `BroadOneShotTestRun` path as raw `vitest run`.
-  - `npx vitest --run path/to/file.test.ts` delegates upstream with no gate side effects.
+  - `npx vitest --run <fixture-client-test-file>` delegates upstream with no gate side effects.
   - `npx vitest --run --coverage` becomes a gated broad run.
   - `npx vitest --run --coverage true` becomes a gated broad run.
   - `npx vitest --run --coverage.enabled` becomes a gated broad run.
@@ -604,8 +609,9 @@
   - `npx vitest --run --coverage.enabled true --reuse-baseline` does not early-exit from a cached success and still executes fresh upstream work.
   - `npx vitest --run --coverage=true --reuse-baseline` does not early-exit from a cached success and still executes fresh upstream work.
   - `npx vitest --run --coverage.enabled=true --reuse-baseline` does not early-exit from a cached success and still executes fresh upstream work.
-  - `npx vitest path/to/file.test.ts` and `npx vitest run path/to/file.test.ts` delegate upstream with no holder file.
-  - `npx vitest run --config vitest.server.config.ts test/unit/server/foo.test.ts` delegates upstream with no gate side effects.
+  - `npx vitest --run --reporter=json --outputFile=tmp.json --reuse-baseline` does not early-exit from a cached success and still executes fresh upstream work.
+  - `npx vitest <fixture-client-test-file>` and `npx vitest run <fixture-client-test-file>` delegate upstream with no holder file.
+  - `npx vitest run --config vitest.server.config.ts <fixture-server-test-file>` delegates upstream with no gate side effects.
   - `npx vitest --ui`, `npx vitest watch`, `npx vitest dev`, `npx vitest related`, and `npx vitest bench` delegate upstream with no gate side effects.
   - `npx vitest --standalone` and `npx vitest --mergeReports` delegate upstream with no gate side effects.
   - The patched entrypoint works from a nested cwd such as `src/`.
@@ -673,9 +679,11 @@
   - delegated public scripts reclassifying trailing args instead of bypassing the wrapper
   - forwarded truthy coverage flags making reusable public adapters such as `test:unit` and `test:client:all` become non-reusable for that invocation
   - forwarded false-valued coverage flags on reusable public adapters such as `test:unit` and `test:client:all` not disabling reuse
+  - forwarded `--reporter=json --outputFile=tmp.json` making reusable single-phase public adapters such as `test:unit` execute fresh work instead of reusing a baseline
   - mixed adapters such as `check` and `verify` rejecting forwarded coverage flags with an actionable error
   - aggregate adapters such as `test`, `test:all`, and `test:server:all` rejecting false-valued non-allowlisted suite-shaping flags such as `--coverage=false` and `--coverage.enabled false`
   - aggregate adapters rejecting `--outputFile` until explicit per-phase remapping or artifact-merge semantics exist
+  - aggregate and mixed adapters rejecting other non-allowlisted forwarded flags such as `--isolate=false`, `--bail=0`, and `--maxWorkers=1`
   - `check` whole-workload reuse
   - `verify` gated but never reusable
   - `test:coverage` gated but never reusable
@@ -772,6 +780,7 @@
 - Unknown broad suite flags disable reuse but do not skip gating.
 - Coverage-bearing raw runs are gated but never reusable.
 - Coverage-bearing raw runs are non-reusable for all coverage-enabling flag forms, not just literal `--coverage`.
+- `--outputFile`-bearing invocations are artifact-producing and non-reusable on raw and reusable single-phase public paths.
 - False-valued coverage forms such as `--coverage false` and `--coverage.enabled false` are not treated as coverage-bearing.
 - False-valued coverage forms such as `--coverage false`, `--coverage=false`, `--coverage.enabled false`, and `--coverage.enabled=false` are not treated as coverage-bearing.
 - False-valued coverage forms such as `--coverage false`, `--coverage=false`, `--coverage.enabled false`, and `--coverage.enabled=false` also do not broaden otherwise narrow/file-targeted invocations.
@@ -779,8 +788,9 @@
 - Rewritten broad npm scripts preserve trailing args after `--` and forward them through classification and upstream execution.
 - Delegated public scripts still pass through wrapper classification, so trailing args cannot turn them into ungated broad runs.
 - Aggregate and mixed adapters reject forwarded suite-shaping flags and positional selectors instead of guessing how to fan them out.
+- Aggregate and mixed adapters also reject other non-allowlisted forwarded semantic flags, including false-valued forms such as `--isolate=false`, `--bail=0`, and `--maxWorkers=1`.
 - Aggregate adapters duplicate only the frozen presentation-flag allowlist: `--reporter`, `--silent`, `--color`, `--no-color`, `--tty`, and `--clearScreen`.
-- Aggregate and mixed adapters reject `--outputFile` and other non-allowlisted suite-shaping flags, including false-valued coverage forms such as `--coverage=false` and `--coverage.enabled false`.
+- Aggregate and mixed adapters reject `--outputFile` and other non-allowlisted forwarded semantic flags, including false-valued coverage forms such as `--coverage=false` and `--coverage.enabled false`.
 - Non-test operational raw Vitest modes and flags bypass the gate instead of being coerced into broad test runs.
 - `--config/-c` plus file-only selectors stay delegated so targeted server one-shots do not hit the broad gate.
 - `test`, `test:all`, and `test:server:all` preserve the current split phase contracts from `main`.
