@@ -305,6 +305,41 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     }
   }, [terminalContent, paneId, applySeqState])
 
+  // Register terminal buffer accessor with test harness (for E2E tests).
+  // Uses xterm.js Terminal.buffer.active API which works with all renderers
+  // (WebGL, canvas, DOM) — unlike DOM scraping via .xterm-rows which only
+  // works with the DOM renderer.
+  //
+  // This must be a useEffect watching terminalContent?.terminalId because:
+  // 1. When the xterm Terminal is first created, terminalId is undefined
+  //    (the server hasn't responded with terminal.created yet)
+  // 2. terminalId becomes defined asynchronously via a WS message handler
+  // 3. The useEffect fires when terminalId transitions from undefined to a
+  //    real value, which is exactly when we can register the buffer
+  useEffect(() => {
+    const tid = terminalContent?.terminalId
+    if (!window.__FRESHELL_TEST_HARNESS__ || !tid) return
+
+    window.__FRESHELL_TEST_HARNESS__.registerTerminalBuffer(
+      tid,
+      () => {
+        const t = termRef.current
+        if (!t) return ''
+        const buf = t.buffer.active
+        const lines: string[] = []
+        for (let y = 0; y < buf.length; y++) {
+          const line = buf.getLine(y)
+          if (line) lines.push(line.translateToString(true))
+        }
+        return lines.join('\n')
+      },
+    )
+
+    return () => {
+      window.__FRESHELL_TEST_HARNESS__?.unregisterTerminalBuffer(tid)
+    }
+  }, [terminalContent?.terminalId])
+
   useEffect(() => {
     hiddenRef.current = hidden
   }, [hidden])
