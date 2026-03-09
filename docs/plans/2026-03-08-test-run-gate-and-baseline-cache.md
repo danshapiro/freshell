@@ -43,6 +43,7 @@
   - `running-undescribed`: probe sees the lock is held but holder metadata is missing, corrupt, unreadable, or missing required fields.
 - Holder writes and result writes must be atomic: write to a temp file in the same directory, `fsync` the temp file, rename over the destination, then best-effort `fsync` the directory. Reads must schema-validate and degrade safely on any failure.
 - Repo discovery must not rely on `process.cwd()` alone. Use the caller’s invocation cwd (`INIT_CWD` when present, otherwise `process.cwd()`), then resolve checkout root and git common-dir from Git.
+- Test code may not write gate state into the live repo common-dir. The implementation must provide a disposable common-dir seam for tests, for example `FRESHELL_TEST_GATE_COMMON_DIR`, and every new gate test must use a temp directory or temporary git fixture through that seam. No gate test may touch `/home/user/code/freshell/.git`.
 - Broad vs narrow is frozen as:
   - Narrow:
     - watch or UI mode
@@ -71,7 +72,7 @@
   - `vitest --run` with no selectors is broad
   - `vitest --run <file>` is narrow
   - `vitest --run --coverage` is broad
-- Any coverage-bearing run is non-reusable, public or raw. If the classified invocation includes `--coverage`, baseline reuse must be disabled even when the run is still gated.
+- Any coverage-bearing run is non-reusable, public or raw. If the classified invocation includes any coverage-enabling flag form such as `--coverage` or `--coverage.enabled`, baseline reuse must be disabled even when the run is still gated.
 - Unknown broad suite-shaping flags are never reusable. They may still run as gated broad work, but reuse must be disabled instead of guessed.
 - Unknown raw Vitest subcommands that are not the default command and are not explicitly classified above must `delegate upstream`. The classifier still returns an explicit outcome; it may not leave any raw entrypoint undefined.
 - Unknown flags on explicitly non-test operational modes must `delegate upstream`, not be coerced into gated broad work.
@@ -92,8 +93,9 @@
 - Concurrency contract is frozen:
   - `BroadOneShotTestRun` uses non-blocking `flock`
   - if the lock is already held, the second broad run exits immediately with code `75`
-  - on contention, it prints the same structured status payload as `--status`, plus a short message indicating another broad run is already active
+  - on contention, it prints the same structured status payload as `--status` to stdout, plus a short human message to stderr indicating another broad run is already active
   - it never silently waits
+- `--force-run` skips baseline reuse only. It never bypasses lock acquisition, never weakens serialization, and never changes the contention exit code or output contract.
 - `--status` contract is frozen:
   - it always performs the same non-blocking lock probe as the runner
   - it exits `0` on successful status queries, regardless of state
@@ -132,7 +134,7 @@
 - `scripts/testing/test-run-classification.ts`
   - Exact broad-vs-narrow rules, raw Vitest default-mode resolution, operational-mode delegation, and raw argv normalization.
 - `scripts/testing/test-run-gate-state.ts`
-  - Lock path resolution, `flock` helpers, holder state machine, atomic holder read/write/delete, and status payload formatting.
+  - Lock path resolution, test-only common-dir override seam, `flock` helpers, holder state machine, atomic holder read/write/delete, and status/contended output formatting.
 - `scripts/testing/test-run-baselines.ts`
   - `suiteKey` generation, results store, exact reuse lookup, newest-record-wins logic, and per-adapter reuse policy checks.
 - `scripts/testing/test-run-adapters.ts`
@@ -145,6 +147,8 @@
   - Minimal patch that changes `node_modules/vitest/vitest.mjs` to import `../../scripts/testing/vitest-patched-entry.mjs`.
 - `test/fixtures/test-run-gate/fake-upstream.ts`
   - Small controllable Node fixture used by integration tests to simulate success, failure, delay, and env capture without running the real broad suite.
+- `test/fixtures/test-run-gate/temp-gate-env.ts`
+  - Helper for creating isolated temp gate directories or temporary git fixtures so parallel tests never touch the live repo `.git`.
 - `test/unit/server/test-run-classification.test.ts`
 - `test/unit/server/test-run-gate-state.test.ts`
 - `test/unit/server/test-run-baselines.test.ts`
@@ -166,11 +170,13 @@
   Cover:
   - `resolveGitCommonDir()` returns the shared `.git` directory for linked worktrees.
   - Invocation cwd comes from `INIT_CWD` when present, then falls back to `process.cwd()`.
+  - Test-only common-dir override returns the supplied disposable directory without probing the live repo.
   - Bare `vitest` delegates when effective watch mode is true.
   - Bare `vitest` becomes `gated broad run` when effective watch mode is false.
   - Bare `vitest --run` becomes `gated broad run` with no selectors.
   - Bare `vitest --run path/to/file.test.ts` becomes `delegate upstream`.
   - Bare `vitest --run --coverage` becomes `gated broad run`.
+  - Bare `vitest --run --coverage.enabled` becomes `gated broad run`.
   - Raw `vitest run` with no selectors is `gated broad run`.
   - Raw `vitest run test/unit`, `vitest run "test/**/*.test.ts"`, `vitest run --config vitest.server.config.ts test/server`, `vitest run -c vitest.server.config.ts test/server`, `vitest run --root . test/unit`, `vitest run --dir test`, `vitest run --project client --project server`, `vitest run -t name`, and `vitest run --changed` are `gated broad run`.
   - Raw `vitest run --config vitest.server.config.ts test/unit/server/foo.test.ts` and `vitest run -c vitest.server.config.ts test/integration/server/bar.test.ts` are `delegate upstream`.
@@ -198,6 +204,7 @@
   Implement:
   - `resolveGitCommonDir(cwd)` using `git -C <checkoutRoot> rev-parse --git-common-dir`
   - `resolveInvocationCwd()` using `INIT_CWD ?? process.cwd()`
+  - a test-only gate-state override seam, e.g. `FRESHELL_TEST_GATE_COMMON_DIR`
   - `classifyVitestInvocation(argv, runtime)` returning a discriminated union with:
     - `kind: 'delegate-upstream'`
     - `kind: 'gated-broad-run'`
@@ -243,22 +250,26 @@
 - [ ] **Step 1: Write the failing lock, holder, and status-contract tests**
 
   Cover:
-  - Gate paths are rooted at `resolveGitCommonDir(invocationCwd)`.
+  - Gate paths are rooted at `resolveGitCommonDir(invocationCwd)` in production.
+  - Gate paths use the disposable override seam in tests and never resolve to `/home/user/code/freshell/.git`.
   - Non-blocking `flock` probe returning success produces `idle` even if `holder.json` exists.
   - Held lock plus valid holder metadata produces `running-described`.
   - Held lock plus missing, corrupt, or partial holder metadata produces `running-undescribed`.
   - Holder writes use temp-file-then-rename behavior in the same directory.
   - `--status` emits the exact JSON payload shape frozen above.
-  - Contended broad runs exit `75` and do not wait.
+  - Contended broad runs exit `75`, emit exactly one JSON object on stdout, and emit the human message on stderr.
+  - `--force-run` does not bypass contention and still exits `75` when the lock is already held.
   - Holder delete failures do not suppress lock release.
 
 - [ ] **Step 2: Add one integration test around real `flock` behavior using the fake upstream fixture**
 
   Simulate:
-  - Process A acquires the gate and sleeps.
+  - Process A acquires the gate and sleeps inside a disposable temp gate directory.
   - Process B calls `test:status` and receives `running-described`.
   - Process C attempts another broad run, exits `75`, and does not create a second holder.
+  - Process C with `--force-run` still exits `75`.
   - After Process A exits without explicit cleanup, a fresh status probe returns `idle` even if the old holder file still exists.
+  - No files are written under the live repo `.git`.
 
 - [ ] **Step 3: Implement the gate state module**
 
@@ -267,6 +278,7 @@
     - lock file
     - holder file
     - results file
+  - `resolveGateCommonDir()` that uses the test override seam when present and normal git-common-dir discovery otherwise
   - `probeBroadRunStatus()`:
     - try non-blocking `flock`
     - if acquired: release immediately and return `idle`
@@ -274,7 +286,7 @@
     - return `running-described` or `running-undescribed`
   - `writeHolderAtomically()` using temp file, `fsync`, rename, best-effort dir `fsync`
   - `readHolderAdvisory()` returning parsed metadata or a typed failure reason
-  - `formatStatusPayload()` and `formatContendedPayload()`
+  - `formatStatusPayload()` and `formatContendedPayload()` with JSON-on-stdout and human-message-on-stderr separation
   - `removeHolderIfPresent()` as best-effort cleanup while still holding the lock
 
 - [ ] **Step 4: Re-run the targeted state tests**
@@ -314,7 +326,7 @@
   - `check` has its own whole-workload `suiteKey`.
   - `verify` has its own whole-workload `suiteKey` but `reusePolicy: 'never'`.
   - `test:coverage` has `reusePolicy: 'never'`.
-  - raw classified runs with `--coverage` have `reusePolicy: 'never'`.
+  - raw classified runs with any coverage-enabling flag form such as `--coverage` and `--coverage.enabled` have `reusePolicy: 'never'`.
   - Raw broad `suiteKey` includes all classified suite-shaping selectors.
   - Raw broad `suiteKey` excludes non-suite UX flags such as reporter/color/output formatting.
   - Unknown suite-shaping flags force `baselineReusable=false`.
@@ -483,6 +495,7 @@
 - Create: `scripts/testing/vitest-patched-entry.mjs`
 - Create: `patches/vitest+3.2.4.patch`
 - Create: `test/fixtures/test-run-gate/fake-upstream.ts`
+- Create: `test/fixtures/test-run-gate/temp-gate-env.ts`
 - Modify: `package.json`
 - Modify: `package-lock.json`
 - Create: `test/integration/server/vitest-patch-adapter.test.ts`
@@ -495,7 +508,9 @@
   - `npx vitest --run` enters the same `BroadOneShotTestRun` path as raw `vitest run`.
   - `npx vitest --run path/to/file.test.ts` delegates upstream with no gate side effects.
   - `npx vitest --run --coverage` becomes a gated broad run.
+  - `npx vitest --run --coverage.enabled` becomes a gated broad run.
   - `npx vitest --run --coverage --reuse-baseline` does not early-exit from a cached success and still executes fresh upstream work.
+  - `npx vitest --run --coverage.enabled --reuse-baseline` does not early-exit from a cached success and still executes fresh upstream work.
   - `npx vitest path/to/file.test.ts` and `npx vitest run path/to/file.test.ts` delegate upstream with no holder file.
   - `npx vitest run --config vitest.server.config.ts test/unit/server/foo.test.ts` delegates upstream with no gate side effects.
   - `npx vitest --ui`, `npx vitest watch`, `npx vitest dev`, `npx vitest related`, and `npx vitest bench` delegate upstream with no gate side effects.
@@ -512,7 +527,7 @@
   - launcher behavior:
     - if `FRESHELL_VITEST_UPSTREAM=1`, import `../../node_modules/vitest/dist/cli.js`
     - otherwise spawn `process.execPath` with the absolute `tsx` CLI path and the absolute `broad-one-shot-test-run.ts` path derived from module location
-    - preserve invocation cwd and pass `INIT_CWD` through unchanged when present
+    - preserve invocation cwd, pass `INIT_CWD` through unchanged when present, and forward the disposable gate-dir override used by tests
 
 - [ ] **Step 3: Re-run the Vitest patch integration tests**
 
@@ -551,10 +566,12 @@
   - `test:status` while idle, `running-described`, and `running-undescribed`
   - contention exit code `75`
   - `--reuse-baseline` and `--force-run`
+  - `--force-run` bypassing reuse only, not serialization
   - `check` whole-workload reuse
   - `verify` gated but never reusable
   - `test:coverage` gated but never reusable
   - raw `npx vitest --run --coverage` gated but never reusable
+  - raw `npx vitest --run --coverage.enabled` gated but never reusable
   - `test` and `test:all` preserving the split `client-all -> server-all`
   - `test:server:all` preserving the split `without-logger -> logger-separation`
   - raw `npx vitest` default-mode gating in non-interactive execution
@@ -563,6 +580,8 @@
   - `-c`, `--root`, `--dir`, and repeated `--project` feeding `suiteKey`
   - non-test operational raw Vitest flags bypassing the gate
   - nested-cwd raw Vitest interception
+  - disposable common-dir isolation so no test touches the live repo `.git`
+  - contended output stream split: JSON only on stdout, human message on stderr
   - summary propagation from env and flag
 
 - [ ] **Step 2: Run the targeted gate verification suite during implementation**
@@ -633,6 +652,7 @@
 - The newest exact result wins; a newer failure blocks reuse of older success.
 - Unknown broad suite flags disable reuse but do not skip gating.
 - Coverage-bearing raw runs are gated but never reusable.
+- Coverage-bearing raw runs are non-reusable for all coverage-enabling flag forms, not just literal `--coverage`.
 - Non-test operational raw Vitest modes and flags bypass the gate instead of being coerced into broad test runs.
 - `--config/-c` plus file-only selectors stay delegated so targeted server one-shots do not hit the broad gate.
 - `test`, `test:all`, and `test:server:all` preserve the current split phase contracts from `main`.
@@ -640,7 +660,10 @@
 - `test:coverage` and `verify` are gated but never reusable.
 - `check` preserves its full contract and is reusable only as a whole exact workload.
 - Raw `vitest` interception has a non-recursive upstream path and works from nested directories.
+- New gate tests use a disposable common-dir seam and are proven not to touch the live repo `.git`.
 - The drift guard is enforced by a literal `package.json` contract test, not just by manual review.
 - All server-side TDD and verification commands run under `vitest.server.config.ts`, so the plan’s test loops are executable.
+- `--force-run` bypasses reuse only and never weakens serialization.
+- Contended runs emit machine-readable JSON on stdout and human prose on stderr.
 - Watch/UI/file-targeted and other delegated paths are covered and proven to avoid gate side effects.
 - Contended broad runs fail fast with exit code `75` and truthful holder status.
