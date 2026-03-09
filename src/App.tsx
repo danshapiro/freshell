@@ -112,6 +112,13 @@ function parseConfigFallbackReason(value: unknown): ConfigFallbackInfo['reason']
     : 'READ_ERROR'
 }
 
+function getTabSwitchShortcutDirection(event: KeyboardEvent): 'prev' | 'next' | null {
+  if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey) return null
+  if (event.code === 'BracketLeft') return 'prev'
+  if (event.code === 'BracketRight') return 'next'
+  return null
+}
+
 const ReadyMessageSchema = z.object({
   type: z.literal('ready'),
   timestamp: z.string(),
@@ -811,22 +818,14 @@ export default function App() {
     }
 
     function onKeyDown(e: KeyboardEvent) {
-      if (isTextInput(e.target)) return
-
-      // Tab switching: Ctrl+Shift+[ (prev) and Ctrl+Shift+] (next)
-      // Also handled in TerminalView.tsx for when terminal is focused
-      if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {
-        if (e.code === 'BracketLeft') {
-          e.preventDefault()
-          dispatch(switchToPrevTab())
-          return
-        }
-        if (e.code === 'BracketRight') {
-          e.preventDefault()
-          dispatch(switchToNextTab())
-          return
-        }
+      const tabSwitchDirection = getTabSwitchShortcutDirection(e)
+      if (tabSwitchDirection) {
+        e.preventDefault()
+        dispatch(tabSwitchDirection === 'prev' ? switchToPrevTab() : switchToNextTab())
+        return
       }
+
+      if (isTextInput(e.target)) return
     }
 
     window.addEventListener('keydown', onKeyDown)
