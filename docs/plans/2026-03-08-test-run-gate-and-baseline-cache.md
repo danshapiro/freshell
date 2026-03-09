@@ -35,7 +35,6 @@
 - Aggregate and mixed adapters may not guess at forwarded suite-shaping inputs. For `test`, `test:all`, `test:server:all`, `check`, and `verify`, forwarded positional selectors and forwarded suite-shaping flags after `--` must be rejected with an actionable error instead of being copied into every phase or silently dropped. Only a small allowlist of presentation-only flags may be duplicated across split Vitest phases.
 - The aggregate-adapter allowlist is frozen to presentation-only Vitest flags that do not change selected tests or runtime semantics:
   - `--reporter`
-  - `--outputFile`
   - `--silent`
   - `--color`
   - `--no-color`
@@ -59,6 +58,7 @@
 - Repo discovery must not rely on `process.cwd()` alone. Use the caller’s invocation cwd (`INIT_CWD` when present, otherwise `process.cwd()`), then resolve checkout root and git common-dir from Git.
 - Test code may not write gate state into the live repo common-dir. The implementation must provide a disposable common-dir seam for tests, for example `FRESHELL_TEST_GATE_COMMON_DIR`, and every new gate test must use a temp directory or temporary git fixture through that seam. No gate test may touch `/home/user/code/freshell/.git`.
 - Broad vs narrow is frozen as:
+  - “resolves to a file” means actual filesystem-backed resolution from the invocation cwd or an explicit injected resolution seam used by tests; filename suffix heuristics are forbidden
   - Narrow:
     - watch or UI mode
     - explicit file-targeted runs where every positional selector resolves to a file and no known broad suite-shaping selector is present
@@ -154,8 +154,6 @@
   - Exact broad-vs-narrow rules, raw Vitest default-mode resolution, operational-mode delegation, and raw argv normalization.
 - `scripts/testing/test-run-gate-state.ts`
   - Lock path resolution, test-only common-dir override seam, `flock` helpers, holder state machine, atomic holder read/write/delete, and status/contended output formatting.
-- `scripts/testing/broad-one-shot-test-run.ts`
-  - Minimal runnable CLI introduced early for Task 2 integration coverage, then expanded in Task 4 into the full adapter surface.
 - `scripts/testing/test-run-baselines.ts`
   - `suiteKey` generation, results store, exact reuse lookup, newest-record-wins logic, and per-adapter reuse policy checks.
 - `scripts/testing/test-run-adapters.ts`
@@ -168,6 +166,8 @@
   - Minimal patch that changes `node_modules/vitest/vitest.mjs` to import `../../scripts/testing/vitest-patched-entry.mjs`.
 - `test/fixtures/test-run-gate/fake-upstream.ts`
   - Small controllable Node fixture used by integration tests to simulate success, failure, delay, and env capture without running the real broad suite.
+- `test/fixtures/test-run-gate/file-targets.ts`
+  - Helper that creates real file-target fixtures or an explicit mocked resolution seam for classification tests so narrow file-target cases exercise actual resolution logic.
 - `test/fixtures/test-run-gate/temp-gate-env.ts`
   - Helper for creating isolated temp gate directories or temporary git fixtures so parallel tests never touch the live repo `.git`.
 - `test/unit/server/test-run-classification.test.ts`
@@ -184,6 +184,7 @@
 - Modify: `server/coding-cli/utils.ts`
 - Modify: `test/unit/server/coding-cli/utils.test.ts`
 - Create: `scripts/testing/test-run-classification.ts`
+- Create: `test/fixtures/test-run-gate/file-targets.ts`
 - Create: `test/unit/server/test-run-classification.test.ts`
 
 - [ ] **Step 1: Write the failing repo-discovery and classification tests**
@@ -196,7 +197,7 @@
   - Bare `vitest` delegates when effective watch mode is true.
   - Bare `vitest` becomes `gated broad run` when effective watch mode is false.
   - Bare `vitest --run` becomes `gated broad run` with no selectors.
-  - Bare `vitest --run path/to/file.test.ts` becomes `delegate upstream`.
+  - Bare `vitest --run <fixture-client-test-file>` becomes `delegate upstream`.
   - Bare `vitest --run --coverage` becomes `gated broad run`.
   - Bare `vitest --run --coverage.enabled` becomes `gated broad run`.
   - Bare `vitest --run --coverage=true` becomes `gated broad run`.
@@ -205,15 +206,16 @@
   - Bare `vitest --run --coverage=false` is not treated as coverage-bearing.
   - Bare `vitest --run --coverage.enabled false` is not treated as coverage-bearing.
   - Bare `vitest --run --coverage.enabled=false` is not treated as coverage-bearing.
-  - `vitest run path/to/file.test.ts --coverage false`, `--coverage=false`, `--coverage.enabled false`, and `--coverage.enabled=false` stay `delegate upstream`.
+  - `vitest run <fixture-client-test-file> --coverage false`, `--coverage=false`, `--coverage.enabled false`, and `--coverage.enabled=false` stay `delegate upstream`.
   - Raw `vitest run` with no selectors is `gated broad run`.
   - Raw `vitest run test/unit`, `vitest run "test/**/*.test.ts"`, `vitest run --config vitest.server.config.ts test/server`, `vitest run -c vitest.server.config.ts test/server`, `vitest run --root . test/unit`, `vitest run --dir test`, `vitest run --project client --project server`, `vitest run -t name`, and `vitest run --changed` are `gated broad run`.
-  - Raw `vitest run --config vitest.server.config.ts test/unit/server/foo.test.ts` and `vitest run -c vitest.server.config.ts test/integration/server/bar.test.ts` are `delegate upstream`.
-  - Raw `vitest path/to/file.test.ts` and `vitest run path/to/file.test.ts` are `delegate upstream`.
+  - Raw `vitest run --config vitest.server.config.ts <fixture-server-test-file>` and `vitest run -c vitest.server.config.ts <fixture-server-integration-test-file>` are `delegate upstream`.
+  - Raw `vitest <fixture-client-test-file>` and `vitest run <fixture-client-test-file>` are `delegate upstream`.
   - Raw `vitest --ui`, `vitest watch`, `vitest dev`, `vitest related`, and `vitest bench` are `delegate upstream`.
   - Raw `vitest --standalone` and `vitest --mergeReports` are `delegate upstream`.
   - Unknown raw Vitest subcommands still get an explicit outcome and default to `delegate upstream`.
   - Unknown broad suite-shaping flags classify as broad but mark reuse disabled.
+  - File-target classification cases use real resolved fixture paths or an explicit injected resolution seam; no test uses placeholder paths that bypass the “resolves to a file” contract.
 
 - [ ] **Step 2: Run only the targeted tests and verify they fail**
 
@@ -234,6 +236,7 @@
   - `resolveGitCommonDir(cwd)` using `git -C <checkoutRoot> rev-parse --git-common-dir`
   - `resolveInvocationCwd()` using `INIT_CWD ?? process.cwd()`
   - a test-only gate-state override seam, e.g. `FRESHELL_TEST_GATE_COMMON_DIR`
+  - file-target resolution based on actual filesystem lookup from the invocation cwd or an explicit injected resolver seam used by tests, never on suffix matching alone
   - trailing-argv parsing so adapter-owned wrappers preserve `npm run <script> -- ...`
   - `classifyVitestInvocation(argv, runtime)` returning a discriminated union with:
     - `kind: 'delegate-upstream'`
@@ -265,6 +268,7 @@
     server/coding-cli/utils.ts \
     test/unit/server/coding-cli/utils.test.ts \
     scripts/testing/test-run-classification.ts \
+    test/fixtures/test-run-gate/file-targets.ts \
     test/unit/server/test-run-classification.test.ts
   git -C /home/user/code/freshell/.worktrees/test-run-gate commit -m "feat(testing): classify broad test entrypoints"
   ```
@@ -457,7 +461,6 @@
     - `npm run test:watch -- --run` becomes a gated broad run instead of bypassing the gate
   - Multi-phase trailing argv behavior is explicit:
     - `npm run test -- --reporter=dot` forwards to both split Vitest phases
-    - `npm run test -- --outputFile=tmp.json` forwards to both split Vitest phases
     - `npm run test -- --silent` forwards to both split Vitest phases
     - `npm run test -- --color`, `--no-color`, `--tty`, and `--clearScreen` are allowed and forwarded to both split Vitest phases
     - `npm run test:server:all -- --reporter=dot` forwards to both server Vitest phases
@@ -468,6 +471,8 @@
     - `npm run check -- test/unit/foo.test.ts` is rejected with an actionable error
     - `npm run verify -- test/unit/foo.test.ts` is rejected with an actionable error
     - `npm run test -- --project server`, `npm run test:server:all -- --dir test/server`, `npm run check -- -t name`, and `npm run verify -- --changed` are rejected with an actionable error instead of being fanned out across phases
+    - `npm run test -- --outputFile=tmp.json` and `npm run test:server:all -- --outputFile=tmp.json` are rejected with an actionable error until explicit per-phase remapping or artifact-merge semantics exist
+    - false-valued non-allowlisted suite-shaping forms such as `npm run test -- --coverage=false`, `npm run test:server:all -- --coverage.enabled false`, `npm run check -- --coverage=false`, and `npm run verify -- --coverage.enabled=false` are rejected with the same actionable error instead of being fanned out
     - `npm run check -- --coverage` and `npm run verify -- --coverage` are rejected with an actionable error
   - `test`, `test:all`, `test:client:all`, `test:server:all`, `test:server:without-logger`, `test:unit`, `test:integration`, `test:client`, `check`, `verify`, and `test:coverage` are `gated broad run`.
   - `test:watch`, `test:ui`, `test:server`, and `test:server:logger-separation` delegate upstream by default, but still pass through wrapper classification first.
@@ -524,6 +529,8 @@
   - explicit multi-phase forwarding rules:
     - duplicate only allowlisted presentation-only flags across each Vitest phase in split aggregates
     - reject forwarded suite-shaping flags on aggregate and mixed adapters with a clear error
+    - reject `--outputFile` on aggregate and mixed adapters until the design grows explicit per-phase remapping or artifact-merge semantics
+    - reject false-valued non-allowlisted suite-shaping flags on aggregate and mixed adapters the same way as truthy forms
     - do not forward trailing args into non-Vitest phases like `build` and `typecheck`
     - reject positional selectors on aggregate and mixed adapters with a clear error instead of copying them into every phase
   - explicit fail-fast semantics for split phases:
@@ -667,6 +674,8 @@
   - forwarded truthy coverage flags making reusable public adapters such as `test:unit` and `test:client:all` become non-reusable for that invocation
   - forwarded false-valued coverage flags on reusable public adapters such as `test:unit` and `test:client:all` not disabling reuse
   - mixed adapters such as `check` and `verify` rejecting forwarded coverage flags with an actionable error
+  - aggregate adapters such as `test`, `test:all`, and `test:server:all` rejecting false-valued non-allowlisted suite-shaping flags such as `--coverage=false` and `--coverage.enabled false`
+  - aggregate adapters rejecting `--outputFile` until explicit per-phase remapping or artifact-merge semantics exist
   - `check` whole-workload reuse
   - `verify` gated but never reusable
   - `test:coverage` gated but never reusable
@@ -766,10 +775,12 @@
 - False-valued coverage forms such as `--coverage false` and `--coverage.enabled false` are not treated as coverage-bearing.
 - False-valued coverage forms such as `--coverage false`, `--coverage=false`, `--coverage.enabled false`, and `--coverage.enabled=false` are not treated as coverage-bearing.
 - False-valued coverage forms such as `--coverage false`, `--coverage=false`, `--coverage.enabled false`, and `--coverage.enabled=false` also do not broaden otherwise narrow/file-targeted invocations.
+- File-targeted narrow-run tests use real resolved fixture paths or an explicit injected resolution seam; the plan does not permit placeholder-path heuristics.
 - Rewritten broad npm scripts preserve trailing args after `--` and forward them through classification and upstream execution.
 - Delegated public scripts still pass through wrapper classification, so trailing args cannot turn them into ungated broad runs.
 - Aggregate and mixed adapters reject forwarded suite-shaping flags and positional selectors instead of guessing how to fan them out.
-- Aggregate adapters duplicate only the frozen presentation-flag allowlist: `--reporter`, `--outputFile`, `--silent`, `--color`, `--no-color`, `--tty`, and `--clearScreen`.
+- Aggregate adapters duplicate only the frozen presentation-flag allowlist: `--reporter`, `--silent`, `--color`, `--no-color`, `--tty`, and `--clearScreen`.
+- Aggregate and mixed adapters reject `--outputFile` and other non-allowlisted suite-shaping flags, including false-valued coverage forms such as `--coverage=false` and `--coverage.enabled false`.
 - Non-test operational raw Vitest modes and flags bypass the gate instead of being coerced into broad test runs.
 - `--config/-c` plus file-only selectors stay delegated so targeted server one-shots do not hit the broad gate.
 - `test`, `test:all`, and `test:server:all` preserve the current split phase contracts from `main`.
