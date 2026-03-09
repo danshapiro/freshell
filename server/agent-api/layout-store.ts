@@ -334,6 +334,18 @@ export class LayoutStore {
     return { tabId }
   }
 
+  renamePane(paneId: string, title: string) {
+    if (!this.snapshot) return { message: 'no layout snapshot' as const }
+
+    const pane = this.getPaneSnapshot(paneId)
+    if (!pane) return { message: 'pane not found' as const }
+
+    if (!this.snapshot.paneTitles) this.snapshot.paneTitles = {}
+    if (!this.snapshot.paneTitles[pane.tabId]) this.snapshot.paneTitles[pane.tabId] = {}
+    this.snapshot.paneTitles[pane.tabId][paneId] = title
+    return { tabId: pane.tabId, paneId }
+  }
+
   closeTab(tabId: string) {
     if (!this.snapshot) return { message: 'no layout snapshot' as const }
     const nextTabs = this.snapshot.tabs.filter((t) => t.id !== tabId)

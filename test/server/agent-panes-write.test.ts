@@ -42,3 +42,61 @@ it('resolves tmux-style pane targets for close', async () => {
   expect(res.body.status).toBe('ok')
   expect(closePane).toHaveBeenCalledWith('pane_resolved')
 })
+
+it('rejects blank pane rename payloads', async () => {
+  const app = express()
+  app.use(express.json())
+  const renamePane = vi.fn()
+  app.use('/api', createAgentApiRouter({
+    layoutStore: { renamePane },
+    registry: {} as any,
+    wsHandler: { broadcastUiCommand: vi.fn() },
+  }))
+
+  const res = await request(app).patch('/api/panes/pane_1').send({ name: '   ' })
+
+  expect(res.status).toBe(400)
+  expect(renamePane).not.toHaveBeenCalled()
+})
+
+it('renames a resolved pane via PATCH /api/panes/:id', async () => {
+  const app = express()
+  app.use(express.json())
+  const renamePane = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_real' }))
+  const broadcastUiCommand = vi.fn()
+  app.use('/api', createAgentApiRouter({
+    layoutStore: {
+      renamePane,
+      resolveTarget: () => ({ tabId: 'tab_1', paneId: 'pane_real' }),
+    } as any,
+    registry: {} as any,
+    wsHandler: { broadcastUiCommand },
+  }))
+
+  const res = await request(app).patch('/api/panes/1.0').send({ name: '  Logs  ' })
+
+  expect(res.status).toBe(200)
+  expect(renamePane).toHaveBeenCalledWith('pane_real', 'Logs')
+  expect(broadcastUiCommand).toHaveBeenCalledWith({
+    command: 'pane.rename',
+    payload: { tabId: 'tab_1', paneId: 'pane_real', title: 'Logs' },
+  })
+})
+
+it('does not broadcast pane.rename when the pane does not exist', async () => {
+  const app = express()
+  app.use(express.json())
+  const renamePane = vi.fn(() => ({ message: 'pane not found' }))
+  const broadcastUiCommand = vi.fn()
+  app.use('/api', createAgentApiRouter({
+    layoutStore: { renamePane },
+    registry: {} as any,
+    wsHandler: { broadcastUiCommand },
+  }))
+
+  const res = await request(app).patch('/api/panes/missing').send({ name: 'Ghost' })
+
+  expect(res.status).toBe(200)
+  expect(renamePane).toHaveBeenCalledWith('missing', 'Ghost')
+  expect(broadcastUiCommand).not.toHaveBeenCalled()
+})

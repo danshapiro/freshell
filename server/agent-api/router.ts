@@ -520,6 +520,24 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
     res.json(ok({ paneId: newPaneId, terminalId }, message))
   })
 
+  router.patch('/panes/:id', (req, res) => {
+    const name = parseRequiredName(req.body?.name)
+    if (!name) return res.status(400).json(fail('name required'))
+
+    const resolved = resolvePaneTarget(req.params.id)
+    const paneId = resolved.paneId || req.params.id
+    const result = layoutStore.renamePane(paneId, name)
+
+    if (result?.tabId) {
+      wsHandler?.broadcastUiCommand({
+        command: 'pane.rename',
+        payload: { tabId: result.tabId, paneId: result.paneId || paneId, title: name },
+      })
+    }
+
+    res.json(ok(result, resolved.message || result?.message || 'pane renamed'))
+  })
+
   router.post('/panes/:id/close', (req, res) => {
     const rawPaneId = req.params.id
     const resolved = resolvePaneTarget(rawPaneId)
