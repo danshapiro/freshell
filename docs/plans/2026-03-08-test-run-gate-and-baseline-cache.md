@@ -468,13 +468,15 @@
     - `npm run test -- --color`, `--no-color`, `--tty`, and `--clearScreen` are allowed and forwarded to both split Vitest phases
     - `npm run test:server:all -- --reporter=dot` forwards to both server Vitest phases
     - `npm run check -- --reporter=dot` forwards only to the nested test phase, not typecheck
+    - `npm run check -- --silent` forwards only to the nested test phase, not typecheck
     - `npm run verify -- --reporter=dot` forwards only to the nested test phase, not build
+    - `npm run verify -- --color`, `--no-color`, `--tty`, and `--clearScreen` forward only to the nested test phase, not build
     - `npm run test -- <fixture-client-test-file>` is rejected with an actionable error
     - `npm run test:server:all -- <fixture-server-test-file>` is rejected with an actionable error
     - `npm run check -- <fixture-client-test-file>` is rejected with an actionable error
     - `npm run verify -- <fixture-client-test-file>` is rejected with an actionable error
     - `npm run test -- --project server`, `npm run test:server:all -- --dir test/server`, `npm run check -- -t name`, and `npm run verify -- --changed` are rejected with an actionable error instead of being fanned out across phases
-    - `npm run test -- --outputFile=tmp.json` and `npm run test:server:all -- --outputFile=tmp.json` are rejected with an actionable error until explicit per-phase remapping or artifact-merge semantics exist
+    - `npm run test -- --outputFile=tmp.json`, `npm run test:server:all -- --outputFile tmp.json`, `npm run check -- --outputFile=tmp.json`, and `npm run verify -- --outputFile tmp.json` are rejected with an actionable error until explicit per-phase remapping or artifact-merge semantics exist
     - false-valued non-allowlisted suite-shaping forms such as `npm run test -- --coverage=false`, `npm run test:server:all -- --coverage.enabled false`, `npm run check -- --coverage=false`, and `npm run verify -- --coverage.enabled=false` are rejected with the same actionable error instead of being fanned out
     - other non-allowlisted forwarded flags such as `npm run test -- --isolate=false`, `npm run test:server:all -- --bail=0`, `npm run check -- --maxWorkers=1`, and `npm run verify -- --passWithNoTests=false` are rejected with the same actionable error instead of being fanned out
     - `npm run check -- --coverage` and `npm run verify -- --coverage` are rejected with an actionable error
@@ -592,6 +594,7 @@
   - `npx vitest run` enters the same `BroadOneShotTestRun` path as public broad scripts.
   - `npx vitest` with `CI=1` or non-TTY runtime becomes a gated broad run.
   - `npx vitest --run` enters the same `BroadOneShotTestRun` path as raw `vitest run`.
+  - Every file-targeted delegation case in this task uses the same real resolved fixture paths or explicit injected resolver seam from Task 1; no synthetic placeholder strings are allowed.
   - `npx vitest --run <fixture-client-test-file>` delegates upstream with no gate side effects.
   - `npx vitest --run --coverage` becomes a gated broad run.
   - `npx vitest --run --coverage true` becomes a gated broad run.
@@ -695,6 +698,7 @@
   - raw `npx vitest --run --coverage.enabled=true` gated but never reusable
   - raw `npx vitest --run --coverage false` and `--coverage.enabled false` not being misclassified as coverage-bearing
   - raw `npx vitest --run --coverage=false` and `--coverage.enabled=false` not being misclassified as coverage-bearing
+  - every file-targeted delegation case in this task uses the same real resolved fixture paths or explicit injected resolver seam from Task 1; no synthetic placeholder strings are allowed
   - targeted file-only invocations with false-valued coverage flags staying delegated instead of becoming broad
   - `test` and `test:all` preserving the split `client-all -> server-all`
   - `test:server:all` preserving the split `without-logger -> logger-separation`
@@ -790,6 +794,7 @@
 - Aggregate and mixed adapters reject forwarded suite-shaping flags and positional selectors instead of guessing how to fan them out.
 - Aggregate and mixed adapters also reject other non-allowlisted forwarded semantic flags, including false-valued forms such as `--isolate=false`, `--bail=0`, and `--maxWorkers=1`.
 - Aggregate adapters duplicate only the frozen presentation-flag allowlist: `--reporter`, `--silent`, `--color`, `--no-color`, `--tty`, and `--clearScreen`.
+- Mixed adapters also accept only that same frozen presentation-flag allowlist on their nested Vitest phase, and the plan now proves `--reporter`, `--silent`, `--color`, `--no-color`, `--tty`, and `--clearScreen` with `check`/`verify` examples.
 - Aggregate and mixed adapters reject `--outputFile` and other non-allowlisted forwarded semantic flags, including false-valued coverage forms such as `--coverage=false` and `--coverage.enabled false`.
 - Non-test operational raw Vitest modes and flags bypass the gate instead of being coerced into broad test runs.
 - `--config/-c` plus file-only selectors stay delegated so targeted server one-shots do not hit the broad gate.
