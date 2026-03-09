@@ -32,6 +32,7 @@
 - `BroadOneShotTestRun` is the only primitive. Every gated broad path, public or raw, must route through it.
 - Public delegated scripts still route through the same wrapper for classification. When they delegate, they must produce no lock/holder/reuse side effects, but they may not bypass classification entirely because trailing args can change mode.
 - Rewritten public npm scripts must preserve trailing-argv behavior. Any args passed after `--` to `npm run <script> -- ...` must be forwarded into classification and then to the eventual upstream command instead of being dropped or misparsed.
+- When a file-targeted single-phase public adapter delegates upstream, forwarded file selectors replace that adapter’s default broad positional selector set instead of being appended to it. Non-selector adapter defaults such as `--config`, `--pool forks`, and `--exclude test/integration/server/logger.separation.test.ts` remain intact on the delegated upstream argv.
 - Aggregate and mixed adapters may not guess at forwarded suite-shaping inputs. For `test`, `test:all`, `test:server:all`, `check`, and `verify`, forwarded positional selectors and forwarded suite-shaping flags after `--` must be rejected with an actionable error instead of being copied into every phase or silently dropped. Only a small allowlist of presentation-only flags may be duplicated across split Vitest phases.
 - The aggregate-adapter allowlist is frozen to presentation-only Vitest flags that do not change selected tests or runtime semantics:
   - `--reporter`
@@ -465,11 +466,11 @@
     - `npm run test:server -- --run --coverage` becomes a gated broad run instead of bypassing the gate
     - `npm run test:watch -- --run` becomes a gated broad run instead of bypassing the gate
   - File-targeted single-phase public adapters preserve narrow delegation:
-    - `npm run test:unit -- <fixture-client-test-file>` delegates upstream with no gate side effects
-    - `npm run test:client -- <fixture-client-test-file>` delegates upstream with no gate side effects
-    - `npm run test:client:all -- <fixture-client-test-file>` delegates upstream with no gate side effects
-    - `npm run test:integration -- <fixture-server-test-file>` delegates upstream with no gate side effects
-    - `npm run test:server:without-logger -- <fixture-server-test-file>` delegates upstream with no gate side effects
+    - `npm run test:unit -- <fixture-client-test-file>` delegates upstream with no gate side effects, replacing the adapter’s default `test/unit` selector with the forwarded file target
+    - `npm run test:client -- <fixture-client-test-file>` delegates upstream with no gate side effects, replacing the adapter’s default `test/unit/client` selector with the forwarded file target
+    - `npm run test:client:all -- <fixture-client-test-file>` delegates upstream with no gate side effects, replacing the absence of a default positional selector with the forwarded file target while preserving `--pool forks`
+    - `npm run test:integration -- <fixture-server-test-file>` delegates upstream with no gate side effects, replacing the adapter’s default `test/server` selector while preserving `--config vitest.server.config.ts`
+    - `npm run test:server:without-logger -- <fixture-server-test-file>` delegates upstream with no gate side effects, replacing the default broad selector set with the forwarded file target while preserving `--config vitest.server.config.ts` and the logger exclusion
   - Multi-phase trailing argv behavior is explicit:
     - `npm run test -- --reporter=dot` forwards to both split Vitest phases
     - `npm run test -- --silent` forwards to both split Vitest phases
@@ -541,6 +542,8 @@
   - adapter argv forwarding so trailing args after `--` are appended to the adapter’s declared upstream command and also participate in classification/reuse decisions when they are suite-shaping
   - explicit narrow delegation carve-outs for file-targeted single-phase public adapters:
     - if `test:unit`, `test:integration`, `test:client`, `test:client:all`, or `test:server:without-logger` receives only resolved file selectors and no broad suite-shaping flags, classify as `delegate upstream` instead of gated broad work
+    - the delegated upstream argv replaces the adapter’s default broad positional selector set with the forwarded file selectors instead of appending them
+    - preserve non-selector adapter defaults during that replacement, including `--config`, `--pool forks`, and the logger exclusion for `test:server:without-logger`
   - explicit multi-phase forwarding rules:
     - duplicate only allowlisted presentation-only flags across each Vitest phase in split aggregates
     - reject any forwarded non-allowlisted flags on aggregate and mixed adapters with a clear error, including suite-shaping, execution-semantic, and false-valued forms
@@ -623,6 +626,7 @@
   - `npx vitest --run --coverage=true --reuse-baseline` does not early-exit from a cached success and still executes fresh upstream work.
   - `npx vitest --run --coverage.enabled=true --reuse-baseline` does not early-exit from a cached success and still executes fresh upstream work.
   - `npx vitest --run --reporter=json --outputFile=tmp.json --reuse-baseline` does not early-exit from a cached success and still executes fresh upstream work.
+  - `npx vitest --run --reporter=json --outputFile tmp.json --reuse-baseline` does not early-exit from a cached success and still executes fresh upstream work.
   - `npx vitest <fixture-client-test-file>` and `npx vitest run <fixture-client-test-file>` delegate upstream with no holder file.
   - `npx vitest run --config vitest.server.config.ts <fixture-server-test-file>` delegates upstream with no gate side effects.
   - `npx vitest --ui`, `npx vitest watch`, `npx vitest dev`, `npx vitest related`, and `npx vitest bench` delegate upstream with no gate side effects.
@@ -694,6 +698,7 @@
   - forwarded truthy coverage flags making reusable public adapters such as `test:unit` and `test:client:all` become non-reusable for that invocation
   - forwarded false-valued coverage flags on reusable public adapters such as `test:unit` and `test:client:all` not disabling reuse
   - forwarded `--reporter=json --outputFile=tmp.json` making reusable single-phase public adapters such as `test:unit` execute fresh work instead of reusing a baseline
+  - forwarded `--reporter=json --outputFile tmp.json` making reusable single-phase public adapters such as `test:unit` execute fresh work instead of reusing a baseline
   - file-targeted single-phase public adapters such as `test:unit`, `test:client`, `test:client:all`, `test:integration`, and `test:server:without-logger` delegating upstream when trailing args resolve to real fixture files
   - mixed adapters such as `check` and `verify` forwarding allowlisted presentation flags only to the nested Vitest phase, never to `build` or `typecheck`
   - mixed adapters such as `check` and `verify` rejecting forwarded coverage flags with an actionable error
@@ -710,6 +715,7 @@
   - raw `npx vitest --run --coverage.enabled true` gated but never reusable
   - raw `npx vitest --run --coverage=true` gated but never reusable
   - raw `npx vitest --run --coverage.enabled=true` gated but never reusable
+  - raw `npx vitest --run --reporter=json --outputFile=tmp.json` and `npx vitest --run --reporter=json --outputFile tmp.json` executing fresh work instead of reusing a baseline
   - raw `npx vitest --run --coverage false` and `--coverage.enabled false` not being misclassified as coverage-bearing
   - raw `npx vitest --run --coverage=false` and `--coverage.enabled=false` not being misclassified as coverage-bearing
   - every file-targeted delegation case in this task uses the same real resolved fixture paths or explicit injected resolver seam from Task 1; no synthetic placeholder strings are allowed
@@ -826,6 +832,7 @@
 - Non-test operational raw Vitest modes and flags bypass the gate instead of being coerced into broad test runs.
 - `--config/-c` plus file-only selectors stay delegated so targeted server one-shots do not hit the broad gate.
 - File-targeted public single-phase adapters stay delegated when trailing args resolve to files and no broad selector is present.
+- When those public single-phase adapters delegate, forwarded file selectors replace the adapter’s default broad positional selector set while preserving non-selector defaults such as config, pool, and the logger exclusion.
 - `test`, `test:all`, and `test:server:all` preserve the current split phase contracts from `main`.
 - `test:server:logger-separation` keeps its current single-fork isolation flags.
 - `test:coverage` and `verify` are gated but never reusable.
