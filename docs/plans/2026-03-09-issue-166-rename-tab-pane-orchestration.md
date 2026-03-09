@@ -4,7 +4,7 @@
 
 **Goal:** Expose orchestration operations for renaming tabs and panes, including active-target defaults and explicit identifiers, and document those operations in the Freshell orchestration skill.
 
-**Architecture:** Keep rename orchestration server-authoritative. Tab rename already exists as a layout-store mutation, so tighten that path by trimming names and rejecting blanks at the HTTP boundary. Add the missing pane rename write path as a pane-targeted mutation in `LayoutStore`, expose it through `PATCH /api/panes/:id`, mirror the resulting `pane.rename` broadcast into Redux, and extend the CLI plus orchestration skill so agents can create or split workspaces and assign stable tab and pane names entirely through the orchestration surface.
+**Architecture:** Keep rename orchestration server-authoritative. Normalize names once at the HTTP boundary, trim blanks out of both rename routes, and only broadcast rename `ui.command` events after the layout store confirms the mutation. Add the missing pane rename write path as a pane-targeted mutation in `LayoutStore`, expose it through `PATCH /api/panes/:id`, mirror the resulting `pane.rename` broadcast into Redux, and extend the CLI plus orchestration skill so agents can create or split workspaces and assign stable tab and pane names entirely through the orchestration surface.
 
 **Tech Stack:** TypeScript, Express agent API, Freshell CLI (`server/cli`), React/Redux UI command handling, Vitest, supertest, child-process CLI e2e tests.
 
@@ -17,19 +17,20 @@
 - Do **not** route pane rename through terminal/session rename APIs. Those only cover coding-CLI terminals and do not satisfy the issue requirement to rename arbitrary panes in the layout tree.
 - Do **not** solve this in Redux only. Orchestration is an HTTP surface for remote agents, so the authoritative mutation must live in the server layout store and then broadcast back to connected clients.
 - Keep tab rename and pane rename as distinct explicit operations. Do **not** auto-rename tabs when panes are renamed.
+- Rename broadcasts must be success-only. Broadcasting a rename when the authoritative store rejected the target would desynchronize every connected client, so tighten tab rename while adding pane rename instead of copying the existing weakness forward.
 - Put active-target defaults in executable CLI behavior, not only in skill prose.
 - Prove the requested end state with a single real CLI flow against a real `LayoutStore`: create a workspace, split it, rename the tab, rename panes, and assert the persisted titles. Do not treat separate tab-only and pane-only flows as sufficient proof of the acceptance criteria.
-- Normalize rename input the same way across both routes and both CLI commands: trim final names and reject blank results.
+- Normalize rename input the same way across both routes and both CLI commands: trim final names, reject blank results, and let explicit-target positional forms join the remaining tokens into the final name.
 
 ## Acceptance Mapping
 
 - `rename-tab` supports `rename-tab NEW_NAME` for the active tab and `rename-tab TARGET NEW_NAME` for an explicit tab.
 - `rename-pane` is added as a first-class orchestration operation and supports both active-pane and explicit-pane targets.
 - The agent API exposes `PATCH /api/panes/:id` and `LayoutStore.renamePane(paneId, title)` so pane rename shares the same authoritative write path as the rest of layout orchestration.
-- Connected UIs converge immediately because successful mutations broadcast `tab.rename` and `pane.rename` `ui.command` events.
+- Connected UIs converge immediately because successful mutations broadcast `tab.rename` and `pane.rename` `ui.command` events only after the authoritative store returns a resolved target.
 - The orchestration skill documents both commands, their target grammar, and a concrete create/split/select/rename flow that uses both explicit targets and active-target defaults without any manual UI interaction.
 
-### Task 1: Tighten Tab Rename Validation at the Server Boundary
+### Task 1: Harden Tab Rename Validation and Broadcast Semantics
 
 **Files:**
 - Modify: `test/server/agent-tabs-write.test.ts`
@@ -57,12 +58,12 @@ it('rejects blank tab rename payloads', async () => {
 })
 ```
 
-**Step 2: Add a failing trim-and-broadcast tab rename test**
+**Step 2: Add a failing trim-and-broadcast-successful tab rename test**
 
 In `test/server/agent-tabs-write.test.ts`, add:
 
 ```ts
-it('trims tab rename payloads before writing and broadcasting', async () => {
+it('trims tab rename payloads before writing and broadcasts only successful renames', async () => {
   const app = express()
   app.use(express.json())
   const renameTab = vi.fn(() => ({ tabId: 'tab_1' }))
@@ -84,7 +85,31 @@ it('trims tab rename payloads before writing and broadcasting', async () => {
 })
 ```
 
-**Step 3: Run the targeted server tab test and confirm failure**
+**Step 3: Add a failing rejected-target tab rename test**
+
+In `test/server/agent-tabs-write.test.ts`, add:
+
+```ts
+it('does not broadcast tab.rename when the tab does not exist', async () => {
+  const app = express()
+  app.use(express.json())
+  const renameTab = vi.fn(() => ({ message: 'tab not found' }))
+  const broadcastUiCommand = vi.fn()
+  app.use('/api', createAgentApiRouter({
+    layoutStore: { renameTab },
+    registry: {} as any,
+    wsHandler: { broadcastUiCommand },
+  }))
+
+  const res = await request(app).patch('/api/tabs/missing').send({ name: 'Ghost' })
+
+  expect(res.status).toBe(200)
+  expect(renameTab).toHaveBeenCalledWith('missing', 'Ghost')
+  expect(broadcastUiCommand).not.toHaveBeenCalled()
+})
+```
+
+**Step 4: Run the targeted server tab test and confirm failure**
 
 Run:
 
@@ -93,9 +118,9 @@ npm test -- test/server/agent-tabs-write.test.ts
 ```
 
 Expected:
-- FAIL because the route currently accepts whitespace-only names and forwards untrimmed values
+- FAIL because the route currently accepts whitespace-only names, forwards untrimmed values, and broadcasts even when the layout store reports `tab not found`
 
-**Step 4: Implement shared name normalization in `server/agent-api/router.ts`**
+**Step 5: Implement shared name normalization and success-only broadcasting in `server/agent-api/router.ts`**
 
 Add this helper near `parseOptionalNumber()`:
 
@@ -114,15 +139,20 @@ router.patch('/tabs/:id', (req, res) => {
   if (!name) return res.status(400).json(fail('name required'))
 
   const result = layoutStore.renameTab(req.params.id, name)
-  wsHandler?.broadcastUiCommand({
-    command: 'tab.rename',
-    payload: { id: req.params.id, title: name },
-  })
+  if (result?.tabId) {
+    wsHandler?.broadcastUiCommand({
+      command: 'tab.rename',
+      payload: { id: req.params.id, title: name },
+    })
+  }
   res.json(ok(result, result.message || 'tab renamed'))
 })
 ```
 
-**Step 5: Re-run the targeted server tab test**
+Important detail:
+- Keep the existing response envelope semantics for missing tabs, but stop emitting `tab.rename` when the mutation did not actually happen.
+
+**Step 6: Re-run the targeted server tab test**
 
 Run:
 
@@ -133,7 +163,7 @@ npm test -- test/server/agent-tabs-write.test.ts
 Expected:
 - PASS
 
-**Step 6: Commit**
+**Step 7: Commit**
 
 ```bash
 git add test/server/agent-tabs-write.test.ts server/agent-api/router.ts
@@ -455,7 +485,7 @@ it('renames a non-active tab when a target id is provided', async () => {
     const first = await runCliJson<{ data: { tabId: string } }>(server.url, ['new-tab', '-n', 'Backlog'])
     const second = await runCliJson<{ data: { tabId: string } }>(server.url, ['new-tab', '-n', 'Active'])
 
-    await runCli(server.url, ['rename-tab', first.data.tabId, 'Release board'])
+    await runCli(server.url, ['rename-tab', first.data.tabId, 'Release', 'board'])
 
     const snapshot = (server.layoutStore as any).snapshot
     expect(snapshot.activeTabId).toBe(second.data.tabId)
@@ -476,7 +506,7 @@ npm test -- test/e2e/agent-cli-flow.test.ts
 ```
 
 Expected:
-- FAIL because `rename-tab NAME` currently treats the lone positional argument as a target instead of the new name
+- FAIL because `rename-tab NAME` currently treats the lone positional argument as a target instead of the new name, and explicit-target positional renames only preserve the first name token
 
 **Step 5: Implement shared rename parsing in `server/cli/index.ts`**
 
@@ -490,6 +520,7 @@ function resolveRenameArgs(
 ) {
   const explicitTarget = getFlag(flags, ...targetFlagNames)
   const explicitName = getFlag(flags, 'n', 'name', 'title')
+  const joinName = (parts: string[]) => parts.join(' ').trim()
 
   if (typeof explicitName === 'string') {
     return {
@@ -501,7 +532,7 @@ function resolveRenameArgs(
   if (typeof explicitTarget === 'string') {
     return {
       target: explicitTarget,
-      name: (args[0] || '').trim(),
+      name: joinName(args),
     }
   }
 
@@ -510,7 +541,7 @@ function resolveRenameArgs(
   }
 
   if (args.length >= 2) {
-    return { target: args[0], name: args[1].trim() }
+    return { target: args[0], name: joinName(args.slice(1)) }
   }
 
   return { target: undefined, name: '' }
@@ -544,7 +575,7 @@ case 'rename-tab': {
 
 Important details:
 - One positional argument means “rename the active target”.
-- Two positional arguments mean “rename the explicit target to the provided name”.
+- Two or more positional arguments mean “rename the explicit target to the remaining joined name”.
 - `-t/--target/--tab` wins over positional target inference.
 - `-n/--name/--title` wins over positional name inference.
 - Trim before validating so whitespace-only names fail locally.
@@ -723,7 +754,7 @@ Under “Targets”, add:
 ```md
 - Omitted target on `rename-tab` means the active tab.
 - Omitted target on `rename-pane` means the active pane in the active tab.
-- If a target or name contains spaces, prefer the flagged `-t/-n` form.
+- If a target contains spaces, or if you want an active-target rename with an unquoted multi-word name, prefer the flagged `-t/-n` form.
 ```
 
 Important detail:
