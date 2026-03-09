@@ -3,10 +3,15 @@
 // environment. They are NOT run by `npm test` (which uses the root vitest
 // configs); instead, they are run explicitly during E2E helper development.
 import { defineConfig } from 'vitest/config'
+import path from 'path'
+import { fileURLToPath } from 'url'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 export default defineConfig({
   test: {
     environment: 'node',
+    root: __dirname,
     include: ['helpers/**/*.test.ts'],
     testTimeout: 60_000, // TestServer startup can take a while
     hookTimeout: 30_000,

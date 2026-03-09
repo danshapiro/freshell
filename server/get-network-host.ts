@@ -30,6 +30,13 @@ export function getNetworkHost(): string {
   // import 'dotenv/config') can still see HOST from .env.
   dotenv.config()
 
+  // Explicit override for E2E tests and CI. Takes precedence over WSL
+  // auto-detection and config file. Only valid bind addresses are accepted.
+  const bindOverride = process.env.FRESHELL_BIND_HOST
+  if (bindOverride === '0.0.0.0' || bindOverride === '127.0.0.1') {
+    return bindOverride
+  }
+
   // On WSL, binding to 127.0.0.1 makes the server unreachable from the
   // Windows host browser. Always bind to 0.0.0.0 so Windows can connect.
   if (isWSL()) return '0.0.0.0'
