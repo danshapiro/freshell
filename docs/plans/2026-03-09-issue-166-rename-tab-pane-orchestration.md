@@ -18,7 +18,7 @@
 - Do **not** solve this in Redux only. Orchestration is an HTTP surface for remote agents, so the authoritative mutation must live in the server layout store and then broadcast back to connected clients.
 - Keep tab rename and pane rename as distinct explicit operations. Do **not** auto-rename tabs when panes are renamed.
 - Put active-target defaults in executable CLI behavior, not only in skill prose.
-- Prove the requested end state with a real create/split/rename CLI flow against a real `LayoutStore`, not only with mocked route smoke tests.
+- Prove the requested end state with a single real CLI flow against a real `LayoutStore`: create a workspace, split it, rename the tab, rename panes, and assert the persisted titles. Do not treat separate tab-only and pane-only flows as sufficient proof of the acceptance criteria.
 - Normalize rename input the same way across both routes and both CLI commands: trim final names and reject blank results.
 
 ## Acceptance Mapping
@@ -27,7 +27,7 @@
 - `rename-pane` is added as a first-class orchestration operation and supports both active-pane and explicit-pane targets.
 - The agent API exposes `PATCH /api/panes/:id` and `LayoutStore.renamePane(paneId, title)` so pane rename shares the same authoritative write path as the rest of layout orchestration.
 - Connected UIs converge immediately because successful mutations broadcast `tab.rename` and `pane.rename` `ui.command` events.
-- The orchestration skill documents both commands, their target grammar, and a concrete create/split/rename flow that assigns meaningful names without any manual UI interaction.
+- The orchestration skill documents both commands, their target grammar, and a concrete create/split/select/rename flow that uses both explicit targets and active-target defaults without any manual UI interaction.
 
 ### Task 1: Tighten Tab Rename Validation at the Server Boundary
 
@@ -567,18 +567,18 @@ git add test/e2e/agent-cli-flow.test.ts server/cli/index.ts
 git commit -m "feat(cli): support active tab rename"
 ```
 
-### Task 5: Add `rename-pane` to the CLI and Prove the End-to-End Flow
+### Task 5: Add `rename-pane` to the CLI and Prove the Combined Workspace Flow
 
 **Files:**
 - Modify: `test/e2e/agent-cli-flow.test.ts`
 - Modify: `server/cli/index.ts`
 
-**Step 1: Add a failing explicit-pane rename flow test**
+**Step 1: Add a failing combined tab-and-pane rename flow test**
 
 In `test/e2e/agent-cli-flow.test.ts`, add:
 
 ```ts
-it('renames panes in a create split rename flow', async () => {
+it('renames the tab and panes in a create split rename flow', async () => {
   const server = await startTestServerWithRealLayoutStore()
   try {
     const created = await runCliJson<{ data: { tabId: string; paneId: string } }>(server.url, [
@@ -601,10 +601,12 @@ it('renames panes in a create split rename flow', async () => {
     ])
     const secondPaneId = split.data.paneId
 
+    await runCli(server.url, ['rename-tab', '-t', tabId, '-n', 'Issue 166 work'])
     await runCli(server.url, ['rename-pane', '-t', firstPaneId, '-n', 'Codex'])
     await runCli(server.url, ['rename-pane', secondPaneId, 'Editor'])
 
     const snapshot = (server.layoutStore as any).snapshot
+    expect(snapshot.tabs.find((tab: any) => tab.id === tabId)?.title).toBe('Issue 166 work')
     expect(snapshot.paneTitles[tabId][firstPaneId]).toBe('Codex')
     expect(snapshot.paneTitles[tabId][secondPaneId]).toBe('Editor')
   } finally {
@@ -648,7 +650,7 @@ npm test -- test/e2e/agent-cli-flow.test.ts
 ```
 
 Expected:
-- FAIL because `rename-pane` is not implemented yet
+- FAIL because `rename-pane` is not implemented yet, so the requested create/split/rename workspace flow still cannot complete through orchestration alone
 
 **Step 4: Add the `rename-pane` CLI command in `server/cli/index.ts`**
 
@@ -725,7 +727,7 @@ Under “Targets”, add:
 ```
 
 Important detail:
-- Update the canonical skill at `.claude/skills/freshell-orchestration/SKILL.md`; the plugin path points there, so do not separately edit the plugin symlink.
+- Update the canonical skill at `.claude/skills/freshell-orchestration/SKILL.md`; the plugin directory contains a pointer file at `.claude/plugins/freshell-orchestration/skills/freshell-orchestration` that already resolves back to this skill directory, so do not edit the pointer file for this issue.
 
 **Step 2: Add a concrete create/split/rename playbook**
 
@@ -743,7 +745,8 @@ P1="$($FSH split-pane -t "$P0" --editor "$FILE" | jq -r '.data.paneId')"
 
 $FSH rename-tab -t "$TAB_ID" -n "Issue 166 work"
 $FSH rename-pane -t "$P0" -n "Codex"
-$FSH rename-pane -t "$P1" -n "Editor"
+$FSH select-pane -t "$P1"
+$FSH rename-pane "Editor"
 ```
 
 **Step 3: Sanity-check the skill markdown**
@@ -805,7 +808,8 @@ P0="$(printf '%s' "$TAB_JSON" | jq -r '.data.paneId')"
 P1="$($FSH split-pane -t "$P0" --editor /absolute/path/to/repo/README.md | jq -r '.data.paneId')"
 $FSH rename-tab -t "$TAB_ID" -n "Canary workspace"
 $FSH rename-pane -t "$P0" -n "Agent"
-$FSH rename-pane -t "$P1" -n "Docs"
+$FSH select-pane -t "$P1"
+$FSH rename-pane "Docs"
 ```
 
 Expected:
