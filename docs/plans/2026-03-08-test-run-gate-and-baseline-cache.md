@@ -33,9 +33,8 @@
 - Public delegated scripts still route through the same wrapper for classification. When they delegate, they must produce no lock/holder/reuse side effects, but they may not bypass classification entirely because trailing args can change mode.
 - Rewritten public npm scripts must preserve trailing-argv behavior. Any args passed after `--` to `npm run <script> -- ...` must be forwarded into classification and then to the eventual upstream command instead of being dropped or misparsed.
 - When a file-targeted single-phase public adapter delegates upstream, forwarded file selectors replace that adapter’s default broad positional selector set instead of being appended to it. Non-selector adapter defaults such as `--config`, `--pool forks`, and `--exclude test/integration/server/logger.separation.test.ts` remain intact on the delegated upstream argv.
-- Aggregate and mixed adapters may not guess at forwarded suite-shaping inputs. For `test`, `test:all`, `test:server:all`, `check`, and `verify`, forwarded positional selectors and forwarded suite-shaping flags after `--` must be rejected with an actionable error instead of being copied into every phase or silently dropped. Only a small allowlist of presentation-only flags may be duplicated across split Vitest phases.
-- The aggregate-adapter allowlist is frozen to presentation-only Vitest flags that do not change selected tests or runtime semantics:
-  - `--reporter`
+- Aggregate and mixed adapters may not guess at forwarded suite-shaping inputs. For `test`, `test:all`, `test:server:all`, `check`, and `verify`, forwarded positional selectors and forwarded suite-shaping flags after `--` must be rejected with an actionable error instead of being copied into every phase or silently dropped. Only a small allowlist of known-safe human-output flags may be duplicated across split Vitest phases, and split adapters may not forward `--reporter` until explicit per-phase reporter semantics are designed.
+- The aggregate-adapter allowlist is frozen to known-safe human-output Vitest flags that do not change selected tests, runtime semantics, or emit machine-readable/artifact output:
   - `--silent`
   - `--color`
   - `--no-color`
@@ -85,6 +84,7 @@
 - Bare raw `vitest` is not always watch. Classification must resolve its effective mode from Vitest’s default watch behavior:
   - if effective watch mode is true, `delegate upstream`
   - if effective watch mode is false, classify the same as raw one-shot `vitest run`
+- Explicit watch requests take precedence over CI/non-TTY inference. Any raw or wrapper-backed invocation containing `--watch` or `-w` must `delegate upstream` and must not gate, even when effective default watch mode would otherwise resolve false.
 - Bare raw `vitest --run` is equivalent to one-shot raw `vitest run` and must classify through the same broad-vs-narrow rules:
   - `vitest --run` with no selectors is broad
   - `vitest --run <file>` is narrow
@@ -94,6 +94,7 @@
 - Unknown broad suite-shaping flags are never reusable. They may still run as gated broad work, but reuse must be disabled instead of guessed.
 - Unknown raw Vitest subcommands that are not the default command and are not explicitly classified above must `delegate upstream`. The classifier still returns an explicit outcome; it may not leave any raw entrypoint undefined.
 - Unknown flags on explicitly non-test operational modes must `delegate upstream`, not be coerced into gated broad work.
+- CLI passthrough flags `--help`, `-h`, `--version`, and `-v` are unconditional `delegate upstream` cases for patched raw `vitest` and wrapper-backed single-phase public entrypoints. They must not acquire the gate, write holder state, or consult reuse logic.
 - `suiteKey` identifies the reusable workload. `commandKey` is provenance and UX only. Different commands may share a `suiteKey` only if they truly execute the same workload.
 - Reusable baseline identity is exact: the newest record matching `(suiteKey, commit, cleanWorktree=true, nodeVersion, platform, arch)` controls reuse. If the newest exact record is a failure, no older success for that same identity may be reused.
 - Reuse policy is frozen per adapter:
@@ -199,6 +200,8 @@
   - Invocation cwd comes from `INIT_CWD` when present, then falls back to `process.cwd()`.
   - Test-only common-dir override returns the supplied disposable directory without probing the live repo.
   - Trailing argv after `--` is preserved and classified instead of being dropped by the wrapper.
+  - Explicit raw `vitest --watch` and `vitest -w` delegate upstream even under `CI=1` or non-TTY runtime.
+  - Explicit raw `vitest --run --watch` and `vitest --run -w` delegate upstream even under `CI=1` or non-TTY runtime.
   - Bare `vitest` delegates when effective watch mode is true.
   - Bare `vitest` becomes `gated broad run` when effective watch mode is false.
   - Bare `vitest --run` becomes `gated broad run` with no selectors.
@@ -218,6 +221,7 @@
   - Raw `vitest <fixture-client-test-file>` and `vitest run <fixture-client-test-file>` are `delegate upstream`.
   - Raw `vitest --ui`, `vitest watch`, `vitest dev`, `vitest related`, and `vitest bench` are `delegate upstream`.
   - Raw `vitest --standalone` and `vitest --mergeReports` are `delegate upstream`.
+  - Raw `vitest --help`, `vitest -h`, `vitest --version`, and `vitest -v` are unconditional `delegate upstream`.
   - Unknown raw Vitest subcommands still get an explicit outcome and default to `delegate upstream`.
   - Unknown broad suite-shaping flags classify as broad but mark reuse disabled.
   - File-target classification cases use real resolved fixture paths or an explicit injected resolution seam; no test uses placeholder paths that bypass the “resolves to a file” contract.
@@ -247,8 +251,10 @@
     - `kind: 'delegate-upstream'`
     - `kind: 'gated-broad-run'`
   - explicit bare-`vitest` mode resolution using `CI` and `stdin.isTTY`
+  - explicit `--watch/-w` precedence so watch requests delegate before CI/non-TTY one-shot inference is applied
   - explicit equivalence between `vitest --run ...` and `vitest run ...`
   - explicit delegate path for operational/non-test modes and flags
+  - explicit delegate path for `--help`, `-h`, `--version`, and `-v`
   - explicit carve-out for `--config/-c` plus file-only selectors so targeted server one-shots remain delegated
   - normalized broad-run classification results including:
     - normalized positional selectors
@@ -469,9 +475,11 @@
     - `npm run test:server -- --run --coverage` becomes a gated broad run instead of bypassing the gate
     - `npm run test:server:logger-separation -- --run --coverage` becomes a gated broad run instead of bypassing the gate
     - `npm run test:watch -- --run` becomes a gated broad run instead of bypassing the gate
+    - explicit `npm run test:watch -- --watch`, `npm run test:watch -- -w`, `npm run test:server -- --watch`, and `npm run test:server -- -w` delegate upstream with no gate side effects even under `CI=1` or other non-TTY one-shot conditions
     - plain `npm run test:watch` delegates only when effective watch mode is true, and becomes a gated broad run under `CI=1` or other non-TTY one-shot conditions
     - plain `npm run test:server` delegates only when effective watch mode is true, and becomes a gated broad run under `CI=1` or other non-TTY one-shot conditions
     - default `npm run test:server:logger-separation` remains delegated only when forwarded trailing args do not introduce a broad suite-shaping selector
+    - wrapper-backed single-phase public entrypoints such as `test:watch`, `test:ui`, `test:server`, `test:server:logger-separation`, `test:unit`, and `test:server:without-logger` treat `--help`, `-h`, `--version`, and `-v` as unconditional passthroughs with no gate side effects
   - File-targeted single-phase public adapters preserve narrow delegation:
     - `npm run test:unit -- <fixture-client-test-file>` delegates upstream with no gate side effects, replacing the adapter’s default `test/unit` selector with the forwarded file target
     - `npm run test:client -- <fixture-client-test-file>` delegates upstream with no gate side effects, replacing the adapter’s default `test/unit/client` selector with the forwarded file target
@@ -482,10 +490,10 @@
     - `npm run test:server:logger-separation -- <fixture-server-test-file>` delegates upstream with no gate side effects, preserving `--config vitest.server.config.ts`, `--pool forks`, `--poolOptions.forks.singleFork`, and `--no-file-parallelism` while replacing the default logger-separation test path with the forwarded file target
     - the fake-upstream fixture captures the exact emitted child argv, and these tests assert the replaced-selector shape and preserved non-selector defaults instead of checking delegation alone
   - Multi-phase trailing argv behavior is explicit:
-    - `npm run test -- --reporter=dot` forwards to both split Vitest phases
     - `npm run test -- --silent` forwards to both split Vitest phases
     - `npm run test -- --color`, `--no-color`, `--tty`, and `--clearScreen` are allowed and forwarded to both split Vitest phases
-    - `npm run test:server:all -- --reporter=dot` forwards to both server Vitest phases
+    - `npm run test -- --reporter=dot` is rejected with an actionable error until explicit per-phase reporter semantics exist
+    - `npm run test:server:all -- --reporter=dot` is rejected with an actionable error until explicit per-phase reporter semantics exist
     - `npm run check -- --reporter=dot` forwards only to the nested test phase, not typecheck
     - `npm run check -- --silent`, `--color`, `--no-color`, `--tty`, and `--clearScreen` forward only to the nested test phase, not typecheck
     - `npm run verify -- --reporter=dot`, `--silent`, `--color`, `--no-color`, `--tty`, and `--clearScreen` forward only to the nested test phase, not build
@@ -557,7 +565,8 @@
     - preserve non-selector adapter defaults during that replacement, including `--config`, `--pool forks`, the logger exclusion for `test:server:without-logger`, and the single-fork/no-file-parallelism flags for `test:server:logger-separation`
     - assert the exact spawned child argv through the fake-upstream capture fixture so selector replacement is verified concretely, not inferred from high-level behavior, including `test:server` and `test:server:logger-separation`
   - explicit multi-phase forwarding rules:
-    - duplicate only allowlisted presentation-only flags across each Vitest phase in split aggregates
+    - duplicate only allowlisted known-safe human-output flags across each Vitest phase in split aggregates
+    - reject forwarded `--reporter` on split aggregates until the design grows explicit per-phase reporter mapping or value-safe duplication rules
     - reject any forwarded non-allowlisted flags on aggregate and mixed adapters with a clear error, including suite-shaping, execution-semantic, and false-valued forms
     - reject `--outputFile` on aggregate and mixed adapters until the design grows explicit per-phase remapping or artifact-merge semantics
     - reject false-valued non-allowlisted suite-shaping flags on aggregate and mixed adapters the same way as truthy forms
@@ -619,6 +628,7 @@
   Cover:
   - `npx vitest run` enters the same `BroadOneShotTestRun` path as public broad scripts.
   - `npx vitest` with `CI=1` or non-TTY runtime becomes a gated broad run.
+  - explicit `npx vitest --watch`, `npx vitest -w`, `npx vitest --run --watch`, and `npx vitest --run -w` delegate upstream with no gate side effects even under `CI=1` or non-TTY runtime.
   - `npx vitest --run` enters the same `BroadOneShotTestRun` path as raw `vitest run`.
   - Every file-targeted delegation case in this task uses the same real resolved fixture paths or explicit injected resolver seam from Task 1; no synthetic placeholder strings are allowed.
   - `npx vitest --run <fixture-client-test-file>` delegates upstream with no gate side effects.
@@ -644,6 +654,7 @@
   - `npx vitest run --config vitest.server.config.ts <fixture-server-test-file>` delegates upstream with no gate side effects.
   - `npx vitest --ui`, `npx vitest watch`, `npx vitest dev`, `npx vitest related`, and `npx vitest bench` delegate upstream with no gate side effects.
   - `npx vitest --standalone` and `npx vitest --mergeReports` delegate upstream with no gate side effects.
+  - `npx vitest --help`, `npx vitest -h`, `npx vitest --version`, and `npx vitest -v` delegate upstream with no gate side effects.
   - The patched entrypoint works from a nested cwd such as `src/`.
   - The patched entrypoint uses a non-recursive env marker so the second hop bypasses gate interception and imports upstream `node_modules/vitest/dist/cli.js` directly.
   - Unknown broad suite flags still gate the run but disable reuse.
@@ -708,6 +719,7 @@
   - baseline reuse staying off by default unless `--reuse-baseline` is present
   - trailing argv passthrough from rewritten npm scripts
   - delegated public scripts reclassifying trailing args instead of bypassing the wrapper
+  - explicit `--watch/-w` on raw and wrapper-backed entrypoints taking precedence over CI/non-TTY inference and remaining delegated with no gate side effects
   - plain `test:watch` and `test:server` delegating only when effective watch mode is true, and becoming gated broad runs under `CI=1` or other non-TTY one-shot conditions
   - default `test:server` remaining delegated only when effective watch mode is true and forwarded trailing args do not introduce a broad suite-shaping selector
   - default `test:server:logger-separation` remaining delegated only when forwarded trailing args do not introduce a broad suite-shaping selector
@@ -718,7 +730,8 @@
   - forwarded `--reporter=json --outputFile tmp.json` making reusable single-phase public adapters such as `test:unit` execute fresh work instead of reusing a baseline
   - file-targeted single-phase public adapters such as `test:unit`, `test:client`, `test:client:all`, `test:integration`, `test:server:without-logger`, `test:server`, and `test:server:logger-separation` delegating upstream when trailing args resolve to real fixture files
   - those single-phase delegated cases asserting the exact spawned child argv via the fake-upstream capture fixture, including selector replacement and preserved non-selector defaults for `test:server` and `test:server:logger-separation`
-  - mixed adapters such as `check` and `verify` forwarding allowlisted presentation flags only to the nested Vitest phase, never to `build` or `typecheck`
+  - split aggregates rejecting forwarded `--reporter` with an actionable error instead of duplicating it across phases
+  - mixed adapters such as `check` and `verify` forwarding `--reporter` and other allowlisted human-output flags only to the nested Vitest phase, never to `build` or `typecheck`
   - mixed adapters such as `check` and `verify` rejecting forwarded coverage flags with an actionable error
   - aggregate adapters such as `test`, `test:all`, and `test:server:all` rejecting false-valued non-allowlisted suite-shaping flags such as `--coverage=false` and `--coverage.enabled false`
   - aggregate adapters rejecting `--outputFile` until explicit per-phase remapping or artifact-merge semantics exist
@@ -746,6 +759,7 @@
   - `--config/-c` plus file-only selectors staying delegated for targeted server loops
   - `-c`, `--root`, `--dir`, and repeated `--project` feeding `suiteKey`
   - non-test operational raw Vitest flags bypassing the gate
+  - raw and wrapper-backed single-phase `--help`, `-h`, `--version`, and `-v` passthroughs bypassing gate and reuse logic
   - nested-cwd raw Vitest interception
   - adapter-owned Vitest child phases bypassing the patched entrypoint instead of self-contenting
   - disposable common-dir isolation so no test touches the live repo `.git`
@@ -844,16 +858,19 @@
 - Delegated public scripts still pass through wrapper classification, so trailing args cannot turn them into ungated broad runs.
 - Aggregate and mixed adapters reject forwarded suite-shaping flags and positional selectors instead of guessing how to fan them out.
 - Aggregate and mixed adapters also reject other non-allowlisted forwarded semantic flags, including false-valued forms such as `--isolate=false`, `--bail=0`, and `--maxWorkers=1`.
-- Aggregate adapters duplicate only the frozen presentation-flag allowlist: `--reporter`, `--silent`, `--color`, `--no-color`, `--tty`, and `--clearScreen`.
-- Mixed adapters also accept only that same frozen presentation-flag allowlist on their nested Vitest phase, and Task 4 plus Task 6 prove that those flags reach only the nested Vitest phase, never `build` or `typecheck`.
+- Split aggregates duplicate only the frozen known-safe human-output allowlist: `--silent`, `--color`, `--no-color`, `--tty`, and `--clearScreen`.
+- Split aggregates reject forwarded `--reporter` until the design grows explicit per-phase reporter mapping or value-safe duplication semantics.
+- Mixed adapters may still forward `--reporter` on their single nested Vitest phase, and Task 4 plus Task 6 prove that forwarded `--reporter`, `--silent`, `--color`, `--no-color`, `--tty`, and `--clearScreen` reach only that nested Vitest phase, never `build` or `typecheck`.
 - Aggregate and mixed adapters reject `--outputFile` and other non-allowlisted forwarded semantic flags, including false-valued coverage forms such as `--coverage=false` and `--coverage.enabled false`.
 - Non-test operational raw Vitest modes and flags bypass the gate instead of being coerced into broad test runs.
-- `test:watch` and `test:server` resolve effective watch mode through the wrapper and become gated broad runs whenever that mode resolves false in CI or other non-TTY one-shot contexts.
+- Explicit `--watch` and `-w` requests on raw and wrapper-backed entrypoints always delegate upstream and take precedence over CI/non-TTY inference.
+- `test:watch` and `test:server` resolve effective watch mode through the wrapper and become gated broad runs whenever that mode resolves false in CI or other non-TTY one-shot contexts, but only when no explicit `--watch/-w` request is present.
 - `--config/-c` plus file-only selectors stay delegated so targeted server one-shots do not hit the broad gate, including `test:server` and `test:server:logger-separation` when their trailing args do not reclassify them as broad and effective watch mode does not force one-shot gating.
 - File-targeted public single-phase adapters stay delegated when trailing args resolve to files and no broad selector is present.
 - When those public single-phase adapters delegate, forwarded file selectors replace the adapter’s default broad positional selector set while preserving non-selector defaults such as config, pool, and the logger exclusion.
 - Task 3 proves result-store writes use the same temp-file, `fsync`, rename, and directory-`fsync` crash-safety sequence frozen in the invariants.
 - Delegated single-phase replacement behavior is asserted against captured child argv, not just high-level delegation outcomes.
+- Raw `vitest` and wrapper-backed single-phase public entrypoints treat `--help`, `-h`, `--version`, and `-v` as unconditional passthroughs that bypass gate and reuse logic.
 - `test`, `test:all`, and `test:server:all` preserve the current split phase contracts from `main`.
 - `test:server:logger-separation` keeps its current single-fork isolation flags.
 - `test:coverage` and `verify` are gated but never reusable.
