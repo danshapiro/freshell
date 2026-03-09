@@ -63,6 +63,11 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
     return Number.isFinite(n) ? n : undefined
   }
 
+  const parseRequiredName = (value: unknown) => {
+    const trimmed = typeof value === 'string' ? value.trim() : ''
+    return trimmed.length > 0 ? trimmed : undefined
+  }
+
   const isValidPercent = (value: number) => Number.isFinite(value) && value >= 1 && value <= 99
   const clampPercent = (value: number) => Math.min(99, Math.max(1, value))
   const normalizePairToHundred = (a: number, b: number): [number, number] => {
@@ -163,8 +168,13 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
   })
 
   router.patch('/tabs/:id', (req, res) => {
-    const result = layoutStore.renameTab(req.params.id, req.body?.name)
-    wsHandler?.broadcastUiCommand({ command: 'tab.rename', payload: { id: req.params.id, title: req.body?.name } })
+    const name = parseRequiredName(req.body?.name)
+    if (!name) return res.status(400).json(fail('name required'))
+
+    const result = layoutStore.renameTab(req.params.id, name)
+    if (result?.tabId) {
+      wsHandler?.broadcastUiCommand({ command: 'tab.rename', payload: { id: req.params.id, title: name } })
+    }
     res.json(ok(result, result.message || 'tab renamed'))
   })
 
