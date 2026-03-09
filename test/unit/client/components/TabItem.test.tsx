@@ -99,6 +99,14 @@ describe('TabItem', () => {
     expect(el?.className).toContain('bg-muted')
   })
 
+  it('uses a static blue status dot for creating tabs when pane icons are unavailable', () => {
+    render(<TabItem {...defaultProps} tab={createTab({ status: 'creating' })} paneContents={[]} iconsOnTabs={false} />)
+    const dot = screen.getByTestId('circle-icon')
+    expect(dot.getAttribute('class')).toContain('text-blue-500')
+    expect(dot.getAttribute('class')).toContain('fill-blue-500')
+    expect(dot.getAttribute('class')).not.toContain('animate-pulse')
+  })
+
   it('applies attention classes on active tab with highlight', () => {
     render(<TabItem {...defaultProps} isActive={true} needsAttention={true} tabAttentionStyle="highlight" />)
     const el = getTabElement()

@@ -233,12 +233,13 @@ describe('PaneHeader', () => {
       expect(paneIcon.getAttribute('class')).toContain('text-muted-foreground/40')
     })
 
-    it('applies pulse animation to icon when status is creating', () => {
+    it('applies blue styling without pulse animation when status is creating', () => {
       render(
         <PaneHeader title="Test" status="creating" isActive={true} onClose={vi.fn()} content={makeTerminalContent()} />
       )
       const paneIcon = screen.getByTestId('pane-icon')
-      expect(paneIcon.getAttribute('class')).toContain('animate-pulse')
+      expect(paneIcon.getAttribute('class')).toContain('text-blue-500')
+      expect(paneIcon.getAttribute('class')).not.toContain('animate-pulse')
     })
   })
 
