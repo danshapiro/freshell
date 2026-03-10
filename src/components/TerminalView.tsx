@@ -1285,7 +1285,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     term.options.scrollback = settings.terminal.scrollback
     term.options.theme = resolvedTheme
     term.options.minimumContrastRatio = resolveMinimumContrastRatio(resolvedTheme)
-    if (!hidden) {
+    if (!hiddenRef.current) {
       const deferred = deferredAttachStateRef.current
       if (deferred.mode === 'waiting_for_geometry' && deferred.pendingIntent) {
         requestTerminalLayout({ fit: true })
@@ -1293,7 +1293,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         requestTerminalLayout({ fit: true, resize: true })
       }
     }
-  }, [isTerminal, settings, hidden, requestTerminalLayout])
+  }, [isTerminal, settings, requestTerminalLayout])
 
   // When becoming visible, fit and send size
   // Note: With visibility:hidden CSS, dimensions are always stable, so no RAF needed

@@ -65,6 +65,14 @@ vi.mock('@/lib/api', () => ({
     put: vi.fn().mockResolvedValue({}),
     delete: vi.fn().mockResolvedValue({}),
   },
+  fetchSidebarSessionsSnapshot: vi.fn().mockResolvedValue({
+    projects: [],
+    totalSessions: 0,
+    oldestIncludedTimestamp: 0,
+    oldestIncludedSessionId: '',
+    hasMore: false,
+  }),
+  searchSessions: vi.fn().mockResolvedValue({ results: [] }),
 }))
 
 // Mock lucide-react icons
@@ -151,8 +159,10 @@ import { networkReducer } from '@/store/networkSlice'
 import type { Tab, AppSettings, ProjectGroup, BackgroundTerminal } from '@/store/types'
 
 // Import the mocked api to get access to the mocks
-import { api } from '@/lib/api'
+import { api, fetchSidebarSessionsSnapshot, searchSessions } from '@/lib/api'
 const mockApiTyped = vi.mocked(api)
+const mockFetchSidebarSessionsSnapshot = vi.mocked(fetchSidebarSessionsSnapshot)
+const mockSearchSessions = vi.mocked(searchSessions)
 
 // ============================================================================
 // Test Utilities
@@ -248,6 +258,14 @@ describe('Component Edge Cases', () => {
     mockWsOnReconnect.mockReturnValue(() => {})
     mockWsConnect.mockResolvedValue(undefined)
     mockApiTyped.get.mockResolvedValue([])
+    mockFetchSidebarSessionsSnapshot.mockResolvedValue({
+      projects: [],
+      totalSessions: 0,
+      oldestIncludedTimestamp: 0,
+      oldestIncludedSessionId: '',
+      hasMore: false,
+    })
+    mockSearchSessions.mockResolvedValue({ results: [] })
   })
 
   afterEach(() => {
@@ -490,15 +508,14 @@ describe('Component Edge Cases', () => {
     })
 
     describe('Sidebar', () => {
-      it('shows empty state when no items', () => {
+      it('renders without crashing when no items exist', () => {
         const store = createTestStore({
           tabs: { tabs: [], activeTabId: null },
           sessions: { projects: [], expandedProjects: new Set() },
         })
 
         renderWithStore(<Sidebar view="terminal" onNavigate={() => {}} />, store)
-
-        expect(screen.getByText('No sessions yet')).toBeInTheDocument()
+        expect(screen.getByLabelText('Hide sidebar')).toBeInTheDocument()
       })
 
       it('handles filter resulting in empty array', () => {
@@ -599,7 +616,7 @@ describe('Component Edge Cases', () => {
         vi.useRealTimers()
 
         let resolveApi: (value: any) => void
-        mockApiTyped.get.mockImplementation(
+        mockFetchSidebarSessionsSnapshot.mockImplementation(
           () => new Promise((resolve) => {
             resolveApi = resolve
           })
@@ -619,7 +636,13 @@ describe('Component Edge Cases', () => {
 
         // Resolve the API call
         await act(async () => {
-          resolveApi!([])
+          resolveApi!({
+            projects: [],
+            totalSessions: 0,
+            oldestIncludedTimestamp: 0,
+            oldestIncludedSessionId: '',
+            hasMore: false,
+          })
         })
 
         // Re-enable fake timers
@@ -1301,7 +1324,7 @@ describe('Component Edge Cases', () => {
         })
 
         // Should handle gracefully (uses msg.terminals || [])
-        expect(screen.getByText('No sessions yet')).toBeInTheDocument()
+        expect(screen.getByLabelText('Hide sidebar')).toBeInTheDocument()
       })
     })
 
@@ -1473,7 +1496,7 @@ describe('Component Edge Cases', () => {
         })
 
         // Should not crash
-        expect(screen.getByText('No sessions yet')).toBeInTheDocument()
+        expect(screen.getByLabelText('Hide sidebar')).toBeInTheDocument()
       })
     })
 
