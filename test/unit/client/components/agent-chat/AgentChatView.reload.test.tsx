@@ -1,9 +1,15 @@
 import { describe, it, expect, vi, afterEach, beforeAll, beforeEach } from 'vitest'
-import { render, screen, cleanup, act } from '@testing-library/react'
+import { render, screen, cleanup, act, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
 import AgentChatView from '@/components/agent-chat/AgentChatView'
-import agentChatReducer, { replayHistory, sessionCreated, sessionInit, setSessionStatus } from '@/store/agentChatSlice'
+import agentChatReducer, {
+  replayHistory,
+  sessionCreated,
+  sessionInit,
+  sessionSnapshotReceived,
+  setSessionStatus,
+} from '@/store/agentChatSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
@@ -15,6 +21,9 @@ beforeAll(() => {
 })
 
 const wsSend = vi.fn()
+const getAgentTimelinePage = vi.fn()
+const getAgentTurnBody = vi.fn()
+const setSessionMetadata = vi.fn(() => Promise.resolve(undefined))
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -22,6 +31,16 @@ vi.mock('@/lib/ws-client', () => ({
     onReconnect: vi.fn(() => vi.fn()),
   }),
 }))
+
+vi.mock('@/lib/api', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api')
+  return {
+    ...actual,
+    getAgentTimelinePage: (...args: unknown[]) => getAgentTimelinePage(...args),
+    getAgentTurnBody: (...args: unknown[]) => getAgentTurnBody(...args),
+    setSessionMetadata: (...args: unknown[]) => setSessionMetadata(...args),
+  }
+})
 
 function makeStore() {
   return configureStore({
@@ -41,6 +60,13 @@ const RELOAD_PANE: AgentChatPaneContent = {
 }
 
 describe('AgentChatView reload/restore behavior', () => {
+  beforeEach(() => {
+    getAgentTimelinePage.mockReset()
+    getAgentTurnBody.mockReset()
+    setSessionMetadata.mockReset()
+    setSessionMetadata.mockResolvedValue(undefined)
+  })
+
   afterEach(() => {
     cleanup()
     wsSend.mockClear()
@@ -204,6 +230,116 @@ describe('AgentChatView reload/restore behavior', () => {
 
     // Should show the welcome screen since session is empty
     expect(screen.getByText('Freshclaude')).toBeInTheDocument()
+  })
+
+  it('restores from sdk.session.snapshot plus HTTP timeline fetch without waiting for sdk.history', async () => {
+    getAgentTimelinePage.mockResolvedValue({
+      sessionId: 'sess-reload-1',
+      items: [
+        {
+          turnId: 'turn-2',
+          sessionId: 'sess-reload-1',
+          role: 'assistant',
+          summary: 'Recent summary',
+          timestamp: '2026-03-10T10:01:00.000Z',
+        },
+      ],
+      nextCursor: null,
+      revision: 2,
+    })
+    getAgentTurnBody.mockResolvedValue({
+      sessionId: 'sess-reload-1',
+      turnId: 'turn-2',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Hydrated from HTTP timeline' }],
+        timestamp: '2026-03-10T10:01:00.000Z',
+      },
+    })
+
+    const store = makeStore()
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sess-reload-1',
+      latestTurnId: 'turn-2',
+      status: 'idle',
+    }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(getAgentTimelinePage).toHaveBeenCalledWith(
+        'sess-reload-1',
+        expect.objectContaining({ priority: 'visible' }),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      )
+    })
+    expect(getAgentTurnBody).toHaveBeenCalledWith(
+      'sess-reload-1',
+      'turn-2',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
+    expect(await screen.findByText('Hydrated from HTTP timeline')).toBeInTheDocument()
+    expect(screen.queryByText(/restoring/i)).not.toBeInTheDocument()
+  })
+
+  it('does not prefetch timeline while the pane is hidden', async () => {
+    const store = makeStore()
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sess-reload-1',
+      latestTurnId: 'turn-2',
+      status: 'idle',
+    }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={RELOAD_PANE} hidden />
+      </Provider>,
+    )
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(getAgentTimelinePage).not.toHaveBeenCalled()
+    expect(getAgentTurnBody).not.toHaveBeenCalled()
+  })
+
+  it('uses the persisted resumeSessionId for visible timeline hydration', async () => {
+    getAgentTimelinePage.mockResolvedValue({
+      sessionId: 'cli-session-1',
+      items: [],
+      nextCursor: null,
+      revision: 1,
+    })
+
+    const store = makeStore()
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sess-reload-1',
+      latestTurnId: 'turn-2',
+      status: 'idle',
+    }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView
+          tabId="t1"
+          paneId="p1"
+          paneContent={{ ...RELOAD_PANE, resumeSessionId: 'cli-session-1' }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(getAgentTimelinePage).toHaveBeenCalledWith(
+        'cli-session-1',
+        expect.objectContaining({ priority: 'visible' }),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      )
+    })
   })
 
   it('stays in restoring state when setSessionStatus arrives before replayHistory (race condition)', () => {

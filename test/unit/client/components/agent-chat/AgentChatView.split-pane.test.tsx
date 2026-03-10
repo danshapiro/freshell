@@ -8,13 +8,14 @@
  * realistic Redux state and verifies the pane recovers correctly.
  */
 import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest'
-import { render, screen, cleanup, act } from '@testing-library/react'
+import { render, screen, cleanup, act, fireEvent, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
 import AgentChatView from '@/components/agent-chat/AgentChatView'
 import agentChatReducer, {
   sessionCreated,
   sessionInit,
+  sessionSnapshotReceived,
   setSessionStatus,
   replayHistory,
 } from '@/store/agentChatSlice'
@@ -29,6 +30,9 @@ beforeAll(() => {
 })
 
 const wsSend = vi.fn()
+const getAgentTimelinePage = vi.fn()
+const getAgentTurnBody = vi.fn()
+const setSessionMetadata = vi.fn(() => Promise.resolve(undefined))
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -36,6 +40,16 @@ vi.mock('@/lib/ws-client', () => ({
     onReconnect: vi.fn(() => vi.fn()),
   }),
 }))
+
+vi.mock('@/lib/api', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api')
+  return {
+    ...actual,
+    getAgentTimelinePage: (...args: unknown[]) => getAgentTimelinePage(...args),
+    getAgentTurnBody: (...args: unknown[]) => getAgentTurnBody(...args),
+    setSessionMetadata: (...args: unknown[]) => setSessionMetadata(...args),
+  }
+})
 
 function makeStore() {
   return configureStore({
@@ -85,6 +99,9 @@ describe('AgentChatView — split pane (Bug 2)', () => {
   afterEach(() => {
     cleanup()
     wsSend.mockClear()
+    getAgentTimelinePage.mockReset()
+    getAgentTurnBody.mockReset()
+    setSessionMetadata.mockClear()
     vi.useRealTimers()
   })
 
@@ -102,7 +119,6 @@ describe('AgentChatView — split pane (Bug 2)', () => {
     }
 
     // Pre-populate the Redux agentChat session
-    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(sessionInit({
       sessionId: 'sess-1',
       cliSessionId: 'cli-abc',
@@ -164,7 +180,6 @@ describe('AgentChatView — split pane (Bug 2)', () => {
       resumeSessionId: 'cli-abc',
     }
 
-    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(sessionInit({
       sessionId: 'sess-1',
       cliSessionId: 'cli-abc',
@@ -209,7 +224,6 @@ describe('AgentChatView — split pane (Bug 2)', () => {
       resumeSessionId: 'cli-abc',
     }
 
-    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(sessionInit({
       sessionId: 'sess-1',
       cliSessionId: 'cli-abc',
@@ -250,6 +264,86 @@ describe('AgentChatView — split pane (Bug 2)', () => {
     expect(content!.status).toBe('idle')
   })
 
+  it('restores a split-pane remount from sdk.session.snapshot plus HTTP timeline hydration', async () => {
+    const store = makeStore()
+
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-1',
+      sessionId: 'sess-1',
+      status: 'idle',
+      resumeSessionId: 'cli-abc',
+    }
+
+    store.dispatch(sessionInit({
+      sessionId: 'sess-1',
+      cliSessionId: 'cli-abc',
+      model: 'claude-opus-4-6',
+    }))
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sess-1',
+      latestTurnId: 'turn-2',
+      status: 'idle',
+    }))
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    getAgentTimelinePage.mockResolvedValue({
+      sessionId: 'cli-abc',
+      items: [
+        {
+          turnId: 'turn-2',
+          sessionId: 'cli-abc',
+          role: 'assistant',
+          summary: 'Split-pane summary',
+          timestamp: '2026-03-10T10:01:00.000Z',
+        },
+      ],
+      nextCursor: null,
+      revision: 2,
+    })
+    getAgentTurnBody.mockResolvedValue({
+      sessionId: 'cli-abc',
+      turnId: 'turn-2',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Hydrated split-pane turn' }],
+        timestamp: '2026-03-10T10:01:00.000Z',
+      },
+    })
+
+    const { unmount } = render(
+      <Provider store={store}>
+        <ReactiveWrapper store={store} tabId="t1" paneId="p1" />
+      </Provider>,
+    )
+
+    unmount()
+    wsSend.mockClear()
+    getAgentTimelinePage.mockClear()
+    getAgentTurnBody.mockClear()
+
+    render(
+      <Provider store={store}>
+        <ReactiveWrapper store={store} tabId="t1" paneId="p1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(getAgentTimelinePage).toHaveBeenCalledWith(
+        'cli-abc',
+        expect.objectContaining({ priority: 'visible' }),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      )
+    })
+    expect(getAgentTurnBody).toHaveBeenCalledWith(
+      'cli-abc',
+      'turn-2',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
+    expect(await screen.findByText('Hydrated split-pane turn')).toBeInTheDocument()
+  })
+
   it('handles the full addPane flow: connected pane survives tree restructuring', () => {
     const store = makeStore()
 
@@ -262,7 +356,6 @@ describe('AgentChatView — split pane (Bug 2)', () => {
       resumeSessionId: 'cli-abc',
     }
 
-    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(sessionInit({
       sessionId: 'sess-1',
       cliSessionId: 'cli-abc',
@@ -324,7 +417,6 @@ describe('AgentChatView — split pane (Bug 2)', () => {
       resumeSessionId: 'cli-abc',
     }
 
-    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(sessionInit({
       sessionId: 'sess-1',
       cliSessionId: 'cli-abc',
@@ -373,7 +465,6 @@ describe('AgentChatView — split pane (Bug 2)', () => {
       status: 'idle',
     }
 
-    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(sessionInit({
       sessionId: 'sess-1',
       cliSessionId: 'cli-abc',
@@ -447,7 +538,6 @@ describe('AgentChatView — split pane (Bug 2)', () => {
       resumeSessionId: 'cli-abc',
     }
 
-    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(sessionInit({
       sessionId: 'sess-1',
       cliSessionId: 'cli-abc',
@@ -487,5 +577,111 @@ describe('AgentChatView — split pane (Bug 2)', () => {
     })
     // Should NOT regress to starting
     expect(getPaneContent(store, 't1', 'p1')!.status).toBe('running')
+  })
+
+  it('expands older turns by fetching bodies on demand after a split-pane remount', async () => {
+    const store = makeStore()
+
+    const pane: AgentChatPaneContent = {
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-1',
+      sessionId: 'sess-1',
+      status: 'idle',
+      resumeSessionId: 'cli-abc',
+    }
+
+    getAgentTimelinePage.mockResolvedValue({
+      sessionId: 'cli-abc',
+      items: [
+        {
+          turnId: 'turn-3',
+          sessionId: 'cli-abc',
+          role: 'assistant',
+          summary: 'Newest visible turn',
+          timestamp: '2026-03-10T10:02:00.000Z',
+        },
+        {
+          turnId: 'turn-2',
+          sessionId: 'cli-abc',
+          role: 'assistant',
+          summary: 'Older collapsed summary',
+          timestamp: '2026-03-10T10:01:00.000Z',
+        },
+      ],
+      nextCursor: null,
+      revision: 2,
+    })
+    getAgentTurnBody.mockImplementation(async (_sessionId: string, turnId: string) => {
+      if (turnId === 'turn-3') {
+        return {
+          sessionId: 'cli-abc',
+          turnId: 'turn-3',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Newest visible turn body' }],
+            timestamp: '2026-03-10T10:02:00.000Z',
+          },
+        }
+      }
+
+      return {
+        sessionId: 'cli-abc',
+        turnId: 'turn-2',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Expanded older turn body' }],
+          timestamp: '2026-03-10T10:01:00.000Z',
+        },
+      }
+    })
+
+    store.dispatch(sessionInit({
+      sessionId: 'sess-1',
+      cliSessionId: 'cli-abc',
+      model: 'claude-opus-4-6',
+    }))
+    store.dispatch(sessionSnapshotReceived({
+      sessionId: 'sess-1',
+      latestTurnId: 'turn-3',
+      status: 'idle',
+    }))
+    store.dispatch(initLayout({ tabId: 't1', content: pane, paneId: 'p1' }))
+
+    const { unmount } = render(
+      <Provider store={store}>
+        <ReactiveWrapper store={store} tabId="t1" paneId="p1" />
+      </Provider>,
+    )
+    unmount()
+
+    render(
+      <Provider store={store}>
+        <ReactiveWrapper store={store} tabId="t1" paneId="p1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(getAgentTimelinePage).toHaveBeenCalledWith(
+        'cli-abc',
+        expect.objectContaining({ priority: 'visible' }),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      )
+    })
+
+    expect(await screen.findByText('Newest visible turn body')).toBeInTheDocument()
+
+    const olderTurnToggle = await screen.findByRole('button', { name: 'Expand turn' })
+    expect(screen.getByText('Older collapsed summary')).toBeInTheDocument()
+    fireEvent.click(olderTurnToggle)
+
+    await waitFor(() => {
+      expect(getAgentTurnBody).toHaveBeenCalledWith(
+        'cli-abc',
+        'turn-2',
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      )
+    })
+    expect(await screen.findByText('Expanded older turn body')).toBeInTheDocument()
   })
 })

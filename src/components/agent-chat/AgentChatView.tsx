@@ -4,6 +4,7 @@ import type { AgentChatPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updatePaneContent, mergePaneContent } from '@/store/panesSlice'
 import { addUserMessage, clearPendingCreate, removePermission, removeQuestion } from '@/store/agentChatSlice'
+import { loadAgentTimelineWindow, loadAgentTurnBody } from '@/store/agentChatThunks'
 import { getWsClient } from '@/lib/ws-client'
 import { cn } from '@/lib/utils'
 import { ChevronDown } from 'lucide-react'
@@ -77,9 +78,11 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const initialSetupDone = useAppSelector((s) => s.settings.settings.agentChat?.initialSetupDone ?? false)
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
   const surfaceVisibleMarkedRef = useRef(false)
+  const timelineSessionId = paneContent.resumeSessionId ?? session?.cliSessionId ?? paneContent.sessionId
 
   // Track whether we're waiting for a session restore (persisted sessionId, history not yet loaded).
-  // Fresh creates set historyLoaded=true immediately; reloads wait for sdk.history.
+  // Fresh creates set historyLoaded=true immediately; reloads wait for an initial
+  // history source (HTTP timeline window or legacy sdk.history).
   // Times out after 5s to handle stale sessionIds from server restarts.
   const isRestoring = !!paneContent.sessionId && !session?.historyLoaded
   const [restoreTimedOut, setRestoreTimedOut] = useState(false)
@@ -244,6 +247,33 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     })
   }, [paneContent.sessionId, ws])
 
+  useEffect(() => {
+    if (!paneContent.sessionId || !timelineSessionId) return
+    if (hidden) return
+    if (activePaneId && activePaneId !== paneId) return
+    if (session?.latestTurnId === undefined) return
+    if (session?.historyLoaded) return
+
+    const promise = dispatch(loadAgentTimelineWindow({
+      sessionId: paneContent.sessionId,
+      timelineSessionId,
+      requestKey: `${tabId}:${paneId}`,
+    }))
+    return () => {
+      promise.abort()
+    }
+  }, [
+    activePaneId,
+    dispatch,
+    hidden,
+    paneContent.sessionId,
+    paneId,
+    session?.historyLoaded,
+    session?.latestTurnId,
+    tabId,
+    timelineSessionId,
+  ])
+
   // Smart auto-scroll: only scroll if user is already at/near the bottom
   useEffect(() => {
     if (isAtBottomRef.current) {
@@ -397,6 +427,8 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const pendingPermissions = session ? Object.values(session.pendingPermissions) : []
   const pendingQuestions = session ? Object.values(session.pendingQuestions) : []
   const hasWaitingItems = pendingPermissions.length > 0 || pendingQuestions.length > 0
+  const timelineItems = useMemo(() => session?.timelineItems ?? [], [session?.timelineItems])
+  const timelineBodies = session?.timelineBodies ?? {}
 
   // Auto-expand: count completed tools across all messages, expand the most recent N
   const RECENT_TOOLS_EXPANDED = 3
@@ -468,16 +500,16 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   useEffect(() => {
     if (surfaceVisibleMarkedRef.current) return
     if (hidden) return
-    if (activePaneId !== paneId) return
+    if (activePaneId && activePaneId !== paneId) return
     if (!session?.historyLoaded) return
-    if (renderItems.length === 0) return
+    if (renderItems.length === 0 && timelineItems.length === 0) return
     getInstalledPerfAuditBridge()?.mark('agent_chat.surface_visible', {
       tabId,
       paneId,
       sessionId: paneContent.sessionId,
     })
     surfaceVisibleMarkedRef.current = true
-  }, [activePaneId, hidden, paneContent.sessionId, paneId, renderItems.length, session?.historyLoaded, tabId])
+  }, [activePaneId, hidden, paneContent.sessionId, paneId, renderItems.length, session?.historyLoaded, tabId, timelineItems.length])
 
   return (
     <div className={cn('h-full w-full flex flex-col', hidden ? 'tab-hidden' : 'tab-visible')} role="region" aria-label={`${providerLabel} Chat`} onPointerUp={handleContainerPointerUp}>
@@ -526,12 +558,49 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         )}
 
         {/* Welcome: no sessionId, session exists but empty, or restore timed out */}
-        {!session?.messages.length && (!isRestoring || restoreTimedOut) && (
+        {!session?.messages.length && timelineItems.length === 0 && (!isRestoring || restoreTimedOut) && (
           <div className="text-center text-muted-foreground text-sm py-6">
             <p className="font-medium mb-1">{providerLabel}</p>
             <p>Rich chat UI for AI agent sessions.</p>
           </div>
         )}
+
+        {timelineItems.map((item) => {
+          const message = timelineBodies[item.turnId]
+          if (message) {
+            return (
+              <MessageBubble
+                key={`timeline-${item.turnId}`}
+                speaker={message.role}
+                content={message.content}
+                timestamp={message.timestamp}
+                model={message.model}
+                showThinking={paneContent.showThinking ?? defaultShowThinking}
+                showTools={paneContent.showTools ?? defaultShowTools}
+                showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+              />
+            )
+          }
+
+          return (
+            <CollapsedTurn
+              key={`timeline-${item.turnId}`}
+              summary={item.summary}
+              loading={session?.timelineLoading}
+              onExpand={() => {
+                if (!paneContent.sessionId) return
+                void dispatch(loadAgentTurnBody({
+                  sessionId: paneContent.sessionId,
+                  timelineSessionId,
+                  turnId: item.turnId,
+                }))
+              }}
+              showThinking={paneContent.showThinking ?? defaultShowThinking}
+              showTools={paneContent.showTools ?? defaultShowTools}
+              showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+            />
+          )
+        })}
 
         {(() => {
           let turnIndex = 0

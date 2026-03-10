@@ -1900,6 +1900,12 @@ export class WsHandler {
           if (m.resumeSessionId) {
             try {
               const messages = await loadSessionHistory(m.resumeSessionId)
+              this.send(ws, {
+                type: 'sdk.session.snapshot',
+                sessionId: session.sessionId,
+                latestTurnId: messages && messages.length > 0 ? `turn-${messages.length - 1}` : null,
+                status: session.status,
+              })
               if (messages && messages.length > 0) {
                 this.send(ws, {
                   type: 'sdk.history',
@@ -1910,6 +1916,13 @@ export class WsHandler {
             } catch (err) {
               log.warn({ err, resumeSessionId: m.resumeSessionId }, 'Failed to load session history from .jsonl')
             }
+          } else {
+            this.send(ws, {
+              type: 'sdk.session.snapshot',
+              sessionId: session.sessionId,
+              latestTurnId: null,
+              status: session.status,
+            })
           }
 
           // Send preliminary sdk.session.init so the client can start interacting.
@@ -2101,6 +2114,12 @@ export class WsHandler {
             log.warn({ err, resumeSessionId: session.resumeSessionId }, 'Failed to load .jsonl history for attach')
           }
         }
+        this.send(ws, {
+          type: 'sdk.session.snapshot',
+          sessionId: m.sessionId,
+          latestTurnId: historyMessages.length > 0 ? `turn-${historyMessages.length - 1}` : null,
+          status: session.status,
+        })
         this.send(ws, {
           type: 'sdk.history',
           sessionId: m.sessionId,

@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import agentChatReducer, {
   sessionCreated,
   sessionInit,
+  sessionSnapshotReceived,
   addAssistantMessage,
   addUserMessage,
   setStreaming,
@@ -13,6 +14,8 @@ import agentChatReducer, {
   turnResult,
   sessionExited,
   replayHistory,
+  timelinePageReceived,
+  turnBodyReceived,
   sessionError,
   clearPendingCreate,
   removeSession,
@@ -169,6 +172,61 @@ describe('agentChatSlice', () => {
       status: 'idle',
     }))
     expect(state.sessions['sess-status'].historyLoaded).toBeUndefined()
+  })
+
+  it('stores a small session snapshot without marking history loaded', () => {
+    const state = agentChatReducer(initial, sessionSnapshotReceived({
+      sessionId: 'sess-snapshot',
+      latestTurnId: 'turn-9',
+      status: 'idle',
+    }))
+
+    expect(state.sessions['sess-snapshot'].status).toBe('idle')
+    expect(state.sessions['sess-snapshot'].latestTurnId).toBe('turn-9')
+    expect(state.sessions['sess-snapshot'].historyLoaded).toBeUndefined()
+  })
+
+  it('stores timeline summaries and marks history loaded once the first page arrives', () => {
+    const state = agentChatReducer(initial, timelinePageReceived({
+      sessionId: 'sess-timeline',
+      items: [
+        {
+          turnId: 'turn-2',
+          sessionId: 'sess-timeline',
+          role: 'assistant',
+          summary: 'Latest summary',
+          timestamp: '2026-03-10T10:01:00.000Z',
+        },
+      ],
+      nextCursor: 'cursor-2',
+      revision: 2,
+      replace: true,
+    }))
+
+    expect(state.sessions['sess-timeline'].historyLoaded).toBe(true)
+    expect(state.sessions['sess-timeline'].timelineItems).toEqual([
+      expect.objectContaining({ turnId: 'turn-2', summary: 'Latest summary' }),
+    ])
+    expect(state.sessions['sess-timeline'].nextTimelineCursor).toBe('cursor-2')
+  })
+
+  it('stores hydrated turn bodies separately from live websocket messages', () => {
+    const state = agentChatReducer(initial, turnBodyReceived({
+      sessionId: 'sess-turn',
+      turnId: 'turn-7',
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: 'Hydrated older turn' }],
+        timestamp: '2026-03-10T09:55:00.000Z',
+      },
+    }))
+
+    expect(state.sessions['sess-turn'].messages).toEqual([])
+    expect(state.sessions['sess-turn'].timelineBodies['turn-7']).toEqual(
+      expect.objectContaining({
+        content: [{ type: 'text', text: 'Hydrated older turn' }],
+      }),
+    )
   })
 
   it('bootstraps session on replayHistory for unknown sessionId', () => {

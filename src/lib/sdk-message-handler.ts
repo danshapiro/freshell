@@ -11,6 +11,7 @@ import {
   addPermissionRequest,
   removePermission,
   addQuestionRequest,
+  sessionSnapshotReceived,
   setSessionStatus,
   turnResult,
   sessionExited,
@@ -68,6 +69,14 @@ export function handleSdkMessage(dispatch: AppDispatch, msg: Record<string, unkn
         model: msg.model as string | undefined,
         cwd: msg.cwd as string | undefined,
         tools: msg.tools as Array<{ name: string }> | undefined,
+      }))
+      return true
+
+    case 'sdk.session.snapshot':
+      dispatch(sessionSnapshotReceived({
+        sessionId: msg.sessionId as string,
+        latestTurnId: (msg.latestTurnId as string | null | undefined) ?? null,
+        status: msg.status as any,
       }))
       return true
 
