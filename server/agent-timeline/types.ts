@@ -1,7 +1,7 @@
 import type { ChatMessage } from '../session-history-loader.js'
 import type {
   AgentTimelinePageQuery as SharedAgentTimelinePageQuery,
-} from '../shared/read-models.js'
+} from '../../shared/read-models.js'
 
 export type AgentTimelinePageQuery = SharedAgentTimelinePageQuery
 

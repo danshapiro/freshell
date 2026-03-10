@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { z } from 'zod'
-import { AgentTimelinePageQuerySchema } from '../shared/read-models.js'
+import { AgentTimelinePageQuerySchema } from '../../shared/read-models.js'
 import type { AgentTimelineService } from './service.js'
 
 export type AgentTimelineRouterDeps = {
