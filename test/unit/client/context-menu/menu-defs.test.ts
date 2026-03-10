@@ -105,6 +105,13 @@ function makeCtx(actions: MenuActions, overrides?: Partial<MenuBuildContext>): M
   }
 }
 
+function getTerminalItem(items: ReturnType<typeof buildMenuItems>, id: string) {
+  const item = items.find((candidate) => candidate.type === 'item' && candidate.id === id)
+  expect(item?.type).toBe('item')
+  if (!item || item.type !== 'item') throw new Error(`Missing terminal item: ${id}`)
+  return item
+}
+
 describe('context menu global view labels', () => {
   it('includes renamed views and new tabs view in global menu', () => {
     const items = buildMenuItems(
@@ -336,6 +343,19 @@ describe('buildMenuItems - "Replace pane" item', () => {
 })
 
 describe('buildMenuItems - terminal "Search" item', () => {
+  it('"Search" appears after the new clipboard separator', () => {
+    const actions = createActions()
+    const items = buildMenuItems(
+      { kind: 'terminal', tabId: 'tab-1', paneId: 'pane-1' },
+      makeCtx(actions),
+    )
+
+    const separatorIndex = items.findIndex((item) => item.type === 'separator' && item.id === 'terminal-clipboard-sep')
+    const searchIndex = items.findIndex((item) => item.type === 'item' && item.id === 'terminal-search')
+    expect(separatorIndex).toBeGreaterThanOrEqual(0)
+    expect(searchIndex).toBeGreaterThan(separatorIndex)
+  })
+
   it('includes "Search" item in terminal context menu', () => {
     const actions = createActions()
     const target: ContextTarget = { kind: 'terminal', tabId: 'tab-1', paneId: 'pane-1' }
@@ -346,17 +366,6 @@ describe('buildMenuItems - terminal "Search" item', () => {
     if (searchItem?.type === 'item') {
       expect(searchItem.label).toBe('Search')
     }
-  })
-
-  it('"Search" appears after "Select all" in terminal menu', () => {
-    const actions = createActions()
-    const target: ContextTarget = { kind: 'terminal', tabId: 'tab-1', paneId: 'pane-1' }
-    const items = buildMenuItems(target, makeCtx(actions))
-
-    const selectAllIndex = items.findIndex((item) => item.type === 'item' && item.id === 'terminal-select-all')
-    const searchIndex = items.findIndex((item) => item.type === 'item' && item.id === 'terminal-search')
-    expect(selectAllIndex).toBeGreaterThanOrEqual(0)
-    expect(searchIndex).toBeGreaterThan(selectAllIndex)
   })
 
   it('calls terminalActions.openSearch when selected', () => {
@@ -371,5 +380,53 @@ describe('buildMenuItems - terminal "Search" item', () => {
       searchItem.onSelect()
       expect(terminalActions?.openSearch).toHaveBeenCalled()
     }
+  })
+})
+
+describe('buildMenuItems - terminal clipboard section', () => {
+  it('places copy, Paste, and Select all in the first section with icons', () => {
+    const items = buildMenuItems(
+      { kind: 'terminal', tabId: 'tab-1', paneId: 'pane-1' },
+      makeCtx(createActions()),
+    )
+
+    expect(
+      items.slice(0, 4).map((item) => item.type === 'item' ? item.id : item.type),
+    ).toEqual([
+      'terminal-copy',
+      'terminal-paste',
+      'terminal-select-all',
+      'separator',
+    ])
+
+    expect(getTerminalItem(items, 'terminal-copy').label).toBe('copy')
+    expect(getTerminalItem(items, 'terminal-copy').icon).toBeTruthy()
+    expect(getTerminalItem(items, 'terminal-paste').icon).toBeTruthy()
+    expect(getTerminalItem(items, 'terminal-select-all').icon).toBeTruthy()
+  })
+
+  it('preserves copy enabled state and action wiring', () => {
+    const actions = createActions()
+    const terminalActions = {
+      copySelection: vi.fn(),
+      paste: vi.fn(),
+      selectAll: vi.fn(),
+      clearScrollback: vi.fn(),
+      reset: vi.fn(),
+      scrollToBottom: vi.fn(),
+      hasSelection: vi.fn(() => true),
+      openSearch: vi.fn(),
+    }
+    actions.getTerminalActions = vi.fn(() => terminalActions)
+
+    const items = buildMenuItems(
+      { kind: 'terminal', tabId: 'tab-1', paneId: 'pane-1' },
+      makeCtx(actions),
+    )
+
+    const copy = getTerminalItem(items, 'terminal-copy')
+    expect(copy.disabled).toBe(false)
+    copy.onSelect()
+    expect(terminalActions.copySelection).toHaveBeenCalledTimes(1)
   })
 })

@@ -1,3 +1,5 @@
+import { createElement } from 'react'
+import { ClipboardPaste, Copy, TextSelect } from 'lucide-react'
 import type { MenuItem, ContextTarget } from './context-menu-types'
 import type { AppView } from '@/components/Sidebar'
 import type { Tab, ProjectGroup } from '@/store/types'
@@ -127,6 +129,38 @@ function buildCopyResumeMenuItem(id: string, candidate: ResumeCommandCandidate, 
     },
     disabled: !canCopy,
   }
+}
+
+function buildTerminalClipboardItems(
+  terminalActions: TerminalActions | undefined,
+  hasSelection: boolean,
+): MenuItem[] {
+  return [
+    {
+      type: 'item',
+      id: 'terminal-copy',
+      label: 'copy',
+      icon: createElement(Copy, { className: 'h-4 w-4' }),
+      onSelect: () => terminalActions?.copySelection(),
+      disabled: !terminalActions || !hasSelection,
+    },
+    {
+      type: 'item',
+      id: 'terminal-paste',
+      label: 'Paste',
+      icon: createElement(ClipboardPaste, { className: 'h-4 w-4' }),
+      onSelect: () => terminalActions?.paste(),
+      disabled: !terminalActions,
+    },
+    {
+      type: 'item',
+      id: 'terminal-select-all',
+      label: 'Select all',
+      icon: createElement(TextSelect, { className: 'h-4 w-4' }),
+      onSelect: () => terminalActions?.selectAll(),
+      disabled: !terminalActions,
+    },
+  ]
 }
 
 function collectPaneLeaves(node: PaneNode): Extract<PaneNode, { type: 'leaf' }>[] {
@@ -295,6 +329,8 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       : []
     const canRefreshPane = !!paneContent && !!buildPaneRefreshTarget(paneContent)
     return [
+      ...buildTerminalClipboardItems(terminalActions, hasSelection),
+      { type: 'separator', id: 'terminal-clipboard-sep' },
       {
         type: 'item',
         id: 'refresh-pane',
@@ -305,27 +341,6 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       { type: 'item', id: 'terminal-split-h', label: 'Split horizontally', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'horizontal') },
       { type: 'item', id: 'terminal-split-v', label: 'Split vertically', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'vertical') },
       { type: 'separator', id: 'terminal-split-sep' },
-      {
-        type: 'item',
-        id: 'terminal-copy',
-        label: 'Copy selection',
-        onSelect: () => terminalActions?.copySelection(),
-        disabled: !terminalActions || !hasSelection,
-      },
-      {
-        type: 'item',
-        id: 'terminal-paste',
-        label: 'Paste',
-        onSelect: () => terminalActions?.paste(),
-        disabled: !terminalActions,
-      },
-      {
-        type: 'item',
-        id: 'terminal-select-all',
-        label: 'Select all',
-        onSelect: () => terminalActions?.selectAll(),
-        disabled: !terminalActions,
-      },
       {
         type: 'item',
         id: 'terminal-search',

@@ -251,6 +251,62 @@ function createStoreWithBrowserPane(options?: { zoomedPaneId?: string }) {
   })
 }
 
+function createStoreWithTerminalPane() {
+  return configureStore({
+    reducer: {
+      tabs: tabsReducer,
+      panes: panesReducer,
+      sessions: sessionsReducer,
+      connection: connectionReducer,
+      settings: settingsReducer,
+    },
+    middleware: (getDefaultMiddleware) =>
+      getDefaultMiddleware({ serializableCheck: false }),
+    preloadedState: {
+      tabs: {
+        tabs: [
+          {
+            id: 'tab-1',
+            createRequestId: 'tab-1',
+            title: 'Shell',
+            status: 'running',
+            mode: 'shell',
+            shell: 'system',
+            createdAt: 1,
+            terminalId: 'term-1',
+          },
+        ],
+        activeTabId: 'tab-1',
+        renameRequestTabId: null,
+      },
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'shell',
+              status: 'running',
+              terminalId: 'term-1',
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+      },
+      sessions: {
+        projects: [],
+        expandedProjects: new Set<string>(),
+      },
+      connection: {
+        status: 'ready',
+        platform: 'linux',
+      },
+    },
+  })
+}
+
 describe('ContextMenuProvider', () => {
   afterEach(() => {
     cleanup()
@@ -904,63 +960,43 @@ describe('ContextMenuProvider', () => {
     })
   })
 
-  describe('Replace pane', () => {
-    function createStoreWithTerminalPane() {
-      return configureStore({
-        reducer: {
-          tabs: tabsReducer,
-          panes: panesReducer,
-          sessions: sessionsReducer,
-          connection: connectionReducer,
-          settings: settingsReducer,
-        },
-        middleware: (getDefaultMiddleware) =>
-          getDefaultMiddleware({ serializableCheck: false }),
-        preloadedState: {
-          tabs: {
-            tabs: [
-              {
-                id: 'tab-1',
-                createRequestId: 'tab-1',
-                title: 'Shell',
-                status: 'running',
-                mode: 'shell',
-                shell: 'system',
-                createdAt: 1,
-                terminalId: 'term-1',
-              },
-            ],
-            activeTabId: 'tab-1',
-            renameRequestTabId: null,
-          },
-          panes: {
-            layouts: {
-              'tab-1': {
-                type: 'leaf',
-                id: 'pane-1',
-                content: {
-                  kind: 'terminal',
-                  mode: 'shell',
-                  status: 'running',
-                  terminalId: 'term-1',
-                },
-              },
-            },
-            activePane: { 'tab-1': 'pane-1' },
-            paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
-          },
-          sessions: {
-            projects: [],
-            expandedProjects: new Set<string>(),
-          },
-          connection: {
-            status: 'ready',
-            platform: 'linux',
-          },
-        },
-      })
-    }
+  it('renders copy, Paste, and Select all as the first terminal menu section with icons', async () => {
+    const user = userEvent.setup()
+    const store = createStoreWithTerminalPane()
 
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div data-context={ContextIds.Terminal} data-tab-id="tab-1" data-pane-id="pane-1">
+            Terminal Content
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Terminal Content'), keys: '[MouseRight]' })
+
+    const menu = screen.getByRole('menu')
+    const children = Array.from(menu.children)
+    expect(
+      children.slice(0, 4).map((node) =>
+        node.getAttribute('role') === 'menuitem'
+          ? node.textContent?.replace(/\s+/g, ' ').trim()
+          : node.getAttribute('role'),
+      ),
+    ).toEqual(['copy', 'Paste', 'Select all', 'separator'])
+
+    for (const node of children.slice(0, 3)) {
+      expect(node.querySelector('svg')).not.toBeNull()
+    }
+  })
+
+  describe('Replace pane', () => {
     it('detaches terminal and replaces pane with picker via context menu', async () => {
       const user = userEvent.setup()
       wsMocks.send.mockClear()
