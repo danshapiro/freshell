@@ -1,21 +1,24 @@
-import { chromium, type Browser, type BrowserContext, type CDPSession, type Page } from '@playwright/test'
-import type { PerfAuditSnapshot } from '@/lib/perf-audit-bridge'
+import fs from 'fs/promises'
+import { chromium, type Browser, type BrowserContext, type Page } from '@playwright/test'
+import WebSocket from 'ws'
 import { TestHarness } from '../helpers/test-harness.js'
-import { TerminalHelper } from '../helpers/terminal-helpers.js'
 import { TestServer, type TestServerInfo } from '../helpers/test-server.js'
+import { TerminalHelper } from '../helpers/terminal-helpers.js'
+import type { PerfAuditSnapshot } from '@/lib/perf-audit-bridge'
 import {
-  VisibleFirstAuditSampleSchema,
   type VisibleFirstAuditSample,
   type VisibleFirstProfileId,
   type VisibleFirstScenarioId,
 } from './audit-contract.js'
-import { buildAuditContextOptions, applyProfileNetworkConditions } from './create-audit-context.js'
+import {
+  applyProfileNetworkConditions,
+  buildAuditContextOptions,
+} from './create-audit-context.js'
 import { deriveVisibleFirstMetrics } from './derive-visible-first-metrics.js'
 import {
   createNetworkRecorder,
   summarizeNetworkCapture,
   type NetworkCapture,
-  type NetworkCaptureSummary,
 } from './network-recorder.js'
 import { parseVisibleFirstServerLogs } from './parse-server-logs.js'
 import { AUDIT_SCENARIOS } from './scenarios.js'
@@ -23,12 +26,18 @@ import {
   buildAgentChatBrowserStorageSeed,
   buildOffscreenTabBrowserStorageSeed,
 } from './seed-browser-storage.js'
-import { seedVisibleFirstAuditServerHome } from './seed-server-home.js'
+import {
+  seedVisibleFirstAuditServerHome,
+  type VisibleFirstAuditHomeSeedResult,
+} from './seed-server-home.js'
+import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
-type SampleExecutionArtifacts = {
+type SampleCollectors = {
   browser: PerfAuditSnapshot
-  transport: NetworkCapture & {
-    summary: NetworkCaptureSummary
+  transport: {
+    http: NetworkCapture['http']
+    ws: NetworkCapture['ws']
+    summary: ReturnType<typeof summarizeNetworkCapture>
   }
   server: Awaited<ReturnType<typeof parseVisibleFirstServerLogs>>
 }
@@ -36,37 +45,86 @@ type SampleExecutionArtifacts = {
 type RunVisibleFirstAuditSampleInput = {
   scenarioId: VisibleFirstScenarioId
   profileId: VisibleFirstProfileId
+  outputDir?: string
   deps?: {
-    executeSample?: (input: {
-      scenarioId: VisibleFirstScenarioId
-      profileId: VisibleFirstProfileId
-    }) => Promise<SampleExecutionArtifacts>
+    executeSample?: (
+      input: RunVisibleFirstAuditSampleInput,
+    ) => Promise<SampleCollectors>
   }
 }
 
+type ReconnectBootstrapResult = {
+  browserStorageSeed: Record<string, string>
+}
+
+const SAMPLE_TIMEOUT_MS = 30_000
+const TERMINAL_RECONNECT_CREATE_REQUEST_ID = 'visible-first-reconnect-create'
+
 function getScenarioDefinition(scenarioId: VisibleFirstScenarioId) {
-  const scenario = AUDIT_SCENARIOS.find((candidate) => candidate.id === scenarioId)
+  const scenario = AUDIT_SCENARIOS.find((entry) => entry.id === scenarioId)
   if (!scenario) {
-    throw new Error(`Unknown visible-first audit scenario: ${scenarioId}`)
+    throw new Error(`Unknown audit scenario: ${scenarioId}`)
   }
   return scenario
 }
 
-async function applyBrowserStorageSeed(page: Page, seed: Record<string, string> | undefined): Promise<void> {
-  if (!seed || Object.keys(seed).length === 0) return
-
-  await page.addInitScript((entries: Array<[string, string]>) => {
-    for (const [key, value] of entries) {
-      window.localStorage.setItem(key, value)
-    }
-  }, Object.entries(seed))
+function emptyCollectors(): SampleCollectors {
+  return {
+    browser: {
+      milestones: {},
+      metadata: {},
+      perfEvents: [],
+      terminalLatencySamplesMs: [],
+    },
+    transport: {
+      http: { requests: [] },
+      ws: { frames: [] },
+      summary: { http: { byRoute: {} }, ws: { byType: {} } },
+    },
+    server: {
+      httpRequests: [],
+      perfEvents: [],
+      perfSystemSamples: [],
+      parserDiagnostics: [],
+    },
+  }
 }
 
-async function waitForPerfAuditMilestone(
+function normalizeTransportCapture(
+  capture: NetworkCapture,
+  browserTimeOriginMs: number,
+): NetworkCapture {
+  return {
+    http: {
+      requests: capture.http.requests.map((request) => ({
+        ...request,
+        timestamp: Math.max(0, request.timestamp - browserTimeOriginMs),
+      })),
+    },
+    ws: {
+      frames: capture.ws.frames.map((frame) => ({
+        ...frame,
+        timestamp: Math.max(0, frame.timestamp - browserTimeOriginMs),
+      })),
+    },
+  }
+}
+
+async function applyBrowserStorageSeed(page: Page, seed: Record<string, string>): Promise<void> {
+  await page.addInitScript((entries) => {
+    for (const [key, value] of Object.entries(entries)) {
+      window.localStorage.setItem(key, value)
+    }
+  }, seed)
+}
+
+async function waitForAuditMilestone(
   page: Page,
+  harness: TestHarness,
   milestone: string,
-  timeoutMs = 30_000,
+  timeoutMs = SAMPLE_TIMEOUT_MS,
 ): Promise<void> {
+  await harness.waitForHarness(timeoutMs)
   await page.waitForFunction(
     (targetMilestone) => {
       const snapshot = window.__FRESHELL_TEST_HARNESS__?.getPerfAuditSnapshot()
@@ -77,125 +135,365 @@ async function waitForPerfAuditMilestone(
   )
 }
 
-async function readPerfAuditSnapshot(page: Page): Promise<PerfAuditSnapshot> {
-  const snapshot = await page.evaluate(() => {
-    return window.__FRESHELL_TEST_HARNESS__?.getPerfAuditSnapshot() ?? null
+async function withWsConnection<T>(
+  serverInfo: TestServerInfo,
+  callback: (ws: WebSocket) => Promise<T>,
+): Promise<T> {
+  const ws = new WebSocket(serverInfo.wsUrl)
+
+  const openPromise = new Promise<void>((resolve, reject) => {
+    ws.once('open', resolve)
+    ws.once('error', reject)
   })
 
-  if (!snapshot) {
-    throw new Error('Perf audit snapshot unavailable from test harness')
-  }
+  await openPromise
+  ws.send(JSON.stringify({
+    type: 'hello',
+    token: serverInfo.token,
+    protocolVersion: WS_PROTOCOL_VERSION,
+  }))
 
-  return snapshot as PerfAuditSnapshot
+  await waitForWsMessage(ws, (message) => message.type === 'ready')
+
+  try {
+    return await callback(ws)
+  } finally {
+    await new Promise<void>((resolve) => {
+      if (ws.readyState === WebSocket.CLOSED) {
+        resolve()
+        return
+      }
+      ws.once('close', () => resolve())
+      ws.close()
+    })
+  }
 }
 
-async function maybeDriveScenarioInteraction(input: {
+function waitForWsMessage(
+  ws: WebSocket,
+  predicate: (message: Record<string, unknown>) => boolean,
+  timeoutMs = 10_000,
+): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup()
+      reject(new Error('Timed out waiting for audit bootstrap WebSocket message'))
+    }, timeoutMs)
+
+    const cleanup = () => {
+      clearTimeout(timeout)
+      ws.off('message', onMessage)
+      ws.off('error', onError)
+      ws.off('close', onClose)
+    }
+
+    const onMessage = (raw: WebSocket.RawData) => {
+      try {
+        const parsed = JSON.parse(raw.toString()) as Record<string, unknown>
+        if (!predicate(parsed)) return
+        cleanup()
+        resolve(parsed)
+      } catch {
+        // Ignore malformed frames from unrelated traffic.
+      }
+    }
+
+    const onError = (error: Error) => {
+      cleanup()
+      reject(error)
+    }
+
+    const onClose = () => {
+      cleanup()
+      reject(new Error('Audit bootstrap WebSocket closed unexpectedly'))
+    }
+
+    ws.on('message', onMessage)
+    ws.once('error', onError)
+    ws.once('close', onClose)
+  })
+}
+
+async function bootstrapReconnectScenario(
+  serverInfo: TestServerInfo,
+  seedResult: VisibleFirstAuditHomeSeedResult,
+): Promise<ReconnectBootstrapResult> {
+  const terminalId = await withWsConnection(serverInfo, async (ws) => {
+    const requestId = 'visible-first-terminal-reconnect-bootstrap'
+    ws.send(JSON.stringify({
+      type: 'terminal.create',
+      requestId,
+      mode: 'shell',
+      shell: 'system',
+    }))
+
+    const created = await waitForWsMessage(
+      ws,
+      (message) => message.type === 'terminal.created' && message.requestId === requestId,
+    )
+    const createdTerminalId = created.terminalId
+    if (typeof createdTerminalId !== 'string' || createdTerminalId.length === 0) {
+      throw new Error('Reconnect bootstrap did not return a terminalId')
+    }
+
+    ws.send(JSON.stringify({
+      type: 'terminal.input',
+      terminalId: createdTerminalId,
+      data: `node ${seedResult.backlogScriptPath}\n`,
+    }))
+
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    return createdTerminalId
+  })
+
+  return {
+    browserStorageSeed: {
+      freshell_version: '3',
+      'freshell.tabs.v2': JSON.stringify({
+        version: 2,
+        tabs: {
+          activeTabId: 'tab-terminal-reconnect',
+          tabs: [
+            {
+              id: 'tab-terminal-reconnect',
+              title: 'Reconnect Audit',
+              createdAt: 1,
+              createRequestId: TERMINAL_RECONNECT_CREATE_REQUEST_ID,
+              status: 'running',
+              mode: 'shell',
+              shell: 'system',
+              terminalId,
+            },
+          ],
+        },
+      }),
+      'freshell.panes.v2': JSON.stringify({
+        version: 3,
+        layouts: {
+          'tab-terminal-reconnect': {
+            type: 'leaf',
+            id: 'pane-terminal-reconnect',
+            content: {
+              kind: 'terminal',
+              createRequestId: TERMINAL_RECONNECT_CREATE_REQUEST_ID,
+              status: 'running',
+              mode: 'shell',
+              shell: 'system',
+              terminalId,
+            },
+          },
+        },
+        activePane: {
+          'tab-terminal-reconnect': 'pane-terminal-reconnect',
+        },
+        paneTitles: {
+          'tab-terminal-reconnect': {
+            'pane-terminal-reconnect': 'Reconnect Audit',
+          },
+        },
+        paneTitleSetByUser: {},
+      }),
+    },
+  }
+}
+
+async function resolveBrowserStorageSeed(input: {
   scenarioId: VisibleFirstScenarioId
-  page: Page
-  harness: TestHarness
-  terminal: TerminalHelper
   serverInfo: TestServerInfo
-}): Promise<void> {
+  seedResult: VisibleFirstAuditHomeSeedResult
+}): Promise<Record<string, string> | null> {
   switch (input.scenarioId) {
-    case 'sidebar-search-large-corpus':
-      await input.harness.waitForConnection()
-      await input.page.getByPlaceholder('Search...').fill('alpha')
-      return
-    case 'offscreen-tab-selection':
-      await input.harness.waitForConnection()
-      await input.page.getByRole('button', { name: /background agent chat/i }).click()
-      return
-    case 'terminal-reconnect-backlog':
-      await input.harness.waitForConnection()
-      await input.terminal.waitForTerminal()
-      await input.terminal.waitForPrompt()
-      return
-    case 'agent-chat-cold-boot':
-    case 'terminal-cold-boot':
-      await input.harness.waitForConnection()
-      return
-    case 'auth-required-cold-boot':
-      return
-    default:
-      return
-  }
-}
-
-function resolveBrowserStorageSeed(
-  scenarioId: VisibleFirstScenarioId,
-): Record<string, string> | undefined {
-  switch (scenarioId) {
     case 'agent-chat-cold-boot':
       return buildAgentChatBrowserStorageSeed()
     case 'offscreen-tab-selection':
       return buildOffscreenTabBrowserStorageSeed()
+    case 'terminal-reconnect-backlog':
+      return (await bootstrapReconnectScenario(input.serverInfo, input.seedResult)).browserStorageSeed
     default:
-      return undefined
+      return null
   }
 }
 
-async function executeVisibleFirstAuditSample(input: {
+function getActiveTerminalId(state: unknown): string | null {
+  const record = state as {
+    tabs?: { activeTabId?: string | null }
+    panes?: { layouts?: Record<string, unknown> }
+  }
+  const activeTabId = record.tabs?.activeTabId
+  if (!activeTabId) return null
+  const layout = record.panes?.layouts?.[activeTabId] as {
+    type?: string
+    content?: { kind?: string; terminalId?: string }
+    children?: unknown[]
+  } | undefined
+  if (!layout) return null
+
+  const queue: Array<typeof layout> = [layout]
+  while (queue.length > 0) {
+    const node = queue.shift()
+    if (!node) continue
+    if (node.type === 'leaf' && node.content?.kind === 'terminal' && typeof node.content.terminalId === 'string') {
+      return node.content.terminalId
+    }
+    if (Array.isArray(node.children)) {
+      queue.push(...(node.children as Array<typeof layout>))
+    }
+  }
+
+  return null
+}
+
+async function driveScenarioInteraction(input: {
   scenarioId: VisibleFirstScenarioId
-  profileId: VisibleFirstProfileId
-}): Promise<SampleExecutionArtifacts> {
+  page: Page
+  harness: TestHarness
+  terminal: TerminalHelper
+}): Promise<void> {
+  switch (input.scenarioId) {
+    case 'sidebar-search-large-corpus': {
+      const showSidebarButton = input.page.getByRole('button', { name: /show sidebar/i })
+      if (await showSidebarButton.isVisible().catch(() => false)) {
+        await showSidebarButton.click()
+      }
+      const searchInput = input.page.getByPlaceholder('Search...')
+      await searchInput.fill('alpha')
+      return
+    }
+    case 'offscreen-tab-selection': {
+      await input.page.getByRole('button', { name: 'Background Agent Chat' }).click()
+      return
+    }
+    case 'terminal-reconnect-backlog': {
+      const terminalId = getActiveTerminalId(await input.harness.getState())
+      if (terminalId) {
+        await input.terminal.waitForOutput('backlog line 1200', {
+          timeout: SAMPLE_TIMEOUT_MS,
+          terminalId,
+        })
+      }
+      return
+    }
+    default:
+      return
+  }
+}
+
+async function executeSampleDefault(
+  input: RunVisibleFirstAuditSampleInput,
+): Promise<SampleCollectors> {
+  let seedResult: VisibleFirstAuditHomeSeedResult | null = null
   const scenario = getScenarioDefinition(input.scenarioId)
   const server = new TestServer({
     preserveHomeOnStop: true,
-    setupHome: seedVisibleFirstAuditServerHome,
+    setupHome: async (homeDir) => {
+      seedResult = await seedVisibleFirstAuditServerHome(homeDir)
+    },
   })
 
   let browser: Browser | null = null
   let context: BrowserContext | null = null
+  let retainedHomeDir: string | null = null
+  let debugLogPath: string | null = null
 
   try {
     const serverInfo = await server.start()
-    browser = await chromium.launch({ headless: true })
-    context = await browser.newContext(buildAuditContextOptions({ profileId: input.profileId }))
+    retainedHomeDir = serverInfo.homeDir
+    debugLogPath = serverInfo.debugLogPath
+    if (!seedResult) {
+      throw new Error('Visible-first server seed did not run before sample start')
+    }
+
+    browser = await chromium.launch({
+      headless: true,
+    })
+
+    context = await browser.newContext(buildAuditContextOptions({
+      profileId: input.profileId,
+    }))
     const page = await context.newPage()
+    const cdpSession = await context.newCDPSession(page)
+    await applyProfileNetworkConditions(cdpSession, input.profileId)
+
+    const recorder = createNetworkRecorder()
+    cdpSession.on('Network.requestWillBeSent', (event) => recorder.onRequestWillBeSent(event))
+    cdpSession.on('Network.responseReceived', (event) => recorder.onResponseReceived(event))
+    cdpSession.on('Network.loadingFinished', (event) => recorder.onLoadingFinished(event))
+    cdpSession.on('Network.webSocketFrameSent', (event) => recorder.onWebSocketFrameSent(event))
+    cdpSession.on('Network.webSocketFrameReceived', (event) => recorder.onWebSocketFrameReceived(event))
+
+    const browserStorageSeed = await resolveBrowserStorageSeed({
+      scenarioId: input.scenarioId,
+      serverInfo,
+      seedResult,
+    })
+    if (browserStorageSeed) {
+      await applyBrowserStorageSeed(page, browserStorageSeed)
+    }
+
+    const url = new URL(scenario.buildUrl({
+      token: serverInfo.token,
+      profileId: input.profileId,
+    }), serverInfo.baseUrl).toString()
+
+    await page.goto(url, { waitUntil: 'domcontentloaded' })
+
     const harness = new TestHarness(page)
     const terminal = new TerminalHelper(page)
-    const cdpSession = await context.newCDPSession(page)
-    const recorder = createNetworkRecorder()
-
-    cdpSession.on('Network.requestWillBeSent', (event) => recorder.onRequestWillBeSent(event as never))
-    cdpSession.on('Network.responseReceived', (event) => recorder.onResponseReceived(event as never))
-    cdpSession.on('Network.loadingFinished', (event) => recorder.onLoadingFinished(event as never))
-    cdpSession.on('Network.webSocketFrameSent', (event) => recorder.onWebSocketFrameSent(event as never))
-    cdpSession.on('Network.webSocketFrameReceived', (event) => recorder.onWebSocketFrameReceived(event as never))
-    await applyProfileNetworkConditions(cdpSession as Pick<CDPSession, 'send'>, input.profileId)
-    await applyBrowserStorageSeed(page, resolveBrowserStorageSeed(input.scenarioId))
-
-    const pathWithQuery = scenario.buildUrl({
-      profileId: input.profileId,
-      token: serverInfo.token,
-    })
-    await page.goto(new URL(pathWithQuery, serverInfo.baseUrl).toString(), {
-      waitUntil: 'domcontentloaded',
-    })
     await harness.waitForHarness()
-    await maybeDriveScenarioInteraction({
+
+    if (input.scenarioId !== 'auth-required-cold-boot') {
+      await harness.waitForConnection()
+    }
+
+    await driveScenarioInteraction({
       scenarioId: input.scenarioId,
       page,
       harness,
       terminal,
-      serverInfo,
     })
-    await waitForPerfAuditMilestone(page, scenario.focusedReadyMilestone)
 
-    const browserSnapshot = await readPerfAuditSnapshot(page)
-    const transport = recorder.snapshot()
+    await waitForAuditMilestone(page, harness, scenario.focusedReadyMilestone)
+
+    const browserSnapshot = await harness.getPerfAuditSnapshot()
+    if (!browserSnapshot) {
+      throw new Error('Perf audit snapshot was not available from the test harness')
+    }
+
+    const browserTimeOriginMs = await page.evaluate(() => performance.timeOrigin)
+    const rawCapture = recorder.snapshot()
+    const normalizedCapture = normalizeTransportCapture(rawCapture, browserTimeOriginMs)
+
+    await context.close()
+    context = null
+    await browser.close()
+    browser = null
+
+    await server.stop()
+
+    if (!debugLogPath) {
+      throw new Error('Visible-first sample did not expose a debug log path')
+    }
+    const serverLogs = await parseVisibleFirstServerLogs(debugLogPath)
     return {
       browser: browserSnapshot,
       transport: {
-        ...transport,
-        summary: summarizeNetworkCapture(transport),
+        http: normalizedCapture.http,
+        ws: normalizedCapture.ws,
+        summary: summarizeNetworkCapture(normalizedCapture),
       },
-      server: await parseVisibleFirstServerLogs(serverInfo.debugLogPath),
+      server: serverLogs,
     }
   } finally {
-    await context?.close().catch(() => {})
-    await browser?.close().catch(() => {})
+    if (context) {
+      await context.close().catch(() => {})
+    }
+    if (browser) {
+      await browser.close().catch(() => {})
+    }
     await server.stop().catch(() => {})
+    if (retainedHomeDir) {
+      await fs.rm(retainedHomeDir, { recursive: true, force: true }).catch(() => {})
+    }
   }
 }
 
@@ -203,52 +501,56 @@ export async function runVisibleFirstAuditSample(
   input: RunVisibleFirstAuditSampleInput,
 ): Promise<VisibleFirstAuditSample> {
   const scenario = getScenarioDefinition(input.scenarioId)
-  const startedAt = new Date().toISOString()
-  const startedAtMs = Date.now()
+  const startedAtDate = new Date()
+  const startTimeMs = Date.now()
+  const collectors = emptyCollectors()
+  const errors: string[] = []
+  let status: VisibleFirstAuditSample['status'] = 'ok'
+  let derived: Record<string, unknown> = {}
 
   try {
-    const execution = input.deps?.executeSample
-      ? await input.deps.executeSample({
-        scenarioId: input.scenarioId,
-        profileId: input.profileId,
-      })
-      : await executeVisibleFirstAuditSample({
-        scenarioId: input.scenarioId,
-        profileId: input.profileId,
-      })
+    const executeSample = input.deps?.executeSample ?? executeSampleDefault
+    const result = await executeSample(input)
+    collectors.browser = result.browser
+    collectors.transport = result.transport
+    collectors.server = result.server
 
-    const sample = VisibleFirstAuditSampleSchema.parse({
-      profileId: input.profileId,
-      status: 'ok',
-      startedAt,
-      finishedAt: new Date().toISOString(),
-      durationMs: Date.now() - startedAtMs,
-      browser: execution.browser,
-      transport: execution.transport,
-      server: execution.server,
-      derived: deriveVisibleFirstMetrics({
-        focusedReadyMilestone: scenario.focusedReadyMilestone,
-        allowedApiRouteIdsBeforeReady: scenario.allowedApiRouteIdsBeforeReady,
-        allowedWsTypesBeforeReady: scenario.allowedWsTypesBeforeReady,
-        browser: execution.browser,
-        transport: execution.transport,
-      }),
-      errors: [],
+    if (typeof collectors.browser.milestones[scenario.focusedReadyMilestone] !== 'number') {
+      throw new Error(`Missing focused-ready milestone: ${scenario.focusedReadyMilestone}`)
+    }
+
+    if (
+      !Array.isArray(collectors.transport.http.requests)
+      || !Array.isArray(collectors.transport.ws.frames)
+    ) {
+      throw new Error('Missing CDP transport capture for audit sample')
+    }
+
+    derived = deriveVisibleFirstMetrics({
+      focusedReadyMilestone: scenario.focusedReadyMilestone,
+      allowedApiRouteIdsBeforeReady: scenario.allowedApiRouteIdsBeforeReady,
+      allowedWsTypesBeforeReady: scenario.allowedWsTypesBeforeReady,
+      browser: collectors.browser,
+      transport: collectors.transport,
     })
-
-    return sample
   } catch (error) {
-    return VisibleFirstAuditSampleSchema.parse({
-      profileId: input.profileId,
-      status: error instanceof Error && /timeout/i.test(error.message) ? 'timeout' : 'error',
-      startedAt,
-      finishedAt: new Date().toISOString(),
-      durationMs: Date.now() - startedAtMs,
-      browser: {},
-      transport: {},
-      server: {},
-      derived: {},
-      errors: [error instanceof Error ? error.message : String(error)],
-    })
+    const message = error instanceof Error ? error.message : String(error)
+    errors.push(message)
+    status = /timed out|timeout/i.test(message) ? 'timeout' : 'error'
+  }
+
+  const finishedAtDate = new Date()
+
+  return {
+    profileId: input.profileId,
+    status,
+    startedAt: startedAtDate.toISOString(),
+    finishedAt: finishedAtDate.toISOString(),
+    durationMs: Math.max(0, Date.now() - startTimeMs),
+    browser: collectors.browser,
+    transport: collectors.transport,
+    server: collectors.server,
+    derived,
+    errors,
   }
 }

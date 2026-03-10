@@ -3,6 +3,7 @@ import { classifyWsFrameType, normalizeAuditRouteId } from './derive-visible-fir
 type RequestWillBeSentEvent = {
   requestId: string
   timestamp?: number
+  wallTime?: number
   request?: {
     url?: string
     method?: string
@@ -97,9 +98,27 @@ export function summarizeNetworkCapture(capture: NetworkCapture): NetworkCapture
 }
 
 export function createNetworkRecorder() {
+  let monotonicEpochOffsetMs: number | null = null
   const pendingRequests = new Map<string, NetworkCapture['http']['requests'][number]>()
   const httpRequests: NetworkCapture['http']['requests'] = []
   const wsFrames: NetworkCapture['ws']['frames'] = []
+
+  function resolveTimestampMs(timestamp?: number, wallTime?: number): number {
+    if (typeof timestamp === 'number' && typeof wallTime === 'number') {
+      monotonicEpochOffsetMs = wallTime * 1000 - timestamp * 1000
+      return wallTime * 1000
+    }
+
+    if (typeof wallTime === 'number') {
+      return wallTime * 1000
+    }
+
+    if (typeof timestamp === 'number' && monotonicEpochOffsetMs !== null) {
+      return timestamp * 1000 + monotonicEpochOffsetMs
+    }
+
+    return (timestamp ?? 0) * 1000
+  }
 
   return {
     onRequestWillBeSent(event: RequestWillBeSentEvent) {
@@ -108,7 +127,7 @@ export function createNetworkRecorder() {
       if (!routeId) return
       pendingRequests.set(event.requestId, {
         requestId: event.requestId,
-        timestamp: event.timestamp ?? 0,
+        timestamp: resolveTimestampMs(event.timestamp, event.wallTime),
         url,
         routeId,
         method: event.request?.method,
@@ -130,7 +149,7 @@ export function createNetworkRecorder() {
       const payload = event.response?.payloadData ?? ''
       wsFrames.push({
         requestId: event.requestId,
-        timestamp: event.timestamp ?? 0,
+        timestamp: resolveTimestampMs(event.timestamp),
         direction: 'sent',
         type: classifyWsFrameType(payload),
         payloadLength: Buffer.byteLength(payload),
@@ -141,7 +160,7 @@ export function createNetworkRecorder() {
       const payload = event.response?.payloadData ?? ''
       wsFrames.push({
         requestId: event.requestId,
-        timestamp: event.timestamp ?? 0,
+        timestamp: resolveTimestampMs(event.timestamp),
         direction: 'received',
         type: classifyWsFrameType(payload),
         payloadLength: Buffer.byteLength(payload),
