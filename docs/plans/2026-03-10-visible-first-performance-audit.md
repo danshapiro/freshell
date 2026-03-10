@@ -2,113 +2,272 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task.
 
-**Goal:** Build a repeatable visible-first performance audit that runs six production-mode Freshell scenarios in Chromium, captures exactly one `desktop_local` sample and one `mobile_restricted` sample per scenario, and writes one schema-validated JSON artifact at `artifacts/perf/visible-first-audit.json`.
+**Goal:** Build a repeatable, production-mode performance audit for the current Freshell app that runs six fixed scenarios in Chromium, captures exactly one `desktop_local` sample and one `mobile_restricted` sample per scenario, and writes one schema-validated JSON artifact to `artifacts/perf/visible-first-audit.json`.
 
-**Architecture:** Land a dedicated audit pipeline under `test/e2e-browser/perf/` instead of stretching the normal Playwright runner into a perf harness. Reuse the existing isolated `TestServer`, capture browser-observed HTTP and WebSocket truth through Chromium CDP, add only the minimum runtime-gated app instrumentation needed to mark focused-surface readiness, parse existing server JSONL logs for server-side work, and merge everything into one strict artifact contract plus a small diff tool.
+**Architecture:** Add a dedicated audit pipeline under `test/e2e-browser/perf/` instead of stretching the normal Playwright test runner into a perf harness. Reuse the existing isolated `TestServer`, use Chromium CDP as the source of truth for HTTP and WebSocket transport, add only the minimum runtime-gated app milestones needed to define visible readiness, parse the existing server JSONL logs for server-side work, and merge everything into one strict artifact contract plus a small compare tool.
 
-**Tech Stack:** TypeScript, Node.js, Playwright Chromium API, existing `test/e2e-browser/helpers/TestServer`, Zod, Vitest, pino JSONL logs, browser `PerformanceObserver`, Node `perf_hooks`.
+**Tech Stack:** TypeScript, Node.js, Playwright Chromium library API, existing `test/e2e-browser/helpers/TestServer`, Zod, Vitest, existing client/server perf loggers, pino JSONL logs, Chromium CDP `Network` domain.
 
 ---
 
 ## Strategy Gate
 
-The accepted direction is correct, but the previous plan was not excellent enough to execute unchanged.
+The accepted direction is correct, but the prior plan was not excellent enough to execute unchanged.
 
-The main problems were:
+The right problem is not “add perf tests.” The right problem is “produce one trustworthy characterization artifact for the current transport so the later visible-first transport work can be judged mechanically against the same scenarios.” That yields these non-negotiable decisions:
 
-1. It asked the audit to report "offscreen work before focused readiness" without defining how that classification works.
-2. Several tasks were still large enough that the execution agent would have to make architecture decisions mid-flight.
-3. The artifact contract was directionally right but not explicit enough about which fields are authoritative and which are derived.
-4. The scenario drivers were not yet specific enough about what constitutes readiness for sidebar search and offscreen tab hydration.
-
-The right problem is not "add perf tests." The right problem is "create one trustworthy, repeatable characterization artifact for the current transport so the later visible-first work can be judged mechanically." That produces these non-negotiable design decisions:
-
-1. The canonical output is the JSON artifact, not a test report, trace, or screenshot set.
-2. HTTP timings/bytes and WebSocket frame counts/bytes must come from Chromium CDP, not app-side guesses.
-3. Focused-surface readiness must come from explicit app milestones because transport data alone cannot safely infer "ready enough for the user."
-4. Server-side work must come from existing JSONL logs and existing perf logging, not a parallel ad hoc reporting channel.
-5. Every measured sample must be cold and isolated: fresh `TestServer`, fresh browser context, cleared storage, unique origin state.
-6. Because the accepted strategy is exactly one desktop sample and one mobile-restricted sample per scenario, the artifact must preserve raw values; it must not invent medians or percentiles for scenario/profile results.
-7. Offscreen/pre-focused work must be computed from scenario-specific allowlists: each scenario declares which HTTP paths and WebSocket message types are required before focused readiness, and everything else observed before the readiness milestone is counted as offscreen work.
+1. The canonical deliverable is the JSON artifact. Traces, screenshots, and raw logs are optional debugging side effects, not the product.
+2. Transport truth comes from Chromium CDP, not app-side counters. HTTP timings/bytes and WebSocket frame counts/bytes must be captured outside the app.
+3. Visible readiness comes from explicit app milestones because transport alone cannot safely infer “user can use the focused surface now.”
+4. Server-side work comes from existing JSONL logs and existing perf logging. The audit must not invent a second server telemetry channel.
+5. Every measured sample is cold and isolated: fresh `TestServer`, fresh browser context, blocked service workers, disabled HTTP cache, empty storage unless the scenario explicitly seeds browser local state.
+6. The user accepted a heavy breadth but only two measured samples per scenario: one `desktop_local` and one `mobile_restricted`. The artifact must preserve raw per-sample values; it must not invent medians or percentiles for scenario/profile summaries.
+7. Offscreen work must be computed mechanically, not by later interpretation. Each scenario must declare which normalized API routes and WebSocket message types are allowed before focused readiness; everything else observed before readiness counts as offscreen work.
+8. The audit must measure application transport, not static asset loading noise. Only `/api/**` requests except known harness-only routes and only the app WebSocket count toward the transport summaries.
+9. Browser-local persisted layout state and server-side fixture data are different concerns. Server HOME seeding must not be used for tabs/panes, which live in browser storage.
 
 This plan lands the requested end state directly:
 
-1. `npm run perf:audit:visible-first` writes exactly one JSON artifact at `artifacts/perf/visible-first-audit.json` by default.
-2. The artifact always contains the six approved scenarios and the two approved profiles unless an explicit smoke-test filter is passed.
-3. `npm run perf:audit:compare -- --base <old> --candidate <new>` compares two schema-valid artifacts later without changing the artifact contract.
+1. `npm run perf:audit:visible-first` writes exactly one JSON artifact to `artifacts/perf/visible-first-audit.json` unless an explicit alternate output path is supplied.
+2. The default run always includes the full six-scenario, two-profile matrix.
+3. The compare command reads two artifacts and emits one machine-readable diff without changing the audit contract.
 
 ## Codebase Findings
 
-1. [test-server.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/test/e2e-browser/helpers/test-server.ts) is the correct isolation seam, but it currently removes the temp HOME on stop and does not expose the log directory. The audit runner cannot parse server logs without extending it.
-2. [test-harness.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/src/lib/test-harness.ts) is already the right browser test seam because it exposes Redux state, WebSocket readiness, and terminal buffers in production builds behind `?e2e=1`.
-3. [perf-logger.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/src/lib/perf-logger.ts) already captures browser perf events and terminal input-to-output latency, but it only writes to console today.
-4. [client-logger.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/src/lib/client-logger.ts) intentionally filters perf-tagged entries before posting to `/api/logs/client`. That behavior is correct and this audit should not bypass it.
-5. [request-logger.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/server/request-logger.ts) and [server/perf-logger.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/server/perf-logger.ts) already emit most server-side information the audit needs into structured JSONL logs.
-6. [test/e2e-browser/vitest.config.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/test/e2e-browser/vitest.config.ts) only includes `helpers/**/*.test.ts` today, so perf smoke coverage will not run until that config is widened intentionally.
-7. [package.json](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/package.json) already contains the correct repo-standard commands to reuse during implementation and verification: `test:client:standard`, `test:e2e:helpers`, and `test`.
+1. [test/e2e-browser/helpers/test-server.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/test/e2e-browser/helpers/test-server.ts) is the correct isolation seam, but it currently deletes the temp HOME on stop and does not expose the log directory. The audit runner cannot parse logs without extending it.
+2. [src/lib/test-harness.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/src/lib/test-harness.ts) already exposes Redux state, WebSocket readiness, and terminal buffers in production builds behind `?e2e=1`. That is the correct seam for audit-only readiness snapshots.
+3. [src/lib/perf-logger.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/src/lib/perf-logger.ts) already emits browser perf events and terminal input-to-output latency, but it only logs to the console today. The audit needs a narrow sink API, not a new logging path.
+4. [src/lib/client-logger.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/src/lib/client-logger.ts) intentionally filters `perf: true` console payloads before posting to `/api/logs/client`. That behavior is correct and must remain unchanged.
+5. [server/request-logger.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/server/request-logger.ts), [server/perf-logger.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/server/perf-logger.ts), and [server/logger.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/server/logger.ts) already emit structured JSONL that the audit can parse.
+6. [src/main.tsx](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/src/main.tsx) registers the service worker unconditionally in production mode. The audit runner must explicitly block service workers at the browser-context level so cold samples stay cold without adding app-only behavior.
+7. Tabs and panes persist in browser `localStorage`, not in the temp HOME. The exact keys are in [src/store/storage-keys.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/src/store/storage-keys.ts) and the schema versions are in [src/store/persistedState.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/src/store/persistedState.ts). The previous plan was wrong to treat offscreen-tab state as server fixture data.
+8. [test/e2e-browser/vitest.config.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/test/e2e-browser/vitest.config.ts) only includes `helpers/**/*.test.ts` today. Perf smoke coverage will not run until that config includes `perf/**/*.test.ts`.
 
-## Scenario Matrix
+## Fixed Audit Matrix
 
-Keep the scenario IDs and profile IDs stable. They are part of the artifact contract.
+The IDs and scenario definitions below are part of the artifact contract. Keep them stable.
 
 ### Profiles
 
 1. `desktop_local`
-   Chromium desktop viewport `1440x900`, no throttling.
+   - Browser: Chromium
+   - Viewport: `1440x900`
+   - Device emulation: none
+   - Network throttling: none
+   - CPU throttling: none
+
 2. `mobile_restricted`
-   Playwright `devices['iPhone 14']`, CDP network emulation at `1.6 Mbps down / 750 kbps up / 150 ms RTT`, no CPU throttling.
+   - Browser: Chromium
+   - Device emulation: Playwright `devices['iPhone 14']`
+   - Network throttling: `download=1_600_000 bps`, `upload=750_000 bps`, `latency=150 ms`
+   - CPU throttling: none
 
-### Scenarios
+### Deterministic Server Fixture Data
 
-1. `auth-required-cold-boot`
-   Focused-ready milestone: auth-required UI is visible.
-   Allowed-before-ready HTTP: `/api/settings`
-   Allowed-before-ready WebSocket types: none
-2. `terminal-cold-boot`
-   Focused-ready milestone: active terminal is visible and first meaningful output exists.
-   Allowed-before-ready HTTP: `/api/settings`, `/api/terminals`
-   Allowed-before-ready WebSocket types: `hello`, `ready`, `terminal.create`, `terminal.created`, `terminal.output`, `terminal.list`, `terminal.meta.list`
-3. `agent-chat-cold-boot`
-   Focused-ready milestone: recent chat content is visible for a long-history session.
-   Allowed-before-ready HTTP: `/api/settings`, `/api/sessions`, `/api/sessions/*`
-   Allowed-before-ready WebSocket types: `hello`, `ready`, `sdk.history`, `sessions.updated`, `sessions.patch`
-4. `sidebar-search-large-corpus`
-   Focused-ready milestone: search results for the typed query are visible.
-   Allowed-before-ready HTTP: `/api/settings`, `/api/sessions`, `/api/sessions/search*`
-   Allowed-before-ready WebSocket types: `hello`, `ready`, `sessions.updated`, `sessions.patch`
-5. `terminal-reconnect-backlog`
-   Focused-ready milestone: reconnect shows current terminal output and replay-tail metrics are captured.
-   Allowed-before-ready HTTP: `/api/settings`, `/api/terminals`
-   Allowed-before-ready WebSocket types: `hello`, `ready`, `terminal.create`, `terminal.created`, `terminal.output`, `terminal.attach`, `terminal.snapshot`, `terminal.meta.list`, `terminal.list`
-6. `offscreen-tab-selection`
-   Focused-ready milestone: selecting a background tab hydrates it on demand and its content is visible.
-   Allowed-before-ready HTTP: `/api/settings`
-   Allowed-before-ready WebSocket types: `hello`, `ready`
+Seed exactly one reusable server fixture set for all measured scenarios:
 
-The allowlists above are deliberate. The later visible-first project cares about "work that happened before the user's focused surface was ready but did not need to happen yet." The audit should compute that mechanically, not by interpretation after the fact.
+1. Session corpus:
+   - 12 projects
+   - 180 session summaries total
+   - 36 sessions whose titles contain the stable search token `alpha`
+   - stable timestamps and deterministic sort order
+2. Long agent-chat history:
+   - 1 dedicated session
+   - 240 turns total
+   - 30 most recent turns dense enough to render immediately
+   - at least 80 older turns with longer bodies so “visible recent turns first” is measurable
+3. Terminal replay script data:
+   - write one deterministic Node script into the temp HOME, for example `audit-terminal-backlog.js`
+   - the script must emit 1,200 lines with stable prefixes and a short delayed tail so reconnect timing is measurable
+4. Auth-required scenario:
+   - no special server seed beyond normal settings
+
+### Deterministic Browser Storage Seed
+
+Seed browser storage separately from server HOME for scenarios that need persisted client layout:
+
+1. Use `page.addInitScript()` before navigation.
+2. Write `freshell_version=3`.
+3. Write [src/store/storage-keys.ts](/home/user/code/freshell/.worktrees/codex-visible-first-perf-audit/src/store/storage-keys.ts) keys with current schema-compatible payloads:
+   - `freshell.tabs.v2`
+   - `freshell.panes.v2`
+4. Do not seed unrelated keys.
+5. The offscreen-tab scenario must start with:
+   - one active lightweight terminal tab
+   - one background agent-chat tab backed by the long-history session
+   - one background terminal tab if needed for tab-selection coverage
+   - sidebar closed by default
+
+### Scenario Definitions
+
+Each scenario owns:
+
+1. its stable `id`
+2. how the server fixture or browser storage is prepared
+3. how the page is navigated
+4. which milestone is the focused-ready boundary
+5. which normalized API route IDs and WebSocket message types are allowed before that boundary
+
+#### `auth-required-cold-boot`
+
+1. Navigation:
+   - `/?e2e=1&perfAudit=1`
+   - no auth token
+2. Focused-ready milestone:
+   - `app.auth_required_visible`
+3. Allowed API route IDs before ready:
+   - `/api/settings`
+4. Allowed WebSocket message types before ready:
+   - none
+
+#### `terminal-cold-boot`
+
+1. Setup:
+   - normal auth token
+   - default active tab resolves to a terminal pane
+2. Navigation:
+   - `/?token=<token>&e2e=1&perfAudit=1`
+3. Focused-ready milestone:
+   - `terminal.first_output`
+4. Allowed API route IDs before ready:
+   - `/api/settings`
+   - `/api/terminals`
+5. Allowed WebSocket message types before ready:
+   - `hello`
+   - `ready`
+   - `terminal.create`
+   - `terminal.created`
+   - `terminal.output`
+   - `terminal.list`
+   - `terminal.meta.list`
+
+#### `agent-chat-cold-boot`
+
+1. Setup:
+   - browser storage seeds the active tab to the dedicated long-history agent session
+2. Navigation:
+   - `/?token=<token>&e2e=1&perfAudit=1`
+3. Focused-ready milestone:
+   - `agent_chat.surface_visible`
+4. Allowed API route IDs before ready:
+   - `/api/settings`
+   - `/api/sessions`
+   - `/api/sessions/:sessionId`
+5. Allowed WebSocket message types before ready:
+   - `hello`
+   - `ready`
+   - `sdk.history`
+   - `sessions.updated`
+   - `sessions.patch`
+
+#### `sidebar-search-large-corpus`
+
+1. Setup:
+   - start from a lightweight terminal tab with the sidebar hidden
+2. Navigation:
+   - `/?token=<token>&e2e=1&perfAudit=1`
+3. Interaction:
+   - open the sidebar
+   - type the stable query `alpha`
+4. Focused-ready milestone:
+   - `sidebar.search_results_visible`
+5. Allowed API route IDs before ready:
+   - `/api/settings`
+   - `/api/sessions`
+   - `/api/sessions/search`
+6. Allowed WebSocket message types before ready:
+   - `hello`
+   - `ready`
+   - `sessions.updated`
+   - `sessions.patch`
+
+#### `terminal-reconnect-backlog`
+
+1. Setup:
+   - create a real terminal
+   - run the deterministic Node backlog script through that terminal
+   - force disconnect after the backlog is established
+2. Navigation:
+   - `/?token=<token>&e2e=1&perfAudit=1`
+3. Focused-ready milestone:
+   - `terminal.first_output`
+4. Allowed API route IDs before ready:
+   - `/api/settings`
+   - `/api/terminals`
+5. Allowed WebSocket message types before ready:
+   - `hello`
+   - `ready`
+   - `terminal.attach`
+   - `terminal.snapshot`
+   - `terminal.output`
+   - `terminal.list`
+   - `terminal.meta.list`
+
+#### `offscreen-tab-selection`
+
+1. Setup:
+   - seed browser storage with one lightweight active tab and one heavy offscreen agent-chat tab
+2. Navigation:
+   - `/?token=<token>&e2e=1&perfAudit=1`
+3. Interaction:
+   - after initial paint, select the heavy background tab
+4. Focused-ready milestone:
+   - `tab.selected_surface_visible`
+5. Allowed API route IDs before ready:
+   - `/api/settings`
+6. Allowed WebSocket message types before ready:
+   - `hello`
+   - `ready`
+
+### Transport Normalization Rules
+
+The current plan must not leave route matching ambiguous. Implement these rules once and reuse them everywhere:
+
+1. Only count requests whose pathname starts with `/api/`.
+2. Ignore these pathnames entirely for derived transport metrics:
+   - `/api/health`
+   - `/api/logs/client`
+3. Strip origin and query string before classification.
+4. Normalize dynamic segments into stable route IDs:
+   - `/api/sessions/<id>` -> `/api/sessions/:sessionId`
+   - `/api/terminals/<id>` -> `/api/terminals/:terminalId`
+5. Leave static route IDs untouched:
+   - `/api/settings`
+   - `/api/sessions`
+   - `/api/sessions/search`
+   - `/api/terminals`
+6. Bucket WebSocket frames by top-level JSON `type`; non-JSON or missing-`type` frames become `unknown`.
+7. “Offscreen before ready” means:
+   - request/frame timestamp is `<= focusedReadyTimestamp`
+   - normalized route ID or WS type is not in that scenario’s allowlist
 
 ## Artifact Contract
 
-Implement the artifact contract once and make every producer and consumer share it. Use Zod in `test/e2e-browser/perf/audit-contract.ts`.
+Implement the contract once in `test/e2e-browser/perf/audit-contract.ts` and make the runner, smoke test, and compare tool all use it.
 
-Top-level required fields:
+### Top-level required fields
 
 1. `schemaVersion: 1`
 2. `generatedAt`
 3. `git: { commit, branch, dirty }`
 4. `build: { nodeVersion, browserVersion, command }`
-5. `profiles: [{ id, label, viewport, network }]`
-6. `scenarios: VisibleFirstScenarioAudit[]`
+5. `profiles`
+6. `scenarios`
 
-Each scenario object must contain:
+### Per-scenario required fields
 
 1. `id`
 2. `description`
 3. `focusedReadyMilestone`
-4. `samples` with exactly two entries, one for `desktop_local` and one for `mobile_restricted`
+4. `samples`
 5. `summaryByProfile`
 
-Each sample object must contain:
+Each scenario must contain exactly two samples in stable order:
+
+1. `desktop_local`
+2. `mobile_restricted`
+
+### Per-sample required fields
 
 1. `profileId`
 2. `status`
@@ -121,31 +280,53 @@ Each sample object must contain:
 9. `derived`
 10. `errors`
 
-The authoritative timing boundary for derived metrics is `focusedReadyMilestone`. Derived metrics must include:
+### Authoritative sample subtrees
+
+These come directly from collectors and must not be recomputed differently elsewhere:
+
+1. `browser`
+   - milestone timestamps
+   - captured perf events
+   - terminal latency samples
+2. `transport`
+   - raw HTTP observations from CDP
+   - raw WebSocket frames from CDP
+   - normalized summaries by route/type
+3. `server`
+   - parsed `http_request` entries
+   - parsed perf events
+   - parsed `perf_system` samples
+   - parser diagnostics
+
+### Derived sample metrics
+
+Derived metrics must be computed from the authoritative data and the scenario definition:
 
 1. `focusedReadyMs`
-2. `httpRequestsBeforeReady`
-3. `httpBytesBeforeReady`
-4. `wsFramesBeforeReady`
-5. `wsBytesBeforeReady`
-6. `offscreenHttpRequestsBeforeReady`
-7. `offscreenHttpBytesBeforeReady`
-8. `offscreenWsFramesBeforeReady`
-9. `offscreenWsBytesBeforeReady`
-10. `terminalInputToFirstOutputMs` when applicable
-11. `wsReadyMs` when applicable
+2. `wsReadyMs` when present
+3. `terminalInputToFirstOutputMs` when present
+4. `httpRequestsBeforeReady`
+5. `httpBytesBeforeReady`
+6. `wsFramesBeforeReady`
+7. `wsBytesBeforeReady`
+8. `offscreenHttpRequestsBeforeReady`
+9. `offscreenHttpBytesBeforeReady`
+10. `offscreenWsFramesBeforeReady`
+11. `offscreenWsBytesBeforeReady`
+
+### Failure policy
 
 The audit fails only when the artifact becomes untrustworthy:
 
-1. scenario/profile timeout or crash
-2. missing required readiness milestone
-3. missing browser transport capture
-4. missing server log capture
-5. final JSON fails schema validation
+1. the scenario crashes or times out
+2. the focused-ready milestone is missing
+3. CDP transport capture is missing
+4. server log capture is missing
+5. the final JSON fails schema validation
 
-It does not fail on performance budgets yet.
+The audit does not fail on latency budgets yet.
 
-## Task 1: Lock the Artifact IDs and Schema
+## Task 1: Lock the Stable IDs and Artifact Schema
 
 **Files:**
 - Create: `test/e2e-browser/perf/audit-contract.ts`
@@ -155,7 +336,11 @@ It does not fail on performance budgets yet.
 
 ```ts
 import { describe, expect, it } from 'vitest'
-import { AUDIT_PROFILE_IDS, AUDIT_SCENARIO_IDS, VisibleFirstAuditSchema } from '@test/e2e-browser/perf/audit-contract'
+import {
+  AUDIT_PROFILE_IDS,
+  AUDIT_SCENARIO_IDS,
+  VisibleFirstAuditSchema,
+} from '@test/e2e-browser/perf/audit-contract'
 
 describe('VisibleFirstAuditSchema', () => {
   it('accepts a full artifact with six scenarios and exactly two samples per scenario', () => {
@@ -181,12 +366,10 @@ Expected: FAIL with a module-not-found error for `audit-contract.ts`.
 
 Create `test/e2e-browser/perf/audit-contract.ts` with:
 
-1. `AUDIT_SCENARIO_IDS`
-2. `AUDIT_PROFILE_IDS`
+1. `AUDIT_PROFILE_IDS`
+2. `AUDIT_SCENARIO_IDS`
 3. strict Zod schemas for the top-level artifact, scenario objects, and sample objects
 4. exported TypeScript types inferred from the schema
-
-Do not defer field naming choices to later tasks.
 
 **Step 4: Run the test to verify it passes**
 
@@ -202,10 +385,10 @@ Expected: PASS.
 
 ```bash
 git add test/e2e-browser/perf/audit-contract.ts test/unit/lib/visible-first-audit-contract.test.ts
-git commit -m "test: define visible-first audit artifact contract"
+git commit -m "test: define visible-first audit contract"
 ```
 
-## Task 2: Define Derived Metric and Offscreen Classification Rules
+## Task 2: Make Route Normalization and Offscreen Classification Explicit
 
 **Files:**
 - Create: `test/e2e-browser/perf/derive-visible-first-metrics.ts`
@@ -215,10 +398,17 @@ git commit -m "test: define visible-first audit artifact contract"
 
 ```ts
 import { describe, expect, it } from 'vitest'
-import { deriveVisibleFirstMetrics } from '@test/e2e-browser/perf/derive-visible-first-metrics'
+import {
+  deriveVisibleFirstMetrics,
+  normalizeAuditRouteId,
+} from '@test/e2e-browser/perf/derive-visible-first-metrics'
 
 describe('deriveVisibleFirstMetrics', () => {
-  it('counts transport before readiness and separates offscreen work by scenario allowlist', () => {
+  it('normalizes dynamic routes and counts pre-ready offscreen work by scenario allowlist', () => {
+    expect(normalizeAuditRouteId('http://localhost:3000/api/sessions/abc123?token=secret')).toBe(
+      '/api/sessions/:sessionId',
+    )
+
     const result = deriveVisibleFirstMetrics(buildSampleFixture())
     expect(result.offscreenHttpRequestsBeforeReady).toBe(1)
     expect(result.offscreenWsFramesBeforeReady).toBe(2)
@@ -238,12 +428,13 @@ Expected: FAIL with a module-not-found error for `derive-visible-first-metrics.t
 
 **Step 3: Write the minimal implementation**
 
-Create `derive-visible-first-metrics.ts` as a pure module that:
+Create `derive-visible-first-metrics.ts` as pure functions that:
 
-1. accepts one scenario definition plus one raw sample
-2. uses the scenario's focused milestone timestamp as the readiness cutoff
-3. treats any pre-ready HTTP path or WS type not in the scenario allowlist as offscreen work
-4. returns only derived numeric data and no filesystem or Playwright state
+1. normalize API route IDs
+2. ignore `/api/health` and `/api/logs/client`
+3. bucket WebSocket frames by `type`
+4. use the scenario focused-ready milestone as the readiness cutoff
+5. return only derived numeric data
 
 **Step 4: Run the test to verify it passes**
 
@@ -262,52 +453,59 @@ git add test/e2e-browser/perf/derive-visible-first-metrics.ts test/unit/lib/visi
 git commit -m "test: define visible-first derived metrics"
 ```
 
-## Task 3: Keep Aggregation Pure and Deterministic
+## Task 3: Keep Aggregation and Comparison Pure
 
 **Files:**
 - Create: `test/e2e-browser/perf/audit-aggregator.ts`
+- Create: `test/e2e-browser/perf/compare-visible-first-audits.ts`
 - Create: `test/unit/lib/visible-first-audit-aggregator.test.ts`
+- Create: `test/unit/lib/visible-first-audit-compare.test.ts`
 
-**Step 1: Write the failing test**
+**Step 1: Write the failing tests**
 
 ```ts
 import { describe, expect, it } from 'vitest'
 import { summarizeScenarioSamples } from '@test/e2e-browser/perf/audit-aggregator'
+import { compareVisibleFirstAudits } from '@test/e2e-browser/perf/compare-visible-first-audits'
 
-describe('summarizeScenarioSamples', () => {
+describe('audit aggregation', () => {
   it('produces stable summaryByProfile entries without inventing medians', () => {
     const summary = summarizeScenarioSamples(buildScenarioFixture())
     expect(summary.desktop_local.focusedReadyMs).toBeTypeOf('number')
-    expect(summary.mobile_restricted.offscreenWsBytesBeforeReady).toBeTypeOf('number')
+  })
+
+  it('diffs two schema-valid artifacts by scenario and profile', () => {
+    const diff = compareVisibleFirstAudits(baseAuditFixture(), candidateAuditFixture())
+    expect(diff.scenarios[0]?.profiles[0]?.profileId).toBe('desktop_local')
   })
 })
 ```
 
-**Step 2: Run the test to verify it fails**
+**Step 2: Run the tests to verify they fail**
 
 Run:
 
 ```bash
-npm run test:client:standard -- test/unit/lib/visible-first-audit-aggregator.test.ts
+npm run test:client:standard -- test/unit/lib/visible-first-audit-aggregator.test.ts test/unit/lib/visible-first-audit-compare.test.ts
 ```
 
-Expected: FAIL with a module-not-found error for `audit-aggregator.ts`.
+Expected: FAIL with module-not-found errors.
 
 **Step 3: Write the minimal implementation**
 
-Create `audit-aggregator.ts` as pure functions only. It should:
+Create pure modules that:
 
 1. summarize one sample into compare-friendly fields
 2. summarize one scenario into `desktop_local` and `mobile_restricted`
-3. preserve profile ordering
+3. compare two already-validated artifacts by scenario and profile
 4. never import Playwright, DOM, or filesystem code
 
-**Step 4: Run the test to verify it passes**
+**Step 4: Run the tests to verify they pass**
 
 Run:
 
 ```bash
-npm run test:client:standard -- test/unit/lib/visible-first-audit-aggregator.test.ts
+npm run test:client:standard -- test/unit/lib/visible-first-audit-aggregator.test.ts test/unit/lib/visible-first-audit-compare.test.ts
 ```
 
 Expected: PASS.
@@ -315,8 +513,8 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add test/e2e-browser/perf/audit-aggregator.ts test/unit/lib/visible-first-audit-aggregator.test.ts
-git commit -m "test: add visible-first audit aggregation"
+git add test/e2e-browser/perf/audit-aggregator.ts test/e2e-browser/perf/compare-visible-first-audits.ts test/unit/lib/visible-first-audit-aggregator.test.ts test/unit/lib/visible-first-audit-compare.test.ts
+git commit -m "test: add visible-first audit aggregation and diff helpers"
 ```
 
 ## Task 4: Extend TestServer for Audit Retention
@@ -351,7 +549,7 @@ Run:
 npm run test:e2e:helpers -- test/e2e-browser/helpers/test-server.test.ts
 ```
 
-Expected: FAIL because `preserveHomeOnStop`, `setupHome`, `homeDir`, and `logsDir` do not exist.
+Expected: FAIL because `setupHome`, `preserveHomeOnStop`, `homeDir`, and `logsDir` do not exist.
 
 **Step 3: Write the minimal implementation**
 
@@ -361,7 +559,7 @@ Extend `TestServer` with:
 2. `preserveHomeOnStop?: boolean`
 3. `homeDir` and `logsDir` in `TestServerInfo`
 
-Call `setupHome` after creating the temp HOME and before starting the server. Keep existing cleanup behavior unchanged for non-audit callers.
+Keep default cleanup behavior unchanged for non-audit callers.
 
 **Step 4: Run the test to verify it passes**
 
@@ -377,26 +575,28 @@ Expected: PASS.
 
 ```bash
 git add test/e2e-browser/helpers/test-server.ts test/e2e-browser/helpers/test-server.test.ts
-git commit -m "test: extend test server for perf audit retention"
+git commit -m "test: extend test server for audit retention"
 ```
 
-## Task 5: Seed Deterministic Audit Fixture Data
+## Task 5: Seed Deterministic Server Fixture Data
 
 **Files:**
-- Create: `test/e2e-browser/perf/seed-home.ts`
-- Create: `test/unit/lib/visible-first-audit-seed-home.test.ts`
+- Create: `test/e2e-browser/perf/seed-server-home.ts`
+- Create: `test/unit/lib/visible-first-audit-seed-server-home.test.ts`
 
 **Step 1: Write the failing test**
 
 ```ts
 import { describe, expect, it } from 'vitest'
-import { seedVisibleFirstAuditHome } from '@test/e2e-browser/perf/seed-home'
+import { seedVisibleFirstAuditServerHome } from '@test/e2e-browser/perf/seed-server-home'
 
-describe('seedVisibleFirstAuditHome', () => {
-  it('creates the large deterministic fixture set used by all six scenarios', async () => {
-    const result = await seedVisibleFirstAuditHome(tmpHome)
-    expect(result.sessionCount).toBeGreaterThan(100)
-    expect(result.scenarioIds).toContain('offscreen-tab-selection')
+describe('seedVisibleFirstAuditServerHome', () => {
+  it('writes the approved session corpus, long-history session, and backlog script', async () => {
+    const result = await seedVisibleFirstAuditServerHome(tmpHome)
+    expect(result.sessionCount).toBe(180)
+    expect(result.alphaSessionCount).toBe(36)
+    expect(result.longHistoryTurnCount).toBe(240)
+    expect(result.backlogScriptPath).toContain('audit-terminal-backlog')
   })
 })
 ```
@@ -406,28 +606,28 @@ describe('seedVisibleFirstAuditHome', () => {
 Run:
 
 ```bash
-npm run test:client:standard -- test/unit/lib/visible-first-audit-seed-home.test.ts
+npm run test:client:standard -- test/unit/lib/visible-first-audit-seed-server-home.test.ts
 ```
 
-Expected: FAIL with a module-not-found error for `seed-home.ts`.
+Expected: FAIL with a module-not-found error for `seed-server-home.ts`.
 
 **Step 3: Write the minimal implementation**
 
-Create `seed-home.ts` that deterministically writes:
+Create `seed-server-home.ts` that deterministically writes:
 
-1. a large session corpus for sidebar/search
-2. a long agent-chat history fixture
-3. persisted tab/pane state for offscreen-tab selection
-4. reconnect/backlog fixture data for terminal replay scenarios
+1. the 180-session corpus
+2. the 240-turn long-history session
+3. one Node backlog script with stable line output
+4. any required config files using real app formats
 
-Reuse app-native file formats and persisted-state shapes instead of inventing synthetic formats.
+Do not attempt to store tab or pane state here.
 
 **Step 4: Run the test to verify it passes**
 
 Run:
 
 ```bash
-npm run test:client:standard -- test/unit/lib/visible-first-audit-seed-home.test.ts
+npm run test:client:standard -- test/unit/lib/visible-first-audit-seed-server-home.test.ts
 ```
 
 Expected: PASS.
@@ -435,11 +635,145 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add test/e2e-browser/perf/seed-home.ts test/unit/lib/visible-first-audit-seed-home.test.ts
-git commit -m "test: add deterministic visible-first audit fixtures"
+git add test/e2e-browser/perf/seed-server-home.ts test/unit/lib/visible-first-audit-seed-server-home.test.ts
+git commit -m "test: add deterministic audit server fixtures"
 ```
 
-## Task 6: Create the Browser Audit Bridge
+## Task 6: Seed Deterministic Browser Storage for Layout-Based Scenarios
+
+**Files:**
+- Create: `test/e2e-browser/perf/seed-browser-storage.ts`
+- Create: `test/unit/lib/visible-first-audit-seed-browser-storage.test.ts`
+
+**Step 1: Write the failing test**
+
+```ts
+import { describe, expect, it } from 'vitest'
+import { buildOffscreenTabBrowserStorageSeed } from '@test/e2e-browser/perf/seed-browser-storage'
+
+describe('buildOffscreenTabBrowserStorageSeed', () => {
+  it('returns schema-compatible localStorage payloads for tabs and panes', () => {
+    const seed = buildOffscreenTabBrowserStorageSeed()
+    expect(seed['freshell_version']).toBe('3')
+    expect(seed['freshell.tabs.v2']).toContain('tabs')
+    expect(seed['freshell.panes.v2']).toContain('layouts')
+  })
+})
+```
+
+**Step 2: Run the test to verify it fails**
+
+Run:
+
+```bash
+npm run test:client:standard -- test/unit/lib/visible-first-audit-seed-browser-storage.test.ts
+```
+
+Expected: FAIL with a module-not-found error for `seed-browser-storage.ts`.
+
+**Step 3: Write the minimal implementation**
+
+Create `seed-browser-storage.ts` with helpers that:
+
+1. build current-schema tab and pane payloads
+2. return a plain key-value map for `page.addInitScript()`
+3. cover the agent-chat active-tab and offscreen-tab-selection scenarios
+
+**Step 4: Run the test to verify it passes**
+
+Run:
+
+```bash
+npm run test:client:standard -- test/unit/lib/visible-first-audit-seed-browser-storage.test.ts
+```
+
+Expected: PASS.
+
+**Step 5: Commit**
+
+```bash
+git add test/e2e-browser/perf/seed-browser-storage.ts test/unit/lib/visible-first-audit-seed-browser-storage.test.ts
+git commit -m "test: add deterministic audit browser storage seeds"
+```
+
+## Task 7: Freeze the Approved Profiles and Scenario Matrix
+
+**Files:**
+- Create: `test/e2e-browser/perf/profiles.ts`
+- Create: `test/e2e-browser/perf/scenarios.ts`
+- Create: `test/unit/lib/visible-first-audit-profiles.test.ts`
+- Create: `test/unit/lib/visible-first-audit-scenarios.test.ts`
+
+**Step 1: Write the failing tests**
+
+```ts
+import { describe, expect, it } from 'vitest'
+import { AUDIT_PROFILES } from '@test/e2e-browser/perf/profiles'
+import { AUDIT_SCENARIOS } from '@test/e2e-browser/perf/scenarios'
+
+describe('audit matrix', () => {
+  it('defines exactly the approved profiles', () => {
+    expect(AUDIT_PROFILES.map((profile) => profile.id)).toEqual([
+      'desktop_local',
+      'mobile_restricted',
+    ])
+  })
+
+  it('defines the six scenarios in stable order with readiness and allowlists', () => {
+    expect(AUDIT_SCENARIOS.map((scenario) => scenario.id)).toEqual([
+      'auth-required-cold-boot',
+      'terminal-cold-boot',
+      'agent-chat-cold-boot',
+      'sidebar-search-large-corpus',
+      'terminal-reconnect-backlog',
+      'offscreen-tab-selection',
+    ])
+  })
+})
+```
+
+**Step 2: Run the tests to verify they fail**
+
+Run:
+
+```bash
+npm run test:client:standard -- test/unit/lib/visible-first-audit-profiles.test.ts test/unit/lib/visible-first-audit-scenarios.test.ts
+```
+
+Expected: FAIL with module-not-found errors.
+
+**Step 3: Write the minimal implementation**
+
+Create immutable definitions for:
+
+1. both profiles, including the exact mobile bandwidth settings
+2. all six scenarios, including:
+   - navigation URL builder
+   - optional server-home seeding
+   - optional browser-storage seeding
+   - focused-ready milestone name
+   - normalized API and WS allowlists
+
+Do not let scenario files own browser launch, artifact writing, or log parsing.
+
+**Step 4: Run the tests to verify they pass**
+
+Run:
+
+```bash
+npm run test:client:standard -- test/unit/lib/visible-first-audit-profiles.test.ts test/unit/lib/visible-first-audit-scenarios.test.ts
+```
+
+Expected: PASS.
+
+**Step 5: Commit**
+
+```bash
+git add test/e2e-browser/perf/profiles.ts test/e2e-browser/perf/scenarios.ts test/unit/lib/visible-first-audit-profiles.test.ts test/unit/lib/visible-first-audit-scenarios.test.ts
+git commit -m "test: define visible-first audit matrix"
+```
+
+## Task 8: Create the Browser Audit Bridge
 
 **Files:**
 - Create: `src/lib/perf-audit-bridge.ts`
@@ -468,7 +802,7 @@ Run:
 npm run test:client:standard -- test/unit/client/lib/perf-audit-bridge.test.ts
 ```
 
-Expected: FAIL because the audit bridge does not exist.
+Expected: FAIL because the bridge does not exist.
 
 **Step 3: Write the minimal implementation**
 
@@ -499,7 +833,7 @@ git add src/lib/perf-audit-bridge.ts test/unit/client/lib/perf-audit-bridge.test
 git commit -m "test: add browser perf audit bridge"
 ```
 
-## Task 7: Feed Existing Client Perf Signals into the Bridge
+## Task 9: Feed Existing Client Perf Signals into the Bridge
 
 **Files:**
 - Modify: `src/lib/perf-logger.ts`
@@ -508,7 +842,8 @@ git commit -m "test: add browser perf audit bridge"
 **Step 1: Write the failing test**
 
 ```ts
-it('forwards perf entries to an installed audit sink without changing console behavior', () => {
+it('forwards perf entries to an installed audit sink without changing console behavior', async () => {
+  const { installClientPerfAuditSink, logClientPerf } = await loadPerfLoggerModule()
   const seen: unknown[] = []
   installClientPerfAuditSink((entry) => seen.push(entry))
   logClientPerf('perf.paint', { name: 'first-contentful-paint' })
@@ -553,7 +888,7 @@ git add src/lib/perf-logger.ts test/unit/client/lib/perf-logger.test.ts
 git commit -m "test: route client perf signals into audit sink"
 ```
 
-## Task 8: Expose Audit Snapshots Through the Existing Test Harness
+## Task 10: Expose Audit Snapshots Through the Existing Test Harness
 
 **Files:**
 - Modify: `src/lib/test-harness.ts`
@@ -581,14 +916,14 @@ Run:
 npm run test:client:standard -- test/unit/client/lib/test-harness.perf-audit.test.ts
 ```
 
-Expected: FAIL because the test harness does not expose audit snapshots.
+Expected: FAIL because the harness does not expose audit snapshots.
 
 **Step 3: Write the minimal implementation**
 
-Extend both harness layers with:
+Extend the harness layers with:
 
 1. `getPerfAuditSnapshot()`
-2. `waitForAuditMilestone(name, timeoutMs?)` in the Playwright helper
+2. `waitForAuditMilestone(name, timeoutMs?)`
 
 Do not create a second browser-only bridge API when the existing harness can carry this.
 
@@ -606,16 +941,18 @@ Expected: PASS.
 
 ```bash
 git add src/lib/test-harness.ts test/e2e-browser/helpers/test-harness.ts test/unit/client/lib/test-harness.perf-audit.test.ts
-git commit -m "test: expose perf audit snapshots in harness"
+git commit -m "test: expose perf audit snapshots in the test harness"
 ```
 
-## Task 9: Mark App Bootstrap and Auth-Required Milestones
+## Task 11: Mark App and Terminal Readiness Milestones
 
 **Files:**
 - Modify: `src/App.tsx`
+- Modify: `src/components/TerminalView.tsx`
 - Modify: `test/unit/client/components/App.lazy-views.test.tsx`
+- Modify: `test/unit/client/components/TerminalView.lifecycle.test.tsx`
 
-**Step 1: Write the failing test**
+**Step 1: Write the failing tests**
 
 ```ts
 it('marks auth-required readiness when booting without a token in perf audit mode', async () => {
@@ -623,53 +960,6 @@ it('marks auth-required readiness when booting without a token in perf audit mod
   expect(await getAuditMilestone('app.auth_required_visible')).toBeGreaterThanOrEqual(0)
 })
 ```
-
-**Step 2: Run the test to verify it fails**
-
-Run:
-
-```bash
-npm run test:client:standard -- test/unit/client/components/App.lazy-views.test.tsx
-```
-
-Expected: FAIL because the audit milestones are not emitted.
-
-**Step 3: Write the minimal implementation**
-
-In `src/App.tsx`, when `?e2e=1&perfAudit=1` is present:
-
-1. install the bridge
-2. mark `app.bootstrap_started`
-3. mark `app.bootstrap_ready`
-4. mark `app.ws_ready` when the socket becomes ready
-5. mark `app.auth_required_visible` when the auth-required path wins
-
-Keep audit behavior behind the runtime flag.
-
-**Step 4: Run the test to verify it passes**
-
-Run:
-
-```bash
-npm run test:client:standard -- test/unit/client/components/App.lazy-views.test.tsx
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git add src/App.tsx test/unit/client/components/App.lazy-views.test.tsx
-git commit -m "test: add app bootstrap audit milestones"
-```
-
-## Task 10: Mark Terminal Readiness Milestones
-
-**Files:**
-- Modify: `src/components/TerminalView.tsx`
-- Modify: `test/unit/client/components/TerminalView.lifecycle.test.tsx`
-
-**Step 1: Write the failing test**
 
 ```ts
 it('marks terminal visibility and first output in perf audit mode', async () => {
@@ -679,31 +969,34 @@ it('marks terminal visibility and first output in perf audit mode', async () => 
 })
 ```
 
-**Step 2: Run the test to verify it fails**
+**Step 2: Run the tests to verify they fail**
 
 Run:
 
 ```bash
-npm run test:client:standard -- test/unit/client/components/TerminalView.lifecycle.test.tsx
+npm run test:client:standard -- test/unit/client/components/App.lazy-views.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx
 ```
 
-Expected: FAIL because the terminal milestones do not exist.
+Expected: FAIL because the audit milestones are not emitted.
 
 **Step 3: Write the minimal implementation**
 
-In `TerminalView.tsx`:
+In audit mode (`?e2e=1&perfAudit=1`):
 
-1. mark `terminal.surface_visible` when the active terminal surface is mounted and visible
-2. mark `terminal.first_output` on the first meaningful output for the active terminal
+1. install the bridge from `App.tsx`
+2. mark `app.bootstrap_started`
+3. mark `app.bootstrap_ready`
+4. mark `app.ws_ready`
+5. mark `app.auth_required_visible`
+6. mark `terminal.surface_visible`
+7. mark `terminal.first_output` only for the active terminal
 
-Do not emit milestones for inactive background terminals.
-
-**Step 4: Run the test to verify it passes**
+**Step 4: Run the tests to verify they pass**
 
 Run:
 
 ```bash
-npm run test:client:standard -- test/unit/client/components/TerminalView.lifecycle.test.tsx
+npm run test:client:standard -- test/unit/client/components/App.lazy-views.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx
 ```
 
 Expected: PASS.
@@ -711,70 +1004,28 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add src/components/TerminalView.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx
-git commit -m "test: add terminal audit milestones"
+git add src/App.tsx src/components/TerminalView.tsx test/unit/client/components/App.lazy-views.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx
+git commit -m "test: add app and terminal audit milestones"
 ```
 
-## Task 11: Mark Agent-Chat Readiness Milestones
+## Task 12: Mark Agent-Chat, Sidebar Search, and Tab-Selection Milestones
 
 **Files:**
 - Modify: `src/components/agent-chat/AgentChatView.tsx`
-- Create: `test/unit/client/components/AgentChatView.perf-audit.test.tsx`
-
-**Step 1: Write the failing test**
-
-```ts
-it('marks agent-chat surface visibility when recent messages render', async () => {
-  renderAgentChatViewForAudit(longHistoryFixture)
-  expect(await getAuditMilestone('agent_chat.surface_visible')).toBeGreaterThanOrEqual(0)
-})
-```
-
-**Step 2: Run the test to verify it fails**
-
-Run:
-
-```bash
-npm run test:client:standard -- test/unit/client/components/AgentChatView.perf-audit.test.tsx
-```
-
-Expected: FAIL because the agent-chat milestones do not exist.
-
-**Step 3: Write the minimal implementation**
-
-In `AgentChatView.tsx`:
-
-1. mark `agent_chat.surface_visible` when the visible recent-message window is rendered
-2. mark `agent_chat.restore_timed_out` if the existing timeout fallback path fires
-
-Do not treat hidden history restoration as readiness.
-
-**Step 4: Run the test to verify it passes**
-
-Run:
-
-```bash
-npm run test:client:standard -- test/unit/client/components/AgentChatView.perf-audit.test.tsx
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git add src/components/agent-chat/AgentChatView.tsx test/unit/client/components/AgentChatView.perf-audit.test.tsx
-git commit -m "test: add agent chat audit milestones"
-```
-
-## Task 12: Mark Sidebar Search and Offscreen Tab Milestones
-
-**Files:**
 - Modify: `src/components/Sidebar.tsx`
 - Modify: `src/components/TabContent.tsx`
+- Create: `test/unit/client/components/agent-chat/AgentChatView.perf-audit.test.tsx`
 - Create: `test/unit/client/components/Sidebar.perf-audit.test.tsx`
 - Create: `test/unit/client/components/TabContent.perf-audit.test.tsx`
 
 **Step 1: Write the failing tests**
+
+```ts
+it('marks agent-chat readiness when recent visible messages render', async () => {
+  renderAgentChatViewForAudit(longHistoryFixture)
+  expect(await getAuditMilestone('agent_chat.surface_visible')).toBeGreaterThanOrEqual(0)
+})
+```
 
 ```ts
 it('marks sidebar search results visibility for the active query', async () => {
@@ -784,7 +1035,7 @@ it('marks sidebar search results visibility for the active query', async () => {
 ```
 
 ```ts
-it('marks offscreen tab selection when the selected tab content becomes visible', async () => {
+it('marks offscreen tab selection when the selected tab becomes visible', async () => {
   renderTabContentForAudit()
   expect(await getAuditMilestone('tab.selected_surface_visible')).toBeGreaterThanOrEqual(0)
 })
@@ -795,30 +1046,29 @@ it('marks offscreen tab selection when the selected tab content becomes visible'
 Run:
 
 ```bash
-npm run test:client:standard -- test/unit/client/components/Sidebar.perf-audit.test.tsx test/unit/client/components/TabContent.perf-audit.test.tsx
+npm run test:client:standard -- test/unit/client/components/agent-chat/AgentChatView.perf-audit.test.tsx test/unit/client/components/Sidebar.perf-audit.test.tsx test/unit/client/components/TabContent.perf-audit.test.tsx
 ```
 
 Expected: FAIL because those milestones do not exist.
 
 **Step 3: Write the minimal implementation**
 
-In `Sidebar.tsx`:
+Add audit-only milestones:
 
-1. mark `sidebar.search_started` when the query is issued
-2. mark `sidebar.search_results_visible` when visible results for the current query render
+1. `agent_chat.surface_visible`
+2. `agent_chat.restore_timed_out`
+3. `sidebar.search_started`
+4. `sidebar.search_results_visible`
+5. `tab.selected_surface_visible`
 
-In `TabContent.tsx`:
-
-1. mark `tab.selected_surface_visible` when the newly selected background tab becomes the visible tab surface
-
-These milestones are required so the audit can draw the readiness boundary for the two most transport-sensitive non-terminal scenarios.
+Do not count hidden or background work as readiness.
 
 **Step 4: Run the tests to verify they pass**
 
 Run:
 
 ```bash
-npm run test:client:standard -- test/unit/client/components/Sidebar.perf-audit.test.tsx test/unit/client/components/TabContent.perf-audit.test.tsx
+npm run test:client:standard -- test/unit/client/components/agent-chat/AgentChatView.perf-audit.test.tsx test/unit/client/components/Sidebar.perf-audit.test.tsx test/unit/client/components/TabContent.perf-audit.test.tsx
 ```
 
 Expected: PASS.
@@ -826,11 +1076,11 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add src/components/Sidebar.tsx src/components/TabContent.tsx test/unit/client/components/Sidebar.perf-audit.test.tsx test/unit/client/components/TabContent.perf-audit.test.tsx
-git commit -m "test: add sidebar and tab-selection audit milestones"
+git add src/components/agent-chat/AgentChatView.tsx src/components/Sidebar.tsx src/components/TabContent.tsx test/unit/client/components/agent-chat/AgentChatView.perf-audit.test.tsx test/unit/client/components/Sidebar.perf-audit.test.tsx test/unit/client/components/TabContent.perf-audit.test.tsx
+git commit -m "test: add visible-readiness milestones for audit scenarios"
 ```
 
-## Task 13: Record HTTP and WebSocket Transport Through CDP
+## Task 13: Record HTTP and WebSocket Transport Through Chromium CDP
 
 **Files:**
 - Create: `test/e2e-browser/perf/cdp-network-recorder.ts`
@@ -843,14 +1093,24 @@ import { describe, expect, it } from 'vitest'
 import { NetworkRecorder } from '@test/e2e-browser/perf/cdp-network-recorder'
 
 describe('NetworkRecorder', () => {
-  it('groups websocket frames by direction and message type', () => {
+  it('groups websocket frames by direction and message type and ignores non-api HTTP noise', () => {
     const recorder = new NetworkRecorder()
     recorder.onFrame('received', JSON.stringify({ type: 'sessions.updated' }))
     recorder.onFrame('sent', JSON.stringify({ type: 'hello' }))
+    recorder.onHttpCompleted({
+      url: 'http://localhost:3000/assets/app.js',
+      method: 'GET',
+      status: 200,
+      encodedDataLength: 1200,
+      startTimeMs: 0,
+      endTimeMs: 10,
+    })
+
     const summary = recorder.summarize()
-    expect(summary.byType).toContainEqual(
+    expect(summary.ws.byType).toContainEqual(
       expect.objectContaining({ direction: 'received', type: 'sessions.updated', count: 1 }),
     )
+    expect(summary.http.byPath).toHaveLength(0)
   })
 })
 ```
@@ -870,10 +1130,11 @@ Expected: FAIL because the recorder does not exist.
 Implement `cdp-network-recorder.ts` around Chromium CDP:
 
 1. enable `Network`
-2. join `responseReceived` and `loadingFinished` into HTTP samples
-3. record WebSocket frames from `webSocketFrameSent` and `webSocketFrameReceived`
-4. bucket frame types from JSON payload `type`, falling back to `unknown`
-5. expose raw samples plus `byPath` and `byType` summaries
+2. join `requestWillBeSent`, `responseReceived`, and `loadingFinished`
+3. use `encodedDataLength` for HTTP bytes
+4. record `webSocketFrameSent` and `webSocketFrameReceived`
+5. normalize route IDs and WS types
+6. ignore non-API requests and ignored API routes
 
 **Step 4: Run the test to verify it passes**
 
@@ -905,7 +1166,7 @@ import { describe, expect, it } from 'vitest'
 import { parseServerDebugLogs } from '@test/e2e-browser/perf/server-log-parser'
 
 describe('parseServerDebugLogs', () => {
-  it('extracts http_request and perf_system entries from server logs', async () => {
+  it('extracts http_request, perf events, and perf_system samples from server logs', async () => {
     const parsed = await parseServerDebugLogs([fixtureLogPath])
     expect(parsed.httpRequests).toHaveLength(1)
     expect(parsed.perfSystem[0]?.event).toBe('perf_system')
@@ -927,10 +1188,10 @@ Expected: FAIL because the parser does not exist.
 
 Create `server-log-parser.ts` that:
 
-1. reads `server-debug*.jsonl` files from the sample log directory
+1. reads `server-debug*.jsonl`
 2. extracts `http_request`
-3. extracts `perf_system`
-4. extracts server perf events and terminal stream perf events
+3. extracts perf events from the perf logger
+4. extracts `perf_system`
 5. counts malformed lines in diagnostics instead of crashing the whole sample
 
 **Step 4: Run the test to verify it passes**
@@ -950,133 +1211,7 @@ git add test/e2e-browser/perf/server-log-parser.ts test/unit/lib/visible-first-a
 git commit -m "test: parse server perf logs for audit artifacts"
 ```
 
-## Task 15: Freeze the Approved Profile Matrix
-
-**Files:**
-- Create: `test/e2e-browser/perf/profiles.ts`
-- Create: `test/unit/lib/visible-first-audit-profiles.test.ts`
-
-**Step 1: Write the failing test**
-
-```ts
-import { describe, expect, it } from 'vitest'
-import { AUDIT_PROFILES } from '@test/e2e-browser/perf/profiles'
-
-describe('AUDIT_PROFILES', () => {
-  it('defines exactly the approved desktop and restricted mobile profiles', () => {
-    expect(AUDIT_PROFILES.map((profile) => profile.id)).toEqual([
-      'desktop_local',
-      'mobile_restricted',
-    ])
-  })
-})
-```
-
-**Step 2: Run the test to verify it fails**
-
-Run:
-
-```bash
-npm run test:client:standard -- test/unit/lib/visible-first-audit-profiles.test.ts
-```
-
-Expected: FAIL because `profiles.ts` does not exist.
-
-**Step 3: Write the minimal implementation**
-
-Create `profiles.ts` with immutable definitions for:
-
-1. desktop viewport
-2. mobile device emulation
-3. restricted-bandwidth CDP settings
-
-Keep all profile constants in one place so the runner and compare tool cannot drift.
-
-**Step 4: Run the test to verify it passes**
-
-Run:
-
-```bash
-npm run test:client:standard -- test/unit/lib/visible-first-audit-profiles.test.ts
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git add test/e2e-browser/perf/profiles.ts test/unit/lib/visible-first-audit-profiles.test.ts
-git commit -m "test: define visible-first audit profiles"
-```
-
-## Task 16: Freeze the Scenario Matrix and Driver Contracts
-
-**Files:**
-- Create: `test/e2e-browser/perf/scenarios.ts`
-- Create: `test/unit/lib/visible-first-audit-scenarios.test.ts`
-
-**Step 1: Write the failing test**
-
-```ts
-import { describe, expect, it } from 'vitest'
-import { AUDIT_SCENARIOS } from '@test/e2e-browser/perf/scenarios'
-
-describe('AUDIT_SCENARIOS', () => {
-  it('defines the approved six scenarios in stable order with readiness and allowlists', () => {
-    expect(AUDIT_SCENARIOS.map((scenario) => scenario.id)).toEqual([
-      'auth-required-cold-boot',
-      'terminal-cold-boot',
-      'agent-chat-cold-boot',
-      'sidebar-search-large-corpus',
-      'terminal-reconnect-backlog',
-      'offscreen-tab-selection',
-    ])
-    expect(AUDIT_SCENARIOS[0]?.focusedReadyMilestone).toBeTypeOf('string')
-  })
-})
-```
-
-**Step 2: Run the test to verify it fails**
-
-Run:
-
-```bash
-npm run test:client:standard -- test/unit/lib/visible-first-audit-scenarios.test.ts
-```
-
-Expected: FAIL because `scenarios.ts` does not exist.
-
-**Step 3: Write the minimal implementation**
-
-Create `scenarios.ts` as data plus small driver functions. Each scenario definition must include:
-
-1. stable `id`
-2. `focusedReadyMilestone`
-3. allowed-before-ready HTTP paths
-4. allowed-before-ready WebSocket types
-5. setup/navigation behavior
-6. one final `collect()` step that returns the browser audit snapshot
-
-Do not let scenario files own browser launch, server launch, artifact writing, or log parsing.
-
-**Step 4: Run the test to verify it passes**
-
-Run:
-
-```bash
-npm run test:client:standard -- test/unit/lib/visible-first-audit-scenarios.test.ts
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git add test/e2e-browser/perf/scenarios.ts test/unit/lib/visible-first-audit-scenarios.test.ts
-git commit -m "test: define visible-first audit scenarios"
-```
-
-## Task 17: Build the Per-Sample Runner
+## Task 15: Build the Per-Sample Runner With Hard Cold Isolation
 
 **Files:**
 - Create: `test/e2e-browser/perf/run-sample.ts`
@@ -1114,14 +1249,20 @@ Create `run-sample.ts` that owns one complete cold sample:
 
 1. start `TestServer` with `PERF_LOGGING=true`, `setupHome`, and preserved HOME
 2. launch Chromium
-3. apply the selected profile
-4. attach the CDP recorder
-5. execute one scenario driver
-6. collect the browser audit snapshot
-7. parse server logs
-8. derive visible-first metrics
-9. return one sample object
-10. clean up browser and server in `finally`
+3. create a fresh browser context for the selected profile with:
+   - `serviceWorkers: 'block'`
+   - empty storage
+4. attach a CDP session
+5. call `Network.enable`
+6. call `Network.setCacheDisabled({ cacheDisabled: true })`
+7. apply `Network.emulateNetworkConditions` only for `mobile_restricted`
+8. apply browser-storage seeds through `page.addInitScript()` only when the scenario asks for them
+9. execute the scenario driver
+10. collect the browser audit snapshot
+11. parse server logs
+12. derive visible-first metrics
+13. return one sample object
+14. clean up browser and server in `finally`
 
 **Step 4: Run the test to verify it passes**
 
@@ -1140,12 +1281,13 @@ git add test/e2e-browser/perf/run-sample.ts test/unit/lib/visible-first-audit-ru
 git commit -m "test: add visible-first audit sample runner"
 ```
 
-## Task 18: Build the Full Audit Runner and CLI
+## Task 16: Build the Full Audit Runner and Both CLIs
 
 **Files:**
 - Create: `test/e2e-browser/perf/run-visible-first-audit.ts`
 - Create: `test/e2e-browser/perf/audit-cli.ts`
 - Create: `scripts/visible-first-audit.ts`
+- Create: `scripts/compare-visible-first-audit.ts`
 - Modify: `package.json`
 - Create: `test/unit/lib/visible-first-audit-cli.test.ts`
 
@@ -1177,18 +1319,20 @@ Expected: FAIL because the CLI helpers do not exist.
 Create:
 
 1. `run-visible-first-audit.ts` to loop serially across the fixed scenario/profile matrix
-2. `audit-cli.ts` to parse output path plus optional reduced smoke filters
-3. `scripts/visible-first-audit.ts` to invoke the runner and write the artifact
+2. `audit-cli.ts` to parse output path plus optional smoke filters
+3. `scripts/visible-first-audit.ts` to invoke the runner and write exactly one artifact
+4. `scripts/compare-visible-first-audit.ts` to load two schema-valid artifacts and emit one JSON diff
 
 Update `package.json` with:
 
 ```json
-"perf:audit:visible-first": "tsx scripts/visible-first-audit.ts"
+"perf:audit:visible-first": "tsx scripts/visible-first-audit.ts",
+"perf:audit:compare": "tsx scripts/compare-visible-first-audit.ts"
 ```
 
-The runner must:
+The audit runner must:
 
-1. ensure a perf-enabled build exists
+1. ensure a production build exists
 2. validate the final artifact with `VisibleFirstAuditSchema`
 3. create `artifacts/perf/` when needed
 4. write exactly one JSON file per invocation
@@ -1206,73 +1350,11 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add test/e2e-browser/perf/run-visible-first-audit.ts test/e2e-browser/perf/audit-cli.ts scripts/visible-first-audit.ts package.json test/unit/lib/visible-first-audit-cli.test.ts
-git commit -m "feat: add visible-first audit runner"
+git add test/e2e-browser/perf/run-visible-first-audit.ts test/e2e-browser/perf/audit-cli.ts scripts/visible-first-audit.ts scripts/compare-visible-first-audit.ts package.json test/unit/lib/visible-first-audit-cli.test.ts
+git commit -m "feat: add visible-first audit runner and compare cli"
 ```
 
-## Task 19: Build the Artifact Compare Tool
-
-**Files:**
-- Create: `scripts/compare-visible-first-audit.ts`
-- Modify: `package.json`
-- Create: `test/unit/lib/visible-first-audit-compare.test.ts`
-
-**Step 1: Write the failing test**
-
-```ts
-import { describe, expect, it } from 'vitest'
-import { compareVisibleFirstAudits } from '../../scripts/compare-visible-first-audit'
-
-describe('compareVisibleFirstAudits', () => {
-  it('diffs two schema-valid artifacts by scenario and profile', () => {
-    const diff = compareVisibleFirstAudits(baseAuditFixture(), candidateAuditFixture())
-    expect(diff.scenarios[0]?.id).toBe('terminal-cold-boot')
-  })
-})
-```
-
-**Step 2: Run the test to verify it fails**
-
-Run:
-
-```bash
-npm run test:client:standard -- test/unit/lib/visible-first-audit-compare.test.ts
-```
-
-Expected: FAIL because the compare tool does not exist.
-
-**Step 3: Write the minimal implementation**
-
-Create `compare-visible-first-audit.ts` that:
-
-1. loads two schema-valid artifacts
-2. compares them by scenario and profile
-3. emits concise JSON deltas for the derived metrics that will matter to the later visible-first work
-
-Update `package.json` with:
-
-```json
-"perf:audit:compare": "tsx scripts/compare-visible-first-audit.ts"
-```
-
-**Step 4: Run the test to verify it passes**
-
-Run:
-
-```bash
-npm run test:client:standard -- test/unit/lib/visible-first-audit-compare.test.ts
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git add scripts/compare-visible-first-audit.ts package.json test/unit/lib/visible-first-audit-compare.test.ts
-git commit -m "feat: add visible-first audit compare tool"
-```
-
-## Task 20: Add Artifact Hygiene, Smoke Coverage, and Operator Docs
+## Task 17: Add Smoke Coverage and Operator Docs
 
 **Files:**
 - Modify: `.gitignore`
@@ -1315,7 +1397,7 @@ Run:
 npm run test:e2e:helpers -- test/e2e-browser/perf/visible-first-audit.smoke.test.ts
 ```
 
-Expected: FAIL because the helper config does not include `perf/**/*.test.ts` yet or the runner is not yet smoke-test friendly.
+Expected: FAIL because the helper config does not include `perf/**/*.test.ts` yet or the runner is not smoke-test friendly.
 
 **Step 3: Write the minimal implementation**
 
@@ -1354,7 +1436,7 @@ Run these in order after all tasks are complete.
 Run:
 
 ```bash
-npm run test:client:standard -- test/unit/lib/visible-first-audit-contract.test.ts test/unit/lib/visible-first-audit-derived-metrics.test.ts test/unit/lib/visible-first-audit-aggregator.test.ts test/unit/lib/visible-first-audit-seed-home.test.ts test/unit/lib/visible-first-audit-network-recorder.test.ts test/unit/lib/visible-first-audit-server-log-parser.test.ts test/unit/lib/visible-first-audit-profiles.test.ts test/unit/lib/visible-first-audit-scenarios.test.ts test/unit/lib/visible-first-audit-run-sample.test.ts test/unit/lib/visible-first-audit-cli.test.ts test/unit/lib/visible-first-audit-compare.test.ts test/unit/client/lib/perf-audit-bridge.test.ts test/unit/client/lib/perf-logger.test.ts test/unit/client/lib/test-harness.perf-audit.test.ts test/unit/client/components/App.lazy-views.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/AgentChatView.perf-audit.test.tsx test/unit/client/components/Sidebar.perf-audit.test.tsx test/unit/client/components/TabContent.perf-audit.test.tsx
+npm run test:client:standard -- test/unit/lib/visible-first-audit-contract.test.ts test/unit/lib/visible-first-audit-derived-metrics.test.ts test/unit/lib/visible-first-audit-aggregator.test.ts test/unit/lib/visible-first-audit-compare.test.ts test/unit/lib/visible-first-audit-seed-server-home.test.ts test/unit/lib/visible-first-audit-seed-browser-storage.test.ts test/unit/lib/visible-first-audit-profiles.test.ts test/unit/lib/visible-first-audit-scenarios.test.ts test/unit/lib/visible-first-audit-network-recorder.test.ts test/unit/lib/visible-first-audit-server-log-parser.test.ts test/unit/lib/visible-first-audit-run-sample.test.ts test/unit/lib/visible-first-audit-cli.test.ts test/unit/client/lib/perf-audit-bridge.test.ts test/unit/client/lib/perf-logger.test.ts test/unit/client/lib/test-harness.perf-audit.test.ts test/unit/client/components/App.lazy-views.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/agent-chat/AgentChatView.perf-audit.test.tsx test/unit/client/components/Sidebar.perf-audit.test.tsx test/unit/client/components/TabContent.perf-audit.test.tsx
 npm run test:e2e:helpers -- test/e2e-browser/helpers/test-server.test.ts test/e2e-browser/perf/visible-first-audit.smoke.test.ts
 ```
 
@@ -1385,13 +1467,13 @@ Expected: `artifacts/perf/visible-first-audit.json` is written successfully.
 Run:
 
 ```bash
-node -e "const fs=require('fs'); const data=JSON.parse(fs.readFileSync('artifacts/perf/visible-first-audit.json','utf8')); console.log(data.schemaVersion, data.scenarios.length)"
+node -e "const fs=require('fs'); const data=JSON.parse(fs.readFileSync('artifacts/perf/visible-first-audit.json','utf8')); console.log(data.schemaVersion, data.scenarios.length, data.scenarios.every((s)=>s.samples.length===2))"
 ```
 
 Expected output:
 
 ```text
-1 6
+1 6 true
 ```
 
 **Step 5: Verify compare mode**
@@ -1406,10 +1488,12 @@ Expected: PASS with zero deltas or an equivalent empty diff.
 
 ## Notes for the Execution Agent
 
-1. Keep scenario IDs, profile IDs, milestone names, and artifact field names stable. Longitudinal value depends on it.
-2. Do not reuse browser contexts or server instances across measured samples.
-3. Do not route perf collection through `/api/logs/client`.
-4. Prefer browser-observed truth over app instrumentation whenever the browser can already answer the question.
-5. Only add app instrumentation for readiness states that cannot be inferred safely from transport events alone.
-6. Do not invent summary statistics that the accepted sampling plan does not support.
-7. Leave generated artifacts uncommitted unless explicitly asked to version a baseline.
+1. Keep scenario IDs, profile IDs, milestone names, route IDs, and artifact field names stable.
+2. Do not route perf collection through `/api/logs/client`.
+3. Do not reuse server instances or browser contexts across measured samples.
+4. Block service workers in the browser context instead of adding app-specific “disable SW” behavior.
+5. Use browser-storage seeding only for client-persisted state; use HOME seeding only for server-side fixture data.
+6. Prefer browser-observed truth over app instrumentation whenever the browser can already answer the question.
+7. Only add app instrumentation for readiness states that transport cannot infer safely.
+8. Do not invent summary statistics that the accepted sampling plan does not support.
+9. Leave generated artifacts uncommitted unless the user explicitly asks to version a baseline.
