@@ -104,6 +104,23 @@ async function runCliJson<T>(url: string, args: string[]) {
   return JSON.parse(output.stdout) as T
 }
 
+async function waitForExpect(assertions: () => void, timeoutMs = 2000, intervalMs = 25) {
+  const deadline = Date.now() + timeoutMs
+  let lastError: unknown
+
+  while (Date.now() < deadline) {
+    try {
+      assertions()
+      return
+    } catch (error) {
+      lastError = error
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs))
+  }
+
+  throw lastError ?? new Error('Timed out waiting for expectations to pass')
+}
+
 describe('cli e2e flow', () => {
   it('runs list-tabs end-to-end', async () => {
     const { url, close } = await startTestServer()
@@ -275,11 +292,13 @@ describe('cli e2e flow', () => {
 
       const renamed = await runCli(server.url, ['rename-tab', 'Release prep'])
 
-      const snapshot = (server.layoutStore as any).snapshot
       expect(renamed.stderr).toContain('active tab used')
-      expect(snapshot.activeTabId).toBe(second.data.tabId)
-      expect(snapshot.tabs.find((tab: any) => tab.id === second.data.tabId)?.title).toBe('Release prep')
-      expect(snapshot.tabs.find((tab: any) => tab.id === first.data.tabId)?.title).toBe('Backlog')
+      await waitForExpect(() => {
+        const snapshot = (server.layoutStore as any).snapshot
+        expect(snapshot.activeTabId).toBe(second.data.tabId)
+        expect(snapshot.tabs.find((tab: any) => tab.id === second.data.tabId)?.title).toBe('Release prep')
+        expect(snapshot.tabs.find((tab: any) => tab.id === first.data.tabId)?.title).toBe('Backlog')
+      })
     } finally {
       await server.close()
     }
@@ -293,10 +312,12 @@ describe('cli e2e flow', () => {
 
       await runCli(server.url, ['rename-tab', first.data.tabId, 'Release', 'board'])
 
-      const snapshot = (server.layoutStore as any).snapshot
-      expect(snapshot.activeTabId).toBe(second.data.tabId)
-      expect(snapshot.tabs.find((tab: any) => tab.id === first.data.tabId)?.title).toBe('Release board')
-      expect(snapshot.tabs.find((tab: any) => tab.id === second.data.tabId)?.title).toBe('Active')
+      await waitForExpect(() => {
+        const snapshot = (server.layoutStore as any).snapshot
+        expect(snapshot.activeTabId).toBe(second.data.tabId)
+        expect(snapshot.tabs.find((tab: any) => tab.id === first.data.tabId)?.title).toBe('Release board')
+        expect(snapshot.tabs.find((tab: any) => tab.id === second.data.tabId)?.title).toBe('Active')
+      })
     } finally {
       await server.close()
     }
@@ -329,10 +350,12 @@ describe('cli e2e flow', () => {
       await runCli(server.url, ['rename-pane', '-t', firstPaneId, '-n', 'Codex'])
       await runCli(server.url, ['rename-pane', secondPaneId, 'Editor'])
 
-      const snapshot = (server.layoutStore as any).snapshot
-      expect(snapshot.tabs.find((tab: any) => tab.id === tabId)?.title).toBe('Issue 166 work')
-      expect(snapshot.paneTitles[tabId][firstPaneId]).toBe('Codex')
-      expect(snapshot.paneTitles[tabId][secondPaneId]).toBe('Editor')
+      await waitForExpect(() => {
+        const snapshot = (server.layoutStore as any).snapshot
+        expect(snapshot.tabs.find((tab: any) => tab.id === tabId)?.title).toBe('Issue 166 work')
+        expect(snapshot.paneTitles[tabId][firstPaneId]).toBe('Codex')
+        expect(snapshot.paneTitles[tabId][secondPaneId]).toBe('Editor')
+      })
     } finally {
       await server.close()
     }
@@ -351,10 +374,12 @@ describe('cli e2e flow', () => {
 
       const renamed = await runCli(server.url, ['rename-pane', 'Main shell'])
 
-      const snapshot = (server.layoutStore as any).snapshot
       expect(renamed.stderr).toContain('active tab used')
-      expect(snapshot.paneTitles[created.data.tabId][created.data.paneId]).toBe('Main shell')
-      expect(snapshot.tabs.find((tab: any) => tab.id === created.data.tabId)?.title).toBe('Main shell')
+      await waitForExpect(() => {
+        const snapshot = (server.layoutStore as any).snapshot
+        expect(snapshot.paneTitles[created.data.tabId][created.data.paneId]).toBe('Main shell')
+        expect(snapshot.tabs.find((tab: any) => tab.id === created.data.tabId)?.title).toBe('Main shell')
+      })
     } finally {
       await server.close()
     }
@@ -405,8 +430,10 @@ describe('cli e2e flow', () => {
 
       await runCli(server.url, ['select-pane', '-t', 'example.txt'])
 
-      const snapshot = (server.layoutStore as any).snapshot
-      expect(snapshot.activePane[tabId]).toBe(split.data.paneId)
+      await waitForExpect(() => {
+        const snapshot = (server.layoutStore as any).snapshot
+        expect(snapshot.activePane[tabId]).toBe(split.data.paneId)
+      })
     } finally {
       await server.close()
     }
@@ -450,8 +477,10 @@ describe('cli e2e flow', () => {
 
       await runCli(server.url, ['select-pane', '-t', 'Editor'])
 
-      const snapshot = (server.layoutStore as any).snapshot
-      expect(snapshot.activePane[tabId]).toBe(firstPaneId)
+      await waitForExpect(() => {
+        const snapshot = (server.layoutStore as any).snapshot
+        expect(snapshot.activePane[tabId]).toBe(firstPaneId)
+      })
     } finally {
       await server.close()
     }
@@ -503,8 +532,10 @@ describe('cli e2e flow', () => {
 
       await runCli(server.url, ['select-pane', '-t', 'Editor notes'])
 
-      const snapshot = (server.layoutStore as any).snapshot
-      expect(snapshot.activePane[tabId]).toBe(secondPaneId)
+      await waitForExpect(() => {
+        const snapshot = (server.layoutStore as any).snapshot
+        expect(snapshot.activePane[tabId]).toBe(secondPaneId)
+      })
     } finally {
       await server.close()
     }
