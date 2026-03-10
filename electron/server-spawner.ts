@@ -123,6 +123,7 @@ export function createServerSpawner(): ServerSpawner {
 
       childProcess = spawn(cmd, args, {
         env,
+        cwd: configDir,
         stdio: ['ignore', 'pipe', 'pipe'],
         detached: false,
       })

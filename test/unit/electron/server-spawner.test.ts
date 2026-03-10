@@ -106,6 +106,28 @@ describe('ServerSpawner', () => {
       expect(opts.env.NODE_ENV).toBe('production')
     })
 
+    it('sets cwd to configDir when spawning server', async () => {
+      const proc = createMockProcess()
+      mockSpawn.mockReturnValue(proc)
+      setupHealthCheckSuccess()
+
+      await spawner.start({
+        spawn: {
+          mode: 'production',
+          nodeBinary: '/app/bundled-node/bin/node',
+          serverEntry: '/app/server/index.js',
+          nativeModulesDir: '/app/resources/bundled-node/native-modules',
+          serverNodeModulesDir: '/app/resources/server-node-modules',
+        },
+        port: 3001,
+        envFile: '/home/user/.freshell/.env',
+        configDir: '/home/user/.freshell',
+      })
+
+      const [, , opts] = mockSpawn.mock.calls[0]
+      expect(opts.cwd).toBe('/home/user/.freshell')
+    })
+
     it('sets NODE_PATH with nativeModulesDir before serverNodeModulesDir', async () => {
       const proc = createMockProcess()
       mockSpawn.mockReturnValue(proc)
@@ -156,6 +178,26 @@ describe('ServerSpawner', () => {
       expect(args).toContain('tsx')
       expect(args).toContain('server/index.ts')
       expect(opts.env.NODE_ENV).toBeUndefined()
+    })
+
+    it('sets cwd to configDir when spawning in dev mode', async () => {
+      const proc = createMockProcess()
+      mockSpawn.mockReturnValue(proc)
+      setupHealthCheckSuccess()
+
+      await spawner.start({
+        spawn: {
+          mode: 'dev',
+          tsxPath: 'npx',
+          serverSourceEntry: 'server/index.ts',
+        },
+        port: 3001,
+        envFile: '/home/user/.freshell/.env',
+        configDir: '/home/user/.freshell',
+      })
+
+      const [, , opts] = mockSpawn.mock.calls[0]
+      expect(opts.cwd).toBe('/home/user/.freshell')
     })
   })
 
