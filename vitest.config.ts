@@ -33,6 +33,8 @@ export default defineConfig({
       'test/e2e-browser/**',
       // Electron tests run under vitest.electron.config.ts (node environment)
       'test/unit/electron/**',
+      // Electron E2E tests run under Playwright, not Vitest
+      'test/e2e-electron/**',
     ],
     testTimeout: 30000,
     hookTimeout: 30000,

@@ -111,10 +111,16 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
         throw new Error('Remote URL not configured. Please re-run setup.')
       }
 
-      // Validate connectivity
+      // Validate connectivity (with timeout to prevent hangs)
       const fetchFn = ctx.fetchHealthCheck ?? (async (url: string) => {
-        const response = await fetch(url)
-        return response.ok
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), 10_000)
+        try {
+          const response = await fetch(url, { signal: controller.signal })
+          return response.ok
+        } finally {
+          clearTimeout(timer)
+        }
       })
 
       let ok: boolean
@@ -200,10 +206,14 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
     }
   })
 
-  // 5. Create system tray
-  ctx.createTray()
+  // 6. Create system tray (non-fatal — icon may be missing in unpackaged mode)
+  try {
+    ctx.createTray()
+  } catch (err) {
+    console.warn('Failed to create system tray:', err)
+  }
 
-  // 6. Schedule update check (10s delay)
+  // 7. Schedule update check (10s delay)
   const updateCheckTimer = setTimeout(() => {
     void ctx.updateManager.checkForUpdates()
   }, 10_000)

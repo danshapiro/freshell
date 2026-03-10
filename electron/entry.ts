@@ -11,6 +11,7 @@
 import { app, BrowserWindow, globalShortcut, ipcMain, Tray, Menu, nativeImage } from 'electron'
 import path from 'path'
 import os from 'os'
+import http from 'http'
 import { fileURLToPath } from 'url'
 
 const __filename = fileURLToPath(import.meta.url)
@@ -104,6 +105,23 @@ async function main(): Promise<void> {
     resourcesPath,
     configDir,
     platform: process.platform,
+    fetchHealthCheck: (url: string): Promise<boolean> => {
+      // Use Node's http module instead of global fetch() — Electron's main
+      // process fetch can hang in certain lifecycle states (e.g. after wizard
+      // window closes and the app re-enters main()).
+      return new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(false), 10_000)
+        const req = http.get(url, (res) => {
+          clearTimeout(timer)
+          resolve(res.statusCode !== undefined && res.statusCode >= 200 && res.statusCode < 400)
+          res.resume() // Drain the response
+        })
+        req.on('error', () => {
+          clearTimeout(timer)
+          resolve(false)
+        })
+      })
+    },
     readEnvToken: async (envPath: string): Promise<string | undefined> => {
       try {
         const fsp = await import('fs/promises')
@@ -223,9 +241,15 @@ async function main(): Promise<void> {
       appPath: isDev ? undefined : app.getAppPath(),
     })
 
-    // When wizard closes, re-read config and restart
+    // When wizard closes, re-read config and restart.
+    // Use setTimeout to defer to a clean event loop tick — calling main()
+    // synchronously inside the 'closed' handler can block I/O callbacks.
     wizardWin.on('closed', () => {
-      void main()
+      setTimeout(() => {
+        main().catch((err) => {
+          console.error('Failed to restart after wizard:', err)
+        })
+      }, 500)
     })
     return
   }
@@ -287,6 +311,16 @@ async function main(): Promise<void> {
     platform: process.platform,
   })
 }
+
+// Prevent Electron from quitting when all windows close during the wizard phase.
+// The window-all-closed handler alone is not sufficient — Electron also fires
+// will-quit independently, and without this guard the process exits before
+// main() can re-run to create the main window.
+app.on('will-quit', (e) => {
+  if (wizardPhase) {
+    e.preventDefault()
+  }
+})
 
 // Start the app
 void main()
