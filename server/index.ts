@@ -61,6 +61,7 @@ import { ExtensionManager } from './extension-manager.js'
 import { createExtensionRouter } from './extension-routes.js'
 import { createServerInfoRouter } from './server-info-router.js'
 import { SessionMetadataStore } from './session-metadata-store.js'
+import { createShellBootstrapRouter } from './shell-bootstrap-router.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -131,6 +132,18 @@ async function main() {
   )
 
   app.use('/api', httpAuthMiddleware)
+  // Shell bootstrap route: returns shell-critical first-paint data only
+  app.use('/api', createShellBootstrapRouter({
+    getSettings: async () => migrateSettingsSortMode(await configStore.getSettings()),
+    getPlatform: async () => ({ platform: await detectPlatform(), host: await detectHostName() }),
+    getShellTaskStatus: async () => startupState.snapshot().tasks,
+    getPerfLogging: () => perfConfig.enabled,
+    getConfigFallback: async () => {
+      const readError = configStore.getLastReadError()
+      if (!readError) return undefined
+      return { reason: readError, backupExists: await configStore.backupExists() }
+    },
+  }))
   app.use('/api', createClientLogsRouter())
 
   const codingCliProviders = [claudeProvider, codexProvider]
