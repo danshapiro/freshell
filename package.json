@@ -55,7 +55,8 @@
     "test:e2e:helpers": "vitest run --config test/e2e-browser/vitest.config.ts",
     "test:e2e:electron": "playwright test --config test/e2e-electron/playwright.electron.config.ts",
     "perf:audit:visible-first": "PORT=3311 npm run build && tsx scripts/visible-first-audit.ts",
-    "perf:audit:compare": "tsx scripts/compare-visible-first-audit.ts"
+    "perf:audit:compare": "tsx scripts/compare-visible-first-audit.ts",
+    "perf:audit:gate": "tsx scripts/assert-visible-first-audit-gate.ts"
   },
   "dependencies": {
     "@ai-sdk/google": "^3.0.29",
