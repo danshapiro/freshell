@@ -82,6 +82,7 @@ export type AppSettings = {
   }
   codingCli: {
     enabledProviders: CodingCliProviderName[]
+    knownProviders?: string[]
     providers: Partial<Record<CodingCliProviderName, {
       model?: string
       sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'

@@ -128,7 +128,9 @@ export class LayoutStore {
     if (!title || !this.snapshot) return
     if (this.snapshot.paneTitleSetByUser?.[tabId]?.[paneId]) return
     this.ensurePaneTitleMaps(tabId)
-    this.snapshot.paneTitles[tabId][paneId] = title
+    const paneTitles = this.snapshot.paneTitles?.[tabId]
+    if (!paneTitles) return
+    paneTitles[paneId] = title
   }
 
   updateFromUi(snapshot: UiSnapshot, connectionId: string) {
@@ -451,8 +453,11 @@ export class LayoutStore {
     if (!pane) return { message: 'pane not found' as const }
 
     this.ensurePaneTitleMaps(pane.tabId)
-    this.snapshot.paneTitles[pane.tabId][paneId] = title
-    this.snapshot.paneTitleSetByUser[pane.tabId][paneId] = true
+    const paneTitles = this.snapshot.paneTitles?.[pane.tabId]
+    const paneTitleSetByUser = this.snapshot.paneTitleSetByUser?.[pane.tabId]
+    if (!paneTitles || !paneTitleSetByUser) return { message: 'pane metadata unavailable' as const }
+    paneTitles[paneId] = title
+    paneTitleSetByUser[paneId] = true
     return { tabId: pane.tabId, paneId }
   }
 

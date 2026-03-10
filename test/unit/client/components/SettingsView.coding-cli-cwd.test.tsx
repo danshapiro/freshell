@@ -5,6 +5,8 @@ import { configureStore } from '@reduxjs/toolkit'
 import SettingsView from '@/components/SettingsView'
 import settingsReducer, { updateSettingsLocal } from '@/store/settingsSlice'
 import { networkReducer } from '@/store/networkSlice'
+import extensionsReducer from '@/store/extensionsSlice'
+import type { ClientExtensionEntry } from '@shared/extension-types'
 
 vi.mock('@/lib/api', () => ({
   api: {
@@ -13,11 +15,40 @@ vi.mock('@/lib/api', () => ({
   },
 }))
 
+const defaultCliExtensions: ClientExtensionEntry[] = [
+  {
+    name: 'claude',
+    version: '1.0.0',
+    label: 'Claude CLI',
+    description: '',
+    category: 'cli',
+    cli: {
+      supportsPermissionMode: true,
+      supportsResume: true,
+      resumeCommandTemplate: ['claude', '--resume', '{{sessionId}}'],
+    },
+  },
+  {
+    name: 'codex',
+    version: '1.0.0',
+    label: 'Codex CLI',
+    description: '',
+    category: 'cli',
+    cli: {
+      supportsModel: true,
+      supportsSandbox: true,
+      supportsResume: true,
+      resumeCommandTemplate: ['codex', 'resume', '{{sessionId}}'],
+    },
+  },
+]
+
 function createTestStore() {
   return configureStore({
     reducer: {
       settings: settingsReducer,
       network: networkReducer,
+      extensions: extensionsReducer,
     },
     preloadedState: {
       settings: {
@@ -43,6 +74,9 @@ function createTestStore() {
         },
         loaded: true,
         lastSavedAt: Date.now(),
+      },
+      extensions: {
+        entries: defaultCliExtensions,
       },
     },
   })
@@ -81,7 +115,7 @@ describe('SettingsView coding CLI cwd', () => {
 
   it('shows initial cwd value from settings', () => {
     const store = configureStore({
-      reducer: { settings: settingsReducer, network: networkReducer },
+      reducer: { settings: settingsReducer, network: networkReducer, extensions: extensionsReducer },
       preloadedState: {
         settings: {
           settings: {
@@ -108,6 +142,9 @@ describe('SettingsView coding CLI cwd', () => {
           },
           loaded: true,
           lastSavedAt: Date.now(),
+        },
+        extensions: {
+          entries: defaultCliExtensions,
         },
       },
     })

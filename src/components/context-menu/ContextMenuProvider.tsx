@@ -47,6 +47,7 @@ import {
 import { nanoid } from 'nanoid'
 
 const CONTEXT_MENU_KEYS = ['ContextMenu']
+const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 
 
 type MenuState = {
@@ -101,7 +102,7 @@ export function ContextMenuProvider({
   const expandedProjects = useAppSelector((s) => s.sessions.expandedProjects)
   const platform = useAppSelector((s) => s.connection?.platform ?? null)
   const appSettings = useAppSelector((s) => s.settings.settings)
-  const extensionEntries: ClientExtensionEntry[] = useAppSelector((s) => s.extensions?.entries ?? [])
+  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
 
   const [menuState, setMenuState] = useState<MenuState | null>(null)
   const [confirmState, setConfirmState] = useState<ConfirmState | null>(null)

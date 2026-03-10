@@ -635,7 +635,7 @@ describe('pane header runtime metadata flow (e2e)', () => {
       } satisfies Partial<AgentChatState>,
     })
 
-    const sessionsPayload = {
+    fetchSidebarSessionsSnapshot.mockResolvedValue({
       projects: [
         {
           projectPath: '/home/user/code/freshell',
@@ -662,9 +662,7 @@ describe('pane header runtime metadata flow (e2e)', () => {
           ],
         },
       ],
-    }
-
-    fetchSidebarSessionsSnapshot.mockResolvedValue(sessionsPayload)
+    })
 
     apiGet.mockImplementation((url: string) => {
       if (url === '/api/settings') {
@@ -678,9 +676,6 @@ describe('pane header runtime metadata flow (e2e)', () => {
           platform: 'linux',
           availableClis: { codex: true, claude: true },
         })
-      }
-      if (url.startsWith('/api/sessions')) {
-        return Promise.resolve(sessionsPayload)
       }
       return Promise.resolve({})
     })

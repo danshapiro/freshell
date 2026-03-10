@@ -348,6 +348,7 @@ async function main() {
     codingCliIndexer,
     perfConfig,
     applyDebugLogging,
+    validCliProviders: allCliNames,
   }))
 
   // --- Network management endpoints ---
@@ -378,6 +379,7 @@ async function main() {
     wsHandler,
     sessionMetadataStore,
     serverInstanceId,
+    validCliProviders: allCliNames,
   }))
 
   app.use('/api', createProjectColorsRouter({ configStore, codingCliIndexer }))

@@ -10,6 +10,7 @@ import { paginateProjects } from './session-pagination.js'
 import { buildSidebarOpenSessionKeys } from './sidebar-session-selection.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
 import type { SessionMetadataStore } from './session-metadata-store.js'
+import { DEFAULT_CLI_PROVIDER_NAMES } from './platform.js'
 
 const log = logger.child({ component: 'sessions-router' })
 
@@ -50,11 +51,20 @@ export interface SessionsRouterDeps {
   wsHandler?: { broadcast: (msg: any) => void }
   sessionMetadataStore?: SessionMetadataStore
   serverInstanceId?: string
+  validCliProviders?: string[]
 }
 
 export function createSessionsRouter(deps: SessionsRouterDeps): Router {
   const { configStore, codingCliIndexer, codingCliProviders, perfConfig } = deps
   const router = Router()
+  const validCliProviders = new Set(deps.validCliProviders ?? DEFAULT_CLI_PROVIDER_NAMES)
+  const sessionMetadataProviderSchema = z.string().min(1).superRefine((value, ctx) => {
+    if (validCliProviders.has(value)) return
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `Unknown CLI provider: '${value}'`,
+    })
+  })
 
   // Search endpoint must come BEFORE the generic /sessions route
   router.get('/sessions/search', async (req, res) => {
@@ -240,7 +250,7 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
   })
 
   const SessionMetadataPostSchema = z.object({
-    provider: CodingCliProviderSchema,
+    provider: sessionMetadataProviderSchema,
     sessionId: z.string().min(1),
     sessionType: z.string().min(1),
   })

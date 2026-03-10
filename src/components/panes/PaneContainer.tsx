@@ -39,6 +39,7 @@ import { clearPendingCreate, removeSession } from '@/store/agentChatSlice'
 import { cancelCreate } from '@/lib/sdk-message-handler'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
 import type { ProjectGroup, CodingCliSession } from '@/store/types'
+import type { ClientExtensionEntry } from '@shared/extension-types'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 
 // Stable empty object to avoid selector memoization issues
@@ -49,6 +50,7 @@ const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_ATTENTION_BY_PANE: Record<string, boolean> = {}
 const EMPTY_PENDING_CREATES: Record<string, string> = {}
+const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 
 interface PaneContainerProps {
   tabId: string
@@ -158,7 +160,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const tabTerminalId = tab?.terminalId
   const paneTitles = useAppSelector((s) => s.panes.paneTitles[tabId] ?? EMPTY_PANE_TITLES)
-  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? [])
+  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const terminalMetaById = useAppSelector(
     (s) => s.terminalMeta?.byTerminalId ?? EMPTY_TERMINAL_META_BY_ID
   )
@@ -509,7 +511,7 @@ function PickerWrapper({
 }) {
   const dispatch = useAppDispatch()
   const settings = useAppSelector((s) => s.settings?.settings)
-  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? [])
+  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const paneLayout = useAppSelector((s) => s.panes.layouts[tabId])
   const tabPref = useMemo(
     () => paneLayout ? getTabDirectoryPreference(paneLayout) : { defaultCwd: undefined, tabDirectories: [] },

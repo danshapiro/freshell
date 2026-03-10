@@ -8,6 +8,7 @@ import { getCliProviderConfigs, type CodingCliProviderConfig } from '@/lib/codin
 import { getVisibleAgentChatConfigs, type AgentChatProviderName } from '@/lib/agent-chat-utils'
 import { ProviderIcon } from '@/components/icons/provider-icons'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
+import type { ClientExtensionEntry } from '@shared/extension-types'
 
 export type PanePickerType = 'shell' | 'cmd' | 'powershell' | 'wsl' | 'browser' | 'editor' | AgentChatProviderName | CodingCliProviderName | `ext:${string}`
 
@@ -36,6 +37,10 @@ const nonShellOptions: PickerOption[] = [
 ]
 
 const MAX_OPTIONS_PER_ROW = 3
+const EMPTY_AVAILABLE_CLIS: Record<string, boolean> = {}
+const EMPTY_FEATURE_FLAGS: Record<string, boolean> = {}
+const EMPTY_ENABLED_PROVIDERS: CodingCliProviderName[] = []
+const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 
 interface PickerRowOption {
   option: PickerOption
@@ -87,10 +92,10 @@ interface PanePickerProps {
 
 export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, paneId }: PanePickerProps) {
   const platform = useAppSelector((s) => s.connection?.platform ?? null)
-  const availableClis = useAppSelector((s) => s.connection?.availableClis ?? {})
-  const featureFlags = useAppSelector((s) => s.connection?.featureFlags ?? {})
-  const enabledProviders = useAppSelector((s) => s.settings?.settings?.codingCli?.enabledProviders ?? [])
-  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? [])
+  const availableClis = useAppSelector((s) => s.connection?.availableClis ?? EMPTY_AVAILABLE_CLIS)
+  const featureFlags = useAppSelector((s) => s.connection?.featureFlags ?? EMPTY_FEATURE_FLAGS)
+  const enabledProviders = useAppSelector((s) => s.settings?.settings?.codingCli?.enabledProviders ?? EMPTY_ENABLED_PROVIDERS)
+  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
 
   const options = useMemo(() => {
     // CLI options: derived from extension entries, show if both available and enabled

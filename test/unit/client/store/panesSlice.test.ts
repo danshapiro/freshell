@@ -148,7 +148,7 @@ describe('panesSlice', () => {
       )
 
       const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
-      expect(state.paneTitles['tab-1'][leaf.id]).toBe('Codex CLI')
+      expect(state.paneTitles['tab-1'][leaf.id]).toBe('Codex')
     })
 
     it('uses the provided paneId when supplied', () => {

@@ -34,9 +34,11 @@ import { getCliProviderConfigs } from '@/lib/coding-cli-utils'
 import { createLogger } from '@/lib/client-logger'
 import { buildKnownDevices, type KnownDevice } from '@/lib/known-devices'
 import { parseNormalizedLineList } from '@shared/string-list'
+import type { ClientExtensionEntry } from '@shared/extension-types'
 
 
 const log = createLogger('SettingsView')
+const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 
 /** Monospace fonts with good Unicode block element support for terminal use */
 const terminalFonts = [
@@ -177,7 +179,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     () => settings.codingCli?.enabledProviders ?? [],
     [settings.codingCli?.enabledProviders],
   )
-  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? [])
+  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const cliProviderConfigs = useMemo(() => getCliProviderConfigs(extensionEntries), [extensionEntries])
   const tabRegistryState = useAppSelector((s) => (s as any).tabRegistry)
   const tabRegistry = tabRegistryState ?? {

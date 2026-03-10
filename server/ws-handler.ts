@@ -35,7 +35,6 @@ import {
   CodexActivityUpdatedSchema,
   HelloSchema,
   PingSchema,
-  TerminalCreateSchema,
   TerminalAttachSchema,
   TerminalDetachSchema,
   TerminalInputSchema,
@@ -43,7 +42,6 @@ import {
   TerminalKillSchema,
   TerminalListSchema,
   TerminalMetaListSchema,
-  CodingCliCreateSchema,
   CodingCliInputSchema,
   CodingCliKillSchema,
   SdkCreateSchema,
@@ -317,7 +315,9 @@ export class WsHandler {
   private createdTerminalByRequestId = new Map<string, string>()
   private screenshotRequests = new Map<string, PendingScreenshot>()
   private readonly serverInstanceId: string
-  private clientMessageSchema: z.ZodDiscriminatedUnion<'type', [z.ZodObject<any>, ...z.ZodObject<any>[]]>
+  // The runtime validator is authoritative here; we keep the field typed broadly because
+  // the dynamic provider schemas widen discriminated-union inference beyond what TS/Zod model well.
+  private clientMessageSchema: z.ZodTypeAny
   private onTerminalExitBound = (payload: { terminalId?: string }) => {
     if (!payload?.terminalId) return
     this.forgetCreatedRequestIdsForTerminal(payload.terminalId)
@@ -357,52 +357,55 @@ export class WsHandler {
     this.terminalStreamBroker = new TerminalStreamBroker(this.registry)
 
     // Build the set of valid CLI provider/mode names from extensions
-    const supportsDynamicCliValidation =
-      extensionManager && typeof extensionManager.getAll === 'function'
-    const extensionModes = supportsDynamicCliValidation
+    const canEnumerateCliExtensions = typeof extensionManager?.getAll === 'function'
+    const extensionModes = canEnumerateCliExtensions
       ? extensionManager.getAll()
           .filter(e => e.manifest.category === 'cli')
           .map(e => e.manifest.name)
       : []
-    const allModes = new Set(['shell', ...extensionModes])
+    const allModes = new Set<string>(['shell', ...extensionModes])
 
     // Build dynamic schemas for the two process-spawning messages.
     // All other schemas (SessionLocatorSchema, TerminalMetaRecordSchema, etc.)
     // already accept any string via the widened CodingCliProviderSchema.
-    const dynamicTerminalCreateSchema = supportsDynamicCliValidation
-      ? z.object({
-          type: z.literal('terminal.create'),
-          requestId: z.string().min(1),
-          mode: z.string().default('shell').refine(
-            (val) => allModes.has(val),
-            (val) => ({ message: `Invalid terminal mode: '${val}'. Valid: ${[...allModes].join(', ')}` }),
-          ),
-          shell: ShellSchema.default('system'),
-          cwd: z.string().optional(),
-          resumeSessionId: z.string().optional(),
-          restore: z.boolean().optional(),
-          tabId: z.string().min(1).optional(),
-          paneId: z.string().min(1).optional(),
+    const dynamicTerminalCreateSchema = z.object({
+      type: z.literal('terminal.create'),
+      requestId: z.string().min(1),
+      mode: z.string().min(1).default('shell').superRefine((val, ctx) => {
+        if (!canEnumerateCliExtensions || allModes.has(val)) return
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `Invalid terminal mode: '${val}'. Valid: ${[...allModes].join(', ')}`,
         })
-      : TerminalCreateSchema
+      }),
+      shell: ShellSchema.default('system'),
+      cwd: z.string().optional(),
+      resumeSessionId: z.string().optional(),
+      restore: z.boolean().optional(),
+      tabId: z.string().min(1).optional(),
+      paneId: z.string().min(1).optional(),
+    })
 
-    const dynamicCodingCliCreateSchema = supportsDynamicCliValidation
-      ? z.object({
-          type: z.literal('codingcli.create'),
-          requestId: z.string().min(1),
-          provider: z.string().min(1).refine(
-            (val) => extensionModes.includes(val),
-            (val) => ({ message: `Unknown CLI provider: '${val}'` }),
-          ),
-          prompt: z.string().min(1),
-          cwd: z.string().optional(),
-          resumeSessionId: z.string().optional(),
-          model: z.string().optional(),
-          maxTurns: z.number().int().positive().optional(),
-          permissionMode: z.enum(['default', 'plan', 'acceptEdits', 'bypassPermissions']).optional(),
-          sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
-        })
-      : CodingCliCreateSchema
+    const dynamicProviderSchema = CodingCliProviderSchema.superRefine((val, ctx) => {
+      if (!canEnumerateCliExtensions || extensionModes.includes(val)) return
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Unknown CLI provider: '${val}'`,
+      })
+    })
+
+    const dynamicCodingCliCreateSchema = z.object({
+      type: z.literal('codingcli.create'),
+      requestId: z.string().min(1),
+      provider: dynamicProviderSchema,
+      prompt: z.string().min(1),
+      cwd: z.string().optional(),
+      resumeSessionId: z.string().optional(),
+      model: z.string().optional(),
+      maxTurns: z.number().int().positive().optional(),
+      permissionMode: z.enum(['default', 'plan', 'acceptEdits', 'bypassPermissions']).optional(),
+      sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+    })
 
     this.clientMessageSchema = z.discriminatedUnion('type', [
       HelloSchema,
@@ -1174,7 +1177,9 @@ export class WsHandler {
         return
       }
 
-      const m = parsed.data
+      // Runtime schema validation already succeeded above; TS cannot preserve the narrowed
+      // discriminated union once provider names become dynamic, so we cast once at the boundary.
+      const m = parsed.data as any
       messageType = m.type
 
       if (rawBytes > this.config.maxRegularWsMessageBytes && m.type !== 'ui.screenshot.result') {

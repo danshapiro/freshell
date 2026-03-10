@@ -226,12 +226,12 @@ describe('agent chat tab shortcut focus (e2e)', () => {
   beforeEach(() => {
     cleanup()
     vi.clearAllMocks()
-    localStorage.clear()
-    localStorage.setItem('freshell.auth-token', 'test-token')
     wsMocks.isReady = false
     wsMocks.serverInstanceId = undefined
+    localStorage.clear()
+    localStorage.setItem('freshell.auth-token', 'test-token')
     fetchSidebarSessionsSnapshot.mockReset()
-    fetchSidebarSessionsSnapshot.mockResolvedValue([])
+    fetchSidebarSessionsSnapshot.mockResolvedValue({ projects: [] })
     apiGet.mockImplementation((url: string) => {
       if (url === '/api/settings') {
         return Promise.resolve({
@@ -269,9 +269,6 @@ describe('agent chat tab shortcut focus (e2e)', () => {
           devMode: false,
           accessUrl: 'http://192.168.1.100:3001',
         })
-      }
-      if (typeof url === 'string' && url.startsWith('/api/sessions')) {
-        return Promise.resolve({ projects: [] })
       }
       return Promise.resolve({})
     })

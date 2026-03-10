@@ -47,9 +47,40 @@ export type CodingCliCommandSpec = {
   supportsPermissionMode?: boolean
 }
 
-// Mutable map, populated at startup from extension registry.
-// No longer a hardcoded Record -- extensions are the single source of truth.
-let codingCliCommands: Map<string, CodingCliCommandSpec> = new Map()
+const FALLBACK_CODING_CLI_COMMAND_SPECS: Array<[string, CodingCliCommandSpec]> = [
+  ['claude', {
+    label: 'Claude CLI',
+    envVar: 'CLAUDE_CMD',
+    defaultCommand: 'claude',
+    resumeArgs: (sessionId: string) => ['--resume', sessionId],
+    supportsPermissionMode: true,
+  }],
+  ['codex', {
+    label: 'Codex CLI',
+    envVar: 'CODEX_CMD',
+    defaultCommand: 'codex',
+    resumeArgs: (sessionId: string) => ['resume', sessionId],
+  }],
+  ['opencode', {
+    label: 'OpenCode',
+    envVar: 'OPENCODE_CMD',
+    defaultCommand: 'opencode',
+  }],
+  ['gemini', {
+    label: 'Gemini',
+    envVar: 'GEMINI_CMD',
+    defaultCommand: 'gemini',
+  }],
+  ['kimi', {
+    label: 'Kimi',
+    envVar: 'KIMI_CMD',
+    defaultCommand: 'kimi',
+  }],
+]
+
+// Compatibility seed for tests and standalone registry instances that are
+// constructed before server bootstrap registers the scanned extension commands.
+let codingCliCommands: Map<string, CodingCliCommandSpec> = new Map(FALLBACK_CODING_CLI_COMMAND_SPECS)
 
 /**
  * Populate the CLI commands map from extension data.

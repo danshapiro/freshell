@@ -2,9 +2,20 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { migrateSettingsSortMode } from './settings-migrate.js'
 import { withPerfSpan } from './perf-logger.js'
+import { DEFAULT_CLI_PROVIDER_NAMES } from './platform.js'
 
 // --- SettingsPatchSchema (moved from settings-schema.ts) ---
-// Provider names are dynamic (driven by extension manifests), so we accept any non-empty string.
+
+function createCliProviderNameSchema(validCliProviders: readonly string[] = DEFAULT_CLI_PROVIDER_NAMES) {
+  const allowedProviders = new Set(validCliProviders)
+  return z.string().min(1).superRefine((value, ctx) => {
+    if (allowedProviders.has(value)) return
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `Unknown CLI provider: '${value}'`,
+    })
+  })
+}
 
 const CodingCliProviderConfigSchema = z
   .object({
@@ -16,8 +27,10 @@ const CodingCliProviderConfigSchema = z
   })
   .strict()
 
-export const SettingsPatchSchema = z
-  .object({
+export function buildSettingsPatchSchema(validCliProviders: readonly string[] = DEFAULT_CLI_PROVIDER_NAMES) {
+  const CliProviderNameSchema = createCliProviderNameSchema(validCliProviders)
+
+  return z.object({
     theme: z.enum(['system', 'light', 'dark']).optional(),
     uiScale: z.coerce.number().optional(),
     terminal: z
@@ -91,13 +104,13 @@ export const SettingsPatchSchema = z
     codingCli: z
       .object({
         enabledProviders: z
-          .array(z.string().min(1))
+          .array(CliProviderNameSchema)
           .optional(),
         knownProviders: z
-          .array(z.string().min(1))
+          .array(CliProviderNameSchema)
           .optional(),
         providers: z
-          .record(z.string(), CodingCliProviderConfigSchema)
+          .record(CliProviderNameSchema, CodingCliProviderConfigSchema)
           .optional(),
       })
       .strict()
@@ -135,7 +148,10 @@ export const SettingsPatchSchema = z
       .strict()
       .optional(),
   })
-  .strict()
+    .strict()
+}
+
+export const SettingsPatchSchema = buildSettingsPatchSchema()
 
 export type SettingsPatch = z.infer<typeof SettingsPatchSchema>
 
@@ -165,10 +181,20 @@ export interface SettingsRouterDeps {
   codingCliIndexer: { refresh: () => Promise<void> }
   perfConfig: { slowSessionRefreshMs: number }
   applyDebugLogging: (enabled: boolean, source: string) => void
+  validCliProviders?: string[]
 }
 
 export function createSettingsRouter(deps: SettingsRouterDeps): Router {
-  const { configStore, registry, wsHandler, codingCliIndexer, perfConfig, applyDebugLogging } = deps
+  const {
+    configStore,
+    registry,
+    wsHandler,
+    codingCliIndexer,
+    perfConfig,
+    applyDebugLogging,
+    validCliProviders = DEFAULT_CLI_PROVIDER_NAMES,
+  } = deps
+  const settingsPatchSchema = buildSettingsPatchSchema(validCliProviders)
   const router = Router()
 
   router.get('/', async (_req, res) => {
@@ -182,7 +208,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
     if (body.sidebar && typeof body.sidebar === 'object') {
       delete body.sidebar.ignoreCodexSubagentSessions
     }
-    const parsed = SettingsPatchSchema.safeParse(body)
+    const parsed = settingsPatchSchema.safeParse(body)
     if (!parsed.success) {
       return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
     }

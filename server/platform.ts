@@ -94,8 +94,18 @@ export type AvailableClis = Record<string, boolean>
 
 export type CliDetectionSpec = { name: string; envVar: string; defaultCmd: string }
 
+export const DEFAULT_CLI_DETECTION_SPECS: CliDetectionSpec[] = [
+  { name: 'claude', envVar: 'CLAUDE_CMD', defaultCmd: 'claude' },
+  { name: 'codex', envVar: 'CODEX_CMD', defaultCmd: 'codex' },
+  { name: 'opencode', envVar: 'OPENCODE_CMD', defaultCmd: 'opencode' },
+  { name: 'gemini', envVar: 'GEMINI_CMD', defaultCmd: 'gemini' },
+  { name: 'kimi', envVar: 'KIMI_CMD', defaultCmd: 'kimi' },
+]
+
+export const DEFAULT_CLI_PROVIDER_NAMES = DEFAULT_CLI_DETECTION_SPECS.map((cli) => cli.name)
+
 export async function detectAvailableClis(
-  cliSpecs: CliDetectionSpec[],
+  cliSpecs: CliDetectionSpec[] = DEFAULT_CLI_DETECTION_SPECS,
 ): Promise<AvailableClis> {
   const results = await Promise.all(
     cliSpecs.map(async (cli) => {

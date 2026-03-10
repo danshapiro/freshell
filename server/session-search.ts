@@ -22,7 +22,7 @@ export type SearchMatch = z.infer<typeof SearchMatchSchema>
 
 export const SearchResultSchema = z.object({
   sessionId: z.string(),
-  provider: z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi']),
+  provider: z.string().min(1),
   projectPath: z.string(),
   title: z.string().optional(),
   summary: z.string().optional(),
