@@ -62,6 +62,9 @@ import { createExtensionRouter } from './extension-routes.js'
 import { createServerInfoRouter } from './server-info-router.js'
 import { SessionMetadataStore } from './session-metadata-store.js'
 import { createShellBootstrapRouter } from './shell-bootstrap-router.js'
+import { loadSessionHistory } from './session-history-loader.js'
+import { createAgentTimelineService } from './agent-timeline/service.js'
+import { createAgentTimelineRouter } from './agent-timeline/router.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -395,6 +398,12 @@ async function main() {
     sessionMetadataStore,
     serverInstanceId,
     validCliProviders: allCliNames,
+  }))
+
+  app.use('/api', createAgentTimelineRouter({
+    service: createAgentTimelineService({
+      loadSessionHistory,
+    }),
   }))
 
   app.use('/api', createProjectColorsRouter({ configStore, codingCliIndexer }))
