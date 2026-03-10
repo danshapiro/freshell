@@ -8,6 +8,8 @@ import tabsReducer, { type TabsState } from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
+import tabRegistryReducer from '@/store/tabRegistrySlice'
+import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer, type NetworkState } from '@/store/networkSlice'
 
 const wsMocks = vi.hoisted(() => ({
@@ -16,9 +18,12 @@ const wsMocks = vi.hoisted(() => ({
   onMessage: vi.fn(() => () => {}),
   onReconnect: vi.fn(() => () => {}),
   setHelloExtensionProvider: vi.fn(),
+  isReady: false,
+  serverInstanceId: undefined as string | undefined,
 }))
 
 const apiGet = vi.hoisted(() => vi.fn())
+const fetchSidebarSessionsSnapshot = vi.hoisted(() => vi.fn())
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -27,6 +32,15 @@ vi.mock('@/lib/ws-client', () => ({
     onMessage: wsMocks.onMessage,
     onReconnect: wsMocks.onReconnect,
     setHelloExtensionProvider: wsMocks.setHelloExtensionProvider,
+    get isReady() {
+      return wsMocks.isReady
+    },
+    get serverInstanceId() {
+      return wsMocks.serverInstanceId
+    },
+    get state() {
+      return wsMocks.isReady ? 'ready' : 'connected'
+    },
   }),
 }))
 
@@ -36,6 +50,8 @@ vi.mock('@/lib/api', () => ({
     patch: vi.fn().mockResolvedValue({}),
     post: vi.fn().mockResolvedValue({}),
   },
+  fetchSidebarSessionsSnapshot: (options?: unknown) => fetchSidebarSessionsSnapshot(options),
+  isApiUnauthorizedError: (err: any) => !!err && typeof err === 'object' && err.status === 401,
 }))
 
 vi.mock('@/hooks/useTheme', () => ({
@@ -138,7 +154,9 @@ function makeStore(activeTabId: TabsState['activeTabId'] = 'tab-fresh') {
       connection: connectionReducer,
       sessions: sessionsReducer,
       panes: panesReducer,
+      tabRegistry: tabRegistryReducer,
       network: networkReducer,
+      extensions: extensionsReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -164,8 +182,11 @@ function makeStore(activeTabId: TabsState['activeTabId'] = 'tab-fresh') {
         error: null,
       },
       connection: {
-        status: 'ready' as const,
+        status: 'disconnected',
         lastError: undefined,
+        platform: null,
+        availableClis: {},
+        serverInstanceId: undefined,
       },
       panes: {
         layouts: {},
@@ -176,7 +197,19 @@ function makeStore(activeTabId: TabsState['activeTabId'] = 'tab-fresh') {
         renameRequestPaneId: null,
         zoomedPane: {},
       },
+      tabRegistry: {
+        deviceId: 'device-test',
+        deviceLabel: 'device-test',
+        deviceAliases: {},
+        localOpen: [],
+        remoteOpen: [],
+        closed: [],
+        localClosed: {},
+        searchRangeDays: 30,
+        loading: false,
+      },
       network: networkState,
+      extensions: { entries: [] },
     },
   })
 }
@@ -195,6 +228,10 @@ describe('agent chat tab shortcut focus (e2e)', () => {
     vi.clearAllMocks()
     localStorage.clear()
     localStorage.setItem('freshell.auth-token', 'test-token')
+    wsMocks.isReady = false
+    wsMocks.serverInstanceId = undefined
+    fetchSidebarSessionsSnapshot.mockReset()
+    fetchSidebarSessionsSnapshot.mockResolvedValue([])
     apiGet.mockImplementation((url: string) => {
       if (url === '/api/settings') {
         return Promise.resolve({

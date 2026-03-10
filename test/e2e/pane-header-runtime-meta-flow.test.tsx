@@ -635,6 +635,37 @@ describe('pane header runtime metadata flow (e2e)', () => {
       } satisfies Partial<AgentChatState>,
     })
 
+    const sessionsPayload = {
+      projects: [
+        {
+          projectPath: '/home/user/code/freshell',
+          sessions: [
+            {
+              provider: 'claude',
+              sessionType: 'freshclaude',
+              sessionId: 'claude-session-1',
+              projectPath: '/home/user/code/freshell',
+              cwd: '/home/user/code/freshell/.worktrees/issue-163',
+              gitBranch: 'main',
+              isDirty: true,
+              updatedAt: 1,
+              tokenUsage: {
+                inputTokens: 10,
+                outputTokens: 5,
+                cachedTokens: 0,
+                totalTokens: 15,
+                contextTokens: 15,
+                compactThresholdTokens: 60,
+                compactPercent: 25,
+              },
+            },
+          ],
+        },
+      ],
+    }
+
+    fetchSidebarSessionsSnapshot.mockResolvedValue(sessionsPayload)
+
     apiGet.mockImplementation((url: string) => {
       if (url === '/api/settings') {
         return Promise.resolve({
@@ -649,34 +680,7 @@ describe('pane header runtime metadata flow (e2e)', () => {
         })
       }
       if (url.startsWith('/api/sessions')) {
-        return Promise.resolve({
-          projects: [
-            {
-              projectPath: '/home/user/code/freshell',
-              sessions: [
-                {
-                  provider: 'claude',
-                  sessionType: 'freshclaude',
-                  sessionId: 'claude-session-1',
-                  projectPath: '/home/user/code/freshell',
-                  cwd: '/home/user/code/freshell/.worktrees/issue-163',
-                  gitBranch: 'main',
-                  isDirty: true,
-                  updatedAt: 1,
-                  tokenUsage: {
-                    inputTokens: 10,
-                    outputTokens: 5,
-                    cachedTokens: 0,
-                    totalTokens: 15,
-                    contextTokens: 15,
-                    compactThresholdTokens: 60,
-                    compactPercent: 25,
-                  },
-                },
-              ],
-            },
-          ],
-        })
+        return Promise.resolve(sessionsPayload)
       }
       return Promise.resolve({})
     })
@@ -692,7 +696,11 @@ describe('pane header runtime metadata flow (e2e)', () => {
     })
 
     act(() => {
-      wsMocks.emitMessage({ type: 'ready' })
+      wsMocks.emitMessage({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-local',
+      })
     })
 
     await waitFor(() => {

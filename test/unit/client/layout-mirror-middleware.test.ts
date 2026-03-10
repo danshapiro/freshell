@@ -59,6 +59,7 @@ describe('layoutMirrorMiddleware', () => {
       layouts: {},
       activePane: {},
       paneTitles: {},
+      paneTitleSetByUser: {},
       timestamp: expect.any(Number),
     })
 
