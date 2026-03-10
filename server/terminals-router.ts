@@ -4,6 +4,9 @@ import { cleanString } from './utils.js'
 import { logger } from './logger.js'
 import { cascadeTerminalRenameToSession } from './rename-cascade.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
+import { TerminalDirectoryQuerySchema } from '../shared/read-models.js'
+import { createTerminalViewService } from './terminal-view/service.js'
+import type { TerminalViewService } from './terminal-view/types.js'
 
 const log = logger.child({ component: 'terminals-router' })
 export const MAX_TERMINAL_TITLE_OVERRIDE_LENGTH = 500
@@ -30,24 +33,60 @@ export interface TerminalsRouterDeps {
   }
   terminalMetadata?: { list: () => TerminalMeta[] }
   codingCliIndexer?: { refresh: () => Promise<void> }
+  terminalViewService?: TerminalViewService
 }
 
 export function createTerminalsRouter(deps: TerminalsRouterDeps): Router {
   const { configStore, registry, wsHandler } = deps
   const router = Router()
+  const terminalViewService = deps.terminalViewService ?? createTerminalViewService({ configStore, registry })
 
-  router.get('/', async (_req, res) => {
-    const cfg = await configStore.snapshot()
-    const list = registry.list().filter((t: any) => !cfg.terminalOverrides?.[t.terminalId]?.deleted)
-    const merged = list.map((t: any) => {
-      const ov = cfg.terminalOverrides?.[t.terminalId]
-      return {
-        ...t,
-        title: ov?.titleOverride || t.title,
-        description: ov?.descriptionOverride || t.description,
-      }
+  router.get('/', async (req, res) => {
+    const hasReadModelQuery = (
+      req.query.priority !== undefined ||
+      req.query.cursor !== undefined ||
+      req.query.revision !== undefined ||
+      req.query.limit !== undefined
+    )
+
+    if (!hasReadModelQuery) {
+      const terminals = await terminalViewService.listTerminalDirectory()
+      return res.json(terminals)
+    }
+
+    const parsed = TerminalDirectoryQuerySchema.safeParse({
+      cursor: typeof req.query.cursor === 'string' ? req.query.cursor : undefined,
+      priority: typeof req.query.priority === 'string' ? req.query.priority : undefined,
+      revision: typeof req.query.revision === 'string' ? Number(req.query.revision) : undefined,
+      limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined,
     })
-    res.json(merged)
+
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
+    }
+
+    try {
+      const page = await terminalViewService.getTerminalDirectoryPage(parsed.data)
+      return res.json(page)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Terminal directory query failed'
+      const status = /cursor/i.test(message) ? 400 : 500
+      return res.status(status).json({ error: message })
+    }
+  })
+
+  router.get('/:terminalId/viewport', async (req, res) => {
+    const terminalId = req.params.terminalId
+    if (!terminalId) {
+      return res.status(400).json({ error: 'Invalid request' })
+    }
+
+    const snapshot = await terminalViewService.getViewportSnapshot({ terminalId })
+    if (!snapshot) {
+      return res.status(404).json({ error: 'Terminal not found' })
+    }
+
+    res.json(snapshot)
   })
 
   router.patch('/:terminalId', async (req, res) => {

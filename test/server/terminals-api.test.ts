@@ -334,6 +334,35 @@ describe('Terminals API', () => {
       expect(statuses).toContain('running')
       expect(statuses).toContain('exited')
     })
+
+    it('returns a paged terminal directory when visible-first query params are provided', async () => {
+      registry.addTerminal({
+        terminalId: 'term_newer',
+        title: 'Newer terminal',
+        mode: 'shell',
+      })
+      registry.addTerminal({
+        terminalId: 'term_older',
+        title: 'Older terminal',
+        mode: 'shell',
+      })
+
+      const response = await request(app)
+        .get('/api/terminals?priority=visible&limit=1')
+        .set('x-auth-token', AUTH_TOKEN)
+        .expect(200)
+
+      expect(response.body).toEqual({
+        items: [
+          expect.objectContaining({
+            terminalId: 'term_older',
+            title: 'Older terminal',
+          }),
+        ],
+        nextCursor: expect.any(String),
+        revision: expect.any(Number),
+      })
+    })
   })
 
   describe('PATCH /api/terminals/:terminalId', () => {

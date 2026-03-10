@@ -65,6 +65,7 @@ import { createShellBootstrapRouter } from './shell-bootstrap-router.js'
 import { loadSessionHistory } from './session-history-loader.js'
 import { createAgentTimelineService } from './agent-timeline/service.js'
 import { createAgentTimelineRouter } from './agent-timeline/router.js'
+import { createTerminalViewService } from './terminal-view/service.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -409,7 +410,14 @@ async function main() {
   app.use('/api', createProjectColorsRouter({ configStore, codingCliIndexer }))
 
   // --- API: terminals ---
-  app.use('/api/terminals', createTerminalsRouter({ configStore, registry, wsHandler, terminalMetadata, codingCliIndexer }))
+  app.use('/api/terminals', createTerminalsRouter({
+    configStore,
+    registry,
+    wsHandler,
+    terminalMetadata,
+    codingCliIndexer,
+    terminalViewService: createTerminalViewService({ configStore, registry }),
+  }))
 
   // --- API: AI ---
   app.use('/api/ai', createAiRouter({ registry, perfConfig }))
