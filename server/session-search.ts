@@ -173,7 +173,7 @@ export function extractAllMessages(content: string): string[] {
   return messages
 }
 
-function extractSnippet(text: string, query: string, contextLength = 50): string {
+export function extractSnippet(text: string, query: string, contextLength = 50): string {
   const lowerText = text.toLowerCase()
   const lowerQuery = query.toLowerCase()
   const index = lowerText.indexOf(lowerQuery)
