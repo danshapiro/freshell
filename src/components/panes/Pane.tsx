@@ -1,5 +1,5 @@
 import { X } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn, isMacLike } from '@/lib/utils'
 import type { TerminalStatus } from '@/store/types'
 import type { PaneContent } from '@/store/paneTypes'
 import PaneHeader from './PaneHeader'
@@ -10,7 +10,6 @@ interface PaneProps {
   paneId: string
   isActive: boolean
   isOnlyPane: boolean
-  platform?: string | null
   title?: string
   metaLabel?: string
   metaTooltip?: string
@@ -36,7 +35,6 @@ export default function Pane({
   paneId,
   isActive,
   isOnlyPane: _isOnlyPane,
-  platform,
   title,
   metaLabel,
   metaTooltip,
@@ -59,7 +57,7 @@ export default function Pane({
   const showHeader = title !== undefined
   const handleMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
     const isSecondaryClick = event.button === 2
-    const isMacContextClick = platform === 'darwin' && event.button === 0 && event.ctrlKey
+    const isMacContextClick = isMacLike() && event.button === 0 && event.ctrlKey
     if (isSecondaryClick || isMacContextClick) return
     onFocus()
   }

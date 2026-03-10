@@ -8,6 +8,7 @@ import panesReducer from '@/store/panesSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import { api } from '@/lib/api'
+import { isMacLike } from '@/lib/utils'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import PaneLayout from '@/components/panes/PaneLayout'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
@@ -40,6 +41,14 @@ vi.mock('@/lib/api', () => ({
     delete: vi.fn().mockResolvedValue({}),
   },
 }))
+
+vi.mock('@/lib/utils', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/utils')>('@/lib/utils')
+  return {
+    ...actual,
+    isMacLike: vi.fn(() => false),
+  }
+})
 
 vi.mock('@/lib/url-rewrite', async () => {
   const actual = await vi.importActual<typeof import('@/lib/url-rewrite')>('@/lib/url-rewrite')
@@ -232,6 +241,7 @@ describe('pane context menu stability (e2e)', () => {
   beforeEach(() => {
     terminalInstances.length = 0
     vi.clearAllMocks()
+    vi.mocked(isMacLike).mockReturnValue(false)
     vi.mocked(api.get).mockResolvedValue([])
     vi.mocked(api.post).mockResolvedValue({})
     vi.mocked(api.patch).mockResolvedValue({})
@@ -282,7 +292,8 @@ describe('pane context menu stability (e2e)', () => {
   })
 
   it('keeps the pane menu open for a primary-button context-menu gesture on an inactive pane header', async () => {
-    const store = createStore(createTwoPaneLayout(), 'darwin')
+    vi.mocked(isMacLike).mockReturnValue(true)
+    const store = createStore(createTwoPaneLayout(), 'linux')
     const { container } = renderFlow(store)
 
     const header = await waitFor(() => {
@@ -307,7 +318,8 @@ describe('pane context menu stability (e2e)', () => {
   })
 
   it('still activates an inactive pane on Ctrl+LeftClick for non-mac platforms', async () => {
-    const store = createStore(createTwoPaneLayout(), 'linux')
+    vi.mocked(isMacLike).mockReturnValue(false)
+    const store = createStore(createTwoPaneLayout(), 'darwin')
     const { container } = renderFlow(store)
 
     const header = await waitFor(() => {
@@ -324,7 +336,8 @@ describe('pane context menu stability (e2e)', () => {
   })
 
   it('still activates an inactive pane on middle click for non-mac platforms', async () => {
-    const store = createStore(createTwoPaneLayout(), 'linux')
+    vi.mocked(isMacLike).mockReturnValue(false)
+    const store = createStore(createTwoPaneLayout(), 'darwin')
     const { container } = renderFlow(store)
 
     const header = await waitFor(() => {
