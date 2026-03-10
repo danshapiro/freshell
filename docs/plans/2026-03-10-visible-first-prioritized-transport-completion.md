@@ -19,13 +19,15 @@ The previous completion plan was strong on destination, but it was still not exc
 3. It still treated a few now-missing test files as if they already existed, which is not execution-safe.
 4. It did not fully adapt to the current worktree state, where parts of the visible-first transport already exist and now need tightening, cutover, or deletion of old peers rather than greenfield creation.
 5. It did not isolate the final hard-delete of legacy websocket bulk transport into a dedicated, machine-checkable cleanup phase.
+6. It still skipped the shared harness-first TDD foundation required by the accepted transport test plan, even though those harnesses do not already exist in this repo.
 
 This revision keeps the accepted architecture and machine gate, but changes the execution shape:
 
-1. Build or tighten the new authoritative HTTP and store-owned seams first.
-2. Switch the client surfaces to the new seams while the old paths still exist temporarily inside the branch.
-3. Delete the legacy websocket transport only after every visible consumer has been moved.
-4. End with a full quality gate plus trusted pre/post audit comparison, with `mobile_restricted` as the decision rule.
+1. Build the shared visible-first test harnesses first so the high-value scenario and integration tests can actually be written before product code.
+2. Build or tighten the new authoritative HTTP and store-owned seams first.
+3. Switch the client surfaces to the new seams while the old paths still exist temporarily inside the branch.
+4. Delete the legacy websocket transport only after every visible consumer has been moved.
+5. End with a full quality gate plus trusted pre/post audit comparison, with `mobile_restricted` as the decision rule.
 
 ## Source Of Truth
 
@@ -100,6 +102,7 @@ The landing is complete only when all of the following are true:
 5. Finish existing seams instead of creating parallel route stacks, schedulers, or telemetry channels.
 6. If a later full-suite run fails, fix the narrowest real defect, add the missing regression if needed, commit the fix, and restart the full gate.
 7. Generated audit artifacts under `artifacts/perf/` are never committed.
+8. All later scenario and integration tests must reuse the shared harness modules from Task 1. Do not create ad hoc websocket stubs, route fixtures, scheduler fakes, or app boot shims once the shared harness exists.
 
 ## Files That Matter
 
@@ -107,6 +110,21 @@ Shared contracts:
 
 - `shared/read-models.ts`
 - `shared/ws-protocol.ts`
+
+Shared visible-first test harnesses:
+
+- `test/helpers/visible-first/protocol-harness.ts`
+- `test/helpers/visible-first/read-model-route-harness.ts`
+- `test/helpers/visible-first/app-hydration-harness.tsx`
+- `test/helpers/visible-first/slow-network-controller.ts`
+- `test/helpers/visible-first/terminal-mirror-fixture.ts`
+- `test/helpers/visible-first/cli-command-harness.ts`
+- `test/unit/visible-first/protocol-harness.test.ts`
+- `test/unit/visible-first/read-model-route-harness.test.ts`
+- `test/unit/visible-first/app-hydration-harness.test.tsx`
+- `test/unit/visible-first/slow-network-controller.test.ts`
+- `test/unit/visible-first/terminal-mirror-fixture.test.ts`
+- `test/unit/visible-first/cli-command-harness.test.ts`
 
 Server transport, read models, and instrumentation:
 
@@ -173,8 +191,12 @@ Client bootstrap, session, agent-chat, and terminal seams:
 Audit gate and comparison tooling:
 
 - `test/e2e-browser/perf/audit-contract.ts`
+- `test/e2e-browser/perf/run-visible-first-audit.ts`
+- `test/e2e-browser/perf/run-sample.ts`
 - `test/e2e-browser/perf/compare-visible-first-audits.ts`
 - `test/e2e-browser/perf/visible-first-audit-gate.ts`
+- `scripts/visible-first-audit.ts`
+- `scripts/compare-visible-first-audit.ts`
 - `scripts/assert-visible-first-audit-gate.ts`
 - `package.json`
 
@@ -204,7 +226,74 @@ Expected: exit `0`.
 
 If this fails, stop runtime work and fix the audit harness first. The final comparison is meaningless without a trusted baseline.
 
-### Task 1: Add The Machine-Enforced Audit Gate
+### Task 1: Build Shared Visible-First Test Harnesses
+
+**Files:**
+- Create: `test/helpers/visible-first/protocol-harness.ts`
+- Create: `test/helpers/visible-first/read-model-route-harness.ts`
+- Create: `test/helpers/visible-first/app-hydration-harness.tsx`
+- Create: `test/helpers/visible-first/slow-network-controller.ts`
+- Create: `test/helpers/visible-first/terminal-mirror-fixture.ts`
+- Create: `test/helpers/visible-first/cli-command-harness.ts`
+- Create: `test/unit/visible-first/protocol-harness.test.ts`
+- Create: `test/unit/visible-first/read-model-route-harness.test.ts`
+- Create: `test/unit/visible-first/app-hydration-harness.test.tsx`
+- Create: `test/unit/visible-first/slow-network-controller.test.ts`
+- Create: `test/unit/visible-first/terminal-mirror-fixture.test.ts`
+- Create: `test/unit/visible-first/cli-command-harness.test.ts`
+
+**Step 1: Write the failing harness contract tests**
+
+Cover:
+
+1. `ProtocolHarness` starts the real websocket handler with fake session and terminal publishers, captures the raw transcript, sends `hello`, and can assert that forbidden legacy message types were never emitted
+2. `ReadModelRouteHarness` mounts auth plus the bootstrap, session-directory, agent-timeline, and terminal-view routers with fake services and records scheduler lane events, aborts, revisions, and response bytes
+3. `AppHydrationHarness` renders `App.tsx` with a real Redux store, gated HTTP promises, seeded layout state, and a programmable websocket stub whose `ready` can be held independently from HTTP
+4. `SlowNetworkController` can hold and release `critical`, `visible`, and `background` requests independently and delay websocket `ready` independently from HTTP
+5. `TerminalMirrorFixture` can apply deterministic ANSI output, expose viewport serialization and `tailSeq`, answer scrollback and search queries, and simulate replay overflow
+6. `CliCommandHarness` captures invoked URLs, stdout, stderr, JSON output, and exit code without needing a real external server
+
+**Step 2: Run the harness lanes**
+
+```bash
+npm run test:server:standard -- test/unit/visible-first/protocol-harness.test.ts test/unit/visible-first/read-model-route-harness.test.ts test/unit/visible-first/terminal-mirror-fixture.test.ts test/unit/visible-first/cli-command-harness.test.ts
+NODE_ENV=test npx vitest run test/unit/visible-first/app-hydration-harness.test.tsx test/unit/visible-first/slow-network-controller.test.ts
+```
+
+Expected: FAIL because the shared harness modules do not exist yet.
+
+**Step 3: Implement the minimal shared harness foundation**
+
+Keep the shared import surface explicit and stable:
+
+```ts
+import { createProtocolHarness } from '@test/helpers/visible-first/protocol-harness'
+import { createReadModelRouteHarness } from '@test/helpers/visible-first/read-model-route-harness'
+import { createAppHydrationHarness } from '@test/helpers/visible-first/app-hydration-harness'
+import { createSlowNetworkController } from '@test/helpers/visible-first/slow-network-controller'
+import { createTerminalMirrorFixture } from '@test/helpers/visible-first/terminal-mirror-fixture'
+import { createCliCommandHarness } from '@test/helpers/visible-first/cli-command-harness'
+```
+
+These harnesses are the only approved foundation for the later scenario and integration tests in this plan. Extend them when a later seam needs more control; do not fork them into one-off local fixtures.
+
+**Step 4: Re-run the harness lanes**
+
+```bash
+npm run test:server:standard -- test/unit/visible-first/protocol-harness.test.ts test/unit/visible-first/read-model-route-harness.test.ts test/unit/visible-first/terminal-mirror-fixture.test.ts test/unit/visible-first/cli-command-harness.test.ts
+NODE_ENV=test npx vitest run test/unit/visible-first/app-hydration-harness.test.tsx test/unit/visible-first/slow-network-controller.test.ts
+```
+
+Expected: PASS.
+
+**Step 5: Commit**
+
+```bash
+git add test/helpers/visible-first/protocol-harness.ts test/helpers/visible-first/read-model-route-harness.ts test/helpers/visible-first/app-hydration-harness.tsx test/helpers/visible-first/slow-network-controller.ts test/helpers/visible-first/terminal-mirror-fixture.ts test/helpers/visible-first/cli-command-harness.ts test/unit/visible-first/protocol-harness.test.ts test/unit/visible-first/read-model-route-harness.test.ts test/unit/visible-first/app-hydration-harness.test.tsx test/unit/visible-first/slow-network-controller.test.ts test/unit/visible-first/terminal-mirror-fixture.test.ts test/unit/visible-first/cli-command-harness.test.ts
+git commit -m "test(visible-first): add shared transport harness foundation"
+```
+
+### Task 2: Add The Machine-Enforced Audit Gate
 
 **Files:**
 - Create: `test/e2e-browser/perf/visible-first-audit-gate.ts`
@@ -284,7 +373,7 @@ git add test/e2e-browser/perf/visible-first-audit-gate.ts scripts/assert-visible
 git commit -m "test(perf): add visible-first audit landing gate"
 ```
 
-### Task 2: Tighten Shared Read-Model Contracts And API Helpers
+### Task 3: Tighten Shared Read-Model Contracts And API Helpers
 
 **Files:**
 - Modify: `test/unit/client/lib/api.test.ts`
@@ -339,7 +428,7 @@ git add test/unit/client/lib/api.test.ts shared/read-models.ts src/lib/api.ts
 git commit -m "refactor(api): tighten visible-first read-model contracts"
 ```
 
-### Task 3: Make `/api/bootstrap` Shell-Only And Budgeted
+### Task 4: Make `/api/bootstrap` Shell-Only And Budgeted
 
 **Files:**
 - Modify: `test/integration/server/bootstrap-router.test.ts`
@@ -395,7 +484,7 @@ git add test/integration/server/bootstrap-router.test.ts server/index.ts server/
 git commit -m "feat(bootstrap): make shell bootstrap authoritative and bounded"
 ```
 
-### Task 4: Make `App.tsx` The Sole WebSocket Owner And Start Focused Hydration Before `ready`
+### Task 5: Make `App.tsx` The Sole WebSocket Owner And Start Focused Hydration Before `ready`
 
 **Files:**
 - Modify: `test/unit/client/components/App.test.tsx`
@@ -473,7 +562,7 @@ git add test/unit/client/components/App.test.tsx test/unit/client/components/App
 git commit -m "refactor(app): centralize websocket ownership and focused bootstrap hydration"
 ```
 
-### Task 5: Finish The Session Directory Query Service
+### Task 6: Finish The Session Directory Query Service
 
 **Files:**
 - Modify: `test/unit/server/session-directory/service.test.ts`
@@ -529,7 +618,7 @@ git add test/unit/server/session-directory/service.test.ts server/session-direct
 git commit -m "feat(session-directory): finish authoritative query service"
 ```
 
-### Task 6: Make `/api/session-directory` The Only Read-Model Authority
+### Task 7: Make `/api/session-directory` The Only Read-Model Authority
 
 **Files:**
 - Modify: `test/integration/server/session-directory-router.test.ts`
@@ -593,7 +682,7 @@ git rm test/integration/session-search-e2e.test.ts server/routes/sessions.ts
 git commit -m "feat(session-directory): make session-directory routes authoritative"
 ```
 
-### Task 7: Move The CLI To The Session Directory Contract
+### Task 8: Move The CLI To The Session Directory Contract
 
 **Files:**
 - Modify: `test/unit/cli/http.test.ts`
@@ -635,7 +724,7 @@ git add test/unit/cli/http.test.ts test/unit/cli/commands.test.ts server/cli/ind
 git commit -m "refactor(cli): use visible-first session-directory routes"
 ```
 
-### Task 8: Move Session Window Hydration Into Store-Owned Visible Intents
+### Task 9: Move Session Window Hydration Into Store-Owned Visible Intents
 
 **Files:**
 - Modify: `test/unit/client/components/Sidebar.test.tsx`
@@ -703,7 +792,7 @@ git add test/unit/client/components/Sidebar.test.tsx test/unit/client/components
 git commit -m "refactor(session-ui): hydrate only visible session windows"
 ```
 
-### Task 9: Scope Session Mutation Refresh To The Active Window
+### Task 10: Scope Session Mutation Refresh To The Active Window
 
 **Files:**
 - Modify: `test/unit/client/components/ContextMenuProvider.test.tsx`
@@ -748,7 +837,7 @@ git add test/unit/client/components/ContextMenuProvider.test.tsx test/e2e/open-t
 git commit -m "fix(session-ui): scope mutation refresh to the active window"
 ```
 
-### Task 10: Finish The Agent Timeline Server Read Model
+### Task 11: Finish The Agent Timeline Server Read Model
 
 **Files:**
 - Modify: `test/integration/server/agent-timeline-router.test.ts`
@@ -800,7 +889,7 @@ git add test/integration/server/agent-timeline-router.test.ts test/unit/server/a
 git commit -m "feat(agent-timeline): finish recent-first timeline read model"
 ```
 
-### Task 11: Restore Agent Chat From Snapshot Plus Visible Timeline Windows
+### Task 12: Restore Agent Chat From Snapshot Plus Visible Timeline Windows
 
 **Files:**
 - Modify: `test/unit/client/agentChatSlice.test.ts`
@@ -866,7 +955,7 @@ git add test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChat
 git commit -m "feat(agent-chat): restore from snapshots and visible timeline windows"
 ```
 
-### Task 12: Finish The Terminal Directory, Viewport, Scrollback, And Search Routes
+### Task 13: Finish The Terminal Directory, Viewport, Scrollback, And Search Routes
 
 **Files:**
 - Modify: `test/integration/server/terminal-view-router.test.ts`
@@ -932,7 +1021,7 @@ git add test/integration/server/terminal-view-router.test.ts test/server/termina
 git commit -m "feat(terminal-server): finish visible-first terminal routes"
 ```
 
-### Task 13: Make Terminal Invalidations And Runtime Deltas Authoritative
+### Task 14: Make Terminal Invalidations And Runtime Deltas Authoritative
 
 **Files:**
 - Modify: `test/server/ws-terminal-meta.test.ts`
@@ -998,7 +1087,7 @@ git rm server/routes/terminals.ts
 git commit -m "feat(terminal-server): switch to targeted invalidations and runtime deltas"
 ```
 
-### Task 14: Paint Terminals Viewport-First
+### Task 15: Paint Terminals Viewport-First
 
 **Files:**
 - Modify: `test/unit/client/components/TerminalView.lifecycle.test.tsx`
@@ -1055,7 +1144,7 @@ git add test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/cl
 git commit -m "feat(terminal-client): paint viewport first and recover from tailSeq"
 ```
 
-### Task 15: Move Terminal Directory Surfaces And Search To Store-Owned HTTP
+### Task 16: Move Terminal Directory Surfaces And Search To Store-Owned HTTP
 
 **Files:**
 - Create: `test/unit/client/store/terminalDirectorySlice.test.ts`
@@ -1127,7 +1216,7 @@ git add test/unit/client/store/terminalDirectorySlice.test.ts test/unit/client/s
 git commit -m "refactor(terminal-ui): move directory and search to store-owned HTTP"
 ```
 
-### Task 16: Enforce Shared Lane Ordering And Abort Propagation
+### Task 17: Enforce Shared Lane Ordering And Abort Propagation
 
 **Files:**
 - Modify: `test/unit/server/read-models/work-scheduler.test.ts`
@@ -1190,7 +1279,7 @@ git add test/unit/server/read-models/work-scheduler.test.ts test/integration/ser
 git commit -m "feat(scheduler): enforce shared visible-first lane ordering"
 ```
 
-### Task 17: Enforce Payload Budgets And Audit-Facing Instrumentation
+### Task 18: Enforce Payload Budgets And Audit-Facing Instrumentation
 
 **Files:**
 - Modify: `test/unit/server/request-logger.test.ts`
@@ -1259,7 +1348,7 @@ git add test/unit/server/request-logger.test.ts test/unit/server/perf-logger.tes
 git commit -m "feat(transport): enforce budgets and audit-facing instrumentation"
 ```
 
-### Task 18: Delete Legacy Bulk WebSocket Delivery And Chunking
+### Task 19: Delete Legacy Bulk WebSocket Delivery And Chunking
 
 **Files:**
 - Modify: `test/server/ws-sidebar-snapshot-refresh.test.ts`
@@ -1310,7 +1399,7 @@ git rm test/server/ws-sessions-patch.test.ts test/unit/server/ws-chunking.test.t
 git commit -m "refactor(protocol): delete bulk websocket delivery and chunking"
 ```
 
-### Task 19: Remove Legacy Capabilities, Commands, And Static Compatibility Paths
+### Task 20: Remove Legacy Capabilities, Commands, And Static Compatibility Paths
 
 **Files:**
 - Modify: `test/server/ws-protocol.test.ts`
@@ -1390,7 +1479,7 @@ git add test/server/ws-protocol.test.ts test/server/ws-edge-cases.test.ts test/s
 git commit -m "refactor(protocol): remove legacy websocket capabilities and commands"
 ```
 
-### Task 20: Run The Full Quality Gate And Audit Loop Until It Passes
+### Task 21: Run The Full Quality Gate And Audit Loop Until It Passes
 
 **Files:**
 - No planned source edits.
@@ -1435,7 +1524,7 @@ Expected:
 1. both commands exit `0`
 2. `artifacts/perf/visible-first-gate.post-cutover.json` reports `"ok": true`
 
-If the gate fails, go back to the narrowest failing seam, add or tighten the missing regression, fix the product, commit the fix, and restart Task 20 from Step 1. Do not stop at the first bad comparison.
+If the gate fails, go back to the narrowest failing seam, add or tighten the missing regression, fix the product, commit the fix, and restart Task 21 from Step 1. Do not stop at the first bad comparison.
 
 **Step 4: Confirm audit artifacts stay uncommitted**
 
