@@ -61,6 +61,7 @@ import { ExtensionManager } from './extension-manager.js'
 import { createExtensionRouter } from './extension-routes.js'
 import { createServerInfoRouter } from './server-info-router.js'
 import { SessionMetadataStore } from './session-metadata-store.js'
+import { createShellBootstrapRouter } from './shell-bootstrap-router.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -352,27 +353,7 @@ async function main() {
     applyDebugLogging,
   }))
 
-  app.use('/api', createShellBootstrapRouter({
-    getSettings: async () => migrateSettingsSortMode(await configStore.getSettings()),
-    getPlatform: async () => ({
-      platform: await detectPlatform(),
-    }),
-    getShellState: async () => ({
-      authenticated: true,
-      ...startupState.snapshot(),
-    }),
-    getPerfState: async () => ({
-      logging: perfConfig.enabled,
-    }),
-    getConfigFallback: async () => {
-      const readError = configStore.getLastReadError()
-      if (!readError) return undefined
-      return {
-        reason: readError,
-        backupExists: await configStore.backupExists(),
-      }
-    },
-  }))
+  // (bootstrap router mounted above, after httpAuthMiddleware)
 
   // --- API: settings ---
   app.use('/api/settings', createSettingsRouter({
