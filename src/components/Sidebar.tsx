@@ -18,6 +18,7 @@ import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { getActiveSessionRefForTab } from '@/lib/session-utils'
 import { createLogger } from '@/lib/client-logger'
 import { useStableArray } from '@/hooks/useStableArray'
+import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 
 
 const log = createLogger('Sidebar')
@@ -244,6 +245,7 @@ export default function Sidebar({
   const [searchTier, setSearchTier] = useState<'title' | 'userMessages' | 'fullText'>('title')
   const [searchResults, setSearchResults] = useState<SearchResult[] | null>(null)
   const [isSearching, setIsSearching] = useState(false)
+  const lastMarkedSearchQueryRef = useRef<string | null>(null)
   const requestIdRef = useRef<string | null>(null)
   const listContainerRef = useRef<HTMLDivElement | null>(null)
   const [listHeight, setListHeight] = useState(0)
@@ -550,6 +552,19 @@ export default function Sidebar({
     onItemClick: handleItemClick,
     timestampTick,
   }), [sortedItems, activeSessionKey, activeTerminalId, settings.sidebar?.showProjectBadges, handleItemClick, timestampTick])
+
+  useEffect(() => {
+    const query = filter.trim()
+    if (!query) return
+    if (isSearching) return
+    if (sortedItems.length === 0) return
+    if (lastMarkedSearchQueryRef.current === query) return
+    getInstalledPerfAuditBridge()?.mark('sidebar.search_results_visible', {
+      query,
+      resultCount: sortedItems.length,
+    })
+    lastMarkedSearchQueryRef.current = query
+  }, [filter, isSearching, sortedItems.length])
 
   return (
     <div
