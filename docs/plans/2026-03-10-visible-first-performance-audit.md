@@ -1155,66 +1155,58 @@ git add src/components/TerminalView.tsx src/lib/ws-client.ts test/unit/client/co
 git commit -m "test: mark terminal readiness audit milestone"
 ```
 
-## Task 13: Mark Agent-Chat, Sidebar Search, and Tab-Selection Milestones
+## Task-Sizing Corrections
+
+The earlier revision had the right architecture, but three places were still too coarse for disciplined trycycle execution:
+
+1. it bundled three unrelated UI milestone seams into one task
+2. it bundled the serial runner, write CLI, compare CLI, and package wiring into one task
+3. it bundled smoke coverage, `.gitignore`, and README work into one task without explicitly running lint afterward
+
+The tasks below split those seams so each commit leaves a smaller, reviewable, green state.
+
+## Task 13: Mark Agent-Chat Readiness
 
 **Files:**
 - Modify: `src/components/agent-chat/AgentChatView.tsx`
-- Modify: `src/components/Sidebar.tsx`
-- Modify: `src/components/TabContent.tsx`
 - Create: `test/unit/client/components/agent-chat/AgentChatView.perf-audit.test.tsx`
-- Create: `test/unit/client/components/Sidebar.perf-audit.test.tsx`
-- Create: `test/unit/client/components/TabContent.perf-audit.test.tsx`
 
-**Step 1: Write the failing tests**
+**Step 1: Write the failing test**
 
 ```ts
-it('marks agent_chat.surface_visible when the focused history is visibly rendered', async () => {
+it('marks agent_chat.surface_visible when the focused history is rendered and loaded', async () => {
   render(<AgentChatViewWithPerfAudit />)
+  expect(await screen.findByText(/assistant/i)).toBeVisible()
   expect(readPerfAuditSnapshot().milestones['agent_chat.surface_visible']).toBeTypeOf('number')
-})
-
-it('marks sidebar.search_results_visible when visible search results render', async () => {
-  render(<SidebarWithPerfAudit />)
-  await typeSearch('alpha')
-  expect(readPerfAuditSnapshot().milestones['sidebar.search_results_visible']).toBeTypeOf('number')
-})
-
-it('marks tab.selected_surface_visible when the selected background tab becomes visible', async () => {
-  render(<TabContentWithPerfAudit />)
-  await selectBackgroundTab()
-  expect(readPerfAuditSnapshot().milestones['tab.selected_surface_visible']).toBeTypeOf('number')
 })
 ```
 
-**Step 2: Run the tests to verify they fail**
+**Step 2: Run the test to verify it fails**
 
 Run:
 
 ```bash
-npm run test:client:standard -- test/unit/client/components/agent-chat/AgentChatView.perf-audit.test.tsx test/unit/client/components/Sidebar.perf-audit.test.tsx test/unit/client/components/TabContent.perf-audit.test.tsx
+npm run test:client:standard -- test/unit/client/components/agent-chat/AgentChatView.perf-audit.test.tsx
 ```
 
-Expected: FAIL because those milestones are not recorded.
+Expected: FAIL because the milestone is not recorded.
 
 **Step 3: Write the minimal implementation**
 
-Mark milestones only when the focused surface is visibly usable:
+In `AgentChatView.tsx`, mark `agent_chat.surface_visible` only when:
 
-1. `AgentChatView.tsx`
-   - mark `agent_chat.surface_visible` after focused history is rendered and `historyLoaded` is true
-2. `Sidebar.tsx`
-   - mark `sidebar.search_results_visible` after visible filtered results are rendered for the current query
-3. `TabContent.tsx`
-   - mark `tab.selected_surface_visible` once the newly selected tab’s focused pane is mounted and visible
+1. the pane is focused
+2. `historyLoaded` is true
+3. at least one visible history row has rendered
 
-Avoid duplicate marks by ignoring repeat calls for the same milestone.
+Ignore repeat marks.
 
-**Step 4: Run the tests to verify they pass**
+**Step 4: Run the test to verify it passes**
 
 Run:
 
 ```bash
-npm run test:client:standard -- test/unit/client/components/agent-chat/AgentChatView.perf-audit.test.tsx test/unit/client/components/Sidebar.perf-audit.test.tsx test/unit/client/components/TabContent.perf-audit.test.tsx
+npm run test:client:standard -- test/unit/client/components/agent-chat/AgentChatView.perf-audit.test.tsx
 ```
 
 Expected: PASS.
@@ -1222,11 +1214,118 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add src/components/agent-chat/AgentChatView.tsx src/components/Sidebar.tsx src/components/TabContent.tsx test/unit/client/components/agent-chat/AgentChatView.perf-audit.test.tsx test/unit/client/components/Sidebar.perf-audit.test.tsx test/unit/client/components/TabContent.perf-audit.test.tsx
-git commit -m "test: mark visible-first surface audit milestones"
+git add src/components/agent-chat/AgentChatView.tsx test/unit/client/components/agent-chat/AgentChatView.perf-audit.test.tsx
+git commit -m "test: mark agent chat audit readiness"
 ```
 
-## Task 14: Record HTTP and WebSocket Transport Through Chromium CDP
+## Task 14: Mark Sidebar Search Readiness
+
+**Files:**
+- Modify: `src/components/Sidebar.tsx`
+- Create: `test/unit/client/components/Sidebar.perf-audit.test.tsx`
+
+**Step 1: Write the failing test**
+
+```ts
+it('marks sidebar.search_results_visible when visible results render for the active query', async () => {
+  render(<SidebarWithPerfAudit />)
+  await typeSearch('alpha')
+  expect(await screen.findByText(/alpha/i)).toBeVisible()
+  expect(readPerfAuditSnapshot().milestones['sidebar.search_results_visible']).toBeTypeOf('number')
+})
+```
+
+**Step 2: Run the test to verify it fails**
+
+Run:
+
+```bash
+npm run test:client:standard -- test/unit/client/components/Sidebar.perf-audit.test.tsx
+```
+
+Expected: FAIL because the milestone is not recorded.
+
+**Step 3: Write the minimal implementation**
+
+In `Sidebar.tsx`, mark `sidebar.search_results_visible` after:
+
+1. the sidebar is visible
+2. the current query is non-empty
+3. the filtered result list for that query has rendered
+
+Do not mark for stale queries or empty-state renders.
+
+**Step 4: Run the test to verify it passes**
+
+Run:
+
+```bash
+npm run test:client:standard -- test/unit/client/components/Sidebar.perf-audit.test.tsx
+```
+
+Expected: PASS.
+
+**Step 5: Commit**
+
+```bash
+git add src/components/Sidebar.tsx test/unit/client/components/Sidebar.perf-audit.test.tsx
+git commit -m "test: mark sidebar audit readiness"
+```
+
+## Task 15: Mark Selected-Tab Readiness
+
+**Files:**
+- Modify: `src/components/TabContent.tsx`
+- Create: `test/unit/client/components/TabContent.perf-audit.test.tsx`
+
+**Step 1: Write the failing test**
+
+```ts
+it('marks tab.selected_surface_visible when a background tab becomes the selected visible tab', async () => {
+  render(<TabContentWithPerfAudit />)
+  await selectBackgroundTab()
+  expect(readPerfAuditSnapshot().milestones['tab.selected_surface_visible']).toBeTypeOf('number')
+})
+```
+
+**Step 2: Run the test to verify it fails**
+
+Run:
+
+```bash
+npm run test:client:standard -- test/unit/client/components/TabContent.perf-audit.test.tsx
+```
+
+Expected: FAIL because the milestone is not recorded.
+
+**Step 3: Write the minimal implementation**
+
+In `TabContent.tsx`, mark `tab.selected_surface_visible` once:
+
+1. the newly selected tab is active
+2. its focused pane is mounted
+3. the pane container is visible
+
+Do not fire the mark for the initial tab on first load; this milestone exists only for the offscreen-tab scenario.
+
+**Step 4: Run the test to verify it passes**
+
+Run:
+
+```bash
+npm run test:client:standard -- test/unit/client/components/TabContent.perf-audit.test.tsx
+```
+
+Expected: PASS.
+
+**Step 5: Commit**
+
+```bash
+git add src/components/TabContent.tsx test/unit/client/components/TabContent.perf-audit.test.tsx
+git commit -m "test: mark selected tab audit readiness"
+```
+
+## Task 16: Record HTTP and WebSocket Transport Through Chromium CDP
 
 **Files:**
 - Create: `test/e2e-browser/perf/network-recorder.ts`
@@ -1288,8 +1387,8 @@ Implementation rules:
 1. count only `/api/**`
 2. ignore `/api/health` and `/api/logs/client`
 3. use `encodedDataLength` where available for bytes
-4. capture raw observations and summarized by-route/by-type views
-5. treat non-JSON WS payloads as `unknown`
+4. preserve raw observations plus summarized `byRoute` and `byType` maps
+5. classify non-JSON or missing-`type` payloads as `unknown`
 
 **Step 4: Run the test to verify it passes**
 
@@ -1308,7 +1407,7 @@ git add test/e2e-browser/perf/network-recorder.ts test/unit/lib/visible-first-au
 git commit -m "test: add visible-first audit network recorder"
 ```
 
-## Task 15: Parse Server JSONL Logs Into Audit Data
+## Task 17: Parse Server JSONL Logs Into Audit Data
 
 **Files:**
 - Create: `test/e2e-browser/perf/parse-server-logs.ts`
@@ -1378,7 +1477,7 @@ git add test/e2e-browser/perf/parse-server-logs.ts test/unit/lib/visible-first-a
 git commit -m "test: add visible-first server log parser"
 ```
 
-## Task 16: Build the Cold Browser Context Helper
+## Task 18: Build the Cold Browser Context Helper
 
 **Files:**
 - Create: `test/e2e-browser/perf/create-audit-context.ts`
@@ -1431,8 +1530,8 @@ Rules:
 
 1. block service workers for both profiles
 2. disable cache through CDP
-3. apply iPhone 14 device profile only for `mobile_restricted`
-4. apply the fixed bandwidth/latency profile only for `mobile_restricted`
+3. apply Playwright `devices['iPhone 14']` only for `mobile_restricted`
+4. apply the fixed bandwidth and latency profile only for `mobile_restricted`
 
 **Step 4: Run the test to verify it passes**
 
@@ -1451,7 +1550,7 @@ git add test/e2e-browser/perf/create-audit-context.ts test/unit/lib/visible-firs
 git commit -m "test: define visible-first audit browser context rules"
 ```
 
-## Task 17: Build the Per-Sample Runner
+## Task 19: Build the Per-Sample Runner
 
 **Files:**
 - Create: `test/e2e-browser/perf/run-sample.ts`
@@ -1488,7 +1587,7 @@ Expected: FAIL with a module-not-found error.
 
 **Step 3: Write the minimal implementation**
 
-Implement the sample runner in one place:
+Implement the end-to-end sample runner in one place:
 
 ```ts
 export async function runVisibleFirstAuditSample(input: {
@@ -1514,7 +1613,7 @@ Execution order:
 12. return one sample object
 13. clean up browser and server in `finally`
 
-This task must be the first true end-to-end slice of the audit.
+This is the first true end-to-end slice of the audit. If this slice is awkward, fix the interfaces instead of adding glue elsewhere.
 
 **Step 4: Run the test to verify it passes**
 
@@ -1533,13 +1632,79 @@ git add test/e2e-browser/perf/run-sample.ts test/unit/lib/visible-first-audit-ru
 git commit -m "test: add visible-first audit sample runner"
 ```
 
-## Task 18: Build the Full Runner and Both CLIs
+## Task 20: Build the Serial Audit Runner
 
 **Files:**
 - Create: `test/e2e-browser/perf/run-visible-first-audit.ts`
+- Create: `test/unit/lib/visible-first-audit-runner.test.ts`
+
+**Step 1: Write the failing test**
+
+```ts
+// @vitest-environment node
+import { describe, expect, it } from 'vitest'
+import { runVisibleFirstAudit } from '@test/e2e-browser/perf/run-visible-first-audit'
+
+describe('runVisibleFirstAudit', () => {
+  it('runs the accepted scenario/profile matrix in stable order and returns a schema-valid object', async () => {
+    const artifact = await runVisibleFirstAudit(fakeAuditRunContext())
+    expect(artifact.scenarios.map((scenario) => scenario.id)).toEqual([
+      'auth-required-cold-boot',
+      'terminal-cold-boot',
+      'agent-chat-cold-boot',
+      'sidebar-search-large-corpus',
+      'terminal-reconnect-backlog',
+      'offscreen-tab-selection',
+    ])
+    expect(artifact.scenarios.every((scenario) => scenario.samples).toBeDefined()).toBe(true)
+  })
+})
+```
+
+**Step 2: Run the test to verify it fails**
+
+Run:
+
+```bash
+npm run test:client:standard -- test/unit/lib/visible-first-audit-runner.test.ts
+```
+
+Expected: FAIL with a module-not-found error.
+
+**Step 3: Write the minimal implementation**
+
+Create `runVisibleFirstAudit(...)` so it:
+
+1. loops serially across all requested scenarios and profiles
+2. calls `runVisibleFirstAuditSample(...)` for each pair
+3. builds `summaryByProfile` from the authoritative samples
+4. validates the final artifact with `VisibleFirstAuditSchema`
+5. returns the parsed artifact object rather than writing files directly
+
+Keep filesystem writes out of this task.
+
+**Step 4: Run the test to verify it passes**
+
+Run:
+
+```bash
+npm run test:client:standard -- test/unit/lib/visible-first-audit-runner.test.ts
+```
+
+Expected: PASS.
+
+**Step 5: Commit**
+
+```bash
+git add test/e2e-browser/perf/run-visible-first-audit.ts test/unit/lib/visible-first-audit-runner.test.ts
+git commit -m "test: add visible-first audit runner"
+```
+
+## Task 21: Add the Main Audit CLI and Package Wiring
+
+**Files:**
 - Create: `test/e2e-browser/perf/audit-cli.ts`
 - Create: `scripts/visible-first-audit.ts`
-- Create: `scripts/compare-visible-first-audit.ts`
 - Modify: `package.json`
 - Create: `test/unit/lib/visible-first-audit-cli.test.ts`
 
@@ -1571,29 +1736,21 @@ Expected: FAIL because the CLI helpers do not exist.
 
 Create:
 
-1. `run-visible-first-audit.ts`
-   - loops serially across all six scenarios and both profiles
-   - validates the final object with `VisibleFirstAuditSchema`
-2. `audit-cli.ts`
+1. `audit-cli.ts`
    - parses `--output`, `--scenario`, and `--profile`
-3. `scripts/visible-first-audit.ts`
-   - runs the audit and writes exactly one JSON file
-4. `scripts/compare-visible-first-audit.ts`
-   - loads two schema-valid artifacts and prints one JSON diff
+2. `scripts/visible-first-audit.ts`
+   - runs `runVisibleFirstAudit(...)`
+   - creates `artifacts/perf/` when needed
+   - writes pretty JSON with a trailing newline
+   - exits non-zero if schema validation fails
 
 Update `package.json` with:
 
 ```json
-"perf:audit:visible-first": "npm run build && tsx scripts/visible-first-audit.ts",
-"perf:audit:compare": "tsx scripts/compare-visible-first-audit.ts"
+"perf:audit:visible-first": "npm run build && tsx scripts/visible-first-audit.ts"
 ```
 
-The main audit script must:
-
-1. create `artifacts/perf/` when needed
-2. preserve stable scenario/profile order
-3. write pretty JSON with a trailing newline
-4. exit non-zero if schema validation fails
+Do not add compare-mode wiring in this task.
 
 **Step 4: Run the test to verify it passes**
 
@@ -1608,11 +1765,77 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add test/e2e-browser/perf/run-visible-first-audit.ts test/e2e-browser/perf/audit-cli.ts scripts/visible-first-audit.ts scripts/compare-visible-first-audit.ts package.json test/unit/lib/visible-first-audit-cli.test.ts
-git commit -m "feat: add visible-first audit runner and compare cli"
+git add test/e2e-browser/perf/audit-cli.ts scripts/visible-first-audit.ts package.json test/unit/lib/visible-first-audit-cli.test.ts
+git commit -m "feat: add visible-first audit cli"
 ```
 
-## Task 19: Add Smoke Coverage and Operator Documentation
+## Task 22: Add the Compare CLI
+
+**Files:**
+- Modify: `test/e2e-browser/perf/audit-cli.ts`
+- Create: `scripts/compare-visible-first-audit.ts`
+- Modify: `package.json`
+- Create: `test/unit/lib/visible-first-audit-compare-cli.test.ts`
+
+**Step 1: Write the failing test**
+
+```ts
+// @vitest-environment node
+import { describe, expect, it } from 'vitest'
+import { parseCompareArgs } from '@test/e2e-browser/perf/audit-cli'
+
+describe('parseCompareArgs', () => {
+  it('requires both base and candidate artifact paths', () => {
+    expect(() => parseCompareArgs(['--base', 'base.json'])).toThrow(/candidate/i)
+  })
+})
+```
+
+**Step 2: Run the test to verify it fails**
+
+Run:
+
+```bash
+npm run test:client:standard -- test/unit/lib/visible-first-audit-compare-cli.test.ts
+```
+
+Expected: FAIL because compare-mode parsing and the compare script do not exist yet.
+
+**Step 3: Write the minimal implementation**
+
+Add:
+
+1. `parseCompareArgs(...)` in `audit-cli.ts`
+2. `scripts/compare-visible-first-audit.ts`
+   - loads two schema-valid artifacts
+   - prints one JSON diff from `compareVisibleFirstAudits(...)`
+
+Update `package.json` with:
+
+```json
+"perf:audit:compare": "tsx scripts/compare-visible-first-audit.ts"
+```
+
+Keep compare output machine-readable JSON only.
+
+**Step 4: Run the test to verify it passes**
+
+Run:
+
+```bash
+npm run test:client:standard -- test/unit/lib/visible-first-audit-compare-cli.test.ts
+```
+
+Expected: PASS.
+
+**Step 5: Commit**
+
+```bash
+git add test/e2e-browser/perf/audit-cli.ts scripts/compare-visible-first-audit.ts package.json test/unit/lib/visible-first-audit-compare-cli.test.ts
+git commit -m "feat: add visible-first audit compare cli"
+```
+
+## Task 23: Add Smoke Coverage, Artifact Ignore Rules, and Operator Documentation
 
 **Files:**
 - Modify: `.gitignore`
@@ -1624,7 +1847,7 @@ git commit -m "feat: add visible-first audit runner and compare cli"
 
 ```ts
 import { describe, expect, it } from 'vitest'
-import { mkdtemp, readFile } from 'fs/promises'
+import { mkdtemp, readFile, writeFile } from 'fs/promises'
 import os from 'os'
 import path from 'path'
 import { runVisibleFirstAudit } from './run-visible-first-audit'
@@ -1635,11 +1858,11 @@ describe('visible-first audit smoke', () => {
     const outputDir = await mkdtemp(path.join(os.tmpdir(), 'visible-first-audit-'))
     const outputPath = path.join(outputDir, 'audit.json')
 
-    await runVisibleFirstAudit({
-      outputPath,
+    const artifact = await runVisibleFirstAudit({
       scenarioIds: ['auth-required-cold-boot'],
       profileIds: ['desktop_local'],
     })
+    await writeFile(outputPath, JSON.stringify(artifact, null, 2) + '\n')
 
     const parsed = VisibleFirstAuditSchema.parse(JSON.parse(await readFile(outputPath, 'utf8')))
     expect(parsed.scenarios).toHaveLength(1)
@@ -1664,7 +1887,7 @@ Expected: FAIL because `perf/**/*.test.ts` is not included yet or the runner is 
 3. add the smoke test
 4. document in `README.md`:
    - how to run the audit
-   - default artifact path
+   - the default artifact path
    - how to diff two artifacts
    - why the mobile sample is bandwidth-restricted
 
@@ -1696,13 +1919,23 @@ Run these in order after all tasks are complete.
 Run:
 
 ```bash
-npm run test:client:standard -- test/unit/lib/visible-first-audit-profiles.test.ts test/unit/lib/visible-first-audit-scenarios.test.ts test/unit/lib/visible-first-audit-contract.test.ts test/unit/lib/visible-first-audit-derived-metrics.test.ts test/unit/lib/visible-first-audit-aggregator.test.ts test/unit/lib/visible-first-audit-compare.test.ts test/unit/lib/visible-first-audit-seed-server-home.test.ts test/unit/lib/visible-first-audit-seed-browser-storage.test.ts test/unit/lib/visible-first-audit-network-recorder.test.ts test/unit/lib/visible-first-audit-server-log-parser.test.ts test/unit/lib/visible-first-audit-context.test.ts test/unit/lib/visible-first-audit-run-sample.test.ts test/unit/lib/visible-first-audit-cli.test.ts test/unit/client/lib/perf-audit-bridge.test.ts test/unit/client/lib/perf-logger.test.ts test/unit/client/lib/test-harness.perf-audit.test.ts test/unit/client/components/App.perf-audit-bootstrap.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/agent-chat/AgentChatView.perf-audit.test.tsx test/unit/client/components/Sidebar.perf-audit.test.tsx test/unit/client/components/TabContent.perf-audit.test.tsx
+npm run test:client:standard -- test/unit/lib/visible-first-audit-profiles.test.ts test/unit/lib/visible-first-audit-scenarios.test.ts test/unit/lib/visible-first-audit-contract.test.ts test/unit/lib/visible-first-audit-derived-metrics.test.ts test/unit/lib/visible-first-audit-aggregator.test.ts test/unit/lib/visible-first-audit-compare.test.ts test/unit/lib/visible-first-audit-seed-server-home.test.ts test/unit/lib/visible-first-audit-seed-browser-storage.test.ts test/unit/lib/visible-first-audit-network-recorder.test.ts test/unit/lib/visible-first-audit-server-log-parser.test.ts test/unit/lib/visible-first-audit-context.test.ts test/unit/lib/visible-first-audit-run-sample.test.ts test/unit/lib/visible-first-audit-runner.test.ts test/unit/lib/visible-first-audit-cli.test.ts test/unit/lib/visible-first-audit-compare-cli.test.ts test/unit/client/lib/perf-audit-bridge.test.ts test/unit/client/lib/perf-logger.test.ts test/unit/client/lib/test-harness.perf-audit.test.ts test/unit/client/components/App.perf-audit-bootstrap.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/agent-chat/AgentChatView.perf-audit.test.tsx test/unit/client/components/Sidebar.perf-audit.test.tsx test/unit/client/components/TabContent.perf-audit.test.tsx
 npm run test:e2e:helpers -- test/e2e-browser/helpers/test-server.test.ts test/e2e-browser/perf/visible-first-audit.smoke.test.ts
 ```
 
 Expected: PASS.
 
-**Step 2: Run the repo-standard full suite**
+**Step 2: Run lint for the touched UI and harness code**
+
+Run:
+
+```bash
+npm run lint
+```
+
+Expected: PASS.
+
+**Step 3: Run the repo-standard full suite**
 
 Run:
 
@@ -1712,7 +1945,7 @@ npm test
 
 Expected: PASS.
 
-**Step 3: Run the full audit**
+**Step 4: Run the full audit**
 
 Run:
 
@@ -1722,12 +1955,12 @@ npm run perf:audit:visible-first
 
 Expected: `artifacts/perf/visible-first-audit.json` is written successfully.
 
-**Step 4: Verify the artifact shape**
+**Step 5: Verify the artifact shape**
 
 Run:
 
 ```bash
-node -e "const fs=require('fs'); const data=JSON.parse(fs.readFileSync('artifacts/perf/visible-first-audit.json','utf8')); console.log(data.schemaVersion, data.scenarios.length, data.scenarios.every((s)=>s.samples.length===2))"
+node --input-type=module -e "import fs from 'node:fs'; const data = JSON.parse(fs.readFileSync('artifacts/perf/visible-first-audit.json', 'utf8')); console.log(data.schemaVersion, data.scenarios.length, data.scenarios.every((scenario) => scenario.samples.length === 2))"
 ```
 
 Expected output:
@@ -1736,7 +1969,7 @@ Expected output:
 1 6 true
 ```
 
-**Step 5: Verify compare mode**
+**Step 6: Verify compare mode**
 
 Run:
 
