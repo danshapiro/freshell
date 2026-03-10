@@ -1,33 +1,15 @@
 import { X, Circle } from 'lucide-react'
 import { useRef, useEffect } from 'react'
 import { cn } from '@/lib/utils'
+import { getTerminalStatusDotClassName, getTerminalStatusIconClassName } from '@/lib/terminal-status-indicator'
 import PaneIcon from '@/components/icons/PaneIcon'
-import type { Tab, TabAttentionStyle } from '@/store/types'
+import type { Tab, TabAttentionStyle, TerminalStatus } from '@/store/types'
 import type { PaneContent } from '@/store/paneTypes'
 import type { MouseEvent, KeyboardEvent } from 'react'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 
-function StatusDot({ status }: { status: string }) {
-  if (status === 'running') {
-    return <Circle className="h-2 w-2 fill-success text-success" />
-  }
-  if (status === 'exited') {
-    return <Circle className="h-2 w-2 text-muted-foreground/40" />
-  }
-  if (status === 'error') {
-    return <Circle className="h-2 w-2 fill-destructive text-destructive" />
-  }
-  // Creating state
-  return <Circle className="h-2 w-2 text-muted-foreground/20 animate-pulse" />
-}
-
-function statusClassName(status: string): string {
-  switch (status) {
-    case 'running': return 'text-success'
-    case 'exited': return 'text-muted-foreground/40'
-    case 'error': return 'text-destructive'
-    default: return 'text-muted-foreground/20 animate-pulse'
-  }
+function StatusDot({ status }: { status: TerminalStatus }) {
+  return <Circle className={cn('h-2 w-2', getTerminalStatusDotClassName(status))} />
 }
 
 const MAX_TAB_ICONS = 6
@@ -86,12 +68,12 @@ export default function TabItem({
     return (
       <span className="flex items-center gap-0.5">
         {visible.map((content, i) => {
-          const status = content.kind === 'terminal' ? content.status : 'running'
+          const status: TerminalStatus = content.kind === 'terminal' ? content.status : 'running'
           return (
             <PaneIcon
               key={i}
               content={content}
-              className={cn('h-3 w-3 shrink-0', statusClassName(status))}
+              className={cn('h-3 w-3 shrink-0', getTerminalStatusIconClassName(status))}
             />
           )
         })}

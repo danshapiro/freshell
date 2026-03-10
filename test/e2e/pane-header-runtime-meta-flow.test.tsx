@@ -6,13 +6,15 @@ import App from '@/App'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
-import sessionsReducer from '@/store/sessionsSlice'
+import sessionsReducer, { markWsSnapshotReceived } from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
+import agentChatReducer from '@/store/agentChatSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import { networkReducer } from '@/store/networkSlice'
 import type { Tab } from '@/store/types'
-import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
+import type { AgentChatState } from '@/store/agentChatTypes'
+import type { PaneNode, TerminalPaneContent, AgentChatPaneContent } from '@/store/paneTypes'
 
 const wsMocks = vi.hoisted(() => {
   const messageHandlers = new Set<(msg: any) => void>()
@@ -93,11 +95,18 @@ vi.mock('@/components/TerminalView', () => ({
   default: ({ paneId }: { paneId: string }) => <div data-testid={`terminal-${paneId}`}>Terminal</div>,
 }))
 
+vi.mock('@/components/agent-chat/AgentChatView', () => ({
+  default: ({ paneId }: { paneId: string }) => <div data-testid={`agent-chat-${paneId}`}>Agent Chat</div>,
+}))
+
 function createStore(options?: {
   codexTab?: Partial<Tab>
   claudeTab?: Partial<Tab>
   codexPane?: Partial<TerminalPaneContent>
   claudePane?: Partial<TerminalPaneContent>
+  freshClaudeTab?: Partial<Tab>
+  freshClaudePane?: AgentChatPaneContent
+  agentChatState?: Partial<AgentChatState>
 }) {
   const codexTab: Tab = {
     id: 'tab-codex',
@@ -150,6 +159,31 @@ function createStore(options?: {
     'tab-claude': { type: 'leaf', id: 'pane-claude', content: claudePane },
   }
 
+  const tabs = [codexTab, claudeTab]
+  const activePane: Record<string, string> = {
+    'tab-codex': 'pane-codex',
+    'tab-claude': 'pane-claude',
+  }
+
+  if (options?.freshClaudeTab && options?.freshClaudePane) {
+    const freshClaudeTab: Tab = {
+      id: 'tab-fresh',
+      createRequestId: 'req-fresh',
+      title: 'FreshClaude Tab',
+      status: 'running',
+      mode: 'claude',
+      createdAt: Date.now(),
+      ...options.freshClaudeTab,
+    }
+    tabs.push(freshClaudeTab)
+    layouts[freshClaudeTab.id] = {
+      type: 'leaf',
+      id: 'pane-fresh',
+      content: options.freshClaudePane,
+    }
+    activePane[freshClaudeTab.id] = 'pane-fresh'
+  }
+
   return configureStore({
     reducer: {
       settings: settingsReducer,
@@ -157,6 +191,7 @@ function createStore(options?: {
       connection: connectionReducer,
       sessions: sessionsReducer,
       panes: panesReducer,
+      agentChat: agentChatReducer,
       turnCompletion: turnCompletionReducer,
       terminalMeta: terminalMetaReducer,
       network: networkReducer,
@@ -177,16 +212,13 @@ function createStore(options?: {
         lastSavedAt: null,
       },
       tabs: {
-        tabs: [codexTab, claudeTab],
+        tabs,
         activeTabId: 'tab-codex',
         renameRequestTabId: null,
       },
       panes: {
         layouts,
-        activePane: {
-          'tab-codex': 'pane-codex',
-          'tab-claude': 'pane-claude',
-        },
+        activePane,
         paneTitles: {},
         paneTitleSetByUser: {},
         renameRequestTabId: null,
@@ -195,6 +227,12 @@ function createStore(options?: {
       },
       terminalMeta: {
         byTerminalId: {},
+      },
+      agentChat: {
+        sessions: {},
+        pendingCreates: {},
+        availableModels: [],
+        ...(options?.agentChatState || {}),
       },
       network: { status: null, loading: false, configuring: false, error: null },
     },
@@ -220,8 +258,8 @@ describe('pane header runtime metadata flow (e2e)', () => {
           availableClis: { codex: true, claude: true },
         })
       }
-      if (url === '/api/sessions') {
-        return Promise.resolve([])
+      if (typeof url === 'string' && url.startsWith('/api/sessions')) {
+        return Promise.resolve({ projects: [] })
       }
       return Promise.resolve({})
     })
@@ -491,6 +529,148 @@ describe('pane header runtime metadata flow (e2e)', () => {
 
     await waitFor(() => {
       expect(screen.getByText(/freshell \(main\*\)\s+25%/)).toBeInTheDocument()
+    })
+  })
+
+  it('renders and updates the same percent-used header indicator for a FreshClaude pane from indexed Claude metadata', async () => {
+    const store = createStore({
+      freshClaudeTab: {
+        id: 'tab-fresh',
+        createRequestId: 'req-fresh',
+        title: 'FreshClaude Tab',
+        status: 'running',
+        mode: 'claude',
+        createdAt: Date.now(),
+      },
+      freshClaudePane: {
+        kind: 'agent-chat',
+        provider: 'freshclaude',
+        createRequestId: 'req-fresh',
+        sessionId: 'sdk-session-1',
+        status: 'idle',
+      } satisfies AgentChatPaneContent,
+      agentChatState: {
+        sessions: {
+          'sdk-session-1': {
+            sessionId: 'sdk-session-1',
+            cliSessionId: 'claude-session-1',
+            status: 'idle',
+            messages: [],
+            streamingText: '',
+            streamingActive: false,
+            pendingPermissions: {},
+            pendingQuestions: {},
+            totalCostUsd: 0,
+            totalInputTokens: 0,
+            totalOutputTokens: 0,
+          },
+        },
+        pendingCreates: {},
+        availableModels: [],
+      } satisfies Partial<AgentChatState>,
+    })
+
+    apiGet.mockImplementation((url: string) => {
+      if (url === '/api/settings') {
+        return Promise.resolve({
+          ...defaultSettings,
+          sidebar: { ...defaultSettings.sidebar, collapsed: true },
+        })
+      }
+      if (url === '/api/platform') {
+        return Promise.resolve({
+          platform: 'linux',
+          availableClis: { codex: true, claude: true },
+        })
+      }
+      if (url.startsWith('/api/sessions')) {
+        return Promise.resolve({
+          projects: [
+            {
+              projectPath: '/home/user/code/freshell',
+              sessions: [
+                {
+                  provider: 'claude',
+                  sessionType: 'freshclaude',
+                  sessionId: 'claude-session-1',
+                  projectPath: '/home/user/code/freshell',
+                  cwd: '/home/user/code/freshell/.worktrees/issue-163',
+                  gitBranch: 'main',
+                  isDirty: true,
+                  updatedAt: 1,
+                  tokenUsage: {
+                    inputTokens: 10,
+                    outputTokens: 5,
+                    cachedTokens: 0,
+                    totalTokens: 15,
+                    contextTokens: 15,
+                    compactThresholdTokens: 60,
+                    compactPercent: 25,
+                  },
+                },
+              ],
+            },
+          ],
+        })
+      }
+      return Promise.resolve({})
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.connect).toHaveBeenCalled()
+    })
+
+    act(() => {
+      wsMocks.emitMessage({ type: 'ready' })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText(/freshell \(main\*\)\s+25%/)).toBeInTheDocument()
+    })
+
+    store.dispatch(markWsSnapshotReceived())
+
+    act(() => {
+      wsMocks.emitMessage({
+        type: 'sessions.patch',
+        upsertProjects: [
+          {
+            projectPath: '/home/user/code/freshell',
+            sessions: [
+              {
+                provider: 'claude',
+                sessionType: 'freshclaude',
+                sessionId: 'claude-session-1',
+                projectPath: '/home/user/code/freshell',
+                cwd: '/home/user/code/freshell/.worktrees/issue-163',
+                gitBranch: 'main',
+                isDirty: true,
+                updatedAt: 2,
+                tokenUsage: {
+                  inputTokens: 10,
+                  outputTokens: 5,
+                  cachedTokens: 0,
+                  totalTokens: 15,
+                  contextTokens: 15,
+                  compactThresholdTokens: 60,
+                  compactPercent: 50,
+                },
+              },
+            ],
+          },
+        ],
+        removeProjectPaths: [],
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText(/freshell \(main\*\)\s+50%/)).toBeInTheDocument()
     })
   })
 })

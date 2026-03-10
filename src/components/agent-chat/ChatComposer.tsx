@@ -103,7 +103,7 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
   }, [])
 
   return (
-    <div className="border-t p-3">
+    <div className="border-t px-3 py-2">
       <div className="flex items-end gap-2">
         <textarea
           ref={textareaCallbackRef}
@@ -115,7 +115,7 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
           placeholder={placeholder ?? 'Message Claude...'}
           rows={1}
           className={cn(
-            'flex-1 resize-none rounded border bg-background px-3 py-2 text-sm',
+            'flex-1 resize-none rounded border bg-background px-3 py-1.5 text-sm',
             'focus:outline-none focus:ring-2 focus:ring-ring',
             'min-h-[36px] max-h-[200px]',
             'disabled:opacity-50'

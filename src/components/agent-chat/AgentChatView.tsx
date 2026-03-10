@@ -465,7 +465,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   return (
     <div className={cn('h-full w-full flex flex-col', hidden ? 'tab-hidden' : 'tab-visible')} role="region" aria-label={`${providerLabel} Chat`} onPointerUp={handleContainerPointerUp}>
       {/* Status bar */}
-      <div className="flex items-center justify-between px-3 py-1.5 border-b text-xs text-muted-foreground">
+      <div className="flex items-center justify-between px-3 py-1 border-b text-xs text-muted-foreground">
         <span>
           {hasWaitingItems && 'Waiting for answer...'}
           {!hasWaitingItems && paneContent.status === 'creating' && 'Creating session...'}
@@ -499,19 +499,19 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
       {/* Message area wrapper (relative for scroll-to-bottom button positioning) */}
       <div className="relative flex-1 min-h-0">
-      <div ref={scrollContainerRef} onScroll={handleScroll} className="h-full overflow-y-auto p-4 space-y-3" data-context="agent-chat" data-session-id={paneContent.sessionId}>
+      <div ref={scrollContainerRef} onScroll={handleScroll} className="h-full overflow-y-auto px-3 py-3 space-y-2" data-context="agent-chat" data-session-id={paneContent.sessionId}>
         {/* Restoring: persisted sessionId but history not yet loaded (reload/back-nav).
              Falls back to welcome screen after timeout (e.g. server restarted, session lost). */}
         {isRestoring && !restoreTimedOut && (
-          <div className="text-center text-muted-foreground text-sm py-8">
+          <div className="text-center text-muted-foreground text-sm py-6">
             <p>Restoring session...</p>
           </div>
         )}
 
         {/* Welcome: no sessionId, session exists but empty, or restore timed out */}
         {!session?.messages.length && (!isRestoring || restoreTimedOut) && (
-          <div className="text-center text-muted-foreground text-sm py-8">
-            <p className="font-medium mb-2">{providerLabel}</p>
+          <div className="text-center text-muted-foreground text-sm py-6">
+            <p className="font-medium mb-1">{providerLabel}</p>
             <p>Rich chat UI for AI agent sessions.</p>
           </div>
         )}
@@ -624,7 +624,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
         {/* Error display */}
         {session?.lastError && (
-          <div className="text-sm text-red-500 bg-red-500/10 rounded-lg p-3" role="alert">
+          <div className="text-sm text-red-500 bg-red-500/10 rounded-lg px-3 py-2" role="alert">
             {session.lastError}
           </div>
         )}
@@ -637,7 +637,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         <button
           onClick={scrollToBottom}
           aria-label="Scroll to bottom"
-          className="absolute bottom-3 left-1/2 -translate-x-1/2 z-10 rounded-full bg-background border shadow-md p-2 hover:bg-muted transition-colors"
+          className="absolute bottom-2 left-1/2 -translate-x-1/2 z-10 rounded-full bg-background border shadow-md p-2 hover:bg-muted transition-colors"
         >
           <ChevronDown className="h-4 w-4" />
           {hasNewMessages && (

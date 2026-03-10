@@ -106,8 +106,6 @@ describe('PaneHeader', () => {
   describe('formatPaneRuntimeLabel()', () => {
     it('formats codex and claude metadata with identical spacing/output for equivalent inputs', () => {
       const codex = formatPaneRuntimeLabel({
-        terminalId: 'term-1',
-        provider: 'codex',
         checkoutRoot: '/home/user/freshell',
         branch: 'main',
         isDirty: true,
@@ -118,12 +116,9 @@ describe('PaneHeader', () => {
           totalTokens: 15,
           compactPercent: 25,
         },
-        updatedAt: 1,
       })
 
       const claude = formatPaneRuntimeLabel({
-        terminalId: 'term-2',
-        provider: 'claude',
         checkoutRoot: '/home/user/freshell',
         branch: 'main',
         isDirty: true,
@@ -134,7 +129,6 @@ describe('PaneHeader', () => {
           totalTokens: 15,
           compactPercent: 25,
         },
-        updatedAt: 1,
       })
 
       expect(codex).toBe('freshell (main*)  25%')
@@ -143,8 +137,6 @@ describe('PaneHeader', () => {
 
     it('omits percentage when compact-threshold usage is unavailable', () => {
       const label = formatPaneRuntimeLabel({
-        terminalId: 'term-3',
-        provider: 'codex',
         checkoutRoot: '/home/user/freshell',
         branch: 'main',
         isDirty: false,
@@ -154,18 +146,35 @@ describe('PaneHeader', () => {
           cachedTokens: 0,
           totalTokens: 15,
         },
-        updatedAt: 1,
       })
 
       expect(label).toBe('freshell (main)')
+    })
+
+    it('formats FreshClaude runtime metadata with the same label contract as CLI panes', () => {
+      const label = formatPaneRuntimeLabel({
+        checkoutRoot: '/home/user/freshell',
+        cwd: '/home/user/freshell/.worktrees/issue-163',
+        branch: 'main',
+        isDirty: true,
+        tokenUsage: {
+          inputTokens: 10,
+          outputTokens: 5,
+          cachedTokens: 0,
+          totalTokens: 15,
+          contextTokens: 15,
+          compactThresholdTokens: 60,
+          compactPercent: 25,
+        },
+      })
+
+      expect(label).toBe('freshell (main*)  25%')
     })
   })
 
   describe('formatPaneRuntimeTooltip()', () => {
     it('formats detailed hover text with directory, branch, and tokens', () => {
       const tooltip = formatPaneRuntimeTooltip({
-        terminalId: 'term-4',
-        provider: 'claude',
         cwd: '/home/user/code/freshell/.worktrees/fix-token-percent-calc',
         checkoutRoot: '/home/user/code/freshell/.worktrees/fix-token-percent-calc',
         branch: 'fix/token-percent-calc',
@@ -179,7 +188,6 @@ describe('PaneHeader', () => {
           compactThresholdTokens: 167000,
           compactPercent: 33,
         },
-        updatedAt: 1,
       })
 
       expect(tooltip).toBe(
@@ -225,12 +233,13 @@ describe('PaneHeader', () => {
       expect(paneIcon.getAttribute('class')).toContain('text-muted-foreground/40')
     })
 
-    it('applies pulse animation to icon when status is creating', () => {
+    it('applies blue styling without pulse animation when status is creating', () => {
       render(
         <PaneHeader title="Test" status="creating" isActive={true} onClose={vi.fn()} content={makeTerminalContent()} />
       )
       const paneIcon = screen.getByTestId('pane-icon')
-      expect(paneIcon.getAttribute('class')).toContain('animate-pulse')
+      expect(paneIcon.getAttribute('class')).toContain('text-blue-500')
+      expect(paneIcon.getAttribute('class')).not.toContain('animate-pulse')
     })
   })
 

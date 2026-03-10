@@ -1,18 +1,10 @@
 import { useRef, useEffect } from 'react'
 import { X, Maximize2, Minimize2, Search } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { getTerminalStatusIconClassName } from '@/lib/terminal-status-indicator'
 import type { TerminalStatus } from '@/store/types'
 import type { PaneContent } from '@/store/paneTypes'
 import PaneIcon from '@/components/icons/PaneIcon'
-
-function statusClassName(status: TerminalStatus): string {
-  switch (status) {
-    case 'running': return 'text-success'
-    case 'exited': return 'text-muted-foreground/40'
-    case 'error': return 'text-destructive'
-    default: return 'text-muted-foreground/20 animate-pulse'
-  }
-}
 
 interface PaneHeaderProps {
   title: string
@@ -27,6 +19,7 @@ interface PaneHeaderProps {
   content: PaneContent
   isRenaming?: boolean
   renameValue?: string
+  renameError?: string
   onRenameChange?: (value: string) => void
   onRenameBlur?: () => void
   onRenameKeyDown?: (e: React.KeyboardEvent) => void
@@ -47,6 +40,7 @@ export default function PaneHeader({
   content,
   isRenaming,
   renameValue,
+  renameError,
   onRenameChange,
   onRenameBlur,
   onRenameKeyDown,
@@ -74,7 +68,7 @@ export default function PaneHeader({
       role="banner"
       aria-label={`Pane: ${title}`}
     >
-      <PaneIcon content={content} className={cn('h-3.5 w-3.5 shrink-0', statusClassName(status))} />
+      <PaneIcon content={content} className={cn('h-3.5 w-3.5 shrink-0', getTerminalStatusIconClassName(status))} />
 
       <div className="min-w-0 flex-1">
         {isRenaming ? (
@@ -87,6 +81,7 @@ export default function PaneHeader({
             onKeyDown={onRenameKeyDown}
             onClick={(e) => e.stopPropagation()}
             aria-label="Rename pane"
+            aria-invalid={renameError ? true : undefined}
           />
         ) : (
           <span className="block truncate" title={title}>

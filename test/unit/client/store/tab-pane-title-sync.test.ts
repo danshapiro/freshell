@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
-import tabsReducer, { addTab, updateTab } from '../../../../src/store/tabsSlice'
+import tabsReducer, { addTab } from '../../../../src/store/tabsSlice'
 import panesReducer, {
   initLayout,
   splitPane,
@@ -32,8 +32,8 @@ describe('tab-pane title sync for single-pane tabs', () => {
     vi.clearAllMocks()
   })
 
-  describe('Direction 1: commitRename on single-pane tab syncs tab title', () => {
-    it('updates tab title when the only pane is renamed', () => {
+  describe('Direction 1: pane rename keeps tab titles independent', () => {
+    it('does not update tab title when the only pane is renamed', () => {
       const store = createStore()
 
       // Create a tab
@@ -50,18 +50,12 @@ describe('tab-pane title sync for single-pane tabs', () => {
       expect(rootNode.type).toBe('leaf')
       const paneId = (rootNode as Extract<PaneNode, { type: 'leaf' }>).id
 
-      // Simulate what commitRename does: dispatch updatePaneTitle, then check
-      // if single-pane and dispatch updateTab
+      // Simulate a pane rename. Pane titles update, but tab titles remain
+      // independent from rename-pane semantics.
       const trimmed = 'New Pane Title'
       store.dispatch(updatePaneTitle({ tabId, paneId, title: trimmed }))
 
-      // If it's a single-pane tab, also update the tab title
-      const layout = store.getState().panes.layouts[tabId]
-      if (layout?.type === 'leaf') {
-        store.dispatch(updateTab({ id: tabId, updates: { title: trimmed } }))
-      }
-
-      expect(store.getState().tabs.tabs[0].title).toBe('New Pane Title')
+      expect(store.getState().tabs.tabs[0].title).toBe('Original Tab Title')
       expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('New Pane Title')
     })
 
@@ -94,12 +88,6 @@ describe('tab-pane title sync for single-pane tabs', () => {
       // Rename the first pane
       const trimmed = 'Renamed Pane'
       store.dispatch(updatePaneTitle({ tabId, paneId: firstPaneId, title: trimmed }))
-
-      // Check: since it's a multi-pane tab, tab title should NOT change
-      const layout = store.getState().panes.layouts[tabId]
-      if (layout?.type === 'leaf') {
-        store.dispatch(updateTab({ id: tabId, updates: { title: trimmed } }))
-      }
 
       expect(store.getState().tabs.tabs[0].title).toBe('Original Tab Title')
       expect(store.getState().panes.paneTitles[tabId][firstPaneId]).toBe('Renamed Pane')

@@ -52,6 +52,8 @@ export const TokenSummarySchema = z.object({
   compactPercent: z.number().int().min(0).max(100).optional(),
 })
 
+export type TokenSummary = z.infer<typeof TokenSummarySchema>
+
 export const TerminalMetaRecordSchema = z.object({
   terminalId: z.string().min(1),
   cwd: z.string().optional(),

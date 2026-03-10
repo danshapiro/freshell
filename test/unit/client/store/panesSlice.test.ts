@@ -141,6 +141,16 @@ describe('panesSlice', () => {
       expect(state.activePane['tab-1']).toBe(leaf.id)
     })
 
+    it('seeds paneTitles from the initialized pane content', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({ tabId: 'tab-1', content: { kind: 'terminal', mode: 'codex', status: 'running' } })
+      )
+
+      const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(state.paneTitles['tab-1'][leaf.id]).toBe('Codex CLI')
+    })
+
     it('uses the provided paneId when supplied', () => {
       const state = panesReducer(
         initialState,
@@ -666,6 +676,30 @@ describe('panesSlice', () => {
 
       expect(swappedLeft.content.kind).toBe('browser')
       expect(swappedRight.content.kind).toBe('terminal')
+    })
+
+    it('swaps pane title metadata and user-set guards with the pane content', () => {
+      const state = panesReducer({
+        ...initialState,
+        layouts: {
+          'tab-1': {
+            type: 'split',
+            id: 'split-1',
+            direction: 'horizontal',
+            sizes: [50, 50],
+            children: [
+              { type: 'leaf', id: 'pane-a', content: { kind: 'terminal', mode: 'shell', status: 'running' } },
+              { type: 'leaf', id: 'pane-b', content: { kind: 'browser', url: 'https://example.com', devToolsOpen: false, browserInstanceId: 'browser-1' } },
+            ],
+          },
+        },
+        activePane: { 'tab-1': 'pane-a' },
+        paneTitles: { 'tab-1': { 'pane-a': 'Ops desk', 'pane-b': 'Docs' } },
+        paneTitleSetByUser: { 'tab-1': { 'pane-a': true } },
+      } as PanesState, swapPanes({ tabId: 'tab-1', paneId: 'pane-a', otherId: 'pane-b' }))
+
+      expect(state.paneTitles['tab-1']).toEqual({ 'pane-a': 'Docs', 'pane-b': 'Ops desk' })
+      expect(state.paneTitleSetByUser['tab-1']).toEqual({ 'pane-b': true })
     })
   })
 

@@ -76,6 +76,26 @@ function waitForMessage(
   })
 }
 
+function closeWebSocket(ws: WebSocket, timeoutMs = 500): Promise<void> {
+  return new Promise((resolve) => {
+    if (ws.readyState === WebSocket.CLOSED) {
+      resolve()
+      return
+    }
+
+    const timeout = setTimeout(() => {
+      ws.terminate()
+      resolve()
+    }, timeoutMs)
+
+    ws.once('close', () => {
+      clearTimeout(timeout)
+      resolve()
+    })
+    ws.close()
+  })
+}
+
 class FakeRegistry {
   detach() { return true }
 }
@@ -172,10 +192,7 @@ describe('ws extension registry', () => {
       expect(registryMsg.extensions[1].serverRunning).toBe(true)
       expect(registryMsg.extensions[1].serverPort).toBe(9999)
     } finally {
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-        ws.terminate()
-      }
-      await new Promise<void>((resolve) => ws.on('close', () => resolve()))
+      await closeWebSocket(ws)
     }
   })
 })
@@ -238,10 +255,7 @@ describe('ws extension registry (no extension manager)', () => {
       const extensionMessages = received.filter((m) => m.type === 'extensions.registry')
       expect(extensionMessages).toHaveLength(0)
     } finally {
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-        ws.terminate()
-      }
-      await new Promise<void>((resolve) => ws.on('close', () => resolve()))
+      await closeWebSocket(ws)
     }
   })
 })

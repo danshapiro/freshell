@@ -330,9 +330,16 @@ export class SessionRepairService extends EventEmitter {
       return
     }
 
-    const historyResult = await this.historyRepairer.ensureHistoryEntryForFile(result.filePath)
-    if (historyResult.status === 'created') {
-      logger.info({ sessionId: result.sessionId, filePath: result.filePath }, 'Backfilled missing Claude history entry')
+    try {
+      const historyResult = await this.historyRepairer.ensureHistoryEntryForFile(result.filePath)
+      if (historyResult.status === 'created') {
+        logger.info({ sessionId: result.sessionId, filePath: result.filePath }, 'Backfilled missing Claude history entry')
+      }
+    } catch (err) {
+      logger.warn(
+        { err, sessionId: result.sessionId, filePath: result.filePath },
+        'Failed to backfill Claude history entry'
+      )
     }
   }
 

@@ -96,7 +96,7 @@ async function request<T = any>(path: string, options: RequestInit = {}): Promis
   if (!res.ok) {
     const err: ApiError = {
       status: res.status,
-      message: (data && data.error) || res.statusText,
+      message: (data && (data.message || data.error)) || res.statusText,
       details: data,
     }
     throw err

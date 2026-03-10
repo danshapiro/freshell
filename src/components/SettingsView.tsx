@@ -2,9 +2,11 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updateSettingsLocal, markSaved, defaultSettings, mergeSettings } from '@/store/settingsSlice'
 import {
-  persistDeviceAlias,
+  dismissDeviceIds,
+  persistDeviceAliasesForDevices,
   persistOwnDeviceLabel,
   setTabRegistryDeviceAliases,
+  setTabRegistryDismissedDeviceIds,
   setTabRegistryDeviceLabel,
 } from '@/store/tabRegistrySlice'
 import { api } from '@/lib/api'
@@ -30,6 +32,7 @@ import { nanoid } from '@reduxjs/toolkit'
 import type { AppView } from '@/components/Sidebar'
 import { CODING_CLI_PROVIDER_CONFIGS } from '@/lib/coding-cli-utils'
 import { createLogger } from '@/lib/client-logger'
+import { buildKnownDevices, type KnownDevice } from '@/lib/known-devices'
 import { parseNormalizedLineList } from '@shared/string-list'
 
 
@@ -179,6 +182,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     deviceId: 'local-device',
     deviceLabel: 'local-device',
     deviceAliases: {} as Record<string, string>,
+    dismissedDeviceIds: [] as string[],
     localOpen: [],
     remoteOpen: [],
     closed: [],
@@ -388,42 +392,22 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   }, [dispatch, enabledProviders, scheduleSave])
 
   const knownDevices = useMemo(() => {
-    const entries = new Map<string, { deviceId: string; baseLabel: string; isOwn: boolean }>()
-    entries.set(tabRegistry.deviceId, {
-      deviceId: tabRegistry.deviceId,
-      baseLabel: tabRegistry.deviceLabel,
-      isOwn: true,
+    return buildKnownDevices({
+      ownDeviceId: tabRegistry.deviceId,
+      ownDeviceLabel: tabRegistry.deviceLabel,
+      deviceAliases: tabRegistry.deviceAliases,
+      dismissedDeviceIds: tabRegistry.dismissedDeviceIds,
+      localOpen: tabRegistry.localOpen,
+      remoteOpen: tabRegistry.remoteOpen,
+      closed: tabRegistry.closed,
     })
-
-    const addRecord = (record: { deviceId: string; deviceLabel: string }) => {
-      if (!entries.has(record.deviceId)) {
-        entries.set(record.deviceId, {
-          deviceId: record.deviceId,
-          baseLabel: record.deviceLabel,
-          isOwn: record.deviceId === tabRegistry.deviceId,
-        })
-      }
-    }
-
-    tabRegistry.localOpen.forEach(addRecord)
-    tabRegistry.remoteOpen.forEach(addRecord)
-    tabRegistry.closed.forEach(addRecord)
-
-    return [...entries.values()]
-      .map((entry) => ({
-        ...entry,
-        effectiveLabel: entry.isOwn
-          ? tabRegistry.deviceLabel
-          : (tabRegistry.deviceAliases[entry.deviceId] || entry.baseLabel),
-      }))
-      .sort((a, b) => Number(b.isOwn) - Number(a.isOwn) || a.effectiveLabel.localeCompare(b.effectiveLabel))
   }, [tabRegistry])
 
   useEffect(() => {
     setDeviceNameInputs((current) => {
       const next: Record<string, string> = {}
       for (const device of knownDevices) {
-        next[device.deviceId] = current[device.deviceId] ?? device.effectiveLabel
+        next[device.key] = current[device.key] ?? device.effectiveLabel
       }
       const changed =
         Object.keys(current).length !== Object.keys(next).length ||
@@ -432,22 +416,35 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     })
   }, [knownDevices])
 
-  const saveDeviceName = useCallback((deviceId: string, isOwn: boolean) => {
-    const nextValue = (deviceNameInputs[deviceId] || '').trim()
-    if (isOwn) {
+  const saveDeviceName = useCallback((device: KnownDevice) => {
+    const nextValue = (deviceNameInputs[device.key] || '').trim()
+    if (device.isOwn) {
       const persisted = persistOwnDeviceLabel(nextValue || tabRegistry.deviceLabel)
       dispatch(setTabRegistryDeviceLabel(persisted))
-      setDeviceNameInputs((current) => ({ ...current, [deviceId]: persisted }))
+      setDeviceNameInputs((current) => ({ ...current, [device.key]: persisted }))
       return
     }
-    const aliases = persistDeviceAlias(deviceId, nextValue || undefined)
+    const aliases = persistDeviceAliasesForDevices(device.deviceIds, nextValue || undefined)
     dispatch(setTabRegistryDeviceAliases(aliases))
-    const fallbackLabel = knownDevices.find((d) => d.deviceId === deviceId)?.baseLabel || ''
     setDeviceNameInputs((current) => ({
       ...current,
-      [deviceId]: aliases[deviceId] || fallbackLabel,
+      [device.key]: device.deviceIds.map((deviceId) => aliases[deviceId]).find(Boolean) || device.baseLabel,
     }))
-  }, [deviceNameInputs, dispatch, knownDevices, tabRegistry.deviceLabel])
+  }, [deviceNameInputs, dispatch, tabRegistry.deviceLabel])
+
+  const deleteDevice = useCallback((device: KnownDevice) => {
+    if (device.isOwn) return
+
+    const aliases = persistDeviceAliasesForDevices(device.deviceIds, undefined)
+    const dismissedIds = dismissDeviceIds(device.deviceIds)
+    dispatch(setTabRegistryDeviceAliases(aliases))
+    dispatch(setTabRegistryDismissedDeviceIds(dismissedIds))
+    setDeviceNameInputs((current) => {
+      const next = { ...current }
+      delete next[device.key]
+      return next
+    })
+  }, [dispatch])
 
   useEffect(() => {
     let cancelled = false
@@ -630,40 +627,6 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               />
             </SettingsRow>
 
-          </SettingsSection>
-
-          <SettingsSection
-            title="Devices"
-            description="Rename devices for the Tabs workspace. Remote device aliases apply only on this machine."
-          >
-            {knownDevices.map((device) => (
-              <SettingsRow
-                key={device.deviceId}
-                label={device.isOwn ? 'This machine' : device.baseLabel}
-                description={device.isOwn ? 'Renaming this updates what other machines see.' : 'Alias stored locally on this machine only.'}
-              >
-                <div className="flex w-full items-center gap-2 md:w-auto">
-                  <input
-                    type="text"
-                    value={deviceNameInputs[device.deviceId] ?? device.effectiveLabel}
-                    onChange={(event) => setDeviceNameInputs((current) => ({
-                      ...current,
-                      [device.deviceId]: event.target.value,
-                    }))}
-                    className="h-10 w-full min-w-[14rem] px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-[20rem]"
-                    aria-label={`Device name for ${device.effectiveLabel}`}
-                    placeholder={device.baseLabel}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => saveDeviceName(device.deviceId, device.isOwn)}
-                    className="h-10 px-3 text-sm rounded-md border border-border hover:bg-muted md:h-8"
-                  >
-                    Save
-                  </button>
-                </div>
-              </SettingsRow>
-            ))}
           </SettingsSection>
 
           {/* Sidebar */}
@@ -1289,6 +1252,50 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 )}
               </>
             )}
+          </SettingsSection>
+
+          <SettingsSection
+            title="Devices"
+            description="Rename devices for the Tabs workspace. Remote device aliases apply only on this machine."
+          >
+            {knownDevices.map((device) => (
+              <SettingsRow
+                key={device.key}
+                label={device.isOwn ? 'This machine' : device.baseLabel}
+                description={device.isOwn ? 'Renaming this updates what other machines see.' : 'Alias stored locally on this machine only.'}
+              >
+                <div className="flex w-full items-center gap-2 md:w-auto">
+                  <input
+                    type="text"
+                    value={deviceNameInputs[device.key] ?? device.effectiveLabel}
+                    onChange={(event) => setDeviceNameInputs((current) => ({
+                      ...current,
+                      [device.key]: event.target.value,
+                    }))}
+                    className="h-10 w-full min-w-[14rem] px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-[20rem]"
+                    aria-label={`Device name for ${device.effectiveLabel}`}
+                    placeholder={device.baseLabel}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => saveDeviceName(device)}
+                    className="h-10 px-3 text-sm rounded-md border border-border hover:bg-muted md:h-8"
+                  >
+                    Save
+                  </button>
+                  {!device.isOwn ? (
+                    <button
+                      type="button"
+                      onClick={() => deleteDevice(device)}
+                      className="h-10 px-3 text-sm rounded-md border border-border hover:bg-muted md:h-8"
+                      aria-label={`Delete device ${device.effectiveLabel}`}
+                    >
+                      Delete
+                    </button>
+                  ) : null}
+                </div>
+              </SettingsRow>
+            ))}
           </SettingsSection>
 
         </div>

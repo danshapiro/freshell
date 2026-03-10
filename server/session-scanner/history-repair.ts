@@ -36,23 +36,40 @@ function normalizeDisplay(text: string): string {
   return text.replace(/\s+/g, ' ').trim()
 }
 
-function extractUserDisplay(message: unknown): string | null {
-  if (typeof message === 'string') {
-    const normalized = normalizeDisplay(message)
-    return normalized ? normalized : null
+function normalizeDisplayOrNull(text: string | undefined): string | null {
+  if (typeof text !== 'string') return null
+  const normalized = normalizeDisplay(text)
+  return normalized ? normalized : null
+}
+
+function extractMessageContentText(content: unknown): string | undefined {
+  if (typeof content === 'string') return content
+
+  if (content && typeof content === 'object' && !Array.isArray(content)) {
+    const text = (content as { text?: unknown }).text
+    return typeof text === 'string' ? text : undefined
   }
 
-  if (!message || typeof message !== 'object') return null
-  const content = (message as { content?: unknown }).content
-  if (!Array.isArray(content)) return null
+  if (!Array.isArray(content)) return undefined
 
   const text = content
     .filter((block): block is { type?: unknown; text?: unknown } => Boolean(block) && typeof block === 'object')
     .filter((block) => block.type === 'text' && typeof block.text === 'string')
     .map((block) => block.text)
     .join(' ')
-  const normalized = normalizeDisplay(text)
-  return normalized ? normalized : null
+  return text || undefined
+}
+
+function extractUserDisplay(message: unknown): string | null {
+  if (typeof message === 'string') {
+    return normalizeDisplayOrNull(message)
+  }
+
+  if (!message || typeof message !== 'object') return null
+  const content = extractMessageContentText((message as { content?: unknown }).content)
+  if (typeof content !== 'string') return null
+
+  return normalizeDisplayOrNull(content)
 }
 
 export function deriveClaudeHistoryEntryFromTranscript(
@@ -104,6 +121,11 @@ export class ClaudeHistoryRepairer {
 
   async ensureHistoryEntryForFile(filePath: string): Promise<ClaudeHistoryRepairResult> {
     const sessionId = path.basename(filePath, '.jsonl')
+    await this.refreshKnownSessionIds()
+    if (this.knownSessionIds?.has(sessionId)) {
+      return { status: 'already_present' }
+    }
+
     let content: string
     try {
       content = await fs.readFile(filePath, 'utf8')

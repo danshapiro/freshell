@@ -1083,4 +1083,25 @@ describe('Tab Switching Keyboard Shortcuts', () => {
     fireEvent.keyDown(window, { code: 'BracketLeft', ctrlKey: true, shiftKey: true })
     expect(store.getState().tabs.activeTabId).toBe('tab-1')
   })
+
+  it('switches tabs from a focused textarea', () => {
+    const store = createStoreWithTabs(3, 1) // active tab-2
+    renderApp(store)
+
+    const textarea = document.createElement('textarea')
+    document.body.appendChild(textarea)
+    try {
+      textarea.focus()
+
+      expect(document.activeElement).toBe(textarea)
+
+      fireEvent.keyDown(textarea, { code: 'BracketRight', ctrlKey: true, shiftKey: true })
+      expect(store.getState().tabs.activeTabId).toBe('tab-3')
+
+      fireEvent.keyDown(textarea, { code: 'BracketLeft', ctrlKey: true, shiftKey: true })
+      expect(store.getState().tabs.activeTabId).toBe('tab-2')
+    } finally {
+      textarea.remove()
+    }
+  })
 })

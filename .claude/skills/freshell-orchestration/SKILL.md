@@ -37,27 +37,37 @@ Use absolute paths for `--cwd` and `--editor`.
 Output behavior:
 - Most commands print JSON.
 - `list-tabs` and `list-panes` print TSV unless `--json`.
+- `list-panes --titles` appends a fifth TSV column with the pane title.
 - `capture-pane` and `display` print plain text.
 
 Targets:
 - Tab target: tab ID or exact tab title.
 - Pane target: pane ID, pane index in active tab, or `tabRef.paneIndex`.
+- Omitted target on `rename-tab` means the active tab.
+- Omitted target on `rename-pane` means the active pane in the active tab.
 - Omitted target falls back to active pane in active tab when command supports it.
+- If a target or name contains spaces, quote it.
+- Use the flagged `-t/-n` form when you want to make the target and name explicit.
 
 Tab commands:
 - `new-tab [-n NAME] [--claude|--codex|--mode MODE] [--shell SHELL] [--cwd DIR] [--browser URL] [--editor FILE] [--resume SESSION_ID] [--prompt TEXT]`
 - `list-tabs [--json]`
 - `select-tab [TARGET]` or `select-tab -t TARGET`
 - `kill-tab [TARGET]` or `kill-tab -t TARGET`
-- `rename-tab [TARGET] [NEW_NAME]` or `rename-tab -t TARGET -n NEW_NAME`
+- `rename-tab NEW_NAME` - rename the active tab
+- `rename-tab TARGET NEW_NAME`
+- `rename-tab -t TARGET -n NEW_NAME`
 - `has-tab TARGET` or `has-tab -t TARGET`
 - `next-tab`
 - `prev-tab`
 
 Pane/layout commands:
 - `split-pane [-t PANE_TARGET] [-v] [--mode MODE] [--shell SHELL] [--cwd DIR] [--browser URL] [--editor FILE]`
-- `list-panes [-t TAB_TARGET] [--json]`
+- `list-panes [-t TAB_TARGET] [--json] [--titles]`
 - `select-pane PANE_TARGET` or `select-pane -t PANE_TARGET`
+- `rename-pane NEW_NAME` - rename the active pane
+- `rename-pane TARGET NEW_NAME`
+- `rename-pane -t TARGET -n NEW_NAME`
 - `kill-pane PANE_TARGET` or `kill-pane -t PANE_TARGET`
 - `resize-pane PANE_TARGET [--x X_PCT] [--y Y_PCT]`
 - `swap-pane PANE_TARGET --other OTHER_PANE_TARGET`
@@ -127,6 +137,24 @@ Split current tab:
 ```bash
 FILE="/absolute/path/to/file.ts"
 $FSH split-pane --editor "$FILE"
+```
+
+## Playbook: create, split, and rename without UI interaction
+
+```bash
+FSH="npx tsx server/cli/index.ts"
+CWD="/absolute/path/to/repo"
+FILE="/absolute/path/to/repo/README.md"
+
+WS="$($FSH new-tab -n 'Triager' --codex --cwd "$CWD")"
+TAB_ID="$(printf '%s' "$WS" | jq -r '.data.tabId')"
+P0="$(printf '%s' "$WS" | jq -r '.data.paneId')"
+P1="$($FSH split-pane -t "$P0" --editor "$FILE" | jq -r '.data.paneId')"
+
+$FSH rename-tab -t "$TAB_ID" -n "Issue 166 work"
+$FSH rename-pane -t "$P0" -n "Codex"
+$FSH select-pane -t "$P1"
+$FSH rename-pane "Editor"
 ```
 
 ## Playbook: parallel Claude panes

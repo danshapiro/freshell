@@ -1,6 +1,11 @@
 import { detectLanIps } from './bootstrap.js' // Must be first - ensures .env exists before dotenv loads
 import 'dotenv/config'
 import { setupWslPortForwarding } from './wsl-port-forward.js'
+import {
+  shouldSetupWslPortForwardingAtStartup,
+  WSL_PORT_FORWARD_DISABLE_ENV,
+  wslPortForwardStartupDisabled,
+} from './wsl-port-forward-startup.js'
 import express from 'express'
 import fs from 'fs'
 import http from 'http'
@@ -178,7 +183,14 @@ async function main() {
   const vitePort = isDev ? Number(process.env.VITE_PORT || 5173) : undefined
   const networkManager = new NetworkManager(server, configStore, port, isDev, vitePort)
   networkManager.setWsHandler(wsHandler)
-  app.use('/api', createAgentApiRouter({ layoutStore, registry, wsHandler }))
+  app.use('/api', createAgentApiRouter({
+    layoutStore,
+    registry,
+    wsHandler,
+    configStore,
+    terminalMetadata,
+    codingCliIndexer,
+  }))
 
   // --- Extension lifecycle broadcasts ---
   extensionManager.on('server.starting', ({ name }: { name: string }) => {
@@ -509,13 +521,19 @@ async function main() {
   const bindHost = getNetworkHost()
 
   // WSL2 port forwarding — only when bound to 0.0.0.0 (remote access active)
-  if (bindHost === '0.0.0.0') {
+  if (shouldSetupWslPortForwardingAtStartup(bindHost, process.env)) {
     const wslPortForwardResult = setupWslPortForwarding(vitePort)
     if (wslPortForwardResult === 'success') {
       console.log('[server] WSL2 port forwarding configured')
     } else if (wslPortForwardResult === 'failed') {
       console.warn('[server] WSL2 port forwarding failed - LAN access may not work')
     }
+  } else if (bindHost === '0.0.0.0' && wslPortForwardStartupDisabled(process.env)) {
+    log.info({
+      event: 'wsl_port_forward_startup_skipped',
+      reason: 'disabled_by_env',
+      envVar: WSL_PORT_FORWARD_DISABLE_ENV,
+    }, 'Skipping automatic WSL2 port forwarding setup')
   }
 
   // Initialize NetworkManager (ALLOWED_ORIGINS) before accepting connections

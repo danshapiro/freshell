@@ -140,3 +140,28 @@ describe('setSessionMetadata()', () => {
     expect(headers.get('Content-Type')).toBe('application/json')
   })
 })
+
+describe('api error mapping', () => {
+  beforeEach(() => {
+    mockFetch.mockReset()
+    localStorage.setItem('freshell.auth-token', 'test-token')
+  })
+
+  afterEach(() => {
+    localStorage.clear()
+  })
+
+  it('prefers agent-api message fields on error responses', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      statusText: 'Bad Request',
+      text: () => Promise.resolve(JSON.stringify({ status: 'error', message: 'name required' })),
+    })
+
+    await expect(api.patch('/api/panes/pane-1', { name: '' })).rejects.toMatchObject({
+      status: 400,
+      message: 'name required',
+    })
+  })
+})

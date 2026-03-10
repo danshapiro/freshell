@@ -2,16 +2,19 @@ import { Router } from 'express'
 import fs from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { nanoid } from 'nanoid'
+import { makeSessionKey } from '../coding-cli/types.js'
+import { MAX_TERMINAL_TITLE_OVERRIDE_LENGTH } from '../terminals-router.js'
 import { ok, approx, fail } from './response.js'
 import { renderCapture } from './capture.js'
 import { waitForMatch } from './wait-for.js'
 import { resolveScreenshotOutputPath } from './screenshot-path.js'
 
 const truthy = (value: unknown) => value === true || value === 'true' || value === '1' || value === 'yes'
+const SYNCABLE_TERMINAL_MODES = new Set(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
 
 type ResizeLayoutStore = {
   getSplitSizes?: (tabId: string | undefined, splitId: string) => [number, number] | undefined
-  resolveTarget?: (target: string) => { paneId?: string }
+  resolveTarget?: (target: string) => { tabId?: string; paneId?: string; message?: string }
   findSplitForPane?: (paneId: string) => { tabId: string; splitId: string } | undefined
 }
 
@@ -47,15 +50,38 @@ async function writeFileAtomic(filePath: string, content: Buffer) {
   }
 }
 
-export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { layoutStore: any; registry: any; wsHandler?: any }) {
+export function createAgentApiRouter({
+  layoutStore,
+  registry,
+  wsHandler,
+  configStore,
+  terminalMetadata,
+  codingCliIndexer,
+}: {
+  layoutStore: any
+  registry: any
+  wsHandler?: any
+  configStore?: any
+  terminalMetadata?: { list: () => Array<{ terminalId: string; provider?: string; sessionId?: string }> }
+  codingCliIndexer?: { refresh: () => Promise<void> }
+}) {
   const router = Router()
 
   const resolvePaneTarget = (raw: string) => {
     if (layoutStore.resolveTarget) {
       const resolved = layoutStore.resolveTarget(raw)
-      if (resolved?.paneId) return resolved
+      if (resolved?.paneId || resolved?.tabId || (resolved?.message && resolved.message !== 'target not resolved')) {
+        return resolved
+      }
     }
     return { paneId: raw }
+  }
+
+  const rejectPaneTargetError = (res: any, resolved: { paneId?: string; message?: string }) => {
+    if (!resolved?.message || resolved.paneId) return false
+    const status = resolved.message.includes('ambiguous') ? 409 : 404
+    res.status(status).json(fail(resolved.message))
+    return true
   }
 
   const parseOptionalNumber = (value: unknown): number | undefined => {
@@ -63,8 +89,16 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
     return Number.isFinite(n) ? n : undefined
   }
 
+  const parseRequiredName = (value: unknown) => {
+    const trimmed = typeof value === 'string' ? value.trim() : ''
+    return trimmed.length > 0 ? trimmed : undefined
+  }
+
   const isValidPercent = (value: number) => Number.isFinite(value) && value >= 1 && value <= 99
   const clampPercent = (value: number) => Math.min(99, Math.max(1, value))
+  const isAmbiguousTargetMessage = (message: string | undefined) => (
+    typeof message === 'string' && message.includes('ambiguous')
+  )
   const normalizePairToHundred = (a: number, b: number): [number, number] => {
     const left = clampPercent(a)
     const right = clampPercent(b)
@@ -93,9 +127,58 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
           return { tabId: parent.tabId, splitId: parent.splitId, message: 'pane matched; resized parent split' }
         }
       }
+      if (isAmbiguousTargetMessage(resolved?.message)) {
+        return { tabId: resolved.tabId, splitId: rawTarget, message: resolved.message }
+      }
     }
 
     return { tabId: requestedTabId, splitId: rawTarget, message: 'split not found' }
+  }
+
+  const persistSyncableTerminalRename = async (paneSnapshot: any, title: string) => {
+    const paneContent = paneSnapshot?.paneContent
+    const terminalId = typeof paneContent?.terminalId === 'string' ? paneContent.terminalId : undefined
+    const meta = terminalId
+      ? terminalMetadata?.list?.().find((entry) => entry.terminalId === terminalId)
+      : undefined
+    const resumeSessionId = typeof paneContent?.resumeSessionId === 'string'
+      ? paneContent.resumeSessionId
+      : undefined
+    const modeCandidates = [
+      typeof paneContent?.mode === 'string' ? paneContent.mode : undefined,
+      terminalId ? registry.get?.(terminalId)?.mode : undefined,
+      typeof meta?.provider === 'string' ? meta.provider : undefined,
+    ]
+    const mode = modeCandidates.find((candidate) => (
+      typeof candidate === 'string' && SYNCABLE_TERMINAL_MODES.has(candidate)
+    ))
+
+    if (!terminalId || !mode || !SYNCABLE_TERMINAL_MODES.has(mode) || !configStore) {
+      return
+    }
+
+    try {
+      await configStore.patchTerminalOverride?.(terminalId, { titleOverride: title })
+      registry.updateTitle?.(terminalId, title)
+
+      const sessionProvider = typeof meta?.provider === 'string' ? meta.provider : mode
+      const sessionId = typeof meta?.sessionId === 'string' ? meta.sessionId : resumeSessionId
+      if (sessionProvider && sessionId) {
+        try {
+          await configStore.patchSessionOverride?.(makeSessionKey(sessionProvider as any, sessionId), {
+            titleOverride: title,
+          })
+          await codingCliIndexer?.refresh?.()
+        } catch {
+          // Match terminals-router semantics: terminal rename persistence is authoritative,
+          // but session-title cascade/index refresh is best-effort.
+        }
+      }
+
+      wsHandler?.broadcast?.({ type: 'terminal.list.updated' })
+    } catch {
+      // Pane rename is authoritative for orchestration; syncable terminal persistence is best-effort.
+    }
   }
 
   router.post('/tabs', (req, res) => {
@@ -163,8 +246,13 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
   })
 
   router.patch('/tabs/:id', (req, res) => {
-    const result = layoutStore.renameTab(req.params.id, req.body?.name)
-    wsHandler?.broadcastUiCommand({ command: 'tab.rename', payload: { id: req.params.id, title: req.body?.name } })
+    const name = parseRequiredName(req.body?.name)
+    if (!name) return res.status(400).json(fail('name required'))
+
+    const result = layoutStore.renameTab(req.params.id, name)
+    if (result?.tabId) {
+      wsHandler?.broadcastUiCommand({ command: 'tab.rename', payload: { id: req.params.id, title: name } })
+    }
     res.json(ok(result, result.message || 'tab renamed'))
   })
 
@@ -211,6 +299,7 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
   router.get('/panes/:id/capture', (req, res) => {
     const rawTarget = req.params.id
     const resolved = resolvePaneTarget(rawTarget)
+    if (rejectPaneTargetError(res, resolved)) return
     const paneId = resolved.paneId || rawTarget
     const paneSnapshot = layoutStore.getPaneSnapshot?.(paneId)
     let terminalId = paneSnapshot?.terminalId || layoutStore.resolvePaneToTerminal?.(paneId)
@@ -248,12 +337,10 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
   })
 
   router.get('/panes/:id/wait-for', async (req, res) => {
-    const paneId = req.params.id
+    const resolved = resolvePaneTarget(req.params.id)
+    if (rejectPaneTargetError(res, resolved)) return
+    const paneId = resolved.paneId || req.params.id
     let terminalId = layoutStore.resolvePaneToTerminal?.(paneId)
-    if (!terminalId && layoutStore.resolveTarget) {
-      const target = layoutStore.resolveTarget(paneId)
-      if (target?.paneId) terminalId = layoutStore.resolvePaneToTerminal?.(target.paneId)
-    }
     const term = terminalId ? registry.get?.(terminalId) : undefined
     if (!term) return res.status(404).json(fail('terminal not found'))
 
@@ -456,6 +543,7 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
   router.post('/panes/:id/split', (req, res) => {
     const rawPaneId = req.params.id
     const resolved = resolvePaneTarget(rawPaneId)
+    if (rejectPaneTargetError(res, resolved)) return
     const paneId = resolved.paneId || rawPaneId
     const direction = req.body?.direction || 'horizontal'
     const wantsBrowser = !!req.body?.browser
@@ -510,9 +598,55 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
     res.json(ok({ paneId: newPaneId, terminalId }, message))
   })
 
+  router.patch('/panes/:id', async (req, res) => {
+    try {
+      const name = parseRequiredName(req.body?.name)
+      if (!name) return res.status(400).json(fail('name required'))
+      if (name.length > MAX_TERMINAL_TITLE_OVERRIDE_LENGTH) {
+        return res.status(400).json(fail(`name must be ${MAX_TERMINAL_TITLE_OVERRIDE_LENGTH} characters or fewer`))
+      }
+
+      const resolved = resolvePaneTarget(req.params.id)
+      if (rejectPaneTargetError(res, resolved)) return
+      const paneId = resolved.paneId || req.params.id
+      const paneSnapshot = layoutStore.getPaneSnapshot?.(paneId)
+      const result = layoutStore.renamePane(paneId, name)
+      let responseData = result
+
+      if (result?.tabId) {
+        await persistSyncableTerminalRename(paneSnapshot, name)
+
+        let tabRenamed = false
+        const tabPanes = layoutStore.listPanes?.(result.tabId) || []
+        if (tabPanes.length === 1) {
+          const tabRenameResult = layoutStore.renameTab?.(result.tabId, name)
+          if (tabRenameResult?.tabId) {
+            tabRenamed = true
+            wsHandler?.broadcastUiCommand({
+              command: 'tab.rename',
+              payload: { id: result.tabId, title: name },
+            })
+          }
+        }
+
+        responseData = { ...result, tabRenamed }
+
+        wsHandler?.broadcastUiCommand({
+          command: 'pane.rename',
+          payload: { tabId: result.tabId, paneId: result.paneId || paneId, title: name },
+        })
+      }
+
+      res.json(ok(responseData, resolved.message || result?.message || 'pane renamed'))
+    } catch (err: any) {
+      res.status(500).json(fail(err?.message || 'Failed to rename pane'))
+    }
+  })
+
   router.post('/panes/:id/close', (req, res) => {
     const rawPaneId = req.params.id
     const resolved = resolvePaneTarget(rawPaneId)
+    if (rejectPaneTargetError(res, resolved)) return
     const paneId = resolved.paneId || rawPaneId
     const result = layoutStore.closePane(paneId)
     wsHandler?.broadcastUiCommand({ command: 'pane.close', payload: { tabId: result?.tabId, paneId } })
@@ -522,6 +656,7 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
   router.post('/panes/:id/select', (req, res) => {
     const rawPaneId = req.params.id
     const resolved = resolvePaneTarget(rawPaneId)
+    if (rejectPaneTargetError(res, resolved)) return
     const paneId = resolved.paneId || rawPaneId
     const tabId = req.body?.tabId || resolved.tabId
     const result = layoutStore.selectPane(tabId, paneId)
@@ -534,6 +669,9 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
   router.post('/panes/:id/resize', (req, res) => {
     const rawTarget = req.params.id
     const resolved = resolveResizeTarget(layoutStore as ResizeLayoutStore, rawTarget, req.body?.tabId)
+    if (isAmbiguousTargetMessage(resolved.message) && rejectPaneTargetError(res, { message: resolved.message })) {
+      return
+    }
     if (resolved.message === 'split not found') {
       return res.json(ok({ message: 'split not found' }, 'split not found'))
     }
@@ -608,8 +746,10 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
     if (!otherRaw) return res.json(approx(undefined, 'swap target missing'))
 
     const resolved = resolvePaneTarget(rawPaneId)
+    if (rejectPaneTargetError(res, resolved)) return
     const paneId = resolved.paneId || rawPaneId
     const otherResolved = resolvePaneTarget(otherRaw)
+    if (rejectPaneTargetError(res, otherResolved)) return
     const otherId = otherResolved.paneId || otherRaw
     if (!otherId) return res.json(approx(undefined, 'swap target missing'))
     const result = layoutStore.swapPane(req.body?.tabId, paneId, otherId)
@@ -621,8 +761,10 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
   })
 
   router.post('/panes/:id/respawn', (req, res) => {
-    const paneId = req.params.id
-    const target = layoutStore.resolveTarget(paneId)
+    const resolved = resolvePaneTarget(req.params.id)
+    if (rejectPaneTargetError(res, resolved)) return
+    const paneId = resolved.paneId || req.params.id
+    const target = resolved.tabId ? resolved : layoutStore.resolveTarget(paneId)
     const tabId = target?.tabId
     if (!tabId) return res.status(404).json(fail('pane not found'))
     const terminal = registry.create({ mode: req.body?.mode || 'shell', shell: req.body?.shell, cwd: req.body?.cwd, envContext: { tabId, paneId } })
@@ -633,23 +775,35 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
   })
 
   router.post('/panes/:id/attach', (req, res) => {
-    const paneId = req.params.id
+    const resolved = resolvePaneTarget(req.params.id)
+    if (rejectPaneTargetError(res, resolved)) return
+    const paneId = resolved.paneId || req.params.id
     const terminalId = req.body?.terminalId
     if (!terminalId) return res.status(400).json(fail('terminalId required'))
-    const target = layoutStore.resolveTarget(paneId)
+    const target = resolved.tabId ? resolved : layoutStore.resolveTarget(paneId)
     const tabId = target?.tabId
     if (!tabId) return res.status(404).json(fail('pane not found'))
-    const content = { kind: 'terminal', terminalId, status: 'running', mode: req.body?.mode || 'shell', shell: req.body?.shell || 'system', createRequestId: nanoid() }
+    const attachedTerminal = registry.get?.(terminalId)
+    const content = {
+      kind: 'terminal',
+      terminalId,
+      status: 'running',
+      mode: req.body?.mode || attachedTerminal?.mode || 'shell',
+      shell: req.body?.shell || attachedTerminal?.shell || 'system',
+      createRequestId: nanoid(),
+    }
     layoutStore.attachPaneContent(tabId, paneId, content)
     wsHandler?.broadcastUiCommand({ command: 'pane.attach', payload: { tabId, paneId, content } })
     res.json(ok({ terminalId }, 'terminal attached'))
   })
 
   router.post('/panes/:id/navigate', (req, res) => {
-    const paneId = req.params.id
+    const resolved = resolvePaneTarget(req.params.id)
+    if (rejectPaneTargetError(res, resolved)) return
+    const paneId = resolved.paneId || req.params.id
     const url = req.body?.url || req.body?.target
     if (!url) return res.status(400).json(fail('url required'))
-    const target = layoutStore.resolveTarget(paneId)
+    const target = resolved.tabId ? resolved : layoutStore.resolveTarget(paneId)
     const tabId = target?.tabId
     if (!tabId) return res.status(404).json(fail('pane not found'))
     const content = { kind: 'browser', url, devToolsOpen: false }
@@ -659,7 +813,9 @@ export function createAgentApiRouter({ layoutStore, registry, wsHandler }: { lay
   })
 
   router.post('/panes/:id/send-keys', (req, res) => {
-    const paneId = req.params.id
+    const resolved = resolvePaneTarget(req.params.id)
+    if (rejectPaneTargetError(res, resolved)) return
+    const paneId = resolved.paneId || req.params.id
     const payload = req.body || {}
     const data = payload.data ?? payload.keys ?? payload.text ?? ''
     let terminalId = layoutStore.resolvePaneToTerminal?.(paneId)

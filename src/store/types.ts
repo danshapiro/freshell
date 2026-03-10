@@ -1,6 +1,6 @@
 export type TerminalStatus = 'creating' | 'running' | 'exited' | 'error'
 
-import type { CodingCliProviderName } from '@shared/ws-protocol'
+import type { CodingCliProviderName, TokenSummary } from '@shared/ws-protocol'
 export type { CodingCliProviderName }
 
 import type { AgentChatProviderName } from '@/lib/agent-chat-types'
@@ -67,6 +67,9 @@ export interface CodingCliSession {
   sourceFile?: string
   isSubagent?: boolean
   isNonInteractive?: boolean
+  gitBranch?: string
+  isDirty?: boolean
+  tokenUsage?: TokenSummary
 }
 
 export interface ProjectGroup {

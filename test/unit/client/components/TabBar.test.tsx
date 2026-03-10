@@ -625,7 +625,7 @@ describe('TabBar', () => {
       expect(errorIndicator).toBeDefined()
     })
 
-    it('shows creating status indicator (pulsing) for creating terminal', () => {
+    it('shows a blue creating status indicator without pulsing for a creating terminal', () => {
       const tab = createTab({ id: 'tab-1', status: 'creating' })
 
       const store = createStore({
@@ -637,9 +637,10 @@ describe('TabBar', () => {
 
       const icons = screen.getAllByTestId('pane-icon')
       const creatingIndicator = icons.find((c) =>
-        getClassString(c).includes('animate-pulse')
+        getClassString(c).includes('text-blue-500')
       )
       expect(creatingIndicator).toBeDefined()
+      expect(getClassString(creatingIndicator!)).not.toContain('animate-pulse')
     })
 
     it('displays correct status for multiple tabs with different statuses', () => {

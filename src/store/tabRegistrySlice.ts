@@ -2,6 +2,7 @@ import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import type { RegistryTabRecord } from './tabRegistryTypes'
 import {
   DEVICE_ALIASES_STORAGE_KEY,
+  DEVICE_DISMISSED_STORAGE_KEY,
   DEVICE_FINGERPRINT_STORAGE_KEY,
   DEVICE_ID_STORAGE_KEY,
   DEVICE_LABEL_CUSTOM_STORAGE_KEY,
@@ -83,6 +84,28 @@ function persistDeviceAliases(storage: Storage | null, aliases: Record<string, s
   }
 }
 
+function loadDismissedDeviceIds(storage: Storage | null): string[] {
+  if (!storage) return []
+  try {
+    const raw = storage.getItem(DEVICE_DISMISSED_STORAGE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return [...new Set(parsed.filter((value): value is string => typeof value === 'string' && value.trim().length > 0))]
+  } catch {
+    return []
+  }
+}
+
+function persistDismissedDeviceIds(storage: Storage | null, deviceIds: string[]): void {
+  if (!storage) return
+  try {
+    storage.setItem(DEVICE_DISMISSED_STORAGE_KEY, JSON.stringify(deviceIds))
+  } catch {
+    // Ignore storage write failures; dismissed IDs remain in-memory for this session.
+  }
+}
+
 function loadDeviceMeta(hints: DeviceMetaHints = {}): { deviceId: string; deviceLabel: string } {
   const storage = safeStorage()
   if (!storage) {
@@ -155,22 +178,42 @@ export function persistOwnDeviceLabel(deviceLabel: string): string {
 }
 
 export function persistDeviceAlias(deviceId: string, label: string | undefined): Record<string, string> {
+  return persistDeviceAliasesForDevices([deviceId], label)
+}
+
+export function persistDeviceAliasesForDevices(deviceIds: string[], label: string | undefined): Record<string, string> {
   const storage = safeStorage()
   const aliases = loadDeviceAliases(storage)
   const normalizedLabel = label?.trim() ? normalizeDeviceLabel(label) : ''
-  if (!normalizedLabel) {
-    delete aliases[deviceId]
-  } else {
-    aliases[deviceId] = normalizedLabel
+  for (const deviceId of [...new Set(deviceIds.filter((value) => typeof value === 'string' && value.trim().length > 0))]) {
+    if (!normalizedLabel) {
+      delete aliases[deviceId]
+    } else {
+      aliases[deviceId] = normalizedLabel
+    }
   }
   persistDeviceAliases(storage, aliases)
   return aliases
+}
+
+export function dismissDeviceIds(deviceIds: string[]): string[] {
+  const storage = safeStorage()
+  const current = loadDismissedDeviceIds(storage)
+  const next = [
+    ...new Set([
+      ...current,
+      ...deviceIds.filter((value) => typeof value === 'string' && value.trim().length > 0),
+    ]),
+  ]
+  persistDismissedDeviceIds(storage, next)
+  return next
 }
 
 export interface TabRegistryState {
   deviceId: string
   deviceLabel: string
   deviceAliases: Record<string, string>
+  dismissedDeviceIds: string[]
   localOpen: RegistryTabRecord[]
   remoteOpen: RegistryTabRecord[]
   closed: RegistryTabRecord[]
@@ -183,11 +226,13 @@ export interface TabRegistryState {
 
 const device = loadDeviceMeta()
 const aliases = loadDeviceAliases(safeStorage())
+const dismissedDeviceIds = loadDismissedDeviceIds(safeStorage())
 
 const initialState: TabRegistryState = {
   deviceId: device.deviceId,
   deviceLabel: device.deviceLabel,
   deviceAliases: aliases,
+  dismissedDeviceIds,
   localOpen: [],
   remoteOpen: [],
   closed: [],
@@ -212,6 +257,9 @@ export const tabRegistrySlice = createSlice({
     },
     setTabRegistryDeviceAliases: (state, action: PayloadAction<Record<string, string>>) => {
       state.deviceAliases = action.payload
+    },
+    setTabRegistryDismissedDeviceIds: (state, action: PayloadAction<string[]>) => {
+      state.dismissedDeviceIds = action.payload
     },
     setTabRegistrySearchRangeDays: (state, action: PayloadAction<number>) => {
       state.searchRangeDays = Math.max(1, action.payload)
@@ -250,6 +298,7 @@ export const {
   setTabRegistryDeviceMeta,
   setTabRegistryDeviceLabel,
   setTabRegistryDeviceAliases,
+  setTabRegistryDismissedDeviceIds,
   setTabRegistrySearchRangeDays,
   setTabRegistryLoading,
   setTabRegistrySnapshot,

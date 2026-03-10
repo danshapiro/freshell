@@ -6,9 +6,10 @@ import { cascadeTerminalRenameToSession } from './rename-cascade.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
 
 const log = logger.child({ component: 'terminals-router' })
+export const MAX_TERMINAL_TITLE_OVERRIDE_LENGTH = 500
 
 export const TerminalPatchSchema = z.object({
-  titleOverride: z.string().max(500).optional().nullable(),
+  titleOverride: z.string().max(MAX_TERMINAL_TITLE_OVERRIDE_LENGTH).optional().nullable(),
   descriptionOverride: z.string().max(2000).optional().nullable(),
   deleted: z.boolean().optional(),
 })

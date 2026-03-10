@@ -10,6 +10,7 @@ describe('UiLayoutSyncSchema', () => {
       layouts: {},
       activePane: {},
       paneTitles: {},
+      paneTitleSetByUser: {},
       timestamp: Date.now(),
     })
     expect(parsed.success).toBe(true)

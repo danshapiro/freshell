@@ -57,6 +57,15 @@ describe('MessageBubble', () => {
     expect(article.className).toContain('max-w-prose')
   })
 
+  it('uses compact vertical padding for denser FreshClaude messages', () => {
+    const { container } = render(
+      <MessageBubble role="assistant" content={[{ type: 'text', text: 'Hello' }]} />
+    )
+    const article = container.querySelector('[role="article"]')!
+    expect(article.className).toContain('pl-2.5')
+    expect(article.className).toContain('py-0.5')
+  })
+
   it('renders thinking block as collapsible', () => {
     render(
       <MessageBubble

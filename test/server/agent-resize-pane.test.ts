@@ -84,6 +84,26 @@ describe('agent resize-pane api', () => {
     expect(resizePane).toHaveBeenCalledWith(undefined, 'split_1', [73, 27])
   })
 
+  it('rejects ambiguous pane title targets before attempting resize', async () => {
+    const resizePane = vi.fn(() => ({ tabId: 'tab_1' }))
+    const layoutStore = {
+      resizePane,
+      getSplitSizes: vi.fn(() => undefined),
+      resolveTarget: vi.fn(() => ({ message: 'pane target is ambiguous; use pane id or tab.pane index' })),
+      findSplitForPane: vi.fn(),
+    }
+    const app = createApp(layoutStore)
+
+    const res = await request(app)
+      .post('/api/panes/Shell/resize')
+      .send({ y: 33 })
+
+    expect(res.status).toBe(409)
+    expect(res.body.status).toBe('error')
+    expect(res.body.message).toContain('ambiguous')
+    expect(resizePane).not.toHaveBeenCalled()
+  })
+
   it('returns 400 for non-numeric or out-of-range x/y/sizes values', async () => {
     const resizePane = vi.fn(() => ({ tabId: 'tab_1' }))
     const layoutStore = {

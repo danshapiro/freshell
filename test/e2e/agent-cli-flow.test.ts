@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { spawn } from 'child_process'
 import path from 'path'
 import { createRequire } from 'module'
@@ -6,6 +6,7 @@ import fs from 'node:fs/promises'
 import express from 'express'
 import http from 'http'
 import { createAgentApiRouter } from '../../server/agent-api/router'
+import { LayoutStore } from '../../server/agent-api/layout-store'
 
 function startTestServer(
   layoutStoreOverrides: Partial<Record<string, any>> = {},
@@ -46,23 +47,61 @@ function resolveCliPaths() {
 }
 
 async function runCli(url: string, args: string[]) {
+  const result = await runCliResult(url, args)
+  if (result.code !== 0) throw new Error(`cli exited ${result.code}: ${result.stderr}`)
+  return { stdout: result.stdout, stderr: result.stderr }
+}
+
+async function runCliResult(url: string, args: string[]) {
   const { tsxPath, cliPath } = resolveCliPaths()
   const proc = spawn(process.execPath, [tsxPath, cliPath, ...args], {
     env: { ...process.env, FRESHELL_URL: url, FRESHELL_TOKEN: 'test-token' },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
 
-  return await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+  return await new Promise<{ code: number; stdout: string; stderr: string }>((resolve, reject) => {
     let stdout = ''
     let stderr = ''
     proc.stdout.on('data', (chunk) => { stdout += chunk.toString() })
     proc.stderr.on('data', (chunk) => { stderr += chunk.toString() })
     proc.on('error', reject)
     proc.on('close', (code) => {
-      if (code !== 0) return reject(new Error(`cli exited ${code}: ${stderr}`))
-      resolve({ stdout, stderr })
+      resolve({ code: code ?? 0, stdout, stderr })
     })
   })
+}
+
+async function startTestServerWithRealLayoutStore() {
+  const layoutStore = new LayoutStore()
+  const app = express()
+  app.use(express.json())
+
+  let terminalCount = 0
+  app.use('/api', createAgentApiRouter({
+    layoutStore,
+    registry: {
+      create: () => ({ terminalId: `term_${++terminalCount}` }),
+      get: () => undefined,
+      input: () => {},
+    },
+  }))
+
+  const server = http.createServer(app)
+  return await new Promise<{ url: string; layoutStore: LayoutStore; close: () => Promise<void> }>((resolve) => {
+    server.listen(0, () => {
+      const { port } = server.address() as { port: number }
+      resolve({
+        url: `http://localhost:${port}`,
+        layoutStore,
+        close: () => new Promise((done) => server.close(() => done())),
+      })
+    })
+  })
+}
+
+async function runCliJson<T>(url: string, args: string[]) {
+  const output = await runCli(url, args)
+  return JSON.parse(output.stdout) as T
 }
 
 describe('cli e2e flow', () => {
@@ -93,6 +132,56 @@ describe('cli e2e flow', () => {
       const output = await runCli(url, ['display', '-p', '#I'])
 
       expect(output.stdout.trim()).toBe('tab_2')
+    } finally {
+      await close()
+    }
+  })
+
+  it('uses the first pane in the active tab when pane commands omit a target and tabs omit activePaneId', async () => {
+    const renamePane = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
+    const { url, close } = await startTestServer({
+      listTabs: () => ([
+        { id: 'tab_1', title: 'Alpha' },
+      ]),
+      listPanes: () => ([
+        { id: 'pane_1', index: 0, kind: 'terminal', terminalId: 'term_1', title: 'Shell' },
+      ]),
+      renamePane,
+      getPaneSnapshot: () => ({
+        tabId: 'tab_1',
+        paneId: 'pane_1',
+        paneContent: { kind: 'terminal', mode: 'shell', terminalId: 'term_1' },
+      }),
+    })
+    try {
+      const output = await runCli(url, ['rename-pane', 'Renamed shell'])
+      const parsed = JSON.parse(output.stdout) as { status: string }
+
+      expect(parsed.status).toBe('ok')
+      expect(renamePane).toHaveBeenCalledWith('pane_1', 'Renamed shell')
+    } finally {
+      await close()
+    }
+  })
+
+  it('rejects ambiguous pane title targets', async () => {
+    const { url, close } = await startTestServer({
+      listTabs: () => ([
+        { id: 'tab_1', title: 'Alpha', activePaneId: 'pane_1' },
+        { id: 'tab_2', title: 'Beta', activePaneId: 'pane_2' },
+      ]),
+      listPanes: (tabId?: string) => {
+        if (tabId === 'tab_2') {
+          return [{ id: 'pane_2', index: 0, kind: 'terminal', terminalId: 'term_2', title: 'Shell' }]
+        }
+        return [{ id: 'pane_1', index: 0, kind: 'terminal', terminalId: 'term_1', title: 'Shell' }]
+      },
+    })
+    try {
+      const output = await runCliResult(url, ['select-pane', '-t', 'Shell'])
+
+      expect(output.code).toBe(1)
+      expect(output.stderr).toContain('pane target is ambiguous')
     } finally {
       await close()
     }
@@ -175,6 +264,249 @@ describe('cli e2e flow', () => {
         await fs.unlink(screenshotPath).catch(() => undefined)
       }
       await close()
+    }
+  })
+
+  it('renames the active tab when only a new name is provided', async () => {
+    const server = await startTestServerWithRealLayoutStore()
+    try {
+      const first = await runCliJson<{ data: { tabId: string } }>(server.url, ['new-tab', '-n', 'Backlog'])
+      const second = await runCliJson<{ data: { tabId: string } }>(server.url, ['new-tab', '-n', 'Active'])
+
+      const renamed = await runCli(server.url, ['rename-tab', 'Release prep'])
+
+      const snapshot = (server.layoutStore as any).snapshot
+      expect(renamed.stderr).toContain('active tab used')
+      expect(snapshot.activeTabId).toBe(second.data.tabId)
+      expect(snapshot.tabs.find((tab: any) => tab.id === second.data.tabId)?.title).toBe('Release prep')
+      expect(snapshot.tabs.find((tab: any) => tab.id === first.data.tabId)?.title).toBe('Backlog')
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('renames a non-active tab when a target id is provided', async () => {
+    const server = await startTestServerWithRealLayoutStore()
+    try {
+      const first = await runCliJson<{ data: { tabId: string } }>(server.url, ['new-tab', '-n', 'Backlog'])
+      const second = await runCliJson<{ data: { tabId: string } }>(server.url, ['new-tab', '-n', 'Active'])
+
+      await runCli(server.url, ['rename-tab', first.data.tabId, 'Release', 'board'])
+
+      const snapshot = (server.layoutStore as any).snapshot
+      expect(snapshot.activeTabId).toBe(second.data.tabId)
+      expect(snapshot.tabs.find((tab: any) => tab.id === first.data.tabId)?.title).toBe('Release board')
+      expect(snapshot.tabs.find((tab: any) => tab.id === second.data.tabId)?.title).toBe('Active')
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('renames the tab and panes in a create split rename flow', async () => {
+    const server = await startTestServerWithRealLayoutStore()
+    try {
+      const created = await runCliJson<{ data: { tabId: string; paneId: string } }>(server.url, [
+        'new-tab',
+        '-n',
+        'Workspace',
+        '--codex',
+        '--cwd',
+        process.cwd(),
+      ])
+      const tabId = created.data.tabId
+      const firstPaneId = created.data.paneId
+
+      const split = await runCliJson<{ data: { paneId: string } }>(server.url, [
+        'split-pane',
+        '-t',
+        firstPaneId,
+        '--editor',
+        '/tmp/example.txt',
+      ])
+      const secondPaneId = split.data.paneId
+
+      await runCli(server.url, ['rename-tab', '-t', tabId, '-n', 'Issue 166 work'])
+      await runCli(server.url, ['rename-pane', '-t', firstPaneId, '-n', 'Codex'])
+      await runCli(server.url, ['rename-pane', secondPaneId, 'Editor'])
+
+      const snapshot = (server.layoutStore as any).snapshot
+      expect(snapshot.tabs.find((tab: any) => tab.id === tabId)?.title).toBe('Issue 166 work')
+      expect(snapshot.paneTitles[tabId][firstPaneId]).toBe('Codex')
+      expect(snapshot.paneTitles[tabId][secondPaneId]).toBe('Editor')
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('renames the active pane when only a new name is provided', async () => {
+    const server = await startTestServerWithRealLayoutStore()
+    try {
+      const created = await runCliJson<{ data: { tabId: string; paneId: string } }>(server.url, [
+        'new-tab',
+        '-n',
+        'Workspace',
+        '--shell',
+        'system',
+      ])
+
+      const renamed = await runCli(server.url, ['rename-pane', 'Main shell'])
+
+      const snapshot = (server.layoutStore as any).snapshot
+      expect(renamed.stderr).toContain('active tab used')
+      expect(snapshot.paneTitles[created.data.tabId][created.data.paneId]).toBe('Main shell')
+      expect(snapshot.tabs.find((tab: any) => tab.id === created.data.tabId)?.title).toBe('Main shell')
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('lists and resolves derived pane titles without an explicit rename', async () => {
+    const server = await startTestServerWithRealLayoutStore()
+    try {
+      const created = await runCliJson<{ data: { tabId: string; paneId: string } }>(server.url, [
+        'new-tab',
+        '-n',
+        'Workspace',
+        '--codex',
+        '--cwd',
+        process.cwd(),
+      ])
+      const tabId = created.data.tabId
+      const firstPaneId = created.data.paneId
+
+      const split = await runCliJson<{ data: { paneId: string } }>(server.url, [
+        'split-pane',
+        '-t',
+        firstPaneId,
+        '--editor',
+        '/tmp/example.txt',
+      ])
+
+      const listed = await runCliJson<{ data: { panes: Array<{ id: string; title?: string }> } }>(server.url, [
+        'list-panes',
+        '--json',
+      ])
+      expect(listed.data.panes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: firstPaneId, title: 'Codex CLI' }),
+        expect.objectContaining({ id: split.data.paneId, title: 'example.txt' }),
+      ]))
+
+      const listedText = await runCli(server.url, ['list-panes'])
+      const listedRows = listedText.stdout.split('\n').filter(Boolean).map((line) => line.split('\t'))
+      expect(listedRows).toEqual(expect.arrayContaining([
+        [firstPaneId, '0', 'terminal', 'term_1'],
+        [split.data.paneId, '1', 'editor', ''],
+      ]))
+      expect(listedRows.every((row) => row.length === 4)).toBe(true)
+
+      const listedWithTitles = await runCli(server.url, ['list-panes', '--titles'])
+      expect(listedWithTitles.stdout).toContain('Codex CLI')
+      expect(listedWithTitles.stdout).toContain('example.txt')
+
+      await runCli(server.url, ['select-pane', '-t', 'example.txt'])
+
+      const snapshot = (server.layoutStore as any).snapshot
+      expect(snapshot.activePane[tabId]).toBe(split.data.paneId)
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('keeps title-based pane targeting aligned after swap-pane', async () => {
+    const server = await startTestServerWithRealLayoutStore()
+    try {
+      const created = await runCliJson<{ data: { tabId: string; paneId: string } }>(server.url, [
+        'new-tab',
+        '-n',
+        'Workspace',
+        '--codex',
+        '--cwd',
+        process.cwd(),
+      ])
+      const tabId = created.data.tabId
+      const firstPaneId = created.data.paneId
+
+      const split = await runCliJson<{ data: { paneId: string } }>(server.url, [
+        'split-pane',
+        '-t',
+        firstPaneId,
+        '--editor',
+        '/tmp/example.txt',
+      ])
+      const secondPaneId = split.data.paneId
+
+      await runCli(server.url, ['rename-pane', '-t', firstPaneId, '-n', 'Codex'])
+      await runCli(server.url, ['rename-pane', '-t', secondPaneId, '-n', 'Editor'])
+      await runCli(server.url, ['swap-pane', '-t', firstPaneId, '-s', secondPaneId])
+
+      const listed = await runCliJson<{ data: { panes: Array<{ id: string; title?: string }> } }>(server.url, [
+        'list-panes',
+        '--json',
+      ])
+      expect(listed.data.panes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: firstPaneId, title: 'Editor' }),
+        expect.objectContaining({ id: secondPaneId, title: 'Codex' }),
+      ]))
+
+      await runCli(server.url, ['select-pane', '-t', 'Editor'])
+
+      const snapshot = (server.layoutStore as any).snapshot
+      expect(snapshot.activePane[tabId]).toBe(firstPaneId)
+    } finally {
+      await server.close()
+    }
+  })
+
+  it('lists pane titles publicly and resolves pane targets by title', async () => {
+    const server = await startTestServerWithRealLayoutStore()
+    try {
+      const created = await runCliJson<{ data: { tabId: string; paneId: string } }>(server.url, [
+        'new-tab',
+        '-n',
+        'Workspace',
+        '--codex',
+        '--cwd',
+        process.cwd(),
+      ])
+      const tabId = created.data.tabId
+      const firstPaneId = created.data.paneId
+
+      const split = await runCliJson<{ data: { paneId: string } }>(server.url, [
+        'split-pane',
+        '-t',
+        firstPaneId,
+        '--editor',
+        '/tmp/example.txt',
+      ])
+      const secondPaneId = split.data.paneId
+
+      await runCli(server.url, ['rename-pane', '-t', secondPaneId, '-n', 'Editor notes'])
+
+      const listed = await runCliJson<{ data: { panes: Array<{ id: string; title?: string }> } }>(server.url, [
+        'list-panes',
+        '--json',
+      ])
+      expect(listed.data.panes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: secondPaneId, title: 'Editor notes' }),
+      ]))
+
+      const listedText = await runCli(server.url, ['list-panes'])
+      const listedRows = listedText.stdout.split('\n').filter(Boolean).map((line) => line.split('\t'))
+      expect(listedRows).toEqual(expect.arrayContaining([
+        [firstPaneId, '0', 'terminal', 'term_1'],
+        [secondPaneId, '1', 'editor', ''],
+      ]))
+      expect(listedRows.every((row) => row.length === 4)).toBe(true)
+
+      const listedWithTitles = await runCli(server.url, ['list-panes', '--titles'])
+      expect(listedWithTitles.stdout).toContain('Editor notes')
+
+      await runCli(server.url, ['select-pane', '-t', 'Editor notes'])
+
+      const snapshot = (server.layoutStore as any).snapshot
+      expect(snapshot.activePane[tabId]).toBe(secondPaneId)
+    } finally {
+      await server.close()
     }
   })
 })

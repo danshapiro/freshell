@@ -11,7 +11,7 @@ type Flags = Record<string, string | boolean>
 
 type TabSummary = { id: string; title?: string; activePaneId?: string }
 
-type PaneSummary = { id: string; index?: number; kind?: string; terminalId?: string }
+type PaneSummary = { id: string; index?: number; kind?: string; terminalId?: string; title?: string }
 
 const aliases: Record<string, string> = {
   'new-window': 'new-tab',
@@ -42,6 +42,42 @@ const getFlag = (flags: Flags, ...names: string[]) => {
   return undefined
 }
 
+function resolveRenameArgs(
+  flags: Flags,
+  args: string[],
+  targetFlagNames: string[],
+) {
+  const explicitTarget = getFlag(flags, ...targetFlagNames)
+  const explicitName = getFlag(flags, 'n', 'name', 'title')
+  const joinName = (parts: string[]) => parts.join(' ').trim()
+
+  if (typeof explicitName === 'string') {
+    return {
+      target: typeof explicitTarget === 'string' ? explicitTarget : args[0],
+      name: explicitName.trim(),
+    }
+  }
+
+  if (typeof explicitTarget === 'string') {
+    return {
+      target: explicitTarget,
+      name: joinName(args),
+    }
+  }
+
+  // Issue 166 intentionally adds active-target defaults for rename commands:
+  // a single positional argument is the new name for the active tab/pane.
+  if (args.length === 1) {
+    return { target: undefined, name: args[0].trim() }
+  }
+
+  if (args.length >= 2) {
+    return { target: args[0], name: joinName(args.slice(1)) }
+  }
+
+  return { target: undefined, name: '' }
+}
+
 const isTruthy = (value: unknown) => value === true || value === 'true' || value === '1' || value === 'yes'
 
 const unwrap = (response: any) => (response && typeof response === 'object' && 'data' in response ? response.data : response)
@@ -63,12 +99,12 @@ async function fetchPanes(client: ReturnType<typeof createHttpClient>, tabId?: s
 
 async function buildTargetContext(client: ReturnType<typeof createHttpClient>) {
   const { tabs, activeTabId } = await fetchTabs(client)
-  const panesByTab: Record<string, string[]> = {}
+  const panesByTab: Record<string, PaneSummary[]> = {}
   const paneInfoById: Record<string, PaneSummary> = {}
 
   for (const tab of tabs) {
     const panes = await fetchPanes(client, tab.id)
-    panesByTab[tab.id] = panes.map((p) => p.id)
+    panesByTab[tab.id] = panes
     for (const pane of panes) paneInfoById[pane.id] = pane
   }
 
@@ -82,7 +118,7 @@ async function resolvePaneTarget(client: ReturnType<typeof createHttpClient>, ta
 
   if (!target) {
     const fallbackTab = tabs.find((t) => t.id === effectiveActiveTabId) || tabs[0]
-    const paneId = fallbackTab?.activePaneId || (fallbackTab ? panesByTab[fallbackTab.id]?.[0] : undefined)
+    const paneId = fallbackTab?.activePaneId || (fallbackTab ? panesByTab[fallbackTab.id]?.[0]?.id : undefined)
     return { tab: fallbackTab, pane: paneId ? paneInfoById[paneId] : undefined, message: 'active tab used' }
   }
 
@@ -219,8 +255,7 @@ async function main() {
       return
     }
     case 'rename-tab': {
-      const target = (getFlag(flags, 't', 'target', 'tab') as string | undefined) || args[0]
-      const name = (getFlag(flags, 'n', 'name', 'title') as string | undefined) || args[1]
+      const { target, name } = resolveRenameArgs(flags, args, ['t', 'target', 'tab'])
       if (!name) {
         writeError('name required')
         process.exitCode = 1
@@ -288,6 +323,7 @@ async function main() {
     case 'list-panes': {
       const target = (getFlag(flags, 't', 'target', 'tab') as string | undefined) || undefined
       let tabId: string | undefined
+      const includeTitles = isTruthy(getFlag(flags, 'titles'))
       if (target) {
         const { tab } = await resolveTabTarget(client, target)
         tabId = tab?.id
@@ -298,7 +334,9 @@ async function main() {
         return
       }
       const panes = unwrap(res)?.panes || []
-      const lines = panes.map((pane: PaneSummary) => `${pane.id}\t${pane.index ?? ''}\t${pane.kind ?? ''}\t${pane.terminalId ?? ''}`)
+      const lines = panes.map((pane: PaneSummary) => includeTitles
+        ? `${pane.id}\t${pane.index ?? ''}\t${pane.kind ?? ''}\t${pane.terminalId ?? ''}\t${pane.title ?? ''}`
+        : `${pane.id}\t${pane.index ?? ''}\t${pane.kind ?? ''}\t${pane.terminalId ?? ''}`)
       writeText(formatList(lines))
       return
     }
@@ -314,6 +352,26 @@ async function main() {
       const res = await client.post(`/api/panes/${encodeURIComponent(resolved.pane.id)}/select`, {
         tabId: resolved.tab?.id,
       })
+      writeJson(res)
+      return
+    }
+    case 'rename-pane': {
+      const { target, name } = resolveRenameArgs(flags, args, ['t', 'target', 'pane'])
+      if (!name) {
+        writeError('name required')
+        process.exitCode = 1
+        return
+      }
+
+      const resolved = await resolvePaneTarget(client, target)
+      if (!resolved.pane?.id) {
+        writeError(resolved.message || 'pane not found')
+        process.exitCode = 1
+        return
+      }
+      if (resolved.message) writeError(resolved.message)
+
+      const res = await client.patch(`/api/panes/${encodeURIComponent(resolved.pane.id)}`, { name })
       writeJson(res)
       return
     }

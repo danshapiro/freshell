@@ -15,6 +15,7 @@ export const layoutMirrorMiddleware: Middleware = (store) => {
       layouts: state.panes.layouts,
       activePane: state.panes.activePane,
       paneTitles: state.panes.paneTitles || {},
+      paneTitleSetByUser: state.panes.paneTitleSetByUser || {},
     }
     const serialized = JSON.stringify(payload)
     if (serialized === lastPayload) return result

@@ -23,6 +23,7 @@ interface PaneProps {
   children: React.ReactNode
   isRenaming?: boolean
   renameValue?: string
+  renameError?: string
   onRenameChange?: (value: string) => void
   onRenameBlur?: () => void
   onRenameKeyDown?: (e: React.KeyboardEvent) => void
@@ -48,6 +49,7 @@ export default function Pane({
   children,
   isRenaming,
   renameValue,
+  renameError,
   onRenameChange,
   onRenameBlur,
   onRenameKeyDown,
@@ -95,12 +97,19 @@ export default function Pane({
             content={content!}
             isRenaming={isRenaming}
             renameValue={renameValue}
+            renameError={renameError}
             onRenameChange={onRenameChange}
             onRenameBlur={onRenameBlur}
             onRenameKeyDown={onRenameKeyDown}
             onDoubleClick={onDoubleClickTitle}
             onSearch={onSearch}
           />
+        </div>
+      )}
+
+      {renameError && (
+        <div className="border-b border-border bg-destructive/10 px-2 py-1 text-xs text-destructive" role="alert">
+          {renameError}
         </div>
       )}
 
