@@ -1,64 +1,74 @@
 import { Router } from 'express'
-
-export const MAX_BOOTSTRAP_PAYLOAD_BYTES = 12 * 1024
-
-export type ShellTasks = Record<string, boolean>
+import { MAX_BOOTSTRAP_PAYLOAD_BYTES, type BootstrapPayload } from '../shared/read-models.js'
 
 export interface ShellBootstrapRouterDeps {
-  getSettings: () => Promise<any>
-  getPlatform: () => Promise<any>
-  getShellTaskStatus: () => Promise<ShellTasks>
-  getPerfLogging: () => boolean
-  getConfigFallback: () => Promise<{ reason: string; backupExists: boolean } | undefined>
+  getSettings: () => Promise<unknown>
+  getPlatform: () => Promise<unknown>
+  getShellState?: () => Promise<BootstrapPayload['shell']>
+  getShellTaskStatus?: () => Promise<Record<string, boolean>>
+  getPerfState?: () => Promise<BootstrapPayload['perf'] | undefined>
+  getPerfLogging?: () => boolean | Promise<boolean>
+  getConfigFallback?: () => Promise<BootstrapPayload['configFallback'] | undefined>
 }
 
-type BootstrapPayload = {
-  settings: unknown
-  platform: unknown
-  shell: { authenticated: boolean; ready?: boolean; tasks?: Record<string, boolean> }
-  perf?: { logging: boolean }
-  configFallback?: { reason: string; backupExists: boolean }
-}
+export { MAX_BOOTSTRAP_PAYLOAD_BYTES }
 
 export function createShellBootstrapRouter(deps: ShellBootstrapRouterDeps): Router {
-  const { getSettings, getPlatform, getShellTaskStatus, getPerfLogging, getConfigFallback } = deps
   const router = Router()
 
   router.get('/bootstrap', async (_req, res) => {
-    const [settings, platform, tasks, configFallback] = await Promise.all([
-      getSettings(),
-      getPlatform(),
-      getShellTaskStatus(),
-      getConfigFallback(),
-    ])
+    try {
+      const [settings, platform, shell, perf, configFallback] = await Promise.all([
+        deps.getSettings(),
+        deps.getPlatform(),
+        (async () => {
+          if (deps.getShellState) {
+            return deps.getShellState()
+          }
+          const tasks = await deps.getShellTaskStatus?.()
+          return {
+            authenticated: true,
+            ...(tasks
+              ? {
+                  ready: Object.values(tasks).every(Boolean),
+                  tasks,
+                }
+              : {}),
+          }
+        })(),
+        (async () => {
+          if (deps.getPerfState) {
+            return deps.getPerfState()
+          }
+          if (deps.getPerfLogging === undefined) {
+            return undefined
+          }
+          return {
+            logging: await deps.getPerfLogging(),
+          }
+        })(),
+        deps.getConfigFallback?.() ?? Promise.resolve(undefined),
+      ])
 
-    const payload: BootstrapPayload = {
-      settings,
-      platform,
-      shell: {
-        authenticated: true,
-        ready: Object.values(tasks).every(Boolean),
-        tasks,
-      },
-      perf: { logging: !!getPerfLogging() },
-      ...(configFallback ? { configFallback } : {}),
-    }
-
-    // Enforce payload budget defensively by truncating large fields if ever added in future
-    // Current payload is small, so this is a soft guard.
-    const body = JSON.stringify(payload)
-    if (Buffer.byteLength(body, 'utf8') > MAX_BOOTSTRAP_PAYLOAD_BYTES) {
-      // If over budget, drop task details but preserve minimal shape
-      const trimmed: BootstrapPayload = {
-        ...payload,
-        shell: { authenticated: true, ready: payload.shell.ready },
+      const payload: BootstrapPayload = {
+        settings,
+        platform,
+        shell,
+        ...(perf ? { perf } : {}),
+        ...(configFallback ? { configFallback } : {}),
       }
-      return res.json(trimmed)
-    }
 
-    res.json(payload)
+      const payloadBytes = Buffer.byteLength(JSON.stringify(payload), 'utf8')
+      if (payloadBytes > MAX_BOOTSTRAP_PAYLOAD_BYTES) {
+        res.status(500).json({ error: 'Bootstrap payload exceeds budget' })
+        return
+      }
+
+      res.json(payload)
+    } catch {
+      res.status(500).json({ error: 'Bootstrap failed' })
+    }
   })
 
   return router
 }
-

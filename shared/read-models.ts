@@ -1,5 +1,15 @@
 import { z } from 'zod'
 
+export const MAX_BOOTSTRAP_PAYLOAD_BYTES = 12 * 1024
+
+export type BootstrapPayload = {
+  settings: unknown
+  platform: unknown
+  shell: { authenticated: boolean; ready?: boolean; tasks?: Record<string, boolean> }
+  perf?: { logging: boolean }
+  configFallback?: { reason: string; backupExists: boolean }
+}
+
 export const ReadModelPrioritySchema = z.enum(['visible', 'background'])
 
 export const SessionDirectoryQuerySchema = z.object({
