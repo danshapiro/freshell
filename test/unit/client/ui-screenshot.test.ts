@@ -1,6 +1,6 @@
+import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import fs from 'node:fs/promises'
 import { deflateSync } from 'node:zlib'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
@@ -26,8 +26,10 @@ vi.mock('../../../src/lib/screenshot-capture-env', () => ({
   suspendTerminalRenderersForScreenshot: vi.fn(async () => async () => {}),
 }))
 
-const CONTEXT_MENU_PROOF_PATH = path.join(os.tmpdir(), 'freshell-terminal-context-menu-proof.png')
+const CONTEXT_MENU_PROOF_BASENAME = 'freshell-terminal-context-menu-proof.png'
 const PNG_SIGNATURE_BYTES = [137, 80, 78, 71, 13, 10, 26, 10] as const
+let contextMenuProofPath = ''
+let contextMenuProofDir = ''
 
 function crc32(buffer: Buffer): number {
   let crc = 0xffffffff
@@ -179,11 +181,14 @@ describe('captureUiScreenshot iframe handling', () => {
   beforeEach(async () => {
     vi.clearAllMocks()
     document.body.innerHTML = ''
-    await fs.rm(CONTEXT_MENU_PROOF_PATH, { force: true })
+    contextMenuProofDir = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-terminal-context-menu-proof-'))
+    contextMenuProofPath = path.join(contextMenuProofDir, CONTEXT_MENU_PROOF_BASENAME)
   })
 
   afterEach(async () => {
-    await fs.rm(CONTEXT_MENU_PROOF_PATH, { force: true })
+    await fs.rm(contextMenuProofDir, { recursive: true, force: true })
+    contextMenuProofDir = ''
+    contextMenuProofPath = ''
   })
 
   it('captures same-origin iframe content into screenshot clone', async () => {
@@ -342,7 +347,7 @@ describe('captureUiScreenshot iframe handling', () => {
 
     const result = await captureUiScreenshot({ scope: 'view' }, createMenuRuntime(store) as any)
     expect(result.ok).toBe(true)
-    await fs.writeFile(CONTEXT_MENU_PROOF_PATH, Buffer.from(result.imageBase64!, 'base64'))
+    await fs.writeFile(contextMenuProofPath, Buffer.from(result.imageBase64!, 'base64'))
 
     expect(vi.mocked(html2canvas)).toHaveBeenCalledTimes(1)
     expect(vi.mocked(html2canvas).mock.calls[0]?.[0]).toBe(document.body)
@@ -358,7 +363,9 @@ describe('captureUiScreenshot iframe handling', () => {
       expect(node.querySelector('svg')).not.toBeNull()
     }
 
-    const artifact = await fs.readFile(CONTEXT_MENU_PROOF_PATH)
+    expect(path.basename(contextMenuProofPath)).toBe(CONTEXT_MENU_PROOF_BASENAME)
+
+    const artifact = await fs.readFile(contextMenuProofPath)
     expect(artifact.length).toBeGreaterThan(8)
     expect(Array.from(artifact.subarray(0, 8))).toEqual([...PNG_SIGNATURE_BYTES])
   })

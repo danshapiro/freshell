@@ -10,6 +10,7 @@ interface PaneProps {
   paneId: string
   isActive: boolean
   isOnlyPane: boolean
+  platform?: string | null
   title?: string
   metaLabel?: string
   metaTooltip?: string
@@ -35,6 +36,7 @@ export default function Pane({
   paneId,
   isActive,
   isOnlyPane: _isOnlyPane,
+  platform,
   title,
   metaLabel,
   metaTooltip,
@@ -57,7 +59,7 @@ export default function Pane({
   const showHeader = title !== undefined
   const handleMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
     if (event.button !== 0) return
-    if (event.ctrlKey) return
+    if (platform === 'darwin' && event.ctrlKey) return
     onFocus()
   }
 

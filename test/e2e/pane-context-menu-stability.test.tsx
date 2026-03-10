@@ -144,7 +144,7 @@ function createTwoPaneLayout(): PaneNode {
   }
 }
 
-function createStore(layout: PaneNode) {
+function createStore(layout: PaneNode, platform: string = 'linux') {
   return configureStore({
     reducer: {
       tabs: tabsReducer,
@@ -187,7 +187,7 @@ function createStore(layout: PaneNode) {
       },
       connection: {
         status: 'ready',
-        platform: 'linux',
+        platform,
         availableClis: {},
         featureFlags: {},
       },
@@ -282,7 +282,7 @@ describe('pane context menu stability (e2e)', () => {
   })
 
   it('keeps the pane menu open for a primary-button context-menu gesture on an inactive pane header', async () => {
-    const store = createStore(createTwoPaneLayout())
+    const store = createStore(createTwoPaneLayout(), 'darwin')
     const { container } = renderFlow(store)
 
     const header = await waitFor(() => {
@@ -304,6 +304,23 @@ describe('pane context menu stability (e2e)', () => {
     expect(screen.getByRole('menu')).toBeInTheDocument()
     expect(screen.getByRole('menuitem', { name: 'Refresh pane' })).toBeInTheDocument()
     expect(store.getState().panes.activePane['tab-1']).toBe('pane-1')
+  })
+
+  it('still activates an inactive pane on Ctrl+LeftClick for non-mac platforms', async () => {
+    const store = createStore(createTwoPaneLayout(), 'linux')
+    const { container } = renderFlow(store)
+
+    const header = await waitFor(() => {
+      const node = container.querySelector('[data-pane-id="pane-2"] [role="banner"]')
+      expect(node).not.toBeNull()
+      return node as HTMLElement
+    })
+
+    fireEvent.mouseDown(header, { button: 0, buttons: 1, ctrlKey: true })
+
+    await waitFor(() => {
+      expect(store.getState().panes.activePane['tab-1']).toBe('pane-2')
+    })
   })
 
   it('still activates an inactive pane on primary click', async () => {

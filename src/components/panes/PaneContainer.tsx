@@ -107,6 +107,7 @@ function resolvePaneRuntimeMeta(
 export default function PaneContainer({ tabId, node, hidden }: PaneContainerProps) {
   const dispatch = useAppDispatch()
   const activePane = useAppSelector((s) => s.panes.activePane[tabId])
+  const platform = useAppSelector((s) => s.connection?.platform ?? null)
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const tabTerminalId = tab?.terminalId
   const paneTitles = useAppSelector((s) => s.panes.paneTitles[tabId] ?? EMPTY_PANE_TITLES)
@@ -356,6 +357,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         paneId={node.id}
         isActive={activePane === node.id}
         isOnlyPane={isOnlyPane}
+        platform={platform}
         title={paneTitle}
         status={paneStatus}
         content={node.content}
