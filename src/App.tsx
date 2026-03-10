@@ -19,11 +19,12 @@ import { api, isApiUnauthorizedError, type VersionInfo } from '@/lib/api'
 import { getShareAction, ensureShareUrlToken } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { getSessionsForHello } from '@/lib/session-utils'
-import { setClientPerfEnabled } from '@/lib/perf-logger'
+import { installClientPerfAuditSink, setClientPerfEnabled } from '@/lib/perf-logger'
 import { applyLocalTerminalFontFamily } from '@/lib/terminal-fonts'
 import { handleUiCommand } from '@/lib/ui-commands'
 import { getAuthToken } from '@/lib/auth'
 import { installTestHarness } from '@/lib/test-harness'
+import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { store } from '@/store/store'
 import { useThemeEffect } from '@/hooks/useTheme'
 import { useMobile } from '@/hooks/useMobile'
@@ -134,7 +135,16 @@ export default function App() {
   const tabs = useAppSelector((s) => s.tabs.tabs)
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
   const settings = useAppSelector((s) => s.settings.settings)
+  const settingsLoaded = useAppSelector((s) => s.settings.loaded)
+  const connectionLastError = useAppSelector((s) => s.connection.lastError)
   const networkStatus = useAppSelector((s) => s.network.status)
+  const perfAuditEnabled = typeof window !== 'undefined'
+    && new URLSearchParams(window.location.search).has('perfAudit')
+  const perfAuditBridgeRef = useRef<ReturnType<typeof createPerfAuditBridge> | null>(null)
+
+  if (perfAuditEnabled && !perfAuditBridgeRef.current) {
+    perfAuditBridgeRef.current = createPerfAuditBridge()
+  }
 
   // Install test harness when URL has ?e2e=1 parameter (for Playwright E2E tests).
   // Uses useState initializer to run exactly once. The URL parameter approach is
@@ -169,6 +179,7 @@ export default function App() {
       () => { (ws as any).ws?.close() },
       // sendWsMessage: send a raw WS message for test cleanup (e.g., terminal.kill)
       (msg: unknown) => { ws.send(msg) },
+      () => perfAuditBridgeRef.current?.snapshot() ?? null,
     )
     return true
   })
@@ -196,6 +207,39 @@ export default function App() {
   const shareAccessUrl = networkStatus?.accessUrl
     ? ensureShareUrlToken(networkStatus.accessUrl, getAuthToken())
     : null
+  const authRequiredVisible = connectionLastError?.includes('Authentication failed') ?? false
+
+  useEffect(() => {
+    if (!perfAuditEnabled || !perfAuditBridgeRef.current) return
+    const bridge = perfAuditBridgeRef.current
+    bridge.mark('app.bootstrap_started')
+    installPerfAuditBridge(bridge)
+    setClientPerfEnabled(true, 'perf-audit')
+    installClientPerfAuditSink((entry) => {
+      bridge.addPerfEvent(entry)
+      if (
+        entry.event === 'perf.terminal_input_to_output_sample'
+        && typeof entry.latencyMs === 'number'
+      ) {
+        bridge.addTerminalLatencySample(entry.latencyMs)
+      }
+    })
+    return () => {
+      installPerfAuditBridge(null)
+      installClientPerfAuditSink(null)
+      setClientPerfEnabled(false, 'perf-audit')
+    }
+  }, [perfAuditEnabled])
+
+  useEffect(() => {
+    if (!perfAuditEnabled || !perfAuditBridgeRef.current || !settingsLoaded) return
+    perfAuditBridgeRef.current.mark('app.settings_loaded')
+  }, [perfAuditEnabled, settingsLoaded])
+
+  useEffect(() => {
+    if (!perfAuditEnabled || !perfAuditBridgeRef.current || !authRequiredVisible) return
+    perfAuditBridgeRef.current.mark('app.auth_required_visible')
+  }, [authRequiredVisible, perfAuditEnabled])
 
   // Keep this tab's Redux state in sync with persisted writes from other browser tabs.
   useEffect(() => {

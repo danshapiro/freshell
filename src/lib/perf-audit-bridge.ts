@@ -12,6 +12,8 @@ export type PerfAuditBridge = {
   snapshot: () => PerfAuditSnapshot
 }
 
+let installedPerfAuditBridge: PerfAuditBridge | null = null
+
 export function createPerfAuditBridge(): PerfAuditBridge {
   const milestones: Record<string, number> = {}
   const metadata: Record<string, unknown> = {}
@@ -42,4 +44,12 @@ export function createPerfAuditBridge(): PerfAuditBridge {
       }
     },
   }
+}
+
+export function installPerfAuditBridge(bridge: PerfAuditBridge | null): void {
+  installedPerfAuditBridge = bridge
+}
+
+export function getInstalledPerfAuditBridge(): PerfAuditBridge | null {
+  return installedPerfAuditBridge
 }
