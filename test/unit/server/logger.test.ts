@@ -19,6 +19,36 @@ describe("logger", () => {
 
   describe("log level configuration", () => {
     it(
+      "uses warn as the default non-debug log level",
+      async () => {
+        const { DEFAULT_NON_DEBUG_LOG_LEVEL } = await import("../../../server/logger")
+
+        expect(DEFAULT_NON_DEBUG_LOG_LEVEL).toBe("warn")
+      },
+      TEST_TIMEOUT_MS,
+    )
+
+    it(
+      "resolves warn when debug logging is disabled",
+      async () => {
+        const { resolveRuntimeLogLevel } = await import("../../../server/logger")
+
+        expect(resolveRuntimeLogLevel(false)).toBe("warn")
+      },
+      TEST_TIMEOUT_MS,
+    )
+
+    it(
+      "resolves debug when debug logging is enabled",
+      async () => {
+        const { resolveRuntimeLogLevel } = await import("../../../server/logger")
+
+        expect(resolveRuntimeLogLevel(true)).toBe("debug")
+      },
+      TEST_TIMEOUT_MS,
+    )
+
+    it(
       "defaults to debug in non-production",
       async () => {
         delete process.env.LOG_LEVEL

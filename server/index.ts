@@ -13,7 +13,7 @@ import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import rateLimit from 'express-rate-limit'
-import { logger, setLogLevel } from './logger.js'
+import { logger, resolveRuntimeLogLevel, setLogLevel } from './logger.js'
 import { requestLogger } from './request-logger.js'
 import { validateStartupSecurity, httpAuthMiddleware } from './auth.js'
 import { configStore } from './config-store.js'
@@ -326,7 +326,7 @@ async function main() {
 
   const applyDebugLogging = (enabled: boolean, source: string) => {
     const nextEnabled = !!enabled
-    setLogLevel(nextEnabled ? 'debug' : 'info')
+    setLogLevel(resolveRuntimeLogLevel(nextEnabled))
     setPerfLoggingEnabled(nextEnabled, source)
     wsHandler.broadcast({ type: 'perf.logging', enabled: nextEnabled })
   }

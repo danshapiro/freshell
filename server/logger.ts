@@ -13,6 +13,7 @@ const DEFAULT_DEBUG_LOG_FILE = 'server-debug'
 const DEFAULT_DEBUG_LOG_SUFFIX = '.jsonl'
 const DEFAULT_DEBUG_LOG_SIZE: SizeString = '10M'
 const DEFAULT_DEBUG_LOG_MAX_FILES = 5
+export const DEFAULT_NON_DEBUG_LOG_LEVEL: LevelWithSilent = 'warn'
 const SOURCE_ENTRY_MATCHERS = [/(^|\/)server\/index\.ts$/i, /(^|\/)server\/index\.js$/i]
 const DIST_ENTRY_MATCHERS = [/(^|\/)dist\/server\/index\.js$/i]
 type LogMode = 'development' | 'production'
@@ -182,6 +183,10 @@ export function createDebugFileStream(filePath: string, options: DebugFileStream
   return createStream(path.basename(filePath), { path: dir, size, maxFiles })
 }
 
+export function resolveRuntimeLogLevel(debugLoggingEnabled: boolean): LevelWithSilent {
+  return debugLoggingEnabled ? 'debug' : DEFAULT_NON_DEBUG_LOG_LEVEL
+}
+
 function createPinoOptions() {
   return {
     level,
@@ -236,7 +241,7 @@ export function createLogger(destination?: DestinationStream) {
   const consoleStream = createConsoleStream(shouldPrettyPrint)
   const consoleLogger = pino(createPinoOptions(), consoleStream)
   const streams: Array<{ stream: DestinationStream; level: LevelWithSilent }> = [
-    { stream: consoleStream, level: 'info' },
+    { stream: consoleStream, level: DEFAULT_NON_DEBUG_LOG_LEVEL },
   ]
 
   const debugLogPath = resolveDebugLogPath()
