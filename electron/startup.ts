@@ -33,6 +33,7 @@ export interface StartupContext {
   /** Electron's process.resourcesPath -- where extraResources live in production */
   resourcesPath?: string
   configDir: string  // ~/.freshell
+  platform: NodeJS.Platform
   createBrowserWindow: (options: Record<string, any>) => BrowserWindowLike
   createTray: () => void
   fetchHealthCheck?: (url: string) => Promise<boolean>
@@ -87,7 +88,7 @@ export async function runStartup(ctx: StartupContext): Promise<StartupResult> {
         await ctx.serverSpawner.start({
           spawn: {
             mode: 'production',
-            nodeBinary: path.join(resourcesPath, 'bundled-node', 'bin', 'node'),
+            nodeBinary: path.join(resourcesPath, 'bundled-node', 'bin', ctx.platform === 'win32' ? 'node.exe' : 'node'),
             serverEntry: path.join(resourcesPath, 'server', 'index.js'),
             nativeModulesDir: path.join(resourcesPath, 'bundled-node', 'native-modules'),
             serverNodeModulesDir: path.join(resourcesPath, 'server-node-modules'),

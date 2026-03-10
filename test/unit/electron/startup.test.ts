@@ -61,6 +61,7 @@ function createDefaultContext(overrides: Partial<StartupContext> = {}): StartupC
     port: 3001,
     resourcesPath: '/app/resources',
     configDir: '/home/user/.freshell',
+    platform: 'linux' as NodeJS.Platform,
     createBrowserWindow: vi.fn().mockReturnValue(createMockWindow()),
     createTray: vi.fn(),
     ...overrides,
@@ -167,6 +168,31 @@ describe('runStartup', () => {
       if (result.type === 'main') {
         expect(result.serverUrl).toBe('http://localhost:3001')
       }
+    })
+
+    it('uses node.exe on Windows platform', async () => {
+      const ctx = createDefaultContext({
+        isDev: false,
+        resourcesPath: 'C:\\Program Files\\Freshell\\resources',
+        platform: 'win32',
+      })
+      const result = await runStartup(ctx)
+      expect(result.type).toBe('main')
+      const startArgs = (ctx.serverSpawner.start as ReturnType<typeof vi.fn>).mock.calls[0][0]
+      expect(startArgs.spawn.nodeBinary).toMatch(/node\.exe$/)
+    })
+
+    it('uses node (no .exe) on Linux platform', async () => {
+      const ctx = createDefaultContext({
+        isDev: false,
+        resourcesPath: '/app/resources',
+        platform: 'linux',
+      })
+      const result = await runStartup(ctx)
+      expect(result.type).toBe('main')
+      const startArgs = (ctx.serverSpawner.start as ReturnType<typeof vi.fn>).mock.calls[0][0]
+      expect(startArgs.spawn.nodeBinary).toMatch(/\/node$/)
+      expect(startArgs.spawn.nodeBinary).not.toMatch(/\.exe$/)
     })
 
     it('throws if resourcesPath is missing in production mode', async () => {

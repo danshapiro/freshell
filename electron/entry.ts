@@ -98,6 +98,7 @@ async function main(): Promise<void> {
     port,
     resourcesPath,
     configDir,
+    platform: process.platform,
     createBrowserWindow: (options) => {
       const win = new BrowserWindow({
         ...options,
