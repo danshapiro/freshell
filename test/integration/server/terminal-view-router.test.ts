@@ -228,4 +228,47 @@ describe('terminal view router', () => {
       .set('x-auth-token', AUTH_TOKEN)
       .expect(404)
   })
+
+  it('serves scrollback windows separately from viewport snapshots', async () => {
+    registry.addTerminal({
+      terminalId: 'term-scrollback',
+      rows: 2,
+    })
+
+    registry.emitOutput('term-scrollback', 'alpha\nbeta\ngamma\ndelta')
+
+    const response = await request(app)
+      .get('/api/terminals/term-scrollback/scrollback?cursor=1&limit=2')
+      .set('x-auth-token', AUTH_TOKEN)
+      .expect(200)
+
+    expect(response.body).toEqual({
+      items: [
+        { line: 1, text: 'beta' },
+        { line: 2, text: 'gamma' },
+      ],
+      nextCursor: '3',
+    })
+  })
+
+  it('keeps terminal search server-side and paged', async () => {
+    registry.addTerminal({
+      terminalId: 'term-search',
+      rows: 3,
+    })
+
+    registry.emitOutput('term-search', 'error one\nok line\nerror two')
+
+    const response = await request(app)
+      .get('/api/terminals/term-search/search?query=error&cursor=1&limit=1')
+      .set('x-auth-token', AUTH_TOKEN)
+      .expect(200)
+
+    expect(response.body).toEqual({
+      matches: [
+        { line: 2, column: 0, text: 'error two' },
+      ],
+      nextCursor: null,
+    })
+  })
 })

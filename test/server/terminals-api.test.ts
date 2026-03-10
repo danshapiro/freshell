@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { EventEmitter } from 'node:events'
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest'
 import express, { type Express } from 'express'
 import request from 'supertest'
@@ -40,8 +41,20 @@ import { httpAuthMiddleware } from '../../server/auth'
 import { configStore } from '../../server/config-store'
 import { createTerminalsRouter } from '../../server/terminals-router'
 
+class FakeBuffer {
+  private chunks: string[] = []
+
+  append(chunk: string) {
+    this.chunks.push(chunk)
+  }
+
+  snapshot() {
+    return this.chunks.join('')
+  }
+}
+
 /** Fake registry that returns controlled terminal data without spawning real PTYs */
-class FakeRegistry {
+class FakeRegistry extends EventEmitter {
   private terminals: Array<{
     terminalId: string
     title: string
@@ -52,6 +65,11 @@ class FakeRegistry {
     status: 'running' | 'exited'
     hasClients: boolean
     cwd?: string
+    cols: number
+    rows: number
+    clients: Set<string>
+    pty: { pid: number }
+    buffer: FakeBuffer
   }> = []
 
   addTerminal(overrides: Partial<{
@@ -61,7 +79,11 @@ class FakeRegistry {
     mode: 'shell' | 'claude' | 'codex'
     status: 'running' | 'exited'
     cwd?: string
+    cols: number
+    rows: number
+    pid: number
   }> = {}) {
+    const buffer = new FakeBuffer()
     const terminal = {
       terminalId: overrides.terminalId || `term_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
       title: overrides.title || 'Shell',
@@ -72,6 +94,11 @@ class FakeRegistry {
       status: overrides.status || 'running',
       hasClients: false,
       cwd: overrides.cwd || '/home/user',
+      cols: overrides.cols || 120,
+      rows: overrides.rows || 30,
+      clients: new Set<string>(),
+      pty: { pid: overrides.pid || 4242 },
+      buffer,
     }
     this.terminals.push(terminal)
     return terminal
@@ -99,6 +126,13 @@ class FakeRegistry {
     const terminal = this.terminals.find(t => t.terminalId === terminalId)
     if (terminal) terminal.description = description
     return !!terminal
+  }
+
+  emitOutput(terminalId: string, data: string) {
+    const terminal = this.terminals.find(t => t.terminalId === terminalId)
+    terminal?.buffer.append(data)
+    if (terminal) terminal.lastActivityAt += 1
+    this.emit('terminal.output.raw', { terminalId, data, at: Date.now() })
   }
 }
 
@@ -361,6 +395,40 @@ describe('Terminals API', () => {
         ],
         nextCursor: expect.any(String),
         revision: expect.any(Number),
+      })
+    })
+
+    it('keeps scrollback and search on separate server-owned routes', async () => {
+      registry.addTerminal({
+        terminalId: 'term_view',
+        title: 'Searchable terminal',
+        mode: 'shell',
+      })
+      registry.emitOutput('term_view', 'alpha\nbeta\nalpha')
+
+      const scrollback = await request(app)
+        .get('/api/terminals/term_view/scrollback?limit=2')
+        .set('x-auth-token', AUTH_TOKEN)
+        .expect(200)
+
+      expect(scrollback.body).toEqual({
+        items: [
+          { line: 0, text: 'alpha' },
+          { line: 1, text: 'beta' },
+        ],
+        nextCursor: '2',
+      })
+
+      const search = await request(app)
+        .get('/api/terminals/term_view/search?query=alpha&limit=1')
+        .set('x-auth-token', AUTH_TOKEN)
+        .expect(200)
+
+      expect(search.body).toEqual({
+        matches: [
+          { line: 0, column: 0, text: 'alpha' },
+        ],
+        nextCursor: '1',
       })
     })
   })

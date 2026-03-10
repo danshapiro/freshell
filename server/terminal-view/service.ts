@@ -3,6 +3,8 @@ import { TerminalViewMirror } from './mirror.js'
 import type {
   TerminalDirectoryItem,
   TerminalDirectoryPage,
+  TerminalScrollbackPage,
+  TerminalSearchPage,
   TerminalViewService,
   TerminalViewportRuntime,
 } from './types.js'
@@ -175,6 +177,24 @@ export function createTerminalViewService(deps: TerminalViewServiceDeps): Termin
       const record = deps.registry.get(terminalId)
       if (!record) return null
       return ensureMirror(record).getViewportSnapshot()
+    },
+
+    async getScrollbackPage({ terminalId, cursor, limit }): Promise<TerminalScrollbackPage | null> {
+      const record = deps.registry.get(terminalId)
+      if (!record) return null
+      return ensureMirror(record).getScrollbackPage({
+        cursor: cursor !== undefined ? Number(cursor) : undefined,
+        limit,
+      })
+    },
+
+    async searchTerminal({ terminalId, query, cursor, limit }): Promise<TerminalSearchPage | null> {
+      const record = deps.registry.get(terminalId)
+      if (!record) return null
+      return ensureMirror(record).search(query, {
+        cursor: cursor !== undefined ? Number(cursor) : undefined,
+        limit,
+      })
     },
   }
 }

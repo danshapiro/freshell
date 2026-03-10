@@ -1,5 +1,10 @@
 import { ReplayRing, type ReplayFrame } from '../terminal-stream/replay-ring.js'
-import type { TerminalViewportRuntime, TerminalViewportSnapshot } from './types.js'
+import type {
+  TerminalSearchPage,
+  TerminalViewportRuntime,
+  TerminalViewportSnapshot,
+  TerminalScrollbackPage,
+} from './types.js'
 
 const ANSI_ESCAPE_PATTERN = /\u001B\[[0-9;?]*[ -/]*[@-~]/gu
 
@@ -86,6 +91,45 @@ export class TerminalViewMirror {
       rows: this.rows,
       tailSeq: this.replayRing.headSeq(),
       runtime: { ...this.runtime },
+    }
+  }
+
+  getScrollbackPage(options: { cursor?: number; limit?: number } = {}): TerminalScrollbackPage {
+    const cursor = options.cursor ?? 0
+    const limit = options.limit ?? this.rows
+    const slice = this.lines.slice(cursor, cursor + limit)
+
+    return {
+      items: slice.map((text, index) => ({
+        line: cursor + index,
+        text,
+      })),
+      nextCursor: cursor + limit < this.lines.length ? String(cursor + limit) : null,
+    }
+  }
+
+  search(query: string, options: { cursor?: number; limit?: number } = {}): TerminalSearchPage {
+    const cursor = options.cursor ?? 0
+    const limit = options.limit ?? 50
+    const normalizedQuery = query.toLowerCase()
+    const matches: TerminalSearchPage['matches'] = []
+
+    for (let lineIndex = cursor; lineIndex < this.lines.length; lineIndex += 1) {
+      if (matches.length >= limit) break
+      const line = this.lines[lineIndex]
+      const column = line.toLowerCase().indexOf(normalizedQuery)
+      if (column === -1) continue
+      matches.push({
+        line: lineIndex,
+        column,
+        text: line,
+      })
+    }
+
+    const lastLine = matches.at(-1)?.line
+    return {
+      matches,
+      nextCursor: lastLine !== undefined && lastLine + 1 < this.lines.length ? String(lastLine + 1) : null,
     }
   }
 }

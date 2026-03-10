@@ -36,8 +36,31 @@ export type TerminalViewportSnapshot = {
   runtime: TerminalViewportRuntime
 }
 
+export type TerminalScrollbackItem = {
+  line: number
+  text: string
+}
+
+export type TerminalScrollbackPage = {
+  items: TerminalScrollbackItem[]
+  nextCursor: string | null
+}
+
+export type TerminalSearchMatch = {
+  line: number
+  column: number
+  text: string
+}
+
+export type TerminalSearchPage = {
+  matches: TerminalSearchMatch[]
+  nextCursor: string | null
+}
+
 export type TerminalViewService = {
   listTerminalDirectory: () => Promise<TerminalDirectoryItem[]>
   getTerminalDirectoryPage: (query: TerminalDirectoryQuery) => Promise<TerminalDirectoryPage>
   getViewportSnapshot: (input: { terminalId: string }) => Promise<TerminalViewportSnapshot | null>
+  getScrollbackPage: (input: { terminalId: string; cursor?: string; limit?: number }) => Promise<TerminalScrollbackPage | null>
+  searchTerminal: (input: { terminalId: string; query: string; cursor?: string; limit?: number }) => Promise<TerminalSearchPage | null>
 }

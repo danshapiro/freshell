@@ -126,4 +126,19 @@ describe('ReplayRing', () => {
     expect(replay.frames[0].bytes).toBeLessThanOrEqual(4)
     expect(replay.frames[0].data).toBe('\uFFFDB')
   })
+
+  it('keeps the current head anchor stable after older frames overflow out of the replay window', () => {
+    const ring = new ReplayRing(3)
+    ring.append('a')
+    ring.append('b')
+    ring.append('c')
+    ring.append('d')
+
+    expect(ring.headSeq()).toBe(4)
+    expect(ring.tailSeq()).toBe(2)
+
+    const replay = ring.replaySince(ring.headSeq())
+    expect(replay.frames).toEqual([])
+    expect(replay.missedFromSeq).toBeUndefined()
+  })
 })

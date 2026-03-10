@@ -4,7 +4,11 @@ import { cleanString } from './utils.js'
 import { logger } from './logger.js'
 import { cascadeTerminalRenameToSession } from './rename-cascade.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
-import { TerminalDirectoryQuerySchema } from '../shared/read-models.js'
+import {
+  TerminalDirectoryQuerySchema,
+  TerminalScrollbackQuerySchema,
+  TerminalSearchQuerySchema,
+} from '../shared/read-models.js'
 import { createTerminalViewService } from './terminal-view/service.js'
 import type { TerminalViewService } from './terminal-view/types.js'
 
@@ -87,6 +91,80 @@ export function createTerminalsRouter(deps: TerminalsRouterDeps): Router {
     }
 
     res.json(snapshot)
+  })
+
+  router.get('/:terminalId/scrollback', async (req, res) => {
+    const parsed = z.object({
+      terminalId: z.string().min(1),
+      cursor: z.string().optional(),
+      limit: z.coerce.number().optional(),
+    }).safeParse({
+      terminalId: req.params.terminalId,
+      cursor: typeof req.query.cursor === 'string' ? req.query.cursor : undefined,
+      limit: typeof req.query.limit === 'string' ? req.query.limit : undefined,
+    })
+
+    const query = TerminalScrollbackQuerySchema.safeParse({
+      cursor: parsed.success ? parsed.data.cursor : undefined,
+      limit: parsed.success ? parsed.data.limit : undefined,
+    })
+
+    if (!parsed.success || !query.success) {
+      return res.status(400).json({
+        error: 'Invalid request',
+        details: [...(!parsed.success ? parsed.error.issues : []), ...(!query.success ? query.error.issues : [])],
+      })
+    }
+
+    const page = await terminalViewService.getScrollbackPage({
+      terminalId: parsed.data.terminalId,
+      cursor: query.data.cursor,
+      limit: query.data.limit,
+    })
+    if (!page) {
+      return res.status(404).json({ error: 'Terminal not found' })
+    }
+
+    res.json(page)
+  })
+
+  router.get('/:terminalId/search', async (req, res) => {
+    const parsed = z.object({
+      terminalId: z.string().min(1),
+      query: z.string().optional(),
+      cursor: z.string().optional(),
+      limit: z.coerce.number().optional(),
+    }).safeParse({
+      terminalId: req.params.terminalId,
+      query: typeof req.query.query === 'string' ? req.query.query : undefined,
+      cursor: typeof req.query.cursor === 'string' ? req.query.cursor : undefined,
+      limit: typeof req.query.limit === 'string' ? req.query.limit : undefined,
+    })
+
+    const query = TerminalSearchQuerySchema.safeParse({
+      query: parsed.success ? parsed.data.query : undefined,
+      cursor: parsed.success ? parsed.data.cursor : undefined,
+      limit: parsed.success ? parsed.data.limit : undefined,
+    })
+
+    if (!parsed.success || !query.success) {
+      return res.status(400).json({
+        error: 'Invalid request',
+        details: [...(!parsed.success ? parsed.error.issues : []), ...(!query.success ? query.error.issues : [])],
+      })
+    }
+
+    const page = await terminalViewService.searchTerminal({
+      terminalId: parsed.data.terminalId,
+      query: query.data.query,
+      cursor: query.data.cursor,
+      limit: query.data.limit,
+    })
+    if (!page) {
+      return res.status(404).json({ error: 'Terminal not found' })
+    }
+
+    res.json(page)
   })
 
   router.patch('/:terminalId', async (req, res) => {
