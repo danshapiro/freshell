@@ -160,7 +160,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
       })
       if (controller.signal.aborted) return
 
-      const nextProjects = Array.isArray(response) ? response : (response.projects ?? [])
+      const nextProjects = Array.isArray(response) ? response : (response?.projects ?? [])
       const projects = append
         ? mergeProjects(windowState?.projects ?? [], nextProjects)
         : nextProjects
