@@ -11,7 +11,6 @@ import TerminalView from '@/components/TerminalView'
 
 const wsHarness = vi.hoisted(() => {
   const handlers = new Set<(msg: any) => void>()
-  const durationSamples: number[] = []
   const latestAttachRequestIdByTerminal = new Map<string, string>()
 
   const withCurrentAttachRequestId = (msg: any) => {
@@ -37,21 +36,12 @@ const wsHarness = vi.hoisted(() => {
     emit(msg: any) {
       const normalized = withCurrentAttachRequestId(msg)
       for (const handler of handlers) {
-        const startedAt = performance.now()
         handler(normalized)
-        durationSamples.push(performance.now() - startedAt)
       }
     },
     reset() {
       handlers.clear()
-      durationSamples.length = 0
       latestAttachRequestIdByTerminal.clear()
-    },
-    clearDurations() {
-      durationSamples.length = 0
-    },
-    durations() {
-      return [...durationSamples]
     },
     rememberAttach(msg: any) {
       if (
@@ -199,7 +189,6 @@ describe('terminal console violations regression (e2e)', () => {
     wsHarness.send.mockImplementation((msg: any) => {
       wsHarness.rememberAttach(msg)
     })
-    wsHarness.clearDurations()
     terminalInstances.length = 0
     rafCallbacks = []
     rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
@@ -251,15 +240,13 @@ describe('terminal console violations regression (e2e)', () => {
 
     terminalInstances[0].write.mockClear()
     terminalInstances[1].write.mockClear()
-    wsHarness.clearDurations()
 
     wsHarness.emit({ type: 'terminal.output', terminalId: 'term-1', seqStart: 2, seqEnd: 2, data: 'A' })
     wsHarness.emit({ type: 'terminal.output', terminalId: 'term-1', seqStart: 3, seqEnd: 3, data: 'B' })
     wsHarness.emit({ type: 'terminal.output', terminalId: 'term-1', seqStart: 4, seqEnd: 4, data: 'C' })
 
     expect(terminalInstances[0].write).not.toHaveBeenCalled()
-    const wsHandlerDurationSamples = wsHarness.durations()
-    expect(wsHandlerDurationSamples.some((ms) => ms > 30)).toBe(false)
+    expect(rafCallbacks).toHaveLength(1)
 
     flushRafQueue(rafCallbacks)
     expect(terminalInstances[0].write).toHaveBeenCalled()
