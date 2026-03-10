@@ -26,6 +26,7 @@ import { consumeTerminalRestoreRequestId, addTerminalRestoreRequestId } from '@/
 import { isTerminalPasteShortcut } from '@/lib/terminal-input-policy'
 import { clearTerminalCursor, loadTerminalCursor, saveTerminalCursor } from '@/lib/terminal-cursor'
 import { paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
+import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import {
   beginAttach,
   createAttachSeqState,
@@ -226,6 +227,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const lastTapAtRef = useRef(0)
   const lastTapPointRef = useRef<{ x: number; y: number } | null>(null)
   const tapCountRef = useRef(0)
+  const terminalFirstOutputMarkedRef = useRef(false)
 
   // Extract terminal-specific fields (safe because we check kind later)
   const isTerminal = paneContent.kind === 'terminal'
@@ -1450,6 +1452,20 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
           const raw = msg.data || ''
           const mode = contentRef.current?.mode || 'shell'
           handleTerminalOutput(raw, mode, tid)
+          if (
+            raw.length > 0
+            && !terminalFirstOutputMarkedRef.current
+            && activeTabId === tabId
+            && activePaneId === paneId
+            && !hiddenRef.current
+          ) {
+            getInstalledPerfAuditBridge()?.mark('terminal.first_output', {
+              tabId,
+              paneId,
+              terminalId: tid,
+            })
+            terminalFirstOutputMarkedRef.current = true
+          }
           applySeqState(frameDecision.state, { terminalId: tid, persistCursor: true })
           const completedAttachOnFrame = !frameDecision.state.pendingReplay
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
