@@ -97,12 +97,13 @@ The landing is complete only when all of the following are true:
    - run any listed grep or smoke proof for that seam
    - commit a green state
 2. Every task ends green on its named lane. Do not commit red states.
-3. Work from the current worktree state. If a listed seam already partially exists, tighten or replace it instead of re-creating it.
-4. If a listed test file does not exist yet, create it in the task that needs it. Do not silently swap to a different file without updating the plan.
-5. Finish existing seams instead of creating parallel route stacks, schedulers, or telemetry channels.
-6. If a later full-suite run fails, fix the narrowest real defect, add the missing regression if needed, commit the fix, and restart the full gate.
-7. Generated audit artifacts under `artifacts/perf/` are never committed.
-8. All later scenario and integration tests must reuse the shared harness modules from Task 1. Do not create ad hoc websocket stubs, route fixtures, scheduler fakes, or app boot shims once the shared harness exists.
+3. If Step 1 and Step 2 show that a named task actually contains multiple independently provable seams, stop before implementation and split it into consecutive child tasks. Each child task must keep the same ordering, write its own failing test, run its own narrow lane, prove green, run any listed grep or smoke proof, and commit separately. Do not batch the child seams back into one implementation commit, and do not let a split move consumer cutover behind hard-delete cleanup.
+4. Work from the current worktree state. If a listed seam already partially exists, tighten or replace it instead of re-creating it.
+5. If a listed test file does not exist yet, create it in the task that needs it. Do not silently swap to a different file without updating the plan.
+6. Finish existing seams instead of creating parallel route stacks, schedulers, or telemetry channels.
+7. If a later full-suite run fails, fix the narrowest real defect, add the missing regression if needed, commit the fix, and restart the full gate.
+8. Generated audit artifacts under `artifacts/perf/` are never committed.
+9. All later scenario and integration tests must reuse the shared harness modules from Task 1. Do not create ad hoc websocket stubs, route fixtures, scheduler fakes, or app boot shims once the shared harness exists.
 
 ## Files That Matter
 
@@ -968,6 +969,13 @@ git commit -m "feat(agent-chat): restore from snapshots and visible timeline win
 - Modify: `server/terminal-view/types.ts`
 - Modify: `server/terminal-view/mirror.ts`
 
+**Pre-approved split if the red proof exposes multiple seams:**
+
+1. `Task 13A`: terminal directory plus viewport contract (`test/integration/server/terminal-view-router.test.ts`, `test/server/terminals-api.test.ts`, `test/unit/server/terminal-view/mirror.test.ts`, `server/index.ts`, `server/terminals-router.ts`, `server/terminal-view/service.ts`, `server/terminal-view/types.ts`, `server/terminal-view/mirror.ts`)
+2. `Task 13B`: terminal scrollback plus search plus replay-anchor determinism (`test/integration/server/terminal-view-router.test.ts`, `test/server/terminals-api.test.ts`, `test/unit/server/terminal-stream/replay-ring.test.ts`, `server/index.ts`, `server/terminals-router.ts`, `server/terminal-view/service.ts`, `server/terminal-view/types.ts`, `server/terminal-view/mirror.ts`)
+
+If the split is used, run `Task 13A` fully green before starting `Task 13B`.
+
 **Step 1: Write the failing terminal route tests**
 
 Cover:
@@ -1299,6 +1307,13 @@ git commit -m "feat(scheduler): enforce shared visible-first lane ordering"
 - Modify: `server/terminals-router.ts`
 - Modify: `src/lib/perf-logger.ts`
 
+**Pre-approved split if the red proof exposes multiple seams:**
+
+1. `Task 18A`: enforce payload ceilings, realtime backpressure, and bounded queue behavior (`test/unit/server/terminal-stream/client-output-queue.test.ts`, `test/unit/server/ws-handler-backpressure.test.ts`, `test/integration/server/bootstrap-router.test.ts`, `test/integration/server/session-directory-router.test.ts`, `test/integration/server/terminal-view-router.test.ts`, `server/terminal-stream/client-output-queue.ts`, `server/ws-handler.ts`, `server/shell-bootstrap-router.ts`, `server/sessions-router.ts`, `server/terminals-router.ts`)
+2. `Task 18B`: wire audit-facing request and perf instrumentation through the existing logger seams (`test/unit/server/request-logger.test.ts`, `test/unit/server/perf-logger.test.ts`, `test/unit/client/lib/perf-logger.test.ts`, `server/request-logger.ts`, `server/perf-logger.ts`, `src/lib/perf-logger.ts`)
+
+If the split is used, keep the shared budget constants and logger seams from this task, finish `Task 18A` green first, then complete `Task 18B`, and leave Tasks 19 and 20 as the first destructive cleanup.
+
 **Step 1: Write the failing budget and instrumentation tests**
 
 Cover:
@@ -1561,7 +1576,7 @@ Expected: source changes only if Step 1 through Step 3 required a real fix; `art
 ## Notes For The Executor
 
 1. Prefer deletion over compatibility shims. The previous regression happened because both the new and old transport paths were active at landing.
-2. Keep temporary coexistence only long enough to switch the next consumer. Tasks 18 and 19 are the non-negotiable hard-delete phase.
+2. Keep temporary coexistence only long enough to switch the next consumer. Tasks 19 and 20 are the non-negotiable hard-delete phase.
 3. When a test encodes legacy behavior that should not survive, rewrite or delete it in the same task that removes the runtime path.
 4. Do not create “temporary” fallbacks for offscreen hydration, terminal metadata snapshots, bulk session payloads, or `sdk.history`.
 5. Do not create no-op commits. Commit only green states with real code or test changes.
