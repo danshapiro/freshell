@@ -44,7 +44,8 @@
     "test:e2e:headed": "playwright test --config test/e2e-browser/playwright.config.ts --headed",
     "test:e2e:update-snapshots": "playwright test --config test/e2e-browser/playwright.config.ts --update-snapshots",
     "test:e2e:debug": "playwright test --config test/e2e-browser/playwright.config.ts --debug",
-    "test:e2e:helpers": "vitest run --config test/e2e-browser/vitest.config.ts"
+    "test:e2e:helpers": "vitest run --config test/e2e-browser/vitest.config.ts",
+    "perf:audit:visible-first": "PORT=3311 npm run build && tsx scripts/visible-first-audit.ts"
   },
   "dependencies": {
     "@ai-sdk/google": "^3.0.29",
