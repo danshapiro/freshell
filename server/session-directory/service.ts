@@ -62,18 +62,19 @@ function compareItems(a: SessionDirectoryItem, b: SessionDirectoryItem): number 
 
 function applySearch(item: SessionDirectoryItem, queryText: string): SessionDirectoryItem | null {
   const normalizedQuery = queryText.toLowerCase()
-  const searchable = [
-    item.title,
-    item.summary,
-    item.firstUserMessage,
-  ].filter((value): value is string => typeof value === 'string' && value.length > 0)
+  const searchable: Array<[SessionDirectoryItem['matchedIn'], string | undefined]> = [
+    ['title', item.title],
+    ['summary', item.summary],
+    ['firstUserMessage', item.firstUserMessage],
+  ]
 
-  const match = searchable.find((value) => value.toLowerCase().includes(normalizedQuery))
-  if (!match) return null
+  const match = searchable.find(([, value]) => typeof value === 'string' && value.toLowerCase().includes(normalizedQuery))
+  if (!match || !match[1]) return null
 
   return {
     ...item,
-    snippet: extractSnippet(match, queryText, 40).slice(0, 140),
+    matchedIn: match[0],
+    snippet: extractSnippet(match[1], queryText, 40).slice(0, 140),
   }
 }
 

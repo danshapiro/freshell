@@ -11,6 +11,7 @@ export type SessionDirectoryItem = {
   title?: string
   summary?: string
   snippet?: string
+  matchedIn?: 'title' | 'summary' | 'firstUserMessage'
   updatedAt: number
   createdAt?: number
   archived?: boolean
