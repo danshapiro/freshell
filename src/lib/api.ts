@@ -3,11 +3,27 @@ import { getClientPerfConfig, isClientPerfLoggingEnabled, logClientPerf } from '
 import { getAuthToken } from '@/lib/auth'
 import { sanitizeSessionLocators } from '@/lib/session-utils'
 import type { SessionLocator } from '@/store/paneTypes'
+import {
+  AgentTimelinePageQuerySchema,
+  SessionDirectoryQuerySchema,
+  TerminalDirectoryQuerySchema,
+  TerminalScrollbackQuerySchema,
+  TerminalSearchQuerySchema,
+  type AgentTimelinePageQuery,
+  type SessionDirectoryQuery,
+  type TerminalDirectoryQuery,
+  type TerminalScrollbackQuery,
+  type TerminalSearchQuery,
+} from '@shared/read-models'
 
 export type ApiError = {
   status: number
   message: string
   details?: unknown
+}
+
+export type ApiRequestOptions = {
+  signal?: AbortSignal
 }
 
 export function isApiUnauthorizedError(error: unknown): error is ApiError {
@@ -108,21 +124,133 @@ async function request<T = any>(path: string, options: RequestInit = {}): Promis
 }
 
 export const api = {
-  get<T = any>(path: string): Promise<T> {
-    return request<T>(path)
+  get<T = any>(path: string, options: ApiRequestOptions = {}): Promise<T> {
+    return request<T>(path, options)
   },
-  post<T = any>(path: string, body: unknown): Promise<T> {
-    return request<T>(path, { method: 'POST', body: JSON.stringify(body) })
+  post<T = any>(path: string, body: unknown, options: ApiRequestOptions = {}): Promise<T> {
+    return request<T>(path, { ...options, method: 'POST', body: JSON.stringify(body) })
   },
-  patch<T = any>(path: string, body: unknown): Promise<T> {
-    return request<T>(path, { method: 'PATCH', body: JSON.stringify(body) })
+  patch<T = any>(path: string, body: unknown, options: ApiRequestOptions = {}): Promise<T> {
+    return request<T>(path, { ...options, method: 'PATCH', body: JSON.stringify(body) })
   },
-  put<T = any>(path: string, body: unknown): Promise<T> {
-    return request<T>(path, { method: 'PUT', body: JSON.stringify(body) })
+  put<T = any>(path: string, body: unknown, options: ApiRequestOptions = {}): Promise<T> {
+    return request<T>(path, { ...options, method: 'PUT', body: JSON.stringify(body) })
   },
-  delete<T = any>(path: string): Promise<T> {
-    return request<T>(path, { method: 'DELETE' })
+  delete<T = any>(path: string, options: ApiRequestOptions = {}): Promise<T> {
+    return request<T>(path, { ...options, method: 'DELETE' })
   },
+}
+
+function buildQueryString(entries: Array<[string, string | number | undefined]>): string {
+  const params = new URLSearchParams()
+  for (const [key, value] of entries) {
+    if (value === undefined) continue
+    params.set(key, String(value))
+  }
+  const query = params.toString()
+  return query.length > 0 ? `?${query}` : ''
+}
+
+export async function getBootstrap(options: ApiRequestOptions = {}): Promise<any> {
+  return api.get('/api/bootstrap', options)
+}
+
+export async function getSessionDirectoryPage(
+  query: SessionDirectoryQuery,
+  options: ApiRequestOptions = {},
+): Promise<any> {
+  const parsed = SessionDirectoryQuerySchema.parse(query)
+  return api.get(
+    `/api/session-directory${buildQueryString([
+      ['query', parsed.query],
+      ['cursor', parsed.cursor],
+      ['priority', parsed.priority],
+      ['revision', parsed.revision],
+      ['limit', parsed.limit],
+    ])}`,
+    options,
+  )
+}
+
+export async function getTerminalDirectoryPage(
+  query: TerminalDirectoryQuery,
+  options: ApiRequestOptions = {},
+): Promise<any> {
+  const parsed = TerminalDirectoryQuerySchema.parse(query)
+  return api.get(
+    `/api/terminals${buildQueryString([
+      ['cursor', parsed.cursor],
+      ['priority', parsed.priority],
+      ['revision', parsed.revision],
+      ['limit', parsed.limit],
+    ])}`,
+    options,
+  )
+}
+
+export async function getAgentTimelinePage(
+  sessionId: string,
+  query: AgentTimelinePageQuery = {},
+  options: ApiRequestOptions = {},
+): Promise<any> {
+  const parsed = AgentTimelinePageQuerySchema.parse(query)
+  return api.get(
+    `/api/agent-sessions/${encodeURIComponent(sessionId)}/timeline${buildQueryString([
+      ['cursor', parsed.cursor],
+      ['priority', parsed.priority],
+      ['limit', parsed.limit],
+    ])}`,
+    options,
+  )
+}
+
+export async function getAgentTurnBody(
+  sessionId: string,
+  turnId: string,
+  options: ApiRequestOptions = {},
+): Promise<any> {
+  return api.get(
+    `/api/agent-sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}`,
+    options,
+  )
+}
+
+export async function getTerminalViewport(
+  terminalId: string,
+  options: ApiRequestOptions = {},
+): Promise<any> {
+  return api.get(`/api/terminals/${encodeURIComponent(terminalId)}/viewport`, options)
+}
+
+export async function getTerminalScrollbackPage(
+  terminalId: string,
+  query: TerminalScrollbackQuery = {},
+  options: ApiRequestOptions = {},
+): Promise<any> {
+  const parsed = TerminalScrollbackQuerySchema.parse(query)
+  return api.get(
+    `/api/terminals/${encodeURIComponent(terminalId)}/scrollback${buildQueryString([
+      ['cursor', parsed.cursor],
+      ['limit', parsed.limit],
+    ])}`,
+    options,
+  )
+}
+
+export async function searchTerminalView(
+  terminalId: string,
+  query: TerminalSearchQuery,
+  options: ApiRequestOptions = {},
+): Promise<any> {
+  const parsed = TerminalSearchQuerySchema.parse(query)
+  return api.get(
+    `/api/terminals/${encodeURIComponent(terminalId)}/search${buildQueryString([
+      ['query', parsed.query],
+      ['cursor', parsed.cursor],
+      ['limit', parsed.limit],
+    ])}`,
+    options,
+  )
 }
 
 export type VersionInfo = {
