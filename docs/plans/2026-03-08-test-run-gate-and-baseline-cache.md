@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task.
 
-**Goal:** Build one repo-owned test coordinator that serializes sanctioned broad one-shot test runs, reports truthful active-holder status, and records exact-match advisory baselines that agents can inspect instead of rerunning unchanged inherited commits.
+**Goal:** Build one repo-owned test coordinator that serializes broad one-shot test runs through one shared queue, reports truthful active-holder status, and records advisory baseline history that agents can inspect before deciding whether to rerun an inherited baseline.
 
-**Architecture:** Route every sanctioned public test entrypoint through a TypeScript coordinator owned by this repo. The coordinator normalizes the requested command into an explicit contract, then either delegates directly to upstream Vitest/build/typecheck behavior or launches a dedicated coordinated runner that owns a repo-specific local socket/pipe. That bound endpoint is the only lock primitive, so liveness is cross-platform and clears automatically when the runner dies. Advisory holder metadata and baseline history live under the Git common-dir shared by all worktrees. Raw `npx vitest` is not intercepted because this repo has no worktree-safe way to hijack it without dependency-graph or shell-environment side effects; instead the repo adds a sanctioned direct entrypoint, `npm run test:vitest -- ...`, and updates agent guidance to use sanctioned commands only.
+**Architecture:** Route every repo-owned public test entrypoint through a TypeScript coordinator owned by this repo. The coordinator classifies each invocation by workload shape, then either delegates directly to upstream Vitest/build/typecheck behavior or launches a dedicated coordinated runner that owns a repo-specific local socket/pipe. That bound endpoint is the only lock primitive, so liveness is cross-platform and clears automatically when the runner dies. Advisory holder metadata and baseline history live under the Git common-dir shared by all worktrees. The governing contract is workload-shape based rather than command-name based: broad one-shot workloads share one queue; watch/UI/focused runs do not. For direct/manual Vitest usage, the repo must provide an ergonomic repo-owned entrypoint and status/reporting that make broad-run coordination easy and bypasses visible.
 
 **Tech Stack:** Node.js, TypeScript, `tsx`, npm scripts, `child_process`, `net`, `fs/promises`, Zod, Vitest.
 
@@ -20,19 +20,42 @@ The previous plan was solving the wrong problem at the wrong layer:
 
 The clean steady-state model is:
 
-1. freeze the public CLI contract for every sanctioned test command and forwarded-arg form this repo already uses;
-2. coordinate only sanctioned broad one-shot workloads through one repo-owned runtime;
+1. freeze the public CLI contract for every repo-owned test command and forwarded-arg form this repo already uses;
+2. coordinate broad one-shot workloads through one repo-owned runtime and one shared queue;
 3. use a cross-platform socket/pipe endpoint as the only mutual-exclusion primitive;
 4. store advisory holder and baseline records under the Git common-dir;
-5. provide a sanctioned direct Vitest passthrough command so agents have an ergonomic alternative to raw `npx vitest`.
+5. provide a repo-owned direct Vitest passthrough command and status surfaces so agents have an ergonomic path that is easy to use and hard to bypass.
 
 That directly solves the user’s goal without platform narrowing, install-time mutation, or ambiguous shell contracts.
+
+## Product Decisions Confirmed By User
+
+These decisions are now frozen requirements for the implementation:
+
+1. coordinated broad runs wait automatically rather than failing fast;
+2. waiting output is visible and repeats roughly once per minute;
+3. baseline history is advisory only and the caller decides whether prior results are good enough;
+4. coordination is defined by broad one-shot workload shape, not by command spelling alone;
+5. watch mode, UI mode, and clearly focused runs remain exempt from the global queue;
+6. waiting may continue for up to 24 hours, and waiting processes never kill a run they did not start;
+7. holder output should include purpose, timing, branch/worktree, command, pid, and resumable session/thread metadata where available;
+8. a human summary is strongly encouraged but not required;
+9. previous successes and failures should be reported prominently before or during waiting, but should not silently replace an explicit requested run;
+10. the design target is Linux, macOS, Windows, and WSL;
+11. recovery from crashes and aborted sessions is more important than perfect exclusion in every pathological race.
 
 ## Frozen Design Decisions
 
 ### 1. Coordination Boundary
 
-Only sanctioned repo commands are guaranteed to pass through the repo-owned coordinator. Of those, only broad one-shot workloads are coordinated:
+The coordination contract is driven by workload shape:
+
+- broad one-shot workloads are coordinated through the shared queue;
+- watch/UI/focused runs are delegated directly;
+- baseline and holder status are reported for both queued callers and explicit status checks;
+- the same broad workload should map to the same queue whether it originates from a composite npm script or a direct Vitest-style repo entrypoint.
+
+Repo-owned commands that must participate in this contract include:
 
 - `npm test`
 - `npm run test:all`
@@ -48,7 +71,11 @@ Only sanctioned repo commands are guaranteed to pass through the repo-owned coor
 - `npm run test:status`
 - `npm run test:vitest -- ...`
 
-Raw `npx vitest ...` and `./node_modules/.bin/vitest ...` remain out of contract in v1. They are documented as unsupported for coordinated broad runs. The sanctioned replacement for direct Vitest usage is `npm run test:vitest -- ...`.
+The plan must make direct/manual full-suite-equivalent Vitest usage visible and ergonomic. If a raw path cannot be safely intercepted cross-platform, the implementation must still:
+
+- provide a repo-owned direct path that covers the same broad-workload classification rules;
+- make the unsupported raw path explicit in docs and status output rather than silently pretending it is coordinated;
+- avoid narrowing the governing product contract to "only blessed script names count."
 
 ### 2. The Lock Primitive Is A Repo-Specific Socket/Pipe
 
@@ -77,11 +104,11 @@ Every worktree for the same repo sees the same active-holder and baseline state.
 
 ### 4. Advisory Baselines Are Exact-Match And Non-Authoritative
 
-Reusable baseline identity is frozen to:
+Reusable baseline identity remains exact-match and non-authoritative. Stored facts should include at least:
 
 - `suiteKey`
 - `repo.commit`
-- `repo.cleanWorktree === true`
+- `repo.cleanWorktree`
 - `runtime.nodeVersion`
 - `runtime.platform`
 - `runtime.arch`
@@ -90,8 +117,8 @@ Rules:
 
 - only successful coordinated suite runs can publish reusable baselines;
 - later failures do not erase an older reusable success for the same identity;
-- the coordinator may surface a matching reusable success in `test:status`;
-- `npm test`, `npm run check`, and `npm run verify` never auto-succeed from cache;
+- the coordinator surfaces matching or similar prior results in `test:status` and pre-run waiting output;
+- `npm test`, `npm run check`, and `npm run verify` never auto-succeed from cache and never silently skip an explicit requested run;
 - the repo rule requiring a fresh `npm test` before landing remains unchanged.
 
 ### 5. Wait Semantics Are Fixed
@@ -101,9 +128,11 @@ For every coordinated workload:
 - try the lock immediately;
 - if busy, print current time, holder info if available, and baseline info if relevant;
 - poll once per minute;
-- wait up to one hour;
+- wait up to 24 hours;
 - never kill a run the current process did not start;
 - exit nonzero only on timeout or internal failure.
+
+The waiting output should make it obvious that the process is intentionally queued, not hung.
 
 ## Frozen Public CLI Contract
 
@@ -155,6 +184,12 @@ Delegated-or-rejected on composite commands (`test`, `test:all`, `check`, `verif
 - `--config vitest.server.config.ts` on a composite command delegates to a single server phase;
 - `--run` on `npm test` / `npm run test:all` is an accepted compatibility no-op.
 
+Summary rules:
+
+- `--summary` or `FRESHELL_TEST_SUMMARY` should populate holder metadata when provided;
+- missing summary does not block the run;
+- missing summary falls back to an automatic placeholder plus repo/session metadata.
+
 ### Existing Repo Forms That Must Be Preserved Explicitly
 
 These forms are part of the contract and must have tests:
@@ -205,6 +240,15 @@ Required fields:
 - `agent.kind`
 - `agent.sessionId`
 - `agent.threadId`
+
+Recommended display fields in status/waiting output:
+
+- summary or fallback summary
+- start time and elapsed time
+- branch and worktree
+- command display
+- pid
+- agent session/thread identifiers when present
 
 If the socket/pipe is live but `holder.json` is missing, partial, or corrupt, `test:status` must report `running-undescribed`.
 
@@ -324,7 +368,7 @@ git commit -m "test: add shared test coordination store primitives"
 
 Cover:
 
-- every sanctioned command in the matrix above;
+- every repo-owned command in the matrix above;
 - the exact preserved forms listed earlier;
 - `--watch` / `-w` always delegating, even in CI or non-TTY;
 - `--help`, `-h`, `--version`, and `-v` passthrough behavior;
@@ -391,7 +435,7 @@ Cover:
 - endpoint-name derivation from Git common-dir hash on Unix and Windows;
 - stale Unix socket cleanup only after failed connect;
 - `test:status` reporting `idle`, `running`, and `running-undescribed`;
-- coordinated runs waiting behind an active coordinated run with once-per-minute polling output;
+- coordinated runs waiting behind an active coordinated run with once-per-minute polling output and 24-hour timeout policy;
 - timeout behavior using shortened fixture time budgets;
 - holder cleanup on success, failure, and coordinator exception;
 - command history vs suite history vs latest reusable success separation;
@@ -426,7 +470,7 @@ if (disposition.kind === 'coordinated') return runCoordinated(disposition)
 
 - start or connect to the repo-specific server;
 - persist holder metadata only after the server is live;
-- wait/poll up to one hour if another coordinated run is active;
+- wait/poll up to 24 hours if another coordinated run is active;
 - execute upstream phases sequentially;
 - persist command and suite results in `finally`;
 - remove advisory holder metadata only if it still belongs to the current pid/run.
@@ -445,7 +489,7 @@ git add /home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-c
 git commit -m "feat: add cross-platform coordinated test runtime"
 ```
 
-## Task 4: Wire Sanctioned Public Commands And Publish The Workflow
+## Task 4: Wire Repo-Owned Public Commands And Publish The Workflow
 
 **Files:**
 
@@ -459,7 +503,7 @@ Extend command-matrix or integration coverage to assert:
 
 - every public npm test script points at the repo-owned coordinator entrypoint;
 - `test:status` exists;
-- `test:vitest` exists and is documented as the sanctioned direct Vitest path;
+- `test:vitest` exists and is documented as the repo-owned direct Vitest path;
 - `docs/skills/testing.md` no longer claims `npm test` is watch mode.
 
 **Step 2: Run the targeted tests and verify they fail**
@@ -489,7 +533,8 @@ Document:
 - how to pass `--summary` or `FRESHELL_TEST_SUMMARY`;
 - how `test:status` exposes active-holder and reusable baseline info;
 - that agents must wait rather than kill another run;
-- that direct `npx vitest` broad runs are unsupported and `npm run test:vitest -- ...` is the sanctioned replacement.
+- that cached prior results are advisory and the caller decides whether to rely on them;
+- how direct/manual Vitest broad runs are expected to use the repo-owned direct path, and what visibility exists if a caller bypasses it.
 
 **Step 4: Re-run the targeted tests and verify they pass**
 
@@ -502,7 +547,7 @@ npx vitest run --config vitest.server.config.ts test/unit/server/test-coordinato
 
 ```bash
 git add /home/user/code/freshell/.worktrees/test-run-gate/package.json /home/user/code/freshell/.worktrees/test-run-gate/AGENTS.md /home/user/code/freshell/.worktrees/test-run-gate/docs/skills/testing.md
-git commit -m "docs: publish sanctioned coordinated test entrypoints"
+git commit -m "docs: publish coordinated test entrypoints"
 ```
 
 ## Task 5: Final Verification And Safety Checks
@@ -541,7 +586,7 @@ npx vitest run --config vitest.server.config.ts test/unit/server/coding-cli/util
 
 Expected: PASS.
 
-**Step 2: Verify the sanctioned status and direct-entry commands**
+**Step 2: Verify the status and direct-entry commands**
 
 Run:
 
@@ -571,12 +616,12 @@ npm run check
 Expected:
 
 - the coordinated runner acquires the repo lock or waits behind another active run;
-- broad runs no longer collide when multiple sanctioned commands start at once;
+- broad runs no longer collide when multiple repo-owned broad commands start at once;
 - `check` still performs typecheck plus a coordinated full-suite test phase.
 
 **Step 4: Commit the verified end state**
 
 ```bash
 git add /home/user/code/freshell/.worktrees/test-run-gate/package.json /home/user/code/freshell/.worktrees/test-run-gate/AGENTS.md /home/user/code/freshell/.worktrees/test-run-gate/docs/skills/testing.md /home/user/code/freshell/.worktrees/test-run-gate/server/coding-cli/utils.ts /home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/coding-cli/utils.test.ts /home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator.ts /home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-command-matrix.ts /home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-store.ts /home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-socket.ts /home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-status.ts /home/user/code/freshell/.worktrees/test-run-gate/scripts/testing/test-coordinator-upstream.ts /home/user/code/freshell/.worktrees/test-run-gate/test/fixtures/testing/fake-coordinated-workload.mjs /home/user/code/freshell/.worktrees/test-run-gate/test/fixtures/testing/temp-test-coordinator-env.ts /home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-store.test.ts /home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-command-matrix.test.ts /home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-socket.test.ts /home/user/code/freshell/.worktrees/test-run-gate/test/unit/server/test-coordinator-status.test.ts /home/user/code/freshell/.worktrees/test-run-gate/test/integration/server/test-coordinator.test.ts
-git commit -m "feat: coordinate sanctioned broad test runs"
+git commit -m "feat: coordinate broad test runs"
 ```
