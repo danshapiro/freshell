@@ -28,7 +28,7 @@ import { codexProvider } from './coding-cli/providers/codex.js'
 import { opencodeProvider } from './coding-cli/providers/opencode.js'
 import { type CodingCliProviderName, type CodingCliSession } from './coding-cli/types.js'
 import { TerminalMetadataService } from './terminal-metadata-service.js'
-import { migrateSettingsSortMode } from './settings-migrate.js'
+import { migrateLegacyDefaultEnabledProviders, migrateSettingsSortMode } from './settings-migrate.js'
 import { createFilesRouter } from './files-router.js'
 import { createPlatformRouter } from './platform-router.js'
 import { createProxyRouter } from './proxy-router.js'
@@ -209,24 +209,28 @@ async function main() {
   // Auto-enable newly-discovered CLI extensions
   {
     const currentSettings = await configStore.getSettings()
-    const hasKnownProviders = currentSettings.codingCli?.knownProviders !== undefined
-    const knownProviders: string[] = currentSettings.codingCli?.knownProviders ?? []
-    const enabledProviders: string[] = currentSettings.codingCli?.enabledProviders ?? []
+    const migratedSettings = migrateLegacyDefaultEnabledProviders(currentSettings, allCliNames)
+    const migratedLegacyDefaults = migratedSettings !== currentSettings
+    const hasKnownProviders = migratedSettings.codingCli?.knownProviders !== undefined
+    const knownProviders: string[] = migratedSettings.codingCli?.knownProviders ?? []
+    const enabledProviders: string[] = migratedSettings.codingCli?.enabledProviders ?? []
 
     if (!hasKnownProviders) {
       // MIGRATION: First run after refactor. Seed knownProviders with ALL registered CLI names
       // so nothing is treated as "new". Preserves the user's existing enabledProviders as-is.
-      await configStore.patchSettings({
-        codingCli: { knownProviders: allCliNames },
-      })
+      const codingCliPatch: Record<string, string[]> = { knownProviders: allCliNames }
+      if (migratedLegacyDefaults) {
+        codingCliPatch.enabledProviders = enabledProviders
+      }
+      await configStore.patchSettings({ codingCli: codingCliPatch })
     } else {
       // NORMAL: Auto-enable truly new extensions (added after migration).
       const newProviders = allCliNames.filter(name => !knownProviders.includes(name))
-      if (newProviders.length > 0) {
+      if (newProviders.length > 0 || migratedLegacyDefaults) {
         await configStore.patchSettings({
           codingCli: {
-            knownProviders: [...knownProviders, ...newProviders],
-            enabledProviders: [...enabledProviders, ...newProviders],
+            knownProviders: newProviders.length > 0 ? [...knownProviders, ...newProviders] : knownProviders,
+            enabledProviders: [...enabledProviders, ...newProviders.filter((name) => !enabledProviders.includes(name))],
           },
         })
       }

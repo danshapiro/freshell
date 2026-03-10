@@ -1,6 +1,7 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import type { AppSettings, SidebarSortMode, CodingCliProviderName } from './types'
 import type { DeepPartial } from '@/lib/type-utils'
+import { DEFAULT_ENABLED_CLI_PROVIDERS } from '@shared/coding-cli-defaults'
 import { normalizeTrimmedStringList } from '@shared/string-list'
 
 export function resolveDefaultLoggingDebug(isDev: boolean = import.meta.env.DEV): boolean {
@@ -51,7 +52,7 @@ export const defaultSettings: AppSettings = {
     attentionDismiss: 'click' as const,
   },
   codingCli: {
-    enabledProviders: ['claude', 'codex'],
+    enabledProviders: [...DEFAULT_ENABLED_CLI_PROVIDERS],
     providers: {
       claude: {
         permissionMode: 'default',

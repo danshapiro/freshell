@@ -21,6 +21,7 @@ import type {
   TerminalSessionBoundEvent,
   TerminalSessionUnboundEvent,
 } from './terminal-stream/registry-events.js'
+import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-launch.js'
 
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
 const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 64 * 1024)
@@ -246,6 +247,9 @@ function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, t
   const providerArgs = providerNotificationArgs(mode, target)
   const baseArgs = spec.args || []
   const commandEnv: Record<string, string> = { ...(spec.env || {}) }
+  if (mode === 'opencode') {
+    Object.assign(commandEnv, getOpencodeEnvOverrides({ ...process.env, ...commandEnv }))
+  }
   let resumeArgs: string[] = []
   if (resumeSessionId) {
     if (spec.resumeArgs) {
@@ -255,8 +259,11 @@ function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, t
     }
   }
   const settingsArgs: string[] = []
-  if (providerSettings?.model && spec.modelArgs) {
-    settingsArgs.push(...spec.modelArgs(providerSettings.model))
+  const effectiveModel = mode === 'opencode'
+    ? resolveOpencodeLaunchModel(providerSettings?.model, { ...process.env, ...commandEnv })
+    : providerSettings?.model
+  if (effectiveModel && spec.modelArgs) {
+    settingsArgs.push(...spec.modelArgs(effectiveModel))
   }
   if (providerSettings?.sandbox && spec.sandboxArgs) {
     settingsArgs.push(...spec.sandboxArgs(providerSettings.sandbox))

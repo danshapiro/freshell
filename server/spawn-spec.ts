@@ -9,6 +9,7 @@ import {
   resolveShell, getSystemShell, isLinuxPath,
 } from './platform-utils.js'
 import type { ShellType } from './platform-utils.js'
+import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-launch.js'
 
 // TerminalMode includes 'shell' for regular terminals, plus coding CLI providers.
 // Provider command defaults are configurable via env vars; resume semantics
@@ -209,6 +210,9 @@ function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, t
   const providerArgs = providerNotificationArgs(mode, target)
   const baseArgs = spec.args || []
   const commandEnv: Record<string, string> = { ...(spec.env || {}) }
+  if (mode === 'opencode') {
+    Object.assign(commandEnv, getOpencodeEnvOverrides({ ...process.env, ...commandEnv }))
+  }
   let resumeArgs: string[] = []
   if (resumeSessionId) {
     if (spec.resumeArgs) {
@@ -218,7 +222,10 @@ function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, t
     }
   }
   const settingsArgs: string[] = []
-  if (providerSettings?.model && spec.modelArgs) settingsArgs.push(...spec.modelArgs(providerSettings.model))
+  const effectiveModel = mode === 'opencode'
+    ? resolveOpencodeLaunchModel(providerSettings?.model, { ...process.env, ...commandEnv })
+    : providerSettings?.model
+  if (effectiveModel && spec.modelArgs) settingsArgs.push(...spec.modelArgs(effectiveModel))
   if (providerSettings?.sandbox && spec.sandboxArgs) settingsArgs.push(...spec.sandboxArgs(providerSettings.sandbox))
   if (providerSettings?.permissionMode && providerSettings.permissionMode !== 'default') {
     if (spec.permissionModeArgs) settingsArgs.push(...spec.permissionModeArgs(providerSettings.permissionMode))

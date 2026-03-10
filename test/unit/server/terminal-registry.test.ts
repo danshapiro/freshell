@@ -915,6 +915,21 @@ describe('buildSpawnSpec Unix paths', () => {
       expect(spec.args).toContain('openai/gpt-5-mini')
     })
 
+    it('defaults OpenCode to a usable Google model and alias env when only GEMINI_API_KEY is set', () => {
+      delete process.env.OPENCODE_CMD
+      delete process.env.GOOGLE_GENERATIVE_AI_API_KEY
+      delete process.env.GOOGLE_API_KEY
+      delete process.env.OPENAI_API_KEY
+      delete process.env.ANTHROPIC_API_KEY
+      process.env.GEMINI_API_KEY = 'gemini-key'
+
+      const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system')
+
+      expect(spec.args).toContain('--model')
+      expect(spec.args).toContain('google/gemini-3-pro-preview')
+      expect(spec.env.GOOGLE_GENERATIVE_AI_API_KEY).toBe('gemini-key')
+    })
+
     it('maps OpenCode plan permission mode to OPENCODE_PERMISSION env', () => {
       delete process.env.OPENCODE_CMD
 

@@ -52,6 +52,7 @@ import { resolveTerminalFontFamily } from '@/lib/terminal-fonts'
 import { ConnectionErrorOverlay } from '@/components/terminal/ConnectionErrorOverlay'
 import { Osc52PromptModal } from '@/components/terminal/Osc52PromptModal'
 import { TerminalSearchBar } from '@/components/terminal/TerminalSearchBar'
+import { registerTerminalRequestModeBypass } from '@/components/terminal/request-mode-bypass'
 import {
   createTerminalRuntime,
   type TerminalRuntime,
@@ -915,6 +916,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     })
 
     term.open(containerRef.current)
+    const requestModeBypass = registerTerminalRequestModeBypass(term, sendInput)
 
     // Register custom link provider for clickable local file paths
     const filePathLinkDisposable = typeof term.registerLinkProvider === 'function'
@@ -1067,6 +1069,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     ro.observe(containerRef.current)
 
     return () => {
+      requestModeBypass.dispose()
       filePathLinkDisposable?.dispose()
       ro.disconnect()
       unregisterActions()
