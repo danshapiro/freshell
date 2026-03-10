@@ -776,7 +776,7 @@ describe('terminal.create session repair wait', () => {
     }
   })
 
-  it('broadcasts terminal.list.updated when create succeeds even if a later explicit attach fails', async () => {
+  it('broadcasts terminals.changed when create succeeds even if a later explicit attach fails', async () => {
     registry.forceAttachFailure = true
 
     const observer = new WebSocket(`ws://127.0.0.1:${port}/ws`)
@@ -790,7 +790,7 @@ describe('terminal.create session repair wait', () => {
       await new Promise<void>((resolve) => creator.on('open', () => resolve()))
       await waitForReady(creator)
 
-      const listUpdatedPromise = waitForMessage(observer, (m) => m.type === 'terminal.list.updated')
+      const terminalsChangedPromise = waitForMessage(observer, (m) => m.type === 'terminals.changed')
       const createdPromise = waitForCreated(creator, 'create-attach-fail-list-update')
 
       creator.send(JSON.stringify({
@@ -802,7 +802,7 @@ describe('terminal.create session repair wait', () => {
       const created = await createdPromise
       expect(registry.records.size).toBe(1)
 
-      await listUpdatedPromise
+      await terminalsChangedPromise
 
       creator.send(JSON.stringify({
         type: 'terminal.attach',

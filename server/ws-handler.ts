@@ -314,6 +314,8 @@ export class WsHandler {
   private terminalCreateLocks = new Map<string, Promise<void>>()
   private createdTerminalByRequestId = new Map<string, string>()
   private screenshotRequests = new Map<string, PendingScreenshot>()
+  private terminalsRevision = 0
+  private terminalRuntimeRevisions = new Map<string, number>()
   private readonly serverInstanceId: string
   // The runtime validator is authoritative here; we keep the field typed broadly because
   // the dynamic provider schemas widen discriminated-union inference beyond what TS/Zod model well.
@@ -1363,7 +1365,7 @@ export class WsHandler {
                 this.rememberCreatedRequestId(m.requestId, reusedTerminalId)
                 terminalId = reusedTerminalId
                 reused = true
-                this.broadcast({ type: 'terminal.list.updated' })
+                this.broadcastTerminalsChanged()
                 return true
               }
 
@@ -1544,12 +1546,12 @@ export class WsHandler {
                 // Terminal may still exist even if created delivery failed (for
                 // example: socket closed after create). Broadcast inventory so
                 // other clients can discover it.
-                this.broadcast({ type: 'terminal.list.updated' })
+                this.broadcastTerminalsChanged()
                 return
               }
 
               // Notify all clients that list changed
-              this.broadcast({ type: 'terminal.list.updated' })
+              this.broadcastTerminalsChanged()
             },
           )
         } catch (err: any) {
@@ -1590,7 +1592,7 @@ export class WsHandler {
         }
         if (attachResult === 'duplicate') return
         state.attachedTerminalIds.add(m.terminalId)
-        this.broadcast({ type: 'terminal.list.updated' })
+        this.broadcastTerminalRuntimeUpdatedForId(m.terminalId)
         return
       }
 
@@ -1602,7 +1604,7 @@ export class WsHandler {
           return
         }
         this.send(ws, { type: 'terminal.detached', terminalId: m.terminalId })
-        this.broadcast({ type: 'terminal.list.updated' })
+        this.broadcastTerminalRuntimeUpdatedForId(m.terminalId)
         return
       }
 
@@ -1628,7 +1630,8 @@ export class WsHandler {
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Unknown terminalId', terminalId: m.terminalId })
           return
         }
-        this.broadcast({ type: 'terminal.list.updated' })
+        this.broadcastTerminalsChanged()
+        this.broadcastTerminalRuntimeUpdatedForId(m.terminalId)
         return
       }
 
@@ -2269,6 +2272,68 @@ export class WsHandler {
       if (!state.sessionsSnapshotSent) continue
       this.safeSend(ws, msg)
     }
+  }
+
+  broadcastTerminalsChanged(): void {
+    this.terminalsRevision += 1
+    this.broadcastAuthenticated({
+      type: 'terminals.changed',
+      revision: this.terminalsRevision,
+    })
+  }
+
+  private resolveTerminalRuntimePayload(terminalId: string): {
+    terminalId: string
+    title: string
+    status: 'running' | 'detached' | 'exited'
+    cwd?: string
+    pid?: number
+  } | null {
+    const record = this.registry.get(terminalId) as
+      | {
+          terminalId: string
+          title: string
+          status: 'running' | 'exited'
+          cwd?: string
+          pty?: { pid?: number }
+          clients?: Set<unknown>
+        }
+      | null
+      | undefined
+
+    if (!record) return null
+
+    return {
+      terminalId: record.terminalId,
+      title: record.title,
+      status: record.status === 'exited'
+        ? 'exited'
+        : ((record.clients?.size ?? 0) > 0 ? 'running' : 'detached'),
+      ...(record.cwd ? { cwd: record.cwd } : {}),
+      ...(typeof record.pty?.pid === 'number' ? { pid: record.pty.pid } : {}),
+    }
+  }
+
+  broadcastTerminalRuntimeUpdated(msg: {
+    terminalId: string
+    title: string
+    status: 'running' | 'detached' | 'exited'
+    cwd?: string
+    pid?: number
+  }): void {
+    const revision = (this.terminalRuntimeRevisions.get(msg.terminalId) ?? 0) + 1
+    this.terminalRuntimeRevisions.set(msg.terminalId, revision)
+    this.broadcastAuthenticated({
+      type: 'terminal.runtime.updated',
+      revision,
+      ...msg,
+    })
+  }
+
+  private broadcastTerminalRuntimeUpdatedForId(terminalId: string): void {
+    const payload = this.resolveTerminalRuntimePayload(terminalId)
+    if (!payload) return
+    this.broadcastTerminalRuntimeUpdated(payload)
   }
 
   broadcastTerminalMetaUpdated(msg: { upsert?: TerminalMeta[]; remove?: string[] }): void {

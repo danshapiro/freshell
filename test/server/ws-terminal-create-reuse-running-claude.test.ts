@@ -91,6 +91,36 @@ function waitForMessage(ws: WebSocket, predicate: (msg: any) => boolean, timeout
   })
 }
 
+function waitForMessages(
+  ws: WebSocket,
+  predicates: Array<(msg: any) => boolean>,
+  timeoutMs = 5_000,
+): Promise<any[]> {
+  return new Promise((resolve, reject) => {
+    const matches: any[] = Array(predicates.length).fill(undefined)
+    const timeout = setTimeout(() => {
+      ws.off('message', handler)
+      reject(new Error('Timeout waiting for messages'))
+    }, timeoutMs)
+
+    const handler = (data: WebSocket.Data) => {
+      const msg = JSON.parse(data.toString())
+      for (let i = 0; i < predicates.length; i += 1) {
+        if (!matches[i] && predicates[i]?.(msg)) {
+          matches[i] = msg
+        }
+      }
+      if (matches.every((entry) => entry !== undefined)) {
+        clearTimeout(timeout)
+        ws.off('message', handler)
+        resolve(matches)
+      }
+    }
+
+    ws.on('message', handler)
+  })
+}
+
 function collectMessages(ws: WebSocket, durationMs: number): Promise<any[]> {
   return new Promise((resolve) => {
     const messages: any[] = []
@@ -162,6 +192,7 @@ class FakeRegistry {
       terminalId,
       createdAt: Date.now(),
       buffer: new FakeBuffer(),
+      title: 'Shell',
       mode: 'claude',
       shell: 'system',
       status: 'running',
@@ -283,7 +314,7 @@ describe('terminal.create reuse running claude terminal', () => {
 
       const requestId = 'reuse-1'
       const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
-      const listUpdatedPromise = waitForMessage(ws, (m) => m.type === 'terminal.list.updated')
+      const terminalsChangedPromise = waitForMessage(ws, (m) => m.type === 'terminals.changed')
 
       ws.send(JSON.stringify({
         type: 'terminal.create',
@@ -298,13 +329,13 @@ describe('terminal.create reuse running claude terminal', () => {
       expect(created.snapshot).toBeUndefined()
       expect(created.snapshotChunked).toBeUndefined()
       expect(preAttachMsgs.some((m) => m.type === 'terminal.attach.ready' && m.terminalId === 'term-existing')).toBe(false)
-      await listUpdatedPromise
+      await terminalsChangedPromise
 
       expect(registry.attachCalls).toHaveLength(0)
-      const attachReadyPromise = waitForMessage(
-        ws,
+      const attachMessagesPromise = waitForMessages(ws, [
         (m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'reuse-1-attach',
-      )
+        (m) => m.type === 'terminal.runtime.updated' && m.terminalId === created.terminalId,
+      ])
       ws.send(JSON.stringify({
         type: 'terminal.attach',
         terminalId: created.terminalId,
@@ -313,9 +344,15 @@ describe('terminal.create reuse running claude terminal', () => {
         rows: 40,
         attachRequestId: 'reuse-1-attach',
       }))
-      const ready = await attachReadyPromise
+      const [ready, runtimeUpdated] = await attachMessagesPromise
 
       expect(ready.type).toBe('terminal.attach.ready')
+      expect(runtimeUpdated).toEqual(expect.objectContaining({
+        type: 'terminal.runtime.updated',
+        terminalId: created.terminalId,
+        status: 'running',
+        title: 'Shell',
+      }))
       expect(registry.attachCalls).toHaveLength(1)
       expect(registry.attachCalls[0]?.opts?.suppressOutput).toBe(true)
       expect(snapshotSpy).not.toHaveBeenCalled()

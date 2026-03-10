@@ -507,6 +507,21 @@ export type TerminalSessionAssociatedMessage = {
   sessionId: string
 }
 
+export type TerminalsChangedMessage = {
+  type: 'terminals.changed'
+  revision: number
+}
+
+export type TerminalRuntimeUpdatedMessage = {
+  type: 'terminal.runtime.updated'
+  terminalId: string
+  revision: number
+  status: 'running' | 'detached' | 'exited'
+  title: string
+  cwd?: string
+  pid?: number
+}
+
 export type TerminalListUpdatedMessage = {
   type: 'terminal.list.updated'
 }
@@ -745,6 +760,8 @@ export type ServerMessage =
   | TerminalOutputGapMessage
   | TerminalTitleUpdatedMessage
   | TerminalSessionAssociatedMessage
+  | TerminalsChangedMessage
+  | TerminalRuntimeUpdatedMessage
   | TerminalListUpdatedMessage
   | TerminalListResponseMessage
   | TerminalMetaListResponseMessage

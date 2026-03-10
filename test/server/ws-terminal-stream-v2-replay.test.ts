@@ -511,9 +511,7 @@ describe('terminal stream v2 replay', () => {
     const listener = (data: WebSocket.Data) => {
       const msg = JSON.parse(data.toString())
       if (msg.terminalId !== terminalId) return
-      if (msg.type === 'terminal.attach.ready' || msg.type === 'terminal.output') {
-        received.push({ type: msg.type, seqStart: msg.seqStart, seqEnd: msg.seqEnd })
-      }
+      received.push({ type: msg.type, seqStart: msg.seqStart, seqEnd: msg.seqEnd })
     }
     ws2.on('message', listener)
 
@@ -544,6 +542,7 @@ describe('terminal stream v2 replay', () => {
       expect(replayed[i]?.seqStart).toBe(6 + i)
       expect(replayed[i]?.seqEnd).toBe(6 + i)
     }
+    expect(received.some((msg) => msg.type === 'terminal.list.updated')).toBe(false)
 
     await close2()
   })
