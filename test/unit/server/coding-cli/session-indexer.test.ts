@@ -24,6 +24,8 @@ type MakeProviderOptions = {
   name?: CodingCliProvider['name']
   displayName?: string
   homeDir?: string
+  getSessionGlob?: CodingCliProvider['getSessionGlob']
+  listSessionsDirect?: CodingCliProvider['listSessionsDirect']
   listSessionFiles?: CodingCliProvider['listSessionFiles']
   parseSessionFile?: CodingCliProvider['parseSessionFile']
   resolveProjectPath?: CodingCliProvider['resolveProjectPath']
@@ -40,7 +42,8 @@ function makeProvider(files: string[], options: MakeProviderOptions = {}): Codin
     name: providerName,
     displayName,
     homeDir,
-    getSessionGlob: () => path.join(homeDir, '**', '*.jsonl'),
+    listSessionsDirect: options.listSessionsDirect,
+    getSessionGlob: options.getSessionGlob ?? (() => path.join(homeDir, '**', '*.jsonl')),
     listSessionFiles: options.listSessionFiles ?? (async () => files),
     parseSessionFile: options.parseSessionFile ?? (async (content: string) => {
       const lines = content.split(/\r?\n/).filter(Boolean)
@@ -173,6 +176,58 @@ describe('CodingCliSessionIndexer', () => {
     expect(projectB?.color).toBe('#222222')
     expect(projectB?.sessions[0].provider).toBe('claude')
     expect(projectB?.sessions[0].title).toBe('Title B')
+  })
+
+  it('indexes providers that expose direct session listings', async () => {
+    vi.mocked(configStore.snapshot).mockResolvedValueOnce({
+      sessionOverrides: {},
+      settings: {
+        codingCli: {
+          enabledProviders: ['opencode'],
+          providers: {},
+        },
+      },
+    })
+
+    const listSessionsDirect = vi.fn().mockResolvedValue([
+      {
+        provider: 'opencode' as const,
+        sessionId: 'opencode-session-1',
+        projectPath: '/project/a',
+        cwd: '/project/a',
+        title: 'OpenCode session',
+        updatedAt: 1_700_000_000_000,
+        createdAt: 1_699_999_000_000,
+      },
+    ])
+
+    const provider = makeProvider([], {
+      name: 'opencode',
+      displayName: 'OpenCode',
+      homeDir: path.join(tempDir, 'opencode'),
+      listSessionsDirect,
+      listSessionFiles: async () => [],
+    })
+
+    const indexer = new CodingCliSessionIndexer([provider])
+    await indexer.refresh()
+
+    expect(listSessionsDirect).toHaveBeenCalledTimes(1)
+    expect(indexer.getProjects()).toEqual([
+      {
+        projectPath: '/project/a',
+        color: '#111111',
+        sessions: [
+          expect.objectContaining({
+            provider: 'opencode',
+            sessionId: 'opencode-session-1',
+            title: 'OpenCode session',
+            cwd: '/project/a',
+            projectPath: '/project/a',
+          }),
+        ],
+      },
+    ])
   })
 
   it('preserves parsed codex task event snapshots from bounded snippets without extra reads', async () => {
@@ -1130,6 +1185,80 @@ describe('CodingCliSessionIndexer', () => {
         )
 
         expect(indexer.getProjects()[0].sessions[0].title).toBe('Late Session')
+      } finally {
+        indexer.stop()
+      }
+    })
+
+    it('discovers direct-provider sessions when a late file root is created under a missing directory tree', async () => {
+      const dataHome = path.join(tempDir, '.local', 'share')
+      const opencodeDir = path.join(dataHome, 'opencode')
+      const dbPath = path.join(opencodeDir, 'opencode.db')
+      await fsp.mkdir(dataHome, { recursive: true })
+
+      const provider = makeProvider([], {
+        name: 'opencode',
+        displayName: 'OpenCode',
+        homeDir: opencodeDir,
+        getSessionGlob: () => dbPath,
+        getSessionRoots: () => [dbPath],
+        listSessionFiles: async () => [],
+        listSessionsDirect: async () => {
+          try {
+            await fsp.access(dbPath)
+          } catch {
+            return []
+          }
+          return [{
+            provider: 'opencode' as const,
+            sessionId: 'late-opencode-session',
+            projectPath: '/project/a',
+            cwd: '/project/a',
+            title: 'Late OpenCode Session',
+            updatedAt: 1_700_000_000_000,
+            createdAt: 1_699_999_000_000,
+          }]
+        },
+      })
+
+      vi.mocked(configStore.snapshot).mockResolvedValue({
+        sessionOverrides: {},
+        settings: {
+          codingCli: {
+            enabledProviders: ['opencode'],
+            providers: {},
+          },
+        },
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider], { debounceMs: 50, throttleMs: 0 })
+      await indexer.start()
+
+      try {
+        expect(indexer.getProjects()).toHaveLength(0)
+
+        await new Promise((r) => setTimeout(r, 200))
+
+        await fsp.mkdir(opencodeDir, { recursive: true })
+        await fsp.writeFile(dbPath, 'stub')
+
+        await vi.waitFor(
+          () => {
+            expect(indexer.getProjects()).toEqual([
+              expect.objectContaining({
+                projectPath: '/project/a',
+                sessions: [
+                  expect.objectContaining({
+                    provider: 'opencode',
+                    sessionId: 'late-opencode-session',
+                    title: 'Late OpenCode Session',
+                  }),
+                ],
+              }),
+            ])
+          },
+          { timeout: 5000, interval: 100 },
+        )
       } finally {
         indexer.stop()
       }

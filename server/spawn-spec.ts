@@ -19,7 +19,14 @@ type CodingCliCommandSpec = {
   label: string
   envVar: string
   defaultCommand: string
+  args?: string[]
+  env?: Record<string, string>
   resumeArgs?: (sessionId: string) => string[]
+  modelArgs?: (model: string) => string[]
+  sandboxArgs?: (sandbox: string) => string[]
+  permissionModeArgs?: (permissionMode: string) => string[]
+  permissionModeEnvVar?: string
+  permissionModeEnvValues?: Record<string, string>
 }
 
 export const CODING_CLI_COMMANDS: Record<Exclude<TerminalMode, 'shell'>, CodingCliCommandSpec> = {
@@ -28,17 +35,28 @@ export const CODING_CLI_COMMANDS: Record<Exclude<TerminalMode, 'shell'>, CodingC
     envVar: 'CLAUDE_CMD',
     defaultCommand: 'claude',
     resumeArgs: (sessionId) => ['--resume', sessionId],
+    permissionModeArgs: (permissionMode) => ['--permission-mode', permissionMode],
   },
   codex: {
     label: 'Codex CLI',
     envVar: 'CODEX_CMD',
     defaultCommand: 'codex',
     resumeArgs: (sessionId) => ['resume', sessionId],
+    modelArgs: (model) => ['--model', model],
+    sandboxArgs: (sandbox) => ['--sandbox', sandbox],
   },
   opencode: {
     label: 'OpenCode',
     envVar: 'OPENCODE_CMD',
     defaultCommand: 'opencode',
+    resumeArgs: (sessionId) => ['--session', sessionId],
+    modelArgs: (model) => ['--model', model],
+    permissionModeEnvVar: 'OPENCODE_PERMISSION',
+    permissionModeEnvValues: {
+      plan: '{"edit":"ask","bash":"ask"}',
+      acceptEdits: '{"edit":"allow","bash":"ask"}',
+      bypassPermissions: '{"edit":"allow","bash":"allow"}',
+    },
   },
   gemini: {
     label: 'Gemini',
@@ -178,11 +196,19 @@ function providerNotificationArgs(mode: TerminalMode, target: ProviderTarget): s
   return []
 }
 
-function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, target: ProviderTarget = 'unix') {
+type ProviderSettings = {
+  permissionMode?: string
+  model?: string
+  sandbox?: string
+}
+
+function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, target: ProviderTarget = 'unix', providerSettings?: ProviderSettings) {
   if (mode === 'shell') return null
   const spec = CODING_CLI_COMMANDS[mode]
   const command = process.env[spec.envVar] || spec.defaultCommand
   const providerArgs = providerNotificationArgs(mode, target)
+  const baseArgs = spec.args || []
+  const commandEnv: Record<string, string> = { ...(spec.env || {}) }
   let resumeArgs: string[] = []
   if (resumeSessionId) {
     if (spec.resumeArgs) {
@@ -191,7 +217,24 @@ function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, t
       logger.warn({ mode, resumeSessionId }, 'Resume requested but no resume args configured')
     }
   }
-  return { command, args: [...providerArgs, ...resumeArgs], label: spec.label }
+  const settingsArgs: string[] = []
+  if (providerSettings?.model && spec.modelArgs) settingsArgs.push(...spec.modelArgs(providerSettings.model))
+  if (providerSettings?.sandbox && spec.sandboxArgs) settingsArgs.push(...spec.sandboxArgs(providerSettings.sandbox))
+  if (providerSettings?.permissionMode && providerSettings.permissionMode !== 'default') {
+    if (spec.permissionModeArgs) settingsArgs.push(...spec.permissionModeArgs(providerSettings.permissionMode))
+    if (spec.permissionModeEnvVar) {
+      const permissionValue =
+        spec.permissionModeEnvValues?.[providerSettings.permissionMode] ??
+        providerSettings.permissionMode
+      if (permissionValue) commandEnv[spec.permissionModeEnvVar] = permissionValue
+    }
+  }
+  return {
+    command,
+    args: [...providerArgs, ...baseArgs, ...settingsArgs, ...resumeArgs],
+    env: commandEnv,
+    label: spec.label,
+  }
 }
 
 export function normalizeResumeSessionId(mode: TerminalMode, resumeSessionId?: string): string | undefined {
@@ -271,7 +314,13 @@ function buildPowerShellCommand(command: string, args: string[]): string {
   return invocation
 }
 
-export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shell: ShellType, resumeSessionId?: string) {
+export function buildSpawnSpec(
+  mode: TerminalMode,
+  cwd: string | undefined,
+  shell: ShellType,
+  resumeSessionId?: string,
+  providerSettings?: ProviderSettings,
+) {
   // CLAUDECODE is set by parent Claude Code sessions and causes child
   // claude processes to refuse to start ("nested session" error). Strip it.
   const { CLAUDECODE: _, ...parentEnv } = process.env
@@ -331,14 +380,14 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
         return { file: wsl, args, cwd: undefined, env }
       }
 
-      const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix')
+      const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings)
       if (!cli) {
         args.push('--exec', 'bash', '-l')
         return { file: wsl, args, cwd: undefined, env }
       }
 
       args.push('--exec', cli.command, ...cli.args)
-      return { file: wsl, args, cwd: undefined, env }
+      return { file: wsl, args, cwd: undefined, env: { ...env, ...cli.env } }
     }
 
     // Option B: Native Windows shells (PowerShell/cmd)
@@ -366,11 +415,11 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
         }
         return { file, args: ['/K'], cwd: procCwd, env }
       }
-      const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows')
+      const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows', providerSettings)
       const cmd = cli?.command || mode
       const command = buildCmdCommand(cmd, cli?.args || [])
       const cd = winCwd ? `cd /d ${quoteCmdArg(winCwd)} && ` : ''
-      return { file, args: ['/K', `${cd}${command}`], cwd: procCwd, env }
+      return { file, args: ['/K', `${cd}${command}`], cwd: procCwd, env: cli ? { ...env, ...cli.env } : env }
     }
 
     // default to PowerShell
@@ -395,12 +444,17 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
       return { file, args: ['-NoLogo'], cwd: procCwd, env }
     }
 
-    const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows')
+    const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows', providerSettings)
     const cmd = cli?.command || mode
     const invocation = buildPowerShellCommand(cmd, cli?.args || [])
     const cd = winCwd ? `Set-Location -LiteralPath ${quotePowerShellLiteral(winCwd)}; ` : ''
     const command = `${cd}${invocation}`
-    return { file, args: ['-NoLogo', '-NoExit', '-Command', command], cwd: procCwd, env }
+    return {
+      file,
+      args: ['-NoLogo', '-NoExit', '-Command', command],
+      cwd: procCwd,
+      env: cli ? { ...env, ...cli.env } : env,
+    }
   }
 // Non-Windows: native spawn using system shell
   const systemShell = getSystemShell()
@@ -409,8 +463,8 @@ export function buildSpawnSpec(mode: TerminalMode, cwd: string | undefined, shel
     return { file: systemShell, args: ['-l'], cwd, env }
   }
 
-  const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix')
+  const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings)
   const cmd = cli?.command || mode
   const args = cli?.args || []
-  return { file: cmd, args, cwd, env }
+  return { file: cmd, args, cwd, env: cli ? { ...env, ...cli.env } : env }
 }

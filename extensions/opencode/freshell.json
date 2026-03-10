@@ -6,7 +6,17 @@
   "category": "cli",
   "cli": {
     "command": "opencode",
-    "envVar": "OPENCODE_CMD"
+    "envVar": "OPENCODE_CMD",
+    "resumeArgs": ["--session", "{{sessionId}}"],
+    "modelArgs": ["--model", "{{model}}"],
+    "permissionModeEnvVar": "OPENCODE_PERMISSION",
+    "permissionModeValues": {
+      "plan": "{\"edit\":\"ask\",\"bash\":\"ask\"}",
+      "acceptEdits": "{\"edit\":\"allow\",\"bash\":\"ask\"}",
+      "bypassPermissions": "{\"edit\":\"allow\",\"bash\":\"allow\"}"
+    },
+    "supportsPermissionMode": true,
+    "supportsModel": true
   },
   "picker": {
     "group": "agents"

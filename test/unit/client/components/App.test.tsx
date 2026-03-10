@@ -18,6 +18,11 @@ beforeEach(() => {
   cleanup()
 })
 
+afterEach(() => {
+  vi.useRealTimers()
+  cleanup()
+})
+
 // Mock the WebSocket client
 const mockSend = vi.fn()
 const mockOnMessage = vi.fn(() => () => {})
@@ -458,6 +463,45 @@ describe('App Component - Share Button', () => {
     await waitFor(() => {
       expect(mockWriteText).toHaveBeenCalledWith('http://192.168.1.100:3001/?token=test-token-abc123')
     })
+
+    expect(screen.getByText('Copied!')).toBeInTheDocument()
+  })
+
+  it('clears the pending share copy reset timer on unmount', async () => {
+    const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout')
+    const mockWriteText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText: mockWriteText },
+      writable: true,
+      configurable: true,
+    })
+
+    const store = createTestStore()
+    act(() => {
+      store.dispatch(setNetworkStatus(makeNetworkStatus({
+        configured: true,
+        host: '0.0.0.0',
+        accessUrl: 'http://192.168.1.100:3001',
+      })))
+    })
+
+    const view = renderApp(store)
+    await openShareFromSettings()
+
+    await waitFor(() => {
+      expect(screen.getByText('Copy link')).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByText('Copy link'))
+
+    await waitFor(() => {
+      expect(screen.getByText('Copied!')).toBeInTheDocument()
+    })
+
+    view.unmount()
+
+    expect(clearTimeoutSpy).toHaveBeenCalled()
+    clearTimeoutSpy.mockRestore()
   })
 
   it('share panel can be closed by clicking X button', async () => {

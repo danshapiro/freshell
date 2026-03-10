@@ -5,7 +5,7 @@ const C1_CSI = '\x9b'
 const C1_DCS = '\x90'
 const C1_OSC = '\x9d'
 
-export type TurnCompleteSignalMode = 'shell' | 'claude' | 'codex' | 'opencode' | 'gemini' | 'kimi'
+export type TurnCompleteSignalMode = 'shell' | (string & {})
 
 export type TurnCompleteSignalParserState = {
   inOsc: boolean

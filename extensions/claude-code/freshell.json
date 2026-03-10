@@ -8,6 +8,7 @@
     "command": "claude",
     "envVar": "CLAUDE_CMD",
     "resumeArgs": ["--resume", "{{sessionId}}"],
+    "permissionModeArgs": ["--permission-mode", "{{permissionMode}}"],
     "supportsPermissionMode": true
   },
   "picker": {

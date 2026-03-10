@@ -813,17 +813,41 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
     registry.shutdown()
   })
 
-  it('skips providers without resume support', () => {
+  it('associates opencode sessions when resume is supported', () => {
     const registry = new TerminalRegistry()
     const broadcasts: any[] = []
 
-    registry.create({ mode: 'opencode', cwd: '/home/user/project' })
+    const term = registry.create({ mode: 'opencode', cwd: '/home/user/project' })
 
     associateOnUpdate(registry, [{
       projectPath: '/home/user/project',
       sessions: [{
         provider: 'opencode',
         sessionId: 'opencode-session-123',
+        projectPath: '/home/user/project',
+        updatedAt: Date.now(),
+        cwd: '/home/user/project',
+      }],
+    }], broadcasts)
+
+    expect(broadcasts).toHaveLength(1)
+    expect(broadcasts[0].terminalId).toBe(term.terminalId)
+    expect(registry.get(term.terminalId)?.resumeSessionId).toBe('opencode-session-123')
+
+    registry.shutdown()
+  })
+
+  it('skips providers without resume support', () => {
+    const registry = new TerminalRegistry()
+    const broadcasts: any[] = []
+
+    registry.create({ mode: 'gemini', cwd: '/home/user/project' })
+
+    associateOnUpdate(registry, [{
+      projectPath: '/home/user/project',
+      sessions: [{
+        provider: 'gemini',
+        sessionId: 'gemini-session-123',
         projectPath: '/home/user/project',
         updatedAt: Date.now(),
         cwd: '/home/user/project',

@@ -8,6 +8,8 @@
     "command": "codex",
     "envVar": "CODEX_CMD",
     "resumeArgs": ["resume", "{{sessionId}}"],
+    "modelArgs": ["--model", "{{model}}"],
+    "sandboxArgs": ["--sandbox", "{{sandbox}}"],
     "supportsModel": true,
     "supportsSandbox": true
   },

@@ -25,6 +25,7 @@ import { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { wireCodexActivityTracker } from './coding-cli/codex-activity-wiring.js'
 import { claudeProvider } from './coding-cli/providers/claude.js'
 import { codexProvider } from './coding-cli/providers/codex.js'
+import { opencodeProvider } from './coding-cli/providers/opencode.js'
 import { type CodingCliProviderName, type CodingCliSession } from './coding-cli/types.js'
 import { TerminalMetadataService } from './terminal-metadata-service.js'
 import { migrateSettingsSortMode } from './settings-migrate.js'
@@ -61,6 +62,14 @@ import { ExtensionManager } from './extension-manager.js'
 import { createExtensionRouter } from './extension-routes.js'
 import { createServerInfoRouter } from './server-info-router.js'
 import { SessionMetadataStore } from './session-metadata-store.js'
+
+function compileArgTemplate(
+  template: string[] | undefined,
+  placeholder: string,
+): ((value: string) => string[]) | undefined {
+  if (!template) return undefined
+  return (value: string) => template.map((arg) => arg.replaceAll(placeholder, value))
+}
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -133,7 +142,7 @@ async function main() {
   app.use('/api', httpAuthMiddleware)
   app.use('/api', createClientLogsRouter())
 
-  const codingCliProviders = [claudeProvider, codexProvider]
+  const codingCliProviders = [claudeProvider, codexProvider, opencodeProvider]
   const freshellConfigDir = path.join(os.homedir(), '.freshell')
   const sessionMetadataStore = new SessionMetadataStore(freshellConfigDir)
   const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders, {}, sessionMetadataStore)
@@ -166,7 +175,13 @@ async function main() {
       label: ext.manifest.label,
       envVar: cli.envVar || '',
       defaultCommand: cli.command,
-      supportsPermissionMode: cli.supportsPermissionMode,
+      args: cli.args,
+      env: cli.env,
+      modelArgs: compileArgTemplate(cli.modelArgs, '{{model}}'),
+      sandboxArgs: compileArgTemplate(cli.sandboxArgs, '{{sandbox}}'),
+      permissionModeArgs: compileArgTemplate(cli.permissionModeArgs, '{{permissionMode}}'),
+      permissionModeEnvVar: cli.permissionModeEnvVar,
+      permissionModeEnvValues: cli.permissionModeValues,
     }
     if (cli.resumeArgs) {
       const template = cli.resumeArgs
