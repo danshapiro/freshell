@@ -35,15 +35,7 @@ export const createCodingCliTab = createAsyncThunk(
     const createdTabId = state.tabs.tabs.find((t) => t.codingCliSessionId === requestId)?.id
 
     const ws = getWsClient()
-    try {
-      await ws.connect()
-    } catch (err) {
-      dispatch(resolveCodingCliRequest({ requestId }))
-      if (createdTabId) {
-        dispatch(updateTab({ id: createdTabId, updates: { status: 'error' } }))
-      }
-      throw err
-    }
+    // Connection is owned by App.tsx; messages will queue until ready
 
     let unsub: (() => void) | undefined
     let timeoutId: ReturnType<typeof setTimeout> | undefined

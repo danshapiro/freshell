@@ -1395,11 +1395,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
     async function ensure() {
       clearRateLimitRetry()
-      try {
-        await ws.connect()
-      } catch {
-        // handled elsewhere
-      }
+      // Connection is owned by App.tsx; messages will queue until ready
 
       unsub = ws.onMessage((msg) => {
         const tid = terminalIdRef.current

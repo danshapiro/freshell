@@ -43,7 +43,7 @@ export default function BackgroundSessions() {
     let unsub = () => {}
     let interval: number | null = null
 
-    ws.connect().catch(() => {})
+    // Connection is owned by App.tsx
     refresh()
     interval = window.setInterval(refresh, 5000)
 

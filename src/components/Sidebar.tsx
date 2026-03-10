@@ -267,9 +267,8 @@ export default function Sidebar({
   }, [ws])
 
   useEffect(() => {
-    ws.connect().catch(() => {})
-
-    // Register message handler BEFORE calling refresh to avoid race condition
+    // Register message handler BEFORE calling refresh to avoid race condition.
+    // Connection is owned by App.tsx
     const unsub = ws.onMessage((msg) => {
       if (msg.type === 'terminal.list.response' && msg.requestId === requestIdRef.current) {
         const incoming = msg.terminals || []

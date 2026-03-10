@@ -513,12 +513,10 @@ export default function App() {
       }
 
       // ── WebSocket setup (synchronous) ─────────────────────────────
-      // Register the message handler BEFORE any async work.  Child components
-      // (Sidebar, TerminalView, etc.) call ws.connect() in their own effects,
-      // so the WebSocket may become ready while we await the HTTP fetches
-      // below.  If the handler isn't registered yet, sdk.history (and other
-      // early messages) are silently lost — causing the "chat history lost on
-      // reload" bug.
+      // Register the message handler BEFORE any async work.  App.tsx is the
+      // sole owner of the WebSocket connection. The socket may become ready
+      // while we await HTTP fetches below; registering early avoids losing
+      // early messages.
       const ws = getWsClient()
       stopTabRegistrySync = startTabRegistrySync(appStore, ws)
 

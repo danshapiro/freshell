@@ -21,9 +21,8 @@ export default function SessionView({ sessionId, hidden }: SessionViewProps) {
   const ws = useMemo(() => getWsClient(), [])
   const events = useMemo(() => (session ? getCodingCliSessionEvents(session) : []), [session])
 
-  // Subscribe to WebSocket events for this session
+  // Subscribe to WebSocket events for this session — connection is owned by App.tsx
   useEffect(() => {
-    ws.connect().catch(() => {})
     const unsub = ws.onMessage((msg) => {
       if (msg.type === 'codingcli.event' && msg.sessionId === sessionId) {
         dispatch(addCodingCliEvent({ sessionId, event: msg.event as NormalizedEvent }))

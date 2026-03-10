@@ -74,7 +74,6 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
         refresh()
       }
     })
-    ws.connect().catch(() => {})
     return () => unsub()
   }, [ws])
 
