@@ -191,6 +191,33 @@ async function main() {
     .filter(e => e.manifest.category === 'cli')
     .map(e => e.manifest.name)
 
+  // Auto-enable newly-discovered CLI extensions
+  {
+    const currentSettings = await configStore.getSettings()
+    const hasKnownProviders = currentSettings.codingCli?.knownProviders !== undefined
+    const knownProviders: string[] = currentSettings.codingCli?.knownProviders ?? []
+    const enabledProviders: string[] = currentSettings.codingCli?.enabledProviders ?? []
+
+    if (!hasKnownProviders) {
+      // MIGRATION: First run after refactor. Seed knownProviders with ALL registered CLI names
+      // so nothing is treated as "new". Preserves the user's existing enabledProviders as-is.
+      await configStore.patchSettings({
+        codingCli: { knownProviders: allCliNames },
+      })
+    } else {
+      // NORMAL: Auto-enable truly new extensions (added after migration).
+      const newProviders = allCliNames.filter(name => !knownProviders.includes(name))
+      if (newProviders.length > 0) {
+        await configStore.patchSettings({
+          codingCli: {
+            knownProviders: [...knownProviders, ...newProviders],
+            enabledProviders: [...enabledProviders, ...newProviders],
+          },
+        })
+      }
+    }
+  }
+
   const server = http.createServer(app)
   const wsHandler = new WsHandler(
     server,

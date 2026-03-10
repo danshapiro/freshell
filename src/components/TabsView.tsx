@@ -19,7 +19,7 @@ import { addTab, setActiveTab } from '@/store/tabsSlice'
 import { addPane, initLayout } from '@/store/panesSlice'
 import { setTabRegistryLoading, setTabRegistrySearchRangeDays } from '@/store/tabRegistrySlice'
 import { selectTabsRegistryGroups } from '@/store/selectors/tabsRegistrySelectors'
-import { CODING_CLI_PROVIDERS } from '@/lib/coding-cli-utils'
+import { isNonShellMode } from '@/lib/coding-cli-utils'
 import type { PaneContentInput, SessionLocator } from '@/store/paneTypes'
 import type { CodingCliProviderName, TabMode } from '@/store/types'
 import type { AgentChatProviderName } from '@/lib/agent-chat-types'
@@ -29,12 +29,10 @@ type ScopeMode = 'all' | 'local' | 'remote'
 
 type DisplayRecord = RegistryTabRecord & { displayDeviceLabel: string }
 
-const CODING_CLI_PROVIDER_SET: ReadonlySet<CodingCliProviderName> = new Set(CODING_CLI_PROVIDERS)
-
 function parseSessionLocator(value: unknown): SessionLocator | undefined {
   if (!value || typeof value !== 'object') return undefined
   const candidate = value as { provider?: unknown; sessionId?: unknown; serverInstanceId?: unknown }
-  if (typeof candidate.provider !== 'string' || !CODING_CLI_PROVIDER_SET.has(candidate.provider as CodingCliProviderName)) {
+  if (typeof candidate.provider !== 'string' || !isNonShellMode(candidate.provider)) {
     return undefined
   }
   if (typeof candidate.sessionId !== 'string') return undefined

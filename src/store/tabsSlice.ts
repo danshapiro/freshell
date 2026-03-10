@@ -311,6 +311,7 @@ export const openSessionTab = createAsyncThunk(
     const resolvedSessionType = sessionType || resolvedProvider
     const state = getState() as RootState
     const localServerInstanceId = (state as Partial<RootState>).connection?.serverInstanceId
+    const extensions = (state as Partial<RootState>).extensions?.entries ?? []
 
     if (terminalId) {
       if (!forceNew) {
@@ -322,7 +323,7 @@ export const openSessionTab = createAsyncThunk(
       }
       // Running terminals are always terminal panes (agent-chat uses SDK, not PTY)
       dispatch(addTab({
-        title: title || getProviderLabel(resolvedProvider),
+        title: title || getProviderLabel(resolvedProvider, extensions),
         terminalId,
         status: 'running',
         mode: resolvedProvider,
@@ -374,7 +375,7 @@ export const openSessionTab = createAsyncThunk(
     }
 
     dispatch(addTab({
-      title: title || getProviderLabel(resolvedProvider),
+      title: title || getProviderLabel(resolvedProvider, extensions),
       mode: resolvedProvider,
       codingCliProvider: resolvedProvider,
       initialCwd: cwd,

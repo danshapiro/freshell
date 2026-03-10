@@ -4,8 +4,7 @@ import { migrateSettingsSortMode } from './settings-migrate.js'
 import { withPerfSpan } from './perf-logger.js'
 
 // --- SettingsPatchSchema (moved from settings-schema.ts) ---
-
-const CODING_CLI_PROVIDER_NAMES = ['claude', 'codex', 'opencode', 'gemini', 'kimi'] as const
+// Provider names are dynamic (driven by extension manifests), so we accept any non-empty string.
 
 const CodingCliProviderConfigSchema = z
   .object({
@@ -92,14 +91,13 @@ export const SettingsPatchSchema = z
     codingCli: z
       .object({
         enabledProviders: z
-          .array(z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi']))
+          .array(z.string().min(1))
+          .optional(),
+        knownProviders: z
+          .array(z.string().min(1))
           .optional(),
         providers: z
           .record(z.string(), CodingCliProviderConfigSchema)
-          .refine(
-            (obj) => Object.keys(obj).every((k) => (CODING_CLI_PROVIDER_NAMES as readonly string[]).includes(k)),
-            { message: 'Unknown provider name' },
-          )
           .optional(),
       })
       .strict()

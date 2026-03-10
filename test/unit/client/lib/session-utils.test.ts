@@ -231,7 +231,8 @@ describe('collectSessionLocatorsFromTabs', () => {
     const tabs = [
       { id: 'tab-invalid-explicit' },
       { id: 'tab-empty-server' },
-      { id: 'tab-invalid-provider-fallback', mode: 'codex', codingCliProvider: 'foo', resumeSessionId: 'bad-provider' },
+      // 'shell' is not a valid session provider (only non-shell modes are valid)
+      { id: 'tab-invalid-provider-fallback', mode: 'codex', codingCliProvider: 'shell', resumeSessionId: 'bad-provider' },
       { id: 'tab-empty-session-fallback', mode: 'codex', resumeSessionId: '' },
       { id: 'tab-valid-fallback', mode: 'codex', resumeSessionId: 'tab-valid' },
     ] as unknown as RootState['tabs']['tabs']
@@ -239,7 +240,7 @@ describe('collectSessionLocatorsFromTabs', () => {
     const panes = {
       layouts: {
         'tab-invalid-explicit': leaf('pane-invalid-explicit', terminalContent('codex', 'resume-valid', {
-          provider: 'foo',
+          provider: 'shell',
           sessionId: '',
           serverInstanceId: '',
         } as unknown as SessionLocator)),

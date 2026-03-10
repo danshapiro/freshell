@@ -2675,7 +2675,8 @@ describe('panesSlice', () => {
 
       // Find the new pane ID (it's the active pane after split)
       const newPaneId = result.activePane['tab-1']
-      expect(result.paneTitles['tab-1'][newPaneId]).toBe('Claude CLI')
+      // Without extensions, derivePaneTitle capitalizes the provider name
+      expect(result.paneTitles['tab-1'][newPaneId]).toBe('Claude')
     })
   })
 
@@ -2698,7 +2699,8 @@ describe('panesSlice', () => {
       }))
 
       const newPaneId = result.activePane['tab-1']
-      expect(result.paneTitles['tab-1'][newPaneId]).toBe('Codex CLI')
+      // Without extensions, derivePaneTitle capitalizes the provider name
+      expect(result.paneTitles['tab-1'][newPaneId]).toBe('Codex')
     })
   })
 
@@ -2737,8 +2739,8 @@ describe('panesSlice', () => {
         content: { kind: 'terminal', createRequestId: 'req-1', status: 'running', mode: 'claude' },
       }))
 
-      // derivePaneTitle for claude mode returns 'Claude CLI'
-      expect(result.paneTitles['tab-1']['pane-1']).toBe('Claude CLI')
+      // Without extensions, derivePaneTitle capitalizes the provider name
+      expect(result.paneTitles['tab-1']['pane-1']).toBe('Claude')
     })
 
     it('updatePaneTitle sets paneTitleSetByUser to true', () => {

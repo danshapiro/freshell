@@ -133,9 +133,7 @@ export function mergeSettings(base: AppSettings, patch: DeepPartial<AppSettings>
     },
     codingCli: {
       ...merged.codingCli,
-      enabledProviders: (merged.codingCli.enabledProviders ?? []).filter(
-        (provider): provider is CodingCliProviderName => provider === 'claude' || provider === 'codex' || provider === 'opencode',
-      ),
+      enabledProviders: merged.codingCli.enabledProviders ?? [],
     },
   }
 }

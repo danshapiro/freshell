@@ -149,14 +149,15 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   const attentionDismiss = useAppSelector((s) => s.settings?.settings?.panes?.attentionDismiss ?? 'click')
   const iconsOnTabs = useAppSelector((s) => s.settings?.settings?.panes?.iconsOnTabs ?? true)
   const tabAttentionStyle = useAppSelector((s) => s.settings?.settings?.panes?.tabAttentionStyle ?? 'highlight')
+  const extensions = useAppSelector((s) => s.extensions?.entries)
 
   const ws = useMemo(() => getWsClient(), [])
 
   // Compute display title for a single tab
   // Priority: user-set title > programmatically-set title (e.g., from Claude) > derived name
   const getDisplayTitle = useCallback(
-    (tab: Tab): string => getTabDisplayTitle(tab, paneLayouts[tab.id]),
-    [paneLayouts]
+    (tab: Tab): string => getTabDisplayTitle(tab, paneLayouts[tab.id], extensions),
+    [paneLayouts, extensions]
   )
 
   const getPaneContents = useCallback((tab: Tab): PaneContent[] | undefined => {

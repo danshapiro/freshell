@@ -2,7 +2,7 @@
  * Session utilities for extracting session information from store state.
  */
 
-import { isCodingCliProviderName } from '@/lib/coding-cli-utils'
+import { isNonShellMode } from '@/lib/coding-cli-utils'
 import type { PaneContent, PaneNode, SessionLocator } from '@/store/paneTypes'
 import type { RootState } from '@/store/store'
 import type { CodingCliProviderName } from '@/store/types'
@@ -20,7 +20,8 @@ function isNonEmptyString(value: unknown): value is string {
 }
 
 function isValidSessionRef(provider: string, sessionId: string): provider is CodingCliProviderName {
-  if (!isCodingCliProviderName(provider) || sessionId.length === 0) return false
+  // Provider names are validated at creation time; here we just check it's a valid non-shell mode.
+  if (!isNonShellMode(provider) || sessionId.length === 0) return false
   return provider !== 'claude' || isValidClaudeSessionId(sessionId)
 }
 
@@ -108,7 +109,7 @@ function extractSessionLocators(content: PaneContent): Array<{
   }
   if (content.kind !== 'terminal') return dedupeBy(locators, locatorIdentity)
   if (content.mode === 'shell') return dedupeBy(locators, locatorIdentity)
-  if (!isCodingCliProviderName(content.mode)) return dedupeBy(locators, locatorIdentity)
+  if (!isNonShellMode(content.mode)) return dedupeBy(locators, locatorIdentity)
   const sessionId = content.resumeSessionId
   if (!sessionId) return dedupeBy(locators, locatorIdentity)
   if (content.mode === 'claude' && !isValidClaudeSessionId(sessionId)) return dedupeBy(locators, locatorIdentity)

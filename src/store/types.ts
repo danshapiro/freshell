@@ -119,6 +119,7 @@ export type ClaudePermissionMode = 'default' | 'plan' | 'acceptEdits' | 'bypassP
 
 export interface CodingCliSettings {
   enabledProviders: CodingCliProviderName[]
+  knownProviders?: string[]  // tracks which CLI extensions the server has seen
   providers: Partial<Record<CodingCliProviderName, {
     model?: string
     sandbox?: CodexSandboxMode

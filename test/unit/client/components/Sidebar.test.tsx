@@ -10,8 +10,23 @@ import panesReducer from '@/store/panesSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
+import extensionsReducer from '@/store/extensionsSlice'
 import type { ProjectGroup, BackgroundTerminal, TabMode } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
+import type { ClientExtensionEntry } from '@shared/extension-types'
+
+const defaultCliExtensions: ClientExtensionEntry[] = [
+  {
+    name: 'claude', version: '1.0.0', label: 'Claude CLI', description: '', category: 'cli',
+    picker: { shortcut: 'L' },
+    cli: { supportsPermissionMode: true, supportsResume: true, resumeCommandTemplate: ['claude', '--resume', '{{sessionId}}'] },
+  },
+  {
+    name: 'codex', version: '1.0.0', label: 'Codex CLI', description: '', category: 'cli',
+    picker: { shortcut: 'X' },
+    cli: { supportsModel: true, supportsSandbox: true, supportsResume: true, resumeCommandTemplate: ['codex', 'resume', '{{sessionId}}'] },
+  },
+]
 
 // Mock react-window's List component
 vi.mock('react-window', () => ({
@@ -126,6 +141,7 @@ function createTestStore(options?: {
       connection: connectionReducer,
       sessions: sessionsReducer,
       sessionActivity: sessionActivityReducer,
+      extensions: extensionsReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -169,6 +185,9 @@ function createTestStore(options?: {
       },
       sessionActivity: {
         sessions: options?.sessionActivity ?? {},
+      },
+      extensions: {
+        entries: defaultCliExtensions,
       },
     },
   })

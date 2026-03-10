@@ -34,10 +34,11 @@ export function TabSwitcher({ onClose }: TabSwitcherProps) {
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
   const paneLayouts = useAppSelector((s) => s.panes.layouts)
   const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
+  const extensions = useAppSelector((s) => s.extensions?.entries)
 
   const getDisplayTitle = useCallback(
-    (tab: Tab): string => getTabDisplayTitle(tab, paneLayouts[tab.id]),
-    [paneLayouts]
+    (tab: Tab): string => getTabDisplayTitle(tab, paneLayouts[tab.id], extensions),
+    [paneLayouts, extensions]
   )
 
   const handleCardClick = useCallback(

@@ -158,6 +158,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const tabTerminalId = tab?.terminalId
   const paneTitles = useAppSelector((s) => s.panes.paneTitles[tabId] ?? EMPTY_PANE_TITLES)
+  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? [])
   const terminalMetaById = useAppSelector(
     (s) => s.terminalMeta?.byTerminalId ?? EMPTY_TERMINAL_META_BY_ID
   )
@@ -206,7 +207,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     // Only handle the request if this PaneContainer renders the target pane as a leaf
     if (node.type !== 'leaf' || node.id !== renameRequestPaneId) return
 
-    const currentTitle = paneTitles[node.id] ?? derivePaneTitle(node.content)
+    const currentTitle = paneTitles[node.id] ?? derivePaneTitle(node.content, extensionEntries)
     setRenamingPaneId(node.id)
     setRenameValue(currentTitle)
     setRenameError(null)
@@ -371,7 +372,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   // Render a leaf pane
   if (node.type === 'leaf') {
     const explicitTitle = paneTitles[node.id]
-    const paneTitle = explicitTitle ?? derivePaneTitle(node.content)
+    const paneTitle = explicitTitle ?? derivePaneTitle(node.content, extensionEntries)
     const paneStatus = node.content.kind === 'terminal'
       ? node.content.status
       : node.content.kind === 'agent-chat'
@@ -508,6 +509,7 @@ function PickerWrapper({
 }) {
   const dispatch = useAppDispatch()
   const settings = useAppSelector((s) => s.settings?.settings)
+  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? [])
   const paneLayout = useAppSelector((s) => s.panes.layouts[tabId])
   const tabPref = useMemo(
     () => paneLayout ? getTabDirectoryPreference(paneLayout) : { defaultCwd: undefined, tabDirectories: [] },
@@ -544,7 +546,7 @@ function PickerWrapper({
       }
     }
 
-    if (isCodingCliProviderName(type)) {
+    if (isCodingCliProviderName(type, extensionEntries)) {
       return {
         kind: 'terminal',
         mode: type,
@@ -607,7 +609,7 @@ function PickerWrapper({
       default:
         throw new Error(`Unsupported pane type: ${String(type)}`)
     }
-  }, [])
+  }, [extensionEntries, settings])
 
   const handleSelect = useCallback((type: PanePickerType) => {
     if (isAgentChatProviderName(type)) {
@@ -615,14 +617,14 @@ function PickerWrapper({
       return
     }
 
-    if (isCodingCliProviderName(type)) {
+    if (isCodingCliProviderName(type, extensionEntries)) {
       setStep({ step: 'directory', providerType: type })
       return
     }
 
     const newContent = createContentForType(type)
     dispatch(updatePaneContent({ tabId, paneId, content: newContent }))
-  }, [createContentForType, dispatch, tabId, paneId])
+  }, [createContentForType, dispatch, tabId, paneId, extensionEntries])
 
   const handleDirectoryConfirm = useCallback((cwd: string) => {
     if (step.step !== 'directory') return
@@ -651,7 +653,7 @@ function PickerWrapper({
   if (step.step === 'directory') {
     const providerType = step.providerType
     const agentConfig = getAgentChatProviderConfig(providerType)
-    const providerLabel = agentConfig ? agentConfig.label : getProviderLabel(providerType)
+    const providerLabel = agentConfig ? agentConfig.label : getProviderLabel(providerType, extensionEntries)
     const settingsKey = (agentConfig ? agentConfig.codingCliProvider : providerType) as CodingCliProviderName
     const globalDefault = settings?.codingCli?.providers?.[settingsKey]?.cwd
     const defaultCwd = tabPref.defaultCwd ?? globalDefault

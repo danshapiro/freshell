@@ -7,6 +7,21 @@ import tabsReducer from '../../../../src/store/tabsSlice'
 import panesReducer from '../../../../src/store/panesSlice'
 import connectionReducer from '../../../../src/store/connectionSlice'
 import settingsReducer, { defaultSettings } from '../../../../src/store/settingsSlice'
+import extensionsReducer from '../../../../src/store/extensionsSlice'
+import type { ClientExtensionEntry } from '../../../../shared/extension-types'
+
+const defaultCliExtensions: ClientExtensionEntry[] = [
+  {
+    name: 'claude', version: '1.0.0', label: 'Claude CLI', description: '', category: 'cli',
+    picker: { shortcut: 'L' },
+    cli: { supportsPermissionMode: true, supportsResume: true, resumeCommandTemplate: ['claude', '--resume', '{{sessionId}}'] },
+  },
+  {
+    name: 'codex', version: '1.0.0', label: 'Codex CLI', description: '', category: 'cli',
+    picker: { shortcut: 'X' },
+    cli: { supportsModel: true, supportsSandbox: true, supportsResume: true, resumeCommandTemplate: ['codex', 'resume', '{{sessionId}}'] },
+  },
+]
 
 // Mock ws-client
 vi.mock('@/lib/ws-client', () => ({
@@ -33,10 +48,14 @@ function createStore(tabsState: any, panesState: any) {
       panes: panesReducer,
       connection: connectionReducer,
       settings: settingsReducer,
+      extensions: extensionsReducer,
     },
     preloadedState: {
       tabs: tabsState,
       panes: panesState,
+      extensions: {
+        entries: defaultCliExtensions,
+      },
       connection: { status: 'connected', error: null, reconnectAttempts: 0 },
       settings: {
         settings: defaultSettings,

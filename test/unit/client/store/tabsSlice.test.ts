@@ -13,6 +13,7 @@ import tabsReducer, {
 } from '../../../../src/store/tabsSlice'
 import panesReducer, { initLayout } from '../../../../src/store/panesSlice'
 import connectionReducer from '../../../../src/store/connectionSlice'
+import extensionsReducer from '../../../../src/store/extensionsSlice'
 import type { Tab } from '../../../../src/store/types'
 
 const VALID_CLAUDE_SESSION_ID = '550e8400-e29b-41d4-a716-446655440000'
@@ -693,6 +694,14 @@ describe('tabsSlice', () => {
         reducer: {
           tabs: tabsReducer,
           panes: panesReducer,
+          extensions: extensionsReducer,
+        },
+        preloadedState: {
+          extensions: {
+            entries: [
+              { name: 'codex', label: 'Codex CLI', category: 'cli', version: '1.0.0', description: '' },
+            ],
+          },
         },
       })
 
@@ -711,6 +720,14 @@ describe('tabsSlice', () => {
         reducer: {
           tabs: tabsReducer,
           panes: panesReducer,
+          extensions: extensionsReducer,
+        },
+        preloadedState: {
+          extensions: {
+            entries: [
+              { name: 'codex', label: 'Codex CLI', category: 'cli', version: '1.0.0', description: '' },
+            ],
+          },
         },
       })
 

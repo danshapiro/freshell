@@ -9,6 +9,18 @@ import extensionsReducer from '@/store/extensionsSlice'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import type { DefaultNewPane, SidebarSortMode, TerminalTheme } from '@/store/types'
 
+const mockClaudeExt: ClientExtensionEntry = {
+  name: 'claude', version: '1.0.0', label: 'Claude CLI', description: '', category: 'cli',
+  picker: { shortcut: 'L' },
+  cli: { supportsPermissionMode: true, supportsResume: true, resumeCommandTemplate: ['claude', '--resume', '{{sessionId}}'] },
+}
+const mockCodexExt: ClientExtensionEntry = {
+  name: 'codex', version: '1.0.0', label: 'Codex CLI', description: '', category: 'cli',
+  picker: { shortcut: 'X' },
+  cli: { supportsModel: true, supportsSandbox: true, supportsResume: true, resumeCommandTemplate: ['codex', 'resume', '{{sessionId}}'] },
+}
+const defaultCliExtensions: ClientExtensionEntry[] = [mockClaudeExt, mockCodexExt]
+
 // Mock lucide-react icons
 vi.mock('lucide-react', () => ({
   Terminal: ({ className }: { className?: string }) => (
@@ -137,6 +149,7 @@ describe('PanePicker', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
+        extensions: defaultCliExtensions,
       })
       expect(screen.getByRole('button', { name: 'Claude CLI' })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Codex CLI' })).toBeInTheDocument()
@@ -146,6 +159,7 @@ describe('PanePicker', () => {
       renderPicker({
         availableClis: { claude: false, codex: true },
         enabledProviders: ['claude', 'codex'],
+        extensions: defaultCliExtensions,
       })
       expect(screen.queryByRole('button', { name: 'Claude CLI' })).not.toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Codex CLI' })).toBeInTheDocument()
@@ -155,6 +169,7 @@ describe('PanePicker', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude'],
+        extensions: defaultCliExtensions,
       })
       expect(screen.getByRole('button', { name: 'Claude CLI' })).toBeInTheDocument()
       expect(screen.queryByRole('button', { name: 'Codex CLI' })).not.toBeInTheDocument()
@@ -164,6 +179,7 @@ describe('PanePicker', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
+        extensions: defaultCliExtensions,
       })
       const claudeButton = screen.getByRole('button', { name: 'Claude CLI' })
       const codexButton = screen.getByRole('button', { name: 'Codex CLI' })
@@ -179,6 +195,7 @@ describe('PanePicker', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
+        extensions: defaultCliExtensions,
       })
       const buttons = screen.getAllByRole('button')
       const labels = buttons.map(b => b.getAttribute('aria-label'))
@@ -195,6 +212,7 @@ describe('PanePicker', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
+        extensions: defaultCliExtensions,
         featureFlags: { kilroy: true },
       })
       const buttons = screen.getAllByRole('button')
@@ -250,6 +268,7 @@ describe('PanePicker', () => {
       const { onSelect } = renderPicker({
         availableClis: { claude: true },
         enabledProviders: ['claude'],
+        extensions: defaultCliExtensions,
       })
       fireEvent.click(screen.getByRole('button', { name: 'Claude CLI' }))
       completeFadeAnimation()
@@ -278,6 +297,7 @@ describe('PanePicker', () => {
       const { onSelect } = renderPicker({
         availableClis: { claude: true },
         enabledProviders: ['claude'],
+        extensions: defaultCliExtensions,
       })
       fireEvent.keyDown(getContainer(), { key: 'l' })
       completeFadeAnimation()
@@ -288,6 +308,7 @@ describe('PanePicker', () => {
       const { onSelect } = renderPicker({
         availableClis: { codex: true },
         enabledProviders: ['codex'],
+        extensions: defaultCliExtensions,
       })
       fireEvent.keyDown(getContainer(), { key: 'x' })
       completeFadeAnimation()
@@ -479,6 +500,7 @@ describe('PanePicker', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
+        extensions: defaultCliExtensions,
       })
 
       const rows = screen.getAllByTestId('pane-picker-option-row')

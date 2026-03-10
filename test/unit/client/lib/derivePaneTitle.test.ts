@@ -28,24 +28,26 @@ describe('derivePaneTitle', () => {
     expect(derivePaneTitle(content)).toBe('Shell')
   })
 
-  it('returns "Claude CLI" for claude mode terminal', () => {
+  it('returns capitalized provider name for claude mode terminal', () => {
     const content: PaneContent = {
       kind: 'terminal',
       mode: 'claude',
       status: 'running',
       createRequestId: 'test',
     }
-    expect(derivePaneTitle(content)).toBe('Claude CLI')
+    // Without extensions, getProviderLabel capitalizes the provider name
+    expect(derivePaneTitle(content)).toBe('Claude')
   })
 
-  it('returns "Codex CLI" for codex mode terminal', () => {
+  it('returns capitalized provider name for codex mode terminal', () => {
     const content: PaneContent = {
       kind: 'terminal',
       mode: 'codex',
       status: 'running',
       createRequestId: 'test',
     }
-    expect(derivePaneTitle(content)).toBe('Codex CLI')
+    // Without extensions, getProviderLabel capitalizes the provider name
+    expect(derivePaneTitle(content)).toBe('Codex')
   })
 
   it('returns "Gemini" for gemini mode terminal', () => {

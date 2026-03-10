@@ -9,7 +9,22 @@ import panesReducer from '@/store/panesSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import settingsReducer from '@/store/settingsSlice'
+import extensionsReducer from '@/store/extensionsSlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
+import type { ClientExtensionEntry } from '@shared/extension-types'
+
+const defaultCliExtensions: ClientExtensionEntry[] = [
+  {
+    name: 'claude', version: '1.0.0', label: 'Claude CLI', description: '', category: 'cli',
+    picker: { shortcut: 'L' },
+    cli: { supportsPermissionMode: true, supportsResume: true, resumeCommandTemplate: ['claude', '--resume', '{{sessionId}}'] },
+  },
+  {
+    name: 'codex', version: '1.0.0', label: 'Codex CLI', description: '', category: 'cli',
+    picker: { shortcut: 'X' },
+    cli: { supportsModel: true, supportsSandbox: true, supportsResume: true, resumeCommandTemplate: ['codex', 'resume', '{{sessionId}}'] },
+  },
+]
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import TabBar from '@/components/TabBar'
 import Pane from '@/components/panes/Pane'
@@ -54,6 +69,7 @@ function createTestStore(options?: { platform?: string | null }) {
       sessions: sessionsReducer,
       connection: connectionReducer,
       settings: settingsReducer,
+      extensions: extensionsReducer,
     },
     middleware: (getDefaultMiddleware) =>
       getDefaultMiddleware({ serializableCheck: false }),
@@ -96,6 +112,9 @@ function createTestStore(options?: { platform?: string | null }) {
         projects: [],
         expandedProjects: new Set<string>(),
       },
+      extensions: {
+        entries: defaultCliExtensions,
+      },
       connection: {
         status: 'ready',
         platform: options?.platform ?? null,
@@ -128,6 +147,7 @@ function createStoreWithSession() {
       panes: panesReducer,
       sessions: sessionsReducer,
       settings: settingsReducer,
+      extensions: extensionsReducer,
     },
     middleware: (getDefaultMiddleware) =>
       getDefaultMiddleware({ serializableCheck: false }),
@@ -187,6 +207,9 @@ function createStoreWithSession() {
         ],
         expandedProjects: new Set<string>(),
       },
+      extensions: {
+        entries: defaultCliExtensions,
+      },
     },
   })
 }
@@ -199,6 +222,7 @@ function createStoreWithBrowserPane(options?: { zoomedPaneId?: string }) {
       sessions: sessionsReducer,
       connection: connectionReducer,
       settings: settingsReducer,
+      extensions: extensionsReducer,
     },
     middleware: (getDefaultMiddleware) =>
       getDefaultMiddleware({ serializableCheck: false }),
@@ -243,6 +267,9 @@ function createStoreWithBrowserPane(options?: { zoomedPaneId?: string }) {
         projects: [],
         expandedProjects: new Set<string>(),
       },
+      extensions: {
+        entries: defaultCliExtensions,
+      },
       connection: {
         status: 'ready',
         platform: null,
@@ -259,6 +286,7 @@ function createStoreWithTerminalPane() {
       sessions: sessionsReducer,
       connection: connectionReducer,
       settings: settingsReducer,
+      extensions: extensionsReducer,
     },
     middleware: (getDefaultMiddleware) =>
       getDefaultMiddleware({ serializableCheck: false }),
@@ -298,6 +326,9 @@ function createStoreWithTerminalPane() {
       sessions: {
         projects: [],
         expandedProjects: new Set<string>(),
+      },
+      extensions: {
+        entries: defaultCliExtensions,
       },
       connection: {
         status: 'ready',
@@ -598,6 +629,7 @@ describe('ContextMenuProvider', () => {
         sessions: sessionsReducer,
         connection: connectionReducer,
         settings: settingsReducer,
+        extensions: extensionsReducer,
       },
       middleware: (getDefaultMiddleware) =>
         getDefaultMiddleware({ serializableCheck: false }),
@@ -615,6 +647,9 @@ describe('ContextMenuProvider', () => {
           ],
           activeTabId: 'tab-1',
           renameRequestTabId: null,
+        },
+        extensions: {
+          entries: defaultCliExtensions,
         },
         panes: {
           layouts: {
@@ -673,6 +708,7 @@ describe('ContextMenuProvider', () => {
         sessions: sessionsReducer,
         connection: connectionReducer,
         settings: settingsReducer,
+        extensions: extensionsReducer,
       },
       middleware: (getDefaultMiddleware) =>
         getDefaultMiddleware({ serializableCheck: false }),
@@ -690,6 +726,9 @@ describe('ContextMenuProvider', () => {
           ],
           activeTabId: 'tab-1',
           renameRequestTabId: null,
+        },
+        extensions: {
+          entries: defaultCliExtensions,
         },
         panes: {
           layouts: {
@@ -792,6 +831,7 @@ describe('ContextMenuProvider', () => {
         sessions: sessionsReducer,
         connection: connectionReducer,
         settings: settingsReducer,
+        extensions: extensionsReducer,
       },
       middleware: (getDefaultMiddleware) =>
         getDefaultMiddleware({ serializableCheck: false }),
@@ -855,6 +895,9 @@ describe('ContextMenuProvider', () => {
         sessions: {
           projects: [],
           expandedProjects: new Set<string>(),
+        },
+        extensions: {
+          entries: defaultCliExtensions,
         },
         connection: {
           status: 'ready',

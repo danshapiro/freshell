@@ -749,7 +749,8 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
 
 export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
   const { item, isActiveTab, showProjectBadge, onClick } = props
-  const { icon: SessionIcon, label: sessionLabel } = resolveSessionTypeConfig(item.sessionType)
+  const extensionEntries = useAppSelector((s) => s.extensions?.entries)
+  const { icon: SessionIcon, label: sessionLabel } = resolveSessionTypeConfig(item.sessionType, extensionEntries)
   return (
     <Tooltip>
       <TooltipTrigger asChild>

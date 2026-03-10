@@ -1,6 +1,6 @@
 import { Terminal, Globe, FileText, LayoutGrid } from 'lucide-react'
 import { ProviderIcon } from '@/components/icons/provider-icons'
-import { isCodingCliMode } from '@/lib/coding-cli-utils'
+import { isNonShellMode } from '@/lib/coding-cli-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import type { PaneContent } from '@/store/paneTypes'
 
@@ -11,7 +11,7 @@ interface PaneIconProps {
 
 export default function PaneIcon({ content, className }: PaneIconProps) {
   if (content.kind === 'terminal') {
-    if (isCodingCliMode(content.mode)) {
+    if (isNonShellMode(content.mode)) {
       return <ProviderIcon provider={content.mode} className={className} />
     }
     return <Terminal className={className} />

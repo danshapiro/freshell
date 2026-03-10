@@ -1,6 +1,6 @@
-import type { CodingCliProviderName } from '@shared/ws-protocol'
-
-export type { CodingCliProviderName } from '@shared/ws-protocol'
+// CodingCliProviderName is now a wide string type — any registered extension name is valid.
+// The shared ws-protocol module's CodingCliProviderSchema infers to `string` after widening.
+export type CodingCliProviderName = string
 
 export type NormalizedEventType =
   | 'session.start'       // Session initialized (was session.init)

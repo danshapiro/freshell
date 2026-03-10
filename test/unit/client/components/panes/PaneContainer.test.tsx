@@ -7,6 +7,7 @@ import panesReducer from '@/store/panesSlice'
 import tabsReducer from '@/store/tabsSlice'
 import settingsReducer from '@/store/settingsSlice'
 import connectionReducer, { ConnectionState } from '@/store/connectionSlice'
+import extensionsReducer from '@/store/extensionsSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import sessionsReducer, { applySessionsPatch, type SessionsState } from '@/store/sessionsSlice'
 import agentChatReducer, { turnResult } from '@/store/agentChatSlice'
@@ -15,6 +16,20 @@ import { markTabAttention, markPaneAttention } from '@/store/turnCompletionSlice
 import type { PanesState } from '@/store/panesSlice'
 import type { PaneNode, PaneContent, EditorPaneContent } from '@/store/paneTypes'
 import type { AgentChatState } from '@/store/agentChatTypes'
+import type { ClientExtensionEntry } from '@shared/extension-types'
+
+const defaultCliExtensions: ClientExtensionEntry[] = [
+  {
+    name: 'claude', version: '1.0.0', label: 'Claude CLI', description: '', category: 'cli',
+    picker: { shortcut: 'L' },
+    cli: { supportsPermissionMode: true, supportsResume: true, resumeCommandTemplate: ['claude', '--resume', '{{sessionId}}'] },
+  },
+  {
+    name: 'codex', version: '1.0.0', label: 'Codex CLI', description: '', category: 'cli',
+    picker: { shortcut: 'X' },
+    cli: { supportsModel: true, supportsSandbox: true, supportsResume: true, resumeCommandTemplate: ['codex', 'resume', '{{sessionId}}'] },
+  },
+]
 
 // Hoist mock functions so vi.mock can reference them
 const {
@@ -192,6 +207,7 @@ function createStore(
       tabs: tabsReducer,
       settings: settingsReducer,
       connection: connectionReducer,
+      extensions: extensionsReducer,
       terminalMeta: terminalMetaReducer,
       sessions: sessionsReducer,
       agentChat: agentChatReducer,
@@ -217,6 +233,9 @@ function createStore(
       tabs: {
         tabs: [{ id: 'tab-1', createRequestId: 'tab-1', title: 'Tab 1', mode: 'shell' as const, status: 'running' as const, createdAt: 1 }],
         activeTabId: 'tab-1',
+      },
+      extensions: {
+        entries: defaultCliExtensions,
       },
       connection: {
         status: 'disconnected',
@@ -1262,6 +1281,7 @@ describe('PaneContainer', () => {
           tabs: tabsReducer,
           settings: settingsReducer,
           connection: connectionReducer,
+          extensions: extensionsReducer,
           terminalMeta: terminalMetaReducer,
           turnCompletion: turnCompletionReducer,
         },
@@ -1278,6 +1298,9 @@ describe('PaneContainer', () => {
           tabs: {
             tabs: [{ id: 'tab-1', createRequestId: 'tab-1', title: 'Tab 1', mode: 'shell' as const, status: 'running' as const, createdAt: 1 }],
             activeTabId: 'tab-1',
+          },
+          extensions: {
+            entries: defaultCliExtensions,
           },
           connection: {
             status: 'ready' as const,
@@ -1475,6 +1498,7 @@ describe('PaneContainer', () => {
           tabs: tabsReducer,
           settings: settingsReducer,
           connection: connectionReducer,
+          extensions: extensionsReducer,
           terminalMeta: terminalMetaReducer,
           turnCompletion: turnCompletionReducer,
         },
@@ -1503,6 +1527,7 @@ describe('PaneContainer', () => {
             tabs: [{ id: 'tab-1', createRequestId: 'tab-1', title: 'Tab 1', mode: 'shell' as const, status: 'running' as const, createdAt: 1 }],
             activeTabId: 'tab-1',
           },
+          extensions: { entries: defaultCliExtensions },
           connection: { status: 'disconnected', platform: null, availableClis: {} },
           terminalMeta: { byTerminalId: {} },
           settings: {

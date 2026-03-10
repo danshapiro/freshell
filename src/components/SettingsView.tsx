@@ -30,7 +30,7 @@ import { initLayout } from '@/store/panesSlice'
 import { fetchFirewallConfig } from '@/lib/firewall-configure'
 import { nanoid } from '@reduxjs/toolkit'
 import type { AppView } from '@/components/Sidebar'
-import { CODING_CLI_PROVIDER_CONFIGS } from '@/lib/coding-cli-utils'
+import { getCliProviderConfigs } from '@/lib/coding-cli-utils'
 import { createLogger } from '@/lib/client-logger'
 import { buildKnownDevices, type KnownDevice } from '@/lib/known-devices'
 import { parseNormalizedLineList } from '@shared/string-list'
@@ -177,6 +177,8 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     () => settings.codingCli?.enabledProviders ?? [],
     [settings.codingCli?.enabledProviders],
   )
+  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? [])
+  const cliProviderConfigs = useMemo(() => getCliProviderConfigs(extensionEntries), [extensionEntries])
   const tabRegistryState = useAppSelector((s) => (s as any).tabRegistry)
   const tabRegistry = tabRegistryState ?? {
     deviceId: 'local-device',
@@ -312,7 +314,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   // Per-provider cwd state
   const [providerCwdInputs, setProviderCwdInputs] = useState<Record<string, string>>(() => {
     const initial: Record<string, string> = {}
-    for (const config of CODING_CLI_PROVIDER_CONFIGS) {
+    for (const config of cliProviderConfigs) {
       initial[config.name] = settings.codingCli?.providers?.[config.name]?.cwd ?? ''
     }
     return initial
@@ -322,13 +324,13 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   const providerCwdValidationRef = useRef<Record<string, number>>({})
   const lastSettingsProviderCwdRef = useRef<Record<string, string>>(
     Object.fromEntries(
-      CODING_CLI_PROVIDER_CONFIGS.map((c) => [c.name, settings.codingCli?.providers?.[c.name]?.cwd ?? ''])
+      cliProviderConfigs.map((c) => [c.name, settings.codingCli?.providers?.[c.name]?.cwd ?? ''])
     )
   )
 
   // Sync provider cwd inputs when settings load or change externally
   useEffect(() => {
-    for (const config of CODING_CLI_PROVIDER_CONFIGS) {
+    for (const config of cliProviderConfigs) {
       const next = settings.codingCli?.providers?.[config.name]?.cwd ?? ''
       const last = lastSettingsProviderCwdRef.current[config.name] ?? ''
       if (next !== last) {
@@ -1060,7 +1062,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
 
           {/* Coding CLIs */}
           <SettingsSection title="Coding CLIs" description="Providers and defaults for coding sessions">
-            {CODING_CLI_PROVIDER_CONFIGS.map((provider) => (
+            {cliProviderConfigs.map((provider) => (
               <SettingsRow key={`enable-${provider.name}`} label={`Enable ${provider.label}`}>
                 <Toggle
                   checked={enabledProviders.includes(provider.name)}
@@ -1069,7 +1071,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               </SettingsRow>
             ))}
 
-            {CODING_CLI_PROVIDER_CONFIGS.map((provider) => {
+            {cliProviderConfigs.map((provider) => {
               const providerSettings = settings.codingCli?.providers?.[provider.name] || {}
 
               return (

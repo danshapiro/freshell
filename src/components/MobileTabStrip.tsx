@@ -19,12 +19,13 @@ export function MobileTabStrip({ onOpenSwitcher, sidebarCollapsed, onToggleSideb
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
   const paneLayouts = useAppSelector((s) => s.panes.layouts)
   const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
+  const extensions = useAppSelector((s) => s.extensions?.entries)
 
   const activeIndex = tabs.findIndex((t) => t.id === activeTabId)
   const activeTab = activeIndex >= 0 ? tabs[activeIndex] : null
 
   const displayTitle = activeTab
-    ? getTabDisplayTitle(activeTab, paneLayouts[activeTab.id])
+    ? getTabDisplayTitle(activeTab, paneLayouts[activeTab.id], extensions)
     : ''
   const isActiveBusy = activeTab
     ? getBusyCodexActivityTerminalIdsForTab(activeTab, paneLayouts, codexActivityByTerminalId).length > 0

@@ -7,7 +7,22 @@ import panesReducer from '@/store/panesSlice'
 import tabsReducer from '@/store/tabsSlice'
 import settingsReducer from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
+import extensionsReducer from '@/store/extensionsSlice'
 import type { PaneNode } from '@/store/paneTypes'
+import type { ClientExtensionEntry } from '@shared/extension-types'
+
+const defaultCliExtensions: ClientExtensionEntry[] = [
+  {
+    name: 'claude', version: '1.0.0', label: 'Claude CLI', description: '', category: 'cli',
+    picker: { shortcut: 'L' },
+    cli: { supportsPermissionMode: true, supportsResume: true, resumeCommandTemplate: ['claude', '--resume', '{{sessionId}}'] },
+  },
+  {
+    name: 'codex', version: '1.0.0', label: 'Codex CLI', description: '', category: 'cli',
+    picker: { shortcut: 'X' },
+    cli: { supportsModel: true, supportsSandbox: true, supportsResume: true, resumeCommandTemplate: ['codex', 'resume', '{{sessionId}}'] },
+  },
+]
 
 const { mockApiGet, mockApiPost, mockApiPatch } = vi.hoisted(() => ({
   mockApiGet: vi.fn(),
@@ -46,6 +61,7 @@ function renderPickerFlow() {
       tabs: tabsReducer,
       settings: settingsReducer,
       connection: connectionReducer,
+      extensions: extensionsReducer,
     },
     preloadedState: {
       panes: {
@@ -56,6 +72,9 @@ function renderPickerFlow() {
       tabs: {
         tabs: [{ id: 'tab-1', createRequestId: 'tab-1', title: 'Tab 1', mode: 'shell' as const, status: 'running' as const, createdAt: 1 }],
         activeTabId: 'tab-1',
+      },
+      extensions: {
+        entries: defaultCliExtensions,
       },
       connection: {
         status: 'ready' as const,
@@ -130,6 +149,7 @@ function renderTabAwarePickerFlow() {
       tabs: tabsReducer,
       settings: settingsReducer,
       connection: connectionReducer,
+      extensions: extensionsReducer,
     },
     preloadedState: {
       panes: {
@@ -140,6 +160,9 @@ function renderTabAwarePickerFlow() {
       tabs: {
         tabs: [{ id: 'tab-1', createRequestId: 'tab-1', title: 'Tab 1', mode: 'shell' as const, status: 'running' as const, createdAt: 1 }],
         activeTabId: 'tab-1',
+      },
+      extensions: {
+        entries: defaultCliExtensions,
       },
       connection: {
         status: 'ready' as const,

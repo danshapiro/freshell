@@ -1,4 +1,8 @@
 import type { CodingCliProviderName } from './coding-cli-types'
+import type { ClientExtensionEntry } from '@shared/extension-types'
+
+// REMOVED: CODING_CLI_PROVIDERS, CODING_CLI_PROVIDER_LABELS, CODING_CLI_PROVIDER_CONFIGS
+// These are now derived from extension entries in Redux state.
 
 export type CodingCliProviderConfig = {
   name: CodingCliProviderName
@@ -8,61 +12,76 @@ export type CodingCliProviderConfig = {
   supportsPermissionMode?: boolean
 }
 
-export const CODING_CLI_PROVIDERS: CodingCliProviderName[] = [
-  'claude',
-  'codex',
-  'opencode',
-  'gemini',
-  'kimi',
-]
-
-export const CODING_CLI_PROVIDER_LABELS: Record<CodingCliProviderName, string> = {
-  claude: 'Claude CLI',
-  codex: 'Codex CLI',
-  opencode: 'OpenCode',
-  gemini: 'Gemini',
-  kimi: 'Kimi',
+export function getCliProviderConfigs(extensions: ClientExtensionEntry[]): CodingCliProviderConfig[] {
+  return extensions
+    .filter(e => e.category === 'cli')
+    .map(e => ({
+      name: e.name,
+      label: e.label,
+      supportsPermissionMode: e.cli?.supportsPermissionMode,
+      supportsModel: e.cli?.supportsModel,
+      supportsSandbox: e.cli?.supportsSandbox,
+    }))
 }
 
-export const CODING_CLI_PROVIDER_CONFIGS: CodingCliProviderConfig[] = [
-  {
-    name: 'claude',
-    label: CODING_CLI_PROVIDER_LABELS.claude,
-    supportsPermissionMode: true,
-  },
-  {
-    name: 'codex',
-    label: CODING_CLI_PROVIDER_LABELS.codex,
-    supportsModel: true,
-    supportsSandbox: true,
-  },
-]
-
-export type ResumeCommandProvider = Extract<CodingCliProviderName, 'claude' | 'codex'>
-
-export function isCodingCliProviderName(value?: string): value is CodingCliProviderName {
-  if (!value) return false
-  return CODING_CLI_PROVIDERS.includes(value as CodingCliProviderName)
+export function getCliProviders(extensions: ClientExtensionEntry[]): CodingCliProviderName[] {
+  return extensions
+    .filter(e => e.category === 'cli')
+    .map(e => e.name)
 }
 
-export function isResumeCommandProvider(value?: string): value is ResumeCommandProvider {
-  return value === 'claude' || value === 'codex'
-}
-
-export function buildResumeCommand(provider?: string, sessionId?: string): string | null {
-  if (!sessionId) return null
-  if (!isResumeCommandProvider(provider)) return null
-  if (provider === 'claude') return `claude --resume ${sessionId}`
-  return `codex resume ${sessionId}`
-}
-
-export function isCodingCliMode(mode?: string): mode is CodingCliProviderName {
-  if (!mode || mode === 'shell') return false
-  return isCodingCliProviderName(mode)
-}
-
-export function getProviderLabel(provider?: string) {
+export function getProviderLabel(provider?: string, extensions?: ClientExtensionEntry[]): string {
   if (!provider) return 'CLI'
-  const label = CODING_CLI_PROVIDER_LABELS[provider as CodingCliProviderName]
-  return label || provider.toUpperCase()
+  const ext = extensions?.find(e => e.name === provider && e.category === 'cli')
+  if (ext) return ext.label
+  return provider.charAt(0).toUpperCase() + provider.slice(1)
+}
+
+export function isCodingCliProviderName(value?: string, extensions?: ClientExtensionEntry[]): value is CodingCliProviderName {
+  if (!value) return false
+  if (!extensions) return false
+  return extensions.some(e => e.category === 'cli' && e.name === value)
+}
+
+export function isCodingCliMode(mode?: string, extensions?: ClientExtensionEntry[]): boolean {
+  if (!mode || mode === 'shell') return false
+  return isCodingCliProviderName(mode, extensions)
+}
+
+/**
+ * Lenient check for non-shell terminal modes.
+ * Unlike isCodingCliMode (which validates against the extension registry),
+ * this simply checks that mode is not 'shell'. Use in contexts where the mode
+ * was already validated at creation time (e.g. Redux reducers, display logic).
+ */
+export function isNonShellMode(mode?: string): boolean {
+  return !!mode && mode !== 'shell'
+}
+
+export type ResumeCommandProvider = string
+
+export function isResumeCommandProvider(value?: string, extensions?: ClientExtensionEntry[]): value is ResumeCommandProvider {
+  if (!value) return false
+  if (!extensions) return false
+  const ext = extensions.find(e => e.name === value && e.category === 'cli')
+  return !!ext?.cli?.supportsResume
+}
+
+/**
+ * Build a resume command string from extension manifest data.
+ * Uses the resumeCommandTemplate from the extension's cli config,
+ * replacing {{sessionId}} with the actual session ID.
+ * Returns null if the provider doesn't support resume or isn't found.
+ */
+export function buildResumeCommand(
+  provider?: string,
+  sessionId?: string,
+  extensions?: ClientExtensionEntry[],
+): string | null {
+  if (!sessionId || !provider) return null
+  const ext = extensions?.find(e => e.name === provider && e.category === 'cli')
+  if (!ext?.cli?.resumeCommandTemplate) return null
+  return ext.cli.resumeCommandTemplate
+    .map(arg => arg.replace('{{sessionId}}', sessionId))
+    .join(' ')
 }
