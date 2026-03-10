@@ -55,6 +55,10 @@ export default function Pane({
   onSearch,
 }: PaneProps) {
   const showHeader = title !== undefined
+  const handleMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return
+    onFocus()
+  }
 
   /* eslint-disable jsx-a11y/no-noninteractive-element-interactions, jsx-a11y/no-noninteractive-tabindex -- Pane is a composite widget; tabIndex enables keyboard navigation between panes, not click interaction */
   return (
@@ -70,7 +74,7 @@ export default function Pane({
       role="group"
       aria-label={`Pane: ${title || 'untitled'}`}
       tabIndex={0}
-      onMouseDown={onFocus}
+      onMouseDown={handleMouseDown}
       onKeyDown={(e) => {
         if (e.target !== e.currentTarget) return
         if (e.key === 'Enter' || e.key === ' ') {
