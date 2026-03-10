@@ -8,6 +8,7 @@ import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
+import tabRegistryReducer from '@/store/tabRegistrySlice'
 import { networkReducer } from '@/store/networkSlice'
 
 const wsMocks = vi.hoisted(() => ({
@@ -70,6 +71,7 @@ function createStore() {
       connection: connectionReducer,
       sessions: sessionsReducer,
       panes: panesReducer,
+      tabRegistry: tabRegistryReducer,
       network: networkReducer,
     },
     middleware: (getDefault) =>
@@ -102,6 +104,24 @@ function createStore() {
       panes: {
         layouts: {},
         activePane: {},
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      },
+      tabRegistry: {
+        deviceId: 'device-test',
+        deviceLabel: 'device-test',
+        deviceAliases: {},
+        dismissedDeviceIds: [],
+        localOpen: [],
+        remoteOpen: [],
+        closed: [],
+        localClosed: {},
+        searchRangeDays: 30,
+        loading: false,
       },
       network: {
         status: null,
