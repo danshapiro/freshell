@@ -1181,12 +1181,12 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const attachTerminal = useCallback((
     tid: string,
     intent: AttachIntent,
-    opts?: { clearViewportFirst?: boolean; suppressNextMatchingResize?: boolean },
+    opts?: { clearViewportFirst?: boolean; suppressNextMatchingResize?: boolean; skipPreAttachFit?: boolean },
   ) => {
     const term = termRef.current
     if (!term) return
     const runtime = runtimeRef.current
-    if (runtime && !hiddenRef.current) {
+    if (runtime && !hiddenRef.current && !opts?.skipPreAttachFit) {
       try {
         runtime.fit()
       } catch {
@@ -1306,6 +1306,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         attachTerminal(tid, deferred.pendingIntent, {
           clearViewportFirst: deferred.pendingIntent === 'viewport_hydrate',
           suppressNextMatchingResize: true,
+          skipPreAttachFit: true,
         })
         return
       }

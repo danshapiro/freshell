@@ -44,7 +44,7 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
   const expandedProjects = useAppSelector((s) => s.sessions.expandedProjects)
   const historyWindow = useAppSelector((s) => s.sessions.windows?.history)
   const projects = useAppSelector((s) => s.sessions.windows?.history?.projects ?? s.sessions.projects)
-  const topLevelSessionCount = useAppSelector((s) => s.sessions.projects.length)
+  const topLevelSessionCount = useAppSelector((s) => s.sessions.projects?.length ?? 0)
   const [filter, setFilter] = useState('')
   const [loading, setLoading] = useState(false)
   const [mobileSessionSheet, setMobileSessionSheet] = useState<MobileSessionSheetState | null>(null)

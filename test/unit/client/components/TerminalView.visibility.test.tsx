@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, cleanup } from '@testing-library/react'
+import { render, cleanup, act } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import tabsReducer from '@/store/tabsSlice'
@@ -180,7 +180,7 @@ describe('TerminalView visibility CSS classes', () => {
     expect(wrapper.className).toContain('tab-visible')
   })
 
-  it('revealing a hidden pane resumes the deferred attach without an extra layout frame', () => {
+  it('revealing a hidden pane resumes the deferred attach without an extra layout frame', async () => {
     const pendingRaf: FrameRequestCallback[] = []
     const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
       pendingRaf.push(cb)
@@ -200,6 +200,9 @@ describe('TerminalView visibility CSS classes', () => {
       while (pendingRaf.length > 0) {
         pendingRaf.shift()?.(16)
       }
+      await act(async () => {
+        await Promise.resolve()
+      })
 
       const runtime = runtimeMocks.instances[0]
       runtime.fit.mockClear()
@@ -214,6 +217,9 @@ describe('TerminalView visibility CSS classes', () => {
       while (pendingRaf.length > 0) {
         pendingRaf.shift()?.(32)
       }
+      await act(async () => {
+        await Promise.resolve()
+      })
 
       const attachMessages = wsMocks.send.mock.calls
         .map((call) => call[0] as { type?: string; terminalId?: string; sinceSeq?: number })

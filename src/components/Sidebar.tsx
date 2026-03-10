@@ -235,7 +235,7 @@ export default function Sidebar({
   const oldestLoadedTimestamp = useAppSelector((s) => s.sessions.oldestLoadedTimestamp)
   const oldestLoadedSessionId = useAppSelector((s) => s.sessions.oldestLoadedSessionId)
   const sidebarWindow = useAppSelector((s) => s.sessions.windows?.sidebar)
-  const topLevelSessionCount = useAppSelector((s) => s.sessions.projects.length)
+  const topLevelSessionCount = useAppSelector((s) => s.sessions.projects?.length ?? 0)
   const [terminals, setTerminals] = useState<BackgroundTerminal[]>([])
   const [filter, setFilter] = useState('')
   const [searchTier, setSearchTier] = useState<'title' | 'userMessages' | 'fullText'>('title')

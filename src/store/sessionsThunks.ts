@@ -112,7 +112,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
   return async (dispatch: AppDispatch, getState: () => RootState) => {
     const { surface, query = '', searchTier = 'title', append = false } = args
     const trimmedQuery = query.trim()
-    const windowState = getState().sessions.windows[surface]
+    const windowState = getState().sessions.windows?.[surface]
 
     abortSurface(surface)
     const controller = new AbortController()
