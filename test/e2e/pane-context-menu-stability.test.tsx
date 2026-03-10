@@ -323,6 +323,23 @@ describe('pane context menu stability (e2e)', () => {
     })
   })
 
+  it('still activates an inactive pane on middle click for non-mac platforms', async () => {
+    const store = createStore(createTwoPaneLayout(), 'linux')
+    const { container } = renderFlow(store)
+
+    const header = await waitFor(() => {
+      const node = container.querySelector('[data-pane-id="pane-2"] [role="banner"]')
+      expect(node).not.toBeNull()
+      return node as HTMLElement
+    })
+
+    fireEvent.mouseDown(header, { button: 1, buttons: 4 })
+
+    await waitFor(() => {
+      expect(store.getState().panes.activePane['tab-1']).toBe('pane-2')
+    })
+  })
+
   it('still activates an inactive pane on primary click', async () => {
     const store = createStore(createTwoPaneLayout())
     const user = userEvent.setup()

@@ -58,8 +58,9 @@ export default function Pane({
 }: PaneProps) {
   const showHeader = title !== undefined
   const handleMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
-    if (event.button !== 0) return
-    if (platform === 'darwin' && event.ctrlKey) return
+    const isSecondaryClick = event.button === 2
+    const isMacContextClick = platform === 'darwin' && event.button === 0 && event.ctrlKey
+    if (isSecondaryClick || isMacContextClick) return
     onFocus()
   }
 
