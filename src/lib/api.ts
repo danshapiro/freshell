@@ -292,6 +292,7 @@ export type SearchOptions = {
   tier?: 'title' | 'userMessages' | 'fullText'
   limit?: number
   maxFiles?: number
+  signal?: AbortSignal
 }
 
 type SessionDirectoryItemResponse = {
@@ -361,12 +362,14 @@ export async function fetchSidebarSessionsSnapshot(options: {
   before?: number
   beforeId?: string
   openSessions?: SessionLocator[]
+  signal?: AbortSignal
 } = {}): Promise<any> {
   const {
     limit = 100,
     before,
     beforeId,
     openSessions = [],
+    signal,
   } = options
   sanitizeSessionLocators(openSessions)
 
@@ -374,6 +377,8 @@ export async function fetchSidebarSessionsSnapshot(options: {
     priority: 'visible',
     limit: Math.min(limit, 50),
     cursor: encodeLegacySessionCursor(before, beforeId),
+  }, {
+    signal,
   }) as SessionDirectoryPageResponse
 
   const projects = groupDirectoryItemsAsProjects(page.items)
@@ -389,11 +394,13 @@ export async function fetchSidebarSessionsSnapshot(options: {
 }
 
 export async function searchSessions(options: SearchOptions): Promise<SearchResponse> {
-  const { query, tier = 'title', limit } = options
+  const { query, tier = 'title', limit, signal } = options
   const page = await getSessionDirectoryPage({
     priority: 'visible',
     query,
     ...(limit ? { limit } : {}),
+  }, {
+    signal,
   }) as SessionDirectoryPageResponse
 
   return {

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { createHash } from 'crypto'
-import { render, screen, fireEvent, cleanup, act } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, act, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import Sidebar from '@/components/Sidebar'
@@ -56,6 +56,7 @@ vi.mock('react-window', () => ({
 const mockSend = vi.fn()
 const mockOnMessage = vi.fn(() => () => {})
 const mockConnect = vi.fn().mockResolvedValue(undefined)
+const mockFetchSidebarSessionsSnapshot = vi.fn()
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -70,6 +71,7 @@ vi.mock('@/lib/api', async () => {
   const actual = await vi.importActual('@/lib/api')
   return {
     ...actual,
+    fetchSidebarSessionsSnapshot: (...args: any[]) => mockFetchSidebarSessionsSnapshot(...args),
     searchSessions: vi.fn(),
   }
 })
@@ -237,6 +239,8 @@ describe('Sidebar Component - Session-Centric Display', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     vi.useFakeTimers()
+    mockFetchSidebarSessionsSnapshot.mockReset()
+    mockFetchSidebarSessionsSnapshot.mockResolvedValue({ projects: [] })
   })
 
   afterEach(() => {
@@ -292,7 +296,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       vi.advanceTimersByTime(100)
 
       // Shell terminal should not appear - only "No sessions yet" message
-      expect(screen.getByText('No sessions yet')).toBeInTheDocument()
+      expect(await screen.findByText('No sessions yet')).toBeInTheDocument()
       expect(screen.queryByText('Shell')).not.toBeInTheDocument()
     })
 
@@ -1208,7 +1212,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       vi.advanceTimersByTime(100)
 
-      expect(screen.getByText('No sessions yet')).toBeInTheDocument()
+      expect(await screen.findByText('No sessions yet')).toBeInTheDocument()
     })
   })
 
@@ -1404,7 +1408,9 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       // After search completes
       await act(() => vi.advanceTimersByTime(1000))
-      expect(queryByTestId('search-loading')).not.toBeInTheDocument()
+      await waitFor(() => {
+        expect(queryByTestId('search-loading')).not.toBeInTheDocument()
+      })
     })
 
     it('shows "No results" message when search returns empty', async () => {
@@ -1459,7 +1465,9 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       // Loading indicator should disappear immediately
       await act(() => vi.advanceTimersByTime(0))
-      expect(queryByTestId('search-loading')).not.toBeInTheDocument()
+      await waitFor(() => {
+        expect(queryByTestId('search-loading')).not.toBeInTheDocument()
+      })
     })
   })
 
@@ -1494,6 +1502,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(mockSearchSessions).toHaveBeenCalledWith({
         query: 'test',
         tier: 'userMessages',
+        signal: expect.any(AbortSignal),
       })
     })
 

@@ -14,7 +14,8 @@ import {
   setLoadingMore,
 } from '@/store/sessionsSlice'
 import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
-import { api, fetchSidebarSessionsSnapshot, isApiUnauthorizedError, type VersionInfo } from '@/lib/api'
+import { api, isApiUnauthorizedError, type VersionInfo } from '@/lib/api'
+import { loadInitialSessionsWindow } from '@/store/sessionsThunks'
 import { getShareAction, ensureShareUrlToken } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { collectSessionLocatorsFromTabs, getSessionsForHello } from '@/lib/session-utils'
@@ -573,13 +574,10 @@ export default function App() {
         return true
       }
 
-      const loadSidebarSessionsSnapshot = () => fetchSidebarSessionsSnapshot({
-        limit: 100,
-        openSessions: collectSessionLocatorsFromTabs(
-          appStore.getState().tabs.tabs,
-          appStore.getState().panes,
-        ),
-      })
+      const loadSidebarSessionsSnapshot = async () => {
+        await appStore.dispatch(loadInitialSessionsWindow() as any)
+        return appStore.getState().sessions.windows.sidebar ?? appStore.getState().sessions
+      }
 
       const unsubscribe = ws.onMessage((msg) => {
         if (!msg?.type) return
@@ -844,24 +842,7 @@ export default function App() {
       }
 
       try {
-        const sessionsRes = await loadSidebarSessionsSnapshot()
-        if (!cancelled) {
-          if (sessionsRes && typeof sessionsRes === 'object' && !Array.isArray(sessionsRes)) {
-            // Paginated response
-            dispatch(setProjects(sessionsRes.projects || []))
-            if (typeof sessionsRes.totalSessions === 'number') {
-              dispatch(setPaginationMeta({
-                totalSessions: sessionsRes.totalSessions,
-                oldestLoadedTimestamp: sessionsRes.oldestIncludedTimestamp,
-                oldestLoadedSessionId: sessionsRes.oldestIncludedSessionId,
-                hasMore: sessionsRes.hasMore,
-              }))
-            }
-          } else {
-            // Backward compat: raw array
-            dispatch(setProjects(sessionsRes))
-          }
-        }
+        await loadSidebarSessionsSnapshot()
       } catch (err: any) {
         if (handleBootstrapAuthFailure(err)) return
         log.warn('Failed to load sessions', err)
@@ -884,24 +865,8 @@ export default function App() {
         const promoted = promoteRecentHttpSessionsBaseline()
         if (!promoted) {
           try {
-            const sessionsRes = await loadSidebarSessionsSnapshot()
-            if (!cancelled) {
-              if (sessionsRes && typeof sessionsRes === 'object' && !Array.isArray(sessionsRes)) {
-                dispatch(setProjects(sessionsRes.projects || []))
-                dispatch(markWsSnapshotReceived())
-                if (typeof sessionsRes.totalSessions === 'number') {
-                  dispatch(setPaginationMeta({
-                    totalSessions: sessionsRes.totalSessions,
-                    oldestLoadedTimestamp: sessionsRes.oldestIncludedTimestamp,
-                    oldestLoadedSessionId: sessionsRes.oldestIncludedSessionId,
-                    hasMore: sessionsRes.hasMore,
-                  }))
-                }
-              } else {
-                dispatch(setProjects(sessionsRes))
-                dispatch(markWsSnapshotReceived())
-              }
-            }
+            await loadSidebarSessionsSnapshot()
+            if (!cancelled) dispatch(markWsSnapshotReceived())
           } catch (err: any) {
             if (handleBootstrapAuthFailure(err)) return
             log.warn('Failed to refresh sessions for pre-connected websocket', err)

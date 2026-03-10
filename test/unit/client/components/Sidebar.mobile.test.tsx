@@ -40,6 +40,7 @@ vi.mock('react-window', () => ({
 const mockSend = vi.fn()
 const mockOnMessage = vi.fn(() => () => {})
 const mockConnect = vi.fn().mockResolvedValue(undefined)
+const mockFetchSidebarSessionsSnapshot = vi.fn()
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -54,6 +55,7 @@ vi.mock('@/lib/api', async () => {
   const actual = await vi.importActual('@/lib/api')
   return {
     ...actual,
+    fetchSidebarSessionsSnapshot: (...args: any[]) => mockFetchSidebarSessionsSnapshot(...args),
     searchSessions: vi.fn(),
   }
 })
@@ -161,6 +163,8 @@ describe('Sidebar mobile touch targets', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     vi.useFakeTimers()
+    mockFetchSidebarSessionsSnapshot.mockReset()
+    mockFetchSidebarSessionsSnapshot.mockResolvedValue({ projects: [] })
   })
 
   afterEach(() => {

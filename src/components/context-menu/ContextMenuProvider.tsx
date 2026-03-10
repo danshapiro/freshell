@@ -12,9 +12,10 @@ import {
   splitPane as splitPaneAction,
   swapSplit,
 } from '@/store/panesSlice'
-import { setProjects, setProjectExpanded } from '@/store/sessionsSlice'
+import { setProjectExpanded } from '@/store/sessionsSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'
+import { refreshActiveSessionWindow } from '@/store/sessionsThunks'
 import { getAuthToken } from '@/lib/auth'
 import { buildShareUrl } from '@/lib/utils'
 import { copyText } from '@/lib/clipboard'
@@ -366,8 +367,7 @@ export function ContextMenuProvider({
         titleOverride: title || undefined,
         summaryOverride: summary,
       })
-      const data = await api.get('/api/sessions')
-      dispatch(setProjects(data))
+      await dispatch(refreshActiveSessionWindow() as any)
     } catch {
       // ignore
     }
@@ -377,8 +377,7 @@ export function ContextMenuProvider({
     try {
       const compositeKey = `${provider || 'claude'}:${sessionId}`
       await api.patch(`/api/sessions/${encodeURIComponent(compositeKey)}`, { archived: next })
-      const data = await api.get('/api/sessions')
-      dispatch(setProjects(data))
+      await dispatch(refreshActiveSessionWindow() as any)
     } catch {
       // ignore
     }
@@ -412,8 +411,7 @@ export function ContextMenuProvider({
         try {
           const compositeKey = `${provider || info.session.provider || 'claude'}:${sessionId}`
           await api.delete(`/api/sessions/${encodeURIComponent(compositeKey)}`)
-          const data = await api.get('/api/sessions')
-          dispatch(setProjects(data))
+          await dispatch(refreshActiveSessionWindow() as any)
         } catch {
           // ignore
         } finally {
@@ -494,8 +492,7 @@ export function ContextMenuProvider({
     if (!next) return
     try {
       await api.put('/api/project-colors', { projectPath, color: next })
-      const data = await api.get('/api/sessions')
-      dispatch(setProjects(data))
+      await dispatch(refreshActiveSessionWindow() as any)
     } catch {
       // ignore
     }

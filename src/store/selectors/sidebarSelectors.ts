@@ -29,7 +29,7 @@ export interface SidebarSessionItem {
 const EMPTY_ACTIVITY: Record<string, number> = {}
 const EMPTY_STRINGS: string[] = []
 
-const selectProjects = (state: RootState) => state.sessions.projects
+const selectProjects = (state: RootState) => state.sessions.windows?.sidebar?.projects ?? state.sessions.projects
 const selectTabs = (state: RootState) => state.tabs.tabs
 const selectPanes = (state: RootState) => state.panes
 const selectSortMode = (state: RootState) => state.settings.settings.sidebar?.sortMode || 'recency-pinned'

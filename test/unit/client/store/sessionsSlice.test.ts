@@ -12,6 +12,8 @@ import sessionsReducer, {
   collapseAll,
   expandAll,
   SessionsState,
+  setActiveSessionSurface,
+  setSessionWindowData,
 } from '@/store/sessionsSlice'
 import type { ProjectGroup } from '@/store/types'
 
@@ -137,6 +139,56 @@ describe('sessionsSlice', () => {
       }
       const state = sessionsReducer(stateWithExpanded, setProjects(mockProjects))
       expect(state.expandedProjects.has('/project/one')).toBe(true)
+    })
+
+    it('hydrates the active window when a surface is already active', () => {
+      const stateWithActiveWindow: SessionsState = {
+        ...initialState,
+        activeSurface: 'sidebar',
+        windows: {
+          sidebar: {
+            projects: [],
+          },
+        },
+      }
+
+      const state = sessionsReducer(stateWithActiveWindow, setProjects(mockProjects))
+      expect(state.windows.sidebar.projects).toEqual(mockProjects)
+    })
+  })
+
+  describe('window surfaces', () => {
+    it('seeds the first activated surface from existing top-level projects', () => {
+      const stateWithProjects: SessionsState = {
+        ...initialState,
+        projects: mockProjects,
+        lastLoadedAt: 1700000000000,
+        totalSessions: 3,
+        oldestLoadedTimestamp: 1699999999000,
+        oldestLoadedSessionId: 'claude:session-3',
+        hasMore: true,
+      }
+
+      const state = sessionsReducer(stateWithProjects, setActiveSessionSurface('sidebar'))
+      expect(state.activeSurface).toBe('sidebar')
+      expect(state.windows.sidebar.projects).toEqual(mockProjects)
+      expect(state.projects).toEqual(mockProjects)
+      expect(state.windows.sidebar.hasMore).toBe(true)
+    })
+
+    it('stores per-surface window data without overwriting another surface', () => {
+      let state: SessionsState = sessionsReducer(undefined, setProjects(mockProjects))
+      state = sessionsReducer(state, setActiveSessionSurface('sidebar'))
+      state = sessionsReducer(state, setSessionWindowData({
+        surface: 'history',
+        projects: [mockProjects[1]],
+        totalSessions: 1,
+        hasMore: false,
+      }))
+
+      expect(state.windows.sidebar.projects).toEqual(mockProjects)
+      expect(state.windows.history.projects).toEqual([mockProjects[1]])
+      expect(state.projects).toEqual(mockProjects)
     })
   })
 

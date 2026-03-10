@@ -76,18 +76,136 @@ export interface SessionsState {
   oldestLoadedSessionId?: string
   hasMore?: boolean
   loadingMore?: boolean
+  activeSurface?: string
+  windows: Record<string, {
+    projects: ProjectGroup[]
+    lastLoadedAt?: number
+    totalSessions?: number
+    oldestLoadedTimestamp?: number
+    oldestLoadedSessionId?: string
+    hasMore?: boolean
+    loading?: boolean
+    error?: string
+    query?: string
+    searchTier?: 'title' | 'userMessages' | 'fullText'
+  }>
 }
 
 const initialState: SessionsState = {
   projects: [],
   expandedProjects: new Set<string>(),
   wsSnapshotReceived: false,
+  windows: {},
+}
+
+function ensureWindow(state: SessionsState, surface: string) {
+  if (!state.windows) {
+    state.windows = {}
+  }
+  if (!state.windows[surface]) {
+    state.windows[surface] = {
+      projects: [],
+    }
+  }
+  return state.windows[surface]
+}
+
+function syncTopLevelFromWindow(state: SessionsState, surface: string) {
+  const window = ensureWindow(state, surface)
+  state.activeSurface = surface
+  state.projects = window.projects
+  state.lastLoadedAt = window.lastLoadedAt
+  state.totalSessions = window.totalSessions
+  state.oldestLoadedTimestamp = window.oldestLoadedTimestamp
+  state.oldestLoadedSessionId = window.oldestLoadedSessionId
+  state.hasMore = window.hasMore
+  state.loadingMore = window.loading
+}
+
+function syncActiveWindowFromTopLevel(state: SessionsState) {
+  if (!state.activeSurface) return
+  const window = ensureWindow(state, state.activeSurface)
+  window.projects = state.projects
+  window.lastLoadedAt = state.lastLoadedAt
+  window.totalSessions = state.totalSessions
+  window.oldestLoadedTimestamp = state.oldestLoadedTimestamp
+  window.oldestLoadedSessionId = state.oldestLoadedSessionId
+  window.hasMore = state.hasMore
+  window.loading = state.loadingMore
 }
 
 export const sessionsSlice = createSlice({
   name: 'sessions',
   initialState,
   reducers: {
+    setActiveSessionSurface: (state, action: PayloadAction<string>) => {
+      if (!state.windows) {
+        state.windows = {}
+      }
+      if (
+        !state.windows?.[action.payload] &&
+        !state.activeSurface &&
+        (state.projects.length > 0 || state.lastLoadedAt !== undefined)
+      ) {
+        state.windows[action.payload] = {
+          projects: state.projects,
+          lastLoadedAt: state.lastLoadedAt,
+          totalSessions: state.totalSessions,
+          oldestLoadedTimestamp: state.oldestLoadedTimestamp,
+          oldestLoadedSessionId: state.oldestLoadedSessionId,
+          hasMore: state.hasMore,
+          loading: state.loadingMore,
+        }
+      }
+      syncTopLevelFromWindow(state, action.payload)
+    },
+    setSessionWindowLoading: (
+      state,
+      action: PayloadAction<{ surface: string; loading: boolean; query?: string; searchTier?: 'title' | 'userMessages' | 'fullText' }>,
+    ) => {
+      const window = ensureWindow(state, action.payload.surface)
+      window.loading = action.payload.loading
+      if (action.payload.query !== undefined) window.query = action.payload.query
+      if (action.payload.searchTier !== undefined) window.searchTier = action.payload.searchTier
+      if (state.activeSurface === action.payload.surface) {
+        state.loadingMore = action.payload.loading
+      }
+    },
+    setSessionWindowError: (
+      state,
+      action: PayloadAction<{ surface: string; error?: string }>,
+    ) => {
+      const window = ensureWindow(state, action.payload.surface)
+      window.error = action.payload.error
+    },
+    setSessionWindowData: (
+      state,
+      action: PayloadAction<{
+        surface: string
+        projects: ProjectGroup[]
+        totalSessions?: number
+        oldestLoadedTimestamp?: number
+        oldestLoadedSessionId?: string
+        hasMore?: boolean
+        query?: string
+        searchTier?: 'title' | 'userMessages' | 'fullText'
+      }>,
+    ) => {
+      const window = ensureWindow(state, action.payload.surface)
+      window.projects = normalizeProjects(action.payload.projects)
+      window.lastLoadedAt = Date.now()
+      window.totalSessions = action.payload.totalSessions
+      window.oldestLoadedTimestamp = action.payload.oldestLoadedTimestamp
+      window.oldestLoadedSessionId = action.payload.oldestLoadedSessionId
+      window.hasMore = action.payload.hasMore
+      window.loading = false
+      window.error = undefined
+      if (action.payload.query !== undefined) window.query = action.payload.query
+      if (action.payload.searchTier !== undefined) window.searchTier = action.payload.searchTier
+      if (!state.activeSurface || state.activeSurface === action.payload.surface) {
+        syncTopLevelFromWindow(state, action.payload.surface)
+      }
+    },
     markWsSnapshotReceived: (state) => {
       state.wsSnapshotReceived = true
     },
@@ -99,6 +217,7 @@ export const sessionsSlice = createSlice({
       state.lastLoadedAt = Date.now()
       const valid = new Set(state.projects.map((p) => p.projectPath))
       state.expandedProjects = new Set(Array.from(state.expandedProjects).filter((k) => valid.has(k)))
+      syncActiveWindowFromTopLevel(state)
     },
     clearProjects: (state) => {
       state.projects = []
@@ -109,6 +228,11 @@ export const sessionsSlice = createSlice({
       state.oldestLoadedSessionId = undefined
       state.hasMore = undefined
       state.loadingMore = undefined
+      if (state.activeSurface) {
+        state.windows[state.activeSurface] = {
+          projects: [],
+        }
+      }
     },
     mergeProjects: (state, action: PayloadAction<ProjectGroup[]>) => {
       const incoming = normalizeProjects(action.payload)
@@ -121,6 +245,7 @@ export const sessionsSlice = createSlice({
       state.lastLoadedAt = Date.now()
       const valid = new Set(state.projects.map((p) => p.projectPath))
       state.expandedProjects = new Set(Array.from(state.expandedProjects).filter((k) => valid.has(k)))
+      syncActiveWindowFromTopLevel(state)
     },
     /**
      * Merge a paginated snapshot into existing state. Unlike setProjects (which
@@ -157,6 +282,7 @@ export const sessionsSlice = createSlice({
       state.lastLoadedAt = Date.now()
       const valid = new Set(state.projects.map((p) => p.projectPath))
       state.expandedProjects = new Set(Array.from(state.expandedProjects).filter((k) => valid.has(k)))
+      syncActiveWindowFromTopLevel(state)
     },
     applySessionsPatch: (
       state,
@@ -176,6 +302,7 @@ export const sessionsSlice = createSlice({
 
       const valid = new Set(state.projects.map((p) => p.projectPath))
       state.expandedProjects = new Set(Array.from(state.expandedProjects).filter((k) => valid.has(k)))
+      syncActiveWindowFromTopLevel(state)
     },
     clearPaginationMeta: (state) => {
       state.totalSessions = undefined
@@ -183,6 +310,7 @@ export const sessionsSlice = createSlice({
       state.oldestLoadedSessionId = undefined
       state.hasMore = undefined
       state.loadingMore = undefined
+      syncActiveWindowFromTopLevel(state)
     },
     setPaginationMeta: (
       state,
@@ -198,6 +326,7 @@ export const sessionsSlice = createSlice({
       state.oldestLoadedTimestamp = oldestLoadedTimestamp
       state.oldestLoadedSessionId = oldestLoadedSessionId
       state.hasMore = hasMore
+      syncActiveWindowFromTopLevel(state)
     },
     appendSessionsPage: (state, action: PayloadAction<ProjectGroup[]>) => {
       const incoming = normalizeProjects(action.payload)
@@ -238,9 +367,11 @@ export const sessionsSlice = createSlice({
       state.loadingMore = false
       const valid = new Set(state.projects.map((p) => p.projectPath))
       state.expandedProjects = new Set(Array.from(state.expandedProjects).filter((k) => valid.has(k)))
+      syncActiveWindowFromTopLevel(state)
     },
     setLoadingMore: (state, action: PayloadAction<boolean>) => {
       state.loadingMore = action.payload
+      syncActiveWindowFromTopLevel(state)
     },
     toggleProjectExpanded: (state, action: PayloadAction<string>) => {
       const key = action.payload
@@ -262,6 +393,10 @@ export const sessionsSlice = createSlice({
 })
 
 export const {
+  setActiveSessionSurface,
+  setSessionWindowLoading,
+  setSessionWindowError,
+  setSessionWindowData,
   markWsSnapshotReceived,
   resetWsSnapshotReceived,
   setProjects,

@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import type { CodingCliProviderName, CodingCliSession, ProjectGroup } from '@/store/types'
-import { toggleProjectExpanded, setProjects } from '@/store/sessionsSlice'
+import { toggleProjectExpanded } from '@/store/sessionsSlice'
 import { api } from '@/lib/api'
+import { activateSessionSurface, fetchSessionWindow } from '@/store/sessionsThunks'
 import { openSessionTab } from '@/store/tabsSlice'
 import { syncPaneTitleByTerminalId } from '@/store/paneTitleSync'
 import { cn } from '@/lib/utils'
@@ -40,10 +41,22 @@ type MobileSessionSheetState = {
 export default function HistoryView({ onOpenSession }: { onOpenSession?: () => void }) {
   const dispatch = useAppDispatch()
   const isMobile = useMobile()
-  const { projects, expandedProjects } = useAppSelector((s) => s.sessions)
+  const expandedProjects = useAppSelector((s) => s.sessions.expandedProjects)
+  const historyWindow = useAppSelector((s) => s.sessions.windows?.history)
+  const projects = useAppSelector((s) => s.sessions.windows?.history?.projects ?? s.sessions.projects)
+  const topLevelSessionCount = useAppSelector((s) => s.sessions.projects.length)
   const [filter, setFilter] = useState('')
   const [loading, setLoading] = useState(false)
   const [mobileSessionSheet, setMobileSessionSheet] = useState<MobileSessionSheetState | null>(null)
+
+  useEffect(() => {
+    if (historyWindow || topLevelSessionCount > 0) return
+    dispatch(activateSessionSurface('history'))
+    void dispatch(fetchSessionWindow({
+      surface: 'history',
+      priority: 'visible',
+    }) as any)
+  }, [dispatch, historyWindow, topLevelSessionCount])
 
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase()
@@ -71,8 +84,10 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
   async function refresh() {
     setLoading(true)
     try {
-      const data = await api.get('/api/sessions')
-      dispatch(setProjects(data))
+      await dispatch(fetchSessionWindow({
+        surface: 'history',
+        priority: 'visible',
+      }) as any)
     } finally {
       setLoading(false)
     }
