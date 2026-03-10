@@ -63,4 +63,39 @@ describe('createHttpClient', () => {
       status: 400,
     })
   })
+
+  it('requests session-directory windows through the configured base URL', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          items: [],
+          nextCursor: null,
+          revision: 1,
+        }),
+        {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        },
+      ),
+    )
+
+    vi.stubGlobal('fetch', fetchMock)
+
+    const client = createHttpClient({
+      url: 'http://127.0.0.1:3344',
+      token: 'test-token',
+    } as any)
+
+    await client.get('/api/session-directory?priority=visible')
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:3344/api/session-directory?priority=visible',
+      expect.objectContaining({
+        method: 'GET',
+        headers: expect.objectContaining({
+          'x-auth-token': 'test-token',
+        }),
+      }),
+    )
+  })
 })

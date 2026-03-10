@@ -294,6 +294,60 @@ export type SearchOptions = {
   maxFiles?: number
 }
 
+type SessionDirectoryItemResponse = {
+  sessionId: string
+  provider: CodingCliProviderName
+  projectPath: string
+  title?: string
+  summary?: string
+  snippet?: string
+  matchedIn?: 'title' | 'summary' | 'firstUserMessage'
+  updatedAt: number
+  createdAt?: number
+  archived?: boolean
+  cwd?: string
+  sessionType?: string
+  firstUserMessage?: string
+}
+
+type SessionDirectoryPageResponse = {
+  items: SessionDirectoryItemResponse[]
+  nextCursor: string | null
+  revision: number
+}
+
+function encodeLegacySessionCursor(before: number | undefined, beforeId: string | undefined): string | undefined {
+  if (before === undefined || beforeId === undefined) return undefined
+  const raw = JSON.stringify({ updatedAt: before, key: beforeId })
+  return btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
+}
+
+function groupDirectoryItemsAsProjects(items: SessionDirectoryItemResponse[]) {
+  const groups = new Map<string, Array<SessionDirectoryItemResponse>>()
+  for (const item of items) {
+    const bucket = groups.get(item.projectPath) ?? []
+    bucket.push(item)
+    groups.set(item.projectPath, bucket)
+  }
+
+  return Array.from(groups.entries()).map(([projectPath, sessions]) => ({
+    projectPath,
+    sessions: sessions.map((item) => ({
+      provider: item.provider,
+      sessionId: item.sessionId,
+      projectPath: item.projectPath,
+      updatedAt: item.updatedAt,
+      createdAt: item.createdAt,
+      archived: item.archived,
+      cwd: item.cwd,
+      title: item.title,
+      summary: item.summary,
+      firstUserMessage: item.firstUserMessage,
+      sessionType: item.sessionType,
+    })),
+  }))
+}
+
 export async function setSessionMetadata(
   provider: string,
   sessionId: string,
@@ -314,28 +368,50 @@ export async function fetchSidebarSessionsSnapshot(options: {
     beforeId,
     openSessions = [],
   } = options
-  const sanitizedOpenSessions = sanitizeSessionLocators(openSessions)
+  sanitizeSessionLocators(openSessions)
 
-  if (sanitizedOpenSessions.length > 0) {
-    return api.post('/api/sessions/query', {
-      limit,
-      ...(before !== undefined ? { before } : {}),
-      ...(beforeId !== undefined ? { beforeId } : {}),
-      openSessions: sanitizedOpenSessions,
-    })
+  const page = await getSessionDirectoryPage({
+    priority: 'visible',
+    limit: Math.min(limit, 50),
+    cursor: encodeLegacySessionCursor(before, beforeId),
+  }) as SessionDirectoryPageResponse
+
+  const projects = groupDirectoryItemsAsProjects(page.items)
+  const oldest = page.items.at(-1)
+
+  return {
+    projects,
+    totalSessions: page.items.length,
+    oldestIncludedTimestamp: oldest?.updatedAt ?? 0,
+    oldestIncludedSessionId: oldest ? `${oldest.provider}:${oldest.sessionId}` : '',
+    hasMore: page.nextCursor !== null,
   }
-
-  const params = new URLSearchParams({ limit: String(limit) })
-  if (before !== undefined) params.set('before', String(before))
-  if (beforeId !== undefined) params.set('beforeId', beforeId)
-  return api.get(`/api/sessions?${params}`)
 }
 
 export async function searchSessions(options: SearchOptions): Promise<SearchResponse> {
-  const { query, tier = 'title', limit, maxFiles } = options
-  const params = new URLSearchParams({ q: query, tier })
-  if (limit) params.set('limit', String(limit))
-  if (maxFiles) params.set('maxFiles', String(maxFiles))
+  const { query, tier = 'title', limit } = options
+  const page = await getSessionDirectoryPage({
+    priority: 'visible',
+    query,
+    ...(limit ? { limit } : {}),
+  }) as SessionDirectoryPageResponse
 
-  return api.get<SearchResponse>(`/api/sessions/search?${params}`)
+  return {
+    results: page.items.map((item) => ({
+      sessionId: item.sessionId,
+      provider: item.provider,
+      projectPath: item.projectPath,
+      title: item.title,
+      summary: item.summary,
+      matchedIn: item.matchedIn === 'firstUserMessage' ? 'userMessage' : item.matchedIn ?? 'title',
+      snippet: item.snippet,
+      updatedAt: item.updatedAt,
+      createdAt: item.createdAt,
+      archived: item.archived,
+      cwd: item.cwd,
+    })),
+    tier,
+    query,
+    totalScanned: page.items.length,
+  }
 }

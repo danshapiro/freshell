@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { pathToFileURL } from 'node:url'
 import { parseArgs } from './args.js'
 import { createHttpClient } from './http.js'
 import { writeError, writeJson, writeText } from './output.js'
@@ -12,6 +13,29 @@ type Flags = Record<string, string | boolean>
 type TabSummary = { id: string; title?: string; activePaneId?: string }
 
 type PaneSummary = { id: string; index?: number; kind?: string; terminalId?: string; title?: string }
+type SessionDirectoryItem = {
+  sessionId: string
+  provider: string
+  projectPath: string
+  title?: string
+  summary?: string
+  snippet?: string
+  matchedIn?: 'title' | 'summary' | 'firstUserMessage'
+  updatedAt: number
+  createdAt?: number
+  archived?: boolean
+  cwd?: string
+}
+type SessionDirectoryPage = {
+  items: SessionDirectoryItem[]
+  nextCursor: string | null
+  revision: number
+}
+type CliCommandWriter = {
+  writeJson: (value: unknown) => void
+  writeError: (value: unknown) => void
+  setExitCode: (code: number) => void
+}
 
 const aliases: Record<string, string> = {
   'new-window': 'new-tab',
@@ -142,6 +166,86 @@ async function resolveTabTarget(client: ReturnType<typeof createHttpClient>, tar
 function formatList(items: string[]) {
   if (!items.length) return ''
   return items.join('\n')
+}
+
+export function sessionDirectoryPageToProjects(page: SessionDirectoryPage) {
+  const groups = new Map<string, SessionDirectoryItem[]>()
+  for (const item of page.items) {
+    const bucket = groups.get(item.projectPath) ?? []
+    bucket.push(item)
+    groups.set(item.projectPath, bucket)
+  }
+
+  return Array.from(groups.entries()).map(([projectPath, sessions]) => ({
+    projectPath,
+    sessions: sessions.map((item) => ({
+      provider: item.provider,
+      sessionId: item.sessionId,
+      projectPath: item.projectPath,
+      updatedAt: item.updatedAt,
+      createdAt: item.createdAt,
+      archived: item.archived,
+      cwd: item.cwd,
+      title: item.title,
+      summary: item.summary,
+    })),
+  }))
+}
+
+export function sessionDirectoryPageToSearchResponse(page: SessionDirectoryPage, query: string) {
+  return {
+    results: page.items.map((item) => ({
+      sessionId: item.sessionId,
+      provider: item.provider,
+      projectPath: item.projectPath,
+      title: item.title,
+      summary: item.summary,
+      matchedIn: item.matchedIn === 'firstUserMessage' ? 'userMessage' : item.matchedIn ?? 'title',
+      snippet: item.snippet,
+      updatedAt: item.updatedAt,
+      createdAt: item.createdAt,
+      archived: item.archived,
+      cwd: item.cwd,
+    })),
+    tier: 'title',
+    query,
+    totalScanned: page.items.length,
+  }
+}
+
+export async function runListSessionsCommand(
+  client: ReturnType<typeof createHttpClient>,
+  writer: CliCommandWriter = {
+    writeJson,
+    writeError,
+    setExitCode: (code) => {
+      process.exitCode = code
+    },
+  },
+) {
+  const page = await client.get<SessionDirectoryPage>('/api/session-directory?priority=visible')
+  writer.writeJson(sessionDirectoryPageToProjects(page))
+}
+
+export async function runSearchSessionsCommand(
+  client: ReturnType<typeof createHttpClient>,
+  query: string | undefined,
+  writer: CliCommandWriter = {
+    writeJson,
+    writeError,
+    setExitCode: (code) => {
+      process.exitCode = code
+    },
+  },
+) {
+  if (!query) {
+    writer.writeError('query required')
+    writer.setExitCode(1)
+    return
+  }
+
+  const page = await client.get<SessionDirectoryPage>(`/api/session-directory?priority=visible&query=${encodeURIComponent(query)}`)
+  writer.writeJson(sessionDirectoryPageToSearchResponse(page, query))
 }
 
 async function handleDisplay(format: string, target: string | undefined, client: ReturnType<typeof createHttpClient>) {
@@ -598,19 +702,12 @@ async function main() {
       return
     }
     case 'list-sessions': {
-      const res = await client.get('/api/sessions')
-      writeJson(res)
+      await runListSessionsCommand(client)
       return
     }
     case 'search-sessions': {
       const query = args[0] || (getFlag(flags, 'q', 'query') as string | undefined)
-      if (!query) {
-        writeError('query required')
-        process.exitCode = 1
-        return
-      }
-      const res = await client.get(`/api/sessions/search?q=${encodeURIComponent(query)}`)
-      writeJson(res)
+      await runSearchSessionsCommand(client, query)
       return
     }
     case 'display': {
@@ -692,7 +789,9 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  writeError(err)
-  process.exitCode = 1
-})
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((err) => {
+    writeError(err)
+    process.exitCode = 1
+  })
+}
