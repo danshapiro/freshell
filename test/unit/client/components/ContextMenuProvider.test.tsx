@@ -960,7 +960,7 @@ describe('ContextMenuProvider', () => {
     })
   })
 
-  it('renders Copy selection, Paste, and Select all as the first terminal menu section with icons', async () => {
+  it('renders copy, Paste, and Select all as the first terminal menu section with icons', async () => {
     const user = userEvent.setup()
     const store = createStoreWithTerminalPane()
 
@@ -989,7 +989,7 @@ describe('ContextMenuProvider', () => {
           ? node.textContent?.replace(/\s+/g, ' ').trim()
           : node.getAttribute('role'),
       ),
-    ).toEqual(['Copy selection', 'Paste', 'Select all', 'separator'])
+    ).toEqual(['copy', 'Paste', 'Select all', 'separator'])
 
     for (const node of children.slice(0, 3)) {
       expect(node.querySelector('svg')).not.toBeNull()

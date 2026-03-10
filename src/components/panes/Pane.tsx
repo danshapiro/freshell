@@ -57,6 +57,7 @@ export default function Pane({
   const showHeader = title !== undefined
   const handleMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
     if (event.button !== 0) return
+    if (event.ctrlKey) return
     onFocus()
   }
 

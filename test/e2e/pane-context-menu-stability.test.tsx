@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
@@ -279,6 +279,31 @@ describe('pane context menu stability (e2e)', () => {
 
     expect(screen.getByRole('menu')).toBeInTheDocument()
     expect(screen.getByRole('menuitem', { name: 'Search' })).toBeInTheDocument()
+  })
+
+  it('keeps the pane menu open for a primary-button context-menu gesture on an inactive pane header', async () => {
+    const store = createStore(createTwoPaneLayout())
+    const { container } = renderFlow(store)
+
+    const header = await waitFor(() => {
+      const node = container.querySelector('[data-pane-id="pane-2"] [role="banner"]')
+      expect(node).not.toBeNull()
+      return node as HTMLElement
+    })
+
+    fireEvent.mouseDown(header, { button: 0, buttons: 1, ctrlKey: true })
+    fireEvent.contextMenu(header, {
+      button: 0,
+      buttons: 0,
+      ctrlKey: true,
+      clientX: 48,
+      clientY: 32,
+    })
+    await settleMenu()
+
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: 'Refresh pane' })).toBeInTheDocument()
+    expect(store.getState().panes.activePane['tab-1']).toBe('pane-1')
   })
 
   it('still activates an inactive pane on primary click', async () => {

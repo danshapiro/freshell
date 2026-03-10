@@ -384,7 +384,7 @@ describe('buildMenuItems - terminal "Search" item', () => {
 })
 
 describe('buildMenuItems - terminal clipboard section', () => {
-  it('places Copy selection, Paste, and Select all in the first section with icons', () => {
+  it('places copy, Paste, and Select all in the first section with icons', () => {
     const items = buildMenuItems(
       { kind: 'terminal', tabId: 'tab-1', paneId: 'pane-1' },
       makeCtx(createActions()),
@@ -399,7 +399,7 @@ describe('buildMenuItems - terminal clipboard section', () => {
       'separator',
     ])
 
-    expect(getTerminalItem(items, 'terminal-copy').label).toBe('Copy selection')
+    expect(getTerminalItem(items, 'terminal-copy').label).toBe('copy')
     expect(getTerminalItem(items, 'terminal-copy').icon).toBeTruthy()
     expect(getTerminalItem(items, 'terminal-paste').icon).toBeTruthy()
     expect(getTerminalItem(items, 'terminal-select-all').icon).toBeTruthy()
