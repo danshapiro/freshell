@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, within } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import PanePicker from '@/components/panes/PanePicker'
+import { setStatus } from '@/store/connectionSlice'
 import settingsReducer from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import extensionsReducer from '@/store/extensionsSlice'
@@ -50,6 +51,8 @@ vi.mock('lucide-react', () => ({
 
 function createStore(overrides?: {
   platform?: string | null
+  connectionStatus?: 'disconnected' | 'connecting' | 'connected' | 'ready'
+  serverInstanceId?: string
   availableClis?: Record<string, boolean>
   enabledProviders?: string[]
   extensions?: ClientExtensionEntry[]
@@ -63,10 +66,11 @@ function createStore(overrides?: {
     },
     preloadedState: {
       connection: {
-        status: 'ready' as const,
+        status: overrides?.connectionStatus ?? 'ready',
         platform: overrides?.platform ?? null,
         availableClis: overrides?.availableClis ?? {},
         featureFlags: overrides?.featureFlags ?? {},
+        serverInstanceId: overrides?.serverInstanceId,
       },
       extensions: {
         entries: overrides?.extensions ?? [],
@@ -276,6 +280,34 @@ describe('PanePicker', () => {
 
       expect(mockApiGet).toHaveBeenCalledWith(expect.stringContaining('/api/extensions'))
       expect(await screen.findByRole('button', { name: 'Notes Widget' })).toBeInTheDocument()
+    })
+
+    it('retries loading the extension registry after the connection reaches ready', async () => {
+      mockApiGet
+        .mockRejectedValueOnce({ status: 503, message: 'Service Unavailable' })
+        .mockResolvedValueOnce([
+          {
+            name: 'notes-widget',
+            version: '0.1.0',
+            label: 'Notes Widget',
+            description: 'A notes widget',
+            category: 'client',
+          },
+        ])
+
+      const { store } = renderPicker({
+        connectionStatus: 'connecting',
+      })
+
+      await waitFor(() => {
+        expect(mockApiGet).toHaveBeenCalledTimes(1)
+      })
+      await Promise.resolve()
+
+      store.dispatch(setStatus('ready'))
+
+      expect(await screen.findByRole('button', { name: 'Notes Widget' })).toBeInTheDocument()
+      expect(mockApiGet).toHaveBeenCalledTimes(2)
     })
 
     it('does not load extension options on demand without an auth token', async () => {

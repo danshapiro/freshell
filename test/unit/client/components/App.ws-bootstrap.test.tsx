@@ -13,6 +13,7 @@ import terminalMetaReducer from '@/store/terminalMetaSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer } from '@/store/networkSlice'
 import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
+import { makeSelectSortedSessionItems } from '@/store/selectors/sidebarSelectors'
 
 // Mock heavy child components to avoid xterm/canvas issues
 vi.mock('@/components/TabContent', () => ({
@@ -279,6 +280,136 @@ describe('App WS bootstrap recovery', () => {
     expect(apiGet).toHaveBeenCalledWith('/api/bootstrap')
     expect(apiGet).not.toHaveBeenCalledWith('/api/settings')
     expect(apiGet).not.toHaveBeenCalledWith('/api/platform')
+  })
+
+  it('recovers bootstrap-owned provider availability and sidebar filters after transient pre-ready 503s', async () => {
+    const recoveredSettings = {
+      ...defaultSettings,
+      sidebar: {
+        ...defaultSettings.sidebar,
+        excludeFirstChatSubstrings: ['__AUTO__'],
+      },
+    }
+    let bootstrapCalls = 0
+    let sidebarCalls = 0
+
+    apiGet.mockImplementation((url: string) => {
+      if (url === '/api/bootstrap') {
+        bootstrapCalls += 1
+        if (bootstrapCalls === 1) {
+          return Promise.reject({ status: 503, message: 'Service Unavailable' })
+        }
+        return Promise.resolve({
+          settings: recoveredSettings,
+          platform: {
+            platform: 'linux',
+            availableClis: { claude: true, codex: true },
+            featureFlags: { kilroy: true },
+          },
+          shell: { authenticated: true, ready: true },
+        })
+      }
+      if (url === '/api/version') {
+        return Promise.resolve({
+          currentVersion: '0.6.0',
+          updateCheck: {
+            updateAvailable: false,
+            currentVersion: '0.6.0',
+          },
+        })
+      }
+      return Promise.resolve({})
+    })
+
+    fetchSidebarSessionsSnapshot.mockImplementation(() => {
+      sidebarCalls += 1
+      if (sidebarCalls === 1) {
+        return Promise.reject({ status: 503, message: 'Service Unavailable' })
+      }
+      return Promise.resolve({
+        projects: [{
+          projectPath: '/work/app',
+          sessions: [
+            {
+              provider: 'codex',
+              sessionId: 'hidden-session',
+              projectPath: '/work/app',
+              updatedAt: 10,
+              title: 'Hidden Auto Session',
+              firstUserMessage: '__AUTO__ reconcile state',
+            },
+            {
+              provider: 'codex',
+              sessionId: 'visible-session',
+              projectPath: '/work/app',
+              updatedAt: 9,
+              title: 'Manual Session',
+              firstUserMessage: 'please fix tests',
+            },
+          ],
+        }],
+        totalSessions: 2,
+        oldestIncludedTimestamp: 9,
+        oldestIncludedSessionId: 'codex:visible-session',
+        hasMore: false,
+      })
+    })
+
+    wsMocks.connect.mockRejectedValueOnce(new Error('WebSocket error'))
+    const store = createStore()
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(store.getState().connection.status).toBe('disconnected')
+      expect(bootstrapCalls).toBe(1)
+      expect(sidebarCalls).toBe(1)
+    })
+
+    act(() => {
+      messageHandler?.({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-recovered',
+      })
+    })
+
+    await waitFor(() => {
+      expect(store.getState().connection.serverInstanceId).toBe('srv-recovered')
+      expect(store.getState().connection.platform).toBe('linux')
+      expect(store.getState().connection.availableClis).toEqual({ claude: true, codex: true })
+      expect(store.getState().settings.settings.sidebar.excludeFirstChatSubstrings).toEqual(['__AUTO__'])
+      expect(store.getState().sessions.projects).toEqual([
+        expect.objectContaining({
+          projectPath: '/work/app',
+          sessions: expect.arrayContaining([
+            expect.objectContaining({
+              sessionId: 'hidden-session',
+              title: 'Hidden Auto Session',
+              firstUserMessage: '__AUTO__ reconcile state',
+            }),
+            expect.objectContaining({
+              sessionId: 'visible-session',
+              title: 'Manual Session',
+              firstUserMessage: 'please fix tests',
+            }),
+          ]),
+        }),
+      ])
+    })
+
+    const selectVisibleItems = makeSelectSortedSessionItems()
+    expect(selectVisibleItems(store.getState() as any, [], '').map((item) => item.title)).toEqual([
+      'Manual Session',
+    ])
+
+    expect(bootstrapCalls).toBe(2)
+    expect(sidebarCalls).toBe(2)
+    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))
   })
 
   it('clears stale codex activity immediately when bootstrap attaches to an already-ready socket', async () => {

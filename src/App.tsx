@@ -441,6 +441,11 @@ export default function App() {
     let cleanup: (() => void) | null = null
     let stopTabRegistrySync: (() => void) | null = null
     let stopWsDisconnectSync: (() => void) | null = null
+    let bootstrapDataLoading = false
+    let sidebarWindowLoading = false
+    let versionInfoLoading = false
+    let startupRecoveryInFlight = false
+    const versionInfoLoadedRef = { current: false }
 
     async function bootstrap() {
       const handleBootstrapAuthFailure = (err: unknown): boolean => {
@@ -455,6 +460,82 @@ export default function App() {
         cleanup?.()
         stopTabRegistrySync?.()
         return true
+      }
+
+      const loadBootstrapData = async (): Promise<boolean> => {
+        if (bootstrapDataLoading) return true
+        bootstrapDataLoading = true
+        try {
+          const bootstrapData = await api.get<{
+            settings?: AppSettings
+            platform?: {
+              platform: string
+              availableClis?: Record<string, boolean>
+              hostName?: string
+              featureFlags?: Record<string, boolean>
+            }
+            configFallback?: {
+              reason?: unknown
+              backupExists?: unknown
+            }
+          }>('/api/bootstrap')
+          if (!cancelled) {
+            if (bootstrapData.settings) {
+              dispatch(setSettings(applyLocalTerminalFontFamily(bootstrapData.settings)))
+            }
+            if (bootstrapData.platform) {
+              dispatch(setPlatform(bootstrapData.platform.platform))
+              if (bootstrapData.platform.availableClis) {
+                dispatch(setAvailableClis(bootstrapData.platform.availableClis))
+              }
+              if (bootstrapData.platform.featureFlags) {
+                dispatch(setFeatureFlags(bootstrapData.platform.featureFlags))
+              }
+              dispatch(setTabRegistryDeviceMeta(resolveAndPersistDeviceMeta({
+                platform: bootstrapData.platform.platform,
+                hostName: bootstrapData.platform.hostName,
+              })))
+            }
+            if (bootstrapData.configFallback) {
+              setConfigFallback({
+                reason: parseConfigFallbackReason(bootstrapData.configFallback.reason),
+                backupExists: !!bootstrapData.configFallback.backupExists,
+              })
+            }
+          }
+          return true
+        } catch (err: any) {
+          if (handleBootstrapAuthFailure(err)) return false
+          log.warn('Failed to load bootstrap data', err)
+          return true
+        } finally {
+          bootstrapDataLoading = false
+        }
+      }
+
+      const loadVersionInfo = async (): Promise<boolean> => {
+        if (versionInfoLoading || versionInfoLoadedRef.current) return true
+        versionInfoLoading = true
+        try {
+          const nextVersionInfo = await api.get<VersionInfo>('/api/version')
+          if (!cancelled && isVersionInfo(nextVersionInfo)) {
+            versionInfoLoadedRef.current = true
+            setVersionInfo(nextVersionInfo)
+          }
+          return true
+        } catch (err: any) {
+          if (handleBootstrapAuthFailure(err)) return false
+          log.warn('Failed to load version info', err)
+          return true
+        } finally {
+          versionInfoLoading = false
+        }
+      }
+
+      const ensureNetworkStatusLoaded = () => {
+        const networkState = appStore.getState().network
+        if (cancelled || networkState.loading || networkState.status !== null) return
+        dispatch(fetchNetworkStatus())
       }
 
       if (!getAuthToken()) {
@@ -514,12 +595,14 @@ export default function App() {
       }
 
       const ensureSidebarSessionsWindow = async (): Promise<boolean> => {
+        if (sidebarWindowLoading) return true
         const sidebarWindow = appStore.getState().sessions.windows?.sidebar
         if (typeof sidebarWindow?.lastLoadedAt === 'number') {
           dispatch(activateSessionSurface('sidebar') as any)
           return true
         }
 
+        sidebarWindowLoading = true
         try {
           await dispatch(loadInitialSessionsWindow() as any)
           return true
@@ -527,6 +610,24 @@ export default function App() {
           if (handleBootstrapAuthFailure(err)) return false
           log.warn('Failed to load initial sidebar session window', err)
           return true
+        } finally {
+          sidebarWindowLoading = false
+        }
+      }
+
+      const recoverMissingStartupState = async () => {
+        if (startupRecoveryInFlight || cancelled) return
+        startupRecoveryInFlight = true
+        try {
+          const state = appStore.getState()
+          if (!state.settings.loaded || state.connection.platform === null) {
+            if (!(await loadBootstrapData())) return
+          }
+          if (!(await ensureSidebarSessionsWindow())) return
+          if (!(await loadVersionInfo())) return
+          ensureNetworkStatusLoaded()
+        } finally {
+          startupRecoveryInFlight = false
         }
       }
 
@@ -545,6 +646,7 @@ export default function App() {
           // from this bootstrap cycle is still safe for enabling follow-up refreshes.
           promoteRecentHttpSessionsBaseline()
           requestCodexActivityList()
+          void recoverMissingStartupState()
         }
         if (msg.type === 'sessions.changed') {
           void appStore.dispatch(refreshActiveSessionWindow() as any)
@@ -649,63 +751,14 @@ export default function App() {
       if (cleanedUp) cleanup()
 
       // ── HTTP bootstrap (async) ────────────────────────────────────
-      try {
-        const bootstrapData = await api.get<{
-          settings?: AppSettings
-          platform?: {
-            platform: string
-            availableClis?: Record<string, boolean>
-            hostName?: string
-            featureFlags?: Record<string, boolean>
-          }
-          configFallback?: {
-            reason?: unknown
-            backupExists?: unknown
-          }
-        }>('/api/bootstrap')
-        if (!cancelled) {
-          if (bootstrapData.settings) {
-            dispatch(setSettings(applyLocalTerminalFontFamily(bootstrapData.settings)))
-          }
-          if (bootstrapData.platform) {
-            dispatch(setPlatform(bootstrapData.platform.platform))
-            if (bootstrapData.platform.availableClis) {
-              dispatch(setAvailableClis(bootstrapData.platform.availableClis))
-            }
-            if (bootstrapData.platform.featureFlags) {
-              dispatch(setFeatureFlags(bootstrapData.platform.featureFlags))
-            }
-            dispatch(setTabRegistryDeviceMeta(resolveAndPersistDeviceMeta({
-              platform: bootstrapData.platform.platform,
-              hostName: bootstrapData.platform.hostName,
-            })))
-          }
-          if (bootstrapData.configFallback) {
-            setConfigFallback({
-              reason: parseConfigFallbackReason(bootstrapData.configFallback.reason),
-              backupExists: !!bootstrapData.configFallback.backupExists,
-            })
-          }
-        }
-      } catch (err: any) {
-        if (handleBootstrapAuthFailure(err)) return
-        log.warn('Failed to load bootstrap data', err)
-      }
+      if (!(await loadBootstrapData())) return
 
       if (!(await ensureSidebarSessionsWindow())) return
 
-      try {
-        const nextVersionInfo = await api.get<VersionInfo>('/api/version')
-        if (!cancelled && isVersionInfo(nextVersionInfo)) {
-          setVersionInfo(nextVersionInfo)
-        }
-      } catch (err: any) {
-        if (handleBootstrapAuthFailure(err)) return
-        log.warn('Failed to load version info', err)
-      }
+      if (!(await loadVersionInfo())) return
 
       // Load network status for remote access wizard/settings
-      if (!cancelled) dispatch(fetchNetworkStatus())
+      ensureNetworkStatusLoaded()
 
       // ── WebSocket connection / reconciliation ─────────────────────
       // Another component may have connected before App finished bootstrap.
@@ -724,6 +777,7 @@ export default function App() {
         if (!cancelled) {
           requestCodexActivityList()
         }
+        void recoverMissingStartupState()
         return
       }
       dispatch(setError(undefined))

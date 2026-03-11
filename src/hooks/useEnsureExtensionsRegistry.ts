@@ -21,6 +21,8 @@ function resolveExtensionsRegistryPath(): string {
 export function useEnsureExtensionsRegistry(enabled = true) {
   const dispatch = useAppDispatch()
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
+  const connectionStatus = useAppSelector((s) => s.connection?.status ?? 'disconnected')
+  const serverInstanceId = useAppSelector((s) => s.connection?.serverInstanceId ?? '')
   const requestedRef = useRef(false)
 
   useEffect(() => {
@@ -47,5 +49,5 @@ export function useEnsureExtensionsRegistry(enabled = true) {
     return () => {
       cancelled = true
     }
-  }, [dispatch, enabled, extensionEntries.length])
+  }, [connectionStatus, dispatch, enabled, extensionEntries.length, serverInstanceId])
 }
