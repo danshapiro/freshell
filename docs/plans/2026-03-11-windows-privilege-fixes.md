@@ -4,7 +4,7 @@
 
 **Goal:** Eliminate surprise Windows privilege escalation during startup and tests, keep manual Windows/WSL firewall repair in-product behind an explicit confirmation step, and force the Windows daemon task to run at least privilege.
 
-**Architecture:** Remove the WSL startup auto-repair path entirely so server boot never crosses the Windows privilege boundary. Keep the existing manual repair affordances in `SetupWizard` and `SettingsView`, but make the privilege jump explicit at both layers: the API must return a safe `confirmation-required` response until the caller sends an explicit confirmation flag, and the UI must show an accessible modal before it sends that second request. For Electron daemon mode, make least privilege part of both the scheduled-task template and the runtime task-management code so new installs and future starts cannot request `HighestAvailable`.
+**Architecture:** Remove the WSL startup auto-repair path entirely and delete the now-obsolete synchronous `setupWslPortForwarding()` wrapper, so server boot no longer crosses the Windows privilege boundary or leaves a dormant self-elevating API behind. Keep the existing manual repair affordances in `SetupWizard` and `SettingsView`, but make the privilege jump explicit at both layers: the API must return a safe `confirmation-required` response until the caller sends an explicit confirmation flag, and the UI must show an accessible modal before it sends that second request. For Electron daemon mode, make least privilege part of both the scheduled-task template and the runtime task-management code so new installs and future starts cannot request `HighestAvailable`.
 
 **Tech Stack:** TypeScript, Express, React/Redux, Vitest, supertest, Electron scheduled-task management
 
@@ -13,6 +13,7 @@
 ## Strategy Gate
 
 - The actual defect is not “tests need a better env flag”; it is that `server/index.ts` performs privileged Windows repair during normal boot. Delete that behavior instead of adding more suppression layers around it.
+- Once the boot-time caller is gone, delete `setupWslPortForwarding()` too. It exists only for that boot path; leaving it exported would preserve a dead self-elevating footgun for no product value.
 - Keep manual Windows/WSL repair in-product. The user explicitly wants a one-click flow, so do not replace it with copy-paste scripts or external shell instructions.
 - Put the privilege boundary on both sides of the API. UI confirmation alone is not sufficient because a future caller could still hit `/api/network/configure-firewall` directly; server-side explicit confirmation is required as a backstop.
 - Reuse the existing repair surfaces in `src/components/SetupWizard.tsx` and `src/components/SettingsView.tsx`. Do not add a third startup-only banner or wizard path for this issue.
@@ -23,7 +24,7 @@
 ## Acceptance Mapping
 
 - Launching `server/index.ts` on WSL with `host === '0.0.0.0'` never triggers a Windows UAC prompt.
-- The obsolete startup-only WSL suppression path (`server/wsl-port-forward-startup.ts` and its test harness env defaulting) is removed.
+- The obsolete startup-only WSL suppression path (`server/wsl-port-forward-startup.ts`, `FRESHELL_DISABLE_WSL_PORT_FORWARD`, and the sync `setupWslPortForwarding()` wrapper) is removed, so no dormant boot-only elevation helper remains.
 - `POST /api/network/configure-firewall` never spawns an elevated Windows process unless the request explicitly confirms elevation.
 - Clicking `Fix` in Settings or `Configure now` in the setup wizard on Windows/WSL first shows an accessible modal that warns the user an administrator approval dialog is coming next; cancelling performs no elevated action.
 - Linux/macOS firewall repair continues to return terminal commands exactly as before.
@@ -31,24 +32,46 @@
 
 ## Scope Notes
 
-- Keep `server/wsl-port-forward.ts` as the manual WSL repair implementation. The module remains valid for explicit repairs; only the boot-time caller goes away.
+- Keep `server/wsl-port-forward.ts` as the home for the pure/manual WSL repair helpers (`getWslIp`, `getRequiredPorts`, script builders, rule parsers). Delete the sync `setupWslPortForwarding()` wrapper because the manual API route does not use it.
 - Keep `NetworkManager` as the source of truth for whether repair is needed (`firewall.platform`, `firewall.portOpen`, `firewall.configuring`). Do not add a separate “pending Windows repair” state machine.
 - Do not change the share-panel routing in `src/lib/share-utils.ts` for this issue. The problem being fixed is unsolicited elevation, not broader remote-access diagnosis UX.
 
-### Task 1: Remove Boot-Time WSL Elevation and Delete the Test-Only Suppression Scaffolding
+### Task 1: Remove Boot-Time WSL Elevation and Delete the Obsolete Auto-Repair Wrapper
 
 **Files:**
 - Delete: `server/wsl-port-forward-startup.ts`
 - Delete: `test/unit/server/wsl-port-forward-startup.test.ts`
 - Modify: `server/index.ts`
+- Modify: `server/wsl-port-forward.ts`
 - Modify: `test/integration/server/wsl-port-forward.test.ts`
 - Modify: `test/integration/server/logger.separation.harness.ts`
 - Modify: `test/integration/server/logger.separation.harness.test.ts`
+- Modify: `test/unit/server/wsl-port-forward.test.ts`
 - Modify: `test/e2e-browser/helpers/test-server.ts`
 
 **Step 1: Write the failing safety tests**
 
-In `test/integration/server/wsl-port-forward.test.ts`, replace the current startup-gate assertion with an assertion that `server/index.ts` no longer imports `setupWslPortForwarding` or `./wsl-port-forward-startup.js`, and no longer calls `setupWslPortForwarding(` anywhere in `main()`.
+In `test/integration/server/wsl-port-forward.test.ts`, rewrite the existing export/startup assertions into two regression checks:
+
+```ts
+it('wsl-port-forward exports only the pure helper surface used by manual repair', async () => {
+  const wslModule = await import('../../../server/wsl-port-forward.js')
+  expect(typeof wslModule.getWslIp).toBe('function')
+  expect(typeof wslModule.getRequiredPorts).toBe('function')
+  expect(typeof wslModule.buildPortForwardingScript).toBe('function')
+  expect(typeof wslModule.buildFirewallOnlyScript).toBe('function')
+  expect('setupWslPortForwarding' in wslModule).toBe(false)
+})
+
+it('server/index.ts no longer imports or calls the startup-only WSL helper', () => {
+  const indexPath = path.resolve(__dirname, '../../../server/index.ts')
+  const indexContent = fs.readFileSync(indexPath, 'utf-8')
+
+  expect(indexContent).not.toContain("from './wsl-port-forward-startup.js'")
+  expect(indexContent).not.toContain('setupWslPortForwarding(')
+  expect(indexContent).not.toContain('shouldSetupWslPortForwardingAtStartup')
+})
+```
 
 In `test/integration/server/logger.separation.harness.test.ts`, replace the env-default assertions with:
 
@@ -70,16 +93,18 @@ npx vitest run --config vitest.server.config.ts \
 ```
 
 Expected:
-- FAIL because `server/index.ts` still imports/calls the startup helper and the logger harness still injects `FRESHELL_DISABLE_WSL_PORT_FORWARD`.
+- FAIL because `server/index.ts` still imports/calls the startup helper, `wsl-port-forward.ts` still exports `setupWslPortForwarding`, and the logger harness still injects `FRESHELL_DISABLE_WSL_PORT_FORWARD`.
 
-**Step 3: Remove the boot-time caller and dead suppression code**
+**Step 3: Remove the boot-time caller, dead env suppression, and dead wrapper**
 
 Implement these changes:
 
 - In `server/index.ts`, delete the entire `shouldSetupWslPortForwardingAtStartup(...)` block and the related imports.
-- Update the nearby comment to explain that WSL repair is manual and exposed through the network repair API/UI, not automatic at boot.
+- Update the nearby comment to explain that WSL repair is surfaced through the manual network repair API/UI, not automatic at boot.
+- In `server/wsl-port-forward.ts`, delete `SetupResult`, `setupWslPortForwarding()`, and any imports/constants that become unused (`execSync`, `isWSL2`, `POWERSHELL_PATH`). Keep the pure helper functions used by the manual route and unit tests.
 - Delete `server/wsl-port-forward-startup.ts` and `test/unit/server/wsl-port-forward-startup.test.ts`.
 - In `test/integration/server/logger.separation.harness.ts`, remove the `delete childEnv.FRESHELL_DISABLE_WSL_PORT_FORWARD` / default-to-`1` logic entirely.
+- In `test/unit/server/wsl-port-forward.test.ts`, remove the `setupWslPortForwarding` import and the entire `describe('setupWslPortForwarding', ...)` block now that the wrapper no longer exists.
 - In `test/e2e-browser/helpers/test-server.ts`, keep the local bind override if it still helps test isolation, but update the comment so it no longer claims startup UAC is expected.
 
 **Step 4: Re-run the targeted tests**
@@ -89,6 +114,7 @@ Run:
 ```bash
 npx vitest run --config vitest.server.config.ts \
   test/integration/server/wsl-port-forward.test.ts \
+  test/unit/server/wsl-port-forward.test.ts \
   test/integration/server/logger.separation.harness.test.ts
 ```
 
@@ -99,9 +125,11 @@ Expected:
 
 ```bash
 git add server/index.ts \
+  server/wsl-port-forward.ts \
   test/integration/server/wsl-port-forward.test.ts \
   test/integration/server/logger.separation.harness.ts \
   test/integration/server/logger.separation.harness.test.ts \
+  test/unit/server/wsl-port-forward.test.ts \
   test/e2e-browser/helpers/test-server.ts
 git rm server/wsl-port-forward-startup.ts test/unit/server/wsl-port-forward-startup.test.ts
 git commit -m "refactor(server): remove WSL auto-repair at startup"
@@ -256,6 +284,7 @@ git commit -m "refactor(server): require confirmation before windows elevation"
 - Modify: `src/components/SetupWizard.tsx`
 - Modify: `src/components/SettingsView.tsx`
 - Modify: `test/unit/client/lib/firewall-configure.test.ts`
+- Create: `test/unit/client/components/ui/confirm-modal.test.tsx`
 - Modify: `test/unit/client/SetupWizard.test.tsx`
 - Modify: `test/unit/client/components/SettingsView.network-access.test.tsx`
 - Modify: `test/e2e/network-setup.test.tsx`
@@ -269,6 +298,26 @@ it('passes confirmElevation when explicitly requested', async () => {
   vi.mocked(api.post).mockResolvedValue({ method: 'windows-elevated', status: 'started' })
   await fetchFirewallConfig({ confirmElevation: true })
   expect(api.post).toHaveBeenCalledWith('/api/network/configure-firewall', { confirmElevation: true })
+})
+```
+
+Create `test/unit/client/components/ui/confirm-modal.test.tsx` with a regression test for the shared modal API:
+
+```tsx
+it('renders a non-destructive primary confirm button when confirmTone is default', () => {
+  render(
+    <ConfirmModal
+      open
+      title="Administrator approval required"
+      body="To complete this, you will need to accept the Windows administrator prompt on the next screen."
+      confirmLabel="Continue"
+      confirmTone="default"
+      onConfirm={vi.fn()}
+      onCancel={vi.fn()}
+    />,
+  )
+
+  expect(screen.getByRole('button', { name: 'Continue' })).not.toHaveClass('bg-destructive')
 })
 ```
 
@@ -310,6 +359,7 @@ Run:
 ```bash
 npx vitest run \
   test/unit/client/lib/firewall-configure.test.ts \
+  test/unit/client/components/ui/confirm-modal.test.tsx \
   test/unit/client/SetupWizard.test.tsx \
   test/unit/client/components/SettingsView.network-access.test.tsx \
   test/e2e/network-setup.test.tsx
@@ -343,11 +393,12 @@ export async function fetchFirewallConfig(
 }
 ```
 
-In `src/components/ui/confirm-modal.tsx`, add a non-destructive confirm styling option so the Windows admin prompt can use a primary button instead of the current destructive red button. Keep the existing destructive default so delete/close flows do not regress.
+In `src/components/ui/confirm-modal.tsx`, add a `confirmTone?: 'destructive' | 'default'` prop so the Windows admin prompt can use a primary button instead of the current destructive red button. Keep `'destructive'` as the default so delete/close flows do not regress.
 
 In both `src/components/SetupWizard.tsx` and `src/components/SettingsView.tsx`:
 
 - On the first `fetchFirewallConfig()` call, if the result is `confirmation-required`, open `ConfirmModal` with the returned title/body/confirmLabel.
+- Pass `confirmTone="default"` for this admin-approval flow; destructive styling is the wrong signal for “continue to the UAC prompt”.
 - On confirm, re-issue `fetchFirewallConfig({ confirmElevation: true })` and continue the existing terminal/polling behavior.
 - On cancel, clear the modal state and do nothing else.
 - Preserve the current Linux/macOS terminal-command flow unchanged.
@@ -362,6 +413,7 @@ Run:
 ```bash
 npx vitest run \
   test/unit/client/lib/firewall-configure.test.ts \
+  test/unit/client/components/ui/confirm-modal.test.tsx \
   test/unit/client/SetupWizard.test.tsx \
   test/unit/client/components/SettingsView.network-access.test.tsx \
   test/e2e/network-setup.test.tsx
@@ -378,6 +430,7 @@ git add src/lib/firewall-configure.ts \
   src/components/SetupWizard.tsx \
   src/components/SettingsView.tsx \
   test/unit/client/lib/firewall-configure.test.ts \
+  test/unit/client/components/ui/confirm-modal.test.tsx \
   test/unit/client/SetupWizard.test.tsx \
   test/unit/client/components/SettingsView.network-access.test.tsx \
   test/e2e/network-setup.test.tsx
@@ -505,6 +558,7 @@ Run:
 ```bash
 npx vitest run \
   test/unit/client/lib/firewall-configure.test.ts \
+  test/unit/client/components/ui/confirm-modal.test.tsx \
   test/unit/client/SetupWizard.test.tsx \
   test/unit/client/components/SettingsView.network-access.test.tsx \
   test/e2e/network-setup.test.tsx
@@ -530,16 +584,19 @@ Run:
 
 ```bash
 npm run lint
-npm test
+npm run verify
 ```
 
 Expected:
 - PASS
 
+If the executor is rebasing/merging this branch to `main` in the same session, rerun `npm test` immediately before the final fast-forward to satisfy repo policy.
+
 **Step 4: Commit the final polish**
 
 ```bash
 git add server/index.ts \
+  server/wsl-port-forward.ts \
   server/elevated-powershell.ts \
   server/network-router.ts \
   server/firewall.ts \
@@ -553,8 +610,10 @@ git add server/index.ts \
   test/integration/server/network-api.test.ts \
   test/integration/server/logger.separation.harness.ts \
   test/integration/server/logger.separation.harness.test.ts \
+  test/unit/server/wsl-port-forward.test.ts \
   test/unit/server/elevated-powershell.test.ts \
   test/unit/client/lib/firewall-configure.test.ts \
+  test/unit/client/components/ui/confirm-modal.test.tsx \
   test/unit/client/SetupWizard.test.tsx \
   test/unit/client/components/SettingsView.network-access.test.tsx \
   test/unit/electron/daemon/windows-service.test.ts \
@@ -567,6 +626,7 @@ git commit -m "fix(windows): tighten privilege boundaries for network repair"
 
 - `git status --short` must be clean.
 - Confirm the deleted startup helper files are gone.
+- Confirm `server/wsl-port-forward.ts` no longer exports `setupWslPortForwarding`.
 - Confirm `installers/windows/freshell-task.xml.template` contains `LeastPrivilege`.
 - Confirm `/api/network/configure-firewall` has exactly three manual behaviors:
   - `terminal` for Linux/macOS
