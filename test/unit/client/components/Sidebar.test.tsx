@@ -11,6 +11,7 @@ import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
 import extensionsReducer from '@/store/extensionsSlice'
+import terminalDirectoryReducer from '@/store/terminalDirectorySlice'
 import type { ProjectGroup, BackgroundTerminal, TabMode } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
@@ -57,6 +58,7 @@ const mockSend = vi.fn()
 const mockOnMessage = vi.fn(() => () => {})
 const mockConnect = vi.fn().mockResolvedValue(undefined)
 const mockFetchSidebarSessionsSnapshot = vi.fn()
+const mockGetTerminalDirectoryPage = vi.fn()
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -72,6 +74,7 @@ vi.mock('@/lib/api', async () => {
   return {
     ...actual,
     fetchSidebarSessionsSnapshot: (...args: any[]) => mockFetchSidebarSessionsSnapshot(...args),
+    getTerminalDirectoryPage: (...args: any[]) => mockGetTerminalDirectoryPage(...args),
     searchSessions: vi.fn(),
   }
 })
@@ -144,6 +147,7 @@ function createTestStore(options?: {
       sessions: sessionsReducer,
       sessionActivity: sessionActivityReducer,
       extensions: extensionsReducer,
+      terminalDirectory: terminalDirectoryReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -205,26 +209,11 @@ function renderSidebar(
   terminals: BackgroundTerminal[] = []
 ) {
   const onNavigate = vi.fn()
-  let messageCallback: ((msg: any) => void) | null = null
-
-  // Setup the mock to capture the message handler and respond to terminal.list
-  mockSend.mockImplementation((msg: any) => {
-    if (msg.type === 'terminal.list' && messageCallback) {
-      // Respond with the same requestId via setTimeout (for fake timers)
-      setTimeout(() => {
-        messageCallback!({
-          type: 'terminal.list.response',
-          requestId: msg.requestId,
-          terminals,
-        })
-      }, 0)
-    }
-  })
-
-  mockOnMessage.mockImplementation((callback: (msg: any) => void) => {
-    messageCallback = callback
-    return () => { messageCallback = null }
-  })
+  mockGetTerminalDirectoryPage.mockImplementation(async () => ({
+    items: terminals,
+    nextCursor: null,
+    revision: 1,
+  }))
 
   const result = render(
     <Provider store={store}>
@@ -241,6 +230,12 @@ describe('Sidebar Component - Session-Centric Display', () => {
     vi.useFakeTimers()
     mockFetchSidebarSessionsSnapshot.mockReset()
     mockFetchSidebarSessionsSnapshot.mockResolvedValue({ projects: [] })
+    mockGetTerminalDirectoryPage.mockReset()
+    mockGetTerminalDirectoryPage.mockResolvedValue({
+      items: [],
+      nextCursor: null,
+      revision: 1,
+    })
   })
 
   afterEach(() => {

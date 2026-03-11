@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo } from 'react'
 import { getWsClient } from '@/lib/ws-client'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { useAppDispatch } from '@/store/hooks'
+import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab } from '@/store/tabsSlice'
+import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
 
 type BackgroundTerminal = {
   terminalId: string
@@ -17,6 +18,8 @@ type BackgroundTerminal = {
   resumeSessionId?: string
 }
 
+const EMPTY_TERMINALS: BackgroundTerminal[] = []
+
 function formatAge(ms: number): string {
   const s = Math.floor(ms / 1000)
   if (s < 60) return `${s}s`
@@ -28,48 +31,28 @@ function formatAge(ms: number): string {
 
 export default function BackgroundSessions() {
   const dispatch = useAppDispatch()
-
   const ws = useMemo(() => getWsClient(), [])
-  const [terminals, setTerminals] = useState<BackgroundTerminal[]>([])
-  const requestIdRef = useRef<string | null>(null)
+  const terminals = useAppSelector((state) => (
+    (state as any).terminalDirectory?.windows?.background?.items ?? EMPTY_TERMINALS
+  )) as BackgroundTerminal[]
 
   const refresh = useCallback(() => {
-    const requestId = `list-${Date.now()}`
-    requestIdRef.current = requestId
-    ws.send({ type: 'terminal.list', requestId })
-  }, [ws])
+    void dispatch(fetchTerminalDirectoryWindow({
+      surface: 'background',
+      priority: 'visible',
+    }) as any).catch(() => {})
+  }, [dispatch])
 
   useEffect(() => {
-    let unsub = () => {}
     let interval: number | null = null
 
-    // Connection is owned by App.tsx
     refresh()
     interval = window.setInterval(refresh, 5000)
 
-    unsub = ws.onMessage((msg) => {
-      if (msg.type === 'terminal.list.response' && msg.requestId === requestIdRef.current) {
-        setTerminals(msg.terminals || [])
-      }
-      if (msg.type === 'terminal.detached') {
-        refresh()
-      }
-      if (msg.type === 'terminal.attach.ready') {
-        refresh()
-      }
-      if (msg.type === 'terminal.exit') {
-        refresh()
-      }
-      if (msg.type === 'terminal.list.updated') {
-        refresh()
-      }
-    })
-
     return () => {
-      unsub()
       if (interval) window.clearInterval(interval)
     }
-  }, [ws, refresh])
+  }, [refresh])
 
   const detachedRunning = terminals.filter((t) => t.status === 'running' && !t.hasClients)
 

@@ -8,6 +8,7 @@ import codingCliReducer from './codingCliSlice'
 import panesReducer from './panesSlice'
 import sessionActivityReducer from './sessionActivitySlice'
 import terminalActivityReducer from './terminalActivitySlice'
+import terminalDirectoryReducer from './terminalDirectorySlice'
 
 import turnCompletionReducer from './turnCompletionSlice'
 import terminalMetaReducer from './terminalMetaSlice'
@@ -36,6 +37,7 @@ export const store = configureStore({
     panes: panesReducer,
     sessionActivity: sessionActivityReducer,
     terminalActivity: terminalActivityReducer,
+    terminalDirectory: terminalDirectoryReducer,
 
     turnCompletion: turnCompletionReducer,
     terminalMeta: terminalMetaReducer,

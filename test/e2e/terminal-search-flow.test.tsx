@@ -6,6 +6,7 @@ import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
+import terminalDirectoryReducer from '@/store/terminalDirectorySlice'
 import TerminalView from '@/components/TerminalView'
 import type { TerminalPaneContent } from '@/store/paneTypes'
 
@@ -16,18 +17,24 @@ const wsMocks = vi.hoisted(() => ({
   onReconnect: vi.fn().mockReturnValue(() => {}),
 }))
 
-const runtimeMocks = vi.hoisted(() => ({
-  findNext: vi.fn(() => true),
-  findPrevious: vi.fn(() => true),
-  clearDecorations: vi.fn(),
-  onDidChangeResults: vi.fn(() => ({ dispose: vi.fn() })),
-}))
+const searchTerminalViewMock = vi.hoisted(() => vi.fn())
 
 let keyHandler: ((event: KeyboardEvent) => boolean) | null = null
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => wsMocks,
 }))
+
+vi.mock('@/lib/api', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api')
+  return {
+    ...actual,
+    api: {
+      patch: vi.fn().mockResolvedValue({}),
+    },
+    searchTerminalView: (...args: any[]) => searchTerminalViewMock(...args),
+  }
+})
 
 vi.mock('@/lib/terminal-themes', () => ({
   getTerminalTheme: () => ({}),
@@ -37,10 +44,6 @@ vi.mock('@/components/terminal/terminal-runtime', () => ({
   createTerminalRuntime: () => ({
     attachAddons: vi.fn(),
     fit: vi.fn(),
-    findNext: runtimeMocks.findNext,
-    findPrevious: runtimeMocks.findPrevious,
-    clearDecorations: runtimeMocks.clearDecorations,
-    onDidChangeResults: runtimeMocks.onDidChangeResults,
     dispose: vi.fn(),
     webglActive: vi.fn(() => false),
   }),
@@ -98,6 +101,7 @@ function createStore() {
       panes: panesReducer,
       settings: settingsReducer,
       connection: connectionReducer,
+      terminalDirectory: terminalDirectoryReducer,
     },
     preloadedState: {
       tabs: {
@@ -131,8 +135,7 @@ function createStore() {
 describe('terminal search flow (e2e)', () => {
   beforeEach(() => {
     keyHandler = null
-    runtimeMocks.findNext.mockClear()
-    runtimeMocks.findPrevious.mockClear()
+    searchTerminalViewMock.mockReset()
     vi.stubGlobal('ResizeObserver', MockResizeObserver)
     vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
       cb(0)
@@ -146,6 +149,13 @@ describe('terminal search flow (e2e)', () => {
   })
 
   it('opens search on Ctrl+F and navigates next/previous matches', async () => {
+    searchTerminalViewMock.mockResolvedValue({
+      matches: [
+        { line: 1, column: 0, text: 'needle one' },
+        { line: 5, column: 4, text: 'needle two' },
+      ],
+      nextCursor: null,
+    })
     const store = createStore()
     const paneContent = (store.getState().panes.layouts['tab-1'] as any).content as TerminalPaneContent
 
@@ -175,22 +185,25 @@ describe('terminal search flow (e2e)', () => {
     const input = await screen.findByRole('textbox', { name: 'Terminal search' })
 
     fireEvent.change(input, { target: { value: 'needle' } })
-    expect(runtimeMocks.findNext).toHaveBeenCalledWith('needle', expect.objectContaining({
-      caseSensitive: false,
-      incremental: true,
-      decorations: expect.objectContaining({
-        matchOverviewRuler: expect.any(String),
-        activeMatchColorOverviewRuler: expect.any(String),
-      }),
-    }))
+    await waitFor(() => {
+      expect(searchTerminalViewMock).toHaveBeenCalledWith(
+        'term-search',
+        { query: 'needle' },
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      )
+    })
+    await waitFor(() => {
+      expect(screen.getByText('1 of 2')).toBeInTheDocument()
+    })
 
     fireEvent.click(screen.getByRole('button', { name: 'Next match' }))
+    await waitFor(() => {
+      expect(screen.getByText('2 of 2')).toBeInTheDocument()
+    })
+
     fireEvent.click(screen.getByRole('button', { name: 'Previous match' }))
-    expect(runtimeMocks.findPrevious).toHaveBeenCalledWith('needle', expect.objectContaining({
-      decorations: expect.objectContaining({
-        matchOverviewRuler: expect.any(String),
-        activeMatchColorOverviewRuler: expect.any(String),
-      }),
-    }))
+    await waitFor(() => {
+      expect(screen.getByText('1 of 2')).toBeInTheDocument()
+    })
   })
 })

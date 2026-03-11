@@ -7,7 +7,6 @@ import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { openSessionTab, setActiveTab } from '@/store/tabsSlice'
 import { addPane, setActivePane } from '@/store/panesSlice'
 import { findPaneForSession } from '@/lib/session-utils'
-import { getWsClient } from '@/lib/ws-client'
 import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import type { BackgroundTerminal, CodingCliProviderName } from '@/store/types'
@@ -18,9 +17,11 @@ import { createLogger } from '@/lib/client-logger'
 import { useStableArray } from '@/hooks/useStableArray'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { activateSessionSurface, fetchSessionWindow } from '@/store/sessionsThunks'
+import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
 
 
 const log = createLogger('Sidebar')
+const EMPTY_TERMINALS: BackgroundTerminal[] = []
 
 /** Compare two BackgroundTerminal arrays by sidebar-relevant fields only.
  *  Ignores lastActivityAt since it changes frequently but doesn't affect rendering. */
@@ -229,18 +230,18 @@ export default function Sidebar({
   })
   const selectSortedItems = useMemo(() => makeSelectSortedSessionItems(), [])
 
-  const ws = useMemo(() => getWsClient(), [])
   const hasMore = useAppSelector((s) => s.sessions.hasMore)
   const loadingMore = useAppSelector((s) => s.sessions.loadingMore)
   const oldestLoadedTimestamp = useAppSelector((s) => s.sessions.oldestLoadedTimestamp)
   const oldestLoadedSessionId = useAppSelector((s) => s.sessions.oldestLoadedSessionId)
   const sidebarWindow = useAppSelector((s) => s.sessions.windows?.sidebar)
   const topLevelSessionCount = useAppSelector((s) => s.sessions.projects?.length ?? 0)
-  const [terminals, setTerminals] = useState<BackgroundTerminal[]>([])
+  const terminals = useAppSelector((state) => (
+    (state as any).terminalDirectory?.windows?.sidebar?.items ?? EMPTY_TERMINALS
+  )) as BackgroundTerminal[]
   const [filter, setFilter] = useState('')
   const [searchTier, setSearchTier] = useState<'title' | 'userMessages' | 'fullText'>('title')
   const lastMarkedSearchQueryRef = useRef<string | null>(null)
-  const requestIdRef = useRef<string | null>(null)
   const listContainerRef = useRef<HTMLDivElement | null>(null)
   const [listHeight, setListHeight] = useState(0)
 
@@ -262,38 +263,20 @@ export default function Sidebar({
     }) as any)
   }, [dispatch, sidebarWindow, topLevelSessionCount])
 
-  // Fetch background terminals
-  const refresh = useCallback(() => {
-    const requestId = `list-${Date.now()}`
-    requestIdRef.current = requestId
-    ws.send({ type: 'terminal.list', requestId })
-  }, [ws])
+  const refreshTerminals = useCallback(() => {
+    void dispatch(fetchTerminalDirectoryWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+    }) as any).catch(() => {})
+  }, [dispatch])
 
   useEffect(() => {
-    // Register message handler BEFORE calling refresh to avoid race condition.
-    // Connection is owned by App.tsx
-    const unsub = ws.onMessage((msg) => {
-      if (msg.type === 'terminal.list.response' && msg.requestId === requestIdRef.current) {
-        const incoming = msg.terminals || []
-        // Only update state when terminal data has actually changed to avoid
-        // unnecessary re-renders that cause the sidebar list to blink/flash.
-        setTerminals((prev) => {
-          if (areTerminalsEqual(prev, incoming)) return prev
-          return incoming
-        })
-      }
-      if (['terminal.detached', 'terminal.attach.ready', 'terminal.exit', 'terminal.list.updated'].includes(msg.type)) {
-        refresh()
-      }
-    })
-
-    refresh()
-    const interval = window.setInterval(refresh, 10000)
+    refreshTerminals()
+    const interval = window.setInterval(refreshTerminals, 10000)
     return () => {
-      unsub()
       window.clearInterval(interval)
     }
-  }, [ws, refresh])
+  }, [refreshTerminals])
 
   useEffect(() => {
     const query = filter.trim()

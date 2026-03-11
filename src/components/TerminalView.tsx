@@ -14,6 +14,7 @@ import { consumePaneRefreshRequest, splitPane, updatePaneContent, updatePaneTitl
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 import { recordTurnComplete, clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
+import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTerminalSearch } from '@/store/terminalDirectoryThunks'
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
 import { api } from '@/lib/api'
 import { getWsClient } from '@/lib/ws-client'
@@ -82,13 +83,6 @@ const TAP_MAX_DISTANCE_PX = 24
 const TOUCH_SCROLL_PIXELS_PER_LINE = 18
 const LIGHT_THEME_MIN_CONTRAST_RATIO = 4.5
 const DEFAULT_MIN_CONTRAST_RATIO = 1
-
-const SEARCH_DECORATIONS = {
-  matchBackground: '#515C6A',
-  matchOverviewRuler: '#D4AA00',
-  activeMatchBackground: '#EEB04A',
-  activeMatchColorOverviewRuler: '#EEB04A',
-} as const
 
 function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): number {
   return theme?.isDark === false ? LIGHT_THEME_MIN_CONTRAST_RATIO : DEFAULT_MIN_CONTRAST_RATIO
@@ -183,7 +177,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   const [pendingOsc52Event, setPendingOsc52Event] = useState<Osc52Event | null>(null)
   const [searchOpen, setSearchOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
-  const [searchResults, setSearchResults] = useState<{ resultIndex: number; resultCount: number } | null>(null)
   const [keyboardInsetPx, setKeyboardInsetPx] = useState(0)
   const [mobileCtrlActive, setMobileCtrlActive] = useState(false)
   const setPendingLinkUriRef = useRef(setPendingLinkUri)
@@ -232,6 +225,16 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
   // Extract terminal-specific fields (safe because we check kind later)
   const isTerminal = paneContent.kind === 'terminal'
   const terminalContent = isTerminal ? paneContent : null
+  const terminalSearchState = useAppSelector((state) => {
+    const terminalId = terminalContent?.terminalId
+    if (!terminalId) return null
+    return (state as any).terminalDirectory?.searches?.[terminalId] ?? null
+  }) as {
+    query: string
+    matches: Array<unknown>
+    activeIndex?: number
+    loading: boolean
+  } | null
 
   // Refs for terminal lifecycle (only meaningful if isTerminal)
   // CRITICAL: Use refs to avoid callback/effect dependency on changing content
@@ -256,6 +259,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     requestId: string
     terminalId: string
   } | null>(null)
+  const searchTerminalIdCleanupRef = useRef<string | null>(terminalContent?.terminalId ?? null)
   const deferredAttachStateRef = useRef<DeferredAttachState>({
     mode: 'none',
     pendingIntent: null,
@@ -572,6 +576,24 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     }
   }, [clearLongPressTimer])
 
+  useEffect(() => {
+    const terminalId = terminalContent?.terminalId ?? null
+    const previousTerminalId = searchTerminalIdCleanupRef.current
+    if (previousTerminalId && previousTerminalId !== terminalId) {
+      void dispatch(loadTerminalSearch({ terminalId: previousTerminalId, query: '' }) as any).catch(() => {})
+      setSearchQuery('')
+    }
+    searchTerminalIdCleanupRef.current = terminalId
+  }, [dispatch, terminalContent?.terminalId])
+
+  useEffect(() => {
+    return () => {
+      const terminalId = searchTerminalIdCleanupRef.current
+      if (!terminalId) return
+      void dispatch(loadTerminalSearch({ terminalId, query: '' }) as any).catch(() => {})
+    }
+  }, [dispatch])
+
   // Helper to update pane content - uses ref to avoid recreation on content changes
   // This is CRITICAL: if updateContent depended on terminalContent directly,
   // it would be recreated on every status update, causing the effect to re-run
@@ -751,30 +773,46 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     ws.send({ type: 'terminal.input', terminalId: tid, data })
   }, [dispatch, tabId, paneId, ws])
 
-  const searchOpts = useMemo(() => ({
-    caseSensitive: false,
-    incremental: true,
-    decorations: SEARCH_DECORATIONS,
-  }), [])
-
   const findNext = useCallback((value: string = searchQuery) => {
-    if (!value) return
-    runtimeRef.current?.findNext(value, searchOpts)
-  }, [searchQuery, searchOpts])
+    const terminalId = terminalIdRef.current
+    const query = value.trim()
+    if (!terminalId || !query) return
+    if (terminalSearchState?.query !== query || terminalSearchState.loading) {
+      void dispatch(loadTerminalSearch({ terminalId, query }) as any).catch(() => {})
+      return
+    }
+    void dispatch(focusNextTerminalSearchMatch(terminalId) as any)
+  }, [dispatch, searchQuery, terminalSearchState?.loading, terminalSearchState?.query])
 
   const findPrevious = useCallback((value: string = searchQuery) => {
-    if (!value) return
-    runtimeRef.current?.findPrevious(value, searchOpts)
-  }, [searchQuery, searchOpts])
+    const terminalId = terminalIdRef.current
+    const query = value.trim()
+    if (!terminalId || !query) return
+    if (terminalSearchState?.query !== query || terminalSearchState.loading) {
+      void dispatch(loadTerminalSearch({ terminalId, query }) as any).catch(() => {})
+      return
+    }
+    void dispatch(focusPreviousTerminalSearchMatch(terminalId) as any)
+  }, [dispatch, searchQuery, terminalSearchState?.loading, terminalSearchState?.query])
+
+  const handleSearchQueryChange = useCallback((value: string) => {
+    setSearchQuery(value)
+    const terminalId = terminalIdRef.current
+    if (!terminalId) return
+    void dispatch(loadTerminalSearch({ terminalId, query: value }) as any).catch(() => {})
+  }, [dispatch])
 
   const closeSearch = useCallback(() => {
     setSearchOpen(false)
-    setSearchResults(null)
-    runtimeRef.current?.clearDecorations()
+    setSearchQuery('')
+    const terminalId = terminalIdRef.current
+    if (terminalId) {
+      void dispatch(loadTerminalSearch({ terminalId, query: '' }) as any).catch(() => {})
+    }
     requestAnimationFrame(() => {
       termRef.current?.focus()
     })
-  }, [])
+  }, [dispatch])
 
   const sendMobileToolbarKey = useCallback((keyId: MobileToolbarKeyId) => {
     if (keyId === 'ctrl') {
@@ -909,10 +947,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     writeQueueRef.current = writeQueue
     const layoutScheduler = createLayoutScheduler(flushScheduledLayout)
     layoutSchedulerRef.current = layoutScheduler
-
-    const searchResultsDisposable = runtime.onDidChangeResults((event) => {
-      setSearchResults({ resultIndex: event.resultIndex, resultCount: event.resultCount })
-    })
 
     term.open(containerRef.current)
 
@@ -1071,7 +1105,6 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       ro.disconnect()
       unregisterActions()
       unregisterCaptureHandler()
-      searchResultsDisposable.dispose()
       if (writeQueueRef.current === writeQueue) {
         writeQueue.clear()
         writeQueueRef.current = null
@@ -1928,15 +1961,14 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       {searchOpen && (
         <TerminalSearchBar
           query={searchQuery}
-          onQueryChange={(value) => {
-            setSearchQuery(value)
-            findNext(value)
-          }}
+          onQueryChange={handleSearchQueryChange}
           onFindNext={() => findNext()}
           onFindPrevious={() => findPrevious()}
           onClose={closeSearch}
-          resultIndex={searchResults?.resultIndex}
-          resultCount={searchResults?.resultCount}
+          resultIndex={terminalSearchState?.activeIndex}
+          resultCount={searchQuery.trim() && terminalSearchState && !terminalSearchState.loading
+            ? terminalSearchState.matches.length
+            : undefined}
         />
       )}
       <Osc52PromptModal
