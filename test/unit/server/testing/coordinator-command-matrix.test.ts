@@ -301,7 +301,7 @@ describe('classifyCommand()', () => {
     })
   })
 
-  it('bypasses coordination for help and version flags', () => {
+  it('bypasses coordination for help and version flags while preserving truthful target ownership', () => {
     expectSinglePhase(classifyCommand({
       commandKey: 'test',
       forwardedArgs: ['--help'],
@@ -318,6 +318,24 @@ describe('classifyCommand()', () => {
       kind: 'passthrough',
       config: 'server',
       args: ['--config', 'vitest.server.config.ts', '-v'],
+    })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['test/server/ws-protocol.test.ts', '--help'],
+    }), {
+      kind: 'passthrough',
+      config: 'server',
+      args: ['run', '--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts', '--help'],
+    })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:unit',
+      forwardedArgs: ['test/unit/server/coding-cli/utils.test.ts', '--help'],
+    }), {
+      kind: 'passthrough',
+      config: 'server',
+      args: ['run', '--config', 'vitest.server.config.ts', 'test/unit/server/coding-cli/utils.test.ts', '--help'],
     })
   })
 
@@ -340,7 +358,7 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'delegated',
       config: 'default',
-      args: ['run', 'test/unit/client', '--reporter', 'dot', 'test/unit/client/components/Sidebar.test.tsx'],
+      args: ['run', '--reporter', 'dot', 'test/unit/client/components/Sidebar.test.tsx'],
     })
   })
 
@@ -515,7 +533,16 @@ describe('classifyCommand()', () => {
     }), {
       kind: 'delegated',
       config: 'default',
-      args: ['run', 'test/unit/client', '--run', 'test/unit/client/components/Sidebar.test.tsx'],
+      args: ['run', '--run', 'test/unit/client/components/Sidebar.test.tsx'],
+    })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:integration',
+      forwardedArgs: ['test/integration/server/port-forward-api.test.ts'],
+    }), {
+      kind: 'delegated',
+      config: 'server',
+      args: ['run', '--config', 'vitest.server.config.ts', 'test/integration/server/port-forward-api.test.ts'],
     })
 
     expectSinglePhase(classifyCommand({

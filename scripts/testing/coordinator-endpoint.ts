@@ -169,7 +169,7 @@ function defaultRuntimeBaseDirs(): string[] {
 
 function uniqueExistingDirectories(baseDirs: string[]): string[] {
   const unique = new Set<string>()
-  for (const baseDir of [...baseDirs].sort((left, right) => Buffer.byteLength(left) - Buffer.byteLength(right))) {
+  for (const baseDir of baseDirs) {
     if (unique.has(baseDir)) {
       continue
     }

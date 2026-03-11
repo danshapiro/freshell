@@ -27,6 +27,7 @@ const LOCK_RETRY_MS = 25
 const LOCK_TIMEOUT_MS = 5_000
 const LOCK_STALE_MS = 30_000
 const CURRENT_PROCESS_STARTED_AT_MS = performance.timeOrigin
+const processMutationQueues = new Map<string, Promise<void>>()
 
 export function getCoordinatorStoreDir(commonDir: string): string {
   return path.join(commonDir, 'freshell-test-coordinator')
@@ -161,26 +162,31 @@ async function mutateReusableSuccessFile(
 }
 
 async function withFileLock<T>(filePath: string, action: () => Promise<T>): Promise<T> {
-  await fsp.mkdir(path.dirname(filePath), { recursive: true })
-  const release = await acquireFileLock(`${filePath}.lock`)
-  try {
-    return await action()
-  } finally {
-    await release()
-  }
+  return withProcessQueue(filePath, async () => {
+    await fsp.mkdir(path.dirname(filePath), { recursive: true })
+    const release = await acquireFileLock(`${filePath}.lock`)
+    try {
+      return await action()
+    } finally {
+      await release()
+    }
+  })
 }
 
 async function acquireFileLock(lockPath: string): Promise<() => Promise<void>> {
-  const deadline = Date.now() + LOCK_TIMEOUT_MS
+  const deadline = nowMs() + LOCK_TIMEOUT_MS
 
   while (true) {
     try {
       const handle = await fsp.open(lockPath, 'wx')
       try {
+        const acquiredAtMs = nowMs()
         await handle.writeFile(JSON.stringify({
           pid: process.pid,
           hostname: hostname(),
-          startedAt: new Date().toISOString(),
+          startedAt: new Date(acquiredAtMs).toISOString(),
+          processStartedAtMs: CURRENT_PROCESS_STARTED_AT_MS,
+          acquiredAtMs,
         }))
       } finally {
         await handle.close()
@@ -204,7 +210,7 @@ async function acquireFileLock(lockPath: string): Promise<() => Promise<void>> {
         continue
       }
 
-      if (Date.now() >= deadline) {
+      if (nowMs() >= deadline) {
         throw new Error(`Timed out acquiring coordinator store lock for ${path.basename(filePathFromLock(lockPath))}.`)
       }
 
@@ -238,10 +244,15 @@ async function isStaleLockFile(lockPath: string, staleMs: number): Promise<boole
     return true
   }
 
-  if (metadata.ageMs !== undefined && metadata.ageMs > staleMs) {
-    if (metadata.pid === process.pid) {
-      return metadata.startedAtMs !== undefined && metadata.startedAtMs < CURRENT_PROCESS_STARTED_AT_MS
+  if (metadata.pid === process.pid) {
+    if (metadata.processStartedAtMs !== undefined) {
+      return metadata.processStartedAtMs < CURRENT_PROCESS_STARTED_AT_MS
     }
+
+    return metadata.mtimeMs !== undefined && metadata.mtimeMs < CURRENT_PROCESS_STARTED_AT_MS
+  }
+
+  if (metadata.ageMs !== undefined && metadata.ageMs > staleMs) {
     return true
   }
 
@@ -252,49 +263,68 @@ async function isStaleLockFile(lockPath: string, staleMs: number): Promise<boole
   return false
 }
 
-async function readLockMetadata(lockPath: string): Promise<{ exists: boolean; pid?: number; ageMs?: number; startedAtMs?: number }> {
+async function readLockMetadata(lockPath: string): Promise<{
+  exists: boolean
+  pid?: number
+  ageMs?: number
+  mtimeMs?: number
+  startedAtMs?: number
+  processStartedAtMs?: number
+}> {
   try {
+    const stats = await fsp.stat(lockPath)
     const raw = await fsp.readFile(lockPath, 'utf8')
-    const parsed = JSON.parse(raw) as { pid?: unknown; startedAt?: unknown }
+    const parsed = JSON.parse(raw) as {
+      pid?: unknown
+      startedAt?: unknown
+      processStartedAtMs?: unknown
+      acquiredAtMs?: unknown
+    }
+    const acquiredAtMs = parseLockNumber(parsed.acquiredAtMs)
     const startedAtMs = parseLockTimestamp(parsed.startedAt)
     return {
       exists: true,
       pid: typeof parsed.pid === 'number' ? parsed.pid : undefined,
       startedAtMs,
-      ageMs: startedAtMs !== undefined ? Math.max(0, Date.now() - startedAtMs) : await readLockAgeFromStat(lockPath),
+      processStartedAtMs: parseLockNumber(parsed.processStartedAtMs),
+      mtimeMs: stats.mtimeMs,
+      ageMs: Math.max(0, nowMs() - (
+        acquiredAtMs
+        ?? startedAtMs
+        ?? stats.mtimeMs
+      )),
     }
   } catch {
-    const ageMs = await readLockAgeFromStat(lockPath)
-    if (ageMs === undefined) {
+    const stats = await fsp.stat(lockPath).catch(() => undefined)
+    if (!stats) {
       return { exists: false }
     }
     return {
       exists: true,
-      ageMs,
+      mtimeMs: stats.mtimeMs,
+      ageMs: Math.max(0, nowMs() - stats.mtimeMs),
     }
   }
 }
 
-function parseLockTimestamp(startedAt: unknown): number | undefined {
-  if (typeof startedAt !== 'string') {
+function parseLockNumber(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
     return undefined
   }
-
-  const started = Date.parse(startedAt)
-  if (Number.isNaN(started)) {
-    return undefined
-  }
-
-  return started
+  return value
 }
 
-async function readLockAgeFromStat(lockPath: string): Promise<number | undefined> {
-  const stats = await fsp.stat(lockPath).catch(() => undefined)
-  if (!stats) {
+function parseLockTimestamp(value: unknown): number | undefined {
+  if (typeof value !== 'string') {
     return undefined
   }
 
-  return Math.max(0, Date.now() - stats.mtimeMs)
+  const parsed = Date.parse(value)
+  if (Number.isNaN(parsed)) {
+    return undefined
+  }
+
+  return parsed
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -308,4 +338,29 @@ function isProcessAlive(pid: number): boolean {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function withProcessQueue<T>(key: string, action: () => Promise<T>): Promise<T> {
+  const previous = processMutationQueues.get(key) ?? Promise.resolve()
+  let releaseCurrent!: () => void
+  const current = new Promise<void>((resolve) => {
+    releaseCurrent = resolve
+  })
+  const queued = previous.catch(() => {}).then(() => current)
+  processMutationQueues.set(key, queued)
+
+  await previous.catch(() => {})
+
+  try {
+    return await action()
+  } finally {
+    releaseCurrent()
+    if (processMutationQueues.get(key) === queued) {
+      processMutationQueues.delete(key)
+    }
+  }
+}
+
+function nowMs(): number {
+  return CURRENT_PROCESS_STARTED_AT_MS + (process.uptime() * 1000)
 }

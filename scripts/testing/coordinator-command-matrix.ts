@@ -129,11 +129,12 @@ function classifyHelpOrVersion(commandKey: CommandKey, normalizedArgs: string[])
   }
 
   if (COMPOSITE_COMMANDS.has(commandKey)) {
-    return passthrough([vitestPhase('default', ['run', ...normalizedArgs])])
+    const targetOwnership = classifyTargetOwnership(normalizedArgs)
+    const owner = targetOwnership === 'server' ? 'server' : 'default'
+    return passthrough([vitestPhase(owner, [...ownerRunPrefix(owner), ...normalizedArgs])])
   }
 
-  const spec = SINGLE_PHASE_SPECS[commandKey]
-  return passthrough([vitestPhase(spec.owner, [...singlePhaseDelegatedBaseArgs(spec), ...normalizedArgs])])
+  return passthrough([buildSinglePhaseDelegatedPhase(commandKey, normalizedArgs)])
 }
 
 function classifyCompositeCommand(commandKey: CommandKey, args: string[]): CommandDisposition {
@@ -221,6 +222,10 @@ function buildSinglePhaseDelegatedPhase(
 
   if (targetOwnership && targetOwnership !== spec.owner) {
     return vitestPhase(targetOwnership, [...ownerRunPrefix(targetOwnership), ...args])
+  }
+
+  if (targetOwnership === spec.owner) {
+    return vitestPhase(spec.owner, [...singlePhaseTargetBaseArgs(spec), ...args])
   }
 
   return vitestPhase(spec.owner, [...singlePhaseDelegatedBaseArgs(spec), ...args])
@@ -358,6 +363,10 @@ function ownerRunPrefix(owner: 'default' | 'server'): string[] {
 
 function singlePhaseDelegatedBaseArgs(spec: SinglePhaseSpec): string[] {
   return spec.delegatedArgs ? [...spec.delegatedArgs] : [...spec.broadArgs]
+}
+
+function singlePhaseTargetBaseArgs(spec: SinglePhaseSpec): string[] {
+  return spec.delegatedArgs ? [...spec.delegatedArgs] : [...ownerRunPrefix(spec.owner)]
 }
 
 function coordinated(suiteKey: SuiteKey, phases: UpstreamPhase[]): CommandDisposition {

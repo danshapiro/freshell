@@ -35,6 +35,17 @@ afterEach(async () => {
   await fsp.rm(tempDir, { recursive: true, force: true })
 })
 
+async function waitForCondition(check: () => Promise<boolean>, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await check()) {
+      return
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  throw new Error('Timed out waiting for condition')
+}
+
 function createHolderRecord(overrides: Partial<HolderRecord> = {}): HolderRecord {
   return {
     schemaVersion: 1,
@@ -238,6 +249,71 @@ describe('coordinator-store', () => {
     expect(Object.keys(commandRuns.byKey).sort()).toEqual(entries
       .map((entry) => entry.commandKey)
       .sort())
+  })
+
+  it('does not reclaim a live same-process lock just because its JSON metadata looks stale', async () => {
+    const originalRename = fsp.rename.bind(fsp)
+    let renameCallCount = 0
+    let releaseFirstRename: (() => void) | undefined
+    const firstRenameBlocked = new Promise<void>((resolve) => {
+      releaseFirstRename = resolve
+    })
+    const renameSpy = vi.spyOn(fsp, 'rename').mockImplementation(async (...args) => {
+      renameCallCount += 1
+      if (renameCallCount === 1) {
+        await firstRenameBlocked
+      }
+      return originalRename(args[0] as Parameters<typeof fsp.rename>[0], args[1] as Parameters<typeof fsp.rename>[1])
+    })
+
+    const lockPath = path.join(storeDir, 'command-runs.json.lock')
+    const first = recordCommandResult(storeDir, createLatestRunRecord({
+      runId: 'run-locked-1',
+      entrypoint: {
+        commandKey: 'command-locked-1',
+        suiteKey: 'full-suite',
+      },
+    }))
+
+    await waitForCondition(async () => {
+      try {
+        await fsp.access(lockPath)
+        return true
+      } catch {
+        return false
+      }
+    })
+
+    await fsp.writeFile(lockPath, JSON.stringify({
+      pid: process.pid,
+      hostname: 'test-host',
+      startedAt: '1970-01-01T00:00:00.000Z',
+    }))
+
+    const second = recordCommandResult(storeDir, createLatestRunRecord({
+      runId: 'run-locked-2',
+      entrypoint: {
+        commandKey: 'command-locked-2',
+        suiteKey: 'full-suite',
+      },
+    }))
+
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(renameCallCount).toBe(1)
+
+    releaseFirstRename?.()
+
+    try {
+      await Promise.all([first, second])
+    } finally {
+      renameSpy.mockRestore()
+    }
+
+    const commandRuns = await readCommandRuns(storeDir)
+    expect(Object.keys(commandRuns.byKey).sort()).toEqual([
+      'command-locked-1',
+      'command-locked-2',
+    ])
   })
 
   it('reclaims an aged readable store lock even when its recorded pid is currently alive', async () => {

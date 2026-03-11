@@ -37,18 +37,30 @@ async function createDirectoryWithByteLength(parentDir: string, byteLength: numb
 }
 
 describe('buildCoordinatorEndpoint()', () => {
-  it('uses a repo-hash unix socket path under the shortest existing runtime directory', () => {
+  it('prefers XDG_RUNTIME_DIR over shared temp directories when it fits the socket-length cap', () => {
     const commonDir = path.join(tempDir, 'repo', '.git')
     const shortDir = path.join(tempDir, 'tmp')
-    const longDir = path.join(tempDir, 'very', 'long', 'runtime', 'directory')
-    fsSetup(shortDir, longDir)
+    const xdgDir = path.join(tempDir, 'very', 'long', 'runtime', 'directory')
+    fsSetup(shortDir, xdgDir)
 
-    const endpoint = buildCoordinatorEndpoint(commonDir, 'linux', [longDir, shortDir])
+    const endpoint = buildCoordinatorEndpoint(commonDir, 'linux', [xdgDir, shortDir])
 
     expect(endpoint.kind).toBe('unix')
     expect(endpoint.repoHash).toHaveLength(12)
-    expect(endpoint.address).toBe(path.join(shortDir, `frt-${endpoint.repoHash}.sock`))
+    expect(path.dirname(endpoint.address)).toBe(xdgDir)
     expect(Buffer.byteLength(endpoint.address)).toBeLessThanOrEqual(90)
+  })
+
+  it('falls back past XDG_RUNTIME_DIR when only the shared temp directory can fit the socket path', async () => {
+    const commonDir = path.join(tempDir, 'repo', '.git')
+    const xdgDir = await createDirectoryWithByteLength(tempDir, 71)
+    const shortDir = path.join(tempDir, 'tmp')
+    fsSetup(shortDir)
+
+    const endpoint = buildCoordinatorEndpoint(commonDir, 'linux', [xdgDir, shortDir])
+
+    expect(endpoint.kind).toBe('unix')
+    expect(endpoint.address).toBe(path.join(shortDir, `frt-${endpoint.repoHash}.sock`))
   })
 
   it('falls back to the shorter unix socket name when the preferred path is too long', async () => {
