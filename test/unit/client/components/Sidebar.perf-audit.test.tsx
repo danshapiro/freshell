@@ -8,7 +8,15 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import sessionsReducer from '@/store/sessionsSlice'
+import terminalDirectoryReducer from '@/store/terminalDirectorySlice'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
+
+const searchSessions = vi.hoisted(() => vi.fn().mockResolvedValue({ results: [] }))
+const getTerminalDirectoryPage = vi.hoisted(() => vi.fn().mockResolvedValue({
+  items: [],
+  nextCursor: null,
+  revision: 1,
+}))
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -22,7 +30,8 @@ vi.mock('@/lib/api', async () => {
   const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api')
   return {
     ...actual,
-    searchSessions: vi.fn().mockResolvedValue({ results: [] }),
+    searchSessions: (options?: unknown) => searchSessions(options),
+    getTerminalDirectoryPage: (query?: unknown, options?: unknown) => getTerminalDirectoryPage(query, options),
   }
 })
 
@@ -42,7 +51,14 @@ describe('Sidebar perf audit milestone', () => {
         tabs: tabsReducer,
         panes: panesReducer,
         sessions: sessionsReducer,
+        terminalDirectory: terminalDirectoryReducer,
       },
+      middleware: (getDefault) =>
+        getDefault({
+          serializableCheck: {
+            ignoredPaths: ['sessions.expandedProjects'],
+          },
+        }),
       preloadedState: {
         settings: {
           settings: defaultSettings,
