@@ -2,9 +2,16 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { AgentTimelinePageQuerySchema } from '../../shared/read-models.js'
 import type { AgentTimelineService } from './service.js'
+import { createRequestAbortSignal } from '../read-models/request-abort.js'
+import {
+  defaultReadModelScheduler,
+  isReadModelAbortError,
+  type ReadModelWorkScheduler,
+} from '../read-models/work-scheduler.js'
 
 export type AgentTimelineRouterDeps = {
   service: AgentTimelineService
+  readModelScheduler?: ReadModelWorkScheduler
 }
 
 const TurnParamsSchema = z.object({
@@ -14,6 +21,7 @@ const TurnParamsSchema = z.object({
 
 export function createAgentTimelineRouter(deps: AgentTimelineRouterDeps): Router {
   const router = Router()
+  const readModelScheduler = deps.readModelScheduler ?? defaultReadModelScheduler
 
   router.get('/agent-sessions/:sessionId/timeline', async (req, res) => {
     const params = z.object({ sessionId: z.string().min(1) }).safeParse(req.params)
@@ -30,13 +38,23 @@ export function createAgentTimelineRouter(deps: AgentTimelineRouterDeps): Router
       })
     }
 
+    const signal = createRequestAbortSignal(req, res)
+
     try {
-      const page = await deps.service.getTimelinePage({
-        sessionId: params.data.sessionId,
-        ...query.data,
+      const page = await readModelScheduler.schedule({
+        lane: query.data.priority ?? 'visible',
+        signal,
+        run: (scheduledSignal) => deps.service.getTimelinePage({
+          sessionId: params.data.sessionId,
+          ...query.data,
+          signal: scheduledSignal,
+        }),
       })
       res.json(page)
     } catch (error) {
+      if (signal.aborted || isReadModelAbortError(error)) {
+        return
+      }
       const message = error instanceof Error ? error.message : 'Agent timeline request failed'
       const status = /cursor/i.test(message) ? 400 : 500
       res.status(status).json({ error: message })

@@ -1,7 +1,7 @@
 // @vitest-environment node
 import express, { type Express } from 'express'
 import request from 'supertest'
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { createShellBootstrapRouter, MAX_BOOTSTRAP_PAYLOAD_BYTES } from '../../../server/shell-bootstrap-router.js'
 
 const TEST_AUTH_TOKEN = 'test-auth-token'
@@ -79,5 +79,22 @@ describe('GET /api/bootstrap', () => {
     expect(res.status).toBe(200)
     expect(res.body.configFallback).toEqual({ reason: 'read_error', backupExists: true })
   })
-})
 
+  it('routes bootstrap through the critical read-model lane', async () => {
+    const schedule = vi.fn(async ({ lane, signal, run }: { lane: string; signal: AbortSignal; run: (signal: AbortSignal) => Promise<unknown> }) => {
+      expect(lane).toBe('critical')
+      expect(signal).toBeInstanceOf(AbortSignal)
+      return run(signal)
+    })
+    const appWithScheduler = createTestApp({
+      readModelScheduler: { schedule },
+    })
+
+    const res = await request(appWithScheduler)
+      .get('/api/bootstrap')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(res.status).toBe(200)
+    expect(schedule).toHaveBeenCalledTimes(1)
+  })
+})

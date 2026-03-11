@@ -10,6 +10,12 @@ import type { SessionMetadataStore } from './session-metadata-store.js'
 import { DEFAULT_CLI_PROVIDER_NAMES } from './platform.js'
 import { SessionDirectoryQuerySchema } from '../shared/read-models.js'
 import { querySessionDirectory } from './session-directory/service.js'
+import { createRequestAbortSignal } from './read-models/request-abort.js'
+import {
+  defaultReadModelScheduler,
+  isReadModelAbortError,
+  type ReadModelWorkScheduler,
+} from './read-models/work-scheduler.js'
 
 const log = logger.child({ component: 'sessions-router' })
 
@@ -38,11 +44,13 @@ export interface SessionsRouterDeps {
   sessionMetadataStore?: SessionMetadataStore
   serverInstanceId?: string
   validCliProviders?: string[]
+  readModelScheduler?: ReadModelWorkScheduler
 }
 
 export function createSessionsRouter(deps: SessionsRouterDeps): Router {
   const { configStore, codingCliIndexer, codingCliProviders, perfConfig } = deps
   const router = Router()
+  const readModelScheduler = deps.readModelScheduler ?? defaultReadModelScheduler
   const validCliProviders = new Set(deps.validCliProviders ?? DEFAULT_CLI_PROVIDER_NAMES)
   const sessionMetadataProviderSchema = z.string().min(1).superRefine((value, ctx) => {
     if (validCliProviders.has(value)) return
@@ -65,14 +73,24 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
       return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
     }
 
+    const signal = createRequestAbortSignal(req, res)
+
     try {
-      const page = await querySessionDirectory({
-        projects: codingCliIndexer.getProjects(),
-        query: parsed.data,
-        terminalMeta: deps.terminalMetadata?.list() ?? [],
+      const page = await readModelScheduler.schedule({
+        lane: parsed.data.priority,
+        signal,
+        run: (scheduledSignal) => querySessionDirectory({
+          projects: codingCliIndexer.getProjects(),
+          query: parsed.data,
+          terminalMeta: deps.terminalMetadata?.list() ?? [],
+          signal: scheduledSignal,
+        }),
       })
       res.json(page)
     } catch (error) {
+      if (signal.aborted || isReadModelAbortError(error)) {
+        return
+      }
       const message = error instanceof Error ? error.message : 'Session directory query failed'
       const status = /cursor/i.test(message) ? 400 : 500
       if (status === 500) {

@@ -100,7 +100,11 @@ class FakeRegistry extends EventEmitter {
   }
 }
 
-function createTestApp(registry: FakeRegistry, configStore: { snapshot: ReturnType<typeof vi.fn> }): Express {
+function createTestApp(
+  registry: FakeRegistry,
+  configStore: { snapshot: ReturnType<typeof vi.fn> },
+  readModelScheduler?: { schedule: (task: { lane: string; signal: AbortSignal; run: (signal: AbortSignal) => Promise<unknown> }) => Promise<unknown> },
+): Express {
   const app = express()
   app.disable('x-powered-by')
   app.use(express.json())
@@ -109,6 +113,7 @@ function createTestApp(registry: FakeRegistry, configStore: { snapshot: ReturnTy
     configStore,
     registry,
     wsHandler: { broadcast: vi.fn() },
+    ...(readModelScheduler ? { readModelScheduler } : {}),
   }))
   return app
 }
@@ -270,5 +275,43 @@ describe('terminal view router', () => {
       ],
       nextCursor: null,
     })
+  })
+
+  it('routes terminal reads through the correct visible-first lanes', async () => {
+    registry.addTerminal({
+      terminalId: 'term-lanes',
+      title: 'Lane test',
+    })
+
+    const schedule = vi.fn(async ({ lane, signal, run }: { lane: string; signal: AbortSignal; run: (signal: AbortSignal) => Promise<unknown> }) => {
+      expect(signal).toBeInstanceOf(AbortSignal)
+      return run(signal)
+    })
+
+    app = createTestApp(registry, configStore, { schedule })
+
+    await request(app)
+      .get('/api/terminals?priority=visible&limit=1')
+      .set('x-auth-token', AUTH_TOKEN)
+      .expect(200)
+    await request(app)
+      .get('/api/terminals/term-lanes/viewport')
+      .set('x-auth-token', AUTH_TOKEN)
+      .expect(200)
+    await request(app)
+      .get('/api/terminals/term-lanes/scrollback?cursor=0&limit=1')
+      .set('x-auth-token', AUTH_TOKEN)
+      .expect(200)
+    await request(app)
+      .get('/api/terminals/term-lanes/search?query=Lane')
+      .set('x-auth-token', AUTH_TOKEN)
+      .expect(200)
+
+    expect(schedule.mock.calls.map(([task]) => task.lane)).toEqual([
+      'visible',
+      'critical',
+      'background',
+      'visible',
+    ])
   })
 })

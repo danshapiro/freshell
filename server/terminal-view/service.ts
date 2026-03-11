@@ -93,6 +93,12 @@ function compareTerminals(a: TerminalDirectoryItem, b: TerminalDirectoryItem): n
   return b.terminalId.localeCompare(a.terminalId)
 }
 
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error ? signal.reason : new Error('Terminal view request aborted')
+  }
+}
+
 export function createTerminalViewService(deps: TerminalViewServiceDeps): TerminalViewService {
   const mirrors = new Map<string, TerminalViewMirror>()
 
@@ -148,10 +154,12 @@ export function createTerminalViewService(deps: TerminalViewServiceDeps): Termin
   return {
     listTerminalDirectory,
 
-    async getTerminalDirectoryPage(query: TerminalDirectoryQuery): Promise<TerminalDirectoryPage> {
+    async getTerminalDirectoryPage(query: TerminalDirectoryQuery & { signal?: AbortSignal }): Promise<TerminalDirectoryPage> {
+      throwIfAborted(query.signal)
       const limit = Math.min(query.limit ?? MAX_DIRECTORY_PAGE_ITEMS, MAX_DIRECTORY_PAGE_ITEMS)
       const cursor = query.cursor ? decodeCursor(query.cursor) : null
       const items = await listTerminalDirectory()
+      throwIfAborted(query.signal)
       const revision = items.reduce((maxRevision, item) => Math.max(maxRevision, item.lastActivityAt), 0)
 
       const filtered = cursor
@@ -173,24 +181,30 @@ export function createTerminalViewService(deps: TerminalViewServiceDeps): Termin
       }
     },
 
-    async getViewportSnapshot({ terminalId }) {
+    async getViewportSnapshot({ terminalId, signal }) {
+      throwIfAborted(signal)
       const record = deps.registry.get(terminalId)
       if (!record) return null
+      throwIfAborted(signal)
       return ensureMirror(record).getViewportSnapshot()
     },
 
-    async getScrollbackPage({ terminalId, cursor, limit }): Promise<TerminalScrollbackPage | null> {
+    async getScrollbackPage({ terminalId, cursor, limit, signal }): Promise<TerminalScrollbackPage | null> {
+      throwIfAborted(signal)
       const record = deps.registry.get(terminalId)
       if (!record) return null
+      throwIfAborted(signal)
       return ensureMirror(record).getScrollbackPage({
         cursor: cursor !== undefined ? Number(cursor) : undefined,
         limit,
       })
     },
 
-    async searchTerminal({ terminalId, query, cursor, limit }): Promise<TerminalSearchPage | null> {
+    async searchTerminal({ terminalId, query, cursor, limit, signal }): Promise<TerminalSearchPage | null> {
+      throwIfAborted(signal)
       const record = deps.registry.get(terminalId)
       if (!record) return null
+      throwIfAborted(signal)
       return ensureMirror(record).search(query, {
         cursor: cursor !== undefined ? Number(cursor) : undefined,
         limit,

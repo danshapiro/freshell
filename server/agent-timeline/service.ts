@@ -20,8 +20,8 @@ type TimelineMessageRecord = {
 }
 
 export type AgentTimelineService = {
-  getTimelinePage: (query: AgentTimelinePageQuery & { sessionId: string }) => Promise<AgentTimelinePage>
-  getTurnBody: (query: { sessionId: string; turnId: string }) => Promise<AgentTimelineTurn | null>
+  getTimelinePage: (query: AgentTimelinePageQuery & { sessionId: string; signal?: AbortSignal }) => Promise<AgentTimelinePage>
+  getTurnBody: (query: { sessionId: string; turnId: string; signal?: AbortSignal }) => Promise<AgentTimelineTurn | null>
 }
 
 export type AgentTimelineServiceDeps = {
@@ -88,6 +88,12 @@ function toTimelineItem(record: TimelineMessageRecord): AgentTimelineItem {
 }
 
 export function createAgentTimelineService(deps: AgentTimelineServiceDeps): AgentTimelineService {
+  function throwIfAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) {
+      throw signal.reason instanceof Error ? signal.reason : new Error('Agent timeline request aborted')
+    }
+  }
+
   async function loadTimeline(sessionId: string): Promise<TimelineMessageRecord[]> {
     const messages = await deps.loadSessionHistory(sessionId)
     return buildTimeline(messages ?? [], sessionId)
@@ -95,9 +101,11 @@ export function createAgentTimelineService(deps: AgentTimelineServiceDeps): Agen
 
   return {
     async getTimelinePage(query) {
+      throwIfAborted(query.signal)
       const limit = Math.min(query.limit ?? DEFAULT_TIMELINE_LIMIT, MAX_TIMELINE_LIMIT)
       const offset = query.cursor ? decodeCursor(query.cursor).offset : 0
       const timeline = await loadTimeline(query.sessionId)
+      throwIfAborted(query.signal)
       const pageItems = timeline.slice(offset, offset + limit)
       const nextOffset = offset + pageItems.length
       const fullMessages = timeline.map((record) => record.message).reverse()

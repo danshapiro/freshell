@@ -1,6 +1,13 @@
 import { z } from 'zod'
 
 export const MAX_BOOTSTRAP_PAYLOAD_BYTES = 12 * 1024
+export const READ_MODEL_LANES = ['critical', 'visible', 'background'] as const
+export const ReadModelLaneSchema = z.enum(READ_MODEL_LANES)
+export const READ_MODEL_LANE_PRIORITY = {
+  critical: 0,
+  visible: 1,
+  background: 2,
+} as const
 
 export type BootstrapPayload = {
   settings: unknown
@@ -45,6 +52,7 @@ export const TerminalSearchQuerySchema = z.object({
 })
 
 export type ReadModelPriority = z.infer<typeof ReadModelPrioritySchema>
+export type ReadModelLane = z.infer<typeof ReadModelLaneSchema>
 export type SessionDirectoryQuery = z.infer<typeof SessionDirectoryQuerySchema>
 export type TerminalDirectoryQuery = z.infer<typeof TerminalDirectoryQuerySchema>
 export type AgentTimelinePageQuery = z.infer<typeof AgentTimelinePageQuerySchema>

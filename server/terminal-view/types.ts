@@ -59,8 +59,8 @@ export type TerminalSearchPage = {
 
 export type TerminalViewService = {
   listTerminalDirectory: () => Promise<TerminalDirectoryItem[]>
-  getTerminalDirectoryPage: (query: TerminalDirectoryQuery) => Promise<TerminalDirectoryPage>
-  getViewportSnapshot: (input: { terminalId: string }) => Promise<TerminalViewportSnapshot | null>
-  getScrollbackPage: (input: { terminalId: string; cursor?: string; limit?: number }) => Promise<TerminalScrollbackPage | null>
-  searchTerminal: (input: { terminalId: string; query: string; cursor?: string; limit?: number }) => Promise<TerminalSearchPage | null>
+  getTerminalDirectoryPage: (query: TerminalDirectoryQuery & { signal?: AbortSignal }) => Promise<TerminalDirectoryPage>
+  getViewportSnapshot: (input: { terminalId: string; signal?: AbortSignal }) => Promise<TerminalViewportSnapshot | null>
+  getScrollbackPage: (input: { terminalId: string; cursor?: string; limit?: number; signal?: AbortSignal }) => Promise<TerminalScrollbackPage | null>
+  searchTerminal: (input: { terminalId: string; query: string; cursor?: string; limit?: number; signal?: AbortSignal }) => Promise<TerminalSearchPage | null>
 }

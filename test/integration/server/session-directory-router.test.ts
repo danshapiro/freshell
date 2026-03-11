@@ -112,4 +112,46 @@ describe('GET /api/session-directory', () => {
     expect(patchSessionOverride).toHaveBeenCalled()
     expect(deleteSession).toHaveBeenCalled()
   })
+
+  it('routes directory reads through the requested visible-first lane', async () => {
+    const schedule = vi.fn(async ({ lane, signal, run }: { lane: string; signal: AbortSignal; run: (signal: AbortSignal) => Promise<unknown> }) => {
+      expect(signal).toBeInstanceOf(AbortSignal)
+      return run(signal)
+    })
+
+    app = express()
+    app.use(express.json())
+    app.use('/api', (req, res, next) => {
+      const token = req.headers['x-auth-token']
+      if (token !== TEST_AUTH_TOKEN) return res.status(401).json({ error: 'Unauthorized' })
+      next()
+    })
+    app.use('/api', createSessionsRouter({
+      configStore: {
+        patchSessionOverride,
+        deleteSession,
+      },
+      codingCliIndexer: {
+        getProjects: () => projects,
+        refresh: vi.fn().mockResolvedValue(undefined),
+      },
+      codingCliProviders: [],
+      perfConfig: { slowSessionRefreshMs: 500 },
+      terminalMetadata: {
+        list: () => [],
+      },
+      readModelScheduler: { schedule },
+    }))
+
+    const response = await request(app)
+      .get('/api/session-directory?priority=background&limit=1')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(response.status).toBe(200)
+    expect(schedule).toHaveBeenCalledWith(expect.objectContaining({
+      lane: 'background',
+      signal: expect.any(AbortSignal),
+      run: expect.any(Function),
+    }))
+  })
 })

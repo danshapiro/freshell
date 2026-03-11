@@ -11,6 +11,12 @@ import {
 } from '../shared/read-models.js'
 import { createTerminalViewService } from './terminal-view/service.js'
 import type { TerminalViewService } from './terminal-view/types.js'
+import { createRequestAbortSignal } from './read-models/request-abort.js'
+import {
+  defaultReadModelScheduler,
+  isReadModelAbortError,
+  type ReadModelWorkScheduler,
+} from './read-models/work-scheduler.js'
 
 const log = logger.child({ component: 'terminals-router' })
 export const MAX_TERMINAL_TITLE_OVERRIDE_LENGTH = 500
@@ -38,11 +44,13 @@ export interface TerminalsRouterDeps {
   terminalMetadata?: { list: () => TerminalMeta[] }
   codingCliIndexer?: { refresh: () => Promise<void> }
   terminalViewService?: TerminalViewService
+  readModelScheduler?: ReadModelWorkScheduler
 }
 
 export function createTerminalsRouter(deps: TerminalsRouterDeps): Router {
   const { configStore, registry, wsHandler } = deps
   const router = Router()
+  const readModelScheduler = deps.readModelScheduler ?? defaultReadModelScheduler
   const terminalViewService = deps.terminalViewService ?? createTerminalViewService({ configStore, registry })
 
   router.get('/', async (req, res) => {
@@ -69,10 +77,22 @@ export function createTerminalsRouter(deps: TerminalsRouterDeps): Router {
       return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
     }
 
+    const signal = createRequestAbortSignal(req, res)
+
     try {
-      const page = await terminalViewService.getTerminalDirectoryPage(parsed.data)
+      const page = await readModelScheduler.schedule({
+        lane: parsed.data.priority,
+        signal,
+        run: (scheduledSignal) => terminalViewService.getTerminalDirectoryPage({
+          ...parsed.data,
+          signal: scheduledSignal,
+        }),
+      })
       return res.json(page)
     } catch (error) {
+      if (signal.aborted || isReadModelAbortError(error)) {
+        return
+      }
       const message = error instanceof Error ? error.message : 'Terminal directory query failed'
       const status = /cursor/i.test(message) ? 400 : 500
       return res.status(status).json({ error: message })
@@ -85,7 +105,24 @@ export function createTerminalsRouter(deps: TerminalsRouterDeps): Router {
       return res.status(400).json({ error: 'Invalid request' })
     }
 
-    const snapshot = await terminalViewService.getViewportSnapshot({ terminalId })
+    const signal = createRequestAbortSignal(req, res)
+    let snapshot
+    try {
+      snapshot = await readModelScheduler.schedule({
+        lane: 'critical',
+        signal,
+        run: (scheduledSignal) => terminalViewService.getViewportSnapshot({
+          terminalId,
+          signal: scheduledSignal,
+        }),
+      })
+    } catch (error) {
+      if (signal.aborted || isReadModelAbortError(error)) {
+        return
+      }
+      const message = error instanceof Error ? error.message : 'Terminal viewport request failed'
+      return res.status(500).json({ error: message })
+    }
     if (!snapshot) {
       return res.status(404).json({ error: 'Terminal not found' })
     }
@@ -116,11 +153,26 @@ export function createTerminalsRouter(deps: TerminalsRouterDeps): Router {
       })
     }
 
-    const page = await terminalViewService.getScrollbackPage({
-      terminalId: parsed.data.terminalId,
-      cursor: query.data.cursor,
-      limit: query.data.limit,
-    })
+    const signal = createRequestAbortSignal(req, res)
+    let page
+    try {
+      page = await readModelScheduler.schedule({
+        lane: 'background',
+        signal,
+        run: (scheduledSignal) => terminalViewService.getScrollbackPage({
+          terminalId: parsed.data.terminalId,
+          cursor: query.data.cursor,
+          limit: query.data.limit,
+          signal: scheduledSignal,
+        }),
+      })
+    } catch (error) {
+      if (signal.aborted || isReadModelAbortError(error)) {
+        return
+      }
+      const message = error instanceof Error ? error.message : 'Terminal scrollback request failed'
+      return res.status(500).json({ error: message })
+    }
     if (!page) {
       return res.status(404).json({ error: 'Terminal not found' })
     }
@@ -154,12 +206,27 @@ export function createTerminalsRouter(deps: TerminalsRouterDeps): Router {
       })
     }
 
-    const page = await terminalViewService.searchTerminal({
-      terminalId: parsed.data.terminalId,
-      query: query.data.query,
-      cursor: query.data.cursor,
-      limit: query.data.limit,
-    })
+    const signal = createRequestAbortSignal(req, res)
+    let page
+    try {
+      page = await readModelScheduler.schedule({
+        lane: 'visible',
+        signal,
+        run: (scheduledSignal) => terminalViewService.searchTerminal({
+          terminalId: parsed.data.terminalId,
+          query: query.data.query,
+          cursor: query.data.cursor,
+          limit: query.data.limit,
+          signal: scheduledSignal,
+        }),
+      })
+    } catch (error) {
+      if (signal.aborted || isReadModelAbortError(error)) {
+        return
+      }
+      const message = error instanceof Error ? error.message : 'Terminal search request failed'
+      return res.status(500).json({ error: message })
+    }
     if (!page) {
       return res.status(404).json({ error: 'Terminal not found' })
     }

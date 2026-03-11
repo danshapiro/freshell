@@ -62,6 +62,7 @@ describe('GET /api/agent-sessions/:sessionId/timeline', () => {
       priority: 'visible',
       cursor: undefined,
       limit: 20,
+      signal: expect.any(AbortSignal),
     })
   })
 
