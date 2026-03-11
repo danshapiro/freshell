@@ -402,7 +402,7 @@ describe('classifyCommand()', () => {
       forwardedArgs: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
     }), {
       kind: 'passthrough',
-      config: 'default',
+      config: 'server',
       args: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
     })
 
@@ -411,7 +411,7 @@ describe('classifyCommand()', () => {
       forwardedArgs: ['-c', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
     }), {
       kind: 'passthrough',
-      config: 'default',
+      config: 'server',
       args: ['-c', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
     })
   })
@@ -532,7 +532,7 @@ describe('classifyCommand()', () => {
       forwardedArgs: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
     }), {
       kind: 'passthrough',
-      config: 'default',
+      config: 'server',
       args: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
     })
   })

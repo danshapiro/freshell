@@ -508,6 +508,60 @@ describe('test coordinator CLI', () => {
     expect(captures.map((entry) => entry.selector)).toEqual(['npm:build'])
   })
 
+  it.each([
+    {
+      commandKey: 'check',
+      forwardedArgs: ['test/server/ws-protocol.test.ts'],
+      failingSelector: 'npm:typecheck',
+      exitCode: 31,
+    },
+    {
+      commandKey: 'verify',
+      forwardedArgs: ['test/unit/client/components/Sidebar.test.tsx'],
+      failingSelector: 'npm:build',
+      exitCode: 32,
+    },
+  ])(
+    'records focused $commandKey pre-phase failures without claiming a full-suite run',
+    async ({ commandKey, forwardedArgs, failingSelector, exitCode }) => {
+      const fixture = await createRepoFixture({ linkedWorktree: true })
+      const captureFile = path.join(fixture.baseDir, `${commandKey}-focused-prephase.jsonl`)
+      const child = spawnCoordinator(
+        fixture.checkoutRoot,
+        commandKey,
+        forwardedArgs,
+        {
+          FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
+          FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
+            [failingSelector]: { exitCode },
+          }),
+        },
+      )
+
+      const exit = await waitForExit(child)
+      expect(exit.code).toBe(exitCode)
+      expect(await readHolder(fixture.storeDir)).toBeUndefined()
+      expect((await readSuiteRuns(fixture.storeDir)).byKey['full-suite']).toBeUndefined()
+
+      const latest = (await readCommandRuns(fixture.storeDir)).byKey[commandKey]
+      expect(latest).toMatchObject({
+        outcome: 'failure',
+        exitCode,
+        entrypoint: {
+          commandKey,
+        },
+        command: {
+          display: `npm run ${commandKey} -- ${forwardedArgs.join(' ')}`,
+          argv: [commandKey, ...forwardedArgs],
+        },
+      })
+      expect(latest.entrypoint.suiteKey).toBeUndefined()
+
+      const captures = await readCaptureLines(captureFile)
+      expect(captures.map((entry) => entry.selector)).toEqual([failingSelector])
+    },
+  )
+
   it('reports running-undescribed when the gate is live but holder metadata is missing or corrupt', async () => {
     const fixture = await createRepoFixture({ linkedWorktree: true })
     const endpoint = buildCoordinatorEndpoint(fixture.commonDir)
@@ -568,6 +622,52 @@ describe('test coordinator CLI', () => {
     const suiteRuns = await readSuiteRuns(fixture.storeDir)
     expect(suiteRuns.byKey['server:all:run']).toMatchObject({
       outcome: 'success',
+    })
+  })
+
+  it('records coordinated forwarded-arg commands truthfully in holder and latest-run metadata', async () => {
+    const fixture = await createRepoFixture({ linkedWorktree: true })
+    const captureFile = path.join(fixture.baseDir, 'coordinated-forwarded-argv.jsonl')
+    const child = spawnCoordinator(
+      fixture.checkoutRoot,
+      'test:server',
+      ['--run'],
+      {
+        FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
+        FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
+          'vitest:server:--config vitest.server.config.ts --run': { holdMs: 1_000 },
+        }),
+      },
+    )
+
+    await waitForRunningStatus(fixture.checkoutRoot, /suiteKey: server:all:run/)
+
+    const holder = await readHolder(fixture.storeDir)
+    expect(holder).toMatchObject({
+      entrypoint: {
+        commandKey: 'test:server',
+        suiteKey: 'server:all:run',
+      },
+      command: {
+        display: 'npm run test:server -- --run',
+        argv: ['test:server', '--run'],
+      },
+    })
+
+    const exit = await waitForExit(child)
+    expect(exit.code).toBe(0)
+
+    const latest = (await readCommandRuns(fixture.storeDir)).byKey['test:server']
+    expect(latest).toMatchObject({
+      outcome: 'success',
+      entrypoint: {
+        commandKey: 'test:server',
+        suiteKey: 'server:all:run',
+      },
+      command: {
+        display: 'npm run test:server -- --run',
+        argv: ['test:server', '--run'],
+      },
     })
   })
 

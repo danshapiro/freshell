@@ -102,7 +102,7 @@ export function classifyCommand(input: CoordinatorInput): CommandDisposition {
   const normalizedArgs = stripLeadingArgSeparator(input.forwardedArgs)
 
   if (input.commandKey === 'test:vitest') {
-    return passthrough([vitestPhase('default', normalizedArgs)])
+    return passthrough([vitestPhase(inferVitestConfig(normalizedArgs), normalizedArgs)])
   }
 
   if (hasExplicitConfigOverride(normalizedArgs)) {
@@ -125,7 +125,7 @@ export function classifyCommand(input: CoordinatorInput): CommandDisposition {
 
 function classifyHelpOrVersion(commandKey: CommandKey, normalizedArgs: string[]): CommandDisposition {
   if (commandKey === 'test:vitest') {
-    return passthrough([vitestPhase('default', normalizedArgs)])
+    return passthrough([vitestPhase(inferVitestConfig(normalizedArgs), normalizedArgs)])
   }
 
   if (COMPOSITE_COMMANDS.has(commandKey)) {
@@ -378,4 +378,32 @@ function vitestPhase(config: 'default' | 'server', args: string[]): UpstreamPhas
     config,
     args,
   }
+}
+
+function inferVitestConfig(args: string[]): 'default' | 'server' {
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]
+    if (arg === '--config' || arg === '-c') {
+      return isServerConfigArg(args[index + 1]) ? 'server' : 'default'
+    }
+
+    if (arg.startsWith('--config=')) {
+      return isServerConfigArg(arg.slice('--config='.length)) ? 'server' : 'default'
+    }
+
+    if (arg.startsWith('-c=')) {
+      return isServerConfigArg(arg.slice('-c='.length)) ? 'server' : 'default'
+    }
+  }
+
+  return 'default'
+}
+
+function isServerConfigArg(value: string | undefined): boolean {
+  if (!value) {
+    return false
+  }
+
+  const normalized = value.replaceAll('\\', '/')
+  return normalized === 'vitest.server.config.ts' || normalized.endsWith('/vitest.server.config.ts')
 }

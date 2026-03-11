@@ -112,8 +112,17 @@ async function runCommand(parsed: ParsedRunArgs): Promise<number> {
     : undefined
   const runtime = runtimeContext()
   const summary = summarizeCommand(parsed.commandKey, parsed.forwardedArgs, parsed.summary)
+  const commandDisplay = publicCommandDisplay(parsed.commandKey, parsed.forwardedArgs)
 
-  const prePhaseResult = await runPrePhasesIfNeeded(parsed.commandKey, parsed.forwardedArgs, repo, runtime, summary)
+  const prePhaseResult = await runPrePhasesIfNeeded({
+    commandKey: parsed.commandKey,
+    forwardedArgs: parsed.forwardedArgs,
+    commandDisplay,
+    disposition,
+    repo,
+    runtime,
+    summary,
+  })
   if (prePhaseResult !== undefined) {
     return prePhaseResult
   }
@@ -133,7 +142,7 @@ async function runCommand(parsed: ParsedRunArgs): Promise<number> {
     repo,
     runtime,
     summary,
-    commandDisplay: publicCommandDisplay(parsed.commandKey, parsed.forwardedArgs),
+    commandDisplay,
     runId: randomUUID(),
   }
 
@@ -162,13 +171,14 @@ function parseRunArgs(args: string[]): ParsedRunArgs {
   }
 
   const commandKey = commandKeyRaw as CommandKey
+  const normalizedForwarded = stripLeadingArgSeparator(forwarded)
   const forwardedArgs: string[] = []
   let summary: string | undefined
 
-  for (let index = 0; index < forwarded.length; index += 1) {
-    const arg = forwarded[index]
+  for (let index = 0; index < normalizedForwarded.length; index += 1) {
+    const arg = normalizedForwarded[index]
     if (arg === '--summary') {
-      summary = forwarded[index + 1]
+      summary = normalizedForwarded[index + 1]
       if (!summary) {
         throw new Error('Missing value for --summary.')
       }
@@ -186,17 +196,21 @@ function parseRunArgs(args: string[]): ParsedRunArgs {
 }
 
 async function runPrePhasesIfNeeded(
-  commandKey: CommandKey,
-  forwardedArgs: string[],
-  repo: RepoContext | undefined,
-  runtime: RuntimeContext,
-  summary: SummaryContext,
+  input: {
+    commandKey: CommandKey
+    forwardedArgs: string[]
+    commandDisplay: string
+    disposition: CommandDisposition
+    repo: RepoContext | undefined
+    runtime: RuntimeContext
+    summary: SummaryContext
+  },
 ): Promise<number | undefined> {
-  if (hasHelpOrVersion(forwardedArgs)) {
+  if (hasHelpOrVersion(input.forwardedArgs)) {
     return undefined
   }
 
-  const prePhases = prePhasesForCommand(commandKey)
+  const prePhases = prePhasesForCommand(input.commandKey)
   if (prePhases.length === 0) {
     return undefined
   }
@@ -204,16 +218,17 @@ async function runPrePhasesIfNeeded(
   for (const phase of prePhases) {
     const exitCode = await runUpstreamPhase(phase, process.env)
     if (exitCode !== 0) {
-      if (repo) {
-        const refreshedRepo = await refreshRepoContext(repo)
+      if (input.repo) {
+        const refreshedRepo = await refreshRepoContext(input.repo)
         await recordCommandResult(getCoordinatorStoreDir(refreshedRepo.commonDir), buildLatestRunRecord({
           runId: randomUUID(),
-          commandKey,
-          suiteKey: 'full-suite',
-          summary,
-          commandDisplay: publicCommandDisplay(commandKey, forwardedArgs),
+          commandKey: input.commandKey,
+          suiteKey: input.disposition.kind === 'coordinated' ? input.disposition.suiteKey : undefined,
+          summary: input.summary,
+          commandDisplay: input.commandDisplay,
+          forwardedArgs: input.forwardedArgs,
           repo: refreshedRepo,
-          runtime,
+          runtime: input.runtime,
           startedAt: new Date().toISOString(),
           finishedAt: new Date().toISOString(),
           exitCode,
@@ -254,6 +269,7 @@ async function runCoordinatedCommand(context: CoordinatedRunContext): Promise<nu
           suiteKey: context.disposition.suiteKey,
           summary: context.summary,
           commandDisplay: context.commandDisplay,
+          forwardedArgs: context.forwardedArgs,
           repo,
           runtime: context.runtime,
           startedAt,
@@ -283,6 +299,7 @@ async function runCoordinatedCommand(context: CoordinatedRunContext): Promise<nu
       suiteKey: context.disposition.suiteKey,
       summary: context.summary,
       commandDisplay: context.commandDisplay,
+      forwardedArgs: context.forwardedArgs,
       repo,
       runtime: context.runtime,
       startedAt,
@@ -308,6 +325,7 @@ async function runCoordinatedCommand(context: CoordinatedRunContext): Promise<nu
       suiteKey: context.disposition.suiteKey,
       summary: context.summary,
       commandDisplay: context.commandDisplay,
+      forwardedArgs: context.forwardedArgs,
       repo,
       runtime: context.runtime,
       startedAt,
@@ -393,6 +411,7 @@ function buildLatestRunRecord(input: {
   suiteKey?: string
   summary: SummaryContext
   commandDisplay: string
+  forwardedArgs: string[]
   repo: RepoContext
   runtime: RuntimeContext
   startedAt: string
@@ -414,7 +433,7 @@ function buildLatestRunRecord(input: {
     },
     command: {
       display: input.commandDisplay,
-      argv: [input.commandKey],
+      argv: [input.commandKey, ...input.forwardedArgs],
     },
     repo: {
       invocationCwd: input.repo.invocationCwd,
@@ -506,6 +525,13 @@ function summarizeCommand(commandKey: CommandKey, forwardedArgs: string[], summa
 function publicCommandDisplay(commandKey: CommandKey, forwardedArgs: string[]): string {
   const base = commandKey === 'test' ? 'npm test' : `npm run ${commandKey}`
   return forwardedArgs.length > 0 ? `${base} -- ${forwardedArgs.join(' ')}` : base
+}
+
+function stripLeadingArgSeparator(args: string[]): string[] {
+  if (args[0] === '--') {
+    return args.slice(1)
+  }
+  return [...args]
 }
 
 function prePhasesForCommand(commandKey: CommandKey): UpstreamPhase[] {
