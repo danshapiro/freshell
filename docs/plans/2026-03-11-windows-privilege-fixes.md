@@ -28,8 +28,9 @@
 - `server/wsl-port-forward.ts` exports only the pure/manual helpers still used by the manual repair route.
 - `POST /api/network/configure-firewall` returns `confirmation-required` for both `wsl2` and `windows` until the caller sends `{ confirmElevation: true }`.
 - `POST /api/network/configure-firewall` rejects malformed acknowledgement bodies (for example `{ confirmElevation: false }`) with `400`.
+- The first `confirmation-required` response does not mark firewall repair as in progress; `firewall.configuring` stays reserved for the actual elevated child process.
 - The confirmation payload copy is explicit: `To complete this, you will need to accept the Windows administrator prompt on the next screen.` A cancel path performs no elevated action.
-- `SetupWizard` and `SettingsView` both use the existing accessible modal infrastructure instead of `window.confirm()`, and the modal reuses shared `Button` variants for its primary action styling.
+- `SetupWizard` and `SettingsView` both use the existing accessible modal infrastructure instead of `window.confirm()`, and the modal shows `Continue` plus `Cancel` with the primary action styled through the shared `Button` variant system rather than destructive red styling.
 - Linux/macOS repair continues to return terminal commands exactly as before.
 - The Windows scheduled-task template uses `LeastPrivilege`, and `WindowsServiceDaemonManager.start()` normalizes the task to limited run level before launching it.
 
@@ -77,7 +78,7 @@ it('server/index.ts does not import or call the startup-only WSL helper path', (
 })
 ```
 
-In `test/unit/server/wsl-port-forward.test.ts`, delete the existing `describe('setupWslPortForwarding', ...)` block so the suite fails on the removed export instead of continuing to pin a dead API.
+In `test/unit/server/wsl-port-forward.test.ts`, remove `setupWslPortForwarding` from the import list and delete the obsolete `describe('setupWslPortForwarding', ...)` block. The red condition for this task comes from the new integration assertions above; the unit file should simply stop pinning the deleted API.
 
 **Step 2: Run the targeted server tests and confirm failure**
 
@@ -99,6 +100,7 @@ Implement these changes:
 - In `server/index.ts`, delete the `shouldSetupWslPortForwardingAtStartup(...)` block and all imports from `./wsl-port-forward-startup.js` and `./wsl-port-forward.js` that existed only for startup repair.
 - Replace the adjacent comment with one sentence explaining that Windows/WSL repair is exposed only through the manual network-repair API/UI.
 - In `server/wsl-port-forward.ts`, delete `SetupResult`, `setupWslPortForwarding()`, and any imports/constants that become unused (`execSync` stays if still needed by pure helpers; `isWSL2` and `POWERSHELL_PATH` do not).
+- In `test/unit/server/wsl-port-forward.test.ts`, keep the remaining parser/script tests intact; only remove the dead startup wrapper coverage and the deleted symbol import.
 - Delete `server/wsl-port-forward-startup.ts` and `test/unit/server/wsl-port-forward-startup.test.ts`.
 
 **Step 4: Re-run the targeted server tests**
@@ -203,7 +205,11 @@ vi.mock('node:child_process', () => ({
 }))
 
 import { execFile } from 'node:child_process'
-import { buildElevatedPowerShellArgs, spawnElevatedPowerShell } from '../../../server/elevated-powershell.js'
+import {
+  buildElevatedPowerShellArgs,
+  ELEVATED_POWERSHELL_TIMEOUT_MS,
+  spawnElevatedPowerShell,
+} from '../../../server/elevated-powershell.js'
 
 it('escapes single quotes for Start-Process -Verb RunAs', () => {
   expect(buildElevatedPowerShellArgs("Write-Host 'hi'")).toEqual([
@@ -220,7 +226,7 @@ it('spawns execFile with a 120s timeout', () => {
   expect(execFile).toHaveBeenCalledWith(
     'powershell.exe',
     buildElevatedPowerShellArgs("Write-Host 'hi'"),
-    { timeout: 120000 },
+    { timeout: ELEVATED_POWERSHELL_TIMEOUT_MS },
     cb,
   )
 })
@@ -242,7 +248,15 @@ Expected:
 Create `server/elevated-powershell.ts` with:
 
 ```ts
-import { execFile } from 'node:child_process'
+import { execFile, type ExecFileException } from 'node:child_process'
+
+export const ELEVATED_POWERSHELL_TIMEOUT_MS = 120_000
+
+export type ElevatedPowerShellCallback = (
+  error: ExecFileException | null,
+  stdout: string,
+  stderr: string,
+) => void
 
 export function buildElevatedPowerShellArgs(script: string): string[] {
   const escaped = script.replace(/'/g, "''")
@@ -255,9 +269,14 @@ export function buildElevatedPowerShellArgs(script: string): string[] {
 export function spawnElevatedPowerShell(
   command: string,
   script: string,
-  callback: Parameters<typeof execFile>[3],
+  callback: ElevatedPowerShellCallback,
 ) {
-  return execFile(command, buildElevatedPowerShellArgs(script), { timeout: 120000 }, callback)
+  return execFile(
+    command,
+    buildElevatedPowerShellArgs(script),
+    { timeout: ELEVATED_POWERSHELL_TIMEOUT_MS },
+    callback,
+  )
 }
 ```
 
@@ -412,6 +431,7 @@ const WINDOWS_ELEVATION_CONFIRMATION = {
 ```
 
 - When `status.firewall.platform` is `'wsl2'` or `'windows'` and `confirmElevation !== true`, return that payload without calling `execFile`.
+- Do not call `networkManager.setFirewallConfiguring(true)` until after `confirmElevation === true` and the elevated process is actually about to spawn.
 - When confirmation is present, use `spawnElevatedPowerShell(...)` from `server/elevated-powershell.ts` in both the WSL and native Windows branches.
 - Keep the existing `firewall.configuring` guard, cache reset, and async completion behavior.
 - Do not describe this bool as a hardened security token in comments or types; it is an explicit acknowledgement required by the product flow.
@@ -481,7 +501,7 @@ it('renders a non-destructive primary button when confirmVariant is default', ()
     />,
   )
 
-  expect(screen.getByRole('button', { name: 'Continue' })).not.toHaveClass('bg-destructive')
+  expect(screen.getByRole('button', { name: 'Continue' })).toHaveClass('bg-primary')
 })
 ```
 
@@ -1034,12 +1054,11 @@ Run:
 ```bash
 npm run lint
 npm run verify
+npm test
 ```
 
 Expected:
 - PASS
-
-If the executor is rebasing or fast-forwarding this branch into `main` in the same session, run `npm test` immediately before the final fast-forward to satisfy repo policy.
 
 **Step 4: Commit the final polish**
 
