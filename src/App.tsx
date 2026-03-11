@@ -43,7 +43,7 @@ import { triggerHapticFeedback } from '@/lib/mobile-haptics'
 import { X, Copy, Check, PanelLeft, AlertTriangle } from 'lucide-react'
 import { updateSettingsLocal, markSaved } from '@/store/settingsSlice'
 
-import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
+import { upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
@@ -195,7 +195,6 @@ export default function App() {
   const paneLayouts = useAppSelector((s) => s.panes.layouts)
   const mainContentRef = useRef<HTMLDivElement>(null)
   const userOpenedSidebarOnMobileRef = useRef(false)
-  const terminalMetaListRequestStartedAtRef = useRef(new Map<string, number>())
   const codexActivityListRequestSeqRef = useRef(new Map<string, number>())
   const codexActivityOrderRef = useRef(0)
   const fullscreenTouchStartYRef = useRef<number | null>(null)
@@ -455,16 +454,6 @@ export default function App() {
         client: { mobile: isMobileRef.current },
       }))
 
-      const requestTerminalMetaList = () => {
-        terminalMetaListRequestStartedAtRef.current.clear()
-        const requestId = `terminal-meta-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-        terminalMetaListRequestStartedAtRef.current.set(requestId, Date.now())
-        ws.send({
-          type: 'terminal.meta.list',
-          requestId,
-        })
-      }
-
       const requestCodexActivityList = () => {
         const requestId = `codex-activity-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
         const requestSeq = ++codexActivityOrderRef.current
@@ -517,7 +506,6 @@ export default function App() {
           // If App registered late and missed a prior invalidation, a fresh HTTP baseline
           // from this bootstrap cycle is still safe for enabling follow-up refreshes.
           promoteRecentHttpSessionsBaseline()
-          requestTerminalMetaList()
           requestCodexActivityList()
         }
         if (msg.type === 'sessions.changed') {
@@ -532,19 +520,6 @@ export default function App() {
             getState: appStore.getState,
             send: (payload) => ws.send(payload),
           })
-        }
-        if (msg.type === 'terminal.meta.list.response') {
-          const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''
-          const requestedAt = requestId
-            ? terminalMetaListRequestStartedAtRef.current.get(requestId)
-            : undefined
-          if (requestId) {
-            terminalMetaListRequestStartedAtRef.current.delete(requestId)
-          }
-          dispatch(setTerminalMetaSnapshot({
-            terminals: msg.terminals || [],
-            requestedAt,
-          }))
         }
         if (msg.type === 'terminal.meta.updated') {
           const upsert = Array.isArray(msg.upsert) ? msg.upsert : []
@@ -713,7 +688,6 @@ export default function App() {
         }
 
         if (!cancelled) {
-          requestTerminalMetaList()
           requestCodexActivityList()
         }
         return

@@ -26,7 +26,6 @@ import {
   ErrorCode,
   ShellSchema,
   CodingCliProviderSchema,
-  TerminalMetaListResponseSchema,
   TerminalMetaUpdatedSchema,
   CodexActivityListResponseSchema,
   CodexActivityListSchema,
@@ -38,8 +37,6 @@ import {
   TerminalInputSchema,
   TerminalResizeSchema,
   TerminalKillSchema,
-  TerminalListSchema,
-  TerminalMetaListSchema,
   CodingCliInputSchema,
   CodingCliKillSchema,
   SdkCreateSchema,
@@ -413,8 +410,6 @@ export class WsHandler {
       TerminalInputSchema,
       TerminalResizeSchema,
       TerminalKillSchema,
-      TerminalListSchema,
-      TerminalMetaListSchema,
       CodexActivityListSchema,
       TabsSyncPushSchema,
       TabsSyncQuerySchema,
@@ -1457,42 +1452,6 @@ export class WsHandler {
         }
         this.broadcastTerminalsChanged()
         this.broadcastTerminalRuntimeUpdatedForId(m.terminalId)
-        return
-      }
-
-      case 'terminal.list': {
-        const cfg = await awaitConfig()
-        // Merge terminal overrides into list output.
-        const list = this.registry.list().filter((t) => !cfg.terminalOverrides?.[t.terminalId]?.deleted)
-        const merged = list.map((t) => {
-          const ov = cfg.terminalOverrides?.[t.terminalId]
-          return {
-            ...t,
-            title: ov?.titleOverride || t.title,
-            description: ov?.descriptionOverride || t.description,
-          }
-        })
-        this.send(ws, { type: 'terminal.list.response', requestId: m.requestId, terminals: merged })
-        return
-      }
-
-      case 'terminal.meta.list': {
-        const terminals = this.terminalMetaListProvider ? this.terminalMetaListProvider() : []
-        const response = TerminalMetaListResponseSchema.safeParse({
-          type: 'terminal.meta.list.response',
-          requestId: m.requestId,
-          terminals,
-        })
-        if (!response.success) {
-          log.warn({ issues: response.error.issues }, 'Invalid terminal.meta.list.response payload')
-          this.sendError(ws, {
-            code: 'INTERNAL_ERROR',
-            message: 'Terminal metadata unavailable',
-            requestId: m.requestId,
-          })
-          return
-        }
-        this.send(ws, response.data)
         return
       }
 

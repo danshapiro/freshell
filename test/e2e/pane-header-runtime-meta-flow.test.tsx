@@ -343,23 +343,14 @@ describe('pane header runtime metadata flow (e2e)', () => {
       })
     })
 
-    let requestId = ''
     await waitFor(() => {
-      const metaCall = wsMocks.send.mock.calls
-        .map((call) => call[0])
-        .find((msg) => msg?.type === 'terminal.meta.list')
-      expect(metaCall).toBeDefined()
-      if (!metaCall || typeof metaCall.requestId !== 'string') {
-        throw new Error('Missing terminal.meta.list requestId')
-      }
-      requestId = metaCall.requestId
+      expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
     })
 
     act(() => {
       wsMocks.emitMessage({
-        type: 'terminal.meta.list.response',
-        requestId,
-        terminals: [
+        type: 'terminal.meta.updated',
+        upsert: [
           {
             terminalId: 'term-codex',
             provider: 'codex',
@@ -391,6 +382,7 @@ describe('pane header runtime metadata flow (e2e)', () => {
             updatedAt: Date.now(),
           },
         ],
+        remove: [],
       })
     })
 
@@ -447,7 +439,7 @@ describe('pane header runtime metadata flow (e2e)', () => {
     })
   })
 
-  it('does not erase newer runtime metadata when an older snapshot response arrives', async () => {
+  it('ignores legacy terminal.meta.list.response frames after live metadata has landed', async () => {
     const store = createStore()
 
     render(
@@ -468,16 +460,8 @@ describe('pane header runtime metadata flow (e2e)', () => {
       })
     })
 
-    let requestId = ''
     await waitFor(() => {
-      const metaCall = wsMocks.send.mock.calls
-        .map((call) => call[0])
-        .find((msg) => msg?.type === 'terminal.meta.list')
-      expect(metaCall).toBeDefined()
-      if (!metaCall || typeof metaCall.requestId !== 'string') {
-        throw new Error('Missing terminal.meta.list requestId')
-      }
-      requestId = metaCall.requestId
+      expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
     })
 
     act(() => {
@@ -511,8 +495,23 @@ describe('pane header runtime metadata flow (e2e)', () => {
     act(() => {
       wsMocks.emitMessage({
         type: 'terminal.meta.list.response',
-        requestId,
-        terminals: [],
+        requestId: 'legacy-terminal-meta-list',
+        terminals: [
+          {
+            terminalId: 'term-codex',
+            provider: 'codex',
+            displaySubdir: 'stale-meta',
+            branch: 'legacy',
+            isDirty: false,
+            tokenUsage: {
+              inputTokens: 1,
+              outputTokens: 1,
+              cachedTokens: 0,
+              totalTokens: 2,
+            },
+            updatedAt: 1,
+          },
+        ],
       })
     })
 
@@ -555,23 +554,14 @@ describe('pane header runtime metadata flow (e2e)', () => {
       })
     })
 
-    let requestId = ''
     await waitFor(() => {
-      const metaCall = wsMocks.send.mock.calls
-        .map((call) => call[0])
-        .find((msg) => msg?.type === 'terminal.meta.list')
-      expect(metaCall).toBeDefined()
-      if (!metaCall || typeof metaCall.requestId !== 'string') {
-        throw new Error('Missing terminal.meta.list requestId')
-      }
-      requestId = metaCall.requestId
+      expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
     })
 
     act(() => {
       wsMocks.emitMessage({
-        type: 'terminal.meta.list.response',
-        requestId,
-        terminals: [
+        type: 'terminal.meta.updated',
+        upsert: [
           {
             terminalId: 'term-codex-tab-level',
             provider: 'codex',
@@ -589,6 +579,7 @@ describe('pane header runtime metadata flow (e2e)', () => {
             updatedAt: Date.now(),
           },
         ],
+        remove: [],
       })
     })
 

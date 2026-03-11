@@ -78,12 +78,6 @@ export const TerminalMetaRecordSchema = z.object({
 
 export type TerminalMetaRecord = z.infer<typeof TerminalMetaRecordSchema>
 
-export const TerminalMetaListResponseSchema = z.object({
-  type: z.literal('terminal.meta.list.response'),
-  requestId: z.string().min(1),
-  terminals: z.array(TerminalMetaRecordSchema),
-})
-
 export const TerminalMetaUpdatedSchema = z.object({
   type: z.literal('terminal.meta.updated'),
   upsert: z.array(TerminalMetaRecordSchema),
@@ -227,16 +221,6 @@ export const TerminalResizeSchema = z.object({
 export const TerminalKillSchema = z.object({
   type: z.literal('terminal.kill'),
   terminalId: z.string().min(1),
-})
-
-export const TerminalListSchema = z.object({
-  type: z.literal('terminal.list'),
-  requestId: z.string().min(1),
-})
-
-export const TerminalMetaListSchema = z.object({
-  type: z.literal('terminal.meta.list'),
-  requestId: z.string().min(1),
 })
 
 export const CodexActivityListSchema = z.object({
@@ -388,8 +372,6 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   TerminalInputSchema,
   TerminalResizeSchema,
   TerminalKillSchema,
-  TerminalListSchema,
-  TerminalMetaListSchema,
   CodexActivityListSchema,
   UiLayoutSyncSchema,
   UiScreenshotResultSchema,
@@ -513,25 +495,6 @@ export type TerminalRuntimeUpdatedMessage = {
 export type TerminalListUpdatedMessage = {
   type: 'terminal.list.updated'
 }
-
-export type TerminalListResponseMessage = {
-  type: 'terminal.list.response'
-  requestId: string
-  terminals: Array<{
-    terminalId: string
-    title: string
-    description?: string
-    mode: 'shell' | CodingCliProviderName
-    resumeSessionId?: string
-    createdAt: number
-    lastActivityAt: number
-    status: 'running' | 'exited'
-    hasClients: boolean
-    cwd?: string
-  }>
-}
-
-export type TerminalMetaListResponseMessage = z.infer<typeof TerminalMetaListResponseSchema>
 
 export type TerminalMetaUpdatedMessage = z.infer<typeof TerminalMetaUpdatedSchema>
 
@@ -723,8 +686,6 @@ export type ServerMessage =
   | TerminalsChangedMessage
   | TerminalRuntimeUpdatedMessage
   | TerminalListUpdatedMessage
-  | TerminalListResponseMessage
-  | TerminalMetaListResponseMessage
   | TerminalMetaUpdatedMessage
   | CodexActivityListResponseMessage
   | CodexActivityUpdatedMessage

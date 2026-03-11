@@ -712,29 +712,21 @@ describe('ws protocol', () => {
     await close()
   })
 
-  it('terminal.list returns all terminals', async () => {
+  it('rejects legacy terminal.list commands', async () => {
     const { ws, close } = await createAuthenticatedConnection()
-
-    // Create two terminals
-    const terminalId1 = await createTerminal(ws, 'list-term-1')
-    const terminalId2 = await createTerminal(ws, 'list-term-2')
 
     ws.send(JSON.stringify({ type: 'terminal.list', requestId: 'list-req-1' }))
 
-    const listResponse = await new Promise<any>((resolve) => {
+    const error = await new Promise<any>((resolve) => {
       ws.on('message', (data) => {
         const msg = JSON.parse(data.toString())
-        if (msg.type === 'terminal.list.response' && msg.requestId === 'list-req-1') resolve(msg)
+        if (msg.type === 'error' && msg.requestId === 'list-req-1') resolve(msg)
       })
     })
 
-    expect(listResponse.type).toBe('terminal.list.response')
-    expect(listResponse.requestId).toBe('list-req-1')
-    expect(listResponse.terminals).toHaveLength(2)
-
-    const ids = listResponse.terminals.map((t: any) => t.terminalId)
-    expect(ids).toContain(terminalId1)
-    expect(ids).toContain(terminalId2)
+    expect(error.type).toBe('error')
+    expect(error.requestId).toBe('list-req-1')
+    expect(error.code).toBe('INVALID_MESSAGE')
 
     await close()
   })

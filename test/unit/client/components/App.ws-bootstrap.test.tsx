@@ -376,7 +376,7 @@ describe('App WS bootstrap recovery', () => {
       expect(store.getState().connection.serverInstanceId).toBe('srv-test')
     })
 
-    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
+    expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))
   })
 
@@ -558,7 +558,7 @@ describe('App WS bootstrap recovery', () => {
     })
 
     expect(wsMocks.connect).not.toHaveBeenCalled()
-    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
+    expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))
     expect(store.getState().sessions.projects.map((p: any) => p.projectPath)).toEqual(['/p1'])
 
@@ -641,7 +641,7 @@ describe('App WS bootstrap recovery', () => {
       signal: expect.any(AbortSignal),
     })
     expect(wsMocks.connect).not.toHaveBeenCalled()
-    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
+    expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))
   })
 

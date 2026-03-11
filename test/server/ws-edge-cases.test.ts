@@ -1148,7 +1148,7 @@ describe('WebSocket edge cases', () => {
       close1()
     })
 
-    it('handles terminal.list when registry is empty', async () => {
+    it('rejects legacy terminal.list commands even when the registry is empty', async () => {
       const { ws, close } = await createAuthenticatedConnection()
 
       // Ensure registry is empty
@@ -1156,8 +1156,19 @@ describe('WebSocket edge cases', () => {
 
       ws.send(JSON.stringify({ type: 'terminal.list', requestId: 'empty-list' }))
 
-      const response = await waitForMessage(ws, (m) => m.type === 'terminal.list.response')
-      expect(response.terminals).toEqual([])
+      const response = await waitForMessage(ws, (m) => m.type === 'error' && m.requestId === 'empty-list')
+      expect(response.code).toBe('INVALID_MESSAGE')
+
+      close()
+    })
+
+    it('rejects legacy terminal.meta.list commands', async () => {
+      const { ws, close } = await createAuthenticatedConnection()
+
+      ws.send(JSON.stringify({ type: 'terminal.meta.list', requestId: 'meta-list' }))
+
+      const response = await waitForMessage(ws, (m) => m.type === 'error' && m.requestId === 'meta-list')
+      expect(response.code).toBe('INVALID_MESSAGE')
 
       close()
     })
