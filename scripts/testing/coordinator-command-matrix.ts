@@ -105,6 +105,13 @@ export function classifyCommand(input: CoordinatorInput): CommandDisposition {
     return passthrough([vitestPhase('default', normalizedArgs)])
   }
 
+  if (hasExplicitConfigOverride(normalizedArgs)) {
+    return {
+      kind: 'rejected',
+      reason: 'Public test commands do not accept --config overrides. Use npm run test:vitest -- ... for direct Vitest config control.',
+    }
+  }
+
   if (hasHelpOrVersion(normalizedArgs)) {
     return classifyHelpOrVersion(input.commandKey, normalizedArgs)
   }
@@ -247,6 +254,10 @@ function hasReporter(args: string[]): boolean {
   return args.some((arg) => arg === '--reporter' || arg.startsWith('--reporter='))
 }
 
+function hasExplicitConfigOverride(args: string[]): boolean {
+  return args.some((arg) => arg === '--config' || arg.startsWith('--config='))
+}
+
 function isExplicitBroadServerRun(args: string[]): boolean {
   const targetOwnership = classifyTargetOwnership(args)
   if (targetOwnership !== undefined) return false
@@ -304,25 +315,33 @@ function extractTargets(args: string[]): string[] {
 }
 
 function classifyTarget(target: string): 'default' | 'server' | undefined {
+  const normalizedTarget = normalizeTargetForOwnership(target)
+
   if (
-    target === 'test/server'
-    || target.startsWith('test/server/')
-    || target === 'test/unit/server'
-    || target.startsWith('test/unit/server/')
-    || target === 'test/integration/server'
-    || target.startsWith('test/integration/server/')
-    || target === 'test/integration/session-repair.test.ts'
-    || target === 'test/integration/session-search-e2e.test.ts'
-    || target === 'test/integration/extension-system.test.ts'
+    normalizedTarget === 'test/server'
+    || normalizedTarget.startsWith('test/server/')
+    || normalizedTarget === 'test/unit/server'
+    || normalizedTarget.startsWith('test/unit/server/')
+    || normalizedTarget === 'test/integration/server'
+    || normalizedTarget.startsWith('test/integration/server/')
+    || normalizedTarget === 'test/integration/session-repair.test.ts'
+    || normalizedTarget === 'test/integration/session-search-e2e.test.ts'
+    || normalizedTarget === 'test/integration/extension-system.test.ts'
   ) {
     return 'server'
   }
 
-  if (target.startsWith('test/')) {
+  if (normalizedTarget.startsWith('test/')) {
     return 'default'
   }
 
   return undefined
+}
+
+function normalizeTargetForOwnership(target: string): string {
+  return target
+    .replaceAll('\\', '/')
+    .replace(/^(?:\.\/)+/, '')
 }
 
 function ownerRunPrefix(owner: 'default' | 'server'): string[] {

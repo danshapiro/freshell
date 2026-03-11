@@ -306,6 +306,49 @@ describe('classifyCommand()', () => {
     })
   })
 
+  it('rejects explicit --config overrides on public commands and directs callers to test:vitest', () => {
+    const composite = classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['--config', 'vitest.server.config.ts'],
+    })
+
+    expect(composite).toMatchObject({
+      kind: 'rejected',
+    })
+    if (composite.kind === 'rejected') {
+      expect(composite.reason).toContain('--config')
+      expect(composite.reason).toContain('test:vitest')
+    }
+
+    const compositeWithTarget = classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
+    })
+    expect(compositeWithTarget).toMatchObject({
+      kind: 'rejected',
+    })
+
+    const singlePhase = classifyCommand({
+      commandKey: 'test:unit',
+      forwardedArgs: ['--config=vitest.server.config.ts'],
+    })
+    expect(singlePhase).toMatchObject({
+      kind: 'rejected',
+    })
+    if (singlePhase.kind === 'rejected') {
+      expect(singlePhase.reason).toContain('test:vitest')
+    }
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:vitest',
+      forwardedArgs: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
+    }), {
+      kind: 'passthrough',
+      config: 'default',
+      args: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
+    })
+  })
+
   it('treats --run on test and test:all as a compatibility no-op', () => {
     expect(classifyCommand({
       commandKey: 'test',
@@ -322,6 +365,35 @@ describe('classifyCommand()', () => {
       kind: 'delegated',
       config: 'default',
       args: ['run', 'test/unit/client/store/panesSlice.test.ts'],
+    })
+  })
+
+  it('normalizes dotted and windows-style target paths before ownership detection', () => {
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['./test/server/ws-protocol.test.ts'],
+    }), {
+      kind: 'delegated',
+      config: 'server',
+      args: ['run', '--config', 'vitest.server.config.ts', './test/server/ws-protocol.test.ts'],
+    })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['test\\server\\ws-protocol.test.ts'],
+    }), {
+      kind: 'delegated',
+      config: 'server',
+      args: ['run', '--config', 'vitest.server.config.ts', 'test\\server\\ws-protocol.test.ts'],
+    })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:unit',
+      forwardedArgs: ['./test/unit/server/coding-cli/utils.test.ts'],
+    }), {
+      kind: 'delegated',
+      config: 'server',
+      args: ['run', '--config', 'vitest.server.config.ts', './test/unit/server/coding-cli/utils.test.ts'],
     })
   })
 

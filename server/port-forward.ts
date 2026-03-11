@@ -178,26 +178,27 @@ export class PortForwardManager {
   }
 
   /** Close a single forward by target port and requester key. */
-  close(targetPort: number, requesterKey?: string): void {
+  close(targetPort: number, requesterKey?: string): Promise<void> {
     const targetMap = this.forwards.get(targetPort)
-    if (!targetMap) return
+    if (!targetMap) return Promise.resolve()
 
     if (requesterKey) {
       const entry = targetMap.get(requesterKey)
-      if (!entry) return
-      this.closeEntry(targetPort, entry, targetMap)
+      if (!entry) return Promise.resolve()
+      return this.closeEntry(targetPort, entry, targetMap).then(() => {
+        if (targetMap.size === 0) {
+          this.forwards.delete(targetPort)
+        }
+      })
+    }
+
+    return Promise.all(
+      [...targetMap.values()].map((entry) => this.closeEntry(targetPort, entry, targetMap)),
+    ).then(() => {
       if (targetMap.size === 0) {
         this.forwards.delete(targetPort)
       }
-      return
-    }
-
-    for (const entry of [...targetMap.values()]) {
-      this.closeEntry(targetPort, entry, targetMap)
-    }
-    if (targetMap.size === 0) {
-      this.forwards.delete(targetPort)
-    }
+    })
   }
 
   /** Close all active forwards and stop the idle-cleanup timer. */
@@ -246,11 +247,11 @@ export class PortForwardManager {
     targetPort: number,
     entry: ForwardEntry,
     targetMap: Map<string, ForwardEntry>,
-  ): void {
+  ): Promise<void> {
     for (const conn of entry.connections) {
       conn.destroy()
     }
-    entry.server.close()
+    entry.connections.clear()
     targetMap.delete(entry.requesterKey)
     log.info(
       {
@@ -260,5 +261,14 @@ export class PortForwardManager {
       },
       'Port forward closed',
     )
+    return new Promise((resolve, reject) => {
+      entry.server.close((err) => {
+        if (err) {
+          reject(err)
+          return
+        }
+        resolve()
+      })
+    })
   }
 }

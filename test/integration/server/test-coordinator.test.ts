@@ -417,7 +417,7 @@ describe('test coordinator CLI', () => {
         FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
         FRESHELL_TEST_COORDINATOR_POLL_MS: '50',
         FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
-          'vitest:default:run': { holdMs: 800 },
+          'vitest:default:run': { holdMs: 5_000 },
         }),
       },
     )

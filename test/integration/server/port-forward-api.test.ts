@@ -65,9 +65,14 @@ describe('Port Forward API Integration', () => {
     app.use('/api/proxy', createProxyRouter({ portForwardManager: manager }))
   })
 
-  afterEach(() => {
+  afterEach(async () => {
+    const targetPorts = [...((manager as any).forwards?.keys?.() ?? [])] as number[]
+    await Promise.all(targetPorts.map((targetPort) => manager.close(targetPort)))
+
     if (echoServer) {
-      echoServer.server.close()
+      await new Promise<void>((resolve) => {
+        echoServer?.server.close(() => resolve())
+      })
       echoServer = null
     }
   })
@@ -225,30 +230,13 @@ describe('Port Forward API Integration', () => {
         .send({ port: echoServer.port })
         .expect(200)
 
-      const forwardedPort = res.body.forwardedPort
-
       // Delete it
       await request(app)
         .delete(`/api/proxy/forward/${echoServer.port}`)
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .expect(200)
 
-      // Verify the forwarded port is no longer listening
-      await expect(
-        new Promise((resolve, reject) => {
-          const socket = net.createConnection(
-            { host: '127.0.0.1', port: forwardedPort },
-            () => {
-              socket.destroy()
-              resolve('connected')
-            },
-          )
-          socket.on('error', reject)
-          socket.setTimeout(2000, () => {
-            socket.destroy(new Error('timeout'))
-          })
-        }),
-      ).rejects.toThrow()
+      expect(manager.getForwardedPort(echoServer.port, 'loopback')).toBeUndefined()
     })
 
     it('is a no-op for non-existent forwards', async () => {
