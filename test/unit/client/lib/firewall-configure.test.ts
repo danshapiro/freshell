@@ -42,4 +42,24 @@ describe('fetchFirewallConfig', () => {
     const result = await fetchFirewallConfig()
     expect(result.method).toBe('none')
   })
+
+  it('returns confirmation-required payloads', async () => {
+    vi.mocked(api.post).mockResolvedValue({
+      method: 'confirmation-required',
+      title: 'Administrator approval required',
+      body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
+      confirmLabel: 'Continue',
+    })
+
+    const result = await fetchFirewallConfig()
+    expect(result.method).toBe('confirmation-required')
+  })
+
+  it('passes confirmElevation when explicitly requested', async () => {
+    vi.mocked(api.post).mockResolvedValue({ method: 'windows-elevated', status: 'started' })
+
+    await fetchFirewallConfig({ confirmElevation: true })
+
+    expect(api.post).toHaveBeenCalledWith('/api/network/configure-firewall', { confirmElevation: true })
+  })
 })

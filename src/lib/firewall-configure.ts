@@ -3,6 +3,12 @@ import { api } from './api'
 export type ConfigureFirewallResult =
   | { method: 'terminal'; command: string }
   | { method: 'wsl2' | 'windows-elevated'; status: string }
+  | {
+    method: 'confirmation-required'
+    title: string
+    body: string
+    confirmLabel: string
+  }
   | { method: 'none'; message?: string }
   | { method: 'in-progress'; error: string }
 
@@ -16,8 +22,13 @@ export type ConfigureFirewallResult =
  *
  * For 'wsl2'/'windows-elevated': caller polls /api/network/status.
  *
+ * For 'confirmation-required': caller prompts the user, then retries with
+ * `{ confirmElevation: true }` if they accept.
+ *
  * For 'none': nothing to do.
  */
-export async function fetchFirewallConfig(): Promise<ConfigureFirewallResult> {
-  return api.post<ConfigureFirewallResult>('/api/network/configure-firewall', {})
+export async function fetchFirewallConfig(
+  body: { confirmElevation?: true } = {},
+): Promise<ConfigureFirewallResult> {
+  return api.post<ConfigureFirewallResult>('/api/network/configure-firewall', body)
 }
