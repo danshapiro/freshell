@@ -53,7 +53,7 @@ export type UpstreamPhase =
   }
 
 export type CommandDisposition =
-  | { kind: 'coordinated'; suiteKey: SuiteKey; phases: UpstreamPhase[] }
+  | { kind: 'coordinated'; suiteKey?: SuiteKey; phases: UpstreamPhase[] }
   | { kind: 'delegated'; phases: UpstreamPhase[] }
   | { kind: 'passthrough'; phases: UpstreamPhase[] }
   | { kind: 'rejected'; reason: string }
@@ -111,7 +111,13 @@ const SINGLE_PHASE_SPECS: Record<Exclude<CommandKey, 'test' | 'test:all' | 'chec
   },
 }
 
-const TARGET_VALUE_FLAGS = new Set(['-t', '--testNamePattern', '--reporter', '--config', '-c'])
+type CompositeTargetAnalysis =
+  | { kind: 'none' }
+  | { kind: 'default' | 'server' }
+  | { kind: 'cross-config'; suiteKey?: SuiteKey }
+  | { kind: 'mixed' }
+
+const TARGET_VALUE_FLAGS = new Set(['-t', '--testNamePattern', '--reporter', '--config', '-c', '--bail', '--changed'])
 
 export function classifyCommand(input: CoordinatorInput): CommandDisposition {
   const normalizedArgs = stripLeadingArgSeparator(input.forwardedArgs)
@@ -170,29 +176,36 @@ function classifyCompositeCommand(commandKey: CommandKey, args: string[]): Comma
   }
 
   const filteredArgs = removeCompositeCompatibilityFlags(args)
-  const targetOwnership = classifyTargetOwnership(filteredArgs)
+  const targetAnalysis = analyzeCompositeTargets(filteredArgs)
 
-  if (targetOwnership === 'mixed') {
+  if (targetAnalysis.kind === 'mixed') {
     return {
       kind: 'rejected',
       reason: 'Mixed client and server selectors are not supported here. Please split the command by config owner.',
     }
   }
 
-  if (targetOwnership === 'server') {
+  if (targetAnalysis.kind === 'cross-config') {
+    return coordinated(targetAnalysis.suiteKey, [
+      vitestPhase('default', ['run', ...filteredArgs]),
+      vitestPhase('server', ['run', '--config', 'vitest.server.config.ts', ...filteredArgs]),
+    ])
+  }
+
+  if (targetAnalysis.kind === 'server') {
     return delegated([
       vitestPhase('server', ['run', '--config', 'vitest.server.config.ts', ...filteredArgs]),
     ])
   }
 
-  if (targetOwnership === 'default') {
+  if (targetAnalysis.kind === 'default') {
     return delegated([
       vitestPhase('default', ['run', ...filteredArgs]),
     ])
   }
 
   if (isBroadCompositeWorkload(filteredArgs)) {
-    return coordinated('full-suite', [
+    return coordinated(coordinatedSuiteKeyForCompositeWorkload(filteredArgs), [
       vitestPhase('default', ['run', ...filteredArgs]),
       vitestPhase('server', ['run', '--config', 'vitest.server.config.ts', ...filteredArgs]),
     ])
@@ -215,7 +228,7 @@ function classifySinglePhaseCommand(commandKey: Exclude<CommandKey, 'test' | 'te
   }
 
   if (commandKey === 'test:server' && isExplicitBroadServerRun(args)) {
-    return coordinated('server:all:run', [
+    return coordinated(suiteKeyForSinglePhaseWorkload(spec, args), [
       vitestPhase('server', buildBroadSinglePhaseArgs(spec, args)),
     ])
   }
@@ -225,7 +238,7 @@ function classifySinglePhaseCommand(commandKey: Exclude<CommandKey, 'test' | 'te
   }
 
   if (isBroadSinglePhaseWorkload(commandKey, args) && spec.broadSuiteKey) {
-    return coordinated(spec.broadSuiteKey, [
+    return coordinated(suiteKeyForSinglePhaseWorkload(spec, args), [
       vitestPhase(spec.owner, buildBroadSinglePhaseArgs(spec, args)),
     ])
   }
@@ -342,6 +355,51 @@ function buildBroadSinglePhaseArgs(spec: SinglePhaseSpec, args: string[]): strin
   return [...spec.broadArgs, ...args]
 }
 
+function suiteKeyForSinglePhaseWorkload(spec: SinglePhaseSpec, args: string[]): SuiteKey | undefined {
+  return hasPartialSelectionFlags(args) ? undefined : spec.broadSuiteKey
+}
+
+function coordinatedSuiteKeyForCompositeWorkload(args: string[]): SuiteKey | undefined {
+  return hasPartialSelectionFlags(args) ? undefined : 'full-suite'
+}
+
+function hasPartialSelectionFlags(args: string[]): boolean {
+  return args.some((arg) => arg === '--changed' || arg.startsWith('--changed='))
+}
+
+function analyzeCompositeTargets(args: string[]): CompositeTargetAnalysis {
+  const classifications = extractTargets(args)
+    .map(classifyCompositeTarget)
+    .filter((classification): classification is NonNullable<ReturnType<typeof classifyCompositeTarget>> => classification !== undefined)
+
+  if (classifications.length === 0) {
+    return { kind: 'none' }
+  }
+
+  const unique = new Set(classifications)
+  if (unique.size === 1) {
+    const [only] = unique
+    if (only === 'full-suite') {
+      return { kind: 'cross-config', suiteKey: 'full-suite' }
+    }
+    if (only === 'cross-config') {
+      return { kind: 'cross-config' }
+    }
+    return { kind: only }
+  }
+
+  const includesCrossConfig = unique.has('cross-config') || unique.has('full-suite')
+  if (includesCrossConfig) {
+    const onlyCrossConfig = [...unique].every((classification) => classification === 'cross-config' || classification === 'full-suite')
+    if (onlyCrossConfig) {
+      return { kind: 'cross-config' }
+    }
+    return { kind: 'mixed' }
+  }
+
+  return { kind: 'mixed' }
+}
+
 function classifyTargetOwnership(args: string[]): 'default' | 'server' | 'mixed' | undefined {
   const ownerships = extractTargets(args)
     .map(classifyTarget)
@@ -414,10 +472,25 @@ function classifyTarget(target: string): 'default' | 'server' | undefined {
   return undefined
 }
 
+function classifyCompositeTarget(target: string): 'default' | 'server' | 'cross-config' | 'full-suite' | undefined {
+  const normalizedTarget = normalizeTargetForOwnership(target)
+
+  if (normalizedTarget === 'test') {
+    return 'full-suite'
+  }
+
+  if (normalizedTarget === 'test/unit' || normalizedTarget === 'test/integration') {
+    return 'cross-config'
+  }
+
+  return classifyTarget(target)
+}
+
 function normalizeTargetForOwnership(target: string): string {
   return target
     .replaceAll('\\', '/')
     .replace(/^(?:\.\/)+/, '')
+    .replace(/\/+$/, '')
 }
 
 function ownerRunPrefix(owner: 'default' | 'server'): string[] {
@@ -442,7 +515,7 @@ function singlePhasePassthroughTargetBaseArgs(spec: SinglePhaseSpec, owner: 'def
   return [...spec.broadArgs]
 }
 
-function coordinated(suiteKey: SuiteKey, phases: UpstreamPhase[]): CommandDisposition {
+function coordinated(suiteKey: SuiteKey | undefined, phases: UpstreamPhase[]): CommandDisposition {
   return { kind: 'coordinated', suiteKey, phases }
 }
 

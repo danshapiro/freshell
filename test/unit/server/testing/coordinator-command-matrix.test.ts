@@ -304,11 +304,9 @@ describe('classifyCommand()', () => {
       commandKey: 'check',
       forwardedArgs: ['--changed'],
     })
-    expect(changed).toMatchObject({
-      kind: 'coordinated',
-      suiteKey: 'full-suite',
-    })
+    expect(changed.kind).toBe('coordinated')
     if (changed.kind === 'coordinated') {
+      expect(changed.suiteKey).toBeUndefined()
       expect(changed.phases).toHaveLength(2)
       expectVitestPhase(changed.phases[0], {
         config: 'default',
@@ -341,6 +339,114 @@ describe('classifyCommand()', () => {
     }
   })
 
+  it('coordinates cross-config directory selectors instead of collapsing them to a single config', () => {
+    const fullTree = classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['test'],
+    })
+    expect(fullTree).toMatchObject({
+      kind: 'coordinated',
+      suiteKey: 'full-suite',
+    })
+    if (fullTree.kind === 'coordinated') {
+      expect(fullTree.phases).toHaveLength(2)
+      expectVitestPhase(fullTree.phases[0], {
+        config: 'default',
+        args: ['run', 'test'],
+      })
+      expectVitestPhase(fullTree.phases[1], {
+        config: 'server',
+        args: ['run', '--config', 'vitest.server.config.ts', 'test'],
+      })
+    }
+
+    const unitTree = classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['test/unit'],
+    })
+    expect(unitTree.kind).toBe('coordinated')
+    if (unitTree.kind === 'coordinated') {
+      expect(unitTree.suiteKey).toBeUndefined()
+      expect(unitTree.phases).toHaveLength(2)
+      expectVitestPhase(unitTree.phases[0], {
+        config: 'default',
+        args: ['run', 'test/unit'],
+      })
+      expectVitestPhase(unitTree.phases[1], {
+        config: 'server',
+        args: ['run', '--config', 'vitest.server.config.ts', 'test/unit'],
+      })
+    }
+
+    const integrationTree = classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['test/integration'],
+    })
+    expect(integrationTree.kind).toBe('coordinated')
+    if (integrationTree.kind === 'coordinated') {
+      expect(integrationTree.suiteKey).toBeUndefined()
+      expect(integrationTree.phases).toHaveLength(2)
+      expectVitestPhase(integrationTree.phases[0], {
+        config: 'default',
+        args: ['run', 'test/integration'],
+      })
+      expectVitestPhase(integrationTree.phases[1], {
+        config: 'server',
+        args: ['run', '--config', 'vitest.server.config.ts', 'test/integration'],
+      })
+    }
+  })
+
+  it('treats split-value flags as flag values instead of positional targets', () => {
+    const bail = classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['--bail', '1'],
+    })
+    expect(bail).toMatchObject({
+      kind: 'coordinated',
+      suiteKey: 'full-suite',
+    })
+    if (bail.kind === 'coordinated') {
+      expect(bail.phases).toHaveLength(2)
+      expectVitestPhase(bail.phases[0], {
+        config: 'default',
+        args: ['run', '--bail', '1'],
+      })
+      expectVitestPhase(bail.phases[1], {
+        config: 'server',
+        args: ['run', '--config', 'vitest.server.config.ts', '--bail', '1'],
+      })
+    }
+
+    const changed = classifyCommand({
+      commandKey: 'check',
+      forwardedArgs: ['--changed', 'origin/main'],
+    })
+    expect(changed.kind).toBe('coordinated')
+    if (changed.kind === 'coordinated') {
+      expect(changed.suiteKey).toBeUndefined()
+      expect(changed.phases).toHaveLength(2)
+      expectVitestPhase(changed.phases[0], {
+        config: 'default',
+        args: ['run', '--changed', 'origin/main'],
+      })
+      expectVitestPhase(changed.phases[1], {
+        config: 'server',
+        args: ['run', '--config', 'vitest.server.config.ts', '--changed', 'origin/main'],
+      })
+    }
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:coverage',
+      forwardedArgs: ['--bail', '1'],
+    }), {
+      kind: 'coordinated',
+      suiteKey: 'default:coverage',
+      config: 'default',
+      args: ['run', '--coverage', '--bail', '1'],
+    })
+  })
+
   it('coordinates broad single-phase workloads when benign flags keep them one-shot', () => {
     expectSinglePhase(classifyCommand({
       commandKey: 'test:unit',
@@ -354,12 +460,12 @@ describe('classifyCommand()', () => {
 
     expectSinglePhase(classifyCommand({
       commandKey: 'test:coverage',
-      forwardedArgs: ['--bail=1'],
+      forwardedArgs: ['--bail', '1'],
     }), {
       kind: 'coordinated',
       suiteKey: 'default:coverage',
       config: 'default',
-      args: ['run', '--coverage', '--bail=1'],
+      args: ['run', '--coverage', '--bail', '1'],
     })
 
     expectSinglePhase(classifyCommand({

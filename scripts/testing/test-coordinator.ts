@@ -358,7 +358,7 @@ async function runCoordinatedCommand(context: CoordinatedRunContext): Promise<nu
     await recordCommandResult(storeDir, latest)
     await recordSuiteResult(storeDir, latest)
 
-    if (exitCode === 0 && repo.commit && repo.isDirty === false) {
+    if (exitCode === 0 && repo.commit && repo.isDirty === false && latest.entrypoint.suiteKey) {
       await recordReusableSuccess(storeDir, buildReusableSuccessRecord(latest))
     }
 
@@ -499,10 +499,14 @@ function buildLatestRunRecord(input: {
 }
 
 function buildReusableSuccessRecord(latest: LatestRunRecord): ReusableSuccessRecord {
+  if (!latest.entrypoint.suiteKey) {
+    throw new Error('Reusable success records require an exact suite key.')
+  }
+
   return {
     ...latest,
     reusableKey: buildReusableSuccessKey({
-      suiteKey: latest.entrypoint.suiteKey ?? 'full-suite',
+      suiteKey: latest.entrypoint.suiteKey,
       commit: latest.repo.commit,
       isDirty: latest.repo.isDirty,
       nodeVersion: latest.runtime.nodeVersion,

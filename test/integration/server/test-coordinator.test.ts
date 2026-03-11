@@ -961,25 +961,31 @@ describe('test coordinator CLI', () => {
   it.each([
     {
       commandKey: 'test',
-      forwardedArgs: ['--bail=1'],
+      forwardedArgs: ['--bail', '1'],
       selectors: [
-        'vitest:default:run --bail=1',
-        'vitest:server:run --config vitest.server.config.ts --bail=1',
+        'vitest:default:run --bail 1',
+        'vitest:server:run --config vitest.server.config.ts --bail 1',
       ],
+      expectedSuiteKey: 'full-suite',
+      expectReusableSuccess: true,
     },
     {
       commandKey: 'check',
-      forwardedArgs: ['--changed'],
+      forwardedArgs: ['--changed', 'origin/main'],
       selectors: [
         'npm:typecheck',
-        'vitest:default:run --changed',
-        'vitest:server:run --config vitest.server.config.ts --changed',
+        'vitest:default:run --changed origin/main',
+        'vitest:server:run --config vitest.server.config.ts --changed origin/main',
       ],
+      expectedSuiteKey: undefined,
+      expectReusableSuccess: false,
     },
   ])('keeps broad composite $commandKey workloads coordinated when forwarded args stay cross-config', async ({
     commandKey,
     forwardedArgs,
     selectors,
+    expectedSuiteKey,
+    expectReusableSuccess,
   }) => {
     const fixture = await createRepoFixture({ linkedWorktree: true })
     const captureFile = path.join(fixture.baseDir, `${commandKey}-broad-flags.jsonl`)
@@ -995,8 +1001,26 @@ describe('test coordinator CLI', () => {
 
     expect(exit.code).toBe(0)
     expect((await readCaptureLines(captureFile)).map((entry) => entry.selector)).toEqual(selectors)
-    expect((await readSuiteRuns(fixture.storeDir)).byKey['full-suite']).toMatchObject({ outcome: 'success' })
-    expect((await readCommandRuns(fixture.storeDir)).byKey[commandKey]).toMatchObject({ outcome: 'success' })
+    const latest = (await readCommandRuns(fixture.storeDir)).byKey[commandKey]
+    expect(latest).toMatchObject({ outcome: 'success' })
+    expect(latest.entrypoint.commandKey).toBe(commandKey)
+    expect(latest.entrypoint.suiteKey).toBe(expectedSuiteKey)
+
+    const suiteRuns = await readSuiteRuns(fixture.storeDir)
+    if (expectedSuiteKey) {
+      expect(suiteRuns.byKey[expectedSuiteKey]).toMatchObject({ outcome: 'success' })
+    } else {
+      expect(suiteRuns.byKey['full-suite']).toBeUndefined()
+    }
+
+    const reusableSuccesses = await readReusableSuccesses(fixture.storeDir)
+    expect(Object.keys(reusableSuccesses.byReusableKey)).toHaveLength(expectReusableSuccess ? 1 : 0)
+
+    if (!expectedSuiteKey) {
+      const status = await runStatus(fixture.checkoutRoot)
+      expect(status.output).not.toContain('latest-suite: full-suite')
+      expect(status.output).not.toContain('reusable-summary:')
+    }
   })
 
   it.each([
@@ -1008,9 +1032,9 @@ describe('test coordinator CLI', () => {
     },
     {
       commandKey: 'test:coverage',
-      forwardedArgs: ['--bail=1'],
+      forwardedArgs: ['--bail', '1'],
       suiteKey: 'default:coverage',
-      selectors: ['vitest:default:run --coverage --bail=1'],
+      selectors: ['vitest:default:run --coverage --bail 1'],
     },
     {
       commandKey: 'test:server',
@@ -1045,6 +1069,64 @@ describe('test coordinator CLI', () => {
         suiteKey,
       },
     })
+  })
+
+  it.each([
+    {
+      forwardedArgs: ['test'],
+      selectors: [
+        'vitest:default:run test',
+        'vitest:server:run --config vitest.server.config.ts test',
+      ],
+      expectedSuiteKey: 'full-suite',
+    },
+    {
+      forwardedArgs: ['test/unit'],
+      selectors: [
+        'vitest:default:run test/unit',
+        'vitest:server:run --config vitest.server.config.ts test/unit',
+      ],
+      expectedSuiteKey: undefined,
+    },
+    {
+      forwardedArgs: ['test/integration'],
+      selectors: [
+        'vitest:default:run test/integration',
+        'vitest:server:run --config vitest.server.config.ts test/integration',
+      ],
+      expectedSuiteKey: undefined,
+    },
+  ])('splits cross-config composite directory selectors truthfully for %j', async ({
+    forwardedArgs,
+    selectors,
+    expectedSuiteKey,
+  }) => {
+    const fixture = await createRepoFixture({ linkedWorktree: true })
+    const captureFile = path.join(fixture.baseDir, `cross-config-${forwardedArgs[0].replaceAll('/', '-')}.jsonl`)
+
+    const exit = await waitForExit(spawnCoordinator(
+      fixture.checkoutRoot,
+      'test',
+      forwardedArgs,
+      {
+        FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
+      },
+    ))
+
+    expect(exit.code).toBe(0)
+    expect((await readCaptureLines(captureFile)).map((entry) => entry.selector)).toEqual(selectors)
+
+    const latest = (await readCommandRuns(fixture.storeDir)).byKey.test
+    expect(latest).toMatchObject({ outcome: 'success' })
+    expect(latest.entrypoint.commandKey).toBe('test')
+    expect(latest.entrypoint.suiteKey).toBe(expectedSuiteKey)
+
+    const suiteRuns = await readSuiteRuns(fixture.storeDir)
+    if (expectedSuiteKey) {
+      expect(suiteRuns.byKey[expectedSuiteKey]).toMatchObject({ outcome: 'success' })
+    } else {
+      expect(suiteRuns.byKey['full-suite']).toBeUndefined()
+    }
   })
 
   it('shows the latest exact coordinated suite and matching reusable baseline in bare status output', async () => {
