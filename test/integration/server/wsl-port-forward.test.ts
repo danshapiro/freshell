@@ -1,60 +1,25 @@
-// test/integration/server/wsl-port-forward.test.ts
-import { describe, it, expect } from 'vitest'
-import fs from 'fs'
-import path from 'path'
+import { describe, expect, it } from 'vitest'
+import fs from 'node:fs'
+import path from 'node:path'
 
-// This test verifies the bootstrap integration without actually running elevated commands
-describe('WSL port forwarding bootstrap integration', () => {
-  it('wsl-port-forward module exports all required functions', async () => {
-    // Dynamically import to verify the module structure
+describe('WSL port forwarding integration', () => {
+  it('exports only the manual WSL helper surface', async () => {
     const wslModule = await import('../../../server/wsl-port-forward.js')
 
-    expect(typeof wslModule.setupWslPortForwarding).toBe('function')
+    expect(typeof wslModule.computeWslPortForwardingPlan).toBe('function')
     expect(typeof wslModule.getWslIp).toBe('function')
-    expect(typeof wslModule.getRequiredPorts).toBe('function')
-    expect(typeof wslModule.needsPortForwardingUpdate).toBe('function')
     expect(typeof wslModule.buildPortForwardingScript).toBe('function')
+    expect(typeof wslModule.buildFirewallOnlyScript).toBe('function')
+    expect('getRequiredPorts' in wslModule).toBe(false)
+    expect('setupWslPortForwarding' in wslModule).toBe(false)
   })
 
-  it('server/index.ts calls setupWslPortForwarding conditionally when bindHost is 0.0.0.0', async () => {
+  it('server/index.ts does not import or call the startup-only WSL helper path', () => {
     const indexPath = path.resolve(__dirname, '../../../server/index.ts')
-    const indexContent = fs.readFileSync(indexPath, 'utf-8')
+    const indexContent = fs.readFileSync(indexPath, 'utf8')
 
-    // Check import exists
-    expect(indexContent).toContain("import { setupWslPortForwarding } from './wsl-port-forward.js'")
-    expect(indexContent).toContain('shouldSetupWslPortForwardingAtStartup')
-    expect(indexContent).toContain("from './wsl-port-forward-startup.js'")
-
-    // Check conditional call exists — only when the startup gate allows it
-    expect(indexContent).toContain('shouldSetupWslPortForwardingAtStartup(bindHost, process.env)')
-    expect(indexContent).toMatch(/setupWslPortForwarding\(/)
-
-    // Verify ordering: validateStartupSecurity must come before setupWslPortForwarding
-    const validatePos = indexContent.indexOf('validateStartupSecurity()')
-    const startupGatePos = indexContent.indexOf('shouldSetupWslPortForwardingAtStartup(bindHost, process.env)')
-    const setupCallPos = indexContent.indexOf('setupWslPortForwarding(')
-
-    expect(validatePos).toBeGreaterThan(-1)
-    expect(startupGatePos).toBeGreaterThan(-1)
-    expect(setupCallPos).toBeGreaterThan(-1)
-    expect(setupCallPos).toBeGreaterThan(validatePos)
-    expect(setupCallPos).toBeGreaterThan(startupGatePos)
-
-    // Verify both are inside main() (after "async function main()")
-    const mainFnPos = indexContent.indexOf('async function main()')
-    expect(mainFnPos).toBeGreaterThan(-1)
-    expect(validatePos).toBeGreaterThan(mainFnPos)
-    expect(startupGatePos).toBeGreaterThan(mainFnPos)
-    expect(setupCallPos).toBeGreaterThan(mainFnPos)
-  })
-
-  it('bootstrap.ts does NOT call setupWslPortForwarding (moved to index.ts)', async () => {
-    // Verify bootstrap no longer calls setupWslPortForwarding
-    // This ensures .env values are loaded before port forwarding reads them
-    const bootstrapPath = path.resolve(__dirname, '../../../server/bootstrap.ts')
-    const bootstrapContent = fs.readFileSync(bootstrapPath, 'utf-8')
-
-    // Should NOT import or call setupWslPortForwarding
-    expect(bootstrapContent).not.toContain('setupWslPortForwarding')
+    expect(indexContent).not.toContain("from './wsl-port-forward-startup.js'")
+    expect(indexContent).not.toContain('setupWslPortForwarding(')
+    expect(indexContent).not.toContain('shouldSetupWslPortForwardingAtStartup')
   })
 })

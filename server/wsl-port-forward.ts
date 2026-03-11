@@ -3,8 +3,6 @@ import { isWSL2 } from './platform.js'
 
 const IPV4_REGEX = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/
 const NETSH_PATH = '/mnt/c/Windows/System32/netsh.exe'
-const POWERSHELL_PATH = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
-const DEFAULT_PORT = 3001
 
 export type PortProxyRule = {
   connectAddress: string
@@ -90,34 +88,6 @@ export function getExistingPortProxyRules(): Map<number, PortProxyRule> {
   } catch {
     return new Map()
   }
-}
-
-/**
- * Get the list of ports that need forwarding.
- * Uses PORT from environment (or default 3001).
- * Includes dev port 5173 unless NODE_ENV is 'production'.
- * Validates port and deduplicates to avoid invalid/duplicate netsh commands.
- */
-export function getRequiredPorts(devPort?: number): number[] {
-  const portEnv = process.env.PORT
-  const serverPort = portEnv ? parseInt(portEnv, 10) : DEFAULT_PORT
-
-  // Validate parsed port (NaN check, valid range)
-  const validServerPort = Number.isNaN(serverPort) || serverPort < 1 || serverPort > 65535
-    ? DEFAULT_PORT
-    : serverPort
-
-  const ports = new Set<number>([validServerPort])
-
-  // Include dev server port unless in production.
-  // Validate range — invalid devPort could generate invalid netsh commands.
-  if (process.env.NODE_ENV !== 'production' && devPort) {
-    if (Number.isInteger(devPort) && devPort >= 1 && devPort <= 65535) {
-      ports.add(devPort)
-    }
-  }
-
-  return Array.from(ports)
 }
 
 /**
@@ -237,35 +207,34 @@ export function buildPortForwardingScript(wslIp: string, ports: number[]): strin
   return commands.join('; ')
 }
 
-export type SetupResult = 'success' | 'skipped' | 'failed' | 'not-wsl2'
+export type WslPortForwardingPlan =
+  | { status: 'not-wsl2' }
+  | { status: 'error'; message: string }
+  | { status: 'noop'; wslIp: string }
+  | {
+    status: 'ready'
+    wslIp: string
+    scriptKind: 'full' | 'firewall-only'
+    script: string
+  }
 
-/**
- * Set up Windows port forwarding for WSL2 LAN access.
- *
- * - Detects if running in WSL2
- * - Gets required ports from environment
- * - Checks existing port proxy rules
- * - Launches elevated PowerShell to add/update rules if needed
- * - Verifies rules were actually applied
- *
- * Returns:
- * - 'not-wsl2': Not running in WSL2, no action needed
- * - 'skipped': Rules already configured correctly
- * - 'success': Rules were added/updated and verified
- * - 'failed': Failed to configure (UAC dismissed, error, or verification failed)
- */
-export function setupWslPortForwarding(devPort?: number): SetupResult {
+function normalizeScriptForElevatedPowerShell(script: string): string {
+  return script.replace(/\\\$/g, '$')
+}
+
+export function computeWslPortForwardingPlan(requiredPorts: number[]): WslPortForwardingPlan {
   if (!isWSL2()) {
-    return 'not-wsl2'
+    return { status: 'not-wsl2' }
   }
 
   const wslIp = getWslIp()
   if (!wslIp) {
-    console.error('[wsl-port-forward] Failed to detect WSL2 IP address')
-    return 'failed'
+    return {
+      status: 'error',
+      message: 'Failed to detect WSL2 IP address',
+    }
   }
 
-  const requiredPorts = getRequiredPorts(devPort)
   const existingRules = getExistingPortProxyRules()
   const existingFirewallPorts = getExistingFirewallPorts()
 
@@ -273,51 +242,21 @@ export function setupWslPortForwarding(devPort?: number): SetupResult {
   const firewallNeedsUpdate = needsFirewallUpdate(requiredPorts, existingFirewallPorts)
 
   if (!portsNeedUpdate && !firewallNeedsUpdate) {
-    console.log(`[wsl-port-forward] Rules up to date for ${wslIp}`)
-    return 'skipped'
+    return {
+      status: 'noop',
+      wslIp,
+    }
   }
 
-  // Choose the appropriate script: full (port forwarding + firewall) or firewall-only.
-  // When only the firewall drifted, skip port forwarding commands to avoid
-  // brief connection interruptions from deleting/re-adding proxy rules.
-  const script = portsNeedUpdate
+  const scriptKind = portsNeedUpdate ? 'full' : 'firewall-only'
+  const script = scriptKind === 'full'
     ? buildPortForwardingScript(wslIp, requiredPorts)
     : buildFirewallOnlyScript(requiredPorts)
 
-  const label = portsNeedUpdate ? 'port forwarding + firewall' : 'firewall'
-  console.log(`[wsl-port-forward] Configuring ${label} for ${wslIp}...`)
-  console.log('[wsl-port-forward] UAC prompt required - please approve to enable LAN access')
-
-  try {
-    // Escape single quotes for PowerShell ArgumentList
-    const escapedScript = script.replace(/'/g, "''")
-
-    execSync(
-      `${POWERSHELL_PATH} -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-Command', '${escapedScript}'"`,
-      { encoding: 'utf-8', timeout: 60000, stdio: 'inherit' }
-    )
-
-    // Verify port forwarding rules if they were updated
-    if (portsNeedUpdate) {
-      const verifyRules = getExistingPortProxyRules()
-      if (needsPortForwardingUpdate(wslIp, requiredPorts, verifyRules)) {
-        console.error('[wsl-port-forward] Port forwarding rules were not applied - UAC may have been cancelled')
-        return 'failed'
-      }
-    }
-
-    // Always verify firewall (updated in both full and firewall-only scripts)
-    const verifyFirewall = getExistingFirewallPorts()
-    if (needsFirewallUpdate(requiredPorts, verifyFirewall)) {
-      console.error('[wsl-port-forward] Firewall rule was not applied - UAC may have been cancelled')
-      return 'failed'
-    }
-
-    console.log(`[wsl-port-forward] ${portsNeedUpdate ? 'Port forwarding' : 'Firewall'} configured successfully`)
-    return 'success'
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err)
-    console.error(`[wsl-port-forward] Failed to configure: ${message}`)
-    return 'failed'
+  return {
+    status: 'ready',
+    wslIp,
+    scriptKind,
+    script: normalizeScriptForElevatedPowerShell(script),
   }
 }
