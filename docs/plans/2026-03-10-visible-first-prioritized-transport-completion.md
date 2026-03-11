@@ -2,36 +2,46 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task.
 
-**Goal:** Land the accepted visible-first prioritized transport spec directly, enforce the quality gates that were previously skipped or softened, and only finish when the post-cutover audit is trusted and shows no `mobile_restricted` regression.
+**Goal:** Finish the accepted visible-first prioritized transport from the current partially cut over branch state by deleting the remaining hybrid websocket bulk paths, locking the spec into machine-checked contradiction gates, enforcing the surviving transport budgets, and only finishing when the trusted `mobile_restricted` audit gate passes.
 
-**Architecture:** Keep the accepted hard-cut destination: server-owned visible/read-model transport over HTTP, with WebSocket v4 reserved for live control, invalidation, and targeted deltas. Build or tighten the new HTTP-owned consumers first, switch every client surface to them, then delete the legacy websocket bulk transport in one explicit cleanup pass so the branch never lands hybrid again.
+**Architecture:** Treat this as a completion pass, not a redesign. The branch already contains the new HTTP-owned read-model routes, App-owned websocket startup, agent timeline read models, terminal viewport-first restore, server-side terminal search, and shared scheduler; the remaining work is to make the branch non-hybrid by proving and deleting every legacy bulk websocket/session-terminal compatibility path, then tightening the surviving HTTP plus invalidation/delta model until the audit gate is green. The landed shape remains the accepted hard cutover: HTTP owns visible snapshots, windowed directories, search, and terminal viewport or scrollback restore; WebSocket owns control, invalidation, and small live deltas only.
 
-**Tech Stack:** Node.js, Express, `ws`, React 18, Redux Toolkit, TypeScript, Zod, Vitest, Playwright/Chromium audit harness, `tsx`
+**Tech Stack:** Node.js, Express, `ws`, React 18, Redux Toolkit, TypeScript, Zod, Vitest, Playwright/Chromium, `tsx`
 
 ---
 
 ## Why This Revision Exists
 
-The previous completion plan was strong on destination, but it was still not excellent for execution:
+The previous completion plan is no longer execution-safe for this worktree.
 
-1. It deleted legacy websocket delivery too early, before every new HTTP-owned consumer was fully switched. That is the same sequencing class that previously produced a hybrid landing and mobile regressions.
-2. Several tasks were still too coarse for trycycle. They bundled protocol, server, client, and cleanup work into one commit-sized step instead of a single seam.
-3. It still treated a few now-missing test files as if they already existed, which is not execution-safe.
-4. It did not fully adapt to the current worktree state, where parts of the visible-first transport already exist and now need tightening, cutover, or deletion of old peers rather than greenfield creation.
-5. It did not isolate the final hard-delete of legacy websocket bulk transport into a dedicated, machine-checkable cleanup phase.
-6. It still skipped the shared harness-first TDD foundation required by the accepted transport test plan, even though those harnesses do not already exist in this repo.
+1. The branch has already landed the shared harnesses, audit-gate helper, shell bootstrap cutover, App-owned websocket bootstrap, session-directory routes and store wiring, agent timeline and snapshot restore, terminal HTTP read models, viewport-first terminal paint, terminal directory and search HTTP cutover, and the shared scheduler. Re-running the old Tasks 1 through 17 literally would tell the executor to recreate or re-delete seams that already moved.
+2. The branch is still hybrid in exactly the way that caused the earlier performance failure. Current `rg` output still shows `sessions.updated`, `sessions.page`, `sessions.patch`, `sdk.history`, `terminal.list`, `terminal.meta.list`, and legacy hello capability flags in production files such as `shared/ws-protocol.ts`, `server/ws-handler.ts`, `src/App.tsx`, `src/lib/ws-client.ts`, and `src/lib/sdk-message-handler.ts`.
+3. The old plan assumed the pre-cutover baseline could still be captured from this worktree before runtime edits. That is no longer true. A safe completion plan must reuse an existing trusted baseline artifact or rebuild it from a clean `main` worktree before the final compare.
+4. The biggest trycycle-process miss was the lack of a first-class acceptance-contract gate. This revision makes that the first remaining task so execution cannot again claim completion while the old and new transport both still exist.
 
-This revision keeps the accepted architecture and machine gate, but changes the execution shape:
+## Current Branch Snapshot
 
-1. Build the shared visible-first test harnesses first so the high-value scenario and integration tests can actually be written before product code.
-2. Build or tighten the new authoritative HTTP and store-owned seams first.
-3. Switch the client surfaces to the new seams while the old paths still exist temporarily inside the branch.
-4. Delete the legacy websocket transport only after every visible consumer has been moved.
-5. End with a full quality gate plus trusted pre/post audit comparison, with `mobile_restricted` as the decision rule.
+Already true on this branch:
+
+1. `/api/bootstrap` is shell-only and budgeted.
+2. `src/App.tsx` is already the only `ws.connect()` caller.
+3. Session-directory routes, store-owned session windows, and the CLI session-directory cutover are already in place.
+4. Agent timeline routes and snapshot-plus-window chat restore already exist.
+5. Terminal directory, viewport, scrollback, and search routes already exist, and the client already paints terminals viewport-first from HTTP.
+6. Shared read-model lane ordering already exists.
+7. `/api/sessions/search`, `/api/sessions/query`, and client `SearchAddon` usage are already gone.
+
+Still false on this branch:
+
+1. Startup and runtime still carry legacy websocket session bulk delivery.
+2. Agent chat still carries `sdk.history` compatibility.
+3. Shared websocket protocol still advertises legacy capabilities and commands.
+4. Terminal directory or runtime compatibility messages still survive.
+5. The final full quality gate and trusted audit compare have not yet been rerun on a fully non-hybrid tree.
 
 ## Source Of Truth
 
-Treat these four documents as the authoritative spec set, in this order:
+Treat these documents as the authoritative spec set, in this order:
 
 1. `docs/plans/2026-03-09-visible-first-prioritized-transport.md`
 2. `docs/plans/2026-03-09-visible-first-prioritized-transport-test-plan.md`
@@ -40,184 +50,143 @@ Treat these four documents as the authoritative spec set, in this order:
 
 ## Strategy Gate
 
-The problem to solve is not "trim a few large payloads." The problem is "finish the server-authoritative visible-first transport, prove it, and delete the hybrid architecture."
+This is not a stabilization branch and not a narrowing pass. It is the direct completion of the accepted hard cutover.
 
-Non-negotiable direction:
+1. Do not redo already-landed read-model work unless a new failing test proves a regression in that seam.
+2. From this point onward, every task must shrink the hybrid surface, never preserve it.
+3. The direct end state is full hard cutover. No landing compatibility shims remain for bulk websocket session, SDK history, or terminal directory snapshot delivery.
+4. `mobile_restricted` remains the release decision rule. If the audit gate fails there, the branch is not done.
+5. `src/App.tsx` remains the sole websocket owner.
+6. Hidden panes and offscreen tabs stay lazy. Visibility or explicit selection is the trigger for HTTP hydration.
+7. When a task deletes a runtime path, it must rewrite or delete the positive legacy test in the same commit.
+8. The accepted transport plan and test plan are authoritative. If the current code conflicts with them, the code changes, not the spec.
 
-1. Do not preserve compatibility shims for legacy bulk websocket session, SDK, or terminal snapshot delivery at landing.
-2. Do not narrow the audit matrix. Keep all six scenarios across `desktop_local` and `mobile_restricted`.
-3. `mobile_restricted` is the user’s decision rule. A mobile regression is a failed landing even if desktop improves.
-4. `src/App.tsx` is the only websocket owner.
-5. Hidden panes and offscreen tabs do not prehydrate. Visibility or explicit selection is the trigger.
-6. The server owns search, pagination, timeline shaping, terminal viewport serialization, scheduler lanes, payload budgets, and transport instrumentation.
-7. The client owns visibility, selection, optimistic UI, and tiny client-only adornment based on browser-local state.
-8. Temporary coexistence inside the branch is acceptable only while new consumers are being switched. The final cleanup tasks must remove the old transport entirely.
+## Acceptance Contract
 
-## Machine Gate
+This is the branch-level acceptance contract. The executor and reviewer should use this exact list when deciding whether the branch is complete.
 
-The landing is complete only when all of the following are true:
+Required behaviors that must exist:
 
-1. The pre-cutover baseline artifact is trusted.
-2. The post-cutover candidate artifact is trusted.
-3. Every scenario/profile pair is present in both artifacts.
-4. Every sample in both artifacts has `status === "ok"`.
-5. No `mobile_restricted.focusedReadyMs` delta is positive.
-6. No `mobile_restricted.terminalInputToFirstOutputMs` delta is positive for:
-   - `terminal-cold-boot`
-   - `terminal-reconnect-backlog`
-7. No positive delta appears in either profile for:
-   - `offscreenHttpRequestsBeforeReady`
-   - `offscreenHttpBytesBeforeReady`
-   - `offscreenWsFramesBeforeReady`
-   - `offscreenWsBytesBeforeReady`
-8. Production code no longer emits or consumes:
-   - `sessions.updated`
-   - `sessions.page`
-   - `sessions.patch`
-   - `sessions.fetch`
-   - `sdk.history`
-   - `terminal.list`
-   - `terminal.list.response`
-   - `terminal.list.updated`
-   - `terminal.meta.list`
-   - `terminal.meta.list.response`
-   - `sessionsPatchV1`
-   - `sessionsPaginationV1`
-9. No production code uses `/api/sessions/search` or `/api/sessions/query`.
-10. No production code imports or instantiates `SearchAddon`.
-11. Only `src/App.tsx` calls `ws.connect()`.
+1. `GET /api/bootstrap` returns shell-only startup data, not session, agent, or terminal read models.
+2. Session browsing and search use `/api/session-directory` only.
+3. Agent chat reload uses `sdk.session.snapshot` plus HTTP timeline windows and turn-body hydration.
+4. Terminal restore uses HTTP viewport first, then websocket tail replay from `tailSeq`.
+5. Terminal search is server-side only.
+6. WebSocket is limited to control, invalidation, and tiny live deltas. It is not a bulk snapshot transport.
+
+Forbidden behaviors that must not exist in production code or successful transcripts:
+
+1. `sessions.updated`
+2. `sessions.page`
+3. `sessions.patch`
+4. `sessions.fetch`
+5. `sdk.history`
+6. `terminal.list`
+7. `terminal.list.response`
+8. `terminal.list.updated`
+9. `terminal.meta.list`
+10. `terminal.meta.list.response`
+11. `sessionsPatchV1`
+12. `sessionsPaginationV1`
+13. `/api/sessions/search`
+14. `/api/sessions/query`
+15. `SearchAddon`
+16. Any `ws.connect()` caller outside `src/App.tsx`
+
+Required measurable outcomes:
+
+1. Both baseline and candidate audit artifacts are trusted.
+2. Every scenario and profile pair is present and `status === "ok"` in both artifacts.
+3. No `mobile_restricted.focusedReadyMs` delta is positive.
+4. No `mobile_restricted.terminalInputToFirstOutputMs` delta is positive for `terminal-cold-boot` or `terminal-reconnect-backlog`.
+5. No positive delta appears in either profile for `offscreenHttpRequestsBeforeReady`, `offscreenHttpBytesBeforeReady`, `offscreenWsFramesBeforeReady`, or `offscreenWsBytesBeforeReady`.
+
+Task 1 turns this acceptance contract into shared constants and reusable transcript assertions so later deletion tasks can prove the branch is no longer hybrid.
 
 ## Execution Rules
 
-1. Every task follows this order:
-   - write failing tests
-   - run the narrow lane and watch it fail
-   - write the minimal implementation
-   - rerun the same lane and make it pass
-   - run any listed grep or smoke proof for that seam
-   - commit a green state
-2. Every task ends green on its named lane. Do not commit red states.
-3. If Step 1 and Step 2 show that a named task actually contains multiple independently provable seams, stop before implementation and split it into consecutive child tasks. Each child task must keep the same ordering, write its own failing test, run its own narrow lane, prove green, run any listed grep or smoke proof, and commit separately. Do not batch the child seams back into one implementation commit, and do not let a split move consumer cutover behind hard-delete cleanup.
-4. Work from the current worktree state. If a listed seam already partially exists, tighten or replace it instead of re-creating it.
-5. If a listed test file does not exist yet, create it in the task that needs it. Do not silently swap to a different file without updating the plan.
-6. Finish existing seams instead of creating parallel route stacks, schedulers, or telemetry channels.
-7. If a later full-suite run fails, fix the narrowest real defect, add the missing regression if needed, commit the fix, and restart the full gate.
-8. Generated audit artifacts under `artifacts/perf/` are never committed.
-9. All later scenario and integration tests must reuse the shared harness modules from Task 1. Do not create ad hoc websocket stubs, route fixtures, scheduler fakes, or app boot shims once the shared harness exists.
+1. Every task follows the same order: write failing tests, run the narrow lane and watch it fail, write the minimal implementation, rerun the same lane and watch it pass, run the listed smoke or grep proof, then commit a green state.
+2. Do not reopen completed tasks from the old plan just because they existed there. Work from the current branch state.
+3. If a listed task proves to contain two independent seams, split it immediately into consecutive child tasks and keep both child tasks green and separately committed.
+4. If a full-suite or audit failure reveals a defect in an already-landed seam, fix the narrowest real defect, add the missing regression, commit that fix, and resume from the relevant quality gate.
+5. Do not commit generated artifacts from `artifacts/perf/`.
+6. Do not preserve contradictory tests. If a test still positively encodes a forbidden legacy behavior, rewrite or delete it in the same task that removes the runtime path.
+7. Prefer deletion over compatibility code. The earlier regression came from paying for both the old websocket bulk path and the new HTTP read-model path at the same time.
 
-## Files That Matter
+## Files That Matter Now
 
-Shared contracts:
-
-- `shared/read-models.ts`
-- `shared/ws-protocol.ts`
-
-Shared visible-first test harnesses:
+Acceptance and contradiction gates:
 
 - `test/helpers/visible-first/protocol-harness.ts`
-- `test/helpers/visible-first/read-model-route-harness.ts`
-- `test/helpers/visible-first/app-hydration-harness.tsx`
-- `test/helpers/visible-first/slow-network-controller.ts`
-- `test/helpers/visible-first/terminal-mirror-fixture.ts`
-- `test/helpers/visible-first/cli-command-harness.ts`
+- `test/helpers/visible-first/acceptance-contract.ts`
 - `test/unit/visible-first/protocol-harness.test.ts`
-- `test/unit/visible-first/read-model-route-harness.test.ts`
-- `test/unit/visible-first/app-hydration-harness.test.tsx`
-- `test/unit/visible-first/slow-network-controller.test.ts`
-- `test/unit/visible-first/terminal-mirror-fixture.test.ts`
-- `test/unit/visible-first/cli-command-harness.test.ts`
+- `test/unit/visible-first/acceptance-contract.test.ts`
+- `test/server/ws-protocol.test.ts`
+- `test/server/ws-edge-cases.test.ts`
+- `test/server/ws-handshake-snapshot.test.ts`
+- `test/unit/client/lib/ws-client.test.ts`
+- `package.json`
 
-Server transport, read models, and instrumentation:
+Remaining legacy websocket cleanup:
 
-- `server/index.ts`
-- `server/shell-bootstrap-router.ts`
-- `server/sessions-router.ts`
-- `server/session-pagination.ts`
-- `server/session-directory/service.ts`
-- `server/session-directory/types.ts`
-- `server/agent-timeline/router.ts`
-- `server/agent-timeline/service.ts`
-- `server/agent-timeline/types.ts`
-- `server/terminals-router.ts`
-- `server/terminal-view/service.ts`
-- `server/terminal-view/types.ts`
-- `server/terminal-view/mirror.ts`
-- `server/terminal-stream/broker.ts`
-- `server/terminal-stream/replay-ring.ts`
-- `server/terminal-stream/client-output-queue.ts`
-- `server/read-models/work-scheduler.ts`
-- `server/read-models/request-abort.ts`
-- `server/request-logger.ts`
-- `server/perf-logger.ts`
-- `server/session-history-loader.ts`
-- `server/sessions-sync/service.ts`
-- `server/cli/index.ts`
-- `server/routes/sessions.ts`
-- `server/routes/terminals.ts`
+- `shared/ws-protocol.ts`
 - `server/ws-handler.ts`
+- `server/sessions-sync/service.ts`
+- `server/session-history-loader.ts`
 - `server/ws-chunking.ts`
-
-Client bootstrap, session, agent-chat, and terminal seams:
-
+- `server/terminals-router.ts`
+- `server/sessions-router.ts`
+- `server/agent-api/router.ts`
+- `server/routes/terminals.ts`
 - `src/App.tsx`
-- `src/lib/api.ts`
 - `src/lib/ws-client.ts`
 - `src/lib/sdk-message-handler.ts`
-- `src/lib/terminal-attach-seq-state.ts`
-- `src/lib/terminal-restore.ts`
-- `src/lib/perf-logger.ts`
-- `src/components/SessionView.tsx`
-- `src/components/Sidebar.tsx`
-- `src/components/OverviewView.tsx`
-- `src/components/BackgroundSessions.tsx`
-- `src/components/HistoryView.tsx`
-- `src/components/TerminalView.tsx`
-- `src/components/terminal/terminal-runtime.ts`
-- `src/components/terminal/TerminalSearchBar.tsx`
-- `src/components/context-menu/ContextMenuProvider.tsx`
-- `src/components/agent-chat/AgentChatView.tsx`
-- `src/components/agent-chat/CollapsedTurn.tsx`
-- `src/components/TabContent.tsx`
-- `src/store/sessionsSlice.ts`
-- `src/store/sessionsThunks.ts`
-- `src/store/selectors/sidebarSelectors.ts`
 - `src/store/agentChatTypes.ts`
 - `src/store/agentChatSlice.ts`
 - `src/store/agentChatThunks.ts`
-- `src/store/terminalDirectorySlice.ts`
-- `src/store/terminalDirectoryThunks.ts`
-- `src/store/terminalMetaSlice.ts`
-- `src/store/store.ts`
+- `src/components/OverviewView.tsx`
 
-Audit gate and comparison tooling:
+Budget and instrumentation seams:
+
+- `shared/read-models.ts`
+- `server/request-logger.ts`
+- `server/perf-logger.ts`
+- `server/terminal-stream/client-output-queue.ts`
+- `server/shell-bootstrap-router.ts`
+- `server/sessions-router.ts`
+- `server/terminals-router.ts`
+- `src/lib/perf-logger.ts`
+- `test/unit/server/request-logger.test.ts`
+- `test/unit/server/perf-logger.test.ts`
+- `test/unit/server/ws-handler-backpressure.test.ts`
+- `test/unit/server/terminal-stream/client-output-queue.test.ts`
+- `test/integration/server/bootstrap-router.test.ts`
+- `test/integration/server/session-directory-router.test.ts`
+- `test/integration/server/terminal-view-router.test.ts`
+- `test/unit/client/lib/perf-logger.test.ts`
+
+Final audit and compare:
 
 - `test/e2e-browser/perf/audit-contract.ts`
+- `test/e2e-browser/perf/visible-first-audit-gate.ts`
 - `test/e2e-browser/perf/run-visible-first-audit.ts`
 - `test/e2e-browser/perf/run-sample.ts`
 - `test/e2e-browser/perf/compare-visible-first-audits.ts`
-- `test/e2e-browser/perf/visible-first-audit-gate.ts`
 - `scripts/visible-first-audit.ts`
 - `scripts/compare-visible-first-audit.ts`
 - `scripts/assert-visible-first-audit-gate.ts`
-- `package.json`
 
-## Preflight: Trusted Baseline Artifact
+## Preflight: Trusted Pre-Cutover Baseline From Clean `main`
 
-Do this before editing runtime code.
+Do this before touching more runtime code. The old preflight is stale because this worktree is already mid-cutover.
 
-1. Create the artifact directory:
+1. Ensure the artifact directory exists:
 
 ```bash
 mkdir -p artifacts/perf
 ```
 
-2. Capture the pre-cutover baseline:
-
-```bash
-npm run perf:audit:visible-first -- --output artifacts/perf/visible-first-baseline.pre-cutover.json
-```
-
-3. Validate that the baseline is trusted:
+2. If `artifacts/perf/visible-first-baseline.pre-cutover.json` already exists, validate it:
 
 ```bash
 npx tsx --eval "import fs from 'node:fs'; import { VisibleFirstAuditSchema, assertVisibleFirstAuditTrusted } from './test/e2e-browser/perf/audit-contract.ts'; const artifact = VisibleFirstAuditSchema.parse(JSON.parse(fs.readFileSync('artifacts/perf/visible-first-baseline.pre-cutover.json', 'utf8'))); assertVisibleFirstAuditTrusted(artifact);"
@@ -225,199 +194,81 @@ npx tsx --eval "import fs from 'node:fs'; import { VisibleFirstAuditSchema, asse
 
 Expected: exit `0`.
 
-If this fails, stop runtime work and fix the audit harness first. The final comparison is meaningless without a trusted baseline.
+3. If the file is missing or the validation fails, rebuild it from a disposable clean `main` worktree, not from this branch:
 
-### Task 1: Build Shared Visible-First Test Harnesses
+```bash
+git -C /home/user/code/freshell worktree add /home/user/code/freshell/.worktrees/codex-visible-first-transport-baseline main
+cd /home/user/code/freshell/.worktrees/codex-visible-first-transport-baseline
+npm run perf:audit:visible-first -- --output /home/user/code/freshell/.worktrees/codex-visible-first-transport-v2/artifacts/perf/visible-first-baseline.pre-cutover.json
+cd /home/user/code/freshell/.worktrees/codex-visible-first-transport-v2
+npx tsx --eval "import fs from 'node:fs'; import { VisibleFirstAuditSchema, assertVisibleFirstAuditTrusted } from './test/e2e-browser/perf/audit-contract.ts'; const artifact = VisibleFirstAuditSchema.parse(JSON.parse(fs.readFileSync('artifacts/perf/visible-first-baseline.pre-cutover.json', 'utf8'))); assertVisibleFirstAuditTrusted(artifact);"
+git -C /home/user/code/freshell worktree remove /home/user/code/freshell/.worktrees/codex-visible-first-transport-baseline
+```
+
+Expected: both audit-validation commands exit `0`.
+
+4. Never commit the baseline artifact. It is a local comparison input only.
+
+### Task 1: Add A Shared Acceptance-Contract Gate
 
 **Files:**
-- Create: `test/helpers/visible-first/protocol-harness.ts`
-- Create: `test/helpers/visible-first/read-model-route-harness.ts`
-- Create: `test/helpers/visible-first/app-hydration-harness.tsx`
-- Create: `test/helpers/visible-first/slow-network-controller.ts`
-- Create: `test/helpers/visible-first/terminal-mirror-fixture.ts`
-- Create: `test/helpers/visible-first/cli-command-harness.ts`
-- Create: `test/unit/visible-first/protocol-harness.test.ts`
-- Create: `test/unit/visible-first/read-model-route-harness.test.ts`
-- Create: `test/unit/visible-first/app-hydration-harness.test.tsx`
-- Create: `test/unit/visible-first/slow-network-controller.test.ts`
-- Create: `test/unit/visible-first/terminal-mirror-fixture.test.ts`
-- Create: `test/unit/visible-first/cli-command-harness.test.ts`
-
-**Step 1: Write the failing harness contract tests**
-
-Cover:
-
-1. `ProtocolHarness` starts the real websocket handler with fake session and terminal publishers, captures the raw transcript, sends `hello`, and can assert that forbidden legacy message types were never emitted
-2. `ReadModelRouteHarness` mounts auth plus the bootstrap, session-directory, agent-timeline, and terminal-view routers with fake services and records scheduler lane events, aborts, revisions, and response bytes
-3. `AppHydrationHarness` renders `App.tsx` with a real Redux store, gated HTTP promises, seeded layout state, and a programmable websocket stub whose `ready` can be held independently from HTTP
-4. `SlowNetworkController` can hold and release `critical`, `visible`, and `background` requests independently and delay websocket `ready` independently from HTTP
-5. `TerminalMirrorFixture` can apply deterministic ANSI output, expose viewport serialization and `tailSeq`, answer scrollback and search queries, and simulate replay overflow
-6. `CliCommandHarness` captures invoked URLs, stdout, stderr, JSON output, and exit code without needing a real external server
-
-**Step 2: Run the harness lanes**
-
-```bash
-npm run test:server:standard -- test/unit/visible-first/protocol-harness.test.ts test/unit/visible-first/read-model-route-harness.test.ts test/unit/visible-first/terminal-mirror-fixture.test.ts test/unit/visible-first/cli-command-harness.test.ts
-NODE_ENV=test npx vitest run test/unit/visible-first/app-hydration-harness.test.tsx test/unit/visible-first/slow-network-controller.test.ts
-```
-
-Expected: FAIL because the shared harness modules do not exist yet.
-
-**Step 3: Implement the minimal shared harness foundation**
-
-Keep the shared import surface explicit and stable:
-
-```ts
-import { createProtocolHarness } from '@test/helpers/visible-first/protocol-harness'
-import { createReadModelRouteHarness } from '@test/helpers/visible-first/read-model-route-harness'
-import { createAppHydrationHarness } from '@test/helpers/visible-first/app-hydration-harness'
-import { createSlowNetworkController } from '@test/helpers/visible-first/slow-network-controller'
-import { createTerminalMirrorFixture } from '@test/helpers/visible-first/terminal-mirror-fixture'
-import { createCliCommandHarness } from '@test/helpers/visible-first/cli-command-harness'
-```
-
-These harnesses are the only approved foundation for the later scenario and integration tests in this plan. Extend them when a later seam needs more control; do not fork them into one-off local fixtures.
-
-**Step 4: Re-run the harness lanes**
-
-```bash
-npm run test:server:standard -- test/unit/visible-first/protocol-harness.test.ts test/unit/visible-first/read-model-route-harness.test.ts test/unit/visible-first/terminal-mirror-fixture.test.ts test/unit/visible-first/cli-command-harness.test.ts
-NODE_ENV=test npx vitest run test/unit/visible-first/app-hydration-harness.test.tsx test/unit/visible-first/slow-network-controller.test.ts
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git add test/helpers/visible-first/protocol-harness.ts test/helpers/visible-first/read-model-route-harness.ts test/helpers/visible-first/app-hydration-harness.tsx test/helpers/visible-first/slow-network-controller.ts test/helpers/visible-first/terminal-mirror-fixture.ts test/helpers/visible-first/cli-command-harness.ts test/unit/visible-first/protocol-harness.test.ts test/unit/visible-first/read-model-route-harness.test.ts test/unit/visible-first/app-hydration-harness.test.tsx test/unit/visible-first/slow-network-controller.test.ts test/unit/visible-first/terminal-mirror-fixture.test.ts test/unit/visible-first/cli-command-harness.test.ts
-git commit -m "test(visible-first): add shared transport harness foundation"
-```
-
-### Task 2: Add The Machine-Enforced Audit Gate
-
-**Files:**
-- Create: `test/e2e-browser/perf/visible-first-audit-gate.ts`
-- Create: `scripts/assert-visible-first-audit-gate.ts`
-- Create: `test/unit/lib/visible-first-audit-gate.test.ts`
+- Create: `test/helpers/visible-first/acceptance-contract.ts`
+- Create: `test/unit/visible-first/acceptance-contract.test.ts`
+- Modify: `test/unit/visible-first/protocol-harness.test.ts`
 - Modify: `package.json`
 
-**Step 1: Write the failing gate tests**
+**Step 1: Write the failing acceptance-contract tests**
 
 Cover:
 
-1. both artifacts are validated with `assertVisibleFirstAuditTrusted(...)`
-2. missing scenario/profile pairs fail
-3. positive `mobile_restricted.focusedReadyMs` deltas fail
-4. positive `mobile_restricted.terminalInputToFirstOutputMs` deltas fail for the two terminal scenarios
-5. positive offscreen-before-ready deltas fail for either profile
-6. the CLI prints JSON only and exits non-zero on violations
+1. the forbidden websocket types, capabilities, route strings, and ownership invariants are defined once in a shared helper
+2. transcript assertions deterministically report forbidden message types and forbidden hello capabilities
+3. a narrow scriptable lane exists for the acceptance-contract tests
 
-**Step 2: Run the gate lane**
+**Step 2: Run the acceptance-contract lane**
 
 ```bash
-NODE_ENV=test npx vitest run test/unit/lib/visible-first-audit-gate.test.ts
+npm run test:visible-first:contract
 ```
 
-Expected: FAIL because the helper and CLI do not exist yet.
+Expected: FAIL because the helper and script do not exist yet.
 
-**Step 3: Implement the helper and CLI**
+**Step 3: Implement the minimal shared acceptance-contract helper**
 
-Use this result shape exactly:
+Keep the shared surface explicit:
 
 ```ts
-export type VisibleFirstAuditGateResult = {
-  ok: boolean
-  violations: Array<{
-    scenarioId: string
-    profileId: string
-    metric:
-      | 'focusedReadyMs'
-      | 'terminalInputToFirstOutputMs'
-      | 'offscreenHttpRequestsBeforeReady'
-      | 'offscreenHttpBytesBeforeReady'
-      | 'offscreenWsFramesBeforeReady'
-      | 'offscreenWsBytesBeforeReady'
-    base: number
-    candidate: number
-    delta: number
-  }>
-}
+export const FORBIDDEN_VISIBLE_FIRST_WS_TYPES = [
+  'sessions.updated',
+  'sessions.page',
+  'sessions.patch',
+  'sessions.fetch',
+  'sdk.history',
+  'terminal.list',
+  'terminal.list.response',
+  'terminal.list.updated',
+  'terminal.meta.list',
+  'terminal.meta.list.response',
+] as const
+
+export const FORBIDDEN_VISIBLE_FIRST_CAPABILITIES = [
+  'sessionsPatchV1',
+  'sessionsPaginationV1',
+] as const
 ```
+
+Add a small helper that accepts a transcript plus hello capabilities and returns the forbidden items it found.
 
 Add this script entry:
 
 ```json
-"perf:audit:gate": "tsx scripts/assert-visible-first-audit-gate.ts"
+"test:visible-first:contract": "vitest run test/unit/visible-first/acceptance-contract.test.ts test/unit/visible-first/protocol-harness.test.ts"
 ```
 
-**Step 4: Re-run the gate lane**
+**Step 4: Re-run the acceptance-contract lane**
 
 ```bash
-NODE_ENV=test npx vitest run test/unit/lib/visible-first-audit-gate.test.ts
-```
-
-Expected: PASS.
-
-**Step 5: Smoke the CLI against the trusted baseline**
-
-```bash
-npm run perf:audit:gate -- --base artifacts/perf/visible-first-baseline.pre-cutover.json --candidate artifacts/perf/visible-first-baseline.pre-cutover.json
-```
-
-Expected: JSON only, exit `0`, and `"ok": true`.
-
-**Step 6: Commit**
-
-```bash
-git add test/e2e-browser/perf/visible-first-audit-gate.ts scripts/assert-visible-first-audit-gate.ts test/unit/lib/visible-first-audit-gate.test.ts package.json
-git commit -m "test(perf): add visible-first audit landing gate"
-```
-
-### Task 3: Tighten Shared Read-Model Contracts And API Helpers
-
-**Files:**
-- Modify: `test/unit/client/lib/api.test.ts`
-- Modify: `shared/read-models.ts`
-- Modify: `src/lib/api.ts`
-
-**Step 1: Write the failing API contract tests**
-
-Cover:
-
-1. `getBootstrap`, `getSessionDirectoryPage`, `getTerminalDirectoryPage`, `getAgentTimelinePage`, `getAgentTurnBody`, `getTerminalViewport`, `getTerminalScrollbackPage`, and `searchTerminalView` target only the new route family
-2. each helper forwards `AbortSignal`
-3. session and terminal directory query helpers encode `cursor`, `revision`, `limit`, and `priority` consistently
-4. the old snapshot helper surface is not required by visible-first read paths
-
-**Step 2: Run the API lane**
-
-```bash
-NODE_ENV=test npx vitest run test/unit/client/lib/api.test.ts
-```
-
-Expected: FAIL until the helper surface is aligned to the accepted contracts.
-
-**Step 3: Implement the minimal contract tightening**
-
-Keep `critical` as a server scheduler lane, not a client query value. The public directory queries stay:
-
-```ts
-export const SessionDirectoryQuerySchema = z.object({
-  query: z.string().optional(),
-  cursor: z.string().min(1).optional(),
-  priority: z.enum(['visible', 'background']),
-  revision: z.number().int().nonnegative().optional(),
-  limit: z.number().int().positive().max(50).optional(),
-})
-```
-
-Apply the same rule to `TerminalDirectoryQuerySchema`, and ensure every helper accepts `options?: { signal?: AbortSignal }`.
-
-**Step 4: Re-run the API lane**
-
-```bash
-NODE_ENV=test npx vitest run test/unit/client/lib/api.test.ts
+npm run test:visible-first:contract
 ```
 
 Expected: PASS.
@@ -425,510 +276,65 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add test/unit/client/lib/api.test.ts shared/read-models.ts src/lib/api.ts
-git commit -m "refactor(api): tighten visible-first read-model contracts"
+git add test/helpers/visible-first/acceptance-contract.ts test/unit/visible-first/acceptance-contract.test.ts test/unit/visible-first/protocol-harness.test.ts package.json
+git commit -m "test(visible-first): add shared acceptance contract gate"
 ```
 
-### Task 4: Make `/api/bootstrap` Shell-Only And Budgeted
+### Task 2: Delete Legacy Session Bulk Delivery And `sdk.history`
 
 **Files:**
-- Modify: `test/integration/server/bootstrap-router.test.ts`
-- Modify: `server/index.ts`
-- Modify: `server/shell-bootstrap-router.ts`
-- Modify: `shared/read-models.ts`
-
-**Step 1: Write the failing bootstrap route tests**
-
-Cover:
-
-1. `GET /api/bootstrap` returns only shell-critical first-paint data
-2. it excludes session-directory rows, agent timelines, terminal viewports, terminal directories, version checks, and network diagnostics
-3. the payload remains under `12 * 1024` bytes
-4. auth failures remain clean and do not leak protected data
-
-**Step 2: Run the bootstrap server lane**
-
-```bash
-npm run test:server:standard -- test/integration/server/bootstrap-router.test.ts
-```
-
-Expected: FAIL until the route is shell-only and budgeted.
-
-**Step 3: Implement the minimal bootstrap contract**
-
-Keep the payload shape explicit:
-
-```ts
-type BootstrapPayload = {
-  settings: unknown
-  platform: unknown
-  shell: { authenticated: boolean; ready?: boolean; tasks?: Record<string, boolean> }
-  perf?: { logging: boolean }
-  configFallback?: { reason: string; backupExists: boolean }
-}
-```
-
-Do not include session-directory, timeline, terminal, version, or network payloads.
-
-**Step 4: Re-run the bootstrap server lane**
-
-```bash
-npm run test:server:standard -- test/integration/server/bootstrap-router.test.ts
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git add test/integration/server/bootstrap-router.test.ts server/index.ts server/shell-bootstrap-router.ts shared/read-models.ts
-git commit -m "feat(bootstrap): make shell bootstrap authoritative and bounded"
-```
-
-### Task 5: Make `App.tsx` The Sole WebSocket Owner And Start Focused Hydration Before `ready`
-
-**Files:**
-- Modify: `test/unit/client/components/App.test.tsx`
-- Modify: `test/unit/client/components/App.ws-bootstrap.test.tsx`
-- Modify: `test/unit/client/components/App.ws-extensions.test.tsx`
-- Modify: `test/unit/client/components/App.perf-audit-bootstrap.test.tsx`
-- Modify: `test/unit/client/components/App.lazy-views.test.tsx`
-- Modify: `test/unit/client/components/App.mobile.test.tsx`
-- Modify: `test/unit/client/components/App.mobile-landscape.test.tsx`
-- Modify: `test/unit/client/components/App.swipe-sidebar.test.tsx`
-- Modify: `test/unit/client/components/App.swipe-tabs.test.tsx`
-- Modify: `test/unit/client/components/App.sidebar-resize.test.tsx`
-- Modify: `test/e2e/auth-required-bootstrap-flow.test.tsx`
-- Modify: `test/e2e/mobile-sidebar-fullwidth-flow.test.tsx`
-- Modify: `test/e2e/terminal-font-settings.test.tsx`
-- Modify: `src/App.tsx`
-- Modify: `src/components/SessionView.tsx`
-- Modify: `src/lib/ws-client.ts`
-
-**Step 1: Write the failing app bootstrap tests**
-
-Cover:
-
-1. `App.tsx` performs one shell bootstrap request before it seeds shell state
-2. focused-pane HTTP hydration starts immediately after bootstrap and does not wait for websocket `ready`
-3. `src/App.tsx` is the only caller of `ws.connect()`
-4. `src/components/SessionView.tsx` no longer calls `ws.connect()`
-5. `/api/version` and network diagnostics are background work
-6. offscreen tabs remain idle at startup
-
-**Step 2: Run the app bootstrap lane**
-
-```bash
-NODE_ENV=test npx vitest run test/unit/client/components/App.test.tsx test/unit/client/components/App.ws-bootstrap.test.tsx test/unit/client/components/App.ws-extensions.test.tsx test/unit/client/components/App.perf-audit-bootstrap.test.tsx test/unit/client/components/App.lazy-views.test.tsx test/unit/client/components/App.mobile.test.tsx test/unit/client/components/App.mobile-landscape.test.tsx test/unit/client/components/App.swipe-sidebar.test.tsx test/unit/client/components/App.swipe-tabs.test.tsx test/unit/client/components/App.sidebar-resize.test.tsx test/e2e/auth-required-bootstrap-flow.test.tsx test/e2e/mobile-sidebar-fullwidth-flow.test.tsx test/e2e/terminal-font-settings.test.tsx
-```
-
-Expected: FAIL until startup ownership and ordering are correct.
-
-**Step 3: Implement the minimal bootstrap cutover**
-
-The ordering must be:
-
-```ts
-const bootstrap = await getBootstrap()
-dispatch(seedBootstrap(bootstrap))
-dispatch(hydrateFocusedPaneFromLayout())
-const wsReadyPromise = ws.connect()
-dispatch(hydrateVisibleSurfacesFromLayout())
-void hydrateBackgroundShellData()
-await wsReadyPromise
-```
-
-Only `src/App.tsx` calls `ws.connect()`.
-
-**Step 4: Re-run the app bootstrap lane**
-
-```bash
-NODE_ENV=test npx vitest run test/unit/client/components/App.test.tsx test/unit/client/components/App.ws-bootstrap.test.tsx test/unit/client/components/App.ws-extensions.test.tsx test/unit/client/components/App.perf-audit-bootstrap.test.tsx test/unit/client/components/App.lazy-views.test.tsx test/unit/client/components/App.mobile.test.tsx test/unit/client/components/App.mobile-landscape.test.tsx test/unit/client/components/App.swipe-sidebar.test.tsx test/unit/client/components/App.swipe-tabs.test.tsx test/unit/client/components/App.sidebar-resize.test.tsx test/e2e/auth-required-bootstrap-flow.test.tsx test/e2e/mobile-sidebar-fullwidth-flow.test.tsx test/e2e/terminal-font-settings.test.tsx
-```
-
-Expected: PASS.
-
-**Step 5: Prove `App.tsx` is the only websocket owner**
-
-```bash
-rg -n "ws\\.connect\\(" src
-```
-
-Expected: only `src/App.tsx`.
-
-**Step 6: Commit**
-
-```bash
-git add test/unit/client/components/App.test.tsx test/unit/client/components/App.ws-bootstrap.test.tsx test/unit/client/components/App.ws-extensions.test.tsx test/unit/client/components/App.perf-audit-bootstrap.test.tsx test/unit/client/components/App.lazy-views.test.tsx test/unit/client/components/App.mobile.test.tsx test/unit/client/components/App.mobile-landscape.test.tsx test/unit/client/components/App.swipe-sidebar.test.tsx test/unit/client/components/App.swipe-tabs.test.tsx test/unit/client/components/App.sidebar-resize.test.tsx test/e2e/auth-required-bootstrap-flow.test.tsx test/e2e/mobile-sidebar-fullwidth-flow.test.tsx test/e2e/terminal-font-settings.test.tsx src/App.tsx src/components/SessionView.tsx src/lib/ws-client.ts
-git commit -m "refactor(app): centralize websocket ownership and focused bootstrap hydration"
-```
-
-### Task 6: Finish The Session Directory Query Service
-
-**Files:**
-- Modify: `test/unit/server/session-directory/service.test.ts`
-- Modify: `server/session-directory/service.ts`
-- Modify: `server/session-directory/types.ts`
-
-**Step 1: Write the failing session-directory service tests**
-
-Cover:
-
-1. canonical server-owned ordering
-2. server-side title and snippet search
-3. bounded snippets and bounded page size
-4. deterministic cursor rejection
-5. joined running metadata needed by the visible directory window
-
-**Step 2: Run the session-directory service lane**
-
-```bash
-npm run test:server:standard -- test/unit/server/session-directory/service.test.ts
-```
-
-Expected: FAIL until the service fully owns the query shape.
-
-**Step 3: Implement the minimal service contract**
-
-Keep the service boundary explicit:
-
-```ts
-type SessionDirectoryQuery = {
-  query?: string
-  cursor?: string
-  limit?: number
-  priority: 'visible' | 'background'
-  revision?: number
-}
-```
-
-The service returns only a window plus `nextCursor` and `revision`.
-
-**Step 4: Re-run the session-directory service lane**
-
-```bash
-npm run test:server:standard -- test/unit/server/session-directory/service.test.ts
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git add test/unit/server/session-directory/service.test.ts server/session-directory/service.ts server/session-directory/types.ts
-git commit -m "feat(session-directory): finish authoritative query service"
-```
-
-### Task 7: Make `/api/session-directory` The Only Read-Model Authority
-
-**Files:**
-- Modify: `test/integration/server/session-directory-router.test.ts`
-- Modify: `test/unit/server/sessions-router-pagination.test.ts`
-- Delete: `test/integration/session-search-e2e.test.ts`
-- Modify: `server/index.ts`
-- Modify: `server/sessions-router.ts`
-- Modify: `server/session-pagination.ts`
-- Delete: `server/routes/sessions.ts`
-
-**Step 1: Write the failing session-directory route tests**
-
-Cover:
-
-1. `GET /api/session-directory` is the only list/search read-model route
-2. query validation accepts only the visible-first cursor window contract
-3. `/api/sessions/search` and `/api/sessions/query` are gone as runtime read paths
-4. mutation routes remain separate from the read-model authority
-
-**Step 2: Run the session-directory route lane**
-
-```bash
-npm run test:server:standard -- test/integration/server/session-directory-router.test.ts test/unit/server/sessions-router-pagination.test.ts
-```
-
-Expected: FAIL until the route family is authoritative.
-
-**Step 3: Implement the minimal route cutover**
-
-Keep the public route surface explicit:
-
-```ts
-GET /api/session-directory
-PATCH /api/sessions/:sessionId
-DELETE /api/sessions/:sessionId
-```
-
-Do not keep `/api/sessions/search` or `/api/sessions/query` alive through alias routes.
-
-**Step 4: Re-run the session-directory route lane**
-
-```bash
-npm run test:server:standard -- test/integration/server/session-directory-router.test.ts test/unit/server/sessions-router-pagination.test.ts
-```
-
-Expected: PASS.
-
-**Step 5: Prove the shadow read-model routes are gone**
-
-```bash
-rg -n "/api/sessions/search|/api/sessions/query" server src
-```
-
-Expected: no matches.
-
-**Step 6: Commit**
-
-```bash
-git add test/integration/server/session-directory-router.test.ts test/unit/server/sessions-router-pagination.test.ts server/index.ts server/sessions-router.ts server/session-pagination.ts
-git rm test/integration/session-search-e2e.test.ts server/routes/sessions.ts
-git commit -m "feat(session-directory): make session-directory routes authoritative"
-```
-
-### Task 8: Move The CLI To The Session Directory Contract
-
-**Files:**
-- Modify: `test/unit/cli/http.test.ts`
-- Modify: `test/unit/cli/commands.test.ts`
-- Modify: `server/cli/index.ts`
-
-**Step 1: Write the failing CLI tests**
-
-Cover:
-
-1. `list-sessions` calls the session-directory contract
-2. `search-sessions` calls the session-directory contract family, not legacy snapshot routes
-3. user-visible CLI output remains stable
-
-**Step 2: Run the CLI lane**
-
-```bash
-NODE_ENV=test npx vitest run test/unit/cli/http.test.ts test/unit/cli/commands.test.ts
-```
-
-Expected: FAIL until the CLI stops depending on `/api/sessions` and `/api/sessions/search`.
-
-**Step 3: Implement the minimal CLI cutover**
-
-Reuse the server-owned window contract. Do not keep separate CLI-only read paths.
-
-**Step 4: Re-run the CLI lane**
-
-```bash
-NODE_ENV=test npx vitest run test/unit/cli/http.test.ts test/unit/cli/commands.test.ts
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git add test/unit/cli/http.test.ts test/unit/cli/commands.test.ts server/cli/index.ts
-git commit -m "refactor(cli): use visible-first session-directory routes"
-```
-
-### Task 9: Move Session Window Hydration Into Store-Owned Visible Intents
-
-**Files:**
-- Modify: `test/unit/client/components/Sidebar.test.tsx`
-- Modify: `test/unit/client/components/Sidebar.mobile.test.tsx`
-- Modify: `test/unit/client/components/BackgroundSessions.test.tsx`
-- Modify: `test/unit/client/components/HistoryView.mobile.test.tsx`
-- Modify: `test/unit/client/components/HistoryView.a11y.test.tsx`
-- Modify: `test/unit/client/components/Sidebar.perf-audit.test.tsx`
-- Modify: `test/unit/client/store/sessionsSlice.test.ts`
-- Modify: `test/unit/client/store/sessionsThunks.test.ts`
-- Modify: `test/unit/client/store/selectors/sidebarSelectors.test.ts`
-- Modify: `test/unit/client/store/selectors/sidebarSelectors.visibility.test.ts`
-- Modify: `src/components/Sidebar.tsx`
-- Modify: `src/components/OverviewView.tsx`
-- Modify: `src/components/BackgroundSessions.tsx`
-- Modify: `src/components/HistoryView.tsx`
-- Modify: `src/store/sessionsSlice.ts`
-- Modify: `src/store/sessionsThunks.ts`
-- Modify: `src/store/selectors/sidebarSelectors.ts`
-
-**Step 1: Write the failing visible-window tests**
-
-Cover:
-
-1. sidebar and history fetch only when visible
-2. background surfaces use windowed session-directory refresh instead of full snapshots
-3. search and load-more are thunk-owned window operations
-4. leaf components do not construct session-directory URLs directly
-
-**Step 2: Run the session window lane**
-
-```bash
-NODE_ENV=test npx vitest run test/unit/client/components/Sidebar.test.tsx test/unit/client/components/Sidebar.mobile.test.tsx test/unit/client/components/BackgroundSessions.test.tsx test/unit/client/components/HistoryView.mobile.test.tsx test/unit/client/components/HistoryView.a11y.test.tsx test/unit/client/components/Sidebar.perf-audit.test.tsx test/unit/client/store/sessionsSlice.test.ts test/unit/client/store/sessionsThunks.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/store/selectors/sidebarSelectors.visibility.test.ts
-```
-
-Expected: FAIL until the store owns visible-window orchestration.
-
-**Step 3: Implement the minimal store-owned window model**
-
-Collapse component intent to a thunk call like:
-
-```ts
-dispatch(fetchSessionWindow({
-  surface: 'sidebar',
-  priority: 'visible',
-  query,
-  cursor,
-}))
-```
-
-Leaf components may dispatch intents. They may not own fetch cancellation, route construction, or invalidation sequencing.
-
-**Step 4: Re-run the session window lane**
-
-```bash
-NODE_ENV=test npx vitest run test/unit/client/components/Sidebar.test.tsx test/unit/client/components/Sidebar.mobile.test.tsx test/unit/client/components/BackgroundSessions.test.tsx test/unit/client/components/HistoryView.mobile.test.tsx test/unit/client/components/HistoryView.a11y.test.tsx test/unit/client/components/Sidebar.perf-audit.test.tsx test/unit/client/store/sessionsSlice.test.ts test/unit/client/store/sessionsThunks.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/store/selectors/sidebarSelectors.visibility.test.ts
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git add test/unit/client/components/Sidebar.test.tsx test/unit/client/components/Sidebar.mobile.test.tsx test/unit/client/components/BackgroundSessions.test.tsx test/unit/client/components/HistoryView.mobile.test.tsx test/unit/client/components/HistoryView.a11y.test.tsx test/unit/client/components/Sidebar.perf-audit.test.tsx test/unit/client/store/sessionsSlice.test.ts test/unit/client/store/sessionsThunks.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/store/selectors/sidebarSelectors.visibility.test.ts src/components/Sidebar.tsx src/components/OverviewView.tsx src/components/BackgroundSessions.tsx src/components/HistoryView.tsx src/store/sessionsSlice.ts src/store/sessionsThunks.ts src/store/selectors/sidebarSelectors.ts
-git commit -m "refactor(session-ui): hydrate only visible session windows"
-```
-
-### Task 10: Scope Session Mutation Refresh To The Active Window
-
-**Files:**
-- Modify: `test/unit/client/components/ContextMenuProvider.test.tsx`
-- Modify: `test/e2e/open-tab-session-sidebar-visibility.test.tsx`
-- Modify: `test/e2e/sidebar-click-opens-pane.test.tsx`
-- Modify: `src/components/context-menu/ContextMenuProvider.tsx`
-- Modify: `src/store/sessionsSlice.ts`
-- Modify: `src/store/sessionsThunks.ts`
-
-**Step 1: Write the failing mutation refresh tests**
-
-Cover:
-
-1. rename, archive, and delete refresh only the active session window
-2. no mutation flow triggers a full `/api/sessions` reload
-3. visible selection stays stable after the targeted refresh
-
-**Step 2: Run the session mutation lane**
-
-```bash
-NODE_ENV=test npx vitest run test/unit/client/components/ContextMenuProvider.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx test/e2e/sidebar-click-opens-pane.test.tsx
-```
-
-Expected: FAIL until mutation refresh is window-scoped.
-
-**Step 3: Implement the minimal targeted refresh behavior**
-
-Use the active query window revision or cursor context to refetch only the visible window after a successful mutation.
-
-**Step 4: Re-run the session mutation lane**
-
-```bash
-NODE_ENV=test npx vitest run test/unit/client/components/ContextMenuProvider.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx test/e2e/sidebar-click-opens-pane.test.tsx
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git add test/unit/client/components/ContextMenuProvider.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx test/e2e/sidebar-click-opens-pane.test.tsx src/components/context-menu/ContextMenuProvider.tsx src/store/sessionsSlice.ts src/store/sessionsThunks.ts
-git commit -m "fix(session-ui): scope mutation refresh to the active window"
-```
-
-### Task 11: Finish The Agent Timeline Server Read Model
-
-**Files:**
-- Modify: `test/integration/server/agent-timeline-router.test.ts`
-- Modify: `test/unit/server/agent-timeline/service.test.ts`
-- Modify: `server/index.ts`
-- Modify: `server/agent-timeline/router.ts`
-- Modify: `server/agent-timeline/service.ts`
-- Modify: `server/agent-timeline/types.ts`
-
-**Step 1: Write the failing agent timeline tests**
-
-Cover:
-
-1. timeline pages are recent-first and cursorable
-2. turn bodies hydrate on demand
-3. route contracts are sufficient for reload without replay arrays
-
-**Step 2: Run the agent timeline server lane**
-
-```bash
-npm run test:server:standard -- test/integration/server/agent-timeline-router.test.ts test/unit/server/agent-timeline/service.test.ts
-```
-
-Expected: FAIL until the server fully owns the visible timeline model.
-
-**Step 3: Implement the minimal route family**
-
-Keep the route surface explicit:
-
-```ts
-GET /api/agent-sessions/:sessionId/timeline
-GET /api/agent-sessions/:sessionId/turns/:turnId
-```
-
-Timeline pages return summaries and cursors only. Turn bodies return full content on demand.
-
-**Step 4: Re-run the agent timeline server lane**
-
-```bash
-npm run test:server:standard -- test/integration/server/agent-timeline-router.test.ts test/unit/server/agent-timeline/service.test.ts
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git add test/integration/server/agent-timeline-router.test.ts test/unit/server/agent-timeline/service.test.ts server/index.ts server/agent-timeline/router.ts server/agent-timeline/service.ts server/agent-timeline/types.ts
-git commit -m "feat(agent-timeline): finish recent-first timeline read model"
-```
-
-### Task 12: Restore Agent Chat From Snapshot Plus Visible Timeline Windows
-
-**Files:**
-- Modify: `test/unit/client/agentChatSlice.test.ts`
-- Modify: `test/unit/client/store/agentChatThunks.test.ts`
+- Modify: `test/server/ws-sidebar-snapshot-refresh.test.ts`
+- Modify: `test/unit/server/sessions-sync/service.test.ts`
+- Modify: `test/unit/server/ws-handler-sdk.test.ts`
+- Modify: `test/unit/server/session-history-loader.test.ts`
 - Modify: `test/unit/client/sdk-message-handler.test.ts`
 - Modify: `test/unit/client/lib/sdk-message-handler.session-lost.test.ts`
+- Modify: `test/unit/client/agentChatSlice.test.ts`
+- Modify: `test/unit/client/store/agentChatThunks.test.ts`
 - Modify: `test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx`
 - Modify: `test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx`
+- Modify: `test/unit/client/components/App.ws-bootstrap.test.tsx`
+- Delete: `test/server/ws-sessions-patch.test.ts`
+- Delete: `test/unit/server/ws-chunking.test.ts`
+- Modify: `server/ws-handler.ts`
+- Modify: `server/session-history-loader.ts`
+- Modify: `server/sessions-sync/service.ts`
+- Delete: `server/ws-chunking.ts`
+- Modify: `src/App.tsx`
+- Modify: `src/lib/sdk-message-handler.ts`
 - Modify: `src/store/agentChatTypes.ts`
 - Modify: `src/store/agentChatSlice.ts`
 - Modify: `src/store/agentChatThunks.ts`
-- Modify: `src/lib/sdk-message-handler.ts`
-- Modify: `src/components/agent-chat/AgentChatView.tsx`
-- Modify: `src/components/agent-chat/CollapsedTurn.tsx`
-- Modify: `src/components/TabContent.tsx`
-- Modify: `server/ws-handler.ts`
 
-**Step 1: Write the failing agent chat client tests**
+**Pre-approved split if the red proof exposes two seams:**
+
+1. `Task 2A`: remove `sessions.updated`, `sessions.page`, `sessions.patch`, and chunking
+2. `Task 2B`: remove `sdk.history` compatibility from server and client restore flows
+
+If split, finish `Task 2A` fully green before `Task 2B`.
+
+**Step 1: Write the failing cleanup tests**
 
 Cover:
 
-1. `sdk.session.snapshot` plus HTTP timeline pages restore reloads and split-pane remounts
-2. hidden panes do not prefetch timeline pages
-3. expanding older turns fetches bodies on demand
-4. session switches abort stale requests
-5. no runtime path waits for `sdk.history`
+1. successful startup transcripts never emit `sessions.updated`, `sessions.page`, or `sessions.patch`
+2. agent-session attach and reload never emit or consume `sdk.history`
+3. `src/App.tsx` no longer buffers or applies legacy session bulk messages
+4. positive legacy patch or chunking tests are deleted rather than preserved as compatibility debt
 
-**Step 2: Run the agent chat lane**
+**Step 2: Run the session and SDK cleanup lane**
 
 ```bash
-NODE_ENV=test npx vitest run test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/sdk-message-handler.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx
+npm run test:server:standard -- test/server/ws-sidebar-snapshot-refresh.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/session-history-loader.test.ts
+NODE_ENV=test npx vitest run test/unit/client/sdk-message-handler.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx test/unit/client/components/App.ws-bootstrap.test.tsx
+npm run test:visible-first:contract
 ```
 
-Expected: FAIL until snapshot-plus-window restore is authoritative.
+Expected: FAIL until the legacy session and SDK bulk paths are gone.
 
-**Step 3: Implement the minimal client model**
+**Step 3: Implement the minimal deletion**
 
-Keep the websocket attach snapshot small and structural:
+The surviving agent restore model stays:
 
 ```ts
 type SdkSessionSnapshotMessage = {
@@ -939,97 +345,35 @@ type SdkSessionSnapshotMessage = {
 }
 ```
 
-Store turn summaries separately from hydrated turn bodies.
+Session browsing refreshes through the existing HTTP window model, not websocket bulk snapshots. Delete chunking instead of keeping a dormant helper.
 
-**Step 4: Re-run the agent chat lane**
+**Step 4: Re-run the session and SDK cleanup lane**
 
 ```bash
-NODE_ENV=test npx vitest run test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/sdk-message-handler.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx
+npm run test:server:standard -- test/server/ws-sidebar-snapshot-refresh.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/session-history-loader.test.ts
+NODE_ENV=test npx vitest run test/unit/client/sdk-message-handler.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx test/unit/client/components/App.ws-bootstrap.test.tsx
+npm run test:visible-first:contract
 ```
 
 Expected: PASS.
 
-**Step 5: Commit**
+**Step 5: Prove the legacy session and SDK strings are gone from production code**
 
 ```bash
-git add test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/sdk-message-handler.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx src/store/agentChatTypes.ts src/store/agentChatSlice.ts src/store/agentChatThunks.ts src/lib/sdk-message-handler.ts src/components/agent-chat/AgentChatView.tsx src/components/agent-chat/CollapsedTurn.tsx src/components/TabContent.tsx server/ws-handler.ts
-git commit -m "feat(agent-chat): restore from snapshots and visible timeline windows"
+rg -n "sessions\\.updated|sessions\\.page|sessions\\.patch|sdk\\.history" shared server src
 ```
 
-### Task 13: Finish The Terminal Directory, Viewport, Scrollback, And Search Routes
+Expected: no matches.
 
-**Files:**
-- Modify: `test/integration/server/terminal-view-router.test.ts`
-- Modify: `test/server/terminals-api.test.ts`
-- Modify: `test/unit/server/terminal-view/mirror.test.ts`
-- Modify: `test/unit/server/terminal-stream/replay-ring.test.ts`
-- Modify: `server/index.ts`
-- Modify: `server/terminals-router.ts`
-- Modify: `server/terminal-view/service.ts`
-- Modify: `server/terminal-view/types.ts`
-- Modify: `server/terminal-view/mirror.ts`
-
-**Pre-approved split if the red proof exposes multiple seams:**
-
-1. `Task 13A`: terminal directory plus viewport contract (`test/integration/server/terminal-view-router.test.ts`, `test/server/terminals-api.test.ts`, `test/unit/server/terminal-view/mirror.test.ts`, `server/index.ts`, `server/terminals-router.ts`, `server/terminal-view/service.ts`, `server/terminal-view/types.ts`, `server/terminal-view/mirror.ts`)
-2. `Task 13B`: terminal scrollback plus search plus replay-anchor determinism (`test/integration/server/terminal-view-router.test.ts`, `test/server/terminals-api.test.ts`, `test/unit/server/terminal-stream/replay-ring.test.ts`, `server/index.ts`, `server/terminals-router.ts`, `server/terminal-view/service.ts`, `server/terminal-view/types.ts`, `server/terminal-view/mirror.ts`)
-
-If the split is used, run `Task 13A` fully green before starting `Task 13B`.
-
-**Step 1: Write the failing terminal route tests**
-
-Cover:
-
-1. directory, viewport, scrollback, and search stay separate routes
-2. viewport responses include `tailSeq` and runtime metadata
-3. search is server-side only
-4. replay anchor behavior remains deterministic
-
-**Step 2: Run the terminal route lane**
+**Step 6: Commit**
 
 ```bash
-npm run test:server:standard -- test/integration/server/terminal-view-router.test.ts test/server/terminals-api.test.ts test/unit/server/terminal-view/mirror.test.ts test/unit/server/terminal-stream/replay-ring.test.ts
+git add test/server/ws-sidebar-snapshot-refresh.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/session-history-loader.test.ts test/unit/client/sdk-message-handler.test.ts test/unit/client/lib/sdk-message-handler.session-lost.test.ts test/unit/client/agentChatSlice.test.ts test/unit/client/store/agentChatThunks.test.ts test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx test/unit/client/components/App.ws-bootstrap.test.tsx server/ws-handler.ts server/session-history-loader.ts server/sessions-sync/service.ts src/App.tsx src/lib/sdk-message-handler.ts src/store/agentChatTypes.ts src/store/agentChatSlice.ts src/store/agentChatThunks.ts
+git rm test/server/ws-sessions-patch.test.ts test/unit/server/ws-chunking.test.ts server/ws-chunking.ts
+git commit -m "refactor(protocol): delete legacy session bulk delivery and sdk history"
 ```
 
-Expected: FAIL until the terminal route family is authoritative.
-
-**Step 3: Implement the minimal terminal route contract**
-
-Use this viewport shape:
-
-```ts
-export type TerminalViewportSnapshot = {
-  terminalId: string
-  revision: number
-  serialized: string
-  cols: number
-  rows: number
-  tailSeq: number
-  runtime: {
-    title: string
-    status: 'running' | 'detached' | 'exited'
-    cwd?: string
-    pid?: number
-  }
-}
-```
-
-**Step 4: Re-run the terminal route lane**
-
-```bash
-npm run test:server:standard -- test/integration/server/terminal-view-router.test.ts test/server/terminals-api.test.ts test/unit/server/terminal-view/mirror.test.ts test/unit/server/terminal-stream/replay-ring.test.ts
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git add test/integration/server/terminal-view-router.test.ts test/server/terminals-api.test.ts test/unit/server/terminal-view/mirror.test.ts test/unit/server/terminal-stream/replay-ring.test.ts server/index.ts server/terminals-router.ts server/terminal-view/service.ts server/terminal-view/types.ts server/terminal-view/mirror.ts
-git commit -m "feat(terminal-server): finish visible-first terminal routes"
-```
-
-### Task 14: Make Terminal Invalidations And Runtime Deltas Authoritative
+### Task 3: Delete Legacy Terminal Commands, Terminal Meta Messages, And Hello Capabilities
 
 **Files:**
 - Modify: `test/server/ws-terminal-meta.test.ts`
@@ -1037,31 +381,58 @@ git commit -m "feat(terminal-server): finish visible-first terminal routes"
 - Modify: `test/server/ws-terminal-create-reuse-running-claude.test.ts`
 - Modify: `test/server/ws-terminal-create-reuse-running-codex.test.ts`
 - Modify: `test/server/ws-terminal-stream-v2-replay.test.ts`
+- Modify: `test/server/ws-protocol.test.ts`
+- Modify: `test/server/ws-edge-cases.test.ts`
+- Modify: `test/server/ws-handshake-snapshot.test.ts`
+- Modify: `test/unit/client/lib/ws-client.test.ts`
+- Modify: `test/unit/client/components/App.ws-bootstrap.test.tsx`
 - Modify: `shared/ws-protocol.ts`
 - Modify: `server/ws-handler.ts`
-- Modify: `server/terminal-stream/broker.ts`
+- Modify: `server/terminals-router.ts`
+- Modify: `server/sessions-router.ts`
+- Modify: `server/agent-api/router.ts`
 - Delete: `server/routes/terminals.ts`
+- Modify: `src/App.tsx`
+- Modify: `src/lib/ws-client.ts`
+- Modify: `src/components/OverviewView.tsx`
 
-**Step 1: Write the failing terminal invalidation tests**
+**Pre-approved split if the red proof exposes two seams:**
+
+1. `Task 3A`: remove legacy hello capabilities and client commands
+2. `Task 3B`: remove terminal list or meta compatibility messages and listeners
+
+If split, finish `Task 3A` fully green before `Task 3B`.
+
+**Step 1: Write the failing protocol cleanup tests**
 
 Cover:
 
-1. directory-affecting mutations emit `terminals.changed`
-2. already-hydrated visible terminals update through `terminal.runtime.updated`
-3. runtime recovery uses the short tail rather than a global snapshot
-4. no surviving path requires `terminal.list.updated` or `terminal.meta.list`
+1. `hello.capabilities` no longer advertises `sessionsPatchV1` or `sessionsPaginationV1`
+2. the client and server reject `sessions.fetch`, `terminal.list`, and `terminal.meta.list`
+3. terminal mutations emit only the surviving tiny invalidations and runtime deltas
+4. `src/App.tsx` and `src/components/OverviewView.tsx` no longer request or consume `terminal.meta.list*` or `terminal.list.updated`
 
-**Step 2: Run the terminal invalidation lane**
+**Step 2: Run the protocol cleanup lane**
 
 ```bash
-npm run test:server:standard -- test/server/ws-terminal-meta.test.ts test/server/ws-terminal-create-session-repair.test.ts test/server/ws-terminal-create-reuse-running-claude.test.ts test/server/ws-terminal-create-reuse-running-codex.test.ts test/server/ws-terminal-stream-v2-replay.test.ts
+npm run test:server:standard -- test/server/ws-terminal-meta.test.ts test/server/ws-terminal-create-session-repair.test.ts test/server/ws-terminal-create-reuse-running-claude.test.ts test/server/ws-terminal-create-reuse-running-codex.test.ts test/server/ws-terminal-stream-v2-replay.test.ts test/server/ws-protocol.test.ts test/server/ws-edge-cases.test.ts test/server/ws-handshake-snapshot.test.ts
+NODE_ENV=test npx vitest run test/unit/client/lib/ws-client.test.ts test/unit/client/components/App.ws-bootstrap.test.tsx
+npm run test:visible-first:contract
 ```
 
-Expected: FAIL until terminal invalidation and replay behavior are fully cut over.
+Expected: FAIL until the remaining legacy protocol entries are gone.
 
-**Step 3: Implement the minimal websocket/runtime contract**
+**Step 3: Implement the minimal protocol cleanup**
 
-The surviving messages are:
+Keep the handshake narrow:
+
+```ts
+type HelloCapabilities = {
+  uiScreenshotV1?: boolean
+}
+```
+
+Keep the surviving terminal notifications narrow:
 
 ```ts
 type TerminalsChangedMessage = { type: 'terminals.changed'; revision: number }
@@ -1077,217 +448,39 @@ type TerminalRuntimeUpdatedMessage = {
 }
 ```
 
-Delete `server/routes/terminals.ts` instead of keeping duplicate routing alive.
+Delete the shared union members and route aliases instead of leaving them dormant.
 
-**Step 4: Re-run the terminal invalidation lane**
+**Step 4: Re-run the protocol cleanup lane**
 
 ```bash
-npm run test:server:standard -- test/server/ws-terminal-meta.test.ts test/server/ws-terminal-create-session-repair.test.ts test/server/ws-terminal-create-reuse-running-claude.test.ts test/server/ws-terminal-create-reuse-running-codex.test.ts test/server/ws-terminal-stream-v2-replay.test.ts
+npm run test:server:standard -- test/server/ws-terminal-meta.test.ts test/server/ws-terminal-create-session-repair.test.ts test/server/ws-terminal-create-reuse-running-claude.test.ts test/server/ws-terminal-create-reuse-running-codex.test.ts test/server/ws-terminal-stream-v2-replay.test.ts test/server/ws-protocol.test.ts test/server/ws-edge-cases.test.ts test/server/ws-handshake-snapshot.test.ts
+NODE_ENV=test npx vitest run test/unit/client/lib/ws-client.test.ts test/unit/client/components/App.ws-bootstrap.test.tsx
+npm run test:visible-first:contract
 ```
 
 Expected: PASS.
 
-**Step 5: Commit**
+**Step 5: Prove the legacy terminal and capability strings are gone**
 
 ```bash
-git add test/server/ws-terminal-meta.test.ts test/server/ws-terminal-create-session-repair.test.ts test/server/ws-terminal-create-reuse-running-claude.test.ts test/server/ws-terminal-create-reuse-running-codex.test.ts test/server/ws-terminal-stream-v2-replay.test.ts shared/ws-protocol.ts server/ws-handler.ts server/terminal-stream/broker.ts
-git rm server/routes/terminals.ts
-git commit -m "feat(terminal-server): switch to targeted invalidations and runtime deltas"
+rg -n "terminal\\.list(\\.updated|\\.response)?|terminal\\.meta\\.list(\\.response)?|sessions\\.fetch|sessionsPatchV1|sessionsPaginationV1" shared server src
+rg -n "ws\\.connect\\(" src
 ```
 
-### Task 15: Paint Terminals Viewport-First
+Expected:
 
-**Files:**
-- Modify: `test/unit/client/components/TerminalView.lifecycle.test.tsx`
-- Modify: `test/unit/client/components/TerminalView.resumeSession.test.tsx`
-- Modify: `test/unit/client/components/TerminalView.mobile-viewport.test.tsx`
-- Modify: `test/unit/client/components/TerminalView.visibility.test.tsx`
-- Modify: `test/unit/client/components/component-edge-cases.test.tsx`
-- Modify: `test/e2e/pane-header-runtime-meta-flow.test.tsx`
-- Modify: `test/e2e/terminal-flaky-network-responsiveness.test.tsx`
-- Modify: `src/components/TerminalView.tsx`
-- Modify: `src/lib/terminal-attach-seq-state.ts`
-- Modify: `src/lib/terminal-restore.ts`
-- Modify: `src/store/terminalMetaSlice.ts`
-- Modify: `src/store/store.ts`
-
-**Step 1: Write the failing viewport-first terminal tests**
-
-Cover:
-
-1. HTTP viewport paints before websocket replay or `ready`
-2. attach uses `sinceSeq = tailSeq`
-3. reconnect overflow yields a gap/invalidation path instead of replaying the full backlog
-4. pane chrome is seeded from viewport runtime metadata
-
-**Step 2: Run the viewport-first client lane**
-
-```bash
-NODE_ENV=test npx vitest run test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/components/TerminalView.mobile-viewport.test.tsx test/unit/client/components/TerminalView.visibility.test.tsx test/unit/client/components/component-edge-cases.test.tsx test/e2e/pane-header-runtime-meta-flow.test.tsx test/e2e/terminal-flaky-network-responsiveness.test.tsx
-```
-
-Expected: FAIL until the client paints viewport-first.
-
-**Step 3: Implement the minimal restore order**
-
-The restore order is fixed:
-
-1. fetch viewport
-2. paint viewport
-3. attach with `sinceSeq = tailSeq`
-4. apply only the short missed tail
-
-**Step 4: Re-run the viewport-first client lane**
-
-```bash
-NODE_ENV=test npx vitest run test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/components/TerminalView.mobile-viewport.test.tsx test/unit/client/components/TerminalView.visibility.test.tsx test/unit/client/components/component-edge-cases.test.tsx test/e2e/pane-header-runtime-meta-flow.test.tsx test/e2e/terminal-flaky-network-responsiveness.test.tsx
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git add test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/TerminalView.resumeSession.test.tsx test/unit/client/components/TerminalView.mobile-viewport.test.tsx test/unit/client/components/TerminalView.visibility.test.tsx test/unit/client/components/component-edge-cases.test.tsx test/e2e/pane-header-runtime-meta-flow.test.tsx test/e2e/terminal-flaky-network-responsiveness.test.tsx src/components/TerminalView.tsx src/lib/terminal-attach-seq-state.ts src/lib/terminal-restore.ts src/store/terminalMetaSlice.ts src/store/store.ts
-git commit -m "feat(terminal-client): paint viewport first and recover from tailSeq"
-```
-
-### Task 16: Move Terminal Directory Surfaces And Search To Store-Owned HTTP
-
-**Files:**
-- Create: `test/unit/client/store/terminalDirectorySlice.test.ts`
-- Create: `test/unit/client/store/terminalDirectoryThunks.test.ts`
-- Modify: `test/unit/client/components/Sidebar.test.tsx`
-- Modify: `test/unit/client/components/Sidebar.mobile.test.tsx`
-- Modify: `test/unit/client/components/BackgroundSessions.test.tsx`
-- Modify: `test/unit/client/components/TerminalView.search.test.tsx`
-- Modify: `test/unit/client/components/terminal/terminal-runtime.test.ts`
-- Modify: `test/unit/client/components/terminal/TerminalSearchBar.mobile.test.tsx`
-- Modify: `src/components/Sidebar.tsx`
-- Modify: `src/components/OverviewView.tsx`
-- Modify: `src/components/BackgroundSessions.tsx`
-- Modify: `src/components/terminal/terminal-runtime.ts`
-- Modify: `src/components/terminal/TerminalSearchBar.tsx`
-- Modify: `src/store/terminalDirectorySlice.ts`
-- Modify: `src/store/terminalDirectoryThunks.ts`
-
-**Step 1: Write the failing terminal directory/search tests**
-
-Cover:
-
-1. visible terminal-directory surfaces fetch only through store-owned thunks
-2. hidden or offscreen terminal surfaces do not prehydrate
-3. terminal search goes to `/api/terminals/:terminalId/search`
-4. client-side `SearchAddon` is no longer required
-
-**Step 2: Run the terminal directory/search lane**
-
-```bash
-NODE_ENV=test npx vitest run test/unit/client/store/terminalDirectorySlice.test.ts test/unit/client/store/terminalDirectoryThunks.test.ts test/unit/client/components/Sidebar.test.tsx test/unit/client/components/Sidebar.mobile.test.tsx test/unit/client/components/BackgroundSessions.test.tsx test/unit/client/components/TerminalView.search.test.tsx test/unit/client/components/terminal/terminal-runtime.test.ts test/unit/client/components/terminal/TerminalSearchBar.mobile.test.tsx
-```
-
-Expected: FAIL until directory ownership and server-side search are complete.
-
-**Step 3: Implement the minimal store-owned directory/search model**
-
-Collapse component intent to a thunk call like:
-
-```ts
-dispatch(fetchTerminalDirectoryWindow({
-  priority: 'visible',
-  cursor,
-}))
-```
-
-Delete `SearchAddon` usage from `src/components/terminal/terminal-runtime.ts`.
-
-**Step 4: Re-run the terminal directory/search lane**
-
-```bash
-NODE_ENV=test npx vitest run test/unit/client/store/terminalDirectorySlice.test.ts test/unit/client/store/terminalDirectoryThunks.test.ts test/unit/client/components/Sidebar.test.tsx test/unit/client/components/Sidebar.mobile.test.tsx test/unit/client/components/BackgroundSessions.test.tsx test/unit/client/components/TerminalView.search.test.tsx test/unit/client/components/terminal/terminal-runtime.test.ts test/unit/client/components/terminal/TerminalSearchBar.mobile.test.tsx
-```
-
-Expected: PASS.
-
-**Step 5: Prove the old client-search and terminal list strings are gone from runtime code**
-
-```bash
-rg -n "SearchAddon|terminal\\.meta\\.list|terminal\\.list\\.updated" src server
-```
-
-Expected: no matches for `SearchAddon` and no surviving legacy terminal list/meta strings in active runtime code.
+1. first command: no matches
+2. second command: only `src/App.tsx`
 
 **Step 6: Commit**
 
 ```bash
-git add test/unit/client/store/terminalDirectorySlice.test.ts test/unit/client/store/terminalDirectoryThunks.test.ts test/unit/client/components/Sidebar.test.tsx test/unit/client/components/Sidebar.mobile.test.tsx test/unit/client/components/BackgroundSessions.test.tsx test/unit/client/components/TerminalView.search.test.tsx test/unit/client/components/terminal/terminal-runtime.test.ts test/unit/client/components/terminal/TerminalSearchBar.mobile.test.tsx src/components/Sidebar.tsx src/components/OverviewView.tsx src/components/BackgroundSessions.tsx src/components/terminal/terminal-runtime.ts src/components/terminal/TerminalSearchBar.tsx src/store/terminalDirectorySlice.ts src/store/terminalDirectoryThunks.ts
-git commit -m "refactor(terminal-ui): move directory and search to store-owned HTTP"
+git add test/server/ws-terminal-meta.test.ts test/server/ws-terminal-create-session-repair.test.ts test/server/ws-terminal-create-reuse-running-claude.test.ts test/server/ws-terminal-create-reuse-running-codex.test.ts test/server/ws-terminal-stream-v2-replay.test.ts test/server/ws-protocol.test.ts test/server/ws-edge-cases.test.ts test/server/ws-handshake-snapshot.test.ts test/unit/client/lib/ws-client.test.ts test/unit/client/components/App.ws-bootstrap.test.tsx shared/ws-protocol.ts server/ws-handler.ts server/terminals-router.ts server/sessions-router.ts server/agent-api/router.ts src/App.tsx src/lib/ws-client.ts src/components/OverviewView.tsx
+git rm server/routes/terminals.ts
+git commit -m "refactor(protocol): remove legacy terminal commands and capabilities"
 ```
 
-### Task 17: Enforce Shared Lane Ordering And Abort Propagation
-
-**Files:**
-- Modify: `test/unit/server/read-models/work-scheduler.test.ts`
-- Modify: `test/integration/server/bootstrap-router.test.ts`
-- Modify: `test/integration/server/session-directory-router.test.ts`
-- Modify: `test/integration/server/terminal-view-router.test.ts`
-- Modify: `shared/read-models.ts`
-- Modify: `server/read-models/work-scheduler.ts`
-- Modify: `server/read-models/request-abort.ts`
-- Modify: `server/shell-bootstrap-router.ts`
-- Modify: `server/sessions-router.ts`
-- Modify: `server/agent-timeline/router.ts`
-- Modify: `server/terminals-router.ts`
-
-**Step 1: Write the failing scheduler tests**
-
-Cover:
-
-1. `critical` outranks `visible`
-2. `visible` outranks `background`
-3. background work is concurrency-bounded
-4. abort from the owning HTTP request cancels queued or running background work
-
-**Step 2: Run the scheduler lane**
-
-```bash
-npm run test:server:standard -- test/unit/server/read-models/work-scheduler.test.ts test/integration/server/bootstrap-router.test.ts test/integration/server/session-directory-router.test.ts test/integration/server/terminal-view-router.test.ts
-```
-
-Expected: FAIL until lane ordering is real and shared.
-
-**Step 3: Implement the minimal shared lane model**
-
-Use one shared lane definition:
-
-```ts
-export const READ_MODEL_LANES = ['critical', 'visible', 'background'] as const
-
-export const READ_MODEL_LANE_PRIORITY = {
-  critical: 0,
-  visible: 1,
-  background: 2,
-} as const
-```
-
-Wire every read-model route to the same scheduler and request-bound abort helper.
-
-**Step 4: Re-run the scheduler lane**
-
-```bash
-npm run test:server:standard -- test/unit/server/read-models/work-scheduler.test.ts test/integration/server/bootstrap-router.test.ts test/integration/server/session-directory-router.test.ts test/integration/server/terminal-view-router.test.ts
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git add test/unit/server/read-models/work-scheduler.test.ts test/integration/server/bootstrap-router.test.ts test/integration/server/session-directory-router.test.ts test/integration/server/terminal-view-router.test.ts shared/read-models.ts server/read-models/work-scheduler.ts server/read-models/request-abort.ts server/shell-bootstrap-router.ts server/sessions-router.ts server/agent-timeline/router.ts server/terminals-router.ts
-git commit -m "feat(scheduler): enforce shared visible-first lane ordering"
-```
-
-### Task 18: Enforce Payload Budgets And Audit-Facing Instrumentation
+### Task 4: Enforce Budgets, Backpressure, And Audit-Facing Instrumentation On The Surviving Transport
 
 **Files:**
 - Modify: `test/unit/server/request-logger.test.ts`
@@ -1298,6 +491,7 @@ git commit -m "feat(scheduler): enforce shared visible-first lane ordering"
 - Modify: `test/integration/server/bootstrap-router.test.ts`
 - Modify: `test/integration/server/session-directory-router.test.ts`
 - Modify: `test/integration/server/terminal-view-router.test.ts`
+- Modify: `shared/read-models.ts`
 - Modify: `server/request-logger.ts`
 - Modify: `server/perf-logger.ts`
 - Modify: `server/terminal-stream/client-output-queue.ts`
@@ -1307,22 +501,22 @@ git commit -m "feat(scheduler): enforce shared visible-first lane ordering"
 - Modify: `server/terminals-router.ts`
 - Modify: `src/lib/perf-logger.ts`
 
-**Pre-approved split if the red proof exposes multiple seams:**
+**Pre-approved split if the red proof exposes two seams:**
 
-1. `Task 18A`: enforce payload ceilings, realtime backpressure, and bounded queue behavior (`test/unit/server/terminal-stream/client-output-queue.test.ts`, `test/unit/server/ws-handler-backpressure.test.ts`, `test/integration/server/bootstrap-router.test.ts`, `test/integration/server/session-directory-router.test.ts`, `test/integration/server/terminal-view-router.test.ts`, `server/terminal-stream/client-output-queue.ts`, `server/ws-handler.ts`, `server/shell-bootstrap-router.ts`, `server/sessions-router.ts`, `server/terminals-router.ts`)
-2. `Task 18B`: wire audit-facing request and perf instrumentation through the existing logger seams (`test/unit/server/request-logger.test.ts`, `test/unit/server/perf-logger.test.ts`, `test/unit/client/lib/perf-logger.test.ts`, `server/request-logger.ts`, `server/perf-logger.ts`, `src/lib/perf-logger.ts`)
+1. `Task 4A`: payload ceilings, websocket backpressure, and bounded queue behavior
+2. `Task 4B`: request and perf logging fields needed by the audit
 
-If the split is used, keep the shared budget constants and logger seams from this task, finish `Task 18A` green first, then complete `Task 18B`, and leave Tasks 19 and 20 as the first destructive cleanup.
+If split, finish `Task 4A` fully green before `Task 4B`.
 
 **Step 1: Write the failing budget and instrumentation tests**
 
 Cover:
 
 1. bootstrap payload stays under `12 * 1024` bytes
-2. realtime frames stay under `16 * 1024` bytes or degrade through gap/invalidation behavior
+2. realtime frames stay under `16 * 1024` bytes or degrade through gap or invalidation behavior
 3. queue overflow does not produce unbounded buffering
-4. request and perf logs capture lane, payload bytes, duration, queue depth, and dropped bytes
-5. live terminal input/output still outranks background read-model work
+4. request and perf logs capture lane, payload bytes, duration, queue depth, and dropped bytes where applicable
+5. live terminal input or output still outranks background read-model work
 
 **Step 2: Run the budget lane**
 
@@ -1331,7 +525,7 @@ npm run test:server:standard -- test/unit/server/request-logger.test.ts test/uni
 NODE_ENV=test npx vitest run test/unit/client/lib/perf-logger.test.ts
 ```
 
-Expected: FAIL until the budgets are enforced in the real seams.
+Expected: FAIL until the surviving transport enforces the budgets and logs the right data.
 
 **Step 3: Implement the minimal shared budgets**
 
@@ -1359,142 +553,11 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add test/unit/server/request-logger.test.ts test/unit/server/perf-logger.test.ts test/unit/server/terminal-stream/client-output-queue.test.ts test/unit/server/ws-handler-backpressure.test.ts test/unit/client/lib/perf-logger.test.ts test/integration/server/bootstrap-router.test.ts test/integration/server/session-directory-router.test.ts test/integration/server/terminal-view-router.test.ts server/request-logger.ts server/perf-logger.ts server/terminal-stream/client-output-queue.ts server/ws-handler.ts server/shell-bootstrap-router.ts server/sessions-router.ts server/terminals-router.ts src/lib/perf-logger.ts
+git add test/unit/server/request-logger.test.ts test/unit/server/perf-logger.test.ts test/unit/server/terminal-stream/client-output-queue.test.ts test/unit/server/ws-handler-backpressure.test.ts test/unit/client/lib/perf-logger.test.ts test/integration/server/bootstrap-router.test.ts test/integration/server/session-directory-router.test.ts test/integration/server/terminal-view-router.test.ts shared/read-models.ts server/request-logger.ts server/perf-logger.ts server/terminal-stream/client-output-queue.ts server/ws-handler.ts server/shell-bootstrap-router.ts server/sessions-router.ts server/terminals-router.ts src/lib/perf-logger.ts
 git commit -m "feat(transport): enforce budgets and audit-facing instrumentation"
 ```
 
-### Task 19: Delete Legacy Bulk WebSocket Delivery And Chunking
-
-**Files:**
-- Modify: `test/server/ws-sidebar-snapshot-refresh.test.ts`
-- Modify: `test/unit/server/sessions-sync/service.test.ts`
-- Modify: `test/unit/server/ws-handler-sdk.test.ts`
-- Modify: `test/unit/server/session-history-loader.test.ts`
-- Delete: `test/server/ws-sessions-patch.test.ts`
-- Delete: `test/unit/server/ws-chunking.test.ts`
-- Modify: `server/ws-handler.ts`
-- Modify: `server/session-history-loader.ts`
-- Modify: `server/sessions-sync/service.ts`
-- Delete: `server/ws-chunking.ts`
-
-**Step 1: Write the failing legacy-delivery cleanup tests**
-
-Cover:
-
-1. successful transcripts never emit `sessions.updated`, `sessions.page`, `sessions.patch`, `sdk.history`, `terminal.list.updated`, or `terminal.meta.list.response`
-2. session invalidation is revision-only
-3. SDK attach/create relies on `sdk.session.snapshot` plus live deltas, never replay arrays
-4. chunking-specific tests are deleted instead of preserved as compatibility debt
-
-**Step 2: Run the legacy-delivery lane**
-
-```bash
-npm run test:server:standard -- test/server/ws-sidebar-snapshot-refresh.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/session-history-loader.test.ts
-```
-
-Expected: FAIL until the bulk websocket delivery paths are gone.
-
-**Step 3: Implement the minimal deletion**
-
-After this task, the surviving session and SDK websocket paths are invalidation or live-delta only. Remove `sdk.history` replay shaping from `server/session-history-loader.ts`, remove chunking, and remove patch-broadcast logic from `server/sessions-sync/service.ts`.
-
-**Step 4: Re-run the legacy-delivery lane**
-
-```bash
-npm run test:server:standard -- test/server/ws-sidebar-snapshot-refresh.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/session-history-loader.test.ts
-```
-
-Expected: PASS.
-
-**Step 5: Commit**
-
-```bash
-git add test/server/ws-sidebar-snapshot-refresh.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/ws-handler-sdk.test.ts test/unit/server/session-history-loader.test.ts server/ws-handler.ts server/session-history-loader.ts server/sessions-sync/service.ts
-git rm test/server/ws-sessions-patch.test.ts test/unit/server/ws-chunking.test.ts server/ws-chunking.ts
-git commit -m "refactor(protocol): delete bulk websocket delivery and chunking"
-```
-
-### Task 20: Remove Legacy Capabilities, Commands, And Static Compatibility Paths
-
-**Files:**
-- Modify: `test/server/ws-protocol.test.ts`
-- Modify: `test/server/ws-edge-cases.test.ts`
-- Modify: `test/server/ws-handshake-snapshot.test.ts`
-- Modify: `test/unit/client/lib/ws-client.test.ts`
-- Modify: `shared/ws-protocol.ts`
-- Modify: `server/ws-handler.ts`
-- Modify: `src/lib/ws-client.ts`
-- Modify: `src/App.tsx`
-
-**Step 1: Write the failing protocol cleanup tests**
-
-Cover:
-
-1. `hello.capabilities` no longer advertises `sessionsPatchV1` or `sessionsPaginationV1`
-2. client messages `sessions.fetch`, `terminal.list`, and `terminal.meta.list` are rejected because they no longer exist
-3. the client and server no longer expose legacy bulk message unions
-4. `src/App.tsx` no longer carries compatibility handlers for `sessions.updated`
-
-**Step 2: Run the protocol cleanup lane**
-
-```bash
-npm run test:server:standard -- test/server/ws-protocol.test.ts test/server/ws-edge-cases.test.ts test/server/ws-handshake-snapshot.test.ts
-NODE_ENV=test npx vitest run test/unit/client/lib/ws-client.test.ts
-```
-
-Expected: FAIL until the remaining compatibility protocol is gone.
-
-**Step 3: Implement the minimal protocol cleanup**
-
-Keep the handshake capabilities narrow:
-
-```ts
-type HelloCapabilities = {
-  uiScreenshotV1?: boolean
-}
-```
-
-Delete these protocol entries from the shared unions and validators:
-
-1. `sessions.fetch`
-2. `terminal.list`
-3. `terminal.list.response`
-4. `terminal.meta.list`
-5. `terminal.meta.list.response`
-6. `sessionsPatchV1`
-7. `sessionsPaginationV1`
-
-**Step 4: Re-run the protocol cleanup lane**
-
-```bash
-npm run test:server:standard -- test/server/ws-protocol.test.ts test/server/ws-edge-cases.test.ts test/server/ws-handshake-snapshot.test.ts
-NODE_ENV=test npx vitest run test/unit/client/lib/ws-client.test.ts
-```
-
-Expected: PASS.
-
-**Step 5: Prove the legacy strings are gone from production code**
-
-```bash
-rg -n "sessions\\.updated|sessions\\.page|sessions\\.patch|sessions\\.fetch|sdk\\.history|terminal\\.list(\\.updated|\\.response)?|terminal\\.meta\\.list(\\.response)?|sessionsPatchV1|sessionsPaginationV1" shared server src
-rg -n "/api/sessions/search|/api/sessions/query" server src
-rg -n "ws\\.connect\\(" src
-```
-
-Expected:
-
-1. first command: no matches
-2. second command: no matches
-3. third command: only `src/App.tsx`
-
-**Step 6: Commit**
-
-```bash
-git add test/server/ws-protocol.test.ts test/server/ws-edge-cases.test.ts test/server/ws-handshake-snapshot.test.ts test/unit/client/lib/ws-client.test.ts shared/ws-protocol.ts server/ws-handler.ts src/lib/ws-client.ts src/App.tsx
-git commit -m "refactor(protocol): remove legacy websocket capabilities and commands"
-```
-
-### Task 21: Run The Full Quality Gate And Audit Loop Until It Passes
+### Task 5: Run The Full Contradiction Gate, Quality Gate, And Audit Loop Until It Passes
 
 **Files:**
 - No planned source edits.
@@ -1504,7 +567,23 @@ git commit -m "refactor(protocol): remove legacy websocket capabilities and comm
   - `artifacts/perf/visible-first-diff.post-cutover.json`
   - `artifacts/perf/visible-first-gate.post-cutover.json`
 
-**Step 1: Run the full quality suite**
+**Step 1: Run the contradiction proofs**
+
+```bash
+npm run test:visible-first:contract
+rg -n "sessions\\.updated|sessions\\.page|sessions\\.patch|sessions\\.fetch|sdk\\.history|terminal\\.list(\\.updated|\\.response)?|terminal\\.meta\\.list(\\.response)?|sessionsPatchV1|sessionsPaginationV1|SearchAddon" shared server src
+rg -n "/api/sessions/search|/api/sessions/query" server src
+rg -n "ws\\.connect\\(" src
+```
+
+Expected:
+
+1. contract lane: PASS
+2. first grep: no matches
+3. second grep: no matches
+4. third grep: only `src/App.tsx`
+
+**Step 2: Run the full quality suite**
 
 ```bash
 npm run lint
@@ -1514,9 +593,9 @@ npm run verify
 
 Expected: all PASS.
 
-If any command fails, fix the narrowest real defect, add the missing regression if needed, commit the fix, and rerun Step 1.
+If any command fails, fix the narrowest real defect, add the missing regression if needed, commit the fix, and restart Task 5 from Step 1.
 
-**Step 2: Capture and validate the post-cutover candidate artifact**
+**Step 3: Capture and validate the post-cutover candidate artifact**
 
 ```bash
 npm run perf:audit:visible-first -- --output artifacts/perf/visible-first-candidate.post-cutover.json
@@ -1525,9 +604,9 @@ npx tsx --eval "import fs from 'node:fs'; import { VisibleFirstAuditSchema, asse
 
 Expected: both commands exit `0`.
 
-If this fails, fix the audit trust defect and rerun Step 2.
+If this fails, fix the audit trust defect, commit the fix, and restart Task 5 from Step 1.
 
-**Step 3: Produce the diff and run the machine gate**
+**Step 4: Produce the diff and run the machine gate**
 
 ```bash
 npm run perf:audit:compare -- --base artifacts/perf/visible-first-baseline.pre-cutover.json --candidate artifacts/perf/visible-first-candidate.post-cutover.json > artifacts/perf/visible-first-diff.post-cutover.json
@@ -1539,44 +618,44 @@ Expected:
 1. both commands exit `0`
 2. `artifacts/perf/visible-first-gate.post-cutover.json` reports `"ok": true`
 
-If the gate fails, go back to the narrowest failing seam, add or tighten the missing regression, fix the product, commit the fix, and restart Task 21 from Step 1. Do not stop at the first bad comparison.
+If the gate fails, go back to the narrowest failing seam, add or tighten the missing regression, fix the product, commit the fix, and restart Task 5 from Step 1. Do not stop at the first bad comparison.
 
-**Step 4: Confirm audit artifacts stay uncommitted**
+**Step 5: Confirm generated artifacts stay uncommitted**
 
 ```bash
 git status --short
 ```
 
-Expected: source changes only if Step 1 through Step 3 required a real fix; `artifacts/perf/*.json` remain untracked or ignored, never staged.
+Expected: source changes only if Step 1 through Step 4 required a real fix; `artifacts/perf/*.json` remain untracked or ignored and never staged.
 
 ## Final Verification Checklist
 
 - [ ] trusted pre-cutover baseline artifact exists
 - [ ] trusted post-cutover candidate artifact exists
+- [ ] `npm run test:visible-first:contract` passes
 - [ ] `npm run lint` passes
 - [ ] `npm test` passes
 - [ ] `npm run verify` passes
-- [ ] production grep finds no legacy bulk websocket strings
+- [ ] production grep finds no forbidden legacy websocket strings
 - [ ] production grep finds no `/api/sessions/search` or `/api/sessions/query`
-- [ ] no production code imports `SearchAddon`
+- [ ] no production code imports or instantiates `SearchAddon`
 - [ ] only `src/App.tsx` calls `ws.connect()`
 - [ ] bootstrap payload stays under `12 * 1024` bytes
-- [ ] scheduler tests prove `critical > visible > background`
-- [ ] background work is abortable and concurrency-bounded
 - [ ] realtime queue overflow degrades by gap or invalidation instead of unbounded buffering
 - [ ] request and perf logs expose lane, payload bytes, duration, queue depth, and dropped bytes where applicable
+- [ ] both audit artifacts validate as trusted
 - [ ] diff JSON exists
 - [ ] gate JSON exists
 - [ ] gate JSON reports `"ok": true`
 - [ ] no `mobile_restricted.focusedReadyMs` regression remains
-- [ ] no terminal input-to-first-output regression remains in the two terminal scenarios
+- [ ] no terminal input-to-first-output regression remains in `terminal-cold-boot` or `terminal-reconnect-backlog`
 - [ ] no offscreen-before-ready regression remains in either profile
 - [ ] no generated audit artifact is committed
 
 ## Notes For The Executor
 
-1. Prefer deletion over compatibility shims. The previous regression happened because both the new and old transport paths were active at landing.
-2. Keep temporary coexistence only long enough to switch the next consumer. Tasks 19 and 20 are the non-negotiable hard-delete phase.
-3. When a test encodes legacy behavior that should not survive, rewrite or delete it in the same task that removes the runtime path.
-4. Do not create “temporary” fallbacks for offscreen hydration, terminal metadata snapshots, bulk session payloads, or `sdk.history`.
-5. Do not create no-op commits. Commit only green states with real code or test changes.
+1. The remaining work is not “finish some cleanup later.” The remaining work is the cleanup. The branch is not done until the hybrid transport is gone.
+2. The acceptance-contract task comes first because that is the highest-leverage trycycle-process correction from the previous failure. Use it as the contradiction gate for the rest of the branch.
+3. Do not preserve old runtime tests as documentation. If they encode forbidden behavior positively, rewrite or delete them.
+4. Do not reintroduce compatibility messages to make a test or audit easier. Fix the surviving HTTP or delta path instead.
+5. If the audit gate fails, continue the loop until it passes. The user explicitly asked for completion, not a partial landing plus a report.
