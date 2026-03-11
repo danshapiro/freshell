@@ -6,6 +6,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import request from 'supertest'
+import isPortReachable from 'is-port-reachable'
 import { NetworkManager } from '../../../server/network-manager.js'
 import { createLocalFileRouter } from '../../../server/local-file-router.js'
 import { createNetworkRouter } from '../../../server/network-router.js'
@@ -22,7 +23,7 @@ vi.mock('../../../server/bootstrap.js', () => ({
   detectLanIps: vi.fn().mockReturnValue(['192.168.1.100']),
 }))
 vi.mock('is-port-reachable', () => ({
-  default: vi.fn().mockResolvedValue(true),
+  default: vi.fn().mockResolvedValue(false),
 }))
 vi.mock('../../../server/wsl-port-forward.js', () => ({
   computeWslPortForwardingPlan: vi.fn().mockReturnValue({
@@ -76,6 +77,13 @@ describe('Network API integration', () => {
 
     // Mount the real local-file router
     app.use('/local-file', createLocalFileRouter())
+
+    await configStore.patchSettings({
+      network: {
+        configured: true,
+        host: '0.0.0.0',
+      },
+    })
   })
 
   afterEach(async () => {
@@ -208,13 +216,6 @@ describe('Network API integration', () => {
       networkManager.resetFirewallCache()
 
       const wslModule = await import('../../../server/wsl-port-forward.js')
-      vi.mocked(wslModule.computeWslPortForwardingPlan).mockReturnValue({
-        status: 'ready',
-        wslIp: '172.24.0.2',
-        scriptKind: 'full',
-        script: '$null # mock script',
-      })
-
       const cp = await import('node:child_process')
 
       const res = await request(app)
@@ -228,10 +229,11 @@ describe('Network API integration', () => {
         body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
         confirmLabel: 'Continue',
       })
+      expect(wslModule.computeWslPortForwardingPlan).not.toHaveBeenCalled()
       expect(cp.execFile).not.toHaveBeenCalled()
     })
 
-    it('returns none for WSL2 when no repair is actually needed anymore', async () => {
+    it('returns none for WSL2 when the confirmed retry recomputes to noop', async () => {
       vi.mocked(detectFirewall).mockResolvedValue({
         platform: 'wsl2',
         active: true,
@@ -245,13 +247,22 @@ describe('Network API integration', () => {
       })
 
       const cp = await import('node:child_process')
-      const res = await request(app)
+      const firstRes = await request(app)
         .post('/api/network/configure-firewall')
         .set('x-auth-token', token)
         .send({})
 
-      expect(res.status).toBe(200)
-      expect(res.body).toEqual({ method: 'none', message: 'No configuration changes required' })
+      expect(firstRes.status).toBe(200)
+      expect(firstRes.body.method).toBe('confirmation-required')
+
+      const confirmedRes = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({ confirmElevation: true })
+
+      expect(confirmedRes.status).toBe(200)
+      expect(confirmedRes.body).toEqual({ method: 'none', message: 'No configuration changes required' })
+      expect(wslModule.computeWslPortForwardingPlan).toHaveBeenCalledTimes(1)
       expect(cp.execFile).not.toHaveBeenCalled()
     })
 
@@ -301,6 +312,71 @@ describe('Network API integration', () => {
 
       expect(res.status).toBe(200)
       expect(res.body.method).toBe('confirmation-required')
+      expect(cp.execFile).not.toHaveBeenCalled()
+    })
+
+    it('returns none for native Windows when the port becomes reachable before confirmation', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'windows',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+
+      vi.mocked(isPortReachable)
+        .mockResolvedValueOnce(false)
+        .mockResolvedValueOnce(true)
+
+      const cp = await import('node:child_process')
+
+      const firstRes = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(firstRes.status).toBe(200)
+      expect(firstRes.body.method).toBe('confirmation-required')
+
+      const confirmedRes = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({ confirmElevation: true })
+
+      expect(confirmedRes.status).toBe(200)
+      expect(confirmedRes.body).toEqual({ method: 'none', message: 'No configuration changes required' })
+      expect(cp.execFile).not.toHaveBeenCalled()
+    })
+
+    it('returns none when remote access is disabled before confirmed repair', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'windows',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+
+      const cp = await import('node:child_process')
+
+      const firstRes = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(firstRes.status).toBe(200)
+      expect(firstRes.body.method).toBe('confirmation-required')
+
+      await configStore.patchSettings({
+        network: {
+          configured: true,
+          host: '127.0.0.1',
+        },
+      })
+
+      const confirmedRes = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({ confirmElevation: true })
+
+      expect(confirmedRes.status).toBe(200)
+      expect(confirmedRes.body).toEqual({ method: 'none', message: 'Remote access is not enabled' })
       expect(cp.execFile).not.toHaveBeenCalled()
     })
 

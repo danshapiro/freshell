@@ -22,6 +22,16 @@ const WINDOWS_ELEVATION_CONFIRMATION = {
   confirmLabel: 'Continue',
 } as const
 
+const NO_CONFIGURATION_CHANGES_REQUIRED = {
+  method: 'none',
+  message: 'No configuration changes required',
+} as const
+
+const REMOTE_ACCESS_DISABLED = {
+  method: 'none',
+  message: 'Remote access is not enabled',
+} as const
+
 export interface NetworkRouterDeps {
   networkManager: {
     getStatus: () => Promise<any>
@@ -128,9 +138,21 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
         })
       }
 
+      if (status.host !== '0.0.0.0') {
+        return res.json(REMOTE_ACCESS_DISABLED)
+      }
+
       const commands = status.firewall.commands
 
       if (status.firewall.platform === 'wsl2') {
+        if (!confirmElevation) {
+          return res.json(WINDOWS_ELEVATION_CONFIRMATION)
+        }
+
+        if (status.firewall.portOpen === true) {
+          return res.json(NO_CONFIGURATION_CHANGES_REQUIRED)
+        }
+
         const plan = computeWslPortForwardingPlan(networkManager.getRelevantPorts())
 
         if (plan.status === 'error') {
@@ -139,11 +161,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
         }
 
         if (plan.status === 'not-wsl2' || plan.status === 'noop') {
-          return res.json({ method: 'none', message: 'No configuration changes required' })
-        }
-
-        if (!confirmElevation) {
-          return res.json(WINDOWS_ELEVATION_CONFIRMATION)
+          return res.json(NO_CONFIGURATION_CHANGES_REQUIRED)
         }
 
         try {
@@ -167,6 +185,10 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
       if (status.firewall.platform === 'windows') {
         if (commands.length === 0) {
           return res.json({ method: 'none', message: 'No firewall detected' })
+        }
+
+        if (status.firewall.portOpen === true) {
+          return res.json(NO_CONFIGURATION_CHANGES_REQUIRED)
         }
 
         if (!confirmElevation) {

@@ -333,6 +333,8 @@ describe('SetupWizard', () => {
 
     const confirmationDialog = await screen.findByRole('dialog', { name: /administrator approval required/i })
     expect(confirmationDialog).toBeInTheDocument()
+    expect(screen.queryByRole('dialog', { name: /network setup wizard/i })).not.toBeInTheDocument()
+    expect(screen.getAllByRole('dialog')).toHaveLength(1)
     expect(mockFetchFirewallConfig).toHaveBeenCalledTimes(1)
 
     fireEvent.click(within(confirmationDialog).getByRole('button', { name: /^continue$/i }))

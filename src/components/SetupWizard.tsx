@@ -322,9 +322,10 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
     <>
       <div
         className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Network setup wizard"
+        role={firewallConfirmation ? undefined : 'dialog'}
+        aria-modal={firewallConfirmation ? undefined : 'true'}
+        aria-label={firewallConfirmation ? undefined : 'Network setup wizard'}
+        aria-hidden={firewallConfirmation ? 'true' : undefined}
       >
         <div className="mx-4 w-full max-w-md rounded-lg border bg-background p-6 shadow-lg">
         {/* Step 1: Ask */}
