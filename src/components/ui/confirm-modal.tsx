@@ -1,12 +1,14 @@
 import React, { useEffect, useRef } from 'react'
 import { createPortal } from 'react-dom'
 import { OVERLAY_Z } from '@/components/ui/overlay'
+import { Button, type ButtonVariant } from '@/components/ui/button'
 
 type ConfirmModalProps = {
   open: boolean
   title: string
   body: React.ReactNode
   confirmLabel: string
+  confirmVariant?: ButtonVariant
   onConfirm: () => void
   onCancel: () => void
 }
@@ -24,7 +26,15 @@ function getFocusable(container: HTMLElement): HTMLElement[] {
     .filter((el) => !el.hasAttribute('disabled') && !el.getAttribute('aria-hidden'))
 }
 
-export function ConfirmModal({ open, title, body, confirmLabel, onConfirm, onCancel }: ConfirmModalProps) {
+export function ConfirmModal({
+  open,
+  title,
+  body,
+  confirmLabel,
+  confirmVariant = 'destructive',
+  onConfirm,
+  onCancel,
+}: ConfirmModalProps) {
   const dialogRef = useRef<HTMLDivElement>(null)
   const confirmRef = useRef<HTMLButtonElement>(null)
   const previousFocusRef = useRef<HTMLElement | null>(null)
@@ -108,16 +118,17 @@ export function ConfirmModal({ open, title, body, confirmLabel, onConfirm, onCan
         <h2 className="text-lg font-semibold">{title}</h2>
         <div className="mt-3 text-sm text-muted-foreground">{body}</div>
         <div className="mt-4 flex justify-end gap-2">
-          <button className="h-8 px-3 text-sm" onClick={onCancel}>
+          <Button variant="ghost" size="sm" onClick={onCancel}>
             Cancel
-          </button>
-          <button
+          </Button>
+          <Button
             ref={confirmRef}
-            className="h-8 px-3 text-sm bg-destructive text-destructive-foreground rounded"
+            variant={confirmVariant}
+            size="sm"
             onClick={onConfirm}
           >
             {confirmLabel}
-          </button>
+          </Button>
         </div>
       </div>
     </div>,
