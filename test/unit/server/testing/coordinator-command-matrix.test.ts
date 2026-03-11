@@ -1,3 +1,7 @@
+import fsp from 'node:fs/promises'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -6,6 +10,10 @@ import {
   type CommandKey,
   type UpstreamPhase,
 } from '../../../../scripts/testing/coordinator-command-matrix.js'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+const REPO_ROOT = path.resolve(__dirname, '../../../..')
 
 function expectVitestPhase(
   phase: UpstreamPhase,
@@ -388,5 +396,24 @@ describe('classifyCommand()', () => {
       config: 'default',
       args: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
     })
+  })
+
+  it('rewires every public test script through the coordinator entrypoint and publishes direct status/vitest scripts', async () => {
+    const packageJson = JSON.parse(await fsp.readFile(path.join(REPO_ROOT, 'package.json'), 'utf8'))
+    const scripts = packageJson.scripts as Record<string, string>
+
+    expect(scripts.test).toBe('tsx scripts/testing/test-coordinator.ts run test')
+    expect(scripts['test:all']).toBe('tsx scripts/testing/test-coordinator.ts run test:all')
+    expect(scripts.check).toBe('tsx scripts/testing/test-coordinator.ts run check')
+    expect(scripts.verify).toBe('tsx scripts/testing/test-coordinator.ts run verify')
+    expect(scripts['test:watch']).toBe('tsx scripts/testing/test-coordinator.ts run test:watch')
+    expect(scripts['test:ui']).toBe('tsx scripts/testing/test-coordinator.ts run test:ui')
+    expect(scripts['test:server']).toBe('tsx scripts/testing/test-coordinator.ts run test:server')
+    expect(scripts['test:coverage']).toBe('tsx scripts/testing/test-coordinator.ts run test:coverage')
+    expect(scripts['test:unit']).toBe('tsx scripts/testing/test-coordinator.ts run test:unit')
+    expect(scripts['test:integration']).toBe('tsx scripts/testing/test-coordinator.ts run test:integration')
+    expect(scripts['test:client']).toBe('tsx scripts/testing/test-coordinator.ts run test:client')
+    expect(scripts['test:status']).toBe('tsx scripts/testing/test-coordinator.ts status')
+    expect(scripts['test:vitest']).toBe('tsx scripts/testing/test-coordinator.ts run test:vitest')
   })
 })

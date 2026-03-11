@@ -357,7 +357,7 @@ describe('test coordinator CLI', () => {
       },
     )
 
-    const activeStatus = await waitForRunningStatus(fixture.checkoutRoot, /running/)
+    const activeStatus = await waitForStatusOutput(fixture.checkoutRoot, /Nightly full suite/)
     expect(activeStatus.output).toContain('Nightly full suite')
     expect(activeStatus.output).toContain('commandKey: test')
     expect(activeStatus.output).toContain('suiteKey: full-suite')
@@ -580,7 +580,7 @@ describe('test coordinator CLI', () => {
       {
         FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
         FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
-          'vitest:default:run': { holdMs: 400 },
+          'vitest:default:run': { holdMs: 4_000 },
         }),
       },
     )
@@ -596,7 +596,6 @@ describe('test coordinator CLI', () => {
     ]
 
     for (const command of commands) {
-      const startedAt = Date.now()
       const exit = await waitForExit(spawnCoordinator(
         fixture.checkoutRoot,
         command.key,
@@ -606,7 +605,7 @@ describe('test coordinator CLI', () => {
         },
       ))
       expect(exit.code).toBe(0)
-      expect(Date.now() - startedAt).toBeLessThan(500)
+      expect(holder.child.exitCode).toBeNull()
     }
 
     await stopChild(holder)
@@ -681,9 +680,30 @@ describe('test coordinator CLI', () => {
 
     await stopChild(holder)
   })
+
+  it('publishes the coordinated workflow truthfully in AGENTS.md and docs/skills/testing.md', async () => {
+    const agents = await fsp.readFile(path.join(REPO_ROOT, 'AGENTS.md'), 'utf8')
+    const docs = await fsp.readFile(path.join(REPO_ROOT, 'docs', 'skills', 'testing.md'), 'utf8')
+
+    expect(agents).toContain('FRESHELL_TEST_SUMMARY')
+    expect(agents).toContain('npm run test:status')
+    expect(agents).toContain('npm run test:vitest -- ...')
+    expect(agents).toMatch(/wait rather than kill a foreign holder/i)
+
+    expect(docs).not.toContain('| `npm test` | Watch mode (re-runs on file changes) |')
+    expect(docs).toContain('`test:unit` is the exact default-config `test/unit` workload')
+    expect(docs).toContain('`test:integration` is the exact server-config `test/server` workload')
+    expect(docs).toContain('`test:server` stays watch-capable by default and only coordinates explicit broad `--run`')
+    expect(docs).toContain('prior successful baselines are advisory only')
+    expect(docs).toContain('use `npm run test:vitest -- ...`')
+  })
 })
 
 async function waitForRunningStatus(cwd: string, pattern: RegExp, timeoutMs = 5_000) {
+  return waitForStatusOutput(cwd, pattern, timeoutMs)
+}
+
+async function waitForStatusOutput(cwd: string, pattern: RegExp, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs
   let lastOutput = ''
 
