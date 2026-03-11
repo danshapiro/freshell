@@ -85,6 +85,10 @@ export function renderStatusView(view: StatusView): string {
 
   if (view.holder) {
     lines.push(`holder: ${view.holder.summary}`)
+    lines.push(`commandKey: ${view.holder.entrypoint.commandKey}`)
+    if (view.holder.entrypoint.suiteKey) {
+      lines.push(`suiteKey: ${view.holder.entrypoint.suiteKey}`)
+    }
     lines.push(`elapsed: ${formatElapsed(view.holder.startedAt)}`)
     lines.push(`branch: ${view.holder.repo.branch ?? 'unknown'}`)
     lines.push(`worktree: ${view.holder.repo.worktreePath}`)
@@ -105,6 +109,7 @@ export function renderStatusView(view: StatusView): string {
   }
 
   if (view.reusableSuccess) {
+    lines.push(`reusable-summary: ${view.reusableSuccess.summary}`)
     lines.push(`reusable-success: ${view.reusableSuccess.reusableKey}`)
   }
 
