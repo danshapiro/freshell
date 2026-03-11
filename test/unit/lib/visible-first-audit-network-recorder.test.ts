@@ -37,12 +37,12 @@ function fakeWsFrame(type: string) {
 describe('createNetworkRecorder', () => {
   it('normalizes app API requests and WS frames from CDP events', () => {
     const recorder = createNetworkRecorder()
-    recorder.onRequestWillBeSent(fakeApiRequest('/api/sessions/abc123'))
+    recorder.onRequestWillBeSent(fakeApiRequest('/api/agent-sessions/abc123/timeline'))
     recorder.onLoadingFinished(fakeLoadingFinished())
-    recorder.onWebSocketFrameReceived(fakeWsFrame('sdk.history'))
+    recorder.onWebSocketFrameReceived(fakeWsFrame('sdk.session.snapshot'))
 
     const summary = summarizeNetworkCapture(recorder.snapshot())
-    expect(summary.http.byRoute['/api/sessions/:sessionId']?.count).toBe(1)
-    expect(summary.ws.byType['sdk.history']?.receivedFrames).toBe(1)
+    expect(summary.http.byRoute['/api/agent-sessions/:sessionId/timeline']?.count).toBe(1)
+    expect(summary.ws.byType['sdk.session.snapshot']?.receivedFrames).toBe(1)
   })
 })

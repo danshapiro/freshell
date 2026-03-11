@@ -1,13 +1,12 @@
 import type { ProjectGroup } from '../coding-cli/types.js'
 import type { TerminalMeta } from '../terminal-metadata-service.js'
 import { extractSnippet } from '../session-search.js'
+import { MAX_DIRECTORY_PAGE_ITEMS } from '../../shared/read-models.js'
 import type {
   SessionDirectoryItem,
   SessionDirectoryPage,
   SessionDirectoryQuery,
 } from './types.js'
-
-const MAX_DIRECTORY_PAGE_ITEMS = 50
 
 type QuerySessionDirectoryInput = {
   projects: ProjectGroup[]

@@ -1,4 +1,7 @@
-import type { TerminalDirectoryQuery } from '../../shared/read-models.js'
+import {
+  MAX_DIRECTORY_PAGE_ITEMS,
+  type TerminalDirectoryQuery,
+} from '../../shared/read-models.js'
 import { TerminalViewMirror } from './mirror.js'
 import type {
   TerminalDirectoryItem,
@@ -8,8 +11,6 @@ import type {
   TerminalViewService,
   TerminalViewportRuntime,
 } from './types.js'
-
-const MAX_DIRECTORY_PAGE_ITEMS = 50
 
 type CursorPayload = {
   lastActivityAt: number

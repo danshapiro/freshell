@@ -1,6 +1,10 @@
 import { z } from 'zod'
 
 export const MAX_BOOTSTRAP_PAYLOAD_BYTES = 12 * 1024
+export const MAX_REALTIME_MESSAGE_BYTES = 16 * 1024
+export const MAX_DIRECTORY_PAGE_ITEMS = 50
+export const MAX_AGENT_TIMELINE_ITEMS = 30
+export const MAX_TERMINAL_SCROLLBACK_PAGE_BYTES = 64 * 1024
 export const READ_MODEL_LANES = ['critical', 'visible', 'background'] as const
 export const ReadModelLaneSchema = z.enum(READ_MODEL_LANES)
 export const READ_MODEL_LANE_PRIORITY = {
@@ -24,20 +28,20 @@ export const SessionDirectoryQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
   priority: ReadModelPrioritySchema,
   revision: z.number().int().nonnegative().optional(),
-  limit: z.number().int().positive().max(50).optional(),
+  limit: z.number().int().positive().max(MAX_DIRECTORY_PAGE_ITEMS).optional(),
 })
 
 export const TerminalDirectoryQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
   priority: ReadModelPrioritySchema,
   revision: z.number().int().nonnegative().optional(),
-  limit: z.number().int().positive().max(50).optional(),
+  limit: z.number().int().positive().max(MAX_DIRECTORY_PAGE_ITEMS).optional(),
 })
 
 export const AgentTimelinePageQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
   priority: ReadModelPrioritySchema.optional(),
-  limit: z.number().int().positive().max(50).optional(),
+  limit: z.number().int().positive().max(MAX_AGENT_TIMELINE_ITEMS).optional(),
 })
 
 export const TerminalScrollbackQuerySchema = z.object({

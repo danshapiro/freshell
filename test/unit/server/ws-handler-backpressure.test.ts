@@ -6,6 +6,7 @@ import WebSocket from 'ws'
 import { WsHandler } from '../../../server/ws-handler'
 import { TerminalRegistry } from '../../../server/terminal-registry'
 import { TerminalStreamBroker } from '../../../server/terminal-stream/broker'
+import { MAX_REALTIME_MESSAGE_BYTES } from '../../../shared/read-models.js'
 
 vi.mock('node-pty', () => ({
   spawn: vi.fn(),
@@ -336,6 +337,34 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     expect(payloads.some((m) => m.type === 'terminal.attach.ready' && m.attachRequestId === 'attach-1')).toBe(true)
     expect(payloads.some((m) => m.type === 'terminal.output' && m.attachRequestId === 'attach-1')).toBe(true)
     expect(payloads.some((m) => m.type === 'terminal.output.gap' && m.attachRequestId === 'attach-1')).toBe(true)
+
+    broker.close()
+  })
+
+  it('keeps each live terminal.output frame within the shared realtime byte budget', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-budget')
+
+    const ws = createMockWs()
+    const attached = await broker.attach(ws as any, 'term-budget', 80, 24, 0, 'attach-budget')
+    expect(attached).toBe('attached')
+
+    for (let i = 0; i < 40; i += 1) {
+      registry.emit('terminal.output.raw', {
+        terminalId: 'term-budget',
+        data: 'x'.repeat(1024),
+        at: Date.now(),
+      })
+    }
+    vi.advanceTimersByTime(10)
+
+    const payloads = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .filter((payload): payload is Record<string, any> => !!payload && payload.type === 'terminal.output')
+
+    expect(payloads.length).toBeGreaterThan(0)
+    expect(payloads.every((payload) => Buffer.byteLength(payload.data ?? '', 'utf8') <= MAX_REALTIME_MESSAGE_BYTES)).toBe(true)
 
     broker.close()
   })

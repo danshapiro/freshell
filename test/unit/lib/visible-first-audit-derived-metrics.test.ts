@@ -7,13 +7,18 @@ import {
 
 describe('deriveVisibleFirstMetrics', () => {
   it('normalizes routes and counts offscreen work before focused readiness', () => {
-    expect(normalizeAuditRouteId('http://localhost:3000/api/sessions/abc123?token=secret')).toBe(
-      '/api/sessions/:sessionId',
+    expect(normalizeAuditRouteId('http://localhost:3000/api/bootstrap?token=secret')).toBe('/api/bootstrap')
+    expect(normalizeAuditRouteId('http://localhost:3000/api/session-directory?query=alpha')).toBe('/api/session-directory')
+    expect(normalizeAuditRouteId('http://localhost:3000/api/agent-sessions/abc123/timeline')).toBe(
+      '/api/agent-sessions/:sessionId/timeline',
+    )
+    expect(normalizeAuditRouteId('http://localhost:3000/api/terminals/term-1/viewport')).toBe(
+      '/api/terminals/:terminalId/viewport',
     )
 
     const input = {
       focusedReadyMilestone: 'terminal.first_output',
-      allowedApiRouteIdsBeforeReady: ['/api/settings', '/api/terminals'],
+      allowedApiRouteIdsBeforeReady: ['/api/bootstrap', '/api/terminals/:terminalId/viewport'],
       allowedWsTypesBeforeReady: ['hello', 'ready', 'terminal.output'],
       browser: {
         milestones: {
@@ -24,15 +29,15 @@ describe('deriveVisibleFirstMetrics', () => {
       transport: {
         http: {
           requests: [
-            { timestamp: 20, url: 'http://localhost:3000/api/settings', encodedDataLength: 10 },
-            { timestamp: 60, url: 'http://localhost:3000/api/sessions/abc123', encodedDataLength: 20 },
-            { timestamp: 120, url: 'http://localhost:3000/api/terminals', encodedDataLength: 30 },
+            { timestamp: 20, url: 'http://localhost:3000/api/bootstrap', encodedDataLength: 10 },
+            { timestamp: 60, url: 'http://localhost:3000/api/session-directory?query=alpha', encodedDataLength: 20 },
+            { timestamp: 120, url: 'http://localhost:3000/api/terminals/term-1/viewport', encodedDataLength: 30 },
           ],
         },
         ws: {
           frames: [
             { timestamp: 30, payload: JSON.stringify({ type: 'hello' }), payloadLength: 8 },
-            { timestamp: 40, payload: JSON.stringify({ type: 'sdk.history' }), payloadLength: 9 },
+            { timestamp: 40, payload: JSON.stringify({ type: 'sdk.session.snapshot' }), payloadLength: 9 },
             { timestamp: 70, payload: '{"type":"unknown-route"}', payloadLength: 10 },
             { timestamp: 130, payload: JSON.stringify({ type: 'terminal.output' }), payloadLength: 11 },
           ],

@@ -1,6 +1,8 @@
+import { MAX_REALTIME_MESSAGE_BYTES } from '../../shared/read-models.js'
+
 export const TERMINAL_STREAM_BATCH_MAX_BYTES = Math.max(
   1024,
-  Number(process.env.TERMINAL_STREAM_BATCH_MAX_BYTES || 64 * 1024),
+  Number(process.env.TERMINAL_STREAM_BATCH_MAX_BYTES || MAX_REALTIME_MESSAGE_BYTES),
 )
 
 export const TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES = Math.max(

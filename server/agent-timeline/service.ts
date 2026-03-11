@@ -1,3 +1,4 @@
+import { MAX_AGENT_TIMELINE_ITEMS } from '../../shared/read-models.js'
 import type { ChatMessage } from '../session-history-loader.js'
 import type {
   AgentTimelineItem,
@@ -7,7 +8,7 @@ import type {
 } from './types.js'
 
 const DEFAULT_TIMELINE_LIMIT = 20
-const MAX_TIMELINE_LIMIT = 50
+const MAX_TIMELINE_LIMIT = MAX_AGENT_TIMELINE_ITEMS
 
 type TimelineCursorPayload = {
   offset: number

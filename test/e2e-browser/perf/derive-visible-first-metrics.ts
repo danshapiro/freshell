@@ -54,6 +54,31 @@ function normalizeAuditPath(pathname: string): string | null {
     return '/api/sessions/:sessionId'
   }
 
+  const agentTimelineMatch = pathname.match(/^\/api\/agent-sessions\/[^/]+\/timeline$/)
+  if (agentTimelineMatch) {
+    return '/api/agent-sessions/:sessionId/timeline'
+  }
+
+  const agentTurnMatch = pathname.match(/^\/api\/agent-sessions\/[^/]+\/turns\/[^/]+$/)
+  if (agentTurnMatch) {
+    return '/api/agent-sessions/:sessionId/turns/:turnId'
+  }
+
+  const terminalViewportMatch = pathname.match(/^\/api\/terminals\/[^/]+\/viewport$/)
+  if (terminalViewportMatch) {
+    return '/api/terminals/:terminalId/viewport'
+  }
+
+  const terminalScrollbackMatch = pathname.match(/^\/api\/terminals\/[^/]+\/scrollback$/)
+  if (terminalScrollbackMatch) {
+    return '/api/terminals/:terminalId/scrollback'
+  }
+
+  const terminalSearchMatch = pathname.match(/^\/api\/terminals\/[^/]+\/search$/)
+  if (terminalSearchMatch) {
+    return '/api/terminals/:terminalId/search'
+  }
+
   const terminalRouteMatch = pathname.match(/^\/api\/terminals\/[^/]+$/)
   if (terminalRouteMatch) {
     return '/api/terminals/:terminalId'
