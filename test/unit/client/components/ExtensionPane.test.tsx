@@ -9,10 +9,12 @@ import type { ClientExtensionEntry } from '@shared/extension-types'
 import type { ExtensionPaneContent } from '@/store/paneTypes'
 
 // Mock the api module for port forwarding tests
+const mockApiGet = vi.fn()
 const mockApiPost = vi.fn()
 const mockApiDelete = vi.fn()
 vi.mock('@/lib/api', () => ({
   api: {
+    get: (...args: unknown[]) => mockApiGet(...args),
     post: (...args: unknown[]) => mockApiPost(...args),
     delete: (...args: unknown[]) => mockApiDelete(...args),
   },
@@ -46,6 +48,12 @@ function renderWithStore(
 afterEach(cleanup)
 
 describe('ExtensionPane', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    localStorage.clear()
+    localStorage.setItem('freshell.auth-token', 'test-token')
+  })
+
   it('renders iframe with correct URL for a server extension', () => {
     const ext: ClientExtensionEntry = {
       name: 'my-dashboard',
@@ -116,6 +124,67 @@ describe('ExtensionPane', () => {
     expect(
       screen.getByText('Extension "nonexistent-ext" is not installed or failed to load.'),
     ).toBeInTheDocument()
+  })
+
+  it('hydrates the extension registry on demand when the active pane entry is missing', async () => {
+    const ext: ClientExtensionEntry = {
+      name: 'notes-widget',
+      version: '0.1.0',
+      label: 'Notes Widget',
+      description: 'A notes widget',
+      category: 'client',
+      url: '/index.html',
+    }
+    mockApiGet.mockResolvedValue([ext])
+
+    const content: ExtensionPaneContent = {
+      kind: 'extension',
+      extensionName: 'notes-widget',
+      props: {},
+    }
+
+    renderWithStore(
+      <ExtensionPane tabId="tab-1" paneId="pane-1" content={content} />,
+      [],
+    )
+
+    await waitFor(() => {
+      expect(mockApiGet).toHaveBeenCalledWith(expect.stringContaining('/api/extensions'))
+    })
+
+    const iframe = await screen.findByTitle('Notes Widget')
+    expect(iframe).toBeInTheDocument()
+    expect((iframe as HTMLIFrameElement).src).toContain('/api/extensions/notes-widget/client/index.html')
+  })
+
+  it('does not hydrate the extension registry without an auth token', async () => {
+    localStorage.removeItem('freshell.auth-token')
+    mockApiGet.mockResolvedValue([
+      {
+        name: 'notes-widget',
+        version: '0.1.0',
+        label: 'Notes Widget',
+        description: 'A notes widget',
+        category: 'client',
+        url: '/index.html',
+      } satisfies ClientExtensionEntry,
+    ])
+
+    const content: ExtensionPaneContent = {
+      kind: 'extension',
+      extensionName: 'notes-widget',
+      props: {},
+    }
+
+    renderWithStore(
+      <ExtensionPane tabId="tab-1" paneId="pane-1" content={content} />,
+      [],
+    )
+
+    await Promise.resolve()
+
+    expect(mockApiGet).not.toHaveBeenCalled()
+    expect(screen.getByText('Extension not available')).toBeInTheDocument()
   })
 
   it('renders iframe with correct sandbox attributes', () => {
@@ -228,6 +297,7 @@ describe('ExtensionPane', () => {
 
   describe('auto-start server extensions', () => {
     beforeEach(() => {
+      mockApiGet.mockReset()
       mockApiPost.mockReset()
       mockApiDelete.mockReset()
       mockIsLoopback.mockReturnValue(true) // local access

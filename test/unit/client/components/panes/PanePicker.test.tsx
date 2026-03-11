@@ -9,6 +9,13 @@ import extensionsReducer from '@/store/extensionsSlice'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import type { DefaultNewPane, SidebarSortMode, TerminalTheme } from '@/store/types'
 
+const mockApiGet = vi.fn()
+vi.mock('@/lib/api', () => ({
+  api: {
+    get: (...args: unknown[]) => mockApiGet(...args),
+  },
+}))
+
 const mockClaudeExt: ClientExtensionEntry = {
   name: 'claude', version: '1.0.0', label: 'Claude CLI', description: '', category: 'cli',
   picker: { shortcut: 'L' },
@@ -124,6 +131,9 @@ const completeFadeAnimation = () => {
 describe('PanePicker', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mockApiGet.mockReset()
+    localStorage.clear()
+    localStorage.setItem('freshell.auth-token', 'test-token')
   })
 
   afterEach(() => {
@@ -235,6 +245,43 @@ describe('PanePicker', () => {
       expect(screen.getByRole('button', { name: 'Editor' })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Browser' })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Shell' })).toBeInTheDocument()
+    })
+
+    it('loads extension options on demand when the registry is empty', async () => {
+      mockApiGet.mockResolvedValue([
+        {
+          name: 'notes-widget',
+          version: '0.1.0',
+          label: 'Notes Widget',
+          description: 'A notes widget',
+          category: 'client',
+        },
+      ])
+
+      renderPicker()
+
+      expect(mockApiGet).toHaveBeenCalledWith(expect.stringContaining('/api/extensions'))
+      expect(await screen.findByRole('button', { name: 'Notes Widget' })).toBeInTheDocument()
+    })
+
+    it('does not load extension options on demand without an auth token', async () => {
+      localStorage.removeItem('freshell.auth-token')
+      mockApiGet.mockResolvedValue([
+        {
+          name: 'notes-widget',
+          version: '0.1.0',
+          label: 'Notes Widget',
+          description: 'A notes widget',
+          category: 'client',
+        },
+      ])
+
+      renderPicker()
+
+      await Promise.resolve()
+
+      expect(mockApiGet).not.toHaveBeenCalled()
+      expect(screen.queryByRole('button', { name: 'Notes Widget' })).not.toBeInTheDocument()
     })
   })
 

@@ -79,6 +79,12 @@ function waitForCondition(predicate: () => boolean, timeoutMs: number, errorMess
 }
 
 function defaultResponseForPath(path: string): unknown {
+  if (path === '/api/bootstrap') {
+    return {
+      settings: defaultSettings,
+      platform: { platform: 'linux', availableClis: {}, featureFlags: {} },
+    }
+  }
   if (path === '/api/settings') return defaultSettings
   if (path === '/api/platform') return { platform: 'linux', availableClis: {}, featureFlags: {} }
   if (path === '/api/version') return { currentVersion: '0.0.0', updateCheck: null }

@@ -474,7 +474,7 @@ export class WsHandler {
           chainDepth: result.chainDepth,
         })
 
-        this.broadcast({
+        this.broadcastSessionRepairActivity(result.sessionId, {
           type: 'session.repair.activity',
           event: 'scanned',
           sessionId: result.sessionId,
@@ -494,7 +494,7 @@ export class WsHandler {
           orphansFixed: result.orphansFixed,
         })
 
-        this.broadcast({
+        this.broadcastSessionRepairActivity(result.sessionId, {
           type: 'session.repair.activity',
           event: 'repaired',
           sessionId: result.sessionId,
@@ -506,7 +506,7 @@ export class WsHandler {
       }
 
       const onError = (sessionId: string, error: Error) => {
-        this.broadcast({
+        this.broadcastSessionRepairActivity(sessionId, {
           type: 'session.repair.activity',
           event: 'error',
           sessionId,
@@ -531,6 +531,17 @@ export class WsHandler {
         if (ws.readyState === WebSocket.OPEN) {
           this.send(ws, msg)
         }
+      }
+    }
+  }
+
+  private broadcastSessionRepairActivity(sessionId: string, msg: unknown): void {
+    for (const [ws, state] of this.clientStates) {
+      if (!state.authenticated || !state.interestedSessions.has(sessionId)) {
+        continue
+      }
+      if (ws.readyState === WebSocket.OPEN) {
+        this.send(ws, msg)
       }
     }
   }
@@ -1058,12 +1069,6 @@ export class WsHandler {
           timestamp: nowIso(),
           serverInstanceId: this.serverInstanceId,
         })
-        if (this.extensionManager) {
-          this.safeSend(ws, {
-            type: 'extensions.registry',
-            extensions: this.extensionManager.toClientRegistry(),
-          })
-        }
         this.scheduleHandshakeSnapshot(ws, state)
         return
       }

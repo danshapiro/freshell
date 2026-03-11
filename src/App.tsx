@@ -8,7 +8,7 @@ import {
 } from '@/store/sessionsSlice'
 import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { api, isApiUnauthorizedError, type VersionInfo } from '@/lib/api'
-import { loadInitialSessionsWindow, refreshActiveSessionWindow } from '@/store/sessionsThunks'
+import { refreshActiveSessionWindow } from '@/store/sessionsThunks'
 import { getShareAction, ensureShareUrlToken } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { collectSessionLocatorsFromTabs, getSessionsForHello } from '@/lib/session-utils'
@@ -284,13 +284,14 @@ export default function App() {
   }, [sidebarWidth, settings.sidebar, dispatch])
 
   const handleSidebarResizeEnd = useCallback(async () => {
+    if (!settingsLoaded) return
     try {
       await api.patch('/api/settings', { sidebar: settings.sidebar })
       dispatch(markSaved())
     } catch (err) {
       log.warn('Failed to save sidebar settings', err)
     }
-  }, [settings.sidebar, dispatch])
+  }, [settings.sidebar, dispatch, settingsLoaded])
 
   const toggleSidebarCollapse = useCallback(async () => {
     const newCollapsed = !sidebarCollapsed
@@ -301,13 +302,14 @@ export default function App() {
       triggerHapticFeedback()
     }
     dispatch(updateSettingsLocal({ sidebar: { ...settings.sidebar, collapsed: newCollapsed } }))
+    if (isMobile || !settingsLoaded) return
     try {
       await api.patch('/api/settings', { sidebar: { ...settings.sidebar, collapsed: newCollapsed } })
       dispatch(markSaved())
     } catch (err) {
       log.warn('Failed to save sidebar settings', err)
     }
-  }, [isMobile, sidebarCollapsed, settings.sidebar, dispatch])
+  }, [isMobile, sidebarCollapsed, settings.sidebar, dispatch, settingsLoaded])
 
   // Swipe gesture: right-swipe from left edge opens sidebar, left-swipe closes it
   const swipeStartXRef = useRef(0)
@@ -436,6 +438,11 @@ export default function App() {
         return true
       }
 
+      if (!getAuthToken()) {
+        dispatch(setStatus('disconnected'))
+        dispatch(setError('Authentication failed'))
+      }
+
       // ── WebSocket setup (synchronous) ─────────────────────────────
       // Register the message handler BEFORE any async work.  App.tsx is the
       // sole owner of the WebSocket connection. The socket may become ready
@@ -485,11 +492,6 @@ export default function App() {
         if (Date.now() - lastLoadedAt > RECENT_HTTP_SESSIONS_BASELINE_MS) return false
         dispatch(markWsSnapshotReceived())
         return true
-      }
-
-      const loadSidebarSessionsSnapshot = async () => {
-        await appStore.dispatch(loadInitialSessionsWindow() as any)
-        return appStore.getState().sessions.windows.sidebar ?? appStore.getState().sessions
       }
 
       const unsubscribe = ws.onMessage((msg) => {
@@ -612,36 +614,46 @@ export default function App() {
 
       // ── HTTP bootstrap (async) ────────────────────────────────────
       try {
-        const settings = await api.get('/api/settings')
-        if (!cancelled) dispatch(setSettings(applyLocalTerminalFontFamily(settings)))
-      } catch (err: any) {
-        if (handleBootstrapAuthFailure(err)) return
-        log.warn('Failed to load settings', err)
-      }
-
-      try {
-        const platformInfo = await api.get<{
-          platform: string
-          availableClis?: Record<string, boolean>
-          hostName?: string
-          featureFlags?: Record<string, boolean>
-        }>('/api/platform')
+        const bootstrapData = await api.get<{
+          settings?: AppSettings
+          platform?: {
+            platform: string
+            availableClis?: Record<string, boolean>
+            hostName?: string
+            featureFlags?: Record<string, boolean>
+          }
+          configFallback?: {
+            reason?: unknown
+            backupExists?: unknown
+          }
+        }>('/api/bootstrap')
         if (!cancelled) {
-          dispatch(setPlatform(platformInfo.platform))
-          if (platformInfo.availableClis) {
-            dispatch(setAvailableClis(platformInfo.availableClis))
+          if (bootstrapData.settings) {
+            dispatch(setSettings(applyLocalTerminalFontFamily(bootstrapData.settings)))
           }
-          if (platformInfo.featureFlags) {
-            dispatch(setFeatureFlags(platformInfo.featureFlags))
+          if (bootstrapData.platform) {
+            dispatch(setPlatform(bootstrapData.platform.platform))
+            if (bootstrapData.platform.availableClis) {
+              dispatch(setAvailableClis(bootstrapData.platform.availableClis))
+            }
+            if (bootstrapData.platform.featureFlags) {
+              dispatch(setFeatureFlags(bootstrapData.platform.featureFlags))
+            }
+            dispatch(setTabRegistryDeviceMeta(resolveAndPersistDeviceMeta({
+              platform: bootstrapData.platform.platform,
+              hostName: bootstrapData.platform.hostName,
+            })))
           }
-          dispatch(setTabRegistryDeviceMeta(resolveAndPersistDeviceMeta({
-            platform: platformInfo.platform,
-            hostName: platformInfo.hostName,
-          })))
+          if (bootstrapData.configFallback) {
+            setConfigFallback({
+              reason: parseConfigFallbackReason(bootstrapData.configFallback.reason),
+              backupExists: !!bootstrapData.configFallback.backupExists,
+            })
+          }
         }
       } catch (err: any) {
         if (handleBootstrapAuthFailure(err)) return
-        log.warn('Failed to load platform info', err)
+        log.warn('Failed to load bootstrap data', err)
       }
 
       try {
@@ -652,13 +664,6 @@ export default function App() {
       } catch (err: any) {
         if (handleBootstrapAuthFailure(err)) return
         log.warn('Failed to load version info', err)
-      }
-
-      try {
-        await loadSidebarSessionsSnapshot()
-      } catch (err: any) {
-        if (handleBootstrapAuthFailure(err)) return
-        log.warn('Failed to load sessions', err)
       }
 
       // Load network status for remote access wizard/settings
@@ -676,16 +681,7 @@ export default function App() {
         dispatch(setServerInstanceId(ws.serverInstanceId))
         dispatch(resetWsSnapshotReceived())
 
-        const promoted = promoteRecentHttpSessionsBaseline()
-        if (!promoted) {
-          try {
-            await loadSidebarSessionsSnapshot()
-            if (!cancelled) dispatch(markWsSnapshotReceived())
-          } catch (err: any) {
-            if (handleBootstrapAuthFailure(err)) return
-            log.warn('Failed to refresh sessions for pre-connected websocket', err)
-          }
-        }
+        promoteRecentHttpSessionsBaseline()
 
         if (!cancelled) {
           requestCodexActivityList()

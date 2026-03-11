@@ -11,7 +11,7 @@ import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
 import extensionsReducer from '@/store/extensionsSlice'
-import terminalDirectoryReducer from '@/store/terminalDirectorySlice'
+import terminalDirectoryReducer, { setTerminalDirectoryWindowData } from '@/store/terminalDirectorySlice'
 import type { ProjectGroup, BackgroundTerminal, TabMode } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
@@ -195,6 +195,16 @@ function createTestStore(options?: {
       extensions: {
         entries: defaultCliExtensions,
       },
+      terminalDirectory: {
+        windows: {
+          sidebar: {
+            items: options?.terminals ?? [],
+            nextCursor: null,
+            revision: 1,
+          },
+        },
+        searches: {},
+      },
     },
   })
 }
@@ -209,11 +219,14 @@ function renderSidebar(
   terminals: BackgroundTerminal[] = []
 ) {
   const onNavigate = vi.fn()
-  mockGetTerminalDirectoryPage.mockImplementation(async () => ({
-    items: terminals,
-    nextCursor: null,
-    revision: 1,
-  }))
+  if (terminals.length > 0) {
+    store.dispatch(setTerminalDirectoryWindowData({
+      surface: 'sidebar',
+      items: terminals,
+      nextCursor: null,
+      revision: 1,
+    }))
+  }
 
   const result = render(
     <Provider store={store}>
@@ -244,6 +257,48 @@ describe('Sidebar Component - Session-Centric Display', () => {
   })
 
   describe('displays sessions only (not terminals)', () => {
+    it('keeps restored open sessions visible without issuing sidebar directory fetches on mount', () => {
+      const store = createTestStore({
+        tabs: [{
+          id: 'tab-restored',
+          title: 'Restored Session',
+          mode: 'codex',
+          resumeSessionId: 'codex-restored',
+          createdAt: 2_000,
+        }],
+        panes: {
+          layouts: {
+            'tab-restored': {
+              type: 'leaf',
+              id: 'pane-restored',
+              content: {
+                kind: 'terminal',
+                mode: 'codex',
+                createRequestId: 'req-restored',
+                status: 'running',
+                resumeSessionId: 'codex-restored',
+                cwd: '/tmp/restored-project',
+              },
+            },
+          },
+          activePane: {
+            'tab-restored': 'pane-restored',
+          },
+          paneTitles: {
+            'tab-restored': {
+              'pane-restored': 'Restored Session',
+            },
+          },
+        },
+      })
+
+      renderSidebar(store)
+
+      expect(screen.getAllByText('Restored Session').length).toBeGreaterThan(0)
+      expect(mockFetchSidebarSessionsSnapshot).not.toHaveBeenCalled()
+      expect(mockGetTerminalDirectoryPage).not.toHaveBeenCalled()
+    })
+
     it('shows sessions from projects', async () => {
       const projects: ProjectGroup[] = [
         {

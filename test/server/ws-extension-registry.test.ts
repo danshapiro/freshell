@@ -165,15 +165,16 @@ describe('ws extension registry', () => {
     await new Promise<void>((resolve) => server!.close(() => resolve()))
   }, HOOK_TIMEOUT_MS)
 
-  it('sends extensions.registry message after ready on hello', async () => {
+  it('does not send extensions.registry eagerly during hello handshake', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const received: any[] = []
 
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
 
-      const MSG_TIMEOUT = 10_000
-      const readyPromise = waitForMessage(ws, (m) => m.type === 'ready', MSG_TIMEOUT)
-      const registryPromise = waitForMessage(ws, (m) => m.type === 'extensions.registry', MSG_TIMEOUT)
+      ws.on('message', (data) => {
+        received.push(JSON.parse(data.toString()))
+      })
 
       ws.send(JSON.stringify({
         type: 'hello',
@@ -181,16 +182,11 @@ describe('ws extension registry', () => {
         protocolVersion: WS_PROTOCOL_VERSION,
       }))
 
-      await readyPromise
-      const registryMsg = await registryPromise
+      await waitForMessage(ws, (m) => m.type === 'ready', 10_000)
+      await new Promise((resolve) => setTimeout(resolve, 200))
 
-      expect(registryMsg.type).toBe('extensions.registry')
-      expect(registryMsg.extensions).toEqual(fakeExtensions)
-      expect(registryMsg.extensions).toHaveLength(2)
-      expect(registryMsg.extensions[0].name).toBe('test-ext')
-      expect(registryMsg.extensions[1].name).toBe('server-ext')
-      expect(registryMsg.extensions[1].serverRunning).toBe(true)
-      expect(registryMsg.extensions[1].serverPort).toBe(9999)
+      const extensionMessages = received.filter((m) => m.type === 'extensions.registry')
+      expect(extensionMessages).toHaveLength(0)
     } finally {
       await closeWebSocket(ws)
     }

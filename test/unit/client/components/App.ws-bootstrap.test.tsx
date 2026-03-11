@@ -93,6 +93,7 @@ function createStore(options?: {
     zoomedPane?: Record<string, string>
   }
   codexActivity?: Partial<CodexActivityState>
+  sessions?: Record<string, unknown>
 }) {
   const defaultCodexActivity: CodexActivityState = {
     byTerminalId: {},
@@ -136,7 +137,15 @@ function createStore(options?: {
         platform: null,
         availableClis: {},
       },
-      sessions: { projects: [], expandedProjects: new Set<string>(), wsSnapshotReceived: false, isLoading: false, error: null },
+      sessions: {
+        projects: [],
+        expandedProjects: new Set<string>(),
+        wsSnapshotReceived: false,
+        isLoading: false,
+        error: null,
+        windows: {},
+        ...options?.sessions,
+      },
       panes,
       network: { status: null, loading: false, configuring: false, error: null },
       codexActivity: {
@@ -184,6 +193,13 @@ describe('App WS bootstrap recovery', () => {
 
     // Keep API calls fast and deterministic.
     apiGet.mockImplementation((url: string) => {
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: defaultSettings,
+          platform: { platform: 'linux' },
+          shell: { authenticated: true, ready: true },
+        })
+      }
       if (url === '/api/settings') return Promise.resolve(defaultSettings)
       if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
       return Promise.resolve({})
@@ -194,7 +210,7 @@ describe('App WS bootstrap recovery', () => {
     cleanup()
   })
 
-  it('marks connection as auth-required and skips websocket connect when bootstrap settings request returns 401', async () => {
+  it('marks connection as auth-required and skips websocket connect when the bootstrap request returns 401', async () => {
     const store = createStore({
       codexActivity: {
         byTerminalId: {
@@ -210,7 +226,7 @@ describe('App WS bootstrap recovery', () => {
       },
     })
     apiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') {
+      if (url === '/api/bootstrap') {
         return Promise.reject({ status: 401, message: 'Unauthorized' })
       }
       return Promise.resolve({})
@@ -244,6 +260,25 @@ describe('App WS bootstrap recovery', () => {
     await waitFor(() => {
       expect(wsMocks.connect).toHaveBeenCalledTimes(1)
     })
+  })
+
+  it('loads shell-critical bootstrap through /api/bootstrap without falling back to legacy settings/platform reads', async () => {
+    const store = createStore()
+    wsMocks.connect.mockResolvedValueOnce(undefined)
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.connect).toHaveBeenCalledTimes(1)
+    })
+
+    expect(apiGet).toHaveBeenCalledWith('/api/bootstrap')
+    expect(apiGet).not.toHaveBeenCalledWith('/api/settings')
+    expect(apiGet).not.toHaveBeenCalledWith('/api/platform')
   })
 
   it('clears stale codex activity immediately when bootstrap attaches to an already-ready socket', async () => {
@@ -460,31 +495,9 @@ describe('App WS bootstrap recovery', () => {
     expect(extension?.client?.mobile).toBe(true)
   })
 
-  it('loads the bootstrap sidebar window through the HTTP session-directory helper', async () => {
-    const olderOpenSessionId = 'older-open'
-    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
-      projects: [
-        {
-          projectPath: '/older',
-          sessions: [
-            {
-              provider: 'codex',
-              sessionId: olderOpenSessionId,
-              projectPath: '/older',
-              updatedAt: 1,
-              title: 'Older Open Session',
-            },
-          ],
-        },
-      ],
-      totalSessions: 101,
-      oldestIncludedTimestamp: 55,
-      oldestIncludedSessionId: 'codex:cursor',
-      hasMore: true,
-    })
-
+  it('does not load the sidebar session window during bootstrap', async () => {
     const store = createStore({
-      tabs: [{ id: 'tab-older', mode: 'codex', resumeSessionId: olderOpenSessionId }],
+      tabs: [{ id: 'tab-older', mode: 'codex', resumeSessionId: 'older-open' }],
       panes: {
         layouts: {
           'tab-older': {
@@ -495,10 +508,10 @@ describe('App WS bootstrap recovery', () => {
               mode: 'codex',
               createRequestId: 'req-older',
               status: 'running',
-              resumeSessionId: olderOpenSessionId,
+              resumeSessionId: 'older-open',
               sessionRef: {
                 provider: 'codex',
-                sessionId: olderOpenSessionId,
+                sessionId: 'older-open',
                 serverInstanceId: 'srv-local',
               },
             },
@@ -517,33 +530,35 @@ describe('App WS bootstrap recovery', () => {
     )
 
     await waitFor(() => {
-      expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledWith({
-        limit: 50,
-        signal: expect.any(AbortSignal),
-      })
-      expect(store.getState().sessions.projects.map((project: any) => project.projectPath)).toEqual(['/older'])
-      expect(store.getState().sessions.oldestLoadedSessionId).toBe('codex:cursor')
-      expect(store.getState().sessions.hasMore).toBe(true)
+      expect(wsMocks.connect).toHaveBeenCalledTimes(1)
     })
+
+    expect(fetchSidebarSessionsSnapshot).not.toHaveBeenCalled()
+    expect(store.getState().sessions.projects).toEqual([])
   })
 
   it('ignores legacy sessions.patch messages when bootstrapping against an already-ready socket', async () => {
-    const store = createStore()
-    wsMocks.isReady = true
-    wsMocks.serverInstanceId = 'srv-preconnected'
-
-    fetchSidebarSessionsSnapshot.mockResolvedValueOnce([
+    const baselineProjects = [
       {
         projectPath: '/p1',
         sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', updatedAt: 1 }],
       },
-    ])
-
-    apiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') return Promise.resolve(defaultSettings)
-      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
-      return Promise.resolve({})
+    ]
+    const store = createStore({
+      sessions: {
+        projects: baselineProjects,
+        lastLoadedAt: Date.now(),
+        activeSurface: 'sidebar',
+        windows: {
+          sidebar: {
+            projects: baselineProjects,
+            lastLoadedAt: Date.now(),
+          },
+        },
+      },
     })
+    wsMocks.isReady = true
+    wsMocks.serverInstanceId = 'srv-preconnected'
 
     render(
       <Provider store={store}>
@@ -560,6 +575,7 @@ describe('App WS bootstrap recovery', () => {
     expect(wsMocks.connect).not.toHaveBeenCalled()
     expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))
+    expect(fetchSidebarSessionsSnapshot).not.toHaveBeenCalled()
     expect(store.getState().sessions.projects.map((p: any) => p.projectPath)).toEqual(['/p1'])
 
     act(() => {
@@ -573,7 +589,7 @@ describe('App WS bootstrap recovery', () => {
     expect(store.getState().sessions.projects.map((p: any) => p.projectPath)).toEqual(['/p1'])
   })
 
-  it('falls back to refetch sessions when pre-connected socket has no recent baseline', async () => {
+  it('does not refetch sessions when a pre-connected socket has no recent baseline', async () => {
     const olderOpenSessionId = 'older-open'
     const store = createStore({
       tabs: [{ id: 'tab-older', mode: 'codex', resumeSessionId: olderOpenSessionId }],
@@ -604,21 +620,6 @@ describe('App WS bootstrap recovery', () => {
     wsMocks.isReady = true
     wsMocks.serverInstanceId = 'srv-preconnected-fallback'
 
-    fetchSidebarSessionsSnapshot
-      .mockRejectedValueOnce(new Error('initial sessions load failed'))
-      .mockResolvedValueOnce([
-        {
-          projectPath: '/p-fallback',
-          sessions: [{ provider: 'codex', sessionId: 's-fallback', projectPath: '/p-fallback', updatedAt: 3 }],
-        },
-      ])
-
-    apiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') return Promise.resolve(defaultSettings)
-      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
-      return Promise.resolve({})
-    })
-
     render(
       <Provider store={store}>
         <App />
@@ -628,18 +629,11 @@ describe('App WS bootstrap recovery', () => {
     await waitFor(() => {
       expect(store.getState().connection.status).toBe('ready')
       expect(store.getState().connection.serverInstanceId).toBe('srv-preconnected-fallback')
-      expect(store.getState().sessions.wsSnapshotReceived).toBe(true)
-      expect(store.getState().sessions.projects.map((p: any) => p.projectPath)).toEqual(['/p-fallback'])
+      expect(store.getState().sessions.wsSnapshotReceived).toBe(false)
+      expect(store.getState().sessions.projects).toEqual([])
     })
 
-    expect(fetchSidebarSessionsSnapshot).toHaveBeenNthCalledWith(1, {
-      limit: 50,
-      signal: expect.any(AbortSignal),
-    })
-    expect(fetchSidebarSessionsSnapshot).toHaveBeenNthCalledWith(2, {
-      limit: 50,
-      signal: expect.any(AbortSignal),
-    })
+    expect(fetchSidebarSessionsSnapshot).not.toHaveBeenCalled()
     expect(wsMocks.connect).not.toHaveBeenCalled()
     expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))

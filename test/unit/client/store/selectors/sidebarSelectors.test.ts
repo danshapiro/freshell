@@ -173,6 +173,52 @@ describe('sidebarSelectors', () => {
       expect(hasTabBySessionId.get(validClaudeSessionId)).toBe(true)
       expect(hasTabBySessionId.get(invalidClaudeSessionId)).toBe(false)
     })
+
+    it('synthesizes a local fallback row for restored open sessions that are not in the current server window', () => {
+      const fallbackSessionId = 'codex-restored'
+      const tabs = [
+        { id: 'tab-restored', title: 'Restored Session', mode: 'codex', resumeSessionId: fallbackSessionId, createdAt: 2_000 },
+      ] as any
+
+      const panes = {
+        layouts: {
+          'tab-restored': {
+            type: 'leaf',
+            id: 'pane-restored',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              status: 'running',
+              createRequestId: 'req-restored',
+              resumeSessionId: fallbackSessionId,
+              initialCwd: '/tmp/restored-project',
+            },
+          },
+        },
+        activePane: {
+          'tab-restored': 'pane-restored',
+        },
+        paneTitles: {
+          'tab-restored': {
+            'pane-restored': 'Restored Session',
+          },
+        },
+      } as any
+
+      const items = buildSessionItems([], tabs, panes, emptyTerminals, emptyActivity)
+
+      expect(items).toEqual([
+        expect.objectContaining({
+          sessionId: fallbackSessionId,
+          provider: 'codex',
+          sessionType: 'codex',
+          title: 'Restored Session',
+          hasTab: true,
+          hasTitle: true,
+          cwd: '/tmp/restored-project',
+        }),
+      ])
+    })
   })
 
   describe('sortSessionItems', () => {

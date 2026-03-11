@@ -567,8 +567,12 @@ describe('App Component - WS Notifications', () => {
       return () => { messageHandler = null }
     })
     mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') return Promise.resolve(defaultSettings)
-      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: defaultSettings,
+          platform: { platform: 'linux' },
+        })
+      }
       if (url === '/api/version') return Promise.resolve(makeVersionInfo())
       if (typeof url === 'string' && url.startsWith('/api/sessions')) return Promise.resolve([])
       return Promise.resolve({})
@@ -689,7 +693,7 @@ describe('App Bootstrap', () => {
     })
   })
 
-  it('does not refetch settings or sessions after websocket connect', async () => {
+  it('does not refetch bootstrap data or eager sidebar sessions after websocket connect', async () => {
     let resolveConnect: () => void
     const connectPromise = new Promise<void>((resolve) => {
       resolveConnect = resolve
@@ -704,9 +708,13 @@ describe('App Bootstrap', () => {
 
     await waitFor(() => {
       const sessionsCalls = fetchSidebarSessionsSnapshot.mock.calls
+      const bootstrapCalls = mockApiGet.mock.calls.filter(([url]) => url === '/api/bootstrap')
       const settingsCalls = mockApiGet.mock.calls.filter(([url]) => url === '/api/settings')
-      expect(sessionsCalls.length).toBe(1)
-      expect(settingsCalls.length).toBe(1)
+      const platformCalls = mockApiGet.mock.calls.filter(([url]) => url === '/api/platform')
+      expect(sessionsCalls.length).toBe(0)
+      expect(bootstrapCalls.length).toBe(1)
+      expect(settingsCalls.length).toBe(0)
+      expect(platformCalls.length).toBe(0)
     })
 
     resolveConnect!()
@@ -714,9 +722,13 @@ describe('App Bootstrap', () => {
     await Promise.resolve()
 
     const sessionsCalls = fetchSidebarSessionsSnapshot.mock.calls
+    const bootstrapCalls = mockApiGet.mock.calls.filter(([url]) => url === '/api/bootstrap')
     const settingsCalls = mockApiGet.mock.calls.filter(([url]) => url === '/api/settings')
-    expect(sessionsCalls.length).toBe(1)
-    expect(settingsCalls.length).toBe(1)
+    const platformCalls = mockApiGet.mock.calls.filter(([url]) => url === '/api/platform')
+    expect(sessionsCalls.length).toBe(0)
+    expect(bootstrapCalls.length).toBe(1)
+    expect(settingsCalls.length).toBe(0)
+    expect(platformCalls.length).toBe(0)
   })
 })
 

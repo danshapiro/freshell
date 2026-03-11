@@ -15,8 +15,7 @@ import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { getActiveSessionRefForTab } from '@/lib/session-utils'
 import { useStableArray } from '@/hooks/useStableArray'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
-import { activateSessionSurface, fetchSessionWindow } from '@/store/sessionsThunks'
-import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
+import { fetchSessionWindow } from '@/store/sessionsThunks'
 
 const EMPTY_TERMINALS: BackgroundTerminal[] = []
 
@@ -245,30 +244,6 @@ export default function Sidebar({
     const id = window.setInterval(() => setTimestampTick((t) => t + 1), 15_000)
     return () => window.clearInterval(id)
   }, [])
-
-  useEffect(() => {
-    if (sidebarWindow || topLevelSessionCount > 0) return
-    dispatch(activateSessionSurface('sidebar'))
-    void dispatch(fetchSessionWindow({
-      surface: 'sidebar',
-      priority: 'visible',
-    }) as any)
-  }, [dispatch, sidebarWindow, topLevelSessionCount])
-
-  const refreshTerminals = useCallback(() => {
-    void dispatch(fetchTerminalDirectoryWindow({
-      surface: 'sidebar',
-      priority: 'visible',
-    }) as any).catch(() => {})
-  }, [dispatch])
-
-  useEffect(() => {
-    refreshTerminals()
-    const interval = window.setInterval(refreshTerminals, 10000)
-    return () => {
-      window.clearInterval(interval)
-    }
-  }, [refreshTerminals])
 
   useEffect(() => {
     const query = filter.trim()

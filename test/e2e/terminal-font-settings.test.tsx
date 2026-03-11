@@ -200,14 +200,14 @@ describe('terminal font preference (e2e)', () => {
     localStorage.setItem(LOCAL_TERMINAL_FONT_KEY, 'Fira Code')
 
     mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') {
+      if (url === '/api/bootstrap') {
         return Promise.resolve({
-          ...defaultSettings,
-          terminal: { ...defaultSettings.terminal, fontFamily: 'Consolas' },
+          settings: {
+            ...defaultSettings,
+            terminal: { ...defaultSettings.terminal, fontFamily: 'Consolas' },
+          },
+          platform: { platform: 'darwin' },
         })
-      }
-      if (url === '/api/platform') {
-        return Promise.resolve({ platform: 'darwin' })
       }
       return Promise.resolve({})
     })
@@ -216,7 +216,7 @@ describe('terminal font preference (e2e)', () => {
     renderApp(store)
 
     await waitFor(() => {
-      expect(mockApiGet).toHaveBeenCalledWith('/api/settings')
+      expect(mockApiGet).toHaveBeenCalledWith('/api/bootstrap')
     })
 
     expect(store.getState().settings.settings.terminal.fontFamily).toBe('Fira Code')
@@ -224,14 +224,14 @@ describe('terminal font preference (e2e)', () => {
 
   it('ignores server font when no local preference exists', async () => {
     mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') {
+      if (url === '/api/bootstrap') {
         return Promise.resolve({
-          ...defaultSettings,
-          terminal: { ...defaultSettings.terminal, fontFamily: 'Consolas' },
+          settings: {
+            ...defaultSettings,
+            terminal: { ...defaultSettings.terminal, fontFamily: 'Consolas' },
+          },
+          platform: { platform: 'darwin' },
         })
-      }
-      if (url === '/api/platform') {
-        return Promise.resolve({ platform: 'darwin' })
       }
       return Promise.resolve({})
     })
@@ -240,7 +240,7 @@ describe('terminal font preference (e2e)', () => {
     renderApp(store)
 
     await waitFor(() => {
-      expect(mockApiGet).toHaveBeenCalledWith('/api/settings')
+      expect(mockApiGet).toHaveBeenCalledWith('/api/bootstrap')
     })
 
     expect(store.getState().settings.settings.terminal.fontFamily).toBe('monospace')

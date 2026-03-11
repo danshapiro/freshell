@@ -144,11 +144,8 @@ describe('App perf audit milestones', () => {
     apiGet.mockReset()
     wsMocks.connect.mockClear()
     apiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') {
+      if (url === '/api/bootstrap') {
         return Promise.reject({ status: 401, message: 'Unauthorized' })
-      }
-      if (url === '/api/platform') {
-        return Promise.resolve({ platform: 'linux' })
       }
       return Promise.resolve({})
     })

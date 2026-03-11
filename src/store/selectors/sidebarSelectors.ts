@@ -1,7 +1,8 @@
 import { createSelector } from '@reduxjs/toolkit'
 import type { RootState } from '../store'
 import type { BackgroundTerminal, CodingCliProviderName } from '../types'
-import { collectSessionRefsFromTabs } from '@/lib/session-utils'
+import { isValidClaudeSessionId } from '@/lib/claude-session-id'
+import { collectSessionRefsFromNode, collectSessionRefsFromTabs } from '@/lib/session-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 
 export interface SidebarSessionItem {
@@ -111,6 +112,108 @@ export function buildSessionItems(
         firstUserMessage: session.firstUserMessage,
       })
     }
+  }
+
+  const knownKeys = new Set(items.map((item) => `${item.provider}:${item.sessionId}`))
+  const paneTitles = panes?.paneTitles ?? {}
+
+  const pushFallbackItem = (input: {
+    provider: CodingCliProviderName
+    sessionId: string
+    sessionType: string
+    title?: string
+    cwd?: string
+    timestamp?: number
+  }) => {
+    const key = `${input.provider}:${input.sessionId}`
+    if (knownKeys.has(key)) return
+    knownKeys.add(key)
+
+    const fallbackTitle = input.title?.trim() || input.sessionId.slice(0, 8)
+    const runningTerminal = runningSessionMap.get(key)
+    const runningTerminalId = runningTerminal?.terminalId
+    items.push({
+      id: `session-${input.provider}-${input.sessionId}`,
+      sessionId: input.sessionId,
+      provider: input.provider,
+      sessionType: input.sessionType,
+      title: fallbackTitle,
+      hasTitle: fallbackTitle !== input.sessionId.slice(0, 8),
+      subtitle: input.cwd ? getProjectName(input.cwd) : undefined,
+      projectPath: input.cwd,
+      timestamp: input.timestamp ?? 0,
+      cwd: input.cwd,
+      hasTab: true,
+      ratchetedActivity: sessionActivity[key],
+      isRunning: !!runningTerminalId,
+      runningTerminalId,
+    })
+  }
+
+  const collectFallbackItemsFromNode = (
+    node: RootState['panes']['layouts'][string],
+    tab: RootState['tabs']['tabs'][number],
+  ) => {
+    if (node.type !== 'leaf') {
+      collectFallbackItemsFromNode(node.children[0], tab)
+      collectFallbackItemsFromNode(node.children[1], tab)
+      return
+    }
+
+    const paneTitle = paneTitles?.[tab.id]?.[node.id]
+    const fallbackTimestamp = tab.lastInputAt ?? tab.createdAt ?? 0
+
+    if (node.content.kind === 'agent-chat') {
+      const sessionId = node.content.resumeSessionId
+      if (!sessionId || !isValidClaudeSessionId(sessionId)) return
+      pushFallbackItem({
+        provider: 'claude',
+        sessionId,
+        sessionType: node.content.provider || 'claude',
+        title: paneTitle || tab.title,
+        cwd: undefined,
+        timestamp: fallbackTimestamp,
+      })
+      return
+    }
+
+    if (node.content.kind !== 'terminal') return
+    if (node.content.mode === 'shell' || !node.content.resumeSessionId) return
+    if (node.content.mode === 'claude' && !isValidClaudeSessionId(node.content.resumeSessionId)) return
+
+    pushFallbackItem({
+      provider: node.content.mode,
+      sessionId: node.content.resumeSessionId,
+      sessionType: node.content.mode,
+      title: paneTitle || tab.title,
+      cwd: node.content.initialCwd,
+      timestamp: fallbackTimestamp,
+    })
+  }
+
+  for (const tab of tabs || []) {
+    const layout = panes.layouts?.[tab.id]
+    if (layout) {
+      const refs = collectSessionRefsFromNode(layout)
+      if (refs.length > 0) {
+        collectFallbackItemsFromNode(layout, tab)
+      }
+      continue
+    }
+
+    const provider = tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
+    const sessionId = tab.resumeSessionId
+    if (!provider || !sessionId) continue
+    if (provider === 'claude' && !isValidClaudeSessionId(sessionId)) continue
+
+    pushFallbackItem({
+      provider,
+      sessionId,
+      sessionType: provider,
+      title: tab.title,
+      cwd: undefined,
+      timestamp: tab.lastInputAt ?? tab.createdAt ?? 0,
+    })
   }
 
   return items

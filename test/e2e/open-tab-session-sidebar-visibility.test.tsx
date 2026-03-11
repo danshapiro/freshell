@@ -130,6 +130,7 @@ function createStore(options?: {
     status: 'disconnected' | 'connecting' | 'connected' | 'ready'
     serverInstanceId?: string
   }>
+  sessions?: Record<string, unknown>
 }) {
   const tabs = options?.tabs ?? [{ id: 'tab-1', mode: 'shell', title: 'Tab 1' }]
   const panes = {
@@ -191,6 +192,8 @@ function createStore(options?: {
         wsSnapshotReceived: false,
         isLoading: false,
         error: null,
+        windows: {},
+        ...options?.sessions,
       },
       panes,
       sessionActivity: {
@@ -231,6 +234,13 @@ describe('open tab session sidebar visibility (e2e)', () => {
     searchSessions.mockClear()
 
     apiGet.mockImplementation((url: string) => {
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: defaultSettings,
+          platform: { platform: 'linux' },
+          shell: { authenticated: true, ready: true },
+        })
+      }
       if (url === '/api/settings') return Promise.resolve(defaultSettings)
       if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
       if (url === '/api/version') return Promise.resolve({})
@@ -243,29 +253,12 @@ describe('open tab session sidebar visibility (e2e)', () => {
     cleanup()
   })
 
-  it('shows an older open local session in the sidebar during bootstrap', async () => {
+  it('shows a restored open local session in the sidebar during bootstrap without issuing a sidebar snapshot fetch', async () => {
     const olderOpenSessionId = 'older-open'
-    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
-      projects: [{
-        projectPath: '/older',
-        sessions: [{
-          provider: 'codex',
-          sessionId: olderOpenSessionId,
-          projectPath: '/older',
-          updatedAt: 1,
-          title: 'Older Open Session',
-        }],
-      }],
-      totalSessions: 101,
-      oldestIncludedTimestamp: 55,
-      oldestIncludedSessionId: 'codex:cursor',
-      hasMore: true,
-    })
-
     const store = createStore({
       tabs: [{
         id: 'tab-older',
-        title: 'Codex CLI',
+        title: 'Older Open Session',
         mode: 'codex',
         resumeSessionId: olderOpenSessionId,
       }],
@@ -291,6 +284,11 @@ describe('open tab session sidebar visibility (e2e)', () => {
         activePane: {
           'tab-older': 'pane-older',
         },
+        paneTitles: {
+          'tab-older': {
+            'pane-older': 'Older Open Session',
+          },
+        },
       },
     })
 
@@ -301,29 +299,45 @@ describe('open tab session sidebar visibility (e2e)', () => {
     )
 
     await waitFor(() => {
-      expect(screen.getByText('Older Open Session')).toBeInTheDocument()
+      expect(screen.getAllByText('Older Open Session').length).toBeGreaterThan(0)
     })
+
+    expect(fetchSidebarSessionsSnapshot).not.toHaveBeenCalled()
   })
 
   it('ignores legacy sessions.updated websocket pushes because the sidebar window is HTTP-owned', async () => {
-    fetchSidebarSessionsSnapshot.mockResolvedValue({
-      projects: [{
+    const recentProjects = [{
+      projectPath: '/recent',
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'recent-session',
         projectPath: '/recent',
-        sessions: [{
-          provider: 'codex',
-          sessionId: 'recent-session',
-          projectPath: '/recent',
-          updatedAt: 10,
-          title: 'Recent Session',
-        }],
+        updatedAt: 10,
+        title: 'Recent Session',
       }],
-      totalSessions: 100,
-      oldestIncludedTimestamp: 10,
-      oldestIncludedSessionId: 'codex:recent-session',
-      hasMore: true,
-    })
+    }]
 
-    const store = createStore()
+    const store = createStore({
+      sessions: {
+        projects: recentProjects,
+        activeSurface: 'sidebar',
+        lastLoadedAt: Date.now(),
+        totalSessions: 100,
+        oldestLoadedTimestamp: 10,
+        oldestLoadedSessionId: 'codex:recent-session',
+        hasMore: true,
+        windows: {
+          sidebar: {
+            projects: recentProjects,
+            lastLoadedAt: Date.now(),
+            totalSessions: 100,
+            oldestLoadedTimestamp: 10,
+            oldestLoadedSessionId: 'codex:recent-session',
+            hasMore: true,
+          },
+        },
+      },
+    })
 
     render(
       <Provider store={store}>
@@ -331,19 +345,7 @@ describe('open tab session sidebar visibility (e2e)', () => {
       </Provider>,
     )
 
-    await waitFor(() => {
-      expect(store.getState().sessions.projects).toEqual([
-        expect.objectContaining({
-          projectPath: '/recent',
-          sessions: expect.arrayContaining([
-            expect.objectContaining({
-              sessionId: 'recent-session',
-              title: 'Recent Session',
-            }),
-          ]),
-        }),
-      ])
-    })
+    expect(store.getState().sessions.projects).toEqual(recentProjects)
 
     act(() => {
       broadcastWs({
@@ -380,22 +382,16 @@ describe('open tab session sidebar visibility (e2e)', () => {
   })
 
   it('refetches the active sidebar window over HTTP when sessions.changed arrives', async () => {
-    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
-      projects: [{
+    const recentProjects = [{
+      projectPath: '/recent',
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'recent-session',
         projectPath: '/recent',
-        sessions: [{
-          provider: 'codex',
-          sessionId: 'recent-session',
-          projectPath: '/recent',
-          updatedAt: 10,
-          title: 'Recent Session',
-        }],
+        updatedAt: 10,
+        title: 'Recent Session',
       }],
-      totalSessions: 100,
-      oldestIncludedTimestamp: 10,
-      oldestIncludedSessionId: 'codex:recent-session',
-      hasMore: true,
-    })
+    }]
     fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
       projects: [{
         projectPath: '/older',
@@ -413,7 +409,27 @@ describe('open tab session sidebar visibility (e2e)', () => {
       hasMore: false,
     })
 
-    const store = createStore()
+    const store = createStore({
+      sessions: {
+        projects: recentProjects,
+        activeSurface: 'sidebar',
+        lastLoadedAt: Date.now(),
+        totalSessions: 100,
+        oldestLoadedTimestamp: 10,
+        oldestLoadedSessionId: 'codex:recent-session',
+        hasMore: true,
+        windows: {
+          sidebar: {
+            projects: recentProjects,
+            lastLoadedAt: Date.now(),
+            totalSessions: 100,
+            oldestLoadedTimestamp: 10,
+            oldestLoadedSessionId: 'codex:recent-session',
+            hasMore: true,
+          },
+        },
+      },
+    })
 
     render(
       <Provider store={store}>
@@ -421,19 +437,7 @@ describe('open tab session sidebar visibility (e2e)', () => {
       </Provider>,
     )
 
-    await waitFor(() => {
-      expect(store.getState().sessions.projects).toEqual([
-        expect.objectContaining({
-          projectPath: '/recent',
-          sessions: expect.arrayContaining([
-            expect.objectContaining({
-              sessionId: 'recent-session',
-              title: 'Recent Session',
-            }),
-          ]),
-        }),
-      ])
-    })
+    expect(store.getState().sessions.projects).toEqual(recentProjects)
 
     act(() => {
       broadcastWs({
@@ -464,7 +468,7 @@ describe('open tab session sidebar visibility (e2e)', () => {
           }),
         ]),
       }))
-    })
+    }, { timeout: 2500 })
 
     act(() => {
       broadcastWs({
@@ -474,7 +478,7 @@ describe('open tab session sidebar visibility (e2e)', () => {
     })
 
     await waitFor(() => {
-      expect(fetchSidebarSessionsSnapshot.mock.calls.length).toBeGreaterThanOrEqual(2)
+      expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
       expect(store.getState().sessions.projects).toEqual([
         expect.objectContaining({
           projectPath: '/older',

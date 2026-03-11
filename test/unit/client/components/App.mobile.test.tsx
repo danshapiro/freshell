@@ -33,10 +33,11 @@ vi.mock('@/lib/ws-client', () => ({
 
 // Mock the api module
 const mockApiGet = vi.fn().mockResolvedValue({})
+const mockApiPatch = vi.fn().mockResolvedValue({})
 vi.mock('@/lib/api', () => ({
   api: {
     get: (url: string) => mockApiGet(url),
-    patch: vi.fn().mockResolvedValue({}),
+    patch: (...args: unknown[]) => mockApiPatch(...args),
     post: vi.fn().mockResolvedValue({}),
   },
   fetchSidebarSessionsSnapshot: vi.fn().mockResolvedValue([]),
@@ -99,7 +100,7 @@ vi.mock('@/store/tabRegistrySync', () => ({
   startTabRegistrySync: () => () => {},
 }))
 
-function createTestStore() {
+function createTestStore(options?: { settingsLoaded?: boolean }) {
   return configureStore({
     reducer: {
       settings: settingsReducer,
@@ -118,7 +119,7 @@ function createTestStore() {
     preloadedState: {
       settings: {
         settings: defaultSettings,
-        loaded: true,
+        loaded: options?.settingsLoaded ?? true,
         lastSavedAt: undefined,
       },
       tabs: {
@@ -254,6 +255,38 @@ describe('App Mobile - Sidebar Backdrop', () => {
 
     // On mobile, sidebar should be rendered in full-width mode.
     expect(screen.getByTestId('mock-sidebar')).toHaveAttribute('data-full-width', 'true')
+  })
+
+  it('does not persist mobile sidebar toggles before settings finish loading', async () => {
+    renderApp(createTestStore({ settingsLoaded: false }))
+
+    await waitFor(() => {
+      expect(screen.getByTitle('Show sidebar')).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByTitle('Show sidebar'))
+
+    await waitFor(() => {
+      expect(screen.getByTestId('mock-sidebar')).toBeInTheDocument()
+    })
+
+    expect(mockApiPatch).not.toHaveBeenCalled()
+  })
+
+  it('does not persist mobile sidebar toggles after settings finish loading', async () => {
+    renderApp()
+
+    await waitFor(() => {
+      expect(screen.getByTitle('Show sidebar')).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByTitle('Show sidebar'))
+
+    await waitFor(() => {
+      expect(screen.getByTestId('mock-sidebar')).toBeInTheDocument()
+    })
+
+    expect(mockApiPatch).not.toHaveBeenCalled()
   })
 
   it('renders mobile sidebar overlay above the MobileTabStrip z-index', async () => {

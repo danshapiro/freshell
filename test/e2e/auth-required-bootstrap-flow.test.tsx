@@ -167,7 +167,7 @@ describe('auth required bootstrap flow (e2e)', () => {
     wsState.serverInstanceId = undefined
 
     mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') {
+      if (url === '/api/bootstrap') {
         return Promise.reject({ status: 401, message: 'Unauthorized' })
       }
       return Promise.resolve({})
@@ -194,6 +194,29 @@ describe('auth required bootstrap flow (e2e)', () => {
     expect(screen.getByText(/Open Freshell using a token URL/i)).toBeInTheDocument()
     expect(screen.getByText(/\/\?token=YOUR_AUTH_TOKEN/i)).toBeInTheDocument()
     expect(screen.getByLabelText(/Token or token URL/i)).toBeInTheDocument()
+    expect(mockConnect).not.toHaveBeenCalled()
+  })
+
+  it('shows the auth dialog immediately when no token is stored', async () => {
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/bootstrap') {
+        return new Promise(() => {})
+      }
+      return Promise.resolve({})
+    })
+
+    const store = createStore()
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('dialog', { name: /authentication required/i })).toBeInTheDocument()
+    })
+
     expect(mockConnect).not.toHaveBeenCalled()
   })
 })

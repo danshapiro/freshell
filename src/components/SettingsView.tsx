@@ -33,6 +33,7 @@ import type { AppView } from '@/components/Sidebar'
 import { getCliProviderConfigs } from '@/lib/coding-cli-utils'
 import { createLogger } from '@/lib/client-logger'
 import { buildKnownDevices, type KnownDevice } from '@/lib/known-devices'
+import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
 import { parseNormalizedLineList } from '@shared/string-list'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
@@ -166,6 +167,8 @@ function normalizePreviewLine(tokens: PreviewToken[], width: number): PreviewTok
 }
 
 export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePanel }: { onNavigate?: (view: AppView) => void; onFirewallTerminal?: (cmd: { tabId: string; command: string }) => void; onSharePanel?: () => void } = {}) {
+  useEnsureExtensionsRegistry()
+
   const dispatch = useAppDispatch()
   const rawSettings = useAppSelector((s) => s.settings.settings)
   const settings = useMemo(

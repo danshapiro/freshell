@@ -25,27 +25,27 @@ describe('createAppHydrationHarness', () => {
         },
       },
       responses: {
-        '/api/settings': { lane: 'critical', value: {} },
-        '/api/platform': { lane: 'visible', value: { platform: 'linux' } },
+        '/api/bootstrap': {
+          lane: 'critical',
+          value: {
+            settings: {},
+            platform: { platform: 'linux' },
+          },
+        },
       },
     })
 
-    await harness.waitForRequest('/api/settings')
+    await harness.waitForRequest('/api/bootstrap')
 
     expect(harness.getStore().getState().tabs.activeTabId).toBe('tab-visible')
     expect(harness.getRequestLog()).toEqual(
-      expect.arrayContaining([expect.objectContaining({ path: '/api/settings', lane: 'critical' })]),
+      expect.arrayContaining([expect.objectContaining({ path: '/api/bootstrap', lane: 'critical' })]),
     )
     expect(harness.isWsReady()).toBe(false)
 
     network.releaseNext('critical')
     await waitFor(() => {
-      expect(harness?.getResolvedRequests().map((entry) => entry.path)).toContain('/api/settings')
-    })
-
-    network.releaseNext('visible')
-    await waitFor(() => {
-      expect(harness?.getResolvedRequests().map((entry) => entry.path)).toContain('/api/platform')
+      expect(harness?.getResolvedRequests().map((entry) => entry.path)).toContain('/api/bootstrap')
     })
 
     network.releaseNext('visible')

@@ -75,7 +75,16 @@ describe('ws session repair activity', () => {
   it('broadcasts session repair activity on scan events', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+    ws.send(JSON.stringify({
+      type: 'hello',
+      token: 'testtoken-testtoken',
+      protocolVersion: WS_PROTOCOL_VERSION,
+      sessions: {
+        active: 'scan-1',
+        visible: [],
+        background: [],
+      },
+    }))
 
     await new Promise<void>((resolve) => {
       ws.on('message', (data) => {
@@ -106,6 +115,49 @@ describe('ws session repair activity', () => {
     expect(activity.event).toBe('scanned')
     expect(activity.sessionId).toBe('scan-1')
     expect(activity.status).toBe('corrupted')
+
+    ws.close()
+  })
+
+  it('does not broadcast unrelated session repair activity to uninterested clients', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    ws.send(JSON.stringify({
+      type: 'hello',
+      token: 'testtoken-testtoken',
+      protocolVersion: WS_PROTOCOL_VERSION,
+      sessions: {
+        active: 'scan-1',
+        visible: [],
+        background: [],
+      },
+    }))
+
+    await new Promise<void>((resolve) => {
+      ws.on('message', (data) => {
+        const msg = JSON.parse(data.toString())
+        if (msg.type === 'ready') resolve()
+      })
+    })
+
+    const received: any[] = []
+    ws.on('message', (data) => {
+      received.push(JSON.parse(data.toString()))
+    })
+
+    sessionRepairService.emit('scanned', {
+      sessionId: 'scan-2',
+      filePath: '/tmp/scan-2.jsonl',
+      status: 'corrupted',
+      chainDepth: 1,
+      orphanCount: 2,
+      fileSize: 10,
+      messageCount: 3,
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    expect(received.filter((msg) => msg.type === 'session.repair.activity')).toEqual([])
 
     ws.close()
   })

@@ -299,16 +299,16 @@ describe('pane header runtime metadata flow (e2e)', () => {
     fetchSidebarSessionsSnapshot.mockResolvedValue([])
 
     apiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') {
+      if (url === '/api/bootstrap') {
         return Promise.resolve({
-          ...defaultSettings,
-          sidebar: { ...defaultSettings.sidebar, collapsed: true },
-        })
-      }
-      if (url === '/api/platform') {
-        return Promise.resolve({
-          platform: 'linux',
-          availableClis: { codex: true, claude: true },
+          settings: {
+            ...defaultSettings,
+            sidebar: { ...defaultSettings.sidebar, collapsed: true },
+          },
+          platform: {
+            platform: 'linux',
+            availableClis: { codex: true, claude: true },
+          },
         })
       }
       if (typeof url === 'string' && url.startsWith('/api/sessions')) {
@@ -626,46 +626,44 @@ describe('pane header runtime metadata flow (e2e)', () => {
       } satisfies Partial<AgentChatState>,
     })
 
-    fetchSidebarSessionsSnapshot.mockResolvedValue({
-      projects: [
-        {
-          projectPath: '/home/user/code/freshell',
-          sessions: [
-            {
-              provider: 'claude',
-              sessionType: 'freshclaude',
-              sessionId: 'claude-session-1',
-              projectPath: '/home/user/code/freshell',
-              cwd: '/home/user/code/freshell/.worktrees/issue-163',
-              gitBranch: 'main',
-              isDirty: true,
-              updatedAt: 1,
-              tokenUsage: {
-                inputTokens: 10,
-                outputTokens: 5,
-                cachedTokens: 0,
-                totalTokens: 15,
-                contextTokens: 15,
-                compactThresholdTokens: 60,
-                compactPercent: 25,
-              },
+    store.dispatch(setProjects([
+      {
+        projectPath: '/home/user/code/freshell',
+        sessions: [
+          {
+            provider: 'claude',
+            sessionType: 'freshclaude',
+            sessionId: 'claude-session-1',
+            projectPath: '/home/user/code/freshell',
+            cwd: '/home/user/code/freshell/.worktrees/issue-163',
+            gitBranch: 'main',
+            isDirty: true,
+            updatedAt: 1,
+            tokenUsage: {
+              inputTokens: 10,
+              outputTokens: 5,
+              cachedTokens: 0,
+              totalTokens: 15,
+              contextTokens: 15,
+              compactThresholdTokens: 60,
+              compactPercent: 25,
             },
-          ],
-        },
-      ],
-    })
+          },
+        ],
+      },
+    ] as any))
 
     apiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') {
+      if (url === '/api/bootstrap') {
         return Promise.resolve({
-          ...defaultSettings,
-          sidebar: { ...defaultSettings.sidebar, collapsed: true },
-        })
-      }
-      if (url === '/api/platform') {
-        return Promise.resolve({
-          platform: 'linux',
-          availableClis: { codex: true, claude: true },
+          settings: {
+            ...defaultSettings,
+            sidebar: { ...defaultSettings.sidebar, collapsed: true },
+          },
+          platform: {
+            platform: 'linux',
+            availableClis: { codex: true, claude: true },
+          },
         })
       }
       return Promise.resolve({})

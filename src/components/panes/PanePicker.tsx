@@ -7,6 +7,7 @@ import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { getCliProviderConfigs, type CodingCliProviderConfig } from '@/lib/coding-cli-utils'
 import { getVisibleAgentChatConfigs, type AgentChatProviderName } from '@/lib/agent-chat-utils'
 import { ProviderIcon } from '@/components/icons/provider-icons'
+import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 
@@ -91,6 +92,8 @@ interface PanePickerProps {
 }
 
 export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, paneId }: PanePickerProps) {
+  useEnsureExtensionsRegistry()
+
   const platform = useAppSelector((s) => s.connection?.platform ?? null)
   const availableClis = useAppSelector((s) => s.connection?.availableClis ?? EMPTY_AVAILABLE_CLIS)
   const featureFlags = useAppSelector((s) => s.connection?.featureFlags ?? EMPTY_FEATURE_FLAGS)

@@ -2,6 +2,9 @@ import type { Middleware } from '@reduxjs/toolkit'
 import { getWsClient } from '@/lib/ws-client'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 
+const INITIAL_LAYOUT_SYNC_DEBOUNCE_MS = 1000
+const LAYOUT_SYNC_DEBOUNCE_MS = 200
+
 function buildTabFallbackSessionRef(tab: {
   mode?: string
   codingCliProvider?: string
@@ -17,6 +20,7 @@ function buildTabFallbackSessionRef(tab: {
 export const layoutMirrorMiddleware: Middleware = (store) => {
   let lastPayload = ''
   let timer: number | undefined
+  let hasSentInitialPayload = false
 
   return (next) => (action) => {
     const result = next(action)
@@ -42,9 +46,13 @@ export const layoutMirrorMiddleware: Middleware = (store) => {
     lastPayload = serialized
 
     if (timer) window.clearTimeout(timer)
+    const debounceMs = hasSentInitialPayload
+      ? LAYOUT_SYNC_DEBOUNCE_MS
+      : INITIAL_LAYOUT_SYNC_DEBOUNCE_MS
     timer = window.setTimeout(() => {
+      hasSentInitialPayload = true
       getWsClient().send({ ...payload, timestamp: Date.now() })
-    }, 200)
+    }, debounceMs)
 
     return result
   }
