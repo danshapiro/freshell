@@ -4,7 +4,7 @@
 
 **Goal:** Remove unsolicited Windows elevation during startup/tests, require an explicit in-product confirmation before any manual Windows/WSL firewall repair can elevate, and ensure Windows daemon tasks run at least privilege.
 
-**Architecture:** Delete the boot-time WSL auto-repair path entirely so privilege elevation can only happen from the existing manual repair buttons. Convert Windows/WSL repair into a two-step contract: the first server response says administrator approval is required; only a second request with `confirmElevation: true` may spawn a shared elevated PowerShell helper. Keep least privilege enforced in both the task XML and the Windows daemon manager so new and existing scheduled tasks stop asking for `HighestAvailable`.
+**Architecture:** Delete the boot-time WSL auto-repair path entirely so privilege elevation can only happen from the existing manual repair buttons; startup should detect stale network state through the normal `NetworkManager` status flow, not by launching UAC. Convert Windows/WSL repair into an explicit two-call acknowledgement contract: the first server response says administrator approval is required, and only a follow-up request with `confirmElevation: true` may spawn a shared elevated PowerShell helper. Keep least privilege enforced in both the task XML and the Windows daemon manager so new and existing scheduled tasks stop asking for `HighestAvailable`.
 
 **Tech Stack:** TypeScript, Express, Zod, React, Redux Toolkit, Vitest, Testing Library, supertest, Electron scheduled tasks
 
@@ -13,10 +13,12 @@
 ## Strategy Gate
 
 - The user approved removing startup auto-elevation. Do not preserve `FRESHELL_DISABLE_WSL_PORT_FORWARD` or any other boot-only suppression layer; delete the boot path instead.
+- Do not replace startup repair with a one-time setup task. WSL IPs drift across boots, and the existing `NetworkManager` firewall status is already the right place to detect drift and surface the manual fix button.
 - Manual repair stays in-product. The accepted UX is a one-click repair flow preceded by an explicit confirmation modal warning that a Windows admin prompt is next.
-- The privilege boundary must be enforced server-side as well as in the UI. Browser confirmation alone is insufficient because other callers can hit the API directly.
+- The API must require an explicit acknowledgement field before it will elevate. That is an accidental-trigger guard for existing callers, not a new security boundary beyond the existing auth token and Windows UAC prompt.
 - Reuse the existing repair entry points in `SetupWizard` and `SettingsView`. Do not add new settings, banners, or script-copy workflows.
 - Centralize the `Start-Process ... -Verb RunAs` argument construction in one server helper. The current duplication is the most fragile code in the affected path.
+- Reuse the shared `Button` variant system inside `ConfirmModal`; do not invent a one-off styling prop when the repo already has `ButtonVariant`.
 - The daemon fix is not documentation-only. Update both the scheduled task definition and the runtime manager so existing elevated tasks are normalized before `schtasks /Run`.
 - No `docs/index.html` update is needed. This is a privilege-boundary correction inside an existing workflow, not a new headline feature.
 
@@ -25,8 +27,9 @@
 - Starting `server/index.ts` on WSL never attempts Windows portproxy/firewall repair and never depends on `FRESHELL_DISABLE_WSL_PORT_FORWARD`.
 - `server/wsl-port-forward.ts` exports only the pure/manual helpers still used by the manual repair route.
 - `POST /api/network/configure-firewall` returns `confirmation-required` for both `wsl2` and `windows` until the caller sends `{ confirmElevation: true }`.
+- `POST /api/network/configure-firewall` rejects malformed acknowledgement bodies (for example `{ confirmElevation: false }`) with `400`.
 - The confirmation payload copy is explicit: `To complete this, you will need to accept the Windows administrator prompt on the next screen.` A cancel path performs no elevated action.
-- `SetupWizard` and `SettingsView` both use the existing accessible modal infrastructure instead of `window.confirm()`.
+- `SetupWizard` and `SettingsView` both use the existing accessible modal infrastructure instead of `window.confirm()`, and the modal reuses shared `Button` variants for its primary action styling.
 - Linux/macOS repair continues to return terminal commands exactly as before.
 - The Windows scheduled-task template uses `LeastPrivilege`, and `WindowsServiceDaemonManager.start()` normalizes the task to limited run level before launching it.
 
@@ -36,6 +39,7 @@
 - Delete the synchronous `setupWslPortForwarding()` wrapper and the startup helper module entirely. They exist only to support the rejected boot-time elevation flow.
 - Keep `NetworkManager` as the source of truth for `firewall.active`, `firewall.portOpen`, and `firewall.configuring`. Do not add parallel repair state.
 - Keep confirmation copy sourced from the server response so both UI entry points stay consistent.
+- Keep the confirmation contract intentionally simple: a strict `{ confirmElevation?: true }` body is enough for the approved UX; do not add persistence, remembered consent, or a separate setup wizard just for UAC.
 - Execution note: use `@trycycle-executing` and keep the task-level commits below intact unless a later task forces a smaller follow-up fix.
 
 ### Task 1: Remove the Boot-Time WSL Auto-Repair Entry Point
@@ -287,7 +291,7 @@ git commit -m "refactor(server): share elevated powershell helper"
 In `test/integration/server/network-api.test.ts`:
 
 - Remove `setupWslPortForwarding` from the `vi.mock('../../../server/wsl-port-forward.js', ...)` factory, because that export is gone.
-- Add these four confirmation-contract tests:
+- Add these five confirmation-contract tests:
 
 ```ts
 it('returns confirmation-required for WSL2 until the caller confirms elevation', async () => {
@@ -360,6 +364,16 @@ it('starts native Windows repair after explicit confirmation', async () => {
   expect(res.status).toBe(200)
   expect(res.body).toEqual({ method: 'windows-elevated', status: 'started' })
 })
+
+it('rejects malformed confirmation payloads', async () => {
+  const res = await request(app)
+    .post('/api/network/configure-firewall')
+    .set('x-auth-token', token)
+    .send({ confirmElevation: false })
+
+  expect(res.status).toBe(400)
+  expect(res.body.error).toBe('Invalid request')
+})
 ```
 
 **Step 2: Run the targeted integration test and confirm failure**
@@ -382,7 +396,7 @@ In `server/network-router.ts`:
 ```ts
 const ConfigureFirewallRequestSchema = z.object({
   confirmElevation: z.literal(true).optional(),
-})
+}).strict()
 ```
 
 - Parse `req.body ?? {}` at the top of the route and return `400` on invalid bodies.
@@ -400,6 +414,7 @@ const WINDOWS_ELEVATION_CONFIRMATION = {
 - When `status.firewall.platform` is `'wsl2'` or `'windows'` and `confirmElevation !== true`, return that payload without calling `execFile`.
 - When confirmation is present, use `spawnElevatedPowerShell(...)` from `server/elevated-powershell.ts` in both the WSL and native Windows branches.
 - Keep the existing `firewall.configuring` guard, cache reset, and async completion behavior.
+- Do not describe this bool as a hardened security token in comments or types; it is an explicit acknowledgement required by the product flow.
 
 In `server/firewall.ts`, update the Windows/WSL comments so they describe the new explicit-confirmation contract rather than unconditional elevation.
 
@@ -423,7 +438,7 @@ git add server/network-router.ts \
 git commit -m "fix(server): require confirmation before windows elevation"
 ```
 
-### Task 5: Make `ConfirmModal` Support Non-Destructive Primary Actions
+### Task 5: Refactor `ConfirmModal` to Reuse Shared Button Variants
 
 **Files:**
 - Modify: `src/components/ui/confirm-modal.tsx`
@@ -453,14 +468,14 @@ it('defaults the confirm button to destructive styling', () => {
   expect(screen.getByRole('button', { name: 'Delete' })).toHaveClass('bg-destructive')
 })
 
-it('renders a non-destructive primary button when confirmTone is default', () => {
+it('renders a non-destructive primary button when confirmVariant is default', () => {
   render(
     <ConfirmModal
       open
       title="Administrator approval required"
       body="To complete this, you will need to accept the Windows administrator prompt on the next screen."
       confirmLabel="Continue"
-      confirmTone="default"
+      confirmVariant="default"
       onConfirm={vi.fn()}
       onCancel={vi.fn()}
     />,
@@ -479,15 +494,17 @@ npx vitest run test/unit/client/components/ui/confirm-modal.test.tsx
 ```
 
 Expected:
-- FAIL because `ConfirmModal` does not accept `confirmTone`.
+- FAIL because `ConfirmModal` does not accept `confirmVariant` or reuse the shared `Button` variants.
 
 **Step 3: Write the minimal implementation**
 
 In `src/components/ui/confirm-modal.tsx`:
 
-- Add `confirmTone?: 'destructive' | 'default'` to `ConfirmModalProps`.
+- Import `Button` and `type ButtonVariant` from `@/components/ui/button`.
+- Add `confirmVariant?: ButtonVariant` to `ConfirmModalProps`.
 - Default it to `'destructive'`.
-- Switch the confirm button class based on that prop, keeping the existing destructive styling unchanged for current callers.
+- Replace the raw action buttons with shared `Button` components, preserving the existing focus handling and destructive default behavior.
+- Keep cancel visually secondary (`ghost` or `outline` is fine), but do not change the modal API beyond the new `confirmVariant`.
 
 **Step 4: Re-run the targeted client test**
 
@@ -504,7 +521,7 @@ Expected:
 
 ```bash
 git add src/components/ui/confirm-modal.tsx test/unit/client/components/ui/confirm-modal.test.tsx
-git commit -m "refactor(ui): allow non-destructive confirm modal actions"
+git commit -m "refactor(ui): reuse button variants in confirm modal"
 ```
 
 ### Task 6: Extend the Client Firewall Helper for the Confirmation Contract
@@ -702,7 +719,7 @@ Expected:
 In `src/components/SetupWizard.tsx`:
 
 - Add local state for the pending confirmation payload and whether the modal is open.
-- On the first `fetchFirewallConfig()` call, if the result is `confirmation-required`, open `ConfirmModal` with the returned `title`, `body`, and `confirmLabel`, using `confirmTone="default"`.
+- On the first `fetchFirewallConfig()` call, if the result is `confirmation-required`, open `ConfirmModal` with the returned `title`, `body`, and `confirmLabel`, using `confirmVariant="default"`.
 - On confirm, call `fetchFirewallConfig({ confirmElevation: true })` and then reuse the existing WSL/Windows polling path.
 - On cancel, close the modal and do nothing else.
 - Keep the Linux/macOS terminal-pane flow unchanged.
@@ -846,7 +863,7 @@ Expected:
 In `src/components/SettingsView.tsx`:
 
 - Add local state for the confirmation modal.
-- On the first `fetchFirewallConfig()` call, if the result is `confirmation-required`, open `ConfirmModal` with `confirmTone="default"`.
+- On the first `fetchFirewallConfig()` call, if the result is `confirmation-required`, open `ConfirmModal` with `confirmVariant="default"`.
 - On confirm, call `fetchFirewallConfig({ confirmElevation: true })`, then reuse the existing follow-up behavior:
   - open a terminal tab for `terminal`
   - schedule `fetchNetworkStatus()` for `wsl2` / `windows-elevated`
@@ -964,6 +981,7 @@ git commit -m "fix(electron): run windows daemon with least privilege"
 
 - Keep the confirmation copy sourced from the server payload.
 - Keep all `Start-Process ... -Verb RunAs` quoting in `server/elevated-powershell.ts`.
+- Keep `ConfirmModal` aligned with `src/components/ui/button.tsx` instead of reintroducing ad-hoc button classes.
 - Remove stale comments that still describe startup auto-repair, boot-only suppression env vars, or unconditional Windows elevation.
 
 Do not add new settings, feature flags, or fallback script flows.
