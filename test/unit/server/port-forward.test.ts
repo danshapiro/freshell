@@ -16,6 +16,27 @@ function createEchoServer(): Promise<{ server: net.Server; port: number }> {
   })
 }
 
+async function flushAsyncWork(): Promise<void> {
+  await Promise.resolve()
+  await Promise.resolve()
+}
+
+async function captureUnhandledRejections<T>(action: () => Promise<T>): Promise<{ result: T; reasons: unknown[] }> {
+  const reasons: unknown[] = []
+  const handler = (reason: unknown) => {
+    reasons.push(reason)
+  }
+
+  process.on('unhandledRejection', handler)
+  try {
+    const result = await action()
+    await flushAsyncWork()
+    return { result, reasons }
+  } finally {
+    process.off('unhandledRejection', handler)
+  }
+}
+
 // Helper: connect to a TCP port and send/receive data
 function tcpExchange(
   host: string,
@@ -77,7 +98,7 @@ describe('PortForwardManager', () => {
   })
 
   afterEach(async () => {
-    manager.closeAll()
+    await manager.closeAll()
     if (echoServer) {
       echoServer.close()
       echoServer = null
@@ -164,7 +185,7 @@ describe('PortForwardManager', () => {
         limitedManager.forward(echo3.port, createRequesterIdentity('127.0.0.1')),
       ).rejects.toThrow(/Maximum port forwards/)
 
-      limitedManager.closeAll()
+      await limitedManager.closeAll()
       echo1.server.close()
       echo2.server.close()
       echo3.server.close()
@@ -330,7 +351,7 @@ describe('PortForwardManager', () => {
         createRequesterIdentity('127.0.0.1'),
       )
 
-      manager.closeAll()
+      await manager.closeAll()
 
       await expect(
         tcpExchange('127.0.0.1', f1.port, 'test'),
@@ -341,6 +362,23 @@ describe('PortForwardManager', () => {
 
       echo1.server.close()
       echo2.server.close()
+    })
+
+    it('handles async server.close failures without unhandled rejections', async () => {
+      const echo = await createEchoServer()
+      echoServer = echo.server
+
+      const requester = createRequesterIdentity('127.0.0.1')
+      await manager.forward(echo.port, requester)
+
+      const entry = (manager as any).forwards.get(echo.port).get(requester.key)
+      vi.spyOn(entry.server, 'close').mockImplementation((callback?: (err?: Error) => void) => {
+        queueMicrotask(() => callback?.(new Error('close failed')))
+        return entry.server
+      })
+
+      const { reasons } = await captureUnhandledRejections(async () => manager.closeAll())
+      expect(reasons).toEqual([])
     })
   })
 
@@ -378,8 +416,38 @@ describe('PortForwardManager', () => {
 
       expect(shortManager.getForwardedPort(echo.port, requester.key)).toBeUndefined()
 
-      shortManager.closeAll()
+      await shortManager.closeAll()
       vi.useRealTimers()
+    })
+
+    it('handles idle cleanup close failures without unhandled rejections', async () => {
+      vi.useFakeTimers()
+
+      const shortManager = new PortForwardManager({ idleTimeoutMs: 1000 })
+      try {
+        const echo = await createEchoServer()
+        echoServer = echo.server
+
+        const requester = createRequesterIdentity('127.0.0.1')
+        await shortManager.forward(echo.port, requester)
+
+        const entry = (shortManager as any).forwards.get(echo.port).get(requester.key)
+        vi.spyOn(entry.server, 'close').mockImplementation((callback?: (err?: Error) => void) => {
+          queueMicrotask(() => callback?.(new Error('idle close failed')))
+          return entry.server
+        })
+
+        const { reasons } = await captureUnhandledRejections(async () => {
+          vi.advanceTimersByTime(70_000)
+          await flushAsyncWork()
+        })
+
+        expect(reasons).toEqual([])
+
+        await shortManager.closeAll()
+      } finally {
+        vi.useRealTimers()
+      }
     })
   })
 })

@@ -261,6 +261,24 @@ describe('classifyCommand()', () => {
       config: 'default',
       args: ['run', '--coverage', '--ui'],
     })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['--watch'],
+    }), {
+      kind: 'delegated',
+      config: 'default',
+      args: ['run', '--watch'],
+    })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['--ui'],
+    }), {
+      kind: 'delegated',
+      config: 'default',
+      args: ['run', '--ui'],
+    })
   })
 
   it('bypasses coordination for help and version flags', () => {

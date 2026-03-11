@@ -2,7 +2,7 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   buildReusableSuccessKey,
@@ -208,5 +208,35 @@ describe('coordinator-store', () => {
       exitCode: 23,
     })
     expect(reusable.byReusableKey[success.reusableKey]).toEqual(success)
+  })
+
+  it('serializes concurrent command result writes so neither latest entry is lost', async () => {
+    const originalRename = fsp.rename.bind(fsp)
+    const renameSpy = vi.spyOn(fsp, 'rename').mockImplementation(async (...args) => {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      return originalRename(args[0] as Parameters<typeof fsp.rename>[0], args[1] as Parameters<typeof fsp.rename>[1])
+    })
+
+    const entries = Array.from({ length: 10 }, (_, index) => ({
+      commandKey: `command-${index}`,
+      runId: `run-${index}`,
+    }))
+
+    try {
+      await Promise.all(entries.map((entry) => recordCommandResult(storeDir, createLatestRunRecord({
+        runId: entry.runId,
+        entrypoint: {
+          commandKey: entry.commandKey,
+          suiteKey: 'full-suite',
+        },
+      }))))
+    } finally {
+      renameSpy.mockRestore()
+    }
+
+    const commandRuns = await readCommandRuns(storeDir)
+    expect(Object.keys(commandRuns.byKey).sort()).toEqual(entries
+      .map((entry) => entry.commandKey)
+      .sort())
   })
 })

@@ -460,7 +460,7 @@ describe('test coordinator CLI', () => {
       {
         FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
         FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
-          'npm:typecheck': { stdout: 'TYPECHECK_MARKER\n', holdMs: 250 },
+          'npm:typecheck': { stdout: 'TYPECHECK_MARKER\n', holdMs: 1_000 },
         }),
       },
     )
@@ -591,6 +591,8 @@ describe('test coordinator CLI', () => {
     const commands: Array<{ key: string; args: string[] }> = [
       { key: 'test:unit', args: ['test/unit/server/coding-cli/utils.test.ts'] },
       { key: 'test:client', args: ['--run', 'test/unit/client/components/Sidebar.test.tsx'] },
+      { key: 'test', args: ['--watch'] },
+      { key: 'test', args: ['--ui'] },
       { key: 'test:watch', args: ['--help'] },
       { key: 'test:ui', args: ['--help'] },
       { key: 'test:vitest', args: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'] },
@@ -608,6 +610,12 @@ describe('test coordinator CLI', () => {
       expect(exit.code).toBe(0)
       expect(holder.child.exitCode).toBeNull()
     }
+
+    const captures = await readCaptureLines(captureFile)
+    expect(captures.map((entry) => entry.selector)).toContain('vitest:default:run --watch')
+    expect(captures.map((entry) => entry.selector)).toContain('vitest:default:run --ui')
+    expect(captures.map((entry) => entry.selector)).not.toContain('vitest:server:run --config vitest.server.config.ts --watch')
+    expect(captures.map((entry) => entry.selector)).not.toContain('vitest:server:run --config vitest.server.config.ts --ui')
 
     await stopChild(holder)
   })

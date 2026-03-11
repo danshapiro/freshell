@@ -77,8 +77,8 @@ describe('Port Forward API Integration', () => {
     }
   })
 
-  afterAll(() => {
-    manager.closeAll()
+  afterAll(async () => {
+    await manager.closeAll()
     delete process.env.FRESHELL_TRUST_PROXY
   })
 

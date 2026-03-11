@@ -169,7 +169,6 @@ function classifyCompositeCommand(commandKey: CommandKey, args: string[]): Comma
   if (hasWatchOrUi(filteredArgs) || hasNamePattern(filteredArgs)) {
     return delegated([
       vitestPhase('default', ['run', ...filteredArgs]),
-      vitestPhase('server', ['run', '--config', 'vitest.server.config.ts', ...filteredArgs]),
     ])
   }
 

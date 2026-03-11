@@ -202,18 +202,18 @@ export class PortForwardManager {
   }
 
   /** Close all active forwards and stop the idle-cleanup timer. */
-  closeAll(): void {
+  async closeAll(): Promise<void> {
+    this.stopIdleCleanup()
+
+    const closing: Promise<void>[] = []
     for (const [targetPort, targetMap] of [...this.forwards.entries()]) {
       for (const entry of [...targetMap.values()]) {
-        this.closeEntry(targetPort, entry, targetMap)
+        closing.push(this.closeEntrySafely(targetPort, entry, targetMap, 'closeAll'))
       }
       this.forwards.delete(targetPort)
     }
     this.inflight.clear()
-    if (this.cleanupTimer) {
-      clearInterval(this.cleanupTimer)
-      this.cleanupTimer = null
-    }
+    await Promise.all(closing)
   }
 
   private startIdleCleanup(): void {
@@ -228,7 +228,7 @@ export class PortForwardManager {
               { targetPort, localPort: entry.localPort, requesterIp: entry.requesterIp },
               'Port forward idle-closed',
             )
-            this.closeEntry(targetPort, entry, targetMap)
+            void this.closeEntrySafely(targetPort, entry, targetMap, 'idle cleanup')
           }
         }
         if (targetMap.size === 0) {
@@ -240,6 +240,13 @@ export class PortForwardManager {
     // Don't let the timer keep the process alive
     if (this.cleanupTimer.unref) {
       this.cleanupTimer.unref()
+    }
+  }
+
+  private stopIdleCleanup(): void {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer)
+      this.cleanupTimer = null
     }
   }
 
@@ -270,5 +277,27 @@ export class PortForwardManager {
         resolve()
       })
     })
+  }
+
+  private async closeEntrySafely(
+    targetPort: number,
+    entry: ForwardEntry,
+    targetMap: Map<string, ForwardEntry>,
+    source: 'closeAll' | 'idle cleanup',
+  ): Promise<void> {
+    try {
+      await this.closeEntry(targetPort, entry, targetMap)
+    } catch (err) {
+      log.error(
+        {
+          err,
+          targetPort,
+          localPort: entry.localPort,
+          requesterIp: entry.requesterIp,
+          source,
+        },
+        'Port forward close failed',
+      )
+    }
   }
 }

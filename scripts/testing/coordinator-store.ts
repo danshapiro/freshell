@@ -1,4 +1,6 @@
 import fsp from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { hostname } from 'node:os'
 import path from 'node:path'
 
 import {
@@ -20,6 +22,9 @@ const HOLDER_FILE = 'holder.json'
 const COMMAND_RUNS_FILE = 'command-runs.json'
 const SUITE_RUNS_FILE = 'suite-runs.json'
 const REUSABLE_SUCCESS_FILE = 'reusable-success.json'
+const LOCK_RETRY_MS = 25
+const LOCK_TIMEOUT_MS = 5_000
+const LOCK_STALE_MS = 30_000
 
 export function getCoordinatorStoreDir(commonDir: string): string {
   return path.join(commonDir, 'freshell-test-coordinator')
@@ -79,9 +84,9 @@ export async function readReusableSuccesses(storeDir: string): Promise<ReusableS
 
 export async function recordCommandResult(storeDir: string, result: LatestRunRecord): Promise<void> {
   const record = latestRunRecordSchema.parse(result)
-  const latestRuns = await readCommandRuns(storeDir)
-  latestRuns.byKey[record.entrypoint.commandKey] = record
-  await writeJsonFile(storeDir, COMMAND_RUNS_FILE, latestRunsFileSchema.parse(latestRuns))
+  await mutateLatestRunsFile(storeDir, COMMAND_RUNS_FILE, (latestRuns) => {
+    latestRuns.byKey[record.entrypoint.commandKey] = record
+  })
 }
 
 export async function recordSuiteResult(storeDir: string, result: LatestRunRecord): Promise<void> {
@@ -89,9 +94,9 @@ export async function recordSuiteResult(storeDir: string, result: LatestRunRecor
   const suiteKey = record.entrypoint.suiteKey
   if (!suiteKey) return
 
-  const latestRuns = await readSuiteRuns(storeDir)
-  latestRuns.byKey[suiteKey] = record
-  await writeJsonFile(storeDir, SUITE_RUNS_FILE, latestRunsFileSchema.parse(latestRuns))
+  await mutateLatestRunsFile(storeDir, SUITE_RUNS_FILE, (latestRuns) => {
+    latestRuns.byKey[suiteKey] = record
+  })
 }
 
 export async function recordReusableSuccess(storeDir: string, result: ReusableSuccessRecord): Promise<void> {
@@ -100,9 +105,9 @@ export async function recordReusableSuccess(storeDir: string, result: ReusableSu
     return
   }
 
-  const reusableSuccesses = await readReusableSuccesses(storeDir)
-  reusableSuccesses.byReusableKey[record.reusableKey] = record
-  await writeJsonFile(storeDir, REUSABLE_SUCCESS_FILE, reusableSuccessFileSchema.parse(reusableSuccesses))
+  await mutateReusableSuccessFile(storeDir, (reusableSuccesses) => {
+    reusableSuccesses.byReusableKey[record.reusableKey] = record
+  })
 }
 
 async function readLatestRunsFile(storeDir: string, fileName: string): Promise<LatestRunsFile> {
@@ -123,9 +128,131 @@ async function writeJsonFile(storeDir: string, fileName: string, data: unknown):
   await fsp.mkdir(storeDir, { recursive: true })
 
   const finalPath = path.join(storeDir, fileName)
-  const tempPath = path.join(storeDir, `${fileName}.${process.pid}.${Date.now()}.tmp`)
+  const tempPath = path.join(storeDir, `${fileName}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`)
   const payload = JSON.stringify(data, null, 2)
 
   await fsp.writeFile(tempPath, payload)
   await fsp.rename(tempPath, finalPath)
+}
+
+async function mutateLatestRunsFile(
+  storeDir: string,
+  fileName: string,
+  mutate: (latestRuns: LatestRunsFile) => void,
+): Promise<void> {
+  await withFileLock(path.join(storeDir, fileName), async () => {
+    const latestRuns = await readLatestRunsFile(storeDir, fileName)
+    mutate(latestRuns)
+    await writeJsonFile(storeDir, fileName, latestRunsFileSchema.parse(latestRuns))
+  })
+}
+
+async function mutateReusableSuccessFile(
+  storeDir: string,
+  mutate: (reusableSuccesses: ReusableSuccessFile) => void,
+): Promise<void> {
+  await withFileLock(path.join(storeDir, REUSABLE_SUCCESS_FILE), async () => {
+    const reusableSuccesses = await readReusableSuccesses(storeDir)
+    mutate(reusableSuccesses)
+    await writeJsonFile(storeDir, REUSABLE_SUCCESS_FILE, reusableSuccessFileSchema.parse(reusableSuccesses))
+  })
+}
+
+async function withFileLock<T>(filePath: string, action: () => Promise<T>): Promise<T> {
+  await fsp.mkdir(path.dirname(filePath), { recursive: true })
+  const release = await acquireFileLock(`${filePath}.lock`)
+  try {
+    return await action()
+  } finally {
+    await release()
+  }
+}
+
+async function acquireFileLock(lockPath: string): Promise<() => Promise<void>> {
+  const deadline = Date.now() + LOCK_TIMEOUT_MS
+
+  while (true) {
+    try {
+      const handle = await fsp.open(lockPath, 'wx')
+      try {
+        await handle.writeFile(JSON.stringify({
+          pid: process.pid,
+          hostname: hostname(),
+          startedAt: new Date().toISOString(),
+        }))
+      } finally {
+        await handle.close()
+      }
+
+      return async () => {
+        try {
+          await fsp.unlink(lockPath)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+            throw error
+          }
+        }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        throw error
+      }
+
+      if (await clearStaleLockIfNeeded(lockPath)) {
+        continue
+      }
+
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out acquiring coordinator store lock for ${path.basename(filePathFromLock(lockPath))}.`)
+      }
+
+      await delay(LOCK_RETRY_MS)
+    }
+  }
+}
+
+async function clearStaleLockIfNeeded(lockPath: string): Promise<boolean> {
+  let stale = false
+
+  try {
+    const raw = await fsp.readFile(lockPath, 'utf8')
+    const parsed = JSON.parse(raw) as { pid?: unknown }
+    if (typeof parsed.pid === 'number') {
+      stale = !isProcessAlive(parsed.pid)
+    }
+  } catch {
+    const stats = await fsp.stat(lockPath).catch(() => undefined)
+    if (!stats) {
+      return true
+    }
+    stale = Date.now() - stats.mtimeMs > LOCK_STALE_MS
+  }
+
+  if (!stale) {
+    return false
+  }
+
+  try {
+    await fsp.unlink(lockPath)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT'
+  }
+}
+
+function filePathFromLock(lockPath: string): string {
+  return lockPath.endsWith('.lock') ? lockPath.slice(0, -'.lock'.length) : lockPath
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
