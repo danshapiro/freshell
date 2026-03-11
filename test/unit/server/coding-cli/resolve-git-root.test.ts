@@ -2,7 +2,13 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import path from 'path'
 import os from 'os'
 import fsp from 'fs/promises'
-import { resolveGitRepoRoot, resolveGitCheckoutRoot, clearRepoRootCache } from '../../../../server/coding-cli/utils'
+import {
+  resolveGitRepoRoot,
+  resolveGitCheckoutRoot,
+  resolveGitCommonDir,
+  resolveInvocationCwd,
+  clearRepoRootCache,
+} from '../../../../server/coding-cli/utils'
 
 let tempDir: string
 
@@ -244,5 +250,56 @@ describe('resolveGitCheckoutRoot()', () => {
     )
 
     expect(await resolveGitCheckoutRoot(nestedDir)).toBe(subDir)
+  })
+})
+
+describe('resolveGitCommonDir()', () => {
+  it('returns the .git directory for a regular repo', async () => {
+    const repoDir = path.join(tempDir, 'repo')
+    const gitDir = path.join(repoDir, '.git')
+    await fsp.mkdir(gitDir, { recursive: true })
+
+    expect(await resolveGitCommonDir(repoDir)).toBe(gitDir)
+  })
+
+  it('returns the shared common-dir for a linked worktree', async () => {
+    const repoDir = path.join(tempDir, 'repo')
+    const gitDir = path.join(repoDir, '.git')
+    await fsp.mkdir(gitDir, { recursive: true })
+
+    const worktreeGitDir = path.join(gitDir, 'worktrees', 'feature')
+    await fsp.mkdir(worktreeGitDir, { recursive: true })
+    await fsp.writeFile(path.join(worktreeGitDir, 'commondir'), '../..\n')
+
+    const worktreeDir = path.join(tempDir, 'repo-feature')
+    await fsp.mkdir(worktreeDir, { recursive: true })
+    await fsp.writeFile(
+      path.join(worktreeDir, '.git'),
+      `gitdir: ${worktreeGitDir}\n`,
+    )
+
+    expect(await resolveGitCommonDir(worktreeDir)).toBe(gitDir)
+  })
+
+  it('returns undefined when no git directory exists', async () => {
+    const plainDir = path.join(tempDir, 'plain')
+    await fsp.mkdir(plainDir, { recursive: true })
+
+    expect(await resolveGitCommonDir(plainDir)).toBeUndefined()
+  })
+})
+
+describe('resolveInvocationCwd()', () => {
+  it('prefers INIT_CWD when present', () => {
+    expect(resolveInvocationCwd({
+      INIT_CWD: '/tmp/init-cwd',
+      PWD: '/tmp/pwd',
+    })).toBe('/tmp/init-cwd')
+  })
+
+  it('falls back to PWD when INIT_CWD is absent', () => {
+    expect(resolveInvocationCwd({
+      PWD: '/tmp/pwd',
+    })).toBe('/tmp/pwd')
   })
 })

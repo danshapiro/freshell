@@ -23,11 +23,13 @@ export { looksLikePath } from '../../shared/path-utils.js'
 
 const repoRootCache = new Map<string, string>()
 const checkoutRootCache = new Map<string, string>()
+const commonDirCache = new Map<string, string | undefined>()
 const execFileAsync = promisify(execFile)
 
 export function clearRepoRootCache(): void {
   repoRootCache.clear()
   checkoutRootCache.clear()
+  commonDirCache.clear()
 }
 
 export async function resolveGitRepoRoot(cwd: string): Promise<string> {
@@ -68,6 +70,26 @@ export async function resolveGitCheckoutRoot(cwd: string): Promise<string> {
   }
 }
 
+export async function resolveGitCommonDir(cwd: string): Promise<string | undefined> {
+  if (!cwd) return undefined
+
+  const normalized = normalizeGitPathInput(cwd)
+  if (!normalized) return undefined
+
+  if (commonDirCache.has(normalized)) {
+    return commonDirCache.get(normalized)
+  }
+
+  try {
+    const result = await walkForGitCommonDir(normalized)
+    commonDirCache.set(normalized, result)
+    return result
+  } catch {
+    commonDirCache.set(normalized, undefined)
+    return undefined
+  }
+}
+
 export async function resolveGitBranchAndDirty(cwd: string): Promise<{ branch?: string; isDirty?: boolean }> {
   const normalized = normalizeGitPathInput(cwd)
   if (!normalized) return {}
@@ -90,6 +112,16 @@ export async function resolveGitBranchAndDirty(cwd: string): Promise<{ branch?: 
     }
   } catch {
     return {}
+  }
+}
+
+export function resolveInvocationCwd(envVars: NodeJS.ProcessEnv = process.env): string | undefined {
+  const candidate = envVars.INIT_CWD || envVars.PWD
+  if (candidate) return candidate
+  try {
+    return process.cwd()
+  } catch {
+    return undefined
   }
 }
 
@@ -211,6 +243,57 @@ async function resolveWorktreeRoot(dotGitDir: string, gitdir: string): Promise<s
   return dotGitDir
 }
 
+async function walkForGitCommonDir(startDir: string): Promise<string | undefined> {
+  let current = startDir
+
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const gitPath = path.join(current, '.git')
+
+    try {
+      const stat = await fsp.lstat(gitPath)
+
+      if (stat.isDirectory()) {
+        return gitPath
+      }
+
+      if (stat.isFile()) {
+        const content = await fsp.readFile(gitPath, 'utf-8')
+        const match = content.match(/^gitdir:\s*(.+)/m)
+        if (!match) return undefined
+
+        const gitdir = path.resolve(path.dirname(gitPath), match[1].trim())
+        return resolveCommonDirFromGitFile(gitdir)
+      }
+    } catch {
+      // .git doesn't exist at this level — keep walking up
+    }
+
+    const parent = path.dirname(current)
+    if (parent === current) break
+    current = parent
+  }
+
+  return undefined
+}
+
+async function resolveCommonDirFromGitFile(gitdir: string): Promise<string> {
+  try {
+    const commondirContent = await fsp.readFile(path.join(gitdir, 'commondir'), 'utf-8')
+    return path.resolve(gitdir, commondirContent.trim())
+  } catch {
+    // Not all gitdir layouts use a commondir file.
+  }
+
+  const worktreesToken = `${path.sep}.git${path.sep}worktrees${path.sep}`
+  const worktreesIndex = gitdir.lastIndexOf(worktreesToken)
+  if (worktreesIndex >= 0) {
+    return gitdir.slice(0, worktreesIndex + `${path.sep}.git`.length)
+  }
+
+  return gitdir
+}
+
 /**
  * Check if a "user" message is actually system context injected by coding CLIs.
  * Both Claude and Codex inject system prompts as role:"user" messages:
@@ -278,4 +361,3 @@ export function extractFromIdeContext(text: string): string | undefined {
 
   return undefined
 }
-
