@@ -59,4 +59,26 @@ describe('TerminalRegistry env injection', () => {
     expect(env.FRESHELL_TAB_ID).toBe('tab_x')
     expect(env.FRESHELL_PANE_ID).toBe('pane_y')
   })
+
+  it('strips server-specific env vars from child PTY processes', () => {
+    process.env.PORT = '3001'
+    process.env.VITE_PORT = '5173'
+    process.env.AUTH_TOKEN = 'secret-token'
+    process.env.ALLOWED_ORIGINS = 'http://localhost:3001'
+    // Sanity: keep a non-stripped var to confirm env is still passed
+    process.env.HOME = '/home/test'
+
+    const registry = new TerminalRegistry()
+    registry.create({ mode: 'shell', envContext: { tabId: 'tab_1', paneId: 'pane_1' } })
+
+    const call = vi.mocked(pty.spawn).mock.calls[0]
+    const env = call[2].env as Record<string, string>
+
+    expect(env.PORT).toBeUndefined()
+    expect(env.VITE_PORT).toBeUndefined()
+    expect(env.AUTH_TOKEN).toBeUndefined()
+    expect(env.ALLOWED_ORIGINS).toBeUndefined()
+    // Non-stripped vars still pass through
+    expect(env.HOME).toBe('/home/test')
+  })
 })
