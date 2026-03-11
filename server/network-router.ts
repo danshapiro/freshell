@@ -35,9 +35,14 @@ const REMOTE_ACCESS_DISABLED = {
 function isRemoteAccessEnabled(
   settings: { network?: { host?: string; configured?: boolean } },
   effectiveHost: '127.0.0.1' | '0.0.0.0',
+  firewallPlatform: string,
 ): boolean {
   if (settings.network?.host === '0.0.0.0') {
     return true
+  }
+
+  if (firewallPlatform === 'wsl2') {
+    return false
   }
 
   return settings.network?.configured !== true && effectiveHost === '0.0.0.0'
@@ -152,7 +157,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
         })
       }
 
-      if (!isRemoteAccessEnabled(settings, status.host)) {
+      if (!isRemoteAccessEnabled(settings, status.host, status.firewall.platform)) {
         return res.json(REMOTE_ACCESS_DISABLED)
       }
 

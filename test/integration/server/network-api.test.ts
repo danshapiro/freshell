@@ -62,6 +62,7 @@ describe('Network API integration', () => {
 
   beforeEach(async () => {
     vi.clearAllMocks()
+    delete process.env.HOST
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-test-'))
     process.env.FRESHELL_HOME = tmpDir
 
@@ -97,6 +98,7 @@ describe('Network API integration', () => {
     if (server.listening) server.close()
     fs.rmSync(tmpDir, { recursive: true, force: true })
     delete process.env.FRESHELL_HOME
+    delete process.env.HOST
   })
 
   describe('GET /api/network/status', () => {
@@ -390,6 +392,36 @@ describe('Network API integration', () => {
       expect(confirmedRes.status).toBe(200)
       expect(confirmedRes.body).toEqual({ method: 'none', message: 'Remote access is not enabled' })
       expect(wslModule.computeWslPortForwardingPlanAsync).toHaveBeenCalledTimes(1)
+      expect(cp.execFile).not.toHaveBeenCalled()
+    })
+
+    it('returns none for local-only WSL2 before remote access is explicitly enabled', async () => {
+      process.env.HOST = '0.0.0.0'
+      await configStore.patchSettings({
+        network: {
+          configured: false,
+          host: '127.0.0.1',
+        },
+      })
+
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+      vi.mocked(isPortReachable).mockResolvedValueOnce(false)
+
+      const wslModule = await import('../../../server/wsl-port-forward.js')
+      const cp = await import('node:child_process')
+
+      const res = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({ method: 'none', message: 'Remote access is not enabled' })
+      expect(wslModule.computeWslPortForwardingPlanAsync).not.toHaveBeenCalled()
       expect(cp.execFile).not.toHaveBeenCalled()
     })
 
