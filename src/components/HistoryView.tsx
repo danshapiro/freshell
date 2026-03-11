@@ -115,12 +115,19 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
     await refresh()
   }
 
-  function openSession(cwd: string | undefined, sessionId: string, title: string, provider: CodingCliProviderName | undefined) {
-    // cwd might be undefined if session metadata didn't include it
-    const label = getProviderLabel(provider)
-    // TabMode now includes all CodingCliProviderName values, so this is type-safe
-    const mode = (provider || 'claude') as CodingCliProviderName
-    dispatch(openSessionTab({ sessionId, title: title || label, cwd, provider: mode }))
+  function openSession(session: CodingCliSession) {
+    const label = getProviderLabel(session.provider)
+    const mode = (session.provider || 'claude') as CodingCliProviderName
+    dispatch(openSessionTab({
+      sessionId: session.sessionId,
+      title: session.title || label,
+      cwd: session.cwd,
+      provider: mode,
+      sessionType: session.sessionType || mode,
+      firstUserMessage: session.firstUserMessage,
+      isSubagent: session.isSubagent,
+      isNonInteractive: session.isNonInteractive,
+    }))
     onOpenSession?.()
   }
 
@@ -193,7 +200,7 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
                 isMobile={isMobile}
                 onToggle={() => dispatch(toggleProjectExpanded(project.projectPath))}
                 onColorChange={(color) => setProjectColor(project.projectPath, color)}
-                  onOpenSession={(sessionId, title, cwd, provider) => openSession(cwd, sessionId, title, provider)}
+                onOpenSession={(session) => openSession(session)}
                 onRenameSession={(provider, sessionId, title, summary) => renameSession(provider, sessionId, title, summary)}
                 onDeleteSession={(provider, sessionId) => deleteSession(provider, sessionId)}
                 onShowSessionDetails={(sheetState) => setMobileSessionSheet(sheetState)}
@@ -237,7 +244,7 @@ function ProjectCard({
   isMobile: boolean
   onToggle: () => void
   onColorChange: (color: string) => void
-  onOpenSession: (sessionId: string, title: string, cwd?: string, provider?: CodingCliProviderName) => void
+  onOpenSession: (session: CodingCliSession) => void
   onRenameSession: (provider: CodingCliProviderName | undefined, sessionId: string, title?: string, summary?: string) => void
   onDeleteSession: (provider: CodingCliProviderName | undefined, sessionId: string) => void
   onShowSessionDetails: (sheetState: MobileSessionSheetState) => void
@@ -312,12 +319,12 @@ function ProjectCard({
                   key={session.sessionId}
                   isMobile={isMobile}
                   session={session}
-                  onOpen={() => onOpenSession(session.sessionId, session.title || session.sessionId.slice(0, 8), session.cwd, session.provider)}
+                  onOpen={() => onOpenSession(session)}
                   onRename={(title, summary) => onRenameSession(session.provider, session.sessionId, title, summary)}
                   onDelete={() => onDeleteSession(session.provider, session.sessionId)}
                   onShowDetails={() => onShowSessionDetails({
                     session,
-                    onOpen: () => onOpenSession(session.sessionId, session.title || session.sessionId.slice(0, 8), session.cwd, session.provider),
+                    onOpen: () => onOpenSession(session),
                     onRename: (title, summary) => onRenameSession(session.provider, session.sessionId, title, summary),
                     onDelete: () => onDeleteSession(session.provider, session.sessionId),
                   })}

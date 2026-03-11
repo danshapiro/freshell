@@ -9,7 +9,7 @@ import {
 import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { api, isApiUnauthorizedError, type VersionInfo } from '@/lib/api'
 import {
-  activateSessionSurface,
+  fetchSessionWindow,
   loadInitialSessionsWindow,
   queueActiveSessionWindowRefresh,
 } from '@/store/sessionsThunks'
@@ -124,9 +124,9 @@ function parseConfigFallbackReason(value: unknown): ConfigFallbackInfo['reason']
     : 'READ_ERROR'
 }
 
-function hasPlatformCapabilities(value: BootstrapPlatformInfo | null | undefined): boolean {
+function hasLoadedPlatformCapabilities(value: BootstrapPlatformInfo | null | undefined): boolean {
   if (!value) return false
-  return Object.keys(value.availableClis ?? {}).length > 0 || Object.keys(value.featureFlags ?? {}).length > 0
+  return 'availableClis' in value || 'featureFlags' in value
 }
 
 const ReadyMessageSchema = z.object({
@@ -437,6 +437,8 @@ export default function App() {
     let versionInfoLoading = false
     let platformDetailsLoading = false
     let startupRecoveryInFlight = false
+    let platformCapabilitiesLoaded = false
+    let lastReadyServerInstanceId: string | undefined
     const versionInfoLoadedRef = { current: false }
 
     async function bootstrap() {
@@ -487,6 +489,9 @@ export default function App() {
               if (bootstrapData.platform.featureFlags) {
                 dispatch(setFeatureFlags(bootstrapData.platform.featureFlags))
               }
+              if (hasLoadedPlatformCapabilities(bootstrapData.platform)) {
+                platformCapabilitiesLoaded = true
+              }
               dispatch(setTabRegistryDeviceMeta(resolveAndPersistDeviceMeta({
                 platform: bootstrapData.platform.platform,
                 hostName: bootstrapData.platform.hostName ?? bootstrapData.platform.host,
@@ -518,6 +523,7 @@ export default function App() {
             dispatch(setPlatform(platformData.platform))
             dispatch(setAvailableClis(platformData.availableClis ?? {}))
             dispatch(setFeatureFlags(platformData.featureFlags ?? {}))
+            platformCapabilitiesLoaded = true
             dispatch(setTabRegistryDeviceMeta(resolveAndPersistDeviceMeta({
               platform: platformData.platform,
               hostName: platformData.hostName ?? platformData.host,
@@ -618,13 +624,20 @@ export default function App() {
         if (sidebarWindowLoading) return true
         const sidebarWindow = appStore.getState().sessions.windows?.sidebar
         if (typeof sidebarWindow?.lastLoadedAt === 'number') {
-          dispatch(activateSessionSurface('sidebar') as any)
           return true
         }
 
         sidebarWindowLoading = true
         try {
-          await dispatch(loadInitialSessionsWindow() as any)
+          const activeSurface = appStore.getState().sessions.activeSurface
+          if (activeSurface && activeSurface !== 'sidebar') {
+            await dispatch(fetchSessionWindow({
+              surface: 'sidebar',
+              priority: 'visible',
+            }) as any)
+          } else {
+            await dispatch(loadInitialSessionsWindow() as any)
+          }
           return true
         } catch (err: unknown) {
           if (handleBootstrapAuthFailure(err)) return false
@@ -643,12 +656,7 @@ export default function App() {
           if (!state.settings.loaded || state.connection.platform === null) {
             if (!(await loadBootstrapData())) return
           }
-          const connectionState = appStore.getState().connection
-          if (!hasPlatformCapabilities({
-            platform: connectionState.platform ?? 'unknown',
-            availableClis: connectionState.availableClis,
-            featureFlags: connectionState.featureFlags,
-          })) {
+          if (!platformCapabilitiesLoaded) {
             if (!(await loadPlatformDetails())) return
           }
           if (!(await ensureSidebarSessionsWindow())) return
@@ -663,6 +671,16 @@ export default function App() {
         if (!msg?.type) return
         if (msg.type === 'ready') {
           const ready = ReadyMessageSchema.safeParse(msg)
+          if (
+            ready.success &&
+            lastReadyServerInstanceId &&
+            lastReadyServerInstanceId !== ready.data.serverInstanceId
+          ) {
+            platformCapabilitiesLoaded = false
+          }
+          if (ready.success) {
+            lastReadyServerInstanceId = ready.data.serverInstanceId
+          }
           // If the initial connect attempt failed before ready, WsClient may still auto-reconnect.
           // Treat 'ready' as the source of truth for connection status.
           resetCodexActivityOverlay()

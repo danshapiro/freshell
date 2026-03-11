@@ -28,9 +28,10 @@ import { buildResumeCommand, type ResumeCommandProvider } from '@/lib/coding-cli
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import { buildResumeContent } from '@/lib/session-type-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { AppView } from '@/components/Sidebar'
-import type { CodingCliProviderName } from '@/store/types'
+import type { CodingCliProviderName, CodingCliSession, ProjectGroup } from '@/store/types'
 import type { ContextId } from './context-menu-constants'
 import type { ContextTarget } from './context-menu-types'
 import { ContextMenu } from './ContextMenu'
@@ -101,6 +102,8 @@ export function ContextMenuProvider({
   const panes = useAppSelector((s) => s.panes.layouts)
   const paneTitles = useAppSelector((s) => s.panes.paneTitles)
   const sessions = useAppSelector((s) => s.sessions.projects)
+  const sidebarSessions = useAppSelector((s) => s.sessions.windows?.sidebar?.projects ?? s.sessions.projects)
+  const historySessions = useAppSelector((s) => s.sessions.windows?.history?.projects ?? s.sessions.projects)
   const expandedProjects = useAppSelector((s) => s.sessions.expandedProjects)
   const platform = useAppSelector((s) => s.connection?.platform ?? null)
   const appSettings = useAppSelector((s) => s.settings.settings)
@@ -285,15 +288,60 @@ export function ContextMenuProvider({
     dispatch(reorderTabs({ fromIndex: index, toIndex: next }))
   }, [dispatch, tabsState.tabs])
 
+  const getProjectCollections = useCallback((): ProjectGroup[][] => {
+    const collections: ProjectGroup[][] = []
+    const pushCollection = (projects: ProjectGroup[]) => {
+      if (projects.length === 0) return
+      if (collections.some((existing) => existing === projects)) return
+      collections.push(projects)
+    }
+    pushCollection(sidebarSessions)
+    pushCollection(historySessions)
+    pushCollection(sessions)
+    return collections
+  }, [historySessions, sessions, sidebarSessions])
+
   const getSessionInfo = useCallback((sessionId: string, provider?: string) => {
-    for (const project of sessions) {
-      const session = project.sessions.find((s) =>
-        s.sessionId === sessionId && (!provider || s.provider === provider)
-      )
-      if (session) return { session, project }
+    for (const projects of getProjectCollections()) {
+      for (const project of projects) {
+        const session = project.sessions.find((s) =>
+          s.sessionId === sessionId && (!provider || s.provider === provider)
+        )
+        if (session) return { session, project }
+      }
     }
     return null
-  }, [sessions])
+  }, [getProjectCollections])
+
+  const getProjectInfo = useCallback((projectPath: string) => {
+    for (const projects of getProjectCollections()) {
+      const project = projects.find((item) => item.projectPath === projectPath)
+      if (project) return project
+    }
+    return null
+  }, [getProjectCollections])
+
+  const persistSessionMetadataOnTab = useCallback((tabId: string, session: CodingCliSession, sessionType: string) => {
+    const provider = (session.provider || 'claude') as CodingCliProviderName
+    const tab = tabsState.tabs.find((item) => item.id === tabId)
+    const sessionMetadataByKey = mergeSessionMetadataByKey(
+      tab?.sessionMetadataByKey,
+      provider,
+      session.sessionId,
+      {
+        sessionType,
+        firstUserMessage: session.firstUserMessage,
+        isSubagent: session.isSubagent,
+        isNonInteractive: session.isNonInteractive,
+      },
+    )
+    if (tab && sessionMetadataByKey !== tab.sessionMetadataByKey) {
+      dispatch(updateTab({
+        id: tabId,
+        updates: { sessionMetadataByKey },
+      }))
+    }
+  }, [dispatch, tabsState.tabs])
 
   const openSessionInNewTab = useCallback((sessionId: string, provider?: string) => {
     const info = getSessionInfo(sessionId, provider)
@@ -315,6 +363,9 @@ export function ContextMenuProvider({
       sessionType,
       terminalId: runningTerminalId,
       forceNew: true,
+      firstUserMessage: session.firstUserMessage,
+      isSubagent: session.isSubagent,
+      isNonInteractive: session.isNonInteractive,
     }))
   }, [dispatch, getSessionInfo, menuState?.target])
 
@@ -349,7 +400,8 @@ export function ContextMenuProvider({
         agentChatProviderSettings: providerSettings,
       }),
     }))
-  }, [tabsState.activeTabId, dispatch, getSessionInfo, openSessionInNewTab, menuState?.target, appSettings])
+    persistSessionMetadataOnTab(activeTabId, session, sessionType)
+  }, [tabsState.activeTabId, dispatch, getSessionInfo, openSessionInNewTab, menuState?.target, appSettings, persistSessionMetadataOnTab])
 
   const renameSession = useCallback(async (sessionId: string, provider?: string, withSummary?: boolean) => {
     const info = getSessionInfo(sessionId, provider)
@@ -509,7 +561,7 @@ export function ContextMenuProvider({
       confirmLabel: 'Open tabs',
       body: 'This will open every session in the project in its own tab.',
       onConfirm: () => {
-        const project = sessions.find((p) => p.projectPath === projectPath)
+        const project = getProjectInfo(projectPath)
         if (project) {
           for (const session of project.sessions) {
             const provider = (session.provider || 'claude') as CodingCliProviderName
@@ -518,6 +570,10 @@ export function ContextMenuProvider({
               title: session.title || session.sessionId.slice(0, 8),
               cwd: session.cwd,
               provider,
+              sessionType: session.sessionType || provider,
+              firstUserMessage: session.firstUserMessage,
+              isSubagent: session.isSubagent,
+              isNonInteractive: session.isNonInteractive,
               forceNew: true,
             }))
           }
@@ -525,7 +581,7 @@ export function ContextMenuProvider({
         setConfirmState(null)
       },
     })
-  }, [dispatch, sessions])
+  }, [dispatch, getProjectInfo])
 
   const copyProjectPath = useCallback(async (projectPath: string) => {
     await copyText(projectPath)

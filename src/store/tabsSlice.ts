@@ -19,6 +19,7 @@ import { UNKNOWN_SERVER_INSTANCE_ID } from './tabRegistryConstants'
 import type { RootState } from './store'
 import { TABS_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
+import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 
 
 const log = createLogger('TabsSlice')
@@ -94,6 +95,7 @@ type AddTabPayload = {
   shell?: ShellType
   initialCwd?: string
   resumeSessionId?: string
+  sessionMetadataByKey?: Tab['sessionMetadataByKey']
   forceNew?: boolean
   createRequestId?: string
 }
@@ -125,6 +127,7 @@ export const tabsSlice = createSlice({
         shell: payload.shell || 'system',
         initialCwd: payload.initialCwd,
         resumeSessionId: payload.resumeSessionId,
+        sessionMetadataByKey: payload.sessionMetadataByKey,
         createdAt: Date.now(),
         lastInputAt: undefined,
       }
@@ -296,7 +299,7 @@ export const closeTab = createAsyncThunk(
 export const openSessionTab = createAsyncThunk(
   'tabs/openSessionTab',
   async (
-    { sessionId, title, cwd, provider, sessionType, terminalId, forceNew }: {
+    { sessionId, title, cwd, provider, sessionType, terminalId, forceNew, firstUserMessage, isSubagent, isNonInteractive }: {
       sessionId: string
       title?: string
       cwd?: string
@@ -304,6 +307,9 @@ export const openSessionTab = createAsyncThunk(
       sessionType?: string
       terminalId?: string
       forceNew?: boolean
+      firstUserMessage?: string
+      isSubagent?: boolean
+      isNonInteractive?: boolean
     },
     { dispatch, getState }
   ) => {
@@ -312,11 +318,31 @@ export const openSessionTab = createAsyncThunk(
     const state = getState() as RootState
     const localServerInstanceId = (state as Partial<RootState>).connection?.serverInstanceId
     const extensions = (state as Partial<RootState>).extensions?.entries ?? []
+    const sessionMetadataInput = {
+      sessionType: resolvedSessionType,
+      firstUserMessage,
+      isSubagent,
+      isNonInteractive,
+    }
+
+    const buildSessionMetadataByKey = (existing?: Tab['sessionMetadataByKey']) =>
+      mergeSessionMetadataByKey(existing, resolvedProvider, sessionId, sessionMetadataInput)
+
+    const updateExistingTabMetadata = (tab: Tab | undefined) => {
+      if (!tab) return
+      const sessionMetadataByKey = buildSessionMetadataByKey(tab.sessionMetadataByKey)
+      if (sessionMetadataByKey === tab.sessionMetadataByKey) return
+      dispatch(updateTab({
+        id: tab.id,
+        updates: { sessionMetadataByKey },
+      }))
+    }
 
     if (terminalId) {
       if (!forceNew) {
         const existingTab = state.tabs.tabs.find((t) => t.terminalId === terminalId)
         if (existingTab) {
+          updateExistingTabMetadata(existingTab)
           dispatch(setActiveTab(existingTab.id))
           return
         }
@@ -330,6 +356,7 @@ export const openSessionTab = createAsyncThunk(
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,
         resumeSessionId: sessionId,
+        sessionMetadataByKey: buildSessionMetadataByKey(),
       }))
       return
     }
@@ -341,6 +368,7 @@ export const openSessionTab = createAsyncThunk(
         localServerInstanceId,
       )
       if (existingTabId) {
+        updateExistingTabMetadata(state.tabs.tabs.find((tab) => tab.id === existingTabId))
         dispatch(setActiveTab(existingTabId))
         return
       }
@@ -351,7 +379,7 @@ export const openSessionTab = createAsyncThunk(
     if (isAgentChatProviderName(resolvedSessionType)) {
       const agentConfig = getAgentChatProviderConfig(resolvedSessionType)
       const providerSettings = agentConfig
-        ? state.settings.settings.agentChat?.providers?.[agentConfig.name]
+        ? state.settings?.settings.agentChat?.providers?.[agentConfig.name]
         : undefined
       const tabId = nanoid()
       dispatch(addTab({
@@ -361,6 +389,7 @@ export const openSessionTab = createAsyncThunk(
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,
         resumeSessionId: sessionId,
+        sessionMetadataByKey: buildSessionMetadataByKey(),
       }))
       dispatch(initLayout({
         tabId,
@@ -380,6 +409,7 @@ export const openSessionTab = createAsyncThunk(
       codingCliProvider: resolvedProvider,
       initialCwd: cwd,
       resumeSessionId: sessionId,
+      sessionMetadataByKey: buildSessionMetadataByKey(),
     }))
   }
 )

@@ -593,6 +593,68 @@ describe('App WS bootstrap recovery', () => {
     expect(apiGet).toHaveBeenCalledWith('/api/platform')
   })
 
+  it('treats empty platform capability maps as loaded and does not refetch them on repeated ready events', async () => {
+    const store = createStore()
+    let platformCalls = 0
+
+    apiGet.mockImplementation((url: string) => {
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: defaultSettings,
+          platform: { platform: 'linux' },
+          shell: { authenticated: true, ready: true },
+        })
+      }
+      if (url === '/api/platform') {
+        platformCalls += 1
+        return Promise.resolve({
+          platform: 'linux',
+          availableClis: {},
+          featureFlags: {},
+          hostName: 'devbox',
+        })
+      }
+      return Promise.resolve({})
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.connect).toHaveBeenCalledTimes(1)
+    })
+
+    act(() => {
+      messageHandler?.({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-platform-empty',
+      })
+    })
+
+    await waitFor(() => {
+      expect(store.getState().connection.availableClis).toEqual({})
+      expect(store.getState().connection.featureFlags).toEqual({})
+    })
+
+    act(() => {
+      messageHandler?.({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-platform-empty',
+      })
+    })
+
+    await waitFor(() => {
+      expect(store.getState().connection.serverInstanceId).toBe('srv-platform-empty')
+    })
+
+    expect(platformCalls).toBe(1)
+  })
+
   it('clears stale codex activity immediately when bootstrap attaches to an already-ready socket', async () => {
     const store = createStore({
       codexActivity: {
@@ -1002,6 +1064,56 @@ describe('App WS bootstrap recovery', () => {
     expect(wsMocks.connect).not.toHaveBeenCalled()
     expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))
+  })
+
+  it('keeps the active non-sidebar session surface during websocket recovery when the sidebar window is already loaded', async () => {
+    const historyProjects = [
+      {
+        projectPath: '/history',
+        sessions: [{ provider: 'claude', sessionId: 'history-1', projectPath: '/history', updatedAt: 10 }],
+      },
+    ]
+    const sidebarProjects = [
+      {
+        projectPath: '/sidebar',
+        sessions: [{ provider: 'codex', sessionId: 'sidebar-1', projectPath: '/sidebar', updatedAt: 20 }],
+      },
+    ]
+
+    const store = createStore({
+      sessions: {
+        projects: historyProjects,
+        activeSurface: 'history',
+        lastLoadedAt: Date.now(),
+        windows: {
+          history: {
+            projects: historyProjects,
+            lastLoadedAt: Date.now(),
+          },
+          sidebar: {
+            projects: sidebarProjects,
+            lastLoadedAt: Date.now(),
+          },
+        },
+      },
+    })
+    wsMocks.isReady = true
+    wsMocks.serverInstanceId = 'srv-preconnected-history'
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(store.getState().connection.status).toBe('ready')
+      expect(store.getState().connection.serverInstanceId).toBe('srv-preconnected-history')
+    })
+
+    expect(store.getState().sessions.activeSurface).toBe('history')
+    expect(store.getState().sessions.projects).toEqual(historyProjects)
+    expect(fetchSidebarSessionsSnapshot).not.toHaveBeenCalled()
   })
 
   it('ignores stale codex activity list responses that arrive after a newer snapshot', async () => {

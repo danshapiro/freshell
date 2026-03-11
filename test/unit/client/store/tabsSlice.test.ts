@@ -650,6 +650,62 @@ describe('tabsSlice', () => {
       expect(tabs[0].mode).toBe('claude')
     })
 
+    it('persists session metadata on newly opened tabs for fallback filtering and restored session type', async () => {
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+        },
+      })
+
+      await store.dispatch(openSessionTab({
+        sessionId: VALID_CLAUDE_SESSION_ID,
+        provider: 'claude',
+        sessionType: 'freshclaude',
+        firstUserMessage: 'IMPORTANT: internal task',
+        isSubagent: true,
+        isNonInteractive: true,
+      }))
+
+      const tab = store.getState().tabs.tabs[0]
+      expect(tab.sessionMetadataByKey).toEqual({
+        [`claude:${VALID_CLAUDE_SESSION_ID}`]: {
+          sessionType: 'freshclaude',
+          firstUserMessage: 'IMPORTANT: internal task',
+          isSubagent: true,
+          isNonInteractive: true,
+        },
+      })
+    })
+
+    it('enriches an existing tab when reopening the same session with session metadata', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      store.dispatch(addTab({
+        id: 'local-fallback',
+        mode: 'claude',
+        resumeSessionId: VALID_CLAUDE_SESSION_ID,
+      }))
+
+      await store.dispatch(openSessionTab({
+        sessionId: VALID_CLAUDE_SESSION_ID,
+        provider: 'claude',
+        sessionType: 'freshclaude',
+        firstUserMessage: 'IMPORTANT: internal task',
+        isSubagent: true,
+      }))
+
+      const tab = store.getState().tabs.tabs.find((item) => item.id === 'local-fallback')
+      expect(store.getState().tabs.activeTabId).toBe('local-fallback')
+      expect(tab?.sessionMetadataByKey).toEqual({
+        [`claude:${VALID_CLAUDE_SESSION_ID}`]: {
+          sessionType: 'freshclaude',
+          firstUserMessage: 'IMPORTANT: internal task',
+          isSubagent: true,
+        },
+      })
+    })
+
     it('activates existing tab when terminalId is already attached', async () => {
       const store = configureStore({
         reducer: {

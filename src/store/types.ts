@@ -36,6 +36,13 @@ export type TabMode = 'shell' | CodingCliProviderName
  */
 export type ShellType = 'system' | 'cmd' | 'powershell' | 'wsl'
 
+export interface SessionListMetadata {
+  sessionType?: string
+  firstUserMessage?: string
+  isSubagent?: boolean
+  isNonInteractive?: boolean
+}
+
 export interface Tab {
   id: string
   createRequestId: string
@@ -50,6 +57,7 @@ export interface Tab {
   shell?: ShellType
   initialCwd?: string
   resumeSessionId?: string     // Mirrored from pane content on session association; serves as fallback if pane layout is lost
+  sessionMetadataByKey?: Record<string, SessionListMetadata>
   createdAt: number
   titleSetByUser?: boolean     // If true, don't auto-update title
   lastInputAt?: number

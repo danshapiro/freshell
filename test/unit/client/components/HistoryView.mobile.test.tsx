@@ -1,10 +1,11 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, cleanup, fireEvent, screen } from '@testing-library/react'
+import { render, cleanup, fireEvent, screen, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import HistoryView from '@/components/HistoryView'
 import sessionsReducer from '@/store/sessionsSlice'
 import tabsReducer from '@/store/tabsSlice'
+import panesReducer from '@/store/panesSlice'
 
 vi.mock('@/lib/api', () => ({
   api: {
@@ -21,6 +22,7 @@ function renderHistoryView(onOpenSession = vi.fn()) {
     reducer: {
       sessions: sessionsReducer,
       tabs: tabsReducer,
+      panes: panesReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -49,14 +51,25 @@ function renderHistoryView(onOpenSession = vi.fn()) {
         expandedProjects: new Set([projectPath]),
       },
       tabs: { tabs: [], activeTabId: null },
+      panes: {
+        layouts: {},
+        activePane: {},
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      },
     } as any,
   })
 
-  return render(
+  const utils = render(
     <Provider store={store}>
       <HistoryView onOpenSession={onOpenSession} />
     </Provider>
   )
+  return { store, ...utils }
 }
 
 describe('HistoryView mobile behavior', () => {
@@ -88,5 +101,77 @@ describe('HistoryView mobile behavior', () => {
     expect(screen.getByRole('button', { name: 'Open session' }).className).toContain('min-h-11')
     expect(screen.getByRole('button', { name: 'Edit session' }).className).toContain('min-h-11')
     expect(screen.getByRole('button', { name: 'Delete session' }).className).toContain('min-h-11')
+  })
+
+  it('opens agent-chat sessions with their sessionType instead of falling back to a terminal tab', async () => {
+    const projectPath = '/test/project'
+    const store = configureStore({
+      reducer: {
+        sessions: sessionsReducer,
+        tabs: tabsReducer,
+        panes: panesReducer,
+      },
+      middleware: (getDefault) =>
+        getDefault({
+          serializableCheck: {
+            ignoredPaths: ['sessions.expandedProjects'],
+          },
+        }),
+      preloadedState: {
+        sessions: {
+          projects: [
+            {
+              projectPath,
+              color: '#6b7280',
+              sessions: [
+                {
+                  provider: 'claude',
+                  sessionType: 'freshclaude',
+                  sessionId: '550e8400-e29b-41d4-a716-446655440000',
+                  projectPath,
+                  updatedAt: Date.now(),
+                  title: 'FreshClaude Session',
+                  summary: 'summary',
+                },
+              ],
+            },
+          ],
+          expandedProjects: new Set([projectPath]),
+        },
+        tabs: { tabs: [], activeTabId: null },
+        panes: {
+          layouts: {},
+          activePane: {},
+          paneTitles: {},
+          paneTitleSetByUser: {},
+          renameRequestTabId: null,
+          renameRequestPaneId: null,
+          zoomedPane: {},
+          refreshRequestsByPane: {},
+        },
+      } as any,
+    })
+
+    render(
+      <Provider store={store}>
+        <HistoryView />
+      </Provider>
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /open session freshclaude session/i }))
+
+    await waitFor(() => {
+      const state = store.getState()
+      const tabId = state.tabs.activeTabId as string
+      const layout = state.panes?.layouts?.[tabId]
+      expect(layout?.type).toBe('leaf')
+      if (layout?.type === 'leaf') {
+        expect(layout.content).toMatchObject({
+          kind: 'agent-chat',
+          provider: 'freshclaude',
+          resumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
+        })
+      }
+    })
   })
 })
