@@ -155,7 +155,7 @@ describe('TabItem', () => {
     expect(screen.getByDisplayValue('Editing')).toBeInTheDocument()
   })
 
-  it('pulses only the exact busy terminal icon in split tabs', () => {
+  it('shows blue color on the exact busy terminal icon in split tabs', () => {
     const paneContents: PaneContent[] = [
       {
         kind: 'terminal',
@@ -188,11 +188,12 @@ describe('TabItem', () => {
     const busyIcon = icons.find((icon) => icon.getAttribute('data-terminal-id') === 'term-1')
     const idleIcon = icons.find((icon) => icon.getAttribute('data-terminal-id') === 'term-2')
 
-    expect(busyIcon?.getAttribute('class')).toContain('animate-pulse')
-    expect(idleIcon?.getAttribute('class') ?? '').not.toContain('animate-pulse')
+    expect(busyIcon?.getAttribute('class')).toContain('text-blue-500')
+    expect(busyIcon?.getAttribute('class')).not.toContain('animate-pulse')
+    expect(idleIcon?.getAttribute('class') ?? '').not.toContain('text-blue-500')
   })
 
-  it('pulses a single unnamed terminal icon during the exact tab-terminal fallback', () => {
+  it('shows blue color on a single unnamed terminal icon during the exact tab-terminal fallback', () => {
     const paneContents: PaneContent[] = [
       {
         kind: 'terminal',
@@ -213,10 +214,11 @@ describe('TabItem', () => {
       />
     )
 
-    expect(screen.getByTestId('pane-icon').getAttribute('class')).toContain('animate-pulse')
+    expect(screen.getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
+    expect(screen.getByTestId('pane-icon').getAttribute('class')).not.toContain('animate-pulse')
   })
 
-  it('pulses the overflow indicator when the exact busy terminal is hidden beyond the visible icon cap', () => {
+  it('shows blue color on the overflow indicator when the exact busy terminal is hidden beyond the visible icon cap', () => {
     const paneContents: PaneContent[] = Array.from({ length: 7 }, (_, index) => ({
       kind: 'terminal',
       mode: 'shell',
@@ -235,7 +237,8 @@ describe('TabItem', () => {
       />
     )
 
-    expect(screen.getByText('+1').getAttribute('class')).toContain('animate-pulse')
+    expect(screen.getByText('+1').getAttribute('class')).toContain('text-blue-500')
+    expect(screen.getByText('+1').getAttribute('class')).not.toContain('animate-pulse')
   })
 
   it('calls onClick when clicked', () => {

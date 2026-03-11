@@ -10,7 +10,8 @@ import type { MouseEvent, KeyboardEvent } from 'react'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 
 function StatusDot({ status, activityPulse }: { status: TerminalStatus; activityPulse?: boolean }) {
-  return <Circle className={cn('h-2 w-2', getTerminalStatusDotClassName(status), activityPulse && status === 'running' && 'animate-pulse')} />
+  const isBusy = activityPulse && status === 'running'
+  return <Circle className={cn('h-2 w-2', isBusy ? 'fill-blue-500 text-blue-500' : getTerminalStatusDotClassName(status))} />
 }
 
 const MAX_TAB_ICONS = 6
@@ -96,14 +97,13 @@ export default function TabItem({
               content={content}
               className={cn(
                 'h-3 w-3 shrink-0',
-                getTerminalStatusIconClassName(status),
-                shouldPulse && 'animate-pulse',
+                shouldPulse ? 'text-blue-500' : getTerminalStatusIconClassName(status),
               )}
             />
           )
         })}
         {overflow > 0 && (
-          <span className={cn('text-[10px] text-muted-foreground leading-none', hiddenBusyTerminal && 'animate-pulse')}>+{overflow}</span>
+          <span className={cn('text-[10px] leading-none', hiddenBusyTerminal ? 'text-blue-500' : 'text-muted-foreground')}>+{overflow}</span>
         )}
       </span>
     )
