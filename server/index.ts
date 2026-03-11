@@ -101,8 +101,7 @@ const ASSOCIATION_MAX_AGE_MS = 30_000
 async function main() {
   validateStartupSecurity()
 
-  // WSL2 port forwarding is deferred until bindHost is known (after config load).
-  // See the conditional call before server.listen() below.
+  // Windows/WSL network repair is available only through the manual network-repair API and UI flows.
 
   initPerfLogging()
 

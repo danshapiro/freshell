@@ -165,6 +165,10 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
       }
 
       if (status.firewall.platform === 'windows') {
+        if (commands.length === 0) {
+          return res.json({ method: 'none', message: 'No firewall detected' })
+        }
+
         if (!confirmElevation) {
           return res.json(WINDOWS_ELEVATION_CONFIRMATION)
         }

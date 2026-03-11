@@ -304,6 +304,33 @@ describe('Network API integration', () => {
       expect(cp.execFile).not.toHaveBeenCalled()
     })
 
+    it('returns none for inactive Windows firewall without prompting or elevating', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'windows',
+        active: false,
+      })
+      networkManager.resetFirewallCache()
+
+      const cp = await import('node:child_process')
+
+      const firstRes = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(firstRes.status).toBe(200)
+      expect(firstRes.body).toEqual({ method: 'none', message: 'No firewall detected' })
+
+      const confirmedRes = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({ confirmElevation: true })
+
+      expect(confirmedRes.status).toBe(200)
+      expect(confirmedRes.body).toEqual({ method: 'none', message: 'No firewall detected' })
+      expect(cp.execFile).not.toHaveBeenCalled()
+    })
+
     it('starts native Windows repair after explicit confirmation', async () => {
       vi.mocked(detectFirewall).mockResolvedValue({
         platform: 'windows',

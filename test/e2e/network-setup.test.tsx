@@ -200,6 +200,45 @@ describe('Network Setup Wizard (e2e)', () => {
       expect(mockFetchFirewallConfig).toHaveBeenNthCalledWith(2, { confirmElevation: true })
     })
   })
+
+  it('refreshes the wizard firewall state when the server reports no changes were needed', async () => {
+    const wslFirewallStatus: NetworkStatusResponse = {
+      ...configuredRemoteStatus,
+      firewall: { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false },
+    }
+    const store = createStore(wslFirewallStatus)
+
+    mockPost.mockResolvedValueOnce(wslFirewallStatus)
+    mockFetchFirewallConfig.mockResolvedValueOnce({
+      method: 'none',
+      message: 'No configuration changes required',
+    })
+    mockGet.mockResolvedValueOnce({
+      ...wslFirewallStatus,
+      firewall: { ...wslFirewallStatus.firewall, portOpen: true },
+    })
+
+    render(
+      <Provider store={store}>
+        <SetupWizard onComplete={vi.fn()} initialStep={2} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /configure firewall/i })).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /configure firewall/i }))
+
+    await waitFor(() => {
+      expect(mockGet).toHaveBeenCalledWith('/api/network/status')
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText(/port is open/i)).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: /configure firewall/i })).not.toBeInTheDocument()
+    })
+  })
 })
 
 describe('Share button routing logic', () => {

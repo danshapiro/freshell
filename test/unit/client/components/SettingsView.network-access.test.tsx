@@ -121,6 +121,53 @@ describe('SettingsView network access section', () => {
     expect(mockFetchFirewallConfig).toHaveBeenCalledTimes(1)
   })
 
+  it('refreshes network status when the server reports no firewall changes were needed', async () => {
+    mockFetchFirewallConfig.mockResolvedValue({
+      method: 'none',
+      message: 'No configuration changes required',
+    })
+
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            firewall: {
+              platform: 'wsl2',
+              active: true,
+              portOpen: false,
+              commands: [],
+              configuring: false,
+            },
+          }),
+        }),
+      },
+    })
+
+    const { api } = await import('@/lib/api')
+    vi.mocked(api.get).mockResolvedValue(createNetworkStatus({
+      firewall: {
+        platform: 'wsl2',
+        active: true,
+        portOpen: true,
+        commands: [],
+        configuring: false,
+      },
+    }))
+
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    fireEvent.click(screen.getByRole('button', { name: /fix firewall/i }))
+
+    await waitFor(() => {
+      expect(api.get).toHaveBeenCalledWith('/api/network/status')
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText(/port is open/i)).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: /fix firewall/i })).not.toBeInTheDocument()
+    })
+  })
+
   it('shows dev-mode restart warning when devMode is true', () => {
     const store = createSettingsViewStore({
       extraPreloadedState: {

@@ -264,6 +264,11 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
       return
     }
 
+    if (result.method === 'none') {
+      void dispatch(fetchNetworkStatus())
+      return
+    }
+
     if (result.method === 'terminal') {
       const tabId = nanoid()
       dispatch(addTab({ id: tabId, title: 'Firewall Setup', mode: 'shell', shell: 'system' }))

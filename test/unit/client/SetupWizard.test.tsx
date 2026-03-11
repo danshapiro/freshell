@@ -353,6 +353,63 @@ describe('SetupWizard', () => {
     expect(mockFetchFirewallConfig).toHaveBeenCalledTimes(1)
   })
 
+  it('refreshes network status when the server reports no firewall changes were needed', async () => {
+    mockFetchFirewallConfig.mockResolvedValue({
+      method: 'none',
+      message: 'No configuration changes required',
+    })
+
+    const firewallActive = { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false }
+    const store = createTestStore({
+      status: {
+        ...defaultNetworkStatus,
+        configured: true,
+        host: '0.0.0.0',
+        firewall: firewallActive,
+        rebinding: false,
+      },
+    })
+
+    mockPost.mockResolvedValueOnce({
+      ...defaultNetworkStatus,
+      configured: true,
+      host: '0.0.0.0',
+      firewall: firewallActive,
+      rebinding: false,
+    })
+
+    const refreshedStatus = {
+      ...defaultNetworkStatus,
+      configured: true,
+      host: '0.0.0.0' as const,
+      firewall: { ...firewallActive, portOpen: true },
+      rebinding: false,
+    }
+    const { api } = await import('@/lib/api')
+    vi.mocked(api.get).mockResolvedValue(refreshedStatus)
+
+    render(
+      <Provider store={store}>
+        <SetupWizard onComplete={vi.fn()} initialStep={2} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /configure firewall/i })).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /configure firewall/i }))
+
+    await waitFor(() => {
+      expect(api.get).toHaveBeenCalledWith('/api/network/status')
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText(/port is open/i)).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: /configure firewall/i })).not.toBeInTheDocument()
+    })
+  })
+
   it('reports firewall error when portOpen is false after configuring completes', async () => {
     mockFetchFirewallConfig.mockResolvedValue({ method: 'wsl2', status: 'ok' })
     const firewallActive = { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false }

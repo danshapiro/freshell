@@ -241,6 +241,13 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
       return
     }
 
+    if (result.method === 'none') {
+      setFirewallStatus('active')
+      setFirewallDetail(result.message ?? 'Refreshing firewall status...')
+      void dispatch(fetchNetworkStatus())
+      return
+    }
+
     if (result.method === 'terminal') {
       const tabId = nanoid()
       dispatch(addTab({ id: tabId, title: 'Firewall Setup', mode: 'shell', shell: 'system' }))
