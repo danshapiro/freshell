@@ -8,7 +8,11 @@ import {
 } from '@/store/sessionsSlice'
 import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { api, isApiUnauthorizedError, type VersionInfo } from '@/lib/api'
-import { refreshActiveSessionWindow } from '@/store/sessionsThunks'
+import {
+  activateSessionSurface,
+  loadInitialSessionsWindow,
+  refreshActiveSessionWindow,
+} from '@/store/sessionsThunks'
 import { getShareAction, ensureShareUrlToken } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { collectSessionLocatorsFromTabs, getSessionsForHello } from '@/lib/session-utils'
@@ -509,6 +513,23 @@ export default function App() {
         return true
       }
 
+      const ensureSidebarSessionsWindow = async (): Promise<boolean> => {
+        const sidebarWindow = appStore.getState().sessions.windows?.sidebar
+        if (typeof sidebarWindow?.lastLoadedAt === 'number') {
+          dispatch(activateSessionSurface('sidebar') as any)
+          return true
+        }
+
+        try {
+          await dispatch(loadInitialSessionsWindow() as any)
+          return true
+        } catch (err: unknown) {
+          if (handleBootstrapAuthFailure(err)) return false
+          log.warn('Failed to load initial sidebar session window', err)
+          return true
+        }
+      }
+
       const unsubscribe = ws.onMessage((msg) => {
         if (!msg?.type) return
         if (msg.type === 'ready') {
@@ -670,6 +691,8 @@ export default function App() {
         if (handleBootstrapAuthFailure(err)) return
         log.warn('Failed to load bootstrap data', err)
       }
+
+      if (!(await ensureSidebarSessionsWindow())) return
 
       try {
         const nextVersionInfo = await api.get<VersionInfo>('/api/version')

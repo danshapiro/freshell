@@ -495,7 +495,7 @@ describe('App WS bootstrap recovery', () => {
     expect(extension?.client?.mobile).toBe(true)
   })
 
-  it('does not load the sidebar session window during bootstrap', async () => {
+  it('loads the sidebar session window during bootstrap when no hydrated sidebar window exists', async () => {
     const store = createStore({
       tabs: [{ id: 'tab-older', mode: 'codex', resumeSessionId: 'older-open' }],
       panes: {
@@ -522,6 +522,22 @@ describe('App WS bootstrap recovery', () => {
         },
       },
     })
+    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+      projects: [{
+        projectPath: '/older',
+        sessions: [{
+          provider: 'codex',
+          sessionId: 'older-open',
+          projectPath: '/older',
+          updatedAt: 1,
+          title: 'Older Open Session',
+        }],
+      }],
+      totalSessions: 1,
+      oldestIncludedTimestamp: 1,
+      oldestIncludedSessionId: 'codex:older-open',
+      hasMore: false,
+    })
 
     render(
       <Provider store={store}>
@@ -533,8 +549,20 @@ describe('App WS bootstrap recovery', () => {
       expect(wsMocks.connect).toHaveBeenCalledTimes(1)
     })
 
-    expect(fetchSidebarSessionsSnapshot).not.toHaveBeenCalled()
-    expect(store.getState().sessions.projects).toEqual([])
+    await waitFor(() => {
+      expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+      expect(store.getState().sessions.projects).toEqual([
+        expect.objectContaining({
+          projectPath: '/older',
+          sessions: expect.arrayContaining([
+            expect.objectContaining({
+              sessionId: 'older-open',
+              title: 'Older Open Session',
+            }),
+          ]),
+        }),
+      ])
+    })
   })
 
   it('ignores legacy sessions.patch messages when bootstrapping against an already-ready socket', async () => {
@@ -589,7 +617,7 @@ describe('App WS bootstrap recovery', () => {
     expect(store.getState().sessions.projects.map((p: any) => p.projectPath)).toEqual(['/p1'])
   })
 
-  it('does not refetch sessions when a pre-connected socket has no recent baseline', async () => {
+  it('hydrates the sidebar session window even when bootstrapping against a pre-connected socket', async () => {
     const olderOpenSessionId = 'older-open'
     const store = createStore({
       tabs: [{ id: 'tab-older', mode: 'codex', resumeSessionId: olderOpenSessionId }],
@@ -619,6 +647,22 @@ describe('App WS bootstrap recovery', () => {
     })
     wsMocks.isReady = true
     wsMocks.serverInstanceId = 'srv-preconnected-fallback'
+    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+      projects: [{
+        projectPath: '/older',
+        sessions: [{
+          provider: 'codex',
+          sessionId: olderOpenSessionId,
+          projectPath: '/older',
+          updatedAt: 1,
+          title: 'Older Open Session',
+        }],
+      }],
+      totalSessions: 1,
+      oldestIncludedTimestamp: 1,
+      oldestIncludedSessionId: `codex:${olderOpenSessionId}`,
+      hasMore: false,
+    })
 
     render(
       <Provider store={store}>
@@ -629,11 +673,20 @@ describe('App WS bootstrap recovery', () => {
     await waitFor(() => {
       expect(store.getState().connection.status).toBe('ready')
       expect(store.getState().connection.serverInstanceId).toBe('srv-preconnected-fallback')
-      expect(store.getState().sessions.wsSnapshotReceived).toBe(false)
-      expect(store.getState().sessions.projects).toEqual([])
+      expect(store.getState().sessions.projects).toEqual([
+        expect.objectContaining({
+          projectPath: '/older',
+          sessions: expect.arrayContaining([
+            expect.objectContaining({
+              sessionId: olderOpenSessionId,
+              title: 'Older Open Session',
+            }),
+          ]),
+        }),
+      ])
     })
 
-    expect(fetchSidebarSessionsSnapshot).not.toHaveBeenCalled()
+    expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
     expect(wsMocks.connect).not.toHaveBeenCalled()
     expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))

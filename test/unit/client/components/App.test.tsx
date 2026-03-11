@@ -737,7 +737,7 @@ describe('App Bootstrap', () => {
     })
   })
 
-  it('does not refetch bootstrap data or eager sidebar sessions after websocket connect', async () => {
+  it('does not refetch bootstrap data or duplicate the eager sidebar hydration after websocket connect', async () => {
     let resolveConnect: () => void
     const connectPromise = new Promise<void>((resolve) => {
       resolveConnect = resolve
@@ -755,7 +755,7 @@ describe('App Bootstrap', () => {
       const bootstrapCalls = mockApiGet.mock.calls.filter(([url]) => url === '/api/bootstrap')
       const settingsCalls = mockApiGet.mock.calls.filter(([url]) => url === '/api/settings')
       const platformCalls = mockApiGet.mock.calls.filter(([url]) => url === '/api/platform')
-      expect(sessionsCalls.length).toBe(0)
+      expect(sessionsCalls.length).toBe(1)
       expect(bootstrapCalls.length).toBe(1)
       expect(settingsCalls.length).toBe(0)
       expect(platformCalls.length).toBe(0)
@@ -769,7 +769,7 @@ describe('App Bootstrap', () => {
     const bootstrapCalls = mockApiGet.mock.calls.filter(([url]) => url === '/api/bootstrap')
     const settingsCalls = mockApiGet.mock.calls.filter(([url]) => url === '/api/settings')
     const platformCalls = mockApiGet.mock.calls.filter(([url]) => url === '/api/platform')
-    expect(sessionsCalls.length).toBe(0)
+    expect(sessionsCalls.length).toBe(1)
     expect(bootstrapCalls.length).toBe(1)
     expect(settingsCalls.length).toBe(0)
     expect(platformCalls.length).toBe(0)

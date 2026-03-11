@@ -127,6 +127,7 @@ function createStore(options?: {
   freshClaudeTab?: Partial<Tab>
   freshClaudePane?: AgentChatPaneContent
   agentChatState?: Partial<AgentChatState>
+  activeTabId?: string
 }) {
   const codexTab: Tab = {
     id: 'tab-codex',
@@ -235,7 +236,7 @@ function createStore(options?: {
       },
       tabs: {
         tabs,
-        activeTabId: 'tab-codex',
+        activeTabId: options?.activeTabId ?? 'tab-codex',
         renameRequestTabId: null,
       },
       connection: {
@@ -589,7 +590,41 @@ describe('pane header runtime metadata flow (e2e)', () => {
   })
 
   it('renders and updates the same percent-used header indicator for a FreshClaude pane from indexed Claude metadata', async () => {
+    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+      projects: [
+        {
+          projectPath: '/home/user/code/freshell',
+          sessions: [
+            {
+              provider: 'claude',
+              sessionType: 'freshclaude',
+              sessionId: 'claude-session-1',
+              projectPath: '/home/user/code/freshell',
+              cwd: '/home/user/code/freshell/.worktrees/issue-163',
+              gitBranch: 'main',
+              isDirty: true,
+              updatedAt: 1,
+              tokenUsage: {
+                inputTokens: 10,
+                outputTokens: 5,
+                cachedTokens: 0,
+                totalTokens: 15,
+                contextTokens: 15,
+                compactThresholdTokens: 60,
+                compactPercent: 25,
+              },
+            },
+          ],
+        },
+      ],
+      totalSessions: 1,
+      oldestIncludedTimestamp: 1,
+      oldestIncludedSessionId: 'claude:claude-session-1',
+      hasMore: false,
+    })
+
     const store = createStore({
+      activeTabId: 'tab-fresh',
       freshClaudeTab: {
         id: 'tab-fresh',
         createRequestId: 'req-fresh',

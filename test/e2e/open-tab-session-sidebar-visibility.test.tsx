@@ -253,8 +253,37 @@ describe('open tab session sidebar visibility (e2e)', () => {
     cleanup()
   })
 
-  it('shows a restored open local session in the sidebar during bootstrap without issuing a sidebar snapshot fetch', async () => {
+  it('hydrates sidebar metadata and non-active sessions during bootstrap when only restored tab fallbacks exist', async () => {
     const olderOpenSessionId = 'older-open'
+    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+      projects: [
+        {
+          projectPath: '/work/project-older',
+          sessions: [{
+            provider: 'codex',
+            sessionId: olderOpenSessionId,
+            projectPath: '/work/project-older',
+            updatedAt: 10,
+            title: 'Older Open Session',
+          }],
+        },
+        {
+          projectPath: '/work/project-teammate',
+          sessions: [{
+            provider: 'codex',
+            sessionId: 'teammate-open',
+            projectPath: '/work/project-teammate',
+            updatedAt: 9,
+            title: 'Teammate Session',
+          }],
+        },
+      ],
+      totalSessions: 2,
+      oldestIncludedTimestamp: 9,
+      oldestIncludedSessionId: 'codex:teammate-open',
+      hasMore: false,
+    })
+
     const store = createStore({
       tabs: [{
         id: 'tab-older',
@@ -300,9 +329,12 @@ describe('open tab session sidebar visibility (e2e)', () => {
 
     await waitFor(() => {
       expect(screen.getAllByText('Older Open Session').length).toBeGreaterThan(0)
+      expect(screen.getAllByText('Teammate Session').length).toBeGreaterThan(0)
+      expect(screen.getAllByText('project-older').length).toBeGreaterThan(0)
+      expect(screen.getAllByText('project-teammate').length).toBeGreaterThan(0)
     })
 
-    expect(fetchSidebarSessionsSnapshot).not.toHaveBeenCalled()
+    expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
   })
 
   it('ignores legacy sessions.updated websocket pushes because the sidebar window is HTTP-owned', async () => {

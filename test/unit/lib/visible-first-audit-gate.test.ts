@@ -3,6 +3,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { execFile } from 'node:child_process'
+import { createRequire } from 'node:module'
 import { promisify } from 'node:util'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
@@ -19,6 +20,7 @@ import {
 } from '@test/e2e-browser/perf/visible-first-audit-gate'
 
 const execFileAsync = promisify(execFile)
+const require = createRequire(import.meta.url)
 
 type GateMetric = VisibleFirstAuditGateResult['violations'][number]['metric']
 
@@ -233,8 +235,9 @@ describe('evaluateVisibleFirstAuditGate', () => {
     tempDirs.add(tempDir)
 
     const result = await execFileAsync(
-      path.resolve(process.cwd(), 'node_modules/.bin/tsx'),
+      process.execPath,
       [
+        require.resolve('tsx/cli'),
         path.resolve(process.cwd(), 'scripts/assert-visible-first-audit-gate.ts'),
         '--base',
         basePath,
