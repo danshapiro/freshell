@@ -4,11 +4,12 @@ import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
 import AgentChatView from '@/components/agent-chat/AgentChatView'
 import agentChatReducer, {
-  replayHistory,
   sessionCreated,
   sessionInit,
   sessionSnapshotReceived,
   setSessionStatus,
+  timelinePageReceived,
+  turnBodyReceived,
 } from '@/store/agentChatSlice'
 import panesReducer, { initLayout } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
@@ -136,7 +137,7 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(screen.getByText('Freshclaude')).toBeInTheDocument()
   })
 
-  it('replaces loading state with messages after replayHistory arrives', () => {
+  it('replaces loading state with hydrated timeline content after the initial window arrives', () => {
     const store = makeStore()
     const { rerender } = render(
       <Provider store={store}>
@@ -148,21 +149,29 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(screen.queryByText('Freshclaude')).not.toBeInTheDocument()
     expect(screen.getByText(/restoring/i)).toBeInTheDocument()
 
-    // Simulate server sending sdk.history
-    store.dispatch(replayHistory({
+    store.dispatch(timelinePageReceived({
       sessionId: 'sess-reload-1',
-      messages: [
+      items: [
         {
-          role: 'user',
-          content: [{ type: 'text', text: 'Hello Claude' }],
+          turnId: 'turn-1',
+          sessionId: 'sess-reload-1',
+          role: 'assistant',
+          summary: 'Hello! How can I help?',
           timestamp: '2026-01-01T00:00:00Z',
         },
-        {
-          role: 'assistant',
-          content: [{ type: 'text', text: 'Hello! How can I help?' }],
-          timestamp: '2026-01-01T00:00:01Z',
-        },
       ],
+      nextCursor: null,
+      revision: 1,
+      replace: true,
+    }))
+    store.dispatch(turnBodyReceived({
+      sessionId: 'sess-reload-1',
+      turnId: 'turn-1',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Hello! How can I help?' }],
+        timestamp: '2026-01-01T00:00:01Z',
+      },
     }))
 
     // Force re-render to pick up store changes
@@ -175,8 +184,6 @@ describe('AgentChatView reload/restore behavior', () => {
     // Loading should be gone
     expect(screen.queryByText(/restoring/i)).not.toBeInTheDocument()
 
-    // Messages should be visible
-    expect(screen.getByText('Hello Claude')).toBeInTheDocument()
     expect(screen.getByText('Hello! How can I help?')).toBeInTheDocument()
   })
 
@@ -202,7 +209,7 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(screen.getByText('Freshclaude')).toBeInTheDocument()
   })
 
-  it('shows welcome screen (not stuck restoring) when replayHistory arrives with empty messages', () => {
+  it('shows welcome screen (not stuck restoring) when the initial timeline window arrives empty', () => {
     const store = makeStore()
     const { rerender } = render(
       <Provider store={store}>
@@ -213,10 +220,12 @@ describe('AgentChatView reload/restore behavior', () => {
     // Initially shows restoring
     expect(screen.getByText(/restoring/i)).toBeInTheDocument()
 
-    // Server sends sdk.history with no messages (empty session)
-    store.dispatch(replayHistory({
+    store.dispatch(timelinePageReceived({
       sessionId: 'sess-reload-1',
-      messages: [],
+      items: [],
+      nextCursor: null,
+      revision: 1,
+      replace: true,
     }))
 
     rerender(
@@ -342,10 +351,8 @@ describe('AgentChatView reload/restore behavior', () => {
     })
   })
 
-  it('stays in restoring state when setSessionStatus arrives before replayHistory (race condition)', () => {
+  it('stays in restoring state when sdk.status arrives before the first timeline window (race condition)', () => {
     const store = makeStore()
-    // Simulate sdk.status arriving before sdk.history — creates session via ensureSession
-    // but without historyLoaded flag
     store.dispatch(setSessionStatus({ sessionId: 'sess-reload-1', status: 'idle' }))
 
     const { rerender } = render(
@@ -358,16 +365,29 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(screen.getByText(/restoring/i)).toBeInTheDocument()
     expect(screen.queryByText('Freshclaude')).not.toBeInTheDocument()
 
-    // Now sdk.history arrives
-    store.dispatch(replayHistory({
+    store.dispatch(timelinePageReceived({
       sessionId: 'sess-reload-1',
-      messages: [
+      items: [
         {
+          turnId: 'turn-1',
+          sessionId: 'sess-reload-1',
           role: 'user',
-          content: [{ type: 'text', text: 'Hello' }],
+          summary: 'Hello',
           timestamp: '2026-01-01T00:00:00Z',
         },
       ],
+      nextCursor: null,
+      revision: 1,
+      replace: true,
+    }))
+    store.dispatch(turnBodyReceived({
+      sessionId: 'sess-reload-1',
+      turnId: 'turn-1',
+      message: {
+        role: 'user',
+        content: [{ type: 'text', text: 'Hello' }],
+        timestamp: '2026-01-01T00:00:00Z',
+      },
     }))
 
     rerender(
@@ -381,7 +401,7 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(screen.getByText('Hello')).toBeInTheDocument()
   })
 
-  it('reactively updates when replayHistory fires (no manual rerender)', async () => {
+  it('reactively updates when timeline hydration lands (no manual rerender)', async () => {
     const store = makeStore()
     render(
       <Provider store={store}>
@@ -392,27 +412,38 @@ describe('AgentChatView reload/restore behavior', () => {
     // Initially shows restoring
     expect(screen.getByText(/restoring/i)).toBeInTheDocument()
 
-    // Dispatch replayHistory — the component should re-render via Redux subscription
-    // WITHOUT requiring an explicit rerender() call
     act(() => {
-      store.dispatch(replayHistory({
+      store.dispatch(timelinePageReceived({
         sessionId: 'sess-reload-1',
-        messages: [
+        items: [
           {
+            turnId: 'turn-1',
+            sessionId: 'sess-reload-1',
             role: 'user',
-            content: [{ type: 'text', text: 'Reactive test message' }],
+            summary: 'Reactive test message',
             timestamp: '2026-01-01T00:00:00Z',
           },
         ],
+        nextCursor: null,
+        revision: 1,
+        replace: true,
+      }))
+      store.dispatch(turnBodyReceived({
+        sessionId: 'sess-reload-1',
+        turnId: 'turn-1',
+        message: {
+          role: 'user',
+          content: [{ type: 'text', text: 'Reactive test message' }],
+          timestamp: '2026-01-01T00:00:00Z',
+        },
       }))
     })
 
-    // Messages should be visible without manual rerender
     expect(screen.queryByText(/restoring/i)).not.toBeInTheDocument()
     expect(screen.getByText('Reactive test message')).toBeInTheDocument()
   })
 
-  it('reactively updates when sdk.history + sdk.status arrive back-to-back (production flow)', () => {
+  it('reactively updates when timeline hydration + sdk.status arrive back-to-back', () => {
     const store = makeStore()
     render(
       <Provider store={store}>
@@ -423,19 +454,30 @@ describe('AgentChatView reload/restore behavior', () => {
     // Initially shows restoring
     expect(screen.getByText(/restoring/i)).toBeInTheDocument()
 
-    // Simulate the real server response: sdk.history then sdk.status arrive back-to-back
-    // Both are dispatched synchronously in the same event loop tick (as they would be
-    // when two WS messages arrive in rapid succession)
     act(() => {
-      store.dispatch(replayHistory({
+      store.dispatch(timelinePageReceived({
         sessionId: 'sess-reload-1',
-        messages: [
+        items: [
           {
+            turnId: 'turn-1',
+            sessionId: 'sess-reload-1',
             role: 'user',
-            content: [{ type: 'text', text: 'Back-to-back test' }],
+            summary: 'Back-to-back test',
             timestamp: '2026-01-01T00:00:00Z',
           },
         ],
+        nextCursor: null,
+        revision: 1,
+        replace: true,
+      }))
+      store.dispatch(turnBodyReceived({
+        sessionId: 'sess-reload-1',
+        turnId: 'turn-1',
+        message: {
+          role: 'user',
+          content: [{ type: 'text', text: 'Back-to-back test' }],
+          timestamp: '2026-01-01T00:00:00Z',
+        },
       }))
       store.dispatch(setSessionStatus({
         sessionId: 'sess-reload-1',
@@ -448,7 +490,7 @@ describe('AgentChatView reload/restore behavior', () => {
     expect(screen.getByText('Back-to-back test')).toBeInTheDocument()
   })
 
-  it('reactively updates when sdk.history and sdk.status arrive in separate event loop ticks', () => {
+  it('reactively updates when timeline hydration and sdk.status arrive in separate event loop ticks', () => {
     const store = makeStore()
     render(
       <Provider store={store}>
@@ -459,25 +501,36 @@ describe('AgentChatView reload/restore behavior', () => {
     // Initially shows restoring
     expect(screen.getByText(/restoring/i)).toBeInTheDocument()
 
-    // sdk.history arrives first (separate event loop tick)
     act(() => {
-      store.dispatch(replayHistory({
+      store.dispatch(timelinePageReceived({
         sessionId: 'sess-reload-1',
-        messages: [
+        items: [
           {
+            turnId: 'turn-1',
+            sessionId: 'sess-reload-1',
             role: 'user',
-            content: [{ type: 'text', text: 'Separate tick test' }],
+            summary: 'Separate tick test',
             timestamp: '2026-01-01T00:00:00Z',
           },
         ],
+        nextCursor: null,
+        revision: 1,
+        replace: true,
+      }))
+      store.dispatch(turnBodyReceived({
+        sessionId: 'sess-reload-1',
+        turnId: 'turn-1',
+        message: {
+          role: 'user',
+          content: [{ type: 'text', text: 'Separate tick test' }],
+          timestamp: '2026-01-01T00:00:00Z',
+        },
       }))
     })
 
-    // After first dispatch, messages should already be visible
     expect(screen.queryByText(/restoring/i)).not.toBeInTheDocument()
     expect(screen.getByText('Separate tick test')).toBeInTheDocument()
 
-    // sdk.status arrives in a separate tick
     act(() => {
       store.dispatch(setSessionStatus({
         sessionId: 'sess-reload-1',
@@ -485,7 +538,6 @@ describe('AgentChatView reload/restore behavior', () => {
       }))
     })
 
-    // Messages should still be visible after status update
     expect(screen.getByText('Separate tick test')).toBeInTheDocument()
   })
 

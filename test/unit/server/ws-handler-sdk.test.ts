@@ -461,7 +461,7 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
-    it('routes sdk.attach and returns history + status', async () => {
+    it('routes sdk.attach and returns snapshot + status without sdk.history', async () => {
       const ws = await connectAndAuth()
       try {
         const messages: any[] = []
@@ -469,8 +469,8 @@ describe('WS Handler SDK Integration', () => {
           let count = 0
           const onMessage = (data: WebSocket.RawData) => {
             const parsed = JSON.parse(data.toString())
-            if (parsed.type === 'sdk.history' || parsed.type === 'sdk.status') {
-              messages.push(parsed)
+            messages.push(parsed)
+            if (parsed.type === 'sdk.session.snapshot' || parsed.type === 'sdk.status') {
               count++
               if (count >= 2) {
                 ws.off('message', onMessage)
@@ -488,15 +488,16 @@ describe('WS Handler SDK Integration', () => {
 
         await collectDone
 
-        const historyMsg = messages.find((m) => m.type === 'sdk.history')
+        const snapshotMsg = messages.find((m) => m.type === 'sdk.session.snapshot')
         const statusMsg = messages.find((m) => m.type === 'sdk.status')
 
-        expect(historyMsg).toBeDefined()
-        expect(historyMsg.sessionId).toBe('sdk-sess-1')
-        expect(historyMsg.messages).toHaveLength(1)
+        expect(snapshotMsg).toBeDefined()
+        expect(snapshotMsg.sessionId).toBe('sdk-sess-1')
+        expect(snapshotMsg.latestTurnId).toBe('turn-0')
         expect(statusMsg).toBeDefined()
         expect(statusMsg.sessionId).toBe('sdk-sess-1')
         expect(statusMsg.status).toBe('idle')
+        expect(messages.some((m) => m.type === 'sdk.history')).toBe(false)
         expect(mockSdkBridge.getSession).toHaveBeenCalledWith('sdk-sess-1')
         expect(mockSdkBridge.subscribe).toHaveBeenCalledWith('sdk-sess-1', expect.any(Function))
       } finally {

@@ -17,7 +17,7 @@ import agentChatReducer, {
   sessionInit,
   sessionSnapshotReceived,
   setSessionStatus,
-  replayHistory,
+  timelinePageReceived,
 } from '@/store/agentChatSlice'
 import panesReducer, { initLayout, addPane } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
@@ -249,11 +249,19 @@ describe('AgentChatView — split pane (Bug 2)', () => {
       </Provider>,
     )
 
-    // Simulate server response to sdk.attach: sdk.history + sdk.status
+    // Simulate server response to sdk.attach: sdk.session.snapshot + timeline hydration + sdk.status
     act(() => {
-      store.dispatch(replayHistory({
+      store.dispatch(sessionSnapshotReceived({
         sessionId: 'sess-1',
-        messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+        latestTurnId: null,
+        status: 'connected',
+      }))
+      store.dispatch(timelinePageReceived({
+        sessionId: 'sess-1',
+        items: [],
+        nextCursor: null,
+        revision: 1,
+        replace: true,
       }))
       store.dispatch(setSessionStatus({ sessionId: 'sess-1', status: 'idle' }))
     })

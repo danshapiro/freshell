@@ -81,8 +81,8 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const timelineSessionId = paneContent.resumeSessionId ?? session?.cliSessionId ?? paneContent.sessionId
 
   // Track whether we're waiting for a session restore (persisted sessionId, history not yet loaded).
-  // Fresh creates set historyLoaded=true immediately; reloads wait for an initial
-  // history source (HTTP timeline window or legacy sdk.history).
+  // Fresh creates set historyLoaded=true immediately; reloads wait for the initial
+  // HTTP timeline window (even if it is empty).
   // Times out after 5s to handle stale sessionIds from server restarts.
   const isRestoring = !!paneContent.sessionId && !session?.historyLoaded
   const [restoreTimedOut, setRestoreTimedOut] = useState(false)

@@ -13,7 +13,6 @@ import agentChatReducer, {
   setSessionStatus,
   turnResult,
   sessionExited,
-  replayHistory,
   timelinePageReceived,
   turnBodyReceived,
   sessionError,
@@ -128,26 +127,6 @@ describe('agentChatSlice', () => {
     expect(state).toEqual(initial)
   })
 
-  it('replays history messages into session (replaces, not appends)', () => {
-    let state = agentChatReducer(initial, sessionCreated({ requestId: 'r', sessionId: 's1' }))
-    // Add an existing message
-    state = agentChatReducer(state, addUserMessage({ sessionId: 's1', text: 'existing' }))
-    expect(state.sessions['s1'].messages).toHaveLength(1)
-
-    // Replay should replace, not append
-    state = agentChatReducer(state, replayHistory({
-      sessionId: 's1',
-      messages: [
-        { role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' },
-        { role: 'assistant', content: [{ type: 'text', text: 'hi' }], timestamp: '2026-01-01T00:00:01Z' },
-      ],
-    }))
-    expect(state.sessions['s1'].messages).toHaveLength(2)
-    expect(state.sessions['s1'].messages[0].role).toBe('user')
-    expect(state.sessions['s1'].messages[0].content[0].text).toBe('hello')
-    expect(state.sessions['s1'].messages[1].role).toBe('assistant')
-  })
-
   it('sets historyLoaded on sessionCreated (fresh create)', () => {
     const state = agentChatReducer(initial, sessionCreated({
       requestId: 'req-1',
@@ -156,14 +135,16 @@ describe('agentChatSlice', () => {
     expect(state.sessions['sess-1'].historyLoaded).toBe(true)
   })
 
-  it('sets historyLoaded on replayHistory (attach/reconnect)', () => {
-    const state = agentChatReducer(initial, replayHistory({
+  it('sets historyLoaded when the initial timeline window is empty', () => {
+    const state = agentChatReducer(initial, timelinePageReceived({
       sessionId: 'sess-attach',
-      messages: [
-        { role: 'user', content: [{ type: 'text', text: 'hi' }], timestamp: '2026-01-01T00:00:00Z' },
-      ],
+      items: [],
+      nextCursor: null,
+      revision: 1,
+      replace: true,
     }))
     expect(state.sessions['sess-attach'].historyLoaded).toBe(true)
+    expect(state.sessions['sess-attach'].timelineItems).toEqual([])
   })
 
   it('does not set historyLoaded on setSessionStatus alone', () => {
@@ -229,15 +210,25 @@ describe('agentChatSlice', () => {
     )
   })
 
-  it('bootstraps session on replayHistory for unknown sessionId', () => {
-    const state = agentChatReducer(initial, replayHistory({
+  it('bootstraps session on timelinePageReceived for unknown sessionId', () => {
+    const state = agentChatReducer(initial, timelinePageReceived({
       sessionId: 'unknown-sess',
-      messages: [
-        { role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' },
+      items: [
+        {
+          turnId: 'turn-1',
+          sessionId: 'unknown-sess',
+          role: 'user',
+          summary: 'hello',
+          timestamp: '2026-01-01T00:00:00Z',
+        },
       ],
+      nextCursor: null,
+      revision: 1,
+      replace: true,
     }))
     expect(state.sessions['unknown-sess']).toBeDefined()
-    expect(state.sessions['unknown-sess'].messages).toHaveLength(1)
+    expect(state.sessions['unknown-sess'].timelineItems).toHaveLength(1)
+    expect(state.sessions['unknown-sess'].historyLoaded).toBe(true)
   })
 
   it('bootstraps session on setSessionStatus for unknown sessionId', () => {

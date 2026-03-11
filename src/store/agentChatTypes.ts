@@ -78,7 +78,7 @@ export interface ChatSessionState {
   totalOutputTokens: number
   tools?: Array<{ name: string }>
   lastError?: string
-  /** True after sdk.history has been received (even if messages are empty) */
+  /** True after a fresh create or the first timeline window establishes restore state. */
   historyLoaded?: boolean
   /** True when server reports session is gone (INVALID_SESSION_ID). Triggers immediate recovery. */
   lost?: boolean

@@ -198,20 +198,6 @@ const agentChatSlice = createSlice({
       session.streamingActive = false
     },
 
-    replayHistory(state, action: PayloadAction<{
-      sessionId: string
-      messages: Array<{ role: 'user' | 'assistant'; content: ChatContentBlock[]; timestamp?: string }>
-    }>) {
-      const session = ensureSession(state, action.payload.sessionId)
-      // Replace messages (not append) — server sends full history on attach/reconnect
-      session.messages = action.payload.messages.map((msg) => ({
-        role: msg.role,
-        content: msg.content,
-        timestamp: msg.timestamp || new Date().toISOString(),
-      }))
-      session.historyLoaded = true
-    },
-
     timelineLoadStarted(state, action: PayloadAction<{ sessionId: string }>) {
       const session = state.sessions[action.payload.sessionId]
       if (!session) return
@@ -299,7 +285,6 @@ export const {
   setSessionStatus,
   turnResult,
   sessionExited,
-  replayHistory,
   timelineLoadStarted,
   timelinePageReceived,
   timelineLoadFailed,

@@ -1734,13 +1734,6 @@ export class WsHandler {
                 latestTurnId: messages && messages.length > 0 ? `turn-${messages.length - 1}` : null,
                 status: session.status,
               })
-              if (messages && messages.length > 0) {
-                this.send(ws, {
-                  type: 'sdk.history',
-                  sessionId: session.sessionId,
-                  messages,
-                })
-              }
             } catch (err) {
               log.warn({ err, resumeSessionId: m.resumeSessionId }, 'Failed to load session history from .jsonl')
             }
@@ -1947,11 +1940,6 @@ export class WsHandler {
           sessionId: m.sessionId,
           latestTurnId: historyMessages.length > 0 ? `turn-${historyMessages.length - 1}` : null,
           status: session.status,
-        })
-        this.send(ws, {
-          type: 'sdk.history',
-          sessionId: m.sessionId,
-          messages: historyMessages,
         })
 
         // Send current status
