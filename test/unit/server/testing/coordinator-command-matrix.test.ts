@@ -1,0 +1,392 @@
+import { describe, expect, it } from 'vitest'
+
+import {
+  classifyCommand,
+  type CommandDisposition,
+  type CommandKey,
+  type UpstreamPhase,
+} from '../../../../scripts/testing/coordinator-command-matrix.js'
+
+function expectVitestPhase(
+  phase: UpstreamPhase,
+  expected: {
+    config: 'default' | 'server'
+    args: string[]
+  },
+) {
+  expect(phase).toMatchObject({
+    runner: 'vitest',
+    config: expected.config,
+    args: expected.args,
+  })
+}
+
+function expectSinglePhase(
+  disposition: CommandDisposition,
+  expected: {
+    kind: 'coordinated' | 'delegated' | 'passthrough'
+    config: 'default' | 'server'
+    args: string[]
+    suiteKey?: string
+  },
+) {
+  expect(disposition.kind).toBe(expected.kind)
+  if (expected.kind === 'coordinated') {
+    expect(disposition.suiteKey).toBe(expected.suiteKey)
+  }
+  expect(disposition.phases).toHaveLength(1)
+  expectVitestPhase(disposition.phases[0], {
+    config: expected.config,
+    args: expected.args,
+  })
+}
+
+describe('classifyCommand()', () => {
+  it.each([
+    {
+      commandKey: 'test',
+      expected: {
+        kind: 'coordinated',
+        suiteKey: 'full-suite',
+        phases: [
+          { config: 'default', args: ['run'] },
+          { config: 'server', args: ['run', '--config', 'vitest.server.config.ts'] },
+        ],
+      },
+    },
+    {
+      commandKey: 'test:all',
+      expected: {
+        kind: 'coordinated',
+        suiteKey: 'full-suite',
+        phases: [
+          { config: 'default', args: ['run'] },
+          { config: 'server', args: ['run', '--config', 'vitest.server.config.ts'] },
+        ],
+      },
+    },
+    {
+      commandKey: 'check',
+      expected: {
+        kind: 'coordinated',
+        suiteKey: 'full-suite',
+        phases: [
+          { config: 'default', args: ['run'] },
+          { config: 'server', args: ['run', '--config', 'vitest.server.config.ts'] },
+        ],
+      },
+    },
+    {
+      commandKey: 'verify',
+      expected: {
+        kind: 'coordinated',
+        suiteKey: 'full-suite',
+        phases: [
+          { config: 'default', args: ['run'] },
+          { config: 'server', args: ['run', '--config', 'vitest.server.config.ts'] },
+        ],
+      },
+    },
+    {
+      commandKey: 'test:coverage',
+      expected: {
+        kind: 'coordinated',
+        suiteKey: 'default:coverage',
+        phases: [
+          { config: 'default', args: ['run', '--coverage'] },
+        ],
+      },
+    },
+    {
+      commandKey: 'test:unit',
+      expected: {
+        kind: 'coordinated',
+        suiteKey: 'default:test/unit',
+        phases: [
+          { config: 'default', args: ['run', 'test/unit'] },
+        ],
+      },
+    },
+    {
+      commandKey: 'test:client',
+      expected: {
+        kind: 'coordinated',
+        suiteKey: 'default:test/unit/client',
+        phases: [
+          { config: 'default', args: ['run', 'test/unit/client'] },
+        ],
+      },
+    },
+    {
+      commandKey: 'test:integration',
+      expected: {
+        kind: 'coordinated',
+        suiteKey: 'server:test/server',
+        phases: [
+          { config: 'server', args: ['run', '--config', 'vitest.server.config.ts', 'test/server'] },
+        ],
+      },
+    },
+    {
+      commandKey: 'test:server',
+      expected: {
+        kind: 'delegated',
+        phases: [
+          { config: 'server', args: ['--config', 'vitest.server.config.ts'] },
+        ],
+      },
+    },
+    {
+      commandKey: 'test:watch',
+      expected: {
+        kind: 'passthrough',
+        phases: [
+          { config: 'default', args: [] },
+        ],
+      },
+    },
+    {
+      commandKey: 'test:ui',
+      expected: {
+        kind: 'passthrough',
+        phases: [
+          { config: 'default', args: ['--ui'] },
+        ],
+      },
+    },
+    {
+      commandKey: 'test:vitest',
+      expected: {
+        kind: 'passthrough',
+        phases: [
+          { config: 'default', args: [] },
+        ],
+      },
+    },
+  ])('freezes the no-arg matrix for $commandKey', ({ commandKey, expected }) => {
+    const disposition = classifyCommand({ commandKey: commandKey as CommandKey, forwardedArgs: [] })
+
+    expect(disposition.kind).toBe(expected.kind)
+    if (disposition.kind === 'coordinated') {
+      expect(disposition.suiteKey).toBe(expected.suiteKey)
+    }
+    expect(disposition.phases).toHaveLength(expected.phases.length)
+    expected.phases.forEach((phase, index) => {
+      expectVitestPhase(disposition.phases[index], phase)
+    })
+  })
+
+  it('keeps test:unit mapped to the default-config test/unit workload', () => {
+    const disposition = classifyCommand({ commandKey: 'test:unit', forwardedArgs: [] })
+
+    expect(disposition).toMatchObject({
+      kind: 'coordinated',
+      suiteKey: 'default:test/unit',
+    })
+  })
+
+  it('keeps test:integration mapped to the server-config test/server workload', () => {
+    const disposition = classifyCommand({ commandKey: 'test:integration', forwardedArgs: [] })
+
+    expect(disposition).toMatchObject({
+      kind: 'coordinated',
+      suiteKey: 'server:test/server',
+    })
+  })
+
+  it('preserves test:server default delegation and coordinates only explicit broad --run', () => {
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:server',
+      forwardedArgs: [],
+    }), {
+      kind: 'delegated',
+      config: 'server',
+      args: ['--config', 'vitest.server.config.ts'],
+    })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:server',
+      forwardedArgs: ['--run'],
+    }), {
+      kind: 'coordinated',
+      suiteKey: 'server:all:run',
+      config: 'server',
+      args: ['--config', 'vitest.server.config.ts', '--run'],
+    })
+  })
+
+  it('delegates narrowed paths to the truthful owning config', () => {
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:unit',
+      forwardedArgs: ['test/unit/server/coding-cli/utils.test.ts'],
+    }), {
+      kind: 'delegated',
+      config: 'server',
+      args: ['run', '--config', 'vitest.server.config.ts', 'test/unit/server/coding-cli/utils.test.ts'],
+    })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['test/unit/server/terminal-registry.test.ts', '-t', 'reaping exited terminals'],
+    }), {
+      kind: 'delegated',
+      config: 'server',
+      args: ['run', '--config', 'vitest.server.config.ts', 'test/unit/server/terminal-registry.test.ts', '-t', 'reaping exited terminals'],
+    })
+  })
+
+  it('always delegates watch and ui flows', () => {
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:unit',
+      forwardedArgs: ['--watch'],
+    }), {
+      kind: 'delegated',
+      config: 'default',
+      args: ['run', 'test/unit', '--watch'],
+    })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:coverage',
+      forwardedArgs: ['--ui'],
+    }), {
+      kind: 'delegated',
+      config: 'default',
+      args: ['run', '--coverage', '--ui'],
+    })
+  })
+
+  it('bypasses coordination for help and version flags', () => {
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['--help'],
+    }), {
+      kind: 'passthrough',
+      config: 'default',
+      args: ['run', '--help'],
+    })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:server',
+      forwardedArgs: ['-v'],
+    }), {
+      kind: 'passthrough',
+      config: 'server',
+      args: ['--config', 'vitest.server.config.ts', '-v'],
+    })
+  })
+
+  it('rejects --reporter on composite commands and allows it on delegated single-phase commands', () => {
+    const composite = classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['--reporter', 'dot'],
+    })
+
+    expect(composite).toMatchObject({
+      kind: 'rejected',
+    })
+    if (composite.kind === 'rejected') {
+      expect(composite.reason).toContain('--reporter')
+    }
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:client',
+      forwardedArgs: ['--reporter', 'dot', 'test/unit/client/components/Sidebar.test.tsx'],
+    }), {
+      kind: 'delegated',
+      config: 'default',
+      args: ['run', 'test/unit/client', '--reporter', 'dot', 'test/unit/client/components/Sidebar.test.tsx'],
+    })
+  })
+
+  it('treats --run on test and test:all as a compatibility no-op', () => {
+    expect(classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['--run'],
+    })).toMatchObject({
+      kind: 'coordinated',
+      suiteKey: 'full-suite',
+    })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:all',
+      forwardedArgs: ['--run', 'test/unit/client/store/panesSlice.test.ts'],
+    }), {
+      kind: 'delegated',
+      config: 'default',
+      args: ['run', 'test/unit/client/store/panesSlice.test.ts'],
+    })
+  })
+
+  it('rejects mixed client and server selectors on composite commands', () => {
+    const disposition = classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: [
+        'test/unit/client/components/Sidebar.test.tsx',
+        'test/unit/server/sessions-sync/diff.test.ts',
+      ],
+    })
+
+    expect(disposition).toMatchObject({
+      kind: 'rejected',
+    })
+    if (disposition.kind === 'rejected') {
+      expect(disposition.reason).toContain('split the command')
+    }
+  })
+
+  it('preserves the frozen real-world command forms', () => {
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['test/unit/server/terminal-registry.test.ts', '-t', 'reaping exited terminals'],
+    }), {
+      kind: 'delegated',
+      config: 'server',
+      args: ['run', '--config', 'vitest.server.config.ts', 'test/unit/server/terminal-registry.test.ts', '-t', 'reaping exited terminals'],
+    })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['--run', 'test/unit/client/store/panesSlice.test.ts'],
+    }), {
+      kind: 'delegated',
+      config: 'default',
+      args: ['run', 'test/unit/client/store/panesSlice.test.ts'],
+    })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:server',
+      forwardedArgs: ['test/unit/server/sessions-sync/diff.test.ts'],
+    }), {
+      kind: 'delegated',
+      config: 'server',
+      args: ['--config', 'vitest.server.config.ts', 'test/unit/server/sessions-sync/diff.test.ts'],
+    })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:client',
+      forwardedArgs: ['--run', 'test/unit/client/components/Sidebar.test.tsx'],
+    }), {
+      kind: 'delegated',
+      config: 'default',
+      args: ['run', 'test/unit/client', '--run', 'test/unit/client/components/Sidebar.test.tsx'],
+    })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:unit',
+      forwardedArgs: ['test/unit/server/coding-cli/utils.test.ts'],
+    }), {
+      kind: 'delegated',
+      config: 'server',
+      args: ['run', '--config', 'vitest.server.config.ts', 'test/unit/server/coding-cli/utils.test.ts'],
+    })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:vitest',
+      forwardedArgs: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
+    }), {
+      kind: 'passthrough',
+      config: 'default',
+      args: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
+    })
+  })
+})
