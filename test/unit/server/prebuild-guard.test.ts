@@ -1,6 +1,13 @@
 import { describe, it, expect, afterEach, vi } from 'vitest'
 import http from 'http'
-import { checkProdRunning, parseEnv } from '../../../scripts/prebuild-guard.js'
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import {
+  checkProdRunning,
+  isLinkedWorktreeCheckout,
+  parseEnv,
+} from '../../../scripts/prebuild-guard.js'
 
 describe('prebuild-guard', () => {
   describe('parseEnv', () => {
@@ -158,6 +165,38 @@ describe('prebuild-guard', () => {
 
       const result = await checkProdRunning(port, { attempts: 1, retryDelayMs: 0, timeoutMs: 25 })
       expect(result).toEqual({ status: 'not-running' })
+    })
+  })
+
+  describe('isLinkedWorktreeCheckout', () => {
+    it('returns true when .git points at git worktree metadata', () => {
+      const root = mkdtempSync(join(tmpdir(), 'prebuild-guard-worktree-'))
+      try {
+        writeFileSync(join(root, '.git'), 'gitdir: /repo/.git/worktrees/visible-first\n')
+        expect(isLinkedWorktreeCheckout(root)).toBe(true)
+      } finally {
+        rmSync(root, { recursive: true, force: true })
+      }
+    })
+
+    it('returns true when .git uses Windows-style git worktree metadata', () => {
+      const root = mkdtempSync(join(tmpdir(), 'prebuild-guard-worktree-win-'))
+      try {
+        writeFileSync(join(root, '.git'), 'gitdir: C:\\repo\\.git\\worktrees\\visible-first\r\n')
+        expect(isLinkedWorktreeCheckout(root)).toBe(true)
+      } finally {
+        rmSync(root, { recursive: true, force: true })
+      }
+    })
+
+    it('returns false for a normal checkout with a .git directory', () => {
+      const root = mkdtempSync(join(tmpdir(), 'prebuild-guard-main-'))
+      try {
+        mkdirSync(join(root, '.git'))
+        expect(isLinkedWorktreeCheckout(root)).toBe(false)
+      } finally {
+        rmSync(root, { recursive: true, force: true })
+      }
     })
   })
 })

@@ -7,7 +7,7 @@
  * If so, blocks the build and suggests safe alternatives.
  */
 
-import { readFileSync } from 'fs'
+import { readFileSync, statSync } from 'fs'
 import { resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
 
@@ -39,6 +39,21 @@ function loadEnv(): Record<string, string> {
     return parseEnv(content)
   } catch {
     return {}
+  }
+}
+
+export function isLinkedWorktreeCheckout(rootDir: string = resolve(__dirname, '..')): boolean {
+  try {
+    const dotGitPath = resolve(rootDir, '.git')
+    const stat = statSync(dotGitPath)
+    if (!stat.isFile()) {
+      return false
+    }
+
+    const pointer = readFileSync(dotGitPath, 'utf-8').trim().replace(/\\/g, '/')
+    return /^gitdir:\s+.+\/\.git\/worktrees\/.+$/m.test(pointer)
+  } catch {
+    return false
   }
 }
 
@@ -108,6 +123,10 @@ export async function checkProdRunning(
 }
 
 export async function main(): Promise<void> {
+  if (isLinkedWorktreeCheckout()) {
+    process.exit(0)
+  }
+
   const env = loadEnv()
   const port = parseInt(process.env.PORT || env.PORT || '3001', 10)
 
