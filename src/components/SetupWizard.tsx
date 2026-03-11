@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { configureNetwork, fetchNetworkStatus } from '@/store/networkSlice'
+import { configureNetwork, fetchNetworkStatus, type NetworkStatusResponse } from '@/store/networkSlice'
 import { addTab } from '@/store/tabsSlice'
 import { initLayout } from '@/store/panesSlice'
 import { fetchFirewallConfig, type ConfigureFirewallResult } from '@/lib/firewall-configure'
@@ -28,6 +28,27 @@ interface SetupWizardProps {
 
 type ChecklistItemStatus = 'pending' | 'active' | 'done' | 'error'
 type FirewallConfirmation = Extract<ConfigureFirewallResult, { method: 'confirmation-required' }>
+type FirewallState = NetworkStatusResponse['firewall']
+
+function getFirewallChecklistState(firewall: FirewallState): { status: ChecklistItemStatus; detail: string } {
+  if (firewall.portOpen === true) {
+    return { status: 'done', detail: 'Port is open' }
+  }
+
+  if (firewall.platform === 'wsl2' && firewall.portOpen === false) {
+    return { status: 'error', detail: 'Port may be blocked by firewall' }
+  }
+
+  if (!firewall.active) {
+    return { status: 'done', detail: 'No firewall detected' }
+  }
+
+  if (firewall.portOpen === false) {
+    return { status: 'error', detail: 'Port may be blocked by firewall' }
+  }
+
+  return { status: 'done', detail: 'Firewall detected — check may be needed' }
+}
 
 function ChecklistItem({ label, status, detail }: { label: string; status: ChecklistItemStatus; detail?: string }) {
   return (
@@ -107,24 +128,18 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
     }
   }, [bindStatus, networkStatus?.rebinding, networkStatus?.host])
 
+  const applyFirewallChecklistState = useCallback((firewall: FirewallState) => {
+    const next = getFirewallChecklistState(firewall)
+    setFirewallStatus(next.status)
+    setFirewallDetail(next.detail)
+  }, [])
+
   // Check firewall status after bind completes
   useEffect(() => {
     if (bindStatus === 'done' && networkStatus?.firewall) {
-      if (!networkStatus.firewall.active) {
-        setFirewallStatus('done')
-        setFirewallDetail('No firewall detected')
-      } else if (networkStatus.firewall.portOpen === true) {
-        setFirewallStatus('done')
-        setFirewallDetail('Port is open')
-      } else if (networkStatus.firewall.portOpen === false) {
-        setFirewallStatus('error')
-        setFirewallDetail('Port may be blocked by firewall')
-      } else {
-        setFirewallStatus('done')
-        setFirewallDetail('Firewall detected — check may be needed')
-      }
+      applyFirewallChecklistState(networkStatus.firewall)
     }
-  }, [bindStatus, networkStatus?.firewall])
+  }, [applyFirewallChecklistState, bindStatus, networkStatus?.firewall])
 
   // Auto-advance to step 3 when all checklist items are done.
   // Firewall errors stay on step 2 so the user can see and act on them.
@@ -235,6 +250,18 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
     }, SETUP_WIZARD_FIREWALL_POLL_INTERVAL_MS)
   }, [dispatch])
 
+  const refreshFirewallStatus = useCallback(async (pendingDetail: string) => {
+    setFirewallStatus('active')
+    setFirewallDetail(pendingDetail)
+    try {
+      const action = await dispatch(fetchNetworkStatus()).unwrap()
+      applyFirewallChecklistState(action.firewall)
+    } catch {
+      setFirewallStatus('error')
+      setFirewallDetail('Failed to refresh firewall status')
+    }
+  }, [applyFirewallChecklistState, dispatch])
+
   const handleFirewallResult = useCallback((result: ConfigureFirewallResult) => {
     if (result.method === 'confirmation-required') {
       setFirewallConfirmation(result)
@@ -242,9 +269,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
     }
 
     if (result.method === 'none') {
-      setFirewallStatus('active')
-      setFirewallDetail(result.message ?? 'Refreshing firewall status...')
-      void dispatch(fetchNetworkStatus())
+      void refreshFirewallStatus(result.message ?? 'Refreshing firewall status...')
       return
     }
 
@@ -263,7 +288,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
     if (result.method === 'wsl2' || result.method === 'windows-elevated') {
       startFirewallPolling()
     }
-  }, [dispatch, onComplete, onNavigate, onFirewallTerminal, startFirewallPolling])
+  }, [onComplete, onNavigate, onFirewallTerminal, refreshFirewallStatus, startFirewallPolling])
 
   const requestFirewallConfig = useCallback(async (body: { confirmElevation?: true } = {}) => {
     const result = await fetchFirewallConfig(body)

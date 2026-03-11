@@ -257,6 +257,39 @@ describe('SetupWizard', () => {
     })
   })
 
+  it('treats blocked WSL2 access as repairable even when Windows Firewall reports inactive', async () => {
+    const firewallBlocked = { platform: 'wsl2', active: false, portOpen: false, commands: [], configuring: false }
+    const store = createTestStore({
+      status: {
+        ...defaultNetworkStatus,
+        configured: true,
+        host: '0.0.0.0',
+        firewall: firewallBlocked,
+        rebinding: false,
+      },
+    })
+
+    mockPost.mockResolvedValueOnce({
+      ...defaultNetworkStatus,
+      configured: true,
+      host: '0.0.0.0',
+      firewall: firewallBlocked,
+      rebinding: false,
+    })
+
+    render(
+      <Provider store={store}>
+        <SetupWizard onComplete={vi.fn()} initialStep={2} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText(/port may be blocked by firewall/i)).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /configure firewall/i })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /continue anyway/i })).toBeInTheDocument()
+    })
+  })
+
   it('shows an admin-approval modal before starting WSL2 repair', async () => {
     mockFetchFirewallConfig
       .mockResolvedValueOnce({
@@ -407,6 +440,53 @@ describe('SetupWizard', () => {
     await waitFor(() => {
       expect(screen.getByText(/port is open/i)).toBeInTheDocument()
       expect(screen.queryByRole('button', { name: /configure firewall/i })).not.toBeInTheDocument()
+    })
+  })
+
+  it('returns to an actionable error state when the no-op firewall refresh fails', async () => {
+    mockFetchFirewallConfig.mockResolvedValue({
+      method: 'none',
+      message: 'No configuration changes required',
+    })
+
+    const firewallActive = { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false }
+    const store = createTestStore({
+      status: {
+        ...defaultNetworkStatus,
+        configured: true,
+        host: '0.0.0.0',
+        firewall: firewallActive,
+        rebinding: false,
+      },
+    })
+
+    mockPost.mockResolvedValueOnce({
+      ...defaultNetworkStatus,
+      configured: true,
+      host: '0.0.0.0',
+      firewall: firewallActive,
+      rebinding: false,
+    })
+
+    const { api } = await import('@/lib/api')
+    vi.mocked(api.get).mockRejectedValue(new Error('status refresh failed'))
+
+    render(
+      <Provider store={store}>
+        <SetupWizard onComplete={vi.fn()} initialStep={2} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /configure firewall/i })).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /configure firewall/i }))
+
+    await waitFor(() => {
+      expect(screen.getByText(/failed to refresh firewall status/i)).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /configure firewall/i })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /continue anyway/i })).toBeInTheDocument()
     })
   })
 

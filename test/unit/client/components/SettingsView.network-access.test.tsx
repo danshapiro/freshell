@@ -48,6 +48,22 @@ describe('SettingsView network access section', () => {
     expect(screen.getByRole('button', { name: /fix firewall/i })).toBeInTheDocument()
   })
 
+  it('keeps WSL2 blocked-state repair visible when the firewall reports inactive', () => {
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            firewall: { platform: 'wsl2', active: false, portOpen: false, commands: [], configuring: false },
+          }),
+        }),
+      },
+    })
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    expect(screen.getByText(/port may be blocked/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /fix firewall/i })).toBeInTheDocument()
+  })
+
   it('shows an admin-approval modal before starting Windows firewall repair', async () => {
     mockFetchFirewallConfig
       .mockResolvedValueOnce({
@@ -165,6 +181,40 @@ describe('SettingsView network access section', () => {
     await waitFor(() => {
       expect(screen.getByText(/port is open/i)).toBeInTheDocument()
       expect(screen.queryByRole('button', { name: /fix firewall/i })).not.toBeInTheDocument()
+    })
+  })
+
+  it('surfaces refresh failures after a no-op firewall response instead of silently keeping stale state', async () => {
+    mockFetchFirewallConfig.mockResolvedValue({
+      method: 'none',
+      message: 'No configuration changes required',
+    })
+
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            firewall: {
+              platform: 'wsl2',
+              active: true,
+              portOpen: false,
+              commands: [],
+              configuring: false,
+            },
+          }),
+        }),
+      },
+    })
+
+    const { api } = await import('@/lib/api')
+    vi.mocked(api.get).mockRejectedValue(new Error('status refresh failed'))
+
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    fireEvent.click(screen.getByRole('button', { name: /fix firewall/i }))
+
+    await waitFor(() => {
+      expect(screen.getByText(/failed to refresh firewall status/i)).toBeInTheDocument()
     })
   })
 

@@ -24,7 +24,7 @@ import type {
   AttentionDismiss,
 } from '@/store/types'
 import type { DeepPartial } from '@/lib/type-utils'
-import { configureNetwork, fetchNetworkStatus } from '@/store/networkSlice'
+import { configureNetwork, fetchNetworkStatus, type NetworkStatusResponse } from '@/store/networkSlice'
 import { addTab } from '@/store/tabsSlice'
 import { initLayout } from '@/store/panesSlice'
 import { fetchFirewallConfig, type ConfigureFirewallResult } from '@/lib/firewall-configure'
@@ -77,9 +77,26 @@ type PreviewToken = {
 }
 
 type FirewallConfirmation = Extract<ConfigureFirewallResult, { method: 'confirmation-required' }>
+type FirewallState = NetworkStatusResponse['firewall']
 
 const terminalPreviewWidth = 40
 const terminalPreviewHeight = 8
+
+function getFirewallDescription(firewall: FirewallState, override: string | null): string {
+  if (override) return override
+  if (firewall.portOpen === true) return 'Port is open'
+  if (firewall.platform === 'wsl2' && firewall.portOpen === false) return 'Port may be blocked'
+  if (!firewall.active) return 'No firewall detected'
+  if (firewall.portOpen === false) return 'Port may be blocked'
+  return 'Firewall detected'
+}
+
+function shouldShowFirewallFix(firewall: FirewallState): boolean {
+  if (firewall.platform === 'wsl2' && firewall.portOpen === false) {
+    return true
+  }
+  return firewall.active && firewall.portOpen !== true
+}
 
 const terminalPreviewLinesRaw: PreviewToken[][] = [
   [{ text: '// terminal preview: syntax demo', kind: 'comment' }],
@@ -202,6 +219,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   const [fontsReady, setFontsReady] = useState(false)
   const [terminalAdvancedOpen, setTerminalAdvancedOpen] = useState(false)
   const [firewallConfirmation, setFirewallConfirmation] = useState<FirewallConfirmation | null>(null)
+  const [firewallRefreshDetail, setFirewallRefreshDetail] = useState<string | null>(null)
   const [defaultCwdInput, setDefaultCwdInput] = useState(settings.defaultCwd ?? '')
   const [defaultCwdError, setDefaultCwdError] = useState<string | null>(null)
   const [excludeFirstChatInput, setExcludeFirstChatInput] = useState(
@@ -258,6 +276,16 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     }
   }, [])
 
+  const refreshFirewallStatusAfterNoop = useCallback(async (message?: string) => {
+    setFirewallRefreshDetail(message ?? 'Refreshing firewall status...')
+    try {
+      await dispatch(fetchNetworkStatus()).unwrap()
+      setFirewallRefreshDetail(null)
+    } catch {
+      setFirewallRefreshDetail('Failed to refresh firewall status')
+    }
+  }, [dispatch])
+
   const handleFirewallFixResult = useCallback((result: ConfigureFirewallResult) => {
     if (result.method === 'confirmation-required') {
       setFirewallConfirmation(result)
@@ -265,9 +293,11 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     }
 
     if (result.method === 'none') {
-      void dispatch(fetchNetworkStatus())
+      void refreshFirewallStatusAfterNoop(result.message)
       return
     }
+
+    setFirewallRefreshDetail(null)
 
     if (result.method === 'terminal') {
       const tabId = nanoid()
@@ -287,9 +317,10 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
         void dispatch(fetchNetworkStatus())
       }, 2000)
     }
-  }, [dispatch, onFirewallTerminal, onNavigate])
+  }, [dispatch, onFirewallTerminal, onNavigate, refreshFirewallStatusAfterNoop])
 
   const requestFirewallFix = useCallback(async (body: { confirmElevation?: true } = {}) => {
+    setFirewallRefreshDetail(null)
     try {
       const result = await fetchFirewallConfig(body)
       handleFirewallFixResult(result)
@@ -1257,16 +1288,11 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 {networkStatus.firewall && (
                   <SettingsRow
                     label="Firewall"
-                    description={
-                      !networkStatus.firewall.active ? 'No firewall detected'
-                        : networkStatus.firewall.portOpen === true ? 'Port is open'
-                        : networkStatus.firewall.portOpen === false ? 'Port may be blocked'
-                        : 'Firewall detected'
-                    }
+                    description={getFirewallDescription(networkStatus.firewall, firewallRefreshDetail)}
                   >
                     <div className="flex items-center gap-2">
                       <span className="text-xs text-muted-foreground">{networkStatus.firewall.platform}</span>
-                      {networkStatus.firewall.active && networkStatus.firewall.portOpen !== true && (
+                      {shouldShowFirewallFix(networkStatus.firewall) && (
                         <button
                           onClick={() => {
                             void requestFirewallFix()
