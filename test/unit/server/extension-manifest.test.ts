@@ -74,6 +74,27 @@ describe('ExtensionManifestSchema', () => {
     }
   })
 
+  it('accepts optional CLI launch templates and permission env mapping', () => {
+    const result = ExtensionManifestSchema.safeParse({
+      ...validCliManifest,
+      cli: {
+        command: 'opencode',
+        resumeArgs: ['--session', '{{sessionId}}'],
+        modelArgs: ['--model', '{{model}}'],
+        sandboxArgs: ['--sandbox', '{{sandbox}}'],
+        permissionModeArgs: ['--permission-mode', '{{permissionMode}}'],
+        permissionModeEnvVar: 'OPENCODE_PERMISSION',
+        permissionModeValues: {
+          plan: '{"edit":"ask","bash":"ask"}',
+        },
+        supportsPermissionMode: true,
+        supportsModel: true,
+        supportsSandbox: true,
+      },
+    })
+    expect(result.success).toBe(true)
+  })
+
   it('rejects missing required fields', () => {
     const result = ExtensionManifestSchema.safeParse({ name: 'x' })
     expect(result.success).toBe(false)

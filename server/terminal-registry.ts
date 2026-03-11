@@ -21,6 +21,7 @@ import type {
   TerminalSessionBoundEvent,
   TerminalSessionUnboundEvent,
 } from './terminal-stream/registry-events.js'
+import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-launch.js'
 
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
 const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 64 * 1024)
@@ -43,8 +44,14 @@ export type CodingCliCommandSpec = {
   label: string
   envVar: string
   defaultCommand: string
+  args?: string[]
+  env?: Record<string, string>
   resumeArgs?: (sessionId: string) => string[]
-  supportsPermissionMode?: boolean
+  modelArgs?: (model: string) => string[]
+  sandboxArgs?: (sandbox: string) => string[]
+  permissionModeArgs?: (permissionMode: string) => string[]
+  permissionModeEnvVar?: string
+  permissionModeEnvValues?: Record<string, string>
 }
 
 const FALLBACK_CODING_CLI_COMMAND_SPECS: Array<[string, CodingCliCommandSpec]> = [
@@ -53,18 +60,28 @@ const FALLBACK_CODING_CLI_COMMAND_SPECS: Array<[string, CodingCliCommandSpec]> =
     envVar: 'CLAUDE_CMD',
     defaultCommand: 'claude',
     resumeArgs: (sessionId: string) => ['--resume', sessionId],
-    supportsPermissionMode: true,
+    permissionModeArgs: (permissionMode: string) => ['--permission-mode', permissionMode],
   }],
   ['codex', {
     label: 'Codex CLI',
     envVar: 'CODEX_CMD',
     defaultCommand: 'codex',
     resumeArgs: (sessionId: string) => ['resume', sessionId],
+    modelArgs: (model: string) => ['--model', model],
+    sandboxArgs: (sandbox: string) => ['--sandbox', sandbox],
   }],
   ['opencode', {
     label: 'OpenCode',
     envVar: 'OPENCODE_CMD',
     defaultCommand: 'opencode',
+    resumeArgs: (sessionId: string) => ['--session', sessionId],
+    modelArgs: (model: string) => ['--model', model],
+    permissionModeEnvVar: 'OPENCODE_PERMISSION',
+    permissionModeEnvValues: {
+      plan: '{"edit":"ask","bash":"ask"}',
+      acceptEdits: '{"edit":"allow","bash":"ask"}',
+      bypassPermissions: '{"edit":"allow","bash":"allow"}',
+    },
   }],
   ['gemini', {
     label: 'Gemini',
@@ -218,6 +235,8 @@ function providerNotificationArgs(mode: TerminalMode, target: ProviderTarget): s
 
 type ProviderSettings = {
   permissionMode?: string
+  model?: string
+  sandbox?: string
 }
 
 function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, target: ProviderTarget = 'unix', providerSettings?: ProviderSettings) {
@@ -226,6 +245,11 @@ function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, t
   if (!spec) return null
   const command = (spec.envVar && process.env[spec.envVar]) || spec.defaultCommand
   const providerArgs = providerNotificationArgs(mode, target)
+  const baseArgs = spec.args || []
+  const commandEnv: Record<string, string> = { ...(spec.env || {}) }
+  if (mode === 'opencode') {
+    Object.assign(commandEnv, getOpencodeEnvOverrides({ ...process.env, ...commandEnv }))
+  }
   let resumeArgs: string[] = []
   if (resumeSessionId) {
     if (spec.resumeArgs) {
@@ -235,10 +259,39 @@ function resolveCodingCliCommand(mode: TerminalMode, resumeSessionId?: string, t
     }
   }
   const settingsArgs: string[] = []
-  if (spec.supportsPermissionMode && providerSettings?.permissionMode && providerSettings.permissionMode !== 'default') {
-    settingsArgs.push('--permission-mode', providerSettings.permissionMode)
+  const effectiveModel = mode === 'opencode'
+    ? resolveOpencodeLaunchModel(providerSettings?.model, { ...process.env, ...commandEnv })
+    : providerSettings?.model
+  if (effectiveModel && spec.modelArgs) {
+    settingsArgs.push(...spec.modelArgs(effectiveModel))
   }
-  return { command, args: [...providerArgs, ...settingsArgs, ...resumeArgs], label: spec.label }
+  if (providerSettings?.sandbox && spec.sandboxArgs) {
+    settingsArgs.push(...spec.sandboxArgs(providerSettings.sandbox))
+  }
+  if (providerSettings?.permissionMode && providerSettings.permissionMode !== 'default') {
+    if (spec.permissionModeArgs) {
+      settingsArgs.push(...spec.permissionModeArgs(providerSettings.permissionMode))
+    }
+    if (spec.permissionModeEnvVar) {
+      const permissionValue =
+        spec.permissionModeEnvValues?.[providerSettings.permissionMode] ??
+        providerSettings.permissionMode
+      if (permissionValue) {
+        commandEnv[spec.permissionModeEnvVar] = permissionValue
+      } else {
+        logger.warn(
+          { mode, permissionMode: providerSettings.permissionMode },
+          'Permission mode requested but no env mapping configured',
+        )
+      }
+    }
+  }
+  return {
+    command,
+    args: [...providerArgs, ...baseArgs, ...settingsArgs, ...resumeArgs],
+    env: commandEnv,
+    label: spec.label,
+  }
 }
 
 function normalizeResumeSessionId(mode: TerminalMode, resumeSessionId?: string): string | undefined {
@@ -726,7 +779,7 @@ export function buildSpawnSpec(
       }
 
       args.push('--exec', cli.command, ...cli.args)
-      return { file: wsl, args, cwd: undefined, env }
+      return { file: wsl, args, cwd: undefined, env: { ...env, ...cli.env } }
     }
 
     // Option B: Native Windows shells (PowerShell/cmd)
@@ -760,7 +813,7 @@ export function buildSpawnSpec(
       const cmd = cli?.command || mode
       const command = buildCmdCommand(cmd, cli?.args || [])
       const cd = winCwd ? `cd /d ${quoteCmdArg(winCwd)} && ` : ''
-      return { file, args: ['/K', `${cd}${command}`], cwd: procCwd, env }
+      return { file, args: ['/K', `${cd}${command}`], cwd: procCwd, env: cli ? { ...env, ...cli.env } : env }
     }
 
     // default to PowerShell
@@ -792,7 +845,12 @@ export function buildSpawnSpec(
     const invocation = buildPowerShellCommand(cmd, cli?.args || [])
     const cd = winCwd ? `Set-Location -LiteralPath ${quotePowerShellLiteral(winCwd)}; ` : ''
     const command = `${cd}${invocation}`
-    return { file, args: ['-NoLogo', '-NoExit', '-Command', command], cwd: procCwd, env }
+    return {
+      file,
+      args: ['-NoLogo', '-NoExit', '-Command', command],
+      cwd: procCwd,
+      env: cli ? { ...env, ...cli.env } : env,
+    }
   }
 // Non-Windows: native spawn using system shell
   const systemShell = getSystemShell()
@@ -805,7 +863,7 @@ export function buildSpawnSpec(
   const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings)
   const cmd = cli?.command || mode
   const args = cli?.args || []
-  return { file: cmd, args, cwd: unixCwd, env }
+  return { file: cmd, args, cwd: unixCwd, env: cli ? { ...env, ...cli.env } : env }
 }
 
 export class TerminalRegistry extends EventEmitter {

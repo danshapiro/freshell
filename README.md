@@ -22,7 +22,7 @@
 
 - **Tabs and panes** — Organize projects with multiple coding agents, shells, browsers, editors, and more on a tab - and as many tabs as you want. 
 - **Desktop, laptop, phone** — Run on your main machine, then work on your project anywhere via VPN or Tailscale.
-- **Speak with the dead** — Resume any Claude or Codex session from any device (even if you weren't using freshell to run it)
+- **Speak with the dead** — Resume any Claude, Codex, or OpenCode session from any device (even if you weren't using freshell to run it)
 - **Fancy tabs** — Auto-name from terminal content, drag-and-drop reorder, and per-pane type icons so you know what's in each tab
 - **Freshclaude** — An interactive alternative to Claude CLI that works with your Anthropic subscription.
 - **Self-configuring workspace** — Just ask Claude or Codex to open a browser in a pane, or create a tab with four subagents. Built-in tmux-like API and skill makes it simple.
@@ -108,11 +108,12 @@ Freshell indexes local session history and can launch terminals for these coding
 |----------|:-:|:-:|----------------|
 | **Claude Code** | Yes | Yes | `~/.claude` |
 | **Codex** | Yes | Yes | `~/.codex` |
-| **OpenCode** | — | Yes | — |
+| **OpenCode** | Yes | Yes | `XDG_DATA_HOME/opencode` (or platform default) |
 | **Gemini** | — | Yes | — |
 | **Kimi** | — | Yes | — |
 
 Enable/disable providers and set defaults in the Settings UI or via `~/.freshell/config.json`.
+OpenCode sessions are discovered directly from OpenCode's local session database, so existing OpenCode work can be resumed from freshell without importing anything manually.
 
 ## Tech Stack
 

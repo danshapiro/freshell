@@ -38,6 +38,19 @@ it('parses dash-prefixed pane ids for attach short pane flag', () => {
   expect(parsed.flags.p).toBe('-FFH7C5JAoRTjK8Qu8RXR')
 })
 
+it('parses dash-prefixed positional rename targets', () => {
+  const parsed = parseArgs(['rename-pane', '-FFH7C5JAoRTjK8Qu8RXR', 'Editor'])
+  expect(parsed.command).toBe('rename-pane')
+  expect(parsed.args).toEqual(['-FFH7C5JAoRTjK8Qu8RXR', 'Editor'])
+})
+
+it('parses dash-prefixed rename flag values', () => {
+  const parsed = parseArgs(['rename-pane', '-t', '-FFH7C5JAoRTjK8Qu8RXR', '-n', '-Editor'])
+  expect(parsed.command).toBe('rename-pane')
+  expect(parsed.flags.t).toBe('-FFH7C5JAoRTjK8Qu8RXR')
+  expect(parsed.flags.n).toBe('-Editor')
+})
+
 it('does not treat dash-prefixed values as -p arguments outside attach', () => {
   const parsed = parseArgs(['display', '-p', '-ABC123'])
   expect(parsed.command).toBe('display')

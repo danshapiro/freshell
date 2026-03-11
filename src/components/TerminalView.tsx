@@ -53,6 +53,7 @@ import { resolveTerminalFontFamily } from '@/lib/terminal-fonts'
 import { ConnectionErrorOverlay } from '@/components/terminal/ConnectionErrorOverlay'
 import { Osc52PromptModal } from '@/components/terminal/Osc52PromptModal'
 import { TerminalSearchBar } from '@/components/terminal/TerminalSearchBar'
+import { registerTerminalRequestModeBypass } from '@/components/terminal/request-mode-bypass'
 import {
   createTerminalRuntime,
   type TerminalRuntime,
@@ -923,7 +924,11 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       },
     })
     const rendererMode = settings.terminal.renderer ?? 'auto'
-    const enableWebgl = rendererMode === 'auto' || rendererMode === 'webgl'
+    // OpenCode paints a dense truecolor light surface that currently renders
+    // unreliably through xterm WebGL on Chrome/Windows. Keep auto mode on the
+    // safer canvas path for that provider unless the user explicitly forces WebGL.
+    const enableWebgl = rendererMode === 'webgl'
+      || (rendererMode === 'auto' && paneContent.mode !== 'opencode')
     let runtime = createNoopRuntime()
     try {
       runtime = createTerminalRuntime({ terminal: term, enableWebgl })
@@ -949,6 +954,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     layoutSchedulerRef.current = layoutScheduler
 
     term.open(containerRef.current)
+    const requestModeBypass = registerTerminalRequestModeBypass(term, sendInput)
 
     // Register custom link provider for clickable local file paths
     const filePathLinkDisposable = typeof term.registerLinkProvider === 'function'
@@ -1101,6 +1107,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
     ro.observe(containerRef.current)
 
     return () => {
+      requestModeBypass.dispose()
       filePathLinkDisposable?.dispose()
       ro.disconnect()
       unregisterActions()

@@ -197,6 +197,7 @@ export default function App() {
   const userOpenedSidebarOnMobileRef = useRef(false)
   const codexActivityListRequestSeqRef = useRef(new Map<string, number>())
   const codexActivityOrderRef = useRef(0)
+  const copiedResetTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const fullscreenTouchStartYRef = useRef<number | null>(null)
   const isLandscapeTerminalView = isMobile && isLandscape && view === 'terminal'
   const shareAccessUrl = networkStatus?.accessUrl
@@ -240,6 +241,14 @@ export default function App() {
   useEffect(() => {
     return installCrossTabSync(appStore)
   }, [appStore])
+
+  useEffect(() => {
+    return () => {
+      if (copiedResetTimeoutRef.current !== null) {
+        clearTimeout(copiedResetTimeoutRef.current)
+      }
+    }
+  }, [])
 
   useEffect(() => {
     isMobileRef.current = isMobile
@@ -397,7 +406,13 @@ export default function App() {
     try {
       await navigator.clipboard.writeText(shareAccessUrl)
       setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
+      if (copiedResetTimeoutRef.current !== null) {
+        clearTimeout(copiedResetTimeoutRef.current)
+      }
+      copiedResetTimeoutRef.current = setTimeout(() => {
+        copiedResetTimeoutRef.current = null
+        setCopied(false)
+      }, 2000)
     } catch (err) {
       log.warn('Clipboard write failed:', err)
     }

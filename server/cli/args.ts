@@ -26,7 +26,16 @@ const FLAGS_ALLOWING_DASH_PREFIX_VALUES = new Set([
 const COMMAND_FLAG_KEYS_ALLOWING_DASH_PREFIX_VALUES: Partial<Record<string, Set<string>>> = {
   // attach uses -p for pane target; allow dash-prefixed pane ids like "-abc123".
   attach: new Set(['p']),
+  // rename commands accept generated tab/pane ids positionally or via flags, and
+  // those ids come from nanoid(), which can start with "-".
+  'rename-pane': new Set(['n', 'name', 'pane', 't', 'target', 'title']),
+  'rename-tab': new Set(['n', 'name', 't', 'tab', 'target', 'title']),
 }
+
+const COMMANDS_TREATING_UNKNOWN_DASH_TOKENS_AS_POSITIONALS = new Set([
+  'rename-pane',
+  'rename-tab',
+])
 
 function isNegativeNumericToken(token: string): boolean {
   return /^-\d+(?:\.\d+)?(?:[eE][-+]?\d+)?$/.test(token)
@@ -42,6 +51,18 @@ function canUseAsFlagValue(token: string | undefined, key: string, command: stri
   if (!token) return false
   if (token === '--') return false
   return !token.startsWith('-') || isNegativeNumericToken(token) || allowsDashPrefixedValue(command, key)
+}
+
+function shouldTreatDashTokenAsPositional(
+  command: string | undefined,
+  token: string,
+  args: string[],
+): boolean {
+  if (!command || !COMMANDS_TREATING_UNKNOWN_DASH_TOKENS_AS_POSITIONALS.has(command)) return false
+  if (args.length > 0) return true
+  const allowedKeys = COMMAND_FLAG_KEYS_ALLOWING_DASH_PREFIX_VALUES[command]
+  const key = token.startsWith('--') ? token.slice(2).split('=')[0] : token.slice(1)
+  return !allowedKeys?.has(key)
 }
 
 export function parseArgs(argv: string[]): ParsedArgs {
@@ -61,6 +82,12 @@ export function parseArgs(argv: string[]): ParsedArgs {
     if (token === '--') {
       args.push(...argv.slice(i + 1))
       break
+    }
+
+    if (token.startsWith('-') && shouldTreatDashTokenAsPositional(command, token, args)) {
+      args.push(token)
+      i += 1
+      continue
     }
 
     if (token.startsWith('--')) {

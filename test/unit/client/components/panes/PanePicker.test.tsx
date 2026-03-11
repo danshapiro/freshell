@@ -26,6 +26,10 @@ const mockCodexExt: ClientExtensionEntry = {
   picker: { shortcut: 'X' },
   cli: { supportsModel: true, supportsSandbox: true, supportsResume: true, resumeCommandTemplate: ['codex', 'resume', '{{sessionId}}'] },
 }
+const mockOpencodeExt: ClientExtensionEntry = {
+  name: 'opencode', version: '1.0.0', label: 'OpenCode', description: '', category: 'cli',
+  cli: { supportsModel: true, supportsPermissionMode: true, supportsResume: true, resumeCommandTemplate: ['opencode', '--session', '{{sessionId}}'] },
+}
 const defaultCliExtensions: ClientExtensionEntry[] = [mockClaudeExt, mockCodexExt]
 
 // Mock lucide-react icons
@@ -163,6 +167,16 @@ describe('PanePicker', () => {
       })
       expect(screen.getByRole('button', { name: 'Claude CLI' })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Codex CLI' })).toBeInTheDocument()
+    })
+
+    it('shows OpenCode when available and enabled', () => {
+      renderPicker({
+        availableClis: { opencode: true },
+        enabledProviders: ['opencode'],
+        extensions: [mockOpencodeExt],
+      })
+
+      expect(screen.getByRole('button', { name: 'OpenCode' })).toBeInTheDocument()
     })
 
     it('hides Claude CLI when not available on system', () => {

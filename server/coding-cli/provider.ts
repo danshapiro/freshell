@@ -1,4 +1,4 @@
-import type { CodingCliProviderName, NormalizedEvent, ParsedSessionMeta } from './types.js'
+import type { CodingCliProviderName, CodingCliSession, NormalizedEvent, ParsedSessionMeta } from './types.js'
 
 export interface SpawnOptions {
   prompt: string
@@ -17,6 +17,7 @@ export interface CodingCliProvider {
   readonly displayName: string
   readonly homeDir: string
 
+  listSessionsDirect?(): Promise<CodingCliSession[]>
   getSessionGlob(): string
   getSessionRoots(): string[]
   listSessionFiles(): Promise<string[]>

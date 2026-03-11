@@ -881,6 +881,74 @@ describe('buildSpawnSpec Unix paths', () => {
       expect(spec.args).toContain('--resume')
       expect(spec.args).toContain(VALID_CLAUDE_SESSION_ID)
     })
+
+    it('includes --model flag for codex when provided', () => {
+      delete process.env.CODEX_CMD
+
+      const spec = buildSpawnSpec('codex', '/Users/john/project', 'system', undefined, {
+        model: 'gpt-5-codex',
+      })
+
+      expect(spec.args).toContain('--model')
+      expect(spec.args).toContain('gpt-5-codex')
+    })
+
+    it('includes --sandbox flag for codex when provided', () => {
+      delete process.env.CODEX_CMD
+
+      const spec = buildSpawnSpec('codex', '/Users/john/project', 'system', undefined, {
+        sandbox: 'workspace-write',
+      })
+
+      expect(spec.args).toContain('--sandbox')
+      expect(spec.args).toContain('workspace-write')
+    })
+
+    it('includes --model flag for opencode when provided', () => {
+      delete process.env.OPENCODE_CMD
+
+      const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system', undefined, {
+        model: 'openai/gpt-5-mini',
+      })
+
+      expect(spec.args).toContain('--model')
+      expect(spec.args).toContain('openai/gpt-5-mini')
+    })
+
+    it('defaults OpenCode to a usable Google model and alias env when only GEMINI_API_KEY is set', () => {
+      delete process.env.OPENCODE_CMD
+      delete process.env.GOOGLE_GENERATIVE_AI_API_KEY
+      delete process.env.GOOGLE_API_KEY
+      delete process.env.OPENAI_API_KEY
+      delete process.env.ANTHROPIC_API_KEY
+      process.env.GEMINI_API_KEY = 'gemini-key'
+
+      const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system')
+
+      expect(spec.args).toContain('--model')
+      expect(spec.args).toContain('google/gemini-3-pro-preview')
+      expect(spec.env.GOOGLE_GENERATIVE_AI_API_KEY).toBe('gemini-key')
+    })
+
+    it('maps OpenCode plan permission mode to OPENCODE_PERMISSION env', () => {
+      delete process.env.OPENCODE_CMD
+
+      const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system', undefined, {
+        permissionMode: 'plan',
+      })
+
+      expect(spec.env.OPENCODE_PERMISSION).toBe('{"edit":"ask","bash":"ask"}')
+    })
+
+    it('maps OpenCode acceptEdits permission mode to OPENCODE_PERMISSION env', () => {
+      delete process.env.OPENCODE_CMD
+
+      const spec = buildSpawnSpec('opencode', '/Users/john/project', 'system', undefined, {
+        permissionMode: 'acceptEdits',
+      })
+
+      expect(spec.env.OPENCODE_PERMISSION).toBe('{"edit":"allow","bash":"ask"}')
+    })
   })
 
   describe('environment variables in spawn spec', () => {
@@ -2097,8 +2165,8 @@ describe('TerminalRegistry', () => {
       expect(modeSupportsResume('shell')).toBe(false)
     })
 
-    it('returns false for opencode (no resumeArgs)', () => {
-      expect(modeSupportsResume('opencode')).toBe(false)
+    it('returns true for opencode', () => {
+      expect(modeSupportsResume('opencode')).toBe(true)
     })
 
     it('returns false for gemini (no resumeArgs)', () => {
