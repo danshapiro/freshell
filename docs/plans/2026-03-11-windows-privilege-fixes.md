@@ -4,7 +4,7 @@
 
 **Goal:** Remove unsolicited Windows elevation during startup/tests, require an explicit in-product confirmation before any manual Windows/WSL firewall repair can elevate, and ensure Windows daemon tasks run at least privilege.
 
-**Architecture:** Delete the boot-time WSL auto-repair path entirely so privilege elevation can only happen from the existing manual repair buttons; startup should detect stale network state through the normal `NetworkManager` status flow, not by launching UAC. Convert Windows/WSL repair into an explicit two-call acknowledgement contract: the first server response says administrator approval is required, and only a follow-up request with `confirmElevation: true` may spawn a shared elevated PowerShell helper. Keep least privilege enforced in both the task XML and the Windows daemon manager so new and existing scheduled tasks stop asking for `HighestAvailable`.
+**Architecture:** Delete the boot-time WSL auto-repair path entirely so privilege elevation can only happen from the existing manual repair buttons; startup should detect stale network state through the normal `NetworkManager` status flow, not by launching UAC. Keep the useful non-elevating WSL drift-detection logic by extracting it into a pure `computeWslPortForwardingPlan(ports)` helper that the manual repair API can call before and after confirmation, so the server only prompts for admin approval when a real repair is still needed. Convert Windows/WSL repair into an explicit two-call acknowledgement contract: the first server response says administrator approval is required, and only a follow-up request with `confirmElevation: true` may spawn a shared elevated PowerShell helper. Keep least privilege enforced in both the task XML and the Windows daemon manager so new and existing scheduled tasks stop asking for `HighestAvailable`.
 
 **Tech Stack:** TypeScript, Express, Zod, React, Redux Toolkit, Vitest, Testing Library, supertest, Electron scheduled tasks
 
@@ -25,10 +25,11 @@
 ## Acceptance Mapping
 
 - Starting `server/index.ts` on WSL never attempts Windows portproxy/firewall repair and never depends on `FRESHELL_DISABLE_WSL_PORT_FORWARD`.
-- `server/wsl-port-forward.ts` exports only the pure/manual helpers still used by the manual repair route.
+- `server/wsl-port-forward.ts` exports only helpers that are still live in the manual repair path, including a pure `computeWslPortForwardingPlan(ports)` helper; dead startup-only helpers are gone.
 - `POST /api/network/configure-firewall` returns `confirmation-required` for both `wsl2` and `windows` until the caller sends `{ confirmElevation: true }`.
 - `POST /api/network/configure-firewall` rejects malformed acknowledgement bodies (for example `{ confirmElevation: false }`) with `400`.
 - The first `confirmation-required` response does not mark firewall repair as in progress; `firewall.configuring` stays reserved for the actual elevated child process.
+- WSL2 returns `none` instead of `confirmation-required` when the pure repair-plan helper determines that portproxy/firewall state is already correct by the time the button is clicked.
 - The confirmation payload copy is explicit: `To complete this, you will need to accept the Windows administrator prompt on the next screen.` A cancel path performs no elevated action.
 - `SetupWizard` and `SettingsView` both use the existing accessible modal infrastructure instead of `window.confirm()`, and the modal shows `Continue` plus `Cancel` with the primary action styled through the shared `Button` variant system rather than destructive red styling.
 - Linux/macOS repair continues to return terminal commands exactly as before.
@@ -36,14 +37,14 @@
 
 ## Scope Notes
 
-- Keep the pure/manual WSL helpers in `server/wsl-port-forward.ts`: `getWslIp`, `getRequiredPorts`, `buildPortForwardingScript`, `buildFirewallOnlyScript`, and the rule parsers.
-- Delete the synchronous `setupWslPortForwarding()` wrapper and the startup helper module entirely. They exist only to support the rejected boot-time elevation flow.
+- Keep the pure/manual WSL helpers in `server/wsl-port-forward.ts` that still matter after the startup path dies: the rule parsers, script builders, and a new `computeWslPortForwardingPlan(ports)` helper that encapsulates non-elevating drift detection.
+- Delete the synchronous `setupWslPortForwarding()` wrapper, the dead `getRequiredPorts()` helper, and the startup helper module entirely. The manual route already has `NetworkManager.getRelevantPorts()`, so the WSL module should no longer parse ports from process env.
 - Keep `NetworkManager` as the source of truth for `firewall.active`, `firewall.portOpen`, and `firewall.configuring`. Do not add parallel repair state.
 - Keep confirmation copy sourced from the server response so both UI entry points stay consistent.
 - Keep the confirmation contract intentionally simple: a strict `{ confirmElevation?: true }` body is enough for the approved UX; do not add persistence, remembered consent, or a separate setup wizard just for UAC.
 - Execution note: use `@trycycle-executing` and keep the task-level commits below intact unless a later task forces a smaller follow-up fix.
 
-### Task 1: Remove the Boot-Time WSL Auto-Repair Entry Point
+### Task 1: Remove the Boot-Time WSL Auto-Repair Entry Point While Preserving Manual WSL Repair Planning
 
 **Files:**
 - Delete: `server/wsl-port-forward-startup.ts`
@@ -61,10 +62,11 @@ In `test/integration/server/wsl-port-forward.test.ts`, replace the startup-era a
 it('exports only the manual WSL helper surface', async () => {
   const wslModule = await import('../../../server/wsl-port-forward.js')
 
+  expect(typeof wslModule.computeWslPortForwardingPlan).toBe('function')
   expect(typeof wslModule.getWslIp).toBe('function')
-  expect(typeof wslModule.getRequiredPorts).toBe('function')
   expect(typeof wslModule.buildPortForwardingScript).toBe('function')
   expect(typeof wslModule.buildFirewallOnlyScript).toBe('function')
+  expect('getRequiredPorts' in wslModule).toBe(false)
   expect('setupWslPortForwarding' in wslModule).toBe(false)
 })
 
@@ -78,7 +80,56 @@ it('server/index.ts does not import or call the startup-only WSL helper path', (
 })
 ```
 
-In `test/unit/server/wsl-port-forward.test.ts`, remove `setupWslPortForwarding` from the import list and delete the obsolete `describe('setupWslPortForwarding', ...)` block. The red condition for this task comes from the new integration assertions above; the unit file should simply stop pinning the deleted API.
+In `test/unit/server/wsl-port-forward.test.ts`, replace the dead `getRequiredPorts` and `setupWslPortForwarding` coverage with a `describe('computeWslPortForwardingPlan', ...)` block that preserves the important scenarios without any elevation side effects:
+
+```ts
+it('returns noop when port forwarding and firewall are already correct', () => {
+  vi.mocked(isWSL2).mockReturnValue(true)
+  vi.mocked(execSync)
+    .mockReturnValueOnce('inet 172.30.149.249/20 scope global eth0\n')
+    .mockReturnValueOnce(`
+Listen on ipv4:             Connect to ipv4:
+
+Address         Port        Address         Port
+--------------- ----------  --------------- ----------
+0.0.0.0         3001        172.30.149.249  3001
+`)
+    .mockReturnValueOnce(`Rule Name: FreshellLANAccess\nLocalPort: 3001\n`)
+
+  expect(computeWslPortForwardingPlan([3001])).toEqual({
+    status: 'noop',
+    wslIp: '172.30.149.249',
+  })
+})
+
+it('returns a firewall-only repair plan when only the firewall drifted', () => {
+  vi.mocked(isWSL2).mockReturnValue(true)
+  vi.mocked(execSync)
+    .mockReturnValueOnce('inet 172.30.149.249/20 scope global eth0\n')
+    .mockReturnValueOnce(`
+Listen on ipv4:             Connect to ipv4:
+
+Address         Port        Address         Port
+--------------- ----------  --------------- ----------
+0.0.0.0         3001        172.30.149.249  3001
+`)
+    .mockReturnValueOnce(`Rule Name: FreshellLANAccess\nLocalPort: 3011\n`)
+
+  expect(computeWslPortForwardingPlan([3001])).toEqual({
+    status: 'ready',
+    wslIp: '172.30.149.249',
+    scriptKind: 'firewall-only',
+    script: expect.stringContaining('FreshellLANAccess'),
+  })
+})
+```
+
+Also keep explicit cases for:
+- `status: 'not-wsl2'` when `isWSL2()` is false
+- `status: 'error'` when WSL IP detection fails
+- `status: 'ready'` with `scriptKind: 'full'` when portproxy rules are missing or point at the wrong IP/port
+
+The red condition for this task should come from both the integration assertions and the new pure-plan expectations.
 
 **Step 2: Run the targeted server tests and confirm failure**
 
@@ -91,7 +142,7 @@ npx vitest run --config vitest.server.config.ts \
 ```
 
 Expected:
-- FAIL because `server/index.ts` still imports/calls the startup helper and `server/wsl-port-forward.ts` still exports `setupWslPortForwarding()`.
+- FAIL because `server/index.ts` still imports/calls the startup helper, and `server/wsl-port-forward.ts` still exports dead startup-only helpers instead of the pure manual planning helper.
 
 **Step 3: Write the minimal implementation**
 
@@ -99,8 +150,25 @@ Implement these changes:
 
 - In `server/index.ts`, delete the `shouldSetupWslPortForwardingAtStartup(...)` block and all imports from `./wsl-port-forward-startup.js` and `./wsl-port-forward.js` that existed only for startup repair.
 - Replace the adjacent comment with one sentence explaining that Windows/WSL repair is exposed only through the manual network-repair API/UI.
-- In `server/wsl-port-forward.ts`, delete `SetupResult`, `setupWslPortForwarding()`, and any imports/constants that become unused (`execSync` stays if still needed by pure helpers; `isWSL2` and `POWERSHELL_PATH` do not).
-- In `test/unit/server/wsl-port-forward.test.ts`, keep the remaining parser/script tests intact; only remove the dead startup wrapper coverage and the deleted symbol import.
+- In `server/wsl-port-forward.ts`, delete `DEFAULT_PORT`, `getRequiredPorts()`, `SetupResult`, `setupWslPortForwarding()`, and any imports/constants that become unused (`POWERSHELL_PATH` must disappear; `execSync` and `isWSL2` stay because the new pure helper uses them).
+- In `server/wsl-port-forward.ts`, add:
+
+```ts
+export type WslPortForwardingPlan =
+  | { status: 'not-wsl2' }
+  | { status: 'error'; message: string }
+  | { status: 'noop'; wslIp: string }
+  | {
+      status: 'ready'
+      wslIp: string
+      scriptKind: 'full' | 'firewall-only'
+      script: string
+    }
+```
+
+- In `server/wsl-port-forward.ts`, implement `computeWslPortForwardingPlan(requiredPorts: number[]): WslPortForwardingPlan` by moving the non-elevating decision logic out of `setupWslPortForwarding()`: detect WSL2, resolve the WSL IP, inspect existing portproxy/firewall rules, choose between `buildPortForwardingScript(...)` and `buildFirewallOnlyScript(...)`, and return `noop` when nothing needs changing.
+- Normalize the returned `script` for the async PowerShell helper inside `computeWslPortForwardingPlan(...)` by converting `\$null` back to `$null` there. Do not duplicate that quoting/unescaping rule inside `network-router.ts`.
+- In `test/unit/server/wsl-port-forward.test.ts`, keep the parser/script tests intact, delete the dead startup wrapper/env-port coverage, and replace it with assertions for the new pure plan helper.
 - Delete `server/wsl-port-forward-startup.ts` and `test/unit/server/wsl-port-forward-startup.test.ts`.
 
 **Step 4: Re-run the targeted server tests**
@@ -309,8 +377,20 @@ git commit -m "refactor(server): share elevated powershell helper"
 
 In `test/integration/server/network-api.test.ts`:
 
-- Remove `setupWslPortForwarding` from the `vi.mock('../../../server/wsl-port-forward.js', ...)` factory, because that export is gone.
-- Add these five confirmation-contract tests:
+- Replace the WSL mock factory with one centered on the new pure helper:
+
+```ts
+vi.mock('../../../server/wsl-port-forward.js', () => ({
+  computeWslPortForwardingPlan: vi.fn().mockReturnValue({
+    status: 'ready',
+    wslIp: '172.24.0.2',
+    scriptKind: 'full',
+    script: '$null # mock script',
+  }),
+}))
+```
+
+- Add these six confirmation-contract tests:
 
 ```ts
 it('returns confirmation-required for WSL2 until the caller confirms elevation', async () => {
@@ -330,6 +410,27 @@ it('returns confirmation-required for WSL2 until the caller confirms elevation',
     body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
     confirmLabel: 'Continue',
   })
+  expect(cp.execFile).not.toHaveBeenCalled()
+})
+
+it('returns none for WSL2 when no repair is actually needed anymore', async () => {
+  vi.mocked(detectFirewall).mockResolvedValue({ platform: 'wsl2', active: true })
+  networkManager.resetFirewallCache()
+
+  const wslModule = await import('../../../server/wsl-port-forward.js')
+  vi.mocked(wslModule.computeWslPortForwardingPlan).mockReturnValue({
+    status: 'noop',
+    wslIp: '172.24.0.2',
+  })
+
+  const cp = await import('node:child_process')
+  const res = await request(app)
+    .post('/api/network/configure-firewall')
+    .set('x-auth-token', token)
+    .send({})
+
+  expect(res.status).toBe(200)
+  expect(res.body).toEqual({ method: 'none', message: 'No configuration changes required' })
   expect(cp.execFile).not.toHaveBeenCalled()
 })
 
@@ -405,6 +506,7 @@ npx vitest run --config vitest.server.config.ts test/integration/server/network-
 
 Expected:
 - FAIL because the route still elevates immediately and there is no `confirmation-required` response.
+- FAIL because the route still elevates immediately, there is no `confirmation-required` response, and there is no WSL no-op branch backed by the new pure planning helper.
 
 **Step 3: Write the minimal implementation**
 
@@ -430,7 +532,12 @@ const WINDOWS_ELEVATION_CONFIRMATION = {
 } as const
 ```
 
-- When `status.firewall.platform` is `'wsl2'` or `'windows'` and `confirmElevation !== true`, return that payload without calling `execFile`.
+- When `status.firewall.platform === 'windows'` and `confirmElevation !== true`, return that payload without calling `execFile`.
+- For the WSL2 branch, call `computeWslPortForwardingPlan(networkManager.getRelevantPorts())` before deciding whether a prompt is needed:
+  - `status: 'error'` -> return `500`
+  - `status: 'noop'` -> return `{ method: 'none', message: 'No configuration changes required' }`
+  - `status: 'ready'` -> use that returned script for the later elevated run
+- Recompute the WSL plan after `confirmElevation === true` instead of trusting the earlier click. If the plan has become `noop` between prompt and confirmation, return `none` and do not set `firewall.configuring`.
 - Do not call `networkManager.setFirewallConfiguring(true)` until after `confirmElevation === true` and the elevated process is actually about to spawn.
 - When confirmation is present, use `spawnElevatedPowerShell(...)` from `server/elevated-powershell.ts` in both the WSL and native Windows branches.
 - Keep the existing `firewall.configuring` guard, cache reset, and async completion behavior.
@@ -1093,10 +1200,11 @@ git commit -m "fix(windows): tighten privilege boundaries for repair flows"
 **Step 5: Final sanity check before handoff**
 
 - `git status --short` is clean.
-- `server/wsl-port-forward.ts` no longer exports `setupWslPortForwarding`.
+- `server/wsl-port-forward.ts` no longer exports `setupWslPortForwarding` or `getRequiredPorts`, and does export `computeWslPortForwardingPlan`.
 - `server/wsl-port-forward-startup.ts` is gone.
-- `POST /api/network/configure-firewall` has exactly three manual behaviors:
+- `POST /api/network/configure-firewall` has exactly four manual behaviors:
   - `terminal` for Linux/macOS
+  - `none` when no repair is needed
   - `confirmation-required` until explicit confirmation on Windows/WSL
   - `wsl2` / `windows-elevated` after explicit confirmation
 - `installers/windows/freshell-task.xml.template` contains `LeastPrivilege`.
