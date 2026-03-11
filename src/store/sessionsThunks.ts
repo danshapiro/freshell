@@ -51,6 +51,10 @@ function searchResultsToProjects(results: Awaited<ReturnType<typeof searchSessio
       cwd: result.cwd,
       title: result.title,
       summary: result.summary,
+      sessionType: result.sessionType,
+      firstUserMessage: result.firstUserMessage,
+      isSubagent: result.isSubagent,
+      isNonInteractive: result.isNonInteractive,
     })
 
     grouped.set(result.projectPath, existing)

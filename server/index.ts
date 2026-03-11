@@ -30,7 +30,7 @@ import { type CodingCliProviderName, type CodingCliSession } from './coding-cli/
 import { TerminalMetadataService } from './terminal-metadata-service.js'
 import { migrateLegacyDefaultEnabledProviders, migrateSettingsSortMode } from './settings-migrate.js'
 import { createFilesRouter } from './files-router.js'
-import { createPlatformRouter } from './platform-router.js'
+import { createPlatformRouter, detectFeatureFlags } from './platform-router.js'
 import { createProxyRouter } from './proxy-router.js'
 import { createLocalFileRouter } from './local-file-router.js'
 import { createTerminalsRouter } from './terminals-router.js'
@@ -148,7 +148,19 @@ async function main() {
   // Shell bootstrap route: returns shell-critical first-paint data only
   app.use('/api', createShellBootstrapRouter({
     getSettings: async () => migrateSettingsSortMode(await configStore.getSettings()),
-    getPlatform: async () => ({ platform: await detectPlatform(), host: await detectHostName() }),
+    getPlatform: async () => {
+      const [platform, availableClis, hostName] = await Promise.all([
+        detectPlatform(),
+        detectAvailableClis(cliDetectionSpecs),
+        detectHostName(),
+      ])
+      return {
+        platform,
+        availableClis,
+        hostName,
+        featureFlags: detectFeatureFlags(),
+      }
+    },
     getShellTaskStatus: async () => startupState.snapshot().tasks,
     getPerfLogging: () => perfConfig.enabled,
     getConfigFallback: async () => {

@@ -270,12 +270,16 @@ export type SearchResult = {
   projectPath: string
   title?: string
   summary?: string
+  sessionType?: string
   matchedIn: 'title' | 'userMessage' | 'assistantMessage' | 'summary'
   snippet?: string
   updatedAt: number
   createdAt?: number
   archived?: boolean
   cwd?: string
+  firstUserMessage?: string
+  isSubagent?: boolean
+  isNonInteractive?: boolean
 }
 
 export type SearchResponse = {
@@ -309,6 +313,8 @@ type SessionDirectoryItemResponse = {
   cwd?: string
   sessionType?: string
   firstUserMessage?: string
+  isSubagent?: boolean
+  isNonInteractive?: boolean
 }
 
 type SessionDirectoryPageResponse = {
@@ -343,6 +349,8 @@ function groupDirectoryItemsAsProjects(items: SessionDirectoryItemResponse[]) {
       cwd: item.cwd,
       title: item.title,
       summary: item.summary,
+      isSubagent: item.isSubagent,
+      isNonInteractive: item.isNonInteractive,
       firstUserMessage: item.firstUserMessage,
       sessionType: item.sessionType,
     })),
@@ -416,6 +424,10 @@ export async function searchSessions(options: SearchOptions): Promise<SearchResp
       createdAt: item.createdAt,
       archived: item.archived,
       cwd: item.cwd,
+      sessionType: item.sessionType,
+      firstUserMessage: item.firstUserMessage,
+      isSubagent: item.isSubagent,
+      isNonInteractive: item.isNonInteractive,
     })),
     tier,
     query,

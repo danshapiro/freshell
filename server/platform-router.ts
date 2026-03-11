@@ -16,7 +16,7 @@ function isTruthy(value: string | undefined): boolean {
   return value === '1' || value.toLowerCase() === 'true'
 }
 
-function detectFeatureFlags(): Record<string, boolean> {
+export function detectFeatureFlags(): Record<string, boolean> {
   return {
     kilroy: isTruthy(process.env.KILROY_ENABLED),
   }

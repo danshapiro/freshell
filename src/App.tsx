@@ -98,6 +98,14 @@ type ConfigFallbackInfo = {
   backupExists: boolean
 }
 
+type BootstrapPlatformInfo = {
+  platform: string
+  availableClis?: Record<string, boolean>
+  hostName?: string
+  host?: string
+  featureFlags?: Record<string, boolean>
+}
+
 function describeConfigFallbackReason(reason: ConfigFallbackInfo['reason']): string {
   if (reason === 'PARSE_ERROR') return 'could not parse config JSON'
   if (reason === 'VERSION_MISMATCH') return 'config version is incompatible'
@@ -109,6 +117,11 @@ function parseConfigFallbackReason(value: unknown): ConfigFallbackInfo['reason']
   return value === 'PARSE_ERROR' || value === 'VERSION_MISMATCH' || value === 'READ_ERROR' || value === 'ENOENT'
     ? value
     : 'READ_ERROR'
+}
+
+function hasPlatformCapabilities(value: BootstrapPlatformInfo | null | undefined): boolean {
+  if (!value) return false
+  return Object.keys(value.availableClis ?? {}).length > 0 || Object.keys(value.featureFlags ?? {}).length > 0
 }
 
 function getTabSwitchShortcutDirection(event: KeyboardEvent): 'prev' | 'next' | null {
@@ -444,6 +457,7 @@ export default function App() {
     let bootstrapDataLoading = false
     let sidebarWindowLoading = false
     let versionInfoLoading = false
+    let platformDetailsLoading = false
     let startupRecoveryInFlight = false
     const versionInfoLoadedRef = { current: false }
 
@@ -468,12 +482,7 @@ export default function App() {
         try {
           const bootstrapData = await api.get<{
             settings?: AppSettings
-            platform?: {
-              platform: string
-              availableClis?: Record<string, boolean>
-              hostName?: string
-              featureFlags?: Record<string, boolean>
-            }
+            platform?: BootstrapPlatformInfo
             configFallback?: {
               reason?: unknown
               backupExists?: unknown
@@ -493,7 +502,7 @@ export default function App() {
               }
               dispatch(setTabRegistryDeviceMeta(resolveAndPersistDeviceMeta({
                 platform: bootstrapData.platform.platform,
-                hostName: bootstrapData.platform.hostName,
+                hostName: bootstrapData.platform.hostName ?? bootstrapData.platform.host,
               })))
             }
             if (bootstrapData.configFallback) {
@@ -510,6 +519,30 @@ export default function App() {
           return true
         } finally {
           bootstrapDataLoading = false
+        }
+      }
+
+      const loadPlatformDetails = async (): Promise<boolean> => {
+        if (platformDetailsLoading) return true
+        platformDetailsLoading = true
+        try {
+          const platformData = await api.get<BootstrapPlatformInfo>('/api/platform')
+          if (!cancelled) {
+            dispatch(setPlatform(platformData.platform))
+            dispatch(setAvailableClis(platformData.availableClis ?? {}))
+            dispatch(setFeatureFlags(platformData.featureFlags ?? {}))
+            dispatch(setTabRegistryDeviceMeta(resolveAndPersistDeviceMeta({
+              platform: platformData.platform,
+              hostName: platformData.hostName ?? platformData.host,
+            })))
+          }
+          return true
+        } catch (err: any) {
+          if (handleBootstrapAuthFailure(err)) return false
+          log.warn('Failed to load platform info', err)
+          return true
+        } finally {
+          platformDetailsLoading = false
         }
       }
 
@@ -622,6 +655,14 @@ export default function App() {
           const state = appStore.getState()
           if (!state.settings.loaded || state.connection.platform === null) {
             if (!(await loadBootstrapData())) return
+          }
+          const connectionState = appStore.getState().connection
+          if (!hasPlatformCapabilities({
+            platform: connectionState.platform ?? 'unknown',
+            availableClis: connectionState.availableClis,
+            featureFlags: connectionState.featureFlags,
+          })) {
+            if (!(await loadPlatformDetails())) return
           }
           if (!(await ensureSidebarSessionsWindow())) return
           if (!(await loadVersionInfo())) return

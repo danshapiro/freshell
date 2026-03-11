@@ -412,6 +412,62 @@ describe('App WS bootstrap recovery', () => {
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))
   })
 
+  it('repairs missing bootstrap platform capabilities from /api/platform after websocket readiness', async () => {
+    const store = createStore()
+    let platformCalls = 0
+
+    apiGet.mockImplementation((url: string) => {
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: defaultSettings,
+          platform: { platform: 'linux' },
+          shell: { authenticated: true, ready: true },
+        })
+      }
+      if (url === '/api/platform') {
+        platformCalls += 1
+        return Promise.resolve({
+          platform: 'linux',
+          availableClis: { claude: true, codex: true, opencode: true },
+          hostName: 'devbox',
+          featureFlags: { kilroy: true },
+        })
+      }
+      return Promise.resolve({})
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.connect).toHaveBeenCalledTimes(1)
+      expect(store.getState().connection.availableClis).toEqual({})
+    })
+
+    act(() => {
+      messageHandler?.({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-platform-repair',
+      })
+    })
+
+    await waitFor(() => {
+      expect(store.getState().connection.availableClis).toEqual({
+        claude: true,
+        codex: true,
+        opencode: true,
+      })
+      expect(store.getState().connection.featureFlags).toEqual({ kilroy: true })
+    })
+
+    expect(platformCalls).toBe(1)
+    expect(apiGet).toHaveBeenCalledWith('/api/platform')
+  })
+
   it('clears stale codex activity immediately when bootstrap attaches to an already-ready socket', async () => {
     const store = createStore({
       codexActivity: {

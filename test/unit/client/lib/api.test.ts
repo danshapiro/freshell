@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   api,
+  fetchSidebarSessionsSnapshot,
   getAgentTimelinePage,
   getAgentTurnBody,
   getBootstrap,
   getSessionDirectoryPage,
   getTerminalDirectoryPage,
+  searchSessions,
   getTerminalScrollbackPage,
   getTerminalViewport,
   searchTerminalView,
@@ -173,6 +175,72 @@ describe('visible-first read-model helpers', () => {
         priority: 'critical',
       }),
     ).toThrow()
+  })
+
+  it('preserves sidebar visibility metadata when grouping session-directory items', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [{
+        sessionId: 'session-1',
+        provider: 'codex',
+        projectPath: '/tmp/project-alpha',
+        title: 'Hidden session',
+        sessionType: 'codex',
+        firstUserMessage: '__AUTO__ worktree cleanup',
+        isSubagent: true,
+        isNonInteractive: true,
+        updatedAt: 1_000,
+      }],
+      nextCursor: null,
+      revision: 1,
+    }))
+
+    const response = await fetchSidebarSessionsSnapshot()
+
+    expect(response.projects).toEqual([
+      expect.objectContaining({
+        projectPath: '/tmp/project-alpha',
+        sessions: [
+          expect.objectContaining({
+            sessionId: 'session-1',
+            sessionType: 'codex',
+            firstUserMessage: '__AUTO__ worktree cleanup',
+            isSubagent: true,
+            isNonInteractive: true,
+          }),
+        ],
+      }),
+    ])
+  })
+
+  it('preserves search visibility metadata from session-directory items', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [{
+        sessionId: 'session-2',
+        provider: 'codex',
+        projectPath: '/tmp/project-beta',
+        title: 'Queued session',
+        matchedIn: 'title',
+        sessionType: 'codex',
+        firstUserMessage: 'queued task',
+        isSubagent: false,
+        isNonInteractive: true,
+        updatedAt: 2_000,
+      }],
+      nextCursor: null,
+      revision: 2,
+    }))
+
+    const response = await searchSessions({ query: 'queued' })
+
+    expect(response.results).toEqual([
+      expect.objectContaining({
+        sessionId: 'session-2',
+        sessionType: 'codex',
+        firstUserMessage: 'queued task',
+        isSubagent: false,
+        isNonInteractive: true,
+      }),
+    ])
   })
 })
 
