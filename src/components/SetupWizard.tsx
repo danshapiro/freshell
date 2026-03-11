@@ -3,7 +3,7 @@ import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { configureNetwork, fetchNetworkStatus } from '@/store/networkSlice'
 import { addTab } from '@/store/tabsSlice'
 import { initLayout } from '@/store/panesSlice'
-import { fetchFirewallConfig } from '@/lib/firewall-configure'
+import { fetchFirewallConfig, type ConfigureFirewallResult } from '@/lib/firewall-configure'
 import { ensureShareUrlToken } from '@/lib/share-utils'
 import { getAuthToken } from '@/lib/auth'
 import {
@@ -17,6 +17,7 @@ import { toSvgDataURL } from 'lean-qr/extras/svg'
 import { nanoid } from '@reduxjs/toolkit'
 import { Check, Loader2, AlertCircle, Copy } from 'lucide-react'
 import type { AppView } from '@/components/Sidebar'
+import { ConfirmModal } from '@/components/ui/confirm-modal'
 
 interface SetupWizardProps {
   onComplete: () => void
@@ -26,6 +27,7 @@ interface SetupWizardProps {
 }
 
 type ChecklistItemStatus = 'pending' | 'active' | 'done' | 'error'
+type FirewallConfirmation = Extract<ConfigureFirewallResult, { method: 'confirmation-required' }>
 
 function ChecklistItem({ label, status, detail }: { label: string; status: ChecklistItemStatus; detail?: string }) {
   return (
@@ -71,6 +73,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
   const [bindDetail, setBindDetail] = useState<string | undefined>()
   const [firewallStatus, setFirewallStatus] = useState<ChecklistItemStatus>('pending')
   const [firewallDetail, setFirewallDetail] = useState<string | undefined>()
+  const [firewallConfirmation, setFirewallConfirmation] = useState<FirewallConfirmation | null>(null)
   const [copied, setCopied] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const mountedRef = useRef(true)
@@ -193,71 +196,105 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
     }
   }, [shareAccessUrl])
 
+  const startFirewallPolling = useCallback(() => {
+    setFirewallStatus('active')
+    setFirewallDetail('Configuring firewall...')
+    const pollFirewall = async (attempts = 0) => {
+      if (!mountedRef.current) return
+      if (attempts >= SETUP_WIZARD_FIREWALL_POLL_MAX_ATTEMPTS) {
+        setFirewallStatus('error')
+        setFirewallDetail('Firewall configuration timed out')
+        return
+      }
+      try {
+        const action = await dispatch(fetchNetworkStatus()).unwrap()
+        if (!action.firewall.configuring) {
+          if (action.firewall.portOpen === true) {
+            setFirewallStatus('done')
+            setFirewallDetail('Firewall configured — port is open')
+          } else if (action.firewall.portOpen === false) {
+            setFirewallStatus('error')
+            setFirewallDetail('Firewall configuration did not open the port')
+          } else {
+            setFirewallStatus('done')
+            setFirewallDetail('Firewall configured')
+          }
+          return
+        }
+      } catch {
+        // Ignore transient polling failures and continue retrying.
+      }
+      firewallPollTimerRef.current = setTimeout(() => {
+        firewallPollTimerRef.current = null
+        void pollFirewall(attempts + 1)
+      }, SETUP_WIZARD_FIREWALL_POLL_INTERVAL_MS)
+    }
+    firewallPollTimerRef.current = setTimeout(() => {
+      firewallPollTimerRef.current = null
+      void pollFirewall()
+    }, SETUP_WIZARD_FIREWALL_POLL_INTERVAL_MS)
+  }, [dispatch])
+
+  const handleFirewallResult = useCallback((result: ConfigureFirewallResult) => {
+    if (result.method === 'confirmation-required') {
+      setFirewallConfirmation(result)
+      return
+    }
+
+    if (result.method === 'terminal') {
+      const tabId = nanoid()
+      dispatch(addTab({ id: tabId, title: 'Firewall Setup', mode: 'shell', shell: 'system' }))
+      dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
+      onFirewallTerminal?.({ tabId, command: result.command })
+      // Dismiss the wizard overlay so the user can interact with the
+      // terminal pane (type the sudo password).
+      onComplete?.()
+      onNavigate?.('terminal')
+      return
+    }
+
+    if (result.method === 'wsl2' || result.method === 'windows-elevated') {
+      startFirewallPolling()
+    }
+  }, [dispatch, onComplete, onNavigate, onFirewallTerminal, startFirewallPolling])
+
+  const requestFirewallConfig = useCallback(async (body: { confirmElevation?: true } = {}) => {
+    const result = await fetchFirewallConfig(body)
+    handleFirewallResult(result)
+  }, [handleFirewallResult])
+
   const handleConfigureFirewall = useCallback(async () => {
     try {
-      const result = await fetchFirewallConfig()
-      if (result.method === 'terminal') {
-        const tabId = nanoid()
-        dispatch(addTab({ id: tabId, title: 'Firewall Setup', mode: 'shell', shell: 'system' }))
-        dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
-        onFirewallTerminal?.({ tabId, command: result.command })
-        // Dismiss the wizard overlay so the user can interact with the
-        // terminal pane (type the sudo password). The wizard is z-[70]
-        // which blocks all interaction with the terminal underneath.
-        onComplete?.()
-        onNavigate?.('terminal')
-      } else if (result.method === 'wsl2' || result.method === 'windows-elevated') {
-        // Server handles elevated process; poll for completion
-        setFirewallStatus('active')
-        setFirewallDetail('Configuring firewall...')
-        const pollFirewall = async (attempts = 0) => {
-          if (!mountedRef.current) return
-          if (attempts >= SETUP_WIZARD_FIREWALL_POLL_MAX_ATTEMPTS) {
-            setFirewallStatus('error')
-            setFirewallDetail('Firewall configuration timed out')
-            return
-          }
-          try {
-            const action = await dispatch(fetchNetworkStatus()).unwrap()
-            if (!action.firewall.configuring) {
-              if (action.firewall.portOpen === true) {
-                setFirewallStatus('done')
-                setFirewallDetail('Firewall configured — port is open')
-              } else if (action.firewall.portOpen === false) {
-                setFirewallStatus('error')
-                setFirewallDetail('Firewall configuration did not open the port')
-              } else {
-                setFirewallStatus('done')
-                setFirewallDetail('Firewall configured')
-              }
-              return
-            }
-          } catch { /* ignore */ }
-          firewallPollTimerRef.current = setTimeout(() => {
-            firewallPollTimerRef.current = null
-            void pollFirewall(attempts + 1)
-          }, SETUP_WIZARD_FIREWALL_POLL_INTERVAL_MS)
-        }
-        firewallPollTimerRef.current = setTimeout(() => {
-          firewallPollTimerRef.current = null
-          void pollFirewall()
-        }, SETUP_WIZARD_FIREWALL_POLL_INTERVAL_MS)
-      }
-      // method === 'none' or 'in-progress': do nothing
+      await requestFirewallConfig()
     } catch (err: any) {
       setFirewallStatus('error')
       setFirewallDetail(err?.message || 'Firewall configuration failed')
     }
-  }, [dispatch, onComplete, onNavigate, onFirewallTerminal])
+  }, [requestFirewallConfig])
+
+  const handleConfirmFirewall = useCallback(async () => {
+    setFirewallConfirmation(null)
+    try {
+      await requestFirewallConfig({ confirmElevation: true })
+    } catch (err: any) {
+      setFirewallStatus('error')
+      setFirewallDetail(err?.message || 'Firewall configuration failed')
+    }
+  }, [requestFirewallConfig])
+
+  const handleCancelFirewallConfirmation = useCallback(() => {
+    setFirewallConfirmation(null)
+  }, [])
 
   return (
-    <div
-      className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 backdrop-blur-sm"
-      role="dialog"
-      aria-modal="true"
-      aria-label="Network setup wizard"
-    >
-      <div className="mx-4 w-full max-w-md rounded-lg border bg-background p-6 shadow-lg">
+    <>
+      <div
+        className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Network setup wizard"
+      >
+        <div className="mx-4 w-full max-w-md rounded-lg border bg-background p-6 shadow-lg">
         {/* Step 1: Ask */}
         {step === 1 && (
           <div className="space-y-6">
@@ -390,7 +427,19 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
             </button>
           </div>
         )}
+        </div>
       </div>
-    </div>
+      <ConfirmModal
+        open={firewallConfirmation !== null}
+        title={firewallConfirmation?.title ?? ''}
+        body={firewallConfirmation?.body ?? ''}
+        confirmLabel={firewallConfirmation?.confirmLabel ?? 'Continue'}
+        confirmVariant="default"
+        onConfirm={() => {
+          void handleConfirmFirewall()
+        }}
+        onCancel={handleCancelFirewallConfirmation}
+      />
+    </>
   )
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import { SetupWizard } from '@/components/SetupWizard'
@@ -13,11 +13,15 @@ import panesReducer from '@/store/panesSlice'
 // Mock the api module to intercept network configure calls
 const mockPost = vi.fn()
 const mockGet = vi.fn()
+const mockFetchFirewallConfig = vi.fn()
 vi.mock('@/lib/api', () => ({
   api: {
     get: (...args: any[]) => mockGet(...args),
     post: (...args: any[]) => mockPost(...args),
   },
+}))
+vi.mock('@/lib/firewall-configure', () => ({
+  fetchFirewallConfig: (...args: any[]) => mockFetchFirewallConfig(...args),
 }))
 
 const unconfiguredStatus: NetworkStatusResponse = {
@@ -155,6 +159,46 @@ describe('Network Setup Wizard (e2e)', () => {
     )
 
     expect(screen.getByRole('dialog')).toBeInTheDocument()
+  })
+
+  it('shows confirmation before retrying WSL firewall repair from the wizard', async () => {
+    const wslFirewallStatus: NetworkStatusResponse = {
+      ...configuredRemoteStatus,
+      firewall: { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false },
+    }
+    const store = createStore(wslFirewallStatus)
+
+    mockPost.mockResolvedValueOnce(wslFirewallStatus)
+    mockFetchFirewallConfig
+      .mockResolvedValueOnce({
+        method: 'confirmation-required',
+        title: 'Administrator approval required',
+        body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
+        confirmLabel: 'Continue',
+      })
+      .mockResolvedValueOnce({ method: 'wsl2', status: 'started' })
+
+    render(
+      <Provider store={store}>
+        <SetupWizard onComplete={vi.fn()} initialStep={2} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /configure firewall/i })).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /configure firewall/i }))
+
+    const confirmationDialog = await screen.findByRole('dialog', { name: /administrator approval required/i })
+    expect(confirmationDialog).toBeInTheDocument()
+    expect(mockFetchFirewallConfig).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(within(confirmationDialog).getByRole('button', { name: /^continue$/i }))
+
+    await waitFor(() => {
+      expect(mockFetchFirewallConfig).toHaveBeenNthCalledWith(2, { confirmElevation: true })
+    })
   })
 })
 

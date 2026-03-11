@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, cleanup, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import { SetupWizard } from '@/components/SetupWizard'
@@ -255,6 +255,102 @@ describe('SetupWizard', () => {
     await waitFor(() => {
       expect(screen.getByRole('button', { name: /configure firewall/i })).toBeInTheDocument()
     })
+  })
+
+  it('shows an admin-approval modal before starting WSL2 repair', async () => {
+    mockFetchFirewallConfig
+      .mockResolvedValueOnce({
+        method: 'confirmation-required',
+        title: 'Administrator approval required',
+        body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
+        confirmLabel: 'Continue',
+      })
+      .mockResolvedValueOnce({ method: 'wsl2', status: 'started' })
+
+    const firewallActive = { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false }
+    const store = createTestStore({
+      status: {
+        ...defaultNetworkStatus,
+        configured: true,
+        host: '0.0.0.0',
+        firewall: firewallActive,
+        rebinding: false,
+      },
+    })
+
+    mockPost.mockResolvedValueOnce({
+      ...defaultNetworkStatus,
+      configured: true,
+      host: '0.0.0.0',
+      firewall: firewallActive,
+      rebinding: false,
+    })
+
+    render(
+      <Provider store={store}>
+        <SetupWizard onComplete={vi.fn()} initialStep={2} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /configure firewall/i })).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /configure firewall/i }))
+
+    const confirmationDialog = await screen.findByRole('dialog', { name: /administrator approval required/i })
+    expect(confirmationDialog).toBeInTheDocument()
+    expect(mockFetchFirewallConfig).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(within(confirmationDialog).getByRole('button', { name: /^continue$/i }))
+
+    await waitFor(() => {
+      expect(mockFetchFirewallConfig).toHaveBeenNthCalledWith(2, { confirmElevation: true })
+    })
+  })
+
+  it('does nothing when the user cancels the admin-approval modal', async () => {
+    mockFetchFirewallConfig.mockResolvedValue({
+      method: 'confirmation-required',
+      title: 'Administrator approval required',
+      body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
+      confirmLabel: 'Continue',
+    })
+
+    const firewallActive = { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false }
+    const store = createTestStore({
+      status: {
+        ...defaultNetworkStatus,
+        configured: true,
+        host: '0.0.0.0',
+        firewall: firewallActive,
+        rebinding: false,
+      },
+    })
+
+    mockPost.mockResolvedValueOnce({
+      ...defaultNetworkStatus,
+      configured: true,
+      host: '0.0.0.0',
+      firewall: firewallActive,
+      rebinding: false,
+    })
+
+    render(
+      <Provider store={store}>
+        <SetupWizard onComplete={vi.fn()} initialStep={2} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /configure firewall/i })).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /configure firewall/i }))
+    const confirmationDialog = await screen.findByRole('dialog', { name: /administrator approval required/i })
+    fireEvent.click(within(confirmationDialog).getByRole('button', { name: /^cancel$/i }))
+
+    expect(mockFetchFirewallConfig).toHaveBeenCalledTimes(1)
   })
 
   it('reports firewall error when portOpen is false after configuring completes', async () => {
