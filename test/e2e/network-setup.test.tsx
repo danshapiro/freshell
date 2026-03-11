@@ -269,4 +269,43 @@ describe('Settings network section (e2e)', () => {
       )
     })
   })
+
+  it('shows confirmation before retrying Windows firewall repair from settings', async () => {
+    const store = createStore({
+      ...configuredRemoteStatus,
+      firewall: {
+        platform: 'windows',
+        active: true,
+        portOpen: false,
+        commands: ['netsh advfirewall firewall add rule name="Freshell (port 3001)" dir=in action=allow protocol=TCP localport=3001 profile=private'],
+        configuring: false,
+      },
+    })
+
+    mockFetchFirewallConfig
+      .mockResolvedValueOnce({
+        method: 'confirmation-required',
+        title: 'Administrator approval required',
+        body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
+        confirmLabel: 'Continue',
+      })
+      .mockResolvedValueOnce({ method: 'windows-elevated', status: 'started' })
+
+    render(
+      <Provider store={store}>
+        <SettingsView onNavigate={vi.fn()} />
+      </Provider>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /fix firewall/i }))
+
+    const confirmationDialog = await screen.findByRole('dialog', { name: /administrator approval required/i })
+    expect(confirmationDialog).toBeInTheDocument()
+
+    fireEvent.click(within(confirmationDialog).getByRole('button', { name: /^continue$/i }))
+
+    await waitFor(() => {
+      expect(mockFetchFirewallConfig).toHaveBeenNthCalledWith(2, { confirmElevation: true })
+    })
+  })
 })

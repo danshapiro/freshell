@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { fireEvent, screen } from '@testing-library/react'
+import { fireEvent, screen, waitFor, within } from '@testing-library/react'
 import {
   createNetworkState,
   createNetworkStatus,
@@ -16,6 +16,11 @@ vi.mock('@/lib/api', () => ({
     put: vi.fn().mockResolvedValue({}),
     delete: vi.fn().mockResolvedValue({}),
   },
+}))
+
+const mockFetchFirewallConfig = vi.fn()
+vi.mock('@/lib/firewall-configure', () => ({
+  fetchFirewallConfig: (...args: any[]) => mockFetchFirewallConfig(...args),
 }))
 
 installSettingsViewHooks({ mockFonts: true })
@@ -41,6 +46,79 @@ describe('SettingsView network access section', () => {
     renderSettingsView(store, { onNavigate: vi.fn() })
 
     expect(screen.getByRole('button', { name: /fix firewall/i })).toBeInTheDocument()
+  })
+
+  it('shows an admin-approval modal before starting Windows firewall repair', async () => {
+    mockFetchFirewallConfig
+      .mockResolvedValueOnce({
+        method: 'confirmation-required',
+        title: 'Administrator approval required',
+        body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
+        confirmLabel: 'Continue',
+      })
+      .mockResolvedValueOnce({ method: 'windows-elevated', status: 'started' })
+
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            firewall: {
+              platform: 'windows',
+              active: true,
+              portOpen: false,
+              commands: ['netsh advfirewall firewall add rule name="Freshell (port 3001)" dir=in action=allow protocol=TCP localport=3001 profile=private'],
+              configuring: false,
+            },
+          }),
+        }),
+      },
+    })
+
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    fireEvent.click(screen.getByRole('button', { name: /fix firewall/i }))
+
+    const confirmationDialog = await screen.findByRole('dialog', { name: /administrator approval required/i })
+    expect(confirmationDialog).toBeInTheDocument()
+
+    fireEvent.click(within(confirmationDialog).getByRole('button', { name: /^continue$/i }))
+
+    await waitFor(() => {
+      expect(mockFetchFirewallConfig).toHaveBeenNthCalledWith(2, { confirmElevation: true })
+    })
+  })
+
+  it('does not re-issue the firewall request when the modal is cancelled', async () => {
+    mockFetchFirewallConfig.mockResolvedValue({
+      method: 'confirmation-required',
+      title: 'Administrator approval required',
+      body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
+      confirmLabel: 'Continue',
+    })
+
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            firewall: {
+              platform: 'windows',
+              active: true,
+              portOpen: false,
+              commands: ['netsh advfirewall firewall add rule name="Freshell (port 3001)" dir=in action=allow protocol=TCP localport=3001 profile=private'],
+              configuring: false,
+            },
+          }),
+        }),
+      },
+    })
+
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    fireEvent.click(screen.getByRole('button', { name: /fix firewall/i }))
+    const confirmationDialog = await screen.findByRole('dialog', { name: /administrator approval required/i })
+    fireEvent.click(within(confirmationDialog).getByRole('button', { name: /^cancel$/i }))
+
+    expect(mockFetchFirewallConfig).toHaveBeenCalledTimes(1)
   })
 
   it('shows dev-mode restart warning when devMode is true', () => {

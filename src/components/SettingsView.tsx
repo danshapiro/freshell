@@ -27,7 +27,7 @@ import type { DeepPartial } from '@/lib/type-utils'
 import { configureNetwork, fetchNetworkStatus } from '@/store/networkSlice'
 import { addTab } from '@/store/tabsSlice'
 import { initLayout } from '@/store/panesSlice'
-import { fetchFirewallConfig } from '@/lib/firewall-configure'
+import { fetchFirewallConfig, type ConfigureFirewallResult } from '@/lib/firewall-configure'
 import { nanoid } from '@reduxjs/toolkit'
 import type { AppView } from '@/components/Sidebar'
 import { getCliProviderConfigs } from '@/lib/coding-cli-utils'
@@ -36,6 +36,7 @@ import { buildKnownDevices, type KnownDevice } from '@/lib/known-devices'
 import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
 import { parseNormalizedLineList } from '@shared/string-list'
 import type { ClientExtensionEntry } from '@shared/extension-types'
+import { ConfirmModal } from '@/components/ui/confirm-modal'
 
 
 const log = createLogger('SettingsView')
@@ -74,6 +75,8 @@ type PreviewToken = {
   text: string
   kind?: PreviewTokenKind
 }
+
+type FirewallConfirmation = Extract<ConfigureFirewallResult, { method: 'confirmation-required' }>
 
 const terminalPreviewWidth = 40
 const terminalPreviewHeight = 8
@@ -198,6 +201,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   const [availableTerminalFonts, setAvailableTerminalFonts] = useState(terminalFonts)
   const [fontsReady, setFontsReady] = useState(false)
   const [terminalAdvancedOpen, setTerminalAdvancedOpen] = useState(false)
+  const [firewallConfirmation, setFirewallConfirmation] = useState<FirewallConfirmation | null>(null)
   const [defaultCwdInput, setDefaultCwdInput] = useState(settings.defaultCwd ?? '')
   const [defaultCwdError, setDefaultCwdError] = useState<string | null>(null)
   const [excludeFirstChatInput, setExcludeFirstChatInput] = useState(
@@ -206,6 +210,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   const [deviceNameInputs, setDeviceNameInputs] = useState<Record<string, string>>({})
   const terminalAdvancedId = useId()
   const pendingRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const firewallRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const defaultCwdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const defaultCwdValidationRef = useRef(0)
   const lastSettingsDefaultCwdRef = useRef(settings.defaultCwd ?? '')
@@ -245,11 +250,56 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   useEffect(() => {
     return () => {
       if (pendingRef.current) clearTimeout(pendingRef.current)
+      if (firewallRefreshTimerRef.current) clearTimeout(firewallRefreshTimerRef.current)
       if (defaultCwdTimerRef.current) clearTimeout(defaultCwdTimerRef.current)
       for (const timer of Object.values(providerCwdTimerRef.current)) {
         clearTimeout(timer)
       }
     }
+  }, [])
+
+  const handleFirewallFixResult = useCallback((result: ConfigureFirewallResult) => {
+    if (result.method === 'confirmation-required') {
+      setFirewallConfirmation(result)
+      return
+    }
+
+    if (result.method === 'terminal') {
+      const tabId = nanoid()
+      dispatch(addTab({ id: tabId, title: 'Firewall Setup', mode: 'shell', shell: 'system' }))
+      dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
+      onFirewallTerminal?.({ tabId, command: result.command })
+      onNavigate?.('terminal')
+      return
+    }
+
+    if (result.method === 'wsl2' || result.method === 'windows-elevated') {
+      if (firewallRefreshTimerRef.current) {
+        clearTimeout(firewallRefreshTimerRef.current)
+      }
+      firewallRefreshTimerRef.current = setTimeout(() => {
+        firewallRefreshTimerRef.current = null
+        void dispatch(fetchNetworkStatus())
+      }, 2000)
+    }
+  }, [dispatch, onFirewallTerminal, onNavigate])
+
+  const requestFirewallFix = useCallback(async (body: { confirmElevation?: true } = {}) => {
+    try {
+      const result = await fetchFirewallConfig(body)
+      handleFirewallFixResult(result)
+    } catch {
+      // Silently fail — user can retry
+    }
+  }, [handleFirewallFixResult])
+
+  const handleConfirmFirewallFix = useCallback(() => {
+    setFirewallConfirmation(null)
+    void requestFirewallFix({ confirmElevation: true })
+  }, [requestFirewallFix])
+
+  const handleCancelFirewallFix = useCallback(() => {
+    setFirewallConfirmation(null)
   }, [])
 
   const scheduleSave = useCallback((updates: any) => {
@@ -1213,22 +1263,8 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                       <span className="text-xs text-muted-foreground">{networkStatus.firewall.platform}</span>
                       {networkStatus.firewall.active && networkStatus.firewall.portOpen !== true && (
                         <button
-                          onClick={async () => {
-                            try {
-                              const result = await fetchFirewallConfig()
-                              if (result.method === 'terminal') {
-                                const tabId = nanoid()
-                                dispatch(addTab({ id: tabId, title: 'Firewall Setup', mode: 'shell', shell: 'system' }))
-                                dispatch(initLayout({ tabId, content: { kind: 'terminal', mode: 'shell' } }))
-                                onFirewallTerminal?.({ tabId, command: result.command })
-                                onNavigate?.('terminal')
-                              } else if (result.method === 'wsl2' || result.method === 'windows-elevated') {
-                                // Server handles it; re-fetch status after a delay
-                                setTimeout(() => dispatch(fetchNetworkStatus()), 2000)
-                              }
-                            } catch {
-                              // Silently fail — user can retry
-                            }
+                          onClick={() => {
+                            void requestFirewallFix()
                           }}
                           className="rounded border px-2 py-0.5 text-xs font-medium transition-colors hover:bg-muted"
                           aria-label="Fix firewall configuration"
@@ -1307,6 +1343,15 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
 
         </div>
       </div>
+      <ConfirmModal
+        open={firewallConfirmation !== null}
+        title={firewallConfirmation?.title ?? ''}
+        body={firewallConfirmation?.body ?? ''}
+        confirmLabel={firewallConfirmation?.confirmLabel ?? 'Continue'}
+        confirmVariant="default"
+        onConfirm={handleConfirmFirewallFix}
+        onCancel={handleCancelFirewallFix}
+      />
     </div>
   )
 }
