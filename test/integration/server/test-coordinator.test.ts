@@ -958,6 +958,95 @@ describe('test coordinator CLI', () => {
     ])
   })
 
+  it.each([
+    {
+      commandKey: 'test',
+      forwardedArgs: ['--bail=1'],
+      selectors: [
+        'vitest:default:run --bail=1',
+        'vitest:server:run --config vitest.server.config.ts --bail=1',
+      ],
+    },
+    {
+      commandKey: 'check',
+      forwardedArgs: ['--changed'],
+      selectors: [
+        'npm:typecheck',
+        'vitest:default:run --changed',
+        'vitest:server:run --config vitest.server.config.ts --changed',
+      ],
+    },
+  ])('keeps broad composite $commandKey workloads coordinated when forwarded args stay cross-config', async ({
+    commandKey,
+    forwardedArgs,
+    selectors,
+  }) => {
+    const fixture = await createRepoFixture({ linkedWorktree: true })
+    const captureFile = path.join(fixture.baseDir, `${commandKey}-broad-flags.jsonl`)
+
+    const exit = await waitForExit(spawnCoordinator(
+      fixture.checkoutRoot,
+      commandKey,
+      forwardedArgs,
+      {
+        FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
+      },
+    ))
+
+    expect(exit.code).toBe(0)
+    expect((await readCaptureLines(captureFile)).map((entry) => entry.selector)).toEqual(selectors)
+    expect((await readSuiteRuns(fixture.storeDir)).byKey['full-suite']).toMatchObject({ outcome: 'success' })
+    expect((await readCommandRuns(fixture.storeDir)).byKey[commandKey]).toMatchObject({ outcome: 'success' })
+  })
+
+  it.each([
+    {
+      commandKey: 'test:unit',
+      forwardedArgs: ['--reporter', 'dot'],
+      suiteKey: 'default:test/unit',
+      selectors: ['vitest:default:run test/unit --reporter dot'],
+    },
+    {
+      commandKey: 'test:coverage',
+      forwardedArgs: ['--bail=1'],
+      suiteKey: 'default:coverage',
+      selectors: ['vitest:default:run --coverage --bail=1'],
+    },
+    {
+      commandKey: 'test:server',
+      forwardedArgs: ['--run', '--reporter', 'dot'],
+      suiteKey: 'server:all:run',
+      selectors: ['vitest:server:--config vitest.server.config.ts --run --reporter dot'],
+    },
+  ])('keeps broad single-phase $commandKey workloads coordinated when benign flags are forwarded', async ({
+    commandKey,
+    forwardedArgs,
+    suiteKey,
+    selectors,
+  }) => {
+    const fixture = await createRepoFixture({ linkedWorktree: true })
+    const captureFile = path.join(fixture.baseDir, `${commandKey.replaceAll(':', '-')}-single-phase-broad-flags.jsonl`)
+
+    const exit = await waitForExit(spawnCoordinator(
+      fixture.checkoutRoot,
+      commandKey,
+      forwardedArgs,
+      {
+        FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
+      },
+    ))
+
+    expect(exit.code).toBe(0)
+    expect((await readCaptureLines(captureFile)).map((entry) => entry.selector)).toEqual(selectors)
+    expect((await readSuiteRuns(fixture.storeDir)).byKey[suiteKey]).toMatchObject({ outcome: 'success' })
+    expect((await readCommandRuns(fixture.storeDir)).byKey[commandKey]).toMatchObject({
+      outcome: 'success',
+      entrypoint: {
+        suiteKey,
+      },
+    })
+  })
+
   it('shows the latest exact coordinated suite and matching reusable baseline in bare status output', async () => {
     const fixture = await createRepoFixture({ linkedWorktree: true })
 
@@ -1026,6 +1115,16 @@ describe('test coordinator CLI', () => {
     expect((await readSuiteRuns(fixture.storeDir)).byKey['full-suite']).toBeUndefined()
 
     await stopChild(holder)
+  })
+
+  it('rejects unknown coordinator run subcommands with a clean usage error', async () => {
+    const fixture = await createRepoFixture({ linkedWorktree: true })
+
+    const exit = await waitForExit(spawnCoordinator(fixture.checkoutRoot, 'bogus'))
+
+    expect(exit.code).toBe(1)
+    expect(exit.output).toContain('Unknown command key "bogus"')
+    expect(exit.output).not.toContain('Cannot read properties')
   })
 
   it('publishes the coordinated workflow truthfully in AGENTS.md and docs/skills/testing.md', async () => {

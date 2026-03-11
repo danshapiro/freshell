@@ -14,8 +14,10 @@ import {
 } from '../../server/coding-cli/utils.js'
 import {
   classifyCommand,
+  COMMAND_KEYS,
   type CommandDisposition,
   type CommandKey,
+  isCommandKey,
   type UpstreamPhase,
 } from './coordinator-command-matrix.js'
 import { buildCoordinatorEndpoint, tryListen, type ListeningServer } from './coordinator-endpoint.js'
@@ -190,6 +192,10 @@ function parseRunArgs(args: string[]): ParsedRunArgs {
   const [commandKeyRaw, ...forwarded] = args
   if (!commandKeyRaw) {
     throw new Error('Missing command key for coordinator run mode.')
+  }
+
+  if (!isCommandKey(commandKeyRaw)) {
+    throw new Error(`Unknown command key "${commandKeyRaw}". Valid command keys: ${COMMAND_KEYS.join(', ')}`)
   }
 
   const commandKey = commandKeyRaw as CommandKey

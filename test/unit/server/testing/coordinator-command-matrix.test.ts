@@ -299,23 +299,77 @@ describe('classifyCommand()', () => {
     })
   })
 
-  it('delegates composite commands when forwarded Vitest flags narrow behavior without changing config ownership', () => {
-    expectSinglePhase(classifyCommand({
-      commandKey: 'test',
+  it('keeps composite broad commands coordinated when forwarded args do not narrow config ownership', () => {
+    const changed = classifyCommand({
+      commandKey: 'check',
       forwardedArgs: ['--changed'],
+    })
+    expect(changed).toMatchObject({
+      kind: 'coordinated',
+      suiteKey: 'full-suite',
+    })
+    if (changed.kind === 'coordinated') {
+      expect(changed.phases).toHaveLength(2)
+      expectVitestPhase(changed.phases[0], {
+        config: 'default',
+        args: ['run', '--changed'],
+      })
+      expectVitestPhase(changed.phases[1], {
+        config: 'server',
+        args: ['run', '--config', 'vitest.server.config.ts', '--changed'],
+      })
+    }
+
+    const bail = classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['--bail=1'],
+    })
+    expect(bail).toMatchObject({
+      kind: 'coordinated',
+      suiteKey: 'full-suite',
+    })
+    if (bail.kind === 'coordinated') {
+      expect(bail.phases).toHaveLength(2)
+      expectVitestPhase(bail.phases[0], {
+        config: 'default',
+        args: ['run', '--bail=1'],
+      })
+      expectVitestPhase(bail.phases[1], {
+        config: 'server',
+        args: ['run', '--config', 'vitest.server.config.ts', '--bail=1'],
+      })
+    }
+  })
+
+  it('coordinates broad single-phase workloads when benign flags keep them one-shot', () => {
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:unit',
+      forwardedArgs: ['--reporter', 'dot'],
     }), {
-      kind: 'delegated',
+      kind: 'coordinated',
+      suiteKey: 'default:test/unit',
       config: 'default',
-      args: ['run', '--changed'],
+      args: ['run', 'test/unit', '--reporter', 'dot'],
     })
 
     expectSinglePhase(classifyCommand({
-      commandKey: 'test',
+      commandKey: 'test:coverage',
       forwardedArgs: ['--bail=1'],
     }), {
-      kind: 'delegated',
+      kind: 'coordinated',
+      suiteKey: 'default:coverage',
       config: 'default',
-      args: ['run', '--bail=1'],
+      args: ['run', '--coverage', '--bail=1'],
+    })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:server',
+      forwardedArgs: ['--run', '--reporter', 'dot'],
+    }), {
+      kind: 'coordinated',
+      suiteKey: 'server:all:run',
+      config: 'server',
+      args: ['--config', 'vitest.server.config.ts', '--run', '--reporter', 'dot'],
     })
   })
 

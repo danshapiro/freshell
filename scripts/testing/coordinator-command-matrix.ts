@@ -20,6 +20,21 @@ export type CommandKey =
   | 'test:client'
   | 'test:vitest'
 
+export const COMMAND_KEYS = [
+  'test',
+  'test:all',
+  'check',
+  'verify',
+  'test:watch',
+  'test:ui',
+  'test:server',
+  'test:coverage',
+  'test:unit',
+  'test:integration',
+  'test:client',
+  'test:vitest',
+] as const satisfies readonly CommandKey[]
+
 export type CoordinatorInput = {
   commandKey: CommandKey
   forwardedArgs: string[]
@@ -123,6 +138,10 @@ export function classifyCommand(input: CoordinatorInput): CommandDisposition {
   return classifySinglePhaseCommand(input.commandKey, normalizedArgs)
 }
 
+export function isCommandKey(value: string): value is CommandKey {
+  return (COMMAND_KEYS as readonly string[]).includes(value)
+}
+
 function classifyHelpOrVersion(commandKey: CommandKey, normalizedArgs: string[]): CommandDisposition {
   if (commandKey === 'test:vitest') {
     return passthrough([vitestPhase(inferVitestConfig(normalizedArgs), normalizedArgs)])
@@ -172,15 +191,15 @@ function classifyCompositeCommand(commandKey: CommandKey, args: string[]): Comma
     ])
   }
 
-  if (filteredArgs.length > 0) {
-    return delegated([
+  if (isBroadCompositeWorkload(filteredArgs)) {
+    return coordinated('full-suite', [
       vitestPhase('default', ['run', ...filteredArgs]),
+      vitestPhase('server', ['run', '--config', 'vitest.server.config.ts', ...filteredArgs]),
     ])
   }
 
-  return coordinated('full-suite', [
-    vitestPhase('default', ['run']),
-    vitestPhase('server', ['run', '--config', 'vitest.server.config.ts']),
+  return delegated([
+    vitestPhase('default', ['run', ...filteredArgs]),
   ])
 }
 
@@ -197,7 +216,7 @@ function classifySinglePhaseCommand(commandKey: Exclude<CommandKey, 'test' | 'te
 
   if (commandKey === 'test:server' && isExplicitBroadServerRun(args)) {
     return coordinated('server:all:run', [
-      vitestPhase('server', ['--config', 'vitest.server.config.ts', '--run']),
+      vitestPhase('server', buildBroadSinglePhaseArgs(spec, args)),
     ])
   }
 
@@ -205,9 +224,9 @@ function classifySinglePhaseCommand(commandKey: Exclude<CommandKey, 'test' | 'te
     return delegated([vitestPhase('server', singlePhaseDelegatedBaseArgs(spec))])
   }
 
-  if (args.length === 0 && spec.broadSuiteKey) {
+  if (isBroadSinglePhaseWorkload(commandKey, args) && spec.broadSuiteKey) {
     return coordinated(spec.broadSuiteKey, [
-      vitestPhase(spec.owner, [...spec.broadArgs]),
+      vitestPhase(spec.owner, buildBroadSinglePhaseArgs(spec, args)),
     ])
   }
 
@@ -291,12 +310,36 @@ function hasExplicitConfigOverride(args: string[]): boolean {
 }
 
 function isExplicitBroadServerRun(args: string[]): boolean {
-  const targetOwnership = classifyTargetOwnership(args)
-  if (targetOwnership !== undefined) return false
-  if (hasNamePattern(args) || hasWatchOrUi(args) || hasReporter(args)) return false
+  if (!args.includes('--run')) return false
+  return !hasNarrowingSelectors(args)
+}
 
-  const significantArgs = args.filter((arg) => arg !== '--run')
-  return significantArgs.length === 0 && args.includes('--run')
+function isBroadCompositeWorkload(args: string[]): boolean {
+  return !hasNarrowingSelectors(args)
+}
+
+function isBroadSinglePhaseWorkload(
+  commandKey: Exclude<CommandKey, 'test' | 'test:all' | 'check' | 'verify'>,
+  args: string[],
+): boolean {
+  if (commandKey === 'test:server') {
+    return isExplicitBroadServerRun(args)
+  }
+
+  return !hasNarrowingSelectors(args)
+}
+
+function hasNarrowingSelectors(args: string[]): boolean {
+  return hasWatchOrUi(args) || hasNamePattern(args) || extractTargets(args).length > 0
+}
+
+function buildBroadSinglePhaseArgs(spec: SinglePhaseSpec, args: string[]): string[] {
+  if (spec.owner === 'server' && args.includes('--run')) {
+    const extraArgs = args.filter((arg) => arg !== '--run')
+    return [...spec.broadArgs, ...extraArgs]
+  }
+
+  return [...spec.broadArgs, ...args]
 }
 
 function classifyTargetOwnership(args: string[]): 'default' | 'server' | 'mixed' | undefined {
