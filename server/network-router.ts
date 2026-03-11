@@ -145,12 +145,12 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
       const commands = status.firewall.commands
 
       if (status.firewall.platform === 'wsl2') {
-        if (!confirmElevation) {
-          return res.json(WINDOWS_ELEVATION_CONFIRMATION)
-        }
-
         if (status.firewall.portOpen === true) {
           return res.json(NO_CONFIGURATION_CHANGES_REQUIRED)
+        }
+
+        if (!confirmElevation) {
+          return res.json(WINDOWS_ELEVATION_CONFIRMATION)
         }
 
         const plan = computeWslPortForwardingPlan(networkManager.getRelevantPorts())

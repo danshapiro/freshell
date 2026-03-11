@@ -214,6 +214,7 @@ describe('Network API integration', () => {
         active: true,
       })
       networkManager.resetFirewallCache()
+      vi.mocked(isPortReachable).mockResolvedValueOnce(false)
 
       const wslModule = await import('../../../server/wsl-port-forward.js')
       const cp = await import('node:child_process')
@@ -233,12 +234,35 @@ describe('Network API integration', () => {
       expect(cp.execFile).not.toHaveBeenCalled()
     })
 
+    it('returns none for WSL2 on the first click when the port is already reachable', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+      vi.mocked(isPortReachable).mockResolvedValueOnce(true)
+
+      const wslModule = await import('../../../server/wsl-port-forward.js')
+      const cp = await import('node:child_process')
+
+      const res = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({ method: 'none', message: 'No configuration changes required' })
+      expect(wslModule.computeWslPortForwardingPlan).not.toHaveBeenCalled()
+      expect(cp.execFile).not.toHaveBeenCalled()
+    })
+
     it('returns none for WSL2 when the confirmed retry recomputes to noop', async () => {
       vi.mocked(detectFirewall).mockResolvedValue({
         platform: 'wsl2',
         active: true,
       })
       networkManager.resetFirewallCache()
+      vi.mocked(isPortReachable).mockResolvedValueOnce(false)
 
       const wslModule = await import('../../../server/wsl-port-forward.js')
       vi.mocked(wslModule.computeWslPortForwardingPlan).mockReturnValue({
@@ -272,6 +296,7 @@ describe('Network API integration', () => {
         active: true,
       })
       networkManager.resetFirewallCache()
+      vi.mocked(isPortReachable).mockResolvedValueOnce(false)
 
       const wslModule = await import('../../../server/wsl-port-forward.js')
       vi.mocked(wslModule.computeWslPortForwardingPlan).mockReturnValue({

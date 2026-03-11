@@ -255,6 +255,13 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
     setFirewallDetail(pendingDetail)
     try {
       const action = await dispatch(fetchNetworkStatus()).unwrap()
+      if (action.host !== '0.0.0.0') {
+        setBindStatus('error')
+        setBindDetail('Remote access is not enabled')
+        setFirewallStatus('error')
+        setFirewallDetail('Remote access is not enabled')
+        return
+      }
       applyFirewallChecklistState(action.firewall)
     } catch {
       setFirewallStatus('error')

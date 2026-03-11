@@ -492,6 +492,59 @@ describe('SetupWizard', () => {
     })
   })
 
+  it('does not advance to success when the no-op response means remote access was disabled', async () => {
+    mockFetchFirewallConfig.mockResolvedValue({
+      method: 'none',
+      message: 'Remote access is not enabled',
+    })
+
+    const firewallActive = { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false }
+    const store = createTestStore({
+      status: {
+        ...defaultNetworkStatus,
+        configured: true,
+        host: '0.0.0.0',
+        firewall: firewallActive,
+        rebinding: false,
+      },
+    })
+
+    mockPost.mockResolvedValueOnce({
+      ...defaultNetworkStatus,
+      configured: true,
+      host: '0.0.0.0',
+      firewall: firewallActive,
+      rebinding: false,
+    })
+
+    const { api } = await import('@/lib/api')
+    vi.mocked(api.get).mockResolvedValue({
+      ...defaultNetworkStatus,
+      configured: true,
+      host: '127.0.0.1',
+      firewall: { ...firewallActive, portOpen: null },
+      rebinding: false,
+    })
+
+    render(
+      <Provider store={store}>
+        <SetupWizard onComplete={vi.fn()} initialStep={2} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /configure firewall/i })).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /configure firewall/i }))
+
+    await waitFor(() => {
+      expect(screen.getAllByText(/remote access is not enabled/i)).toHaveLength(2)
+      expect(screen.queryByText(/you're all set/i)).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /close/i })).toBeInTheDocument()
+    })
+  })
+
   it('reports firewall error when portOpen is false after configuring completes', async () => {
     mockFetchFirewallConfig.mockResolvedValue({ method: 'wsl2', status: 'ok' })
     const firewallActive = { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false }
