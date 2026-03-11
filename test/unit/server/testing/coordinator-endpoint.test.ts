@@ -3,7 +3,7 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   buildCoordinatorEndpoint,
@@ -154,4 +154,64 @@ describe('tryListen()', () => {
 
     await closeHandle(secondHolder!)
   })
+
+  it('does not let concurrent stale-socket recovery unlink a newly live unix socket', async () => {
+    const commonDir = path.join(tempDir, 'repo', '.git')
+    const endpoint = buildCoordinatorEndpoint(commonDir, 'linux', [tempDir])
+
+    await fsp.mkdir(path.dirname(endpoint.address), { recursive: true })
+    await fsp.writeFile(endpoint.address, '')
+
+    const originalRm = fsp.rm.bind(fsp)
+    let endpointRmCalls = 0
+    let removedLiveSocket = false
+    let releaseSecondRm: (() => void) | undefined
+    const secondRmReached = new Promise<void>((resolve) => {
+      releaseSecondRm = resolve
+    })
+
+    const rmSpy = vi.spyOn(fsp, 'rm').mockImplementation(async (target, options) => {
+      if (target === endpoint.address) {
+        endpointRmCalls += 1
+        if (endpointRmCalls === 1) {
+          await Promise.race([secondRmReached, delay(500)])
+        } else if (endpointRmCalls === 2) {
+          releaseSecondRm?.()
+          const deadline = Date.now() + 5_000
+          while (Date.now() < deadline) {
+            const stat = await fsp.lstat(endpoint.address).catch(() => undefined)
+            if (stat?.isSocket()) {
+              removedLiveSocket = true
+              break
+            }
+            await delay(10)
+          }
+        }
+      }
+
+      return originalRm(target, options)
+    })
+
+    let first: Awaited<ReturnType<typeof tryListen>> | undefined
+    let second: Awaited<ReturnType<typeof tryListen>> | undefined
+    try {
+      ;[first, second] = await Promise.all([tryListen(endpoint), tryListen(endpoint)])
+    } finally {
+      rmSpy.mockRestore()
+    }
+
+    const listeners = [first, second].filter((handle): handle is Awaited<ReturnType<typeof tryListen>> & { kind: 'listening' } => {
+      return handle?.kind === 'listening'
+    })
+
+    expect(removedLiveSocket).toBe(false)
+    expect(listeners).toHaveLength(1)
+
+    await closeHandle(first)
+    await closeHandle(second)
+  })
 })
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}

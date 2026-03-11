@@ -35,6 +35,7 @@ export type StatusView = {
   latestCommand?: LatestRunRecord
   latestSuite?: LatestRunRecord
   reusableSuccess?: ReusableSuccessRecord
+  fullSuiteReusableSuccess?: ReusableSuccessRecord
   latestCommandsByKey: Record<string, LatestRunRecord>
   latestSuitesByKey: Record<string, LatestRunRecord>
 }
@@ -57,17 +58,39 @@ export async function buildStatusView(request: StatusRequest): Promise<StatusVie
     : activeHolder
       ? 'running'
       : 'idle'
-  const suiteKey = request.suiteKey ?? 'full-suite'
   const latestCommand = request.commandKey ? commandRuns.byKey[request.commandKey] : undefined
-  const latestSuite = suiteRuns.byKey[suiteKey]
-  const reusableSuccess = resolveReusableSuccess(reusableSuccesses.byReusableKey, {
-    suiteKey,
-    commit: request.commit,
-    isDirty: request.isDirty,
-    nodeVersion: request.nodeVersion,
-    platform: request.platform,
-    arch: request.arch,
-  })
+  const latestSuite = request.suiteKey
+    ? suiteRuns.byKey[request.suiteKey]
+    : pickLatestRunRecord(suiteRuns.byKey)
+  const reusableSuccess = request.suiteKey
+    ? resolveReusableSuccess(reusableSuccesses.byReusableKey, {
+      suiteKey: request.suiteKey,
+      commit: request.commit,
+      isDirty: request.isDirty,
+      nodeVersion: request.nodeVersion,
+      platform: request.platform,
+      arch: request.arch,
+    })
+    : latestSuite?.entrypoint.suiteKey
+      ? resolveReusableSuccess(reusableSuccesses.byReusableKey, {
+        suiteKey: latestSuite.entrypoint.suiteKey,
+        commit: request.commit,
+        isDirty: request.isDirty,
+        nodeVersion: request.nodeVersion,
+        platform: request.platform,
+        arch: request.arch,
+      })
+      : undefined
+  const fullSuiteReusableSuccess = request.suiteKey
+    ? undefined
+    : resolveReusableSuccess(reusableSuccesses.byReusableKey, {
+      suiteKey: 'full-suite',
+      commit: request.commit,
+      isDirty: request.isDirty,
+      nodeVersion: request.nodeVersion,
+      platform: request.platform,
+      arch: request.arch,
+    })
 
   return {
     state,
@@ -75,6 +98,9 @@ export async function buildStatusView(request: StatusRequest): Promise<StatusVie
     latestCommand,
     latestSuite,
     reusableSuccess,
+    fullSuiteReusableSuccess: fullSuiteReusableSuccess?.reusableKey === reusableSuccess?.reusableKey
+      ? undefined
+      : fullSuiteReusableSuccess,
     latestCommandsByKey: commandRuns.byKey,
     latestSuitesByKey: suiteRuns.byKey,
   }
@@ -113,12 +139,25 @@ export function renderStatusView(view: StatusView): string {
     lines.push(`reusable-success: ${view.reusableSuccess.reusableKey}`)
   }
 
+  if (view.fullSuiteReusableSuccess) {
+    lines.push(`full-suite-reusable-summary: ${view.fullSuiteReusableSuccess.summary}`)
+    lines.push(`full-suite-reusable-success: ${view.fullSuiteReusableSuccess.reusableKey}`)
+  }
+
   if (Object.keys(view.latestCommandsByKey).length > 0) {
     const summary = Object.entries(view.latestCommandsByKey)
       .sort(([left], [right]) => left.localeCompare(right))
       .map(([key, record]) => `${key}=${record.outcome}`)
       .join(', ')
     lines.push(`latest-commands: ${summary}`)
+  }
+
+  if (Object.keys(view.latestSuitesByKey).length > 0) {
+    const summary = Object.entries(view.latestSuitesByKey)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, record]) => `${key}=${record.outcome}`)
+      .join(', ')
+    lines.push(`latest-suites: ${summary}`)
   }
 
   return lines.join('\n')
@@ -165,4 +204,22 @@ function formatElapsed(startedAt: string): string {
   if (hours > 0) return `${hours}h ${minutes}m`
   if (minutes > 0) return `${minutes}m ${seconds}s`
   return `${seconds}s`
+}
+
+function pickLatestRunRecord(byKey: Record<string, LatestRunRecord>): LatestRunRecord | undefined {
+  const records = Object.values(byKey)
+  if (records.length === 0) {
+    return undefined
+  }
+
+  return records.sort((left, right) => compareRecordRecency(right) - compareRecordRecency(left))[0]
+}
+
+function compareRecordRecency(record: LatestRunRecord): number {
+  return parseTimestamp(record.finishedAt) ?? parseTimestamp(record.startedAt) ?? 0
+}
+
+function parseTimestamp(value: string): number | undefined {
+  const parsed = Date.parse(value)
+  return Number.isNaN(parsed) ? undefined : parsed
 }

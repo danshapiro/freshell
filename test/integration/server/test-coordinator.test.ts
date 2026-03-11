@@ -637,6 +637,18 @@ describe('test coordinator CLI', () => {
     ])
   })
 
+  it('shows the latest exact coordinated suite and matching reusable baseline in bare status output', async () => {
+    const fixture = await createRepoFixture({ linkedWorktree: true })
+
+    expect((await waitForExit(spawnCoordinator(fixture.checkoutRoot, 'test:unit'))).code).toBe(0)
+
+    const status = await runStatus(fixture.checkoutRoot)
+    expect(status.code).toBe(0)
+    expect(status.output).toContain('state: idle')
+    expect(status.output).toContain('latest-suite: default:test/unit success exit=0')
+    expect(status.output).toContain('reusable-summary:')
+  })
+
   it('does not create reusable baselines for dirty worktree successes, but does after an exact clean rerun', async () => {
     const fixture = await createRepoFixture({ linkedWorktree: true, dirty: true })
 
@@ -686,6 +698,11 @@ describe('test coordinator CLI', () => {
     const holderRecord = await readHolder(fixture.storeDir)
     expect(holder.child.exitCode).toBeNull()
     expect(holderRecord?.summary).toBe('Long-running holder')
+    expect((await readCommandRuns(fixture.storeDir)).byKey['test:all']).toMatchObject({
+      outcome: 'failure',
+      exitCode: 124,
+    })
+    expect((await readSuiteRuns(fixture.storeDir)).byKey['full-suite']).toBeUndefined()
 
     await stopChild(holder)
   })

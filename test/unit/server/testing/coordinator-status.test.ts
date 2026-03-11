@@ -231,4 +231,60 @@ describe('buildStatusView()', () => {
 
     await listener.close()
   })
+
+  it('surfaces the latest coordinated suite and reusable baseline when bare status is requested', async () => {
+    const commonDir = path.join(tempDir, 'repo', '.git')
+    const storeDir = getCoordinatorStoreDir(commonDir)
+    const latest = createLatestRunRecord({
+      summary: 'Unit-only baseline',
+      entrypoint: {
+        commandKey: 'test:unit',
+        suiteKey: 'default:test/unit',
+      },
+      command: {
+        display: 'npm run test:unit',
+        argv: ['test:unit'],
+      },
+      repo: {
+        ...createLatestRunRecord().repo,
+        commonDir,
+      },
+    })
+    const reusable = createReusableSuccessRecord({
+      summary: latest.summary,
+      entrypoint: latest.entrypoint,
+      command: latest.command,
+      repo: latest.repo,
+      runtime: latest.runtime,
+      reusableKey: buildReusableSuccessKey({
+        suiteKey: 'default:test/unit',
+        commit: latest.repo.commit ?? '',
+        isDirty: latest.repo.isDirty,
+        nodeVersion: latest.runtime.nodeVersion,
+        platform: latest.runtime.platform,
+        arch: latest.runtime.arch,
+      }),
+    })
+
+    await recordCommandResult(storeDir, latest)
+    await recordSuiteResult(storeDir, latest)
+    await recordReusableSuccess(storeDir, reusable)
+
+    const view = await buildStatusView({
+      commonDir,
+      commit: latest.repo.commit,
+      isDirty: latest.repo.isDirty,
+      nodeVersion: latest.runtime.nodeVersion,
+      platform: latest.runtime.platform,
+      arch: latest.runtime.arch,
+    })
+
+    expect(view.state).toBe('idle')
+    expect(view.latestSuite).toEqual(latest)
+    expect(view.reusableSuccess).toEqual(reusable)
+
+    const rendered = renderStatusView(view)
+    expect(rendered).toContain('latest-suite: default:test/unit success exit=0')
+    expect(rendered).toContain('reusable-summary: Unit-only baseline')
+  })
 })

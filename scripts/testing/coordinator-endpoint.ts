@@ -9,6 +9,9 @@ import type { HolderRecord } from './coordinator-schema.js'
 import { readHolder, getCoordinatorStoreDir } from './coordinator-store.js'
 
 const UNIX_SOCKET_MAX_BYTES = 90
+const CLEANUP_LOCK_RETRY_MS = 10
+const CLEANUP_LOCK_TIMEOUT_MS = 5_000
+const CLEANUP_LOCK_STALE_MS = 30_000
 
 export type CoordinatorEndpoint =
   | {
@@ -74,16 +77,9 @@ export function buildCoordinatorEndpoint(
 
 export async function tryListen(endpoint: CoordinatorEndpoint): Promise<ListeningServer | { kind: 'busy' }> {
   if (endpoint.kind === 'unix') {
-    await fsp.mkdir(path.dirname(endpoint.address), { recursive: true })
-
-    const existingEntry = await fsp.lstat(endpoint.address).then(() => true).catch(() => false)
-    if (existingEntry) {
-      const liveOwner = await canConnect(endpoint)
-      if (liveOwner) {
-        return { kind: 'busy' }
-      }
-
-      await fsp.rm(endpoint.address, { force: true })
+    const preparation = await prepareUnixSocket(endpoint)
+    if (preparation === 'busy') {
+      return { kind: 'busy' }
     }
   }
 
@@ -108,6 +104,36 @@ export async function tryListen(endpoint: CoordinatorEndpoint): Promise<Listenin
     close: async () => {
       await closeServer(server)
     },
+  }
+}
+
+async function prepareUnixSocket(endpoint: Extract<CoordinatorEndpoint, { kind: 'unix' }>): Promise<'ready' | 'busy'> {
+  await fsp.mkdir(path.dirname(endpoint.address), { recursive: true })
+
+  while (true) {
+    if (!(await pathExists(endpoint.address))) {
+      return 'ready'
+    }
+
+    if (await canConnect(endpoint)) {
+      return 'busy'
+    }
+
+    const release = await acquireCleanupLock(endpoint.address)
+    try {
+      if (!(await pathExists(endpoint.address))) {
+        return 'ready'
+      }
+
+      if (await canConnect(endpoint)) {
+        return 'busy'
+      }
+
+      await fsp.rm(endpoint.address, { force: true })
+      return 'ready'
+    } finally {
+      await release()
+    }
   }
 }
 
@@ -202,4 +228,101 @@ function closeServer(server: net.Server): Promise<void> {
       }
     })
   })
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+  try {
+    await fsp.lstat(filePath)
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return false
+    }
+    throw error
+  }
+}
+
+async function acquireCleanupLock(address: string): Promise<() => Promise<void>> {
+  const lockPath = `${address}.cleanup.lock`
+  const deadline = Date.now() + CLEANUP_LOCK_TIMEOUT_MS
+
+  while (true) {
+    try {
+      const handle = await fsp.open(lockPath, 'wx')
+      try {
+        await handle.writeFile(JSON.stringify({
+          pid: process.pid,
+          startedAt: new Date().toISOString(),
+        }))
+      } finally {
+        await handle.close()
+      }
+
+      return async () => {
+        try {
+          await fsp.unlink(lockPath)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+            throw error
+          }
+        }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        throw error
+      }
+
+      if (await clearStaleCleanupLock(lockPath)) {
+        continue
+      }
+
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out acquiring coordinator socket cleanup lock for ${address}.`)
+      }
+
+      await delay(CLEANUP_LOCK_RETRY_MS)
+    }
+  }
+}
+
+async function clearStaleCleanupLock(lockPath: string): Promise<boolean> {
+  let stale = false
+
+  try {
+    const raw = await fsp.readFile(lockPath, 'utf8')
+    const parsed = JSON.parse(raw) as { pid?: unknown }
+    if (typeof parsed.pid === 'number') {
+      stale = !isProcessAlive(parsed.pid)
+    }
+  } catch {
+    const stats = await fsp.stat(lockPath).catch(() => undefined)
+    if (!stats) {
+      return true
+    }
+    stale = Date.now() - stats.mtimeMs > CLEANUP_LOCK_STALE_MS
+  }
+
+  if (!stale) {
+    return false
+  }
+
+  try {
+    await fsp.unlink(lockPath)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT'
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }

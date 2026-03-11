@@ -39,7 +39,6 @@ import { assertNoCoordinatorRecursion, runUpstreamPhase } from './coordinator-up
 const execFileAsync = promisify(execFile)
 const DEFAULT_POLL_MS = 60_000
 const DEFAULT_MAX_WAIT_MS = 24 * 60 * 60 * 1000
-const STATUS_ONLY_SUITE_KEY = 'full-suite'
 
 type ParsedRunArgs = {
   commandKey: CommandKey
@@ -146,7 +145,6 @@ async function printStatus(): Promise<number> {
   const statusView = await buildStatusView({
     commonDir: repo.commonDir,
     commandKey: undefined,
-    suiteKey: STATUS_ONLY_SUITE_KEY,
     commit: repo.commit,
     isDirty: repo.isDirty,
     nodeVersion: process.version,
@@ -211,7 +209,7 @@ async function runPrePhasesIfNeeded(
         await recordCommandResult(getCoordinatorStoreDir(refreshedRepo.commonDir), buildLatestRunRecord({
           runId: randomUUID(),
           commandKey,
-          suiteKey: STATUS_ONLY_SUITE_KEY,
+          suiteKey: 'full-suite',
           summary,
           commandDisplay: publicCommandDisplay(commandKey, forwardedArgs),
           repo: refreshedRepo,
@@ -248,6 +246,20 @@ async function runCoordinatedCommand(context: CoordinatedRunContext): Promise<nu
 
       await printQueuedStatus(context)
       if (Date.now() - waitStarted >= maxWaitMs) {
+        const finishedAt = new Date().toISOString()
+        const repo = await refreshRepoContext(context.repo).catch(() => context.repo)
+        await recordCommandResult(getCoordinatorStoreDir(repo.commonDir), buildLatestRunRecord({
+          runId: context.runId,
+          commandKey: context.commandKey,
+          suiteKey: context.disposition.suiteKey,
+          summary: context.summary,
+          commandDisplay: context.commandDisplay,
+          repo,
+          runtime: context.runtime,
+          startedAt,
+          finishedAt,
+          exitCode: 124,
+        }))
         console.error(`${new Date().toISOString()} queued intentionally but timed out waiting for the coordinated run gate.`)
         return 124
       }
@@ -423,7 +435,7 @@ function buildReusableSuccessRecord(latest: LatestRunRecord): ReusableSuccessRec
   return {
     ...latest,
     reusableKey: buildReusableSuccessKey({
-      suiteKey: latest.entrypoint.suiteKey ?? STATUS_ONLY_SUITE_KEY,
+      suiteKey: latest.entrypoint.suiteKey ?? 'full-suite',
       commit: latest.repo.commit,
       isDirty: latest.repo.isDirty,
       nodeVersion: latest.runtime.nodeVersion,
