@@ -45,13 +45,7 @@ export function buildServerProcessEnv(
     delete childEnv[key]
   }
 
-  delete childEnv.FRESHELL_DISABLE_WSL_PORT_FORWARD
-
   Object.assign(childEnv, env)
-
-  if (env.FRESHELL_DISABLE_WSL_PORT_FORWARD === undefined) {
-    childEnv.FRESHELL_DISABLE_WSL_PORT_FORWARD = '1'
-  }
 
   return childEnv
 }

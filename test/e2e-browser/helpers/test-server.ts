@@ -305,8 +305,8 @@ export class TestServer {
         NODE_ENV: 'production',
         FRESHELL_LOG_DIR: logsDir,
         HIDE_STARTUP_TOKEN: 'true',
-        // Force bind to 127.0.0.1 to skip WSL2 port forwarding (which
-        // requires a UAC prompt and blocks server startup for 60s).
+        // Keep the E2E server loopback-only so browser tests stay isolated to the
+        // local machine instead of exposing a LAN listener.
         FRESHELL_BIND_HOST: '127.0.0.1',
         ...this.options.env,
       }, homeDir, runtimeRootMode)
