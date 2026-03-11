@@ -156,6 +156,7 @@ import connectionReducer from '@/store/connectionSlice'
 import codingCliReducer from '@/store/codingCliSlice'
 import panesReducer from '@/store/panesSlice'
 import { networkReducer } from '@/store/networkSlice'
+import terminalDirectoryReducer from '@/store/terminalDirectorySlice'
 import type { Tab, AppSettings, ProjectGroup, BackgroundTerminal } from '@/store/types'
 
 // Import the mocked api to get access to the mocks
@@ -172,6 +173,10 @@ interface TestStoreState {
   tabs?: Partial<TabsState>
   settings?: Partial<SettingsState>
   sessions?: Partial<SessionsState>
+  terminalDirectory?: {
+    windows?: Record<string, any>
+    searches?: Record<string, any>
+  }
 }
 
 function createTestStore(state: TestStoreState = {}) {
@@ -184,6 +189,7 @@ function createTestStore(state: TestStoreState = {}) {
       codingCli: codingCliReducer,
       panes: panesReducer,
       network: networkReducer,
+      terminalDirectory: terminalDirectoryReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -214,6 +220,11 @@ function createTestStore(state: TestStoreState = {}) {
       panes: {
         layouts: {},
         activePane: {},
+      },
+      terminalDirectory: {
+        windows: {},
+        searches: {},
+        ...state.terminalDirectory,
       },
     },
   })
@@ -454,36 +465,26 @@ describe('Component Edge Cases', () => {
 
     describe('BackgroundSessions', () => {
       it('handles terminals with undefined lastActivityAt', () => {
-        const store = createTestStore()
-
-        // Simulate WebSocket message with incomplete terminal data
-        let messageHandler: ((msg: any) => void) | null = null
-        mockWsOnMessage.mockImplementation((handler) => {
-          messageHandler = handler
-          return () => {}
+        const store = createTestStore({
+          terminalDirectory: {
+            windows: {
+              background: {
+                items: [
+                  {
+                    terminalId: 'term-1',
+                    title: 'Test',
+                    createdAt: Date.now(),
+                    lastActivityAt: undefined,
+                    status: 'running',
+                    hasClients: false,
+                  },
+                ],
+              },
+            },
+          },
         })
 
         renderWithStore(<BackgroundSessions />, store)
-
-        // Trigger message with terminal missing lastActivityAt
-        act(() => {
-          if (messageHandler) {
-            messageHandler({
-              type: 'terminal.list.response',
-              requestId: expect.any(String),
-              terminals: [
-                {
-                  terminalId: 'term-1',
-                  title: 'Test',
-                  createdAt: Date.now(),
-                  lastActivityAt: undefined,
-                  status: 'running',
-                  hasClients: false,
-                },
-              ],
-            })
-          }
-        })
 
         // Component should handle undefined lastActivityAt gracefully
         expect(screen.queryByText(/undefined/)).not.toBeInTheDocument()
@@ -591,6 +592,49 @@ describe('Component Edge Cases', () => {
         // Should not show section headers when both arrays are empty
         expect(screen.queryByText('Running')).not.toBeInTheDocument()
         expect(screen.queryByText('Exited')).not.toBeInTheDocument()
+      })
+
+      it('refreshes when terminals.changed arrives', async () => {
+        vi.useRealTimers()
+        let messageHandler: ((msg: any) => void) | null = null
+        mockWsOnMessage.mockImplementation((handler) => {
+          messageHandler = handler
+          return () => {}
+        })
+        mockApiTyped.get
+          .mockResolvedValueOnce([{
+            terminalId: 'term-1',
+            title: 'Old Title',
+            createdAt: Date.now(),
+            lastActivityAt: Date.now(),
+            status: 'running',
+            hasClients: false,
+          }])
+          .mockResolvedValueOnce([{
+            terminalId: 'term-1',
+            title: 'New Title',
+            createdAt: Date.now(),
+            lastActivityAt: Date.now(),
+            status: 'running',
+            hasClients: false,
+          }])
+
+        const store = createTestStore()
+        renderWithStore(<OverviewView />, store)
+
+        await waitFor(() => {
+          expect(screen.getByText('Old Title')).toBeInTheDocument()
+        })
+
+        act(() => {
+          messageHandler?.({ type: 'terminals.changed', revision: 1 })
+        })
+
+        await waitFor(() => {
+          expect(screen.getByText('New Title')).toBeInTheDocument()
+        })
+
+        vi.useFakeTimers()
       })
     })
 
@@ -999,39 +1043,21 @@ describe('Component Edge Cases', () => {
     })
 
     describe('Sidebar', () => {
-      it('cleans up WebSocket subscription on unmount', () => {
-        const unsubscribe = vi.fn()
-        mockWsOnMessage.mockReturnValue(unsubscribe)
-
+      it('cleans up local timers on unmount without websocket ownership', () => {
         const store = createTestStore({
           tabs: { tabs: [], activeTabId: null },
         })
 
-        const { unmount } = renderWithStore(
-          <Sidebar view="terminal" onNavigate={() => {}} />,
-          store
-        )
-
-        unmount()
-
-        expect(unsubscribe).toHaveBeenCalled()
-      })
-
-      it('cleans up interval on unmount', () => {
         const clearIntervalSpy = vi.spyOn(window, 'clearInterval')
-
-        const store = createTestStore({
-          tabs: { tabs: [], activeTabId: null },
-        })
-
         const { unmount } = renderWithStore(
           <Sidebar view="terminal" onNavigate={() => {}} />,
-          store
+          store,
         )
 
         unmount()
 
         expect(clearIntervalSpy).toHaveBeenCalled()
+        expect(mockWsOnMessage).not.toHaveBeenCalled()
         clearIntervalSpy.mockRestore()
       })
     })
@@ -1074,9 +1100,7 @@ describe('Component Edge Cases', () => {
     })
 
     describe('BackgroundSessions', () => {
-      it('cleans up on unmount', () => {
-        const unsubscribe = vi.fn()
-        mockWsOnMessage.mockReturnValue(unsubscribe)
+      it('cleans up polling timers on unmount', () => {
         const clearIntervalSpy = vi.spyOn(window, 'clearInterval')
 
         const store = createTestStore()
@@ -1084,8 +1108,8 @@ describe('Component Edge Cases', () => {
 
         unmount()
 
-        expect(unsubscribe).toHaveBeenCalled()
         expect(clearIntervalSpy).toHaveBeenCalled()
+        expect(mockWsOnMessage).not.toHaveBeenCalled()
 
         clearIntervalSpy.mockRestore()
       })
@@ -1192,6 +1216,7 @@ describe('Component Edge Cases', () => {
   describe('8. Invalid data shapes from API', () => {
     describe('OverviewView', () => {
       it('handles null API response gracefully', async () => {
+        vi.useRealTimers()
         // Previously this would crash because items.filter() was called on null
         // Now the component uses (data ?? []) to handle null gracefully
         mockApiTyped.get.mockResolvedValueOnce(null)
@@ -1200,13 +1225,11 @@ describe('Component Edge Cases', () => {
 
         renderWithStore(<OverviewView />, store)
 
-        // Should not throw - component handles null gracefully
-        await act(async () => {
-          await vi.runAllTimersAsync()
+        await waitFor(() => {
+          expect(screen.getByText('No terminals tracked yet')).toBeInTheDocument()
         })
 
-        // Should show empty state since null is treated as empty array
-        expect(screen.getByText('No terminals tracked yet')).toBeInTheDocument()
+        vi.useFakeTimers()
       })
 
       it('handles terminals with invalid status', async () => {
@@ -1233,6 +1256,7 @@ describe('Component Edge Cases', () => {
       })
 
       it('handles terminal with string timestamp instead of number', async () => {
+        vi.useRealTimers()
         mockApiTyped.get.mockResolvedValueOnce([
           {
             terminalId: 'term-1',
@@ -1247,12 +1271,11 @@ describe('Component Edge Cases', () => {
         const store = createTestStore()
         renderWithStore(<OverviewView />, store)
 
-        await act(async () => {
-          await vi.runAllTimersAsync()
+        await waitFor(() => {
+          expect(screen.getByText('Test')).toBeInTheDocument()
         })
 
-        // formatTime and formatDuration will produce unexpected results but shouldn't crash
-        expect(screen.getByText('Test')).toBeInTheDocument()
+        vi.useFakeTimers()
       })
     })
 
@@ -1299,66 +1322,48 @@ describe('Component Edge Cases', () => {
     })
 
     describe('Sidebar', () => {
-      it('handles WebSocket message with missing terminals array', () => {
+      it('handles empty terminal directory state', () => {
         const store = createTestStore({
           tabs: { tabs: [], activeTabId: null },
-        })
-
-        let messageHandler: ((msg: any) => void) | null = null
-        mockWsOnMessage.mockImplementation((handler) => {
-          messageHandler = handler
-          return () => {}
+          terminalDirectory: {
+            windows: {
+              sidebar: {
+                items: [],
+              },
+            },
+          },
         })
 
         renderWithStore(<Sidebar view="terminal" onNavigate={() => {}} />, store)
 
-        // Send message with missing terminals
-        act(() => {
-          if (messageHandler) {
-            messageHandler({
-              type: 'terminal.list.response',
-              requestId: expect.any(String),
-              // terminals is missing
-            })
-          }
-        })
-
-        // Should handle gracefully (uses msg.terminals || [])
+        // Should handle empty state gracefully.
         expect(screen.getByLabelText('Hide sidebar')).toBeInTheDocument()
       })
     })
 
     describe('BackgroundSessions', () => {
-      it('handles terminal with null values', () => {
-        const store = createTestStore()
-
-        let messageHandler: ((msg: any) => void) | null = null
-        mockWsOnMessage.mockImplementation((handler) => {
-          messageHandler = handler
-          return () => {}
-        })
+      it('handles terminal entries with null-like values', () => {
+        const store = createTestStore({
+          terminalDirectory: {
+            windows: {
+              background: {
+                items: [
+                  {
+                    terminalId: 'term-1',
+                    title: null,
+                    createdAt: null,
+                    lastActivityAt: null,
+                    cwd: null,
+                    status: 'running',
+                    hasClients: false,
+                  },
+                ],
+              },
+            },
+          },
+        } as any)
 
         renderWithStore(<BackgroundSessions />, store)
-
-        act(() => {
-          if (messageHandler) {
-            messageHandler({
-              type: 'terminal.list.response',
-              requestId: expect.any(String),
-              terminals: [
-                {
-                  terminalId: 'term-1',
-                  title: null,
-                  createdAt: null,
-                  lastActivityAt: null,
-                  cwd: null,
-                  status: 'running',
-                  hasClients: false,
-                },
-              ],
-            })
-          }
-        })
 
         // Should handle null values gracefully
         expect(() => {}).not.toThrow()
@@ -1484,9 +1489,8 @@ describe('Component Edge Cases', () => {
           if (messageHandler) {
             for (let i = 0; i < 100; i++) {
               messageHandler({
-                type: 'terminal.list.response',
-                requestId: `req-${i}`,
-                terminals: [],
+                type: 'terminals.changed',
+                revision: i + 1,
               })
               messageHandler({ type: 'terminal.detached' })
               messageHandler({ type: 'terminal.attach.ready' })
@@ -1539,10 +1543,8 @@ describe('Component Edge Cases', () => {
     })
 
     describe('Memory leak prevention', () => {
-      it('properly cleans up all subscriptions on Sidebar unmount', () => {
-        const unsubscribe = vi.fn()
+      it('properly cleans up Sidebar timers without taking websocket ownership', () => {
         const clearIntervalFn = vi.fn()
-        mockWsOnMessage.mockReturnValue(unsubscribe)
         const originalClearInterval = window.clearInterval
         window.clearInterval = clearIntervalFn
 
@@ -1557,8 +1559,8 @@ describe('Component Edge Cases', () => {
 
         unmount()
 
-        expect(unsubscribe).toHaveBeenCalled()
         expect(clearIntervalFn).toHaveBeenCalled()
+        expect(mockWsOnMessage).not.toHaveBeenCalled()
 
         window.clearInterval = originalClearInterval
       })

@@ -113,6 +113,50 @@ describe('GET /api/session-directory', () => {
     expect(deleteSession).toHaveBeenCalled()
   })
 
+  it('broadcasts terminals.changed when a session rename cascades to a terminal title', async () => {
+    const broadcastTerminalsChanged = vi.fn()
+    const updateTitle = vi.fn()
+
+    app = express()
+    app.use(express.json())
+    app.use('/api', (req, res, next) => {
+      const token = req.headers['x-auth-token']
+      if (token !== TEST_AUTH_TOKEN) return res.status(401).json({ error: 'Unauthorized' })
+      next()
+    })
+
+    app.use('/api', createSessionsRouter({
+      configStore: {
+        patchSessionOverride,
+        deleteSession,
+      },
+      codingCliIndexer: {
+        getProjects: () => projects,
+        refresh: vi.fn().mockResolvedValue(undefined),
+      },
+      codingCliProviders: [],
+      perfConfig: { slowSessionRefreshMs: 500 },
+      terminalMetadata: {
+        list: () => [{ terminalId: 'term-1', provider: 'claude', sessionId: 'session-1' }],
+      },
+      registry: {
+        updateTitle,
+      },
+      wsHandler: {
+        broadcastTerminalsChanged,
+      } as any,
+    }))
+
+    const patch = await request(app)
+      .patch('/api/sessions/session-1?provider=claude')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({ titleOverride: 'Renamed session' })
+
+    expect(patch.status).toBe(200)
+    expect(updateTitle).toHaveBeenCalledWith('term-1', 'Renamed session')
+    expect(broadcastTerminalsChanged).toHaveBeenCalledOnce()
+  })
+
   it('routes directory reads through the requested visible-first lane', async () => {
     const schedule = vi.fn(async ({ lane, signal, run }: { lane: string; signal: AbortSignal; run: (signal: AbortSignal) => Promise<unknown> }) => {
       expect(signal).toBeInstanceOf(AbortSignal)

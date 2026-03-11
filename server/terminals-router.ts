@@ -40,6 +40,7 @@ export interface TerminalsRouterDeps {
   }
   wsHandler: {
     broadcast: (msg: any) => void
+    broadcastTerminalsChanged?: () => void
   }
   terminalMetadata?: { list: () => TerminalMeta[] }
   codingCliIndexer?: { refresh: () => Promise<void> }
@@ -266,14 +267,14 @@ export function createTerminalsRouter(deps: TerminalsRouterDeps): Router {
       }
     }
 
-    wsHandler.broadcast({ type: 'terminal.list.updated' })
+    wsHandler.broadcastTerminalsChanged?.()
     res.json(next)
   })
 
   router.delete('/:terminalId', async (req, res) => {
     const terminalId = req.params.terminalId
     await configStore.deleteTerminal(terminalId)
-    wsHandler.broadcast({ type: 'terminal.list.updated' })
+    wsHandler.broadcastTerminalsChanged?.()
     res.json({ ok: true })
   })
 

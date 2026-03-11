@@ -181,7 +181,7 @@ export function createAgentApiRouter({
         }
       }
 
-      wsHandler?.broadcast?.({ type: 'terminal.list.updated' })
+      wsHandler?.broadcastTerminalsChanged?.()
     } catch {
       // Pane rename is authoritative for orchestration; syncable terminal persistence is best-effort.
     }

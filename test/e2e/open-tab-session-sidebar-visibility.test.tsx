@@ -227,17 +227,6 @@ describe('open tab session sidebar visibility (e2e)', () => {
     wsMocks.isReady = false
     wsMocks.serverInstanceId = undefined
 
-    wsMocks.send.mockImplementation((msg: any) => {
-      if (msg.type !== 'terminal.list') return
-      queueMicrotask(() => {
-        broadcastWs({
-          type: 'terminal.list.response',
-          requestId: msg.requestId,
-          terminals: [],
-        })
-      })
-    })
-
     fetchSidebarSessionsSnapshot.mockReset()
     searchSessions.mockClear()
 

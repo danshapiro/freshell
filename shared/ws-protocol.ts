@@ -492,10 +492,6 @@ export type TerminalRuntimeUpdatedMessage = {
   pid?: number
 }
 
-export type TerminalListUpdatedMessage = {
-  type: 'terminal.list.updated'
-}
-
 export type TerminalMetaUpdatedMessage = z.infer<typeof TerminalMetaUpdatedSchema>
 
 export type CodexActivityListResponseMessage = z.infer<typeof CodexActivityListResponseSchema>
@@ -685,7 +681,6 @@ export type ServerMessage =
   | TerminalSessionAssociatedMessage
   | TerminalsChangedMessage
   | TerminalRuntimeUpdatedMessage
-  | TerminalListUpdatedMessage
   | TerminalMetaUpdatedMessage
   | CodexActivityListResponseMessage
   | CodexActivityUpdatedMessage

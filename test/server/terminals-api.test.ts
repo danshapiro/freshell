@@ -137,7 +137,13 @@ class FakeRegistry extends EventEmitter {
 }
 
 /** Create a minimal Express app with terminal routes for testing */
-function createTestApp(registry: FakeRegistry, wsHandler: { broadcast: ReturnType<typeof vi.fn> }): Express {
+function createTestApp(
+  registry: FakeRegistry,
+  wsHandler: {
+    broadcast: ReturnType<typeof vi.fn>
+    broadcastTerminalsChanged?: ReturnType<typeof vi.fn>
+  },
+): Express {
   const app = express()
   app.disable('x-powered-by')
   app.use(express.json())
@@ -156,7 +162,10 @@ describe('Terminals API', () => {
   const AUTH_TOKEN = 'test-auth-token-16chars'
   let app: Express
   let registry: FakeRegistry
-  let wsHandler: { broadcast: ReturnType<typeof vi.fn> }
+  let wsHandler: {
+    broadcast: ReturnType<typeof vi.fn>
+    broadcastTerminalsChanged: ReturnType<typeof vi.fn>
+  }
 
   beforeAll(() => {
     process.env.AUTH_TOKEN = AUTH_TOKEN
@@ -165,7 +174,10 @@ describe('Terminals API', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     registry = new FakeRegistry()
-    wsHandler = { broadcast: vi.fn() }
+    wsHandler = {
+      broadcast: vi.fn(),
+      broadcastTerminalsChanged: vi.fn(),
+    }
     app = createTestApp(registry, wsHandler)
 
     // Reset config store mock to default behavior
@@ -504,7 +516,7 @@ describe('Terminals API', () => {
       })
     })
 
-    it('broadcasts terminal.list.updated after successful patch', async () => {
+    it('broadcasts terminals.changed after successful patch', async () => {
       vi.mocked(configStore.patchTerminalOverride).mockResolvedValue({})
 
       await request(app)
@@ -513,7 +525,8 @@ describe('Terminals API', () => {
         .send({ titleOverride: 'Test' })
         .expect(200)
 
-      expect(wsHandler.broadcast).toHaveBeenCalledWith({ type: 'terminal.list.updated' })
+      expect(wsHandler.broadcastTerminalsChanged).toHaveBeenCalledOnce()
+      expect(wsHandler.broadcast).not.toHaveBeenCalled()
     })
 
     it('rejects non-boolean deleted field', async () => {
@@ -595,13 +608,14 @@ describe('Terminals API', () => {
       expect(response.body).toEqual({ ok: true })
     })
 
-    it('broadcasts terminal.list.updated after successful delete', async () => {
+    it('broadcasts terminals.changed after successful delete', async () => {
       await request(app)
         .delete('/api/terminals/term_123')
         .set('x-auth-token', AUTH_TOKEN)
         .expect(200)
 
-      expect(wsHandler.broadcast).toHaveBeenCalledWith({ type: 'terminal.list.updated' })
+      expect(wsHandler.broadcastTerminalsChanged).toHaveBeenCalledOnce()
+      expect(wsHandler.broadcast).not.toHaveBeenCalled()
     })
   })
 })

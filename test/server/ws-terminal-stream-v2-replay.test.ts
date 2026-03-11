@@ -542,7 +542,7 @@ describe('terminal stream v2 replay', () => {
       expect(replayed[i]?.seqStart).toBe(6 + i)
       expect(replayed[i]?.seqEnd).toBe(6 + i)
     }
-    expect(received.some((msg) => msg.type === 'terminal.list.updated')).toBe(false)
+    expect(received.some((msg) => msg.type === 'terminals.changed')).toBe(false)
 
     await close2()
   })

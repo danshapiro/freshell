@@ -9,7 +9,7 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
-import type { ProjectGroup, BackgroundTerminal } from '@/store/types'
+import type { ProjectGroup } from '@/store/types'
 
 // Mock react-window's List component
 vi.mock('react-window', () => ({
@@ -178,26 +178,8 @@ function createStore(options: {
   })
 }
 
-function renderSidebar(store: ReturnType<typeof createStore>, terminals: BackgroundTerminal[] = []) {
+function renderSidebar(store: ReturnType<typeof createStore>) {
   const onNavigate = vi.fn()
-  let messageCallback: ((msg: any) => void) | null = null
-
-  mockSend.mockImplementation((msg: any) => {
-    if (msg.type === 'terminal.list' && messageCallback) {
-      setTimeout(() => {
-        messageCallback!({
-          type: 'terminal.list.response',
-          requestId: msg.requestId,
-          terminals,
-        })
-      }, 0)
-    }
-  })
-
-  mockOnMessage.mockImplementation((callback: (msg: any) => void) => {
-    messageCallback = callback
-    return () => { messageCallback = null }
-  })
 
   const result = render(
     <Provider store={store}>

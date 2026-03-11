@@ -40,7 +40,7 @@ export interface SessionsRouterDeps {
   perfConfig: { slowSessionRefreshMs: number }
   terminalMetadata?: { list: () => TerminalMeta[] }
   registry?: { updateTitle: (id: string, title: string) => void }
-  wsHandler?: { broadcast: (msg: any) => void }
+  wsHandler?: { broadcastTerminalsChanged?: () => void }
   sessionMetadataStore?: SessionMetadataStore
   serverInstanceId?: string
   validCliProviders?: string[]
@@ -133,7 +133,7 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
         )
         if (cascadedTerminalId) {
           deps.registry?.updateTitle(cascadedTerminalId, cleanTitle)
-          deps.wsHandler?.broadcast({ type: 'terminal.list.updated' })
+          deps.wsHandler?.broadcastTerminalsChanged?.()
         }
       } catch (err) {
         log.warn({ err, compositeKey }, 'Cascade rename to terminal failed (non-fatal)')

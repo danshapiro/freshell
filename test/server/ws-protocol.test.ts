@@ -679,11 +679,11 @@ describe('ws protocol', () => {
 
     ws.send(JSON.stringify({ type: 'terminal.kill', terminalId }))
 
-    // Wait for list.updated broadcast
+    // Wait for directory invalidation broadcast
     await new Promise<void>((resolve) => {
       ws.on('message', (data) => {
         const msg = JSON.parse(data.toString())
-        if (msg.type === 'terminal.list.updated') resolve()
+        if (msg.type === 'terminals.changed') resolve()
       })
     })
 

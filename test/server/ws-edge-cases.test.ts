@@ -642,7 +642,7 @@ describe('WebSocket edge cases', () => {
 
       // Kill the terminal
       ws.send(JSON.stringify({ type: 'terminal.kill', terminalId }))
-      await waitForMessage(ws, (m) => m.type === 'terminal.list.updated')
+      await waitForMessage(ws, (m) => m.type === 'terminals.changed')
 
       // Try to send input to killed terminal
       ws.send(JSON.stringify({ type: 'terminal.input', terminalId, data: 'should fail' }))
@@ -1612,7 +1612,7 @@ describe('WebSocket edge cases', () => {
       clearInterval(floodInterval)
 
       // Wait for kill to process
-      await waitForMessage(ws, (m) => m.type === 'terminal.list.updated')
+      await waitForMessage(ws, (m) => m.type === 'terminals.changed')
 
       // Terminal should be killed
       expect(registry.killCalls).toContain(terminalId)
