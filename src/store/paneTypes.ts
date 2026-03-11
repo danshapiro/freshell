@@ -1,4 +1,4 @@
-import type { TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
+import type { TerminalStatus, TabMode, ShellType } from './types'
 import type { AgentChatProviderName } from '@/lib/agent-chat-types'
 import type { SessionLocator as SharedSessionLocator } from '@shared/ws-protocol'
 

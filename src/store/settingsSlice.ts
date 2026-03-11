@@ -1,5 +1,5 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
-import type { AppSettings, SidebarSortMode, CodingCliProviderName } from './types'
+import type { AppSettings, SidebarSortMode } from './types'
 import type { DeepPartial } from '@/lib/type-utils'
 import { normalizeTrimmedStringList } from '@shared/string-list'
 

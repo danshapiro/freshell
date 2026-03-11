@@ -13,14 +13,11 @@ import type { BackgroundTerminal, CodingCliProviderName } from '@/store/types'
 import { makeSelectSortedSessionItems, type SidebarSessionItem } from '@/store/selectors/sidebarSelectors'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { getActiveSessionRefForTab } from '@/lib/session-utils'
-import { createLogger } from '@/lib/client-logger'
 import { useStableArray } from '@/hooks/useStableArray'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { activateSessionSurface, fetchSessionWindow } from '@/store/sessionsThunks'
 import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
 
-
-const log = createLogger('Sidebar')
 const EMPTY_TERMINALS: BackgroundTerminal[] = []
 
 /** Compare two BackgroundTerminal arrays by sidebar-relevant fields only.
@@ -87,11 +84,6 @@ function formatRelativeTime(timestamp: number): string {
   if (hours < 24) return `${hours}h`
   if (days < 7) return `${days}d`
   return new Date(timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
-}
-
-function getProjectName(projectPath: string): string {
-  const parts = projectPath.replace(/\\/g, '/').split('/')
-  return parts[parts.length - 1] || projectPath
 }
 
 /** Structural equality for a single session item — returns true when all
@@ -415,7 +407,6 @@ export default function Sidebar({
     ? listHeight
     : Math.min(sortedItems.length * SESSION_ITEM_HEIGHT, SESSION_LIST_MAX_HEIGHT)
 
-  const loadMoreSeqRef = useRef(0)
   const loadMoreInFlightRef = useRef(false)
   const loadMoreTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const handleRowsRendered = useCallback(
