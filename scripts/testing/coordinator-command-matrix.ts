@@ -134,6 +134,11 @@ function classifyHelpOrVersion(commandKey: CommandKey, normalizedArgs: string[])
     return passthrough([vitestPhase(owner, [...ownerRunPrefix(owner), ...normalizedArgs])])
   }
 
+  const spec = SINGLE_PHASE_SPECS[commandKey]
+  if (spec.passthroughKind === 'passthrough') {
+    return passthrough([buildSinglePhasePassthroughPhase(commandKey, normalizedArgs)])
+  }
+
   return passthrough([buildSinglePhaseDelegatedPhase(commandKey, normalizedArgs)])
 }
 
@@ -183,7 +188,7 @@ function classifySinglePhaseCommand(commandKey: Exclude<CommandKey, 'test' | 'te
   const spec = SINGLE_PHASE_SPECS[commandKey]
 
   if (spec.passthroughKind === 'passthrough') {
-    return passthrough([vitestPhase(spec.owner, [...spec.broadArgs, ...args])])
+    return passthrough([buildSinglePhasePassthroughPhase(commandKey, args)])
   }
 
   if (hasWatchOrUi(args)) {
@@ -207,6 +212,24 @@ function classifySinglePhaseCommand(commandKey: Exclude<CommandKey, 'test' | 'te
   }
 
   return delegated([buildSinglePhaseDelegatedPhase(commandKey, args)])
+}
+
+function buildSinglePhasePassthroughPhase(
+  commandKey: Exclude<CommandKey, 'test' | 'test:all' | 'check' | 'verify'>,
+  args: string[],
+): UpstreamPhase {
+  const spec = SINGLE_PHASE_SPECS[commandKey]
+  const targetOwnership = classifyTargetOwnership(args)
+
+  if (targetOwnership === 'mixed') {
+    throw new Error('Mixed config ownership is not supported in a single passthrough phase.')
+  }
+
+  if (targetOwnership && targetOwnership !== spec.owner) {
+    return vitestPhase(targetOwnership, [...singlePhasePassthroughTargetBaseArgs(spec, targetOwnership), ...args])
+  }
+
+  return vitestPhase(spec.owner, [...spec.broadArgs, ...args])
 }
 
 function buildSinglePhaseDelegatedPhase(
@@ -367,6 +390,13 @@ function singlePhaseDelegatedBaseArgs(spec: SinglePhaseSpec): string[] {
 
 function singlePhaseTargetBaseArgs(spec: SinglePhaseSpec): string[] {
   return spec.delegatedArgs ? [...spec.delegatedArgs] : [...ownerRunPrefix(spec.owner)]
+}
+
+function singlePhasePassthroughTargetBaseArgs(spec: SinglePhaseSpec, owner: 'default' | 'server'): string[] {
+  if (owner === 'server') {
+    return ['--config', 'vitest.server.config.ts', ...spec.broadArgs]
+  }
+  return [...spec.broadArgs]
 }
 
 function coordinated(suiteKey: SuiteKey, phases: UpstreamPhase[]): CommandDisposition {

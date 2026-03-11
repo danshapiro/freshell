@@ -279,6 +279,24 @@ describe('classifyCommand()', () => {
       config: 'default',
       args: ['run', '--ui'],
     })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:watch',
+      forwardedArgs: ['test/server/ws-protocol.test.ts'],
+    }), {
+      kind: 'passthrough',
+      config: 'server',
+      args: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
+    })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:ui',
+      forwardedArgs: ['test/server/ws-protocol.test.ts'],
+    }), {
+      kind: 'passthrough',
+      config: 'server',
+      args: ['--config', 'vitest.server.config.ts', '--ui', 'test/server/ws-protocol.test.ts'],
+    })
   })
 
   it('delegates composite commands when forwarded Vitest flags narrow behavior without changing config ownership', () => {

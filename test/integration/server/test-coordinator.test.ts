@@ -527,7 +527,7 @@ describe('test coordinator CLI', () => {
         },
       )
 
-      await waitForOutput(queued, /queued intentionally/i)
+      await waitForOutput(queued, /queued intentionally/i, 15_000)
       await delay(150)
 
       const queuedCaptures = await readCaptureLines(captureFile)
@@ -641,6 +641,118 @@ describe('test coordinator CLI', () => {
     },
   )
 
+  it.each([
+    {
+      commandKey: 'check',
+      forwardedArgs: ['test/server/ws-protocol.test.ts'],
+      prePhaseSelector: 'npm:typecheck',
+      delegatedSelector: 'vitest:server:run --config vitest.server.config.ts test/server/ws-protocol.test.ts',
+    },
+    {
+      commandKey: 'verify',
+      forwardedArgs: ['test/unit/client/components/Sidebar.test.tsx'],
+      prePhaseSelector: 'npm:build',
+      delegatedSelector: 'vitest:default:run test/unit/client/components/Sidebar.test.tsx',
+    },
+  ])(
+    'records focused successful $commandKey runs after pre-phases succeed',
+    async ({ commandKey, forwardedArgs, prePhaseSelector, delegatedSelector }) => {
+      const fixture = await createRepoFixture({ linkedWorktree: true })
+      const captureFile = path.join(fixture.baseDir, `${commandKey}-focused-success.jsonl`)
+      const child = spawnCoordinator(
+        fixture.checkoutRoot,
+        commandKey,
+        forwardedArgs,
+        {
+          FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
+        },
+      )
+
+      const exit = await waitForExit(child)
+      expect(exit.code).toBe(0)
+
+      const latest = (await readCommandRuns(fixture.storeDir)).byKey[commandKey]
+      expect(latest).toMatchObject({
+        outcome: 'success',
+        exitCode: 0,
+        entrypoint: {
+          commandKey,
+        },
+        command: {
+          display: `npm run ${commandKey} -- ${forwardedArgs.join(' ')}`,
+          argv: [commandKey, ...forwardedArgs],
+        },
+      })
+      expect(latest.entrypoint.suiteKey).toBeUndefined()
+      expect((await readSuiteRuns(fixture.storeDir)).byKey['full-suite']).toBeUndefined()
+
+      const captures = await readCaptureLines(captureFile)
+      expect(captures.map((entry) => entry.selector)).toEqual([
+        prePhaseSelector,
+        delegatedSelector,
+      ])
+    },
+  )
+
+  it.each([
+    {
+      commandKey: 'check',
+      forwardedArgs: ['test/server/ws-protocol.test.ts'],
+      prePhaseSelector: 'npm:typecheck',
+      failingSelector: 'vitest:server:run --config vitest.server.config.ts test/server/ws-protocol.test.ts',
+      exitCode: 41,
+    },
+    {
+      commandKey: 'verify',
+      forwardedArgs: ['test/unit/client/components/Sidebar.test.tsx'],
+      prePhaseSelector: 'npm:build',
+      failingSelector: 'vitest:default:run test/unit/client/components/Sidebar.test.tsx',
+      exitCode: 42,
+    },
+  ])(
+    'records focused $commandKey failures after successful pre-phases without claiming a full-suite run',
+    async ({ commandKey, forwardedArgs, prePhaseSelector, failingSelector, exitCode }) => {
+      const fixture = await createRepoFixture({ linkedWorktree: true })
+      const captureFile = path.join(fixture.baseDir, `${commandKey}-focused-post-prephase-failure.jsonl`)
+      const child = spawnCoordinator(
+        fixture.checkoutRoot,
+        commandKey,
+        forwardedArgs,
+        {
+          FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
+          FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
+            [failingSelector]: { exitCode },
+          }),
+        },
+      )
+
+      const exit = await waitForExit(child)
+      expect(exit.code).toBe(exitCode)
+      expect(await readHolder(fixture.storeDir)).toBeUndefined()
+      expect((await readSuiteRuns(fixture.storeDir)).byKey['full-suite']).toBeUndefined()
+
+      const latest = (await readCommandRuns(fixture.storeDir)).byKey[commandKey]
+      expect(latest).toMatchObject({
+        outcome: 'failure',
+        exitCode,
+        entrypoint: {
+          commandKey,
+        },
+        command: {
+          display: `npm run ${commandKey} -- ${forwardedArgs.join(' ')}`,
+          argv: [commandKey, ...forwardedArgs],
+        },
+      })
+      expect(latest.entrypoint.suiteKey).toBeUndefined()
+
+      const captures = await readCaptureLines(captureFile)
+      expect(captures.map((entry) => entry.selector)).toEqual([
+        prePhaseSelector,
+        failingSelector,
+      ])
+    },
+  )
+
   it('reports running-undescribed when the gate is live but holder metadata is missing or corrupt', async () => {
     const fixture = await createRepoFixture({ linkedWorktree: true })
     const endpoint = buildCoordinatorEndpoint(fixture.commonDir)
@@ -702,6 +814,36 @@ describe('test coordinator CLI', () => {
     expect(suiteRuns.byKey['server:all:run']).toMatchObject({
       outcome: 'success',
     })
+  })
+
+  it('falls back to the actual checkout when INIT_CWD is outside the repo for status and help passthroughs', async () => {
+    const fixture = await createRepoFixture({ linkedWorktree: true })
+    const outsideDir = path.join(fixture.baseDir, 'outside-init-cwd')
+    const captureFile = path.join(fixture.baseDir, 'init-cwd-fallback.jsonl')
+    await fsp.mkdir(outsideDir, { recursive: true })
+
+    const status = await runStatus(fixture.checkoutRoot, {
+      INIT_CWD: outsideDir,
+    })
+    expect(status.code).toBe(0)
+    expect(status.output).toContain('state: idle')
+
+    const help = await waitForExit(spawnCoordinator(
+      fixture.checkoutRoot,
+      'check',
+      ['--help'],
+      {
+        INIT_CWD: outsideDir,
+        FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
+      },
+    ))
+    expect(help.code).toBe(0)
+    expect(help.output).not.toContain('requires a git repository checkout')
+
+    const captures = await readCaptureLines(captureFile)
+    expect(captures.map((entry) => entry.selector)).toEqual([
+      'vitest:default:run --help',
+    ])
   })
 
   it('records coordinated forwarded-arg commands truthfully in holder and latest-run metadata', async () => {

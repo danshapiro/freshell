@@ -107,14 +107,13 @@ async function runCommand(parsed: ParsedRunArgs): Promise<number> {
     return 1
   }
 
-  const repo = disposition.kind === 'coordinated' || parsed.commandKey === 'check' || parsed.commandKey === 'verify'
-    ? await resolveRepoContext()
-    : undefined
   const runtime = runtimeContext()
   const summary = summarizeCommand(parsed.commandKey, parsed.forwardedArgs, parsed.summary)
   const commandDisplay = publicCommandDisplay(parsed.commandKey, parsed.forwardedArgs)
+  const startedAt = new Date().toISOString()
 
   if (disposition.kind === 'coordinated') {
+    const repo = await resolveRepoContext()
     if (!repo) {
       throw new Error('A coordinated command could not resolve repo metadata.')
     }
@@ -133,6 +132,8 @@ async function runCommand(parsed: ParsedRunArgs): Promise<number> {
     return runCoordinatedCommand(coordinatedContext)
   }
 
+  const shouldPersistDelegatedResult = shouldPersistDelegatedCommandResult(parsed.commandKey, parsed.forwardedArgs)
+  const repo = shouldPersistDelegatedResult ? await resolveRepoContext() : undefined
   const prePhaseResult = await runPrePhasesIfNeeded({
     commandKey: parsed.commandKey,
     forwardedArgs: parsed.forwardedArgs,
@@ -141,13 +142,31 @@ async function runCommand(parsed: ParsedRunArgs): Promise<number> {
     repo,
     runtime,
     summary,
+    startedAt,
   })
   if (prePhaseResult !== undefined) {
     return prePhaseResult
   }
 
   if (disposition.kind === 'delegated' || disposition.kind === 'passthrough') {
-    return runPhases(disposition.phases)
+    const exitCode = await runPhases(disposition.phases)
+    if (repo) {
+      const refreshedRepo = await refreshRepoContext(repo).catch(() => repo)
+      await recordCommandResult(getCoordinatorStoreDir(refreshedRepo.commonDir), buildLatestRunRecord({
+        runId: randomUUID(),
+        commandKey: parsed.commandKey,
+        suiteKey: undefined,
+        summary,
+        commandDisplay,
+        forwardedArgs: parsed.forwardedArgs,
+        repo: refreshedRepo,
+        runtime,
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        exitCode,
+      }))
+    }
+    return exitCode
   }
   throw new Error('Unsupported coordinator disposition.')
 }
@@ -207,6 +226,7 @@ async function runPrePhasesIfNeeded(
     repo: RepoContext | undefined
     runtime: RuntimeContext
     summary: SummaryContext
+    startedAt: string
   },
 ): Promise<number | undefined> {
   if (hasHelpOrVersion(input.forwardedArgs)) {
@@ -232,7 +252,7 @@ async function runPrePhasesIfNeeded(
           forwardedArgs: input.forwardedArgs,
           repo: refreshedRepo,
           runtime: input.runtime,
-          startedAt: new Date().toISOString(),
+          startedAt: input.startedAt,
           finishedAt: new Date().toISOString(),
           exitCode,
         }))
@@ -304,6 +324,7 @@ async function runCoordinatedCommand(context: CoordinatedRunContext): Promise<nu
       repo: activeRepo,
       runtime: context.runtime,
       summary: context.summary,
+      startedAt,
     })
     if (prePhaseResult !== undefined) {
       return prePhaseResult
@@ -486,7 +507,7 @@ function buildReusableSuccessRecord(latest: LatestRunRecord): ReusableSuccessRec
 }
 
 async function resolveRepoContext(): Promise<RepoContext> {
-  const invocationCwd = resolveInvocationCwd(process.env) ?? process.cwd()
+  const invocationCwd = await resolveRepoInvocationCwd(process.env)
   const [checkoutRoot, repoRoot, commonDir, branchDirty] = await Promise.all([
     resolveGitCheckoutRoot(invocationCwd),
     resolveGitRepoRoot(invocationCwd),
@@ -508,6 +529,23 @@ async function resolveRepoContext(): Promise<RepoContext> {
     commit: await resolveGitCommit(checkoutRoot),
     isDirty: branchDirty.isDirty,
   }
+}
+
+async function resolveRepoInvocationCwd(envVars: NodeJS.ProcessEnv = process.env): Promise<string> {
+  const primary = resolveInvocationCwd(envVars)
+  const candidates = uniqueDefinedStrings([
+    primary,
+    envVars.PWD,
+    process.cwd(),
+  ])
+
+  for (const candidate of candidates) {
+    if (await resolveGitCommonDir(candidate)) {
+      return candidate
+    }
+  }
+
+  return primary ?? process.cwd()
 }
 
 async function refreshRepoContext(previous: RepoContext): Promise<RepoContext> {
@@ -569,6 +607,14 @@ function hasHelpOrVersion(args: string[]): boolean {
   return args.some((arg) => arg === '--help' || arg === '-h' || arg === '--version' || arg === '-v')
 }
 
+function shouldPersistDelegatedCommandResult(commandKey: CommandKey, forwardedArgs: string[]): boolean {
+  if (hasHelpOrVersion(forwardedArgs)) {
+    return false
+  }
+
+  return commandKey === 'check' || commandKey === 'verify'
+}
+
 function runtimeContext(): RuntimeContext {
   return {
     nodeVersion: process.version,
@@ -602,6 +648,10 @@ function safeUsername(): string | undefined {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function uniqueDefinedStrings(values: Array<string | undefined>): string[] {
+  return [...new Set(values.filter((value): value is string => typeof value === 'string' && value.length > 0))]
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
