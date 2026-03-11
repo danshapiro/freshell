@@ -123,7 +123,7 @@ class MockResizeObserver {
   unobserve = vi.fn()
 }
 
-function createStore(renderer: 'auto' | 'webgl' | 'canvas') {
+function createStore(renderer: 'auto' | 'webgl' | 'canvas', mode: TerminalPaneContent['mode'] = 'shell') {
   const tabId = 'tab-renderer'
   const paneId = 'pane-renderer'
   const terminalId = 'term-renderer'
@@ -132,7 +132,7 @@ function createStore(renderer: 'auto' | 'webgl' | 'canvas') {
     kind: 'terminal',
     createRequestId: 'req-renderer',
     status: 'running',
-    mode: 'shell',
+    mode,
     shell: 'system',
     terminalId,
   }
@@ -150,7 +150,7 @@ function createStore(renderer: 'auto' | 'webgl' | 'canvas') {
       tabs: {
         tabs: [{
           id: tabId,
-          mode: 'shell',
+          mode,
           status: 'running',
           title: 'Shell',
           terminalId,
@@ -222,6 +222,19 @@ describe('TerminalView renderer mode', () => {
 
     await waitFor(() => {
       expect(runtimeMockState.lastEnableWebgl).toBe(true)
+    })
+  })
+
+  it('auto mode keeps OpenCode on canvas by default', async () => {
+    const { store, tabId, paneId, paneContent } = createStore('auto', 'opencode')
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(runtimeMockState.lastEnableWebgl).toBe(false)
     })
   })
 

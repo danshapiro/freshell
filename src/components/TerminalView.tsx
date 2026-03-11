@@ -886,7 +886,11 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
       },
     })
     const rendererMode = settings.terminal.renderer ?? 'auto'
-    const enableWebgl = rendererMode === 'auto' || rendererMode === 'webgl'
+    // OpenCode paints a dense truecolor light surface that currently renders
+    // unreliably through xterm WebGL on Chrome/Windows. Keep auto mode on the
+    // safer canvas path for that provider unless the user explicitly forces WebGL.
+    const enableWebgl = rendererMode === 'webgl'
+      || (rendererMode === 'auto' && paneContent.mode !== 'opencode')
     let runtime = createNoopRuntime()
     try {
       runtime = createTerminalRuntime({ terminal: term, enableWebgl })
