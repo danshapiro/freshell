@@ -32,6 +32,12 @@ vi.mock('../../../server/wsl-port-forward.js', () => ({
     scriptKind: 'full',
     script: '$null # mock script',
   }),
+  computeWslPortForwardingPlanAsync: vi.fn().mockResolvedValue({
+    status: 'ready',
+    wslIp: '172.24.0.2',
+    scriptKind: 'full',
+    script: '$null # mock script',
+  }),
 }))
 vi.mock('node:child_process', async () => {
   const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process')
@@ -217,6 +223,12 @@ describe('Network API integration', () => {
       vi.mocked(isPortReachable).mockResolvedValueOnce(false)
 
       const wslModule = await import('../../../server/wsl-port-forward.js')
+      vi.mocked(wslModule.computeWslPortForwardingPlanAsync).mockResolvedValue({
+        status: 'ready',
+        wslIp: '172.24.0.2',
+        scriptKind: 'full',
+        script: '$null # mock script',
+      })
       const cp = await import('node:child_process')
 
       const res = await request(app)
@@ -230,19 +242,23 @@ describe('Network API integration', () => {
         body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
         confirmLabel: 'Continue',
       })
-      expect(wslModule.computeWslPortForwardingPlan).not.toHaveBeenCalled()
+      expect(wslModule.computeWslPortForwardingPlanAsync).toHaveBeenCalledTimes(1)
       expect(cp.execFile).not.toHaveBeenCalled()
     })
 
-    it('returns none for WSL2 on the first click when the port is already reachable', async () => {
+    it('returns none for WSL2 on the first click when the recomputed plan is already noop', async () => {
       vi.mocked(detectFirewall).mockResolvedValue({
         platform: 'wsl2',
         active: true,
       })
       networkManager.resetFirewallCache()
-      vi.mocked(isPortReachable).mockResolvedValueOnce(true)
+      vi.mocked(isPortReachable).mockResolvedValueOnce(false)
 
       const wslModule = await import('../../../server/wsl-port-forward.js')
+      vi.mocked(wslModule.computeWslPortForwardingPlanAsync).mockResolvedValue({
+        status: 'noop',
+        wslIp: '172.24.0.2',
+      })
       const cp = await import('node:child_process')
 
       const res = await request(app)
@@ -252,7 +268,7 @@ describe('Network API integration', () => {
 
       expect(res.status).toBe(200)
       expect(res.body).toEqual({ method: 'none', message: 'No configuration changes required' })
-      expect(wslModule.computeWslPortForwardingPlan).not.toHaveBeenCalled()
+      expect(wslModule.computeWslPortForwardingPlanAsync).toHaveBeenCalledTimes(1)
       expect(cp.execFile).not.toHaveBeenCalled()
     })
 
@@ -262,13 +278,22 @@ describe('Network API integration', () => {
         active: true,
       })
       networkManager.resetFirewallCache()
-      vi.mocked(isPortReachable).mockResolvedValueOnce(false)
+      vi.mocked(isPortReachable)
+        .mockResolvedValueOnce(false)
+        .mockResolvedValueOnce(false)
 
       const wslModule = await import('../../../server/wsl-port-forward.js')
-      vi.mocked(wslModule.computeWslPortForwardingPlan).mockReturnValue({
-        status: 'noop',
-        wslIp: '172.24.0.2',
-      })
+      vi.mocked(wslModule.computeWslPortForwardingPlanAsync)
+        .mockResolvedValueOnce({
+          status: 'ready',
+          wslIp: '172.24.0.2',
+          scriptKind: 'full',
+          script: '$null # mock script',
+        })
+        .mockResolvedValueOnce({
+          status: 'noop',
+          wslIp: '172.24.0.2',
+        })
 
       const cp = await import('node:child_process')
       const firstRes = await request(app)
@@ -286,7 +311,7 @@ describe('Network API integration', () => {
 
       expect(confirmedRes.status).toBe(200)
       expect(confirmedRes.body).toEqual({ method: 'none', message: 'No configuration changes required' })
-      expect(wslModule.computeWslPortForwardingPlan).toHaveBeenCalledTimes(1)
+      expect(wslModule.computeWslPortForwardingPlanAsync).toHaveBeenCalledTimes(2)
       expect(cp.execFile).not.toHaveBeenCalled()
     })
 
@@ -299,7 +324,7 @@ describe('Network API integration', () => {
       vi.mocked(isPortReachable).mockResolvedValueOnce(false)
 
       const wslModule = await import('../../../server/wsl-port-forward.js')
-      vi.mocked(wslModule.computeWslPortForwardingPlan).mockReturnValue({
+      vi.mocked(wslModule.computeWslPortForwardingPlanAsync).mockResolvedValue({
         status: 'ready',
         wslIp: '172.24.0.2',
         scriptKind: 'full',
@@ -320,6 +345,52 @@ describe('Network API integration', () => {
       expect(res.body).toEqual({ method: 'wsl2', status: 'started' })
 
       networkManager.setFirewallConfiguring(false)
+    })
+
+    it('returns none for WSL2 when remote access is disabled before confirmed repair', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+      vi.mocked(isPortReachable)
+        .mockResolvedValueOnce(false)
+        .mockResolvedValueOnce(false)
+
+      const wslModule = await import('../../../server/wsl-port-forward.js')
+      vi.mocked(wslModule.computeWslPortForwardingPlanAsync).mockResolvedValue({
+        status: 'ready',
+        wslIp: '172.24.0.2',
+        scriptKind: 'full',
+        script: '$null # mock script',
+      })
+
+      const cp = await import('node:child_process')
+
+      const firstRes = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(firstRes.status).toBe(200)
+      expect(firstRes.body.method).toBe('confirmation-required')
+
+      await configStore.patchSettings({
+        network: {
+          configured: true,
+          host: '127.0.0.1',
+        },
+      })
+
+      const confirmedRes = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({ confirmElevation: true })
+
+      expect(confirmedRes.status).toBe(200)
+      expect(confirmedRes.body).toEqual({ method: 'none', message: 'Remote access is not enabled' })
+      expect(wslModule.computeWslPortForwardingPlanAsync).toHaveBeenCalledTimes(1)
+      expect(cp.execFile).not.toHaveBeenCalled()
     })
 
     it('returns confirmation-required for native Windows until the caller confirms elevation', async () => {

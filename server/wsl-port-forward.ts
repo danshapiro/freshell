@@ -1,8 +1,10 @@
-import { execSync } from 'child_process'
+import { execFile, execSync } from 'child_process'
+import { promisify } from 'util'
 import { isWSL2 } from './platform.js'
 
 const IPV4_REGEX = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/
 const NETSH_PATH = '/mnt/c/Windows/System32/netsh.exe'
+const execFileAsync = promisify(execFile)
 
 export type PortProxyRule = {
   connectAddress: string
@@ -74,6 +76,38 @@ export function getWslIp(): string | null {
   }
 }
 
+async function getWslIpAsync(): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync('ip', ['-4', 'addr', 'show', 'eth0'], {
+      encoding: 'utf-8',
+      timeout: 5000,
+    })
+    const eth0Match = stdout.match(/inet\s+([\d.]+)/)
+    if (eth0Match && IPV4_REGEX.test(eth0Match[1])) {
+      return eth0Match[1]
+    }
+  } catch {
+    // eth0 not available, fall through to hostname -I
+  }
+
+  try {
+    const { stdout } = await execFileAsync('hostname', ['-I'], {
+      encoding: 'utf-8',
+      timeout: 5000,
+    })
+    const addresses = stdout.trim().split(/\s+/).filter(Boolean)
+
+    for (const addr of addresses) {
+      if (IPV4_REGEX.test(addr) && !addr.startsWith('172.17.')) {
+        return addr
+      }
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
 /**
  * Query existing Windows port proxy rules.
  * Returns a Map of listenPort -> { connectAddress, connectPort }.
@@ -85,6 +119,19 @@ export function getExistingPortProxyRules(): Map<number, PortProxyRule> {
       { encoding: 'utf-8', timeout: 10000 }
     )
     return parsePortProxyRules(output)
+  } catch {
+    return new Map()
+  }
+}
+
+async function getExistingPortProxyRulesAsync(): Promise<Map<number, PortProxyRule>> {
+  try {
+    const { stdout } = await execFileAsync(
+      NETSH_PATH,
+      ['interface', 'portproxy', 'show', 'v4tov4'],
+      { encoding: 'utf-8', timeout: 10000 }
+    )
+    return parsePortProxyRules(stdout)
   } catch {
     return new Map()
   }
@@ -121,6 +168,19 @@ export function getExistingFirewallPorts(): Set<number> {
       { encoding: 'utf-8', timeout: 10000 }
     )
     return parseFirewallRulePorts(output)
+  } catch {
+    return new Set()
+  }
+}
+
+async function getExistingFirewallPortsAsync(): Promise<Set<number>> {
+  try {
+    const { stdout } = await execFileAsync(
+      NETSH_PATH,
+      ['advfirewall', 'firewall', 'show', 'rule', 'name=FreshellLANAccess'],
+      { encoding: 'utf-8', timeout: 10000 }
+    )
+    return parseFirewallRulePorts(stdout)
   } catch {
     return new Set()
   }
@@ -222,22 +282,12 @@ function normalizeScriptForElevatedPowerShell(script: string): string {
   return script.replace(/\\\$/g, '$')
 }
 
-export function computeWslPortForwardingPlan(requiredPorts: number[]): WslPortForwardingPlan {
-  if (!isWSL2()) {
-    return { status: 'not-wsl2' }
-  }
-
-  const wslIp = getWslIp()
-  if (!wslIp) {
-    return {
-      status: 'error',
-      message: 'Failed to detect WSL2 IP address',
-    }
-  }
-
-  const existingRules = getExistingPortProxyRules()
-  const existingFirewallPorts = getExistingFirewallPorts()
-
+function buildWslPortForwardingPlan(
+  requiredPorts: number[],
+  wslIp: string,
+  existingRules: Map<number, PortProxyRule>,
+  existingFirewallPorts: Set<number>,
+): WslPortForwardingPlan {
   const portsNeedUpdate = needsPortForwardingUpdate(wslIp, requiredPorts, existingRules)
   const firewallNeedsUpdate = needsFirewallUpdate(requiredPorts, existingFirewallPorts)
 
@@ -259,4 +309,44 @@ export function computeWslPortForwardingPlan(requiredPorts: number[]): WslPortFo
     scriptKind,
     script: normalizeScriptForElevatedPowerShell(script),
   }
+}
+
+export function computeWslPortForwardingPlan(requiredPorts: number[]): WslPortForwardingPlan {
+  if (!isWSL2()) {
+    return { status: 'not-wsl2' }
+  }
+
+  const wslIp = getWslIp()
+  if (!wslIp) {
+    return {
+      status: 'error',
+      message: 'Failed to detect WSL2 IP address',
+    }
+  }
+
+  const existingRules = getExistingPortProxyRules()
+  const existingFirewallPorts = getExistingFirewallPorts()
+
+  return buildWslPortForwardingPlan(requiredPorts, wslIp, existingRules, existingFirewallPorts)
+}
+
+export async function computeWslPortForwardingPlanAsync(requiredPorts: number[]): Promise<WslPortForwardingPlan> {
+  if (!isWSL2()) {
+    return { status: 'not-wsl2' }
+  }
+
+  const wslIp = await getWslIpAsync()
+  if (!wslIp) {
+    return {
+      status: 'error',
+      message: 'Failed to detect WSL2 IP address',
+    }
+  }
+
+  const [existingRules, existingFirewallPorts] = await Promise.all([
+    getExistingPortProxyRulesAsync(),
+    getExistingFirewallPortsAsync(),
+  ])
+
+  return buildWslPortForwardingPlan(requiredPorts, wslIp, existingRules, existingFirewallPorts)
 }

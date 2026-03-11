@@ -2,7 +2,7 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { spawnElevatedPowerShell } from './elevated-powershell.js'
 import { logger } from './logger.js'
-import { computeWslPortForwardingPlan } from './wsl-port-forward.js'
+import { computeWslPortForwardingPlanAsync } from './wsl-port-forward.js'
 
 const log = logger.child({ component: 'network-router' })
 
@@ -31,6 +31,17 @@ const REMOTE_ACCESS_DISABLED = {
   method: 'none',
   message: 'Remote access is not enabled',
 } as const
+
+function isRemoteAccessEnabled(
+  settings: { network?: { host?: string; configured?: boolean } },
+  effectiveHost: '127.0.0.1' | '0.0.0.0',
+): boolean {
+  if (settings.network?.host === '0.0.0.0') {
+    return true
+  }
+
+  return settings.network?.configured !== true && effectiveHost === '0.0.0.0'
+}
 
 export interface NetworkRouterDeps {
   networkManager: {
@@ -127,7 +138,10 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
     }
 
     try {
-      const status = await networkManager.getStatus()
+      const [status, settings] = await Promise.all([
+        networkManager.getStatus(),
+        configStore.getSettings(),
+      ])
       const confirmElevation = parsed.data.confirmElevation === true
 
       // In-flight guard: prevent concurrent elevated firewall processes
@@ -138,7 +152,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
         })
       }
 
-      if (status.host !== '0.0.0.0') {
+      if (!isRemoteAccessEnabled(settings, status.host)) {
         return res.json(REMOTE_ACCESS_DISABLED)
       }
 
@@ -149,11 +163,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
           return res.json(NO_CONFIGURATION_CHANGES_REQUIRED)
         }
 
-        if (!confirmElevation) {
-          return res.json(WINDOWS_ELEVATION_CONFIRMATION)
-        }
-
-        const plan = computeWslPortForwardingPlan(networkManager.getRelevantPorts())
+        const plan = await computeWslPortForwardingPlanAsync(networkManager.getRelevantPorts())
 
         if (plan.status === 'error') {
           log.error({ message: plan.message }, 'WSL2 port forwarding setup error')
@@ -162,6 +172,10 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
 
         if (plan.status === 'not-wsl2' || plan.status === 'noop') {
           return res.json(NO_CONFIGURATION_CHANGES_REQUIRED)
+        }
+
+        if (!confirmElevation) {
+          return res.json(WINDOWS_ELEVATION_CONFIRMATION)
         }
 
         try {
