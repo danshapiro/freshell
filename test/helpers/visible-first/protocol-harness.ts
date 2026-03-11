@@ -2,6 +2,7 @@ import http from 'node:http'
 import WebSocket from 'ws'
 import { WsHandler } from '../../../server/ws-handler'
 import { WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol'
+import { inspectVisibleFirstTranscript } from './acceptance-contract'
 
 type ProtocolHarnessOptions = {
   authToken?: string
@@ -14,21 +15,6 @@ type ProtocolHarnessOptions = {
 }
 
 type ProtocolMessage = Record<string, unknown>
-
-const DEFAULT_FORBIDDEN_TYPES = [
-  'sessions.updated',
-  'sessions.page',
-  'sessions.patch',
-  'sessions.fetch',
-  'sdk.history',
-  'terminal.list',
-  'terminal.list.response',
-  'terminal.list.updated',
-  'terminal.meta.list',
-  'terminal.meta.list.response',
-  'sessionsPatchV1',
-  'sessionsPaginationV1',
-]
 
 function listen(server: http.Server, timeoutMs = 5_000): Promise<{ port: number }> {
   return new Promise((resolve, reject) => {
@@ -254,6 +240,8 @@ export async function createProtocolHarness(options: ProtocolHarnessOptions = {}
       const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
       const rawTranscript: string[] = []
       const transcript: ProtocolMessage[] = []
+      const rawOutboundTranscript: string[] = []
+      const outboundTranscript: ProtocolMessage[] = []
       openClients.add(ws)
 
       ws.on('message', (data) => {
@@ -266,16 +254,21 @@ export async function createProtocolHarness(options: ProtocolHarnessOptions = {}
 
       return {
         send(message: unknown) {
+          rawOutboundTranscript.push(JSON.stringify(message))
+          outboundTranscript.push(message as ProtocolMessage)
           ws.send(JSON.stringify(message))
         },
 
         async sendHello(overrides: Partial<ProtocolMessage> = {}) {
-          ws.send(JSON.stringify({
+          const message = {
             type: 'hello',
             token: authToken,
             protocolVersion: WS_PROTOCOL_VERSION,
             ...overrides,
-          }))
+          }
+          rawOutboundTranscript.push(JSON.stringify(message))
+          outboundTranscript.push(message as ProtocolMessage)
+          ws.send(JSON.stringify(message))
         },
 
         waitForMessage: (predicate: (message: ProtocolMessage) => boolean, timeoutMs?: number) =>
@@ -291,10 +284,18 @@ export async function createProtocolHarness(options: ProtocolHarnessOptions = {}
           return rawTranscript.slice()
         },
 
-        assertNoLegacyMessages(forbiddenTypes = DEFAULT_FORBIDDEN_TYPES): void {
-          const offenders = transcript
-            .map((message) => message.type)
-            .filter((type): type is string => typeof type === 'string' && forbiddenTypes.includes(type))
+        getCapturedTranscript() {
+          return {
+            inboundMessages: transcript.slice(),
+            outboundMessages: outboundTranscript.slice(),
+          }
+        },
+
+        assertNoLegacyMessages(): void {
+          const offenders = inspectVisibleFirstTranscript({
+            inboundMessages: transcript,
+            outboundMessages: outboundTranscript,
+          }).forbiddenTypes
 
           if (offenders.length > 0) {
             throw new Error(`Forbidden websocket message types observed: ${offenders.join(', ')}`)

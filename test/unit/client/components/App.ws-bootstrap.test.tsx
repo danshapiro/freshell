@@ -231,6 +231,21 @@ describe('App WS bootstrap recovery', () => {
     expect(wsMocks.connect).not.toHaveBeenCalled()
   })
 
+  it('owns websocket startup by connecting after a successful bootstrap when no socket is preconnected', async () => {
+    const store = createStore()
+    wsMocks.connect.mockResolvedValueOnce(undefined)
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.connect).toHaveBeenCalledTimes(1)
+    })
+  })
+
   it('clears stale codex activity immediately when bootstrap attaches to an already-ready socket', async () => {
     const store = createStore({
       codexActivity: {

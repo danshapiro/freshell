@@ -42,6 +42,7 @@
     "test:unit": "vitest run test/unit",
     "test:integration": "vitest run --config vitest.server.config.ts test/server",
     "test:client": "vitest run test/unit/client",
+    "test:visible-first:contract": "vitest run test/unit/visible-first/acceptance-contract.test.ts test/unit/visible-first/protocol-harness.test.ts test/unit/lib/visible-first-acceptance-report.test.ts",
     "test:all": "npm test",
     "smoke:browser-use": "python3 test/browser_use/smoke_freshell.py",
     "prepare:icons": "node assets/icons/prepare-icons.mjs",
@@ -55,6 +56,7 @@
     "test:e2e:helpers": "vitest run --config test/e2e-browser/vitest.config.ts",
     "test:e2e:electron": "playwright test --config test/e2e-electron/playwright.electron.config.ts",
     "perf:audit:visible-first": "PORT=3311 npm run build && tsx scripts/visible-first-audit.ts",
+    "visible-first:contract:check": "tsx scripts/assert-visible-first-acceptance.ts",
     "perf:audit:compare": "tsx scripts/compare-visible-first-audit.ts",
     "perf:audit:gate": "tsx scripts/assert-visible-first-audit-gate.ts"
   },

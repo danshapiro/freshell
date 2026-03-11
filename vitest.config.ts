@@ -28,7 +28,6 @@ export default defineConfig({
       'test/server/**',
       'test/unit/server/**',
       'test/integration/server/**',
-      'test/unit/visible-first/protocol-harness.test.ts',
       'test/unit/visible-first/read-model-route-harness.test.ts',
       'test/unit/visible-first/terminal-mirror-fixture.test.ts',
       'test/unit/visible-first/cli-command-harness.test.ts',
