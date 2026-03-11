@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import { MAX_BOOTSTRAP_PAYLOAD_BYTES, type BootstrapPayload } from '../shared/read-models.js'
+import { setResponsePerfContext } from './request-logger.js'
 import { createRequestAbortSignal } from './read-models/request-abort.js'
 import {
   defaultReadModelScheduler,
@@ -83,6 +84,10 @@ export function createShellBootstrapRouter(deps: ShellBootstrapRouterDeps): Rout
         return
       }
 
+      setResponsePerfContext(res, {
+        readModelLane: 'critical',
+        responsePayloadBytes: payloadBytes,
+      })
       res.json(payload)
     } catch (error) {
       if (signal.aborted || isReadModelAbortError(error)) {

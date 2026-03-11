@@ -86,6 +86,10 @@ describe('requestLogger', () => {
       ip: '127.0.0.1',
     }
     const res = new FakeResponse()
+    ;(res as any).locals = {
+      readModelLane: 'visible',
+      responsePayloadBytes: 4321,
+    }
 
     await new Promise<void>((resolve) => {
       requestLogger(req, res as any, () => resolve())
@@ -99,6 +103,8 @@ describe('requestLogger', () => {
         method: 'GET',
         path: '/api/test',
         statusCode: 200,
+        lane: 'visible',
+        payloadBytes: 4321,
       }),
       'warn',
     )
@@ -124,4 +130,3 @@ describe('requestLogger', () => {
     expect(mockState.logPerfEvent).not.toHaveBeenCalled()
   })
 })
-

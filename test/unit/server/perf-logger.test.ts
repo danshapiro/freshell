@@ -21,6 +21,7 @@ import {
   isPerfLoggingEnabled,
   getPerfConfig,
   logPerfEvent,
+  logTerminalStreamPerfEvent,
   startPerfTimer,
 } from '../../../server/perf-logger'
 
@@ -90,5 +91,22 @@ describe('perf logger config', () => {
     expect(debugEntries[0].event).toBe('session_refresh')
     expect(debugEntries[0].perfSeverity).toBe('warn')
     expect(typeof debugEntries[0].durationMs).toBe('number')
+  })
+
+  it('preserves queue depth and dropped-byte fields on terminal stream perf events', () => {
+    getPerfConfig().enabled = true
+    logTerminalStreamPerfEvent('terminal_stream_queue_pressure', {
+      terminalId: 'term-1',
+      queueDepth: 12,
+      droppedBytes: 4096,
+    }, 'warn')
+
+    expect(debugEntries[0]).toMatchObject({
+      event: 'terminal_stream_queue_pressure',
+      terminalId: 'term-1',
+      queueDepth: 12,
+      droppedBytes: 4096,
+      perfSeverity: 'warn',
+    })
   })
 })

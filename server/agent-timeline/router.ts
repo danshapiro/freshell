@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { AgentTimelinePageQuerySchema } from '../../shared/read-models.js'
 import type { AgentTimelineService } from './service.js'
 import { createRequestAbortSignal } from '../read-models/request-abort.js'
+import { setResponsePerfContext } from '../request-logger.js'
 import {
   defaultReadModelScheduler,
   isReadModelAbortError,
@@ -49,6 +50,10 @@ export function createAgentTimelineRouter(deps: AgentTimelineRouterDeps): Router
           ...query.data,
           signal: scheduledSignal,
         }),
+      })
+      setResponsePerfContext(res, {
+        readModelLane: query.data.priority ?? 'visible',
+        responsePayloadBytes: Buffer.byteLength(JSON.stringify(page), 'utf8'),
       })
       res.json(page)
     } catch (error) {

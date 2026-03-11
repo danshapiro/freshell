@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { cleanString } from './utils.js'
 import { logger } from './logger.js'
+import { setResponsePerfContext } from './request-logger.js'
 import { cascadeTerminalRenameToSession } from './rename-cascade.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
 import {
@@ -64,6 +65,10 @@ export function createTerminalsRouter(deps: TerminalsRouterDeps): Router {
 
     if (!hasReadModelQuery) {
       const terminals = await terminalViewService.listTerminalDirectory()
+      setResponsePerfContext(res, {
+        readModelLane: 'visible',
+        responsePayloadBytes: Buffer.byteLength(JSON.stringify(terminals), 'utf8'),
+      })
       return res.json(terminals)
     }
 
@@ -88,6 +93,10 @@ export function createTerminalsRouter(deps: TerminalsRouterDeps): Router {
           ...parsed.data,
           signal: scheduledSignal,
         }),
+      })
+      setResponsePerfContext(res, {
+        readModelLane: parsed.data.priority,
+        responsePayloadBytes: Buffer.byteLength(JSON.stringify(page), 'utf8'),
       })
       return res.json(page)
     } catch (error) {
@@ -128,6 +137,10 @@ export function createTerminalsRouter(deps: TerminalsRouterDeps): Router {
       return res.status(404).json({ error: 'Terminal not found' })
     }
 
+    setResponsePerfContext(res, {
+      readModelLane: 'critical',
+      responsePayloadBytes: Buffer.byteLength(JSON.stringify(snapshot), 'utf8'),
+    })
     res.json(snapshot)
   })
 
@@ -178,6 +191,10 @@ export function createTerminalsRouter(deps: TerminalsRouterDeps): Router {
       return res.status(404).json({ error: 'Terminal not found' })
     }
 
+    setResponsePerfContext(res, {
+      readModelLane: 'background',
+      responsePayloadBytes: Buffer.byteLength(JSON.stringify(page), 'utf8'),
+    })
     res.json(page)
   })
 
@@ -232,6 +249,10 @@ export function createTerminalsRouter(deps: TerminalsRouterDeps): Router {
       return res.status(404).json({ error: 'Terminal not found' })
     }
 
+    setResponsePerfContext(res, {
+      readModelLane: 'visible',
+      responsePayloadBytes: Buffer.byteLength(JSON.stringify(page), 'utf8'),
+    })
     res.json(page)
   })
 

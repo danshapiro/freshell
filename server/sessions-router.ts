@@ -4,6 +4,7 @@ import { cleanString } from './utils.js'
 import { makeSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
 import { CodingCliProviderSchema } from '../shared/ws-protocol.js'
 import { logger } from './logger.js'
+import { setResponsePerfContext } from './request-logger.js'
 import { cascadeSessionRenameToTerminal } from './rename-cascade.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
 import type { SessionMetadataStore } from './session-metadata-store.js'
@@ -85,6 +86,10 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
           terminalMeta: deps.terminalMetadata?.list() ?? [],
           signal: scheduledSignal,
         }),
+      })
+      setResponsePerfContext(res, {
+        readModelLane: parsed.data.priority,
+        responsePayloadBytes: Buffer.byteLength(JSON.stringify(page), 'utf8'),
       })
       res.json(page)
     } catch (error) {

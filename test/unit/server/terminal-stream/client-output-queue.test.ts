@@ -75,4 +75,16 @@ describe('ClientOutputQueue', () => {
       data: '45',
     })
   })
+
+  it('tracks queue depth and dropped bytes for overflow logging', () => {
+    const queue = new ClientOutputQueue(2)
+    queue.enqueue(frame(1, '1'))
+    queue.enqueue(frame(2, '2'))
+    queue.enqueue(frame(3, '3'))
+
+    expect(queue.pendingFrames()).toBe(2)
+    expect(queue.peekDroppedBytes()).toBe(1)
+    expect(queue.consumeDroppedBytes()).toBe(1)
+    expect(queue.peekDroppedBytes()).toBe(0)
+  })
 })

@@ -422,12 +422,18 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     expect(perfSpy.mock.calls.some(([event, payload, level]) =>
       event === 'terminal_stream_queue_pressure' &&
       payload?.terminalId === 'term-overflow' &&
+      typeof payload?.queueDepth === 'number' &&
+      payload.queueDepth > 0 &&
+      typeof payload?.droppedBytes === 'number' &&
+      payload.droppedBytes > 0 &&
       level === 'warn',
     )).toBe(true)
     expect(perfSpy.mock.calls.some(([event, payload, level]) =>
       event === 'terminal_stream_gap' &&
       payload?.terminalId === 'term-overflow' &&
       payload?.reason === 'queue_overflow' &&
+      typeof payload?.droppedBytes === 'number' &&
+      payload.droppedBytes > 0 &&
       level === 'warn',
     )).toBe(true)
 
