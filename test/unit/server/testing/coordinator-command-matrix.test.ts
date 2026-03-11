@@ -281,6 +281,26 @@ describe('classifyCommand()', () => {
     })
   })
 
+  it('delegates composite commands when forwarded Vitest flags narrow behavior without changing config ownership', () => {
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['--changed'],
+    }), {
+      kind: 'delegated',
+      config: 'default',
+      args: ['run', '--changed'],
+    })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['--bail=1'],
+    }), {
+      kind: 'delegated',
+      config: 'default',
+      args: ['run', '--bail=1'],
+    })
+  })
+
   it('bypasses coordination for help and version flags', () => {
     expectSinglePhase(classifyCommand({
       commandKey: 'test',
@@ -357,6 +377,26 @@ describe('classifyCommand()', () => {
       expect(singlePhase.reason).toContain('test:vitest')
     }
 
+    const shortForm = classifyCommand({
+      commandKey: 'test',
+      forwardedArgs: ['-c', 'vitest.server.config.ts'],
+    })
+    expect(shortForm).toMatchObject({
+      kind: 'rejected',
+    })
+    if (shortForm.kind === 'rejected') {
+      expect(shortForm.reason).toContain('--config')
+      expect(shortForm.reason).toContain('test:vitest')
+    }
+
+    const shortFormEquals = classifyCommand({
+      commandKey: 'test:unit',
+      forwardedArgs: ['-c=vitest.server.config.ts'],
+    })
+    expect(shortFormEquals).toMatchObject({
+      kind: 'rejected',
+    })
+
     expectSinglePhase(classifyCommand({
       commandKey: 'test:vitest',
       forwardedArgs: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
@@ -364,6 +404,15 @@ describe('classifyCommand()', () => {
       kind: 'passthrough',
       config: 'default',
       args: ['--config', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
+    })
+
+    expectSinglePhase(classifyCommand({
+      commandKey: 'test:vitest',
+      forwardedArgs: ['-c', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
+    }), {
+      kind: 'passthrough',
+      config: 'default',
+      args: ['-c', 'vitest.server.config.ts', 'test/server/ws-protocol.test.ts'],
     })
   })
 

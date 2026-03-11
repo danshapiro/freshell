@@ -96,7 +96,7 @@ const SINGLE_PHASE_SPECS: Record<Exclude<CommandKey, 'test' | 'test:all' | 'chec
   },
 }
 
-const TARGET_VALUE_FLAGS = new Set(['-t', '--testNamePattern', '--reporter', '--config'])
+const TARGET_VALUE_FLAGS = new Set(['-t', '--testNamePattern', '--reporter', '--config', '-c'])
 
 export function classifyCommand(input: CoordinatorInput): CommandDisposition {
   const normalizedArgs = stripLeadingArgSeparator(input.forwardedArgs)
@@ -166,7 +166,7 @@ function classifyCompositeCommand(commandKey: CommandKey, args: string[]): Comma
     ])
   }
 
-  if (hasWatchOrUi(filteredArgs) || hasNamePattern(filteredArgs)) {
+  if (filteredArgs.length > 0) {
     return delegated([
       vitestPhase('default', ['run', ...filteredArgs]),
     ])
@@ -254,7 +254,12 @@ function hasReporter(args: string[]): boolean {
 }
 
 function hasExplicitConfigOverride(args: string[]): boolean {
-  return args.some((arg) => arg === '--config' || arg.startsWith('--config='))
+  return args.some((arg) => (
+    arg === '--config'
+    || arg.startsWith('--config=')
+    || arg === '-c'
+    || arg.startsWith('-c=')
+  ))
 }
 
 function isExplicitBroadServerRun(args: string[]): boolean {
@@ -299,6 +304,7 @@ function extractTargets(args: string[]): string[] {
       arg.startsWith('--testNamePattern=')
       || arg.startsWith('--reporter=')
       || arg.startsWith('--config=')
+      || arg.startsWith('-c=')
     ) {
       continue
     }

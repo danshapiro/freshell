@@ -107,9 +107,6 @@ export async function tryListen(endpoint: CoordinatorEndpoint): Promise<Listenin
     server,
     close: async () => {
       await closeServer(server)
-      if (endpoint.kind === 'unix') {
-        await fsp.rm(endpoint.address, { force: true }).catch(() => {})
-      }
     },
   }
 }

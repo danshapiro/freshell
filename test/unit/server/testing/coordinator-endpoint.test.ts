@@ -118,4 +118,40 @@ describe('tryListen()', () => {
 
     await closeHandle(handle)
   })
+
+  it('does not unlink a rebound unix socket during holder handoff', async () => {
+    const commonDir = path.join(tempDir, 'repo', '.git')
+    const endpoint = buildCoordinatorEndpoint(commonDir, 'linux', [tempDir])
+
+    const firstHolder = await tryListen(endpoint)
+    expect(firstHolder.kind).toBe('listening')
+    if (firstHolder.kind !== 'listening') {
+      return
+    }
+
+    let secondHolder: Awaited<ReturnType<typeof tryListen>> | undefined
+    const originalClose = firstHolder.server.close.bind(firstHolder.server)
+    firstHolder.server.close = ((callback?: (error?: Error) => void) => {
+      return originalClose(async (error) => {
+        if (error) {
+          callback?.(error)
+          return
+        }
+
+        secondHolder = await tryListen(endpoint)
+        callback?.()
+      })
+    }) as typeof firstHolder.server.close
+
+    await firstHolder.close()
+
+    expect(secondHolder).toBeDefined()
+    expect(secondHolder).toMatchObject({ kind: 'listening' })
+    await expect(fsp.stat(endpoint.address)).resolves.toBeDefined()
+
+    const contender = await tryListen(endpoint)
+    expect(contender).toEqual({ kind: 'busy' })
+
+    await closeHandle(secondHolder!)
+  })
 })
