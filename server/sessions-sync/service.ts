@@ -2,7 +2,7 @@ import type { ProjectGroup } from '../coding-cli/types.js'
 import { diffProjects } from './diff.js'
 
 type SessionsSyncWs = {
-  broadcastSessionsChanged: (msg: { type: 'sessions.changed'; revision: number }) => void
+  broadcastSessionsChanged: (revision: number) => void
 }
 
 type SessionsSyncOptions = { coalesceMs?: number }
@@ -60,10 +60,7 @@ export class SessionsSyncService {
       return
     }
     this.revision += 1
-    this.ws.broadcastSessionsChanged({
-      type: 'sessions.changed',
-      revision: this.revision,
-    })
+    this.ws.broadcastSessionsChanged(this.revision)
   }
 
   private onWindowElapsed = () => {

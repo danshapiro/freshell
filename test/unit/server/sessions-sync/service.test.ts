@@ -29,10 +29,7 @@ describe('SessionsSyncService', () => {
     svc.publish(a)
 
     expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(1)
-    expect(ws.broadcastSessionsChanged).toHaveBeenLastCalledWith({
-      type: 'sessions.changed',
-      revision: 1,
-    })
+    expect(ws.broadcastSessionsChanged).toHaveBeenLastCalledWith(1)
 
     vi.advanceTimersByTime(151)
     expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(1)
@@ -54,10 +51,7 @@ describe('SessionsSyncService', () => {
     expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(1)
     vi.advanceTimersByTime(150)
     expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(2)
-    expect(ws.broadcastSessionsChanged).toHaveBeenLastCalledWith({
-      type: 'sessions.changed',
-      revision: 2,
-    })
+    expect(ws.broadcastSessionsChanged).toHaveBeenLastCalledWith(2)
   })
 
   it('emits one trailing publish per window while burst updates continue', () => {
@@ -79,10 +73,7 @@ describe('SessionsSyncService', () => {
     vi.advanceTimersByTime(150)
 
     expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(3)
-    expect(ws.broadcastSessionsChanged).toHaveBeenLastCalledWith({
-      type: 'sessions.changed',
-      revision: 3,
-    })
+    expect(ws.broadcastSessionsChanged).toHaveBeenLastCalledWith(3)
   })
 
   it('shutdown clears pending trailing timer and state', () => {
@@ -155,9 +146,6 @@ describe('SessionsSyncService', () => {
     ])
 
     expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(1)
-    expect(ws.broadcastSessionsChanged).toHaveBeenLastCalledWith({
-      type: 'sessions.changed',
-      revision: 1,
-    })
+    expect(ws.broadcastSessionsChanged).toHaveBeenLastCalledWith(1)
   })
 })

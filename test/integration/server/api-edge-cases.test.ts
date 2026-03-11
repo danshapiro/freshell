@@ -91,7 +91,12 @@ describe('API Edge Cases - Security Testing', () => {
 
     app.use('/api/terminals', createTerminalsRouter({
       configStore,
-      registry: { list: vi.fn().mockReturnValue([]), updateTitle: vi.fn(), updateDescription: vi.fn() },
+      registry: {
+        list: vi.fn().mockReturnValue([]),
+        get: vi.fn().mockReturnValue(undefined),
+        updateTitle: vi.fn(),
+        updateDescription: vi.fn(),
+      },
       wsHandler: { broadcast: vi.fn() },
     }))
 

@@ -1,3 +1,4 @@
+import type { TerminalMode } from './terminal-registry.js'
 import { Router } from 'express'
 import { z } from 'zod'
 import { cleanString } from './utils.js'
@@ -35,7 +36,34 @@ export interface TerminalsRouterDeps {
     deleteTerminal: (id: string) => Promise<void>
   }
   registry: {
-    list: () => any[]
+    list: () => Array<{
+      terminalId: string
+      title: string
+      description?: string
+      mode: TerminalMode
+      resumeSessionId?: string
+      createdAt: number
+      lastActivityAt: number
+      status: 'running' | 'exited'
+      hasClients: boolean
+      cwd?: string
+    }>
+    get: (terminalId: string) => {
+      terminalId: string
+      title: string
+      description?: string
+      mode: TerminalMode
+      resumeSessionId?: string
+      createdAt: number
+      lastActivityAt: number
+      status: 'running' | 'exited'
+      cwd?: string
+      cols: number
+      rows: number
+      clients: Set<unknown>
+      pty?: { pid?: number }
+      buffer: { snapshot: () => string }
+    } | undefined
     updateTitle: (id: string, title: string) => void
     updateDescription: (id: string, desc: string) => void
   }

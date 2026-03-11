@@ -1,10 +1,11 @@
+import type { TerminalMode } from '../terminal-registry.js'
 import type { TerminalDirectoryQuery } from '../../shared/read-models.js'
 
 export type TerminalDirectoryItem = {
   terminalId: string
   title: string
   description?: string
-  mode: 'shell' | 'claude' | 'codex'
+  mode: TerminalMode
   resumeSessionId?: string
   createdAt: number
   lastActivityAt: number

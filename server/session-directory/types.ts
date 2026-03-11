@@ -1,6 +1,6 @@
 import type {
   SessionDirectoryQuery as SharedSessionDirectoryQuery,
-} from '../shared/read-models.js'
+} from '../../shared/read-models.js'
 
 export type SessionDirectoryQuery = SharedSessionDirectoryQuery
 

@@ -1,3 +1,4 @@
+import type { TerminalMode } from '../terminal-registry.js'
 import {
   MAX_DIRECTORY_PAGE_ITEMS,
   type TerminalDirectoryQuery,
@@ -23,7 +24,7 @@ type TerminalRecord = {
   terminalId: string
   title: string
   description?: string
-  mode: 'shell' | 'claude' | 'codex'
+  mode: TerminalMode
   resumeSessionId?: string
   createdAt: number
   lastActivityAt: number
