@@ -1,6 +1,7 @@
 import fsp from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { hostname } from 'node:os'
+import { performance } from 'node:perf_hooks'
 import path from 'node:path'
 
 import {
@@ -25,6 +26,7 @@ const REUSABLE_SUCCESS_FILE = 'reusable-success.json'
 const LOCK_RETRY_MS = 25
 const LOCK_TIMEOUT_MS = 5_000
 const LOCK_STALE_MS = 30_000
+const CURRENT_PROCESS_STARTED_AT_MS = performance.timeOrigin
 
 export function getCoordinatorStoreDir(commonDir: string): string {
   return path.join(commonDir, 'freshell-test-coordinator')
@@ -212,21 +214,7 @@ async function acquireFileLock(lockPath: string): Promise<() => Promise<void>> {
 }
 
 async function clearStaleLockIfNeeded(lockPath: string): Promise<boolean> {
-  let stale = false
-
-  try {
-    const raw = await fsp.readFile(lockPath, 'utf8')
-    const parsed = JSON.parse(raw) as { pid?: unknown }
-    if (typeof parsed.pid === 'number') {
-      stale = !isProcessAlive(parsed.pid)
-    }
-  } catch {
-    const stats = await fsp.stat(lockPath).catch(() => undefined)
-    if (!stats) {
-      return true
-    }
-    stale = Date.now() - stats.mtimeMs > LOCK_STALE_MS
-  }
+  const stale = await isStaleLockFile(lockPath, LOCK_STALE_MS)
 
   if (!stale) {
     return false
@@ -242,6 +230,71 @@ async function clearStaleLockIfNeeded(lockPath: string): Promise<boolean> {
 
 function filePathFromLock(lockPath: string): string {
   return lockPath.endsWith('.lock') ? lockPath.slice(0, -'.lock'.length) : lockPath
+}
+
+async function isStaleLockFile(lockPath: string, staleMs: number): Promise<boolean> {
+  const metadata = await readLockMetadata(lockPath)
+  if (!metadata.exists) {
+    return true
+  }
+
+  if (metadata.ageMs !== undefined && metadata.ageMs > staleMs) {
+    if (metadata.pid === process.pid) {
+      return metadata.startedAtMs !== undefined && metadata.startedAtMs < CURRENT_PROCESS_STARTED_AT_MS
+    }
+    return true
+  }
+
+  if (metadata.pid !== undefined) {
+    return !isProcessAlive(metadata.pid)
+  }
+
+  return false
+}
+
+async function readLockMetadata(lockPath: string): Promise<{ exists: boolean; pid?: number; ageMs?: number; startedAtMs?: number }> {
+  try {
+    const raw = await fsp.readFile(lockPath, 'utf8')
+    const parsed = JSON.parse(raw) as { pid?: unknown; startedAt?: unknown }
+    const startedAtMs = parseLockTimestamp(parsed.startedAt)
+    return {
+      exists: true,
+      pid: typeof parsed.pid === 'number' ? parsed.pid : undefined,
+      startedAtMs,
+      ageMs: startedAtMs !== undefined ? Math.max(0, Date.now() - startedAtMs) : await readLockAgeFromStat(lockPath),
+    }
+  } catch {
+    const ageMs = await readLockAgeFromStat(lockPath)
+    if (ageMs === undefined) {
+      return { exists: false }
+    }
+    return {
+      exists: true,
+      ageMs,
+    }
+  }
+}
+
+function parseLockTimestamp(startedAt: unknown): number | undefined {
+  if (typeof startedAt !== 'string') {
+    return undefined
+  }
+
+  const started = Date.parse(startedAt)
+  if (Number.isNaN(started)) {
+    return undefined
+  }
+
+  return started
+}
+
+async function readLockAgeFromStat(lockPath: string): Promise<number | undefined> {
+  const stats = await fsp.stat(lockPath).catch(() => undefined)
+  if (!stats) {
+    return undefined
+  }
+
+  return Math.max(0, Date.now() - stats.mtimeMs)
 }
 
 function isProcessAlive(pid: number): boolean {

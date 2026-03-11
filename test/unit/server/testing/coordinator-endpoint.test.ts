@@ -210,6 +210,24 @@ describe('tryListen()', () => {
     await closeHandle(first)
     await closeHandle(second)
   })
+
+  it('reclaims an aged readable cleanup lock even when its recorded pid is currently alive', async () => {
+    const commonDir = path.join(tempDir, 'repo', '.git')
+    const endpoint = buildCoordinatorEndpoint(commonDir, 'linux', [tempDir])
+    const liveForeignPid = process.ppid > 1 ? process.ppid : 1
+
+    await fsp.mkdir(path.dirname(endpoint.address), { recursive: true })
+    await fsp.writeFile(endpoint.address, '')
+    await fsp.writeFile(`${endpoint.address}.cleanup.lock`, JSON.stringify({
+      pid: liveForeignPid,
+      startedAt: '1970-01-01T00:00:00.000Z',
+    }))
+
+    const handle = await tryListen(endpoint)
+    expect(handle.kind).toBe('listening')
+
+    await closeHandle(handle)
+  }, 15_000)
 })
 
 function delay(ms: number): Promise<void> {

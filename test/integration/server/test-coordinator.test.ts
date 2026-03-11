@@ -434,7 +434,8 @@ describe('test coordinator CLI', () => {
       },
     )
 
-    const queuedOutput = await waitForOutput(second, /queued intentionally/i)
+    const queuedOutput = await waitForOutput(second, /First broad run/)
+    expect(queuedOutput).toMatch(/queued intentionally/i)
     expect(queuedOutput).toContain('First broad run')
     expect(queuedOutput).toContain(fixture.branch)
     expect(queuedOutput).toContain(fixture.worktreePath)
@@ -450,7 +451,7 @@ describe('test coordinator CLI', () => {
     })
   })
 
-  it('runs typecheck before the coordinated full-suite phase and only succeeds after both phases pass', async () => {
+  it('acquires the gate before running typecheck and only succeeds after both phases pass', async () => {
     const fixture = await createRepoFixture({ linkedWorktree: true })
     const captureFile = path.join(fixture.baseDir, 'capture.jsonl')
     const child = spawnCoordinator(
@@ -466,8 +467,8 @@ describe('test coordinator CLI', () => {
     )
 
     await waitForOutput(child, /TYPECHECK_MARKER/)
-    const prePhaseStatus = await runStatus(fixture.checkoutRoot)
-    expect(prePhaseStatus.output).toContain('state: idle')
+    const prePhaseStatus = await waitForRunningStatus(fixture.checkoutRoot, /commandKey: check/)
+    expect(prePhaseStatus.output).toContain('suiteKey: full-suite')
 
     const exit = await waitForExit(child)
     expect(exit.code).toBe(0)
@@ -483,6 +484,84 @@ describe('test coordinator CLI', () => {
     expect(commandRuns.byKey.check).toMatchObject({ outcome: 'success' })
     expect(suiteRuns.byKey['full-suite']).toMatchObject({ outcome: 'success' })
   })
+
+  it.each([
+    {
+      commandKey: 'check',
+      prePhaseSelector: 'npm:typecheck',
+    },
+    {
+      commandKey: 'verify',
+      prePhaseSelector: 'npm:build',
+    },
+  ])(
+    'waits to acquire the gate before running coordinated $commandKey pre-phases and refreshes holder metadata after queueing',
+    async ({ commandKey, prePhaseSelector }) => {
+      const fixture = await createRepoFixture({ linkedWorktree: true })
+      const captureFile = path.join(fixture.baseDir, `${commandKey}-queue-refresh.jsonl`)
+      const holder = spawnCoordinator(
+        fixture.checkoutRoot,
+        'test',
+        [],
+        {
+          FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
+          FRESHELL_TEST_COORDINATOR_POLL_MS: '50',
+          FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
+            'vitest:default:run': { holdMs: 1_500 },
+          }),
+        },
+      )
+
+      await waitForRunningStatus(fixture.checkoutRoot, /commandKey: test/)
+
+      const queued = spawnCoordinator(
+        fixture.checkoutRoot,
+        commandKey,
+        [],
+        {
+          FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
+          FRESHELL_TEST_COORDINATOR_POLL_MS: '50',
+          FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
+            'vitest:default:run': { holdMs: 1_000 },
+          }),
+        },
+      )
+
+      await waitForOutput(queued, /queued intentionally/i)
+      await delay(150)
+
+      const queuedCaptures = await readCaptureLines(captureFile)
+      expect(queuedCaptures.map((entry) => entry.selector)).not.toContain(prePhaseSelector)
+
+      await fixture.markDirty()
+
+      expect((await waitForExit(holder)).code).toBe(0)
+      await waitForRunningStatus(fixture.checkoutRoot, new RegExp(`commandKey: ${commandKey}`))
+
+      const activeHolder = await readHolder(fixture.storeDir)
+      expect(activeHolder).toMatchObject({
+        entrypoint: {
+          commandKey,
+          suiteKey: 'full-suite',
+        },
+        repo: {
+          isDirty: true,
+        },
+      })
+
+      const exit = await waitForExit(queued)
+      expect(exit.code).toBe(0)
+
+      const latest = (await readCommandRuns(fixture.storeDir)).byKey[commandKey]
+      expect(latest).toMatchObject({
+        outcome: 'success',
+        repo: {
+          isDirty: true,
+        },
+      })
+      expect(latest.durationMs).toBeLessThan(2_000)
+    },
+  )
 
   it('propagates a failing build exit code exactly and never claims the coordinated suite ran', async () => {
     const fixture = await createRepoFixture({ linkedWorktree: true })

@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import net from 'node:net'
 import os from 'node:os'
+import { performance } from 'node:perf_hooks'
 import path from 'node:path'
 
 import type { HolderRecord } from './coordinator-schema.js'
@@ -12,6 +13,7 @@ const UNIX_SOCKET_MAX_BYTES = 90
 const CLEANUP_LOCK_RETRY_MS = 10
 const CLEANUP_LOCK_TIMEOUT_MS = 5_000
 const CLEANUP_LOCK_STALE_MS = 30_000
+const CURRENT_PROCESS_STARTED_AT_MS = performance.timeOrigin
 
 export type CoordinatorEndpoint =
   | {
@@ -286,21 +288,7 @@ async function acquireCleanupLock(address: string): Promise<() => Promise<void>>
 }
 
 async function clearStaleCleanupLock(lockPath: string): Promise<boolean> {
-  let stale = false
-
-  try {
-    const raw = await fsp.readFile(lockPath, 'utf8')
-    const parsed = JSON.parse(raw) as { pid?: unknown }
-    if (typeof parsed.pid === 'number') {
-      stale = !isProcessAlive(parsed.pid)
-    }
-  } catch {
-    const stats = await fsp.stat(lockPath).catch(() => undefined)
-    if (!stats) {
-      return true
-    }
-    stale = Date.now() - stats.mtimeMs > CLEANUP_LOCK_STALE_MS
-  }
+  const stale = await isStaleLockFile(lockPath, CLEANUP_LOCK_STALE_MS)
 
   if (!stale) {
     return false
@@ -325,4 +313,69 @@ function isProcessAlive(pid: number): boolean {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function isStaleLockFile(lockPath: string, staleMs: number): Promise<boolean> {
+  const metadata = await readLockMetadata(lockPath)
+  if (!metadata.exists) {
+    return true
+  }
+
+  if (metadata.ageMs !== undefined && metadata.ageMs > staleMs) {
+    if (metadata.pid === process.pid) {
+      return metadata.startedAtMs !== undefined && metadata.startedAtMs < CURRENT_PROCESS_STARTED_AT_MS
+    }
+    return true
+  }
+
+  if (metadata.pid !== undefined) {
+    return !isProcessAlive(metadata.pid)
+  }
+
+  return false
+}
+
+async function readLockMetadata(lockPath: string): Promise<{ exists: boolean; pid?: number; ageMs?: number; startedAtMs?: number }> {
+  try {
+    const raw = await fsp.readFile(lockPath, 'utf8')
+    const parsed = JSON.parse(raw) as { pid?: unknown; startedAt?: unknown }
+    const startedAtMs = parseLockTimestamp(parsed.startedAt)
+    return {
+      exists: true,
+      pid: typeof parsed.pid === 'number' ? parsed.pid : undefined,
+      startedAtMs,
+      ageMs: startedAtMs !== undefined ? Math.max(0, Date.now() - startedAtMs) : await readLockAgeFromStat(lockPath),
+    }
+  } catch {
+    const ageMs = await readLockAgeFromStat(lockPath)
+    if (ageMs === undefined) {
+      return { exists: false }
+    }
+    return {
+      exists: true,
+      ageMs,
+    }
+  }
+}
+
+function parseLockTimestamp(startedAt: unknown): number | undefined {
+  if (typeof startedAt !== 'string') {
+    return undefined
+  }
+
+  const started = Date.parse(startedAt)
+  if (Number.isNaN(started)) {
+    return undefined
+  }
+
+  return started
+}
+
+async function readLockAgeFromStat(lockPath: string): Promise<number | undefined> {
+  const stats = await fsp.stat(lockPath).catch(() => undefined)
+  if (!stats) {
+    return undefined
+  }
+
+  return Math.max(0, Date.now() - stats.mtimeMs)
 }

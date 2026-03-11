@@ -114,6 +114,25 @@ async function runCommand(parsed: ParsedRunArgs): Promise<number> {
   const summary = summarizeCommand(parsed.commandKey, parsed.forwardedArgs, parsed.summary)
   const commandDisplay = publicCommandDisplay(parsed.commandKey, parsed.forwardedArgs)
 
+  if (disposition.kind === 'coordinated') {
+    if (!repo) {
+      throw new Error('A coordinated command could not resolve repo metadata.')
+    }
+
+    const coordinatedContext: CoordinatedRunContext = {
+      commandKey: parsed.commandKey,
+      forwardedArgs: parsed.forwardedArgs,
+      disposition,
+      repo,
+      runtime,
+      summary,
+      commandDisplay,
+      runId: randomUUID(),
+    }
+
+    return runCoordinatedCommand(coordinatedContext)
+  }
+
   const prePhaseResult = await runPrePhasesIfNeeded({
     commandKey: parsed.commandKey,
     forwardedArgs: parsed.forwardedArgs,
@@ -130,23 +149,7 @@ async function runCommand(parsed: ParsedRunArgs): Promise<number> {
   if (disposition.kind === 'delegated' || disposition.kind === 'passthrough') {
     return runPhases(disposition.phases)
   }
-
-  if (!repo) {
-    throw new Error('A coordinated command could not resolve repo metadata.')
-  }
-
-  const coordinatedContext: CoordinatedRunContext = {
-    commandKey: parsed.commandKey,
-    forwardedArgs: parsed.forwardedArgs,
-    disposition,
-    repo,
-    runtime,
-    summary,
-    commandDisplay,
-    runId: randomUUID(),
-  }
-
-  return runCoordinatedCommand(coordinatedContext)
+  throw new Error('Unsupported coordinator disposition.')
 }
 
 async function printStatus(): Promise<number> {
@@ -245,11 +248,13 @@ async function runCoordinatedCommand(context: CoordinatedRunContext): Promise<nu
   const endpoint = buildCoordinatorEndpoint(context.repo.commonDir)
   const pollMs = parseNumberEnv('FRESHELL_TEST_COORDINATOR_POLL_MS', DEFAULT_POLL_MS)
   const maxWaitMs = parseNumberEnv('FRESHELL_TEST_COORDINATOR_MAX_WAIT_MS', DEFAULT_MAX_WAIT_MS)
-  const startedAt = new Date().toISOString()
+  const queuedAt = new Date().toISOString()
+  let startedAt = queuedAt
   const waitStarted = Date.now()
 
   let listener: ListeningServer | undefined
   let suiteStarted = false
+  let activeRepo = context.repo
 
   try {
     while (!listener) {
@@ -272,7 +277,7 @@ async function runCoordinatedCommand(context: CoordinatedRunContext): Promise<nu
           forwardedArgs: context.forwardedArgs,
           repo,
           runtime: context.runtime,
-          startedAt,
+          startedAt: queuedAt,
           finishedAt,
           exitCode: 124,
         }))
@@ -282,17 +287,32 @@ async function runCoordinatedCommand(context: CoordinatedRunContext): Promise<nu
       await delay(pollMs)
     }
 
-    const holder = buildHolderRecord(context, startedAt)
+    activeRepo = await refreshRepoContext(context.repo).catch(() => context.repo)
+    startedAt = new Date().toISOString()
+    const holder = buildHolderRecord(context, activeRepo, startedAt)
     await writeHolder(endpoint.storeDir, holder)
 
     if (process.env.FRESHELL_TEST_COORDINATOR_THROW_AFTER_HOLDER === '1') {
       throw new Error('Injected failure after holder write.')
     }
 
+    const prePhaseResult = await runPrePhasesIfNeeded({
+      commandKey: context.commandKey,
+      forwardedArgs: context.forwardedArgs,
+      commandDisplay: context.commandDisplay,
+      disposition: context.disposition,
+      repo: activeRepo,
+      runtime: context.runtime,
+      summary: context.summary,
+    })
+    if (prePhaseResult !== undefined) {
+      return prePhaseResult
+    }
+
     suiteStarted = true
     const exitCode = await runPhases(context.disposition.phases)
     const finishedAt = new Date().toISOString()
-    const repo = await refreshRepoContext(context.repo)
+    const repo = await refreshRepoContext(activeRepo)
     const latest = buildLatestRunRecord({
       runId: context.runId,
       commandKey: context.commandKey,
@@ -318,7 +338,7 @@ async function runCoordinatedCommand(context: CoordinatedRunContext): Promise<nu
     return exitCode
   } catch (error) {
     const finishedAt = new Date().toISOString()
-    const repo = await refreshRepoContext(context.repo).catch(() => context.repo)
+    const repo = await refreshRepoContext(activeRepo).catch(() => activeRepo)
     const latest = buildLatestRunRecord({
       runId: context.runId,
       commandKey: context.commandKey,
@@ -358,12 +378,13 @@ async function runPhases(phases: UpstreamPhase[]): Promise<number> {
 }
 
 async function printQueuedStatus(context: CoordinatedRunContext): Promise<void> {
+  const repo = await refreshRepoContext(context.repo).catch(() => context.repo)
   const statusView = await buildStatusView({
-    commonDir: context.repo.commonDir,
+    commonDir: repo.commonDir,
     commandKey: context.commandKey,
     suiteKey: context.disposition.suiteKey,
-    commit: context.repo.commit,
-    isDirty: context.repo.isDirty,
+    commit: repo.commit,
+    isDirty: repo.isDirty,
     nodeVersion: context.runtime.nodeVersion,
     platform: context.runtime.platform,
     arch: context.runtime.arch,
@@ -372,7 +393,7 @@ async function printQueuedStatus(context: CoordinatedRunContext): Promise<void> 
   console.log(renderStatusView(statusView))
 }
 
-function buildHolderRecord(context: CoordinatedRunContext, startedAt: string): HolderRecord {
+function buildHolderRecord(context: CoordinatedRunContext, repo: RepoContext, startedAt: string): HolderRecord {
   return {
     schemaVersion: 1,
     runId: context.runId,
@@ -391,14 +412,14 @@ function buildHolderRecord(context: CoordinatedRunContext, startedAt: string): H
       argv: [context.commandKey, ...context.forwardedArgs],
     },
     repo: {
-      invocationCwd: context.repo.invocationCwd,
-      checkoutRoot: context.repo.checkoutRoot,
-      repoRoot: context.repo.repoRoot,
-      commonDir: context.repo.commonDir,
-      worktreePath: context.repo.worktreePath,
-      branch: context.repo.branch,
-      commit: context.repo.commit,
-      isDirty: context.repo.isDirty,
+      invocationCwd: repo.invocationCwd,
+      checkoutRoot: repo.checkoutRoot,
+      repoRoot: repo.repoRoot,
+      commonDir: repo.commonDir,
+      worktreePath: repo.worktreePath,
+      branch: repo.branch,
+      commit: repo.commit,
+      isDirty: repo.isDirty,
     },
     runtime: context.runtime,
     agent: readAgentMetadata(),

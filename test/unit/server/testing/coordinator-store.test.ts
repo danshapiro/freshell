@@ -239,4 +239,26 @@ describe('coordinator-store', () => {
       .map((entry) => entry.commandKey)
       .sort())
   })
+
+  it('reclaims an aged readable store lock even when its recorded pid is currently alive', async () => {
+    const liveForeignPid = process.ppid > 1 ? process.ppid : 1
+    await fsp.mkdir(storeDir, { recursive: true })
+    await fsp.writeFile(path.join(storeDir, 'command-runs.json.lock'), JSON.stringify({
+      pid: liveForeignPid,
+      hostname: 'test-host',
+      startedAt: '1970-01-01T00:00:00.000Z',
+    }))
+
+    await expect(recordCommandResult(storeDir, createLatestRunRecord({
+      runId: 'run-stale-lock',
+      entrypoint: {
+        commandKey: 'check',
+        suiteKey: 'full-suite',
+      },
+    }))).resolves.toBeUndefined()
+
+    expect((await readCommandRuns(storeDir)).byKey.check).toMatchObject({
+      runId: 'run-stale-lock',
+    })
+  }, 15_000)
 })
