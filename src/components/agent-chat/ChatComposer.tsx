@@ -2,6 +2,8 @@ import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useSta
 import { Send, Square } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { getDraft, setDraft, clearDraft } from '@/lib/draft-store'
+import { useAppDispatch } from '@/store/hooks'
+import { switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 
 export interface ChatComposerHandle {
   focus: () => void
@@ -19,6 +21,7 @@ interface ChatComposerProps {
 }
 
 const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function ChatComposer({ paneId, onSend, onInterrupt, disabled, isRunning, placeholder, autoFocus, shouldFocusOnReady }, ref) {
+  const dispatch = useAppDispatch()
   const [text, setText] = useState(() => (paneId ? getDraft(paneId) : ''))
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
 
@@ -81,6 +84,20 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
   }, [text, onSend, paneId])
 
   const handleKeyDown = useCallback((e: KeyboardEvent<HTMLTextAreaElement>) => {
+    // Tab switching: Ctrl+Shift+[ (prev) and Ctrl+Shift+] (next)
+    if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {
+      if (e.code === 'BracketLeft') {
+        e.preventDefault()
+        dispatch(switchToPrevTab())
+        return
+      }
+      if (e.code === 'BracketRight') {
+        e.preventDefault()
+        dispatch(switchToNextTab())
+        return
+      }
+    }
+
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
       handleSend()
@@ -89,7 +106,7 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
       e.preventDefault()
       onInterrupt()
     }
-  }, [handleSend, isRunning, onInterrupt])
+  }, [dispatch, handleSend, isRunning, onInterrupt])
 
   const handleInput = useCallback(() => {
     if (textareaRef.current) resizeTextarea(textareaRef.current)

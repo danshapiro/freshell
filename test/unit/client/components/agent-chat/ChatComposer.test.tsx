@@ -1,8 +1,23 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
-import { render, screen, cleanup } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import ChatComposer from '../../../../../src/components/agent-chat/ChatComposer'
 import { getDraft, clearDraft } from '@/lib/draft-store'
+
+const mockDispatch = vi.fn()
+vi.mock('@/store/hooks', () => ({
+  useAppDispatch: () => mockDispatch,
+  useAppSelector: () => ({}),
+}))
+
+vi.mock('@/store/tabsSlice', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/store/tabsSlice')>()
+  return {
+    ...actual,
+    switchToNextTab: () => ({ type: 'tabs/switchToNextTab' }),
+    switchToPrevTab: () => ({ type: 'tabs/switchToPrevTab' }),
+  }
+})
 
 describe('ChatComposer', () => {
   afterEach(() => {
@@ -10,6 +25,7 @@ describe('ChatComposer', () => {
     clearDraft('test-pane')
     clearDraft('pane-a')
     clearDraft('pane-b')
+    mockDispatch.mockClear()
   })
   it('renders textarea and send button', () => {
     render(<ChatComposer onSend={() => {}} onInterrupt={() => {}} />)
@@ -226,6 +242,30 @@ describe('ChatComposer', () => {
       )
       flushRAF()
       expect(focusSpy).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('tab switching shortcuts', () => {
+    it('dispatches switchToNextTab on Ctrl+Shift+]', () => {
+      render(<ChatComposer onSend={() => {}} onInterrupt={() => {}} />)
+      const textarea = screen.getByRole('textbox')
+      fireEvent.keyDown(textarea, { code: 'BracketRight', ctrlKey: true, shiftKey: true })
+      expect(mockDispatch).toHaveBeenCalledWith({ type: 'tabs/switchToNextTab' })
+    })
+
+    it('dispatches switchToPrevTab on Ctrl+Shift+[', () => {
+      render(<ChatComposer onSend={() => {}} onInterrupt={() => {}} />)
+      const textarea = screen.getByRole('textbox')
+      fireEvent.keyDown(textarea, { code: 'BracketLeft', ctrlKey: true, shiftKey: true })
+      expect(mockDispatch).toHaveBeenCalledWith({ type: 'tabs/switchToPrevTab' })
+    })
+
+    it('does not dispatch tab switch without Ctrl+Shift', () => {
+      render(<ChatComposer onSend={() => {}} onInterrupt={() => {}} />)
+      const textarea = screen.getByRole('textbox')
+      fireEvent.keyDown(textarea, { code: 'BracketRight', ctrlKey: false, shiftKey: true })
+      fireEvent.keyDown(textarea, { code: 'BracketLeft', ctrlKey: true, shiftKey: false })
+      expect(mockDispatch).not.toHaveBeenCalled()
     })
   })
 })
