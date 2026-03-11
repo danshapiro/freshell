@@ -6,7 +6,7 @@ import App from '@/App'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
-import sessionsReducer, { markWsSnapshotReceived } from '@/store/sessionsSlice'
+import sessionsReducer, { setProjects } from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
 import agentChatReducer from '@/store/agentChatSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
@@ -702,39 +702,33 @@ describe('pane header runtime metadata flow (e2e)', () => {
       expect(screen.getByText(/freshell \(main\*\)\s+25%/)).toBeInTheDocument()
     })
 
-    store.dispatch(markWsSnapshotReceived())
-
     act(() => {
-      wsMocks.emitMessage({
-        type: 'sessions.patch',
-        upsertProjects: [
-          {
-            projectPath: '/home/user/code/freshell',
-            sessions: [
-              {
-                provider: 'claude',
-                sessionType: 'freshclaude',
-                sessionId: 'claude-session-1',
-                projectPath: '/home/user/code/freshell',
-                cwd: '/home/user/code/freshell/.worktrees/issue-163',
-                gitBranch: 'main',
-                isDirty: true,
-                updatedAt: 2,
-                tokenUsage: {
-                  inputTokens: 10,
-                  outputTokens: 5,
-                  cachedTokens: 0,
-                  totalTokens: 15,
-                  contextTokens: 15,
-                  compactThresholdTokens: 60,
-                  compactPercent: 50,
-                },
+      store.dispatch(setProjects([
+        {
+          projectPath: '/home/user/code/freshell',
+          sessions: [
+            {
+              provider: 'claude',
+              sessionType: 'freshclaude',
+              sessionId: 'claude-session-1',
+              projectPath: '/home/user/code/freshell',
+              cwd: '/home/user/code/freshell/.worktrees/issue-163',
+              gitBranch: 'main',
+              isDirty: true,
+              updatedAt: 2,
+              tokenUsage: {
+                inputTokens: 10,
+                outputTokens: 5,
+                cachedTokens: 0,
+                totalTokens: 15,
+                contextTokens: 15,
+                compactThresholdTokens: 60,
+                compactPercent: 50,
               },
-            ],
-          },
-        ],
-        removeProjectPaths: [],
-      })
+            },
+          ],
+        },
+      ] as any))
     })
 
     await waitFor(() => {

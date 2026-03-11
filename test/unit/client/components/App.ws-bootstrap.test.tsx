@@ -460,7 +460,7 @@ describe('App WS bootstrap recovery', () => {
     expect(extension?.client?.mobile).toBe(true)
   })
 
-  it('uses the sidebar snapshot helper with exact open-session locators during bootstrap', async () => {
+  it('loads the bootstrap sidebar window through the HTTP session-directory helper', async () => {
     const olderOpenSessionId = 'older-open'
     fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
       projects: [
@@ -518,11 +518,8 @@ describe('App WS bootstrap recovery', () => {
 
     await waitFor(() => {
       expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledWith({
-        limit: 100,
-        openSessions: [
-          { provider: 'codex', sessionId: olderOpenSessionId, serverInstanceId: 'srv-local' },
-          { provider: 'codex', sessionId: olderOpenSessionId },
-        ],
+        limit: 50,
+        signal: expect.any(AbortSignal),
       })
       expect(store.getState().sessions.projects.map((project: any) => project.projectPath)).toEqual(['/older'])
       expect(store.getState().sessions.oldestLoadedSessionId).toBe('codex:cursor')
@@ -530,7 +527,7 @@ describe('App WS bootstrap recovery', () => {
     })
   })
 
-  it('promotes a recent HTTP sessions baseline when socket is already ready before App bootstrap connects', async () => {
+  it('ignores legacy sessions.patch messages when bootstrapping against an already-ready socket', async () => {
     const store = createStore()
     wsMocks.isReady = true
     wsMocks.serverInstanceId = 'srv-preconnected'
@@ -573,9 +570,7 @@ describe('App WS bootstrap recovery', () => {
       })
     })
 
-    await waitFor(() => {
-      expect(store.getState().sessions.projects.map((p: any) => p.projectPath).sort()).toEqual(['/p1', '/p2'])
-    })
+    expect(store.getState().sessions.projects.map((p: any) => p.projectPath)).toEqual(['/p1'])
   })
 
   it('falls back to refetch sessions when pre-connected socket has no recent baseline', async () => {
@@ -638,18 +633,12 @@ describe('App WS bootstrap recovery', () => {
     })
 
     expect(fetchSidebarSessionsSnapshot).toHaveBeenNthCalledWith(1, {
-      limit: 100,
-      openSessions: [
-        { provider: 'codex', sessionId: olderOpenSessionId, serverInstanceId: 'srv-local' },
-        { provider: 'codex', sessionId: olderOpenSessionId },
-      ],
+      limit: 50,
+      signal: expect.any(AbortSignal),
     })
     expect(fetchSidebarSessionsSnapshot).toHaveBeenNthCalledWith(2, {
-      limit: 100,
-      openSessions: [
-        { provider: 'codex', sessionId: olderOpenSessionId, serverInstanceId: 'srv-local' },
-        { provider: 'codex', sessionId: olderOpenSessionId },
-      ],
+      limit: 50,
+      signal: expect.any(AbortSignal),
     })
     expect(wsMocks.connect).not.toHaveBeenCalled()
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))

@@ -3,19 +3,12 @@ import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { setStatus, setError, setErrorCode, setServerInstanceId, setPlatform, setAvailableClis, setFeatureFlags } from '@/store/connectionSlice'
 import { setSettings } from '@/store/settingsSlice'
 import {
-  setProjects,
-  mergeSnapshotProjects,
-  applySessionsPatch,
   markWsSnapshotReceived,
   resetWsSnapshotReceived,
-  clearPaginationMeta,
-  setPaginationMeta,
-  appendSessionsPage,
-  setLoadingMore,
 } from '@/store/sessionsSlice'
 import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { api, isApiUnauthorizedError, type VersionInfo } from '@/lib/api'
-import { loadInitialSessionsWindow } from '@/store/sessionsThunks'
+import { loadInitialSessionsWindow, refreshActiveSessionWindow } from '@/store/sessionsThunks'
 import { getShareAction, ensureShareUrlToken } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { collectSessionLocatorsFromTabs, getSessionsForHello } from '@/lib/session-utils'
@@ -55,7 +48,7 @@ import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, res
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
 import { createLogger } from '@/lib/client-logger'
-import type { ProjectGroup, AppSettings } from '@/store/types'
+import type { AppSettings } from '@/store/types'
 import { z } from 'zod'
 
 const log = createLogger('App')
@@ -429,75 +422,6 @@ export default function App() {
     let stopTabRegistrySync: (() => void) | null = null
     let stopWsDisconnectSync: (() => void) | null = null
 
-    // Buffer for chunked sessions.updated messages — we accumulate all chunks
-    // and apply them atomically to avoid the sidebar collapsing and rebuilding
-    // (scrollbar "blink") during incremental chunked delivery.
-    //
-    // The debounce timer fires 300ms after the LAST chunk.  Server inter-chunk
-    // delays are normally sub-millisecond (setImmediate yield); the only source
-    // of longer gaps is WebSocket drain backpressure.  300ms is generous enough
-    // for all practical scenarios.  If the timer fires with a partial buffer
-    // (extreme backpressure), setProjects replaces the sidebar briefly; any
-    // late-arriving append chunks merge gracefully via the fallback path.
-    let chunkedBuffer: ProjectGroup[] | null = null
-    let chunkedFlushTimer: ReturnType<typeof setTimeout> | null = null
-    // Generation counter: incremented on every sessions.updated snapshot.
-    // sessions.page responses are only applied when the generation matches,
-    // preventing stale page responses from corrupting state after a reset.
-    let snapshotGeneration = 0
-    let activePaginationGeneration = -1
-    let pendingPaginationMeta: {
-      authoritative?: boolean
-      totalSessions: number
-      oldestIncludedTimestamp: number
-      oldestIncludedSessionId: string
-      hasMore: boolean
-    } | null = null
-    const CHUNK_FLUSH_DELAY_MS = 300
-
-    function clearChunkedState() {
-      if (chunkedFlushTimer) { clearTimeout(chunkedFlushTimer); chunkedFlushTimer = null }
-      chunkedBuffer = null
-      pendingPaginationMeta = null
-    }
-
-    function flushChunkedBuffer() {
-      if (chunkedFlushTimer) { clearTimeout(chunkedFlushTimer); chunkedFlushTimer = null }
-      if (chunkedBuffer) {
-        // When the snapshot is paginated (hasMore), merge with existing state
-        // to preserve older sessions the user already loaded via scroll pagination.
-        // Personalized refreshes can mark the paginated snapshot authoritative,
-        // which means the new snapshot should fully replace the visible window.
-        if (pendingPaginationMeta?.hasMore && !pendingPaginationMeta.authoritative) {
-          dispatch(mergeSnapshotProjects(chunkedBuffer))
-        } else {
-          dispatch(setProjects(chunkedBuffer))
-        }
-        dispatch(markWsSnapshotReceived())
-        // Reset any stale load-more guard — the snapshot invalidated it
-        dispatch(setLoadingMore(false))
-        if (pendingPaginationMeta) {
-          dispatch(setPaginationMeta({
-            totalSessions: pendingPaginationMeta.totalSessions,
-            oldestLoadedTimestamp: pendingPaginationMeta.oldestIncludedTimestamp,
-            oldestLoadedSessionId: pendingPaginationMeta.oldestIncludedSessionId,
-            hasMore: pendingPaginationMeta.hasMore,
-          }))
-          activePaginationGeneration = snapshotGeneration
-          pendingPaginationMeta = null
-        } else {
-          // Full snapshot without pagination: clear stale pagination state
-          dispatch(clearPaginationMeta())
-          activePaginationGeneration = -1
-        }
-        chunkedBuffer = null
-      }
-    }
-
-    function scheduleChunkedFlush() {
-      if (chunkedFlushTimer) clearTimeout(chunkedFlushTimer)
-      chunkedFlushTimer = setTimeout(flushChunkedBuffer, CHUNK_FLUSH_DELAY_MS)
-    }
     async function bootstrap() {
       const handleBootstrapAuthFailure = (err: unknown): boolean => {
         if (!isApiUnauthorizedError(err)) return false
@@ -590,99 +514,14 @@ export default function App() {
           dispatch(setStatus('ready'))
           dispatch(setServerInstanceId(ready.success ? ready.data.serverInstanceId : undefined))
           dispatch(resetWsSnapshotReceived())
-          // Discard any in-flight chunked buffer from a previous connection
-          // to prevent stale data from overwriting the new session snapshot.
-          clearChunkedState()
-          // If App registered late and missed a prior snapshot, a fresh HTTP baseline
-          // from this bootstrap cycle is still safe for enabling patch application.
+          // If App registered late and missed a prior invalidation, a fresh HTTP baseline
+          // from this bootstrap cycle is still safe for enabling follow-up refreshes.
           promoteRecentHttpSessionsBaseline()
           requestTerminalMetaList()
           requestCodexActivityList()
         }
-        if (msg.type === 'sessions.updated') {
-          const projects = (msg.projects || []) as ProjectGroup[]
-          // Extract optional pagination metadata from first/single chunk
-          const hasPaginationMeta = typeof msg.totalSessions === 'number'
-          const paginationMeta = hasPaginationMeta ? {
-            authoritative: msg.authoritative === true,
-            totalSessions: msg.totalSessions as number,
-            oldestIncludedTimestamp: msg.oldestIncludedTimestamp as number,
-            oldestIncludedSessionId: msg.oldestIncludedSessionId as string,
-            hasMore: msg.hasMore as boolean,
-          } : null
-          if (msg.clear) {
-            // First chunk of a multi-chunk update: start buffering instead of
-            // clearing Redux state (which causes the sidebar to collapse).
-            snapshotGeneration++
-            chunkedBuffer = [...projects]
-            pendingPaginationMeta = paginationMeta
-            scheduleChunkedFlush()
-          } else if (msg.append) {
-            if (chunkedBuffer) {
-              // Subsequent chunk while buffering: accumulate
-              chunkedBuffer.push(...projects)
-              scheduleChunkedFlush()
-            } else {
-              // Append after the flush window can still occur on slow links.
-              // Merge like a partial snapshot so split projects keep earlier sessions.
-              dispatch(mergeSnapshotProjects(projects))
-              dispatch(markWsSnapshotReceived())
-            }
-          } else {
-            // Single-chunk update (no clear/append flags): apply immediately
-            snapshotGeneration++
-            if (chunkedBuffer) flushChunkedBuffer()
-            // When paginated, merge to preserve older sessions loaded via scroll.
-            if (paginationMeta?.hasMore && !paginationMeta.authoritative) {
-              dispatch(mergeSnapshotProjects(projects))
-            } else {
-              dispatch(setProjects(projects))
-            }
-            dispatch(markWsSnapshotReceived())
-            // Reset any stale load-more guard — the snapshot invalidated it
-            dispatch(setLoadingMore(false))
-            if (paginationMeta) {
-              dispatch(setPaginationMeta({
-                totalSessions: paginationMeta.totalSessions,
-                oldestLoadedTimestamp: paginationMeta.oldestIncludedTimestamp,
-                oldestLoadedSessionId: paginationMeta.oldestIncludedSessionId,
-                hasMore: paginationMeta.hasMore,
-              }))
-              activePaginationGeneration = snapshotGeneration
-            } else {
-              dispatch(clearPaginationMeta())
-              activePaginationGeneration = -1
-            }
-          }
-        }
-        if (msg.type === 'sessions.patch') {
-          // If a patch arrives while we're buffering a chunked update, flush
-          // the buffer first so the patch applies against a complete baseline.
-          if (chunkedBuffer) flushChunkedBuffer()
-          const upsertProjects = (msg.upsertProjects || []) as ProjectGroup[]
-          dispatch(applySessionsPatch({
-            upsertProjects,
-            removeProjectPaths: msg.removeProjectPaths || [],
-          }))
-        }
-        if (msg.type === 'sessions.page') {
-          // Ignore stale page responses from a previous snapshot generation
-          const sessionState = appStore.getState().sessions
-          if (activePaginationGeneration === snapshotGeneration && sessionState.hasMore != null) {
-            const projects = (msg.projects || []) as ProjectGroup[]
-            dispatch(appendSessionsPage(projects))
-            if (typeof msg.totalSessions === 'number') {
-              const incomingOldest = msg.oldestIncludedTimestamp as number
-              if (sessionState.oldestLoadedTimestamp === undefined || incomingOldest <= sessionState.oldestLoadedTimestamp) {
-                dispatch(setPaginationMeta({
-                  totalSessions: msg.totalSessions as number,
-                  oldestLoadedTimestamp: incomingOldest,
-                  oldestLoadedSessionId: msg.oldestIncludedSessionId as string,
-                  hasMore: msg.hasMore as boolean,
-                }))
-              }
-            }
-          }
+        if (msg.type === 'sessions.changed') {
+          void appStore.dispatch(refreshActiveSessionWindow() as any)
         }
         if (msg.type === 'settings.updated') {
           dispatch(setSettings(applyLocalTerminalFontFamily(msg.settings as AppSettings)))
@@ -793,7 +632,6 @@ export default function App() {
       cleanup = () => {
         stopWsDisconnectSync?.()
         unsubscribe()
-        clearChunkedState()
       }
       if (cleanedUp) cleanup()
 
@@ -853,7 +691,8 @@ export default function App() {
 
       // ── WebSocket connection / reconciliation ─────────────────────
       // Another component may have connected before App finished bootstrap.
-      // Reconcile state for the already-ready socket so sessions patches do not stay blocked.
+      // Reconcile state for the already-ready socket without waiting for a websocket-owned
+      // sidebar snapshot. The HTTP bootstrap window remains the source of truth.
       if (ws.isReady) {
         if (cancelled) return
         resetCodexActivityOverlay()

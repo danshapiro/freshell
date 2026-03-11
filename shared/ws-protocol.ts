@@ -168,8 +168,6 @@ export const HelloSchema = z.object({
   token: z.string().optional(),
   protocolVersion: z.literal(WS_PROTOCOL_VERSION),
   capabilities: z.object({
-    sessionsPatchV1: z.boolean().optional(),
-    sessionsPaginationV1: z.boolean().optional(),
     uiScreenshotV1: z.boolean().optional(),
   }).optional(),
   client: z.object({
@@ -379,15 +377,6 @@ export const BrowserSdkMessageSchema = z.discriminatedUnion('type', [
 
 export type BrowserSdkMessage = z.infer<typeof BrowserSdkMessageSchema>
 
-// Sessions pagination (client → server)
-export const SessionsFetchSchema = z.object({
-  type: z.literal('sessions.fetch'),
-  requestId: z.string().min(1),
-  before: z.number().nonnegative().optional(),
-  beforeId: z.string().min(1).optional(),
-  limit: z.number().int().min(1).max(500).optional(),
-})
-
 // ── Client message discriminated union ──
 
 export const ClientMessageSchema = z.discriminatedUnion('type', [
@@ -404,7 +393,6 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   CodexActivityListSchema,
   UiLayoutSyncSchema,
   UiScreenshotResultSchema,
-  SessionsFetchSchema,
   CodingCliCreateSchema,
   CodingCliInputSchema,
   CodingCliKillSchema,
@@ -553,36 +541,9 @@ export type CodexActivityUpdatedMessage = z.infer<typeof CodexActivityUpdatedSch
 
 // -- Sessions --
 
-export type SessionsUpdatedMessage = {
-  type: 'sessions.updated'
-  // Intentionally unknown to avoid coupling this shared protocol package to
-  // client-only ProjectGroup types.
-  projects: unknown[]
-  clear?: true
-  append?: true
-  authoritative?: true
-  totalSessions?: number
-  oldestIncludedTimestamp?: number
-  oldestIncludedSessionId?: string
-  hasMore?: boolean
-}
-
-export type SessionsPageMessage = {
-  type: 'sessions.page'
-  requestId: string
-  projects: unknown[]
-  totalSessions: number
-  oldestIncludedTimestamp: number
-  oldestIncludedSessionId: string
-  hasMore: boolean
-}
-
-export type SessionsPatchMessage = {
-  type: 'sessions.patch'
-  // Intentionally unknown to avoid coupling this shared protocol package to
-  // client-only ProjectGroup types.
-  upsertProjects: unknown[]
-  removeProjectPaths: string[]
+export type SessionsChangedMessage = {
+  type: 'sessions.changed'
+  revision: number
 }
 
 // -- Settings --
@@ -768,9 +729,7 @@ export type ServerMessage =
   | TerminalMetaUpdatedMessage
   | CodexActivityListResponseMessage
   | CodexActivityUpdatedMessage
-  | SessionsUpdatedMessage
-  | SessionsPageMessage
-  | SessionsPatchMessage
+  | SessionsChangedMessage
   | SettingsUpdatedMessage
   | UiCommandMessage
   | PerfLoggingMessage

@@ -295,7 +295,7 @@ describe('ws protocol', () => {
       type: 'hello',
       token: 'testtoken-testtoken',
       protocolVersion: WS_PROTOCOL_VERSION,
-      capabilities: { sessionsPatchV1: true },
+      capabilities: { uiScreenshotV1: true },
     }))
 
     const ready = await new Promise<any>((resolve) => {

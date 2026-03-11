@@ -18,8 +18,6 @@ import type { SdkBridge } from './sdk-bridge.js'
 import type { CodexActivityRecord, SdkServerMessage } from '../shared/ws-protocol.js'
 import type { ExtensionManager } from './extension-manager.js'
 import { TerminalStreamBroker } from './terminal-stream/broker.js'
-import { chunkProjects } from './ws-chunking.js'
-import { paginateProjects } from './session-pagination.js'
 import { buildSidebarOpenSessionKeys, type SidebarSessionLocator } from './sidebar-session-selection.js'
 import { loadSessionHistory, type ChatMessage } from './session-history-loader.js'
 import { TabRegistryRecordBaseSchema, TabRegistryRecordSchema } from './tabs-registry/types.js'
@@ -54,7 +52,6 @@ import {
   SdkSetModelSchema,
   SdkSetPermissionModeSchema,
   UiScreenshotResultSchema,
-  SessionsFetchSchema,
   WS_PROTOCOL_VERSION,
 } from '../shared/ws-protocol.js'
 import { UiLayoutSyncSchema } from './agent-api/layout-schema.js'
@@ -252,10 +249,7 @@ const TabsSyncQuerySchema = z.object({
 
 type ClientState = {
   authenticated: boolean
-  supportsSessionsPatchV1: boolean
-  supportsSessionsPaginationV1: boolean
   supportsUiScreenshotV1: boolean
-  sessionsSnapshotSent: boolean
   attachedTerminalIds: Set<string>
   createdByRequestId: Map<string, string>
   terminalCreateTimestamps: number[]
@@ -314,6 +308,7 @@ export class WsHandler {
   private terminalCreateLocks = new Map<string, Promise<void>>()
   private createdTerminalByRequestId = new Map<string, string>()
   private screenshotRequests = new Map<string, PendingScreenshot>()
+  private sessionsRevision = 0
   private terminalsRevision = 0
   private terminalRuntimeRevisions = new Map<string, number>()
   private readonly serverInstanceId: string
@@ -437,7 +432,6 @@ export class WsHandler {
       SdkSetPermissionModeSchema,
       UiLayoutSyncSchema,
       UiScreenshotResultSchema,
-      SessionsFetchSchema,
     ])
     const registryWithEvents = this.registry as unknown as {
       on?: (event: string, listener: (...args: any[]) => void) => void
@@ -715,10 +709,7 @@ export class WsHandler {
 
     const state: ClientState = {
       authenticated: false,
-      supportsSessionsPatchV1: false,
-      supportsSessionsPaginationV1: false,
       supportsUiScreenshotV1: false,
-      sessionsSnapshotSent: false,
       attachedTerminalIds: new Set(),
       createdByRequestId: new Map(),
       terminalCreateTimestamps: [],
@@ -958,80 +949,12 @@ export class WsHandler {
     }, 0)
   }
 
-  private paginateSidebarProjects(
-    projects: ProjectGroup[],
-    state: ClientState,
-    options: {
-      limit?: number
-      before?: number
-      beforeId?: string
-    } = {},
-  ) {
-    return paginateProjects(projects, {
-      limit: options.limit,
-      before: options.before,
-      beforeId: options.beforeId,
-      forceIncludeSessionKeys: state.sidebarOpenSessionKeys,
-    })
-  }
-
-  private async sendSidebarSessionsSnapshot(
-    ws: LiveWebSocket,
-    state: ClientState,
-    projects: ProjectGroup[],
-    options: {
-      authoritative?: boolean
-      forceClear?: boolean
-      limit?: number
-      before?: number
-      beforeId?: string
-    } = {},
-  ): Promise<boolean> {
-    const paginated = this.paginateSidebarProjects(projects, state, options)
-    const allSent = await this.sendChunkedSessions(ws, paginated.projects, {
-      authoritative: options.authoritative ? true : undefined,
-      totalSessions: paginated.totalSessions,
-      oldestIncludedTimestamp: paginated.oldestIncludedTimestamp,
-      oldestIncludedSessionId: paginated.oldestIncludedSessionId,
-      hasMore: paginated.hasMore,
-    }, options.forceClear)
-    state.sessionsSnapshotSent = allSent
-    return allSent
-  }
-
-  private async refreshSidebarSessionsSnapshot(ws: LiveWebSocket, state: ClientState): Promise<void> {
-    if (!this.handshakeSnapshotProvider) return
-    try {
-      const snapshot = await this.handshakeSnapshotProvider()
-      const projects = snapshot.projects ?? []
-      if (state.supportsSessionsPaginationV1) {
-        await this.sendSidebarSessionsSnapshot(ws, state, projects, {
-          authoritative: true,
-          forceClear: true,
-        })
-      } else {
-        const allSent = await this.sendChunkedSessions(ws, projects, undefined, true)
-        state.sessionsSnapshotSent = allSent
-      }
-    } catch (err) {
-      logger.warn({ err, connectionId: ws.connectionId }, 'Failed to refresh sidebar sessions snapshot')
-    }
-  }
-
   private async sendHandshakeSnapshot(ws: LiveWebSocket, state: ClientState) {
     if (!this.handshakeSnapshotProvider) return
     try {
       const snapshot = await this.handshakeSnapshotProvider()
       if (snapshot.settings) {
         this.safeSend(ws, { type: 'settings.updated', settings: snapshot.settings })
-      }
-      if (snapshot.projects) {
-        if (state.supportsSessionsPaginationV1) {
-          await this.sendSidebarSessionsSnapshot(ws, state, snapshot.projects)
-        } else {
-          const allSent = await this.sendChunkedSessions(ws, snapshot.projects)
-          state.sessionsSnapshotSent = allSent
-        }
       }
       if (typeof snapshot.perfLogging === 'boolean') {
         this.safeSend(ws, { type: 'perf.logging', enabled: snapshot.perfLogging })
@@ -1042,101 +965,6 @@ export class WsHandler {
     } catch (err) {
       logger.warn({ err }, 'Failed to send handshake snapshot')
     }
-  }
-
-  /**
-   * Send chunked sessions to a single WebSocket client with interleave protection.
-   * Uses a generation counter to cancel in-flight sends when a new update arrives.
-   * Returns true if all chunks were sent, false if sending was interrupted.
-   */
-  private async sendChunkedSessions(
-    ws: LiveWebSocket,
-    projects: ProjectGroup[],
-    paginationMeta?: {
-      authoritative?: true
-      totalSessions: number
-      oldestIncludedTimestamp: number
-      oldestIncludedSessionId: string
-      hasMore: boolean
-    },
-    forceClear?: boolean,
-  ): Promise<boolean> {
-    // Increment generation to cancel any in-flight sends for this connection
-    const generation = (ws.sessionUpdateGeneration = (ws.sessionUpdateGeneration || 0) + 1)
-    const isSuperseded = () => ws.sessionUpdateGeneration !== generation
-    const chunks = chunkProjects(projects, this.config.maxChunkBytes)
-
-    // Instrumentation: measure session payload size
-    const totalSessions = projects.reduce((sum, p) => sum + (p.sessions?.length ?? 0), 0)
-    let totalPayloadBytes = 0
-
-    for (let i = 0; i < chunks.length; i++) {
-      // Bail out if connection closed or a newer update has started
-      if (ws.readyState !== WebSocket.OPEN) return false
-      if (isSuperseded()) return false
-
-      // Wait for buffer to drain BEFORE sending the next chunk (skip first chunk).
-      // On remote connections (Tailscale, SSH tunnels), TCP drain is slower than
-      // chunk sends, so bufferedAmount can accumulate past the backpressure kill
-      // threshold (MAX_WS_BUFFERED_AMOUNT) if we don't drain first.
-      if (i > 0) {
-        const buffered = ws.bufferedAmount as number | undefined
-        if (typeof buffered === 'number' && buffered > this.config.drainThresholdBytes) {
-          if (!await this.waitForDrain(ws, this.config.drainThresholdBytes, this.config.drainTimeoutMs, isSuperseded)) return false
-        } else {
-          await new Promise<void>((resolve) => setImmediate(resolve))
-        }
-      }
-
-      // The fast-path yield above can give a newer generation a chance to start.
-      // Re-check before we serialize/send so stale streams do not leak chunks.
-      if (ws.readyState !== WebSocket.OPEN) return false
-      if (isSuperseded()) return false
-
-      const isFirst = i === 0
-      let msg: {
-        type: 'sessions.updated'
-        projects: ProjectGroup[]
-        clear?: true
-        append?: true
-        authoritative?: true
-        totalSessions?: number
-        oldestIncludedTimestamp?: number
-        oldestIncludedSessionId?: string
-        hasMore?: boolean
-      }
-
-      if (chunks.length === 1) {
-        // Single chunk: no flags needed (backwards compatible), unless forceClear
-        // is set (broadcast replacement path where client must clear existing state)
-        msg = { type: 'sessions.updated', projects: chunks[i], ...paginationMeta }
-        if (forceClear) msg.clear = true
-      } else if (isFirst) {
-        // First chunk: clear existing data, include pagination metadata
-        msg = { type: 'sessions.updated', projects: chunks[i], clear: true, ...paginationMeta }
-      } else {
-        // Subsequent chunks: append to existing
-        msg = { type: 'sessions.updated', projects: chunks[i], append: true }
-      }
-
-      totalPayloadBytes += Buffer.byteLength(JSON.stringify(msg))
-      // Skip the send() backpressure guard for chunks 2..N — we already
-      // drained above. Keep it for the first chunk in case the buffer is
-      // already near MAX_WS_BUFFERED_AMOUNT from concurrent writes.
-      this.safeSend(ws, msg, /* skipBackpressureCheck */ i > 0)
-    }
-    // Verify connection survived the final send (safeSend can trigger backpressure close)
-    const allSent = ws.readyState === WebSocket.OPEN && !isSuperseded()
-    if (allSent) {
-      logger.info({
-        event: 'sessions_snapshot_sent',
-        connectionId: ws.connectionId,
-        sessionCount: totalSessions,
-        chunkCount: chunks.length,
-        uncompressedBytes: totalPayloadBytes,
-      }, `Sessions snapshot: ${totalSessions} sessions, ${chunks.length} chunks, ${(totalPayloadBytes / 1024).toFixed(1)} KB uncompressed`)
-    }
-    return allSent
   }
   private async onMessage(ws: LiveWebSocket, state: ClientState, data: WebSocket.RawData) {
     const endMessageTimer = startPerfTimer(
@@ -1203,8 +1031,6 @@ export class WsHandler {
           return
         }
         state.authenticated = true
-        state.supportsSessionsPatchV1 = !!m.capabilities?.sessionsPatchV1
-        state.supportsSessionsPaginationV1 = !!m.capabilities?.sessionsPaginationV1
         state.supportsUiScreenshotV1 = !!m.capabilities?.uiScreenshotV1
         state.sidebarOpenSessionKeys = buildSidebarOpenSessionKeys(
           m.sidebarOpenSessions ?? [],
@@ -1284,7 +1110,6 @@ export class WsHandler {
         )
         if (!sameStringSet(state.sidebarOpenSessionKeys, nextSidebarOpenSessionKeys)) {
           state.sidebarOpenSessionKeys = nextSidebarOpenSessionKeys
-          await this.refreshSidebarSessionsSnapshot(ws, state)
         }
         return
       }
@@ -2170,37 +1995,6 @@ export class WsHandler {
         return
       }
 
-      case 'sessions.fetch': {
-        const parsed = SessionsFetchSchema.safeParse(msg)
-        if (!parsed.success) {
-          this.sendError(ws, { code: 'INVALID_MESSAGE', message: 'Invalid sessions.fetch', requestId: (msg as any).requestId })
-          return
-        }
-        const { requestId, before, beforeId, limit } = parsed.data
-        if (!this.handshakeSnapshotProvider) {
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Session provider not available', requestId })
-          return
-        }
-        try {
-          const snapshot = await this.handshakeSnapshotProvider()
-          const allProjects = snapshot.projects ?? []
-          const result = this.paginateSidebarProjects(allProjects, state, { before, beforeId, limit })
-          this.safeSend(ws, {
-            type: 'sessions.page',
-            requestId,
-            projects: result.projects,
-            totalSessions: result.totalSessions,
-            oldestIncludedTimestamp: result.oldestIncludedTimestamp,
-            oldestIncludedSessionId: result.oldestIncludedSessionId,
-            hasMore: result.hasMore,
-          })
-        } catch (err) {
-          logger.warn({ err, requestId }, 'Failed to fetch sessions page')
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Failed to fetch sessions', requestId })
-        }
-        return
-      }
-
       default:
         this.sendError(ws, { code: 'UNKNOWN_MESSAGE', message: 'Unknown message type' })
         return
@@ -2231,47 +2025,12 @@ export class WsHandler {
     this.broadcast({ type: 'ui.command', ...command })
   }
 
-  /**
-   * Broadcast sessions.updated to all connected clients with chunking for mobile compatibility.
-   * This handles backpressure per-client to avoid overwhelming mobile WebSocket buffers.
-   */
-  broadcastSessionsUpdated(projects: ProjectGroup[]): void {
-    for (const ws of this.connections) {
-      if (ws.readyState !== WebSocket.OPEN) continue
-      const state = this.clientStates.get(ws)
-      if (state?.supportsSessionsPaginationV1) {
-        void this.sendSidebarSessionsSnapshot(ws, state, projects, { forceClear: true })
-      } else {
-        void this.sendChunkedSessions(ws, projects)
-      }
-    }
-  }
-
-  broadcastSessionsUpdatedToLegacy(projects: ProjectGroup[]): void {
-    for (const ws of this.connections) {
-      if (ws.readyState !== WebSocket.OPEN) continue
-      const state = this.clientStates.get(ws)
-      if (!state?.authenticated) continue
-      if (state.supportsSessionsPatchV1 && state.sessionsSnapshotSent) continue
-      // Update sessionsSnapshotSent on success so patch-capable clients
-      // can transition to patch mode after a successful full snapshot.
-      void this.sendChunkedSessions(ws, projects).then((allSent) => {
-        if (allSent && state.supportsSessionsPatchV1) {
-          state.sessionsSnapshotSent = true
-        }
-      })
-    }
-  }
-
-  broadcastSessionsPatch(msg: { type: 'sessions.patch'; upsertProjects: ProjectGroup[]; removeProjectPaths: string[] }): void {
-    for (const ws of this.connections) {
-      if (ws.readyState !== WebSocket.OPEN) continue
-      const state = this.clientStates.get(ws)
-      if (!state?.authenticated) continue
-      if (!state.supportsSessionsPatchV1) continue
-      if (!state.sessionsSnapshotSent) continue
-      this.safeSend(ws, msg)
-    }
+  broadcastSessionsChanged(revision: number): void {
+    this.sessionsRevision = Math.max(this.sessionsRevision, revision)
+    this.broadcastAuthenticated({
+      type: 'sessions.changed',
+      revision,
+    })
   }
 
   broadcastTerminalsChanged(): void {

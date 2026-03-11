@@ -8,11 +8,6 @@ const HOOK_TIMEOUT_MS = 30_000
 
 vi.setConfig({ testTimeout: TEST_TIMEOUT_MS, hookTimeout: HOOK_TIMEOUT_MS })
 
-type Snapshot = {
-  settings: any
-  projects: any[]
-}
-
 class FakeRegistry {
   detach() {
     return true
@@ -50,11 +45,10 @@ function waitForMessage(ws: WebSocket, predicate: (msg: any) => boolean, timeout
 
     const handler = (data: WebSocket.Data) => {
       const msg = JSON.parse(data.toString())
-      if (predicate(msg)) {
-        clearTimeout(timeout)
-        ws.off('message', handler)
-        resolve(msg)
-      }
+      if (!predicate(msg)) return
+      clearTimeout(timeout)
+      ws.off('message', handler)
+      resolve(msg)
     }
 
     ws.on('message', handler)
@@ -80,30 +74,19 @@ function expectNoMessage(ws: WebSocket, predicate: (msg: any) => boolean, timeou
   })
 }
 
-function flattenSessions(projects: Array<{ sessions?: Array<{ sessionId: string }> }>): string[] {
-  return projects.flatMap((project) => (project.sessions || []).map((session) => session.sessionId))
-}
-
 describe('ws sidebar snapshot refresh', () => {
   let server: http.Server | undefined
   let port: number
-  let snapshot: Snapshot
   let wsHandler: any
 
   beforeAll(async () => {
     process.env.NODE_ENV = 'test'
     process.env.AUTH_TOKEN = 'testtoken-testtoken'
     process.env.HELLO_TIMEOUT_MS = '100'
-    delete process.env.MAX_WS_CHUNK_BYTES
 
     vi.resetModules()
     const { WsHandler } = await import('../../server/ws-handler')
     const { LayoutStore } = await import('../../server/agent-api/layout-store')
-
-    snapshot = {
-      settings: { theme: 'dark' },
-      projects: [],
-    }
 
     server = http.createServer((_req, res) => {
       res.statusCode = 404
@@ -116,7 +99,22 @@ describe('ws sidebar snapshot refresh', () => {
       undefined,
       undefined,
       undefined,
-      async () => snapshot,
+      async () => ({
+        settings: { theme: 'dark' },
+        projects: [
+          {
+            projectPath: '/demo',
+            sessions: [
+              {
+                provider: 'claude',
+                sessionId: 'older-open',
+                projectPath: '/demo',
+                updatedAt: 10,
+              },
+            ],
+          },
+        ],
+      }),
       undefined,
       undefined,
       'srv-local',
@@ -132,259 +130,22 @@ describe('ws sidebar snapshot refresh', () => {
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }, HOOK_TIMEOUT_MS)
 
-  it('refreshes and preserves personalized sidebar snapshots when ui.layout.sync changes the local open-session keys', async () => {
-    const targetSessionId = 'older-open'
-    const foreignSessionId = 'older-foreign'
-
-    snapshot = {
-      settings: { theme: 'dark' },
-      projects: [{
-        projectPath: '/demo',
-        sessions: [
-          ...Array.from({ length: 100 }, (_, index) => ({
-            provider: 'claude',
-            sessionId: `new-${index}`,
-            projectPath: '/demo',
-            updatedAt: 10_000 - index,
-          })),
-          {
-            provider: 'claude',
-            sessionId: targetSessionId,
-            projectPath: '/demo',
-            updatedAt: 10,
-          },
-          {
-            provider: 'claude',
-            sessionId: foreignSessionId,
-            projectPath: '/demo',
-            updatedAt: 9,
-          },
-        ],
-      }],
-    }
-
+  it('does not send sessions.updated during hello or ui.layout.sync refreshes', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
-    const closeWs = async () => {
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-        ws.terminate()
-      }
-      await new Promise<void>((resolve) => ws.on('close', () => resolve()))
-    }
 
     try {
       await new Promise<void>((resolve) => ws.on('open', () => resolve()))
 
       const readyPromise = waitForMessage(ws, (m) => m.type === 'ready')
-      const initialSessionsPromise = waitForMessage(ws, (m) => m.type === 'sessions.updated')
 
       ws.send(JSON.stringify({
         type: 'hello',
         token: 'testtoken-testtoken',
         protocolVersion: WS_PROTOCOL_VERSION,
-        capabilities: {
-          sessionsPaginationV1: true,
-        },
       }))
 
       await readyPromise
-      const initialSessions = await initialSessionsPromise
-      const initialIds = flattenSessions(initialSessions.projects)
-      expect(initialIds).not.toContain(targetSessionId)
-      expect(initialIds).not.toContain(foreignSessionId)
-      expect(initialSessions.authoritative).toBeUndefined()
-
-      const refreshPromise = waitForMessage(
-        ws,
-        (m) => m.type === 'sessions.updated' && flattenSessions(m.projects).includes(targetSessionId),
-      )
-
-      ws.send(JSON.stringify({
-        type: 'ui.layout.sync',
-        tabs: [
-          { id: 'tab-layout', title: 'layout local' },
-          {
-            id: 'tab-no-layout',
-            title: 'no layout local',
-            fallbackSessionRef: { provider: 'claude', sessionId: targetSessionId },
-          },
-          { id: 'tab-foreign', title: 'foreign copy' },
-        ],
-        activeTabId: 'tab-no-layout',
-        layouts: {
-          'tab-layout': {
-            type: 'leaf',
-            id: 'pane-layout',
-            content: {
-              kind: 'terminal',
-              mode: 'claude',
-              createRequestId: 'req-layout',
-              status: 'running',
-              resumeSessionId: targetSessionId,
-              sessionRef: {
-                provider: 'claude',
-                sessionId: targetSessionId,
-                serverInstanceId: 'srv-local',
-              },
-            },
-          },
-          'tab-foreign': {
-            type: 'leaf',
-            id: 'pane-foreign',
-            content: {
-              kind: 'terminal',
-              mode: 'claude',
-              createRequestId: 'req-foreign',
-              status: 'running',
-              sessionRef: {
-                provider: 'claude',
-                sessionId: foreignSessionId,
-                serverInstanceId: 'srv-remote',
-              },
-            },
-          },
-        },
-        activePane: {
-          'tab-layout': 'pane-layout',
-          'tab-foreign': 'pane-foreign',
-        },
-        paneTitles: {},
-        timestamp: Date.now(),
-      }))
-
-      const refreshedSessions = await refreshPromise
-      const refreshedIds = flattenSessions(refreshedSessions.projects)
-      expect(refreshedIds).toContain(targetSessionId)
-      expect(refreshedIds.filter((sessionId) => sessionId === targetSessionId)).toHaveLength(1)
-      expect(refreshedIds).not.toContain(foreignSessionId)
-      expect(refreshedSessions.authoritative).toBe(true)
-      expect(refreshedSessions.hasMore).toBe(true)
-
-      ws.send(JSON.stringify({
-        type: 'ui.layout.sync',
-        tabs: [
-          { id: 'tab-layout', title: 'layout local' },
-          {
-            id: 'tab-no-layout',
-            title: 'no layout local',
-            fallbackSessionRef: { provider: 'claude', sessionId: targetSessionId },
-          },
-          { id: 'tab-foreign', title: 'foreign copy' },
-        ],
-        activeTabId: 'tab-no-layout',
-        layouts: {
-          'tab-layout': {
-            type: 'leaf',
-            id: 'pane-layout',
-            content: {
-              kind: 'terminal',
-              mode: 'claude',
-              createRequestId: 'req-layout',
-              status: 'running',
-              resumeSessionId: targetSessionId,
-              sessionRef: {
-                provider: 'claude',
-                sessionId: targetSessionId,
-                serverInstanceId: 'srv-local',
-              },
-            },
-          },
-          'tab-foreign': {
-            type: 'leaf',
-            id: 'pane-foreign',
-            content: {
-              kind: 'terminal',
-              mode: 'claude',
-              createRequestId: 'req-foreign',
-              status: 'running',
-              sessionRef: {
-                provider: 'claude',
-                sessionId: foreignSessionId,
-                serverInstanceId: 'srv-remote',
-              },
-            },
-          },
-        },
-        activePane: {
-          'tab-layout': 'pane-layout',
-          'tab-foreign': 'pane-foreign',
-        },
-        paneTitles: {},
-        timestamp: Date.now(),
-      }))
-
       await expectNoMessage(ws, (m) => m.type === 'sessions.updated')
-
-      const broadcastPromise = waitForMessage(
-        ws,
-        (m) => m.type === 'sessions.updated' && flattenSessions(m.projects).includes(targetSessionId),
-      )
-      wsHandler.broadcastSessionsUpdated(snapshot.projects)
-
-      const broadcastedSessions = await broadcastPromise
-      const broadcastedIds = flattenSessions(broadcastedSessions.projects)
-      expect(broadcastedIds).toContain(targetSessionId)
-      expect(broadcastedIds).not.toContain(foreignSessionId)
-      expect(broadcastedSessions.authoritative).toBeUndefined()
-    } finally {
-      await closeWs()
-    }
-  })
-
-  it('normalizes agent-chat resumeSessionId to claude when refreshing personalized sidebar snapshots', async () => {
-    const targetSessionId = '550e8400-e29b-41d4-a716-446655440000'
-
-    snapshot = {
-      settings: { theme: 'dark' },
-      projects: [{
-        projectPath: '/claude',
-        sessions: [
-          ...Array.from({ length: 100 }, (_, index) => ({
-            provider: 'claude',
-            sessionId: `newer-${index}`,
-            projectPath: '/claude',
-            updatedAt: 20_000 - index,
-          })),
-          {
-            provider: 'claude',
-            sessionId: targetSessionId,
-            projectPath: '/claude',
-            updatedAt: 1,
-          },
-        ],
-      }],
-    }
-
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
-    const closeWs = async () => {
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-        ws.terminate()
-      }
-      await new Promise<void>((resolve) => ws.on('close', () => resolve()))
-    }
-
-    try {
-      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-
-      const readyPromise = waitForMessage(ws, (m) => m.type === 'ready')
-      const initialSessionsPromise = waitForMessage(ws, (m) => m.type === 'sessions.updated')
-
-      ws.send(JSON.stringify({
-        type: 'hello',
-        token: 'testtoken-testtoken',
-        protocolVersion: WS_PROTOCOL_VERSION,
-        capabilities: {
-          sessionsPaginationV1: true,
-        },
-      }))
-
-      await readyPromise
-      const initialSessions = await initialSessionsPromise
-      expect(flattenSessions(initialSessions.projects)).not.toContain(targetSessionId)
-
-      const refreshPromise = waitForMessage(
-        ws,
-        (m) => m.type === 'sessions.updated' && flattenSessions(m.projects).includes(targetSessionId),
-      )
 
       ws.send(JSON.stringify({
         type: 'ui.layout.sync',
@@ -399,7 +160,7 @@ describe('ws sidebar snapshot refresh', () => {
               provider: 'freshclaude',
               createRequestId: 'req-agent',
               status: 'connected',
-              resumeSessionId: targetSessionId,
+              resumeSessionId: 'older-open',
             },
           },
         },
@@ -410,11 +171,40 @@ describe('ws sidebar snapshot refresh', () => {
         timestamp: Date.now(),
       }))
 
-      const refreshedSessions = await refreshPromise
-      expect(flattenSessions(refreshedSessions.projects)).toContain(targetSessionId)
-      expect(refreshedSessions.hasMore).toBe(false)
+      await expectNoMessage(ws, (m) => m.type === 'sessions.updated')
     } finally {
-      await closeWs()
+      ws.terminate()
+      await new Promise<void>((resolve) => ws.on('close', () => resolve()))
+    }
+  })
+
+  it('broadcasts sessions.changed invalidations instead of snapshot payloads', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+
+      const readyPromise = waitForMessage(ws, (m) => m.type === 'ready')
+
+      ws.send(JSON.stringify({
+        type: 'hello',
+        token: 'testtoken-testtoken',
+        protocolVersion: WS_PROTOCOL_VERSION,
+      }))
+
+      await readyPromise
+
+      const invalidationPromise = waitForMessage(ws, (m) => m.type === 'sessions.changed')
+      wsHandler.broadcastSessionsChanged(7)
+
+      await expect(invalidationPromise).resolves.toEqual({
+        type: 'sessions.changed',
+        revision: 7,
+      })
+      await expectNoMessage(ws, (m) => m.type === 'sessions.updated')
+    } finally {
+      ws.terminate()
+      await new Promise<void>((resolve) => ws.on('close', () => resolve()))
     }
   })
 })

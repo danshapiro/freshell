@@ -736,8 +736,7 @@ describe('App WS message handling', () => {
     cleanup()
   })
 
-  it('buffers chunked sessions.updated and applies atomically after flush delay', async () => {
-    vi.useFakeTimers()
+  it('ignores legacy session bulk websocket messages because sidebar state is HTTP-owned', async () => {
     let handler: ((msg: any) => void) | null = null
     mockOnMessage.mockImplementation((cb: (msg: any) => void) => {
       handler = cb
@@ -749,264 +748,27 @@ describe('App WS message handling', () => {
 
     await vi.waitFor(() => expect(handler).not.toBeNull())
 
-    // Seed initial data so we can verify it's preserved during buffering
     act(() => {
       handler!({
         type: 'sessions.updated',
-        projects: [{ projectPath: '/existing', sessions: [{ provider: 'claude', sessionId: 's0', updatedAt: 0 }] }],
-      })
-    })
-    expect(store.getState().sessions.projects.map((p: any) => p.projectPath)).toEqual(['/existing'])
-
-    // Send chunked clear — should NOT clear Redux state immediately
-    act(() => {
-      handler!({
-        type: 'sessions.updated',
-        clear: true,
         projects: [{ projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', updatedAt: 1 }] }],
       })
-    })
-    // Old data should still be in Redux (buffer holds new data)
-    expect(store.getState().sessions.projects.map((p: any) => p.projectPath)).toEqual(['/existing'])
-
-    // Send append chunk
-    act(() => {
-      handler!({
-        type: 'sessions.updated',
-        append: true,
-        projects: [{ projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', updatedAt: 2 }] }],
-      })
-    })
-    // Still old data in Redux
-    expect(store.getState().sessions.projects.map((p: any) => p.projectPath)).toEqual(['/existing'])
-
-    // Advance past the flush delay (300ms)
-    act(() => { vi.advanceTimersByTime(300) })
-
-    // Now both chunks should be applied atomically
-    expect(store.getState().sessions.projects.map((p: any) => p.projectPath).sort()).toEqual(['/p1', '/p2'])
-
-    vi.useRealTimers()
-  })
-
-  it('flushes chunked buffer when a sessions.patch arrives mid-chunking', async () => {
-    vi.useFakeTimers()
-    let handler: ((msg: any) => void) | null = null
-    mockOnMessage.mockImplementation((cb: (msg: any) => void) => {
-      handler = cb
-      return () => { handler = null }
-    })
-
-    const store = createTestStore()
-    renderApp(store)
-
-    await vi.waitFor(() => expect(handler).not.toBeNull())
-
-    // Start a chunked update
-    act(() => {
-      handler!({
-        type: 'sessions.updated',
-        clear: true,
-        projects: [{ projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', updatedAt: 1 }] }],
-      })
-      handler!({
-        type: 'sessions.updated',
-        append: true,
-        projects: [{ projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', updatedAt: 2 }] }],
-      })
-    })
-
-    // Buffer hasn't flushed yet
-    expect(store.getState().sessions.projects).toEqual([])
-
-    // Patch arrives — should flush buffer first, then apply patch
-    act(() => {
       handler!({
         type: 'sessions.patch',
-        upsertProjects: [{ projectPath: '/p3', sessions: [{ provider: 'claude', sessionId: 's3', updatedAt: 3 }] }],
-        removeProjectPaths: ['/p1'],
+        upsertProjects: [{ projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', updatedAt: 2 }] }],
+        removeProjectPaths: [],
       })
-    })
-
-    // Buffer should have flushed (/p1, /p2), then patch applied (remove /p1, add /p3)
-    expect(store.getState().sessions.projects.map((p: any) => p.projectPath).sort()).toEqual(['/p2', '/p3'])
-
-    vi.useRealTimers()
-  })
-
-  it('preserves existing data when late chunk arrives after flush timer', async () => {
-    vi.useFakeTimers()
-    let handler: ((msg: any) => void) | null = null
-    mockOnMessage.mockImplementation((cb: (msg: any) => void) => {
-      handler = cb
-      return () => { handler = null }
-    })
-
-    const store = createTestStore()
-    renderApp(store)
-
-    await vi.waitFor(() => expect(handler).not.toBeNull())
-
-    // Seed initial data
-    act(() => {
       handler!({
-        type: 'sessions.updated',
-        projects: [
-          { projectPath: '/existing1', sessions: [{ provider: 'claude', sessionId: 's0', updatedAt: 0 }] },
-          { projectPath: '/existing2', sessions: [{ provider: 'claude', sessionId: 's1', updatedAt: 1 }] },
-        ],
-      })
-    })
-    expect(store.getState().sessions.projects).toHaveLength(2)
-
-    // Start chunked update — only first chunk arrives
-    act(() => {
-      handler!({
-        type: 'sessions.updated',
-        clear: true,
-        projects: [{ projectPath: '/new1', sessions: [{ provider: 'claude', sessionId: 's2', updatedAt: 2 }] }],
-      })
-    })
-    // Old data still visible
-    expect(store.getState().sessions.projects.map((p: any) => p.projectPath).sort()).toEqual(['/existing1', '/existing2'])
-
-    // Flush timer fires before second chunk (simulates backpressure gap)
-    act(() => { vi.advanceTimersByTime(300) })
-
-    // Flushed atomically — buffer had full stream (only 1 chunk + 300ms silence = complete)
-    expect(store.getState().sessions.projects.map((p: any) => p.projectPath)).toEqual(['/new1'])
-
-    // Late append chunk arrives — merges gracefully
-    act(() => {
-      handler!({
-        type: 'sessions.updated',
-        append: true,
-        projects: [{ projectPath: '/new2', sessions: [{ provider: 'claude', sessionId: 's3', updatedAt: 3 }] }],
+        type: 'sessions.page',
+        projects: [{ projectPath: '/p3', sessions: [{ provider: 'claude', sessionId: 's3', updatedAt: 3 }] }],
+        totalSessions: 1,
+        oldestIncludedTimestamp: 3,
+        oldestIncludedSessionId: 'claude:s3',
+        hasMore: false,
       })
     })
 
-    // Both chunks now in Redux
-    expect(store.getState().sessions.projects.map((p: any) => p.projectPath).sort()).toEqual(['/new1', '/new2'])
-
-    vi.useRealTimers()
-  })
-
-  it('merges a late append chunk into the same split project after the flush timer', async () => {
-    vi.useFakeTimers()
-    let handler: ((msg: any) => void) | null = null
-    mockOnMessage.mockImplementation((cb: (msg: any) => void) => {
-      handler = cb
-      return () => { handler = null }
-    })
-
-    const store = createTestStore()
-    renderApp(store)
-
-    await vi.waitFor(() => expect(handler).not.toBeNull())
-
-    act(() => {
-      handler!({
-        type: 'sessions.updated',
-        clear: true,
-        projects: [{
-          projectPath: '/split/project',
-          sessions: [
-            { provider: 'claude', sessionId: 's1', updatedAt: 1 },
-            { provider: 'claude', sessionId: 's2', updatedAt: 2 },
-          ],
-        }],
-      })
-    })
-
-    act(() => { vi.advanceTimersByTime(300) })
-
-    expect(store.getState().sessions.projects[0].sessions.map((s: any) => s.sessionId)).toEqual(['s1', 's2'])
-
-    act(() => {
-      handler!({
-        type: 'sessions.updated',
-        append: true,
-        projects: [{
-          projectPath: '/split/project',
-          sessions: [
-            { provider: 'claude', sessionId: 's3', updatedAt: 3 },
-          ],
-        }],
-      })
-    })
-
-    expect(store.getState().sessions.projects).toHaveLength(1)
-    expect(store.getState().sessions.projects[0].sessions.map((s: any) => s.sessionId)).toEqual(['s3', 's1', 's2'])
-
-    vi.useRealTimers()
-  })
-
-  it('ignores sessions.patch messages until a WS sessions.updated snapshot is received', async () => {
-    let handler: ((msg: any) => void) | null = null
-    mockOnMessage.mockImplementation((cb: (msg: any) => void) => {
-      handler = cb
-      return () => { handler = null }
-    })
-
-    const store = createTestStore()
-    renderApp(store)
-    await waitFor(() => expect(handler).not.toBeNull())
-
-    handler!({
-      type: 'sessions.patch',
-      upsertProjects: [{ projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', updatedAt: 1 }] }],
-      removeProjectPaths: [],
-    })
-
-    await waitFor(() => {
-      expect(store.getState().sessions.projects).toEqual([])
-    })
-
-    handler!({
-      type: 'sessions.updated',
-      projects: [{ projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', updatedAt: 2 }] }],
-    })
-
-    handler!({
-      type: 'sessions.patch',
-      upsertProjects: [{ projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', updatedAt: 3 }] }],
-      removeProjectPaths: [],
-    })
-
-    await waitFor(() => {
-      expect(store.getState().sessions.projects.map((p: any) => p.projectPath).sort()).toEqual(['/p1', '/p2'])
-    })
-  })
-
-  it('applies sessions.patch messages (upsert + remove) without clearing all sessions', async () => {
-    let handler: ((msg: any) => void) | null = null
-    mockOnMessage.mockImplementation((cb: (msg: any) => void) => {
-      handler = cb
-      return () => { handler = null }
-    })
-
-    const store = createTestStore()
-    renderApp(store)
-    await waitFor(() => expect(handler).not.toBeNull())
-
-    // Seed state via a full snapshot (existing behavior).
-    handler!({
-      type: 'sessions.updated',
-      projects: [
-        { projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', updatedAt: 1 }] },
-        { projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', updatedAt: 2 }] },
-      ],
-    })
-
-    handler!({
-      type: 'sessions.patch',
-      upsertProjects: [{ projectPath: '/p3', sessions: [{ provider: 'claude', sessionId: 's3', updatedAt: 3 }] }],
-      removeProjectPaths: ['/p1'],
-    })
-
-    await waitFor(() => {
-      expect(store.getState().sessions.projects.map((p: any) => p.projectPath).sort()).toEqual(['/p2', '/p3'])
-    })
+    expect(store.getState().sessions.projects).toEqual([])
   })
 })
 

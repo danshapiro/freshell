@@ -1,14 +1,8 @@
 import type { ProjectGroup } from '../coding-cli/types.js'
 import { diffProjects } from './diff.js'
 
-function estimateBytes(value: unknown): number {
-  return Buffer.byteLength(JSON.stringify(value))
-}
-
 type SessionsSyncWs = {
-  broadcastSessionsPatch: (msg: { type: 'sessions.patch'; upsertProjects: ProjectGroup[]; removeProjectPaths: string[] }) => void
-  broadcastSessionsUpdatedToLegacy: (projects: ProjectGroup[]) => void
-  broadcastSessionsUpdated: (projects: ProjectGroup[]) => void
+  broadcastSessionsChanged: (msg: { type: 'sessions.changed'; revision: number }) => void
 }
 
 type SessionsSyncOptions = { coalesceMs?: number }
@@ -25,6 +19,7 @@ export class SessionsSyncService {
   private pendingTrailing: ProjectGroup[] | null = null
   private timer: NodeJS.Timeout | null = null
   private coalesceMs: number
+  private revision = 0
 
   constructor(
     private ws: SessionsSyncWs,
@@ -64,22 +59,11 @@ export class SessionsSyncService {
     if (diff.upsertProjects.length === 0 && diff.removeProjectPaths.length === 0) {
       return
     }
-
-    const patchMsg = {
-      type: 'sessions.patch',
-      upsertProjects: diff.upsertProjects,
-      removeProjectPaths: diff.removeProjectPaths,
-    } as const
-
-    const maxBytes = Number(process.env.MAX_WS_CHUNK_BYTES || 500 * 1024)
-    if (estimateBytes(patchMsg) > maxBytes) {
-      this.ws.broadcastSessionsUpdated(next)
-      return
-    }
-
-    // Patch-first: send diffs to capable clients; snapshots only to legacy clients.
-    this.ws.broadcastSessionsPatch(patchMsg)
-    this.ws.broadcastSessionsUpdatedToLegacy(next)
+    this.revision += 1
+    this.ws.broadcastSessionsChanged({
+      type: 'sessions.changed',
+      revision: this.revision,
+    })
   }
 
   private onWindowElapsed = () => {

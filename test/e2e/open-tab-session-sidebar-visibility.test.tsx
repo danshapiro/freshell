@@ -316,8 +316,8 @@ describe('open tab session sidebar visibility (e2e)', () => {
     })
   })
 
-  it('updates the sidebar when a no-layout local session tab triggers a personalized websocket refresh', async () => {
-    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+  it('ignores legacy sessions.updated websocket pushes because the sidebar window is HTTP-owned', async () => {
+    fetchSidebarSessionsSnapshot.mockResolvedValue({
       projects: [{
         projectPath: '/recent',
         sessions: [{
@@ -343,38 +343,17 @@ describe('open tab session sidebar visibility (e2e)', () => {
     )
 
     await waitFor(() => {
-      expect(screen.getByText('Recent Session')).toBeInTheDocument()
-    })
-
-    act(() => {
-      broadcastWs({
-        type: 'ready',
-        timestamp: new Date().toISOString(),
-        serverInstanceId: 'srv-local',
-      })
-    })
-
-    await waitFor(() => {
-      expect(store.getState().connection.status).toBe('ready')
-      expect(store.getState().connection.serverInstanceId).toBe('srv-local')
-    })
-
-    await act(async () => {
-      await store.dispatch(openSessionTab({ provider: 'codex', sessionId: 'older-open' }) as any)
-    })
-
-    await waitFor(() => {
-      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
-        type: 'ui.layout.sync',
-        tabs: expect.arrayContaining([
-          expect.objectContaining({
-            fallbackSessionRef: {
-              provider: 'codex',
-              sessionId: 'older-open',
-            },
-          }),
-        ]),
-      }))
+      expect(store.getState().sessions.projects).toEqual([
+        expect.objectContaining({
+          projectPath: '/recent',
+          sessions: expect.arrayContaining([
+            expect.objectContaining({
+              sessionId: 'recent-session',
+              title: 'Recent Session',
+            }),
+          ]),
+        }),
+      ])
     })
 
     act(() => {
@@ -391,19 +370,27 @@ describe('open tab session sidebar visibility (e2e)', () => {
             title: 'Older Open Session',
           }],
         }],
-        totalSessions: 101,
+        totalSessions: 1,
         oldestIncludedTimestamp: 1,
         oldestIncludedSessionId: 'codex:older-open',
         hasMore: false,
       })
     })
 
-    await waitFor(() => {
-      expect(screen.getByText('Older Open Session')).toBeInTheDocument()
-    })
+    expect(store.getState().sessions.projects).toEqual([
+      expect.objectContaining({
+        projectPath: '/recent',
+        sessions: expect.arrayContaining([
+          expect.objectContaining({
+            sessionId: 'recent-session',
+            title: 'Recent Session',
+          }),
+        ]),
+      }),
+    ])
   })
 
-  it('removes a force-included older session when a later personalized refresh no longer includes it', async () => {
+  it('refetches the active sidebar window over HTTP when sessions.changed arrives', async () => {
     fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
       projects: [{
         projectPath: '/recent',
@@ -420,6 +407,22 @@ describe('open tab session sidebar visibility (e2e)', () => {
       oldestIncludedSessionId: 'codex:recent-session',
       hasMore: true,
     })
+    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+      projects: [{
+        projectPath: '/older',
+        sessions: [{
+          provider: 'codex',
+          sessionId: 'older-open',
+          projectPath: '/older',
+          updatedAt: 1,
+          title: 'Older Open Session',
+        }],
+      }],
+      totalSessions: 1,
+      oldestIncludedTimestamp: 1,
+      oldestIncludedSessionId: 'codex:older-open',
+      hasMore: false,
+    })
 
     const store = createStore()
 
@@ -430,7 +433,17 @@ describe('open tab session sidebar visibility (e2e)', () => {
     )
 
     await waitFor(() => {
-      expect(screen.getByText('Recent Session')).toBeInTheDocument()
+      expect(store.getState().sessions.projects).toEqual([
+        expect.objectContaining({
+          projectPath: '/recent',
+          sessions: expect.arrayContaining([
+            expect.objectContaining({
+              sessionId: 'recent-session',
+              title: 'Recent Session',
+            }),
+          ]),
+        }),
+      ])
     })
 
     act(() => {
@@ -466,65 +479,24 @@ describe('open tab session sidebar visibility (e2e)', () => {
 
     act(() => {
       broadcastWs({
-        type: 'sessions.updated',
-        clear: true,
-        projects: [
-          {
-            projectPath: '/recent',
-            sessions: [{
-              provider: 'codex',
-              sessionId: 'recent-session',
-              projectPath: '/recent',
-              updatedAt: 10,
-              title: 'Recent Session',
-            }],
-          },
-          {
-            projectPath: '/older',
-            sessions: [{
-              provider: 'codex',
+        type: 'sessions.changed',
+        revision: 7,
+      })
+    })
+
+    await waitFor(() => {
+      expect(fetchSidebarSessionsSnapshot.mock.calls.length).toBeGreaterThanOrEqual(2)
+      expect(store.getState().sessions.projects).toEqual([
+        expect.objectContaining({
+          projectPath: '/older',
+          sessions: expect.arrayContaining([
+            expect.objectContaining({
               sessionId: 'older-open',
-              projectPath: '/older',
-              updatedAt: 1,
               title: 'Older Open Session',
-            }],
-          },
-        ],
-        totalSessions: 101,
-        oldestIncludedTimestamp: 10,
-        oldestIncludedSessionId: 'codex:recent-session',
-        hasMore: true,
-      })
-    })
-
-    await waitFor(() => {
-      expect(screen.getByText('Older Open Session')).toBeInTheDocument()
-    })
-
-    act(() => {
-      broadcastWs({
-        type: 'sessions.updated',
-        clear: true,
-        authoritative: true,
-        projects: [{
-          projectPath: '/recent',
-          sessions: [{
-            provider: 'codex',
-            sessionId: 'recent-session',
-            projectPath: '/recent',
-            updatedAt: 10,
-            title: 'Recent Session',
-          }],
-        }],
-        totalSessions: 100,
-        oldestIncludedTimestamp: 10,
-        oldestIncludedSessionId: 'codex:recent-session',
-        hasMore: true,
-      })
-    })
-
-    await waitFor(() => {
-      expect(screen.queryByText('Older Open Session')).not.toBeInTheDocument()
+            }),
+          ]),
+        }),
+      ])
     })
   })
 })
