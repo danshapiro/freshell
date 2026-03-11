@@ -73,6 +73,7 @@ afterEach(async () => {
 function createChildEnv(cwd: string, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env }
   for (const key of [
+    'FRESHELL_TEST_COORDINATOR_ACTIVE',
     'VITEST',
     'VITEST_POOL_ID',
     'VITEST_WORKER_ID',
@@ -580,7 +581,7 @@ describe('test coordinator CLI', () => {
       {
         FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
         FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
-          'vitest:default:run': { holdMs: 4_000 },
+          'vitest:default:run': { holdMs: 20_000 },
         }),
       },
     )
@@ -652,7 +653,7 @@ describe('test coordinator CLI', () => {
         FRESHELL_TEST_SUMMARY: 'Long-running holder',
         FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
         FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
-          'vitest:default:run': { holdMs: 1_200 },
+          'vitest:default:run': { holdMs: 10_000 },
         }),
       },
     )

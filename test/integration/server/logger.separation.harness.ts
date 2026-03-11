@@ -32,6 +32,7 @@ export async function startServerProcess(
   const logStream = await createLogWriter(logPath)
   const childEnv: NodeJS.ProcessEnv = { ...process.env }
   for (const key of [
+    'FRESHELL_TEST_COORDINATOR_ACTIVE',
     'LOG_DEBUG_PATH',
     'FRESHELL_LOG_MODE',
     'FRESHELL_LOG_INSTANCE_ID',
@@ -127,7 +128,7 @@ export async function listCandidateFiles(
   logDir: string,
   mode: string,
   instance: string,
-  timeoutMs = 4000,
+  timeoutMs = 10_000,
   pollMs = 120,
 ): Promise<string[]> {
   const deadline = Date.now() + timeoutMs
