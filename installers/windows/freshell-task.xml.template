@@ -10,7 +10,7 @@
   </Triggers>
   <Principals>
     <Principal id="Author">
-      <RunLevel>HighestAvailable</RunLevel>
+      <RunLevel>LeastPrivilege</RunLevel>
     </Principal>
   </Principals>
   <Settings>

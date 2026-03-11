@@ -67,6 +67,7 @@ export class WindowsServiceDaemonManager implements DaemonManager {
       '/XML', getTaskXmlPath(),
       '/F', // Force overwrite if exists (idempotent)
     ])
+    await this.ensureLeastPrivilege()
   }
 
   async uninstall(): Promise<void> {
@@ -87,6 +88,7 @@ export class WindowsServiceDaemonManager implements DaemonManager {
   }
 
   async start(): Promise<void> {
+    await this.ensureLeastPrivilege()
     await execFilePromise('schtasks', ['/Run', '/TN', TASK_NAME])
   }
 
@@ -150,5 +152,9 @@ export class WindowsServiceDaemonManager implements DaemonManager {
     } catch {
       return false
     }
+  }
+
+  private async ensureLeastPrivilege(): Promise<void> {
+    await execFilePromise('schtasks', ['/Change', '/TN', TASK_NAME, '/RL', 'LIMITED'])
   }
 }

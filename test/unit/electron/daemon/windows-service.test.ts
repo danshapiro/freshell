@@ -33,6 +33,11 @@ const testPaths: DaemonPaths = {
 
 const TEMPLATE_CONTENT = `<?xml version="1.0"?>
 <Task>
+  <Principals>
+    <Principal id="Author">
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
   <Actions><Exec>
     <Command>cmd.exe</Command>
     <Arguments>/c "set "NODE_PATH={{NODE_PATH}}" &amp;&amp; set "NODE_ENV=production" &amp;&amp; set "PORT={{PORT}}" &amp;&amp; set "FRESHELL_CONFIG_DIR={{CONFIG_DIR}}" &amp;&amp; "{{NODE_BINARY}}" "{{SERVER_ENTRY}}""</Arguments>
@@ -132,6 +137,15 @@ describe('WindowsServiceDaemonManager', () => {
         expect(call[1]).toContain('/F')
       }
     })
+
+    it('writes a least-privilege task definition', async () => {
+      setupExecFileSuccess()
+      await manager.install(testPaths, 3001)
+
+      const writtenContent = mockWriteFile.mock.calls[0][1] as string
+      expect(writtenContent).toContain('<RunLevel>LeastPrivilege</RunLevel>')
+      expect(writtenContent).not.toContain('<RunLevel>HighestAvailable</RunLevel>')
+    })
   })
 
   describe('uninstall', () => {
@@ -158,6 +172,19 @@ describe('WindowsServiceDaemonManager', () => {
         (call: any[]) => call[0] === 'schtasks' && call[1]?.includes('/Run')
       )
       expect(runCall).toBeDefined()
+    })
+
+    it('normalizes the scheduled task to LIMITED before start', async () => {
+      setupExecFileSuccess()
+      await manager.start()
+
+      expect(mockExecFile.mock.calls[0][0]).toBe('schtasks')
+      expect(mockExecFile.mock.calls[0][1]).toEqual(
+        expect.arrayContaining(['/Change', '/TN', 'Freshell Server', '/RL', 'LIMITED']),
+      )
+      expect(mockExecFile.mock.calls[1][1]).toEqual(
+        expect.arrayContaining(['/Run', '/TN', 'Freshell Server']),
+      )
     })
   })
 
