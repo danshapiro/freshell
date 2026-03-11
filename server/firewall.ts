@@ -145,17 +145,17 @@ export function firewallCommands(platform: FirewallPlatform, ports: number[]): s
       ]
 
     case 'windows':
-      // Native Windows: netsh requires admin elevation. Return the commands
-      // as data — the configure-firewall endpoint will spawn an elevated
-      // PowerShell to execute them (same approach as WSL2).
+      // Native Windows: netsh requires admin elevation. Return commands as data;
+      // the configure-firewall endpoint now waits for explicit client confirmation
+      // before spawning the shared elevated PowerShell helper.
       // SECURITY: profile=private restricts to private networks only.
       return ports.map(
         (p) => `netsh advfirewall firewall add rule name="Freshell (port ${p})" dir=in action=allow protocol=TCP localport=${p} profile=private`,
       )
 
     case 'wsl2':
-      // WSL2 firewall + port proxy is handled by wsl-port-forward.ts via the
-      // configure-firewall endpoint, which spawns elevated PowerShell async.
+      // WSL2 repair is planned by wsl-port-forward.ts and only elevated after an
+      // explicit configure-firewall confirmation from the client flow.
       return []
 
     case 'linux-none':

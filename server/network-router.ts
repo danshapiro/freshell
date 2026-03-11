@@ -1,6 +1,8 @@
 import { Router } from 'express'
 import { z } from 'zod'
+import { spawnElevatedPowerShell } from './elevated-powershell.js'
 import { logger } from './logger.js'
+import { computeWslPortForwardingPlan } from './wsl-port-forward.js'
 
 const log = logger.child({ component: 'network-router' })
 
@@ -8,6 +10,17 @@ export const NetworkConfigureSchema = z.object({
   host: z.enum(['127.0.0.1', '0.0.0.0']),
   configured: z.boolean(),
 })
+
+const ConfigureFirewallRequestSchema = z.object({
+  confirmElevation: z.literal(true).optional(),
+}).strict()
+
+const WINDOWS_ELEVATION_CONFIRMATION = {
+  method: 'confirmation-required',
+  title: 'Administrator approval required',
+  body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
+  confirmLabel: 'Continue',
+} as const
 
 export interface NetworkRouterDeps {
   networkManager: {
@@ -29,6 +42,37 @@ export interface NetworkRouterDeps {
 export function createNetworkRouter(deps: NetworkRouterDeps): Router {
   const { networkManager, configStore, wsHandler, detectLanIps } = deps
   const router = Router()
+
+  const startElevatedRepair = (
+    command: string,
+    script: string,
+    {
+      completedLog,
+      failedLog,
+      spawnFailedLog,
+    }: {
+      completedLog: string
+      failedLog: string
+      spawnFailedLog: string
+    },
+  ) => {
+    networkManager.setFirewallConfiguring(true)
+    const child = spawnElevatedPowerShell(command, script, (err, _stdout, stderr) => {
+      if (err) {
+        log.error({ err, stderr }, failedLog)
+      } else {
+        log.info(completedLog)
+      }
+      networkManager.resetFirewallCache()
+      networkManager.setFirewallConfiguring(false)
+    })
+
+    child.on('error', (err) => {
+      log.error({ err }, spawnFailedLog)
+      networkManager.resetFirewallCache()
+      networkManager.setFirewallConfiguring(false)
+    })
+  }
 
   router.get('/lan-info', (_req, res) => {
     res.json({ ips: detectLanIps() })
@@ -66,9 +110,15 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
     }
   })
 
-  router.post('/network/configure-firewall', async (_req, res) => {
+  router.post('/network/configure-firewall', async (req, res) => {
+    const parsed = ConfigureFirewallRequestSchema.safeParse(req.body ?? {})
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
+    }
+
     try {
       const status = await networkManager.getStatus()
+      const confirmElevation = parsed.data.confirmElevation === true
 
       // In-flight guard: prevent concurrent elevated firewall processes
       if (status.firewall.configuring) {
@@ -80,71 +130,51 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
 
       const commands = status.firewall.commands
 
-      if (commands.length === 0) {
-        if (status.firewall.platform === 'wsl2') {
-          const { execFile } = await import('node:child_process')
-          const { buildPortForwardingScript, getWslIp } = await import('./wsl-port-forward.js')
-          const POWERSHELL_PATH = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
-          try {
-            const wslIp = getWslIp()
-            if (!wslIp) {
-              log.error('Failed to detect WSL2 IP address')
-              return res.status(500).json({ error: 'Could not detect WSL2 IP address' })
-            }
-            const ports = networkManager.getRelevantPorts()
-            const rawScript = buildPortForwardingScript(wslIp, ports)
-            const script = rawScript.replace(/\\\$/g, '$')
-            const escapedScript = script.replace(/'/g, "''")
-            networkManager.setFirewallConfiguring(true)
-            const child = execFile(POWERSHELL_PATH, [
-              '-Command',
-              `Start-Process powershell -Verb RunAs -Wait -ArgumentList '-Command', '${escapedScript}'`,
-            ], { timeout: 120000 }, (err, _stdout, stderr) => {
-              if (err) {
-                log.error({ err, stderr }, 'WSL2 port forwarding failed')
-              } else {
-                log.info('WSL2 port forwarding completed successfully')
-              }
-              networkManager.resetFirewallCache()
-              networkManager.setFirewallConfiguring(false)
-            })
-            child.on('error', (err) => {
-              log.error({ err }, 'Failed to spawn PowerShell for WSL2 port forwarding')
-              networkManager.resetFirewallCache()
-              networkManager.setFirewallConfiguring(false)
-            })
-            return res.json({ method: 'wsl2', status: 'started' })
-          } catch (err) {
-            log.error({ err }, 'WSL2 port forwarding setup error')
-            networkManager.setFirewallConfiguring(false)
-            return res.status(500).json({ error: 'WSL2 port forwarding failed to start' })
-          }
+      if (status.firewall.platform === 'wsl2') {
+        const plan = computeWslPortForwardingPlan(networkManager.getRelevantPorts())
+
+        if (plan.status === 'error') {
+          log.error({ message: plan.message }, 'WSL2 port forwarding setup error')
+          return res.status(500).json({ error: plan.message })
         }
-        return res.json({ method: 'none', message: 'No firewall detected' })
+
+        if (plan.status === 'not-wsl2' || plan.status === 'noop') {
+          return res.json({ method: 'none', message: 'No configuration changes required' })
+        }
+
+        if (!confirmElevation) {
+          return res.json(WINDOWS_ELEVATION_CONFIRMATION)
+        }
+
+        try {
+          startElevatedRepair(
+            '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe',
+            plan.script,
+            {
+              completedLog: 'WSL2 port forwarding completed successfully',
+              failedLog: 'WSL2 port forwarding failed',
+              spawnFailedLog: 'Failed to spawn PowerShell for WSL2 port forwarding',
+            },
+          )
+          return res.json({ method: 'wsl2', status: 'started' })
+        } catch (err) {
+          log.error({ err }, 'WSL2 port forwarding setup error')
+          networkManager.setFirewallConfiguring(false)
+          return res.status(500).json({ error: 'WSL2 port forwarding failed to start' })
+        }
       }
 
       if (status.firewall.platform === 'windows') {
-        const { execFile } = await import('node:child_process')
+        if (!confirmElevation) {
+          return res.json(WINDOWS_ELEVATION_CONFIRMATION)
+        }
+
         const script = commands.join('; ')
-        const escapedScript = script.replace(/'/g, "''")
         try {
-          networkManager.setFirewallConfiguring(true)
-          const child = execFile('powershell.exe', [
-            '-Command',
-            `Start-Process powershell -Verb RunAs -Wait -ArgumentList '-Command', '${escapedScript}'`,
-          ], { timeout: 120000 }, (err, _stdout, stderr) => {
-            if (err) {
-              log.error({ err, stderr }, 'Windows firewall configuration failed')
-            } else {
-              log.info('Windows firewall configured successfully')
-            }
-            networkManager.resetFirewallCache()
-            networkManager.setFirewallConfiguring(false)
-          })
-          child.on('error', (err) => {
-            log.error({ err }, 'Failed to spawn PowerShell for Windows firewall')
-            networkManager.resetFirewallCache()
-            networkManager.setFirewallConfiguring(false)
+          startElevatedRepair('powershell.exe', script, {
+            completedLog: 'Windows firewall configured successfully',
+            failedLog: 'Windows firewall configuration failed',
+            spawnFailedLog: 'Failed to spawn PowerShell for Windows firewall',
           })
           return res.json({ method: 'windows-elevated', status: 'started' })
         } catch (err) {
@@ -152,6 +182,10 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
           networkManager.setFirewallConfiguring(false)
           return res.status(500).json({ error: 'Windows firewall configuration failed to start' })
         }
+      }
+
+      if (commands.length === 0) {
+        return res.json({ method: 'none', message: 'No firewall detected' })
       }
 
       // Linux/macOS: return command for client to run in a terminal pane

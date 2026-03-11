@@ -25,9 +25,12 @@ vi.mock('is-port-reachable', () => ({
   default: vi.fn().mockResolvedValue(true),
 }))
 vi.mock('../../../server/wsl-port-forward.js', () => ({
-  getWslIp: vi.fn().mockReturnValue('172.24.0.2'),
-  buildPortForwardingScript: vi.fn().mockReturnValue('$null # mock script'),
-  setupWslPortForwarding: vi.fn(),
+  computeWslPortForwardingPlan: vi.fn().mockReturnValue({
+    status: 'ready',
+    wslIp: '172.24.0.2',
+    scriptKind: 'full',
+    script: '$null # mock script',
+  }),
 }))
 vi.mock('node:child_process', async () => {
   const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process')
@@ -51,6 +54,7 @@ describe('Network API integration', () => {
   })
 
   beforeEach(async () => {
+    vi.clearAllMocks()
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-test-'))
     process.env.FRESHELL_HOME = tmpDir
 
@@ -196,30 +200,141 @@ describe('Network API integration', () => {
       expect(res.body.command).toContain('ufw allow')
     })
 
-    it('returns wsl2 method for wsl2 platform', async () => {
+    it('returns confirmation-required for WSL2 until the caller confirms elevation', async () => {
       vi.mocked(detectFirewall).mockResolvedValue({
         platform: 'wsl2',
         active: true,
       })
       networkManager.resetFirewallCache()
-      const cp = await import('node:child_process')
-      vi.mocked(cp.execFile).mockImplementation((_cmd: any, _args: any, _opts: any, cb: any) => {
-        // Don't call cb — leave firewall in configuring state for this test
-        return { on: vi.fn() } as any
-      })
+
       const wslModule = await import('../../../server/wsl-port-forward.js')
-      vi.mocked(wslModule.getWslIp).mockReturnValue('172.24.0.2')
-      vi.mocked(wslModule.buildPortForwardingScript).mockReturnValue('$null # mock script')
+      vi.mocked(wslModule.computeWslPortForwardingPlan).mockReturnValue({
+        status: 'ready',
+        wslIp: '172.24.0.2',
+        scriptKind: 'full',
+        script: '$null # mock script',
+      })
+
+      const cp = await import('node:child_process')
 
       const res = await request(app)
         .post('/api/network/configure-firewall')
         .set('x-auth-token', token)
-      expect(res.status).toBe(200)
-      expect(res.body.method).toBe('wsl2')
-      expect(res.body.status).toBe('started')
 
-      // Clean up configuring state (callback was not called in the mock)
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({
+        method: 'confirmation-required',
+        title: 'Administrator approval required',
+        body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
+        confirmLabel: 'Continue',
+      })
+      expect(cp.execFile).not.toHaveBeenCalled()
+    })
+
+    it('returns none for WSL2 when no repair is actually needed anymore', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+
+      const wslModule = await import('../../../server/wsl-port-forward.js')
+      vi.mocked(wslModule.computeWslPortForwardingPlan).mockReturnValue({
+        status: 'noop',
+        wslIp: '172.24.0.2',
+      })
+
+      const cp = await import('node:child_process')
+      const res = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({ method: 'none', message: 'No configuration changes required' })
+      expect(cp.execFile).not.toHaveBeenCalled()
+    })
+
+    it('starts WSL2 repair after explicit confirmation', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+
+      const wslModule = await import('../../../server/wsl-port-forward.js')
+      vi.mocked(wslModule.computeWslPortForwardingPlan).mockReturnValue({
+        status: 'ready',
+        wslIp: '172.24.0.2',
+        scriptKind: 'full',
+        script: '$null # mock script',
+      })
+
+      const cp = await import('node:child_process')
+      vi.mocked(cp.execFile).mockImplementation((_cmd: any, _args: any, _opts: any, _cb: any) => {
+        return { on: vi.fn() } as any
+      })
+
+      const res = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({ confirmElevation: true })
+
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({ method: 'wsl2', status: 'started' })
+
       networkManager.setFirewallConfiguring(false)
+    })
+
+    it('returns confirmation-required for native Windows until the caller confirms elevation', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'windows',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+
+      const cp = await import('node:child_process')
+      const res = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(res.status).toBe(200)
+      expect(res.body.method).toBe('confirmation-required')
+      expect(cp.execFile).not.toHaveBeenCalled()
+    })
+
+    it('starts native Windows repair after explicit confirmation', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'windows',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+
+      const cp = await import('node:child_process')
+      vi.mocked(cp.execFile).mockImplementation((_cmd: any, _args: any, _opts: any, _cb: any) => {
+        return { on: vi.fn() } as any
+      })
+
+      const res = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({ confirmElevation: true })
+
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({ method: 'windows-elevated', status: 'started' })
+
+      networkManager.setFirewallConfiguring(false)
+    })
+
+    it('rejects malformed confirmation payloads', async () => {
+      const res = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({ confirmElevation: false })
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('Invalid request')
     })
 
     it('rejects concurrent firewall configuration (in-flight guard)', async () => {
