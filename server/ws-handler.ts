@@ -1857,6 +1857,29 @@ export class WsHandler {
         }
         const session = this.sdkBridge.getSession(m.sessionId)
         if (!session) {
+          if (isValidClaudeSessionId(m.sessionId)) {
+            try {
+              const historicalMessages = await loadSessionHistory(m.sessionId)
+              if (historicalMessages !== null) {
+                this.send(ws, {
+                  type: 'sdk.session.snapshot',
+                  sessionId: m.sessionId,
+                  latestTurnId: historicalMessages.length > 0
+                    ? `turn-${historicalMessages.length - 1}`
+                    : null,
+                  status: 'idle',
+                })
+                this.send(ws, {
+                  type: 'sdk.status',
+                  sessionId: m.sessionId,
+                  status: 'idle',
+                })
+                return
+              }
+            } catch (err) {
+              log.warn({ err, sessionId: m.sessionId }, 'Failed to load durable Claude history for attach')
+            }
+          }
           // Send sdk.error (not generic error) so the client's SDK message handler
           // can identify the lost session and trigger immediate recovery.
           this.send(ws, {
