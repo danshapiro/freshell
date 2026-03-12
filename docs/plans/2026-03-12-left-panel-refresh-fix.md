@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task.
 
-**Goal:** Eliminate the left-panel blanking loop by suppressing session-directory invalidations that come from invisible session-file churn and by keeping the sidebar list visible during refreshes.
+**Goal:** Stop the left sidebar from repeatedly blanking by making `sessions.changed` fire only for real session-directory changes and by keeping already-loaded sidebar content visible during refreshes.
 
-**Architecture:** Treat the session sidebar as a read model with an explicit visibility contract. On the server, only directory-visible session fields are allowed to advance a file-backed session's directory timestamp or trigger `sessions.changed`; raw file `mtime`, token counters, codex task-event noise, and other non-directory metadata stay available for other surfaces but must not invalidate the sidebar. On the client, switch the sidebar to stale-while-refresh after first load so invalidations and title-search refreshes keep the last loaded list rendered while showing a non-destructive loading indicator.
+**Architecture:** Treat the session directory as a server-owned read model with one shared projection function. Extract the exact "directory-visible session" projection into `server/session-directory/projection.ts`, make the HTTP read model use it directly, make websocket invalidation diffing compare that same projection, and make the file indexer preserve a file-backed session's `updatedAt` when a rewrite changes nothing in that projection. On the client, keep the last loaded sidebar rows mounted for any later refresh and show refresh status inline; only the very first load is allowed to block the list.
 
 **Tech Stack:** Node.js, TypeScript, React 18, Redux Toolkit, Vitest, Testing Library
 
@@ -12,142 +12,326 @@
 
 ## Strategy Gate
 
-This bug is two coupled defects and should be fixed as one cut:
+This fix needs to land both defects together:
 
-1. The server currently treats file churn as sidebar churn because `CodingCliSession.updatedAt` is sourced from file `mtime` and the diff logic compares entire session objects.
-2. The client currently treats any in-flight sidebar refresh as a blank-state render.
+1. The server currently treats raw file churn as sidebar churn because file-backed sessions advance `updatedAt` from file `mtime`, and `diffProjects()` compares entire `CodingCliSession` objects.
+2. The client currently renders refreshes as an empty panel because `Sidebar.tsx` drops the list whenever `sidebarWindow.loading` is true.
 
-The direct end state is:
+The clean architectural direction is:
 
-- `sessions.changed` means "the session-directory/sidebar read model changed in a way the sidebar can observe."
-- Once the sidebar has loaded at least once, refreshes are stale-while-refresh, not blank-while-refresh.
+- `updatedAt` for file-backed sessions should mean "last directory-visible change", not "last raw file write". That is already the timestamp used for session-directory sort order, pagination cursors, and revisioning, so a second parallel timestamp would fork the read model for little gain.
+- The session-directory projection must have exactly one source of truth. Do not keep one field list in `session-directory/service.ts` and a second, similar-but-different field list in `sessions-sync/diff.ts`.
+- After first load, sidebar refreshes must be stale-while-refresh. Rendering stale rows during refresh is correct here because the alternative is disruptive blanking and the next server response remains authoritative.
 
 Rejected approaches:
 
-- Client-only stale rendering: hides the symptom but keeps the server emitting needless invalidations and the client aborting/refetching on each one.
+- Client-only stale rendering: hides the symptom but keeps the server spamming invalidations and refetches.
 - Server-only invalidation suppression: reduces the loop frequency but still leaves legitimate refreshes visually disruptive.
-- Timer tuning only: changes cadence, not semantics.
+- Adding a new `directoryUpdatedAt` field: duplicates recency semantics across the codebase and forces extra plumbing through session-directory, search, pagination, and client state.
+- Debounce or throttle tuning only: changes cadence, not meaning.
 
 Implementation invariants:
 
-- After the first successful sidebar load, `sessions.changed` must never cause the list to disappear.
-- File-backed sessions must not advance the sidebar sort timestamp purely because the underlying file was rewritten without changing directory-visible data.
-- Directory-visible edits still invalidate immediately: rename, archive, delete, first-user-message changes, summary/title changes, session-type metadata changes, and session appearance/disappearance.
-- `docs/index.html` stays untouched; this is a behavioral stability fix, not a new feature surface.
+- `sessions.changed` means "the session-directory read model changed in a way the sidebar or session search can observe."
+- A rewrite that changes only invisible metadata (`tokenUsage`, `codexTaskEvents`, `sourceFile`, other non-directory fields) must not advance a file-backed session's `updatedAt`.
+- A rename, summary change, archive toggle, first-user-message change, session-type change, session creation, session deletion, or any visible ordering change must still invalidate immediately.
+- Once `sidebarWindow.lastLoadedAt` exists, the sidebar list must never disappear only because a refresh is in flight.
+- `docs/index.html` stays untouched; this is a behavior fix, not a new product surface.
 
-### Task 1: Capture the server-side churn regressions first
+### Task 1: Lock the server read-model contract in failing tests
 
 **Files:**
+- Create: `test/unit/server/session-directory/projection.test.ts`
 - Modify: `test/unit/server/sessions-sync/diff.test.ts`
-- Modify: `test/unit/server/sessions-sync/service.test.ts`
 - Modify: `test/unit/server/coding-cli/session-indexer.test.ts`
 
-**Step 1: Write the failing tests**
+**Step 1: Create the failing projection contract test**
 
-Add server regressions that define the read-model contract explicitly:
-
-- `diff.test.ts`: prove `diffProjects()` ignores session fields that never affect the directory/sidebar surface (`tokenUsage`, `codexTaskEvents`, `sourceFile`) while still reacting to directory-visible fields (`title`, `summary`, `firstUserMessage`, `archived`, `sessionType`, `updatedAt` once it is semantic).
-- `service.test.ts`: prove `SessionsSyncService.publish()` does not broadcast when the only snapshot delta is invisible sidebar metadata, but still broadcasts when a directory-visible field changes.
-- `session-indexer.test.ts`: create one file-backed session, refresh once, then rewrite the file with a newer `mtime` but identical directory-visible parsed metadata and assert the indexed session keeps its prior `updatedAt`. Add the companion regression where a directory-visible parsed field changes and `updatedAt` advances.
-
-For the indexer test, use `fsp.utimes()` or a second write separated by fake time so the failure is unambiguous.
-
-**Step 2: Run the targeted tests to verify they fail**
-
-Run:
-
-```bash
-npx vitest run test/unit/server/sessions-sync/diff.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/coding-cli/session-indexer.test.ts
-```
-
-Expected: FAIL because the current diff path still treats invisible fields as meaningful and the indexer still bumps `updatedAt` from raw file `mtime`.
-
-### Task 2: Implement directory-visible comparison and semantic timestamp carry-forward
-
-**Files:**
-- Create: `server/session-directory/comparison.ts`
-- Modify: `server/coding-cli/session-indexer.ts`
-- Modify: `server/sessions-sync/diff.ts`
-- Modify only the Task 1 test files as needed
-
-**Step 1: Add the shared directory-comparison helper**
-
-Create a small helper that defines the authoritative "directory-visible session shape" shared by the indexer and sync diff. Keep it intentionally narrow:
+Add `test/unit/server/session-directory/projection.test.ts` for the new shared helper module. The test should define the exact visible projection once:
 
 ```ts
-export type DirectoryComparableSession = Pick<
-  CodingCliSession,
-  'provider' | 'sessionId' | 'projectPath' | 'updatedAt' | 'createdAt' |
-  'archived' | 'title' | 'summary' | 'firstUserMessage' | 'cwd' |
-  'sessionType' | 'isSubagent' | 'isNonInteractive'
->
-
-export function toDirectoryComparableSession(
-  session: CodingCliSession,
-  options?: { includeUpdatedAt?: boolean },
-): DirectoryComparableSession | Omit<DirectoryComparableSession, 'updatedAt'> { ... }
+expect(toSessionDirectoryProjection({
+  provider: 'codex',
+  sessionId: 's1',
+  projectPath: '/repo',
+  updatedAt: 100,
+  createdAt: 50,
+  title: 'Deploy',
+  summary: 'Summary',
+  firstUserMessage: 'ship it',
+  cwd: '/repo',
+  archived: false,
+  sessionType: 'codex',
+  isSubagent: false,
+  isNonInteractive: false,
+  tokenUsage: { inputTokens: 1, outputTokens: 2, cachedTokens: 3, totalTokens: 6 },
+  codexTaskEvents: { latestTaskStartedAt: 99 },
+  sourceFile: '/tmp/session.jsonl',
+})).toEqual({
+  provider: 'codex',
+  sessionId: 's1',
+  projectPath: '/repo',
+  updatedAt: 100,
+  createdAt: 50,
+  title: 'Deploy',
+  summary: 'Summary',
+  firstUserMessage: 'ship it',
+  cwd: '/repo',
+  archived: false,
+  sessionType: 'codex',
+  isSubagent: false,
+  isNonInteractive: false,
+})
 ```
 
-The key rule is that this helper must exclude fields that are real for other surfaces but invisible to the sidebar read model.
+Add the companion equality test that ignores `updatedAt` only when asked:
 
-**Step 2: Preserve `updatedAt` when a file rewrite changes nothing visible**
+```ts
+expect(directoryProjectionEqual(a, b, { includeUpdatedAt: false })).toBe(true)
+expect(directoryProjectionEqual(a, b, { includeUpdatedAt: true })).toBe(false)
+```
 
-In `server/coding-cli/session-indexer.ts`, after building the next file-backed `baseSession`, compare it to the cached prior `baseSession` using the shared helper with `includeUpdatedAt: false`.
-
-If the directory-visible projection is unchanged, carry forward the previous `updatedAt` instead of replacing it with the new file `mtime`.
-
-If the directory-visible projection changed, keep the new timestamp candidate from the file stat.
-
-Do not apply this rewrite heuristic to direct providers that already own their own `updatedAt`.
-
-**Step 3: Make `diffProjects()` use the same directory-visible projection**
-
-Replace the current "compare every own enumerable field" behavior with comparison through the shared directory projection. The diff still needs to respect:
-
-- project path
-- project color
-- session ordering
-- every directory-visible field listed above
-
-It must stop reacting to fields that never reach the sidebar/session-directory payload.
-
-**Step 4: Run the targeted server tests**
+**Step 2: Run the new projection test and verify it fails**
 
 Run:
 
 ```bash
-npx vitest run test/unit/server/sessions-sync/diff.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/coding-cli/session-indexer.test.ts
+npx vitest run test/unit/server/session-directory/projection.test.ts
+```
+
+Expected: FAIL because `server/session-directory/projection.ts` does not exist yet.
+
+**Step 3: Add the failing diff regression**
+
+Extend `test/unit/server/sessions-sync/diff.test.ts` with two cases:
+
+- changing only invisible fields such as `tokenUsage`, `codexTaskEvents`, or `sourceFile` does not produce an upsert
+- changing a directory-visible field such as `title`, `summary`, `archived`, `firstUserMessage`, or `sessionType` still produces an upsert
+
+Use the same session identity in both snapshots so the test isolates field visibility, not insert/remove behavior.
+
+**Step 4: Run the diff test and verify the invisible-field case fails**
+
+Run:
+
+```bash
+npx vitest run test/unit/server/sessions-sync/diff.test.ts
+```
+
+Expected: FAIL because `diffProjects()` still compares whole session objects.
+
+**Step 5: Add the failing indexer regression**
+
+Extend `test/unit/server/coding-cli/session-indexer.test.ts` with a custom `parseSessionFile` stub that actually returns invisible metadata from the fixture content. Do not rely on the default `makeProvider()` parser here; it currently ignores `tokenUsage` and `codexTaskEvents`, so the regression would be false-positive.
+
+Add two tests:
+
+- rewriting a file with newer `mtime` and different invisible metadata only keeps the prior `updatedAt`
+- rewriting the same file with a visible change such as `title` or `summary` advances `updatedAt`
+
+Use `fsp.utimes()` or fake time to make the `mtime` jump obvious.
+
+**Step 6: Run the indexer test and verify the new case fails**
+
+Run:
+
+```bash
+npx vitest run test/unit/server/coding-cli/session-indexer.test.ts
+```
+
+Expected: FAIL because the indexer still copies raw `mtime` into `updatedAt`.
+
+### Task 2: Extract the session-directory projection as the single source of truth
+
+**Files:**
+- Create: `server/session-directory/projection.ts`
+- Modify: `server/session-directory/service.ts`
+- Test: `test/unit/server/session-directory/projection.test.ts`
+- Test: `test/unit/server/session-directory/service.test.ts`
+
+**Step 1: Implement the shared projection helper**
+
+Create `server/session-directory/projection.ts` with an explicit projected type and equality helper:
+
+```ts
+import type { CodingCliSession } from '../coding-cli/types.js'
+import type { SessionDirectoryItem } from './types.js'
+
+export type SessionDirectoryProjection = Omit<
+  SessionDirectoryItem,
+  'isRunning' | 'runningTerminalId' | 'snippet' | 'matchedIn'
+>
+
+export function toSessionDirectoryProjection(session: CodingCliSession): SessionDirectoryProjection {
+  return {
+    provider: session.provider,
+    sessionId: session.sessionId,
+    projectPath: session.projectPath,
+    title: session.title,
+    summary: session.summary,
+    updatedAt: session.updatedAt,
+    createdAt: session.createdAt,
+    archived: session.archived,
+    cwd: session.cwd,
+    sessionType: session.sessionType,
+    isSubagent: session.isSubagent,
+    isNonInteractive: session.isNonInteractive,
+    firstUserMessage: session.firstUserMessage,
+  }
+}
+```
+
+The equality helper should compare the projected objects after optionally omitting `updatedAt`; do not compare raw `CodingCliSession` fields directly.
+
+**Step 2: Refactor `session-directory/service.ts` to use the helper**
+
+Replace the hand-built object in `toItems()` with:
+
+```ts
+items.push(joinRunningState({
+  ...toSessionDirectoryProjection(session),
+  isRunning: false,
+}, terminalMeta))
+```
+
+Keep sorting, search, cursor, and running-state behavior unchanged.
+
+**Step 3: Run the projection and session-directory tests**
+
+Run:
+
+```bash
+npx vitest run test/unit/server/session-directory/projection.test.ts test/unit/server/session-directory/service.test.ts
 ```
 
 Expected: PASS
 
-**Step 5: Commit the server-side cut**
+**Step 4: If `service.test.ts` needs expectation updates, make them now**
+
+Only adjust `test/unit/server/session-directory/service.test.ts` if the refactor changes nothing but import paths or object construction details. Do not widen behavior here; this task is about removing duplicated projection logic, not changing the read-model output.
+
+### Task 3: Use the shared projection for invalidation and semantic timestamps
+
+**Files:**
+- Modify: `server/sessions-sync/diff.ts`
+- Modify: `server/coding-cli/session-indexer.ts`
+- Test: `test/unit/server/sessions-sync/diff.test.ts`
+- Test: `test/unit/server/coding-cli/session-indexer.test.ts`
+- Test: `test/unit/server/session-directory/projection.test.ts`
+
+**Step 1: Make `diffProjects()` compare projected sessions**
+
+Replace `sessionsEqual()` so it compares:
+
+```ts
+directoryProjectionEqual(
+  toSessionDirectoryProjection(a),
+  toSessionDirectoryProjection(b),
+  { includeUpdatedAt: true },
+)
+```
+
+Preserve the existing project-level checks for project path, color, session count, and session order.
+
+**Step 2: Preserve `updatedAt` across invisible file rewrites**
+
+In `server/coding-cli/session-indexer.ts`, after building the next `baseSession`, compare the previous and next projections with `includeUpdatedAt: false`.
+
+Use this rule:
+
+```ts
+const previous = cached?.baseSession
+const nextUpdatedAt = stat.mtimeMs || stat.mtime.getTime()
+const updatedAt =
+  previous &&
+  directoryProjectionEqual(
+    toSessionDirectoryProjection(previous),
+    toSessionDirectoryProjection({ ...baseSession, updatedAt: nextUpdatedAt }),
+    { includeUpdatedAt: false },
+  )
+    ? previous.updatedAt
+    : nextUpdatedAt
+```
+
+Then store `updatedAt` in `baseSession`.
+
+Do not apply this carry-forward logic to direct providers; only the file-backed cache path needs it.
+
+**Step 3: Run the full targeted server regression set**
 
 Run:
 
 ```bash
-git add server/session-directory/comparison.ts server/coding-cli/session-indexer.ts server/sessions-sync/diff.ts test/unit/server/sessions-sync/diff.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/coding-cli/session-indexer.test.ts
-git commit -m "fix(sessions): suppress invisible sidebar invalidations"
+npx vitest run test/unit/server/session-directory/projection.test.ts test/unit/server/session-directory/service.test.ts test/unit/server/sessions-sync/diff.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/sessions-sync/service.test.ts
 ```
 
-Expected: one commit containing only the server-side invalidation work and its tests.
+Expected: PASS
 
-### Task 3: Capture the client-side blanking regression with unit and e2e coverage
+**Step 4: Commit the server-side cut**
+
+Run:
+
+```bash
+git add server/session-directory/projection.ts server/session-directory/service.ts server/sessions-sync/diff.ts server/coding-cli/session-indexer.ts test/unit/server/session-directory/projection.test.ts test/unit/server/session-directory/service.test.ts test/unit/server/sessions-sync/diff.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/sessions-sync/service.test.ts
+git commit -m "fix(sessions): stabilize sidebar invalidation semantics"
+```
+
+Expected: one commit containing the projection extraction, semantic timestamp change, and server regressions.
+
+### Task 4: Lock the client stale-while-refresh behavior in failing tests
 
 **Files:**
 - Modify: `test/unit/client/components/Sidebar.test.tsx`
 - Modify: `test/e2e/open-tab-session-sidebar-visibility.test.tsx`
 
-**Step 1: Write the failing client tests**
+**Step 1: Add the failing sidebar unit regression**
 
-Add two focused regressions:
+In `Sidebar.test.tsx`, preload `sessions.windows.sidebar` with:
 
-- `Sidebar.test.tsx`: preload a sidebar window with one or more sessions plus `lastLoadedAt`, then set `loading: true` and assert the existing session rows still render while a refresh status is visible. Add the title-search variant: when a store-owned title search is in flight after the sidebar has already loaded, the previous list stays mounted and the component does not fall through to the empty-state branch.
-- `open-tab-session-sidebar-visibility.test.tsx`: make the `sessions.changed` HTTP refetch stay pending, broadcast `sessions.changed`, and assert the previously rendered sidebar row remains in the DOM until the promise resolves. After resolution, assert the new data replaces it.
+```ts
+sidebar: {
+  projects: recentProjects,
+  lastLoadedAt: 1_700_000_000_000,
+  loading: true,
+  query: '',
+  searchTier: 'title',
+}
+```
 
-Keep the assertions DOM-facing. Do not test internal booleans.
+If the existing `createTestStore()` helper cannot express that shape cleanly, extend the helper first instead of inlining ad-hoc preloaded state in multiple tests.
 
-**Step 2: Run the targeted client tests to verify they fail**
+Assert all three conditions at once:
+
+- the old row text is still rendered
+- the virtualized list is still present
+- an inline loading status is rendered
+
+Add the companion search case with `query: 'deploy'` and `searchTier: 'title'` so a background refresh of an active title search also keeps stale rows mounted.
+
+**Step 2: Run the sidebar unit test and verify it fails**
+
+Run:
+
+```bash
+npx vitest run test/unit/client/components/Sidebar.test.tsx
+```
+
+Expected: FAIL because `Sidebar.tsx` currently returns `null` for the list while loading.
+
+**Step 3: Add the failing sidebar invalidation e2e regression**
+
+In `test/e2e/open-tab-session-sidebar-visibility.test.tsx`, keep the first sidebar snapshot resolved, then make the invalidation-triggered HTTP refetch hang on a deferred promise:
+
+```ts
+const deferred = createDeferred<any>()
+fetchSidebarSessionsSnapshot
+  .mockResolvedValueOnce(initialResponse)
+  .mockReturnValueOnce(deferred.promise)
+```
+
+Broadcast `sessions.changed`, assert the existing session row remains visible while the promise is pending, then resolve the promise with the new response and assert the new row replaces the old one.
+
+**Step 4: Run the client regressions and verify the new e2e case fails**
 
 Run:
 
@@ -155,42 +339,52 @@ Run:
 npx vitest run test/unit/client/components/Sidebar.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
 ```
 
-Expected: FAIL because the current sidebar render path drops the list whenever `sidebarWindow.loading` is true and the search-loading branch is limited to non-title searches.
+Expected: FAIL because the sidebar still blanks during refresh.
 
-### Task 4: Switch the sidebar to stale-while-refresh rendering
+### Task 5: Implement stale-while-refresh sidebar rendering
 
 **Files:**
 - Modify: `src/components/Sidebar.tsx`
-- Modify only the Task 3 test files as needed
+- Test: `test/unit/client/components/Sidebar.test.tsx`
+- Test: `test/e2e/open-tab-session-sidebar-visibility.test.tsx`
 
-**Step 1: Implement non-destructive refresh rendering**
+**Step 1: Split first-load blocking from refresh loading**
 
-Update the session-list render logic so it distinguishes initial load from refresh:
+Introduce explicit render guards:
 
 ```tsx
 const hasLoadedSidebarWindow = typeof sidebarWindow?.lastLoadedAt === 'number'
-const showBlockingLoad = sidebarWindow?.loading && !hasLoadedSidebarWindow && sortedItems.length === 0
-const showRefreshStatus = sidebarWindow?.loading && hasLoadedSidebarWindow
+const showBlockingLoad = !!sidebarWindow?.loading && !hasLoadedSidebarWindow && sortedItems.length === 0
+const showRefreshStatus = !!sidebarWindow?.loading && hasLoadedSidebarWindow
 ```
 
-Render rules:
+**Step 2: Keep the list mounted during refresh**
 
-- `showBlockingLoad`: show the centered blocking loading UI.
-- `showRefreshStatus`: keep the existing list or empty state rendered and add an inline `role="status"` indicator.
-- Empty-state messages only render when not in the blocking-load path.
+Render policy:
 
-For copy:
+- `showBlockingLoad`: show the centered blocking spinner
+- `showRefreshStatus`: keep rendering the list or empty state and add inline status text
+- empty-state copy is allowed only when not in the blocking path
 
-- Non-search refresh or title-search refresh: `Updating sessions...`
-- Non-title search refresh: `Searching...`
+Use clear status copy:
 
-Preserve the existing `search-loading` test surface for the non-title search case if practical, but make it an overlay/status, not a mutually exclusive branch that removes the list.
+- no query or title query: `Updating sessions...`
+- non-title search: `Searching...`
 
-**Step 2: Keep the render path simple**
+Keep the status element accessible with `role="status"`.
 
-Do not widen Redux state unless the component genuinely needs it. The current store already gives enough signal through `sidebarWindow.loading`, `sidebarWindow.lastLoadedAt`, and the preserved session window contents. The goal is to change rendering policy, not add a second fetch state machine.
+**Step 3: Do not add new Redux state unless a test proves it is necessary**
 
-**Step 3: Run the targeted client tests**
+The current store already exposes everything needed:
+
+- `sidebarWindow.loading`
+- `sidebarWindow.lastLoadedAt`
+- preserved `projects`
+- current `query` and `searchTier`
+
+This fix is a rendering-policy change, not a state-model rewrite.
+
+**Step 4: Run the targeted client tests**
 
 Run:
 
@@ -200,60 +394,71 @@ npx vitest run test/unit/client/components/Sidebar.test.tsx test/e2e/open-tab-se
 
 Expected: PASS
 
-**Step 4: Commit the client-side cut**
+**Step 5: Commit the client-side cut**
 
 Run:
 
 ```bash
 git add src/components/Sidebar.tsx test/unit/client/components/Sidebar.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
-git commit -m "fix(sidebar): keep sessions visible during refresh"
+git commit -m "fix(sidebar): preserve session list during refresh"
 ```
 
-Expected: one commit containing only the stale-while-refresh client work and its tests.
+Expected: one commit containing only the sidebar stale-while-refresh change and its regressions.
 
-### Task 5: Run the combined verification gate
+### Task 6: Run the combined verification gate
 
 **Files:**
 - Modify only files already touched by this plan if follow-up fixes are required
 
-**Step 1: Run focused verification for the full bug surface**
+**Step 1: Run the focused regression suite**
 
 Run:
 
 ```bash
-npx vitest run test/unit/server/sessions-sync/diff.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/client/components/Sidebar.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
+npx vitest run test/unit/server/session-directory/projection.test.ts test/unit/server/session-directory/service.test.ts test/unit/server/sessions-sync/diff.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/client/components/Sidebar.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
 ```
 
 Expected: PASS
 
-**Step 2: Run accessibility and full-suite verification**
+**Step 2: Run accessibility lint**
 
 Run:
 
 ```bash
 npm run lint
+```
+
+Expected: PASS
+
+**Step 3: Run the full repository test suite**
+
+Run:
+
+```bash
 CI=true npm test
 ```
 
 Expected: PASS
 
-Per repo policy, if `npm test` fails, stop and fix the failure before any merge work, even if it looks unrelated.
+Per repo policy, if this fails, stop and fix the failure before any merge work even if it looks unrelated.
 
-**Step 3: Commit only if verification required follow-up edits**
+**Step 4: Commit only if verification required follow-up edits**
 
-Run only if Step 2 changed files:
+Run only if Steps 1-3 changed files:
 
 ```bash
 git add <follow-up-files>
-git commit -m "test: finish sidebar refresh stability verification"
+git commit -m "test: finish sidebar refresh verification"
 ```
 
 Expected: no extra commit unless verification exposed a real issue.
 
 ## Final Verification Checklist
 
-- `sessions.changed` is no longer emitted for raw file rewrites that do not change directory-visible session data.
-- A loaded sidebar never goes blank while refresh is in flight.
-- Title-search refreshes also preserve the previous list until the new results arrive.
-- Session rename/archive/delete flows still refresh correctly because those fields remain directory-visible.
-- Server and client targeted regressions pass, then `npm run lint`, then `CI=true npm test`.
+- Raw file rewrites that change only invisible metadata do not emit `sessions.changed`.
+- File-backed sessions still move in the directory immediately when a directory-visible field changes.
+- `server/session-directory/service.ts`, `server/sessions-sync/diff.ts`, and `server/coding-cli/session-indexer.ts` all derive visibility from the same projection helper.
+- A loaded sidebar never goes blank while a refresh is in flight.
+- The first load can still show a blocking loading state.
+- Title-filtered sidebar refreshes also keep stale rows visible until the new response arrives.
+- Focused regressions pass, then `npm run lint`, then `CI=true npm test`.
