@@ -279,7 +279,7 @@ describe('TabBar', () => {
       expect(scrollContainer).toBeNull()
     })
 
-    it('pulses a tab when any exact terminal id in that tab is busy', () => {
+    it('shows blue icon on the exact busy terminal in a tab', () => {
       const tab = createTab({
         id: 'tab-codex',
         title: 'Codex Tab',
@@ -307,11 +307,11 @@ describe('TabBar', () => {
       const busyIcon = icons.find((icon) => icon.getAttribute('data-terminal-id') === 'term-1')
       const idleIcon = icons.find((icon) => icon.getAttribute('data-terminal-id') === 'term-2')
 
-      expect(busyIcon?.getAttribute('class')).toContain('animate-pulse')
-      expect(idleIcon?.getAttribute('class') ?? '').not.toContain('animate-pulse')
+      expect(busyIcon?.getAttribute('class')).toContain('text-blue-500')
+      expect(idleIcon?.getAttribute('class') ?? '').not.toContain('text-blue-500')
     })
 
-    it('does not pulse a tab when the exact record is only pending', () => {
+    it('does not show blue icon when the exact record is only pending', () => {
       const tab = createTab({
         id: 'tab-codex',
         title: 'Codex Pending',
@@ -350,10 +350,10 @@ describe('TabBar', () => {
       renderWithStore(<TabBar />, store)
 
       const tabElement = screen.getByLabelText('Codex Pending')
-      const pulsingIcons = within(tabElement).getAllByTestId('pane-icon')
-        .filter((icon) => icon.getAttribute('class')?.includes('animate-pulse'))
+      const blueIcons = within(tabElement).getAllByTestId('pane-icon')
+        .filter((icon) => icon.getAttribute('class')?.includes('text-blue-500'))
 
-      expect(pulsingIcons).toHaveLength(0)
+      expect(blueIcons).toHaveLength(0)
     })
 
     it('falls back to the exact tab terminal id for a single-pane rehydrate gap', () => {
@@ -395,10 +395,10 @@ describe('TabBar', () => {
       renderWithStore(<TabBar />, store)
 
       const tabElement = screen.getByLabelText('Rehydrate Gap')
-      const pulsingIcons = within(tabElement).getAllByTestId('pane-icon')
-        .filter((icon) => icon.getAttribute('class')?.includes('animate-pulse'))
+      const blueIcons = within(tabElement).getAllByTestId('pane-icon')
+        .filter((icon) => icon.getAttribute('class')?.includes('text-blue-500'))
 
-      expect(pulsingIcons.length).toBeGreaterThan(0)
+      expect(blueIcons.length).toBeGreaterThan(0)
     })
   })
 
@@ -768,7 +768,7 @@ describe('TabBar', () => {
       expect(errorIndicator).toBeDefined()
     })
 
-    it('shows a blue creating status indicator without pulsing for a creating terminal', () => {
+    it('shows a muted creating status indicator for a creating terminal', () => {
       const tab = createTab({ id: 'tab-1', status: 'creating' })
 
       const store = createStore({
@@ -780,10 +780,10 @@ describe('TabBar', () => {
 
       const icons = screen.getAllByTestId('pane-icon')
       const creatingIndicator = icons.find((c) =>
-        getClassString(c).includes('text-blue-500')
+        getClassString(c).includes('text-muted-foreground')
       )
       expect(creatingIndicator).toBeDefined()
-      expect(getClassString(creatingIndicator!)).not.toContain('animate-pulse')
+      expect(getClassString(creatingIndicator!)).not.toContain('text-blue-500')
     })
 
     it('displays correct status for multiple tabs with different statuses', () => {

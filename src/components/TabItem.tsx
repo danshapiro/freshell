@@ -10,7 +10,7 @@ import type { MouseEvent, KeyboardEvent } from 'react'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 
 function StatusDot({ status, busy }: { status: TerminalStatus; busy?: boolean }) {
-  return <Circle className={cn('h-2 w-2', getTerminalStatusDotClassName(status), busy && status === 'running' && 'fill-blue-500 text-blue-500')} />
+  return <Circle className={cn('h-2 w-2', busy && status === 'running' ? 'fill-blue-500 text-blue-500' : getTerminalStatusDotClassName(status))} />
 }
 
 const MAX_TAB_ICONS = 6
