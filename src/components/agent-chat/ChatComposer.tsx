@@ -88,11 +88,13 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
     if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {
       if (e.code === 'BracketLeft') {
         e.preventDefault()
+        e.stopPropagation()
         dispatch(switchToPrevTab())
         return
       }
       if (e.code === 'BracketRight') {
         e.preventDefault()
+        e.stopPropagation()
         dispatch(switchToNextTab())
         return
       }
