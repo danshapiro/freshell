@@ -26,7 +26,7 @@ No approval required. The approved strategy still fits the implementation plan a
 - What it does: renders `SetupWizard` and `SettingsView` with real reducers and mocked repair/network APIs so the tests can drive clicks, confirmation modals, polling, and terminal-tab side effects.
 - What it exposes: `render()` with Redux stores, accessible role/text queries, request-call inspection for `fetchFirewallConfig`, and status-poll inspection through mocked `fetchNetworkStatus`.
 - Estimated complexity: low. `test/unit/client/SetupWizard.test.tsx`, `test/unit/client/components/settings-view-test-utils.tsx`, and `test/e2e/network-setup.test.tsx` already exist and only need extension.
-- Tests that depend on it: 1, 2, 3, 4.
+- Tests that depend on it: 1, 2, 3, 4, 17.
 
 ### H2: Network API integration harness
 
@@ -269,13 +269,25 @@ No approval required. The approved strategy still fits the implementation plan a
     - The helper uses the shared timeout constant instead of open-coded per-call timeouts. Sources: `Plan-SG`, `Plan-T5`.
     Interactions: shared helper <> Windows PowerShell quoting rules, shared helper <> child-process timeout handling.
 
+17. Name: Manual repair UIs treat `in-progress` as active work instead of a dead end
+    Type: scenario
+    Harness: H1
+    Preconditions: Remote access is already enabled. For the wizard path, the mocked repair API returns `{ method: 'in-progress', error: 'Firewall configuration already in progress' }`, and mocked `fetchNetworkStatus()` eventually reports `firewall.configuring: false` with `portOpen: true`. For the settings path, the same mocked repair result is returned and `fetchNetworkStatus()` is observable after the scheduled refresh.
+    Actions:
+    1. Render `SetupWizard` at step 2 and click `Configure now`.
+    2. Render `SettingsView` and click `Fix`.
+    Expected outcome:
+    - `SetupWizard` does not reopen the admin-approval modal or open a terminal; it keeps the firewall checklist in its active/polling state and completes when the refreshed status reports success. Sources: `Plan-AM`, `Plan-T4`.
+    - `SettingsView` does not silently do nothing; it schedules the same status-refresh path it uses after a started Windows repair. Sources: `Plan-AM`, `Plan-T4`.
+    Interactions: UI result branching <> `fetchFirewallConfig`, `SetupWizard` <> firewall polling loop, `SettingsView` <> deferred status refresh.
+
 ## Coverage summary
 
 Covered action space:
 - Server startup surfaces that previously owned WSL boot-time repair, including spawned child-server/test launches.
 - The full `/api/network/configure-firewall` contract: empty body, tokenized confirmed body, malformed body, token rotation, confirmed single-flight guard, WSL no-op recompute, Windows start, Linux/mac terminal commands, and no-firewall `none`.
 - The WSL drift-detection planner across `not-wsl2`, `error`, `noop`, `firewall-only`, and `full`.
-- User-facing repair actions in both manual entry points: `SetupWizard` `Configure now`, `Continue`, `Cancel`, and `SettingsView` `Fix`.
+- User-facing repair actions in both manual entry points: `SetupWizard` `Configure now`, `Continue`, `Cancel`, and `in-progress` polling; `SettingsView` `Fix`, confirmed retry, and `in-progress` refresh.
 - Shared contracts that other callers can regress: confirmation-modal styling, client helper typing, elevated PowerShell quoting, and daemon least-privilege normalization.
 
 Explicitly excluded per the agreed strategy:
