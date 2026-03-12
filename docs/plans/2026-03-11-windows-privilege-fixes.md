@@ -4,7 +4,7 @@
 
 **Goal:** Remove unsolicited Windows elevation during startup/tests, require an explicit in-product confirmation before any manual Windows/WSL firewall repair can elevate, and ensure Windows daemon tasks run at least privilege.
 
-**Architecture:** Delete the boot-time WSL auto-repair path entirely so privilege elevation can only happen from the existing manual repair buttons; startup should detect stale network state through the normal `NetworkManager` status flow, not by launching UAC. Keep the useful non-elevating WSL drift-detection logic by extracting it into a pure `computeWslPortForwardingPlan(ports)` helper that the manual repair API can call before and after confirmation, so the server only prompts for admin approval when a real repair is still needed. Convert Windows/WSL repair into an explicit two-call acknowledgement contract: the first server response says administrator approval is required, and only a follow-up request with `confirmElevation: true` may spawn a shared elevated PowerShell helper. Keep least privilege enforced in both the task XML and the Windows daemon manager so new and existing scheduled tasks stop asking for `HighestAvailable`.
+**Architecture:** Delete the boot-time WSL auto-repair path entirely so privilege elevation can only happen from the existing manual repair buttons; startup should detect stale network state through the normal `NetworkManager` status flow, not by launching UAC. Keep the useful non-elevating WSL drift-detection logic in `server/wsl-port-forward.ts` so the manual repair API can recompute current WSL state both before and after the user confirms. Reset Windows/WSL repair around a server-enforced two-step protocol: the first response returns `confirmation-required` plus a one-time `confirmationToken`, and only a second request that round-trips both `confirmElevation: true` and that token, under a single-flight server lock and after recomputing current repair state, may spawn the shared elevated PowerShell helper. Keep least privilege enforced in both the task XML and the Windows daemon manager so new and existing scheduled tasks stop asking for `HighestAvailable`.
 
 **Tech Stack:** TypeScript, Express, Zod, React, Redux Toolkit, Vitest, Testing Library, supertest, Electron scheduled tasks
 
@@ -15,7 +15,9 @@
 - The user approved removing startup auto-elevation. Do not preserve `FRESHELL_DISABLE_WSL_PORT_FORWARD` or any other boot-only suppression layer; delete the boot path instead.
 - Do not replace startup repair with a one-time setup task. WSL IPs drift across boots, and the existing `NetworkManager` firewall status is already the right place to detect drift and surface the manual fix button.
 - Manual repair stays in-product. The accepted UX is a one-click repair flow preceded by an explicit confirmation modal warning that a Windows admin prompt is next.
-- The API must require an explicit acknowledgement field before it will elevate. That is an accidental-trigger guard for existing callers, not a new security boundary beyond the existing auth token and Windows UAC prompt.
+- The API must enforce the two-step flow itself. A bare `confirmElevation` boolean is not enough because a first-call `POST` can still bypass the UI. Issue a one-time server token from the first response and require that token on the confirmed retry.
+- `firewall.configuring` is status for the live elevated child process, not a lock. Protect the confirmed retry path with a dedicated single-flight guard from fresh state revalidation through `spawnElevatedPowerShell(...)`.
+- Recompute current repair state after confirmation instead of caching a script across the modal. That is required for WSL IP drift, port-open drift, and "remote access disabled mid-flow" correctness.
 - Reuse the existing repair entry points in `SetupWizard` and `SettingsView`. Do not add new settings, banners, or script-copy workflows.
 - Centralize the `Start-Process ... -Verb RunAs` argument construction in one server helper. The current duplication is the most fragile code in the affected path.
 - Reuse the shared `Button` variant system inside `ConfirmModal`; do not invent a one-off styling prop when the repo already has `ButtonVariant`.
@@ -26,12 +28,13 @@
 
 - Starting `server/index.ts` on WSL never attempts Windows portproxy/firewall repair and never depends on `FRESHELL_DISABLE_WSL_PORT_FORWARD`.
 - `server/wsl-port-forward.ts` exports only helpers that are still live in the manual repair path, including a pure `computeWslPortForwardingPlan(ports)` helper; dead startup-only helpers are gone.
-- `POST /api/network/configure-firewall` returns `confirmation-required` for both `wsl2` and `windows` until the caller sends `{ confirmElevation: true }`.
-- `POST /api/network/configure-firewall` rejects malformed acknowledgement bodies (for example `{ confirmElevation: false }`) with `400`.
-- The first `confirmation-required` response does not mark firewall repair as in progress; `firewall.configuring` stays reserved for the actual elevated child process.
-- WSL2 returns `none` instead of `confirmation-required` when the pure repair-plan helper determines that portproxy/firewall state is already correct by the time the button is clicked.
+- `POST /api/network/configure-firewall` returns `confirmation-required` with a fresh `confirmationToken` for both `wsl2` and `windows` whenever repair is still needed and the caller has not yet round-tripped a valid token.
+- First-call `{ confirmElevation: true }`, missing tokens, expired tokens, or replayed tokens never elevate; they return a fresh `confirmation-required` response when repair is still needed.
+- `POST /api/network/configure-firewall` rejects malformed acknowledgement bodies (for example `{ confirmElevation: false }` or a non-string `confirmationToken`) with `400`.
+- The first `confirmation-required` response does not mark firewall repair as in progress; `firewall.configuring` stays reserved for the actual elevated child process, and a separate single-flight guard ensures concurrent confirmed requests can spawn at most one elevated child.
+- WSL2 returns `none` instead of `confirmation-required` when the WSL repair-plan helper determines that portproxy/firewall state is already correct by the time the button is clicked or re-clicked after confirmation.
 - The confirmation payload copy is explicit: `To complete this, you will need to accept the Windows administrator prompt on the next screen.` A cancel path performs no elevated action.
-- `SetupWizard` and `SettingsView` both use the existing accessible modal infrastructure instead of `window.confirm()`, and the modal shows `Continue` plus `Cancel` with the primary action styled through the shared `Button` variant system rather than destructive red styling.
+- `SetupWizard` and `SettingsView` both use the existing accessible modal infrastructure instead of `window.confirm()`, the modal shows `Continue` plus `Cancel` with the primary action styled through the shared `Button` variant system rather than destructive red styling, and the confirmed retry sends both `confirmElevation: true` and the server-issued `confirmationToken`.
 - Linux/macOS repair continues to return terminal commands exactly as before.
 - The Windows scheduled-task template uses `LeastPrivilege`, and `WindowsServiceDaemonManager.start()` normalizes the task to limited run level before launching it.
 
@@ -39,9 +42,9 @@
 
 - Keep the pure/manual WSL helpers in `server/wsl-port-forward.ts` that still matter after the startup path dies: the rule parsers, script builders, and a new `computeWslPortForwardingPlan(ports)` helper that encapsulates non-elevating drift detection.
 - Delete the synchronous `setupWslPortForwarding()` wrapper, the dead `getRequiredPorts()` helper, and the startup helper module entirely. The manual route already has `NetworkManager.getRelevantPorts()`, so the WSL module should no longer parse ports from process env.
-- Keep `NetworkManager` as the source of truth for `firewall.active`, `firewall.portOpen`, and `firewall.configuring`. Do not add parallel repair state.
-- Keep confirmation copy sourced from the server response so both UI entry points stay consistent.
-- Keep the confirmation contract intentionally simple: a strict `{ confirmElevation?: true }` body is enough for the approved UX; do not add persistence, remembered consent, or a separate setup wizard just for UAC.
+- Keep `NetworkManager` as the source of truth for `firewall.active`, `firewall.portOpen`, and `firewall.configuring`, but add router-local state for pending confirmation tokens and the single-flight confirmed-repair lock. Do not pretend `firewall.configuring` alone is sufficient protocol state.
+- Keep confirmation copy and `confirmationToken` sourced from the server response so both UI entry points stay consistent.
+- Keep the confirmation contract intentionally small but real: `confirmationToken` is one-time proof that the prompt was shown, not remembered consent. Do not add persistence, remembered consent, or a separate setup wizard just for UAC.
 - Execution note: use `@trycycle-executing` and keep the task-level commits below intact unless a later task forces a smaller follow-up fix.
 
 ### Task 1: Remove the Boot-Time WSL Auto-Repair Entry Point While Preserving Manual WSL Repair Planning
@@ -366,22 +369,91 @@ git add server/elevated-powershell.ts test/unit/server/elevated-powershell.test.
 git commit -m "refactor(server): share elevated powershell helper"
 ```
 
-### Task 4: Require Explicit API Confirmation Before Any Windows/WSL Elevation
+### Task 4: Reset the Firewall Repair API Around a Real Confirmation Contract
 
 **Files:**
+- Create: `server/firewall-repair-coordinator.ts`
+- Create: `test/unit/server/firewall-repair-coordinator.test.ts`
 - Modify: `server/network-router.ts`
 - Modify: `server/firewall.ts`
 - Modify: `test/integration/server/network-api.test.ts`
 
-**Step 1: Write the failing integration tests**
+**Step 1: Write the failing unit and integration tests**
+
+Create `test/unit/server/firewall-repair-coordinator.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest'
+import {
+  createFirewallRepairCoordinator,
+  FIREWALL_CONFIRMATION_TTL_MS,
+  FIREWALL_REPAIR_LOCKED,
+} from '../../../server/firewall-repair-coordinator.js'
+
+it('issues one-time confirmation tokens scoped to the repair platform', () => {
+  const coordinator = createFirewallRepairCoordinator(() => 1_000)
+
+  const confirmation = coordinator.issueConfirmation('wsl2')
+
+  expect(confirmation).toMatchObject({
+    method: 'confirmation-required',
+    confirmationToken: expect.any(String),
+  })
+  expect(
+    coordinator.consumeConfirmation(confirmation.confirmationToken, 'windows'),
+  ).toBe(false)
+  expect(
+    coordinator.consumeConfirmation(confirmation.confirmationToken, 'wsl2'),
+  ).toBe(true)
+  expect(
+    coordinator.consumeConfirmation(confirmation.confirmationToken, 'wsl2'),
+  ).toBe(false)
+})
+
+it('expires stale confirmation tokens', () => {
+  let now = 1_000
+  const coordinator = createFirewallRepairCoordinator(() => now)
+  const confirmation = coordinator.issueConfirmation('windows')
+
+  now += FIREWALL_CONFIRMATION_TTL_MS + 1
+
+  expect(
+    coordinator.consumeConfirmation(confirmation.confirmationToken, 'windows'),
+  ).toBe(false)
+})
+
+it('returns locked while a confirmed repair is already running and releases afterwards', async () => {
+  const coordinator = createFirewallRepairCoordinator()
+  let release!: () => void
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve
+  })
+
+  const first = coordinator.withConfirmedRepairLock(async () => {
+    await blocked
+    return 'started'
+  })
+
+  expect(
+    await coordinator.withConfirmedRepairLock(async () => 'second'),
+  ).toBe(FIREWALL_REPAIR_LOCKED)
+
+  release()
+
+  await expect(first).resolves.toBe('started')
+  await expect(
+    coordinator.withConfirmedRepairLock(async () => 'after-release'),
+  ).resolves.toBe('after-release')
+})
+```
 
 In `test/integration/server/network-api.test.ts`:
 
-- Replace the WSL mock factory with one centered on the new pure helper:
+- Replace the WSL mock factory with one centered on the async manual helper:
 
 ```ts
 vi.mock('../../../server/wsl-port-forward.js', () => ({
-  computeWslPortForwardingPlan: vi.fn().mockReturnValue({
+  computeWslPortForwardingPlanAsync: vi.fn().mockResolvedValue({
     status: 'ready',
     wslIp: '172.24.0.2',
     scriptKind: 'full',
@@ -390,7 +462,7 @@ vi.mock('../../../server/wsl-port-forward.js', () => ({
 }))
 ```
 
-- Add these six confirmation-contract tests:
+- Add these confirmation-contract tests:
 
 ```ts
 it('returns confirmation-required for WSL2 until the caller confirms elevation', async () => {
@@ -404,39 +476,40 @@ it('returns confirmation-required for WSL2 until the caller confirms elevation',
     .send({})
 
   expect(res.status).toBe(200)
-  expect(res.body).toEqual({
+  expect(res.body).toMatchObject({
     method: 'confirmation-required',
     title: 'Administrator approval required',
     body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
     confirmLabel: 'Continue',
+    confirmationToken: expect.any(String),
   })
   expect(cp.execFile).not.toHaveBeenCalled()
 })
 
-it('returns none for WSL2 when no repair is actually needed anymore', async () => {
+it('does not elevate on a first-call confirmed WSL2 request without a server token', async () => {
   vi.mocked(detectFirewall).mockResolvedValue({ platform: 'wsl2', active: true })
   networkManager.resetFirewallCache()
-
-  const wslModule = await import('../../../server/wsl-port-forward.js')
-  vi.mocked(wslModule.computeWslPortForwardingPlan).mockReturnValue({
-    status: 'noop',
-    wslIp: '172.24.0.2',
-  })
 
   const cp = await import('node:child_process')
   const res = await request(app)
     .post('/api/network/configure-firewall')
     .set('x-auth-token', token)
-    .send({})
+    .send({ confirmElevation: true })
 
   expect(res.status).toBe(200)
-  expect(res.body).toEqual({ method: 'none', message: 'No configuration changes required' })
+  expect(res.body.method).toBe('confirmation-required')
+  expect(res.body.confirmationToken).toEqual(expect.any(String))
   expect(cp.execFile).not.toHaveBeenCalled()
 })
 
-it('starts WSL2 repair after explicit confirmation', async () => {
+it('starts WSL2 repair only after a confirmed retry with the issued token', async () => {
   vi.mocked(detectFirewall).mockResolvedValue({ platform: 'wsl2', active: true })
   networkManager.resetFirewallCache()
+
+  const firstRes = await request(app)
+    .post('/api/network/configure-firewall')
+    .set('x-auth-token', token)
+    .send({})
 
   const cp = await import('node:child_process')
   vi.mocked(cp.execFile).mockImplementation((_cmd: any, _args: any, _opts: any, _cb: any) => {
@@ -446,13 +519,82 @@ it('starts WSL2 repair after explicit confirmation', async () => {
   const res = await request(app)
     .post('/api/network/configure-firewall')
     .set('x-auth-token', token)
-    .send({ confirmElevation: true })
+    .send({
+      confirmElevation: true,
+      confirmationToken: firstRes.body.confirmationToken,
+    })
 
   expect(res.status).toBe(200)
   expect(res.body).toEqual({ method: 'wsl2', status: 'started' })
 })
 
-it('returns confirmation-required for native Windows until the caller confirms elevation', async () => {
+it('returns none for WSL2 when the confirmed retry recomputes to noop', async () => {
+  vi.mocked(detectFirewall).mockResolvedValue({ platform: 'wsl2', active: true })
+  networkManager.resetFirewallCache()
+
+  const wslModule = await import('../../../server/wsl-port-forward.js')
+  vi.mocked(wslModule.computeWslPortForwardingPlanAsync)
+    .mockResolvedValueOnce({
+      status: 'ready',
+      wslIp: '172.24.0.2',
+      scriptKind: 'full',
+      script: '$null # mock script',
+    })
+    .mockResolvedValueOnce({
+      status: 'noop',
+      wslIp: '172.24.0.2',
+    })
+
+  const firstRes = await request(app)
+    .post('/api/network/configure-firewall')
+    .set('x-auth-token', token)
+    .send({})
+
+  const cp = await import('node:child_process')
+  const confirmedRes = await request(app)
+    .post('/api/network/configure-firewall')
+    .set('x-auth-token', token)
+    .send({
+      confirmElevation: true,
+      confirmationToken: firstRes.body.confirmationToken,
+    })
+
+  expect(confirmedRes.status).toBe(200)
+  expect(confirmedRes.body).toEqual({ method: 'none', message: 'No configuration changes required' })
+  expect(cp.execFile).not.toHaveBeenCalled()
+})
+
+it('returns none when remote access is disabled before the confirmed retry', async () => {
+  vi.mocked(detectFirewall).mockResolvedValue({ platform: 'windows', active: true })
+  networkManager.resetFirewallCache()
+
+  const firstRes = await request(app)
+    .post('/api/network/configure-firewall')
+    .set('x-auth-token', token)
+    .send({})
+
+  await configStore.patchSettings({
+    network: {
+      configured: true,
+      host: '127.0.0.1',
+    },
+  })
+
+  const cp = await import('node:child_process')
+  const confirmedRes = await request(app)
+    .post('/api/network/configure-firewall')
+    .set('x-auth-token', token)
+    .send({
+      confirmElevation: true,
+      confirmationToken: firstRes.body.confirmationToken,
+    })
+
+  expect(confirmedRes.status).toBe(200)
+  expect(confirmedRes.body).toEqual({ method: 'none', message: 'Remote access is not enabled' })
+  expect(cp.execFile).not.toHaveBeenCalled()
+})
+
+it('does not elevate on a first-call confirmed Windows request without a server token', async () => {
   vi.mocked(detectFirewall).mockResolvedValue({ platform: 'windows', active: true })
   networkManager.resetFirewallCache()
 
@@ -460,16 +602,22 @@ it('returns confirmation-required for native Windows until the caller confirms e
   const res = await request(app)
     .post('/api/network/configure-firewall')
     .set('x-auth-token', token)
-    .send({})
+    .send({ confirmElevation: true })
 
   expect(res.status).toBe(200)
   expect(res.body.method).toBe('confirmation-required')
+  expect(res.body.confirmationToken).toEqual(expect.any(String))
   expect(cp.execFile).not.toHaveBeenCalled()
 })
 
-it('starts native Windows repair after explicit confirmation', async () => {
+it('starts native Windows repair only after a confirmed retry with the issued token', async () => {
   vi.mocked(detectFirewall).mockResolvedValue({ platform: 'windows', active: true })
   networkManager.resetFirewallCache()
+
+  const firstRes = await request(app)
+    .post('/api/network/configure-firewall')
+    .set('x-auth-token', token)
+    .send({})
 
   const cp = await import('node:child_process')
   vi.mocked(cp.execFile).mockImplementation((_cmd: any, _args: any, _opts: any, _cb: any) => {
@@ -479,10 +627,89 @@ it('starts native Windows repair after explicit confirmation', async () => {
   const res = await request(app)
     .post('/api/network/configure-firewall')
     .set('x-auth-token', token)
-    .send({ confirmElevation: true })
+    .send({
+      confirmElevation: true,
+      confirmationToken: firstRes.body.confirmationToken,
+    })
 
   expect(res.status).toBe(200)
   expect(res.body).toEqual({ method: 'windows-elevated', status: 'started' })
+})
+
+it('allows only one confirmed repair request through the single-flight lock', async () => {
+  vi.mocked(detectFirewall).mockResolvedValue({ platform: 'wsl2', active: true })
+  networkManager.resetFirewallCache()
+
+  const wslModule = await import('../../../server/wsl-port-forward.js')
+  const firstPrompt = await request(app)
+    .post('/api/network/configure-firewall')
+    .set('x-auth-token', token)
+    .send({})
+  const secondPrompt = await request(app)
+    .post('/api/network/configure-firewall')
+    .set('x-auth-token', token)
+    .send({})
+
+  let release!: () => void
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  let enteredLockedSection!: () => void
+  const enteredLockedSectionPromise = new Promise<void>((resolve) => {
+    enteredLockedSection = resolve
+  })
+
+  vi.mocked(wslModule.computeWslPortForwardingPlanAsync)
+    .mockImplementationOnce(async () => {
+      enteredLockedSection()
+      await blocked
+      return {
+        status: 'ready',
+        wslIp: '172.24.0.2',
+        scriptKind: 'full',
+        script: '$null # mock script',
+      }
+    })
+    .mockResolvedValueOnce({
+      status: 'ready',
+      wslIp: '172.24.0.2',
+      scriptKind: 'full',
+      script: '$null # mock script',
+    })
+
+  const cp = await import('node:child_process')
+  vi.mocked(cp.execFile).mockImplementation((_cmd: any, _args: any, _opts: any, _cb: any) => {
+    return { on: vi.fn() } as any
+  })
+
+  const firstConfirmed = request(app)
+    .post('/api/network/configure-firewall')
+    .set('x-auth-token', token)
+    .send({
+      confirmElevation: true,
+      confirmationToken: firstPrompt.body.confirmationToken,
+    })
+
+  await enteredLockedSectionPromise
+
+  const secondConfirmedPromise = request(app)
+    .post('/api/network/configure-firewall')
+    .set('x-auth-token', token)
+    .send({
+      confirmElevation: true,
+      confirmationToken: secondPrompt.body.confirmationToken,
+    })
+
+  release()
+  const [firstConfirmedRes, secondConfirmed] = await Promise.all([
+    firstConfirmed,
+    secondConfirmedPromise,
+  ])
+
+  expect(firstConfirmedRes.status).toBe(200)
+  expect(secondConfirmed.status).toBe(409)
+  expect(secondConfirmed.body.method).toBe('in-progress')
+  expect(cp.execFile).toHaveBeenCalledTimes(1)
 })
 
 it('rejects malformed confirmation payloads', async () => {
@@ -502,46 +729,112 @@ Run:
 
 ```bash
 npx vitest run --config vitest.server.config.ts test/integration/server/network-api.test.ts
+npx vitest run --config vitest.server.config.ts test/unit/server/firewall-repair-coordinator.test.ts
 ```
 
 Expected:
-- FAIL because the route still elevates immediately and there is no `confirmation-required` response.
-- FAIL because the route still elevates immediately, there is no `confirmation-required` response, and there is no WSL no-op branch backed by the new pure planning helper.
+- FAIL because `server/firewall-repair-coordinator.ts` does not exist yet and the route still treats `confirmElevation: true` as sufficient on the first call, does not issue one-time confirmation tokens, and does not hold a real single-flight lock across the confirmed repair path.
 
 **Step 3: Write the minimal implementation**
 
+Create `server/firewall-repair-coordinator.ts` with:
+
+```ts
+import { randomUUID } from 'node:crypto'
+
+export const FIREWALL_CONFIRMATION_TTL_MS = 5 * 60_000
+export const FIREWALL_REPAIR_LOCKED = Symbol('FIREWALL_REPAIR_LOCKED')
+
+type RepairPlatform = 'windows' | 'wsl2'
+
+export function createFirewallRepairCoordinator(now: () => number = () => Date.now()) {
+  const confirmations = new Map<string, { platform: RepairPlatform; expiresAt: number }>()
+  let confirmedRepairInFlight = false
+
+  function pruneExpired() {
+    const currentTime = now()
+    for (const [token, entry] of confirmations) {
+      if (entry.expiresAt <= currentTime) {
+        confirmations.delete(token)
+      }
+    }
+  }
+
+  return {
+    issueConfirmation(platform: RepairPlatform) {
+      pruneExpired()
+      const confirmationToken = randomUUID()
+      confirmations.set(confirmationToken, {
+        platform,
+        expiresAt: now() + FIREWALL_CONFIRMATION_TTL_MS,
+      })
+      return {
+        method: 'confirmation-required' as const,
+        title: 'Administrator approval required',
+        body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
+        confirmLabel: 'Continue',
+        confirmationToken,
+      }
+    },
+    consumeConfirmation(token: string | undefined, platform: RepairPlatform) {
+      pruneExpired()
+      if (!token) return false
+      const entry = confirmations.get(token)
+      if (!entry || entry.platform !== platform) {
+        return false
+      }
+      confirmations.delete(token)
+      return true
+    },
+    async withConfirmedRepairLock<T>(fn: () => Promise<T>) {
+      if (confirmedRepairInFlight) {
+        return FIREWALL_REPAIR_LOCKED
+      }
+      confirmedRepairInFlight = true
+      try {
+        return await fn()
+      } finally {
+        confirmedRepairInFlight = false
+      }
+    },
+  }
+}
+```
+
 In `server/network-router.ts`:
 
-- Add a request schema:
+- Instantiate one `const repairCoordinator = createFirewallRepairCoordinator()` inside `createNetworkRouter(...)`.
+- Expand the request schema to:
 
 ```ts
 const ConfigureFirewallRequestSchema = z.object({
   confirmElevation: z.literal(true).optional(),
+  confirmationToken: z.string().uuid().optional(),
 }).strict()
 ```
 
 - Parse `req.body ?? {}` at the top of the route and return `400` on invalid bodies.
-- Add a shared constant for the confirmation response:
-
-```ts
-const WINDOWS_ELEVATION_CONFIRMATION = {
-  method: 'confirmation-required',
-  title: 'Administrator approval required',
-  body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
-  confirmLabel: 'Continue',
-} as const
-```
-
-- When `status.firewall.platform === 'windows'` and `confirmElevation !== true`, return that payload without calling `execFile`.
-- For the WSL2 branch, call `computeWslPortForwardingPlan(networkManager.getRelevantPorts())` before deciding whether a prompt is needed:
-  - `status: 'error'` -> return `500`
-  - `status: 'noop'` -> return `{ method: 'none', message: 'No configuration changes required' }`
-  - `status: 'ready'` -> use that returned script for the later elevated run
-- Recompute the WSL plan after `confirmElevation === true` instead of trusting the earlier click. If the plan has become `noop` between prompt and confirmation, return `none` and do not set `firewall.configuring`.
-- Do not call `networkManager.setFirewallConfiguring(true)` until after `confirmElevation === true` and the elevated process is actually about to spawn.
-- When confirmation is present, use `spawnElevatedPowerShell(...)` from `server/elevated-powershell.ts` in both the WSL and native Windows branches.
-- Keep the existing `firewall.configuring` guard, cache reset, and async completion behavior.
-- Do not describe this bool as a hardened security token in comments or types; it is an explicit acknowledgement required by the product flow.
+- Add a small local helper that converts the current platform-specific state into one of three repair actions:
+  - `{ kind: 'none', response: { method: 'none', ... } }`
+  - `{ kind: 'confirmable', platform: 'wsl2' | 'windows', script: string, responseMethod: 'wsl2' | 'windows-elevated' }`
+  - `{ kind: 'error', status: 500, body: { error: string } }`
+- For WSL2, that helper must await `computeWslPortForwardingPlanAsync(networkManager.getRelevantPorts())` on every call:
+  - `status: 'error'` -> `500`
+  - `status: 'noop'` or `status: 'not-wsl2'` -> `{ method: 'none', message: 'No configuration changes required' }`
+  - `status: 'ready'` -> carry the returned `script`
+- For Windows, the helper must re-read `status.firewall.commands` and `status.firewall.portOpen` each time:
+  - no commands -> `{ method: 'none', message: 'No firewall detected' }`
+  - `portOpen === true` -> `{ method: 'none', message: 'No configuration changes required' }`
+  - otherwise -> confirmable action with `script = commands.join('; ')`
+- Before any platform-specific repair work, keep the existing remote-access-disabled check and return `{ method: 'none', message: 'Remote access is not enabled' }`.
+- If the request is missing either `confirmElevation: true` or a valid `confirmationToken`, and repair is still needed, return `repairCoordinator.issueConfirmation(platform)` without calling `spawnElevatedPowerShell(...)`. This includes first-call `{ confirmElevation: true }`.
+- For confirmed requests, wrap the whole fresh-state revalidation and spawn decision inside `repairCoordinator.withConfirmedRepairLock(...)`.
+  - If the lock returns `FIREWALL_REPAIR_LOCKED`, respond with `409` and `{ method: 'in-progress', error: 'Firewall configuration already in progress' }`.
+  - Once inside the lock, re-fetch fresh `status` and `settings`, re-run the repair-action helper, and only then decide whether to return `none`, `confirmation-required`, or start repair.
+  - Only if `repairCoordinator.consumeConfirmation(confirmationToken, platform)` succeeds may the route call `spawnElevatedPowerShell(...)`.
+  - Keep `networkManager.setFirewallConfiguring(true)` inside the confirmed path immediately before spawning the child, not on the first prompt.
+- Keep the existing cache reset and async completion behavior after the child exits or spawn fails.
+- Do not describe `confirmationToken` as durable consent; it is one-time proof that the prompt was shown by the product flow.
 
 In `server/firewall.ts`, update the Windows/WSL comments so they describe the new explicit-confirmation contract rather than unconditional elevation.
 
@@ -551,6 +844,7 @@ Run:
 
 ```bash
 npx vitest run --config vitest.server.config.ts test/integration/server/network-api.test.ts
+npx vitest run --config vitest.server.config.ts test/unit/server/firewall-repair-coordinator.test.ts
 ```
 
 Expected:
@@ -560,9 +854,11 @@ Expected:
 
 ```bash
 git add server/network-router.ts \
+  server/firewall-repair-coordinator.ts \
   server/firewall.ts \
-  test/integration/server/network-api.test.ts
-git commit -m "fix(server): require confirmation before windows elevation"
+  test/integration/server/network-api.test.ts \
+  test/unit/server/firewall-repair-coordinator.test.ts
+git commit -m "fix(server): enforce two-step windows repair contract"
 ```
 
 ### Task 5: Refactor `ConfirmModal` to Reuse Shared Button Variants
@@ -651,7 +947,7 @@ git add src/components/ui/confirm-modal.tsx test/unit/client/components/ui/confi
 git commit -m "refactor(ui): reuse button variants in confirm modal"
 ```
 
-### Task 6: Extend the Client Firewall Helper for the Confirmation Contract
+### Task 6: Extend the Client Firewall Helper for the Tokenized Confirmation Contract
 
 **Files:**
 - Modify: `src/lib/firewall-configure.ts`
@@ -668,18 +964,25 @@ it('returns confirmation-required payloads', async () => {
     title: 'Administrator approval required',
     body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
     confirmLabel: 'Continue',
+    confirmationToken: 'confirm-1',
   })
 
   const result = await fetchFirewallConfig()
   expect(result.method).toBe('confirmation-required')
 })
 
-it('passes confirmElevation when explicitly requested', async () => {
+it('passes confirmElevation and confirmationToken when explicitly requested', async () => {
   vi.mocked(api.post).mockResolvedValue({ method: 'windows-elevated', status: 'started' })
 
-  await fetchFirewallConfig({ confirmElevation: true })
+  await fetchFirewallConfig({
+    confirmElevation: true,
+    confirmationToken: 'confirm-1',
+  })
 
-  expect(api.post).toHaveBeenCalledWith('/api/network/configure-firewall', { confirmElevation: true })
+  expect(api.post).toHaveBeenCalledWith('/api/network/configure-firewall', {
+    confirmElevation: true,
+    confirmationToken: 'confirm-1',
+  })
 })
 ```
 
@@ -706,6 +1009,7 @@ In `src/lib/firewall-configure.ts`:
     title: string
     body: string
     confirmLabel: string
+    confirmationToken: string
   }
 ```
 
@@ -713,7 +1017,7 @@ In `src/lib/firewall-configure.ts`:
 
 ```ts
 export async function fetchFirewallConfig(
-  body: { confirmElevation?: true } = {},
+  body: { confirmElevation?: true; confirmationToken?: string } = {},
 ): Promise<ConfigureFirewallResult> {
   return api.post<ConfigureFirewallResult>('/api/network/configure-firewall', body)
 }
@@ -756,6 +1060,7 @@ it('shows an admin-approval modal before starting WSL2 repair', async () => {
       title: 'Administrator approval required',
       body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
       confirmLabel: 'Continue',
+      confirmationToken: 'confirm-1',
     })
     .mockResolvedValueOnce({ method: 'wsl2', status: 'started' })
 
@@ -787,7 +1092,10 @@ it('shows an admin-approval modal before starting WSL2 repair', async () => {
   fireEvent.click(screen.getByRole('button', { name: /continue/i }))
 
   await waitFor(() => {
-    expect(mockFetchFirewallConfig).toHaveBeenNthCalledWith(2, { confirmElevation: true })
+    expect(mockFetchFirewallConfig).toHaveBeenNthCalledWith(2, {
+      confirmElevation: true,
+      confirmationToken: 'confirm-1',
+    })
   })
 })
 
@@ -797,6 +1105,7 @@ it('does nothing when the user cancels the admin-approval modal', async () => {
     title: 'Administrator approval required',
     body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
     confirmLabel: 'Continue',
+    confirmationToken: 'confirm-1',
   })
 
   const store = createTestStore({
@@ -826,7 +1135,7 @@ it('does nothing when the user cancels the admin-approval modal', async () => {
 })
 ```
 
-In `test/e2e/network-setup.test.tsx`, add a wizard-path flow that asserts the confirmation dialog appears before the second firewall request is sent.
+In `test/e2e/network-setup.test.tsx`, add a wizard-path flow that asserts the confirmation dialog appears before the second firewall request is sent and that the retry body includes the issued `confirmationToken`.
 
 **Step 2: Run the targeted wizard tests and confirm failure**
 
@@ -847,7 +1156,9 @@ In `src/components/SetupWizard.tsx`:
 
 - Add local state for the pending confirmation payload and whether the modal is open.
 - On the first `fetchFirewallConfig()` call, if the result is `confirmation-required`, open `ConfirmModal` with the returned `title`, `body`, and `confirmLabel`, using `confirmVariant="default"`.
-- On confirm, call `fetchFirewallConfig({ confirmElevation: true })` and then reuse the existing WSL/Windows polling path.
+- Store the full confirmation payload, including `confirmationToken`, in state.
+- On confirm, call `fetchFirewallConfig({ confirmElevation: true, confirmationToken })` and then reuse the existing WSL/Windows polling path.
+- Treat any repeated `confirmation-required` response from that retry as a fresh prompt update rather than assuming the second call always starts repair.
 - On cancel, close the modal and do nothing else.
 - Keep the Linux/macOS terminal-pane flow unchanged.
 
@@ -905,6 +1216,7 @@ it('shows an admin-approval modal before starting Windows firewall repair', asyn
       title: 'Administrator approval required',
       body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
       confirmLabel: 'Continue',
+      confirmationToken: 'confirm-1',
     })
     .mockResolvedValueOnce({ method: 'windows-elevated', status: 'started' })
 
@@ -933,7 +1245,10 @@ it('shows an admin-approval modal before starting Windows firewall repair', asyn
   fireEvent.click(screen.getByRole('button', { name: /continue/i }))
 
   await waitFor(() => {
-    expect(mockFetchFirewallConfig).toHaveBeenNthCalledWith(2, { confirmElevation: true })
+    expect(mockFetchFirewallConfig).toHaveBeenNthCalledWith(2, {
+      confirmElevation: true,
+      confirmationToken: 'confirm-1',
+    })
   })
 })
 
@@ -943,6 +1258,7 @@ it('does not re-issue the firewall request when the modal is cancelled', async (
     title: 'Administrator approval required',
     body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
     confirmLabel: 'Continue',
+    confirmationToken: 'confirm-1',
   })
 
   const store = createSettingsViewStore({
@@ -970,7 +1286,7 @@ it('does not re-issue the firewall request when the modal is cancelled', async (
 })
 ```
 
-In `test/e2e/network-setup.test.tsx`, extend the settings flow so it also checks for the confirmation modal before the second request.
+In `test/e2e/network-setup.test.tsx`, extend the settings flow so it also checks for the confirmation modal before the second request and asserts that the retry includes the server-issued `confirmationToken`.
 
 **Step 2: Run the targeted settings tests and confirm failure**
 
@@ -991,9 +1307,11 @@ In `src/components/SettingsView.tsx`:
 
 - Add local state for the confirmation modal.
 - On the first `fetchFirewallConfig()` call, if the result is `confirmation-required`, open `ConfirmModal` with `confirmVariant="default"`.
-- On confirm, call `fetchFirewallConfig({ confirmElevation: true })`, then reuse the existing follow-up behavior:
+- Store the full confirmation payload, including `confirmationToken`, in state.
+- On confirm, call `fetchFirewallConfig({ confirmElevation: true, confirmationToken })`, then reuse the existing follow-up behavior:
   - open a terminal tab for `terminal`
   - schedule `fetchNetworkStatus()` for `wsl2` / `windows-elevated`
+- Treat any repeated `confirmation-required` response from that retry as a fresh prompt update rather than assuming the second call always starts repair.
 - On cancel, close the modal and exit without side effects.
 
 **Step 4: Re-run the targeted settings tests**
@@ -1107,6 +1425,7 @@ git commit -m "fix(electron): run windows daemon with least privilege"
 **Step 1: Refactor for clarity only where it reduces future privilege regressions**
 
 - Keep the confirmation copy sourced from the server payload.
+- Keep the one-time token issuance and single-flight lock in `server/firewall-repair-coordinator.ts`; do not re-spread that protocol logic across `network-router.ts`, `NetworkManager`, and the UI.
 - Keep all `Start-Process ... -Verb RunAs` quoting in `server/elevated-powershell.ts`.
 - Keep `ConfirmModal` aligned with `src/components/ui/button.tsx` instead of reintroducing ad-hoc button classes.
 - Remove stale comments that still describe startup auto-repair, boot-only suppression env vars, or unconditional Windows elevation.
@@ -1122,6 +1441,7 @@ npx vitest run --config vitest.server.config.ts \
   test/integration/server/wsl-port-forward.test.ts \
   test/integration/server/logger.separation.harness.test.ts \
   test/integration/server/network-api.test.ts \
+  test/unit/server/firewall-repair-coordinator.test.ts \
   test/unit/server/wsl-port-forward.test.ts \
   test/unit/server/elevated-powershell.test.ts
 ```
@@ -1173,6 +1493,7 @@ Expected:
 git add server/index.ts \
   server/wsl-port-forward.ts \
   server/elevated-powershell.ts \
+  server/firewall-repair-coordinator.ts \
   server/network-router.ts \
   server/firewall.ts \
   src/components/ui/confirm-modal.tsx \
@@ -1185,6 +1506,7 @@ git add server/index.ts \
   test/integration/server/logger.separation.harness.ts \
   test/integration/server/logger.separation.harness.test.ts \
   test/integration/server/network-api.test.ts \
+  test/unit/server/firewall-repair-coordinator.test.ts \
   test/unit/server/wsl-port-forward.test.ts \
   test/unit/server/elevated-powershell.test.ts \
   test/unit/client/components/ui/confirm-modal.test.tsx \
@@ -1202,9 +1524,10 @@ git commit -m "fix(windows): tighten privilege boundaries for repair flows"
 - `git status --short` is clean.
 - `server/wsl-port-forward.ts` no longer exports `setupWslPortForwarding` or `getRequiredPorts`, and does export `computeWslPortForwardingPlan`.
 - `server/wsl-port-forward-startup.ts` is gone.
-- `POST /api/network/configure-firewall` has exactly four manual behaviors:
+- `POST /api/network/configure-firewall` has exactly five interactive outcomes:
   - `terminal` for Linux/macOS
   - `none` when no repair is needed
-  - `confirmation-required` until explicit confirmation on Windows/WSL
-  - `wsl2` / `windows-elevated` after explicit confirmation
+  - `confirmation-required` with a one-time `confirmationToken` while Windows/WSL repair still needs user approval
+  - `wsl2` / `windows-elevated` after a validated confirmed retry
+  - `in-progress` when another confirmed repair is already active
 - `installers/windows/freshell-task.xml.template` contains `LeastPrivilege`.
