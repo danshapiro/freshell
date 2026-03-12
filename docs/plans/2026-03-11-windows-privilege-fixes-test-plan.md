@@ -16,7 +16,7 @@ No approval required. The approved strategy still fits the implementation plan a
 - `Transcript`: the approved 2026-03-11 trycycle conversation, especially the user-approved decisions to remove startup auto-elevation, require explicit pre-UAC confirmation with accept/cancel copy, keep manual repair in-product, and run daemon tasks at least privilege.
 - `Plan-SG`: `docs/plans/2026-03-11-windows-privilege-fixes.md`, sections `Strategy Gate` and `Scope Notes`.
 - `Plan-AM`: `docs/plans/2026-03-11-windows-privilege-fixes.md`, section `Acceptance Mapping`.
-- `Plan-T1` through `Plan-T10`: the task sections in `docs/plans/2026-03-11-windows-privilege-fixes.md`.
+- `Plan-T1` through `Plan-T5`: the task sections in `docs/plans/2026-03-11-windows-privilege-fixes.md`.
 - `Client repair contract`: the documented contract in `src/lib/firewall-configure.ts` describing the existing `terminal`, `wsl2` / `windows-elevated`, and `none` flows that must stay intact where the implementation plan says behavior is unchanged.
 
 ## Harness requirements
@@ -69,9 +69,9 @@ No approval required. The approved strategy still fits the implementation plan a
    4. Click `Continue`.
    5. Let the polling loop finish with `portOpen: true`.
    Expected outcome:
-   - The first click opens an accessible modal titled `Administrator approval required` with the approved body copy and `Continue` plus `Cancel`; there is no second repair request yet. Sources: `Transcript`, `Plan-AM`, `Plan-T7`.
-   - The second repair request is `fetchFirewallConfig({ confirmElevation: true })`. Sources: `Plan-AM`, `Plan-T6`, `Plan-T7`.
-   - The wizard reports firewall progress only after confirmed elevation and ends in a success state once polling sees `configuring: false` and `portOpen: true`. Sources: `Plan-AM`, `Plan-T4`, `Plan-T7`.
+   - The first click opens an accessible modal titled `Administrator approval required` with the approved body copy and `Continue` plus `Cancel`; there is no second repair request yet. Sources: `Transcript`, `Plan-AM`, `Plan-T4`.
+   - The second repair request is `fetchFirewallConfig({ confirmElevation: true, confirmationToken: '<token from first response>' })`. Sources: `Plan-AM`, `Plan-T3`, `Plan-T4`.
+   - The wizard reports firewall progress only after confirmed elevation and ends in a success state once polling sees `configuring: false` and `portOpen: true`. Sources: `Plan-AM`, `Plan-T2`, `Plan-T4`.
    Interactions: `SetupWizard` <> `fetchFirewallConfig`, `SetupWizard` <> `fetchNetworkStatus`, modal layering over the wizard, Redux `network` state updates.
 
 2. Name: Setup Wizard cancel path does not trigger elevation
@@ -83,8 +83,8 @@ No approval required. The approved strategy still fits the implementation plan a
    2. Click `Configure now`.
    3. Click `Cancel` in the admin-approval modal.
    Expected outcome:
-   - The confirmation modal is shown before any confirmed repair begins. Sources: `Transcript`, `Plan-AM`, `Plan-T7`.
-   - The repair API is called exactly once, no `{ confirmElevation: true }` request is sent, and no firewall polling starts. Sources: `Plan-AM`, `Plan-T4`, `Plan-T7`.
+   - The confirmation modal is shown before any confirmed repair begins. Sources: `Transcript`, `Plan-AM`, `Plan-T4`.
+   - The repair API is called exactly once, no `{ confirmElevation: true, confirmationToken }` request is sent, and no firewall polling starts. Sources: `Plan-AM`, `Plan-T2`, `Plan-T4`.
    Interactions: `SetupWizard` <> `ConfirmModal`, `SetupWizard` <> repair API call-count boundary.
 
 3. Name: Settings view requires explicit approval before starting native Windows firewall repair
@@ -97,8 +97,8 @@ No approval required. The approved strategy still fits the implementation plan a
    3. Observe the admin-approval modal.
    4. Click `Continue`.
    Expected outcome:
-   - The first click shows the same approval copy and actions as the wizard flow. Sources: `Transcript`, `Plan-AM`, `Plan-T8`.
-   - The confirmed request sends `{ confirmElevation: true }` and follows the existing Windows server-handled completion path by scheduling a status refresh instead of opening a terminal. Sources: `Plan-AM`, `Plan-T6`, `Plan-T8`, `Client repair contract`.
+   - The first click shows the same approval copy and actions as the wizard flow. Sources: `Transcript`, `Plan-AM`, `Plan-T4`.
+   - The confirmed request sends `{ confirmElevation: true, confirmationToken: '<token from first response>' }` and follows the existing Windows server-handled completion path by scheduling a status refresh instead of opening a terminal. Sources: `Plan-AM`, `Plan-T3`, `Plan-T4`, `Client repair contract`.
    Interactions: `SettingsView` <> `fetchFirewallConfig`, `SettingsView` <> `fetchNetworkStatus`, modal rendering inside an already-mounted settings view.
 
 4. Name: Linux and macOS firewall repair stays on the existing terminal-command path
@@ -109,7 +109,7 @@ No approval required. The approved strategy still fits the implementation plan a
    1. Render `SettingsView` and click `Fix`.
    2. Repeat the same flow from `SetupWizard` by clicking `Configure now`.
    Expected outcome:
-   - Neither UI shows the Windows admin-approval modal for terminal-command platforms. Sources: `Plan-AM`, `Plan-T7`, `Plan-T8`.
+   - Neither UI shows the Windows admin-approval modal for terminal-command platforms. Sources: `Plan-AM`, `Plan-T4`.
    - Both UIs stay on the pre-existing terminal flow by routing the returned command into the terminal-pane entry point. Sources: `Plan-AM`, `Plan-SG`, `Client repair contract`.
    Interactions: UI repair entry points <> terminal-tab creation, UI repair entry points <> platform-specific result branching.
 
@@ -121,8 +121,8 @@ No approval required. The approved strategy still fits the implementation plan a
    1. Call `runStartup(...)`.
    2. Observe the daemon-manager interactions and the returned startup result.
    Expected outcome:
-   - Startup still calls `daemonManager.start()` when the daemon is installed but not running. Sources: `Plan-T9`, `Plan-T10`.
-   - Startup still returns the main-window path rather than failing because of the least-privilege normalization change. Sources: `Plan-T10`.
+   - Startup still calls `daemonManager.start()` when the daemon is installed but not running. Sources: `Plan-T5`.
+   - Startup still returns the main-window path rather than failing because of the least-privilege normalization change. Sources: `Plan-T5`.
    Interactions: desktop startup orchestration <> daemon-manager state, daemon start decision <> browser window creation.
 
 6. Name: WSL configure-firewall first call returns confirmation-required and does not spawn elevation
@@ -134,8 +134,8 @@ No approval required. The approved strategy still fits the implementation plan a
    2. Inspect the HTTP response and the mocked `execFile` calls.
    3. Re-read network status if needed to observe `firewall.configuring`.
    Expected outcome:
-   - The route returns `{ method: 'confirmation-required', title, body, confirmLabel }` with the approved copy. Sources: `Transcript`, `Plan-AM`, `Plan-T4`.
-   - No elevated child process is spawned and `firewall.configuring` is not consumed by the pre-confirmation response. Sources: `Plan-AM`, `Plan-T4`.
+   - The route returns `{ method: 'confirmation-required', title, body, confirmLabel, confirmationToken }` with the approved copy and a server-issued token. Sources: `Transcript`, `Plan-AM`, `Plan-T2`.
+   - No elevated child process is spawned and `firewall.configuring` is not consumed by the pre-confirmation response. Sources: `Plan-AM`, `Plan-T2`.
    Interactions: router <> `NetworkManager`, router <> WSL planning helper, router <> child-process boundary.
 
 7. Name: WSL confirmation is recomputed and short-circuits to none when repair is no longer needed
@@ -143,11 +143,12 @@ No approval required. The approved strategy still fits the implementation plan a
    Harness: H2
    Preconditions: `detectFirewall()` reports WSL2. The first planning call can report `ready`, but the confirmed call recomputes to `{ status: 'noop', wslIp: '...' }`.
    Actions:
-   1. POST `/api/network/configure-firewall` with `{ confirmElevation: true }`.
-   2. Inspect the response and process-spawn side effects.
+   1. POST `/api/network/configure-firewall` with `{}` and capture `confirmationToken`.
+   2. POST `/api/network/configure-firewall` with `{ confirmElevation: true, confirmationToken }`.
+   3. Inspect the response and process-spawn side effects.
    Expected outcome:
-   - The route returns `{ method: 'none', message: 'No configuration changes required' }` when the recomputed plan is already satisfied. Sources: `Plan-AM`, `Plan-T4`.
-   - No elevated child process is spawned and `firewall.configuring` stays false in this boundary case. Sources: `Plan-AM`, `Plan-T4`.
+   - The route returns `{ method: 'none', message: 'No configuration changes required' }` when the recomputed plan is already satisfied. Sources: `Plan-AM`, `Plan-T2`.
+   - No elevated child process is spawned and `firewall.configuring` stays false in this boundary case. Sources: `Plan-AM`, `Plan-T2`.
    Interactions: confirmation route <> pure WSL planning helper, race between user confirmation and current network state.
 
 8. Name: Native Windows configure-firewall follows the same two-call confirmation contract
@@ -156,23 +157,26 @@ No approval required. The approved strategy still fits the implementation plan a
    Preconditions: `detectFirewall()` reports `{ platform: 'windows', active: true }`; firewall commands are present; mocked `execFile` can record a started child process.
    Actions:
    1. POST `/api/network/configure-firewall` with `{}`.
-   2. POST `/api/network/configure-firewall` with `{ confirmElevation: true }`.
+   2. POST `/api/network/configure-firewall` with `{ confirmElevation: true, confirmationToken: '<token from step 1>' }`.
    Expected outcome:
-   - The first response is `confirmation-required`, not `windows-elevated`. Sources: `Transcript`, `Plan-AM`, `Plan-T4`.
-   - The confirmed response is `{ method: 'windows-elevated', status: 'started' }` and only then may the server mark firewall configuration as in progress. Sources: `Plan-AM`, `Plan-T4`.
+   - The first response is `confirmation-required`, not `windows-elevated`. Sources: `Transcript`, `Plan-AM`, `Plan-T2`.
+   - The confirmed response is `{ method: 'windows-elevated', status: 'started' }` and only then may the server mark firewall configuration as in progress. Sources: `Plan-AM`, `Plan-T2`.
    Interactions: router <> Windows firewall command list, router <> shared elevated PowerShell helper.
 
-9. Name: Configure-firewall rejects malformed confirmation bodies and preserves the in-progress guard
+9. Name: Configure-firewall rotates tokens, rejects malformed confirmation bodies, and preserves the confirmed in-progress guard
    Type: boundary
    Harness: H2
-   Preconditions: Authenticated router harness is mounted. For the guard case, `networkManager.setFirewallConfiguring(true)` is set before the request.
+   Preconditions: Authenticated router harness is mounted. For the guard case, the first confirmed request can hold the single-flight lock long enough for a concurrent second confirmed request to arrive.
    Actions:
    1. POST `/api/network/configure-firewall` with `{ confirmElevation: false }`.
-   2. POST `/api/network/configure-firewall` while `firewall.configuring === true`.
+   2. POST `/api/network/configure-firewall` with `{}` twice and keep both returned tokens.
+   3. Retry with the superseded first token after the second token has been issued.
+   4. Launch two concurrent confirmed retries with the still-current token.
    Expected outcome:
-   - `{ confirmElevation: false }` is rejected with `400` and `error: 'Invalid request'`. Sources: `Plan-AM`, `Plan-T4`.
-   - An in-flight configure request still returns `409` with `method: 'in-progress'`. Sources: `Plan-T4`.
-   Interactions: request-body validation <> router branching, router <> `NetworkManager` concurrency guard.
+   - `{ confirmElevation: false }` is rejected with `400` and `error: 'Invalid request'`. Sources: `Plan-AM`, `Plan-T2`.
+   - The first token is rejected after the second token is issued, and the route returns a fresh `confirmation-required` response instead of elevating. Sources: `Plan-AM`, `Plan-T1`, `Plan-T2`.
+   - Of the two concurrent confirmed retries that both passed pre-lock validation, one returns started and the other returns `409 { method: 'in-progress' }`. Sources: `Plan-AM`, `Plan-T1`, `Plan-T2`.
+   Interactions: request-body validation <> router branching, confirmation-token rotation <> router protocol, router <> confirmed single-flight lock.
 
 10. Name: Pure WSL planning covers not-wsl2, detection failure, no-op, firewall-only drift, and full repair drift
     Type: integration
@@ -185,8 +189,8 @@ No approval required. The approved strategy still fits the implementation plan a
     4. Call it with only firewall drift.
     5. Call it with missing or wrong portproxy rules.
     Expected outcome:
-    - The helper returns `status: 'not-wsl2'`, `status: 'error'`, `status: 'noop'`, `status: 'ready'` with `scriptKind: 'firewall-only'`, and `status: 'ready'` with `scriptKind: 'full'` for the respective cases. Sources: `Plan-AM`, `Plan-T1`.
-    - No case in this helper path executes elevation directly; it only computes the plan and normalized script. Sources: `Plan-SG`, `Plan-T1`.
+    - The helper returns `status: 'not-wsl2'`, `status: 'error'`, `status: 'noop'`, `status: 'ready'` with `scriptKind: 'firewall-only'`, and `status: 'ready'` with `scriptKind: 'full'` for the respective cases. Sources: `Plan-AM`, `Plan-T5`.
+    - No case in this helper path executes elevation directly; it only computes the plan and normalized script. Sources: `Plan-SG`, `Plan-T5`.
     Interactions: pure WSL plan helper <> shell-command parsing, drift detection across portproxy and firewall state.
 
 11. Name: Startup and spawned-test launches no longer have any boot-only WSL repair path
@@ -198,9 +202,9 @@ No approval required. The approved strategy still fits the implementation plan a
     2. Inspect `server/index.ts`.
     3. Build child env with `buildServerProcessEnv({}, {})`.
     Expected outcome:
-    - `server/wsl-port-forward.ts` exports the manual helper surface, including `computeWslPortForwardingPlan`, and no longer exports `setupWslPortForwarding` or `getRequiredPorts`. Sources: `Plan-AM`, `Plan-T1`.
-    - `server/index.ts` no longer imports or calls the startup-only WSL helper path. Sources: `Plan-AM`, `Plan-T1`.
-    - Child server launches do not inject `FRESHELL_DISABLE_WSL_PORT_FORWARD`. Sources: `Plan-AM`, `Plan-T2`.
+    - `server/wsl-port-forward.ts` exports the manual helper surface, including `computeWslPortForwardingPlan`, and no longer exports `setupWslPortForwarding` or `getRequiredPorts`. Sources: `Plan-AM`, `Plan-T5`.
+    - `server/index.ts` no longer imports or calls the startup-only WSL helper path. Sources: `Plan-AM`, `Plan-T5`.
+    - Child server launches do not inject `FRESHELL_DISABLE_WSL_PORT_FORWARD`. Sources: `Plan-AM`, `Plan-T5`.
     Interactions: startup server entrypoint <> WSL helper module surface, logger/test harness env composition.
 
 12. Name: Linux and macOS configure-firewall responses stay unchanged at the API boundary
@@ -211,7 +215,7 @@ No approval required. The approved strategy still fits the implementation plan a
     1. POST `/api/network/configure-firewall` for each platform case.
     2. Inspect the returned `method` and command payload.
     Expected outcome:
-    - Linux/macOS continue to return `method: 'terminal'` with a command string, and `linux-none` continues to return `method: 'none'`. Sources: `Plan-AM`, `Plan-T4`, `Client repair contract`.
+    - Linux/macOS continue to return `method: 'terminal'` with a command string, and `linux-none` continues to return `method: 'none'`. Sources: `Plan-AM`, `Plan-T2`, `Client repair contract`.
     - These platforms do not return `confirmation-required`. Sources: `Plan-AM`, `Plan-SG`.
     Interactions: router <> `detectFirewall`, router <> cross-platform firewall-command generation.
 
@@ -225,8 +229,8 @@ No approval required. The approved strategy still fits the implementation plan a
     3. Call `manager.start()`.
     4. Inspect the `schtasks` command sequence.
     Expected outcome:
-    - The written task definition contains `<RunLevel>LeastPrivilege</RunLevel>` and not `HighestAvailable`. Sources: `Transcript`, `Plan-AM`, `Plan-T9`.
-    - Startup normalizes the task with `schtasks /Change /RL LIMITED` before `schtasks /Run`. Sources: `Plan-AM`, `Plan-T9`.
+    - The written task definition contains `<RunLevel>LeastPrivilege</RunLevel>` and not `HighestAvailable`. Sources: `Transcript`, `Plan-AM`, `Plan-T5`.
+    - Startup normalizes the task with `schtasks /Change /RL LIMITED` before `schtasks /Run`. Sources: `Plan-AM`, `Plan-T5`.
     Interactions: daemon manager <> task XML template, daemon manager <> Windows Task Scheduler command surface.
 
 14. Name: Confirm modal keeps destructive defaults while supporting a non-destructive admin-approval primary action
@@ -247,10 +251,10 @@ No approval required. The approved strategy still fits the implementation plan a
     Preconditions: `api.post(...)` is mocked.
     Actions:
     1. Mock a `confirmation-required` response and call `fetchFirewallConfig()`.
-    2. Call `fetchFirewallConfig({ confirmElevation: true })`.
+    2. Call `fetchFirewallConfig({ confirmElevation: true, confirmationToken: 'confirm-1' })`.
     Expected outcome:
-    - The helper exposes `method: 'confirmation-required'` without narrowing it away. Sources: `Plan-AM`, `Plan-T6`.
-    - The helper sends `{ confirmElevation: true }` verbatim on the follow-up call. Sources: `Plan-AM`, `Plan-T6`.
+    - The helper exposes `method: 'confirmation-required'` without narrowing it away. Sources: `Plan-AM`, `Plan-T3`.
+    - The helper sends `{ confirmElevation: true, confirmationToken: 'confirm-1' }` verbatim on the follow-up call. Sources: `Plan-AM`, `Plan-T3`.
     Interactions: client helper <> server route contract, UI callers <> typed result union.
 
 16. Name: Shared elevated PowerShell helper preserves quoting and timeout invariants
@@ -261,15 +265,15 @@ No approval required. The approved strategy still fits the implementation plan a
     1. Build argv for a script containing single quotes.
     2. Call `spawnElevatedPowerShell(...)`.
     Expected outcome:
-    - The helper escapes single quotes correctly for `Start-Process ... -Verb RunAs -ArgumentList ...`. Sources: `Plan-SG`, `Plan-T3`.
-    - The helper uses the shared timeout constant instead of open-coded per-call timeouts. Sources: `Plan-SG`, `Plan-T3`.
+    - The helper escapes single quotes correctly for `Start-Process ... -Verb RunAs -ArgumentList ...`. Sources: `Plan-SG`, `Plan-T5`.
+    - The helper uses the shared timeout constant instead of open-coded per-call timeouts. Sources: `Plan-SG`, `Plan-T5`.
     Interactions: shared helper <> Windows PowerShell quoting rules, shared helper <> child-process timeout handling.
 
 ## Coverage summary
 
 Covered action space:
 - Server startup surfaces that previously owned WSL boot-time repair, including spawned child-server/test launches.
-- The full `/api/network/configure-firewall` contract: empty body, confirmed body, malformed body, in-progress guard, WSL no-op recompute, Windows start, Linux/mac terminal commands, and no-firewall `none`.
+- The full `/api/network/configure-firewall` contract: empty body, tokenized confirmed body, malformed body, token rotation, confirmed single-flight guard, WSL no-op recompute, Windows start, Linux/mac terminal commands, and no-firewall `none`.
 - The WSL drift-detection planner across `not-wsl2`, `error`, `noop`, `firewall-only`, and `full`.
 - User-facing repair actions in both manual entry points: `SetupWizard` `Configure now`, `Continue`, `Cancel`, and `SettingsView` `Fix`.
 - Shared contracts that other callers can regress: confirmation-modal styling, client helper typing, elevated PowerShell quoting, and daemon least-privilege normalization.

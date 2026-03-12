@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use @trycycle-executing to implement this plan task-by-task.
 
-**Goal:** Finish the Windows privilege-boundary fixes by making `POST /api/network/configure-firewall` a server-enforced two-step confirmation flow, round-tripping the server-issued confirmation token through the existing manual UI repair flows, and re-verifying the already-landed startup and daemon least-privilege changes.
+**Goal:** Finish the Windows privilege-boundary fixes by making `POST /api/network/configure-firewall` a server-enforced two-step confirmation flow with a latest-only server-issued confirmation token, round-tripping that token through the existing manual UI repair flows, and re-verifying the already-landed startup and daemon least-privilege changes.
 
-**Architecture:** This branch already removed boot-time WSL repair, added the manual confirmation modal UX in `SetupWizard` and `SettingsView`, and lowered the Windows scheduled task to least privilege. The remaining defects are concentrated in `server/network-router.ts`: a bare `confirmElevation` boolean still starts elevation on the first call, and the route treats `status.firewall.configuring` as a lock even though it is only a UI status snapshot. Fix that by adding a small router-local coordinator that owns one-time confirmation tokens and the confirmed-repair single-flight lock, while keeping repair-need detection in `network-router.ts` and current network/firewall facts in `networkManager`.
+**Architecture:** This branch already removed boot-time WSL repair, added the manual confirmation modal UX in `SetupWizard` and `SettingsView`, and lowered the Windows scheduled task to least privilege. The remaining defects are concentrated in `server/network-router.ts`: a bare `confirmElevation` boolean still starts elevation on the first call, and the route treats `status.firewall.configuring` as a lock even though it is only a UI status snapshot. Fix that by adding a small router-local coordinator that owns one latest-only confirmation token plus the confirmed-repair single-flight lock, while keeping repair-need detection in `network-router.ts` and current network/firewall facts in `networkManager`.
 
 **Tech Stack:** TypeScript, Express, Zod, React, Redux Toolkit, Vitest, Testing Library, supertest, Electron scheduled tasks
 
@@ -29,17 +29,20 @@ Expected behavior:
    - return `terminal` for Linux/macOS command-based repair
    - return `none` if remote access is disabled or no repair is needed
    - return `confirmation-required` with a fresh one-time `confirmationToken` if native Windows or WSL repair still needs elevation
+   - every fresh `confirmation-required` response rotates the outstanding token, so only the most recently shown modal can authorize elevation
    - never spawn elevated PowerShell
 2. Confirmed retry: `POST /api/network/configure-firewall` with `{ confirmElevation: true, confirmationToken }`.
 Expected behavior:
-   - take a real single-flight lock before any confirmed elevation work
+   - if `confirmElevation` is absent or the token is missing/wrong for the currently resolved repair platform, return a fresh `confirmation-required` response immediately
+   - only take the real single-flight lock once the request carries the currently issued token for that platform
    - recompute current repair need inside the lock
    - return `none` if the situation changed and no repair is needed anymore
-   - return `confirmation-required` again if the token is missing, expired, replayed, or wrong for the current repair platform
+   - return `confirmation-required` again if the token became expired, replayed, superseded, or wrong for the recomputed repair platform
    - return `wsl2` or `windows-elevated` only after both a valid token and a successful lock acquisition
 3. Lock precedence:
 Expected behavior:
    - if another confirmed repair already owns the single-flight lock, return `409 { method: 'in-progress' }`
+   - first calls and invalid confirmed calls never consume the lock
    - `status.firewall.configuring` remains a status flag for live elevated work, not the synchronization primitive
 4. WSL/manual repair drift:
 Expected behavior:
@@ -59,8 +62,10 @@ This is the simplest direct fix for the user’s request: the app still presents
   - `wsl2` or `windows-elevated` only after a validated confirmed retry
   - `in-progress` when another confirmed repair already owns the single-flight lock
 - A first-call body of `{ confirmElevation: true }` never elevates. Absent an active confirmed repair, it returns a fresh `confirmation-required` response.
-- A missing token, expired token, replayed token, or platform-mismatched token never elevates. Absent an active confirmed repair, the route returns a fresh `confirmation-required` response if repair is still needed.
+- A missing token, expired token, replayed token, superseded token, or platform-mismatched token never elevates. Absent an active confirmed repair, the route returns a fresh `confirmation-required` response if repair is still needed.
+- A newly issued `confirmationToken` supersedes any earlier unconfirmed token; only the most recently shown modal can authorize elevation.
 - `confirmation-required` responses never set `firewall.configuring`; that flag is reserved for a live elevated child process.
+- Invalid confirmed requests do not take the single-flight lock; `409 { method: 'in-progress' }` is reserved for concurrent confirmed retries that already passed token validation.
 - WSL repair is recomputed on both the first click and the confirmed retry. Either call may legitimately collapse to `{ method: 'none', message: 'No configuration changes required' }`.
 - Both UI entry points keep the existing accessible modal and exact copy: `To complete this, you will need to accept the Windows administrator prompt on the next screen.`
 - The confirm button path from both UI entry points sends both `confirmElevation: true` and the server-issued `confirmationToken`.
@@ -70,6 +75,7 @@ This is the simplest direct fix for the user’s request: the app still presents
 ## Scope Notes
 
 - Treat the branch’s current state as the starting point. `server/wsl-port-forward-startup.ts` is already gone, the manual WSL planning helpers already exist, `ConfirmModal` already has the required UX, and the daemon code already normalizes the scheduled task run level.
+- The companion plan at `docs/plans/2026-03-11-windows-privilege-fixes-test-plan.md` must stay in sync with this tokenized contract. It previously described bare-boolean retries and stale task references; do not leave that ambiguity behind.
 - Keep `server/wsl-port-forward.ts` purely non-elevating. If a regression test fails there, repair it without reintroducing any startup wrapper or env-derived suppression logic.
 - Keep comments accurate, but do not pad the change set with broad cleanup. Only touch comments that would be wrong after the route contract changes.
 - Execution note: use @trycycle-executing and keep commits small and frequent.
@@ -92,23 +98,30 @@ import {
   FIREWALL_REPAIR_LOCKED,
 } from '../../../server/firewall-repair-coordinator.js'
 
-it('issues one-time confirmation tokens scoped to a repair platform', () => {
+it('rotates the latest confirmation token and rejects superseded or wrong-platform tokens', () => {
   const coordinator = createFirewallRepairCoordinator(() => 1_000)
 
-  const confirmation = coordinator.issueConfirmation('wsl2')
+  const first = coordinator.issueConfirmation('wsl2')
+  const second = coordinator.issueConfirmation('wsl2')
 
-  expect(confirmation).toMatchObject({
+  expect(second).toMatchObject({
     method: 'confirmation-required',
     confirmationToken: expect.any(String),
   })
   expect(
-    coordinator.consumeConfirmation(confirmation.confirmationToken, 'windows'),
+    coordinator.matchesConfirmation(first.confirmationToken, 'wsl2'),
   ).toBe(false)
   expect(
-    coordinator.consumeConfirmation(confirmation.confirmationToken, 'wsl2'),
+    coordinator.matchesConfirmation(second.confirmationToken, 'windows'),
+  ).toBe(false)
+  expect(
+    coordinator.matchesConfirmation(second.confirmationToken, 'wsl2'),
   ).toBe(true)
   expect(
-    coordinator.consumeConfirmation(confirmation.confirmationToken, 'wsl2'),
+    coordinator.consumeConfirmation(second.confirmationToken, 'wsl2'),
+  ).toBe(true)
+  expect(
+    coordinator.consumeConfirmation(second.confirmationToken, 'wsl2'),
   ).toBe(false)
 })
 
@@ -120,7 +133,7 @@ it('expires stale confirmation tokens', () => {
   now += FIREWALL_CONFIRMATION_TTL_MS + 1
 
   expect(
-    coordinator.consumeConfirmation(confirmation.confirmationToken, 'windows'),
+    coordinator.matchesConfirmation(confirmation.confirmationToken, 'windows'),
   ).toBe(false)
 })
 
@@ -173,27 +186,26 @@ type RepairPlatform = 'windows' | 'wsl2'
 export function createFirewallRepairCoordinator(
   now: () => number = () => Date.now(),
 ) {
-  const confirmations = new Map<
-    string,
-    { platform: RepairPlatform; expiresAt: number }
-  >()
+  let currentConfirmation:
+    | { token: string; platform: RepairPlatform; expiresAt: number }
+    | null = null
   let confirmedRepairInFlight = false
 
-  function pruneExpired() {
-    const currentTime = now()
-    for (const [token, entry] of confirmations) {
-      if (entry.expiresAt <= currentTime) confirmations.delete(token)
+  function readCurrentConfirmation() {
+    if (currentConfirmation && currentConfirmation.expiresAt <= now()) {
+      currentConfirmation = null
     }
+    return currentConfirmation
   }
 
   return {
     issueConfirmation(platform: RepairPlatform) {
-      pruneExpired()
       const confirmationToken = randomUUID()
-      confirmations.set(confirmationToken, {
+      currentConfirmation = {
+        token: confirmationToken,
         platform,
         expiresAt: now() + FIREWALL_CONFIRMATION_TTL_MS,
-      })
+      }
       return {
         method: 'confirmation-required' as const,
         title: 'Administrator approval required',
@@ -202,12 +214,16 @@ export function createFirewallRepairCoordinator(
         confirmationToken,
       }
     },
+    matchesConfirmation(token: string | undefined, platform: RepairPlatform) {
+      const confirmation = readCurrentConfirmation()
+      return !!confirmation && confirmation.token === token && confirmation.platform === platform
+    },
     consumeConfirmation(token: string | undefined, platform: RepairPlatform) {
-      pruneExpired()
-      if (!token) return false
-      const entry = confirmations.get(token)
-      if (!entry || entry.platform !== platform) return false
-      confirmations.delete(token)
+      const confirmation = readCurrentConfirmation()
+      if (!confirmation || confirmation.token !== token || confirmation.platform !== platform) {
+        return false
+      }
+      currentConfirmation = null
       return true
     },
     async withConfirmedRepairLock<T>(fn: () => Promise<T>) {
@@ -297,7 +313,7 @@ Also add assertions for:
 - first native-Windows click returns `confirmation-required` with `confirmationToken`
 - first native-Windows `{ confirmElevation: true }` re-prompts instead of elevating
 - confirmed native-Windows retry with the issued token starts repair
-- replayed or platform-mismatched tokens re-prompt instead of elevating
+- superseded, replayed, or platform-mismatched tokens re-prompt instead of elevating
 - malformed bodies such as `{ confirmElevation: false }` or `{ confirmationToken: 7 }` return `400`
 - two concurrent confirmed requests produce one started response and one `409 { method: 'in-progress' }`
 
@@ -437,7 +453,7 @@ if (action.kind === 'none' || action.kind === 'terminal') {
   return res.json(action.response)
 }
 
-if (!confirmElevation) {
+if (!confirmElevation || !repairCoordinator.matchesConfirmation(confirmationToken, action.platform)) {
   return res.json(repairCoordinator.issueConfirmation(action.platform))
 }
 
@@ -496,7 +512,8 @@ return res.status(lockedResult.status).json(lockedResult.body)
 
 Important constraints:
 
-- A first-call `{ confirmElevation: true }` still falls through to `issueConfirmation(...)` because there is no valid token.
+- A first-call `{ confirmElevation: true }` still falls through to `issueConfirmation(...)` before lock acquisition because there is no valid token.
+- A newly issued token supersedes the previous outstanding token, so only the currently displayed modal can authorize elevation.
 - `networkManager.setFirewallConfiguring(true)` happens only immediately before the real spawn.
 - The existing `startElevatedRepair(...)` cleanup continues to reset the firewall cache and clear `firewall.configuring` on exit or spawn failure.
 - Keep the existing outer `try/catch` around the route so WSL plan errors still log and return `500`.
@@ -761,8 +778,10 @@ git commit -m "fix(ui): confirm elevated repair with server tokens"
 - Modify only if a regression test fails: `src/components/ui/confirm-modal.tsx`
 - Modify only if a regression test fails: `test/unit/client/components/ui/confirm-modal.test.tsx`
 - Modify only if a regression test fails: `electron/daemon/windows-service.ts`
+- Modify only if a regression test fails: `electron/startup.ts`
 - Modify only if a regression test fails: `installers/windows/freshell-task.xml.template`
 - Modify only if a regression test fails: `test/unit/electron/daemon/windows-service.test.ts`
+- Modify only if a regression test fails: `test/unit/electron/startup.test.ts`
 
 **Step 1: Run the focused regression matrix first**
 
@@ -792,11 +811,12 @@ Run:
 
 ```bash
 npx vitest run --config vitest.electron.config.ts \
-  test/unit/electron/daemon/windows-service.test.ts
+  test/unit/electron/daemon/windows-service.test.ts \
+  test/unit/electron/startup.test.ts
 ```
 
 Expected:
-- PASS, confirming the scheduled task remains least privilege.
+- PASS, confirming the scheduled task remains least privilege and startup still exercises the daemon path correctly after least-privilege normalization.
 
 **Step 2: If a regression fails, repair only the minimal drift**
 
@@ -876,8 +896,10 @@ git add server/index.ts \
   src/components/ui/confirm-modal.tsx \
   test/unit/client/components/ui/confirm-modal.test.tsx \
   electron/daemon/windows-service.ts \
+  electron/startup.ts \
   installers/windows/freshell-task.xml.template \
-  test/unit/electron/daemon/windows-service.test.ts
+  test/unit/electron/daemon/windows-service.test.ts \
+  test/unit/electron/startup.test.ts
 git commit -m "chore: preserve windows privilege boundary regressions"
 ```
 
