@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task.
 
-**Goal:** Stop the left sidebar from repeatedly blanking by making `sessions.changed` fire only for real session-directory changes and by keeping already-loaded sidebar content visible during refreshes.
+**Goal:** Stop the left sidebar from blanking during live session refreshes, while suppressing websocket invalidations caused only by session fields the sidebar and session search cannot observe.
 
-**Architecture:** Treat the session directory as a server-owned read model with one shared projection function. Extract the exact "directory-visible session" projection into `server/session-directory/projection.ts`, make the HTTP read model use it directly, make websocket invalidation diffing compare that same projection, and make the file indexer preserve a file-backed session's `updatedAt` when a rewrite changes nothing in that projection. On the client, keep the last loaded sidebar rows mounted for any later refresh and show refresh status inline; only the very first load is allowed to block the list.
+**Architecture:** Extract one server-owned session-directory projection that defines the exact fields exposed by `/api/session-directory`, and use that same projection to decide whether `sessions.changed` should fire. Keep `CodingCliSession.updatedAt` as true activity time; do not redefine recency just to reduce refreshes. On the client, treat websocket invalidation refreshes as stale-while-refresh and coalesce overlapping invalidations so one in-flight sidebar fetch can settle before a follow-up refresh starts.
 
 **Tech Stack:** Node.js, TypeScript, React 18, Redux Toolkit, Vitest, Testing Library
 
@@ -12,32 +12,29 @@
 
 ## Strategy Gate
 
-This fix needs to land both defects together:
+The current plan direction is close, but one proposed change is wrong for this product surface: carrying forward the old `updatedAt` across file rewrites would quietly redefine sidebar recency from "last session activity" to "last visible metadata change". That would make sort order, relative timestamps, and pagination cursors stale. The user asked to fix disruptive blanking and noisy invalidations, not to freeze live recency.
 
-1. The server currently treats raw file churn as sidebar churn because file-backed sessions advance `updatedAt` from file `mtime`, and `diffProjects()` compares entire `CodingCliSession` objects.
-2. The client currently renders refreshes as an empty panel because `Sidebar.tsx` drops the list whenever `sidebarWindow.loading` is true.
+The clean fix is:
 
-The clean architectural direction is:
-
-- `updatedAt` for file-backed sessions should mean "last directory-visible change", not "last raw file write". That is already the timestamp used for session-directory sort order, pagination cursors, and revisioning, so a second parallel timestamp would fork the read model for little gain.
-- The session-directory projection must have exactly one source of truth. Do not keep one field list in `session-directory/service.ts` and a second, similar-but-different field list in `sessions-sync/diff.ts`.
-- After first load, sidebar refreshes must be stale-while-refresh. Rendering stale rows during refresh is correct here because the alternative is disruptive blanking and the next server response remains authoritative.
+- Server: define one explicit session-directory projection and reuse it everywhere the sidebar/search read model is compared.
+- Client: preserve the already-rendered sidebar rows during refresh and stop websocket invalidations from repeatedly aborting and restarting the same fetch.
 
 Rejected approaches:
 
-- Client-only stale rendering: hides the symptom but keeps the server spamming invalidations and refetches.
-- Server-only invalidation suppression: reduces the loop frequency but still leaves legitimate refreshes visually disruptive.
-- Adding a new `directoryUpdatedAt` field: duplicates recency semantics across the codebase and forces extra plumbing through session-directory, search, pagination, and client state.
-- Debounce or throttle tuning only: changes cadence, not meaning.
+- Preserving the previous `updatedAt` when only invisible metadata changed. This hides some invalidations by lying about activity time.
+- Client-only stale rendering with no invalidation coalescing. This removes the empty panel but still wastes work by aborting and restarting refreshes during invalidation bursts.
+- Adding a second timestamp such as `directoryUpdatedAt`. That duplicates recency semantics across the read model, diffing, pagination, and client state.
 
 Implementation invariants:
 
-- `sessions.changed` means "the session-directory read model changed in a way the sidebar or session search can observe."
-- A rewrite that changes only invisible metadata (`tokenUsage`, `codexTaskEvents`, `sourceFile`, other non-directory fields) must not advance a file-backed session's `updatedAt`.
-- A rename, summary change, archive toggle, first-user-message change, session-type change, session creation, session deletion, or any visible ordering change must still invalidate immediately.
-- Once `sidebarWindow.lastLoadedAt` exists, the sidebar list must never disappear only because a refresh is in flight.
+- `CodingCliSession.updatedAt` continues to mean provider or file activity time.
+- `sessions.changed` means "the session-directory read model changed in a way its consumers can observe".
+- Invisible metadata alone (`tokenUsage`, `codexTaskEvents`, `sourceFile`, other non-directory fields) must not trigger `sessions.changed` when `updatedAt` is unchanged.
+- A loaded sidebar must never unmount its existing rows just because a refresh is in flight.
+- Repeated `sessions.changed` messages while a sidebar refresh is already running collapse to one follow-up refresh at most.
+- First load may still show a blocking loading state.
 - `docs/index.html` stays untouched; this is a behavior fix, not a new product surface.
-- Use repo-owned test entrypoints, not raw `npx vitest`. Server-focused runs go through `npm run test:server:standard -- ...`, default-config client/e2e runs go through `npm run test:client:standard -- ...`, and the final broad gate runs as `FRESHELL_TEST_SUMMARY="left panel refresh fix" CI=true npm test`.
+- Use repo-owned entrypoints only. The final broad run is `FRESHELL_TEST_SUMMARY="left panel refresh fix" CI=true npm test`.
 
 ### Task 1: Lock the server read-model contract in failing tests
 
@@ -45,11 +42,10 @@ Implementation invariants:
 - Create: `test/unit/server/session-directory/projection.test.ts`
 - Modify: `test/unit/server/sessions-sync/diff.test.ts`
 - Modify: `test/unit/server/sessions-sync/service.test.ts`
-- Modify: `test/unit/server/coding-cli/session-indexer.test.ts`
 
 **Step 1: Create the failing projection contract test**
 
-Add `test/unit/server/session-directory/projection.test.ts` for the new shared helper module. The test should define the exact visible projection once:
+Add `test/unit/server/session-directory/projection.test.ts` with one explicit projection expectation:
 
 ```ts
 expect(toSessionDirectoryProjection({
@@ -86,7 +82,7 @@ expect(toSessionDirectoryProjection({
 })
 ```
 
-Add the companion equality test that ignores `updatedAt` only when asked:
+Add the companion equality test:
 
 ```ts
 expect(directoryProjectionEqual(a, b, { includeUpdatedAt: false })).toBe(true)
@@ -105,12 +101,13 @@ Expected: FAIL because `server/session-directory/projection.ts` does not exist y
 
 **Step 3: Add the failing diff regression**
 
-Extend `test/unit/server/sessions-sync/diff.test.ts` with two cases:
+Extend `test/unit/server/sessions-sync/diff.test.ts` with three focused cases:
 
-- changing only invisible fields such as `tokenUsage`, `codexTaskEvents`, or `sourceFile` does not produce an upsert
-- changing a directory-visible field such as `title`, `summary`, `archived`, `firstUserMessage`, or `sessionType` still produces an upsert
+- changing only invisible fields such as `tokenUsage`, `codexTaskEvents`, or `sourceFile` while keeping the same `updatedAt` does not produce an upsert
+- changing only `updatedAt` still produces an upsert because recency is directory-visible
+- changing a visible field such as `title`, `summary`, `archived`, `firstUserMessage`, or `sessionType` still produces an upsert
 
-Use the same session identity in both snapshots so the test isolates field visibility, not insert/remove behavior.
+Use the same provider, sessionId, and projectPath in all three cases so the tests isolate field visibility instead of insert or delete behavior.
 
 **Step 4: Run the diff test and verify the invisible-field case fails**
 
@@ -124,15 +121,15 @@ Expected: FAIL because `diffProjects()` still compares whole session objects.
 
 **Step 5: Add the failing sessions-sync service regression**
 
-Extend `test/unit/server/sessions-sync/service.test.ts` with a boundary-level case:
+Extend `test/unit/server/sessions-sync/service.test.ts` with one boundary test:
 
-- first `publish()` sends one invalidation
-- a second `publish()` whose session changed only in invisible fields does not send another invalidation
-- a later `publish()` with a visible field change still increments the revision and broadcasts
+- first `publish()` broadcasts revision `1`
+- second `publish()` changes only invisible fields and keeps the same `updatedAt`, so it does not broadcast
+- third `publish()` changes only `updatedAt`, so it does broadcast revision `2`
 
-Keep this test at the `SessionsSyncService` layer so the executor proves the websocket invalidation boundary now inherits the projection semantics instead of relying only on `diff.test.ts`.
+This test belongs at `SessionsSyncService` so the executor proves the websocket invalidation boundary inherits the projection semantics instead of relying only on `diff.test.ts`.
 
-**Step 6: Run the service test and verify the invisible-only publish still fails**
+**Step 6: Run the service test and verify it fails**
 
 Run:
 
@@ -140,28 +137,7 @@ Run:
 npm run test:server:standard -- test/unit/server/sessions-sync/service.test.ts
 ```
 
-Expected: FAIL because `SessionsSyncService.publish()` still sees invisible metadata churn as a change through `diffProjects()`.
-
-**Step 7: Add the failing indexer regression**
-
-Extend `test/unit/server/coding-cli/session-indexer.test.ts` with a custom `parseSessionFile` stub that actually returns invisible metadata from the fixture content. Do not rely on the default `makeProvider()` parser here; it currently ignores `tokenUsage` and `codexTaskEvents`, so the regression would be false-positive.
-
-Add two tests:
-
-- rewriting a file with newer `mtime` and different invisible metadata only keeps the prior `updatedAt`
-- rewriting the same file with a visible change such as `title` or `summary` advances `updatedAt`
-
-Use `fsp.utimes()` or fake time to make the `mtime` jump obvious.
-
-**Step 8: Run the indexer test and verify the new case fails**
-
-Run:
-
-```bash
-npm run test:server:standard -- test/unit/server/coding-cli/session-indexer.test.ts
-```
-
-Expected: FAIL because the indexer still copies raw `mtime` into `updatedAt`.
+Expected: FAIL because `SessionsSyncService.publish()` still treats invisible metadata churn as a meaningful change.
 
 ### Task 2: Extract the session-directory projection as the single source of truth
 
@@ -173,7 +149,7 @@ Expected: FAIL because the indexer still copies raw `mtime` into `updatedAt`.
 
 **Step 1: Implement the shared projection helper**
 
-Create `server/session-directory/projection.ts` with an explicit projected type and equality helper:
+Create `server/session-directory/projection.ts`:
 
 ```ts
 import type { CodingCliSession } from '../coding-cli/types.js'
@@ -203,11 +179,11 @@ export function toSessionDirectoryProjection(session: CodingCliSession): Session
 }
 ```
 
-The equality helper should compare the projected objects after optionally omitting `updatedAt`; do not compare raw `CodingCliSession` fields directly.
+Also add `directoryProjectionEqual(a, b, { includeUpdatedAt?: boolean })`. Compare the explicit projected keys, not raw `CodingCliSession` objects.
 
 **Step 2: Refactor `session-directory/service.ts` to use the helper**
 
-Replace the hand-built object in `toItems()` with:
+Replace the hand-built object in `toItems()` with the shared projection:
 
 ```ts
 items.push(joinRunningState({
@@ -216,7 +192,7 @@ items.push(joinRunningState({
 }, terminalMeta))
 ```
 
-Keep sorting, search, cursor, and running-state behavior unchanged.
+Keep search, cursor, ordering, and running-state behavior unchanged.
 
 **Step 3: Run the projection and session-directory tests**
 
@@ -228,19 +204,17 @@ npm run test:server:standard -- test/unit/server/session-directory/projection.te
 
 Expected: PASS
 
-### Task 3: Use the shared projection for invalidation and semantic timestamps
+### Task 3: Use the shared projection for websocket invalidation diffing
 
 **Files:**
 - Modify: `server/sessions-sync/diff.ts`
-- Modify: `server/coding-cli/session-indexer.ts`
 - Test: `test/unit/server/sessions-sync/diff.test.ts`
 - Test: `test/unit/server/sessions-sync/service.test.ts`
-- Test: `test/unit/server/coding-cli/session-indexer.test.ts`
 - Test: `test/unit/server/session-directory/projection.test.ts`
 
-**Step 1: Make `diffProjects()` compare projected sessions**
+**Step 1: Make `diffProjects()` compare directory projections**
 
-Replace `sessionsEqual()` so it compares:
+Replace raw session-object comparison with:
 
 ```ts
 directoryProjectionEqual(
@@ -250,38 +224,18 @@ directoryProjectionEqual(
 )
 ```
 
-Preserve the existing project-level checks for project path, color, session count, and session order.
+Keep the existing project-level checks for project path, color, session count, and session order.
 
-**Step 2: Preserve `updatedAt` across invisible file rewrites**
+**Step 2: Do not modify `server/coding-cli/session-indexer.ts`**
 
-In `server/coding-cli/session-indexer.ts`, after building the next `baseSession`, compare the previous and next projections with `includeUpdatedAt: false`.
-
-Use this rule:
-
-```ts
-const previous = cached?.baseSession
-const nextUpdatedAt = stat.mtimeMs || stat.mtime.getTime()
-const updatedAt =
-  previous &&
-  directoryProjectionEqual(
-    toSessionDirectoryProjection(previous),
-    toSessionDirectoryProjection({ ...baseSession, updatedAt: nextUpdatedAt }),
-    { includeUpdatedAt: false },
-  )
-    ? previous.updatedAt
-    : nextUpdatedAt
-```
-
-Then store `updatedAt` in `baseSession`.
-
-Do not apply this carry-forward logic to direct providers; only the file-backed cache path needs it.
+The current indexer should continue to source `updatedAt` from provider activity or file `mtime`. Add no indexer workaround unless a newly written test proves the product requirement is to freeze recency, because that would be a meaning change, not a bug fix.
 
 **Step 3: Run the full targeted server regression set**
 
 Run:
 
 ```bash
-npm run test:server:standard -- test/unit/server/session-directory/projection.test.ts test/unit/server/session-directory/service.test.ts test/unit/server/sessions-sync/diff.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/coding-cli/session-indexer.test.ts
+npm run test:server:standard -- test/unit/server/session-directory/projection.test.ts test/unit/server/session-directory/service.test.ts test/unit/server/sessions-sync/diff.test.ts test/unit/server/sessions-sync/service.test.ts
 ```
 
 Expected: PASS
@@ -291,19 +245,20 @@ Expected: PASS
 Run:
 
 ```bash
-git add server/session-directory/projection.ts server/session-directory/service.ts server/sessions-sync/diff.ts server/coding-cli/session-indexer.ts test/unit/server/session-directory/projection.test.ts test/unit/server/session-directory/service.test.ts test/unit/server/sessions-sync/diff.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/sessions-sync/service.test.ts
-git commit -m "fix(sessions): stabilize sidebar invalidation semantics"
+git add server/session-directory/projection.ts server/session-directory/service.ts server/sessions-sync/diff.ts test/unit/server/session-directory/projection.test.ts test/unit/server/sessions-sync/diff.test.ts test/unit/server/sessions-sync/service.test.ts
+git commit -m "fix(sessions): align invalidations with directory projection"
 ```
 
-Expected: one commit containing the projection extraction, semantic timestamp change, and server regressions.
+Expected: one commit containing only the shared projection extraction and invalidation semantics cleanup.
 
-### Task 4: Lock the client stale-while-refresh behavior in failing tests
+### Task 4: Lock stale-while-refresh and invalidation coalescing in failing client tests
 
 **Files:**
 - Modify: `test/unit/client/components/Sidebar.test.tsx`
+- Modify: `test/unit/client/components/App.test.tsx`
 - Modify: `test/e2e/open-tab-session-sidebar-visibility.test.tsx`
 
-**Step 1: Add the failing sidebar unit regression**
+**Step 1: Add the failing sidebar stale-while-refresh regression**
 
 In `Sidebar.test.tsx`, preload `sessions.windows.sidebar` with:
 
@@ -317,15 +272,13 @@ sidebar: {
 }
 ```
 
-If the existing `createTestStore()` helper cannot express that shape cleanly, extend the helper first instead of inlining ad-hoc preloaded state in multiple tests.
-
 Assert all three conditions at once:
 
-- the old row text is still rendered
-- the virtualized list is still present
-- an inline loading status is rendered
+- the existing row text is still rendered
+- the list stays mounted
+- an inline refresh status is rendered
 
-Add the companion search case with `query: 'deploy'` and `searchTier: 'title'` so a background refresh of an active title search also keeps stale rows mounted.
+Add the companion search case with `query: 'deploy'` and keep the stale row mounted there too. Preserve the existing `data-testid="search-loading"` contract for the query case so the rest of the suite does not need unrelated rewrites.
 
 **Step 2: Run the sidebar unit test and verify it fails**
 
@@ -335,11 +288,38 @@ Run:
 npm run test:client:standard -- test/unit/client/components/Sidebar.test.tsx
 ```
 
-Expected: FAIL because `Sidebar.tsx` currently returns `null` for the list while loading.
+Expected: FAIL because `Sidebar.tsx` currently unmounts the list whenever `sidebarWindow.loading` is true.
 
-**Step 3: Add the failing sidebar invalidation e2e regression**
+**Step 3: Add the failing App invalidation-coalescing regression**
 
-In `test/e2e/open-tab-session-sidebar-visibility.test.tsx`, keep the first sidebar snapshot resolved, then make the invalidation-triggered HTTP refetch hang on a deferred promise:
+In `App.test.tsx`, create a deferred sidebar refresh:
+
+```ts
+const deferred = createDeferred<any>()
+fetchSidebarSessionsSnapshot.mockReturnValueOnce(deferred.promise)
+```
+
+Seed the store with an already-loaded sidebar window, send two `sessions.changed` messages before resolving the promise, and assert:
+
+- only one HTTP refresh starts while the first promise is pending
+- the first request's `AbortSignal` is not aborted by the second invalidation
+- resolving the first refresh triggers exactly one follow-up refresh, not two
+
+This test belongs in `App.test.tsx` because websocket invalidation policy is an App concern; `fetchSessionWindow()` should still be allowed to replace in-flight requests for search typing.
+
+**Step 4: Run the App unit test and verify it fails**
+
+Run:
+
+```bash
+npm run test:client:standard -- test/unit/client/components/App.test.tsx
+```
+
+Expected: FAIL because `App.tsx` currently dispatches `refreshActiveSessionWindow()` for every `sessions.changed` message, and the thunk aborts the previous request.
+
+**Step 5: Add the failing end-to-end sidebar regression**
+
+In `test/e2e/open-tab-session-sidebar-visibility.test.tsx`, keep the first sidebar snapshot loaded, then make the invalidation-triggered refetch hang on a deferred promise:
 
 ```ts
 const deferred = createDeferred<any>()
@@ -348,95 +328,128 @@ fetchSidebarSessionsSnapshot
   .mockReturnValueOnce(deferred.promise)
 ```
 
-Broadcast `sessions.changed`, assert the existing session row remains visible while the promise is pending, then resolve the promise with the new response and assert the new row replaces the old one.
+Broadcast `sessions.changed`, assert the existing session row remains visible while the promise is pending, then optionally broadcast a second `sessions.changed` and assert the fetch count still stays at `1` until the first promise resolves. Resolve the promise with the new response and assert the new row replaces the old one.
 
-**Step 4: Run the client regressions and verify the new e2e case fails**
+**Step 6: Run the new client regressions and verify they fail**
 
 Run:
 
 ```bash
-npm run test:client:standard -- test/unit/client/components/Sidebar.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
+npm run test:client:standard -- test/unit/client/components/Sidebar.test.tsx test/unit/client/components/App.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
 ```
 
-Expected: FAIL because the sidebar still blanks during refresh.
+Expected: FAIL because the sidebar still blanks during refresh and websocket invalidations still overlap.
 
-### Task 5: Implement stale-while-refresh sidebar rendering
+### Task 5: Implement stale-while-refresh rendering and websocket refresh coalescing
 
 **Files:**
 - Modify: `src/components/Sidebar.tsx`
+- Modify: `src/App.tsx`
 - Test: `test/unit/client/components/Sidebar.test.tsx`
+- Test: `test/unit/client/components/App.test.tsx`
 - Test: `test/e2e/open-tab-session-sidebar-visibility.test.tsx`
 
-**Step 1: Split first-load blocking from refresh loading**
+**Step 1: Add a coalesced invalidation refresh helper in `App.tsx`**
 
-Introduce explicit render guards:
+Inside the websocket effect, replace the direct `refreshActiveSessionWindow()` call with a small queue that drains at most one follow-up refresh:
+
+```ts
+let sessionsRefreshInFlight = false
+let sessionsRefreshQueued = false
+
+const drainSessionsRefreshQueue = async () => {
+  if (sessionsRefreshInFlight) {
+    sessionsRefreshQueued = true
+    return
+  }
+
+  sessionsRefreshInFlight = true
+  try {
+    do {
+      sessionsRefreshQueued = false
+      await appStore.dispatch(refreshActiveSessionWindow() as any)
+    } while (sessionsRefreshQueued && !cancelled)
+  } finally {
+    sessionsRefreshInFlight = false
+  }
+}
+```
+
+Use this helper only for websocket `sessions.changed` handling. Do not move the queue into generic search typing paths.
+
+**Step 2: Split blocking load from background refresh in `Sidebar.tsx`**
+
+Add explicit render guards:
 
 ```tsx
 const hasLoadedSidebarWindow = typeof sidebarWindow?.lastLoadedAt === 'number'
 const activeQuery = sidebarWindow?.query?.trim() ?? ''
 const showBlockingLoad = !!sidebarWindow?.loading && !hasLoadedSidebarWindow && sortedItems.length === 0
 const showRefreshStatus = !!sidebarWindow?.loading && hasLoadedSidebarWindow
-const refreshStatusLabel = activeQuery ? 'Searching...' : 'Updating sessions...'
 ```
 
-**Step 2: Keep the list mounted during refresh**
+**Step 3: Restructure the session-list area so the status row does not break virtualization height**
+
+Do not prepend the status row inside the measured list container. Instead, make the list section a flex column:
+
+```tsx
+<div className="flex flex-1 min-h-0 flex-col">
+  {showRefreshStatus && (
+    <div
+      className="px-4 py-2 text-xs text-muted-foreground flex items-center gap-2"
+      role="status"
+      data-testid={activeQuery ? 'search-loading' : 'sessions-refreshing'}
+    >
+      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+      <span>{activeQuery ? 'Searching...' : 'Updating sessions...'}</span>
+    </div>
+  )}
+  <div ref={listContainerRef} className="flex-1 min-h-0 px-2">
+    {/* blocking spinner, empty state, or List */}
+  </div>
+</div>
+```
+
+The `min-h-0` is required so the `react-window` list can shrink inside the flex column without overflow bugs.
+
+**Step 4: Keep already-loaded content mounted during refresh**
 
 Render policy:
 
 - `showBlockingLoad`: show the centered blocking spinner
-- `showRefreshStatus`: render a small inline status row and keep rendering the stale list or stale empty state underneath it
-- empty-state copy is allowed only when not in the blocking path
+- otherwise: keep rendering the list or empty state even if `sidebarWindow.loading` is true
+- query-backed refreshes reuse the existing `search-loading` test id
 
-Use one status source of truth:
+The current store already has the necessary state:
 
-```tsx
-{showRefreshStatus && (
-  <div className="px-2 py-2 text-xs text-muted-foreground" role="status">
-    {refreshStatusLabel}
-  </div>
-)}
-{showBlockingLoad ? (
-  <BlockingSpinner />
-) : sortedItems.length === 0 ? (
-  <EmptyState />
-) : (
-  <List ... />
-)}
-```
-
-Keep the status element accessible with `role="status"`. Do not special-case title search as "not a real search"; if there is an active store-owned query, the stale list stays mounted and the status says `Searching...`.
-
-**Step 3: Do not add new Redux state unless a test proves it is necessary**
-
-The current store already exposes everything needed:
-
-- `sidebarWindow.loading`
+- `sidebarWindow.projects`
 - `sidebarWindow.lastLoadedAt`
-- preserved `projects`
-- current `query` and `searchTier`
+- `sidebarWindow.loading`
+- `sidebarWindow.query`
+- `sidebarWindow.searchTier`
 
-This fix is a rendering-policy change, not a state-model rewrite.
+Do not add new Redux state unless a failing test proves it is necessary.
 
-**Step 4: Run the targeted client tests**
+**Step 5: Run the targeted client tests**
 
 Run:
 
 ```bash
-npm run test:client:standard -- test/unit/client/components/Sidebar.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
+npm run test:client:standard -- test/unit/client/components/Sidebar.test.tsx test/unit/client/components/App.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
 ```
 
 Expected: PASS
 
-**Step 5: Commit the client-side cut**
+**Step 6: Commit the client-side cut**
 
 Run:
 
 ```bash
-git add src/components/Sidebar.tsx test/unit/client/components/Sidebar.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
-git commit -m "fix(sidebar): preserve session list during refresh"
+git add src/App.tsx src/components/Sidebar.tsx test/unit/client/components/App.test.tsx test/unit/client/components/Sidebar.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
+git commit -m "fix(sidebar): preserve loaded sessions during refresh"
 ```
 
-Expected: one commit containing only the sidebar stale-while-refresh change and its regressions.
+Expected: one commit containing the sidebar stale-while-refresh behavior and websocket invalidation coalescing.
 
 ### Task 6: Run the combined verification gate
 
@@ -448,7 +461,7 @@ Expected: one commit containing only the sidebar stale-while-refresh change and 
 Run:
 
 ```bash
-npm run test:server:standard -- test/unit/server/session-directory/projection.test.ts test/unit/server/session-directory/service.test.ts test/unit/server/sessions-sync/diff.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/coding-cli/session-indexer.test.ts
+npm run test:server:standard -- test/unit/server/session-directory/projection.test.ts test/unit/server/session-directory/service.test.ts test/unit/server/sessions-sync/diff.test.ts test/unit/server/sessions-sync/service.test.ts
 ```
 
 Expected: PASS
@@ -458,7 +471,7 @@ Expected: PASS
 Run:
 
 ```bash
-npm run test:client:standard -- test/unit/client/components/Sidebar.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
+npm run test:client:standard -- test/unit/client/components/Sidebar.test.tsx test/unit/client/components/App.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
 ```
 
 Expected: PASS
@@ -483,11 +496,11 @@ FRESHELL_TEST_SUMMARY="left panel refresh fix" CI=true npm test
 
 Expected: PASS
 
-Per repo policy, if this fails, stop and fix the failure before any merge work even if it looks unrelated.
+If the coordinated broad run is busy, wait rather than killing another holder. Use `npm run test:status` to inspect the holder and recent results.
 
 **Step 5: Commit only if verification required follow-up edits**
 
-Run only if Steps 1-4 required follow-up code edits:
+Run only if Steps 1-4 required real code changes:
 
 ```bash
 git add <follow-up-files>
@@ -498,10 +511,10 @@ Expected: no extra commit unless verification exposed a real issue.
 
 ## Final Verification Checklist
 
-- Raw file rewrites that change only invisible metadata do not emit `sessions.changed`.
-- File-backed sessions still move in the directory immediately when a directory-visible field changes.
-- `server/session-directory/service.ts`, `server/sessions-sync/diff.ts`, and `server/coding-cli/session-indexer.ts` all derive visibility from the same projection helper.
+- `updatedAt` still reflects real session activity.
+- Invisible metadata alone no longer causes `sessions.changed` when `updatedAt` is stable.
+- `server/session-directory/service.ts` and `server/sessions-sync/diff.ts` derive visibility from the same projection helper.
 - A loaded sidebar never goes blank while a refresh is in flight.
-- The first load can still show a blocking loading state.
-- Title-filtered sidebar refreshes also keep stale rows visible until the new response arrives.
+- Search refreshes also keep stale rows visible.
+- Websocket invalidation bursts do not abort and restart the same sidebar refresh over and over.
 - Focused server regressions pass, then focused client regressions pass, then `npm run lint`, then `FRESHELL_TEST_SUMMARY="left panel refresh fix" CI=true npm test`.
