@@ -4,7 +4,7 @@
 
 **Goal:** Stop the left sidebar from blanking during live session refreshes, while ensuring `sessions.changed` only fires when the `/api/session-directory` read model actually changes in a way the sidebar or session search can observe.
 
-**Architecture:** Keep the existing full-fidelity session diff for internal server consumers, and add a separate session-directory snapshot comparator for the websocket invalidation boundary. On the client, keep already-loaded sidebar content mounted during refresh and route websocket invalidations through a coalesced refresh thunk so repeated invalidations cannot keep aborting the same request.
+**Architecture:** Keep the existing full-fidelity session diff for internal server consumers, and add a shared session-directory projection module reused by both the HTTP read model and the websocket invalidation boundary. On the client, keep already-loaded sidebar content mounted during refresh and route websocket invalidations through a coalesced refresh thunk with repo-standard reset hooks for module-scope fetch state, so repeated invalidations cannot keep aborting the same request and tests remain deterministic.
 
 **Tech Stack:** Node.js, TypeScript, React 18, Redux Toolkit, Vitest, Testing Library
 
@@ -32,6 +32,7 @@ Rejected approaches:
 - Freezing or carrying forward `updatedAt` to suppress refreshes. That lies about recency and sort order for active sessions.
 - Client-only stale rendering with no refresh coalescing. That removes the empty panel but still wastes work by aborting and restarting fetches during invalidation bursts.
 - Adding new Redux loading enums for the sidebar. Existing `lastLoadedAt` plus `loading` already distinguishes first load from background refresh.
+- Threading websocket `sessions.changed.revision` through `/api/session-directory` fetches. The websocket revision is a sync-service invalidation counter, while the route revision is currently a page watermark derived from session/terminal activity; wiring them together here would add plumbing without addressing the actual bug.
 
 Implementation invariants:
 
@@ -41,6 +42,7 @@ Implementation invariants:
 - A loaded sidebar must never unmount its current rows just because a refresh is in flight.
 - Repeated websocket invalidations while a session-window refresh is already running collapse to one follow-up refresh at most.
 - Explicit user-driven refresh paths keep their current direct behavior; only websocket invalidations get coalesced.
+- New module-scope state in `sessionsThunks.ts` must be resettable in tests, following the existing thunk-controller pattern used elsewhere in the repo.
 - `docs/index.html` stays untouched; this is a behavior fix, not a new UI surface.
 - Use repo-owned commands only. The final broad run is `FRESHELL_TEST_SUMMARY="left panel refresh fix" CI=true npm test`.
 
@@ -218,6 +220,7 @@ export function toSessionDirectoryComparableItem(session: CodingCliSession): Ses
 `hasSessionDirectorySnapshotChange()` should flatten both project arrays into the same sorted comparable-item order used by the directory route and compare those ordered arrays item-by-item. Do not inspect raw `CodingCliSession` objects there.
 
 Do not include project color in this comparator because the route does not expose it today.
+Do not involve the route's `revision` number in this helper; this helper answers "would the directory payload contents differ?" and nothing else.
 
 **Step 2: Refactor `session-directory/service.ts` to use the helper**
 
@@ -325,9 +328,11 @@ npm run test:client:standard -- test/unit/client/components/Sidebar.test.tsx
 
 Expected: FAIL because `Sidebar.tsx` currently unmounts the list whenever `sidebarWindow.loading` is true.
 
-**Step 3: Add the failing invalidation-queue thunk regression**
+**Step 3: Add the failing invalidation-queue thunk regression and the future reset-hook usage**
 
-In `test/unit/client/store/sessionsThunks.test.ts`, add a small deferred helper and a new test around a new invalidation-specific thunk:
+In `test/unit/client/store/sessionsThunks.test.ts`, import a future `_resetSessionWindowThunkState()` helper from `src/store/sessionsThunks.ts` and call it in `beforeEach`/`afterEach`, matching the pattern already used by `terminalDirectoryThunks` and `agentChatThunks`.
+
+Then add a small deferred helper and a new test around a new invalidation-specific thunk:
 
 ```ts
 const deferred = createDeferred<any>()
@@ -361,7 +366,9 @@ Expected: FAIL because repeated invalidations still dispatch `fetchSessionWindow
 
 **Step 5: Add the failing integration regression with real Sidebar rendering**
 
-In `test/e2e/open-tab-session-sidebar-visibility.test.tsx`, keep the first sidebar snapshot loaded, then make the invalidation-triggered refetch hang:
+In `test/e2e/open-tab-session-sidebar-visibility.test.tsx`, also import the future `_resetSessionWindowThunkState()` helper and clear it in `afterEach()` so the deferred invalidation test cannot leak queue/controller state across cases.
+
+Keep the first sidebar snapshot loaded, then make the invalidation-triggered refetch hang:
 
 ```ts
 const deferred = createDeferred<any>()
@@ -401,9 +408,9 @@ Expected: FAIL because the sidebar still blanks during refresh and invalidation 
 - Test: `test/unit/client/store/sessionsThunks.test.ts`
 - Test: `test/e2e/open-tab-session-sidebar-visibility.test.tsx`
 
-**Step 1: Add an invalidation-only queued refresh thunk in `sessionsThunks.ts`**
+**Step 1: Add an invalidation-only queued refresh thunk and test reset helper in `sessionsThunks.ts`**
 
-Keep `refreshActiveSessionWindow()` unchanged for explicit user-driven refreshes. Add a new exported thunk, for example `queueActiveSessionWindowRefresh()`, backed by module-scope queue state keyed by surface.
+Keep `refreshActiveSessionWindow()` unchanged for explicit user-driven refreshes. Add a new exported thunk, for example `queueActiveSessionWindowRefresh()`, backed by module-scope queue state keyed by surface. In the same file, add `_resetSessionWindowThunkState()` that aborts outstanding controllers, clears the controller map, and clears the invalidation queue map for deterministic tests.
 
 Use the existing `fetchSessionWindow()` as the work unit:
 
@@ -412,6 +419,14 @@ const invalidationRefreshState = new Map<SessionSurface, {
   inFlight: Promise<void> | null
   queued: boolean
 }>()
+
+export function _resetSessionWindowThunkState(): void {
+  for (const controller of controllers.values()) {
+    controller.abort()
+  }
+  controllers.clear()
+  invalidationRefreshState.clear()
+}
 
 export function queueActiveSessionWindowRefresh() {
   return async (dispatch: AppDispatch, getState: () => RootState) => {
@@ -450,6 +465,7 @@ export function queueActiveSessionWindowRefresh() {
 ```
 
 This queue must never call `fetchSessionWindow()` concurrently for the same surface.
+It must also leave the existing `controllers`-based abort behavior intact for explicit user-driven refreshes and append flows.
 
 **Step 2: Route websocket invalidations through the queue**
 
@@ -605,4 +621,6 @@ Expected: no extra commit unless verification exposed a real issue.
 - A loaded sidebar never goes blank while any refresh is in flight.
 - First-load search still uses the existing `search-loading` contract.
 - Repeated websocket invalidations do not abort and restart the same sidebar refresh over and over.
+- `sessionsThunks.ts` exposes `_resetSessionWindowThunkState()` and the new queue/controller module state is cleaned between tests.
+- No code path assumes websocket invalidation revisions and `/api/session-directory` page revisions are interchangeable.
 - Focused server regressions pass, then focused client regressions pass, then `npm run lint`, then `FRESHELL_TEST_SUMMARY="left panel refresh fix" CI=true npm test`.
