@@ -37,12 +37,14 @@ Implementation invariants:
 - A rename, summary change, archive toggle, first-user-message change, session-type change, session creation, session deletion, or any visible ordering change must still invalidate immediately.
 - Once `sidebarWindow.lastLoadedAt` exists, the sidebar list must never disappear only because a refresh is in flight.
 - `docs/index.html` stays untouched; this is a behavior fix, not a new product surface.
+- Use repo-owned test entrypoints, not raw `npx vitest`. Server-focused runs go through `npm run test:server:standard -- ...`, default-config client/e2e runs go through `npm run test:client:standard -- ...`, and the final broad gate runs as `FRESHELL_TEST_SUMMARY="left panel refresh fix" CI=true npm test`.
 
 ### Task 1: Lock the server read-model contract in failing tests
 
 **Files:**
 - Create: `test/unit/server/session-directory/projection.test.ts`
 - Modify: `test/unit/server/sessions-sync/diff.test.ts`
+- Modify: `test/unit/server/sessions-sync/service.test.ts`
 - Modify: `test/unit/server/coding-cli/session-indexer.test.ts`
 
 **Step 1: Create the failing projection contract test**
@@ -96,7 +98,7 @@ expect(directoryProjectionEqual(a, b, { includeUpdatedAt: true })).toBe(false)
 Run:
 
 ```bash
-npx vitest run test/unit/server/session-directory/projection.test.ts
+npm run test:server:standard -- test/unit/server/session-directory/projection.test.ts
 ```
 
 Expected: FAIL because `server/session-directory/projection.ts` does not exist yet.
@@ -115,12 +117,32 @@ Use the same session identity in both snapshots so the test isolates field visib
 Run:
 
 ```bash
-npx vitest run test/unit/server/sessions-sync/diff.test.ts
+npm run test:server:standard -- test/unit/server/sessions-sync/diff.test.ts
 ```
 
 Expected: FAIL because `diffProjects()` still compares whole session objects.
 
-**Step 5: Add the failing indexer regression**
+**Step 5: Add the failing sessions-sync service regression**
+
+Extend `test/unit/server/sessions-sync/service.test.ts` with a boundary-level case:
+
+- first `publish()` sends one invalidation
+- a second `publish()` whose session changed only in invisible fields does not send another invalidation
+- a later `publish()` with a visible field change still increments the revision and broadcasts
+
+Keep this test at the `SessionsSyncService` layer so the executor proves the websocket invalidation boundary now inherits the projection semantics instead of relying only on `diff.test.ts`.
+
+**Step 6: Run the service test and verify the invisible-only publish still fails**
+
+Run:
+
+```bash
+npm run test:server:standard -- test/unit/server/sessions-sync/service.test.ts
+```
+
+Expected: FAIL because `SessionsSyncService.publish()` still sees invisible metadata churn as a change through `diffProjects()`.
+
+**Step 7: Add the failing indexer regression**
 
 Extend `test/unit/server/coding-cli/session-indexer.test.ts` with a custom `parseSessionFile` stub that actually returns invisible metadata from the fixture content. Do not rely on the default `makeProvider()` parser here; it currently ignores `tokenUsage` and `codexTaskEvents`, so the regression would be false-positive.
 
@@ -131,12 +153,12 @@ Add two tests:
 
 Use `fsp.utimes()` or fake time to make the `mtime` jump obvious.
 
-**Step 6: Run the indexer test and verify the new case fails**
+**Step 8: Run the indexer test and verify the new case fails**
 
 Run:
 
 ```bash
-npx vitest run test/unit/server/coding-cli/session-indexer.test.ts
+npm run test:server:standard -- test/unit/server/coding-cli/session-indexer.test.ts
 ```
 
 Expected: FAIL because the indexer still copies raw `mtime` into `updatedAt`.
@@ -201,14 +223,10 @@ Keep sorting, search, cursor, and running-state behavior unchanged.
 Run:
 
 ```bash
-npx vitest run test/unit/server/session-directory/projection.test.ts test/unit/server/session-directory/service.test.ts
+npm run test:server:standard -- test/unit/server/session-directory/projection.test.ts test/unit/server/session-directory/service.test.ts
 ```
 
 Expected: PASS
-
-**Step 4: If `service.test.ts` needs expectation updates, make them now**
-
-Only adjust `test/unit/server/session-directory/service.test.ts` if the refactor changes nothing but import paths or object construction details. Do not widen behavior here; this task is about removing duplicated projection logic, not changing the read-model output.
 
 ### Task 3: Use the shared projection for invalidation and semantic timestamps
 
@@ -216,6 +234,7 @@ Only adjust `test/unit/server/session-directory/service.test.ts` if the refactor
 - Modify: `server/sessions-sync/diff.ts`
 - Modify: `server/coding-cli/session-indexer.ts`
 - Test: `test/unit/server/sessions-sync/diff.test.ts`
+- Test: `test/unit/server/sessions-sync/service.test.ts`
 - Test: `test/unit/server/coding-cli/session-indexer.test.ts`
 - Test: `test/unit/server/session-directory/projection.test.ts`
 
@@ -262,7 +281,7 @@ Do not apply this carry-forward logic to direct providers; only the file-backed 
 Run:
 
 ```bash
-npx vitest run test/unit/server/session-directory/projection.test.ts test/unit/server/session-directory/service.test.ts test/unit/server/sessions-sync/diff.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/sessions-sync/service.test.ts
+npm run test:server:standard -- test/unit/server/session-directory/projection.test.ts test/unit/server/session-directory/service.test.ts test/unit/server/sessions-sync/diff.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/coding-cli/session-indexer.test.ts
 ```
 
 Expected: PASS
@@ -313,7 +332,7 @@ Add the companion search case with `query: 'deploy'` and `searchTier: 'title'` s
 Run:
 
 ```bash
-npx vitest run test/unit/client/components/Sidebar.test.tsx
+npm run test:client:standard -- test/unit/client/components/Sidebar.test.tsx
 ```
 
 Expected: FAIL because `Sidebar.tsx` currently returns `null` for the list while loading.
@@ -336,7 +355,7 @@ Broadcast `sessions.changed`, assert the existing session row remains visible wh
 Run:
 
 ```bash
-npx vitest run test/unit/client/components/Sidebar.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
+npm run test:client:standard -- test/unit/client/components/Sidebar.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
 ```
 
 Expected: FAIL because the sidebar still blanks during refresh.
@@ -354,8 +373,10 @@ Introduce explicit render guards:
 
 ```tsx
 const hasLoadedSidebarWindow = typeof sidebarWindow?.lastLoadedAt === 'number'
+const activeQuery = sidebarWindow?.query?.trim() ?? ''
 const showBlockingLoad = !!sidebarWindow?.loading && !hasLoadedSidebarWindow && sortedItems.length === 0
 const showRefreshStatus = !!sidebarWindow?.loading && hasLoadedSidebarWindow
+const refreshStatusLabel = activeQuery ? 'Searching...' : 'Updating sessions...'
 ```
 
 **Step 2: Keep the list mounted during refresh**
@@ -363,15 +384,27 @@ const showRefreshStatus = !!sidebarWindow?.loading && hasLoadedSidebarWindow
 Render policy:
 
 - `showBlockingLoad`: show the centered blocking spinner
-- `showRefreshStatus`: keep rendering the list or empty state and add inline status text
+- `showRefreshStatus`: render a small inline status row and keep rendering the stale list or stale empty state underneath it
 - empty-state copy is allowed only when not in the blocking path
 
-Use clear status copy:
+Use one status source of truth:
 
-- no query or title query: `Updating sessions...`
-- non-title search: `Searching...`
+```tsx
+{showRefreshStatus && (
+  <div className="px-2 py-2 text-xs text-muted-foreground" role="status">
+    {refreshStatusLabel}
+  </div>
+)}
+{showBlockingLoad ? (
+  <BlockingSpinner />
+) : sortedItems.length === 0 ? (
+  <EmptyState />
+) : (
+  <List ... />
+)}
+```
 
-Keep the status element accessible with `role="status"`.
+Keep the status element accessible with `role="status"`. Do not special-case title search as "not a real search"; if there is an active store-owned query, the stale list stays mounted and the status says `Searching...`.
 
 **Step 3: Do not add new Redux state unless a test proves it is necessary**
 
@@ -389,7 +422,7 @@ This fix is a rendering-policy change, not a state-model rewrite.
 Run:
 
 ```bash
-npx vitest run test/unit/client/components/Sidebar.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
+npm run test:client:standard -- test/unit/client/components/Sidebar.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
 ```
 
 Expected: PASS
@@ -410,17 +443,27 @@ Expected: one commit containing only the sidebar stale-while-refresh change and 
 **Files:**
 - Modify only files already touched by this plan if follow-up fixes are required
 
-**Step 1: Run the focused regression suite**
+**Step 1: Run the focused server regression suite**
 
 Run:
 
 ```bash
-npx vitest run test/unit/server/session-directory/projection.test.ts test/unit/server/session-directory/service.test.ts test/unit/server/sessions-sync/diff.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/client/components/Sidebar.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
+npm run test:server:standard -- test/unit/server/session-directory/projection.test.ts test/unit/server/session-directory/service.test.ts test/unit/server/sessions-sync/diff.test.ts test/unit/server/sessions-sync/service.test.ts test/unit/server/coding-cli/session-indexer.test.ts
 ```
 
 Expected: PASS
 
-**Step 2: Run accessibility lint**
+**Step 2: Run the focused client regression suite**
+
+Run:
+
+```bash
+npm run test:client:standard -- test/unit/client/components/Sidebar.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
+```
+
+Expected: PASS
+
+**Step 3: Run accessibility lint**
 
 Run:
 
@@ -430,21 +473,21 @@ npm run lint
 
 Expected: PASS
 
-**Step 3: Run the full repository test suite**
+**Step 4: Run the full repository test suite**
 
 Run:
 
 ```bash
-CI=true npm test
+FRESHELL_TEST_SUMMARY="left panel refresh fix" CI=true npm test
 ```
 
 Expected: PASS
 
 Per repo policy, if this fails, stop and fix the failure before any merge work even if it looks unrelated.
 
-**Step 4: Commit only if verification required follow-up edits**
+**Step 5: Commit only if verification required follow-up edits**
 
-Run only if Steps 1-3 changed files:
+Run only if Steps 1-4 required follow-up code edits:
 
 ```bash
 git add <follow-up-files>
@@ -461,4 +504,4 @@ Expected: no extra commit unless verification exposed a real issue.
 - A loaded sidebar never goes blank while a refresh is in flight.
 - The first load can still show a blocking loading state.
 - Title-filtered sidebar refreshes also keep stale rows visible until the new response arrives.
-- Focused regressions pass, then `npm run lint`, then `CI=true npm test`.
+- Focused server regressions pass, then focused client regressions pass, then `npm run lint`, then `FRESHELL_TEST_SUMMARY="left panel refresh fix" CI=true npm test`.
