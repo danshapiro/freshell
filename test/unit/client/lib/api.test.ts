@@ -1,12 +1,35 @@
-import { afterEach, describe, it, expect, vi, beforeEach } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  api,
+  fetchSidebarSessionsSnapshot,
+  getAgentTimelinePage,
+  getAgentTurnBody,
+  getBootstrap,
+  getSessionDirectoryPage,
+  getTerminalDirectoryPage,
+  searchSessions,
+  getTerminalScrollbackPage,
+  getTerminalViewport,
+  searchTerminalView,
+  setSessionMetadata,
+} from '@/lib/api'
+import {
+  SessionDirectoryQuerySchema,
+  TerminalDirectoryQuerySchema,
+} from '@shared/read-models'
 
-// Mock fetch globally
 const mockFetch = vi.fn()
 global.fetch = mockFetch
 
-import { api, searchSessions, setSessionMetadata, type SearchResponse } from '@/lib/api'
+function mockJson(value: unknown) {
+  return {
+    ok: true,
+    status: 200,
+    text: () => Promise.resolve(JSON.stringify(value)),
+  }
+}
 
-describe('searchSessions()', () => {
+describe('visible-first read-model helpers', () => {
   beforeEach(() => {
     mockFetch.mockReset()
     localStorage.setItem('freshell.auth-token', 'test-token')
@@ -16,74 +39,208 @@ describe('searchSessions()', () => {
     localStorage.clear()
   })
 
-  it('calls /api/sessions/search with query', async () => {
-    const mockResponse: SearchResponse = {
-      results: [],
-      tier: 'title',
-      query: 'test',
-      totalScanned: 0,
-    }
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      text: () => Promise.resolve(JSON.stringify(mockResponse)),
-    })
+  it('getBootstrap targets only /api/bootstrap', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({ shell: { authenticated: true } }))
 
-    await searchSessions({ query: 'test' })
+    await getBootstrap()
 
     expect(mockFetch).toHaveBeenCalledWith(
-      '/api/sessions/search?q=test&tier=title',
+      '/api/bootstrap',
       expect.objectContaining({
         headers: expect.any(Headers),
-      })
+      }),
     )
   })
 
-  it('includes tier parameter', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      text: () => Promise.resolve(JSON.stringify({ results: [], tier: 'fullText', query: 'test', totalScanned: 0 })),
-    })
+  it('getSessionDirectoryPage encodes query, cursor, priority, revision, and limit while forwarding AbortSignal', async () => {
+    const signal = new AbortController().signal
+    mockFetch.mockResolvedValueOnce(mockJson({ items: [] }))
 
-    await searchSessions({ query: 'test', tier: 'fullText' })
+    await getSessionDirectoryPage(
+      {
+        query: 'alpha',
+        cursor: 'cursor-1',
+        priority: 'visible',
+        revision: 4,
+        limit: 10,
+      },
+      { signal },
+    )
 
     expect(mockFetch).toHaveBeenCalledWith(
-      '/api/sessions/search?q=test&tier=fullText',
-      expect.anything()
+      '/api/session-directory?query=alpha&cursor=cursor-1&priority=visible&revision=4&limit=10',
+      expect.objectContaining({
+        signal,
+        headers: expect.any(Headers),
+      }),
     )
   })
 
-  it('includes limit parameter when provided', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      text: () => Promise.resolve(JSON.stringify({ results: [], tier: 'title', query: 'test', totalScanned: 0 })),
-    })
+  it('getTerminalDirectoryPage encodes cursor, priority, revision, and limit consistently', async () => {
+    const signal = new AbortController().signal
+    mockFetch.mockResolvedValueOnce(mockJson({ items: [] }))
 
-    await searchSessions({ query: 'test', limit: 10 })
+    await getTerminalDirectoryPage(
+      {
+        cursor: 'cursor-2',
+        priority: 'background',
+        revision: 6,
+        limit: 5,
+      },
+      { signal },
+    )
 
     expect(mockFetch).toHaveBeenCalledWith(
-      '/api/sessions/search?q=test&tier=title&limit=10',
-      expect.anything()
+      '/api/terminals?cursor=cursor-2&priority=background&revision=6&limit=5',
+      expect.objectContaining({
+        signal,
+        headers: expect.any(Headers),
+      }),
     )
   })
 
-  it('returns search response', async () => {
-    const mockResponse: SearchResponse = {
-      results: [
-        { sessionId: 'abc', provider: 'claude', projectPath: '/proj', matchedIn: 'title', updatedAt: 1000 },
-      ],
-      tier: 'title',
-      query: 'test',
-      totalScanned: 5,
-    }
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      text: () => Promise.resolve(JSON.stringify(mockResponse)),
-    })
+  it('agent chat helpers target only the new route family and forward AbortSignal', async () => {
+    const signal = new AbortController().signal
+    mockFetch
+      .mockResolvedValueOnce(mockJson({ items: [], nextCursor: null }))
+      .mockResolvedValueOnce(mockJson({ turnId: 'turn-1', body: [] }))
 
-    const result = await searchSessions({ query: 'test' })
+    await getAgentTimelinePage('session-1', { cursor: 'page-2', limit: 20 }, { signal })
+    await getAgentTurnBody('session-1', 'turn-1', { signal })
 
-    expect(result.results).toHaveLength(1)
-    expect(result.results[0].sessionId).toBe('abc')
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      1,
+      '/api/agent-sessions/session-1/timeline?cursor=page-2&limit=20',
+      expect.objectContaining({
+        signal,
+        headers: expect.any(Headers),
+      }),
+    )
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      2,
+      '/api/agent-sessions/session-1/turns/turn-1',
+      expect.objectContaining({
+        signal,
+        headers: expect.any(Headers),
+      }),
+    )
+  })
+
+  it('terminal view helpers target only viewport, scrollback, and search routes while forwarding AbortSignal', async () => {
+    const signal = new AbortController().signal
+    mockFetch
+      .mockResolvedValueOnce(mockJson({ terminalId: 'term-1' }))
+      .mockResolvedValueOnce(mockJson({ items: [] }))
+      .mockResolvedValueOnce(mockJson({ matches: [] }))
+
+    await getTerminalViewport('term-1', { signal })
+    await getTerminalScrollbackPage('term-1', { cursor: 'line-100', limit: 50 }, { signal })
+    await searchTerminalView('term-1', { query: 'error', cursor: 'hit-2', limit: 25 }, { signal })
+
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      1,
+      '/api/terminals/term-1/viewport',
+      expect.objectContaining({
+        signal,
+        headers: expect.any(Headers),
+      }),
+    )
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      2,
+      '/api/terminals/term-1/scrollback?cursor=line-100&limit=50',
+      expect.objectContaining({
+        signal,
+        headers: expect.any(Headers),
+      }),
+    )
+    expect(mockFetch).toHaveBeenNthCalledWith(
+      3,
+      '/api/terminals/term-1/search?query=error&cursor=hit-2&limit=25',
+      expect.objectContaining({
+        signal,
+        headers: expect.any(Headers),
+      }),
+    )
+  })
+
+  it('keeps critical out of public client directory query schemas', () => {
+    expect(() =>
+      SessionDirectoryQuerySchema.parse({
+        priority: 'critical',
+      }),
+    ).toThrow()
+
+    expect(() =>
+      TerminalDirectoryQuerySchema.parse({
+        priority: 'critical',
+      }),
+    ).toThrow()
+  })
+
+  it('preserves sidebar visibility metadata when grouping session-directory items', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [{
+        sessionId: 'session-1',
+        provider: 'codex',
+        projectPath: '/tmp/project-alpha',
+        title: 'Hidden session',
+        sessionType: 'codex',
+        firstUserMessage: '__AUTO__ worktree cleanup',
+        isSubagent: true,
+        isNonInteractive: true,
+        updatedAt: 1_000,
+      }],
+      nextCursor: null,
+      revision: 1,
+    }))
+
+    const response = await fetchSidebarSessionsSnapshot()
+
+    expect(response.projects).toEqual([
+      expect.objectContaining({
+        projectPath: '/tmp/project-alpha',
+        sessions: [
+          expect.objectContaining({
+            sessionId: 'session-1',
+            sessionType: 'codex',
+            firstUserMessage: '__AUTO__ worktree cleanup',
+            isSubagent: true,
+            isNonInteractive: true,
+          }),
+        ],
+      }),
+    ])
+  })
+
+  it('preserves search visibility metadata from session-directory items', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [{
+        sessionId: 'session-2',
+        provider: 'codex',
+        projectPath: '/tmp/project-beta',
+        title: 'Queued session',
+        matchedIn: 'title',
+        sessionType: 'codex',
+        firstUserMessage: 'queued task',
+        isSubagent: false,
+        isNonInteractive: true,
+        updatedAt: 2_000,
+      }],
+      nextCursor: null,
+      revision: 2,
+    }))
+
+    const response = await searchSessions({ query: 'queued' })
+
+    expect(response.results).toEqual([
+      expect.objectContaining({
+        sessionId: 'session-2',
+        sessionType: 'codex',
+        firstUserMessage: 'queued task',
+        isSubagent: false,
+        isNonInteractive: true,
+      }),
+    ])
   })
 })
 
@@ -138,5 +295,30 @@ describe('setSessionMetadata()', () => {
     const call = mockFetch.mock.calls[0]
     const headers = call[1].headers as Headers
     expect(headers.get('Content-Type')).toBe('application/json')
+  })
+})
+
+describe('api error mapping', () => {
+  beforeEach(() => {
+    mockFetch.mockReset()
+    localStorage.setItem('freshell.auth-token', 'test-token')
+  })
+
+  afterEach(() => {
+    localStorage.clear()
+  })
+
+  it('prefers agent-api message fields on error responses', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      statusText: 'Bad Request',
+      text: () => Promise.resolve(JSON.stringify({ status: 'error', message: 'name required' })),
+    })
+
+    await expect(api.patch('/api/panes/pane-1', { name: '' })).rejects.toMatchObject({
+      status: 400,
+      message: 'name required',
+    })
   })
 })

@@ -1,8 +1,10 @@
+import { useEffect, useRef } from 'react'
 import { PaneLayout } from './panes'
 import SessionView from './SessionView'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { useAppSelector } from '@/store/hooks'
 import type { PaneContentInput } from '@/store/paneTypes'
+import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 
 interface TabContentProps {
   tabId: string
@@ -12,6 +14,14 @@ interface TabContentProps {
 export default function TabContent({ tabId, hidden }: TabContentProps) {
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const defaultNewPane = useAppSelector((s) => s.settings.settings.panes?.defaultNewPane || 'ask')
+  const previousHiddenRef = useRef(hidden)
+
+  useEffect(() => {
+    const wasHidden = previousHiddenRef.current
+    previousHiddenRef.current = hidden
+    if (!wasHidden || hidden) return
+    getInstalledPerfAuditBridge()?.mark('tab.selected_surface_visible', { tabId })
+  }, [hidden, tabId])
 
   if (!tab) return null
 

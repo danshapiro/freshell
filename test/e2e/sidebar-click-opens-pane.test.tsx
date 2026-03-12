@@ -9,7 +9,7 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
-import type { ProjectGroup, BackgroundTerminal } from '@/store/types'
+import type { ProjectGroup } from '@/store/types'
 
 // Mock react-window's List component
 vi.mock('react-window', () => ({
@@ -80,6 +80,7 @@ function createStore(options: {
   excludeFirstChatMustStart?: boolean
   showSubagents?: boolean
   ignoreCodexSubagents?: boolean
+  showNoninteractiveSessions?: boolean
 }) {
   const projects = options.projects.map((project) => ({
     ...project,
@@ -134,6 +135,7 @@ function createStore(options: {
             showProjectBadges: true,
             showSubagents: options.showSubagents ?? defaultSettings.sidebar.showSubagents,
             ignoreCodexSubagents: options.ignoreCodexSubagents ?? defaultSettings.sidebar.ignoreCodexSubagents,
+            showNoninteractiveSessions: options.showNoninteractiveSessions ?? defaultSettings.sidebar.showNoninteractiveSessions,
             hideEmptySessions: false,
             excludeFirstChatSubstrings: options.excludeFirstChatSubstrings ?? defaultSettings.sidebar.excludeFirstChatSubstrings,
             excludeFirstChatMustStart: options.excludeFirstChatMustStart ?? defaultSettings.sidebar.excludeFirstChatMustStart,
@@ -176,26 +178,8 @@ function createStore(options: {
   })
 }
 
-function renderSidebar(store: ReturnType<typeof createStore>, terminals: BackgroundTerminal[] = []) {
+function renderSidebar(store: ReturnType<typeof createStore>) {
   const onNavigate = vi.fn()
-  let messageCallback: ((msg: any) => void) | null = null
-
-  mockSend.mockImplementation((msg: any) => {
-    if (msg.type === 'terminal.list' && messageCallback) {
-      setTimeout(() => {
-        messageCallback!({
-          type: 'terminal.list.response',
-          requestId: msg.requestId,
-          terminals,
-        })
-      }, 0)
-    }
-  })
-
-  mockOnMessage.mockImplementation((callback: (msg: any) => void) => {
-    messageCallback = callback
-    return () => { messageCallback = null }
-  })
 
   const result = render(
     <Provider store={store}>
@@ -513,6 +497,47 @@ describe('sidebar click opens pane (e2e)', () => {
     expect(state.panes.activePane['tab-2']).toBe('pane-chat')
     // Layout should be unchanged (still a leaf, no split)
     expect(state.panes.layouts['tab-2'].type).toBe('leaf')
+  })
+
+  it('shows freshclaude non-interactive sessions while keeping exec-style Claude sessions hidden', async () => {
+    const projects: ProjectGroup[] = [
+      {
+        projectPath: '/home/user/project',
+        sessions: [
+          {
+            sessionId: sessionId('freshclaude-visible'),
+            projectPath: '/home/user/project',
+            updatedAt: Date.now(),
+            title: 'Freshclaude visible',
+            cwd: '/home/user/project',
+            isNonInteractive: true,
+            sessionType: 'freshclaude',
+          },
+          {
+            sessionId: sessionId('exec-hidden'),
+            projectPath: '/home/user/project',
+            updatedAt: Date.now() - 1000,
+            title: 'Exec hidden',
+            cwd: '/home/user/project',
+            isNonInteractive: true,
+          },
+        ],
+      },
+    ]
+
+    const store = createStore({
+      projects,
+      showNoninteractiveSessions: false,
+    })
+
+    renderSidebar(store)
+
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+
+    expect(screen.getByText('Freshclaude visible')).toBeInTheDocument()
+    expect(screen.queryByText('Exec hidden')).not.toBeInTheDocument()
   })
 
   it('clicking a session with no active tab creates a new tab', async () => {

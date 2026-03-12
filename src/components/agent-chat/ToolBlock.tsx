@@ -49,7 +49,7 @@ function ToolBlock({ name, input, output, isError, status, initialExpanded }: To
   return (
     <div
       className={cn(
-        'border-l-2 my-1 text-xs',
+        'border-l-2 my-0.5 text-xs',
         isError
           ? 'border-l-[hsl(var(--claude-error))]'
           : 'border-l-[hsl(var(--claude-tool))]'
@@ -58,7 +58,7 @@ function ToolBlock({ name, input, output, isError, status, initialExpanded }: To
       <button
         type="button"
         onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-2 w-full px-2 py-1 text-left hover:bg-accent/50 rounded-r"
+        className="flex w-full items-center gap-2 rounded-r px-2 py-0.5 text-left hover:bg-accent/50"
         aria-expanded={expanded}
         aria-label={`${name} tool call`}
       >
@@ -81,7 +81,7 @@ function ToolBlock({ name, input, output, isError, status, initialExpanded }: To
       </button>
 
       {expanded && (
-        <div className="px-2 py-1.5 border-t border-border/50 text-xs">
+        <div className="border-t border-border/50 px-2 py-1 text-xs">
           {name === 'Edit' && input &&
             typeof input.old_string === 'string' &&
             typeof input.new_string === 'string' ? (
@@ -106,7 +106,7 @@ function ToolBlock({ name, input, output, isError, status, initialExpanded }: To
               {output && (
                 <pre
                   className={cn(
-                    'whitespace-pre-wrap font-mono max-h-48 overflow-y-auto mt-1',
+                    'mt-0.5 max-h-48 overflow-y-auto whitespace-pre-wrap font-mono',
                     isError ? 'text-red-500' : 'opacity-80'
                   )}
                   data-tool-output=""

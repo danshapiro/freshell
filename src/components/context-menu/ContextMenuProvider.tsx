@@ -12,9 +12,10 @@ import {
   splitPane as splitPaneAction,
   swapSplit,
 } from '@/store/panesSlice'
-import { setProjects, setProjectExpanded } from '@/store/sessionsSlice'
+import { setProjectExpanded } from '@/store/sessionsSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'
+import { refreshActiveSessionWindow } from '@/store/sessionsThunks'
 import { getAuthToken } from '@/lib/auth'
 import { buildShareUrl } from '@/lib/utils'
 import { copyText } from '@/lib/clipboard'
@@ -24,6 +25,7 @@ import { collectSessionRefsFromNode } from '@/lib/session-utils'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { getBrowserActions, getEditorActions, getTerminalActions } from '@/lib/pane-action-registry'
 import { buildResumeCommand, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
+import type { ClientExtensionEntry } from '@shared/extension-types'
 import { buildResumeContent } from '@/lib/session-type-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
@@ -46,6 +48,7 @@ import {
 import { nanoid } from 'nanoid'
 
 const CONTEXT_MENU_KEYS = ['ContextMenu']
+const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 
 
 type MenuState = {
@@ -100,6 +103,7 @@ export function ContextMenuProvider({
   const expandedProjects = useAppSelector((s) => s.sessions.expandedProjects)
   const platform = useAppSelector((s) => s.connection?.platform ?? null)
   const appSettings = useAppSelector((s) => s.settings.settings)
+  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
 
   const [menuState, setMenuState] = useState<MenuState | null>(null)
   const [confirmState, setConfirmState] = useState<ConfirmState | null>(null)
@@ -156,16 +160,16 @@ export function ContextMenuProvider({
   }, [buildShareLink])
 
   const copyTabNames = useCallback(async () => {
-    const names = tabsState.tabs.map((tab) => getTabDisplayTitle(tab, panes[tab.id]))
+    const names = tabsState.tabs.map((tab) => getTabDisplayTitle(tab, panes[tab.id], extensionEntries))
     await copyText(names.join('\n'))
-  }, [tabsState.tabs, panes])
+  }, [tabsState.tabs, panes, extensionEntries])
 
   const copyTabName = useCallback(async (tabId: string) => {
     const tab = tabsState.tabs.find((t) => t.id === tabId)
     if (!tab) return
-    const name = getTabDisplayTitle(tab, panes[tab.id])
+    const name = getTabDisplayTitle(tab, panes[tab.id], extensionEntries)
     await copyText(name)
-  }, [tabsState.tabs, panes])
+  }, [tabsState.tabs, panes, extensionEntries])
 
   const newDefaultTab = useCallback(() => {
     dispatch(addTab({ mode: 'shell' }))
@@ -363,8 +367,7 @@ export function ContextMenuProvider({
         titleOverride: title || undefined,
         summaryOverride: summary,
       })
-      const data = await api.get('/api/sessions')
-      dispatch(setProjects(data))
+      await dispatch(refreshActiveSessionWindow() as any)
     } catch {
       // ignore
     }
@@ -374,8 +377,7 @@ export function ContextMenuProvider({
     try {
       const compositeKey = `${provider || 'claude'}:${sessionId}`
       await api.patch(`/api/sessions/${encodeURIComponent(compositeKey)}`, { archived: next })
-      const data = await api.get('/api/sessions')
-      dispatch(setProjects(data))
+      await dispatch(refreshActiveSessionWindow() as any)
     } catch {
       // ignore
     }
@@ -409,8 +411,7 @@ export function ContextMenuProvider({
         try {
           const compositeKey = `${provider || info.session.provider || 'claude'}:${sessionId}`
           await api.delete(`/api/sessions/${encodeURIComponent(compositeKey)}`)
-          const data = await api.get('/api/sessions')
-          dispatch(setProjects(data))
+          await dispatch(refreshActiveSessionWindow() as any)
         } catch {
           // ignore
         } finally {
@@ -481,18 +482,17 @@ export function ContextMenuProvider({
   }, [getSessionInfo, tabsState.tabs, panes, menuState?.target])
 
   const copyResumeCommand = useCallback(async (provider: ResumeCommandProvider, sessionId: string) => {
-    const command = buildResumeCommand(provider, sessionId)
+    const command = buildResumeCommand(provider, sessionId, extensionEntries)
     if (!command) return
     await copyText(command)
-  }, [])
+  }, [extensionEntries])
 
   const setProjectColor = useCallback(async (projectPath: string) => {
     const next = window.prompt('Project color (hex)', '#6b7280')
     if (!next) return
     try {
       await api.put('/api/project-colors', { projectPath, color: next })
-      const data = await api.get('/api/sessions')
-      dispatch(setProjects(data))
+      await dispatch(refreshActiveSessionWindow() as any)
     } catch {
       // ignore
     }
@@ -806,6 +806,7 @@ export function ContextMenuProvider({
       contextElement: menuState.contextElement,
       clickTarget: menuState.clickTarget,
       platform,
+      extensions: extensionEntries,
       actions: {
         newDefaultTab,
         newTabWithPane,
@@ -877,6 +878,7 @@ export function ContextMenuProvider({
     sessions,
     expandedProjects,
     platform,
+    extensionEntries,
     newDefaultTab,
     newTabWithPane,
     copyTabNames,

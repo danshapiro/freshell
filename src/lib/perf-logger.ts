@@ -12,6 +12,8 @@ type ClientPerfConfig = {
   rateLimitMs: number
 }
 
+type ClientPerfAuditSink = (entry: Record<string, unknown>) => void
+
 function parseBoolean(value: string | undefined): boolean {
   if (!value) return false
   const normalized = value.trim().toLowerCase()
@@ -49,10 +51,15 @@ const terminalInputSentAtById = new Map<string, number>()
 const terminalInputToOutputSamplesMs: number[] = []
 let perfInitialized = false
 let memoryTimer: number | null = null
+let clientPerfAuditSink: ClientPerfAuditSink | null = null
 const MAX_TERMINAL_INPUT_TO_OUTPUT_SAMPLES = 200
 
 export function getClientPerfConfig(): ClientPerfConfig {
   return perfConfig
+}
+
+export function installClientPerfAuditSink(sink: ClientPerfAuditSink | null): void {
+  clientPerfAuditSink = sink
 }
 
 export function isClientPerfLoggingEnabled(): boolean {
@@ -95,6 +102,7 @@ export function logClientPerf(
 ) {
   if (!perfConfig.enabled) return
   const payload = { event, perf: true, ...context }
+  clientPerfAuditSink?.(payload)
   if (level === 'error') console.error(payload)
   else if (level === 'warn') console.warn(payload)
   else if (level === 'debug') console.debug(payload)
@@ -134,6 +142,12 @@ export function markTerminalOutputSeen(terminalId: string, atMs = perfNowMs()): 
   if (terminalInputToOutputSamplesMs.length > MAX_TERMINAL_INPUT_TO_OUTPUT_SAMPLES) {
     terminalInputToOutputSamplesMs.shift()
   }
+  clientPerfAuditSink?.({
+    event: 'perf.terminal_input_to_output_sample',
+    perf: true,
+    terminalId,
+    latencyMs: Number(latencyMs.toFixed(2)),
+  })
 
   if (!shouldLog('perf.terminal_input_to_output', perfConfig.rateLimitMs)) return
 

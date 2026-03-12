@@ -402,5 +402,35 @@ describe('ExtensionManager', () => {
       const mgr = new ExtensionManager()
       expect(mgr.toClientRegistry()).toEqual([])
     })
+
+    it('includes CLI resume metadata while ignoring server-only launch templates', async () => {
+      await writeExtension(extDir1, 'cli', cliManifest({
+        name: 'opencode',
+        label: 'OpenCode',
+        cli: {
+          command: 'opencode',
+          resumeArgs: ['--session', '{{sessionId}}'],
+          modelArgs: ['--model', '{{model}}'],
+          permissionModeEnvVar: 'OPENCODE_PERMISSION',
+          permissionModeValues: {
+            plan: '{"edit":"ask","bash":"ask"}',
+          },
+          supportsPermissionMode: true,
+          supportsModel: true,
+        },
+      }))
+
+      const mgr = new ExtensionManager()
+      mgr.scan([extDir1])
+
+      const entry = mgr.toClientRegistry()[0]
+      expect(entry.cli).toEqual({
+        supportsPermissionMode: true,
+        supportsModel: true,
+        supportsSandbox: undefined,
+        supportsResume: true,
+        resumeCommandTemplate: ['opencode', '--session', '{{sessionId}}'],
+      })
+    })
   })
 })

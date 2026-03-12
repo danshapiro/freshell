@@ -6,21 +6,18 @@ import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { openSessionTab, setActiveTab } from '@/store/tabsSlice'
 import { addPane, setActivePane } from '@/store/panesSlice'
-import { setLoadingMore } from '@/store/sessionsSlice'
 import { findPaneForSession } from '@/lib/session-utils'
-import { getWsClient } from '@/lib/ws-client'
-import { searchSessions, type SearchResult } from '@/lib/api'
 import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import type { BackgroundTerminal, CodingCliProviderName } from '@/store/types'
-import { makeSelectKnownSessionKeys, makeSelectSortedSessionItems, type SidebarSessionItem } from '@/store/selectors/sidebarSelectors'
+import { makeSelectSortedSessionItems, type SidebarSessionItem } from '@/store/selectors/sidebarSelectors'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { getActiveSessionRefForTab } from '@/lib/session-utils'
-import { createLogger } from '@/lib/client-logger'
 import { useStableArray } from '@/hooks/useStableArray'
+import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
+import { fetchSessionWindow } from '@/store/sessionsThunks'
 
-
-const log = createLogger('Sidebar')
+const EMPTY_TERMINALS: BackgroundTerminal[] = []
 
 /** Compare two BackgroundTerminal arrays by sidebar-relevant fields only.
  *  Ignores lastActivityAt since it changes frequently but doesn't affect rendering. */
@@ -86,11 +83,6 @@ function formatRelativeTime(timestamp: number): string {
   if (hours < 24) return `${hours}h`
   if (days < 7) return `${days}d`
   return new Date(timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
-}
-
-function getProjectName(projectPath: string): string {
-  const parts = projectPath.replace(/\\/g, '/').split('/')
-  return parts[parts.length - 1] || projectPath
 }
 
 /** Structural equality for a single session item — returns true when all
@@ -228,23 +220,19 @@ export default function Sidebar({
     return `${ref.provider}:${ref.sessionId}`
   })
   const selectSortedItems = useMemo(() => makeSelectSortedSessionItems(), [])
-  // Separate selector instance for allItems: createSelector caches only one
-  // result, so calling the same instance with different filter args would thrash
-  // the cache and cause both to recompute on every render during search.
-  const selectAllItems = useMemo(() => makeSelectSortedSessionItems(), [])
-  const selectKnownSessionKeys = useMemo(() => makeSelectKnownSessionKeys(), [])
 
-  const ws = useMemo(() => getWsClient(), [])
   const hasMore = useAppSelector((s) => s.sessions.hasMore)
   const loadingMore = useAppSelector((s) => s.sessions.loadingMore)
   const oldestLoadedTimestamp = useAppSelector((s) => s.sessions.oldestLoadedTimestamp)
   const oldestLoadedSessionId = useAppSelector((s) => s.sessions.oldestLoadedSessionId)
-  const [terminals, setTerminals] = useState<BackgroundTerminal[]>([])
+  const sidebarWindow = useAppSelector((s) => s.sessions.windows?.sidebar)
+  const topLevelSessionCount = useAppSelector((s) => s.sessions.projects?.length ?? 0)
+  const terminals = useAppSelector((state) => (
+    (state as any).terminalDirectory?.windows?.sidebar?.items ?? EMPTY_TERMINALS
+  )) as BackgroundTerminal[]
   const [filter, setFilter] = useState('')
   const [searchTier, setSearchTier] = useState<'title' | 'userMessages' | 'fullText'>('title')
-  const [searchResults, setSearchResults] = useState<SearchResult[] | null>(null)
-  const [isSearching, setIsSearching] = useState(false)
-  const requestIdRef = useRef<string | null>(null)
+  const lastMarkedSearchQueryRef = useRef<string | null>(null)
   const listContainerRef = useRef<HTMLDivElement | null>(null)
   const [listHeight, setListHeight] = useState(0)
 
@@ -257,147 +245,39 @@ export default function Sidebar({
     return () => window.clearInterval(id)
   }, [])
 
-  // Fetch background terminals
-  const refresh = useCallback(() => {
-    const requestId = `list-${Date.now()}`
-    requestIdRef.current = requestId
-    ws.send({ type: 'terminal.list', requestId })
-  }, [ws])
-
   useEffect(() => {
-    ws.connect().catch(() => {})
-
-    // Register message handler BEFORE calling refresh to avoid race condition
-    const unsub = ws.onMessage((msg) => {
-      if (msg.type === 'terminal.list.response' && msg.requestId === requestIdRef.current) {
-        const incoming = msg.terminals || []
-        // Only update state when terminal data has actually changed to avoid
-        // unnecessary re-renders that cause the sidebar list to blink/flash.
-        setTerminals((prev) => {
-          if (areTerminalsEqual(prev, incoming)) return prev
-          return incoming
-        })
+    const query = filter.trim()
+    if (!query) {
+      if (sidebarWindow && lastMarkedSearchQueryRef.current !== null) {
+        lastMarkedSearchQueryRef.current = null
+        void dispatch(fetchSessionWindow({
+          surface: 'sidebar',
+          priority: 'visible',
+        }) as any)
       }
-      if (['terminal.detached', 'terminal.attach.ready', 'terminal.exit', 'terminal.list.updated'].includes(msg.type)) {
-        refresh()
-      }
-    })
-
-    refresh()
-    const interval = window.setInterval(refresh, 10000)
-    return () => {
-      unsub()
-      window.clearInterval(interval)
-    }
-  }, [ws, refresh])
-
-  // Backend search for non-title tiers
-  useEffect(() => {
-    if (!filter.trim() || searchTier === 'title') {
-      setSearchResults(null)
-      setIsSearching(false)
       return
     }
 
-    const controller = new AbortController()
+    if (!sidebarWindow && topLevelSessionCount > 0 && searchTier === 'title') {
+      return
+    }
+
     const timeoutId = setTimeout(async () => {
-      setIsSearching(true)
-      try {
-        const response = await searchSessions({
-          query: filter.trim(),
-          tier: searchTier,
-        })
-        if (!controller.signal.aborted) {
-          setSearchResults(response.results)
-        }
-      } catch (err) {
-        log.error('Search failed:', err)
-        if (!controller.signal.aborted) {
-          setSearchResults([])
-        }
-      } finally {
-        if (!controller.signal.aborted) {
-          setIsSearching(false)
-        }
-      }
+      void dispatch(fetchSessionWindow({
+        surface: 'sidebar',
+        priority: 'visible',
+        query,
+        searchTier,
+      }) as any)
     }, 300) // Debounce 300ms
 
     return () => {
-      controller.abort()
       clearTimeout(timeoutId)
-      setIsSearching(false)
     }
-  }, [filter, searchTier])
+  }, [dispatch, filter, searchTier, sidebarWindow, topLevelSessionCount])
 
-  // Build session list with selector for local filtering (title tier)
-  const localFilteredItems = useAppSelector((state) => selectSortedItems(state, terminals, filter))
-  const allItems = useAppSelector((state) => selectAllItems(state, terminals, ''))
-  const knownSessionKeys = useAppSelector((state) => selectKnownSessionKeys(state))
-  const itemsByKey = useMemo(() => {
-    const map = new Map<string, SidebarSessionItem>()
-    for (const item of allItems) {
-      map.set(`${item.provider}:${item.sessionId}`, item)
-    }
-    return map
-  }, [allItems])
-
-  // Combine local and backend search results
-  const computedItems = useMemo(() => {
-    // If we have backend search results, convert them to SessionItems
-    if (searchResults !== null) {
-      const items: SessionItem[] = []
-      for (const result of searchResults) {
-        const provider = (result.provider || 'claude') as CodingCliProviderName
-        const key = `${provider}:${result.sessionId}`
-        const existing = itemsByKey.get(key)
-        // Keep visibility filtering consistent with the normal sidebar list.
-        if (!existing && knownSessionKeys.has(key)) continue
-        if (!existing) {
-          items.push({
-            id: `search-${provider}-${result.sessionId}`,
-            sessionId: result.sessionId,
-            provider,
-            sessionType: provider,
-            title: result.title || result.sessionId.slice(0, 8),
-            hasTitle: !!result.title,
-            subtitle: getProjectName(result.projectPath),
-            projectPath: result.projectPath,
-            timestamp: result.updatedAt,
-            archived: result.archived,
-            cwd: result.cwd,
-            hasTab: false,
-            isRunning: false,
-          })
-          continue
-        }
-        items.push({
-          id: `search-${provider}-${result.sessionId}`,
-          sessionId: result.sessionId,
-          provider,
-          sessionType: existing.sessionType,
-          title: result.title || existing.title || result.sessionId.slice(0, 8),
-          hasTitle: !!(result.title || existing.hasTitle),
-          subtitle: getProjectName(result.projectPath),
-          projectPath: result.projectPath,
-          projectColor: existing?.projectColor,
-          timestamp: result.updatedAt,
-          archived: result.archived,
-          cwd: result.cwd,
-          hasTab: existing.hasTab,
-          ratchetedActivity: existing.ratchetedActivity,
-          isRunning: existing.isRunning,
-          runningTerminalId: existing.runningTerminalId,
-          isSubagent: existing.isSubagent,
-          isNonInteractive: existing.isNonInteractive,
-          firstUserMessage: existing.firstUserMessage,
-        })
-      }
-      return items
-    }
-
-    // Otherwise use local filtering for title tier
-    return localFilteredItems
-  }, [itemsByKey, knownSessionKeys, localFilteredItems, searchResults])
+  const localFilteredItems = useAppSelector((state) => selectSortedItems(state, terminals, sidebarWindow ? '' : filter))
+  const computedItems = useMemo(() => localFilteredItems, [localFilteredItems])
 
   // Stabilize the array reference so react-window doesn't rebuild all row
   // elements when the selector produces new objects with identical field
@@ -434,9 +314,14 @@ export default function Sidebar({
     const state = store.getState()
     const currentActiveTabId = state.tabs.activeTabId
     const runningTerminalId = item.isRunning ? item.runningTerminalId : undefined
+    const localServerInstanceId = state.connection.serverInstanceId
 
     // 1. Dedup: if session is already open in a pane, focus it
-    const existing = findPaneForSession(state, provider, item.sessionId)
+    const existing = findPaneForSession(
+      state,
+      { provider, sessionId: item.sessionId },
+      localServerInstanceId,
+    )
     if (existing) {
       dispatch(setActiveTab(existing.tabId))
       if (existing.paneId) {
@@ -497,7 +382,6 @@ export default function Sidebar({
     ? listHeight
     : Math.min(sortedItems.length * SESSION_ITEM_HEIGHT, SESSION_LIST_MAX_HEIGHT)
 
-  const loadMoreSeqRef = useRef(0)
   const loadMoreInFlightRef = useRef(false)
   const loadMoreTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const handleRowsRendered = useCallback(
@@ -512,23 +396,18 @@ export default function Sidebar({
       const nearBottom = allRows.stopIndex >= sortedItems.length - 10
       if (!nearBottom) return
       loadMoreInFlightRef.current = true
-      dispatch(setLoadingMore(true))
-      const requestId = `load-more-${++loadMoreSeqRef.current}`
-      ws.send({
-        type: 'sessions.fetch',
-        requestId,
-        before: oldestLoadedTimestamp,
-        beforeId: oldestLoadedSessionId,
-        limit: 100,
-      })
+      void dispatch(fetchSessionWindow({
+        surface: 'sidebar',
+        priority: 'visible',
+        append: true,
+      }) as any)
       // Safety timeout: reset if response never arrives
       if (loadMoreTimeoutRef.current) clearTimeout(loadMoreTimeoutRef.current)
       loadMoreTimeoutRef.current = setTimeout(() => {
         loadMoreInFlightRef.current = false
-        dispatch(setLoadingMore(false))
       }, 15_000)
     },
-    [hasMore, oldestLoadedTimestamp, oldestLoadedSessionId, sortedItems.length, filter, dispatch, ws],
+    [hasMore, oldestLoadedTimestamp, oldestLoadedSessionId, sortedItems.length, filter, dispatch],
   )
   // Reset in-flight guard when loadingMore clears (response received)
   useEffect(() => {
@@ -550,6 +429,19 @@ export default function Sidebar({
     onItemClick: handleItemClick,
     timestampTick,
   }), [sortedItems, activeSessionKey, activeTerminalId, settings.sidebar?.showProjectBadges, handleItemClick, timestampTick])
+
+  useEffect(() => {
+    const query = filter.trim()
+    if (!query) return
+    if (sidebarWindow?.loading) return
+    if (sortedItems.length === 0) return
+    if (lastMarkedSearchQueryRef.current === query) return
+    getInstalledPerfAuditBridge()?.mark('sidebar.search_results_visible', {
+      query,
+      resultCount: sortedItems.length,
+    })
+    lastMarkedSearchQueryRef.current = query
+  }, [filter, sidebarWindow?.loading, sortedItems.length])
 
   return (
     <div
@@ -674,13 +566,13 @@ export default function Sidebar({
 
       {/* Session List */}
       <div ref={listContainerRef} className="flex-1 px-2">
-        {isSearching && (
+        {sidebarWindow?.loading && filter.trim() && (
           <div className="flex items-center justify-center py-8" data-testid="search-loading">
             <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
             <span className="ml-2 text-sm text-muted-foreground">Searching...</span>
           </div>
         )}
-        {!isSearching && sortedItems.length === 0 ? (
+        {!sidebarWindow?.loading && sortedItems.length === 0 ? (
           <div className="px-2 py-8 text-center text-sm text-muted-foreground">
             {filter.trim() && searchTier !== 'title'
               ? 'No results found'
@@ -688,7 +580,7 @@ export default function Sidebar({
               ? 'No matching sessions'
               : 'No sessions yet'}
           </div>
-        ) : !isSearching ? (
+        ) : !sidebarWindow?.loading ? (
           <List
             defaultHeight={effectiveListHeight}
             rowCount={sortedItems.length}
@@ -744,7 +636,8 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
 
 export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
   const { item, isActiveTab, showProjectBadge, onClick } = props
-  const { icon: SessionIcon, label: sessionLabel } = resolveSessionTypeConfig(item.sessionType)
+  const extensionEntries = useAppSelector((s) => s.extensions?.entries)
+  const { icon: SessionIcon, label: sessionLabel } = resolveSessionTypeConfig(item.sessionType, extensionEntries)
   return (
     <Tooltip>
       <TooltipTrigger asChild>

@@ -8,17 +8,23 @@ const HOOK_TIMEOUT_MS = 30_000
 vi.setConfig({ testTimeout: TEST_TIMEOUT_MS, hookTimeout: HOOK_TIMEOUT_MS })
 
 // Mock the config-store module before importing ws-handler
-vi.mock('../../server/config-store', () => ({
-  configStore: {
-    snapshot: vi.fn().mockResolvedValue({
-      version: 1,
-      settings: {},
-      sessionOverrides: {},
-      terminalOverrides: {},
-      projectColors: {},
-    }),
-  },
+const mockConfigStore = vi.hoisted(() => ({
+  snapshot: vi.fn(),
 }))
+
+vi.mock('../../server/config-store', () => ({
+  configStore: mockConfigStore,
+}))
+
+function defaultConfigSnapshot() {
+  return {
+    version: 1,
+    settings: {},
+    sessionOverrides: {},
+    terminalOverrides: {},
+    projectColors: {},
+  }
+}
 
 function listen(server: http.Server, timeoutMs = HOOK_TIMEOUT_MS): Promise<{ port: number }> {
   return new Promise((resolve, reject) => {
@@ -104,11 +110,13 @@ class FakeBuffer {
 class FakeRegistry {
   records = new Map<string, any>()
   // Track calls for verification
+  createCalls: any[] = []
   inputCalls: { terminalId: string; data: string }[] = []
   resizeCalls: { terminalId: string; cols: number; rows: number }[] = []
   killCalls: string[] = []
 
   create(opts: any) {
+    this.createCalls.push(opts)
     const terminalId = 'term_' + Math.random().toString(16).slice(2)
     const rec = {
       terminalId,
@@ -250,7 +258,10 @@ describe('ws protocol', () => {
 
   beforeEach(() => {
     // Clear registry state between tests
+    mockConfigStore.snapshot.mockReset()
+    mockConfigStore.snapshot.mockResolvedValue(defaultConfigSnapshot())
     registry.records.clear()
+    registry.createCalls = []
     registry.inputCalls = []
     registry.resizeCalls = []
     registry.killCalls = []
@@ -295,7 +306,7 @@ describe('ws protocol', () => {
       type: 'hello',
       token: 'testtoken-testtoken',
       protocolVersion: WS_PROTOCOL_VERSION,
-      capabilities: { sessionsPatchV1: true },
+      capabilities: { uiScreenshotV1: true },
     }))
 
     const ready = await new Promise<any>((resolve) => {
@@ -376,6 +387,45 @@ describe('ws protocol', () => {
     })
 
     expect(created.terminalId).toMatch(/^term_/)
+    await closeWebSocket(ws)
+  })
+
+  it('passes persisted coding CLI provider settings into registry.create', async () => {
+    mockConfigStore.snapshot.mockResolvedValue({
+      ...defaultConfigSnapshot(),
+      settings: {
+        codingCli: {
+          providers: {
+            codex: {
+              model: 'gpt-5-codex',
+              sandbox: 'workspace-write',
+            },
+          },
+        },
+      },
+    })
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    ws.send(JSON.stringify({ type: 'hello', token: 'testtoken-testtoken', protocolVersion: WS_PROTOCOL_VERSION }))
+
+    await waitForMessage(ws, (msg) => msg.type === 'ready', 5000)
+
+    const requestId = 'req-codex-settings'
+    ws.send(JSON.stringify({ type: 'terminal.create', requestId, mode: 'codex' }))
+    await waitForMessage(
+      ws,
+      (msg) => msg.type === 'terminal.created' && msg.requestId === requestId,
+      5000,
+    )
+
+    expect(registry.createCalls).toHaveLength(1)
+    expect(registry.createCalls[0]?.providerSettings).toEqual({
+      permissionMode: undefined,
+      model: 'gpt-5-codex',
+      sandbox: 'workspace-write',
+    })
+
     await closeWebSocket(ws)
   })
 
@@ -679,11 +729,11 @@ describe('ws protocol', () => {
 
     ws.send(JSON.stringify({ type: 'terminal.kill', terminalId }))
 
-    // Wait for list.updated broadcast
+    // Wait for directory invalidation broadcast
     await new Promise<void>((resolve) => {
       ws.on('message', (data) => {
         const msg = JSON.parse(data.toString())
-        if (msg.type === 'terminal.list.updated') resolve()
+        if (msg.type === 'terminals.changed') resolve()
       })
     })
 
@@ -712,29 +762,21 @@ describe('ws protocol', () => {
     await close()
   })
 
-  it('terminal.list returns all terminals', async () => {
+  it('rejects legacy terminal.list commands', async () => {
     const { ws, close } = await createAuthenticatedConnection()
-
-    // Create two terminals
-    const terminalId1 = await createTerminal(ws, 'list-term-1')
-    const terminalId2 = await createTerminal(ws, 'list-term-2')
 
     ws.send(JSON.stringify({ type: 'terminal.list', requestId: 'list-req-1' }))
 
-    const listResponse = await new Promise<any>((resolve) => {
+    const error = await new Promise<any>((resolve) => {
       ws.on('message', (data) => {
         const msg = JSON.parse(data.toString())
-        if (msg.type === 'terminal.list.response' && msg.requestId === 'list-req-1') resolve(msg)
+        if (msg.type === 'error' && msg.requestId === 'list-req-1') resolve(msg)
       })
     })
 
-    expect(listResponse.type).toBe('terminal.list.response')
-    expect(listResponse.requestId).toBe('list-req-1')
-    expect(listResponse.terminals).toHaveLength(2)
-
-    const ids = listResponse.terminals.map((t: any) => t.terminalId)
-    expect(ids).toContain(terminalId1)
-    expect(ids).toContain(terminalId2)
+    expect(error.type).toBe('error')
+    expect(error.requestId).toBe('list-req-1')
+    expect(error.code).toBe('INVALID_MESSAGE')
 
     await close()
   })

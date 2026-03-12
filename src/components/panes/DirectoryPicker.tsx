@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react'
-import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import type { ApiError } from '@/lib/api'
 import { api } from '@/lib/api'
 import { fuzzyMatch } from '@/lib/fuzzy-match'

@@ -1,4 +1,14 @@
-import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
+import type { TokenSummary } from '@shared/ws-protocol'
+
+export type PaneRuntimeMeta = {
+  cwd?: string
+  checkoutRoot?: string
+  repoRoot?: string
+  displaySubdir?: string
+  branch?: string
+  isDirty?: boolean
+  tokenUsage?: TokenSummary
+}
 
 const tokenNumberFormatter = new Intl.NumberFormat('en-US')
 
@@ -10,7 +20,7 @@ function safeBasename(input?: string): string | undefined {
   return segments[segments.length - 1] || normalized
 }
 
-export function formatPaneRuntimeLabel(meta: TerminalMetaRecord | undefined): string | undefined {
+export function formatPaneRuntimeLabel(meta: PaneRuntimeMeta | undefined): string | undefined {
   if (!meta) return undefined
 
   const subdir = meta.displaySubdir || safeBasename(meta.checkoutRoot) || safeBasename(meta.cwd)
@@ -32,7 +42,7 @@ export function formatPaneRuntimeLabel(meta: TerminalMetaRecord | undefined): st
   return left ? `${left}  ${percent}` : percent
 }
 
-export function formatPaneRuntimeTooltip(meta: TerminalMetaRecord | undefined): string | undefined {
+export function formatPaneRuntimeTooltip(meta: PaneRuntimeMeta | undefined): string | undefined {
   if (!meta) return undefined
 
   const lines: string[] = []

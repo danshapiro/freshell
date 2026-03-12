@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, cleanup } from '@testing-library/react'
+import { render, cleanup, act } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import tabsReducer from '@/store/tabsSlice'
@@ -180,7 +180,7 @@ describe('TerminalView visibility CSS classes', () => {
     expect(wrapper.className).toContain('tab-visible')
   })
 
-  it('coalesces hidden->visible layout work into one fit/resize frame', () => {
+  it('revealing a hidden pane resumes the deferred attach without an extra layout frame', async () => {
     const pendingRaf: FrameRequestCallback[] = []
     const rafSpy = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
       pendingRaf.push(cb)
@@ -200,6 +200,9 @@ describe('TerminalView visibility CSS classes', () => {
       while (pendingRaf.length > 0) {
         pendingRaf.shift()?.(16)
       }
+      await act(async () => {
+        await Promise.resolve()
+      })
 
       const runtime = runtimeMocks.instances[0]
       runtime.fit.mockClear()
@@ -211,14 +214,18 @@ describe('TerminalView visibility CSS classes', () => {
         </Provider>
       )
 
-      expect(pendingRaf.length).toBe(1)
-      pendingRaf.shift()?.(32)
+      while (pendingRaf.length > 0) {
+        pendingRaf.shift()?.(32)
+      }
+      await act(async () => {
+        await Promise.resolve()
+      })
 
-      expect(runtime.fit).toHaveBeenCalledTimes(1)
-      const resizeMessages = wsMocks.send.mock.calls
-        .map((call) => call[0] as { type?: string; terminalId?: string })
-        .filter((msg) => msg.type === 'terminal.resize' && msg.terminalId === 'term-1')
-      expect(resizeMessages).toHaveLength(1)
+      const attachMessages = wsMocks.send.mock.calls
+        .map((call) => call[0] as { type?: string; terminalId?: string; sinceSeq?: number })
+        .filter((msg) => msg.type === 'terminal.attach' && msg.terminalId === 'term-1')
+      expect(attachMessages).toHaveLength(1)
+      expect(attachMessages[0]?.sinceSeq).toBe(0)
     } finally {
       rafSpy.mockRestore()
       cancelRafSpy.mockRestore()

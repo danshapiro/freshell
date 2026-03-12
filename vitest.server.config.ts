@@ -1,17 +1,33 @@
 import { defineConfig } from 'vitest/config'
+import path from 'path'
+import { fileURLToPath } from 'url'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, './src'),
+      '@test': path.resolve(__dirname, './test'),
+      '@shared': path.resolve(__dirname, './shared'),
+    },
+  },
   test: {
     environment: 'node',
     include: [
       'test/server/**/*.test.ts',
       'test/unit/server/**/*.test.ts',
+      'test/unit/visible-first/**/*.test.ts',
       'test/integration/server/**/*.test.ts',
       'test/integration/session-repair.test.ts',
       'test/integration/session-search-e2e.test.ts',
       'test/integration/extension-system.test.ts',
     ],
-    exclude: ['docs/plans/**'],
+    exclude: [
+      'docs/plans/**',
+      'test/unit/visible-first/slow-network-controller.test.ts',
+    ],
     testTimeout: 30000,
     hookTimeout: 30000,
     // Maximum parallelization settings

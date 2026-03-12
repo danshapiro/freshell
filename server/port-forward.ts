@@ -61,12 +61,10 @@ export class PortForwardManager {
       return { port: existing.localPort }
     }
 
-    // Deduplicate concurrent requests for the same (targetPort, requesterKey)
     const inflightKey = `${targetPort}:${requester.key}`
     const pending = this.inflight.get(inflightKey)
     if (pending) return pending
 
-    // Enforce maximum forwards limit
     if (this.activeForwardCount() >= this.maxForwards) {
       throw new Error(
         `Maximum port forwards (${this.maxForwards}) reached. Close unused forwards first.`,
@@ -75,8 +73,7 @@ export class PortForwardManager {
 
     const promise = new Promise<{ port: number }>((resolve, reject) => {
       const server = net.createServer((clientSocket) => {
-        const entry =
-          this.forwards.get(targetPort)?.get(requester.key) ?? null
+        const entry = this.forwards.get(targetPort)?.get(requester.key) ?? null
         const clientIp = normalizeIp(clientSocket.remoteAddress)
 
         if (!entry || !clientIp || !entry.allowedIps.has(clientIp)) {
@@ -113,7 +110,6 @@ export class PortForwardManager {
 
         clientSocket.on('error', cleanup)
         targetSocket.on('error', (err) => {
-          // Propagate target errors to the client so it sees the failure
           clientSocket.destroy(err)
           targetSocket.destroy()
           entry.connections.delete(clientSocket)
@@ -131,8 +127,6 @@ export class PortForwardManager {
         }
       })
 
-      // Listen on port 0 → OS assigns an available port.
-      // Bind to 0.0.0.0 so remote clients can reach it.
       server.listen(0, '0.0.0.0', () => {
         resolved = true
         const addr = server.address() as net.AddressInfo
@@ -178,27 +172,26 @@ export class PortForwardManager {
   }
 
   /** Close a single forward by target port and requester key. */
-  close(targetPort: number, requesterKey?: string): Promise<void> {
+  async close(targetPort: number, requesterKey?: string): Promise<void> {
     const targetMap = this.forwards.get(targetPort)
-    if (!targetMap) return Promise.resolve()
+    if (!targetMap) return
 
     if (requesterKey) {
       const entry = targetMap.get(requesterKey)
-      if (!entry) return Promise.resolve()
-      return this.closeEntry(targetPort, entry, targetMap).then(() => {
-        if (targetMap.size === 0) {
-          this.forwards.delete(targetPort)
-        }
-      })
-    }
-
-    return Promise.all(
-      [...targetMap.values()].map((entry) => this.closeEntry(targetPort, entry, targetMap)),
-    ).then(() => {
+      if (!entry) return
+      await this.closeEntry(targetPort, entry, targetMap)
       if (targetMap.size === 0) {
         this.forwards.delete(targetPort)
       }
-    })
+      return
+    }
+
+    await Promise.all(
+      [...targetMap.values()].map((entry) => this.closeEntry(targetPort, entry, targetMap)),
+    )
+    if (targetMap.size === 0) {
+      this.forwards.delete(targetPort)
+    }
   }
 
   /** Close all active forwards and stop the idle-cleanup timer. */
@@ -237,7 +230,6 @@ export class PortForwardManager {
       }
     }, 60_000)
 
-    // Don't let the timer keep the process alive
     if (this.cleanupTimer.unref) {
       this.cleanupTimer.unref()
     }
@@ -250,7 +242,7 @@ export class PortForwardManager {
     }
   }
 
-  private closeEntry(
+  private async closeEntry(
     targetPort: number,
     entry: ForwardEntry,
     targetMap: Map<string, ForwardEntry>,
@@ -260,15 +252,11 @@ export class PortForwardManager {
     }
     entry.connections.clear()
     targetMap.delete(entry.requesterKey)
-    log.info(
-      {
-        targetPort,
-        localPort: entry.localPort,
-        requesterIp: entry.requesterIp,
-      },
-      'Port forward closed',
-    )
-    return new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
+      if (!entry.server.listening) {
+        resolve()
+        return
+      }
       entry.server.close((err) => {
         if (err) {
           reject(err)
@@ -277,6 +265,14 @@ export class PortForwardManager {
         resolve()
       })
     })
+    log.info(
+      {
+        targetPort,
+        localPort: entry.localPort,
+        requesterIp: entry.requesterIp,
+      },
+      'Port forward closed',
+    )
   }
 
   private async closeEntrySafely(

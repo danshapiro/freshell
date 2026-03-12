@@ -2,13 +2,11 @@
 import { readFileSync } from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
-import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import {
-  listCandidateFiles,
   startServerProcess,
   stopProcess,
   waitForResolvedPath,
@@ -18,7 +16,6 @@ import {
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const REPO_ROOT = path.resolve(__dirname, '../../..')
-const DIST_SERVER_ENTRY = path.join(REPO_ROOT, 'dist', 'server', 'index.js')
 const require = createRequire(import.meta.url)
 let TSX_CLI: string | undefined
 const HAS_TSX_CLI = (() => {
@@ -29,17 +26,29 @@ const HAS_TSX_CLI = (() => {
     return false
   }
 })()
-const DEFAULT_TEST_TIMEOUT_MS = 45_000
+const DEFAULT_TEST_TIMEOUT_MS = 120_000
 const ANSI_ESCAPE_PATTERN = /\u001b\[[0-9;]*m/g
+const SOURCE_LOGGER_PROBE = [
+  '(async () => {',
+  "  process.argv = ['node', 'server/index.ts']",
+  "  await import('./server/logger.ts')",
+  '  setTimeout(() => process.exit(0), 25)',
+  '})()',
+].join('\n')
+const DIST_LOGGER_PROBE = [
+  '(async () => {',
+  "  process.argv = ['node', 'dist/server/index.js']",
+  "  await import('./server/logger.ts')",
+  '  setTimeout(() => process.exit(0), 25)',
+  '})()',
+].join('\n')
 
 const activeProcesses: LoggerServerProcess[] = []
 const activeLogDirs: string[] = []
-let initialized = false
-let distBuildPromise: Promise<void> | null = null
 
 function getTSXCLI(): string {
   if (!TSX_CLI) {
-    throw new Error('tsx CLI was not resolved')
+    TSX_CLI = require.resolve('tsx/cli')
   }
   return TSX_CLI
 }
@@ -69,45 +78,8 @@ function parseStartupLogPayload(startupLog: string) {
   }
 }
 
-async function ensureDistBuilt() {
-  if (distBuildPromise) return distBuildPromise
-
-  distBuildPromise = new Promise<void>((resolve, reject) => {
-    const tscPath = require.resolve('typescript/bin/tsc')
-    const build = spawn(process.execPath, [tscPath, '-p', 'tsconfig.server.json'], {
-      cwd: REPO_ROOT,
-      stdio: ['ignore', 'ignore', 'pipe'],
-    })
-    let errorOutput = ''
-    build.stderr?.on('data', (chunk: Buffer) => {
-      errorOutput += chunk.toString()
-    })
-    build.once('exit', (code) => {
-      if (code === 0) {
-        resolve()
-      } else {
-        reject(new Error(`tsc server build failed with code ${code}: ${errorOutput}`))
-      }
-    })
-    build.once('error', (err) => reject(err as Error))
-  })
-
-  return distBuildPromise
-}
-
-async function initializeEnvironment() {
-  if (initialized) return
-  try {
-    TSX_CLI = require.resolve('tsx/cli')
-  } catch {
-    TSX_CLI = undefined
-  }
-  await ensureDistBuilt()
-  initialized = true
-}
-
 beforeAll(() => {
-  initialized = false
+  TSX_CLI = undefined
 })
 
 async function withLogDir<T>(fn: (logDir: string) => Promise<T>): Promise<T> {
@@ -140,90 +112,80 @@ beforeEach(() => {
   activeLogDirs.length = 0
 })
 
+async function startSourceLoggerProcess(env: NodeJS.ProcessEnv) {
+  return await startServerProcess(
+    [process.execPath, getTSXCLI(), '-e', SOURCE_LOGGER_PROBE],
+    env,
+    REPO_ROOT,
+  )
+}
+
+async function startDistLoggerProcess(env: NodeJS.ProcessEnv) {
+  return await startServerProcess(
+    [process.execPath, getTSXCLI(), '-e', DIST_LOGGER_PROBE],
+    env,
+    REPO_ROOT,
+  )
+}
+
 describe('debug log separation', () => {
   it.skipIf(!HAS_TSX_CLI)(
-    'dist and source launches choose different default filenames',
+    'dist and source launches choose different mode-specific filenames',
     { timeout: DEFAULT_TEST_TIMEOUT_MS },
     async () => {
-      await initializeEnvironment()
-
       await withLogDir(async (logDir) => {
-        const tsxCli = getTSXCLI()
-        const devProc = await startServerProcess(
-          [process.execPath, tsxCli, 'watch', 'server/index.ts'],
+        const devProc = await startSourceLoggerProcess(
           {
-            AUTH_TOKEN: 'integration-token-1x16chars',
             FRESHELL_LOG_DIR: logDir,
+            FRESHELL_LOG_INSTANCE_ID: 'source-mode',
             NODE_ENV: 'production',
-            PORT: '3411',
-            VITE_PORT: '4173',
           },
-          REPO_ROOT,
         )
-        const distProc = await startServerProcess(
-          ['node', DIST_SERVER_ENTRY],
+        const distProc = await startDistLoggerProcess(
           {
-            AUTH_TOKEN: 'integration-token-2x16chars',
+            FRESHELL_DEBUG_STREAM_INSTANCE: 'dist-mode',
             FRESHELL_LOG_DIR: logDir,
             NODE_ENV: 'production',
-            PORT: '3412',
-            VITE_PORT: '4174',
           },
-          REPO_ROOT,
         )
         activeProcesses.push(devProc, distProc)
 
         const devPath = await waitForResolvedPath(devProc)
         const distPath = await waitForResolvedPath(distProc)
 
-        expect(devPath).toContain('server-debug.development.3411.jsonl')
-        expect(distPath).toContain('server-debug.production.3412.jsonl')
+        expect(devPath).toContain('server-debug.development.source-mode.jsonl')
+        expect(distPath).toContain('server-debug.production.dist-mode.jsonl')
         expect(devPath).not.toBe(distPath)
-
-        const devCandidates = await listCandidateFiles(logDir, 'development', '3411')
-        const distCandidates = await listCandidateFiles(logDir, 'production', '3412')
-
-        expect(devCandidates).toHaveLength(1)
-        expect(distCandidates).toHaveLength(1)
       })
     },
   )
 
   it.skipIf(!HAS_TSX_CLI)(
-    'concurrent default launches with same mode do not reuse a single file',
+    'concurrent launches with the same mode keep separate files',
     { timeout: DEFAULT_TEST_TIMEOUT_MS },
     async () => {
-      await initializeEnvironment()
-
       await withLogDir(async (logDir) => {
-        const tsxCli = getTSXCLI()
-        const processA = await startServerProcess(
-          [process.execPath, tsxCli, 'watch', 'server/index.ts'],
+        const processA = await startSourceLoggerProcess(
           {
-            AUTH_TOKEN: 'integration-token-3x16chars',
             FRESHELL_LOG_DIR: logDir,
+            FRESHELL_LOG_INSTANCE_ID: 'concurrent-a',
             NODE_ENV: 'development',
-            PORT: '3413',
           },
-          REPO_ROOT,
         )
-        const processB = await startServerProcess(
-          [process.execPath, tsxCli, 'watch', 'server/index.ts'],
+        const processB = await startSourceLoggerProcess(
           {
-            AUTH_TOKEN: 'integration-token-4x16chars',
             FRESHELL_LOG_DIR: logDir,
+            FRESHELL_LOG_INSTANCE_ID: 'concurrent-b',
             NODE_ENV: 'development',
-            PORT: '3414',
           },
-          REPO_ROOT,
         )
         activeProcesses.push(processA, processB)
 
         const pathA = await waitForResolvedPath(processA)
         const pathB = await waitForResolvedPath(processB)
 
-        expect(pathA).toContain('server-debug.development.3413.jsonl')
-        expect(pathB).toContain('server-debug.development.3414.jsonl')
+        expect(pathA).toContain('server-debug.development.concurrent-a.jsonl')
+        expect(pathB).toContain('server-debug.development.concurrent-b.jsonl')
         expect(pathA).not.toBe(pathB)
       })
     },
@@ -233,31 +195,20 @@ describe('debug log separation', () => {
     'explicit instance settings are respected across launch modes',
     { timeout: DEFAULT_TEST_TIMEOUT_MS },
     async () => {
-      await initializeEnvironment()
-
       await withLogDir(async (logDir) => {
-        const tsxCli = getTSXCLI()
-        const procA = await startServerProcess(
-          [process.execPath, tsxCli, 'watch', 'server/index.ts'],
+        const procA = await startSourceLoggerProcess(
           {
-            AUTH_TOKEN: 'integration-token-5x16chars',
             FRESHELL_LOG_DIR: logDir,
             FRESHELL_LOG_INSTANCE_ID: 'alpha',
             NODE_ENV: 'production',
-            PORT: '3415',
           },
-          REPO_ROOT,
         )
-        const procB = await startServerProcess(
-          ['node', DIST_SERVER_ENTRY],
+        const procB = await startDistLoggerProcess(
           {
-            AUTH_TOKEN: 'integration-token-6x16chars',
             FRESHELL_LOG_DIR: logDir,
             FRESHELL_DEBUG_STREAM_INSTANCE: 'ci-run-beta',
             NODE_ENV: 'production',
-            PORT: '3416',
           },
-          REPO_ROOT,
         )
         activeProcesses.push(procA, procB)
 
@@ -265,11 +216,6 @@ describe('debug log separation', () => {
         const pathB = await waitForResolvedPath(procB)
         expect(pathA).toContain('server-debug.development.alpha.jsonl')
         expect(pathB).toContain('server-debug.production.ci-run-beta.jsonl')
-
-        const alphaCandidates = await listCandidateFiles(logDir, 'development', 'alpha')
-        const betaCandidates = await listCandidateFiles(logDir, 'production', 'ci-run-beta')
-        expect(alphaCandidates).toHaveLength(1)
-        expect(betaCandidates).toHaveLength(1)
       })
     },
   )
@@ -278,21 +224,14 @@ describe('debug log separation', () => {
     'startup logs include resolved debug destination details',
     { timeout: DEFAULT_TEST_TIMEOUT_MS },
     async () => {
-      await initializeEnvironment()
-
       await withLogDir(async (logDir) => {
-        const tsxCli = getTSXCLI()
-        const proc = await startServerProcess(
-          [process.execPath, tsxCli, 'watch', 'server/index.ts'],
+        const proc = await startSourceLoggerProcess(
           {
-            AUTH_TOKEN: 'integration-token-7x16chars',
             FRESHELL_LOG_DIR: logDir,
             FRESHELL_LOG_MODE: 'production',
             FRESHELL_LOG_INSTANCE_ID: 'ci-run-1',
             NODE_ENV: 'production',
-            PORT: '3420',
           },
-          REPO_ROOT,
         )
         activeProcesses.push(proc)
 

@@ -61,7 +61,7 @@ describe('SessionView', () => {
     expect(screen.getByText(/test prompt/)).toBeInTheDocument()
   })
 
-  it('connects the websocket on mount', async () => {
+  it('subscribes to websocket messages on mount without opening a new connection', async () => {
     const store = createTestStore()
     render(
       <Provider store={store}>
@@ -69,7 +69,8 @@ describe('SessionView', () => {
       </Provider>
     )
 
-    await waitFor(() => expect(mockConnect).toHaveBeenCalled())
+    await waitFor(() => expect(mockOnMessage).toHaveBeenCalled())
+    expect(mockConnect).not.toHaveBeenCalled()
   })
 
   it('renders message events', () => {

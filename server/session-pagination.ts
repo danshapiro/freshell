@@ -24,6 +24,7 @@ export interface PaginateOptions {
    * whose composite key sorts before this value.
    */
   beforeId?: string
+  forceIncludeSessionKeys?: ReadonlySet<string>
 }
 
 /** Build the composite cursor key for a session. */
@@ -93,9 +94,16 @@ export function paginateProjects(
   // Sort by updatedAt descending, ties broken by composite key descending
   allSessions.sort(compareSessionsDesc)
 
-  // Take top N
-  const hasMore = allSessions.length > limit
-  const page = allSessions.slice(0, limit)
+  const primaryPage = allSessions.slice(0, limit)
+  const primaryKeys = new Set(primaryPage.map(cursorKey))
+  const forcedExtras = before === undefined && options.forceIncludeSessionKeys?.size
+    ? allSessions.filter((session) => (
+      options.forceIncludeSessionKeys!.has(cursorKey(session)) && !primaryKeys.has(cursorKey(session))
+    ))
+    : []
+  const page = [...primaryPage, ...forcedExtras].sort(compareSessionsDesc)
+  const pageKeys = new Set(page.map(cursorKey))
+  const hasMore = allSessions.some((session) => !pageKeys.has(cursorKey(session)))
 
   // Regroup by project path
   const groupMap = new Map<string, CodingCliSession[]>()
@@ -115,7 +123,7 @@ export function paginateProjects(
     projects.push({ projectPath: path, sessions, ...(color ? { color } : {}) })
   }
 
-  const oldest = page.length > 0 ? page[page.length - 1] : undefined
+  const oldest = primaryPage.length > 0 ? primaryPage[primaryPage.length - 1] : undefined
 
   return {
     projects,

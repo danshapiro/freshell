@@ -4,9 +4,7 @@ import type { ProjectGroup } from '../../../../server/coding-cli/types.js'
 
 function createWsMocks() {
   return {
-    broadcastSessionsPatch: vi.fn(),
-    broadcastSessionsUpdatedToLegacy: vi.fn(),
-    broadcastSessionsUpdated: vi.fn(),
+    broadcastSessionsChanged: vi.fn(),
   }
 }
 
@@ -30,12 +28,11 @@ describe('SessionsSyncService', () => {
     const a = [createProject('/p1', 1)]
     svc.publish(a)
 
-    expect(ws.broadcastSessionsPatch).toHaveBeenCalledTimes(1)
-    expect(ws.broadcastSessionsUpdatedToLegacy).toHaveBeenCalledTimes(1)
-    expect(ws.broadcastSessionsUpdated).not.toHaveBeenCalled()
+    expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(1)
+    expect(ws.broadcastSessionsChanged).toHaveBeenLastCalledWith(1)
 
     vi.advanceTimersByTime(151)
-    expect(ws.broadcastSessionsPatch).toHaveBeenCalledTimes(1)
+    expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(1)
   })
 
   it('coalesces rapid publishes into one trailing flush with latest state', () => {
@@ -51,11 +48,10 @@ describe('SessionsSyncService', () => {
     svc.publish(b)
     svc.publish(c)
 
-    expect(ws.broadcastSessionsPatch).toHaveBeenCalledTimes(1)
+    expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(1)
     vi.advanceTimersByTime(150)
-    expect(ws.broadcastSessionsPatch).toHaveBeenCalledTimes(2)
-    const trailingPatch = ws.broadcastSessionsPatch.mock.calls[1][0]
-    expect(trailingPatch.upsertProjects[0].sessions[0].updatedAt).toBe(3)
+    expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(2)
+    expect(ws.broadcastSessionsChanged).toHaveBeenLastCalledWith(2)
   })
 
   it('emits one trailing publish per window while burst updates continue', () => {
@@ -76,9 +72,8 @@ describe('SessionsSyncService', () => {
     svc.publish(d)
     vi.advanceTimersByTime(150)
 
-    expect(ws.broadcastSessionsPatch).toHaveBeenCalledTimes(3)
-    const secondWindowPatch = ws.broadcastSessionsPatch.mock.calls[2][0]
-    expect(secondWindowPatch.upsertProjects[0].sessions[0].updatedAt).toBe(4)
+    expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(3)
+    expect(ws.broadcastSessionsChanged).toHaveBeenLastCalledWith(3)
   })
 
   it('shutdown clears pending trailing timer and state', () => {
@@ -91,11 +86,11 @@ describe('SessionsSyncService', () => {
 
     svc.publish(a)
     svc.publish(b)
-    expect(ws.broadcastSessionsPatch).toHaveBeenCalledTimes(1)
+    expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(1)
 
     svc.shutdown()
     vi.advanceTimersByTime(1_000)
-    expect(ws.broadcastSessionsPatch).toHaveBeenCalledTimes(1)
+    expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(1)
   })
 
   it('disables coalescing when coalesceMs is zero', () => {
@@ -106,8 +101,7 @@ describe('SessionsSyncService', () => {
     svc.publish([createProject('/p1', 2)])
     svc.publish([createProject('/p1', 3)])
 
-    expect(ws.broadcastSessionsPatch).toHaveBeenCalledTimes(3)
-    expect(ws.broadcastSessionsUpdatedToLegacy).toHaveBeenCalledTimes(3)
+    expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(3)
   })
 
   it('suppresses no-change trailing flushes (A->B->A), updates baseline, and stops timer', () => {
@@ -123,33 +117,35 @@ describe('SessionsSyncService', () => {
     svc.publish(b)
     svc.publish(aAgain)
 
-    expect(ws.broadcastSessionsPatch).toHaveBeenCalledTimes(1)
+    expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(1)
     vi.advanceTimersByTime(150)
-    expect(ws.broadcastSessionsPatch).toHaveBeenCalledTimes(1)
+    expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(1)
 
     vi.advanceTimersByTime(500)
-    expect(ws.broadcastSessionsPatch).toHaveBeenCalledTimes(1)
+    expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(1)
 
     svc.publish(b)
-    expect(ws.broadcastSessionsPatch).toHaveBeenCalledTimes(2)
+    expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(2)
   })
 
-  it('falls back to sessions.updated when sessions.patch payload exceeds configured max', () => {
-    const originalMax = process.env.MAX_WS_CHUNK_BYTES
-    process.env.MAX_WS_CHUNK_BYTES = '1'
+  it('broadcasts the same lightweight invalidation even when the changed snapshot is large', () => {
+    const ws = createWsMocks()
+    const svc = new SessionsSyncService(ws as any, { coalesceMs: 0 })
 
-    try {
-      const ws = createWsMocks()
-      const svc = new SessionsSyncService(ws as any, { coalesceMs: 0 })
+    svc.publish([
+      {
+        projectPath: '/p1',
+        sessions: Array.from({ length: 200 }, (_, index) => ({
+          provider: 'claude',
+          sessionId: `s-${index}`,
+          projectPath: '/p1',
+          updatedAt: index,
+          summary: 'x'.repeat(2_000),
+        })),
+      },
+    ])
 
-      svc.publish([createProject('/p1', 1)])
-
-      expect(ws.broadcastSessionsUpdated).toHaveBeenCalledTimes(1)
-      expect(ws.broadcastSessionsPatch).not.toHaveBeenCalled()
-      expect(ws.broadcastSessionsUpdatedToLegacy).not.toHaveBeenCalled()
-    } finally {
-      if (typeof originalMax === 'string') process.env.MAX_WS_CHUNK_BYTES = originalMax
-      else delete process.env.MAX_WS_CHUNK_BYTES
-    }
+    expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(1)
+    expect(ws.broadcastSessionsChanged).toHaveBeenLastCalledWith(1)
   })
 })

@@ -1,0 +1,18 @@
+[Unit]
+Description=Freshell Terminal Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={{NODE_BINARY}} {{SERVER_ENTRY}}
+Environment=PORT={{PORT}}
+Environment=NODE_PATH={{NODE_PATH}}
+Environment=NODE_ENV=production
+Environment=FRESHELL_CONFIG_DIR={{CONFIG_DIR}}
+StandardOutput=append:{{LOG_DIR}}/server-stdout.log
+StandardError=append:{{LOG_DIR}}/server-stderr.log
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

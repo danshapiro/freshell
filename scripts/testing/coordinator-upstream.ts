@@ -41,10 +41,11 @@ export async function runUpstreamPhase(
 
 function resolveSpawnSpec(phase: UpstreamPhase, envVars: NodeJS.ProcessEnv): { command: string; args: string[]; selector: string } {
   if (phase.runner === 'npm') {
+    const forwardedArgs = phase.args.length > 0 ? ['--', ...phase.args] : []
     return {
       command: process.platform === 'win32' ? 'npm.cmd' : 'npm',
-      args: ['run', phase.script, ...phase.args],
-      selector: `npm:${phase.script}`,
+      args: ['run', phase.script, ...forwardedArgs],
+      selector: `npm:${phase.script}${phase.args.length > 0 ? ` ${phase.args.join(' ')}` : ''}`,
     }
   }
 

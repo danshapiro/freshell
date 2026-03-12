@@ -35,6 +35,8 @@ vi.mock('@/lib/api', () => ({
     patch: (url: string, data: any) => mockApiPatch(url, data),
     post: vi.fn().mockResolvedValue({}),
   },
+  fetchSidebarSessionsSnapshot: vi.fn().mockResolvedValue([]),
+  isApiUnauthorizedError: (err: any) => !!err && typeof err === 'object' && err.status === 401,
 }))
 
 // Mock heavy child components to avoid xterm/canvas issues
@@ -79,6 +81,10 @@ vi.mock('@/components/OverviewView', () => ({
 // Mock the useThemeEffect hook
 vi.mock('@/hooks/useTheme', () => ({
   useThemeEffect: () => {},
+}))
+
+vi.mock('@/store/tabRegistrySync', () => ({
+  startTabRegistrySync: () => () => {},
 }))
 vi.mock('@/components/SetupWizard', () => ({
   SetupWizard: () => <div data-testid="mock-setup-wizard">Setup Wizard</div>,

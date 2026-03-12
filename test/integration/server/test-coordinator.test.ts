@@ -353,7 +353,7 @@ describe('test coordinator CLI', () => {
         FRESHELL_TEST_SUMMARY: 'Nightly full suite',
         FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
         FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
-          'vitest:default:run': { holdMs: 1_000 },
+          'npm:test:balanced': { holdMs: 1_000 },
         }),
       },
     )
@@ -417,7 +417,7 @@ describe('test coordinator CLI', () => {
         FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
         FRESHELL_TEST_COORDINATOR_POLL_MS: '50',
         FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
-          'vitest:default:run': { holdMs: 5_000 },
+          'npm:test:balanced': { holdMs: 5_000 },
         }),
       },
     )
@@ -476,8 +476,7 @@ describe('test coordinator CLI', () => {
     const captures = await readCaptureLines(captureFile)
     expect(captures.map((entry) => entry.selector)).toEqual([
       'npm:typecheck',
-      'vitest:default:run',
-      'vitest:server:run --config vitest.server.config.ts',
+      'npm:test:balanced',
     ])
     const commandRuns = await readCommandRuns(fixture.storeDir)
     const suiteRuns = await readSuiteRuns(fixture.storeDir)
@@ -507,7 +506,7 @@ describe('test coordinator CLI', () => {
           FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
           FRESHELL_TEST_COORDINATOR_POLL_MS: '50',
           FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
-            'vitest:default:run': { holdMs: 1_500 },
+            'npm:test:balanced': { holdMs: 1_500 },
           }),
         },
       )
@@ -522,7 +521,7 @@ describe('test coordinator CLI', () => {
           FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
           FRESHELL_TEST_COORDINATOR_POLL_MS: '50',
           FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
-            'vitest:default:run': { holdMs: 1_000 },
+            'npm:test:balanced': { holdMs: 1_000 },
           }),
         },
       )
@@ -902,7 +901,7 @@ describe('test coordinator CLI', () => {
       {
         FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
         FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
-          'vitest:default:run': { holdMs: 20_000 },
+          'npm:test:balanced': { holdMs: 20_000 },
         }),
       },
     )
@@ -962,10 +961,7 @@ describe('test coordinator CLI', () => {
     {
       commandKey: 'test',
       forwardedArgs: ['--bail', '1'],
-      selectors: [
-        'vitest:default:run --bail 1',
-        'vitest:server:run --config vitest.server.config.ts --bail 1',
-      ],
+      selectors: ['npm:test:balanced --bail 1'],
       expectedSuiteKey: 'full-suite',
       expectReusableSuccess: true,
     },
@@ -974,8 +970,7 @@ describe('test coordinator CLI', () => {
       forwardedArgs: ['--changed', 'origin/main'],
       selectors: [
         'npm:typecheck',
-        'vitest:default:run --changed origin/main',
-        'vitest:server:run --config vitest.server.config.ts --changed origin/main',
+        'npm:test:balanced --changed origin/main',
       ],
       expectedSuiteKey: undefined,
       expectReusableSuccess: false,
@@ -1074,26 +1069,17 @@ describe('test coordinator CLI', () => {
   it.each([
     {
       forwardedArgs: ['test'],
-      selectors: [
-        'vitest:default:run test',
-        'vitest:server:run --config vitest.server.config.ts test',
-      ],
+      selectors: ['npm:test:balanced test'],
       expectedSuiteKey: 'full-suite',
     },
     {
       forwardedArgs: ['test/unit'],
-      selectors: [
-        'vitest:default:run test/unit',
-        'vitest:server:run --config vitest.server.config.ts test/unit',
-      ],
+      selectors: ['npm:test:balanced test/unit'],
       expectedSuiteKey: undefined,
     },
     {
       forwardedArgs: ['test/integration'],
-      selectors: [
-        'vitest:default:run test/integration',
-        'vitest:server:run --config vitest.server.config.ts test/integration',
-      ],
+      selectors: ['npm:test:balanced test/integration'],
       expectedSuiteKey: undefined,
     },
   ])('splits cross-config composite directory selectors truthfully for %j', async ({
@@ -1165,7 +1151,7 @@ describe('test coordinator CLI', () => {
         FRESHELL_TEST_SUMMARY: 'Long-running holder',
         FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
         FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify({
-          'vitest:default:run': { holdMs: 10_000 },
+          'npm:test:balanced': { holdMs: 10_000 },
         }),
       },
     )

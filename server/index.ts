@@ -1,6 +1,11 @@
 import { detectLanIps } from './bootstrap.js' // Must be first - ensures .env exists before dotenv loads
 import 'dotenv/config'
 import { setupWslPortForwarding } from './wsl-port-forward.js'
+import {
+  shouldSetupWslPortForwardingAtStartup,
+  WSL_PORT_FORWARD_DISABLE_ENV,
+  wslPortForwardStartupDisabled,
+} from './wsl-port-forward-startup.js'
 import express from 'express'
 import fs from 'fs'
 import http from 'http'
@@ -8,22 +13,24 @@ import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import rateLimit from 'express-rate-limit'
-import { logger, setLogLevel } from './logger.js'
+import { logger, resolveRuntimeLogLevel, setLogLevel } from './logger.js'
 import { requestLogger } from './request-logger.js'
 import { validateStartupSecurity, httpAuthMiddleware } from './auth.js'
 import { configStore } from './config-store.js'
-import { TerminalRegistry, type TerminalRecord } from './terminal-registry.js'
+import { TerminalRegistry, type TerminalRecord, registerCodingCliCommands, type CodingCliCommandSpec } from './terminal-registry.js'
 import { WsHandler } from './ws-handler.js'
 import { SessionsSyncService } from './sessions-sync/service.js'
 import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
 import { CodingCliSessionManager } from './coding-cli/session-manager.js'
+import { wireCodexActivityTracker } from './coding-cli/codex-activity-wiring.js'
 import { claudeProvider } from './coding-cli/providers/claude.js'
 import { codexProvider } from './coding-cli/providers/codex.js'
+import { opencodeProvider } from './coding-cli/providers/opencode.js'
 import { type CodingCliProviderName, type CodingCliSession } from './coding-cli/types.js'
 import { TerminalMetadataService } from './terminal-metadata-service.js'
-import { migrateSettingsSortMode } from './settings-migrate.js'
+import { migrateLegacyDefaultEnabledProviders, migrateSettingsSortMode } from './settings-migrate.js'
 import { createFilesRouter } from './files-router.js'
-import { createPlatformRouter } from './platform-router.js'
+import { createPlatformRouter, detectFeatureFlags } from './platform-router.js'
 import { createProxyRouter } from './proxy-router.js'
 import { createLocalFileRouter } from './local-file-router.js'
 import { createTerminalsRouter } from './terminals-router.js'
@@ -35,7 +42,7 @@ import { SdkBridge } from './sdk-bridge.js'
 import { createClientLogsRouter } from './client-logs.js'
 import { createStartupState } from './startup-state.js'
 import { getPerfConfig, initPerfLogging, setPerfLoggingEnabled, withPerfSpan } from './perf-logger.js'
-import { detectPlatform, detectAvailableClis, detectHostName } from './platform.js'
+import { detectPlatform, detectAvailableClis, detectHostName, type CliDetectionSpec } from './platform.js'
 import { resolveVisitPort } from './startup-url.js'
 import { NetworkManager } from './network-manager.js'
 import { getNetworkHost } from './get-network-host.js'
@@ -53,7 +60,21 @@ import { LayoutStore } from './agent-api/layout-store.js'
 import { createAgentApiRouter } from './agent-api/router.js'
 import { ExtensionManager } from './extension-manager.js'
 import { createExtensionRouter } from './extension-routes.js'
+import { createServerInfoRouter } from './server-info-router.js'
 import { SessionMetadataStore } from './session-metadata-store.js'
+import { createShellBootstrapRouter } from './shell-bootstrap-router.js'
+import { loadSessionHistory } from './session-history-loader.js'
+import { createAgentTimelineService } from './agent-timeline/service.js'
+import { createAgentTimelineRouter } from './agent-timeline/router.js'
+import { createTerminalViewService } from './terminal-view/service.js'
+
+function compileArgTemplate(
+  template: string[] | undefined,
+  placeholder: string,
+): ((value: string) => string[]) | undefined {
+  if (!template) return undefined
+  return (value: string) => template.map((arg) => arg.replaceAll(placeholder, value))
+}
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -73,6 +94,7 @@ function findPackageJson(): string {
 
 const packageJson = JSON.parse(fs.readFileSync(findPackageJson(), 'utf-8'))
 const APP_VERSION: string = packageJson.version
+const SERVER_STARTED_AT = Date.now()
 const log = logger.child({ component: 'server' })
 const perfConfig = getPerfConfig()
 
@@ -123,9 +145,33 @@ async function main() {
   )
 
   app.use('/api', httpAuthMiddleware)
+  // Shell bootstrap route: returns shell-critical first-paint data only
+  app.use('/api', createShellBootstrapRouter({
+    getSettings: async () => migrateSettingsSortMode(await configStore.getSettings()),
+    getPlatform: async () => {
+      const [platform, availableClis, hostName] = await Promise.all([
+        detectPlatform(),
+        detectAvailableClis(cliDetectionSpecs),
+        detectHostName(),
+      ])
+      return {
+        platform,
+        availableClis,
+        hostName,
+        featureFlags: detectFeatureFlags(),
+      }
+    },
+    getShellTaskStatus: async () => startupState.snapshot().tasks,
+    getPerfLogging: () => perfConfig.enabled,
+    getConfigFallback: async () => {
+      const readError = configStore.getLastReadError()
+      if (!readError) return undefined
+      return { reason: readError, backupExists: await configStore.backupExists() }
+    },
+  }))
   app.use('/api', createClientLogsRouter())
 
-  const codingCliProviders = [claudeProvider, codexProvider]
+  const codingCliProviders = [claudeProvider, codexProvider, opencodeProvider]
   const freshellConfigDir = path.join(os.homedir(), '.freshell')
   const sessionMetadataStore = new SessionMetadataStore(freshellConfigDir)
   const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders, {}, sessionMetadataStore)
@@ -136,6 +182,7 @@ async function main() {
   const registry = new TerminalRegistry(settings)
   const terminalMetadata = new TerminalMetadataService()
   const layoutStore = new LayoutStore()
+  const codexActivity = wireCodexActivityTracker({ registry, codingCliIndexer })
 
   const sessionRepairService = getSessionRepairService()
   const serverInstanceId = await loadOrCreateServerInstanceId()
@@ -145,7 +192,79 @@ async function main() {
   const extensionManager = new ExtensionManager()
   const userExtDir = path.join(os.homedir(), '.freshell', 'extensions')
   const localExtDir = path.join(process.cwd(), '.freshell', 'extensions')
-  extensionManager.scan([userExtDir, localExtDir])
+  const builtinExtDir = path.join(process.cwd(), 'extensions')
+  extensionManager.scan([userExtDir, localExtDir, builtinExtDir])
+
+  // Build CLI commands from extension manifests
+  const cliCommandsMap = new Map<string, CodingCliCommandSpec>()
+  for (const ext of extensionManager.getAll()) {
+    if (ext.manifest.category !== 'cli' || !ext.manifest.cli) continue
+    const cli = ext.manifest.cli
+    const spec: CodingCliCommandSpec = {
+      label: ext.manifest.label,
+      envVar: cli.envVar || '',
+      defaultCommand: cli.command,
+      args: cli.args,
+      env: cli.env,
+      modelArgs: compileArgTemplate(cli.modelArgs, '{{model}}'),
+      sandboxArgs: compileArgTemplate(cli.sandboxArgs, '{{sandbox}}'),
+      permissionModeArgs: compileArgTemplate(cli.permissionModeArgs, '{{permissionMode}}'),
+      permissionModeEnvVar: cli.permissionModeEnvVar,
+      permissionModeEnvValues: cli.permissionModeValues,
+    }
+    if (cli.resumeArgs) {
+      const template = cli.resumeArgs
+      spec.resumeArgs = (sessionId: string) =>
+        template.map(arg => arg.replace('{{sessionId}}', sessionId))
+    }
+    cliCommandsMap.set(ext.manifest.name, spec)
+  }
+  registerCodingCliCommands(cliCommandsMap)
+
+  // Build CLI detection specs from extension manifests
+  const cliDetectionSpecs: CliDetectionSpec[] = extensionManager.getAll()
+    .filter(e => e.manifest.category === 'cli' && e.manifest.cli)
+    .map(e => ({
+      name: e.manifest.name,
+      envVar: e.manifest.cli!.envVar || '',
+      defaultCmd: e.manifest.cli!.command,
+    }))
+
+  // Collect all CLI extension names for settings validation
+  const allCliNames = extensionManager.getAll()
+    .filter(e => e.manifest.category === 'cli')
+    .map(e => e.manifest.name)
+
+  // Auto-enable newly-discovered CLI extensions
+  {
+    const currentSettings = await configStore.getSettings()
+    const migratedSettings = migrateLegacyDefaultEnabledProviders(currentSettings, allCliNames)
+    const migratedLegacyDefaults = migratedSettings !== currentSettings
+    const hasKnownProviders = migratedSettings.codingCli?.knownProviders !== undefined
+    const knownProviders: string[] = migratedSettings.codingCli?.knownProviders ?? []
+    const enabledProviders: string[] = migratedSettings.codingCli?.enabledProviders ?? []
+
+    if (!hasKnownProviders) {
+      // MIGRATION: First run after refactor. Seed knownProviders with ALL registered CLI names
+      // so nothing is treated as "new". Preserves the user's existing enabledProviders as-is.
+      const codingCliPatch: Record<string, string[]> = { knownProviders: allCliNames }
+      if (migratedLegacyDefaults) {
+        codingCliPatch.enabledProviders = enabledProviders
+      }
+      await configStore.patchSettings({ codingCli: codingCliPatch })
+    } else {
+      // NORMAL: Auto-enable truly new extensions (added after migration).
+      const newProviders = allCliNames.filter(name => !knownProviders.includes(name))
+      if (newProviders.length > 0 || migratedLegacyDefaults) {
+        await configStore.patchSettings({
+          codingCli: {
+            knownProviders: newProviders.length > 0 ? [...knownProviders, ...newProviders] : knownProviders,
+            enabledProviders: [...enabledProviders, ...newProviders.filter((name) => !enabledProviders.includes(name))],
+          },
+        })
+      }
+    }
+  }
 
   const server = http.createServer(app)
   const wsHandler = new WsHandler(
@@ -172,13 +291,22 @@ async function main() {
     serverInstanceId,
     layoutStore,
     extensionManager,
+    () => codexActivity.tracker.list(),
   )
   const port = Number(process.env.PORT || 3001)
   const isDev = process.env.NODE_ENV !== 'production'
   const vitePort = isDev ? Number(process.env.VITE_PORT || 5173) : undefined
   const networkManager = new NetworkManager(server, configStore, port, isDev, vitePort)
   networkManager.setWsHandler(wsHandler)
-  app.use('/api', createAgentApiRouter({ layoutStore, registry, wsHandler }))
+  app.use('/api', createAgentApiRouter({
+    layoutStore,
+    registry,
+    wsHandler,
+    configStore,
+    terminalMetadata,
+    codingCliIndexer,
+    codexActivityTracker: codexActivity.tracker,
+  }))
 
   // --- Extension lifecycle broadcasts ---
   extensionManager.on('server.starting', ({ name }: { name: string }) => {
@@ -196,6 +324,10 @@ async function main() {
 
   const sessionsSync = new SessionsSyncService(wsHandler)
   const associationCoordinator = new SessionAssociationCoordinator(registry, ASSOCIATION_MAX_AGE_MS)
+
+  codexActivity.tracker.on('changed', (payload) => {
+    wsHandler.broadcastCodexActivityUpdated(payload)
+  })
 
   const broadcastTerminalMetaUpserts = (upsert: ReturnType<TerminalMetadataService['list']>) => {
     if (upsert.length === 0) return
@@ -242,7 +374,7 @@ async function main() {
 
   const applyDebugLogging = (enabled: boolean, source: string) => {
     const nextEnabled = !!enabled
-    setLogLevel(nextEnabled ? 'debug' : 'info')
+    setLogLevel(resolveRuntimeLogLevel(nextEnabled))
     setPerfLoggingEnabled(nextEnabled, source)
     wsHandler.broadcast({ type: 'perf.logging', enabled: nextEnabled })
   }
@@ -256,6 +388,8 @@ async function main() {
     applyDebugLogging,
   }))
 
+  // (bootstrap router mounted above, after httpAuthMiddleware)
+
   // --- API: settings ---
   app.use('/api/settings', createSettingsRouter({
     configStore,
@@ -264,6 +398,7 @@ async function main() {
     codingCliIndexer,
     perfConfig,
     applyDebugLogging,
+    validCliProviders: allCliNames,
   }))
 
   // --- Network management endpoints ---
@@ -276,7 +411,7 @@ async function main() {
 
   app.use('/api', createPlatformRouter({
     detectPlatform,
-    detectAvailableClis,
+    detectAvailableClis: () => detectAvailableClis(cliDetectionSpecs),
     detectHostName,
     checkForUpdate,
     appVersion: APP_VERSION,
@@ -293,12 +428,27 @@ async function main() {
     registry,
     wsHandler,
     sessionMetadataStore,
+    serverInstanceId,
+    validCliProviders: allCliNames,
+  }))
+
+  app.use('/api', createAgentTimelineRouter({
+    service: createAgentTimelineService({
+      loadSessionHistory,
+    }),
   }))
 
   app.use('/api', createProjectColorsRouter({ configStore, codingCliIndexer }))
 
   // --- API: terminals ---
-  app.use('/api/terminals', createTerminalsRouter({ configStore, registry, wsHandler, terminalMetadata, codingCliIndexer }))
+  app.use('/api/terminals', createTerminalsRouter({
+    configStore,
+    registry,
+    wsHandler,
+    terminalMetadata,
+    codingCliIndexer,
+    terminalViewService: createTerminalViewService({ configStore, registry }),
+  }))
 
   // --- API: AI ---
   app.use('/api/ai', createAiRouter({ registry, perfConfig }))
@@ -314,6 +464,12 @@ async function main() {
     codingCliIndexer,
     tabsRegistryStore,
     registry,
+  }))
+
+  // --- API: server-info ---
+  app.use('/api/server-info', createServerInfoRouter({
+    appVersion: APP_VERSION,
+    startedAt: SERVER_STARTED_AT,
   }))
 
   // --- API: extensions ---
@@ -509,13 +665,19 @@ async function main() {
   const bindHost = getNetworkHost()
 
   // WSL2 port forwarding — only when bound to 0.0.0.0 (remote access active)
-  if (bindHost === '0.0.0.0') {
+  if (shouldSetupWslPortForwardingAtStartup(bindHost, process.env)) {
     const wslPortForwardResult = setupWslPortForwarding(vitePort)
     if (wslPortForwardResult === 'success') {
       console.log('[server] WSL2 port forwarding configured')
     } else if (wslPortForwardResult === 'failed') {
       console.warn('[server] WSL2 port forwarding failed - LAN access may not work')
     }
+  } else if (bindHost === '0.0.0.0' && wslPortForwardStartupDisabled(process.env)) {
+    log.info({
+      event: 'wsl_port_forward_startup_skipped',
+      reason: 'disabled_by_env',
+      envVar: WSL_PORT_FORWARD_DISABLE_ENV,
+    }, 'Skipping automatic WSL2 port forwarding setup')
   }
 
   // Initialize NetworkManager (ALLOWED_ORIGINS) before accepting connections
@@ -605,6 +767,9 @@ async function main() {
 
     // 8. Stop session indexer
     codingCliIndexer.stop()
+
+    // 8b. Stop Codex activity tracker listeners and sweep timer
+    codexActivity.dispose()
 
     // 9. Stop session repair service
     await sessionRepairService.stop()

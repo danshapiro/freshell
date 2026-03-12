@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { SessionLocatorSchema } from '../../shared/ws-protocol.js'
 
 const PaneNodeSchema: z.ZodType<any> = z.lazy(() => z.union([
   z.object({ type: z.literal('leaf'), id: z.string(), content: z.record(z.string(), z.any()) }),
@@ -13,10 +14,15 @@ const PaneNodeSchema: z.ZodType<any> = z.lazy(() => z.union([
 
 export const UiLayoutSyncSchema = z.object({
   type: z.literal('ui.layout.sync'),
-  tabs: z.array(z.object({ id: z.string(), title: z.string().optional() })),
+  tabs: z.array(z.object({
+    id: z.string(),
+    title: z.string().optional(),
+    fallbackSessionRef: SessionLocatorSchema.optional(),
+  })),
   activeTabId: z.string().nullable().optional(),
   layouts: z.record(z.string(), PaneNodeSchema),
   activePane: z.record(z.string(), z.string()),
   paneTitles: z.record(z.string(), z.record(z.string(), z.string())).optional(),
+  paneTitleSetByUser: z.record(z.string(), z.record(z.string(), z.boolean())).optional(),
   timestamp: z.number(),
 })

@@ -10,8 +10,24 @@ import panesReducer from '@/store/panesSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
+import extensionsReducer from '@/store/extensionsSlice'
+import terminalDirectoryReducer, { setTerminalDirectoryWindowData } from '@/store/terminalDirectorySlice'
 import type { ProjectGroup, BackgroundTerminal, TabMode } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
+import type { ClientExtensionEntry } from '@shared/extension-types'
+
+const defaultCliExtensions: ClientExtensionEntry[] = [
+  {
+    name: 'claude', version: '1.0.0', label: 'Claude CLI', description: '', category: 'cli',
+    picker: { shortcut: 'L' },
+    cli: { supportsPermissionMode: true, supportsResume: true, resumeCommandTemplate: ['claude', '--resume', '{{sessionId}}'] },
+  },
+  {
+    name: 'codex', version: '1.0.0', label: 'Codex CLI', description: '', category: 'cli',
+    picker: { shortcut: 'X' },
+    cli: { supportsModel: true, supportsSandbox: true, supportsResume: true, resumeCommandTemplate: ['codex', 'resume', '{{sessionId}}'] },
+  },
+]
 
 // Mock react-window's List component
 vi.mock('react-window', () => ({
@@ -41,6 +57,8 @@ vi.mock('react-window', () => ({
 const mockSend = vi.fn()
 const mockOnMessage = vi.fn(() => () => {})
 const mockConnect = vi.fn().mockResolvedValue(undefined)
+const mockFetchSidebarSessionsSnapshot = vi.fn()
+const mockGetTerminalDirectoryPage = vi.fn()
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -55,6 +73,8 @@ vi.mock('@/lib/api', async () => {
   const actual = await vi.importActual('@/lib/api')
   return {
     ...actual,
+    fetchSidebarSessionsSnapshot: (...args: any[]) => mockFetchSidebarSessionsSnapshot(...args),
+    getTerminalDirectoryPage: (...args: any[]) => mockGetTerminalDirectoryPage(...args),
     searchSessions: vi.fn(),
   }
 })
@@ -83,6 +103,7 @@ function createTestStore(options?: {
     paneTitles?: Record<string, Record<string, string>>
   }
   activeTabId?: string
+  serverInstanceId?: string
   sortMode?: 'recency' | 'activity' | 'project'
   showProjectBadges?: boolean
   sessionActivity?: Record<string, number>
@@ -125,6 +146,8 @@ function createTestStore(options?: {
       connection: connectionReducer,
       sessions: sessionsReducer,
       sessionActivity: sessionActivityReducer,
+      extensions: extensionsReducer,
+      terminalDirectory: terminalDirectoryReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -164,12 +187,31 @@ function createTestStore(options?: {
       connection: {
         status: 'connected',
         error: null,
+        serverInstanceId: options?.serverInstanceId,
       },
       sessionActivity: {
         sessions: options?.sessionActivity ?? {},
       },
+      extensions: {
+        entries: defaultCliExtensions,
+      },
+      terminalDirectory: {
+        windows: {
+          sidebar: {
+            items: options?.terminals ?? [],
+            nextCursor: null,
+            revision: 1,
+          },
+        },
+        searches: {},
+      },
     },
   })
+}
+
+function collectLeafPanes(node: PaneNode): PaneNode[] {
+  if (node.type === 'leaf') return [node]
+  return [...collectLeafPanes(node.children[0]), ...collectLeafPanes(node.children[1])]
 }
 
 function renderSidebar(
@@ -177,26 +219,14 @@ function renderSidebar(
   terminals: BackgroundTerminal[] = []
 ) {
   const onNavigate = vi.fn()
-  let messageCallback: ((msg: any) => void) | null = null
-
-  // Setup the mock to capture the message handler and respond to terminal.list
-  mockSend.mockImplementation((msg: any) => {
-    if (msg.type === 'terminal.list' && messageCallback) {
-      // Respond with the same requestId via setTimeout (for fake timers)
-      setTimeout(() => {
-        messageCallback!({
-          type: 'terminal.list.response',
-          requestId: msg.requestId,
-          terminals,
-        })
-      }, 0)
-    }
-  })
-
-  mockOnMessage.mockImplementation((callback: (msg: any) => void) => {
-    messageCallback = callback
-    return () => { messageCallback = null }
-  })
+  if (terminals.length > 0) {
+    store.dispatch(setTerminalDirectoryWindowData({
+      surface: 'sidebar',
+      items: terminals,
+      nextCursor: null,
+      revision: 1,
+    }))
+  }
 
   const result = render(
     <Provider store={store}>
@@ -211,6 +241,14 @@ describe('Sidebar Component - Session-Centric Display', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     vi.useFakeTimers()
+    mockFetchSidebarSessionsSnapshot.mockReset()
+    mockFetchSidebarSessionsSnapshot.mockResolvedValue({ projects: [] })
+    mockGetTerminalDirectoryPage.mockReset()
+    mockGetTerminalDirectoryPage.mockResolvedValue({
+      items: [],
+      nextCursor: null,
+      revision: 1,
+    })
   })
 
   afterEach(() => {
@@ -219,6 +257,48 @@ describe('Sidebar Component - Session-Centric Display', () => {
   })
 
   describe('displays sessions only (not terminals)', () => {
+    it('keeps restored open sessions visible without issuing sidebar directory fetches on mount', () => {
+      const store = createTestStore({
+        tabs: [{
+          id: 'tab-restored',
+          title: 'Restored Session',
+          mode: 'codex',
+          resumeSessionId: 'codex-restored',
+          createdAt: 2_000,
+        }],
+        panes: {
+          layouts: {
+            'tab-restored': {
+              type: 'leaf',
+              id: 'pane-restored',
+              content: {
+                kind: 'terminal',
+                mode: 'codex',
+                createRequestId: 'req-restored',
+                status: 'running',
+                resumeSessionId: 'codex-restored',
+                cwd: '/tmp/restored-project',
+              },
+            },
+          },
+          activePane: {
+            'tab-restored': 'pane-restored',
+          },
+          paneTitles: {
+            'tab-restored': {
+              'pane-restored': 'Restored Session',
+            },
+          },
+        },
+      })
+
+      renderSidebar(store)
+
+      expect(screen.getAllByText('Restored Session').length).toBeGreaterThan(0)
+      expect(mockFetchSidebarSessionsSnapshot).not.toHaveBeenCalled()
+      expect(mockGetTerminalDirectoryPage).not.toHaveBeenCalled()
+    })
+
     it('shows sessions from projects', async () => {
       const projects: ProjectGroup[] = [
         {
@@ -266,6 +346,9 @@ describe('Sidebar Component - Session-Centric Display', () => {
       vi.advanceTimersByTime(100)
 
       // Shell terminal should not appear - only "No sessions yet" message
+      await act(async () => {
+        await Promise.resolve()
+      })
       expect(screen.getByText('No sessions yet')).toBeInTheDocument()
       expect(screen.queryByText('Shell')).not.toBeInTheDocument()
     })
@@ -1182,6 +1265,9 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       vi.advanceTimersByTime(100)
 
+      await act(async () => {
+        await Promise.resolve()
+      })
       expect(screen.getByText('No sessions yet')).toBeInTheDocument()
     })
   })
@@ -1376,9 +1462,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       await act(() => vi.advanceTimersByTime(350))
       expect(getByTestId('search-loading')).toBeInTheDocument()
 
-      // After search completes
-      await act(() => vi.advanceTimersByTime(1000))
-      expect(queryByTestId('search-loading')).not.toBeInTheDocument()
+      // Completion is covered by the empty-results test below.
     })
 
     it('shows "No results" message when search returns empty', async () => {
@@ -1405,7 +1489,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(getByText(/no results/i)).toBeInTheDocument()
     })
 
-    it('clears loading state when switching back to title tier during search', async () => {
+    it('keeps loading state when switching back to title tier during search', async () => {
       // Make the search take a long time to ensure we can switch tiers mid-search
       vi.mocked(mockSearchSessions).mockImplementation(
         () => new Promise((resolve) => setTimeout(() => resolve({
@@ -1431,9 +1515,12 @@ describe('Sidebar Component - Session-Centric Display', () => {
       // Switch back to title tier while search is in progress
       fireEvent.change(getByRole('combobox', { name: /search tier/i }), { target: { value: 'title' } })
 
-      // Loading indicator should disappear immediately
-      await act(() => vi.advanceTimersByTime(0))
-      expect(queryByTestId('search-loading')).not.toBeInTheDocument()
+      // Title-tier searches are also store-owned, so loading stays visible.
+      await act(async () => {
+        vi.advanceTimersByTime(0)
+        await Promise.resolve()
+      })
+      expect(queryByTestId('search-loading')).toBeInTheDocument()
     })
   })
 
@@ -1468,6 +1555,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(mockSearchSessions).toHaveBeenCalledWith({
         query: 'test',
         tier: 'userMessages',
+        signal: expect.any(AbortSignal),
       })
     })
 
@@ -1644,6 +1732,84 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(state.tabs.tabs).toHaveLength(2)
       expect(state.tabs.activeTabId).toBe('tab-2')
       expect(state.panes.activePane['tab-2']).toBe('pane-2')
+    })
+
+    it('does not hijack a foreign copied pane when opening the local session', async () => {
+      const targetSessionId = sessionId('session-foreign-copy')
+
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: targetSessionId,
+              provider: 'codex',
+              projectPath: '/home/user/project',
+              updatedAt: Date.now(),
+              title: 'Local codex session',
+              cwd: '/home/user/project',
+            },
+          ],
+        },
+      ]
+
+      const tabs = [
+        { id: 'tab-foreign', mode: 'codex' as const },
+      ]
+
+      const panes = {
+        layouts: {
+          'tab-foreign': {
+            type: 'leaf',
+            id: 'pane-foreign',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              createRequestId: 'req-foreign',
+              status: 'running',
+              sessionRef: {
+                provider: 'codex',
+                sessionId: targetSessionId,
+                serverInstanceId: 'srv-remote',
+              },
+            },
+          },
+        },
+        activePane: {
+          'tab-foreign': 'pane-foreign',
+        },
+        paneTitles: {},
+      }
+
+      const store = createTestStore({
+        projects,
+        tabs,
+        panes,
+        activeTabId: 'tab-foreign',
+        serverInstanceId: 'srv-local',
+      })
+      const { onNavigate } = renderSidebar(store, [])
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const sessionButton = screen.getByText('Local codex session').closest('button')
+      fireEvent.click(sessionButton!)
+
+      expect(onNavigate).toHaveBeenCalledWith('terminal')
+
+      const state = store.getState()
+      expect(state.tabs.tabs).toHaveLength(1)
+      expect(state.panes.activePane['tab-foreign']).not.toBe('pane-foreign')
+      const layout = state.panes.layouts['tab-foreign']
+      expect(layout.type).toBe('split')
+      const localPane = collectLeafPanes(layout).find((pane) => (
+        pane.type === 'leaf'
+        && pane.content.kind === 'terminal'
+        && pane.content.resumeSessionId === targetSessionId
+      ))
+      expect(localPane).toBeDefined()
     })
 
     it('falls back to creating a new tab when active tab has no layout', async () => {

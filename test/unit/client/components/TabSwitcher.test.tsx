@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, fireEvent } from '@testing-library/react'
+import { render, screen, cleanup, fireEvent, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import connectionReducer from '@/store/connectionSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
+import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import type { Tab } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
@@ -37,62 +38,85 @@ function createTab(id: string, title: string, overrides?: Partial<Tab>): Tab {
   }
 }
 
-function createLeafLayout(tabId: string): PaneNode {
+function createLeafLayout(tab: Tab): PaneNode {
   return {
     type: 'leaf',
-    id: `pane-${tabId}`,
+    id: `pane-${tab.id}`,
     content: {
       kind: 'terminal',
-      mode: 'shell',
-      shell: 'system',
-      createRequestId: `req-${tabId}`,
-      status: 'running',
+      mode: tab.mode,
+      shell: tab.shell || 'system',
+      createRequestId: `req-${tab.id}`,
+      status: tab.status,
+      terminalId: tab.terminalId,
     },
   }
 }
 
-function createStore(tabs: Tab[], activeTabId: string) {
+function createStore(
+  tabs: Tab[],
+  activeTabId: string,
+  opts?: { codexActivity?: Partial<CodexActivityState>; includeCodexActivity?: boolean },
+) {
   const layouts: Record<string, PaneNode> = {}
   const activePane: Record<string, string> = {}
   for (const tab of tabs) {
-    layouts[tab.id] = createLeafLayout(tab.id)
+    layouts[tab.id] = createLeafLayout(tab)
     activePane[tab.id] = `pane-${tab.id}`
   }
 
+  const includeCodexActivity = opts?.includeCodexActivity ?? true
+  const defaultCodexActivity: CodexActivityState = {
+    byTerminalId: {},
+    lastSnapshotSeq: 0,
+    liveMutationSeqByTerminalId: {},
+    removedMutationSeqByTerminalId: {},
+  }
+
+  const reducer = {
+    tabs: tabsReducer,
+    panes: panesReducer,
+    connection: connectionReducer,
+    settings: settingsReducer,
+    turnCompletion: turnCompletionReducer,
+    ...(includeCodexActivity ? { codexActivity: codexActivityReducer } : {}),
+  }
+  const preloadedState: Record<string, unknown> = {
+    tabs: {
+      tabs,
+      activeTabId,
+      renameRequestTabId: null,
+    },
+    panes: {
+      layouts,
+      activePane,
+      paneTitles: {},
+      paneTitleSetByUser: {},
+      renameRequestTabId: null,
+      renameRequestPaneId: null,
+      zoomedPane: {},
+    },
+    connection: {
+      status: 'ready' as const,
+      lastError: undefined,
+      platform: 'linux',
+      availableClis: {},
+    },
+    settings: {
+      settings: defaultSettings,
+      loaded: true,
+    },
+  }
+  if (includeCodexActivity) {
+    preloadedState.codexActivity = {
+      ...defaultCodexActivity,
+      ...(opts?.codexActivity ?? {}),
+    }
+  }
+
   return configureStore({
-    reducer: {
-      tabs: tabsReducer,
-      panes: panesReducer,
-      connection: connectionReducer,
-      settings: settingsReducer,
-      turnCompletion: turnCompletionReducer,
-    },
-    preloadedState: {
-      tabs: {
-        tabs,
-        activeTabId,
-        renameRequestTabId: null,
-      },
-      panes: {
-        layouts,
-        activePane,
-        paneTitles: {},
-        paneTitleSetByUser: {},
-        renameRequestTabId: null,
-        renameRequestPaneId: null,
-        zoomedPane: {},
-      },
-      connection: {
-        status: 'ready' as const,
-        lastError: undefined,
-        platform: 'linux',
-        availableClis: {},
-      },
-      settings: {
-        settings: defaultSettings,
-        loaded: true,
-      },
-    },
+    reducer,
+    preloadedState,
   })
 }
 
@@ -345,5 +369,61 @@ describe('TabSwitcher', () => {
 
     const grid = container.querySelector('.grid-cols-2')
     expect(grid).toBeTruthy()
+  })
+
+  it('shows a busy badge only on tabs with exact busy codex activity', async () => {
+    const { TabSwitcher } = await import('@/components/TabSwitcher')
+    const shellTab = createTab('tab-1', 'Shell')
+    const codexTab = createTab('tab-2', 'Codex', {
+      mode: 'codex',
+      terminalId: 'term-codex',
+    })
+    const store = createStore([shellTab, codexTab], 'tab-1', {
+      codexActivity: {
+        byTerminalId: {
+          'term-codex': {
+            terminalId: 'term-codex',
+            sessionId: 'session-codex',
+            phase: 'busy',
+            updatedAt: 10,
+          },
+        },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TabSwitcher onClose={() => {}} />
+      </Provider>
+    )
+
+    const shellCard = screen.getByRole('button', { name: /switch to shell/i })
+    const codexCard = screen.getByRole('button', { name: /switch to codex/i })
+
+    expect(within(shellCard).queryByText('Busy')).not.toBeInTheDocument()
+    expect(within(codexCard).getByTestId('tab-switcher-busy-badge-tab-2')).toHaveTextContent('Busy')
+  })
+
+  it('does not warn about selector instability when codex activity state is absent', async () => {
+    const { TabSwitcher } = await import('@/components/TabSwitcher')
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const store = createStore([createTab('tab-1', 'Shell')], 'tab-1', {
+      includeCodexActivity: false,
+    })
+
+    try {
+      render(
+        <Provider store={store}>
+          <TabSwitcher onClose={() => {}} />
+        </Provider>
+      )
+
+      expect(warnSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('returned a different result when called with the same parameters'),
+        expect.anything(),
+      )
+    } finally {
+      warnSpy.mockRestore()
+    }
   })
 })

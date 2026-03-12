@@ -29,6 +29,20 @@ function expectVitestPhase(
   })
 }
 
+function expectNpmPhase(
+  phase: UpstreamPhase,
+  expected: {
+    script: 'typecheck' | 'build' | 'test:balanced'
+    args: string[]
+  },
+) {
+  expect(phase).toMatchObject({
+    runner: 'npm',
+    script: expected.script,
+    args: expected.args,
+  })
+}
+
 function expectSinglePhase(
   disposition: CommandDisposition,
   expected: {
@@ -57,8 +71,7 @@ describe('classifyCommand()', () => {
         kind: 'coordinated',
         suiteKey: 'full-suite',
         phases: [
-          { config: 'default', args: ['run'] },
-          { config: 'server', args: ['run', '--config', 'vitest.server.config.ts'] },
+          { runner: 'npm', script: 'test:balanced', args: [] },
         ],
       },
     },
@@ -68,8 +81,7 @@ describe('classifyCommand()', () => {
         kind: 'coordinated',
         suiteKey: 'full-suite',
         phases: [
-          { config: 'default', args: ['run'] },
-          { config: 'server', args: ['run', '--config', 'vitest.server.config.ts'] },
+          { runner: 'npm', script: 'test:balanced', args: [] },
         ],
       },
     },
@@ -79,8 +91,7 @@ describe('classifyCommand()', () => {
         kind: 'coordinated',
         suiteKey: 'full-suite',
         phases: [
-          { config: 'default', args: ['run'] },
-          { config: 'server', args: ['run', '--config', 'vitest.server.config.ts'] },
+          { runner: 'npm', script: 'test:balanced', args: [] },
         ],
       },
     },
@@ -90,8 +101,7 @@ describe('classifyCommand()', () => {
         kind: 'coordinated',
         suiteKey: 'full-suite',
         phases: [
-          { config: 'default', args: ['run'] },
-          { config: 'server', args: ['run', '--config', 'vitest.server.config.ts'] },
+          { runner: 'npm', script: 'test:balanced', args: [] },
         ],
       },
     },
@@ -180,6 +190,10 @@ describe('classifyCommand()', () => {
     }
     expect(disposition.phases).toHaveLength(expected.phases.length)
     expected.phases.forEach((phase, index) => {
+      if ('runner' in phase && phase.runner === 'npm') {
+        expectNpmPhase(disposition.phases[index], phase)
+        return
+      }
       expectVitestPhase(disposition.phases[index], phase)
     })
   })
@@ -307,14 +321,10 @@ describe('classifyCommand()', () => {
     expect(changed.kind).toBe('coordinated')
     if (changed.kind === 'coordinated') {
       expect(changed.suiteKey).toBeUndefined()
-      expect(changed.phases).toHaveLength(2)
-      expectVitestPhase(changed.phases[0], {
-        config: 'default',
-        args: ['run', '--changed'],
-      })
-      expectVitestPhase(changed.phases[1], {
-        config: 'server',
-        args: ['run', '--config', 'vitest.server.config.ts', '--changed'],
+      expect(changed.phases).toHaveLength(1)
+      expectNpmPhase(changed.phases[0], {
+        script: 'test:balanced',
+        args: ['--changed'],
       })
     }
 
@@ -327,14 +337,10 @@ describe('classifyCommand()', () => {
       suiteKey: 'full-suite',
     })
     if (bail.kind === 'coordinated') {
-      expect(bail.phases).toHaveLength(2)
-      expectVitestPhase(bail.phases[0], {
-        config: 'default',
-        args: ['run', '--bail=1'],
-      })
-      expectVitestPhase(bail.phases[1], {
-        config: 'server',
-        args: ['run', '--config', 'vitest.server.config.ts', '--bail=1'],
+      expect(bail.phases).toHaveLength(1)
+      expectNpmPhase(bail.phases[0], {
+        script: 'test:balanced',
+        args: ['--bail=1'],
       })
     }
   })
@@ -349,14 +355,10 @@ describe('classifyCommand()', () => {
       suiteKey: 'full-suite',
     })
     if (fullTree.kind === 'coordinated') {
-      expect(fullTree.phases).toHaveLength(2)
-      expectVitestPhase(fullTree.phases[0], {
-        config: 'default',
-        args: ['run', 'test'],
-      })
-      expectVitestPhase(fullTree.phases[1], {
-        config: 'server',
-        args: ['run', '--config', 'vitest.server.config.ts', 'test'],
+      expect(fullTree.phases).toHaveLength(1)
+      expectNpmPhase(fullTree.phases[0], {
+        script: 'test:balanced',
+        args: ['test'],
       })
     }
 
@@ -367,14 +369,10 @@ describe('classifyCommand()', () => {
     expect(unitTree.kind).toBe('coordinated')
     if (unitTree.kind === 'coordinated') {
       expect(unitTree.suiteKey).toBeUndefined()
-      expect(unitTree.phases).toHaveLength(2)
-      expectVitestPhase(unitTree.phases[0], {
-        config: 'default',
-        args: ['run', 'test/unit'],
-      })
-      expectVitestPhase(unitTree.phases[1], {
-        config: 'server',
-        args: ['run', '--config', 'vitest.server.config.ts', 'test/unit'],
+      expect(unitTree.phases).toHaveLength(1)
+      expectNpmPhase(unitTree.phases[0], {
+        script: 'test:balanced',
+        args: ['test/unit'],
       })
     }
 
@@ -385,14 +383,10 @@ describe('classifyCommand()', () => {
     expect(integrationTree.kind).toBe('coordinated')
     if (integrationTree.kind === 'coordinated') {
       expect(integrationTree.suiteKey).toBeUndefined()
-      expect(integrationTree.phases).toHaveLength(2)
-      expectVitestPhase(integrationTree.phases[0], {
-        config: 'default',
-        args: ['run', 'test/integration'],
-      })
-      expectVitestPhase(integrationTree.phases[1], {
-        config: 'server',
-        args: ['run', '--config', 'vitest.server.config.ts', 'test/integration'],
+      expect(integrationTree.phases).toHaveLength(1)
+      expectNpmPhase(integrationTree.phases[0], {
+        script: 'test:balanced',
+        args: ['test/integration'],
       })
     }
   })
@@ -407,14 +401,10 @@ describe('classifyCommand()', () => {
       suiteKey: 'full-suite',
     })
     if (bail.kind === 'coordinated') {
-      expect(bail.phases).toHaveLength(2)
-      expectVitestPhase(bail.phases[0], {
-        config: 'default',
-        args: ['run', '--bail', '1'],
-      })
-      expectVitestPhase(bail.phases[1], {
-        config: 'server',
-        args: ['run', '--config', 'vitest.server.config.ts', '--bail', '1'],
+      expect(bail.phases).toHaveLength(1)
+      expectNpmPhase(bail.phases[0], {
+        script: 'test:balanced',
+        args: ['--bail', '1'],
       })
     }
 
@@ -425,14 +415,10 @@ describe('classifyCommand()', () => {
     expect(changed.kind).toBe('coordinated')
     if (changed.kind === 'coordinated') {
       expect(changed.suiteKey).toBeUndefined()
-      expect(changed.phases).toHaveLength(2)
-      expectVitestPhase(changed.phases[0], {
-        config: 'default',
-        args: ['run', '--changed', 'origin/main'],
-      })
-      expectVitestPhase(changed.phases[1], {
-        config: 'server',
-        args: ['run', '--config', 'vitest.server.config.ts', '--changed', 'origin/main'],
+      expect(changed.phases).toHaveLength(1)
+      expectNpmPhase(changed.phases[0], {
+        script: 'test:balanced',
+        args: ['--changed', 'origin/main'],
       })
     }
 
@@ -742,7 +728,7 @@ describe('classifyCommand()', () => {
     })
   })
 
-  it('rewires every public test script through the coordinator entrypoint and publishes direct status/vitest scripts', async () => {
+  it('rewires coordinated public test scripts through the coordinator entrypoint while preserving newer direct suite helpers', async () => {
     const packageJson = JSON.parse(await fsp.readFile(path.join(REPO_ROOT, 'package.json'), 'utf8'))
     const scripts = packageJson.scripts as Record<string, string>
 
@@ -759,5 +745,9 @@ describe('classifyCommand()', () => {
     expect(scripts['test:client']).toBe('tsx scripts/testing/test-coordinator.ts run test:client')
     expect(scripts['test:status']).toBe('tsx scripts/testing/test-coordinator.ts status')
     expect(scripts['test:vitest']).toBe('tsx scripts/testing/test-coordinator.ts run test:vitest')
+    expect(scripts['test:balanced']).toBe('tsx scripts/run-standard-tests.ts')
+    expect(scripts['test:aggressive']).toBe('tsx scripts/run-standard-tests.ts --mode aggressive')
+    expect(scripts['test:sequential']).toBe('vitest run && vitest run --config vitest.server.config.ts && vitest run --config vitest.electron.config.ts')
+    expect(scripts['test:electron']).toBe('vitest run --config vitest.electron.config.ts')
   })
 })

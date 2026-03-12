@@ -46,6 +46,16 @@ const CliConfigSchema = z.strictObject({
   command: z.string().min(1),
   args: z.array(z.string()).optional().default([]),
   env: z.record(z.string(), z.string()).optional(),
+  envVar: z.string().optional(),              // env var to override command (e.g., 'CLAUDE_CMD')
+  resumeArgs: z.array(z.string()).optional(), // template with {{sessionId}} placeholder
+  modelArgs: z.array(z.string()).optional(),  // template with {{model}} placeholder
+  sandboxArgs: z.array(z.string()).optional(), // template with {{sandbox}} placeholder
+  permissionModeArgs: z.array(z.string()).optional(), // template with {{permissionMode}} placeholder
+  permissionModeEnvVar: z.string().optional(),
+  permissionModeValues: z.record(z.string(), z.string()).optional(),
+  supportsPermissionMode: z.boolean().optional(),
+  supportsModel: z.boolean().optional(),      // shows model field in SettingsView
+  supportsSandbox: z.boolean().optional(),    // shows sandbox selector in SettingsView
 })
 
 // ──────────────────────────────────────────────────────────────

@@ -63,7 +63,7 @@ describe('settingsSlice', () => {
         soundEnabled: true,
       })
       expect(state.settings.codingCli).toEqual({
-        enabledProviders: ['claude', 'codex'],
+        enabledProviders: ['claude', 'codex', 'opencode'],
         providers: {
           claude: {
             permissionMode: 'default',

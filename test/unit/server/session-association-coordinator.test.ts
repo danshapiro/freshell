@@ -70,6 +70,6 @@ describe('SessionAssociationCoordinator', () => {
 
     expect(result).toEqual({ associated: true, terminalId: 'term-1' })
     expect(registry.findUnassociatedTerminals).toHaveBeenCalledWith('codex', '/repo/project')
-    expect(registry.bindSession).toHaveBeenCalledWith('term-1', 'codex', 'session-main')
+    expect(registry.bindSession).toHaveBeenCalledWith('term-1', 'codex', 'session-main', 'association')
   })
 })

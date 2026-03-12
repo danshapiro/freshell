@@ -31,6 +31,7 @@ export class ClientOutputQueue {
   private frames: ReplayFrame[] = []
   private totalBytes = 0
   private pendingGap: GapEvent | null = null
+  private droppedBytes = 0
 
   constructor(maxBytes?: number) {
     this.maxBytes = resolveMaxBytes(maxBytes)
@@ -91,10 +92,25 @@ export class ClientOutputQueue {
     return this.totalBytes
   }
 
+  pendingFrames(): number {
+    return this.frames.length
+  }
+
+  peekDroppedBytes(): number {
+    return this.droppedBytes
+  }
+
+  consumeDroppedBytes(): number {
+    const droppedBytes = this.droppedBytes
+    this.droppedBytes = 0
+    return droppedBytes
+  }
+
   clear(): void {
     this.frames = []
     this.totalBytes = 0
     this.pendingGap = null
+    this.droppedBytes = 0
   }
 
   private evictOverflow(): void {
@@ -102,6 +118,7 @@ export class ClientOutputQueue {
       const dropped = this.frames.shift()
       if (!dropped) break
       this.totalBytes -= dropped.bytes
+      this.droppedBytes += dropped.bytes
       this.extendGap(dropped.seqStart, dropped.seqEnd)
     }
   }

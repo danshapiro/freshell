@@ -642,7 +642,7 @@ describe('WebSocket edge cases', () => {
 
       // Kill the terminal
       ws.send(JSON.stringify({ type: 'terminal.kill', terminalId }))
-      await waitForMessage(ws, (m) => m.type === 'terminal.list.updated')
+      await waitForMessage(ws, (m) => m.type === 'terminals.changed')
 
       // Try to send input to killed terminal
       ws.send(JSON.stringify({ type: 'terminal.input', terminalId, data: 'should fail' }))
@@ -1148,7 +1148,7 @@ describe('WebSocket edge cases', () => {
       close1()
     })
 
-    it('handles terminal.list when registry is empty', async () => {
+    it('rejects legacy terminal.list commands even when the registry is empty', async () => {
       const { ws, close } = await createAuthenticatedConnection()
 
       // Ensure registry is empty
@@ -1156,8 +1156,19 @@ describe('WebSocket edge cases', () => {
 
       ws.send(JSON.stringify({ type: 'terminal.list', requestId: 'empty-list' }))
 
-      const response = await waitForMessage(ws, (m) => m.type === 'terminal.list.response')
-      expect(response.terminals).toEqual([])
+      const response = await waitForMessage(ws, (m) => m.type === 'error' && m.requestId === 'empty-list')
+      expect(response.code).toBe('INVALID_MESSAGE')
+
+      close()
+    })
+
+    it('rejects legacy terminal.meta.list commands', async () => {
+      const { ws, close } = await createAuthenticatedConnection()
+
+      ws.send(JSON.stringify({ type: 'terminal.meta.list', requestId: 'meta-list' }))
+
+      const response = await waitForMessage(ws, (m) => m.type === 'error' && m.requestId === 'meta-list')
+      expect(response.code).toBe('INVALID_MESSAGE')
 
       close()
     })
@@ -1178,33 +1189,23 @@ describe('WebSocket edge cases', () => {
       sendAttach(ws3, terminalId)
       await waitForMessage(ws3, (m) => m.type === 'terminal.attach.ready' && m.terminalId === terminalId)
 
-      // Set up listeners on all clients
-      const outputs1: string[] = []
-      const outputs2: string[] = []
-      const outputs3: string[] = []
+      const waitForBroadcast = (ws: WebSocket) =>
+        waitForMessage(
+          ws,
+          (m) => m.type === 'terminal.output' && m.terminalId === terminalId && m.data.includes('broadcast test'),
+        )
 
-      ws1.on('message', (data) => {
-        const msg = JSON.parse(data.toString())
-        if (msg.type === 'terminal.output') outputs1.push(msg.data)
-      })
-      ws2.on('message', (data) => {
-        const msg = JSON.parse(data.toString())
-        if (msg.type === 'terminal.output') outputs2.push(msg.data)
-      })
-      ws3.on('message', (data) => {
-        const msg = JSON.parse(data.toString())
-        if (msg.type === 'terminal.output') outputs3.push(msg.data)
-      })
+      const output1 = waitForBroadcast(ws1)
+      const output2 = waitForBroadcast(ws2)
+      const output3 = waitForBroadcast(ws3)
 
       // Simulate output
       registry.simulateOutput(terminalId, 'broadcast test\n')
 
-      await new Promise((r) => setTimeout(r, 100))
-
       // All clients should receive the output
-      expect(outputs1.join('')).toContain('broadcast test')
-      expect(outputs2.join('')).toContain('broadcast test')
-      expect(outputs3.join('')).toContain('broadcast test')
+      await expect(output1).resolves.toMatchObject({ type: 'terminal.output', terminalId })
+      await expect(output2).resolves.toMatchObject({ type: 'terminal.output', terminalId })
+      await expect(output3).resolves.toMatchObject({ type: 'terminal.output', terminalId })
 
       close1()
       close2()
@@ -1611,7 +1612,7 @@ describe('WebSocket edge cases', () => {
       clearInterval(floodInterval)
 
       // Wait for kill to process
-      await waitForMessage(ws, (m) => m.type === 'terminal.list.updated')
+      await waitForMessage(ws, (m) => m.type === 'terminals.changed')
 
       // Terminal should be killed
       expect(registry.killCalls).toContain(terminalId)

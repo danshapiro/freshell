@@ -3,7 +3,7 @@ import os from 'os'
 import fsp from 'fs/promises'
 import { extractTitleFromMessage } from '../../title-utils.js'
 import type { CodingCliProvider } from '../provider.js'
-import { normalizeFirstUserMessage, type NormalizedEvent, type ParsedSessionMeta, type TokenPayload, type TokenSummary } from '../types.js'
+import { normalizeFirstUserMessage, type CodexTaskEventSnapshot, type NormalizedEvent, type ParsedSessionMeta, type TokenPayload, type TokenSummary } from '../types.js'
 import { looksLikePath, isSystemContext, extractFromIdeContext, resolveGitRepoRoot } from '../utils.js'
 
 const CODEX_MAX_PLAUSIBLE_CONTEXT_TOKENS_WITHOUT_WINDOW = 5_000_000
@@ -32,6 +32,21 @@ function toFiniteNumber(value: unknown): number | undefined {
     if (Number.isFinite(parsed)) return parsed
   }
   return undefined
+}
+
+function parseTimestampMs(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Date.parse(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return undefined
+}
+
+function maxTimestamp(current: number | undefined, candidate: number | undefined): number | undefined {
+  if (candidate === undefined) return current
+  if (current === undefined) return candidate
+  return Math.max(current, candidate)
 }
 
 function normalizeCompactPercent(numerator: number, denominator?: number): number | undefined {
@@ -220,6 +235,9 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
   let gitBranch: string | undefined
   let isDirty: boolean | undefined
   let tokenUsage: TokenSummary | undefined
+  let latestTaskStartedAt: number | undefined
+  let latestTaskCompletedAt: number | undefined
+  let latestTurnAbortedAt: number | undefined
 
   for (const line of lines) {
     let obj: any
@@ -288,6 +306,23 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
       if (parsedToken.summary) tokenUsage = parsedToken.summary
     }
 
+    if (obj?.type === 'event_msg') {
+      const timestampMs = parseTimestampMs(obj.timestamp)
+      switch (obj?.payload?.type) {
+        case 'task_started':
+          latestTaskStartedAt = maxTimestamp(latestTaskStartedAt, timestampMs)
+          break
+        case 'task_complete':
+          latestTaskCompletedAt = maxTimestamp(latestTaskCompletedAt, timestampMs)
+          break
+        case 'turn_aborted':
+          latestTurnAbortedAt = maxTimestamp(latestTurnAbortedAt, timestampMs)
+          break
+        default:
+          break
+      }
+    }
+
     if (!cwd && obj?.type === 'turn_context' && typeof obj?.payload?.cwd === 'string') {
       const ctxCwd = obj.payload.cwd
       if (looksLikePath(ctxCwd)) cwd = ctxCwd
@@ -295,6 +330,15 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
   }
 
   return {
+    ...(latestTaskStartedAt !== undefined || latestTaskCompletedAt !== undefined || latestTurnAbortedAt !== undefined
+      ? {
+          codexTaskEvents: {
+            ...(latestTaskStartedAt !== undefined ? { latestTaskStartedAt } : {}),
+            ...(latestTaskCompletedAt !== undefined ? { latestTaskCompletedAt } : {}),
+            ...(latestTurnAbortedAt !== undefined ? { latestTurnAbortedAt } : {}),
+          } satisfies CodexTaskEventSnapshot,
+        }
+      : {}),
     sessionId,
     cwd,
     title,
@@ -307,6 +351,31 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
     isDirty,
     tokenUsage,
   }
+}
+
+export function sanitizeCodexTaskEventsForTruncatedSnippet(
+  snapshot: CodexTaskEventSnapshot | undefined,
+  tailSnapshot?: CodexTaskEventSnapshot,
+): CodexTaskEventSnapshot | undefined {
+  if (!snapshot) return undefined
+
+  const tailStartedAt = tailSnapshot?.latestTaskStartedAt
+  const tailCompletedAt = tailSnapshot?.latestTaskCompletedAt
+  const tailTurnAbortedAt = tailSnapshot?.latestTurnAbortedAt
+  const tailClearAt = maxTimestamp(tailCompletedAt, tailTurnAbortedAt)
+  const preserveTailStart = tailStartedAt !== undefined && (tailClearAt === undefined || tailStartedAt > tailClearAt)
+
+  const sanitized: CodexTaskEventSnapshot = {
+    ...(preserveTailStart && tailStartedAt !== undefined ? { latestTaskStartedAt: tailStartedAt } : {}),
+    ...((preserveTailStart ? tailCompletedAt : snapshot.latestTaskCompletedAt) !== undefined
+      ? { latestTaskCompletedAt: preserveTailStart ? tailCompletedAt : snapshot.latestTaskCompletedAt }
+      : {}),
+    ...((preserveTailStart ? tailTurnAbortedAt : snapshot.latestTurnAbortedAt) !== undefined
+      ? { latestTurnAbortedAt: preserveTailStart ? tailTurnAbortedAt : snapshot.latestTurnAbortedAt }
+      : {}),
+  }
+
+  return Object.keys(sanitized).length > 0 ? sanitized : undefined
 }
 
 function extractSessionIdFromFilename(filePath: string): string {

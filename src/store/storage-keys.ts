@@ -8,6 +8,7 @@ export const STORAGE_KEYS = {
   deviceLabelCustom: 'freshell.device-label-custom.v2',
   deviceFingerprint: 'freshell.device-fingerprint.v2',
   deviceAliases: 'freshell.device-aliases.v2',
+  deviceDismissed: 'freshell.device-dismissed.v1',
 } as const
 
 export const TABS_STORAGE_KEY = STORAGE_KEYS.tabs
@@ -19,3 +20,4 @@ export const DEVICE_LABEL_STORAGE_KEY = STORAGE_KEYS.deviceLabel
 export const DEVICE_LABEL_CUSTOM_STORAGE_KEY = STORAGE_KEYS.deviceLabelCustom
 export const DEVICE_FINGERPRINT_STORAGE_KEY = STORAGE_KEYS.deviceFingerprint
 export const DEVICE_ALIASES_STORAGE_KEY = STORAGE_KEYS.deviceAliases
+export const DEVICE_DISMISSED_STORAGE_KEY = STORAGE_KEYS.deviceDismissed

@@ -4,6 +4,7 @@ import type { AgentChatPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updatePaneContent, mergePaneContent } from '@/store/panesSlice'
 import { addUserMessage, clearPendingCreate, removePermission, removeQuestion } from '@/store/agentChatSlice'
+import { loadAgentTimelineWindow, loadAgentTurnBody } from '@/store/agentChatThunks'
 import { getWsClient } from '@/lib/ws-client'
 import { cn } from '@/lib/utils'
 import { ChevronDown } from 'lucide-react'
@@ -15,10 +16,11 @@ import AgentChatSettings from './AgentChatSettings'
 import ThinkingIndicator from './ThinkingIndicator'
 import { useStreamDebounce } from './useStreamDebounce'
 import CollapsedTurn from './CollapsedTurn'
-import type { ChatMessage, ChatSessionState } from '@/store/agentChatTypes'
+import type { ChatMessage } from '@/store/agentChatTypes'
 import { api, setSessionMetadata } from '@/lib/api'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 
 /** Early lifecycle states that should not be re-entered once the session has advanced. */
 const EARLY_STATES = new Set(['creating', 'starting'])
@@ -74,9 +76,13 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const availableModels = useAppSelector((s) => s.agentChat.availableModels)
   const settingsLoaded = useAppSelector((s) => s.settings.loaded)
   const initialSetupDone = useAppSelector((s) => s.settings.settings.agentChat?.initialSetupDone ?? false)
+  const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
+  const surfaceVisibleMarkedRef = useRef(false)
+  const timelineSessionId = paneContent.resumeSessionId ?? session?.cliSessionId ?? paneContent.sessionId
 
   // Track whether we're waiting for a session restore (persisted sessionId, history not yet loaded).
-  // Fresh creates set historyLoaded=true immediately; reloads wait for sdk.history.
+  // Fresh creates set historyLoaded=true immediately; reloads wait for the initial
+  // HTTP timeline window (even if it is empty).
   // Times out after 5s to handle stale sessionIds from server restarts.
   const isRestoring = !!paneContent.sessionId && !session?.historyLoaded
   const [restoreTimedOut, setRestoreTimedOut] = useState(false)
@@ -241,6 +247,33 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     })
   }, [paneContent.sessionId, ws])
 
+  useEffect(() => {
+    if (!paneContent.sessionId || !timelineSessionId) return
+    if (hidden) return
+    if (activePaneId && activePaneId !== paneId) return
+    if (session?.latestTurnId === undefined) return
+    if (session?.historyLoaded) return
+
+    const promise = dispatch(loadAgentTimelineWindow({
+      sessionId: paneContent.sessionId,
+      timelineSessionId,
+      requestKey: `${tabId}:${paneId}`,
+    }))
+    return () => {
+      promise.abort()
+    }
+  }, [
+    activePaneId,
+    dispatch,
+    hidden,
+    paneContent.sessionId,
+    paneId,
+    session?.historyLoaded,
+    session?.latestTurnId,
+    tabId,
+    timelineSessionId,
+  ])
+
   // Smart auto-scroll: only scroll if user is already at/near the bottom
   useEffect(() => {
     if (isAtBottomRef.current) {
@@ -381,7 +414,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     && !initialSetupDone
     && (settingsLoaded || settingsLoadTimedOut)
 
-  // Auto-focus is handled by the ChatComposer's autoFocus prop below.
+  // Focus is handled by the ChatComposer readiness prop below.
   // When settings are dismissed, focus imperatively via the dismiss callback.
 
 
@@ -394,6 +427,8 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const pendingPermissions = session ? Object.values(session.pendingPermissions) : []
   const pendingQuestions = session ? Object.values(session.pendingQuestions) : []
   const hasWaitingItems = pendingPermissions.length > 0 || pendingQuestions.length > 0
+  const timelineItems = useMemo(() => session?.timelineItems ?? [], [session?.timelineItems])
+  const timelineBodies = session?.timelineBodies ?? {}
 
   // Auto-expand: count completed tools across all messages, expand the most recent N
   const RECENT_TOOLS_EXPANDED = 3
@@ -462,10 +497,24 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const turnItems = renderItems.filter(r => r.kind === 'turn')
   const collapseThreshold = Math.max(0, turnItems.length - RECENT_TURNS_FULL)
 
+  useEffect(() => {
+    if (surfaceVisibleMarkedRef.current) return
+    if (hidden) return
+    if (activePaneId && activePaneId !== paneId) return
+    if (!session?.historyLoaded) return
+    if (renderItems.length === 0 && timelineItems.length === 0) return
+    getInstalledPerfAuditBridge()?.mark('agent_chat.surface_visible', {
+      tabId,
+      paneId,
+      sessionId: paneContent.sessionId,
+    })
+    surfaceVisibleMarkedRef.current = true
+  }, [activePaneId, hidden, paneContent.sessionId, paneId, renderItems.length, session?.historyLoaded, tabId, timelineItems.length])
+
   return (
     <div className={cn('h-full w-full flex flex-col', hidden ? 'tab-hidden' : 'tab-visible')} role="region" aria-label={`${providerLabel} Chat`} onPointerUp={handleContainerPointerUp}>
       {/* Status bar */}
-      <div className="flex items-center justify-between px-3 py-1.5 border-b text-xs text-muted-foreground">
+      <div className="flex items-center justify-between px-3 py-1 border-b text-xs text-muted-foreground">
         <span>
           {hasWaitingItems && 'Waiting for answer...'}
           {!hasWaitingItems && paneContent.status === 'creating' && 'Creating session...'}
@@ -499,22 +548,59 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
       {/* Message area wrapper (relative for scroll-to-bottom button positioning) */}
       <div className="relative flex-1 min-h-0">
-      <div ref={scrollContainerRef} onScroll={handleScroll} className="h-full overflow-y-auto p-4 space-y-3" data-context="agent-chat" data-session-id={paneContent.sessionId}>
+      <div ref={scrollContainerRef} onScroll={handleScroll} className="h-full overflow-y-auto px-3 py-3 space-y-2" data-context="agent-chat" data-session-id={paneContent.sessionId}>
         {/* Restoring: persisted sessionId but history not yet loaded (reload/back-nav).
              Falls back to welcome screen after timeout (e.g. server restarted, session lost). */}
         {isRestoring && !restoreTimedOut && (
-          <div className="text-center text-muted-foreground text-sm py-8">
+          <div className="text-center text-muted-foreground text-sm py-6">
             <p>Restoring session...</p>
           </div>
         )}
 
         {/* Welcome: no sessionId, session exists but empty, or restore timed out */}
-        {!session?.messages.length && (!isRestoring || restoreTimedOut) && (
-          <div className="text-center text-muted-foreground text-sm py-8">
-            <p className="font-medium mb-2">{providerLabel}</p>
+        {!session?.messages.length && timelineItems.length === 0 && (!isRestoring || restoreTimedOut) && (
+          <div className="text-center text-muted-foreground text-sm py-6">
+            <p className="font-medium mb-1">{providerLabel}</p>
             <p>Rich chat UI for AI agent sessions.</p>
           </div>
         )}
+
+        {timelineItems.map((item) => {
+          const message = timelineBodies[item.turnId]
+          if (message) {
+            return (
+              <MessageBubble
+                key={`timeline-${item.turnId}`}
+                speaker={message.role}
+                content={message.content}
+                timestamp={message.timestamp}
+                model={message.model}
+                showThinking={paneContent.showThinking ?? defaultShowThinking}
+                showTools={paneContent.showTools ?? defaultShowTools}
+                showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+              />
+            )
+          }
+
+          return (
+            <CollapsedTurn
+              key={`timeline-${item.turnId}`}
+              summary={item.summary}
+              loading={session?.timelineLoading}
+              onExpand={() => {
+                if (!paneContent.sessionId) return
+                void dispatch(loadAgentTurnBody({
+                  sessionId: paneContent.sessionId,
+                  timelineSessionId,
+                  turnId: item.turnId,
+                }))
+              }}
+              showThinking={paneContent.showThinking ?? defaultShowThinking}
+              showTools={paneContent.showTools ?? defaultShowTools}
+              showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
+            />
+          )
+        })}
 
         {(() => {
           let turnIndex = 0
@@ -538,7 +624,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
               return (
                 <React.Fragment key={`turn-${i}`}>
                   <MessageBubble
-                    role={item.user.role}
+                    speaker={item.user.role}
                     content={item.user.content}
                     timestamp={item.user.timestamp}
                     showThinking={paneContent.showThinking ?? defaultShowThinking}
@@ -546,7 +632,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
                     showTimecodes={paneContent.showTimecodes ?? defaultShowTimecodes}
                   />
                   <MessageBubble
-                    role={item.assistant.role}
+                    speaker={item.assistant.role}
                     content={item.assistant.content}
                     timestamp={item.assistant.timestamp}
                     model={item.assistant.model}
@@ -564,7 +650,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
             return (
               <MessageBubble
                 key={`msg-${i}`}
-                role={item.message.role}
+                speaker={item.message.role}
                 content={item.message.content}
                 timestamp={item.message.timestamp}
                 model={item.message.model}
@@ -581,7 +667,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
         {session?.streamingActive && streamingContent.length > 0 && (
           <MessageBubble
-            role="assistant"
+            speaker="assistant"
             content={streamingContent}
             showThinking={paneContent.showThinking ?? defaultShowThinking}
             showTools={paneContent.showTools ?? defaultShowTools}
@@ -624,7 +710,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
         {/* Error display */}
         {session?.lastError && (
-          <div className="text-sm text-red-500 bg-red-500/10 rounded-lg p-3" role="alert">
+          <div className="text-sm text-red-500 bg-red-500/10 rounded-lg px-3 py-2" role="alert">
             {session.lastError}
           </div>
         )}
@@ -637,7 +723,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         <button
           onClick={scrollToBottom}
           aria-label="Scroll to bottom"
-          className="absolute bottom-3 left-1/2 -translate-x-1/2 z-10 rounded-full bg-background border shadow-md p-2 hover:bg-muted transition-colors"
+          className="absolute bottom-2 left-1/2 -translate-x-1/2 z-10 rounded-full bg-background border shadow-md p-2 hover:bg-muted transition-colors"
         >
           <ChevronDown className="h-4 w-4" />
           {hasNewMessages && (
@@ -658,7 +744,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
         onInterrupt={handleInterrupt}
         disabled={!isInteractive && !isRunning}
         isRunning={isRunning}
-        autoFocus={!shouldShowSettings}
+        shouldFocusOnReady={!shouldShowSettings}
         placeholder={
           hasWaitingItems
             ? 'Waiting for answer...'

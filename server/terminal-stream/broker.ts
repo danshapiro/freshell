@@ -388,6 +388,8 @@ export class TerminalStreamBroker {
         pendingBytes,
         batchMaxBytes: TERMINAL_STREAM_BATCH_MAX_BYTES,
         bufferedAmount: ws.bufferedAmount,
+        queueDepth: attachment.queue.pendingFrames(),
+        droppedBytes: attachment.queue.peekDroppedBytes(),
       }, 'warn')
     }
 
@@ -397,7 +399,18 @@ export class TerminalStreamBroker {
     const attachRequestId = attachment.activeAttachRequestId
     for (const item of batch) {
       if (isGapEvent(item)) {
-        if (!this.sendGap(ws, terminalId, item, attachRequestId)) return
+        if (!this.sendGap(
+          ws,
+          terminalId,
+          item,
+          attachRequestId,
+          item.reason === 'queue_overflow'
+            ? {
+                queueDepth: attachment.queue.pendingFrames(),
+                droppedBytes: attachment.queue.consumeDroppedBytes(),
+              }
+            : undefined,
+        )) return
         attachment.lastSeq = Math.max(attachment.lastSeq, item.toSeq)
         continue
       }
@@ -477,6 +490,7 @@ export class TerminalStreamBroker {
     terminalId: string,
     gap: GapEvent,
     attachRequestId?: string,
+    queueContext?: { queueDepth?: number; droppedBytes?: number },
   ): boolean {
     this.perfEventLogger('terminal_stream_gap', {
       terminalId,
@@ -484,6 +498,8 @@ export class TerminalStreamBroker {
       fromSeq: gap.fromSeq,
       toSeq: gap.toSeq,
       reason: gap.reason,
+      ...(typeof queueContext?.queueDepth === 'number' ? { queueDepth: queueContext.queueDepth } : {}),
+      ...(typeof queueContext?.droppedBytes === 'number' ? { droppedBytes: queueContext.droppedBytes } : {}),
     }, gap.reason === 'queue_overflow' ? 'warn' : 'info')
 
     return this.safeSend(ws, {

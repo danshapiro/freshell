@@ -19,6 +19,8 @@ export default defineConfig({
     setupFiles: ['./test/setup/dom.ts'],
     exclude: [
       '**/node_modules/**',
+      '**/server-node-modules/**',
+      '**/bundled-node/**',
       '**/.worktrees/**',
       '**/.claude/worktrees/**',
       'docs/plans/**',
@@ -26,8 +28,16 @@ export default defineConfig({
       'test/server/**',
       'test/unit/server/**',
       'test/integration/server/**',
+      'test/unit/visible-first/read-model-route-harness.test.ts',
+      'test/unit/visible-first/terminal-mirror-fixture.test.ts',
+      'test/unit/visible-first/cli-command-harness.test.ts',
       'test/integration/session-repair.test.ts',
       'test/integration/session-search-e2e.test.ts',
+      'test/e2e-browser/**',
+      // Electron tests run under vitest.electron.config.ts (node environment)
+      'test/unit/electron/**',
+      // Electron E2E tests run under Playwright, not Vitest
+      'test/e2e-electron/**',
     ],
     testTimeout: 30000,
     hookTimeout: 30000,

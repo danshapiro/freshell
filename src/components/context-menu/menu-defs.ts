@@ -1,3 +1,5 @@
+import { createElement } from 'react'
+import { ClipboardPaste, Copy, TextSelect } from 'lucide-react'
 import type { MenuItem, ContextTarget } from './context-menu-types'
 import type { AppView } from '@/components/Sidebar'
 import type { Tab, ProjectGroup } from '@/store/types'
@@ -6,6 +8,7 @@ import { buildPaneRefreshTarget, findPaneContent } from '@/lib/pane-utils'
 import { collectSessionRefsFromNode } from '@/lib/session-utils'
 import type { TerminalActions, EditorActions, BrowserActions } from '@/lib/pane-action-registry'
 import { buildResumeCommand, isResumeCommandProvider, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
+import type { ClientExtensionEntry } from '@shared/extension-types'
 
 export type MenuActions = {
   newDefaultTab: () => void
@@ -71,6 +74,7 @@ export type MenuBuildContext = {
   clickTarget: HTMLElement | null
   actions: MenuActions
   platform: string | null
+  extensions?: ClientExtensionEntry[]
 }
 
 function isWindowsLike(platform: string | null): boolean {
@@ -95,9 +99,9 @@ function getTabProvider(tab?: Tab): string | undefined {
   return tab.codingCliProvider || (tab.mode !== 'shell' ? tab.mode : undefined)
 }
 
-function getResumeCandidateForTerminalContent(content: PaneContent, tab?: Tab): ResumeCommandCandidate | null {
+function getResumeCandidateForTerminalContent(content: PaneContent, tab?: Tab, extensions?: ClientExtensionEntry[]): ResumeCommandCandidate | null {
   if (content.kind !== 'terminal') return null
-  if (!isResumeCommandProvider(content.mode)) return null
+  if (!isResumeCommandProvider(content.mode, extensions)) return null
   const tabProvider = getTabProvider(tab)
   const sessionId = content.resumeSessionId || (tabProvider === content.mode ? tab?.resumeSessionId : undefined)
   return {
@@ -106,17 +110,17 @@ function getResumeCandidateForTerminalContent(content: PaneContent, tab?: Tab): 
   }
 }
 
-function getResumeCandidateForLegacyTab(tab?: Tab): ResumeCommandCandidate | null {
+function getResumeCandidateForLegacyTab(tab?: Tab, extensions?: ClientExtensionEntry[]): ResumeCommandCandidate | null {
   const provider = getTabProvider(tab)
-  if (!isResumeCommandProvider(provider)) return null
+  if (!isResumeCommandProvider(provider, extensions)) return null
   return {
     provider,
     sessionId: tab?.resumeSessionId,
   }
 }
 
-function buildCopyResumeMenuItem(id: string, candidate: ResumeCommandCandidate, actions: MenuActions): MenuItem {
-  const canCopy = !!buildResumeCommand(candidate.provider, candidate.sessionId)
+function buildCopyResumeMenuItem(id: string, candidate: ResumeCommandCandidate, actions: MenuActions, extensions?: ClientExtensionEntry[]): MenuItem {
+  const canCopy = !!buildResumeCommand(candidate.provider, candidate.sessionId, extensions)
   return {
     type: 'item',
     id,
@@ -129,6 +133,38 @@ function buildCopyResumeMenuItem(id: string, candidate: ResumeCommandCandidate, 
   }
 }
 
+function buildTerminalClipboardItems(
+  terminalActions: TerminalActions | undefined,
+  hasSelection: boolean,
+): MenuItem[] {
+  return [
+    {
+      type: 'item',
+      id: 'terminal-copy',
+      label: 'copy',
+      icon: createElement(Copy, { className: 'h-4 w-4' }),
+      onSelect: () => terminalActions?.copySelection(),
+      disabled: !terminalActions || !hasSelection,
+    },
+    {
+      type: 'item',
+      id: 'terminal-paste',
+      label: 'Paste',
+      icon: createElement(ClipboardPaste, { className: 'h-4 w-4' }),
+      onSelect: () => terminalActions?.paste(),
+      disabled: !terminalActions,
+    },
+    {
+      type: 'item',
+      id: 'terminal-select-all',
+      label: 'Select all',
+      icon: createElement(TextSelect, { className: 'h-4 w-4' }),
+      onSelect: () => terminalActions?.selectAll(),
+      disabled: !terminalActions,
+    },
+  ]
+}
+
 function collectPaneLeaves(node: PaneNode): Extract<PaneNode, { type: 'leaf' }>[] {
   if (node.type === 'leaf') return [node]
   return [
@@ -138,7 +174,7 @@ function collectPaneLeaves(node: PaneNode): Extract<PaneNode, { type: 'leaf' }>[
 }
 
 export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): MenuItem[] {
-  const { actions, tabs, paneLayouts, sessions, view, sidebarCollapsed, expandedProjects, contextElement, clickTarget, platform } = ctx
+  const { actions, tabs, paneLayouts, sessions, view, sidebarCollapsed, expandedProjects, contextElement, clickTarget, platform, extensions } = ctx
   const isSessionOpen = (sessionId: string, provider?: string) => {
     const keyProvider = provider || 'claude'
     for (const tab of tabs) {
@@ -201,12 +237,12 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     const layout = paneLayouts[target.tabId]
     const resumeCandidate =
       layout?.type === 'leaf'
-        ? getResumeCandidateForTerminalContent(layout.content, tab)
+        ? getResumeCandidateForTerminalContent(layout.content, tab, extensions)
         : !layout
-          ? getResumeCandidateForLegacyTab(tab)
+          ? getResumeCandidateForLegacyTab(tab, extensions)
           : null
     const tabResumeMenuItem = resumeCandidate
-      ? [buildCopyResumeMenuItem('tab-copy-resume-command', resumeCandidate, actions)]
+      ? [buildCopyResumeMenuItem('tab-copy-resume-command', resumeCandidate, actions, extensions)]
       : []
     const isFirst = index <= 0
     const isLast = index === tabs.length - 1
@@ -253,9 +289,9 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     const tab = tabs.find((t) => t.id === target.tabId)
     const layout = paneLayouts[target.tabId]
     const paneContent = layout ? findPaneContent(layout, target.paneId) : null
-    const resumeCandidate = paneContent ? getResumeCandidateForTerminalContent(paneContent, tab) : null
+    const resumeCandidate = paneContent ? getResumeCandidateForTerminalContent(paneContent, tab, extensions) : null
     const paneResumeMenuItem = resumeCandidate
-      ? [buildCopyResumeMenuItem('pane-copy-resume-command', resumeCandidate, actions)]
+      ? [buildCopyResumeMenuItem('pane-copy-resume-command', resumeCandidate, actions, extensions)]
       : []
     const canRefreshPane = !!paneContent && !!buildPaneRefreshTarget(paneContent)
     return [
@@ -289,12 +325,14 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     const tab = tabs.find((t) => t.id === target.tabId)
     const layout = paneLayouts[target.tabId]
     const paneContent = layout ? findPaneContent(layout, target.paneId) : null
-    const resumeCandidate = paneContent ? getResumeCandidateForTerminalContent(paneContent, tab) : null
+    const resumeCandidate = paneContent ? getResumeCandidateForTerminalContent(paneContent, tab, extensions) : null
     const terminalResumeMenuItem = resumeCandidate
-      ? [buildCopyResumeMenuItem('terminal-copy-resume-command', resumeCandidate, actions)]
+      ? [buildCopyResumeMenuItem('terminal-copy-resume-command', resumeCandidate, actions, extensions)]
       : []
     const canRefreshPane = !!paneContent && !!buildPaneRefreshTarget(paneContent)
     return [
+      ...buildTerminalClipboardItems(terminalActions, hasSelection),
+      { type: 'separator', id: 'terminal-clipboard-sep' },
       {
         type: 'item',
         id: 'refresh-pane',
@@ -305,27 +343,6 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
       { type: 'item', id: 'terminal-split-h', label: 'Split horizontally', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'horizontal') },
       { type: 'item', id: 'terminal-split-v', label: 'Split vertically', onSelect: () => actions.splitPane(target.tabId, target.paneId, 'vertical') },
       { type: 'separator', id: 'terminal-split-sep' },
-      {
-        type: 'item',
-        id: 'terminal-copy',
-        label: 'Copy selection',
-        onSelect: () => terminalActions?.copySelection(),
-        disabled: !terminalActions || !hasSelection,
-      },
-      {
-        type: 'item',
-        id: 'terminal-paste',
-        label: 'Paste',
-        onSelect: () => terminalActions?.paste(),
-        disabled: !terminalActions,
-      },
-      {
-        type: 'item',
-        id: 'terminal-select-all',
-        label: 'Select all',
-        onSelect: () => terminalActions?.selectAll(),
-        disabled: !terminalActions,
-      },
       {
         type: 'item',
         id: 'terminal-search',
@@ -435,14 +452,14 @@ export function buildMenuItems(target: ContextTarget, ctx: MenuBuildContext): Me
     const archived = sessionInfo?.session.archived ?? false
     const isRunning = !!target.runningTerminalId
     const provider = target.provider || 'claude'
-    const resumeCandidate = isResumeCommandProvider(provider)
+    const resumeCandidate = isResumeCommandProvider(provider, extensions)
       ? {
           provider,
           sessionId: target.sessionId,
         }
       : null
     const sidebarResumeMenuItem = resumeCandidate
-      ? [buildCopyResumeMenuItem('session-copy-resume-command', resumeCandidate, actions)]
+      ? [buildCopyResumeMenuItem('session-copy-resume-command', resumeCandidate, actions, extensions)]
       : []
 
     return [

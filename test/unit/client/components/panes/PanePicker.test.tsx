@@ -1,13 +1,37 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, within } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, waitFor, within } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import PanePicker from '@/components/panes/PanePicker'
+import { setStatus } from '@/store/connectionSlice'
 import settingsReducer from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import type { DefaultNewPane, SidebarSortMode, TerminalTheme } from '@/store/types'
+
+const mockApiGet = vi.fn()
+vi.mock('@/lib/api', () => ({
+  api: {
+    get: (...args: unknown[]) => mockApiGet(...args),
+  },
+}))
+
+const mockClaudeExt: ClientExtensionEntry = {
+  name: 'claude', version: '1.0.0', label: 'Claude CLI', description: '', category: 'cli',
+  picker: { shortcut: 'L' },
+  cli: { supportsPermissionMode: true, supportsResume: true, resumeCommandTemplate: ['claude', '--resume', '{{sessionId}}'] },
+}
+const mockCodexExt: ClientExtensionEntry = {
+  name: 'codex', version: '1.0.0', label: 'Codex CLI', description: '', category: 'cli',
+  picker: { shortcut: 'X' },
+  cli: { supportsModel: true, supportsSandbox: true, supportsResume: true, resumeCommandTemplate: ['codex', 'resume', '{{sessionId}}'] },
+}
+const mockOpencodeExt: ClientExtensionEntry = {
+  name: 'opencode', version: '1.0.0', label: 'OpenCode', description: '', category: 'cli',
+  cli: { supportsModel: true, supportsPermissionMode: true, supportsResume: true, resumeCommandTemplate: ['opencode', '--session', '{{sessionId}}'] },
+}
+const defaultCliExtensions: ClientExtensionEntry[] = [mockClaudeExt, mockCodexExt]
 
 // Mock lucide-react icons
 vi.mock('lucide-react', () => ({
@@ -27,6 +51,8 @@ vi.mock('lucide-react', () => ({
 
 function createStore(overrides?: {
   platform?: string | null
+  connectionStatus?: 'disconnected' | 'connecting' | 'connected' | 'ready'
+  serverInstanceId?: string
   availableClis?: Record<string, boolean>
   enabledProviders?: string[]
   extensions?: ClientExtensionEntry[]
@@ -40,10 +66,11 @@ function createStore(overrides?: {
     },
     preloadedState: {
       connection: {
-        status: 'ready' as const,
+        status: overrides?.connectionStatus ?? 'ready',
         platform: overrides?.platform ?? null,
         availableClis: overrides?.availableClis ?? {},
         featureFlags: overrides?.featureFlags ?? {},
+        serverInstanceId: overrides?.serverInstanceId,
       },
       extensions: {
         entries: overrides?.extensions ?? [],
@@ -112,6 +139,9 @@ const completeFadeAnimation = () => {
 describe('PanePicker', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mockApiGet.mockReset()
+    localStorage.clear()
+    localStorage.setItem('freshell.auth-token', 'test-token')
   })
 
   afterEach(() => {
@@ -137,15 +167,27 @@ describe('PanePicker', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
+        extensions: defaultCliExtensions,
       })
       expect(screen.getByRole('button', { name: 'Claude CLI' })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Codex CLI' })).toBeInTheDocument()
+    })
+
+    it('shows OpenCode when available and enabled', () => {
+      renderPicker({
+        availableClis: { opencode: true },
+        enabledProviders: ['opencode'],
+        extensions: [mockOpencodeExt],
+      })
+
+      expect(screen.getByRole('button', { name: 'OpenCode' })).toBeInTheDocument()
     })
 
     it('hides Claude CLI when not available on system', () => {
       renderPicker({
         availableClis: { claude: false, codex: true },
         enabledProviders: ['claude', 'codex'],
+        extensions: defaultCliExtensions,
       })
       expect(screen.queryByRole('button', { name: 'Claude CLI' })).not.toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Codex CLI' })).toBeInTheDocument()
@@ -155,6 +197,7 @@ describe('PanePicker', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude'],
+        extensions: defaultCliExtensions,
       })
       expect(screen.getByRole('button', { name: 'Claude CLI' })).toBeInTheDocument()
       expect(screen.queryByRole('button', { name: 'Codex CLI' })).not.toBeInTheDocument()
@@ -164,6 +207,7 @@ describe('PanePicker', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
+        extensions: defaultCliExtensions,
       })
       const claudeButton = screen.getByRole('button', { name: 'Claude CLI' })
       const codexButton = screen.getByRole('button', { name: 'Codex CLI' })
@@ -179,6 +223,7 @@ describe('PanePicker', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
+        extensions: defaultCliExtensions,
       })
       const buttons = screen.getAllByRole('button')
       const labels = buttons.map(b => b.getAttribute('aria-label'))
@@ -195,6 +240,7 @@ describe('PanePicker', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
+        extensions: defaultCliExtensions,
         featureFlags: { kilroy: true },
       })
       const buttons = screen.getAllByRole('button')
@@ -217,6 +263,71 @@ describe('PanePicker', () => {
       expect(screen.getByRole('button', { name: 'Editor' })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Browser' })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Shell' })).toBeInTheDocument()
+    })
+
+    it('loads extension options on demand when the registry is empty', async () => {
+      mockApiGet.mockResolvedValue([
+        {
+          name: 'notes-widget',
+          version: '0.1.0',
+          label: 'Notes Widget',
+          description: 'A notes widget',
+          category: 'client',
+        },
+      ])
+
+      renderPicker()
+
+      expect(mockApiGet).toHaveBeenCalledWith(expect.stringContaining('/api/extensions'))
+      expect(await screen.findByRole('button', { name: 'Notes Widget' })).toBeInTheDocument()
+    })
+
+    it('retries loading the extension registry after the connection reaches ready', async () => {
+      mockApiGet
+        .mockRejectedValueOnce({ status: 503, message: 'Service Unavailable' })
+        .mockResolvedValueOnce([
+          {
+            name: 'notes-widget',
+            version: '0.1.0',
+            label: 'Notes Widget',
+            description: 'A notes widget',
+            category: 'client',
+          },
+        ])
+
+      const { store } = renderPicker({
+        connectionStatus: 'connecting',
+      })
+
+      await waitFor(() => {
+        expect(mockApiGet).toHaveBeenCalledTimes(1)
+      })
+      await Promise.resolve()
+
+      store.dispatch(setStatus('ready'))
+
+      expect(await screen.findByRole('button', { name: 'Notes Widget' })).toBeInTheDocument()
+      expect(mockApiGet).toHaveBeenCalledTimes(2)
+    })
+
+    it('does not load extension options on demand without an auth token', async () => {
+      localStorage.removeItem('freshell.auth-token')
+      mockApiGet.mockResolvedValue([
+        {
+          name: 'notes-widget',
+          version: '0.1.0',
+          label: 'Notes Widget',
+          description: 'A notes widget',
+          category: 'client',
+        },
+      ])
+
+      renderPicker()
+
+      await Promise.resolve()
+
+      expect(mockApiGet).not.toHaveBeenCalled()
+      expect(screen.queryByRole('button', { name: 'Notes Widget' })).not.toBeInTheDocument()
     })
   })
 
@@ -250,6 +361,7 @@ describe('PanePicker', () => {
       const { onSelect } = renderPicker({
         availableClis: { claude: true },
         enabledProviders: ['claude'],
+        extensions: defaultCliExtensions,
       })
       fireEvent.click(screen.getByRole('button', { name: 'Claude CLI' }))
       completeFadeAnimation()
@@ -278,6 +390,7 @@ describe('PanePicker', () => {
       const { onSelect } = renderPicker({
         availableClis: { claude: true },
         enabledProviders: ['claude'],
+        extensions: defaultCliExtensions,
       })
       fireEvent.keyDown(getContainer(), { key: 'l' })
       completeFadeAnimation()
@@ -288,6 +401,7 @@ describe('PanePicker', () => {
       const { onSelect } = renderPicker({
         availableClis: { codex: true },
         enabledProviders: ['codex'],
+        extensions: defaultCliExtensions,
       })
       fireEvent.keyDown(getContainer(), { key: 'x' })
       completeFadeAnimation()
@@ -479,6 +593,7 @@ describe('PanePicker', () => {
       renderPicker({
         availableClis: { claude: true, codex: true },
         enabledProviders: ['claude', 'codex'],
+        extensions: defaultCliExtensions,
       })
 
       const rows = screen.getAllByTestId('pane-picker-option-row')

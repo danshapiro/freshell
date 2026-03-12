@@ -18,7 +18,7 @@ export interface ChatMessage {
 
 /**
  * Parse JSONL content from a Claude Code session file and extract chat messages
- * in the format compatible with sdk.history.
+ * in the normalized shape used by visible-first restore flows.
  */
 export function extractChatMessagesFromJsonl(content: string): ChatMessage[] {
   const lines = content.split(/\r?\n/).filter(Boolean)

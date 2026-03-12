@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.freshell.server</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{NODE_BINARY}}</string>
+    <string>{{SERVER_ENTRY}}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PORT</key>
+    <string>{{PORT}}</string>
+    <key>NODE_PATH</key>
+    <string>{{NODE_PATH}}</string>
+    <key>NODE_ENV</key>
+    <string>production</string>
+    <key>FRESHELL_CONFIG_DIR</key>
+    <string>{{CONFIG_DIR}}</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{{LOG_DIR}}/server-stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{LOG_DIR}}/server-stderr.log</string>
+</dict>
+</plist>

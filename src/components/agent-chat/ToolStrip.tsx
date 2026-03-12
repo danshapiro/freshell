@@ -54,13 +54,16 @@ interface ToolStripProps {
   completedToolOffset?: number
   /** Completed tools at globalIndex >= this value get initialExpanded=true. */
   autoExpandAbove?: number
+  /** When false, strip is locked to collapsed view (no expand chevron). Default true. */
+  showTools?: boolean
 }
 
-function ToolStrip({ pairs, isStreaming, completedToolOffset, autoExpandAbove }: ToolStripProps) {
-  const expanded = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot)
+function ToolStrip({ pairs, isStreaming, completedToolOffset, autoExpandAbove, showTools = true }: ToolStripProps) {
+  const expandedPref = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot)
+  const expanded = showTools && expandedPref
 
   const handleToggle = () => {
-    setExpandedPreference(!expanded)
+    setExpandedPreference(!expandedPref)
   }
 
   const hasErrors = pairs.some(p => p.isError)
@@ -88,26 +91,28 @@ function ToolStrip({ pairs, isStreaming, completedToolOffset, autoExpandAbove }:
     <div
       role="region"
       aria-label="Tool strip"
-      className="my-1"
+      className="my-0.5"
     >
       {/* Collapsed view: single-line reel with tool-colored border + chevron */}
       {!expanded && (
         <div
           className={cn(
-            'flex items-center gap-1 px-2 py-1 text-xs min-w-0 border-l-2',
+            'flex items-center gap-1 px-2 py-0.5 text-xs min-w-0 border-l-2',
             hasErrors
               ? 'border-l-[hsl(var(--claude-error))]'
               : 'border-l-[hsl(var(--claude-tool))]',
           )}
         >
-          <button
-            type="button"
-            onClick={handleToggle}
-            className="shrink-0 p-0.5 hover:bg-accent/50 rounded transition-colors"
-            aria-label="Toggle tool details"
-          >
-            <ChevronRight className="h-3 w-3" />
-          </button>
+          {showTools && (
+            <button
+              type="button"
+              onClick={handleToggle}
+              className="shrink-0 p-0.5 hover:bg-accent/50 rounded transition-colors"
+              aria-label="Toggle tool details"
+            >
+              <ChevronRight className="h-3 w-3" />
+            </button>
+          )}
           <SlotReel
             toolName={isSettled ? null : (currentTool?.name ?? null)}
             previewText={
@@ -129,7 +134,7 @@ function ToolStrip({ pairs, isStreaming, completedToolOffset, autoExpandAbove }:
           <button
             type="button"
             onClick={handleToggle}
-            className="shrink-0 p-0.5 hover:bg-accent/50 rounded transition-colors ml-2"
+            className="ml-1.5 shrink-0 rounded p-0.5 transition-colors hover:bg-accent/50"
             aria-label="Toggle tool details"
           >
             <ChevronRight className="h-3 w-3 rotate-90 transition-transform" />

@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
 import TabItem from '@/components/TabItem'
 import type { Tab } from '@/store/types'
+import type { PaneContent } from '@/store/paneTypes'
 
 // Mock lucide-react icons
 vi.mock('lucide-react', () => ({
@@ -10,6 +11,12 @@ vi.mock('lucide-react', () => ({
   ),
   Circle: ({ className }: { className?: string }) => (
     <svg data-testid="circle-icon" className={className} />
+  ),
+}))
+
+vi.mock('@/components/icons/PaneIcon', () => ({
+  default: ({ content, className }: { content: any; className?: string }) => (
+    <svg data-testid="pane-icon" data-terminal-id={content?.terminalId} className={className} />
   ),
 }))
 
@@ -99,6 +106,14 @@ describe('TabItem', () => {
     expect(el?.className).toContain('bg-muted')
   })
 
+  it('uses a static blue status dot for creating tabs when pane icons are unavailable', () => {
+    render(<TabItem {...defaultProps} tab={createTab({ status: 'creating' })} paneContents={[]} iconsOnTabs={false} />)
+    const dot = screen.getByTestId('circle-icon')
+    expect(dot.getAttribute('class')).toContain('text-blue-500')
+    expect(dot.getAttribute('class')).toContain('fill-blue-500')
+    expect(dot.getAttribute('class')).not.toContain('animate-pulse')
+  })
+
   it('applies attention classes on active tab with highlight', () => {
     render(<TabItem {...defaultProps} isActive={true} needsAttention={true} tabAttentionStyle="highlight" />)
     const el = getTabElement()
@@ -138,6 +153,89 @@ describe('TabItem', () => {
       />
     )
     expect(screen.getByDisplayValue('Editing')).toBeInTheDocument()
+  })
+
+  it('pulses only the exact busy terminal icon in split tabs', () => {
+    const paneContents: PaneContent[] = [
+      {
+        kind: 'terminal',
+        mode: 'codex',
+        shell: 'system',
+        status: 'running',
+        createRequestId: 'req-1',
+        terminalId: 'term-1',
+      },
+      {
+        kind: 'terminal',
+        mode: 'shell',
+        shell: 'system',
+        status: 'running',
+        createRequestId: 'req-2',
+        terminalId: 'term-2',
+      },
+    ]
+
+    render(
+      <TabItem
+        {...defaultProps}
+        paneContents={paneContents}
+        activityPulse={true}
+        activityTerminalIds={['term-1']}
+      />
+    )
+
+    const icons = screen.getAllByTestId('pane-icon')
+    const busyIcon = icons.find((icon) => icon.getAttribute('data-terminal-id') === 'term-1')
+    const idleIcon = icons.find((icon) => icon.getAttribute('data-terminal-id') === 'term-2')
+
+    expect(busyIcon?.getAttribute('class')).toContain('animate-pulse')
+    expect(idleIcon?.getAttribute('class') ?? '').not.toContain('animate-pulse')
+  })
+
+  it('pulses a single unnamed terminal icon during the exact tab-terminal fallback', () => {
+    const paneContents: PaneContent[] = [
+      {
+        kind: 'terminal',
+        mode: 'codex',
+        shell: 'system',
+        status: 'running',
+        createRequestId: 'req-1',
+        terminalId: undefined,
+      },
+    ]
+
+    render(
+      <TabItem
+        {...defaultProps}
+        paneContents={paneContents}
+        activityPulse={true}
+        activityTerminalIds={['term-tab']}
+      />
+    )
+
+    expect(screen.getByTestId('pane-icon').getAttribute('class')).toContain('animate-pulse')
+  })
+
+  it('pulses the overflow indicator when the exact busy terminal is hidden beyond the visible icon cap', () => {
+    const paneContents: PaneContent[] = Array.from({ length: 7 }, (_, index) => ({
+      kind: 'terminal',
+      mode: 'shell',
+      shell: 'system',
+      status: 'running',
+      createRequestId: `req-${index + 1}`,
+      terminalId: `term-${index + 1}`,
+    }))
+
+    render(
+      <TabItem
+        {...defaultProps}
+        paneContents={paneContents}
+        activityPulse={true}
+        activityTerminalIds={['term-7']}
+      />
+    )
+
+    expect(screen.getByText('+1').getAttribute('class')).toContain('animate-pulse')
   })
 
   it('calls onClick when clicked', () => {
@@ -181,6 +279,72 @@ describe('TabItem', () => {
     render(<TabItem {...defaultProps} isActive={false} />)
     const el = getTabElement()
     expect(el?.className).not.toContain('mt-1')
+  })
+
+  describe('tooltip', () => {
+    it('shows full title in tooltip on hover', async () => {
+      render(<TabItem {...defaultProps} tab={createTab({ title: 'My Long Tab Name' })} />)
+
+      const tabEl = screen.getByRole('button', { name: 'My Long Tab Name' })
+      fireEvent.mouseEnter(tabEl)
+
+      const tooltip = await screen.findByRole('tooltip')
+      expect(tooltip).toHaveTextContent('My Long Tab Name')
+    })
+
+    it('hides tooltip on mouse leave', async () => {
+      render(<TabItem {...defaultProps} tab={createTab({ title: 'My Long Tab Name' })} />)
+
+      const tabEl = screen.getByRole('button', { name: 'My Long Tab Name' })
+      fireEvent.mouseEnter(tabEl)
+
+      // Wait for tooltip to appear
+      await screen.findByRole('tooltip')
+
+      fireEvent.mouseLeave(tabEl)
+
+      // Tooltip should be removed
+      await waitFor(() => {
+        expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
+      })
+    })
+
+    it('does not show tooltip during rename mode', async () => {
+      render(
+        <TabItem
+          {...defaultProps}
+          tab={createTab({ title: 'Renaming Tab' })}
+          isRenaming={true}
+          renameValue="Renaming Tab"
+        />
+      )
+
+      const tabEl = screen.getByRole('button', { name: 'Renaming Tab' })
+      fireEvent.mouseEnter(tabEl)
+
+      // Give React a chance to flush — tooltip should never appear
+      await waitFor(() => {
+        expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
+      })
+    })
+
+    it('does not show tooltip during drag', async () => {
+      render(
+        <TabItem
+          {...defaultProps}
+          tab={createTab({ title: 'Dragging Tab' })}
+          isDragging={true}
+        />
+      )
+
+      const tabEl = screen.getByRole('button', { name: 'Dragging Tab' })
+      fireEvent.mouseEnter(tabEl)
+
+      // Give React a chance to flush — tooltip should never appear
+      await waitFor(() => {
+        expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
+      })
+    })
   })
 
   describe('XSS sanitization', () => {

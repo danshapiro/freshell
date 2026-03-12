@@ -13,9 +13,19 @@ import {
 } from '../../../server/sdk-bridge-types.js'
 import { BrowserSdkMessageSchema, WS_PROTOCOL_VERSION } from '../../../shared/ws-protocol.js'
 
+const loadSessionHistoryMock = vi.hoisted(() => vi.fn())
+
 vi.mock('node-pty', () => ({
   spawn: vi.fn(),
 }))
+
+vi.mock('../../../server/session-history-loader.js', async () => {
+  const actual = await vi.importActual<typeof import('../../../server/session-history-loader.js')>('../../../server/session-history-loader.js')
+  return {
+    ...actual,
+    loadSessionHistory: (...args: Parameters<typeof actual.loadSessionHistory>) => loadSessionHistoryMock(...args),
+  }
+})
 
 const TEST_AUTH_TOKEN = 'testtoken-testtoken'
 
@@ -224,6 +234,7 @@ describe('WS Handler SDK Integration', () => {
       server = http.createServer()
       await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
       registry = new TerminalRegistry()
+      loadSessionHistoryMock.mockReset()
 
       mockSdkBridge = {
         createSession: vi.fn().mockReturnValue({ sessionId: 'sdk-sess-1', status: 'starting', messages: [] }),
@@ -461,7 +472,8 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
-    it('routes sdk.attach and returns history + status', async () => {
+    it('routes sdk.attach and returns snapshot + status without sdk.history', async () => {
+      loadSessionHistoryMock.mockResolvedValue(null)
       const ws = await connectAndAuth()
       try {
         const messages: any[] = []
@@ -469,8 +481,8 @@ describe('WS Handler SDK Integration', () => {
           let count = 0
           const onMessage = (data: WebSocket.RawData) => {
             const parsed = JSON.parse(data.toString())
-            if (parsed.type === 'sdk.history' || parsed.type === 'sdk.status') {
-              messages.push(parsed)
+            messages.push(parsed)
+            if (parsed.type === 'sdk.session.snapshot' || parsed.type === 'sdk.status') {
               count++
               if (count >= 2) {
                 ws.off('message', onMessage)
@@ -488,15 +500,16 @@ describe('WS Handler SDK Integration', () => {
 
         await collectDone
 
-        const historyMsg = messages.find((m) => m.type === 'sdk.history')
+        const snapshotMsg = messages.find((m) => m.type === 'sdk.session.snapshot')
         const statusMsg = messages.find((m) => m.type === 'sdk.status')
 
-        expect(historyMsg).toBeDefined()
-        expect(historyMsg.sessionId).toBe('sdk-sess-1')
-        expect(historyMsg.messages).toHaveLength(1)
+        expect(snapshotMsg).toBeDefined()
+        expect(snapshotMsg.sessionId).toBe('sdk-sess-1')
+        expect(snapshotMsg.latestTurnId).toBe('turn-0')
         expect(statusMsg).toBeDefined()
         expect(statusMsg.sessionId).toBe('sdk-sess-1')
         expect(statusMsg.status).toBe('idle')
+        expect(messages.some((m) => m.type === 'sdk.history')).toBe(false)
         expect(mockSdkBridge.getSession).toHaveBeenCalledWith('sdk-sess-1')
         expect(mockSdkBridge.subscribe).toHaveBeenCalledWith('sdk-sess-1', expect.any(Function))
       } finally {
@@ -504,8 +517,74 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
+    it('hydrates sdk.attach from durable Claude history when no live SDK session exists', async () => {
+      const durableSessionId = '00000000-0000-4000-8000-000000000241'
+      mockSdkBridge.getSession.mockReturnValue(undefined)
+      loadSessionHistoryMock.mockResolvedValue([
+        {
+          role: 'user',
+          content: [{ type: 'text', text: 'Earlier question' }],
+          timestamp: '2026-03-10T10:00:00.000Z',
+        },
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Earlier answer' }],
+          timestamp: '2026-03-10T10:00:01.000Z',
+        },
+      ])
+
+      const ws = await connectAndAuth()
+      try {
+        const messages: any[] = []
+        const collectDone = new Promise<void>((resolve) => {
+          let count = 0
+          const onMessage = (data: WebSocket.RawData) => {
+            const parsed = JSON.parse(data.toString())
+            messages.push(parsed)
+            if (parsed.type === 'sdk.session.snapshot' || parsed.type === 'sdk.status') {
+              count += 1
+              if (count >= 2) {
+                ws.off('message', onMessage)
+                resolve()
+              }
+            }
+          }
+          ws.on('message', onMessage)
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.attach',
+          sessionId: durableSessionId,
+        }))
+
+        await collectDone
+
+        const snapshotMsg = messages.find((m) => m.type === 'sdk.session.snapshot')
+        const statusMsg = messages.find((m) => m.type === 'sdk.status')
+
+        expect(snapshotMsg).toEqual({
+          type: 'sdk.session.snapshot',
+          sessionId: durableSessionId,
+          latestTurnId: 'turn-1',
+          status: 'idle',
+        })
+        expect(statusMsg).toEqual({
+          type: 'sdk.status',
+          sessionId: durableSessionId,
+          status: 'idle',
+        })
+        expect(messages.some((m) => m.type === 'sdk.error')).toBe(false)
+        expect(messages.some((m) => m.type === 'sdk.history')).toBe(false)
+        expect(loadSessionHistoryMock).toHaveBeenCalledWith(durableSessionId)
+        expect(mockSdkBridge.subscribe).not.toHaveBeenCalledWith(durableSessionId, expect.any(Function))
+      } finally {
+        ws.close()
+      }
+    })
+
     it('returns sdk.error for sdk.attach with unknown session', async () => {
       mockSdkBridge.getSession.mockReturnValue(undefined)
+      loadSessionHistoryMock.mockResolvedValue(null)
       const ws = await connectAndAuth()
       try {
         const response = await sendAndWaitForResponse(ws, {

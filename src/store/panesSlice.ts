@@ -511,6 +511,7 @@ export const panesSlice = createSlice({
         content: normalized,
       }
       state.activePane[tabId] = paneId
+      state.paneTitles[tabId] = { [paneId]: derivePaneTitle(normalized) }
       reconcileRefreshRequestsForTab(state, tabId)
     },
 
@@ -850,6 +851,21 @@ export const panesSlice = createSlice({
         const temp = titles[paneId]
         titles[paneId] = titles[otherId]
         titles[otherId] = temp
+      }
+
+      if (state.paneTitleSetByUser[tabId]) {
+        const titleSetByUser = state.paneTitleSetByUser[tabId]
+        const temp = titleSetByUser[paneId]
+        if (titleSetByUser[otherId] === undefined) {
+          delete titleSetByUser[paneId]
+        } else {
+          titleSetByUser[paneId] = titleSetByUser[otherId]
+        }
+        if (temp === undefined) {
+          delete titleSetByUser[otherId]
+        } else {
+          titleSetByUser[otherId] = temp
+        }
       }
 
       reconcileRefreshRequestsForTab(state, tabId)

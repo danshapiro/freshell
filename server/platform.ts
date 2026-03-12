@@ -92,18 +92,24 @@ async function isCommandAvailable(command: string): Promise<boolean> {
 
 export type AvailableClis = Record<string, boolean>
 
-const CLI_COMMANDS = [
+export type CliDetectionSpec = { name: string; envVar: string; defaultCmd: string }
+
+export const DEFAULT_CLI_DETECTION_SPECS: CliDetectionSpec[] = [
   { name: 'claude', envVar: 'CLAUDE_CMD', defaultCmd: 'claude' },
   { name: 'codex', envVar: 'CODEX_CMD', defaultCmd: 'codex' },
   { name: 'opencode', envVar: 'OPENCODE_CMD', defaultCmd: 'opencode' },
   { name: 'gemini', envVar: 'GEMINI_CMD', defaultCmd: 'gemini' },
   { name: 'kimi', envVar: 'KIMI_CMD', defaultCmd: 'kimi' },
-] as const
+]
 
-export async function detectAvailableClis(): Promise<AvailableClis> {
+export const DEFAULT_CLI_PROVIDER_NAMES = DEFAULT_CLI_DETECTION_SPECS.map((cli) => cli.name)
+
+export async function detectAvailableClis(
+  cliSpecs: CliDetectionSpec[] = DEFAULT_CLI_DETECTION_SPECS,
+): Promise<AvailableClis> {
   const results = await Promise.all(
-    CLI_COMMANDS.map(async (cli) => {
-      const cmd = process.env[cli.envVar] || cli.defaultCmd
+    cliSpecs.map(async (cli) => {
+      const cmd = cli.envVar ? (process.env[cli.envVar] || cli.defaultCmd) : cli.defaultCmd
       const available = await isCommandAvailable(cmd)
       return [cli.name, available] as const
     })

@@ -32,6 +32,8 @@ vi.mock('@/lib/api', () => ({
     patch: vi.fn().mockResolvedValue({}),
     post: vi.fn().mockResolvedValue({}),
   },
+  fetchSidebarSessionsSnapshot: vi.fn().mockResolvedValue([]),
+  isApiUnauthorizedError: (err: any) => !!err && typeof err === 'object' && err.status === 401,
 }))
 
 vi.mock('@/components/TabContent', () => ({
@@ -61,6 +63,10 @@ vi.mock('@/components/SetupWizard', () => ({
 
 vi.mock('@/hooks/useTheme', () => ({
   useThemeEffect: () => {},
+}))
+
+vi.mock('@/store/tabRegistrySync', () => ({
+  startTabRegistrySync: () => () => {},
 }))
 
 vi.mock('@use-gesture/react', () => ({

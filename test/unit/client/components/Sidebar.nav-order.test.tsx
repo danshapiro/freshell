@@ -6,7 +6,15 @@ import tabsReducer from '../../../../src/store/tabsSlice'
 import panesReducer from '../../../../src/store/panesSlice'
 import sessionsReducer from '../../../../src/store/sessionsSlice'
 import settingsReducer from '../../../../src/store/settingsSlice'
+import terminalDirectoryReducer from '../../../../src/store/terminalDirectorySlice'
 import Sidebar from '../../../../src/components/Sidebar'
+
+const fetchSidebarSessionsSnapshot = vi.hoisted(() => vi.fn().mockResolvedValue([]))
+const getTerminalDirectoryPage = vi.hoisted(() => vi.fn().mockResolvedValue({
+  items: [],
+  nextCursor: null,
+  revision: 1,
+}))
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -16,6 +24,15 @@ vi.mock('@/lib/ws-client', () => ({
   }),
 }))
 
+vi.mock('@/lib/api', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api')
+  return {
+    ...actual,
+    fetchSidebarSessionsSnapshot: (options?: unknown) => fetchSidebarSessionsSnapshot(options),
+    getTerminalDirectoryPage: (query?: unknown, options?: unknown) => getTerminalDirectoryPage(query, options),
+  }
+})
+
 describe('Sidebar navigation order', () => {
   it('renders navigation in the requested order', () => {
     const store = configureStore({
@@ -24,7 +41,14 @@ describe('Sidebar navigation order', () => {
         panes: panesReducer,
         sessions: sessionsReducer,
         settings: settingsReducer,
+        terminalDirectory: terminalDirectoryReducer,
       },
+      middleware: (getDefault) =>
+        getDefault({
+          serializableCheck: {
+            ignoredPaths: ['sessions.expandedProjects'],
+          },
+        }),
     })
 
     const { container } = render(

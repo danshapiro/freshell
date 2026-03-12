@@ -106,4 +106,21 @@ describe('client perf logger config', () => {
     setClientPerfEnabled(false, 'test')
     infoSpy.mockRestore()
   })
+
+  it('forwards perf entries to an installed audit sink without changing console behavior', async () => {
+    const { installClientPerfAuditSink, logClientPerf, setClientPerfEnabled } = await loadPerfLoggerModule()
+    const seen: unknown[] = []
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
+
+    setClientPerfEnabled(true, 'test')
+    installClientPerfAuditSink((entry) => seen.push(entry))
+    logClientPerf('perf.paint', { name: 'first-contentful-paint' })
+
+    expect(seen).toHaveLength(1)
+    expect(infoSpy.mock.calls.some((call) => call[0]?.event === 'perf.paint')).toBe(true)
+
+    installClientPerfAuditSink(null)
+    setClientPerfEnabled(false, 'test')
+    infoSpy.mockRestore()
+  })
 })

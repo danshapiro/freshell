@@ -48,7 +48,7 @@ export type UpstreamPhase =
   }
   | {
     runner: 'npm'
-    script: 'typecheck' | 'build'
+    script: 'typecheck' | 'build' | 'test:balanced'
     args: string[]
   }
 
@@ -187,8 +187,7 @@ function classifyCompositeCommand(commandKey: CommandKey, args: string[]): Comma
 
   if (targetAnalysis.kind === 'cross-config') {
     return coordinated(targetAnalysis.suiteKey, [
-      vitestPhase('default', ['run', ...filteredArgs]),
-      vitestPhase('server', ['run', '--config', 'vitest.server.config.ts', ...filteredArgs]),
+      npmPhase('test:balanced', filteredArgs),
     ])
   }
 
@@ -206,8 +205,7 @@ function classifyCompositeCommand(commandKey: CommandKey, args: string[]): Comma
 
   if (isBroadCompositeWorkload(filteredArgs)) {
     return coordinated(coordinatedSuiteKeyForCompositeWorkload(filteredArgs), [
-      vitestPhase('default', ['run', ...filteredArgs]),
-      vitestPhase('server', ['run', '--config', 'vitest.server.config.ts', ...filteredArgs]),
+      npmPhase('test:balanced', filteredArgs),
     ])
   }
 
@@ -531,6 +529,14 @@ function vitestPhase(config: 'default' | 'server', args: string[]): UpstreamPhas
   return {
     runner: 'vitest',
     config,
+    args,
+  }
+}
+
+function npmPhase(script: 'typecheck' | 'build' | 'test:balanced', args: string[]): UpstreamPhase {
+  return {
+    runner: 'npm',
+    script,
     args,
   }
 }

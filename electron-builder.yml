@@ -1,0 +1,91 @@
+appId: com.freshell.desktop
+productName: Freshell
+copyright: Copyright (c) 2026 Freshell
+
+directories:
+  output: release
+  buildResources: assets/electron
+
+# --- ASAR vs extraResources split ---
+#
+# The ASAR archive (files) contains ONLY code that runs inside Electron's
+# patched Node.js, which can transparently read from ASAR:
+#   - dist/electron/** (main process code)
+#   - dist/wizard/**  (wizard renderer bundle)
+#
+# Everything the standalone bundled Node.js binary needs is placed in
+# extraResources, which lives on the REAL filesystem. A vanilla Node.js
+# process cannot read from ASAR archives -- it would get ENOENT/MODULE_NOT_FOUND.
+# This includes:
+#   - dist/server/** (the Freshell server code)
+#   - dist/client/** (static web assets served by Express)
+#   - server-node-modules/** (pruned runtime dependencies for the server)
+#   - bundled-node/bin/** (the standalone Node.js binary)
+#   - bundled-node/native-modules/** (recompiled node-pty)
+
+files:
+  - dist/electron/**
+  - dist/wizard/**
+  - package.json
+
+extraResources:
+  # The standalone Node.js binary
+  - from: bundled-node/${os}/${arch}
+    to: bundled-node/bin
+    filter:
+      - "**/*"
+  # Recompiled native modules (node-pty against bundled Node ABI)
+  - from: bundled-node/native-modules
+    to: bundled-node/native-modules
+    filter:
+      - "**/*"
+  # The Freshell server (runs under bundled Node, NOT Electron)
+  - from: dist/server
+    to: server
+    filter:
+      - "**/*"
+  # Static client assets (served by Express in production)
+  - from: dist/client
+    to: client
+    filter:
+      - "**/*"
+  # Pruned server runtime dependencies (see prepare-bundled-node.ts Step 4)
+  - from: server-node-modules
+    to: server-node-modules
+    filter:
+      - "**/*"
+  # Tray icons (needed at runtime for system tray)
+  - from: assets/electron
+    to: assets
+    filter:
+      - "tray-icon*"
+  # Installer templates (daemon service definitions for launchd/systemd/Windows Task Scheduler)
+  - from: installers
+    to: installers
+    filter:
+      - "**/*"
+
+mac:
+  category: public.app-category.developer-tools
+  target:
+    - dmg
+  icon: assets/electron/icon.icns
+
+win:
+  target:
+    - nsis
+  icon: assets/electron/icon.ico
+
+linux:
+  target:
+    - AppImage
+    - deb
+  category: Development
+  icon: assets/electron/icons
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+
+publish:
+  provider: github

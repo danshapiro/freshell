@@ -1,11 +1,29 @@
 import type { CodingCliProviderName } from './coding-cli-types'
 import { getClientPerfConfig, isClientPerfLoggingEnabled, logClientPerf } from '@/lib/perf-logger'
 import { getAuthToken } from '@/lib/auth'
+import { sanitizeSessionLocators } from '@/lib/session-utils'
+import type { SessionLocator } from '@/store/paneTypes'
+import {
+  AgentTimelinePageQuerySchema,
+  SessionDirectoryQuerySchema,
+  TerminalDirectoryQuerySchema,
+  TerminalScrollbackQuerySchema,
+  TerminalSearchQuerySchema,
+  type AgentTimelinePageQuery,
+  type SessionDirectoryQuery,
+  type TerminalDirectoryQuery,
+  type TerminalScrollbackQuery,
+  type TerminalSearchQuery,
+} from '@shared/read-models'
 
 export type ApiError = {
   status: number
   message: string
   details?: unknown
+}
+
+export type ApiRequestOptions = {
+  signal?: AbortSignal
 }
 
 export function isApiUnauthorizedError(error: unknown): error is ApiError {
@@ -96,7 +114,7 @@ async function request<T = any>(path: string, options: RequestInit = {}): Promis
   if (!res.ok) {
     const err: ApiError = {
       status: res.status,
-      message: (data && data.error) || res.statusText,
+      message: (data && (data.message || data.error)) || res.statusText,
       details: data,
     }
     throw err
@@ -106,21 +124,133 @@ async function request<T = any>(path: string, options: RequestInit = {}): Promis
 }
 
 export const api = {
-  get<T = any>(path: string): Promise<T> {
-    return request<T>(path)
+  get<T = any>(path: string, options: ApiRequestOptions = {}): Promise<T> {
+    return request<T>(path, options)
   },
-  post<T = any>(path: string, body: unknown): Promise<T> {
-    return request<T>(path, { method: 'POST', body: JSON.stringify(body) })
+  post<T = any>(path: string, body: unknown, options: ApiRequestOptions = {}): Promise<T> {
+    return request<T>(path, { ...options, method: 'POST', body: JSON.stringify(body) })
   },
-  patch<T = any>(path: string, body: unknown): Promise<T> {
-    return request<T>(path, { method: 'PATCH', body: JSON.stringify(body) })
+  patch<T = any>(path: string, body: unknown, options: ApiRequestOptions = {}): Promise<T> {
+    return request<T>(path, { ...options, method: 'PATCH', body: JSON.stringify(body) })
   },
-  put<T = any>(path: string, body: unknown): Promise<T> {
-    return request<T>(path, { method: 'PUT', body: JSON.stringify(body) })
+  put<T = any>(path: string, body: unknown, options: ApiRequestOptions = {}): Promise<T> {
+    return request<T>(path, { ...options, method: 'PUT', body: JSON.stringify(body) })
   },
-  delete<T = any>(path: string): Promise<T> {
-    return request<T>(path, { method: 'DELETE' })
+  delete<T = any>(path: string, options: ApiRequestOptions = {}): Promise<T> {
+    return request<T>(path, { ...options, method: 'DELETE' })
   },
+}
+
+function buildQueryString(entries: Array<[string, string | number | undefined]>): string {
+  const params = new URLSearchParams()
+  for (const [key, value] of entries) {
+    if (value === undefined) continue
+    params.set(key, String(value))
+  }
+  const query = params.toString()
+  return query.length > 0 ? `?${query}` : ''
+}
+
+export async function getBootstrap(options: ApiRequestOptions = {}): Promise<any> {
+  return api.get('/api/bootstrap', options)
+}
+
+export async function getSessionDirectoryPage(
+  query: SessionDirectoryQuery,
+  options: ApiRequestOptions = {},
+): Promise<any> {
+  const parsed = SessionDirectoryQuerySchema.parse(query)
+  return api.get(
+    `/api/session-directory${buildQueryString([
+      ['query', parsed.query],
+      ['cursor', parsed.cursor],
+      ['priority', parsed.priority],
+      ['revision', parsed.revision],
+      ['limit', parsed.limit],
+    ])}`,
+    options,
+  )
+}
+
+export async function getTerminalDirectoryPage(
+  query: TerminalDirectoryQuery,
+  options: ApiRequestOptions = {},
+): Promise<any> {
+  const parsed = TerminalDirectoryQuerySchema.parse(query)
+  return api.get(
+    `/api/terminals${buildQueryString([
+      ['cursor', parsed.cursor],
+      ['priority', parsed.priority],
+      ['revision', parsed.revision],
+      ['limit', parsed.limit],
+    ])}`,
+    options,
+  )
+}
+
+export async function getAgentTimelinePage(
+  sessionId: string,
+  query: AgentTimelinePageQuery = {},
+  options: ApiRequestOptions = {},
+): Promise<any> {
+  const parsed = AgentTimelinePageQuerySchema.parse(query)
+  return api.get(
+    `/api/agent-sessions/${encodeURIComponent(sessionId)}/timeline${buildQueryString([
+      ['cursor', parsed.cursor],
+      ['priority', parsed.priority],
+      ['limit', parsed.limit],
+    ])}`,
+    options,
+  )
+}
+
+export async function getAgentTurnBody(
+  sessionId: string,
+  turnId: string,
+  options: ApiRequestOptions = {},
+): Promise<any> {
+  return api.get(
+    `/api/agent-sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}`,
+    options,
+  )
+}
+
+export async function getTerminalViewport(
+  terminalId: string,
+  options: ApiRequestOptions = {},
+): Promise<any> {
+  return api.get(`/api/terminals/${encodeURIComponent(terminalId)}/viewport`, options)
+}
+
+export async function getTerminalScrollbackPage(
+  terminalId: string,
+  query: TerminalScrollbackQuery = {},
+  options: ApiRequestOptions = {},
+): Promise<any> {
+  const parsed = TerminalScrollbackQuerySchema.parse(query)
+  return api.get(
+    `/api/terminals/${encodeURIComponent(terminalId)}/scrollback${buildQueryString([
+      ['cursor', parsed.cursor],
+      ['limit', parsed.limit],
+    ])}`,
+    options,
+  )
+}
+
+export async function searchTerminalView(
+  terminalId: string,
+  query: TerminalSearchQuery,
+  options: ApiRequestOptions = {},
+): Promise<any> {
+  const parsed = TerminalSearchQuerySchema.parse(query)
+  return api.get(
+    `/api/terminals/${encodeURIComponent(terminalId)}/search${buildQueryString([
+      ['query', parsed.query],
+      ['cursor', parsed.cursor],
+      ['limit', parsed.limit],
+    ])}`,
+    options,
+  )
 }
 
 export type VersionInfo = {
@@ -140,12 +270,16 @@ export type SearchResult = {
   projectPath: string
   title?: string
   summary?: string
+  sessionType?: string
   matchedIn: 'title' | 'userMessage' | 'assistantMessage' | 'summary'
   snippet?: string
   updatedAt: number
   createdAt?: number
   archived?: boolean
   cwd?: string
+  firstUserMessage?: string
+  isSubagent?: boolean
+  isNonInteractive?: boolean
 }
 
 export type SearchResponse = {
@@ -162,6 +296,65 @@ export type SearchOptions = {
   tier?: 'title' | 'userMessages' | 'fullText'
   limit?: number
   maxFiles?: number
+  signal?: AbortSignal
+}
+
+type SessionDirectoryItemResponse = {
+  sessionId: string
+  provider: CodingCliProviderName
+  projectPath: string
+  title?: string
+  summary?: string
+  snippet?: string
+  matchedIn?: 'title' | 'summary' | 'firstUserMessage'
+  updatedAt: number
+  createdAt?: number
+  archived?: boolean
+  cwd?: string
+  sessionType?: string
+  firstUserMessage?: string
+  isSubagent?: boolean
+  isNonInteractive?: boolean
+}
+
+type SessionDirectoryPageResponse = {
+  items: SessionDirectoryItemResponse[]
+  nextCursor: string | null
+  revision: number
+}
+
+function encodeLegacySessionCursor(before: number | undefined, beforeId: string | undefined): string | undefined {
+  if (before === undefined || beforeId === undefined) return undefined
+  const raw = JSON.stringify({ updatedAt: before, key: beforeId })
+  return btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
+}
+
+function groupDirectoryItemsAsProjects(items: SessionDirectoryItemResponse[]) {
+  const groups = new Map<string, Array<SessionDirectoryItemResponse>>()
+  for (const item of items) {
+    const bucket = groups.get(item.projectPath) ?? []
+    bucket.push(item)
+    groups.set(item.projectPath, bucket)
+  }
+
+  return Array.from(groups.entries()).map(([projectPath, sessions]) => ({
+    projectPath,
+    sessions: sessions.map((item) => ({
+      provider: item.provider,
+      sessionId: item.sessionId,
+      projectPath: item.projectPath,
+      updatedAt: item.updatedAt,
+      createdAt: item.createdAt,
+      archived: item.archived,
+      cwd: item.cwd,
+      title: item.title,
+      summary: item.summary,
+      isSubagent: item.isSubagent,
+      isNonInteractive: item.isNonInteractive,
+      firstUserMessage: item.firstUserMessage,
+      sessionType: item.sessionType,
+    })),
+  }))
 }
 
 export async function setSessionMetadata(
@@ -172,11 +365,72 @@ export async function setSessionMetadata(
   await api.post('/api/session-metadata', { provider, sessionId, sessionType })
 }
 
-export async function searchSessions(options: SearchOptions): Promise<SearchResponse> {
-  const { query, tier = 'title', limit, maxFiles } = options
-  const params = new URLSearchParams({ q: query, tier })
-  if (limit) params.set('limit', String(limit))
-  if (maxFiles) params.set('maxFiles', String(maxFiles))
+export async function fetchSidebarSessionsSnapshot(options: {
+  limit?: number
+  before?: number
+  beforeId?: string
+  openSessions?: SessionLocator[]
+  signal?: AbortSignal
+} = {}): Promise<any> {
+  const {
+    limit = 100,
+    before,
+    beforeId,
+    openSessions = [],
+    signal,
+  } = options
+  sanitizeSessionLocators(openSessions)
 
-  return api.get<SearchResponse>(`/api/sessions/search?${params}`)
+  const page = await getSessionDirectoryPage({
+    priority: 'visible',
+    limit: Math.min(limit, 50),
+    cursor: encodeLegacySessionCursor(before, beforeId),
+  }, {
+    signal,
+  }) as SessionDirectoryPageResponse
+
+  const projects = groupDirectoryItemsAsProjects(page.items)
+  const oldest = page.items.at(-1)
+
+  return {
+    projects,
+    totalSessions: page.items.length,
+    oldestIncludedTimestamp: oldest?.updatedAt ?? 0,
+    oldestIncludedSessionId: oldest ? `${oldest.provider}:${oldest.sessionId}` : '',
+    hasMore: page.nextCursor !== null,
+  }
+}
+
+export async function searchSessions(options: SearchOptions): Promise<SearchResponse> {
+  const { query, tier = 'title', limit, signal } = options
+  const page = await getSessionDirectoryPage({
+    priority: 'visible',
+    query,
+    ...(limit ? { limit } : {}),
+  }, {
+    signal,
+  }) as SessionDirectoryPageResponse
+
+  return {
+    results: page.items.map((item) => ({
+      sessionId: item.sessionId,
+      provider: item.provider,
+      projectPath: item.projectPath,
+      title: item.title,
+      summary: item.summary,
+      matchedIn: item.matchedIn === 'firstUserMessage' ? 'userMessage' : item.matchedIn ?? 'title',
+      snippet: item.snippet,
+      updatedAt: item.updatedAt,
+      createdAt: item.createdAt,
+      archived: item.archived,
+      cwd: item.cwd,
+      sessionType: item.sessionType,
+      firstUserMessage: item.firstUserMessage,
+      isSubagent: item.isSubagent,
+      isNonInteractive: item.isNonInteractive,
+    })),
+    tier,
+    query,
+    totalScanned: page.items.length,
+  }
 }

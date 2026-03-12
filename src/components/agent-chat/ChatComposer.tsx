@@ -15,9 +15,10 @@ interface ChatComposerProps {
   isRunning?: boolean
   placeholder?: string
   autoFocus?: boolean
+  shouldFocusOnReady?: boolean
 }
 
-const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function ChatComposer({ paneId, onSend, onInterrupt, disabled, isRunning, placeholder, autoFocus }, ref) {
+const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function ChatComposer({ paneId, onSend, onInterrupt, disabled, isRunning, placeholder, autoFocus, shouldFocusOnReady }, ref) {
   const [text, setText] = useState(() => (paneId ? getDraft(paneId) : ''))
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
 
@@ -42,23 +43,24 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
     focus: () => textareaRef.current?.focus(),
   }), [])
 
-  // Auto-focus when the textarea becomes enabled (disabled transitions false).
+  // Focus when the textarea becomes enabled (disabled transitions false).
   // At mount the textarea may be disabled (status='creating'), so we watch
-  // the `disabled` prop and focus once it goes falsy — if autoFocus was requested.
-  const autoFocusFiredRef = useRef(false)
+  // the `disabled` prop and focus once it goes falsy when requested.
+  const focusOnReadyFiredRef = useRef(false)
+  const focusRequested = shouldFocusOnReady ?? autoFocus ?? false
   const textareaCallbackRef = useCallback((node: HTMLTextAreaElement | null) => {
     textareaRef.current = node
   }, [])
 
   useEffect(() => {
-    if (!autoFocus || disabled || autoFocusFiredRef.current) return
-    autoFocusFiredRef.current = true
+    if (!focusRequested || disabled || focusOnReadyFiredRef.current) return
+    focusOnReadyFiredRef.current = true
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         textareaRef.current?.focus()
       })
     })
-  }, [disabled, autoFocus])
+  }, [disabled, focusRequested])
 
   // Sync draft store on every text change
   const handleTextChange = useCallback((value: string) => {
@@ -103,7 +105,7 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
   }, [])
 
   return (
-    <div className="border-t p-3">
+    <div className="border-t px-3 py-2">
       <div className="flex items-end gap-2">
         <textarea
           ref={textareaCallbackRef}
@@ -115,7 +117,7 @@ const ChatComposer = forwardRef<ChatComposerHandle, ChatComposerProps>(function 
           placeholder={placeholder ?? 'Message Claude...'}
           rows={1}
           className={cn(
-            'flex-1 resize-none rounded border bg-background px-3 py-2 text-sm',
+            'flex-1 resize-none rounded border bg-background px-3 py-1.5 text-sm',
             'focus:outline-none focus:ring-2 focus:ring-ring',
             'min-h-[36px] max-h-[200px]',
             'disabled:opacity-50'

@@ -6,6 +6,12 @@ import { initLayout } from '@/store/panesSlice'
 import { fetchFirewallConfig } from '@/lib/firewall-configure'
 import { ensureShareUrlToken } from '@/lib/share-utils'
 import { getAuthToken } from '@/lib/auth'
+import {
+  SETUP_WIZARD_AUTO_ADVANCE_DELAY_MS,
+  SETUP_WIZARD_COPY_RESET_DELAY_MS,
+  SETUP_WIZARD_FIREWALL_POLL_INTERVAL_MS,
+  SETUP_WIZARD_FIREWALL_POLL_MAX_ATTEMPTS,
+} from '@/components/setup-wizard-timing'
 import { generate } from 'lean-qr'
 import { toSvgDataURL } from 'lean-qr/extras/svg'
 import { nanoid } from '@reduxjs/toolkit'
@@ -121,7 +127,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
   // Firewall errors stay on step 2 so the user can see and act on them.
   useEffect(() => {
     if (step === 2 && bindStatus === 'done' && firewallStatus === 'done') {
-      const timer = setTimeout(() => setStep(3), 800)
+      const timer = setTimeout(() => setStep(3), SETUP_WIZARD_AUTO_ADVANCE_DELAY_MS)
       return () => clearTimeout(timer)
     }
   }, [step, bindStatus, firewallStatus])
@@ -181,7 +187,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
         copyResetTimerRef.current = null
         if (!mountedRef.current) return
         setCopied(false)
-      }, 2000)
+      }, SETUP_WIZARD_COPY_RESET_DELAY_MS)
     } catch {
       // Clipboard may not be available
     }
@@ -206,7 +212,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
         setFirewallDetail('Configuring firewall...')
         const pollFirewall = async (attempts = 0) => {
           if (!mountedRef.current) return
-          if (attempts >= 10) {
+          if (attempts >= SETUP_WIZARD_FIREWALL_POLL_MAX_ATTEMPTS) {
             setFirewallStatus('error')
             setFirewallDetail('Firewall configuration timed out')
             return
@@ -230,12 +236,12 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
           firewallPollTimerRef.current = setTimeout(() => {
             firewallPollTimerRef.current = null
             void pollFirewall(attempts + 1)
-          }, 1000)
+          }, SETUP_WIZARD_FIREWALL_POLL_INTERVAL_MS)
         }
         firewallPollTimerRef.current = setTimeout(() => {
           firewallPollTimerRef.current = null
           void pollFirewall()
-        }, 1000)
+        }, SETUP_WIZARD_FIREWALL_POLL_INTERVAL_MS)
       }
       // method === 'none' or 'in-progress': do nothing
     } catch (err: any) {

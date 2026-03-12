@@ -42,6 +42,12 @@ const mockFetchFirewallConfig = vi.fn()
 vi.mock('@/lib/firewall-configure', () => ({
   fetchFirewallConfig: (...args: any[]) => mockFetchFirewallConfig(...args),
 }))
+vi.mock('@/components/setup-wizard-timing', () => ({
+  SETUP_WIZARD_AUTO_ADVANCE_DELAY_MS: 10,
+  SETUP_WIZARD_COPY_RESET_DELAY_MS: 20,
+  SETUP_WIZARD_FIREWALL_POLL_INTERVAL_MS: 10,
+  SETUP_WIZARD_FIREWALL_POLL_MAX_ATTEMPTS: 3,
+}))
 
 const defaultNetworkStatus = {
   configured: false,
@@ -82,6 +88,7 @@ describe('SetupWizard', () => {
   afterEach(() => {
     cleanup()
     vi.clearAllMocks()
+    vi.useRealTimers()
     localStorage.clear()
   })
   it('renders step 1 with setup prompt by default', () => {
@@ -293,12 +300,12 @@ describe('SetupWizard', () => {
     await waitFor(() => {
       expect(screen.getByRole('button', { name: /configure firewall/i })).toBeInTheDocument()
     })
+
     fireEvent.click(screen.getByRole('button', { name: /configure firewall/i }))
 
-    // Should show error detail when portOpen is false
     await waitFor(() => {
       expect(screen.getByText(/did not open the port/i)).toBeInTheDocument()
-    }, { timeout: 15000 })
+    })
   })
 
   it('sets error status when firewall polling times out after 10 attempts', async () => {
@@ -344,12 +351,12 @@ describe('SetupWizard', () => {
     await waitFor(() => {
       expect(screen.getByRole('button', { name: /configure firewall/i })).toBeInTheDocument()
     })
+
     fireEvent.click(screen.getByRole('button', { name: /configure firewall/i }))
 
-    // After 10 polls × 1s each, the timeout error should appear
     await waitFor(() => {
       expect(screen.getByText(/timed out/i)).toBeInTheDocument()
-    }, { timeout: 15000 })
+    })
   }, 20000)
 
   it('shows dev-mode restart warning on step 3 when devMode is true', async () => {

@@ -39,6 +39,8 @@ vi.mock('@/lib/api', () => ({
     patch: vi.fn().mockResolvedValue({}),
     post: vi.fn().mockResolvedValue({}),
   },
+  fetchSidebarSessionsSnapshot: vi.fn().mockResolvedValue([]),
+  isApiUnauthorizedError: (err: any) => !!err && typeof err === 'object' && err.status === 401,
 }))
 
 // Mock heavy child components to avoid xterm/canvas issues
@@ -76,6 +78,10 @@ vi.mock('@/components/SetupWizard', () => ({
 // Mock the useThemeEffect hook to avoid errors from missing settings.terminal.fontSize
 vi.mock('@/hooks/useTheme', () => ({
   useThemeEffect: () => {},
+}))
+
+vi.mock('@/store/tabRegistrySync', () => ({
+  startTabRegistrySync: () => () => {},
 }))
 
 function createTestStore(options?: { sidebarCollapsed?: boolean }) {

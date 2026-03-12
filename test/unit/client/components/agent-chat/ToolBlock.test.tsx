@@ -109,6 +109,23 @@ describe('ToolBlock', () => {
     expect(wrapper.className).toContain('border-l')
   })
 
+  it('uses tighter vertical spacing in the tool chrome', async () => {
+    const user = userEvent.setup()
+    const { container } = render(
+      <ToolBlock name="Bash" input={{ command: 'ls' }} status="complete" output="files" />
+    )
+
+    const wrapper = container.firstElementChild as HTMLElement
+    expect(wrapper.className).toContain('my-0.5')
+
+    const button = screen.getByRole('button', { name: 'Bash tool call' })
+    expect(button.className).toContain('py-0.5')
+
+    await user.click(button)
+    const details = button.nextElementSibling as HTMLElement
+    expect(details.className).toContain('py-1')
+  })
+
   // --- data-* attribute tests for context menu ---
 
   describe('data attributes for context menu', () => {

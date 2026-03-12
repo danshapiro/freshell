@@ -8,6 +8,8 @@ import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
+import tabRegistryReducer from '@/store/tabRegistrySlice'
+import terminalMetaReducer from '@/store/terminalMetaSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer } from '@/store/networkSlice'
 import type { ClientExtensionEntry } from '@shared/extension-types'
@@ -46,7 +48,13 @@ const wsMocks = vi.hoisted(() => ({
   serverInstanceId: undefined as string | undefined,
 }))
 
-let messageHandler: ((msg: any) => void) | null = null
+const messageHandlers = new Set<(msg: any) => void>()
+
+function broadcastWs(msg: any) {
+  for (const handler of Array.from(messageHandlers)) {
+    handler(msg)
+  }
+}
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -65,12 +73,14 @@ vi.mock('@/lib/ws-client', () => ({
 }))
 
 const apiGet = vi.hoisted(() => vi.fn())
+const fetchSidebarSessionsSnapshot = vi.hoisted(() => vi.fn())
 vi.mock('@/lib/api', () => ({
   api: {
     get: (url: string) => apiGet(url),
     patch: vi.fn().mockResolvedValue({}),
     post: vi.fn().mockResolvedValue({}),
   },
+  fetchSidebarSessionsSnapshot: (options?: unknown) => fetchSidebarSessionsSnapshot(options),
   isApiUnauthorizedError: (err: any) => !!err && typeof err === 'object' && err.status === 401,
 }))
 
@@ -82,6 +92,8 @@ function createStore() {
       connection: connectionReducer,
       sessions: sessionsReducer,
       panes: panesReducer,
+      tabRegistry: tabRegistryReducer,
+      terminalMeta: terminalMetaReducer,
       network: networkReducer,
       extensions: extensionsReducer,
     },
@@ -99,7 +111,27 @@ function createStore() {
         availableClis: {},
       },
       sessions: { projects: [], expandedProjects: new Set<string>(), wsSnapshotReceived: false, isLoading: false, error: null },
-      panes: { layouts: {}, activePane: {} },
+      panes: {
+        layouts: {},
+        activePane: {},
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+      },
+      tabRegistry: {
+        deviceId: 'device-test',
+        deviceLabel: 'device-test',
+        deviceAliases: {},
+        localOpen: [],
+        remoteOpen: [],
+        closed: [],
+        localClosed: {},
+        searchRangeDays: 30,
+        loading: false,
+      },
+      terminalMeta: { byTerminalId: {} },
       network: { status: null, loading: false, configuring: false, error: null },
       extensions: { entries: [] },
     },
@@ -113,19 +145,20 @@ describe('App WS extension messages', () => {
     wsMocks.onReconnect.mockReturnValue(() => {})
     wsMocks.isReady = false
     wsMocks.serverInstanceId = undefined
-    messageHandler = null
+    messageHandlers.clear()
 
     wsMocks.onMessage.mockImplementation((cb: (msg: any) => void) => {
-      messageHandler = cb
-      return () => { messageHandler = null }
+      messageHandlers.add(cb)
+      return () => { messageHandlers.delete(cb) }
     })
 
     wsMocks.connect.mockResolvedValue(undefined)
+    fetchSidebarSessionsSnapshot.mockReset()
+    fetchSidebarSessionsSnapshot.mockResolvedValue([])
 
     apiGet.mockImplementation((url: string) => {
       if (url === '/api/settings') return Promise.resolve(defaultSettings)
       if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
-      if (url === '/api/sessions') return Promise.resolve([])
       return Promise.resolve({})
     })
   })
@@ -145,7 +178,7 @@ describe('App WS extension messages', () => {
 
     // Wait for bootstrap to register the message handler
     await waitFor(() => {
-      expect(messageHandler).toBeTypeOf('function')
+      expect(messageHandlers.size).toBeGreaterThan(0)
     })
 
     const extensions: ClientExtensionEntry[] = [
@@ -168,7 +201,7 @@ describe('App WS extension messages', () => {
     ]
 
     act(() => {
-      messageHandler?.({ type: 'extensions.registry', extensions })
+      broadcastWs({ type: 'extensions.registry', extensions })
     })
 
     expect(store.getState().extensions.entries).toEqual(extensions)
@@ -184,7 +217,7 @@ describe('App WS extension messages', () => {
     )
 
     await waitFor(() => {
-      expect(messageHandler).toBeTypeOf('function')
+      expect(messageHandlers.size).toBeGreaterThan(0)
     })
 
     // Pre-populate the registry so updateServerStatus has an entry to update
@@ -200,13 +233,13 @@ describe('App WS extension messages', () => {
     ]
 
     act(() => {
-      messageHandler?.({ type: 'extensions.registry', extensions })
+      broadcastWs({ type: 'extensions.registry', extensions })
     })
 
     expect(store.getState().extensions.entries[0].serverRunning).toBe(false)
 
     act(() => {
-      messageHandler?.({ type: 'extension.server.ready', name: 'my-ext', port: 9200 })
+      broadcastWs({ type: 'extension.server.ready', name: 'my-ext', port: 9200 })
     })
 
     expect(store.getState().extensions.entries[0].serverRunning).toBe(true)
@@ -223,7 +256,7 @@ describe('App WS extension messages', () => {
     )
 
     await waitFor(() => {
-      expect(messageHandler).toBeTypeOf('function')
+      expect(messageHandlers.size).toBeGreaterThan(0)
     })
 
     // Pre-populate with a running server extension
@@ -240,14 +273,14 @@ describe('App WS extension messages', () => {
     ]
 
     act(() => {
-      messageHandler?.({ type: 'extensions.registry', extensions })
+      broadcastWs({ type: 'extensions.registry', extensions })
     })
 
     expect(store.getState().extensions.entries[0].serverRunning).toBe(true)
     expect(store.getState().extensions.entries[0].serverPort).toBe(9200)
 
     act(() => {
-      messageHandler?.({ type: 'extension.server.stopped', name: 'my-ext' })
+      broadcastWs({ type: 'extension.server.stopped', name: 'my-ext' })
     })
 
     expect(store.getState().extensions.entries[0].serverRunning).toBe(false)

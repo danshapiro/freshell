@@ -1,16 +1,8 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
+import type { TokenSummary } from '@shared/ws-protocol'
 import type { CodingCliProviderName } from './types'
 
-export type TerminalTokenUsage = {
-  inputTokens: number
-  outputTokens: number
-  cachedTokens: number
-  totalTokens: number
-  contextTokens?: number
-  modelContextWindow?: number
-  compactThresholdTokens?: number
-  compactPercent?: number
-}
+export type TerminalTokenUsage = TokenSummary
 
 export type TerminalMetaRecord = {
   terminalId: string

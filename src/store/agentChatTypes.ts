@@ -22,6 +22,14 @@ export interface ChatMessage {
   messageId?: string
 }
 
+export interface AgentTimelineItem {
+  turnId: string
+  sessionId: string
+  role: ChatMessage['role']
+  summary: string
+  timestamp?: string
+}
+
 export interface PermissionRequest {
   requestId: string
   subtype: string
@@ -53,8 +61,14 @@ export interface ChatSessionState {
   cliSessionId?: string
   cwd?: string
   model?: string
+  latestTurnId?: string | null
   status: 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited'
   messages: ChatMessage[]
+  timelineItems: AgentTimelineItem[]
+  timelineBodies: Record<string, ChatMessage>
+  nextTimelineCursor?: string | null
+  timelineLoading?: boolean
+  timelineError?: string
   streamingText: string
   streamingActive: boolean
   pendingPermissions: Record<string, PermissionRequest>
@@ -64,7 +78,7 @@ export interface ChatSessionState {
   totalOutputTokens: number
   tools?: Array<{ name: string }>
   lastError?: string
-  /** True after sdk.history has been received (even if messages are empty) */
+  /** True after a fresh create or the first timeline window establishes restore state. */
   historyLoaded?: boolean
   /** True when server reports session is gone (INVALID_SESSION_ID). Triggers immediate recovery. */
   lost?: boolean

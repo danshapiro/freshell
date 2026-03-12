@@ -219,20 +219,17 @@ describe('SDK Message Handler', () => {
     )
   })
 
-  it('handles sdk.history by dispatching replayHistory', () => {
-    const messages = [
-      { role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' },
-      { role: 'assistant', content: [{ type: 'text', text: 'hi' }], timestamp: '2026-01-01T00:00:01Z' },
-    ]
+  it('ignores legacy sdk.history messages', () => {
     const handled = handleSdkMessage(dispatch, {
       type: 'sdk.history',
       sessionId: 'sess-1',
-      messages,
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'hello' }], timestamp: '2026-01-01T00:00:00Z' },
+        { role: 'assistant', content: [{ type: 'text', text: 'hi' }], timestamp: '2026-01-01T00:00:01Z' },
+      ],
     })
-    expect(handled).toBe(true)
-    expect(dispatch).toHaveBeenCalledWith(
-      agentChatSlice.replayHistory({ sessionId: 'sess-1', messages })
-    )
+    expect(handled).toBe(false)
+    expect(dispatch).not.toHaveBeenCalled()
   })
 
   it('handles sdk.error by dispatching sessionError', () => {

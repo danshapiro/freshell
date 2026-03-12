@@ -1,0 +1,20 @@
+{
+  "name": "codex",
+  "version": "1.0.0",
+  "label": "Codex CLI",
+  "description": "OpenAI's Codex CLI agent",
+  "category": "cli",
+  "cli": {
+    "command": "codex",
+    "envVar": "CODEX_CMD",
+    "resumeArgs": ["resume", "{{sessionId}}"],
+    "modelArgs": ["--model", "{{model}}"],
+    "sandboxArgs": ["--sandbox", "{{sandbox}}"],
+    "supportsModel": true,
+    "supportsSandbox": true
+  },
+  "picker": {
+    "shortcut": "X",
+    "group": "agents"
+  }
+}

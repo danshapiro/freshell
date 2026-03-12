@@ -3,6 +3,7 @@ import { useAppSelector, useAppDispatch } from '@/store/hooks'
 import { updateServerStatus } from '@/store/extensionsSlice'
 import { isLoopbackHostname } from '@/lib/url-rewrite'
 import { api } from '@/lib/api'
+import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
 import type { ExtensionPaneContent } from '@/store/paneTypes'
 import ExtensionError from './ExtensionError'
 
@@ -24,6 +25,8 @@ function interpolateUrl(template: string, props: Record<string, unknown>): strin
 }
 
 export default function ExtensionPane({ content }: ExtensionPaneProps) {
+  useEnsureExtensionsRegistry()
+
   const dispatch = useAppDispatch()
   const extension = useAppSelector((s) =>
     s.extensions.entries.find((e) => e.name === content.extensionName),

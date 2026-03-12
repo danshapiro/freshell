@@ -1,0 +1,14 @@
+{
+  "name": "kimi",
+  "version": "1.0.0",
+  "label": "Kimi",
+  "description": "Kimi CLI agent",
+  "category": "cli",
+  "cli": {
+    "command": "kimi",
+    "envVar": "KIMI_CMD"
+  },
+  "picker": {
+    "group": "agents"
+  }
+}

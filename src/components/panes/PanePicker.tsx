@@ -4,10 +4,12 @@ import { Terminal, Globe, FileText, LayoutGrid } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAppSelector } from '@/store/hooks'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
-import { CODING_CLI_PROVIDER_CONFIGS, type CodingCliProviderConfig } from '@/lib/coding-cli-utils'
+import { getCliProviderConfigs, type CodingCliProviderConfig } from '@/lib/coding-cli-utils'
 import { getVisibleAgentChatConfigs, type AgentChatProviderName } from '@/lib/agent-chat-utils'
 import { ProviderIcon } from '@/components/icons/provider-icons'
+import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
+import type { ClientExtensionEntry } from '@shared/extension-types'
 
 export type PanePickerType = 'shell' | 'cmd' | 'powershell' | 'wsl' | 'browser' | 'editor' | AgentChatProviderName | CodingCliProviderName | `ext:${string}`
 
@@ -35,15 +37,11 @@ const nonShellOptions: PickerOption[] = [
   { type: 'browser', label: 'Browser', icon: Globe, shortcut: 'B' },
 ]
 
-const CLI_SHORTCUTS: Record<string, string> = {
-  claude: 'L',
-  codex: 'X',
-  opencode: 'O',
-  gemini: 'G',
-  kimi: 'K',
-}
-
 const MAX_OPTIONS_PER_ROW = 3
+const EMPTY_AVAILABLE_CLIS: Record<string, boolean> = {}
+const EMPTY_FEATURE_FLAGS: Record<string, boolean> = {}
+const EMPTY_ENABLED_PROVIDERS: CodingCliProviderName[] = []
+const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 
 interface PickerRowOption {
   option: PickerOption
@@ -71,13 +69,13 @@ function buildBalancedOptionRows(options: PickerOption[]): PickerRowOption[][] {
   })
 }
 
-function cliConfigToOption(config: CodingCliProviderConfig): PickerOption {
+function cliConfigToOption(config: CodingCliProviderConfig, ext?: { picker?: { shortcut?: string } }): PickerOption {
   return {
     type: config.name,
     label: config.label,
     icon: null,
     providerName: config.name,
-    shortcut: CLI_SHORTCUTS[config.name] ?? config.name[0].toUpperCase(),
+    shortcut: ext?.picker?.shortcut ?? config.name[0].toUpperCase(),
   }
 }
 
@@ -94,17 +92,20 @@ interface PanePickerProps {
 }
 
 export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, paneId }: PanePickerProps) {
+  useEnsureExtensionsRegistry()
+
   const platform = useAppSelector((s) => s.connection?.platform ?? null)
-  const availableClis = useAppSelector((s) => s.connection?.availableClis ?? {})
-  const featureFlags = useAppSelector((s) => s.connection?.featureFlags ?? {})
-  const enabledProviders = useAppSelector((s) => s.settings?.settings?.codingCli?.enabledProviders ?? [])
-  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? [])
+  const availableClis = useAppSelector((s) => s.connection?.availableClis ?? EMPTY_AVAILABLE_CLIS)
+  const featureFlags = useAppSelector((s) => s.connection?.featureFlags ?? EMPTY_FEATURE_FLAGS)
+  const enabledProviders = useAppSelector((s) => s.settings?.settings?.codingCli?.enabledProviders ?? EMPTY_ENABLED_PROVIDERS)
+  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
 
   const options = useMemo(() => {
-    // CLI options: only show if both available on system and enabled in settings
-    const cliOptions = CODING_CLI_PROVIDER_CONFIGS
+    // CLI options: derived from extension entries, show if both available and enabled
+    const cliConfigs = getCliProviderConfigs(extensionEntries)
+    const cliOptions = cliConfigs
       .filter((config) => availableClis[config.name] && enabledProviders.includes(config.name))
-      .map(cliConfigToOption)
+      .map((config) => cliConfigToOption(config, extensionEntries.find(e => e.name === config.name)))
 
     // Shell options depend on platform
     const shellOptions = isWindowsLike(platform) ? windowsShellOptions : [shellOption]
@@ -124,13 +125,15 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
     const agentChatBefore = allAgentChatOptions.filter((o) => !o.afterCli)
     const agentChatAfter = allAgentChatOptions.filter((o) => o.afterCli)
 
-    // Extension options from the registry
-    const extensionOptions: PickerOption[] = extensionEntries.map((ext) => ({
-      type: `ext:${ext.name}` as PanePickerType,
-      label: ext.label,
-      icon: LayoutGrid,
-      shortcut: ext.picker?.shortcut ?? '',
-    }))
+    // Extension options from the registry (exclude CLI extensions -- they're in cliOptions)
+    const extensionOptions: PickerOption[] = extensionEntries
+      .filter((ext) => ext.category !== 'cli')
+      .map((ext) => ({
+        type: `ext:${ext.name}` as PanePickerType,
+        label: ext.label,
+        icon: LayoutGrid,
+        shortcut: ext.picker?.shortcut ?? '',
+      }))
 
     // Order: agent chat (before), CLIs, agent chat (after), Editor, Browser, Shell(s), Extensions
     return [...agentChatBefore, ...cliOptions, ...agentChatAfter, ...nonShellOptions, ...shellOptions, ...extensionOptions]

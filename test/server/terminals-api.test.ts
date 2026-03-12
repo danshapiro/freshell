@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { EventEmitter } from 'node:events'
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest'
 import express, { type Express } from 'express'
 import request from 'supertest'
@@ -40,8 +41,20 @@ import { httpAuthMiddleware } from '../../server/auth'
 import { configStore } from '../../server/config-store'
 import { createTerminalsRouter } from '../../server/terminals-router'
 
+class FakeBuffer {
+  private chunks: string[] = []
+
+  append(chunk: string) {
+    this.chunks.push(chunk)
+  }
+
+  snapshot() {
+    return this.chunks.join('')
+  }
+}
+
 /** Fake registry that returns controlled terminal data without spawning real PTYs */
-class FakeRegistry {
+class FakeRegistry extends EventEmitter {
   private terminals: Array<{
     terminalId: string
     title: string
@@ -52,6 +65,11 @@ class FakeRegistry {
     status: 'running' | 'exited'
     hasClients: boolean
     cwd?: string
+    cols: number
+    rows: number
+    clients: Set<string>
+    pty: { pid: number }
+    buffer: FakeBuffer
   }> = []
 
   addTerminal(overrides: Partial<{
@@ -61,7 +79,11 @@ class FakeRegistry {
     mode: 'shell' | 'claude' | 'codex'
     status: 'running' | 'exited'
     cwd?: string
+    cols: number
+    rows: number
+    pid: number
   }> = {}) {
+    const buffer = new FakeBuffer()
     const terminal = {
       terminalId: overrides.terminalId || `term_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
       title: overrides.title || 'Shell',
@@ -72,6 +94,11 @@ class FakeRegistry {
       status: overrides.status || 'running',
       hasClients: false,
       cwd: overrides.cwd || '/home/user',
+      cols: overrides.cols || 120,
+      rows: overrides.rows || 30,
+      clients: new Set<string>(),
+      pty: { pid: overrides.pid || 4242 },
+      buffer,
     }
     this.terminals.push(terminal)
     return terminal
@@ -100,10 +127,23 @@ class FakeRegistry {
     if (terminal) terminal.description = description
     return !!terminal
   }
+
+  emitOutput(terminalId: string, data: string) {
+    const terminal = this.terminals.find(t => t.terminalId === terminalId)
+    terminal?.buffer.append(data)
+    if (terminal) terminal.lastActivityAt += 1
+    this.emit('terminal.output.raw', { terminalId, data, at: Date.now() })
+  }
 }
 
 /** Create a minimal Express app with terminal routes for testing */
-function createTestApp(registry: FakeRegistry, wsHandler: { broadcast: ReturnType<typeof vi.fn> }): Express {
+function createTestApp(
+  registry: FakeRegistry,
+  wsHandler: {
+    broadcast: ReturnType<typeof vi.fn>
+    broadcastTerminalsChanged?: ReturnType<typeof vi.fn>
+  },
+): Express {
   const app = express()
   app.disable('x-powered-by')
   app.use(express.json())
@@ -122,7 +162,10 @@ describe('Terminals API', () => {
   const AUTH_TOKEN = 'test-auth-token-16chars'
   let app: Express
   let registry: FakeRegistry
-  let wsHandler: { broadcast: ReturnType<typeof vi.fn> }
+  let wsHandler: {
+    broadcast: ReturnType<typeof vi.fn>
+    broadcastTerminalsChanged: ReturnType<typeof vi.fn>
+  }
 
   beforeAll(() => {
     process.env.AUTH_TOKEN = AUTH_TOKEN
@@ -131,7 +174,10 @@ describe('Terminals API', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     registry = new FakeRegistry()
-    wsHandler = { broadcast: vi.fn() }
+    wsHandler = {
+      broadcast: vi.fn(),
+      broadcastTerminalsChanged: vi.fn(),
+    }
     app = createTestApp(registry, wsHandler)
 
     // Reset config store mock to default behavior
@@ -334,6 +380,69 @@ describe('Terminals API', () => {
       expect(statuses).toContain('running')
       expect(statuses).toContain('exited')
     })
+
+    it('returns a paged terminal directory when visible-first query params are provided', async () => {
+      registry.addTerminal({
+        terminalId: 'term_newer',
+        title: 'Newer terminal',
+        mode: 'shell',
+      })
+      registry.addTerminal({
+        terminalId: 'term_older',
+        title: 'Older terminal',
+        mode: 'shell',
+      })
+
+      const response = await request(app)
+        .get('/api/terminals?priority=visible&limit=1')
+        .set('x-auth-token', AUTH_TOKEN)
+        .expect(200)
+
+      expect(response.body).toEqual({
+        items: [
+          expect.objectContaining({
+            terminalId: 'term_older',
+            title: 'Older terminal',
+          }),
+        ],
+        nextCursor: expect.any(String),
+        revision: expect.any(Number),
+      })
+    })
+
+    it('keeps scrollback and search on separate server-owned routes', async () => {
+      registry.addTerminal({
+        terminalId: 'term_view',
+        title: 'Searchable terminal',
+        mode: 'shell',
+      })
+      registry.emitOutput('term_view', 'alpha\nbeta\nalpha')
+
+      const scrollback = await request(app)
+        .get('/api/terminals/term_view/scrollback?limit=2')
+        .set('x-auth-token', AUTH_TOKEN)
+        .expect(200)
+
+      expect(scrollback.body).toEqual({
+        items: [
+          { line: 0, text: 'alpha' },
+          { line: 1, text: 'beta' },
+        ],
+        nextCursor: '2',
+      })
+
+      const search = await request(app)
+        .get('/api/terminals/term_view/search?query=alpha&limit=1')
+        .set('x-auth-token', AUTH_TOKEN)
+        .expect(200)
+
+      expect(search.body).toEqual({
+        matches: [
+          { line: 0, column: 0, text: 'alpha' },
+        ],
+        nextCursor: '1',
+      })
+    })
   })
 
   describe('PATCH /api/terminals/:terminalId', () => {
@@ -407,7 +516,7 @@ describe('Terminals API', () => {
       })
     })
 
-    it('broadcasts terminal.list.updated after successful patch', async () => {
+    it('broadcasts terminals.changed after successful patch', async () => {
       vi.mocked(configStore.patchTerminalOverride).mockResolvedValue({})
 
       await request(app)
@@ -416,7 +525,8 @@ describe('Terminals API', () => {
         .send({ titleOverride: 'Test' })
         .expect(200)
 
-      expect(wsHandler.broadcast).toHaveBeenCalledWith({ type: 'terminal.list.updated' })
+      expect(wsHandler.broadcastTerminalsChanged).toHaveBeenCalledOnce()
+      expect(wsHandler.broadcast).not.toHaveBeenCalled()
     })
 
     it('rejects non-boolean deleted field', async () => {
@@ -498,13 +608,14 @@ describe('Terminals API', () => {
       expect(response.body).toEqual({ ok: true })
     })
 
-    it('broadcasts terminal.list.updated after successful delete', async () => {
+    it('broadcasts terminals.changed after successful delete', async () => {
       await request(app)
         .delete('/api/terminals/term_123')
         .set('x-auth-token', AUTH_TOKEN)
         .expect(200)
 
-      expect(wsHandler.broadcast).toHaveBeenCalledWith({ type: 'terminal.list.updated' })
+      expect(wsHandler.broadcastTerminalsChanged).toHaveBeenCalledOnce()
+      expect(wsHandler.broadcast).not.toHaveBeenCalled()
     })
   })
 })

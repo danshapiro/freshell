@@ -79,7 +79,7 @@ describe('WsClient.connect', () => {
     expect(resolved).toBe(true)
   })
 
-  it('sends protocol version in hello and omits legacy terminalAttachChunk capability', async () => {
+  it('sends protocol version in hello and only advertises surviving capabilities', async () => {
     const c = new WsClient('ws://example/ws')
     const p = c.connect()
     expect(MockWebSocket.instances).toHaveLength(1)
@@ -88,7 +88,7 @@ describe('WsClient.connect', () => {
     const hello = JSON.parse(MockWebSocket.instances[0].sent[0])
     expect(hello.type).toBe('hello')
     expect(hello.protocolVersion).toBe(WS_PROTOCOL_VERSION)
-    expect(hello.capabilities).toEqual({ sessionsPatchV1: true, sessionsPaginationV1: true, uiScreenshotV1: true })
+    expect(hello.capabilities).toEqual({ uiScreenshotV1: true })
 
     MockWebSocket.instances[0]._message({ type: 'ready' })
     await p
@@ -312,6 +312,28 @@ describe('WsClient.connect', () => {
         attachRequestId: 'attach-from-reconnect-handler',
       }),
     ])
+  })
+
+  it('filters invalid sidebarOpenSessions before sending hello', async () => {
+    const c = new WsClient('ws://example/ws')
+    c.setHelloExtensionProvider(() => ({
+      sidebarOpenSessions: [
+        { provider: 'foo', sessionId: '' } as any,
+        { provider: 'codex', sessionId: 'older-open', serverInstanceId: '' } as any,
+      ],
+    }))
+
+    const p = c.connect()
+    expect(MockWebSocket.instances).toHaveLength(1)
+    MockWebSocket.instances[0]._open()
+
+    const hello = JSON.parse(MockWebSocket.instances[0].sent[0])
+    expect(hello.sidebarOpenSessions).toEqual([
+      { provider: 'codex', sessionId: 'older-open' },
+    ])
+
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p
   })
 
   it('treats HELLO_TIMEOUT as transient and schedules reconnect', async () => {

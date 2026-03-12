@@ -1,3 +1,4 @@
+import fs from 'fs'
 import path from 'path'
 import fsp from 'fs/promises'
 import type { Stats } from 'fs'
@@ -7,6 +8,7 @@ import { getPerfConfig, startPerfTimer } from '../perf-logger.js'
 import { configStore, SessionOverride } from '../config-store.js'
 import type { CodingCliProvider } from './provider.js'
 import { makeSessionKey, type CodingCliSession, type CodingCliProviderName, type ProjectGroup } from './types.js'
+import { sanitizeCodexTaskEventsForTruncatedSnippet } from './providers/codex.js'
 import { diffProjects } from '../sessions-sync/diff.js'
 import type { SessionMetadataStore, SessionMetadataEntry } from '../session-metadata-store.js'
 
@@ -22,6 +24,21 @@ const IS_WINDOWS = process.platform === 'win32'
 const normalizeFilePath = (filePath: string) => {
   const resolved = path.resolve(filePath)
   return IS_WINDOWS ? resolved.toLowerCase() : resolved
+}
+
+function findNearestExistingAncestor(targetPath: string): string {
+  let current = normalizeFilePath(targetPath)
+  let parent = path.dirname(current)
+  while (current !== parent) {
+    try {
+      if (fs.existsSync(current)) return current
+    } catch {
+      // Ignore filesystem errors while walking upward.
+    }
+    current = parent
+    parent = path.dirname(current)
+  }
+  return current
 }
 
 /**
@@ -48,11 +65,21 @@ function applyOverride(session: CodingCliSession, ov: SessionOverride | undefine
   }
 }
 
-async function readSessionSnippet(filePath: string): Promise<string> {
+type SessionSnippet = {
+  content: string
+  truncated: boolean
+  tailContent?: string
+}
+
+async function readSessionSnippet(filePath: string): Promise<SessionSnippet> {
   try {
     const stat = await fsp.stat(filePath)
     if (stat.size <= SESSION_SNIPPET_BYTES) {
-      return await fsp.readFile(filePath, 'utf-8')
+      return {
+        content: await fsp.readFile(filePath, 'utf-8'),
+        truncated: false,
+        tailContent: undefined,
+      }
     }
 
     const headBytes = Math.floor(SESSION_SNIPPET_BYTES / 2)
@@ -77,14 +104,14 @@ async function readSessionSnippet(filePath: string): Promise<string> {
       const head = headNewline >= 0 ? headRaw.slice(0, headNewline) : headRaw
       const tail = tailNewline >= 0 ? tailRaw.slice(tailNewline + 1) : tailRaw
 
-      if (!head) return tail
-      if (!tail) return head
-      return `${head}\n${tail}`
+      if (!head) return { content: tail, truncated: true, tailContent: tail }
+      if (!tail) return { content: head, truncated: true, tailContent: '' }
+      return { content: `${head}\n${tail}`, truncated: true, tailContent: tail }
     } finally {
       await fd.close()
     }
   } catch {
-    return ''
+    return { content: '', truncated: false, tailContent: undefined }
   }
 }
 
@@ -131,6 +158,7 @@ export class CodingCliSessionIndexer {
   private initialized = false
   private sessionKeyToFilePath = new Map<string, string>()
   private urgentRefreshNeeded = false
+  private dirtyProviders = new Set<CodingCliProviderName>()
 
   constructor(
     private providers: CodingCliProvider[],
@@ -205,19 +233,35 @@ export class CodingCliSessionIndexer {
 
     if (rootSet.size === 0) return
 
-    // Watch the parent directory of each root so we detect when the root itself is created.
-    const parentDirs = new Set<string>()
+    // Watch the nearest existing ancestor of each root so we still detect late
+    // root creation when one or more intermediate directories do not exist yet.
+    const watchRoots = new Set<string>()
+    let maxDepth = 0
     for (const root of rootSet) {
-      parentDirs.add(path.dirname(root))
+      const ancestor = findNearestExistingAncestor(root)
+      watchRoots.add(ancestor)
+      const relative = path.relative(ancestor, root)
+      const depth = relative ? relative.split(path.sep).filter(Boolean).length : 0
+      maxDepth = Math.max(maxDepth, depth)
     }
 
-    this.rootWatcher = chokidar.watch(Array.from(parentDirs), {
+    this.rootWatcher = chokidar.watch(Array.from(watchRoots), {
       ignoreInitial: true,
-      depth: 0,
+      depth: Math.max(0, maxDepth),
     })
 
+    const roots = Array.from(rootSet)
+    const affectsWatchedRoot = (entryPath: string) => {
+      const normalized = normalizeFilePath(entryPath)
+      return roots.some((root) => {
+        if (root === normalized) return true
+        const prefix = normalized.endsWith(path.sep) ? normalized : `${normalized}${path.sep}`
+        return root.startsWith(prefix)
+      })
+    }
+
     this.rootWatcher.on('addDir', (dirPath) => {
-      if (rootSet.has(normalizeFilePath(dirPath))) {
+      if (affectsWatchedRoot(dirPath)) {
         logger.info({ dirPath }, 'Provider session root created, scheduling full scan')
         this.needsFullScan = true
         this.scheduleRefresh()
@@ -225,8 +269,24 @@ export class CodingCliSessionIndexer {
     })
 
     this.rootWatcher.on('unlinkDir', (dirPath) => {
-      if (rootSet.has(normalizeFilePath(dirPath))) {
+      if (affectsWatchedRoot(dirPath)) {
         logger.info({ dirPath }, 'Provider session root removed, scheduling full scan')
+        this.needsFullScan = true
+        this.scheduleRefresh()
+      }
+    })
+
+    this.rootWatcher.on('add', (filePath) => {
+      if (affectsWatchedRoot(filePath)) {
+        logger.info({ filePath }, 'Provider session root file created, scheduling full scan')
+        this.needsFullScan = true
+        this.scheduleRefresh()
+      }
+    })
+
+    this.rootWatcher.on('unlink', (filePath) => {
+      if (affectsWatchedRoot(filePath)) {
+        logger.info({ filePath }, 'Provider session root file removed, scheduling full scan')
         this.needsFullScan = true
         this.scheduleRefresh()
       }
@@ -273,6 +333,13 @@ export class CodingCliSessionIndexer {
 
   private markDirty(filePath: string) {
     const normalized = normalizeFilePath(filePath)
+    const provider = this.resolveProviderForFile(filePath)
+    if (provider?.listSessionsDirect) {
+      this.dirtyProviders.add(provider.name)
+      this.deletedFiles.delete(normalized)
+      this.urgentRefreshNeeded = true
+      return
+    }
     this.deletedFiles.delete(normalized)
     this.dirtyFiles.add(normalized)
 
@@ -287,6 +354,12 @@ export class CodingCliSessionIndexer {
 
   private markDeleted(filePath: string) {
     const normalized = normalizeFilePath(filePath)
+    const provider = this.resolveProviderForFile(filePath)
+    if (provider?.listSessionsDirect) {
+      this.dirtyProviders.add(provider.name)
+      this.dirtyFiles.delete(normalized)
+      return
+    }
     this.dirtyFiles.delete(normalized)
     this.deletedFiles.add(normalized)
   }
@@ -314,6 +387,14 @@ export class CodingCliSessionIndexer {
       this.sessionKeyToFilePath.delete(makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId))
     }
     this.fileCache.delete(cacheKey)
+  }
+
+  private makeDirectCacheKey(provider: CodingCliProviderName, sessionId: string): string {
+    return `direct:${provider}:${sessionId}`
+  }
+
+  private isDirectCacheKey(cacheKey: string): boolean {
+    return cacheKey.startsWith('direct:')
   }
 
   private pruneSeenSessions(now: number) {
@@ -402,8 +483,17 @@ export class CodingCliSessionIndexer {
       this.sessionKeyToFilePath.delete(makeSessionKey(cached.baseSession.provider, cached.baseSession.sessionId))
     }
 
-    const content = await readSessionSnippet(filePath)
-    const meta = await provider.parseSessionFile(content, filePath)
+    const snippet = await readSessionSnippet(filePath)
+    const meta = await provider.parseSessionFile(snippet.content, filePath)
+    if (snippet.truncated && provider.name === 'codex') {
+      const tailMeta = snippet.tailContent
+        ? await provider.parseSessionFile(snippet.tailContent, filePath)
+        : undefined
+      meta.codexTaskEvents = sanitizeCodexTaskEventsForTruncatedSnippet(
+        meta.codexTaskEvents,
+        tailMeta?.codexTaskEvents,
+      )
+    }
     if (!meta.cwd) {
       this.fileCache.set(cacheKey, {
         provider: provider.name,
@@ -433,6 +523,7 @@ export class CodingCliSessionIndexer {
       sourceFile: filePath,
       isSubagent: meta.isSubagent || isSubagentSession(filePath) || undefined,
       isNonInteractive: meta.isNonInteractive || undefined,
+      codexTaskEvents: meta.codexTaskEvents,
     }
 
     this.fileCache.set(cacheKey, {
@@ -442,6 +533,46 @@ export class CodingCliSessionIndexer {
       baseSession,
     })
     this.sessionKeyToFilePath.set(makeSessionKey(provider.name, sessionId), filePath)
+  }
+
+  private updateDirectCacheEntry(provider: CodingCliProvider, session: CodingCliSession, cacheKey: string) {
+    this.fileCache.set(cacheKey, {
+      provider: provider.name,
+      mtimeMs: session.updatedAt,
+      size: 0,
+      baseSession: {
+        ...session,
+        provider: provider.name,
+      },
+    })
+  }
+
+  private async refreshDirectProvider(provider: CodingCliProvider): Promise<Set<string>> {
+    if (!provider.listSessionsDirect) return new Set()
+
+    const seenKeys = new Set<string>()
+    let sessions: CodingCliSession[] = []
+    try {
+      sessions = await provider.listSessionsDirect()
+    } catch (err) {
+      logger.warn({ err, provider: provider.name }, 'Could not list provider sessions directly')
+      return seenKeys
+    }
+
+    for (const session of sessions) {
+      const cacheKey = this.makeDirectCacheKey(provider.name, session.sessionId)
+      seenKeys.add(cacheKey)
+      this.updateDirectCacheEntry(provider, session, cacheKey)
+    }
+
+    for (const [cacheKey, cached] of this.fileCache) {
+      if (!this.isDirectCacheKey(cacheKey) || cached.provider !== provider.name) continue
+      if (!seenKeys.has(cacheKey)) {
+        this.deleteCacheEntry(cacheKey)
+      }
+    }
+
+    return seenKeys
   }
 
   scheduleRefresh() {
@@ -518,10 +649,23 @@ export class CodingCliSessionIndexer {
       this.needsFullScan = false
       this.dirtyFiles.clear()
       this.deletedFiles.clear()
+      this.dirtyProviders.clear()
 
-      const seenFiles = new Set<string>()
+      const seenCacheKeys = new Set<string>()
       for (const provider of this.providers) {
         if (!enabledSet.has(provider.name)) continue
+        if (provider.listSessionsDirect) {
+          const seenDirectKeys = await this.refreshDirectProvider(provider)
+          fileCount += seenDirectKeys.size
+          for (const cacheKey of seenDirectKeys) {
+            processedEntries += 1
+            if (processedEntries % REFRESH_YIELD_EVERY === 0) {
+              await yieldToEventLoop()
+            }
+            seenCacheKeys.add(cacheKey)
+          }
+          continue
+        }
         let files: string[] = []
         try {
           files = await provider.listSessionFiles()
@@ -537,7 +681,7 @@ export class CodingCliSessionIndexer {
             await yieldToEventLoop()
           }
           const cacheKey = normalizeFilePath(file)
-          seenFiles.add(cacheKey)
+          seenCacheKeys.add(cacheKey)
           await this.updateCacheEntry(provider, file, cacheKey)
         }
       }
@@ -548,18 +692,34 @@ export class CodingCliSessionIndexer {
           await yieldToEventLoop()
         }
         const cached = this.fileCache.get(cachedFile)
-        if (!cached || !enabledSet.has(cached.provider) || !seenFiles.has(cachedFile)) {
+        if (!cached || !enabledSet.has(cached.provider) || !seenCacheKeys.has(cachedFile)) {
           this.deleteCacheEntry(cachedFile)
         }
       }
     } else {
       const deletedFiles = Array.from(this.deletedFiles)
       const dirtyFiles = Array.from(this.dirtyFiles)
+      const dirtyProviders = Array.from(this.dirtyProviders)
       this.deletedFiles.clear()
       this.dirtyFiles.clear()
+      this.dirtyProviders.clear()
 
       for (const file of deletedFiles) {
         this.deleteCacheEntry(file)
+      }
+
+      for (const providerName of dirtyProviders) {
+        const provider = this.providers.find((candidate) => candidate.name === providerName)
+        if (!provider?.listSessionsDirect) continue
+        if (!enabledSet.has(provider.name)) {
+          for (const [cacheKey, cached] of this.fileCache) {
+            if (this.isDirectCacheKey(cacheKey) && cached.provider === provider.name) {
+              this.deleteCacheEntry(cacheKey)
+            }
+          }
+          continue
+        }
+        await this.refreshDirectProvider(provider)
       }
 
       for (const file of dirtyFiles) {
@@ -575,6 +735,7 @@ export class CodingCliSessionIndexer {
           this.needsFullScan = true
           continue
         }
+        if (provider.listSessionsDirect) continue
         if (!enabledSet.has(provider.name)) {
           this.deleteCacheEntry(file)
           continue

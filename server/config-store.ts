@@ -3,6 +3,7 @@ import path from 'path'
 import os from 'os'
 import { logger } from './logger.js'
 import type { CodingCliProviderName } from './coding-cli/types.js'
+import { DEFAULT_ENABLED_CLI_PROVIDERS } from '../shared/coding-cli-defaults.js'
 import { normalizeTrimmedStringList } from '../shared/string-list.js'
 
 /**
@@ -82,6 +83,7 @@ export type AppSettings = {
   }
   codingCli: {
     enabledProviders: CodingCliProviderName[]
+    knownProviders?: string[]
     providers: Partial<Record<CodingCliProviderName, {
       model?: string
       sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
@@ -184,7 +186,7 @@ export const defaultSettings: AppSettings = {
     collapsed: false,
   },
   codingCli: {
-    enabledProviders: ['claude', 'codex'],
+    enabledProviders: [...DEFAULT_ENABLED_CLI_PROVIDERS],
     providers: {
       claude: {
         permissionMode: 'default',

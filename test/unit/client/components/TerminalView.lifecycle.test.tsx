@@ -10,6 +10,7 @@ import turnCompletionReducer from '@/store/turnCompletionSlice'
 import { useAppSelector } from '@/store/hooks'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import { __resetTerminalCursorCacheForTests } from '@/lib/terminal-cursor'
+import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { TERMINAL_CURSOR_STORAGE_KEY } from '@/store/storage-keys'
 
 const wsMocks = vi.hoisted(() => ({
@@ -222,6 +223,7 @@ describe('TerminalView lifecycle updates', () => {
     })
     cancelAnimationFrameSpy = vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {})
     vi.stubGlobal('ResizeObserver', MockResizeObserver)
+    installPerfAuditBridge(null)
   })
 
   afterEach(() => {
@@ -235,6 +237,7 @@ describe('TerminalView lifecycle updates', () => {
     requestAnimationFrameSpy = null
     cancelAnimationFrameSpy = null
     reconnectHandler = null
+    installPerfAuditBridge(null)
   })
 
   function setupThemeTerminal() {
@@ -297,6 +300,46 @@ describe('TerminalView lifecycle updates', () => {
     await waitFor(() => {
       expect(terminalInstances[0]?.options.minimumContrastRatio).toBe(4.5)
     })
+  })
+
+  it('marks terminal.first_output when the focused terminal renders output', async () => {
+    const bridge = createPerfAuditBridge()
+    installPerfAuditBridge(bridge)
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal()
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.created',
+        requestId: 'req-theme',
+        terminalId: 'term-1',
+        createdAt: Date.now(),
+      })
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId: 'term-1',
+        attachRequestId: latestAttachRequestIdForTerminal('term-1'),
+        seq: 0,
+      })
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId: 'term-1',
+        seqStart: 1,
+        seqEnd: 1,
+        data: 'hello from terminal',
+      })
+    })
+
+    expect(bridge.snapshot().milestones['terminal.first_output']).toBeTypeOf('number')
   })
 
   it('keeps default contrast behavior when terminal theme is dark', async () => {

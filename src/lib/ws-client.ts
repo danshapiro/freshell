@@ -5,7 +5,8 @@ import {
   markTerminalOutputSeen,
 } from '@/lib/perf-logger'
 import { getAuthToken } from '@/lib/auth'
-import type { ServerMessage } from '@shared/ws-protocol'
+import { sanitizeSessionLocators } from '@/lib/session-utils'
+import type { ServerMessage, SessionLocator } from '@shared/ws-protocol'
 import { createLogger } from '@/lib/client-logger'
 
 const log = createLogger('WsClient')
@@ -13,8 +14,10 @@ const log = createLogger('WsClient')
 type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'ready'
 type MessageHandler = (msg: ServerMessage) => void
 type ReconnectHandler = () => void
+type DisconnectHandler = () => void
 type HelloExtensionProvider = () => {
   sessions?: { active?: string; visible?: string[]; background?: string[] }
+  sidebarOpenSessions?: SessionLocator[]
   client?: { mobile?: boolean }
 }
 type TabsSyncPushPayload = {
@@ -82,6 +85,7 @@ export class WsClient {
   private connectPromise: Promise<void> | null = null
   private messageHandlers = new Set<MessageHandler>()
   private reconnectHandlers = new Set<ReconnectHandler>()
+  private disconnectHandlers = new Set<DisconnectHandler>()
   private pendingMessages: unknown[] = []
   private intentionalClose = false
   private helloExtensionProvider?: HelloExtensionProvider
@@ -170,12 +174,18 @@ export class WsClient {
         // Send hello with token in message body (not URL).
         const token = getAuthToken()
         const extensions = this.helloExtensionProvider?.() || {}
+        const helloExtensions = {
+          ...extensions,
+          ...(extensions.sidebarOpenSessions !== undefined
+            ? { sidebarOpenSessions: sanitizeSessionLocators(extensions.sidebarOpenSessions) }
+            : {}),
+        }
         this.ws?.send(JSON.stringify({
           type: 'hello',
           token,
           protocolVersion: WS_PROTOCOL_VERSION,
-          capabilities: { sessionsPatchV1: true, sessionsPaginationV1: true, uiScreenshotV1: true },
-          ...extensions,
+          capabilities: { uiScreenshotV1: true },
+          ...helloExtensions,
         }))
       }
 
@@ -309,6 +319,7 @@ export class WsClient {
         const closedBeforeReady = !wasReady
         this._state = 'disconnected'
         this.ws = null
+        this.disconnectHandlers.forEach((handler) => handler())
 
         // Close codes:
         // 4001 NOT_AUTHENTICATED: fatal, do not reconnect.
@@ -519,6 +530,11 @@ export class WsClient {
   onReconnect(handler: ReconnectHandler): () => void {
     this.reconnectHandlers.add(handler)
     return () => this.reconnectHandlers.delete(handler)
+  }
+
+  onDisconnect(handler: DisconnectHandler): () => void {
+    this.disconnectHandlers.add(handler)
+    return () => this.disconnectHandlers.delete(handler)
   }
 
   private sendNow(msg: unknown) {

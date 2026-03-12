@@ -4,8 +4,6 @@ import type { IDisposable } from '@xterm/xterm'
 import { createTerminalRuntime } from '@/components/terminal/terminal-runtime'
 
 const fitSpy = vi.fn()
-const findNextSpy = vi.fn()
-const findPreviousSpy = vi.fn()
 const webglDisposeSpy = vi.fn()
 
 let contextLossHandler: (() => void) | null = null
@@ -13,13 +11,6 @@ let contextLossHandler: (() => void) | null = null
 vi.mock('@xterm/addon-fit', () => ({
   FitAddon: class {
     fit = fitSpy
-  },
-}))
-
-vi.mock('@xterm/addon-search', () => ({
-  SearchAddon: class {
-    findNext = findNextSpy
-    findPrevious = findPreviousSpy
   },
 }))
 
@@ -38,12 +29,10 @@ describe('terminal runtime', () => {
   beforeEach(() => {
     contextLossHandler = null
     fitSpy.mockClear()
-    findNextSpy.mockClear()
-    findPreviousSpy.mockClear()
     webglDisposeSpy.mockClear()
   })
 
-  it('loads fit and search addons', () => {
+  it('loads the fit addon without the legacy search addon', () => {
     const terminal = {
       loadAddon: vi.fn(),
     }
@@ -51,7 +40,7 @@ describe('terminal runtime', () => {
     const runtime = createTerminalRuntime({ terminal: terminal as any, enableWebgl: false })
     runtime.attachAddons()
 
-    expect(terminal.loadAddon).toHaveBeenCalledTimes(2)
+    expect(terminal.loadAddon).toHaveBeenCalledTimes(1)
   })
 
   it('starts with webgl inactive and enables it asynchronously', async () => {
@@ -80,7 +69,7 @@ describe('terminal runtime', () => {
     const runtime = createTerminalRuntime({ terminal: terminal as any, enableWebgl: true })
     expect(() => runtime.attachAddons()).not.toThrow()
     await vi.waitFor(() => {
-      expect(terminal.loadAddon).toHaveBeenCalledTimes(3)
+      expect(terminal.loadAddon).toHaveBeenCalledTimes(2)
     })
     expect(runtime.webglActive()).toBe(false)
   })

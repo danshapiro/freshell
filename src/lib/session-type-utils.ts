@@ -1,31 +1,32 @@
 import type { ComponentType } from 'react'
 import { PROVIDER_ICONS, DefaultProviderIcon } from '@/components/icons/provider-icons'
-import { CODING_CLI_PROVIDER_LABELS, isCodingCliMode } from '@/lib/coding-cli-utils'
+import { isNonShellMode, getProviderLabel } from '@/lib/coding-cli-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import type { AgentChatProviderName } from '@/lib/agent-chat-types'
 import type { CodingCliProviderName } from '@/store/types'
 import type { PaneContentInput } from '@/store/paneTypes'
+import type { ClientExtensionEntry } from '@shared/extension-types'
 
 export interface SessionTypeConfig {
   icon: ComponentType<{ className?: string }>
   label: string
 }
 
-export function resolveSessionTypeConfig(sessionType: string): SessionTypeConfig {
-  // 1. Check coding CLI providers
-  if (isCodingCliMode(sessionType)) {
-    return {
-      icon: PROVIDER_ICONS[sessionType as keyof typeof PROVIDER_ICONS] ?? DefaultProviderIcon,
-      label: CODING_CLI_PROVIDER_LABELS[sessionType as keyof typeof CODING_CLI_PROVIDER_LABELS] ?? sessionType,
-    }
-  }
-
-  // 2. Check agent-chat providers
+export function resolveSessionTypeConfig(sessionType: string, extensions?: ClientExtensionEntry[]): SessionTypeConfig {
+  // 1. Check agent-chat providers first (they have explicit configs)
   const agentConfig = getAgentChatProviderConfig(sessionType)
   if (agentConfig) {
     return {
       icon: agentConfig.icon,
       label: agentConfig.label,
+    }
+  }
+
+  // 2. Any non-shell mode is a coding CLI provider
+  if (isNonShellMode(sessionType)) {
+    return {
+      icon: PROVIDER_ICONS[sessionType as keyof typeof PROVIDER_ICONS] ?? DefaultProviderIcon,
+      label: getProviderLabel(sessionType, extensions),
     }
   }
 
@@ -66,7 +67,7 @@ export function buildResumeContent(opts: {
     }
   }
   // Terminal pane (claude CLI, codex CLI, or fallback to 'claude')
-  const provider: CodingCliProviderName = isCodingCliMode(opts.sessionType)
+  const provider: CodingCliProviderName = isNonShellMode(opts.sessionType)
     ? opts.sessionType as CodingCliProviderName
     : 'claude'
   return {

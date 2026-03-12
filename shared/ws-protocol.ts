@@ -33,9 +33,17 @@ export const WS_PROTOCOL_VERSION = 3 as const
 
 export const ShellSchema = z.enum(['system', 'cmd', 'powershell', 'wsl'])
 
-export const CodingCliProviderSchema = z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
+export const CodingCliProviderSchema = z.string().min(1)
 
 export type CodingCliProviderName = z.infer<typeof CodingCliProviderSchema>
+
+export const SessionLocatorSchema = z.object({
+  provider: CodingCliProviderSchema,
+  sessionId: z.string().min(1),
+  serverInstanceId: z.string().min(1).optional(),
+})
+
+export type SessionLocator = z.infer<typeof SessionLocatorSchema>
 
 // ──────────────────────────────────────────────────────────────
 // Terminal metadata schemas (used in both directions)
@@ -51,6 +59,8 @@ export const TokenSummarySchema = z.object({
   compactThresholdTokens: z.number().int().positive().optional(),
   compactPercent: z.number().int().min(0).max(100).optional(),
 })
+
+export type TokenSummary = z.infer<typeof TokenSummarySchema>
 
 export const TerminalMetaRecordSchema = z.object({
   terminalId: z.string().min(1),
@@ -68,15 +78,30 @@ export const TerminalMetaRecordSchema = z.object({
 
 export type TerminalMetaRecord = z.infer<typeof TerminalMetaRecordSchema>
 
-export const TerminalMetaListResponseSchema = z.object({
-  type: z.literal('terminal.meta.list.response'),
-  requestId: z.string().min(1),
-  terminals: z.array(TerminalMetaRecordSchema),
-})
-
 export const TerminalMetaUpdatedSchema = z.object({
   type: z.literal('terminal.meta.updated'),
   upsert: z.array(TerminalMetaRecordSchema),
+  remove: z.array(z.string().min(1)),
+})
+
+export const CodexActivityRecordSchema = z.object({
+  terminalId: z.string().min(1),
+  sessionId: z.string().optional(),
+  phase: z.enum(['idle', 'pending', 'busy', 'unknown']),
+  updatedAt: z.number().int().nonnegative(),
+})
+
+export type CodexActivityRecord = z.infer<typeof CodexActivityRecordSchema>
+
+export const CodexActivityListResponseSchema = z.object({
+  type: z.literal('codex.activity.list.response'),
+  requestId: z.string().min(1),
+  terminals: z.array(CodexActivityRecordSchema),
+})
+
+export const CodexActivityUpdatedSchema = z.object({
+  type: z.literal('codex.activity.updated'),
+  upsert: z.array(CodexActivityRecordSchema),
   remove: z.array(z.string().min(1)),
 })
 
@@ -137,13 +162,12 @@ export const HelloSchema = z.object({
   token: z.string().optional(),
   protocolVersion: z.literal(WS_PROTOCOL_VERSION),
   capabilities: z.object({
-    sessionsPatchV1: z.boolean().optional(),
-    sessionsPaginationV1: z.boolean().optional(),
     uiScreenshotV1: z.boolean().optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),
   }).optional(),
+  sidebarOpenSessions: z.array(SessionLocatorSchema).optional(),
   sessions: z.object({
     active: z.string().optional(),
     visible: z.array(z.string()).optional(),
@@ -158,7 +182,7 @@ export const PingSchema = z.object({
 export const TerminalCreateSchema = z.object({
   type: z.literal('terminal.create'),
   requestId: z.string().min(1),
-  mode: z.enum(['shell', 'claude', 'codex', 'opencode', 'gemini', 'kimi']).default('shell'),
+  mode: z.string().default('shell'),
   shell: ShellSchema.default('system'),
   cwd: z.string().optional(),
   resumeSessionId: z.string().optional(),
@@ -199,13 +223,8 @@ export const TerminalKillSchema = z.object({
   terminalId: z.string().min(1),
 })
 
-export const TerminalListSchema = z.object({
-  type: z.literal('terminal.list'),
-  requestId: z.string().min(1),
-})
-
-export const TerminalMetaListSchema = z.object({
-  type: z.literal('terminal.meta.list'),
+export const CodexActivityListSchema = z.object({
+  type: z.literal('codex.activity.list'),
   requestId: z.string().min(1),
 })
 
@@ -214,6 +233,7 @@ export const UiLayoutSyncSchema = z.object({
   tabs: z.array(z.object({
     id: z.string(),
     title: z.string().optional(),
+    fallbackSessionRef: SessionLocatorSchema.optional(),
   })),
   activeTabId: z.string().nullable().optional(),
   layouts: z.record(z.string(), z.unknown()),
@@ -341,15 +361,6 @@ export const BrowserSdkMessageSchema = z.discriminatedUnion('type', [
 
 export type BrowserSdkMessage = z.infer<typeof BrowserSdkMessageSchema>
 
-// Sessions pagination (client → server)
-export const SessionsFetchSchema = z.object({
-  type: z.literal('sessions.fetch'),
-  requestId: z.string().min(1),
-  before: z.number().nonnegative().optional(),
-  beforeId: z.string().min(1).optional(),
-  limit: z.number().int().min(1).max(500).optional(),
-})
-
 // ── Client message discriminated union ──
 
 export const ClientMessageSchema = z.discriminatedUnion('type', [
@@ -361,11 +372,9 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   TerminalInputSchema,
   TerminalResizeSchema,
   TerminalKillSchema,
-  TerminalListSchema,
-  TerminalMetaListSchema,
+  CodexActivityListSchema,
   UiLayoutSyncSchema,
   UiScreenshotResultSchema,
-  SessionsFetchSchema,
   CodingCliCreateSchema,
   CodingCliInputSchema,
   CodingCliKillSchema,
@@ -468,62 +477,32 @@ export type TerminalSessionAssociatedMessage = {
   sessionId: string
 }
 
-export type TerminalListUpdatedMessage = {
-  type: 'terminal.list.updated'
+export type TerminalsChangedMessage = {
+  type: 'terminals.changed'
+  revision: number
 }
 
-export type TerminalListResponseMessage = {
-  type: 'terminal.list.response'
-  requestId: string
-  terminals: Array<{
-    terminalId: string
-    title: string
-    description?: string
-    mode: 'shell' | CodingCliProviderName
-    resumeSessionId?: string
-    createdAt: number
-    lastActivityAt: number
-    status: 'running' | 'exited'
-    hasClients: boolean
-    cwd?: string
-  }>
+export type TerminalRuntimeUpdatedMessage = {
+  type: 'terminal.runtime.updated'
+  terminalId: string
+  revision: number
+  status: 'running' | 'detached' | 'exited'
+  title: string
+  cwd?: string
+  pid?: number
 }
-
-export type TerminalMetaListResponseMessage = z.infer<typeof TerminalMetaListResponseSchema>
 
 export type TerminalMetaUpdatedMessage = z.infer<typeof TerminalMetaUpdatedSchema>
 
+export type CodexActivityListResponseMessage = z.infer<typeof CodexActivityListResponseSchema>
+
+export type CodexActivityUpdatedMessage = z.infer<typeof CodexActivityUpdatedSchema>
+
 // -- Sessions --
 
-export type SessionsUpdatedMessage = {
-  type: 'sessions.updated'
-  // Intentionally unknown to avoid coupling this shared protocol package to
-  // client-only ProjectGroup types.
-  projects: unknown[]
-  clear?: true
-  append?: true
-  totalSessions?: number
-  oldestIncludedTimestamp?: number
-  oldestIncludedSessionId?: string
-  hasMore?: boolean
-}
-
-export type SessionsPageMessage = {
-  type: 'sessions.page'
-  requestId: string
-  projects: unknown[]
-  totalSessions: number
-  oldestIncludedTimestamp: number
-  oldestIncludedSessionId: string
-  hasMore: boolean
-}
-
-export type SessionsPatchMessage = {
-  type: 'sessions.patch'
-  // Intentionally unknown to avoid coupling this shared protocol package to
-  // client-only ProjectGroup types.
-  upsertProjects: unknown[]
-  removeProjectPaths: string[]
+export type SessionsChangedMessage = {
+  type: 'sessions.changed'
+  revision: number
 }
 
 // -- Settings --
@@ -652,7 +631,6 @@ export type SdkServerMessage =
   | { type: 'sdk.permission.cancelled'; sessionId: string; requestId: string }
   | { type: 'sdk.status'; sessionId: string; status: SdkSessionStatus }
   | { type: 'sdk.error'; sessionId: string; message: string; code?: string }
-  | { type: 'sdk.history'; sessionId: string; messages: Array<{ role: 'user' | 'assistant'; content: ContentBlock[]; timestamp?: string }> }
   | { type: 'sdk.exit'; sessionId: string; exitCode?: number }
   | { type: 'sdk.killed'; sessionId: string; success: boolean }
   | { type: 'sdk.models'; sessionId: string; models: Array<{ value: string; displayName: string; description: string }> }
@@ -701,13 +679,12 @@ export type ServerMessage =
   | TerminalOutputGapMessage
   | TerminalTitleUpdatedMessage
   | TerminalSessionAssociatedMessage
-  | TerminalListUpdatedMessage
-  | TerminalListResponseMessage
-  | TerminalMetaListResponseMessage
+  | TerminalsChangedMessage
+  | TerminalRuntimeUpdatedMessage
   | TerminalMetaUpdatedMessage
-  | SessionsUpdatedMessage
-  | SessionsPageMessage
-  | SessionsPatchMessage
+  | CodexActivityListResponseMessage
+  | CodexActivityUpdatedMessage
+  | SessionsChangedMessage
   | SettingsUpdatedMessage
   | UiCommandMessage
   | PerfLoggingMessage

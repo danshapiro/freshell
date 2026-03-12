@@ -280,9 +280,9 @@ describe('PortForwardManager', () => {
       ).rejects.toThrow()
     })
 
-    it('is a no-op for non-existent forwards', () => {
+    it('is a no-op for non-existent forwards', async () => {
       // Should not throw
-      manager.close(99999)
+      await manager.close(99999)
     })
 
     it('waits for the listening socket to finish closing', async () => {

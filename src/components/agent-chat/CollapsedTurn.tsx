@@ -4,8 +4,12 @@ import type { ChatMessage } from '@/store/agentChatTypes'
 import MessageBubble from './MessageBubble'
 
 interface CollapsedTurnProps {
-  userMessage: ChatMessage
-  assistantMessage: ChatMessage
+  userMessage?: ChatMessage
+  assistantMessage?: ChatMessage
+  summary?: string
+  message?: ChatMessage
+  loading?: boolean
+  onExpand?: () => void
   showThinking?: boolean
   showTools?: boolean
   showTimecodes?: boolean
@@ -34,19 +38,75 @@ function makeSummary(userMsg: ChatMessage, assistantMsg: ChatMessage): string {
 function CollapsedTurn({
   userMessage,
   assistantMessage,
+  summary,
+  message,
+  loading = false,
+  onExpand,
   showThinking = true,
   showTools = true,
   showTimecodes = false,
 }: CollapsedTurnProps) {
   const [expanded, setExpanded] = useState(false)
-  const summary = useMemo(
-    () => makeSummary(userMessage, assistantMessage),
-    [userMessage, assistantMessage],
+  const summaryText = useMemo(
+    () => {
+      if (summary) return summary
+      if (userMessage && assistantMessage) {
+        return makeSummary(userMessage, assistantMessage)
+      }
+      return '(loading turn)'
+    },
+    [assistantMessage, summary, userMessage],
   )
 
   if (expanded) {
+    if (message) {
+      return (
+        <div className="space-y-2">
+          <button
+            type="button"
+            onClick={() => setExpanded(false)}
+            className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+            aria-expanded={true}
+            aria-label="Collapse turn"
+          >
+            <ChevronRight className="h-3 w-3 rotate-90 transition-transform" />
+            <span className="font-mono opacity-70">{summaryText}</span>
+          </button>
+          <MessageBubble
+            speaker={message.role}
+            content={message.content}
+            timestamp={message.timestamp}
+            model={message.model}
+            showThinking={showThinking}
+            showTools={showTools}
+            showTimecodes={showTimecodes}
+          />
+        </div>
+      )
+    }
+
+    if (!userMessage || !assistantMessage) {
+      return (
+        <div className="space-y-2">
+          <button
+            type="button"
+            onClick={() => setExpanded(false)}
+            className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+            aria-expanded={true}
+            aria-label="Collapse turn"
+          >
+            <ChevronRight className="h-3 w-3 rotate-90 transition-transform" />
+            <span className="font-mono opacity-70">{summaryText}</span>
+          </button>
+          <div className="text-xs text-muted-foreground">
+            {loading ? 'Loading turn...' : 'Turn body unavailable'}
+          </div>
+        </div>
+      )
+    }
+
     return (
-      <div className="space-y-3">
+      <div className="space-y-2">
         <button
           type="button"
           onClick={() => setExpanded(false)}
@@ -55,10 +115,10 @@ function CollapsedTurn({
           aria-label="Collapse turn"
         >
           <ChevronRight className="h-3 w-3 rotate-90 transition-transform" />
-          <span className="font-mono opacity-70">{summary}</span>
+          <span className="font-mono opacity-70">{summaryText}</span>
         </button>
         <MessageBubble
-          role={userMessage.role}
+          speaker={userMessage.role}
           content={userMessage.content}
           timestamp={userMessage.timestamp}
           showThinking={showThinking}
@@ -66,7 +126,7 @@ function CollapsedTurn({
           showTimecodes={showTimecodes}
         />
         <MessageBubble
-          role={assistantMessage.role}
+          speaker={assistantMessage.role}
           content={assistantMessage.content}
           timestamp={assistantMessage.timestamp}
           model={assistantMessage.model}
@@ -81,13 +141,16 @@ function CollapsedTurn({
   return (
     <button
       type="button"
-      onClick={() => setExpanded(true)}
+      onClick={() => {
+        setExpanded(true)
+        onExpand?.()
+      }}
       className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors w-full text-left"
       aria-expanded={false}
       aria-label="Expand turn"
     >
       <ChevronRight className="h-3 w-3 shrink-0 transition-transform" />
-      <span className="font-mono truncate">{summary}</span>
+      <span className="font-mono truncate">{summaryText}</span>
     </button>
   )
 }

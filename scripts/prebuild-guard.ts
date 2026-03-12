@@ -7,7 +7,7 @@
  * If so, blocks the build and suggests safe alternatives.
  */
 
-import { readFileSync } from 'fs'
+import { readFileSync, statSync } from 'fs'
 import { resolve, dirname } from 'path'
 import { fileURLToPath } from 'url'
 
@@ -42,6 +42,21 @@ function loadEnv(): Record<string, string> {
   }
 }
 
+export function isLinkedWorktreeCheckout(rootDir: string = resolve(__dirname, '..')): boolean {
+  try {
+    const dotGitPath = resolve(rootDir, '.git')
+    const stat = statSync(dotGitPath)
+    if (!stat.isFile()) {
+      return false
+    }
+
+    const pointer = readFileSync(dotGitPath, 'utf-8').trim().replace(/\\/g, '/')
+    return /^gitdir:\s+.+\/\.git\/worktrees\/.+$/m.test(pointer)
+  } catch {
+    return false
+  }
+}
+
 export interface ProdCheckResult {
   status: 'running' | 'not-running'
   version?: string
@@ -51,12 +66,18 @@ const PROD_CHECK_TIMEOUT_MS = 3000
 const PROD_CHECK_ATTEMPTS = 3
 const PROD_CHECK_RETRY_DELAY_MS = 100
 
-async function probeProdRunning(port: number): Promise<{
+export interface ProdCheckOptions {
+  timeoutMs?: number
+  attempts?: number
+  retryDelayMs?: number
+}
+
+async function probeProdRunning(port: number, timeoutMs: number): Promise<{
   result: ProdCheckResult
   transientFailure: boolean
 }> {
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), PROD_CHECK_TIMEOUT_MS)
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
   try {
     const res = await fetch(`http://127.0.0.1:${port}/api/health`, {
       signal: controller.signal,
@@ -79,22 +100,33 @@ async function probeProdRunning(port: number): Promise<{
   }
 }
 
-export async function checkProdRunning(port: number): Promise<ProdCheckResult> {
-  for (let attempt = 1; attempt <= PROD_CHECK_ATTEMPTS; attempt += 1) {
-    const { result, transientFailure } = await probeProdRunning(port)
+export async function checkProdRunning(
+  port: number,
+  {
+    timeoutMs = PROD_CHECK_TIMEOUT_MS,
+    attempts = PROD_CHECK_ATTEMPTS,
+    retryDelayMs = PROD_CHECK_RETRY_DELAY_MS,
+  }: ProdCheckOptions = {},
+): Promise<ProdCheckResult> {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const { result, transientFailure } = await probeProdRunning(port, timeoutMs)
     if (result.status === 'running') {
       return result
     }
-    if (!transientFailure || attempt === PROD_CHECK_ATTEMPTS) {
+    if (!transientFailure || attempt === attempts) {
       return result
     }
-    await new Promise((resolve) => setTimeout(resolve, PROD_CHECK_RETRY_DELAY_MS))
+    await new Promise((resolve) => setTimeout(resolve, retryDelayMs))
   }
 
   return { status: 'not-running' }
 }
 
 export async function main(): Promise<void> {
+  if (isLinkedWorktreeCheckout()) {
+    process.exit(0)
+  }
+
   const env = loadEnv()
   const port = parseInt(process.env.PORT || env.PORT || '3001', 10)
 

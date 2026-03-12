@@ -70,11 +70,10 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
 
   useEffect(() => {
     const unsub = ws.onMessage((msg) => {
-      if (['terminal.list.updated', 'terminal.exit', 'terminal.detached', 'terminal.attach.ready'].includes(msg.type)) {
+      if (['terminals.changed', 'terminal.exit', 'terminal.detached', 'terminal.attach.ready'].includes(msg.type)) {
         refresh()
       }
     })
-    ws.connect().catch(() => {})
     return () => unsub()
   }, [ws])
 

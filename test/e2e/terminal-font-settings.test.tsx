@@ -8,6 +8,9 @@ import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
+import tabRegistryReducer from '@/store/tabRegistrySlice'
+import terminalMetaReducer from '@/store/terminalMetaSlice'
+import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer } from '@/store/networkSlice'
 import { LOCAL_TERMINAL_FONT_KEY } from '@/lib/terminal-fonts'
 
@@ -16,6 +19,11 @@ const mockOnMessage = vi.fn(() => () => {})
 const mockOnReconnect = vi.fn(() => () => {})
 const mockConnect = vi.fn().mockResolvedValue(undefined)
 const mockApiGet = vi.fn().mockResolvedValue({})
+const fetchSidebarSessionsSnapshot = vi.fn()
+const wsState = {
+  isReady: false,
+  serverInstanceId: undefined as string | undefined,
+}
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -24,6 +32,15 @@ vi.mock('@/lib/ws-client', () => ({
     onReconnect: mockOnReconnect,
     connect: mockConnect,
     setHelloExtensionProvider: vi.fn(),
+    get isReady() {
+      return wsState.isReady
+    },
+    get serverInstanceId() {
+      return wsState.serverInstanceId
+    },
+    get state() {
+      return wsState.isReady ? 'ready' : 'connected'
+    },
   }),
 }))
 
@@ -33,6 +50,8 @@ vi.mock('@/lib/api', () => ({
     patch: vi.fn().mockResolvedValue({}),
     post: vi.fn().mockResolvedValue({}),
   },
+  fetchSidebarSessionsSnapshot: (options?: unknown) => fetchSidebarSessionsSnapshot(options),
+  isApiUnauthorizedError: (err: any) => !!err && typeof err === 'object' && err.status === 401,
 }))
 
 vi.mock('@/components/TabContent', () => ({
@@ -71,7 +90,10 @@ function createTestStore() {
       connection: connectionReducer,
       sessions: sessionsReducer,
       panes: panesReducer,
+      tabRegistry: tabRegistryReducer,
+      terminalMeta: terminalMetaReducer,
       network: networkReducer,
+      extensions: extensionsReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -92,18 +114,40 @@ function createTestStore() {
       sessions: {
         projects: [],
         expandedProjects: new Set<string>(),
+        wsSnapshotReceived: false,
         isLoading: false,
         error: null,
       },
       connection: {
         status: 'ready' as const,
         lastError: undefined,
+        platform: null,
+        availableClis: {},
+        serverInstanceId: undefined,
       },
       panes: {
         layouts: {},
         activePane: {},
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
       },
+      tabRegistry: {
+        deviceId: 'device-test',
+        deviceLabel: 'device-test',
+        deviceAliases: {},
+        localOpen: [],
+        remoteOpen: [],
+        closed: [],
+        localClosed: {},
+        searchRangeDays: 30,
+        loading: false,
+      },
+      terminalMeta: { byTerminalId: {} },
       network: { status: null, loading: false, configuring: false, error: null },
+      extensions: { entries: [] },
     },
   })
 }
@@ -122,6 +166,10 @@ describe('terminal font preference (e2e)', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     localStorage.clear()
+    fetchSidebarSessionsSnapshot.mockReset()
+    fetchSidebarSessionsSnapshot.mockResolvedValue([])
+    wsState.isReady = false
+    wsState.serverInstanceId = undefined
     const sessionStorageMock: Record<string, string> = {
       'auth-token': 'test-token-abc123',
     }
@@ -152,17 +200,14 @@ describe('terminal font preference (e2e)', () => {
     localStorage.setItem(LOCAL_TERMINAL_FONT_KEY, 'Fira Code')
 
     mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') {
+      if (url === '/api/bootstrap') {
         return Promise.resolve({
-          ...defaultSettings,
-          terminal: { ...defaultSettings.terminal, fontFamily: 'Consolas' },
+          settings: {
+            ...defaultSettings,
+            terminal: { ...defaultSettings.terminal, fontFamily: 'Consolas' },
+          },
+          platform: { platform: 'darwin' },
         })
-      }
-      if (url === '/api/platform') {
-        return Promise.resolve({ platform: 'darwin' })
-      }
-      if (url === '/api/sessions') {
-        return Promise.resolve([])
       }
       return Promise.resolve({})
     })
@@ -171,7 +216,7 @@ describe('terminal font preference (e2e)', () => {
     renderApp(store)
 
     await waitFor(() => {
-      expect(mockApiGet).toHaveBeenCalledWith('/api/settings')
+      expect(mockApiGet).toHaveBeenCalledWith('/api/bootstrap')
     })
 
     expect(store.getState().settings.settings.terminal.fontFamily).toBe('Fira Code')
@@ -179,17 +224,14 @@ describe('terminal font preference (e2e)', () => {
 
   it('ignores server font when no local preference exists', async () => {
     mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') {
+      if (url === '/api/bootstrap') {
         return Promise.resolve({
-          ...defaultSettings,
-          terminal: { ...defaultSettings.terminal, fontFamily: 'Consolas' },
+          settings: {
+            ...defaultSettings,
+            terminal: { ...defaultSettings.terminal, fontFamily: 'Consolas' },
+          },
+          platform: { platform: 'darwin' },
         })
-      }
-      if (url === '/api/platform') {
-        return Promise.resolve({ platform: 'darwin' })
-      }
-      if (url === '/api/sessions') {
-        return Promise.resolve([])
       }
       return Promise.resolve({})
     })
@@ -198,7 +240,7 @@ describe('terminal font preference (e2e)', () => {
     renderApp(store)
 
     await waitFor(() => {
-      expect(mockApiGet).toHaveBeenCalledWith('/api/settings')
+      expect(mockApiGet).toHaveBeenCalledWith('/api/bootstrap')
     })
 
     expect(store.getState().settings.settings.terminal.fontFamily).toBe('monospace')

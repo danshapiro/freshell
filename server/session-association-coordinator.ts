@@ -1,5 +1,6 @@
 import { makeSessionKey, type CodingCliSession, type ProjectGroup } from './coding-cli/types.js'
 import { modeSupportsResume, type BindSessionResult } from './terminal-registry.js'
+import type { SessionBindingReason } from './terminal-stream/registry-events.js'
 
 type TerminalAssociationCandidate = {
   terminalId: string
@@ -8,7 +9,12 @@ type TerminalAssociationCandidate = {
 
 type AssociationRegistry = {
   findUnassociatedTerminals: (mode: CodingCliSession['provider'], cwd: string) => TerminalAssociationCandidate[]
-  bindSession: (terminalId: string, provider: CodingCliSession['provider'], sessionId: string) => BindSessionResult
+  bindSession: (
+    terminalId: string,
+    provider: CodingCliSession['provider'],
+    sessionId: string,
+    reason: SessionBindingReason,
+  ) => BindSessionResult
 }
 
 export type SessionAssociationResult = {
@@ -50,7 +56,7 @@ export class SessionAssociationCoordinator {
     const term = unassociated.find((candidate) => session.updatedAt >= candidate.createdAt - this.maxAssociationAgeMs)
     if (!term) return { associated: false }
 
-    const bound = this.registry.bindSession(term.terminalId, session.provider, session.sessionId)
+    const bound = this.registry.bindSession(term.terminalId, session.provider, session.sessionId, 'association')
     if (!bound.ok) return { associated: false }
 
     return { associated: true, terminalId: term.terminalId }

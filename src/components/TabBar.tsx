@@ -1,10 +1,12 @@
-import { PanelLeft, Plus } from 'lucide-react'
+import { ChevronLeft, ChevronRight, PanelLeft, Plus } from 'lucide-react'
+import { cn } from '@/lib/utils'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, closeTab, setActiveTab, updateTab, reorderTabs, clearTabRenameRequest } from '@/store/tabsSlice'
 import { clearTabAttention, clearPaneAttention } from '@/store/turnCompletionSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { collectTerminalIds, collectPaneContents } from '@/lib/pane-utils'
+import { resolveExactCodexActivity } from '@/lib/codex-activity-resolver'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useTabBarScroll } from '@/hooks/useTabBarScroll'
 import TabItem from './TabItem'
@@ -40,6 +42,8 @@ interface SortableTabProps {
   displayTitle: string
   isActive: boolean
   needsAttention: boolean
+  activityPulse: boolean
+  activityTerminalIds: string[]
   isDragging: boolean
   isRenaming: boolean
   renameValue: string
@@ -59,6 +63,8 @@ function SortableTab({
   displayTitle,
   isActive,
   needsAttention,
+  activityPulse,
+  activityTerminalIds,
   isDragging,
   isRenaming,
   renameValue,
@@ -97,6 +103,8 @@ function SortableTab({
         tab={tabWithDisplayTitle}
         isActive={isActive}
         needsAttention={needsAttention}
+        activityPulse={activityPulse}
+        activityTerminalIds={activityTerminalIds}
         isDragging={isDragging}
         isRenaming={isRenaming}
         renameValue={renameValue}
@@ -117,6 +125,8 @@ function SortableTab({
 // Stable empty object to avoid creating new references
 const EMPTY_LAYOUTS: Record<string, never> = {}
 const EMPTY_ATTENTION: Record<string, boolean> = {}
+const EMPTY_CODEX_ACTIVITY_BY_ID = {}
+const EMPTY_ACTIVITY_TERMINAL_IDS: string[] = []
 
 interface TabBarProps {
   sidebarCollapsed?: boolean
@@ -134,18 +144,20 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   const paneLayouts = useAppSelector((s) => s.panes?.layouts) ?? EMPTY_LAYOUTS
   const attentionByTab = useAppSelector((s) => s.turnCompletion?.attentionByTab) ?? EMPTY_ATTENTION
   const attentionByPane = useAppSelector((s) => s.turnCompletion?.attentionByPane) ?? EMPTY_ATTENTION
+  const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
   const activePaneMap = useAppSelector((s) => s.panes?.activePane)
   const attentionDismiss = useAppSelector((s) => s.settings?.settings?.panes?.attentionDismiss ?? 'click')
   const iconsOnTabs = useAppSelector((s) => s.settings?.settings?.panes?.iconsOnTabs ?? true)
   const tabAttentionStyle = useAppSelector((s) => s.settings?.settings?.panes?.tabAttentionStyle ?? 'highlight')
+  const extensions = useAppSelector((s) => s.extensions?.entries)
 
   const ws = useMemo(() => getWsClient(), [])
 
   // Compute display title for a single tab
   // Priority: user-set title > programmatically-set title (e.g., from Claude) > derived name
   const getDisplayTitle = useCallback(
-    (tab: Tab): string => getTabDisplayTitle(tab, paneLayouts[tab.id]),
-    [paneLayouts]
+    (tab: Tab): string => getTabDisplayTitle(tab, paneLayouts[tab.id], extensions),
+    [paneLayouts, extensions]
   )
 
   const getPaneContents = useCallback((tab: Tab): PaneContent[] | undefined => {
@@ -176,6 +188,37 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     }
     return tab.terminalId ? [tab.terminalId] : []
   }, [paneLayouts])
+
+  const getTabActivityTerminalIds = useCallback((tab: Tab): string[] => {
+    const layout = paneLayouts[tab.id]
+    if (!layout) {
+      if (
+        tab.terminalId
+        && tab.status === 'running'
+        && codexActivityByTerminalId[tab.terminalId]?.phase === 'busy'
+      ) {
+        return [tab.terminalId]
+      }
+      return EMPTY_ACTIVITY_TERMINAL_IDS
+    }
+
+    const busyTerminalIds = new Set<string>()
+    const isOnlyPane = layout.type === 'leaf'
+    for (const content of collectPaneContents(layout)) {
+      if (content.kind !== 'terminal') continue
+      if (content.status !== 'running') continue
+      const record = resolveExactCodexActivity(codexActivityByTerminalId, {
+        terminalId: content.terminalId,
+        tabTerminalId: tab.terminalId,
+        isOnlyPane,
+      })
+      if (record?.phase === 'busy') {
+        busyTerminalIds.add(record.terminalId)
+      }
+    }
+
+    return busyTerminalIds.size > 0 ? Array.from(busyTerminalIds) : EMPTY_ACTIVITY_TERMINAL_IDS
+  }, [codexActivityByTerminalId, paneLayouts])
 
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
@@ -225,6 +268,96 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     [tabs, dispatch]
   )
 
+  const renderSortableTab = useCallback((tab: Tab) => {
+    const activityTerminalIds = getTabActivityTerminalIds(tab)
+    return (
+      <SortableTab
+        key={tab.id}
+        tab={tab}
+        displayTitle={getDisplayTitle(tab)}
+        isActive={tab.id === activeTabId}
+        needsAttention={!!attentionByTab[tab.id]}
+        activityPulse={activityTerminalIds.length > 0}
+        activityTerminalIds={activityTerminalIds}
+        isDragging={activeId === tab.id}
+        isRenaming={renamingId === tab.id}
+        renameValue={renameValue}
+        paneContents={getPaneContents(tab)}
+        iconsOnTabs={iconsOnTabs}
+        tabAttentionStyle={tabAttentionStyle}
+        onRenameChange={setRenameValue}
+        onRenameBlur={() => {
+          dispatch(
+            updateTab({
+              id: tab.id,
+              updates: { title: renameValue || tab.title, titleSetByUser: true },
+            })
+          )
+          setRenamingId(null)
+        }}
+        onRenameKeyDown={(e) => {
+          e.stopPropagation() // Prevent dnd-kit from intercepting keys (esp. space)
+          if (e.key === 'Enter' || e.key === 'Escape') {
+            ;(e.target as HTMLInputElement).blur()
+          }
+        }}
+        onClose={(e) => {
+          const terminalIds = getTerminalIdsForTab(tab)
+          if (terminalIds.length > 0) {
+            const messageType = e.shiftKey ? 'terminal.kill' : 'terminal.detach'
+            for (const terminalId of terminalIds) {
+              ws.send({
+                type: messageType,
+                terminalId,
+              })
+            }
+          } else if (tab.codingCliSessionId) {
+            if (tab.status === 'creating') {
+              dispatch(cancelCodingCliRequest({ requestId: tab.codingCliSessionId }))
+            } else {
+              ws.send({
+                type: 'codingcli.kill',
+                sessionId: tab.codingCliSessionId,
+              })
+            }
+          }
+          dispatch(closeTab(tab.id))
+        }}
+        onClick={() => {
+          if (attentionDismiss === 'click' && attentionByTab[tab.id]) {
+            dispatch(clearTabAttention({ tabId: tab.id }))
+            const activePaneId = activePaneMap?.[tab.id]
+            if (activePaneId && attentionByPane[activePaneId]) {
+              dispatch(clearPaneAttention({ paneId: activePaneId }))
+            }
+          }
+          dispatch(setActiveTab(tab.id))
+        }}
+        onDoubleClick={() => {
+          setRenamingId(tab.id)
+          setRenameValue(getDisplayTitle(tab))
+        }}
+      />
+    )
+  }, [
+    activeId,
+    activePaneMap,
+    activeTabId,
+    attentionByPane,
+    attentionByTab,
+    attentionDismiss,
+    dispatch,
+    getDisplayTitle,
+    getPaneContents,
+    getTabActivityTerminalIds,
+    getTerminalIdsForTab,
+    iconsOnTabs,
+    renameValue,
+    renamingId,
+    tabAttentionStyle,
+    ws,
+  ])
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.shiftKey && activeTabId) {
@@ -242,7 +375,15 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [activeTabId, tabs, dispatch])
 
-  const { callbackRef, canScrollLeft, canScrollRight } = useTabBarScroll(activeTabId, tabs.length)
+  const {
+    callbackRef,
+    canScrollLeft,
+    canScrollRight,
+    handleArrowClick,
+    startHoldScroll,
+    stopHoldScroll,
+    cancelHoldScroll,
+  } = useTabBarScroll(activeTabId, tabs.length)
 
   const activeTab = activeId ? tabs.find((t: Tab) => t.id === activeId) : null
 
@@ -279,107 +420,59 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
           items={tabs.map((t: Tab) => t.id)}
           strategy={horizontalListSortingStrategy}
         >
-          <div className="relative z-10 flex items-end flex-1 min-w-0">
-            {/* Overflow indicator: left */}
-            {canScrollLeft && (
-              <div
-                className="pointer-events-none absolute left-0 top-0 bottom-0 w-8 z-20 bg-gradient-to-r from-background to-transparent"
-                aria-hidden="true"
-              />
+          {/* Left scroll arrow -- flex sibling alongside the scroll container */}
+          <button
+            className={cn(
+              'flex-shrink-0 w-7 h-8 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-all duration-150',
+              canScrollLeft ? 'opacity-100' : 'opacity-0 pointer-events-none',
             )}
+            aria-label="Scroll tabs left"
+            aria-hidden={canScrollLeft ? undefined : true}
+            tabIndex={canScrollLeft ? 0 : -1}
+            onClick={() => handleArrowClick('left')}
+            onPointerDown={() => startHoldScroll('left')}
+            onPointerUp={stopHoldScroll}
+            onPointerLeave={cancelHoldScroll}
+            onPointerCancel={cancelHoldScroll}
+          >
+            <ChevronLeft className="h-4 w-4" />
+          </button>
 
-            {/* Scrollable tab strip */}
-            <div
-              ref={callbackRef}
-              className="flex items-end gap-0.5 overflow-x-auto overflow-y-hidden scrollbar-none pt-px flex-1 min-w-0"
-            >
-              {sidebarCollapsed && onToggleSidebar && (
-                <button
-                  className="flex-shrink-0 mb-1 p-1 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-colors"
-                  title="Show sidebar"
-                  aria-label="Show sidebar"
-                  onClick={onToggleSidebar}
-                >
-                  <PanelLeft className="h-3.5 w-3.5" />
-                </button>
-              )}
-              {tabs.map((tab: Tab) => (
-                <SortableTab
-                  key={tab.id}
-                  tab={tab}
-                  displayTitle={getDisplayTitle(tab)}
-                  isActive={tab.id === activeTabId}
-                  needsAttention={!!attentionByTab[tab.id]}
-                  isDragging={activeId === tab.id}
-                  isRenaming={renamingId === tab.id}
-                  renameValue={renameValue}
-                  paneContents={getPaneContents(tab)}
-                  iconsOnTabs={iconsOnTabs}
-                  tabAttentionStyle={tabAttentionStyle}
-                  onRenameChange={setRenameValue}
-                  onRenameBlur={() => {
-                    dispatch(
-                      updateTab({
-                        id: tab.id,
-                        updates: { title: renameValue || tab.title, titleSetByUser: true },
-                      })
-                    )
-                    setRenamingId(null)
-                  }}
-                  onRenameKeyDown={(e) => {
-                    e.stopPropagation() // Prevent dnd-kit from intercepting keys (esp. space)
-                    if (e.key === 'Enter' || e.key === 'Escape') {
-                      ;(e.target as HTMLInputElement).blur()
-                    }
-                  }}
-                  onClose={(e) => {
-                    const terminalIds = getTerminalIdsForTab(tab)
-                    if (terminalIds.length > 0) {
-                      const messageType = e.shiftKey ? 'terminal.kill' : 'terminal.detach'
-                      for (const terminalId of terminalIds) {
-                        ws.send({
-                          type: messageType,
-                          terminalId,
-                        })
-                      }
-                    } else if (tab.codingCliSessionId) {
-                      if (tab.status === 'creating') {
-                        dispatch(cancelCodingCliRequest({ requestId: tab.codingCliSessionId }))
-                      } else {
-                        ws.send({
-                          type: 'codingcli.kill',
-                          sessionId: tab.codingCliSessionId,
-                        })
-                      }
-                    }
-                    dispatch(closeTab(tab.id))
-                  }}
-                  onClick={() => {
-                    if (attentionDismiss === 'click' && attentionByTab[tab.id]) {
-                      dispatch(clearTabAttention({ tabId: tab.id }))
-                      const activePaneId = activePaneMap?.[tab.id]
-                      if (activePaneId && attentionByPane[activePaneId]) {
-                        dispatch(clearPaneAttention({ paneId: activePaneId }))
-                      }
-                    }
-                    dispatch(setActiveTab(tab.id))
-                  }}
-                  onDoubleClick={() => {
-                    setRenamingId(tab.id)
-                    setRenameValue(getDisplayTitle(tab))
-                  }}
-                />
-              ))}
-            </div>
-
-            {/* Overflow indicator: right */}
-            {canScrollRight && (
-              <div
-                className="pointer-events-none absolute right-0 top-0 bottom-0 w-8 z-20 bg-gradient-to-l from-background to-transparent"
-                aria-hidden="true"
-              />
+          {/* Scrollable tab strip */}
+          <div
+            ref={callbackRef}
+            className="flex items-end gap-0.5 overflow-x-auto overflow-y-hidden scrollbar-none pt-px flex-1 min-w-0"
+          >
+            {sidebarCollapsed && onToggleSidebar && (
+              <button
+                className="flex-shrink-0 mb-1 p-1 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-colors"
+                title="Show sidebar"
+                aria-label="Show sidebar"
+                onClick={onToggleSidebar}
+              >
+                <PanelLeft className="h-3.5 w-3.5" />
+              </button>
             )}
+            {tabs.map(renderSortableTab)}
           </div>
+
+          {/* Right scroll arrow -- flex sibling alongside the scroll container */}
+          <button
+            className={cn(
+              'flex-shrink-0 w-7 h-8 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-all duration-150',
+              canScrollRight ? 'opacity-100' : 'opacity-0 pointer-events-none',
+            )}
+            aria-label="Scroll tabs right"
+            aria-hidden={canScrollRight ? undefined : true}
+            tabIndex={canScrollRight ? 0 : -1}
+            onClick={() => handleArrowClick('right')}
+            onPointerDown={() => startHoldScroll('right')}
+            onPointerUp={stopHoldScroll}
+            onPointerLeave={cancelHoldScroll}
+            onPointerCancel={cancelHoldScroll}
+          >
+            <ChevronRight className="h-4 w-4" />
+          </button>
         </SortableContext>
 
         {/* Pinned + button -- outside the scrollable area */}
@@ -407,6 +500,8 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
                 tab={{ ...activeTab, title: getDisplayTitle(activeTab) }}
                 isActive={activeTab.id === activeTabId}
                 needsAttention={!!attentionByTab[activeTab.id]}
+                activityPulse={getTabActivityTerminalIds(activeTab).length > 0}
+                activityTerminalIds={getTabActivityTerminalIds(activeTab)}
                 isDragging={false}
                 isRenaming={false}
                 renameValue=""

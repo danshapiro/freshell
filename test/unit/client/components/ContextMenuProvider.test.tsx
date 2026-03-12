@@ -9,7 +9,22 @@ import panesReducer from '@/store/panesSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import settingsReducer from '@/store/settingsSlice'
+import extensionsReducer from '@/store/extensionsSlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
+import type { ClientExtensionEntry } from '@shared/extension-types'
+
+const defaultCliExtensions: ClientExtensionEntry[] = [
+  {
+    name: 'claude', version: '1.0.0', label: 'Claude CLI', description: '', category: 'cli',
+    picker: { shortcut: 'L' },
+    cli: { supportsPermissionMode: true, supportsResume: true, resumeCommandTemplate: ['claude', '--resume', '{{sessionId}}'] },
+  },
+  {
+    name: 'codex', version: '1.0.0', label: 'Codex CLI', description: '', category: 'cli',
+    picker: { shortcut: 'X' },
+    cli: { supportsModel: true, supportsSandbox: true, supportsResume: true, resumeCommandTemplate: ['codex', 'resume', '{{sessionId}}'] },
+  },
+]
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import TabBar from '@/components/TabBar'
 import Pane from '@/components/panes/Pane'
@@ -54,6 +69,7 @@ function createTestStore(options?: { platform?: string | null }) {
       sessions: sessionsReducer,
       connection: connectionReducer,
       settings: settingsReducer,
+      extensions: extensionsReducer,
     },
     middleware: (getDefaultMiddleware) =>
       getDefaultMiddleware({ serializableCheck: false }),
@@ -96,6 +112,9 @@ function createTestStore(options?: { platform?: string | null }) {
         projects: [],
         expandedProjects: new Set<string>(),
       },
+      extensions: {
+        entries: defaultCliExtensions,
+      },
       connection: {
         status: 'ready',
         platform: options?.platform ?? null,
@@ -128,6 +147,7 @@ function createStoreWithSession() {
       panes: panesReducer,
       sessions: sessionsReducer,
       settings: settingsReducer,
+      extensions: extensionsReducer,
     },
     middleware: (getDefaultMiddleware) =>
       getDefaultMiddleware({ serializableCheck: false }),
@@ -187,6 +207,9 @@ function createStoreWithSession() {
         ],
         expandedProjects: new Set<string>(),
       },
+      extensions: {
+        entries: defaultCliExtensions,
+      },
     },
   })
 }
@@ -199,6 +222,7 @@ function createStoreWithBrowserPane(options?: { zoomedPaneId?: string }) {
       sessions: sessionsReducer,
       connection: connectionReducer,
       settings: settingsReducer,
+      extensions: extensionsReducer,
     },
     middleware: (getDefaultMiddleware) =>
       getDefaultMiddleware({ serializableCheck: false }),
@@ -243,9 +267,72 @@ function createStoreWithBrowserPane(options?: { zoomedPaneId?: string }) {
         projects: [],
         expandedProjects: new Set<string>(),
       },
+      extensions: {
+        entries: defaultCliExtensions,
+      },
       connection: {
         status: 'ready',
         platform: null,
+      },
+    },
+  })
+}
+
+function createStoreWithTerminalPane() {
+  return configureStore({
+    reducer: {
+      tabs: tabsReducer,
+      panes: panesReducer,
+      sessions: sessionsReducer,
+      connection: connectionReducer,
+      settings: settingsReducer,
+      extensions: extensionsReducer,
+    },
+    middleware: (getDefaultMiddleware) =>
+      getDefaultMiddleware({ serializableCheck: false }),
+    preloadedState: {
+      tabs: {
+        tabs: [
+          {
+            id: 'tab-1',
+            createRequestId: 'tab-1',
+            title: 'Shell',
+            status: 'running',
+            mode: 'shell',
+            shell: 'system',
+            createdAt: 1,
+            terminalId: 'term-1',
+          },
+        ],
+        activeTabId: 'tab-1',
+        renameRequestTabId: null,
+      },
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'shell',
+              status: 'running',
+              terminalId: 'term-1',
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+      },
+      sessions: {
+        projects: [],
+        expandedProjects: new Set<string>(),
+      },
+      extensions: {
+        entries: defaultCliExtensions,
+      },
+      connection: {
+        status: 'ready',
+        platform: 'linux',
       },
     },
   })
@@ -542,6 +629,7 @@ describe('ContextMenuProvider', () => {
         sessions: sessionsReducer,
         connection: connectionReducer,
         settings: settingsReducer,
+        extensions: extensionsReducer,
       },
       middleware: (getDefaultMiddleware) =>
         getDefaultMiddleware({ serializableCheck: false }),
@@ -559,6 +647,9 @@ describe('ContextMenuProvider', () => {
           ],
           activeTabId: 'tab-1',
           renameRequestTabId: null,
+        },
+        extensions: {
+          entries: defaultCliExtensions,
         },
         panes: {
           layouts: {
@@ -617,6 +708,7 @@ describe('ContextMenuProvider', () => {
         sessions: sessionsReducer,
         connection: connectionReducer,
         settings: settingsReducer,
+        extensions: extensionsReducer,
       },
       middleware: (getDefaultMiddleware) =>
         getDefaultMiddleware({ serializableCheck: false }),
@@ -634,6 +726,9 @@ describe('ContextMenuProvider', () => {
           ],
           activeTabId: 'tab-1',
           renameRequestTabId: null,
+        },
+        extensions: {
+          entries: defaultCliExtensions,
         },
         panes: {
           layouts: {
@@ -736,6 +831,7 @@ describe('ContextMenuProvider', () => {
         sessions: sessionsReducer,
         connection: connectionReducer,
         settings: settingsReducer,
+        extensions: extensionsReducer,
       },
       middleware: (getDefaultMiddleware) =>
         getDefaultMiddleware({ serializableCheck: false }),
@@ -799,6 +895,9 @@ describe('ContextMenuProvider', () => {
         sessions: {
           projects: [],
           expandedProjects: new Set<string>(),
+        },
+        extensions: {
+          entries: defaultCliExtensions,
         },
         connection: {
           status: 'ready',
@@ -904,63 +1003,43 @@ describe('ContextMenuProvider', () => {
     })
   })
 
-  describe('Replace pane', () => {
-    function createStoreWithTerminalPane() {
-      return configureStore({
-        reducer: {
-          tabs: tabsReducer,
-          panes: panesReducer,
-          sessions: sessionsReducer,
-          connection: connectionReducer,
-          settings: settingsReducer,
-        },
-        middleware: (getDefaultMiddleware) =>
-          getDefaultMiddleware({ serializableCheck: false }),
-        preloadedState: {
-          tabs: {
-            tabs: [
-              {
-                id: 'tab-1',
-                createRequestId: 'tab-1',
-                title: 'Shell',
-                status: 'running',
-                mode: 'shell',
-                shell: 'system',
-                createdAt: 1,
-                terminalId: 'term-1',
-              },
-            ],
-            activeTabId: 'tab-1',
-            renameRequestTabId: null,
-          },
-          panes: {
-            layouts: {
-              'tab-1': {
-                type: 'leaf',
-                id: 'pane-1',
-                content: {
-                  kind: 'terminal',
-                  mode: 'shell',
-                  status: 'running',
-                  terminalId: 'term-1',
-                },
-              },
-            },
-            activePane: { 'tab-1': 'pane-1' },
-            paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
-          },
-          sessions: {
-            projects: [],
-            expandedProjects: new Set<string>(),
-          },
-          connection: {
-            status: 'ready',
-            platform: 'linux',
-          },
-        },
-      })
-    }
+  it('renders copy, Paste, and Select all as the first terminal menu section with icons', async () => {
+    const user = userEvent.setup()
+    const store = createStoreWithTerminalPane()
 
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div data-context={ContextIds.Terminal} data-tab-id="tab-1" data-pane-id="pane-1">
+            Terminal Content
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Terminal Content'), keys: '[MouseRight]' })
+
+    const menu = screen.getByRole('menu')
+    const children = Array.from(menu.children)
+    expect(
+      children.slice(0, 4).map((node) =>
+        node.getAttribute('role') === 'menuitem'
+          ? node.textContent?.replace(/\s+/g, ' ').trim()
+          : node.getAttribute('role'),
+      ),
+    ).toEqual(['copy', 'Paste', 'Select all', 'separator'])
+
+    for (const node of children.slice(0, 3)) {
+      expect(node.querySelector('svg')).not.toBeNull()
+    }
+  })
+
+  describe('Replace pane', () => {
     it('detaches terminal and replaces pane with picker via context menu', async () => {
       const user = userEvent.setup()
       wsMocks.send.mockClear()

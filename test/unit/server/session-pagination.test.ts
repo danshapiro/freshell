@@ -241,6 +241,75 @@ describe('paginateProjects', () => {
     expect(result.totalSessions).toBe(150)
   })
 
+  it('force-includes older first-page sessions without duplicating in-window sessions and preserves the primary cursor', () => {
+    const projects: ProjectGroup[] = [
+      makeProject('/a', [
+        makeSession('claude', 's1', 100, '/a'),
+        makeSession('claude', 's2', 200, '/a'),
+        makeSession('claude', 's3', 300, '/a'),
+        makeSession('claude', 's4', 400, '/a'),
+        makeSession('claude', 's5', 500, '/a'),
+      ]),
+    ]
+
+    const result = paginateProjects(projects, {
+      limit: 3,
+      forceIncludeSessionKeys: new Set(['claude:s4', 'claude:s1']),
+    })
+
+    const sessionIds = result.projects.flatMap((project) => project.sessions).map((session) => session.sessionId)
+    expect(sessionIds).toEqual(['s5', 's4', 's3', 's1'])
+    expect(result.oldestIncludedTimestamp).toBe(300)
+    expect(result.oldestIncludedSessionId).toBe('claude:s3')
+    expect(result.hasMore).toBe(true)
+  })
+
+  it('ignores force inclusion on later pages', () => {
+    const projects: ProjectGroup[] = [
+      makeProject('/a', [
+        makeSession('claude', 's1', 100, '/a'),
+        makeSession('claude', 's2', 200, '/a'),
+        makeSession('claude', 's3', 300, '/a'),
+        makeSession('claude', 's4', 400, '/a'),
+        makeSession('claude', 's5', 500, '/a'),
+      ]),
+    ]
+
+    const page1 = paginateProjects(projects, {
+      limit: 3,
+      forceIncludeSessionKeys: new Set(['claude:s1']),
+    })
+
+    const page2 = paginateProjects(projects, {
+      limit: 3,
+      before: page1.oldestIncludedTimestamp,
+      beforeId: page1.oldestIncludedSessionId,
+      forceIncludeSessionKeys: new Set(['claude:s5']),
+    })
+
+    const sessionIds = page2.projects.flatMap((project) => project.sessions).map((session) => session.sessionId)
+    expect(sessionIds).toEqual(['s2', 's1'])
+  })
+
+  it('reports no more pages when force-included extras already cover every remaining unique session', () => {
+    const projects: ProjectGroup[] = [
+      makeProject('/a', [
+        makeSession('claude', 's1', 100, '/a'),
+        makeSession('claude', 's2', 200, '/a'),
+        makeSession('claude', 's3', 300, '/a'),
+      ]),
+    ]
+
+    const result = paginateProjects(projects, {
+      limit: 2,
+      forceIncludeSessionKeys: new Set(['claude:s1']),
+    })
+
+    const sessionIds = result.projects.flatMap((project) => project.sessions).map((session) => session.sessionId)
+    expect(sessionIds).toEqual(['s3', 's2', 's1'])
+    expect(result.hasMore).toBe(false)
+  })
+
   it('sets correct totalSessions counting all sessions including filtered', () => {
     const projects: ProjectGroup[] = [
       makeProject('/a', [

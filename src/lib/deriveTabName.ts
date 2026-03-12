@@ -1,5 +1,6 @@
 import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent } from '../store/paneTypes'
-import { getProviderLabel, isCodingCliMode } from './coding-cli-utils'
+import type { ClientExtensionEntry } from '@shared/extension-types'
+import { getProviderLabel, isNonShellMode } from './coding-cli-utils'
 
 /**
  * Collect all leaf pane contents in tree order (left-to-right, top-to-bottom).
@@ -10,10 +11,10 @@ function collectContents(node: PaneNode): PaneContent[] {
 }
 
 /**
- * Check if a terminal is a CLI (claude or codex mode).
+ * Check if a terminal is a CLI (non-shell mode).
  */
 function isCli(content: PaneContent): content is TerminalPaneContent {
-  return content.kind === 'terminal' && isCodingCliMode(content.mode)
+  return content.kind === 'terminal' && isNonShellMode(content.mode)
 }
 
 /**
@@ -78,13 +79,13 @@ function extractLastDirSegment(path: string): string | null {
  * 2. First browser
  * 3. First shell terminal (using last directory segment of initialCwd)
  */
-export function deriveTabName(layout: PaneNode): string {
+export function deriveTabName(layout: PaneNode, extensions?: ClientExtensionEntry[]): string {
   const contents = collectContents(layout)
 
   // Priority 1: First CLI instance
   const cli = contents.find(isCli)
   if (cli) {
-    return getProviderLabel(cli.mode)
+    return getProviderLabel(cli.mode, extensions)
   }
 
   // Priority 2: First browser

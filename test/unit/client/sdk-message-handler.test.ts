@@ -84,6 +84,26 @@ describe('sdk-message-handler', () => {
     expect(calls[0].type).toBe('agentChat/sessionInit')
   })
 
+  it('dispatches sessionSnapshotReceived on sdk.session.snapshot', () => {
+    const { dispatch, calls } = createMockDispatch()
+
+    const handled = handleSdkMessage(dispatch, {
+      type: 'sdk.session.snapshot',
+      sessionId: 's1',
+      latestTurnId: 'turn-9',
+      status: 'idle',
+    })
+
+    expect(handled).toBe(true)
+    expect(dispatch).toHaveBeenCalledOnce()
+    expect(calls[0].type).toBe('agentChat/sessionSnapshotReceived')
+    expect(calls[0].payload).toEqual({
+      sessionId: 's1',
+      latestTurnId: 'turn-9',
+      status: 'idle',
+    })
+  })
+
   it('dispatches turnResult on sdk.result', () => {
     const { dispatch, calls } = createMockDispatch()
 

@@ -1,5 +1,5 @@
 import { X } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn, isMacLike } from '@/lib/utils'
 import type { TerminalStatus } from '@/store/types'
 import type { PaneContent } from '@/store/paneTypes'
 import PaneHeader from './PaneHeader'
@@ -14,6 +14,7 @@ interface PaneProps {
   metaLabel?: string
   metaTooltip?: string
   needsAttention?: boolean
+  activityPulse?: boolean
   status?: TerminalStatus
   content?: PaneContent
   onClose: () => void
@@ -23,6 +24,7 @@ interface PaneProps {
   children: React.ReactNode
   isRenaming?: boolean
   renameValue?: string
+  renameError?: string
   onRenameChange?: (value: string) => void
   onRenameBlur?: () => void
   onRenameKeyDown?: (e: React.KeyboardEvent) => void
@@ -39,6 +41,7 @@ export default function Pane({
   metaLabel,
   metaTooltip,
   needsAttention,
+  activityPulse,
   status,
   content,
   onClose,
@@ -48,6 +51,7 @@ export default function Pane({
   children,
   isRenaming,
   renameValue,
+  renameError,
   onRenameChange,
   onRenameBlur,
   onRenameKeyDown,
@@ -55,6 +59,12 @@ export default function Pane({
   onSearch,
 }: PaneProps) {
   const showHeader = title !== undefined
+  const handleMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
+    const isSecondaryClick = event.button === 2
+    const isMacContextClick = isMacLike() && event.button === 0 && event.ctrlKey
+    if (isSecondaryClick || isMacContextClick) return
+    onFocus()
+  }
 
   /* eslint-disable jsx-a11y/no-noninteractive-element-interactions, jsx-a11y/no-noninteractive-tabindex -- Pane is a composite widget; tabIndex enables keyboard navigation between panes, not click interaction */
   return (
@@ -70,7 +80,7 @@ export default function Pane({
       role="group"
       aria-label={`Pane: ${title || 'untitled'}`}
       tabIndex={0}
-      onMouseDown={onFocus}
+      onMouseDown={handleMouseDown}
       onKeyDown={(e) => {
         if (e.target !== e.currentTarget) return
         if (e.key === 'Enter' || e.key === ' ') {
@@ -87,6 +97,7 @@ export default function Pane({
             metaLabel={metaLabel}
             metaTooltip={metaTooltip}
             needsAttention={needsAttention}
+            activityPulse={activityPulse}
             status={status || 'creating'}
             isActive={isActive}
             onClose={onClose}
@@ -95,12 +106,19 @@ export default function Pane({
             content={content!}
             isRenaming={isRenaming}
             renameValue={renameValue}
+            renameError={renameError}
             onRenameChange={onRenameChange}
             onRenameBlur={onRenameBlur}
             onRenameKeyDown={onRenameKeyDown}
             onDoubleClick={onDoubleClickTitle}
             onSearch={onSearch}
           />
+        </div>
+      )}
+
+      {renameError && (
+        <div className="border-b border-border bg-destructive/10 px-2 py-1 text-xs text-destructive" role="alert">
+          {renameError}
         </div>
       )}
 

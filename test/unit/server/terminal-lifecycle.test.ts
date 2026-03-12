@@ -166,6 +166,65 @@ describe('TerminalRegistry Lifecycle', () => {
       )
     })
 
+    it('emits terminal.input.raw for each terminal input chunk', () => {
+      const term = registry.create({ mode: 'shell' })
+      const onInput = vi.fn()
+
+      registry.on('terminal.input.raw', onInput)
+      registry.input(term.terminalId, '\r')
+
+      expect(onInput).toHaveBeenCalledWith(
+        expect.objectContaining({
+          terminalId: term.terminalId,
+          data: '\r',
+          at: expect.any(Number),
+        }),
+      )
+    })
+
+    it('emits terminal.session.bound before terminal.created for resumed terminals', () => {
+      const order: string[] = []
+      const onBound = vi.fn(() => order.push('terminal.session.bound'))
+      const onCreated = vi.fn(() => order.push('terminal.created'))
+
+      registry.on('terminal.session.bound', onBound)
+      registry.on('terminal.created', onCreated)
+
+      const term = registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+        resumeSessionId: 'codex-session-123',
+      })
+
+      expect(order).toEqual(['terminal.session.bound', 'terminal.created'])
+      expect(onBound).toHaveBeenCalledWith({
+        terminalId: term.terminalId,
+        provider: 'codex',
+        sessionId: 'codex-session-123',
+        reason: 'resume',
+      })
+    })
+
+    it('emits terminal.session.unbound with exit reason when a bound PTY exits', () => {
+      const term = registry.create({
+        mode: 'codex',
+        cwd: '/home/user/project',
+        resumeSessionId: 'codex-session-123',
+      })
+      const pty = mockPtyProcess.instances[0]
+      const onUnbound = vi.fn()
+
+      registry.on('terminal.session.unbound', onUnbound)
+      pty._emitExit(0)
+
+      expect(onUnbound).toHaveBeenCalledWith({
+        terminalId: term.terminalId,
+        provider: 'codex',
+        sessionId: 'codex-session-123',
+        reason: 'exit',
+      })
+    })
+
     it('exposes attached client count and connection ids for broker metadata', () => {
       const term = registry.create({ mode: 'shell' })
       const clientA = createMockWebSocket()

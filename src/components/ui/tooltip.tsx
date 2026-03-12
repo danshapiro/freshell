@@ -91,6 +91,7 @@ export function TooltipContent({
   return createPortal(
     <div
       ref={contentRef}
+      role="tooltip"
       className={cn(
         `fixed rounded-md border px-2 py-1 text-xs shadow-lg animate-in fade-in-0 zoom-in-95 ${OVERLAY_Z.tooltip}`,
         'bg-zinc-100 text-zinc-900 border-zinc-300',

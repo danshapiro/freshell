@@ -8,10 +8,18 @@ import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
+import tabRegistryReducer from '@/store/tabRegistrySlice'
+import terminalMetaReducer from '@/store/terminalMetaSlice'
+import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer, setNetworkStatus, type NetworkStatusResponse } from '@/store/networkSlice'
 
 // Ensure DOM is clean even if another test file forgot cleanup.
 beforeEach(() => {
+  cleanup()
+})
+
+afterEach(() => {
+  vi.useRealTimers()
   cleanup()
 })
 
@@ -20,6 +28,10 @@ const mockSend = vi.fn()
 const mockOnMessage = vi.fn(() => () => {})
 const mockOnReconnect = vi.fn(() => () => {})
 const mockConnect = vi.fn().mockResolvedValue(undefined)
+const wsState = {
+  isReady: false,
+  serverInstanceId: undefined as string | undefined,
+}
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -28,17 +40,29 @@ vi.mock('@/lib/ws-client', () => ({
     onReconnect: mockOnReconnect,
     connect: mockConnect,
     setHelloExtensionProvider: vi.fn(),
+    get isReady() {
+      return wsState.isReady
+    },
+    get serverInstanceId() {
+      return wsState.serverInstanceId
+    },
+    get state() {
+      return wsState.isReady ? 'ready' : 'connected'
+    },
   }),
 }))
 
 // Mock the api module
 const mockApiGet = vi.fn().mockResolvedValue({})
+const fetchSidebarSessionsSnapshot = vi.fn()
 vi.mock('@/lib/api', () => ({
   api: {
     get: (url: string) => mockApiGet(url),
     patch: vi.fn().mockResolvedValue({}),
     post: vi.fn().mockResolvedValue({}),
   },
+  fetchSidebarSessionsSnapshot: (options?: unknown) => fetchSidebarSessionsSnapshot(options),
+  isApiUnauthorizedError: (err: any) => !!err && typeof err === 'object' && err.status === 401,
 }))
 
 const mockGenerateQr = vi.fn().mockReturnValue({ size: 21 })
@@ -131,7 +155,10 @@ function createTestStore() {
       connection: connectionReducer,
       sessions: sessionsReducer,
       panes: panesReducer,
+      tabRegistry: tabRegistryReducer,
+      terminalMeta: terminalMetaReducer,
       network: networkReducer,
+      extensions: extensionsReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -159,17 +186,38 @@ function createTestStore() {
       connection: {
         status: 'ready' as const,
         lastError: undefined,
+        platform: null,
+        availableClis: {},
+        serverInstanceId: undefined,
       },
       panes: {
         layouts: {},
         activePane: {},
+        paneTitles: {},
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
       },
+      tabRegistry: {
+        deviceId: 'device-test',
+        deviceLabel: 'device-test',
+        deviceAliases: {},
+        localOpen: [],
+        remoteOpen: [],
+        closed: [],
+        localClosed: {},
+        searchRangeDays: 30,
+        loading: false,
+      },
+      terminalMeta: { byTerminalId: {} },
       network: {
         status: null,
         loading: false,
         configuring: false,
         error: null,
       },
+      extensions: { entries: [] },
     },
   })
 }
@@ -221,6 +269,10 @@ describe('App Component - Share Button', () => {
     vi.clearAllMocks()
     localStorage.clear()
     localStorage.setItem('freshell.auth-token', 'test-token-abc123')
+    fetchSidebarSessionsSnapshot.mockReset()
+    fetchSidebarSessionsSnapshot.mockResolvedValue([])
+    wsState.isReady = false
+    wsState.serverInstanceId = undefined
     mockApiGet.mockImplementation((url: string) => {
       if (url === '/api/settings') return Promise.resolve(defaultSettings)
       if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
@@ -239,7 +291,10 @@ describe('App Component - Share Button', () => {
 
   async function openShareFromSettings() {
     fireEvent.click(screen.getByTitle('Go settings'))
-    const openShareButton = await screen.findByRole('button', { name: 'Open share panel' })
+    await waitFor(() => {
+      expect(screen.queryByText('Loading settings…')).not.toBeInTheDocument()
+    }, { timeout: 5000 })
+    const openShareButton = await screen.findByRole('button', { name: 'Open share panel' }, { timeout: 5000 })
     fireEvent.click(openShareButton)
   }
 
@@ -408,6 +463,45 @@ describe('App Component - Share Button', () => {
     await waitFor(() => {
       expect(mockWriteText).toHaveBeenCalledWith('http://192.168.1.100:3001/?token=test-token-abc123')
     })
+
+    expect(screen.getByText('Copied!')).toBeInTheDocument()
+  })
+
+  it('clears the pending share copy reset timer on unmount', async () => {
+    const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout')
+    const mockWriteText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText: mockWriteText },
+      writable: true,
+      configurable: true,
+    })
+
+    const store = createTestStore()
+    act(() => {
+      store.dispatch(setNetworkStatus(makeNetworkStatus({
+        configured: true,
+        host: '0.0.0.0',
+        accessUrl: 'http://192.168.1.100:3001',
+      })))
+    })
+
+    const view = renderApp(store)
+    await openShareFromSettings()
+
+    await waitFor(() => {
+      expect(screen.getByText('Copy link')).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByText('Copy link'))
+
+    await waitFor(() => {
+      expect(screen.getByText('Copied!')).toBeInTheDocument()
+    })
+
+    view.unmount()
+
+    expect(clearTimeoutSpy).toHaveBeenCalled()
+    clearTimeoutSpy.mockRestore()
   })
 
   it('share panel can be closed by clicking X button', async () => {
@@ -451,6 +545,10 @@ describe('App Component - Share Button', () => {
 describe('App Component - Version Status', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    fetchSidebarSessionsSnapshot.mockReset()
+    fetchSidebarSessionsSnapshot.mockResolvedValue([])
+    wsState.isReady = false
+    wsState.serverInstanceId = undefined
     mockApiGet.mockImplementation((url: string) => {
       if (url === '/api/settings') return Promise.resolve(defaultSettings)
       if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
@@ -513,8 +611,12 @@ describe('App Component - WS Notifications', () => {
       return () => { messageHandler = null }
     })
     mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') return Promise.resolve(defaultSettings)
-      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: defaultSettings,
+          platform: { platform: 'linux' },
+        })
+      }
       if (url === '/api/version') return Promise.resolve(makeVersionInfo())
       if (typeof url === 'string' && url.startsWith('/api/sessions')) return Promise.resolve([])
       return Promise.resolve({})
@@ -598,6 +700,10 @@ describe('App Bootstrap', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     localStorage.clear()
+    fetchSidebarSessionsSnapshot.mockReset()
+    fetchSidebarSessionsSnapshot.mockResolvedValue([])
+    wsState.isReady = false
+    wsState.serverInstanceId = undefined
     const sessionStorageMock: Record<string, string> = {
       'auth-token': 'test-token-abc123',
     }
@@ -631,7 +737,7 @@ describe('App Bootstrap', () => {
     })
   })
 
-  it('does not refetch settings or sessions after websocket connect', async () => {
+  it('does not refetch bootstrap data or duplicate the eager sidebar hydration after websocket connect', async () => {
     let resolveConnect: () => void
     const connectPromise = new Promise<void>((resolve) => {
       resolveConnect = resolve
@@ -645,20 +751,28 @@ describe('App Bootstrap', () => {
     })
 
     await waitFor(() => {
-      const sessionsCalls = mockApiGet.mock.calls.filter(([url]) => typeof url === 'string' && url.startsWith('/api/sessions'))
+      const sessionsCalls = fetchSidebarSessionsSnapshot.mock.calls
+      const bootstrapCalls = mockApiGet.mock.calls.filter(([url]) => url === '/api/bootstrap')
       const settingsCalls = mockApiGet.mock.calls.filter(([url]) => url === '/api/settings')
+      const platformCalls = mockApiGet.mock.calls.filter(([url]) => url === '/api/platform')
       expect(sessionsCalls.length).toBe(1)
-      expect(settingsCalls.length).toBe(1)
+      expect(bootstrapCalls.length).toBe(1)
+      expect(settingsCalls.length).toBe(0)
+      expect(platformCalls.length).toBe(0)
     })
 
     resolveConnect!()
     await Promise.resolve()
     await Promise.resolve()
 
-    const sessionsCalls = mockApiGet.mock.calls.filter(([url]) => typeof url === 'string' && url.startsWith('/api/sessions'))
+    const sessionsCalls = fetchSidebarSessionsSnapshot.mock.calls
+    const bootstrapCalls = mockApiGet.mock.calls.filter(([url]) => url === '/api/bootstrap')
     const settingsCalls = mockApiGet.mock.calls.filter(([url]) => url === '/api/settings')
+    const platformCalls = mockApiGet.mock.calls.filter(([url]) => url === '/api/platform')
     expect(sessionsCalls.length).toBe(1)
-    expect(settingsCalls.length).toBe(1)
+    expect(bootstrapCalls.length).toBe(1)
+    expect(settingsCalls.length).toBe(0)
+    expect(platformCalls.length).toBe(0)
   })
 })
 
@@ -678,8 +792,7 @@ describe('App WS message handling', () => {
     cleanup()
   })
 
-  it('buffers chunked sessions.updated and applies atomically after flush delay', async () => {
-    vi.useFakeTimers()
+  it('ignores legacy session bulk websocket messages because sidebar state is HTTP-owned', async () => {
     let handler: ((msg: any) => void) | null = null
     mockOnMessage.mockImplementation((cb: (msg: any) => void) => {
       handler = cb
@@ -691,264 +804,27 @@ describe('App WS message handling', () => {
 
     await vi.waitFor(() => expect(handler).not.toBeNull())
 
-    // Seed initial data so we can verify it's preserved during buffering
     act(() => {
       handler!({
         type: 'sessions.updated',
-        projects: [{ projectPath: '/existing', sessions: [{ provider: 'claude', sessionId: 's0', updatedAt: 0 }] }],
-      })
-    })
-    expect(store.getState().sessions.projects.map((p: any) => p.projectPath)).toEqual(['/existing'])
-
-    // Send chunked clear — should NOT clear Redux state immediately
-    act(() => {
-      handler!({
-        type: 'sessions.updated',
-        clear: true,
         projects: [{ projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', updatedAt: 1 }] }],
       })
-    })
-    // Old data should still be in Redux (buffer holds new data)
-    expect(store.getState().sessions.projects.map((p: any) => p.projectPath)).toEqual(['/existing'])
-
-    // Send append chunk
-    act(() => {
-      handler!({
-        type: 'sessions.updated',
-        append: true,
-        projects: [{ projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', updatedAt: 2 }] }],
-      })
-    })
-    // Still old data in Redux
-    expect(store.getState().sessions.projects.map((p: any) => p.projectPath)).toEqual(['/existing'])
-
-    // Advance past the flush delay (300ms)
-    act(() => { vi.advanceTimersByTime(300) })
-
-    // Now both chunks should be applied atomically
-    expect(store.getState().sessions.projects.map((p: any) => p.projectPath).sort()).toEqual(['/p1', '/p2'])
-
-    vi.useRealTimers()
-  })
-
-  it('flushes chunked buffer when a sessions.patch arrives mid-chunking', async () => {
-    vi.useFakeTimers()
-    let handler: ((msg: any) => void) | null = null
-    mockOnMessage.mockImplementation((cb: (msg: any) => void) => {
-      handler = cb
-      return () => { handler = null }
-    })
-
-    const store = createTestStore()
-    renderApp(store)
-
-    await vi.waitFor(() => expect(handler).not.toBeNull())
-
-    // Start a chunked update
-    act(() => {
-      handler!({
-        type: 'sessions.updated',
-        clear: true,
-        projects: [{ projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', updatedAt: 1 }] }],
-      })
-      handler!({
-        type: 'sessions.updated',
-        append: true,
-        projects: [{ projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', updatedAt: 2 }] }],
-      })
-    })
-
-    // Buffer hasn't flushed yet
-    expect(store.getState().sessions.projects).toEqual([])
-
-    // Patch arrives — should flush buffer first, then apply patch
-    act(() => {
       handler!({
         type: 'sessions.patch',
-        upsertProjects: [{ projectPath: '/p3', sessions: [{ provider: 'claude', sessionId: 's3', updatedAt: 3 }] }],
-        removeProjectPaths: ['/p1'],
+        upsertProjects: [{ projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', updatedAt: 2 }] }],
+        removeProjectPaths: [],
       })
-    })
-
-    // Buffer should have flushed (/p1, /p2), then patch applied (remove /p1, add /p3)
-    expect(store.getState().sessions.projects.map((p: any) => p.projectPath).sort()).toEqual(['/p2', '/p3'])
-
-    vi.useRealTimers()
-  })
-
-  it('preserves existing data when late chunk arrives after flush timer', async () => {
-    vi.useFakeTimers()
-    let handler: ((msg: any) => void) | null = null
-    mockOnMessage.mockImplementation((cb: (msg: any) => void) => {
-      handler = cb
-      return () => { handler = null }
-    })
-
-    const store = createTestStore()
-    renderApp(store)
-
-    await vi.waitFor(() => expect(handler).not.toBeNull())
-
-    // Seed initial data
-    act(() => {
       handler!({
-        type: 'sessions.updated',
-        projects: [
-          { projectPath: '/existing1', sessions: [{ provider: 'claude', sessionId: 's0', updatedAt: 0 }] },
-          { projectPath: '/existing2', sessions: [{ provider: 'claude', sessionId: 's1', updatedAt: 1 }] },
-        ],
-      })
-    })
-    expect(store.getState().sessions.projects).toHaveLength(2)
-
-    // Start chunked update — only first chunk arrives
-    act(() => {
-      handler!({
-        type: 'sessions.updated',
-        clear: true,
-        projects: [{ projectPath: '/new1', sessions: [{ provider: 'claude', sessionId: 's2', updatedAt: 2 }] }],
-      })
-    })
-    // Old data still visible
-    expect(store.getState().sessions.projects.map((p: any) => p.projectPath).sort()).toEqual(['/existing1', '/existing2'])
-
-    // Flush timer fires before second chunk (simulates backpressure gap)
-    act(() => { vi.advanceTimersByTime(300) })
-
-    // Flushed atomically — buffer had full stream (only 1 chunk + 300ms silence = complete)
-    expect(store.getState().sessions.projects.map((p: any) => p.projectPath)).toEqual(['/new1'])
-
-    // Late append chunk arrives — merges gracefully
-    act(() => {
-      handler!({
-        type: 'sessions.updated',
-        append: true,
-        projects: [{ projectPath: '/new2', sessions: [{ provider: 'claude', sessionId: 's3', updatedAt: 3 }] }],
+        type: 'sessions.page',
+        projects: [{ projectPath: '/p3', sessions: [{ provider: 'claude', sessionId: 's3', updatedAt: 3 }] }],
+        totalSessions: 1,
+        oldestIncludedTimestamp: 3,
+        oldestIncludedSessionId: 'claude:s3',
+        hasMore: false,
       })
     })
 
-    // Both chunks now in Redux
-    expect(store.getState().sessions.projects.map((p: any) => p.projectPath).sort()).toEqual(['/new1', '/new2'])
-
-    vi.useRealTimers()
-  })
-
-  it('merges a late append chunk into the same split project after the flush timer', async () => {
-    vi.useFakeTimers()
-    let handler: ((msg: any) => void) | null = null
-    mockOnMessage.mockImplementation((cb: (msg: any) => void) => {
-      handler = cb
-      return () => { handler = null }
-    })
-
-    const store = createTestStore()
-    renderApp(store)
-
-    await vi.waitFor(() => expect(handler).not.toBeNull())
-
-    act(() => {
-      handler!({
-        type: 'sessions.updated',
-        clear: true,
-        projects: [{
-          projectPath: '/split/project',
-          sessions: [
-            { provider: 'claude', sessionId: 's1', updatedAt: 1 },
-            { provider: 'claude', sessionId: 's2', updatedAt: 2 },
-          ],
-        }],
-      })
-    })
-
-    act(() => { vi.advanceTimersByTime(300) })
-
-    expect(store.getState().sessions.projects[0].sessions.map((s: any) => s.sessionId)).toEqual(['s1', 's2'])
-
-    act(() => {
-      handler!({
-        type: 'sessions.updated',
-        append: true,
-        projects: [{
-          projectPath: '/split/project',
-          sessions: [
-            { provider: 'claude', sessionId: 's3', updatedAt: 3 },
-          ],
-        }],
-      })
-    })
-
-    expect(store.getState().sessions.projects).toHaveLength(1)
-    expect(store.getState().sessions.projects[0].sessions.map((s: any) => s.sessionId)).toEqual(['s3', 's1', 's2'])
-
-    vi.useRealTimers()
-  })
-
-  it('ignores sessions.patch messages until a WS sessions.updated snapshot is received', async () => {
-    let handler: ((msg: any) => void) | null = null
-    mockOnMessage.mockImplementation((cb: (msg: any) => void) => {
-      handler = cb
-      return () => { handler = null }
-    })
-
-    const store = createTestStore()
-    renderApp(store)
-    await waitFor(() => expect(handler).not.toBeNull())
-
-    handler!({
-      type: 'sessions.patch',
-      upsertProjects: [{ projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', updatedAt: 1 }] }],
-      removeProjectPaths: [],
-    })
-
-    await waitFor(() => {
-      expect(store.getState().sessions.projects).toEqual([])
-    })
-
-    handler!({
-      type: 'sessions.updated',
-      projects: [{ projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', updatedAt: 2 }] }],
-    })
-
-    handler!({
-      type: 'sessions.patch',
-      upsertProjects: [{ projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', updatedAt: 3 }] }],
-      removeProjectPaths: [],
-    })
-
-    await waitFor(() => {
-      expect(store.getState().sessions.projects.map((p: any) => p.projectPath).sort()).toEqual(['/p1', '/p2'])
-    })
-  })
-
-  it('applies sessions.patch messages (upsert + remove) without clearing all sessions', async () => {
-    let handler: ((msg: any) => void) | null = null
-    mockOnMessage.mockImplementation((cb: (msg: any) => void) => {
-      handler = cb
-      return () => { handler = null }
-    })
-
-    const store = createTestStore()
-    renderApp(store)
-    await waitFor(() => expect(handler).not.toBeNull())
-
-    // Seed state via a full snapshot (existing behavior).
-    handler!({
-      type: 'sessions.updated',
-      projects: [
-        { projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', updatedAt: 1 }] },
-        { projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', updatedAt: 2 }] },
-      ],
-    })
-
-    handler!({
-      type: 'sessions.patch',
-      upsertProjects: [{ projectPath: '/p3', sessions: [{ provider: 'claude', sessionId: 's3', updatedAt: 3 }] }],
-      removeProjectPaths: ['/p1'],
-    })
-
-    await waitFor(() => {
-      expect(store.getState().sessions.projects.map((p: any) => p.projectPath).sort()).toEqual(['/p2', '/p3'])
-    })
+    expect(store.getState().sessions.projects).toEqual([])
   })
 })
 
@@ -972,7 +848,10 @@ describe('Tab Switching Keyboard Shortcuts', () => {
         connection: connectionReducer,
         sessions: sessionsReducer,
         panes: panesReducer,
+        tabRegistry: tabRegistryReducer,
+        terminalMeta: terminalMetaReducer,
         network: networkReducer,
+        extensions: extensionsReducer,
       },
       middleware: (getDefault) =>
         getDefault({
@@ -1000,17 +879,38 @@ describe('Tab Switching Keyboard Shortcuts', () => {
         connection: {
           status: 'ready' as const,
           lastError: undefined,
+          platform: null,
+          availableClis: {},
+          serverInstanceId: undefined,
         },
         panes: {
           layouts: {},
           activePane: {},
+          paneTitles: {},
+          paneTitleSetByUser: {},
+          renameRequestTabId: null,
+          renameRequestPaneId: null,
+          zoomedPane: {},
         },
+        tabRegistry: {
+          deviceId: 'device-test',
+          deviceLabel: 'device-test',
+          deviceAliases: {},
+          localOpen: [],
+          remoteOpen: [],
+          closed: [],
+          localClosed: {},
+          searchRangeDays: 30,
+          loading: false,
+        },
+        terminalMeta: { byTerminalId: {} },
         network: {
           status: null,
           loading: false,
           configuring: false,
           error: null,
         },
+        extensions: { entries: [] },
       },
     })
   }
@@ -1018,6 +918,10 @@ describe('Tab Switching Keyboard Shortcuts', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     localStorage.clear()
+    fetchSidebarSessionsSnapshot.mockReset()
+    fetchSidebarSessionsSnapshot.mockResolvedValue([])
+    wsState.isReady = false
+    wsState.serverInstanceId = undefined
     const sessionStorageMock: Record<string, string> = {
       'auth-token': 'test-token',
     }
@@ -1079,5 +983,26 @@ describe('Tab Switching Keyboard Shortcuts', () => {
 
     fireEvent.keyDown(window, { code: 'BracketLeft', ctrlKey: true, shiftKey: true })
     expect(store.getState().tabs.activeTabId).toBe('tab-1')
+  })
+
+  it('switches tabs from a focused textarea', () => {
+    const store = createStoreWithTabs(3, 1) // active tab-2
+    renderApp(store)
+
+    const textarea = document.createElement('textarea')
+    document.body.appendChild(textarea)
+    try {
+      textarea.focus()
+
+      expect(document.activeElement).toBe(textarea)
+
+      fireEvent.keyDown(textarea, { code: 'BracketRight', ctrlKey: true, shiftKey: true })
+      expect(store.getState().tabs.activeTabId).toBe('tab-3')
+
+      fireEvent.keyDown(textarea, { code: 'BracketLeft', ctrlKey: true, shiftKey: true })
+      expect(store.getState().tabs.activeTabId).toBe('tab-2')
+    } finally {
+      textarea.remove()
+    }
   })
 })

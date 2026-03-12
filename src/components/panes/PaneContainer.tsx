@@ -19,26 +19,38 @@ import { getTerminalActions } from '@/lib/pane-action-registry'
 import { cn } from '@/lib/utils'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'
+import { resolveExactCodexActivity } from '@/lib/codex-activity-resolver'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
-import { shouldSyncRenameToServer } from '@/lib/rename-utils'
 import { getTabDirectoryPreference } from '@/lib/tab-directory-preference'
-import { formatPaneRuntimeLabel, formatPaneRuntimeTooltip } from '@/lib/format-terminal-title-meta'
+import {
+  formatPaneRuntimeLabel,
+  formatPaneRuntimeTooltip,
+  type PaneRuntimeMeta,
+} from '@/lib/format-terminal-title-meta'
 import { snap1D, collectCollinearSnapTargets, convertThresholdToLocal } from '@/lib/pane-snap'
 import { nanoid } from 'nanoid'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
+import type { ChatSessionState } from '@/store/agentChatTypes'
+import type { AgentChatPaneContent } from '@/store/paneTypes'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 import { clearPaneAttention, clearTabAttention } from '@/store/turnCompletionSlice'
 import { clearPendingCreate, removeSession } from '@/store/agentChatSlice'
 import { cancelCreate } from '@/lib/sdk-message-handler'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
+import type { ProjectGroup, CodingCliSession } from '@/store/types'
+import type { ClientExtensionEntry } from '@shared/extension-types'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 
 // Stable empty object to avoid selector memoization issues
 const EMPTY_PANE_TITLES: Record<string, string> = {}
 const EMPTY_TERMINAL_META_BY_ID: Record<string, TerminalMetaRecord> = {}
+const EMPTY_PROJECTS: ProjectGroup[] = []
+const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
+const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_ATTENTION_BY_PANE: Record<string, boolean> = {}
 const EMPTY_PENDING_CREATES: Record<string, string> = {}
+const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 
 interface PaneContainerProps {
   tabId: string
@@ -104,14 +116,58 @@ function resolvePaneRuntimeMeta(
   return undefined
 }
 
+function findIndexedSessionById(
+  projects: ProjectGroup[],
+  provider: CodingCliProviderName,
+  sessionId: string,
+): CodingCliSession | undefined {
+  for (const project of projects) {
+    const match = project.sessions.find((session) => (
+      session.provider === provider && session.sessionId === sessionId
+    ))
+    if (match) return match
+  }
+  return undefined
+}
+
+function resolveFreshClaudeRuntimeMeta(
+  indexedProjects: ProjectGroup[],
+  content: AgentChatPaneContent,
+  session: ChatSessionState | undefined,
+): PaneRuntimeMeta | undefined {
+  if (content.provider !== 'freshclaude') return undefined
+
+  const provider = getAgentChatProviderConfig(content.provider)?.codingCliProvider
+  const indexedSessionId = session?.cliSessionId ?? content.resumeSessionId
+  if (!provider || !indexedSessionId) return undefined
+
+  const indexed = findIndexedSessionById(indexedProjects, provider, indexedSessionId)
+  if (!indexed) return undefined
+
+  return {
+    cwd: indexed.cwd,
+    checkoutRoot: indexed.projectPath,
+    repoRoot: indexed.projectPath,
+    branch: indexed.gitBranch,
+    isDirty: indexed.isDirty,
+    tokenUsage: indexed.tokenUsage,
+  }
+}
+
 export default function PaneContainer({ tabId, node, hidden }: PaneContainerProps) {
   const dispatch = useAppDispatch()
   const activePane = useAppSelector((s) => s.panes.activePane[tabId])
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const tabTerminalId = tab?.terminalId
   const paneTitles = useAppSelector((s) => s.panes.paneTitles[tabId] ?? EMPTY_PANE_TITLES)
+  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const terminalMetaById = useAppSelector(
     (s) => s.terminalMeta?.byTerminalId ?? EMPTY_TERMINAL_META_BY_ID
+  )
+  const indexedProjects = useAppSelector((s) => s.sessions?.projects ?? EMPTY_PROJECTS)
+  const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
+  const codexActivityByTerminalId = useAppSelector(
+    (s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID
   )
   const zoomedPaneId = useAppSelector((s) => s.panes.zoomedPane?.[tabId])
   const attentionByPane = useAppSelector(
@@ -141,6 +197,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   // Inline rename state (local to this PaneContainer instance)
   const [renamingPaneId, setRenamingPaneId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
+  const [renameError, setRenameError] = useState<string | null>(null)
 
   // Listen for rename requests from Redux (context menu trigger)
   const renameRequestTabId = useAppSelector((s) => s.panes.renameRequestTabId)
@@ -152,43 +209,55 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     // Only handle the request if this PaneContainer renders the target pane as a leaf
     if (node.type !== 'leaf' || node.id !== renameRequestPaneId) return
 
-    const currentTitle = paneTitles[node.id] ?? derivePaneTitle(node.content)
+    const currentTitle = paneTitles[node.id] ?? derivePaneTitle(node.content, extensionEntries)
     setRenamingPaneId(node.id)
     setRenameValue(currentTitle)
+    setRenameError(null)
     dispatch(clearPaneRenameRequest())
   }, [renameRequestTabId, renameRequestPaneId, tabId, node, paneTitles, dispatch])
 
   const startRename = useCallback((paneId: string, currentTitle: string) => {
     setRenamingPaneId(paneId)
     setRenameValue(currentTitle)
+    setRenameError(null)
   }, [])
+
+  const handleRenameChange = useCallback((value: string) => {
+    setRenameValue(value)
+    if (renameError) setRenameError(null)
+  }, [renameError])
 
   const commitRename = useCallback(() => {
     if (!renamingPaneId) return
+    const paneId = renamingPaneId
     const trimmed = renameValue.trim()
-    if (trimmed) {
-      dispatch(updatePaneTitle({ tabId, paneId: renamingPaneId, title: trimmed }))
-
-      // Sync tab title when renaming the only pane in a tab
-      if (isOnlyPane) {
+    if (!trimmed) {
+      setRenameError(null)
+      setRenamingPaneId(null)
+      setRenameValue('')
+      return
+    }
+    if (node.type !== 'leaf') return
+    api.patch(`/api/panes/${encodeURIComponent(paneId)}`, {
+      name: trimmed,
+    }).then((response: { data?: { paneId?: string; tabRenamed?: boolean }; message?: string } | null | undefined) => {
+      if (response?.data?.paneId !== paneId) {
+        throw new Error(response?.message || 'Failed to rename pane')
+      }
+      dispatch(updatePaneTitle({ tabId, paneId, title: trimmed }))
+      if (response.data.tabRenamed === true) {
         dispatch(updateTab({ id: tabId, updates: { title: trimmed } }))
       }
-
-      // For coding CLI panes, persist the rename to the server so it
-      // cascades as a session title override.
-      if (node.type === 'leaf' && node.content.kind === 'terminal') {
-        const { mode, terminalId } = node.content
-        if (shouldSyncRenameToServer(mode, terminalId)) {
-          api.patch(`/api/terminals/${encodeURIComponent(terminalId!)}`, {
-            titleOverride: trimmed,
-          }).catch(() => {}) // Best-effort; UI already updated via Redux
-        }
-      }
-    }
-    // Empty value keeps the original title (no dispatch)
-    setRenamingPaneId(null)
-    setRenameValue('')
-  }, [dispatch, tabId, renamingPaneId, renameValue, node, isOnlyPane])
+      setRenameError(null)
+      setRenamingPaneId(null)
+      setRenameValue('')
+    }).catch((error: any) => {
+      const message = typeof error?.message === 'string' && error.message
+        ? error.message
+        : 'Failed to rename pane'
+      setRenameError(message)
+    })
+  }, [dispatch, tabId, renamingPaneId, renameValue, node])
 
   const handleRenameKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === 'Enter' || e.key === 'Escape') {
@@ -305,7 +374,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   // Render a leaf pane
   if (node.type === 'leaf') {
     const explicitTitle = paneTitles[node.id]
-    const paneTitle = explicitTitle ?? derivePaneTitle(node.content)
+    const paneTitle = explicitTitle ?? derivePaneTitle(node.content, extensionEntries)
     const paneStatus = node.content.kind === 'terminal'
       ? node.content.status
       : node.content.kind === 'agent-chat'
@@ -328,7 +397,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       node.content.kind === 'terminal'
         ? (node.content.initialCwd || tab?.initialCwd)
         : undefined
-    const paneRuntimeMeta =
+    const paneRuntimeMeta: PaneRuntimeMeta | undefined =
       node.content.kind === 'terminal'
         ? resolvePaneRuntimeMeta(terminalMetaById, {
           terminalId: node.content.terminalId,
@@ -338,6 +407,12 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
           resumeSessionId: paneResumeSessionId,
           initialCwd: paneInitialCwd,
         })
+        : node.content.kind === 'agent-chat'
+          ? resolveFreshClaudeRuntimeMeta(
+            indexedProjects,
+            node.content,
+            node.content.sessionId ? agentChatSessions[node.content.sessionId] : undefined,
+          )
         : undefined
     const paneMetaLabel =
       paneRuntimeMeta
@@ -347,6 +422,18 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       paneRuntimeMeta
         ? formatPaneRuntimeTooltip(paneRuntimeMeta)
         : undefined
+    const paneActivityRecord =
+      node.content.kind === 'terminal'
+        ? resolveExactCodexActivity(codexActivityByTerminalId, {
+          terminalId: node.content.terminalId,
+          tabTerminalId,
+          isOnlyPane,
+        })
+        : undefined
+    const paneActivityPulse =
+      node.content.kind === 'terminal'
+      && node.content.status === 'running'
+      && paneActivityRecord?.phase === 'busy'
 
     const needsAttention = tabAttentionStyle !== 'none' && !!attentionByPane[node.id]
 
@@ -361,6 +448,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         content={node.content}
         metaLabel={paneMetaLabel}
         metaTooltip={paneMetaTooltip}
+        activityPulse={paneActivityPulse}
         needsAttention={needsAttention}
         onClose={() => handleClose(node.id, node.content)}
         onFocus={() => handleFocus(node.id)}
@@ -368,7 +456,8 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         isZoomed={zoomedPaneId === node.id}
         isRenaming={isRenaming}
         renameValue={isRenaming ? renameValue : undefined}
-        onRenameChange={isRenaming ? setRenameValue : undefined}
+        renameError={isRenaming ? renameError || undefined : undefined}
+        onRenameChange={isRenaming ? handleRenameChange : undefined}
         onRenameBlur={isRenaming ? commitRename : undefined}
         onRenameKeyDown={isRenaming ? handleRenameKeyDown : undefined}
         onSearch={node.content.kind === 'terminal' ? () => getTerminalActions(node.id)?.openSearch() : undefined}
@@ -422,6 +511,7 @@ function PickerWrapper({
 }) {
   const dispatch = useAppDispatch()
   const settings = useAppSelector((s) => s.settings?.settings)
+  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const paneLayout = useAppSelector((s) => s.panes.layouts[tabId])
   const tabPref = useMemo(
     () => paneLayout ? getTabDirectoryPreference(paneLayout) : { defaultCwd: undefined, tabDirectories: [] },
@@ -458,7 +548,7 @@ function PickerWrapper({
       }
     }
 
-    if (isCodingCliProviderName(type)) {
+    if (isCodingCliProviderName(type, extensionEntries)) {
       return {
         kind: 'terminal',
         mode: type,
@@ -521,7 +611,7 @@ function PickerWrapper({
       default:
         throw new Error(`Unsupported pane type: ${String(type)}`)
     }
-  }, [])
+  }, [extensionEntries, settings])
 
   const handleSelect = useCallback((type: PanePickerType) => {
     if (isAgentChatProviderName(type)) {
@@ -529,14 +619,14 @@ function PickerWrapper({
       return
     }
 
-    if (isCodingCliProviderName(type)) {
+    if (isCodingCliProviderName(type, extensionEntries)) {
       setStep({ step: 'directory', providerType: type })
       return
     }
 
     const newContent = createContentForType(type)
     dispatch(updatePaneContent({ tabId, paneId, content: newContent }))
-  }, [createContentForType, dispatch, tabId, paneId])
+  }, [createContentForType, dispatch, tabId, paneId, extensionEntries])
 
   const handleDirectoryConfirm = useCallback((cwd: string) => {
     if (step.step !== 'directory') return
@@ -565,7 +655,7 @@ function PickerWrapper({
   if (step.step === 'directory') {
     const providerType = step.providerType
     const agentConfig = getAgentChatProviderConfig(providerType)
-    const providerLabel = agentConfig ? agentConfig.label : getProviderLabel(providerType)
+    const providerLabel = agentConfig ? agentConfig.label : getProviderLabel(providerType, extensionEntries)
     const settingsKey = (agentConfig ? agentConfig.codingCliProvider : providerType) as CodingCliProviderName
     const globalDefault = settings?.codingCli?.providers?.[settingsKey]?.cwd
     const defaultCwd = tabPref.defaultCwd ?? globalDefault

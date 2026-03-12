@@ -7,16 +7,35 @@ import panesReducer from '@/store/panesSlice'
 import tabsReducer from '@/store/tabsSlice'
 import settingsReducer from '@/store/settingsSlice'
 import connectionReducer, { ConnectionState } from '@/store/connectionSlice'
+import extensionsReducer from '@/store/extensionsSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
+import sessionsReducer, { applySessionsPatch, type SessionsState } from '@/store/sessionsSlice'
+import agentChatReducer, { turnResult } from '@/store/agentChatSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import { markTabAttention, markPaneAttention } from '@/store/turnCompletionSlice'
 import type { PanesState } from '@/store/panesSlice'
 import type { PaneNode, PaneContent, EditorPaneContent } from '@/store/paneTypes'
+import type { AgentChatState } from '@/store/agentChatTypes'
+import type { ClientExtensionEntry } from '@shared/extension-types'
+
+const defaultCliExtensions: ClientExtensionEntry[] = [
+  {
+    name: 'claude', version: '1.0.0', label: 'Claude CLI', description: '', category: 'cli',
+    picker: { shortcut: 'L' },
+    cli: { supportsPermissionMode: true, supportsResume: true, resumeCommandTemplate: ['claude', '--resume', '{{sessionId}}'] },
+  },
+  {
+    name: 'codex', version: '1.0.0', label: 'Codex CLI', description: '', category: 'cli',
+    picker: { shortcut: 'X' },
+    cli: { supportsModel: true, supportsSandbox: true, supportsResume: true, resumeCommandTemplate: ['codex', 'resume', '{{sessionId}}'] },
+  },
+]
 
 // Hoist mock functions so vi.mock can reference them
 const {
   mockSend,
   mockTerminalView,
+  mockAgentChatView,
   mockBrowserPane,
   browserPaneMounts,
   browserPaneUnmounts,
@@ -27,6 +46,9 @@ const {
   mockSend: vi.fn(),
   mockTerminalView: vi.fn(({ tabId, paneId, hidden }: { tabId: string; paneId: string; hidden?: boolean }) => (
     <div data-testid={`terminal-${paneId}`} data-hidden={String(hidden)}>Terminal for {tabId}/{paneId}</div>
+  )),
+  mockAgentChatView: vi.fn(({ paneId }: { paneId: string }) => (
+    <div data-testid={`agent-chat-${paneId}`}>Agent Chat</div>
   )),
   mockBrowserPane: vi.fn(),
   browserPaneMounts: [] as string[],
@@ -126,6 +148,10 @@ vi.mock('@/components/TerminalView', () => ({
   default: mockTerminalView,
 }))
 
+vi.mock('@/components/agent-chat/AgentChatView', () => ({
+  default: mockAgentChatView,
+}))
+
 // Mock BrowserPane component
 vi.mock('@/components/panes/BrowserPane', () => ({
   default: ({ paneId, url, browserInstanceId }: { paneId: string; url: string; browserInstanceId: string }) => {
@@ -171,7 +197,9 @@ function createTerminalContent(overrides: Partial<PaneContent & { kind: 'termina
 
 function createStore(
   initialPanesState: Partial<PanesState> = {},
-  initialConnectionState: Partial<ConnectionState> = {}
+  initialConnectionState: Partial<ConnectionState> = {},
+  initialSessionsState: Partial<SessionsState> = {},
+  initialAgentChatState: Partial<AgentChatState> = {},
 ) {
   return configureStore({
     reducer: {
@@ -179,9 +207,18 @@ function createStore(
       tabs: tabsReducer,
       settings: settingsReducer,
       connection: connectionReducer,
+      extensions: extensionsReducer,
       terminalMeta: terminalMetaReducer,
+      sessions: sessionsReducer,
+      agentChat: agentChatReducer,
       turnCompletion: turnCompletionReducer,
     },
+    middleware: (getDefaultMiddleware) =>
+      getDefaultMiddleware({
+        serializableCheck: {
+          ignoredPaths: ['sessions.expandedProjects'],
+        },
+      }),
     preloadedState: {
       panes: {
         layouts: {},
@@ -197,6 +234,9 @@ function createStore(
         tabs: [{ id: 'tab-1', createRequestId: 'tab-1', title: 'Tab 1', mode: 'shell' as const, status: 'running' as const, createdAt: 1 }],
         activeTabId: 'tab-1',
       },
+      extensions: {
+        entries: defaultCliExtensions,
+      },
       connection: {
         status: 'disconnected',
         platform: null,
@@ -205,6 +245,18 @@ function createStore(
       },
       terminalMeta: {
         byTerminalId: {},
+      },
+      sessions: {
+        projects: [],
+        expandedProjects: new Set(),
+        wsSnapshotReceived: true,
+        ...initialSessionsState,
+      },
+      agentChat: {
+        sessions: {},
+        pendingCreates: {},
+        availableModels: [],
+        ...initialAgentChatState,
       },
     },
   })
@@ -227,6 +279,7 @@ describe('PaneContainer', () => {
   beforeEach(() => {
     mockSend.mockClear()
     mockTerminalView.mockClear()
+    mockAgentChatView.mockClear()
     mockBrowserPane.mockClear()
     browserPaneMounts.length = 0
     browserPaneUnmounts.length = 0
@@ -426,6 +479,191 @@ describe('PaneContainer', () => {
         type: 'terminal.detach',
         terminalId: 'term-222',
       })
+    })
+  })
+
+  describe('pane rename sync', () => {
+    it('commits local pane and tab title changes only after the pane rename API succeeds for a single-pane tab', async () => {
+      mockApiPatch.mockResolvedValueOnce({
+        status: 'ok',
+        data: { tabId: 'tab-1', paneId: 'pane-1', tabRenamed: true },
+        message: 'pane renamed',
+      })
+
+      const leafNode: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: createTerminalContent({ terminalId: 'term-1' }),
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': leafNode },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+        renameRequestTabId: 'tab-1',
+        renameRequestPaneId: 'pane-1',
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={leafNode} />,
+        store
+      )
+
+      const renameInput = await screen.findByLabelText('Rename pane')
+      fireEvent.change(renameInput, { target: { value: 'Ops desk' } })
+      fireEvent.blur(renameInput)
+
+      await waitFor(() => {
+        expect(mockApiPatch).toHaveBeenCalledWith('/api/panes/pane-1', { name: 'Ops desk' })
+      })
+      await waitFor(() => {
+        expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Ops desk')
+      })
+      expect(store.getState().tabs.tabs[0].title).toBe('Ops desk')
+    })
+
+    it('updates only the local pane title when the server confirms no tab rename happened', async () => {
+      mockApiPatch.mockResolvedValueOnce({
+        status: 'ok',
+        data: { tabId: 'tab-1', paneId: 'pane-1', tabRenamed: false },
+        message: 'pane renamed',
+      })
+
+      const leafNode: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: createTerminalContent({ terminalId: 'term-1' }),
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': leafNode },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+        renameRequestTabId: 'tab-1',
+        renameRequestPaneId: 'pane-1',
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={leafNode} />,
+        store
+      )
+
+      const renameInput = await screen.findByLabelText('Rename pane')
+      fireEvent.change(renameInput, { target: { value: 'Ops desk' } })
+      fireEvent.blur(renameInput)
+
+      await waitFor(() => {
+        expect(mockApiPatch).toHaveBeenCalledWith('/api/panes/pane-1', { name: 'Ops desk' })
+      })
+      await waitFor(() => {
+        expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Ops desk')
+      })
+      expect(store.getState().tabs.tabs[0].title).toBe('Tab 1')
+    })
+
+    it('keeps the rename editor open and does not update local titles when the server reports pane not found in a 200 response', async () => {
+      mockApiPatch.mockResolvedValueOnce({
+        status: 'ok',
+        message: 'pane not found',
+      })
+
+      const leafNode: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: createTerminalContent({ terminalId: 'term-1' }),
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': leafNode },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+        renameRequestTabId: 'tab-1',
+        renameRequestPaneId: 'pane-1',
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={leafNode} />,
+        store
+      )
+
+      const renameInput = await screen.findByLabelText('Rename pane')
+      fireEvent.change(renameInput, { target: { value: 'Ops desk' } })
+      fireEvent.blur(renameInput)
+
+      await waitFor(() => {
+        expect(mockApiPatch).toHaveBeenCalledWith('/api/panes/pane-1', { name: 'Ops desk' })
+      })
+      expect(await screen.findByLabelText('Rename pane')).toHaveValue('Ops desk')
+      expect(screen.getByRole('alert')).toHaveTextContent('pane not found')
+      expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Shell')
+      expect(store.getState().tabs.tabs[0].title).toBe('Tab 1')
+    })
+
+    it('does not update local pane titles when the pane rename API rejects the request', async () => {
+      mockApiPatch.mockRejectedValueOnce(new Error('name must be 500 characters or fewer'))
+
+      const leafNode: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: createTerminalContent({ terminalId: 'term-1' }),
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': leafNode },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+        renameRequestTabId: 'tab-1',
+        renameRequestPaneId: 'pane-1',
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={leafNode} />,
+        store
+      )
+
+      const renameInput = await screen.findByLabelText('Rename pane')
+      fireEvent.change(renameInput, { target: { value: 'x'.repeat(600) } })
+      fireEvent.blur(renameInput)
+
+      await waitFor(() => {
+        expect(mockApiPatch).toHaveBeenCalledWith('/api/panes/pane-1', { name: 'x'.repeat(600) })
+      })
+      expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Shell')
+      expect(store.getState().tabs.tabs[0].title).toBe('Tab 1')
+    })
+
+    it('keeps the rename editor open with the typed value when the pane rename API rejects the request', async () => {
+      mockApiPatch.mockRejectedValueOnce(new Error('name must be 500 characters or fewer'))
+
+      const leafNode: PaneNode = {
+        type: 'leaf',
+        id: 'pane-1',
+        content: createTerminalContent({ terminalId: 'term-1' }),
+      }
+
+      const store = createStore({
+        layouts: { 'tab-1': leafNode },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+        renameRequestTabId: 'tab-1',
+        renameRequestPaneId: 'pane-1',
+      })
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={leafNode} />,
+        store
+      )
+
+      const renameInput = await screen.findByLabelText('Rename pane')
+      fireEvent.change(renameInput, { target: { value: 'x'.repeat(600) } })
+      fireEvent.blur(renameInput)
+
+      await waitFor(() => {
+        expect(mockApiPatch).toHaveBeenCalledWith('/api/panes/pane-1', { name: 'x'.repeat(600) })
+      })
+      expect(await screen.findByLabelText('Rename pane')).toHaveValue('x'.repeat(600))
+      expect(screen.getByRole('alert')).toHaveTextContent('name must be 500 characters or fewer')
+      expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Shell')
     })
   })
 
@@ -1043,6 +1281,7 @@ describe('PaneContainer', () => {
           tabs: tabsReducer,
           settings: settingsReducer,
           connection: connectionReducer,
+          extensions: extensionsReducer,
           terminalMeta: terminalMetaReducer,
           turnCompletion: turnCompletionReducer,
         },
@@ -1059,6 +1298,9 @@ describe('PaneContainer', () => {
           tabs: {
             tabs: [{ id: 'tab-1', createRequestId: 'tab-1', title: 'Tab 1', mode: 'shell' as const, status: 'running' as const, createdAt: 1 }],
             activeTabId: 'tab-1',
+          },
+          extensions: {
+            entries: defaultCliExtensions,
           },
           connection: {
             status: 'ready' as const,
@@ -1256,6 +1498,7 @@ describe('PaneContainer', () => {
           tabs: tabsReducer,
           settings: settingsReducer,
           connection: connectionReducer,
+          extensions: extensionsReducer,
           terminalMeta: terminalMetaReducer,
           turnCompletion: turnCompletionReducer,
         },
@@ -1284,6 +1527,7 @@ describe('PaneContainer', () => {
             tabs: [{ id: 'tab-1', createRequestId: 'tab-1', title: 'Tab 1', mode: 'shell' as const, status: 'running' as const, createdAt: 1 }],
             activeTabId: 'tab-1',
           },
+          extensions: { entries: defaultCliExtensions },
           connection: { status: 'disconnected', platform: null, availableClis: {} },
           terminalMeta: { byTerminalId: {} },
           settings: {
@@ -1444,6 +1688,348 @@ describe('PaneContainer', () => {
       // In type mode, clicking should NOT clear attention
       expect(store.getState().turnCompletion.attentionByPane['pane-2']).toBe(true)
       expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
+    })
+  })
+
+  describe('FreshClaude runtime metadata', () => {
+    it('renders FreshClaude header token usage from the indexed Claude session linked by cliSessionId and does not approximate from SDK totals', async () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-fresh',
+        content: {
+          kind: 'agent-chat',
+          provider: 'freshclaude',
+          createRequestId: 'req-fresh',
+          sessionId: 'sdk-session-1',
+          status: 'idle',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-fresh' },
+        },
+        {},
+        {
+          projects: [
+            {
+              projectPath: '/home/user/code/freshell',
+              sessions: [
+                {
+                  provider: 'claude',
+                  sessionType: 'freshclaude',
+                  sessionId: 'claude-session-1',
+                  projectPath: '/home/user/code/freshell',
+                  cwd: '/home/user/code/freshell/.worktrees/issue-163',
+                  gitBranch: 'main',
+                  isDirty: true,
+                  updatedAt: 1,
+                  tokenUsage: {
+                    inputTokens: 10,
+                    outputTokens: 5,
+                    cachedTokens: 0,
+                    totalTokens: 15,
+                    contextTokens: 15,
+                    compactThresholdTokens: 60,
+                    compactPercent: 25,
+                  },
+                },
+              ],
+            },
+          ],
+        },
+        {
+          sessions: {
+            'sdk-session-1': {
+              sessionId: 'sdk-session-1',
+              cliSessionId: 'claude-session-1',
+              status: 'idle',
+              messages: [],
+              streamingText: '',
+              streamingActive: false,
+              pendingPermissions: {},
+              pendingQuestions: {},
+              totalCostUsd: 0,
+              totalInputTokens: 4000,
+              totalOutputTokens: 2000,
+            },
+          },
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      const meta = screen.getByText(/freshell \(main\*\)\s+25%/)
+      expect(meta).toHaveAttribute(
+        'title',
+        'Directory: /home/user/code/freshell/.worktrees/issue-163\nbranch: main*\nTokens: 15/60(25% full)',
+      )
+
+      store.dispatch(turnResult({
+        sessionId: 'sdk-session-1',
+        usage: { input_tokens: 999999, output_tokens: 999999 },
+      }))
+
+      expect(screen.getByText(/freshell \(main\*\)\s+25%/)).toBeInTheDocument()
+
+      store.dispatch(applySessionsPatch({
+        upsertProjects: [],
+        removeProjectPaths: ['/home/user/code/freshell'],
+      }))
+
+      expect(store.getState().sessions.projects).toEqual([])
+
+      await waitFor(() => {
+        expect(screen.queryByText(/freshell \(main\*\)\s+25%/)).not.toBeInTheDocument()
+      })
+
+      store.dispatch(turnResult({
+        sessionId: 'sdk-session-1',
+        usage: { input_tokens: 500000, output_tokens: 500000 },
+      }))
+
+      expect(screen.queryByText(/%$/)).not.toBeInTheDocument()
+    })
+
+    it('prefers cliSessionId over resumeSessionId when both identities exist', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-fresh',
+        content: {
+          kind: 'agent-chat',
+          provider: 'freshclaude',
+          createRequestId: 'req-fresh',
+          sessionId: 'sdk-session-1',
+          resumeSessionId: 'resume-session-2',
+          status: 'idle',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-fresh' },
+        },
+        {},
+        {
+          projects: [
+            {
+              projectPath: '/home/user/code/freshell',
+              sessions: [
+                {
+                  provider: 'claude',
+                  sessionType: 'freshclaude',
+                  sessionId: 'cli-session-1',
+                  projectPath: '/home/user/code/freshell',
+                  cwd: '/home/user/code/freshell',
+                  gitBranch: 'main',
+                  isDirty: true,
+                  updatedAt: 2,
+                  tokenUsage: {
+                    inputTokens: 10,
+                    outputTokens: 5,
+                    cachedTokens: 0,
+                    totalTokens: 15,
+                    contextTokens: 15,
+                    compactThresholdTokens: 60,
+                    compactPercent: 25,
+                  },
+                },
+                {
+                  provider: 'claude',
+                  sessionType: 'freshclaude',
+                  sessionId: 'resume-session-2',
+                  projectPath: '/home/user/code/freshell',
+                  cwd: '/home/user/code/freshell/other',
+                  gitBranch: 'stale',
+                  isDirty: false,
+                  updatedAt: 1,
+                  tokenUsage: {
+                    inputTokens: 1,
+                    outputTokens: 1,
+                    cachedTokens: 0,
+                    totalTokens: 2,
+                    contextTokens: 2,
+                    compactThresholdTokens: 20,
+                    compactPercent: 10,
+                  },
+                },
+              ],
+            },
+          ],
+        },
+        {
+          sessions: {
+            'sdk-session-1': {
+              sessionId: 'sdk-session-1',
+              cliSessionId: 'cli-session-1',
+              status: 'idle',
+              messages: [],
+              streamingText: '',
+              streamingActive: false,
+              pendingPermissions: {},
+              pendingQuestions: {},
+              totalCostUsd: 0,
+              totalInputTokens: 0,
+              totalOutputTokens: 0,
+            },
+          },
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      const meta = screen.getByText(/freshell \(main\*\)\s+25%/)
+      expect(meta).toHaveAttribute(
+        'title',
+        'Directory: /home/user/code/freshell\nbranch: main*\nTokens: 15/60(25% full)',
+      )
+      expect(screen.queryByText(/other \(stale\)\s+10%/)).not.toBeInTheDocument()
+    })
+
+    it('falls back to resumeSessionId for FreshClaude panes before sdk.session.init arrives', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-fresh',
+        content: {
+          kind: 'agent-chat',
+          provider: 'freshclaude',
+          createRequestId: 'req-fresh',
+          status: 'starting',
+          resumeSessionId: 'claude-session-restored',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-fresh' },
+        },
+        {},
+        {
+          projects: [
+            {
+              projectPath: '/home/user/code/freshell',
+              sessions: [
+                {
+                  provider: 'claude',
+                  sessionType: 'freshclaude',
+                  sessionId: 'claude-session-restored',
+                  projectPath: '/home/user/code/freshell',
+                  cwd: '/home/user/code/freshell/.worktrees/issue-163',
+                  gitBranch: 'main',
+                  isDirty: false,
+                  updatedAt: 1,
+                  tokenUsage: {
+                    inputTokens: 10,
+                    outputTokens: 5,
+                    cachedTokens: 0,
+                    totalTokens: 15,
+                    contextTokens: 15,
+                    compactThresholdTokens: 60,
+                    compactPercent: 25,
+                  },
+                },
+              ],
+            },
+          ],
+        },
+        {
+          sessions: {},
+          pendingCreates: {},
+          availableModels: [],
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      expect(screen.getByText(/freshell \(main\)\s+25%/)).toBeInTheDocument()
+    })
+
+    it('does not add the token-budget indicator to kilroy panes', () => {
+      const node: PaneNode = {
+        type: 'leaf',
+        id: 'pane-kilroy',
+        content: {
+          kind: 'agent-chat',
+          provider: 'kilroy',
+          createRequestId: 'req-kilroy',
+          sessionId: 'sdk-session-1',
+          status: 'idle',
+        },
+      }
+
+      const store = createStore(
+        {
+          layouts: { 'tab-1': node },
+          activePane: { 'tab-1': 'pane-kilroy' },
+        },
+        {},
+        {
+          projects: [
+            {
+              projectPath: '/home/user/code/freshell',
+              sessions: [
+                {
+                  provider: 'claude',
+                  sessionType: 'freshclaude',
+                  sessionId: 'claude-session-1',
+                  projectPath: '/home/user/code/freshell',
+                  cwd: '/home/user/code/freshell',
+                  gitBranch: 'main',
+                  isDirty: true,
+                  updatedAt: 1,
+                  tokenUsage: {
+                    inputTokens: 10,
+                    outputTokens: 5,
+                    cachedTokens: 0,
+                    totalTokens: 15,
+                    contextTokens: 15,
+                    compactThresholdTokens: 60,
+                    compactPercent: 25,
+                  },
+                },
+              ],
+            },
+          ],
+        },
+        {
+          sessions: {
+            'sdk-session-1': {
+              sessionId: 'sdk-session-1',
+              cliSessionId: 'claude-session-1',
+              status: 'idle',
+              messages: [],
+              streamingText: '',
+              streamingActive: false,
+              pendingPermissions: {},
+              pendingQuestions: {},
+              totalCostUsd: 0,
+              totalInputTokens: 0,
+              totalOutputTokens: 0,
+            },
+          },
+        },
+      )
+
+      renderWithStore(
+        <PaneContainer tabId="tab-1" node={node} />,
+        store,
+      )
+
+      expect(screen.getByText('Kilroy')).toBeInTheDocument()
+      expect(screen.queryByText('freshell (main*)  25%')).not.toBeInTheDocument()
+      expect(screen.queryByText(/%$/)).not.toBeInTheDocument()
     })
   })
 })

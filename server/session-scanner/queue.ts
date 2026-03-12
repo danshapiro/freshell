@@ -53,12 +53,22 @@ export class SessionRepairQueue extends EventEmitter {
   private hasStarted = false
   private waiting: Map<string, WaitingPromise[]> = new Map()
   private maxProcessedCache: number
+  private postScan?: (result: SessionScanResult) => Promise<void>
+  private currentWork: Promise<void> | null = null
 
-  constructor(scanner: SessionScanner, cache: SessionCache, options?: { maxProcessedCache?: number }) {
+  constructor(
+    scanner: SessionScanner,
+    cache: SessionCache,
+    options?: {
+      maxProcessedCache?: number
+      postScan?: (result: SessionScanResult) => Promise<void>
+    },
+  ) {
     super()
     this.scanner = scanner
     this.cache = cache
     this.maxProcessedCache = options?.maxProcessedCache ?? MAX_PROCESSED_CACHE
+    this.postScan = options?.postScan
   }
 
   /**
@@ -178,56 +188,60 @@ export class SessionRepairQueue extends EventEmitter {
     }
 
     this.processing.add(item.sessionId)
+    this.currentWork = (async () => {
+      try {
+        // Check cache first
+        const cached = await this.cache.get(item.filePath, {
+          allowStaleMs: item.priority === 'active' ? ACTIVE_CACHE_GRACE_MS : undefined,
+        })
+        if (cached) {
+          const normalized = cached.sessionId === item.sessionId
+            ? cached
+            : { ...cached, sessionId: item.sessionId }
+          await this.postScan?.(normalized)
+          this.setProcessed(item.sessionId, normalized)
+          this.emit('scanned', normalized)
+          this.resolveWaiting(item.sessionId, normalized)
+          return
+        }
 
-    try {
-      // Check cache first
-      const cached = await this.cache.get(item.filePath, {
-        allowStaleMs: item.priority === 'active' ? ACTIVE_CACHE_GRACE_MS : undefined,
-      })
-      if (cached) {
-        const normalized = cached.sessionId === item.sessionId
-          ? cached
-          : { ...cached, sessionId: item.sessionId }
-        this.setProcessed(item.sessionId, normalized)
-        this.emit('scanned', normalized)
-        this.resolveWaiting(item.sessionId, normalized)
+        // Scan the session
+        const scanResult = await this.scanner.scan(item.filePath)
+        await this.cache.set(item.filePath, scanResult)
+        const normalizedScan = scanResult.sessionId === item.sessionId
+          ? scanResult
+          : { ...scanResult, sessionId: item.sessionId }
+        this.emit('scanned', normalizedScan)
+
+        // Repair if corrupted
+        if (normalizedScan.status === 'corrupted') {
+          const repairResult = await this.scanner.repair(item.filePath)
+          this.emit('repaired', repairResult)
+
+          // Re-scan to get updated result
+          const newResult = await this.scanner.scan(item.filePath)
+          await this.cache.set(item.filePath, newResult)
+          const normalizedNew = newResult.sessionId === item.sessionId
+            ? newResult
+            : { ...newResult, sessionId: item.sessionId }
+          await this.postScan?.(normalizedNew)
+          this.setProcessed(item.sessionId, normalizedNew)
+          this.resolveWaiting(item.sessionId, normalizedNew)
+        } else {
+          await this.postScan?.(normalizedScan)
+          this.setProcessed(item.sessionId, normalizedScan)
+          this.resolveWaiting(item.sessionId, normalizedScan)
+        }
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err))
+        this.emit('error', item.sessionId, error)
+        this.rejectWaiting(item.sessionId, error)
+      } finally {
         this.processing.delete(item.sessionId)
-        setImmediate(() => this.processNext())
-        return
       }
-
-      // Scan the session
-      const scanResult = await this.scanner.scan(item.filePath)
-      await this.cache.set(item.filePath, scanResult)
-      const normalizedScan = scanResult.sessionId === item.sessionId
-        ? scanResult
-        : { ...scanResult, sessionId: item.sessionId }
-      this.emit('scanned', normalizedScan)
-
-      // Repair if corrupted
-      if (normalizedScan.status === 'corrupted') {
-        const repairResult = await this.scanner.repair(item.filePath)
-        this.emit('repaired', repairResult)
-
-        // Re-scan to get updated result
-        const newResult = await this.scanner.scan(item.filePath)
-        await this.cache.set(item.filePath, newResult)
-        const normalizedNew = newResult.sessionId === item.sessionId
-          ? newResult
-          : { ...newResult, sessionId: item.sessionId }
-        this.setProcessed(item.sessionId, normalizedNew)
-        this.resolveWaiting(item.sessionId, normalizedNew)
-      } else {
-        this.setProcessed(item.sessionId, normalizedScan)
-        this.resolveWaiting(item.sessionId, normalizedScan)
-      }
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err))
-      this.emit('error', item.sessionId, error)
-      this.rejectWaiting(item.sessionId, error)
-    } finally {
-      this.processing.delete(item.sessionId)
-    }
+    })()
+    await this.currentWork
+    this.currentWork = null
 
     // Process next item
     setImmediate(() => this.processNext())
@@ -292,6 +306,7 @@ export class SessionRepairQueue extends EventEmitter {
   async stop(): Promise<void> {
     this.stopped = true
     this.running = false
+    const inFlight = this.currentWork
 
     // Reject all waiting promises
     for (const [sessionId, waiting] of this.waiting) {
@@ -301,6 +316,10 @@ export class SessionRepairQueue extends EventEmitter {
       }
     }
     this.waiting.clear()
+
+    if (inFlight) {
+      await inFlight
+    }
   }
 
   /**

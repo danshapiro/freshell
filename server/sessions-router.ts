@@ -3,12 +3,20 @@ import { z } from 'zod'
 import { cleanString } from './utils.js'
 import { makeSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
 import { CodingCliProviderSchema } from '../shared/ws-protocol.js'
-import { startPerfTimer } from './perf-logger.js'
 import { logger } from './logger.js'
+import { setResponsePerfContext } from './request-logger.js'
 import { cascadeSessionRenameToTerminal } from './rename-cascade.js'
-import { paginateProjects } from './session-pagination.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
 import type { SessionMetadataStore } from './session-metadata-store.js'
+import { DEFAULT_CLI_PROVIDER_NAMES } from './platform.js'
+import { SessionDirectoryQuerySchema } from '../shared/read-models.js'
+import { querySessionDirectory } from './session-directory/service.js'
+import { createRequestAbortSignal } from './read-models/request-abort.js'
+import {
+  defaultReadModelScheduler,
+  isReadModelAbortError,
+  type ReadModelWorkScheduler,
+} from './read-models/work-scheduler.js'
 
 const log = logger.child({ component: 'sessions-router' })
 
@@ -33,119 +41,67 @@ export interface SessionsRouterDeps {
   perfConfig: { slowSessionRefreshMs: number }
   terminalMetadata?: { list: () => TerminalMeta[] }
   registry?: { updateTitle: (id: string, title: string) => void }
-  wsHandler?: { broadcast: (msg: any) => void }
+  wsHandler?: { broadcastTerminalsChanged?: () => void }
   sessionMetadataStore?: SessionMetadataStore
+  serverInstanceId?: string
+  validCliProviders?: string[]
+  readModelScheduler?: ReadModelWorkScheduler
 }
 
 export function createSessionsRouter(deps: SessionsRouterDeps): Router {
   const { configStore, codingCliIndexer, codingCliProviders, perfConfig } = deps
   const router = Router()
-
-  // Search endpoint must come BEFORE the generic /sessions route
-  router.get('/sessions/search', async (req, res) => {
-    try {
-      const { SearchRequestSchema, searchSessions } = await import('./session-search.js')
-
-      const parsed = SearchRequestSchema.safeParse({
-        query: req.query.q,
-        tier: req.query.tier || 'title',
-        limit: req.query.limit ? Number(req.query.limit) : undefined,
-        maxFiles: req.query.maxFiles ? Number(req.query.maxFiles) : undefined,
-      })
-
-      if (!parsed.success) {
-        return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
-      }
-
-      const endSearchTimer = startPerfTimer(
-        'sessions_search',
-        {
-          queryLength: parsed.data.query.length,
-          tier: parsed.data.tier,
-          limit: parsed.data.limit,
-        },
-        { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
-      )
-
-      try {
-        const response = await searchSessions({
-          projects: codingCliIndexer.getProjects(),
-          providers: codingCliProviders,
-          query: parsed.data.query,
-          tier: parsed.data.tier,
-          limit: parsed.data.limit,
-          maxFiles: parsed.data.maxFiles,
-        })
-
-        endSearchTimer({ resultCount: response.results.length, totalScanned: response.totalScanned })
-
-        res.json(response)
-      } catch (err: any) {
-        endSearchTimer({
-          error: true,
-          errorName: err?.name,
-          errorMessage: err?.message,
-        })
-        throw err
-      }
-    } catch (err: any) {
-      log.error({ err }, 'Session search failed')
-      res.status(500).json({ error: 'Search failed' })
-    }
+  const readModelScheduler = deps.readModelScheduler ?? defaultReadModelScheduler
+  const validCliProviders = new Set(deps.validCliProviders ?? DEFAULT_CLI_PROVIDER_NAMES)
+  const sessionMetadataProviderSchema = z.string().min(1).superRefine((value, ctx) => {
+    if (validCliProviders.has(value)) return
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `Unknown CLI provider: '${value}'`,
+    })
   })
 
-  router.get('/sessions', async (req, res) => {
-    const projects = codingCliIndexer.getProjects()
-    // Reject arrays (e.g. ?limit=1&limit=2) — only single string values accepted
-    if (typeof req.query.limit !== 'string' && req.query.limit !== undefined) {
-      return res.status(400).json({ error: 'Invalid limit parameter' })
-    }
-    if (typeof req.query.before !== 'string' && req.query.before !== undefined) {
-      return res.status(400).json({ error: 'Invalid before parameter' })
-    }
-    if (typeof req.query.beforeId !== 'string' && req.query.beforeId !== undefined) {
-      return res.status(400).json({ error: 'Invalid beforeId parameter' })
-    }
-    const limitStr = req.query.limit as string | undefined
-    const beforeStr = req.query.before as string | undefined
-    const beforeIdRaw = req.query.beforeId as string | undefined
-    const beforeId = beforeIdRaw != null && beforeIdRaw !== '' ? beforeIdRaw : undefined
+  router.get('/session-directory', async (req, res) => {
+    const parsed = SessionDirectoryQuerySchema.safeParse({
+      query: typeof req.query.query === 'string' ? req.query.query : undefined,
+      cursor: typeof req.query.cursor === 'string' ? req.query.cursor : undefined,
+      priority: req.query.priority,
+      revision: typeof req.query.revision === 'string' ? Number(req.query.revision) : undefined,
+      limit: typeof req.query.limit === 'string' ? Number(req.query.limit) : undefined,
+    })
 
-    // Parse numeric params (undefined if key absent)
-    const limitRaw = limitStr != null && limitStr !== '' ? Number(limitStr) : undefined
-    const beforeRaw = beforeStr != null && beforeStr !== '' ? Number(beforeStr) : undefined
-
-    // Reject empty string params that were present in the query
-    if (limitStr !== undefined && limitRaw === undefined) {
-      return res.status(400).json({ error: 'Invalid limit parameter' })
-    }
-    if (beforeStr !== undefined && beforeRaw === undefined) {
-      return res.status(400).json({ error: 'Invalid before parameter' })
-    }
-    if (beforeIdRaw !== undefined && beforeId === undefined) {
-      return res.status(400).json({ error: 'Invalid beforeId parameter' })
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
     }
 
-    // Validate numeric params
-    if (limitRaw !== undefined && (!Number.isFinite(limitRaw) || limitRaw < 1 || !Number.isInteger(limitRaw))) {
-      return res.status(400).json({ error: 'Invalid limit parameter' })
-    }
-    if (beforeRaw !== undefined && (!Number.isFinite(beforeRaw) || beforeRaw < 0)) {
-      return res.status(400).json({ error: 'Invalid before parameter' })
-    }
+    const signal = createRequestAbortSignal(req, res)
 
-    // If limit or before is provided, return a PaginatedResult
-    // (beforeId alone is a no-op — it's only a tie-breaker for before)
-    if (limitRaw !== undefined || beforeRaw !== undefined) {
-      const result = paginateProjects(projects, {
-        limit: limitRaw,
-        before: beforeRaw,
-        beforeId,
+    try {
+      const page = await readModelScheduler.schedule({
+        lane: parsed.data.priority,
+        signal,
+        run: (scheduledSignal) => querySessionDirectory({
+          projects: codingCliIndexer.getProjects(),
+          query: parsed.data,
+          terminalMeta: deps.terminalMetadata?.list() ?? [],
+          signal: scheduledSignal,
+        }),
       })
-      res.json(result)
-    } else {
-      // Backward compat: return raw array
-      res.json(projects)
+      setResponsePerfContext(res, {
+        readModelLane: parsed.data.priority,
+        responsePayloadBytes: Buffer.byteLength(JSON.stringify(page), 'utf8'),
+      })
+      res.json(page)
+    } catch (error) {
+      if (signal.aborted || isReadModelAbortError(error)) {
+        return
+      }
+      const message = error instanceof Error ? error.message : 'Session directory query failed'
+      const status = /cursor/i.test(message) ? 400 : 500
+      if (status === 500) {
+        log.error({ err: error }, 'Session directory query failed')
+      }
+      res.status(status).json({ error: message })
     }
   })
 
@@ -182,7 +138,7 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
         )
         if (cascadedTerminalId) {
           deps.registry?.updateTitle(cascadedTerminalId, cleanTitle)
-          deps.wsHandler?.broadcast({ type: 'terminal.list.updated' })
+          deps.wsHandler?.broadcastTerminalsChanged?.()
         }
       } catch (err) {
         log.warn({ err, compositeKey }, 'Cascade rename to terminal failed (non-fatal)')
@@ -203,7 +159,7 @@ export function createSessionsRouter(deps: SessionsRouterDeps): Router {
   })
 
   const SessionMetadataPostSchema = z.object({
-    provider: CodingCliProviderSchema,
+    provider: sessionMetadataProviderSchema,
     sessionId: z.string().min(1),
     sessionType: z.string().min(1),
   })

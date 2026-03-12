@@ -1,13 +1,14 @@
 import type { PaneContent } from '@/store/paneTypes'
-import { getProviderLabel, isCodingCliMode } from '@/lib/coding-cli-utils'
+import { getProviderLabel, isNonShellMode } from '@/lib/coding-cli-utils'
 import { getAgentChatProviderLabel } from '@/lib/agent-chat-utils'
+import type { ClientExtensionEntry } from '@shared/extension-types'
 
 /**
  * Derives a default title for a pane based on its content.
  * For terminals: based on mode and shell type.
  * For browsers: based on URL hostname.
  */
-export function derivePaneTitle(content: PaneContent): string {
+export function derivePaneTitle(content: PaneContent, extensions?: ClientExtensionEntry[]): string {
   if (content.kind === 'picker') {
     return 'New Tab'
   }
@@ -37,8 +38,8 @@ export function derivePaneTitle(content: PaneContent): string {
   }
 
   // Terminal content
-  if (isCodingCliMode(content.mode)) {
-    return getProviderLabel(content.mode)
+  if (isNonShellMode(content.mode)) {
+    return getProviderLabel(content.mode, extensions)
   }
 
   // Shell mode - use shell type if specified

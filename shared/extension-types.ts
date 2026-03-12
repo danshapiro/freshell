@@ -31,4 +31,11 @@ export interface ClientExtensionEntry {
   picker?: { shortcut?: string; group?: string }
   serverRunning?: boolean
   serverPort?: number
+  cli?: {
+    supportsPermissionMode?: boolean
+    supportsModel?: boolean
+    supportsSandbox?: boolean
+    supportsResume?: boolean
+    resumeCommandTemplate?: string[]  // e.g., ["claude", "--resume", "{{sessionId}}"]
+  }
 }

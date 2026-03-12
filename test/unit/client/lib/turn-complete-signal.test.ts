@@ -27,6 +27,13 @@ describe('extractTurnCompleteSignals', () => {
     expect(out.cleaned).toBe(input)
   })
 
+  it('ignores BEL for providers without turn-complete signals', () => {
+    const input = `x${TURN_COMPLETE_SIGNAL}y`
+    const out = extractTurnCompleteSignals(input, 'gemini')
+    expect(out.count).toBe(0)
+    expect(out.cleaned).toBe(input)
+  })
+
   it('ignores non-signal output in codex mode', () => {
     const input = 'normal output'
     const out = extractTurnCompleteSignals(input, 'codex')
@@ -69,5 +76,25 @@ describe('extractTurnCompleteSignals', () => {
     expect(osc.cleaned).toBe('\x1b]0;tab-title\x9c')
     expect(bell.count).toBe(1)
     expect(bell.cleaned).toBe('done')
+  })
+
+  it('tracks split CSI sequences across chunks so a later BEL still counts', () => {
+    const state = createTurnCompleteSignalParserState()
+
+    const first = extractTurnCompleteSignals('\x1b[', 'codex', state)
+    const second = extractTurnCompleteSignals(`0m${TURN_COMPLETE_SIGNAL}done`, 'codex', state)
+
+    expect(first).toEqual({ cleaned: '\x1b[', count: 0 })
+    expect(second).toEqual({ cleaned: '0mdone', count: 1 })
+  })
+
+  it('tracks split DCS sequences across chunks and only counts BEL after the terminator', () => {
+    const state = createTurnCompleteSignalParserState()
+
+    const first = extractTurnCompleteSignals('\x1bP', 'codex', state)
+    const second = extractTurnCompleteSignals(`qpayload${TURN_COMPLETE_SIGNAL}\x1b\\${TURN_COMPLETE_SIGNAL}done`, 'codex', state)
+
+    expect(first).toEqual({ cleaned: '\x1bP', count: 0 })
+    expect(second).toEqual({ cleaned: `qpayload${TURN_COMPLETE_SIGNAL}\x1b\\done`, count: 1 })
   })
 })

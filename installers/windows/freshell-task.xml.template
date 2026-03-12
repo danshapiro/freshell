@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Freshell Terminal Server</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+  </Settings>
+  <Actions>
+    <!-- Windows Task Scheduler does not support <Environment> elements.
+         We use cmd.exe /c with inline "set" commands to inject the required
+         environment variables before starting the Node.js server process. -->
+    <Exec>
+      <Command>cmd.exe</Command>
+      <Arguments>/c "set "NODE_PATH={{NODE_PATH}}" &amp;&amp; set "NODE_ENV=production" &amp;&amp; set "PORT={{PORT}}" &amp;&amp; set "FRESHELL_CONFIG_DIR={{CONFIG_DIR}}" &amp;&amp; "{{NODE_BINARY}}" "{{SERVER_ENTRY}}""</Arguments>
+      <WorkingDirectory>{{CONFIG_DIR}}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

@@ -181,6 +181,7 @@ describe('sessionsSlice pagination', () => {
 
       expect(state.projects[0].sessions.map((session) => session.sessionId)).toEqual(['s1', 's2'])
     })
+
     it('clears loadingMore flag', () => {
       let state = stateWith([])
       state = sessionsReducer(state, setLoadingMore(true))

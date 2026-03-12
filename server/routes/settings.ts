@@ -74,7 +74,7 @@ export function createSettingsRouter(deps: SettingsRouterDeps) {
   router.get('/platform', async (_req, res) => {
     const [platform, availableClis] = await Promise.all([
       detectPlatform(),
-      detectAvailableClis(),
+      detectAvailableClis([]),
     ])
     res.json({ platform, availableClis })
   })

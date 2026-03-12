@@ -1,0 +1,14 @@
+{
+  "name": "gemini",
+  "version": "1.0.0",
+  "label": "Gemini",
+  "description": "Google's Gemini CLI agent",
+  "category": "cli",
+  "cli": {
+    "command": "gemini",
+    "envVar": "GEMINI_CMD"
+  },
+  "picker": {
+    "group": "agents"
+  }
+}

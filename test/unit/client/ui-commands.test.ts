@@ -80,6 +80,23 @@ describe('handleUiCommand', () => {
     expect(actions[1].type).toBe('panes/swapPanes')
   })
 
+  it('handles pane.rename', () => {
+    const actions: any[] = []
+    const dispatch = (action: any) => {
+      actions.push(action)
+      return action
+    }
+
+    handleUiCommand({
+      type: 'ui.command',
+      command: 'pane.rename',
+      payload: { tabId: 't1', paneId: 'p1', title: 'Logs' },
+    }, dispatch)
+
+    expect(actions[0].type).toBe('panes/updatePaneTitle')
+    expect(actions[0].payload).toEqual({ tabId: 't1', paneId: 'p1', title: 'Logs' })
+  })
+
   it('dispatches closeTab thunk for tab.close', () => {
     const actions: any[] = []
     const dispatch = (action: any) => {

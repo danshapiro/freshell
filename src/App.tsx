@@ -1,29 +1,27 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type TouchEvent as ReactTouchEvent } from 'react'
-import { useAppDispatch, useAppSelector } from '@/store/hooks'
+import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { setStatus, setError, setErrorCode, setServerInstanceId, setPlatform, setAvailableClis, setFeatureFlags } from '@/store/connectionSlice'
 import { setSettings } from '@/store/settingsSlice'
 import {
-  setProjects,
-  mergeProjects,
-  mergeSnapshotProjects,
-  applySessionsPatch,
   markWsSnapshotReceived,
   resetWsSnapshotReceived,
-  clearPaginationMeta,
-  setPaginationMeta,
-  appendSessionsPage,
-  setLoadingMore,
 } from '@/store/sessionsSlice'
 import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { api, isApiUnauthorizedError, type VersionInfo } from '@/lib/api'
+import {
+  activateSessionSurface,
+  loadInitialSessionsWindow,
+  refreshActiveSessionWindow,
+} from '@/store/sessionsThunks'
 import { getShareAction, ensureShareUrlToken } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
-import { getSessionsForHello } from '@/lib/session-utils'
-import { setClientPerfEnabled } from '@/lib/perf-logger'
+import { collectSessionLocatorsFromTabs, getSessionsForHello } from '@/lib/session-utils'
+import { installClientPerfAuditSink, setClientPerfEnabled } from '@/lib/perf-logger'
 import { applyLocalTerminalFontFamily } from '@/lib/terminal-fonts'
 import { handleUiCommand } from '@/lib/ui-commands'
 import { getAuthToken } from '@/lib/auth'
-import { store } from '@/store/store'
+import { installTestHarness } from '@/lib/test-harness'
+import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { useThemeEffect } from '@/hooks/useTheme'
 import { useMobile } from '@/hooks/useMobile'
 import { useOrientation } from '@/hooks/useOrientation'
@@ -49,11 +47,12 @@ import { triggerHapticFeedback } from '@/lib/mobile-haptics'
 import { X, Copy, Check, PanelLeft, AlertTriangle } from 'lucide-react'
 import { updateSettingsLocal, markSaved } from '@/store/settingsSlice'
 
-import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
+import { upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
+import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
 import { createLogger } from '@/lib/client-logger'
-import type { ProjectGroup, AppSettings } from '@/store/types'
+import type { AppSettings } from '@/store/types'
 import { z } from 'zod'
 
 const log = createLogger('App')
@@ -99,6 +98,14 @@ type ConfigFallbackInfo = {
   backupExists: boolean
 }
 
+type BootstrapPlatformInfo = {
+  platform: string
+  availableClis?: Record<string, boolean>
+  hostName?: string
+  host?: string
+  featureFlags?: Record<string, boolean>
+}
+
 function describeConfigFallbackReason(reason: ConfigFallbackInfo['reason']): string {
   if (reason === 'PARSE_ERROR') return 'could not parse config JSON'
   if (reason === 'VERSION_MISMATCH') return 'config version is incompatible'
@@ -112,6 +119,18 @@ function parseConfigFallbackReason(value: unknown): ConfigFallbackInfo['reason']
     : 'READ_ERROR'
 }
 
+function hasPlatformCapabilities(value: BootstrapPlatformInfo | null | undefined): boolean {
+  if (!value) return false
+  return Object.keys(value.availableClis ?? {}).length > 0 || Object.keys(value.featureFlags ?? {}).length > 0
+}
+
+function getTabSwitchShortcutDirection(event: KeyboardEvent): 'prev' | 'next' | null {
+  if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey) return null
+  if (event.code === 'BracketLeft') return 'prev'
+  if (event.code === 'BracketRight') return 'next'
+  return null
+}
+
 const ReadyMessageSchema = z.object({
   type: z.literal('ready'),
   timestamp: z.string(),
@@ -123,10 +142,58 @@ export default function App() {
   useTurnCompletionNotifications()
 
   const dispatch = useAppDispatch()
+  const appStore = useAppStore()
   const tabs = useAppSelector((s) => s.tabs.tabs)
   const activeTabId = useAppSelector((s) => s.tabs.activeTabId)
   const settings = useAppSelector((s) => s.settings.settings)
+  const settingsLoaded = useAppSelector((s) => s.settings.loaded)
+  const connectionLastError = useAppSelector((s) => s.connection.lastError)
   const networkStatus = useAppSelector((s) => s.network.status)
+  const perfAuditEnabled = typeof window !== 'undefined'
+    && new URLSearchParams(window.location.search).has('perfAudit')
+  const perfAuditBridgeRef = useRef<ReturnType<typeof createPerfAuditBridge> | null>(null)
+
+  if (perfAuditEnabled && !perfAuditBridgeRef.current) {
+    perfAuditBridgeRef.current = createPerfAuditBridge()
+  }
+
+  // Install test harness when URL has ?e2e=1 parameter (for Playwright E2E tests).
+  // Uses useState initializer to run exactly once. The URL parameter approach is
+  // used instead of import.meta.env.PROD because E2E tests run against the
+  // production build where PROD=true.
+  const [_harnessInstalled] = useState(() => {
+    if (typeof window === 'undefined') return false
+    const params = new URLSearchParams(window.location.search)
+    if (!params.has('e2e')) return false
+
+    const ws = getWsClient()
+    installTestHarness(
+      appStore,
+      () => (ws as any)._state || 'unknown',
+      (timeoutMs = 10_000) => new Promise<void>((resolve, reject) => {
+        if ((ws as any)._state === 'ready') { resolve(); return }
+        const timeout = setTimeout(
+          () => reject(new Error('WS connection timeout')),
+          timeoutMs,
+        )
+        const unsub = ws.onMessage(() => {
+          if ((ws as any)._state === 'ready') {
+            clearTimeout(timeout)
+            unsub()
+            resolve()
+          }
+        })
+      }),
+      // forceDisconnect: close the underlying WebSocket to trigger auto-reconnect.
+      // Unlike ws.disconnect(), this does NOT set intentionalClose, so the client
+      // will reconnect automatically.
+      () => { (ws as any).ws?.close() },
+      // sendWsMessage: send a raw WS message for test cleanup (e.g., terminal.kill)
+      (msg: unknown) => { ws.send(msg) },
+      () => perfAuditBridgeRef.current?.snapshot() ?? null,
+    )
+    return true
+  })
 
   const [view, setView] = useState<AppView>('terminal')
   const [showSharePanel, setShowSharePanel] = useState(false)
@@ -145,16 +212,59 @@ export default function App() {
   const paneLayouts = useAppSelector((s) => s.panes.layouts)
   const mainContentRef = useRef<HTMLDivElement>(null)
   const userOpenedSidebarOnMobileRef = useRef(false)
-  const terminalMetaListRequestStartedAtRef = useRef(new Map<string, number>())
+  const codexActivityListRequestSeqRef = useRef(new Map<string, number>())
+  const codexActivityOrderRef = useRef(0)
+  const copiedResetTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const fullscreenTouchStartYRef = useRef<number | null>(null)
   const isLandscapeTerminalView = isMobile && isLandscape && view === 'terminal'
   const shareAccessUrl = networkStatus?.accessUrl
     ? ensureShareUrlToken(networkStatus.accessUrl, getAuthToken())
     : null
+  const authRequiredVisible = connectionLastError?.includes('Authentication failed') ?? false
+
+  useEffect(() => {
+    if (!perfAuditEnabled || !perfAuditBridgeRef.current) return
+    const bridge = perfAuditBridgeRef.current
+    bridge.mark('app.bootstrap_started')
+    installPerfAuditBridge(bridge)
+    setClientPerfEnabled(true, 'perf-audit')
+    installClientPerfAuditSink((entry) => {
+      bridge.addPerfEvent(entry)
+      if (
+        entry.event === 'perf.terminal_input_to_output_sample'
+        && typeof entry.latencyMs === 'number'
+      ) {
+        bridge.addTerminalLatencySample(entry.latencyMs)
+      }
+    })
+    return () => {
+      installPerfAuditBridge(null)
+      installClientPerfAuditSink(null)
+      setClientPerfEnabled(false, 'perf-audit')
+    }
+  }, [perfAuditEnabled])
+
+  useEffect(() => {
+    if (!perfAuditEnabled || !perfAuditBridgeRef.current || !settingsLoaded) return
+    perfAuditBridgeRef.current.mark('app.settings_loaded')
+  }, [perfAuditEnabled, settingsLoaded])
+
+  useEffect(() => {
+    if (!perfAuditEnabled || !perfAuditBridgeRef.current || !authRequiredVisible) return
+    perfAuditBridgeRef.current.mark('app.auth_required_visible')
+  }, [authRequiredVisible, perfAuditEnabled])
 
   // Keep this tab's Redux state in sync with persisted writes from other browser tabs.
   useEffect(() => {
-    return installCrossTabSync(store)
+    return installCrossTabSync(appStore)
+  }, [appStore])
+
+  useEffect(() => {
+    return () => {
+      if (copiedResetTimeoutRef.current !== null) {
+        clearTimeout(copiedResetTimeoutRef.current)
+      }
+    }
   }, [])
 
   useEffect(() => {
@@ -200,13 +310,14 @@ export default function App() {
   }, [sidebarWidth, settings.sidebar, dispatch])
 
   const handleSidebarResizeEnd = useCallback(async () => {
+    if (!settingsLoaded) return
     try {
       await api.patch('/api/settings', { sidebar: settings.sidebar })
       dispatch(markSaved())
     } catch (err) {
       log.warn('Failed to save sidebar settings', err)
     }
-  }, [settings.sidebar, dispatch])
+  }, [settings.sidebar, dispatch, settingsLoaded])
 
   const toggleSidebarCollapse = useCallback(async () => {
     const newCollapsed = !sidebarCollapsed
@@ -217,13 +328,14 @@ export default function App() {
       triggerHapticFeedback()
     }
     dispatch(updateSettingsLocal({ sidebar: { ...settings.sidebar, collapsed: newCollapsed } }))
+    if (isMobile || !settingsLoaded) return
     try {
       await api.patch('/api/settings', { sidebar: { ...settings.sidebar, collapsed: newCollapsed } })
       dispatch(markSaved())
     } catch (err) {
       log.warn('Failed to save sidebar settings', err)
     }
-  }, [isMobile, sidebarCollapsed, settings.sidebar, dispatch])
+  }, [isMobile, sidebarCollapsed, settings.sidebar, dispatch, settingsLoaded])
 
   // Swipe gesture: right-swipe from left edge opens sidebar, left-swipe closes it
   const swipeStartXRef = useRef(0)
@@ -311,7 +423,13 @@ export default function App() {
     try {
       await navigator.clipboard.writeText(shareAccessUrl)
       setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
+      if (copiedResetTimeoutRef.current !== null) {
+        clearTimeout(copiedResetTimeoutRef.current)
+      }
+      copiedResetTimeoutRef.current = setTimeout(() => {
+        copiedResetTimeoutRef.current = null
+        setCopied(false)
+      }, 2000)
     } catch (err) {
       log.warn('Clipboard write failed:', err)
     }
@@ -335,78 +453,19 @@ export default function App() {
     let cleanedUp = false
     let cleanup: (() => void) | null = null
     let stopTabRegistrySync: (() => void) | null = null
+    let stopWsDisconnectSync: (() => void) | null = null
+    let bootstrapDataLoading = false
+    let sidebarWindowLoading = false
+    let versionInfoLoading = false
+    let platformDetailsLoading = false
+    let startupRecoveryInFlight = false
+    const versionInfoLoadedRef = { current: false }
 
-    // Buffer for chunked sessions.updated messages — we accumulate all chunks
-    // and apply them atomically to avoid the sidebar collapsing and rebuilding
-    // (scrollbar "blink") during incremental chunked delivery.
-    //
-    // The debounce timer fires 300ms after the LAST chunk.  Server inter-chunk
-    // delays are normally sub-millisecond (setImmediate yield); the only source
-    // of longer gaps is WebSocket drain backpressure.  300ms is generous enough
-    // for all practical scenarios.  If the timer fires with a partial buffer
-    // (extreme backpressure), setProjects replaces the sidebar briefly; any
-    // late-arriving append chunks merge gracefully via the fallback path.
-    let chunkedBuffer: ProjectGroup[] | null = null
-    let chunkedFlushTimer: ReturnType<typeof setTimeout> | null = null
-    // Generation counter: incremented on every sessions.updated snapshot.
-    // sessions.page responses are only applied when the generation matches,
-    // preventing stale page responses from corrupting state after a reset.
-    let snapshotGeneration = 0
-    let activePaginationGeneration = -1
-    let pendingPaginationMeta: {
-      totalSessions: number
-      oldestIncludedTimestamp: number
-      oldestIncludedSessionId: string
-      hasMore: boolean
-    } | null = null
-    const CHUNK_FLUSH_DELAY_MS = 300
-
-    function clearChunkedState() {
-      if (chunkedFlushTimer) { clearTimeout(chunkedFlushTimer); chunkedFlushTimer = null }
-      chunkedBuffer = null
-      pendingPaginationMeta = null
-    }
-
-    function flushChunkedBuffer() {
-      if (chunkedFlushTimer) { clearTimeout(chunkedFlushTimer); chunkedFlushTimer = null }
-      if (chunkedBuffer) {
-        // When the snapshot is paginated (hasMore), merge with existing state
-        // to preserve older sessions the user already loaded via scroll pagination.
-        // Full snapshots (no hasMore) replace entirely for correctness.
-        if (pendingPaginationMeta?.hasMore) {
-          dispatch(mergeSnapshotProjects(chunkedBuffer))
-        } else {
-          dispatch(setProjects(chunkedBuffer))
-        }
-        dispatch(markWsSnapshotReceived())
-        // Reset any stale load-more guard — the snapshot invalidated it
-        dispatch(setLoadingMore(false))
-        if (pendingPaginationMeta) {
-          dispatch(setPaginationMeta({
-            totalSessions: pendingPaginationMeta.totalSessions,
-            oldestLoadedTimestamp: pendingPaginationMeta.oldestIncludedTimestamp,
-            oldestLoadedSessionId: pendingPaginationMeta.oldestIncludedSessionId,
-            hasMore: pendingPaginationMeta.hasMore,
-          }))
-          activePaginationGeneration = snapshotGeneration
-          pendingPaginationMeta = null
-        } else {
-          // Full snapshot without pagination: clear stale pagination state
-          dispatch(clearPaginationMeta())
-          activePaginationGeneration = -1
-        }
-        chunkedBuffer = null
-      }
-    }
-
-    function scheduleChunkedFlush() {
-      if (chunkedFlushTimer) clearTimeout(chunkedFlushTimer)
-      chunkedFlushTimer = setTimeout(flushChunkedBuffer, CHUNK_FLUSH_DELAY_MS)
-    }
     async function bootstrap() {
       const handleBootstrapAuthFailure = (err: unknown): boolean => {
         if (!isApiUnauthorizedError(err)) return false
         if (!cancelled) {
+          resetCodexActivityOverlay()
           dispatch(setStatus('disconnected'))
           dispatch(setError('Authentication failed'))
         }
@@ -417,38 +476,200 @@ export default function App() {
         return true
       }
 
+      const loadBootstrapData = async (): Promise<boolean> => {
+        if (bootstrapDataLoading) return true
+        bootstrapDataLoading = true
+        try {
+          const bootstrapData = await api.get<{
+            settings?: AppSettings
+            platform?: BootstrapPlatformInfo
+            configFallback?: {
+              reason?: unknown
+              backupExists?: unknown
+            }
+          }>('/api/bootstrap')
+          if (!cancelled) {
+            if (bootstrapData.settings) {
+              dispatch(setSettings(applyLocalTerminalFontFamily(bootstrapData.settings)))
+            }
+            if (bootstrapData.platform) {
+              dispatch(setPlatform(bootstrapData.platform.platform))
+              if (bootstrapData.platform.availableClis) {
+                dispatch(setAvailableClis(bootstrapData.platform.availableClis))
+              }
+              if (bootstrapData.platform.featureFlags) {
+                dispatch(setFeatureFlags(bootstrapData.platform.featureFlags))
+              }
+              dispatch(setTabRegistryDeviceMeta(resolveAndPersistDeviceMeta({
+                platform: bootstrapData.platform.platform,
+                hostName: bootstrapData.platform.hostName ?? bootstrapData.platform.host,
+              })))
+            }
+            if (bootstrapData.configFallback) {
+              setConfigFallback({
+                reason: parseConfigFallbackReason(bootstrapData.configFallback.reason),
+                backupExists: !!bootstrapData.configFallback.backupExists,
+              })
+            }
+          }
+          return true
+        } catch (err: any) {
+          if (handleBootstrapAuthFailure(err)) return false
+          log.warn('Failed to load bootstrap data', err)
+          return true
+        } finally {
+          bootstrapDataLoading = false
+        }
+      }
+
+      const loadPlatformDetails = async (): Promise<boolean> => {
+        if (platformDetailsLoading) return true
+        platformDetailsLoading = true
+        try {
+          const platformData = await api.get<BootstrapPlatformInfo>('/api/platform')
+          if (!cancelled) {
+            dispatch(setPlatform(platformData.platform))
+            dispatch(setAvailableClis(platformData.availableClis ?? {}))
+            dispatch(setFeatureFlags(platformData.featureFlags ?? {}))
+            dispatch(setTabRegistryDeviceMeta(resolveAndPersistDeviceMeta({
+              platform: platformData.platform,
+              hostName: platformData.hostName ?? platformData.host,
+            })))
+          }
+          return true
+        } catch (err: any) {
+          if (handleBootstrapAuthFailure(err)) return false
+          log.warn('Failed to load platform info', err)
+          return true
+        } finally {
+          platformDetailsLoading = false
+        }
+      }
+
+      const loadVersionInfo = async (): Promise<boolean> => {
+        if (versionInfoLoading || versionInfoLoadedRef.current) return true
+        versionInfoLoading = true
+        try {
+          const nextVersionInfo = await api.get<VersionInfo>('/api/version')
+          if (!cancelled && isVersionInfo(nextVersionInfo)) {
+            versionInfoLoadedRef.current = true
+            setVersionInfo(nextVersionInfo)
+          }
+          return true
+        } catch (err: any) {
+          if (handleBootstrapAuthFailure(err)) return false
+          log.warn('Failed to load version info', err)
+          return true
+        } finally {
+          versionInfoLoading = false
+        }
+      }
+
+      const ensureNetworkStatusLoaded = () => {
+        const networkState = appStore.getState().network
+        if (cancelled || networkState.loading || networkState.status !== null) return
+        dispatch(fetchNetworkStatus())
+      }
+
+      if (!getAuthToken()) {
+        dispatch(setStatus('disconnected'))
+        dispatch(setError('Authentication failed'))
+      }
+
       // ── WebSocket setup (synchronous) ─────────────────────────────
-      // Register the message handler BEFORE any async work.  Child components
-      // (Sidebar, TerminalView, etc.) call ws.connect() in their own effects,
-      // so the WebSocket may become ready while we await the HTTP fetches
-      // below.  If the handler isn't registered yet, sdk.history (and other
-      // early messages) are silently lost — causing the "chat history lost on
-      // reload" bug.
+      // Register the message handler BEFORE any async work.  App.tsx is the
+      // sole owner of the WebSocket connection. The socket may become ready
+      // while we await HTTP fetches below; registering early avoids losing
+      // early messages.
       const ws = getWsClient()
-      stopTabRegistrySync = startTabRegistrySync(store, ws)
+      stopTabRegistrySync = startTabRegistrySync(appStore, ws)
 
       // Set up hello extension to include session IDs for prioritized repair
       ws.setHelloExtensionProvider(() => ({
-        sessions: getSessionsForHello(store.getState()),
+        sessions: getSessionsForHello(appStore.getState()),
+        sidebarOpenSessions: collectSessionLocatorsFromTabs(
+          appStore.getState().tabs.tabs,
+          appStore.getState().panes,
+        ),
         client: { mobile: isMobileRef.current },
       }))
 
-      const requestTerminalMetaList = () => {
-        terminalMetaListRequestStartedAtRef.current.clear()
-        const requestId = `terminal-meta-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-        terminalMetaListRequestStartedAtRef.current.set(requestId, Date.now())
+      const requestCodexActivityList = () => {
+        const requestId = `codex-activity-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+        const requestSeq = ++codexActivityOrderRef.current
+        codexActivityListRequestSeqRef.current.set(requestId, requestSeq)
         ws.send({
-          type: 'terminal.meta.list',
+          type: 'codex.activity.list',
           requestId,
         })
       }
 
+      const resetCodexActivityOverlay = () => {
+        codexActivityListRequestSeqRef.current.clear()
+        dispatch(resetCodexActivity())
+      }
+
+      const wsWithOptionalDisconnect = ws as typeof ws & {
+        onDisconnect?: (handler: () => void) => (() => void) | void
+      }
+
+      stopWsDisconnectSync = wsWithOptionalDisconnect.onDisconnect?.(() => {
+        if (cancelled) return
+        resetCodexActivityOverlay()
+        dispatch(setStatus('disconnected'))
+      }) ?? null
+
       const promoteRecentHttpSessionsBaseline = () => {
-        const lastLoadedAt = store.getState().sessions.lastLoadedAt
+        const lastLoadedAt = appStore.getState().sessions.lastLoadedAt
         if (typeof lastLoadedAt !== 'number') return false
         if (Date.now() - lastLoadedAt > RECENT_HTTP_SESSIONS_BASELINE_MS) return false
         dispatch(markWsSnapshotReceived())
         return true
+      }
+
+      const ensureSidebarSessionsWindow = async (): Promise<boolean> => {
+        if (sidebarWindowLoading) return true
+        const sidebarWindow = appStore.getState().sessions.windows?.sidebar
+        if (typeof sidebarWindow?.lastLoadedAt === 'number') {
+          dispatch(activateSessionSurface('sidebar') as any)
+          return true
+        }
+
+        sidebarWindowLoading = true
+        try {
+          await dispatch(loadInitialSessionsWindow() as any)
+          return true
+        } catch (err: unknown) {
+          if (handleBootstrapAuthFailure(err)) return false
+          log.warn('Failed to load initial sidebar session window', err)
+          return true
+        } finally {
+          sidebarWindowLoading = false
+        }
+      }
+
+      const recoverMissingStartupState = async () => {
+        if (startupRecoveryInFlight || cancelled) return
+        startupRecoveryInFlight = true
+        try {
+          const state = appStore.getState()
+          if (!state.settings.loaded || state.connection.platform === null) {
+            if (!(await loadBootstrapData())) return
+          }
+          const connectionState = appStore.getState().connection
+          if (!hasPlatformCapabilities({
+            platform: connectionState.platform ?? 'unknown',
+            availableClis: connectionState.availableClis,
+            featureFlags: connectionState.featureFlags,
+          })) {
+            if (!(await loadPlatformDetails())) return
+          }
+          if (!(await ensureSidebarSessionsWindow())) return
+          if (!(await loadVersionInfo())) return
+          ensureNetworkStatusLoaded()
+        } finally {
+          startupRecoveryInFlight = false
+        }
       }
 
       const unsubscribe = ws.onMessage((msg) => {
@@ -457,101 +678,19 @@ export default function App() {
           const ready = ReadyMessageSchema.safeParse(msg)
           // If the initial connect attempt failed before ready, WsClient may still auto-reconnect.
           // Treat 'ready' as the source of truth for connection status.
+          resetCodexActivityOverlay()
           dispatch(setError(undefined))
           dispatch(setStatus('ready'))
           dispatch(setServerInstanceId(ready.success ? ready.data.serverInstanceId : undefined))
           dispatch(resetWsSnapshotReceived())
-          // Discard any in-flight chunked buffer from a previous connection
-          // to prevent stale data from overwriting the new session snapshot.
-          clearChunkedState()
-          // If App registered late and missed a prior snapshot, a fresh HTTP baseline
-          // from this bootstrap cycle is still safe for enabling patch application.
+          // If App registered late and missed a prior invalidation, a fresh HTTP baseline
+          // from this bootstrap cycle is still safe for enabling follow-up refreshes.
           promoteRecentHttpSessionsBaseline()
-          requestTerminalMetaList()
+          requestCodexActivityList()
+          void recoverMissingStartupState()
         }
-        if (msg.type === 'sessions.updated') {
-          const projects = (msg.projects || []) as ProjectGroup[]
-          // Extract optional pagination metadata from first/single chunk
-          const hasPaginationMeta = typeof msg.totalSessions === 'number'
-          const paginationMeta = hasPaginationMeta ? {
-            totalSessions: msg.totalSessions as number,
-            oldestIncludedTimestamp: msg.oldestIncludedTimestamp as number,
-            oldestIncludedSessionId: msg.oldestIncludedSessionId as string,
-            hasMore: msg.hasMore as boolean,
-          } : null
-          if (msg.clear) {
-            // First chunk of a multi-chunk update: start buffering instead of
-            // clearing Redux state (which causes the sidebar to collapse).
-            snapshotGeneration++
-            chunkedBuffer = [...projects]
-            pendingPaginationMeta = paginationMeta
-            scheduleChunkedFlush()
-          } else if (msg.append) {
-            if (chunkedBuffer) {
-              // Subsequent chunk while buffering: accumulate
-              chunkedBuffer.push(...projects)
-              scheduleChunkedFlush()
-            } else {
-              // Append after the flush window can still occur on slow links.
-              // Merge like a partial snapshot so split projects keep earlier sessions.
-              dispatch(mergeSnapshotProjects(projects))
-              dispatch(markWsSnapshotReceived())
-            }
-          } else {
-            // Single-chunk update (no clear/append flags): apply immediately
-            snapshotGeneration++
-            if (chunkedBuffer) flushChunkedBuffer()
-            // When paginated, merge to preserve older sessions loaded via scroll.
-            if (paginationMeta?.hasMore) {
-              dispatch(mergeSnapshotProjects(projects))
-            } else {
-              dispatch(setProjects(projects))
-            }
-            dispatch(markWsSnapshotReceived())
-            // Reset any stale load-more guard — the snapshot invalidated it
-            dispatch(setLoadingMore(false))
-            if (paginationMeta) {
-              dispatch(setPaginationMeta({
-                totalSessions: paginationMeta.totalSessions,
-                oldestLoadedTimestamp: paginationMeta.oldestIncludedTimestamp,
-                oldestLoadedSessionId: paginationMeta.oldestIncludedSessionId,
-                hasMore: paginationMeta.hasMore,
-              }))
-              activePaginationGeneration = snapshotGeneration
-            } else {
-              dispatch(clearPaginationMeta())
-              activePaginationGeneration = -1
-            }
-          }
-        }
-        if (msg.type === 'sessions.patch') {
-          // If a patch arrives while we're buffering a chunked update, flush
-          // the buffer first so the patch applies against a complete baseline.
-          if (chunkedBuffer) flushChunkedBuffer()
-          const upsertProjects = (msg.upsertProjects || []) as ProjectGroup[]
-          dispatch(applySessionsPatch({
-            upsertProjects,
-            removeProjectPaths: msg.removeProjectPaths || [],
-          }))
-        }
-        if (msg.type === 'sessions.page') {
-          // Ignore stale page responses from a previous snapshot generation
-          const sessionState = store.getState().sessions
-          if (activePaginationGeneration === snapshotGeneration && sessionState.hasMore != null) {
-            const projects = (msg.projects || []) as ProjectGroup[]
-            dispatch(appendSessionsPage(projects))
-            if (typeof msg.totalSessions === 'number') {
-              const incomingOldest = msg.oldestIncludedTimestamp as number
-              if (sessionState.oldestLoadedTimestamp === undefined || incomingOldest <= sessionState.oldestLoadedTimestamp) {
-                dispatch(setPaginationMeta({
-                  totalSessions: msg.totalSessions as number,
-                  oldestLoadedTimestamp: incomingOldest,
-                  oldestLoadedSessionId: msg.oldestIncludedSessionId as string,
-                  hasMore: msg.hasMore as boolean,
-                }))
-              }
-            }
-          }
+        if (msg.type === 'sessions.changed') {
+          void appStore.dispatch(refreshActiveSessionWindow() as any)
         }
         if (msg.type === 'settings.updated') {
           dispatch(setSettings(applyLocalTerminalFontFamily(msg.settings as AppSettings)))
@@ -559,22 +698,9 @@ export default function App() {
         if (msg.type === 'ui.command') {
           handleUiCommand(msg as Record<string, unknown>, {
             dispatch,
-            getState: store.getState,
+            getState: appStore.getState,
             send: (payload) => ws.send(payload),
           })
-        }
-        if (msg.type === 'terminal.meta.list.response') {
-          const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''
-          const requestedAt = requestId
-            ? terminalMetaListRequestStartedAtRef.current.get(requestId)
-            : undefined
-          if (requestId) {
-            terminalMetaListRequestStartedAtRef.current.delete(requestId)
-          }
-          dispatch(setTerminalMetaSnapshot({
-            terminals: msg.terminals || [],
-            requestedAt,
-          }))
         }
         if (msg.type === 'terminal.meta.updated') {
           const upsert = Array.isArray(msg.upsert) ? msg.upsert : []
@@ -585,6 +711,35 @@ export default function App() {
           const remove = Array.isArray(msg.remove) ? msg.remove : []
           for (const terminalId of remove) {
             dispatch(removeTerminalMeta(terminalId))
+          }
+        }
+        if (msg.type === 'codex.activity.list.response') {
+          const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''
+          if (!requestId) return
+          const requestSeq = codexActivityListRequestSeqRef.current.get(requestId)
+          codexActivityListRequestSeqRef.current.delete(requestId)
+          if (requestSeq === undefined) return
+          dispatch(setCodexActivitySnapshot({
+            terminals: msg.terminals || [],
+            requestSeq,
+          }))
+        }
+        if (msg.type === 'codex.activity.updated') {
+          const mutationSeq = ++codexActivityOrderRef.current
+          const upsert = Array.isArray(msg.upsert) ? msg.upsert : []
+          if (upsert.length > 0) {
+            dispatch(upsertCodexActivity({
+              terminals: upsert,
+              mutationSeq,
+            }))
+          }
+
+          const remove = Array.isArray(msg.remove) ? msg.remove : []
+          if (remove.length > 0) {
+            dispatch(removeCodexActivity({
+              terminalIds: remove,
+              mutationSeq,
+            }))
           }
         }
         if (msg.type === 'terminal.exit') {
@@ -631,120 +786,39 @@ export default function App() {
       })
 
       cleanup = () => {
+        stopWsDisconnectSync?.()
         unsubscribe()
-        clearChunkedState()
       }
       if (cleanedUp) cleanup()
 
       // ── HTTP bootstrap (async) ────────────────────────────────────
-      try {
-        const settings = await api.get('/api/settings')
-        if (!cancelled) dispatch(setSettings(applyLocalTerminalFontFamily(settings)))
-      } catch (err: any) {
-        if (handleBootstrapAuthFailure(err)) return
-        log.warn('Failed to load settings', err)
-      }
+      if (!(await loadBootstrapData())) return
 
-      try {
-        const platformInfo = await api.get<{
-          platform: string
-          availableClis?: Record<string, boolean>
-          hostName?: string
-          featureFlags?: Record<string, boolean>
-        }>('/api/platform')
-        if (!cancelled) {
-          dispatch(setPlatform(platformInfo.platform))
-          if (platformInfo.availableClis) {
-            dispatch(setAvailableClis(platformInfo.availableClis))
-          }
-          if (platformInfo.featureFlags) {
-            dispatch(setFeatureFlags(platformInfo.featureFlags))
-          }
-          dispatch(setTabRegistryDeviceMeta(resolveAndPersistDeviceMeta({
-            platform: platformInfo.platform,
-            hostName: platformInfo.hostName,
-          })))
-        }
-      } catch (err: any) {
-        if (handleBootstrapAuthFailure(err)) return
-        log.warn('Failed to load platform info', err)
-      }
+      if (!(await ensureSidebarSessionsWindow())) return
 
-      try {
-        const nextVersionInfo = await api.get<VersionInfo>('/api/version')
-        if (!cancelled && isVersionInfo(nextVersionInfo)) {
-          setVersionInfo(nextVersionInfo)
-        }
-      } catch (err: any) {
-        if (handleBootstrapAuthFailure(err)) return
-        log.warn('Failed to load version info', err)
-      }
-
-      try {
-        const sessionsRes = await api.get('/api/sessions?limit=100')
-        if (!cancelled) {
-          if (sessionsRes && typeof sessionsRes === 'object' && !Array.isArray(sessionsRes)) {
-            // Paginated response
-            dispatch(setProjects(sessionsRes.projects || []))
-            if (typeof sessionsRes.totalSessions === 'number') {
-              dispatch(setPaginationMeta({
-                totalSessions: sessionsRes.totalSessions,
-                oldestLoadedTimestamp: sessionsRes.oldestIncludedTimestamp,
-                oldestLoadedSessionId: sessionsRes.oldestIncludedSessionId,
-                hasMore: sessionsRes.hasMore,
-              }))
-            }
-          } else {
-            // Backward compat: raw array
-            dispatch(setProjects(sessionsRes))
-          }
-        }
-      } catch (err: any) {
-        if (handleBootstrapAuthFailure(err)) return
-        log.warn('Failed to load sessions', err)
-      }
+      if (!(await loadVersionInfo())) return
 
       // Load network status for remote access wizard/settings
-      if (!cancelled) dispatch(fetchNetworkStatus())
+      ensureNetworkStatusLoaded()
 
       // ── WebSocket connection / reconciliation ─────────────────────
       // Another component may have connected before App finished bootstrap.
-      // Reconcile state for the already-ready socket so sessions patches do not stay blocked.
+      // Reconcile state for the already-ready socket without waiting for a websocket-owned
+      // sidebar snapshot. The HTTP bootstrap window remains the source of truth.
       if (ws.isReady) {
         if (cancelled) return
+        resetCodexActivityOverlay()
         dispatch(setError(undefined))
         dispatch(setStatus('ready'))
         dispatch(setServerInstanceId(ws.serverInstanceId))
         dispatch(resetWsSnapshotReceived())
 
-        const promoted = promoteRecentHttpSessionsBaseline()
-        if (!promoted) {
-          try {
-            const sessionsRes = await api.get('/api/sessions?limit=100')
-            if (!cancelled) {
-              if (sessionsRes && typeof sessionsRes === 'object' && !Array.isArray(sessionsRes)) {
-                dispatch(setProjects(sessionsRes.projects || []))
-                dispatch(markWsSnapshotReceived())
-                if (typeof sessionsRes.totalSessions === 'number') {
-                  dispatch(setPaginationMeta({
-                    totalSessions: sessionsRes.totalSessions,
-                    oldestLoadedTimestamp: sessionsRes.oldestIncludedTimestamp,
-                    oldestLoadedSessionId: sessionsRes.oldestIncludedSessionId,
-                    hasMore: sessionsRes.hasMore,
-                  }))
-                }
-              } else {
-                dispatch(setProjects(sessionsRes))
-                dispatch(markWsSnapshotReceived())
-              }
-            }
-          } catch (err: any) {
-            if (handleBootstrapAuthFailure(err)) return
-            log.warn('Failed to refresh sessions for pre-connected websocket', err)
-          }
-        }
+        promoteRecentHttpSessionsBaseline()
 
-        if (!cancelled) requestTerminalMetaList()
+        if (!cancelled) {
+          requestCodexActivityList()
+        }
+        void recoverMissingStartupState()
         return
       }
       dispatch(setError(undefined))
@@ -755,6 +829,7 @@ export default function App() {
         if (!cancelled) dispatch(setStatus('ready'))
       } catch (err: any) {
         if (!cancelled) {
+          resetCodexActivityOverlay()
           dispatch(setStatus('disconnected'))
           dispatch(setError(err?.message || 'WebSocket connection failed'))
           if (typeof err?.wsCloseCode === 'number') {
@@ -771,9 +846,10 @@ export default function App() {
       cleanedUp = true
       cleanup?.()
       stopTabRegistrySync?.()
+      stopWsDisconnectSync?.()
       void cleanupPromise
     }
-  }, [dispatch])
+  }, [appStore, dispatch])
 
   // Auto-show setup wizard on first run (unconfigured + localhost)
   useEffect(() => {
@@ -811,22 +887,14 @@ export default function App() {
     }
 
     function onKeyDown(e: KeyboardEvent) {
-      if (isTextInput(e.target)) return
-
-      // Tab switching: Ctrl+Shift+[ (prev) and Ctrl+Shift+] (next)
-      // Also handled in TerminalView.tsx for when terminal is focused
-      if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey) {
-        if (e.code === 'BracketLeft') {
-          e.preventDefault()
-          dispatch(switchToPrevTab())
-          return
-        }
-        if (e.code === 'BracketRight') {
-          e.preventDefault()
-          dispatch(switchToNextTab())
-          return
-        }
+      const tabSwitchDirection = getTabSwitchShortcutDirection(e)
+      if (tabSwitchDirection) {
+        e.preventDefault()
+        dispatch(tabSwitchDirection === 'prev' ? switchToPrevTab() : switchToNextTab())
+        return
       }
+
+      if (isTextInput(e.target)) return
     }
 
     window.addEventListener('keydown', onKeyDown)

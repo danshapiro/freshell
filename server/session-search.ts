@@ -22,7 +22,7 @@ export type SearchMatch = z.infer<typeof SearchMatchSchema>
 
 export const SearchResultSchema = z.object({
   sessionId: z.string(),
-  provider: z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi']),
+  provider: z.string().min(1),
   projectPath: z.string(),
   title: z.string().optional(),
   summary: z.string().optional(),
@@ -173,7 +173,7 @@ export function extractAllMessages(content: string): string[] {
   return messages
 }
 
-function extractSnippet(text: string, query: string, contextLength = 50): string {
+export function extractSnippet(text: string, query: string, contextLength = 50): string {
   const lowerText = text.toLowerCase()
   const lowerQuery = query.toLowerCase()
   const index = lowerText.indexOf(lowerQuery)

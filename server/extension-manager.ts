@@ -172,6 +172,19 @@ export class ExtensionManager extends EventEmitter {
         clientEntry.picker = manifest.picker
       }
 
+      if (manifest.category === 'cli' && manifest.cli) {
+        const resumeCommandTemplate = manifest.cli.resumeArgs
+          ? [manifest.cli.command, ...manifest.cli.resumeArgs]
+          : undefined
+        clientEntry.cli = {
+          supportsPermissionMode: manifest.cli.supportsPermissionMode,
+          supportsModel: manifest.cli.supportsModel,
+          supportsSandbox: manifest.cli.supportsSandbox,
+          supportsResume: !!manifest.cli.resumeArgs,
+          resumeCommandTemplate,
+        }
+      }
+
       return clientEntry
     })
   }

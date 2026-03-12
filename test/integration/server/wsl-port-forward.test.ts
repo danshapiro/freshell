@@ -22,23 +22,29 @@ describe('WSL port forwarding bootstrap integration', () => {
 
     // Check import exists
     expect(indexContent).toContain("import { setupWslPortForwarding } from './wsl-port-forward.js'")
+    expect(indexContent).toContain('shouldSetupWslPortForwardingAtStartup')
+    expect(indexContent).toContain("from './wsl-port-forward-startup.js'")
 
-    // Check conditional call exists — only when bound to all interfaces
-    expect(indexContent).toContain("if (bindHost === '0.0.0.0')")
+    // Check conditional call exists — only when the startup gate allows it
+    expect(indexContent).toContain('shouldSetupWslPortForwardingAtStartup(bindHost, process.env)')
     expect(indexContent).toMatch(/setupWslPortForwarding\(/)
 
     // Verify ordering: validateStartupSecurity must come before setupWslPortForwarding
     const validatePos = indexContent.indexOf('validateStartupSecurity()')
+    const startupGatePos = indexContent.indexOf('shouldSetupWslPortForwardingAtStartup(bindHost, process.env)')
     const setupCallPos = indexContent.indexOf('setupWslPortForwarding(')
 
     expect(validatePos).toBeGreaterThan(-1)
+    expect(startupGatePos).toBeGreaterThan(-1)
     expect(setupCallPos).toBeGreaterThan(-1)
     expect(setupCallPos).toBeGreaterThan(validatePos)
+    expect(setupCallPos).toBeGreaterThan(startupGatePos)
 
     // Verify both are inside main() (after "async function main()")
     const mainFnPos = indexContent.indexOf('async function main()')
     expect(mainFnPos).toBeGreaterThan(-1)
     expect(validatePos).toBeGreaterThan(mainFnPos)
+    expect(startupGatePos).toBeGreaterThan(mainFnPos)
     expect(setupCallPos).toBeGreaterThan(mainFnPos)
   })
 

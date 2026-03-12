@@ -3,9 +3,11 @@ export type LayoutSnapshot = {
   activeTabId?: string | null
   layouts: Record<string, any>
   activePane: Record<string, string>
+  paneTitles?: Record<string, Record<string, string>>
 }
 
 type ResolveResult = { tabId?: string; paneId?: string; message?: string }
+const AMBIGUOUS_PANE_TARGET_MESSAGE = 'pane target is ambiguous; use pane id or tab.pane index'
 
 type Leaf = { id: string; content?: { terminalId?: string } }
 
@@ -77,6 +79,16 @@ export function resolveTarget(target: string, snapshot: LayoutSnapshot): Resolve
       return { tabId: activeTabId, paneId: pane?.id, message: 'active tab used' }
     }
   }
+
+  let titleMatch: ResolveResult | undefined
+  for (const [tabId, leaves] of panesByTab.entries()) {
+    for (const leaf of leaves) {
+      if (snapshot.paneTitles?.[tabId]?.[leaf.id] !== clean) continue
+      if (titleMatch) return { message: AMBIGUOUS_PANE_TARGET_MESSAGE }
+      titleMatch = { tabId, paneId: leaf.id }
+    }
+  }
+  if (titleMatch) return titleMatch
 
   return { message: 'target not resolved' }
 }

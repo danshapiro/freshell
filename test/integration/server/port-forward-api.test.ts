@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterAll, afterEach, vi } from 'vitest'
 import express, { type Express } from 'express'
 import request from 'supertest'
 import * as net from 'net'
@@ -7,7 +7,6 @@ import { PortForwardManager } from '../../../server/port-forward.js'
 import { parseTrustProxyEnv } from '../../../server/request-ip.js'
 import { createProxyRouter } from '../../../server/proxy-router.js'
 
-// Mock logger to avoid pino setup in test
 vi.mock('../../../server/logger', () => {
   const logger = {
     info: vi.fn(),
@@ -24,7 +23,6 @@ vi.mock('../../../server/logger', () => {
 
 const TEST_AUTH_TOKEN = 'test-auth-token-12345678'
 
-// Helper: create a TCP server on localhost that echoes data back
 function createEchoServer(): Promise<{ server: net.Server; port: number }> {
   return new Promise((resolve) => {
     const server = net.createServer((socket) => {
@@ -37,12 +35,56 @@ function createEchoServer(): Promise<{ server: net.Server; port: number }> {
   })
 }
 
+function waitForForwardedPortToClose(port: number, timeoutMs = 2_000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now()
+
+    const attempt = () => {
+      const socket = net.createConnection({ host: '127.0.0.1', port })
+      let settled = false
+
+      const cleanup = () => {
+        socket.removeAllListeners()
+      }
+
+      socket.once('connect', () => {
+        cleanup()
+        socket.destroy()
+        if (Date.now() - startedAt >= timeoutMs) {
+          reject(new Error(`Forwarded port ${port} was still accepting connections`))
+          return
+        }
+        setTimeout(attempt, 25)
+      })
+
+      socket.once('error', () => {
+        settled = true
+        cleanup()
+        resolve()
+      })
+
+      socket.setTimeout(250, () => {
+        if (settled) return
+        cleanup()
+        socket.destroy(new Error('timeout'))
+        if (Date.now() - startedAt >= timeoutMs) {
+          reject(new Error(`Timed out waiting for forwarded port ${port} to close`))
+          return
+        }
+        setTimeout(attempt, 25)
+      })
+    }
+
+    attempt()
+  })
+}
+
 describe('Port Forward API Integration', () => {
   let app: Express
   let manager: PortForwardManager
   let echoServer: { server: net.Server; port: number } | null = null
 
-  beforeAll(() => {
+  beforeEach(() => {
     process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
     process.env.FRESHELL_TRUST_PROXY = 'loopback'
     manager = new PortForwardManager({ idleTimeoutMs: 60_000 })
@@ -51,7 +93,6 @@ describe('Port Forward API Integration', () => {
     app.use(express.json({ limit: '1mb' }))
     app.set('trust proxy', parseTrustProxyEnv(process.env.FRESHELL_TRUST_PROXY))
 
-    // Auth middleware (matches server/auth.ts)
     app.use('/api', (req, res, next) => {
       const token = process.env.AUTH_TOKEN
       const provided = req.headers['x-auth-token'] as string | undefined
@@ -61,14 +102,11 @@ describe('Port Forward API Integration', () => {
       next()
     })
 
-    // Mount the real proxy router with the real PortForwardManager
     app.use('/api/proxy', createProxyRouter({ portForwardManager: manager }))
   })
 
   afterEach(async () => {
-    const targetPorts = [...((manager as any).forwards?.keys?.() ?? [])] as number[]
-    await Promise.all(targetPorts.map((targetPort) => manager.close(targetPort)))
-
+    await manager.closeAll()
     if (echoServer) {
       await new Promise<void>((resolve) => {
         echoServer?.server.close(() => resolve())
@@ -77,8 +115,8 @@ describe('Port Forward API Integration', () => {
     }
   })
 
-  afterAll(async () => {
-    await manager.closeAll()
+  afterAll(() => {
+    delete process.env.AUTH_TOKEN
     delete process.env.FRESHELL_TRUST_PROXY
   })
 
@@ -223,20 +261,20 @@ describe('Port Forward API Integration', () => {
     it('closes an existing forward', async () => {
       echoServer = await createEchoServer()
 
-      // Create the forward
       const res = await request(app)
         .post('/api/proxy/forward')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .send({ port: echoServer.port })
         .expect(200)
+      const forwardedPort = res.body.forwardedPort
 
-      // Delete it
       await request(app)
         .delete(`/api/proxy/forward/${echoServer.port}`)
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .expect(200)
 
       expect(manager.getForwardedPort(echoServer.port, 'loopback')).toBeUndefined()
+      await waitForForwardedPortToClose(forwardedPort)
     })
 
     it('is a no-op for non-existent forwards', async () => {

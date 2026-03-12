@@ -6,6 +6,7 @@ import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
+import terminalDirectoryReducer from '@/store/terminalDirectorySlice'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 
 const wsMocks = vi.hoisted(() => ({
@@ -15,12 +16,7 @@ const wsMocks = vi.hoisted(() => ({
   onReconnect: vi.fn().mockReturnValue(() => {}),
 }))
 
-const runtimeMocks = vi.hoisted(() => ({
-  findNext: vi.fn(() => true),
-  findPrevious: vi.fn(() => true),
-  clearDecorations: vi.fn(),
-  onDidChangeResults: vi.fn(() => ({ dispose: vi.fn() })),
-}))
+const searchTerminalViewMock = vi.hoisted(() => vi.fn())
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -31,11 +27,16 @@ vi.mock('@/lib/ws-client', () => ({
   }),
 }))
 
-vi.mock('@/lib/api', () => ({
-  api: {
-    patch: vi.fn().mockResolvedValue({}),
-  },
-}))
+vi.mock('@/lib/api', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api')
+  return {
+    ...actual,
+    api: {
+      patch: vi.fn().mockResolvedValue({}),
+    },
+    searchTerminalView: (...args: any[]) => searchTerminalViewMock(...args),
+  }
+})
 
 vi.mock('@/lib/clipboard', () => ({
   copyText: vi.fn().mockResolvedValue(true),
@@ -50,10 +51,6 @@ vi.mock('@/components/terminal/terminal-runtime', () => ({
   createTerminalRuntime: () => ({
     attachAddons: vi.fn(),
     fit: vi.fn(),
-    findNext: runtimeMocks.findNext,
-    findPrevious: runtimeMocks.findPrevious,
-    clearDecorations: runtimeMocks.clearDecorations,
-    onDidChangeResults: runtimeMocks.onDidChangeResults,
     dispose: vi.fn(),
     webglActive: vi.fn(() => false),
   }),
@@ -65,7 +62,6 @@ vi.mock('lucide-react', () => ({
 
 let capturedKeyHandler: ((event: KeyboardEvent) => boolean) | null = null
 let capturedTerminal: { focus: ReturnType<typeof vi.fn> } | null = null
-
 let capturedTerminalOptions: Record<string, unknown> | null = null
 
 vi.mock('@xterm/xterm', () => {
@@ -129,6 +125,7 @@ function createTestStore() {
         panes: panesReducer,
         settings: settingsReducer,
         connection: connectionReducer,
+        terminalDirectory: terminalDirectoryReducer,
       },
       preloadedState: {
         tabs: {
@@ -158,7 +155,10 @@ function createTestStore() {
   }
 }
 
-function createKeyboardEvent(key: string, modifiers: { ctrlKey?: boolean; shiftKey?: boolean; altKey?: boolean; metaKey?: boolean } = {}): KeyboardEvent {
+function createKeyboardEvent(
+  key: string,
+  modifiers: { ctrlKey?: boolean; shiftKey?: boolean; altKey?: boolean; metaKey?: boolean } = {},
+): KeyboardEvent {
   return {
     key,
     code: key === 'f' ? 'KeyF' : `Key${key.toUpperCase()}`,
@@ -172,13 +172,20 @@ function createKeyboardEvent(key: string, modifiers: { ctrlKey?: boolean; shiftK
   } as unknown as KeyboardEvent
 }
 
+function createDeferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((innerResolve) => {
+    resolve = innerResolve
+  })
+  return { promise, resolve }
+}
+
 describe('TerminalView search', () => {
   beforeEach(() => {
     capturedKeyHandler = null
     capturedTerminal = null
     capturedTerminalOptions = null
-    runtimeMocks.findNext.mockClear()
-    runtimeMocks.findPrevious.mockClear()
+    searchTerminalViewMock.mockReset()
     vi.stubGlobal('ResizeObserver', MockResizeObserver)
     vi.stubGlobal('requestAnimationFrame', (cb: FrameRequestCallback) => {
       cb(0)
@@ -191,7 +198,15 @@ describe('TerminalView search', () => {
     vi.unstubAllGlobals()
   })
 
-  it('opens search on Ctrl+F and supports next/previous/escape', async () => {
+  it('opens search on Ctrl+F, uses the server-owned search route, and cycles matches', async () => {
+    searchTerminalViewMock.mockResolvedValue({
+      matches: [
+        { line: 1, column: 0, text: 'needle one' },
+        { line: 5, column: 4, text: 'needle two' },
+      ],
+      nextCursor: null,
+    })
+
     const { store, tabId, paneId, paneContent } = createTestStore()
 
     render(
@@ -211,40 +226,53 @@ describe('TerminalView search', () => {
 
     const input = await screen.findByRole('textbox', { name: 'Terminal search' })
     fireEvent.change(input, { target: { value: 'needle' } })
-    // Should include decorations for visible match highlighting
-    expect(runtimeMocks.findNext).toHaveBeenCalledWith('needle', expect.objectContaining({
-      caseSensitive: false,
-      incremental: true,
-      decorations: expect.objectContaining({
-        matchOverviewRuler: expect.any(String),
-        activeMatchColorOverviewRuler: expect.any(String),
-      }),
-    }))
+
+    await waitFor(() => {
+      expect(searchTerminalViewMock).toHaveBeenCalledWith(
+        'term-1',
+        { query: 'needle' },
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      )
+    })
+    await waitFor(() => {
+      expect(screen.getByText('1 of 2')).toBeInTheDocument()
+    })
 
     fireEvent.keyDown(input, { key: 'Enter' })
-    expect(runtimeMocks.findNext).toHaveBeenCalledWith('needle', expect.objectContaining({
-      decorations: expect.objectContaining({
-        matchOverviewRuler: expect.any(String),
-        activeMatchColorOverviewRuler: expect.any(String),
-      }),
-    }))
+    await waitFor(() => {
+      expect(screen.getByText('2 of 2')).toBeInTheDocument()
+    })
 
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: true })
-    expect(runtimeMocks.findPrevious).toHaveBeenCalledWith('needle', expect.objectContaining({
-      decorations: expect.objectContaining({
-        matchOverviewRuler: expect.any(String),
-        activeMatchColorOverviewRuler: expect.any(String),
-      }),
-    }))
+    await waitFor(() => {
+      expect(screen.getByText('1 of 2')).toBeInTheDocument()
+    })
 
     fireEvent.keyDown(input, { key: 'Escape' })
     await waitFor(() => {
       expect(screen.queryByRole('textbox', { name: 'Terminal search' })).not.toBeInTheDocument()
     })
+    expect(store.getState().terminalDirectory.searches['term-1']).toBeUndefined()
     expect(capturedTerminal?.focus).toHaveBeenCalled()
   })
 
-  it('calls clearDecorations when closing search', async () => {
+  it('aborts stale server-owned searches when the query changes', async () => {
+    const first = createDeferred<{ matches: Array<{ line: number; column: number; text: string }>; nextCursor: null }>()
+    const signals: AbortSignal[] = []
+
+    searchTerminalViewMock
+      .mockImplementationOnce((_terminalId: string, _query: { query: string }, options: { signal?: AbortSignal }) => {
+        if (options.signal) signals.push(options.signal)
+        return first.promise
+      })
+      .mockImplementationOnce((_terminalId: string, _query: { query: string }, options: { signal?: AbortSignal }) => {
+        if (options.signal) signals.push(options.signal)
+        return Promise.resolve({
+          matches: [{ line: 2, column: 1, text: 'needle two' }],
+          nextCursor: null,
+        })
+      })
+
     const { store, tabId, paneId, paneContent } = createTestStore()
 
     render(
@@ -257,28 +285,34 @@ describe('TerminalView search', () => {
       expect(capturedKeyHandler).not.toBeNull()
     })
 
-    // Open search
     capturedKeyHandler!(createKeyboardEvent('f', { ctrlKey: true }))
     const input = await screen.findByRole('textbox', { name: 'Terminal search' })
 
-    // Type something to trigger decorations
-    fireEvent.change(input, { target: { value: 'test' } })
-
-    // Close search
-    fireEvent.keyDown(input, { key: 'Escape' })
+    fireEvent.change(input, { target: { value: 'need' } })
     await waitFor(() => {
-      expect(screen.queryByRole('textbox', { name: 'Terminal search' })).not.toBeInTheDocument()
+      expect(searchTerminalViewMock).toHaveBeenCalledTimes(1)
     })
 
-    expect(runtimeMocks.clearDecorations).toHaveBeenCalled()
+    fireEvent.change(input, { target: { value: 'needle' } })
+    await waitFor(() => {
+      expect(searchTerminalViewMock).toHaveBeenCalledTimes(2)
+    })
+
+    expect(signals).toHaveLength(2)
+    expect(signals[0].aborted).toBe(true)
+    expect(signals[1].aborted).toBe(false)
+
+    first.resolve({ matches: [], nextCursor: null })
+
+    await waitFor(() => {
+      expect(screen.getByText('1 of 1')).toBeInTheDocument()
+    })
   })
 
-  it('displays result count from onDidChangeResults', async () => {
-    // Set up onDidChangeResults to capture the callback and allow triggering it
-    let resultsCallback: ((event: { resultIndex: number; resultCount: number }) => void) | null = null
-    runtimeMocks.onDidChangeResults.mockImplementation((cb: (event: { resultIndex: number; resultCount: number }) => void) => {
-      resultsCallback = cb
-      return { dispose: vi.fn() }
+  it('displays "No results" when the server search returns no matches', async () => {
+    searchTerminalViewMock.mockResolvedValue({
+      matches: [],
+      nextCursor: null,
     })
 
     const { store, tabId, paneId, paneContent } = createTestStore()
@@ -293,17 +327,12 @@ describe('TerminalView search', () => {
       expect(capturedKeyHandler).not.toBeNull()
     })
 
-    // Open search
     capturedKeyHandler!(createKeyboardEvent('f', { ctrlKey: true }))
-    await screen.findByRole('textbox', { name: 'Terminal search' })
+    const input = await screen.findByRole('textbox', { name: 'Terminal search' })
+    fireEvent.change(input, { target: { value: 'nonexistent' } })
 
-    // Simulate search results from the addon
-    expect(resultsCallback).not.toBeNull()
-    resultsCallback!({ resultIndex: 2, resultCount: 5 })
-
-    // Should display "3 of 5" (resultIndex is 0-based)
     await waitFor(() => {
-      expect(screen.getByText('3 of 5')).toBeInTheDocument()
+      expect(screen.getByText('No results')).toBeInTheDocument()
     })
   })
 
@@ -323,38 +352,5 @@ describe('TerminalView search', () => {
     expect(capturedTerminalOptions).toEqual(
       expect.objectContaining({ allowProposedApi: true }),
     )
-  })
-
-  it('displays "No results" when search finds nothing', async () => {
-    let resultsCallback: ((event: { resultIndex: number; resultCount: number }) => void) | null = null
-    runtimeMocks.onDidChangeResults.mockImplementation((cb: (event: { resultIndex: number; resultCount: number }) => void) => {
-      resultsCallback = cb
-      return { dispose: vi.fn() }
-    })
-
-    const { store, tabId, paneId, paneContent } = createTestStore()
-
-    render(
-      <Provider store={store}>
-        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
-      </Provider>,
-    )
-
-    await waitFor(() => {
-      expect(capturedKeyHandler).not.toBeNull()
-    })
-
-    capturedKeyHandler!(createKeyboardEvent('f', { ctrlKey: true }))
-    const input = await screen.findByRole('textbox', { name: 'Terminal search' })
-
-    // Type something
-    fireEvent.change(input, { target: { value: 'nonexistent' } })
-
-    // Simulate no results
-    resultsCallback!({ resultIndex: -1, resultCount: 0 })
-
-    await waitFor(() => {
-      expect(screen.getByText('No results')).toBeInTheDocument()
-    })
   })
 })

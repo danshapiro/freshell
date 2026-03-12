@@ -1,5 +1,12 @@
 import { createSlice, type PayloadAction } from '@reduxjs/toolkit'
-import type { AgentChatState, ChatContentBlock, ChatSessionState, QuestionDefinition } from './agentChatTypes'
+import type {
+  AgentChatState,
+  AgentTimelineItem,
+  ChatContentBlock,
+  ChatMessage,
+  ChatSessionState,
+  QuestionDefinition,
+} from './agentChatTypes'
 
 const initialState: AgentChatState = {
   sessions: {},
@@ -14,6 +21,8 @@ function ensureSession(state: AgentChatState, sessionId: string): ChatSessionSta
       sessionId,
       status: 'starting',
       messages: [],
+      timelineItems: [],
+      timelineBodies: {},
       streamingText: '',
       streamingActive: false,
       pendingPermissions: {},
@@ -52,6 +61,16 @@ const agentChatSlice = createSlice({
       session.cwd = action.payload.cwd
       session.tools = action.payload.tools
       session.status = 'connected'
+    },
+
+    sessionSnapshotReceived(state, action: PayloadAction<{
+      sessionId: string
+      latestTurnId: string | null
+      status: ChatSessionState['status']
+    }>) {
+      const session = ensureSession(state, action.payload.sessionId)
+      session.latestTurnId = action.payload.latestTurnId
+      session.status = action.payload.status
     },
 
     addUserMessage(state, action: PayloadAction<{
@@ -179,18 +198,43 @@ const agentChatSlice = createSlice({
       session.streamingActive = false
     },
 
-    replayHistory(state, action: PayloadAction<{
+    timelineLoadStarted(state, action: PayloadAction<{ sessionId: string }>) {
+      const session = state.sessions[action.payload.sessionId]
+      if (!session) return
+      session.timelineLoading = true
+      session.timelineError = undefined
+    },
+
+    timelinePageReceived(state, action: PayloadAction<{
       sessionId: string
-      messages: Array<{ role: 'user' | 'assistant'; content: ChatContentBlock[]; timestamp?: string }>
+      items: AgentTimelineItem[]
+      nextCursor: string | null
+      revision: number
+      replace?: boolean
     }>) {
       const session = ensureSession(state, action.payload.sessionId)
-      // Replace messages (not append) — server sends full history on attach/reconnect
-      session.messages = action.payload.messages.map((msg) => ({
-        role: msg.role,
-        content: msg.content,
-        timestamp: msg.timestamp || new Date().toISOString(),
-      }))
+      session.timelineItems = action.payload.replace === false
+        ? [...session.timelineItems, ...action.payload.items]
+        : action.payload.items
+      session.nextTimelineCursor = action.payload.nextCursor
+      session.timelineLoading = false
+      session.timelineError = undefined
       session.historyLoaded = true
+    },
+
+    timelineLoadFailed(state, action: PayloadAction<{ sessionId: string; message: string }>) {
+      const session = ensureSession(state, action.payload.sessionId)
+      session.timelineLoading = false
+      session.timelineError = action.payload.message
+    },
+
+    turnBodyReceived(state, action: PayloadAction<{
+      sessionId: string
+      turnId: string
+      message: ChatMessage
+    }>) {
+      const session = ensureSession(state, action.payload.sessionId)
+      session.timelineBodies[action.payload.turnId] = action.payload.message
     },
 
     sessionError(state, action: PayloadAction<{ sessionId: string; message: string }>) {
@@ -228,6 +272,7 @@ const agentChatSlice = createSlice({
 export const {
   sessionCreated,
   sessionInit,
+  sessionSnapshotReceived,
   addUserMessage,
   addAssistantMessage,
   setStreaming,
@@ -240,7 +285,10 @@ export const {
   setSessionStatus,
   turnResult,
   sessionExited,
-  replayHistory,
+  timelineLoadStarted,
+  timelinePageReceived,
+  timelineLoadFailed,
+  turnBodyReceived,
   sessionError,
   markSessionLost,
   clearPendingCreate,

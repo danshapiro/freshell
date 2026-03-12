@@ -115,38 +115,45 @@ describe('ws terminal metadata protocol', () => {
     await new Promise<void>((resolve) => server.close(() => resolve()))
   })
 
-  it('returns terminal.meta.list.response for terminal.meta.list requests', async () => {
+  it('broadcasts terminals.changed revision invalidations', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
     ws.send(JSON.stringify({ type: 'hello', token: 'terminal-meta-token', protocolVersion: WS_PROTOCOL_VERSION }))
     await waitForMessage(ws, (msg) => msg.type === 'ready')
 
-    ws.send(JSON.stringify({ type: 'terminal.meta.list', requestId: 'req-meta-1' }))
-    const response = await waitForMessage(
-      ws,
-      (msg) => msg.type === 'terminal.meta.list.response' && msg.requestId === 'req-meta-1',
-    )
+    wsHandler.broadcastTerminalsChanged()
 
-    expect(response.terminals).toEqual(sampleMeta)
+    const changed = await waitForMessage(ws, (msg) => msg.type === 'terminals.changed')
+    expect(changed).toEqual({
+      type: 'terminals.changed',
+      revision: 1,
+    })
     ws.close()
   })
 
-  it('broadcasts terminal.meta.updated payloads', async () => {
+  it('broadcasts terminal.runtime.updated payloads', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
     ws.send(JSON.stringify({ type: 'hello', token: 'terminal-meta-token', protocolVersion: WS_PROTOCOL_VERSION }))
     await waitForMessage(ws, (msg) => msg.type === 'ready')
 
-    wsHandler.broadcastTerminalMetaUpdated({
-      upsert: sampleMeta as any,
-      remove: [],
+    wsHandler.broadcastTerminalRuntimeUpdated({
+      terminalId: 'term-1',
+      title: 'Shell',
+      status: 'running',
+      cwd: '/workspace/repo',
+      pid: 4242,
     })
 
-    const updated = await waitForMessage(ws, (msg) => msg.type === 'terminal.meta.updated')
+    const updated = await waitForMessage(ws, (msg) => msg.type === 'terminal.runtime.updated')
     expect(updated).toEqual({
-      type: 'terminal.meta.updated',
-      upsert: sampleMeta,
-      remove: [],
+      type: 'terminal.runtime.updated',
+      terminalId: 'term-1',
+      revision: 1,
+      title: 'Shell',
+      status: 'running',
+      cwd: '/workspace/repo',
+      pid: 4242,
     })
     ws.close()
   })

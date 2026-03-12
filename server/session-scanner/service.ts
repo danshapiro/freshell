@@ -11,14 +11,16 @@ import os from 'os'
 import { glob } from 'glob'
 import { EventEmitter } from 'events'
 import { logger } from '../logger.js'
-import { getClaudeProjectsDir } from '../claude-home.js'
+import { getClaudeHome, getClaudeProjectsDir } from '../claude-home.js'
 import { createSessionScanner } from './scanner.js'
 import { SessionCache } from './cache.js'
 import { SessionRepairQueue, type Priority, ACTIVE_CACHE_GRACE_MS } from './queue.js'
+import { ClaudeHistoryRepairer } from './history-repair.js'
 import type { SessionScanner, SessionScanResult, SessionRepairResult } from './types.js'
 
 const BACKUP_RETENTION_DAYS = 30
 const CACHE_FILENAME = 'session-cache.json'
+const TOP_LEVEL_SESSION_GLOB = '*/*.jsonl'
 
 export interface SessionRepairServiceOptions {
   /** Directory to store cache file. Defaults to ~/.freshell */
@@ -42,13 +44,17 @@ export class SessionRepairService extends EventEmitter {
   private sessionPathIndex = new Map<string, string>()
   private indexInitialized = false
   private filePathResolver?: (sessionId: string) => string | undefined
+  private historyRepairer: ClaudeHistoryRepairer
 
   constructor(options: SessionRepairServiceOptions = {}) {
     super()
     this.cacheDir = options.cacheDir || path.join(os.homedir(), '.freshell')
     this.scanner = options.scanner || createSessionScanner()
     this.cache = new SessionCache(path.join(this.cacheDir, CACHE_FILENAME))
-    this.queue = new SessionRepairQueue(this.scanner, this.cache)
+    this.historyRepairer = new ClaudeHistoryRepairer({ claudeHome: getClaudeHome() })
+    this.queue = new SessionRepairQueue(this.scanner, this.cache, {
+      postScan: async (result) => this.ensureSessionArtifacts(result),
+    })
     this.claudeBase = getClaudeProjectsDir()
     this.filePathResolver = options.getFilePathForSession
 
@@ -82,6 +88,9 @@ export class SessionRepairService extends EventEmitter {
 
     // Cleanup old backups
     await this.cleanupOldBackups()
+
+    // Discover top-level Claude sessions so automatic repair covers dormant sessions too.
+    await this.discoverTopLevelSessions()
 
     // Start background processing
     this.queue.start()
@@ -147,6 +156,7 @@ export class SessionRepairService extends EventEmitter {
     // Check if already processed
     const existing = this.queue.getResult(sessionId)
     if (existing) {
+      await this.ensureSessionArtifacts(existing)
       return existing
     }
 
@@ -170,6 +180,7 @@ export class SessionRepairService extends EventEmitter {
       if (fileSessionId !== sessionId) {
         this.queue.seedResult(sessionId, normalized)
       }
+      await this.ensureSessionArtifacts(normalized)
       return normalized
     }
     if (fileSessionId !== sessionId && this.queue.has(fileSessionId)) {
@@ -178,6 +189,7 @@ export class SessionRepairService extends EventEmitter {
         ? result
         : { ...result, sessionId }
       this.queue.seedResult(sessionId, normalized)
+      await this.ensureSessionArtifacts(normalized)
       return normalized
     }
 
@@ -191,6 +203,7 @@ export class SessionRepairService extends EventEmitter {
         ? cached
         : { ...cached, sessionId }
       this.queue.seedResult(sessionId, normalized)
+      await this.ensureSessionArtifacts(normalized)
       return normalized
     }
 
@@ -288,6 +301,45 @@ export class SessionRepairService extends EventEmitter {
     } catch (err) {
       logger.debug({ err, sessionId }, 'Failed to resolve session file path')
       return null
+    }
+  }
+
+  private async discoverTopLevelSessions(): Promise<void> {
+    try {
+      const matches = await glob(TOP_LEVEL_SESSION_GLOB, {
+        cwd: this.claudeBase,
+        absolute: true,
+        nodir: true,
+      })
+
+      if (matches.length === 0) return
+
+      const queued = matches.map((filePath) => {
+        const sessionId = path.basename(filePath, '.jsonl')
+        this.sessionPathIndex.set(sessionId, filePath)
+        return { sessionId, filePath, priority: 'disk' as const }
+      })
+      this.queue.enqueue(queued)
+    } catch (err) {
+      logger.warn({ err, claudeBase: this.claudeBase }, 'Failed to discover top-level Claude sessions for repair')
+    }
+  }
+
+  private async ensureSessionArtifacts(result: SessionScanResult): Promise<void> {
+    if (result.status === 'missing' || result.status === 'unreadable' || !result.filePath) {
+      return
+    }
+
+    try {
+      const historyResult = await this.historyRepairer.ensureHistoryEntryForFile(result.filePath)
+      if (historyResult.status === 'created') {
+        logger.info({ sessionId: result.sessionId, filePath: result.filePath }, 'Backfilled missing Claude history entry')
+      }
+    } catch (err) {
+      logger.warn(
+        { err, sessionId: result.sessionId, filePath: result.filePath },
+        'Failed to backfill Claude history entry'
+      )
     }
   }
 

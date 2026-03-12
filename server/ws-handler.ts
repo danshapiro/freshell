@@ -15,11 +15,10 @@ import type { SessionRepairService } from './session-scanner/service.js'
 import type { SessionScanResult, SessionRepairResult } from './session-scanner/types.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
 import type { SdkBridge } from './sdk-bridge.js'
-import type { SdkServerMessage } from '../shared/ws-protocol.js'
+import type { CodexActivityRecord, SdkServerMessage } from '../shared/ws-protocol.js'
 import type { ExtensionManager } from './extension-manager.js'
 import { TerminalStreamBroker } from './terminal-stream/broker.js'
-import { chunkProjects } from './ws-chunking.js'
-import { paginateProjects } from './session-pagination.js'
+import { buildSidebarOpenSessionKeys, type SidebarSessionLocator } from './sidebar-session-selection.js'
 import { loadSessionHistory, type ChatMessage } from './session-history-loader.js'
 import { TabRegistryRecordBaseSchema, TabRegistryRecordSchema } from './tabs-registry/types.js'
 import type { TabsRegistryStore } from './tabs-registry/store.js'
@@ -27,21 +26,17 @@ import {
   ErrorCode,
   ShellSchema,
   CodingCliProviderSchema,
-  TokenSummarySchema,
-  TerminalMetaRecordSchema,
-  TerminalMetaListResponseSchema,
   TerminalMetaUpdatedSchema,
+  CodexActivityListResponseSchema,
+  CodexActivityListSchema,
+  CodexActivityUpdatedSchema,
   HelloSchema,
   PingSchema,
-  TerminalCreateSchema,
   TerminalAttachSchema,
   TerminalDetachSchema,
   TerminalInputSchema,
   TerminalResizeSchema,
   TerminalKillSchema,
-  TerminalListSchema,
-  TerminalMetaListSchema,
-  CodingCliCreateSchema,
   CodingCliInputSchema,
   CodingCliKillSchema,
   SdkCreateSchema,
@@ -54,30 +49,45 @@ import {
   SdkSetModelSchema,
   SdkSetPermissionModeSchema,
   UiScreenshotResultSchema,
-  SessionsFetchSchema,
   WS_PROTOCOL_VERSION,
 } from '../shared/ws-protocol.js'
 import { UiLayoutSyncSchema } from './agent-api/layout-schema.js'
 import type { LayoutStore } from './agent-api/layout-store.js'
 
-const MAX_CONNECTIONS = Number(process.env.MAX_CONNECTIONS || 50)
-const HELLO_TIMEOUT_MS = Number(process.env.HELLO_TIMEOUT_MS || 5_000)
-const PING_INTERVAL_MS = Number(process.env.PING_INTERVAL_MS || 30_000)
-const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
-const WS_MAX_PAYLOAD_BYTES = Number(process.env.WS_MAX_PAYLOAD_BYTES || 16 * 1024 * 1024)
-const MAX_SCREENSHOT_BASE64_BYTES = Number(process.env.MAX_SCREENSHOT_BASE64_BYTES || 12 * 1024 * 1024)
-// Use ?? so only unset vars fall back; preserves explicit values in MAX_REGULAR_WS_MESSAGE_BYTES.
-const REGULAR_WS_MESSAGE_BYTES_ENV = process.env.MAX_REGULAR_WS_MESSAGE_BYTES ?? process.env.DEFAULT_WS_MESSAGE_BYTES
-const MAX_REGULAR_WS_MESSAGE_BYTES = Number(REGULAR_WS_MESSAGE_BYTES_ENV ?? 1 * 1024 * 1024)
-// Max payload size per WebSocket message for mobile browser compatibility (500KB)
-const MAX_CHUNK_BYTES = Number(process.env.MAX_WS_CHUNK_BYTES || 500 * 1024)
-// Drain-aware sending: wait for buffer to drop below threshold between chunks
-const DRAIN_THRESHOLD_BYTES = Number(process.env.WS_DRAIN_THRESHOLD_BYTES || 512 * 1024) // 512KB
-const DRAIN_TIMEOUT_MS = Number(process.env.WS_DRAIN_TIMEOUT_MS || 30_000) // 30s
+type WsHandlerConfig = {
+  maxConnections: number
+  helloTimeoutMs: number
+  pingIntervalMs: number
+  maxWsBufferedAmount: number
+  wsMaxPayloadBytes: number
+  maxScreenshotBase64Bytes: number
+  maxRegularWsMessageBytes: number
+  maxChunkBytes: number
+  drainThresholdBytes: number
+  drainTimeoutMs: number
+  terminalCreateRateLimit: number
+  terminalCreateRateWindowMs: number
+}
+
+function readWsHandlerConfig(): WsHandlerConfig {
+  // Use ?? so only unset vars fall back; preserves explicit MAX_REGULAR_WS_MESSAGE_BYTES values.
+  const regularWsMessageBytesEnv = process.env.MAX_REGULAR_WS_MESSAGE_BYTES ?? process.env.DEFAULT_WS_MESSAGE_BYTES
+  return {
+    maxConnections: Number(process.env.MAX_CONNECTIONS || 50),
+    helloTimeoutMs: Number(process.env.HELLO_TIMEOUT_MS || 5_000),
+    pingIntervalMs: Number(process.env.PING_INTERVAL_MS || 30_000),
+    maxWsBufferedAmount: Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024),
+    wsMaxPayloadBytes: Number(process.env.WS_MAX_PAYLOAD_BYTES || 16 * 1024 * 1024),
+    maxScreenshotBase64Bytes: Number(process.env.MAX_SCREENSHOT_BASE64_BYTES || 12 * 1024 * 1024),
+    maxRegularWsMessageBytes: Number(regularWsMessageBytesEnv ?? 1 * 1024 * 1024),
+    maxChunkBytes: Number(process.env.MAX_WS_CHUNK_BYTES || 500 * 1024),
+    drainThresholdBytes: Number(process.env.WS_DRAIN_THRESHOLD_BYTES || 512 * 1024),
+    drainTimeoutMs: Number(process.env.WS_DRAIN_TIMEOUT_MS || 30_000),
+    terminalCreateRateLimit: Number(process.env.TERMINAL_CREATE_RATE_LIMIT || 10),
+    terminalCreateRateWindowMs: Number(process.env.TERMINAL_CREATE_RATE_WINDOW_MS || 10_000),
+  }
+}
 const DRAIN_POLL_INTERVAL_MS = 50
-// Rate limit: max terminal.create requests per client within a sliding window
-const TERMINAL_CREATE_RATE_LIMIT = Number(process.env.TERMINAL_CREATE_RATE_LIMIT || 10)
-const TERMINAL_CREATE_RATE_WINDOW_MS = Number(process.env.TERMINAL_CREATE_RATE_WINDOW_MS || 10_000)
 /** Sentinel value reserved in createdByRequestId while awaiting async session repair */
 const REPAIR_PENDING_SENTINEL = '__repair_pending__'
 const log = logger.child({ component: 'ws' })
@@ -112,6 +122,108 @@ function isMobileUserAgent(userAgent: string | undefined): boolean {
   return /Mobi|Android|iPhone|iPad|iPod/i.test(userAgent)
 }
 
+function sameStringSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a.size !== b.size) return false
+  for (const value of a) {
+    if (!b.has(value)) return false
+  }
+  return true
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0
+}
+
+function normalizeUiSessionLocator(value: unknown): SidebarSessionLocator | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const candidate = value as {
+    provider?: unknown
+    sessionId?: unknown
+    serverInstanceId?: unknown
+  }
+  const provider = CodingCliProviderSchema.safeParse(candidate.provider)
+  if (!provider.success || !isNonEmptyString(candidate.sessionId)) return undefined
+  return {
+    provider: provider.data,
+    sessionId: candidate.sessionId,
+    ...(isNonEmptyString(candidate.serverInstanceId)
+      ? { serverInstanceId: candidate.serverInstanceId }
+      : {}),
+  }
+}
+
+function extractSessionLocatorsFromUiContent(content: Record<string, unknown>): SidebarSessionLocator[] {
+  const locators: SidebarSessionLocator[] = []
+
+  const explicit = normalizeUiSessionLocator(content.sessionRef)
+  if (explicit) {
+    locators.push(explicit)
+  }
+
+  const kind = content.kind
+  if (kind === 'agent-chat') {
+    if (isNonEmptyString(content.resumeSessionId)) {
+      locators.push({ provider: 'claude', sessionId: content.resumeSessionId })
+    }
+    return locators
+  }
+
+  if (kind !== 'terminal') return locators
+
+  const mode = CodingCliProviderSchema.safeParse(content.mode)
+  if (!mode.success || !isNonEmptyString(content.resumeSessionId)) {
+    return locators
+  }
+
+  locators.push({
+    provider: mode.data,
+    sessionId: content.resumeSessionId,
+  })
+  return locators
+}
+
+function collectSessionLocatorsFromUiLayoutNode(node: unknown, locators: SidebarSessionLocator[]): void {
+  if (!node || typeof node !== 'object') return
+  const candidate = node as {
+    type?: unknown
+    content?: unknown
+    children?: unknown
+  }
+
+  if (candidate.type === 'leaf' && candidate.content && typeof candidate.content === 'object') {
+    locators.push(...extractSessionLocatorsFromUiContent(candidate.content as Record<string, unknown>))
+    return
+  }
+
+  if (candidate.type !== 'split' || !Array.isArray(candidate.children)) return
+  for (const child of candidate.children) {
+    collectSessionLocatorsFromUiLayoutNode(child, locators)
+  }
+}
+
+function collectSessionLocatorsFromUiLayouts(layouts: Record<string, unknown>): SidebarSessionLocator[] {
+  const locators: SidebarSessionLocator[] = []
+  for (const node of Object.values(layouts)) {
+    collectSessionLocatorsFromUiLayoutNode(node, locators)
+  }
+  return locators
+}
+
+function collectFallbackSessionLocatorsFromUiTabs(
+  tabs: Array<{ id: string; fallbackSessionRef?: SidebarSessionLocator }>,
+  layouts: Record<string, unknown>,
+): SidebarSessionLocator[] {
+  const locators: SidebarSessionLocator[] = []
+  for (const tab of tabs) {
+    if (layouts[tab.id] != null) continue
+    const fallback = normalizeUiSessionLocator(tab.fallbackSessionRef)
+    if (fallback) {
+      locators.push(fallback)
+    }
+  }
+  return locators
+}
+
 const TabsSyncPushRecordSchema = TabRegistryRecordBaseSchema.omit({
   serverInstanceId: true,
   deviceId: true,
@@ -132,42 +244,9 @@ const TabsSyncQuerySchema = z.object({
   rangeDays: z.number().int().positive().optional(),
 })
 
-const ClientMessageSchema = z.discriminatedUnion('type', [
-  HelloSchema,
-  PingSchema,
-  TerminalCreateSchema,
-  TerminalAttachSchema,
-  TerminalDetachSchema,
-  TerminalInputSchema,
-  TerminalResizeSchema,
-  TerminalKillSchema,
-  TerminalListSchema,
-  TerminalMetaListSchema,
-  TabsSyncPushSchema,
-  TabsSyncQuerySchema,
-  CodingCliCreateSchema,
-  CodingCliInputSchema,
-  CodingCliKillSchema,
-  SdkCreateSchema,
-  SdkSendSchema,
-  SdkPermissionRespondSchema,
-  SdkQuestionRespondSchema,
-  SdkInterruptSchema,
-  SdkKillSchema,
-  SdkAttachSchema,
-  SdkSetModelSchema,
-  SdkSetPermissionModeSchema,
-  UiLayoutSyncSchema,
-  UiScreenshotResultSchema,
-  SessionsFetchSchema,
-])
-
 type ClientState = {
   authenticated: boolean
-  supportsSessionsPatchV1: boolean
-  supportsSessionsPaginationV1: boolean
   supportsUiScreenshotV1: boolean
-  sessionsSnapshotSent: boolean
   attachedTerminalIds: Set<string>
   createdByRequestId: Map<string, string>
   terminalCreateTimestamps: number[]
@@ -176,6 +255,7 @@ type ClientState = {
   sdkSessions: Set<string>
   sdkSubscriptions: Map<string, () => void>
   interestedSessions: Set<string>
+  sidebarOpenSessionKeys: Set<string>
   helloTimer?: NodeJS.Timeout
 }
 
@@ -207,6 +287,8 @@ function createScreenshotError(code: ScreenshotErrorCode, message: string): Erro
 }
 
 export class WsHandler {
+  private readonly config: WsHandlerConfig
+  private readonly authToken: string
   private wss: WebSocketServer
   private connections = new Set<LiveWebSocket>()
   private clientStates = new Map<LiveWebSocket, ClientState>()
@@ -215,6 +297,7 @@ export class WsHandler {
   private sessionRepairService?: SessionRepairService
   private handshakeSnapshotProvider?: HandshakeSnapshotProvider
   private terminalMetaListProvider?: () => TerminalMeta[]
+  private codexActivityListProvider?: () => CodexActivityRecord[]
   private tabsRegistryStore?: TabsRegistryStore
   private layoutStore?: LayoutStore
   private extensionManager?: ExtensionManager
@@ -222,7 +305,13 @@ export class WsHandler {
   private terminalCreateLocks = new Map<string, Promise<void>>()
   private createdTerminalByRequestId = new Map<string, string>()
   private screenshotRequests = new Map<string, PendingScreenshot>()
+  private sessionsRevision = 0
+  private terminalsRevision = 0
+  private terminalRuntimeRevisions = new Map<string, number>()
   private readonly serverInstanceId: string
+  // The runtime validator is authoritative here; we keep the field typed broadly because
+  // the dynamic provider schemas widen discriminated-union inference beyond what TS/Zod model well.
+  private clientMessageSchema: z.ZodTypeAny
   private onTerminalExitBound = (payload: { terminalId?: string }) => {
     if (!payload?.terminalId) return
     this.forgetCreatedRequestIdsForTerminal(payload.terminalId)
@@ -245,10 +334,14 @@ export class WsHandler {
     serverInstanceId?: string,
     layoutStore?: LayoutStore,
     extensionManager?: ExtensionManager,
+    codexActivityListProvider?: () => CodexActivityRecord[],
   ) {
+    this.config = readWsHandlerConfig()
+    this.authToken = getRequiredAuthToken()
     this.sessionRepairService = sessionRepairService
     this.handshakeSnapshotProvider = handshakeSnapshotProvider
     this.terminalMetaListProvider = terminalMetaListProvider
+    this.codexActivityListProvider = codexActivityListProvider
     this.tabsRegistryStore = tabsRegistryStore
     this.layoutStore = layoutStore
     this.extensionManager = extensionManager
@@ -256,6 +349,85 @@ export class WsHandler {
       ? serverInstanceId
       : `srv-${randomUUID()}`
     this.terminalStreamBroker = new TerminalStreamBroker(this.registry)
+
+    // Build the set of valid CLI provider/mode names from extensions
+    const canEnumerateCliExtensions = typeof extensionManager?.getAll === 'function'
+    const extensionModes = canEnumerateCliExtensions
+      ? extensionManager.getAll()
+          .filter(e => e.manifest.category === 'cli')
+          .map(e => e.manifest.name)
+      : []
+    const allModes = new Set<string>(['shell', ...extensionModes])
+
+    // Build dynamic schemas for the two process-spawning messages.
+    // All other schemas (SessionLocatorSchema, TerminalMetaRecordSchema, etc.)
+    // already accept any string via the widened CodingCliProviderSchema.
+    const dynamicTerminalCreateSchema = z.object({
+      type: z.literal('terminal.create'),
+      requestId: z.string().min(1),
+      mode: z.string().min(1).default('shell').superRefine((val, ctx) => {
+        if (!canEnumerateCliExtensions || allModes.has(val)) return
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `Invalid terminal mode: '${val}'. Valid: ${[...allModes].join(', ')}`,
+        })
+      }),
+      shell: ShellSchema.default('system'),
+      cwd: z.string().optional(),
+      resumeSessionId: z.string().optional(),
+      restore: z.boolean().optional(),
+      tabId: z.string().min(1).optional(),
+      paneId: z.string().min(1).optional(),
+    })
+
+    const dynamicProviderSchema = CodingCliProviderSchema.superRefine((val, ctx) => {
+      if (!canEnumerateCliExtensions || extensionModes.includes(val)) return
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Unknown CLI provider: '${val}'`,
+      })
+    })
+
+    const dynamicCodingCliCreateSchema = z.object({
+      type: z.literal('codingcli.create'),
+      requestId: z.string().min(1),
+      provider: dynamicProviderSchema,
+      prompt: z.string().min(1),
+      cwd: z.string().optional(),
+      resumeSessionId: z.string().optional(),
+      model: z.string().optional(),
+      maxTurns: z.number().int().positive().optional(),
+      permissionMode: z.enum(['default', 'plan', 'acceptEdits', 'bypassPermissions']).optional(),
+      sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+    })
+
+    this.clientMessageSchema = z.discriminatedUnion('type', [
+      HelloSchema,
+      PingSchema,
+      dynamicTerminalCreateSchema,
+      TerminalAttachSchema,
+      TerminalDetachSchema,
+      TerminalInputSchema,
+      TerminalResizeSchema,
+      TerminalKillSchema,
+      CodexActivityListSchema,
+      TabsSyncPushSchema,
+      TabsSyncQuerySchema,
+      dynamicCodingCliCreateSchema,
+      CodingCliInputSchema,
+      CodingCliKillSchema,
+      SdkCreateSchema,
+      SdkSendSchema,
+      SdkPermissionRespondSchema,
+      SdkQuestionRespondSchema,
+      SdkInterruptSchema,
+      SdkKillSchema,
+      SdkAttachSchema,
+      SdkSetModelSchema,
+      SdkSetPermissionModeSchema,
+      UiLayoutSyncSchema,
+      UiScreenshotResultSchema,
+    ])
     const registryWithEvents = this.registry as unknown as {
       on?: (event: string, listener: (...args: any[]) => void) => void
     }
@@ -263,7 +435,7 @@ export class WsHandler {
     this.wss = new WebSocketServer({
       server,
       path: '/ws',
-      maxPayload: WS_MAX_PAYLOAD_BYTES,
+      maxPayload: this.config.wsMaxPayloadBytes,
       perMessageDeflate: {
         zlibDeflateOptions: { level: 1 },
         threshold: 1024,
@@ -290,7 +462,7 @@ export class WsHandler {
         ws.isAlive = false
         ws.ping()
       }
-    }, PING_INTERVAL_MS)
+    }, this.config.pingIntervalMs)
 
     // Subscribe to session repair events
     if (this.sessionRepairService) {
@@ -302,7 +474,7 @@ export class WsHandler {
           chainDepth: result.chainDepth,
         })
 
-        this.broadcast({
+        this.broadcastSessionRepairActivity(result.sessionId, {
           type: 'session.repair.activity',
           event: 'scanned',
           sessionId: result.sessionId,
@@ -322,7 +494,7 @@ export class WsHandler {
           orphansFixed: result.orphansFixed,
         })
 
-        this.broadcast({
+        this.broadcastSessionRepairActivity(result.sessionId, {
           type: 'session.repair.activity',
           event: 'repaired',
           sessionId: result.sessionId,
@@ -334,7 +506,7 @@ export class WsHandler {
       }
 
       const onError = (sessionId: string, error: Error) => {
-        this.broadcast({
+        this.broadcastSessionRepairActivity(sessionId, {
           type: 'session.repair.activity',
           event: 'error',
           sessionId,
@@ -359,6 +531,17 @@ export class WsHandler {
         if (ws.readyState === WebSocket.OPEN) {
           this.send(ws, msg)
         }
+      }
+    }
+  }
+
+  private broadcastSessionRepairActivity(sessionId: string, msg: unknown): void {
+    for (const [ws, state] of this.clientStates) {
+      if (!state.authenticated || !state.interestedSessions.has(sessionId)) {
+        continue
+      }
+      if (ws.readyState === WebSocket.OPEN) {
+        this.send(ws, msg)
       }
     }
   }
@@ -493,7 +676,7 @@ export class WsHandler {
   }
 
   private onConnection(ws: LiveWebSocket, req: http.IncomingMessage) {
-    if (this.connections.size >= MAX_CONNECTIONS) {
+    if (this.connections.size >= this.config.maxConnections) {
       ws.close(CLOSE_CODES.MAX_CONNECTIONS, 'Too many connections')
       return
     }
@@ -532,10 +715,7 @@ export class WsHandler {
 
     const state: ClientState = {
       authenticated: false,
-      supportsSessionsPatchV1: false,
-      supportsSessionsPaginationV1: false,
       supportsUiScreenshotV1: false,
-      sessionsSnapshotSent: false,
       attachedTerminalIds: new Set(),
       createdByRequestId: new Map(),
       terminalCreateTimestamps: [],
@@ -544,6 +724,7 @@ export class WsHandler {
       sdkSessions: new Set(),
       sdkSubscriptions: new Map(),
       interestedSessions: new Set(),
+      sidebarOpenSessionKeys: new Set(),
     }
     this.clientStates.set(ws, state)
 
@@ -571,7 +752,7 @@ export class WsHandler {
       if (!state.authenticated) {
         ws.close(CLOSE_CODES.HELLO_TIMEOUT, 'Hello timeout')
       }
-    }, HELLO_TIMEOUT_MS)
+    }, this.config.helloTimeoutMs)
 
     ws.on('message', (data) => void this.onMessage(ws, state, data))
     ws.on('close', (code, reason) => this.onClose(ws, state, code, reason))
@@ -628,7 +809,7 @@ export class WsHandler {
 
   private closeForBackpressureIfNeeded(ws: LiveWebSocket, bufferedOverride?: number): boolean {
     const buffered = bufferedOverride ?? (ws.bufferedAmount as number | undefined)
-    if (typeof buffered !== 'number' || buffered <= MAX_WS_BUFFERED_AMOUNT) return false
+    if (typeof buffered !== 'number' || buffered <= this.config.maxWsBufferedAmount) return false
 
     if (perfConfig.enabled && shouldLog(`ws_backpressure_${ws.connectionId || 'unknown'}`, perfConfig.rateLimitMs)) {
       logPerfEvent(
@@ -636,7 +817,7 @@ export class WsHandler {
         {
           connectionId: ws.connectionId,
           bufferedBytes: buffered,
-          limitBytes: MAX_WS_BUFFERED_AMOUNT,
+          limitBytes: this.config.maxWsBufferedAmount,
         },
         'warn',
       )
@@ -781,21 +962,6 @@ export class WsHandler {
       if (snapshot.settings) {
         this.safeSend(ws, { type: 'settings.updated', settings: snapshot.settings })
       }
-      if (snapshot.projects) {
-        if (state.supportsSessionsPaginationV1) {
-          const paginated = paginateProjects(snapshot.projects, { limit: 100 })
-          const allSent = await this.sendChunkedSessions(ws, paginated.projects, {
-            totalSessions: paginated.totalSessions,
-            oldestIncludedTimestamp: paginated.oldestIncludedTimestamp,
-            oldestIncludedSessionId: paginated.oldestIncludedSessionId,
-            hasMore: paginated.hasMore,
-          })
-          state.sessionsSnapshotSent = allSent
-        } else {
-          const allSent = await this.sendChunkedSessions(ws, snapshot.projects)
-          state.sessionsSnapshotSent = allSent
-        }
-      }
       if (typeof snapshot.perfLogging === 'boolean') {
         this.safeSend(ws, { type: 'perf.logging', enabled: snapshot.perfLogging })
       }
@@ -805,99 +971,6 @@ export class WsHandler {
     } catch (err) {
       logger.warn({ err }, 'Failed to send handshake snapshot')
     }
-  }
-
-  /**
-   * Send chunked sessions to a single WebSocket client with interleave protection.
-   * Uses a generation counter to cancel in-flight sends when a new update arrives.
-   * Returns true if all chunks were sent, false if sending was interrupted.
-   */
-  private async sendChunkedSessions(
-    ws: LiveWebSocket,
-    projects: ProjectGroup[],
-    paginationMeta?: {
-      totalSessions: number
-      oldestIncludedTimestamp: number
-      oldestIncludedSessionId: string
-      hasMore: boolean
-    },
-    forceClear?: boolean,
-  ): Promise<boolean> {
-    // Increment generation to cancel any in-flight sends for this connection
-    const generation = (ws.sessionUpdateGeneration = (ws.sessionUpdateGeneration || 0) + 1)
-    const isSuperseded = () => ws.sessionUpdateGeneration !== generation
-    const chunks = chunkProjects(projects, MAX_CHUNK_BYTES)
-
-    // Instrumentation: measure session payload size
-    const totalSessions = projects.reduce((sum, p) => sum + (p.sessions?.length ?? 0), 0)
-    let totalPayloadBytes = 0
-
-    for (let i = 0; i < chunks.length; i++) {
-      // Bail out if connection closed or a newer update has started
-      if (ws.readyState !== WebSocket.OPEN) return false
-      if (isSuperseded()) return false
-
-      // Wait for buffer to drain BEFORE sending the next chunk (skip first chunk).
-      // On remote connections (Tailscale, SSH tunnels), TCP drain is slower than
-      // chunk sends, so bufferedAmount can accumulate past the backpressure kill
-      // threshold (MAX_WS_BUFFERED_AMOUNT) if we don't drain first.
-      if (i > 0) {
-        const buffered = ws.bufferedAmount as number | undefined
-        if (typeof buffered === 'number' && buffered > DRAIN_THRESHOLD_BYTES) {
-          if (!await this.waitForDrain(ws, DRAIN_THRESHOLD_BYTES, DRAIN_TIMEOUT_MS, isSuperseded)) return false
-        } else {
-          await new Promise<void>((resolve) => setImmediate(resolve))
-        }
-      }
-
-      // The fast-path yield above can give a newer generation a chance to start.
-      // Re-check before we serialize/send so stale streams do not leak chunks.
-      if (ws.readyState !== WebSocket.OPEN) return false
-      if (isSuperseded()) return false
-
-      const isFirst = i === 0
-      let msg: {
-        type: 'sessions.updated'
-        projects: ProjectGroup[]
-        clear?: true
-        append?: true
-        totalSessions?: number
-        oldestIncludedTimestamp?: number
-        oldestIncludedSessionId?: string
-        hasMore?: boolean
-      }
-
-      if (chunks.length === 1) {
-        // Single chunk: no flags needed (backwards compatible), unless forceClear
-        // is set (broadcast replacement path where client must clear existing state)
-        msg = { type: 'sessions.updated', projects: chunks[i], ...paginationMeta }
-        if (forceClear) msg.clear = true
-      } else if (isFirst) {
-        // First chunk: clear existing data, include pagination metadata
-        msg = { type: 'sessions.updated', projects: chunks[i], clear: true, ...paginationMeta }
-      } else {
-        // Subsequent chunks: append to existing
-        msg = { type: 'sessions.updated', projects: chunks[i], append: true }
-      }
-
-      totalPayloadBytes += Buffer.byteLength(JSON.stringify(msg))
-      // Skip the send() backpressure guard for chunks 2..N — we already
-      // drained above. Keep it for the first chunk in case the buffer is
-      // already near MAX_WS_BUFFERED_AMOUNT from concurrent writes.
-      this.safeSend(ws, msg, /* skipBackpressureCheck */ i > 0)
-    }
-    // Verify connection survived the final send (safeSend can trigger backpressure close)
-    const allSent = ws.readyState === WebSocket.OPEN && !isSuperseded()
-    if (allSent) {
-      logger.info({
-        event: 'sessions_snapshot_sent',
-        connectionId: ws.connectionId,
-        sessionCount: totalSessions,
-        chunkCount: chunks.length,
-        uncompressedBytes: totalPayloadBytes,
-      }, `Sessions snapshot: ${totalSessions} sessions, ${chunks.length} chunks, ${(totalPayloadBytes / 1024).toFixed(1)} KB uncompressed`)
-    }
-    return allSent
   }
   private async onMessage(ws: LiveWebSocket, state: ClientState, data: WebSocket.RawData) {
     const endMessageTimer = startPerfTimer(
@@ -934,16 +1007,18 @@ export class WsHandler {
         return
       }
 
-      const parsed = ClientMessageSchema.safeParse(msg)
+      const parsed = this.clientMessageSchema.safeParse(msg)
       if (!parsed.success) {
         this.sendError(ws, { code: 'INVALID_MESSAGE', message: parsed.error.message, requestId: msg?.requestId })
         return
       }
 
-      const m = parsed.data
+      // Runtime schema validation already succeeded above; TS cannot preserve the narrowed
+      // discriminated union once provider names become dynamic, so we cast once at the boundary.
+      const m = parsed.data as any
       messageType = m.type
 
-      if (rawBytes > MAX_REGULAR_WS_MESSAGE_BYTES && m.type !== 'ui.screenshot.result') {
+      if (rawBytes > this.config.maxRegularWsMessageBytes && m.type !== 'ui.screenshot.result') {
         ws.close(1009, 'Message too large')
         return
       }
@@ -955,17 +1030,18 @@ export class WsHandler {
       }
 
       if (m.type === 'hello') {
-        const expected = getRequiredAuthToken()
-        if (!m.token || !timingSafeCompare(m.token, expected)) {
+        if (!m.token || !timingSafeCompare(m.token, this.authToken)) {
           log.warn({ event: 'ws_auth_failed', connectionId: ws.connectionId }, 'WebSocket auth failed')
           this.sendError(ws, { code: 'NOT_AUTHENTICATED', message: 'Invalid token' })
           ws.close(CLOSE_CODES.NOT_AUTHENTICATED, 'Invalid token')
           return
         }
         state.authenticated = true
-        state.supportsSessionsPatchV1 = !!m.capabilities?.sessionsPatchV1
-        state.supportsSessionsPaginationV1 = !!m.capabilities?.sessionsPaginationV1
         state.supportsUiScreenshotV1 = !!m.capabilities?.uiScreenshotV1
+        state.sidebarOpenSessionKeys = buildSidebarOpenSessionKeys(
+          m.sidebarOpenSessions ?? [],
+          this.serverInstanceId,
+        )
         if (typeof m.client?.mobile === 'boolean') {
           ws.isMobileClient = m.client.mobile
         }
@@ -993,12 +1069,6 @@ export class WsHandler {
           timestamp: nowIso(),
           serverInstanceId: this.serverInstanceId,
         })
-        if (this.extensionManager) {
-          this.safeSend(ws, {
-            type: 'extensions.registry',
-            extensions: this.extensionManager.toClientRegistry(),
-          })
-        }
         this.scheduleHandshakeSnapshot(ws, state)
         return
       }
@@ -1015,7 +1085,7 @@ export class WsHandler {
         if (!pending) return
         if (pending.connectionId && pending.connectionId !== ws.connectionId) return
 
-        if (typeof m.imageBase64 === 'string' && m.imageBase64.length > MAX_SCREENSHOT_BASE64_BYTES) {
+        if (typeof m.imageBase64 === 'string' && m.imageBase64.length > this.config.maxScreenshotBase64Bytes) {
           clearTimeout(pending.timeout)
           this.screenshotRequests.delete(m.requestId)
           pending.reject(new Error('Screenshot payload too large'))
@@ -1030,6 +1100,16 @@ export class WsHandler {
       case 'ui.layout.sync': {
         if (this.layoutStore) {
           this.layoutStore.updateFromUi(m, ws.connectionId || 'unknown')
+        }
+        const nextSidebarOpenSessionKeys = buildSidebarOpenSessionKeys(
+          [
+            ...collectSessionLocatorsFromUiLayouts(m.layouts),
+            ...collectFallbackSessionLocatorsFromUiTabs(m.tabs, m.layouts),
+          ],
+          this.serverInstanceId,
+        )
+        if (!sameStringSet(state.sidebarOpenSessionKeys, nextSidebarOpenSessionKeys)) {
+          state.sidebarOpenSessionKeys = nextSidebarOpenSessionKeys
         }
         return
       }
@@ -1110,7 +1190,7 @@ export class WsHandler {
                 this.rememberCreatedRequestId(m.requestId, reusedTerminalId)
                 terminalId = reusedTerminalId
                 reused = true
-                this.broadcast({ type: 'terminal.list.updated' })
+                this.broadcastTerminalsChanged()
                 return true
               }
 
@@ -1178,9 +1258,9 @@ export class WsHandler {
               if (!m.restore) {
                 const now = Date.now()
                 state.terminalCreateTimestamps = state.terminalCreateTimestamps.filter(
-                  (t) => now - t < TERMINAL_CREATE_RATE_WINDOW_MS
+                  (t) => now - t < this.config.terminalCreateRateWindowMs
                 )
-                if (state.terminalCreateTimestamps.length >= TERMINAL_CREATE_RATE_LIMIT) {
+                if (state.terminalCreateTimestamps.length >= this.config.terminalCreateRateLimit) {
                   rateLimited = true
                   log.warn({ connectionId: ws.connectionId, count: state.terminalCreateTimestamps.length }, 'terminal.create rate limited')
                   this.sendError(ws, { code: 'RATE_LIMITED', message: 'Too many terminal.create requests', requestId: m.requestId })
@@ -1266,7 +1346,13 @@ export class WsHandler {
                 cwd: m.cwd,
                 resumeSessionId: effectiveResumeSessionId,
                 envContext: { tabId: m.tabId, paneId: m.paneId },
-                providerSettings: providerSettings ? { permissionMode: providerSettings.permissionMode } : undefined,
+                providerSettings: providerSettings
+                  ? {
+                      permissionMode: providerSettings.permissionMode,
+                      model: providerSettings.model,
+                      sandbox: providerSettings.sandbox,
+                    }
+                  : undefined,
               })
 
               if (m.mode !== 'shell' && typeof m.cwd === 'string' && m.cwd.trim()) {
@@ -1291,12 +1377,12 @@ export class WsHandler {
                 // Terminal may still exist even if created delivery failed (for
                 // example: socket closed after create). Broadcast inventory so
                 // other clients can discover it.
-                this.broadcast({ type: 'terminal.list.updated' })
+                this.broadcastTerminalsChanged()
                 return
               }
 
               // Notify all clients that list changed
-              this.broadcast({ type: 'terminal.list.updated' })
+              this.broadcastTerminalsChanged()
             },
           )
         } catch (err: any) {
@@ -1337,7 +1423,7 @@ export class WsHandler {
         }
         if (attachResult === 'duplicate') return
         state.attachedTerminalIds.add(m.terminalId)
-        this.broadcast({ type: 'terminal.list.updated' })
+        this.broadcastTerminalRuntimeUpdatedForId(m.terminalId)
         return
       }
 
@@ -1349,7 +1435,7 @@ export class WsHandler {
           return
         }
         this.send(ws, { type: 'terminal.detached', terminalId: m.terminalId })
-        this.broadcast({ type: 'terminal.list.updated' })
+        this.broadcastTerminalRuntimeUpdatedForId(m.terminalId)
         return
       }
 
@@ -1375,38 +1461,23 @@ export class WsHandler {
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Unknown terminalId', terminalId: m.terminalId })
           return
         }
-        this.broadcast({ type: 'terminal.list.updated' })
+        this.broadcastTerminalsChanged()
+        this.broadcastTerminalRuntimeUpdatedForId(m.terminalId)
         return
       }
 
-      case 'terminal.list': {
-        const cfg = await awaitConfig()
-        // Merge terminal overrides into list output.
-        const list = this.registry.list().filter((t) => !cfg.terminalOverrides?.[t.terminalId]?.deleted)
-        const merged = list.map((t) => {
-          const ov = cfg.terminalOverrides?.[t.terminalId]
-          return {
-            ...t,
-            title: ov?.titleOverride || t.title,
-            description: ov?.descriptionOverride || t.description,
-          }
-        })
-        this.send(ws, { type: 'terminal.list.response', requestId: m.requestId, terminals: merged })
-        return
-      }
-
-      case 'terminal.meta.list': {
-        const terminals = this.terminalMetaListProvider ? this.terminalMetaListProvider() : []
-        const response = TerminalMetaListResponseSchema.safeParse({
-          type: 'terminal.meta.list.response',
+      case 'codex.activity.list': {
+        const terminals = this.codexActivityListProvider ? this.codexActivityListProvider() : []
+        const response = CodexActivityListResponseSchema.safeParse({
+          type: 'codex.activity.list.response',
           requestId: m.requestId,
           terminals,
         })
         if (!response.success) {
-          log.warn({ issues: response.error.issues }, 'Invalid terminal.meta.list.response payload')
+          log.warn({ issues: response.error.issues }, 'Invalid codex.activity.list.response payload')
           this.sendError(ws, {
             code: 'INTERNAL_ERROR',
-            message: 'Terminal metadata unavailable',
+            message: 'Codex activity unavailable',
             requestId: m.requestId,
           })
           return
@@ -1627,16 +1698,22 @@ export class WsHandler {
           if (m.resumeSessionId) {
             try {
               const messages = await loadSessionHistory(m.resumeSessionId)
-              if (messages && messages.length > 0) {
-                this.send(ws, {
-                  type: 'sdk.history',
-                  sessionId: session.sessionId,
-                  messages,
-                })
-              }
+              this.send(ws, {
+                type: 'sdk.session.snapshot',
+                sessionId: session.sessionId,
+                latestTurnId: messages && messages.length > 0 ? `turn-${messages.length - 1}` : null,
+                status: session.status,
+              })
             } catch (err) {
               log.warn({ err, resumeSessionId: m.resumeSessionId }, 'Failed to load session history from .jsonl')
             }
+          } else {
+            this.send(ws, {
+              type: 'sdk.session.snapshot',
+              sessionId: session.sessionId,
+              latestTurnId: null,
+              status: session.status,
+            })
           }
 
           // Send preliminary sdk.session.init so the client can start interacting.
@@ -1791,6 +1868,29 @@ export class WsHandler {
         }
         const session = this.sdkBridge.getSession(m.sessionId)
         if (!session) {
+          if (isValidClaudeSessionId(m.sessionId)) {
+            try {
+              const historicalMessages = await loadSessionHistory(m.sessionId)
+              if (historicalMessages !== null) {
+                this.send(ws, {
+                  type: 'sdk.session.snapshot',
+                  sessionId: m.sessionId,
+                  latestTurnId: historicalMessages.length > 0
+                    ? `turn-${historicalMessages.length - 1}`
+                    : null,
+                  status: 'idle',
+                })
+                this.send(ws, {
+                  type: 'sdk.status',
+                  sessionId: m.sessionId,
+                  status: 'idle',
+                })
+                return
+              }
+            } catch (err) {
+              log.warn({ err, sessionId: m.sessionId }, 'Failed to load durable Claude history for attach')
+            }
+          }
           // Send sdk.error (not generic error) so the client's SDK message handler
           // can identify the lost session and trigger immediate recovery.
           this.send(ws, {
@@ -1829,9 +1929,10 @@ export class WsHandler {
           }
         }
         this.send(ws, {
-          type: 'sdk.history',
+          type: 'sdk.session.snapshot',
           sessionId: m.sessionId,
-          messages: historyMessages,
+          latestTurnId: historyMessages.length > 0 ? `turn-${historyMessages.length - 1}` : null,
+          status: session.status,
         })
 
         // Send current status
@@ -1875,37 +1976,6 @@ export class WsHandler {
         return
       }
 
-      case 'sessions.fetch': {
-        const parsed = SessionsFetchSchema.safeParse(msg)
-        if (!parsed.success) {
-          this.sendError(ws, { code: 'INVALID_MESSAGE', message: 'Invalid sessions.fetch', requestId: (msg as any).requestId })
-          return
-        }
-        const { requestId, before, beforeId, limit } = parsed.data
-        if (!this.handshakeSnapshotProvider) {
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Session provider not available', requestId })
-          return
-        }
-        try {
-          const snapshot = await this.handshakeSnapshotProvider()
-          const allProjects = snapshot.projects ?? []
-          const result = paginateProjects(allProjects, { before, beforeId, limit })
-          this.safeSend(ws, {
-            type: 'sessions.page',
-            requestId,
-            projects: result.projects,
-            totalSessions: result.totalSessions,
-            oldestIncludedTimestamp: result.oldestIncludedTimestamp,
-            oldestIncludedSessionId: result.oldestIncludedSessionId,
-            hasMore: result.hasMore,
-          })
-        } catch (err) {
-          logger.warn({ err, requestId }, 'Failed to fetch sessions page')
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'Failed to fetch sessions', requestId })
-        }
-        return
-      }
-
       default:
         this.sendError(ws, { code: 'UNKNOWN_MESSAGE', message: 'Unknown message type' })
         return
@@ -1923,59 +1993,87 @@ export class WsHandler {
     }
   }
 
+  broadcastAuthenticated(msg: unknown) {
+    for (const ws of this.connections) {
+      if (ws.readyState !== WebSocket.OPEN) continue
+      const state = this.clientStates.get(ws)
+      if (!state?.authenticated) continue
+      this.send(ws, msg)
+    }
+  }
+
   broadcastUiCommand(command: { command: string; payload?: any }) {
     this.broadcast({ type: 'ui.command', ...command })
   }
 
-  /**
-   * Broadcast sessions.updated to all connected clients with chunking for mobile compatibility.
-   * This handles backpressure per-client to avoid overwhelming mobile WebSocket buffers.
-   */
-  broadcastSessionsUpdated(projects: ProjectGroup[]): void {
-    // Compute paginated view once, reuse for all pagination-capable clients
-    let paginated: ReturnType<typeof paginateProjects> | null = null
-    for (const ws of this.connections) {
-      if (ws.readyState !== WebSocket.OPEN) continue
-      const state = this.clientStates.get(ws)
-      if (state?.supportsSessionsPaginationV1) {
-        if (!paginated) paginated = paginateProjects(projects, { limit: 100 })
-        void this.sendChunkedSessions(ws, paginated.projects, {
-          totalSessions: paginated.totalSessions,
-          oldestIncludedTimestamp: paginated.oldestIncludedTimestamp,
-          oldestIncludedSessionId: paginated.oldestIncludedSessionId,
-          hasMore: paginated.hasMore,
-        }, true)
-      } else {
-        void this.sendChunkedSessions(ws, projects)
-      }
-    }
+  broadcastSessionsChanged(revision: number): void {
+    this.sessionsRevision = Math.max(this.sessionsRevision, revision)
+    this.broadcastAuthenticated({
+      type: 'sessions.changed',
+      revision,
+    })
   }
 
-  broadcastSessionsUpdatedToLegacy(projects: ProjectGroup[]): void {
-    for (const ws of this.connections) {
-      if (ws.readyState !== WebSocket.OPEN) continue
-      const state = this.clientStates.get(ws)
-      if (!state?.authenticated) continue
-      if (state.supportsSessionsPatchV1 && state.sessionsSnapshotSent) continue
-      // Update sessionsSnapshotSent on success so patch-capable clients
-      // can transition to patch mode after a successful full snapshot.
-      void this.sendChunkedSessions(ws, projects).then((allSent) => {
-        if (allSent && state.supportsSessionsPatchV1) {
-          state.sessionsSnapshotSent = true
+  broadcastTerminalsChanged(): void {
+    this.terminalsRevision += 1
+    this.broadcastAuthenticated({
+      type: 'terminals.changed',
+      revision: this.terminalsRevision,
+    })
+  }
+
+  private resolveTerminalRuntimePayload(terminalId: string): {
+    terminalId: string
+    title: string
+    status: 'running' | 'detached' | 'exited'
+    cwd?: string
+    pid?: number
+  } | null {
+    const record = this.registry.get(terminalId) as
+      | {
+          terminalId: string
+          title: string
+          status: 'running' | 'exited'
+          cwd?: string
+          pty?: { pid?: number }
+          clients?: Set<unknown>
         }
-      })
+      | null
+      | undefined
+
+    if (!record) return null
+
+    return {
+      terminalId: record.terminalId,
+      title: record.title,
+      status: record.status === 'exited'
+        ? 'exited'
+        : ((record.clients?.size ?? 0) > 0 ? 'running' : 'detached'),
+      ...(record.cwd ? { cwd: record.cwd } : {}),
+      ...(typeof record.pty?.pid === 'number' ? { pid: record.pty.pid } : {}),
     }
   }
 
-  broadcastSessionsPatch(msg: { type: 'sessions.patch'; upsertProjects: ProjectGroup[]; removeProjectPaths: string[] }): void {
-    for (const ws of this.connections) {
-      if (ws.readyState !== WebSocket.OPEN) continue
-      const state = this.clientStates.get(ws)
-      if (!state?.authenticated) continue
-      if (!state.supportsSessionsPatchV1) continue
-      if (!state.sessionsSnapshotSent) continue
-      this.safeSend(ws, msg)
-    }
+  broadcastTerminalRuntimeUpdated(msg: {
+    terminalId: string
+    title: string
+    status: 'running' | 'detached' | 'exited'
+    cwd?: string
+    pid?: number
+  }): void {
+    const revision = (this.terminalRuntimeRevisions.get(msg.terminalId) ?? 0) + 1
+    this.terminalRuntimeRevisions.set(msg.terminalId, revision)
+    this.broadcastAuthenticated({
+      type: 'terminal.runtime.updated',
+      revision,
+      ...msg,
+    })
+  }
+
+  private broadcastTerminalRuntimeUpdatedForId(terminalId: string): void {
+    const payload = this.resolveTerminalRuntimePayload(terminalId)
+    if (!payload) return
+    this.broadcastTerminalRuntimeUpdated(payload)
   }
 
   broadcastTerminalMetaUpdated(msg: { upsert?: TerminalMeta[]; remove?: string[] }): void {
@@ -1991,6 +2089,21 @@ export class WsHandler {
     }
 
     this.broadcast(parsed.data)
+  }
+
+  broadcastCodexActivityUpdated(msg: { upsert?: CodexActivityRecord[]; remove?: string[] }): void {
+    const parsed = CodexActivityUpdatedSchema.safeParse({
+      type: 'codex.activity.updated',
+      upsert: msg.upsert || [],
+      remove: msg.remove || [],
+    })
+
+    if (!parsed.success) {
+      log.warn({ issues: parsed.error.issues }, 'Invalid codex.activity.updated payload')
+      return
+    }
+
+    this.broadcastAuthenticated(parsed.data)
   }
 
   /**
@@ -2035,7 +2148,7 @@ export class WsHandler {
         ws.isAlive = false
         ws.ping()
       }
-    }, PING_INTERVAL_MS)
+    }, this.config.pingIntervalMs)
 
     log.info('WsHandler resumed after rebind')
   }

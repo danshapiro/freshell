@@ -45,6 +45,27 @@ describe('handleSdkMessage — session-lost error handling', () => {
     expect(session.historyLoaded).toBe(true)
   })
 
+  it('preserves snapshot state when a restored session is later reported lost', () => {
+    handleSdkMessage(store.dispatch, {
+      type: 'sdk.session.snapshot',
+      sessionId: 'sess-1',
+      latestTurnId: 'turn-9',
+      status: 'idle',
+    })
+
+    const handled = handleSdkMessage(store.dispatch, {
+      type: 'sdk.error',
+      sessionId: 'sess-1',
+      code: 'INVALID_SESSION_ID',
+      message: 'SDK session not found',
+    })
+
+    expect(handled).toBe(true)
+    const session = store.getState().agentChat.sessions['sess-1']
+    expect(session.latestTurnId).toBe('turn-9')
+    expect(session.lost).toBe(true)
+  })
+
   it('creates session entry and marks lost even if session did not exist in Redux', () => {
     // This simulates a page-refresh scenario: pane has sessionId from localStorage
     // but Redux was empty. Server responds with INVALID_SESSION_ID.

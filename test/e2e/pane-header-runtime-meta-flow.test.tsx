@@ -6,13 +6,17 @@ import App from '@/App'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
-import sessionsReducer from '@/store/sessionsSlice'
+import sessionsReducer, { setProjects } from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
+import agentChatReducer from '@/store/agentChatSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
+import tabRegistryReducer from '@/store/tabRegistrySlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
+import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer } from '@/store/networkSlice'
 import type { Tab } from '@/store/types'
-import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
+import type { AgentChatState } from '@/store/agentChatTypes'
+import type { PaneNode, TerminalPaneContent, AgentChatPaneContent } from '@/store/paneTypes'
 
 const wsMocks = vi.hoisted(() => {
   const messageHandlers = new Set<(msg: any) => void>()
@@ -26,7 +30,13 @@ const wsMocks = vi.hoisted(() => {
     }),
     onReconnect: vi.fn(() => () => {}),
     setHelloExtensionProvider: vi.fn(),
+    isReady: false,
+    serverInstanceId: undefined as string | undefined,
     emitMessage: (msg: any) => {
+      if (msg?.type === 'ready') {
+        wsMocks.isReady = true
+        wsMocks.serverInstanceId = typeof msg.serverInstanceId === 'string' ? msg.serverInstanceId : undefined
+      }
       for (const callback of messageHandlers) callback(msg)
     },
     resetHandlers: () => messageHandlers.clear(),
@@ -34,6 +44,7 @@ const wsMocks = vi.hoisted(() => {
 })
 
 const apiGet = vi.hoisted(() => vi.fn())
+const fetchSidebarSessionsSnapshot = vi.hoisted(() => vi.fn())
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -42,6 +53,15 @@ vi.mock('@/lib/ws-client', () => ({
     onMessage: wsMocks.onMessage,
     onReconnect: wsMocks.onReconnect,
     setHelloExtensionProvider: wsMocks.setHelloExtensionProvider,
+    get isReady() {
+      return wsMocks.isReady
+    },
+    get serverInstanceId() {
+      return wsMocks.serverInstanceId
+    },
+    get state() {
+      return wsMocks.isReady ? 'ready' : 'connected'
+    },
   }),
 }))
 
@@ -51,6 +71,8 @@ vi.mock('@/lib/api', () => ({
     patch: vi.fn().mockResolvedValue({}),
     post: vi.fn().mockResolvedValue({}),
   },
+  fetchSidebarSessionsSnapshot: (options?: unknown) => fetchSidebarSessionsSnapshot(options),
+  isApiUnauthorizedError: (err: any) => !!err && typeof err === 'object' && err.status === 401,
 }))
 
 vi.mock('@/hooks/useTheme', () => ({
@@ -93,11 +115,19 @@ vi.mock('@/components/TerminalView', () => ({
   default: ({ paneId }: { paneId: string }) => <div data-testid={`terminal-${paneId}`}>Terminal</div>,
 }))
 
+vi.mock('@/components/agent-chat/AgentChatView', () => ({
+  default: ({ paneId }: { paneId: string }) => <div data-testid={`agent-chat-${paneId}`}>Agent Chat</div>,
+}))
+
 function createStore(options?: {
   codexTab?: Partial<Tab>
   claudeTab?: Partial<Tab>
   codexPane?: Partial<TerminalPaneContent>
   claudePane?: Partial<TerminalPaneContent>
+  freshClaudeTab?: Partial<Tab>
+  freshClaudePane?: AgentChatPaneContent
+  agentChatState?: Partial<AgentChatState>
+  activeTabId?: string
 }) {
   const codexTab: Tab = {
     id: 'tab-codex',
@@ -150,6 +180,31 @@ function createStore(options?: {
     'tab-claude': { type: 'leaf', id: 'pane-claude', content: claudePane },
   }
 
+  const tabs = [codexTab, claudeTab]
+  const activePane: Record<string, string> = {
+    'tab-codex': 'pane-codex',
+    'tab-claude': 'pane-claude',
+  }
+
+  if (options?.freshClaudeTab && options?.freshClaudePane) {
+    const freshClaudeTab: Tab = {
+      id: 'tab-fresh',
+      createRequestId: 'req-fresh',
+      title: 'FreshClaude Tab',
+      status: 'running',
+      mode: 'claude',
+      createdAt: Date.now(),
+      ...options.freshClaudeTab,
+    }
+    tabs.push(freshClaudeTab)
+    layouts[freshClaudeTab.id] = {
+      type: 'leaf',
+      id: 'pane-fresh',
+      content: options.freshClaudePane,
+    }
+    activePane[freshClaudeTab.id] = 'pane-fresh'
+  }
+
   return configureStore({
     reducer: {
       settings: settingsReducer,
@@ -157,9 +212,12 @@ function createStore(options?: {
       connection: connectionReducer,
       sessions: sessionsReducer,
       panes: panesReducer,
+      agentChat: agentChatReducer,
       turnCompletion: turnCompletionReducer,
+      tabRegistry: tabRegistryReducer,
       terminalMeta: terminalMetaReducer,
       network: networkReducer,
+      extensions: extensionsReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -177,16 +235,27 @@ function createStore(options?: {
         lastSavedAt: null,
       },
       tabs: {
-        tabs: [codexTab, claudeTab],
-        activeTabId: 'tab-codex',
+        tabs,
+        activeTabId: options?.activeTabId ?? 'tab-codex',
         renameRequestTabId: null,
+      },
+      connection: {
+        status: 'disconnected',
+        lastError: undefined,
+        platform: null,
+        availableClis: {},
+        serverInstanceId: undefined,
+      },
+      sessions: {
+        projects: [],
+        expandedProjects: new Set<string>(),
+        wsSnapshotReceived: false,
+        isLoading: false,
+        error: null,
       },
       panes: {
         layouts,
-        activePane: {
-          'tab-codex': 'pane-codex',
-          'tab-claude': 'pane-claude',
-        },
+        activePane,
         paneTitles: {},
         paneTitleSetByUser: {},
         renameRequestTabId: null,
@@ -196,7 +265,25 @@ function createStore(options?: {
       terminalMeta: {
         byTerminalId: {},
       },
+      agentChat: {
+        sessions: {},
+        pendingCreates: {},
+        availableModels: [],
+        ...(options?.agentChatState || {}),
+      },
+      tabRegistry: {
+        deviceId: 'device-test',
+        deviceLabel: 'device-test',
+        deviceAliases: {},
+        localOpen: [],
+        remoteOpen: [],
+        closed: [],
+        localClosed: {},
+        searchRangeDays: 30,
+        loading: false,
+      },
       network: { status: null, loading: false, configuring: false, error: null },
+      extensions: { entries: [] },
     },
   })
 }
@@ -206,22 +293,27 @@ describe('pane header runtime metadata flow (e2e)', () => {
     cleanup()
     vi.clearAllMocks()
     wsMocks.resetHandlers()
+    wsMocks.isReady = false
+    wsMocks.serverInstanceId = undefined
+
+    fetchSidebarSessionsSnapshot.mockReset()
+    fetchSidebarSessionsSnapshot.mockResolvedValue([])
 
     apiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') {
+      if (url === '/api/bootstrap') {
         return Promise.resolve({
-          ...defaultSettings,
-          sidebar: { ...defaultSettings.sidebar, collapsed: true },
+          settings: {
+            ...defaultSettings,
+            sidebar: { ...defaultSettings.sidebar, collapsed: true },
+          },
+          platform: {
+            platform: 'linux',
+            availableClis: { codex: true, claude: true },
+          },
         })
       }
-      if (url === '/api/platform') {
-        return Promise.resolve({
-          platform: 'linux',
-          availableClis: { codex: true, claude: true },
-        })
-      }
-      if (url === '/api/sessions') {
-        return Promise.resolve([])
+      if (typeof url === 'string' && url.startsWith('/api/sessions')) {
+        return Promise.resolve({ projects: [] })
       }
       return Promise.resolve({})
     })
@@ -245,26 +337,21 @@ describe('pane header runtime metadata flow (e2e)', () => {
     })
 
     act(() => {
-      wsMocks.emitMessage({ type: 'ready' })
+      wsMocks.emitMessage({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-local',
+      })
     })
 
-    let requestId = ''
     await waitFor(() => {
-      const metaCall = wsMocks.send.mock.calls
-        .map((call) => call[0])
-        .find((msg) => msg?.type === 'terminal.meta.list')
-      expect(metaCall).toBeDefined()
-      if (!metaCall || typeof metaCall.requestId !== 'string') {
-        throw new Error('Missing terminal.meta.list requestId')
-      }
-      requestId = metaCall.requestId
+      expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
     })
 
     act(() => {
       wsMocks.emitMessage({
-        type: 'terminal.meta.list.response',
-        requestId,
-        terminals: [
+        type: 'terminal.meta.updated',
+        upsert: [
           {
             terminalId: 'term-codex',
             provider: 'codex',
@@ -296,6 +383,7 @@ describe('pane header runtime metadata flow (e2e)', () => {
             updatedAt: Date.now(),
           },
         ],
+        remove: [],
       })
     })
 
@@ -352,7 +440,7 @@ describe('pane header runtime metadata flow (e2e)', () => {
     })
   })
 
-  it('does not erase newer runtime metadata when an older snapshot response arrives', async () => {
+  it('ignores legacy terminal.meta.list.response frames after live metadata has landed', async () => {
     const store = createStore()
 
     render(
@@ -366,19 +454,15 @@ describe('pane header runtime metadata flow (e2e)', () => {
     })
 
     act(() => {
-      wsMocks.emitMessage({ type: 'ready' })
+      wsMocks.emitMessage({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-local',
+      })
     })
 
-    let requestId = ''
     await waitFor(() => {
-      const metaCall = wsMocks.send.mock.calls
-        .map((call) => call[0])
-        .find((msg) => msg?.type === 'terminal.meta.list')
-      expect(metaCall).toBeDefined()
-      if (!metaCall || typeof metaCall.requestId !== 'string') {
-        throw new Error('Missing terminal.meta.list requestId')
-      }
-      requestId = metaCall.requestId
+      expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
     })
 
     act(() => {
@@ -412,8 +496,23 @@ describe('pane header runtime metadata flow (e2e)', () => {
     act(() => {
       wsMocks.emitMessage({
         type: 'terminal.meta.list.response',
-        requestId,
-        terminals: [],
+        requestId: 'legacy-terminal-meta-list',
+        terminals: [
+          {
+            terminalId: 'term-codex',
+            provider: 'codex',
+            displaySubdir: 'stale-meta',
+            branch: 'legacy',
+            isDirty: false,
+            tokenUsage: {
+              inputTokens: 1,
+              outputTokens: 1,
+              cachedTokens: 0,
+              totalTokens: 2,
+            },
+            updatedAt: 1,
+          },
+        ],
       })
     })
 
@@ -449,26 +548,21 @@ describe('pane header runtime metadata flow (e2e)', () => {
     })
 
     act(() => {
-      wsMocks.emitMessage({ type: 'ready' })
+      wsMocks.emitMessage({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-local',
+      })
     })
 
-    let requestId = ''
     await waitFor(() => {
-      const metaCall = wsMocks.send.mock.calls
-        .map((call) => call[0])
-        .find((msg) => msg?.type === 'terminal.meta.list')
-      expect(metaCall).toBeDefined()
-      if (!metaCall || typeof metaCall.requestId !== 'string') {
-        throw new Error('Missing terminal.meta.list requestId')
-      }
-      requestId = metaCall.requestId
+      expect(wsMocks.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.meta.list' }))
     })
 
     act(() => {
       wsMocks.emitMessage({
-        type: 'terminal.meta.list.response',
-        requestId,
-        terminals: [
+        type: 'terminal.meta.updated',
+        upsert: [
           {
             terminalId: 'term-codex-tab-level',
             provider: 'codex',
@@ -486,11 +580,183 @@ describe('pane header runtime metadata flow (e2e)', () => {
             updatedAt: Date.now(),
           },
         ],
+        remove: [],
       })
     })
 
     await waitFor(() => {
       expect(screen.getByText(/freshell \(main\*\)\s+25%/)).toBeInTheDocument()
+    })
+  })
+
+  it('renders and updates the same percent-used header indicator for a FreshClaude pane from indexed Claude metadata', async () => {
+    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+      projects: [
+        {
+          projectPath: '/home/user/code/freshell',
+          sessions: [
+            {
+              provider: 'claude',
+              sessionType: 'freshclaude',
+              sessionId: 'claude-session-1',
+              projectPath: '/home/user/code/freshell',
+              cwd: '/home/user/code/freshell/.worktrees/issue-163',
+              gitBranch: 'main',
+              isDirty: true,
+              updatedAt: 1,
+              tokenUsage: {
+                inputTokens: 10,
+                outputTokens: 5,
+                cachedTokens: 0,
+                totalTokens: 15,
+                contextTokens: 15,
+                compactThresholdTokens: 60,
+                compactPercent: 25,
+              },
+            },
+          ],
+        },
+      ],
+      totalSessions: 1,
+      oldestIncludedTimestamp: 1,
+      oldestIncludedSessionId: 'claude:claude-session-1',
+      hasMore: false,
+    })
+
+    const store = createStore({
+      activeTabId: 'tab-fresh',
+      freshClaudeTab: {
+        id: 'tab-fresh',
+        createRequestId: 'req-fresh',
+        title: 'FreshClaude Tab',
+        status: 'running',
+        mode: 'claude',
+        createdAt: Date.now(),
+      },
+      freshClaudePane: {
+        kind: 'agent-chat',
+        provider: 'freshclaude',
+        createRequestId: 'req-fresh',
+        sessionId: 'sdk-session-1',
+        status: 'idle',
+      } satisfies AgentChatPaneContent,
+      agentChatState: {
+        sessions: {
+          'sdk-session-1': {
+            sessionId: 'sdk-session-1',
+            cliSessionId: 'claude-session-1',
+            status: 'idle',
+            messages: [],
+            streamingText: '',
+            streamingActive: false,
+            pendingPermissions: {},
+            pendingQuestions: {},
+            totalCostUsd: 0,
+            totalInputTokens: 0,
+            totalOutputTokens: 0,
+          },
+        },
+        pendingCreates: {},
+        availableModels: [],
+      } satisfies Partial<AgentChatState>,
+    })
+
+    store.dispatch(setProjects([
+      {
+        projectPath: '/home/user/code/freshell',
+        sessions: [
+          {
+            provider: 'claude',
+            sessionType: 'freshclaude',
+            sessionId: 'claude-session-1',
+            projectPath: '/home/user/code/freshell',
+            cwd: '/home/user/code/freshell/.worktrees/issue-163',
+            gitBranch: 'main',
+            isDirty: true,
+            updatedAt: 1,
+            tokenUsage: {
+              inputTokens: 10,
+              outputTokens: 5,
+              cachedTokens: 0,
+              totalTokens: 15,
+              contextTokens: 15,
+              compactThresholdTokens: 60,
+              compactPercent: 25,
+            },
+          },
+        ],
+      },
+    ] as any))
+
+    apiGet.mockImplementation((url: string) => {
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: {
+            ...defaultSettings,
+            sidebar: { ...defaultSettings.sidebar, collapsed: true },
+          },
+          platform: {
+            platform: 'linux',
+            availableClis: { codex: true, claude: true },
+          },
+        })
+      }
+      return Promise.resolve({})
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.connect).toHaveBeenCalled()
+    })
+
+    act(() => {
+      wsMocks.emitMessage({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-local',
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText(/freshell \(main\*\)\s+25%/)).toBeInTheDocument()
+    })
+
+    act(() => {
+      store.dispatch(setProjects([
+        {
+          projectPath: '/home/user/code/freshell',
+          sessions: [
+            {
+              provider: 'claude',
+              sessionType: 'freshclaude',
+              sessionId: 'claude-session-1',
+              projectPath: '/home/user/code/freshell',
+              cwd: '/home/user/code/freshell/.worktrees/issue-163',
+              gitBranch: 'main',
+              isDirty: true,
+              updatedAt: 2,
+              tokenUsage: {
+                inputTokens: 10,
+                outputTokens: 5,
+                cachedTokens: 0,
+                totalTokens: 15,
+                contextTokens: 15,
+                compactThresholdTokens: 60,
+                compactPercent: 50,
+              },
+            },
+          ],
+        },
+      ] as any))
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText(/freshell \(main\*\)\s+50%/)).toBeInTheDocument()
     })
   })
 })
