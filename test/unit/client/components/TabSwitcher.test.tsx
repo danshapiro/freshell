@@ -401,7 +401,11 @@ describe('TabSwitcher', () => {
     const codexCard = screen.getByRole('button', { name: /switch to codex/i })
 
     expect(within(shellCard).queryByText('Busy')).not.toBeInTheDocument()
-    expect(within(codexCard).getByTestId('tab-switcher-busy-badge-tab-2')).toHaveTextContent('Busy')
+    const badge = within(codexCard).getByTestId('tab-switcher-busy-badge-tab-2')
+    expect(badge).toHaveTextContent('Busy')
+    expect(badge.className).toContain('bg-blue-500/15')
+    expect(badge.className).toContain('text-blue-600')
+    expect(badge.className).not.toContain('animate-pulse')
   })
 
   it('does not warn about selector instability when codex activity state is absent', async () => {

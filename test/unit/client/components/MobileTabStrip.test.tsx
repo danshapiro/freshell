@@ -331,7 +331,11 @@ describe('MobileTabStrip', () => {
       </Provider>
     )
 
-    expect(screen.getByTestId('mobile-tab-busy-badge')).toHaveTextContent('Busy')
+    const badge = screen.getByTestId('mobile-tab-busy-badge')
+    expect(badge).toHaveTextContent('Busy')
+    expect(badge.className).toContain('bg-blue-500/15')
+    expect(badge.className).toContain('text-blue-600')
+    expect(badge.className).not.toContain('animate-pulse')
   })
 
   it('does not warn about selector instability when codex activity state is absent', async () => {
