@@ -430,7 +430,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
           isOnlyPane,
         })
         : undefined
-    const paneActivityPulse =
+    const paneBusy =
       node.content.kind === 'terminal'
       && node.content.status === 'running'
       && paneActivityRecord?.phase === 'busy'
@@ -448,7 +448,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         content={node.content}
         metaLabel={paneMetaLabel}
         metaTooltip={paneMetaTooltip}
-        activityPulse={paneActivityPulse}
+        busy={paneBusy}
         needsAttention={needsAttention}
         onClose={() => handleClose(node.id, node.content)}
         onFocus={() => handleFocus(node.id)}

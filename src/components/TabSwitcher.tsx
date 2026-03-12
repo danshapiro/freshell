@@ -100,7 +100,7 @@ export function TabSwitcher({ onClose }: TabSwitcherProps) {
                   </span>
                   {isBusy && (
                     <span
-                      className="inline-flex shrink-0 items-center rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-700 animate-pulse"
+                      className="inline-flex shrink-0 items-center rounded-full bg-blue-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-blue-600 dark:text-blue-400"
                       data-testid={`tab-switcher-busy-badge-${tab.id}`}
                     >
                       Busy

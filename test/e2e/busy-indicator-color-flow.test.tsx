@@ -75,7 +75,7 @@ describe('busy indicator color flow (e2e)', () => {
     cleanup()
   })
 
-  it('renders creating busy icons as static blue in both tab and pane chrome', () => {
+  it('renders creating icons as muted in both tab and pane chrome', () => {
     const store = createStore()
 
     render(
@@ -99,12 +99,12 @@ describe('busy indicator color flow (e2e)', () => {
       </Provider>
     )
 
-    const busyIcons = screen.getAllByTestId('pane-icon')
-    expect(busyIcons).toHaveLength(2)
+    const icons = screen.getAllByTestId('pane-icon')
+    expect(icons).toHaveLength(2)
 
-    for (const icon of busyIcons) {
-      expect(icon.getAttribute('class')).toContain('text-blue-500')
-      expect(icon.getAttribute('class')).not.toContain('animate-pulse')
+    for (const icon of icons) {
+      expect(icon.getAttribute('class')).toContain('text-muted-foreground')
+      expect(icon.getAttribute('class')).not.toContain('text-blue-500')
     }
   })
 })

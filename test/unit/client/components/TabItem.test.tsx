@@ -106,12 +106,12 @@ describe('TabItem', () => {
     expect(el?.className).toContain('bg-muted')
   })
 
-  it('uses a static blue status dot for creating tabs when pane icons are unavailable', () => {
+  it('uses a muted status dot for creating tabs when pane icons are unavailable', () => {
     render(<TabItem {...defaultProps} tab={createTab({ status: 'creating' })} paneContents={[]} iconsOnTabs={false} />)
     const dot = screen.getByTestId('circle-icon')
-    expect(dot.getAttribute('class')).toContain('text-blue-500')
-    expect(dot.getAttribute('class')).toContain('fill-blue-500')
-    expect(dot.getAttribute('class')).not.toContain('animate-pulse')
+    expect(dot.getAttribute('class')).toContain('text-muted-foreground')
+    expect(dot.getAttribute('class')).toContain('fill-muted-foreground')
+    expect(dot.getAttribute('class')).not.toContain('text-blue-500')
   })
 
   it('applies attention classes on active tab with highlight', () => {
@@ -155,7 +155,7 @@ describe('TabItem', () => {
     expect(screen.getByDisplayValue('Editing')).toBeInTheDocument()
   })
 
-  it('pulses only the exact busy terminal icon in split tabs', () => {
+  it('shows blue icon only for the exact busy terminal in split tabs', () => {
     const paneContents: PaneContent[] = [
       {
         kind: 'terminal',
@@ -179,7 +179,7 @@ describe('TabItem', () => {
       <TabItem
         {...defaultProps}
         paneContents={paneContents}
-        activityPulse={true}
+        busy={true}
         activityTerminalIds={['term-1']}
       />
     )
@@ -188,11 +188,11 @@ describe('TabItem', () => {
     const busyIcon = icons.find((icon) => icon.getAttribute('data-terminal-id') === 'term-1')
     const idleIcon = icons.find((icon) => icon.getAttribute('data-terminal-id') === 'term-2')
 
-    expect(busyIcon?.getAttribute('class')).toContain('animate-pulse')
-    expect(idleIcon?.getAttribute('class') ?? '').not.toContain('animate-pulse')
+    expect(busyIcon?.getAttribute('class')).toContain('text-blue-500')
+    expect(idleIcon?.getAttribute('class') ?? '').not.toContain('text-blue-500')
   })
 
-  it('pulses a single unnamed terminal icon during the exact tab-terminal fallback', () => {
+  it('shows blue icon for a single unnamed terminal during the exact tab-terminal fallback', () => {
     const paneContents: PaneContent[] = [
       {
         kind: 'terminal',
@@ -208,15 +208,15 @@ describe('TabItem', () => {
       <TabItem
         {...defaultProps}
         paneContents={paneContents}
-        activityPulse={true}
+        busy={true}
         activityTerminalIds={['term-tab']}
       />
     )
 
-    expect(screen.getByTestId('pane-icon').getAttribute('class')).toContain('animate-pulse')
+    expect(screen.getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
   })
 
-  it('pulses the overflow indicator when the exact busy terminal is hidden beyond the visible icon cap', () => {
+  it('shows blue overflow indicator when the exact busy terminal is hidden beyond the visible icon cap', () => {
     const paneContents: PaneContent[] = Array.from({ length: 7 }, (_, index) => ({
       kind: 'terminal',
       mode: 'shell',
@@ -230,12 +230,12 @@ describe('TabItem', () => {
       <TabItem
         {...defaultProps}
         paneContents={paneContents}
-        activityPulse={true}
+        busy={true}
         activityTerminalIds={['term-7']}
       />
     )
 
-    expect(screen.getByText('+1').getAttribute('class')).toContain('animate-pulse')
+    expect(screen.getByText('+1').getAttribute('class')).toContain('text-blue-500')
   })
 
   it('calls onClick when clicked', () => {

@@ -10,7 +10,7 @@ export function getTerminalStatusIconClassName(status: TerminalStatus): string {
       return 'text-destructive'
     case 'creating':
     default:
-      return 'text-blue-500'
+      return 'text-muted-foreground'
   }
 }
 
@@ -24,6 +24,6 @@ export function getTerminalStatusDotClassName(status: TerminalStatus): string {
       return 'fill-destructive text-destructive'
     case 'creating':
     default:
-      return 'fill-blue-500 text-blue-500'
+      return 'fill-muted-foreground text-muted-foreground'
   }
 }

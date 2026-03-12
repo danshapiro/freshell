@@ -42,7 +42,7 @@ interface SortableTabProps {
   displayTitle: string
   isActive: boolean
   needsAttention: boolean
-  activityPulse: boolean
+  busy: boolean
   activityTerminalIds: string[]
   isDragging: boolean
   isRenaming: boolean
@@ -63,7 +63,7 @@ function SortableTab({
   displayTitle,
   isActive,
   needsAttention,
-  activityPulse,
+  busy,
   activityTerminalIds,
   isDragging,
   isRenaming,
@@ -103,7 +103,7 @@ function SortableTab({
         tab={tabWithDisplayTitle}
         isActive={isActive}
         needsAttention={needsAttention}
-        activityPulse={activityPulse}
+        busy={busy}
         activityTerminalIds={activityTerminalIds}
         isDragging={isDragging}
         isRenaming={isRenaming}
@@ -277,7 +277,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         displayTitle={getDisplayTitle(tab)}
         isActive={tab.id === activeTabId}
         needsAttention={!!attentionByTab[tab.id]}
-        activityPulse={activityTerminalIds.length > 0}
+        busy={activityTerminalIds.length > 0}
         activityTerminalIds={activityTerminalIds}
         isDragging={activeId === tab.id}
         isRenaming={renamingId === tab.id}
@@ -500,7 +500,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
                 tab={{ ...activeTab, title: getDisplayTitle(activeTab) }}
                 isActive={activeTab.id === activeTabId}
                 needsAttention={!!attentionByTab[activeTab.id]}
-                activityPulse={getTabActivityTerminalIds(activeTab).length > 0}
+                busy={getTabActivityTerminalIds(activeTab).length > 0}
                 activityTerminalIds={getTabActivityTerminalIds(activeTab)}
                 isDragging={false}
                 isRenaming={false}

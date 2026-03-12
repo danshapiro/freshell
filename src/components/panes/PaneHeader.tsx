@@ -11,7 +11,7 @@ interface PaneHeaderProps {
   metaLabel?: string
   metaTooltip?: string
   needsAttention?: boolean
-  activityPulse?: boolean
+  busy?: boolean
   status: TerminalStatus
   isActive: boolean
   onClose: () => void
@@ -33,7 +33,7 @@ export default function PaneHeader({
   metaLabel,
   metaTooltip,
   needsAttention,
-  activityPulse,
+  busy,
   status,
   isActive,
   onClose,
@@ -74,8 +74,7 @@ export default function PaneHeader({
         content={content}
         className={cn(
           'h-3.5 w-3.5 shrink-0',
-          getTerminalStatusIconClassName(status),
-          activityPulse && status === 'running' && 'animate-pulse',
+          busy && status === 'running' ? 'text-blue-500' : getTerminalStatusIconClassName(status),
         )}
       />
 

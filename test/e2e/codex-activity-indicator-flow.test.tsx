@@ -138,7 +138,7 @@ describe('codex activity indicator flow (e2e)', () => {
     cleanup()
   })
 
-  it('pulses the pane and tab only when the exact live terminal id is busy', () => {
+  it('shows blue icon on pane and tab only when the exact live terminal id is busy', () => {
     renderHarness({
       codexActivity: {
         byTerminalId: {
@@ -151,10 +151,10 @@ describe('codex activity indicator flow (e2e)', () => {
     })
 
     const paneHeader = screen.getByRole('banner', { name: 'Pane: Codex Pane' })
-    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('animate-pulse')
+    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
 
     const tabButton = screen.getByLabelText('Codex Tab')
-    expect(within(tabButton).getByTestId('pane-icon').getAttribute('class')).toContain('animate-pulse')
+    expect(within(tabButton).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
   })
 
   it('falls back to the exact tab terminal id during single-pane rehydrate gaps', () => {
@@ -172,13 +172,13 @@ describe('codex activity indicator flow (e2e)', () => {
     })
 
     const paneHeader = screen.getByRole('banner', { name: 'Pane: Codex Pane' })
-    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('animate-pulse')
+    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
 
     const tabButton = screen.getByLabelText('Codex Tab')
-    expect(within(tabButton).getByTestId('pane-icon').getAttribute('class')).toContain('animate-pulse')
+    expect(within(tabButton).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
   })
 
-  it('never pulses from resumeSessionId, sessionRef, cwd, or provider-only terminal meta fallbacks', () => {
+  it('never shows blue from resumeSessionId, sessionRef, cwd, or provider-only terminal meta fallbacks', () => {
     renderHarness({
       tab: {
         terminalId: undefined,
@@ -217,9 +217,9 @@ describe('codex activity indicator flow (e2e)', () => {
     })
 
     const paneHeader = screen.getByRole('banner', { name: 'Pane: Codex Pane' })
-    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('animate-pulse')
+    expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
 
     const tabButton = screen.getByLabelText('Codex Tab')
-    expect(within(tabButton).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('animate-pulse')
+    expect(within(tabButton).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
   })
 })

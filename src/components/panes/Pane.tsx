@@ -14,7 +14,7 @@ interface PaneProps {
   metaLabel?: string
   metaTooltip?: string
   needsAttention?: boolean
-  activityPulse?: boolean
+  busy?: boolean
   status?: TerminalStatus
   content?: PaneContent
   onClose: () => void
@@ -41,7 +41,7 @@ export default function Pane({
   metaLabel,
   metaTooltip,
   needsAttention,
-  activityPulse,
+  busy,
   status,
   content,
   onClose,
@@ -97,7 +97,7 @@ export default function Pane({
             metaLabel={metaLabel}
             metaTooltip={metaTooltip}
             needsAttention={needsAttention}
-            activityPulse={activityPulse}
+            busy={busy}
             status={status || 'creating'}
             isActive={isActive}
             onClose={onClose}
