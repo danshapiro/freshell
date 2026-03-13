@@ -69,6 +69,12 @@ describe('TestServer', () => {
     expect(res.status).toBe(200)
   })
 
+  it('rejects bootstrap auth against the project runtime root', () => {
+    expect(() => new TestServer({
+      authStrategy: 'bootstrap',
+    })).toThrow(/requires runtimeRootMode "isolated"/)
+  })
+
   it('bootstraps AUTH_TOKEN into the isolated runtime root for a compiled cold start', async () => {
     server = new TestServer({
       authStrategy: 'bootstrap',

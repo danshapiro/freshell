@@ -39,6 +39,15 @@ export interface TestServerOptions {
   runtimeRootMode?: 'project' | 'isolated'
 }
 
+function validateTestServerOptions(options: TestServerOptions): void {
+  const authStrategy = options.authStrategy ?? 'explicit-env'
+  const runtimeRootMode = options.runtimeRootMode ?? 'project'
+
+  if (authStrategy === 'bootstrap' && runtimeRootMode !== 'isolated') {
+    throw new Error('authStrategy "bootstrap" requires runtimeRootMode "isolated"')
+  }
+}
+
 /**
  * Find an available ephemeral port by briefly binding to port 0.
  * The OS assigns a free port, we read it, then close immediately.
@@ -112,6 +121,7 @@ export class TestServer {
   private readonly options: TestServerOptions
 
   constructor(options: TestServerOptions = {}) {
+    validateTestServerOptions(options)
     this.options = options
   }
 
