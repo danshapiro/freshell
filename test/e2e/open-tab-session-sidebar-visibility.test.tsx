@@ -537,6 +537,8 @@ describe('open tab session sidebar visibility (e2e)', () => {
         }),
       ])
     })
+
+    expect(screen.queryByTestId('sessions-refreshing')).not.toBeInTheDocument()
   })
 
   it('keeps the loaded sidebar visible during an invalidation burst and queues at most one follow-up refresh', async () => {
@@ -653,5 +655,83 @@ describe('open tab session sidebar visibility (e2e)', () => {
 
     expect(screen.queryByText('Recent Session')).not.toBeInTheDocument()
     expect(fetchSidebarSessionsSnapshot.mock.calls.length).toBeLessThanOrEqual(2)
+  })
+
+  it('keeps loaded search results visible and shows no search chrome during websocket revalidation', async () => {
+    const searchProjects = [{
+      projectPath: '/search',
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'search-session',
+        projectPath: '/search',
+        updatedAt: 10,
+        title: 'Search Result',
+      }],
+    }]
+    const deferred = createDeferred<any>()
+    searchSessions.mockReturnValueOnce(deferred.promise)
+
+    const store = createStore({
+      sessions: {
+        projects: searchProjects,
+        activeSurface: 'sidebar',
+        lastLoadedAt: Date.now(),
+        windows: {
+          sidebar: {
+            projects: searchProjects,
+            lastLoadedAt: Date.now(),
+            loading: false,
+            query: 'search',
+            searchTier: 'title',
+          },
+        },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Search Result').length).toBeGreaterThan(0)
+    })
+
+    act(() => {
+      broadcastWs({
+        type: 'sessions.changed',
+        revision: 9,
+      })
+    })
+
+    await waitFor(() => {
+      expect(searchSessions).toHaveBeenCalledTimes(1)
+      expect(searchSessions).toHaveBeenCalledWith({
+        query: 'search',
+        tier: 'title',
+        signal: expect.any(AbortSignal),
+      })
+    })
+
+    expect(screen.getAllByText('Search Result').length).toBeGreaterThan(0)
+    expect(screen.queryByTestId('search-loading')).not.toBeInTheDocument()
+
+    await act(async () => {
+      deferred.resolve({
+        results: [{
+          provider: 'codex',
+          sessionId: 'search-session',
+          projectPath: '/search',
+          title: 'Search Result',
+          updatedAt: 10,
+          archived: false,
+        }],
+        tier: 'title',
+        query: 'search',
+        totalScanned: 1,
+      })
+      await Promise.resolve()
+    })
   })
 })

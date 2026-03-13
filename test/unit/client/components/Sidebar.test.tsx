@@ -1731,6 +1731,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
               projects: recentProjects,
               lastLoadedAt: 1_700_000_000_000,
               loading: true,
+              loadingKind: 'background',
               query: '',
               searchTier: 'title',
             },
@@ -1742,10 +1743,11 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       expect(screen.getByText('Recent Session')).toBeInTheDocument()
       expect(screen.getByTestId('virtualized-list')).toBeInTheDocument()
-      expect(screen.getByTestId('sessions-refreshing')).toBeInTheDocument()
+      expect(screen.queryByTestId('sessions-refreshing')).not.toBeInTheDocument()
+      expect(screen.queryByTestId('search-loading')).not.toBeInTheDocument()
     })
 
-    it('keeps loaded search results mounted while refresh is in flight', async () => {
+    it('keeps loaded search results mounted during a silent background refresh', async () => {
       const searchProjects: ProjectGroup[] = [{
         projectPath: '/work/search',
         sessions: [{
@@ -1768,6 +1770,46 @@ describe('Sidebar Component - Session-Centric Display', () => {
               projects: searchProjects,
               lastLoadedAt: 1_700_000_000_000,
               loading: true,
+              loadingKind: 'background',
+              query: 'search',
+              searchTier: 'title',
+            },
+          },
+        },
+      })
+
+      const { getByPlaceholderText } = renderSidebar(store, [])
+      fireEvent.change(getByPlaceholderText('Search...'), { target: { value: 'search' } })
+
+      expect(screen.getByText('Search Result')).toBeInTheDocument()
+      expect(screen.queryByTestId('search-loading')).not.toBeInTheDocument()
+      expect(screen.queryByTestId('sessions-refreshing')).not.toBeInTheDocument()
+    })
+
+    it('keeps loaded search results mounted while visible search work is in flight', async () => {
+      const searchProjects: ProjectGroup[] = [{
+        projectPath: '/work/search',
+        sessions: [{
+          provider: 'codex',
+          sessionId: 'search-session',
+          projectPath: '/work/search',
+          updatedAt: 1_700_000_000_000,
+          title: 'Search Result',
+        }],
+      }]
+
+      const store = createTestStore({
+        projects: searchProjects,
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: searchProjects,
+          lastLoadedAt: 1_700_000_000_000,
+          windows: {
+            sidebar: {
+              projects: searchProjects,
+              lastLoadedAt: 1_700_000_000_000,
+              loading: true,
+              loadingKind: 'search',
               query: 'search',
               searchTier: 'title',
             },
@@ -1794,6 +1836,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
               projects: [],
               lastLoadedAt: 1_700_000_000_000,
               loading: true,
+              loadingKind: 'background',
               query: '',
               searchTier: 'title',
             },
@@ -1804,7 +1847,8 @@ describe('Sidebar Component - Session-Centric Display', () => {
       renderSidebar(store, [])
 
       expect(screen.getByText('No sessions yet')).toBeInTheDocument()
-      expect(screen.getByTestId('sessions-refreshing')).toBeInTheDocument()
+      expect(screen.queryByTestId('sessions-refreshing')).not.toBeInTheDocument()
+      expect(screen.queryByTestId('search-loading')).not.toBeInTheDocument()
     })
 
     it('keeps first-load search blocking when no results have loaded yet', async () => {
@@ -1817,6 +1861,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             sidebar: {
               projects: [],
               loading: true,
+              loadingKind: 'initial',
               query: 'search',
               searchTier: 'title',
             },
@@ -1873,6 +1918,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             sidebar: {
               projects: [],
               loading: true,
+              loadingKind: 'initial',
               query: '',
               searchTier: 'title',
             },
@@ -1929,6 +1975,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             sidebar: {
               projects: [],
               loading: true,
+              loadingKind: 'initial',
               query: 'search',
               searchTier: 'title',
             },
