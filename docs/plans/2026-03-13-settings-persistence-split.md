@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task.
 
-**Goal:** Split Freshell settings into a strict server-backed contract and a unified browser-local preference layer, move the approved UI/debugging settings to browser storage, keep the approved server-backed workflow settings replicated across surfaces, and land the migration without losing legacy user preferences.
+**Goal:** Split Freshell settings into a strict server-backed contract and a unified browser-local preference layer, move the approved UI and debugging settings to browser storage, keep the approved workflow settings replicated through the server, and migrate existing users without silently losing moved preferences.
 
-**Architecture:** Replace the overloaded shared `AppSettings` model with one shared `ServerSettings` contract in `shared/settings.ts` and one browser-only `BrowserPreferences` module in `src/lib/browser-preferences.ts`. The client Redux settings slice should store both `serverSettings` and the resolved composed settings so bootstrap responses, websocket `settings.updated` messages, and local-storage sync can all converge deterministically without ad hoc per-field overlays.
+**Architecture:** Introduce one shared `ServerSettings` contract in `shared/settings.ts` and one unified browser-preference store in `src/lib/browser-preferences.ts`. Keep Redux storing both server and local settings plus a composed resolved view so most UI code can keep reading `state.settings.settings`, while all writes become explicitly local or explicitly server-backed.
 
 **Tech Stack:** TypeScript, Zod, Express, React 18, Redux Toolkit, Vitest, Testing Library, Playwright
 
@@ -12,17 +12,21 @@
 
 ## Strategy Gate
 
-The direct path is a clean cutover, not another round of per-field exceptions.
+The right fix is a clean persistence split, not more ad hoc exceptions.
 
-- Do **not** patch the current drift by sprinkling more `delete body.sidebar.*`, `applyLocalTerminalFontFamily()`, or one-off `localStorage` keys around the UI. That would keep the root problem: one type pretending to represent two persistence domains.
-- Put the server contract, defaults, normalization, and migration helpers in one shared module so the server validator, server config store, and client resolved-settings model all derive from the same source of truth.
-- Put browser-local preferences in one structured storage blob with targeted legacy-key migration. Keep device identity/aliases/dismissals in their existing dedicated keys because they are already browser-local and are not part of the settings split.
-- Keep `sidebar.excludeFirstChatSubstrings` server-backed with `sidebar.excludeFirstChatMustStart`. The user explicitly approved the assumption that the first-chat exclusion rule replicates across surfaces, and the toggle is not meaningful without the substring list.
-- Delete the dead duplicate route module `server/routes/settings.ts` so there is only one server settings router implementation after this change.
+- Do not keep the current mixed `AppSettings` model and paper over it with more one-off client overlays or `delete body.sidebar.foo` hacks.
+- Do not add a second duplicate schema tree. Shared settings types, defaults, normalization, and Zod builders must live in one `shared/settings.ts` module so the server validator, config store, and client composition logic cannot drift again.
+- Keep local browser preferences in one structured localStorage blob. Device identity, aliases, and dismissed-device state can stay in their existing dedicated browser keys because they are already local and are not part of the settings split.
+- Use a migration-only `legacyLocalSettingsSeed` in server config/bootstrap so pre-split server-backed values can seed missing local settings after upgrade. This is intentionally one-way fallback metadata, not live shared state.
+- Keep the local default `sidebar.sortMode` at `recency-pinned`. That matches the current client UX and removes the existing server/client default mismatch. Continue migrating legacy `'hybrid'` to `'activity'`.
+- Keep `sidebar.excludeFirstChatSubstrings` server-backed with `sidebar.excludeFirstChatMustStart`. The user explicitly kept that rule replicated across surfaces, and the toggle is not meaningful without the substring list.
+- Keep dynamic coding-CLI provider validation. `shared/settings.ts` must export schema builders that accept the runtime provider list; a static closed schema would regress extension/provider support.
+- Any code path that broadcasts `settings.updated` or returns bootstrap settings must send `ServerSettings`, never a mixed resolved client object.
+- Delete the dead duplicate server router in `server/routes/settings.ts` as part of the cutover so there is only one settings API implementation.
 
 ## Persistence Classification
 
-These paths are the end-state contract. Do not improvise alternate classifications while implementing.
+These are the end-state buckets. Do not improvise alternate classifications during implementation.
 
 **Server-backed settings**
 
@@ -69,90 +73,86 @@ These paths are the end-state contract. Do not improvise alternate classificatio
 - `sidebar.collapsed`
 - `notifications.soundEnabled`
 
-**Browser-local non-settings preferences that should join the same unified local-preference system**
+**Browser-local non-settings preferences that should live in the same unified browser-preference blob**
 
 - `toolStripExpanded`
 - `tabs.searchRangeDays`
 
-### Task 1: Define the shared server/local settings contract
+## Key Decisions
+
+- `allowedFilePaths` remains server-backed and internal. Do not add new UI for it during this work.
+- `defaultCwd` keeps its current PATCH API behavior where `null` clears the value. Preserve that explicitly in the server patch schema instead of accidentally removing it when deriving schemas from shared types.
+- `legacyLocalSettingsSeed` is intentionally migration-only fallback. It may seed a brand-new browser profile once after upgrade, but once local preferences exist they win permanently and ongoing local changes never replicate through the server.
+- Shared settings code must not import client-only types such as `AgentChatProviderName` from `src/`. In `shared/settings.ts`, use `string` keys for `agentChat.providers`.
+- Keep `defaultSettings` exports in both `server/config-store.ts` and `src/store/settingsSlice.ts`, but change what they mean:
+  - server `defaultSettings` becomes `defaultServerSettings`
+  - client `defaultSettings` becomes `composeResolvedSettings(defaultServerSettings, defaultLocalSettings)`
+
+### Task 1: Create the shared settings contract and normalization helpers
 
 **Files:**
 - Create: `shared/settings.ts`
 - Create: `test/unit/shared/settings.test.ts`
-- Modify: `test/integration/server/settings-api.test.ts`
-- Modify: `test/unit/server/config-store.test.ts`
-- Modify: `test/unit/server/settings-migrate.test.ts`
-- Delete: `server/routes/settings.ts`
 
 **Step 1: Write the failing tests**
 
-Add a pure shared-settings test suite that proves the new classification and merge rules:
+Add a new pure unit suite that proves:
 
-- composing `ServerSettings + LocalSettings` yields the resolved client settings shape
-- extracting a local-settings seed from legacy server config picks up the moved fields
-- stripping local-only keys from legacy server config leaves only server-backed settings
-- legacy local sort mode `'hybrid'` becomes `'activity'`
-- `agentChat.defaultPlugins` is part of the server-backed contract
-
-Extend the server API test so `/api/settings`:
-
-- rejects representative moved local fields such as `theme`, `terminal.fontSize`, `sidebar.sortMode`, `sidebar.showSubagents`, `sidebar.width`, `notifications.soundEnabled`
-- still accepts representative server-backed fields such as `defaultCwd`, `terminal.scrollback`, `sidebar.excludeFirstChatSubstrings`, `sidebar.excludeFirstChatMustStart`, and `agentChat.defaultPlugins`
-- never returns moved local-only fields from `GET /api/settings` or `PATCH /api/settings`
-
-Extend the config-store test so loading a legacy `config.json` containing both server-backed and newly-local fields produces:
-
-- sanitized server settings in memory
-- an extracted local-preference seed for the moved fields
-- rewritten persisted config that no longer reintroduces local-only settings on `patchSettings()`
-
-Remove the obsolete server sort-mode migration expectations from `test/unit/server/settings-migrate.test.ts`; keep only the still-valid `migrateLegacyDefaultEnabledProviders` coverage there.
+- `buildServerSettingsPatchSchema()` accepts server-backed fields and rejects representative local-only fields.
+- `composeResolvedSettings(server, local)` produces the resolved client shape, including `terminal.fontFamily`.
+- `extractLegacyLocalSettingsSeed()` pulls moved fields out of a legacy mixed settings object.
+- `stripLocalSettings()` removes moved fields while preserving server-backed fields.
+- local sort-mode normalization keeps valid values, migrates `'hybrid'` to `'activity'`, and defaults invalid values to `'recency-pinned'`.
+- `agentChat.defaultPlugins` is part of the server-backed contract.
 
 **Step 2: Run the tests to verify they fail**
 
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/shared/settings.test.ts test/integration/server/settings-api.test.ts test/unit/server/config-store.test.ts test/unit/server/settings-migrate.test.ts
+npm run test:vitest -- test/unit/shared/settings.test.ts
 ```
 
-Expected: FAIL because `shared/settings.ts` does not exist, `/api/settings` still accepts and returns local-only fields, `ConfigStore` still treats local-only keys as server settings, and the server migration suite still assumes sort mode is server-backed.
+Expected: FAIL because `shared/settings.ts` does not exist.
 
 **Step 3: Write the minimal implementation**
 
-Create `shared/settings.ts` as the single contract module. It should export:
+Create `shared/settings.ts` as the single source of truth for settings contracts. It should export:
 
 ```ts
 export const defaultServerSettings
 export const defaultLocalSettings
-export const ServerSettingsSchema
-export const LocalSettingsSchema
 export type ServerSettings
 export type ServerSettingsPatch
 export type LocalSettings
 export type LocalSettingsPatch
 export type ResolvedSettings
+export function buildServerSettingsSchema(...)
+export function buildServerSettingsPatchSchema(...)
+export const LocalSettingsSchema
 export function mergeServerSettings(...)
 export function mergeLocalSettings(...)
 export function composeResolvedSettings(...)
+export function normalizeLocalSortMode(...)
 export function extractLegacyLocalSettingsSeed(...)
 export function stripLocalSettings(...)
 ```
 
 Implementation rules:
 
-- Lift existing server-backed enums and defaults from `server/config-store.ts`; do not invent new values.
-- Include `agentChat.defaultPlugins` in `ServerSettingsSchema`.
-- Keep `terminal.fontFamily` and `sidebar.ignoreCodexSubagents` out of `ServerSettingsSchema`.
-- Move the old client-only sort-mode migration into shared local-settings normalization.
-- Delete `server/routes/settings.ts`.
+- `buildServerSettingsSchema()` and `buildServerSettingsPatchSchema()` must accept the runtime coding-CLI provider list.
+- Preserve the PATCH-only `defaultCwd: null` clearing behavior.
+- Put `agentChat.defaultPlugins` in `ServerSettings`.
+- Keep `terminal.fontFamily` and `sidebar.ignoreCodexSubagents` out of `ServerSettings`.
+- Make `defaultLocalSettings.sidebar.sortMode` equal `'recency-pinned'`.
+- Do not import any `src/` types into `shared/settings.ts`.
 
 **Step 4: Run the tests to verify they pass**
 
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/shared/settings.test.ts test/integration/server/settings-api.test.ts test/unit/server/config-store.test.ts test/unit/server/settings-migrate.test.ts
+npm run test:vitest -- test/unit/shared/settings.test.ts
 ```
 
 Expected: PASS
@@ -160,81 +160,74 @@ Expected: PASS
 **Step 5: Commit**
 
 ```bash
-git add shared/settings.ts \
-  test/unit/shared/settings.test.ts \
-  test/integration/server/settings-api.test.ts \
-  test/unit/server/config-store.test.ts \
-  test/unit/server/settings-migrate.test.ts \
-  server/routes/settings.ts
-git commit -m "refactor(settings): define server and local contracts"
+git add shared/settings.ts test/unit/shared/settings.test.ts
+git commit -m "refactor(settings): add shared server and local contracts"
 ```
 
-### Task 2: Cut the server over to `ServerSettings` and expose bootstrap migration seed
+### Task 2: Cut the server config store and settings API over to `ServerSettings`
 
 **Files:**
 - Modify: `server/config-store.ts`
 - Modify: `server/settings-router.ts`
 - Modify: `server/settings-migrate.ts`
-- Modify: `server/index.ts`
-- Modify: `server/shell-bootstrap-router.ts`
-- Modify: `server/perf-router.ts`
-- Modify: `server/ws-handler.ts`
-- Modify: `server/terminal-registry.ts`
-- Modify: `shared/read-models.ts`
-- Modify: `test/integration/server/bootstrap-router.test.ts`
+- Modify: `test/integration/server/settings-api.test.ts`
+- Modify: `test/integration/server/api-edge-cases.test.ts`
+- Modify: `test/unit/server/config-store.test.ts`
+- Modify: `test/unit/server/settings-migrate.test.ts`
+- Delete: `server/routes/settings.ts`
 
 **Step 1: Write the failing tests**
 
-Add bootstrap router assertions that `/api/bootstrap` includes:
+Update the server contract tests so they assert:
 
-- sanitized `settings` containing only `ServerSettings`
-- optional `localPreferenceSeed` when legacy moved fields were found in config
-- no payload-budget regression beyond the existing bootstrap size guard
-
-Add config-store assertions that:
-
-- `UserConfig.settings` is stored as `ServerSettings`
-- optional `localPreferenceSeed` is retained as migration metadata
-- `patchSettings()` never writes local-only fields back into `settings`
+- `GET /api/settings` and `PATCH /api/settings` return and accept only `ServerSettings`.
+- representative moved local fields such as `theme`, `terminal.fontSize`, `terminal.renderer`, `sidebar.sortMode`, `sidebar.showSubagents`, `sidebar.ignoreCodexSubagents`, `sidebar.width`, `panes.snapThreshold`, and `notifications.soundEnabled` are rejected with `400`.
+- representative server-backed fields such as `defaultCwd`, `terminal.scrollback`, `logging.debug`, `sidebar.excludeFirstChatSubstrings`, `sidebar.excludeFirstChatMustStart`, `codingCli.providers.codex.cwd`, and `agentChat.defaultPlugins` still round-trip.
+- `PATCH /api/settings` still accepts `defaultCwd: null` and normalizes it to `undefined`.
+- loading a legacy `config.json` with moved local fields produces sanitized server settings plus a `legacyLocalSettingsSeed`.
+- `patchSettings()` never writes local-only fields back into `config.json`.
+- `server/settings-migrate.ts` no longer owns sort-mode migration; only still-valid server migrations remain there.
 
 **Step 2: Run the tests to verify they fail**
 
 Run:
 
 ```bash
-npm run test:vitest -- test/integration/server/bootstrap-router.test.ts test/integration/server/settings-api.test.ts test/unit/server/config-store.test.ts
+npm run test:vitest -- test/integration/server/settings-api.test.ts test/integration/server/api-edge-cases.test.ts test/unit/server/config-store.test.ts test/unit/server/settings-migrate.test.ts
 ```
 
-Expected: FAIL because bootstrap does not yet expose `localPreferenceSeed`, server runtime code still imports the old `AppSettings` shape, and settings updates still flow through the old contract.
+Expected: FAIL because the server still persists and validates the old mixed settings shape.
 
 **Step 3: Write the minimal implementation**
 
-Server-side implementation rules:
+Server implementation rules:
 
-- Rename the server type usage to `ServerSettings` everywhere server runtime depends on settings.
-- `ConfigStore` should cache:
+- `server/config-store.ts` should persist:
 
 ```ts
-type UserConfig = {
+export type UserConfig = {
   version: 1
   settings: ServerSettings
-  localPreferenceSeed?: LocalSettingsPatch
-  ...
+  legacyLocalSettingsSeed?: LocalSettingsPatch
+  sessionOverrides: ...
+  terminalOverrides: ...
+  projectColors: ...
+  recentDirectories?: string[]
 }
 ```
 
-- On load, read the raw legacy config once, extract the local seed with `extractLegacyLocalSettingsSeed()`, strip local settings out of `settings`, and keep the seed in `localPreferenceSeed`.
-- `createSettingsRouter()` must validate patches with the shared `ServerSettingsSchema`-derived patch schema. Do not keep local-only fields in the router and do not keep the old `ignoreCodexSubagentSessions` workaround except as an optional legacy no-op delete before validation if still needed for compatibility.
-- `createShellBootstrapRouter()` should accept a `getLocalPreferenceSeed` dependency and include `localPreferenceSeed` in the bootstrap payload only when defined.
-- `TerminalRegistry`, `PerfRouter`, and websocket `settings.updated` broadcasts must operate on `ServerSettings`, not resolved client settings.
-- `server/settings-migrate.ts` should only contain migrations that still belong to the server contract after the split.
+- On load, read the raw legacy config, extract moved local fields into `legacyLocalSettingsSeed`, strip them from `settings`, and normalize the remaining server settings.
+- Keep `legacyLocalSettingsSeed` as migration metadata only. It is not part of `ServerSettings`, and `patchSettings()` must never merge incoming patches into it.
+- `server/settings-router.ts` should delegate schema building to `shared/settings.ts` and keep exporting `SettingsPatchSchema` for existing imports.
+- Remove sort-mode migration from server settings flow. Sort-mode normalization now belongs to local settings only.
+- Delete `server/routes/settings.ts`.
 
 **Step 4: Run the tests to verify they pass**
 
 Run:
 
 ```bash
-npm run test:vitest -- test/integration/server/bootstrap-router.test.ts test/integration/server/settings-api.test.ts test/unit/server/config-store.test.ts
+npm run test:vitest -- test/integration/server/settings-api.test.ts test/integration/server/api-edge-cases.test.ts test/unit/server/config-store.test.ts test/unit/server/settings-migrate.test.ts
 ```
 
 Expected: PASS
@@ -245,53 +238,142 @@ Expected: PASS
 git add server/config-store.ts \
   server/settings-router.ts \
   server/settings-migrate.ts \
-  server/index.ts \
-  server/shell-bootstrap-router.ts \
-  server/perf-router.ts \
-  server/ws-handler.ts \
-  server/terminal-registry.ts \
-  shared/read-models.ts \
-  test/integration/server/bootstrap-router.test.ts
-git commit -m "refactor(settings): migrate server persistence and bootstrap"
+  test/integration/server/settings-api.test.ts \
+  test/integration/server/api-edge-cases.test.ts \
+  test/unit/server/config-store.test.ts \
+  test/unit/server/settings-migrate.test.ts \
+  server/routes/settings.ts
+git commit -m "refactor(settings): move server persistence to server-only contract"
 ```
 
-### Task 3: Build the unified browser-preferences storage module and migrate legacy keys
+### Task 3: Return only server settings from bootstrap and all server broadcasts
 
 **Files:**
-- Create: `src/lib/browser-preferences.ts`
-- Create: `test/unit/client/lib/browser-preferences.test.ts`
-- Modify: `src/lib/terminal-fonts.ts`
-- Modify: `src/store/storage-keys.ts`
+- Modify: `shared/read-models.ts`
+- Modify: `server/index.ts`
+- Modify: `server/shell-bootstrap-router.ts`
+- Modify: `server/perf-router.ts`
+- Modify: `server/network-router.ts`
+- Modify: `server/network-manager.ts`
+- Modify: `server/ws-handler.ts`
+- Modify: `server/terminal-registry.ts`
+- Modify: `test/integration/server/bootstrap-router.test.ts`
+- Modify: `test/server/perf-api.test.ts`
+- Modify: `test/integration/server/network-api.test.ts`
 
 **Step 1: Write the failing tests**
 
-Add a browser-preferences unit suite that proves:
+Add or update tests so they prove:
 
-- the new storage key reads and writes a structured JSON blob
-- malformed JSON falls back safely to defaults
-- legacy keys are imported into the new blob exactly once:
-  - `freshell.terminal.fontFamily.v1`
-  - `freshell:toolStripExpanded`
-- bootstrap `localPreferenceSeed` fills missing local settings but never overwrites an existing local value
-- `tabs.searchRangeDays` persists in the same blob
-- subscription notifies both same-document writes and cross-document `storage` events
+- `/api/bootstrap` returns `settings: ServerSettings` and optional `legacyLocalSettingsSeed`, not a mixed resolved settings object.
+- bootstrap still respects the existing payload budget.
+- `POST /api/perf` broadcasts a `settings.updated` message containing only server-backed settings.
+- `POST /api/network/configure` does the same.
+- the server runtime types used by `TerminalRegistry` and websocket settings snapshots are `ServerSettings`.
 
 **Step 2: Run the tests to verify they fail**
 
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/lib/browser-preferences.test.ts test/unit/client/lib/terminal-fonts.test.ts test/unit/client/components/agent-chat/ToolStrip.test.tsx test/e2e/tabs-view-search-range.test.tsx
+npm run test:vitest -- test/integration/server/bootstrap-router.test.ts test/server/perf-api.test.ts test/integration/server/network-api.test.ts
 ```
 
-Expected: FAIL because the unified browser-preferences module does not exist, terminal-font persistence still lives in `terminal-fonts.ts`, ToolStrip still uses the legacy key, and search-range persistence is still absent.
+Expected: FAIL because bootstrap and server broadcasters still use the mixed settings object.
 
 **Step 3: Write the minimal implementation**
 
-Create `src/lib/browser-preferences.ts` with one storage key, one schema, and one subscription surface:
+Implementation rules:
+
+- Extend `BootstrapPayload` in `shared/read-models.ts` to:
+
+```ts
+export type BootstrapPayload = {
+  settings: ServerSettings
+  legacyLocalSettingsSeed?: LocalSettingsPatch
+  platform: unknown
+  shell: ...
+  perf?: ...
+  configFallback?: ...
+}
+```
+
+- `createShellBootstrapRouter()` should accept a `getLegacyLocalSettingsSeed` dependency and include it only when defined.
+- `server/index.ts`, `server/perf-router.ts`, `server/network-router.ts`, `server/network-manager.ts`, and `server/ws-handler.ts` must all broadcast or hand off `ServerSettings`.
+- `server/terminal-registry.ts` must accept `ServerSettings` because it only needs server-owned fields such as `defaultCwd`, `scrollback`, and idle-kill settings.
+
+**Step 4: Run the tests to verify they pass**
+
+Run:
+
+```bash
+npm run test:vitest -- test/integration/server/bootstrap-router.test.ts test/server/perf-api.test.ts test/integration/server/network-api.test.ts
+```
+
+Expected: PASS
+
+**Step 5: Commit**
+
+```bash
+git add shared/read-models.ts \
+  server/index.ts \
+  server/shell-bootstrap-router.ts \
+  server/perf-router.ts \
+  server/network-router.ts \
+  server/network-manager.ts \
+  server/ws-handler.ts \
+  server/terminal-registry.ts \
+  test/integration/server/bootstrap-router.test.ts \
+  test/server/perf-api.test.ts \
+  test/integration/server/network-api.test.ts
+git commit -m "refactor(settings): send only server settings over server surfaces"
+```
+
+### Task 4: Build the unified browser-preference store and targeted legacy-key migration
+
+**Files:**
+- Create: `src/lib/browser-preferences.ts`
+- Create: `test/unit/client/lib/browser-preferences.test.ts`
+- Modify: `src/lib/terminal-fonts.ts`
+- Modify: `src/store/storage-keys.ts`
+- Modify: `src/store/storage-migration.ts`
+- Modify: `test/unit/client/lib/terminal-fonts.test.ts`
+- Modify: `test/unit/client/store/storage-migration.test.ts`
+
+**Step 1: Write the failing tests**
+
+Add a browser-preference unit suite that proves:
+
+- the new storage key reads and writes a structured blob.
+- malformed JSON falls back safely.
+- legacy keys are imported exactly once:
+  - `freshell.terminal.fontFamily.v1`
+  - `freshell:toolStripExpanded`
+- `tabs.searchRangeDays` is stored in the same blob.
+- same-document subscribers are notified without dispatching a fake `StorageEvent`.
+- cross-document `storage` events also notify subscribers.
+- seeding from `legacyLocalSettingsSeed` fills only missing values and never overwrites an existing local value.
+
+Extend `terminal-fonts` tests so they prove `terminal-fonts.ts` no longer owns localStorage persistence.
+Extend the storage-migration test so a general storage-version bump preserves the browser-preference blob.
+
+**Step 2: Run the tests to verify they fail**
+
+Run:
+
+```bash
+npm run test:vitest -- test/unit/client/lib/browser-preferences.test.ts test/unit/client/lib/terminal-fonts.test.ts test/unit/client/store/storage-migration.test.ts
+```
+
+Expected: FAIL because the unified browser-preference module does not exist.
+
+**Step 3: Write the minimal implementation**
+
+Create `src/lib/browser-preferences.ts` with one versioned key and one subscription surface:
 
 ```ts
 export const BROWSER_PREFERENCES_STORAGE_KEY = 'freshell.browser-preferences.v1'
+export const BROWSER_PREFERENCES_EVENT = 'freshell.browser-preferences.changed'
 
 export type BrowserPreferences = {
   settings: LocalSettings
@@ -312,16 +394,18 @@ export function setSearchRangeDaysPreference(...)
 
 Implementation rules:
 
-- Keep `terminal-fonts.ts` focused on font-family resolution and font catalog only. Remove its storage helpers and update callers to use `browser-preferences.ts`.
-- Add a constant for `BROWSER_PREFERENCES_STORAGE_KEY` to `src/store/storage-keys.ts`.
-- Do **not** use the global wipe-based storage migration for this feature. Perform targeted migration inside `browser-preferences.ts` so tabs/panes/device state remain intact.
+- Use a `CustomEvent` for same-document notifications and listen to real `storage` events for cross-tab updates.
+- Keep `terminal-fonts.ts` focused on font catalog and font-family resolution only.
+- Add `BROWSER_PREFERENCES_STORAGE_KEY` to `src/store/storage-keys.ts`.
+- Update `src/store/storage-migration.ts` so repo-wide storage-version wipes preserve `BROWSER_PREFERENCES_STORAGE_KEY`. Browser preferences are independently versioned and should not be lost because tabs or panes changed schema.
+- Do not use the global wipe-based `storage-migration.ts` for this feature.
 
 **Step 4: Run the tests to verify they pass**
 
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/lib/browser-preferences.test.ts test/unit/client/lib/terminal-fonts.test.ts test/unit/client/components/agent-chat/ToolStrip.test.tsx test/e2e/tabs-view-search-range.test.tsx
+npm run test:vitest -- test/unit/client/lib/browser-preferences.test.ts test/unit/client/lib/terminal-fonts.test.ts test/unit/client/store/storage-migration.test.ts
 ```
 
 Expected: PASS
@@ -332,11 +416,14 @@ Expected: PASS
 git add src/lib/browser-preferences.ts \
   test/unit/client/lib/browser-preferences.test.ts \
   src/lib/terminal-fonts.ts \
-  src/store/storage-keys.ts
-git commit -m "feat(settings): add unified browser preferences storage"
+  src/store/storage-keys.ts \
+  src/store/storage-migration.ts \
+  test/unit/client/lib/terminal-fonts.test.ts \
+  test/unit/client/store/storage-migration.test.ts
+git commit -m "feat(settings): add unified browser preferences store"
 ```
 
-### Task 4: Recompose client settings from `serverSettings + localSettings`
+### Task 5: Hydrate the client settings slice from server settings plus local preferences
 
 **Files:**
 - Modify: `src/store/types.ts`
@@ -349,18 +436,15 @@ git commit -m "feat(settings): add unified browser preferences storage"
 
 **Step 1: Write the failing tests**
 
-Update the settings slice and bootstrap tests so they assert the new convergence model:
+Update the client state tests so they prove:
 
-- the settings slice keeps `serverSettings` separately from resolved `settings`
-- bootstrap composes resolved settings from sanitized server settings plus browser-local preferences
-- bootstrap seeds empty local preferences from `localPreferenceSeed`
-- websocket `settings.updated` recomposes from the current browser-local preferences instead of clobbering them
-- a storage change in the browser-preference blob recomposes resolved settings without refetching `/api/settings`
-
-Extend the terminal-font flow test into a broader local-settings migration proof:
-
-- an empty browser seeds `terminal.fontFamily` from bootstrap `localPreferenceSeed`
-- an existing local font still wins over bootstrap seed and over later websocket updates
+- `SettingsState` holds `serverSettings`, `localSettings`, and composed `settings`.
+- the slice initializes `localSettings` from `browser-preferences.ts` synchronously.
+- bootstrap composes resolved settings from `settings + localSettings`.
+- bootstrap seeds missing local values from `legacyLocalSettingsSeed`.
+- websocket `settings.updated` recomposes against the current local settings instead of clobbering them.
+- a browser-preference change recomposes settings without refetching `/api/settings`.
+- terminal font migration still works, but now through the general local-settings path rather than a font-family special case.
 
 **Step 2: Run the tests to verify they fail**
 
@@ -370,11 +454,11 @@ Run:
 npm run test:vitest -- test/unit/client/store/settingsSlice.test.ts test/unit/client/components/App.ws-bootstrap.test.tsx test/e2e/terminal-font-settings.test.tsx
 ```
 
-Expected: FAIL because the slice still stores only one mixed settings object, App still overlays only `fontFamily`, and bootstrap/ws paths do not know about `localPreferenceSeed` or the new browser-preference subscription.
+Expected: FAIL because the slice still stores only one mixed settings object and `App.tsx` still hard-codes `applyLocalTerminalFontFamily()`.
 
 **Step 3: Write the minimal implementation**
 
-Refactor the settings slice into the steady-state model:
+Refactor the settings slice into this steady-state shape:
 
 ```ts
 type SettingsState = {
@@ -386,21 +470,24 @@ type SettingsState = {
 }
 ```
 
-Add pure actions that keep the composition explicit:
+Add pure actions:
 
-- `setServerSettings(serverSettings)`
+- `hydrateServerSettings(serverSettings)`
 - `hydrateLocalSettings(localSettings)`
 - `updateLocalSettings(localPatch)`
 - `previewServerSettingsPatch(serverPatch)`
 - `markSaved()`
 
-`App.tsx` must:
+Implementation rules:
 
-- load browser preferences before applying bootstrap settings
-- seed empty local preferences from `bootstrap.localPreferenceSeed`
-- dispatch `setServerSettings()` for bootstrap and `settings.updated`
-- subscribe to browser-preference changes and dispatch `hydrateLocalSettings()` / `setTabRegistrySearchRangeDays()` without extra network traffic
-- remove the old `applyLocalTerminalFontFamily()` special case entirely
+- `src/store/types.ts` should stop owning duplicate settings definitions and instead re-export the shared settings types needed by the client.
+- `src/store/settingsSlice.ts` should export `defaultSettings = composeResolvedSettings(defaultServerSettings, defaultLocalSettings)` to minimize UI churn.
+- `App.tsx` should:
+  - load browser preferences before applying bootstrap data
+  - seed missing local values from `bootstrap.legacyLocalSettingsSeed`
+  - dispatch `hydrateServerSettings()` for bootstrap and websocket updates
+  - subscribe to browser-preference changes and dispatch `hydrateLocalSettings()`
+  - delete the `applyLocalTerminalFontFamily()` special case entirely
 
 **Step 4: Run the tests to verify they pass**
 
@@ -422,15 +509,15 @@ git add src/store/types.ts \
   test/unit/client/components/App.ws-bootstrap.test.tsx \
   test/e2e/terminal-font-settings.test.tsx \
   test/unit/client/components/settings-view-test-utils.tsx
-git commit -m "refactor(settings): compose resolved settings from server and local state"
+git commit -m "refactor(settings): compose client settings from server and local state"
 ```
 
-### Task 5: Split Settings UI, sidebar, and OSC52 writes by persistence layer
+### Task 6: Split SettingsView, sidebar, and OSC52 writes by persistence layer
 
 **Files:**
 - Modify: `src/components/SettingsView.tsx`
-- Modify: `src/components/TerminalView.tsx`
 - Modify: `src/App.tsx`
+- Modify: `src/components/TerminalView.tsx`
 - Modify: `test/unit/client/components/SettingsView.core.test.tsx`
 - Modify: `test/unit/client/components/SettingsView.behavior.test.tsx`
 - Modify: `test/unit/client/components/SettingsView.terminal-advanced.test.tsx`
@@ -440,17 +527,49 @@ git commit -m "refactor(settings): compose resolved settings from server and loc
 
 **Step 1: Write the failing tests**
 
-Rewrite the UI persistence tests around the new split:
+Rewrite the UI persistence tests so they assert:
 
-- local controls update Redux plus browser-preference storage and do **not** call `/api/settings`
-- server-backed controls still optimistically update Redux, debounce a server patch, and mark save time on success
-- sidebar width/collapse is local-only, including mobile auto-collapse
-- OSC52 policy is local-only in both SettingsView and TerminalView prompt flows
+- local controls update Redux and the browser-preference blob immediately, and never call `/api/settings`.
+- server-backed controls optimistically preview the server patch, debounce `/api/settings`, and mark save time on success.
+- sidebar width and collapsed state are local-only, including responsive/mobile auto-collapse.
+- OSC52 policy is local-only in both SettingsView and TerminalView prompt flows.
 
-Use these representative assertions:
+Use this exact local-vs-server split in assertions:
 
-- local: `theme`, `uiScale`, `terminal.fontSize`, `terminal.cursorBlink`, `terminal.theme`, `terminal.warnExternalLinks`, `terminal.renderer`, `sidebar.sortMode`, `sidebar.showSubagents`, `sidebar.ignoreCodexSubagents`, `sidebar.showNoninteractiveSessions`, `sidebar.hideEmptySessions`, `sidebar.width`, `sidebar.collapsed`, `notifications.soundEnabled`
-- server: `defaultCwd`, `terminal.scrollback`, `safety.autoKillIdleMinutes`, `sidebar.excludeFirstChatSubstrings`, `sidebar.excludeFirstChatMustStart`, `logging.debug`
+- local controls:
+  - `theme`
+  - `uiScale`
+- `terminal.fontSize`
+- `terminal.fontFamily`
+- `terminal.lineHeight`
+  - `terminal.cursorBlink`
+  - `terminal.theme`
+  - `terminal.warnExternalLinks`
+  - `terminal.osc52Clipboard`
+  - `terminal.renderer`
+  - `sidebar.sortMode`
+  - `sidebar.showProjectBadges`
+  - `sidebar.showSubagents`
+  - `sidebar.ignoreCodexSubagents`
+  - `sidebar.showNoninteractiveSessions`
+  - `sidebar.hideEmptySessions`
+  - `sidebar.width`
+  - `sidebar.collapsed`
+  - `panes.snapThreshold`
+  - `panes.iconsOnTabs`
+  - `panes.tabAttentionStyle`
+  - `panes.attentionDismiss`
+  - `notifications.soundEnabled`
+- server-backed controls:
+  - `defaultCwd`
+  - `terminal.scrollback`
+  - `logging.debug`
+  - `safety.autoKillIdleMinutes`
+  - `panes.defaultNewPane`
+  - `sidebar.excludeFirstChatSubstrings`
+  - `sidebar.excludeFirstChatMustStart`
+  - `editor.*`
+  - `codingCli.enabledProviders`
 
 **Step 2: Run the tests to verify they fail**
 
@@ -460,11 +579,11 @@ Run:
 npm run test:vitest -- test/unit/client/components/SettingsView.core.test.tsx test/unit/client/components/SettingsView.behavior.test.tsx test/unit/client/components/SettingsView.terminal-advanced.test.tsx test/unit/client/components/App.sidebar-resize.test.tsx test/unit/client/components/TerminalView.osc52.test.tsx test/e2e/terminal-osc52-policy-flow.test.tsx
 ```
 
-Expected: FAIL because the current UI still routes almost every control through one debounced `/api/settings` writer and the sidebar / OSC52 paths still patch the server.
+Expected: FAIL because the current UI still routes almost everything through one debounced server patch helper.
 
 **Step 3: Write the minimal implementation**
 
-Refactor `SettingsView` so it has two explicit write helpers instead of one generic `scheduleSave()`:
+Refactor `SettingsView.tsx` to use two explicit write helpers:
 
 ```ts
 const applyLocalPreference = (patch: DeepPartial<LocalSettings>) => { ... }
@@ -474,10 +593,10 @@ const applyServerSetting = (patch: DeepPartial<ServerSettings>) => { ... }
 Implementation rules:
 
 - Local controls must call `updateLocalSettings()` and `patchBrowserPreferences({ settings: ... })` immediately.
-- Server-backed controls must call `previewServerSettingsPatch()` and debounce only the server patch.
-- `App.tsx` sidebar resize/collapse handlers must stop patching `/api/settings`.
-- `TerminalView.tsx` `persistOsc52Policy()` must stop patching `/api/settings`.
-- Do not keep any code path that submits a full mixed `sidebar` object to the server.
+- Server-backed controls must call `previewServerSettingsPatch()` and debounce only the `/api/settings` call.
+- `App.tsx` sidebar resize/collapse handlers must stop PATCHing `/api/settings`.
+- `TerminalView.tsx` `persistOsc52Policy()` must stop PATCHing `/api/settings`.
+- No code path may submit a mixed `sidebar` object to the server anymore.
 
 **Step 4: Run the tests to verify they pass**
 
@@ -493,66 +612,129 @@ Expected: PASS
 
 ```bash
 git add src/components/SettingsView.tsx \
-  src/components/TerminalView.tsx \
   src/App.tsx \
+  src/components/TerminalView.tsx \
   test/unit/client/components/SettingsView.core.test.tsx \
   test/unit/client/components/SettingsView.behavior.test.tsx \
   test/unit/client/components/SettingsView.terminal-advanced.test.tsx \
   test/unit/client/components/App.sidebar-resize.test.tsx \
   test/unit/client/components/TerminalView.osc52.test.tsx \
   test/e2e/terminal-osc52-policy-flow.test.tsx
-git commit -m "fix(settings): split local and server write paths"
+git commit -m "fix(settings): split local and server settings writes in the UI"
 ```
 
-### Task 6: Fold tool-strip state, tab search range, and agent-chat defaults into the new model
+### Task 7: Fix the remaining server-backed writers outside SettingsView
 
 **Files:**
-- Modify: `src/components/agent-chat/ToolStrip.tsx`
-- Modify: `src/components/TabsView.tsx`
-- Modify: `src/store/tabRegistrySlice.ts`
 - Modify: `src/components/panes/PaneContainer.tsx`
-- Modify: `test/unit/client/components/agent-chat/ToolStrip.test.tsx`
-- Modify: `test/unit/client/components/agent-chat/MessageBubble.test.tsx`
-- Modify: `test/e2e/tabs-view-search-range.test.tsx`
+- Modify: `src/components/agent-chat/AgentChatView.tsx`
 - Modify: `test/unit/client/components/panes/PaneContainer.test.tsx`
-- Modify: `test/e2e/agent-chat-context-menu-flow.test.tsx`
-- Modify: `test/e2e/agent-chat-polish-flow.test.tsx`
+- Modify: `test/unit/client/components/agent-chat/AgentChatView.behavior.test.tsx`
 
 **Step 1: Write the failing tests**
 
-Update the tool-strip and tabs tests so they assert:
+Add or update tests so they prove:
 
-- ToolStrip reads and writes its expanded state through `browser-preferences.ts`, not the legacy `freshell:toolStripExpanded` key
-- `searchRangeDays` initializes from the browser-preference blob, persists on change, and survives rerender/reload
-- `PaneContainer` still passes `settings.agentChat.defaultPlugins` into new agent-chat panes after the server contract change
-
-Update the agent-chat flow tests that hard-code the legacy tool-strip key so they fail until the new browser-preference helper is in place.
+- `PaneContainer` still saves coding-CLI provider `cwd` as a server-backed setting, but now uses the server-preview path instead of `updateSettingsLocal()` with the mixed settings model.
+- `AgentChatView` still saves:
+  - `agentChat.providers.<provider>.defaultModel`
+  - `agentChat.providers.<provider>.defaultPermissionMode`
+  - `agentChat.providers.<provider>.defaultEffort`
+  - `agentChat.initialSetupDone`
+- those writes remain server-backed and keep optimistic UI behavior.
 
 **Step 2: Run the tests to verify they fail**
 
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/components/agent-chat/ToolStrip.test.tsx test/unit/client/components/agent-chat/MessageBubble.test.tsx test/e2e/tabs-view-search-range.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/e2e/agent-chat-context-menu-flow.test.tsx test/e2e/agent-chat-polish-flow.test.tsx
+npm run test:vitest -- test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/components/agent-chat/AgentChatView.behavior.test.tsx
 ```
 
-Expected: FAIL because ToolStrip still uses the legacy key, `searchRangeDays` still resets on reload, and the tests still reference the old storage behavior.
+Expected: FAIL because those components still rely on the old mixed settings actions.
 
 **Step 3: Write the minimal implementation**
 
 Implementation rules:
 
-- `ToolStrip.tsx` should use `subscribeBrowserPreferences()` and the dedicated getter/setter helpers for `toolStrip.expanded`.
-- `tabRegistrySlice.ts` should read its initial `searchRangeDays` from `browser-preferences.ts`; `TabsView.tsx` should persist updates through `setSearchRangeDaysPreference()` whenever the user changes the range.
-- Keep `searchRangeDays` inside the tab-registry Redux state because `tabRegistrySync.ts` already depends on it for outbound websocket queries.
-- `PaneContainer.tsx` does not need a persistence refactor; it only needs to keep consuming the resolved settings object so `agentChat.defaultPlugins` continues to work after the server schema fix.
+- `PaneContainer.tsx` should replace `updateSettingsLocal(patch)` with `previewServerSettingsPatch(patch)` before PATCHing `/api/settings`.
+- `AgentChatView.tsx` should do the same for agent-chat provider defaults and `initialSetupDone`.
+- Keep `settings.agentChat.defaultPlugins` flowing through resolved settings for pane creation. This task is about the write paths that the current plan previously missed.
 
 **Step 4: Run the tests to verify they pass**
 
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/components/agent-chat/ToolStrip.test.tsx test/unit/client/components/agent-chat/MessageBubble.test.tsx test/e2e/tabs-view-search-range.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/e2e/agent-chat-context-menu-flow.test.tsx test/e2e/agent-chat-polish-flow.test.tsx
+npm run test:vitest -- test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/components/agent-chat/AgentChatView.behavior.test.tsx
+```
+
+Expected: PASS
+
+**Step 5: Commit**
+
+```bash
+git add src/components/panes/PaneContainer.tsx \
+  src/components/agent-chat/AgentChatView.tsx \
+  test/unit/client/components/panes/PaneContainer.test.tsx \
+  test/unit/client/components/agent-chat/AgentChatView.behavior.test.tsx
+git commit -m "fix(settings): keep non-SettingsView server writers working"
+```
+
+### Task 8: Move ToolStrip state and tab search range into the unified browser-preference store
+
+**Files:**
+- Modify: `src/components/agent-chat/ToolStrip.tsx`
+- Modify: `src/components/TabsView.tsx`
+- Modify: `src/store/tabRegistrySlice.ts`
+- Modify: `test/unit/client/components/agent-chat/ToolStrip.test.tsx`
+- Modify: `test/unit/client/components/agent-chat/MessageBubble.test.tsx`
+- Modify: `test/e2e/tabs-view-search-range.test.tsx`
+- Modify: `test/e2e/agent-chat-context-menu-flow.test.tsx`
+- Modify: `test/e2e/agent-chat-polish-flow.test.tsx`
+
+**Step 1: Write the failing tests**
+
+Update the tests so they assert:
+
+- ToolStrip reads and writes its expanded state through `browser-preferences.ts`, not the legacy `freshell:toolStripExpanded` key.
+- `searchRangeDays` initializes from browser preferences, persists on change, and survives rerender/reload.
+- tests that hard-code the legacy tool-strip key fail until the new helper is in place.
+
+**Step 2: Run the tests to verify they fail**
+
+Run:
+
+```bash
+npm run test:vitest -- test/unit/client/components/agent-chat/ToolStrip.test.tsx test/unit/client/components/agent-chat/MessageBubble.test.tsx test/e2e/tabs-view-search-range.test.tsx test/e2e/agent-chat-context-menu-flow.test.tsx test/e2e/agent-chat-polish-flow.test.tsx
+```
+
+Expected: FAIL because ToolStrip still uses the legacy key and `searchRangeDays` still resets on reload.
+
+**Step 3: Write the minimal implementation**
+
+Implementation rules:
+
+- `ToolStrip.tsx` should use:
+
+```ts
+const expanded = useSyncExternalStore(
+  subscribeBrowserPreferences,
+  getToolStripExpandedPreference,
+  () => false,
+)
+```
+
+- `tabRegistrySlice.ts` should initialize `searchRangeDays` from `getSearchRangeDaysPreference()`.
+- `TabsView.tsx` should persist range changes through `setSearchRangeDaysPreference()`.
+- Keep `searchRangeDays` in Redux because `tabRegistrySync.ts` depends on it for outbound websocket queries.
+
+**Step 4: Run the tests to verify they pass**
+
+Run:
+
+```bash
+npm run test:vitest -- test/unit/client/components/agent-chat/ToolStrip.test.tsx test/unit/client/components/agent-chat/MessageBubble.test.tsx test/e2e/tabs-view-search-range.test.tsx test/e2e/agent-chat-context-menu-flow.test.tsx test/e2e/agent-chat-polish-flow.test.tsx
 ```
 
 Expected: PASS
@@ -563,17 +745,15 @@ Expected: PASS
 git add src/components/agent-chat/ToolStrip.tsx \
   src/components/TabsView.tsx \
   src/store/tabRegistrySlice.ts \
-  src/components/panes/PaneContainer.tsx \
   test/unit/client/components/agent-chat/ToolStrip.test.tsx \
   test/unit/client/components/agent-chat/MessageBubble.test.tsx \
   test/e2e/tabs-view-search-range.test.tsx \
-  test/unit/client/components/panes/PaneContainer.test.tsx \
   test/e2e/agent-chat-context-menu-flow.test.tsx \
   test/e2e/agent-chat-polish-flow.test.tsx
-git commit -m "fix(local-prefs): persist tool strip and tabs range"
+git commit -m "fix(local-prefs): move tool strip and tabs range into browser preferences"
 ```
 
-### Task 7: Prove cross-surface semantics in Playwright and run the full verification gate
+### Task 9: Prove the cross-surface behavior and run the final verification gate
 
 **Files:**
 - Create: `test/e2e-browser/specs/settings-persistence-split.spec.ts`
@@ -581,15 +761,15 @@ git commit -m "fix(local-prefs): persist tool strip and tabs range"
 
 **Step 1: Write the failing tests**
 
-Add one dedicated Playwright spec that uses two separate browser contexts against the same isolated server and proves the user-facing guarantee:
+Add one dedicated Playwright spec that uses two browser contexts against the same isolated server and proves:
 
-- Context A writes a local-only preference into the browser-preference blob and reloads; the value persists in A.
-- Context B starts clean against the same server; it does **not** inherit A’s local-only preference.
-- Context A patches a server-backed setting through `/api/settings` and reloads.
-- Context B reloads and **does** inherit the server-backed setting.
-- The server `config.json` on disk never contains the local-only preference.
+- Context A writes a local-only preference and reloads; the value persists in A.
+- Context B starts clean against the same server; it does not inherit A’s local-only preference.
+- Context A writes a server-backed setting through `/api/settings`.
+- Context B reloads and does inherit the server-backed value.
+- the isolated server `config.json` on disk never contains the local-only preference.
 
-Update `multi-client.spec.ts` so its existing “settings change broadcasts to other clients” test stops using `terminal.fontSize` and uses a still-server-backed field such as `defaultCwd` instead.
+Update `multi-client.spec.ts` so its existing settings-broadcast proof uses a still-server-backed field such as `defaultCwd`, not a now-local field such as `terminal.fontSize`.
 
 **Step 2: Run the tests to verify they fail**
 
@@ -599,17 +779,16 @@ Run:
 npm run test:e2e -- test/e2e-browser/specs/settings-persistence-split.spec.ts test/e2e-browser/specs/multi-client.spec.ts
 ```
 
-Expected: FAIL because local-only settings still replicate through the server contract, the old multi-client test still uses a now-local field, or the browser-preference sync path is incomplete.
+Expected: FAIL because the browser-vs-server scoping is not fully implemented yet.
 
 **Step 3: Write the minimal implementation**
 
-Keep the Playwright surface honest:
+Implementation rules:
 
-- Use direct `page.evaluate()` writes to the browser-preference blob for the local-only proof; the UI write paths are already covered in RTL/Vitest and this spec only needs to prove browser-vs-server scoping.
+- Use direct `page.evaluate()` access to the browser-preference blob for the local-only proof. This spec is about persistence scoping, not about re-testing SettingsView controls already covered in Vitest.
 - Use `/api/settings` for the server-backed proof.
-- Read `serverInfo.homeDir` / `serverInfo.configDir` in the test process to inspect the isolated `config.json` directly.
-
-Do **not** add screenshots for this task. Structured Redux/storage/config assertions are the truthful surface.
+- Read the isolated server config file from the test process to prove local-only fields never hit disk.
+- Do not add screenshots for this task.
 
 **Step 4: Run the tests to verify they pass**
 
@@ -632,12 +811,12 @@ npm run test:e2e -- test/e2e-browser/specs/settings-persistence-split.spec.ts te
 
 Expected: PASS
 
-Do not update `docs/index.html` for this work. The visible UI is materially the same; the change is persistence architecture and behavior correctness.
+Do not update `docs/index.html` for this work. The UI surface is materially the same; the change is persistence behavior and architecture.
 
 **Step 5: Commit**
 
 ```bash
 git add test/e2e-browser/specs/settings-persistence-split.spec.ts \
   test/e2e-browser/specs/multi-client.spec.ts
-git commit -m "test(settings): prove local and server persistence split"
+git commit -m "test(settings): prove local and server persistence semantics"
 ```
