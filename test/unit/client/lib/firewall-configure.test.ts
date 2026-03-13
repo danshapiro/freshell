@@ -6,7 +6,7 @@ vi.mock('@/lib/api', () => ({
   },
 }))
 
-import { fetchFirewallConfig } from '@/lib/firewall-configure'
+import { cancelFirewallConfirmation, fetchFirewallConfig } from '@/lib/firewall-configure'
 import { api } from '@/lib/api'
 
 describe('fetchFirewallConfig', () => {
@@ -69,6 +69,16 @@ describe('fetchFirewallConfig', () => {
 
     expect(api.post).toHaveBeenCalledWith('/api/network/configure-firewall', {
       confirmElevation: true,
+      confirmationToken: 'confirm-1',
+    })
+  })
+
+  it('posts the server-issued token when canceling a confirmation', async () => {
+    vi.mocked(api.post).mockResolvedValue({})
+
+    await cancelFirewallConfirmation('confirm-1')
+
+    expect(api.post).toHaveBeenCalledWith('/api/network/cancel-firewall-confirmation', {
       confirmationToken: 'confirm-1',
     })
   })

@@ -1,10 +1,11 @@
-import { describe, it, expect, vi, afterEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import { SetupWizard } from '@/components/SetupWizard'
 import { networkReducer, type NetworkState } from '@/store/networkSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
+import { api } from '@/lib/api'
 
 // Mock lean-qr to avoid canvas issues in jsdom
 const mockGenerateQr = vi.fn().mockReturnValue({ size: 21 })
@@ -17,18 +18,20 @@ vi.mock('lean-qr/extras/svg', () => ({
 }))
 
 // Mock the api module
-const mockPost = vi.fn().mockResolvedValue({
+const defaultConfigureNetworkResponse = {
   configured: true,
   host: '0.0.0.0',
   port: 3001,
   lanIps: ['192.168.1.100'],
   machineHostname: 'test',
   firewall: { platform: 'linux-none', active: false, portOpen: null, commands: [], configuring: false },
+  remoteAccessEnabled: true,
   rebinding: false,
   devMode: false,
   accessUrl: 'http://192.168.1.100:3001/?token=abc',
   rebindScheduled: false,
-})
+}
+const mockPost = vi.fn().mockResolvedValue(defaultConfigureNetworkResponse)
 vi.mock('@/lib/api', () => ({
   api: {
     get: vi.fn().mockResolvedValue({}),
@@ -39,8 +42,10 @@ vi.mock('@/lib/api', () => ({
 
 // Mock firewall-configure for firewall button tests
 const mockFetchFirewallConfig = vi.fn()
+const mockCancelFirewallConfirmation = vi.fn().mockResolvedValue(undefined)
 vi.mock('@/lib/firewall-configure', () => ({
   fetchFirewallConfig: (...args: any[]) => mockFetchFirewallConfig(...args),
+  cancelFirewallConfirmation: (...args: any[]) => mockCancelFirewallConfirmation(...args),
 }))
 vi.mock('@/components/setup-wizard-timing', () => ({
   SETUP_WIZARD_AUTO_ADVANCE_DELAY_MS: 10,
@@ -62,6 +67,17 @@ const defaultNetworkStatus = {
 }
 
 function createTestStore(networkOverrides: Partial<NetworkState> = {}) {
+  const baseStatus = { ...defaultNetworkStatus }
+  const mergedStatus = networkOverrides.status
+    ? {
+        ...baseStatus,
+        ...networkOverrides.status,
+      }
+    : baseStatus
+  if (mergedStatus && networkOverrides.status?.remoteAccessEnabled === undefined) {
+    mergedStatus.remoteAccessEnabled = mergedStatus.host === '0.0.0.0'
+  }
+
   return configureStore({
     reducer: {
       network: networkReducer,
@@ -69,7 +85,7 @@ function createTestStore(networkOverrides: Partial<NetworkState> = {}) {
     },
     preloadedState: {
       network: {
-        status: defaultNetworkStatus,
+        status: mergedStatus,
         loading: false,
         configuring: false,
         error: null,
@@ -85,6 +101,16 @@ function createTestStore(networkOverrides: Partial<NetworkState> = {}) {
 }
 
 describe('SetupWizard', () => {
+  beforeEach(() => {
+    mockPost.mockReset()
+    mockPost.mockResolvedValue({ ...defaultConfigureNetworkResponse })
+    mockFetchFirewallConfig.mockReset()
+    mockCancelFirewallConfirmation.mockReset()
+    mockCancelFirewallConfirmation.mockResolvedValue(undefined)
+    vi.mocked(api.get).mockResolvedValue({})
+    vi.mocked(api.patch).mockResolvedValue({})
+  })
+
   afterEach(() => {
     cleanup()
     vi.clearAllMocks()
@@ -348,7 +374,7 @@ describe('SetupWizard', () => {
     })
   })
 
-  it('does nothing when the user cancels the admin-approval modal', async () => {
+  it('revokes the confirmation token when the user cancels the admin-approval modal', async () => {
     mockFetchFirewallConfig.mockResolvedValue({
       method: 'confirmation-required',
       title: 'Administrator approval required',
@@ -391,6 +417,9 @@ describe('SetupWizard', () => {
     fireEvent.click(within(confirmationDialog).getByRole('button', { name: /^cancel$/i }))
 
     expect(mockFetchFirewallConfig).toHaveBeenCalledTimes(1)
+    await waitFor(() => {
+      expect(mockCancelFirewallConfirmation).toHaveBeenCalledWith('confirm-1')
+    })
   })
 
   it('treats an in-progress wizard repair as active work and starts polling', async () => {

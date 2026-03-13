@@ -13,7 +13,7 @@ import {
   loadInitialSessionsWindow,
   queueActiveSessionWindowRefresh,
 } from '@/store/sessionsThunks'
-import { getShareAction, ensureShareUrlToken } from '@/lib/share-utils'
+import { getShareAction, ensureShareUrlToken, isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { collectSessionLocatorsFromTabs, getSessionsForHello } from '@/lib/session-utils'
 import { installClientPerfAuditSink, setClientPerfEnabled } from '@/lib/perf-logger'
@@ -853,11 +853,11 @@ export default function App() {
 
   // Auto-show setup wizard on first run (unconfigured + localhost)
   useEffect(() => {
-    if (networkStatus && !networkStatus.configured && networkStatus.host === '127.0.0.1') {
+    if (networkStatus && !networkStatus.configured && !isRemoteAccessEnabledStatus(networkStatus)) {
       setWizardInitialStep(1)
       setShowSetupWizard(true)
     }
-  }, [networkStatus?.configured, networkStatus?.host])
+  }, [networkStatus])
 
   // Watch for terminal to become ready, then send the pending firewall command.
   // This respects the pane-owned terminal lifecycle in TerminalView.tsx —

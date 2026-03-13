@@ -4,6 +4,7 @@ import { api } from '@/lib/api'
 export interface NetworkStatusResponse {
   configured: boolean
   host: '127.0.0.1' | '0.0.0.0'
+  remoteAccessEnabled?: boolean
   port: number
   lanIps: string[]
   machineHostname: string

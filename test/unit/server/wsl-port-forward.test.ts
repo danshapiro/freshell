@@ -13,12 +13,14 @@ import {
   getWslIp,
   parsePortProxyRules,
   getExistingPortProxyRules,
+  getRequiredPorts,
   needsPortForwardingUpdate,
   buildPortForwardingScript,
   parseFirewallRulePorts,
   getExistingFirewallPorts,
   needsFirewallUpdate,
   buildFirewallOnlyScript,
+  setupWslPortForwarding,
   type PortProxyRule
 } from '../../../server/wsl-port-forward.js'
 
@@ -194,6 +196,32 @@ Address         Port        Address         Port
       const rules = getExistingPortProxyRules()
 
       expect(rules.size).toBe(0)
+    })
+  })
+
+  describe('getRequiredPorts', () => {
+    const originalEnv = process.env
+
+    beforeEach(() => {
+      process.env = { ...originalEnv }
+    })
+
+    afterEach(() => {
+      process.env = originalEnv
+    })
+
+    it('uses PORT from environment and includes the dev server port outside production', () => {
+      process.env.PORT = '4000'
+      delete process.env.NODE_ENV
+
+      expect(getRequiredPorts(5173)).toEqual([4000, 5173])
+    })
+
+    it('deduplicates ports and falls back to the default when PORT is invalid', () => {
+      process.env.PORT = 'not-a-number'
+      delete process.env.NODE_ENV
+
+      expect(getRequiredPorts(3001)).toEqual([3001])
     })
   })
 
@@ -518,6 +546,43 @@ Address         Port        Address         Port
         scriptKind: 'full',
         script: expect.stringContaining('connectaddress=172.30.149.249 connectport=3001'),
       })
+    })
+  })
+
+  describe('setupWslPortForwarding', () => {
+    const originalEnv = process.env
+
+    beforeEach(() => {
+      process.env = { ...originalEnv }
+    })
+
+    afterEach(() => {
+      process.env = originalEnv
+    })
+
+    it('re-applies drifted startup rules and verifies the repair', () => {
+      vi.mocked(isWSL2).mockReturnValue(true)
+      process.env.PORT = '3001'
+      process.env.NODE_ENV = 'production'
+      vi.mocked(execSync)
+        .mockReturnValueOnce('inet 172.30.149.249/20 scope global eth0\n')
+        .mockReturnValueOnce('')
+        .mockReturnValueOnce('Rule Name: FreshellLANAccess\nLocalPort: 3001\n')
+        .mockReturnValueOnce('')
+        .mockReturnValueOnce(`
+Listen on ipv4:             Connect to ipv4:
+
+Address         Port        Address         Port
+--------------- ----------  --------------- ----------
+0.0.0.0         3001        172.30.149.249  3001
+`)
+        .mockReturnValueOnce('Rule Name: FreshellLANAccess\nLocalPort: 3001\n')
+
+      expect(setupWslPortForwarding()).toBe('success')
+      expect(execSync).toHaveBeenCalledWith(
+        expect.stringContaining('Start-Process powershell -Verb RunAs -Wait'),
+        expect.objectContaining({ stdio: 'inherit' }),
+      )
     })
   })
 })

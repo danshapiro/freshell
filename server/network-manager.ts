@@ -5,12 +5,14 @@ import { detectLanIps } from './bootstrap.js'
 import { detectFirewall, firewallCommands, type FirewallInfo, type FirewallPlatform } from './firewall.js'
 import type { ConfigStore, NetworkSettings } from './config-store.js'
 import { logger } from './logger.js'
+import { isRemoteAccessEnabled } from './network-access.js'
 
 const log = logger.child({ component: 'network-manager' })
 
 export interface NetworkStatus {
   configured: boolean
   host: '127.0.0.1' | '0.0.0.0'
+  remoteAccessEnabled: boolean
   port: number
   lanIps: string[]
   machineHostname: string
@@ -139,6 +141,7 @@ export class NetworkManager {
     return {
       configured: network.configured,
       host: effectiveHost,
+      remoteAccessEnabled: isRemoteAccessEnabled(network, effectiveHost, this.firewallInfo.platform),
       port: this.port,
       lanIps: this.lanIps,
       machineHostname: os.hostname().replace(/\.local$/, ''),

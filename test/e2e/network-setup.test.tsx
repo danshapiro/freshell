@@ -14,6 +14,7 @@ import panesReducer from '@/store/panesSlice'
 const mockPost = vi.fn()
 const mockGet = vi.fn()
 const mockFetchFirewallConfig = vi.fn()
+const mockCancelFirewallConfirmation = vi.fn().mockResolvedValue(undefined)
 vi.mock('@/lib/api', () => ({
   api: {
     get: (...args: any[]) => mockGet(...args),
@@ -22,6 +23,7 @@ vi.mock('@/lib/api', () => ({
 }))
 vi.mock('@/lib/firewall-configure', () => ({
   fetchFirewallConfig: (...args: any[]) => mockFetchFirewallConfig(...args),
+  cancelFirewallConfirmation: (...args: any[]) => mockCancelFirewallConfirmation(...args),
 }))
 
 const unconfiguredStatus: NetworkStatusResponse = {
@@ -31,6 +33,7 @@ const unconfiguredStatus: NetworkStatusResponse = {
   lanIps: ['192.168.1.100'],
   machineHostname: 'my-laptop',
   firewall: { platform: 'linux-none', active: false, portOpen: null, commands: [], configuring: false },
+  remoteAccessEnabled: false,
   rebinding: false,
   devMode: false,
   accessUrl: 'http://192.168.1.100:3001/?token=test',
@@ -40,6 +43,7 @@ const configuredRemoteStatus: NetworkStatusResponse = {
   ...unconfiguredStatus,
   configured: true,
   host: '0.0.0.0',
+  remoteAccessEnabled: true,
   firewall: { platform: 'linux-none', active: false, portOpen: true, commands: [], configuring: false },
 }
 

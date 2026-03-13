@@ -779,6 +779,42 @@ describe('Network API integration', () => {
       expectConfirmationRequired(replayRes.body)
     })
 
+    it('revokes a confirmation token when the client cancels the approval modal', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'windows',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+
+      const cp = await import('node:child_process')
+
+      const firstRes = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({})
+
+      expectConfirmationRequired(firstRes.body)
+
+      const cancelRes = await request(app)
+        .post('/api/network/cancel-firewall-confirmation')
+        .set('x-auth-token', token)
+        .send({ confirmationToken: firstRes.body.confirmationToken })
+
+      expect(cancelRes.status).toBe(204)
+
+      const confirmedRes = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({
+          confirmElevation: true,
+          confirmationToken: firstRes.body.confirmationToken,
+        })
+
+      expect(confirmedRes.status).toBe(200)
+      expectConfirmationRequired(confirmedRes.body)
+      expect(cp.execFile).not.toHaveBeenCalled()
+    })
+
     it('re-prompts when a confirmation token is for the wrong platform', async () => {
       vi.mocked(detectFirewall)
         .mockResolvedValueOnce({

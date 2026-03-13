@@ -3,6 +3,7 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { spawnElevatedPowerShell } from './elevated-powershell.js'
 import { logger } from './logger.js'
+import { isRemoteAccessEnabled } from './network-access.js'
 import { computeWslPortForwardingPlanAsync } from './wsl-port-forward.js'
 
 const log = logger.child({ component: 'network-router' })
@@ -15,6 +16,10 @@ export const NetworkConfigureSchema = z.object({
 const ConfigureFirewallRequestSchema = z.object({
   confirmElevation: z.literal(true).optional(),
   confirmationToken: z.string().min(1).optional(),
+}).strict()
+
+const CancelFirewallConfirmationRequestSchema = z.object({
+  confirmationToken: z.string().min(1),
 }).strict()
 
 const WINDOWS_ELEVATION_CONFIRMATION = {
@@ -47,22 +52,6 @@ type RepairActionResolution =
   | { kind: 'none'; response: { method: 'none'; message: string } }
   | { kind: 'terminal'; response: { method: 'terminal'; command: string } }
   | ConfirmableRepairAction
-
-function isRemoteAccessEnabled(
-  settings: { network?: { host?: string; configured?: boolean } },
-  effectiveHost: '127.0.0.1' | '0.0.0.0',
-  firewallPlatform: string,
-): boolean {
-  if (settings.network?.host === '0.0.0.0') {
-    return true
-  }
-
-  if (firewallPlatform === 'wsl2') {
-    return false
-  }
-
-  return settings.network?.configured !== true && effectiveHost === '0.0.0.0'
-}
 
 export interface NetworkRouterDeps {
   networkManager: {
@@ -188,7 +177,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
     status: Awaited<ReturnType<NetworkRouterDeps['networkManager']['getStatus']>>,
     settings: Awaited<ReturnType<NetworkRouterDeps['configStore']['getSettings']>>,
   ): Promise<RepairActionResolution> => {
-    if (!isRemoteAccessEnabled(settings, status.host, status.firewall.platform)) {
+    if (!isRemoteAccessEnabled(settings.network, status.host, status.firewall.platform)) {
       return { kind: 'none', response: REMOTE_ACCESS_DISABLED }
     }
 
@@ -273,6 +262,16 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
     } catch (broadcastErr) {
       log.error({ err: broadcastErr }, 'Failed to broadcast settings after network configure')
     }
+  })
+
+  router.post('/network/cancel-firewall-confirmation', (req, res) => {
+    const parsed = CancelFirewallConfirmationRequestSchema.safeParse(req.body ?? {})
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
+    }
+
+    consumeCurrentConfirmation(parsed.data.confirmationToken)
+    return res.status(204).send()
   })
 
   router.post('/network/configure-firewall', async (req, res) => {

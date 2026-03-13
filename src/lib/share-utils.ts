@@ -14,18 +14,22 @@ export function ensureShareUrlToken(url: string, token: string | null | undefine
   }
 }
 
-export function getShareAction(status: { configured: boolean; host: string } | null): ShareAction {
+export function isRemoteAccessEnabledStatus(
+  status: { host: string; remoteAccessEnabled?: boolean } | null,
+): boolean {
+  if (status === null) return false
+  return status.remoteAccessEnabled ?? status.host === '0.0.0.0'
+}
+
+export function getShareAction(
+  status: { configured: boolean; host: string; remoteAccessEnabled?: boolean } | null,
+): ShareAction {
   // When network status hasn't loaded yet, return loading to prevent
   // incorrectly routing already-configured users to the setup wizard
   // (network status is fetched asynchronously on app load).
   if (status === null) return { type: 'loading' }
 
-  // IMPORTANT: The `host` field reflects the EFFECTIVE host (accounting for
-  // HOST env override when configured=false). So host=0.0.0.0 means remote
-  // access IS active regardless of the configured flag. This handles legacy
-  // HOST=0.0.0.0 deployments that have configured=false but are fully
-  // network-accessible.
-  if (status.host === '0.0.0.0') {
+  if (isRemoteAccessEnabledStatus(status)) {
     // Remote access is active — show the share panel (QR code, URL, etc.)
     // regardless of whether the user ran the wizard.
     return { type: 'panel' }

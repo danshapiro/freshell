@@ -231,13 +231,15 @@ function renderApp(store = createTestStore()) {
 }
 
 function makeNetworkStatus(overrides: Partial<NetworkStatusResponse> = {}): NetworkStatusResponse {
+  const host = overrides.host ?? '0.0.0.0'
   return {
     configured: true,
-    host: '0.0.0.0',
+    host,
     port: 3001,
     lanIps: ['192.168.1.100'],
     machineHostname: 'test-host',
     firewall: { platform: 'linux', active: false, portOpen: null, commands: [], configuring: false },
+    remoteAccessEnabled: overrides.remoteAccessEnabled ?? (host === '0.0.0.0'),
     rebinding: false,
     devMode: false,
     accessUrl: 'http://192.168.1.100:3001',
@@ -331,6 +333,32 @@ describe('App Component - Share Button', () => {
 
     // Should show the wizard at step 1
     expect(screen.getByTestId('mock-setup-wizard')).toBeInTheDocument()
+    expect(screen.getByTestId('mock-setup-wizard').dataset.initialStep).toBe('1')
+  })
+
+  it('auto-opens setup wizard when WSL stays bound to 0.0.0.0 but remote access is disabled', async () => {
+    const store = createTestStore()
+    const wslLocalOnlyStatus = makeNetworkStatus({
+      configured: false,
+      host: '0.0.0.0',
+      remoteAccessEnabled: false,
+    })
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/version') return Promise.resolve(makeVersionInfo())
+      if (typeof url === 'string' && url.startsWith('/api/sessions')) return Promise.resolve([])
+      if (url === '/api/network/status') return Promise.resolve(wslLocalOnlyStatus)
+      return Promise.resolve({})
+    })
+
+    act(() => {
+      store.dispatch(setNetworkStatus(wslLocalOnlyStatus))
+    })
+
+    renderApp(store)
+
+    expect(await screen.findByTestId('mock-setup-wizard')).toBeInTheDocument()
     expect(screen.getByTestId('mock-setup-wizard').dataset.initialStep).toBe('1')
   })
 

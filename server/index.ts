@@ -41,6 +41,8 @@ import { detectPlatform, detectAvailableClis, detectHostName, type CliDetectionS
 import { resolveVisitPort } from './startup-url.js'
 import { NetworkManager } from './network-manager.js'
 import { getNetworkHost } from './get-network-host.js'
+import { setupWslPortForwarding } from './wsl-port-forward.js'
+import { shouldSetupWslPortForwardingAtStartup } from './wsl-port-forward-startup.js'
 import { PortForwardManager } from './port-forward.js'
 import { parseTrustProxyEnv } from './request-ip.js'
 import { createTabsRegistryStore } from './tabs-registry/store.js'
@@ -101,7 +103,8 @@ const ASSOCIATION_MAX_AGE_MS = 30_000
 async function main() {
   validateStartupSecurity()
 
-  // Windows/WSL network repair is available only through the manual network-repair API and UI flows.
+  // Manual repair still owns user-facing elevation; startup WSL repair only re-applies
+  // previously opted-in forwarding rules after the WSL IP drifts across restarts.
 
   initPerfLogging()
 
@@ -658,7 +661,14 @@ async function main() {
   const currentSettings = await configStore.getSettings()
   const bindHost = getNetworkHost()
 
-  // Windows and WSL network repair is available only through the manual network-repair API and UI.
+  if (shouldSetupWslPortForwardingAtStartup(bindHost, currentSettings.network)) {
+    const wslPortForwardResult = setupWslPortForwarding(vitePort)
+    if (wslPortForwardResult === 'success') {
+      console.log('[server] WSL2 port forwarding configured')
+    } else if (wslPortForwardResult === 'failed') {
+      console.warn('[server] WSL2 port forwarding failed - LAN access may not work')
+    }
+  }
 
   // Initialize NetworkManager (ALLOWED_ORIGINS) before accepting connections
   if (currentSettings.network.configured || bindHost === '0.0.0.0') {

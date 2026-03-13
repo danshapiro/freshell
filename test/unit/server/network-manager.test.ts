@@ -95,6 +95,27 @@ describe('NetworkManager', () => {
     expect(status.lanIps).toContain('192.168.1.100')
   })
 
+  it('reports WSL remote access intent separately from the effective bind host', async () => {
+    const firewallModule = await import('../../../server/firewall.js')
+    vi.mocked(firewallModule.detectFirewall).mockResolvedValue({
+      platform: 'wsl2',
+      active: true,
+    })
+    mockConfigStore = createMockConfigStore({
+      network: {
+        host: '127.0.0.1',
+        configured: true,
+      },
+    })
+    manager = new NetworkManager(server, mockConfigStore, 0)
+    await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+
+    const status = await manager.getStatus()
+
+    expect(status.host).toBe('0.0.0.0')
+    expect(status.remoteAccessEnabled).toBe(false)
+  })
+
   it('hot rebinds from localhost to 0.0.0.0', async () => {
     manager = new NetworkManager(server, mockConfigStore, 0)
     // Start listening on localhost

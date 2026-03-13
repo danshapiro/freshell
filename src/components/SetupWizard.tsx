@@ -3,8 +3,12 @@ import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { configureNetwork, fetchNetworkStatus, type NetworkStatusResponse } from '@/store/networkSlice'
 import { addTab } from '@/store/tabsSlice'
 import { initLayout } from '@/store/panesSlice'
-import { fetchFirewallConfig, type ConfigureFirewallResult } from '@/lib/firewall-configure'
-import { ensureShareUrlToken } from '@/lib/share-utils'
+import {
+  cancelFirewallConfirmation,
+  fetchFirewallConfig,
+  type ConfigureFirewallResult,
+} from '@/lib/firewall-configure'
+import { ensureShareUrlToken, isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { getAuthToken } from '@/lib/auth'
 import {
   SETUP_WIZARD_AUTO_ADVANCE_DELAY_MS,
@@ -85,6 +89,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
   const dispatch = useAppDispatch()
   const networkStatus = useAppSelector((s) => s.network.status)
   const configuring = useAppSelector((s) => s.network.configuring)
+  const remoteAccessEnabled = isRemoteAccessEnabledStatus(networkStatus)
   const shareAccessUrl = networkStatus?.accessUrl
     ? ensureShareUrlToken(networkStatus.accessUrl, getAuthToken())
     : null
@@ -117,8 +122,8 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
 
   // Watch for rebinding completion when on step 2
   useEffect(() => {
-    if (bindStatus === 'active' && networkStatus && !networkStatus.rebinding) {
-      if (networkStatus.host === '0.0.0.0') {
+    if (bindStatus === 'active' && networkStatus && !configuring && !networkStatus.rebinding) {
+      if (remoteAccessEnabled) {
         setBindStatus('done')
         setBindDetail('Bound to all interfaces')
       } else {
@@ -126,7 +131,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
         setBindDetail('Rebind failed — rolled back to localhost')
       }
     }
-  }, [bindStatus, networkStatus?.rebinding, networkStatus?.host])
+  }, [bindStatus, configuring, networkStatus, remoteAccessEnabled])
 
   const applyFirewallChecklistState = useCallback((firewall: FirewallState) => {
     const next = getFirewallChecklistState(firewall)
@@ -154,7 +159,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
   // from share button after the user previously chose localhost-only).
   const startBind = useCallback(async () => {
     setBindStatus('active')
-    setBindDetail('Binding to network...')
+    setBindDetail('Applying network settings...')
     try {
       await dispatch(configureNetwork({
         host: '0.0.0.0',
@@ -166,13 +171,23 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
     }
   }, [dispatch])
 
-  // Auto-trigger bind when entering at step 2 directly (initialStep=2).
-  // Without this, step 2 shows a pending checklist with no way to progress.
+  // Entering directly at step 2 can mean either "enable remote access now"
+  // or "remote access is already enabled, go straight to firewall checks".
   useEffect(() => {
-    if (initialStep === 2 && step === 2 && bindStatus === 'pending') {
+    if (step !== 2 || bindStatus !== 'pending' || configuring) {
+      return
+    }
+
+    if (networkStatus && !networkStatus.rebinding && remoteAccessEnabled) {
+      setBindStatus('done')
+      setBindDetail('Bound to all interfaces')
+      return
+    }
+
+    if (initialStep === 2) {
       startBind()
     }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps -- mount-only
+  }, [bindStatus, configuring, initialStep, networkStatus, remoteAccessEnabled, startBind, step])
 
   const handleYes = useCallback(async () => {
     setStep(2)
@@ -255,7 +270,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
     setFirewallDetail(pendingDetail)
     try {
       const action = await dispatch(fetchNetworkStatus()).unwrap()
-      if (action.host !== '0.0.0.0') {
+      if (!isRemoteAccessEnabledStatus(action)) {
         setBindStatus('error')
         setBindDetail('Remote access is not enabled')
         setFirewallStatus('error')
@@ -337,8 +352,13 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
   }, [firewallConfirmation, requestFirewallConfig])
 
   const handleCancelFirewallConfirmation = useCallback(() => {
+    const confirmationToken = firewallConfirmation?.confirmationToken
     setFirewallConfirmation(null)
-  }, [])
+    if (!confirmationToken) {
+      return
+    }
+    void cancelFirewallConfirmation(confirmationToken).catch(() => {})
+  }, [firewallConfirmation])
 
   return (
     <>

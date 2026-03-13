@@ -37,3 +37,7 @@ export async function fetchFirewallConfig(
 ): Promise<ConfigureFirewallResult> {
   return api.post<ConfigureFirewallResult>('/api/network/configure-firewall', body)
 }
+
+export async function cancelFirewallConfirmation(confirmationToken: string): Promise<void> {
+  await api.post('/api/network/cancel-firewall-confirmation', { confirmationToken })
+}

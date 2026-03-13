@@ -22,14 +22,24 @@ describe('getShareAction', () => {
   })
 
   it('returns panel when configured with remote access', () => {
-    const action = getShareAction({ configured: true, host: '0.0.0.0' })
+    const action = getShareAction({ configured: true, host: '0.0.0.0', remoteAccessEnabled: true })
     expect(action).toEqual({ type: 'panel' })
   })
 
   it('returns panel for legacy HOST env override (configured=false, host=0.0.0.0)', () => {
     // Legacy deployments that set HOST=0.0.0.0 have configured=false but
     // remote access is active. They should see the share panel, not the wizard.
-    const action = getShareAction({ configured: false, host: '0.0.0.0' })
+    const action = getShareAction({ configured: false, host: '0.0.0.0', remoteAccessEnabled: true })
     expect(action).toEqual({ type: 'panel' })
+  })
+
+  it('returns the wizard when WSL stays bound to 0.0.0.0 but remote access is disabled', () => {
+    const action = getShareAction({
+      configured: true,
+      host: '0.0.0.0',
+      remoteAccessEnabled: false,
+    })
+
+    expect(action).toEqual({ type: 'wizard', initialStep: 2 })
   })
 })

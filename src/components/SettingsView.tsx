@@ -27,13 +27,18 @@ import type { DeepPartial } from '@/lib/type-utils'
 import { configureNetwork, fetchNetworkStatus, type NetworkStatusResponse } from '@/store/networkSlice'
 import { addTab } from '@/store/tabsSlice'
 import { initLayout } from '@/store/panesSlice'
-import { fetchFirewallConfig, type ConfigureFirewallResult } from '@/lib/firewall-configure'
+import {
+  cancelFirewallConfirmation,
+  fetchFirewallConfig,
+  type ConfigureFirewallResult,
+} from '@/lib/firewall-configure'
 import { nanoid } from '@reduxjs/toolkit'
 import type { AppView } from '@/components/Sidebar'
 import { getCliProviderConfigs } from '@/lib/coding-cli-utils'
 import { createLogger } from '@/lib/client-logger'
 import { buildKnownDevices, type KnownDevice } from '@/lib/known-devices'
 import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
+import { isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { parseNormalizedLineList } from '@shared/string-list'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
@@ -198,6 +203,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   const lastSavedAt = useAppSelector((s) => s.settings.lastSavedAt)
   const networkStatus = useAppSelector((s) => s.network.status)
   const configuring = useAppSelector((s) => s.network.configuring)
+  const remoteAccessEnabled = isRemoteAccessEnabledStatus(networkStatus)
   const enabledProviders = useMemo(
     () => settings.codingCli?.enabledProviders ?? [],
     [settings.codingCli?.enabledProviders],
@@ -369,8 +375,13 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   }, [firewallConfirmation, requestFirewallFix])
 
   const handleCancelFirewallFix = useCallback(() => {
+    const confirmationToken = firewallConfirmation?.confirmationToken
     setFirewallConfirmation(null)
-  }, [])
+    if (!confirmationToken) {
+      return
+    }
+    void cancelFirewallConfirmation(confirmationToken).catch(() => {})
+  }, [firewallConfirmation])
 
   const scheduleSave = useCallback((updates: any) => {
     if (pendingRef.current) clearTimeout(pendingRef.current)
@@ -1305,7 +1316,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
           <SettingsSection title="Network Access" description="Control how Freshell is accessible on your network">
             <SettingsRow label="Remote access" description="Allow connections from other devices on your network">
               <Toggle
-                checked={networkStatus?.host === '0.0.0.0'}
+                checked={remoteAccessEnabled}
                 disabled={configuring || networkStatus?.rebinding}
                 aria-label="Remote access"
                 onChange={async (checked) => {
@@ -1317,7 +1328,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               />
             </SettingsRow>
 
-            {networkStatus?.host === '0.0.0.0' && (
+            {remoteAccessEnabled && networkStatus && (
               <>
                 {networkStatus.firewall && (
                   <SettingsRow

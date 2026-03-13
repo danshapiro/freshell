@@ -19,8 +19,10 @@ vi.mock('@/lib/api', () => ({
 }))
 
 const mockFetchFirewallConfig = vi.fn()
+const mockCancelFirewallConfirmation = vi.fn().mockResolvedValue(undefined)
 vi.mock('@/lib/firewall-configure', () => ({
   fetchFirewallConfig: (...args: any[]) => mockFetchFirewallConfig(...args),
+  cancelFirewallConfirmation: (...args: any[]) => mockCancelFirewallConfirmation(...args),
 }))
 
 installSettingsViewHooks({ mockFonts: true })
@@ -62,6 +64,25 @@ describe('SettingsView network access section', () => {
 
     expect(screen.getByText(/port may be blocked/i)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /fix firewall/i })).toBeInTheDocument()
+  })
+
+  it('uses the server remoteAccessEnabled signal for WSL instead of the effective bind host', () => {
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            host: '0.0.0.0',
+            remoteAccessEnabled: false,
+            firewall: { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false },
+          }),
+        }),
+      },
+    })
+
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    expect(screen.getByRole('switch', { name: /remote access/i })).not.toBeChecked()
+    expect(screen.queryByRole('button', { name: /fix firewall/i })).not.toBeInTheDocument()
   })
 
   it('shows an admin-approval modal before starting Windows firewall repair', async () => {
@@ -108,7 +129,7 @@ describe('SettingsView network access section', () => {
     })
   })
 
-  it('does not re-issue the firewall request when the modal is cancelled', async () => {
+  it('revokes the confirmation token when the modal is cancelled', async () => {
     mockFetchFirewallConfig.mockResolvedValue({
       method: 'confirmation-required',
       title: 'Administrator approval required',
@@ -140,6 +161,9 @@ describe('SettingsView network access section', () => {
     fireEvent.click(within(confirmationDialog).getByRole('button', { name: /^cancel$/i }))
 
     expect(mockFetchFirewallConfig).toHaveBeenCalledTimes(1)
+    await waitFor(() => {
+      expect(mockCancelFirewallConfirmation).toHaveBeenCalledWith('confirm-1')
+    })
   })
 
   it('clears the in-progress refresh detail after the scheduled status refresh succeeds', async () => {
