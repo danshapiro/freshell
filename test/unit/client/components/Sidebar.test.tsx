@@ -1818,12 +1818,14 @@ describe('Sidebar Component - Session-Centric Display', () => {
       })
 
       const { getByPlaceholderText } = renderSidebar(store, [])
-      fireEvent.change(getByPlaceholderText('Search...'), { target: { value: 'search' } })
+      const searchInput = getByPlaceholderText('Search...')
+      fireEvent.change(searchInput, { target: { value: 'search' } })
 
       expect(screen.getByText('Search Result')).toBeInTheDocument()
       const searchLoading = screen.getByTestId('search-loading')
       expect(searchLoading).toBeInTheDocument()
       expect(searchLoading.querySelector('span:not(.sr-only)')).toHaveTextContent('Searching...')
+      expect(searchInput).toHaveClass('pr-36')
     })
 
     it('keeps a loaded empty-state message visible during refresh', async () => {
@@ -1849,6 +1851,45 @@ describe('Sidebar Component - Session-Centric Display', () => {
       renderSidebar(store, [])
 
       expect(screen.getByText('No sessions yet')).toBeInTheDocument()
+      expect(screen.queryByTestId('sessions-refreshing')).not.toBeInTheDocument()
+      expect(screen.queryByTestId('search-loading')).not.toBeInTheDocument()
+    })
+
+    it('keeps a loaded sidebar list mounted during pagination without showing refresh chrome', async () => {
+      const recentProjects: ProjectGroup[] = [{
+        projectPath: '/work/recent',
+        sessions: [{
+          provider: 'codex',
+          sessionId: 'recent-session',
+          projectPath: '/work/recent',
+          updatedAt: 1_700_000_000_000,
+          title: 'Recent Session',
+        }],
+      }]
+
+      const store = createTestStore({
+        projects: recentProjects,
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: recentProjects,
+          lastLoadedAt: 1_700_000_000_000,
+          windows: {
+            sidebar: {
+              projects: recentProjects,
+              lastLoadedAt: 1_700_000_000_000,
+              loading: true,
+              loadingKind: 'pagination',
+              query: '',
+              searchTier: 'title',
+            },
+          },
+        },
+      })
+
+      renderSidebar(store, [])
+
+      expect(screen.getByText('Recent Session')).toBeInTheDocument()
+      expect(screen.getByTestId('virtualized-list')).toBeInTheDocument()
       expect(screen.queryByTestId('sessions-refreshing')).not.toBeInTheDocument()
       expect(screen.queryByTestId('search-loading')).not.toBeInTheDocument()
     })

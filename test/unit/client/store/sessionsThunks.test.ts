@@ -338,6 +338,75 @@ describe('sessionsThunks', () => {
     ])
   })
 
+  it('classifies append fetches as silent pagination work until they settle', async () => {
+    fetchSidebarSessionsSnapshot.mockResolvedValueOnce({
+      projects: [
+        {
+          projectPath: '/tmp/project-alpha',
+          sessions: [
+            {
+              provider: 'claude',
+              sessionId: 'session-alpha',
+              projectPath: '/tmp/project-alpha',
+              updatedAt: 2_000,
+              title: 'Alpha',
+            },
+          ],
+        },
+      ],
+      totalSessions: 2,
+      oldestIncludedTimestamp: 2_000,
+      oldestIncludedSessionId: 'claude:session-alpha',
+      hasMore: true,
+    })
+
+    const appendDeferred = createDeferred<any>()
+    fetchSidebarSessionsSnapshot.mockReturnValueOnce(appendDeferred.promise)
+
+    const store = createStore()
+    store.dispatch(setActiveSessionSurface('sidebar'))
+
+    await store.dispatch(fetchSessionWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+    }) as any)
+
+    const appendRequest = store.dispatch(fetchSessionWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+      append: true,
+    }) as any)
+
+    try {
+      expect((store.getState().sessions.windows.sidebar as any).loadingKind).toBe('pagination')
+    } finally {
+      appendDeferred.resolve({
+        projects: [
+          {
+            projectPath: '/tmp/project-beta',
+            sessions: [
+              {
+                provider: 'claude',
+                sessionId: 'session-beta',
+                projectPath: '/tmp/project-beta',
+                updatedAt: 1_000,
+                title: 'Beta',
+              },
+            ],
+          },
+        ],
+        totalSessions: 2,
+        oldestIncludedTimestamp: 1_000,
+        oldestIncludedSessionId: 'claude:session-beta',
+        hasMore: false,
+      })
+
+      await appendRequest
+    }
+
+    expect((store.getState().sessions.windows.sidebar as any).loadingKind).toBeUndefined()
+  })
+
   it('refreshes the active active-query window silently while reusing its query context', async () => {
     searchSessions.mockResolvedValue({
       results: [

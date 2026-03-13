@@ -534,9 +534,9 @@ export default function Sidebar({
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
             aria-busy={showSearchLoading}
-            className="w-full h-8 pl-8 pr-12 text-sm bg-muted/50 border-0 rounded-md placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-border"
+            className="w-full h-8 pl-8 pr-36 text-sm bg-muted/50 border-0 rounded-md placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-border"
           />
-          <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
+          <div className="absolute right-2 top-1/2 flex w-28 -translate-y-1/2 items-center justify-end gap-1">
             {showSearchLoading ? (
               <span
                 role="status"
