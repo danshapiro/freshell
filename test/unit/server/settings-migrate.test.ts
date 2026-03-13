@@ -5,29 +5,14 @@ import {
 } from '../../../server/settings-migrate'
 
 describe('migrateSettingsSortMode', () => {
-  it('converts hybrid sortMode to activity', () => {
+  it('leaves legacy local sort modes untouched on the server migration path', () => {
     const settings = { sidebar: { sortMode: 'hybrid' } }
 
     const migrated = migrateSettingsSortMode(settings)
 
-    expect(migrated.sidebar.sortMode).toBe('activity')
+    expect(migrated).toBe(settings)
+    expect(migrated.sidebar.sortMode).toBe('hybrid')
     expect(settings.sidebar.sortMode).toBe('hybrid')
-  })
-
-  it('preserves valid sort modes', () => {
-    const settings = { sidebar: { sortMode: 'recency' } }
-
-    const migrated = migrateSettingsSortMode(settings)
-
-    expect(migrated.sidebar.sortMode).toBe('recency')
-  })
-
-  it('preserves recency-pinned sort mode', () => {
-    const settings = { sidebar: { sortMode: 'recency-pinned' } }
-
-    const migrated = migrateSettingsSortMode(settings)
-
-    expect(migrated.sidebar.sortMode).toBe('recency-pinned')
   })
 
   it('handles missing or invalid sidebar safely', () => {
@@ -56,6 +41,24 @@ describe('migrateLegacyDefaultEnabledProviders', () => {
       },
     })
     expect(settings.codingCli.enabledProviders).toEqual(['claude', 'codex'])
+  })
+
+  it('keeps migration helpers pure and does not mutate the input object', () => {
+    const settings = {
+      codingCli: {
+        enabledProviders: ['claude', 'codex'],
+        knownProviders: ['claude', 'codex', 'opencode'],
+      },
+    }
+
+    void migrateLegacyDefaultEnabledProviders(settings, ['claude', 'codex', 'opencode'])
+
+    expect(settings).toEqual({
+      codingCli: {
+        enabledProviders: ['claude', 'codex'],
+        knownProviders: ['claude', 'codex', 'opencode'],
+      },
+    })
   })
 
   it('preserves explicit provider customizations', () => {
