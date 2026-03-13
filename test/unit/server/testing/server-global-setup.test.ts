@@ -1,3 +1,5 @@
+import path from 'node:path'
+
 import { describe, expect, it, vi } from 'vitest'
 
 import { ensureBuiltServerEntry, installBuiltServerEntryRefresh } from '../../../setup/server-global-setup.js'
@@ -5,13 +7,16 @@ import { ensureBuiltServerEntry, installBuiltServerEntryRefresh } from '../../..
 describe('ensureBuiltServerEntry', () => {
   it('rebuilds dist/server before the parallel server suite', () => {
     const execFileSync = vi.fn()
+    const rmSync = vi.fn()
 
     ensureBuiltServerEntry('/repo', {
       execFileSync,
+      rmSync,
       env: { PATH: '/bin' },
       platform: 'linux',
     })
 
+    expect(rmSync).toHaveBeenCalledWith(path.join('/repo', 'dist', '.env'), { force: true })
     expect(execFileSync).toHaveBeenCalledWith('npm', ['run', 'build:server'], {
       cwd: '/repo',
       env: {
@@ -24,13 +29,16 @@ describe('ensureBuiltServerEntry', () => {
 
   it('rebuilds even when dist/server/index.js already exists so worktree artifacts cannot go stale', () => {
     const execFileSync = vi.fn()
+    const rmSync = vi.fn()
 
     ensureBuiltServerEntry('/repo', {
       execFileSync,
+      rmSync,
       env: { PATH: '/bin' },
       platform: 'linux',
     })
 
+    expect(rmSync).toHaveBeenCalledWith(path.join('/repo', 'dist', '.env'), { force: true })
     expect(execFileSync).toHaveBeenCalledWith('npm', ['run', 'build:server'], {
       cwd: '/repo',
       env: {
@@ -43,13 +51,16 @@ describe('ensureBuiltServerEntry', () => {
 
   it('uses npm.cmd on Windows', () => {
     const execFileSync = vi.fn()
+    const rmSync = vi.fn()
 
     ensureBuiltServerEntry('C:\\repo', {
       execFileSync,
+      rmSync,
       env: { PATH: 'C:\\Windows\\System32' },
       platform: 'win32',
     })
 
+    expect(rmSync).toHaveBeenCalledWith(path.join('C:\\repo', 'dist', '.env'), { force: true })
     expect(execFileSync).toHaveBeenCalledWith('npm.cmd', ['run', 'build:server'], {
       cwd: 'C:\\repo',
       env: {

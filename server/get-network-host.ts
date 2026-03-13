@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { homedir } from 'node:os'
 import dotenv from 'dotenv'
+import { getFreshellConfigDir } from './freshell-home.js'
 import { isWSL } from './platform.js'
 
 /**
@@ -42,7 +42,7 @@ export function getNetworkHost(): string {
   if (isWSL()) return '0.0.0.0'
 
   try {
-    const configPath = join(homedir(), '.freshell', 'config.json')
+    const configPath = join(getFreshellConfigDir(), 'config.json')
     const config = JSON.parse(readFileSync(configPath, 'utf-8'))
     const rawHost = config.settings?.network?.host
     // Whitelist only valid bind addresses to prevent malformed config from
@@ -62,4 +62,3 @@ export function getNetworkHost(): string {
     return '127.0.0.1'
   }
 }
-

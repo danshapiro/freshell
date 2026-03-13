@@ -56,6 +56,8 @@ describe('ConfigStore', () => {
   })
 
   afterEach(async () => {
+    delete process.env.FRESHELL_HOME
+
     // Clean up temp directory
     try {
       await fsp.rm(tempDir, { recursive: true, force: true })
@@ -94,6 +96,17 @@ describe('ConfigStore', () => {
 
       const stat = await fsp.stat(configDir)
       expect(stat.isDirectory()).toBe(true)
+    })
+
+    it('stores config under FRESHELL_HOME when set', async () => {
+      const isolatedHome = path.join(tempDir, 'isolated-home')
+      process.env.FRESHELL_HOME = isolatedHome
+
+      const store = new ConfigStore()
+      await store.load()
+
+      await expect(fsp.stat(path.join(isolatedHome, '.freshell', 'config.json'))).resolves.toBeDefined()
+      await expect(fsp.access(configPath)).rejects.toThrow()
     })
 
     it('cleans up stale config temp files on startup', async () => {

@@ -1,12 +1,12 @@
 import { randomUUID } from 'crypto'
 import fs from 'fs/promises'
-import os from 'os'
 import path from 'path'
+import { getFreshellConfigDir } from './freshell-home.js'
 
 const INSTANCE_ID_FILENAME = 'instance-id'
 
 function resolveInstanceIdPath(baseDir?: string): string {
-  const root = baseDir ? path.resolve(baseDir) : path.join(os.homedir(), '.freshell')
+  const root = baseDir ? path.resolve(baseDir) : getFreshellConfigDir()
   return path.join(root, INSTANCE_ID_FILENAME)
 }
 

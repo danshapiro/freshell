@@ -1,7 +1,7 @@
 import fs from 'fs'
 import fsp from 'fs/promises'
-import os from 'os'
 import path from 'path'
+import { getFreshellConfigDir } from '../freshell-home.js'
 import { TabsDeviceStore } from './device-store.js'
 import { TabRegistryRecordSchema, type RegistryTabRecord } from './types.js'
 
@@ -43,7 +43,7 @@ function sortByClosedDesc(a: RegistryTabRecord, b: RegistryTabRecord): number {
 
 function resolveStoreDir(baseDir?: string): string {
   if (baseDir) return path.resolve(baseDir)
-  return path.join(os.homedir(), '.freshell', 'tabs-registry')
+  return path.join(getFreshellConfigDir(), 'tabs-registry')
 }
 
 export class TabsRegistryStore {

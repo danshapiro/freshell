@@ -172,6 +172,10 @@ describe('bootstrap module', () => {
   })
 
   describe('readConfigHost', () => {
+    afterEach(() => {
+      delete process.env.FRESHELL_HOME
+    })
+
     it('returns 0.0.0.0 when config.json has remote access configured', () => {
       vi.mocked(os.homedir).mockReturnValue('/home/testuser')
       vi.mocked(fs.readFileSync).mockReturnValue(
@@ -213,6 +217,16 @@ describe('bootstrap module', () => {
       vi.mocked(fs.readFileSync).mockReturnValue(JSON.stringify({ settings: {} }))
 
       expect(readConfigHost()).toBe('127.0.0.1')
+    })
+
+    it('reads config from FRESHELL_HOME when set', () => {
+      process.env.FRESHELL_HOME = '/tmp/freshell-test-home'
+      vi.mocked(fs.readFileSync).mockImplementation((filePath) => {
+        expect(filePath).toBe(path.join('/tmp/freshell-test-home', '.freshell', 'config.json'))
+        return JSON.stringify({ settings: { network: { host: '0.0.0.0' } } })
+      })
+
+      expect(readConfigHost()).toBe('0.0.0.0')
     })
   })
 

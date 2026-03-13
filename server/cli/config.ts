@@ -1,13 +1,13 @@
 import fs from 'fs'
 import path from 'path'
-import os from 'os'
+import { getFreshellConfigDir } from '../freshell-home.js'
 
 type CliConfig = { url: string; token?: string }
 
 type CliConfigFile = { url?: string; token?: string }
 
 function loadConfigFile(): CliConfigFile {
-  const file = path.join(os.homedir(), '.freshell', 'cli.json')
+  const file = path.join(getFreshellConfigDir(), 'cli.json')
   if (!fs.existsSync(file)) return {}
   try {
     const raw = JSON.parse(fs.readFileSync(file, 'utf-8')) as CliConfigFile

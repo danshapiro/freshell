@@ -112,6 +112,10 @@ describe('Network API integration', () => {
           configured: true,
         })
       expect(res.status).toBe(200)
+
+      const configPath = path.join(tmpDir, '.freshell', 'config.json')
+      const saved = JSON.parse(fs.readFileSync(configPath, 'utf8')) as { settings?: { network?: { host?: string } } }
+      expect(saved.settings?.network?.host).toBe('0.0.0.0')
     })
 
     it('rejects invalid host values', async () => {

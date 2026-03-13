@@ -23,25 +23,32 @@ describe('issue 174 compiled startup regression', () => {
   })
 
   it('bootstraps AUTH_TOKEN into an isolated runtime root on the coordinated server suite path', async () => {
+    const staleDistEnvPath = path.join(PROJECT_ROOT, 'dist', '.env')
+    await fs.writeFile(staleDistEnvPath, 'AUTH_TOKEN=stale-dist-token\n', 'utf8')
+
     server = new TestServer({
       authStrategy: 'bootstrap',
       runtimeRootMode: 'isolated',
     })
 
-    const info = await server.start()
-    expect(info.runtimeRoot).toContain(path.join(PROJECT_ROOT, '.worktrees', 'test-server-runtime-'))
+    try {
+      const info = await server.start()
+      expect(info.runtimeRoot).toContain(path.join(PROJECT_ROOT, '.worktrees', 'test-server-runtime-'))
 
-    const envText = await fs.readFile(path.join(info.runtimeRoot, '.env'), 'utf8')
-    expect(envText).toMatch(/^AUTH_TOKEN=[a-f0-9]{64}$/m)
-    await expect(fs.stat(path.join(info.runtimeRoot, 'dist', '.env'))).rejects.toThrow()
+      const envText = await fs.readFile(path.join(info.runtimeRoot, '.env'), 'utf8')
+      expect(envText).toMatch(/^AUTH_TOKEN=[a-f0-9]{64}$/m)
+      await expect(fs.stat(path.join(info.runtimeRoot, 'dist', '.env'))).rejects.toThrow()
 
-    const healthRes = await fetch(`${info.baseUrl}/api/health`)
-    expect(healthRes.status).toBe(200)
-    await expect(healthRes.json()).resolves.toMatchObject({ ok: true })
+      const healthRes = await fetch(`${info.baseUrl}/api/health`)
+      expect(healthRes.status).toBe(200)
+      await expect(healthRes.json()).resolves.toMatchObject({ ok: true })
 
-    const settingsRes = await fetch(`${info.baseUrl}/api/settings`, {
-      headers: { 'x-auth-token': info.token },
-    })
-    expect(settingsRes.status).toBe(200)
+      const settingsRes = await fetch(`${info.baseUrl}/api/settings`, {
+        headers: { 'x-auth-token': info.token },
+      })
+      expect(settingsRes.status).toBe(200)
+    } finally {
+      await fs.rm(staleDistEnvPath, { force: true })
+    }
   })
 })

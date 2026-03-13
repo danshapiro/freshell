@@ -7,11 +7,11 @@
 
 import { promises as fs } from 'fs'
 import path from 'path'
-import os from 'os'
 import { glob } from 'glob'
 import { EventEmitter } from 'events'
 import { logger } from '../logger.js'
 import { getClaudeHome, getClaudeProjectsDir } from '../claude-home.js'
+import { getFreshellConfigDir } from '../freshell-home.js'
 import { createSessionScanner } from './scanner.js'
 import { SessionCache } from './cache.js'
 import { SessionRepairQueue, type Priority, ACTIVE_CACHE_GRACE_MS } from './queue.js'
@@ -48,7 +48,7 @@ export class SessionRepairService extends EventEmitter {
 
   constructor(options: SessionRepairServiceOptions = {}) {
     super()
-    this.cacheDir = options.cacheDir || path.join(os.homedir(), '.freshell')
+    this.cacheDir = options.cacheDir || getFreshellConfigDir()
     this.scanner = options.scanner || createSessionScanner()
     this.cache = new SessionCache(path.join(this.cacheDir, CACHE_FILENAME))
     this.historyRepairer = new ClaudeHistoryRepairer({ claudeHome: getClaudeHome() })

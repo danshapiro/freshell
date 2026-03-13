@@ -12,6 +12,7 @@ import crypto from 'crypto'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
+import { getFreshellConfigDir } from './freshell-home.js'
 import { isWSL } from './platform.js'
 
 export type BootstrapResult = {
@@ -104,7 +105,7 @@ function scoreLanIp(ip: string, netmask: string): number {
  */
 export function readConfigHost(): '127.0.0.1' | '0.0.0.0' {
   try {
-    const configPath = path.join(os.homedir(), '.freshell', 'config.json')
+    const configPath = path.join(getFreshellConfigDir(), 'config.json')
     const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
     const host = config.settings?.network?.host
     return (host === '0.0.0.0' || host === '127.0.0.1') ? host : '127.0.0.1'
@@ -329,4 +330,3 @@ if (result.action === 'created') {
 } else if (result.action === 'error') {
   console.error(`[bootstrap] Failed to ensure .env: ${result.error}`)
 }
-

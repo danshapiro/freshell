@@ -43,20 +43,31 @@ function isWindowsStylePath(filePath: string): boolean {
   return /^[A-Za-z]:\\/.test(filePath.replace(/\//g, '\\'))
 }
 
-export function applyIsolatedHomeEnvironment(
+function applyAppDataIsolation(
   env: Record<string, string>,
   homeDir: string,
 ): Record<string, string> {
   const pathImpl = isWindowsStylePath(homeDir) ? path.win32 : path.posix
-  const nextEnv = {
+  return {
     ...env,
+    FRESHELL_HOME: homeDir,
     HOME: homeDir,
-    USERPROFILE: homeDir,
     CLAUDE_HOME: pathImpl.join(homeDir, '.claude'),
     CODEX_HOME: pathImpl.join(homeDir, '.codex'),
     XDG_DATA_HOME: pathImpl.join(homeDir, '.local', 'share'),
     LOCALAPPDATA: pathImpl.join(homeDir, 'AppData', 'Local'),
   }
+}
+
+export function applyIsolatedHomeEnvironment(
+  env: Record<string, string>,
+  homeDir: string,
+): Record<string, string> {
+  const nextEnv = applyAppDataIsolation({
+    ...env,
+    HOME: homeDir,
+    USERPROFILE: homeDir,
+  }, homeDir)
 
   const windowsHomeDir = homeDir.replace(/\//g, '\\')
   const windowsDrivePathMatch = windowsHomeDir.match(/^([A-Za-z]:)(\\.*)$/)
@@ -80,10 +91,7 @@ export function applyTestServerHomeEnvironment(
     return applyIsolatedHomeEnvironment(env, homeDir)
   }
 
-  return {
-    ...env,
-    HOME: homeDir,
-  }
+  return applyAppDataIsolation(env, homeDir)
 }
 
 export function requireBuiltServerEntry(
@@ -143,12 +151,15 @@ function findProjectRoot(): string {
 async function createIsolatedRuntimeRoot(projectRoot: string): Promise<string> {
   requireBuiltServerEntry(projectRoot)
   const runtimeRootsParent = path.join(projectRoot, '.worktrees')
-  await fsp.mkdir(runtimeRootsParent, { recursive: true })
+    await fsp.mkdir(runtimeRootsParent, { recursive: true })
   const runtimeRoot = await fsp.mkdtemp(path.join(runtimeRootsParent, 'test-server-runtime-'))
 
   try {
     await fsp.copyFile(path.join(projectRoot, 'package.json'), path.join(runtimeRoot, 'package.json'))
-    await fsp.cp(path.join(projectRoot, 'dist'), path.join(runtimeRoot, 'dist'), { recursive: true })
+    await fsp.cp(path.join(projectRoot, 'dist'), path.join(runtimeRoot, 'dist'), {
+      recursive: true,
+      filter: (source) => path.basename(source) !== '.env',
+    })
     return runtimeRoot
   } catch (error) {
     await fsp.rm(runtimeRoot, { recursive: true, force: true }).catch(() => {})

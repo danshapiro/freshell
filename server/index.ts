@@ -17,6 +17,7 @@ import { logger, resolveRuntimeLogLevel, setLogLevel } from './logger.js'
 import { requestLogger } from './request-logger.js'
 import { validateStartupSecurity, httpAuthMiddleware } from './auth.js'
 import { configStore } from './config-store.js'
+import { getFreshellConfigDir } from './freshell-home.js'
 import { TerminalRegistry, type TerminalRecord, registerCodingCliCommands, type CodingCliCommandSpec } from './terminal-registry.js'
 import { WsHandler } from './ws-handler.js'
 import { SessionsSyncService } from './sessions-sync/service.js'
@@ -172,7 +173,7 @@ async function main() {
   app.use('/api', createClientLogsRouter())
 
   const codingCliProviders = [claudeProvider, codexProvider, opencodeProvider]
-  const freshellConfigDir = path.join(os.homedir(), '.freshell')
+  const freshellConfigDir = getFreshellConfigDir()
   const sessionMetadataStore = new SessionMetadataStore(freshellConfigDir)
   const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders, {}, sessionMetadataStore)
   const codingCliSessionManager = new CodingCliSessionManager(codingCliProviders)
@@ -190,7 +191,7 @@ async function main() {
   const sdkBridge = new SdkBridge()
 
   const extensionManager = new ExtensionManager()
-  const userExtDir = path.join(os.homedir(), '.freshell', 'extensions')
+  const userExtDir = path.join(freshellConfigDir, 'extensions')
   const localExtDir = path.join(process.cwd(), '.freshell', 'extensions')
   const builtinExtDir = path.join(process.cwd(), 'extensions')
   extensionManager.scan([userExtDir, localExtDir, builtinExtDir])

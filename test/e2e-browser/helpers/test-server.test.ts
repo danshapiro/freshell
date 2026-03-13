@@ -80,6 +80,7 @@ describe('TestServer', () => {
     }, '/tmp/freshell-e2e-home')
 
     expect(env.HOME).toBe('/tmp/freshell-e2e-home')
+    expect(env.FRESHELL_HOME).toBe('/tmp/freshell-e2e-home')
     expect(env.USERPROFILE).toBe('/tmp/freshell-e2e-home')
     expect('HOMEDRIVE' in env).toBe(false)
     expect('HOMEPATH' in env).toBe(false)
@@ -93,6 +94,7 @@ describe('TestServer', () => {
     const env = applyIsolatedHomeEnvironment({}, 'D:\\Temp\\freshell-e2e-home')
 
     expect(env.HOME).toBe('D:\\Temp\\freshell-e2e-home')
+    expect(env.FRESHELL_HOME).toBe('D:\\Temp\\freshell-e2e-home')
     expect(env.USERPROFILE).toBe('D:\\Temp\\freshell-e2e-home')
     expect(env.HOMEDRIVE).toBe('D:')
     expect(env.HOMEPATH).toBe('\\Temp\\freshell-e2e-home')
@@ -115,13 +117,14 @@ describe('TestServer', () => {
     }, '/tmp/freshell-e2e-home')
 
     expect(env.HOME).toBe('/tmp/freshell-e2e-home')
+    expect(env.FRESHELL_HOME).toBe('/tmp/freshell-e2e-home')
     expect(env.USERPROFILE).toBe('C:\\Users\\real-user')
     expect(env.HOMEDRIVE).toBe('C:')
     expect(env.HOMEPATH).toBe('\\Users\\real-user')
-    expect(env.CLAUDE_HOME).toBe('/real/.claude')
-    expect(env.CODEX_HOME).toBe('/real/.codex')
-    expect(env.XDG_DATA_HOME).toBe('/real/.local/share')
-    expect(env.LOCALAPPDATA).toBe('C:\\Users\\real-user\\AppData\\Local')
+    expect(env.CLAUDE_HOME).toBe('/tmp/freshell-e2e-home/.claude')
+    expect(env.CODEX_HOME).toBe('/tmp/freshell-e2e-home/.codex')
+    expect(env.XDG_DATA_HOME).toBe('/tmp/freshell-e2e-home/.local/share')
+    expect(env.LOCALAPPDATA).toBe('/tmp/freshell-e2e-home/AppData/Local')
   })
 
   it('reports the build-first guidance before isolated staging when the compiled server is missing', () => {

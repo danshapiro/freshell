@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process'
+import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { GlobalSetupContext } from 'vitest/node'
@@ -9,6 +10,7 @@ const PROJECT_ROOT = path.resolve(__dirname, '../..')
 
 interface EnsureBuiltServerEntryDeps {
   execFileSync: typeof execFileSync
+  rmSync: typeof fs.rmSync
   env: NodeJS.ProcessEnv
   platform: NodeJS.Platform
 }
@@ -21,12 +23,14 @@ export function ensureBuiltServerEntry(
   projectRoot: string,
   deps: EnsureBuiltServerEntryDeps = {
     execFileSync,
+    rmSync: fs.rmSync,
     env: process.env,
     platform: process.platform,
   },
 ): void {
   // dist/ is gitignored in worktrees, so rebuild unconditionally here rather
   // than trusting a possibly stale compiled entry from an earlier branch state.
+  deps.rmSync(path.join(projectRoot, 'dist', '.env'), { force: true })
   const npmCommand = deps.platform === 'win32' ? 'npm.cmd' : 'npm'
   deps.execFileSync(npmCommand, ['run', 'build:server'], {
     cwd: projectRoot,

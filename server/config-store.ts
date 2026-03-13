@@ -1,7 +1,7 @@
 import fsp from 'fs/promises'
 import path from 'path'
-import os from 'os'
 import { logger } from './logger.js'
+import { getFreshellConfigDir } from './freshell-home.js'
 import type { CodingCliProviderName } from './coding-cli/types.js'
 import { DEFAULT_ENABLED_CLI_PROVIDERS } from '../shared/coding-cli-defaults.js'
 import { normalizeTrimmedStringList } from '../shared/string-list.js'
@@ -205,7 +205,7 @@ export const defaultSettings: AppSettings = {
 }
 
 function configDir(): string {
-  return path.join(os.homedir(), '.freshell')
+  return getFreshellConfigDir()
 }
 
 function configPath(): string {
