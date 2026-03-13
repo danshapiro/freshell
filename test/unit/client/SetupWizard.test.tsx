@@ -474,6 +474,29 @@ describe('SetupWizard', () => {
     })
   })
 
+  it('treats an initially configuring firewall as active work instead of an error', () => {
+    const firewallActive = { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: true }
+    const store = createTestStore({
+      status: {
+        ...defaultNetworkStatus,
+        configured: true,
+        host: '0.0.0.0',
+        firewall: firewallActive,
+        rebinding: false,
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <SetupWizard onComplete={vi.fn()} initialStep={2} />
+      </Provider>,
+    )
+
+    expect(screen.getByText(/firewall configuration already in progress/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /configure firewall now/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /continue anyway/i })).not.toBeInTheDocument()
+  })
+
   it('refreshes network status when the server reports no firewall changes were needed', async () => {
     mockFetchFirewallConfig.mockResolvedValue({
       method: 'none',

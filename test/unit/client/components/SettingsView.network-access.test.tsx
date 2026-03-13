@@ -219,6 +219,38 @@ describe('SettingsView network access section', () => {
     expect(screen.queryByText(/firewall configuration already in progress/i)).not.toBeInTheDocument()
   })
 
+  it('shows in-progress detail immediately after a firewall repair starts', async () => {
+    mockFetchFirewallConfig.mockResolvedValueOnce({
+      method: 'windows-elevated',
+      status: 'started',
+    })
+
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            firewall: {
+              platform: 'windows',
+              active: true,
+              portOpen: false,
+              commands: ['netsh advfirewall firewall add rule name="Freshell (port 3001)" dir=in action=allow protocol=TCP localport=3001 profile=private'],
+              configuring: false,
+            },
+          }),
+        }),
+      },
+    })
+
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    fireEvent.click(screen.getByRole('button', { name: /fix firewall/i }))
+
+    await waitFor(() => {
+      expect(screen.getByText(/firewall configuration already in progress/i)).toBeInTheDocument()
+    })
+    expect(screen.queryByRole('button', { name: /fix firewall/i })).not.toBeInTheDocument()
+  })
+
   it('hides the Fix action and shows in-progress detail when the firewall is already configuring', () => {
     const store = createSettingsViewStore({
       extraPreloadedState: {
@@ -240,6 +272,63 @@ describe('SettingsView network access section', () => {
 
     expect(screen.getByText(/firewall configuration already in progress/i)).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /fix firewall/i })).not.toBeInTheDocument()
+  })
+
+  it('stops polling and surfaces a timeout when firewall configuration never finishes', async () => {
+    vi.useFakeTimers()
+    mockFetchFirewallConfig.mockResolvedValueOnce({
+      method: 'in-progress',
+      error: 'Firewall configuration already in progress',
+    })
+
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            firewall: {
+              platform: 'windows',
+              active: true,
+              portOpen: false,
+              commands: ['netsh advfirewall firewall add rule name="Freshell (port 3001)" dir=in action=allow protocol=TCP localport=3001 profile=private'],
+              configuring: false,
+            },
+          }),
+        }),
+      },
+    })
+
+    const { api } = await import('@/lib/api')
+    vi.mocked(api.get).mockResolvedValue(createNetworkStatus({
+      firewall: {
+        platform: 'windows',
+        active: true,
+        portOpen: false,
+        commands: ['netsh advfirewall firewall add rule name="Freshell (port 3001)" dir=in action=allow protocol=TCP localport=3001 profile=private'],
+        configuring: true,
+      },
+    }))
+
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    fireEvent.click(screen.getByRole('button', { name: /fix firewall/i }))
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(22000)
+      await Promise.resolve()
+    })
+
+    expect(screen.getByText(/firewall configuration timed out/i)).toBeInTheDocument()
+    const callCountAfterTimeout = vi.mocked(api.get).mock.calls.length
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4000)
+      await Promise.resolve()
+    })
+
+    expect(vi.mocked(api.get).mock.calls.length).toBe(callCountAfterTimeout)
   })
 
   it('refreshes network status when the server reports no firewall changes were needed', async () => {

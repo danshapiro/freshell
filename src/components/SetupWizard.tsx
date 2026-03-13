@@ -39,6 +39,10 @@ function getFirewallChecklistState(firewall: FirewallState): { status: Checklist
     return { status: 'done', detail: 'Port is open' }
   }
 
+  if (firewall.configuring) {
+    return { status: 'active', detail: 'Firewall configuration already in progress' }
+  }
+
   if (firewall.platform === 'wsl2' && firewall.portOpen === false) {
     return { status: 'error', detail: 'Port may be blocked by firewall' }
   }

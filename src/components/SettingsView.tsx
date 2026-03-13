@@ -46,6 +46,8 @@ import { ConfirmModal } from '@/components/ui/confirm-modal'
 
 const log = createLogger('SettingsView')
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
+const SETTINGS_FIREWALL_POLL_INTERVAL_MS = 2000
+const SETTINGS_FIREWALL_POLL_MAX_ATTEMPTS = 10
 
 /** Monospace fonts with good Unicode block element support for terminal use */
 const terminalFonts = [
@@ -97,8 +99,12 @@ function getFirewallDescription(firewall: FirewallState, override: string | null
   return 'Firewall detected'
 }
 
-function shouldShowFirewallFix(firewall: FirewallState): boolean {
-  if (firewall.configuring) {
+function isFirewallRefreshInProgress(firewall: FirewallState, override: string | null): boolean {
+  return firewall.configuring || override === 'Firewall configuration already in progress'
+}
+
+function shouldShowFirewallFix(firewall: FirewallState, override: string | null): boolean {
+  if (isFirewallRefreshInProgress(firewall, override)) {
     return false
   }
   if (firewall.platform === 'wsl2' && firewall.portOpen === false) {
@@ -304,7 +310,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     }
   }, [dispatch])
 
-  const queueFirewallRefresh = useCallback((refreshRequestId: number, detail: string | null) => {
+  const queueFirewallRefresh = useCallback((refreshRequestId: number, detail: string | null, attempts = 0) => {
     firewallRefreshTimerRef.current = setTimeout(() => {
       firewallRefreshTimerRef.current = null
       void dispatch(fetchNetworkStatus())
@@ -315,7 +321,12 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
           }
 
           if (status.firewall.configuring) {
-            queueFirewallRefresh(refreshRequestId, detail)
+            if (attempts + 1 >= SETTINGS_FIREWALL_POLL_MAX_ATTEMPTS) {
+              setFirewallRefreshDetail('Firewall configuration timed out')
+              return
+            }
+
+            queueFirewallRefresh(refreshRequestId, detail, attempts + 1)
             return
           }
 
@@ -326,7 +337,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
             setFirewallRefreshDetail('Failed to refresh firewall status')
           }
         })
-    }, 2000)
+    }, SETTINGS_FIREWALL_POLL_INTERVAL_MS)
   }, [dispatch])
 
   const scheduleFirewallRefresh = useCallback((detail: string | null = null) => {
@@ -367,7 +378,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     }
 
     if (result.method === 'wsl2' || result.method === 'windows-elevated') {
-      scheduleFirewallRefresh()
+      scheduleFirewallRefresh('Firewall configuration already in progress')
     }
   }, [onFirewallTerminal, onNavigate, refreshFirewallStatusAfterNoop, scheduleFirewallRefresh])
 
@@ -1360,7 +1371,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                   >
                     <div className="flex items-center gap-2">
                       <span className="text-xs text-muted-foreground">{networkStatus.firewall.platform}</span>
-                      {shouldShowFirewallFix(networkStatus.firewall) && (
+                      {shouldShowFirewallFix(networkStatus.firewall, firewallRefreshDetail) && (
                         <button
                           onClick={() => {
                             void requestFirewallFix()
