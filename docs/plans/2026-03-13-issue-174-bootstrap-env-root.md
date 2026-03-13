@@ -4,7 +4,7 @@
 
 **Goal:** Lock issue `#174` down with heavy regression coverage by proving that a clean compiled startup writes `.env` into the runtime root, loads that token on first run, and serves authenticated requests successfully.
 
-**Architecture:** The functional fix already exists on the current branch and on `main`: [server/bootstrap.ts](/home/user/code/freshell/.worktrees/trycycle-issue-174-bootstrap-env-root/server/bootstrap.ts#L310) resolves the env root from `process.cwd()`, which matches `dotenv/config`. The missing work is durable coverage at the real failure boundary, so the plan extends the existing production-start `TestServer` harness just enough to run `dist/server/index.js` from an isolated temp runtime root without a preseeded `AUTH_TOKEN`, then verifies both the compiled cold-start flow and the helper cleanup path.
+**Architecture:** The functional fix already exists on the current branch and on `main`: [server/bootstrap.ts](/home/user/code/freshell/.worktrees/trycycle-issue-174-bootstrap-env-root/server/bootstrap.ts#L310) resolves the env root from `process.cwd()`, which matches `dotenv/config`. The missing work is durable coverage at the real failure boundary, so the plan extends the existing production-start `TestServer` harness just enough to run `dist/server/index.js` from a clean isolated runtime root under the worktree without a preseeded `AUTH_TOKEN`, then verifies both the compiled cold-start flow and the helper cleanup path. Keeping the isolated runtime root under the worktree is deliberate: it changes `process.cwd()` while still allowing Node to resolve the repo's `node_modules` from ancestor directories, so the regression fails only for real bootstrap/env-root mistakes.
 
 **Tech Stack:** Node.js, TypeScript, Vitest, built `dist/server` startup, `test/e2e-browser/helpers/TestServer`
 
@@ -21,9 +21,10 @@
 - The issue body says the failure was caused by bootstrap writing `.env` to `dist/.env` while `dotenv/config` loaded from `process.cwd()`. That exact mismatch is already corrected in the current code by [server/bootstrap.ts](/home/user/code/freshell/.worktrees/trycycle-issue-174-bootstrap-env-root/server/bootstrap.ts#L313).
 - Because the product fix is already present, the right plan is not to invent another env-loading abstraction. The right plan is to add the missing compiled-start regression harness and only touch product code if that regression still exposes a real mismatch.
 - The cleanest surface is the existing `TestServer` helper in [test/e2e-browser/helpers/test-server.ts](/home/user/code/freshell/.worktrees/trycycle-issue-174-bootstrap-env-root/test/e2e-browser/helpers/test-server.ts), because it is already the canonical “start the built production server and wait for health” utility used by browser and perf tests. Replacing it with a one-off spawn helper would duplicate port selection, health waiting, log capture, and cleanup logic for a single issue.
+- Do not stage the isolated runtime root in `os.tmpdir()`. A copied `dist/server/index.js` outside the repo tree would stop resolving dependencies from the repo's `node_modules`, so the test would fail for the wrong reason. The isolated runtime root must live under the worktree.
 - Heavy coverage for this issue means:
   - keep the existing source-contract unit assertion for `resolveProjectRoot()`
-  - add a real compiled cold-start regression using a temp runtime root and no inherited `AUTH_TOKEN`
+  - add a real compiled cold-start regression using a temporary isolated runtime root under the worktree and no inherited `AUTH_TOKEN`
   - add coverage for the new harness cleanup semantics introduced by the isolated runtime root
   - run the coordinated full suite after focused build-backed verification
 - No `docs/index.html` update is needed. This is a startup regression with no user-facing UI change.
@@ -32,6 +33,7 @@
 
 - Keep the product rule `resolveProjectRoot() === process.cwd()`. That is the issue’s preferred fix and it is the only rule guaranteed to agree with `dotenv/config`.
 - Extend `TestServer` behind opt-in options rather than changing default behavior. Existing Playwright/perf callers must continue to get the current “project-root + explicit token” startup path unchanged.
+- Stage isolated runtime roots under an ignored directory inside the worktree, not the system temp directory. That keeps `process.cwd()` isolated while preserving normal Node ancestor lookup for `node_modules`.
 - The isolated runtime root should copy only `package.json` and `dist/`. Do not symlink. Windows-native reproduction was part of the issue, and symlink behavior would make the regression less representative. Do not copy `extensions/`: [server/extension-manager.ts](/home/user/code/freshell/.worktrees/trycycle-issue-174-bootstrap-env-root/server/extension-manager.ts#L62) explicitly tolerates missing extension directories, so they are not required for `/api/health` and `/api/settings`.
 - Treat harness changes as the expected end state. Product code changes are conditional and only allowed if the new compiled-start regression still reveals a real runtime-root mismatch.
 
@@ -66,7 +68,7 @@ Add this spec near the existing `TestServer` tests in [test/e2e-browser/helpers/
 
 This is the exact issue path in executable form:
 - built server, not source server
-- clean temp runtime root, not the repo root
+- clean isolated runtime root under the worktree, not the repo root
 - no inherited `AUTH_TOKEN`
 - `.env` must land in the runtime root, not `dist/`
 - authenticated API must work with the bootstrapped token
@@ -82,7 +84,7 @@ npm run test:e2e:helpers -- helpers/test-server.test.ts -t "bootstraps AUTH_TOKE
 
 Expected:
 - `FAIL`
-- Failure reason should be harness-related: missing `runtimeRoot`, no isolated runtime-root mode, or no bootstrap-auth mode.
+- Failure reason should be harness-related: TypeScript rejecting the new options/properties, missing `runtimeRoot`, no isolated runtime-root mode, or no bootstrap-auth mode.
 
 ### Task 2: Extend `TestServer` for isolated compiled startup without changing defaults
 
@@ -129,14 +131,16 @@ In the same file, add:
 
 ```ts
 async function createIsolatedRuntimeRoot(projectRoot: string): Promise<string> {
-  const runtimeRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-runtime-'))
+  const runtimeRootsParent = path.join(projectRoot, '.worktrees')
+  await fsp.mkdir(runtimeRootsParent, { recursive: true })
+  const runtimeRoot = await fsp.mkdtemp(path.join(runtimeRootsParent, 'test-server-runtime-'))
   await fsp.copyFile(path.join(projectRoot, 'package.json'), path.join(runtimeRoot, 'package.json'))
   await fsp.cp(path.join(projectRoot, 'dist'), path.join(runtimeRoot, 'dist'), { recursive: true })
   return runtimeRoot
 }
 ```
 
-Do not use symlinks.
+Do not use symlinks. Do not use `os.tmpdir()`.
 
 **Step 3: Add a private parser for the bootstrapped token**
 
@@ -154,7 +158,7 @@ function readAuthTokenFromEnvFile(envText: string): string {
 
 Keep this helper private. The public contract is still `TestServer.start()`.
 
-**Step 4: Track the temp runtime root on the class**
+**Step 4: Track the isolated runtime root on the class**
 
 Add a private field:
 
@@ -162,7 +166,7 @@ Add a private field:
   private runtimeRootDir: string | null = null
 ```
 
-This field exists only to clean up temp runtime roots created by `runtimeRootMode: 'isolated'`.
+This field exists only to clean up isolated runtime roots created by `runtimeRootMode: 'isolated'`.
 
 **Step 5: Choose the runtime root before spawn**
 
@@ -217,6 +221,8 @@ if (authStrategy === 'explicit-env') {
 } else {
   delete env.AUTH_TOKEN
 }
+
+delete env.VITE_PORT
 
 this.process = spawn('node', [serverEntry], {
   cwd: runtimeRoot,
@@ -274,10 +280,11 @@ This must never delete the repo root, because `runtimeRootDir` is only populated
 
 In [test/e2e-browser/helpers/test-server.test.ts](/home/user/code/freshell/.worktrees/trycycle-issue-174-bootstrap-env-root/test/e2e-browser/helpers/test-server.test.ts), make two small additions besides the red regression:
 
-1. Extend the existing `"starts a server on an ephemeral port"` test:
+1. Extend the existing `"starts a server on an ephemeral port"` test. Add `fileURLToPath` import from `url`, derive the worktree root from the test file path, and assert the default runtime root is still the project root:
 
 ```ts
-    expect(info.runtimeRoot).toBeTruthy()
+    const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..')
+    expect(info.runtimeRoot).toBe(projectRoot)
 ```
 
 2. Add a cleanup test:
