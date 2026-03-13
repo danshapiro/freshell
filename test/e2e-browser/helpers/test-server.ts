@@ -91,6 +91,14 @@ export function applyTestServerHomeEnvironment(
     return applyIsolatedHomeEnvironment(env, homeDir)
   }
 
+  // Native Windows can safely point USERPROFILE/HOMEDRIVE/HOMEPATH at the
+  // temp home, which keeps os.homedir()-based server paths isolated. On
+  // non-Windows hosts (including WSL), preserve those shell vars because
+  // Windows executables may need a Windows-native profile path to start.
+  if (process.platform === 'win32') {
+    return applyIsolatedHomeEnvironment(env, homeDir)
+  }
+
   return applyAppDataIsolation(env, homeDir)
 }
 
@@ -102,7 +110,7 @@ export function requireBuiltServerEntry(
   if (!existsSync(serverEntry)) {
     throw new Error(
       `Built server not found at ${serverEntry}. Run "npm run build" first, ` +
-      'or let the Playwright globalSetup handle it.'
+      'or let the E2E helper globalSetup rebuild it.'
     )
   }
   return serverEntry

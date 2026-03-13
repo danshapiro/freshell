@@ -1,11 +1,11 @@
 import { AsyncLocalStorage } from 'async_hooks'
 import fs from 'fs'
-import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { createRequire } from 'module'
 import pino, { type DestinationStream, type LevelWithSilent } from 'pino'
 import { createStream, type RotatingFileStream } from 'rotating-file-stream'
+import { getFreshellHomeDir } from './freshell-home.js'
 
 const env = process.env.NODE_ENV || 'development'
 const level = process.env.LOG_LEVEL || 'debug'
@@ -85,7 +85,7 @@ export function getLogContext(): LogContext | undefined {
 
 export function resolveDebugLogPath(
   envVars: NodeJS.ProcessEnv = process.env,
-  homeDir: string = os.homedir(),
+  homeDir: string = getFreshellHomeDir(envVars),
   argv: string[] = process.argv,
 ): string | null {
   const explicitPath = envVars.LOG_DEBUG_PATH?.trim()

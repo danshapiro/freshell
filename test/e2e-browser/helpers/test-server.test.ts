@@ -13,6 +13,16 @@ function resolveProjectRoot(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..')
 }
 
+function withPlatform<T>(platform: NodeJS.Platform, fn: () => T): T {
+  const originalPlatform = process.platform
+  Object.defineProperty(process, 'platform', { value: platform })
+  try {
+    return fn()
+  } finally {
+    Object.defineProperty(process, 'platform', { value: originalPlatform })
+  }
+}
+
 describe('TestServer', () => {
   let server: TestServer | undefined
 
@@ -105,7 +115,7 @@ describe('TestServer', () => {
   })
 
   it('preserves inherited Windows shell env vars for project-root starts', () => {
-    const env = applyTestServerHomeEnvironment({
+    const env = withPlatform('linux', () => applyTestServerHomeEnvironment({
       HOME: '/real/home',
       USERPROFILE: 'C:\\Users\\real-user',
       HOMEDRIVE: 'C:',
@@ -114,7 +124,7 @@ describe('TestServer', () => {
       CODEX_HOME: '/real/.codex',
       XDG_DATA_HOME: '/real/.local/share',
       LOCALAPPDATA: 'C:\\Users\\real-user\\AppData\\Local',
-    }, '/tmp/freshell-e2e-home')
+    }, '/tmp/freshell-e2e-home'))
 
     expect(env.HOME).toBe('/tmp/freshell-e2e-home')
     expect(env.FRESHELL_HOME).toBe('/tmp/freshell-e2e-home')
@@ -127,9 +137,32 @@ describe('TestServer', () => {
     expect(env.LOCALAPPDATA).toBe('/tmp/freshell-e2e-home/AppData/Local')
   })
 
+  it('isolates Windows shell env vars for project-root starts on native Windows', () => {
+    const env = withPlatform('win32', () => applyTestServerHomeEnvironment({
+      HOME: 'C:\\Users\\real-user',
+      USERPROFILE: 'C:\\Users\\real-user',
+      HOMEDRIVE: 'C:',
+      HOMEPATH: '\\Users\\real-user',
+      CLAUDE_HOME: 'C:\\Users\\real-user\\.claude',
+      CODEX_HOME: 'C:\\Users\\real-user\\.codex',
+      XDG_DATA_HOME: 'C:\\Users\\real-user\\.local\\share',
+      LOCALAPPDATA: 'C:\\Users\\real-user\\AppData\\Local',
+    }, 'D:\\Temp\\freshell-e2e-home'))
+
+    expect(env.HOME).toBe('D:\\Temp\\freshell-e2e-home')
+    expect(env.FRESHELL_HOME).toBe('D:\\Temp\\freshell-e2e-home')
+    expect(env.USERPROFILE).toBe('D:\\Temp\\freshell-e2e-home')
+    expect(env.HOMEDRIVE).toBe('D:')
+    expect(env.HOMEPATH).toBe('\\Temp\\freshell-e2e-home')
+    expect(env.CLAUDE_HOME).toBe('D:\\Temp\\freshell-e2e-home\\.claude')
+    expect(env.CODEX_HOME).toBe('D:\\Temp\\freshell-e2e-home\\.codex')
+    expect(env.XDG_DATA_HOME).toBe('D:\\Temp\\freshell-e2e-home\\.local\\share')
+    expect(env.LOCALAPPDATA).toBe('D:\\Temp\\freshell-e2e-home\\AppData\\Local')
+  })
+
   it('reports the build-first guidance before isolated staging when the compiled server is missing', () => {
     expect(() => requireBuiltServerEntry('/repo', () => false)).toThrow(
-      'Built server not found at /repo/dist/server/index.js. Run "npm run build" first, or let the Playwright globalSetup handle it.',
+      'Built server not found at /repo/dist/server/index.js. Run "npm run build" first, or let the E2E helper globalSetup rebuild it.',
     )
   })
 

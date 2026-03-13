@@ -207,6 +207,25 @@ describe("logger", () => {
     )
 
     it(
+      "uses FRESHELL_HOME when deriving the default log directory",
+      async () => {
+        const { resolveDebugLogPath } = await import("../../../server/logger")
+        const resolved = resolveDebugLogPath(
+          { FRESHELL_HOME: "/tmp/freshell-home", NODE_ENV: "development", PORT: "3001" } as NodeJS.ProcessEnv,
+        )
+        expect(resolved).toBe(
+          path.join(
+            "/tmp/freshell-home",
+            ".freshell",
+            "logs",
+            "server-debug.development.3001.jsonl",
+          ),
+        )
+      },
+      TEST_TIMEOUT_MS,
+    )
+
+    it(
       "uses explicit mode over NODE_ENV when computing defaults",
       async () => {
         const { resolveDebugLogPath } = await import("../../../server/logger")
