@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { fireEvent, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import {
   createNetworkState,
   createNetworkStatus,
@@ -71,6 +71,7 @@ describe('SettingsView network access section', () => {
         title: 'Administrator approval required',
         body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
         confirmLabel: 'Continue',
+        confirmationToken: 'confirm-1',
       })
       .mockResolvedValueOnce({ method: 'windows-elevated', status: 'started' })
 
@@ -100,7 +101,10 @@ describe('SettingsView network access section', () => {
     fireEvent.click(within(confirmationDialog).getByRole('button', { name: /^continue$/i }))
 
     await waitFor(() => {
-      expect(mockFetchFirewallConfig).toHaveBeenNthCalledWith(2, { confirmElevation: true })
+      expect(mockFetchFirewallConfig).toHaveBeenNthCalledWith(2, {
+        confirmElevation: true,
+        confirmationToken: 'confirm-1',
+      })
     })
   })
 
@@ -110,6 +114,7 @@ describe('SettingsView network access section', () => {
       title: 'Administrator approval required',
       body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
       confirmLabel: 'Continue',
+      confirmationToken: 'confirm-1',
     })
 
     const store = createSettingsViewStore({
@@ -135,6 +140,52 @@ describe('SettingsView network access section', () => {
     fireEvent.click(within(confirmationDialog).getByRole('button', { name: /^cancel$/i }))
 
     expect(mockFetchFirewallConfig).toHaveBeenCalledTimes(1)
+  })
+
+  it('treats an in-progress settings repair as a refresh path instead of a no-op', async () => {
+    vi.useFakeTimers()
+    mockFetchFirewallConfig.mockResolvedValueOnce({
+      method: 'in-progress',
+      error: 'Firewall configuration already in progress',
+    })
+
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            firewall: {
+              platform: 'windows',
+              active: true,
+              portOpen: false,
+              commands: ['netsh advfirewall firewall add rule name="Freshell (port 3001)" dir=in action=allow protocol=TCP localport=3001 profile=private'],
+              configuring: false,
+            },
+          }),
+        }),
+      },
+    })
+
+    const { api } = await import('@/lib/api')
+    vi.mocked(api.get).mockResolvedValue(createNetworkStatus({
+      firewall: {
+        platform: 'windows',
+        active: true,
+        portOpen: true,
+        commands: ['netsh advfirewall firewall add rule name="Freshell (port 3001)" dir=in action=allow protocol=TCP localport=3001 profile=private'],
+        configuring: false,
+      },
+    }))
+
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    fireEvent.click(screen.getByRole('button', { name: /fix firewall/i }))
+
+    await act(async () => {
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(2000)
+    })
+
+    expect(api.get).toHaveBeenCalledWith('/api/network/status')
   })
 
   it('refreshes network status when the server reports no firewall changes were needed', async () => {

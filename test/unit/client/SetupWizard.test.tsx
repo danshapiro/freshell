@@ -297,6 +297,7 @@ describe('SetupWizard', () => {
         title: 'Administrator approval required',
         body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
         confirmLabel: 'Continue',
+        confirmationToken: 'confirm-1',
       })
       .mockResolvedValueOnce({ method: 'wsl2', status: 'started' })
 
@@ -340,7 +341,10 @@ describe('SetupWizard', () => {
     fireEvent.click(within(confirmationDialog).getByRole('button', { name: /^continue$/i }))
 
     await waitFor(() => {
-      expect(mockFetchFirewallConfig).toHaveBeenNthCalledWith(2, { confirmElevation: true })
+      expect(mockFetchFirewallConfig).toHaveBeenNthCalledWith(2, {
+        confirmElevation: true,
+        confirmationToken: 'confirm-1',
+      })
     })
   })
 
@@ -350,6 +354,7 @@ describe('SetupWizard', () => {
       title: 'Administrator approval required',
       body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
       confirmLabel: 'Continue',
+      confirmationToken: 'confirm-1',
     })
 
     const firewallActive = { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false }
@@ -386,6 +391,58 @@ describe('SetupWizard', () => {
     fireEvent.click(within(confirmationDialog).getByRole('button', { name: /^cancel$/i }))
 
     expect(mockFetchFirewallConfig).toHaveBeenCalledTimes(1)
+  })
+
+  it('treats an in-progress wizard repair as active work and starts polling', async () => {
+    mockFetchFirewallConfig.mockResolvedValueOnce({
+      method: 'in-progress',
+      error: 'Firewall configuration already in progress',
+    })
+
+    const firewallActive = { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false }
+    const store = createTestStore({
+      status: {
+        ...defaultNetworkStatus,
+        configured: true,
+        host: '0.0.0.0',
+        firewall: firewallActive,
+        rebinding: false,
+      },
+    })
+
+    mockPost.mockResolvedValueOnce({
+      ...defaultNetworkStatus,
+      configured: true,
+      host: '0.0.0.0',
+      firewall: firewallActive,
+      rebinding: false,
+    })
+
+    const refreshedStatus = {
+      ...defaultNetworkStatus,
+      configured: true,
+      host: '0.0.0.0' as const,
+      firewall: { ...firewallActive, configuring: false, portOpen: true },
+      rebinding: false,
+    }
+    const { api } = await import('@/lib/api')
+    vi.mocked(api.get).mockResolvedValue(refreshedStatus)
+
+    render(
+      <Provider store={store}>
+        <SetupWizard onComplete={vi.fn()} initialStep={2} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /configure firewall/i })).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /configure firewall/i }))
+
+    await waitFor(() => {
+      expect(api.get).toHaveBeenCalledWith('/api/network/status')
+    })
   })
 
   it('refreshes network status when the server reports no firewall changes were needed', async () => {

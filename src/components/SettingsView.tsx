@@ -286,6 +286,17 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     }
   }, [dispatch])
 
+  const scheduleFirewallRefresh = useCallback((detail: string | null = null) => {
+    setFirewallRefreshDetail(detail)
+    if (firewallRefreshTimerRef.current) {
+      clearTimeout(firewallRefreshTimerRef.current)
+    }
+    firewallRefreshTimerRef.current = setTimeout(() => {
+      firewallRefreshTimerRef.current = null
+      void dispatch(fetchNetworkStatus())
+    }, 2000)
+  }, [dispatch])
+
   const handleFirewallFixResult = useCallback((result: ConfigureFirewallResult) => {
     if (result.method === 'confirmation-required') {
       setFirewallConfirmation(result)
@@ -308,18 +319,19 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
       return
     }
 
-    if (result.method === 'wsl2' || result.method === 'windows-elevated') {
-      if (firewallRefreshTimerRef.current) {
-        clearTimeout(firewallRefreshTimerRef.current)
-      }
-      firewallRefreshTimerRef.current = setTimeout(() => {
-        firewallRefreshTimerRef.current = null
-        void dispatch(fetchNetworkStatus())
-      }, 2000)
+    if (result.method === 'in-progress') {
+      scheduleFirewallRefresh(result.error)
+      return
     }
-  }, [dispatch, onFirewallTerminal, onNavigate, refreshFirewallStatusAfterNoop])
 
-  const requestFirewallFix = useCallback(async (body: { confirmElevation?: true } = {}) => {
+    if (result.method === 'wsl2' || result.method === 'windows-elevated') {
+      scheduleFirewallRefresh()
+    }
+  }, [onFirewallTerminal, onNavigate, refreshFirewallStatusAfterNoop, scheduleFirewallRefresh])
+
+  const requestFirewallFix = useCallback(async (
+    body: { confirmElevation?: true; confirmationToken?: string } = {},
+  ) => {
     setFirewallRefreshDetail(null)
     try {
       const result = await fetchFirewallConfig(body)
@@ -330,9 +342,17 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   }, [handleFirewallFixResult])
 
   const handleConfirmFirewallFix = useCallback(() => {
+    if (!firewallConfirmation) {
+      return
+    }
+
+    const confirmationToken = firewallConfirmation.confirmationToken
     setFirewallConfirmation(null)
-    void requestFirewallFix({ confirmElevation: true })
-  }, [requestFirewallFix])
+    void requestFirewallFix({
+      confirmElevation: true,
+      confirmationToken,
+    })
+  }, [firewallConfirmation, requestFirewallFix])
 
   const handleCancelFirewallFix = useCallback(() => {
     setFirewallConfirmation(null)

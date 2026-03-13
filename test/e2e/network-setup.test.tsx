@@ -175,6 +175,7 @@ describe('Network Setup Wizard (e2e)', () => {
         title: 'Administrator approval required',
         body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
         confirmLabel: 'Continue',
+        confirmationToken: 'confirm-1',
       })
       .mockResolvedValueOnce({ method: 'wsl2', status: 'started' })
 
@@ -197,7 +198,10 @@ describe('Network Setup Wizard (e2e)', () => {
     fireEvent.click(within(confirmationDialog).getByRole('button', { name: /^continue$/i }))
 
     await waitFor(() => {
-      expect(mockFetchFirewallConfig).toHaveBeenNthCalledWith(2, { confirmElevation: true })
+      expect(mockFetchFirewallConfig).toHaveBeenNthCalledWith(2, {
+        confirmElevation: true,
+        confirmationToken: 'confirm-1',
+      })
     })
   })
 
@@ -327,6 +331,7 @@ describe('Settings network section (e2e)', () => {
         title: 'Administrator approval required',
         body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
         confirmLabel: 'Continue',
+        confirmationToken: 'confirm-1',
       })
       .mockResolvedValueOnce({ method: 'windows-elevated', status: 'started' })
 
@@ -344,7 +349,10 @@ describe('Settings network section (e2e)', () => {
     fireEvent.click(within(confirmationDialog).getByRole('button', { name: /^continue$/i }))
 
     await waitFor(() => {
-      expect(mockFetchFirewallConfig).toHaveBeenNthCalledWith(2, { confirmElevation: true })
+      expect(mockFetchFirewallConfig).toHaveBeenNthCalledWith(2, {
+        confirmElevation: true,
+        confirmationToken: 'confirm-1',
+      })
     })
   })
 })

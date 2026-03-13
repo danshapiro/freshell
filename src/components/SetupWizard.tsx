@@ -211,9 +211,9 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
     }
   }, [shareAccessUrl])
 
-  const startFirewallPolling = useCallback(() => {
+  const startFirewallPolling = useCallback((initialDetail = 'Configuring firewall...') => {
     setFirewallStatus('active')
-    setFirewallDetail('Configuring firewall...')
+    setFirewallDetail(initialDetail)
     const pollFirewall = async (attempts = 0) => {
       if (!mountedRef.current) return
       if (attempts >= SETUP_WIZARD_FIREWALL_POLL_MAX_ATTEMPTS) {
@@ -292,12 +292,19 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
       return
     }
 
+    if (result.method === 'in-progress') {
+      startFirewallPolling(result.error)
+      return
+    }
+
     if (result.method === 'wsl2' || result.method === 'windows-elevated') {
       startFirewallPolling()
     }
   }, [onComplete, onNavigate, onFirewallTerminal, refreshFirewallStatus, startFirewallPolling])
 
-  const requestFirewallConfig = useCallback(async (body: { confirmElevation?: true } = {}) => {
+  const requestFirewallConfig = useCallback(async (
+    body: { confirmElevation?: true; confirmationToken?: string } = {},
+  ) => {
     const result = await fetchFirewallConfig(body)
     handleFirewallResult(result)
   }, [handleFirewallResult])
@@ -312,14 +319,22 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
   }, [requestFirewallConfig])
 
   const handleConfirmFirewall = useCallback(async () => {
+    if (!firewallConfirmation) {
+      return
+    }
+
+    const confirmationToken = firewallConfirmation.confirmationToken
     setFirewallConfirmation(null)
     try {
-      await requestFirewallConfig({ confirmElevation: true })
+      await requestFirewallConfig({
+        confirmElevation: true,
+        confirmationToken,
+      })
     } catch (err: any) {
       setFirewallStatus('error')
       setFirewallDetail(err?.message || 'Firewall configuration failed')
     }
-  }, [requestFirewallConfig])
+  }, [firewallConfirmation, requestFirewallConfig])
 
   const handleCancelFirewallConfirmation = useCallback(() => {
     setFirewallConfirmation(null)
