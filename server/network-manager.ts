@@ -92,15 +92,20 @@ export class NetworkManager {
     this.wsHandler = handler
   }
 
+  private async getFirewallInfo(): Promise<FirewallInfo> {
+    if (!this.firewallInfo) {
+      this.firewallInfo = await detectFirewall()
+    }
+
+    return this.firewallInfo
+  }
+
   async getStatus(): Promise<NetworkStatus> {
     const settings = await this.configStore.getSettings()
     const network = settings.network
 
     this.ensureLanIps()
-
-    if (!this.firewallInfo) {
-      this.firewallInfo = await detectFirewall()
-    }
+    const firewallInfo = await this.getFirewallInfo()
 
     const ports = this.getRelevantPorts()
 
@@ -127,8 +132,8 @@ export class NetworkManager {
       }
     }
 
-    const commands = this.firewallInfo.active
-      ? firewallCommands(this.firewallInfo.platform, ports)
+    const commands = firewallInfo.active
+      ? firewallCommands(firewallInfo.platform, ports)
       : []
 
     const token = process.env.AUTH_TOKEN ?? ''
@@ -141,13 +146,13 @@ export class NetworkManager {
     return {
       configured: network.configured,
       host: effectiveHost,
-      remoteAccessEnabled: isRemoteAccessEnabled(network, effectiveHost, this.firewallInfo.platform),
+      remoteAccessEnabled: isRemoteAccessEnabled(network, effectiveHost, firewallInfo.platform),
       port: this.port,
       lanIps: this.lanIps,
       machineHostname: os.hostname().replace(/\.local$/, ''),
       firewall: {
-        platform: this.firewallInfo.platform,
-        active: this.firewallInfo.active,
+        platform: firewallInfo.platform,
+        active: firewallInfo.active,
         portOpen,
         commands,
         configuring: this.firewallConfiguring,
@@ -160,6 +165,8 @@ export class NetworkManager {
   }
 
   async configure(network: NetworkSettings): Promise<{ rebindScheduled: boolean }> {
+    const firewallInfo = await this.getFirewallInfo()
+
     // Use the actual server bind address to detect host changes. On WSL2
     // the server starts on 0.0.0.0 regardless of config, so comparing
     // against the config value would cause spurious rebinds.
@@ -169,8 +176,10 @@ export class NetworkManager {
       actualHost === '0.0.0.0' || actualHost === '::' ? '0.0.0.0'
       : actualHost === '127.0.0.1' || actualHost === '::1' ? '127.0.0.1'
       : null
-    // Only rebind if we can determine the current host AND it differs
-    const hostChanged = effectiveCurrentHost !== null && effectiveCurrentHost !== network.host
+    // On WSL, the listener stays on 0.0.0.0 and the saved host is only an intent flag.
+    const hostChanged = firewallInfo.platform !== 'wsl2'
+      && effectiveCurrentHost !== null
+      && effectiveCurrentHost !== network.host
 
     await this.configStore.patchSettings({ network })
 

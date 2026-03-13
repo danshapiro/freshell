@@ -20,7 +20,6 @@ import {
   getExistingFirewallPorts,
   needsFirewallUpdate,
   buildFirewallOnlyScript,
-  setupWslPortForwarding,
   type PortProxyRule
 } from '../../../server/wsl-port-forward.js'
 
@@ -548,5 +547,4 @@ Address         Port        Address         Port
       })
     })
   })
-
 })

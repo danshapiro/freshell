@@ -13,6 +13,7 @@ import { createNetworkRouter } from '../../../server/network-router.js'
 import { ConfigStore } from '../../../server/config-store.js'
 import { httpAuthMiddleware } from '../../../server/auth.js'
 import { detectFirewall } from '../../../server/firewall.js'
+import * as wslModule from '../../../server/wsl-port-forward.js'
 
 // Mock firewall detection to avoid real system calls
 vi.mock('../../../server/firewall.js', async () => {
@@ -63,6 +64,13 @@ describe('Network API integration', () => {
   beforeEach(async () => {
     vi.clearAllMocks()
     delete process.env.HOST
+    vi.mocked(detectFirewall).mockResolvedValue({ platform: 'linux-none', active: false })
+    vi.mocked(wslModule.computeWslPortForwardingPlanAsync).mockResolvedValue({
+      status: 'ready',
+      wslIp: '172.24.0.2',
+      scriptKind: 'full',
+      script: '$null # mock script',
+    })
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-test-'))
     process.env.FRESHELL_HOME = tmpDir
 
@@ -147,6 +155,37 @@ describe('Network API integration', () => {
           configured: true,
         })
       expect(res.status).toBe(400)
+    })
+
+    it('keeps WSL bound to 0.0.0.0 when disabling remote access intent', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+      await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+
+      const res = await request(app)
+        .post('/api/network/configure')
+        .set('x-auth-token', token)
+        .send({
+          host: '127.0.0.1',
+          configured: true,
+        })
+
+      expect(res.status).toBe(200)
+      expect(res.body.rebindScheduled).toBe(false)
+      expect(res.body.host).toBe('0.0.0.0')
+      expect(res.body.remoteAccessEnabled).toBe(false)
+
+      const settings = await configStore.getSettings()
+      expect(settings.network).toEqual(expect.objectContaining({
+        host: '127.0.0.1',
+        configured: true,
+      }))
+
+      const addr = server.address()
+      expect(addr && typeof addr === 'object' ? addr.address : null).toBe('0.0.0.0')
     })
   })
 
@@ -528,6 +567,68 @@ describe('Network API integration', () => {
       expect(res.body).toEqual({ method: 'none', message: 'Remote access is not enabled' })
       expect(wslModule.computeWslPortForwardingPlanAsync).not.toHaveBeenCalled()
       expect(cp.execFile).not.toHaveBeenCalled()
+    })
+
+    it('returns the concrete WSL planning error before confirmation', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+
+      const wslModule = await import('../../../server/wsl-port-forward.js')
+      vi.mocked(wslModule.computeWslPortForwardingPlanAsync).mockResolvedValue({
+        status: 'error',
+        message: 'Failed to detect WSL2 IP address',
+      })
+
+      const res = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(res.status).toBe(500)
+      expect(res.body).toEqual({ error: 'Failed to detect WSL2 IP address' })
+    })
+
+    it('returns the concrete WSL planning error after confirmation', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+
+      const wslModule = await import('../../../server/wsl-port-forward.js')
+      vi.mocked(wslModule.computeWslPortForwardingPlanAsync)
+        .mockResolvedValueOnce({
+          status: 'ready',
+          wslIp: '172.24.0.2',
+          scriptKind: 'full',
+          script: '$null # mock script',
+        })
+        .mockResolvedValueOnce({
+          status: 'error',
+          message: 'Failed to detect WSL2 IP address',
+        })
+
+      const firstRes = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(firstRes.status).toBe(200)
+      expectConfirmationRequired(firstRes.body)
+
+      const confirmedRes = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({
+          confirmElevation: true,
+          confirmationToken: firstRes.body.confirmationToken,
+        })
+
+      expect(confirmedRes.status).toBe(500)
+      expect(confirmedRes.body).toEqual({ error: 'Failed to detect WSL2 IP address' })
     })
 
     it('returns confirmation-required for native Windows until the caller confirms elevation', async () => {

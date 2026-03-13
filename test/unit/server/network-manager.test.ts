@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import http from 'node:http'
 import { NetworkManager } from '../../../server/network-manager.js'
 import { detectLanIps } from '../../../server/bootstrap.js'
+import { detectFirewall } from '../../../server/firewall.js'
 
 // Mock external dependencies
 vi.mock('../../../server/bootstrap.js', () => ({
@@ -55,6 +56,7 @@ describe('NetworkManager', () => {
     delete process.env.ALLOWED_ORIGINS
     delete process.env.EXTRA_ALLOWED_ORIGINS
     delete process.env.HOST
+    vi.mocked(detectFirewall).mockResolvedValue({ platform: 'linux-none', active: false })
   })
 
   afterEach(async () => {
@@ -112,6 +114,42 @@ describe('NetworkManager', () => {
 
     const status = await manager.getStatus()
 
+    expect(status.host).toBe('0.0.0.0')
+    expect(status.remoteAccessEnabled).toBe(false)
+  })
+
+  it('does not hot rebind WSL when only the saved remote-access intent changes', async () => {
+    const firewallModule = await import('../../../server/firewall.js')
+    vi.mocked(firewallModule.detectFirewall).mockResolvedValue({
+      platform: 'wsl2',
+      active: true,
+    })
+    mockConfigStore = createMockConfigStore({
+      network: {
+        host: '0.0.0.0',
+        configured: true,
+      },
+    })
+    manager = new NetworkManager(server, mockConfigStore, 0)
+    await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+
+    const result = await manager.configure({
+      host: '127.0.0.1',
+      configured: true,
+    })
+
+    expect(result.rebindScheduled).toBe(false)
+    expect(mockConfigStore.patchSettings).toHaveBeenCalledWith({
+      network: {
+        host: '127.0.0.1',
+        configured: true,
+      },
+    })
+
+    const addr = server.address()
+    expect(addr && typeof addr === 'object' ? addr.address : null).toBe('0.0.0.0')
+
+    const status = await manager.getStatus()
     expect(status.host).toBe('0.0.0.0')
     expect(status.remoteAccessEnabled).toBe(false)
   })

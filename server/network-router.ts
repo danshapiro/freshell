@@ -49,6 +49,7 @@ type ConfirmableRepairAction = {
 }
 
 type RepairActionResolution =
+  | { kind: 'error'; error: string }
   | { kind: 'none'; response: { method: 'none'; message: string } }
   | { kind: 'terminal'; response: { method: 'terminal'; command: string } }
   | ConfirmableRepairAction
@@ -188,7 +189,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
 
       const plan = await computeWslPortForwardingPlanAsync(networkManager.getRelevantPorts())
       if (plan.status === 'error') {
-        throw new Error(plan.message)
+        return { kind: 'error', error: plan.message }
       }
       if (plan.status === 'noop' || plan.status === 'not-wsl2') {
         return { kind: 'none', response: NO_CONFIGURATION_CHANGES_REQUIRED }
@@ -289,6 +290,13 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
       ])
       const action = await resolveRepairAction(status, settings)
 
+      if (action.kind === 'error') {
+        if (confirmElevation) {
+          consumeCurrentConfirmation(confirmationToken)
+        }
+        return res.status(500).json({ error: action.error })
+      }
+
       if (action.kind === 'none' || action.kind === 'terminal') {
         if (confirmElevation) {
           consumeCurrentConfirmation(confirmationToken)
@@ -314,6 +322,15 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
           configStore.getSettings(),
         ])
         const freshAction = await resolveRepairAction(freshStatus, freshSettings)
+
+        if (freshAction.kind === 'error') {
+          consumeCurrentConfirmation(confirmationToken)
+          releaseConfirmedRepair()
+          return {
+            status: 500 as const,
+            body: { error: freshAction.error },
+          }
+        }
 
         if (freshAction.kind === 'none' || freshAction.kind === 'terminal') {
           consumeCurrentConfirmation(confirmationToken)
