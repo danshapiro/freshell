@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { createHash } from 'crypto'
-import { render, screen, fireEvent, cleanup, act, within } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, act } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import Sidebar from '@/components/Sidebar'
@@ -961,7 +961,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       const tabbedButton = screen.getByRole('button', { name: /Tabbed session/ })
       expect(tabbedButton.querySelector('.text-success')).toBeTruthy()
-      expect(tabbedButton.querySelector('.text-muted-foreground svg')).toBeFalsy()
+      expect(tabbedButton.querySelector('svg.text-muted-foreground')).toBeFalsy()
 
       const noTabButton = screen.getByRole('button', { name: /No tab session/ })
       expect(noTabButton.querySelector('svg.text-muted-foreground')).toBeTruthy()
