@@ -4,18 +4,38 @@ import { isWSL2 } from './platform.js'
 const IPV4_REGEX = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/
 const NETSH_PATH = '/mnt/c/Windows/System32/netsh.exe'
 const DEFAULT_PORT = 3001
+
+type ExecFileSettledResult = {
+  error: Error | null
+  stdout: string
+  stderr: string
+}
+
+function execFileSettledAsync(
+  command: string,
+  args: string[],
+  options: { encoding: 'utf-8'; timeout: number },
+): Promise<ExecFileSettledResult> {
+  return new Promise((resolve) => {
+    execFile(command, args, options, (error, stdout, stderr) => {
+      resolve({
+        error: error ?? null,
+        stdout: toErrorText(stdout),
+        stderr: toErrorText(stderr),
+      })
+    })
+  })
+}
+
 function execFileAsync(command: string, args: string[], options: { encoding: 'utf-8'; timeout: number }) {
   return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
-    execFile(command, args, options, (error, stdout, stderr) => {
+    void execFileSettledAsync(command, args, options).then(({ error, stdout, stderr }) => {
       if (error) {
         reject(error)
         return
       }
 
-      resolve({
-        stdout: typeof stdout === 'string' ? stdout : stdout.toString(),
-        stderr: typeof stderr === 'string' ? stderr : stderr.toString(),
-      })
+      resolve({ stdout, stderr })
     })
   })
 }
@@ -32,22 +52,9 @@ function toErrorText(value: unknown): string {
   return ''
 }
 
-function isMissingFirewallRuleError(error: unknown): boolean {
-  if (typeof error !== 'object' || error === null) {
-    return false
-  }
-
-  const errorLike = error as {
-    message?: unknown
-    stdout?: unknown
-    stderr?: unknown
-  }
-
-  const combinedText = [
-    typeof errorLike.message === 'string' ? errorLike.message : '',
-    toErrorText(errorLike.stdout),
-    toErrorText(errorLike.stderr),
-  ]
+function isMissingFirewallRuleOutput(stdout: string, stderr: string): boolean {
+  const combinedText = [stdout, stderr]
+    .map(toErrorText)
     .filter(Boolean)
     .join('\n')
 
@@ -243,20 +250,21 @@ export function getExistingFirewallPorts(): Set<number> {
 }
 
 async function getExistingFirewallPortsAsync(): Promise<Set<number> | null> {
-  try {
-    const { stdout } = await execFileAsync(
-      NETSH_PATH,
-      ['advfirewall', 'firewall', 'show', 'rule', 'name=FreshellLANAccess'],
-      { encoding: 'utf-8', timeout: 10000 }
-    )
-    return parseFirewallRulePorts(stdout)
-  } catch (error) {
-    if (isMissingFirewallRuleError(error)) {
+  const { error, stdout, stderr } = await execFileSettledAsync(
+    NETSH_PATH,
+    ['advfirewall', 'firewall', 'show', 'rule', 'name=FreshellLANAccess'],
+    { encoding: 'utf-8', timeout: 10000 },
+  )
+
+  if (error) {
+    if (isMissingFirewallRuleOutput(stdout, stderr)) {
       return new Set()
     }
 
     return null
   }
+
+  return parseFirewallRulePorts(stdout)
 }
 
 /**
@@ -413,7 +421,8 @@ function buildWslPortForwardingTeardownPlan(
   existingRules: Map<number, PortProxyRule>,
   existingFirewallPorts: Set<number>,
 ): WslPortForwardingTeardownPlan {
-  const hasRelevantPortProxyRules = requiredPorts.some((port) => existingRules.has(port))
+  const teardownPorts = Array.from(new Set([...requiredPorts, ...existingFirewallPorts]))
+  const hasRelevantPortProxyRules = teardownPorts.some((port) => existingRules.has(port))
   const hasFreshellFirewallRule = existingFirewallPorts.size > 0
 
   if (!hasRelevantPortProxyRules && !hasFreshellFirewallRule) {
@@ -422,7 +431,7 @@ function buildWslPortForwardingTeardownPlan(
 
   return {
     status: 'ready',
-    script: normalizeScriptForElevatedPowerShell(buildPortForwardingTeardownScript(requiredPorts)),
+    script: normalizeScriptForElevatedPowerShell(buildPortForwardingTeardownScript(teardownPorts)),
   }
 }
 

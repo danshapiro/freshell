@@ -609,6 +609,33 @@ LocalPort:                            3001
   })
 
   describe('computeWslPortForwardingTeardownPlanAsync', () => {
+    it('tears down stale old forwarded ports retained in the Freshell firewall rule', async () => {
+      vi.mocked(isWSL2).mockReturnValue(true)
+      vi.mocked(execFile).mockImplementation((_cmd: any, args: any, _opts: any, cb: any) => {
+        if (args[0] === 'interface') {
+          cb?.(null, `
+Listen on ipv4:             Connect to ipv4:
+
+Address         Port        Address         Port
+--------------- ----------  --------------- ----------
+0.0.0.0         5173        172.30.149.249  5173
+`, '')
+          return {} as any
+        }
+
+        cb?.(null, `
+Rule Name:                            FreshellLANAccess
+LocalPort:                            3001,5173
+`, '')
+        return {} as any
+      })
+
+      await expect(computeWslPortForwardingTeardownPlanAsync([3001])).resolves.toEqual({
+        status: 'ready',
+        script: expect.stringContaining('listenport=5173'),
+      })
+    })
+
     it('treats a missing Freshell firewall rule as normal absence instead of a fatal async error', async () => {
       vi.mocked(isWSL2).mockReturnValue(true)
       vi.mocked(execFile).mockImplementation((_cmd: any, args: any, _opts: any, cb: any) => {
@@ -622,15 +649,7 @@ Address         Port        Address         Port
           return {} as any
         }
 
-        cb?.(
-          Object.assign(new Error('rule not found'), {
-            code: 1,
-            stdout: 'No rules match the specified criteria.\r\n',
-            stderr: '',
-          }),
-          '',
-          '',
-        )
+        cb?.(new Error('rule not found'), 'No rules match the specified criteria.\r\n', '')
         return {} as any
       })
 
@@ -673,15 +692,7 @@ Address         Port        Address         Port
           return {} as any
         }
 
-        cb?.(
-          Object.assign(new Error('rule not found'), {
-            code: 1,
-            stdout: 'No rules match the specified criteria.\r\n',
-            stderr: '',
-          }),
-          '',
-          '',
-        )
+        cb?.(new Error('rule not found'), 'No rules match the specified criteria.\r\n', '')
         return {} as any
       })
 
