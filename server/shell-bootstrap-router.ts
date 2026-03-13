@@ -9,7 +9,8 @@ import {
 } from './read-models/work-scheduler.js'
 
 export interface ShellBootstrapRouterDeps {
-  getSettings: () => Promise<unknown>
+  getSettings: () => Promise<BootstrapPayload['settings']>
+  getLegacyLocalSettingsSeed?: () => Promise<BootstrapPayload['legacyLocalSettingsSeed']>
   getPlatform: () => Promise<unknown>
   getShellState?: () => Promise<BootstrapPayload['shell']>
   getShellTaskStatus?: () => Promise<Record<string, boolean>>
@@ -32,8 +33,9 @@ export function createShellBootstrapRouter(deps: ShellBootstrapRouterDeps): Rout
         lane: 'critical',
         signal,
         run: async (scheduledSignal) => {
-          const [settings, platform, shell, perf, configFallback] = await Promise.all([
+          const [settings, legacyLocalSettingsSeed, platform, shell, perf, configFallback] = await Promise.all([
             deps.getSettings(),
+            deps.getLegacyLocalSettingsSeed?.() ?? Promise.resolve(undefined),
             deps.getPlatform(),
             (async () => {
               if (deps.getShellState) {
@@ -70,6 +72,7 @@ export function createShellBootstrapRouter(deps: ShellBootstrapRouterDeps): Rout
 
           return {
             settings,
+            ...(legacyLocalSettingsSeed ? { legacyLocalSettingsSeed } : {}),
             platform,
             shell,
             ...(perf ? { perf } : {}),

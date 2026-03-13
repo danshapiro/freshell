@@ -141,7 +141,8 @@ async function main() {
   app.use('/api', httpAuthMiddleware)
   // Shell bootstrap route: returns shell-critical first-paint data only
   app.use('/api', createShellBootstrapRouter({
-    getSettings: async () => migrateSettingsSortMode(await configStore.getSettings()),
+    getSettings: async () => configStore.getSettings(),
+    getLegacyLocalSettingsSeed: async () => configStore.getLegacyLocalSettingsSeed(),
     getPlatform: async () => {
       const [platform, availableClis, hostName] = await Promise.all([
         detectPlatform(),

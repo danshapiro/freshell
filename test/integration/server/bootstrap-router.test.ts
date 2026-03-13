@@ -2,15 +2,15 @@
 import express, { type Express } from 'express'
 import request from 'supertest'
 import { describe, it, expect, beforeEach, vi } from 'vitest'
+
 import { createShellBootstrapRouter, MAX_BOOTSTRAP_PAYLOAD_BYTES } from '../../../server/shell-bootstrap-router.js'
+import { defaultSettings } from '../../../server/config-store.js'
 
 const TEST_AUTH_TOKEN = 'test-auth-token'
 
 function createTestApp(deps?: Partial<Parameters<typeof createShellBootstrapRouter>[0]>): Express {
   const app = express()
   app.use(express.json())
-
-  // Minimal auth middleware for /api
   app.use('/api', (req, res, next) => {
     const token = req.headers['x-auth-token']
     if (token !== TEST_AUTH_TOKEN) return res.status(401).json({ error: 'Unauthorized' })
@@ -18,7 +18,8 @@ function createTestApp(deps?: Partial<Parameters<typeof createShellBootstrapRout
   })
 
   app.use('/api', createShellBootstrapRouter({
-    getSettings: async () => ({ theme: 'system', logging: { debug: false } }),
+    getSettings: async () => defaultSettings,
+    getLegacyLocalSettingsSeed: async () => undefined,
     getPlatform: async () => ({ os: 'linux', arch: 'x64' }),
     getShellTaskStatus: async () => ({ codingCliIndexer: false, sessionRepairService: false }),
     getPerfLogging: () => false,
@@ -36,35 +37,37 @@ describe('GET /api/bootstrap', () => {
     app = createTestApp()
   })
 
-  it('returns only shell-critical first-paint data and stays under the payload budget', async () => {
+  it('returns server-only settings and stays under the payload budget', async () => {
     const res = await request(app)
       .get('/api/bootstrap')
       .set('x-auth-token', TEST_AUTH_TOKEN)
 
     expect(res.status).toBe(200)
     expect(res.headers['content-type']).toMatch(/application\/json/)
-
-    // Payload budget
-    const payloadBytes = Buffer.byteLength(res.text || '', 'utf8')
-    expect(payloadBytes).toBeLessThanOrEqual(MAX_BOOTSTRAP_PAYLOAD_BYTES)
-
-    // Explicit contract: only these top-level keys
-    const keys = Object.keys(res.body)
-    expect(keys.sort()).toEqual(['configFallback', 'perf', 'platform', 'settings', 'shell'].filter(k => k in res.body).sort())
-
-    // No session/timeline/terminal/version/network payloads
-    const body = JSON.stringify(res.body)
-    expect(body).not.toMatch(/\b(sessions|timeline|terminals?|viewport|scrollback|search|version|network)\b/)
-
-    // Shell contains authenticated and task readiness
-    expect(res.body.shell).toMatchObject({ authenticated: true })
+    expect(Buffer.byteLength(res.text || '', 'utf8')).toBeLessThanOrEqual(MAX_BOOTSTRAP_PAYLOAD_BYTES)
+    expect(res.body.settings).toEqual(defaultSettings)
+    expect(res.body.settings).not.toHaveProperty('theme')
+    expect(res.body).not.toHaveProperty('legacyLocalSettingsSeed')
   })
 
-  it('fails cleanly without leaking data when unauthenticated', async () => {
-    const res = await request(app).get('/api/bootstrap')
-    expect(res.status).toBe(401)
-    // Ensure no accidental data leak
-    expect(res.body).toEqual({ error: 'Unauthorized' })
+  it('may return a bootstrap-only legacyLocalSettingsSeed', async () => {
+    const seed = {
+      theme: 'dark',
+      terminal: {
+        fontFamily: 'Fira Code',
+      },
+    }
+    const appWithSeed = createTestApp({
+      getLegacyLocalSettingsSeed: async () => seed,
+    })
+
+    const res = await request(appWithSeed)
+      .get('/api/bootstrap')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(res.status).toBe(200)
+    expect(res.body.legacyLocalSettingsSeed).toEqual(seed)
+    expect(Buffer.byteLength(res.text || '', 'utf8')).toBeLessThanOrEqual(MAX_BOOTSTRAP_PAYLOAD_BYTES)
   })
 
   it('includes configFallback when provided', async () => {

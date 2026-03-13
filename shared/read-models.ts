@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import type { LocalSettingsPatch, ServerSettings } from './settings.js'
 
 export const MAX_BOOTSTRAP_PAYLOAD_BYTES = 12 * 1024
 export const MAX_REALTIME_MESSAGE_BYTES = 16 * 1024
@@ -14,7 +15,8 @@ export const READ_MODEL_LANE_PRIORITY = {
 } as const
 
 export type BootstrapPayload = {
-  settings: unknown
+  settings: ServerSettings
+  legacyLocalSettingsSeed?: LocalSettingsPatch
   platform: unknown
   shell: { authenticated: boolean; ready?: boolean; tasks?: Record<string, boolean> }
   perf?: { logging: boolean }
