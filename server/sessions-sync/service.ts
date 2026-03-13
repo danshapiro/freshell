@@ -1,5 +1,5 @@
 import type { ProjectGroup } from '../coding-cli/types.js'
-import { diffProjects } from './diff.js'
+import { hasSessionDirectorySnapshotChange } from '../session-directory/projection.js'
 
 type SessionsSyncWs = {
   broadcastSessionsChanged: (revision: number) => void
@@ -50,13 +50,12 @@ export class SessionsSyncService {
 
   private flush(next: ProjectGroup[]): void {
     const prev = this.hasLast ? this.last : []
-    const diff = diffProjects(prev, next)
+    const changed = hasSessionDirectorySnapshotChange(prev, next)
 
     this.last = next
     this.hasLast = true
 
-    // No changes between snapshots.
-    if (diff.upsertProjects.length === 0 && diff.removeProjectPaths.length === 0) {
+    if (!changed) {
       return
     }
     this.revision += 1

@@ -15,6 +15,18 @@ function createProject(path: string, updatedAt: number): ProjectGroup {
   }
 }
 
+function createDetailedProject(
+  path: string,
+  session: NonNullable<ProjectGroup['sessions']>[number],
+  color?: string,
+): ProjectGroup {
+  return {
+    projectPath: path,
+    sessions: [{ provider: 'claude', projectPath: path, updatedAt: 1, sessionId: 's1', ...session }],
+    ...(color ? { color } : {}),
+  }
+}
+
 describe('SessionsSyncService', () => {
   afterEach(() => {
     vi.useRealTimers()
@@ -147,5 +159,66 @@ describe('SessionsSyncService', () => {
 
     expect(ws.broadcastSessionsChanged).toHaveBeenCalledTimes(1)
     expect(ws.broadcastSessionsChanged).toHaveBeenLastCalledWith(1)
+  })
+
+  it('broadcasts only when directory-visible fields change', () => {
+    const ws = createWsMocks()
+    const svc = new SessionsSyncService(ws as any, { coalesceMs: 0 })
+
+    svc.publish([
+      createDetailedProject('/repo', {
+        provider: 'codex',
+        sessionId: 's1',
+        projectPath: '/repo',
+        updatedAt: 100,
+        title: 'Deploy',
+        tokenUsage: {
+          inputTokens: 1,
+          outputTokens: 2,
+          cachedTokens: 0,
+          totalTokens: 3,
+        },
+      }, '#f00'),
+    ])
+    svc.publish([
+      createDetailedProject('/repo', {
+        provider: 'codex',
+        sessionId: 's1',
+        projectPath: '/repo',
+        updatedAt: 100,
+        title: 'Deploy',
+        tokenUsage: {
+          inputTokens: 9,
+          outputTokens: 9,
+          cachedTokens: 9,
+          totalTokens: 27,
+        },
+        sourceFile: '/tmp/other.jsonl',
+      }, '#0f0'),
+    ])
+    svc.publish([
+      createDetailedProject('/repo', {
+        provider: 'codex',
+        sessionId: 's1',
+        projectPath: '/repo',
+        updatedAt: 101,
+        title: 'Deploy',
+      }, '#0f0'),
+    ])
+    svc.publish([
+      createDetailedProject('/repo', {
+        provider: 'codex',
+        sessionId: 's1',
+        projectPath: '/repo',
+        updatedAt: 101,
+        title: 'Deploy v2',
+      }, '#0f0'),
+    ])
+
+    expect(ws.broadcastSessionsChanged.mock.calls).toEqual([
+      [1],
+      [2],
+      [3],
+    ])
   })
 })

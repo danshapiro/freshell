@@ -2,6 +2,10 @@ import type { ProjectGroup } from '../coding-cli/types.js'
 import type { TerminalMeta } from '../terminal-metadata-service.js'
 import { extractSnippet } from '../session-search.js'
 import { MAX_DIRECTORY_PAGE_ITEMS } from '../../shared/read-models.js'
+import {
+  buildSessionDirectoryComparableSnapshot,
+  compareSessionDirectoryComparableItems,
+} from './projection.js'
 import type {
   SessionDirectoryItem,
   SessionDirectoryPage,
@@ -47,16 +51,7 @@ function throwIfAborted(signal?: AbortSignal): void {
 }
 
 function compareItems(a: SessionDirectoryItem, b: SessionDirectoryItem): number {
-  const aArchived = !!a.archived
-  const bArchived = !!b.archived
-  if (aArchived !== bArchived) return aArchived ? 1 : -1
-
-  const byUpdatedAt = b.updatedAt - a.updatedAt
-  if (byUpdatedAt !== 0) return byUpdatedAt
-
-  const aKey = buildSessionKey(a)
-  const bKey = buildSessionKey(b)
-  return bKey.localeCompare(aKey)
+  return compareSessionDirectoryComparableItems(a, b)
 }
 
 function applySearch(item: SessionDirectoryItem, queryText: string): SessionDirectoryItem | null {
@@ -98,30 +93,12 @@ function joinRunningState(item: SessionDirectoryItem, terminalMeta: TerminalMeta
 }
 
 function toItems(projects: ProjectGroup[], terminalMeta: TerminalMeta[]): SessionDirectoryItem[] {
-  const items: SessionDirectoryItem[] = []
-
-  for (const project of projects) {
-    for (const session of project.sessions) {
-      items.push(joinRunningState({
-        sessionId: session.sessionId,
-        provider: session.provider,
-        projectPath: session.projectPath,
-        title: session.title,
-        summary: session.summary,
-        updatedAt: session.updatedAt,
-        createdAt: session.createdAt,
-        archived: session.archived,
-        cwd: session.cwd,
-        sessionType: session.sessionType,
-        isSubagent: session.isSubagent,
-        isNonInteractive: session.isNonInteractive,
-        firstUserMessage: session.firstUserMessage,
-        isRunning: false,
-      }, terminalMeta))
-    }
-  }
-
-  return items
+  return buildSessionDirectoryComparableSnapshot(projects).map((item) => (
+    joinRunningState({
+      ...item,
+      isRunning: false,
+    }, terminalMeta)
+  ))
 }
 
 export async function querySessionDirectory(input: QuerySessionDirectoryInput): Promise<SessionDirectoryPage> {
