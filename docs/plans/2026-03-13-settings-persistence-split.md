@@ -4,7 +4,7 @@
 
 **Goal:** Split Freshell settings into a real server-backed contract and a real browser-local contract, move the approved sidebar/debugging/display controls to browser storage, keep the approved workflow controls on the server, and migrate existing mixed settings without restoring cross-surface sync for local-only preferences.
 
-**Architecture:** Put the settings contract in `shared/settings.ts`, with separate `ServerSettings`, `LocalSettings`, and `ResolvedSettings` types plus shared normalization and merge helpers. Persist only `ServerSettings` in `config.json`, persist only browser-local preferences in a versioned browser blob, and keep the migration bridge as bootstrap-only `legacyLocalSettingsSeed` metadata outside the live server settings contract. On the client, hydrate local preferences synchronously in the settings slice initial state, update server-backed settings through one thunked save path, and keep resolved settings as the single shape components read.
+**Architecture:** Put the settings contract in `shared/settings.ts`, with separate `ServerSettings`, `LocalSettings`, and `ResolvedSettings` types plus shared normalization and merge helpers. Persist only `ServerSettings` in `config.json`, persist only browser-local preferences in a versioned browser blob owned by `src/lib/browser-preferences.ts`, and keep the migration bridge as bootstrap-only `legacyLocalSettingsSeed` metadata outside the live server settings contract. On the client, hydrate local preferences synchronously in the settings slice initial state, update server-backed settings through one thunked save path, and keep resolved settings as the single shape components read; `src/lib/terminal-fonts.ts` ends as pure font-stack helpers only, not a persistence layer.
 
 **Tech Stack:** TypeScript, Zod, Express, React 18, Redux Toolkit, Vitest, Testing Library, Playwright
 
@@ -36,7 +36,9 @@
 - `shared/settings.ts` should export pure structural defaults. Environment-specific defaults, specifically `logging.debug`, must be injected by callers instead of baking server or client environment logic into the shared module.
 - The client settings slice should hydrate browser-local settings synchronously from localStorage during module initialization. This repo already hydrates other browser-local state synchronously in slice initial state; doing local settings later in `App.tsx` would create unnecessary first-render drift.
 - Server-backed writes should go through one thunked save path, not repeated `api.patch('/api/settings')` calls spread across components. This makes the server/local split explicit in code and tests.
+- The Redux slice may keep a denormalized `settings` read model for compatibility with the existing tree, but it must always be recomputed from `serverSettings` plus `localSettings`, and it must never be persisted or patched directly.
 - `defaultSettings` should continue to exist in `src/store/settingsSlice.ts`, but as resolved settings built from shared defaults. That keeps the broad test suite stable while still removing the mixed persistence model.
+- `src/lib/terminal-fonts.ts` should end this refactor with only font normalization / fallback helpers such as `resolveTerminalFontFamily()`. All browser storage reads, writes, migrations, and seed application for terminal font preferences belong in `src/lib/browser-preferences.ts`; do not keep `loadLocalTerminalFontFamily()`, `saveLocalTerminalFontFamily()`, or `applyLocalTerminalFontFamily()` as compatibility APIs.
 - Any new relative imports used by server or shared code must include `.js` extensions for NodeNext/ESM compatibility.
 
 ## Persistence Classification
@@ -491,7 +493,7 @@ Add tests that prove:
 - `seedBrowserPreferencesSettingsIfEmpty(seed)` fills only missing settings
 - `getToolStripExpandedPreference()` and `getSearchRangeDaysPreference()` read from the new blob
 - storage migration preserves auth and the new browser-preferences blob when clearing old `freshell.` keys
-- `src/lib/terminal-fonts.ts` becomes a thin adapter over the new browser-preferences module
+- `src/lib/terminal-fonts.ts` keeps only font-stack resolution helpers and no longer exports browser-storage helpers
 
 **Step 2: Run the tests to verify they fail**
 
@@ -531,7 +533,7 @@ Implementation rules:
 
 - Store only sparse settings patches in the blob.
 - Migrate legacy font and tool-strip keys inside this module, not inside components.
-- Keep `terminal-fonts.ts` as a compatibility wrapper during the refactor.
+- Reduce `terminal-fonts.ts` to pure font-stack helpers; remove browser storage reads/writes and move those responsibilities entirely into `browser-preferences.ts`.
 - Do not bump `STORAGE_VERSION` for this task.
 
 **Step 4: Run the tests to verify they pass**
@@ -778,7 +780,7 @@ Expected: FAIL because `App.tsx` still overlays terminal font locally and still 
 
 Implementation rules:
 
-- Stop calling `applyLocalTerminalFontFamily()` from bootstrap and websocket paths.
+- Delete the last `applyLocalTerminalFontFamily()` call sites; bootstrap and websocket hydration should recompose resolved settings from server plus browser-local state instead of using a mixed helper.
 - When bootstrap includes `legacyLocalSettingsSeed`, call `seedBrowserPreferencesSettingsIfEmpty(...)`, then dispatch `setLocalSettings(...)` only if the seed actually changed the browser-preferences record.
 - `settings.updated` should dispatch `setServerSettings(msg.settings)`.
 
@@ -1150,7 +1152,7 @@ Run:
 npm run test:vitest -- test/unit/client/components/App.ws-extensions.test.tsx test/unit/client/components/App.perf-audit-bootstrap.test.tsx test/unit/client/components/App.lazy-views.test.tsx test/e2e/auth-required-bootstrap-flow.test.tsx test/e2e/settings-devices-flow.test.tsx
 ```
 
-Expected: at least one FAIL from stale bootstrap shapes, stale settings payloads, or stale local-storage keys.
+Expected: FAIL because these helpers and fixtures still fabricate mixed bootstrap/settings payloads or still seed obsolete local-storage keys.
 
 **Step 3: Write the minimal implementation**
 
@@ -1200,7 +1202,7 @@ Run:
 npm run test:vitest -- test/e2e/open-tab-session-sidebar-visibility.test.tsx test/e2e/directory-picker-flow.test.tsx test/e2e/sidebar-busy-icon-flow.test.tsx test/e2e/sidebar-click-opens-pane.test.tsx test/e2e/pane-header-runtime-meta-flow.test.tsx
 ```
 
-Expected: at least one FAIL from stale mixed-settings fixtures.
+Expected: FAIL because these scenario fixtures still seed local-only settings through server payloads or mixed `settings.updated` messages.
 
 **Step 3: Write the minimal implementation**
 
@@ -1271,6 +1273,7 @@ Implementation rules:
 Run:
 
 ```bash
+rg -n "applyLocalTerminalFontFamily|loadLocalTerminalFontFamily|saveLocalTerminalFontFamily|freshell:toolStripExpanded" src server shared
 npm run test:e2e -- test/e2e-browser/specs/settings-persistence-split.spec.ts test/e2e-browser/specs/multi-client.spec.ts
 npm run lint
 npm run typecheck
@@ -1278,7 +1281,10 @@ npm run test:status
 FRESHELL_TEST_SUMMARY="settings persistence split final" npm test
 ```
 
-Expected: PASS
+Expected:
+
+- `rg` prints no results
+- every command passes
 
 **Step 5: Commit**
 
