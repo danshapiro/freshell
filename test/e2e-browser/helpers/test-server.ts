@@ -21,6 +21,7 @@ export interface TestServerInfo {
   logsDir: string
   debugLogPath: string
   pid: number
+  runtimeRoot: string
 }
 
 export interface TestServerOptions {
@@ -34,6 +35,8 @@ export interface TestServerOptions {
   startTimeoutMs?: number
   /** Whether to pipe server stdout/stderr to the test console (default: false) */
   verbose?: boolean
+  authStrategy?: 'explicit-env' | 'bootstrap'
+  runtimeRootMode?: 'project' | 'isolated'
 }
 
 /**
@@ -67,6 +70,23 @@ function findProjectRoot(): string {
   throw new Error('Could not find project root (no package.json found)')
 }
 
+async function createIsolatedRuntimeRoot(projectRoot: string): Promise<string> {
+  const runtimeRootsParent = path.join(projectRoot, '.worktrees')
+  await fsp.mkdir(runtimeRootsParent, { recursive: true })
+  const runtimeRoot = await fsp.mkdtemp(path.join(runtimeRootsParent, 'test-server-runtime-'))
+  await fsp.copyFile(path.join(projectRoot, 'package.json'), path.join(runtimeRoot, 'package.json'))
+  await fsp.cp(path.join(projectRoot, 'dist'), path.join(runtimeRoot, 'dist'), { recursive: true })
+  return runtimeRoot
+}
+
+function readAuthTokenFromEnvFile(envText: string): string {
+  const match = envText.match(/^AUTH_TOKEN=(.+)$/m)
+  if (!match) {
+    throw new Error('Bootstrapped .env did not contain AUTH_TOKEN')
+  }
+  return match[1].trim()
+}
+
 /**
  * Spawns an isolated Freshell server for E2E testing.
  *
@@ -80,6 +100,7 @@ export class TestServer {
   private process: ChildProcess | null = null
   private _info: TestServerInfo | null = null
   private configDir: string | null = null
+  private runtimeRootDir: string | null = null
   private stdoutBuffer = ''
   private stderrBuffer = ''
   private readonly options: TestServerOptions
@@ -96,7 +117,7 @@ export class TestServer {
   async start(): Promise<TestServerInfo> {
     if (this.process) throw new Error('TestServer already started')
 
-    const token = randomUUID()
+    const explicitToken = randomUUID()
     const port = await findFreePort()
     this.configDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-e2e-'))
     const homeDir = this.configDir
@@ -129,9 +150,15 @@ export class TestServer {
     await fsp.mkdir(logsDir, { recursive: true })
 
     const projectRoot = findProjectRoot()
+    const runtimeRootMode = this.options.runtimeRootMode ?? 'project'
+    const runtimeRoot = runtimeRootMode === 'isolated'
+      ? await createIsolatedRuntimeRoot(projectRoot)
+      : projectRoot
+
+    this.runtimeRootDir = runtimeRootMode === 'isolated' ? runtimeRoot : null
 
     // We need the built server and client for production mode
-    const serverEntry = path.join(projectRoot, 'dist', 'server', 'index.js')
+    const serverEntry = path.join(runtimeRoot, 'dist', 'server', 'index.js')
     if (!fs.existsSync(serverEntry)) {
       throw new Error(
         `Built server not found at ${serverEntry}. Run "npm run build" first, ` +
@@ -139,10 +166,10 @@ export class TestServer {
       )
     }
 
+    const authStrategy = this.options.authStrategy ?? 'explicit-env'
     const env: Record<string, string> = {
       ...process.env as Record<string, string>,
       PORT: String(port),
-      AUTH_TOKEN: token,
       HOME: homeDir,
       NODE_ENV: 'production',
       FRESHELL_LOG_DIR: logsDir,
@@ -153,11 +180,17 @@ export class TestServer {
       ...this.options.env,
     }
 
+    if (authStrategy === 'explicit-env') {
+      env.AUTH_TOKEN = explicitToken
+    } else {
+      delete env.AUTH_TOKEN
+    }
+
     // Remove any env vars that might interfere
     delete env.VITE_PORT
 
     this.process = spawn('node', [serverEntry], {
-      cwd: projectRoot,
+      cwd: runtimeRoot,
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
@@ -184,6 +217,10 @@ export class TestServer {
     const timeoutMs = this.options.startTimeoutMs ?? 30_000
     await this.waitForHealth(baseUrl, timeoutMs)
 
+    const token = authStrategy === 'bootstrap'
+      ? readAuthTokenFromEnvFile(await fsp.readFile(path.join(runtimeRoot, '.env'), 'utf8'))
+      : explicitToken
+
     this._info = {
       port,
       baseUrl,
@@ -194,6 +231,7 @@ export class TestServer {
       logsDir,
       debugLogPath,
       pid,
+      runtimeRoot,
     }
     return this._info
   }
@@ -222,7 +260,11 @@ export class TestServer {
       if (this.configDir && !this.options.preserveHomeOnStop) {
         await fsp.rm(this.configDir, { recursive: true, force: true }).catch(() => {})
       }
+      if (this.runtimeRootDir) {
+        await fsp.rm(this.runtimeRootDir, { recursive: true, force: true }).catch(() => {})
+      }
       this.configDir = null
+      this.runtimeRootDir = null
       this._info = null
     })
   }
