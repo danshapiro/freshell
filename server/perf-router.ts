@@ -1,5 +1,4 @@
 import { Router } from 'express'
-import { migrateSettingsSortMode } from './settings-migrate.js'
 
 export interface PerfRouterDeps {
   configStore: { patchSettings: (patch: any) => Promise<any> }
@@ -15,10 +14,9 @@ export function createPerfRouter(deps: PerfRouterDeps): Router {
   router.post('/', async (req, res) => {
     const enabled = req.body?.enabled === true
     const updated = await configStore.patchSettings({ logging: { debug: enabled } })
-    const migrated = migrateSettingsSortMode(updated)
-    registry.setSettings(migrated)
-    applyDebugLogging(!!migrated.logging?.debug, 'api')
-    wsHandler.broadcast({ type: 'settings.updated', settings: migrated })
+    registry.setSettings(updated)
+    applyDebugLogging(!!updated.logging?.debug, 'api')
+    wsHandler.broadcast({ type: 'settings.updated', settings: updated })
     res.json({ ok: true, enabled })
   })
 

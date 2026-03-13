@@ -11,6 +11,7 @@ import {
   computeWslPortForwardingTeardownPlanAsync,
   persistManagedWslRemoteAccessPorts,
 } from './wsl-port-forward.js'
+import type { ServerSettings } from '../shared/settings.js'
 
 const log = logger.child({ component: 'network-router' })
 
@@ -74,7 +75,7 @@ export interface NetworkRouterDeps {
     resetFirewallCache: () => void
   }
   configStore: {
-    getSettings: () => Promise<any>
+    getSettings: () => Promise<ServerSettings>
   }
   wsHandler: {
     broadcast: (msg: any) => void

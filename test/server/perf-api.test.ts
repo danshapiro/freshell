@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import { createPerfRouter } from '../../server/perf-router.js'
+import { defaultSettings } from '../../server/config-store.js'
 
 describe('Perf API', () => {
   let app: express.Express
@@ -28,7 +29,10 @@ describe('Perf API', () => {
   })
 
   it('enables debug logging when enabled is true', async () => {
-    mockPatchSettings.mockResolvedValue({ logging: { debug: true } })
+    mockPatchSettings.mockResolvedValue({
+      ...defaultSettings,
+      logging: { debug: true },
+    })
 
     const res = await request(app)
       .post('/api/perf')
@@ -40,8 +44,15 @@ describe('Perf API', () => {
     expect(mockSetSettings).toHaveBeenCalled()
     expect(mockApplyDebugLogging).toHaveBeenCalledWith(true, 'api')
     expect(mockBroadcast).toHaveBeenCalledWith(
-      expect.objectContaining({ type: 'settings.updated' }),
+      expect.objectContaining({
+        type: 'settings.updated',
+        settings: expect.objectContaining({
+          logging: { debug: true },
+        }),
+      }),
     )
+    expect(mockBroadcast.mock.calls[0][0].settings).not.toHaveProperty('theme')
+    expect(mockBroadcast.mock.calls[0][0]).not.toHaveProperty('legacyLocalSettingsSeed')
   })
 
   it('disables debug logging when enabled is false', async () => {

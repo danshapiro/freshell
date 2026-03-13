@@ -7,10 +7,13 @@ import fsp from 'node:fs/promises'
 import isPortReachable from 'is-port-reachable'
 import { detectLanIps } from './bootstrap.js'
 import { detectFirewall, firewallCommands, type FirewallInfo, type FirewallPlatform } from './firewall.js'
-import type { ConfigStore, NetworkSettings } from './config-store.js'
+import type { ConfigStore } from './config-store.js'
 import { logger } from './logger.js'
 import { isRemoteAccessEnabled } from './network-access.js'
 import { computeWslPortForwardingPlanAsync } from './wsl-port-forward.js'
+import type { ServerSettings } from '../shared/settings.js'
+
+type NetworkSettings = ServerSettings['network']
 
 const log = logger.child({ component: 'network-manager' })
 const WINDOWS_FIREWALL_QUERY_TIMEOUT_MS = 10_000

@@ -7,7 +7,7 @@ import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-l
 import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed, timingSafeCompare } from './auth.js'
 import { modeSupportsResume } from './terminal-registry.js'
 import type { TerminalRegistry, TerminalMode } from './terminal-registry.js'
-import { configStore, type AppSettings, type ConfigReadError } from './config-store.js'
+import { configStore, type ConfigReadError } from './config-store.js'
 import type { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import type { ProjectGroup } from './coding-cli/types.js'
 import type { TerminalMeta } from './terminal-metadata-service.js'
@@ -22,6 +22,7 @@ import { buildSidebarOpenSessionKeys, type SidebarSessionLocator } from './sideb
 import { loadSessionHistory, type ChatMessage } from './session-history-loader.js'
 import { TabRegistryRecordBaseSchema, TabRegistryRecordSchema } from './tabs-registry/types.js'
 import type { TabsRegistryStore } from './tabs-registry/store.js'
+import type { ServerSettings } from '../shared/settings.js'
 import {
   ErrorCode,
   ShellSchema,
@@ -260,7 +261,7 @@ type ClientState = {
 }
 
 type HandshakeSnapshot = {
-  settings?: AppSettings
+  settings?: ServerSettings
   projects?: ProjectGroup[]
   perfLogging?: boolean
   configFallback?: {

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } 
 import http from 'http'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
+import { defaultSettings } from '../../server/config-store'
 
 const TEST_TIMEOUT_MS = 30_000
 const HOOK_TIMEOUT_MS = 30_000
@@ -13,6 +14,7 @@ type Snapshot = {
   projects: any[]
   perfLogging?: boolean
   configFallback?: { reason: string; backupExists: boolean }
+  legacyLocalSettingsSeed?: unknown
 }
 
 function listen(server: http.Server, timeoutMs = HOOK_TIMEOUT_MS): Promise<{ port: number }> {
@@ -154,30 +156,10 @@ describe('ws handshake snapshot', () => {
 
     snapshot = {
       settings: {
-        theme: 'dark',
-        uiScale: 1,
-        terminal: {
-          fontSize: 14,
-          lineHeight: 1,
-          cursorBlink: true,
-          scrollback: 5000,
-          theme: 'auto',
-        },
-        safety: {
-          autoKillIdleMinutes: 180,
-        },
-        panes: {
-          defaultNewPane: 'ask',
-        },
-        sidebar: {
-          sortMode: 'activity',
-          showProjectBadges: true,
-          width: 288,
-          collapsed: false,
-        },
+        ...defaultSettings,
         codingCli: {
           enabledProviders: ['claude'],
-          providers: {},
+          providers: defaultSettings.codingCli.providers,
         },
       },
       projects: [
@@ -236,6 +218,12 @@ describe('ws handshake snapshot', () => {
   }, HOOK_TIMEOUT_MS)
 
   it('sends settings after ready without a websocket sessions snapshot', async () => {
+    snapshot = {
+      ...snapshot,
+      legacyLocalSettingsSeed: {
+        theme: 'dark',
+      },
+    }
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
 
     try {
@@ -249,6 +237,9 @@ describe('ws handshake snapshot', () => {
       const settingsMsg = await settingsPromise
 
       expect(settingsMsg.settings).toEqual(snapshot.settings)
+      expect(settingsMsg.settings).not.toHaveProperty('theme')
+      expect(settingsMsg).not.toHaveProperty('legacyLocalSettingsSeed')
+      await expectNoMessage(ws, (m) => Object.prototype.hasOwnProperty.call(m, 'legacyLocalSettingsSeed'))
       await expectNoMessage(ws, (m) => m.type === 'sessions.updated')
     } finally {
       await closeWs(ws)

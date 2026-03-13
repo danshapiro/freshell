@@ -8,7 +8,7 @@ import fs from 'fs'
 import { EventEmitter } from 'events'
 import { logger } from './logger.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
-import type { AppSettings } from './config-store.js'
+import type { ServerSettings } from '../shared/settings.js'
 import { convertWindowsPathToWslPath, isReachableDirectorySync } from './path-utils.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
 import { makeSessionKey, parseSessionKey, type CodingCliProviderName } from './coding-cli/types.js'
@@ -411,7 +411,7 @@ export class ChunkRingBuffer {
   }
 }
 
-function getDefaultCwd(settings?: AppSettings): string | undefined {
+function getDefaultCwd(settings?: ServerSettings): string | undefined {
   const candidate = settings?.defaultCwd
   if (!candidate) return undefined
   const { ok, resolvedPath } = isReachableDirectorySync(candidate)
@@ -869,7 +869,7 @@ export function buildSpawnSpec(
 export class TerminalRegistry extends EventEmitter {
   private terminals = new Map<string, TerminalRecord>()
   private bindingAuthority = new SessionBindingAuthority()
-  private settings: AppSettings | undefined
+  private settings: ServerSettings | undefined
   private idleTimer: NodeJS.Timeout | null = null
   private perfTimer: NodeJS.Timeout | null = null
   private maxTerminals: number
@@ -880,7 +880,7 @@ export class TerminalRegistry extends EventEmitter {
   // - outputBuffers/flush timers/mobile batching -> broker client-output queue.
   private outputBuffers = new Map<WebSocket, PendingOutput>()
 
-  constructor(settings?: AppSettings, maxTerminals?: number, maxExitedTerminals?: number) {
+  constructor(settings?: ServerSettings, maxTerminals?: number, maxExitedTerminals?: number) {
     super()
     this.settings = settings
     this.maxTerminals = maxTerminals ?? MAX_TERMINALS
@@ -894,7 +894,7 @@ export class TerminalRegistry extends EventEmitter {
     this.startPerfMonitor()
   }
 
-  setSettings(settings: AppSettings) {
+  setSettings(settings: ServerSettings) {
     this.settings = settings
     this.scrollbackMaxChars = this.computeScrollbackMaxChars(settings)
     for (const t of this.terminals.values()) {
@@ -906,7 +906,7 @@ export class TerminalRegistry extends EventEmitter {
     return this.scrollbackMaxChars
   }
 
-  private computeScrollbackMaxChars(settings?: AppSettings): number {
+  private computeScrollbackMaxChars(settings?: ServerSettings): number {
     const lines = settings?.terminal?.scrollback
     if (typeof lines !== 'number' || !Number.isFinite(lines)) return DEFAULT_MAX_SCROLLBACK_CHARS
     const computed = Math.floor(lines * APPROX_CHARS_PER_LINE)

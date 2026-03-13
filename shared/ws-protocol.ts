@@ -8,6 +8,7 @@
  */
 import { z } from 'zod'
 import type { ClientExtensionEntry } from './extension-types.js'
+import type { ServerSettings } from './settings.js'
 
 // ──────────────────────────────────────────────────────────────
 // Shared enums and helpers
@@ -509,9 +510,7 @@ export type SessionsChangedMessage = {
 
 export type SettingsUpdatedMessage = {
   type: 'settings.updated'
-  // Intentionally unknown to avoid coupling this shared protocol package to
-  // client-only AppSettings types.
-  settings: unknown
+  settings: ServerSettings
 }
 
 // -- UI commands --

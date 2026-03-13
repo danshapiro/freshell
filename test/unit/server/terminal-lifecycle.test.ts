@@ -58,9 +58,9 @@ vi.mock('../../../server/logger', () => {
 
 // Import after mocking
 import { TerminalRegistry, type TerminalRecord, ChunkRingBuffer } from '../../../server/terminal-registry'
+import { defaultSettings, type AppSettings } from '../../../server/config-store'
 import { getPerfConfig, setPerfLoggingEnabled } from '../../../server/perf-logger'
 import { logger } from '../../../server/logger'
-import type { AppSettings } from '../../../server/config-store'
 
 // Mock WebSocket
 function createMockWebSocket(opts?: { isMobileClient?: boolean }): any {
@@ -75,33 +75,9 @@ function createMockWebSocket(opts?: { isMobileClient?: boolean }): any {
 
 function createTestSettings(overrides?: Partial<AppSettings>): AppSettings {
   return {
-    theme: 'system',
-    uiScale: 1.0,
-    logging: {
-      debug: false,
-    },
-    terminal: {
-      fontSize: 14,
-      lineHeight: 1,
-      cursorBlink: true,
-      scrollback: 5000,
-      theme: 'auto',
-    },
+    ...defaultSettings,
     safety: {
       autoKillIdleMinutes: 30,
-    },
-    sidebar: {
-      sortMode: 'hybrid',
-      showProjectBadges: true,
-      width: 288,
-      collapsed: false,
-    },
-    codingCli: {
-      enabledProviders: ['claude', 'codex'],
-      providers: {
-        claude: { permissionMode: 'default' },
-        codex: {},
-      },
     },
     ...overrides,
   }
@@ -1163,7 +1139,7 @@ describe('TerminalRegistry Lifecycle', () => {
 
   describe('Settings management', () => {
     it('should update settings', () => {
-      const newSettings = createTestSettings({ theme: 'dark' })
+      const newSettings = createTestSettings({ logging: { debug: true } })
       registry.setSettings(newSettings)
 
       // Settings are private, but affect idle timeout behavior

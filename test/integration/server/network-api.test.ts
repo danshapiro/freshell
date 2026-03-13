@@ -79,6 +79,7 @@ describe('Network API integration', () => {
   let tmpDir: string
   let configStore: ConfigStore
   let networkManager: NetworkManager
+  let mockBroadcast: ReturnType<typeof vi.fn>
 
   beforeAll(() => {
     process.env.AUTH_TOKEN = token
@@ -134,6 +135,7 @@ describe('Network API integration', () => {
     configStore = new ConfigStore()
     server = http.createServer()
     networkManager = new NetworkManager(server, configStore, 0)
+    mockBroadcast = vi.fn()
 
     app = express()
     app.use(express.json())
@@ -143,7 +145,7 @@ describe('Network API integration', () => {
     app.use('/api', createNetworkRouter({
       networkManager,
       configStore,
-      wsHandler: { broadcast: vi.fn() },
+      wsHandler: { broadcast: mockBroadcast },
       detectLanIps: () => ['192.168.1.100'],
     }))
 
@@ -225,10 +227,22 @@ describe('Network API integration', () => {
           configured: true,
         })
       expect(res.status).toBe(200)
-
       const configPath = path.join(tmpDir, '.freshell', 'config.json')
       const saved = JSON.parse(fs.readFileSync(configPath, 'utf8')) as { settings?: { network?: { host?: string } } }
       expect(saved.settings?.network?.host).toBe('0.0.0.0')
+      expect(mockBroadcast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'settings.updated',
+          settings: expect.objectContaining({
+            network: expect.objectContaining({
+              host: '0.0.0.0',
+              configured: true,
+            }),
+          }),
+        }),
+      )
+      expect(mockBroadcast.mock.calls[0][0].settings).not.toHaveProperty('theme')
+      expect(mockBroadcast.mock.calls[0][0]).not.toHaveProperty('legacyLocalSettingsSeed')
     })
 
     it('rejects invalid host values', async () => {
