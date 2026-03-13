@@ -23,6 +23,14 @@ type FetchSessionWindowArgs = {
 }
 
 const controllers = new Map<string, AbortController>()
+const invalidationRefreshState = new Map<SessionSurface, {
+  inFlight: Promise<void> | null
+  queued: boolean
+}>()
+
+function isSessionSurface(value: unknown): value is SessionSurface {
+  return value === 'sidebar' || value === 'history' || value === 'bootstrap'
+}
 
 function abortSurface(surface: string) {
   const controller = controllers.get(surface)
@@ -30,6 +38,14 @@ function abortSurface(surface: string) {
     controller.abort()
     controllers.delete(surface)
   }
+}
+
+export function _resetSessionWindowThunkState(): void {
+  for (const controller of controllers.values()) {
+    controller.abort()
+  }
+  controllers.clear()
+  invalidationRefreshState.clear()
 }
 
 function searchResultsToProjects(results: Awaited<ReturnType<typeof searchSessions>>['results']): ProjectGroup[] {
@@ -211,6 +227,47 @@ export function refreshActiveSessionWindow() {
       query: windowState?.query,
       searchTier: windowState?.searchTier,
     }) as any)
+  }
+}
+
+export function queueActiveSessionWindowRefresh() {
+  return async (dispatch: AppDispatch, getState: () => RootState) => {
+    const activeSurface = getState().sessions.activeSurface
+    if (!isSessionSurface(activeSurface)) return
+
+    const existing = invalidationRefreshState.get(activeSurface)
+    if (existing?.inFlight) {
+      existing.queued = true
+      return existing.inFlight
+    }
+
+    const state = {
+      inFlight: null as Promise<void> | null,
+      queued: false,
+    }
+    invalidationRefreshState.set(activeSurface, state)
+
+    const run = (async () => {
+      try {
+        do {
+          state.queued = false
+          const windowState = getState().sessions.windows[activeSurface]
+          await dispatch(fetchSessionWindow({
+            surface: activeSurface,
+            priority: 'visible',
+            query: windowState?.query,
+            searchTier: windowState?.searchTier,
+          }) as any)
+        } while (state.queued)
+      } finally {
+        if (invalidationRefreshState.get(activeSurface) === state) {
+          invalidationRefreshState.delete(activeSurface)
+        }
+      }
+    })()
+
+    state.inFlight = run
+    return run
   }
 }
 

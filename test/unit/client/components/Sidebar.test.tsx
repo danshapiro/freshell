@@ -88,6 +88,7 @@ const sessionId = (label: string) => {
 
 function createTestStore(options?: {
   projects?: ProjectGroup[]
+  sessions?: Record<string, unknown>
   terminals?: BackgroundTerminal[]
   tabs?: Array<{
     id: string
@@ -183,6 +184,7 @@ function createTestStore(options?: {
         expandedProjects: new Set<string>(),
         isLoading: false,
         error: null,
+        ...options?.sessions,
       },
       connection: {
         status: 'connected',
@@ -1521,6 +1523,129 @@ describe('Sidebar Component - Session-Centric Display', () => {
         await Promise.resolve()
       })
       expect(queryByTestId('search-loading')).toBeInTheDocument()
+    })
+
+    it('keeps a loaded sidebar list mounted during a non-search refresh', async () => {
+      const recentProjects: ProjectGroup[] = [{
+        projectPath: '/work/recent',
+        sessions: [{
+          provider: 'codex',
+          sessionId: 'recent-session',
+          projectPath: '/work/recent',
+          updatedAt: 1_700_000_000_000,
+          title: 'Recent Session',
+        }],
+      }]
+
+      const store = createTestStore({
+        projects: recentProjects,
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: recentProjects,
+          lastLoadedAt: 1_700_000_000_000,
+          windows: {
+            sidebar: {
+              projects: recentProjects,
+              lastLoadedAt: 1_700_000_000_000,
+              loading: true,
+              query: '',
+              searchTier: 'title',
+            },
+          },
+        },
+      })
+
+      renderSidebar(store, [])
+
+      expect(screen.getByText('Recent Session')).toBeInTheDocument()
+      expect(screen.getByTestId('virtualized-list')).toBeInTheDocument()
+      expect(screen.getByTestId('sessions-refreshing')).toBeInTheDocument()
+    })
+
+    it('keeps loaded search results mounted while refresh is in flight', async () => {
+      const searchProjects: ProjectGroup[] = [{
+        projectPath: '/work/search',
+        sessions: [{
+          provider: 'codex',
+          sessionId: 'search-session',
+          projectPath: '/work/search',
+          updatedAt: 1_700_000_000_000,
+          title: 'Search Result',
+        }],
+      }]
+
+      const store = createTestStore({
+        projects: searchProjects,
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: searchProjects,
+          lastLoadedAt: 1_700_000_000_000,
+          windows: {
+            sidebar: {
+              projects: searchProjects,
+              lastLoadedAt: 1_700_000_000_000,
+              loading: true,
+              query: 'search',
+              searchTier: 'title',
+            },
+          },
+        },
+      })
+
+      const { getByPlaceholderText } = renderSidebar(store, [])
+      fireEvent.change(getByPlaceholderText('Search...'), { target: { value: 'search' } })
+
+      expect(screen.getByText('Search Result')).toBeInTheDocument()
+      expect(screen.getByTestId('search-loading')).toBeInTheDocument()
+    })
+
+    it('keeps a loaded empty-state message visible during refresh', async () => {
+      const store = createTestStore({
+        projects: [],
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: [],
+          lastLoadedAt: 1_700_000_000_000,
+          windows: {
+            sidebar: {
+              projects: [],
+              lastLoadedAt: 1_700_000_000_000,
+              loading: true,
+              query: '',
+              searchTier: 'title',
+            },
+          },
+        },
+      })
+
+      renderSidebar(store, [])
+
+      expect(screen.getByText('No sessions yet')).toBeInTheDocument()
+      expect(screen.getByTestId('sessions-refreshing')).toBeInTheDocument()
+    })
+
+    it('keeps first-load search blocking when no results have loaded yet', async () => {
+      const store = createTestStore({
+        projects: [],
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: [],
+          windows: {
+            sidebar: {
+              projects: [],
+              loading: true,
+              query: 'search',
+              searchTier: 'title',
+            },
+          },
+        },
+      })
+
+      const { getByPlaceholderText } = renderSidebar(store, [])
+      fireEvent.change(getByPlaceholderText('Search...'), { target: { value: 'search' } })
+
+      expect(screen.getByTestId('search-loading')).toBeInTheDocument()
+      expect(screen.queryByText('Search Result')).not.toBeInTheDocument()
     })
   })
 
