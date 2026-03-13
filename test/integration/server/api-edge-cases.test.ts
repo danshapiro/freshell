@@ -602,7 +602,7 @@ describe('API Edge Cases - Security Testing', () => {
       const baseline = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
-        .send({ theme: 'dark' })
+        .send({ defaultCwd: '/workspace' })
 
       expect(baseline.status).toBe(200)
 
@@ -612,7 +612,7 @@ describe('API Edge Cases - Security Testing', () => {
         .set('x-auth-token', TEST_AUTH_TOKEN)
 
       expect(final.status).toBe(200)
-      expect(['dark', 'light', 'system']).toContain(final.body.theme)
+      expect(final.body.defaultCwd).toBe('/workspace')
     })
 
     it('handles concurrent writes to different session IDs (sequential for safety)', async () => {
@@ -639,7 +639,7 @@ describe('API Edge Cases - Security Testing', () => {
       await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
-        .send({ theme: 'dark' })
+        .send({ defaultCwd: '/workspace' })
 
       // Then do concurrent reads - these should all succeed
       const requests = Array.from({ length: 10 }, () =>
@@ -653,7 +653,7 @@ describe('API Edge Cases - Security Testing', () => {
       // All reads should succeed
       results.forEach((res) => {
         expect(res.status).toBe(200)
-        expect(res.body).toHaveProperty('theme')
+        expect(res.body).toHaveProperty('defaultCwd')
       })
     })
 
@@ -662,10 +662,10 @@ describe('API Edge Cases - Security Testing', () => {
         const res = await request(app)
           .patch('/api/settings')
           .set('x-auth-token', TEST_AUTH_TOKEN)
-          .send({ terminal: { fontSize: 10 + i } })
+          .send({ terminal: { scrollback: 1000 + i } })
 
         expect(res.status).toBe(200)
-        expect(res.body.terminal.fontSize).toBe(10 + i)
+        expect(res.body.terminal.scrollback).toBe(1000 + i)
       }
     })
 
@@ -706,17 +706,17 @@ describe('API Edge Cases - Security Testing', () => {
       const res1 = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
-        .send({ terminal: { fontSize: 10 } })
+        .send({ terminal: { scrollback: 10 } })
 
       expect(res1.status).toBe(200)
 
       const res2 = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
-        .send({ terminal: { fontSize: 11 } })
+        .send({ terminal: { scrollback: 11 } })
 
       expect(res2.status).toBe(200)
-      expect(res2.body.terminal.fontSize).toBe(11)
+      expect(res2.body.terminal.scrollback).toBe(11)
     })
   })
 
@@ -936,9 +936,9 @@ describe('API Edge Cases - Security Testing', () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
-        .send({ theme: 12345 })
+        .send({ defaultCwd: 12345 })
 
-      // Real router validates theme as enum('system','light','dark')
+      // Real router validates defaultCwd as string|null.
       expect(res.status).toBe(400)
     })
 
@@ -946,9 +946,9 @@ describe('API Edge Cases - Security Testing', () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
-        .send({ theme: { nested: 'object' } })
+        .send({ defaultCwd: { nested: 'object' } })
 
-      // Real router validates theme as enum('system','light','dark')
+      // Real router validates defaultCwd as string|null.
       expect(res.status).toBe(400)
     })
 
@@ -956,11 +956,11 @@ describe('API Edge Cases - Security Testing', () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
-        .send({ terminal: { cursorBlink: 'true' } }) // string instead of boolean
+        .send({ logging: { debug: 'true' } }) // string instead of boolean
 
       expect(res.status).toBe(200)
       // z.coerce.boolean() coerces 'true' to boolean true
-      expect(res.body.terminal.cursorBlink).toBe(true)
+      expect(res.body.logging.debug).toBe(true)
     })
 
     it('handles extreme numeric values via z.coerce.number()', async () => {
@@ -968,7 +968,7 @@ describe('API Edge Cases - Security Testing', () => {
       const res = await request(app)
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
-        .send({ terminal: { fontSize: Number.MAX_VALUE } })
+        .send({ terminal: { scrollback: Number.MAX_VALUE } })
 
       expect(res.status).toBe(200)
     })
@@ -1201,7 +1201,7 @@ describe('API Edge Cases - Security Testing', () => {
         const res = await request(app)
           .patch('/api/settings')
           .set('x-auth-token', TEST_AUTH_TOKEN)
-          .send({ theme: 'dark' })
+          .send({ defaultCwd: '/workspace' })
 
         // Should fail to write or somehow handle gracefully
         expect([200, 500]).toContain(res.status)
@@ -1229,11 +1229,11 @@ describe('API Edge Cases - Security Testing', () => {
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .set('Content-Type', 'text/plain')
-        .send('{ "theme": "dark" }')
+        .send('{ "defaultCwd": "/workspace" }')
 
       expect(res.status).toBe(200)
       // Body not parsed, so no changes
-      expect(res.body.theme).toBe('system')
+      expect(res.body).toEqual(defaultSettings)
     })
 
     it('handles charset in content-type', async () => {
@@ -1241,10 +1241,10 @@ describe('API Edge Cases - Security Testing', () => {
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .set('Content-Type', 'application/json; charset=utf-8')
-        .send(JSON.stringify({ theme: 'dark' }))
+        .send(JSON.stringify({ defaultCwd: '/workspace' }))
 
       expect(res.status).toBe(200)
-      expect(res.body.theme).toBe('dark')
+      expect(res.body.defaultCwd).toBe('/workspace')
     })
 
     it('handles weird charset specification', async () => {
@@ -1252,7 +1252,7 @@ describe('API Edge Cases - Security Testing', () => {
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .set('Content-Type', 'application/json; charset=iso-8859-1')
-        .send(JSON.stringify({ theme: 'dark' }))
+        .send(JSON.stringify({ defaultCwd: '/workspace' }))
 
       // Express may reject non-UTF-8 charset with 415 Unsupported Media Type
       expect([200, 415]).toContain(res.status)
@@ -1263,11 +1263,11 @@ describe('API Edge Cases - Security Testing', () => {
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .set('Content-Type', 'application/x-www-form-urlencoded')
-        .send('theme=dark')
+        .send('defaultCwd=/workspace')
 
       // Should not parse
       expect(res.status).toBe(200)
-      expect(res.body.theme).toBe('system')
+      expect(res.body).toEqual(defaultSettings)
     })
 
     it('handles multipart/form-data', async () => {
@@ -1275,11 +1275,11 @@ describe('API Edge Cases - Security Testing', () => {
         .patch('/api/settings')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .set('Content-Type', 'multipart/form-data; boundary=----WebKitFormBoundary')
-        .send('------WebKitFormBoundary\r\nContent-Disposition: form-data; name="theme"\r\n\r\ndark\r\n------WebKitFormBoundary--')
+        .send('------WebKitFormBoundary\r\nContent-Disposition: form-data; name="defaultCwd"\r\n\r\n/workspace\r\n------WebKitFormBoundary--')
 
       // Should not parse
       expect(res.status).toBe(200)
-      expect(res.body.theme).toBe('system')
+      expect(res.body).toEqual(defaultSettings)
     })
   })
 })

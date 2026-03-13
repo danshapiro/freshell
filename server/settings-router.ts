@@ -1,159 +1,17 @@
 import { Router } from 'express'
-import { z } from 'zod'
-import { migrateSettingsSortMode } from './settings-migrate.js'
 import { withPerfSpan } from './perf-logger.js'
 import { DEFAULT_CLI_PROVIDER_NAMES } from './platform.js'
+import { buildServerSettingsPatchSchema, type ServerSettingsPatch } from '../shared/settings.js'
 
 // --- SettingsPatchSchema (moved from settings-schema.ts) ---
 
-function createCliProviderNameSchema(validCliProviders: readonly string[] = DEFAULT_CLI_PROVIDER_NAMES) {
-  const allowedProviders = new Set(validCliProviders)
-  return z.string().min(1).superRefine((value, ctx) => {
-    if (allowedProviders.has(value)) return
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: `Unknown CLI provider: '${value}'`,
-    })
-  })
-}
-
-const CodingCliProviderConfigSchema = z
-  .object({
-    model: z.string().optional(),
-    sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
-    permissionMode: z.enum(['default', 'plan', 'acceptEdits', 'bypassPermissions']).optional(),
-    maxTurns: z.coerce.number().optional(),
-    cwd: z.string().optional(),
-  })
-  .strict()
-
 export function buildSettingsPatchSchema(validCliProviders: readonly string[] = DEFAULT_CLI_PROVIDER_NAMES) {
-  const CliProviderNameSchema = createCliProviderNameSchema(validCliProviders)
-
-  return z.object({
-    theme: z.enum(['system', 'light', 'dark']).optional(),
-    uiScale: z.coerce.number().optional(),
-    terminal: z
-      .object({
-        fontSize: z.coerce.number().optional(),
-        lineHeight: z.coerce.number().optional(),
-        cursorBlink: z.coerce.boolean().optional(),
-        scrollback: z.coerce.number().optional(),
-        theme: z
-          .enum([
-            'auto',
-            'dracula',
-            'one-dark',
-            'solarized-dark',
-            'github-dark',
-            'one-light',
-            'solarized-light',
-            'github-light',
-          ])
-          .optional(),
-        warnExternalLinks: z.coerce.boolean().optional(),
-        osc52Clipboard: z.enum(['ask', 'always', 'never']).optional(),
-        renderer: z.enum(['auto', 'webgl', 'canvas']).optional(),
-      })
-      .strict()
-      .optional(),
-    defaultCwd: z.string().nullable().optional(),
-    allowedFilePaths: z.array(z.string()).optional(),
-    logging: z
-      .object({
-        debug: z.coerce.boolean().optional(),
-      })
-      .strict()
-      .optional(),
-    safety: z
-      .object({
-        autoKillIdleMinutes: z.coerce.number().optional(),
-      })
-      .strict()
-      .optional(),
-    panes: z
-      .object({
-        defaultNewPane: z.enum(['ask', 'shell', 'browser', 'editor']).optional(),
-        snapThreshold: z.coerce.number().optional(),
-        iconsOnTabs: z.coerce.boolean().optional(),
-        tabAttentionStyle: z.enum(['highlight', 'pulse', 'darken', 'none']).optional(),
-        attentionDismiss: z.enum(['click', 'type']).optional(),
-      })
-      .strict()
-      .optional(),
-    sidebar: z
-      .object({
-        sortMode: z.enum(['recency', 'recency-pinned', 'activity', 'project']).optional(),
-        showProjectBadges: z.coerce.boolean().optional(),
-        showSubagents: z.coerce.boolean().optional(),
-        showNoninteractiveSessions: z.coerce.boolean().optional(),
-        hideEmptySessions: z.coerce.boolean().optional(),
-        excludeFirstChatSubstrings: z.array(z.string()).optional(),
-        excludeFirstChatMustStart: z.coerce.boolean().optional(),
-        width: z.coerce.number().optional(),
-        collapsed: z.coerce.boolean().optional(),
-      })
-      .strict()
-      .optional(),
-    notifications: z
-      .object({
-        soundEnabled: z.coerce.boolean().optional(),
-      })
-      .strict()
-      .optional(),
-    codingCli: z
-      .object({
-        enabledProviders: z
-          .array(CliProviderNameSchema)
-          .optional(),
-        knownProviders: z
-          .array(CliProviderNameSchema)
-          .optional(),
-        providers: z
-          .record(CliProviderNameSchema, CodingCliProviderConfigSchema)
-          .optional(),
-      })
-      .strict()
-      .optional(),
-    agentChat: z
-      .object({
-        initialSetupDone: z.boolean().optional(),
-        providers: z
-          .record(
-            z.string(),
-            z
-              .object({
-                defaultModel: z.string().optional(),
-                defaultPermissionMode: z.string().optional(),
-                defaultEffort: z.enum(['low', 'medium', 'high', 'max']).optional(),
-              })
-              .strict(),
-          )
-          .optional(),
-      })
-      .strict()
-      .optional(),
-    editor: z
-      .object({
-        externalEditor: z.enum(['auto', 'cursor', 'code', 'custom']).optional(),
-        customEditorCommand: z.string().optional(),
-      })
-      .strict()
-      .optional(),
-    network: z
-      .object({
-        host: z.enum(['127.0.0.1', '0.0.0.0']).optional(),
-        configured: z.coerce.boolean().optional(),
-      })
-      .strict()
-      .optional(),
-  })
-    .strict()
+  return buildServerSettingsPatchSchema(validCliProviders)
 }
 
 export const SettingsPatchSchema = buildSettingsPatchSchema()
 
-export type SettingsPatch = z.infer<typeof SettingsPatchSchema>
+export type SettingsPatch = ServerSettingsPatch
 
 // --- normalizeSettingsPatch (moved from server/index.ts) ---
 
@@ -199,32 +57,26 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
 
   router.get('/', async (_req, res) => {
     const s = await configStore.getSettings()
-    res.json(migrateSettingsSortMode(s))
+    res.json(s)
   })
 
   const handleSettingsPatch = async (req: any, res: any) => {
-    // Strip deprecated keys that may linger in persisted client state
-    const body = req.body || {}
-    if (body.sidebar && typeof body.sidebar === 'object') {
-      delete body.sidebar.ignoreCodexSubagentSessions
-    }
-    const parsed = settingsPatchSchema.safeParse(body)
+    const parsed = settingsPatchSchema.safeParse(req.body || {})
     if (!parsed.success) {
       return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
     }
-    const patch = normalizeSettingsPatch(migrateSettingsSortMode(parsed.data) as any)
+    const patch = normalizeSettingsPatch(parsed.data as Record<string, any>) as SettingsPatch
     const updated = await configStore.patchSettings(patch)
-    const migrated = migrateSettingsSortMode(updated)
-    registry.setSettings(migrated)
-    applyDebugLogging(!!migrated.logging?.debug, 'settings')
-    wsHandler.broadcast({ type: 'settings.updated', settings: migrated })
+    registry.setSettings(updated)
+    applyDebugLogging(!!updated.logging?.debug, 'settings')
+    wsHandler.broadcast({ type: 'settings.updated', settings: updated })
     await withPerfSpan(
       'coding_cli_refresh',
       () => codingCliIndexer.refresh(),
       {},
       { minDurationMs: perfConfig.slowSessionRefreshMs, level: 'warn' },
     )
-    res.json(migrated)
+    res.json(updated)
   }
 
   router.patch('/', handleSettingsPatch)
