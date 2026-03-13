@@ -88,6 +88,15 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
   let currentConfirmation: { token: string; platform: RepairPlatform } | null = null
   let confirmedRepairInFlight = false
 
+  const consumeCurrentConfirmation = (token: string | undefined) => {
+    if (currentConfirmation === null || currentConfirmation.token !== token) {
+      return false
+    }
+
+    currentConfirmation = null
+    return true
+  }
+
   const startElevatedRepair = (
     command: string,
     script: string,
@@ -95,28 +104,44 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
       completedLog,
       failedLog,
       spawnFailedLog,
+      releaseConfirmedRepair,
     }: {
       completedLog: string
       failedLog: string
       spawnFailedLog: string
+      releaseConfirmedRepair: () => void
     },
   ) => {
     networkManager.setFirewallConfiguring(true)
-    const child = spawnElevatedPowerShell(command, script, (err, _stdout, stderr) => {
-      if (err) {
-        log.error({ err, stderr }, failedLog)
-      } else {
-        log.info(completedLog)
+    let settled = false
+    const settleRepair = () => {
+      if (settled) {
+        return
       }
+      settled = true
       networkManager.resetFirewallCache()
       networkManager.setFirewallConfiguring(false)
-    })
+      releaseConfirmedRepair()
+    }
 
-    child.on('error', (err) => {
-      log.error({ err }, spawnFailedLog)
-      networkManager.resetFirewallCache()
-      networkManager.setFirewallConfiguring(false)
-    })
+    try {
+      const child = spawnElevatedPowerShell(command, script, (err, _stdout, stderr) => {
+        if (err) {
+          log.error({ err, stderr }, failedLog)
+        } else {
+          log.info(completedLog)
+        }
+        settleRepair()
+      })
+
+      child.on('error', (err) => {
+        log.error({ err }, spawnFailedLog)
+        settleRepair()
+      })
+    } catch (err) {
+      settleRepair()
+      throw err
+    }
   }
 
   const issueConfirmation = (platform: RepairPlatform) => {
@@ -143,15 +168,18 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
     return true
   }
 
-  const withConfirmedRepairLock = async <T,>(fn: () => Promise<T>) => {
+  const acquireConfirmedRepairLock = () => {
     if (confirmedRepairInFlight) {
       return FIREWALL_REPAIR_LOCKED
     }
 
     confirmedRepairInFlight = true
-    try {
-      return await fn()
-    } finally {
+    let released = false
+    return () => {
+      if (released) {
+        return
+      }
+      released = true
       confirmedRepairInFlight = false
     }
   }
@@ -263,6 +291,9 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
       const action = await resolveRepairAction(status, settings)
 
       if (action.kind === 'none' || action.kind === 'terminal') {
+        if (confirmElevation) {
+          consumeCurrentConfirmation(confirmationToken)
+        }
         return res.json(action.response)
       }
 
@@ -270,7 +301,15 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
         return res.json(issueConfirmation(action.platform))
       }
 
-      const lockedResult = await withConfirmedRepairLock(async () => {
+      const releaseConfirmedRepair = acquireConfirmedRepairLock()
+      if (releaseConfirmedRepair === FIREWALL_REPAIR_LOCKED) {
+        return res.status(409).json({
+          error: 'Firewall configuration already in progress',
+          method: 'in-progress',
+        })
+      }
+
+      const lockedResult = await (async () => {
         const [freshStatus, freshSettings] = await Promise.all([
           networkManager.getStatus(),
           configStore.getSettings(),
@@ -278,10 +317,13 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
         const freshAction = await resolveRepairAction(freshStatus, freshSettings)
 
         if (freshAction.kind === 'none' || freshAction.kind === 'terminal') {
+          consumeCurrentConfirmation(confirmationToken)
+          releaseConfirmedRepair()
           return { status: 200 as const, body: freshAction.response }
         }
 
         if (!consumeConfirmation(confirmationToken, freshAction.platform)) {
+          releaseConfirmedRepair()
           return {
             status: 200 as const,
             body: issueConfirmation(freshAction.platform),
@@ -299,11 +341,13 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
                 completedLog: 'WSL2 port forwarding completed successfully',
                 failedLog: 'WSL2 port forwarding failed',
                 spawnFailedLog: 'Failed to spawn PowerShell for WSL2 port forwarding',
+                releaseConfirmedRepair,
               }
               : {
                 completedLog: 'Windows firewall configured successfully',
                 failedLog: 'Windows firewall configuration failed',
                 spawnFailedLog: 'Failed to spawn PowerShell for Windows firewall',
+                releaseConfirmedRepair,
               },
           )
 
@@ -318,6 +362,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
               ? 'WSL2 port forwarding setup error'
               : 'Windows firewall setup error',
           )
+          releaseConfirmedRepair()
           networkManager.setFirewallConfiguring(false)
           return {
             status: 500 as const,
@@ -328,14 +373,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
             },
           }
         }
-      })
-
-      if (lockedResult === FIREWALL_REPAIR_LOCKED) {
-        return res.status(409).json({
-          error: 'Firewall configuration already in progress',
-          method: 'in-progress',
-        })
-      }
+      })()
 
       return res.status(lockedResult.status).json(lockedResult.body)
     } catch (err) {

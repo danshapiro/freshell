@@ -142,7 +142,7 @@ describe('SettingsView network access section', () => {
     expect(mockFetchFirewallConfig).toHaveBeenCalledTimes(1)
   })
 
-  it('treats an in-progress settings repair as a refresh path instead of a no-op', async () => {
+  it('clears the in-progress refresh detail after the scheduled status refresh succeeds', async () => {
     vi.useFakeTimers()
     mockFetchFirewallConfig.mockResolvedValueOnce({
       method: 'in-progress',
@@ -179,13 +179,20 @@ describe('SettingsView network access section', () => {
     renderSettingsView(store, { onNavigate: vi.fn() })
 
     fireEvent.click(screen.getByRole('button', { name: /fix firewall/i }))
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(screen.getByText(/firewall configuration already in progress/i)).toBeInTheDocument()
 
     await act(async () => {
       await Promise.resolve()
       await vi.advanceTimersByTimeAsync(2000)
+      await Promise.resolve()
     })
 
     expect(api.get).toHaveBeenCalledWith('/api/network/status')
+    expect(screen.getByText(/port is open/i)).toBeInTheDocument()
+    expect(screen.queryByText(/firewall configuration already in progress/i)).not.toBeInTheDocument()
   })
 
   it('refreshes network status when the server reports no firewall changes were needed', async () => {

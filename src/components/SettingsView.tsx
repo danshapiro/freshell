@@ -229,6 +229,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   const terminalAdvancedId = useId()
   const pendingRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const firewallRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const firewallRefreshRequestRef = useRef(0)
   const defaultCwdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const defaultCwdValidationRef = useRef(0)
   const lastSettingsDefaultCwdRef = useRef(settings.defaultCwd ?? '')
@@ -291,9 +292,22 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     if (firewallRefreshTimerRef.current) {
       clearTimeout(firewallRefreshTimerRef.current)
     }
+    firewallRefreshRequestRef.current += 1
+    const refreshRequestId = firewallRefreshRequestRef.current
     firewallRefreshTimerRef.current = setTimeout(() => {
       firewallRefreshTimerRef.current = null
       void dispatch(fetchNetworkStatus())
+        .unwrap()
+        .then(() => {
+          if (firewallRefreshRequestRef.current === refreshRequestId) {
+            setFirewallRefreshDetail(null)
+          }
+        })
+        .catch(() => {
+          if (firewallRefreshRequestRef.current === refreshRequestId) {
+            setFirewallRefreshDetail('Failed to refresh firewall status')
+          }
+        })
     }, 2000)
   }, [dispatch])
 
