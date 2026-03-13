@@ -39,14 +39,23 @@ export interface TestServerOptions {
   runtimeRootMode?: 'project' | 'isolated'
 }
 
+function isWindowsStylePath(filePath: string): boolean {
+  return /^[A-Za-z]:\\/.test(filePath.replace(/\//g, '\\'))
+}
+
 export function applyIsolatedHomeEnvironment(
   env: Record<string, string>,
   homeDir: string,
 ): Record<string, string> {
+  const pathImpl = isWindowsStylePath(homeDir) ? path.win32 : path.posix
   const nextEnv = {
     ...env,
     HOME: homeDir,
     USERPROFILE: homeDir,
+    CLAUDE_HOME: pathImpl.join(homeDir, '.claude'),
+    CODEX_HOME: pathImpl.join(homeDir, '.codex'),
+    XDG_DATA_HOME: pathImpl.join(homeDir, '.local', 'share'),
+    LOCALAPPDATA: pathImpl.join(homeDir, 'AppData', 'Local'),
   }
 
   const windowsHomeDir = homeDir.replace(/\//g, '\\')
@@ -60,6 +69,20 @@ export function applyIsolatedHomeEnvironment(
   }
 
   return nextEnv
+}
+
+export function requireBuiltServerEntry(
+  projectRoot: string,
+  existsSync: (filePath: string) => boolean = fs.existsSync,
+): string {
+  const serverEntry = path.join(projectRoot, 'dist', 'server', 'index.js')
+  if (!existsSync(serverEntry)) {
+    throw new Error(
+      `Built server not found at ${serverEntry}. Run "npm run build" first, ` +
+      'or let the Playwright globalSetup handle it.'
+    )
+  }
+  return serverEntry
 }
 
 function validateTestServerOptions(options: TestServerOptions): void {
@@ -103,6 +126,7 @@ function findProjectRoot(): string {
 }
 
 async function createIsolatedRuntimeRoot(projectRoot: string): Promise<string> {
+  requireBuiltServerEntry(projectRoot)
   const runtimeRootsParent = path.join(projectRoot, '.worktrees')
   await fsp.mkdir(runtimeRootsParent, { recursive: true })
   const runtimeRoot = await fsp.mkdtemp(path.join(runtimeRootsParent, 'test-server-runtime-'))
@@ -238,13 +262,7 @@ export class TestServer {
       this.runtimeRootDir = runtimeRootMode === 'isolated' ? runtimeRoot : null
 
       // We need the built server and client for production mode
-      const serverEntry = path.join(runtimeRoot, 'dist', 'server', 'index.js')
-      if (!fs.existsSync(serverEntry)) {
-        throw new Error(
-          `Built server not found at ${serverEntry}. Run "npm run build" first, ` +
-          'or let the Playwright globalSetup handle it.'
-        )
-      }
+      const serverEntry = requireBuiltServerEntry(runtimeRoot)
 
       const authStrategy = this.options.authStrategy ?? 'explicit-env'
       const env = applyIsolatedHomeEnvironment({

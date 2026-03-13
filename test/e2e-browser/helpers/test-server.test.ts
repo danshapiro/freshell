@@ -2,7 +2,7 @@ import fs from 'fs/promises'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { describe, it, expect, afterEach, vi } from 'vitest'
-import { applyIsolatedHomeEnvironment, TestServer } from './test-server.js'
+import { applyIsolatedHomeEnvironment, requireBuiltServerEntry, TestServer } from './test-server.js'
 
 function resolveProjectRoot(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..')
@@ -68,12 +68,20 @@ describe('TestServer', () => {
       USERPROFILE: 'C:\\Users\\real-user',
       HOMEDRIVE: 'C:',
       HOMEPATH: '\\Users\\real-user',
+      CLAUDE_HOME: '/real/.claude',
+      CODEX_HOME: '/real/.codex',
+      XDG_DATA_HOME: '/real/.local/share',
+      LOCALAPPDATA: 'C:\\Users\\real-user\\AppData\\Local',
     }, '/tmp/freshell-e2e-home')
 
     expect(env.HOME).toBe('/tmp/freshell-e2e-home')
     expect(env.USERPROFILE).toBe('/tmp/freshell-e2e-home')
     expect('HOMEDRIVE' in env).toBe(false)
     expect('HOMEPATH' in env).toBe(false)
+    expect(env.CLAUDE_HOME).toBe('/tmp/freshell-e2e-home/.claude')
+    expect(env.CODEX_HOME).toBe('/tmp/freshell-e2e-home/.codex')
+    expect(env.XDG_DATA_HOME).toBe('/tmp/freshell-e2e-home/.local/share')
+    expect(env.LOCALAPPDATA).toBe('/tmp/freshell-e2e-home/AppData/Local')
   })
 
   it('derives Windows drive-based home vars for native Windows isolated homes', () => {
@@ -83,6 +91,16 @@ describe('TestServer', () => {
     expect(env.USERPROFILE).toBe('D:\\Temp\\freshell-e2e-home')
     expect(env.HOMEDRIVE).toBe('D:')
     expect(env.HOMEPATH).toBe('\\Temp\\freshell-e2e-home')
+    expect(env.CLAUDE_HOME).toBe('D:\\Temp\\freshell-e2e-home\\.claude')
+    expect(env.CODEX_HOME).toBe('D:\\Temp\\freshell-e2e-home\\.codex')
+    expect(env.XDG_DATA_HOME).toBe('D:\\Temp\\freshell-e2e-home\\.local\\share')
+    expect(env.LOCALAPPDATA).toBe('D:\\Temp\\freshell-e2e-home\\AppData\\Local')
+  })
+
+  it('reports the build-first guidance before isolated staging when the compiled server is missing', () => {
+    expect(() => requireBuiltServerEntry('/repo', () => false)).toThrow(
+      'Built server not found at /repo/dist/server/index.js. Run "npm run build" first, or let the Playwright globalSetup handle it.',
+    )
   })
 
   it('bootstraps AUTH_TOKEN into the isolated runtime root for a compiled cold start', async () => {
