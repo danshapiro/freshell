@@ -4,7 +4,13 @@ import os from 'os'
 import fsp from 'fs/promises'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
-import { resolveGitBranchAndDirty, clearRepoRootCache } from '../../../../server/coding-cli/utils'
+import {
+  resolveGitBranchAndDirty,
+  resolveGitCheckoutRoot,
+  resolveGitCommonDir,
+  resolveGitRepoRoot,
+  clearRepoRootCache,
+} from '../../../../server/coding-cli/utils'
 
 const execFileAsync = promisify(execFile)
 
@@ -23,6 +29,16 @@ async function initRepo(repoDir: string, branchName: string) {
   await runGit(['add', 'README.md'], repoDir)
   await runGit(['commit', '-m', 'init'], repoDir)
   await runGit(['checkout', '-B', branchName], repoDir)
+}
+
+async function createLinkedWorktreeFixture(baseDir: string) {
+  const repoDir = path.join(baseDir, 'repo')
+  const worktreeDir = path.join(baseDir, 'repo-feature')
+
+  await initRepo(repoDir, 'main')
+  await runGit(['worktree', 'add', '-b', 'feature/worktree', worktreeDir], repoDir)
+
+  return { repoDir, worktreeDir }
 }
 
 beforeEach(async () => {
@@ -69,5 +85,25 @@ describe('resolveGitBranchAndDirty()', () => {
     const result = await resolveGitBranchAndDirty(plainDir)
 
     expect(result).toEqual({})
+  })
+
+  it('resolves branch, dirty state, checkout root, repo root, and common-dir for linked worktrees', async () => {
+    const { repoDir, worktreeDir } = await createLinkedWorktreeFixture(tempDir)
+    const nestedDir = path.join(worktreeDir, 'src', 'deep')
+    await fsp.mkdir(nestedDir, { recursive: true })
+
+    await fsp.writeFile(path.join(worktreeDir, 'dirty.txt'), 'dirty\n')
+
+    expect(await resolveGitCheckoutRoot(nestedDir)).toBe(worktreeDir)
+    expect(await resolveGitRepoRoot(nestedDir)).toBe(repoDir)
+    expect(await resolveGitCommonDir(nestedDir)).toBe(path.join(repoDir, '.git'))
+
+    const result = await resolveGitBranchAndDirty(nestedDir)
+
+    expect(result).toEqual({
+      branch: 'feature/worktree',
+      isDirty: true,
+    })
+    expect(result).not.toHaveProperty('cleanWorktree')
   })
 })

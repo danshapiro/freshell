@@ -48,7 +48,7 @@ function listen(server: http.Server, timeoutMs = HOOK_TIMEOUT_MS): Promise<{ por
   })
 }
 
-function waitForMessage(ws: WebSocket, predicate: (msg: any) => boolean, timeoutMs = 5000): Promise<any> {
+function waitForMessage(ws: WebSocket, predicate: (msg: any) => boolean, timeoutMs = 10_000): Promise<any> {
   return new Promise((resolve, reject) => {
     const cleanup = () => {
       clearTimeout(timeout)

@@ -7,7 +7,6 @@ import { PortForwardManager } from '../../../server/port-forward.js'
 import { parseTrustProxyEnv } from '../../../server/request-ip.js'
 import { createProxyRouter } from '../../../server/proxy-router.js'
 
-// Mock logger to avoid pino setup in test
 vi.mock('../../../server/logger', () => {
   const logger = {
     info: vi.fn(),
@@ -24,7 +23,6 @@ vi.mock('../../../server/logger', () => {
 
 const TEST_AUTH_TOKEN = 'test-auth-token-12345678'
 
-// Helper: create a TCP server on localhost that echoes data back
 function createEchoServer(): Promise<{ server: net.Server; port: number }> {
   return new Promise((resolve) => {
     const server = net.createServer((socket) => {
@@ -95,7 +93,6 @@ describe('Port Forward API Integration', () => {
     app.use(express.json({ limit: '1mb' }))
     app.set('trust proxy', parseTrustProxyEnv(process.env.FRESHELL_TRUST_PROXY))
 
-    // Auth middleware (matches server/auth.ts)
     app.use('/api', (req, res, next) => {
       const token = process.env.AUTH_TOKEN
       const provided = req.headers['x-auth-token'] as string | undefined
@@ -105,14 +102,15 @@ describe('Port Forward API Integration', () => {
       next()
     })
 
-    // Mount the real proxy router with the real PortForwardManager
     app.use('/api/proxy', createProxyRouter({ portForwardManager: manager }))
   })
 
   afterEach(async () => {
     await manager.closeAll()
     if (echoServer) {
-      echoServer.server.close()
+      await new Promise<void>((resolve) => {
+        echoServer?.server.close(() => resolve())
+      })
       echoServer = null
     }
   })
@@ -263,23 +261,19 @@ describe('Port Forward API Integration', () => {
     it('closes an existing forward', async () => {
       echoServer = await createEchoServer()
 
-      // Create the forward
       const res = await request(app)
         .post('/api/proxy/forward')
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .send({ port: echoServer.port })
         .expect(200)
-
       const forwardedPort = res.body.forwardedPort
 
-      // Delete it
       await request(app)
         .delete(`/api/proxy/forward/${echoServer.port}`)
         .set('x-auth-token', TEST_AUTH_TOKEN)
         .expect(200)
 
-      // A connect attempt already queued in the kernel can occasionally race with close.
-      // Wait for the listener to become unavailable rather than assuming a single probe must fail.
+      expect(manager.getForwardedPort(echoServer.port, 'loopback')).toBeUndefined()
       await waitForForwardedPortToClose(forwardedPort)
     })
 
