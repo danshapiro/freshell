@@ -483,6 +483,39 @@ describe('sessionsThunks', () => {
     }
   })
 
+  it('treats websocket recovery without committed sidebar data as an initial blocking load', async () => {
+    const deferred = createDeferred<any>()
+    fetchSidebarSessionsSnapshot.mockReturnValueOnce(deferred.promise)
+
+    const store = createStoreWithSessions({
+      activeSurface: 'sidebar',
+      projects: [],
+      windows: {
+        sidebar: {
+          projects: [],
+          query: '',
+          searchTier: 'title',
+        },
+      },
+    })
+
+    const request = store.dispatch(queueActiveSessionWindowRefresh() as any)
+
+    try {
+      expect((store.getState().sessions.windows.sidebar as any).loadingKind).toBe('initial')
+    } finally {
+      deferred.resolve({
+        projects: [],
+        totalSessions: 0,
+        oldestIncludedTimestamp: 0,
+        oldestIncludedSessionId: '',
+        hasMore: false,
+      })
+
+      await request
+    }
+  })
+
   it('coalesces repeated invalidations into one in-flight fetch plus one trailing refresh', async () => {
     const firstFetch = createDeferred<any>()
     fetchSidebarSessionsSnapshot

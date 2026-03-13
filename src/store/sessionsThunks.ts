@@ -138,8 +138,8 @@ function getLoadingKind(args: {
   hasCommittedItems: boolean
 }): SessionWindowLoadingKind {
   if (args.append) return 'pagination'
-  if (args.priority === 'background') return 'background'
   if (!args.hasCommittedWindow && !args.hasCommittedItems) return 'initial'
+  if (args.priority === 'background') return 'background'
 
   const queryChanged = args.trimmedQuery !== args.previousQuery
   const tierChanged = args.nextTier !== args.previousTier

@@ -215,7 +215,7 @@ describe('sessionsSlice', () => {
       expect(state.expandedProjects.size).toBe(0)
     })
 
-    it('does not update lastLoadedAt', () => {
+    it('clears lastLoadedAt', () => {
       const stateWithTimestamp = {
         ...initialState,
         projects: mockProjects,
@@ -223,7 +223,7 @@ describe('sessionsSlice', () => {
         wsSnapshotReceived: true,
       }
       const state = sessionsReducer(stateWithTimestamp, clearProjects())
-      expect(state.lastLoadedAt).toBe(1700000000000)
+      expect(state.lastLoadedAt).toBeUndefined()
     })
   })
 

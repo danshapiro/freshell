@@ -247,6 +247,7 @@ export const sessionsSlice = createSlice({
       state.projects = []
       state.expandedProjects = new Set()
       state.wsSnapshotReceived = false
+      state.lastLoadedAt = undefined
       state.totalSessions = undefined
       state.oldestLoadedTimestamp = undefined
       state.oldestLoadedSessionId = undefined

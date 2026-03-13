@@ -1821,7 +1821,9 @@ describe('Sidebar Component - Session-Centric Display', () => {
       fireEvent.change(getByPlaceholderText('Search...'), { target: { value: 'search' } })
 
       expect(screen.getByText('Search Result')).toBeInTheDocument()
-      expect(screen.getByTestId('search-loading')).toBeInTheDocument()
+      const searchLoading = screen.getByTestId('search-loading')
+      expect(searchLoading).toBeInTheDocument()
+      expect(searchLoading.querySelector('span:not(.sr-only)')).toHaveTextContent('Searching...')
     })
 
     it('keeps a loaded empty-state message visible during refresh', async () => {

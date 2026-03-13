@@ -6,7 +6,7 @@ import App from '@/App'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import tabsReducer, { openSessionTab } from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
-import sessionsReducer from '@/store/sessionsSlice'
+import sessionsReducer, { clearProjects } from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
 import tabRegistryReducer from '@/store/tabRegistrySlice'
@@ -735,6 +735,68 @@ describe('open tab session sidebar visibility (e2e)', () => {
     })
   })
 
+  it('blocks with loading UI when websocket recovery starts from an empty, uncommitted sidebar window', async () => {
+    const deferred = createDeferred<any>()
+    fetchSidebarSessionsSnapshot.mockReturnValueOnce(deferred.promise)
+
+    const store = createStore({
+      sessions: {
+        projects: [],
+        activeSurface: 'sidebar',
+        lastLoadedAt: 1_700_000_000_000,
+        windows: {
+          sidebar: {
+            projects: [],
+            lastLoadedAt: 1_700_000_000_000,
+            query: '',
+            searchTier: 'title',
+          },
+        },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(apiGet).toHaveBeenCalledWith('/api/version')
+    })
+
+    act(() => {
+      store.dispatch(clearProjects())
+    })
+
+    act(() => {
+      broadcastWs({
+        type: 'sessions.changed',
+        revision: 10,
+      })
+    })
+
+    await waitFor(() => {
+      expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText('Loading sessions...')).toBeInTheDocument()
+      expect(screen.queryByText('No sessions yet')).not.toBeInTheDocument()
+    })
+
+    await act(async () => {
+      deferred.resolve({
+        projects: [],
+        totalSessions: 0,
+        oldestIncludedTimestamp: 0,
+        oldestIncludedSessionId: '',
+        hasMore: false,
+      })
+      await Promise.resolve()
+    })
+  })
+
   it('keeps direct active-query refreshes silent and only shows searching for actual query changes', async () => {
     const searchProjects = [{
       projectPath: '/search',
@@ -819,7 +881,9 @@ describe('open tab session sidebar visibility (e2e)', () => {
         tier: 'title',
         signal: expect.any(AbortSignal),
       })
-      expect(screen.getByTestId('search-loading')).toBeInTheDocument()
+      const searchLoading = screen.getByTestId('search-loading')
+      expect(searchLoading).toBeInTheDocument()
+      expect(searchLoading.querySelector('span:not(.sr-only)')).toHaveTextContent('Searching...')
     })
 
     await act(async () => {

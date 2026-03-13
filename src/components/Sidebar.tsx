@@ -541,10 +541,10 @@ export default function Sidebar({
               <span
                 role="status"
                 data-testid="search-loading"
-                className="inline-flex items-center text-xs text-muted-foreground"
+                className="inline-flex items-center gap-1 text-xs text-muted-foreground"
               >
                 <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-                <span className="sr-only">Searching...</span>
+                <span>Searching...</span>
               </span>
             ) : null}
             {filter ? (
