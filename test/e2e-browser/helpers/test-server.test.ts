@@ -2,23 +2,10 @@ import fs from 'fs/promises'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { describe, it, expect, afterEach, vi } from 'vitest'
-import { TestServer } from './test-server.js'
+import { applyIsolatedHomeEnvironment, TestServer } from './test-server.js'
 
 function resolveProjectRoot(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..')
-}
-
-async function listIsolatedRuntimeRoots(): Promise<string[]> {
-  const runtimeRootsParent = path.join(resolveProjectRoot(), '.worktrees')
-  try {
-    const entries = await fs.readdir(runtimeRootsParent, { withFileTypes: true })
-    return entries
-      .filter((entry) => entry.isDirectory() && entry.name.startsWith('test-server-runtime-'))
-      .map((entry) => entry.name)
-      .sort()
-  } catch {
-    return []
-  }
 }
 
 describe('TestServer', () => {
@@ -73,6 +60,29 @@ describe('TestServer', () => {
     expect(() => new TestServer({
       authStrategy: 'bootstrap',
     })).toThrow(/requires runtimeRootMode "isolated"/)
+  })
+
+  it('overrides Windows home env vars when isolating the server HOME', () => {
+    const env = applyIsolatedHomeEnvironment({
+      HOME: '/real/home',
+      USERPROFILE: 'C:\\Users\\real-user',
+      HOMEDRIVE: 'C:',
+      HOMEPATH: '\\Users\\real-user',
+    }, '/tmp/freshell-e2e-home')
+
+    expect(env.HOME).toBe('/tmp/freshell-e2e-home')
+    expect(env.USERPROFILE).toBe('/tmp/freshell-e2e-home')
+    expect('HOMEDRIVE' in env).toBe(false)
+    expect('HOMEPATH' in env).toBe(false)
+  })
+
+  it('derives Windows drive-based home vars for native Windows isolated homes', () => {
+    const env = applyIsolatedHomeEnvironment({}, 'D:\\Temp\\freshell-e2e-home')
+
+    expect(env.HOME).toBe('D:\\Temp\\freshell-e2e-home')
+    expect(env.USERPROFILE).toBe('D:\\Temp\\freshell-e2e-home')
+    expect(env.HOMEDRIVE).toBe('D:')
+    expect(env.HOMEPATH).toBe('\\Temp\\freshell-e2e-home')
   })
 
   it('bootstraps AUTH_TOKEN into the isolated runtime root for a compiled cold start', async () => {
@@ -173,8 +183,16 @@ describe('TestServer', () => {
   })
 
   it('cleans up temp HOME and isolated runtime roots when isolated staging fails', async () => {
-    const runtimeRootsBefore = await listIsolatedRuntimeRoots()
     let failedHomeDir: string | undefined
+    let failedRuntimeRoot: string | undefined
+    const originalMkdtemp = fs.mkdtemp.bind(fs)
+    const mkdtempSpy = vi.spyOn(fs, 'mkdtemp').mockImplementation(async (prefix, options) => {
+      const created = await originalMkdtemp(prefix, options)
+      if (String(prefix).includes('test-server-runtime-')) {
+        failedRuntimeRoot = created
+      }
+      return created
+    })
     const copySpy = vi.spyOn(fs, 'cp').mockRejectedValue(new Error('Injected isolated runtime staging failure'))
 
     try {
@@ -188,13 +206,15 @@ describe('TestServer', () => {
 
       await expect(server.start()).rejects.toThrow('Injected isolated runtime staging failure')
     } finally {
+      mkdtempSpy.mockRestore()
       copySpy.mockRestore()
     }
 
     await server.stop()
     server = undefined
 
-    expect(await listIsolatedRuntimeRoots()).toEqual(runtimeRootsBefore)
+    expect(failedRuntimeRoot).toBeTruthy()
+    await expect(fs.stat(failedRuntimeRoot!)).rejects.toThrow()
     await expect(fs.stat(failedHomeDir!)).rejects.toThrow()
   })
 

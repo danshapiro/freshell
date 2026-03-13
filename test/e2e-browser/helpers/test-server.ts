@@ -39,6 +39,29 @@ export interface TestServerOptions {
   runtimeRootMode?: 'project' | 'isolated'
 }
 
+export function applyIsolatedHomeEnvironment(
+  env: Record<string, string>,
+  homeDir: string,
+): Record<string, string> {
+  const nextEnv = {
+    ...env,
+    HOME: homeDir,
+    USERPROFILE: homeDir,
+  }
+
+  const windowsHomeDir = homeDir.replace(/\//g, '\\')
+  const windowsDrivePathMatch = windowsHomeDir.match(/^([A-Za-z]:)(\\.*)$/)
+  if (windowsDrivePathMatch) {
+    nextEnv.HOMEDRIVE = windowsDrivePathMatch[1]
+    nextEnv.HOMEPATH = windowsDrivePathMatch[2]
+  } else {
+    delete nextEnv.HOMEDRIVE
+    delete nextEnv.HOMEPATH
+  }
+
+  return nextEnv
+}
+
 function validateTestServerOptions(options: TestServerOptions): void {
   const authStrategy = options.authStrategy ?? 'explicit-env'
   const runtimeRootMode = options.runtimeRootMode ?? 'project'
@@ -224,10 +247,9 @@ export class TestServer {
       }
 
       const authStrategy = this.options.authStrategy ?? 'explicit-env'
-      const env: Record<string, string> = {
+      const env = applyIsolatedHomeEnvironment({
         ...process.env as Record<string, string>,
         PORT: String(port),
-        HOME: homeDir,
         NODE_ENV: 'production',
         FRESHELL_LOG_DIR: logsDir,
         HIDE_STARTUP_TOKEN: 'true',
@@ -235,7 +257,7 @@ export class TestServer {
         // requires a UAC prompt and blocks server startup for 60s).
         FRESHELL_BIND_HOST: '127.0.0.1',
         ...this.options.env,
-      }
+      }, homeDir)
 
       if (authStrategy === 'explicit-env') {
         env.AUTH_TOKEN = explicitToken

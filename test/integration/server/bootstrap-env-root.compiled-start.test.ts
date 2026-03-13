@@ -1,27 +1,19 @@
-import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { TestServer } from '../../e2e-browser/helpers/test-server.js'
 
-const execFileAsync = promisify(execFile)
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const PROJECT_ROOT = path.resolve(__dirname, '../../..')
-const NPM_COMMAND = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 
 vi.setConfig({ testTimeout: 120_000, hookTimeout: 120_000 })
 
 describe('issue 174 compiled startup regression', () => {
   let server: TestServer | undefined
-
-  beforeAll(async () => {
-    await execFileAsync(NPM_COMMAND, ['run', 'build:server'], { cwd: PROJECT_ROOT })
-  })
 
   afterEach(async () => {
     if (server) {
