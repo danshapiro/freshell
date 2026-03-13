@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import App from '@/App'
@@ -729,6 +729,104 @@ describe('open tab session sidebar visibility (e2e)', () => {
         }],
         tier: 'title',
         query: 'search',
+        totalScanned: 1,
+      })
+      await Promise.resolve()
+    })
+  })
+
+  it('keeps direct active-query refreshes silent and only shows searching for actual query changes', async () => {
+    const searchProjects = [{
+      projectPath: '/search',
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'search-session',
+        projectPath: '/search',
+        updatedAt: 10,
+        title: 'Search Result',
+      }],
+    }]
+    const refreshDeferred = createDeferred<any>()
+    const queryChangeDeferred = createDeferred<any>()
+    searchSessions
+      .mockReturnValueOnce(refreshDeferred.promise)
+      .mockReturnValueOnce(queryChangeDeferred.promise)
+
+    const store = createStore({
+      sessions: {
+        projects: searchProjects,
+        activeSurface: 'sidebar',
+        lastLoadedAt: Date.now(),
+        windows: {
+          sidebar: {
+            projects: searchProjects,
+            lastLoadedAt: Date.now(),
+            loading: false,
+            query: 'search',
+            searchTier: 'title',
+          },
+        },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Search Result').length).toBeGreaterThan(0)
+    })
+
+    const refreshRequest = store.dispatch((sessionsThunks as any).refreshActiveSessionWindow())
+
+    await waitFor(() => {
+      expect(searchSessions).toHaveBeenCalledTimes(1)
+      expect(searchSessions).toHaveBeenNthCalledWith(1, {
+        query: 'search',
+        tier: 'title',
+        signal: expect.any(AbortSignal),
+      })
+    })
+
+    expect(screen.getAllByText('Search Result').length).toBeGreaterThan(0)
+    expect(screen.queryByTestId('search-loading')).not.toBeInTheDocument()
+
+    await act(async () => {
+      refreshDeferred.resolve({
+        results: [{
+          provider: 'codex',
+          sessionId: 'search-session',
+          projectPath: '/search',
+          title: 'Search Result',
+          updatedAt: 10,
+          archived: false,
+        }],
+        tier: 'title',
+        query: 'search',
+        totalScanned: 1,
+      })
+      await refreshRequest
+    })
+
+    fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'search plus' } })
+
+    await waitFor(() => {
+      expect(searchSessions).toHaveBeenCalledTimes(2)
+      expect(searchSessions).toHaveBeenNthCalledWith(2, {
+        query: 'search plus',
+        tier: 'title',
+        signal: expect.any(AbortSignal),
+      })
+      expect(screen.getByTestId('search-loading')).toBeInTheDocument()
+    })
+
+    await act(async () => {
+      queryChangeDeferred.resolve({
+        results: [],
+        tier: 'title',
+        query: 'search plus',
         totalScanned: 1,
       })
       await Promise.resolve()

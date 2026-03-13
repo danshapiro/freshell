@@ -338,7 +338,7 @@ describe('sessionsThunks', () => {
     ])
   })
 
-  it('refreshes the active window using its query context', async () => {
+  it('refreshes the active active-query window silently while reusing its query context', async () => {
     searchSessions.mockResolvedValue({
       results: [
         {
@@ -367,7 +367,32 @@ describe('sessionsThunks', () => {
 
     searchSessions.mockClear()
 
-    await store.dispatch(refreshActiveSessionWindow() as any)
+    const deferred = createDeferred<any>()
+    searchSessions.mockReturnValueOnce(deferred.promise)
+
+    const request = store.dispatch(refreshActiveSessionWindow() as any)
+
+    try {
+      expect((store.getState().sessions.windows.sidebar as any).loadingKind).toBe('background')
+    } finally {
+      deferred.resolve({
+        results: [
+          {
+            provider: 'claude',
+            sessionId: 'session-search',
+            projectPath: '/tmp/search-project',
+            title: 'Search result',
+            updatedAt: 3_000,
+            archived: false,
+          },
+        ],
+        tier: 'fullText',
+        query: 'needle',
+        totalScanned: 1,
+      })
+
+      await request
+    }
 
     expect(searchSessions).toHaveBeenCalledWith({
       query: 'needle',

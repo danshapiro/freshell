@@ -143,7 +143,7 @@ function getLoadingKind(args: {
 
   const queryChanged = args.trimmedQuery !== args.previousQuery
   const tierChanged = args.nextTier !== args.previousTier
-  if (queryChanged || tierChanged || args.trimmedQuery.length > 0 || args.previousQuery.length > 0) {
+  if (queryChanged || tierChanged) {
     return 'search'
   }
 
