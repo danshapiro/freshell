@@ -378,9 +378,11 @@ export default function Sidebar({
   const activeTab = tabs.find((t) => t.id === activeTabId)
   const activeSessionKey = activeSessionKeyFromPanes
   const activeTerminalId = activeTab?.terminalId
+  const activeSearchTier = sidebarWindow?.searchTier ?? searchTier
   const hasLoadedSidebarWindow = typeof sidebarWindow?.lastLoadedAt === 'number'
+  const sidebarWindowHasItems = (sidebarWindow?.projects ?? []).some((project) => (project.sessions?.length ?? 0) > 0)
   const activeQuery = (sidebarWindow?.query ?? filter).trim()
-  const showBlockingLoad = !!sidebarWindow?.loading && !hasLoadedSidebarWindow && sortedItems.length === 0
+  const showBlockingLoad = !!sidebarWindow?.loading && !hasLoadedSidebarWindow && !sidebarWindowHasItems
   const showInlineRefreshStatus = !!sidebarWindow?.loading && hasLoadedSidebarWindow
   const effectiveListHeight = listHeight > 0
     ? listHeight
@@ -593,7 +595,7 @@ export default function Sidebar({
             </div>
           ) : sortedItems.length === 0 ? (
           <div className="px-2 py-8 text-center text-sm text-muted-foreground">
-            {activeQuery && searchTier !== 'title'
+            {activeQuery && activeSearchTier !== 'title'
               ? 'No results found'
               : activeQuery
               ? 'No matching sessions'

@@ -1647,6 +1647,119 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(screen.getByTestId('search-loading')).toBeInTheDocument()
       expect(screen.queryByText('Search Result')).not.toBeInTheDocument()
     })
+
+    it('keeps initial sidebar loads blocking even when fallback tab sessions exist', async () => {
+      const fallbackSessionId = sessionId('fallback-sidebar-load')
+      const store = createTestStore({
+        projects: [],
+        tabs: [{
+          id: 'tab-fallback-load',
+          title: 'Fallback Session',
+          mode: 'codex',
+          resumeSessionId: fallbackSessionId,
+          createdAt: 2_000,
+        }],
+        panes: {
+          layouts: {
+            'tab-fallback-load': {
+              type: 'leaf',
+              id: 'pane-fallback-load',
+              content: {
+                kind: 'terminal',
+                mode: 'codex',
+                createRequestId: 'req-fallback-load',
+                status: 'running',
+                resumeSessionId: fallbackSessionId,
+                cwd: '/tmp/fallback-load',
+              },
+            },
+          },
+          activePane: {
+            'tab-fallback-load': 'pane-fallback-load',
+          },
+          paneTitles: {
+            'tab-fallback-load': {
+              'pane-fallback-load': 'Fallback Session',
+            },
+          },
+        },
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: [],
+          windows: {
+            sidebar: {
+              projects: [],
+              loading: true,
+              query: '',
+              searchTier: 'title',
+            },
+          },
+        },
+      })
+
+      renderSidebar(store, [])
+
+      expect(screen.getByText('Loading sessions...')).toBeInTheDocument()
+      expect(screen.queryByText('Fallback Session')).not.toBeInTheDocument()
+      expect(screen.queryByTestId('virtualized-list')).not.toBeInTheDocument()
+    })
+
+    it('keeps first-load search blocking even when fallback tab sessions exist', async () => {
+      const fallbackSessionId = sessionId('fallback-search-load')
+      const store = createTestStore({
+        projects: [],
+        tabs: [{
+          id: 'tab-fallback-search',
+          title: 'Fallback Search Session',
+          mode: 'codex',
+          resumeSessionId: fallbackSessionId,
+          createdAt: 2_000,
+        }],
+        panes: {
+          layouts: {
+            'tab-fallback-search': {
+              type: 'leaf',
+              id: 'pane-fallback-search',
+              content: {
+                kind: 'terminal',
+                mode: 'codex',
+                createRequestId: 'req-fallback-search',
+                status: 'running',
+                resumeSessionId: fallbackSessionId,
+                cwd: '/tmp/fallback-search',
+              },
+            },
+          },
+          activePane: {
+            'tab-fallback-search': 'pane-fallback-search',
+          },
+          paneTitles: {
+            'tab-fallback-search': {
+              'pane-fallback-search': 'Fallback Search Session',
+            },
+          },
+        },
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: [],
+          windows: {
+            sidebar: {
+              projects: [],
+              loading: true,
+              query: 'search',
+              searchTier: 'title',
+            },
+          },
+        },
+      })
+
+      const { getByPlaceholderText } = renderSidebar(store, [])
+      fireEvent.change(getByPlaceholderText('Search...'), { target: { value: 'search' } })
+
+      expect(screen.getByTestId('search-loading')).toBeInTheDocument()
+      expect(screen.queryByText('Fallback Search Session')).not.toBeInTheDocument()
+      expect(screen.queryByTestId('virtualized-list')).not.toBeInTheDocument()
+    })
   })
 
   describe('Backend search integration', () => {

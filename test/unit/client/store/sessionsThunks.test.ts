@@ -277,4 +277,44 @@ describe('sessionsThunks', () => {
 
     await Promise.all([first, second])
   })
+
+  it('queues websocket invalidations behind an already-running direct fetch', async () => {
+    const firstFetch = createDeferred<any>()
+    fetchSidebarSessionsSnapshot
+      .mockReturnValueOnce(firstFetch.promise)
+      .mockResolvedValueOnce({
+        projects: [],
+        totalSessions: 0,
+        oldestIncludedTimestamp: 0,
+        oldestIncludedSessionId: '',
+        hasMore: false,
+      })
+
+    const store = createStore()
+    store.dispatch(setActiveSessionSurface('sidebar'))
+
+    const first = store.dispatch(fetchSessionWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+    }) as any)
+    expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+
+    const firstSignal = fetchSidebarSessionsSnapshot.mock.calls[0]?.[0]?.signal as AbortSignal
+    const queued = store.dispatch(queueActiveSessionWindowRefresh() as any)
+
+    expect(firstSignal.aborted).toBe(false)
+    expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+
+    firstFetch.resolve({
+      projects: [],
+      totalSessions: 0,
+      oldestIncludedTimestamp: 0,
+      oldestIncludedSessionId: '',
+      hasMore: false,
+    })
+
+    await Promise.all([first, queued])
+
+    expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(2)
+  })
 })
