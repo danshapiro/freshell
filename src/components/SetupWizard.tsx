@@ -385,6 +385,15 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
     void cancelFirewallConfirmation(confirmationToken).catch(() => {})
   }, [firewallConfirmation])
 
+  const handleContinueAnyway = useCallback(() => {
+    if (networkStatus?.firewall.platform === 'wsl2' && !isRemoteAccessEnabledStatus(networkStatus)) {
+      onComplete()
+      return
+    }
+
+    setStep(3)
+  }, [networkStatus, onComplete])
+
   return (
     <>
       <div
@@ -475,7 +484,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
 
             {bindStatus === 'done' && firewallStatus === 'error' && (
               <button
-                onClick={() => setStep(3)}
+                onClick={handleContinueAnyway}
                 className="w-full rounded-md bg-foreground px-4 py-2 text-sm font-medium text-background transition-opacity hover:opacity-90"
                 aria-label="Continue anyway"
               >

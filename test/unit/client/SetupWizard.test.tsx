@@ -869,4 +869,34 @@ describe('SetupWizard', () => {
     expect(screen.queryByRole('button', { name: /copy url/i })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: /configure firewall/i })).toBeInTheDocument()
   })
+
+  it('does not show the success or share screen on WSL when continuing anyway before remote access is enabled', async () => {
+    const firewallBlocked = { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false }
+    const store = createTestStore({
+      status: {
+        ...defaultNetworkStatus,
+        configured: true,
+        host: '0.0.0.0',
+        remoteAccessEnabled: false,
+        remoteAccessRequested: true,
+        accessUrl: 'http://localhost:3001/?token=abc',
+        firewall: firewallBlocked,
+        rebinding: false,
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <SetupWizard onComplete={vi.fn()} initialStep={2} />
+      </Provider>,
+    )
+
+    const continueButton = await screen.findByRole('button', { name: /continue anyway/i })
+    fireEvent.click(continueButton)
+
+    expect(screen.queryByText(/you're all set/i)).not.toBeInTheDocument()
+    expect(screen.queryByRole('img', { name: /qr code for access url/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /copy url/i })).not.toBeInTheDocument()
+    expect(screen.queryByText(/localhost:3001/i)).not.toBeInTheDocument()
+  })
 })

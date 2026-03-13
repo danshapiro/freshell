@@ -183,6 +183,36 @@ describe('SettingsView network access section', () => {
     expect(screen.getByRole('switch', { name: /remote access/i })).toBeChecked()
   })
 
+  it('surfaces a visible error when disabling WSL remote access fails', async () => {
+    const { api } = await import('@/lib/api')
+    vi.mocked(api.post).mockRejectedValueOnce({
+      status: 500,
+      message: 'Disable failed',
+      details: { error: 'Disable failed' },
+    })
+
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            host: '0.0.0.0',
+            remoteAccessEnabled: true,
+            firewall: { platform: 'wsl2', active: true, portOpen: true, commands: [], configuring: false },
+          } as any),
+        }),
+      },
+    })
+
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    fireEvent.click(screen.getByRole('switch', { name: /remote access/i }))
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(/disable failed/i)
+    })
+    expect(screen.getByRole('switch', { name: /remote access/i })).toBeChecked()
+  })
+
   it('shows an admin-approval modal before starting Windows firewall repair', async () => {
     mockFetchFirewallConfig
       .mockResolvedValueOnce({

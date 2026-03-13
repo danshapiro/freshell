@@ -120,6 +120,17 @@ function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof Error && error.message.trim().length > 0) {
     return error.message
   }
+
+  if (
+    typeof error === 'object'
+    && error !== null
+    && 'message' in error
+    && typeof (error as { message?: unknown }).message === 'string'
+    && (error as { message: string }).message.trim().length > 0
+  ) {
+    return (error as { message: string }).message
+  }
+
   return fallback
 }
 
@@ -253,6 +264,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     ? isFirewallRefreshInProgress(networkStatus.firewall, firewallRefreshDetail)
     : false
   const [remoteAccessPending, setRemoteAccessPending] = useState(false)
+  const [remoteAccessError, setRemoteAccessError] = useState<string | null>(null)
   const [defaultCwdInput, setDefaultCwdInput] = useState(settings.defaultCwd ?? '')
   const [defaultCwdError, setDefaultCwdError] = useState<string | null>(null)
   const [excludeFirstChatInput, setExcludeFirstChatInput] = useState(
@@ -395,6 +407,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
 
   const scheduleRemoteAccessRefresh = useCallback(() => {
     setRemoteAccessPending(true)
+    setRemoteAccessError(null)
     if (remoteAccessRefreshTimerRef.current) {
       clearTimeout(remoteAccessRefreshTimerRef.current)
     }
@@ -451,6 +464,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   const requestWslRemoteAccessDisable = useCallback(async (
     body: { confirmElevation?: true; confirmationToken?: string } = {},
   ) => {
+    setRemoteAccessError(null)
     try {
       const result = await api.post<ConfigureFirewallResult>('/api/network/disable-remote-access', body)
       if (result.method === 'confirmation-required') {
@@ -475,6 +489,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
 
       log.warn('Failed to disable WSL remote access', error)
       setRemoteAccessPending(false)
+      setRemoteAccessError(getErrorMessage(error, 'Failed to disable remote access'))
     }
   }, [dispatch, scheduleRemoteAccessRefresh])
 
@@ -1441,12 +1456,16 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
 
           {/* Network Access */}
           <SettingsSection title="Network Access" description="Control how Freshell is accessible on your network">
-            <SettingsRow label="Remote access" description="Allow connections from other devices on your network">
+            <SettingsRow
+              label="Remote access"
+              description={remoteAccessError ?? 'Allow connections from other devices on your network'}
+            >
               <Toggle
                 checked={remoteAccessToggleChecked}
                 disabled={configuring || networkStatus?.rebinding || remoteAccessPending || firewallRepairInProgress}
                 aria-label="Remote access"
                 onChange={async (checked) => {
+                  setRemoteAccessError(null)
                   if (isWslRemoteAccess) {
                     if (checked) {
                       await dispatch(configureNetwork({
@@ -1467,6 +1486,15 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 }}
               />
             </SettingsRow>
+
+            {remoteAccessError && (
+              <div
+                role="alert"
+                className="rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-800 dark:bg-red-950 dark:text-red-300"
+              >
+                {remoteAccessError}
+              </div>
+            )}
 
             {(remoteAccessEnabled || (isWslRemoteAccess && remoteAccessRequested)) && networkStatus && (
               <>

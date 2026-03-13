@@ -10,6 +10,7 @@ import { isWSL2 } from '../../../server/platform.js'
 
 import {
   computeWslPortForwardingPlan,
+  computeWslPortForwardingPlanAsync,
   getWslIp,
   parsePortProxyRules,
   getExistingPortProxyRules,
@@ -608,6 +609,36 @@ LocalPort:                            3001
   })
 
   describe('computeWslPortForwardingTeardownPlanAsync', () => {
+    it('treats a missing Freshell firewall rule as normal absence instead of a fatal async error', async () => {
+      vi.mocked(isWSL2).mockReturnValue(true)
+      vi.mocked(execFile).mockImplementation((_cmd: any, args: any, _opts: any, cb: any) => {
+        if (args[0] === 'interface') {
+          cb?.(null, `
+Listen on ipv4:             Connect to ipv4:
+
+Address         Port        Address         Port
+--------------- ----------  --------------- ----------
+`, '')
+          return {} as any
+        }
+
+        cb?.(
+          Object.assign(new Error('rule not found'), {
+            code: 1,
+            stdout: 'No rules match the specified criteria.\r\n',
+            stderr: '',
+          }),
+          '',
+          '',
+        )
+        return {} as any
+      })
+
+      await expect(computeWslPortForwardingTeardownPlanAsync([3001])).resolves.toEqual({
+        status: 'noop',
+      })
+    })
+
     it('returns an error when async Windows exposure probes fail', async () => {
       vi.mocked(isWSL2).mockReturnValue(true)
       vi.mocked(execFile).mockImplementation((_cmd: any, _args: any, _opts: any, cb: any) => {
@@ -618,6 +649,47 @@ LocalPort:                            3001
       await expect(computeWslPortForwardingTeardownPlanAsync([3001])).resolves.toEqual({
         status: 'error',
         message: 'Failed to query existing Windows remote access rules',
+      })
+    })
+  })
+
+  describe('computeWslPortForwardingPlanAsync', () => {
+    it('treats a missing Freshell firewall rule as drift instead of a fatal async error', async () => {
+      vi.mocked(isWSL2).mockReturnValue(true)
+      vi.mocked(execFile).mockImplementation((cmd: any, args: any, _opts: any, cb: any) => {
+        if (cmd === 'ip') {
+          cb?.(null, 'inet 172.30.149.249/20 scope global eth0\n', '')
+          return {} as any
+        }
+
+        if (args[0] === 'interface') {
+          cb?.(null, `
+Listen on ipv4:             Connect to ipv4:
+
+Address         Port        Address         Port
+--------------- ----------  --------------- ----------
+0.0.0.0         3001        172.30.149.249  3001
+`, '')
+          return {} as any
+        }
+
+        cb?.(
+          Object.assign(new Error('rule not found'), {
+            code: 1,
+            stdout: 'No rules match the specified criteria.\r\n',
+            stderr: '',
+          }),
+          '',
+          '',
+        )
+        return {} as any
+      })
+
+      await expect(computeWslPortForwardingPlanAsync([3001])).resolves.toEqual({
+        status: 'ready',
+        wslIp: '172.30.149.249',
+        scriptKind: 'firewall-only',
+        script: expect.stringContaining('FreshellLANAccess'),
       })
     })
   })

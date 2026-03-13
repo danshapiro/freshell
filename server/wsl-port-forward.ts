@@ -20,6 +20,40 @@ function execFileAsync(command: string, args: string[], options: { encoding: 'ut
   })
 }
 
+function toErrorText(value: unknown): string {
+  if (typeof value === 'string') {
+    return value
+  }
+
+  if (value instanceof Uint8Array) {
+    return Buffer.from(value).toString('utf-8')
+  }
+
+  return ''
+}
+
+function isMissingFirewallRuleError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) {
+    return false
+  }
+
+  const errorLike = error as {
+    message?: unknown
+    stdout?: unknown
+    stderr?: unknown
+  }
+
+  const combinedText = [
+    typeof errorLike.message === 'string' ? errorLike.message : '',
+    toErrorText(errorLike.stdout),
+    toErrorText(errorLike.stderr),
+  ]
+    .filter(Boolean)
+    .join('\n')
+
+  return /no rules match the specified criteria/i.test(combinedText)
+}
+
 export type PortProxyRule = {
   connectAddress: string
   connectPort: number
@@ -216,7 +250,11 @@ async function getExistingFirewallPortsAsync(): Promise<Set<number> | null> {
       { encoding: 'utf-8', timeout: 10000 }
     )
     return parseFirewallRulePorts(stdout)
-  } catch {
+  } catch (error) {
+    if (isMissingFirewallRuleError(error)) {
+      return new Set()
+    }
+
     return null
   }
 }
