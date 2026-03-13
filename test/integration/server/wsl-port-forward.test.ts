@@ -1,6 +1,4 @@
 import { describe, expect, it } from 'vitest'
-import fs from 'node:fs'
-import path from 'node:path'
 
 describe('WSL port forwarding integration', () => {
   it('exports the startup WSL repair helpers alongside the planning helpers', async () => {
@@ -14,13 +12,11 @@ describe('WSL port forwarding integration', () => {
     expect(typeof wslModule.buildFirewallOnlyScript).toBe('function')
   })
 
-  it('server/index.ts wires startup WSL repair through the saved remote-access intent', () => {
-    const indexPath = path.resolve(__dirname, '../../../server/index.ts')
-    const indexContent = fs.readFileSync(indexPath, 'utf8')
+  it('gates startup WSL repair on both the effective bind host and saved remote-access intent', async () => {
+    const { shouldSetupWslPortForwardingAtStartup } = await import('../../../server/wsl-port-forward-startup.js')
 
-    expect(indexContent).toContain("import { setupWslPortForwarding } from './wsl-port-forward.js'")
-    expect(indexContent).toContain("from './wsl-port-forward-startup.js'")
-    expect(indexContent).toContain('shouldSetupWslPortForwardingAtStartup(bindHost, currentSettings.network)')
-    expect(indexContent).toContain('setupWslPortForwarding(vitePort)')
+    expect(shouldSetupWslPortForwardingAtStartup('0.0.0.0', { host: '0.0.0.0', configured: true })).toBe(true)
+    expect(shouldSetupWslPortForwardingAtStartup('0.0.0.0', { host: '127.0.0.1', configured: true })).toBe(false)
+    expect(shouldSetupWslPortForwardingAtStartup('127.0.0.1', { host: '0.0.0.0', configured: true })).toBe(false)
   })
 })

@@ -627,6 +627,7 @@ describe('SetupWizard', () => {
     await waitFor(() => {
       expect(screen.getAllByText(/remote access is not enabled/i)).toHaveLength(2)
       expect(screen.queryByText(/you're all set/i)).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: /configure firewall/i })).not.toBeInTheDocument()
       expect(screen.getByRole('button', { name: /close/i })).toBeInTheDocument()
     })
   })

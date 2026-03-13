@@ -1,4 +1,4 @@
-import { api } from './api'
+import { api, type ApiError } from './api'
 
 export type ConfigureFirewallResult =
   | { method: 'terminal'; command: string }
@@ -35,7 +35,19 @@ export type ConfigureFirewallResult =
 export async function fetchFirewallConfig(
   body: { confirmElevation?: true; confirmationToken?: string } = {},
 ): Promise<ConfigureFirewallResult> {
-  return api.post<ConfigureFirewallResult>('/api/network/configure-firewall', body)
+  try {
+    return await api.post<ConfigureFirewallResult>('/api/network/configure-firewall', body)
+  } catch (error) {
+    const apiError = error as ApiError | undefined
+    const details = apiError?.details as { method?: string; error?: string } | undefined
+    if (apiError?.status === 409 && details?.method === 'in-progress') {
+      return {
+        method: 'in-progress',
+        error: details.error ?? apiError.message,
+      }
+    }
+    throw error
+  }
 }
 
 export async function cancelFirewallConfirmation(confirmationToken: string): Promise<void> {

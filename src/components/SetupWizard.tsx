@@ -420,7 +420,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
             <div className="space-y-1">
               <ChecklistItem label="Binding to network..." status={bindStatus} detail={bindDetail} />
               <ChecklistItem label="Checking firewall..." status={firewallStatus} detail={firewallDetail} />
-              {firewallStatus === 'error' && networkStatus?.firewall && (
+              {bindStatus === 'done' && firewallStatus === 'error' && networkStatus?.firewall && (
                 <button
                   onClick={handleConfigureFirewall}
                   className="ml-8 mt-1 rounded-md border px-3 py-1.5 text-xs font-medium transition-colors hover:bg-muted"

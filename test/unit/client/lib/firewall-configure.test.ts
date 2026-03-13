@@ -73,6 +73,22 @@ describe('fetchFirewallConfig', () => {
     })
   })
 
+  it('translates the API 409 conflict into an in-progress firewall result', async () => {
+    vi.mocked(api.post).mockRejectedValue({
+      status: 409,
+      message: 'Firewall configuration already in progress',
+      details: {
+        error: 'Firewall configuration already in progress',
+        method: 'in-progress',
+      },
+    })
+
+    await expect(fetchFirewallConfig()).resolves.toEqual({
+      method: 'in-progress',
+      error: 'Firewall configuration already in progress',
+    })
+  })
+
   it('posts the server-issued token when canceling a confirmation', async () => {
     vi.mocked(api.post).mockResolvedValue({})
 
