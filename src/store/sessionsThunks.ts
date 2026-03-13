@@ -10,6 +10,7 @@ import {
   setSessionWindowData,
   setSessionWindowError,
   setSessionWindowLoading,
+  type SessionWindowLoadingKind,
 } from './sessionsSlice'
 
 export type SessionSurface = 'sidebar' | 'history' | 'bootstrap'
@@ -126,6 +127,29 @@ function mergeProjects(existing: ProjectGroup[], incoming: ProjectGroup[]): Proj
   return Array.from(projectMap.values())
 }
 
+function getLoadingKind(args: {
+  priority: 'visible' | 'background'
+  append: boolean
+  trimmedQuery: string
+  previousQuery: string
+  previousTier: SearchOptions['tier']
+  nextTier: SearchOptions['tier']
+  hasCommittedWindow: boolean
+  hasCommittedItems: boolean
+}): SessionWindowLoadingKind {
+  if (args.append) return 'pagination'
+  if (args.priority === 'background') return 'background'
+  if (!args.hasCommittedWindow && !args.hasCommittedItems) return 'initial'
+
+  const queryChanged = args.trimmedQuery !== args.previousQuery
+  const tierChanged = args.nextTier !== args.previousTier
+  if (queryChanged || tierChanged || args.trimmedQuery.length > 0 || args.previousQuery.length > 0) {
+    return 'search'
+  }
+
+  return 'background'
+}
+
 export function activateSessionSurface(surface: SessionSurface) {
   return (dispatch: AppDispatch) => {
     dispatch(setActiveSessionSurface(surface))
@@ -137,6 +161,20 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
     const { surface, query = '', searchTier = 'title', append = false } = args
     const trimmedQuery = query.trim()
     const windowState = getState().sessions.windows?.[surface]
+    const previousQuery = (windowState?.query ?? '').trim()
+    const previousTier = windowState?.searchTier ?? 'title'
+    const hasCommittedWindow = typeof windowState?.lastLoadedAt === 'number'
+    const hasCommittedItems = (windowState?.projects ?? []).some((project) => (project.sessions?.length ?? 0) > 0)
+    const loadingKind = getLoadingKind({
+      priority: args.priority,
+      append,
+      trimmedQuery,
+      previousQuery,
+      previousTier,
+      nextTier: searchTier,
+      hasCommittedWindow,
+      hasCommittedItems,
+    })
 
     abortSurface(surface)
     const controller = new AbortController()
@@ -147,6 +185,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
       dispatch(setSessionWindowLoading({
         surface,
         loading: true,
+        loadingKind,
         query: trimmedQuery,
         searchTier,
       }))
@@ -278,7 +317,7 @@ export function queueActiveSessionWindowRefresh() {
           const windowState = getState().sessions.windows[activeSurface]
           await dispatch(fetchSessionWindow({
             surface: activeSurface,
-            priority: 'visible',
+            priority: 'background',
             query: windowState?.query,
             searchTier: windowState?.searchTier,
           }) as any)

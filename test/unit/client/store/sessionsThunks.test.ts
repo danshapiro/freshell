@@ -146,8 +146,30 @@ describe('sessionsThunks', () => {
     const deferred = createDeferred<any>()
     searchSessions.mockReturnValueOnce(deferred.promise)
 
-    const store = createStore()
-    store.dispatch(setActiveSessionSurface('sidebar'))
+    const loadedProjects = [{
+      projectPath: '/tmp/project-alpha',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-alpha',
+        projectPath: '/tmp/project-alpha',
+        updatedAt: 1_000,
+        title: 'Alpha',
+      }],
+    }]
+
+    const store = createStoreWithSessions({
+      activeSurface: 'sidebar',
+      projects: loadedProjects,
+      lastLoadedAt: 1_000,
+      windows: {
+        sidebar: {
+          projects: loadedProjects,
+          lastLoadedAt: 1_000,
+          query: '',
+          searchTier: 'title',
+        },
+      },
+    })
 
     const request = store.dispatch(fetchSessionWindow({
       surface: 'sidebar',

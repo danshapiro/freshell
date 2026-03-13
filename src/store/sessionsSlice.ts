@@ -1,6 +1,22 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import type { ProjectGroup } from './types'
 
+export type SessionWindowLoadingKind = 'initial' | 'search' | 'background' | 'pagination'
+
+export interface SessionWindowState {
+  projects: ProjectGroup[]
+  lastLoadedAt?: number
+  totalSessions?: number
+  oldestLoadedTimestamp?: number
+  oldestLoadedSessionId?: string
+  hasMore?: boolean
+  loading?: boolean
+  loadingKind?: SessionWindowLoadingKind
+  error?: string
+  query?: string
+  searchTier?: 'title' | 'userMessages' | 'fullText'
+}
+
 function sessionKey(s: any): string {
   return `${s.provider || 'claude'}:${s.sessionId}`
 }
@@ -76,19 +92,9 @@ export interface SessionsState {
   oldestLoadedSessionId?: string
   hasMore?: boolean
   loadingMore?: boolean
+  loadingKind?: SessionWindowLoadingKind
   activeSurface?: string
-  windows: Record<string, {
-    projects: ProjectGroup[]
-    lastLoadedAt?: number
-    totalSessions?: number
-    oldestLoadedTimestamp?: number
-    oldestLoadedSessionId?: string
-    hasMore?: boolean
-    loading?: boolean
-    error?: string
-    query?: string
-    searchTier?: 'title' | 'userMessages' | 'fullText'
-  }>
+  windows: Record<string, SessionWindowState>
 }
 
 const initialState: SessionsState = {
@@ -98,7 +104,7 @@ const initialState: SessionsState = {
   windows: {},
 }
 
-function ensureWindow(state: SessionsState, surface: string) {
+function ensureWindow(state: SessionsState, surface: string): SessionWindowState {
   if (!state.windows) {
     state.windows = {}
   }
@@ -120,6 +126,7 @@ function syncTopLevelFromWindow(state: SessionsState, surface: string) {
   state.oldestLoadedSessionId = window.oldestLoadedSessionId
   state.hasMore = window.hasMore
   state.loadingMore = window.loading
+  state.loadingKind = window.loadingKind
 }
 
 function syncActiveWindowFromTopLevel(state: SessionsState) {
@@ -132,6 +139,7 @@ function syncActiveWindowFromTopLevel(state: SessionsState) {
   window.oldestLoadedSessionId = state.oldestLoadedSessionId
   window.hasMore = state.hasMore
   window.loading = state.loadingMore
+  window.loadingKind = state.loadingKind
 }
 
 export const sessionsSlice = createSlice({
@@ -155,20 +163,29 @@ export const sessionsSlice = createSlice({
           oldestLoadedSessionId: state.oldestLoadedSessionId,
           hasMore: state.hasMore,
           loading: state.loadingMore,
+          loadingKind: state.loadingKind,
         }
       }
       syncTopLevelFromWindow(state, action.payload)
     },
     setSessionWindowLoading: (
       state,
-      action: PayloadAction<{ surface: string; loading: boolean; query?: string; searchTier?: 'title' | 'userMessages' | 'fullText' }>,
+      action: PayloadAction<{
+        surface: string
+        loading: boolean
+        loadingKind?: SessionWindowLoadingKind
+        query?: string
+        searchTier?: 'title' | 'userMessages' | 'fullText'
+      }>,
     ) => {
       const window = ensureWindow(state, action.payload.surface)
       window.loading = action.payload.loading
+      window.loadingKind = action.payload.loading ? action.payload.loadingKind : undefined
       if (action.payload.query !== undefined) window.query = action.payload.query
       if (action.payload.searchTier !== undefined) window.searchTier = action.payload.searchTier
       if (state.activeSurface === action.payload.surface) {
         state.loadingMore = action.payload.loading
+        state.loadingKind = action.payload.loading ? action.payload.loadingKind : undefined
       }
     },
     setSessionWindowError: (
@@ -177,6 +194,12 @@ export const sessionsSlice = createSlice({
     ) => {
       const window = ensureWindow(state, action.payload.surface)
       window.error = action.payload.error
+      if (action.payload.error !== undefined) {
+        window.loadingKind = undefined
+        if (state.activeSurface === action.payload.surface) {
+          state.loadingKind = undefined
+        }
+      }
     },
     setSessionWindowData: (
       state,
@@ -199,6 +222,7 @@ export const sessionsSlice = createSlice({
       window.oldestLoadedSessionId = action.payload.oldestLoadedSessionId
       window.hasMore = action.payload.hasMore
       window.loading = false
+      window.loadingKind = undefined
       window.error = undefined
       if (action.payload.query !== undefined) window.query = action.payload.query
       if (action.payload.searchTier !== undefined) window.searchTier = action.payload.searchTier
@@ -228,6 +252,7 @@ export const sessionsSlice = createSlice({
       state.oldestLoadedSessionId = undefined
       state.hasMore = undefined
       state.loadingMore = undefined
+      state.loadingKind = undefined
       if (state.activeSurface) {
         state.windows[state.activeSurface] = {
           projects: [],
@@ -310,6 +335,7 @@ export const sessionsSlice = createSlice({
       state.oldestLoadedSessionId = undefined
       state.hasMore = undefined
       state.loadingMore = undefined
+      state.loadingKind = undefined
       syncActiveWindowFromTopLevel(state)
     },
     setPaginationMeta: (
@@ -365,12 +391,16 @@ export const sessionsSlice = createSlice({
       state.projects = sortProjectsByRecency(Array.from(projectMap.values()))
       state.lastLoadedAt = Date.now()
       state.loadingMore = false
+      state.loadingKind = undefined
       const valid = new Set(state.projects.map((p) => p.projectPath))
       state.expandedProjects = new Set(Array.from(state.expandedProjects).filter((k) => valid.has(k)))
       syncActiveWindowFromTopLevel(state)
     },
     setLoadingMore: (state, action: PayloadAction<boolean>) => {
       state.loadingMore = action.payload
+      if (!action.payload) {
+        state.loadingKind = undefined
+      }
       syncActiveWindowFromTopLevel(state)
     },
     toggleProjectExpanded: (state, action: PayloadAction<string>) => {
