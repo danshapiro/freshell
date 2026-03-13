@@ -8,6 +8,7 @@ export type ConfigureFirewallResult =
     title: string
     body: string
     confirmLabel: string
+    confirmationToken: string
   }
   | { method: 'none'; message?: string }
   | { method: 'in-progress'; error: string }
@@ -23,12 +24,16 @@ export type ConfigureFirewallResult =
  * For 'wsl2'/'windows-elevated': caller polls /api/network/status.
  *
  * For 'confirmation-required': caller prompts the user, then retries with
- * `{ confirmElevation: true }` if they accept.
+ * `{ confirmElevation: true, confirmationToken }` using the server-issued
+ * `confirmationToken` if they accept.
+ *
+ * For 'in-progress': another confirmed repair is already running, so the caller
+ * should follow status instead of retrying blindly.
  *
  * For 'none': nothing to do.
  */
 export async function fetchFirewallConfig(
-  body: { confirmElevation?: true } = {},
+  body: { confirmElevation?: true; confirmationToken?: string } = {},
 ): Promise<ConfigureFirewallResult> {
   return api.post<ConfigureFirewallResult>('/api/network/configure-firewall', body)
 }
