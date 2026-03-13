@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { execSync } from 'child_process'
+import { execFile, execSync } from 'child_process'
 
 vi.mock('child_process')
 vi.mock('../../../server/platform.js', () => ({
@@ -22,6 +22,7 @@ import {
   buildFirewallOnlyScript,
   buildPortForwardingTeardownScript,
   computeWslPortForwardingTeardownPlan,
+  computeWslPortForwardingTeardownPlanAsync,
   type PortProxyRule
 } from '../../../server/wsl-port-forward.js'
 
@@ -602,6 +603,21 @@ LocalPort:                            3001
       expect(computeWslPortForwardingTeardownPlan([3001])).toEqual({
         status: 'ready',
         script: buildPortForwardingTeardownScript([3001]).replace(/\\\$/g, '$'),
+      })
+    })
+  })
+
+  describe('computeWslPortForwardingTeardownPlanAsync', () => {
+    it('returns an error when async Windows exposure probes fail', async () => {
+      vi.mocked(isWSL2).mockReturnValue(true)
+      vi.mocked(execFile).mockImplementation((_cmd: any, _args: any, _opts: any, cb: any) => {
+        cb?.(new Error('netsh failed'))
+        return {} as any
+      })
+
+      await expect(computeWslPortForwardingTeardownPlanAsync([3001])).resolves.toEqual({
+        status: 'error',
+        message: 'Failed to query existing Windows remote access rules',
       })
     })
   })

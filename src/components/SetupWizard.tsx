@@ -33,6 +33,7 @@ interface SetupWizardProps {
 type ChecklistItemStatus = 'pending' | 'active' | 'done' | 'error'
 type FirewallConfirmation = Extract<ConfigureFirewallResult, { method: 'confirmation-required' }>
 type FirewallState = NetworkStatusResponse['firewall']
+type FirewallChecklistStatus = Pick<NetworkStatusResponse, 'firewall' | 'host' | 'remoteAccessEnabled'>
 
 function isRemoteAccessBindRequested(status: NetworkStatusResponse | null): boolean {
   if (status === null || status.host !== '0.0.0.0') {
@@ -46,7 +47,8 @@ function isBoundToAllInterfaces(status: NetworkStatusResponse | null): boolean {
   return status?.host === '0.0.0.0'
 }
 
-function getFirewallChecklistState(firewall: FirewallState): { status: ChecklistItemStatus; detail: string } {
+function getFirewallChecklistState(status: FirewallChecklistStatus): { status: ChecklistItemStatus; detail: string } {
+  const { firewall } = status
   if (firewall.portOpen === true) {
     return { status: 'done', detail: 'Port is open' }
   }
@@ -55,7 +57,7 @@ function getFirewallChecklistState(firewall: FirewallState): { status: Checklist
     return { status: 'active', detail: 'Firewall configuration already in progress' }
   }
 
-  if (firewall.platform === 'wsl2' && firewall.portOpen === false) {
+  if (firewall.platform === 'wsl2' && !isRemoteAccessEnabledStatus(status)) {
     return { status: 'error', detail: 'Port may be blocked by firewall' }
   }
 
@@ -148,8 +150,8 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
     }
   }, [bindStatus, configuring, networkStatus])
 
-  const applyFirewallChecklistState = useCallback((firewall: FirewallState) => {
-    const next = getFirewallChecklistState(firewall)
+  const applyFirewallChecklistState = useCallback((status: FirewallChecklistStatus) => {
+    const next = getFirewallChecklistState(status)
     setFirewallStatus(next.status)
     setFirewallDetail(next.detail)
   }, [])
@@ -157,18 +159,23 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
   // Check firewall status after bind completes
   useEffect(() => {
     if (bindStatus === 'done' && networkStatus?.firewall) {
-      applyFirewallChecklistState(networkStatus.firewall)
+      applyFirewallChecklistState(networkStatus)
     }
-  }, [applyFirewallChecklistState, bindStatus, networkStatus?.firewall])
+  }, [applyFirewallChecklistState, bindStatus, networkStatus])
 
   // Auto-advance to step 3 when all checklist items are done.
   // Firewall errors stay on step 2 so the user can see and act on them.
   useEffect(() => {
-    if (step === 2 && bindStatus === 'done' && firewallStatus === 'done') {
+    if (
+      step === 2
+      && bindStatus === 'done'
+      && firewallStatus === 'done'
+      && (networkStatus?.firewall.platform !== 'wsl2' || isRemoteAccessEnabledStatus(networkStatus))
+    ) {
       const timer = setTimeout(() => setStep(3), SETUP_WIZARD_AUTO_ADVANCE_DELAY_MS)
       return () => clearTimeout(timer)
     }
-  }, [step, bindStatus, firewallStatus])
+  }, [step, bindStatus, firewallStatus, networkStatus])
 
   // Start binding when entering step 2 directly (e.g. re-enabling remote access
   // from share button after the user previously chose localhost-only).
@@ -260,6 +267,9 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
           } else if (action.firewall.portOpen === false) {
             setFirewallStatus('error')
             setFirewallDetail('Firewall configuration did not open the port')
+          } else if (action.firewall.platform === 'wsl2' && !isRemoteAccessEnabledStatus(action)) {
+            setFirewallStatus('error')
+            setFirewallDetail('Port may be blocked by firewall')
           } else {
             setFirewallStatus('done')
             setFirewallDetail('Firewall configured')
@@ -292,7 +302,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
         setFirewallDetail('Remote access is not enabled')
         return
       }
-      applyFirewallChecklistState(action.firewall)
+      applyFirewallChecklistState(action)
     } catch {
       setFirewallStatus('error')
       setFirewallDetail('Failed to refresh firewall status')

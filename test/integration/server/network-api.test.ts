@@ -1424,5 +1424,33 @@ describe('Network API integration', () => {
       finishRepair?.()
       networkManager.setFirewallConfiguring(false)
     })
+
+    it('returns the teardown probe failure instead of treating it as a successful noop', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+      vi.mocked(wslModule.computeWslPortForwardingTeardownPlanAsync).mockResolvedValue({
+        status: 'error',
+        message: 'Failed to query existing Windows remote access rules',
+      })
+
+      const cp = await import('node:child_process')
+      const res = await request(app)
+        .post('/api/network/disable-remote-access')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(res.status).toBe(500)
+      expect(res.body).toEqual({ error: 'Failed to query existing Windows remote access rules' })
+      expect(cp.execFile).not.toHaveBeenCalled()
+
+      const settings = await configStore.getSettings()
+      expect(settings.network).toEqual(expect.objectContaining({
+        configured: true,
+        host: '0.0.0.0',
+      }))
+    })
   })
 })

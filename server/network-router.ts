@@ -273,6 +273,10 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
     const remoteAccessRequested = isRemoteAccessEnabled(settings.network, status.host, status.firewall.platform)
     const teardownPlan = await computeWslPortForwardingTeardownPlanAsync(networkManager.getRelevantPorts())
 
+    if (teardownPlan.status === 'error') {
+      return { kind: 'error', error: teardownPlan.message }
+    }
+
     if (teardownPlan.status === 'not-wsl2') {
       return { kind: 'none', response: REMOTE_ACCESS_DISABLED }
     }

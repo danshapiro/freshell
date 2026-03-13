@@ -837,4 +837,36 @@ describe('SetupWizard', () => {
     expect(screen.getByText(/dev mode/i)).toBeInTheDocument()
     expect(screen.getByText(/npm run dev/i)).toBeInTheDocument()
   })
+
+  it('does not auto-advance on WSL when port reachability is still unknown and remote access is not yet enabled', async () => {
+    const firewallPending = { platform: 'wsl2', active: true, portOpen: null, commands: [], configuring: false }
+    const store = createTestStore({
+      status: {
+        ...defaultNetworkStatus,
+        configured: true,
+        host: '0.0.0.0',
+        remoteAccessEnabled: false,
+        remoteAccessRequested: true,
+        accessUrl: 'http://localhost:3001/?token=abc',
+        firewall: firewallPending,
+        rebinding: false,
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <SetupWizard onComplete={vi.fn()} initialStep={2} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText(/setting up remote access/i)).toBeInTheDocument()
+      expect(screen.getByText(/bound to all interfaces/i)).toBeInTheDocument()
+    })
+
+    expect(screen.queryByText(/you're all set/i)).not.toBeInTheDocument()
+    expect(screen.queryByRole('img', { name: /qr code for access url/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /copy url/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /configure firewall/i })).toBeInTheDocument()
+  })
 })

@@ -1,11 +1,24 @@
 import { execFile, execSync } from 'child_process'
-import { promisify } from 'util'
 import { isWSL2 } from './platform.js'
 
 const IPV4_REGEX = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/
 const NETSH_PATH = '/mnt/c/Windows/System32/netsh.exe'
 const DEFAULT_PORT = 3001
-const execFileAsync = promisify(execFile)
+function execFileAsync(command: string, args: string[], options: { encoding: 'utf-8'; timeout: number }) {
+  return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    execFile(command, args, options, (error, stdout, stderr) => {
+      if (error) {
+        reject(error)
+        return
+      }
+
+      resolve({
+        stdout: typeof stdout === 'string' ? stdout : stdout.toString(),
+        stderr: typeof stderr === 'string' ? stderr : stderr.toString(),
+      })
+    })
+  })
+}
 
 export type PortProxyRule = {
   connectAddress: string
@@ -146,7 +159,7 @@ export function getRequiredPorts(devPort?: number): number[] {
   return Array.from(ports)
 }
 
-async function getExistingPortProxyRulesAsync(): Promise<Map<number, PortProxyRule>> {
+async function getExistingPortProxyRulesAsync(): Promise<Map<number, PortProxyRule> | null> {
   try {
     const { stdout } = await execFileAsync(
       NETSH_PATH,
@@ -155,7 +168,7 @@ async function getExistingPortProxyRulesAsync(): Promise<Map<number, PortProxyRu
     )
     return parsePortProxyRules(stdout)
   } catch {
-    return new Map()
+    return null
   }
 }
 
@@ -195,7 +208,7 @@ export function getExistingFirewallPorts(): Set<number> {
   }
 }
 
-async function getExistingFirewallPortsAsync(): Promise<Set<number>> {
+async function getExistingFirewallPortsAsync(): Promise<Set<number> | null> {
   try {
     const { stdout } = await execFileAsync(
       NETSH_PATH,
@@ -204,7 +217,7 @@ async function getExistingFirewallPortsAsync(): Promise<Set<number>> {
     )
     return parseFirewallRulePorts(stdout)
   } catch {
-    return new Set()
+    return null
   }
 }
 
@@ -320,6 +333,7 @@ export type WslPortForwardingPlan =
 
 export type WslPortForwardingTeardownPlan =
   | { status: 'not-wsl2' }
+  | { status: 'error'; message: string }
   | { status: 'noop' }
   | { status: 'ready'; script: string }
 
@@ -411,6 +425,13 @@ export async function computeWslPortForwardingPlanAsync(requiredPorts: number[])
     getExistingFirewallPortsAsync(),
   ])
 
+  if (existingRules === null || existingFirewallPorts === null) {
+    return {
+      status: 'error',
+      message: 'Failed to query existing Windows remote access rules',
+    }
+  }
+
   return buildWslPortForwardingPlan(requiredPorts, wslIp, existingRules, existingFirewallPorts)
 }
 
@@ -436,6 +457,13 @@ export async function computeWslPortForwardingTeardownPlanAsync(
     getExistingPortProxyRulesAsync(),
     getExistingFirewallPortsAsync(),
   ])
+
+  if (existingRules === null || existingFirewallPorts === null) {
+    return {
+      status: 'error',
+      message: 'Failed to query existing Windows remote access rules',
+    }
+  }
 
   return buildWslPortForwardingTeardownPlan(requiredPorts, existingRules, existingFirewallPorts)
 }
