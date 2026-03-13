@@ -228,7 +228,7 @@ describe('Network API integration', () => {
       expect(addr && typeof addr === 'object' ? addr.address : null).toBe('0.0.0.0')
     })
 
-    it('keeps Windows firewall repair available in dev mode when only the Vite port is reachable', async () => {
+    it('treats dev mode firewall repair as satisfied when the advertised Vite port is already reachable', async () => {
       const devConfigStore = new ConfigStore()
       const devServer = http.createServer()
       const devNetworkManager = new NetworkManager(devServer, devConfigStore, 3001, true, 5173)
@@ -264,7 +264,10 @@ describe('Network API integration', () => {
           .send({})
 
         expect(res.status).toBe(200)
-        expectConfirmationRequired(res.body)
+        expect(res.body).toEqual({
+          method: 'none',
+          message: 'No configuration changes required',
+        })
       } finally {
         await devNetworkManager.stop()
         await new Promise<void>((resolve, reject) => {
@@ -1206,6 +1209,8 @@ describe('Network API integration', () => {
       expect(startedRes.status).toBe(200)
       expect(startedRes.body).toEqual({ method: 'wsl2', status: 'started' })
 
+      vi.mocked(wslModule.computeWslPortForwardingPlanAsync).mockClear()
+
       const secondFirstRes = await request(app)
         .post('/api/network/configure-firewall')
         .set('x-auth-token', token)
@@ -1230,6 +1235,7 @@ describe('Network API integration', () => {
         error: 'Firewall configuration already in progress',
         method: 'in-progress',
       })
+      expect(wslModule.computeWslPortForwardingPlanAsync).not.toHaveBeenCalled()
 
       finishRepair?.()
       networkManager.setFirewallConfiguring(false)

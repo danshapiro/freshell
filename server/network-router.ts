@@ -67,6 +67,7 @@ export interface NetworkRouterDeps {
     getStatus: () => Promise<any>
     configure: (data: any) => Promise<{ rebindScheduled: boolean }>
     getRelevantPorts: () => number[]
+    getRemoteAccessPorts: () => number[]
     setFirewallConfiguring: (v: boolean) => void
     resetFirewallCache: () => void
   }
@@ -220,7 +221,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
         return { kind: 'none', response: NO_CONFIGURATION_CHANGES_REQUIRED }
       }
 
-      const plan = await computeWslPortForwardingPlanAsync(networkManager.getRelevantPorts())
+      const plan = await computeWslPortForwardingPlanAsync(networkManager.getRemoteAccessPorts())
       if (plan.status === 'error') {
         return { kind: 'error', error: plan.message }
       }
@@ -271,7 +272,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
     }
 
     const remoteAccessRequested = isRemoteAccessEnabled(settings.network, status.host, status.firewall.platform)
-    const teardownPlan = await computeWslPortForwardingTeardownPlanAsync(networkManager.getRelevantPorts())
+    const teardownPlan = await computeWslPortForwardingTeardownPlanAsync(networkManager.getRemoteAccessPorts())
 
     if (teardownPlan.status === 'error') {
       return { kind: 'error', error: teardownPlan.message }
@@ -481,6 +482,13 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
     }
 
     try {
+      if (confirmedRepairInFlight) {
+        return res.status(409).json({
+          error: 'Firewall configuration already in progress',
+          method: 'in-progress',
+        })
+      }
+
       const confirmElevation = parsed.data.confirmElevation === true
       const confirmationToken = parsed.data.confirmationToken
       const [status, settings] = await Promise.all([

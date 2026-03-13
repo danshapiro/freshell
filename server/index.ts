@@ -666,6 +666,8 @@ async function main() {
 
   server.listen(port, bindHost, () => {
     log.info({ event: 'server_listening', port, host: bindHost, appVersion: APP_VERSION }, 'Server listening')
+    startBackgroundTasks()
+
     void (async () => {
       const token = process.env.AUTH_TOKEN
       const visitPort = resolveVisitPort(port, process.env)
@@ -709,8 +711,6 @@ async function main() {
         console.log(`   \x1b[33m(dev mode: Vite client on port ${visitPort}, Express server on port ${port})\x1b[0m`)
       }
       console.log('')
-
-      startBackgroundTasks()
     })()
   })
 

@@ -108,7 +108,7 @@ export class NetworkManager {
     this.ensureLanIps()
     const firewallInfo = await this.getFirewallInfo()
 
-    const ports = this.getRelevantPorts()
+    const remoteAccessPorts = this.getRemoteAccessPorts()
 
     // Use the actual server bind address, not the config value. On WSL2
     // the server binds to 0.0.0.0 regardless of config (for Windows host
@@ -126,7 +126,7 @@ export class NetworkManager {
     let portOpen: boolean | null = null
     if (effectiveHost === '0.0.0.0' && this.lanIps.length > 0) {
       const probeResults = await Promise.all(
-        ports.map(async (port) => {
+        remoteAccessPorts.map(async (port) => {
           try {
             return await isPortReachable(port, { host: this.lanIps[0], timeout: 2000 })
           } catch {
@@ -145,7 +145,7 @@ export class NetworkManager {
     }
 
     const commands = firewallInfo.active
-      ? firewallCommands(firewallInfo.platform, ports)
+      ? firewallCommands(firewallInfo.platform, remoteAccessPorts)
       : []
 
     const remoteAccessRequested = isRemoteAccessEnabled(network, effectiveHost, firewallInfo.platform)
@@ -332,6 +332,13 @@ export class NetworkManager {
       ports.push(this.devPort)
     }
     return ports
+  }
+
+  getRemoteAccessPorts(): number[] {
+    if (this.devMode && this.devPort) {
+      return [this.devPort]
+    }
+    return [this.port]
   }
 
   private ensureLanIps(): void {

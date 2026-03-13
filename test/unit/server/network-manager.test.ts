@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import http from 'node:http'
 import { NetworkManager } from '../../../server/network-manager.js'
 import { detectLanIps } from '../../../server/bootstrap.js'
-import { detectFirewall } from '../../../server/firewall.js'
+import { detectFirewall, firewallCommands } from '../../../server/firewall.js'
 
 // Mock external dependencies
 vi.mock('../../../server/bootstrap.js', () => ({
@@ -258,13 +258,15 @@ describe('NetworkManager', () => {
     expect(status.devMode).toBe(true)
   })
 
-  it('marks portOpen false in dev mode when any relevant port is unreachable', async () => {
+  it('treats dev mode remote access as healthy when the advertised Vite port is reachable', async () => {
     const firewallModule = await import('../../../server/firewall.js')
     const portReachable = await import('is-port-reachable')
     vi.mocked(firewallModule.detectFirewall).mockResolvedValue({
       platform: 'windows',
       active: true,
     })
+    vi.mocked(firewallCommands).mockClear()
+    vi.mocked(portReachable.default).mockClear()
     vi.mocked(portReachable.default).mockImplementation(async (port) => port === 5173)
     mockConfigStore = createMockConfigStore({
       network: {
@@ -277,9 +279,10 @@ describe('NetworkManager', () => {
 
     const status = await manager.getStatus()
 
-    expect(status.firewall.portOpen).toBe(false)
+    expect(status.firewall.portOpen).toBe(true)
     const probedPorts = vi.mocked(portReachable.default).mock.calls.map(([port]) => port)
-    expect(probedPorts).toEqual(expect.arrayContaining([9876, 5173]))
+    expect(probedPorts).toEqual([5173])
+    expect(vi.mocked(firewallCommands)).toHaveBeenCalledWith('windows', [5173])
   })
 
   it('preserves WsHandler across rebind via prepareForRebind/resumeAfterRebind', async () => {

@@ -35,6 +35,7 @@ describe('LAN Info API', () => {
         getStatus: async () => ({}),
         configure: async () => ({ rebindScheduled: false }),
         getRelevantPorts: () => [],
+        getRemoteAccessPorts: () => [],
         setFirewallConfiguring: () => {},
         resetFirewallCache: () => {},
       },
