@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { ensureBuiltServerEntry } from '../../../setup/server-global-setup.js'
+import { ensureBuiltServerEntry, installBuiltServerEntryRefresh } from '../../../setup/server-global-setup.js'
 
 describe('ensureBuiltServerEntry', () => {
   it('rebuilds dist/server before the parallel server suite', () => {
@@ -58,5 +58,27 @@ describe('ensureBuiltServerEntry', () => {
       },
       stdio: 'inherit',
     })
+  })
+
+  it('rebuilds dist/server on every watch rerun', async () => {
+    let rerunHandler: ((testFiles: unknown[]) => Promise<void> | void) | undefined
+    const ensureBuiltServerEntry = vi.fn()
+
+    installBuiltServerEntryRefresh({
+      onTestsRerun(handler) {
+        rerunHandler = handler
+      },
+    }, '/repo', {
+      ensureBuiltServerEntry,
+    })
+
+    expect(ensureBuiltServerEntry).toHaveBeenCalledTimes(1)
+    expect(ensureBuiltServerEntry).toHaveBeenNthCalledWith(1, '/repo')
+    expect(rerunHandler).toBeTypeOf('function')
+
+    await rerunHandler?.([])
+
+    expect(ensureBuiltServerEntry).toHaveBeenCalledTimes(2)
+    expect(ensureBuiltServerEntry).toHaveBeenNthCalledWith(2, '/repo')
   })
 })

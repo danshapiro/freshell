@@ -71,6 +71,21 @@ export function applyIsolatedHomeEnvironment(
   return nextEnv
 }
 
+export function applyTestServerHomeEnvironment(
+  env: Record<string, string>,
+  homeDir: string,
+  runtimeRootMode: TestServerOptions['runtimeRootMode'] = 'project',
+): Record<string, string> {
+  if (runtimeRootMode === 'isolated') {
+    return applyIsolatedHomeEnvironment(env, homeDir)
+  }
+
+  return {
+    ...env,
+    HOME: homeDir,
+  }
+}
+
 export function requireBuiltServerEntry(
   projectRoot: string,
   existsSync: (filePath: string) => boolean = fs.existsSync,
@@ -265,7 +280,7 @@ export class TestServer {
       const serverEntry = requireBuiltServerEntry(runtimeRoot)
 
       const authStrategy = this.options.authStrategy ?? 'explicit-env'
-      const env = applyIsolatedHomeEnvironment({
+      const env = applyTestServerHomeEnvironment({
         ...process.env as Record<string, string>,
         PORT: String(port),
         NODE_ENV: 'production',
@@ -275,7 +290,7 @@ export class TestServer {
         // requires a UAC prompt and blocks server startup for 60s).
         FRESHELL_BIND_HOST: '127.0.0.1',
         ...this.options.env,
-      }, homeDir)
+      }, homeDir, runtimeRootMode)
 
       if (authStrategy === 'explicit-env') {
         env.AUTH_TOKEN = explicitToken

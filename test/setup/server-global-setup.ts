@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import type { GlobalSetupContext } from 'vitest/node'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -10,6 +11,10 @@ interface EnsureBuiltServerEntryDeps {
   execFileSync: typeof execFileSync
   env: NodeJS.ProcessEnv
   platform: NodeJS.Platform
+}
+
+interface InstallBuiltServerEntryRefreshDeps {
+  ensureBuiltServerEntry: (projectRoot: string) => void
 }
 
 export function ensureBuiltServerEntry(
@@ -33,6 +38,19 @@ export function ensureBuiltServerEntry(
   })
 }
 
-export default async function globalSetup(): Promise<void> {
-  ensureBuiltServerEntry(PROJECT_ROOT)
+export function installBuiltServerEntryRefresh(
+  project: Pick<GlobalSetupContext, 'onTestsRerun'>,
+  projectRoot: string,
+  deps: InstallBuiltServerEntryRefreshDeps = {
+    ensureBuiltServerEntry: (root) => ensureBuiltServerEntry(root),
+  },
+): void {
+  deps.ensureBuiltServerEntry(projectRoot)
+  project.onTestsRerun(() => {
+    deps.ensureBuiltServerEntry(projectRoot)
+  })
+}
+
+export default async function globalSetup(project: GlobalSetupContext): Promise<void> {
+  installBuiltServerEntryRefresh(project, PROJECT_ROOT)
 }

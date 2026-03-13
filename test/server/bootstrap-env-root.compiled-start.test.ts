@@ -4,11 +4,11 @@ import { fileURLToPath } from 'node:url'
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { TestServer } from '../../e2e-browser/helpers/test-server.js'
+import { TestServer } from '../e2e-browser/helpers/test-server.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
-const PROJECT_ROOT = path.resolve(__dirname, '../../..')
+const PROJECT_ROOT = path.resolve(__dirname, '../..')
 
 vi.setConfig({ testTimeout: 120_000, hookTimeout: 120_000 })
 

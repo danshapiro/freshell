@@ -2,7 +2,12 @@ import fs from 'fs/promises'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { describe, it, expect, afterEach, vi } from 'vitest'
-import { applyIsolatedHomeEnvironment, requireBuiltServerEntry, TestServer } from './test-server.js'
+import {
+  applyIsolatedHomeEnvironment,
+  applyTestServerHomeEnvironment,
+  requireBuiltServerEntry,
+  TestServer,
+} from './test-server.js'
 
 function resolveProjectRoot(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..')
@@ -95,6 +100,28 @@ describe('TestServer', () => {
     expect(env.CODEX_HOME).toBe('D:\\Temp\\freshell-e2e-home\\.codex')
     expect(env.XDG_DATA_HOME).toBe('D:\\Temp\\freshell-e2e-home\\.local\\share')
     expect(env.LOCALAPPDATA).toBe('D:\\Temp\\freshell-e2e-home\\AppData\\Local')
+  })
+
+  it('preserves inherited Windows shell env vars for project-root starts', () => {
+    const env = applyTestServerHomeEnvironment({
+      HOME: '/real/home',
+      USERPROFILE: 'C:\\Users\\real-user',
+      HOMEDRIVE: 'C:',
+      HOMEPATH: '\\Users\\real-user',
+      CLAUDE_HOME: '/real/.claude',
+      CODEX_HOME: '/real/.codex',
+      XDG_DATA_HOME: '/real/.local/share',
+      LOCALAPPDATA: 'C:\\Users\\real-user\\AppData\\Local',
+    }, '/tmp/freshell-e2e-home')
+
+    expect(env.HOME).toBe('/tmp/freshell-e2e-home')
+    expect(env.USERPROFILE).toBe('C:\\Users\\real-user')
+    expect(env.HOMEDRIVE).toBe('C:')
+    expect(env.HOMEPATH).toBe('\\Users\\real-user')
+    expect(env.CLAUDE_HOME).toBe('/real/.claude')
+    expect(env.CODEX_HOME).toBe('/real/.codex')
+    expect(env.XDG_DATA_HOME).toBe('/real/.local/share')
+    expect(env.LOCALAPPDATA).toBe('C:\\Users\\real-user\\AppData\\Local')
   })
 
   it('reports the build-first guidance before isolated staging when the compiled server is missing', () => {
