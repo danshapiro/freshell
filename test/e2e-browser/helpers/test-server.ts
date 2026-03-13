@@ -70,12 +70,30 @@ function findProjectRoot(): string {
   throw new Error('Could not find project root (no package.json found)')
 }
 
+async function copyPathIfPresent(projectRoot: string, runtimeRoot: string, relativePath: string): Promise<void> {
+  const sourcePath = path.join(projectRoot, relativePath)
+  if (!fs.existsSync(sourcePath)) return
+
+  const targetPath = path.join(runtimeRoot, relativePath)
+  const stat = await fsp.stat(sourcePath)
+  if (stat.isDirectory()) {
+    await fsp.cp(sourcePath, targetPath, { recursive: true })
+    return
+  }
+
+  await fsp.mkdir(path.dirname(targetPath), { recursive: true })
+  await fsp.copyFile(sourcePath, targetPath)
+}
+
 async function createIsolatedRuntimeRoot(projectRoot: string): Promise<string> {
   const runtimeRootsParent = path.join(projectRoot, '.worktrees')
   await fsp.mkdir(runtimeRootsParent, { recursive: true })
   const runtimeRoot = await fsp.mkdtemp(path.join(runtimeRootsParent, 'test-server-runtime-'))
-  await fsp.copyFile(path.join(projectRoot, 'package.json'), path.join(runtimeRoot, 'package.json'))
-  await fsp.cp(path.join(projectRoot, 'dist'), path.join(runtimeRoot, 'dist'), { recursive: true })
+  await copyPathIfPresent(projectRoot, runtimeRoot, 'package.json')
+  await copyPathIfPresent(projectRoot, runtimeRoot, 'dist')
+  await copyPathIfPresent(projectRoot, runtimeRoot, 'extensions')
+  await copyPathIfPresent(projectRoot, runtimeRoot, '.claude')
+  await copyPathIfPresent(projectRoot, runtimeRoot, path.join('.freshell', 'extensions'))
   return runtimeRoot
 }
 
@@ -114,137 +132,30 @@ export class TestServer {
     return this._info
   }
 
-  async start(): Promise<TestServerInfo> {
-    if (this.process) throw new Error('TestServer already started')
-
-    const explicitToken = randomUUID()
-    const port = await findFreePort()
-    this.configDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-e2e-'))
-    const homeDir = this.configDir
-
-    if (this.options.setupHome) {
-      await this.options.setupHome(homeDir)
+  private async cleanupArtifacts(forceRemoveHome: boolean): Promise<void> {
+    if (this.configDir && (forceRemoveHome || !this.options.preserveHomeOnStop)) {
+      await fsp.rm(this.configDir, { recursive: true, force: true }).catch(() => {})
     }
-
-    // Create the .freshell config dir inside the temp HOME so the server doesn't error
-    const freshellDir = path.join(homeDir, '.freshell')
-    await fsp.mkdir(freshellDir, { recursive: true })
-
-    // Pre-seed config.json so the SetupWizard does not block the UI.
-    // On non-WSL systems (including CI), the client shows a SetupWizard modal
-    // when config.json is missing, blocking all interaction. This minimal config
-    // marks the network as already configured, bypassing the wizard.
-    const configPath = path.join(freshellDir, 'config.json')
-    await fsp.writeFile(configPath, JSON.stringify({
-      version: 1,
-      settings: {
-        network: {
-          configured: true,
-          host: '127.0.0.1',
-        },
-      },
-    }, null, 2))
-
-    // Create a logs dir
-    const logsDir = path.join(homeDir, '.freshell', 'logs')
-    await fsp.mkdir(logsDir, { recursive: true })
-
-    const projectRoot = findProjectRoot()
-    const runtimeRootMode = this.options.runtimeRootMode ?? 'project'
-    const runtimeRoot = runtimeRootMode === 'isolated'
-      ? await createIsolatedRuntimeRoot(projectRoot)
-      : projectRoot
-
-    this.runtimeRootDir = runtimeRootMode === 'isolated' ? runtimeRoot : null
-
-    // We need the built server and client for production mode
-    const serverEntry = path.join(runtimeRoot, 'dist', 'server', 'index.js')
-    if (!fs.existsSync(serverEntry)) {
-      throw new Error(
-        `Built server not found at ${serverEntry}. Run "npm run build" first, ` +
-        'or let the Playwright globalSetup handle it.'
-      )
+    if (this.runtimeRootDir) {
+      await fsp.rm(this.runtimeRootDir, { recursive: true, force: true }).catch(() => {})
     }
-
-    const authStrategy = this.options.authStrategy ?? 'explicit-env'
-    const env: Record<string, string> = {
-      ...process.env as Record<string, string>,
-      PORT: String(port),
-      HOME: homeDir,
-      NODE_ENV: 'production',
-      FRESHELL_LOG_DIR: logsDir,
-      HIDE_STARTUP_TOKEN: 'true',
-      // Force bind to 127.0.0.1 to skip WSL2 port forwarding (which
-      // requires a UAC prompt and blocks server startup for 60s).
-      FRESHELL_BIND_HOST: '127.0.0.1',
-      ...this.options.env,
-    }
-
-    if (authStrategy === 'explicit-env') {
-      env.AUTH_TOKEN = explicitToken
-    } else {
-      delete env.AUTH_TOKEN
-    }
-
-    // Remove any env vars that might interfere
-    delete env.VITE_PORT
-
-    this.process = spawn('node', [serverEntry], {
-      cwd: runtimeRoot,
-      env,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-
-    const pid = this.process.pid!
-    const debugLogPath = resolveDebugLogPath(env, homeDir) ?? path.join(logsDir, `server-debug.production.${port}.jsonl`)
-
-    this.process.stdout!.on('data', (chunk: Buffer) => {
-      const text = chunk.toString()
-      this.stdoutBuffer += text
-      if (this.options.verbose) process.stdout.write(`[test-server:${pid}] ${text}`)
-    })
-
-    this.process.stderr!.on('data', (chunk: Buffer) => {
-      const text = chunk.toString()
-      this.stderrBuffer += text
-      if (this.options.verbose) process.stderr.write(`[test-server:${pid}] ${text}`)
-    })
-
-    const baseUrl = `http://127.0.0.1:${port}`
-    const wsUrl = `ws://127.0.0.1:${port}/ws`
-
-    // Wait for health check to pass (confirms server is listening on the port)
-    const timeoutMs = this.options.startTimeoutMs ?? 30_000
-    await this.waitForHealth(baseUrl, timeoutMs)
-
-    const token = authStrategy === 'bootstrap'
-      ? readAuthTokenFromEnvFile(await fsp.readFile(path.join(runtimeRoot, '.env'), 'utf8'))
-      : explicitToken
-
-    this._info = {
-      port,
-      baseUrl,
-      wsUrl,
-      token,
-      configDir: homeDir,
-      homeDir,
-      logsDir,
-      debugLogPath,
-      pid,
-      runtimeRoot,
-    }
-    return this._info
-  }
-
-  async stop(): Promise<void> {
-    if (!this.process) return
-
-    const proc = this.process
-    this.process = null
+    this.configDir = null
+    this.runtimeRootDir = null
+    this._info = null
     this.stdoutBuffer = ''
     this.stderrBuffer = ''
+  }
 
-    return new Promise<void>((resolve) => {
+  private async stopProcess(forceRemoveHome: boolean): Promise<void> {
+    const proc = this.process
+    this.process = null
+
+    if (!proc) {
+      await this.cleanupArtifacts(forceRemoveHome)
+      return
+    }
+
+    await new Promise<void>((resolve) => {
       const timeout = setTimeout(() => {
         proc.kill('SIGKILL')
         resolve()
@@ -257,16 +168,139 @@ export class TestServer {
 
       proc.kill('SIGTERM')
     }).finally(async () => {
-      if (this.configDir && !this.options.preserveHomeOnStop) {
-        await fsp.rm(this.configDir, { recursive: true, force: true }).catch(() => {})
-      }
-      if (this.runtimeRootDir) {
-        await fsp.rm(this.runtimeRootDir, { recursive: true, force: true }).catch(() => {})
-      }
-      this.configDir = null
-      this.runtimeRootDir = null
-      this._info = null
+      await this.cleanupArtifacts(forceRemoveHome)
     })
+  }
+
+  async start(): Promise<TestServerInfo> {
+    if (this.process) throw new Error('TestServer already started')
+
+    try {
+      const explicitToken = randomUUID()
+      const port = await findFreePort()
+      this.configDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-e2e-'))
+      const homeDir = this.configDir
+
+      if (this.options.setupHome) {
+        await this.options.setupHome(homeDir)
+      }
+
+      // Create the .freshell config dir inside the temp HOME so the server doesn't error
+      const freshellDir = path.join(homeDir, '.freshell')
+      await fsp.mkdir(freshellDir, { recursive: true })
+
+      // Pre-seed config.json so the SetupWizard does not block the UI.
+      // On non-WSL systems (including CI), the client shows a SetupWizard modal
+      // when config.json is missing, blocking all interaction. This minimal config
+      // marks the network as already configured, bypassing the wizard.
+      const configPath = path.join(freshellDir, 'config.json')
+      await fsp.writeFile(configPath, JSON.stringify({
+        version: 1,
+        settings: {
+          network: {
+            configured: true,
+            host: '127.0.0.1',
+          },
+        },
+      }, null, 2))
+
+      // Create a logs dir
+      const logsDir = path.join(homeDir, '.freshell', 'logs')
+      await fsp.mkdir(logsDir, { recursive: true })
+
+      const projectRoot = findProjectRoot()
+      const runtimeRootMode = this.options.runtimeRootMode ?? 'project'
+      const runtimeRoot = runtimeRootMode === 'isolated'
+        ? await createIsolatedRuntimeRoot(projectRoot)
+        : projectRoot
+
+      this.runtimeRootDir = runtimeRootMode === 'isolated' ? runtimeRoot : null
+
+      // We need the built server and client for production mode
+      const serverEntry = path.join(runtimeRoot, 'dist', 'server', 'index.js')
+      if (!fs.existsSync(serverEntry)) {
+        throw new Error(
+          `Built server not found at ${serverEntry}. Run "npm run build" first, ` +
+          'or let the Playwright globalSetup handle it.'
+        )
+      }
+
+      const authStrategy = this.options.authStrategy ?? 'explicit-env'
+      const env: Record<string, string> = {
+        ...process.env as Record<string, string>,
+        PORT: String(port),
+        HOME: homeDir,
+        NODE_ENV: 'production',
+        FRESHELL_LOG_DIR: logsDir,
+        HIDE_STARTUP_TOKEN: 'true',
+        // Force bind to 127.0.0.1 to skip WSL2 port forwarding (which
+        // requires a UAC prompt and blocks server startup for 60s).
+        FRESHELL_BIND_HOST: '127.0.0.1',
+        ...this.options.env,
+      }
+
+      if (authStrategy === 'explicit-env') {
+        env.AUTH_TOKEN = explicitToken
+      } else {
+        delete env.AUTH_TOKEN
+      }
+
+      // Remove any env vars that might interfere
+      delete env.VITE_PORT
+
+      this.process = spawn('node', [serverEntry], {
+        cwd: runtimeRoot,
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+
+      const pid = this.process.pid!
+      const debugLogPath = resolveDebugLogPath(env, homeDir) ?? path.join(logsDir, `server-debug.production.${port}.jsonl`)
+
+      this.process.stdout!.on('data', (chunk: Buffer) => {
+        const text = chunk.toString()
+        this.stdoutBuffer += text
+        if (this.options.verbose) process.stdout.write(`[test-server:${pid}] ${text}`)
+      })
+
+      this.process.stderr!.on('data', (chunk: Buffer) => {
+        const text = chunk.toString()
+        this.stderrBuffer += text
+        if (this.options.verbose) process.stderr.write(`[test-server:${pid}] ${text}`)
+      })
+
+      const baseUrl = `http://127.0.0.1:${port}`
+      const wsUrl = `ws://127.0.0.1:${port}/ws`
+
+      // Wait for health check to pass (confirms server is listening on the port)
+      const timeoutMs = this.options.startTimeoutMs ?? 30_000
+      await this.waitForHealth(baseUrl, timeoutMs)
+
+      const token = authStrategy === 'bootstrap'
+        ? readAuthTokenFromEnvFile(await fsp.readFile(path.join(runtimeRoot, '.env'), 'utf8'))
+        : explicitToken
+
+      this._info = {
+        port,
+        baseUrl,
+        wsUrl,
+        token,
+        configDir: homeDir,
+        homeDir,
+        logsDir,
+        debugLogPath,
+        pid,
+        runtimeRoot,
+      }
+      return this._info
+    } catch (error) {
+      await this.stopProcess(true)
+      throw error
+    }
+  }
+
+  async stop(): Promise<void> {
+    await this.stopProcess(false)
   }
 
   private async waitForHealth(baseUrl: string, timeoutMs: number): Promise<void> {
