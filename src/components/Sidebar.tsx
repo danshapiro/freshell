@@ -393,8 +393,12 @@ export default function Sidebar({
   const hasLoadedSidebarWindow = typeof sidebarWindow?.lastLoadedAt === 'number'
   const sidebarWindowHasItems = (sidebarWindow?.projects ?? []).some((project) => (project.sessions?.length ?? 0) > 0)
   const activeQuery = (sidebarWindow?.query ?? filter).trim()
-  const showBlockingLoad = !!sidebarWindow?.loading && !hasLoadedSidebarWindow && !sidebarWindowHasItems
-  const showInlineRefreshStatus = !!sidebarWindow?.loading && hasLoadedSidebarWindow
+  const loadingKind = sidebarWindow?.loadingKind
+  const showBlockingLoad = !!sidebarWindow?.loading
+    && loadingKind === 'initial'
+    && !hasLoadedSidebarWindow
+    && !sidebarWindowHasItems
+  const showSearchLoading = !!sidebarWindow?.loading && loadingKind === 'search'
   const effectiveListHeight = listHeight > 0
     ? listHeight
     : Math.min(sortedItems.length * SESSION_ITEM_HEIGHT, SESSION_LIST_MAX_HEIGHT)
@@ -529,17 +533,30 @@ export default function Sidebar({
             placeholder="Search..."
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
-            className="w-full h-8 pl-8 pr-8 text-sm bg-muted/50 border-0 rounded-md placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-border"
+            aria-busy={showSearchLoading}
+            className="w-full h-8 pl-8 pr-12 text-sm bg-muted/50 border-0 rounded-md placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-border"
           />
-          {filter && (
-            <button
-              aria-label="Clear search"
-              onClick={() => setFilter('')}
-              className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-foreground"
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
-          )}
+          <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
+            {showSearchLoading ? (
+              <span
+                role="status"
+                data-testid="search-loading"
+                className="inline-flex items-center text-xs text-muted-foreground"
+              >
+                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                <span className="sr-only">Searching...</span>
+              </span>
+            ) : null}
+            {filter ? (
+              <button
+                aria-label="Clear search"
+                onClick={() => setFilter('')}
+                className="p-0.5 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-foreground"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            ) : null}
+          </div>
         </div>
         {filter.trim() && (
           <div className="mt-2">
@@ -584,16 +601,6 @@ export default function Sidebar({
 
       {/* Session List */}
       <div className="flex flex-1 min-h-0 flex-col">
-        {showInlineRefreshStatus && (
-          <div
-            className="px-4 py-2 text-xs text-muted-foreground flex items-center gap-2"
-            role="status"
-            data-testid={activeQuery ? 'search-loading' : 'sessions-refreshing'}
-          >
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            <span>{activeQuery ? 'Searching...' : 'Updating sessions...'}</span>
-          </div>
-        )}
         <div ref={listContainerRef} className="flex-1 min-h-0 px-2">
           {showBlockingLoad ? (
             <div
