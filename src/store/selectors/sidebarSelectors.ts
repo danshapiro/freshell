@@ -21,6 +21,7 @@ export interface SidebarSessionItem {
   ratchetedActivity?: number
   isRunning: boolean
   runningTerminalId?: string
+  runningTerminalIds?: string[]
   isSubagent?: boolean
   isNonInteractive?: boolean
   firstUserMessage?: string
@@ -61,15 +62,21 @@ export function buildSessionItems(
   sessionActivity: Record<string, number>
 ): SidebarSessionItem[] {
   const items: SidebarSessionItem[] = []
-  const runningSessionMap = new Map<string, { terminalId: string; createdAt: number }>()
+  const runningSessionMap = new Map<string, { terminalId: string; createdAt: number; allTerminalIds: string[] }>()
   const tabSessionMap = new Map<string, { hasTab: boolean }>()
 
   for (const terminal of terminals || []) {
     if (terminal.mode && terminal.mode !== 'shell' && terminal.status === 'running' && terminal.resumeSessionId) {
       const sessionKey = `${terminal.mode}:${terminal.resumeSessionId}`
       const existing = runningSessionMap.get(sessionKey)
-      if (!existing || terminal.createdAt < existing.createdAt) {
-        runningSessionMap.set(sessionKey, { terminalId: terminal.terminalId, createdAt: terminal.createdAt })
+      if (existing) {
+        existing.allTerminalIds.push(terminal.terminalId)
+        if (terminal.createdAt < existing.createdAt) {
+          existing.terminalId = terminal.terminalId
+          existing.createdAt = terminal.createdAt
+        }
+      } else {
+        runningSessionMap.set(sessionKey, { terminalId: terminal.terminalId, createdAt: terminal.createdAt, allTerminalIds: [terminal.terminalId] })
       }
     }
   }
@@ -87,6 +94,7 @@ export function buildSessionItems(
       const key = `${provider}:${session.sessionId}`
       const runningTerminal = runningSessionMap.get(key)
       const runningTerminalId = runningTerminal?.terminalId
+      const runningTerminalIds = runningTerminal?.allTerminalIds
       const tabInfo = tabSessionMap.get(key)
       const ratchetedActivity = sessionActivity[key]
       const hasTitle = !!session.title
@@ -107,6 +115,7 @@ export function buildSessionItems(
         ratchetedActivity,
         isRunning: !!runningTerminalId,
         runningTerminalId,
+        runningTerminalIds,
         isSubagent: session.isSubagent,
         isNonInteractive: session.isNonInteractive,
         firstUserMessage: session.firstUserMessage,
@@ -132,6 +141,7 @@ export function buildSessionItems(
     const fallbackTitle = input.title?.trim() || input.sessionId.slice(0, 8)
     const runningTerminal = runningSessionMap.get(key)
     const runningTerminalId = runningTerminal?.terminalId
+    const runningTerminalIds = runningTerminal?.allTerminalIds
     items.push({
       id: `session-${input.provider}-${input.sessionId}`,
       sessionId: input.sessionId,
@@ -147,6 +157,7 @@ export function buildSessionItems(
       ratchetedActivity: sessionActivity[key],
       isRunning: !!runningTerminalId,
       runningTerminalId,
+      runningTerminalIds,
     })
   }
 

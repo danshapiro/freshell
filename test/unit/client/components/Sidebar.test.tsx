@@ -1054,6 +1054,80 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(idleButton.querySelector('.text-success')).toBeTruthy()
       expect(idleButton.querySelector('.text-blue-500')).toBeFalsy()
     })
+
+    it('shows blue when a non-primary terminal for the session is busy', async () => {
+      const now = Date.now()
+      const oldTerminalId = 'term-old'
+      const newTerminalId = 'term-new'
+      const sid = sessionId('multi-terminal')
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: sid,
+              projectPath: '/home/user/project',
+              updatedAt: now,
+              title: 'Multi terminal',
+              cwd: '/home/user/project',
+              provider: 'codex',
+            },
+          ],
+        },
+      ]
+
+      const tabs = [
+        { id: 'tab-1', terminalId: newTerminalId, resumeSessionId: sid, mode: 'codex' },
+      ]
+
+      // Two background terminals for the same session — old one is primary (earlier createdAt)
+      const terminals: BackgroundTerminal[] = [
+        {
+          terminalId: oldTerminalId,
+          title: 'Codex Old',
+          createdAt: now - 5000,
+          status: 'running',
+          hasClients: false,
+          mode: 'codex',
+          resumeSessionId: sid,
+        },
+        {
+          terminalId: newTerminalId,
+          title: 'Codex New',
+          createdAt: now,
+          status: 'running',
+          hasClients: true,
+          mode: 'codex',
+          resumeSessionId: sid,
+        },
+      ]
+
+      const store = createTestStore({
+        projects,
+        tabs,
+        sortMode: 'activity',
+        codexActivity: {
+          byTerminalId: {
+            // Only the newer terminal is busy — not the primary one
+            [newTerminalId]: {
+              terminalId: newTerminalId,
+              sessionId: 'sess',
+              phase: 'busy',
+              updatedAt: 10,
+            },
+          },
+        },
+      })
+      renderSidebar(store, terminals)
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      const button = screen.getByRole('button', { name: /Multi terminal/ })
+      expect(button.querySelector('.text-blue-500')).toBeTruthy()
+      expect(button.querySelector('.text-success')).toBeFalsy()
+    })
   })
 
   describe('session filtering', () => {

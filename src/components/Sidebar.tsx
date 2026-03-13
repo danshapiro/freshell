@@ -58,6 +58,7 @@ export function areSessionItemsEqual(a: SessionItem[], b: SessionItem[]): boolea
       ai.hasTab !== bi.hasTab ||
       ai.isRunning !== bi.isRunning ||
       ai.runningTerminalId !== bi.runningTerminalId ||
+      !areTerminalIdsEqual(ai.runningTerminalIds, bi.runningTerminalIds) ||
       ai.archived !== bi.archived ||
       ai.projectColor !== bi.projectColor ||
       ai.cwd !== bi.cwd ||
@@ -89,6 +90,15 @@ function formatRelativeTime(timestamp: number): string {
  *  fields that affect rendering, sorting, or filtering are identical. Used by
  *  useStableArray to prevent react-window from rebuilding all row elements
  *  when the selector produces new object references for unchanged sessions. */
+function areTerminalIdsEqual(a?: string[], b?: string[]): boolean {
+  if (a === b) return true
+  if (!a || !b || a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false
+  }
+  return true
+}
+
 function isSessionItemEqual(a: SessionItem, b: SessionItem): boolean {
   return (
     a.sessionId === b.sessionId &&
@@ -100,6 +110,7 @@ function isSessionItemEqual(a: SessionItem, b: SessionItem): boolean {
     a.hasTab === b.hasTab &&
     a.isRunning === b.isRunning &&
     a.runningTerminalId === b.runningTerminalId &&
+    areTerminalIdsEqual(a.runningTerminalIds, b.runningTerminalIds) &&
     a.archived === b.archived &&
     a.projectColor === b.projectColor &&
     a.cwd === b.cwd &&
@@ -627,6 +638,7 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
     a.hasTab === b.hasTab &&
     a.isRunning === b.isRunning &&
     a.runningTerminalId === b.runningTerminalId &&
+    areTerminalIdsEqual(a.runningTerminalIds, b.runningTerminalIds) &&
     a.archived === b.archived &&
     a.projectColor === b.projectColor &&
     a.cwd === b.cwd &&
@@ -637,11 +649,14 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
 export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
   const { item, isActiveTab, showProjectBadge, onClick } = props
   const extensionEntries = useAppSelector((s) => s.extensions?.entries)
-  const codexPhase = useAppSelector((s) =>
-    item.runningTerminalId ? s.codexActivity?.byTerminalId?.[item.runningTerminalId]?.phase : undefined
-  )
+  const terminalIds = item.runningTerminalIds
+  const isBusy = useAppSelector((s) => {
+    if (!item.hasTab || !terminalIds?.length) return false
+    const byTerminalId = s.codexActivity?.byTerminalId
+    if (!byTerminalId) return false
+    return terminalIds.some((tid) => byTerminalId[tid]?.phase === 'busy')
+  })
   const { icon: SessionIcon, label: sessionLabel } = resolveSessionTypeConfig(item.sessionType, extensionEntries)
-  const isBusy = item.hasTab && !!item.runningTerminalId && codexPhase === 'busy'
   return (
     <Tooltip>
       <TooltipTrigger asChild>
