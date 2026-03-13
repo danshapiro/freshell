@@ -103,6 +103,13 @@ function shouldShowFirewallFix(firewall: FirewallState): boolean {
   return firewall.active && firewall.portOpen !== true
 }
 
+function getErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message.trim().length > 0) {
+    return error.message
+  }
+  return fallback
+}
+
 const terminalPreviewLinesRaw: PreviewToken[][] = [
   [{ text: '// terminal preview: syntax demo', kind: 'comment' }],
   [
@@ -293,21 +300,22 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     }
   }, [dispatch])
 
-  const scheduleFirewallRefresh = useCallback((detail: string | null = null) => {
-    setFirewallRefreshDetail(detail)
-    if (firewallRefreshTimerRef.current) {
-      clearTimeout(firewallRefreshTimerRef.current)
-    }
-    firewallRefreshRequestRef.current += 1
-    const refreshRequestId = firewallRefreshRequestRef.current
+  const queueFirewallRefresh = useCallback((refreshRequestId: number, detail: string | null) => {
     firewallRefreshTimerRef.current = setTimeout(() => {
       firewallRefreshTimerRef.current = null
       void dispatch(fetchNetworkStatus())
         .unwrap()
-        .then(() => {
-          if (firewallRefreshRequestRef.current === refreshRequestId) {
-            setFirewallRefreshDetail(null)
+        .then((status) => {
+          if (firewallRefreshRequestRef.current !== refreshRequestId) {
+            return
           }
+
+          if (status.firewall.configuring) {
+            queueFirewallRefresh(refreshRequestId, detail)
+            return
+          }
+
+          setFirewallRefreshDetail(null)
         })
         .catch(() => {
           if (firewallRefreshRequestRef.current === refreshRequestId) {
@@ -316,6 +324,16 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
         })
     }, 2000)
   }, [dispatch])
+
+  const scheduleFirewallRefresh = useCallback((detail: string | null = null) => {
+    setFirewallRefreshDetail(detail)
+    if (firewallRefreshTimerRef.current) {
+      clearTimeout(firewallRefreshTimerRef.current)
+    }
+    firewallRefreshRequestRef.current += 1
+    const refreshRequestId = firewallRefreshRequestRef.current
+    queueFirewallRefresh(refreshRequestId, detail)
+  }, [queueFirewallRefresh])
 
   const handleFirewallFixResult = useCallback((result: ConfigureFirewallResult) => {
     if (result.method === 'confirmation-required') {
@@ -356,8 +374,9 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     try {
       const result = await fetchFirewallConfig(body)
       handleFirewallFixResult(result)
-    } catch {
-      // Silently fail — user can retry
+    } catch (error) {
+      log.warn('Failed to configure firewall', error)
+      setFirewallRefreshDetail(getErrorMessage(error, 'Failed to configure firewall'))
     }
   }, [handleFirewallFixResult])
 

@@ -549,40 +549,4 @@ Address         Port        Address         Port
     })
   })
 
-  describe('setupWslPortForwarding', () => {
-    const originalEnv = process.env
-
-    beforeEach(() => {
-      process.env = { ...originalEnv }
-    })
-
-    afterEach(() => {
-      process.env = originalEnv
-    })
-
-    it('re-applies drifted startup rules and verifies the repair', () => {
-      vi.mocked(isWSL2).mockReturnValue(true)
-      process.env.PORT = '3001'
-      process.env.NODE_ENV = 'production'
-      vi.mocked(execSync)
-        .mockReturnValueOnce('inet 172.30.149.249/20 scope global eth0\n')
-        .mockReturnValueOnce('')
-        .mockReturnValueOnce('Rule Name: FreshellLANAccess\nLocalPort: 3001\n')
-        .mockReturnValueOnce('')
-        .mockReturnValueOnce(`
-Listen on ipv4:             Connect to ipv4:
-
-Address         Port        Address         Port
---------------- ----------  --------------- ----------
-0.0.0.0         3001        172.30.149.249  3001
-`)
-        .mockReturnValueOnce('Rule Name: FreshellLANAccess\nLocalPort: 3001\n')
-
-      expect(setupWslPortForwarding()).toBe('success')
-      expect(execSync).toHaveBeenCalledWith(
-        expect.stringContaining('Start-Process powershell -Verb RunAs -Wait'),
-        expect.objectContaining({ stdio: 'inherit' }),
-      )
-    })
-  })
 })

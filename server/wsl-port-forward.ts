@@ -4,7 +4,6 @@ import { isWSL2 } from './platform.js'
 
 const IPV4_REGEX = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/
 const NETSH_PATH = '/mnt/c/Windows/System32/netsh.exe'
-const POWERSHELL_PATH = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
 const DEFAULT_PORT = 3001
 const execFileAsync = promisify(execFile)
 
@@ -351,49 +350,6 @@ export function computeWslPortForwardingPlan(requiredPorts: number[]): WslPortFo
   const existingFirewallPorts = getExistingFirewallPorts()
 
   return buildWslPortForwardingPlan(requiredPorts, wslIp, existingRules, existingFirewallPorts)
-}
-
-export type SetupResult = 'success' | 'skipped' | 'failed' | 'not-wsl2'
-
-export function setupWslPortForwarding(devPort?: number): SetupResult {
-  const requiredPorts = getRequiredPorts(devPort)
-  const plan = computeWslPortForwardingPlan(requiredPorts)
-
-  if (plan.status === 'not-wsl2') {
-    return 'not-wsl2'
-  }
-
-  if (plan.status === 'error') {
-    return 'failed'
-  }
-
-  if (plan.status === 'noop') {
-    return 'skipped'
-  }
-
-  try {
-    const escapedScript = plan.script
-      .replace(/\$/g, '\\$')
-      .replace(/'/g, "''")
-
-    execSync(
-      `${POWERSHELL_PATH} -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-Command', '${escapedScript}'"`,
-      { encoding: 'utf-8', timeout: 60000, stdio: 'inherit' },
-    )
-
-    const verifyRules = getExistingPortProxyRules()
-    if (
-      plan.scriptKind === 'full'
-      && needsPortForwardingUpdate(plan.wslIp, requiredPorts, verifyRules)
-    ) {
-      return 'failed'
-    }
-
-    const verifyFirewall = getExistingFirewallPorts()
-    return needsFirewallUpdate(requiredPorts, verifyFirewall) ? 'failed' : 'success'
-  } catch {
-    return 'failed'
-  }
 }
 
 export async function computeWslPortForwardingPlanAsync(requiredPorts: number[]): Promise<WslPortForwardingPlan> {

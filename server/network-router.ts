@@ -101,15 +101,12 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
       releaseConfirmedRepair: () => void
     },
   ) => {
-    networkManager.setFirewallConfiguring(true)
     let settled = false
     const settleRepair = () => {
       if (settled) {
         return
       }
       settled = true
-      networkManager.resetFirewallCache()
-      networkManager.setFirewallConfiguring(false)
       releaseConfirmedRepair()
     }
 
@@ -163,6 +160,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
     }
 
     confirmedRepairInFlight = true
+    networkManager.setFirewallConfiguring(true)
     let released = false
     return () => {
       if (released) {
@@ -170,6 +168,8 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
       }
       released = true
       confirmedRepairInFlight = false
+      networkManager.resetFirewallCache()
+      networkManager.setFirewallConfiguring(false)
     }
   }
 
@@ -362,7 +362,6 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
               : 'Windows firewall setup error',
           )
           releaseConfirmedRepair()
-          networkManager.setFirewallConfiguring(false)
           return {
             status: 500 as const,
             body: {

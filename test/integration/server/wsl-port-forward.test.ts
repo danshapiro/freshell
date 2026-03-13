@@ -1,22 +1,27 @@
+import fs from 'fs'
+import path from 'path'
 import { describe, expect, it } from 'vitest'
 
 describe('WSL port forwarding integration', () => {
-  it('exports the startup WSL repair helpers alongside the planning helpers', async () => {
+  it('exports only the WSL planning helpers needed by the manual repair flow', async () => {
     const wslModule = await import('../../../server/wsl-port-forward.js')
 
     expect(typeof wslModule.computeWslPortForwardingPlan).toBe('function')
     expect(typeof wslModule.getWslIp).toBe('function')
     expect(typeof wslModule.getRequiredPorts).toBe('function')
-    expect(typeof wslModule.setupWslPortForwarding).toBe('function')
+    expect('setupWslPortForwarding' in wslModule).toBe(false)
     expect(typeof wslModule.buildPortForwardingScript).toBe('function')
     expect(typeof wslModule.buildFirewallOnlyScript).toBe('function')
   })
 
-  it('gates startup WSL repair on both the effective bind host and saved remote-access intent', async () => {
-    const { shouldSetupWslPortForwardingAtStartup } = await import('../../../server/wsl-port-forward-startup.js')
+  it('keeps boot-time WSL repair removed from the server startup path', () => {
+    const indexPath = path.resolve(__dirname, '../../../server/index.ts')
+    const startupHelperPath = path.resolve(__dirname, '../../../server/wsl-port-forward-startup.ts')
+    const indexContent = fs.readFileSync(indexPath, 'utf8')
 
-    expect(shouldSetupWslPortForwardingAtStartup('0.0.0.0', { host: '0.0.0.0', configured: true })).toBe(true)
-    expect(shouldSetupWslPortForwardingAtStartup('0.0.0.0', { host: '127.0.0.1', configured: true })).toBe(false)
-    expect(shouldSetupWslPortForwardingAtStartup('127.0.0.1', { host: '0.0.0.0', configured: true })).toBe(false)
+    expect(indexContent).not.toContain("import { setupWslPortForwarding } from './wsl-port-forward.js'")
+    expect(indexContent).not.toContain("from './wsl-port-forward-startup.js'")
+    expect(indexContent).not.toContain('setupWslPortForwarding(')
+    expect(fs.existsSync(startupHelperPath)).toBe(false)
   })
 })
