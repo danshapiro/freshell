@@ -637,11 +637,11 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
 export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
   const { item, isActiveTab, showProjectBadge, onClick } = props
   const extensionEntries = useAppSelector((s) => s.extensions?.entries)
-  const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId)
+  const codexPhase = useAppSelector((s) =>
+    item.runningTerminalId ? s.codexActivity?.byTerminalId?.[item.runningTerminalId]?.phase : undefined
+  )
   const { icon: SessionIcon, label: sessionLabel } = resolveSessionTypeConfig(item.sessionType, extensionEntries)
-  const isBusy = item.hasTab
-    && !!item.runningTerminalId
-    && codexActivityByTerminalId?.[item.runningTerminalId]?.phase === 'busy'
+  const isBusy = item.hasTab && !!item.runningTerminalId && codexPhase === 'busy'
   return (
     <Tooltip>
       <TooltipTrigger asChild>

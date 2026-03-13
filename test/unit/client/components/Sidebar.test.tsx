@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { createHash } from 'crypto'
-import { render, screen, fireEvent, cleanup, act } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, act, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import Sidebar from '@/components/Sidebar'
@@ -959,11 +959,13 @@ describe('Sidebar Component - Session-Centric Display', () => {
         vi.advanceTimersByTime(100)
       })
 
-      const greenIcons = document.querySelectorAll('.text-success')
-      expect(greenIcons.length).toBeGreaterThan(0)
+      const tabbedButton = screen.getByRole('button', { name: /Tabbed session/ })
+      expect(tabbedButton.querySelector('.text-success')).toBeTruthy()
+      expect(tabbedButton.querySelector('.text-muted-foreground svg')).toBeFalsy()
 
-      const mutedIcons = document.querySelectorAll('.text-muted-foreground')
-      expect(mutedIcons.length).toBeGreaterThan(0)
+      const noTabButton = screen.getByRole('button', { name: /No tab session/ })
+      expect(noTabButton.querySelector('svg.text-muted-foreground')).toBeTruthy()
+      expect(noTabButton.querySelector('.text-success')).toBeFalsy()
     })
 
     it('shows blue indicator for busy codex sessions instead of green', async () => {
@@ -981,6 +983,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
               updatedAt: now,
               title: 'Busy codex session',
               cwd: '/home/user/project',
+              provider: 'codex',
             },
             {
               sessionId: idleSessionId,
@@ -1042,12 +1045,14 @@ describe('Sidebar Component - Session-Centric Display', () => {
       })
 
       // The busy session should have a blue icon
-      const blueIcons = document.querySelectorAll('.text-blue-500')
-      expect(blueIcons.length).toBeGreaterThan(0)
+      const busyButton = screen.getByRole('button', { name: /Busy codex session/ })
+      expect(busyButton.querySelector('.text-blue-500')).toBeTruthy()
+      expect(busyButton.querySelector('.text-success')).toBeFalsy()
 
       // The idle session with a tab should still be green, not blue
-      const greenIcons = document.querySelectorAll('.text-success')
-      expect(greenIcons.length).toBeGreaterThan(0)
+      const idleButton = screen.getByRole('button', { name: /Idle session/ })
+      expect(idleButton.querySelector('.text-success')).toBeTruthy()
+      expect(idleButton.querySelector('.text-blue-500')).toBeFalsy()
     })
   })
 
