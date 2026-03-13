@@ -29,14 +29,20 @@ const defaultCliExtensions: ClientExtensionEntry[] = [
   },
 ]
 
+let latestOnRowsRendered:
+  | ((visibleRows: { startIndex: number; stopIndex: number }, allRows: { startIndex: number; stopIndex: number }) => void)
+  | null = null
+
 // Mock react-window's List component
 vi.mock('react-window', () => ({
-  List: ({ rowCount, rowComponent: Row, rowProps, style }: {
+  List: ({ rowCount, rowComponent: Row, rowProps, style, onRowsRendered }: {
     rowCount: number
     rowComponent: React.ComponentType<any>
     rowProps: any
     style: React.CSSProperties
+    onRowsRendered?: (visibleRows: { startIndex: number; stopIndex: number }, allRows: { startIndex: number; stopIndex: number }) => void
   }) => {
+    latestOnRowsRendered = onRowsRendered ?? null
     const items = []
     for (let i = 0; i < rowCount; i++) {
       items.push(
@@ -243,6 +249,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     vi.useFakeTimers()
+    latestOnRowsRendered = null
     mockFetchSidebarSessionsSnapshot.mockReset()
     mockFetchSidebarSessionsSnapshot.mockResolvedValue({ projects: [] })
     mockGetTerminalDirectoryPage.mockReset()
@@ -1759,6 +1766,58 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(screen.getByTestId('search-loading')).toBeInTheDocument()
       expect(screen.queryByText('Fallback Search Session')).not.toBeInTheDocument()
       expect(screen.queryByTestId('virtualized-list')).not.toBeInTheDocument()
+    })
+
+    it('does not start append pagination while the sidebar is already refreshing', async () => {
+      const recentProjects: ProjectGroup[] = [{
+        projectPath: '/work/recent',
+        sessions: [{
+          provider: 'codex',
+          sessionId: 'recent-session',
+          projectPath: '/work/recent',
+          updatedAt: 1_700_000_000_000,
+          title: 'Recent Session',
+        }],
+      }]
+
+      const store = createTestStore({
+        projects: recentProjects,
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: recentProjects,
+          lastLoadedAt: 1_700_000_000_000,
+          hasMore: true,
+          oldestLoadedTimestamp: 1_700_000_000_000,
+          oldestLoadedSessionId: 'codex:recent-session',
+          loadingMore: true,
+          windows: {
+            sidebar: {
+              projects: recentProjects,
+              lastLoadedAt: 1_700_000_000_000,
+              loading: true,
+              query: '',
+              searchTier: 'title',
+              hasMore: true,
+              oldestLoadedTimestamp: 1_700_000_000_000,
+              oldestLoadedSessionId: 'codex:recent-session',
+            },
+          },
+        },
+      })
+
+      renderSidebar(store, [])
+
+      expect(latestOnRowsRendered).not.toBeNull()
+
+      await act(async () => {
+        latestOnRowsRendered?.(
+          { startIndex: 0, stopIndex: 0 },
+          { startIndex: 0, stopIndex: 0 },
+        )
+        await Promise.resolve()
+      })
+
+      expect(mockFetchSidebarSessionsSnapshot).not.toHaveBeenCalled()
     })
   })
 

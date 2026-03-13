@@ -28,6 +28,7 @@ const invalidationRefreshState = new Map<SessionSurface, {
   inFlight: Promise<void> | null
   queued: boolean
 }>()
+let sessionWindowThunkGeneration = 0
 
 function isSessionSurface(value: unknown): value is SessionSurface {
   return value === 'sidebar' || value === 'history' || value === 'bootstrap'
@@ -42,6 +43,7 @@ function abortSurface(surface: string) {
 }
 
 export function _resetSessionWindowThunkState(): void {
+  sessionWindowThunkGeneration += 1
   for (const controller of controllers.values()) {
     controller.abort()
   }
@@ -252,7 +254,7 @@ export function queueActiveSessionWindowRefresh() {
       return existing.inFlight
     }
 
-    const activeRequest = inFlightRequests.get(activeSurface) ?? null
+    const generation = sessionWindowThunkGeneration
     const state = {
       inFlight: null as Promise<void> | null,
       queued: true,
@@ -261,14 +263,16 @@ export function queueActiveSessionWindowRefresh() {
 
     const run = (async () => {
       try {
-        if (activeRequest) {
-          try {
-            await activeRequest
-          } catch {
-            // A queued invalidation should still retry after an aborted/failed direct fetch.
+        while (generation === sessionWindowThunkGeneration) {
+          const activeRequest = inFlightRequests.get(activeSurface) ?? null
+          if (activeRequest) {
+            try {
+              await activeRequest
+            } catch {
+              // A queued invalidation should still retry after an aborted/failed direct fetch.
+            }
+            continue
           }
-        }
-        do {
           if (!state.queued) break
           state.queued = false
           const windowState = getState().sessions.windows[activeSurface]
@@ -278,7 +282,7 @@ export function queueActiveSessionWindowRefresh() {
             query: windowState?.query,
             searchTier: windowState?.searchTier,
           }) as any)
-        } while (state.queued)
+        }
       } finally {
         if (invalidationRefreshState.get(activeSurface) === state) {
           invalidationRefreshState.delete(activeSurface)

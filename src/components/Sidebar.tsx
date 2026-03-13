@@ -394,6 +394,7 @@ export default function Sidebar({
     (_visibleRows: { startIndex: number; stopIndex: number }, allRows: { startIndex: number; stopIndex: number }) => {
       if (
         !hasMore ||
+        sidebarWindow?.loading ||
         loadMoreInFlightRef.current ||
         oldestLoadedTimestamp == null ||
         oldestLoadedSessionId == null ||
@@ -413,7 +414,7 @@ export default function Sidebar({
         loadMoreInFlightRef.current = false
       }, 15_000)
     },
-    [hasMore, oldestLoadedTimestamp, oldestLoadedSessionId, sortedItems.length, filter, dispatch],
+    [hasMore, sidebarWindow?.loading, oldestLoadedTimestamp, oldestLoadedSessionId, sortedItems.length, filter, dispatch],
   )
   // Reset in-flight guard when loadingMore clears (response received)
   useEffect(() => {

@@ -317,4 +317,96 @@ describe('sessionsThunks', () => {
 
     expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(2)
   })
+
+  it('does not let a queued invalidation abort a newer direct fetch', async () => {
+    const firstFetch = createDeferred<any>()
+    const secondFetch = createDeferred<any>()
+    fetchSidebarSessionsSnapshot
+      .mockReturnValueOnce(firstFetch.promise)
+      .mockReturnValueOnce(secondFetch.promise)
+      .mockResolvedValueOnce({
+        projects: [],
+        totalSessions: 0,
+        oldestIncludedTimestamp: 0,
+        oldestIncludedSessionId: '',
+        hasMore: false,
+      })
+
+    const store = createStore()
+    store.dispatch(setActiveSessionSurface('sidebar'))
+
+    const first = store.dispatch(fetchSessionWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+    }) as any)
+    const queued = store.dispatch(queueActiveSessionWindowRefresh() as any)
+
+    expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+
+    const firstSignal = fetchSidebarSessionsSnapshot.mock.calls[0]?.[0]?.signal as AbortSignal
+    const second = store.dispatch(fetchSessionWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+    }) as any)
+    const secondSignal = fetchSidebarSessionsSnapshot.mock.calls[1]?.[0]?.signal as AbortSignal
+
+    expect(firstSignal.aborted).toBe(true)
+    expect(secondSignal.aborted).toBe(false)
+    expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(2)
+
+    firstFetch.resolve({
+      projects: [],
+      totalSessions: 0,
+      oldestIncludedTimestamp: 0,
+      oldestIncludedSessionId: '',
+      hasMore: false,
+    })
+
+    await Promise.resolve()
+    expect(secondSignal.aborted).toBe(false)
+    expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(2)
+
+    secondFetch.resolve({
+      projects: [],
+      totalSessions: 0,
+      oldestIncludedTimestamp: 0,
+      oldestIncludedSessionId: '',
+      hasMore: false,
+    })
+
+    await Promise.all([first, second, queued])
+
+    expect(secondSignal.aborted).toBe(false)
+    expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(3)
+  })
+
+  it('reset hook cancels parked invalidation runners before they can dispatch follow-up fetches', async () => {
+    const firstFetch = createDeferred<any>()
+    fetchSidebarSessionsSnapshot.mockReturnValueOnce(firstFetch.promise)
+
+    const store = createStore()
+    store.dispatch(setActiveSessionSurface('sidebar'))
+
+    const first = store.dispatch(fetchSessionWindow({
+      surface: 'sidebar',
+      priority: 'visible',
+    }) as any)
+    const queued = store.dispatch(queueActiveSessionWindowRefresh() as any)
+
+    expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+
+    _resetSessionWindowThunkState()
+
+    firstFetch.resolve({
+      projects: [],
+      totalSessions: 0,
+      oldestIncludedTimestamp: 0,
+      oldestIncludedSessionId: '',
+      hasMore: false,
+    })
+
+    await Promise.all([first, queued])
+
+    expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+  })
 })
