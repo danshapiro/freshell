@@ -346,6 +346,14 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
         networkManager.getStatus(),
         configStore.getSettings(),
       ])
+
+      if (confirmedRepairInFlight) {
+        return res.status(409).json({
+          error: 'Firewall configuration already in progress',
+          method: 'in-progress',
+        })
+      }
+
       const action = await resolveWslDisableAction(status, settings)
 
       if (action.kind === 'error') {
@@ -370,13 +378,6 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
           consumeCurrentConfirmation(confirmationToken)
         }
         return res.json(action.response)
-      }
-
-      if (confirmedRepairInFlight) {
-        return res.status(409).json({
-          error: 'Firewall configuration already in progress',
-          method: 'in-progress',
-        })
       }
 
       if (!confirmElevation || !matchesConfirmation(confirmationToken, action.confirmationAction)) {

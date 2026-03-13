@@ -34,6 +34,18 @@ type ChecklistItemStatus = 'pending' | 'active' | 'done' | 'error'
 type FirewallConfirmation = Extract<ConfigureFirewallResult, { method: 'confirmation-required' }>
 type FirewallState = NetworkStatusResponse['firewall']
 
+function isRemoteAccessBindRequested(status: NetworkStatusResponse | null): boolean {
+  if (status === null || status.host !== '0.0.0.0') {
+    return false
+  }
+
+  return status.remoteAccessRequested ?? isRemoteAccessEnabledStatus(status)
+}
+
+function isBoundToAllInterfaces(status: NetworkStatusResponse | null): boolean {
+  return status?.host === '0.0.0.0'
+}
+
 function getFirewallChecklistState(firewall: FirewallState): { status: ChecklistItemStatus; detail: string } {
   if (firewall.portOpen === true) {
     return { status: 'done', detail: 'Port is open' }
@@ -93,7 +105,6 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
   const dispatch = useAppDispatch()
   const networkStatus = useAppSelector((s) => s.network.status)
   const configuring = useAppSelector((s) => s.network.configuring)
-  const remoteAccessEnabled = isRemoteAccessEnabledStatus(networkStatus)
   const shareAccessUrl = networkStatus?.accessUrl
     ? ensureShareUrlToken(networkStatus.accessUrl, getAuthToken())
     : null
@@ -127,7 +138,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
   // Watch for rebinding completion when on step 2
   useEffect(() => {
     if (bindStatus === 'active' && networkStatus && !configuring && !networkStatus.rebinding) {
-      if (remoteAccessEnabled) {
+      if (isBoundToAllInterfaces(networkStatus)) {
         setBindStatus('done')
         setBindDetail('Bound to all interfaces')
       } else {
@@ -135,7 +146,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
         setBindDetail('Rebind failed — rolled back to localhost')
       }
     }
-  }, [bindStatus, configuring, networkStatus, remoteAccessEnabled])
+  }, [bindStatus, configuring, networkStatus])
 
   const applyFirewallChecklistState = useCallback((firewall: FirewallState) => {
     const next = getFirewallChecklistState(firewall)
@@ -182,7 +193,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
       return
     }
 
-    if (networkStatus && !networkStatus.rebinding && remoteAccessEnabled) {
+    if (networkStatus && !networkStatus.rebinding && isRemoteAccessBindRequested(networkStatus)) {
       setBindStatus('done')
       setBindDetail('Bound to all interfaces')
       return
@@ -191,7 +202,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
     if (initialStep === 2) {
       startBind()
     }
-  }, [bindStatus, configuring, initialStep, networkStatus, remoteAccessEnabled, startBind, step])
+  }, [bindStatus, configuring, initialStep, networkStatus, startBind, step])
 
   const handleYes = useCallback(async () => {
     setStep(2)
@@ -274,7 +285,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
     setFirewallDetail(pendingDetail)
     try {
       const action = await dispatch(fetchNetworkStatus()).unwrap()
-      if (!isRemoteAccessEnabledStatus(action)) {
+      if (!isBoundToAllInterfaces(action)) {
         setBindStatus('error')
         setBindDetail('Remote access is not enabled')
         setFirewallStatus('error')

@@ -249,6 +249,9 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   const [terminalAdvancedOpen, setTerminalAdvancedOpen] = useState(false)
   const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmation | null>(null)
   const [firewallRefreshDetail, setFirewallRefreshDetail] = useState<string | null>(null)
+  const firewallRepairInProgress = networkStatus?.firewall
+    ? isFirewallRefreshInProgress(networkStatus.firewall, firewallRefreshDetail)
+    : false
   const [remoteAccessPending, setRemoteAccessPending] = useState(false)
   const [defaultCwdInput, setDefaultCwdInput] = useState(settings.defaultCwd ?? '')
   const [defaultCwdError, setDefaultCwdError] = useState<string | null>(null)
@@ -1441,7 +1444,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
             <SettingsRow label="Remote access" description="Allow connections from other devices on your network">
               <Toggle
                 checked={remoteAccessToggleChecked}
-                disabled={configuring || networkStatus?.rebinding || remoteAccessPending}
+                disabled={configuring || networkStatus?.rebinding || remoteAccessPending || firewallRepairInProgress}
                 aria-label="Remote access"
                 onChange={async (checked) => {
                   if (isWslRemoteAccess) {

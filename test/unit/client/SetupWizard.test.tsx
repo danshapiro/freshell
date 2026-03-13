@@ -68,14 +68,23 @@ const defaultNetworkStatus = {
 
 function createTestStore(networkOverrides: Partial<NetworkState> = {}) {
   const baseStatus = { ...defaultNetworkStatus }
+  const { status: _ignoredStatus, ...restNetworkOverrides } = networkOverrides
   const mergedStatus = networkOverrides.status
     ? {
         ...baseStatus,
         ...networkOverrides.status,
       }
     : baseStatus
-  if (mergedStatus && networkOverrides.status?.remoteAccessEnabled === undefined) {
-    mergedStatus.remoteAccessEnabled = mergedStatus.host === '0.0.0.0'
+  if (mergedStatus) {
+    const isWsl = mergedStatus.firewall?.platform === 'wsl2'
+    if (networkOverrides.status?.remoteAccessEnabled === undefined) {
+      mergedStatus.remoteAccessEnabled = isWsl ? false : mergedStatus.host === '0.0.0.0'
+    }
+    if (networkOverrides.status?.remoteAccessRequested === undefined) {
+      mergedStatus.remoteAccessRequested = isWsl
+        ? mergedStatus.host === '0.0.0.0'
+        : mergedStatus.remoteAccessEnabled
+    }
   }
 
   return configureStore({
@@ -89,7 +98,7 @@ function createTestStore(networkOverrides: Partial<NetworkState> = {}) {
         loading: false,
         configuring: false,
         error: null,
-        ...networkOverrides,
+        ...restNetworkOverrides,
       },
       settings: {
         settings: defaultSettings,
@@ -281,6 +290,35 @@ describe('SetupWizard', () => {
     await waitFor(() => {
       expect(screen.getByRole('button', { name: /configure firewall/i })).toBeInTheDocument()
     })
+  })
+
+  it('treats the real WSL bind shape as bound even before firewall repair completes', async () => {
+    const firewallBlocked = { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false }
+    const store = createTestStore({
+      status: {
+        ...defaultNetworkStatus,
+        configured: true,
+        host: '0.0.0.0',
+        remoteAccessEnabled: false,
+        remoteAccessRequested: true,
+        firewall: firewallBlocked,
+        rebinding: false,
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <SetupWizard onComplete={vi.fn()} initialStep={2} />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /configure firewall/i })).toBeInTheDocument()
+    })
+
+    expect(mockPost).not.toHaveBeenCalled()
+    expect(screen.getByText(/bound to all interfaces/i)).toBeInTheDocument()
+    expect(screen.getByText(/port may be blocked by firewall/i)).toBeInTheDocument()
   })
 
   it('treats blocked WSL2 access as repairable even when Windows Firewall reports inactive', async () => {

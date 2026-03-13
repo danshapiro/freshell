@@ -576,6 +576,25 @@ describe('SettingsView network access section', () => {
     expect(screen.getByRole('switch', { name: /remote access/i })).toBeDisabled()
   })
 
+  it('disables the WSL remote access toggle while firewall repair is already in progress', () => {
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            host: '0.0.0.0',
+            remoteAccessEnabled: true,
+            remoteAccessRequested: true,
+            firewall: { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: true },
+          }),
+        }),
+      },
+    })
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    expect(screen.getByRole('switch', { name: /remote access/i })).toBeDisabled()
+    expect(screen.queryByRole('button', { name: /fix firewall/i })).not.toBeInTheDocument()
+  })
+
   it('renders Get link button when access URL is present', () => {
     const store = createSettingsViewStore({
       extraPreloadedState: {

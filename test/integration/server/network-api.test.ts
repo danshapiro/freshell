@@ -1357,5 +1357,72 @@ describe('Network API integration', () => {
       expect(statusRes.body.accessUrl).toContain('localhost')
       expect(statusRes.body.accessUrl).not.toContain('192.168.1.100')
     })
+
+    it('returns 409 in-progress for disable requests while a confirmed WSL repair is still running', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+      await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+      vi.mocked(isPortReachable).mockResolvedValue(false)
+      vi.mocked(wslModule.computeWslPortForwardingPlanAsync).mockResolvedValue({
+        status: 'ready',
+        wslIp: '172.24.0.2',
+        scriptKind: 'full',
+        script: '$null # mock script',
+      })
+      vi.mocked(wslModule.computeWslPortForwardingTeardownPlanAsync).mockResolvedValue({
+        status: 'noop',
+      })
+
+      const cp = await import('node:child_process')
+      let finishRepair: (() => void) | null = null
+      vi.mocked(cp.execFile).mockImplementation((_cmd: any, _args: any, _opts: any, cb: any) => {
+        finishRepair = () => {
+          cb?.(null, '', '')
+        }
+        return { on: vi.fn() } as any
+      })
+
+      const repairConfirmationRes = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(repairConfirmationRes.status).toBe(200)
+      expectConfirmationRequired(repairConfirmationRes.body)
+
+      const repairStartedRes = await request(app)
+        .post('/api/network/configure-firewall')
+        .set('x-auth-token', token)
+        .send({
+          confirmElevation: true,
+          confirmationToken: repairConfirmationRes.body.confirmationToken,
+        })
+
+      expect(repairStartedRes.status).toBe(200)
+      expect(repairStartedRes.body).toEqual({ method: 'wsl2', status: 'started' })
+
+      const disableRes = await request(app)
+        .post('/api/network/disable-remote-access')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(disableRes.status).toBe(409)
+      expect(disableRes.body).toEqual({
+        error: 'Firewall configuration already in progress',
+        method: 'in-progress',
+      })
+
+      const settings = await configStore.getSettings()
+      expect(settings.network).toEqual(expect.objectContaining({
+        configured: true,
+        host: '0.0.0.0',
+      }))
+
+      finishRepair?.()
+      networkManager.setFirewallConfiguring(false)
+    })
   })
 })
