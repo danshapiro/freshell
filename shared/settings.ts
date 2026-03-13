@@ -275,27 +275,39 @@ function maybeAssignNested(
 function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSettingsPatch | undefined {
   const normalized: LocalSettingsPatch = {}
 
-  if (patch.theme !== undefined) {
+  if (ThemeSchema.safeParse(patch.theme).success) {
     normalized.theme = patch.theme as ThemeMode
   }
-  if (patch.uiScale !== undefined) {
+  if (typeof patch.uiScale === 'number' && Number.isFinite(patch.uiScale)) {
     normalized.uiScale = patch.uiScale as number
   }
 
   if (isRecord(patch.terminal)) {
     const terminal: LocalSettingsPatch['terminal'] = {}
-    if (hasOwn(patch.terminal, 'fontSize')) terminal.fontSize = patch.terminal.fontSize as number
-    if (hasOwn(patch.terminal, 'fontFamily')) terminal.fontFamily = patch.terminal.fontFamily as string
-    if (hasOwn(patch.terminal, 'lineHeight')) terminal.lineHeight = patch.terminal.lineHeight as number
-    if (hasOwn(patch.terminal, 'cursorBlink')) terminal.cursorBlink = patch.terminal.cursorBlink as boolean
-    if (hasOwn(patch.terminal, 'theme')) terminal.theme = patch.terminal.theme as TerminalTheme
-    if (hasOwn(patch.terminal, 'warnExternalLinks')) {
+    if (typeof patch.terminal.fontSize === 'number' && Number.isFinite(patch.terminal.fontSize)) {
+      terminal.fontSize = patch.terminal.fontSize as number
+    }
+    if (typeof patch.terminal.fontFamily === 'string') {
+      terminal.fontFamily = patch.terminal.fontFamily
+    }
+    if (typeof patch.terminal.lineHeight === 'number' && Number.isFinite(patch.terminal.lineHeight)) {
+      terminal.lineHeight = patch.terminal.lineHeight as number
+    }
+    if (typeof patch.terminal.cursorBlink === 'boolean') {
+      terminal.cursorBlink = patch.terminal.cursorBlink
+    }
+    if (TerminalThemeSchema.safeParse(patch.terminal.theme).success) {
+      terminal.theme = patch.terminal.theme as TerminalTheme
+    }
+    if (typeof patch.terminal.warnExternalLinks === 'boolean') {
       terminal.warnExternalLinks = patch.terminal.warnExternalLinks as boolean
     }
-    if (hasOwn(patch.terminal, 'osc52Clipboard')) {
+    if (Osc52ClipboardSchema.safeParse(patch.terminal.osc52Clipboard).success) {
       terminal.osc52Clipboard = patch.terminal.osc52Clipboard as Osc52ClipboardPolicy
     }
-    if (hasOwn(patch.terminal, 'renderer')) terminal.renderer = patch.terminal.renderer as TerminalRendererMode
+    if (TerminalRendererSchema.safeParse(patch.terminal.renderer).success) {
+      terminal.renderer = patch.terminal.renderer as TerminalRendererMode
+    }
     if (Object.keys(terminal).length > 0) {
       normalized.terminal = terminal
     }
@@ -303,12 +315,16 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
 
   if (isRecord(patch.panes)) {
     const panes: LocalSettingsPatch['panes'] = {}
-    if (hasOwn(patch.panes, 'snapThreshold')) panes.snapThreshold = patch.panes.snapThreshold as number
-    if (hasOwn(patch.panes, 'iconsOnTabs')) panes.iconsOnTabs = patch.panes.iconsOnTabs as boolean
-    if (hasOwn(patch.panes, 'tabAttentionStyle')) {
+    if (typeof patch.panes.snapThreshold === 'number' && Number.isFinite(patch.panes.snapThreshold)) {
+      panes.snapThreshold = patch.panes.snapThreshold as number
+    }
+    if (typeof patch.panes.iconsOnTabs === 'boolean') {
+      panes.iconsOnTabs = patch.panes.iconsOnTabs as boolean
+    }
+    if (TabAttentionStyleSchema.safeParse(patch.panes.tabAttentionStyle).success) {
       panes.tabAttentionStyle = patch.panes.tabAttentionStyle as TabAttentionStyle
     }
-    if (hasOwn(patch.panes, 'attentionDismiss')) {
+    if (AttentionDismissSchema.safeParse(patch.panes.attentionDismiss).success) {
       panes.attentionDismiss = patch.panes.attentionDismiss as AttentionDismiss
     }
     if (Object.keys(panes).length > 0) {
@@ -321,21 +337,27 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
     if (hasOwn(patch.sidebar, 'sortMode')) {
       sidebar.sortMode = normalizeLocalSortMode(patch.sidebar.sortMode)
     }
-    if (hasOwn(patch.sidebar, 'showProjectBadges')) {
+    if (typeof patch.sidebar.showProjectBadges === 'boolean') {
       sidebar.showProjectBadges = patch.sidebar.showProjectBadges as boolean
     }
-    if (hasOwn(patch.sidebar, 'showSubagents')) sidebar.showSubagents = patch.sidebar.showSubagents as boolean
-    if (hasOwn(patch.sidebar, 'ignoreCodexSubagents')) {
+    if (typeof patch.sidebar.showSubagents === 'boolean') {
+      sidebar.showSubagents = patch.sidebar.showSubagents as boolean
+    }
+    if (typeof patch.sidebar.ignoreCodexSubagents === 'boolean') {
       sidebar.ignoreCodexSubagents = patch.sidebar.ignoreCodexSubagents as boolean
     }
-    if (hasOwn(patch.sidebar, 'showNoninteractiveSessions')) {
+    if (typeof patch.sidebar.showNoninteractiveSessions === 'boolean') {
       sidebar.showNoninteractiveSessions = patch.sidebar.showNoninteractiveSessions as boolean
     }
-    if (hasOwn(patch.sidebar, 'hideEmptySessions')) {
+    if (typeof patch.sidebar.hideEmptySessions === 'boolean') {
       sidebar.hideEmptySessions = patch.sidebar.hideEmptySessions as boolean
     }
-    if (hasOwn(patch.sidebar, 'width')) sidebar.width = patch.sidebar.width as number
-    if (hasOwn(patch.sidebar, 'collapsed')) sidebar.collapsed = patch.sidebar.collapsed as boolean
+    if (typeof patch.sidebar.width === 'number' && Number.isFinite(patch.sidebar.width)) {
+      sidebar.width = patch.sidebar.width as number
+    }
+    if (typeof patch.sidebar.collapsed === 'boolean') {
+      sidebar.collapsed = patch.sidebar.collapsed as boolean
+    }
     if (Object.keys(sidebar).length > 0) {
       normalized.sidebar = sidebar
     }
@@ -343,7 +365,7 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
 
   if (isRecord(patch.notifications)) {
     const notifications: LocalSettingsPatch['notifications'] = {}
-    if (hasOwn(patch.notifications, 'soundEnabled')) {
+    if (typeof patch.notifications.soundEnabled === 'boolean') {
       notifications.soundEnabled = patch.notifications.soundEnabled as boolean
     }
     if (Object.keys(notifications).length > 0) {

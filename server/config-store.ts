@@ -2,9 +2,15 @@ import fsp from 'fs/promises'
 import path from 'path'
 import { logger } from './logger.js'
 import { getFreshellConfigDir } from './freshell-home.js'
-import type { CodingCliProviderName } from './coding-cli/types.js'
-import { DEFAULT_ENABLED_CLI_PROVIDERS } from '../shared/coding-cli-defaults.js'
-import { normalizeTrimmedStringList } from '../shared/string-list.js'
+import {
+  createDefaultServerSettings,
+  extractLegacyLocalSettingsSeed,
+  mergeServerSettings,
+  stripLocalSettings,
+  type LocalSettingsPatch,
+  type ServerSettings,
+  type ServerSettingsPatch,
+} from '../shared/settings.js'
 
 /**
  * Simple promise-based mutex to serialize write operations.
@@ -26,95 +32,8 @@ class Mutex {
   }
 }
 
-export interface NetworkSettings {
-  host: '127.0.0.1' | '0.0.0.0'
-  configured: boolean
-}
-
-export type AppSettings = {
-  theme: 'system' | 'light' | 'dark'
-  uiScale: number
-  terminal: {
-    fontSize: number
-    lineHeight: number
-    cursorBlink: boolean
-    scrollback: number
-    theme:
-      | 'auto'
-      | 'dracula'
-      | 'one-dark'
-      | 'solarized-dark'
-      | 'github-dark'
-      | 'one-light'
-      | 'solarized-light'
-      | 'github-light'
-    warnExternalLinks: boolean
-    osc52Clipboard: 'ask' | 'always' | 'never'
-    renderer: 'auto' | 'webgl' | 'canvas'
-  }
-  defaultCwd?: string
-  allowedFilePaths?: string[]
-  logging: {
-    debug: boolean
-  }
-  safety: {
-    autoKillIdleMinutes: number
-  }
-  panes: {
-    defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor'
-    iconsOnTabs: boolean
-    snapThreshold: number // 0-8, % of container's smallest dimension; 0 = off
-    tabAttentionStyle: 'highlight' | 'pulse' | 'darken' | 'none'
-    attentionDismiss: 'click' | 'type'
-  }
-  sidebar: {
-    sortMode: 'recency' | 'recency-pinned' | 'activity' | 'project'
-    showProjectBadges: boolean
-    showSubagents: boolean
-    showNoninteractiveSessions: boolean
-    hideEmptySessions: boolean
-    excludeFirstChatSubstrings: string[]
-    excludeFirstChatMustStart: boolean
-    width: number
-    collapsed: boolean
-  }
-  notifications: {
-    soundEnabled: boolean
-  }
-  codingCli: {
-    enabledProviders: CodingCliProviderName[]
-    knownProviders?: string[]
-    providers: Partial<Record<CodingCliProviderName, {
-      model?: string
-      sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
-      permissionMode?: 'default' | 'plan' | 'acceptEdits' | 'bypassPermissions'
-      maxTurns?: number
-      cwd?: string
-    }>>
-  }
-  editor: {
-    externalEditor: 'auto' | 'cursor' | 'code' | 'custom'
-    customEditorCommand?: string
-  }
-  agentChat?: {
-    initialSetupDone?: boolean
-    defaultPlugins?: string[]
-    providers?: Partial<Record<string, {
-      defaultModel?: string
-      defaultPermissionMode?: string
-      defaultEffort?: 'low' | 'medium' | 'high' | 'max'
-    }>>
-  }
-  network: NetworkSettings
-}
-
-type DeepPartial<T> = T extends readonly (infer U)[]
-  ? U[]
-  : T extends object
-    ? { [K in keyof T]?: DeepPartial<T[K]> }
-    : T
-
-export type AppSettingsPatch = DeepPartial<AppSettings>
+export type AppSettings = ServerSettings
+export type AppSettingsPatch = ServerSettingsPatch
 
 export type SessionOverride = {
   titleOverride?: string
@@ -133,6 +52,7 @@ export type TerminalOverride = {
 export type UserConfig = {
   version: 1
   settings: AppSettings
+  legacyLocalSettingsSeed?: LocalSettingsPatch
   sessionOverrides: Record<string, SessionOverride>
   terminalOverrides: Record<string, TerminalOverride>
   projectColors: Record<string, string>
@@ -143,66 +63,9 @@ export function resolveDefaultLoggingDebug(env: NodeJS.ProcessEnv = process.env)
   return env.NODE_ENV !== 'production'
 }
 
-export const defaultSettings: AppSettings = {
-  theme: 'system',
-  uiScale: 1.0,
-  terminal: {
-    fontSize: 16,
-    lineHeight: 1,
-    cursorBlink: true,
-    scrollback: 5000,
-    theme: 'auto',
-    warnExternalLinks: true,
-    osc52Clipboard: 'ask',
-    renderer: 'auto',
-  },
-  defaultCwd: undefined,
-  allowedFilePaths: undefined,
-  logging: {
-    debug: resolveDefaultLoggingDebug(),
-  },
-  safety: {
-    autoKillIdleMinutes: 180,
-  },
-  notifications: {
-    soundEnabled: true,
-  },
-  panes: {
-    defaultNewPane: 'ask',
-    iconsOnTabs: true,
-    snapThreshold: 2,
-    tabAttentionStyle: 'highlight',
-    attentionDismiss: 'click',
-  },
-  sidebar: {
-    sortMode: 'activity',
-    showProjectBadges: true,
-    showSubagents: false,
-    showNoninteractiveSessions: false,
-    hideEmptySessions: true,
-    excludeFirstChatSubstrings: [],
-    excludeFirstChatMustStart: false,
-    width: 288,
-    collapsed: false,
-  },
-  codingCli: {
-    enabledProviders: [...DEFAULT_ENABLED_CLI_PROVIDERS],
-    providers: {
-      claude: {
-        permissionMode: 'default',
-      },
-      codex: {},
-    },
-  },
-  editor: {
-    externalEditor: 'auto',
-  },
-  agentChat: { providers: {} },
-  network: {
-    host: '127.0.0.1',
-    configured: false,
-  },
-}
+export const defaultSettings: AppSettings = createDefaultServerSettings({
+  loggingDebug: resolveDefaultLoggingDebug(),
+})
 
 function configDir(): string {
   return getFreshellConfigDir()
@@ -395,74 +258,29 @@ async function readConfigFile(): Promise<{ config: UserConfig | null; error?: Co
   }
 }
 
-function mergeProviderRecords(
-  base?: Partial<Record<string, Record<string, unknown>>>,
-  patch?: Partial<Record<string, Record<string, unknown>>>,
-): Record<string, Record<string, unknown>> {
-  const merged: Record<string, Record<string, unknown>> = { ...(base || {}) } as any
-  for (const [key, value] of Object.entries(patch || {})) {
-    merged[key] = { ...(merged[key] || {}), ...(value || {}) }
-  }
-  return merged
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
 }
 
-function mergeSettings(base: AppSettings, patch: AppSettingsPatch): AppSettings {
-  const baseLogging = base.logging ?? defaultSettings.logging
-  const terminalPatch: Partial<AppSettings['terminal']> = patch.terminal ?? {}
-  const terminalUpdates = {
-    fontSize: terminalPatch.fontSize,
-    lineHeight: terminalPatch.lineHeight,
-    cursorBlink: terminalPatch.cursorBlink,
-    scrollback: terminalPatch.scrollback,
-    theme: terminalPatch.theme,
-    warnExternalLinks: terminalPatch.warnExternalLinks,
-    osc52Clipboard: terminalPatch.osc52Clipboard,
-    renderer: terminalPatch.renderer,
+function migrateLegacyFreshClaudeSettings(rawSettings: Record<string, unknown>): Record<string, unknown> {
+  if (!isRecord(rawSettings.freshclaude)) {
+    return rawSettings
   }
-  return {
-    ...base,
-    ...patch,
-    terminal: {
-      ...base.terminal,
-      ...Object.fromEntries(
-        Object.entries(terminalUpdates).filter(([, value]) => value !== undefined)
-      ),
-    },
-    logging: { ...baseLogging, ...(patch.logging || {}) },
-    safety: { ...base.safety, ...(patch.safety || {}) },
-    notifications: { ...base.notifications, ...(patch.notifications || {}) },
-    panes: { ...base.panes, ...(patch.panes || {}) },
-    sidebar: {
-      ...base.sidebar,
-      ...(patch.sidebar || {}),
-      excludeFirstChatSubstrings: normalizeTrimmedStringList(
-        (patch.sidebar && Object.prototype.hasOwnProperty.call(patch.sidebar, 'excludeFirstChatSubstrings'))
-          ? patch.sidebar.excludeFirstChatSubstrings
-          : base.sidebar.excludeFirstChatSubstrings
-      ),
-      excludeFirstChatMustStart: (patch.sidebar && Object.prototype.hasOwnProperty.call(patch.sidebar, 'excludeFirstChatMustStart'))
-        ? !!patch.sidebar.excludeFirstChatMustStart
-        : !!base.sidebar.excludeFirstChatMustStart,
-    },
-    codingCli: {
-      ...base.codingCli,
-      ...(patch.codingCli || {}),
-      providers: {
-        ...base.codingCli.providers,
-        ...(patch.codingCli?.providers || {}),
-      },
-    },
-    editor: { ...base.editor, ...(patch.editor || {}) },
-    agentChat: {
-      ...base.agentChat,
-      ...(patch.agentChat || {}),
-      providers: mergeProviderRecords(base.agentChat?.providers, patch.agentChat?.providers),
-    },
-    network: {
-      ...base.network,
-      ...(patch.network || {}),
-    },
+
+  const migrated = { ...rawSettings }
+  const existingAgentChat = isRecord(migrated.agentChat) ? { ...migrated.agentChat } : {}
+  const existingProviders = isRecord(existingAgentChat.providers) ? { ...existingAgentChat.providers } : {}
+
+  existingProviders.freshclaude = {
+    ...rawSettings.freshclaude,
+    ...(isRecord(existingProviders.freshclaude) ? existingProviders.freshclaude : {}),
   }
+
+  existingAgentChat.providers = existingProviders
+  migrated.agentChat = existingAgentChat
+  delete migrated.freshclaude
+
+  return migrated
 }
 
 export class ConfigStore {
@@ -490,25 +308,18 @@ export class ConfigStore {
     this.lastReadError = error
     if (existing) {
       this.lastReadError = undefined
-      // Migrate flat freshclaude → nested agentChat.providers.freshclaude
-      const rawSettings = (existing.settings || {}) as AppSettings & Record<string, unknown>
-      if (rawSettings.freshclaude) {
-        if (!rawSettings.agentChat) {
-          rawSettings.agentChat = { providers: { freshclaude: rawSettings.freshclaude } }
-        } else {
-          // Mixed case: merge legacy values under agentChat.providers.freshclaude
-          rawSettings.agentChat = rawSettings.agentChat || {}
-          rawSettings.agentChat.providers = rawSettings.agentChat.providers || {}
-          rawSettings.agentChat.providers.freshclaude = {
-            ...rawSettings.freshclaude,
-            ...(rawSettings.agentChat.providers.freshclaude || {}),
-          }
-        }
-        delete rawSettings.freshclaude
-      }
-      this.cache = {
+      const rawSettings = migrateLegacyFreshClaudeSettings(
+        isRecord(existing.settings) ? { ...existing.settings } : {},
+      )
+      const legacyLocalSettingsSeed = existing.legacyLocalSettingsSeed ?? extractLegacyLocalSettingsSeed(rawSettings)
+      const settings = mergeServerSettings(
+        createDefaultServerSettings({ loggingDebug: resolveDefaultLoggingDebug(process.env) }),
+        stripLocalSettings(rawSettings) as AppSettingsPatch,
+      )
+      const normalized: UserConfig = {
         ...existing,
-        settings: mergeSettings(defaultSettings, rawSettings),
+        settings,
+        legacyLocalSettingsSeed,
         sessionOverrides: existing.sessionOverrides || {},
         terminalOverrides: existing.terminalOverrides || {},
         projectColors: existing.projectColors || {},
@@ -516,6 +327,15 @@ export class ConfigStore {
           ? existing.recentDirectories.filter((dir) => typeof dir === 'string' && dir.trim().length > 0)
           : [],
       }
+
+      this.cache = normalized
+      const shouldPersistNormalizedConfig =
+        JSON.stringify(existing.settings) !== JSON.stringify(settings)
+        || JSON.stringify(existing.legacyLocalSettingsSeed) !== JSON.stringify(legacyLocalSettingsSeed)
+      if (shouldPersistNormalizedConfig) {
+        await this.saveInternal(normalized)
+      }
+
       return this.cache
     }
 
@@ -527,6 +347,7 @@ export class ConfigStore {
     this.cache = {
       version: 1,
       settings: defaultSettings,
+      legacyLocalSettingsSeed: undefined,
       sessionOverrides: {},
       terminalOverrides: {},
       projectColors: {},
@@ -560,12 +381,17 @@ export class ConfigStore {
     return cfg.settings
   }
 
+  async getLegacyLocalSettingsSeed(): Promise<LocalSettingsPatch | undefined> {
+    const cfg = await this.load()
+    return cfg.legacyLocalSettingsSeed
+  }
+
   async patchSettings(patch: AppSettingsPatch): Promise<AppSettings> {
     return this.writeMutex.acquire(async () => {
       const cfg = await this.load()
       const updated: UserConfig = {
         ...cfg,
-        settings: mergeSettings(cfg.settings, patch),
+        settings: mergeServerSettings(cfg.settings, patch),
       }
       await this.saveInternal(updated)
       return updated.settings
@@ -662,6 +488,6 @@ export class ConfigStore {
 export const configStore = new ConfigStore()
 
 // Quick integrity log in dev
-if (process.env.NODE_ENV !== 'production') {
+if (process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'test') {
   configStore.load().then((cfg) => logger.debug({ configPath: configPath() }, 'Loaded config'))
 }

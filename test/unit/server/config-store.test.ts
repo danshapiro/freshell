@@ -145,10 +145,14 @@ describe('ConfigStore', () => {
         version: 1,
         settings: {
           ...defaultSettings,
-          theme: 'dark',
+          defaultCwd: '/workspace',
           terminal: {
             ...defaultSettings.terminal,
-            fontSize: 16,
+            scrollback: 12000,
+          },
+          agentChat: {
+            ...defaultSettings.agentChat,
+            defaultPlugins: ['fs'],
           },
         },
         sessionOverrides: { 'session-1': { titleOverride: 'Custom Title' } },
@@ -160,38 +164,83 @@ describe('ConfigStore', () => {
       const store = new ConfigStore()
       const config = await store.load()
 
-      expect(config.settings.theme).toBe('dark')
-      expect(config.settings.terminal.fontSize).toBe(16)
+      expect(config.settings.defaultCwd).toBe('/workspace')
+      expect(config.settings.terminal.scrollback).toBe(12000)
+      expect(config.settings.agentChat.defaultPlugins).toEqual(['fs'])
       expect(config.sessionOverrides['session-1']?.titleOverride).toBe('Custom Title')
       expect(config.terminalOverrides['term-1']?.deleted).toBe(true)
       expect(config.projectColors['/projects/foo']).toBe('#ff0000')
       expect(store.getLastReadError()).toBeUndefined()
     })
 
-    it('merges partial settings with defaults', async () => {
-      // Create a config with only some settings
+    it('loads a legacy mixed config as sanitized server settings with a top-level migration seed', async () => {
       await fsp.mkdir(configDir, { recursive: true })
-      const partialConfig = {
+      const legacyConfig = {
         version: 1,
         settings: {
-          theme: 'light' as const,
-          // terminal and safety omitted
+          theme: 'dark' as const,
+          terminal: {
+            fontFamily: 'Fira Code',
+            fontSize: 18,
+            scrollback: 9000,
+          },
+          sidebar: {
+            sortMode: 'project' as const,
+            showSubagents: true,
+            excludeFirstChatSubstrings: [' build ', 'build'],
+            excludeFirstChatMustStart: true,
+          },
+          notifications: {
+            soundEnabled: false,
+          },
+          agentChat: {
+            defaultPlugins: ['fs'],
+          },
         },
         sessionOverrides: {},
         terminalOverrides: {},
         projectColors: {},
       }
-      await fsp.writeFile(configPath, JSON.stringify(partialConfig, null, 2))
+      await fsp.writeFile(configPath, JSON.stringify(legacyConfig, null, 2))
 
       const store = new ConfigStore()
       const config = await store.load()
 
-      expect(config.settings.theme).toBe('light')
-      // Default terminal settings should be merged in
-      expect(config.settings.terminal).toEqual(defaultSettings.terminal)
-      expect(config.settings.safety).toEqual(defaultSettings.safety)
-      expect(config.settings.uiScale).toBe(defaultSettings.uiScale)
-      expect(config.settings.sidebar).toEqual(defaultSettings.sidebar)
+      expect(config.settings).toEqual({
+        ...defaultSettings,
+        terminal: {
+          ...defaultSettings.terminal,
+          scrollback: 9000,
+        },
+        sidebar: {
+          excludeFirstChatSubstrings: ['build'],
+          excludeFirstChatMustStart: true,
+        },
+        agentChat: {
+          ...defaultSettings.agentChat,
+          defaultPlugins: ['fs'],
+        },
+      })
+      expect(config.legacyLocalSettingsSeed).toEqual({
+        theme: 'dark',
+        terminal: {
+          fontFamily: 'Fira Code',
+          fontSize: 18,
+        },
+        sidebar: {
+          sortMode: 'project',
+          showSubagents: true,
+        },
+        notifications: {
+          soundEnabled: false,
+        },
+      })
+      expect((config.settings as Record<string, unknown>).theme).toBeUndefined()
+
+      const saved = JSON.parse(await fsp.readFile(configPath, 'utf-8'))
+      expect(saved.legacyLocalSettingsSeed).toEqual(config.legacyLocalSettingsSeed)
+      expect(saved.settings.theme).toBeUndefined()
+      expect(saved.settings.sidebar.excludeFirstChatMustStart).toBe(true)
     })
 
     it('returns null for invalid version and creates default config', async () => {
@@ -228,7 +277,7 @@ describe('ConfigStore', () => {
         configPath,
         JSON.stringify({
           version: 1,
-          settings: { ...defaultSettings, theme: 'light' },
+          settings: { ...defaultSettings, defaultCwd: '/cached' },
           sessionOverrides: {},
           terminalOverrides: {},
           projectColors: {},
@@ -246,7 +295,7 @@ describe('ConfigStore', () => {
       const store = new ConfigStore()
       const config: UserConfig = {
         version: 1,
-        settings: { ...defaultSettings, theme: 'dark' },
+        settings: { ...defaultSettings, defaultCwd: '/workspace' },
         sessionOverrides: {},
         terminalOverrides: {},
         projectColors: {},
@@ -256,7 +305,7 @@ describe('ConfigStore', () => {
 
       const raw = await fsp.readFile(configPath, 'utf-8')
       const saved = JSON.parse(raw)
-      expect(saved.settings.theme).toBe('dark')
+      expect(saved.settings.defaultCwd).toBe('/workspace')
     })
 
     it('creates directory if needed', async () => {
@@ -294,7 +343,7 @@ describe('ConfigStore', () => {
       // Save new config
       const newConfig: UserConfig = {
         version: 1,
-        settings: { ...defaultSettings, theme: 'dark' },
+        settings: { ...defaultSettings, defaultCwd: '/workspace' },
         sessionOverrides: {},
         terminalOverrides: {},
         projectColors: {},
@@ -303,7 +352,7 @@ describe('ConfigStore', () => {
 
       // Subsequent load should return the saved config (from cache)
       const loaded = await store.load()
-      expect(loaded.settings.theme).toBe('dark')
+      expect(loaded.settings.defaultCwd).toBe('/workspace')
     })
 
     it('writes formatted JSON with indentation', async () => {
@@ -341,7 +390,7 @@ describe('ConfigStore', () => {
 
       const config: UserConfig = {
         version: 1,
-        settings: { ...defaultSettings, theme: 'dark' },
+        settings: { ...defaultSettings, defaultCwd: '/workspace' },
         sessionOverrides: {},
         terminalOverrides: {},
         projectColors: {},
@@ -371,7 +420,7 @@ describe('ConfigStore', () => {
 
       const config: UserConfig = {
         version: 1,
-        settings: { ...defaultSettings, theme: 'dark' },
+        settings: { ...defaultSettings, defaultCwd: '/workspace' },
         sessionOverrides: {},
         terminalOverrides: {},
         projectColors: {},
@@ -389,7 +438,7 @@ describe('ConfigStore', () => {
       const store = new ConfigStore()
       await store.load()
 
-      await store.patchSettings({ theme: 'dark' })
+      await store.patchSettings({ defaultCwd: '/workspace' })
 
       const backupExists = await fsp
         .access(backupConfigPath)
@@ -399,7 +448,7 @@ describe('ConfigStore', () => {
 
       const raw = await fsp.readFile(backupConfigPath, 'utf-8')
       const parsed = JSON.parse(raw)
-      expect(parsed.settings.theme).toBe('dark')
+      expect(parsed.settings.defaultCwd).toBe('/workspace')
     })
 
     it('does not fail config save when backup write fails', async () => {
@@ -409,11 +458,11 @@ describe('ConfigStore', () => {
       await fsp.rm(backupConfigPath, { recursive: true, force: true })
       await fsp.mkdir(backupConfigPath, { recursive: true })
 
-      await expect(store.patchSettings({ theme: 'light' })).resolves.toMatchObject({ theme: 'light' })
+      await expect(store.patchSettings({ defaultCwd: '/fallback' })).resolves.toMatchObject({ defaultCwd: '/fallback' })
 
       const raw = await fsp.readFile(configPath, 'utf-8')
       const parsed = JSON.parse(raw)
-      expect(parsed.settings.theme).toBe('light')
+      expect(parsed.settings.defaultCwd).toBe('/fallback')
     })
 
     it('reports backup existence correctly', async () => {
@@ -437,7 +486,7 @@ describe('ConfigStore', () => {
       await fsp.mkdir(configDir, { recursive: true })
       const existingConfig: UserConfig = {
         version: 1,
-        settings: { ...defaultSettings, theme: 'light' },
+        settings: { ...defaultSettings, defaultCwd: '/workspace' },
         sessionOverrides: {},
         terminalOverrides: {},
         projectColors: {},
@@ -447,7 +496,7 @@ describe('ConfigStore', () => {
       const store = new ConfigStore()
       const settings = await store.getSettings()
 
-      expect(settings.theme).toBe('light')
+      expect(settings.defaultCwd).toBe('/workspace')
     })
   })
 
@@ -456,9 +505,9 @@ describe('ConfigStore', () => {
       const store = new ConfigStore()
       await store.load()
 
-      const updated = await store.patchSettings({ theme: 'dark' })
+      const updated = await store.patchSettings({ defaultCwd: '/workspace' })
 
-      expect(updated.theme).toBe('dark')
+      expect(updated.defaultCwd).toBe('/workspace')
       // Other settings should remain default
       expect(updated.terminal).toEqual(defaultSettings.terminal)
       expect(updated.safety).toEqual(defaultSettings.safety)
@@ -469,24 +518,24 @@ describe('ConfigStore', () => {
       await store.load()
 
       const updated = await store.patchSettings({
-        terminal: { fontSize: 18 },
+        terminal: { scrollback: 18000 },
       })
 
-      expect(updated.terminal.fontSize).toBe(18)
+      expect(updated.terminal.scrollback).toBe(18000)
       // Other terminal settings should remain default
-      expect(updated.terminal.cursorBlink).toBe(defaultSettings.terminal.cursorBlink)
+      expect(updated.logging).toEqual(defaultSettings.logging)
     })
 
     it('persists updates to disk', async () => {
       const store = new ConfigStore()
       await store.load()
 
-      await store.patchSettings({ theme: 'light' })
+      await store.patchSettings({ defaultCwd: '/workspace' })
 
       // Read from disk directly
       const raw = await fsp.readFile(configPath, 'utf-8')
       const saved = JSON.parse(raw)
-      expect(saved.settings.theme).toBe('light')
+      expect(saved.settings.defaultCwd).toBe('/workspace')
     })
 
     it('can update safety settings', async () => {
@@ -509,6 +558,48 @@ describe('ConfigStore', () => {
       })
 
       expect(updated.defaultCwd).toBe('/custom/path')
+    })
+
+    it('preserves legacyLocalSettingsSeed and keeps moved local fields out of settings when saving server-backed changes', async () => {
+      await fsp.mkdir(configDir, { recursive: true })
+      await fsp.writeFile(configPath, JSON.stringify({
+        version: 1,
+        settings: {
+          theme: 'dark',
+          terminal: {
+            fontFamily: 'Fira Code',
+            scrollback: 9000,
+          },
+          agentChat: {
+            defaultPlugins: ['fs'],
+          },
+        },
+        sessionOverrides: {},
+        terminalOverrides: {},
+        projectColors: {},
+      }, null, 2))
+
+      const store = new ConfigStore()
+      await store.load()
+
+      const updated = await store.patchSettings({
+        agentChat: {
+          defaultPlugins: ['fs', 'search'],
+        },
+      })
+
+      expect(updated.agentChat.defaultPlugins).toEqual(['fs', 'search'])
+
+      const saved = JSON.parse(await fsp.readFile(configPath, 'utf-8'))
+      expect(saved.legacyLocalSettingsSeed).toEqual({
+        theme: 'dark',
+        terminal: {
+          fontFamily: 'Fira Code',
+        },
+      })
+      expect(saved.settings.theme).toBeUndefined()
+      expect(saved.settings.terminal.fontFamily).toBeUndefined()
+      expect(saved.settings.agentChat.defaultPlugins).toEqual(['fs', 'search'])
     })
 
   })
@@ -669,21 +760,25 @@ describe('ConfigStore', () => {
     it('returns current config state', async () => {
       const store = new ConfigStore()
       await store.load()
-      await store.patchSettings({ theme: 'dark' })
+      await store.patchSettings({ defaultCwd: '/workspace' })
 
       const snapshot = await store.snapshot()
 
       expect(snapshot.version).toBe(1)
-      expect(snapshot.settings.theme).toBe('dark')
+      expect(snapshot.settings.defaultCwd).toBe('/workspace')
     })
   })
 
   describe('settings validation (type safety)', () => {
-    it('theme must be valid enum value', async () => {
+    it('ignores moved local fields when loading malformed mixed settings', async () => {
       await fsp.mkdir(configDir, { recursive: true })
       const invalidConfig = {
         version: 1,
-        settings: { ...defaultSettings, theme: 'invalid-theme' },
+        settings: {
+          ...defaultSettings,
+          theme: 'invalid-theme',
+          terminal: { scrollback: 5000, fontSize: 20 },
+        },
         sessionOverrides: {},
         terminalOverrides: {},
         projectColors: {},
@@ -693,20 +788,39 @@ describe('ConfigStore', () => {
       const store = new ConfigStore()
       const config = await store.load()
 
-      // The current implementation doesn't validate - it just passes through
-      // This documents the actual behavior
-      expect(config.settings.theme).toBe('invalid-theme')
-    })
-
-    it('terminal fontSize accepts number values', async () => {
-      const store = new ConfigStore()
-      await store.load()
-
-      const updated = await store.patchSettings({
+      expect((config.settings as Record<string, unknown>).theme).toBeUndefined()
+      expect(config.settings.terminal.scrollback).toBe(5000)
+      expect(config.legacyLocalSettingsSeed).toEqual({
         terminal: { fontSize: 20 },
       })
+    })
 
-      expect(updated.terminal.fontSize).toBe(20)
+    it('agentChat defaultPlugins survives load and patch', async () => {
+      await fsp.mkdir(configDir, { recursive: true })
+      const existingConfig: UserConfig = {
+        version: 1,
+        settings: {
+          ...defaultSettings,
+          agentChat: {
+            ...defaultSettings.agentChat,
+            defaultPlugins: ['fs'],
+          },
+        },
+        sessionOverrides: {},
+        terminalOverrides: {},
+        projectColors: {},
+      }
+      await fsp.writeFile(configPath, JSON.stringify(existingConfig))
+
+      const store = new ConfigStore()
+      const loaded = await store.load()
+      expect(loaded.settings.agentChat.defaultPlugins).toEqual(['fs'])
+
+      const updated = await store.patchSettings({
+        agentChat: { defaultPlugins: ['fs', 'search'] },
+      })
+
+      expect(updated.agentChat.defaultPlugins).toEqual(['fs', 'search'])
     })
 
     it('terminal scrollback accepts number values', async () => {
@@ -750,7 +864,7 @@ describe('ConfigStore', () => {
     })
 
     it('defaultSettings includes empty agentChat providers', () => {
-      expect(defaultSettings.agentChat).toEqual({ providers: {} })
+      expect(defaultSettings.agentChat).toEqual({ defaultPlugins: [], providers: {} })
     })
 
     it('migrates legacy flat freshclaude settings to agentChat.providers.freshclaude on load', async () => {
@@ -863,7 +977,7 @@ describe('ConfigStore', () => {
       const config = await store.load()
 
       // Should merge with defaults
-      expect(config.settings.theme).toBe(defaultSettings.theme)
+      expect(config.settings.defaultCwd).toBe(defaultSettings.defaultCwd)
       expect(config.settings.terminal).toEqual(defaultSettings.terminal)
     })
 
@@ -891,7 +1005,7 @@ describe('ConfigStore', () => {
       await store.load()
 
       // Run saves sequentially
-      await store.patchSettings({ theme: 'dark' })
+      await store.patchSettings({ defaultCwd: '/workspace' })
       await store.setProjectColor('/p1', '#000')
       await store.patchSessionOverride('s1', { titleOverride: 'T1' })
 
@@ -901,7 +1015,7 @@ describe('ConfigStore', () => {
 
       // Verify all changes were persisted
       const parsed = JSON.parse(raw)
-      expect(parsed.settings.theme).toBe('dark')
+      expect(parsed.settings.defaultCwd).toBe('/workspace')
       expect(parsed.projectColors['/p1']).toBe('#000')
       expect(parsed.sessionOverrides['s1'].titleOverride).toBe('T1')
     })
