@@ -39,6 +39,14 @@ vi.mock('../../../server/wsl-port-forward.js', () => ({
     scriptKind: 'full',
     script: '$null # mock script',
   }),
+  computeWslPortForwardingTeardownPlan: vi.fn().mockReturnValue({
+    status: 'ready',
+    script: '$null # mock teardown script',
+  }),
+  computeWslPortForwardingTeardownPlanAsync: vi.fn().mockResolvedValue({
+    status: 'ready',
+    script: '$null # mock teardown script',
+  }),
 }))
 vi.mock('node:child_process', async () => {
   const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process')
@@ -72,14 +80,36 @@ describe('Network API integration', () => {
   })
 
   beforeEach(async () => {
-    vi.clearAllMocks()
+    const cp = await import('node:child_process')
+    vi.mocked(cp.execFile).mockReset()
+    vi.mocked(detectFirewall).mockReset()
+    vi.mocked(isPortReachable).mockReset()
+    vi.mocked(wslModule.computeWslPortForwardingPlan).mockReset()
+    vi.mocked(wslModule.computeWslPortForwardingPlanAsync).mockReset()
+    vi.mocked(wslModule.computeWslPortForwardingTeardownPlan).mockReset()
+    vi.mocked(wslModule.computeWslPortForwardingTeardownPlanAsync).mockReset()
     delete process.env.HOST
     vi.mocked(detectFirewall).mockResolvedValue({ platform: 'linux-none', active: false })
+    vi.mocked(isPortReachable).mockResolvedValue(false)
+    vi.mocked(wslModule.computeWslPortForwardingPlan).mockReturnValue({
+      status: 'ready',
+      wslIp: '172.24.0.2',
+      scriptKind: 'full',
+      script: '$null # mock script',
+    })
     vi.mocked(wslModule.computeWslPortForwardingPlanAsync).mockResolvedValue({
       status: 'ready',
       wslIp: '172.24.0.2',
       scriptKind: 'full',
       script: '$null # mock script',
+    })
+    vi.mocked(wslModule.computeWslPortForwardingTeardownPlan).mockReturnValue({
+      status: 'ready',
+      script: '$null # mock teardown script',
+    })
+    vi.mocked(wslModule.computeWslPortForwardingTeardownPlanAsync).mockResolvedValue({
+      status: 'ready',
+      script: '$null # mock teardown script',
     })
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-test-'))
     process.env.FRESHELL_HOME = tmpDir
@@ -1203,6 +1233,129 @@ describe('Network API integration', () => {
 
       finishRepair?.()
       networkManager.setFirewallConfiguring(false)
+    })
+  })
+
+  describe('POST /api/network/disable-remote-access', () => {
+    it('returns confirmation-required for WSL disable while Windows exposure is still active', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+      await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+      vi.mocked(isPortReachable).mockResolvedValue(true)
+
+      const cp = await import('node:child_process')
+      vi.mocked(wslModule.computeWslPortForwardingTeardownPlanAsync).mockResolvedValue({
+        status: 'ready',
+        script: '$null # mock teardown script',
+      })
+
+      const res = await request(app)
+        .post('/api/network/disable-remote-access')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(res.status).toBe(200)
+      expectConfirmationRequired(res.body)
+      expect(cp.execFile).not.toHaveBeenCalled()
+
+      const settings = await configStore.getSettings()
+      expect(settings.network).toEqual(expect.objectContaining({
+        configured: true,
+        host: '0.0.0.0',
+      }))
+    })
+
+    it('disables WSL remote access immediately when no privileged teardown is needed', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+      vi.mocked(wslModule.computeWslPortForwardingTeardownPlanAsync).mockResolvedValue({
+        status: 'noop',
+      })
+
+      const cp = await import('node:child_process')
+      const res = await request(app)
+        .post('/api/network/disable-remote-access')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({ method: 'none', message: 'Remote access disabled' })
+      expect(cp.execFile).not.toHaveBeenCalled()
+
+      const settings = await configStore.getSettings()
+      expect(settings.network).toEqual(expect.objectContaining({
+        configured: true,
+        host: '127.0.0.1',
+      }))
+    })
+
+    it('starts confirmed WSL disable and stops advertising a LAN URL after teardown completes', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+      await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+      vi.mocked(isPortReachable).mockResolvedValue(true)
+      vi.mocked(wslModule.computeWslPortForwardingTeardownPlanAsync).mockResolvedValue({
+        status: 'ready',
+        script: '$null # mock teardown script',
+      })
+
+      const cp = await import('node:child_process')
+      let finishDisable: ((error?: Error | null) => void) | null = null
+      vi.mocked(cp.execFile).mockImplementation((_cmd: any, _args: any, _opts: any, cb: any) => {
+        finishDisable = (error = null) => {
+          cb?.(error, '', '')
+        }
+        return { on: vi.fn() } as any
+      })
+
+      const firstRes = await request(app)
+        .post('/api/network/disable-remote-access')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(firstRes.status).toBe(200)
+      expectConfirmationRequired(firstRes.body)
+
+      const startedRes = await request(app)
+        .post('/api/network/disable-remote-access')
+        .set('x-auth-token', token)
+        .send({
+          confirmElevation: true,
+          confirmationToken: firstRes.body.confirmationToken,
+        })
+
+      expect(startedRes.status).toBe(200)
+      expect(startedRes.body).toEqual({ method: 'wsl2', status: 'started' })
+
+      vi.mocked(isPortReachable).mockResolvedValue(false)
+      finishDisable?.()
+
+      await vi.waitFor(async () => {
+        const settings = await configStore.getSettings()
+        expect(settings.network).toEqual(expect.objectContaining({
+          configured: true,
+          host: '127.0.0.1',
+        }))
+      })
+
+      const statusRes = await request(app)
+        .get('/api/network/status')
+        .set('x-auth-token', token)
+
+      expect(statusRes.status).toBe(200)
+      expect(statusRes.body.remoteAccessEnabled).toBe(false)
+      expect(statusRes.body.remoteAccessRequested).toBe(false)
+      expect(statusRes.body.accessUrl).toContain('localhost')
+      expect(statusRes.body.accessUrl).not.toContain('192.168.1.100')
     })
   })
 })

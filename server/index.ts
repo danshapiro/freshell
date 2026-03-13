@@ -666,40 +666,52 @@ async function main() {
 
   server.listen(port, bindHost, () => {
     log.info({ event: 'server_listening', port, host: bindHost, appVersion: APP_VERSION }, 'Server listening')
-
-    // Print friendly startup message
-    const token = process.env.AUTH_TOKEN
-    const lanIps = detectLanIps()
-    const lanIp = lanIps[0] || 'localhost'
-    const visitPort = resolveVisitPort(port, process.env)
-    const hideToken = process.env.HIDE_STARTUP_TOKEN?.toLowerCase() === 'true'
-    const url = hideToken
-      ? `http://${lanIp}:${visitPort}/`
-      : `http://${lanIp}:${visitPort}/?token=${token}`
-
-    console.log('')
-    console.log(`\x1b[32m\u{1F41A}\u{1F525} freshell is ready!\x1b[0m`)
-    if (bindHost === '127.0.0.1') {
+    void (async () => {
+      const token = process.env.AUTH_TOKEN
+      const visitPort = resolveVisitPort(port, process.env)
+      const hideToken = process.env.HIDE_STARTUP_TOKEN?.toLowerCase() === 'true'
       const localUrl = hideToken
         ? `http://localhost:${visitPort}/`
         : `http://localhost:${visitPort}/?token=${token}`
-      console.log(`   Local only: \x1b[36m${localUrl}\x1b[0m`)
-      if (hideToken) {
-        console.log('   Auth token is configured in .env (not printed to logs).')
-      }
-      console.log(`   Run the setup wizard to enable remote access.`)
-    } else {
-      console.log(`   Visit from anywhere on your network: \x1b[36m${url}\x1b[0m`)
-      if (hideToken) {
-        console.log('   Auth token is configured in .env (not printed to logs).')
-      }
-    }
-    if (isDev) {
-      console.log(`   \x1b[33m(dev mode: Vite client on port ${visitPort}, Express server on port ${port})\x1b[0m`)
-    }
-    console.log('')
 
-    startBackgroundTasks()
+      let advertisedUrl = localUrl
+      let remoteAccessEnabled = bindHost !== '127.0.0.1'
+
+      try {
+        const startupStatus = await networkManager.getStatus()
+        remoteAccessEnabled = startupStatus.remoteAccessEnabled
+        if (hideToken) {
+          const parsed = new URL(startupStatus.accessUrl)
+          parsed.searchParams.delete('token')
+          advertisedUrl = parsed.toString()
+        } else {
+          advertisedUrl = startupStatus.accessUrl
+        }
+      } catch (err) {
+        log.warn({ err }, 'Failed to resolve startup network status for banner output')
+      }
+
+      console.log('')
+      console.log(`\x1b[32m\u{1F41A}\u{1F525} freshell is ready!\x1b[0m`)
+      if (!remoteAccessEnabled) {
+        console.log(`   Local only: \x1b[36m${localUrl}\x1b[0m`)
+        if (hideToken) {
+          console.log('   Auth token is configured in .env (not printed to logs).')
+        }
+        console.log('   Run the setup wizard to enable remote access.')
+      } else {
+        console.log(`   Visit from anywhere on your network: \x1b[36m${advertisedUrl}\x1b[0m`)
+        if (hideToken) {
+          console.log('   Auth token is configured in .env (not printed to logs).')
+        }
+      }
+      if (isDev) {
+        console.log(`   \x1b[33m(dev mode: Vite client on port ${visitPort}, Express server on port ${port})\x1b[0m`)
+      }
+      console.log('')
+
+      startBackgroundTasks()
+    })()
   })
 
   // Graceful shutdown handler

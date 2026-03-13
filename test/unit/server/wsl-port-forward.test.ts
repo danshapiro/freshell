@@ -20,6 +20,8 @@ import {
   getExistingFirewallPorts,
   needsFirewallUpdate,
   buildFirewallOnlyScript,
+  buildPortForwardingTeardownScript,
+  computeWslPortForwardingTeardownPlan,
   type PortProxyRule
 } from '../../../server/wsl-port-forward.js'
 
@@ -544,6 +546,62 @@ Address         Port        Address         Port
         wslIp: '172.30.149.249',
         scriptKind: 'full',
         script: expect.stringContaining('connectaddress=172.30.149.249 connectport=3001'),
+      })
+    })
+  })
+
+  describe('buildPortForwardingTeardownScript', () => {
+    it('removes relevant portproxy rules and the Freshell firewall rule', () => {
+      const script = buildPortForwardingTeardownScript([3001, 5173])
+
+      expect(script).toContain('netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=3001')
+      expect(script).toContain('netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=5173')
+      expect(script).toContain('netsh advfirewall firewall delete rule name=FreshellLANAccess')
+      expect(script).toContain('2>\\$null')
+    })
+  })
+
+  describe('computeWslPortForwardingTeardownPlan', () => {
+    it('returns not-wsl2 when not running in WSL2', () => {
+      vi.mocked(isWSL2).mockReturnValue(false)
+
+      expect(computeWslPortForwardingTeardownPlan([3001])).toEqual({ status: 'not-wsl2' })
+    })
+
+    it('returns noop when no relevant Windows exposure remains', () => {
+      vi.mocked(isWSL2).mockReturnValue(true)
+      vi.mocked(execSync)
+        .mockReturnValueOnce(`
+Listen on ipv4:             Connect to ipv4:
+
+Address         Port        Address         Port
+--------------- ----------  --------------- ----------
+`)
+        .mockImplementationOnce(() => {
+          throw new Error('rule not found')
+        })
+
+      expect(computeWslPortForwardingTeardownPlan([3001])).toEqual({ status: 'noop' })
+    })
+
+    it('returns a teardown script when Freshell portproxy or firewall exposure still exists', () => {
+      vi.mocked(isWSL2).mockReturnValue(true)
+      vi.mocked(execSync)
+        .mockReturnValueOnce(`
+Listen on ipv4:             Connect to ipv4:
+
+Address         Port        Address         Port
+--------------- ----------  --------------- ----------
+0.0.0.0         3001        172.30.149.249  3001
+`)
+        .mockReturnValueOnce(`
+Rule Name:                            FreshellLANAccess
+LocalPort:                            3001
+`)
+
+      expect(computeWslPortForwardingTeardownPlan([3001])).toEqual({
+        status: 'ready',
+        script: buildPortForwardingTeardownScript([3001]).replace(/\\\$/g, '$'),
       })
     })
   })

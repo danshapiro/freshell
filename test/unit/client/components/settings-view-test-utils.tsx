@@ -104,6 +104,7 @@ export function createTabRegistryState(overrides: Partial<TabRegistryState> = {}
 
 export function createNetworkStatus(overrides: Partial<NetworkStatusResponse> = {}): NetworkStatusResponse {
   const host = overrides.host ?? '0.0.0.0'
+  const remoteAccessEnabled = overrides.remoteAccessEnabled ?? (host === '0.0.0.0')
   return {
     configured: true,
     host,
@@ -117,7 +118,8 @@ export function createNetworkStatus(overrides: Partial<NetworkStatusResponse> = 
       commands: [],
       configuring: false,
     },
-    remoteAccessEnabled: overrides.remoteAccessEnabled ?? (host === '0.0.0.0'),
+    remoteAccessEnabled,
+    remoteAccessRequested: overrides.remoteAccessRequested ?? remoteAccessEnabled,
     rebinding: false,
     devMode: false,
     accessUrl: 'http://192.168.1.100:3001/?token=abc',

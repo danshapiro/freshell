@@ -7,11 +7,13 @@ describe('WSL port forwarding integration', () => {
     const wslModule = await import('../../../server/wsl-port-forward.js')
 
     expect(typeof wslModule.computeWslPortForwardingPlan).toBe('function')
+    expect(typeof wslModule.computeWslPortForwardingTeardownPlan).toBe('function')
     expect(typeof wslModule.getWslIp).toBe('function')
     expect(typeof wslModule.getRequiredPorts).toBe('function')
     expect('setupWslPortForwarding' in wslModule).toBe(false)
     expect(typeof wslModule.buildPortForwardingScript).toBe('function')
     expect(typeof wslModule.buildFirewallOnlyScript).toBe('function')
+    expect(typeof wslModule.buildPortForwardingTeardownScript).toBe('function')
   })
 
   it('keeps boot-time WSL repair removed from the server startup path', () => {

@@ -13,6 +13,7 @@ export interface NetworkStatus {
   configured: boolean
   host: '127.0.0.1' | '0.0.0.0'
   remoteAccessEnabled: boolean
+  remoteAccessRequested: boolean
   port: number
   lanIps: string[]
   machineHostname: string
@@ -147,8 +148,13 @@ export class NetworkManager {
       ? firewallCommands(firewallInfo.platform, ports)
       : []
 
+    const remoteAccessRequested = isRemoteAccessEnabled(network, effectiveHost, firewallInfo.platform)
+    const remoteAccessEnabled = firewallInfo.platform === 'wsl2'
+      ? portOpen === true
+      : remoteAccessRequested
+
     const token = process.env.AUTH_TOKEN ?? ''
-    const accessHost = effectiveHost === '0.0.0.0'
+    const accessHost = remoteAccessEnabled
       ? (this.lanIps[0] ?? 'localhost')
       : 'localhost'
     const accessPort = this.devMode && this.devPort ? this.devPort : this.port
@@ -157,7 +163,8 @@ export class NetworkManager {
     return {
       configured: network.configured,
       host: effectiveHost,
-      remoteAccessEnabled: isRemoteAccessEnabled(network, effectiveHost, firewallInfo.platform),
+      remoteAccessEnabled,
+      remoteAccessRequested,
       port: this.port,
       lanIps: this.lanIps,
       machineHostname: os.hostname().replace(/\.local$/, ''),

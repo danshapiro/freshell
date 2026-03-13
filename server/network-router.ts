@@ -4,7 +4,10 @@ import { z } from 'zod'
 import { spawnElevatedPowerShell } from './elevated-powershell.js'
 import { logger } from './logger.js'
 import { isRemoteAccessEnabled } from './network-access.js'
-import { computeWslPortForwardingPlanAsync } from './wsl-port-forward.js'
+import {
+  computeWslPortForwardingPlanAsync,
+  computeWslPortForwardingTeardownPlanAsync,
+} from './wsl-port-forward.js'
 
 const log = logger.child({ component: 'network-router' })
 
@@ -39,11 +42,16 @@ const REMOTE_ACCESS_DISABLED = {
   message: 'Remote access is not enabled',
 } as const
 
-type RepairPlatform = 'windows' | 'wsl2'
+const REMOTE_ACCESS_DISABLED_SUCCESS = {
+  method: 'none',
+  message: 'Remote access disabled',
+} as const
+
+type ConfirmationAction = 'windows-repair' | 'wsl2-repair' | 'wsl2-disable'
 
 type ConfirmableRepairAction = {
   kind: 'confirmable'
-  platform: RepairPlatform
+  confirmationAction: ConfirmationAction
   script: string
   responseMethod: 'windows-elevated' | 'wsl2'
 }
@@ -75,7 +83,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
   const { networkManager, configStore, wsHandler, detectLanIps } = deps
   const router = Router()
   const FIREWALL_REPAIR_LOCKED = Symbol('FIREWALL_REPAIR_LOCKED')
-  let currentConfirmation: { token: string; platform: RepairPlatform } | null = null
+  let currentConfirmation: { token: string; action: ConfirmationAction } | null = null
   let confirmedRepairInFlight = false
 
   const consumeCurrentConfirmation = (token: string | undefined) => {
@@ -87,6 +95,20 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
     return true
   }
 
+  const broadcastSettingsUpdated = async () => {
+    try {
+      const fullSettings = await configStore.getSettings()
+      wsHandler.broadcast({ type: 'settings.updated', settings: fullSettings })
+    } catch (broadcastErr) {
+      log.error({ err: broadcastErr }, 'Failed to broadcast settings after network configure')
+    }
+  }
+
+  const applyRemoteAccessSetting = async (host: '127.0.0.1' | '0.0.0.0') => {
+    await networkManager.configure({ host, configured: true })
+    await broadcastSettingsUpdated()
+  }
+
   const startElevatedRepair = (
     command: string,
     script: string,
@@ -94,11 +116,13 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
       completedLog,
       failedLog,
       spawnFailedLog,
+      onSuccess,
       releaseConfirmedRepair,
     }: {
       completedLog: string
       failedLog: string
       spawnFailedLog: string
+      onSuccess?: () => Promise<void> | void
       releaseConfirmedRepair: () => void
     },
   ) => {
@@ -113,12 +137,21 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
 
     try {
       const child = spawnElevatedPowerShell(command, script, (err, _stdout, stderr) => {
-        if (err) {
-          log.error({ err, stderr }, failedLog)
-        } else {
-          log.info(completedLog)
-        }
-        settleRepair()
+        void (async () => {
+          if (err) {
+            log.error({ err, stderr }, failedLog)
+          } else {
+            log.info(completedLog)
+            if (onSuccess) {
+              try {
+                await onSuccess()
+              } catch (onSuccessErr) {
+                log.error({ err: onSuccessErr }, 'Failed to apply post-repair network settings')
+              }
+            }
+          }
+          settleRepair()
+        })()
       })
 
       child.on('error', (err) => {
@@ -131,23 +164,23 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
     }
   }
 
-  const issueConfirmation = (platform: RepairPlatform) => {
+  const issueConfirmation = (action: ConfirmationAction) => {
     const confirmationToken = randomUUID()
-    currentConfirmation = { token: confirmationToken, platform }
+    currentConfirmation = { token: confirmationToken, action }
     return {
       ...WINDOWS_ELEVATION_CONFIRMATION,
       confirmationToken,
     }
   }
 
-  const matchesConfirmation = (token: string | undefined, platform: RepairPlatform) => {
+  const matchesConfirmation = (token: string | undefined, action: ConfirmationAction) => {
     return currentConfirmation !== null
       && currentConfirmation.token === token
-      && currentConfirmation.platform === platform
+      && currentConfirmation.action === action
   }
 
-  const consumeConfirmation = (token: string | undefined, platform: RepairPlatform) => {
-    if (!matchesConfirmation(token, platform)) {
+  const consumeConfirmation = (token: string | undefined, action: ConfirmationAction) => {
+    if (!matchesConfirmation(token, action)) {
       return false
     }
 
@@ -197,7 +230,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
 
       return {
         kind: 'confirmable',
-        platform: 'wsl2',
+        confirmationAction: 'wsl2-repair',
         script: plan.script,
         responseMethod: 'wsl2',
       }
@@ -213,7 +246,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
 
       return {
         kind: 'confirmable',
-        platform: 'windows',
+        confirmationAction: 'windows-repair',
         script: status.firewall.commands.join('; '),
         responseMethod: 'windows-elevated',
       }
@@ -226,6 +259,36 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
     return {
       kind: 'terminal',
       response: { method: 'terminal', command: status.firewall.commands.join(' && ') },
+    }
+  }
+
+  const resolveWslDisableAction = async (
+    status: Awaited<ReturnType<NetworkRouterDeps['networkManager']['getStatus']>>,
+    settings: Awaited<ReturnType<NetworkRouterDeps['configStore']['getSettings']>>,
+  ): Promise<RepairActionResolution> => {
+    if (status.firewall.platform !== 'wsl2') {
+      return { kind: 'none', response: REMOTE_ACCESS_DISABLED }
+    }
+
+    const remoteAccessRequested = isRemoteAccessEnabled(settings.network, status.host, status.firewall.platform)
+    const teardownPlan = await computeWslPortForwardingTeardownPlanAsync(networkManager.getRelevantPorts())
+
+    if (teardownPlan.status === 'not-wsl2') {
+      return { kind: 'none', response: REMOTE_ACCESS_DISABLED }
+    }
+
+    if (teardownPlan.status === 'noop') {
+      return {
+        kind: 'none',
+        response: remoteAccessRequested ? REMOTE_ACCESS_DISABLED_SUCCESS : REMOTE_ACCESS_DISABLED,
+      }
+    }
+
+    return {
+      kind: 'confirmable',
+      confirmationAction: 'wsl2-disable',
+      script: teardownPlan.script,
+      responseMethod: 'wsl2',
     }
   }
 
@@ -257,12 +320,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
       res.status(500).json({ error: 'Failed to configure network' })
       return
     }
-    try {
-      const fullSettings = await configStore.getSettings()
-      wsHandler.broadcast({ type: 'settings.updated', settings: fullSettings })
-    } catch (broadcastErr) {
-      log.error({ err: broadcastErr }, 'Failed to broadcast settings after network configure')
-    }
+    await broadcastSettingsUpdated()
   })
 
   router.post('/network/cancel-firewall-confirmation', (req, res) => {
@@ -273,6 +331,142 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
 
     consumeCurrentConfirmation(parsed.data.confirmationToken)
     return res.status(204).send()
+  })
+
+  router.post('/network/disable-remote-access', async (req, res) => {
+    const parsed = ConfigureFirewallRequestSchema.safeParse(req.body ?? {})
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })
+    }
+
+    try {
+      const confirmElevation = parsed.data.confirmElevation === true
+      const confirmationToken = parsed.data.confirmationToken
+      const [status, settings] = await Promise.all([
+        networkManager.getStatus(),
+        configStore.getSettings(),
+      ])
+      const action = await resolveWslDisableAction(status, settings)
+
+      if (action.kind === 'error') {
+        if (confirmElevation) {
+          consumeCurrentConfirmation(confirmationToken)
+        }
+        return res.status(500).json({ error: action.error })
+      }
+
+      if (action.kind === 'terminal') {
+        if (confirmElevation) {
+          consumeCurrentConfirmation(confirmationToken)
+        }
+        return res.status(500).json({ error: 'Invalid WSL disable action' })
+      }
+
+      if (action.kind === 'none') {
+        if (action.response.message === REMOTE_ACCESS_DISABLED_SUCCESS.message) {
+          await applyRemoteAccessSetting('127.0.0.1')
+        }
+        if (confirmElevation) {
+          consumeCurrentConfirmation(confirmationToken)
+        }
+        return res.json(action.response)
+      }
+
+      if (confirmedRepairInFlight) {
+        return res.status(409).json({
+          error: 'Firewall configuration already in progress',
+          method: 'in-progress',
+        })
+      }
+
+      if (!confirmElevation || !matchesConfirmation(confirmationToken, action.confirmationAction)) {
+        return res.json(issueConfirmation(action.confirmationAction))
+      }
+
+      const releaseConfirmedRepair = acquireConfirmedRepairLock()
+      if (releaseConfirmedRepair === FIREWALL_REPAIR_LOCKED) {
+        return res.status(409).json({
+          error: 'Firewall configuration already in progress',
+          method: 'in-progress',
+        })
+      }
+
+      const lockedResult = await (async () => {
+        const [freshStatus, freshSettings] = await Promise.all([
+          networkManager.getStatus(),
+          configStore.getSettings(),
+        ])
+        const freshAction = await resolveWslDisableAction(freshStatus, freshSettings)
+
+        if (freshAction.kind === 'error') {
+          consumeCurrentConfirmation(confirmationToken)
+          releaseConfirmedRepair()
+          return {
+            status: 500 as const,
+            body: { error: freshAction.error },
+          }
+        }
+
+        if (freshAction.kind === 'terminal') {
+          consumeCurrentConfirmation(confirmationToken)
+          releaseConfirmedRepair()
+          return {
+            status: 500 as const,
+            body: { error: 'Invalid WSL disable action' },
+          }
+        }
+
+        if (freshAction.kind === 'none') {
+          consumeCurrentConfirmation(confirmationToken)
+          if (freshAction.response.message === REMOTE_ACCESS_DISABLED_SUCCESS.message) {
+            await applyRemoteAccessSetting('127.0.0.1')
+          }
+          releaseConfirmedRepair()
+          return { status: 200 as const, body: freshAction.response }
+        }
+
+        if (!consumeConfirmation(confirmationToken, freshAction.confirmationAction)) {
+          releaseConfirmedRepair()
+          return {
+            status: 200 as const,
+            body: issueConfirmation(freshAction.confirmationAction),
+          }
+        }
+
+        try {
+          startElevatedRepair(
+            '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe',
+            freshAction.script,
+            {
+              completedLog: 'WSL2 remote access teardown completed successfully',
+              failedLog: 'WSL2 remote access teardown failed',
+              spawnFailedLog: 'Failed to spawn PowerShell for WSL2 remote access teardown',
+              onSuccess: async () => {
+                await applyRemoteAccessSetting('127.0.0.1')
+              },
+              releaseConfirmedRepair,
+            },
+          )
+
+          return {
+            status: 200 as const,
+            body: { method: freshAction.responseMethod, status: 'started' as const },
+          }
+        } catch (err) {
+          log.error({ err }, 'WSL2 remote access teardown error')
+          releaseConfirmedRepair()
+          return {
+            status: 500 as const,
+            body: { error: 'WSL2 remote access teardown failed to start' },
+          }
+        }
+      })()
+
+      return res.status(lockedResult.status).json(lockedResult.body)
+    } catch (err) {
+      log.error({ err }, 'Remote access disable error')
+      res.status(500).json({ error: 'Remote access disable failed' })
+    }
   })
 
   router.post('/network/configure-firewall', async (req, res) => {
@@ -311,8 +505,8 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
         })
       }
 
-      if (!confirmElevation || !matchesConfirmation(confirmationToken, action.platform)) {
-        return res.json(issueConfirmation(action.platform))
+      if (!confirmElevation || !matchesConfirmation(confirmationToken, action.confirmationAction)) {
+        return res.json(issueConfirmation(action.confirmationAction))
       }
 
       const releaseConfirmedRepair = acquireConfirmedRepairLock()
@@ -345,21 +539,21 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
           return { status: 200 as const, body: freshAction.response }
         }
 
-        if (!consumeConfirmation(confirmationToken, freshAction.platform)) {
+        if (!consumeConfirmation(confirmationToken, freshAction.confirmationAction)) {
           releaseConfirmedRepair()
           return {
             status: 200 as const,
-            body: issueConfirmation(freshAction.platform),
+            body: issueConfirmation(freshAction.confirmationAction),
           }
         }
 
         try {
           startElevatedRepair(
-            freshAction.platform === 'wsl2'
+            freshAction.confirmationAction === 'wsl2-repair'
               ? '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
               : 'powershell.exe',
             freshAction.script,
-            freshAction.platform === 'wsl2'
+            freshAction.confirmationAction === 'wsl2-repair'
               ? {
                 completedLog: 'WSL2 port forwarding completed successfully',
                 failedLog: 'WSL2 port forwarding failed',
@@ -381,7 +575,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
         } catch (err) {
           log.error(
             { err },
-            freshAction.platform === 'wsl2'
+            freshAction.confirmationAction === 'wsl2-repair'
               ? 'WSL2 port forwarding setup error'
               : 'Windows firewall setup error',
           )
@@ -389,7 +583,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
           return {
             status: 500 as const,
             body: {
-              error: freshAction.platform === 'wsl2'
+              error: freshAction.confirmationAction === 'wsl2-repair'
                 ? 'WSL2 port forwarding failed to start'
                 : 'Windows firewall configuration failed to start',
             },

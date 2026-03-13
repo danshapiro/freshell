@@ -99,10 +99,12 @@ describe('NetworkManager', () => {
 
   it('reports WSL remote access intent separately from the effective bind host', async () => {
     const firewallModule = await import('../../../server/firewall.js')
+    const portReachable = await import('is-port-reachable')
     vi.mocked(firewallModule.detectFirewall).mockResolvedValue({
       platform: 'wsl2',
       active: true,
     })
+    vi.mocked(portReachable.default).mockResolvedValue(false)
     mockConfigStore = createMockConfigStore({
       network: {
         host: '127.0.0.1',
@@ -116,6 +118,59 @@ describe('NetworkManager', () => {
 
     expect(status.host).toBe('0.0.0.0')
     expect(status.remoteAccessEnabled).toBe(false)
+    expect((status as any).remoteAccessRequested).toBe(false)
+  })
+
+  it('reports requested-but-unrepaired WSL remote access as local-only with a repairable intent', async () => {
+    const firewallModule = await import('../../../server/firewall.js')
+    const portReachable = await import('is-port-reachable')
+    vi.mocked(firewallModule.detectFirewall).mockResolvedValue({
+      platform: 'wsl2',
+      active: true,
+    })
+    vi.mocked(portReachable.default).mockResolvedValue(false)
+    mockConfigStore = createMockConfigStore({
+      network: {
+        host: '0.0.0.0',
+        configured: true,
+      },
+    })
+    manager = new NetworkManager(server, mockConfigStore, 0)
+    await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+
+    const status = await manager.getStatus()
+
+    expect(status.host).toBe('0.0.0.0')
+    expect(status.remoteAccessEnabled).toBe(false)
+    expect((status as any).remoteAccessRequested).toBe(true)
+    expect(status.accessUrl).toContain('localhost')
+    expect(status.accessUrl).not.toContain('192.168.1.100')
+  })
+
+  it('reports stale WSL LAN exposure as still remotely accessible until teardown completes', async () => {
+    const firewallModule = await import('../../../server/firewall.js')
+    const portReachable = await import('is-port-reachable')
+    vi.mocked(firewallModule.detectFirewall).mockResolvedValue({
+      platform: 'wsl2',
+      active: true,
+    })
+    vi.mocked(portReachable.default).mockResolvedValue(true)
+    mockConfigStore = createMockConfigStore({
+      network: {
+        host: '127.0.0.1',
+        configured: true,
+      },
+    })
+    manager = new NetworkManager(server, mockConfigStore, testPort)
+    await new Promise<void>((resolve) => server.listen(testPort, '0.0.0.0', resolve))
+
+    const status = await manager.getStatus()
+
+    expect(status.host).toBe('0.0.0.0')
+    expect(status.remoteAccessEnabled).toBe(true)
+    expect((status as any).remoteAccessRequested).toBe(false)
+    expect(status.accessUrl).toContain('192.168.1.100')
+    expect(status.accessUrl).not.toContain('localhost')
   })
 
   it('does not hot rebind WSL when only the saved remote-access intent changes', async () => {
@@ -148,10 +203,6 @@ describe('NetworkManager', () => {
 
     const addr = server.address()
     expect(addr && typeof addr === 'object' ? addr.address : null).toBe('0.0.0.0')
-
-    const status = await manager.getStatus()
-    expect(status.host).toBe('0.0.0.0')
-    expect(status.remoteAccessEnabled).toBe(false)
   })
 
   it('hot rebinds from localhost to 0.0.0.0', async () => {

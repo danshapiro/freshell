@@ -9,7 +9,7 @@ import {
   setTabRegistryDismissedDeviceIds,
   setTabRegistryDeviceLabel,
 } from '@/store/tabRegistrySlice'
-import { api } from '@/lib/api'
+import { api, type ApiError } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { terminalThemes, darkThemes, lightThemes, getTerminalTheme } from '@/lib/terminal-themes'
 import { resolveTerminalFontFamily, saveLocalTerminalFontFamily } from '@/lib/terminal-fonts'
@@ -84,6 +84,9 @@ type PreviewToken = {
 }
 
 type FirewallConfirmation = Extract<ConfigureFirewallResult, { method: 'confirmation-required' }>
+type PendingConfirmation =
+  | { kind: 'firewall-fix'; request: FirewallConfirmation }
+  | { kind: 'wsl-disable'; request: FirewallConfirmation }
 type FirewallState = NetworkStatusResponse['firewall']
 
 const terminalPreviewWidth = 40
@@ -221,6 +224,9 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   const networkStatus = useAppSelector((s) => s.network.status)
   const configuring = useAppSelector((s) => s.network.configuring)
   const remoteAccessEnabled = isRemoteAccessEnabledStatus(networkStatus)
+  const remoteAccessRequested = networkStatus?.remoteAccessRequested ?? remoteAccessEnabled
+  const isWslRemoteAccess = networkStatus?.firewall?.platform === 'wsl2'
+  const remoteAccessToggleChecked = remoteAccessEnabled || (isWslRemoteAccess && remoteAccessRequested)
   const enabledProviders = useMemo(
     () => settings.codingCli?.enabledProviders ?? [],
     [settings.codingCli?.enabledProviders],
@@ -241,8 +247,9 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   const [availableTerminalFonts, setAvailableTerminalFonts] = useState(terminalFonts)
   const [fontsReady, setFontsReady] = useState(false)
   const [terminalAdvancedOpen, setTerminalAdvancedOpen] = useState(false)
-  const [firewallConfirmation, setFirewallConfirmation] = useState<FirewallConfirmation | null>(null)
+  const [pendingConfirmation, setPendingConfirmation] = useState<PendingConfirmation | null>(null)
   const [firewallRefreshDetail, setFirewallRefreshDetail] = useState<string | null>(null)
+  const [remoteAccessPending, setRemoteAccessPending] = useState(false)
   const [defaultCwdInput, setDefaultCwdInput] = useState(settings.defaultCwd ?? '')
   const [defaultCwdError, setDefaultCwdError] = useState<string | null>(null)
   const [excludeFirstChatInput, setExcludeFirstChatInput] = useState(
@@ -253,6 +260,8 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   const pendingRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const firewallRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const firewallRefreshRequestRef = useRef(0)
+  const remoteAccessRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const remoteAccessRefreshRequestRef = useRef(0)
   const defaultCwdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const defaultCwdValidationRef = useRef(0)
   const lastSettingsDefaultCwdRef = useRef(settings.defaultCwd ?? '')
@@ -293,6 +302,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     return () => {
       if (pendingRef.current) clearTimeout(pendingRef.current)
       if (firewallRefreshTimerRef.current) clearTimeout(firewallRefreshTimerRef.current)
+      if (remoteAccessRefreshTimerRef.current) clearTimeout(remoteAccessRefreshTimerRef.current)
       if (defaultCwdTimerRef.current) clearTimeout(defaultCwdTimerRef.current)
       for (const timer of Object.values(providerCwdTimerRef.current)) {
         clearTimeout(timer)
@@ -350,9 +360,49 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     queueFirewallRefresh(refreshRequestId, detail)
   }, [queueFirewallRefresh])
 
+  const queueRemoteAccessRefresh = useCallback((refreshRequestId: number, attempts = 0) => {
+    remoteAccessRefreshTimerRef.current = setTimeout(() => {
+      remoteAccessRefreshTimerRef.current = null
+      void dispatch(fetchNetworkStatus())
+        .unwrap()
+        .then((status) => {
+          if (remoteAccessRefreshRequestRef.current !== refreshRequestId) {
+            return
+          }
+
+          if (status.firewall.configuring) {
+            if (attempts + 1 >= SETTINGS_FIREWALL_POLL_MAX_ATTEMPTS) {
+              setRemoteAccessPending(false)
+              return
+            }
+
+            queueRemoteAccessRefresh(refreshRequestId, attempts + 1)
+            return
+          }
+
+          setRemoteAccessPending(false)
+        })
+        .catch(() => {
+          if (remoteAccessRefreshRequestRef.current === refreshRequestId) {
+            setRemoteAccessPending(false)
+          }
+        })
+    }, SETTINGS_FIREWALL_POLL_INTERVAL_MS)
+  }, [dispatch])
+
+  const scheduleRemoteAccessRefresh = useCallback(() => {
+    setRemoteAccessPending(true)
+    if (remoteAccessRefreshTimerRef.current) {
+      clearTimeout(remoteAccessRefreshTimerRef.current)
+    }
+    remoteAccessRefreshRequestRef.current += 1
+    const refreshRequestId = remoteAccessRefreshRequestRef.current
+    queueRemoteAccessRefresh(refreshRequestId)
+  }, [queueRemoteAccessRefresh])
+
   const handleFirewallFixResult = useCallback((result: ConfigureFirewallResult) => {
     if (result.method === 'confirmation-required') {
-      setFirewallConfirmation(result)
+      setPendingConfirmation({ kind: 'firewall-fix', request: result })
       return
     }
 
@@ -395,27 +445,67 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     }
   }, [handleFirewallFixResult])
 
-  const handleConfirmFirewallFix = useCallback(() => {
-    if (!firewallConfirmation) {
+  const requestWslRemoteAccessDisable = useCallback(async (
+    body: { confirmElevation?: true; confirmationToken?: string } = {},
+  ) => {
+    try {
+      const result = await api.post<ConfigureFirewallResult>('/api/network/disable-remote-access', body)
+      if (result.method === 'confirmation-required') {
+        setPendingConfirmation({ kind: 'wsl-disable', request: result })
+        return
+      }
+      if (result.method === 'none') {
+        setRemoteAccessPending(false)
+        await dispatch(fetchNetworkStatus()).unwrap()
+        return
+      }
+      if (result.method === 'in-progress' || result.method === 'wsl2') {
+        scheduleRemoteAccessRefresh()
+      }
+    } catch (error) {
+      const apiError = error as ApiError | undefined
+      const details = apiError?.details as { method?: string; error?: string } | undefined
+      if (apiError?.status === 409 && details?.method === 'in-progress') {
+        scheduleRemoteAccessRefresh()
+        return
+      }
+
+      log.warn('Failed to disable WSL remote access', error)
+      setRemoteAccessPending(false)
+    }
+  }, [dispatch, scheduleRemoteAccessRefresh])
+
+  const handleConfirmPendingAction = useCallback(() => {
+    if (!pendingConfirmation) {
       return
     }
 
-    const confirmationToken = firewallConfirmation.confirmationToken
-    setFirewallConfirmation(null)
-    void requestFirewallFix({
+    const { kind, request } = pendingConfirmation
+    const confirmationToken = request.confirmationToken
+    setPendingConfirmation(null)
+
+    if (kind === 'firewall-fix') {
+      void requestFirewallFix({
+        confirmElevation: true,
+        confirmationToken,
+      })
+      return
+    }
+
+    void requestWslRemoteAccessDisable({
       confirmElevation: true,
       confirmationToken,
     })
-  }, [firewallConfirmation, requestFirewallFix])
+  }, [pendingConfirmation, requestFirewallFix, requestWslRemoteAccessDisable])
 
-  const handleCancelFirewallFix = useCallback(() => {
-    const confirmationToken = firewallConfirmation?.confirmationToken
-    setFirewallConfirmation(null)
+  const handleCancelPendingAction = useCallback(() => {
+    const confirmationToken = pendingConfirmation?.request.confirmationToken
+    setPendingConfirmation(null)
     if (!confirmationToken) {
       return
     }
     void cancelFirewallConfirmation(confirmationToken).catch(() => {})
-  }, [firewallConfirmation])
+  }, [pendingConfirmation])
 
   const scheduleSave = useCallback((updates: any) => {
     if (pendingRef.current) clearTimeout(pendingRef.current)
@@ -1350,10 +1440,23 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
           <SettingsSection title="Network Access" description="Control how Freshell is accessible on your network">
             <SettingsRow label="Remote access" description="Allow connections from other devices on your network">
               <Toggle
-                checked={remoteAccessEnabled}
-                disabled={configuring || networkStatus?.rebinding}
+                checked={remoteAccessToggleChecked}
+                disabled={configuring || networkStatus?.rebinding || remoteAccessPending}
                 aria-label="Remote access"
                 onChange={async (checked) => {
+                  if (isWslRemoteAccess) {
+                    if (checked) {
+                      await dispatch(configureNetwork({
+                        host: '0.0.0.0',
+                        configured: true,
+                      })).unwrap()
+                      return
+                    }
+
+                    await requestWslRemoteAccessDisable()
+                    return
+                  }
+
                   await dispatch(configureNetwork({
                     host: checked ? '0.0.0.0' : '127.0.0.1',
                     configured: true,
@@ -1362,7 +1465,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               />
             </SettingsRow>
 
-            {remoteAccessEnabled && networkStatus && (
+            {(remoteAccessEnabled || (isWslRemoteAccess && remoteAccessRequested)) && networkStatus && (
               <>
                 {networkStatus.firewall && (
                   <SettingsRow
@@ -1386,7 +1489,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                   </SettingsRow>
                 )}
 
-                {networkStatus.accessUrl && (
+                {remoteAccessEnabled && networkStatus.accessUrl && (
                   <SettingsRow label="Device access" description="Get a link to use from your phone or other computers">
                     <button
                       onClick={() => onSharePanel?.()}
@@ -1454,13 +1557,13 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
         </div>
       </div>
       <ConfirmModal
-        open={firewallConfirmation !== null}
-        title={firewallConfirmation?.title ?? ''}
-        body={firewallConfirmation?.body ?? ''}
-        confirmLabel={firewallConfirmation?.confirmLabel ?? 'Continue'}
+        open={pendingConfirmation !== null}
+        title={pendingConfirmation?.request.title ?? ''}
+        body={pendingConfirmation?.request.body ?? ''}
+        confirmLabel={pendingConfirmation?.request.confirmLabel ?? 'Continue'}
         confirmVariant="default"
-        onConfirm={handleConfirmFirewallFix}
-        onCancel={handleCancelFirewallFix}
+        onConfirm={handleConfirmPendingAction}
+        onCancel={handleCancelPendingAction}
       />
     </div>
   )

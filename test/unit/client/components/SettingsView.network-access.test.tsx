@@ -74,7 +74,7 @@ describe('SettingsView network access section', () => {
             host: '0.0.0.0',
             remoteAccessEnabled: false,
             firewall: { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false },
-          }),
+          } as any),
         }),
       },
     })
@@ -83,6 +83,104 @@ describe('SettingsView network access section', () => {
 
     expect(screen.getByRole('switch', { name: /remote access/i })).not.toBeChecked()
     expect(screen.queryByRole('button', { name: /fix firewall/i })).not.toBeInTheDocument()
+  })
+
+  it('keeps the WSL toggle on and exposes repair when remote access was requested but is not yet active', () => {
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            host: '0.0.0.0',
+            remoteAccessEnabled: false,
+            remoteAccessRequested: true,
+            accessUrl: 'http://localhost:3001/?token=abc',
+            firewall: { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false },
+          } as any),
+        }),
+      },
+    })
+
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    expect(screen.getByRole('switch', { name: /remote access/i })).toBeChecked()
+    expect(screen.getByRole('button', { name: /fix firewall/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /get link/i })).not.toBeInTheDocument()
+  })
+
+  it('shows an admin-approval modal before disabling exposed WSL remote access', async () => {
+    const { api } = await import('@/lib/api')
+    vi.mocked(api.post)
+      .mockResolvedValueOnce({
+        method: 'confirmation-required',
+        title: 'Administrator approval required',
+        body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
+        confirmLabel: 'Continue',
+        confirmationToken: 'disable-1',
+      })
+      .mockResolvedValueOnce({ method: 'wsl2', status: 'started' })
+
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            host: '0.0.0.0',
+            remoteAccessEnabled: true,
+            firewall: { platform: 'wsl2', active: true, portOpen: true, commands: [], configuring: false },
+          } as any),
+        }),
+      },
+    })
+
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    fireEvent.click(screen.getByRole('switch', { name: /remote access/i }))
+
+    const confirmationDialog = await screen.findByRole('dialog', { name: /administrator approval required/i })
+    expect(confirmationDialog).toBeInTheDocument()
+
+    fireEvent.click(within(confirmationDialog).getByRole('button', { name: /^continue$/i }))
+
+    await waitFor(() => {
+      expect(api.post).toHaveBeenNthCalledWith(2, '/api/network/disable-remote-access', {
+        confirmElevation: true,
+        confirmationToken: 'disable-1',
+      })
+    })
+  })
+
+  it('keeps WSL remote access enabled when the disable confirmation is cancelled', async () => {
+    const { api } = await import('@/lib/api')
+    vi.mocked(api.post).mockResolvedValueOnce({
+      method: 'confirmation-required',
+      title: 'Administrator approval required',
+      body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
+      confirmLabel: 'Continue',
+      confirmationToken: 'disable-1',
+    })
+
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            host: '0.0.0.0',
+            remoteAccessEnabled: true,
+            firewall: { platform: 'wsl2', active: true, portOpen: true, commands: [], configuring: false },
+          } as any),
+        }),
+      },
+    })
+
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    fireEvent.click(screen.getByRole('switch', { name: /remote access/i }))
+    const confirmationDialog = await screen.findByRole('dialog', { name: /administrator approval required/i })
+    fireEvent.click(within(confirmationDialog).getByRole('button', { name: /^cancel$/i }))
+
+    expect(api.post).toHaveBeenCalledTimes(1)
+    await waitFor(() => {
+      expect(mockCancelFirewallConfirmation).toHaveBeenCalledWith('disable-1')
+    })
+    expect(screen.getByRole('switch', { name: /remote access/i })).toBeChecked()
   })
 
   it('shows an admin-approval modal before starting Windows firewall repair', async () => {

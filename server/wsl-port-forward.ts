@@ -289,6 +289,24 @@ export function buildPortForwardingScript(wslIp: string, ports: number[]): strin
   return commands.join('; ')
 }
 
+/**
+ * Build PowerShell script to remove Freshell's Windows portproxy and firewall exposure.
+ * This keeps the server reachable from the Windows host while removing LAN access.
+ */
+export function buildPortForwardingTeardownScript(ports: number[]): string {
+  const commands: string[] = []
+
+  for (const port of new Set(ports)) {
+    commands.push(
+      `netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=${port} 2>\\$null`
+    )
+  }
+
+  commands.push(`netsh advfirewall firewall delete rule name=FreshellLANAccess 2>\\$null`)
+
+  return commands.join('; ')
+}
+
 export type WslPortForwardingPlan =
   | { status: 'not-wsl2' }
   | { status: 'error'; message: string }
@@ -299,6 +317,11 @@ export type WslPortForwardingPlan =
     scriptKind: 'full' | 'firewall-only'
     script: string
   }
+
+export type WslPortForwardingTeardownPlan =
+  | { status: 'not-wsl2' }
+  | { status: 'noop' }
+  | { status: 'ready'; script: string }
 
 function normalizeScriptForElevatedPowerShell(script: string): string {
   return script.replace(/\\\$/g, '$')
@@ -330,6 +353,24 @@ function buildWslPortForwardingPlan(
     wslIp,
     scriptKind,
     script: normalizeScriptForElevatedPowerShell(script),
+  }
+}
+
+function buildWslPortForwardingTeardownPlan(
+  requiredPorts: number[],
+  existingRules: Map<number, PortProxyRule>,
+  existingFirewallPorts: Set<number>,
+): WslPortForwardingTeardownPlan {
+  const hasRelevantPortProxyRules = requiredPorts.some((port) => existingRules.has(port))
+  const hasFreshellFirewallRule = existingFirewallPorts.size > 0
+
+  if (!hasRelevantPortProxyRules && !hasFreshellFirewallRule) {
+    return { status: 'noop' }
+  }
+
+  return {
+    status: 'ready',
+    script: normalizeScriptForElevatedPowerShell(buildPortForwardingTeardownScript(requiredPorts)),
   }
 }
 
@@ -371,4 +412,30 @@ export async function computeWslPortForwardingPlanAsync(requiredPorts: number[])
   ])
 
   return buildWslPortForwardingPlan(requiredPorts, wslIp, existingRules, existingFirewallPorts)
+}
+
+export function computeWslPortForwardingTeardownPlan(requiredPorts: number[]): WslPortForwardingTeardownPlan {
+  if (!isWSL2()) {
+    return { status: 'not-wsl2' }
+  }
+
+  const existingRules = getExistingPortProxyRules()
+  const existingFirewallPorts = getExistingFirewallPorts()
+
+  return buildWslPortForwardingTeardownPlan(requiredPorts, existingRules, existingFirewallPorts)
+}
+
+export async function computeWslPortForwardingTeardownPlanAsync(
+  requiredPorts: number[],
+): Promise<WslPortForwardingTeardownPlan> {
+  if (!isWSL2()) {
+    return { status: 'not-wsl2' }
+  }
+
+  const [existingRules, existingFirewallPorts] = await Promise.all([
+    getExistingPortProxyRulesAsync(),
+    getExistingFirewallPortsAsync(),
+  ])
+
+  return buildWslPortForwardingTeardownPlan(requiredPorts, existingRules, existingFirewallPorts)
 }
