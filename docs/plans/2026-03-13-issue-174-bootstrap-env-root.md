@@ -2,371 +2,328 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task.
 
-**Goal:** Ensure a clean built Freshell server always bootstraps and loads `.env` from the same runtime root, then lock that behavior with a real compiled-startup regression test so first-run `npm run start` no longer crashes or regresses.
+**Goal:** Prove that a clean compiled Freshell startup bootstraps `.env` in the runtime root and starts successfully, so issue `#174` cannot regress.
 
-**Architecture:** Keep the runtime root anchored to `process.cwd()` because Freshell already intentionally treats CWD as the runtime root for repo launches and Electron-spawned config directories. Remove the bootstrap/dotenv double-guessing by introducing one small env-path helper used by both the bootstrap writer and a dedicated dotenv loader path, then prove the contract with an isolated compiled-server harness instead of only unit tests.
+**Architecture:** The product code already uses the correct runtime-root rule: `server/bootstrap.ts` resolves the env location from `process.cwd()`, matching `dotenv/config`. Do not broaden this into a loader refactor unless a red compiled-start regression proves another mismatch. The work is to extend the existing `TestServer` helper so it can run `dist/server/index.js` from an isolated temp runtime root without a preseeded `AUTH_TOKEN`, then add regression tests that exercise the exact first-run failure from the issue.
 
-**Tech Stack:** Node.js, TypeScript, dotenv, Vitest, existing E2E helper harness
+**Tech Stack:** Node.js, TypeScript, Vitest, built `dist/server` startup, helper harness in `test/e2e-browser/helpers`
 
 ---
 
 ## Strategy Gate
 
-- `server/bootstrap.ts` on `main` already contains the source-level hotfix from `7233abe6`: it writes `.env` to `process.cwd()`. The open issue exists because the tagged production path lacked that fix, and the current repository still has no compiled-runtime regression test preventing the mismatch from returning.
-- The clean end state is not another relative-path tweak. Freshell already relies on CWD as runtime root in several places: `server/index.ts` extension lookup, orchestration skill/plugin paths, and Electron app-bound server startup via `cwd=configDir`. Switching back to file-relative discovery would fix one edge while fighting the rest of the runtime model.
-- The actual weakness is duplicated authority:
-  - `bootstrap.ts` decides where to write `.env`
-  - `server/index.ts` imports `dotenv/config`, which independently decides where to read `.env`
-  - `server/get-network-host.ts` calls `dotenv.config()` again
-  The plan should converge these onto one helper.
-- Heavy coverage is justified here because the failure only appears at the compiled/process boundary. Unit tests alone are too weak.
+- Issue `#174` is a compiled-runtime bug, not a source-only bug. The failing path is: fresh build -> `npm run start` -> bootstrap writes `.env` to `dist/` -> `dotenv/config` loads from CWD -> `AUTH_TOKEN` stays unset -> startup throws.
+- On this branch, `server/bootstrap.ts` already contains the direct fix from the issue’s preferred Option A: `resolveProjectRoot()` returns `process.cwd()`, and autorun writes `path.join(resolveProjectRoot(), '.env')`.
+- Because the product code is already aligned, the right problem is no longer “change bootstrap path logic again”. The real gap is the absence of a regression test at the exact boundary where the bug happened: a compiled cold start from a clean runtime root.
+- Heavy coverage for this issue means:
+  - keep the existing unit assertion that `resolveProjectRoot()` returns `process.cwd()`
+  - add helper coverage for isolated runtime-root / bootstrap-auth startup
+  - add a real compiled cold-start regression test
+  - run the coordinated full suite plus the compiled helper suite after a fresh build
+- No `docs/index.html` change is needed. This is a startup regression fix, not a new UI feature.
 
 ## Key Decisions
 
-- Keep CWD as the authoritative runtime root, but centralize it in `server/env-path.ts` so write-path and read-path can never drift again.
-- Replace `import 'dotenv/config'` with a side-effect module that calls `dotenv.config({ path: resolveEnvPath() })`. This preserves import-time env loading for modules that read `process.env` during evaluation.
-- Keep the callable dotenv helper separate from the side-effect module:
-  - `server/load-env.ts` exports `loadEnvFile()` with no top-level side effect
-  - `server/load-env-on-import.ts` imports `loadEnvFile()` and invokes it immediately
-  This keeps `server/get-network-host.ts` explicit while letting `server/index.ts` load env early enough.
-- Extend the existing `TestServer` helper instead of inventing a second production-server harness. Add an opt-in isolated runtime root plus bootstrap auth mode, while keeping current defaults unchanged for existing E2E tests.
-- Stage the compiled-runtime test in a temporary copied runtime root, not the repo worktree, because the regression creates `.env` as a side effect and the test must remain hermetic on Windows as well as Unix. Use `fs.cp()` rather than symlinks to avoid Windows symlink privilege problems.
-- No `docs/index.html` change is needed. This is a startup/runtime correctness fix, not a new UI feature.
+- Runtime root remains `process.cwd()`. That is the issue’s recommended fix and it already matches `dotenv/config`.
+- The only planned code surface is `test/e2e-browser/helpers/test-server.ts`, behind opt-in options, so existing Playwright/browser helper callers keep their current behavior.
+- The isolated runtime root must be a copied temp directory containing `package.json` and `dist/`. Do not use symlinks; the issue was reported on native Windows and the regression harness must behave the same there.
+- Do not add a new product-side env helper unless the compiled startup regression still fails after the harness work. If that happens, fix only the concrete mismatch the regression exposes.
 
-### Task 1: Lock the missing contract at the right seams
+### Task 1: Add the failing compiled-start regression
 
 **Files:**
-- Add: `test/unit/server/env-path.test.ts`
 - Modify: `test/e2e-browser/helpers/test-server.test.ts`
 
-**Step 1: Write the failing unit test for the shared env path**
+**Step 1: Write the red regression test**
 
-Add a new node-environment unit test file that defines the contract before any implementation exists:
-
-```ts
-import { describe, it, expect, vi } from 'vitest'
-
-vi.mock('dotenv', () => ({
-  default: { config: vi.fn() },
-  config: vi.fn(),
-}))
-
-import dotenv from 'dotenv'
-import { resolveEnvPath } from '../../../server/env-path.js'
-import { loadEnvFile } from '../../../server/load-env.js'
-
-describe('resolveEnvPath', () => {
-  it('anchors .env to the runtime cwd', () => {
-    expect(resolveEnvPath('/tmp/freshell-runtime')).toBe('/tmp/freshell-runtime/.env')
-  })
-})
-
-describe('loadEnvFile', () => {
-  it('loads dotenv from the shared env path', () => {
-    loadEnvFile('/tmp/freshell-runtime')
-    expect(dotenv.config).toHaveBeenCalledWith({ path: '/tmp/freshell-runtime/.env' })
-  })
-})
-```
-
-This creates a red test for the new single-source-of-truth contract.
-
-**Step 2: Write the failing compiled-startup regression test**
-
-In `test/e2e-browser/helpers/test-server.test.ts`, add a new helper-level regression spec that exercises the real built server without injecting `AUTH_TOKEN` from the parent process:
+Add this spec near the existing `TestServer` tests:
 
 ```ts
-it('bootstraps AUTH_TOKEN into the isolated runtime root instead of dist/', async () => {
-  server = new TestServer({
-    authStrategy: 'bootstrap',
-    runtimeRootMode: 'isolated',
+  it('bootstraps AUTH_TOKEN into the isolated runtime root for a compiled cold start', async () => {
+    server = new TestServer({
+      authStrategy: 'bootstrap',
+      runtimeRootMode: 'isolated',
+    })
+
+    const info = await server.start()
+
+    const envText = await fs.readFile(path.join(info.runtimeRoot, '.env'), 'utf8')
+    expect(envText).toMatch(/^AUTH_TOKEN=[a-f0-9]{64}$/m)
+    await expect(fs.stat(path.join(info.runtimeRoot, 'dist', '.env'))).rejects.toThrow()
+
+    const res = await fetch(`${info.baseUrl}/api/settings`, {
+      headers: { 'x-auth-token': info.token },
+    })
+    expect(res.status).toBe(200)
   })
-
-  const info = await server.start()
-
-  const envText = await fs.readFile(path.join(info.runtimeRoot, '.env'), 'utf8')
-  expect(envText).toMatch(/^AUTH_TOKEN=.+$/m)
-  await expect(fs.stat(path.join(info.runtimeRoot, 'dist', '.env'))).rejects.toThrow()
-
-  const res = await fetch(`${info.baseUrl}/api/settings`, {
-    headers: { 'x-auth-token': info.token },
-  })
-  expect(res.status).toBe(200)
-})
 ```
 
-This is the critical regression: a built server, a clean runtime root, no preset token, and a positive assertion that `dist/.env` is absent.
+This is the entire issue in one test: no parent `AUTH_TOKEN`, real built server, runtime root temp directory, `.env` must appear in the runtime root, and authenticated startup must succeed.
 
-**Step 3: Run the new tests to verify they fail for the right reason**
+**Step 2: Run the red test**
 
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/env-path.test.ts
 npm run build
-npm run test:e2e:helpers -- helpers/test-server.test.ts
+npm run test:e2e:helpers -- helpers/test-server.test.ts -t "bootstraps AUTH_TOKEN into the isolated runtime root for a compiled cold start"
 ```
 
 Expected:
-- The unit test fails because `server/env-path.ts` and `server/load-env.ts` do not exist yet.
-- The helper test fails because `TestServer` has no bootstrap auth mode or isolated runtime-root support yet.
+- `FAIL`
+- The failure should show that `TestServer` does not yet support the isolated runtime root / bootstrap-auth flow, or that `runtimeRoot` is missing / `.env` is not created in the expected place.
 
-### Task 2: Make `.env` path resolution authoritative and shared
-
-**Files:**
-- Add: `server/env-path.ts`
-- Add: `server/load-env.ts`
-- Add: `server/load-env-on-import.ts`
-- Modify: `server/bootstrap.ts`
-- Modify: `server/index.ts`
-- Modify: `server/get-network-host.ts`
-- Modify: `test/unit/server/bootstrap.test.ts`
-- Modify: `test/unit/vite-config.test.ts`
-- Modify: `test/unit/server/env-path.test.ts`
-
-**Step 1: Add a tiny shared env-path helper**
-
-Create `server/env-path.ts`:
-
-```ts
-import path from 'path'
-
-export function resolveEnvPath(cwd: string = process.cwd()): string {
-  return path.resolve(cwd, '.env')
-}
-```
-
-Do not make this helper smarter than the runtime model. It should encode the existing CWD-based contract explicitly, not reintroduce file-layout heuristics.
-
-**Step 2: Add a callable dotenv helper and a side-effect import module**
-
-Create `server/load-env.ts`:
-
-```ts
-import dotenv from 'dotenv'
-import { resolveEnvPath } from './env-path.js'
-
-export function loadEnvFile(cwd: string = process.cwd()) {
-  return dotenv.config({ path: resolveEnvPath(cwd) })
-}
-```
-
-Create `server/load-env-on-import.ts`:
-
-```ts
-import { loadEnvFile } from './load-env.js'
-
-loadEnvFile()
-```
-
-The split matters:
-- `load-env.ts` is safe for explicit use from `getNetworkHost()`
-- `load-env-on-import.ts` exists only so `server/index.ts` can keep import-time env initialization
-
-**Step 3: Rewire bootstrap to the shared env path**
-
-In `server/bootstrap.ts`:
-- Import `resolveEnvPath` from `./env-path.js`
-- Delete the `resolveProjectRoot()` helper and its auto-run usage
-- Keep `ensureEnvFile(envPath)` pure
-- Change the auto-run section to:
-
-```ts
-const envPath = resolveEnvPath()
-const result = ensureEnvFile(envPath)
-```
-
-Do not change `ensureEnvFile()` semantics in this issue. The fix is path authority, not env-content policy.
-
-**Step 4: Rewire server startup without breaking import order**
-
-In `server/index.ts`, replace the current first two imports with:
-
-```ts
-import './bootstrap.js'
-import './load-env-on-import.js'
-```
-
-Do not move env loading into `main()`. Several imported modules already read `process.env` at module evaluation time; the whole point is to keep env available before they execute.
-
-**Step 5: Reuse the same loader in `get-network-host`**
-
-In `server/get-network-host.ts`:
-- Remove the direct `dotenv` import
-- Import `loadEnvFile` from `./load-env.js`
-- Replace `dotenv.config()` inside `getNetworkHost()` with `loadEnvFile()`
-
-This closes the last remaining duplicate dotenv path decision in the server runtime.
-
-**Step 6: Update unit tests to match the new source of truth**
-
-In `test/unit/server/bootstrap.test.ts`:
-- Remove the old `resolveProjectRoot()` describe block
-- Keep the `ensureEnvFile()` coverage unchanged; it still owns content generation and patching
-
-In `test/unit/vite-config.test.ts`:
-- Mock `../../server/load-env.js` instead of raw dotenv so the test stays hermetic after the refactor
-- Add one assertion that `getNetworkHost()` calls the shared loader before reading config:
-
-```ts
-expect(loadEnvFile).toHaveBeenCalled()
-```
-
-In `test/unit/server/env-path.test.ts`:
-- Finalize the loader contract from Task 1 against the real implementation
-
-**Step 7: Run the focused unit suite**
-
-Run:
-
-```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/env-path.test.ts test/unit/server/bootstrap.test.ts
-npm run test:vitest -- test/unit/vite-config.test.ts
-```
-
-Expected:
-- PASS
-
-**Step 8: Commit the env-path refactor checkpoint**
-
-```bash
-git add server/env-path.ts server/load-env.ts server/load-env-on-import.ts server/bootstrap.ts server/index.ts server/get-network-host.ts test/unit/server/env-path.test.ts test/unit/server/bootstrap.test.ts test/unit/vite-config.test.ts
-git commit -m "refactor(server): centralize runtime env path loading"
-```
-
-### Task 3: Extend the production test harness to cover first-run compiled startup
+### Task 2: Teach `TestServer` the exact startup mode the issue needs
 
 **Files:**
 - Modify: `test/e2e-browser/helpers/test-server.ts`
 - Modify: `test/e2e-browser/helpers/test-server.test.ts`
 
-**Step 1: Add opt-in bootstrap and isolated-runtime modes to `TestServer`**
+**Step 1: Extend the helper types without changing defaults**
 
-Extend the helper types:
+In `test/e2e-browser/helpers/test-server.ts`, extend the public types:
 
 ```ts
-export interface TestServerOptions {
-  authStrategy?: 'explicit-env' | 'bootstrap'
-  runtimeRootMode?: 'project' | 'isolated'
-  ...
+export interface TestServerInfo {
+  port: number
+  baseUrl: string
+  wsUrl: string
+  token: string
+  configDir: string
+  homeDir: string
+  logsDir: string
+  debugLogPath: string
+  pid: number
+  runtimeRoot: string
 }
 
-export interface TestServerInfo {
-  ...
-  runtimeRoot: string
+export interface TestServerOptions {
+  env?: Record<string, string>
+  setupHome?: (homeDir: string) => Promise<void>
+  preserveHomeOnStop?: boolean
+  startTimeoutMs?: number
+  verbose?: boolean
+  authStrategy?: 'explicit-env' | 'bootstrap'
+  runtimeRootMode?: 'project' | 'isolated'
 }
 ```
 
-Keep defaults exactly as they are today:
+Defaults must stay:
 - `authStrategy: 'explicit-env'`
 - `runtimeRootMode: 'project'`
 
-That preserves all existing E2E callers.
+That keeps every existing caller behaving exactly as it does now.
 
-**Step 2: Implement isolated runtime-root staging with real compiled output**
+**Step 2: Add a helper that stages an isolated runtime root**
 
-In `test/e2e-browser/helpers/test-server.ts`:
-- Add a `createRuntimeRoot()` helper that, when `runtimeRootMode === 'isolated'`, creates a temp directory and copies:
-  - `package.json`
-  - `dist/`
-- If an `extensions/` directory is needed for startup fidelity, create it explicitly or copy it only when required. Do not use symlinks; Windows reproducibility matters for this issue.
-- Spawn `node dist/server/index.js` with `cwd` set to `runtimeRoot`, not the repo root, when isolated mode is selected
-- Include `runtimeRoot` in `TestServerInfo`
-
-The purpose is to simulate a fresh built checkout without letting the test create `.env` inside the repo worktree.
-
-**Step 3: Implement bootstrap-auth startup in the helper**
-
-When `authStrategy === 'bootstrap'`:
-- Do not inject `AUTH_TOKEN` into the child environment
-- After health succeeds, parse `${runtimeRoot}/.env` and extract the generated token
-- Populate `info.token` from that file so callers can authenticate normally
-- Leave the existing explicit-env path unchanged for the rest of the suite
-
-A small internal parser is enough here:
+Add a private helper that copies only the runtime artifacts required for `node dist/server/index.js`:
 
 ```ts
-function readAuthTokenFromEnv(envText: string): string {
+async function createIsolatedRuntimeRoot(projectRoot: string): Promise<string> {
+  const runtimeRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-runtime-'))
+  await fsp.copyFile(path.join(projectRoot, 'package.json'), path.join(runtimeRoot, 'package.json'))
+  await fsp.cp(path.join(projectRoot, 'dist'), path.join(runtimeRoot, 'dist'), { recursive: true })
+  return runtimeRoot
+}
+```
+
+Do not use symlinks. The regression needs Windows-safe behavior.
+
+**Step 3: Add a helper that reads the bootstrapped token back out of `.env`**
+
+Add a small internal parser in the same file:
+
+```ts
+function readAuthTokenFromEnvFile(envText: string): string {
   const match = envText.match(/^AUTH_TOKEN=(.+)$/m)
-  if (!match) throw new Error('Bootstrapped .env did not contain AUTH_TOKEN')
+  if (!match) {
+    throw new Error('Bootstrapped .env did not contain AUTH_TOKEN')
+  }
   return match[1].trim()
 }
 ```
 
-**Step 4: Make the helper test red-to-green on the real compiled flow**
+Keep this private. The public regression test should cover it through `TestServer.start()`.
 
-Keep the new regression spec from Task 1 and add one more explicit token assertion:
+**Step 4: Stage the runtime root before spawning the process**
+
+Inside `start()`:
+- resolve `projectRoot` exactly as today
+- choose `runtimeRoot`
+  - project mode -> `projectRoot`
+  - isolated mode -> `await createIsolatedRuntimeRoot(projectRoot)`
+- resolve `serverEntry` from `runtimeRoot`, not `projectRoot`
+- spawn the child with `cwd: runtimeRoot`
+
+The built server must believe the temp runtime root is its real working directory. That is how the original bug is reproduced honestly.
+
+**Step 5: Make auth injection optional**
+
+Inside `start()`:
+- keep generating the explicit token up front for the default path
+- when `authStrategy === 'explicit-env'`, continue setting `AUTH_TOKEN` in the child env exactly as today
+- when `authStrategy === 'bootstrap'`, delete `AUTH_TOKEN` from the child env before `spawn()`
+
+Use this shape:
 
 ```ts
-expect(info.token).toMatch(/^[a-f0-9]{64}$/)
+const authStrategy = this.options.authStrategy ?? 'explicit-env'
+const token = authStrategy === 'explicit-env' ? randomUUID() : ''
+...
+if (authStrategy === 'explicit-env') {
+  env.AUTH_TOKEN = token
+} else {
+  delete env.AUTH_TOKEN
+}
 ```
 
-Then run:
+Do not change any other env defaults.
 
-```bash
-npm run build
-npm run test:e2e:helpers -- helpers/test-server.test.ts
+**Step 6: Read the generated token after health succeeds**
+
+After `waitForHealth(baseUrl, timeoutMs)`:
+- if `authStrategy === 'bootstrap'`, read `${runtimeRoot}/.env`
+- parse the generated token with `readAuthTokenFromEnvFile`
+- return that token in `TestServerInfo`
+
+Use this exact flow:
+
+```ts
+const resolvedToken = authStrategy === 'bootstrap'
+  ? readAuthTokenFromEnvFile(await fsp.readFile(path.join(runtimeRoot, '.env'), 'utf8'))
+  : token
 ```
 
-Expected:
-- PASS
+Set `runtimeRoot` on `this._info`.
 
-**Step 5: Commit the compiled-startup regression coverage**
+**Step 7: Clean up isolated runtime roots on stop**
 
-```bash
-git add test/e2e-browser/helpers/test-server.ts test/e2e-browser/helpers/test-server.test.ts
-git commit -m "test(server): cover first-run compiled bootstrap startup"
+Add a private field for the temp-managed runtime root.
+When `runtimeRootMode === 'isolated'`, remove that temp directory in `stop()` after the process exits.
+Do not delete the repo root when `runtimeRootMode === 'project'`.
+
+**Step 8: Add one green-path assertion for the new info surface**
+
+In `test/e2e-browser/helpers/test-server.test.ts`, update the existing `"starts a server on an ephemeral port"` test to assert:
+
+```ts
+    expect(info.runtimeRoot).toBeTruthy()
 ```
 
-### Task 4: Refactor lightly, then run heavy verification
+Do not add more default-path churn than this. The cold-start regression is the real coverage.
 
-**Files:**
-- Modify only files already touched for this issue
-
-**Step 1: Keep the runtime-root story single-purpose**
-
-Do a small refactor pass only if needed so:
-- `resolveEnvPath()` remains the only place that turns a runtime root into a `.env` path
-- `loadEnvFile()` remains the only place that tells dotenv where to read
-- `TestServer` contains the new isolated-runtime logic behind opt-in options rather than duplicating spawn code paths
-
-Do not broaden this into a general runtime-root cleanup. `process.cwd()` remains the current steady-state design for the rest of the server.
-
-**Step 2: Re-run the narrow suites after the refactor**
+**Step 9: Run the helper suite**
 
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/env-path.test.ts test/unit/server/bootstrap.test.ts
-npm run test:vitest -- test/unit/vite-config.test.ts
 npm run build
 npm run test:e2e:helpers -- helpers/test-server.test.ts
 ```
 
 Expected:
-- PASS
+- `PASS`
 
-**Step 3: Run the coordinated broad suite and final compiled-runtime check**
+**Step 10: Commit the helper changes**
 
-First inspect the coordinator:
+```bash
+git add test/e2e-browser/helpers/test-server.ts test/e2e-browser/helpers/test-server.test.ts
+git commit -m "test(harness): support isolated compiled startup"
+```
+
+### Task 3: Verify the existing product fix still matches the source contract
+
+**Files:**
+- Modify: none expected
+- Test: `test/unit/server/bootstrap.test.ts`
+
+**Step 1: Run the existing bootstrap unit contract**
+
+Run:
+
+```bash
+npm run test:vitest -- --config vitest.server.config.ts test/unit/server/bootstrap.test.ts -t "returns process.cwd() so .env lands where dotenv looks"
+```
+
+Expected:
+- `PASS`
+
+This confirms the source-level rule that actually fixes the issue remains in place.
+
+**Step 2: Only if this test or the compiled helper regression still fails, apply the minimum product fix**
+
+Allowed file:
+- Modify: `server/bootstrap.ts`
+
+Allowed change:
+- keep `resolveProjectRoot()` returning `process.cwd()`
+- keep the autorun path as `path.join(resolveProjectRoot(), '.env')`
+
+Do not introduce a wider env-loading refactor here. The issue is about runtime-root agreement, not about abstracting dotenv.
+
+**Step 3: If Step 2 was needed, run the focused tests again**
+
+Run:
+
+```bash
+npm run test:vitest -- --config vitest.server.config.ts test/unit/server/bootstrap.test.ts
+npm run build
+npm run test:e2e:helpers -- helpers/test-server.test.ts
+```
+
+Expected:
+- `PASS`
+
+**Step 4: Commit only if product code changed**
+
+```bash
+git add server/bootstrap.ts test/unit/server/bootstrap.test.ts
+git commit -m "fix(server): keep first-run bootstrap rooted at cwd"
+```
+
+### Task 4: Heavy verification and final issue close-out
+
+**Files:**
+- Modify only files already touched for this issue
+
+**Step 1: Run the focused verification stack in the same order users hit the bug**
+
+Run:
+
+```bash
+npm run build
+npm run test:e2e:helpers -- helpers/test-server.test.ts
+npm run test:vitest -- --config vitest.server.config.ts test/unit/server/bootstrap.test.ts
+```
+
+Expected:
+- `PASS`
+
+**Step 2: Check the coordinated gate before the broad run**
+
+Run:
 
 ```bash
 npm run test:status
 ```
 
 Expected:
-- The shared coordinator is idle, or you wait until it is available
+- The shared coordinator is idle, or you wait until it becomes available.
 
-Then run the broad repo suite:
+**Step 3: Run the coordinated full suite**
+
+Run:
 
 ```bash
-FRESHELL_TEST_SUMMARY="issue 174 bootstrap env root" npm test
+FRESHELL_TEST_SUMMARY="issue 174 compiled first-run bootstrap" npm test
 ```
 
 Expected:
-- PASS
+- `PASS`
 
-Finally rerun the helper suite against fresh build output:
+**Step 4: Re-run the compiled-start helper suite after the broad run**
+
+Run:
 
 ```bash
 npm run build
@@ -374,36 +331,25 @@ npm run test:e2e:helpers -- helpers/test-server.test.ts
 ```
 
 Expected:
-- PASS
+- `PASS`
 
-This is the heavy verification for this issue:
-- unit contract for env-path authority
-- source/runtime integration through `getNetworkHost()`
-- real compiled server cold-start in an isolated runtime root
-- full coordinated repo suite
+This rerun matters because the issue is about the built artifact, not just source tests.
 
-### Task 5: Commit the issue fix
+**Step 5: Commit the issue closure**
 
-**Files:**
-- Stage the issue-specific code, tests, and this plan only
-
-**Step 1: Commit**
+If only harness/tests changed:
 
 ```bash
-git add docs/plans/2026-03-13-issue-174-bootstrap-env-root.md \
-  server/env-path.ts \
-  server/load-env.ts \
-  server/load-env-on-import.ts \
-  server/bootstrap.ts \
-  server/index.ts \
-  server/get-network-host.ts \
-  test/unit/server/env-path.test.ts \
-  test/unit/server/bootstrap.test.ts \
-  test/unit/vite-config.test.ts \
-  test/e2e-browser/helpers/test-server.ts \
-  test/e2e-browser/helpers/test-server.test.ts
-git commit -m "fix(server): harden first-run env bootstrap"
+git add test/e2e-browser/helpers/test-server.ts test/e2e-browser/helpers/test-server.test.ts
+git commit -m "test(server): lock first-run bootstrap runtime root"
+```
+
+If `server/bootstrap.ts` also changed:
+
+```bash
+git add server/bootstrap.ts test/unit/server/bootstrap.test.ts test/e2e-browser/helpers/test-server.ts test/e2e-browser/helpers/test-server.test.ts
+git commit -m "fix(server): lock first-run bootstrap runtime root"
 ```
 
 Expected:
-- One commit containing the shared env-path refactor, the compiled-startup regression coverage, and the plan for issue `#174`
+- One final issue commit containing the code that actually changed for `#174`.
