@@ -11,6 +11,7 @@ import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
 import extensionsReducer from '@/store/extensionsSlice'
+import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
 import terminalDirectoryReducer, { setTerminalDirectoryWindowData } from '@/store/terminalDirectorySlice'
 import type { ProjectGroup, BackgroundTerminal, TabMode } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
@@ -107,6 +108,7 @@ function createTestStore(options?: {
   sortMode?: 'recency' | 'activity' | 'project'
   showProjectBadges?: boolean
   sessionActivity?: Record<string, number>
+  codexActivity?: Partial<CodexActivityState>
 }) {
   const projects = (options?.projects ?? []).map((project) => ({
     ...project,
@@ -147,6 +149,7 @@ function createTestStore(options?: {
       sessions: sessionsReducer,
       sessionActivity: sessionActivityReducer,
       extensions: extensionsReducer,
+      codexActivity: codexActivityReducer,
       terminalDirectory: terminalDirectoryReducer,
     },
     middleware: (getDefault) =>
@@ -194,6 +197,13 @@ function createTestStore(options?: {
       },
       extensions: {
         entries: defaultCliExtensions,
+      },
+      codexActivity: {
+        byTerminalId: {},
+        lastSnapshotSeq: 0,
+        liveMutationSeqByTerminalId: {},
+        removedMutationSeqByTerminalId: {},
+        ...(options?.codexActivity ?? {}),
       },
       terminalDirectory: {
         windows: {
@@ -910,7 +920,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(buttons[1]).toHaveTextContent('Never active session')
     })
 
-    it('shows green indicator for sessions with tabs, grey for others', async () => {
+    it('shows green indicator for sessions with tabs, muted for others', async () => {
       const now = Date.now()
       const projects: ProjectGroup[] = [
         {
@@ -949,8 +959,95 @@ describe('Sidebar Component - Session-Centric Display', () => {
         vi.advanceTimersByTime(100)
       })
 
-      const playIcons = document.querySelectorAll('.text-success')
-      expect(playIcons.length).toBeGreaterThan(0)
+      const greenIcons = document.querySelectorAll('.text-success')
+      expect(greenIcons.length).toBeGreaterThan(0)
+
+      const mutedIcons = document.querySelectorAll('.text-muted-foreground')
+      expect(mutedIcons.length).toBeGreaterThan(0)
+    })
+
+    it('shows blue indicator for busy codex sessions instead of green', async () => {
+      const now = Date.now()
+      const terminalId = 'term-busy-codex'
+      const busySessionId = sessionId('busy-session')
+      const idleSessionId = sessionId('idle-session')
+      const projects: ProjectGroup[] = [
+        {
+          projectPath: '/home/user/project',
+          sessions: [
+            {
+              sessionId: busySessionId,
+              projectPath: '/home/user/project',
+              updatedAt: now,
+              title: 'Busy codex session',
+              cwd: '/home/user/project',
+            },
+            {
+              sessionId: idleSessionId,
+              projectPath: '/home/user/project',
+              updatedAt: now,
+              title: 'Idle session',
+              cwd: '/home/user/project',
+            },
+          ],
+        },
+      ]
+
+      const tabs = [
+        {
+          id: 'tab-1',
+          terminalId,
+          resumeSessionId: busySessionId,
+          mode: 'codex',
+        },
+        {
+          id: 'tab-2',
+          resumeSessionId: idleSessionId,
+          mode: 'claude',
+        },
+      ]
+
+      // Background terminal needed so the selector can map session→terminalId
+      const terminals: BackgroundTerminal[] = [
+        {
+          terminalId,
+          title: 'Codex',
+          createdAt: now,
+          status: 'running',
+          hasClients: true,
+          mode: 'codex',
+          resumeSessionId: busySessionId,
+        },
+      ]
+
+      const store = createTestStore({
+        projects,
+        tabs,
+        sortMode: 'activity',
+        codexActivity: {
+          byTerminalId: {
+            [terminalId]: {
+              terminalId,
+              sessionId: 'session-codex',
+              phase: 'busy',
+              updatedAt: 10,
+            },
+          },
+        },
+      })
+      renderSidebar(store, terminals)
+
+      await act(async () => {
+        vi.advanceTimersByTime(100)
+      })
+
+      // The busy session should have a blue icon
+      const blueIcons = document.querySelectorAll('.text-blue-500')
+      expect(blueIcons.length).toBeGreaterThan(0)
+
+      // The idle session with a tab should still be green, not blue
+      const greenIcons = document.querySelectorAll('.text-success')
+      expect(greenIcons.length).toBeGreaterThan(0)
     })
   })
 

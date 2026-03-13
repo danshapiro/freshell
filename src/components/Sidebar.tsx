@@ -637,7 +637,11 @@ function areSidebarItemPropsEqual(prev: SidebarItemProps, next: SidebarItemProps
 export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
   const { item, isActiveTab, showProjectBadge, onClick } = props
   const extensionEntries = useAppSelector((s) => s.extensions?.entries)
+  const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId)
   const { icon: SessionIcon, label: sessionLabel } = resolveSessionTypeConfig(item.sessionType, extensionEntries)
+  const isBusy = item.hasTab
+    && !!item.runningTerminalId
+    && codexActivityByTerminalId?.[item.runningTerminalId]?.phase === 'busy'
   return (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -658,11 +662,11 @@ export const SidebarItem = memo(function SidebarItem(props: SidebarItemProps) {
         >
           {/* Provider icon */}
           <div className="flex-shrink-0">
-            <div className={cn('relative', item.hasTab && 'animate-pulse-subtle')}>
+            <div className="relative">
               <SessionIcon
                 className={cn(
                   'h-3.5 w-3.5',
-                  item.hasTab ? 'text-success' : 'text-muted-foreground'
+                  isBusy ? 'text-blue-500' : item.hasTab ? 'text-success' : 'text-muted-foreground'
                 )}
               />
             </div>
