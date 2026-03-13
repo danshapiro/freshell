@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { Router } from 'express'
 import { z } from 'zod'
 import { spawnElevatedPowerShell } from './elevated-powershell.js'
@@ -13,6 +14,7 @@ export const NetworkConfigureSchema = z.object({
 
 const ConfigureFirewallRequestSchema = z.object({
   confirmElevation: z.literal(true).optional(),
+  confirmationToken: z.string().min(1).optional(),
 }).strict()
 
 const WINDOWS_ELEVATION_CONFIRMATION = {
@@ -31,6 +33,20 @@ const REMOTE_ACCESS_DISABLED = {
   method: 'none',
   message: 'Remote access is not enabled',
 } as const
+
+type RepairPlatform = 'windows' | 'wsl2'
+
+type ConfirmableRepairAction = {
+  kind: 'confirmable'
+  platform: RepairPlatform
+  script: string
+  responseMethod: 'windows-elevated' | 'wsl2'
+}
+
+type RepairActionResolution =
+  | { kind: 'none'; response: { method: 'none'; message: string } }
+  | { kind: 'terminal'; response: { method: 'terminal'; command: string } }
+  | ConfirmableRepairAction
 
 function isRemoteAccessEnabled(
   settings: { network?: { host?: string; configured?: boolean } },
@@ -68,6 +84,9 @@ export interface NetworkRouterDeps {
 export function createNetworkRouter(deps: NetworkRouterDeps): Router {
   const { networkManager, configStore, wsHandler, detectLanIps } = deps
   const router = Router()
+  const FIREWALL_REPAIR_LOCKED = Symbol('FIREWALL_REPAIR_LOCKED')
+  let currentConfirmation: { token: string; platform: RepairPlatform } | null = null
+  let confirmedRepairInFlight = false
 
   const startElevatedRepair = (
     command: string,
@@ -98,6 +117,98 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
       networkManager.resetFirewallCache()
       networkManager.setFirewallConfiguring(false)
     })
+  }
+
+  const issueConfirmation = (platform: RepairPlatform) => {
+    const confirmationToken = randomUUID()
+    currentConfirmation = { token: confirmationToken, platform }
+    return {
+      ...WINDOWS_ELEVATION_CONFIRMATION,
+      confirmationToken,
+    }
+  }
+
+  const matchesConfirmation = (token: string | undefined, platform: RepairPlatform) => {
+    return currentConfirmation !== null
+      && currentConfirmation.token === token
+      && currentConfirmation.platform === platform
+  }
+
+  const consumeConfirmation = (token: string | undefined, platform: RepairPlatform) => {
+    if (!matchesConfirmation(token, platform)) {
+      return false
+    }
+
+    currentConfirmation = null
+    return true
+  }
+
+  const withConfirmedRepairLock = async <T,>(fn: () => Promise<T>) => {
+    if (confirmedRepairInFlight) {
+      return FIREWALL_REPAIR_LOCKED
+    }
+
+    confirmedRepairInFlight = true
+    try {
+      return await fn()
+    } finally {
+      confirmedRepairInFlight = false
+    }
+  }
+
+  const resolveRepairAction = async (
+    status: Awaited<ReturnType<NetworkRouterDeps['networkManager']['getStatus']>>,
+    settings: Awaited<ReturnType<NetworkRouterDeps['configStore']['getSettings']>>,
+  ): Promise<RepairActionResolution> => {
+    if (!isRemoteAccessEnabled(settings, status.host, status.firewall.platform)) {
+      return { kind: 'none', response: REMOTE_ACCESS_DISABLED }
+    }
+
+    if (status.firewall.platform === 'wsl2') {
+      if (status.firewall.portOpen === true) {
+        return { kind: 'none', response: NO_CONFIGURATION_CHANGES_REQUIRED }
+      }
+
+      const plan = await computeWslPortForwardingPlanAsync(networkManager.getRelevantPorts())
+      if (plan.status === 'error') {
+        throw new Error(plan.message)
+      }
+      if (plan.status === 'noop' || plan.status === 'not-wsl2') {
+        return { kind: 'none', response: NO_CONFIGURATION_CHANGES_REQUIRED }
+      }
+
+      return {
+        kind: 'confirmable',
+        platform: 'wsl2',
+        script: plan.script,
+        responseMethod: 'wsl2',
+      }
+    }
+
+    if (status.firewall.platform === 'windows') {
+      if (status.firewall.commands.length === 0) {
+        return { kind: 'none', response: { method: 'none', message: 'No firewall detected' } }
+      }
+      if (status.firewall.portOpen === true) {
+        return { kind: 'none', response: NO_CONFIGURATION_CHANGES_REQUIRED }
+      }
+
+      return {
+        kind: 'confirmable',
+        platform: 'windows',
+        script: status.firewall.commands.join('; '),
+        responseMethod: 'windows-elevated',
+      }
+    }
+
+    if (status.firewall.commands.length === 0) {
+      return { kind: 'none', response: { method: 'none', message: 'No firewall detected' } }
+    }
+
+    return {
+      kind: 'terminal',
+      response: { method: 'terminal', command: status.firewall.commands.join(' && ') },
+    }
   }
 
   router.get('/lan-info', (_req, res) => {
@@ -143,99 +254,90 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
     }
 
     try {
+      const confirmElevation = parsed.data.confirmElevation === true
+      const confirmationToken = parsed.data.confirmationToken
       const [status, settings] = await Promise.all([
         networkManager.getStatus(),
         configStore.getSettings(),
       ])
-      const confirmElevation = parsed.data.confirmElevation === true
+      const action = await resolveRepairAction(status, settings)
 
-      // In-flight guard: prevent concurrent elevated firewall processes
-      if (status.firewall.configuring) {
+      if (action.kind === 'none' || action.kind === 'terminal') {
+        return res.json(action.response)
+      }
+
+      if (!confirmElevation || !matchesConfirmation(confirmationToken, action.platform)) {
+        return res.json(issueConfirmation(action.platform))
+      }
+
+      const lockedResult = await withConfirmedRepairLock(async () => {
+        const [freshStatus, freshSettings] = await Promise.all([
+          networkManager.getStatus(),
+          configStore.getSettings(),
+        ])
+        const freshAction = await resolveRepairAction(freshStatus, freshSettings)
+
+        if (freshAction.kind === 'none' || freshAction.kind === 'terminal') {
+          return { status: 200 as const, body: freshAction.response }
+        }
+
+        if (!consumeConfirmation(confirmationToken, freshAction.platform)) {
+          return {
+            status: 200 as const,
+            body: issueConfirmation(freshAction.platform),
+          }
+        }
+
+        try {
+          startElevatedRepair(
+            freshAction.platform === 'wsl2'
+              ? '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
+              : 'powershell.exe',
+            freshAction.script,
+            freshAction.platform === 'wsl2'
+              ? {
+                completedLog: 'WSL2 port forwarding completed successfully',
+                failedLog: 'WSL2 port forwarding failed',
+                spawnFailedLog: 'Failed to spawn PowerShell for WSL2 port forwarding',
+              }
+              : {
+                completedLog: 'Windows firewall configured successfully',
+                failedLog: 'Windows firewall configuration failed',
+                spawnFailedLog: 'Failed to spawn PowerShell for Windows firewall',
+              },
+          )
+
+          return {
+            status: 200 as const,
+            body: { method: freshAction.responseMethod, status: 'started' as const },
+          }
+        } catch (err) {
+          log.error(
+            { err },
+            freshAction.platform === 'wsl2'
+              ? 'WSL2 port forwarding setup error'
+              : 'Windows firewall setup error',
+          )
+          networkManager.setFirewallConfiguring(false)
+          return {
+            status: 500 as const,
+            body: {
+              error: freshAction.platform === 'wsl2'
+                ? 'WSL2 port forwarding failed to start'
+                : 'Windows firewall configuration failed to start',
+            },
+          }
+        }
+      })
+
+      if (lockedResult === FIREWALL_REPAIR_LOCKED) {
         return res.status(409).json({
           error: 'Firewall configuration already in progress',
           method: 'in-progress',
         })
       }
 
-      if (!isRemoteAccessEnabled(settings, status.host, status.firewall.platform)) {
-        return res.json(REMOTE_ACCESS_DISABLED)
-      }
-
-      const commands = status.firewall.commands
-
-      if (status.firewall.platform === 'wsl2') {
-        if (status.firewall.portOpen === true) {
-          return res.json(NO_CONFIGURATION_CHANGES_REQUIRED)
-        }
-
-        const plan = await computeWslPortForwardingPlanAsync(networkManager.getRelevantPorts())
-
-        if (plan.status === 'error') {
-          log.error({ message: plan.message }, 'WSL2 port forwarding setup error')
-          return res.status(500).json({ error: plan.message })
-        }
-
-        if (plan.status === 'not-wsl2' || plan.status === 'noop') {
-          return res.json(NO_CONFIGURATION_CHANGES_REQUIRED)
-        }
-
-        if (!confirmElevation) {
-          return res.json(WINDOWS_ELEVATION_CONFIRMATION)
-        }
-
-        try {
-          startElevatedRepair(
-            '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe',
-            plan.script,
-            {
-              completedLog: 'WSL2 port forwarding completed successfully',
-              failedLog: 'WSL2 port forwarding failed',
-              spawnFailedLog: 'Failed to spawn PowerShell for WSL2 port forwarding',
-            },
-          )
-          return res.json({ method: 'wsl2', status: 'started' })
-        } catch (err) {
-          log.error({ err }, 'WSL2 port forwarding setup error')
-          networkManager.setFirewallConfiguring(false)
-          return res.status(500).json({ error: 'WSL2 port forwarding failed to start' })
-        }
-      }
-
-      if (status.firewall.platform === 'windows') {
-        if (commands.length === 0) {
-          return res.json({ method: 'none', message: 'No firewall detected' })
-        }
-
-        if (status.firewall.portOpen === true) {
-          return res.json(NO_CONFIGURATION_CHANGES_REQUIRED)
-        }
-
-        if (!confirmElevation) {
-          return res.json(WINDOWS_ELEVATION_CONFIRMATION)
-        }
-
-        const script = commands.join('; ')
-        try {
-          startElevatedRepair('powershell.exe', script, {
-            completedLog: 'Windows firewall configured successfully',
-            failedLog: 'Windows firewall configuration failed',
-            spawnFailedLog: 'Failed to spawn PowerShell for Windows firewall',
-          })
-          return res.json({ method: 'windows-elevated', status: 'started' })
-        } catch (err) {
-          log.error({ err }, 'Windows firewall setup error')
-          networkManager.setFirewallConfiguring(false)
-          return res.status(500).json({ error: 'Windows firewall configuration failed to start' })
-        }
-      }
-
-      if (commands.length === 0) {
-        return res.json({ method: 'none', message: 'No firewall detected' })
-      }
-
-      // Linux/macOS: return command for client to run in a terminal pane
-      const command = commands.join(' && ')
-      res.json({ method: 'terminal', command })
+      return res.status(lockedResult.status).json(lockedResult.body)
     } catch (err) {
       log.error({ err }, 'Firewall configuration error')
       res.status(500).json({ error: 'Firewall configuration failed' })
