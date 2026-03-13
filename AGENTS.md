@@ -19,6 +19,13 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - Debug logging toggle (UI Settings → Debugging → Debug logging) enables debug-level logs and perf logging; keep OFF outside perf investigations.
 - When adding new user-facing features or making significant UI changes, update `docs/index.html` to reflect them. It's a nonfunctional mock of the default experience, so only major changes need to be added.
 
+## Test Coordination
+- Broad repo-supported test runs wait for the shared coordinator gate; if another agent holds it, wait rather than kill a foreign holder.
+- Set `FRESHELL_TEST_SUMMARY` when you want holder/status output to show a human-meaningful reason for a broad run.
+- Use `npm run test:status` to inspect the current holder, recent results, and any advisory reusable baseline.
+- Use `npm run test:vitest -- ...` for a repo-owned direct Vitest path. Raw `npx vitest` is not a coordinated workflow.
+- `test:unit` is the exact default-config `test/unit` workload, `test:integration` is the exact server-config `test/server` workload, and `test:server` stays watch-capable unless you pass an explicit broad `--run`.
+
 ## Merging to Main (CRITICAL - Read This)
 
 **You are running inside Freshell right now. This session, the terminal the user is typing in, is served by the main branch. If you break main, you kill yourself mid-operation and the user has to clean up your mess with a separate agent.**
@@ -68,10 +75,12 @@ npm run serve               # Build and run production server
 
 ### Testing
 ```bash
-npm test                    # Run all tests (client + server)
-npm run check               # Typecheck + test without building (safe while prod runs)
-npm run verify              # Build + test (catches type errors that vitest misses)
-npm run test:coverage       # Generate coverage report
+npm test                    # Coordinated full suite (default + server configs)
+npm run check               # Typecheck, then coordinated full suite
+npm run verify              # Build, then coordinated full suite
+npm run test:coverage       # Coordinated default-config coverage run
+npm run test:status         # Show active holder, latest results, and advisory baseline info
+npm run test:vitest -- ...  # Repo-owned direct Vitest path for focused passthrough work
 ```
 
 ## Architecture

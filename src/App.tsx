@@ -11,7 +11,7 @@ import { api, isApiUnauthorizedError, type VersionInfo } from '@/lib/api'
 import {
   activateSessionSurface,
   loadInitialSessionsWindow,
-  refreshActiveSessionWindow,
+  queueActiveSessionWindowRefresh,
 } from '@/store/sessionsThunks'
 import { getShareAction, ensureShareUrlToken } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
@@ -690,7 +690,7 @@ export default function App() {
           void recoverMissingStartupState()
         }
         if (msg.type === 'sessions.changed') {
-          void appStore.dispatch(refreshActiveSessionWindow() as any)
+          void appStore.dispatch(queueActiveSessionWindowRefresh() as any)
         }
         if (msg.type === 'settings.updated') {
           dispatch(setSettings(applyLocalTerminalFontFamily(msg.settings as AppSettings)))

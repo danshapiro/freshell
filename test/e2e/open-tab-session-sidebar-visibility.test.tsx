@@ -14,6 +14,9 @@ import terminalMetaReducer from '@/store/terminalMetaSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer } from '@/store/networkSlice'
 import { layoutMirrorMiddleware } from '@/store/layoutMirrorMiddleware'
+import * as sessionsThunks from '@/store/sessionsThunks'
+
+const _resetSessionWindowThunkState = ((sessionsThunks as any)._resetSessionWindowThunkState ?? (() => {})) as () => void
 
 vi.mock('react-window', () => ({
   List: ({ rowCount, rowComponent: Row, rowProps, style }: {
@@ -113,6 +116,16 @@ function broadcastWs(msg: any) {
   for (const handler of Array.from(wsHandlers)) {
     handler(msg)
   }
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
 }
 
 function createStore(options?: {
@@ -250,6 +263,7 @@ describe('open tab session sidebar visibility (e2e)', () => {
   })
 
   afterEach(() => {
+    _resetSessionWindowThunkState()
     cleanup()
   })
 
@@ -523,5 +537,121 @@ describe('open tab session sidebar visibility (e2e)', () => {
         }),
       ])
     })
+  })
+
+  it('keeps the loaded sidebar visible during an invalidation burst and queues at most one follow-up refresh', async () => {
+    const initialProjects = [{
+      projectPath: '/recent',
+      sessions: [{
+        provider: 'codex',
+        sessionId: 'recent-session',
+        projectPath: '/recent',
+        updatedAt: 10,
+        title: 'Recent Session',
+      }],
+    }]
+    const deferred = createDeferred<any>()
+
+    fetchSidebarSessionsSnapshot
+      .mockReturnValueOnce(deferred.promise)
+      .mockResolvedValue({
+        projects: [{
+          projectPath: '/older',
+          sessions: [{
+            provider: 'codex',
+            sessionId: 'older-open',
+            projectPath: '/older',
+            updatedAt: 11,
+            title: 'Older Open Session',
+          }],
+        }],
+        totalSessions: 1,
+        oldestIncludedTimestamp: 11,
+        oldestIncludedSessionId: 'codex:older-open',
+        hasMore: false,
+      })
+
+    const store = createStore({
+      sessions: {
+        projects: initialProjects,
+        activeSurface: 'sidebar',
+        lastLoadedAt: Date.now(),
+        totalSessions: 1,
+        oldestLoadedTimestamp: 10,
+        oldestLoadedSessionId: 'codex:recent-session',
+        hasMore: false,
+        windows: {
+          sidebar: {
+            projects: initialProjects,
+            lastLoadedAt: Date.now(),
+            totalSessions: 1,
+            oldestLoadedTimestamp: 10,
+            oldestLoadedSessionId: 'codex:recent-session',
+            hasMore: false,
+            loading: false,
+          },
+        },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Recent Session').length).toBeGreaterThan(0)
+    })
+
+    act(() => {
+      broadcastWs({
+        type: 'sessions.changed',
+        revision: 7,
+      })
+    })
+
+    await waitFor(() => {
+      expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+    })
+
+    expect(screen.getAllByText('Recent Session').length).toBeGreaterThan(0)
+
+    act(() => {
+      broadcastWs({
+        type: 'sessions.changed',
+        revision: 8,
+      })
+    })
+
+    expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
+    expect(screen.getAllByText('Recent Session').length).toBeGreaterThan(0)
+
+    await act(async () => {
+      deferred.resolve({
+        projects: [{
+          projectPath: '/older',
+          sessions: [{
+            provider: 'codex',
+            sessionId: 'older-open',
+            projectPath: '/older',
+            updatedAt: 11,
+            title: 'Older Open Session',
+          }],
+        }],
+        totalSessions: 1,
+        oldestIncludedTimestamp: 11,
+        oldestIncludedSessionId: 'codex:older-open',
+        hasMore: false,
+      })
+      await Promise.resolve()
+    })
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Older Open Session').length).toBeGreaterThan(0)
+    })
+
+    expect(screen.queryByText('Recent Session')).not.toBeInTheDocument()
+    expect(fetchSidebarSessionsSnapshot.mock.calls.length).toBeLessThanOrEqual(2)
   })
 })

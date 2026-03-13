@@ -44,6 +44,18 @@ it('parses dash-prefixed positional rename targets', () => {
   expect(parsed.args).toEqual(['-FFH7C5JAoRTjK8Qu8RXR', 'Editor'])
 })
 
+it('parses dash-prefixed positional send-keys targets without swallowing send-keys flags', () => {
+  const positional = parseArgs(['send-keys', '-FFH7C5JAoRTjK8Qu8RXR', 'ENTER'])
+  expect(positional.command).toBe('send-keys')
+  expect(positional.flags).toEqual({})
+  expect(positional.args).toEqual(['-FFH7C5JAoRTjK8Qu8RXR', 'ENTER'])
+
+  const withFlags = parseArgs(['send-keys', '-l', '-FFH7C5JAoRTjK8Qu8RXR', 'echo hello'])
+  expect(withFlags.command).toBe('send-keys')
+  expect(withFlags.flags.l).toBe(true)
+  expect(withFlags.args).toEqual(['-FFH7C5JAoRTjK8Qu8RXR', 'echo hello'])
+})
+
 it('parses dash-prefixed rename flag values', () => {
   const parsed = parseArgs(['rename-pane', '-t', '-FFH7C5JAoRTjK8Qu8RXR', '-n', '-Editor'])
   expect(parsed.command).toBe('rename-pane')

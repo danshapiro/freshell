@@ -389,6 +389,12 @@ export default function Sidebar({
   const activeTab = tabs.find((t) => t.id === activeTabId)
   const activeSessionKey = activeSessionKeyFromPanes
   const activeTerminalId = activeTab?.terminalId
+  const activeSearchTier = sidebarWindow?.searchTier ?? searchTier
+  const hasLoadedSidebarWindow = typeof sidebarWindow?.lastLoadedAt === 'number'
+  const sidebarWindowHasItems = (sidebarWindow?.projects ?? []).some((project) => (project.sessions?.length ?? 0) > 0)
+  const activeQuery = (sidebarWindow?.query ?? filter).trim()
+  const showBlockingLoad = !!sidebarWindow?.loading && !hasLoadedSidebarWindow && !sidebarWindowHasItems
+  const showInlineRefreshStatus = !!sidebarWindow?.loading && hasLoadedSidebarWindow
   const effectiveListHeight = listHeight > 0
     ? listHeight
     : Math.min(sortedItems.length * SESSION_ITEM_HEIGHT, SESSION_LIST_MAX_HEIGHT)
@@ -399,6 +405,7 @@ export default function Sidebar({
     (_visibleRows: { startIndex: number; stopIndex: number }, allRows: { startIndex: number; stopIndex: number }) => {
       if (
         !hasMore ||
+        sidebarWindow?.loading ||
         loadMoreInFlightRef.current ||
         oldestLoadedTimestamp == null ||
         oldestLoadedSessionId == null ||
@@ -418,7 +425,7 @@ export default function Sidebar({
         loadMoreInFlightRef.current = false
       }, 15_000)
     },
-    [hasMore, oldestLoadedTimestamp, oldestLoadedSessionId, sortedItems.length, filter, dispatch],
+    [hasMore, sidebarWindow?.loading, oldestLoadedTimestamp, oldestLoadedSessionId, sortedItems.length, filter, dispatch],
   )
   // Reset in-flight guard when loadingMore clears (response received)
   useEffect(() => {
@@ -576,33 +583,49 @@ export default function Sidebar({
       </div>
 
       {/* Session List */}
-      <div ref={listContainerRef} className="flex-1 px-2">
-        {sidebarWindow?.loading && filter.trim() && (
-          <div className="flex items-center justify-center py-8" data-testid="search-loading">
-            <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
-            <span className="ml-2 text-sm text-muted-foreground">Searching...</span>
+      <div className="flex flex-1 min-h-0 flex-col">
+        {showInlineRefreshStatus && (
+          <div
+            className="px-4 py-2 text-xs text-muted-foreground flex items-center gap-2"
+            role="status"
+            data-testid={activeQuery ? 'search-loading' : 'sessions-refreshing'}
+          >
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            <span>{activeQuery ? 'Searching...' : 'Updating sessions...'}</span>
           </div>
         )}
-        {!sidebarWindow?.loading && sortedItems.length === 0 ? (
+        <div ref={listContainerRef} className="flex-1 min-h-0 px-2">
+          {showBlockingLoad ? (
+            <div
+              className="flex items-center justify-center py-8"
+              data-testid={activeQuery ? 'search-loading' : undefined}
+            >
+              <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+              <span className="ml-2 text-sm text-muted-foreground">
+                {activeQuery ? 'Searching...' : 'Loading sessions...'}
+              </span>
+            </div>
+          ) : sortedItems.length === 0 ? (
           <div className="px-2 py-8 text-center text-sm text-muted-foreground">
-            {filter.trim() && searchTier !== 'title'
+            {activeQuery && activeSearchTier !== 'title'
               ? 'No results found'
-              : filter.trim()
+              : activeQuery
               ? 'No matching sessions'
               : 'No sessions yet'}
           </div>
-        ) : !sidebarWindow?.loading ? (
-          <List
-            defaultHeight={effectiveListHeight}
-            rowCount={sortedItems.length}
-            rowHeight={SESSION_ITEM_HEIGHT}
-            rowComponent={SidebarRow}
-            rowProps={rowProps}
-            onRowsRendered={handleRowsRendered}
-            className="overflow-y-auto"
-            style={{ height: effectiveListHeight, width: '100%' }}
-          />
-        ) : null}
+          ) : (
+            <List
+              defaultHeight={effectiveListHeight}
+              rowCount={sortedItems.length}
+              rowHeight={SESSION_ITEM_HEIGHT}
+              rowComponent={SidebarRow}
+              rowProps={rowProps}
+              onRowsRendered={handleRowsRendered}
+              className="overflow-y-auto"
+              style={{ height: effectiveListHeight, width: '100%' }}
+            />
+          )}
+        </div>
       </div>
 
     </div>

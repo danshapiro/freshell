@@ -23,6 +23,16 @@ type FetchSessionWindowArgs = {
 }
 
 const controllers = new Map<string, AbortController>()
+const inFlightRequests = new Map<SessionSurface, Promise<void>>()
+const invalidationRefreshState = new Map<SessionSurface, {
+  inFlight: Promise<void> | null
+  queued: boolean
+}>()
+let sessionWindowThunkGeneration = 0
+
+function isSessionSurface(value: unknown): value is SessionSurface {
+  return value === 'sidebar' || value === 'history' || value === 'bootstrap'
+}
 
 function abortSurface(surface: string) {
   const controller = controllers.get(surface)
@@ -30,6 +40,16 @@ function abortSurface(surface: string) {
     controller.abort()
     controllers.delete(surface)
   }
+}
+
+export function _resetSessionWindowThunkState(): void {
+  sessionWindowThunkGeneration += 1
+  for (const controller of controllers.values()) {
+    controller.abort()
+  }
+  controllers.clear()
+  inFlightRequests.clear()
+  invalidationRefreshState.clear()
 }
 
 function searchResultsToProjects(results: Awaited<ReturnType<typeof searchSessions>>['results']): ProjectGroup[] {
@@ -122,81 +142,90 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
     const controller = new AbortController()
     controllers.set(surface, controller)
 
-    dispatch(setSessionWindowLoading({
-      surface,
-      loading: true,
-      query: trimmedQuery,
-      searchTier,
-    }))
-    dispatch(setSessionWindowError({ surface, error: undefined }))
+    let requestPromise: Promise<void>
+    requestPromise = (async () => {
+      dispatch(setSessionWindowLoading({
+        surface,
+        loading: true,
+        query: trimmedQuery,
+        searchTier,
+      }))
+      dispatch(setSessionWindowError({ surface, error: undefined }))
 
-    try {
-      if (trimmedQuery) {
-        const response = await searchSessions({
-          query: trimmedQuery,
-          tier: searchTier,
+      try {
+        if (trimmedQuery) {
+          const response = await searchSessions({
+            query: trimmedQuery,
+            tier: searchTier,
+            signal: controller.signal,
+          })
+          if (controller.signal.aborted) return
+
+          dispatch(setSessionWindowData({
+            surface,
+            projects: searchResultsToProjects(response.results),
+            totalSessions: response.results.length,
+            oldestLoadedTimestamp: response.results.at(-1)?.updatedAt ?? 0,
+            oldestLoadedSessionId: response.results.at(-1)
+              ? `${response.results.at(-1)!.provider}:${response.results.at(-1)!.sessionId}`
+              : '',
+            hasMore: false,
+            query: trimmedQuery,
+            searchTier,
+          }))
+          return
+        }
+
+        const response = await fetchSidebarSessionsSnapshot({
+          limit: 50,
+          ...(append ? {
+            before: windowState?.oldestLoadedTimestamp,
+            beforeId: windowState?.oldestLoadedSessionId,
+          } : {}),
           signal: controller.signal,
         })
         if (controller.signal.aborted) return
 
+        const nextProjects = Array.isArray(response) ? response : (response?.projects ?? [])
+        const projects = append
+          ? mergeProjects(windowState?.projects ?? [], nextProjects)
+          : nextProjects
+
         dispatch(setSessionWindowData({
           surface,
-          projects: searchResultsToProjects(response.results),
-          totalSessions: response.results.length,
-          oldestLoadedTimestamp: response.results.at(-1)?.updatedAt ?? 0,
-          oldestLoadedSessionId: response.results.at(-1)
-            ? `${response.results.at(-1)!.provider}:${response.results.at(-1)!.sessionId}`
-            : '',
-          hasMore: false,
+          projects,
+          totalSessions: response?.totalSessions,
+          oldestLoadedTimestamp: response?.oldestIncludedTimestamp,
+          oldestLoadedSessionId: response?.oldestIncludedSessionId,
+          hasMore: response?.hasMore,
           query: trimmedQuery,
           searchTier,
         }))
-        return
+      } catch (error) {
+        if (controller.signal.aborted) return
+        dispatch(setSessionWindowError({
+          surface,
+          error: error instanceof Error ? error.message : 'Failed to load session window',
+        }))
+        dispatch(setSessionWindowLoading({
+          surface,
+          loading: false,
+          query: trimmedQuery,
+          searchTier,
+        }))
+        throw error
+      } finally {
+        if (controllers.get(surface) === controller) {
+          controllers.delete(surface)
+        }
+        if (inFlightRequests.get(surface) === requestPromise) {
+          inFlightRequests.delete(surface)
+        }
       }
+    })()
 
-      const response = await fetchSidebarSessionsSnapshot({
-        limit: 50,
-        ...(append ? {
-          before: windowState?.oldestLoadedTimestamp,
-          beforeId: windowState?.oldestLoadedSessionId,
-        } : {}),
-        signal: controller.signal,
-      })
-      if (controller.signal.aborted) return
-
-      const nextProjects = Array.isArray(response) ? response : (response?.projects ?? [])
-      const projects = append
-        ? mergeProjects(windowState?.projects ?? [], nextProjects)
-        : nextProjects
-
-      dispatch(setSessionWindowData({
-        surface,
-        projects,
-        totalSessions: response?.totalSessions,
-        oldestLoadedTimestamp: response?.oldestIncludedTimestamp,
-        oldestLoadedSessionId: response?.oldestIncludedSessionId,
-        hasMore: response?.hasMore,
-        query: trimmedQuery,
-        searchTier,
-      }))
-    } catch (error) {
-      if (controller.signal.aborted) return
-      dispatch(setSessionWindowError({
-        surface,
-        error: error instanceof Error ? error.message : 'Failed to load session window',
-      }))
-      dispatch(setSessionWindowLoading({
-        surface,
-        loading: false,
-        query: trimmedQuery,
-        searchTier,
-      }))
-      throw error
-    } finally {
-      if (controllers.get(surface) === controller) {
-        controllers.delete(surface)
-      }
-    }
+    inFlightRequests.set(surface, requestPromise)
+    return requestPromise
   }
 }
 
@@ -211,6 +240,58 @@ export function refreshActiveSessionWindow() {
       query: windowState?.query,
       searchTier: windowState?.searchTier,
     }) as any)
+  }
+}
+
+export function queueActiveSessionWindowRefresh() {
+  return async (dispatch: AppDispatch, getState: () => RootState) => {
+    const activeSurface = getState().sessions.activeSurface
+    if (!isSessionSurface(activeSurface)) return
+
+    const existing = invalidationRefreshState.get(activeSurface)
+    if (existing?.inFlight) {
+      existing.queued = true
+      return existing.inFlight
+    }
+
+    const generation = sessionWindowThunkGeneration
+    const state = {
+      inFlight: null as Promise<void> | null,
+      queued: true,
+    }
+    invalidationRefreshState.set(activeSurface, state)
+
+    const run = (async () => {
+      try {
+        while (generation === sessionWindowThunkGeneration) {
+          const activeRequest = inFlightRequests.get(activeSurface) ?? null
+          if (activeRequest) {
+            try {
+              await activeRequest
+            } catch {
+              // A queued invalidation should still retry after an aborted/failed direct fetch.
+            }
+            continue
+          }
+          if (!state.queued) break
+          state.queued = false
+          const windowState = getState().sessions.windows[activeSurface]
+          await dispatch(fetchSessionWindow({
+            surface: activeSurface,
+            priority: 'visible',
+            query: windowState?.query,
+            searchTier: windowState?.searchTier,
+          }) as any)
+        }
+      } finally {
+        if (invalidationRefreshState.get(activeSurface) === state) {
+          invalidationRefreshState.delete(activeSurface)
+        }
+      }
+    })()
+
+    state.inFlight = run
+    return run
   }
 }
 

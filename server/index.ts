@@ -763,7 +763,7 @@ async function main() {
     wsHandler.close()
 
     // 7. Close port forwards
-    portForwardManager.closeAll()
+    await portForwardManager.closeAll()
 
     // 8. Stop session indexer
     codingCliIndexer.stop()

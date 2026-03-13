@@ -131,4 +131,31 @@ describe('diffProjects', () => {
     expect(diff.removeProjectPaths).toEqual([])
     expect(diff.upsertProjects).toEqual(next)
   })
+
+  it('stays strict for internal metadata changes that are invisible to the directory read model', () => {
+    const prev: ProjectGroup[] = [
+      pg('/p1', [{
+        provider: 'codex',
+        sessionId: 's1',
+        projectPath: '/p1',
+        updatedAt: 1,
+        title: 'Deploy',
+        sourceFile: '/tmp/a.jsonl',
+      }]),
+    ]
+    const next: ProjectGroup[] = [
+      pg('/p1', [{
+        provider: 'codex',
+        sessionId: 's1',
+        projectPath: '/p1',
+        updatedAt: 1,
+        title: 'Deploy',
+        sourceFile: '/tmp/b.jsonl',
+      }]),
+    ]
+
+    const diff = diffProjects(prev, next)
+    expect(diff.removeProjectPaths).toEqual([])
+    expect(diff.upsertProjects).toEqual(next)
+  })
 })

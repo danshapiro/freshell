@@ -21,6 +21,7 @@ const PARENT_LOG_ENV_KEYS = [
 ] as const
 
 const PARENT_TEST_ENV_KEYS = [
+  'FRESHELL_TEST_COORDINATOR_ACTIVE',
   'VITEST',
   'VITEST_POOL_ID',
   'VITEST_WORKER_ID',
@@ -64,7 +65,7 @@ export async function startServerProcess(
   const stderrLogDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-logger-'))
   const logPath = path.join(
     stderrLogDir,
-    `server.log`,
+    'server.log',
   )
   const logStream = await createLogWriter(logPath)
   const childEnv = buildServerProcessEnv(env)

@@ -30,14 +30,20 @@ const defaultCliExtensions: ClientExtensionEntry[] = [
   },
 ]
 
+let latestOnRowsRendered:
+  | ((visibleRows: { startIndex: number; stopIndex: number }, allRows: { startIndex: number; stopIndex: number }) => void)
+  | null = null
+
 // Mock react-window's List component
 vi.mock('react-window', () => ({
-  List: ({ rowCount, rowComponent: Row, rowProps, style }: {
+  List: ({ rowCount, rowComponent: Row, rowProps, style, onRowsRendered }: {
     rowCount: number
     rowComponent: React.ComponentType<any>
     rowProps: any
     style: React.CSSProperties
+    onRowsRendered?: (visibleRows: { startIndex: number; stopIndex: number }, allRows: { startIndex: number; stopIndex: number }) => void
   }) => {
+    latestOnRowsRendered = onRowsRendered ?? null
     const items = []
     for (let i = 0; i < rowCount; i++) {
       items.push(
@@ -89,6 +95,7 @@ const sessionId = (label: string) => {
 
 function createTestStore(options?: {
   projects?: ProjectGroup[]
+  sessions?: Record<string, unknown>
   terminals?: BackgroundTerminal[]
   tabs?: Array<{
     id: string
@@ -186,6 +193,7 @@ function createTestStore(options?: {
         expandedProjects: new Set<string>(),
         isLoading: false,
         error: null,
+        ...options?.sessions,
       },
       connection: {
         status: 'connected',
@@ -251,6 +259,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     vi.useFakeTimers()
+    latestOnRowsRendered = null
     mockFetchSidebarSessionsSnapshot.mockReset()
     mockFetchSidebarSessionsSnapshot.mockResolvedValue({ projects: [] })
     mockGetTerminalDirectoryPage.mockReset()
@@ -1697,6 +1706,294 @@ describe('Sidebar Component - Session-Centric Display', () => {
         await Promise.resolve()
       })
       expect(queryByTestId('search-loading')).toBeInTheDocument()
+    })
+
+    it('keeps a loaded sidebar list mounted during a non-search refresh', async () => {
+      const recentProjects: ProjectGroup[] = [{
+        projectPath: '/work/recent',
+        sessions: [{
+          provider: 'codex',
+          sessionId: 'recent-session',
+          projectPath: '/work/recent',
+          updatedAt: 1_700_000_000_000,
+          title: 'Recent Session',
+        }],
+      }]
+
+      const store = createTestStore({
+        projects: recentProjects,
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: recentProjects,
+          lastLoadedAt: 1_700_000_000_000,
+          windows: {
+            sidebar: {
+              projects: recentProjects,
+              lastLoadedAt: 1_700_000_000_000,
+              loading: true,
+              query: '',
+              searchTier: 'title',
+            },
+          },
+        },
+      })
+
+      renderSidebar(store, [])
+
+      expect(screen.getByText('Recent Session')).toBeInTheDocument()
+      expect(screen.getByTestId('virtualized-list')).toBeInTheDocument()
+      expect(screen.getByTestId('sessions-refreshing')).toBeInTheDocument()
+    })
+
+    it('keeps loaded search results mounted while refresh is in flight', async () => {
+      const searchProjects: ProjectGroup[] = [{
+        projectPath: '/work/search',
+        sessions: [{
+          provider: 'codex',
+          sessionId: 'search-session',
+          projectPath: '/work/search',
+          updatedAt: 1_700_000_000_000,
+          title: 'Search Result',
+        }],
+      }]
+
+      const store = createTestStore({
+        projects: searchProjects,
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: searchProjects,
+          lastLoadedAt: 1_700_000_000_000,
+          windows: {
+            sidebar: {
+              projects: searchProjects,
+              lastLoadedAt: 1_700_000_000_000,
+              loading: true,
+              query: 'search',
+              searchTier: 'title',
+            },
+          },
+        },
+      })
+
+      const { getByPlaceholderText } = renderSidebar(store, [])
+      fireEvent.change(getByPlaceholderText('Search...'), { target: { value: 'search' } })
+
+      expect(screen.getByText('Search Result')).toBeInTheDocument()
+      expect(screen.getByTestId('search-loading')).toBeInTheDocument()
+    })
+
+    it('keeps a loaded empty-state message visible during refresh', async () => {
+      const store = createTestStore({
+        projects: [],
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: [],
+          lastLoadedAt: 1_700_000_000_000,
+          windows: {
+            sidebar: {
+              projects: [],
+              lastLoadedAt: 1_700_000_000_000,
+              loading: true,
+              query: '',
+              searchTier: 'title',
+            },
+          },
+        },
+      })
+
+      renderSidebar(store, [])
+
+      expect(screen.getByText('No sessions yet')).toBeInTheDocument()
+      expect(screen.getByTestId('sessions-refreshing')).toBeInTheDocument()
+    })
+
+    it('keeps first-load search blocking when no results have loaded yet', async () => {
+      const store = createTestStore({
+        projects: [],
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: [],
+          windows: {
+            sidebar: {
+              projects: [],
+              loading: true,
+              query: 'search',
+              searchTier: 'title',
+            },
+          },
+        },
+      })
+
+      const { getByPlaceholderText } = renderSidebar(store, [])
+      fireEvent.change(getByPlaceholderText('Search...'), { target: { value: 'search' } })
+
+      expect(screen.getByTestId('search-loading')).toBeInTheDocument()
+      expect(screen.queryByText('Search Result')).not.toBeInTheDocument()
+    })
+
+    it('keeps initial sidebar loads blocking even when fallback tab sessions exist', async () => {
+      const fallbackSessionId = sessionId('fallback-sidebar-load')
+      const store = createTestStore({
+        projects: [],
+        tabs: [{
+          id: 'tab-fallback-load',
+          title: 'Fallback Session',
+          mode: 'codex',
+          resumeSessionId: fallbackSessionId,
+          createdAt: 2_000,
+        }],
+        panes: {
+          layouts: {
+            'tab-fallback-load': {
+              type: 'leaf',
+              id: 'pane-fallback-load',
+              content: {
+                kind: 'terminal',
+                mode: 'codex',
+                createRequestId: 'req-fallback-load',
+                status: 'running',
+                resumeSessionId: fallbackSessionId,
+                cwd: '/tmp/fallback-load',
+              },
+            },
+          },
+          activePane: {
+            'tab-fallback-load': 'pane-fallback-load',
+          },
+          paneTitles: {
+            'tab-fallback-load': {
+              'pane-fallback-load': 'Fallback Session',
+            },
+          },
+        },
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: [],
+          windows: {
+            sidebar: {
+              projects: [],
+              loading: true,
+              query: '',
+              searchTier: 'title',
+            },
+          },
+        },
+      })
+
+      renderSidebar(store, [])
+
+      expect(screen.getByText('Loading sessions...')).toBeInTheDocument()
+      expect(screen.queryByText('Fallback Session')).not.toBeInTheDocument()
+      expect(screen.queryByTestId('virtualized-list')).not.toBeInTheDocument()
+    })
+
+    it('keeps first-load search blocking even when fallback tab sessions exist', async () => {
+      const fallbackSessionId = sessionId('fallback-search-load')
+      const store = createTestStore({
+        projects: [],
+        tabs: [{
+          id: 'tab-fallback-search',
+          title: 'Fallback Search Session',
+          mode: 'codex',
+          resumeSessionId: fallbackSessionId,
+          createdAt: 2_000,
+        }],
+        panes: {
+          layouts: {
+            'tab-fallback-search': {
+              type: 'leaf',
+              id: 'pane-fallback-search',
+              content: {
+                kind: 'terminal',
+                mode: 'codex',
+                createRequestId: 'req-fallback-search',
+                status: 'running',
+                resumeSessionId: fallbackSessionId,
+                cwd: '/tmp/fallback-search',
+              },
+            },
+          },
+          activePane: {
+            'tab-fallback-search': 'pane-fallback-search',
+          },
+          paneTitles: {
+            'tab-fallback-search': {
+              'pane-fallback-search': 'Fallback Search Session',
+            },
+          },
+        },
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: [],
+          windows: {
+            sidebar: {
+              projects: [],
+              loading: true,
+              query: 'search',
+              searchTier: 'title',
+            },
+          },
+        },
+      })
+
+      const { getByPlaceholderText } = renderSidebar(store, [])
+      fireEvent.change(getByPlaceholderText('Search...'), { target: { value: 'search' } })
+
+      expect(screen.getByTestId('search-loading')).toBeInTheDocument()
+      expect(screen.queryByText('Fallback Search Session')).not.toBeInTheDocument()
+      expect(screen.queryByTestId('virtualized-list')).not.toBeInTheDocument()
+    })
+
+    it('does not start append pagination while the sidebar is already refreshing', async () => {
+      const recentProjects: ProjectGroup[] = [{
+        projectPath: '/work/recent',
+        sessions: [{
+          provider: 'codex',
+          sessionId: 'recent-session',
+          projectPath: '/work/recent',
+          updatedAt: 1_700_000_000_000,
+          title: 'Recent Session',
+        }],
+      }]
+
+      const store = createTestStore({
+        projects: recentProjects,
+        sessions: {
+          activeSurface: 'sidebar',
+          projects: recentProjects,
+          lastLoadedAt: 1_700_000_000_000,
+          hasMore: true,
+          oldestLoadedTimestamp: 1_700_000_000_000,
+          oldestLoadedSessionId: 'codex:recent-session',
+          loadingMore: true,
+          windows: {
+            sidebar: {
+              projects: recentProjects,
+              lastLoadedAt: 1_700_000_000_000,
+              loading: true,
+              query: '',
+              searchTier: 'title',
+              hasMore: true,
+              oldestLoadedTimestamp: 1_700_000_000_000,
+              oldestLoadedSessionId: 'codex:recent-session',
+            },
+          },
+        },
+      })
+
+      renderSidebar(store, [])
+
+      expect(latestOnRowsRendered).not.toBeNull()
+
+      await act(async () => {
+        latestOnRowsRendered?.(
+          { startIndex: 0, stopIndex: 0 },
+          { startIndex: 0, stopIndex: 0 },
+        )
+        await Promise.resolve()
+      })
+
+      expect(mockFetchSidebarSessionsSnapshot).not.toHaveBeenCalled()
     })
   })
 
