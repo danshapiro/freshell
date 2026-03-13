@@ -70,31 +70,19 @@ function findProjectRoot(): string {
   throw new Error('Could not find project root (no package.json found)')
 }
 
-async function copyPathIfPresent(projectRoot: string, runtimeRoot: string, relativePath: string): Promise<void> {
-  const sourcePath = path.join(projectRoot, relativePath)
-  if (!fs.existsSync(sourcePath)) return
-
-  const targetPath = path.join(runtimeRoot, relativePath)
-  const stat = await fsp.stat(sourcePath)
-  if (stat.isDirectory()) {
-    await fsp.cp(sourcePath, targetPath, { recursive: true })
-    return
-  }
-
-  await fsp.mkdir(path.dirname(targetPath), { recursive: true })
-  await fsp.copyFile(sourcePath, targetPath)
-}
-
 async function createIsolatedRuntimeRoot(projectRoot: string): Promise<string> {
   const runtimeRootsParent = path.join(projectRoot, '.worktrees')
   await fsp.mkdir(runtimeRootsParent, { recursive: true })
   const runtimeRoot = await fsp.mkdtemp(path.join(runtimeRootsParent, 'test-server-runtime-'))
-  await copyPathIfPresent(projectRoot, runtimeRoot, 'package.json')
-  await copyPathIfPresent(projectRoot, runtimeRoot, 'dist')
-  await copyPathIfPresent(projectRoot, runtimeRoot, 'extensions')
-  await copyPathIfPresent(projectRoot, runtimeRoot, '.claude')
-  await copyPathIfPresent(projectRoot, runtimeRoot, path.join('.freshell', 'extensions'))
-  return runtimeRoot
+
+  try {
+    await fsp.copyFile(path.join(projectRoot, 'package.json'), path.join(runtimeRoot, 'package.json'))
+    await fsp.cp(path.join(projectRoot, 'dist'), path.join(runtimeRoot, 'dist'), { recursive: true })
+    return runtimeRoot
+  } catch (error) {
+    await fsp.rm(runtimeRoot, { recursive: true, force: true }).catch(() => {})
+    throw error
+  }
 }
 
 function readAuthTokenFromEnvFile(envText: string): string {

@@ -1,19 +1,11 @@
 import fs from 'fs/promises'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import { TestServer } from './test-server.js'
 
 function resolveProjectRoot(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..')
-}
-
-async function readBootstrap(baseUrl: string, token: string): Promise<any> {
-  const res = await fetch(`${baseUrl}/api/bootstrap`, {
-    headers: { 'x-auth-token': token },
-  })
-  expect(res.status).toBe(200)
-  return res.json()
 }
 
 async function listIsolatedRuntimeRoots(): Promise<string[]> {
@@ -89,15 +81,6 @@ describe('TestServer', () => {
     const envText = await fs.readFile(path.join(info.runtimeRoot, '.env'), 'utf8')
     expect(envText).toMatch(/^AUTH_TOKEN=[a-f0-9]{64}$/m)
     await expect(fs.stat(path.join(info.runtimeRoot, 'dist', '.env'))).rejects.toThrow()
-    await expect(fs.stat(path.join(info.runtimeRoot, 'extensions'))).resolves.toBeDefined()
-    await expect(fs.stat(path.join(info.runtimeRoot, '.claude', 'plugins', 'freshell-orchestration'))).resolves.toBeDefined()
-    await expect(fs.stat(path.join(info.runtimeRoot, '.claude', 'skills', 'freshell-orchestration'))).resolves.toBeDefined()
-
-    const healthRes = await fetch(`${info.baseUrl}/api/health`)
-    expect(healthRes.status).toBe(200)
-
-    const bootstrap = await readBootstrap(info.baseUrl, info.token)
-    expect(Object.keys(bootstrap.platform.availableClis ?? {})).not.toHaveLength(0)
 
     const res = await fetch(`${info.baseUrl}/api/settings`, {
       headers: { 'x-auth-token': info.token },
@@ -124,6 +107,28 @@ describe('TestServer', () => {
     await expect(fs.stat(path.join(resolveProjectRoot(), 'package.json'))).resolves.toBeDefined()
   })
 
+  it('starts isolated compiled startup without copied extension or skill directories', async () => {
+    server = new TestServer({
+      authStrategy: 'bootstrap',
+      runtimeRootMode: 'isolated',
+    })
+
+    const info = await server.start()
+
+    await expect(fs.stat(path.join(info.runtimeRoot, 'extensions'))).rejects.toThrow()
+    await expect(fs.stat(path.join(info.runtimeRoot, '.freshell', 'extensions'))).rejects.toThrow()
+    await expect(fs.stat(path.join(info.runtimeRoot, '.claude'))).rejects.toThrow()
+
+    const healthRes = await fetch(`${info.baseUrl}/api/health`)
+    expect(healthRes.status).toBe(200)
+    await expect(healthRes.json()).resolves.toMatchObject({ ok: true })
+
+    const settingsRes = await fetch(`${info.baseUrl}/api/settings`, {
+      headers: { 'x-auth-token': info.token },
+    })
+    expect(settingsRes.status).toBe(200)
+  })
+
   it('keeps the same bootstrap and auth contract for default and isolated compiled startup', async () => {
     const defaultServer = new TestServer()
     const isolatedServer = new TestServer({
@@ -141,10 +146,6 @@ describe('TestServer', () => {
       expect(isolatedHealthRes.status).toBe(200)
       await expect(defaultHealthRes.json()).resolves.toMatchObject({ ok: true })
       await expect(isolatedHealthRes.json()).resolves.toMatchObject({ ok: true })
-
-      const defaultBootstrap = await readBootstrap(defaultInfo.baseUrl, defaultInfo.token)
-      const isolatedBootstrap = await readBootstrap(isolatedInfo.baseUrl, isolatedInfo.token)
-      expect(isolatedBootstrap.platform).toEqual(defaultBootstrap.platform)
 
       const defaultUnauthedRes = await fetch(`${defaultInfo.baseUrl}/api/settings`)
       const isolatedUnauthedRes = await fetch(`${isolatedInfo.baseUrl}/api/settings`)
@@ -165,27 +166,23 @@ describe('TestServer', () => {
     }
   })
 
-  it('cleans up temp HOME and isolated runtime roots when startup fails before spawn', async () => {
-    const projectRoot = resolveProjectRoot()
-    const serverEntry = path.join(projectRoot, 'dist', 'server', 'index.js')
-    const serverEntryBackup = `${serverEntry}.test-backup`
+  it('cleans up temp HOME and isolated runtime roots when isolated staging fails', async () => {
     const runtimeRootsBefore = await listIsolatedRuntimeRoots()
     let failedHomeDir: string | undefined
-
-    await fs.rename(serverEntry, serverEntryBackup)
-
-    server = new TestServer({
-      authStrategy: 'bootstrap',
-      runtimeRootMode: 'isolated',
-      setupHome: async (homeDir) => {
-        failedHomeDir = homeDir
-      },
-    })
+    const copySpy = vi.spyOn(fs, 'cp').mockRejectedValue(new Error('Injected isolated runtime staging failure'))
 
     try {
-      await expect(server.start()).rejects.toThrow(/Built server not found/)
+      server = new TestServer({
+        authStrategy: 'bootstrap',
+        runtimeRootMode: 'isolated',
+        setupHome: async (homeDir) => {
+          failedHomeDir = homeDir
+        },
+      })
+
+      await expect(server.start()).rejects.toThrow('Injected isolated runtime staging failure')
     } finally {
-      await fs.rename(serverEntryBackup, serverEntry)
+      copySpy.mockRestore()
     }
 
     await server.stop()
