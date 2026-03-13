@@ -122,13 +122,24 @@ export class NetworkManager {
         ? process.env.HOST as '127.0.0.1' | '0.0.0.0'
         : network.host
 
-    const probePort = this.devMode && this.devPort ? this.devPort : this.port
     let portOpen: boolean | null = null
     if (effectiveHost === '0.0.0.0' && this.lanIps.length > 0) {
-      try {
-        portOpen = await isPortReachable(probePort, { host: this.lanIps[0], timeout: 2000 })
-      } catch {
+      const probeResults = await Promise.all(
+        ports.map(async (port) => {
+          try {
+            return await isPortReachable(port, { host: this.lanIps[0], timeout: 2000 })
+          } catch {
+            return null
+          }
+        }),
+      )
+
+      if (probeResults.includes(false)) {
+        portOpen = false
+      } else if (probeResults.includes(null)) {
         portOpen = null
+      } else {
+        portOpen = true
       }
     }
 

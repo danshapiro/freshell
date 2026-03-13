@@ -89,6 +89,7 @@ const terminalPreviewHeight = 8
 
 function getFirewallDescription(firewall: FirewallState, override: string | null): string {
   if (override) return override
+  if (firewall.configuring) return 'Firewall configuration already in progress'
   if (firewall.portOpen === true) return 'Port is open'
   if (firewall.platform === 'wsl2' && firewall.portOpen === false) return 'Port may be blocked'
   if (!firewall.active) return 'No firewall detected'
@@ -97,6 +98,9 @@ function getFirewallDescription(firewall: FirewallState, override: string | null
 }
 
 function shouldShowFirewallFix(firewall: FirewallState): boolean {
+  if (firewall.configuring) {
+    return false
+  }
   if (firewall.platform === 'wsl2' && firewall.portOpen === false) {
     return true
   }

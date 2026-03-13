@@ -45,6 +45,16 @@ vi.mock('node:child_process', async () => {
   return { ...actual, execFile: vi.fn() }
 })
 
+function expectConfirmationRequired(body: any) {
+  expect(body).toMatchObject({
+    method: 'confirmation-required',
+    title: 'Administrator approval required',
+    body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
+    confirmLabel: 'Continue',
+  })
+  expect(body.confirmationToken).toEqual(expect.any(String))
+}
+
 describe('Network API integration', () => {
   const token = 'test-token-for-network-api'
   let app: express.Express
@@ -187,6 +197,54 @@ describe('Network API integration', () => {
       const addr = server.address()
       expect(addr && typeof addr === 'object' ? addr.address : null).toBe('0.0.0.0')
     })
+
+    it('keeps Windows firewall repair available in dev mode when only the Vite port is reachable', async () => {
+      const devConfigStore = new ConfigStore()
+      const devServer = http.createServer()
+      const devNetworkManager = new NetworkManager(devServer, devConfigStore, 3001, true, 5173)
+      const devApp = express()
+      devApp.use(express.json())
+      devApp.use('/api', httpAuthMiddleware)
+      devApp.use('/api', createNetworkRouter({
+        networkManager: devNetworkManager,
+        configStore: devConfigStore,
+        wsHandler: { broadcast: vi.fn() },
+        detectLanIps: () => ['192.168.1.100'],
+      }))
+
+      await devConfigStore.patchSettings({
+        network: {
+          configured: true,
+          host: '0.0.0.0',
+        },
+      })
+      await new Promise<void>((resolve) => devServer.listen(0, '0.0.0.0', resolve))
+
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'windows',
+        active: true,
+      })
+      vi.mocked(isPortReachable).mockImplementation(async (port) => port === 5173)
+      devNetworkManager.resetFirewallCache()
+
+      try {
+        const res = await request(devApp)
+          .post('/api/network/configure-firewall')
+          .set('x-auth-token', token)
+          .send({})
+
+        expect(res.status).toBe(200)
+        expectConfirmationRequired(res.body)
+      } finally {
+        await devNetworkManager.stop()
+        await new Promise<void>((resolve, reject) => {
+          devServer.close((err) => {
+            if (err) reject(err)
+            else resolve()
+          })
+        })
+      }
+    })
   })
 
   describe('/local-file auth', () => {
@@ -222,16 +280,6 @@ describe('Network API integration', () => {
   })
 
   describe('POST /api/network/configure-firewall', () => {
-    const expectConfirmationRequired = (body: any) => {
-      expect(body).toMatchObject({
-        method: 'confirmation-required',
-        title: 'Administrator approval required',
-        body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
-        confirmLabel: 'Continue',
-      })
-      expect(body.confirmationToken).toEqual(expect.any(String))
-    }
-
     it('requires auth', async () => {
       const res = await request(app)
         .post('/api/network/configure-firewall')
@@ -844,7 +892,8 @@ describe('Network API integration', () => {
         .mockResolvedValueOnce(false)
 
       const cp = await import('node:child_process')
-      vi.mocked(cp.execFile).mockImplementation((_cmd: any, _args: any, _opts: any, _cb: any) => {
+      vi.mocked(cp.execFile).mockImplementation((_cmd: any, _args: any, _opts: any, cb: any) => {
+        cb?.(null, '', '')
         return { on: vi.fn() } as any
       })
 
@@ -1080,7 +1129,7 @@ describe('Network API integration', () => {
       networkManager.setFirewallConfiguring(false)
     })
 
-    it('returns 409 in-progress for a confirmed retry while a prior elevated repair is still running', async () => {
+    it('returns 409 in-progress for fresh and confirmed requests while a prior elevated repair is still running', async () => {
       vi.mocked(detectFirewall).mockResolvedValue({
         platform: 'wsl2',
         active: true,
@@ -1132,19 +1181,22 @@ describe('Network API integration', () => {
         .set('x-auth-token', token)
         .send({})
 
-      expect(secondFirstRes.status).toBe(200)
-      expectConfirmationRequired(secondFirstRes.body)
+      expect(secondFirstRes.status).toBe(409)
+      expect(secondFirstRes.body).toEqual({
+        error: 'Firewall configuration already in progress',
+        method: 'in-progress',
+      })
 
-      const inProgressRes = await request(app)
+      const confirmedRetryRes = await request(app)
         .post('/api/network/configure-firewall')
         .set('x-auth-token', token)
         .send({
           confirmElevation: true,
-          confirmationToken: secondFirstRes.body.confirmationToken,
+          confirmationToken: firstRes.body.confirmationToken,
         })
 
-      expect(inProgressRes.status).toBe(409)
-      expect(inProgressRes.body).toEqual({
+      expect(confirmedRetryRes.status).toBe(409)
+      expect(confirmedRetryRes.body).toEqual({
         error: 'Firewall configuration already in progress',
         method: 'in-progress',
       })

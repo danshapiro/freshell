@@ -219,6 +219,29 @@ describe('SettingsView network access section', () => {
     expect(screen.queryByText(/firewall configuration already in progress/i)).not.toBeInTheDocument()
   })
 
+  it('hides the Fix action and shows in-progress detail when the firewall is already configuring', () => {
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            firewall: {
+              platform: 'windows',
+              active: true,
+              portOpen: false,
+              commands: ['netsh advfirewall firewall add rule name="Freshell (port 3001)" dir=in action=allow protocol=TCP localport=3001 profile=private'],
+              configuring: true,
+            },
+          }),
+        }),
+      },
+    })
+
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    expect(screen.getByText(/firewall configuration already in progress/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /fix firewall/i })).not.toBeInTheDocument()
+  })
+
   it('refreshes network status when the server reports no firewall changes were needed', async () => {
     mockFetchFirewallConfig.mockResolvedValue({
       method: 'none',

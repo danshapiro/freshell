@@ -207,6 +207,30 @@ describe('NetworkManager', () => {
     expect(status.devMode).toBe(true)
   })
 
+  it('marks portOpen false in dev mode when any relevant port is unreachable', async () => {
+    const firewallModule = await import('../../../server/firewall.js')
+    const portReachable = await import('is-port-reachable')
+    vi.mocked(firewallModule.detectFirewall).mockResolvedValue({
+      platform: 'windows',
+      active: true,
+    })
+    vi.mocked(portReachable.default).mockImplementation(async (port) => port === 5173)
+    mockConfigStore = createMockConfigStore({
+      network: {
+        host: '0.0.0.0',
+        configured: true,
+      },
+    })
+    manager = new NetworkManager(server, mockConfigStore, 9876, true, 5173)
+    await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+
+    const status = await manager.getStatus()
+
+    expect(status.firewall.portOpen).toBe(false)
+    const probedPorts = vi.mocked(portReachable.default).mock.calls.map(([port]) => port)
+    expect(probedPorts).toEqual(expect.arrayContaining([9876, 5173]))
+  })
+
   it('preserves WsHandler across rebind via prepareForRebind/resumeAfterRebind', async () => {
     manager = new NetworkManager(server, mockConfigStore, 0)
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))

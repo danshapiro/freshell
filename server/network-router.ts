@@ -304,6 +304,13 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
         return res.json(action.response)
       }
 
+      if (confirmedRepairInFlight) {
+        return res.status(409).json({
+          error: 'Firewall configuration already in progress',
+          method: 'in-progress',
+        })
+      }
+
       if (!confirmElevation || !matchesConfirmation(confirmationToken, action.platform)) {
         return res.json(issueConfirmation(action.platform))
       }
