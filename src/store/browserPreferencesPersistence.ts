@@ -1,6 +1,6 @@
 import type { Middleware } from '@reduxjs/toolkit'
 
-import { extractLegacyLocalSettingsSeed, mergeLocalSettings, defaultLocalSettings, type LocalSettings, type LocalSettingsPatch } from '@shared/settings'
+import { mergeLocalSettings, defaultLocalSettings, type LocalSettings, type LocalSettingsPatch } from '@shared/settings'
 import { loadBrowserPreferencesRecord, type BrowserPreferencesRecord } from '@/lib/browser-preferences'
 import { BROWSER_PREFERENCES_STORAGE_KEY } from './storage-keys'
 import { broadcastPersistedRaw } from './persistBroadcast'
@@ -266,6 +266,7 @@ export function getPendingBrowserPreferencesWriteState(store: { getState: Browse
 export const browserPreferencesPersistenceMiddleware: Middleware<{}, BrowserPreferencesState> = (store) => {
   let dirty = false
   let flushTimer: ReturnType<typeof setTimeout> | null = null
+  let retrySuppressed = false
   resetPendingWriteState(store.getState as BrowserPreferencesMiddlewareGetState)
 
   const flush = () => {
@@ -273,7 +274,7 @@ export const browserPreferencesPersistenceMiddleware: Middleware<{}, BrowserPref
     if (!dirty) return
 
     if (!canUseStorage()) {
-      scheduleFlush()
+      retrySuppressed = true
       return
     }
 
@@ -283,14 +284,15 @@ export const browserPreferencesPersistenceMiddleware: Middleware<{}, BrowserPref
       localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, raw)
       broadcastPersistedRaw(BROWSER_PREFERENCES_STORAGE_KEY, raw)
       dirty = false
+      retrySuppressed = false
       resetPendingWriteState(store.getState as BrowserPreferencesMiddlewareGetState)
     } catch {
-      scheduleFlush()
+      retrySuppressed = true
     }
   }
 
   const scheduleFlush = () => {
-    if (flushTimer) return
+    if (flushTimer || retrySuppressed || !dirty) return
     flushTimer = setTimeout(flush, BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
   }
 
@@ -336,11 +338,13 @@ export const browserPreferencesPersistenceMiddleware: Middleware<{}, BrowserPref
       if (action?.type === 'settings/updateSettingsLocal') {
         pending.settingsPatch = mergeLocalSettings(pending.settingsPatch, action.payload || {})
       } else if (action?.type === 'settings/setLocalSettings') {
-        pending.settingsPatch = extractLegacyLocalSettingsSeed(action.payload as Record<string, unknown>) ?? {}
+        const nextPatch = buildLocalSettingsPatch(action.payload as LocalSettings)
+        pending.settingsPatch = Object.keys(nextPatch).length > 0 ? nextPatch : undefined
       } else if (action?.type === 'tabRegistry/setTabRegistrySearchRangeDays') {
         pending.hasPendingSearchRangeDays = true
         pending.searchRangeDays = action.payload
       }
+      retrySuppressed = false
       dirty = true
       scheduleFlush()
     }

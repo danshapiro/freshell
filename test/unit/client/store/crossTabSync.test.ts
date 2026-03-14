@@ -3,7 +3,7 @@ import { configureStore } from '@reduxjs/toolkit'
 
 import tabsReducer, { hydrateTabs } from '../../../../src/store/tabsSlice'
 import panesReducer, { hydratePanes } from '../../../../src/store/panesSlice'
-import settingsReducer, { updateSettingsLocal } from '../../../../src/store/settingsSlice'
+import settingsReducer, { setLocalSettings, updateSettingsLocal } from '../../../../src/store/settingsSlice'
 import tabRegistryReducer from '../../../../src/store/tabRegistrySlice'
 import { installCrossTabSync } from '../../../../src/store/crossTabSync'
 import {
@@ -13,6 +13,7 @@ import {
 } from '../../../../src/store/browserPreferencesPersistence'
 import { broadcastPersistedRaw, resetPersistBroadcastForTests } from '../../../../src/store/persistBroadcast'
 import { BROWSER_PREFERENCES_STORAGE_KEY, PANES_STORAGE_KEY, TABS_STORAGE_KEY } from '../../../../src/store/storage-keys'
+import { resolveLocalSettings } from '@shared/settings'
 
 describe('crossTabSync', () => {
   const cleanups: Array<() => void> = []
@@ -233,6 +234,54 @@ describe('crossTabSync', () => {
     store.dispatch(updateSettingsLocal({
       theme: 'dark',
     }))
+
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: BROWSER_PREFERENCES_STORAGE_KEY,
+      newValue: JSON.stringify({
+        settings: {
+          theme: 'system',
+          sidebar: {
+            sortMode: 'project',
+          },
+        },
+        tabs: {
+          searchRangeDays: 365,
+        },
+      }),
+    }))
+
+    expect(store.getState().settings.settings.theme).toBe('dark')
+    expect(store.getState().settings.settings.sidebar.sortMode).toBe('project')
+    expect(store.getState().tabRegistry.searchRangeDays).toBe(365)
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    expect(JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')).toEqual({
+      settings: {
+        theme: 'dark',
+        sidebar: {
+          sortMode: 'project',
+        },
+      },
+      tabs: {
+        searchRangeDays: 365,
+      },
+    })
+  })
+
+  it('merges remote browser-preference writes without treating resolved defaults from setLocalSettings as dirty', () => {
+    vi.useFakeTimers()
+
+    const store = configureStore({
+      reducer: { settings: settingsReducer, tabRegistry: tabRegistryReducer },
+      middleware: (getDefault) => getDefault().concat(browserPreferencesPersistenceMiddleware),
+    })
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    store.dispatch(setLocalSettings(resolveLocalSettings({
+      theme: 'dark',
+    })))
 
     window.dispatchEvent(new StorageEvent('storage', {
       key: BROWSER_PREFERENCES_STORAGE_KEY,

@@ -154,4 +154,35 @@ describe('browserPreferencesPersistence', () => {
       },
     })
   })
+
+  it('stops automatic retry loops after a storage write failure until another local change happens', () => {
+    const store = createStore()
+    const setItemSpy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('QuotaExceededError', 'QuotaExceededError')
+    })
+
+    store.dispatch(updateSettingsLocal({
+      theme: 'dark',
+    }))
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+    expect(setItemSpy).toHaveBeenCalledTimes(1)
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS * 5)
+    expect(setItemSpy).toHaveBeenCalledTimes(1)
+
+    store.dispatch(updateSettingsLocal({
+      sidebar: {
+        sortMode: 'project',
+      },
+    }))
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+    expect(setItemSpy).toHaveBeenCalledTimes(2)
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS * 5)
+    expect(setItemSpy).toHaveBeenCalledTimes(2)
+
+    setItemSpy.mockRestore()
+  })
 })
