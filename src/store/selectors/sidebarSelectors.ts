@@ -109,7 +109,7 @@ export function buildSessionItems(
         projectPath: project.projectPath,
         projectColor: project.color,
         archived: session.archived,
-        timestamp: session.updatedAt,
+        timestamp: session.lastActivityAt,
         cwd: session.cwd,
         hasTab: tabInfo?.hasTab ?? false,
         ratchetedActivity,

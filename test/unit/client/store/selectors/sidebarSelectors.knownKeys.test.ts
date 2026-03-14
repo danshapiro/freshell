@@ -22,8 +22,8 @@ describe('makeSelectKnownSessionKeys', () => {
       {
         projectPath: '/repo',
         sessions: [
-          { sessionId: 'session-a', provider: 'claude', updatedAt: 1, projectPath: '/repo' },
-          { sessionId: 'session-b', provider: 'codex', updatedAt: 2, projectPath: '/repo' },
+          { sessionId: 'session-a', provider: 'claude', lastActivityAt: 1, projectPath: '/repo' },
+          { sessionId: 'session-b', provider: 'codex', lastActivityAt: 2, projectPath: '/repo' },
         ],
       },
     ] as RootState['sessions']['projects']
@@ -43,7 +43,7 @@ describe('makeSelectKnownSessionKeys', () => {
       {
         projectPath: '/repo',
         sessions: [
-          { sessionId: 'legacy-session', updatedAt: 1, projectPath: '/repo' },
+          { sessionId: 'legacy-session', lastActivityAt: 1, projectPath: '/repo' },
         ],
       },
     ] as RootState['sessions']['projects']

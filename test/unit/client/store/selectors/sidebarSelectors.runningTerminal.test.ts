@@ -14,7 +14,7 @@ function createState(): RootState {
               provider: 'codex',
               sessionId: 'session-1',
               projectPath: '/repo',
-              updatedAt: 1,
+              lastActivityAt: 1,
               title: 'Session One',
               cwd: '/repo',
             },

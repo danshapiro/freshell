@@ -36,7 +36,7 @@ describe('sidebarSelectors', () => {
           provider: 'claude' as const,
           sessionId: 'sess-1',
           projectPath,
-          updatedAt: 1000,
+          lastActivityAt: 1000,
           ...s,
         })),
       }
