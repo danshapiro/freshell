@@ -14,6 +14,7 @@
 
 import { createLogger } from '@/lib/client-logger'
 import { clearAuthCookie } from '@/lib/auth'
+import { BROWSER_PREFERENCES_STORAGE_KEY } from './storage-keys'
 
 const log = createLogger('StorageMigration')
 
@@ -43,7 +44,7 @@ export function runStorageMigration(): void {
     if (currentVersion >= STORAGE_VERSION) return
 
     const preservedAuthToken = localStorage.getItem(AUTH_STORAGE_KEY)
-    clearFreshellKeysExcept([AUTH_STORAGE_KEY])
+    clearFreshellKeysExcept([AUTH_STORAGE_KEY, BROWSER_PREFERENCES_STORAGE_KEY])
 
     if (preservedAuthToken) {
       localStorage.setItem(AUTH_STORAGE_KEY, preservedAuthToken)

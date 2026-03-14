@@ -1,16 +1,10 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import {
   resolveTerminalFontFamily,
-  loadLocalTerminalFontFamily,
-  saveLocalTerminalFontFamily,
-  LOCAL_TERMINAL_FONT_KEY,
 } from '@/lib/terminal-fonts'
+import * as terminalFonts from '@/lib/terminal-fonts'
 
 describe('terminal fonts', () => {
-  beforeEach(() => {
-    localStorage.clear()
-  })
-
   it('resolves a font family with a monospace fallback', () => {
     const resolved = resolveTerminalFontFamily('Consolas')
     const parts = resolved.split(',').map((part) => part.trim().replace(/^"|"$/g, ''))
@@ -27,15 +21,11 @@ describe('terminal fonts', () => {
     expect(parts[parts.length - 1]).toBe('monospace')
   })
 
-  it('persists and loads local terminal font preference', () => {
-    expect(loadLocalTerminalFontFamily()).toBeNull()
-
-    saveLocalTerminalFontFamily('Fira Code')
-    expect(localStorage.getItem(LOCAL_TERMINAL_FONT_KEY)).toBe('Fira Code')
-    expect(loadLocalTerminalFontFamily()).toBe('Fira Code')
-
-    saveLocalTerminalFontFamily(null)
-    expect(localStorage.getItem(LOCAL_TERMINAL_FONT_KEY)).toBeNull()
-    expect(loadLocalTerminalFontFamily()).toBeNull()
+  it('keeps only font-stack helpers and no storage helper exports', () => {
+    expect(typeof terminalFonts.resolveTerminalFontFamily).toBe('function')
+    expect(terminalFonts).not.toHaveProperty('LOCAL_TERMINAL_FONT_KEY')
+    expect(terminalFonts).not.toHaveProperty('loadLocalTerminalFontFamily')
+    expect(terminalFonts).not.toHaveProperty('saveLocalTerminalFontFamily')
+    expect(terminalFonts).not.toHaveProperty('applyLocalTerminalFontFamily')
   })
 })

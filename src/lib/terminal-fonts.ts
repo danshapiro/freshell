@@ -1,8 +1,3 @@
-import type { AppSettings } from '@/store/types'
-
-export const LOCAL_TERMINAL_FONT_KEY = 'freshell.terminal.fontFamily.v1'
-const DEFAULT_LOCAL_FONT_FAMILY = 'monospace'
-
 const DEFAULT_MONO_FALLBACKS = [
   'Cascadia Mono',
   'Cascadia Code',
@@ -64,54 +59,4 @@ export function resolveTerminalFontFamily(preferred?: string | null): string {
   }
 
   return resolved.length > 0 ? resolved.join(', ') : 'monospace'
-}
-
-function canUseStorage(): boolean {
-  try {
-    return typeof window !== 'undefined' && typeof window.localStorage !== 'undefined'
-  } catch {
-    return false
-  }
-}
-
-export function loadLocalTerminalFontFamily(): string | null {
-  if (!canUseStorage()) return null
-  try {
-    const value = window.localStorage.getItem(LOCAL_TERMINAL_FONT_KEY)
-    const trimmed = value?.trim()
-    return trimmed ? trimmed : null
-  } catch {
-    return null
-  }
-}
-
-export function saveLocalTerminalFontFamily(value: string | null | undefined): void {
-  if (!canUseStorage()) return
-  try {
-    const trimmed = value?.trim()
-    if (!trimmed) {
-      window.localStorage.removeItem(LOCAL_TERMINAL_FONT_KEY)
-      return
-    }
-    window.localStorage.setItem(LOCAL_TERMINAL_FONT_KEY, trimmed)
-  } catch {
-    // ignore storage failures
-  }
-}
-
-export function applyLocalTerminalFontFamily(settings: AppSettings): AppSettings {
-  const local = loadLocalTerminalFontFamily()
-  const nextFont = local ?? DEFAULT_LOCAL_FONT_FAMILY
-
-  if (!local) {
-    saveLocalTerminalFontFamily(nextFont)
-  }
-
-  return {
-    ...settings,
-    terminal: {
-      ...(settings?.terminal || {}),
-      fontFamily: nextFont,
-    },
-  }
 }

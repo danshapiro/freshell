@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { BROWSER_PREFERENCES_STORAGE_KEY } from '@/store/storage-keys'
 
 const AUTH_STORAGE_KEY = 'freshell.auth-token'
 
@@ -31,12 +32,22 @@ describe('storage-migration', () => {
   it('clears legacy freshell v1 keys while preserving auth token on version bump', async () => {
     localStorage.setItem('freshell_version', '2')
     localStorage.setItem(AUTH_STORAGE_KEY, 'token-123')
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      settings: {
+        theme: 'dark',
+      },
+    }))
     localStorage.setItem('freshell.tabs.v1', 'legacy-tabs')
     localStorage.setItem('freshell.panes.v1', 'legacy-panes')
 
     await importFreshStorageMigration()
 
     expect(localStorage.getItem(AUTH_STORAGE_KEY)).toBe('token-123')
+    expect(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY)).toBe(JSON.stringify({
+      settings: {
+        theme: 'dark',
+      },
+    }))
     expect(localStorage.getItem('freshell.tabs.v1')).toBeNull()
     expect(localStorage.getItem('freshell.panes.v1')).toBeNull()
     expect(localStorage.getItem('freshell_version')).toBe('3')
