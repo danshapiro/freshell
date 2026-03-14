@@ -523,10 +523,12 @@ export class CodingCliSessionIndexer {
     const appendOnlyReparse = sameSession && size >= (cached?.size ?? 0)
     const createdAt = appendOnlyReparse
       ? minDefined(previous?.createdAt, meta.createdAt)
-      : meta.createdAt
+      : (sameSession ? (meta.createdAt ?? previous?.createdAt) : meta.createdAt)
     const lastActivityAt = appendOnlyReparse
       ? (maxDefined(previous?.lastActivityAt, meta.lastActivityAt) ?? createdAt ?? 0)
-      : (meta.lastActivityAt ?? createdAt ?? 0)
+      : (sameSession
+          ? (meta.lastActivityAt ?? previous?.lastActivityAt ?? createdAt ?? 0)
+          : (meta.lastActivityAt ?? createdAt ?? 0))
 
     const baseSession: CodingCliSession = {
       provider: provider.name,

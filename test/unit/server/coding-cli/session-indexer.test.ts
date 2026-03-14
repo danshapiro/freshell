@@ -377,6 +377,45 @@ describe('CodingCliSessionIndexer', () => {
     expect(indexer.getProjects()[0]?.sessions[0]?.lastActivityAt).toBe(200)
   })
 
+  it('preserves semantic clocks when a same-session reparse shrinks the file', async () => {
+    const file = path.join(tempDir, 'session-shrink.jsonl')
+    await fsp.writeFile(
+      file,
+      [
+        JSON.stringify({ cwd: '/repo', title: 'Deploy' }),
+        JSON.stringify({ extra: 'keep original size larger' }),
+      ].join('\n') + '\n',
+    )
+
+    const parseSessionFile = vi.fn()
+      .mockResolvedValueOnce({
+        cwd: '/repo',
+        sessionId: 'session-shrink',
+        title: 'Deploy',
+        createdAt: 100,
+        lastActivityAt: 200,
+        messageCount: 2,
+      })
+      .mockResolvedValueOnce({
+        cwd: '/repo',
+        sessionId: 'session-shrink',
+        title: 'Deploy',
+        messageCount: 1,
+      })
+
+    const provider = makeProvider([file], { parseSessionFile })
+    const indexer = new CodingCliSessionIndexer([provider])
+
+    await indexer.refresh()
+    await fsp.writeFile(file, JSON.stringify({ cwd: '/repo', title: 'Deploy' }) + '\n')
+    ;(indexer as any).markDirty(file)
+    await indexer.refresh()
+
+    const session = indexer.getProjects()[0]?.sessions[0]
+    expect(session?.createdAt).toBe(100)
+    expect(session?.lastActivityAt).toBe(200)
+  })
+
   it('does not let append-only reparses move lastActivityAt backwards', async () => {
     const file = path.join(tempDir, 'session-b.jsonl')
     await fsp.writeFile(file, JSON.stringify({ cwd: '/repo', title: 'Deploy' }) + '\n')

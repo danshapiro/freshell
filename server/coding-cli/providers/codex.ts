@@ -13,7 +13,14 @@ const CODEX_MAX_PLAUSIBLE_CONTEXT_TOKENS_WITHOUT_WINDOW = 5_000_000
 const CODEX_AUTO_COMPACT_DEFAULT_PERCENT = 90
 const CODEX_EFFECTIVE_CONTEXT_WINDOW_DEFAULT_PERCENT = 95
 const SEMANTIC_CODEX_RESPONSE_TYPES = new Set(['message', 'function_call', 'function_call_output'])
-const SEMANTIC_CODEX_EVENT_TYPES = new Set(['agent_message', 'agent_reasoning', 'task_started', 'task_complete', 'turn_aborted'])
+const SEMANTIC_CODEX_EVENT_TYPES = new Set([
+  'agent_message',
+  'agent_reasoning',
+  'task_started',
+  'task_complete',
+  'turn_aborted',
+  'user_message',
+])
 
 export function defaultCodexHome(): string {
   return process.env.CODEX_HOME || path.join(os.homedir(), '.codex')

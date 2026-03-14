@@ -144,6 +144,24 @@ describe('codex-provider', () => {
     expect(meta.lastActivityAt).toBe(Date.parse('2026-03-01T00:00:05.000Z'))
   })
 
+  it('treats user_message event payloads as semantic user activity', () => {
+    const meta = parseCodexSessionContent([
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:00.000Z',
+        type: 'session_meta',
+        payload: { id: 'session-user-message', cwd: '/project/codex' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-03-01T00:00:05.000Z',
+        type: 'event_msg',
+        payload: { type: 'user_message', message: 'Visible user prompt' },
+      }),
+    ].join('\n'))
+
+    expect(meta.createdAt).toBe(Date.parse('2026-03-01T00:00:00.000Z'))
+    expect(meta.lastActivityAt).toBe(Date.parse('2026-03-01T00:00:05.000Z'))
+  })
+
   it('parses fixture-backed codex task event timestamps', async () => {
     const content = await fsp.readFile(codexTaskEventsFixturePath, 'utf8')
 
