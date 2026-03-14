@@ -1,9 +1,16 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import fs from 'node:fs'
 import http from 'node:http'
+import os from 'node:os'
+import path from 'node:path'
 import { execFile } from 'node:child_process'
-import { NetworkManager } from '../../../server/network-manager.js'
+import {
+  NetworkManager,
+  persistManagedWindowsRemoteAccessPortsForServer,
+} from '../../../server/network-manager.js'
 import { detectLanIps } from '../../../server/bootstrap.js'
 import { detectFirewall, firewallCommands } from '../../../server/firewall.js'
+import { computeWslPortForwardingPlanAsync } from '../../../server/wsl-port-forward.js'
 
 // Mock external dependencies
 vi.mock('../../../server/bootstrap.js', () => ({
@@ -52,7 +59,9 @@ describe('NetworkManager', () => {
   let savedAllowedOrigins: string | undefined
   let savedExtraAllowedOrigins: string | undefined
   let savedAuthToken: string | undefined
+  let savedFreshellHome: string | undefined
   let savedHost: string | undefined
+  let tmpDir: string
 
   beforeEach(() => {
     server = http.createServer()
@@ -60,11 +69,16 @@ describe('NetworkManager', () => {
     savedAllowedOrigins = process.env.ALLOWED_ORIGINS
     savedExtraAllowedOrigins = process.env.EXTRA_ALLOWED_ORIGINS
     savedAuthToken = process.env.AUTH_TOKEN
+    savedFreshellHome = process.env.FRESHELL_HOME
     savedHost = process.env.HOST
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-windows-managed-'))
     delete process.env.ALLOWED_ORIGINS
     delete process.env.EXTRA_ALLOWED_ORIGINS
     delete process.env.HOST
+    process.env.FRESHELL_HOME = tmpDir
     vi.mocked(detectFirewall).mockResolvedValue({ platform: 'linux-none', active: false })
+    vi.mocked(computeWslPortForwardingPlanAsync).mockReset()
+    vi.mocked(computeWslPortForwardingPlanAsync).mockResolvedValue({ status: 'noop', wslIp: '172.30.149.249' })
     vi.mocked(execFile).mockImplementation((_cmd: any, _args: any, _opts: any, cb: any) => {
       cb?.(Object.assign(new Error('rule not found'), { code: 1 }), '', '')
       return {} as any
@@ -89,11 +103,17 @@ describe('NetworkManager', () => {
     } else {
       delete process.env.AUTH_TOKEN
     }
+    if (savedFreshellHome !== undefined) {
+      process.env.FRESHELL_HOME = savedFreshellHome
+    } else {
+      delete process.env.FRESHELL_HOME
+    }
     if (savedHost !== undefined) {
       process.env.HOST = savedHost
     } else {
       delete process.env.HOST
     }
+    fs.rmSync(tmpDir, { recursive: true, force: true })
   })
 
   it('starts with localhost binding by default', async () => {
@@ -395,6 +415,7 @@ describe('NetworkManager', () => {
       active: true,
     })
     vi.mocked(portReachable.default).mockImplementation(async (port) => port === 5173)
+    await persistManagedWindowsRemoteAccessPortsForServer(9876, [9876])
     vi.mocked(execFile).mockImplementation((_cmd: any, args: any, _opts: any, cb: any) => {
       const ruleNameArg = args.at(-1)
       if (ruleNameArg === 'name=Freshell (port 9876)') {
@@ -440,6 +461,7 @@ describe('NetworkManager', () => {
       active: true,
     })
     vi.mocked(portReachable.default).mockResolvedValue(false)
+    await persistManagedWindowsRemoteAccessPortsForServer(9876, [9876])
     vi.mocked(execFile).mockImplementation((_cmd: any, args: any, _opts: any, cb: any) => {
       const ruleNameArg = args.at(-1)
       if (ruleNameArg === 'name=Freshell (port 9876)') {
@@ -471,6 +493,54 @@ describe('NetworkManager', () => {
     )
     expect(status.firewall.commands).not.toContain(
       'netsh advfirewall firewall add rule name="Freshell (port 9876)" dir=in action=allow protocol=TCP localport=9876 profile=private',
+    )
+  })
+
+  it('flags stale native Windows rules outside the current relevant ports for cleanup', async () => {
+    const firewallModule = await import('../../../server/firewall.js')
+    const portReachable = await import('is-port-reachable')
+    vi.mocked(firewallModule.detectFirewall).mockResolvedValue({
+      platform: 'windows',
+      active: true,
+    })
+    vi.mocked(portReachable.default).mockImplementation(async (port) => port === 5173)
+    await persistManagedWindowsRemoteAccessPortsForServer(9876, [4321])
+    vi.mocked(execFile).mockImplementation((_cmd: any, args: any, _opts: any, cb: any) => {
+      const ruleNameArg = args.at(-1)
+      if (ruleNameArg === 'name=Freshell (port 4321)') {
+        cb?.(null, [
+          'Rule Name: Freshell (port 4321)',
+          'Rule Name: Some Other App',
+        ].join('\n'), '')
+        return {} as any
+      }
+      cb?.(Object.assign(new Error('rule not found'), { code: 1 }), '', '')
+      return {} as any
+    })
+    mockConfigStore = createMockConfigStore({
+      network: {
+        host: '0.0.0.0',
+        configured: true,
+      },
+    })
+    manager = new NetworkManager(server, mockConfigStore, 9876, true, 5173)
+    await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+
+    const status = await manager.getStatus()
+
+    expect(status.remoteAccessEnabled).toBe(true)
+    expect((status as any).remoteAccessRequested).toBe(true)
+    expect((status as any).remoteAccessNeedsRepair).toBe(true)
+    expect(status.accessUrl).toContain('192.168.1.100:5173')
+    expect(status.firewall.portOpen).toBe(false)
+    expect(status.firewall.commands).toContain(
+      'netsh advfirewall firewall delete rule name="Freshell (port 4321)" 2>$null',
+    )
+    expect(status.firewall.commands).not.toContain(
+      'netsh advfirewall firewall add rule name="Freshell (port 4321)" dir=in action=allow protocol=TCP localport=4321 profile=private',
+    )
+    expect(status.firewall.commands).toContain(
+      'netsh advfirewall firewall add rule name="Freshell (port 5173)" dir=in action=allow protocol=TCP localport=5173 profile=private',
     )
   })
 

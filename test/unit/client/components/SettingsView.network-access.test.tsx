@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest'
+import { afterEach, describe, it, expect, vi } from 'vitest'
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import {
   createNetworkState,
@@ -26,6 +26,11 @@ vi.mock('@/lib/firewall-configure', () => ({
 installSettingsViewHooks({ mockFonts: true })
 
 describe('SettingsView network access section', () => {
+  afterEach(() => {
+    vi.clearAllTimers()
+    vi.useRealTimers()
+  })
+
   it('renders remote access toggle', () => {
     const store = createSettingsViewStore()
     renderSettingsView(store, { onNavigate: vi.fn() })
@@ -171,6 +176,98 @@ describe('SettingsView network access section', () => {
         confirmationToken: 'disable-1',
       })
     })
+  })
+
+  it('shows an admin-approval modal before disabling native Windows remote access', async () => {
+    const { api } = await import('@/lib/api')
+    vi.mocked(api.post)
+      .mockResolvedValueOnce({
+        method: 'confirmation-required',
+        title: 'Administrator approval required',
+        body: 'To complete this, you will need to accept the Windows administrator prompt on the next screen.',
+        confirmLabel: 'Continue',
+        confirmationToken: 'disable-windows-1',
+      })
+      .mockResolvedValueOnce({ method: 'windows-elevated', status: 'started' })
+
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            host: '0.0.0.0',
+            remoteAccessEnabled: true,
+            firewall: {
+              platform: 'windows',
+              active: true,
+              portOpen: true,
+              commands: [],
+              configuring: false,
+            },
+          } as any),
+        }),
+      },
+    })
+
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    fireEvent.click(screen.getByRole('switch', { name: /remote access/i }))
+
+    const confirmationDialog = await screen.findByRole('dialog', { name: /administrator approval required/i })
+    expect(confirmationDialog).toBeInTheDocument()
+
+    fireEvent.click(within(confirmationDialog).getByRole('button', { name: /^continue$/i }))
+
+    await waitFor(() => {
+      expect(api.post).toHaveBeenNthCalledWith(2, '/api/network/disable-remote-access', {
+        confirmElevation: true,
+        confirmationToken: 'disable-windows-1',
+      })
+    })
+  })
+
+  it('refreshes network status after native Windows disable elevation starts', async () => {
+    vi.useFakeTimers()
+    const { api } = await import('@/lib/api')
+    vi.mocked(api.post).mockResolvedValueOnce({ method: 'windows-elevated', status: 'started' })
+    vi.mocked(api.get).mockResolvedValueOnce(createNetworkStatus({
+      host: '127.0.0.1',
+      remoteAccessEnabled: false,
+      remoteAccessRequested: false,
+      accessUrl: 'http://localhost:3001/?token=abc',
+      firewall: { platform: 'windows', active: true, portOpen: false, commands: [], configuring: false },
+    } as any))
+
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            host: '0.0.0.0',
+            remoteAccessEnabled: true,
+            remoteAccessRequested: true,
+            firewall: {
+              platform: 'windows',
+              active: true,
+              portOpen: true,
+              commands: [],
+              configuring: false,
+            },
+          } as any),
+        }),
+      },
+    })
+
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    fireEvent.click(screen.getByRole('switch', { name: /remote access/i }))
+
+    await act(async () => {
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(2000)
+      await Promise.resolve()
+    })
+
+    expect(api.get).toHaveBeenCalledWith('/api/network/status')
+    expect(screen.getByRole('switch', { name: /remote access/i })).not.toBeChecked()
   })
 
   it('keeps WSL remote access enabled when the disable confirmation is cancelled', async () => {

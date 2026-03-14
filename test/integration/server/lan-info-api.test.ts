@@ -34,9 +34,12 @@ describe('LAN Info API', () => {
       networkManager: {
         getStatus: async () => ({}),
         configure: async () => ({ rebindScheduled: false }),
+        getManagedWindowsRemoteAccessPorts: async () => [],
         getRelevantPorts: () => [],
         getRemoteAccessPorts: () => [],
+        persistManagedWindowsRemoteAccessPorts: async () => {},
         setFirewallConfiguring: () => {},
+        clearManagedWindowsRemoteAccessPorts: async () => {},
         resetFirewallCache: () => {},
       },
       configStore: {

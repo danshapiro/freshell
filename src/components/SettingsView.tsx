@@ -85,7 +85,7 @@ type PreviewToken = {
 type FirewallConfirmation = Extract<ConfigureFirewallResult, { method: 'confirmation-required' }>
 type PendingConfirmation =
   | { kind: 'firewall-fix'; request: FirewallConfirmation }
-  | { kind: 'wsl-disable'; request: FirewallConfirmation }
+  | { kind: 'remote-access-disable'; request: FirewallConfirmation }
 type FirewallState = NetworkStatusResponse['firewall']
 
 const terminalPreviewWidth = 40
@@ -235,7 +235,10 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   const configuring = useAppSelector((s) => s.network.configuring)
   const remoteAccessEnabled = isRemoteAccessEnabledStatus(networkStatus)
   const remoteAccessRequested = networkStatus?.remoteAccessRequested ?? remoteAccessEnabled
-  const isWslRemoteAccess = networkStatus?.firewall?.platform === 'wsl2'
+  const requiresPrivilegedRemoteAccessDisable = (
+    networkStatus?.firewall?.platform === 'windows'
+    || networkStatus?.firewall?.platform === 'wsl2'
+  )
   const remoteAccessToggleChecked = remoteAccessEnabled || remoteAccessRequested
   const enabledProviders = useMemo(
     () => settings.codingCli?.enabledProviders ?? [],
@@ -492,14 +495,14 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     }
   }, [handleFirewallFixResult])
 
-  const requestWslRemoteAccessDisable = useCallback(async (
+  const requestRemoteAccessDisable = useCallback(async (
     body: { confirmElevation?: true; confirmationToken?: string } = {},
   ) => {
     setRemoteAccessError(null)
     try {
       const result = await api.post<ConfigureFirewallResult>('/api/network/disable-remote-access', body)
       if (result.method === 'confirmation-required') {
-        setPendingConfirmation({ kind: 'wsl-disable', request: result })
+        setPendingConfirmation({ kind: 'remote-access-disable', request: result })
         return
       }
       if (result.method === 'none') {
@@ -507,7 +510,11 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
         await dispatch(fetchNetworkStatus()).unwrap()
         return
       }
-      if (result.method === 'in-progress' || result.method === 'wsl2') {
+      if (
+        result.method === 'in-progress'
+        || result.method === 'windows-elevated'
+        || result.method === 'wsl2'
+      ) {
         scheduleRemoteAccessRefresh()
       }
     } catch (error) {
@@ -518,7 +525,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
         return
       }
 
-      log.warn('Failed to disable WSL remote access', error)
+      log.warn('Failed to disable remote access', error)
       setRemoteAccessPending(false)
       setRemoteAccessError(getErrorMessage(error, 'Failed to disable remote access'))
     }
@@ -554,11 +561,11 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
       return
     }
 
-    void requestWslRemoteAccessDisable({
+    void requestRemoteAccessDisable({
       confirmElevation: true,
       confirmationToken,
     })
-  }, [pendingConfirmation, requestFirewallFix, requestWslRemoteAccessDisable])
+  }, [pendingConfirmation, requestFirewallFix, requestRemoteAccessDisable])
 
   const handleCancelPendingAction = useCallback(() => {
     setPendingConfirmation(null)
@@ -1505,13 +1512,13 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 aria-label="Remote access"
                 onChange={async (checked) => {
                   setRemoteAccessError(null)
-                  if (isWslRemoteAccess) {
-                    if (checked) {
-                      await requestRemoteAccessConfigure('0.0.0.0')
-                      return
-                    }
+                  if (checked) {
+                    await requestRemoteAccessConfigure('0.0.0.0')
+                    return
+                  }
 
-                    await requestWslRemoteAccessDisable()
+                  if (requiresPrivilegedRemoteAccessDisable) {
+                    await requestRemoteAccessDisable()
                     return
                   }
 

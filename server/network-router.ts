@@ -3,6 +3,7 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { spawnElevatedPowerShell } from './elevated-powershell.js'
 import { logger } from './logger.js'
+import { buildWindowsFirewallDeleteCommands } from './network-manager.js'
 import { isRemoteAccessEnabled } from './network-access.js'
 import {
   clearManagedWslRemoteAccessPorts,
@@ -45,7 +46,7 @@ const REMOTE_ACCESS_DISABLED_SUCCESS = {
   message: 'Remote access disabled',
 } as const
 
-type ConfirmationAction = 'windows-repair' | 'wsl2-repair' | 'wsl2-disable'
+type ConfirmationAction = 'windows-disable' | 'windows-repair' | 'wsl2-repair' | 'wsl2-disable'
 
 type ConfirmableRepairAction = {
   kind: 'confirmable'
@@ -64,9 +65,12 @@ export interface NetworkRouterDeps {
   networkManager: {
     getStatus: () => Promise<any>
     configure: (data: any) => Promise<{ rebindScheduled: boolean }>
+    getManagedWindowsRemoteAccessPorts: () => Promise<number[]>
     getRelevantPorts: () => number[]
     getRemoteAccessPorts: () => number[]
+    persistManagedWindowsRemoteAccessPorts: () => Promise<void>
     setFirewallConfiguring: (v: boolean) => void
+    clearManagedWindowsRemoteAccessPorts: () => Promise<void>
     resetFirewallCache: () => void
   }
   configStore: {
@@ -109,6 +113,21 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
   const applyRemoteAccessSetting = async (host: '127.0.0.1' | '0.0.0.0') => {
     await networkManager.configure({ host, configured: true })
     await broadcastSettingsUpdated()
+  }
+
+  const applyRemoteAccessDisabledState = async (
+    platform: Awaited<ReturnType<NetworkRouterDeps['networkManager']['getStatus']>>['firewall']['platform'],
+  ) => {
+    await applyRemoteAccessSetting('127.0.0.1')
+    if (platform === 'wsl2') {
+      await clearManagedWslRemoteAccessPortsSafe()
+    } else if (platform === 'windows') {
+      try {
+        await networkManager.clearManagedWindowsRemoteAccessPorts()
+      } catch (err) {
+        log.error({ err }, 'Failed to clear managed Windows remote access ports')
+      }
+    }
   }
 
   const persistCurrentWslRemoteAccessPorts = async () => {
@@ -299,15 +318,36 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
     }
   }
 
-  const resolveWslDisableAction = async (
+  const resolveRemoteAccessDisableAction = async (
     status: Awaited<ReturnType<NetworkRouterDeps['networkManager']['getStatus']>>,
     settings: Awaited<ReturnType<NetworkRouterDeps['configStore']['getSettings']>>,
   ): Promise<RepairActionResolution> => {
-    if (status.firewall.platform !== 'wsl2') {
-      return { kind: 'none', response: REMOTE_ACCESS_DISABLED }
+    const remoteAccessRequested = isRemoteAccessEnabled(settings.network, status.host, status.firewall.platform)
+
+    if (status.firewall.platform === 'windows') {
+      const managedWindowsPorts = new Set(await networkManager.getManagedWindowsRemoteAccessPorts())
+      if (managedWindowsPorts.size === 0) {
+        return {
+          kind: 'none',
+          response: remoteAccessRequested ? REMOTE_ACCESS_DISABLED_SUCCESS : REMOTE_ACCESS_DISABLED,
+        }
+      }
+
+      return {
+        kind: 'confirmable',
+        confirmationAction: 'windows-disable',
+        script: buildWindowsFirewallDeleteCommands(managedWindowsPorts).join('; '),
+        responseMethod: 'windows-elevated',
+      }
     }
 
-    const remoteAccessRequested = isRemoteAccessEnabled(settings.network, status.host, status.firewall.platform)
+    if (status.firewall.platform !== 'wsl2') {
+      return {
+        kind: 'none',
+        response: remoteAccessRequested ? REMOTE_ACCESS_DISABLED_SUCCESS : REMOTE_ACCESS_DISABLED,
+      }
+    }
+
     const teardownPlan = await computeWslPortForwardingTeardownPlanAsync(
       networkManager.getRemoteAccessPorts(),
       networkManager.getRelevantPorts(),
@@ -359,6 +399,12 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
     }
     if (teardownPlan.status === 'ready') {
       throw new Error('WSL2 remote access teardown verification failed')
+    }
+  }
+
+  const verifyWindowsDisableSuccess = async () => {
+    if ((await networkManager.getManagedWindowsRemoteAccessPorts()).length > 0) {
+      throw new Error('Windows remote access teardown verification failed')
     }
   }
 
@@ -414,7 +460,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
         })
       }
 
-      const action = await resolveWslDisableAction(status, settings)
+      const action = await resolveRemoteAccessDisableAction(status, settings)
 
       if (action.kind === 'error') {
         if (confirmElevation) {
@@ -427,13 +473,12 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
         if (confirmElevation) {
           consumeCurrentConfirmation(confirmationToken)
         }
-        return res.status(500).json({ error: 'Invalid WSL disable action' })
+        return res.status(500).json({ error: 'Invalid remote access disable action' })
       }
 
       if (action.kind === 'none') {
         if (action.response.message === REMOTE_ACCESS_DISABLED_SUCCESS.message) {
-          await applyRemoteAccessSetting('127.0.0.1')
-          await clearManagedWslRemoteAccessPortsSafe()
+          await applyRemoteAccessDisabledState(status.firewall.platform)
         }
         if (confirmElevation) {
           consumeCurrentConfirmation(confirmationToken)
@@ -458,7 +503,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
           networkManager.getStatus(),
           configStore.getSettings(),
         ])
-        const freshAction = await resolveWslDisableAction(freshStatus, freshSettings)
+        const freshAction = await resolveRemoteAccessDisableAction(freshStatus, freshSettings)
 
         if (freshAction.kind === 'error') {
           consumeCurrentConfirmation(confirmationToken)
@@ -474,7 +519,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
           releaseConfirmedRepair()
           return {
             status: 500 as const,
-            body: { error: 'Invalid WSL disable action' },
+            body: { error: 'Invalid remote access disable action' },
           }
         }
 
@@ -482,12 +527,11 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
           consumeCurrentConfirmation(confirmationToken)
           try {
             if (freshAction.response.message === REMOTE_ACCESS_DISABLED_SUCCESS.message) {
-              await applyRemoteAccessSetting('127.0.0.1')
-              await clearManagedWslRemoteAccessPortsSafe()
+              await applyRemoteAccessDisabledState(freshStatus.firewall.platform)
             }
             return { status: 200 as const, body: freshAction.response }
           } catch (err) {
-            log.error({ err }, 'Failed to persist confirmed WSL remote access disable settings')
+            log.error({ err }, 'Failed to persist confirmed remote access disable settings')
             return {
               status: 500 as const,
               body: { error: 'Failed to persist remote access disable settings' },
@@ -507,19 +551,31 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
 
         try {
           startElevatedRepair(
-            '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe',
+            freshAction.confirmationAction === 'wsl2-disable'
+              ? '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
+              : 'powershell.exe',
             freshAction.script,
-            {
-              completedLog: 'WSL2 remote access teardown completed successfully',
-              failedLog: 'WSL2 remote access teardown failed',
-              spawnFailedLog: 'Failed to spawn PowerShell for WSL2 remote access teardown',
-              verifySuccess: verifyWslDisableSuccess,
-              onSuccess: async () => {
-                await applyRemoteAccessSetting('127.0.0.1')
-                await clearManagedWslRemoteAccessPortsSafe()
+            freshAction.confirmationAction === 'wsl2-disable'
+              ? {
+                completedLog: 'WSL2 remote access teardown completed successfully',
+                failedLog: 'WSL2 remote access teardown failed',
+                spawnFailedLog: 'Failed to spawn PowerShell for WSL2 remote access teardown',
+                verifySuccess: verifyWslDisableSuccess,
+                onSuccess: async () => {
+                  await applyRemoteAccessDisabledState('wsl2')
+                },
+                releaseConfirmedRepair,
+              }
+              : {
+                completedLog: 'Windows remote access teardown completed successfully',
+                failedLog: 'Windows remote access teardown failed',
+                spawnFailedLog: 'Failed to spawn PowerShell for Windows remote access teardown',
+                verifySuccess: verifyWindowsDisableSuccess,
+                onSuccess: async () => {
+                  await applyRemoteAccessDisabledState('windows')
+                },
+                releaseConfirmedRepair,
               },
-              releaseConfirmedRepair,
-            },
           )
 
           return {
@@ -527,11 +583,20 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
             body: { method: freshAction.responseMethod, status: 'started' as const },
           }
         } catch (err) {
-          log.error({ err }, 'WSL2 remote access teardown error')
+          log.error(
+            { err },
+            freshAction.confirmationAction === 'wsl2-disable'
+              ? 'WSL2 remote access teardown error'
+              : 'Windows remote access teardown error',
+          )
           releaseConfirmedRepair()
           return {
             status: 500 as const,
-            body: { error: 'WSL2 remote access teardown failed to start' },
+            body: {
+              error: freshAction.confirmationAction === 'wsl2-disable'
+                ? 'WSL2 remote access teardown failed to start'
+                : 'Windows remote access teardown failed to start',
+            },
           }
         }
       })()
@@ -649,6 +714,9 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
                 completedLog: 'Windows firewall configured successfully',
                 failedLog: 'Windows firewall configuration failed',
                 spawnFailedLog: 'Failed to spawn PowerShell for Windows firewall',
+                onSuccess: async () => {
+                  await networkManager.persistManagedWindowsRemoteAccessPorts()
+                },
                 releaseConfirmedRepair,
               },
           )

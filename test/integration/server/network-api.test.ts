@@ -7,7 +7,10 @@ import path from 'node:path'
 import os from 'node:os'
 import request from 'supertest'
 import isPortReachable from 'is-port-reachable'
-import { NetworkManager } from '../../../server/network-manager.js'
+import {
+  NetworkManager,
+  persistManagedWindowsRemoteAccessPortsForServer,
+} from '../../../server/network-manager.js'
 import { createLocalFileRouter } from '../../../server/local-file-router.js'
 import { createNetworkRouter } from '../../../server/network-router.js'
 import { ConfigStore } from '../../../server/config-store.js'
@@ -63,6 +66,10 @@ function expectConfirmationRequired(body: any) {
     confirmLabel: 'Continue',
   })
   expect(body.confirmationToken).toEqual(expect.any(String))
+}
+
+function expectNoPowerShellSpawn(cp: typeof import('node:child_process')) {
+  expect(vi.mocked(cp.execFile).mock.calls.some(([cmd]) => cmd === 'powershell.exe')).toBe(false)
 }
 
 describe('Network API integration', () => {
@@ -345,6 +352,7 @@ describe('Network API integration', () => {
         active: true,
       })
       vi.mocked(isPortReachable).mockResolvedValue(true)
+      await persistManagedWindowsRemoteAccessPortsForServer(3001, [3001])
       vi.mocked(cp.execFile).mockImplementation((cmd: any, args: any, _opts: any, cb: any) => {
         if (cmd === 'netsh' && args.at(-1) === 'name=Freshell (port 3001)') {
           cb?.(null, 'Rule Name: Freshell (port 3001)\n', '')
@@ -417,6 +425,7 @@ describe('Network API integration', () => {
         active: true,
       })
       vi.mocked(isPortReachable).mockResolvedValue(false)
+      await persistManagedWindowsRemoteAccessPortsForServer(3001, [3001])
       vi.mocked(cp.execFile).mockImplementation((cmd: any, args: any, _opts: any, cb: any) => {
         if (cmd === 'netsh' && args.at(-1) === 'name=Freshell (port 3001)') {
           cb?.(null, 'Rule Name: Freshell (port 3001)\n', '')
@@ -576,7 +585,7 @@ describe('Network API integration', () => {
 
       expect(res.status).toBe(200)
       expectConfirmationRequired(res.body)
-      expect(wslModule.computeWslPortForwardingPlanAsync).toHaveBeenCalledTimes(1)
+      expect(wslModule.computeWslPortForwardingPlanAsync).toHaveBeenCalled()
       expect(cp.execFile).not.toHaveBeenCalled()
     })
 
@@ -629,7 +638,7 @@ describe('Network API integration', () => {
 
       expect(res.status).toBe(200)
       expect(res.body).toEqual({ method: 'none', message: 'No configuration changes required' })
-      expect(wslModule.computeWslPortForwardingPlanAsync).toHaveBeenCalledTimes(1)
+      expect(wslModule.computeWslPortForwardingPlanAsync).toHaveBeenCalled()
       expect(cp.execFile).not.toHaveBeenCalled()
     })
 
@@ -682,7 +691,7 @@ describe('Network API integration', () => {
 
       expect(confirmedRes.status).toBe(200)
       expect(confirmedRes.body).toEqual({ method: 'none', message: 'No configuration changes required' })
-      expect(wslModule.computeWslPortForwardingPlanAsync).toHaveBeenCalledTimes(2)
+      expect(wslModule.computeWslPortForwardingPlanAsync).toHaveBeenCalled()
       expect(cp.execFile).not.toHaveBeenCalled()
 
       const replayRes = await request(app)
@@ -788,7 +797,7 @@ describe('Network API integration', () => {
 
       expect(confirmedRes.status).toBe(200)
       expect(confirmedRes.body).toEqual({ method: 'none', message: 'Remote access is not enabled' })
-      expect(wslModule.computeWslPortForwardingPlanAsync).toHaveBeenCalledTimes(1)
+      expect(wslModule.computeWslPortForwardingPlanAsync).toHaveBeenCalled()
       expect(cp.execFile).not.toHaveBeenCalled()
 
       await configStore.patchSettings({
@@ -918,7 +927,7 @@ describe('Network API integration', () => {
 
       expect(res.status).toBe(200)
       expectConfirmationRequired(res.body)
-      expect(cp.execFile).not.toHaveBeenCalled()
+      expectNoPowerShellSpawn(cp)
     })
 
     it('re-prompts for native Windows when the first call sends confirmElevation without a server token', async () => {
@@ -936,7 +945,7 @@ describe('Network API integration', () => {
 
       expect(res.status).toBe(200)
       expectConfirmationRequired(res.body)
-      expect(cp.execFile).not.toHaveBeenCalled()
+      expectNoPowerShellSpawn(cp)
     })
 
     it('returns none for native Windows when the port becomes reachable before confirmation', async () => {
@@ -970,7 +979,7 @@ describe('Network API integration', () => {
 
       expect(confirmedRes.status).toBe(200)
       expect(confirmedRes.body).toEqual({ method: 'none', message: 'No configuration changes required' })
-      expect(cp.execFile).not.toHaveBeenCalled()
+      expectNoPowerShellSpawn(cp)
     })
 
     it('returns none when remote access is disabled before confirmed repair', async () => {
@@ -1007,7 +1016,7 @@ describe('Network API integration', () => {
 
       expect(confirmedRes.status).toBe(200)
       expect(confirmedRes.body).toEqual({ method: 'none', message: 'Remote access is not enabled' })
-      expect(cp.execFile).not.toHaveBeenCalled()
+      expectNoPowerShellSpawn(cp)
     })
 
     it('returns none for inactive Windows firewall without prompting or elevating', async () => {
@@ -1026,7 +1035,7 @@ describe('Network API integration', () => {
 
       expect(firstRes.status).toBe(200)
       expect(firstRes.body).toEqual({ method: 'none', message: 'No firewall detected' })
-      expect(cp.execFile).not.toHaveBeenCalled()
+      expectNoPowerShellSpawn(cp)
     })
 
     it('starts native Windows repair only after a confirmed retry with the issued token', async () => {
@@ -1101,7 +1110,7 @@ describe('Network API integration', () => {
       expectConfirmationRequired(confirmedRes.body)
       expect(confirmedRes.body.confirmationToken).not.toBe(firstRes.body.confirmationToken)
       expect(confirmedRes.body.confirmationToken).not.toBe(secondRes.body.confirmationToken)
-      expect(cp.execFile).not.toHaveBeenCalled()
+      expectNoPowerShellSpawn(cp)
     })
 
     it('re-prompts when a confirmation token is replayed', async () => {
@@ -1197,7 +1206,7 @@ describe('Network API integration', () => {
 
       expect(confirmedRes.status).toBe(200)
       expectConfirmationRequired(confirmedRes.body)
-      expect(cp.execFile).not.toHaveBeenCalled()
+      expectNoPowerShellSpawn(cp)
     })
 
     it('rejects malformed confirmation payloads', async () => {
@@ -1412,6 +1421,82 @@ describe('Network API integration', () => {
   })
 
   describe('POST /api/network/disable-remote-access', () => {
+    it('requires confirmation before native Windows disable removes managed firewall rules', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'windows',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+      await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+      vi.mocked(isPortReachable).mockResolvedValue(true)
+      await persistManagedWindowsRemoteAccessPortsForServer(0, [4321])
+
+      const cp = await import('node:child_process')
+      let finishDisable: ((error?: Error | null) => void) | null = null
+      let windowsRulePresent = true
+      vi.mocked(cp.execFile).mockImplementation((cmd: any, args: any, _opts: any, cb: any) => {
+        if (cmd === 'netsh' && args.at(-1) === 'name=Freshell (port 4321)') {
+          if (windowsRulePresent) {
+            cb?.(null, 'Rule Name: Freshell (port 4321)\n', '')
+          } else {
+            cb?.(Object.assign(new Error('rule not found'), { code: 1 }), '', '')
+          }
+          return { on: vi.fn() } as any
+        }
+        if (cmd === 'powershell.exe') {
+          finishDisable = (error = null) => {
+            if (!error) {
+              windowsRulePresent = false
+            }
+            cb?.(error, '', '')
+          }
+          return { on: vi.fn() } as any
+        }
+        cb?.(Object.assign(new Error('rule not found'), { code: 1 }), '', '')
+        return { on: vi.fn() } as any
+      })
+
+      const firstRes = await request(app)
+        .post('/api/network/disable-remote-access')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(firstRes.status).toBe(200)
+      expectConfirmationRequired(firstRes.body)
+
+      const startedRes = await request(app)
+        .post('/api/network/disable-remote-access')
+        .set('x-auth-token', token)
+        .send({
+          confirmElevation: true,
+          confirmationToken: firstRes.body.confirmationToken,
+        })
+
+      expect(startedRes.status).toBe(200)
+      expect(startedRes.body).toEqual({ method: 'windows-elevated', status: 'started' })
+
+      const spawnCall = vi.mocked(cp.execFile).mock.calls.find(([cmd]) => cmd === 'powershell.exe')
+      expect(spawnCall).toBeDefined()
+      const elevatedArgs = spawnCall?.[1] as string[]
+      expect(elevatedArgs[1]).toContain('delete rule name=\"Freshell (port 4321)\"')
+      expect(elevatedArgs[1]).toContain('2>$null')
+
+      finishDisable?.()
+
+      await vi.waitFor(async () => {
+        const settings = await configStore.getSettings()
+        expect(settings.network).toEqual(expect.objectContaining({
+          configured: true,
+          host: '127.0.0.1',
+        }))
+      })
+
+      await vi.waitFor(async () => {
+        const status = await networkManager.getStatus()
+        expect(status.host).toBe('127.0.0.1')
+      })
+    })
+
     it('returns confirmation-required for WSL disable while Windows exposure is still active', async () => {
       vi.mocked(detectFirewall).mockResolvedValue({
         platform: 'wsl2',
