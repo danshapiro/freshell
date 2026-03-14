@@ -17,10 +17,10 @@ import ThinkingIndicator from './ThinkingIndicator'
 import { useStreamDebounce } from './useStreamDebounce'
 import CollapsedTurn from './CollapsedTurn'
 import type { ChatMessage } from '@/store/agentChatTypes'
-import { api, setSessionMetadata } from '@/lib/api'
-import { updateSettingsLocal } from '@/store/settingsSlice'
+import { setSessionMetadata } from '@/lib/api'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
+import { saveServerSettingsPatch } from '@/store/settingsThunks'
 
 /** Early lifecycle states that should not be re-entered once the session has advanced. */
 const EARLY_STATES = new Set(['creating', 'starting'])
@@ -381,7 +381,9 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     if (changes.permissionMode) defaultsPatch.defaultPermissionMode = changes.permissionMode as string
     if (changes.effort) defaultsPatch.defaultEffort = changes.effort as string
     if (Object.keys(defaultsPatch).length > 0) {
-      void api.patch('/api/settings', { agentChat: { providers: { [paneContent.provider]: defaultsPatch } } }).catch(() => {})
+      void dispatch(saveServerSettingsPatch({
+        agentChat: { providers: { [paneContent.provider]: defaultsPatch } },
+      }))
     }
   }, [tabId, paneId, dispatch, ws])
 
@@ -391,10 +393,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
       paneId,
       content: { ...paneContentRef.current, settingsDismissed: true },
     }))
-    // Persist globally so future panes skip the settings panel.
-    // Update Redux optimistically so immediately-opened panes reflect the change.
-    dispatch(updateSettingsLocal({ agentChat: { initialSetupDone: true } }))
-    void api.patch('/api/settings', { agentChat: { initialSetupDone: true } }).catch(() => {})
+    void dispatch(saveServerSettingsPatch({ agentChat: { initialSetupDone: true } }))
     composerRef.current?.focus()
   }, [tabId, paneId, dispatch])
 

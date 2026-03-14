@@ -1,11 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, fireEvent, cleanup } from '@testing-library/react'
+import { render, fireEvent, cleanup, screen, waitFor } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import PaneContainer from '@/components/panes/PaneContainer'
 import panesReducer from '@/store/panesSlice'
 import tabsReducer from '@/store/tabsSlice'
-import settingsReducer from '@/store/settingsSlice'
+import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
@@ -13,13 +13,24 @@ import extensionsReducer from '@/store/extensionsSlice'
 import type { PanesState } from '@/store/panesSlice'
 import type { PaneNode } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  mergeServerSettings,
+  resolveLocalSettings,
+  type ServerSettingsPatch,
+} from '@shared/settings'
 
 // Hoist mock functions so vi.mock can reference them
-const { mockSend, mockTerminalView } = vi.hoisted(() => ({
+const { mockSend, mockTerminalView, saveServerSettingsPatchSpy } = vi.hoisted(() => ({
   mockSend: vi.fn(),
   mockTerminalView: vi.fn(({ tabId, paneId }: { tabId: string; paneId: string }) => (
     <div data-testid={`terminal-${paneId}`}>Terminal for {tabId}/{paneId}</div>
   )),
+  saveServerSettingsPatchSpy: vi.fn((patch: unknown) => ({
+    type: 'settings/saveServerSettingsPatch',
+    payload: patch,
+  })),
 }))
 
 vi.mock('@/lib/ws-client', () => ({
@@ -32,6 +43,10 @@ vi.mock('@/lib/api', () => ({
     post: vi.fn().mockResolvedValue({ valid: true, resolvedPath: '/resolved/path' }),
     patch: vi.fn().mockResolvedValue({}),
   },
+}))
+
+vi.mock('@/store/settingsThunks', () => ({
+  saveServerSettingsPatch: (patch: unknown) => saveServerSettingsPatchSpy(patch),
 }))
 
 vi.mock('lucide-react', () => ({
@@ -87,9 +102,28 @@ function createPickerNode(paneId: string): PaneNode {
   }
 }
 
+const defaultServerSettings = createDefaultServerSettings({
+  loggingDebug: defaultSettings.logging.debug,
+})
+
+function createSettingsState(settingsOverrides: ServerSettingsPatch = {}) {
+  const serverSettings = mergeServerSettings(defaultServerSettings, settingsOverrides)
+  const localSettings = resolveLocalSettings()
+
+  return {
+    serverSettings,
+    localSettings,
+    settings: composeResolvedSettings(serverSettings, localSettings),
+    loaded: true,
+    lastSavedAt: undefined,
+  }
+}
+
 function createStore(
   initialPanesState: Partial<PanesState> = {},
   extensions: ClientExtensionEntry[] = [],
+  settingsOverrides: ServerSettingsPatch = {},
+  connectionOverrides: Record<string, unknown> = {},
 ) {
   return configureStore({
     reducer: {
@@ -120,7 +154,10 @@ function createStore(
         status: 'disconnected',
         platform: null,
         availableClis: {},
+        featureFlags: {},
+        ...connectionOverrides,
       },
+      settings: createSettingsState(settingsOverrides),
       terminalMeta: {
         byTerminalId: {},
       },
@@ -141,6 +178,7 @@ describe('createContentForType with ext: prefix', () => {
   beforeEach(() => {
     mockSend.mockClear()
     mockTerminalView.mockClear()
+    saveServerSettingsPatchSpy.mockClear()
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
       if (url === '/api/terminals') return { ok: true, text: async () => '[]' }
       if (url.startsWith('/api/files/complete')) return { ok: true, text: async () => '{"suggestions":[]}' }
@@ -261,5 +299,63 @@ describe('createContentForType with ext: prefix', () => {
     const paneContent = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
     // Extension content should only have kind, extensionName, and props
     expect(Object.keys(paneContent).sort()).toEqual(['extensionName', 'kind', 'props'])
+  })
+
+  it('creates agent chat content with default plugins from resolved settings', async () => {
+    const node = createPickerNode('pane-1')
+    const store = createStore(
+      { layouts: { 'tab-1': node }, activePane: { 'tab-1': 'pane-1' } },
+      [],
+      {
+        codingCli: {
+          enabledProviders: ['claude'],
+          providers: { claude: { cwd: '/workspace/default' } },
+        },
+        agentChat: {
+          defaultPlugins: ['planner', 'sandbox'],
+          providers: {
+            freshclaude: {
+              defaultModel: 'claude-sonnet-4-6',
+              defaultPermissionMode: 'default',
+              defaultEffort: 'medium',
+            },
+          },
+        },
+      },
+      {
+        status: 'ready',
+        platform: 'linux',
+        availableClis: { claude: true },
+      },
+    )
+
+    expect(store.getState().settings.settings.agentChat.defaultPlugins).toEqual(['planner', 'sandbox'])
+
+    render(
+      <Provider store={store}>
+        <PaneContainer tabId="tab-1" node={node} />
+      </Provider>,
+    )
+
+    const container = getPickerContainer()
+    fireEvent.keyDown(container, { key: 'a' })
+    fireEvent.transitionEnd(container)
+
+    const input = await screen.findByLabelText('Starting directory for Freshclaude')
+    fireEvent.change(input, { target: { value: '/workspace/project' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    await waitFor(() => {
+      const state = store.getState().panes
+      const paneContent = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
+      expect(paneContent.kind).toBe('agent-chat')
+      if (paneContent.kind === 'agent-chat') {
+        expect(paneContent.provider).toBe('freshclaude')
+        expect(paneContent.plugins).toEqual(['planner', 'sandbox'])
+        expect(paneContent.model).toBe('claude-sonnet-4-6')
+        expect(paneContent.permissionMode).toBe('default')
+        expect(paneContent.effort).toBe('medium')
+      }
+    })
   })
 })

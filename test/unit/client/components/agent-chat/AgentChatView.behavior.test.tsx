@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach, beforeAll } from 'vitest'
-import { render, screen, cleanup, within, act } from '@testing-library/react'
+import { render, screen, cleanup, within, act, fireEvent } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import AgentChatView from '@/components/agent-chat/AgentChatView'
@@ -26,6 +26,15 @@ vi.mock('@/lib/ws-client', () => ({
   }),
 }))
 
+const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn((patch: unknown) => ({
+  type: 'settings/saveServerSettingsPatch',
+  payload: patch,
+})))
+
+vi.mock('@/store/settingsThunks', () => ({
+  saveServerSettingsPatch: (patch: unknown) => saveServerSettingsPatchSpy(patch),
+}))
+
 function makeStore(settingsOverrides?: Record<string, unknown>) {
   return configureStore({
     reducer: {
@@ -44,6 +53,10 @@ function makeStore(settingsOverrides?: Record<string, unknown>) {
     },
   })
 }
+
+afterEach(() => {
+  saveServerSettingsPatchSpy.mockClear()
+})
 
 const BASE_PANE: AgentChatPaneContent = {
   kind: 'agent-chat', provider: 'freshclaude',
@@ -423,5 +436,49 @@ describe('AgentChatView settings auto-open (#110)', () => {
     act(() => { vi.advanceTimersByTime(60) })
     expect(screen.getByRole('textbox', { name: 'Chat message input' })).toHaveFocus()
     vi.useRealTimers()
+  })
+
+  it('persists provider defaults through saveServerSettingsPatch when settings change', () => {
+    const store = makeStore()
+    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+      </Provider>,
+    )
+
+    const dialog = screen.getByRole('dialog', { name: 'Agent chat settings' })
+    fireEvent.change(within(dialog).getByLabelText('Model'), { target: { value: 'claude-sonnet-4-6' } })
+    fireEvent.change(within(dialog).getByLabelText('Permissions'), { target: { value: 'default' } })
+    fireEvent.change(within(dialog).getByLabelText('Effort'), { target: { value: 'medium' } })
+
+    expect(saveServerSettingsPatchSpy).toHaveBeenNthCalledWith(1, {
+      agentChat: { providers: { freshclaude: { defaultModel: 'claude-sonnet-4-6' } } },
+    })
+    expect(saveServerSettingsPatchSpy).toHaveBeenNthCalledWith(2, {
+      agentChat: { providers: { freshclaude: { defaultPermissionMode: 'default' } } },
+    })
+    expect(saveServerSettingsPatchSpy).toHaveBeenNthCalledWith(3, {
+      agentChat: { providers: { freshclaude: { defaultEffort: 'medium' } } },
+    })
+  })
+
+  it('persists initial setup completion through saveServerSettingsPatch when settings are dismissed', () => {
+    const store = makeStore()
+    store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
+
+    render(
+      <Provider store={store}>
+        <AgentChatView tabId="t1" paneId="p1" paneContent={BASE_PANE} />
+      </Provider>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
+
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      agentChat: { initialSetupDone: true },
+    })
+    expect(screen.queryByRole('dialog', { name: 'Agent chat settings' })).not.toBeInTheDocument()
   })
 })

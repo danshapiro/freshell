@@ -93,6 +93,7 @@ function normalizePaneContent(
       model: input.model,
       permissionMode: input.permissionMode,
       effort: input.effort,
+      plugins: input.plugins,
       showThinking: input.showThinking,
       showTools: input.showTools,
       showTimecodes: input.showTimecodes,

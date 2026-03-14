@@ -33,7 +33,6 @@ import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import type { ChatSessionState } from '@/store/agentChatTypes'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
-import { updateSettingsLocal } from '@/store/settingsSlice'
 import { clearPaneAttention, clearTabAttention } from '@/store/turnCompletionSlice'
 import { clearPendingCreate, removeSession } from '@/store/agentChatSlice'
 import { cancelCreate } from '@/lib/sdk-message-handler'
@@ -42,6 +41,7 @@ import type { ProjectGroup, CodingCliSession } from '@/store/types'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { applyPaneRename } from '@/store/titleSync'
+import { saveServerSettingsPatch } from '@/store/settingsThunks'
 
 // Stable empty object to avoid selector memoization issues
 const EMPTY_PANE_TITLES: Record<string, string> = {}
@@ -509,6 +509,9 @@ function PickerWrapper({
 }) {
   const dispatch = useAppDispatch()
   const settings = useAppSelector((s) => s.settings?.settings)
+  const agentChatSettings = useAppSelector(
+    (s) => s.settings?.settings?.agentChat ?? s.settings?.serverSettings?.agentChat
+  )
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const paneLayout = useAppSelector((s) => s.panes.layouts[tabId])
   const tabPref = useMemo(
@@ -532,7 +535,7 @@ function PickerWrapper({
 
     if (isAgentChatProviderName(type)) {
       const providerConfig = getAgentChatProviderConfig(type)!
-      const providerSettings = settings?.agentChat?.providers?.[type]
+      const providerSettings = agentChatSettings?.providers?.[type]
       return {
         kind: 'agent-chat',
         provider: type,
@@ -541,7 +544,7 @@ function PickerWrapper({
         model: providerSettings?.defaultModel ?? providerConfig.defaultModel,
         permissionMode: providerSettings?.defaultPermissionMode ?? providerConfig.defaultPermissionMode,
         effort: providerSettings?.defaultEffort ?? providerConfig.defaultEffort,
-        plugins: settings?.agentChat?.defaultPlugins,
+        plugins: agentChatSettings?.defaultPlugins,
         ...(cwd ? { initialCwd: cwd } : {}),
       }
     }
@@ -609,7 +612,7 @@ function PickerWrapper({
       default:
         throw new Error(`Unsupported pane type: ${String(type)}`)
     }
-  }, [extensionEntries, settings])
+  }, [agentChatSettings, extensionEntries])
 
   const handleSelect = useCallback((type: PanePickerType) => {
     if (isAgentChatProviderName(type)) {
@@ -640,10 +643,7 @@ function PickerWrapper({
     const patch = {
       codingCli: { providers: { [settingsKey]: { ...existingProviderSettings, cwd } } },
     }
-    dispatch(updateSettingsLocal(patch as any))
-    void api.patch('/api/settings', patch).catch((err) => {
-      console.warn('Failed to save provider starting directory', err)
-    })
+    void dispatch(saveServerSettingsPatch(patch))
   }, [createContentForType, dispatch, paneId, settings, step, tabId])
 
   const handleCancel = useCallback(() => {

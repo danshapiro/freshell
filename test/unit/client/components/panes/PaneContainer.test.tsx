@@ -42,6 +42,7 @@ const {
   mockApiGet,
   mockApiPost,
   mockApiPatch,
+  saveServerSettingsPatchSpy,
 } = vi.hoisted(() => ({
   mockSend: vi.fn(),
   mockTerminalView: vi.fn(({ tabId, paneId, hidden }: { tabId: string; paneId: string; hidden?: boolean }) => (
@@ -56,6 +57,10 @@ const {
   mockApiGet: vi.fn(),
   mockApiPost: vi.fn(),
   mockApiPatch: vi.fn(),
+  saveServerSettingsPatchSpy: vi.fn((patch: unknown) => ({
+    type: 'settings/saveServerSettingsPatch',
+    payload: patch,
+  })),
 }))
 
 // Mock the ws-client module
@@ -71,6 +76,10 @@ vi.mock('@/lib/api', () => ({
     post: (path: string, body: unknown) => mockApiPost(path, body),
     patch: (path: string, body: unknown) => mockApiPatch(path, body),
   },
+}))
+
+vi.mock('@/store/settingsThunks', () => ({
+  saveServerSettingsPatch: (patch: unknown) => saveServerSettingsPatchSpy(patch),
 }))
 
 // Mock lucide-react icons
@@ -286,6 +295,7 @@ describe('PaneContainer', () => {
     mockApiGet.mockReset()
     mockApiPost.mockReset()
     mockApiPatch.mockReset()
+    saveServerSettingsPatchSpy.mockClear()
     mockApiGet.mockResolvedValue({ directories: [] })
     mockApiPost.mockResolvedValue({ valid: true, resolvedPath: '/resolved/path' })
     mockApiPatch.mockResolvedValue({})
@@ -1359,7 +1369,7 @@ describe('PaneContainer', () => {
       expect(paneContent.kind).toBe('picker')
     })
 
-    it('creates terminal on directory confirm and persists provider cwd', async () => {
+    it('creates terminal on directory confirm and persists provider cwd through saveServerSettingsPatch', async () => {
       const node = createPickerNode('pane-1')
       const store = createStoreWithClaude(node, { cwd: '/home/user/projects', permissionMode: 'plan' })
       mockApiPost.mockResolvedValueOnce({ valid: true, resolvedPath: '/home/user/new-project' })
@@ -1388,9 +1398,10 @@ describe('PaneContainer', () => {
         }
       })
 
-      expect(mockApiPatch).toHaveBeenCalledWith('/api/settings', {
+      expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
         codingCli: { providers: { claude: { permissionMode: 'plan', cwd: '/home/user/new-project' } } },
       })
+      expect(mockApiPatch).not.toHaveBeenCalledWith('/api/settings', expect.anything())
     })
 
     it('returns to pane type picker when back is clicked in directory picker', () => {
