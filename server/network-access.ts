@@ -1,5 +1,7 @@
-import type { NetworkSettings } from './config-store.js'
+import type { ServerSettings } from '../shared/settings.js'
 import type { FirewallPlatform } from './firewall.js'
+
+type NetworkSettings = ServerSettings['network']
 
 export function isRemoteAccessEnabled(
   network: Pick<NetworkSettings, 'configured' | 'host'> | undefined,
