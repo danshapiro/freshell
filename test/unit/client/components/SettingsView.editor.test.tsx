@@ -283,7 +283,10 @@ describe('SettingsView Editor section', () => {
     })
 
     expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
-      editor: { customEditorCommand: 'vim +{line} {file}' },
+      patch: {
+        editor: { customEditorCommand: 'vim +{line} {file}' },
+      },
+      confirmedServerSettings: expect.any(Object),
     })
     expect(api.patch).toHaveBeenCalledWith('/api/settings', {
       editor: { customEditorCommand: 'vim +{line} {file}' },
@@ -314,12 +317,38 @@ describe('SettingsView Editor section', () => {
 
     expect(saveServerSettingsPatchSpy).toHaveBeenCalledTimes(1)
     expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
-      editor: { customEditorCommand: 'vim +{line} {file}' },
+      patch: {
+        editor: { customEditorCommand: 'vim +{line} {file}' },
+      },
+      confirmedServerSettings: expect.any(Object),
     })
     expect(api.patch).toHaveBeenCalledTimes(1)
     expect(api.patch).toHaveBeenCalledWith('/api/settings', {
       editor: { customEditorCommand: 'vim +{line} {file}' },
     })
+  })
+
+  it('rolls back debounced custom command previews when the save fails', async () => {
+    const store = createTestStore({ editor: { externalEditor: 'custom' } })
+    vi.mocked(api.patch).mockRejectedValueOnce(new Error('save failed'))
+
+    render(
+      <Provider store={store}>
+        <SettingsView />
+      </Provider>
+    )
+
+    const input = screen.getByPlaceholderText('nvim +{line} {file}')
+    fireEvent.change(input, { target: { value: 'vim +{line} {file}' } })
+
+    expect(store.getState().settings.settings.editor?.customEditorCommand).toBe('vim +{line} {file}')
+
+    await act(async () => {
+      vi.advanceTimersByTime(500)
+      await Promise.resolve()
+    })
+
+    expect(store.getState().settings.settings.editor?.customEditorCommand).toBeUndefined()
   })
 
   it('displays existing custom command value', () => {

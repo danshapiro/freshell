@@ -987,7 +987,7 @@ describe('App Bootstrap', () => {
     })
   })
 
-  it('merges legacyLocalSettingsSeed into a partial browser-local payload without overwriting existing values', async () => {
+  it('does not apply legacyLocalSettingsSeed when browser-local settings already exist', async () => {
     localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
       settings: {
         terminal: {
@@ -996,13 +996,78 @@ describe('App Bootstrap', () => {
       },
     }))
 
-    const store = createTestStore({
-      settings: {
-        local: {
-          terminal: {
-            fontFamily: 'JetBrains Mono',
+    const store = configureStore({
+      reducer: {
+        settings: settingsReducer,
+        tabs: tabsReducer,
+        connection: connectionReducer,
+        sessions: sessionsReducer,
+        panes: panesReducer,
+        tabRegistry: tabRegistryReducer,
+        terminalMeta: terminalMetaReducer,
+        network: networkReducer,
+        extensions: extensionsReducer,
+      },
+      middleware: (getDefault) =>
+        getDefault({
+          serializableCheck: {
+            ignoredPaths: ['sessions.expandedProjects'],
           },
+        }),
+      preloadedState: {
+        settings: createSettingsState({
+          local: {
+            terminal: {
+              fontFamily: 'JetBrains Mono',
+            },
+          },
+        }),
+        tabs: {
+          tabs: [{ id: 'tab-1', mode: 'shell' }],
+          activeTabId: 'tab-1',
         },
+        sessions: {
+          projects: [],
+          expandedProjects: new Set<string>(),
+          wsSnapshotReceived: false,
+          isLoading: false,
+          error: null,
+        },
+        connection: {
+          status: 'ready' as const,
+          lastError: undefined,
+          platform: null,
+          availableClis: {},
+          serverInstanceId: undefined,
+        },
+        panes: {
+          layouts: {},
+          activePane: {},
+          paneTitles: {},
+          paneTitleSetByUser: {},
+          renameRequestTabId: null,
+          renameRequestPaneId: null,
+          zoomedPane: {},
+        },
+        tabRegistry: {
+          deviceId: 'device-test',
+          deviceLabel: 'device-test',
+          deviceAliases: {},
+          localOpen: [],
+          remoteOpen: [],
+          closed: [],
+          localClosed: {},
+          searchRangeDays: 30,
+          loading: false,
+        },
+        terminalMeta: { byTerminalId: {} },
+        network: {
+          status: null,
+          loading: false,
+          configuring: false,
+          error: null,
+        },
+        extensions: { entries: [] },
       },
     })
 
@@ -1030,17 +1095,14 @@ describe('App Bootstrap', () => {
     renderApp(store)
 
     await waitFor(() => {
-      expect(store.getState().settings.settings.theme).toBe('light')
+      expect(store.getState().settings.loaded).toBe(true)
     })
 
+    expect(store.getState().settings.settings.theme).toBe('system')
     expect(store.getState().settings.settings.terminal.fontFamily).toBe('JetBrains Mono')
-    expect(store.getState().settings.settings.sidebar.showSubagents).toBe(true)
+    expect(store.getState().settings.settings.sidebar.showSubagents).toBe(false)
     expect(JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')).toEqual({
       settings: {
-        theme: 'light',
-        sidebar: {
-          showSubagents: true,
-        },
         terminal: {
           fontFamily: 'JetBrains Mono',
         },

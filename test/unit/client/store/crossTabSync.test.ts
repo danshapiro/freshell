@@ -276,6 +276,40 @@ describe('crossTabSync', () => {
     expect(store.getState().tabRegistry.searchRangeDays).toBe(365)
   })
 
+  it('applies sparse browser-preference resets when previously persisted settings or search range are removed', () => {
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      settings: {
+        theme: 'dark',
+      },
+      tabs: {
+        searchRangeDays: 365,
+      },
+    }))
+
+    const store = configureStore({
+      reducer: { settings: settingsReducer, tabRegistry: tabRegistryReducer },
+    })
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    store.dispatch(setLocalSettings(resolveLocalSettings({
+      theme: 'dark',
+    })))
+    store.dispatch(setTabRegistrySearchRangeDays(365))
+
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: BROWSER_PREFERENCES_STORAGE_KEY,
+      newValue: JSON.stringify({
+        toolStrip: {
+          expanded: true,
+        },
+      }),
+    }))
+
+    expect(store.getState().settings.settings.theme).toBe('system')
+    expect(store.getState().tabRegistry.searchRangeDays).toBe(30)
+  })
+
   it('merges remote browser-preference writes without clobbering dirty local settings', () => {
     vi.useFakeTimers()
 

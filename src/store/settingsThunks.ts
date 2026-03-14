@@ -72,6 +72,11 @@ type PendingServerSettingsPatch = {
   id: number
   patch: ServerSettingsPatch
 }
+type SaveServerSettingsPatchArgs = ServerSettingsPatch | {
+  patch: ServerSettingsPatch
+  confirmedServerSettings?: ServerSettings
+}
+type SaveServerSettingsPatchEnvelope = Extract<SaveServerSettingsPatchArgs, { patch: ServerSettingsPatch }>
 type SaveServerSettingsState = {
   queue: Promise<void>
   confirmedServerSettings?: ServerSettings
@@ -100,6 +105,30 @@ function getOrCreateSaveServerSettingsState(getState: SaveServerSettingsGetState
   }
   saveServerSettingsStateByGetState.set(getState, created)
   return created
+}
+
+function isSaveServerSettingsPatchEnvelope(
+  args: SaveServerSettingsPatchArgs,
+): args is SaveServerSettingsPatchEnvelope {
+  return isRecord(args) && Object.prototype.hasOwnProperty.call(args, 'patch')
+}
+
+function normalizeSaveServerSettingsPatchArgs(
+  args: SaveServerSettingsPatchArgs,
+): { patch: ServerSettingsPatch; confirmedServerSettings?: ServerSettings } {
+  if (isSaveServerSettingsPatchEnvelope(args)) {
+    const confirmedServerSettings = isServerSettings(args.confirmedServerSettings)
+      ? args.confirmedServerSettings
+      : undefined
+    return {
+      patch: isRecord(args.patch) ? args.patch : {},
+      confirmedServerSettings,
+    }
+  }
+
+  return {
+    patch: isRecord(args) ? args : {},
+  }
 }
 
 function buildVisibleServerSettings(
@@ -164,11 +193,12 @@ function queueServerSettingsSave(
 
 export const saveServerSettingsPatch = createAsyncThunk(
   'settings/saveServerSettingsPatch',
-  async (patch: ServerSettingsPatch, { dispatch, getState }) => {
+  async (args: SaveServerSettingsPatchArgs, { dispatch, getState }) => {
+    const { patch, confirmedServerSettings } = normalizeSaveServerSettingsPatchArgs(args)
     const typedGetState = getState as SaveServerSettingsGetState
     const saveState = getOrCreateSaveServerSettingsState(typedGetState)
     if (saveState.pendingPatches.length === 0) {
-      saveState.confirmedServerSettings = typedGetState().settings.serverSettings
+      saveState.confirmedServerSettings = confirmedServerSettings ?? typedGetState().settings.serverSettings
     }
     const patchId = nextPendingServerSettingsPatchId++
     saveState.pendingPatches = [...saveState.pendingPatches, { id: patchId, patch }]

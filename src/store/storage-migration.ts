@@ -21,7 +21,10 @@ const log = createLogger('StorageMigration')
 const STORAGE_VERSION = 3
 const STORAGE_VERSION_KEY = 'freshell_version'
 const AUTH_STORAGE_KEY = 'freshell.auth-token'
-const LEGACY_BROWSER_PREFERENCE_KEYS = ['freshell.terminal.fontFamily.v1'] as const
+const LEGACY_BROWSER_PREFERENCE_KEYS = [
+  'freshell.terminal.fontFamily.v1',
+  'freshell:toolStripExpanded',
+] as const
 
 function readStorageVersion(): number {
   const stored = localStorage.getItem(STORAGE_VERSION_KEY)

@@ -181,6 +181,48 @@ describe('settingsThunks', () => {
     warnSpy.mockRestore()
   })
 
+  it('rolls back a rejected save to the last confirmed server settings when the patch was previewed before dispatch', async () => {
+    const store = makeStore()
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    apiPatch.mockRejectedValue(new Error('save failed'))
+
+    store.dispatch(setServerSettings({
+      ...store.getState().settings.serverSettings,
+      editor: {
+        ...store.getState().settings.serverSettings.editor,
+        externalEditor: 'custom',
+      },
+    }))
+    const confirmedServerSettings = store.getState().settings.serverSettings
+
+    store.dispatch({
+      type: 'settings/previewServerSettingsPatch',
+      payload: {
+        editor: {
+          customEditorCommand: 'vim +{line} {file}',
+        },
+      },
+    })
+
+    expect(store.getState().settings.settings.editor.customEditorCommand).toBe('vim +{line} {file}')
+
+    const result = await store.dispatch(saveServerSettingsPatch({
+      patch: {
+        editor: {
+          customEditorCommand: 'vim +{line} {file}',
+        },
+      },
+      confirmedServerSettings,
+    }))
+
+    expect(result.type).toBe('settings/saveServerSettingsPatch/rejected')
+    expect(store.getState().settings.settings.editor.customEditorCommand).toBeUndefined()
+    expect(warnSpy).toHaveBeenCalledWith('[settingsThunks]', 'Failed to save server settings patch', expect.any(Error))
+
+    warnSpy.mockRestore()
+  })
+
   it('preserves nested coding CLI clears by converting them into API clear sentinels', async () => {
     const store = makeStore()
     const initialServerSettings = store.getState().settings.serverSettings

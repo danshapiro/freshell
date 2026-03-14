@@ -112,10 +112,18 @@ function dispatchHydratePanesFromPersisted(store: StoreLike, raw: string) {
   })
 }
 
-function dispatchHydrateBrowserPreferencesFromPersisted(store: StoreLike, raw: string) {
+function dispatchHydrateBrowserPreferencesFromPersisted(
+  store: StoreLike,
+  raw: string,
+  previousRaw?: string,
+) {
   const parsed = parseBrowserPreferencesRaw(raw)
   if (!parsed) return
 
+  const previousParsed = previousRaw ? parseBrowserPreferencesRaw(previousRaw) : null
+  const remoteResetSettingsToDefaults = previousParsed?.settings !== undefined && parsed.settings === undefined
+  const remoteResetSearchRangeToDefault =
+    previousParsed?.tabs?.searchRangeDays !== undefined && parsed.tabs?.searchRangeDays === undefined
   const pendingWriteState = getPendingBrowserPreferencesWriteState(store)
   const remoteSettingsPatch = parsed.settings ?? {}
   let mergedSettingsPatch = remoteSettingsPatch
@@ -135,13 +143,22 @@ function dispatchHydrateBrowserPreferencesFromPersisted(store: StoreLike, raw: s
     ? pendingWriteState.searchRangeDays
     : (parsed.tabs?.searchRangeDays ?? DEFAULT_SEARCH_RANGE_DAYS)
 
-  if (parsed.settings || pendingWriteState.settingsPatch || pendingWriteState.transientSettingsPatch) {
+  if (
+    parsed.settings
+    || remoteResetSettingsToDefaults
+    || pendingWriteState.settingsPatch
+    || pendingWriteState.transientSettingsPatch
+  ) {
     store.dispatch({
       ...setLocalSettings(nextSettings),
       meta: { skipPersist: true, source: 'cross-tab' },
     })
   }
-  if (parsed.tabs?.searchRangeDays !== undefined || pendingWriteState.hasPendingSearchRangeDays) {
+  if (
+    parsed.tabs?.searchRangeDays !== undefined
+    || remoteResetSearchRangeToDefault
+    || pendingWriteState.hasPendingSearchRangeDays
+  ) {
     store.dispatch({
       ...setTabRegistrySearchRangeDays(nextSearchRangeDays),
       meta: { skipPersist: true, source: 'cross-tab' },
@@ -149,13 +166,13 @@ function dispatchHydrateBrowserPreferencesFromPersisted(store: StoreLike, raw: s
   }
 }
 
-function handleIncomingRaw(store: StoreLike, key: string, raw: string) {
+function handleIncomingRaw(store: StoreLike, key: string, raw: string, previousRaw?: string) {
   if (key === TABS_STORAGE_KEY) {
     dispatchHydrateTabsFromPersisted(store, raw)
   } else if (key === PANES_STORAGE_KEY) {
     dispatchHydratePanesFromPersisted(store, raw)
   } else if (key === BROWSER_PREFERENCES_STORAGE_KEY) {
-    dispatchHydrateBrowserPreferencesFromPersisted(store, raw)
+    dispatchHydrateBrowserPreferencesFromPersisted(store, raw, previousRaw)
   }
 }
 
@@ -165,10 +182,18 @@ export function installCrossTabSync(store: StoreLike): () => void {
   // Storage events and BroadcastChannel can both deliver the same persisted payload.
   // Dedupe by exact raw value so we don't hydrate twice.
   const lastProcessedRawByKey = new Map<string, string>()
+  for (const key of [TABS_STORAGE_KEY, PANES_STORAGE_KEY, BROWSER_PREFERENCES_STORAGE_KEY]) {
+    const existingRaw = localStorage.getItem(key)
+    if (typeof existingRaw === 'string') {
+      lastProcessedRawByKey.set(key, existingRaw)
+    }
+  }
+
   const handleIncomingRawDeduped = (key: string, raw: string) => {
-    if (lastProcessedRawByKey.get(key) === raw) return
+    const previousRaw = lastProcessedRawByKey.get(key)
+    if (previousRaw === raw) return
     lastProcessedRawByKey.set(key, raw)
-    handleIncomingRaw(store, key, raw)
+    handleIncomingRaw(store, key, raw, previousRaw)
   }
 
   // Keep dedupe state in sync with local writes too. Otherwise, if we process a remote raw,

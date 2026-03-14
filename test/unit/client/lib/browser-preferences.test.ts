@@ -97,7 +97,7 @@ describe('browser preferences', () => {
     setItemSpy.mockRestore()
   })
 
-  it('fills missing seeded values without overwriting existing local settings', () => {
+  it('does not apply a legacy seed when the browser already has local settings', () => {
     localStorage.setItem('freshell.terminal.fontFamily.v1', 'Fira Code')
     expect(loadBrowserPreferencesRecord()).toEqual({
       settings: {
@@ -117,12 +117,8 @@ describe('browser preferences', () => {
       },
     })).toEqual({
       settings: {
-        theme: 'light',
         terminal: {
           fontFamily: 'Fira Code',
-        },
-        sidebar: {
-          showSubagents: true,
         },
       },
       legacyLocalSettingsSeedApplied: true,

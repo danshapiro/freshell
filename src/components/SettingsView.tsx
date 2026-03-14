@@ -231,6 +231,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
 
   const dispatch = useAppDispatch()
   const rawSettings = useAppSelector((s) => s.settings.settings)
+  const serverSettings = useAppSelector((s) => s.settings.serverSettings)
   const settings = useMemo(
     () => mergeSettings(defaultSettings, rawSettings || {}),
     [rawSettings],
@@ -285,6 +286,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   const remoteAccessRefreshRequestRef = useRef(0)
   const defaultCwdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const serverTextSaveTimerRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
+  const serverTextConfirmedSettingsRef = useRef<Record<string, typeof serverSettings>>({})
   const defaultCwdValidationRef = useRef(0)
   const lastSettingsDefaultCwdRef = useRef(settings.defaultCwd ?? '')
   const lastSettingsExcludeFirstChatRef = useRef(
@@ -578,14 +580,23 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   }, [dispatch])
 
   const scheduleServerTextSettingSave = useCallback((key: string, updates: ServerSettingsPatch) => {
+    if (!serverTextSaveTimerRef.current[key]) {
+      serverTextConfirmedSettingsRef.current[key] = serverSettings
+    }
     dispatch(previewServerSettingsPatch(updates))
     if (serverTextSaveTimerRef.current[key]) {
       clearTimeout(serverTextSaveTimerRef.current[key])
     }
     serverTextSaveTimerRef.current[key] = setTimeout(() => {
-      void dispatch(saveServerSettingsPatch(updates))
+      const confirmedServerSettings = serverTextConfirmedSettingsRef.current[key]
+      delete serverTextSaveTimerRef.current[key]
+      delete serverTextConfirmedSettingsRef.current[key]
+      void dispatch(saveServerSettingsPatch({
+        patch: updates,
+        confirmedServerSettings,
+      }))
     }, SERVER_TEXT_SETTINGS_DEBOUNCE_MS)
-  }, [dispatch])
+  }, [dispatch, serverSettings])
 
   useEffect(() => {
     const next = settings.defaultCwd ?? ''

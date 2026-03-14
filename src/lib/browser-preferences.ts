@@ -214,13 +214,16 @@ export function seedBrowserPreferencesSettingsIfEmpty(seed: LocalSettingsPatch):
     return current
   }
 
-  const nextSettings = current.settings === undefined
-    ? normalizedSeed
-    : mergeLocalSettings(normalizedSeed, current.settings)
+  if (current.settings !== undefined) {
+    return saveRecord({
+      ...current,
+      legacyLocalSettingsSeedApplied: true,
+    })
+  }
 
   return saveRecord({
     ...current,
-    settings: nextSettings,
+    settings: normalizedSeed,
     legacyLocalSettingsSeedApplied: true,
   })
 }
