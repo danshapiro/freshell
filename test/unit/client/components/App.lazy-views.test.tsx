@@ -9,6 +9,11 @@ import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
 import { networkReducer } from '@/store/networkSlice'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  resolveLocalSettings,
+} from '@shared/settings'
 
 const mockSend = vi.fn()
 const mockOnMessage = vi.fn(() => () => {})
@@ -75,6 +80,11 @@ vi.mock('@/store/tabRegistrySync', () => ({
 }))
 
 function createStore() {
+  const serverSettings = createDefaultServerSettings({
+    loggingDebug: defaultSettings.logging.debug,
+  })
+  const localSettings = resolveLocalSettings()
+
   return configureStore({
     reducer: {
       settings: settingsReducer,
@@ -91,7 +101,13 @@ function createStore() {
         },
       }),
     preloadedState: {
-      settings: { settings: defaultSettings, loaded: true, lastSavedAt: undefined },
+      settings: {
+        serverSettings,
+        localSettings,
+        settings: composeResolvedSettings(serverSettings, localSettings),
+        loaded: true,
+        lastSavedAt: undefined,
+      },
       tabs: { tabs: [{ id: 'tab-1', mode: 'shell' }], activeTabId: 'tab-1' },
       sessions: { projects: [], expandedProjects: new Set<string>(), wsSnapshotReceived: false, isLoading: false, error: null },
       connection: { status: 'ready' as const, lastError: undefined },
@@ -107,9 +123,14 @@ describe('App lazy-loaded views', () => {
     localStorage.clear()
     localStorage.setItem('freshell.auth-token', 'test-token-abc123')
     mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') return Promise.resolve(defaultSettings)
-      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
-      if (url === '/api/sessions') return Promise.resolve([])
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: createDefaultServerSettings({
+            loggingDebug: defaultSettings.logging.debug,
+          }),
+          platform: { platform: 'linux', availableClis: {}, featureFlags: {} },
+        })
+      }
       return Promise.resolve({})
     })
   })

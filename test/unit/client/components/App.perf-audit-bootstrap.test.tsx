@@ -10,6 +10,11 @@ import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
 import tabRegistryReducer from '@/store/tabRegistrySlice'
 import { networkReducer } from '@/store/networkSlice'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  resolveLocalSettings,
+} from '@shared/settings'
 
 const wsMocks = vi.hoisted(() => ({
   send: vi.fn(),
@@ -64,6 +69,11 @@ vi.mock('@/hooks/useTheme', () => ({
 }))
 
 function createStore() {
+  const serverSettings = createDefaultServerSettings({
+    loggingDebug: defaultSettings.logging.debug,
+  })
+  const localSettings = resolveLocalSettings()
+
   return configureStore({
     reducer: {
       settings: settingsReducer,
@@ -82,7 +92,9 @@ function createStore() {
       }),
     preloadedState: {
       settings: {
-        settings: defaultSettings,
+        serverSettings,
+        localSettings,
+        settings: composeResolvedSettings(serverSettings, localSettings),
         loaded: false,
         lastSavedAt: undefined,
       },

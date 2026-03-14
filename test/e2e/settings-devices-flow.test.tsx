@@ -11,6 +11,11 @@ import { networkReducer } from '@/store/networkSlice'
 import tabRegistryReducer, { type TabRegistryState } from '@/store/tabRegistrySlice'
 import { DEVICE_DISMISSED_STORAGE_KEY } from '@/store/storage-keys'
 import type { RegistryTabRecord } from '@/store/tabRegistryTypes'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  resolveLocalSettings,
+} from '@shared/settings'
 
 vi.mock('@/lib/api', () => ({
   api: {
@@ -57,6 +62,11 @@ function createTabRegistryState(overrides: Partial<TabRegistryState> = {}): TabR
 }
 
 function createStore(tabRegistryState: Partial<TabRegistryState> = {}) {
+  const serverSettings = createDefaultServerSettings({
+    loggingDebug: defaultSettings.logging.debug,
+  })
+  const localSettings = resolveLocalSettings()
+
   return configureStore({
     reducer: {
       settings: settingsReducer,
@@ -74,7 +84,9 @@ function createStore(tabRegistryState: Partial<TabRegistryState> = {}) {
       }),
     preloadedState: {
       settings: {
-        settings: defaultSettings,
+        serverSettings,
+        localSettings,
+        settings: composeResolvedSettings(serverSettings, localSettings),
         loaded: true,
         lastSavedAt: undefined,
       },

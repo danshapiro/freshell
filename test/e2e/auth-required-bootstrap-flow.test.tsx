@@ -12,6 +12,11 @@ import tabRegistryReducer from '@/store/tabRegistrySlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer } from '@/store/networkSlice'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  resolveLocalSettings,
+} from '@shared/settings'
 
 const mockSend = vi.fn()
 const mockOnMessage = vi.fn(() => () => {})
@@ -83,6 +88,11 @@ vi.mock('@/components/SetupWizard', () => ({
 }))
 
 function createStore() {
+  const serverSettings = createDefaultServerSettings({
+    loggingDebug: defaultSettings.logging.debug,
+  })
+  const localSettings = resolveLocalSettings()
+
   return configureStore({
     reducer: {
       settings: settingsReducer,
@@ -103,7 +113,9 @@ function createStore() {
       }),
     preloadedState: {
       settings: {
-        settings: defaultSettings,
+        serverSettings,
+        localSettings,
+        settings: composeResolvedSettings(serverSettings, localSettings),
         loaded: true,
         lastSavedAt: undefined,
       },

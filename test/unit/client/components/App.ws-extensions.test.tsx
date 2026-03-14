@@ -13,6 +13,11 @@ import terminalMetaReducer from '@/store/terminalMetaSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer } from '@/store/networkSlice'
 import type { ClientExtensionEntry } from '@shared/extension-types'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  resolveLocalSettings,
+} from '@shared/settings'
 
 // Mock heavy child components to avoid xterm/canvas issues
 vi.mock('@/components/TabContent', () => ({
@@ -85,6 +90,11 @@ vi.mock('@/lib/api', () => ({
 }))
 
 function createStore() {
+  const serverSettings = createDefaultServerSettings({
+    loggingDebug: defaultSettings.logging.debug,
+  })
+  const localSettings = resolveLocalSettings()
+
   return configureStore({
     reducer: {
       settings: settingsReducer,
@@ -102,7 +112,13 @@ function createStore() {
         serializableCheck: { ignoredPaths: ['sessions.expandedProjects'] },
       }),
     preloadedState: {
-      settings: { settings: defaultSettings, loaded: true, lastSavedAt: undefined },
+      settings: {
+        serverSettings,
+        localSettings,
+        settings: composeResolvedSettings(serverSettings, localSettings),
+        loaded: true,
+        lastSavedAt: undefined,
+      },
       tabs: { tabs: [{ id: 'tab-1', mode: 'shell' as const }], activeTabId: 'tab-1' },
       connection: {
         status: 'disconnected' as const,
@@ -157,8 +173,14 @@ describe('App WS extension messages', () => {
     fetchSidebarSessionsSnapshot.mockResolvedValue([])
 
     apiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') return Promise.resolve(defaultSettings)
-      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: createDefaultServerSettings({
+            loggingDebug: defaultSettings.logging.debug,
+          }),
+          platform: { platform: 'linux', availableClis: {}, featureFlags: {} },
+        })
+      }
       return Promise.resolve({})
     })
   })

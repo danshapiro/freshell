@@ -12,6 +12,11 @@ import terminalMetaReducer from '@/store/terminalMetaSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer } from '@/store/networkSlice'
 import codexActivityReducer from '@/store/codexActivitySlice'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  resolveLocalSettings,
+} from '@shared/settings'
 import type { SlowNetworkLane } from './slow-network-controller'
 
 type AppHydrationHarnessResponse = {
@@ -58,6 +63,21 @@ type WsStub = {
   serverInstanceId: string | undefined
 }
 
+function createSettingsState(loaded: boolean) {
+  const serverSettings = createDefaultServerSettings({
+    loggingDebug: defaultSettings.logging.debug,
+  })
+  const localSettings = resolveLocalSettings()
+
+  return {
+    serverSettings,
+    localSettings,
+    settings: composeResolvedSettings(serverSettings, localSettings),
+    loaded,
+    lastSavedAt: undefined,
+  }
+}
+
 function waitForCondition(predicate: () => boolean, timeoutMs: number, errorMessage: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const deadline = Date.now() + timeoutMs
@@ -80,12 +100,19 @@ function waitForCondition(predicate: () => boolean, timeoutMs: number, errorMess
 
 function defaultResponseForPath(path: string): unknown {
   if (path === '/api/bootstrap') {
+    const settings = createDefaultServerSettings({
+      loggingDebug: defaultSettings.logging.debug,
+    })
     return {
-      settings: defaultSettings,
+      settings,
       platform: { platform: 'linux', availableClis: {}, featureFlags: {} },
     }
   }
-  if (path === '/api/settings') return defaultSettings
+  if (path === '/api/settings') {
+    return createDefaultServerSettings({
+      loggingDebug: defaultSettings.logging.debug,
+    })
+  }
   if (path === '/api/platform') return { platform: 'linux', availableClis: {}, featureFlags: {} }
   if (path === '/api/version') return { currentVersion: '0.0.0', updateCheck: null }
   if (path === '/api/network/status') {
@@ -140,7 +167,7 @@ function createHarnessStore(seedState: AppHydrationHarnessOptions['seedState']) 
         serializableCheck: { ignoredPaths: ['sessions.expandedProjects'] },
       }),
     preloadedState: {
-      settings: { settings: defaultSettings, loaded: false, lastSavedAt: undefined },
+      settings: createSettingsState(false),
       tabs: { tabs, activeTabId: seedState?.activeTabId ?? ((tabs[0]?.id as string | undefined) ?? null) },
       connection: {
         status: 'disconnected' as const,
