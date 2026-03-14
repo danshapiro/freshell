@@ -17,6 +17,7 @@
 - Keep terminal-local handling. Removing the xterm-side handler would risk letting xterm translate the bracket shortcut into terminal input before the global listener runs.
 - Make the global listener a fallback, not a competitor. The clean contract is: the focused surface calls `preventDefault()` when it owns the shortcut, and the window-level handler exits when `event.defaultPrevented` is already true.
 - Reuse the existing browser test helpers instead of introducing new xterm-driving patterns in the plan. This repo already has a `terminal` fixture for focusing xterm reliably; the regression should lean on that abstraction rather than hard-coding new direct selectors beyond what the helper already encapsulates.
+- Reuse the existing non-terminal shortcut regression instead of cloning it. `test/e2e/agent-chat-tab-shortcut-focus.test.tsx` already proves the FreshClaude composer path, so the new work should keep that file in the focused verification set rather than adding a second composer-specific test.
 - Reordered tabs are the user-visible proof, so add a real browser regression that drags tabs into a new order and then presses the shortcut from the focused terminal.
 - Add one fast unit regression for the routing contract so the bug stays easy to diagnose locally without paying the Playwright startup cost every time.
 - No `docs/index.html` update is needed. This is a bug fix to existing shortcut behavior, not a new user-facing workflow.
@@ -88,7 +89,8 @@ In `test/e2e-browser/specs/tab-management.spec.ts`, add:
     await expect.poll(() => harness.getActiveTabId()).toBe(expectedNextId)
 
     // This test intentionally drives the terminal-focused path only.
-    // Existing App keyboard tests already cover the non-terminal fallback owner.
+    // FreshClaude fallback coverage already exists in
+    // test/e2e/agent-chat-tab-shortcut-focus.test.tsx.
   })
 ```
 
@@ -103,7 +105,7 @@ npm run test:e2e:chromium -- test/e2e-browser/specs/tab-management.spec.ts
 Expected:
 - FAIL in the new test because the focused terminal path currently double-handles the shortcut, so one keypress skips past the immediate reordered neighbor.
 
-### Task 2: Lock the Routing Contract in a Fast Unit Test and Apply the Minimal Fix
+### Task 2: Lock the Consumed-Event Contract in a Fast App Test and Apply the Minimal Fix
 
 **Files:**
 - Modify: `test/unit/client/components/App.test.tsx`
@@ -111,12 +113,11 @@ Expected:
 
 **Step 1: Add a failing App regression for already-consumed terminal shortcuts**
 
-In `test/unit/client/components/App.test.tsx`, update the `tabsSlice` import to include `reorderTabs`, then add:
+In `test/unit/client/components/App.test.tsx`, add:
 
 ```ts
   it('does not re-handle a prevented tab-switch event from an xterm control', () => {
     const store = createStoreWithTabs(3, 1) // active tab-2
-    store.dispatch(reorderTabs({ fromIndex: 0, toIndex: 2 })) // tab order: 2, 3, 1
     renderApp(store)
 
     const xtermTarget = document.createElement('textarea')
@@ -177,20 +178,29 @@ In the window `onKeyDown` handler, add the consumed-event guard before shortcut 
 Important detail:
 - Keep the text-input guard after the tab-switch branch so non-terminal inputs such as the FreshClaude composer still inherit the global shortcut behavior.
 
-**Step 4: Re-run the focused unit test and the browser regression**
+**Step 4: Re-run the focused App unit test**
 
 Run:
 
 ```bash
 npm run test:vitest -- test/unit/client/components/App.test.tsx -t "does not re-handle a prevented tab-switch event from an xterm control"
-npm run test:e2e:chromium -- test/e2e-browser/specs/tab-management.spec.ts
 ```
 
 Expected:
 - PASS for the new App unit test
+
+**Step 5: Re-run the browser regression from Task 1**
+
+Run:
+
+```bash
+npm run test:e2e:chromium -- test/e2e-browser/specs/tab-management.spec.ts
+```
+
+Expected:
 - PASS for the reordered browser shortcut regression
 
-**Step 5: Commit the minimal behavioral fix**
+**Step 6: Commit the minimal behavioral fix**
 
 ```bash
 git add test/unit/client/components/App.test.tsx src/App.tsx test/e2e-browser/specs/tab-management.spec.ts
@@ -336,21 +346,51 @@ git commit -m "refactor: share tab switch shortcut matcher"
 **Files:**
 - None
 
-**Step 1: Re-run the focused regression suite together**
+**Step 1: Re-run the focused client-side unit suite**
 
 Run:
 
 ```bash
 npm run test:vitest -- test/unit/client/components/App.test.tsx test/unit/client/components/TerminalView.keyboard.test.tsx test/unit/client/lib/tab-switch-shortcuts.test.ts
+```
+
+Expected:
+- PASS across the focused unit coverage
+
+**Step 2: Re-run the existing FreshClaude composer regression**
+
+Run:
+
+```bash
+npm run test:vitest -- test/e2e/agent-chat-tab-shortcut-focus.test.tsx
+```
+
+Expected:
+- PASS, proving the non-terminal fallback path still works when the real composer owns focus
+
+**Step 3: Re-run the browser regression for reordered terminal focus**
+
+Run:
+
+```bash
 npm run test:e2e:chromium -- test/e2e-browser/specs/tab-management.spec.ts
+```
+
+Expected:
+- PASS for the reordered browser shortcut regression
+
+**Step 4: Run lint on the touched client surface**
+
+Run:
+
+```bash
 npm run lint
 ```
 
 Expected:
-- PASS across the focused unit and browser coverage
 - PASS for lint on the touched client files
 
-**Step 2: If this execution turn includes landing to main, run the coordinated full suite before any merge**
+**Step 5: If this execution turn includes landing to main, run the coordinated full suite before any branch movement**
 
 Run:
 
@@ -364,22 +404,35 @@ Expected:
 Important detail:
 - If any unrelated failure appears here, stop and fix it before attempting to land, per repo policy.
 
-**Step 3: If the user later authorizes landing, follow the repo merge safety rules exactly**
+**Step 6: If the user later authorizes landing, rebase the worktree branch onto `origin/main`**
 
 Run from the worktree first:
 
 ```bash
 git fetch origin
-git merge origin/main
+git rebase origin/main
 ```
 
-Then re-run:
+Expected:
+- Clean rebase, or conflicts resolved in the worktree branch only
+
+Important detail:
+- Do not merge `main` into the branch here. The repo instructions for this checkout are rebase-first, then fast-forward `main` only after the rebased worktree is green.
+
+**Step 7: Re-run the coordinated full suite after the rebase**
+
+Run:
 
 ```bash
 FRESHELL_TEST_SUMMARY="tab rotation after reorder" npm test
 ```
 
-Only after the worktree is green, fast-forward `main` from the main checkout:
+Expected:
+- PASS for the rebased branch
+
+**Step 8: Only after the worktree is green, fast-forward `main` from the main checkout**
+
+Run:
 
 ```bash
 git merge --ff-only trycycle-tab-rotation-after-reorder
