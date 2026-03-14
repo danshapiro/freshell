@@ -188,7 +188,8 @@ describe('visible-first read-model helpers', () => {
         firstUserMessage: '__AUTO__ worktree cleanup',
         isSubagent: true,
         isNonInteractive: true,
-        updatedAt: 1_000,
+        isRunning: false,
+        lastActivityAt: 1_000,
       }],
       nextCursor: null,
       revision: 1,
@@ -202,6 +203,7 @@ describe('visible-first read-model helpers', () => {
         sessions: [
           expect.objectContaining({
             sessionId: 'session-1',
+            lastActivityAt: 1_000,
             sessionType: 'codex',
             firstUserMessage: '__AUTO__ worktree cleanup',
             isSubagent: true,
@@ -210,6 +212,27 @@ describe('visible-first read-model helpers', () => {
         ],
       }),
     ])
+  })
+
+  it('encodes session-directory cursors with lastActivityAt', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [],
+      nextCursor: null,
+      revision: 0,
+    }))
+
+    await fetchSidebarSessionsSnapshot({
+      before: 1_000,
+      beforeId: 'codex:session-1',
+    })
+
+    const requestUrl = mockFetch.mock.calls[0]?.[0] as string
+    const cursor = new URL(`http://localhost${requestUrl}`).searchParams.get('cursor')
+    expect(cursor).toBeTruthy()
+    expect(JSON.parse(Buffer.from(cursor!, 'base64url').toString('utf8'))).toEqual({
+      lastActivityAt: 1_000,
+      key: 'codex:session-1',
+    })
   })
 
   it('preserves search visibility metadata from session-directory items', async () => {
@@ -224,7 +247,8 @@ describe('visible-first read-model helpers', () => {
         firstUserMessage: 'queued task',
         isSubagent: false,
         isNonInteractive: true,
-        updatedAt: 2_000,
+        isRunning: false,
+        lastActivityAt: 2_000,
       }],
       nextCursor: null,
       revision: 2,
@@ -235,6 +259,7 @@ describe('visible-first read-model helpers', () => {
     expect(response.results).toEqual([
       expect.objectContaining({
         sessionId: 'session-2',
+        lastActivityAt: 2_000,
         sessionType: 'codex',
         firstUserMessage: 'queued task',
         isSubagent: false,

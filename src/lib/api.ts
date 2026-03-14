@@ -5,11 +5,14 @@ import { sanitizeSessionLocators } from '@/lib/session-utils'
 import type { SessionLocator } from '@/store/paneTypes'
 import {
   AgentTimelinePageQuerySchema,
+  SessionDirectoryPageSchema,
   SessionDirectoryQuerySchema,
   TerminalDirectoryQuerySchema,
   TerminalScrollbackQuerySchema,
   TerminalSearchQuerySchema,
   type AgentTimelinePageQuery,
+  type SessionDirectoryItem as ReadModelSessionDirectoryItem,
+  type SessionDirectoryPage as ReadModelSessionDirectoryPage,
   type SessionDirectoryQuery,
   type TerminalDirectoryQuery,
   type TerminalScrollbackQuery,
@@ -273,7 +276,7 @@ export type SearchResult = {
   sessionType?: string
   matchedIn: 'title' | 'userMessage' | 'assistantMessage' | 'summary'
   snippet?: string
-  updatedAt: number
+  lastActivityAt: number
   createdAt?: number
   archived?: boolean
   cwd?: string
@@ -299,38 +302,14 @@ export type SearchOptions = {
   signal?: AbortSignal
 }
 
-type SessionDirectoryItemResponse = {
-  sessionId: string
-  provider: CodingCliProviderName
-  projectPath: string
-  title?: string
-  summary?: string
-  snippet?: string
-  matchedIn?: 'title' | 'summary' | 'firstUserMessage'
-  updatedAt: number
-  createdAt?: number
-  archived?: boolean
-  cwd?: string
-  sessionType?: string
-  firstUserMessage?: string
-  isSubagent?: boolean
-  isNonInteractive?: boolean
-}
-
-type SessionDirectoryPageResponse = {
-  items: SessionDirectoryItemResponse[]
-  nextCursor: string | null
-  revision: number
-}
-
-function encodeLegacySessionCursor(before: number | undefined, beforeId: string | undefined): string | undefined {
+function encodeSessionCursor(before: number | undefined, beforeId: string | undefined): string | undefined {
   if (before === undefined || beforeId === undefined) return undefined
-  const raw = JSON.stringify({ updatedAt: before, key: beforeId })
+  const raw = JSON.stringify({ lastActivityAt: before, key: beforeId })
   return btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
 }
 
-function groupDirectoryItemsAsProjects(items: SessionDirectoryItemResponse[]) {
-  const groups = new Map<string, Array<SessionDirectoryItemResponse>>()
+function groupDirectoryItemsAsProjects(items: ReadModelSessionDirectoryItem[]) {
+  const groups = new Map<string, Array<ReadModelSessionDirectoryItem>>()
   for (const item of items) {
     const bucket = groups.get(item.projectPath) ?? []
     bucket.push(item)
@@ -343,7 +322,7 @@ function groupDirectoryItemsAsProjects(items: SessionDirectoryItemResponse[]) {
       provider: item.provider,
       sessionId: item.sessionId,
       projectPath: item.projectPath,
-      updatedAt: item.updatedAt,
+      lastActivityAt: item.lastActivityAt,
       createdAt: item.createdAt,
       archived: item.archived,
       cwd: item.cwd,
@@ -381,13 +360,13 @@ export async function fetchSidebarSessionsSnapshot(options: {
   } = options
   sanitizeSessionLocators(openSessions)
 
-  const page = await getSessionDirectoryPage({
+  const page = SessionDirectoryPageSchema.parse(await getSessionDirectoryPage({
     priority: 'visible',
     limit: Math.min(limit, 50),
-    cursor: encodeLegacySessionCursor(before, beforeId),
+    cursor: encodeSessionCursor(before, beforeId),
   }, {
     signal,
-  }) as SessionDirectoryPageResponse
+  })) as ReadModelSessionDirectoryPage
 
   const projects = groupDirectoryItemsAsProjects(page.items)
   const oldest = page.items.at(-1)
@@ -395,7 +374,7 @@ export async function fetchSidebarSessionsSnapshot(options: {
   return {
     projects,
     totalSessions: page.items.length,
-    oldestIncludedTimestamp: oldest?.updatedAt ?? 0,
+    oldestIncludedTimestamp: oldest?.lastActivityAt ?? 0,
     oldestIncludedSessionId: oldest ? `${oldest.provider}:${oldest.sessionId}` : '',
     hasMore: page.nextCursor !== null,
   }
@@ -403,13 +382,13 @@ export async function fetchSidebarSessionsSnapshot(options: {
 
 export async function searchSessions(options: SearchOptions): Promise<SearchResponse> {
   const { query, tier = 'title', limit, signal } = options
-  const page = await getSessionDirectoryPage({
+  const page = SessionDirectoryPageSchema.parse(await getSessionDirectoryPage({
     priority: 'visible',
     query,
     ...(limit ? { limit } : {}),
   }, {
     signal,
-  }) as SessionDirectoryPageResponse
+  })) as ReadModelSessionDirectoryPage
 
   return {
     results: page.items.map((item) => ({
@@ -420,7 +399,7 @@ export async function searchSessions(options: SearchOptions): Promise<SearchResp
       summary: item.summary,
       matchedIn: item.matchedIn === 'firstUserMessage' ? 'userMessage' : item.matchedIn ?? 'title',
       snippet: item.snippet,
-      updatedAt: item.updatedAt,
+      lastActivityAt: item.lastActivityAt,
       createdAt: item.createdAt,
       archived: item.archived,
       cwd: item.cwd,
