@@ -214,6 +214,251 @@ function createStoreWithSession() {
   })
 }
 
+function createStoreWithSidebarWindowAgentSession() {
+  return configureStore({
+    reducer: {
+      tabs: tabsReducer,
+      panes: panesReducer,
+      sessions: sessionsReducer,
+      connection: connectionReducer,
+      settings: settingsReducer,
+      extensions: extensionsReducer,
+    },
+    middleware: (getDefaultMiddleware) =>
+      getDefaultMiddleware({ serializableCheck: false }),
+    preloadedState: {
+      tabs: {
+        tabs: [
+          {
+            id: 'tab-1',
+            createRequestId: 'tab-1',
+            title: 'Shell',
+            status: 'running',
+            mode: 'shell',
+            shell: 'system',
+            createdAt: 1,
+          },
+        ],
+        activeTabId: 'tab-1',
+        renameRequestTabId: null,
+      },
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'shell',
+              status: 'running',
+              terminalId: 'term-1',
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      },
+      sessions: {
+        projects: [
+          {
+            projectPath: '/history/project',
+            sessions: [
+              {
+                sessionId: 'history-only',
+                provider: 'claude',
+                title: 'History Only',
+                cwd: '/history/project',
+                createdAt: 1000,
+                updatedAt: 2000,
+              },
+            ],
+          },
+        ],
+        activeSurface: 'history',
+        windows: {
+          history: {
+            projects: [
+              {
+                projectPath: '/history/project',
+                sessions: [
+                  {
+                    sessionId: 'history-only',
+                    provider: 'claude',
+                    title: 'History Only',
+                    cwd: '/history/project',
+                    createdAt: 1000,
+                    updatedAt: 2000,
+                  },
+                ],
+              },
+            ],
+            lastLoadedAt: 1,
+          },
+          sidebar: {
+            projects: [
+              {
+                projectPath: '/sidebar/project',
+                sessions: [
+                  {
+                    sessionId: VALID_SESSION_ID,
+                    provider: 'claude',
+                    sessionType: 'freshclaude',
+                    title: 'Sidebar Agent Session',
+                    cwd: '/sidebar/project',
+                    createdAt: 1000,
+                    updatedAt: 2000,
+                  },
+                ],
+              },
+            ],
+            lastLoadedAt: 1,
+          },
+        },
+        expandedProjects: new Set<string>(),
+      },
+      extensions: {
+        entries: defaultCliExtensions,
+      },
+      connection: {
+        status: 'ready',
+        platform: null,
+      },
+    },
+  })
+}
+
+function createStoreWithOverlappingSessionWindows() {
+  return configureStore({
+    reducer: {
+      tabs: tabsReducer,
+      panes: panesReducer,
+      sessions: sessionsReducer,
+      connection: connectionReducer,
+      settings: settingsReducer,
+      extensions: extensionsReducer,
+    },
+    middleware: (getDefaultMiddleware) =>
+      getDefaultMiddleware({ serializableCheck: false }),
+    preloadedState: {
+      tabs: {
+        tabs: [
+          {
+            id: 'tab-1',
+            createRequestId: 'tab-1',
+            title: 'Shell',
+            status: 'running',
+            mode: 'shell',
+            shell: 'system',
+            createdAt: 1,
+          },
+        ],
+        activeTabId: 'tab-1',
+        renameRequestTabId: null,
+      },
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'shell',
+              status: 'running',
+              terminalId: 'term-1',
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Shell' } },
+        paneTitleSetByUser: {},
+        renameRequestTabId: null,
+        renameRequestPaneId: null,
+        zoomedPane: {},
+        refreshRequestsByPane: {},
+      },
+      sessions: {
+        projects: [
+          {
+            projectPath: '/shared/project',
+            sessions: [
+              {
+                sessionId: VALID_SESSION_ID,
+                provider: 'claude',
+                sessionType: 'freshclaude',
+                title: 'Sidebar Agent Session',
+                cwd: '/shared/project/sidebar',
+                createdAt: 1000,
+                updatedAt: 2000,
+              },
+            ],
+          },
+        ],
+        activeSurface: 'history',
+        windows: {
+          sidebar: {
+            projects: [
+              {
+                projectPath: '/shared/project',
+                sessions: [
+                  {
+                    sessionId: VALID_SESSION_ID,
+                    provider: 'claude',
+                    sessionType: 'freshclaude',
+                    title: 'Sidebar Agent Session',
+                    cwd: '/shared/project/sidebar',
+                    createdAt: 1000,
+                    updatedAt: 2000,
+                  },
+                ],
+              },
+            ],
+            lastLoadedAt: 1,
+          },
+          history: {
+            projects: [
+              {
+                projectPath: '/shared/project',
+                sessions: [
+                  {
+                    sessionId: VALID_SESSION_ID,
+                    provider: 'claude',
+                    title: 'History Terminal Session',
+                    cwd: '/shared/project/history',
+                    createdAt: 1000,
+                    updatedAt: 2000,
+                  },
+                  {
+                    sessionId: 'history-extra',
+                    provider: 'claude',
+                    title: 'History Extra Session',
+                    cwd: '/shared/project/history',
+                    createdAt: 1000,
+                    updatedAt: 2000,
+                  },
+                ],
+              },
+            ],
+            lastLoadedAt: 1,
+          },
+        },
+        expandedProjects: new Set<string>(),
+      },
+      extensions: {
+        entries: defaultCliExtensions,
+      },
+      connection: {
+        status: 'ready',
+        platform: null,
+      },
+    },
+  })
+}
+
 function createStoreWithBrowserPane(options?: { zoomedPaneId?: string }) {
   return configureStore({
     reducer: {
@@ -590,6 +835,122 @@ describe('ContextMenuProvider', () => {
         }
       }
     }
+  })
+
+  it('uses the sidebar session window for sidebar actions and preserves agent-chat session type', async () => {
+    const user = userEvent.setup()
+    const store = createStoreWithSidebarWindowAgentSession()
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.SidebarSession}
+            data-session-id={VALID_SESSION_ID}
+            data-provider="claude"
+            data-session-type="freshclaude"
+          >
+            Sidebar Agent Session
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Sidebar Agent Session'), keys: '[MouseRight]' })
+    await user.click(screen.getByText('Open in this tab'))
+
+    const newLayout = store.getState().panes.layouts['tab-1']
+    expect(newLayout?.type).toBe('split')
+    if (newLayout?.type === 'split') {
+      const newPane = newLayout.children.find(
+        (child) => child.type === 'leaf' && child.id !== 'pane-1',
+      )
+      expect(newPane).toBeDefined()
+      if (newPane?.type === 'leaf') {
+        expect(newPane.content).toMatchObject({
+          kind: 'agent-chat',
+          provider: 'freshclaude',
+          resumeSessionId: VALID_SESSION_ID,
+        })
+      }
+    }
+
+    expect(store.getState().tabs.tabs[0].sessionMetadataByKey).toEqual({
+      [`claude:${VALID_SESSION_ID}`]: {
+        sessionType: 'freshclaude',
+      },
+    })
+  })
+
+  it('uses the history session window for history-session actions even when sidebar has a conflicting session snapshot', async () => {
+    const user = userEvent.setup()
+    const store = createStoreWithOverlappingSessionWindows()
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="history"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.HistorySession}
+            data-session-id={VALID_SESSION_ID}
+            data-provider="claude"
+          >
+            History Terminal Session
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('History Terminal Session'), keys: '[MouseRight]' })
+    await user.click(screen.getByText('Open session'))
+
+    const openedTab = store.getState().tabs.tabs.find((tab) => tab.id !== 'tab-1')
+    expect(openedTab).toMatchObject({
+      title: 'History Terminal Session',
+      initialCwd: '/shared/project/history',
+      resumeSessionId: VALID_SESSION_ID,
+    })
+    expect(store.getState().panes.layouts[openedTab!.id]).toBeUndefined()
+  })
+
+  it('uses the history project window for history-project actions even when sidebar has a conflicting project snapshot', async () => {
+    const user = userEvent.setup()
+    const store = createStoreWithOverlappingSessionWindows()
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="history"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.HistoryProject}
+            data-project-path="/shared/project"
+          >
+            Shared Project
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Shared Project'), keys: '[MouseRight]' })
+    await user.click(screen.getByText('Open all sessions in tabs'))
+    await user.click(await screen.findByRole('button', { name: 'Open tabs' }))
+
+    const openedTabs = store.getState().tabs.tabs.filter((tab) => tab.id !== 'tab-1')
+    expect(openedTabs).toHaveLength(2)
+    expect(openedTabs.map((tab) => tab.title)).toEqual([
+      'History Terminal Session',
+      'History Extra Session',
+    ])
   })
 
   it('copies resume command from sidebar session context menu', async () => {
@@ -1003,7 +1364,7 @@ describe('ContextMenuProvider', () => {
     })
   })
 
-  it('renders copy, Paste, and Select all as the first terminal menu section with icons', async () => {
+  it('renders Copy, Paste, and Select all as the first terminal menu section with icons', async () => {
     const user = userEvent.setup()
     const store = createStoreWithTerminalPane()
 

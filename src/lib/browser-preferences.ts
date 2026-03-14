@@ -200,6 +200,13 @@ export function patchBrowserPreferencesRecord(patch: BrowserPreferencesRecord): 
     }
   }
 
+  if (patch.legacyLocalSettingsSeedApplied === true) {
+    next = {
+      ...next,
+      legacyLocalSettingsSeedApplied: true,
+    }
+  }
+
   return saveRecord(next)
 }
 

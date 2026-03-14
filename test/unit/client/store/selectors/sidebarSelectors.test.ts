@@ -18,7 +18,7 @@ function createSessionItem(overrides: Partial<SidebarSessionItem>): SidebarSessi
 }
 
 // Import the sort function and buildSessionItems for testing
-import { sortSessionItems, buildSessionItems } from '@/store/selectors/sidebarSelectors'
+import { sortSessionItems, buildSessionItems, filterSessionItemsByVisibility } from '@/store/selectors/sidebarSelectors'
 import type { CodingCliSession, ProjectGroup } from '@/store/types'
 
 describe('sidebarSelectors', () => {
@@ -218,6 +218,73 @@ describe('sidebarSelectors', () => {
           cwd: '/tmp/restored-project',
         }),
       ])
+    })
+
+    it('preserves fallback visibility metadata from tab session metadata so hidden sessions stay filtered', () => {
+      const hiddenSessionId = 'codex-hidden'
+      const tabs = [
+        {
+          id: 'tab-hidden',
+          title: 'Hidden Session',
+          mode: 'codex',
+          resumeSessionId: hiddenSessionId,
+          createdAt: 2_000,
+          sessionMetadataByKey: {
+            'codex:codex-hidden': {
+              sessionType: 'codex',
+              firstUserMessage: 'IMPORTANT: internal trycycle task',
+              isSubagent: true,
+              isNonInteractive: true,
+            },
+          },
+        },
+      ] as any
+
+      const panes = {
+        layouts: {
+          'tab-hidden': {
+            type: 'leaf',
+            id: 'pane-hidden',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              status: 'running',
+              createRequestId: 'req-hidden',
+              resumeSessionId: hiddenSessionId,
+              initialCwd: '/tmp/hidden-project',
+            },
+          },
+        },
+        activePane: {
+          'tab-hidden': 'pane-hidden',
+        },
+        paneTitles: {
+          'tab-hidden': {
+            'pane-hidden': 'Hidden Session',
+          },
+        },
+      } as any
+
+      const items = buildSessionItems([], tabs, panes, emptyTerminals, emptyActivity)
+
+      expect(items).toEqual([
+        expect.objectContaining({
+          sessionId: hiddenSessionId,
+          sessionType: 'codex',
+          isSubagent: true,
+          isNonInteractive: true,
+          firstUserMessage: 'IMPORTANT: internal trycycle task',
+        }),
+      ])
+
+      expect(filterSessionItemsByVisibility(items, {
+        showSubagents: false,
+        ignoreCodexSubagents: true,
+        showNoninteractiveSessions: false,
+        hideEmptySessions: true,
+        excludeFirstChatSubstrings: ['IMPORTANT:'],
+        excludeFirstChatMustStart: true,
+      })).toEqual([])
     })
   })
 

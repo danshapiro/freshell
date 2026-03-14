@@ -9,7 +9,7 @@ import {
 import { addTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import { api, isApiUnauthorizedError, type VersionInfo } from '@/lib/api'
 import {
-  activateSessionSurface,
+  fetchSessionWindow,
   loadInitialSessionsWindow,
   queueActiveSessionWindowRefresh,
 } from '@/store/sessionsThunks'
@@ -19,6 +19,7 @@ import { collectSessionLocatorsFromTabs, getSessionsForHello } from '@/lib/sessi
 import { installClientPerfAuditSink, setClientPerfEnabled } from '@/lib/perf-logger'
 import {
   loadBrowserPreferencesRecord,
+  patchBrowserPreferencesRecord,
   resolveBrowserPreferenceSettings,
   seedBrowserPreferencesSettingsIfEmpty,
 } from '@/lib/browser-preferences'
@@ -36,6 +37,7 @@ import { useDrag } from '@use-gesture/react'
 import { installCrossTabSync } from '@/store/crossTabSync'
 import { startTabRegistrySync } from '@/store/tabRegistrySync'
 import { resolveAndPersistDeviceMeta, setTabRegistryDeviceMeta } from '@/store/tabRegistrySlice'
+import { buildLocalSettingsPatch } from '@/store/browserPreferencesPersistence'
 import Sidebar, { AppView } from '@/components/Sidebar'
 import TabBar from '@/components/TabBar'
 import TabContent from '@/components/TabContent'
@@ -124,9 +126,9 @@ function parseConfigFallbackReason(value: unknown): ConfigFallbackInfo['reason']
     : 'READ_ERROR'
 }
 
-function hasPlatformCapabilities(value: BootstrapPlatformInfo | null | undefined): boolean {
+function hasLoadedPlatformCapabilities(value: BootstrapPlatformInfo | null | undefined): boolean {
   if (!value) return false
-  return Object.keys(value.availableClis ?? {}).length > 0 || Object.keys(value.featureFlags ?? {}).length > 0
+  return 'availableClis' in value || 'featureFlags' in value
 }
 
 const ReadyMessageSchema = z.object({
@@ -437,6 +439,9 @@ export default function App() {
     let versionInfoLoading = false
     let platformDetailsLoading = false
     let startupRecoveryInFlight = false
+    let startupRecoveryRerunRequested = false
+    let platformCapabilitiesLoaded = false
+    let lastReadyServerInstanceId: string | undefined
     const versionInfoLoadedRef = { current: false }
 
     async function bootstrap() {
@@ -470,7 +475,22 @@ export default function App() {
           if (!cancelled) {
             if (bootstrapData.legacyLocalSettingsSeed) {
               const currentPreferences = loadBrowserPreferencesRecord()
-              const nextPreferences = seedBrowserPreferencesSettingsIfEmpty(bootstrapData.legacyLocalSettingsSeed)
+              const currentLocalSettingsPatch = buildLocalSettingsPatch(appStore.getState().settings.localSettings)
+              const currentPreferencesPatch = currentPreferences.settings ?? {}
+              const hasExistingLocalSettings =
+                Object.keys(currentPreferencesPatch).length > 0
+                || Object.keys(currentLocalSettingsPatch).length > 0
+              const shouldPersistCurrentLocalSettings =
+                Object.keys(currentLocalSettingsPatch).length > 0
+                && JSON.stringify(currentPreferencesPatch) !== JSON.stringify(currentLocalSettingsPatch)
+              const nextPreferences = hasExistingLocalSettings
+                ? patchBrowserPreferencesRecord({
+                    ...(shouldPersistCurrentLocalSettings
+                      ? { settings: currentLocalSettingsPatch }
+                      : {}),
+                    legacyLocalSettingsSeedApplied: true,
+                  })
+                : seedBrowserPreferencesSettingsIfEmpty(bootstrapData.legacyLocalSettingsSeed)
 
               if (JSON.stringify(currentPreferences.settings) !== JSON.stringify(nextPreferences.settings)) {
                 dispatch(setLocalSettings(resolveBrowserPreferenceSettings(nextPreferences)))
@@ -486,6 +506,9 @@ export default function App() {
               }
               if (bootstrapData.platform.featureFlags) {
                 dispatch(setFeatureFlags(bootstrapData.platform.featureFlags))
+              }
+              if (hasLoadedPlatformCapabilities(bootstrapData.platform)) {
+                platformCapabilitiesLoaded = true
               }
               dispatch(setTabRegistryDeviceMeta(resolveAndPersistDeviceMeta({
                 platform: bootstrapData.platform.platform,
@@ -518,6 +541,7 @@ export default function App() {
             dispatch(setPlatform(platformData.platform))
             dispatch(setAvailableClis(platformData.availableClis ?? {}))
             dispatch(setFeatureFlags(platformData.featureFlags ?? {}))
+            platformCapabilitiesLoaded = true
             dispatch(setTabRegistryDeviceMeta(resolveAndPersistDeviceMeta({
               platform: platformData.platform,
               hostName: platformData.hostName ?? platformData.host,
@@ -618,13 +642,20 @@ export default function App() {
         if (sidebarWindowLoading) return true
         const sidebarWindow = appStore.getState().sessions.windows?.sidebar
         if (typeof sidebarWindow?.lastLoadedAt === 'number') {
-          dispatch(activateSessionSurface('sidebar') as any)
           return true
         }
 
         sidebarWindowLoading = true
         try {
-          await dispatch(loadInitialSessionsWindow() as any)
+          const activeSurface = appStore.getState().sessions.activeSurface
+          if (activeSurface && activeSurface !== 'sidebar') {
+            await dispatch(fetchSessionWindow({
+              surface: 'sidebar',
+              priority: 'visible',
+            }) as any)
+          } else {
+            await dispatch(loadInitialSessionsWindow() as any)
+          }
           return true
         } catch (err: unknown) {
           if (handleBootstrapAuthFailure(err)) return false
@@ -636,19 +667,18 @@ export default function App() {
       }
 
       const recoverMissingStartupState = async () => {
-        if (startupRecoveryInFlight || cancelled) return
+        if (cancelled) return
+        if (startupRecoveryInFlight) {
+          startupRecoveryRerunRequested = true
+          return
+        }
         startupRecoveryInFlight = true
         try {
           const state = appStore.getState()
           if (!state.settings.loaded || state.connection.platform === null) {
             if (!(await loadBootstrapData())) return
           }
-          const connectionState = appStore.getState().connection
-          if (!hasPlatformCapabilities({
-            platform: connectionState.platform ?? 'unknown',
-            availableClis: connectionState.availableClis,
-            featureFlags: connectionState.featureFlags,
-          })) {
+          if (!platformCapabilitiesLoaded) {
             if (!(await loadPlatformDetails())) return
           }
           if (!(await ensureSidebarSessionsWindow())) return
@@ -656,6 +686,10 @@ export default function App() {
           ensureNetworkStatusLoaded()
         } finally {
           startupRecoveryInFlight = false
+          if (startupRecoveryRerunRequested && !cancelled) {
+            startupRecoveryRerunRequested = false
+            void recoverMissingStartupState()
+          }
         }
       }
 
@@ -663,6 +697,16 @@ export default function App() {
         if (!msg?.type) return
         if (msg.type === 'ready') {
           const ready = ReadyMessageSchema.safeParse(msg)
+          if (
+            ready.success &&
+            lastReadyServerInstanceId &&
+            lastReadyServerInstanceId !== ready.data.serverInstanceId
+          ) {
+            platformCapabilitiesLoaded = false
+          }
+          if (ready.success) {
+            lastReadyServerInstanceId = ready.data.serverInstanceId
+          }
           // If the initial connect attempt failed before ready, WsClient may still auto-reconnect.
           // Treat 'ready' as the source of truth for connection status.
           resetCodexActivityOverlay()
@@ -794,6 +838,7 @@ export default function App() {
       // sidebar snapshot. The HTTP bootstrap window remains the source of truth.
       if (ws.isReady) {
         if (cancelled) return
+        lastReadyServerInstanceId = ws.serverInstanceId
         resetCodexActivityOverlay()
         dispatch(setError(undefined))
         dispatch(setStatus('ready'))

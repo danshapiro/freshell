@@ -371,6 +371,105 @@ describe('open tab session sidebar visibility (e2e)', () => {
     expect(fetchSidebarSessionsSnapshot).toHaveBeenCalledTimes(1)
   })
 
+  it('recovers CLI availability and sidebar filtering after transient pre-ready failures', async () => {
+    const recoveredSettings = {
+      ...defaultSettings,
+      sidebar: {
+        ...defaultSettings.sidebar,
+        excludeFirstChatSubstrings: ['__AUTO__'],
+      },
+    }
+    let bootstrapCalls = 0
+    let sidebarCalls = 0
+
+    apiGet.mockImplementation((url: string) => {
+      if (url === '/api/bootstrap') {
+        bootstrapCalls += 1
+        if (bootstrapCalls === 1) {
+          return Promise.reject({ status: 503, message: 'Service Unavailable' })
+        }
+        return Promise.resolve({
+          settings: recoveredSettings,
+          platform: {
+            platform: 'linux',
+            availableClis: { claude: true, codex: true },
+            featureFlags: { kilroy: true },
+          },
+          shell: { authenticated: true, ready: true },
+        })
+      }
+      if (url === '/api/version') return Promise.resolve({})
+      if (url === '/api/network/status') return Promise.resolve(null)
+      return Promise.resolve({})
+    })
+
+    fetchSidebarSessionsSnapshot.mockImplementation(() => {
+      sidebarCalls += 1
+      if (sidebarCalls === 1) {
+        return Promise.reject({ status: 503, message: 'Service Unavailable' })
+      }
+      return Promise.resolve({
+        projects: [{
+          projectPath: '/work/app',
+          sessions: [
+            {
+              provider: 'codex',
+              sessionId: 'hidden-auto-session',
+              projectPath: '/work/app',
+              updatedAt: 10,
+              title: 'Hidden Auto Session',
+              firstUserMessage: '__AUTO__ reconcile state',
+            },
+            {
+              provider: 'codex',
+              sessionId: 'visible-manual-session',
+              projectPath: '/work/app',
+              updatedAt: 9,
+              title: 'Visible Manual Session',
+              firstUserMessage: 'please fix tests',
+            },
+          ],
+        }],
+        totalSessions: 2,
+        oldestIncludedTimestamp: 9,
+        oldestIncludedSessionId: 'codex:visible-manual-session',
+        hasMore: false,
+      })
+    })
+
+    const store = createStore()
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(apiGet).toHaveBeenCalledWith('/api/bootstrap')
+    })
+
+    act(() => {
+      wsMocks.isReady = true
+      wsMocks.serverInstanceId = 'srv-recovered'
+      broadcastWs({
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-recovered',
+      })
+    })
+
+    await waitFor(() => {
+      expect(store.getState().connection.availableClis).toEqual({ claude: true, codex: true })
+      expect(store.getState().settings.settings.sidebar.excludeFirstChatSubstrings).toEqual(['__AUTO__'])
+      expect(screen.queryByText('Hidden Auto Session')).not.toBeInTheDocument()
+      expect(screen.getAllByText('Visible Manual Session').length).toBeGreaterThan(0)
+    })
+
+    expect(bootstrapCalls).toBe(2)
+    expect(sidebarCalls).toBe(2)
+  })
+
   it('ignores legacy sessions.updated websocket pushes because the sidebar window is HTTP-owned', async () => {
     const recentProjects = [{
       projectPath: '/recent',

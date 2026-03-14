@@ -384,7 +384,7 @@ describe('buildMenuItems - terminal "Search" item', () => {
 })
 
 describe('buildMenuItems - terminal clipboard section', () => {
-  it('places copy, Paste, and Select all in the first section with icons', () => {
+  it('places Copy, Paste, and Select all in the first section with icons', () => {
     const items = buildMenuItems(
       { kind: 'terminal', tabId: 'tab-1', paneId: 'pane-1' },
       makeCtx(createActions()),

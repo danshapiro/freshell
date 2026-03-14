@@ -28,6 +28,7 @@ interface TabConfig {
   terminalId?: string
   codingCliSessionId?: string
   resumeSessionId?: string
+  sessionMetadataByKey?: Record<string, unknown>
 }
 
 interface StoreOptions {
@@ -58,6 +59,7 @@ function createStore(tabs: TabConfig[], options: StoreOptions = {}) {
           terminalId: t.terminalId,
           codingCliSessionId: t.codingCliSessionId,
           resumeSessionId: t.resumeSessionId,
+          sessionMetadataByKey: t.sessionMetadataByKey,
           createRequestId: 'req-1',
         })),
         activeTabId: tabs[0]?.id,
@@ -157,6 +159,38 @@ describe('TabContent', () => {
 
       expect(getByTestId('session-view')).toBeInTheDocument()
       expect(mockPaneLayout).not.toHaveBeenCalled()
+    })
+
+    it('restores agent-chat default content for no-layout tabs using persisted session metadata', () => {
+      const store = createStore([
+        {
+          id: 'tab-1',
+          mode: 'claude',
+          resumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
+          sessionMetadataByKey: {
+            'claude:550e8400-e29b-41d4-a716-446655440000': {
+              sessionType: 'freshclaude',
+            },
+          },
+        },
+      ])
+
+      render(
+        <Provider store={store}>
+          <TabContent tabId="tab-1" />
+        </Provider>
+      )
+
+      expect(mockPaneLayout).toHaveBeenCalledWith(
+        expect.objectContaining({
+          defaultContent: expect.objectContaining({
+            kind: 'agent-chat',
+            provider: 'freshclaude',
+            resumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
+          }),
+        }),
+        expect.anything(),
+      )
     })
   })
 

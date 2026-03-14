@@ -84,7 +84,7 @@ function assignChangedScalar<T extends Record<string, unknown>, K extends keyof 
   }
 }
 
-function buildLocalSettingsPatch(localSettings: LocalSettings): LocalSettingsPatch {
+export function buildLocalSettingsPatch(localSettings: LocalSettings): LocalSettingsPatch {
   const patch: LocalSettingsPatch = {}
 
   assignChangedScalar(patch, localSettings, defaultLocalSettings, 'theme')

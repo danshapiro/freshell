@@ -3,7 +3,7 @@ import { Terminal, Folder, Settings, LayoutGrid, Search, Loader2, X, Archive, Pa
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
-import { openSessionTab, setActiveTab } from '@/store/tabsSlice'
+import { openSessionTab, setActiveTab, updateTab } from '@/store/tabsSlice'
 import { addPane, setActivePane } from '@/store/panesSlice'
 import { findPaneForSession } from '@/lib/session-utils'
 import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type-utils'
@@ -15,6 +15,7 @@ import { getActiveSessionRefForTab } from '@/lib/session-utils'
 import { useStableArray } from '@/hooks/useStableArray'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { fetchSessionWindow } from '@/store/sessionsThunks'
+import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 
 const EMPTY_TERMINALS: BackgroundTerminal[] = []
 
@@ -286,6 +287,9 @@ export default function Sidebar({
         provider,
         sessionType,
         terminalId: runningTerminalId,
+        firstUserMessage: item.firstUserMessage,
+        isSubagent: item.isSubagent,
+        isNonInteractive: item.isNonInteractive,
       }))
       onNavigate('terminal')
       return
@@ -302,6 +306,24 @@ export default function Sidebar({
         agentChatProviderSettings: providerSettings,
       }),
     }))
+    const activeTab = state.tabs.tabs.find((tab) => tab.id === currentActiveTabId)
+    const sessionMetadataByKey = mergeSessionMetadataByKey(
+      activeTab?.sessionMetadataByKey,
+      provider,
+      item.sessionId,
+      {
+        sessionType,
+        firstUserMessage: item.firstUserMessage,
+        isSubagent: item.isSubagent,
+        isNonInteractive: item.isNonInteractive,
+      },
+    )
+    if (activeTab && sessionMetadataByKey !== activeTab.sessionMetadataByKey) {
+      dispatch(updateTab({
+        id: currentActiveTabId,
+        updates: { sessionMetadataByKey },
+      }))
+    }
     onNavigate('terminal')
   }, [dispatch, onNavigate, store])
 

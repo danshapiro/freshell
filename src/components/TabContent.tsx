@@ -5,6 +5,8 @@ import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { useAppSelector } from '@/store/hooks'
 import type { PaneContentInput } from '@/store/paneTypes'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
+import { buildResumeContent } from '@/lib/session-type-utils'
+import { getTabResumeSessionType } from '@/lib/session-metadata'
 
 interface TabContentProps {
   tabId: string
@@ -32,12 +34,24 @@ export default function TabContent({ tabId, hidden }: TabContentProps) {
 
   // Build default content based on setting
   let defaultContent: PaneContentInput
+  const resumeSessionType = getTabResumeSessionType(tab)
 
-  // If tab already has a terminalId (e.g., restored from persistence), use that
-  // Or if the tab is claude/codex mode, or has a resumeSessionId, force terminal
-  const forceTerminal = tab.terminalId || tab.mode !== 'shell' || tab.resumeSessionId
-
-  if (forceTerminal) {
+  if (tab.terminalId) {
+    defaultContent = {
+      kind: 'terminal',
+      mode: tab.mode,
+      shell: tab.shell,
+      resumeSessionId: tab.resumeSessionId,
+      initialCwd: tab.initialCwd,
+      terminalId: tab.terminalId,
+    }
+  } else if (tab.resumeSessionId && resumeSessionType) {
+    defaultContent = buildResumeContent({
+      sessionType: resumeSessionType,
+      sessionId: tab.resumeSessionId,
+      cwd: tab.initialCwd,
+    })
+  } else if (tab.mode !== 'shell') {
     defaultContent = {
       kind: 'terminal',
       mode: tab.mode,

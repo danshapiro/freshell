@@ -4,6 +4,8 @@ import type { BackgroundTerminal, CodingCliProviderName } from '../types'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { collectSessionRefsFromNode, collectSessionRefsFromTabs } from '@/lib/session-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { getSessionMetadata } from '@/lib/session-metadata'
+import type { SessionListMetadata } from '../types'
 
 export interface SidebarSessionItem {
   id: string
@@ -133,6 +135,7 @@ export function buildSessionItems(
     title?: string
     cwd?: string
     timestamp?: number
+    metadata?: SessionListMetadata
   }) => {
     const key = `${input.provider}:${input.sessionId}`
     if (knownKeys.has(key)) return
@@ -146,7 +149,7 @@ export function buildSessionItems(
       id: `session-${input.provider}-${input.sessionId}`,
       sessionId: input.sessionId,
       provider: input.provider,
-      sessionType: input.sessionType,
+      sessionType: input.metadata?.sessionType || input.sessionType,
       title: fallbackTitle,
       hasTitle: fallbackTitle !== input.sessionId.slice(0, 8),
       subtitle: input.cwd ? getProjectName(input.cwd) : undefined,
@@ -158,6 +161,9 @@ export function buildSessionItems(
       isRunning: !!runningTerminalId,
       runningTerminalId,
       runningTerminalIds,
+      isSubagent: input.metadata?.isSubagent,
+      isNonInteractive: input.metadata?.isNonInteractive,
+      firstUserMessage: input.metadata?.firstUserMessage,
     })
   }
 
@@ -177,6 +183,7 @@ export function buildSessionItems(
     if (node.content.kind === 'agent-chat') {
       const sessionId = node.content.resumeSessionId
       if (!sessionId || !isValidClaudeSessionId(sessionId)) return
+      const metadata = getSessionMetadata(tab, 'claude', sessionId)
       pushFallbackItem({
         provider: 'claude',
         sessionId,
@@ -184,6 +191,7 @@ export function buildSessionItems(
         title: paneTitle || tab.title,
         cwd: undefined,
         timestamp: fallbackTimestamp,
+        metadata,
       })
       return
     }
@@ -192,6 +200,7 @@ export function buildSessionItems(
     if (node.content.mode === 'shell' || !node.content.resumeSessionId) return
     if (node.content.mode === 'claude' && !isValidClaudeSessionId(node.content.resumeSessionId)) return
 
+    const metadata = getSessionMetadata(tab, node.content.mode, node.content.resumeSessionId)
     pushFallbackItem({
       provider: node.content.mode,
       sessionId: node.content.resumeSessionId,
@@ -199,6 +208,7 @@ export function buildSessionItems(
       title: paneTitle || tab.title,
       cwd: node.content.initialCwd,
       timestamp: fallbackTimestamp,
+      metadata,
     })
   }
 
@@ -217,13 +227,15 @@ export function buildSessionItems(
     if (!provider || !sessionId) continue
     if (provider === 'claude' && !isValidClaudeSessionId(sessionId)) continue
 
+    const metadata = getSessionMetadata(tab, provider, sessionId)
     pushFallbackItem({
       provider,
       sessionId,
-      sessionType: provider,
+      sessionType: metadata?.sessionType || provider,
       title: tab.title,
       cwd: undefined,
       timestamp: tab.lastInputAt ?? tab.createdAt ?? 0,
+      metadata,
     })
   }
 
