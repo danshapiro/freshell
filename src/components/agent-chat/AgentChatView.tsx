@@ -3,7 +3,13 @@ import { nanoid } from 'nanoid'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { updatePaneContent, mergePaneContent } from '@/store/panesSlice'
-import { addUserMessage, clearPendingCreate, removePermission, removeQuestion } from '@/store/agentChatSlice'
+import {
+  addUserMessage,
+  clearPendingCreate,
+  registerPendingCreate,
+  removePermission,
+  removeQuestion,
+} from '@/store/agentChatSlice'
 import { loadAgentTimelineWindow, loadAgentTurnBody } from '@/store/agentChatThunks'
 import { getWsClient } from '@/lib/ws-client'
 import { cn } from '@/lib/utils'
@@ -67,7 +73,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
   // Resolve pendingCreates -> pane sessionId
   const pendingSessionId = useAppSelector(
-    (s) => s.agentChat.pendingCreates[paneContent.createRequestId],
+    (s) => s.agentChat.pendingCreates[paneContent.createRequestId]?.sessionId,
   )
   const sessionId = paneContent.sessionId
   const session = useAppSelector(
@@ -210,6 +216,10 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     if (paneContent.status !== 'creating') return
 
     createSentRef.current = true
+    dispatch(registerPendingCreate({
+      requestId: paneContent.createRequestId,
+      expectsHistoryHydration: Boolean(paneContent.resumeSessionId),
+    }))
     ws.send({
       type: 'sdk.create',
       requestId: paneContent.createRequestId,
