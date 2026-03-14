@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest'
-import { filterSessionItemsByVisibility } from '@/store/selectors/sidebarSelectors'
+import { filterSessionItemsByVisibility, makeSelectSortedSessionItems } from '@/store/selectors/sidebarSelectors'
 import type { SidebarSessionItem } from '@/store/selectors/sidebarSelectors'
+import type { BackgroundTerminal } from '@/store/types'
+import type { RootState } from '@/store/store'
 
 function createSessionItem(overrides: Partial<SidebarSessionItem>): SidebarSessionItem {
   return {
@@ -322,5 +324,67 @@ describe('filterSessionItemsByVisibility', () => {
 
       expect(result.map((i) => i.id)).toEqual(['1'])
     })
+  })
+})
+
+describe('makeSelectSortedSessionItems', () => {
+  it('falls back to activity sorting when the local sort mode is missing', () => {
+    const selector = makeSelectSortedSessionItems()
+    const state = {
+      sessions: {
+        projects: [
+          {
+            projectPath: '/repo',
+            sessions: [
+              {
+                provider: 'claude',
+                sessionId: 'session-low-activity',
+                updatedAt: 2_000,
+                title: 'Low activity',
+              },
+              {
+                provider: 'claude',
+                sessionId: 'session-high-activity',
+                updatedAt: 1_000,
+                title: 'High activity',
+              },
+            ],
+          },
+        ],
+      },
+      tabs: {
+        tabs: [],
+      },
+      panes: {
+        layouts: {},
+        paneTitles: {},
+      },
+      settings: {
+        settings: {
+          sidebar: {
+            showSubagents: true,
+            ignoreCodexSubagents: true,
+            showNoninteractiveSessions: true,
+            hideEmptySessions: false,
+            excludeFirstChatSubstrings: [],
+            excludeFirstChatMustStart: false,
+          },
+        },
+      },
+      sessionActivity: {
+        sessions: {
+          'claude:session-low-activity': 1,
+          'claude:session-high-activity': 50,
+        },
+      },
+    } as RootState
+    const terminals: BackgroundTerminal[] = []
+
+    const result = selector(state, terminals, '')
+
+    expect(result.map((item) => item.sessionId)).toEqual([
+      'session-high-activity',
+      'session-low-activity',
+    ])
   })
 })

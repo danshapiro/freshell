@@ -9,6 +9,14 @@ import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
 import { networkReducer } from '@/store/networkSlice'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  mergeServerSettings,
+  resolveLocalSettings,
+  type LocalSettingsPatch,
+  type ServerSettingsPatch,
+} from '@shared/settings'
 
 // Mock the WebSocket client
 const mockSend = vi.fn()
@@ -78,6 +86,25 @@ vi.mock('@/components/OverviewView', () => ({
   default: () => <div data-testid="mock-overview-view">Overview View</div>,
 }))
 
+vi.mock('@/components/panes/PaneDivider', () => ({
+  default: ({
+    onResize,
+    onResizeEnd,
+  }: {
+    onResize: (delta: number) => void
+    onResizeEnd?: () => void
+  }) => (
+    <div data-testid="mock-pane-divider">
+      <button title="Resize sidebar" onClick={() => onResize(50)}>
+        Resize sidebar
+      </button>
+      <button title="Finish sidebar resize" onClick={() => onResizeEnd?.()}>
+        Finish sidebar resize
+      </button>
+    </div>
+  ),
+}))
+
 // Mock the useThemeEffect hook
 vi.mock('@/hooks/useTheme', () => ({
   useThemeEffect: () => {},
@@ -89,6 +116,27 @@ vi.mock('@/store/tabRegistrySync', () => ({
 vi.mock('@/components/SetupWizard', () => ({
   SetupWizard: () => <div data-testid="mock-setup-wizard">Setup Wizard</div>,
 }))
+
+const defaultServerSettings = createDefaultServerSettings({
+  loggingDebug: defaultSettings.logging.debug,
+})
+
+function createSettingsState(options: {
+  server?: ServerSettingsPatch
+  local?: LocalSettingsPatch
+  loaded?: boolean
+} = {}) {
+  const serverSettings = mergeServerSettings(defaultServerSettings, options.server ?? {})
+  const localSettings = resolveLocalSettings(options.local)
+
+  return {
+    serverSettings,
+    localSettings,
+    settings: composeResolvedSettings(serverSettings, localSettings),
+    loaded: options.loaded ?? true,
+    lastSavedAt: undefined,
+  }
+}
 
 function createTestStore(options?: {
   sidebarWidth?: number
@@ -110,18 +158,14 @@ function createTestStore(options?: {
         },
       }),
     preloadedState: {
-      settings: {
-        settings: {
-          ...defaultSettings,
+      settings: createSettingsState({
+        local: {
           sidebar: {
-            ...defaultSettings.sidebar,
             width: options?.sidebarWidth ?? 288,
             collapsed: options?.sidebarCollapsed ?? false,
           },
         },
-        loaded: true,
-        lastSavedAt: undefined,
-      },
+      }),
       tabs: {
         tabs: [{ id: 'tab-1', mode: 'shell' }],
         activeTabId: 'tab-1',
@@ -160,7 +204,10 @@ describe('App Component - Sidebar Resize', () => {
     // Default: desktop viewport (matchMedia matches=false is the default)
 
     mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/bootstrap') return Promise.resolve({
+        settings: defaultServerSettings,
+        platform: { platform: 'linux' },
+      })
       if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
       if (url === '/api/sessions') return Promise.resolve([])
       return Promise.resolve({})
@@ -220,19 +267,17 @@ describe('App Component - Sidebar Resize', () => {
       })
     })
 
-    it('persists collapse state to settings API', async () => {
+    it('keeps collapse state browser-local without calling the settings API', async () => {
       renderApp()
 
       const toggleButton = screen.getByTitle('Hide sidebar')
       fireEvent.click(toggleButton)
 
       await waitFor(() => {
-        expect(mockApiPatch).toHaveBeenCalledWith('/api/settings', expect.objectContaining({
-          sidebar: expect.objectContaining({
-            collapsed: true,
-          }),
-        }))
+        expect(screen.queryByTestId('mock-sidebar')).not.toBeInTheDocument()
       })
+
+      expect(mockApiPatch).not.toHaveBeenCalled()
     })
   })
 
@@ -250,6 +295,19 @@ describe('App Component - Sidebar Resize', () => {
 
       const sidebar = screen.getByTestId('mock-sidebar')
       expect(sidebar.getAttribute('data-width')).toBe('288')
+    })
+
+    it('keeps resized width browser-local without calling the settings API', async () => {
+      renderApp()
+
+      fireEvent.click(screen.getByTitle('Resize sidebar'))
+      expect(screen.getByTestId('mock-sidebar')).toHaveAttribute('data-width', '338')
+
+      fireEvent.click(screen.getByTitle('Finish sidebar resize'))
+
+      await waitFor(() => {
+        expect(mockApiPatch).not.toHaveBeenCalled()
+      })
     })
   })
 

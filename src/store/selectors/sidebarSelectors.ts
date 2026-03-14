@@ -34,9 +34,9 @@ const EMPTY_STRINGS: string[] = []
 const selectProjects = (state: RootState) => state.sessions.windows?.sidebar?.projects ?? state.sessions.projects
 const selectTabs = (state: RootState) => state.tabs.tabs
 const selectPanes = (state: RootState) => state.panes
-const selectSortMode = (state: RootState) => state.settings.settings.sidebar?.sortMode || 'recency-pinned'
+const selectSortMode = (state: RootState) => state.settings.settings.sidebar?.sortMode || 'activity'
 const selectSessionActivityForSort = (state: RootState) => {
-  const sortMode = state.settings.settings.sidebar?.sortMode || 'recency-pinned'
+  const sortMode = state.settings.settings.sidebar?.sortMode || 'activity'
   if (sortMode !== 'activity') return EMPTY_ACTIVITY
   return state.sessionActivity?.sessions || EMPTY_ACTIVITY
 }

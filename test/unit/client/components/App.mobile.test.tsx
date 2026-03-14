@@ -9,6 +9,14 @@ import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
 import { networkReducer } from '@/store/networkSlice'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  mergeServerSettings,
+  resolveLocalSettings,
+  type LocalSettingsPatch,
+  type ServerSettingsPatch,
+} from '@shared/settings'
 
 // Ensure DOM is clean even if another test file forgot cleanup.
 beforeEach(() => {
@@ -100,6 +108,27 @@ vi.mock('@/store/tabRegistrySync', () => ({
   startTabRegistrySync: () => () => {},
 }))
 
+const defaultServerSettings = createDefaultServerSettings({
+  loggingDebug: defaultSettings.logging.debug,
+})
+
+function createSettingsState(options: {
+  server?: ServerSettingsPatch
+  local?: LocalSettingsPatch
+  loaded?: boolean
+} = {}) {
+  const serverSettings = mergeServerSettings(defaultServerSettings, options.server ?? {})
+  const localSettings = resolveLocalSettings(options.local)
+
+  return {
+    serverSettings,
+    localSettings,
+    settings: composeResolvedSettings(serverSettings, localSettings),
+    loaded: options.loaded ?? true,
+    lastSavedAt: undefined,
+  }
+}
+
 function createTestStore(options?: { settingsLoaded?: boolean }) {
   return configureStore({
     reducer: {
@@ -117,11 +146,7 @@ function createTestStore(options?: { settingsLoaded?: boolean }) {
         },
       }),
     preloadedState: {
-      settings: {
-        settings: defaultSettings,
-        loaded: options?.settingsLoaded ?? true,
-        lastSavedAt: undefined,
-      },
+      settings: createSettingsState({ loaded: options?.settingsLoaded ?? true }),
       tabs: {
         tabs: [{ id: 'tab-1', mode: 'shell' }],
         activeTabId: 'tab-1',
@@ -165,7 +190,10 @@ describe('App Header - Mobile Touch Targets', () => {
     localStorage.clear()
     localStorage.setItem('freshell.auth-token', 'test-token-abc123')
     mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/bootstrap') return Promise.resolve({
+        settings: defaultServerSettings,
+        platform: { platform: 'linux' },
+      })
       if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
       if (url === '/api/sessions') return Promise.resolve([])
       return Promise.resolve({})
@@ -218,7 +246,10 @@ describe('App Mobile - Sidebar Backdrop', () => {
     localStorage.clear()
     localStorage.setItem('freshell.auth-token', 'test-token-abc123')
     mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/bootstrap') return Promise.resolve({
+        settings: defaultServerSettings,
+        platform: { platform: 'linux' },
+      })
       if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
       if (url === '/api/sessions') return Promise.resolve([])
       return Promise.resolve({})
@@ -390,7 +421,10 @@ describe('App Mobile - Header Pinning', () => {
     localStorage.clear()
     localStorage.setItem('freshell.auth-token', 'test-token-abc123')
     mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/bootstrap') return Promise.resolve({
+        settings: defaultServerSettings,
+        platform: { platform: 'linux' },
+      })
       if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
       if (url === '/api/sessions') return Promise.resolve([])
       return Promise.resolve({})

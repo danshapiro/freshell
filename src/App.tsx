@@ -50,7 +50,7 @@ import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvid
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { triggerHapticFeedback } from '@/lib/mobile-haptics'
 import { X, Copy, Check, PanelLeft, AlertTriangle } from 'lucide-react'
-import { updateSettingsLocal, markSaved } from '@/store/settingsSlice'
+import { updateSettingsLocal } from '@/store/settingsSlice'
 
 import { upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
@@ -280,15 +280,15 @@ export default function App() {
       return
     }
     if (!sidebarCollapsed && !userOpenedSidebarOnMobileRef.current) {
-      dispatch(updateSettingsLocal({ sidebar: { ...settings.sidebar, collapsed: true } }))
+      dispatch(updateSettingsLocal({ sidebar: { collapsed: true } }))
     }
-  }, [isMobile, sidebarCollapsed, settings.sidebar, dispatch])
+  }, [isMobile, sidebarCollapsed, dispatch])
 
   useEffect(() => {
     if (isLandscapeTerminalView && !sidebarCollapsed) {
-      dispatch(updateSettingsLocal({ sidebar: { ...settings.sidebar, collapsed: true } }))
+      dispatch(updateSettingsLocal({ sidebar: { collapsed: true } }))
     }
-  }, [dispatch, isLandscapeTerminalView, settings.sidebar, sidebarCollapsed])
+  }, [dispatch, isLandscapeTerminalView, sidebarCollapsed])
 
   useEffect(() => {
     if (view !== 'terminal' && isFullscreen) {
@@ -304,20 +304,12 @@ export default function App() {
 
   const handleSidebarResize = useCallback((delta: number) => {
     const newWidth = Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, sidebarWidth + delta))
-    dispatch(updateSettingsLocal({ sidebar: { ...settings.sidebar, width: newWidth } }))
-  }, [sidebarWidth, settings.sidebar, dispatch])
+    dispatch(updateSettingsLocal({ sidebar: { width: newWidth } }))
+  }, [sidebarWidth, dispatch])
 
-  const handleSidebarResizeEnd = useCallback(async () => {
-    if (!settingsLoaded) return
-    try {
-      await api.patch('/api/settings', { sidebar: settings.sidebar })
-      dispatch(markSaved())
-    } catch (err) {
-      log.warn('Failed to save sidebar settings', err)
-    }
-  }, [settings.sidebar, dispatch, settingsLoaded])
+  const handleSidebarResizeEnd = useCallback(() => {}, [])
 
-  const toggleSidebarCollapse = useCallback(async () => {
+  const toggleSidebarCollapse = useCallback(() => {
     const newCollapsed = !sidebarCollapsed
     if (isMobile && !newCollapsed) {
       userOpenedSidebarOnMobileRef.current = true
@@ -325,15 +317,8 @@ export default function App() {
     } else if (isMobile && newCollapsed) {
       triggerHapticFeedback()
     }
-    dispatch(updateSettingsLocal({ sidebar: { ...settings.sidebar, collapsed: newCollapsed } }))
-    if (isMobile || !settingsLoaded) return
-    try {
-      await api.patch('/api/settings', { sidebar: { ...settings.sidebar, collapsed: newCollapsed } })
-      dispatch(markSaved())
-    } catch (err) {
-      log.warn('Failed to save sidebar settings', err)
-    }
-  }, [isMobile, sidebarCollapsed, settings.sidebar, dispatch, settingsLoaded])
+    dispatch(updateSettingsLocal({ sidebar: { collapsed: newCollapsed } }))
+  }, [isMobile, sidebarCollapsed, dispatch])
 
   // Swipe gesture: right-swipe from left edge opens sidebar, left-swipe closes it
   const swipeStartXRef = useRef(0)

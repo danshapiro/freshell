@@ -9,6 +9,12 @@ import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
 import { networkReducer } from '@/store/networkSlice'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  mergeServerSettings,
+  resolveLocalSettings,
+} from '@shared/settings'
 
 const mockSend = vi.fn()
 const mockOnMessage = vi.fn(() => () => {})
@@ -73,6 +79,22 @@ vi.mock('@use-gesture/react', () => ({
   useDrag: () => () => ({}),
 }))
 
+const defaultServerSettings = createDefaultServerSettings({
+  loggingDebug: defaultSettings.logging.debug,
+})
+
+function createSettingsState() {
+  const localSettings = resolveLocalSettings()
+
+  return {
+    serverSettings: defaultServerSettings,
+    localSettings,
+    settings: composeResolvedSettings(defaultServerSettings, localSettings),
+    loaded: true,
+    lastSavedAt: undefined,
+  }
+}
+
 function createStore() {
   return configureStore({
     reducer: {
@@ -90,7 +112,7 @@ function createStore() {
         },
       }),
     preloadedState: {
-      settings: { settings: defaultSettings, loaded: true, lastSavedAt: undefined },
+      settings: createSettingsState(),
       tabs: { tabs: [{ id: 'tab-1', mode: 'shell' }], activeTabId: 'tab-1' },
       sessions: { projects: [], expandedProjects: new Set<string>(), wsSnapshotReceived: false, isLoading: false, error: null },
       connection: { status: 'ready' as const, lastError: undefined },
@@ -110,7 +132,10 @@ describe('App mobile landscape mode', () => {
     ;(globalThis as any).setMobileForTest(true)
     Object.defineProperty(window, 'innerHeight', { value: 420, configurable: true })
     mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/bootstrap') return Promise.resolve({
+        settings: defaultServerSettings,
+        platform: { platform: 'linux' },
+      })
       if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
       if (url === '/api/sessions') return Promise.resolve([])
       return Promise.resolve({})
