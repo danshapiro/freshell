@@ -22,6 +22,7 @@ import { handleUiCommand } from '@/lib/ui-commands'
 import { getAuthToken } from '@/lib/auth'
 import { installTestHarness } from '@/lib/test-harness'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
+import { getTabSwitchShortcutDirection } from '@/lib/tab-switch-shortcuts'
 import { useThemeEffect } from '@/hooks/useTheme'
 import { useMobile } from '@/hooks/useMobile'
 import { useOrientation } from '@/hooks/useOrientation'
@@ -122,13 +123,6 @@ function parseConfigFallbackReason(value: unknown): ConfigFallbackInfo['reason']
 function hasPlatformCapabilities(value: BootstrapPlatformInfo | null | undefined): boolean {
   if (!value) return false
   return Object.keys(value.availableClis ?? {}).length > 0 || Object.keys(value.featureFlags ?? {}).length > 0
-}
-
-function getTabSwitchShortcutDirection(event: KeyboardEvent): 'prev' | 'next' | null {
-  if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey) return null
-  if (event.code === 'BracketLeft') return 'prev'
-  if (event.code === 'BracketRight') return 'next'
-  return null
 }
 
 const ReadyMessageSchema = z.object({

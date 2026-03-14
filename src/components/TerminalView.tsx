@@ -38,6 +38,7 @@ import {
 } from '@/lib/terminal-attach-seq-state'
 import { useMobile } from '@/hooks/useMobile'
 import { findLocalFilePaths } from '@/lib/path-utils'
+import { getTabSwitchShortcutDirection } from '@/lib/tab-switch-shortcuts'
 import {
   createTurnCompleteSignalParserState,
   extractTurnCompleteSignals,
@@ -1066,18 +1067,11 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
         return false
       }
 
-      // Tab switching: Ctrl+Shift+[ (prev) and Ctrl+Shift+] (next)
-      if (event.ctrlKey && event.shiftKey && !event.altKey && !event.metaKey && event.type === 'keydown' && !event.repeat) {
-        if (event.code === 'BracketLeft') {
-          event.preventDefault()
-          dispatch(switchToPrevTab())
-          return false
-        }
-        if (event.code === 'BracketRight') {
-          event.preventDefault()
-          dispatch(switchToNextTab())
-          return false
-        }
+      const tabSwitchDirection = getTabSwitchShortcutDirection(event)
+      if (tabSwitchDirection && event.type === 'keydown' && !event.repeat) {
+        event.preventDefault()
+        dispatch(tabSwitchDirection === 'prev' ? switchToPrevTab() : switchToNextTab())
+        return false
       }
 
       // Shift+Enter -> send newline (same as Ctrl+J)

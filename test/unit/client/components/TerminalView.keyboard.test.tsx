@@ -165,6 +165,58 @@ function createTestStore(terminalId?: string) {
   }
 }
 
+function createTabSwitchTestStore(activeIndex = 1) {
+  const tabs = Array.from({ length: 3 }, (_, index) => {
+    const paneContent = createTerminalContent(`req-${index + 1}`, `term-${index + 1}`)
+    return {
+      tab: {
+        id: `tab-${index + 1}`,
+        mode: 'shell' as const,
+        status: 'running' as const,
+        title: `Shell ${index + 1}`,
+        titleSetByUser: false,
+        createRequestId: paneContent.createRequestId,
+        terminalId: paneContent.terminalId,
+        createdAt: index + 1,
+      },
+      paneId: `pane-${index + 1}`,
+      paneContent,
+    }
+  })
+  const active = tabs[activeIndex]
+  const layouts = Object.fromEntries(
+    tabs.map(({ tab, paneId, paneContent }) => [tab.id, { type: 'leaf', id: paneId, content: paneContent } satisfies PaneNode]),
+  )
+  const activePane = Object.fromEntries(tabs.map(({ tab, paneId }) => [tab.id, paneId]))
+
+  return {
+    store: configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: tabs.map(({ tab }) => tab),
+          activeTabId: active.tab.id,
+        },
+        panes: {
+          layouts,
+          activePane,
+          paneTitles: {},
+        },
+        settings: { settings: defaultSettings, status: 'loaded' as const },
+        connection: { status: 'connected' as const, error: null },
+      },
+    }),
+    tabId: active.tab.id,
+    paneId: active.paneId,
+    paneContent: active.paneContent,
+  }
+}
+
 function createTerminalContent(createRequestId: string, terminalId?: string): TerminalPaneContent {
   return {
     kind: 'terminal',
@@ -462,8 +514,8 @@ describe('TerminalView keyboard handling', () => {
   })
 
   describe('tab switching shortcuts', () => {
-    it('returns false for Ctrl+Shift+[ to switch to previous tab', async () => {
-      const { store, tabId, paneId, paneContent } = createTestStore('term-1')
+    it('moves one tab left for Ctrl+Shift+[ without sending terminal input', async () => {
+      const { store, tabId, paneId, paneContent } = createTabSwitchTestStore(1)
 
       render(
         <Provider store={store}>
@@ -475,15 +527,18 @@ describe('TerminalView keyboard handling', () => {
         expect(capturedKeyHandler).not.toBeNull()
       })
 
+      const wsSendCountBefore = wsMocks.send.mock.calls.length
       const event = createKeyboardEvent('[', { ctrlKey: true, shiftKey: true })
       const result = capturedKeyHandler!(event)
 
       expect(result).toBe(false)
       expect(event.preventDefault).toHaveBeenCalled()
+      expect(store.getState().tabs.activeTabId).toBe('tab-1')
+      expect(wsMocks.send).toHaveBeenCalledTimes(wsSendCountBefore)
     })
 
-    it('returns false for Ctrl+Shift+] to switch to next tab', async () => {
-      const { store, tabId, paneId, paneContent } = createTestStore('term-1')
+    it('moves one tab right for Ctrl+Shift+] without sending terminal input', async () => {
+      const { store, tabId, paneId, paneContent } = createTabSwitchTestStore(1)
 
       render(
         <Provider store={store}>
@@ -495,11 +550,46 @@ describe('TerminalView keyboard handling', () => {
         expect(capturedKeyHandler).not.toBeNull()
       })
 
+      const wsSendCountBefore = wsMocks.send.mock.calls.length
       const event = createKeyboardEvent(']', { ctrlKey: true, shiftKey: true })
       const result = capturedKeyHandler!(event)
 
       expect(result).toBe(false)
       expect(event.preventDefault).toHaveBeenCalled()
+      expect(store.getState().tabs.activeTabId).toBe('tab-3')
+      expect(wsMocks.send).toHaveBeenCalledTimes(wsSendCountBefore)
+    })
+
+    it('ignores repeated or non-keydown bracket shortcut events', async () => {
+      const { store, tabId, paneId, paneContent } = createTabSwitchTestStore(1)
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(capturedKeyHandler).not.toBeNull()
+      })
+
+      const wsSendCountBefore = wsMocks.send.mock.calls.length
+      const repeatedEvent = createKeyboardEvent(']', { ctrlKey: true, shiftKey: true })
+      ;(repeatedEvent as any).repeat = true
+
+      const repeatedResult = capturedKeyHandler!(repeatedEvent)
+
+      expect(repeatedResult).toBe(true)
+      expect(repeatedEvent.preventDefault).not.toHaveBeenCalled()
+      expect(store.getState().tabs.activeTabId).toBe('tab-2')
+
+      const keyupEvent = createKeyboardEvent(']', { ctrlKey: true, shiftKey: true }, 'keyup')
+      const keyupResult = capturedKeyHandler!(keyupEvent)
+
+      expect(keyupResult).toBe(true)
+      expect(keyupEvent.preventDefault).not.toHaveBeenCalled()
+      expect(store.getState().tabs.activeTabId).toBe('tab-2')
+      expect(wsMocks.send).toHaveBeenCalledTimes(wsSendCountBefore)
     })
   })
 
