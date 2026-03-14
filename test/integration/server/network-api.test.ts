@@ -1398,10 +1398,22 @@ describe('Network API integration', () => {
       networkManager.resetFirewallCache()
       await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
       vi.mocked(isPortReachable).mockResolvedValue(true)
-      vi.mocked(wslModule.computeWslPortForwardingTeardownPlanAsync).mockResolvedValue({
-        status: 'ready',
-        script: '$null # mock teardown script',
-      })
+      vi.mocked(wslModule.computeWslPortForwardingTeardownPlanAsync)
+        .mockResolvedValueOnce({
+          status: 'ready',
+          script: '$null # mock teardown script',
+        })
+        .mockResolvedValueOnce({
+          status: 'ready',
+          script: '$null # mock teardown script',
+        })
+        .mockResolvedValueOnce({
+          status: 'ready',
+          script: '$null # mock teardown script',
+        })
+        .mockResolvedValue({
+          status: 'noop',
+        })
 
       const cp = await import('node:child_process')
       let finishDisable: ((error?: Error | null) => void) | null = null
@@ -1451,6 +1463,84 @@ describe('Network API integration', () => {
       expect(statusRes.body.remoteAccessRequested).toBe(false)
       expect(statusRes.body.accessUrl).toContain('localhost')
       expect(statusRes.body.accessUrl).not.toContain('192.168.1.100')
+    })
+
+    it('does not persist WSL disable settings when the elevated teardown completes but verification still finds Windows exposure', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+      await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+      vi.mocked(isPortReachable).mockResolvedValue(true)
+      vi.mocked(wslModule.computeWslPortForwardingTeardownPlanAsync)
+        .mockResolvedValueOnce({
+          status: 'ready',
+          script: '$null # mock teardown script',
+        })
+        .mockResolvedValueOnce({
+          status: 'ready',
+          script: '$null # mock teardown script',
+        })
+        .mockResolvedValue({
+          status: 'ready',
+          script: '$null # mock teardown script',
+        })
+
+      const cp = await import('node:child_process')
+      let finishDisable: ((error?: Error | null) => void) | null = null
+      vi.mocked(cp.execFile).mockImplementation((_cmd: any, _args: any, _opts: any, cb: any) => {
+        finishDisable = (error = null) => {
+          cb?.(error, '', '')
+        }
+        return { on: vi.fn() } as any
+      })
+
+      const firstRes = await request(app)
+        .post('/api/network/disable-remote-access')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(firstRes.status).toBe(200)
+      expectConfirmationRequired(firstRes.body)
+
+      const startedRes = await request(app)
+        .post('/api/network/disable-remote-access')
+        .set('x-auth-token', token)
+        .send({
+          confirmElevation: true,
+          confirmationToken: firstRes.body.confirmationToken,
+        })
+
+      expect(startedRes.status).toBe(200)
+      expect(startedRes.body).toEqual({ method: 'wsl2', status: 'started' })
+
+      finishDisable?.()
+
+      await vi.waitFor(async () => {
+        const statusRes = await request(app)
+          .get('/api/network/status')
+          .set('x-auth-token', token)
+
+        expect(statusRes.status).toBe(200)
+        expect(statusRes.body.firewall.configuring).toBe(false)
+      })
+
+      const settings = await configStore.getSettings()
+      expect(settings.network).toEqual(expect.objectContaining({
+        configured: true,
+        host: '0.0.0.0',
+      }))
+      expect(wslModule.clearManagedWslRemoteAccessPorts).not.toHaveBeenCalled()
+
+      const statusRes = await request(app)
+        .get('/api/network/status')
+        .set('x-auth-token', token)
+
+      expect(statusRes.status).toBe(200)
+      expect(statusRes.body.remoteAccessEnabled).toBe(true)
+      expect(statusRes.body.remoteAccessRequested).toBe(true)
+      expect(statusRes.body.accessUrl).toContain('192.168.1.100')
     })
 
     it('releases the confirmed repair lock when the confirmed noop disable save fails', async () => {

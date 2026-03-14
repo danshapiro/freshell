@@ -213,6 +213,32 @@ describe('SettingsView network access section', () => {
     expect(screen.getByRole('switch', { name: /remote access/i })).toBeChecked()
   })
 
+  it('surfaces a visible error when a direct remote access configure request is rejected', async () => {
+    const { api } = await import('@/lib/api')
+    vi.mocked(api.post).mockRejectedValueOnce(new Error('Configure failed'))
+
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            host: '127.0.0.1',
+            remoteAccessEnabled: false,
+            firewall: { platform: 'windows', active: true, portOpen: false, commands: ['netsh ...'], configuring: false },
+          } as any),
+        }),
+      },
+    })
+
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    fireEvent.click(screen.getByRole('switch', { name: /remote access/i }))
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(/configure failed/i)
+    })
+    expect(screen.getByRole('switch', { name: /remote access/i })).not.toBeChecked()
+  })
+
   it('shows a visible error when WSL teardown polling finishes but remote access is still enabled', async () => {
     vi.useFakeTimers()
     const { api } = await import('@/lib/api')

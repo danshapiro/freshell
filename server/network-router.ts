@@ -135,12 +135,14 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
       completedLog,
       failedLog,
       spawnFailedLog,
+      verifySuccess,
       onSuccess,
       releaseConfirmedRepair,
     }: {
       completedLog: string
       failedLog: string
       spawnFailedLog: string
+      verifySuccess?: () => Promise<void>
       onSuccess?: () => Promise<void> | void
       releaseConfirmedRepair: () => void
     },
@@ -160,13 +162,20 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
           if (err) {
             log.error({ err, stderr }, failedLog)
           } else {
-            log.info(completedLog)
-            if (onSuccess) {
-              try {
-                await onSuccess()
-              } catch (onSuccessErr) {
-                log.error({ err: onSuccessErr }, 'Failed to apply post-repair network settings')
+            try {
+              if (verifySuccess) {
+                await verifySuccess()
               }
+              log.info(completedLog)
+              if (onSuccess) {
+                try {
+                  await onSuccess()
+                } catch (onSuccessErr) {
+                  log.error({ err: onSuccessErr }, 'Failed to apply post-repair network settings')
+                }
+              }
+            } catch (verificationErr) {
+              log.error({ err: verificationErr }, failedLog)
             }
           }
           settleRepair()
@@ -312,6 +321,26 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
       confirmationAction: 'wsl2-disable',
       script: teardownPlan.script,
       responseMethod: 'wsl2',
+    }
+  }
+
+  const verifyWslRepairSuccess = async () => {
+    const plan = await computeWslPortForwardingPlanAsync(networkManager.getRemoteAccessPorts())
+    if (plan.status === 'error') {
+      throw new Error(plan.message)
+    }
+    if (plan.status === 'ready') {
+      throw new Error('WSL2 port forwarding verification failed')
+    }
+  }
+
+  const verifyWslDisableSuccess = async () => {
+    const teardownPlan = await computeWslPortForwardingTeardownPlanAsync(networkManager.getRemoteAccessPorts())
+    if (teardownPlan.status === 'error') {
+      throw new Error(teardownPlan.message)
+    }
+    if (teardownPlan.status === 'ready') {
+      throw new Error('WSL2 remote access teardown verification failed')
     }
   }
 
@@ -476,6 +505,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
               completedLog: 'WSL2 remote access teardown completed successfully',
               failedLog: 'WSL2 remote access teardown failed',
               spawnFailedLog: 'Failed to spawn PowerShell for WSL2 remote access teardown',
+              verifySuccess: verifyWslDisableSuccess,
               onSuccess: async () => {
                 await applyRemoteAccessSetting('127.0.0.1')
                 await clearManagedWslRemoteAccessPortsSafe()
@@ -601,6 +631,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
                 completedLog: 'WSL2 port forwarding completed successfully',
                 failedLog: 'WSL2 port forwarding failed',
                 spawnFailedLog: 'Failed to spawn PowerShell for WSL2 port forwarding',
+                verifySuccess: verifyWslRepairSuccess,
                 onSuccess: async () => {
                   await persistCurrentWslRemoteAccessPorts()
                 },

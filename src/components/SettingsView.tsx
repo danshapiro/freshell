@@ -501,6 +501,19 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     }
   }, [dispatch, scheduleRemoteAccessRefresh])
 
+  const requestRemoteAccessConfigure = useCallback(async (host: '127.0.0.1' | '0.0.0.0') => {
+    setRemoteAccessError(null)
+    try {
+      await dispatch(configureNetwork({
+        host,
+        configured: true,
+      })).unwrap()
+    } catch (error) {
+      log.warn('Failed to configure remote access', error)
+      setRemoteAccessError(getErrorMessage(error, 'Failed to configure remote access'))
+    }
+  }, [dispatch])
+
   const handleConfirmPendingAction = useCallback(() => {
     if (!pendingConfirmation) {
       return
@@ -1476,10 +1489,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                   setRemoteAccessError(null)
                   if (isWslRemoteAccess) {
                     if (checked) {
-                      await dispatch(configureNetwork({
-                        host: '0.0.0.0',
-                        configured: true,
-                      })).unwrap()
+                      await requestRemoteAccessConfigure('0.0.0.0')
                       return
                     }
 
@@ -1487,10 +1497,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                     return
                   }
 
-                  await dispatch(configureNetwork({
-                    host: checked ? '0.0.0.0' : '127.0.0.1',
-                    configured: true,
-                  })).unwrap()
+                  await requestRemoteAccessConfigure(checked ? '0.0.0.0' : '127.0.0.1')
                 }}
               />
             </SettingsRow>
