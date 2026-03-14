@@ -5,6 +5,7 @@ import { getFreshellConfigDir } from './freshell-home.js'
 import {
   createDefaultServerSettings,
   extractLegacyLocalSettingsSeed,
+  mergeLocalSettings,
   mergeServerSettings,
   stripLocalSettings,
   type LocalSettingsPatch,
@@ -311,7 +312,13 @@ export class ConfigStore {
       const rawSettings = migrateLegacyFreshClaudeSettings(
         isRecord(existing.settings) ? { ...existing.settings } : {},
       )
-      const legacyLocalSettingsSeed = existing.legacyLocalSettingsSeed ?? extractLegacyLocalSettingsSeed(rawSettings)
+      const extractedLegacyLocalSettingsSeed = extractLegacyLocalSettingsSeed(rawSettings)
+      const storedLegacyLocalSettingsSeed = isRecord(existing.legacyLocalSettingsSeed)
+        ? extractLegacyLocalSettingsSeed(existing.legacyLocalSettingsSeed)
+        : undefined
+      const legacyLocalSettingsSeed = storedLegacyLocalSettingsSeed
+        ? mergeLocalSettings(extractedLegacyLocalSettingsSeed, storedLegacyLocalSettingsSeed)
+        : extractedLegacyLocalSettingsSeed
       const settings = mergeServerSettings(
         createDefaultServerSettings({ loggingDebug: resolveDefaultLoggingDebug(process.env) }),
         stripLocalSettings(rawSettings) as AppSettingsPatch,

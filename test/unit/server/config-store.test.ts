@@ -243,6 +243,95 @@ describe('ConfigStore', () => {
       expect(saved.settings.sidebar.excludeFirstChatMustStart).toBe(true)
     })
 
+    it('merges existing legacyLocalSettingsSeed with moved local fields still present in settings', async () => {
+      await fsp.mkdir(configDir, { recursive: true })
+      const partiallyMigratedConfig: UserConfig = {
+        version: 1,
+        settings: {
+          ...defaultSettings,
+          terminal: {
+            ...defaultSettings.terminal,
+            fontSize: 22,
+          },
+        } as any,
+        legacyLocalSettingsSeed: {
+          theme: 'dark',
+        },
+        sessionOverrides: {},
+        terminalOverrides: {},
+        projectColors: {},
+      }
+      await fsp.writeFile(configPath, JSON.stringify(partiallyMigratedConfig, null, 2))
+
+      const store = new ConfigStore()
+      const loaded = await store.load()
+
+      expect(loaded.legacyLocalSettingsSeed).toEqual({
+        theme: 'dark',
+        terminal: {
+          fontSize: 22,
+        },
+      })
+      expect((loaded.settings.terminal as Record<string, unknown>).fontSize).toBeUndefined()
+
+      const saved = JSON.parse(await fsp.readFile(configPath, 'utf-8'))
+      expect(saved.legacyLocalSettingsSeed).toEqual({
+        theme: 'dark',
+        terminal: {
+          fontSize: 22,
+        },
+      })
+      expect(saved.settings.terminal.fontSize).toBeUndefined()
+    })
+
+    it('clamps malformed migrated local settings before exposing or persisting the legacy seed', async () => {
+      await fsp.mkdir(configDir, { recursive: true })
+      const invalidSeedConfig: UserConfig = {
+        version: 1,
+        settings: defaultSettings,
+        legacyLocalSettingsSeed: {
+          uiScale: -5,
+          terminal: {
+            fontSize: 1_000_000,
+            lineHeight: -2,
+          },
+          sidebar: {
+            width: -999,
+          },
+        },
+        sessionOverrides: {},
+        terminalOverrides: {},
+        projectColors: {},
+      }
+      await fsp.writeFile(configPath, JSON.stringify(invalidSeedConfig, null, 2))
+
+      const store = new ConfigStore()
+      const loaded = await store.load()
+
+      expect(loaded.legacyLocalSettingsSeed).toEqual({
+        uiScale: 0.75,
+        terminal: {
+          fontSize: 32,
+          lineHeight: 1,
+        },
+        sidebar: {
+          width: 200,
+        },
+      })
+
+      const saved = JSON.parse(await fsp.readFile(configPath, 'utf-8'))
+      expect(saved.legacyLocalSettingsSeed).toEqual({
+        uiScale: 0.75,
+        terminal: {
+          fontSize: 32,
+          lineHeight: 1,
+        },
+        sidebar: {
+          width: 200,
+        },
+      })
+    })
+
     it('returns null for invalid version and creates default config', async () => {
       await fsp.mkdir(configDir, { recursive: true })
       await fsp.writeFile(configPath, JSON.stringify({ version: 99, settings: {} }))

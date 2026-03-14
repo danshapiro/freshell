@@ -762,14 +762,14 @@ describe('State Edge Cases', () => {
         expect(settings.defaultCwd).toBeUndefined()
       })
 
-      it('handles rapid sequential updates', () => {
+      it('handles rapid sequential updates with range clamping', () => {
         const store = createTestStore()
 
         for (let i = 1; i <= 100; i++) {
           store.dispatch(updateSettingsLocal({ terminal: { fontSize: i } }))
         }
 
-        expect(store.getState().settings.settings.terminal.fontSize).toBe(100)
+        expect(store.getState().settings.settings.terminal.fontSize).toBe(32)
       })
     })
 
@@ -896,7 +896,7 @@ describe('State Edge Cases', () => {
     })
 
     describe('invalid settings values', () => {
-      it('handles negative numeric values', () => {
+      it('clamps negative numeric values into supported ranges', () => {
         const store = createTestStore()
 
         store.dispatch(
@@ -906,10 +906,9 @@ describe('State Edge Cases', () => {
           })
         )
 
-        // Values are stored as-is (no validation in reducer)
         const settings = store.getState().settings.settings
-        expect(settings.uiScale).toBe(-1)
-        expect(settings.terminal.fontSize).toBe(-10)
+        expect(settings.uiScale).toBe(0.75)
+        expect(settings.terminal.fontSize).toBe(12)
       })
 
       it('handles NaN and Infinity in numeric fields', () => {
@@ -927,7 +926,7 @@ describe('State Edge Cases', () => {
         expect(store.getState().settings.settings.terminal.fontSize).toBe(defaultSettings.terminal.fontSize)
       })
 
-      it('handles extremely large values', () => {
+      it('clamps extremely large values into supported ranges', () => {
         const store = createTestStore()
 
         store.dispatch(
@@ -937,7 +936,8 @@ describe('State Edge Cases', () => {
           })
         )
 
-        expect(store.getState().settings.settings.uiScale).toBe(Number.MAX_SAFE_INTEGER)
+        expect(store.getState().settings.settings.uiScale).toBe(1.5)
+        expect(store.getState().settings.settings.terminal.fontSize).toBe(32)
       })
     })
   })
@@ -1067,7 +1067,7 @@ describe('State Edge Cases', () => {
         )
 
         // Settings state valid
-        expect(state.settings.settings.terminal.fontSize).toBeGreaterThanOrEqual(10)
+        expect(state.settings.settings.terminal.fontSize).toBeGreaterThanOrEqual(12)
         expect(state.settings.settings.terminal.fontSize).toBeLessThan(30)
       })
     })
@@ -1114,10 +1114,9 @@ describe('State Edge Cases', () => {
       // This may cause UI inconsistencies if components expect proper state machine
     })
 
-    it('ISSUE: settings validation not performed in reducer', () => {
+    it('clamps invalid local settings values during reducer normalization', () => {
       const store = createTestStore()
 
-      // Can set invalid values
       store.dispatch(
         updateSettingsLocal({
           uiScale: -999,
@@ -1125,9 +1124,8 @@ describe('State Edge Cases', () => {
         })
       )
 
-      // Negative values stored without validation
-      expect(store.getState().settings.settings.uiScale).toBe(-999)
-      expect(store.getState().settings.settings.terminal.fontSize).toBe(-1)
+      expect(store.getState().settings.settings.uiScale).toBe(0.75)
+      expect(store.getState().settings.settings.terminal.fontSize).toBe(12)
     })
   })
 })

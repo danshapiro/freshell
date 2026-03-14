@@ -16,6 +16,7 @@ type BrowserPreferencesState = {
 
 type BrowserPreferencesWriteState = {
   settingsPatch?: LocalSettingsPatch
+  transientSettingsPatch?: LocalSettingsPatch
   hasPendingSearchRangeDays: boolean
   searchRangeDays: number
 }
@@ -71,6 +72,10 @@ export function resetBrowserPreferencesFlushListenersForTests() {
 
 function canUseStorage(): boolean {
   return typeof localStorage !== 'undefined'
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
 }
 
 function assignChangedScalar<T extends Record<string, unknown>, K extends keyof T>(
@@ -134,7 +139,64 @@ function buildLocalSettingsPatch(localSettings: LocalSettings): LocalSettingsPat
   return patch
 }
 
-function buildBrowserPreferencesRecord(state: BrowserPreferencesState): BrowserPreferencesRecord {
+function omitMaskedPatch<T extends Record<string, unknown>>(patch: T, mask?: Partial<T>): T {
+  if (!mask) {
+    return { ...patch }
+  }
+
+  const next: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(patch)) {
+    if (!Object.prototype.hasOwnProperty.call(mask, key)) {
+      next[key] = value
+      continue
+    }
+
+    const maskedValue = mask[key as keyof T]
+    if (isRecord(value) && isRecord(maskedValue)) {
+      const nested = omitMaskedPatch(
+        value,
+        maskedValue as Record<string, unknown>,
+      )
+      if (Object.keys(nested).length > 0) {
+        next[key] = nested
+      }
+    }
+  }
+
+  return next as T
+}
+
+function clearPatchKeys<T extends Record<string, unknown>>(patch: T | undefined, keysToClear?: Partial<T>): T | undefined {
+  if (!patch || !keysToClear) {
+    return patch
+  }
+
+  const next: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(patch)) {
+    if (!Object.prototype.hasOwnProperty.call(keysToClear, key)) {
+      next[key] = value
+      continue
+    }
+
+    const clearValue = keysToClear[key as keyof T]
+    if (isRecord(value) && isRecord(clearValue)) {
+      const nested = clearPatchKeys(
+        value,
+        clearValue as Record<string, unknown>,
+      )
+      if (nested && Object.keys(nested).length > 0) {
+        next[key] = nested
+      }
+    }
+  }
+
+  return Object.keys(next).length > 0 ? (next as T) : undefined
+}
+
+function buildBrowserPreferencesRecord(
+  state: BrowserPreferencesState,
+  transientSettingsPatch?: LocalSettingsPatch,
+): BrowserPreferencesRecord {
   const current = loadBrowserPreferencesRecord()
   const next: BrowserPreferencesRecord = {}
 
@@ -146,7 +208,10 @@ function buildBrowserPreferencesRecord(state: BrowserPreferencesState): BrowserP
     next.toolStrip = { expanded: current.toolStrip.expanded }
   }
 
-  const settingsPatch = buildLocalSettingsPatch(state.settings.localSettings)
+  const settingsPatch = omitMaskedPatch(
+    buildLocalSettingsPatch(state.settings.localSettings),
+    transientSettingsPatch,
+  )
   if (Object.keys(settingsPatch).length > 0) {
     next.settings = settingsPatch
   }
@@ -175,7 +240,9 @@ function getOrCreatePendingWriteState(getState: BrowserPreferencesMiddlewareGetS
 }
 
 function resetPendingWriteState(getState: BrowserPreferencesMiddlewareGetState) {
+  const existing = pendingWritesByGetState.get(getState)
   pendingWritesByGetState.set(getState, {
+    transientSettingsPatch: existing?.transientSettingsPatch,
     hasPendingSearchRangeDays: false,
     searchRangeDays: DEFAULT_SEARCH_RANGE_DAYS,
   })
@@ -211,7 +278,8 @@ export const browserPreferencesPersistenceMiddleware: Middleware<{}, BrowserPref
     }
 
     try {
-      const raw = JSON.stringify(buildBrowserPreferencesRecord(store.getState()))
+      const pending = getOrCreatePendingWriteState(store.getState as BrowserPreferencesMiddlewareGetState)
+      const raw = JSON.stringify(buildBrowserPreferencesRecord(store.getState(), pending.transientSettingsPatch))
       localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, raw)
       broadcastPersistedRaw(BROWSER_PREFERENCES_STORAGE_KEY, raw)
       dirty = false
@@ -238,6 +306,22 @@ export const browserPreferencesPersistenceMiddleware: Middleware<{}, BrowserPref
 
   return (next) => (action: any) => {
     const result = next(action)
+
+    if (action?.type === 'settings/updateSettingsLocal' || action?.type === 'settings/setLocalSettings') {
+      const pending = getOrCreatePendingWriteState(store.getState as BrowserPreferencesMiddlewareGetState)
+      if (action?.meta?.skipPersist) {
+        if (action?.type === 'settings/updateSettingsLocal') {
+          pending.transientSettingsPatch = mergeLocalSettings(pending.transientSettingsPatch, action.payload || {})
+        }
+        return result
+      }
+
+      if (action?.type === 'settings/updateSettingsLocal') {
+        pending.transientSettingsPatch = clearPatchKeys(pending.transientSettingsPatch, action.payload || {})
+      } else if (action?.type === 'settings/setLocalSettings') {
+        pending.transientSettingsPatch = undefined
+      }
+    }
 
     if (action?.meta?.skipPersist) {
       return result

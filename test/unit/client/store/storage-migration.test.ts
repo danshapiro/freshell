@@ -64,6 +64,34 @@ describe('storage-migration', () => {
     expect(document.cookie).not.toContain('freshell-auth=')
   })
 
+  it('preserves legacy terminal font migration when storage cleanup runs before browser preferences load', async () => {
+    localStorage.setItem('freshell_version', '2')
+    localStorage.setItem('freshell.terminal.fontFamily.v1', 'Fira Code')
+    localStorage.setItem('freshell.tabs.v1', 'legacy-tabs')
+
+    await importFreshStorageMigration()
+
+    const browserPreferences = await import('@/lib/browser-preferences')
+
+    expect(browserPreferences.loadBrowserPreferencesRecord()).toEqual({
+      settings: {
+        terminal: {
+          fontFamily: 'Fira Code',
+        },
+      },
+    })
+    expect(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY)).toBe(JSON.stringify({
+      settings: {
+        terminal: {
+          fontFamily: 'Fira Code',
+        },
+      },
+    }))
+    expect(localStorage.getItem('freshell.terminal.fontFamily.v1')).toBeNull()
+    expect(localStorage.getItem('freshell.tabs.v1')).toBeNull()
+    expect(localStorage.getItem('freshell_version')).toBe('3')
+  })
+
   it('keeps migration bootstrap order deterministic in static imports', async () => {
     const mainSource = (await import('@/main.tsx?raw')).default as string
     const storeSource = (await import('@/store/store.ts?raw')).default as string

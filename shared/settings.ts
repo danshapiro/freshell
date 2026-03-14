@@ -25,6 +25,16 @@ const CLAUDE_PERMISSION_MODE_VALUES = ['default', 'plan', 'acceptEdits', 'bypass
 const EXTERNAL_EDITOR_VALUES = ['auto', 'cursor', 'code', 'custom'] as const
 const NETWORK_HOST_VALUES = ['127.0.0.1', '0.0.0.0'] as const
 const AGENT_CHAT_EFFORT_VALUES = ['low', 'medium', 'high', 'max'] as const
+const UI_SCALE_MIN = 0.75
+const UI_SCALE_MAX = 1.5
+const TERMINAL_FONT_SIZE_MIN = 12
+const TERMINAL_FONT_SIZE_MAX = 32
+const TERMINAL_LINE_HEIGHT_MIN = 1
+const TERMINAL_LINE_HEIGHT_MAX = 1.8
+const PANE_SNAP_THRESHOLD_MIN = 0
+const PANE_SNAP_THRESHOLD_MAX = 8
+const SIDEBAR_WIDTH_MIN = 200
+const SIDEBAR_WIDTH_MAX = 500
 
 const TERMINAL_LOCAL_KEYS = [
   'fontSize',
@@ -295,26 +305,56 @@ function maybeAssignNested(
   }
 }
 
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value))
+}
+
+function normalizeClampedNumber(value: unknown, min: number, max: number): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return undefined
+  }
+  return clampNumber(value, min, max)
+}
+
+function normalizeRoundedClampedNumber(value: unknown, min: number, max: number): number | undefined {
+  const normalized = normalizeClampedNumber(value, min, max)
+  if (normalized === undefined) {
+    return undefined
+  }
+  return Math.round(normalized)
+}
+
 function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSettingsPatch | undefined {
   const normalized: LocalSettingsPatch = {}
 
   if (ThemeSchema.safeParse(patch.theme).success) {
     normalized.theme = patch.theme as ThemeMode
   }
-  if (typeof patch.uiScale === 'number' && Number.isFinite(patch.uiScale)) {
-    normalized.uiScale = patch.uiScale as number
+  const normalizedUiScale = normalizeClampedNumber(patch.uiScale, UI_SCALE_MIN, UI_SCALE_MAX)
+  if (normalizedUiScale !== undefined) {
+    normalized.uiScale = normalizedUiScale
   }
 
   if (isRecord(patch.terminal)) {
     const terminal: LocalSettingsPatch['terminal'] = {}
-    if (typeof patch.terminal.fontSize === 'number' && Number.isFinite(patch.terminal.fontSize)) {
-      terminal.fontSize = patch.terminal.fontSize as number
+    const normalizedFontSize = normalizeRoundedClampedNumber(
+      patch.terminal.fontSize,
+      TERMINAL_FONT_SIZE_MIN,
+      TERMINAL_FONT_SIZE_MAX,
+    )
+    if (normalizedFontSize !== undefined) {
+      terminal.fontSize = normalizedFontSize
     }
     if (typeof patch.terminal.fontFamily === 'string') {
       terminal.fontFamily = patch.terminal.fontFamily
     }
-    if (typeof patch.terminal.lineHeight === 'number' && Number.isFinite(patch.terminal.lineHeight)) {
-      terminal.lineHeight = patch.terminal.lineHeight as number
+    const normalizedLineHeight = normalizeClampedNumber(
+      patch.terminal.lineHeight,
+      TERMINAL_LINE_HEIGHT_MIN,
+      TERMINAL_LINE_HEIGHT_MAX,
+    )
+    if (normalizedLineHeight !== undefined) {
+      terminal.lineHeight = normalizedLineHeight
     }
     if (typeof patch.terminal.cursorBlink === 'boolean') {
       terminal.cursorBlink = patch.terminal.cursorBlink
@@ -338,8 +378,13 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
 
   if (isRecord(patch.panes)) {
     const panes: LocalSettingsPatch['panes'] = {}
-    if (typeof patch.panes.snapThreshold === 'number' && Number.isFinite(patch.panes.snapThreshold)) {
-      panes.snapThreshold = patch.panes.snapThreshold as number
+    const normalizedSnapThreshold = normalizeRoundedClampedNumber(
+      patch.panes.snapThreshold,
+      PANE_SNAP_THRESHOLD_MIN,
+      PANE_SNAP_THRESHOLD_MAX,
+    )
+    if (normalizedSnapThreshold !== undefined) {
+      panes.snapThreshold = normalizedSnapThreshold
     }
     if (typeof patch.panes.iconsOnTabs === 'boolean') {
       panes.iconsOnTabs = patch.panes.iconsOnTabs as boolean
@@ -375,8 +420,13 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
     if (typeof patch.sidebar.hideEmptySessions === 'boolean') {
       sidebar.hideEmptySessions = patch.sidebar.hideEmptySessions as boolean
     }
-    if (typeof patch.sidebar.width === 'number' && Number.isFinite(patch.sidebar.width)) {
-      sidebar.width = patch.sidebar.width as number
+    const normalizedSidebarWidth = normalizeRoundedClampedNumber(
+      patch.sidebar.width,
+      SIDEBAR_WIDTH_MIN,
+      SIDEBAR_WIDTH_MAX,
+    )
+    if (normalizedSidebarWidth !== undefined) {
+      sidebar.width = normalizedSidebarWidth
     }
     if (typeof patch.sidebar.collapsed === 'boolean') {
       sidebar.collapsed = patch.sidebar.collapsed as boolean

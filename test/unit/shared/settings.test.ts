@@ -132,6 +132,34 @@ describe('shared settings contract', () => {
     })
   })
 
+  it('clamps migrated local numeric values into supported ranges when extracting a legacy seed', () => {
+    expect(extractLegacyLocalSettingsSeed({
+      uiScale: -5,
+      terminal: {
+        fontSize: 1_000_000,
+        lineHeight: -2,
+      },
+      panes: {
+        snapThreshold: 99,
+      },
+      sidebar: {
+        width: -999,
+      },
+    })).toEqual({
+      uiScale: 0.75,
+      terminal: {
+        fontSize: 32,
+        lineHeight: 1,
+      },
+      panes: {
+        snapThreshold: 8,
+      },
+      sidebar: {
+        width: 200,
+      },
+    })
+  })
+
   it('strips moved local settings while preserving server-backed settings', () => {
     const rawMixedSettings = {
       theme: 'dark',
