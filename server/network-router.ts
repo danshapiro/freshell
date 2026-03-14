@@ -45,8 +45,6 @@ const REMOTE_ACCESS_DISABLED_SUCCESS = {
   message: 'Remote access disabled',
 } as const
 
-export const FIREWALL_CONFIRMATION_TTL_MS = 30_000
-
 type ConfirmationAction = 'windows-repair' | 'wsl2-repair' | 'wsl2-disable'
 
 type ConfirmableRepairAction = {
@@ -84,21 +82,10 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
   const { networkManager, configStore, wsHandler, detectLanIps } = deps
   const router = Router()
   const FIREWALL_REPAIR_LOCKED = Symbol('FIREWALL_REPAIR_LOCKED')
-  let currentConfirmation: { token: string; action: ConfirmationAction; expiresAt: number } | null = null
+  let currentConfirmation: { token: string; action: ConfirmationAction } | null = null
   let confirmedRepairInFlight = false
 
-  const getCurrentConfirmation = () => {
-    if (currentConfirmation === null) {
-      return null
-    }
-
-    if (currentConfirmation.expiresAt <= Date.now()) {
-      currentConfirmation = null
-      return null
-    }
-
-    return currentConfirmation
-  }
+  const getCurrentConfirmation = () => currentConfirmation
 
   const consumeCurrentConfirmation = (token: string | undefined) => {
     const confirmation = getCurrentConfirmation()
@@ -194,6 +181,10 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
         })()
       })
 
+      if (!settled) {
+        networkManager.setFirewallConfiguring(true)
+      }
+
       child.on('error', (err) => {
         log.error({ err }, spawnFailedLog)
         settleRepair()
@@ -209,7 +200,6 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
     currentConfirmation = {
       token: confirmationToken,
       action,
-      expiresAt: Date.now() + FIREWALL_CONFIRMATION_TTL_MS,
     }
     return {
       ...WINDOWS_ELEVATION_CONFIRMATION,
@@ -239,7 +229,6 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
     }
 
     confirmedRepairInFlight = true
-    networkManager.setFirewallConfiguring(true)
     let released = false
     return () => {
       if (released) {

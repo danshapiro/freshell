@@ -263,10 +263,16 @@ export class NetworkManager {
       : []
     const remoteAccessEnabled = firewallInfo.platform === 'wsl2'
       ? rawPortOpen === true
-      : remoteAccessRequested && portOpen !== false
-    const remoteAccessNeedsRepair = firewallInfo.platform === 'wsl2'
+      : remoteAccessRequested && rawPortOpen === true
+    const remoteAccessNeedsRepair = (
+      firewallInfo.platform === 'wsl2'
       && remoteAccessRequested
       && portOpen === false
+    ) || (
+      firewallInfo.platform === 'windows'
+      && remoteAccessRequested
+      && staleUpgradeExposure
+    )
     const shareRouteEnabled = remoteAccessEnabled
       || (
         firewallInfo.platform === 'wsl2'

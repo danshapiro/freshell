@@ -359,7 +359,7 @@ describe('NetworkManager', () => {
     expect(status.firewall.portOpen).toBe(false)
   })
 
-  it('builds cleanup commands for stale native Windows dev-mode API-port rules on upgrade', async () => {
+  it('keeps remote access enabled while flagging stale native Windows dev-mode API-port rules for cleanup', async () => {
     const firewallModule = await import('../../../server/firewall.js')
     const portReachable = await import('is-port-reachable')
     vi.mocked(firewallModule.detectFirewall).mockResolvedValue({
@@ -387,8 +387,11 @@ describe('NetworkManager', () => {
 
     const status = await manager.getStatus()
 
-    expect(status.remoteAccessEnabled).toBe(false)
+    expect(status.remoteAccessEnabled).toBe(true)
     expect((status as any).remoteAccessRequested).toBe(true)
+    expect((status as any).remoteAccessNeedsRepair).toBe(true)
+    expect(status.accessUrl).toContain('192.168.1.100:5173')
+    expect(status.accessUrl).not.toContain('localhost')
     expect(status.firewall.portOpen).toBe(false)
     expect(status.firewall.commands).toContain(
       'netsh advfirewall firewall delete rule name="Freshell (port 9876)" 2>$null',

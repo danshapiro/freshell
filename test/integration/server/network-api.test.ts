@@ -9,7 +9,7 @@ import request from 'supertest'
 import isPortReachable from 'is-port-reachable'
 import { NetworkManager } from '../../../server/network-manager.js'
 import { createLocalFileRouter } from '../../../server/local-file-router.js'
-import { createNetworkRouter, FIREWALL_CONFIRMATION_TTL_MS } from '../../../server/network-router.js'
+import { createNetworkRouter } from '../../../server/network-router.js'
 import { ConfigStore } from '../../../server/config-store.js'
 import { httpAuthMiddleware } from '../../../server/auth.js'
 import { detectFirewall } from '../../../server/firewall.js'
@@ -306,6 +306,78 @@ describe('Network API integration', () => {
           method: 'none',
           message: 'No configuration changes required',
         })
+      } finally {
+        await devNetworkManager.stop()
+        await new Promise<void>((resolve, reject) => {
+          devServer.close((err) => {
+            if (err) reject(err)
+            else resolve()
+          })
+        })
+      }
+    })
+
+    it('keeps native Windows dev-mode remote access enabled while prompting stale cleanup for the old API port', async () => {
+      const devConfigStore = new ConfigStore()
+      const devServer = http.createServer()
+      const devNetworkManager = new NetworkManager(devServer, devConfigStore, 3001, true, 5173)
+      const devApp = express()
+      devApp.use(express.json())
+      devApp.use('/api', httpAuthMiddleware)
+      devApp.use('/api', createNetworkRouter({
+        networkManager: devNetworkManager,
+        configStore: devConfigStore,
+        wsHandler: { broadcast: vi.fn() },
+        detectLanIps: () => ['192.168.1.100'],
+      }))
+
+      await devConfigStore.patchSettings({
+        network: {
+          configured: true,
+          host: '0.0.0.0',
+        },
+      })
+      await new Promise<void>((resolve) => devServer.listen(0, '0.0.0.0', resolve))
+
+      const cp = await import('node:child_process')
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'windows',
+        active: true,
+      })
+      vi.mocked(isPortReachable).mockResolvedValue(true)
+      vi.mocked(cp.execFile).mockImplementation((cmd: any, args: any, _opts: any, cb: any) => {
+        if (cmd === 'netsh' && args.at(-1) === 'name=Freshell (port 3001)') {
+          cb?.(null, 'Rule Name: Freshell (port 3001)\n', '')
+          return { on: vi.fn() } as any
+        }
+        if (cmd === 'netsh') {
+          cb?.(Object.assign(new Error('rule not found'), { code: 1 }), '', '')
+          return { on: vi.fn() } as any
+        }
+        cb?.(null, '', '')
+        return { on: vi.fn() } as any
+      })
+      devNetworkManager.resetFirewallCache()
+
+      try {
+        const statusRes = await request(devApp)
+          .get('/api/network/status')
+          .set('x-auth-token', token)
+
+        expect(statusRes.status).toBe(200)
+        expect(statusRes.body.remoteAccessEnabled).toBe(true)
+        expect(statusRes.body.remoteAccessNeedsRepair).toBe(true)
+        expect(statusRes.body.accessUrl).toContain('192.168.1.100:5173')
+        expect(statusRes.body.accessUrl).not.toContain('localhost')
+        expect(statusRes.body.firewall.portOpen).toBe(false)
+
+        const firstRes = await request(devApp)
+          .post('/api/network/configure-firewall')
+          .set('x-auth-token', token)
+          .send({})
+
+        expect(firstRes.status).toBe(200)
+        expectConfirmationRequired(firstRes.body)
       } finally {
         await devNetworkManager.stop()
         await new Promise<void>((resolve, reject) => {
@@ -1081,41 +1153,6 @@ describe('Network API integration', () => {
       expectConfirmationRequired(replayRes.body)
     })
 
-    it('re-prompts when a confirmation token expires before the confirmed retry arrives', async () => {
-      vi.useFakeTimers()
-      vi.mocked(detectFirewall).mockResolvedValue({
-        platform: 'windows',
-        active: true,
-      })
-      networkManager.resetFirewallCache()
-
-      const cp = await import('node:child_process')
-      try {
-        const firstRes = await request(app)
-          .post('/api/network/configure-firewall')
-          .set('x-auth-token', token)
-          .send({})
-
-        expectConfirmationRequired(firstRes.body)
-
-        vi.advanceTimersByTime(FIREWALL_CONFIRMATION_TTL_MS + 1)
-
-        const confirmedRes = await request(app)
-          .post('/api/network/configure-firewall')
-          .set('x-auth-token', token)
-          .send({
-            confirmElevation: true,
-            confirmationToken: firstRes.body.confirmationToken,
-          })
-
-        expect(confirmedRes.status).toBe(200)
-        expectConfirmationRequired(confirmedRes.body)
-        expect(cp.execFile).not.toHaveBeenCalled()
-      } finally {
-        vi.useRealTimers()
-      }
-    })
-
     it('re-prompts when a confirmation token is for the wrong platform', async () => {
       vi.mocked(detectFirewall)
         .mockResolvedValueOnce({
@@ -1271,6 +1308,13 @@ describe('Network API integration', () => {
         method: 'in-progress',
       })
 
+      const statusDuringLockRes = await request(app)
+        .get('/api/network/status')
+        .set('x-auth-token', token)
+
+      expect(statusDuringLockRes.status).toBe(200)
+      expect(statusDuringLockRes.body.firewall.configuring).toBe(false)
+
       releasePlan()
 
       const startedRes = await startedResPromise
@@ -1328,6 +1372,13 @@ describe('Network API integration', () => {
       expect(startedRes.body).toEqual({ method: 'wsl2', status: 'started' })
 
       vi.mocked(wslModule.computeWslPortForwardingPlanAsync).mockClear()
+
+      const statusWhileRunningRes = await request(app)
+        .get('/api/network/status')
+        .set('x-auth-token', token)
+
+      expect(statusWhileRunningRes.status).toBe(200)
+      expect(statusWhileRunningRes.body.firewall.configuring).toBe(true)
 
       const secondFirstRes = await request(app)
         .post('/api/network/configure-firewall')
