@@ -16,6 +16,7 @@ import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer, type NetworkState, type NetworkStatusResponse } from '@/store/networkSlice'
 import tabRegistryReducer, { type TabRegistryState } from '@/store/tabRegistrySlice'
 import type { RegistryTabRecord } from '@/store/tabRegistryTypes'
+import { serverSettingsSaveStateMiddleware } from '@/store/settingsThunks'
 import type { AppSettings } from '@/store/types'
 import type { DeepPartial } from '@/lib/type-utils'
 import type { ClientExtensionEntry } from '@shared/extension-types'
@@ -187,7 +188,7 @@ export function createSettingsViewStore(options: CreateSettingsViewStoreOptions 
         serializableCheck: {
           ignoredPaths: ['sessions.expandedProjects'],
         },
-      }),
+      }).concat(serverSettingsSaveStateMiddleware),
     preloadedState: {
       settings: createSettingsState(settings, settingsState),
       extensions: {

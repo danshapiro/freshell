@@ -3,8 +3,6 @@ import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import {
   defaultSettings,
   mergeSettings,
-  previewServerSettingsPatch,
-  setServerSettings,
   updateSettingsLocal,
 } from '@/store/settingsSlice'
 import {
@@ -31,7 +29,11 @@ import type {
   LocalSettingsPatch,
   ServerSettingsPatch,
 } from '@/store/types'
-import { saveServerSettingsPatch } from '@/store/settingsThunks'
+import {
+  discardStagedServerSettingsPatch,
+  saveServerSettingsPatch,
+  stageServerSettingsPatchPreview,
+} from '@/store/settingsThunks'
 import { configureNetwork, fetchNetworkStatus, type NetworkStatusResponse } from '@/store/networkSlice'
 import { addTab } from '@/store/tabsSlice'
 import { initLayout } from '@/store/panesSlice'
@@ -232,7 +234,6 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
 
   const dispatch = useAppDispatch()
   const rawSettings = useAppSelector((s) => s.settings.settings)
-  const serverSettings = useAppSelector((s) => s.settings.serverSettings)
   const settings = useMemo(
     () => mergeSettings(defaultSettings, rawSettings || {}),
     [rawSettings],
@@ -253,6 +254,10 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   )
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const cliProviderConfigs = useMemo(() => getCliProviderConfigs(extensionEntries), [extensionEntries])
+  const liveCliProviderNames = useMemo(
+    () => new Set(cliProviderConfigs.map((config) => config.name)),
+    [cliProviderConfigs],
+  )
   const tabRegistryState = useAppSelector((s) => (s as any).tabRegistry)
   const tabRegistry = tabRegistryState ?? {
     deviceId: 'local-device',
@@ -287,11 +292,6 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   const remoteAccessRefreshRequestRef = useRef(0)
   const defaultCwdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const serverTextSaveTimerRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
-  const serverTextPendingPreviewRef = useRef<Record<string, {
-    confirmedServerSettings: typeof serverSettings
-    order: number
-  }>>({})
-  const nextServerTextPreviewOrderRef = useRef(1)
   const defaultCwdValidationRef = useRef(0)
   const lastSettingsDefaultCwdRef = useRef(settings.defaultCwd ?? '')
   const lastSettingsExcludeFirstChatRef = useRef(
@@ -324,16 +324,14 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
       if (firewallRefreshTimerRef.current) clearTimeout(firewallRefreshTimerRef.current)
       if (remoteAccessRefreshTimerRef.current) clearTimeout(remoteAccessRefreshTimerRef.current)
       if (defaultCwdTimerRef.current) clearTimeout(defaultCwdTimerRef.current)
-      const pendingServerTextEntries = Object.entries(serverTextPendingPreviewRef.current)
-        .sort(([, left], [, right]) => left.order - right.order)
+      const pendingServerTextKeys = Object.keys(serverTextSaveTimerRef.current)
       for (const timer of Object.values(serverTextSaveTimerRef.current)) {
         clearTimeout(timer)
       }
-      if (pendingServerTextEntries.length > 0) {
-        dispatch(setServerSettings(pendingServerTextEntries[0][1].confirmedServerSettings))
+      for (const key of pendingServerTextKeys) {
+        dispatch(discardStagedServerSettingsPatch(key))
       }
       serverTextSaveTimerRef.current = {}
-      serverTextPendingPreviewRef.current = {}
       for (const timer of Object.values(providerCwdTimerRef.current)) {
         clearTimeout(timer)
       }
@@ -592,26 +590,18 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   }, [dispatch])
 
   const scheduleServerTextSettingSave = useCallback((key: string, updates: ServerSettingsPatch) => {
-    if (!serverTextPendingPreviewRef.current[key]) {
-      serverTextPendingPreviewRef.current[key] = {
-        confirmedServerSettings: serverSettings,
-        order: nextServerTextPreviewOrderRef.current++,
-      }
-    }
-    dispatch(previewServerSettingsPatch(updates))
+    dispatch(stageServerSettingsPatchPreview({ key, patch: updates }))
     if (serverTextSaveTimerRef.current[key]) {
       clearTimeout(serverTextSaveTimerRef.current[key])
     }
     serverTextSaveTimerRef.current[key] = setTimeout(() => {
-      const confirmedServerSettings = serverTextPendingPreviewRef.current[key]?.confirmedServerSettings
       delete serverTextSaveTimerRef.current[key]
-      delete serverTextPendingPreviewRef.current[key]
       void dispatch(saveServerSettingsPatch({
         patch: updates,
-        confirmedServerSettings,
+        stagedKey: key,
       }))
     }, SERVER_TEXT_SETTINGS_DEBOUNCE_MS)
-  }, [dispatch, serverSettings])
+  }, [dispatch])
 
   useEffect(() => {
     const next = settings.defaultCwd ?? ''
@@ -740,11 +730,12 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   }, [applyServerSetting])
 
   const setProviderEnabled = useCallback((provider: CodingCliProviderName, enabled: boolean) => {
+    const sanitizedEnabledProviders = enabledProviders.filter((candidate) => liveCliProviderNames.has(candidate))
     const next = enabled
-      ? Array.from(new Set([...enabledProviders, provider]))
-      : enabledProviders.filter((p) => p !== provider)
+      ? Array.from(new Set([...sanitizedEnabledProviders, provider]))
+      : sanitizedEnabledProviders.filter((candidate) => candidate !== provider)
     applyServerSetting({ codingCli: { enabledProviders: next } })
-  }, [applyServerSetting, enabledProviders])
+  }, [applyServerSetting, enabledProviders, liveCliProviderNames])
 
   const knownDevices = useMemo(() => {
     return buildKnownDevices({

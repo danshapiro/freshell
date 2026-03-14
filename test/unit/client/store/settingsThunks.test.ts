@@ -3,9 +3,11 @@ import { configureStore } from '@reduxjs/toolkit'
 
 import settingsReducer, { setServerSettings } from '@/store/settingsSlice'
 import {
+  discardStagedServerSettingsPatch,
   resetServerSettingsSaveQueueForTests,
   saveServerSettingsPatch,
   serverSettingsSaveStateMiddleware,
+  stageServerSettingsPatchPreview,
 } from '@/store/settingsThunks'
 
 const apiPatch = vi.fn()
@@ -226,6 +228,58 @@ describe('settingsThunks', () => {
     expect(warnSpy).toHaveBeenCalledWith('[settingsThunks]', 'Failed to save server settings patch', expect.any(Error))
 
     warnSpy.mockRestore()
+  })
+
+  it('reapplies staged debounced previews when an authoritative settings update arrives before save dispatch', () => {
+    const store = makeStore()
+    const authoritativeBaseline = store.getState().settings.serverSettings
+
+    store.dispatch(stageServerSettingsPatchPreview({
+      key: 'editor.customEditorCommand',
+      patch: {
+        editor: {
+          customEditorCommand: 'vim +{line} {file}',
+        },
+      },
+    }))
+
+    store.dispatch(setServerSettings({
+      ...authoritativeBaseline,
+      terminal: {
+        ...authoritativeBaseline.terminal,
+        scrollback: 12000,
+      },
+    }))
+
+    expect(store.getState().settings.settings.editor.customEditorCommand).toBe('vim +{line} {file}')
+    expect(store.getState().settings.settings.terminal.scrollback).toBe(12000)
+  })
+
+  it('discarding a staged debounced preview preserves newer authoritative server settings', () => {
+    const store = makeStore()
+    const authoritativeBaseline = store.getState().settings.serverSettings
+
+    store.dispatch(stageServerSettingsPatchPreview({
+      key: 'editor.customEditorCommand',
+      patch: {
+        editor: {
+          customEditorCommand: 'vim +{line} {file}',
+        },
+      },
+    }))
+
+    store.dispatch(setServerSettings({
+      ...authoritativeBaseline,
+      terminal: {
+        ...authoritativeBaseline.terminal,
+        scrollback: 12000,
+      },
+    }))
+
+    store.dispatch(discardStagedServerSettingsPatch('editor.customEditorCommand'))
+
+    expect(store.getState().settings.settings.editor.customEditorCommand).toBeUndefined()
+    expect(store.getState().settings.settings.terminal.scrollback).toBe(12000)
   })
 
   it('preserves an intervening authoritative settings update when an in-flight save later rejects', async () => {

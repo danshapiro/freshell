@@ -3,7 +3,7 @@ import { createAsyncThunk, type Middleware } from '@reduxjs/toolkit'
 import { api } from '@/lib/api'
 import { createLogger } from '@/lib/client-logger'
 import { mergeServerSettings, stripLocalSettings, type ServerSettings, type ServerSettingsPatch } from '@shared/settings'
-import { markSaved, previewServerSettingsPatch, setServerSettings, type SettingsState } from './settingsSlice'
+import { markSaved, setServerSettings, type SettingsState } from './settingsSlice'
 
 const log = createLogger('settingsThunks')
 
@@ -70,17 +70,29 @@ export function normalizeServerSettingsPatchForApi(patch: ServerSettingsPatch): 
 type SaveServerSettingsGetState = () => { settings: Pick<SettingsState, 'serverSettings'> }
 type PendingServerSettingsPatch = {
   id: number
+  sequence: number
+  patch: ServerSettingsPatch
+}
+type StagedServerSettingsPatch = {
+  key: string
+  sequence: number
+  patch: ServerSettingsPatch
+}
+type StageServerSettingsPatchPreviewArgs = {
+  key: string
   patch: ServerSettingsPatch
 }
 type SaveServerSettingsPatchArgs = ServerSettingsPatch | {
   patch: ServerSettingsPatch
   confirmedServerSettings?: ServerSettings
+  stagedKey?: string
 }
 type SaveServerSettingsPatchEnvelope = Extract<SaveServerSettingsPatchArgs, { patch: ServerSettingsPatch }>
 type SaveServerSettingsState = {
   queue: Promise<void>
   confirmedServerSettings?: ServerSettings
   pendingPatches: PendingServerSettingsPatch[]
+  stagedPatches: StagedServerSettingsPatch[]
 }
 type SaveQueueMeta = {
   saveQueueReconcile?: boolean
@@ -88,12 +100,14 @@ type SaveQueueMeta = {
 
 let saveServerSettingsStateByGetState = new WeakMap<SaveServerSettingsGetState, SaveServerSettingsState>()
 let nextPendingServerSettingsPatchId = 1
+let nextServerSettingsPatchSequence = 1
 
 type DispatchLike = (action: unknown) => unknown
 
 export function resetServerSettingsSaveQueueForTests() {
   saveServerSettingsStateByGetState = new WeakMap()
   nextPendingServerSettingsPatchId = 1
+  nextServerSettingsPatchSequence = 1
 }
 
 function getOrCreateSaveServerSettingsState(getState: SaveServerSettingsGetState): SaveServerSettingsState {
@@ -105,6 +119,7 @@ function getOrCreateSaveServerSettingsState(getState: SaveServerSettingsGetState
   const created: SaveServerSettingsState = {
     queue: Promise.resolve(),
     pendingPatches: [],
+    stagedPatches: [],
   }
   saveServerSettingsStateByGetState.set(getState, created)
   return created
@@ -118,7 +133,7 @@ function isSaveServerSettingsPatchEnvelope(
 
 function normalizeSaveServerSettingsPatchArgs(
   args: SaveServerSettingsPatchArgs,
-): { patch: ServerSettingsPatch; confirmedServerSettings?: ServerSettings } {
+): { patch: ServerSettingsPatch; confirmedServerSettings?: ServerSettings; stagedKey?: string } {
   if (isSaveServerSettingsPatchEnvelope(args)) {
     const confirmedServerSettings = isServerSettings(args.confirmedServerSettings)
       ? args.confirmedServerSettings
@@ -126,6 +141,7 @@ function normalizeSaveServerSettingsPatchArgs(
     return {
       patch: isRecord(args.patch) ? args.patch : {},
       confirmedServerSettings,
+      stagedKey: typeof args.stagedKey === 'string' ? args.stagedKey : undefined,
     }
   }
 
@@ -136,9 +152,12 @@ function normalizeSaveServerSettingsPatchArgs(
 
 function buildVisibleServerSettings(
   confirmedServerSettings: ServerSettings,
+  stagedPatches: StagedServerSettingsPatch[],
   pendingPatches: PendingServerSettingsPatch[],
 ): ServerSettings {
-  return pendingPatches.reduce(
+  return [...stagedPatches, ...pendingPatches]
+    .sort((left, right) => left.sequence - right.sequence)
+    .reduce(
     (settings, pendingPatch) => mergeServerSettings(settings, pendingPatch.patch),
     confirmedServerSettings,
   )
@@ -162,7 +181,11 @@ function reconcileVisibleServerSettings(
 
   dispatch({
     ...setServerSettings(
-      buildVisibleServerSettings(saveState.confirmedServerSettings, saveState.pendingPatches),
+      buildVisibleServerSettings(
+        saveState.confirmedServerSettings,
+        saveState.stagedPatches,
+        saveState.pendingPatches,
+      ),
     ),
     meta: { saveQueueReconcile: true },
   })
@@ -173,6 +196,23 @@ function removePendingServerSettingsPatch(
   patchId: number,
 ) {
   saveState.pendingPatches = saveState.pendingPatches.filter((pendingPatch) => pendingPatch.id !== patchId)
+}
+
+function removeStagedServerSettingsPatch(
+  saveState: SaveServerSettingsState,
+  key: string,
+) {
+  saveState.stagedPatches = saveState.stagedPatches.filter((stagedPatch) => stagedPatch.key !== key)
+}
+
+function ensureConfirmedServerSettings(
+  saveState: SaveServerSettingsState,
+  getState: SaveServerSettingsGetState,
+  confirmedServerSettings?: ServerSettings,
+) {
+  if (!saveState.confirmedServerSettings) {
+    saveState.confirmedServerSettings = confirmedServerSettings ?? getState().settings.serverSettings
+  }
 }
 
 function queueServerSettingsSave(
@@ -222,9 +262,13 @@ export const serverSettingsSaveStateMiddleware: Middleware<
   }
 
   saveState.confirmedServerSettings = action.payload
-  if (saveState.pendingPatches.length > 0) {
+  if (saveState.pendingPatches.length > 0 || saveState.stagedPatches.length > 0) {
     storeApi.dispatch({
-      ...setServerSettings(buildVisibleServerSettings(action.payload, saveState.pendingPatches)),
+      ...setServerSettings(buildVisibleServerSettings(
+        action.payload,
+        saveState.stagedPatches,
+        saveState.pendingPatches,
+      )),
       meta: { saveQueueReconcile: true },
     })
   }
@@ -232,18 +276,63 @@ export const serverSettingsSaveStateMiddleware: Middleware<
   return result
 }
 
+export function stageServerSettingsPatchPreview(args: StageServerSettingsPatchPreviewArgs) {
+  return (dispatch: DispatchLike, getState: SaveServerSettingsGetState) => {
+    if (typeof args.key !== 'string' || !args.key) {
+      return
+    }
+
+    const saveState = getOrCreateSaveServerSettingsState(getState)
+    ensureConfirmedServerSettings(saveState, getState)
+    removeStagedServerSettingsPatch(saveState, args.key)
+    saveState.stagedPatches = [
+      ...saveState.stagedPatches,
+      {
+        key: args.key,
+        patch: isRecord(args.patch) ? args.patch : {},
+        sequence: nextServerSettingsPatchSequence++,
+      },
+    ]
+    reconcileVisibleServerSettings(dispatch, saveState)
+  }
+}
+
+export function discardStagedServerSettingsPatch(key: string) {
+  return (dispatch: DispatchLike, getState: SaveServerSettingsGetState) => {
+    if (typeof key !== 'string' || !key) {
+      return
+    }
+
+    const saveState = getOrCreateSaveServerSettingsState(getState)
+    if (!saveState.confirmedServerSettings) {
+      return
+    }
+
+    removeStagedServerSettingsPatch(saveState, key)
+    reconcileVisibleServerSettings(dispatch, saveState)
+  }
+}
+
 export const saveServerSettingsPatch = createAsyncThunk(
   'settings/saveServerSettingsPatch',
   async (args: SaveServerSettingsPatchArgs, { dispatch, getState }) => {
-    const { patch, confirmedServerSettings } = normalizeSaveServerSettingsPatchArgs(args)
+    const { patch, confirmedServerSettings, stagedKey } = normalizeSaveServerSettingsPatchArgs(args)
     const typedGetState = getState as SaveServerSettingsGetState
     const saveState = getOrCreateSaveServerSettingsState(typedGetState)
-    if (saveState.pendingPatches.length === 0) {
-      saveState.confirmedServerSettings = confirmedServerSettings ?? typedGetState().settings.serverSettings
+    ensureConfirmedServerSettings(saveState, typedGetState, confirmedServerSettings)
+    const stagedPatch = stagedKey
+      ? saveState.stagedPatches.find((candidate) => candidate.key === stagedKey)
+      : undefined
+    if (stagedKey) {
+      removeStagedServerSettingsPatch(saveState, stagedKey)
     }
     const patchId = nextPendingServerSettingsPatchId++
-    saveState.pendingPatches = [...saveState.pendingPatches, { id: patchId, patch }]
-    dispatch(previewServerSettingsPatch(patch))
+    const patchSequence = stagedPatch?.sequence ?? nextServerSettingsPatchSequence++
+    saveState.pendingPatches = [
+      ...saveState.pendingPatches,
+      { id: patchId, sequence: patchSequence, patch },
+    ]
+    reconcileVisibleServerSettings(dispatch, saveState)
     await queueServerSettingsSave(dispatch, typedGetState, patch, patchId)
   },
 )

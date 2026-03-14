@@ -3,7 +3,7 @@ import { render, screen, fireEvent, cleanup, act } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import SettingsView from '@/components/SettingsView'
-import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
+import settingsReducer, { defaultSettings, setServerSettings } from '@/store/settingsSlice'
 import { networkReducer } from '@/store/networkSlice'
 import type { AppSettings } from '@/store/types'
 import type { DeepPartial } from '@/lib/type-utils'
@@ -29,6 +29,7 @@ vi.mock('@/lib/api', () => ({
 }))
 
 import { api } from '@/lib/api'
+import { serverSettingsSaveStateMiddleware } from '@/store/settingsThunks'
 
 const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn())
 
@@ -68,6 +69,7 @@ function createTestStore(settingsOverrides?: DeepPartial<AppSettings>) {
       settings: settingsReducer,
       network: networkReducer,
     },
+    middleware: (getDefault) => getDefault().concat(serverSettingsSaveStateMiddleware),
     preloadedState: {
       settings: {
         serverSettings,
@@ -286,7 +288,7 @@ describe('SettingsView Editor section', () => {
       patch: {
         editor: { customEditorCommand: 'vim +{line} {file}' },
       },
-      confirmedServerSettings: expect.any(Object),
+      stagedKey: 'editor.customEditorCommand',
     })
     expect(api.patch).toHaveBeenCalledWith('/api/settings', {
       editor: { customEditorCommand: 'vim +{line} {file}' },
@@ -320,7 +322,7 @@ describe('SettingsView Editor section', () => {
       patch: {
         editor: { customEditorCommand: 'vim +{line} {file}' },
       },
-      confirmedServerSettings: expect.any(Object),
+      stagedKey: 'editor.customEditorCommand',
     })
     expect(api.patch).toHaveBeenCalledTimes(1)
     expect(api.patch).toHaveBeenCalledWith('/api/settings', {
@@ -373,6 +375,40 @@ describe('SettingsView Editor section', () => {
     })
 
     expect(api.patch).not.toHaveBeenCalled()
+  })
+
+  it('preserves a pending debounced custom command through authoritative updates and discards only that preview on unmount', () => {
+    const store = createTestStore({
+      editor: { externalEditor: 'custom' },
+      terminal: { scrollback: 1000 },
+    })
+    const authoritativeBaseline = store.getState().settings.serverSettings
+    const { unmount } = render(
+      <Provider store={store}>
+        <SettingsView />
+      </Provider>
+    )
+
+    const input = screen.getByPlaceholderText('nvim +{line} {file}')
+    fireEvent.change(input, { target: { value: 'vim +{line} {file}' } })
+
+    store.dispatch(setServerSettings({
+      ...authoritativeBaseline,
+      terminal: {
+        ...authoritativeBaseline.terminal,
+        scrollback: 12000,
+      },
+    }))
+
+    expect(store.getState().settings.settings.editor?.customEditorCommand).toBe('vim +{line} {file}')
+    expect(store.getState().settings.settings.terminal.scrollback).toBe(12000)
+    expect(screen.getByDisplayValue('vim +{line} {file}')).toBeInTheDocument()
+
+    unmount()
+
+    expect(store.getState().settings.settings.editor?.customEditorCommand).toBeUndefined()
+    expect(store.getState().settings.settings.terminal.scrollback).toBe(12000)
+    expect(saveServerSettingsPatchSpy).not.toHaveBeenCalled()
   })
 
   it('displays existing custom command value', () => {

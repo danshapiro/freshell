@@ -244,6 +244,29 @@ describe('SettingsView behavior sections', () => {
       expect(store.getState().settings.settings.codingCli.enabledProviders).not.toContain('codex')
     })
 
+    it('filters removed provider names out of enabledProviders when toggling a live provider', async () => {
+      const store = createSettingsViewStore({
+        settings: {
+          codingCli: {
+            enabledProviders: ['codex', 'removed-provider'],
+          },
+        },
+      })
+      renderSettingsView(store)
+
+      const row = screen.getByText('Enable Codex CLI').closest('div')!
+      const toggle = row.querySelector('button')!
+      fireEvent.click(toggle)
+
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
+        codingCli: { enabledProviders: [] },
+      })
+    })
+
     it('debounces codex model saves and sends only the latest value', async () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
