@@ -16,6 +16,7 @@
 - The likely failure is input routing, not reorder persistence. `App` and `TerminalView` both handle the same shortcut today, so a focused terminal can dispatch two tab-switch actions for one physical keypress.
 - Keep terminal-local handling. Removing the xterm-side handler would risk letting xterm translate the bracket shortcut into terminal input before the global listener runs.
 - Make the global listener a fallback, not a competitor. The clean contract is: the focused surface calls `preventDefault()` when it owns the shortcut, and the window-level handler exits when `event.defaultPrevented` is already true.
+- Reuse the existing browser test helpers instead of introducing new xterm-driving patterns in the plan. This repo already has a `terminal` fixture for focusing xterm reliably; the regression should lean on that abstraction rather than hard-coding new direct selectors beyond what the helper already encapsulates.
 - Reordered tabs are the user-visible proof, so add a real browser regression that drags tabs into a new order and then presses the shortcut from the focused terminal.
 - Add one fast unit regression for the routing contract so the bug stays easy to diagnose locally without paying the Playwright startup cost every time.
 - No `docs/index.html` update is needed. This is a bug fix to existing shortcut behavior, not a new user-facing workflow.
@@ -37,11 +38,12 @@
 In `test/e2e-browser/specs/tab-management.spec.ts`, add:
 
 ```ts
-  test('Ctrl+Shift+brackets follow reordered tab order from a focused terminal', async ({ freshellPage, page, harness }) => {
+  test('Ctrl+Shift+brackets follow reordered tab order from a focused terminal', async ({ freshellPage, page, harness, terminal }) => {
     const addButton = page.locator('[data-context="tab-add"]')
     await addButton.click()
     await addButton.click()
     await harness.waitForTabCount(3)
+    await terminal.waitForTerminal()
     await harness.waitForTerminalStatus('running')
 
     const stateBefore = await harness.getState()
@@ -70,15 +72,23 @@ In `test/e2e-browser/specs/tab-management.spec.ts`, add:
     const orderedIds = reordered.tabs.tabs.map((tab: { id: string }) => tab.id)
     const startingActiveId = reordered.tabs.activeTabId as string
     const startingIndex = orderedIds.indexOf(startingActiveId)
+    const expectedPrevId = orderedIds[(startingIndex - 1 + orderedIds.length) % orderedIds.length]
     const expectedNextId = orderedIds[(startingIndex + 1) % orderedIds.length]
 
-    await page.locator('.xterm:visible').first().click()
+    await terminal.getTerminalContainer().click()
+    await page.keyboard.press('Control+Shift+[')
+    await expect.poll(() => harness.getActiveTabId()).toBe(expectedPrevId)
+
+    await terminal.getTerminalContainer().click()
+    await page.keyboard.press('Control+Shift+]')
+    await expect.poll(() => harness.getActiveTabId()).toBe(startingActiveId)
+
+    await terminal.getTerminalContainer().click()
     await page.keyboard.press('Control+Shift+]')
     await expect.poll(() => harness.getActiveTabId()).toBe(expectedNextId)
 
-    await page.locator('.xterm:visible').first().click()
-    await page.keyboard.press('Control+Shift+[')
-    await expect.poll(() => harness.getActiveTabId()).toBe(startingActiveId)
+    // This test intentionally drives the terminal-focused path only.
+    // Existing App keyboard tests already cover the non-terminal fallback owner.
   })
 ```
 
@@ -299,6 +309,7 @@ Then:
 
 Important detail:
 - Keep `TerminalView` as the terminal-focused owner so the shortcut still returns `false` to xterm and never becomes terminal input.
+- Keep repeat filtering in `TerminalView`, not in the shared helper. The helper should answer only “does this modifier/code combination mean prev/next tab?”, while each caller remains responsible for its own event-lifecycle concerns (`keydown` vs `keyup`, repeat suppression, and whether the event has already been consumed).
 
 **Step 4: Re-run the focused helper and client tests**
 
@@ -332,10 +343,12 @@ Run:
 ```bash
 npm run test:vitest -- test/unit/client/components/App.test.tsx test/unit/client/components/TerminalView.keyboard.test.tsx test/unit/client/lib/tab-switch-shortcuts.test.ts
 npm run test:e2e:chromium -- test/e2e-browser/specs/tab-management.spec.ts
+npm run lint
 ```
 
 Expected:
 - PASS across the focused unit and browser coverage
+- PASS for lint on the touched client files
 
 **Step 2: If this execution turn includes landing to main, run the coordinated full suite before any merge**
 
@@ -374,3 +387,5 @@ git merge --ff-only trycycle-tab-rotation-after-reorder
 
 Important detail:
 - Never run a normal `git merge` directly on `main`. The repo is serving this session from `main`, and conflict markers there would break the running server.
+
+Use `@trycycle-executing` to carry this out task-by-task without collapsing or reordering the red/green/refactor sequence.
