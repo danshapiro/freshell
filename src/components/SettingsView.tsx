@@ -2,9 +2,7 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import {
   defaultSettings,
-  markSaved,
   mergeSettings,
-  previewServerSettingsPatch,
   updateSettingsLocal,
 } from '@/store/settingsSlice'
 import {
@@ -31,7 +29,7 @@ import type {
   LocalSettingsPatch,
   ServerSettingsPatch,
 } from '@/store/types'
-import type { DeepPartial } from '@/lib/type-utils'
+import { saveServerSettingsPatch } from '@/store/settingsThunks'
 import { configureNetwork, fetchNetworkStatus, type NetworkStatusResponse } from '@/store/networkSlice'
 import { addTab } from '@/store/tabsSlice'
 import { initLayout } from '@/store/panesSlice'
@@ -39,7 +37,6 @@ import {
   fetchFirewallConfig,
   type ConfigureFirewallResult,
 } from '@/lib/firewall-configure'
-import { normalizeServerSettingsPatchForApi } from '@/store/settingsThunks'
 import { nanoid } from '@reduxjs/toolkit'
 import type { AppView } from '@/components/Sidebar'
 import { getCliProviderConfigs } from '@/lib/coding-cli-utils'
@@ -283,7 +280,6 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   )
   const [deviceNameInputs, setDeviceNameInputs] = useState<Record<string, string>>({})
   const terminalAdvancedId = useId()
-  const pendingRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const firewallRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const firewallRefreshRequestRef = useRef(0)
   const remoteAccessRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -316,17 +312,8 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     [previewTheme],
   )
 
-  const patch = useMemo(
-    () => async (updates: ServerSettingsPatch) => {
-      await api.patch('/api/settings', normalizeServerSettingsPatchForApi(updates))
-      dispatch(markSaved())
-    },
-    [dispatch],
-  )
-
   useEffect(() => {
     return () => {
-      if (pendingRef.current) clearTimeout(pendingRef.current)
       if (firewallRefreshTimerRef.current) clearTimeout(firewallRefreshTimerRef.current)
       if (remoteAccessRefreshTimerRef.current) clearTimeout(remoteAccessRefreshTimerRef.current)
       if (defaultCwdTimerRef.current) clearTimeout(defaultCwdTimerRef.current)
@@ -583,18 +570,9 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     dispatch(updateSettingsLocal(updates))
   }, [dispatch])
 
-  const scheduleSave = useCallback((updates: ServerSettingsPatch) => {
-    if (pendingRef.current) clearTimeout(pendingRef.current)
-    pendingRef.current = setTimeout(() => {
-      patch(updates).catch((err) => log.warn('Failed to save settings', err))
-      pendingRef.current = null
-    }, 500)
-  }, [patch])
-
   const applyServerSetting = useCallback((updates: ServerSettingsPatch) => {
-    dispatch(previewServerSettingsPatch(updates))
-    scheduleSave(updates)
-  }, [dispatch, scheduleSave])
+    void dispatch(saveServerSettingsPatch(updates))
+  }, [dispatch])
 
   useEffect(() => {
     const next = settings.defaultCwd ?? ''

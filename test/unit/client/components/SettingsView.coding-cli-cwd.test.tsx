@@ -1,12 +1,18 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
-import { render, screen, cleanup, act } from '@testing-library/react'
+import { render, screen, cleanup, act, fireEvent } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import SettingsView from '@/components/SettingsView'
-import settingsReducer, { updateSettingsLocal } from '@/store/settingsSlice'
+import settingsReducer, { defaultSettings, setServerSettings } from '@/store/settingsSlice'
 import { networkReducer } from '@/store/networkSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import type { ClientExtensionEntry } from '@shared/extension-types'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  mergeServerSettings,
+  resolveLocalSettings,
+} from '@shared/settings'
 
 vi.mock('@/lib/api', () => ({
   api: {
@@ -14,6 +20,19 @@ vi.mock('@/lib/api', () => ({
     post: vi.fn().mockResolvedValue({ valid: true }),
   },
 }))
+
+const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn())
+
+vi.mock('@/store/settingsThunks', async () => {
+  const actual = await vi.importActual<typeof import('@/store/settingsThunks')>('@/store/settingsThunks')
+  return {
+    ...actual,
+    saveServerSettingsPatch: (patch: unknown) => {
+      saveServerSettingsPatchSpy(patch)
+      return actual.saveServerSettingsPatch(patch as any)
+    },
+  }
+})
 
 const defaultCliExtensions: ClientExtensionEntry[] = [
   {
@@ -43,7 +62,12 @@ const defaultCliExtensions: ClientExtensionEntry[] = [
   },
 ]
 
+const defaultServerSettings = createDefaultServerSettings({
+  loggingDebug: defaultSettings.logging.debug,
+})
+
 function createTestStore() {
+  const localSettings = resolveLocalSettings()
   return configureStore({
     reducer: {
       settings: settingsReducer,
@@ -52,26 +76,9 @@ function createTestStore() {
     },
     preloadedState: {
       settings: {
-        settings: {
-          theme: 'system',
-          uiScale: 1,
-          terminal: {
-            fontSize: 14,
-            fontFamily: 'monospace',
-            lineHeight: 1.2,
-            cursorBlink: true,
-            scrollback: 5000,
-            theme: 'auto',
-          },
-          safety: { autoKillIdleMinutes: 180 },
-          sidebar: { sortMode: 'activity', showProjectBadges: true, width: 288, collapsed: false },
-          panes: { defaultNewPane: 'ask' },
-          codingCli: {
-            enabledProviders: ['claude', 'codex'],
-            providers: {},
-          },
-          logging: { debug: false },
-        },
+        serverSettings: defaultServerSettings,
+        localSettings,
+        settings: composeResolvedSettings(defaultServerSettings, localSettings),
         loaded: true,
         lastSavedAt: Date.now(),
       },
@@ -85,10 +92,13 @@ function createTestStore() {
 describe('SettingsView coding CLI cwd', () => {
   beforeEach(() => {
     localStorage.clear()
+    saveServerSettingsPatchSpy.mockReset()
+    vi.useFakeTimers()
   })
 
   afterEach(() => {
     cleanup()
+    vi.useRealTimers()
   })
 
   it('renders starting directory inputs for configured providers', () => {
@@ -114,32 +124,22 @@ describe('SettingsView coding CLI cwd', () => {
   })
 
   it('shows initial cwd value from settings', () => {
+    const localSettings = resolveLocalSettings()
+    const serverSettings = mergeServerSettings(defaultServerSettings, {
+      codingCli: {
+        enabledProviders: ['claude'],
+        providers: {
+          claude: { cwd: '/home/user/work' },
+        },
+      },
+    })
     const store = configureStore({
       reducer: { settings: settingsReducer, network: networkReducer, extensions: extensionsReducer },
       preloadedState: {
         settings: {
-          settings: {
-            theme: 'system',
-            uiScale: 1,
-            terminal: {
-              fontSize: 14,
-              fontFamily: 'monospace',
-              lineHeight: 1.2,
-              cursorBlink: true,
-              scrollback: 5000,
-              theme: 'auto',
-            },
-            safety: { autoKillIdleMinutes: 180 },
-            sidebar: { sortMode: 'activity', showProjectBadges: true, width: 288, collapsed: false },
-            panes: { defaultNewPane: 'ask' },
-            codingCli: {
-              enabledProviders: ['claude'],
-              providers: {
-                claude: { cwd: '/home/user/work' },
-              },
-            },
-            logging: { debug: false },
-          },
+          serverSettings,
+          localSettings,
+          settings: composeResolvedSettings(serverSettings, localSettings),
           loaded: true,
           lastSavedAt: Date.now(),
         },
@@ -172,11 +172,33 @@ describe('SettingsView coding CLI cwd', () => {
 
     // Simulate external settings update (e.g. from WebSocket broadcast)
     act(() => {
-      store.dispatch(updateSettingsLocal({
+      store.dispatch(setServerSettings(mergeServerSettings(store.getState().settings.serverSettings, {
         codingCli: { providers: { claude: { cwd: '/new/path' } } },
-      } as any))
+      })))
     })
 
     expect(claudeInput.value).toBe('/new/path')
+  })
+
+  it('validates cwd changes through saveServerSettingsPatch and updates state optimistically', async () => {
+    const store = createTestStore()
+    render(
+      <Provider store={store}>
+        <SettingsView />
+      </Provider>
+    )
+
+    const claudeInput = screen.getByLabelText('Claude CLI starting directory')
+    fireEvent.change(claudeInput, { target: { value: '/tmp/project' } })
+
+    await act(async () => {
+      vi.advanceTimersByTime(500)
+      await Promise.resolve()
+    })
+
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      codingCli: { providers: { claude: { cwd: '/tmp/project' } } },
+    })
+    expect(store.getState().settings.settings.codingCli.providers.claude?.cwd).toBe('/tmp/project')
   })
 })

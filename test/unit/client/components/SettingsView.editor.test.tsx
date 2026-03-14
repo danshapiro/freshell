@@ -7,6 +7,15 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import { networkReducer } from '@/store/networkSlice'
 import type { AppSettings } from '@/store/types'
 import type { DeepPartial } from '@/lib/type-utils'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  extractLegacyLocalSettingsSeed,
+  mergeServerSettings,
+  resolveLocalSettings,
+  stripLocalSettings,
+  type ServerSettingsPatch,
+} from '@shared/settings'
 
 // Mock the API
 vi.mock('@/lib/api', () => ({
@@ -21,6 +30,23 @@ vi.mock('@/lib/api', () => ({
 
 import { api } from '@/lib/api'
 
+const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn())
+
+vi.mock('@/store/settingsThunks', async () => {
+  const actual = await vi.importActual<typeof import('@/store/settingsThunks')>('@/store/settingsThunks')
+  return {
+    ...actual,
+    saveServerSettingsPatch: (patch: unknown) => {
+      saveServerSettingsPatchSpy(patch)
+      return actual.saveServerSettingsPatch(patch as any)
+    },
+  }
+})
+
+const defaultServerSettings = createDefaultServerSettings({
+  loggingDebug: defaultSettings.logging.debug,
+})
+
 function createTestStore(settingsOverrides?: DeepPartial<AppSettings>) {
   const settings = settingsOverrides
     ? {
@@ -29,6 +55,13 @@ function createTestStore(settingsOverrides?: DeepPartial<AppSettings>) {
         editor: { ...defaultSettings.editor, ...(settingsOverrides.editor || {}) },
       }
     : defaultSettings
+  const serverSettings = mergeServerSettings(
+    defaultServerSettings,
+    stripLocalSettings(settings as unknown as Record<string, unknown>) as ServerSettingsPatch,
+  )
+  const localSettings = resolveLocalSettings(
+    extractLegacyLocalSettingsSeed(settings as unknown as Record<string, unknown>),
+  )
 
   return configureStore({
     reducer: {
@@ -37,7 +70,9 @@ function createTestStore(settingsOverrides?: DeepPartial<AppSettings>) {
     },
     preloadedState: {
       settings: {
-        settings,
+        serverSettings,
+        localSettings,
+        settings: composeResolvedSettings(serverSettings, localSettings),
         loaded: true,
         lastSavedAt: undefined,
       },
@@ -50,6 +85,7 @@ describe('SettingsView Editor section', () => {
     localStorage.clear()
     vi.useFakeTimers()
     vi.clearAllMocks()
+    saveServerSettingsPatchSpy.mockReset()
   })
 
   afterEach(() => {
@@ -119,7 +155,7 @@ describe('SettingsView Editor section', () => {
     expect(dropdown).toHaveValue('cursor')
   })
 
-  it('dispatches settings update when dropdown changes', async () => {
+  it('dispatches saveServerSettingsPatch when dropdown changes', async () => {
     const store = createTestStore()
     render(
       <Provider store={store}>
@@ -136,6 +172,9 @@ describe('SettingsView Editor section', () => {
       vi.advanceTimersByTime(500)
     })
 
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      editor: { externalEditor: 'code' },
+    })
     expect(api.patch).toHaveBeenCalledWith('/api/settings', {
       editor: { externalEditor: 'code' },
     })
@@ -224,7 +263,7 @@ describe('SettingsView Editor section', () => {
     expect(screen.queryByPlaceholderText('nvim +{line} {file}')).not.toBeInTheDocument()
   })
 
-  it('dispatches custom command update when typing in the input', async () => {
+  it('dispatches saveServerSettingsPatch when typing in the custom command input', async () => {
     const store = createTestStore({ editor: { externalEditor: 'custom' } })
     render(
       <Provider store={store}>
@@ -243,6 +282,9 @@ describe('SettingsView Editor section', () => {
       vi.advanceTimersByTime(500)
     })
 
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      editor: { customEditorCommand: 'vim +{line} {file}' },
+    })
     expect(api.patch).toHaveBeenCalledWith('/api/settings', {
       editor: { customEditorCommand: 'vim +{line} {file}' },
     })
