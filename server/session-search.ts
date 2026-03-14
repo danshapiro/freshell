@@ -28,7 +28,7 @@ export const SearchResultSchema = z.object({
   summary: z.string().optional(),
   matchedIn: z.enum(['title', 'userMessage', 'assistantMessage', 'summary']),
   snippet: z.string().optional(),
-  updatedAt: z.number(),
+  lastActivityAt: z.number(),
   createdAt: z.number().optional(),
   archived: z.boolean().optional(),
   cwd: z.string().optional(),
@@ -79,7 +79,7 @@ export function searchTitleTier(
           summary: session.summary,
           matchedIn: titleMatch ? 'title' : 'summary',
           snippet: titleMatch ? session.title : session.summary,
-          updatedAt: session.updatedAt,
+          lastActivityAt: session.lastActivityAt,
           createdAt: session.createdAt,
           archived: session.archived,
           cwd: session.cwd,
@@ -96,7 +96,7 @@ function sortWithArchived(a: SearchResult, b: SearchResult): number {
   const aArchived = !!a.archived
   const bArchived = !!b.archived
   if (aArchived !== bArchived) return aArchived ? 1 : -1
-  return b.updatedAt - a.updatedAt
+  return b.lastActivityAt - a.lastActivityAt
 }
 
 function extractTextFromContent(content: unknown): string {
@@ -195,7 +195,7 @@ export async function searchSessionFile(
   filePath: string,
   query: string,
   tier: 'userMessages' | 'fullText'
-): Promise<Omit<SearchResult, 'sessionId' | 'projectPath' | 'updatedAt'> | null> {
+): Promise<Omit<SearchResult, 'sessionId' | 'projectPath' | 'lastActivityAt'> | null> {
   const q = query.toLowerCase()
 
   let handle: fs.promises.FileHandle | null = null
@@ -305,7 +305,7 @@ export async function searchSessions(
       if (!sessionFile) continue
 
       const searchTier = tier === SearchTier.UserMessages ? 'userMessages' : 'fullText'
-      let match: Omit<SearchResult, 'sessionId' | 'projectPath' | 'updatedAt'> | null = null
+      let match: Omit<SearchResult, 'sessionId' | 'projectPath' | 'lastActivityAt'> | null = null
       try {
         match = await searchSessionFile(provider, sessionFile, query, searchTier)
       } catch {
@@ -322,7 +322,7 @@ export async function searchSessions(
           summary: session.summary,
           matchedIn: match.matchedIn!,
           snippet: match.snippet,
-          updatedAt: session.updatedAt,
+          lastActivityAt: session.lastActivityAt,
           createdAt: session.createdAt,
           archived: session.archived,
           cwd: session.cwd,
@@ -334,7 +334,7 @@ export async function searchSessions(
     if (results.length >= limit || budgetExceeded) break
   }
 
-  // Sort by updatedAt descending
+  // Sort by lastActivityAt descending
   results.sort(sortWithArchived)
 
   return {

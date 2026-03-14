@@ -21,7 +21,7 @@ describe('CLI commands', () => {
             provider: 'claude',
             sessionId: 'session-1',
             projectPath: '/repo/alpha',
-            updatedAt: 100,
+            lastActivityAt: 100,
             title: 'Alpha',
           },
         ],
@@ -48,6 +48,7 @@ describe('CLI commands', () => {
           expect.objectContaining({
             provider: 'claude',
             sessionId: 'session-1',
+            lastActivityAt: 100,
             title: 'Alpha',
           }),
         ],
@@ -63,7 +64,7 @@ describe('CLI commands', () => {
             provider: 'claude',
             sessionId: 'session-1',
             projectPath: '/repo/alpha',
-            updatedAt: 100,
+            lastActivityAt: 100,
             title: 'Alpha deploy',
             snippet: 'Alpha deploy',
             matchedIn: 'title',
@@ -89,6 +90,7 @@ describe('CLI commands', () => {
       results: [
         expect.objectContaining({
           sessionId: 'session-1',
+          lastActivityAt: 100,
           matchedIn: 'title',
           snippet: 'Alpha deploy',
         }),

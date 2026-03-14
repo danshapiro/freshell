@@ -5,14 +5,14 @@ import type { ProjectGroup, CodingCliSession } from '../../../server/coding-cli/
 function makeSession(
   provider: 'claude' | 'codex',
   sessionId: string,
-  updatedAt: number,
+  lastActivityAt: number,
   projectPath = '/project/a',
 ): CodingCliSession {
   return {
     provider,
     sessionId,
     projectPath,
-    updatedAt,
+    lastActivityAt,
     title: `Session ${sessionId}`,
   }
 }
@@ -49,10 +49,10 @@ describe('paginateProjects', () => {
     const result = paginateProjects(projects, { limit: 2 })
     expect(result.hasMore).toBe(true)
     expect(result.totalSessions).toBe(3)
-    // Should include the 2 most recent (updatedAt 300, 200)
+    // Should include the 2 most recent (lastActivityAt 300, 200)
     const allSessions = result.projects.flatMap(p => p.sessions)
     expect(allSessions).toHaveLength(2)
-    const timestamps = allSessions.map(s => s.updatedAt).sort((a, b) => b - a)
+    const timestamps = allSessions.map(s => s.lastActivityAt).sort((a, b) => b - a)
     expect(timestamps).toEqual([300, 200])
     expect(result.oldestIncludedTimestamp).toBe(200)
   })
@@ -99,10 +99,10 @@ describe('paginateProjects', () => {
     ]
 
     const result = paginateProjects(projects, { before: 300, limit: 10 })
-    // Should only include sessions with updatedAt < 300
+    // Should only include sessions with lastActivityAt < 300
     const allSessions = result.projects.flatMap(p => p.sessions)
     expect(allSessions).toHaveLength(2)
-    expect(allSessions.every(s => s.updatedAt < 300)).toBe(true)
+    expect(allSessions.every(s => s.lastActivityAt < 300)).toBe(true)
     expect(result.oldestIncludedTimestamp).toBe(100)
     expect(result.hasMore).toBe(false)
   })
@@ -116,7 +116,7 @@ describe('paginateProjects', () => {
       ]),
     ]
 
-    // Page 1: get first 2 (sorted by updatedAt desc, then sessionId desc)
+    // Page 1: get first 2 (sorted by lastActivityAt desc, then sessionId desc)
     const page1 = paginateProjects(projects, { limit: 2 })
     const page1Sessions = page1.projects.flatMap(p => p.sessions)
     expect(page1Sessions).toHaveLength(2)
@@ -140,7 +140,7 @@ describe('paginateProjects', () => {
   it('handles cross-provider sessionId collisions with compound cursor', () => {
     const projects: ProjectGroup[] = [
       makeProject('/a', [
-        // Same sessionId, same updatedAt, different providers
+        // Same sessionId, same lastActivityAt, different providers
         makeSession('claude', 'same-id', 1000, '/a'),
         makeSession('codex', 'same-id', 1000, '/a'),
         makeSession('claude', 'other', 500, '/a'),
@@ -161,7 +161,7 @@ describe('paginateProjects', () => {
     })
     const page2Sessions = page2.projects.flatMap(p => p.sessions)
     expect(page2Sessions).toHaveLength(1)
-    expect(page2Sessions[0].updatedAt).toBe(500)
+    expect(page2Sessions[0].lastActivityAt).toBe(500)
     expect(page2.hasMore).toBe(false)
   })
 
@@ -189,7 +189,7 @@ describe('paginateProjects', () => {
     })
     expect(page2.hasMore).toBe(true)
     const page2Sessions = page2.projects.flatMap(p => p.sessions)
-    const page2Timestamps = page2Sessions.map(s => s.updatedAt).sort((a, b) => b - a)
+    const page2Timestamps = page2Sessions.map(s => s.lastActivityAt).sort((a, b) => b - a)
     expect(page2Timestamps).toEqual([300, 200])
     expect(page2.oldestIncludedTimestamp).toBe(200)
 
@@ -202,7 +202,7 @@ describe('paginateProjects', () => {
     expect(page3.hasMore).toBe(false)
     const page3Sessions = page3.projects.flatMap(p => p.sessions)
     expect(page3Sessions).toHaveLength(1)
-    expect(page3Sessions[0].updatedAt).toBe(100)
+    expect(page3Sessions[0].lastActivityAt).toBe(100)
   })
 
   it('handles empty input', () => {

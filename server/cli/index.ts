@@ -21,7 +21,7 @@ type SessionDirectoryItem = {
   summary?: string
   snippet?: string
   matchedIn?: 'title' | 'summary' | 'firstUserMessage'
-  updatedAt: number
+  lastActivityAt: number
   createdAt?: number
   archived?: boolean
   cwd?: string
@@ -182,7 +182,7 @@ export function sessionDirectoryPageToProjects(page: SessionDirectoryPage) {
       provider: item.provider,
       sessionId: item.sessionId,
       projectPath: item.projectPath,
-      updatedAt: item.updatedAt,
+      lastActivityAt: item.lastActivityAt,
       createdAt: item.createdAt,
       archived: item.archived,
       cwd: item.cwd,
@@ -202,7 +202,7 @@ export function sessionDirectoryPageToSearchResponse(page: SessionDirectoryPage,
       summary: item.summary,
       matchedIn: item.matchedIn === 'firstUserMessage' ? 'userMessage' : item.matchedIn ?? 'title',
       snippet: item.snippet,
-      updatedAt: item.updatedAt,
+      lastActivityAt: item.lastActivityAt,
       createdAt: item.createdAt,
       archived: item.archived,
       cwd: item.cwd,

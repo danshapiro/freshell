@@ -20,7 +20,7 @@ describe('GET /api/session-directory', () => {
           provider: 'claude',
           sessionId: 'session-1',
           projectPath: '/repo/alpha',
-          updatedAt: 100,
+          lastActivityAt: 100,
           title: 'Alpha deploy',
           firstUserMessage: 'deploy alpha',
         },
@@ -28,7 +28,7 @@ describe('GET /api/session-directory', () => {
           provider: 'claude',
           sessionId: 'session-2',
           projectPath: '/repo/alpha',
-          updatedAt: 50,
+          lastActivityAt: 50,
           title: 'Routine cleanup',
         },
       ],
@@ -71,6 +71,7 @@ describe('GET /api/session-directory', () => {
 
     expect(res.status).toBe(200)
     expect(res.body.items.map((item: { sessionId: string }) => item.sessionId)).toEqual(['session-1'])
+    expect(res.body.items[0].lastActivityAt).toBe(100)
     expect(res.body.nextCursor).toBeTruthy()
     expect(typeof res.body.revision).toBe('number')
   })
@@ -83,6 +84,7 @@ describe('GET /api/session-directory', () => {
     expect(res.status).toBe(200)
     expect(res.body.items).toHaveLength(1)
     expect(res.body.items[0].sessionId).toBe('session-1')
+    expect(res.body.items[0].lastActivityAt).toBe(100)
   })
 
   it('removes legacy read-model routes', async () => {

@@ -35,7 +35,7 @@ describe('session-search types', () => {
         title: 'Fix the bug',
         matchedIn: 'title',
         snippet: 'Fix the bug in login',
-        updatedAt: Date.now(),
+        lastActivityAt: Date.now(),
       }
       expect(() => SearchResultSchema.parse(result)).not.toThrow()
     })
@@ -50,7 +50,7 @@ describe('session-search types', () => {
         sessionId: 'abc123',
         projectPath: '/home/user/project',
         matchedIn: 'title',
-        updatedAt: Date.now(),
+        lastActivityAt: Date.now(),
       }
       expect(() => SearchResultSchema.parse(invalid)).toThrow()
     })
@@ -66,7 +66,7 @@ describe('searchTitleTier()', () => {
           provider: 'claude',
           sessionId: 'session-1',
           projectPath: '/home/user/project-a',
-          updatedAt: 1000,
+          lastActivityAt: 1000,
           title: 'Fix the login bug',
           cwd: '/home/user/project-a',
         },
@@ -74,7 +74,7 @@ describe('searchTitleTier()', () => {
           provider: 'claude',
           sessionId: 'session-2',
           projectPath: '/home/user/project-a',
-          updatedAt: 2000,
+          lastActivityAt: 2000,
           title: 'Add user authentication',
           cwd: '/home/user/project-a',
         },
@@ -87,7 +87,7 @@ describe('searchTitleTier()', () => {
           provider: 'claude',
           sessionId: 'session-3',
           projectPath: '/home/user/project-b',
-          updatedAt: 3000,
+          lastActivityAt: 3000,
           title: 'Implement dark mode',
           summary: 'User requested dark mode feature',
           cwd: '/home/user/project-b',
@@ -132,12 +132,12 @@ describe('searchTitleTier()', () => {
     expect(results).toHaveLength(1)
   })
 
-  it('sorts by updatedAt descending', () => {
+  it('sorts by lastActivityAt descending', () => {
     const results = searchTitleTier(mockProjects, 'a')
-    expect(results[0].updatedAt).toBeGreaterThanOrEqual(results[results.length - 1].updatedAt)
+    expect(results[0].lastActivityAt).toBeGreaterThanOrEqual(results[results.length - 1].lastActivityAt)
   })
 
-  it('sorts non-archived before archived and by updatedAt within groups', () => {
+  it('sorts non-archived before archived and by lastActivityAt within groups', () => {
     const projects: ProjectGroup[] = [
       {
         projectPath: '/home/user/project-a',
@@ -145,21 +145,21 @@ describe('searchTitleTier()', () => {
           {
             sessionId: 's1',
             projectPath: '/home/user/project-a',
-            updatedAt: 2000,
+            lastActivityAt: 2000,
             title: 'Alpha task',
             archived: false,
           },
           {
             sessionId: 's2',
             projectPath: '/home/user/project-a',
-            updatedAt: 3000,
+            lastActivityAt: 3000,
             title: 'Albatross review',
             archived: true,
           },
           {
             sessionId: 's3',
             projectPath: '/home/user/project-a',
-            updatedAt: 1000,
+            lastActivityAt: 1000,
             title: 'Alaska note',
             archived: false,
           },
@@ -415,7 +415,7 @@ describe('searchSessions() orchestrator', () => {
             provider: 'claude',
             sessionId: 'session-1',
             projectPath: '/test-project',
-            updatedAt: 1000,
+            lastActivityAt: 1000,
             title: 'Fix login bug',
             cwd: '/project',
             sourceFile: path.join(projectDir, 'session-1.jsonl'),
@@ -424,7 +424,7 @@ describe('searchSessions() orchestrator', () => {
             provider: 'claude',
             sessionId: 'session-2',
             projectPath: '/test-project',
-            updatedAt: 2000,
+            lastActivityAt: 2000,
             title: 'Hello',
             cwd: '/project',
             sourceFile: path.join(projectDir, 'session-2.jsonl'),
@@ -454,7 +454,7 @@ describe('searchSessions() orchestrator', () => {
             provider: 'claude',
             sessionId: 'session-1',
             projectPath: '/test-project',
-            updatedAt: 1000,
+            lastActivityAt: 1000,
             title: 'Fix login bug',
             cwd: '/project',
             sourceFile: path.join(projectDir, 'session-1.jsonl'),
@@ -463,7 +463,7 @@ describe('searchSessions() orchestrator', () => {
             provider: 'claude',
             sessionId: 'session-2',
             projectPath: '/test-project',
-            updatedAt: 2000,
+            lastActivityAt: 2000,
             title: 'Hello',
             cwd: '/project',
             sourceFile: path.join(projectDir, 'session-2.jsonl'),
@@ -492,7 +492,7 @@ describe('searchSessions() orchestrator', () => {
             provider: 'claude',
             sessionId: 'session-1',
             projectPath: '/test-project',
-            updatedAt: 1000,
+            lastActivityAt: 1000,
             title: 'Login',
             cwd: '/project',
             sourceFile: path.join(projectDir, 'session-1.jsonl'),
@@ -501,7 +501,7 @@ describe('searchSessions() orchestrator', () => {
             provider: 'claude',
             sessionId: 'session-2',
             projectPath: '/test-project',
-            updatedAt: 2000,
+            lastActivityAt: 2000,
             title: 'Hello',
             cwd: '/project',
             sourceFile: path.join(projectDir, 'session-2.jsonl'),
@@ -531,7 +531,7 @@ describe('searchSessions() orchestrator', () => {
             provider: 'claude',
             sessionId: 'session-1',
             projectPath: '/test-project',
-            updatedAt: 1000,
+            lastActivityAt: 1000,
             title: 'Login',
             cwd: '/project',
             sourceFile: path.join(projectDir, 'session-1.jsonl'),
@@ -540,7 +540,7 @@ describe('searchSessions() orchestrator', () => {
             provider: 'claude',
             sessionId: 'session-2',
             projectPath: '/test-project',
-            updatedAt: 2000,
+            lastActivityAt: 2000,
             title: 'Hello',
             cwd: '/project',
             sourceFile: path.join(projectDir, 'session-2.jsonl'),
@@ -573,7 +573,7 @@ describe('searchSessions() orchestrator', () => {
             provider: 'claude',
             sessionId: 'session-missing',
             projectPath: '/test-project',
-            updatedAt: 1000,
+            lastActivityAt: 1000,
             title: 'Missing',
             cwd: '/project',
             sourceFile: missingFile,
@@ -610,7 +610,7 @@ describe('searchSessions() orchestrator', () => {
             provider: 'claude',
             sessionId: 'session-error',
             projectPath: '/test-project',
-            updatedAt: 1000,
+            lastActivityAt: 1000,
             title: 'Error',
             cwd: '/project',
             sourceFile: filePath,

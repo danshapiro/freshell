@@ -20,7 +20,7 @@ export interface PaginateOptions {
   before?: number
   /**
    * Tie-breaker: composite key (provider:sessionId).
-   * When `before` matches a session's updatedAt, only include sessions
+   * When `before` matches a session's lastActivityAt, only include sessions
    * whose composite key sorts before this value.
    */
   beforeId?: string
@@ -37,7 +37,7 @@ function cursorKey(s: CodingCliSession): string {
  * composite key (provider:sessionId) descending for deterministic pagination.
  */
 function compareSessionsDesc(a: CodingCliSession, b: CodingCliSession): number {
-  const diff = b.updatedAt - a.updatedAt
+  const diff = b.lastActivityAt - a.lastActivityAt
   if (diff !== 0) return diff
   // Deterministic tie-breaker: composite key descending
   const aKey = cursorKey(a)
@@ -50,12 +50,12 @@ function compareSessionsDesc(a: CodingCliSession, b: CodingCliSession): number {
 /**
  * Paginate a list of project groups by session recency.
  *
- * Flattens all sessions, sorts by updatedAt desc (ties broken by composite key
+ * Flattens all sessions, sorts by lastActivityAt desc (ties broken by composite key
  * desc), takes the top `limit`, then regroups into ProjectGroup[] preserving
  * project colors.
  *
  * Uses a compound cursor (before + beforeId) for stable pagination when
- * multiple sessions share the same updatedAt timestamp.
+ * multiple sessions share the same lastActivityAt timestamp.
  */
 export function paginateProjects(
   allProjects: ProjectGroup[],
@@ -82,16 +82,16 @@ export function paginateProjects(
     if (beforeId !== undefined) {
       // Compound cursor: exclude sessions at or after the cursor position
       allSessions = allSessions.filter(s =>
-        s.updatedAt < before ||
-        (s.updatedAt === before && cursorKey(s) < beforeId),
+        s.lastActivityAt < before ||
+        (s.lastActivityAt === before && cursorKey(s) < beforeId),
       )
     } else {
       // Simple timestamp cursor (backward compat)
-      allSessions = allSessions.filter(s => s.updatedAt < before)
+      allSessions = allSessions.filter(s => s.lastActivityAt < before)
     }
   }
 
-  // Sort by updatedAt descending, ties broken by composite key descending
+  // Sort by lastActivityAt descending, ties broken by composite key descending
   allSessions.sort(compareSessionsDesc)
 
   const primaryPage = allSessions.slice(0, limit)
@@ -128,7 +128,7 @@ export function paginateProjects(
   return {
     projects,
     totalSessions,
-    oldestIncludedTimestamp: oldest?.updatedAt ?? 0,
+    oldestIncludedTimestamp: oldest?.lastActivityAt ?? 0,
     oldestIncludedSessionId: oldest ? cursorKey(oldest) : '',
     hasMore,
   }

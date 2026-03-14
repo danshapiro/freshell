@@ -116,12 +116,12 @@ describe('codex session rebind regression', () => {
     await new Promise<void>((resolve) => server.close(() => resolve()))
   })
 
-  const applyIndexerUpdate = (updatedAtBase: number) => {
+  const applyIndexerUpdate = (lastActivityAtBase: number) => {
     const sessions: CodingCliSession[] = CODEX_SESSION_IDS.map((sessionId, index) => ({
       provider: 'codex',
       sessionId,
       projectPath: CODEX_CWD,
-      updatedAt: updatedAtBase + index,
+      lastActivityAt: lastActivityAtBase + index,
       cwd: CODEX_CWD,
     }))
     const projects: ProjectGroup[] = [{ projectPath: CODEX_CWD, sessions }]
