@@ -1,7 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { act, fireEvent, screen, within } from '@testing-library/react'
 import { DEVICE_DISMISSED_STORAGE_KEY } from '@/store/storage-keys'
-import { LOCAL_TERMINAL_FONT_KEY } from '@/lib/terminal-fonts'
 import {
   createSettingsViewStore,
   createTabRegistryState,
@@ -34,7 +33,7 @@ function getSlider(predicate: (slider: HTMLElement) => boolean) {
 
 describe('SettingsView behavior sections', () => {
   describe('additional settings interactions', () => {
-    it('updates terminal theme', async () => {
+    it('updates terminal theme locally without calling /api/settings', async () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
@@ -47,9 +46,7 @@ describe('SettingsView behavior sections', () => {
         vi.advanceTimersByTime(500)
       })
 
-      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
-        terminal: { theme: 'one-dark' },
-      })
+      expect(api.patch).not.toHaveBeenCalled()
     })
 
     it('updates UI scale slider', () => {
@@ -69,7 +66,7 @@ describe('SettingsView behavior sections', () => {
       expect(screen.getByText('150%')).toBeInTheDocument()
     })
 
-    it('updates sidebar sort mode', async () => {
+    it('updates sidebar sort mode locally without calling /api/settings', async () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
@@ -90,12 +87,10 @@ describe('SettingsView behavior sections', () => {
         vi.advanceTimersByTime(500)
       })
 
-      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
-        sidebar: { sortMode: 'activity' },
-      })
+      expect(api.patch).not.toHaveBeenCalled()
     })
 
-    it('updates sidebar sort mode to recency-pinned', async () => {
+    it('updates sidebar sort mode to recency-pinned locally without calling /api/settings', async () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
@@ -112,9 +107,7 @@ describe('SettingsView behavior sections', () => {
         vi.advanceTimersByTime(500)
       })
 
-      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
-        sidebar: { sortMode: 'recency-pinned' },
-      })
+      expect(api.patch).not.toHaveBeenCalled()
     })
 
     it('toggles show project badges', () => {
@@ -171,7 +164,7 @@ describe('SettingsView behavior sections', () => {
       })
     })
 
-    it('toggles notification sound', async () => {
+    it('toggles notification sound locally without calling /api/settings', async () => {
       const store = createSettingsViewStore({
         settings: {
           notifications: { soundEnabled: true },
@@ -189,12 +182,10 @@ describe('SettingsView behavior sections', () => {
         vi.advanceTimersByTime(500)
       })
 
-      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
-        notifications: { soundEnabled: false },
-      })
+      expect(api.patch).not.toHaveBeenCalled()
     })
 
-    it('toggles cursor blink', async () => {
+    it('toggles cursor blink locally without calling /api/settings', async () => {
       const store = createSettingsViewStore({
         settings: {
           terminal: { cursorBlink: true },
@@ -212,9 +203,7 @@ describe('SettingsView behavior sections', () => {
         vi.advanceTimersByTime(500)
       })
 
-      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
-        terminal: { cursorBlink: false },
-      })
+      expect(api.patch).not.toHaveBeenCalled()
     })
 
     it('toggles debug logging', async () => {
@@ -334,7 +323,7 @@ describe('SettingsView behavior sections', () => {
       fireEvent.change(fontFamilySelect, { target: { value: 'Cascadia Code' } })
 
       expect(store.getState().settings.settings.terminal.fontFamily).toBe('Cascadia Code')
-      expect(localStorage.getItem(LOCAL_TERMINAL_FONT_KEY)).toBe('Cascadia Code')
+      expect(localStorage.length).toBe(0)
 
       await act(async () => {
         vi.advanceTimersByTime(500)
@@ -387,6 +376,7 @@ describe('SettingsView behavior sections', () => {
       await act(async () => {
         vi.advanceTimersByTime(500)
         await Promise.resolve()
+        vi.advanceTimersByTime(500)
       })
 
       expect(api.post).toHaveBeenCalledWith('/api/files/validate-dir', {
@@ -413,6 +403,7 @@ describe('SettingsView behavior sections', () => {
       await act(async () => {
         vi.advanceTimersByTime(500)
         await Promise.resolve()
+        vi.advanceTimersByTime(500)
       })
 
       expect(api.post).toHaveBeenCalledWith('/api/files/validate-dir', {
@@ -439,6 +430,7 @@ describe('SettingsView behavior sections', () => {
       await act(async () => {
         vi.advanceTimersByTime(500)
         await Promise.resolve()
+        vi.advanceTimersByTime(500)
       })
 
       expect(api.post).not.toHaveBeenCalled()

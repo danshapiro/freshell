@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { updateSettingsLocal, markSaved, defaultSettings, mergeSettings } from '@/store/settingsSlice'
+import {
+  defaultSettings,
+  markSaved,
+  mergeSettings,
+  previewServerSettingsPatch,
+  updateSettingsLocal,
+} from '@/store/settingsSlice'
 import {
   dismissDeviceIds,
   persistDeviceAliasesForDevices,
@@ -12,7 +18,7 @@ import {
 import { api, type ApiError } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { terminalThemes, darkThemes, lightThemes, getTerminalTheme } from '@/lib/terminal-themes'
-import { resolveTerminalFontFamily, saveLocalTerminalFontFamily } from '@/lib/terminal-fonts'
+import { resolveTerminalFontFamily } from '@/lib/terminal-fonts'
 import type {
   AppSettings,
   SidebarSortMode,
@@ -22,6 +28,8 @@ import type {
   CodingCliProviderName,
   TabAttentionStyle,
   AttentionDismiss,
+  LocalSettingsPatch,
+  ServerSettingsPatch,
 } from '@/store/types'
 import type { DeepPartial } from '@/lib/type-utils'
 import { configureNetwork, fetchNetworkStatus, type NetworkStatusResponse } from '@/store/networkSlice'
@@ -31,6 +39,7 @@ import {
   fetchFirewallConfig,
   type ConfigureFirewallResult,
 } from '@/lib/firewall-configure'
+import { normalizeServerSettingsPatchForApi } from '@/store/settingsThunks'
 import { nanoid } from '@reduxjs/toolkit'
 import type { AppView } from '@/components/Sidebar'
 import { getCliProviderConfigs } from '@/lib/coding-cli-utils'
@@ -308,8 +317,8 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   )
 
   const patch = useMemo(
-    () => async (updates: DeepPartial<AppSettings>) => {
-      await api.patch('/api/settings', updates)
+    () => async (updates: ServerSettingsPatch) => {
+      await api.patch('/api/settings', normalizeServerSettingsPatchForApi(updates))
       dispatch(markSaved())
     },
     [dispatch],
@@ -326,7 +335,6 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
       }
     }
   }, [])
-
   const refreshFirewallStatusAfterNoop = useCallback(async (message?: string) => {
     setFirewallRefreshDetail(message ?? 'Refreshing firewall status...')
     try {
@@ -571,13 +579,22 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     setPendingConfirmation(null)
   }, [pendingConfirmation])
 
-  const scheduleSave = useCallback((updates: any) => {
+  const applyLocalSetting = useCallback((updates: LocalSettingsPatch) => {
+    dispatch(updateSettingsLocal(updates))
+  }, [dispatch])
+
+  const scheduleSave = useCallback((updates: ServerSettingsPatch) => {
     if (pendingRef.current) clearTimeout(pendingRef.current)
     pendingRef.current = setTimeout(() => {
       patch(updates).catch((err) => log.warn('Failed to save settings', err))
       pendingRef.current = null
     }, 500)
   }, [patch])
+
+  const applyServerSetting = useCallback((updates: ServerSettingsPatch) => {
+    dispatch(previewServerSettingsPatch(updates))
+    scheduleSave(updates)
+  }, [dispatch, scheduleSave])
 
   useEffect(() => {
     const next = settings.defaultCwd ?? ''
@@ -597,10 +614,8 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
 
   const commitDefaultCwd = useCallback((nextValue: string | undefined) => {
     if (nextValue === settings.defaultCwd) return
-    dispatch(updateSettingsLocal({ defaultCwd: nextValue }))
-    // Send '' to API when clearing — JSON.stringify strips undefined, but server normalizes '' → undefined
-    patch({ defaultCwd: nextValue ?? '' }).catch((err) => log.warn('Failed to save settings', err))
-  }, [dispatch, patch, settings.defaultCwd])
+    applyServerSetting({ defaultCwd: nextValue })
+  }, [applyServerSetting, settings.defaultCwd])
 
   const scheduleDefaultCwdValidation = useCallback((value: string) => {
     defaultCwdValidationRef.current += 1
@@ -682,10 +697,9 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
       const trimmed = value.trim()
       if (!trimmed) {
         setProviderCwdErrors((prev) => ({ ...prev, [key]: null }))
-        dispatch(updateSettingsLocal({
+        applyServerSetting({
           codingCli: { providers: { [providerName]: { cwd: undefined } } },
-        }))
-        scheduleSave({ codingCli: { providers: { [providerName]: { cwd: undefined } } } })
+        })
         return
       }
 
@@ -694,10 +708,9 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
           if (providerCwdValidationRef.current[key] !== validationId) return
           if (result.valid) {
             setProviderCwdErrors((prev) => ({ ...prev, [key]: null }))
-            dispatch(updateSettingsLocal({
+            applyServerSetting({
               codingCli: { providers: { [providerName]: { cwd: trimmed } } },
-            }))
-            scheduleSave({ codingCli: { providers: { [providerName]: { cwd: trimmed } } } })
+            })
           } else {
             setProviderCwdErrors((prev) => ({ ...prev, [key]: 'directory not found' }))
           }
@@ -707,15 +720,14 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
           setProviderCwdErrors((prev) => ({ ...prev, [key]: 'directory not found' }))
         })
     }, 500)
-  }, [dispatch, scheduleSave])
+  }, [applyServerSetting])
 
   const setProviderEnabled = useCallback((provider: CodingCliProviderName, enabled: boolean) => {
     const next = enabled
       ? Array.from(new Set([...enabledProviders, provider]))
       : enabledProviders.filter((p) => p !== provider)
-    dispatch(updateSettingsLocal({ codingCli: { enabledProviders: next } }))
-    scheduleSave({ codingCli: { enabledProviders: next } })
-  }, [dispatch, enabledProviders, scheduleSave])
+    applyServerSetting({ codingCli: { enabledProviders: next } })
+  }, [applyServerSetting, enabledProviders])
 
   const knownDevices = useMemo(() => {
     return buildKnownDevices({
@@ -856,10 +868,9 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     if (isSelectedFontAvailable) return
     if (fallbackFontFamily === settings.terminal.fontFamily) return
 
-    dispatch(updateSettingsLocal({ terminal: { fontFamily: fallbackFontFamily } }))
-    saveLocalTerminalFontFamily(fallbackFontFamily)
+    applyLocalSetting({ terminal: { fontFamily: fallbackFontFamily } })
   }, [
-    dispatch,
+    applyLocalSetting,
     fallbackFontFamily,
     fontsReady,
     isSelectedFontAvailable,
@@ -932,8 +943,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                   { value: 'dark', label: 'Dark' },
                 ]}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ theme: v as AppSettings['theme'] }))
-                  scheduleSave({ theme: v })
+                  applyLocalSetting({ theme: v as AppSettings['theme'] })
                 }}
               />
             </SettingsRow>
@@ -947,8 +957,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 labelWidth="w-12"
                 format={(v) => `${Math.round(v * 100)}%`}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ uiScale: v }))
-                  scheduleSave({ uiScale: v })
+                  applyLocalSetting({ uiScale: v })
                 }}
               />
             </SettingsRow>
@@ -959,11 +968,10 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
           <SettingsSection title="Sidebar" description="Session list and navigation">
             <SettingsRow label="Sort mode">
               <select
-                value={settings.sidebar?.sortMode || 'recency-pinned'}
+                value={settings.sidebar?.sortMode || 'activity'}
                 onChange={(e) => {
                   const v = e.target.value as SidebarSortMode
-                  dispatch(updateSettingsLocal({ sidebar: { sortMode: v } }))
-                  scheduleSave({ sidebar: { sortMode: v } })
+                  applyLocalSetting({ sidebar: { sortMode: v } })
                 }}
                 className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
               >
@@ -978,8 +986,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <Toggle
                 checked={settings.sidebar?.showProjectBadges ?? true}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ sidebar: { showProjectBadges: checked } }))
-                  scheduleSave({ sidebar: { showProjectBadges: checked } })
+                  applyLocalSetting({ sidebar: { showProjectBadges: checked } })
                 }}
               />
             </SettingsRow>
@@ -988,8 +995,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <Toggle
                 checked={settings.sidebar?.showSubagents ?? false}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ sidebar: { showSubagents: checked } }))
-                  scheduleSave({ sidebar: { showSubagents: checked } })
+                  applyLocalSetting({ sidebar: { showSubagents: checked } })
                 }}
               />
             </SettingsRow>
@@ -998,8 +1004,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <Toggle
                 checked={settings.sidebar?.ignoreCodexSubagents ?? true}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ sidebar: { ignoreCodexSubagents: checked } }))
-                  scheduleSave({ sidebar: { ignoreCodexSubagents: checked } })
+                  applyLocalSetting({ sidebar: { ignoreCodexSubagents: checked } })
                 }}
               />
             </SettingsRow>
@@ -1008,8 +1013,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <Toggle
                 checked={settings.sidebar?.showNoninteractiveSessions ?? false}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ sidebar: { showNoninteractiveSessions: checked } }))
-                  scheduleSave({ sidebar: { showNoninteractiveSessions: checked } })
+                  applyLocalSetting({ sidebar: { showNoninteractiveSessions: checked } })
                 }}
               />
             </SettingsRow>
@@ -1021,8 +1025,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <Toggle
                 checked={settings.sidebar?.hideEmptySessions ?? true}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ sidebar: { hideEmptySessions: checked } }))
-                  scheduleSave({ sidebar: { hideEmptySessions: checked } })
+                  applyLocalSetting({ sidebar: { hideEmptySessions: checked } })
                 }}
                 aria-label="Hide empty sessions"
               />
@@ -1038,8 +1041,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                   const nextInput = event.target.value
                   setExcludeFirstChatInput(nextInput)
                   const excludeFirstChatSubstrings = parseNormalizedLineList(nextInput)
-                  dispatch(updateSettingsLocal({ sidebar: { excludeFirstChatSubstrings } }))
-                  scheduleSave({ sidebar: { excludeFirstChatSubstrings } })
+                  applyServerSetting({ sidebar: { excludeFirstChatSubstrings } })
                 }}
                 className="min-h-20 w-full rounded-md bg-muted border-0 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-border md:w-[24rem]"
                 placeholder="__AUTO__"
@@ -1051,8 +1053,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <Toggle
                 checked={settings.sidebar?.excludeFirstChatMustStart ?? false}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ sidebar: { excludeFirstChatMustStart: checked } }))
-                  scheduleSave({ sidebar: { excludeFirstChatMustStart: checked } })
+                  applyServerSetting({ sidebar: { excludeFirstChatMustStart: checked } })
                 }}
                 aria-label="Require first chat exclusion substring at start"
               />
@@ -1067,8 +1068,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 value={settings.panes?.defaultNewPane || 'ask'}
                 onChange={(e) => {
                   const v = e.target.value as 'ask' | 'shell' | 'browser' | 'editor'
-                  dispatch(updateSettingsLocal({ panes: { defaultNewPane: v } }))
-                  scheduleSave({ panes: { defaultNewPane: v } })
+                  applyServerSetting({ panes: { defaultNewPane: v } })
                 }}
                 className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
               >
@@ -1088,8 +1088,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 labelWidth="w-10"
                 format={(v) => v === 0 ? 'Off' : `${v}%`}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ panes: { snapThreshold: v } }))
-                  scheduleSave({ panes: { snapThreshold: v } })
+                  applyLocalSetting({ panes: { snapThreshold: v } })
                 }}
               />
             </SettingsRow>
@@ -1098,8 +1097,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <Toggle
                 checked={settings.panes?.iconsOnTabs ?? true}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ panes: { iconsOnTabs: checked } }))
-                  scheduleSave({ panes: { iconsOnTabs: checked } })
+                  applyLocalSetting({ panes: { iconsOnTabs: checked } })
                 }}
               />
             </SettingsRow>
@@ -1115,8 +1113,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 ]}
                 onChange={(v: string) => {
                   const tabAttentionStyle = v as TabAttentionStyle
-                  dispatch(updateSettingsLocal({ panes: { tabAttentionStyle } }))
-                  scheduleSave({ panes: { tabAttentionStyle } })
+                  applyLocalSetting({ panes: { tabAttentionStyle } })
                 }}
               />
             </SettingsRow>
@@ -1130,8 +1127,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 ]}
                 onChange={(v: string) => {
                   const attentionDismiss = v as AttentionDismiss
-                  dispatch(updateSettingsLocal({ panes: { attentionDismiss } }))
-                  scheduleSave({ panes: { attentionDismiss } })
+                  applyLocalSetting({ panes: { attentionDismiss } })
                 }}
               />
             </SettingsRow>
@@ -1143,8 +1139,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <Toggle
                 checked={settings.notifications?.soundEnabled ?? true}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ notifications: { soundEnabled: checked } }))
-                  scheduleSave({ notifications: { soundEnabled: checked } })
+                  applyLocalSetting({ notifications: { soundEnabled: checked } })
                 }}
               />
             </SettingsRow>
@@ -1157,8 +1152,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 value={settings.terminal.theme}
                 onChange={(e) => {
                   const v = e.target.value as TerminalTheme
-                  dispatch(updateSettingsLocal({ terminal: { theme: v } }))
-                  scheduleSave({ terminal: { theme: v } })
+                  applyLocalSetting({ terminal: { theme: v } })
                 }}
                 className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
               >
@@ -1185,8 +1179,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 labelWidth="w-20"
                 format={(v) => `${v}px (${Math.round(v / 16 * 100)}%)`}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ terminal: { fontSize: v } }))
-                  scheduleSave({ terminal: { fontSize: v } })
+                  applyLocalSetting({ terminal: { fontSize: v } })
                 }}
               />
             </SettingsRow>
@@ -1200,8 +1193,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 labelWidth="w-10"
                 format={(v) => v.toFixed(2)}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ terminal: { lineHeight: v } }))
-                  scheduleSave({ terminal: { lineHeight: v } })
+                  applyLocalSetting({ terminal: { lineHeight: v } })
                 }}
               />
             </SettingsRow>
@@ -1214,8 +1206,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 step={500}
                 format={(v) => v.toLocaleString()}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ terminal: { scrollback: v } }))
-                  scheduleSave({ terminal: { scrollback: v } })
+                  applyServerSetting({ terminal: { scrollback: v } })
                 }}
               />
             </SettingsRow>
@@ -1224,8 +1215,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <Toggle
                 checked={settings.terminal.cursorBlink}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ terminal: { cursorBlink: checked } }))
-                  scheduleSave({ terminal: { cursorBlink: checked } })
+                  applyLocalSetting({ terminal: { cursorBlink: checked } })
                 }}
               />
             </SettingsRow>
@@ -1234,8 +1224,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <Toggle
                 checked={settings.terminal.warnExternalLinks}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ terminal: { warnExternalLinks: checked } }))
-                  scheduleSave({ terminal: { warnExternalLinks: checked } })
+                  applyLocalSetting({ terminal: { warnExternalLinks: checked } })
                 }}
               />
             </SettingsRow>
@@ -1244,8 +1233,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <select
                 value={isSelectedFontAvailable ? settings.terminal.fontFamily : fallbackFontFamily}
                 onChange={(e) => {
-                  dispatch(updateSettingsLocal({ terminal: { fontFamily: e.target.value } }))
-                  saveLocalTerminalFontFamily(e.target.value)
+                  applyLocalSetting({ terminal: { fontFamily: e.target.value } })
                 }}
                 className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
               >
@@ -1279,8 +1267,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                       { value: 'never', label: 'Never' },
                     ]}
                     onChange={(v: string) => {
-                      dispatch(updateSettingsLocal({ terminal: { osc52Clipboard: v as 'ask' | 'always' | 'never' } } as any))
-                      scheduleSave({ terminal: { osc52Clipboard: v as 'ask' | 'always' | 'never' } })
+                      applyLocalSetting({ terminal: { osc52Clipboard: v as 'ask' | 'always' | 'never' } } as any)
                     }}
                   />
                 </SettingsRow>
@@ -1295,8 +1282,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 value={settings.editor?.externalEditor ?? 'auto'}
                 onChange={(e) => {
                   const v = e.target.value as 'auto' | 'cursor' | 'code' | 'custom'
-                  dispatch(updateSettingsLocal({ editor: { externalEditor: v } }))
-                  scheduleSave({ editor: { externalEditor: v } })
+                  applyServerSetting({ editor: { externalEditor: v } })
                 }}
                 className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
               >
@@ -1316,10 +1302,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                   value={settings.editor?.customEditorCommand ?? ''}
                   placeholder="nvim +{line} {file}"
                   onChange={(e) => {
-                    dispatch(updateSettingsLocal({
-                      editor: { customEditorCommand: e.target.value },
-                    }))
-                    scheduleSave({
+                    applyServerSetting({
                       editor: { customEditorCommand: e.target.value },
                     })
                   }}
@@ -1339,8 +1322,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 step={10}
                 format={(v) => String(v)}
                 onChange={(v) => {
-                  dispatch(updateSettingsLocal({ safety: { autoKillIdleMinutes: v } }))
-                  scheduleSave({ safety: { autoKillIdleMinutes: v } })
+                  applyServerSetting({ safety: { autoKillIdleMinutes: v } })
                 }}
               />
             </SettingsRow>
@@ -1377,8 +1359,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
               <Toggle
                 checked={settings.logging?.debug ?? false}
                 onChange={(checked) => {
-                  dispatch(updateSettingsLocal({ logging: { debug: checked } }))
-                  scheduleSave({ logging: { debug: checked } })
+                  applyServerSetting({ logging: { debug: checked } })
                 }}
               />
             </SettingsRow>
@@ -1406,10 +1387,9 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                         value={(providerSettings.permissionMode as ClaudePermissionMode) || 'default'}
                         onChange={(e) => {
                           const v = e.target.value as ClaudePermissionMode
-                          dispatch(updateSettingsLocal({
+                          applyServerSetting({
                             codingCli: { providers: { [provider.name]: { permissionMode: v } } },
-                          }))
-                          scheduleSave({ codingCli: { providers: { [provider.name]: { permissionMode: v } } } })
+                          })
                         }}
                         className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
                       >
@@ -1429,10 +1409,9 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                         placeholder={provider.name === 'codex' ? 'e.g. gpt-5-codex' : 'e.g. claude-3-5-sonnet'}
                         onChange={(e) => {
                           const model = e.target.value.trim()
-                          dispatch(updateSettingsLocal({
+                          applyServerSetting({
                             codingCli: { providers: { [provider.name]: { model: model || undefined } } },
-                          }))
-                          scheduleSave({ codingCli: { providers: { [provider.name]: { model: model || undefined } } } })
+                          })
                         }}
                         className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:max-w-xs"
                       />
@@ -1446,10 +1425,9 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                         onChange={(e) => {
                           const v = e.target.value as CodexSandboxMode
                           const sandbox = v || undefined
-                          dispatch(updateSettingsLocal({
+                          applyServerSetting({
                             codingCli: { providers: { [provider.name]: { sandbox } } },
-                          }))
-                          scheduleSave({ codingCli: { providers: { [provider.name]: { sandbox } } } })
+                          })
                         }}
                         className="h-10 w-full px-3 text-sm bg-muted border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border md:h-8 md:w-auto"
                       >

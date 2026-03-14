@@ -1,10 +1,18 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
-import { render, screen, cleanup } from '@testing-library/react'
+import { act, fireEvent, render, screen, cleanup } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import SettingsView from '@/components/SettingsView'
-import settingsReducer from '@/store/settingsSlice'
+import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import { networkReducer } from '@/store/networkSlice'
+import { api } from '@/lib/api'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  mergeServerSettings,
+  resolveLocalSettings,
+  type LocalSettingsPatch,
+} from '@shared/settings'
 
 // Mock the API
 vi.mock('@/lib/api', () => ({
@@ -13,7 +21,21 @@ vi.mock('@/lib/api', () => ({
   },
 }))
 
-function createTestStore(defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor' = 'ask') {
+const defaultServerSettings = createDefaultServerSettings({
+  loggingDebug: defaultSettings.logging.debug,
+})
+
+function createTestStore(
+  defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor' = 'ask',
+  local?: LocalSettingsPatch,
+) {
+  const serverSettings = mergeServerSettings(defaultServerSettings, {
+    panes: {
+      defaultNewPane,
+    },
+  })
+  const localSettings = resolveLocalSettings(local)
+
   return configureStore({
     reducer: {
       settings: settingsReducer,
@@ -21,41 +43,9 @@ function createTestStore(defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor' 
     },
     preloadedState: {
       settings: {
-        settings: {
-          theme: 'system',
-          uiScale: 1,
-          terminal: {
-            fontSize: 14,
-            fontFamily: 'monospace',
-            lineHeight: 1.2,
-            cursorBlink: true,
-            scrollback: 5000,
-            theme: 'auto',
-          },
-          logging: {
-            debug: false,
-          },
-          safety: {
-            autoKillIdleMinutes: 180,
-          },
-          sidebar: {
-            sortMode: 'activity',
-            showProjectBadges: true,
-            showSubagents: false,
-            showNoninteractiveSessions: false,
-            width: 288,
-            collapsed: false,
-          },
-          panes: {
-            defaultNewPane,
-            snapThreshold: 2,
-            iconsOnTabs: true,
-          },
-          codingCli: {
-            enabledProviders: ['claude', 'codex'],
-            providers: {},
-          },
-        },
+        serverSettings,
+        localSettings,
+        settings: composeResolvedSettings(serverSettings, localSettings),
         loaded: true,
         lastSavedAt: Date.now(),
       },
@@ -65,7 +55,7 @@ function createTestStore(defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor' 
 
 describe('SettingsView Panes section', () => {
   beforeEach(() => {
-    vi.useRealTimers()
+    vi.useFakeTimers()
     localStorage.clear()
   })
 
@@ -147,5 +137,50 @@ describe('SettingsView Panes section', () => {
 
     // The slider should show "2%" for the default value
     expect(screen.getByText('2%')).toBeInTheDocument()
+  })
+
+  it('updates snap distance locally without calling /api/settings', async () => {
+    const store = createTestStore()
+    render(
+      <Provider store={store}>
+        <SettingsView />
+      </Provider>
+    )
+
+    const snapSlider = screen.getAllByRole('slider').find((slider) => {
+      return slider.getAttribute('min') === '0' && slider.getAttribute('max') === '8'
+    })!
+
+    fireEvent.change(snapSlider, { target: { value: '4' } })
+    fireEvent.pointerUp(snapSlider)
+
+    expect(store.getState().settings.settings.panes.snapThreshold).toBe(4)
+
+    await act(async () => {
+      vi.advanceTimersByTime(600)
+    })
+
+    expect(api.patch).not.toHaveBeenCalled()
+  })
+
+  it('toggles icons on tabs locally without calling /api/settings', async () => {
+    const store = createTestStore('ask', { panes: { iconsOnTabs: true } })
+    render(
+      <Provider store={store}>
+        <SettingsView />
+      </Provider>
+    )
+
+    const row = screen.getByText('Icons on tabs').closest('div')!
+    const toggle = row.querySelector('button')!
+    fireEvent.click(toggle)
+
+    expect(store.getState().settings.settings.panes.iconsOnTabs).toBe(false)
+
+    await act(async () => {
+      vi.advanceTimersByTime(600)
+    })
+
+    expect(api.patch).not.toHaveBeenCalled()
   })
 })

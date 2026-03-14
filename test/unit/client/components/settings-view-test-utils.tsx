@@ -19,6 +19,15 @@ import type { RegistryTabRecord } from '@/store/tabRegistryTypes'
 import type { AppSettings } from '@/store/types'
 import type { DeepPartial } from '@/lib/type-utils'
 import type { ClientExtensionEntry } from '@shared/extension-types'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  extractLegacyLocalSettingsSeed,
+  mergeServerSettings,
+  resolveLocalSettings,
+  stripLocalSettings,
+  type ServerSettingsPatch,
+} from '@shared/settings'
 
 type SettingsViewProps = ComponentProps<typeof SettingsView>
 
@@ -66,6 +75,29 @@ const defaultCliExtensions: ClientExtensionEntry[] = [
 
 export function createSettings(overrides?: DeepPartial<AppSettings>): AppSettings {
   return overrides ? mergeSettings(defaultSettings, overrides) : defaultSettings
+}
+
+function createSettingsState(
+  overrides?: DeepPartial<AppSettings>,
+  stateOverrides: Omit<Partial<SettingsState>, 'settings' | 'serverSettings' | 'localSettings'> = {},
+): SettingsState {
+  const resolvedSettings = createSettings(overrides)
+  const serverSettings = mergeServerSettings(
+    createDefaultServerSettings({ loggingDebug: defaultSettings.logging.debug }),
+    stripLocalSettings(resolvedSettings as unknown as Record<string, unknown>) as ServerSettingsPatch,
+  )
+  const localSettings = resolveLocalSettings(
+    extractLegacyLocalSettingsSeed(resolvedSettings as unknown as Record<string, unknown>),
+  )
+
+  return {
+    serverSettings,
+    localSettings,
+    settings: composeResolvedSettings(serverSettings, localSettings),
+    loaded: true,
+    lastSavedAt: undefined,
+    ...stateOverrides,
+  }
 }
 
 export function makeRegistryRecord(overrides: Partial<RegistryTabRecord>): RegistryTabRecord {
@@ -157,12 +189,7 @@ export function createSettingsViewStore(options: CreateSettingsViewStoreOptions 
         },
       }),
     preloadedState: {
-      settings: {
-        settings: createSettings(settings),
-        loaded: true,
-        lastSavedAt: undefined,
-        ...settingsState,
-      },
+      settings: createSettingsState(settings, settingsState),
       extensions: {
         entries: defaultCliExtensions,
       },

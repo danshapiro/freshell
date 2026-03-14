@@ -1,6 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
 import { act, fireEvent, screen, within } from '@testing-library/react'
-import { LOCAL_TERMINAL_FONT_KEY } from '@/lib/terminal-fonts'
 import { defaultSettings } from '@/store/settingsSlice'
 import {
   createSettingsViewStore,
@@ -237,7 +236,7 @@ describe('SettingsView core sections', () => {
       })
 
       expect(store.getState().settings.settings.terminal.fontFamily).toBe('monospace')
-      expect(localStorage.getItem(LOCAL_TERMINAL_FONT_KEY)).toBe('monospace')
+      expect(localStorage.length).toBe(0)
     })
 
     it('displays sidebar sort mode value', () => {
@@ -295,7 +294,7 @@ describe('SettingsView core sections', () => {
       expect(store.getState().settings.settings.theme).toBe('system')
     })
 
-    it('schedules API save after theme change', async () => {
+    it('keeps theme changes local without calling /api/settings', async () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
@@ -305,7 +304,7 @@ describe('SettingsView core sections', () => {
         vi.advanceTimersByTime(500)
       })
 
-      expect(api.patch).toHaveBeenCalledWith('/api/settings', { theme: 'dark' })
+      expect(api.patch).not.toHaveBeenCalled()
     })
   })
 
@@ -329,7 +328,7 @@ describe('SettingsView core sections', () => {
       expect(screen.getByText('20px (125%)')).toBeInTheDocument()
     })
 
-    it('schedules API save after font size change', async () => {
+    it('keeps font size changes local without calling /api/settings', async () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
@@ -341,14 +340,12 @@ describe('SettingsView core sections', () => {
         vi.advanceTimersByTime(500)
       })
 
-      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
-        terminal: { fontSize: 18 },
-      })
+      expect(api.patch).not.toHaveBeenCalled()
     })
   })
 
-  describe('auto-save behavior', () => {
-    it('auto-saves settings after debounce delay', async () => {
+  describe('local-only change behavior', () => {
+    it('does not schedule /api/settings after debounce for theme changes', async () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
@@ -359,10 +356,10 @@ describe('SettingsView core sections', () => {
         vi.advanceTimersByTime(500)
       })
 
-      expect(api.patch).toHaveBeenCalledWith('/api/settings', { theme: 'dark' })
+      expect(api.patch).not.toHaveBeenCalled()
     })
 
-    it('debounces multiple rapid changes', async () => {
+    it('keeps only the latest local theme change without calling /api/settings', async () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
@@ -384,11 +381,11 @@ describe('SettingsView core sections', () => {
         vi.advanceTimersByTime(500)
       })
 
-      expect(api.patch).toHaveBeenCalledTimes(1)
-      expect(api.patch).toHaveBeenCalledWith('/api/settings', { theme: 'system' })
+      expect(store.getState().settings.settings.theme).toBe('system')
+      expect(api.patch).not.toHaveBeenCalled()
     })
 
-    it('updates markSaved after successful API call', async () => {
+    it('does not update lastSavedAt for local-only changes', async () => {
       const store = createSettingsViewStore({ settingsState: { lastSavedAt: undefined } })
       renderSettingsView(store)
 
@@ -402,7 +399,7 @@ describe('SettingsView core sections', () => {
         await vi.runAllTimersAsync()
       })
 
-      expect(store.getState().settings.lastSavedAt).toBeDefined()
+      expect(store.getState().settings.lastSavedAt).toBeUndefined()
     })
   })
 

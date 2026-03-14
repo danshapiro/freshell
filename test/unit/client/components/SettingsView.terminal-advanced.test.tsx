@@ -9,6 +9,11 @@ import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import { networkReducer } from '@/store/networkSlice'
 import { api } from '@/lib/api'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  resolveLocalSettings,
+} from '@shared/settings'
 
 vi.mock('@/lib/api', () => ({
   api: {
@@ -21,6 +26,22 @@ vi.mock('@/lib/api', () => ({
 }))
 
 let originalFonts: Document['fonts'] | undefined
+const defaultServerSettings = createDefaultServerSettings({
+  loggingDebug: defaultSettings.logging.debug,
+})
+
+function createSettingsState(settingsState?: Partial<SettingsState>): SettingsState {
+  const localSettings = resolveLocalSettings()
+
+  return {
+    serverSettings: defaultServerSettings,
+    localSettings,
+    settings: composeResolvedSettings(defaultServerSettings, localSettings),
+    loaded: true,
+    lastSavedAt: undefined,
+    ...settingsState,
+  }
+}
 
 function createTestStore(settingsState?: Partial<SettingsState>) {
   return configureStore({
@@ -38,12 +59,7 @@ function createTestStore(settingsState?: Partial<SettingsState>) {
         },
       }),
     preloadedState: {
-      settings: {
-        settings: defaultSettings,
-        loaded: true,
-        lastSavedAt: undefined,
-        ...settingsState,
-      },
+      settings: createSettingsState(settingsState),
     },
   })
 }
@@ -110,7 +126,7 @@ describe('SettingsView terminal advanced settings', () => {
     expect(screen.getByRole('button', { name: 'Never' })).toBeInTheDocument()
   })
 
-  it('persists Always and Never policy updates', async () => {
+  it('keeps Always and Never policy updates local-only', async () => {
     const store = createTestStore()
     renderWithStore(store)
 
@@ -121,13 +137,13 @@ describe('SettingsView terminal advanced settings', () => {
     await act(async () => {
       vi.advanceTimersByTime(600)
     })
-    expect(api.patch).toHaveBeenCalledWith('/api/settings', { terminal: { osc52Clipboard: 'always' } })
+    expect(api.patch).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByRole('button', { name: 'Never' }))
 
     await act(async () => {
       vi.advanceTimersByTime(600)
     })
-    expect(api.patch).toHaveBeenCalledWith('/api/settings', { terminal: { osc52Clipboard: 'never' } })
+    expect(api.patch).not.toHaveBeenCalled()
   })
 })
