@@ -115,6 +115,24 @@ describe('parseSessionContent() - token usage snapshots', () => {
     expect(meta.lastActivityAt).toBe(Date.parse('2026-03-01T00:00:04.000Z'))
   })
 
+  it('treats flat-string assistant messages as semantic activity', () => {
+    const meta = parseSessionContent([
+      JSON.stringify({
+        type: 'user',
+        message: 'Please create a hello world script',
+        timestamp: '2026-03-01T00:00:03.000Z',
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        message: 'Done! The script has been created.',
+        timestamp: '2026-03-01T00:00:05.000Z',
+      }),
+    ].join('\n'))
+
+    expect(meta.createdAt).toBe(Date.parse('2026-03-01T00:00:03.000Z'))
+    expect(meta.lastActivityAt).toBe(Date.parse('2026-03-01T00:00:05.000Z'))
+  })
+
   it('uses latest assistant usage snapshot with uuid -> message.id -> line-hash dedupe priority', () => {
     const content = [
       JSON.stringify({

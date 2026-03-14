@@ -83,6 +83,7 @@ function parseTimestampMs(value: unknown): number | undefined {
 }
 
 function assistantHasVisibleContent(message: unknown): boolean {
+  if (typeof message === 'string') return message.trim().length > 0
   if (!message || typeof message !== 'object') return false
 
   const content = (message as { content?: unknown }).content
