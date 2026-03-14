@@ -9,7 +9,7 @@ const baseSession = {
   provider: 'codex',
   sessionId: 's1',
   projectPath: '/repo',
-  updatedAt: 100,
+  lastActivityAt: 100,
   title: 'Deploy',
 } as const
 
@@ -19,7 +19,7 @@ describe('session-directory projection', () => {
       provider: 'codex',
       sessionId: 's1',
       projectPath: '/repo',
-      updatedAt: 100,
+      lastActivityAt: 100,
       createdAt: 50,
       title: 'Deploy',
       summary: 'Summary',
@@ -36,7 +36,7 @@ describe('session-directory projection', () => {
       provider: 'codex',
       sessionId: 's1',
       projectPath: '/repo',
-      updatedAt: 100,
+      lastActivityAt: 100,
       createdAt: 50,
       title: 'Deploy',
       summary: 'Summary',
@@ -49,7 +49,7 @@ describe('session-directory projection', () => {
     })
   })
 
-  it('ignores invisible metadata and project color but still treats updatedAt as visible', () => {
+  it('ignores invisible metadata and project color but still treats lastActivityAt as visible', () => {
     const first: ProjectGroup[] = [{
       projectPath: '/repo',
       color: '#f00',
@@ -60,15 +60,15 @@ describe('session-directory projection', () => {
       color: '#0f0',
       sessions: [{ ...baseSession, tokenUsage: { inputTokens: 9, outputTokens: 9, cachedTokens: 9, totalTokens: 27 }, sourceFile: '/tmp/other.jsonl' }],
     }]
-    const updatedAtChanged: ProjectGroup[] = [{
+    const lastActivityAtChanged: ProjectGroup[] = [{
       projectPath: '/repo',
-      sessions: [{ ...baseSession, updatedAt: 101 }],
+      sessions: [{ ...baseSession, lastActivityAt: 101 }],
     }]
 
     expect(hasSessionDirectorySnapshotChange(first, second)).toBe(false)
     expect(hasSessionDirectorySnapshotChange(
-      [{ projectPath: '/repo', sessions: [{ ...baseSession, updatedAt: 100 }] }],
-      updatedAtChanged,
+      [{ projectPath: '/repo', sessions: [{ ...baseSession, lastActivityAt: 100 }] }],
+      lastActivityAtChanged,
     )).toBe(true)
   })
 })

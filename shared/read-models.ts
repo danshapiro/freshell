@@ -31,6 +31,32 @@ export const SessionDirectoryQuerySchema = z.object({
   limit: z.number().int().positive().max(MAX_DIRECTORY_PAGE_ITEMS).optional(),
 })
 
+export const SessionDirectoryItemSchema = z.object({
+  sessionId: z.string().min(1),
+  provider: z.string().min(1),
+  projectPath: z.string().min(1),
+  title: z.string().optional(),
+  summary: z.string().optional(),
+  snippet: z.string().optional(),
+  matchedIn: z.enum(['title', 'summary', 'firstUserMessage']).optional(),
+  lastActivityAt: z.number().int().nonnegative(),
+  createdAt: z.number().int().nonnegative().optional(),
+  archived: z.boolean().optional(),
+  cwd: z.string().optional(),
+  sessionType: z.string().optional(),
+  firstUserMessage: z.string().optional(),
+  isSubagent: z.boolean().optional(),
+  isNonInteractive: z.boolean().optional(),
+  isRunning: z.boolean(),
+  runningTerminalId: z.string().optional(),
+})
+
+export const SessionDirectoryPageSchema = z.object({
+  items: z.array(SessionDirectoryItemSchema),
+  nextCursor: z.string().nullable(),
+  revision: z.number().int().nonnegative(),
+})
+
 export const TerminalDirectoryQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
   priority: ReadModelPrioritySchema,
@@ -58,6 +84,8 @@ export const TerminalSearchQuerySchema = z.object({
 export type ReadModelPriority = z.infer<typeof ReadModelPrioritySchema>
 export type ReadModelLane = z.infer<typeof ReadModelLaneSchema>
 export type SessionDirectoryQuery = z.infer<typeof SessionDirectoryQuerySchema>
+export type SessionDirectoryItem = z.infer<typeof SessionDirectoryItemSchema>
+export type SessionDirectoryPage = z.infer<typeof SessionDirectoryPageSchema>
 export type TerminalDirectoryQuery = z.infer<typeof TerminalDirectoryQuerySchema>
 export type AgentTimelinePageQuery = z.infer<typeof AgentTimelinePageQuerySchema>
 export type TerminalScrollbackQuery = z.infer<typeof TerminalScrollbackQuerySchema>
