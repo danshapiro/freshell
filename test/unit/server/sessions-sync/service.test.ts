@@ -8,10 +8,10 @@ function createWsMocks() {
   }
 }
 
-function createProject(path: string, updatedAt: number): ProjectGroup {
+function createProject(path: string, lastActivityAt: number): ProjectGroup {
   return {
     projectPath: path,
-    sessions: [{ provider: 'claude', sessionId: `${path}-${updatedAt}`, projectPath: path, updatedAt }],
+    sessions: [{ provider: 'claude', sessionId: `${path}-${lastActivityAt}`, projectPath: path, lastActivityAt }],
   }
 }
 
@@ -22,7 +22,7 @@ function createDetailedProject(
 ): ProjectGroup {
   return {
     projectPath: path,
-    sessions: [{ provider: 'claude', projectPath: path, updatedAt: 1, sessionId: 's1', ...session }],
+    sessions: [{ provider: 'claude', projectPath: path, lastActivityAt: 1, sessionId: 's1', ...session }],
     ...(color ? { color } : {}),
   }
 }
@@ -151,7 +151,7 @@ describe('SessionsSyncService', () => {
           provider: 'claude',
           sessionId: `s-${index}`,
           projectPath: '/p1',
-          updatedAt: index,
+          lastActivityAt: index,
           summary: 'x'.repeat(2_000),
         })),
       },
@@ -170,7 +170,7 @@ describe('SessionsSyncService', () => {
         provider: 'codex',
         sessionId: 's1',
         projectPath: '/repo',
-        updatedAt: 100,
+        lastActivityAt: 100,
         title: 'Deploy',
         tokenUsage: {
           inputTokens: 1,
@@ -185,7 +185,7 @@ describe('SessionsSyncService', () => {
         provider: 'codex',
         sessionId: 's1',
         projectPath: '/repo',
-        updatedAt: 100,
+        lastActivityAt: 100,
         title: 'Deploy',
         tokenUsage: {
           inputTokens: 9,
@@ -201,7 +201,7 @@ describe('SessionsSyncService', () => {
         provider: 'codex',
         sessionId: 's1',
         projectPath: '/repo',
-        updatedAt: 101,
+        lastActivityAt: 101,
         title: 'Deploy',
       }, '#0f0'),
     ])
@@ -210,7 +210,7 @@ describe('SessionsSyncService', () => {
         provider: 'codex',
         sessionId: 's1',
         projectPath: '/repo',
-        updatedAt: 101,
+        lastActivityAt: 101,
         title: 'Deploy v2',
       }, '#0f0'),
     ])

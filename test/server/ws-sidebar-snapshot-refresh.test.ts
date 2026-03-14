@@ -109,7 +109,7 @@ describe('ws sidebar snapshot refresh', () => {
                 provider: 'claude',
                 sessionId: 'older-open',
                 projectPath: '/demo',
-                updatedAt: 10,
+                lastActivityAt: 10,
               },
             ],
           },

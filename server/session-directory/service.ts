@@ -20,7 +20,7 @@ type QuerySessionDirectoryInput = {
 }
 
 type CursorPayload = {
-  updatedAt: number
+  lastActivityAt: number
   key: string
 }
 
@@ -35,10 +35,10 @@ function encodeCursor(payload: CursorPayload): string {
 function decodeCursor(cursor: string): CursorPayload {
   try {
     const payload = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as Partial<CursorPayload>
-    if (typeof payload.updatedAt !== 'number' || !Number.isFinite(payload.updatedAt) || typeof payload.key !== 'string' || payload.key.length === 0) {
+    if (typeof payload.lastActivityAt !== 'number' || !Number.isFinite(payload.lastActivityAt) || typeof payload.key !== 'string' || payload.key.length === 0) {
       throw new Error('invalid')
     }
-    return { updatedAt: payload.updatedAt, key: payload.key }
+    return { lastActivityAt: payload.lastActivityAt, key: payload.key }
   } catch {
     throw new Error('Invalid session-directory cursor')
   }
@@ -106,7 +106,7 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
   const cursor = input.query.cursor ? decodeCursor(input.query.cursor) : null
   const revision = Math.max(
     0,
-    ...input.projects.flatMap((project) => project.sessions.map((session) => session.updatedAt)),
+    ...input.projects.flatMap((project) => project.sessions.map((session) => session.lastActivityAt)),
     ...input.terminalMeta.map((meta) => meta.updatedAt),
   )
 
@@ -123,8 +123,8 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
 
   if (cursor) {
     items = items.filter((item) => (
-      item.updatedAt < cursor.updatedAt ||
-      (item.updatedAt === cursor.updatedAt && buildSessionKey(item).localeCompare(cursor.key) < 0)
+      item.lastActivityAt < cursor.lastActivityAt ||
+      (item.lastActivityAt === cursor.lastActivityAt && buildSessionKey(item).localeCompare(cursor.key) < 0)
     ))
   }
 
@@ -133,7 +133,7 @@ export async function querySessionDirectory(input: QuerySessionDirectoryInput): 
   const pageItems = items.slice(0, limit)
   const tail = pageItems.at(-1)
   const nextCursor = items.length > limit && tail
-    ? encodeCursor({ updatedAt: tail.updatedAt, key: buildSessionKey(tail) })
+    ? encodeCursor({ lastActivityAt: tail.lastActivityAt, key: buildSessionKey(tail) })
     : null
 
   return {

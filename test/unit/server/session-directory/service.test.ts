@@ -4,7 +4,7 @@ import type { ProjectGroup, CodingCliSession } from '../../../../server/coding-c
 import type { TerminalMeta } from '../../../../server/terminal-metadata-service.js'
 import { querySessionDirectory } from '../../../../server/session-directory/service.js'
 
-function makeSession(overrides: Partial<CodingCliSession> & Pick<CodingCliSession, 'sessionId' | 'projectPath' | 'updatedAt'>): CodingCliSession {
+function makeSession(overrides: Partial<CodingCliSession> & Pick<CodingCliSession, 'sessionId' | 'projectPath' | 'lastActivityAt'>): CodingCliSession {
   return {
     provider: 'claude',
     title: overrides.sessionId,
@@ -30,7 +30,7 @@ describe('querySessionDirectory', () => {
       makeSession({
         sessionId: 'session-archived',
         projectPath: '/repo/alpha',
-        updatedAt: 400,
+        lastActivityAt: 400,
         archived: true,
         title: 'Old archived session',
         summary: 'Archived deploy history',
@@ -38,7 +38,7 @@ describe('querySessionDirectory', () => {
       makeSession({
         sessionId: 'session-tie-z',
         projectPath: '/repo/alpha',
-        updatedAt: 1_000,
+        lastActivityAt: 1_000,
         title: 'Zulu deploy',
         summary: 'Deploy summary',
         firstUserMessage: 'deploy alpha service',
@@ -47,7 +47,7 @@ describe('querySessionDirectory', () => {
       makeSession({
         sessionId: 'session-search',
         projectPath: '/repo/alpha',
-        updatedAt: 900,
+        lastActivityAt: 900,
         title: 'Routine work',
         summary: 'This session investigates deploy failures in production and captures the remediation notes in detail.',
         firstUserMessage: 'Investigate deploy failures and remediate them safely.',
@@ -58,7 +58,7 @@ describe('querySessionDirectory', () => {
         provider: 'codex',
         sessionId: 'session-tie-a',
         projectPath: '/repo/beta',
-        updatedAt: 1_000,
+        lastActivityAt: 1_000,
         title: 'Alpha deploy',
         summary: 'Deploy beta',
         firstUserMessage: 'check beta deploy',
@@ -67,7 +67,7 @@ describe('querySessionDirectory', () => {
       makeSession({
         sessionId: 'session-recent',
         projectPath: '/repo/beta',
-        updatedAt: 1_100,
+        lastActivityAt: 1_100,
         title: 'Newest session',
         firstUserMessage: 'latest visible work',
       }),
@@ -143,6 +143,10 @@ describe('querySessionDirectory', () => {
       'session-tie-a',
     ])
     expect(firstPage.nextCursor).toBeTruthy()
+    expect(JSON.parse(Buffer.from(firstPage.nextCursor!, 'base64url').toString('utf8'))).toEqual({
+      lastActivityAt: 1_000,
+      key: 'codex:session-tie-a',
+    })
 
     const secondPage = await querySessionDirectory({
       projects,
@@ -176,7 +180,7 @@ describe('querySessionDirectory', () => {
       makeProject('/repo/many', Array.from({ length: 75 }, (_, index) => makeSession({
         sessionId: `session-${index}`,
         projectPath: '/repo/many',
-        updatedAt: 5_000 - index,
+        lastActivityAt: 5_000 - index,
       }))),
     ]
 
