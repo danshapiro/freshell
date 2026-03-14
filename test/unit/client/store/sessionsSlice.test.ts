@@ -28,14 +28,14 @@ describe('sessionsSlice', () => {
         {
           sessionId: 'session-1',
           projectPath: '/project/one',
-          updatedAt: 1700000000000,
+          lastActivityAt: 1700000000000,
           messageCount: 5,
           title: 'First Session',
         },
         {
           sessionId: 'session-2',
           projectPath: '/project/one',
-          updatedAt: 1700000001000,
+          lastActivityAt: 1700000001000,
           messageCount: 3,
           title: 'Second Session',
         },
@@ -48,7 +48,7 @@ describe('sessionsSlice', () => {
         {
           sessionId: 'session-3',
           projectPath: '/project/two',
-          updatedAt: 1700000002000,
+          lastActivityAt: 1700000002000,
           title: 'Third Session',
         },
       ],
@@ -237,7 +237,7 @@ describe('sessionsSlice', () => {
       const existingProjects: ProjectGroup[] = [
         {
           projectPath: '/project/one',
-          sessions: [{ sessionId: 'old-session', projectPath: '/project/one', updatedAt: 1600000000000 }],
+          sessions: [{ sessionId: 'old-session', projectPath: '/project/one', lastActivityAt: 1600000000000 }],
         },
         {
           projectPath: '/project/existing',
@@ -252,7 +252,7 @@ describe('sessionsSlice', () => {
       const newProjects: ProjectGroup[] = [
         {
           projectPath: '/project/one',
-          sessions: [{ sessionId: 'new-session', projectPath: '/project/one', updatedAt: 1700000000000 }],
+          sessions: [{ sessionId: 'new-session', projectPath: '/project/one', lastActivityAt: 1700000000000 }],
           color: '#ff0000',
         },
         {
@@ -314,11 +314,11 @@ describe('sessionsSlice', () => {
   describe('applySessionsPatch', () => {
     it('ignores patches until a WS sessions.updated snapshot has been received', () => {
       const starting = sessionsReducer(undefined, setProjects([
-        { projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', updatedAt: 1 }] },
+        { projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', lastActivityAt: 1 }] },
       ] as any))
 
       const next = sessionsReducer(starting, applySessionsPatch({
-        upsertProjects: [{ projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', projectPath: '/p2', updatedAt: 2 }] }],
+        upsertProjects: [{ projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', projectPath: '/p2', lastActivityAt: 2 }] }],
         removeProjectPaths: [],
       }))
 
@@ -328,28 +328,28 @@ describe('sessionsSlice', () => {
 
     it('upserts projects and removes deleted project paths', () => {
       let starting = sessionsReducer(undefined, setProjects([
-        { projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', updatedAt: 1 }] },
-        { projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', projectPath: '/p2', updatedAt: 2 }] },
+        { projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', lastActivityAt: 1 }] },
+        { projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', projectPath: '/p2', lastActivityAt: 2 }] },
       ] as any))
       starting = sessionsReducer(starting, markWsSnapshotReceived())
 
       const next = sessionsReducer(starting, applySessionsPatch({
-        upsertProjects: [{ projectPath: '/p3', sessions: [{ provider: 'claude', sessionId: 's3', projectPath: '/p3', updatedAt: 3 }] }],
+        upsertProjects: [{ projectPath: '/p3', sessions: [{ provider: 'claude', sessionId: 's3', projectPath: '/p3', lastActivityAt: 3 }] }],
         removeProjectPaths: ['/p1'],
       }))
 
       expect(next.projects.map((p) => p.projectPath).sort()).toEqual(['/p2', '/p3'])
     })
 
-    it('keeps HistoryView project ordering stable by sorting projects by newest session updatedAt', () => {
+    it('keeps HistoryView project ordering stable by sorting projects by newest session lastActivityAt', () => {
       let starting = sessionsReducer(undefined, setProjects([
-        { projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', projectPath: '/p2', updatedAt: 20 }] },
-        { projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', updatedAt: 10 }] },
+        { projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', projectPath: '/p2', lastActivityAt: 20 }] },
+        { projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', lastActivityAt: 10 }] },
       ] as any))
       starting = sessionsReducer(starting, markWsSnapshotReceived())
 
       const next = sessionsReducer(starting, applySessionsPatch({
-        upsertProjects: [{ projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', updatedAt: 30 }] }],
+        upsertProjects: [{ projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', lastActivityAt: 30 }] }],
         removeProjectPaths: [],
       }))
 
@@ -582,20 +582,20 @@ describe('sessionsSlice', () => {
         {
           projectPath: '/large/project',
           sessions: [
-            { sessionId: 's1', projectPath: '/large/project', updatedAt: 1 },
-            { sessionId: 's2', projectPath: '/large/project', updatedAt: 2 },
+            { sessionId: 's1', projectPath: '/large/project', lastActivityAt: 1 },
+            { sessionId: 's2', projectPath: '/large/project', lastActivityAt: 2 },
           ],
         },
         {
           projectPath: '/large/project',
           sessions: [
-            { sessionId: 's3', projectPath: '/large/project', updatedAt: 3 },
+            { sessionId: 's3', projectPath: '/large/project', lastActivityAt: 3 },
           ],
         },
         {
           projectPath: '/other/project',
           sessions: [
-            { sessionId: 's4', projectPath: '/other/project', updatedAt: 4 },
+            { sessionId: 's4', projectPath: '/other/project', lastActivityAt: 4 },
           ],
         },
       ]
@@ -615,12 +615,12 @@ describe('sessionsSlice', () => {
       const splitChunks: ProjectGroup[] = [
         {
           projectPath: '/colored/project',
-          sessions: [{ sessionId: 's1', projectPath: '/colored/project', updatedAt: 1 }],
+          sessions: [{ sessionId: 's1', projectPath: '/colored/project', lastActivityAt: 1 }],
           color: '#ff0000',
         },
         {
           projectPath: '/colored/project',
-          sessions: [{ sessionId: 's2', projectPath: '/colored/project', updatedAt: 2 }],
+          sessions: [{ sessionId: 's2', projectPath: '/colored/project', lastActivityAt: 2 }],
         },
       ]
 
@@ -638,15 +638,15 @@ describe('sessionsSlice', () => {
         {
           projectPath: '/project/dup',
           sessions: [
-            { sessionId: 's1', projectPath: '/project/dup', updatedAt: 1 },
-            { sessionId: 's2', projectPath: '/project/dup', updatedAt: 2 },
+            { sessionId: 's1', projectPath: '/project/dup', lastActivityAt: 1 },
+            { sessionId: 's2', projectPath: '/project/dup', lastActivityAt: 2 },
           ],
         },
         {
           projectPath: '/project/dup',
           sessions: [
-            { sessionId: 's2', projectPath: '/project/dup', updatedAt: 2 },
-            { sessionId: 's3', projectPath: '/project/dup', updatedAt: 3 },
+            { sessionId: 's2', projectPath: '/project/dup', lastActivityAt: 2 },
+            { sessionId: 's3', projectPath: '/project/dup', lastActivityAt: 3 },
           ],
         },
       ]
@@ -664,13 +664,13 @@ describe('sessionsSlice', () => {
         {
           projectPath: '/project/multi',
           sessions: [
-            { sessionId: 's1', projectPath: '/project/multi', updatedAt: 1, provider: 'claude' },
+            { sessionId: 's1', projectPath: '/project/multi', lastActivityAt: 1, provider: 'claude' },
           ],
         },
         {
           projectPath: '/project/multi',
           sessions: [
-            { sessionId: 's1', projectPath: '/project/multi', updatedAt: 2, provider: 'codex' },
+            { sessionId: 's1', projectPath: '/project/multi', lastActivityAt: 2, provider: 'codex' },
           ],
         },
       ]
@@ -685,7 +685,7 @@ describe('sessionsSlice', () => {
       const bad: ProjectGroup[] = [
         {
           projectPath: '/project/one',
-          sessions: [1, 'x', null, [], { sessionId: 's1', projectPath: '/project/one', updatedAt: 1 }] as any,
+          sessions: [1, 'x', null, [], { sessionId: 's1', projectPath: '/project/one', lastActivityAt: 1 }] as any,
         },
       ]
 
@@ -699,12 +699,12 @@ describe('sessionsSlice', () => {
     it('adds new projects from snapshot', () => {
       const existing: ProjectGroup[] = [
         { projectPath: '/project/a', sessions: [
-          { sessionId: 's1', projectPath: '/project/a', updatedAt: 1000, provider: 'claude' },
+          { sessionId: 's1', projectPath: '/project/a', lastActivityAt: 1000, provider: 'claude' },
         ] },
       ]
       const snapshot: ProjectGroup[] = [
         { projectPath: '/project/b', sessions: [
-          { sessionId: 's2', projectPath: '/project/b', updatedAt: 2000, provider: 'claude' },
+          { sessionId: 's2', projectPath: '/project/b', lastActivityAt: 2000, provider: 'claude' },
         ] },
       ]
       let state = sessionsReducer(initialState, setProjects(existing))
@@ -718,14 +718,14 @@ describe('sessionsSlice', () => {
     it('updates sessions from snapshot while preserving older sessions', () => {
       const existing: ProjectGroup[] = [
         { projectPath: '/project/a', sessions: [
-          { sessionId: 's1', projectPath: '/project/a', updatedAt: 3000, provider: 'claude', title: 'Recent' },
-          { sessionId: 's2', projectPath: '/project/a', updatedAt: 1000, provider: 'claude', title: 'Old paginated' },
+          { sessionId: 's1', projectPath: '/project/a', lastActivityAt: 3000, provider: 'claude', title: 'Recent' },
+          { sessionId: 's2', projectPath: '/project/a', lastActivityAt: 1000, provider: 'claude', title: 'Old paginated' },
         ] },
       ]
       // Snapshot only includes the recent session (paginated window)
       const snapshot: ProjectGroup[] = [
         { projectPath: '/project/a', sessions: [
-          { sessionId: 's1', projectPath: '/project/a', updatedAt: 4000, provider: 'claude', title: 'Recent updated' },
+          { sessionId: 's1', projectPath: '/project/a', lastActivityAt: 4000, provider: 'claude', title: 'Recent updated' },
         ] },
       ]
       let state = sessionsReducer(initialState, setProjects(existing))
@@ -736,7 +736,7 @@ describe('sessionsSlice', () => {
 
       const s1 = project.sessions.find((s: any) => s.sessionId === 's1') as any
       expect(s1.title).toBe('Recent updated')
-      expect(s1.updatedAt).toBe(4000)
+      expect(s1.lastActivityAt).toBe(4000)
 
       const s2 = project.sessions.find((s: any) => s.sessionId === 's2') as any
       expect(s2.title).toBe('Old paginated')
@@ -745,14 +745,14 @@ describe('sessionsSlice', () => {
     it('does not duplicate sessions that appear in both snapshot and existing', () => {
       const existing: ProjectGroup[] = [
         { projectPath: '/project/a', sessions: [
-          { sessionId: 's1', projectPath: '/project/a', updatedAt: 1000, provider: 'claude' },
-          { sessionId: 's2', projectPath: '/project/a', updatedAt: 500, provider: 'claude' },
+          { sessionId: 's1', projectPath: '/project/a', lastActivityAt: 1000, provider: 'claude' },
+          { sessionId: 's2', projectPath: '/project/a', lastActivityAt: 500, provider: 'claude' },
         ] },
       ]
       const snapshot: ProjectGroup[] = [
         { projectPath: '/project/a', sessions: [
-          { sessionId: 's1', projectPath: '/project/a', updatedAt: 2000, provider: 'claude' },
-          { sessionId: 's2', projectPath: '/project/a', updatedAt: 1500, provider: 'claude' },
+          { sessionId: 's1', projectPath: '/project/a', lastActivityAt: 2000, provider: 'claude' },
+          { sessionId: 's2', projectPath: '/project/a', lastActivityAt: 1500, provider: 'claude' },
         ] },
       ]
       let state = sessionsReducer(initialState, setProjects(existing))
@@ -765,16 +765,16 @@ describe('sessionsSlice', () => {
     it('preserves projects not in the snapshot', () => {
       const existing: ProjectGroup[] = [
         { projectPath: '/project/a', sessions: [
-          { sessionId: 's1', projectPath: '/project/a', updatedAt: 1000, provider: 'claude' },
+          { sessionId: 's1', projectPath: '/project/a', lastActivityAt: 1000, provider: 'claude' },
         ] },
         { projectPath: '/project/old', sessions: [
-          { sessionId: 's-old', projectPath: '/project/old', updatedAt: 100, provider: 'claude' },
+          { sessionId: 's-old', projectPath: '/project/old', lastActivityAt: 100, provider: 'claude' },
         ] },
       ]
       // Snapshot only has project/a (paginated, doesn't include old projects)
       const snapshot: ProjectGroup[] = [
         { projectPath: '/project/a', sessions: [
-          { sessionId: 's1', projectPath: '/project/a', updatedAt: 2000, provider: 'claude' },
+          { sessionId: 's1', projectPath: '/project/a', lastActivityAt: 2000, provider: 'claude' },
         ] },
       ]
       let state = sessionsReducer(initialState, setProjects(existing))
@@ -788,13 +788,13 @@ describe('sessionsSlice', () => {
     it('handles different providers for the same sessionId', () => {
       const existing: ProjectGroup[] = [
         { projectPath: '/project/a', sessions: [
-          { sessionId: 's1', projectPath: '/project/a', updatedAt: 1000, provider: 'claude' },
-          { sessionId: 's1', projectPath: '/project/a', updatedAt: 500, provider: 'codex' },
+          { sessionId: 's1', projectPath: '/project/a', lastActivityAt: 1000, provider: 'claude' },
+          { sessionId: 's1', projectPath: '/project/a', lastActivityAt: 500, provider: 'codex' },
         ] },
       ]
       const snapshot: ProjectGroup[] = [
         { projectPath: '/project/a', sessions: [
-          { sessionId: 's1', projectPath: '/project/a', updatedAt: 2000, provider: 'claude' },
+          { sessionId: 's1', projectPath: '/project/a', lastActivityAt: 2000, provider: 'claude' },
         ] },
       ]
       let state = sessionsReducer(initialState, setProjects(existing))
@@ -804,9 +804,9 @@ describe('sessionsSlice', () => {
       // Should have both: updated claude session + preserved codex session
       expect(project.sessions).toHaveLength(2)
       const claudeSession = project.sessions.find((s: any) => s.provider === 'claude') as any
-      expect(claudeSession.updatedAt).toBe(2000)
+      expect(claudeSession.lastActivityAt).toBe(2000)
       const codexSession = project.sessions.find((s: any) => s.provider === 'codex') as any
-      expect(codexSession.updatedAt).toBe(500)
+      expect(codexSession.lastActivityAt).toBe(500)
     })
   })
 })

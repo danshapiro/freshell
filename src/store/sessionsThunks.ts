@@ -66,7 +66,7 @@ function searchResultsToProjects(results: Awaited<ReturnType<typeof searchSessio
       provider: result.provider,
       sessionId: result.sessionId,
       projectPath: result.projectPath,
-      updatedAt: result.updatedAt,
+      lastActivityAt: result.lastActivityAt,
       createdAt: result.createdAt,
       archived: result.archived,
       cwd: result.cwd,
@@ -204,7 +204,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
             surface,
             projects: searchResultsToProjects(response.results),
             totalSessions: response.results.length,
-            oldestLoadedTimestamp: response.results.at(-1)?.updatedAt ?? 0,
+            oldestLoadedTimestamp: response.results.at(-1)?.lastActivityAt ?? 0,
             oldestLoadedSessionId: response.results.at(-1)
               ? `${response.results.at(-1)!.provider}:${response.results.at(-1)!.sessionId}`
               : '',

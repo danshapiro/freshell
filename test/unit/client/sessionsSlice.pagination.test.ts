@@ -11,8 +11,8 @@ import sessionsReducer, {
 } from '../../../src/store/sessionsSlice'
 import type { ProjectGroup } from '../../../src/store/types'
 
-function makeSession(provider: string, sessionId: string, updatedAt: number, projectPath: string) {
-  return { provider, sessionId, projectPath, updatedAt, title: `Session ${sessionId}` }
+function makeSession(provider: string, sessionId: string, lastActivityAt: number, projectPath: string) {
+  return { provider, sessionId, projectPath, lastActivityAt, title: `Session ${sessionId}` }
 }
 
 function makeProject(path: string, sessions: any[]): ProjectGroup {
@@ -167,7 +167,7 @@ describe('sessionsSlice pagination', () => {
 
     it('treats a missing provider as claude when deduplicating older pages', () => {
       const existing = [
-        makeProject('/a', [{ sessionId: 's1', projectPath: '/a', updatedAt: 200, title: 'Session s1' } as any]),
+        makeProject('/a', [{ sessionId: 's1', projectPath: '/a', lastActivityAt: 200, title: 'Session s1' } as any]),
       ]
       let state = stateWith(existing)
 

@@ -55,11 +55,11 @@ function normalizeProjects(payload: unknown): ProjectGroup[] {
   return Array.from(merged.values())
 }
 
-function projectNewestUpdatedAt(project: ProjectGroup): number {
-  // Sessions are expected sorted by updatedAt desc from the server, but don't rely on it.
+function projectNewestLastActivityAt(project: ProjectGroup): number {
+  // Sessions are expected sorted by lastActivityAt desc from the server, but don't rely on it.
   let max = 0
   for (const s of project.sessions || []) {
-    if (typeof (s as any).updatedAt === 'number') max = Math.max(max, (s as any).updatedAt)
+    if (typeof (s as any).lastActivityAt === 'number') max = Math.max(max, (s as any).lastActivityAt)
   }
   return max
 }
@@ -68,7 +68,7 @@ function sortProjectsByRecency(projects: ProjectGroup[]): ProjectGroup[] {
   const newestByPath = new Map<string, number>()
   const newest = (project: ProjectGroup): number => {
     if (newestByPath.has(project.projectPath)) return newestByPath.get(project.projectPath)!
-    const time = projectNewestUpdatedAt(project)
+    const time = projectNewestLastActivityAt(project)
     newestByPath.set(project.projectPath, time)
     return time
   }
