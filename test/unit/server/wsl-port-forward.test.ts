@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { execFile, execSync } from 'child_process'
+import fsp from 'fs/promises'
+import os from 'os'
+import path from 'path'
 
 vi.mock('child_process')
 vi.mock('../../../server/platform.js', () => ({
@@ -24,16 +27,30 @@ import {
   buildPortForwardingTeardownScript,
   computeWslPortForwardingTeardownPlan,
   computeWslPortForwardingTeardownPlanAsync,
+  persistManagedWslRemoteAccessPorts,
   type PortProxyRule
 } from '../../../server/wsl-port-forward.js'
 
 describe('wsl-port-forward', () => {
-  beforeEach(() => {
+  let originalHome: string | undefined
+  let tempHome: string
+
+  beforeEach(async () => {
     vi.clearAllMocks()
+    originalHome = process.env.HOME
+    tempHome = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-wsl-port-forward-'))
+    process.env.HOME = tempHome
+    vi.spyOn(os, 'homedir').mockReturnValue(tempHome)
   })
 
-  afterEach(() => {
+  afterEach(async () => {
     vi.resetAllMocks()
+    if (originalHome === undefined) {
+      delete process.env.HOME
+    } else {
+      process.env.HOME = originalHome
+    }
+    await fsp.rm(tempHome, { recursive: true, force: true })
   })
 
   describe('getWslIp', () => {
@@ -636,6 +653,38 @@ LocalPort:                            3001,5173
       })
     })
 
+    it('tears down stale owned portproxy-only drift without deleting unrelated Windows rules', async () => {
+      await persistManagedWslRemoteAccessPorts([5173])
+      vi.mocked(isWSL2).mockReturnValue(true)
+      vi.mocked(execFile).mockImplementation((_cmd: any, args: any, _opts: any, cb: any) => {
+        if (args[0] === 'interface') {
+          cb?.(null, `
+Listen on ipv4:             Connect to ipv4:
+
+Address         Port        Address         Port
+--------------- ----------  --------------- ----------
+0.0.0.0         5173        172.30.149.249  5173
+0.0.0.0         8080        10.0.0.8       8080
+`, '')
+          return {} as any
+        }
+
+        const missingRuleError = Object.assign(new Error('rule not found'), { code: 1 })
+        cb?.(missingRuleError, 'Aucune regle ne correspond aux criteres specifies.\r\n', '')
+        return {} as any
+      })
+
+      const plan = await computeWslPortForwardingTeardownPlanAsync([3001])
+      expect(plan).toEqual({
+        status: 'ready',
+        script: expect.stringContaining('listenport=5173'),
+      })
+      if (plan.status === 'ready') {
+        expect(plan.script).toContain('listenport=3001')
+        expect(plan.script).not.toContain('listenport=8080')
+      }
+    })
+
     it('treats a missing Freshell firewall rule as normal absence instead of a fatal async error', async () => {
       vi.mocked(isWSL2).mockReturnValue(true)
       vi.mocked(execFile).mockImplementation((_cmd: any, args: any, _opts: any, cb: any) => {
@@ -649,7 +698,8 @@ Address         Port        Address         Port
           return {} as any
         }
 
-        cb?.(new Error('rule not found'), 'No rules match the specified criteria.\r\n', '')
+        const missingRuleError = Object.assign(new Error('rule not found'), { code: 1 })
+        cb?.(missingRuleError, 'Aucune regle ne correspond aux criteres specifies.\r\n', '')
         return {} as any
       })
 
@@ -692,7 +742,8 @@ Address         Port        Address         Port
           return {} as any
         }
 
-        cb?.(new Error('rule not found'), 'No rules match the specified criteria.\r\n', '')
+        const missingRuleError = Object.assign(new Error('rule not found'), { code: 1 })
+        cb?.(missingRuleError, 'Aucune regle ne correspond aux criteres specifies.\r\n', '')
         return {} as any
       })
 

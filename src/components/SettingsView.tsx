@@ -395,6 +395,14 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
             return
           }
 
+          const remoteAccessStillEnabled = isRemoteAccessEnabledStatus(status)
+            || (status.remoteAccessRequested ?? false)
+          if (remoteAccessStillEnabled) {
+            setRemoteAccessPending(false)
+            setRemoteAccessError('Remote access is still enabled')
+            return
+          }
+
           setRemoteAccessPending(false)
         })
         .catch(() => {

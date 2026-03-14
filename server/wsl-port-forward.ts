@@ -1,9 +1,14 @@
 import { execFile, execSync } from 'child_process'
+import fs from 'node:fs'
+import fsp from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
 import { isWSL2 } from './platform.js'
 
 const IPV4_REGEX = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/
 const NETSH_PATH = '/mnt/c/Windows/System32/netsh.exe'
 const DEFAULT_PORT = 3001
+const MANAGED_WSL_PORTS_FILE = 'wsl-managed-remote-access-ports.json'
 
 type ExecFileSettledResult = {
   error: Error | null
@@ -52,13 +57,65 @@ function toErrorText(value: unknown): string {
   return ''
 }
 
-function isMissingFirewallRuleOutput(stdout: string, stderr: string): boolean {
-  const combinedText = [stdout, stderr]
-    .map(toErrorText)
-    .filter(Boolean)
-    .join('\n')
+function getManagedWslPortsPath(): string {
+  return path.join(os.homedir(), '.freshell', MANAGED_WSL_PORTS_FILE)
+}
 
-  return /no rules match the specified criteria/i.test(combinedText)
+function normalizeManagedPorts(ports: number[]): number[] {
+  return Array.from(new Set(
+    ports.filter((port) => Number.isInteger(port) && port >= 1 && port <= 65535),
+  )).sort((a, b) => a - b)
+}
+
+function parseManagedWslPorts(raw: string): Set<number> {
+  try {
+    const parsed = JSON.parse(raw) as { ports?: unknown }
+    if (!Array.isArray(parsed.ports)) {
+      return new Set()
+    }
+
+    return new Set(normalizeManagedPorts(parsed.ports.filter((port): port is number => typeof port === 'number')))
+  } catch {
+    return new Set()
+  }
+}
+
+function readManagedWslRemoteAccessPorts(): Set<number> {
+  try {
+    return parseManagedWslPorts(fs.readFileSync(getManagedWslPortsPath(), 'utf-8'))
+  } catch {
+    return new Set()
+  }
+}
+
+async function readManagedWslRemoteAccessPortsAsync(): Promise<Set<number>> {
+  try {
+    return parseManagedWslPorts(await fsp.readFile(getManagedWslPortsPath(), 'utf-8'))
+  } catch {
+    return new Set()
+  }
+}
+
+function getExecExitCode(error: Error | null): number | null {
+  if (!error || typeof error !== 'object') {
+    return null
+  }
+
+  const code = (error as { code?: unknown }).code
+  if (typeof code === 'number') {
+    return code
+  }
+  if (typeof code === 'string' && /^\d+$/.test(code)) {
+    return Number.parseInt(code, 10)
+  }
+
+  return null
+}
+
+function isMissingFirewallRuleResult(error: Error | null, stdout: string, stderr: string): boolean {
+  return getExecExitCode(error) === 1
+    && toErrorText(stderr).trim().length === 0
+    && parseFirewallRulePorts(stdout).size === 0
 }
 
 export type PortProxyRule = {
@@ -200,6 +257,33 @@ export function getRequiredPorts(devPort?: number): number[] {
   return Array.from(ports)
 }
 
+export async function persistManagedWslRemoteAccessPorts(ports: number[]): Promise<void> {
+  const normalizedPorts = normalizeManagedPorts(ports)
+  const managedPortsPath = getManagedWslPortsPath()
+
+  if (normalizedPorts.length === 0) {
+    await clearManagedWslRemoteAccessPorts()
+    return
+  }
+
+  await fsp.mkdir(path.dirname(managedPortsPath), { recursive: true })
+  await fsp.writeFile(
+    managedPortsPath,
+    JSON.stringify({ ports: normalizedPorts }, null, 2),
+    'utf-8',
+  )
+}
+
+export async function clearManagedWslRemoteAccessPorts(): Promise<void> {
+  try {
+    await fsp.unlink(getManagedWslPortsPath())
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw error
+    }
+  }
+}
+
 async function getExistingPortProxyRulesAsync(): Promise<Map<number, PortProxyRule> | null> {
   try {
     const { stdout } = await execFileAsync(
@@ -257,7 +341,7 @@ async function getExistingFirewallPortsAsync(): Promise<Set<number> | null> {
   )
 
   if (error) {
-    if (isMissingFirewallRuleOutput(stdout, stderr)) {
+    if (isMissingFirewallRuleResult(error, stdout, stderr)) {
       return new Set()
     }
 
@@ -319,12 +403,12 @@ export function needsPortForwardingUpdate(
  * Uses \$null escaping to prevent shell variable expansion.
  * Firewall rule restricted to private profile for security.
  */
-export function buildPortForwardingScript(wslIp: string, ports: number[]): string {
+export function buildPortForwardingScript(wslIp: string, ports: number[], cleanupPorts: number[] = ports): string {
   const commands: string[] = []
 
   // Delete existing rules for 0.0.0.0 (the address we use for listening)
   // Use \$null to prevent sh from expanding $null
-  for (const port of ports) {
+  for (const port of new Set(cleanupPorts)) {
     commands.push(
       `netsh interface portproxy delete v4tov4 listenaddress=0.0.0.0 listenport=${port} 2>\\$null`
     )
@@ -392,6 +476,7 @@ function buildWslPortForwardingPlan(
   wslIp: string,
   existingRules: Map<number, PortProxyRule>,
   existingFirewallPorts: Set<number>,
+  managedPorts: Set<number>,
 ): WslPortForwardingPlan {
   const portsNeedUpdate = needsPortForwardingUpdate(wslIp, requiredPorts, existingRules)
   const firewallNeedsUpdate = needsFirewallUpdate(requiredPorts, existingFirewallPorts)
@@ -404,8 +489,9 @@ function buildWslPortForwardingPlan(
   }
 
   const scriptKind = portsNeedUpdate ? 'full' : 'firewall-only'
+  const cleanupPorts = Array.from(new Set([...requiredPorts, ...managedPorts]))
   const script = scriptKind === 'full'
-    ? buildPortForwardingScript(wslIp, requiredPorts)
+    ? buildPortForwardingScript(wslIp, requiredPorts, cleanupPorts)
     : buildFirewallOnlyScript(requiredPorts)
 
   return {
@@ -420,8 +506,9 @@ function buildWslPortForwardingTeardownPlan(
   requiredPorts: number[],
   existingRules: Map<number, PortProxyRule>,
   existingFirewallPorts: Set<number>,
+  managedPorts: Set<number>,
 ): WslPortForwardingTeardownPlan {
-  const teardownPorts = Array.from(new Set([...requiredPorts, ...existingFirewallPorts]))
+  const teardownPorts = Array.from(new Set([...requiredPorts, ...existingFirewallPorts, ...managedPorts]))
   const hasRelevantPortProxyRules = teardownPorts.some((port) => existingRules.has(port))
   const hasFreshellFirewallRule = existingFirewallPorts.size > 0
 
@@ -450,8 +537,9 @@ export function computeWslPortForwardingPlan(requiredPorts: number[]): WslPortFo
 
   const existingRules = getExistingPortProxyRules()
   const existingFirewallPorts = getExistingFirewallPorts()
+  const managedPorts = readManagedWslRemoteAccessPorts()
 
-  return buildWslPortForwardingPlan(requiredPorts, wslIp, existingRules, existingFirewallPorts)
+  return buildWslPortForwardingPlan(requiredPorts, wslIp, existingRules, existingFirewallPorts, managedPorts)
 }
 
 export async function computeWslPortForwardingPlanAsync(requiredPorts: number[]): Promise<WslPortForwardingPlan> {
@@ -471,6 +559,7 @@ export async function computeWslPortForwardingPlanAsync(requiredPorts: number[])
     getExistingPortProxyRulesAsync(),
     getExistingFirewallPortsAsync(),
   ])
+  const managedPorts = await readManagedWslRemoteAccessPortsAsync()
 
   if (existingRules === null || existingFirewallPorts === null) {
     return {
@@ -479,7 +568,7 @@ export async function computeWslPortForwardingPlanAsync(requiredPorts: number[])
     }
   }
 
-  return buildWslPortForwardingPlan(requiredPorts, wslIp, existingRules, existingFirewallPorts)
+  return buildWslPortForwardingPlan(requiredPorts, wslIp, existingRules, existingFirewallPorts, managedPorts)
 }
 
 export function computeWslPortForwardingTeardownPlan(requiredPorts: number[]): WslPortForwardingTeardownPlan {
@@ -489,8 +578,9 @@ export function computeWslPortForwardingTeardownPlan(requiredPorts: number[]): W
 
   const existingRules = getExistingPortProxyRules()
   const existingFirewallPorts = getExistingFirewallPorts()
+  const managedPorts = readManagedWslRemoteAccessPorts()
 
-  return buildWslPortForwardingTeardownPlan(requiredPorts, existingRules, existingFirewallPorts)
+  return buildWslPortForwardingTeardownPlan(requiredPorts, existingRules, existingFirewallPorts, managedPorts)
 }
 
 export async function computeWslPortForwardingTeardownPlanAsync(
@@ -504,6 +594,7 @@ export async function computeWslPortForwardingTeardownPlanAsync(
     getExistingPortProxyRulesAsync(),
     getExistingFirewallPortsAsync(),
   ])
+  const managedPorts = await readManagedWslRemoteAccessPortsAsync()
 
   if (existingRules === null || existingFirewallPorts === null) {
     return {
@@ -512,5 +603,5 @@ export async function computeWslPortForwardingTeardownPlanAsync(
     }
   }
 
-  return buildWslPortForwardingTeardownPlan(requiredPorts, existingRules, existingFirewallPorts)
+  return buildWslPortForwardingTeardownPlan(requiredPorts, existingRules, existingFirewallPorts, managedPorts)
 }

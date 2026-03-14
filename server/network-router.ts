@@ -5,8 +5,10 @@ import { spawnElevatedPowerShell } from './elevated-powershell.js'
 import { logger } from './logger.js'
 import { isRemoteAccessEnabled } from './network-access.js'
 import {
+  clearManagedWslRemoteAccessPorts,
   computeWslPortForwardingPlanAsync,
   computeWslPortForwardingTeardownPlanAsync,
+  persistManagedWslRemoteAccessPorts,
 } from './wsl-port-forward.js'
 
 const log = logger.child({ component: 'network-router' })
@@ -108,6 +110,22 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
   const applyRemoteAccessSetting = async (host: '127.0.0.1' | '0.0.0.0') => {
     await networkManager.configure({ host, configured: true })
     await broadcastSettingsUpdated()
+  }
+
+  const persistCurrentWslRemoteAccessPorts = async () => {
+    try {
+      await persistManagedWslRemoteAccessPorts(networkManager.getRemoteAccessPorts())
+    } catch (err) {
+      log.error({ err }, 'Failed to persist managed WSL remote access ports')
+    }
+  }
+
+  const clearManagedWslRemoteAccessPortsSafe = async () => {
+    try {
+      await clearManagedWslRemoteAccessPorts()
+    } catch (err) {
+      log.error({ err }, 'Failed to clear managed WSL remote access ports')
+    }
   }
 
   const startElevatedRepair = (
@@ -378,6 +396,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
       if (action.kind === 'none') {
         if (action.response.message === REMOTE_ACCESS_DISABLED_SUCCESS.message) {
           await applyRemoteAccessSetting('127.0.0.1')
+          await clearManagedWslRemoteAccessPortsSafe()
         }
         if (confirmElevation) {
           consumeCurrentConfirmation(confirmationToken)
@@ -424,11 +443,21 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
 
         if (freshAction.kind === 'none') {
           consumeCurrentConfirmation(confirmationToken)
-          if (freshAction.response.message === REMOTE_ACCESS_DISABLED_SUCCESS.message) {
-            await applyRemoteAccessSetting('127.0.0.1')
+          try {
+            if (freshAction.response.message === REMOTE_ACCESS_DISABLED_SUCCESS.message) {
+              await applyRemoteAccessSetting('127.0.0.1')
+              await clearManagedWslRemoteAccessPortsSafe()
+            }
+            return { status: 200 as const, body: freshAction.response }
+          } catch (err) {
+            log.error({ err }, 'Failed to persist confirmed WSL remote access disable settings')
+            return {
+              status: 500 as const,
+              body: { error: 'Failed to persist remote access disable settings' },
+            }
+          } finally {
+            releaseConfirmedRepair()
           }
-          releaseConfirmedRepair()
-          return { status: 200 as const, body: freshAction.response }
         }
 
         if (!consumeConfirmation(confirmationToken, freshAction.confirmationAction)) {
@@ -449,6 +478,7 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
               spawnFailedLog: 'Failed to spawn PowerShell for WSL2 remote access teardown',
               onSuccess: async () => {
                 await applyRemoteAccessSetting('127.0.0.1')
+                await clearManagedWslRemoteAccessPortsSafe()
               },
               releaseConfirmedRepair,
             },
@@ -571,6 +601,9 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
                 completedLog: 'WSL2 port forwarding completed successfully',
                 failedLog: 'WSL2 port forwarding failed',
                 spawnFailedLog: 'Failed to spawn PowerShell for WSL2 port forwarding',
+                onSuccess: async () => {
+                  await persistCurrentWslRemoteAccessPorts()
+                },
                 releaseConfirmedRepair,
               }
               : {

@@ -27,6 +27,7 @@ vi.mock('is-port-reachable', () => ({
   default: vi.fn().mockResolvedValue(false),
 }))
 vi.mock('../../../server/wsl-port-forward.js', () => ({
+  clearManagedWslRemoteAccessPorts: vi.fn().mockResolvedValue(undefined),
   computeWslPortForwardingPlan: vi.fn().mockReturnValue({
     status: 'ready',
     wslIp: '172.24.0.2',
@@ -47,6 +48,7 @@ vi.mock('../../../server/wsl-port-forward.js', () => ({
     status: 'ready',
     script: '$null # mock teardown script',
   }),
+  persistManagedWslRemoteAccessPorts: vi.fn().mockResolvedValue(undefined),
 }))
 vi.mock('node:child_process', async () => {
   const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process')
@@ -88,6 +90,8 @@ describe('Network API integration', () => {
     vi.mocked(wslModule.computeWslPortForwardingPlanAsync).mockReset()
     vi.mocked(wslModule.computeWslPortForwardingTeardownPlan).mockReset()
     vi.mocked(wslModule.computeWslPortForwardingTeardownPlanAsync).mockReset()
+    vi.mocked(wslModule.persistManagedWslRemoteAccessPorts).mockReset()
+    vi.mocked(wslModule.clearManagedWslRemoteAccessPorts).mockReset()
     delete process.env.HOST
     vi.mocked(detectFirewall).mockResolvedValue({ platform: 'linux-none', active: false })
     vi.mocked(isPortReachable).mockResolvedValue(false)
@@ -111,6 +115,8 @@ describe('Network API integration', () => {
       status: 'ready',
       script: '$null # mock teardown script',
     })
+    vi.mocked(wslModule.persistManagedWslRemoteAccessPorts).mockResolvedValue(undefined)
+    vi.mocked(wslModule.clearManagedWslRemoteAccessPorts).mockResolvedValue(undefined)
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'freshell-test-'))
     process.env.FRESHELL_HOME = tmpDir
 
@@ -1362,6 +1368,77 @@ describe('Network API integration', () => {
       expect(statusRes.body.remoteAccessRequested).toBe(false)
       expect(statusRes.body.accessUrl).toContain('localhost')
       expect(statusRes.body.accessUrl).not.toContain('192.168.1.100')
+    })
+
+    it('releases the confirmed repair lock when the confirmed noop disable save fails', async () => {
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'wsl2',
+        active: true,
+      })
+      networkManager.resetFirewallCache()
+      await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+      vi.mocked(isPortReachable).mockResolvedValue(true)
+      vi.mocked(wslModule.computeWslPortForwardingTeardownPlanAsync)
+        .mockResolvedValueOnce({
+          status: 'ready',
+          script: '$null # mock teardown script',
+        })
+        .mockResolvedValueOnce({
+          status: 'ready',
+          script: '$null # mock teardown script',
+        })
+        .mockResolvedValueOnce({
+          status: 'noop',
+        })
+        .mockResolvedValue({
+          status: 'noop',
+        })
+
+      const originalConfigure = networkManager.configure.bind(networkManager)
+      let failNextDisableSave = true
+      vi.spyOn(networkManager, 'configure').mockImplementation(async (config) => {
+        if (config.host === '127.0.0.1' && failNextDisableSave) {
+          failNextDisableSave = false
+          throw new Error('save failed')
+        }
+        return originalConfigure(config)
+      })
+
+      const firstRes = await request(app)
+        .post('/api/network/disable-remote-access')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(firstRes.status).toBe(200)
+      expectConfirmationRequired(firstRes.body)
+
+      const failedConfirmRes = await request(app)
+        .post('/api/network/disable-remote-access')
+        .set('x-auth-token', token)
+        .send({
+          confirmElevation: true,
+          confirmationToken: firstRes.body.confirmationToken,
+        })
+
+      expect(failedConfirmRes.status).toBe(500)
+      expect(failedConfirmRes.body).toEqual({
+        error: 'Failed to persist remote access disable settings',
+      })
+
+      const statusRes = await request(app)
+        .get('/api/network/status')
+        .set('x-auth-token', token)
+
+      expect(statusRes.status).toBe(200)
+      expect(statusRes.body.firewall.configuring).toBe(false)
+
+      const followUpRes = await request(app)
+        .post('/api/network/disable-remote-access')
+        .set('x-auth-token', token)
+        .send({})
+
+      expect(followUpRes.status).toBe(200)
+      expect(followUpRes.body).toEqual({ method: 'none', message: 'Remote access disabled' })
     })
 
     it('returns 409 in-progress for disable requests while a confirmed WSL repair is still running', async () => {
