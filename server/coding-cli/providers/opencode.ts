@@ -12,7 +12,7 @@ type OpencodeSessionRow = {
   cwd: string
   title: string
   createdAt: number
-  updatedAt: number
+  lastActivityAt: number
   projectPath: string | null
 }
 
@@ -58,7 +58,7 @@ export class OpencodeProvider implements CodingCliProvider {
           s.directory AS cwd,
           s.title AS title,
           s.time_created AS createdAt,
-          s.time_updated AS updatedAt,
+          s.time_updated AS lastActivityAt,
           p.worktree AS projectPath
         FROM session s
         LEFT JOIN project p
@@ -78,7 +78,7 @@ export class OpencodeProvider implements CodingCliProvider {
           projectPath,
           cwd: row.cwd,
           title: typeof row.title === 'string' ? row.title : undefined,
-          updatedAt: toValidTimestamp(row.updatedAt) ?? Date.now(),
+          lastActivityAt: toValidTimestamp(row.lastActivityAt) ?? Date.now(),
           createdAt: toValidTimestamp(row.createdAt),
         })
       }

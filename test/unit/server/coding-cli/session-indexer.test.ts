@@ -196,7 +196,7 @@ describe('CodingCliSessionIndexer', () => {
         projectPath: '/project/a',
         cwd: '/project/a',
         title: 'OpenCode session',
-        updatedAt: 1_700_000_000_000,
+        lastActivityAt: 1_700_000_000_000,
         createdAt: 1_699_999_000_000,
       },
     ])
@@ -270,7 +270,7 @@ describe('CodingCliSessionIndexer', () => {
     })
   })
 
-  it('sorts projects deterministically by newest session updatedAt then projectPath', async () => {
+  it('sorts projects deterministically by newest session lastActivityAt then projectPath', async () => {
     const fileA = path.join(tempDir, 'session-a.jsonl')
     const fileB = path.join(tempDir, 'session-b.jsonl')
 
@@ -346,6 +346,70 @@ describe('CodingCliSessionIndexer', () => {
     expect(parseSessionFile).toHaveBeenCalledTimes(1)
   })
 
+  it('preserves semantic recency when a touched file reparses without semantic timestamps', async () => {
+    const file = path.join(tempDir, 'session-a.jsonl')
+    await fsp.writeFile(file, JSON.stringify({ cwd: '/repo', title: 'Deploy' }) + '\n')
+
+    const parseSessionFile = vi.fn()
+      .mockResolvedValueOnce({
+        cwd: '/repo',
+        sessionId: 'session-a',
+        title: 'Deploy',
+        createdAt: 100,
+        lastActivityAt: 200,
+        messageCount: 1,
+      })
+      .mockResolvedValueOnce({
+        cwd: '/repo',
+        sessionId: 'session-a',
+        title: 'Deploy',
+        messageCount: 1,
+      })
+
+    const provider = makeProvider([file], { parseSessionFile })
+    const indexer = new CodingCliSessionIndexer([provider])
+
+    await indexer.refresh()
+    await fsp.utimes(file, new Date(10_000), new Date(10_000))
+    ;(indexer as any).markDirty(file)
+    await indexer.refresh()
+
+    expect(indexer.getProjects()[0]?.sessions[0]?.lastActivityAt).toBe(200)
+  })
+
+  it('does not let append-only reparses move lastActivityAt backwards', async () => {
+    const file = path.join(tempDir, 'session-b.jsonl')
+    await fsp.writeFile(file, JSON.stringify({ cwd: '/repo', title: 'Deploy' }) + '\n')
+
+    const parseSessionFile = vi.fn()
+      .mockResolvedValueOnce({
+        cwd: '/repo',
+        sessionId: 'session-b',
+        title: 'Deploy',
+        createdAt: 100,
+        lastActivityAt: 900,
+        messageCount: 10,
+      })
+      .mockResolvedValueOnce({
+        cwd: '/repo',
+        sessionId: 'session-b',
+        title: 'Deploy',
+        createdAt: 100,
+        lastActivityAt: 300,
+        messageCount: 11,
+      })
+
+    const provider = makeProvider([file], { parseSessionFile })
+    const indexer = new CodingCliSessionIndexer([provider])
+
+    await indexer.refresh()
+    await fsp.appendFile(file, JSON.stringify({ type: 'file-history-snapshot', snapshot: {} }) + '\n')
+    ;(indexer as any).markDirty(file)
+    await indexer.refresh()
+
+    expect(indexer.getProjects()[0]?.sessions[0]?.lastActivityAt).toBe(900)
+  })
+
   it('prefers ParsedSessionMeta.sessionId over filename', async () => {
     const fileA = path.join(tempDir, 'legacy-id.jsonl')
     await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Title A' }) + '\n')
@@ -380,14 +444,14 @@ describe('CodingCliSessionIndexer', () => {
         provider: 'claude',
         sessionId,
         projectPath: '/project/a',
-        updatedAt: 100,
+        lastActivityAt: 100,
         cwd: '/project/a',
       },
       {
         provider: 'codex',
         sessionId,
         projectPath: '/project/a',
-        updatedAt: 101,
+        lastActivityAt: 101,
         cwd: '/project/a',
       },
     ])
@@ -486,7 +550,7 @@ describe('CodingCliSessionIndexer', () => {
         provider: 'claude',
         sessionId: 'active-session',
         projectPath: '/project/a',
-        updatedAt: 100,
+        lastActivityAt: 100,
         cwd: '/project/a',
       },
     ])
@@ -505,7 +569,7 @@ describe('CodingCliSessionIndexer', () => {
       provider: 'claude' as const,
       sessionId: 'reappearing-session',
       projectPath: '/project/a',
-      updatedAt: 100,
+      lastActivityAt: 100,
       cwd: '/project/a',
     }
 
@@ -516,7 +580,7 @@ describe('CodingCliSessionIndexer', () => {
     expect(detected).toEqual([makeSessionKey('claude', 'reappearing-session')])
   })
 
-  it('calls new-session handlers oldest-first by updatedAt', () => {
+  it('calls new-session handlers oldest-first by lastActivityAt', () => {
     const indexer = new CodingCliSessionIndexer([])
     const order: string[] = []
     indexer.onNewSession((session) => order.push(session.sessionId))
@@ -527,14 +591,14 @@ describe('CodingCliSessionIndexer', () => {
         provider: 'claude',
         sessionId: 'newer',
         projectPath: '/project/a',
-        updatedAt: 200,
+        lastActivityAt: 200,
         cwd: '/project/a',
       },
       {
         provider: 'claude',
         sessionId: 'older',
         projectPath: '/project/a',
-        updatedAt: 100,
+        lastActivityAt: 100,
         cwd: '/project/a',
       },
     ])
@@ -554,7 +618,7 @@ describe('CodingCliSessionIndexer', () => {
         provider: 'claude',
         sessionId: 'session-a',
         projectPath: '/project/a',
-        updatedAt: 100,
+        lastActivityAt: 100,
         cwd: '/project/a',
       },
     ])
@@ -1215,7 +1279,7 @@ describe('CodingCliSessionIndexer', () => {
             projectPath: '/project/a',
             cwd: '/project/a',
             title: 'Late OpenCode Session',
-            updatedAt: 1_700_000_000_000,
+            lastActivityAt: 1_700_000_000_000,
             createdAt: 1_699_999_000_000,
           }]
         },

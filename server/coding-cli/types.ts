@@ -166,7 +166,7 @@ export interface CodingCliSession {
   provider: CodingCliProviderName
   sessionId: string
   projectPath: string
-  updatedAt: number
+  lastActivityAt: number
   createdAt?: number
   archived?: boolean
   messageCount?: number

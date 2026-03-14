@@ -26,6 +26,18 @@ const normalizeFilePath = (filePath: string) => {
   return IS_WINDOWS ? resolved.toLowerCase() : resolved
 }
 
+function minDefined(a: number | undefined, b: number | undefined): number | undefined {
+  if (a === undefined) return b
+  if (b === undefined) return a
+  return Math.min(a, b)
+}
+
+function maxDefined(a: number | undefined, b: number | undefined): number | undefined {
+  if (a === undefined) return b
+  if (b === undefined) return a
+  return Math.max(a, b)
+}
+
 function findNearestExistingAncestor(targetPath: string): string {
   let current = normalizeFilePath(targetPath)
   let parent = path.dirname(current)
@@ -444,7 +456,7 @@ export class CodingCliSessionIndexer {
 
     if (this.initialized && newSessions.length > 0) {
       newSessions.sort((a, b) => {
-        const diff = a.updatedAt - b.updatedAt
+        const diff = a.lastActivityAt - b.lastActivityAt
         return diff !== 0
           ? diff
           : makeSessionKey(a.provider, a.sessionId).localeCompare(makeSessionKey(b.provider, b.sessionId))
@@ -506,12 +518,22 @@ export class CodingCliSessionIndexer {
 
     const projectPath = await provider.resolveProjectPath(filePath, meta)
     const sessionId = meta.sessionId || provider.extractSessionId(filePath, meta)
+    const previous = cached?.baseSession
+    const sameSession = previous?.provider === provider.name && previous?.sessionId === sessionId
+    const appendOnlyReparse = sameSession && size >= (cached?.size ?? 0)
+    const createdAt = appendOnlyReparse
+      ? minDefined(previous?.createdAt, meta.createdAt)
+      : meta.createdAt
+    const lastActivityAt = appendOnlyReparse
+      ? (maxDefined(previous?.lastActivityAt, meta.lastActivityAt) ?? createdAt ?? 0)
+      : (meta.lastActivityAt ?? createdAt ?? 0)
 
     const baseSession: CodingCliSession = {
       provider: provider.name,
       sessionId,
       projectPath,
-      updatedAt: stat.mtimeMs || stat.mtime.getTime(),
+      lastActivityAt,
+      createdAt,
       messageCount: meta.messageCount,
       title: meta.title,
       summary: meta.summary,
@@ -538,7 +560,7 @@ export class CodingCliSessionIndexer {
   private updateDirectCacheEntry(provider: CodingCliProvider, session: CodingCliSession, cacheKey: string) {
     this.fileCache.set(cacheKey, {
       provider: provider.name,
-      mtimeMs: session.updatedAt,
+      mtimeMs: session.lastActivityAt,
       size: 0,
       baseSession: {
         ...session,
@@ -792,12 +814,12 @@ export class CodingCliSessionIndexer {
     const groups: ProjectGroup[] = Array.from(groupsByPath.values()).map((group) => ({
       ...group,
       color: colors[group.projectPath],
-      sessions: group.sessions.sort((a, b) => b.updatedAt - a.updatedAt),
+      sessions: group.sessions.sort((a, b) => b.lastActivityAt - a.lastActivityAt),
     }))
 
     // Sort projects by most recent session activity.
     groups.sort((a, b) => {
-      const diff = (b.sessions[0]?.updatedAt || 0) - (a.sessions[0]?.updatedAt || 0)
+      const diff = (b.sessions[0]?.lastActivityAt || 0) - (a.sessions[0]?.lastActivityAt || 0)
       if (diff !== 0) return diff
       if (a.projectPath < b.projectPath) return -1
       if (a.projectPath > b.projectPath) return 1

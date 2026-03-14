@@ -56,7 +56,7 @@ describe('OpencodeProvider', () => {
         cwd: '/repo/root/packages/app',
         title: 'OpenCode root session',
         createdAt: 1000,
-        updatedAt: 2000,
+        lastActivityAt: 2000,
       },
     ])
   })
