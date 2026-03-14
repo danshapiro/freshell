@@ -84,10 +84,15 @@ export interface ChatSessionState {
   lost?: boolean
 }
 
+export interface PendingAgentCreate {
+  sessionId?: string
+  expectsHistoryHydration: boolean
+}
+
 export interface AgentChatState {
   sessions: Record<string, ChatSessionState>
   /** Maps createRequestId -> sessionId for correlating sdk.created responses */
-  pendingCreates: Record<string, string>
+  pendingCreates: Record<string, PendingAgentCreate>
   /** Available models from SDK supportedModels() */
   availableModels: Array<{ value: string; displayName: string; description: string }>
 }

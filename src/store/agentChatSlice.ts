@@ -39,13 +39,29 @@ const agentChatSlice = createSlice({
   name: 'agentChat',
   initialState,
   reducers: {
+    registerPendingCreate(state, action: PayloadAction<{
+      requestId: string
+      expectsHistoryHydration: boolean
+    }>) {
+      const current = state.pendingCreates[action.payload.requestId]
+      state.pendingCreates[action.payload.requestId] = {
+        sessionId: current?.sessionId,
+        expectsHistoryHydration: action.payload.expectsHistoryHydration,
+      }
+    },
+
     sessionCreated(state, action: PayloadAction<{ requestId: string; sessionId: string }>) {
       const { requestId, sessionId } = action.payload
+      const pending = state.pendingCreates[requestId]
+      const expectsHistoryHydration = pending?.expectsHistoryHydration ?? false
       const session = ensureSession(state, sessionId)
-      // Fresh creates have no history to load — mark as loaded so the UI doesn't
-      // show "Restoring session..." for newly created sessions.
-      session.historyLoaded = true
-      state.pendingCreates[requestId] = sessionId
+      // Fresh creates have no history to load, but resumed creates stay in
+      // restore mode until snapshot/timeline data establishes durable history.
+      session.historyLoaded = !expectsHistoryHydration
+      state.pendingCreates[requestId] = {
+        sessionId,
+        expectsHistoryHydration,
+      }
     },
 
     sessionInit(state, action: PayloadAction<{
@@ -71,6 +87,9 @@ const agentChatSlice = createSlice({
       const session = ensureSession(state, action.payload.sessionId)
       session.latestTurnId = action.payload.latestTurnId
       session.status = action.payload.status
+      if (action.payload.latestTurnId === null) {
+        session.historyLoaded = true
+      }
     },
 
     addUserMessage(state, action: PayloadAction<{
@@ -270,6 +289,7 @@ const agentChatSlice = createSlice({
 })
 
 export const {
+  registerPendingCreate,
   sessionCreated,
   sessionInit,
   sessionSnapshotReceived,
