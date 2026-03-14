@@ -40,7 +40,6 @@ import {
 import { nanoid } from '@reduxjs/toolkit'
 import type { AppView } from '@/components/Sidebar'
 import { getCliProviderConfigs } from '@/lib/coding-cli-utils'
-import { createLogger } from '@/lib/client-logger'
 import { buildKnownDevices, type KnownDevice } from '@/lib/known-devices'
 import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
 import { isRemoteAccessEnabledStatus } from '@/lib/share-utils'
@@ -48,8 +47,6 @@ import { parseNormalizedLineList } from '@shared/string-list'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
 
-
-const log = createLogger('SettingsView')
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 const SETTINGS_FIREWALL_POLL_INTERVAL_MS = 2000
 const SETTINGS_FIREWALL_POLL_MAX_ATTEMPTS = 10

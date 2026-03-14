@@ -11,6 +11,11 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import type { Tab } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  resolveLocalSettings,
+} from '@shared/settings'
 
 // Mock the ws-client module
 const mockSend = vi.fn()
@@ -124,6 +129,11 @@ function createStore(
     removedMutationSeqByTerminalId: {},
   },
 ) {
+  const serverSettings = createDefaultServerSettings({
+    loggingDebug: defaultSettings.logging.debug,
+  })
+  const localSettings = resolveLocalSettings()
+
   return configureStore({
     reducer: {
       tabs: tabsReducer,
@@ -152,7 +162,9 @@ function createStore(
         ...panesState,
       },
       settings: {
-        settings: defaultSettings,
+        serverSettings,
+        localSettings,
+        settings: composeResolvedSettings(serverSettings, localSettings),
         loaded: true,
       },
       turnCompletion: {

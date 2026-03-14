@@ -588,7 +588,7 @@ describe('PaneLayout', () => {
     ) {
       const store = createStore(panesState)
       store.dispatch({
-        type: 'settings/updateSettingsLocal',
+        type: 'settings/previewServerSettingsPatch',
         payload: { panes: { defaultNewPane } },
       })
       return store
@@ -669,7 +669,7 @@ describe('PaneLayout', () => {
     ) {
       const store = createStore(panesState)
       store.dispatch({
-        type: 'settings/updateSettingsLocal',
+        type: 'settings/previewServerSettingsPatch',
         payload: { panes: { defaultNewPane } },
       })
       return store

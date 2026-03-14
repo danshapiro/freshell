@@ -1,3 +1,5 @@
+import fs from 'fs/promises'
+import path from 'path'
 import { test, expect } from '../helpers/fixtures.js'
 
 // Helper: wait for a page to be connected and ready
@@ -82,15 +84,15 @@ test.describe('Multi-Client', () => {
     await waitForReady(page1)
     await waitForReady(page2)
 
-    // Get initial font size from page2 (settings.settings.terminal.fontSize)
+    const sharedDefaultCwd = path.join(serverInfo.homeDir, 'multi-client-default-cwd')
+    await fs.mkdir(sharedDefaultCwd, { recursive: true })
+
+    // Get initial default cwd from page2 before changing it server-side.
     const settingsBefore = await page2.evaluate(() =>
-      window.__FRESHELL_TEST_HARNESS__?.getState()?.settings?.settings?.terminal?.fontSize
+      window.__FRESHELL_TEST_HARNESS__?.getState()?.settings?.settings?.defaultCwd
     )
 
-    // Change font size setting from page1 via the API (PATCH /api/settings).
-    // Only send the specific field to change (spreading full terminal settings
-    // would include client-side-only keys like fontFamily that the server rejects).
-    const newFontSize = (settingsBefore || 14) + 1
+    // Change a server-backed field from page1 via the API.
     const patchResponse = await page1.evaluate(async (info) => {
       const res = await fetch(`${info.baseUrl}/api/settings`, {
         method: 'PATCH',
@@ -99,28 +101,29 @@ test.describe('Multi-Client', () => {
           'x-auth-token': info.token,
         },
         body: JSON.stringify({
-          terminal: { fontSize: info.newFontSize },
+          defaultCwd: info.defaultCwd,
         }),
       })
       return { ok: res.ok, status: res.status }
-    }, { baseUrl: serverInfo.baseUrl, token: serverInfo.token, newFontSize })
+    }, { baseUrl: serverInfo.baseUrl, token: serverInfo.token, defaultCwd: sharedDefaultCwd })
 
     expect(patchResponse.ok).toBe(true)
 
     // Wait for page2 to receive the broadcast and update its settings
     await page2.waitForFunction(
-      (expectedFontSize) => {
-        const current = window.__FRESHELL_TEST_HARNESS__?.getState()?.settings?.settings?.terminal?.fontSize
-        return current === expectedFontSize
+      (expectedDefaultCwd) => {
+        const current = window.__FRESHELL_TEST_HARNESS__?.getState()?.settings?.settings?.defaultCwd
+        return current === expectedDefaultCwd
       },
-      newFontSize,
+      sharedDefaultCwd,
       { timeout: 15_000 }
     )
 
     const settingsAfter = await page2.evaluate(() =>
-      window.__FRESHELL_TEST_HARNESS__?.getState()?.settings?.settings?.terminal?.fontSize
+      window.__FRESHELL_TEST_HARNESS__?.getState()?.settings?.settings?.defaultCwd
     )
-    expect(settingsAfter).toBe(newFontSize)
+    expect(settingsAfter).toBe(sharedDefaultCwd)
+    expect(settingsAfter).not.toBe(settingsBefore)
 
     await context.close()
   })

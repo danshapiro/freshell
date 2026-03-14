@@ -158,6 +158,11 @@ import panesReducer from '@/store/panesSlice'
 import { networkReducer } from '@/store/networkSlice'
 import terminalDirectoryReducer from '@/store/terminalDirectorySlice'
 import type { Tab, AppSettings, ProjectGroup, BackgroundTerminal } from '@/store/types'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  resolveLocalSettings,
+} from '@shared/settings'
 
 // Import the mocked api to get access to the mocks
 import { api, fetchSidebarSessionsSnapshot, searchSessions } from '@/lib/api'
@@ -177,6 +182,24 @@ interface TestStoreState {
     windows?: Record<string, any>
     searches?: Record<string, any>
   }
+}
+
+function createSettingsState(overrides: Partial<SettingsState> = {}): SettingsState {
+  const serverSettings = overrides.serverSettings ?? createDefaultServerSettings({
+    loggingDebug: defaultSettings.logging.debug,
+  })
+  const localSettings = overrides.localSettings ?? resolveLocalSettings()
+
+  return {
+    serverSettings,
+    localSettings,
+    settings: Object.prototype.hasOwnProperty.call(overrides, 'settings')
+      ? overrides.settings
+      : composeResolvedSettings(serverSettings, localSettings),
+    loaded: true,
+    lastSavedAt: undefined,
+    ...overrides,
+  } as SettingsState
 }
 
 function createTestStore(state: TestStoreState = {}) {
@@ -204,10 +227,7 @@ function createTestStore(state: TestStoreState = {}) {
         ...state.tabs,
       },
       settings: {
-        settings: defaultSettings,
-        loaded: true,
-        lastSavedAt: undefined,
-        ...state.settings,
+        ...createSettingsState(state.settings),
       },
       sessions: {
         projects: [],
@@ -741,27 +761,29 @@ describe('Component Edge Cases', () => {
 
     describe('SettingsView with pending save', () => {
       it('handles rapid setting changes without crash', async () => {
+        mockApiTyped.post.mockResolvedValue({ valid: true })
+
         const store = createTestStore()
         renderWithStore(<SettingsView />, store)
 
-        // Rapidly change theme multiple times
-        const darkButtons = screen.getAllByRole('button', { name: 'Dark' })
-        const lightButtons = screen.getAllByRole('button', { name: 'Light' })
-        const systemButton = screen.getByRole('button', { name: 'System' })
+        const defaultCwdInput = screen.getByPlaceholderText('e.g. C:\\Users\\you\\projects')
+        let finalPath = ''
 
         for (let i = 0; i < 10; i++) {
-          fireEvent.click(darkButtons[0])
-          fireEvent.click(lightButtons[0])
-          fireEvent.click(systemButton)
+          finalPath = `/tmp/project-${i}`
+          fireEvent.change(defaultCwdInput, { target: { value: finalPath } })
         }
 
         // Should not throw
         await act(async () => {
           vi.advanceTimersByTime(500)
+          await vi.runAllTimersAsync()
         })
 
-        // Only one API call should be made (debounced)
+        expect(mockApiTyped.post).toHaveBeenCalledTimes(1)
+        expect(mockApiTyped.post).toHaveBeenCalledWith('/api/files/validate-dir', { path: finalPath })
         expect(mockApiTyped.patch).toHaveBeenCalledTimes(1)
+        expect(mockApiTyped.patch).toHaveBeenCalledWith('/api/settings', { defaultCwd: finalPath })
       })
     })
   })
@@ -844,25 +866,25 @@ describe('Component Edge Cases', () => {
 
     describe('SettingsView API error handling', () => {
       it('handles API patch failure gracefully', async () => {
+        mockApiTyped.post.mockResolvedValue({ valid: true })
         mockApiTyped.patch.mockRejectedValueOnce(new Error('Save failed'))
 
         const store = createTestStore()
-        const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
 
         renderWithStore(<SettingsView />, store)
 
-        const darkButtons = screen.getAllByRole('button', { name: 'Dark' })
-        fireEvent.click(darkButtons[0])
+        fireEvent.change(screen.getByPlaceholderText('e.g. C:\\Users\\you\\projects'), {
+          target: { value: '/tmp/save-failure' },
+        })
 
         await act(async () => {
           vi.advanceTimersByTime(500)
           await vi.runAllTimersAsync()
         })
 
-        // Should log warning but not crash
-        expect(consoleSpy).toHaveBeenCalledWith('[SettingsView]', 'Failed to save settings', expect.any(Error))
-
-        consoleSpy.mockRestore()
+        expect(mockApiTyped.post).toHaveBeenCalledWith('/api/files/validate-dir', { path: '/tmp/save-failure' })
+        expect(mockApiTyped.patch).toHaveBeenCalledWith('/api/settings', { defaultCwd: '/tmp/save-failure' })
+        expect(screen.getByText('Settings')).toBeInTheDocument()
       })
     })
   })
@@ -1026,8 +1048,9 @@ describe('Component Edge Cases', () => {
         const { unmount } = renderWithStore(<SettingsView />, store)
 
         // Trigger a save
-        const darkButtons = screen.getAllByRole('button', { name: 'Dark' })
-        fireEvent.click(darkButtons[0])
+        fireEvent.change(screen.getByPlaceholderText('e.g. C:\\Users\\you\\projects'), {
+          target: { value: '/tmp/pending-save' },
+        })
 
         // Unmount before debounce completes
         unmount()
@@ -1037,7 +1060,7 @@ describe('Component Edge Cases', () => {
           vi.advanceTimersByTime(1000)
         })
 
-        // API should not have been called (cleanup cleared the timeout)
+        expect(mockApiTyped.post).not.toHaveBeenCalled()
         expect(mockApiTyped.patch).not.toHaveBeenCalled()
       })
     })
@@ -1141,11 +1164,11 @@ describe('Component Edge Cases', () => {
       it('handles undefined settings gracefully', () => {
         const store = configureStore({
           reducer: {
-            settings: (state = { settings: undefined, loaded: false }) => state,
+            settings: (state = createSettingsState({ settings: undefined, loaded: false })) => state,
             network: networkReducer,
           },
           preloadedState: {
-            settings: { settings: undefined, loaded: false } as any,
+            settings: createSettingsState({ settings: undefined, loaded: false }) as any,
           },
         })
 
@@ -1167,7 +1190,7 @@ describe('Component Edge Cases', () => {
               serializableCheck: { ignoredPaths: ['sessions.expandedProjects'] },
             }),
           preloadedState: {
-            settings: { settings: defaultSettings, loaded: true },
+            settings: createSettingsState(),
             tabs: { tabs: [], activeTabId: null },
             sessions: { projects: undefined, expandedProjects: new Set() } as any,
           },

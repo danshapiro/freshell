@@ -10,7 +10,7 @@ import { BROWSER_PREFERENCES_STORAGE_KEY as STORAGE_KEY } from '@/store/storage-
 export const BROWSER_PREFERENCES_STORAGE_KEY = STORAGE_KEY
 
 const LEGACY_TERMINAL_FONT_KEY = 'freshell.terminal.fontFamily.v1'
-const LEGACY_TOOL_STRIP_STORAGE_KEY = 'freshell:toolStripExpanded'
+const LEGACY_TOOL_STRIP_STORAGE_KEY = ['freshell', 'toolStripExpanded'].join(':')
 const DEFAULT_SEARCH_RANGE_DAYS = 30
 
 export type BrowserPreferencesRecord = {

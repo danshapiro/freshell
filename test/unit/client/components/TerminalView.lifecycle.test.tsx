@@ -12,6 +12,11 @@ import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import { __resetTerminalCursorCacheForTests } from '@/lib/terminal-cursor'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import { TERMINAL_CURSOR_STORAGE_KEY } from '@/store/storage-keys'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  resolveLocalSettings,
+} from '@shared/settings'
 
 const wsMocks = vi.hoisted(() => ({
   send: vi.fn(),
@@ -169,6 +174,24 @@ function latestAttachRequestIdForTerminal(terminalId: string | undefined): strin
   return typeof attach?.attachRequestId === 'string' ? attach.attachRequestId : undefined
 }
 
+function createSettingsState(overrides: Record<string, unknown> = {}) {
+  const serverSettings = (overrides.serverSettings as Record<string, unknown> | undefined) ?? createDefaultServerSettings({
+    loggingDebug: defaultSettings.logging.debug,
+  })
+  const localSettings = (overrides.localSettings as Record<string, unknown> | undefined) ?? resolveLocalSettings()
+
+  return {
+    serverSettings,
+    localSettings,
+    settings: Object.prototype.hasOwnProperty.call(overrides, 'settings')
+      ? overrides.settings
+      : composeResolvedSettings(serverSettings as never, localSettings as never),
+    loaded: true,
+    lastSavedAt: undefined,
+    ...overrides,
+  }
+}
+
 function withCurrentAttachRequestId<T extends { type?: string; terminalId?: string; attachRequestId?: string }>(
   msg: T & { __preserveMissingAttachRequestId?: boolean },
 ): T {
@@ -279,7 +302,7 @@ describe('TerminalView lifecycle updates', () => {
           activePane: { [tabId]: paneId },
           paneTitles: {},
         },
-        settings: { settings: defaultSettings, status: 'loaded' },
+        settings: createSettingsState(),
         connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
       },
     })
@@ -421,7 +444,7 @@ describe('TerminalView lifecycle updates', () => {
           activePane: { [tabId]: paneId },
           paneTitles: {},
         },
-        settings: { settings: defaultSettings, status: 'loaded' },
+        settings: createSettingsState(),
         connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
       },
     })
@@ -506,7 +529,7 @@ describe('TerminalView lifecycle updates', () => {
           },
           paneTitles: {},
         },
-        settings: { settings: defaultSettings, status: 'loaded' },
+        settings: createSettingsState(),
         connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
       },
     })
@@ -593,7 +616,7 @@ describe('TerminalView lifecycle updates', () => {
           activePane: { [tabId]: paneId },
           paneTitles: {},
         },
-        settings: { settings: defaultSettings, status: 'loaded' },
+        settings: createSettingsState(),
         connection: { status: 'connected', error: null },
         turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
       },
@@ -683,7 +706,7 @@ describe('TerminalView lifecycle updates', () => {
           activePane: { [tabId]: paneId },
           paneTitles: {},
         },
-        settings: { settings: defaultSettings, status: 'loaded' },
+        settings: createSettingsState(),
         connection: { status: 'connected', error: null },
         turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
       },
@@ -770,7 +793,7 @@ describe('TerminalView lifecycle updates', () => {
           activePane: { [tabId]: paneId },
           paneTitles: {},
         },
-        settings: { settings: defaultSettings, status: 'loaded' },
+        settings: createSettingsState(),
         connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
       },
     })
@@ -852,7 +875,7 @@ describe('TerminalView lifecycle updates', () => {
           activePane: { [tabId]: paneId },
           paneTitles: {},
         },
-        settings: { settings: defaultSettings, status: 'loaded' },
+        settings: createSettingsState(),
         connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
       },
     })
@@ -935,7 +958,7 @@ describe('TerminalView lifecycle updates', () => {
           activePane: { [tabId]: paneId },
           paneTitles: {},
         },
-        settings: { settings: defaultSettings, status: 'loaded' },
+        settings: createSettingsState(),
         connection: { status: 'connected', error: null },
       },
     })
@@ -1019,7 +1042,7 @@ describe('TerminalView lifecycle updates', () => {
           activePane: { [tabId]: paneId },
           paneTitles: {},
         },
-        settings: { settings: defaultSettings, status: 'loaded' },
+        settings: createSettingsState(),
         connection: { status: 'connected', error: null },
       },
     })
@@ -1084,7 +1107,7 @@ describe('TerminalView lifecycle updates', () => {
           activePane: { [tabId]: paneId },
           paneTitles: {},
         },
-        settings: { settings: defaultSettings, status: 'loaded' },
+        settings: createSettingsState(),
         connection: { status: 'connected', error: null },
       },
     })
@@ -1156,7 +1179,7 @@ describe('TerminalView lifecycle updates', () => {
           activePane: { [tabId]: paneId },
           paneTitles: {},
         },
-        settings: { settings: defaultSettings, status: 'loaded' },
+        settings: createSettingsState(),
         connection: { status: 'connected', error: null },
       },
     })
@@ -1251,7 +1274,7 @@ describe('TerminalView lifecycle updates', () => {
           activePane: { [tabId]: paneId },
           paneTitles: {},
         },
-        settings: { settings: defaultSettings, status: 'loaded' },
+        settings: createSettingsState(),
         connection: { status: 'connected', error: null },
       },
     })
@@ -1308,7 +1331,7 @@ describe('TerminalView lifecycle updates', () => {
           activePane: { [tabId]: paneId },
           paneTitles: {},
         },
-        settings: { settings: defaultSettings, status: 'loaded' },
+        settings: createSettingsState(),
         connection: { status: 'connected', error: null },
       },
     })
@@ -1393,7 +1416,7 @@ describe('TerminalView lifecycle updates', () => {
           activePane: { [tabId]: paneId },
           paneTitles: {},
         },
-        settings: { settings: defaultSettings, status: 'loaded' },
+        settings: createSettingsState(),
         connection: { status: 'connected', error: null },
       },
     })
@@ -1490,7 +1513,7 @@ describe('TerminalView lifecycle updates', () => {
           activePane: { [tabId]: paneId },
           paneTitles: {},
         },
-        settings: { settings: defaultSettings, status: 'loaded' },
+        settings: createSettingsState(),
         connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
       },
     })
@@ -1577,7 +1600,7 @@ describe('TerminalView lifecycle updates', () => {
           activePane: { [tabId]: paneId },
           paneTitles: {},
         },
-        settings: { settings: defaultSettings, status: 'loaded' },
+        settings: createSettingsState(),
         connection: { status: 'connected', error: null },
       },
     })
@@ -1656,7 +1679,7 @@ describe('TerminalView lifecycle updates', () => {
             activePane: { [tabId]: paneId },
             paneTitles: {},
           },
-          settings: { settings: defaultSettings, status: 'loaded' },
+          settings: createSettingsState(),
           connection: {
             status: connectionStatus,
             error: null,
@@ -1782,7 +1805,7 @@ describe('TerminalView lifecycle updates', () => {
               }
               : {},
           },
-          settings: { settings: defaultSettings, status: 'loaded' },
+          settings: createSettingsState(),
           connection: { status: 'connected', error: null },
         },
       })
@@ -2751,7 +2774,7 @@ describe('TerminalView lifecycle updates', () => {
             activePane: { [tabId]: paneId },
             paneTitles: {},
           },
-          settings: {
+          settings: createSettingsState({
             settings: {
               ...defaultSettings,
               terminal: {
@@ -2759,8 +2782,7 @@ describe('TerminalView lifecycle updates', () => {
                 osc52Clipboard: 'never',
               },
             },
-            status: 'loaded',
-          },
+          }),
           connection: { status: 'connected', error: null },
           turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {}, attentionByPane: {} },
         },

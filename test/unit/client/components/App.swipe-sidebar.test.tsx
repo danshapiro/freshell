@@ -9,6 +9,11 @@ import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer from '@/store/panesSlice'
 import { networkReducer } from '@/store/networkSlice'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  resolveLocalSettings,
+} from '@shared/settings'
 
 // Ensure DOM is clean even if another test file forgot cleanup.
 beforeEach(() => {
@@ -85,6 +90,15 @@ vi.mock('@/store/tabRegistrySync', () => ({
 }))
 
 function createTestStore(options?: { sidebarCollapsed?: boolean }) {
+  const serverSettings = createDefaultServerSettings({
+    loggingDebug: defaultSettings.logging.debug,
+  })
+  const localSettings = resolveLocalSettings({
+    sidebar: {
+      collapsed: options?.sidebarCollapsed ?? false,
+    },
+  })
+
   return configureStore({
     reducer: {
       settings: settingsReducer,
@@ -102,13 +116,9 @@ function createTestStore(options?: { sidebarCollapsed?: boolean }) {
       }),
     preloadedState: {
       settings: {
-        settings: {
-          ...defaultSettings,
-          sidebar: {
-            ...defaultSettings.sidebar,
-            collapsed: options?.sidebarCollapsed ?? false,
-          },
-        },
+        serverSettings,
+        localSettings,
+        settings: composeResolvedSettings(serverSettings, localSettings),
         loaded: true,
         lastSavedAt: undefined,
       },
@@ -155,9 +165,14 @@ describe('App - Swipe Sidebar Gesture', () => {
     localStorage.clear()
     localStorage.setItem('freshell.auth-token', 'test-token-abc123')
     mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') return Promise.resolve(defaultSettings)
-      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
-      if (url === '/api/sessions') return Promise.resolve([])
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: createDefaultServerSettings({
+            loggingDebug: defaultSettings.logging.debug,
+          }),
+          platform: { platform: 'linux', availableClis: {}, featureFlags: {} },
+        })
+      }
       return Promise.resolve({})
     })
   })

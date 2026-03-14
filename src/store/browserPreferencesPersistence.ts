@@ -64,7 +64,7 @@ function canUseStorage(): boolean {
 }
 
 function assignChangedScalar<T extends Record<string, unknown>, K extends keyof T>(
-  patch: Partial<T>,
+  patch: Partial<Record<K, T[K]>>,
   current: T,
   defaults: T,
   key: K,
