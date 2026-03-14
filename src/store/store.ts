@@ -20,6 +20,7 @@ import extensionsReducer from './extensionsSlice'
 import { perfMiddleware } from './perfMiddleware'
 import { persistMiddleware } from './persistMiddleware'
 import { sessionActivityPersistMiddleware } from './sessionActivityPersistence'
+import { browserPreferencesPersistenceMiddleware } from './browserPreferencesPersistence'
 import { createLogger } from '@/lib/client-logger'
 import { layoutMirrorMiddleware } from './layoutMirrorMiddleware'
 
@@ -52,7 +53,13 @@ export const store = configureStore({
       serializableCheck: {
         ignoredPaths: ['sessions.expandedProjects'],
       },
-    }).concat(perfMiddleware, persistMiddleware, layoutMirrorMiddleware, sessionActivityPersistMiddleware),
+    }).concat(
+      perfMiddleware,
+      persistMiddleware,
+      browserPreferencesPersistenceMiddleware,
+      layoutMirrorMiddleware,
+      sessionActivityPersistMiddleware,
+    ),
 })
 
 // Note: Tabs and Panes are now loaded from localStorage directly in their slice

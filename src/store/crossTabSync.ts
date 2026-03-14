@@ -1,13 +1,19 @@
 import { z } from 'zod'
 import { hydratePanes } from './panesSlice'
+import { setLocalSettings } from './settingsSlice'
+import { setTabRegistrySearchRangeDays } from './tabRegistrySlice'
 import { hydrateTabs } from './tabsSlice'
 import { parsePersistedPanesRaw, parsePersistedTabsRaw, PANES_STORAGE_KEY, TABS_STORAGE_KEY } from './persistedState'
 import { getPersistBroadcastSourceId, onPersistBroadcast, PERSIST_BROADCAST_CHANNEL_NAME } from './persistBroadcast'
+import { BROWSER_PREFERENCES_STORAGE_KEY } from './storage-keys'
+import { parseBrowserPreferencesRaw, resolveBrowserPreferenceSettings } from '@/lib/browser-preferences'
 
 type StoreLike = {
   dispatch: (action: any) => any
   getState: () => any
 }
+
+const DEFAULT_SEARCH_RANGE_DAYS = 30
 
 const zPersistBroadcastMsg = z.object({
   type: z.literal('persist'),
@@ -104,11 +110,27 @@ function dispatchHydratePanesFromPersisted(store: StoreLike, raw: string) {
   })
 }
 
+function dispatchHydrateBrowserPreferencesFromPersisted(store: StoreLike, raw: string) {
+  const parsed = parseBrowserPreferencesRaw(raw)
+  if (!parsed) return
+
+  store.dispatch({
+    ...setLocalSettings(resolveBrowserPreferenceSettings(parsed)),
+    meta: { skipPersist: true, source: 'cross-tab' },
+  })
+  store.dispatch({
+    ...setTabRegistrySearchRangeDays(parsed.tabs?.searchRangeDays ?? DEFAULT_SEARCH_RANGE_DAYS),
+    meta: { skipPersist: true, source: 'cross-tab' },
+  })
+}
+
 function handleIncomingRaw(store: StoreLike, key: string, raw: string) {
   if (key === TABS_STORAGE_KEY) {
     dispatchHydrateTabsFromPersisted(store, raw)
   } else if (key === PANES_STORAGE_KEY) {
     dispatchHydratePanesFromPersisted(store, raw)
+  } else if (key === BROWSER_PREFERENCES_STORAGE_KEY) {
+    dispatchHydrateBrowserPreferencesFromPersisted(store, raw)
   }
 }
 
@@ -128,14 +150,26 @@ export function installCrossTabSync(store: StoreLike): () => void {
   // then diverge locally (persisted raw changes), a later remote event with the original raw
   // could be incorrectly ignored.
   const unsubscribeLocal = onPersistBroadcast((msg) => {
-    if (msg.key !== TABS_STORAGE_KEY && msg.key !== PANES_STORAGE_KEY) return
+    if (
+      msg.key !== TABS_STORAGE_KEY
+      && msg.key !== PANES_STORAGE_KEY
+      && msg.key !== BROWSER_PREFERENCES_STORAGE_KEY
+    ) {
+      return
+    }
     lastProcessedRawByKey.set(msg.key, msg.raw)
   })
 
   const onStorage = (e: StorageEvent) => {
     if (e.storageArea && e.storageArea !== localStorage) return
     const key = e.key
-    if (key !== TABS_STORAGE_KEY && key !== PANES_STORAGE_KEY) return
+    if (
+      key !== TABS_STORAGE_KEY
+      && key !== PANES_STORAGE_KEY
+      && key !== BROWSER_PREFERENCES_STORAGE_KEY
+    ) {
+      return
+    }
     if (typeof e.newValue !== 'string') return
     handleIncomingRawDeduped(key, e.newValue)
   }

@@ -1,5 +1,6 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import type { RegistryTabRecord } from './tabRegistryTypes'
+import { getSearchRangeDaysPreference } from '@/lib/browser-preferences'
 import {
   DEVICE_ALIASES_STORAGE_KEY,
   DEVICE_DISMISSED_STORAGE_KEY,
@@ -227,6 +228,7 @@ export interface TabRegistryState {
 const device = loadDeviceMeta()
 const aliases = loadDeviceAliases(safeStorage())
 const dismissedDeviceIds = loadDismissedDeviceIds(safeStorage())
+const initialSearchRangeDays = getSearchRangeDaysPreference()
 
 const initialState: TabRegistryState = {
   deviceId: device.deviceId,
@@ -237,7 +239,7 @@ const initialState: TabRegistryState = {
   remoteOpen: [],
   closed: [],
   localClosed: {},
-  searchRangeDays: 30,
+  searchRangeDays: initialSearchRangeDays,
   loading: false,
 }
 

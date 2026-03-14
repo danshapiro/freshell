@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import reducer, {
   setTabRegistryLoading,
   setTabRegistrySnapshot,
@@ -6,6 +6,7 @@ import reducer, {
   recordClosedTabSnapshot,
 } from '../../../../src/store/tabRegistrySlice'
 import {
+  BROWSER_PREFERENCES_STORAGE_KEY,
   STORAGE_KEYS,
   DEVICE_ALIASES_STORAGE_KEY,
   DEVICE_FINGERPRINT_STORAGE_KEY,
@@ -35,6 +36,14 @@ function makeRecord(overrides: Partial<RegistryTabRecord>): RegistryTabRecord {
 }
 
 describe('tabRegistrySlice', () => {
+  beforeEach(() => {
+    localStorage.clear()
+  })
+
+  afterEach(() => {
+    localStorage.clear()
+  })
+
   it('uses v2 namespaced device storage keys', () => {
     expect(STORAGE_KEYS.deviceId).toBe('freshell.device-id.v2')
     expect(STORAGE_KEYS.deviceLabel).toBe('freshell.device-label.v2')
@@ -74,5 +83,19 @@ describe('tabRegistrySlice', () => {
       }),
     ))
     expect(Object.keys(state.localClosed)).toEqual(['local:closed'])
+  })
+
+  it('initializes searchRangeDays from browser preferences instead of always resetting to 30', async () => {
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      tabs: {
+        searchRangeDays: 365,
+      },
+    }))
+
+    vi.resetModules()
+    const freshModule = await import('../../../../src/store/tabRegistrySlice')
+    const freshReducer = freshModule.default
+
+    expect(freshReducer(undefined, { type: 'unknown' }).searchRangeDays).toBe(365)
   })
 })

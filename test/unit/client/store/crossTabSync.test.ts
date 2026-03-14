@@ -3,9 +3,11 @@ import { configureStore } from '@reduxjs/toolkit'
 
 import tabsReducer, { hydrateTabs } from '../../../../src/store/tabsSlice'
 import panesReducer, { hydratePanes } from '../../../../src/store/panesSlice'
+import settingsReducer from '../../../../src/store/settingsSlice'
+import tabRegistryReducer from '../../../../src/store/tabRegistrySlice'
 import { installCrossTabSync } from '../../../../src/store/crossTabSync'
 import { broadcastPersistedRaw } from '../../../../src/store/persistBroadcast'
-import { PANES_STORAGE_KEY, TABS_STORAGE_KEY } from '../../../../src/store/persistedState'
+import { BROWSER_PREFERENCES_STORAGE_KEY, PANES_STORAGE_KEY, TABS_STORAGE_KEY } from '../../../../src/store/storage-keys'
 
 describe('crossTabSync', () => {
   const cleanups: Array<() => void> = []
@@ -133,6 +135,77 @@ describe('crossTabSync', () => {
       expect(hydrateCalls).toHaveLength(1)
 
       cleanup()
+    } finally {
+      ;(globalThis as any).BroadcastChannel = original
+    }
+  })
+
+  it('hydrates browser-preference changes from storage events', () => {
+    const store = configureStore({
+      reducer: { settings: settingsReducer, tabRegistry: tabRegistryReducer },
+    })
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    const remoteRaw = JSON.stringify({
+      settings: {
+        theme: 'dark',
+        sidebar: {
+          sortMode: 'project',
+        },
+      },
+      tabs: {
+        searchRangeDays: 365,
+      },
+    })
+
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: BROWSER_PREFERENCES_STORAGE_KEY,
+      newValue: remoteRaw,
+    }))
+
+    expect(store.getState().settings.localSettings.theme).toBe('dark')
+    expect(store.getState().settings.settings.sidebar.sortMode).toBe('project')
+    expect(store.getState().tabRegistry.searchRangeDays).toBe(365)
+  })
+
+  it('hydrates browser-preference changes from BroadcastChannel messages', () => {
+    const store = configureStore({
+      reducer: { settings: settingsReducer, tabRegistry: tabRegistryReducer },
+    })
+
+    const original = (globalThis as any).BroadcastChannel
+    class MockBC {
+      static instance: MockBC | null = null
+      onmessage: ((ev: any) => void) | null = null
+      constructor(_name: string) {
+        MockBC.instance = this
+      }
+      close() {}
+    }
+    ;(globalThis as any).BroadcastChannel = MockBC
+
+    try {
+      cleanups.push(installCrossTabSync(store as any))
+
+      MockBC.instance?.onmessage?.({
+        data: {
+          type: 'persist',
+          key: BROWSER_PREFERENCES_STORAGE_KEY,
+          raw: JSON.stringify({
+            settings: {
+              theme: 'dark',
+            },
+            tabs: {
+              searchRangeDays: 90,
+            },
+          }),
+          sourceId: 'other-tab',
+        },
+      })
+
+      expect(store.getState().settings.settings.theme).toBe('dark')
+      expect(store.getState().tabRegistry.searchRangeDays).toBe(90)
     } finally {
       ;(globalThis as any).BroadcastChannel = original
     }
