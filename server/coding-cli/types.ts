@@ -134,6 +134,8 @@ export interface ApprovalPayload {
 export interface ParsedSessionMeta {
   sessionId?: string
   cwd?: string
+  createdAt?: number
+  lastActivityAt?: number
   title?: string
   summary?: string
   firstUserMessage?: string

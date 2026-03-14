@@ -69,6 +69,52 @@ describe('parseSessionContent() - token usage snapshots', () => {
     }
   })
 
+  it('derives Claude createdAt and lastActivityAt from semantic transcript records', () => {
+    const meta = parseSessionContent([
+      JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        session_id: '11111111-1111-1111-1111-111111111111',
+        cwd: '/repo',
+        timestamp: '2026-03-01T00:00:00.000Z',
+      }),
+      JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: 'Ship it' },
+        timestamp: '2026-03-01T00:00:03.000Z',
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'On it' }] },
+        timestamp: '2026-03-01T00:00:05.000Z',
+      }),
+    ].join('\n'))
+
+    expect(meta.createdAt).toBe(Date.parse('2026-03-01T00:00:00.000Z'))
+    expect(meta.lastActivityAt).toBe(Date.parse('2026-03-01T00:00:05.000Z'))
+  })
+
+  it('ignores Claude housekeeping-only records when deriving lastActivityAt', () => {
+    const meta = parseSessionContent([
+      JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: 'Keep this timestamp' },
+        timestamp: '2026-03-01T00:00:04.000Z',
+      }),
+      JSON.stringify({
+        type: 'assistant',
+        message: { role: 'assistant', usage: { input_tokens: 1, output_tokens: 2 } },
+        timestamp: '2026-03-01T00:00:20.000Z',
+      }),
+      JSON.stringify({
+        type: 'file-history-snapshot',
+        snapshot: { timestamp: '2026-03-01T00:00:21.000Z' },
+      }),
+    ].join('\n'))
+
+    expect(meta.lastActivityAt).toBe(Date.parse('2026-03-01T00:00:04.000Z'))
+  })
+
   it('uses latest assistant usage snapshot with uuid -> message.id -> line-hash dedupe priority', () => {
     const content = [
       JSON.stringify({

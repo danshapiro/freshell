@@ -12,6 +12,8 @@ import { looksLikePath, isSystemContext, extractFromIdeContext, resolveGitChecko
 export type JsonlMeta = {
   sessionId?: string
   cwd?: string
+  createdAt?: number
+  lastActivityAt?: number
   title?: string
   summary?: string
   firstUserMessage?: string
@@ -69,6 +71,68 @@ function toFiniteNumber(value: unknown): number | undefined {
     if (Number.isFinite(parsed)) return parsed
   }
   return undefined
+}
+
+function parseTimestampMs(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Date.parse(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return undefined
+}
+
+function assistantHasVisibleContent(message: unknown): boolean {
+  if (!message || typeof message !== 'object') return false
+
+  const content = (message as { content?: unknown }).content
+  if (typeof content === 'string') return content.trim().length > 0
+  if (!Array.isArray(content)) return false
+
+  return content.some((block) => {
+    if (typeof block === 'string') return block.trim().length > 0
+    if (!block || typeof block !== 'object') return false
+
+    const typedBlock = block as {
+      type?: unknown
+      text?: unknown
+      thinking?: unknown
+      reasoning?: unknown
+    }
+
+    if (typedBlock.type === 'tool_use' || typedBlock.type === 'tool_result') return true
+    if (typedBlock.type === 'text' && typeof typedBlock.text === 'string') {
+      return typedBlock.text.trim().length > 0
+    }
+    if (typedBlock.type === 'thinking' && typeof typedBlock.thinking === 'string') {
+      return typedBlock.thinking.trim().length > 0
+    }
+    if (typedBlock.type === 'reasoning' && typeof typedBlock.reasoning === 'string') {
+      return typedBlock.reasoning.trim().length > 0
+    }
+    if (typeof typedBlock.text === 'string') return typedBlock.text.trim().length > 0
+    return false
+  })
+}
+
+function isClaudeSemanticRecord(obj: any): boolean {
+  if (obj?.type === 'system') return obj?.subtype === 'init'
+  if (obj?.type === 'result') return true
+  if (obj?.type === 'user' || obj?.role === 'user' || obj?.message?.role === 'user') return true
+  if (obj?.type === 'assistant' || obj?.role === 'assistant' || obj?.message?.role === 'assistant') {
+    return assistantHasVisibleContent(obj?.message ?? obj)
+  }
+  return false
+}
+
+function recordSemanticClock(
+  clock: { createdAt?: number; lastActivityAt?: number },
+  value: unknown,
+): void {
+  const at = parseTimestampMs(value)
+  if (at === undefined) return
+  clock.createdAt = clock.createdAt === undefined ? at : Math.min(clock.createdAt, at)
+  clock.lastActivityAt = clock.lastActivityAt === undefined ? at : Math.max(clock.lastActivityAt, at)
 }
 
 function resolveClaudeCompactPercentThreshold(): number {
@@ -241,6 +305,8 @@ export function parseSessionContent(content: string, options: ParseSessionOption
   const lines = content.split(/\r?\n/).filter(Boolean)
   let sessionId: string | undefined
   let cwd: string | undefined
+  let createdAt: number | undefined
+  let lastActivityAt: number | undefined
   let title: string | undefined
   let summary: string | undefined
   let firstUserMessage: string | undefined
@@ -263,6 +329,13 @@ export function parseSessionContent(content: string, options: ParseSessionOption
       obj = JSON.parse(line)
     } catch {
       continue
+    }
+
+    if (isClaudeSemanticRecord(obj)) {
+      const clock = { createdAt, lastActivityAt }
+      recordSemanticClock(clock, obj?.timestamp)
+      createdAt = clock.createdAt
+      lastActivityAt = clock.lastActivityAt
     }
 
     if (obj.type === 'queue-operation') isNonInteractive = true
@@ -397,6 +470,8 @@ export function parseSessionContent(content: string, options: ParseSessionOption
   return {
     sessionId,
     cwd,
+    createdAt,
+    lastActivityAt,
     title,
     summary,
     firstUserMessage,
