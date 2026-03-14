@@ -1,8 +1,10 @@
 import { z } from 'zod'
+import { mergeLocalSettings, resolveLocalSettings } from '@shared/settings'
 import { hydratePanes } from './panesSlice'
 import { setLocalSettings } from './settingsSlice'
 import { setTabRegistrySearchRangeDays } from './tabRegistrySlice'
 import { hydrateTabs } from './tabsSlice'
+import { getPendingBrowserPreferencesWriteState } from './browserPreferencesPersistence'
 import { parsePersistedPanesRaw, parsePersistedTabsRaw, PANES_STORAGE_KEY, TABS_STORAGE_KEY } from './persistedState'
 import { getPersistBroadcastSourceId, onPersistBroadcast, PERSIST_BROADCAST_CHANNEL_NAME } from './persistBroadcast'
 import { BROWSER_PREFERENCES_STORAGE_KEY } from './storage-keys'
@@ -114,12 +116,21 @@ function dispatchHydrateBrowserPreferencesFromPersisted(store: StoreLike, raw: s
   const parsed = parseBrowserPreferencesRaw(raw)
   if (!parsed) return
 
+  const pendingWriteState = getPendingBrowserPreferencesWriteState(store)
+  const remoteSettingsPatch = parsed.settings ?? {}
+  const nextSettings = pendingWriteState.settingsPatch
+    ? resolveLocalSettings(mergeLocalSettings(remoteSettingsPatch, pendingWriteState.settingsPatch))
+    : resolveBrowserPreferenceSettings(parsed)
+  const nextSearchRangeDays = pendingWriteState.hasPendingSearchRangeDays
+    ? pendingWriteState.searchRangeDays
+    : (parsed.tabs?.searchRangeDays ?? DEFAULT_SEARCH_RANGE_DAYS)
+
   store.dispatch({
-    ...setLocalSettings(resolveBrowserPreferenceSettings(parsed)),
+    ...setLocalSettings(nextSettings),
     meta: { skipPersist: true, source: 'cross-tab' },
   })
   store.dispatch({
-    ...setTabRegistrySearchRangeDays(parsed.tabs?.searchRangeDays ?? DEFAULT_SEARCH_RANGE_DAYS),
+    ...setTabRegistrySearchRangeDays(nextSearchRangeDays),
     meta: { skipPersist: true, source: 'cross-tab' },
   })
 }

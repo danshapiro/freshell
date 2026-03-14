@@ -290,6 +290,38 @@ describe('SettingsView Editor section', () => {
     })
   })
 
+  it('debounces custom command saves and sends only the latest typed value', async () => {
+    const store = createTestStore({ editor: { externalEditor: 'custom' } })
+    render(
+      <Provider store={store}>
+        <SettingsView />
+      </Provider>
+    )
+
+    const input = screen.getByPlaceholderText('nvim +{line} {file}')
+    fireEvent.change(input, { target: { value: 'vim' } })
+    fireEvent.change(input, { target: { value: 'vim +{line}' } })
+    fireEvent.change(input, { target: { value: 'vim +{line} {file}' } })
+
+    expect(store.getState().settings.settings.editor?.customEditorCommand).toBe(
+      'vim +{line} {file}'
+    )
+    expect(api.patch).not.toHaveBeenCalled()
+
+    await act(async () => {
+      vi.advanceTimersByTime(500)
+    })
+
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledTimes(1)
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      editor: { customEditorCommand: 'vim +{line} {file}' },
+    })
+    expect(api.patch).toHaveBeenCalledTimes(1)
+    expect(api.patch).toHaveBeenCalledWith('/api/settings', {
+      editor: { customEditorCommand: 'vim +{line} {file}' },
+    })
+  })
+
   it('displays existing custom command value', () => {
     const store = createTestStore({
       editor: { externalEditor: 'custom', customEditorCommand: 'emacs +{line} {file}' },

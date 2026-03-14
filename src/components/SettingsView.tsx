@@ -3,6 +3,7 @@ import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import {
   defaultSettings,
   mergeSettings,
+  previewServerSettingsPatch,
   updateSettingsLocal,
 } from '@/store/settingsSlice'
 import {
@@ -50,6 +51,7 @@ import { ConfirmModal } from '@/components/ui/confirm-modal'
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 const SETTINGS_FIREWALL_POLL_INTERVAL_MS = 2000
 const SETTINGS_FIREWALL_POLL_MAX_ATTEMPTS = 10
+const SERVER_TEXT_SETTINGS_DEBOUNCE_MS = 500
 
 /** Monospace fonts with good Unicode block element support for terminal use */
 const terminalFonts = [
@@ -282,6 +284,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   const remoteAccessRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const remoteAccessRefreshRequestRef = useRef(0)
   const defaultCwdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const serverTextSaveTimerRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
   const defaultCwdValidationRef = useRef(0)
   const lastSettingsDefaultCwdRef = useRef(settings.defaultCwd ?? '')
   const lastSettingsExcludeFirstChatRef = useRef(
@@ -314,6 +317,9 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
       if (firewallRefreshTimerRef.current) clearTimeout(firewallRefreshTimerRef.current)
       if (remoteAccessRefreshTimerRef.current) clearTimeout(remoteAccessRefreshTimerRef.current)
       if (defaultCwdTimerRef.current) clearTimeout(defaultCwdTimerRef.current)
+      for (const timer of Object.values(serverTextSaveTimerRef.current)) {
+        clearTimeout(timer)
+      }
       for (const timer of Object.values(providerCwdTimerRef.current)) {
         clearTimeout(timer)
       }
@@ -569,6 +575,16 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
 
   const applyServerSetting = useCallback((updates: ServerSettingsPatch) => {
     void dispatch(saveServerSettingsPatch(updates))
+  }, [dispatch])
+
+  const scheduleServerTextSettingSave = useCallback((key: string, updates: ServerSettingsPatch) => {
+    dispatch(previewServerSettingsPatch(updates))
+    if (serverTextSaveTimerRef.current[key]) {
+      clearTimeout(serverTextSaveTimerRef.current[key])
+    }
+    serverTextSaveTimerRef.current[key] = setTimeout(() => {
+      void dispatch(saveServerSettingsPatch(updates))
+    }, SERVER_TEXT_SETTINGS_DEBOUNCE_MS)
   }, [dispatch])
 
   useEffect(() => {
@@ -1016,7 +1032,9 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                   const nextInput = event.target.value
                   setExcludeFirstChatInput(nextInput)
                   const excludeFirstChatSubstrings = parseNormalizedLineList(nextInput)
-                  applyServerSetting({ sidebar: { excludeFirstChatSubstrings } })
+                  scheduleServerTextSettingSave('sidebar.excludeFirstChatSubstrings', {
+                    sidebar: { excludeFirstChatSubstrings },
+                  })
                 }}
                 className="min-h-20 w-full rounded-md bg-muted border-0 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-border md:w-[24rem]"
                 placeholder="__AUTO__"
@@ -1277,7 +1295,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                   value={settings.editor?.customEditorCommand ?? ''}
                   placeholder="nvim +{line} {file}"
                   onChange={(e) => {
-                    applyServerSetting({
+                    scheduleServerTextSettingSave('editor.customEditorCommand', {
                       editor: { customEditorCommand: e.target.value },
                     })
                   }}
@@ -1384,7 +1402,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                         placeholder={provider.name === 'codex' ? 'e.g. gpt-5-codex' : 'e.g. claude-3-5-sonnet'}
                         onChange={(e) => {
                           const model = e.target.value.trim()
-                          applyServerSetting({
+                          scheduleServerTextSettingSave(`codingCli.providers.${provider.name}.model`, {
                             codingCli: { providers: { [provider.name]: { model: model || undefined } } },
                           })
                         }}

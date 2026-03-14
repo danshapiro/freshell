@@ -3,7 +3,7 @@ import { render, waitFor, cleanup } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import App from '@/App'
-import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
+import settingsReducer, { defaultSettings, setLocalSettings } from '@/store/settingsSlice'
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
@@ -13,6 +13,7 @@ import terminalMetaReducer from '@/store/terminalMetaSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer } from '@/store/networkSlice'
 import { BROWSER_PREFERENCES_STORAGE_KEY } from '@/store/storage-keys'
+import { loadBrowserPreferencesRecord, resolveBrowserPreferenceSettings } from '@/lib/browser-preferences'
 import {
   composeResolvedSettings,
   createDefaultServerSettings,
@@ -240,75 +241,8 @@ describe('terminal font preference (e2e)', () => {
       return Promise.resolve({})
     })
 
-    const store = configureStore({
-      reducer: {
-        settings: settingsReducer,
-        tabs: tabsReducer,
-        connection: connectionReducer,
-        sessions: sessionsReducer,
-        panes: panesReducer,
-        tabRegistry: tabRegistryReducer,
-        terminalMeta: terminalMetaReducer,
-        network: networkReducer,
-        extensions: extensionsReducer,
-      },
-      middleware: (getDefault) =>
-        getDefault({
-          serializableCheck: {
-            ignoredPaths: ['sessions.expandedProjects'],
-          },
-        }),
-      preloadedState: {
-        settings: createSettingsState({
-          local: {
-            terminal: {
-              fontFamily: 'Fira Code',
-            },
-          },
-        }),
-        tabs: {
-          tabs: [{ id: 'tab-1', mode: 'shell' }],
-          activeTabId: 'tab-1',
-        },
-        sessions: {
-          projects: [],
-          expandedProjects: new Set<string>(),
-          wsSnapshotReceived: false,
-          isLoading: false,
-          error: null,
-        },
-        connection: {
-          status: 'ready' as const,
-          lastError: undefined,
-          platform: null,
-          availableClis: {},
-          serverInstanceId: undefined,
-        },
-        panes: {
-          layouts: {},
-          activePane: {},
-          paneTitles: {},
-          paneTitleSetByUser: {},
-          renameRequestTabId: null,
-          renameRequestPaneId: null,
-          zoomedPane: {},
-        },
-        tabRegistry: {
-          deviceId: 'device-test',
-          deviceLabel: 'device-test',
-          deviceAliases: {},
-          localOpen: [],
-          remoteOpen: [],
-          closed: [],
-          localClosed: {},
-          searchRangeDays: 30,
-          loading: false,
-        },
-        terminalMeta: { byTerminalId: {} },
-        network: { status: null, loading: false, configuring: false, error: null },
-        extensions: { entries: [] },
-      },
-    })
+    const store = createTestStore()
+    store.dispatch(setLocalSettings(resolveBrowserPreferenceSettings(loadBrowserPreferencesRecord())))
     renderApp(store)
 
     await waitFor(() => {

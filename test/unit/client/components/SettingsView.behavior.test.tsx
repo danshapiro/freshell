@@ -121,19 +121,23 @@ describe('SettingsView behavior sections', () => {
       expect(store.getState().settings.settings.sidebar.showProjectBadges).toBe(false)
     })
 
-    it('updates sidebar first-chat exclusion substrings', async () => {
+    it('debounces sidebar first-chat exclusion substring saves and sends the latest value', async () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
       const textarea = screen.getByLabelText('Sidebar first chat exclusion substrings')
+      fireEvent.change(textarea, { target: { value: '__AUTO__' } })
       fireEvent.change(textarea, { target: { value: '__AUTO__\ncanary' } })
 
       expect(store.getState().settings.settings.sidebar.excludeFirstChatSubstrings).toEqual(['__AUTO__', 'canary'])
+
+      expect(api.patch).not.toHaveBeenCalled()
 
       await act(async () => {
         vi.advanceTimersByTime(500)
       })
 
+      expect(api.patch).toHaveBeenCalledTimes(1)
       expect(api.patch).toHaveBeenCalledWith('/api/settings', {
         sidebar: { excludeFirstChatSubstrings: ['__AUTO__', 'canary'] },
       })
@@ -240,21 +244,57 @@ describe('SettingsView behavior sections', () => {
       expect(store.getState().settings.settings.codingCli.enabledProviders).not.toContain('codex')
     })
 
-    it('updates codex model input', async () => {
+    it('debounces codex model saves and sends only the latest value', async () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)
 
       const input = screen.getByPlaceholderText('e.g. gpt-5-codex')
+      fireEvent.change(input, { target: { value: 'gpt' } })
       fireEvent.change(input, { target: { value: 'gpt-5-codex' } })
 
       expect(store.getState().settings.settings.codingCli.providers.codex?.model).toBe('gpt-5-codex')
+
+      expect(api.patch).not.toHaveBeenCalled()
+
+      await act(async () => {
+        vi.advanceTimersByTime(500)
+      })
+
+      expect(api.patch).toHaveBeenCalledTimes(1)
+      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
+        codingCli: { providers: { codex: { model: 'gpt-5-codex' } } },
+      })
+    })
+
+    it('clears codex model overrides through the shared save path', async () => {
+      const store = createSettingsViewStore({
+        settings: {
+          codingCli: {
+            providers: {
+              codex: {
+                model: 'gpt-5-codex',
+              },
+            },
+          },
+        },
+      })
+      renderSettingsView(store)
+
+      const input = screen.getByDisplayValue('gpt-5-codex')
+      fireEvent.change(input, { target: { value: '' } })
+
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      expect(store.getState().settings.settings.codingCli.providers.codex?.model).toBeUndefined()
 
       await act(async () => {
         vi.advanceTimersByTime(500)
       })
 
       expect(api.patch).toHaveBeenCalledWith('/api/settings', {
-        codingCli: { providers: { codex: { model: 'gpt-5-codex' } } },
+        codingCli: { providers: { codex: { model: null } } },
       })
     })
 
@@ -276,6 +316,41 @@ describe('SettingsView behavior sections', () => {
 
       expect(api.patch).toHaveBeenCalledWith('/api/settings', {
         codingCli: { providers: { codex: { sandbox: 'workspace-write' } } },
+      })
+    })
+
+    it('clears codex sandbox overrides through the shared save path', async () => {
+      const store = createSettingsViewStore({
+        settings: {
+          codingCli: {
+            providers: {
+              codex: {
+                sandbox: 'workspace-write',
+              },
+            },
+          },
+        },
+      })
+      renderSettingsView(store)
+
+      const sandboxSelect = getSelect((select) => {
+        return select.querySelector('option[value="workspace-write"]') !== null
+      })
+
+      fireEvent.change(sandboxSelect, { target: { value: '' } })
+
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      expect(store.getState().settings.settings.codingCli.providers.codex?.sandbox).toBeUndefined()
+
+      await act(async () => {
+        vi.advanceTimersByTime(500)
+      })
+
+      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
+        codingCli: { providers: { codex: { sandbox: null } } },
       })
     })
 

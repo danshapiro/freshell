@@ -538,6 +538,31 @@ describe('ConfigStore', () => {
       expect(saved.settings.defaultCwd).toBe('/workspace')
     })
 
+    it('filters local-only and unknown nested keys from internal patch callers', async () => {
+      const store = new ConfigStore()
+      await store.load()
+
+      const updated = await store.patchSettings({
+        theme: 'dark',
+        terminal: {
+          scrollback: 18000,
+          fontFamily: 'Fira Code',
+          unknownNestedFlag: true,
+        },
+        sidebar: {
+          excludeFirstChatMustStart: true,
+          showSubagents: true,
+        },
+      } as any)
+
+      expect(updated.theme).toBeUndefined()
+      expect(updated.terminal.scrollback).toBe(18000)
+      expect((updated.terminal as Record<string, unknown>).fontFamily).toBeUndefined()
+      expect((updated.terminal as Record<string, unknown>).unknownNestedFlag).toBeUndefined()
+      expect(updated.sidebar.excludeFirstChatMustStart).toBe(true)
+      expect((updated.sidebar as Record<string, unknown>).showSubagents).toBeUndefined()
+    })
+
     it('can update safety settings', async () => {
       const store = new ConfigStore()
       await store.load()

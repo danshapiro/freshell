@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   BROWSER_PREFERENCES_STORAGE_KEY,
@@ -66,6 +66,35 @@ describe('browser preferences', () => {
         expanded: true,
       },
     }))
+  })
+
+  it('keeps legacy keys when migrating into the new blob fails to save', () => {
+    localStorage.setItem('freshell.terminal.fontFamily.v1', 'Fira Code')
+    localStorage.setItem('freshell:toolStripExpanded', 'true')
+
+    const originalSetItem = Storage.prototype.setItem
+    const setItemSpy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (key: string, value: string) {
+      if (key === BROWSER_PREFERENCES_STORAGE_KEY) {
+        throw new Error('quota exceeded')
+      }
+      return originalSetItem.call(this, key, value)
+    })
+
+    expect(loadBrowserPreferencesRecord()).toEqual({
+      settings: {
+        terminal: {
+          fontFamily: 'Fira Code',
+        },
+      },
+      toolStrip: {
+        expanded: true,
+      },
+    })
+    expect(localStorage.getItem('freshell.terminal.fontFamily.v1')).toBe('Fira Code')
+    expect(localStorage.getItem('freshell:toolStripExpanded')).toBe('true')
+    expect(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY)).toBeNull()
+
+    setItemSpy.mockRestore()
   })
 
   it('fills missing seeded values without overwriting existing local settings', () => {

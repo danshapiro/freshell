@@ -64,16 +64,21 @@ function normalizeRecord(value: unknown): BrowserPreferencesRecord {
 }
 
 function saveRecord(record: BrowserPreferencesRecord): BrowserPreferencesRecord {
+  persistRecord(record)
+  return record
+}
+
+function persistRecord(record: BrowserPreferencesRecord): boolean {
   if (!canUseStorage()) {
-    return record
+    return false
   }
 
   try {
     window.localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify(record))
+    return true
   } catch {
-    // Ignore storage failures and return the in-memory value.
+    return false
   }
-  return record
 }
 
 function migrateLegacyKeys(record: BrowserPreferencesRecord): BrowserPreferencesRecord {
@@ -82,11 +87,13 @@ function migrateLegacyKeys(record: BrowserPreferencesRecord): BrowserPreferences
   }
 
   let next = record
-  let changed = false
+  let needsPersist = false
+  let sawLegacyKeys = false
 
   try {
     const legacyFont = window.localStorage.getItem(LEGACY_TERMINAL_FONT_KEY)?.trim()
     if (legacyFont) {
+      sawLegacyKeys = true
       const currentFontFamily = next.settings?.terminal?.fontFamily
       if (!currentFontFamily) {
         next = {
@@ -95,29 +102,39 @@ function migrateLegacyKeys(record: BrowserPreferencesRecord): BrowserPreferences
             terminal: { fontFamily: legacyFont },
           }),
         }
-        changed = true
+        needsPersist = true
       }
-      window.localStorage.removeItem(LEGACY_TERMINAL_FONT_KEY)
-      changed = true
     }
 
     const legacyToolStrip = window.localStorage.getItem(LEGACY_TOOL_STRIP_STORAGE_KEY)
     if (legacyToolStrip === 'true' || legacyToolStrip === 'false') {
+      sawLegacyKeys = true
       if (next.toolStrip?.expanded === undefined) {
         next = {
           ...next,
           toolStrip: { expanded: legacyToolStrip === 'true' },
         }
-        changed = true
+        needsPersist = true
       }
-      window.localStorage.removeItem(LEGACY_TOOL_STRIP_STORAGE_KEY)
-      changed = true
     }
   } catch {
     return record
   }
 
-  return changed ? saveRecord(next) : next
+  if (needsPersist && !persistRecord(next)) {
+    return next
+  }
+
+  if (sawLegacyKeys) {
+    try {
+      window.localStorage.removeItem(LEGACY_TERMINAL_FONT_KEY)
+      window.localStorage.removeItem(LEGACY_TOOL_STRIP_STORAGE_KEY)
+    } catch {
+      // Ignore cleanup failures and keep the migrated in-memory value.
+    }
+  }
+
+  return next
 }
 
 export function parseBrowserPreferencesRaw(raw: string): BrowserPreferencesRecord | null {

@@ -280,13 +280,19 @@ export default function App() {
       return
     }
     if (!sidebarCollapsed && !userOpenedSidebarOnMobileRef.current) {
-      dispatch(updateSettingsLocal({ sidebar: { collapsed: true } }))
+      dispatch({
+        ...updateSettingsLocal({ sidebar: { collapsed: true } }),
+        meta: { skipPersist: true, source: 'responsive-auto-collapse' },
+      })
     }
   }, [isMobile, sidebarCollapsed, dispatch])
 
   useEffect(() => {
     if (isLandscapeTerminalView && !sidebarCollapsed) {
-      dispatch(updateSettingsLocal({ sidebar: { collapsed: true } }))
+      dispatch({
+        ...updateSettingsLocal({ sidebar: { collapsed: true } }),
+        meta: { skipPersist: true, source: 'responsive-auto-collapse' },
+      })
     }
   }, [dispatch, isLandscapeTerminalView, sidebarCollapsed])
 

@@ -24,6 +24,31 @@ export const normalizeSettingsPatch = (patch: Record<string, any>) => {
       patch.defaultCwd = undefined
     }
   }
+
+  if (patch.codingCli?.providers && typeof patch.codingCli.providers === 'object') {
+    for (const providerPatch of Object.values(patch.codingCli.providers)) {
+      if (!providerPatch || typeof providerPatch !== 'object' || Array.isArray(providerPatch)) {
+        continue
+      }
+      const providerPatchRecord = providerPatch as Record<string, unknown>
+      if (Object.prototype.hasOwnProperty.call(providerPatchRecord, 'cwd')) {
+        const raw = providerPatchRecord.cwd
+        if (raw === null || (typeof raw === 'string' && raw.trim() === '')) {
+          providerPatchRecord.cwd = undefined
+        }
+      }
+      if (Object.prototype.hasOwnProperty.call(providerPatchRecord, 'model')) {
+        const raw = providerPatchRecord.model
+        if (raw === null || (typeof raw === 'string' && raw.trim() === '')) {
+          providerPatchRecord.model = undefined
+        }
+      }
+      if (Object.prototype.hasOwnProperty.call(providerPatchRecord, 'sandbox') && providerPatchRecord.sandbox === null) {
+        providerPatchRecord.sandbox = undefined
+      }
+    }
+  }
+
   return patch
 }
 

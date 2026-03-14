@@ -212,13 +212,22 @@ function mergeDefined<T extends Record<string, unknown>>(base: T, patch?: Partia
   return merged as T
 }
 
+function mergeOwnKeys<T extends Record<string, unknown>>(base: T, patch?: Partial<T>): T {
+  if (!patch) return { ...base }
+  const merged: Record<string, unknown> = { ...base }
+  for (const key of Object.keys(patch)) {
+    merged[key] = patch[key as keyof T]
+  }
+  return merged as T
+}
+
 function mergeRecordOfObjects<T extends Record<string, unknown>>(
   base?: Partial<Record<string, T>>,
   patch?: Partial<Record<string, T>>,
 ): Partial<Record<string, T>> {
   const merged: Partial<Record<string, T>> = { ...(base || {}) }
   for (const [key, value] of Object.entries(patch || {})) {
-    merged[key] = mergeDefined((merged[key] || {}) as T, value || {})
+    merged[key] = mergeOwnKeys((merged[key] || {}) as T, value || {})
   }
   return merged
 }
@@ -258,6 +267,20 @@ function pickKeys(
       continue
     }
     next[key] = value
+  }
+  return next
+}
+
+function pickOwnKeysPreservingUndefined(
+  source: Record<string, unknown>,
+  keys: readonly string[],
+): Record<string, unknown> {
+  const next: Record<string, unknown> = {}
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(source, key)) {
+      continue
+    }
+    next[key] = source[key]
   }
   return next
 }
@@ -401,6 +424,18 @@ function createCodingCliProviderConfigSchema() {
     .strict()
 }
 
+function createCodingCliProviderConfigPatchSchema() {
+  return z
+    .object({
+      model: z.string().nullable().optional(),
+      sandbox: z.enum(CODEX_SANDBOX_VALUES).nullable().optional(),
+      permissionMode: z.enum(CLAUDE_PERMISSION_MODE_VALUES).optional(),
+      maxTurns: z.coerce.number().optional(),
+      cwd: z.string().nullable().optional(),
+    })
+    .strict()
+}
+
 function createAgentChatProviderDefaultsPatchSchema() {
   return z
     .object({
@@ -463,7 +498,7 @@ export function buildServerSettingsPatchSchema(validCliProviders: readonly strin
     codingCli: z.object({
       enabledProviders: z.array(CliProviderNameSchema).optional(),
       knownProviders: z.array(CliProviderNameSchema).optional(),
-      providers: z.record(CliProviderNameSchema, createCodingCliProviderConfigSchema()).optional(),
+      providers: z.record(CliProviderNameSchema, createCodingCliProviderConfigPatchSchema()).optional(),
     }).strict().optional(),
     editor: z.object({
       externalEditor: ExternalEditorSchema.optional(),
@@ -562,25 +597,206 @@ export function createDefaultResolvedSettings(options: SettingsDefaultsOptions =
   return composeResolvedSettings(createDefaultServerSettings(options), defaultLocalSettings)
 }
 
+function sanitizeServerSettingsPatch(patch: ServerSettingsPatch): ServerSettingsPatch {
+  if (!isRecord(patch)) {
+    return {}
+  }
+
+  const candidate = stripLocalSettings(patch as Record<string, unknown>)
+  const sanitized: ServerSettingsPatch = {}
+  const cliProviderNameSchema = createCliProviderNameSchema()
+  const codingCliProviderConfigPatchSchema = createCodingCliProviderConfigPatchSchema()
+  const agentChatProviderDefaultsPatchSchema = createAgentChatProviderDefaultsPatchSchema()
+
+  if (
+    hasOwn(candidate, 'defaultCwd')
+    && (typeof candidate.defaultCwd === 'string' || candidate.defaultCwd == null)
+  ) {
+    sanitized.defaultCwd = candidate.defaultCwd as ServerSettingsPatch['defaultCwd']
+  }
+  if (hasOwn(candidate, 'allowedFilePaths') && Array.isArray(candidate.allowedFilePaths)) {
+    sanitized.allowedFilePaths = candidate.allowedFilePaths.filter((value): value is string => typeof value === 'string')
+  }
+
+  if (isRecord(candidate.logging) && hasOwn(candidate.logging, 'debug')) {
+    sanitized.logging = { debug: !!candidate.logging.debug }
+  }
+
+  if (isRecord(candidate.safety) && hasOwn(candidate.safety, 'autoKillIdleMinutes')) {
+    const parsed = z.coerce.number().safeParse(candidate.safety.autoKillIdleMinutes)
+    if (parsed.success) {
+      sanitized.safety = { autoKillIdleMinutes: parsed.data }
+    }
+  }
+
+  if (isRecord(candidate.terminal) && hasOwn(candidate.terminal, 'scrollback')) {
+    const parsed = z.coerce.number().safeParse(candidate.terminal.scrollback)
+    if (parsed.success) {
+      sanitized.terminal = { scrollback: parsed.data }
+    }
+  }
+
+  if (isRecord(candidate.panes) && hasOwn(candidate.panes, 'defaultNewPane')) {
+    const parsed = DefaultNewPaneSchema.safeParse(candidate.panes.defaultNewPane)
+    if (parsed.success) {
+      sanitized.panes = { defaultNewPane: parsed.data }
+    }
+  }
+
+  if (isRecord(candidate.sidebar)) {
+    const sidebar: ServerSettingsPatch['sidebar'] = {}
+    if (hasOwn(candidate.sidebar, 'excludeFirstChatSubstrings') && Array.isArray(candidate.sidebar.excludeFirstChatSubstrings)) {
+      sidebar.excludeFirstChatSubstrings = candidate.sidebar.excludeFirstChatSubstrings.filter(
+        (value): value is string => typeof value === 'string',
+      )
+    }
+    if (hasOwn(candidate.sidebar, 'excludeFirstChatMustStart')) {
+      sidebar.excludeFirstChatMustStart = !!candidate.sidebar.excludeFirstChatMustStart
+    }
+    if (Object.keys(sidebar).length > 0) {
+      sanitized.sidebar = sidebar
+    }
+  }
+
+  if (isRecord(candidate.codingCli)) {
+    const codingCli: ServerSettingsPatch['codingCli'] = {}
+    if (hasOwn(candidate.codingCli, 'enabledProviders') && Array.isArray(candidate.codingCli.enabledProviders)) {
+      codingCli.enabledProviders = candidate.codingCli.enabledProviders.filter(
+        (value): value is string => cliProviderNameSchema.safeParse(value).success,
+      )
+    }
+    if (hasOwn(candidate.codingCli, 'knownProviders') && Array.isArray(candidate.codingCli.knownProviders)) {
+      codingCli.knownProviders = candidate.codingCli.knownProviders.filter(
+        (value): value is string => cliProviderNameSchema.safeParse(value).success,
+      )
+    }
+    if (isRecord(candidate.codingCli.providers)) {
+      const providers: NonNullable<ServerSettingsPatch['codingCli']>['providers'] = {}
+      for (const [providerName, providerPatch] of Object.entries(candidate.codingCli.providers)) {
+        if (!cliProviderNameSchema.safeParse(providerName).success) {
+          continue
+        }
+        const pickedProviderPatch = isRecord(providerPatch)
+          ? pickOwnKeysPreservingUndefined(providerPatch, ['model', 'sandbox', 'permissionMode', 'maxTurns', 'cwd'])
+          : providerPatch
+        const parsed = codingCliProviderConfigPatchSchema.safeParse(
+          pickedProviderPatch,
+        )
+        if (parsed.success && isRecord(pickedProviderPatch) && Object.keys(pickedProviderPatch).length > 0) {
+          const normalizedProviderPatch: Partial<CodingCliProviderConfig> = {}
+          if (hasOwn(pickedProviderPatch, 'model')) {
+            normalizedProviderPatch.model = parsed.data.model ?? undefined
+          }
+          if (hasOwn(pickedProviderPatch, 'sandbox')) {
+            normalizedProviderPatch.sandbox = parsed.data.sandbox ?? undefined
+          }
+          if (hasOwn(pickedProviderPatch, 'permissionMode')) {
+            normalizedProviderPatch.permissionMode = parsed.data.permissionMode
+          }
+          if (hasOwn(pickedProviderPatch, 'maxTurns')) {
+            normalizedProviderPatch.maxTurns = parsed.data.maxTurns
+          }
+          if (hasOwn(pickedProviderPatch, 'cwd')) {
+            normalizedProviderPatch.cwd = parsed.data.cwd ?? undefined
+          }
+          providers[providerName] = normalizedProviderPatch
+        }
+      }
+      if (Object.keys(providers).length > 0) {
+        codingCli.providers = providers
+      }
+    }
+    if (Object.keys(codingCli).length > 0) {
+      sanitized.codingCli = codingCli
+    }
+  }
+
+  if (isRecord(candidate.editor)) {
+    const editor: ServerSettingsPatch['editor'] = {}
+    if (hasOwn(candidate.editor, 'externalEditor')) {
+      const parsed = ExternalEditorSchema.safeParse(candidate.editor.externalEditor)
+      if (parsed.success) {
+        editor.externalEditor = parsed.data
+      }
+    }
+    if (hasOwn(candidate.editor, 'customEditorCommand') && typeof candidate.editor.customEditorCommand === 'string') {
+      editor.customEditorCommand = candidate.editor.customEditorCommand
+    }
+    if (Object.keys(editor).length > 0) {
+      sanitized.editor = editor
+    }
+  }
+
+  if (isRecord(candidate.agentChat)) {
+    const agentChat: ServerSettingsPatch['agentChat'] = {}
+    if (hasOwn(candidate.agentChat, 'initialSetupDone') && typeof candidate.agentChat.initialSetupDone === 'boolean') {
+      agentChat.initialSetupDone = candidate.agentChat.initialSetupDone
+    }
+    if (hasOwn(candidate.agentChat, 'defaultPlugins') && Array.isArray(candidate.agentChat.defaultPlugins)) {
+      agentChat.defaultPlugins = candidate.agentChat.defaultPlugins.filter(
+        (value): value is string => typeof value === 'string',
+      )
+    }
+    if (isRecord(candidate.agentChat.providers)) {
+      const providers: NonNullable<ServerSettingsPatch['agentChat']>['providers'] = {}
+      for (const [providerName, providerPatch] of Object.entries(candidate.agentChat.providers)) {
+        const parsed = agentChatProviderDefaultsPatchSchema.safeParse(
+          isRecord(providerPatch)
+            ? pickKeys(providerPatch, ['defaultModel', 'defaultPermissionMode', 'defaultEffort'])
+            : providerPatch,
+        )
+        if (parsed.success && Object.keys(parsed.data).length > 0) {
+          providers[providerName] = parsed.data
+        }
+      }
+      if (Object.keys(providers).length > 0) {
+        agentChat.providers = providers
+      }
+    }
+    if (Object.keys(agentChat).length > 0) {
+      sanitized.agentChat = agentChat
+    }
+  }
+
+  if (isRecord(candidate.network)) {
+    const network: ServerSettingsPatch['network'] = {}
+    if (hasOwn(candidate.network, 'host')) {
+      const parsed = NetworkHostSchema.safeParse(candidate.network.host)
+      if (parsed.success) {
+        network.host = parsed.data
+      }
+    }
+    if (hasOwn(candidate.network, 'configured')) {
+      network.configured = !!candidate.network.configured
+    }
+    if (Object.keys(network).length > 0) {
+      sanitized.network = network
+    }
+  }
+
+  return sanitized
+}
+
 export function mergeServerSettings(base: ServerSettings, patch: ServerSettingsPatch): ServerSettings {
-  const codingCliPatch = patch.codingCli
-  const agentChatPatch = patch.agentChat
+  const normalizedPatch = sanitizeServerSettingsPatch(patch)
+  const codingCliPatch = normalizedPatch.codingCli
+  const agentChatPatch = normalizedPatch.agentChat
 
   return {
     ...base,
-    ...(hasOwn(patch, 'defaultCwd') ? { defaultCwd: patch.defaultCwd } : {}),
-    ...(hasOwn(patch, 'allowedFilePaths') ? { allowedFilePaths: patch.allowedFilePaths } : {}),
-    logging: mergeDefined(base.logging, patch.logging),
-    safety: mergeDefined(base.safety, patch.safety),
-    terminal: mergeDefined(base.terminal, patch.terminal),
-    panes: mergeDefined(base.panes, patch.panes),
+    ...(hasOwn(normalizedPatch, 'defaultCwd') ? { defaultCwd: normalizedPatch.defaultCwd } : {}),
+    ...(hasOwn(normalizedPatch, 'allowedFilePaths') ? { allowedFilePaths: normalizedPatch.allowedFilePaths } : {}),
+    logging: mergeDefined(base.logging, normalizedPatch.logging),
+    safety: mergeDefined(base.safety, normalizedPatch.safety),
+    terminal: mergeDefined(base.terminal, normalizedPatch.terminal),
+    panes: mergeDefined(base.panes, normalizedPatch.panes),
     sidebar: {
-      ...mergeDefined(base.sidebar, patch.sidebar),
-      excludeFirstChatSubstrings: hasOwn(patch.sidebar, 'excludeFirstChatSubstrings')
-        ? normalizeTrimmedStringList(patch.sidebar?.excludeFirstChatSubstrings)
+      ...mergeDefined(base.sidebar, normalizedPatch.sidebar),
+      excludeFirstChatSubstrings: hasOwn(normalizedPatch.sidebar, 'excludeFirstChatSubstrings')
+        ? normalizeTrimmedStringList(normalizedPatch.sidebar?.excludeFirstChatSubstrings)
         : base.sidebar.excludeFirstChatSubstrings,
-      excludeFirstChatMustStart: hasOwn(patch.sidebar, 'excludeFirstChatMustStart')
-        ? !!patch.sidebar?.excludeFirstChatMustStart
+      excludeFirstChatMustStart: hasOwn(normalizedPatch.sidebar, 'excludeFirstChatMustStart')
+        ? !!normalizedPatch.sidebar?.excludeFirstChatMustStart
         : base.sidebar.excludeFirstChatMustStart,
     },
     codingCli: {
@@ -593,7 +809,7 @@ export function mergeServerSettings(base: ServerSettings, patch: ServerSettingsP
         : base.codingCli.knownProviders ? [...base.codingCli.knownProviders] : undefined,
       providers: mergeRecordOfObjects(base.codingCli.providers, codingCliPatch?.providers),
     },
-    editor: mergeDefined(base.editor, patch.editor),
+    editor: mergeDefined(base.editor, normalizedPatch.editor),
     agentChat: {
       ...mergeDefined(base.agentChat, agentChatPatch),
       defaultPlugins: hasOwn(agentChatPatch, 'defaultPlugins')
@@ -601,7 +817,7 @@ export function mergeServerSettings(base: ServerSettings, patch: ServerSettingsP
         : base.agentChat.defaultPlugins,
       providers: mergeRecordOfObjects(base.agentChat.providers, agentChatPatch?.providers),
     },
-    network: mergeDefined(base.network, patch.network),
+    network: mergeDefined(base.network, normalizedPatch.network),
   }
 }
 

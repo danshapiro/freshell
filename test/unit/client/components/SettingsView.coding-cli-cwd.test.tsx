@@ -13,6 +13,7 @@ import {
   mergeServerSettings,
   resolveLocalSettings,
 } from '@shared/settings'
+import { api } from '@/lib/api'
 
 vi.mock('@/lib/api', () => ({
   api: {
@@ -200,5 +201,70 @@ describe('SettingsView coding CLI cwd', () => {
       codingCli: { providers: { claude: { cwd: '/tmp/project' } } },
     })
     expect(store.getState().settings.settings.codingCli.providers.claude?.cwd).toBe('/tmp/project')
+  })
+
+  it('clears provider cwd overrides through the shared save path', async () => {
+    const localSettings = resolveLocalSettings()
+    const serverSettings = mergeServerSettings(defaultServerSettings, {
+      codingCli: {
+        providers: {
+          claude: {
+            cwd: '/home/user/work',
+          },
+        },
+      },
+    })
+    const store = configureStore({
+      reducer: {
+        settings: settingsReducer,
+        network: networkReducer,
+        extensions: extensionsReducer,
+      },
+      preloadedState: {
+        settings: {
+          serverSettings,
+          localSettings,
+          settings: composeResolvedSettings(serverSettings, localSettings),
+          loaded: true,
+          lastSavedAt: Date.now(),
+        },
+        extensions: {
+          entries: defaultCliExtensions,
+        },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <SettingsView />
+      </Provider>
+    )
+
+    const claudeInput = screen.getByDisplayValue('/home/user/work')
+    fireEvent.change(claudeInput, { target: { value: '' } })
+
+    await act(async () => {
+      vi.advanceTimersByTime(500)
+      await Promise.resolve()
+    })
+
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      codingCli: { providers: { claude: { cwd: undefined } } },
+    })
+    expect(api.patch).toHaveBeenCalledWith('/api/settings', {
+      codingCli: {
+        providers: {
+          claude: {
+            cwd: null,
+          },
+        },
+      },
+    })
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(store.getState().settings.settings.codingCli.providers.claude?.cwd).toBeUndefined()
   })
 })

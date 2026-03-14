@@ -14,6 +14,10 @@ import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer, setNetworkStatus, type NetworkStatusResponse } from '@/store/networkSlice'
 import { BROWSER_PREFERENCES_STORAGE_KEY } from '@/store/storage-keys'
 import {
+  BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS,
+  browserPreferencesPersistenceMiddleware,
+} from '@/store/browserPreferencesPersistence'
+import {
   composeResolvedSettings,
   createDefaultServerSettings,
   mergeServerSettings,
@@ -786,6 +790,81 @@ describe('App Component - Mobile Sidebar', () => {
     // Give effects a chance to run; sidebar should remain open.
     await new Promise((r) => setTimeout(r, 0))
     expect(screen.getByTestId('mock-sidebar')).toBeInTheDocument()
+  })
+
+  it('does not persist responsive auto-collapse into browser preferences across a later desktop reload', async () => {
+    ;(globalThis as any).setMobileForTest(true)
+
+    const mobileStore = configureStore({
+      reducer: {
+        settings: settingsReducer,
+        tabs: tabsReducer,
+        connection: connectionReducer,
+        sessions: sessionsReducer,
+        panes: panesReducer,
+        tabRegistry: tabRegistryReducer,
+        terminalMeta: terminalMetaReducer,
+        network: networkReducer,
+        extensions: extensionsReducer,
+      },
+      middleware: (getDefault) =>
+        getDefault({
+          serializableCheck: {
+            ignoredPaths: ['sessions.expandedProjects'],
+          },
+        }).concat(browserPreferencesPersistenceMiddleware),
+      preloadedState: createTestStore().getState(),
+    })
+
+    const mobileView = renderApp(mobileStore)
+
+    await waitFor(() => {
+      expect(screen.getByTitle('Show sidebar')).toBeInTheDocument()
+    })
+
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS + 25)
+      })
+    })
+
+    expect(JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')).not.toEqual(
+      expect.objectContaining({
+        settings: expect.objectContaining({
+          sidebar: expect.objectContaining({
+            collapsed: true,
+          }),
+        }),
+      }),
+    )
+
+    mobileView.unmount()
+    ;(globalThis as any).setMobileForTest(false)
+
+    renderApp(configureStore({
+      reducer: {
+        settings: settingsReducer,
+        tabs: tabsReducer,
+        connection: connectionReducer,
+        sessions: sessionsReducer,
+        panes: panesReducer,
+        tabRegistry: tabRegistryReducer,
+        terminalMeta: terminalMetaReducer,
+        network: networkReducer,
+        extensions: extensionsReducer,
+      },
+      middleware: (getDefault) =>
+        getDefault({
+          serializableCheck: {
+            ignoredPaths: ['sessions.expandedProjects'],
+          },
+        }).concat(browserPreferencesPersistenceMiddleware),
+      preloadedState: createTestStore().getState(),
+    }))
+
+    await waitFor(() => {
+      expect(screen.getByTitle('Hide sidebar')).toBeInTheDocument()
+    })
   })
 })
 describe('App Bootstrap', () => {

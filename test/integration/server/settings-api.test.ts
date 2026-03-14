@@ -142,6 +142,43 @@ describe('Settings API Integration', () => {
     expect(res.body.defaultCwd).toBeUndefined()
   })
 
+  it('PATCH /api/settings accepts null sentinels to clear provider overrides', async () => {
+    await request(app)
+      .patch('/api/settings')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({
+        codingCli: {
+          providers: {
+            codex: {
+              cwd: '/workspace',
+              model: 'gpt-5-codex',
+              sandbox: 'workspace-write',
+            },
+          },
+        },
+      })
+
+    const res = await request(app)
+      .patch('/api/settings')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({
+        codingCli: {
+          providers: {
+            codex: {
+              cwd: null,
+              model: null,
+              sandbox: null,
+            },
+          },
+        },
+      })
+
+    expect(res.status).toBe(200)
+    expect(res.body.codingCli.providers.codex.cwd).toBeUndefined()
+    expect(res.body.codingCli.providers.codex.model).toBeUndefined()
+    expect(res.body.codingCli.providers.codex.sandbox).toBeUndefined()
+  })
+
   it('PATCH /api/settings rejects local-only settings fields', async () => {
     const payloads = [
       { theme: 'dark' },

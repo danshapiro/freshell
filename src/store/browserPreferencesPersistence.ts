@@ -1,6 +1,6 @@
 import type { Middleware } from '@reduxjs/toolkit'
 
-import { defaultLocalSettings, type LocalSettings, type LocalSettingsPatch } from '@shared/settings'
+import { extractLegacyLocalSettingsSeed, mergeLocalSettings, defaultLocalSettings, type LocalSettings, type LocalSettingsPatch } from '@shared/settings'
 import { loadBrowserPreferencesRecord, type BrowserPreferencesRecord } from '@/lib/browser-preferences'
 import { BROWSER_PREFERENCES_STORAGE_KEY } from './storage-keys'
 import { broadcastPersistedRaw } from './persistBroadcast'
@@ -14,10 +14,19 @@ type BrowserPreferencesState = {
   tabRegistry: Pick<TabRegistryState, 'searchRangeDays'>
 }
 
+type BrowserPreferencesWriteState = {
+  settingsPatch?: LocalSettingsPatch
+  hasPendingSearchRangeDays: boolean
+  searchRangeDays: number
+}
+
 const DEFAULT_SEARCH_RANGE_DAYS = 30
 
 const flushCallbacks = new Set<() => void>()
 let flushListenersAttached = false
+let pendingWritesByGetState = new WeakMap<BrowserPreferencesMiddlewareGetState, BrowserPreferencesWriteState>()
+
+type BrowserPreferencesMiddlewareGetState = () => unknown
 
 function notifyFlushCallbacks() {
   for (const cb of flushCallbacks) {
@@ -57,6 +66,7 @@ function registerFlushCallback(cb: () => void) {
 
 export function resetBrowserPreferencesFlushListenersForTests() {
   flushCallbacks.clear()
+  pendingWritesByGetState = new WeakMap()
 }
 
 function canUseStorage(): boolean {
@@ -150,9 +160,46 @@ function buildBrowserPreferencesRecord(state: BrowserPreferencesState): BrowserP
   return next
 }
 
+function getOrCreatePendingWriteState(getState: BrowserPreferencesMiddlewareGetState): BrowserPreferencesWriteState {
+  const existing = pendingWritesByGetState.get(getState)
+  if (existing) {
+    return existing
+  }
+
+  const created: BrowserPreferencesWriteState = {
+    hasPendingSearchRangeDays: false,
+    searchRangeDays: DEFAULT_SEARCH_RANGE_DAYS,
+  }
+  pendingWritesByGetState.set(getState, created)
+  return created
+}
+
+function resetPendingWriteState(getState: BrowserPreferencesMiddlewareGetState) {
+  pendingWritesByGetState.set(getState, {
+    hasPendingSearchRangeDays: false,
+    searchRangeDays: DEFAULT_SEARCH_RANGE_DAYS,
+  })
+}
+
+export function getPendingBrowserPreferencesWriteState(store: { getState: BrowserPreferencesMiddlewareGetState }) {
+  const pending = pendingWritesByGetState.get(store.getState)
+  if (!pending) {
+    return {
+      hasPendingSearchRangeDays: false,
+      searchRangeDays: DEFAULT_SEARCH_RANGE_DAYS,
+    }
+  }
+  return {
+    settingsPatch: pending.settingsPatch,
+    hasPendingSearchRangeDays: pending.hasPendingSearchRangeDays,
+    searchRangeDays: pending.searchRangeDays,
+  }
+}
+
 export const browserPreferencesPersistenceMiddleware: Middleware<{}, BrowserPreferencesState> = (store) => {
   let dirty = false
   let flushTimer: ReturnType<typeof setTimeout> | null = null
+  resetPendingWriteState(store.getState as BrowserPreferencesMiddlewareGetState)
 
   const flush = () => {
     flushTimer = null
@@ -168,6 +215,7 @@ export const browserPreferencesPersistenceMiddleware: Middleware<{}, BrowserPref
       localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, raw)
       broadcastPersistedRaw(BROWSER_PREFERENCES_STORAGE_KEY, raw)
       dirty = false
+      resetPendingWriteState(store.getState as BrowserPreferencesMiddlewareGetState)
     } catch {
       scheduleFlush()
     }
@@ -200,6 +248,15 @@ export const browserPreferencesPersistenceMiddleware: Middleware<{}, BrowserPref
       || action?.type === 'settings/setLocalSettings'
       || action?.type === 'tabRegistry/setTabRegistrySearchRangeDays'
     ) {
+      const pending = getOrCreatePendingWriteState(store.getState as BrowserPreferencesMiddlewareGetState)
+      if (action?.type === 'settings/updateSettingsLocal') {
+        pending.settingsPatch = mergeLocalSettings(pending.settingsPatch, action.payload || {})
+      } else if (action?.type === 'settings/setLocalSettings') {
+        pending.settingsPatch = extractLegacyLocalSettingsSeed(action.payload as Record<string, unknown>) ?? {}
+      } else if (action?.type === 'tabRegistry/setTabRegistrySearchRangeDays') {
+        pending.hasPendingSearchRangeDays = true
+        pending.searchRangeDays = action.payload
+      }
       dirty = true
       scheduleFlush()
     }
