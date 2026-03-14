@@ -180,7 +180,7 @@ export function fetchSessionWindow(args: FetchSessionWindowArgs) {
     const controller = new AbortController()
     controllers.set(surface, controller)
 
-    let requestPromise: Promise<void>
+    let requestPromise!: Promise<void>
     requestPromise = (async () => {
       dispatch(setSessionWindowLoading({
         surface,
