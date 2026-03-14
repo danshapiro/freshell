@@ -14,6 +14,7 @@ import {
   setTabRegistryDeviceLabel,
 } from '@/store/tabRegistrySlice'
 import { api, type ApiError } from '@/lib/api'
+import { createLogger } from '@/lib/client-logger'
 import { cn } from '@/lib/utils'
 import { terminalThemes, darkThemes, lightThemes, getTerminalTheme } from '@/lib/terminal-themes'
 import { resolveTerminalFontFamily } from '@/lib/terminal-fonts'
@@ -55,6 +56,7 @@ const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 const SETTINGS_FIREWALL_POLL_INTERVAL_MS = 2000
 const SETTINGS_FIREWALL_POLL_MAX_ATTEMPTS = 10
 const SERVER_TEXT_SETTINGS_DEBOUNCE_MS = 500
+const log = createLogger('SettingsView')
 
 /** Monospace fonts with good Unicode block element support for terminal use */
 const terminalFonts = [
