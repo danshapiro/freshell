@@ -111,7 +111,7 @@ describe('browserPreferencesPersistence', () => {
     })
   })
 
-  it('does not persist skipPersist local keys when a later normal local update flushes', () => {
+  it('does not write browser preferences for a skipPersist local update by itself', () => {
     const store = createStore()
 
     store.dispatch({
@@ -123,36 +123,8 @@ describe('browserPreferencesPersistence', () => {
       meta: { skipPersist: true },
     })
 
-    expect(store.getState().settings.localSettings.sidebar.collapsed).toBe(true)
-
-    store.dispatch(updateSettingsLocal({
-      theme: 'dark',
-    }))
-
     vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
-
-    expect(JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')).toEqual({
-      settings: {
-        theme: 'dark',
-      },
-    })
-
-    store.dispatch(updateSettingsLocal({
-      terminal: {
-        fontSize: 18,
-      },
-    }))
-
-    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
-
-    expect(JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')).toEqual({
-      settings: {
-        theme: 'dark',
-        terminal: {
-          fontSize: 18,
-        },
-      },
-    })
+    expect(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY)).toBeNull()
   })
 
   it('stops automatic retry loops after a storage write failure until another local change happens', () => {

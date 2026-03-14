@@ -792,6 +792,20 @@ describe('App Component - Mobile Sidebar', () => {
     expect(screen.getByTestId('mock-sidebar')).toBeInTheDocument()
   })
 
+  it('keeps responsive auto-collapse out of persisted local settings state', async () => {
+    ;(globalThis as any).setMobileForTest(true)
+
+    const store = createTestStore()
+    renderApp(store)
+
+    await waitFor(() => {
+      expect(screen.getByTitle('Show sidebar')).toBeInTheDocument()
+      expect(screen.queryByTestId('mock-sidebar')).not.toBeInTheDocument()
+    })
+
+    expect(store.getState().settings.localSettings.sidebar.collapsed).toBe(false)
+  })
+
   it('does not persist responsive auto-collapse into browser preferences across a later desktop reload', async () => {
     ;(globalThis as any).setMobileForTest(true)
 

@@ -268,6 +268,30 @@ describe('SettingsView behavior sections', () => {
       })
     })
 
+    it('preserves enabled provider names that are not live or browser-known when toggling another provider', async () => {
+      const store = createSettingsViewStore({
+        settings: {
+          codingCli: {
+            enabledProviders: ['codex', 'custom-cli'],
+            knownProviders: ['claude', 'codex'],
+          },
+        },
+      })
+      renderSettingsView(store)
+
+      const row = screen.getByText('Enable Codex CLI').closest('div')!
+      const toggle = row.querySelector('button')!
+      fireEvent.click(toggle)
+
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      expect(api.patch).toHaveBeenCalledWith('/api/settings', {
+        codingCli: { enabledProviders: ['custom-cli'] },
+      })
+    })
+
     it('debounces codex model saves and sends only the latest value', async () => {
       const store = createSettingsViewStore()
       renderSettingsView(store)

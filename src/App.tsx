@@ -271,30 +271,19 @@ export default function App() {
 
   // Sidebar width from settings (or local state during drag)
   const sidebarWidth = settings.sidebar?.width ?? 288
-  const sidebarCollapsed = settings.sidebar?.collapsed ?? false
+  const persistedSidebarCollapsed = settings.sidebar?.collapsed ?? false
 
-  // Auto-collapse sidebar on mobile
   useEffect(() => {
     if (!isMobile) {
       userOpenedSidebarOnMobileRef.current = false
-      return
     }
-    if (!sidebarCollapsed && !userOpenedSidebarOnMobileRef.current) {
-      dispatch({
-        ...updateSettingsLocal({ sidebar: { collapsed: true } }),
-        meta: { skipPersist: true, source: 'responsive-auto-collapse' },
-      })
-    }
-  }, [isMobile, sidebarCollapsed, dispatch])
+  }, [isMobile])
 
-  useEffect(() => {
-    if (isLandscapeTerminalView && !sidebarCollapsed) {
-      dispatch({
-        ...updateSettingsLocal({ sidebar: { collapsed: true } }),
-        meta: { skipPersist: true, source: 'responsive-auto-collapse' },
-      })
-    }
-  }, [dispatch, isLandscapeTerminalView, sidebarCollapsed])
+  const responsiveSidebarCollapsed = (
+    isLandscapeTerminalView
+    || (isMobile && !persistedSidebarCollapsed && !userOpenedSidebarOnMobileRef.current)
+  )
+  const sidebarCollapsed = persistedSidebarCollapsed || responsiveSidebarCollapsed
 
   useEffect(() => {
     if (view !== 'terminal' && isFullscreen) {

@@ -254,14 +254,6 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   )
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const cliProviderConfigs = useMemo(() => getCliProviderConfigs(extensionEntries), [extensionEntries])
-  const liveCliProviderNames = useMemo(
-    () => new Set(cliProviderConfigs.map((config) => config.name)),
-    [cliProviderConfigs],
-  )
-  const knownCliProviderNames = useMemo(
-    () => new Set(settings.codingCli?.knownProviders ?? []),
-    [settings.codingCli?.knownProviders],
-  )
   const tabRegistryState = useAppSelector((s) => (s as any).tabRegistry)
   const tabRegistry = tabRegistryState ?? {
     deviceId: 'local-device',
@@ -734,14 +726,11 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
   }, [applyServerSetting])
 
   const setProviderEnabled = useCallback((provider: CodingCliProviderName, enabled: boolean) => {
-    const sanitizedEnabledProviders = enabledProviders.filter((candidate) => (
-      liveCliProviderNames.has(candidate) || knownCliProviderNames.has(candidate)
-    ))
     const next = enabled
-      ? Array.from(new Set([...sanitizedEnabledProviders, provider]))
-      : sanitizedEnabledProviders.filter((candidate) => candidate !== provider)
+      ? Array.from(new Set([...enabledProviders, provider]))
+      : enabledProviders.filter((candidate) => candidate !== provider)
     applyServerSetting({ codingCli: { enabledProviders: next } })
-  }, [applyServerSetting, enabledProviders, knownCliProviderNames, liveCliProviderNames])
+  }, [applyServerSetting, enabledProviders])
 
   const knownDevices = useMemo(() => {
     return buildKnownDevices({

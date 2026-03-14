@@ -221,7 +221,9 @@ describe('crossTabSync', () => {
     }
   })
 
-  it('preserves transient skipPersist local settings while hydrating remote browser preferences', () => {
+  it('preserves authoritative remote sidebar collapse through a later unrelated local write', () => {
+    vi.useFakeTimers()
+
     const store = configureStore({
       reducer: { settings: settingsReducer, tabRegistry: tabRegistryReducer },
       middleware: (getDefault) => getDefault().concat(browserPreferencesPersistenceMiddleware),
@@ -229,26 +231,37 @@ describe('crossTabSync', () => {
 
     cleanups.push(installCrossTabSync(store as any))
 
-    store.dispatch({
-      ...updateSettingsLocal({
+    const remoteRaw = JSON.stringify({
+      settings: {
         sidebar: {
           collapsed: true,
         },
-      }),
-      meta: { skipPersist: true, source: 'responsive-auto-collapse' },
+      },
     })
+
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, remoteRaw)
 
     window.dispatchEvent(new StorageEvent('storage', {
       key: BROWSER_PREFERENCES_STORAGE_KEY,
-      newValue: JSON.stringify({
-        settings: {
-          theme: 'dark',
-        },
-      }),
+      newValue: remoteRaw,
     }))
 
-    expect(store.getState().settings.settings.theme).toBe('dark')
     expect(store.getState().settings.settings.sidebar.collapsed).toBe(true)
+
+    store.dispatch(updateSettingsLocal({
+      theme: 'dark',
+    }))
+
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+    expect(JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')).toEqual({
+      settings: {
+        theme: 'dark',
+        sidebar: {
+          collapsed: true,
+        },
+      },
+    })
   })
 
   it('ignores toolStrip-only browser-preference writes for Redux local settings and search range', () => {
