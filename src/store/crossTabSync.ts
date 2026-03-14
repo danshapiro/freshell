@@ -135,14 +135,18 @@ function dispatchHydrateBrowserPreferencesFromPersisted(store: StoreLike, raw: s
     ? pendingWriteState.searchRangeDays
     : (parsed.tabs?.searchRangeDays ?? DEFAULT_SEARCH_RANGE_DAYS)
 
-  store.dispatch({
-    ...setLocalSettings(nextSettings),
-    meta: { skipPersist: true, source: 'cross-tab' },
-  })
-  store.dispatch({
-    ...setTabRegistrySearchRangeDays(nextSearchRangeDays),
-    meta: { skipPersist: true, source: 'cross-tab' },
-  })
+  if (parsed.settings || pendingWriteState.settingsPatch || pendingWriteState.transientSettingsPatch) {
+    store.dispatch({
+      ...setLocalSettings(nextSettings),
+      meta: { skipPersist: true, source: 'cross-tab' },
+    })
+  }
+  if (parsed.tabs?.searchRangeDays !== undefined || pendingWriteState.hasPendingSearchRangeDays) {
+    store.dispatch({
+      ...setTabRegistrySearchRangeDays(nextSearchRangeDays),
+      meta: { skipPersist: true, source: 'cross-tab' },
+    })
+  }
 }
 
 function handleIncomingRaw(store: StoreLike, key: string, raw: string) {

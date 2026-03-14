@@ -132,6 +132,18 @@ describe('shared settings contract', () => {
     })
   })
 
+  it('translates deprecated ignoreCodexSubagentSessions into ignoreCodexSubagents when extracting a legacy seed', () => {
+    expect(extractLegacyLocalSettingsSeed({
+      sidebar: {
+        ignoreCodexSubagentSessions: true,
+      },
+    } as Record<string, unknown>)).toEqual({
+      sidebar: {
+        ignoreCodexSubagents: true,
+      },
+    })
+  })
+
   it('clamps migrated local numeric values into supported ranges when extracting a legacy seed', () => {
     expect(extractLegacyLocalSettingsSeed({
       uiScale: -5,

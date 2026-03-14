@@ -133,6 +133,54 @@ describe('settingsThunks', () => {
     await second
   })
 
+  it('rolls back failed optimistic previews while preserving later queued saves and logs the failure', async () => {
+    const store = makeStore()
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    let rejectFirst: ((reason?: unknown) => void) | null = null
+    let resolveSecond: ((value: unknown) => void) | null = null
+
+    apiPatch.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      rejectFirst = reject
+    }))
+    apiPatch.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveSecond = resolve
+    }))
+
+    const first = store.dispatch(saveServerSettingsPatch({
+      defaultCwd: '/workspace',
+    }))
+    const second = store.dispatch(saveServerSettingsPatch({
+      terminal: {
+        scrollback: 12000,
+      },
+    }))
+
+    expect(store.getState().settings.settings.defaultCwd).toBe('/workspace')
+    expect(store.getState().settings.settings.terminal.scrollback).toBe(12000)
+
+    await Promise.resolve()
+    expect(apiPatch).toHaveBeenCalledTimes(1)
+
+    rejectFirst?.(new Error('save failed'))
+    const firstResult = await first
+    await Promise.resolve()
+
+    expect(firstResult.type).toBe('settings/saveServerSettingsPatch/rejected')
+    expect(apiPatch).toHaveBeenCalledTimes(2)
+    expect(store.getState().settings.settings.defaultCwd).toBeUndefined()
+    expect(store.getState().settings.settings.terminal.scrollback).toBe(12000)
+    expect(warnSpy).toHaveBeenCalledWith('[settingsThunks]', 'Failed to save server settings patch', expect.any(Error))
+
+    resolveSecond?.(store.getState().settings.serverSettings)
+    const secondResult = await second
+
+    expect(secondResult.type).toBe('settings/saveServerSettingsPatch/fulfilled')
+    expect(store.getState().settings.settings.defaultCwd).toBeUndefined()
+    expect(store.getState().settings.settings.terminal.scrollback).toBe(12000)
+
+    warnSpy.mockRestore()
+  })
+
   it('preserves nested coding CLI clears by converting them into API clear sentinels', async () => {
     const store = makeStore()
     const initialServerSettings = store.getState().settings.serverSettings

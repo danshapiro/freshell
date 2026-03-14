@@ -986,7 +986,14 @@ export function extractLegacyLocalSettingsSeed(
     maybeAssignNested(patch, 'panes', pickKeys(raw.panes, PANES_LOCAL_KEYS))
   }
   if (isRecord(raw.sidebar)) {
-    maybeAssignNested(patch, 'sidebar', pickKeys(raw.sidebar, SIDEBAR_LOCAL_KEYS))
+    const sidebarPatch = pickKeys(raw.sidebar, SIDEBAR_LOCAL_KEYS)
+    if (
+      !Object.prototype.hasOwnProperty.call(sidebarPatch, 'ignoreCodexSubagents')
+      && typeof raw.sidebar.ignoreCodexSubagentSessions === 'boolean'
+    ) {
+      sidebarPatch.ignoreCodexSubagents = raw.sidebar.ignoreCodexSubagentSessions
+    }
+    maybeAssignNested(patch, 'sidebar', sidebarPatch)
   }
   if (isRecord(raw.notifications)) {
     maybeAssignNested(patch, 'notifications', pickKeys(raw.notifications, ['soundEnabled']))

@@ -4,7 +4,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer, { hydrateTabs } from '../../../../src/store/tabsSlice'
 import panesReducer, { hydratePanes } from '../../../../src/store/panesSlice'
 import settingsReducer, { setLocalSettings, updateSettingsLocal } from '../../../../src/store/settingsSlice'
-import tabRegistryReducer from '../../../../src/store/tabRegistrySlice'
+import tabRegistryReducer, { setTabRegistrySearchRangeDays } from '../../../../src/store/tabRegistrySlice'
 import { installCrossTabSync } from '../../../../src/store/crossTabSync'
 import {
   BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS,
@@ -249,6 +249,31 @@ describe('crossTabSync', () => {
 
     expect(store.getState().settings.settings.theme).toBe('dark')
     expect(store.getState().settings.settings.sidebar.collapsed).toBe(true)
+  })
+
+  it('ignores toolStrip-only browser-preference writes for Redux local settings and search range', () => {
+    const store = configureStore({
+      reducer: { settings: settingsReducer, tabRegistry: tabRegistryReducer },
+    })
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    store.dispatch(updateSettingsLocal({
+      theme: 'dark',
+    }))
+    store.dispatch(setTabRegistrySearchRangeDays(365))
+
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: BROWSER_PREFERENCES_STORAGE_KEY,
+      newValue: JSON.stringify({
+        toolStrip: {
+          expanded: true,
+        },
+      }),
+    }))
+
+    expect(store.getState().settings.settings.theme).toBe('dark')
+    expect(store.getState().tabRegistry.searchRangeDays).toBe(365)
   })
 
   it('merges remote browser-preference writes without clobbering dirty local settings', () => {
