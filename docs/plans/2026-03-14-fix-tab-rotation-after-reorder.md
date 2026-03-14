@@ -20,6 +20,7 @@
 - Reuse the existing non-terminal shortcut regression instead of cloning it. `test/e2e/agent-chat-tab-shortcut-focus.test.tsx` already proves the FreshClaude composer path, so the new work should keep that file in the focused verification set rather than adding a second composer-specific test.
 - Reordered tabs are the user-visible proof, so add a real browser regression that drags tabs into a new order and then presses the shortcut from the focused terminal.
 - Add one fast unit regression for the routing contract so the bug stays easy to diagnose locally without paying the Playwright startup cost every time.
+- Do **not** add a reducer-level reordered-traversal test for `tabsSlice`. `reorderTabs`, `switchToNextTab`, and `switchToPrevTab` already operate on the same `state.tabs.tabs` array, so another reducer test would only restate behavior that is not broken. Keep the new fast test focused on event ownership, and let the browser regression prove reordered visible order end-to-end.
 - No `docs/index.html` update is needed. This is a bug fix to existing shortcut behavior, not a new user-facing workflow.
 
 ## Acceptance Mapping
@@ -77,6 +78,7 @@ In `test/e2e-browser/specs/tab-management.spec.ts`, add:
     const expectedNextId = orderedIds[(startingIndex + 1) % orderedIds.length]
 
     await terminal.getTerminalContainer().click()
+    await expect(terminal.getTerminalInput()).toBeFocused()
     await page.keyboard.press('Control+Shift+[')
     await expect.poll(() => harness.getActiveTabId()).toBe(expectedPrevId)
 
@@ -99,7 +101,7 @@ In `test/e2e-browser/specs/tab-management.spec.ts`, add:
 Run:
 
 ```bash
-npm run test:e2e:chromium -- test/e2e-browser/specs/tab-management.spec.ts
+npm run test:e2e:chromium -- test/e2e-browser/specs/tab-management.spec.ts --grep "Ctrl+Shift+brackets follow reordered tab order from a focused terminal"
 ```
 
 Expected:
@@ -177,6 +179,7 @@ In the window `onKeyDown` handler, add the consumed-event guard before shortcut 
 
 Important detail:
 - Keep the text-input guard after the tab-switch branch so non-terminal inputs such as the FreshClaude composer still inherit the global shortcut behavior.
+- Do **not** change `src/store/tabsSlice.ts` in this green step. The reducer already rotates through reordered `state.tabs.tabs`; the fix here is only to stop the second handler from firing.
 
 **Step 4: Re-run the focused App unit test**
 
@@ -194,7 +197,7 @@ Expected:
 Run:
 
 ```bash
-npm run test:e2e:chromium -- test/e2e-browser/specs/tab-management.spec.ts
+npm run test:e2e:chromium -- test/e2e-browser/specs/tab-management.spec.ts --grep "Ctrl+Shift+brackets follow reordered tab order from a focused terminal"
 ```
 
 Expected:
@@ -373,7 +376,7 @@ Expected:
 Run:
 
 ```bash
-npm run test:e2e:chromium -- test/e2e-browser/specs/tab-management.spec.ts
+npm run test:e2e:chromium -- test/e2e-browser/specs/tab-management.spec.ts --grep "Ctrl+Shift+brackets follow reordered tab order from a focused terminal"
 ```
 
 Expected:
