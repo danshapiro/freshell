@@ -306,7 +306,7 @@ function ProjectCard({
           <div className="divide-y divide-border/30">
             {project.sessions
               .slice()
-              .sort((a, b) => b.updatedAt - a.updatedAt)
+              .sort((a, b) => b.lastActivityAt - a.lastActivityAt)
               .map((session) => (
                 <SessionRow
                   key={session.sessionId}
@@ -413,7 +413,7 @@ function SessionRow({
               {getProviderLabel(session.provider)}
             </span>
             <span className="text-2xs text-muted-foreground">
-              {formatTime(session.updatedAt)}
+              {formatTime(session.lastActivityAt)}
             </span>
           </div>
           {session.summary && (
@@ -508,7 +508,7 @@ function MobileSessionDetailsSheet({
         </div>
         <div className="space-y-2 text-xs text-muted-foreground">
           <div>{getProviderLabel(session.provider)}</div>
-          <div>{formatTime(session.updatedAt)}</div>
+          <div>{formatTime(session.lastActivityAt)}</div>
           {session.cwd && <div className="truncate">{session.cwd}</div>}
         </div>
         <div className="mt-3 space-y-2">

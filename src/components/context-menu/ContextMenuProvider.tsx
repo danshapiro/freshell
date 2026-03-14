@@ -389,7 +389,7 @@ export function ContextMenuProvider({
     if (!info) return
     const messageCount = info.session.messageCount
     const createdAt = info.session.createdAt
-    const updatedAt = info.session.updatedAt
+    const lastActivityAt = info.session.lastActivityAt
     const summary = info.session.summary
 
     const formatDate = (value?: number) => {
@@ -405,7 +405,7 @@ export function ContextMenuProvider({
           {summary ? <div className="text-xs">{summary}</div> : null}
           <div className="text-xs">Messages: {messageCount ?? 'unknown'}</div>
           <div className="text-xs">Created: {formatDate(createdAt)}</div>
-          <div className="text-xs">Last used: {formatDate(updatedAt)}</div>
+          <div className="text-xs">Last used: {formatDate(lastActivityAt)}</div>
         </div>
       ),
       onConfirm: async () => {
@@ -466,8 +466,8 @@ export function ContextMenuProvider({
       cwd: session.cwd,
       createdAt: session.createdAt,
       startDate: session.createdAt ? new Date(session.createdAt).toISOString() : null,
-      updatedAt: session.updatedAt,
-      endDate: session.updatedAt ? new Date(session.updatedAt).toISOString() : null,
+      lastActivityAt: session.lastActivityAt,
+      endDate: session.lastActivityAt ? new Date(session.lastActivityAt).toISOString() : null,
       messageCount: session.messageCount,
       summary: session.summary,
       archived: session.archived,

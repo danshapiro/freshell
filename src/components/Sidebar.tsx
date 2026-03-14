@@ -20,7 +20,7 @@ import { fetchSessionWindow } from '@/store/sessionsThunks'
 const EMPTY_TERMINALS: BackgroundTerminal[] = []
 
 /** Compare two BackgroundTerminal arrays by sidebar-relevant fields only.
- *  Ignores lastActivityAt since it changes frequently but doesn't affect rendering. */
+ *  Ignores terminal `lastActivityAt` since it changes frequently but doesn't affect rendering. */
 export function areTerminalsEqual(a: BackgroundTerminal[], b: BackgroundTerminal[]): boolean {
   if (a.length !== b.length) return false
   for (let i = 0; i < a.length; i++) {
@@ -292,7 +292,7 @@ export default function Sidebar({
 
   // Stabilize the array reference so react-window doesn't rebuild all row
   // elements when the selector produces new objects with identical field
-  // values (e.g. an active session's updatedAt changed but no visible fields
+  // values (e.g. an active session's lastActivityAt changed but no visible fields
   // differ). Individual SidebarItem updates still go through when a field
   // value actually changes — the custom memo comparator on SidebarItem
   // handles that independently.

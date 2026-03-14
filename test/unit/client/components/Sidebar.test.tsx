@@ -327,7 +327,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-1'),
               projectPath: '/home/user/project-a',
-              updatedAt: Date.now() - 1000,
+              lastActivityAt: Date.now() - 1000,
               title: 'Fix authentication bug',
               cwd: '/home/user/project-a',
             },
@@ -380,7 +380,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-abc'),
               projectPath: '/home/user/project',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Implement user authentication',
               cwd: '/home/user/project',
             },
@@ -419,7 +419,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: 'session-abc',
               projectPath: '/home/user/project',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Implement user authentication',
               cwd: '/home/user/project',
             },
@@ -453,7 +453,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: 'session-fc',
               projectPath: '/home/user/project',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Freshclaude session',
               cwd: '/home/user/project',
               sessionType: 'freshclaude',
@@ -495,7 +495,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-running'),
               projectPath: '/home/user/project',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Active work session',
               cwd: '/home/user/project',
             },
@@ -536,7 +536,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-1'),
               projectPath: '/home/user/project',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Completed session',
               cwd: '/home/user/project',
             },
@@ -576,7 +576,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-1'),
               projectPath: '/home/user/project',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Session with shell terminal',
               cwd: '/home/user/project',
             },
@@ -618,7 +618,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: session,
               projectPath: '/home/user/project',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Pane-owned session',
               cwd: '/home/user/project',
             },
@@ -675,7 +675,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: invalid,
               projectPath: '/home/user/project',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Invalid session id',
               cwd: '/home/user/project',
             },
@@ -733,14 +733,14 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-no-tab'),
               projectPath: '/home/user/project',
-              updatedAt: now,
+              lastActivityAt: now,
               title: 'Session without tab',
               cwd: '/home/user/project',
             },
             {
               sessionId: sessionId('session-with-tab'),
               projectPath: '/home/user/project',
-              updatedAt: now - 10000,
+              lastActivityAt: now - 10000,
               title: 'Session with tab',
               cwd: '/home/user/project',
             },
@@ -781,14 +781,14 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-old-input'),
               projectPath: '/home/user/project',
-              updatedAt: now,
+              lastActivityAt: now,
               title: 'Old input session',
               cwd: '/home/user/project',
             },
             {
               sessionId: sessionId('session-recent-input'),
               projectPath: '/home/user/project',
-              updatedAt: now - 10000,
+              lastActivityAt: now - 10000,
               title: 'Recent input session',
               cwd: '/home/user/project',
             },
@@ -838,14 +838,14 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-with-input'),
               projectPath: '/home/user/project',
-              updatedAt: now - 60000,
+              lastActivityAt: now - 60000,
               title: 'Has input timestamp',
               cwd: '/home/user/project',
             },
             {
               sessionId: sessionId('session-no-input'),
               projectPath: '/home/user/project',
-              updatedAt: now,
+              lastActivityAt: now,
               title: 'No input timestamp',
               cwd: '/home/user/project',
             },
@@ -890,14 +890,14 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-was-active'),
               projectPath: '/home/user/project',
-              updatedAt: now - 60000,
+              lastActivityAt: now - 60000,
               title: 'Was active session',
               cwd: '/home/user/project',
             },
             {
               sessionId: sessionId('session-never-active'),
               projectPath: '/home/user/project',
-              updatedAt: now,
+              lastActivityAt: now,
               title: 'Never active session',
               cwd: '/home/user/project',
             },
@@ -938,14 +938,14 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-with-tab'),
               projectPath: '/home/user/project',
-              updatedAt: now,
+              lastActivityAt: now,
               title: 'Tabbed session',
               cwd: '/home/user/project',
             },
             {
               sessionId: sessionId('session-no-tab'),
               projectPath: '/home/user/project',
-              updatedAt: now,
+              lastActivityAt: now,
               title: 'No tab session',
               cwd: '/home/user/project',
             },
@@ -989,7 +989,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: busySessionId,
               projectPath: '/home/user/project',
-              updatedAt: now,
+              lastActivityAt: now,
               title: 'Busy codex session',
               cwd: '/home/user/project',
               provider: 'codex',
@@ -997,7 +997,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: idleSessionId,
               projectPath: '/home/user/project',
-              updatedAt: now,
+              lastActivityAt: now,
               title: 'Idle session',
               cwd: '/home/user/project',
             },
@@ -1042,7 +1042,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
               terminalId,
               sessionId: 'session-codex',
               phase: 'busy',
-              updatedAt: 10,
+              lastActivityAt: 10,
             },
           },
         },
@@ -1076,7 +1076,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sid,
               projectPath: '/home/user/project',
-              updatedAt: now,
+              lastActivityAt: now,
               title: 'Multi terminal',
               cwd: '/home/user/project',
               provider: 'codex',
@@ -1122,7 +1122,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
               terminalId: newTerminalId,
               sessionId: 'sess',
               phase: 'busy',
-              updatedAt: 10,
+              lastActivityAt: 10,
             },
           },
         },
@@ -1148,14 +1148,14 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-1'),
               projectPath: '/home/user/project',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Fix authentication bug',
               cwd: '/home/user/project',
             },
             {
               sessionId: sessionId('session-2'),
               projectPath: '/home/user/project',
-              updatedAt: Date.now() - 1000,
+              lastActivityAt: Date.now() - 1000,
               title: 'Add user profile page',
               cwd: '/home/user/project',
             },
@@ -1189,7 +1189,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-1'),
               projectPath: '/home/user/project-alpha',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Alpha work',
               cwd: '/home/user/project-alpha',
             },
@@ -1201,7 +1201,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-2'),
               projectPath: '/home/user/project-beta',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Beta work',
               cwd: '/home/user/project-beta',
             },
@@ -1231,7 +1231,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-to-resume'),
               projectPath: '/home/user/project',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Session to resume',
               cwd: '/home/user/project',
             },
@@ -1265,7 +1265,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-already-open'),
               projectPath: '/home/user/project',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Already open session',
               cwd: '/home/user/project',
             },
@@ -1335,7 +1335,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-running'),
               projectPath: '/home/user/project',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Running session',
               cwd: '/home/user/project',
             },
@@ -1398,7 +1398,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-running-no-tab'),
               projectPath: '/home/user/project',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Running without tab',
               cwd: '/home/user/project',
             },
@@ -1466,7 +1466,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-1'),
               projectPath: '/home/user/my-awesome-project',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Session title',
               cwd: '/home/user/my-awesome-project',
             },
@@ -1490,7 +1490,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-1'),
               projectPath: '/home/user/my-awesome-project',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Session title',
               cwd: '/home/user/my-awesome-project',
             },
@@ -1715,7 +1715,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
           provider: 'codex',
           sessionId: 'recent-session',
           projectPath: '/work/recent',
-          updatedAt: 1_700_000_000_000,
+          lastActivityAt: 1_700_000_000_000,
           title: 'Recent Session',
         }],
       }]
@@ -1754,7 +1754,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
           provider: 'codex',
           sessionId: 'search-session',
           projectPath: '/work/search',
-          updatedAt: 1_700_000_000_000,
+          lastActivityAt: 1_700_000_000_000,
           title: 'Search Result',
         }],
       }]
@@ -1793,7 +1793,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
           provider: 'codex',
           sessionId: 'search-session',
           projectPath: '/work/search',
-          updatedAt: 1_700_000_000_000,
+          lastActivityAt: 1_700_000_000_000,
           title: 'Search Result',
         }],
       }]
@@ -1862,7 +1862,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
           provider: 'codex',
           sessionId: 'recent-session',
           projectPath: '/work/recent',
-          updatedAt: 1_700_000_000_000,
+          lastActivityAt: 1_700_000_000_000,
           title: 'Recent Session',
         }],
       }]
@@ -2041,7 +2041,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
           provider: 'codex',
           sessionId: 'recent-session',
           projectPath: '/work/recent',
-          updatedAt: 1_700_000_000_000,
+          lastActivityAt: 1_700_000_000_000,
           title: 'Recent Session',
         }],
       }]
@@ -2095,7 +2095,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
     it('calls searchSessions API when tier is not title and query exists', async () => {
       vi.mocked(mockSearchSessions).mockResolvedValue({
         results: [
-          { sessionId: 'result-1', provider: 'claude', projectPath: '/proj', matchedIn: 'userMessage', updatedAt: 1000, snippet: 'Found it' },
+          { sessionId: 'result-1', provider: 'claude', projectPath: '/proj', matchedIn: 'userMessage', lastActivityAt: 1000, snippet: 'Found it' },
         ],
         tier: 'userMessages',
         query: 'test',
@@ -2125,7 +2125,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
     it('displays search results from API', async () => {
       vi.mocked(mockSearchSessions).mockResolvedValue({
         results: [
-          { sessionId: 'result-1', provider: 'claude', projectPath: '/proj', matchedIn: 'userMessage', updatedAt: 1000, title: 'Found Session', snippet: 'test found here' },
+          { sessionId: 'result-1', provider: 'claude', projectPath: '/proj', matchedIn: 'userMessage', lastActivityAt: 1000, title: 'Found Session', snippet: 'test found here' },
         ],
         tier: 'userMessages',
         query: 'test',
@@ -2153,7 +2153,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
         projects: [
           {
             projectPath: '/proj',
-            sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/proj', updatedAt: 1000, title: 'Test session', cwd: '/proj' }],
+            sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/proj', lastActivityAt: 1000, title: 'Test session', cwd: '/proj' }],
           },
         ],
       })
@@ -2178,7 +2178,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-to-split'),
               projectPath: '/home/user/project',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Session to split',
               cwd: '/home/user/project',
             },
@@ -2234,7 +2234,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: targetSessionId,
               projectPath: '/home/user/project',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Already in pane',
               cwd: '/home/user/project',
             },
@@ -2308,7 +2308,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
               sessionId: targetSessionId,
               provider: 'codex',
               projectPath: '/home/user/project',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Local codex session',
               cwd: '/home/user/project',
             },
@@ -2383,7 +2383,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
             {
               sessionId: sessionId('session-no-layout'),
               projectPath: '/home/user/project',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'No layout tab',
               cwd: '/home/user/project',
             },

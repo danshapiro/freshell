@@ -219,7 +219,7 @@ describe('App WS bootstrap recovery', () => {
             terminalId: 'term-stale',
             sessionId: 'session-stale',
             phase: 'busy',
-            updatedAt: 10,
+            lastActivityAt: 10,
           },
         },
         lastSnapshotSeq: 3,
@@ -334,7 +334,7 @@ describe('App WS bootstrap recovery', () => {
               provider: 'codex',
               sessionId: 'hidden-session',
               projectPath: '/work/app',
-              updatedAt: 10,
+              lastActivityAt: 10,
               title: 'Hidden Auto Session',
               firstUserMessage: '__AUTO__ reconcile state',
             },
@@ -342,7 +342,7 @@ describe('App WS bootstrap recovery', () => {
               provider: 'codex',
               sessionId: 'visible-session',
               projectPath: '/work/app',
-              updatedAt: 9,
+              lastActivityAt: 9,
               title: 'Manual Session',
               firstUserMessage: 'please fix tests',
             },
@@ -476,7 +476,7 @@ describe('App WS bootstrap recovery', () => {
             terminalId: 'term-stale',
             sessionId: 'session-stale',
             phase: 'busy',
-            updatedAt: 10,
+            lastActivityAt: 10,
           },
         },
         lastSnapshotSeq: 4,
@@ -546,7 +546,7 @@ describe('App WS bootstrap recovery', () => {
           terminalId: 'term-live',
           sessionId: 'session-live',
           phase: 'busy',
-          updatedAt: 20,
+          lastActivityAt: 20,
         }],
         remove: [],
       })
@@ -716,7 +716,7 @@ describe('App WS bootstrap recovery', () => {
           provider: 'codex',
           sessionId: 'older-open',
           projectPath: '/older',
-          updatedAt: 1,
+          lastActivityAt: 1,
           title: 'Older Open Session',
         }],
       }],
@@ -756,7 +756,7 @@ describe('App WS bootstrap recovery', () => {
     const baselineProjects = [
       {
         projectPath: '/p1',
-        sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', updatedAt: 1 }],
+        sessions: [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', lastActivityAt: 1 }],
       },
     ]
     const store = createStore({
@@ -796,7 +796,7 @@ describe('App WS bootstrap recovery', () => {
     act(() => {
       messageHandler?.({
         type: 'sessions.patch',
-        upsertProjects: [{ projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', updatedAt: 2 }] }],
+        upsertProjects: [{ projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', lastActivityAt: 2 }] }],
         removeProjectPaths: [],
       })
     })
@@ -841,7 +841,7 @@ describe('App WS bootstrap recovery', () => {
           provider: 'codex',
           sessionId: olderOpenSessionId,
           projectPath: '/older',
-          updatedAt: 1,
+          lastActivityAt: 1,
           title: 'Older Open Session',
         }],
       }],
@@ -921,7 +921,7 @@ describe('App WS bootstrap recovery', () => {
             terminalId: 'term-1',
             sessionId: 'session-1',
             phase: 'idle',
-            updatedAt: 200,
+            lastActivityAt: 200,
           },
         ],
       })
@@ -933,7 +933,7 @@ describe('App WS bootstrap recovery', () => {
             terminalId: 'term-1',
             sessionId: 'session-1',
             phase: 'busy',
-            updatedAt: 100,
+            lastActivityAt: 100,
           },
         ],
       })

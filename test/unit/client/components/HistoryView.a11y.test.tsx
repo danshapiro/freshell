@@ -52,7 +52,7 @@ describe('HistoryView a11y', () => {
                   provider: 'claude',
                   sessionId: 'session-123',
                   projectPath,
-                  updatedAt: Date.now(),
+                  lastActivityAt: Date.now(),
                   title: 'Test Session',
                 },
               ],

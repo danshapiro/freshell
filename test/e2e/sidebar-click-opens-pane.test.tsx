@@ -209,7 +209,7 @@ describe('sidebar click opens pane (e2e)', () => {
           {
             sessionId: sessionId('hidden-session'),
             projectPath: '/home/user/project',
-            updatedAt: Date.now(),
+            lastActivityAt: Date.now(),
             title: 'Hidden canary session',
             firstUserMessage: '__AUTO__ run helper flow',
             cwd: '/home/user/project',
@@ -217,7 +217,7 @@ describe('sidebar click opens pane (e2e)', () => {
           {
             sessionId: sessionId('visible-session'),
             projectPath: '/home/user/project',
-            updatedAt: Date.now() - 1000,
+            lastActivityAt: Date.now() - 1000,
             title: 'Visible manual session',
             firstUserMessage: 'please fix tests',
             cwd: '/home/user/project',
@@ -252,7 +252,7 @@ describe('sidebar click opens pane (e2e)', () => {
             provider: 'codex',
             sessionId: sessionId('codex-subagent'),
             projectPath: '/home/user/project',
-            updatedAt: Date.now(),
+            lastActivityAt: Date.now(),
             title: 'Codex subagent session',
             isSubagent: true,
             cwd: '/home/user/project',
@@ -261,7 +261,7 @@ describe('sidebar click opens pane (e2e)', () => {
             provider: 'claude',
             sessionId: sessionId('claude-subagent'),
             projectPath: '/home/user/project',
-            updatedAt: Date.now() - 1000,
+            lastActivityAt: Date.now() - 1000,
             title: 'Claude subagent session',
             isSubagent: true,
             cwd: '/home/user/project',
@@ -296,7 +296,7 @@ describe('sidebar click opens pane (e2e)', () => {
           {
             sessionId: sessionId('new-session'),
             projectPath: '/home/user/project',
-            updatedAt: Date.now(),
+            lastActivityAt: Date.now(),
             title: 'New session to open',
             cwd: '/home/user/project',
           },
@@ -354,7 +354,7 @@ describe('sidebar click opens pane (e2e)', () => {
           {
             sessionId: targetId,
             projectPath: '/home/user/project',
-            updatedAt: Date.now(),
+            lastActivityAt: Date.now(),
             title: 'Already open session',
             cwd: '/home/user/project',
           },
@@ -432,7 +432,7 @@ describe('sidebar click opens pane (e2e)', () => {
           {
             sessionId: targetId,
             projectPath: '/home/user/project',
-            updatedAt: Date.now(),
+            lastActivityAt: Date.now(),
             title: 'Freshclaude session',
             cwd: '/home/user/project',
           },
@@ -507,7 +507,7 @@ describe('sidebar click opens pane (e2e)', () => {
           {
             sessionId: sessionId('freshclaude-visible'),
             projectPath: '/home/user/project',
-            updatedAt: Date.now(),
+            lastActivityAt: Date.now(),
             title: 'Freshclaude visible',
             cwd: '/home/user/project',
             isNonInteractive: true,
@@ -516,7 +516,7 @@ describe('sidebar click opens pane (e2e)', () => {
           {
             sessionId: sessionId('exec-hidden'),
             projectPath: '/home/user/project',
-            updatedAt: Date.now() - 1000,
+            lastActivityAt: Date.now() - 1000,
             title: 'Exec hidden',
             cwd: '/home/user/project',
             isNonInteractive: true,
@@ -548,7 +548,7 @@ describe('sidebar click opens pane (e2e)', () => {
           {
             sessionId: sessionId('orphan-session'),
             projectPath: '/home/user/project',
-            updatedAt: Date.now(),
+            lastActivityAt: Date.now(),
             title: 'Orphan session',
             cwd: '/home/user/project',
           },

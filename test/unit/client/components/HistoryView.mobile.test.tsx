@@ -39,7 +39,7 @@ function renderHistoryView(onOpenSession = vi.fn()) {
                 provider: 'claude',
                 sessionId: 'session-123',
                 projectPath,
-                updatedAt: Date.now(),
+                lastActivityAt: Date.now(),
                 title: 'Test Session',
                 summary: 'summary',
               },

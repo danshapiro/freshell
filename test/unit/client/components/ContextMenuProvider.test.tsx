@@ -199,7 +199,7 @@ function createStoreWithSession() {
                 title: 'Test Session',
                 cwd: '/test/project',
                 createdAt: 1000,
-                updatedAt: 2000,
+                lastActivityAt: 2000,
                 messageCount: 5,
               },
             ],

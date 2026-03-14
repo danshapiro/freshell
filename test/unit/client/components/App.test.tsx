@@ -867,16 +867,16 @@ describe('App WS message handling', () => {
     act(() => {
       handler!({
         type: 'sessions.updated',
-        projects: [{ projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', updatedAt: 1 }] }],
+        projects: [{ projectPath: '/p1', sessions: [{ provider: 'claude', sessionId: 's1', lastActivityAt: 1 }] }],
       })
       handler!({
         type: 'sessions.patch',
-        upsertProjects: [{ projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', updatedAt: 2 }] }],
+        upsertProjects: [{ projectPath: '/p2', sessions: [{ provider: 'claude', sessionId: 's2', lastActivityAt: 2 }] }],
         removeProjectPaths: [],
       })
       handler!({
         type: 'sessions.page',
-        projects: [{ projectPath: '/p3', sessions: [{ provider: 'claude', sessionId: 's3', updatedAt: 3 }] }],
+        projects: [{ projectPath: '/p3', sessions: [{ provider: 'claude', sessionId: 's3', lastActivityAt: 3 }] }],
         totalSessions: 1,
         oldestIncludedTimestamp: 3,
         oldestIncludedSessionId: 'claude:s3',
