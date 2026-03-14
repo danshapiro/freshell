@@ -36,14 +36,15 @@ import connectionReducer, {
   ConnectionStatus,
 } from '@/store/connectionSlice'
 import settingsReducer, {
-  setSettings,
+  setServerSettings,
+  previewServerSettingsPatch,
   updateSettingsLocal,
   markSaved,
   defaultSettings,
   mergeSettings,
   SettingsState,
 } from '@/store/settingsSlice'
-import type { Tab, ProjectGroup, AppSettings } from '@/store/types'
+import type { Tab, ProjectGroup, AppSettings, ServerSettings } from '@/store/types'
 
 // Enable Immer's MapSet plugin for Set/Map support in Redux state
 enableMapSet()
@@ -753,13 +754,11 @@ describe('State Edge Cases', () => {
         store.dispatch(
           updateSettingsLocal({
             theme: 'dark',
-            defaultCwd: undefined,
           })
         )
 
         const settings = store.getState().settings.settings
         expect(settings.theme).toBe('dark')
-        // undefined should not overwrite existing value due to spread
         expect(settings.defaultCwd).toBeUndefined()
       })
 
@@ -793,42 +792,23 @@ describe('State Edge Cases', () => {
       it('handles setSettings with completely different structure', () => {
         const store = createTestStore()
 
-        const customSettings: AppSettings = {
-          theme: 'light',
-          uiScale: 2.0,
+        const customSettings: ServerSettings = {
+          defaultCwd: '/custom/path',
           logging: {
             debug: false,
           },
           terminal: {
-            fontSize: 24,
-            fontFamily: 'Fira Code',
-            lineHeight: 1.8,
-            cursorBlink: false,
             scrollback: 100000,
-            theme: 'one-light',
-            warnExternalLinks: true,
           },
-          defaultCwd: '/custom/path',
           safety: {
             autoKillIdleMinutes: 10,
           },
           sidebar: {
-            sortMode: 'activity',
-            showProjectBadges: false,
-            showSubagents: false,
-            showNoninteractiveSessions: false,
-            width: 400,
-            collapsed: true,
-          },
-          notifications: {
-            soundEnabled: false,
+            excludeFirstChatSubstrings: [],
+            excludeFirstChatMustStart: false,
           },
           panes: {
             defaultNewPane: 'shell',
-            snapThreshold: 3,
-            iconsOnTabs: true,
-            tabAttentionStyle: 'highlight' as const,
-            attentionDismiss: 'click' as const,
           },
           codingCli: {
             enabledProviders: ['claude', 'codex'],
@@ -837,31 +817,81 @@ describe('State Edge Cases', () => {
               codex: { model: 'gpt-5-codex' },
             },
           },
+          editor: {
+            externalEditor: 'auto',
+          },
+          agentChat: {
+            defaultPlugins: ['fs'],
+            providers: {},
+          },
           network: {
             host: '127.0.0.1',
             configured: false,
           },
         }
 
-        store.dispatch(setSettings(customSettings))
+        store.dispatch(setServerSettings(customSettings))
 
-        expect(store.getState().settings.settings).toEqual(mergeSettings(defaultSettings, customSettings))
+        expect(store.getState().settings.settings).toEqual({
+          ...defaultSettings,
+          ...customSettings,
+          terminal: {
+            ...defaultSettings.terminal,
+            scrollback: 100000,
+          },
+          safety: {
+            ...defaultSettings.safety,
+            autoKillIdleMinutes: 10,
+          },
+          sidebar: {
+            ...defaultSettings.sidebar,
+            excludeFirstChatSubstrings: [],
+            excludeFirstChatMustStart: false,
+          },
+          panes: {
+            ...defaultSettings.panes,
+            defaultNewPane: 'shell',
+          },
+          codingCli: {
+            ...defaultSettings.codingCli,
+            enabledProviders: ['claude', 'codex'],
+            providers: {
+              ...defaultSettings.codingCli.providers,
+              claude: { permissionMode: 'default' },
+              codex: { model: 'gpt-5-codex' },
+            },
+          },
+          editor: {
+            ...defaultSettings.editor,
+            externalEditor: 'auto',
+          },
+          agentChat: {
+            ...defaultSettings.agentChat,
+            defaultPlugins: ['fs'],
+            providers: {},
+          },
+          network: {
+            ...defaultSettings.network,
+            host: '127.0.0.1',
+            configured: false,
+          },
+        })
         expect(store.getState().settings.loaded).toBe(true)
       })
 
-      it('handles multiple setSettings calls overwriting each other', () => {
+      it('handles multiple setServerSettings calls overwriting each other', () => {
         const store = createTestStore()
 
         for (let i = 0; i < 10; i++) {
-          const settings: AppSettings = {
+          const settings: ServerSettings = {
             ...defaultSettings,
-            uiScale: i * 0.1 + 1,
+            defaultCwd: `/custom/${i}`,
           }
-          store.dispatch(setSettings(settings))
+          store.dispatch(setServerSettings(settings))
         }
 
         // Last one wins
-        expect(store.getState().settings.settings.uiScale).toBeCloseTo(1.9, 5)
+        expect(store.getState().settings.settings.defaultCwd).toBe('/custom/9')
       })
     })
 
@@ -872,8 +902,7 @@ describe('State Edge Cases', () => {
         store.dispatch(
           updateSettingsLocal({
             uiScale: -1,
-            terminal: { fontSize: -10, scrollback: -1000 },
-            safety: { autoKillIdleMinutes: -5 },
+            terminal: { fontSize: -10 },
           })
         )
 
@@ -893,9 +922,9 @@ describe('State Edge Cases', () => {
           })
         )
 
-        // Values are stored as-is (no validation)
-        expect(store.getState().settings.settings.uiScale).toBeNaN()
-        expect(store.getState().settings.settings.terminal.fontSize).toBe(Infinity)
+        // Non-finite values are ignored by the shared local-settings parser.
+        expect(store.getState().settings.settings.uiScale).toBe(defaultSettings.uiScale)
+        expect(store.getState().settings.settings.terminal.fontSize).toBe(defaultSettings.terminal.fontSize)
       })
 
       it('handles extremely large values', () => {
@@ -904,7 +933,7 @@ describe('State Edge Cases', () => {
         store.dispatch(
           updateSettingsLocal({
             uiScale: Number.MAX_SAFE_INTEGER,
-            terminal: { scrollback: Number.MAX_SAFE_INTEGER },
+            terminal: { fontSize: Number.MAX_SAFE_INTEGER },
           })
         )
 
@@ -1092,7 +1121,7 @@ describe('State Edge Cases', () => {
       store.dispatch(
         updateSettingsLocal({
           uiScale: -999,
-          terminal: { fontSize: -1, scrollback: -1 },
+          terminal: { fontSize: -1 },
         })
       )
 

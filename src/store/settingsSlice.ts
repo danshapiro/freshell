@@ -1,154 +1,128 @@
-import { createSlice, PayloadAction } from '@reduxjs/toolkit'
-import type { AppSettings, SidebarSortMode } from './types'
+import { createSlice, type PayloadAction } from '@reduxjs/toolkit'
+
+import {
+  composeResolvedSettings,
+  createDefaultResolvedSettings,
+  createDefaultServerSettings,
+  extractLegacyLocalSettingsSeed,
+  mergeLocalSettings,
+  mergeServerSettings,
+  resolveLocalSettings,
+  stripLocalSettings,
+  type LocalSettings,
+  type LocalSettingsPatch,
+  type ResolvedSettings,
+  type ServerSettings,
+  type ServerSettingsPatch,
+} from '@shared/settings'
+import { loadBrowserPreferencesRecord, resolveBrowserPreferenceSettings } from '@/lib/browser-preferences'
+import type { AppSettings } from './types'
 import type { DeepPartial } from '@/lib/type-utils'
-import { DEFAULT_ENABLED_CLI_PROVIDERS } from '@shared/coding-cli-defaults'
-import { normalizeTrimmedStringList } from '@shared/string-list'
 
 export function resolveDefaultLoggingDebug(isDev: boolean = import.meta.env.DEV): boolean {
   return !!isDev
 }
 
-export const defaultSettings: AppSettings = {
-  theme: 'system',
-  uiScale: 1.0, // 100% = UI text matches terminal font size
-  terminal: {
-    fontSize: 16,
-    fontFamily: 'monospace',
-    lineHeight: 1,
-    cursorBlink: true,
-    scrollback: 5000,
-    theme: 'auto',
-    warnExternalLinks: true,
-    osc52Clipboard: 'ask',
-    renderer: 'auto',
-  },
-  defaultCwd: undefined,
-  logging: {
-    debug: resolveDefaultLoggingDebug(),
-  },
-  safety: {
-    autoKillIdleMinutes: 180,
-  },
-  sidebar: {
-    sortMode: 'recency-pinned',
-    showProjectBadges: true,
-    showSubagents: false,
-    ignoreCodexSubagents: true,
-    showNoninteractiveSessions: false,
-    hideEmptySessions: true,
-    excludeFirstChatSubstrings: [],
-    excludeFirstChatMustStart: false,
-    width: 288,
-    collapsed: false,
-  },
-  notifications: {
-    soundEnabled: true,
-  },
-  panes: {
-    defaultNewPane: 'ask' as const,
-    snapThreshold: 2,
-    iconsOnTabs: true,
-    tabAttentionStyle: 'highlight' as const,
-    attentionDismiss: 'click' as const,
-  },
-  codingCli: {
-    enabledProviders: [...DEFAULT_ENABLED_CLI_PROVIDERS],
-    providers: {
-      claude: {
-        permissionMode: 'default',
-      },
-      codex: {},
-    },
-  },
-  editor: {
-    externalEditor: 'auto' as const,
-  },
-  agentChat: { providers: {} },
-  network: {
-    host: '127.0.0.1' as const,
-    configured: false,
-  },
+const defaultServerSettings = createDefaultServerSettings({
+  loggingDebug: resolveDefaultLoggingDebug(),
+})
+
+export const defaultSettings: AppSettings = createDefaultResolvedSettings({
+  loggingDebug: resolveDefaultLoggingDebug(),
+})
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
 }
 
-export function migrateSortMode(mode: string | undefined): SidebarSortMode {
-  if (mode === 'recency' || mode === 'recency-pinned' || mode === 'activity' || mode === 'project') {
-    return mode
+function normalizeServerPatch(value: unknown): ServerSettingsPatch {
+  if (!isRecord(value)) {
+    return {}
   }
-  // Migrate legacy 'hybrid' mode to 'activity' (similar behavior)
-  if (mode === 'hybrid') {
-    return 'activity'
+  return stripLocalSettings(value) as ServerSettingsPatch
+}
+
+function normalizeLocalPatch(value: unknown): LocalSettingsPatch {
+  if (!isRecord(value)) {
+    return {}
   }
-  return 'recency-pinned'
+  return extractLegacyLocalSettingsSeed(value) ?? {}
+}
+
+function resolveServerSettings(settings: ServerSettings): ServerSettings {
+  return mergeServerSettings(defaultServerSettings, normalizeServerPatch(settings))
+}
+
+function resolveSettings(serverSettings: ServerSettings, localSettings: LocalSettings): ResolvedSettings {
+  return composeResolvedSettings(serverSettings, localSettings)
+}
+
+function toServerSettings(settings: ResolvedSettings): ServerSettings {
+  return mergeServerSettings(
+    createDefaultServerSettings({ loggingDebug: settings.logging.debug }),
+    normalizeServerPatch(settings),
+  )
+}
+
+function toLocalSettingsPatch(settings: ResolvedSettings | LocalSettings): LocalSettingsPatch {
+  return normalizeLocalPatch(settings)
+}
+
+function loadInitialLocalSettings(): LocalSettings {
+  return resolveBrowserPreferenceSettings(loadBrowserPreferencesRecord())
 }
 
 export interface SettingsState {
-  settings: AppSettings
+  serverSettings: ServerSettings
+  localSettings: LocalSettings
+  settings: ResolvedSettings
   loaded: boolean
   lastSavedAt?: number
 }
 
+const initialLocalSettings = loadInitialLocalSettings()
+
 const initialState: SettingsState = {
-  settings: defaultSettings,
+  serverSettings: defaultServerSettings,
+  localSettings: initialLocalSettings,
+  settings: resolveSettings(defaultServerSettings, initialLocalSettings),
   loaded: false,
 }
 
 export function mergeSettings(base: AppSettings, patch: DeepPartial<AppSettings>): AppSettings {
-  const baseLogging = base.logging ?? defaultSettings.logging
-  const baseCodingCli = base.codingCli ?? defaultSettings.codingCli
-  const merged = {
-    ...base,
-    ...patch,
-    terminal: { ...base.terminal, ...(patch.terminal || {}) },
-    logging: { ...baseLogging, ...(patch.logging || {}) },
-    safety: { ...base.safety, ...(patch.safety || {}) },
-    sidebar: { ...base.sidebar, ...(patch.sidebar || {}) },
-    notifications: { ...base.notifications, ...(patch.notifications || {}) },
-    panes: { ...base.panes, ...(patch.panes || {}) },
-    codingCli: {
-      ...baseCodingCli,
-      ...(patch.codingCli || {}),
-      providers: {
-        ...baseCodingCli.providers,
-        ...(patch.codingCli?.providers || {}),
-      },
-    },
-    editor: { ...base.editor, ...(patch.editor || {}) },
-    agentChat: {
-      ...(base.agentChat || defaultSettings.agentChat),
-      ...(patch.agentChat || {}),
-      providers: {
-        ...(base.agentChat || defaultSettings.agentChat)?.providers,
-        ...(patch.agentChat?.providers || {}),
-      },
-    },
-    network: { ...base.network, ...(patch.network || {}) },
-  }
+  const serverSettings = mergeServerSettings(
+    toServerSettings(base),
+    normalizeServerPatch(patch),
+  )
+  const localSettings = resolveLocalSettings(
+    mergeLocalSettings(toLocalSettingsPatch(base), normalizeLocalPatch(patch)),
+  )
 
-  return {
-    ...merged,
-    sidebar: {
-      ...merged.sidebar,
-      sortMode: migrateSortMode(merged.sidebar?.sortMode),
-      excludeFirstChatSubstrings: normalizeTrimmedStringList(merged.sidebar?.excludeFirstChatSubstrings),
-      excludeFirstChatMustStart: !!merged.sidebar?.excludeFirstChatMustStart,
-    },
-    codingCli: {
-      ...merged.codingCli,
-      enabledProviders: merged.codingCli.enabledProviders ?? [],
-    },
-  }
+  return resolveSettings(serverSettings, localSettings)
 }
 
 export const settingsSlice = createSlice({
   name: 'settings',
   initialState,
   reducers: {
-    setSettings: (state, action: PayloadAction<AppSettings>) => {
-      state.settings = mergeSettings(defaultSettings, action.payload)
+    setServerSettings: (state, action: PayloadAction<ServerSettings>) => {
+      state.serverSettings = resolveServerSettings(action.payload)
+      state.settings = resolveSettings(state.serverSettings, state.localSettings)
       state.loaded = true
     },
-    updateSettingsLocal: (state, action: PayloadAction<DeepPartial<AppSettings>>) => {
-      state.settings = mergeSettings(state.settings, action.payload)
+    setLocalSettings: (state, action: PayloadAction<LocalSettings>) => {
+      state.localSettings = resolveLocalSettings(action.payload)
+      state.settings = resolveSettings(state.serverSettings, state.localSettings)
+    },
+    updateSettingsLocal: (state, action: PayloadAction<LocalSettingsPatch>) => {
+      state.localSettings = resolveLocalSettings(
+        mergeLocalSettings(toLocalSettingsPatch(state.localSettings), normalizeLocalPatch(action.payload)),
+      )
+      state.settings = resolveSettings(state.serverSettings, state.localSettings)
+    },
+    previewServerSettingsPatch: (state, action: PayloadAction<ServerSettingsPatch>) => {
+      state.serverSettings = mergeServerSettings(state.serverSettings, normalizeServerPatch(action.payload))
+      state.settings = resolveSettings(state.serverSettings, state.localSettings)
     },
     markSaved: (state) => {
       state.lastSavedAt = Date.now()
@@ -156,5 +130,12 @@ export const settingsSlice = createSlice({
   },
 })
 
-export const { setSettings, updateSettingsLocal, markSaved } = settingsSlice.actions
+export const {
+  setServerSettings,
+  setLocalSettings,
+  updateSettingsLocal,
+  previewServerSettingsPatch,
+  markSaved,
+} = settingsSlice.actions
+
 export default settingsSlice.reducer

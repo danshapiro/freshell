@@ -1,562 +1,169 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import settingsReducer, {
-  setSettings,
-  updateSettingsLocal,
-  markSaved,
-  defaultSettings,
-  mergeSettings,
-  resolveDefaultLoggingDebug,
-  SettingsState,
-} from '../../../../src/store/settingsSlice'
-import type { AppSettings } from '../../../../src/store/types'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { BROWSER_PREFERENCES_STORAGE_KEY } from '@/store/storage-keys'
+
+async function importFreshSettingsSlice() {
+  vi.resetModules()
+  return await import('@/store/settingsSlice')
+}
 
 describe('settingsSlice', () => {
-  describe('initial state', () => {
-    it('has correct default values', () => {
-      const state = settingsReducer(undefined, { type: 'unknown' })
-
-      expect(state.settings).toEqual(defaultSettings)
-      expect(state.loaded).toBe(false)
-      expect(state.lastSavedAt).toBeUndefined()
-    })
-
-    it('has default settings with expected structure', () => {
-      const state = settingsReducer(undefined, { type: 'unknown' })
-
-      expect(state.settings.theme).toBe('system')
-      expect(state.settings.uiScale).toBe(1.0)
-      expect(state.settings.terminal).toEqual({
-        fontSize: 16,
-        fontFamily: 'monospace',
-        lineHeight: 1,
-        cursorBlink: true,
-        scrollback: 5000,
-        theme: 'auto',
-        warnExternalLinks: true,
-        osc52Clipboard: 'ask',
-        renderer: 'auto',
-      })
-      expect(state.settings.defaultCwd).toBeUndefined()
-      expect(state.settings.safety).toEqual({
-        autoKillIdleMinutes: 180,
-      })
-      expect(state.settings.sidebar).toEqual({
-        sortMode: 'recency-pinned',
-        showProjectBadges: true,
-        showSubagents: false,
-        ignoreCodexSubagents: true,
-        showNoninteractiveSessions: false,
-        hideEmptySessions: true,
-        excludeFirstChatSubstrings: [],
-        excludeFirstChatMustStart: false,
-        width: 288,
-        collapsed: false,
-      })
-      expect(state.settings.panes).toEqual({
-        defaultNewPane: 'ask',
-        snapThreshold: 2,
-        iconsOnTabs: true,
-        tabAttentionStyle: 'highlight',
-        attentionDismiss: 'click',
-      })
-      expect(state.settings.notifications).toEqual({
-        soundEnabled: true,
-      })
-      expect(state.settings.codingCli).toEqual({
-        enabledProviders: ['claude', 'codex', 'opencode'],
-        providers: {
-          claude: {
-            permissionMode: 'default',
-          },
-          codex: {},
-        },
-      })
-    })
+  beforeEach(() => {
+    localStorage.clear()
   })
 
-  describe('logging defaults', () => {
-    it('enables debug logging in development', () => {
-      expect(resolveDefaultLoggingDebug(true)).toBe(true)
-    })
-
-    it('disables debug logging in production', () => {
-      expect(resolveDefaultLoggingDebug(false)).toBe(false)
-    })
+  afterEach(() => {
+    localStorage.clear()
   })
 
-  describe('setSettings', () => {
-    it('replaces entire settings', () => {
-      const initialState: SettingsState = {
-        settings: defaultSettings,
-        loaded: false,
-      }
-
-      const newSettings: AppSettings = {
+  it('stores serverSettings, localSettings, and resolved settings in initial state', async () => {
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      settings: {
         theme: 'dark',
-        uiScale: 1.5,
-        logging: {
-          debug: true,
-        },
         terminal: {
-          fontSize: 16,
-          fontFamily: 'monospace',
-          lineHeight: 1.4,
-          cursorBlink: false,
-          scrollback: 10000,
-          theme: 'one-light',
-          warnExternalLinks: true,
-          osc52Clipboard: 'ask',
-          renderer: 'auto',
+          fontSize: 18,
         },
-        defaultCwd: '/home/user',
-        safety: {
-          autoKillIdleMinutes: 60,
-        },
-        sidebar: {
-          sortMode: 'recency',
-          showProjectBadges: false,
-          showSubagents: false,
-          ignoreCodexSubagents: true,
-          showNoninteractiveSessions: false,
-          hideEmptySessions: true,
-          excludeFirstChatSubstrings: [],
-          excludeFirstChatMustStart: false,
-          width: 320,
-          collapsed: false,
-        },
-        notifications: {
-          soundEnabled: false,
-        },
-        codingCli: {
-          enabledProviders: ['codex'],
-          providers: {
-            codex: {
-              model: 'gpt-5-codex',
-              sandbox: 'read-only',
-            },
-          },
-        },
-        panes: {
-          defaultNewPane: 'shell',
-          snapThreshold: 2,
-          iconsOnTabs: true,
-          tabAttentionStyle: 'highlight',
-          attentionDismiss: 'click' as const,
-        },
-        network: {
-          host: '127.0.0.1' as const,
-          configured: false,
-        },
-      }
+      },
+    }))
 
-      const state = settingsReducer(initialState, setSettings(newSettings))
+    const { default: settingsReducer, defaultSettings } = await importFreshSettingsSlice()
+    const state = settingsReducer(undefined, { type: 'unknown' })
 
-      expect(state.settings).toEqual({
-        ...newSettings,
-        codingCli: {
-          ...newSettings.codingCli,
-          providers: {
-            ...defaultSettings.codingCli.providers,
-            ...newSettings.codingCli.providers,
-          },
-        },
-        editor: {
-          ...defaultSettings.editor,
-          ...newSettings.editor,
-        },
-        agentChat: { providers: {} },
-      })
+    expect(state.serverSettings.terminal.scrollback).toBe(5000)
+    expect(state.localSettings.theme).toBe('dark')
+    expect(state.localSettings.terminal.fontSize).toBe(18)
+    expect(state.settings).toEqual({
+      ...defaultSettings,
+      theme: 'dark',
+      terminal: {
+        ...defaultSettings.terminal,
+        fontSize: 18,
+      },
     })
+    expect(state.loaded).toBe(false)
+  })
 
-    it('sets loaded to true', () => {
-      const initialState: SettingsState = {
-        settings: defaultSettings,
-        loaded: false,
-      }
+  it('keeps defaultSettings exported as resolved settings', async () => {
+    const { defaultSettings } = await importFreshSettingsSlice()
 
-      const state = settingsReducer(initialState, setSettings(defaultSettings))
+    expect(defaultSettings.theme).toBe('system')
+    expect(defaultSettings.sidebar.sortMode).toBe('activity')
+    expect(defaultSettings.terminal.fontFamily).toBe('monospace')
+    expect(defaultSettings.terminal.scrollback).toBe(5000)
+  })
 
-      expect(state.loaded).toBe(true)
-    })
+  it('setServerSettings replaces serverSettings and recomputes the resolved view', async () => {
+    const settingsSlice = await importFreshSettingsSlice()
+    const {
+      default: settingsReducer,
+      defaultSettings,
+      setServerSettings,
+    } = settingsSlice
+    type SettingsState = settingsSlice.SettingsState
 
-    it('replaces all properties including nested ones', () => {
-      const initialState: SettingsState = {
-        settings: {
-          ...defaultSettings,
-          terminal: {
-            ...defaultSettings.terminal,
-            fontSize: 20,
-          },
-        },
-        loaded: true,
-      }
+    const initialState: SettingsState = settingsReducer(undefined, { type: 'unknown' })
+    const nextServerSettings = {
+      ...initialState.serverSettings,
+      defaultCwd: '/workspace',
+      terminal: {
+        scrollback: 12000,
+      },
+      agentChat: {
+        ...initialState.serverSettings.agentChat,
+        defaultPlugins: ['fs'],
+      },
+    }
 
-      const newSettings: AppSettings = {
-        ...defaultSettings,
-        terminal: {
-          ...defaultSettings.terminal,
-          fontSize: 12,
-        },
-      }
+    const state = settingsReducer(initialState, setServerSettings(nextServerSettings))
 
-      const state = settingsReducer(initialState, setSettings(newSettings))
-
-      expect(state.settings.terminal.fontSize).toBe(12)
+    expect(state.loaded).toBe(true)
+    expect(state.serverSettings).toEqual(nextServerSettings)
+    expect(state.settings).toEqual({
+      ...defaultSettings,
+      defaultCwd: '/workspace',
+      terminal: {
+        ...defaultSettings.terminal,
+        scrollback: 12000,
+      },
+      agentChat: {
+        ...defaultSettings.agentChat,
+        defaultPlugins: ['fs'],
+      },
     })
   })
 
-  describe('updateSettingsLocal', () => {
-    it('merges partial updates at top level', () => {
-      const initialState: SettingsState = {
-        settings: defaultSettings,
-        loaded: true,
-      }
+  it('previewServerSettingsPatch only applies server-backed fields', async () => {
+    const {
+      default: settingsReducer,
+      previewServerSettingsPatch,
+    } = await importFreshSettingsSlice()
 
-      const state = settingsReducer(
-        initialState,
-        updateSettingsLocal({ theme: 'dark', uiScale: 2 })
-      )
+    const initialState = settingsReducer(undefined, { type: 'unknown' })
+    const state = settingsReducer(initialState, previewServerSettingsPatch({
+      defaultCwd: '/workspace',
+      terminal: {
+        scrollback: 12000,
+      },
+      theme: 'dark',
+      sidebar: {
+        sortMode: 'project',
+      },
+    } as any))
 
-      expect(state.settings.theme).toBe('dark')
-      expect(state.settings.uiScale).toBe(2)
-      // Other properties should remain unchanged
-      expect(state.settings.terminal).toEqual(defaultSettings.terminal)
-      expect(state.settings.safety).toEqual(defaultSettings.safety)
-      expect(state.settings.sidebar).toEqual(defaultSettings.sidebar)
-    })
-
-    it('deep merges terminal settings', () => {
-      const initialState: SettingsState = {
-        settings: defaultSettings,
-        loaded: true,
-      }
-
-      const state = settingsReducer(
-        initialState,
-        updateSettingsLocal({
-          terminal: { fontSize: 18 },
-        })
-      )
-
-      expect(state.settings.terminal.fontSize).toBe(18)
-      // Other terminal properties should remain unchanged
-      expect(state.settings.terminal.fontFamily).toBe(defaultSettings.terminal.fontFamily)
-      expect(state.settings.terminal.lineHeight).toBe(defaultSettings.terminal.lineHeight)
-      expect(state.settings.terminal.cursorBlink).toBe(defaultSettings.terminal.cursorBlink)
-      expect(state.settings.terminal.scrollback).toBe(defaultSettings.terminal.scrollback)
-      expect(state.settings.terminal.theme).toBe(defaultSettings.terminal.theme)
-      expect(state.settings.terminal.osc52Clipboard).toBe(defaultSettings.terminal.osc52Clipboard)
-      expect(state.settings.terminal.renderer).toBe(defaultSettings.terminal.renderer)
-    })
-
-    it('deep merges safety settings', () => {
-      const initialState: SettingsState = {
-        settings: defaultSettings,
-        loaded: true,
-      }
-
-      const state = settingsReducer(
-        initialState,
-        updateSettingsLocal({
-          safety: { autoKillIdleMinutes: 60 },
-        })
-      )
-
-      expect(state.settings.safety.autoKillIdleMinutes).toBe(60)
-    })
-
-    it('deep merges sidebar settings', () => {
-      const initialState: SettingsState = {
-        settings: defaultSettings,
-        loaded: true,
-      }
-
-      const state = settingsReducer(
-        initialState,
-        updateSettingsLocal({
-          sidebar: { sortMode: 'activity' },
-        })
-      )
-
-      expect(state.settings.sidebar.sortMode).toBe('activity')
-      expect(state.settings.sidebar.showProjectBadges).toBe(defaultSettings.sidebar.showProjectBadges)
-    })
-
-    it('normalizes first-chat exclusion substrings', () => {
-      const initialState: SettingsState = {
-        settings: defaultSettings,
-        loaded: true,
-      }
-
-      const state = settingsReducer(
-        initialState,
-        updateSettingsLocal({
-          sidebar: {
-            excludeFirstChatSubstrings: ['  __AUTO__  ', '', '__AUTO__', 'canary'],
-          },
-        })
-      )
-
-      expect(state.settings.sidebar.excludeFirstChatSubstrings).toEqual(['__AUTO__', 'canary'])
-    })
-
-    it('deep merges coding CLI settings', () => {
-      const initialState: SettingsState = {
-        settings: defaultSettings,
-        loaded: true,
-      }
-
-      const state = settingsReducer(
-        initialState,
-        updateSettingsLocal({
-          codingCli: {
-            enabledProviders: ['claude'],
-            providers: {
-              codex: {
-                model: 'gpt-5-codex',
-              },
-            },
-          },
-        })
-      )
-
-      expect(state.settings.codingCli.enabledProviders).toEqual(['claude'])
-      expect(state.settings.codingCli.providers.codex?.model).toBe('gpt-5-codex')
-      expect(state.settings.codingCli.providers.claude?.permissionMode).toBe('default')
-    })
-
-    it('handles multiple nested updates simultaneously', () => {
-      const initialState: SettingsState = {
-        settings: defaultSettings,
-        loaded: true,
-      }
-
-      const state = settingsReducer(
-        initialState,
-        updateSettingsLocal({
-          theme: 'light',
-          terminal: { fontSize: 16, cursorBlink: false },
-          safety: { autoKillIdleMinutes: 60 },
-          sidebar: { showProjectBadges: false },
-        })
-      )
-
-      expect(state.settings.theme).toBe('light')
-      expect(state.settings.terminal.fontSize).toBe(16)
-      expect(state.settings.terminal.cursorBlink).toBe(false)
-      expect(state.settings.terminal.fontFamily).toBe(defaultSettings.terminal.fontFamily)
-      expect(state.settings.terminal.osc52Clipboard).toBe(defaultSettings.terminal.osc52Clipboard)
-      expect(state.settings.terminal.renderer).toBe(defaultSettings.terminal.renderer)
-      expect(state.settings.safety.autoKillIdleMinutes).toBe(60)
-      expect(state.settings.sidebar.showProjectBadges).toBe(false)
-      expect(state.settings.sidebar.sortMode).toBe(defaultSettings.sidebar.sortMode)
-    })
-
-    it('preserves loaded state', () => {
-      const initialState: SettingsState = {
-        settings: defaultSettings,
-        loaded: true,
-      }
-
-      const state = settingsReducer(
-        initialState,
-        updateSettingsLocal({ theme: 'dark' })
-      )
-
-      expect(state.loaded).toBe(true)
-    })
-
-    it('handles empty partial update', () => {
-      const initialState: SettingsState = {
-        settings: defaultSettings,
-        loaded: true,
-      }
-
-      const state = settingsReducer(initialState, updateSettingsLocal({}))
-
-      expect(state.settings).toEqual(defaultSettings)
-    })
-
-    it('can update defaultCwd', () => {
-      const initialState: SettingsState = {
-        settings: defaultSettings,
-        loaded: true,
-      }
-
-      const state = settingsReducer(
-        initialState,
-        updateSettingsLocal({ defaultCwd: '/new/path' })
-      )
-
-      expect(state.settings.defaultCwd).toBe('/new/path')
-    })
+    expect(state.serverSettings.defaultCwd).toBe('/workspace')
+    expect(state.settings.defaultCwd).toBe('/workspace')
+    expect(state.serverSettings.terminal.scrollback).toBe(12000)
+    expect(state.settings.terminal.scrollback).toBe(12000)
+    expect(state.settings.theme).toBe(initialState.settings.theme)
+    expect(state.settings.sidebar.sortMode).toBe(initialState.settings.sidebar.sortMode)
   })
 
-  describe('markSaved', () => {
-    beforeEach(() => {
-      vi.useFakeTimers()
-    })
+  it('updateSettingsLocal only applies local fields', async () => {
+    const {
+      default: settingsReducer,
+      updateSettingsLocal,
+    } = await importFreshSettingsSlice()
 
-    afterEach(() => {
-      vi.useRealTimers()
-    })
+    const initialState = settingsReducer(undefined, { type: 'unknown' })
+    const state = settingsReducer(initialState, updateSettingsLocal({
+      theme: 'dark',
+      terminal: {
+        fontSize: 18,
+        scrollback: 9000,
+      },
+      defaultCwd: '/workspace',
+      sidebar: {
+        sortMode: 'project',
+      },
+    } as any))
 
-    it('sets lastSavedAt to current timestamp', () => {
-      const initialState: SettingsState = {
-        settings: defaultSettings,
-        loaded: true,
-      }
-
-      const now = Date.now()
-      vi.setSystemTime(now)
-
-      const state = settingsReducer(initialState, markSaved())
-
-      expect(state.lastSavedAt).toBe(now)
-    })
-
-    it('updates lastSavedAt on subsequent calls', () => {
-      const initialState: SettingsState = {
-        settings: defaultSettings,
-        loaded: true,
-        lastSavedAt: 1000,
-      }
-
-      const newTime = 2000
-      vi.setSystemTime(newTime)
-
-      const state = settingsReducer(initialState, markSaved())
-
-      expect(state.lastSavedAt).toBe(newTime)
-    })
-
-    it('preserves other state properties', () => {
-      const initialState: SettingsState = {
-        settings: { ...defaultSettings, theme: 'dark' },
-        loaded: true,
-      }
-
-      const state = settingsReducer(initialState, markSaved())
-
-      expect(state.settings.theme).toBe('dark')
-      expect(state.loaded).toBe(true)
-    })
+    expect(state.localSettings.theme).toBe('dark')
+    expect(state.settings.theme).toBe('dark')
+    expect(state.localSettings.terminal.fontSize).toBe(18)
+    expect(state.settings.terminal.fontSize).toBe(18)
+    expect(state.settings.terminal.scrollback).toBe(initialState.settings.terminal.scrollback)
+    expect(state.settings.defaultCwd).toBe(initialState.settings.defaultCwd)
+    expect(state.settings.sidebar.sortMode).toBe('project')
   })
 
-  describe('defaultSettings export', () => {
-    it('exports defaultSettings constant', () => {
-      expect(defaultSettings).toBeDefined()
-      expect(defaultSettings.theme).toBe('system')
-      expect(defaultSettings.uiScale).toBe(1.0)
-    })
+  it('markSaved updates lastSavedAt without disturbing split state', async () => {
+    vi.useFakeTimers()
+    const now = 1_700_000_000_000
+    vi.setSystemTime(now)
 
-    it('has all required properties', () => {
-      expect(defaultSettings).toHaveProperty('theme')
-      expect(defaultSettings).toHaveProperty('uiScale')
-      expect(defaultSettings).toHaveProperty('terminal')
-      expect(defaultSettings).toHaveProperty('logging')
-      expect(defaultSettings).toHaveProperty('safety')
-      expect(defaultSettings).toHaveProperty('sidebar')
-      expect(defaultSettings).toHaveProperty('codingCli')
-    })
+    const {
+      default: settingsReducer,
+      markSaved,
+    } = await importFreshSettingsSlice()
 
-    it('defaultSettings includes panes.iconsOnTabs as true', () => {
-      expect(defaultSettings.panes.iconsOnTabs).toBe(true)
-    })
-  })
+    const initialState = settingsReducer(undefined, { type: 'unknown' })
+    const state = settingsReducer(initialState, markSaved())
 
-  describe('panes mergeSettings', () => {
-    it('mergeSettings preserves iconsOnTabs when patching panes', () => {
-      const result = mergeSettings(defaultSettings, { panes: { defaultNewPane: 'shell' } })
-      expect(result.panes.iconsOnTabs).toBe(true)
-    })
+    expect(state.lastSavedAt).toBe(now)
+    expect(state.serverSettings).toEqual(initialState.serverSettings)
+    expect(state.localSettings).toEqual(initialState.localSettings)
+    expect(state.settings).toEqual(initialState.settings)
 
-    it('mergeSettings allows overriding iconsOnTabs to false', () => {
-      const result = mergeSettings(defaultSettings, { panes: { iconsOnTabs: false } })
-      expect(result.panes.iconsOnTabs).toBe(false)
-    })
-
-    it('deep merges panes settings via updateSettingsLocal', () => {
-      const initialState: SettingsState = {
-        settings: defaultSettings,
-        loaded: true,
-      }
-
-      const state = settingsReducer(
-        initialState,
-        updateSettingsLocal({ panes: { iconsOnTabs: false } })
-      )
-
-      expect(state.settings.panes.iconsOnTabs).toBe(false)
-      expect(state.settings.panes.defaultNewPane).toBe('ask')
-    })
-  })
-
-  describe('terminal mergeSettings', () => {
-    it('preserves terminal policy fields when patching terminal settings', () => {
-      const base = {
-        ...defaultSettings,
-        terminal: {
-          ...defaultSettings.terminal,
-          osc52Clipboard: 'never' as const,
-          renderer: 'canvas' as const,
-        },
-      }
-
-      const result = mergeSettings(base, { terminal: { fontSize: 18 } } as any)
-      expect(result.terminal.fontSize).toBe(18)
-      expect(result.terminal.osc52Clipboard).toBe('never')
-      expect(result.terminal.renderer).toBe('canvas')
-    })
-  })
-})
-
-describe('mergeSettings – panes.snapThreshold', () => {
-  it('merges panes.snapThreshold without clobbering defaultNewPane', () => {
-    const base = { ...defaultSettings }
-    const patch = { panes: { snapThreshold: 6 } }
-    const result = mergeSettings(base, patch)
-    expect(result.panes.snapThreshold).toBe(6)
-    expect(result.panes.defaultNewPane).toBe('ask') // preserved
-  })
-
-  it('defaults panes.snapThreshold to 2', () => {
-    expect(defaultSettings.panes.snapThreshold).toBe(2)
-  })
-
-  it('preserves snapThreshold when patching defaultNewPane', () => {
-    const base = { ...defaultSettings, panes: { ...defaultSettings.panes, snapThreshold: 7 } }
-    const patch = { panes: { defaultNewPane: 'shell' as const } }
-    const result = mergeSettings(base, patch)
-    expect(result.panes.defaultNewPane).toBe('shell')
-    expect(result.panes.snapThreshold).toBe(7)
-  })
-
-  it('allows snapThreshold to be set to 0 (off)', () => {
-    const base = { ...defaultSettings }
-    const patch = { panes: { snapThreshold: 0 } }
-    const result = mergeSettings(base, patch)
-    expect(result.panes.snapThreshold).toBe(0)
-  })
-})
-
-describe('settingsSlice - sortMode migration', () => {
-  it('migrates hybrid to activity', async () => {
-    const { migrateSortMode } = await import('@/store/settingsSlice')
-    expect(migrateSortMode('hybrid')).toBe('activity')
-  })
-
-  it('preserves valid sort modes', async () => {
-    const { migrateSortMode } = await import('@/store/settingsSlice')
-    expect(migrateSortMode('recency')).toBe('recency')
-    expect(migrateSortMode('recency-pinned')).toBe('recency-pinned')
-    expect(migrateSortMode('activity')).toBe('activity')
-    expect(migrateSortMode('project')).toBe('project')
-  })
-
-  it('defaults invalid values to recency-pinned', async () => {
-    const { migrateSortMode } = await import('@/store/settingsSlice')
-    expect(migrateSortMode('invalid' as any)).toBe('recency-pinned')
-    expect(migrateSortMode(undefined as any)).toBe('recency-pinned')
+    vi.useRealTimers()
   })
 })
