@@ -881,7 +881,7 @@ export default function App() {
     }
 
     function onKeyDown(e: KeyboardEvent) {
-      if (e.defaultPrevented) return
+      if (e.defaultPrevented || e.repeat) return
 
       const tabSwitchDirection = getTabSwitchShortcutDirection(e)
       if (tabSwitchDirection) {
