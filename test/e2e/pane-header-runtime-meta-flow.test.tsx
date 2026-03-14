@@ -603,7 +603,7 @@ describe('pane header runtime metadata flow (e2e)', () => {
               cwd: '/home/user/code/freshell/.worktrees/issue-163',
               gitBranch: 'main',
               isDirty: true,
-              updatedAt: 1,
+              lastActivityAt: 1,
               tokenUsage: {
                 inputTokens: 10,
                 outputTokens: 5,
@@ -673,7 +673,7 @@ describe('pane header runtime metadata flow (e2e)', () => {
             cwd: '/home/user/code/freshell/.worktrees/issue-163',
             gitBranch: 'main',
             isDirty: true,
-            updatedAt: 1,
+            lastActivityAt: 1,
             tokenUsage: {
               inputTokens: 10,
               outputTokens: 5,
@@ -739,7 +739,7 @@ describe('pane header runtime metadata flow (e2e)', () => {
               cwd: '/home/user/code/freshell/.worktrees/issue-163',
               gitBranch: 'main',
               isDirty: true,
-              updatedAt: 2,
+              lastActivityAt: 2,
               tokenUsage: {
                 inputTokens: 10,
                 outputTokens: 5,

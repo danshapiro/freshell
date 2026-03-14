@@ -188,7 +188,7 @@ describe('ws handshake snapshot', () => {
               provider: 'claude',
               sessionId: 'sess-1',
               projectPath: '/tmp/demo',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
             },
           ],
         },

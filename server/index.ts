@@ -95,7 +95,7 @@ const SERVER_STARTED_AT = Date.now()
 const log = logger.child({ component: 'server' })
 const perfConfig = getPerfConfig()
 
-// Max age difference (ms) between a session's updatedAt and a terminal's createdAt
+// Max age difference (ms) between a session's lastActivityAt and a terminal's createdAt
 // for association to be considered valid. Prevents binding to stale sessions
 // from previous server runs.
 const ASSOCIATION_MAX_AGE_MS = 30_000

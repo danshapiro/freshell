@@ -84,7 +84,7 @@ describe('Sidebar perf audit milestone', () => {
                   sessionId: '00000000-0000-4000-8000-000000000999',
                   title: 'alpha project session',
                   projectPath: '/tmp/project-alpha',
-                  updatedAt: 1_000,
+                  lastActivityAt: 1_000,
                   cwd: '/tmp/project-alpha',
                 },
               ],

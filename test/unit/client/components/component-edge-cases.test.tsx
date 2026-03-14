@@ -412,7 +412,7 @@ describe('Component Edge Cases', () => {
             {
               sessionId: 'sess-1',
               projectPath: '/test',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: undefined,
               summary: undefined,
               cwd: undefined,
@@ -522,7 +522,7 @@ describe('Component Edge Cases', () => {
       it('handles filter resulting in empty array', () => {
         const project = createProjectGroup({
           sessions: [
-            { sessionId: 'sess-1', projectPath: '/test', updatedAt: Date.now(), title: 'Alpha' },
+            { sessionId: 'sess-1', projectPath: '/test', lastActivityAt: Date.now(), title: 'Alpha' },
           ],
         })
 
@@ -944,7 +944,7 @@ describe('Component Edge Cases', () => {
           sessions: Array.from({ length: 40 }, (_, i) => ({
             sessionId: `sess-${i}`,
             projectPath: '/test',
-            updatedAt: Date.now(),
+            lastActivityAt: Date.now(),
             title: `Session ${i}`,
           })),
         })
@@ -1280,14 +1280,14 @@ describe('Component Edge Cases', () => {
     })
 
     describe('HistoryView', () => {
-      it('handles session with non-numeric updatedAt', () => {
+      it('handles session with non-numeric lastActivityAt', () => {
         const projectWithBadDate: ProjectGroup = {
           projectPath: '/test',
           sessions: [
             {
               sessionId: 'sess-1',
               projectPath: '/test',
-              updatedAt: 'invalid' as unknown as number,
+              lastActivityAt: 'invalid' as unknown as number,
               title: 'Test Session',
             },
           ],
@@ -1308,7 +1308,7 @@ describe('Component Edge Cases', () => {
             {
               sessionId: 'sess-1',
               projectPath: 'C:\\Users\\test<>user\\project',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
             },
           ],
         }
@@ -1421,7 +1421,7 @@ describe('Component Edge Cases', () => {
             {
               sessionId: 'sess-1',
               projectPath: '/test',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: 'Test Session',
             },
           ],
@@ -1528,7 +1528,7 @@ describe('Component Edge Cases', () => {
             {
               sessionId: 'sess-1',
               projectPath: '/test',
-              updatedAt: Date.now(),
+              lastActivityAt: Date.now(),
               title: '<img onerror="alert(1)" src="x">',
             },
           ],

@@ -28,7 +28,11 @@ describe('session-directory query validation', () => {
   })
 
   it('accepts only the visible-first query window contract', async () => {
-    const res = await request(app).get('/session-directory?priority=visible&limit=10&revision=3&cursor=eyJ1cGRhdGVkQXQiOjEsImtleSI6ImNsYXVkZTpzZXNzaW9uLTEifQ')
+    const cursor = Buffer.from(JSON.stringify({
+      lastActivityAt: 1,
+      key: 'claude:session-1',
+    }), 'utf8').toString('base64url')
+    const res = await request(app).get(`/session-directory?priority=visible&limit=10&revision=3&cursor=${cursor}`)
     expect(res.status).toBe(200)
   })
 

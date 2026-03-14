@@ -531,7 +531,7 @@ describe('State Edge Cases', () => {
                 {
                   sessionId: `session-${i}`,
                   projectPath: `/project/${i}`,
-                  updatedAt: Date.now(),
+                  lastActivityAt: Date.now(),
                 },
               ],
             },
@@ -996,7 +996,7 @@ describe('State Edge Cases', () => {
               {
                 projectPath: `/project/${i}`,
                 sessions: [
-                  { sessionId: `s-${i}`, projectPath: `/project/${i}`, updatedAt: Date.now() },
+                  { sessionId: `s-${i}`, projectPath: `/project/${i}`, lastActivityAt: Date.now() },
                 ],
               },
             ])

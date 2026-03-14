@@ -177,7 +177,7 @@ describe('Sidebar mobile touch targets', () => {
           {
             sessionId: sessionId('session-1'),
             projectPath: '/home/user/project',
-            updatedAt: Date.now(),
+            lastActivityAt: Date.now(),
             title: 'Test session',
             cwd: '/home/user/project',
           },

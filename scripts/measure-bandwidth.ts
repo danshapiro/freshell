@@ -30,14 +30,14 @@ function compressSize(json: string, level: 1 | 6 = 1): number {
 
 interface ProjectLike {
   projectPath: string
-  sessions: Array<{ updatedAt: number; sessionId: string; [k: string]: unknown }>
+  sessions: Array<{ lastActivityAt: number; sessionId: string; [k: string]: unknown }>
   [k: string]: unknown
 }
 
 function paginateLocal(projects: ProjectLike[], limit: number): ProjectLike[] {
   // Flatten, sort by recency, take top N, regroup
   const all = projects.flatMap(p => p.sessions.map(s => ({ ...s, _projectPath: p.projectPath, _color: (p as any).color })))
-  all.sort((a, b) => b.updatedAt - a.updatedAt)
+  all.sort((a, b) => b.lastActivityAt - a.lastActivityAt)
   const page = all.slice(0, limit)
   const groups = new Map<string, { sessions: any[]; color?: string }>()
   for (const s of page) {
