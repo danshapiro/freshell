@@ -62,6 +62,7 @@ import { loadSessionHistory } from './session-history-loader.js'
 import { createAgentTimelineService } from './agent-timeline/service.js'
 import { createAgentTimelineRouter } from './agent-timeline/router.js'
 import { createTerminalViewService } from './terminal-view/service.js'
+import { resolveStartupBanner } from './startup-banner.js'
 
 function compileArgTemplate(
   template: string[] | undefined,
@@ -677,13 +678,10 @@ async function main() {
         : `http://localhost:${visitPort}/?token=${token}`
 
       let advertisedUrl = localUrl
-      let remoteAccessEnabled = bindHost !== '127.0.0.1'
-      let remoteAccessNeedsRepair = false
+      let startupStatus: Awaited<ReturnType<typeof networkManager.getStatus>> | null = null
 
       try {
-        const startupStatus = await networkManager.getStatus()
-        remoteAccessEnabled = startupStatus.remoteAccessEnabled
-        remoteAccessNeedsRepair = startupStatus.remoteAccessNeedsRepair === true
+        startupStatus = await networkManager.getStatus()
         if (hideToken) {
           const parsed = new URL(startupStatus.accessUrl)
           parsed.searchParams.delete('token')
@@ -697,23 +695,27 @@ async function main() {
 
       console.log('')
       console.log(`\x1b[32m\u{1F41A}\u{1F525} freshell is ready!\x1b[0m`)
-      if (remoteAccessNeedsRepair) {
-        console.log(`   Local only for now: \x1b[36m${localUrl}\x1b[0m`)
+      const banner = resolveStartupBanner({
+        localUrl,
+        advertisedUrl,
+        fallbackRemoteAccessEnabled: bindHost !== '127.0.0.1',
+        status: startupStatus,
+      })
+      if (banner.kind === 'local') {
+        console.log(`   Local only: \x1b[36m${banner.url}\x1b[0m`)
         if (hideToken) {
           console.log('   Auth token is configured in .env (not printed to logs).')
         }
-        console.log('   Remote access is configured but needs firewall/port-forward repair.')
-        console.log('   Open Settings and use Fix firewall to restore LAN access.')
-      } else if (!remoteAccessEnabled) {
-        console.log(`   Local only: \x1b[36m${localUrl}\x1b[0m`)
-        if (hideToken) {
-          console.log('   Auth token is configured in .env (not printed to logs).')
+        for (const line of banner.noteLines) {
+          console.log(`   ${line}`)
         }
-        console.log('   Run the setup wizard to enable remote access.')
       } else {
-        console.log(`   Visit from anywhere on your network: \x1b[36m${advertisedUrl}\x1b[0m`)
+        console.log(`   Visit from anywhere on your network: \x1b[36m${banner.url}\x1b[0m`)
         if (hideToken) {
           console.log('   Auth token is configured in .env (not printed to logs).')
+        }
+        for (const line of banner.noteLines) {
+          console.log(`   ${line}`)
         }
       }
       if (isDev) {
