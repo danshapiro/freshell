@@ -582,6 +582,65 @@ describe('WS Handler SDK Integration', () => {
       }
     })
 
+    it('for resumed sdk.create sends sdk.created, then sdk.session.snapshot, then sdk.session.init', async () => {
+      const durableSessionId = '00000000-0000-4000-8000-000000000241'
+      loadSessionHistoryMock.mockResolvedValue([
+        {
+          role: 'user',
+          content: [{ type: 'text', text: 'Earlier question' }],
+          timestamp: '2026-03-10T10:00:00.000Z',
+        },
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Earlier answer' }],
+          timestamp: '2026-03-10T10:00:01.000Z',
+        },
+      ])
+
+      const ws = await connectAndAuth()
+      try {
+        const messages: any[] = []
+        const collected = new Promise<void>((resolve) => {
+          const onMessage = (data: WebSocket.RawData) => {
+            const parsed = JSON.parse(data.toString())
+            if (
+              parsed.type === 'sdk.created'
+              || parsed.type === 'sdk.session.snapshot'
+              || parsed.type === 'sdk.session.init'
+            ) {
+              messages.push(parsed)
+            }
+            if (messages.length >= 3) {
+              ws.off('message', onMessage)
+              resolve()
+            }
+          }
+          ws.on('message', onMessage)
+        })
+
+        ws.send(JSON.stringify({
+          type: 'sdk.create',
+          requestId: 'req-resume-order',
+          resumeSessionId: durableSessionId,
+        }))
+
+        await collected
+
+        expect(messages.map((m) => m.type).slice(0, 3)).toEqual([
+          'sdk.created',
+          'sdk.session.snapshot',
+          'sdk.session.init',
+        ])
+        expect(messages[1]).toEqual(expect.objectContaining({
+          sessionId: 'sdk-sess-1',
+          latestTurnId: 'turn-1',
+        }))
+        expect(messages.some((m) => m.type === 'sdk.history')).toBe(false)
+      } finally {
+        ws.close()
+      }
+    })
+
     it('returns sdk.error for sdk.attach with unknown session', async () => {
       mockSdkBridge.getSession.mockReturnValue(undefined)
       loadSessionHistoryMock.mockResolvedValue(null)
