@@ -21,6 +21,10 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import type { ChatContentBlock } from '@/store/agentChatTypes'
+import {
+  BROWSER_PREFERENCES_STORAGE_KEY,
+  setToolStripExpandedPreference,
+} from '@/lib/browser-preferences'
 
 // jsdom doesn't implement scrollIntoView
 beforeAll(() => {
@@ -152,12 +156,12 @@ describe('freshclaude polish e2e: compact density', () => {
 describe('freshclaude polish e2e: tool block expand/collapse', () => {
   afterEach(() => {
     cleanup()
-    localStorage.removeItem('freshell:toolStripExpanded')
+    localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
   })
 
   it('collapses and expands tool blocks on click', () => {
     // Tool strips are collapsed by default; set expanded to test ToolBlock interaction
-    localStorage.setItem('freshell:toolStripExpanded', 'true')
+    setToolStripExpandedPreference(true)
     const store = makeStore()
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'Run a command' }))
@@ -197,12 +201,12 @@ describe('freshclaude polish e2e: tool block expand/collapse', () => {
 describe('freshclaude polish e2e: auto-collapse old tools', () => {
   afterEach(() => {
     cleanup()
-    localStorage.removeItem('freshell:toolStripExpanded')
+    localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
   })
 
   it('old tools start collapsed while recent tools start expanded', () => {
     // Tool strips are collapsed by default; set expanded to test auto-expand behavior
-    localStorage.setItem('freshell:toolStripExpanded', 'true')
+    setToolStripExpandedPreference(true)
     const store = makeStore()
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'Do things' }))
@@ -328,12 +332,12 @@ describe('freshclaude polish e2e: thinking indicator', () => {
 describe('freshclaude polish e2e: diff view for Edit tool', () => {
   afterEach(() => {
     cleanup()
-    localStorage.removeItem('freshell:toolStripExpanded')
+    localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
   })
 
   it('shows color-coded diff when an Edit tool result contains old_string/new_string', () => {
     // Tool strips are collapsed by default; set expanded to test ToolBlock content
-    localStorage.setItem('freshell:toolStripExpanded', 'true')
+    setToolStripExpandedPreference(true)
     const store = makeStore()
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'Edit a file' }))
@@ -385,12 +389,12 @@ describe('freshclaude polish e2e: diff view for Edit tool', () => {
 describe('freshclaude polish e2e: system-reminder stripping', () => {
   afterEach(() => {
     cleanup()
-    localStorage.removeItem('freshell:toolStripExpanded')
+    localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
   })
 
   it('strips <system-reminder> tags from tool result output', () => {
     // Tool strips are collapsed by default; set expanded to verify content is sanitized
-    localStorage.setItem('freshell:toolStripExpanded', 'true')
+    setToolStripExpandedPreference(true)
     const store = makeStore()
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'Read a file' }))

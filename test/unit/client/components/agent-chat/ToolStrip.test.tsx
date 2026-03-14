@@ -3,8 +3,13 @@ import { render, screen, cleanup } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import ToolStrip from '@/components/agent-chat/ToolStrip'
 import type { ToolPair } from '@/components/agent-chat/ToolStrip'
+import {
+  BROWSER_PREFERENCES_STORAGE_KEY,
+  getToolStripExpandedPreference,
+  loadBrowserPreferencesRecord,
+} from '@/lib/browser-preferences'
 
-const STORAGE_KEY = 'freshell:toolStripExpanded'
+const LEGACY_TOOL_STRIP_STORAGE_KEY = 'freshell:toolStripExpanded'
 
 function makePair(
   name: string,
@@ -24,7 +29,8 @@ function makePair(
 
 describe('ToolStrip', () => {
   beforeEach(() => {
-    localStorage.removeItem(STORAGE_KEY)
+    localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
+    localStorage.removeItem(LEGACY_TOOL_STRIP_STORAGE_KEY)
   })
   afterEach(cleanup)
 
@@ -54,7 +60,7 @@ describe('ToolStrip', () => {
     expect(collapsedRow.className).toContain('py-0.5')
   })
 
-  it('expands on chevron click and persists to localStorage', async () => {
+  it('expands on chevron click and persists to browser preferences', async () => {
     const user = userEvent.setup()
     const pairs = [
       makePair('Bash', { command: 'ls' }, 'file1\nfile2'),
@@ -67,11 +73,13 @@ describe('ToolStrip', () => {
     // Expanded: should show individual ToolBlock
     expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
     // Persisted
-    expect(localStorage.getItem(STORAGE_KEY)).toBe('true')
+    expect(loadBrowserPreferencesRecord().toolStrip?.expanded).toBe(true)
   })
 
-  it('starts expanded when localStorage has stored preference', () => {
-    localStorage.setItem(STORAGE_KEY, 'true')
+  it('starts expanded when browser preferences have a stored preference', () => {
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      toolStrip: { expanded: true },
+    }))
     const pairs = [
       makePair('Bash', { command: 'ls' }, 'file1\nfile2'),
     ]
@@ -80,8 +88,10 @@ describe('ToolStrip', () => {
     expect(screen.getByRole('button', { name: /Bash tool call/i })).toBeInTheDocument()
   })
 
-  it('collapses on second chevron click and removes localStorage', async () => {
-    localStorage.setItem(STORAGE_KEY, 'true')
+  it('collapses on second chevron click and stores false in browser preferences', async () => {
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      toolStrip: { expanded: true },
+    }))
     const user = userEvent.setup()
     const pairs = [makePair('Bash', { command: 'ls' }, 'file1')]
     render(<ToolStrip pairs={pairs} isStreaming={false} />)
@@ -91,7 +101,7 @@ describe('ToolStrip', () => {
 
     // Should be collapsed again
     expect(screen.getByText('1 tool used')).toBeInTheDocument()
-    expect(localStorage.getItem(STORAGE_KEY)).toBe('false')
+    expect(loadBrowserPreferencesRecord().toolStrip?.expanded).toBe(false)
   })
 
   it('shows streaming tool activity when isStreaming is true', () => {
@@ -143,7 +153,9 @@ describe('ToolStrip', () => {
   })
 
   it('always shows collapsed view when showTools is false, even if localStorage says expanded', () => {
-    localStorage.setItem(STORAGE_KEY, 'true')
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      toolStrip: { expanded: true },
+    }))
     const pairs = [
       makePair('Bash', { command: 'ls' }, 'file1\nfile2'),
       makePair('Read', { file_path: '/path/file.ts' }, 'content'),
@@ -158,7 +170,9 @@ describe('ToolStrip', () => {
   })
 
   it('passes autoExpandAbove props through to ToolBlocks in expanded mode', async () => {
-    localStorage.setItem(STORAGE_KEY, 'true')
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      toolStrip: { expanded: true },
+    }))
     const pairs = [
       makePair('Bash', { command: 'echo 1' }, 'output1'),
       makePair('Bash', { command: 'echo 2' }, 'output2'),
@@ -175,5 +189,12 @@ describe('ToolStrip', () => {
     // Tools at indices 1,2 (globalIndex=1,2) should be expanded (>= autoExpandAbove=1)
     expect(toolButtons[1]).toHaveAttribute('aria-expanded', 'true')
     expect(toolButtons[2]).toHaveAttribute('aria-expanded', 'true')
+  })
+
+  it('migrates the legacy tool-strip key through the browser preferences helper', () => {
+    localStorage.setItem(LEGACY_TOOL_STRIP_STORAGE_KEY, 'true')
+
+    expect(getToolStripExpandedPreference()).toBe(true)
+    expect(loadBrowserPreferencesRecord().toolStrip?.expanded).toBe(true)
   })
 })

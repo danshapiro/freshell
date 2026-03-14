@@ -22,6 +22,10 @@ import settingsReducer from '@/store/settingsSlice'
 import type { AgentChatPaneContent } from '@/store/paneTypes'
 import { buildMenuItems, type MenuActions, type MenuBuildContext } from '@/components/context-menu/menu-defs'
 import type { ContextTarget } from '@/components/context-menu/context-menu-types'
+import {
+  BROWSER_PREFERENCES_STORAGE_KEY,
+  setToolStripExpandedPreference,
+} from '@/lib/browser-preferences'
 
 // jsdom doesn't implement scrollIntoView
 beforeAll(() => {
@@ -124,12 +128,12 @@ function createMockContext(actions: MenuActions, overrides?: Partial<MenuBuildCo
 describe('freshclaude context menu integration', () => {
   afterEach(() => {
     cleanup()
-    localStorage.removeItem('freshell:toolStripExpanded')
+    localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
   })
 
   it('right-click on tool input in rendered DOM produces "Copy command" menu item', () => {
     // Tool strips are collapsed by default; expand to access ToolBlock data attributes
-    localStorage.setItem('freshell:toolStripExpanded', 'true')
+    setToolStripExpandedPreference(true)
     const store = makeStore()
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'Run a command' }))
@@ -178,7 +182,7 @@ describe('freshclaude context menu integration', () => {
 
   it('right-click on diff in rendered DOM produces diff-specific menu items', () => {
     // Tool strips are collapsed by default; expand to access ToolBlock data attributes
-    localStorage.setItem('freshell:toolStripExpanded', 'true')
+    setToolStripExpandedPreference(true)
     const store = makeStore()
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'Edit a file' }))
@@ -245,7 +249,7 @@ describe('freshclaude context menu integration', () => {
 
   it('right-click on tool output in rendered DOM produces "Copy output" menu item', () => {
     // Tool strips are collapsed by default; expand to access ToolBlock data attributes
-    localStorage.setItem('freshell:toolStripExpanded', 'true')
+    setToolStripExpandedPreference(true)
     const store = makeStore()
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     store.dispatch(addUserMessage({ sessionId: 'sess-1', text: 'List files' }))

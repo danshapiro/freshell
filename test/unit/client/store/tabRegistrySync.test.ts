@@ -157,6 +157,36 @@ describe('tabRegistrySync', () => {
     stop()
   })
 
+  it('re-queries with the current search range after reconnect', () => {
+    state = {
+      ...state,
+      tabRegistry: {
+        ...state.tabRegistry,
+        searchRangeDays: 365,
+      },
+    }
+
+    const store = {
+      getState: () => state,
+      dispatch,
+      subscribe: (listener: Listener) => {
+        listeners.push(listener)
+        return () => {
+          listeners = listeners.filter((item) => item !== listener)
+        }
+      },
+    }
+
+    const stop = startTabRegistrySync(store as any, ws)
+    ws.sendTabsSyncQuery.mockClear()
+
+    wsReconnectHandlers.forEach((handler) => handler())
+
+    expect(ws.sendTabsSyncQuery).toHaveBeenCalledTimes(1)
+    expect(ws.sendTabsSyncQuery.mock.calls[0][0].rangeDays).toBe(365)
+    stop()
+  })
+
   it('applies tabs.sync.snapshot responses into store dispatch', () => {
     const store = {
       getState: () => state,

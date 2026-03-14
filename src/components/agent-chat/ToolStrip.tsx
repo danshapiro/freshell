@@ -1,42 +1,14 @@
 import { memo, useMemo, useSyncExternalStore } from 'react'
 import { ChevronRight } from 'lucide-react'
+import {
+  getToolStripExpandedPreference,
+  setToolStripExpandedPreference,
+  subscribeToolStripPreference,
+} from '@/lib/browser-preferences'
 import { cn } from '@/lib/utils'
 import { getToolPreview } from './tool-preview'
 import ToolBlock from './ToolBlock'
 import SlotReel from './SlotReel'
-
-const STORAGE_KEY = 'freshell:toolStripExpanded'
-
-/** Read the expanded preference from localStorage. */
-function getSnapshot(): boolean {
-  try {
-    return localStorage.getItem(STORAGE_KEY) === 'true'
-  } catch {
-    return false
-  }
-}
-
-function getServerSnapshot(): boolean {
-  return false
-}
-
-function subscribe(callback: () => void): () => void {
-  const handler = (e: StorageEvent) => {
-    if (e.key === STORAGE_KEY) callback()
-  }
-  window.addEventListener('storage', handler)
-  return () => window.removeEventListener('storage', handler)
-}
-
-function setExpandedPreference(expanded: boolean): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, String(expanded))
-    // Dispatch storage event for other tabs / useSyncExternalStore
-    window.dispatchEvent(new StorageEvent('storage', { key: STORAGE_KEY }))
-  } catch {
-    // localStorage unavailable; degrade gracefully
-  }
-}
 
 export interface ToolPair {
   id: string
@@ -59,11 +31,15 @@ interface ToolStripProps {
 }
 
 function ToolStrip({ pairs, isStreaming, completedToolOffset, autoExpandAbove, showTools = true }: ToolStripProps) {
-  const expandedPref = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot)
+  const expandedPref = useSyncExternalStore(
+    subscribeToolStripPreference,
+    getToolStripExpandedPreference,
+    () => false,
+  )
   const expanded = showTools && expandedPref
 
   const handleToggle = () => {
-    setExpandedPreference(!expandedPref)
+    setToolStripExpandedPreference(!expandedPref)
   }
 
   const hasErrors = pairs.some(p => p.isError)

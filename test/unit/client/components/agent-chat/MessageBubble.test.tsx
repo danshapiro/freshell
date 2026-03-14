@@ -3,8 +3,9 @@ import { render, screen, cleanup, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import MessageBubble from '../../../../../src/components/agent-chat/MessageBubble'
 import type { ChatContentBlock } from '@/store/agentChatTypes'
-
-const STORAGE_KEY = 'freshell:toolStripExpanded'
+import {
+  BROWSER_PREFERENCES_STORAGE_KEY,
+} from '@/lib/browser-preferences'
 
 // Render MarkdownRenderer synchronously to avoid React.lazy timing issues
 // when running in the full test suite (dynamic import may not resolve in time)
@@ -19,7 +20,7 @@ vi.mock('@/components/markdown/LazyMarkdown', async () => {
 
 describe('MessageBubble', () => {
   beforeEach(() => {
-    localStorage.removeItem(STORAGE_KEY)
+    localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
   })
   afterEach(() => {
     cleanup()
@@ -161,7 +162,7 @@ describe('MessageBubble', () => {
 
 describe('MessageBubble display toggles', () => {
   beforeEach(() => {
-    localStorage.removeItem(STORAGE_KEY)
+    localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
   })
   afterEach(cleanup)
 
@@ -260,7 +261,7 @@ describe('MessageBubble display toggles', () => {
 
 describe('MessageBubble empty message hiding', () => {
   beforeEach(() => {
-    localStorage.removeItem(STORAGE_KEY)
+    localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
   })
   afterEach(cleanup)
 
@@ -326,7 +327,7 @@ describe('MessageBubble empty message hiding', () => {
 
 describe('MessageBubble system-reminder stripping', () => {
   beforeEach(() => {
-    localStorage.removeItem(STORAGE_KEY)
+    localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
   })
   afterEach(cleanup)
 
@@ -374,7 +375,7 @@ describe('MessageBubble system-reminder stripping', () => {
 
 describe('MessageBubble tool strip grouping', () => {
   beforeEach(() => {
-    localStorage.removeItem(STORAGE_KEY)
+    localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
   })
   afterEach(cleanup)
 
@@ -507,7 +508,7 @@ describe('MessageBubble tool strip grouping', () => {
 
 describe('MessageBubble tool strip visual behavior', () => {
   beforeEach(() => {
-    localStorage.removeItem(STORAGE_KEY)
+    localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
   })
   afterEach(cleanup)
 
