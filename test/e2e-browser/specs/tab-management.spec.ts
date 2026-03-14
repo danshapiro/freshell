@@ -1,6 +1,23 @@
 import { test, expect } from '../helpers/fixtures.js'
 
 test.describe('Tab Management', () => {
+  async function selectShellForActiveTab(page: any): Promise<void> {
+    const shellNames = ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']
+    for (const name of shellNames) {
+      try {
+        const button = page.getByRole('button', { name: new RegExp(`^${name}$`, 'i') })
+        if (await button.isVisible().catch(() => false)) {
+          await button.click({ timeout: 5000 })
+          await page.locator('.xterm').last().waitFor({ state: 'visible', timeout: 30_000 })
+          return
+        }
+      } catch {
+        continue
+      }
+    }
+    throw new Error('No shell option available for the active tab')
+  }
+
   test('starts with one tab', async ({ freshellPage, harness }) => {
     const tabCount = await harness.getTabCount()
     expect(tabCount).toBe(1)
@@ -145,5 +162,63 @@ test.describe('Tab Management', () => {
     const tabIdsAfter = stateAfter.tabs.tabs.map((t: any) => t.id)
     // Tab order should have changed
     expect(tabIdsAfter).not.toEqual(tabIdsBefore)
+  })
+
+  test('Ctrl+Shift+brackets follow reordered tab order from a focused terminal', async ({ freshellPage, page, harness, terminal }) => {
+    const addButton = page.locator('[data-context="tab-add"]')
+    await addButton.click()
+    await selectShellForActiveTab(page)
+    await addButton.click()
+    await selectShellForActiveTab(page)
+    await harness.waitForTabCount(3)
+    await harness.waitForTerminalStatus('running')
+
+    const stateBefore = await harness.getState()
+    const orderedBefore = stateBefore.tabs.tabs.map((tab: { id: string }) => tab.id)
+
+    const firstTab = page.locator('[data-context="tab"]').first()
+    const lastTab = page.locator('[data-context="tab"]').last()
+    const firstBox = await firstTab.boundingBox()
+    const lastBox = await lastTab.boundingBox()
+    expect(firstBox).toBeTruthy()
+    expect(lastBox).toBeTruthy()
+
+    await page.mouse.move(firstBox!.x + firstBox!.width / 2, firstBox!.y + firstBox!.height / 2)
+    await page.mouse.down()
+    await page.mouse.move(lastBox!.x + lastBox!.width / 2, lastBox!.y + lastBox!.height / 2, { steps: 10 })
+    await page.mouse.up()
+
+    await page.waitForFunction((before: string[]) => {
+      const state = window.__FRESHELL_TEST_HARNESS__?.getState()
+      if (!state) return false
+      const after = state.tabs.tabs.map((tab: { id: string }) => tab.id)
+      return JSON.stringify(after) !== JSON.stringify(before)
+    }, orderedBefore)
+
+    const reordered = await harness.getState()
+    const orderedIds = reordered.tabs.tabs.map((tab: { id: string }) => tab.id)
+    const startingActiveId = reordered.tabs.activeTabId as string
+    const startingIndex = orderedIds.indexOf(startingActiveId)
+    const expectedPrevIndex = (startingIndex - 1 + orderedIds.length) % orderedIds.length
+    const expectedPrevId = orderedIds[(startingIndex - 1 + orderedIds.length) % orderedIds.length]
+    const expectedNextId = orderedIds[(startingIndex + 1) % orderedIds.length]
+
+    await terminal.waitForTerminal(startingIndex)
+    await terminal.getTerminalContainer(startingIndex).click()
+    await expect(terminal.getTerminalInput(startingIndex)).toBeFocused()
+    await page.keyboard.press('Control+Shift+[')
+    await expect.poll(() => harness.getActiveTabId()).toBe(expectedPrevId)
+
+    await terminal.getTerminalContainer(expectedPrevIndex).click()
+    await page.keyboard.press('Control+Shift+]')
+    await expect.poll(() => harness.getActiveTabId()).toBe(startingActiveId)
+
+    await terminal.getTerminalContainer(startingIndex).click()
+    await page.keyboard.press('Control+Shift+]')
+    await expect.poll(() => harness.getActiveTabId()).toBe(expectedNextId)
+
+    // This test intentionally drives the terminal-focused path only.
+    // FreshClaude fallback coverage already exists in
+    // test/e2e/agent-chat-tab-shortcut-focus.test.tsx.
   })
 })

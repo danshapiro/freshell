@@ -1065,4 +1065,32 @@ describe('Tab Switching Keyboard Shortcuts', () => {
       textarea.remove()
     }
   })
+
+  it('does not re-handle a prevented tab-switch event from an xterm control', () => {
+    const store = createStoreWithTabs(3, 1) // active tab-2
+    renderApp(store)
+
+    const xtermTarget = document.createElement('textarea')
+    xtermTarget.className = 'xterm-helper-textarea'
+    document.body.appendChild(xtermTarget)
+
+    try {
+      xtermTarget.focus()
+
+      const event = new KeyboardEvent('keydown', {
+        bubbles: true,
+        cancelable: true,
+        code: 'BracketRight',
+        ctrlKey: true,
+        shiftKey: true,
+      })
+      event.preventDefault()
+
+      xtermTarget.dispatchEvent(event)
+
+      expect(store.getState().tabs.activeTabId).toBe('tab-2')
+    } finally {
+      xtermTarget.remove()
+    }
+  })
 })
