@@ -35,7 +35,7 @@ export type CodexTerminalActivity = CodexActivityRecord & {
   lastSeenTaskStartedAt?: number
   lastSeenTaskCompletedAt?: number
   lastSeenTurnAbortedAt?: number
-  lastSeenSessionUpdatedAt?: number
+  lastSeenSessionLastActivityAt?: number
   lastObservedAt: number
   parserState: TurnCompleteSignalParserState
 }
@@ -232,7 +232,7 @@ export class CodexActivityTracker extends EventEmitter {
       lastSeenTaskStartedAt: input.session?.codexTaskEvents?.latestTaskStartedAt,
       lastSeenTaskCompletedAt: input.session?.codexTaskEvents?.latestTaskCompletedAt,
       lastSeenTurnAbortedAt: input.session?.codexTaskEvents?.latestTurnAbortedAt,
-      lastSeenSessionUpdatedAt: input.session?.updatedAt,
+      lastSeenSessionLastActivityAt: input.session?.lastActivityAt,
       lastClearedAt: latestClearAt(input.session),
       parserState: createTurnCompleteSignalParserState(),
     }
@@ -333,7 +333,7 @@ export class CodexActivityTracker extends EventEmitter {
       const nextCompletedAt = session.codexTaskEvents?.latestTaskCompletedAt
       const nextTurnAbortedAt = session.codexTaskEvents?.latestTurnAbortedAt
       const clearedAt = maxDefined(nextCompletedAt, nextTurnAbortedAt)
-      state.lastSeenSessionUpdatedAt = maxDefined(state.lastSeenSessionUpdatedAt, session.updatedAt)
+      state.lastSeenSessionLastActivityAt = maxDefined(state.lastSeenSessionLastActivityAt, session.lastActivityAt)
 
       if (nextStartedAt !== undefined) {
         const isNewStart = state.lastSeenTaskStartedAt === undefined || nextStartedAt > state.lastSeenTaskStartedAt
@@ -500,7 +500,10 @@ export class CodexActivityTracker extends EventEmitter {
     state.lastSeenTaskStartedAt = maxDefined(state.lastSeenTaskStartedAt, startedAt)
     state.lastSeenTaskCompletedAt = maxDefined(state.lastSeenTaskCompletedAt, input.session?.codexTaskEvents?.latestTaskCompletedAt)
     state.lastSeenTurnAbortedAt = maxDefined(state.lastSeenTurnAbortedAt, input.session?.codexTaskEvents?.latestTurnAbortedAt)
-    state.lastSeenSessionUpdatedAt = maxDefined(state.lastSeenSessionUpdatedAt, input.session?.updatedAt)
+    state.lastSeenSessionLastActivityAt = maxDefined(
+      state.lastSeenSessionLastActivityAt,
+      input.session?.lastActivityAt,
+    )
     state.lastClearedAt = maxDefined(state.lastClearedAt, clearedAt)
 
     if (!isUnresolvedSession(input.session) || startedAt === undefined) {

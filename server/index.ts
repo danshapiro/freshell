@@ -570,7 +570,7 @@ async function main() {
       provider: 'claude',
       sessionId: session.sessionId,
       projectPath: session.projectPath,
-      updatedAt: session.updatedAt,
+      lastActivityAt: session.lastActivityAt,
       cwd: session.cwd,
     })
     if (!shouldAssociate) return
@@ -578,7 +578,7 @@ async function main() {
       provider: 'claude',
       sessionId: session.sessionId,
       projectPath: session.projectPath,
-      updatedAt: session.updatedAt,
+      lastActivityAt: session.lastActivityAt,
       cwd: session.cwd,
     })
     if (!result.associated || !result.terminalId) return

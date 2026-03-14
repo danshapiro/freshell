@@ -33,7 +33,7 @@ function createSession(overrides: Partial<CodingCliSession> = {}): CodingCliSess
     provider: 'codex',
     sessionId: 'codex-session-1',
     projectPath: '/repo/project',
-    updatedAt: 1_000,
+    lastActivityAt: 1_000,
     cwd: '/repo/project',
     ...overrides,
   }

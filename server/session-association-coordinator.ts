@@ -53,7 +53,7 @@ export class SessionAssociationCoordinator {
     const unassociated = this.registry.findUnassociatedTerminals(session.provider, cwd)
     if (unassociated.length === 0) return { associated: false }
 
-    const term = unassociated.find((candidate) => session.updatedAt >= candidate.createdAt - this.maxAssociationAgeMs)
+    const term = unassociated.find((candidate) => session.lastActivityAt >= candidate.createdAt - this.maxAssociationAgeMs)
     if (!term) return { associated: false }
 
     const bound = this.registry.bindSession(term.terminalId, session.provider, session.sessionId, 'association')
@@ -72,14 +72,14 @@ export class SessionAssociationCoordinator {
 
   private trackIfAdvanced(session: CodingCliSession): boolean {
     const key = makeSessionKey(session.provider, session.sessionId)
-    const next = this.normalizeUpdatedAt(session.updatedAt)
+    const next = this.normalizeLastActivityAt(session.lastActivityAt)
     const prev = this.watermarks.get(key)
     if (prev !== undefined && next <= prev) return false
     this.watermarks.set(key, next)
     return true
   }
 
-  private normalizeUpdatedAt(value: number): number {
+  private normalizeLastActivityAt(value: number): number {
     if (!Number.isFinite(value) || value <= 0) return 0
     return Math.floor(value)
   }

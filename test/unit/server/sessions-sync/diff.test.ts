@@ -10,7 +10,7 @@ describe('diffProjects', () => {
   it('upserts newly added projects', () => {
     const prev: ProjectGroup[] = []
     const next: ProjectGroup[] = [
-      pg('/p1', [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', updatedAt: 1 }]),
+      pg('/p1', [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', lastActivityAt: 1 }]),
     ]
 
     const diff = diffProjects(prev, next)
@@ -20,11 +20,11 @@ describe('diffProjects', () => {
 
   it('removes deleted projects', () => {
     const prev: ProjectGroup[] = [
-      pg('/p1', [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', updatedAt: 1 }]),
-      pg('/p2', [{ provider: 'claude', sessionId: 's2', projectPath: '/p2', updatedAt: 2 }]),
+      pg('/p1', [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', lastActivityAt: 1 }]),
+      pg('/p2', [{ provider: 'claude', sessionId: 's2', projectPath: '/p2', lastActivityAt: 2 }]),
     ]
     const next: ProjectGroup[] = [
-      pg('/p2', [{ provider: 'claude', sessionId: 's2', projectPath: '/p2', updatedAt: 2 }]),
+      pg('/p2', [{ provider: 'claude', sessionId: 's2', projectPath: '/p2', lastActivityAt: 2 }]),
     ]
 
     const diff = diffProjects(prev, next)
@@ -34,10 +34,10 @@ describe('diffProjects', () => {
 
   it('upserts projects when a session field changes', () => {
     const prev: ProjectGroup[] = [
-      pg('/p1', [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', updatedAt: 1, title: 'Old' }]),
+      pg('/p1', [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', lastActivityAt: 1, title: 'Old' }]),
     ]
     const next: ProjectGroup[] = [
-      pg('/p1', [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', updatedAt: 1, title: 'New' }]),
+      pg('/p1', [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', lastActivityAt: 1, title: 'New' }]),
     ]
 
     const diff = diffProjects(prev, next)
@@ -47,10 +47,10 @@ describe('diffProjects', () => {
 
   it('does not upsert unchanged projects', () => {
     const prev: ProjectGroup[] = [
-      pg('/p1', [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', updatedAt: 1 }], '#aaa'),
+      pg('/p1', [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', lastActivityAt: 1 }], '#aaa'),
     ]
     const next: ProjectGroup[] = [
-      pg('/p1', [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', updatedAt: 1 }], '#aaa'),
+      pg('/p1', [{ provider: 'claude', sessionId: 's1', projectPath: '/p1', lastActivityAt: 1 }], '#aaa'),
     ]
 
     const diff = diffProjects(prev, next)
@@ -64,7 +64,7 @@ describe('diffProjects', () => {
         provider: 'claude',
         sessionId: 's1',
         projectPath: '/p1',
-        updatedAt: 1,
+        lastActivityAt: 1,
         tokenUsage: {
           inputTokens: 10,
           outputTokens: 20,
@@ -79,7 +79,7 @@ describe('diffProjects', () => {
         provider: 'claude',
         sessionId: 's1',
         projectPath: '/p1',
-        updatedAt: 1,
+        lastActivityAt: 1,
         tokenUsage: {
           inputTokens: 10,
           outputTokens: 20,
@@ -103,7 +103,7 @@ describe('diffProjects', () => {
         provider: 'claude',
         sessionId: 's1',
         projectPath: '/p1',
-        updatedAt: 1,
+        lastActivityAt: 1,
         tokenUsage: {
           inputTokens: 10,
           outputTokens: 20,
@@ -117,7 +117,7 @@ describe('diffProjects', () => {
         provider: 'claude',
         sessionId: 's1',
         projectPath: '/p1',
-        updatedAt: 1,
+        lastActivityAt: 1,
         tokenUsage: {
           inputTokens: 11,
           outputTokens: 20,
@@ -138,7 +138,7 @@ describe('diffProjects', () => {
         provider: 'codex',
         sessionId: 's1',
         projectPath: '/p1',
-        updatedAt: 1,
+        lastActivityAt: 1,
         title: 'Deploy',
         sourceFile: '/tmp/a.jsonl',
       }]),
@@ -148,7 +148,7 @@ describe('diffProjects', () => {
         provider: 'codex',
         sessionId: 's1',
         projectPath: '/p1',
-        updatedAt: 1,
+        lastActivityAt: 1,
         title: 'Deploy',
         sourceFile: '/tmp/b.jsonl',
       }]),

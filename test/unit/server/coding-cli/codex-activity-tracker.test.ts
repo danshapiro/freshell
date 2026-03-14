@@ -16,7 +16,7 @@ function createSession(
     provider: 'codex',
     sessionId,
     projectPath: '/repo/project',
-    updatedAt: 1_000,
+    lastActivityAt: 1_000,
     cwd: '/repo/project',
     ...(codexTaskEvents ? { codexTaskEvents } : {}),
     ...overrides,
@@ -131,7 +131,7 @@ describe('CodexActivityTracker', () => {
     expect(tracker.getActivity('term-1')).toMatchObject({ phase: 'pending' })
 
     tracker.reconcileProjects(
-      createProjects(createSession('session-1', undefined, { updatedAt: 9_000 })),
+      createProjects(createSession('session-1', undefined, { lastActivityAt: 9_000 })),
       9_000,
     )
 
@@ -161,7 +161,7 @@ describe('CodexActivityTracker', () => {
     tracker.reconcileProjects(
       createProjects(createSession('session-1', {
         latestTaskStartedAt: 1_150,
-      }, { updatedAt: 9_000 })),
+      }, { lastActivityAt: 9_000 })),
       9_000,
     )
 
@@ -266,7 +266,7 @@ describe('CodexActivityTracker', () => {
       createProjects(createSession('session-1', {
         latestTaskStartedAt: 1_260,
         latestTaskCompletedAt: 1_250,
-      }, { updatedAt: 1_300 })),
+      }, { lastActivityAt: 1_300 })),
       1_300,
     )
 
@@ -389,7 +389,7 @@ describe('CodexActivityTracker', () => {
     tracker.reconcileProjects(
       createProjects(createSession('session-1', {
         latestTaskStartedAt: 1_150,
-      }, { updatedAt: 9_000 })),
+      }, { lastActivityAt: 9_000 })),
       9_000,
     )
 
@@ -475,7 +475,7 @@ describe('CodexActivityTracker', () => {
     })
     tracker.noteInput({ terminalId: 'term-1', data: '\r', at: 1_100 })
     tracker.reconcileProjects(
-      createProjects(createSession('session-1', { latestTaskStartedAt: 1_150 }, { updatedAt: 1_200 })),
+      createProjects(createSession('session-1', { latestTaskStartedAt: 1_150 }, { lastActivityAt: 1_200 })),
       1_200,
     )
 
@@ -484,7 +484,7 @@ describe('CodexActivityTracker', () => {
       createProjects(createSession('session-1', {
         latestTaskStartedAt: 1_150,
         latestTaskCompletedAt: 10_000,
-      }, { updatedAt: 10_050 })),
+      }, { lastActivityAt: 10_050 })),
       10_050,
     )
 
@@ -500,7 +500,7 @@ describe('CodexActivityTracker', () => {
       createProjects(createSession('session-1', {
         latestTaskStartedAt: 10_060,
         latestTaskCompletedAt: 10_000,
-      }, { updatedAt: 10_100 })),
+      }, { lastActivityAt: 10_100 })),
       10_100,
     )
 

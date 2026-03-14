@@ -7,7 +7,7 @@ function createSession(overrides: Partial<CodingCliSession> = {}): CodingCliSess
     provider: 'codex',
     sessionId: 'session-main',
     projectPath: '/repo/project',
-    updatedAt: 2_000,
+    lastActivityAt: 2_000,
     cwd: '/repo/project',
     ...overrides,
   }
@@ -22,9 +22,9 @@ describe('SessionAssociationCoordinator', () => {
     const coordinator = new SessionAssociationCoordinator(registry as any, 30_000)
 
     const sessions = [
-      createSession({ sessionId: 'session-main', updatedAt: 1 }),
-      createSession({ sessionId: 'session-subagent', updatedAt: 2, isSubagent: true }),
-      createSession({ sessionId: 'session-exec', updatedAt: 3, isNonInteractive: true }),
+      createSession({ sessionId: 'session-main', lastActivityAt: 1 }),
+      createSession({ sessionId: 'session-subagent', lastActivityAt: 2, isSubagent: true }),
+      createSession({ sessionId: 'session-exec', lastActivityAt: 3, isNonInteractive: true }),
     ]
 
     const candidates = coordinator.collectNewOrAdvanced([

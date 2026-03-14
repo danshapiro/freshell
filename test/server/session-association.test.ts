@@ -56,7 +56,7 @@ describe('SessionAssociationCoordinator integration', () => {
       provider: 'codex',
       sessionId: 'codex-session-abc-123',
       projectPath: '/home/user/project',
-      updatedAt: Date.now(),
+      lastActivityAt: Date.now(),
       cwd: '/home/user/project',
     })
 
@@ -86,7 +86,7 @@ describe('Session-Terminal metadata broadcasts', () => {
       provider: 'codex',
       sessionId: SESSION_ID_ONE,
       projectPath: '/home/user/project',
-      updatedAt: Date.now(),
+      lastActivityAt: Date.now(),
       cwd: '/home/user/project',
       gitBranch: 'feature/codex',
       isDirty: true,
@@ -168,7 +168,7 @@ describe('Session-Terminal metadata broadcasts', () => {
       provider: 'claude',
       sessionId: SESSION_ID_TWO,
       projectPath: '/home/user/project',
-      updatedAt: Date.now(),
+      lastActivityAt: Date.now(),
       cwd: '/home/user/project',
       gitBranch: 'feature/claude',
       isDirty: false,
@@ -227,7 +227,7 @@ describe('Session-Terminal metadata broadcasts', () => {
       provider: 'claude',
       sessionId: SESSION_ID_TWO,
       projectPath: '/home/user/project',
-      updatedAt: Date.now(),
+      lastActivityAt: Date.now(),
       cwd: '/home/user/project',
     }])
     await Promise.all(pending)
@@ -290,7 +290,7 @@ describe('Session-Terminal Association Integration', () => {
       provider: 'claude',
       sessionId: SESSION_ID_ONE,
       projectPath: '/home/user/project',
-      updatedAt: Date.now(),
+      lastActivityAt: Date.now(),
       cwd: '/home/user/project',
     }
     indexer['detectNewSessions']([newSession])
@@ -333,7 +333,7 @@ describe('Session-Terminal Association Integration', () => {
       provider: 'claude',
       sessionId: SESSION_ID_TWO,
       projectPath: '/home/user/project',
-      updatedAt: Date.now(),
+      lastActivityAt: Date.now(),
       cwd: '/home/user/project',
     }])
 
@@ -374,7 +374,7 @@ describe('Session-Terminal Association Integration', () => {
       provider: 'claude',
       sessionId: SESSION_ID_TWO,
       projectPath: '/home/user/project',
-      updatedAt: Date.now(),
+      lastActivityAt: Date.now(),
       cwd: '/home/user/project',
     }])
 
@@ -418,7 +418,7 @@ describe('Session-Terminal Association Integration', () => {
       provider: 'claude',
       sessionId: SESSION_ID_ONE,
       projectPath: '/home/user/project',
-      updatedAt: Date.now(),
+      lastActivityAt: Date.now(),
       cwd: '/home/user/project',
     }])
 
@@ -431,7 +431,7 @@ describe('Session-Terminal Association Integration', () => {
       provider: 'claude',
       sessionId: SESSION_ID_THREE,
       projectPath: '/home/user/project',
-      updatedAt: Date.now(),
+      lastActivityAt: Date.now(),
       cwd: '/home/user/project',
     }])
 
@@ -474,7 +474,7 @@ describe('Session-Terminal Association Integration', () => {
       provider: 'claude',
       sessionId: SESSION_ID_FOUR,
       projectPath: '/home/user/project',
-      updatedAt: Date.now(),
+      lastActivityAt: Date.now(),
       cwd: '/home/user/project',
     }])
 
@@ -512,7 +512,7 @@ describe('Session-Terminal Association Integration', () => {
       provider: 'claude',
       sessionId: SESSION_ID_FIVE,
       projectPath: '/home/user/project',
-      updatedAt: Date.now(),
+      lastActivityAt: Date.now(),
       cwd: undefined,
     }])
 
@@ -548,7 +548,7 @@ describe('Session-Terminal Association Integration', () => {
       provider: 'claude',
       sessionId: SESSION_ID_SIX,
       projectPath: '/home/user/project',
-      updatedAt: Date.now(),
+      lastActivityAt: Date.now(),
       cwd: '/home/user/project',
     }])
 
@@ -590,7 +590,7 @@ describe('Session-Terminal Association Platform-specific', () => {
       provider: 'claude',
       sessionId: SESSION_ID_SEVEN,
       projectPath: '/home/user/project/',
-      updatedAt: Date.now(),
+      lastActivityAt: Date.now(),
       cwd: '/home/user/project/',
     }])
 
@@ -631,7 +631,7 @@ describe('Session-Terminal Association Platform-specific', () => {
       provider: 'claude',
       sessionId: SESSION_ID_EIGHT,
       projectPath: '/home/user/project',
-      updatedAt: Date.now(),
+      lastActivityAt: Date.now(),
       cwd: '/home/user/project',
     }])
 
@@ -664,7 +664,7 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
         if (unassociated.length === 0) continue
 
         const term = unassociated[0]
-        if (session.updatedAt < term.createdAt - ASSOCIATION_MAX_AGE_MS) continue
+        if (session.lastActivityAt < term.createdAt - ASSOCIATION_MAX_AGE_MS) continue
 
         const associated = registry.setResumeSessionId(term.terminalId, session.sessionId)
         if (!associated) continue
@@ -691,7 +691,7 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
         provider: 'codex',
         sessionId: 'codex-session-abc-123',
         projectPath: '/home/user/project',
-        updatedAt: Date.now(),
+        lastActivityAt: Date.now(),
         cwd: '/home/user/project',
       }],
     }], broadcasts)
@@ -719,7 +719,7 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
         provider: 'codex' as const,
         sessionId: 'codex-session-abc-123',
         projectPath: '/home/user/project',
-        updatedAt: Date.now(),
+        lastActivityAt: Date.now(),
         cwd: '/home/user/project',
       }],
     }]
@@ -748,7 +748,7 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
         provider: 'codex' as const,
         sessionId: 'codex-session-abc-123',
         projectPath: '/home/user/project',
-        updatedAt: Date.now(),
+        lastActivityAt: Date.now(),
         cwd: '/home/user/project',
       }],
     }]
@@ -777,7 +777,7 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
         provider: 'codex',
         sessionId: 'codex-session-abc-123',
         projectPath: '/home/user/project',
-        updatedAt: Date.now(),
+        lastActivityAt: Date.now(),
         cwd: '/home/user/project',
       }],
     }], broadcasts)
@@ -800,7 +800,7 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
         provider: 'codex',
         sessionId: 'codex-session-abc-123',
         projectPath: '/home/user/project',
-        updatedAt: Date.now(),
+        lastActivityAt: Date.now(),
         cwd: '/home/user/project',
       }],
     }], broadcasts)
@@ -825,7 +825,7 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
         provider: 'opencode',
         sessionId: 'opencode-session-123',
         projectPath: '/home/user/project',
-        updatedAt: Date.now(),
+        lastActivityAt: Date.now(),
         cwd: '/home/user/project',
       }],
     }], broadcasts)
@@ -849,7 +849,7 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
         provider: 'gemini',
         sessionId: 'gemini-session-123',
         projectPath: '/home/user/project',
-        updatedAt: Date.now(),
+        lastActivityAt: Date.now(),
         cwd: '/home/user/project',
       }],
     }], broadcasts)
@@ -872,7 +872,7 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
         provider: 'claude',
         sessionId: SESSION_ID_ONE,
         projectPath: '/home/user/project',
-        updatedAt: Date.now(),
+        lastActivityAt: Date.now(),
         cwd: '/home/user/project',
       }],
     }], broadcasts)
@@ -896,7 +896,7 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
         provider: 'codex',
         sessionId: 'different-session',
         projectPath: '/home/user/project',
-        updatedAt: Date.now(),
+        lastActivityAt: Date.now(),
         cwd: '/home/user/project',
       }],
     }], broadcasts)
@@ -920,7 +920,7 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
         provider: 'codex',
         sessionId: 'old-stale-session',
         projectPath: '/home/user/project',
-        updatedAt: hoursAgo,
+        lastActivityAt: hoursAgo,
         cwd: '/home/user/project',
       }],
     }], broadcasts)
@@ -944,7 +944,7 @@ describe('Codex Session-Terminal Association via onUpdate', () => {
         provider: 'codex',
         sessionId: 'matching-session',
         projectPath: '/home/user/project',
-        updatedAt: shortly,
+        lastActivityAt: shortly,
         cwd: '/home/user/project',
       }],
     }], broadcasts)
