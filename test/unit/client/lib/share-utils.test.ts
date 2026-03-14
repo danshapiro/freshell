@@ -42,4 +42,19 @@ describe('getShareAction', () => {
 
     expect(action).toEqual({ type: 'wizard', initialStep: 2 })
   })
+
+  it('returns the share panel when WSL remote access was requested but reachability is still unknown', () => {
+    const action = getShareAction({
+      configured: true,
+      host: '0.0.0.0',
+      remoteAccessEnabled: false,
+      remoteAccessRequested: true,
+      firewall: {
+        platform: 'wsl2',
+        portOpen: null,
+      },
+    })
+
+    expect(action).toEqual({ type: 'panel' })
+  })
 })

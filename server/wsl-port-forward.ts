@@ -471,8 +471,19 @@ function normalizeScriptForElevatedPowerShell(script: string): string {
   return script.replace(/\\\$/g, '$')
 }
 
+function getLegacyOwnedPortProxyPorts(
+  requiredPorts: number[],
+  knownOwnedPorts: number[],
+  existingRules: Map<number, PortProxyRule>,
+): number[] {
+  const requiredPortSet = new Set(requiredPorts)
+  return normalizeManagedPorts(knownOwnedPorts)
+    .filter((port) => !requiredPortSet.has(port) && existingRules.has(port))
+}
+
 function buildWslPortForwardingPlan(
   requiredPorts: number[],
+  knownOwnedPorts: number[],
   wslIp: string,
   existingRules: Map<number, PortProxyRule>,
   existingFirewallPorts: Set<number>,
@@ -481,7 +492,10 @@ function buildWslPortForwardingPlan(
   const requiredPortSet = new Set(requiredPorts)
   const staleOwnedPorts = Array.from(new Set([...existingFirewallPorts, ...managedPorts]))
     .filter((port) => !requiredPortSet.has(port))
-  const staleOwnedPortProxyPorts = staleOwnedPorts.filter((port) => existingRules.has(port))
+  const staleOwnedPortProxyPorts = Array.from(new Set([
+    ...staleOwnedPorts.filter((port) => existingRules.has(port)),
+    ...getLegacyOwnedPortProxyPorts(requiredPorts, knownOwnedPorts, existingRules),
+  ]))
   const portsNeedUpdate = needsPortForwardingUpdate(wslIp, requiredPorts, existingRules)
     || staleOwnedPortProxyPorts.length > 0
   const firewallNeedsUpdate = needsFirewallUpdate(requiredPorts, existingFirewallPorts)
@@ -495,7 +509,12 @@ function buildWslPortForwardingPlan(
   }
 
   const scriptKind = portsNeedUpdate ? 'full' : 'firewall-only'
-  const cleanupPorts = Array.from(new Set([...requiredPorts, ...managedPorts, ...existingFirewallPorts]))
+  const cleanupPorts = Array.from(new Set([
+    ...requiredPorts,
+    ...managedPorts,
+    ...existingFirewallPorts,
+    ...staleOwnedPortProxyPorts,
+  ]))
   const script = scriptKind === 'full'
     ? buildPortForwardingScript(wslIp, requiredPorts, cleanupPorts)
     : buildFirewallOnlyScript(requiredPorts)
@@ -510,11 +529,17 @@ function buildWslPortForwardingPlan(
 
 function buildWslPortForwardingTeardownPlan(
   requiredPorts: number[],
+  knownOwnedPorts: number[],
   existingRules: Map<number, PortProxyRule>,
   existingFirewallPorts: Set<number>,
   managedPorts: Set<number>,
 ): WslPortForwardingTeardownPlan {
-  const teardownPorts = Array.from(new Set([...requiredPorts, ...existingFirewallPorts, ...managedPorts]))
+  const teardownPorts = Array.from(new Set([
+    ...requiredPorts,
+    ...existingFirewallPorts,
+    ...managedPorts,
+    ...getLegacyOwnedPortProxyPorts([], knownOwnedPorts, existingRules),
+  ]))
   const hasRelevantPortProxyRules = teardownPorts.some((port) => existingRules.has(port))
   const hasFreshellFirewallRule = existingFirewallPorts.size > 0
 
@@ -528,7 +553,10 @@ function buildWslPortForwardingTeardownPlan(
   }
 }
 
-export function computeWslPortForwardingPlan(requiredPorts: number[]): WslPortForwardingPlan {
+export function computeWslPortForwardingPlan(
+  requiredPorts: number[],
+  knownOwnedPorts: number[] = requiredPorts,
+): WslPortForwardingPlan {
   if (!isWSL2()) {
     return { status: 'not-wsl2' }
   }
@@ -545,10 +573,20 @@ export function computeWslPortForwardingPlan(requiredPorts: number[]): WslPortFo
   const existingFirewallPorts = getExistingFirewallPorts()
   const managedPorts = readManagedWslRemoteAccessPorts()
 
-  return buildWslPortForwardingPlan(requiredPorts, wslIp, existingRules, existingFirewallPorts, managedPorts)
+  return buildWslPortForwardingPlan(
+    requiredPorts,
+    knownOwnedPorts,
+    wslIp,
+    existingRules,
+    existingFirewallPorts,
+    managedPorts,
+  )
 }
 
-export async function computeWslPortForwardingPlanAsync(requiredPorts: number[]): Promise<WslPortForwardingPlan> {
+export async function computeWslPortForwardingPlanAsync(
+  requiredPorts: number[],
+  knownOwnedPorts: number[] = requiredPorts,
+): Promise<WslPortForwardingPlan> {
   if (!isWSL2()) {
     return { status: 'not-wsl2' }
   }
@@ -574,10 +612,20 @@ export async function computeWslPortForwardingPlanAsync(requiredPorts: number[])
     }
   }
 
-  return buildWslPortForwardingPlan(requiredPorts, wslIp, existingRules, existingFirewallPorts, managedPorts)
+  return buildWslPortForwardingPlan(
+    requiredPorts,
+    knownOwnedPorts,
+    wslIp,
+    existingRules,
+    existingFirewallPorts,
+    managedPorts,
+  )
 }
 
-export function computeWslPortForwardingTeardownPlan(requiredPorts: number[]): WslPortForwardingTeardownPlan {
+export function computeWslPortForwardingTeardownPlan(
+  requiredPorts: number[],
+  knownOwnedPorts: number[] = requiredPorts,
+): WslPortForwardingTeardownPlan {
   if (!isWSL2()) {
     return { status: 'not-wsl2' }
   }
@@ -586,11 +634,18 @@ export function computeWslPortForwardingTeardownPlan(requiredPorts: number[]): W
   const existingFirewallPorts = getExistingFirewallPorts()
   const managedPorts = readManagedWslRemoteAccessPorts()
 
-  return buildWslPortForwardingTeardownPlan(requiredPorts, existingRules, existingFirewallPorts, managedPorts)
+  return buildWslPortForwardingTeardownPlan(
+    requiredPorts,
+    knownOwnedPorts,
+    existingRules,
+    existingFirewallPorts,
+    managedPorts,
+  )
 }
 
 export async function computeWslPortForwardingTeardownPlanAsync(
   requiredPorts: number[],
+  knownOwnedPorts: number[] = requiredPorts,
 ): Promise<WslPortForwardingTeardownPlan> {
   if (!isWSL2()) {
     return { status: 'not-wsl2' }
@@ -609,5 +664,11 @@ export async function computeWslPortForwardingTeardownPlanAsync(
     }
   }
 
-  return buildWslPortForwardingTeardownPlan(requiredPorts, existingRules, existingFirewallPorts, managedPorts)
+  return buildWslPortForwardingTeardownPlan(
+    requiredPorts,
+    knownOwnedPorts,
+    existingRules,
+    existingFirewallPorts,
+    managedPorts,
+  )
 }

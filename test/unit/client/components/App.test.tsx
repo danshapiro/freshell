@@ -391,6 +391,38 @@ describe('App Component - Share Button', () => {
     expect(screen.getByTestId('mock-setup-wizard').dataset.initialStep).toBe('2')
   })
 
+  it('shows the share panel instead of the wizard when WSL remote access was requested but reachability is still unknown', async () => {
+    const store = createTestStore()
+    const wslReachabilityUnknownStatus = makeNetworkStatus({
+      configured: true,
+      host: '0.0.0.0',
+      remoteAccessEnabled: false,
+      remoteAccessRequested: true,
+      accessUrl: 'http://192.168.1.100:3001',
+      firewall: { platform: 'wsl2', active: true, portOpen: null, commands: [], configuring: false },
+    } as any)
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/settings') return Promise.resolve(defaultSettings)
+      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/version') return Promise.resolve(makeVersionInfo())
+      if (typeof url === 'string' && url.startsWith('/api/sessions')) return Promise.resolve([])
+      if (url === '/api/network/status') return Promise.resolve(wslReachabilityUnknownStatus)
+      return Promise.resolve({})
+    })
+    act(() => {
+      store.dispatch(setNetworkStatus(wslReachabilityUnknownStatus))
+    })
+
+    renderApp(store)
+    await openShareFromSettings()
+
+    await waitFor(() => {
+      expect(screen.getByText('Share Access')).toBeInTheDocument()
+      expect(screen.getByText('http://192.168.1.100:3001/?token=test-token-abc123')).toBeInTheDocument()
+    })
+    expect(screen.queryByTestId('mock-setup-wizard')).not.toBeInTheDocument()
+  })
+
   it('shows share panel with access URL when configured with remote access', async () => {
     const store = createTestStore()
     act(() => {

@@ -598,6 +598,48 @@ Address         Port        Address         Port
         expect(plan.script).not.toContain('localport=3001,5173')
       }
     })
+
+    it('returns a full repair plan when stale legacy Freshell portproxy-only drift remains on an internal port', async () => {
+      vi.mocked(isWSL2).mockReturnValue(true)
+      vi.mocked(execFile).mockImplementation((cmd: any, args: any, _opts: any, cb: any) => {
+        if (cmd === 'ip') {
+          cb?.(null, 'inet 172.30.149.249/20 scope global eth0\n', '')
+          return {} as any
+        }
+
+        if (args[0] === 'interface') {
+          cb?.(null, `
+Listen on ipv4:             Connect to ipv4:
+
+Address         Port        Address         Port
+--------------- ----------  --------------- ----------
+0.0.0.0         3001        172.30.149.249  3001
+0.0.0.0         5173        172.30.149.249  5173
+0.0.0.0         8080        10.0.0.8       8080
+`, '')
+          return {} as any
+        }
+
+        const missingRuleError = Object.assign(new Error('rule not found'), { code: 1 })
+        cb?.(missingRuleError, 'Aucune regle ne correspond aux criteres specifies.\r\n', '')
+        return {} as any
+      })
+
+      const plan = await (computeWslPortForwardingPlanAsync as any)([5173], [3001, 5173])
+      expect(plan).toEqual({
+        status: 'ready',
+        wslIp: '172.30.149.249',
+        scriptKind: 'full',
+        script: expect.stringContaining('listenport=3001'),
+      })
+      if (plan.status === 'ready') {
+        expect(plan.script).toContain('listenport=3001')
+        expect(plan.script).toContain('listenport=5173')
+        expect(plan.script).not.toContain('listenport=8080')
+        expect(plan.script).not.toContain('connectport=3001')
+        expect(plan.script).toContain('connectport=5173')
+      }
+    })
   })
 
   describe('buildPortForwardingTeardownScript', () => {
@@ -712,6 +754,38 @@ Address         Port        Address         Port
       })
       if (plan.status === 'ready') {
         expect(plan.script).toContain('listenport=3001')
+        expect(plan.script).not.toContain('listenport=8080')
+      }
+    })
+
+    it('tears down stale legacy Freshell portproxy-only drift on internal ports without deleting unrelated Windows rules', async () => {
+      vi.mocked(isWSL2).mockReturnValue(true)
+      vi.mocked(execFile).mockImplementation((_cmd: any, args: any, _opts: any, cb: any) => {
+        if (args[0] === 'interface') {
+          cb?.(null, `
+Listen on ipv4:             Connect to ipv4:
+
+Address         Port        Address         Port
+--------------- ----------  --------------- ----------
+0.0.0.0         3001        172.30.149.249  3001
+0.0.0.0         8080        10.0.0.8       8080
+`, '')
+          return {} as any
+        }
+
+        const missingRuleError = Object.assign(new Error('rule not found'), { code: 1 })
+        cb?.(missingRuleError, 'Aucune regle ne correspond aux criteres specifies.\r\n', '')
+        return {} as any
+      })
+
+      const plan = await (computeWslPortForwardingTeardownPlanAsync as any)([5173], [3001, 5173])
+      expect(plan).toEqual({
+        status: 'ready',
+        script: expect.stringContaining('listenport=3001'),
+      })
+      if (plan.status === 'ready') {
+        expect(plan.script).toContain('listenport=3001')
+        expect(plan.script).toContain('listenport=5173')
         expect(plan.script).not.toContain('listenport=8080')
       }
     })

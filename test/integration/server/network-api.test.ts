@@ -289,7 +289,7 @@ describe('Network API integration', () => {
       }
     })
 
-    it('prompts for Windows cleanup when a stale dev-mode API-port rule remains from the old contract', async () => {
+    it('prompts for Windows cleanup and current-port opening when a stale dev-mode API-port rule remains from the old contract', async () => {
       const cp = await import('node:child_process')
       const devConfigStore = new ConfigStore()
       const devServer = http.createServer()
@@ -316,7 +316,7 @@ describe('Network API integration', () => {
         platform: 'windows',
         active: true,
       })
-      vi.mocked(isPortReachable).mockImplementation(async (port) => port === 5173)
+      vi.mocked(isPortReachable).mockResolvedValue(false)
       vi.mocked(cp.execFile).mockImplementation((cmd: any, args: any, _opts: any, cb: any) => {
         if (cmd === 'netsh' && args.at(-1) === 'name=Freshell (port 3001)') {
           cb?.(null, 'Rule Name: Freshell (port 3001)\n', '')

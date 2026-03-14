@@ -242,11 +242,10 @@ export class NetworkManager {
     if (
       remoteAccessRequested
       && effectiveHost === '0.0.0.0'
-      && rawPortOpen === true
       && legacyDevUpgradePorts.length > 0
     ) {
       if (firewallInfo.platform === 'wsl2') {
-        const wslPlan = await computeWslPortForwardingPlanAsync(remoteAccessPorts)
+        const wslPlan = await computeWslPortForwardingPlanAsync(remoteAccessPorts, this.getRelevantPorts())
         staleUpgradeExposure = wslPlan.status === 'ready'
       } else if (firewallInfo.platform === 'windows' && firewallInfo.active) {
         existingManagedWindowsPorts = await getExistingManagedWindowsFirewallPorts(this.getRelevantPorts())
@@ -264,9 +263,15 @@ export class NetworkManager {
     const remoteAccessEnabled = firewallInfo.platform === 'wsl2'
       ? rawPortOpen === true
       : remoteAccessRequested
+    const shareRouteEnabled = remoteAccessEnabled
+      || (
+        firewallInfo.platform === 'wsl2'
+        && remoteAccessRequested
+        && rawPortOpen === null
+      )
 
     const token = process.env.AUTH_TOKEN ?? ''
-    const accessHost = remoteAccessEnabled
+    const accessHost = shareRouteEnabled
       ? (this.lanIps[0] ?? 'localhost')
       : 'localhost'
     const accessPort = this.devMode && this.devPort ? this.devPort : this.port

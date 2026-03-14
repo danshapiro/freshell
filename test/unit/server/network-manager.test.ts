@@ -159,6 +159,33 @@ describe('NetworkManager', () => {
     expect(status.accessUrl).not.toContain('192.168.1.100')
   })
 
+  it('keeps the LAN share URL when WSL reachability checks fail but remote access is still requested', async () => {
+    const firewallModule = await import('../../../server/firewall.js')
+    const portReachable = await import('is-port-reachable')
+    vi.mocked(firewallModule.detectFirewall).mockResolvedValue({
+      platform: 'wsl2',
+      active: true,
+    })
+    vi.mocked(portReachable.default).mockRejectedValue(new Error('probe failed'))
+    mockConfigStore = createMockConfigStore({
+      network: {
+        host: '0.0.0.0',
+        configured: true,
+      },
+    })
+    manager = new NetworkManager(server, mockConfigStore, testPort)
+    await new Promise<void>((resolve) => server.listen(testPort, '0.0.0.0', resolve))
+
+    const status = await manager.getStatus()
+
+    expect(status.host).toBe('0.0.0.0')
+    expect(status.remoteAccessEnabled).toBe(false)
+    expect((status as any).remoteAccessRequested).toBe(true)
+    expect(status.firewall.portOpen).toBeNull()
+    expect(status.accessUrl).toContain('192.168.1.100')
+    expect(status.accessUrl).not.toContain('localhost')
+  })
+
   it('reports stale WSL LAN exposure as still remotely accessible until teardown completes', async () => {
     const firewallModule = await import('../../../server/firewall.js')
     const portReachable = await import('is-port-reachable')
@@ -336,6 +363,47 @@ describe('NetworkManager', () => {
       active: true,
     })
     vi.mocked(portReachable.default).mockImplementation(async (port) => port === 5173)
+    vi.mocked(execFile).mockImplementation((_cmd: any, args: any, _opts: any, cb: any) => {
+      const ruleNameArg = args.at(-1)
+      if (ruleNameArg === 'name=Freshell (port 9876)') {
+        cb?.(null, 'Rule Name: Freshell (port 9876)\n', '')
+        return {} as any
+      }
+      cb?.(Object.assign(new Error('rule not found'), { code: 1 }), '', '')
+      return {} as any
+    })
+    mockConfigStore = createMockConfigStore({
+      network: {
+        host: '0.0.0.0',
+        configured: true,
+      },
+    })
+    manager = new NetworkManager(server, mockConfigStore, 9876, true, 5173)
+    await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+
+    const status = await manager.getStatus()
+
+    expect(status.remoteAccessEnabled).toBe(true)
+    expect(status.firewall.portOpen).toBe(false)
+    expect(status.firewall.commands).toContain(
+      'netsh advfirewall firewall delete rule name="Freshell (port 9876)" 2>$null',
+    )
+    expect(status.firewall.commands).toContain(
+      'netsh advfirewall firewall add rule name="Freshell (port 5173)" dir=in action=allow protocol=TCP localport=5173 profile=private',
+    )
+    expect(status.firewall.commands).not.toContain(
+      'netsh advfirewall firewall add rule name="Freshell (port 9876)" dir=in action=allow protocol=TCP localport=9876 profile=private',
+    )
+  })
+
+  it('builds cleanup commands for stale native Windows dev-mode API-port rules while reopening the advertised Vite port', async () => {
+    const firewallModule = await import('../../../server/firewall.js')
+    const portReachable = await import('is-port-reachable')
+    vi.mocked(firewallModule.detectFirewall).mockResolvedValue({
+      platform: 'windows',
+      active: true,
+    })
+    vi.mocked(portReachable.default).mockResolvedValue(false)
     vi.mocked(execFile).mockImplementation((_cmd: any, args: any, _opts: any, cb: any) => {
       const ruleNameArg = args.at(-1)
       if (ruleNameArg === 'name=Freshell (port 9876)') {

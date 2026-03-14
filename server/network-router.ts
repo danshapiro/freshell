@@ -248,7 +248,10 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
         return { kind: 'none', response: NO_CONFIGURATION_CHANGES_REQUIRED }
       }
 
-      const plan = await computeWslPortForwardingPlanAsync(networkManager.getRemoteAccessPorts())
+      const plan = await computeWslPortForwardingPlanAsync(
+        networkManager.getRemoteAccessPorts(),
+        networkManager.getRelevantPorts(),
+      )
       if (plan.status === 'error') {
         return { kind: 'error', error: plan.message }
       }
@@ -299,7 +302,10 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
     }
 
     const remoteAccessRequested = isRemoteAccessEnabled(settings.network, status.host, status.firewall.platform)
-    const teardownPlan = await computeWslPortForwardingTeardownPlanAsync(networkManager.getRemoteAccessPorts())
+    const teardownPlan = await computeWslPortForwardingTeardownPlanAsync(
+      networkManager.getRemoteAccessPorts(),
+      networkManager.getRelevantPorts(),
+    )
 
     if (teardownPlan.status === 'error') {
       return { kind: 'error', error: teardownPlan.message }
@@ -325,7 +331,10 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
   }
 
   const verifyWslRepairSuccess = async () => {
-    const plan = await computeWslPortForwardingPlanAsync(networkManager.getRemoteAccessPorts())
+    const plan = await computeWslPortForwardingPlanAsync(
+      networkManager.getRemoteAccessPorts(),
+      networkManager.getRelevantPorts(),
+    )
     if (plan.status === 'error') {
       throw new Error(plan.message)
     }
@@ -335,7 +344,10 @@ export function createNetworkRouter(deps: NetworkRouterDeps): Router {
   }
 
   const verifyWslDisableSuccess = async () => {
-    const teardownPlan = await computeWslPortForwardingTeardownPlanAsync(networkManager.getRemoteAccessPorts())
+    const teardownPlan = await computeWslPortForwardingTeardownPlanAsync(
+      networkManager.getRemoteAccessPorts(),
+      networkManager.getRelevantPorts(),
+    )
     if (teardownPlan.status === 'error') {
       throw new Error(teardownPlan.message)
     }

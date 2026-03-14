@@ -21,15 +21,34 @@ export function isRemoteAccessEnabledStatus(
   return status.remoteAccessEnabled ?? status.host === '0.0.0.0'
 }
 
+function isWslRemoteAccessReachabilityUnknown(
+  status: {
+    host: string
+    remoteAccessRequested?: boolean
+    firewall?: { platform?: string; portOpen?: boolean | null }
+  },
+): boolean {
+  return status.host === '0.0.0.0'
+    && status.remoteAccessRequested === true
+    && status.firewall?.platform === 'wsl2'
+    && status.firewall.portOpen === null
+}
+
 export function getShareAction(
-  status: { configured: boolean; host: string; remoteAccessEnabled?: boolean } | null,
+  status: {
+    configured: boolean
+    host: string
+    remoteAccessEnabled?: boolean
+    remoteAccessRequested?: boolean
+    firewall?: { platform?: string; portOpen?: boolean | null }
+  } | null,
 ): ShareAction {
   // When network status hasn't loaded yet, return loading to prevent
   // incorrectly routing already-configured users to the setup wizard
   // (network status is fetched asynchronously on app load).
   if (status === null) return { type: 'loading' }
 
-  if (isRemoteAccessEnabledStatus(status)) {
+  if (isRemoteAccessEnabledStatus(status) || isWslRemoteAccessReachabilityUnknown(status)) {
     // Remote access is active — show the share panel (QR code, URL, etc.)
     // regardless of whether the user ran the wizard.
     return { type: 'panel' }
