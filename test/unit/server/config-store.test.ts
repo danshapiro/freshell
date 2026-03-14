@@ -377,6 +377,90 @@ describe('ConfigStore', () => {
       const config2 = await store.load()
       expect(config2).toBe(config1) // Same reference
     })
+
+    it('does not let a normalization save overwrite a later patchSettings write', async () => {
+      await fsp.mkdir(configDir, { recursive: true })
+      await fsp.writeFile(
+        configPath,
+        JSON.stringify({
+          version: 1,
+          settings: {
+            ...defaultSettings,
+            theme: 'dark',
+          },
+          sessionOverrides: {},
+          terminalOverrides: {},
+          projectColors: {},
+        }, null, 2),
+      )
+
+      const store = new ConfigStore()
+      const originalSaveInternal = (store as any).saveInternal.bind(store)
+      let resolveNormalizationWriteStarted!: () => void
+      const normalizationWriteStarted = new Promise<void>((resolve) => {
+        resolveNormalizationWriteStarted = resolve
+      })
+      let releaseNormalizationWrite!: () => void
+      const saveInternalSpy = vi.spyOn(store as any, 'saveInternal').mockImplementation(async (cfg: UserConfig) => {
+        if (cfg.legacyLocalSettingsSeed && cfg.settings.logging.debug === defaultSettings.logging.debug) {
+          resolveNormalizationWriteStarted()
+          await new Promise<void>((resolve) => {
+            releaseNormalizationWrite = resolve
+          })
+        }
+
+        return originalSaveInternal(cfg)
+      })
+
+      const loadPromise = store.load()
+      await normalizationWriteStarted
+      let patchSettled = false
+      const patchPromise = store.patchSettings({ logging: { debug: false } }).then(() => {
+        patchSettled = true
+      })
+      await Promise.resolve()
+      expect(patchSettled).toBe(false)
+      releaseNormalizationWrite()
+      await patchPromise
+      await loadPromise
+
+      const saved = JSON.parse(await fsp.readFile(configPath, 'utf-8'))
+      expect(saved.settings.logging.debug).toBe(false)
+
+      saveInternalSpy.mockRestore()
+    })
+
+    it('returns normalized config when persisting normalization fails on read', async () => {
+      await fsp.mkdir(configDir, { recursive: true })
+      await fsp.writeFile(
+        configPath,
+        JSON.stringify({
+          version: 1,
+          settings: {
+            ...defaultSettings,
+            theme: 'dark',
+          },
+          sessionOverrides: {},
+          terminalOverrides: {},
+          projectColors: {},
+        }, null, 2),
+      )
+
+      const store = new ConfigStore()
+      const err = new Error('EACCES: permission denied') as NodeJS.ErrnoException
+      err.code = 'EACCES'
+      const saveInternalSpy = vi.spyOn(store as any, 'saveInternal').mockRejectedValueOnce(err)
+
+      const loaded = await store.load()
+
+      expect(loaded.legacyLocalSettingsSeed).toEqual({ theme: 'dark' })
+      expect((loaded.settings as Record<string, unknown>).theme).toBeUndefined()
+
+      const raw = JSON.parse(await fsp.readFile(configPath, 'utf-8'))
+      expect(raw.settings.theme).toBe('dark')
+
+      saveInternalSpy.mockRestore()
+    })
   })
 
   describe('save()', () => {

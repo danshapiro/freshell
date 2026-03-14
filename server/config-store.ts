@@ -302,7 +302,7 @@ export class ConfigStore {
     }
   }
 
-  async load(): Promise<UserConfig> {
+  private async loadInternal(options: { persistNormalizedConfig: boolean }): Promise<UserConfig> {
     if (this.cache) return this.cache
     await ensureConfigTmpCleanup()
     const { config: existing, error } = await readConfigFile()
@@ -335,15 +335,22 @@ export class ConfigStore {
           : [],
       }
 
-      this.cache = normalized
       const shouldPersistNormalizedConfig =
         JSON.stringify(existing.settings) !== JSON.stringify(settings)
         || JSON.stringify(existing.legacyLocalSettingsSeed) !== JSON.stringify(legacyLocalSettingsSeed)
-      if (shouldPersistNormalizedConfig) {
-        await this.saveInternal(normalized)
+      this.cache = normalized
+      if (options.persistNormalizedConfig && shouldPersistNormalizedConfig) {
+        try {
+          await this.saveInternal(normalized)
+        } catch (err) {
+          logger.warn(
+            { err, event: 'config_normalize_persist_failed', filePath: configPath() },
+            'Failed to persist normalized config; using in-memory normalized config'
+          )
+        }
       }
 
-      return this.cache
+      return this.cache ?? normalized
     }
 
     // Initial config file creation - no mutex needed here since:
@@ -364,8 +371,23 @@ export class ConfigStore {
     return this.cache
   }
 
+  async load(): Promise<UserConfig> {
+    if (this.cache) return this.cache
+    return this.writeMutex.acquire(async () => {
+      if (this.cache) return this.cache
+      return this.loadInternal({ persistNormalizedConfig: true })
+    })
+  }
+
+  private async loadForWrite(): Promise<UserConfig> {
+    if (this.cache) return this.cache
+    return this.loadInternal({ persistNormalizedConfig: false })
+  }
+
   async save(cfg: UserConfig) {
-    await this.saveInternal(cfg)
+    await this.writeMutex.acquire(async () => {
+      await this.saveInternal(cfg)
+    })
   }
 
   /**
@@ -395,7 +417,7 @@ export class ConfigStore {
 
   async patchSettings(patch: AppSettingsPatch): Promise<AppSettings> {
     return this.writeMutex.acquire(async () => {
-      const cfg = await this.load()
+      const cfg = await this.loadForWrite()
       const updated: UserConfig = {
         ...cfg,
         settings: mergeServerSettings(cfg.settings, patch),
@@ -412,7 +434,7 @@ export class ConfigStore {
 
   async patchSessionOverride(sessionId: string, patch: SessionOverride): Promise<SessionOverride> {
     return this.writeMutex.acquire(async () => {
-      const cfg = await this.load()
+      const cfg = await this.loadForWrite()
       const existing = cfg.sessionOverrides[sessionId] || {}
       const next = { ...existing, ...patch }
       const updated: UserConfig = {
@@ -435,7 +457,7 @@ export class ConfigStore {
 
   async patchTerminalOverride(terminalId: string, patch: TerminalOverride): Promise<TerminalOverride> {
     return this.writeMutex.acquire(async () => {
-      const cfg = await this.load()
+      const cfg = await this.loadForWrite()
       const existing = cfg.terminalOverrides[terminalId] || {}
       const next = { ...existing, ...patch }
       const updated: UserConfig = {
@@ -453,7 +475,7 @@ export class ConfigStore {
 
   async setProjectColor(projectPath: string, color: string): Promise<void> {
     return this.writeMutex.acquire(async () => {
-      const cfg = await this.load()
+      const cfg = await this.loadForWrite()
       const updated: UserConfig = {
         ...cfg,
         projectColors: { ...cfg.projectColors, [projectPath]: color },
@@ -475,7 +497,7 @@ export class ConfigStore {
     }
 
     return this.writeMutex.acquire(async () => {
-      const cfg = await this.load()
+      const cfg = await this.loadForWrite()
       const existing = cfg.recentDirectories || []
       const next = [trimmed, ...existing.filter((value) => value !== trimmed)].slice(0, 20)
       const updated: UserConfig = {

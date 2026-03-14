@@ -244,11 +244,12 @@ describe('SettingsView behavior sections', () => {
       expect(store.getState().settings.settings.codingCli.enabledProviders).not.toContain('codex')
     })
 
-    it('filters removed provider names out of enabledProviders when toggling a live provider', async () => {
+    it('preserves server-known runtime provider names when toggling a live provider', async () => {
       const store = createSettingsViewStore({
         settings: {
           codingCli: {
-            enabledProviders: ['codex', 'removed-provider'],
+            enabledProviders: ['codex', 'gemini'],
+            knownProviders: ['claude', 'codex', 'opencode', 'gemini'],
           },
         },
       })
@@ -263,7 +264,7 @@ describe('SettingsView behavior sections', () => {
       })
 
       expect(api.patch).toHaveBeenCalledWith('/api/settings', {
-        codingCli: { enabledProviders: [] },
+        codingCli: { enabledProviders: ['gemini'] },
       })
     })
 
