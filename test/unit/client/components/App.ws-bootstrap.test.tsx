@@ -14,6 +14,15 @@ import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer } from '@/store/networkSlice'
 import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
 import { makeSelectSortedSessionItems } from '@/store/selectors/sidebarSelectors'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  mergeServerSettings,
+  resolveLocalSettings,
+  type LocalSettingsPatch,
+  type ServerSettings,
+  type ServerSettingsPatch,
+} from '@shared/settings'
 
 // Mock heavy child components to avoid xterm/canvas issues
 vi.mock('@/components/TabContent', () => ({
@@ -38,6 +47,27 @@ vi.mock('@/hooks/useTheme', () => ({
 vi.mock('@/components/SetupWizard', () => ({
   SetupWizard: () => <div data-testid="mock-setup-wizard">Setup Wizard</div>,
 }))
+
+const defaultServerSettings = createDefaultServerSettings({
+  loggingDebug: defaultSettings.logging.debug,
+})
+
+function createSettingsState(options: {
+  server?: ServerSettingsPatch
+  local?: LocalSettingsPatch
+  loaded?: boolean
+} = {}) {
+  const serverSettings = mergeServerSettings(defaultServerSettings, options.server ?? {})
+  const localSettings = resolveLocalSettings(options.local)
+
+  return {
+    serverSettings,
+    localSettings,
+    settings: composeResolvedSettings(serverSettings, localSettings),
+    loaded: options.loaded ?? true,
+    lastSavedAt: undefined,
+  }
+}
 
 const wsMocks = vi.hoisted(() => ({
   send: vi.fn(),
@@ -83,6 +113,11 @@ vi.mock('@/lib/api', () => ({
 }))
 
 function createStore(options?: {
+  settings?: {
+    server?: ServerSettingsPatch
+    local?: LocalSettingsPatch
+    loaded?: boolean
+  }
   tabs?: Array<Record<string, unknown>>
   panes?: {
     layouts: Record<string, unknown>
@@ -130,7 +165,7 @@ function createStore(options?: {
         serializableCheck: { ignoredPaths: ['sessions.expandedProjects'] },
       }),
     preloadedState: {
-      settings: { settings: defaultSettings, loaded: true, lastSavedAt: undefined },
+      settings: createSettingsState(options?.settings),
       tabs: { tabs, activeTabId: (tabs[0]?.id as string | undefined) ?? null },
       connection: {
         status: 'disconnected' as const,
@@ -196,7 +231,7 @@ describe('App WS bootstrap recovery', () => {
     apiGet.mockImplementation((url: string) => {
       if (url === '/api/bootstrap') {
         return Promise.resolve({
-          settings: defaultSettings,
+          settings: defaultServerSettings,
           platform: { platform: 'linux' },
           shell: { authenticated: true, ready: true },
         })
@@ -280,6 +315,96 @@ describe('App WS bootstrap recovery', () => {
     expect(apiGet).toHaveBeenCalledWith('/api/bootstrap')
     expect(apiGet).not.toHaveBeenCalledWith('/api/settings')
     expect(apiGet).not.toHaveBeenCalledWith('/api/platform')
+  })
+
+  it('recomposes bootstrap server settings against already-loaded local browser preferences', async () => {
+    const store = createStore({
+      settings: {
+        local: {
+          theme: 'dark',
+          terminal: {
+            fontFamily: 'Fira Code',
+          },
+        },
+      },
+    })
+
+    apiGet.mockImplementation((url: string) => {
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: mergeServerSettings(defaultServerSettings, {
+            defaultCwd: '/workspace',
+            terminal: {
+              scrollback: 12000,
+            },
+          }),
+          platform: { platform: 'linux' },
+          shell: { authenticated: true, ready: true },
+        })
+      }
+      return Promise.resolve({})
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(store.getState().settings.serverSettings.defaultCwd).toBe('/workspace')
+    })
+
+    expect(store.getState().settings.settings.defaultCwd).toBe('/workspace')
+    expect(store.getState().settings.settings.terminal.scrollback).toBe(12000)
+    expect(store.getState().settings.settings.theme).toBe('dark')
+    expect(store.getState().settings.settings.terminal.fontFamily).toBe('Fira Code')
+  })
+
+  it('keeps browser-local overrides when websocket settings.updated replaces server settings', async () => {
+    const store = createStore({
+      settings: {
+        local: {
+          theme: 'dark',
+          terminal: {
+            fontFamily: 'Fira Code',
+          },
+        },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(apiGet).toHaveBeenCalledWith('/api/bootstrap')
+    })
+
+    const nextServerSettings: ServerSettings = mergeServerSettings(defaultServerSettings, {
+      defaultCwd: '/server',
+      terminal: {
+        scrollback: 12000,
+      },
+    })
+
+    act(() => {
+      messageHandler?.({
+        type: 'settings.updated',
+        settings: nextServerSettings,
+      })
+    })
+
+    await waitFor(() => {
+      expect(store.getState().settings.serverSettings.defaultCwd).toBe('/server')
+    })
+
+    expect(store.getState().settings.settings.defaultCwd).toBe('/server')
+    expect(store.getState().settings.settings.terminal.scrollback).toBe(12000)
+    expect(store.getState().settings.settings.theme).toBe('dark')
+    expect(store.getState().settings.settings.terminal.fontFamily).toBe('Fira Code')
   })
 
   it('recovers bootstrap-owned provider availability and sidebar filters after transient pre-ready 503s', async () => {

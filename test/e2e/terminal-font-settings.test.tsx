@@ -12,7 +12,15 @@ import tabRegistryReducer from '@/store/tabRegistrySlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer } from '@/store/networkSlice'
-import { LOCAL_TERMINAL_FONT_KEY } from '@/lib/terminal-fonts'
+import { BROWSER_PREFERENCES_STORAGE_KEY } from '@/store/storage-keys'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  mergeServerSettings,
+  resolveLocalSettings,
+  type LocalSettingsPatch,
+  type ServerSettingsPatch,
+} from '@shared/settings'
 
 const mockSend = vi.fn()
 const mockOnMessage = vi.fn(() => () => {})
@@ -82,6 +90,27 @@ vi.mock('@/components/SetupWizard', () => ({
   SetupWizard: () => <div data-testid="mock-setup-wizard">Setup Wizard</div>,
 }))
 
+const defaultServerSettings = createDefaultServerSettings({
+  loggingDebug: defaultSettings.logging.debug,
+})
+
+function createSettingsState(options: {
+  server?: ServerSettingsPatch
+  local?: LocalSettingsPatch
+  loaded?: boolean
+} = {}) {
+  const serverSettings = mergeServerSettings(defaultServerSettings, options.server ?? {})
+  const localSettings = resolveLocalSettings(options.local)
+
+  return {
+    serverSettings,
+    localSettings,
+    settings: composeResolvedSettings(serverSettings, localSettings),
+    loaded: options.loaded ?? true,
+    lastSavedAt: undefined,
+  }
+}
+
 function createTestStore() {
   return configureStore({
     reducer: {
@@ -102,11 +131,7 @@ function createTestStore() {
         },
       }),
     preloadedState: {
-      settings: {
-        settings: defaultSettings,
-        loaded: true,
-        lastSavedAt: undefined,
-      },
+      settings: createSettingsState(),
       tabs: {
         tabs: [{ id: 'tab-1', mode: 'shell' }],
         activeTabId: 'tab-1',
@@ -197,22 +222,93 @@ describe('terminal font preference (e2e)', () => {
   })
 
   it('keeps terminal font preference local to the browser', async () => {
-    localStorage.setItem(LOCAL_TERMINAL_FONT_KEY, 'Fira Code')
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      settings: {
+        terminal: {
+          fontFamily: 'Fira Code',
+        },
+      },
+    }))
 
     mockApiGet.mockImplementation((url: string) => {
       if (url === '/api/bootstrap') {
         return Promise.resolve({
-          settings: {
-            ...defaultSettings,
-            terminal: { ...defaultSettings.terminal, fontFamily: 'Consolas' },
-          },
+          settings: defaultServerSettings,
           platform: { platform: 'darwin' },
         })
       }
       return Promise.resolve({})
     })
 
-    const store = createTestStore()
+    const store = configureStore({
+      reducer: {
+        settings: settingsReducer,
+        tabs: tabsReducer,
+        connection: connectionReducer,
+        sessions: sessionsReducer,
+        panes: panesReducer,
+        tabRegistry: tabRegistryReducer,
+        terminalMeta: terminalMetaReducer,
+        network: networkReducer,
+        extensions: extensionsReducer,
+      },
+      middleware: (getDefault) =>
+        getDefault({
+          serializableCheck: {
+            ignoredPaths: ['sessions.expandedProjects'],
+          },
+        }),
+      preloadedState: {
+        settings: createSettingsState({
+          local: {
+            terminal: {
+              fontFamily: 'Fira Code',
+            },
+          },
+        }),
+        tabs: {
+          tabs: [{ id: 'tab-1', mode: 'shell' }],
+          activeTabId: 'tab-1',
+        },
+        sessions: {
+          projects: [],
+          expandedProjects: new Set<string>(),
+          wsSnapshotReceived: false,
+          isLoading: false,
+          error: null,
+        },
+        connection: {
+          status: 'ready' as const,
+          lastError: undefined,
+          platform: null,
+          availableClis: {},
+          serverInstanceId: undefined,
+        },
+        panes: {
+          layouts: {},
+          activePane: {},
+          paneTitles: {},
+          paneTitleSetByUser: {},
+          renameRequestTabId: null,
+          renameRequestPaneId: null,
+          zoomedPane: {},
+        },
+        tabRegistry: {
+          deviceId: 'device-test',
+          deviceLabel: 'device-test',
+          deviceAliases: {},
+          localOpen: [],
+          remoteOpen: [],
+          closed: [],
+          localClosed: {},
+          searchRangeDays: 30,
+          loading: false,
+        },
+        terminalMeta: { byTerminalId: {} },
+        network: { status: null, loading: false, configuring: false, error: null },
+        extensions: { entries: [] },
+      },
+    })
     renderApp(store)
 
     await waitFor(() => {
@@ -222,13 +318,15 @@ describe('terminal font preference (e2e)', () => {
     expect(store.getState().settings.settings.terminal.fontFamily).toBe('Fira Code')
   })
 
-  it('ignores server font when no local preference exists', async () => {
+  it('hydrates a legacyLocalSettingsSeed terminal font into browser preferences when no local settings exist', async () => {
     mockApiGet.mockImplementation((url: string) => {
       if (url === '/api/bootstrap') {
         return Promise.resolve({
-          settings: {
-            ...defaultSettings,
-            terminal: { ...defaultSettings.terminal, fontFamily: 'Consolas' },
+          settings: defaultServerSettings,
+          legacyLocalSettingsSeed: {
+            terminal: {
+              fontFamily: 'Consolas',
+            },
           },
           platform: { platform: 'darwin' },
         })
@@ -243,7 +341,13 @@ describe('terminal font preference (e2e)', () => {
       expect(mockApiGet).toHaveBeenCalledWith('/api/bootstrap')
     })
 
-    expect(store.getState().settings.settings.terminal.fontFamily).toBe('monospace')
-    expect(localStorage.getItem(LOCAL_TERMINAL_FONT_KEY)).toBe('monospace')
+    expect(store.getState().settings.settings.terminal.fontFamily).toBe('Consolas')
+    expect(JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')).toEqual({
+      settings: {
+        terminal: {
+          fontFamily: 'Consolas',
+        },
+      },
+    })
   })
 })

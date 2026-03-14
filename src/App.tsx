@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type TouchEvent as ReactTouchEvent } from 'react'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { setStatus, setError, setErrorCode, setServerInstanceId, setPlatform, setAvailableClis, setFeatureFlags } from '@/store/connectionSlice'
-import { setSettings } from '@/store/settingsSlice'
+import { setLocalSettings, setServerSettings } from '@/store/settingsSlice'
 import {
   markWsSnapshotReceived,
   resetWsSnapshotReceived,
@@ -17,7 +17,11 @@ import { getShareAction, ensureShareUrlToken, isRemoteAccessEnabledStatus } from
 import { getWsClient } from '@/lib/ws-client'
 import { collectSessionLocatorsFromTabs, getSessionsForHello } from '@/lib/session-utils'
 import { installClientPerfAuditSink, setClientPerfEnabled } from '@/lib/perf-logger'
-import { applyLocalTerminalFontFamily } from '@/lib/terminal-fonts'
+import {
+  loadBrowserPreferencesRecord,
+  resolveBrowserPreferenceSettings,
+  seedBrowserPreferencesSettingsIfEmpty,
+} from '@/lib/browser-preferences'
 import { handleUiCommand } from '@/lib/ui-commands'
 import { getAuthToken } from '@/lib/auth'
 import { installTestHarness } from '@/lib/test-harness'
@@ -53,7 +57,7 @@ import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, res
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleSdkMessage } from '@/lib/sdk-message-handler'
 import { createLogger } from '@/lib/client-logger'
-import type { AppSettings } from '@/store/types'
+import type { LocalSettingsPatch, ServerSettings } from '@shared/settings'
 import { z } from 'zod'
 
 const log = createLogger('App')
@@ -475,7 +479,8 @@ export default function App() {
         bootstrapDataLoading = true
         try {
           const bootstrapData = await api.get<{
-            settings?: AppSettings
+            settings?: ServerSettings
+            legacyLocalSettingsSeed?: LocalSettingsPatch
             platform?: BootstrapPlatformInfo
             configFallback?: {
               reason?: unknown
@@ -483,8 +488,16 @@ export default function App() {
             }
           }>('/api/bootstrap')
           if (!cancelled) {
+            if (bootstrapData.legacyLocalSettingsSeed) {
+              const currentPreferences = loadBrowserPreferencesRecord()
+              const nextPreferences = seedBrowserPreferencesSettingsIfEmpty(bootstrapData.legacyLocalSettingsSeed)
+
+              if (JSON.stringify(currentPreferences.settings) !== JSON.stringify(nextPreferences.settings)) {
+                dispatch(setLocalSettings(resolveBrowserPreferenceSettings(nextPreferences)))
+              }
+            }
             if (bootstrapData.settings) {
-              dispatch(setSettings(applyLocalTerminalFontFamily(bootstrapData.settings)))
+              dispatch(setServerSettings(bootstrapData.settings))
             }
             if (bootstrapData.platform) {
               dispatch(setPlatform(bootstrapData.platform.platform))
@@ -687,7 +700,7 @@ export default function App() {
           void appStore.dispatch(queueActiveSessionWindowRefresh() as any)
         }
         if (msg.type === 'settings.updated') {
-          dispatch(setSettings(applyLocalTerminalFontFamily(msg.settings as AppSettings)))
+          dispatch(setServerSettings(msg.settings as ServerSettings))
         }
         if (msg.type === 'ui.command') {
           handleUiCommand(msg as Record<string, unknown>, {

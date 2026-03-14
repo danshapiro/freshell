@@ -12,6 +12,15 @@ import tabRegistryReducer from '@/store/tabRegistrySlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import extensionsReducer from '@/store/extensionsSlice'
 import { networkReducer, setNetworkStatus, type NetworkStatusResponse } from '@/store/networkSlice'
+import { BROWSER_PREFERENCES_STORAGE_KEY } from '@/store/storage-keys'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  mergeServerSettings,
+  resolveLocalSettings,
+  type LocalSettingsPatch,
+  type ServerSettingsPatch,
+} from '@shared/settings'
 
 // Ensure DOM is clean even if another test file forgot cleanup.
 beforeEach(() => {
@@ -147,6 +156,27 @@ vi.mock('@/hooks/useTheme', () => ({
   useThemeEffect: () => {},
 }))
 
+const defaultServerSettings = createDefaultServerSettings({
+  loggingDebug: defaultSettings.logging.debug,
+})
+
+function createSettingsState(options: {
+  server?: ServerSettingsPatch
+  local?: LocalSettingsPatch
+  loaded?: boolean
+} = {}) {
+  const serverSettings = mergeServerSettings(defaultServerSettings, options.server ?? {})
+  const localSettings = resolveLocalSettings(options.local)
+
+  return {
+    serverSettings,
+    localSettings,
+    settings: composeResolvedSettings(serverSettings, localSettings),
+    loaded: options.loaded ?? true,
+    lastSavedAt: undefined,
+  }
+}
+
 function createTestStore() {
   return configureStore({
     reducer: {
@@ -167,11 +197,7 @@ function createTestStore() {
         },
       }),
     preloadedState: {
-      settings: {
-        settings: defaultSettings,
-        loaded: true,
-        lastSavedAt: undefined,
-      },
+      settings: createSettingsState(),
       tabs: {
         tabs: [{ id: 'tab-1', mode: 'shell' }],
         activeTabId: 'tab-1',
@@ -276,8 +302,12 @@ describe('App Component - Share Button', () => {
     wsState.isReady = false
     wsState.serverInstanceId = undefined
     mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') return Promise.resolve(defaultSettings)
-      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: defaultServerSettings,
+          platform: { platform: 'linux' },
+        })
+      }
       if (url === '/api/version') return Promise.resolve(makeVersionInfo())
       if (typeof url === 'string' && url.startsWith('/api/sessions')) return Promise.resolve([])
       if (url === '/api/network/status') {
@@ -673,7 +703,7 @@ describe('App Component - WS Notifications', () => {
     mockApiGet.mockImplementation((url: string) => {
       if (url === '/api/bootstrap') {
         return Promise.resolve({
-          settings: defaultSettings,
+          settings: defaultServerSettings,
           platform: { platform: 'linux' },
         })
       }
@@ -719,8 +749,12 @@ describe('App Component - Mobile Sidebar', () => {
     vi.clearAllMocks()
     localStorage.clear()
     mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') return Promise.resolve(defaultSettings)
-      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: defaultServerSettings,
+          platform: { platform: 'linux' },
+        })
+      }
       if (url === '/api/version') return Promise.resolve(makeVersionInfo())
       if (typeof url === 'string' && url.startsWith('/api/sessions')) return Promise.resolve([])
       return Promise.resolve({})
@@ -781,8 +815,12 @@ describe('App Bootstrap', () => {
       writable: true,
     })
     mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') return Promise.resolve(defaultSettings)
-      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: defaultServerSettings,
+          platform: { platform: 'linux' },
+        })
+      }
       if (url === '/api/version') return Promise.resolve(makeVersionInfo())
       if (typeof url === 'string' && url.startsWith('/api/sessions')) return Promise.resolve([])
       return Promise.resolve({})
@@ -834,14 +872,171 @@ describe('App Bootstrap', () => {
     expect(settingsCalls.length).toBe(0)
     expect(platformCalls.length).toBe(0)
   })
+
+  it('writes legacyLocalSettingsSeed into browser preferences when no local settings payload exists', async () => {
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: defaultServerSettings,
+          legacyLocalSettingsSeed: {
+            terminal: {
+              fontFamily: 'Fira Code',
+            },
+          },
+          platform: { platform: 'linux' },
+        })
+      }
+      if (url === '/api/version') return Promise.resolve(makeVersionInfo())
+      if (typeof url === 'string' && url.startsWith('/api/sessions')) return Promise.resolve([])
+      return Promise.resolve({})
+    })
+
+    const store = createTestStore()
+    renderApp(store)
+
+    await waitFor(() => {
+      expect(store.getState().settings.settings.terminal.fontFamily).toBe('Fira Code')
+    })
+
+    expect(JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')).toEqual({
+      settings: {
+        terminal: {
+          fontFamily: 'Fira Code',
+        },
+      },
+    })
+  })
+
+  it('keeps an existing browser-local settings payload instead of overwriting it with legacyLocalSettingsSeed', async () => {
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      settings: {
+        theme: 'dark',
+        terminal: {
+          fontFamily: 'JetBrains Mono',
+        },
+      },
+    }))
+
+    const store = configureStore({
+      reducer: {
+        settings: settingsReducer,
+        tabs: tabsReducer,
+        connection: connectionReducer,
+        sessions: sessionsReducer,
+        panes: panesReducer,
+        tabRegistry: tabRegistryReducer,
+        terminalMeta: terminalMetaReducer,
+        network: networkReducer,
+        extensions: extensionsReducer,
+      },
+      middleware: (getDefault) =>
+        getDefault({
+          serializableCheck: {
+            ignoredPaths: ['sessions.expandedProjects'],
+          },
+        }),
+      preloadedState: {
+        settings: createSettingsState({
+          local: {
+            theme: 'dark',
+            terminal: {
+              fontFamily: 'JetBrains Mono',
+            },
+          },
+        }),
+        tabs: {
+          tabs: [{ id: 'tab-1', mode: 'shell' }],
+          activeTabId: 'tab-1',
+        },
+        sessions: {
+          projects: [],
+          expandedProjects: new Set<string>(),
+          wsSnapshotReceived: false,
+          isLoading: false,
+          error: null,
+        },
+        connection: {
+          status: 'ready' as const,
+          lastError: undefined,
+          platform: null,
+          availableClis: {},
+          serverInstanceId: undefined,
+        },
+        panes: {
+          layouts: {},
+          activePane: {},
+          paneTitles: {},
+          paneTitleSetByUser: {},
+          renameRequestTabId: null,
+          renameRequestPaneId: null,
+          zoomedPane: {},
+        },
+        tabRegistry: {
+          deviceId: 'device-test',
+          deviceLabel: 'device-test',
+          deviceAliases: {},
+          localOpen: [],
+          remoteOpen: [],
+          closed: [],
+          localClosed: {},
+          searchRangeDays: 30,
+          loading: false,
+        },
+        terminalMeta: { byTerminalId: {} },
+        network: {
+          status: null,
+          loading: false,
+          configuring: false,
+          error: null,
+        },
+        extensions: { entries: [] },
+      },
+    })
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: defaultServerSettings,
+          legacyLocalSettingsSeed: {
+            terminal: {
+              fontFamily: 'Fira Code',
+            },
+          },
+          platform: { platform: 'linux' },
+        })
+      }
+      if (url === '/api/version') return Promise.resolve(makeVersionInfo())
+      if (typeof url === 'string' && url.startsWith('/api/sessions')) return Promise.resolve([])
+      return Promise.resolve({})
+    })
+
+    renderApp(store)
+
+    await waitFor(() => {
+      expect(store.getState().settings.settings.terminal.fontFamily).toBe('JetBrains Mono')
+    })
+
+    expect(JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')).toEqual({
+      settings: {
+        theme: 'dark',
+        terminal: {
+          fontFamily: 'JetBrains Mono',
+        },
+      },
+    })
+  })
 })
 
 describe('App WS message handling', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mockApiGet.mockImplementation((url: string) => {
-      if (url === '/api/settings') return Promise.resolve(defaultSettings)
-      if (url === '/api/platform') return Promise.resolve({ platform: 'linux' })
+      if (url === '/api/bootstrap') {
+        return Promise.resolve({
+          settings: defaultServerSettings,
+          platform: { platform: 'linux' },
+        })
+      }
       if (url === '/api/version') return Promise.resolve(makeVersionInfo())
       if (typeof url === 'string' && url.startsWith('/api/sessions')) return Promise.resolve([])
       return Promise.resolve({})
@@ -920,11 +1115,7 @@ describe('Tab Switching Keyboard Shortcuts', () => {
           },
         }),
       preloadedState: {
-        settings: {
-          settings: defaultSettings,
-          loaded: true,
-          lastSavedAt: undefined,
-        },
+        settings: createSettingsState(),
         tabs: {
           tabs,
           activeTabId: tabs[activeIndex]?.id || null,
