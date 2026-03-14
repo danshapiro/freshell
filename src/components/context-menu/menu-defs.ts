@@ -141,7 +141,7 @@ function buildTerminalClipboardItems(
     {
       type: 'item',
       id: 'terminal-copy',
-      label: 'copy',
+      label: 'Copy',
       icon: createElement(Copy, { className: 'h-4 w-4' }),
       onSelect: () => terminalActions?.copySelection(),
       disabled: !terminalActions || !hasSelection,
