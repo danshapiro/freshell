@@ -138,6 +138,11 @@ describe('codex activity indicator flow (e2e)', () => {
     cleanup()
   })
 
+  function getVisibleSinglePaneTab() {
+    // Single-pane tabs surface the pane's visible title when it is an explicit override.
+    return screen.getByLabelText('Codex Pane')
+  }
+
   it('shows blue icon on pane and tab only when the exact live terminal id is busy', () => {
     renderHarness({
       codexActivity: {
@@ -153,7 +158,7 @@ describe('codex activity indicator flow (e2e)', () => {
     const paneHeader = screen.getByRole('banner', { name: 'Pane: Codex Pane' })
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
 
-    const tabButton = screen.getByLabelText('Codex Tab')
+    const tabButton = getVisibleSinglePaneTab()
     expect(within(tabButton).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
   })
 
@@ -174,7 +179,7 @@ describe('codex activity indicator flow (e2e)', () => {
     const paneHeader = screen.getByRole('banner', { name: 'Pane: Codex Pane' })
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
 
-    const tabButton = screen.getByLabelText('Codex Tab')
+    const tabButton = getVisibleSinglePaneTab()
     expect(within(tabButton).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
   })
 
@@ -219,7 +224,7 @@ describe('codex activity indicator flow (e2e)', () => {
     const paneHeader = screen.getByRole('banner', { name: 'Pane: Codex Pane' })
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
 
-    const tabButton = screen.getByLabelText('Codex Tab')
+    const tabButton = getVisibleSinglePaneTab()
     expect(within(tabButton).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
   })
 })
