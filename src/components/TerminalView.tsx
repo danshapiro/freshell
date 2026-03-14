@@ -703,10 +703,7 @@ export default function TerminalView({ tabId, paneId, paneContent, hidden }: Ter
 
   const persistOsc52Policy = useCallback((policy: Osc52Policy) => {
     osc52PolicyRef.current = policy
-    dispatch(updateSettingsLocal({ terminal: { osc52Clipboard: policy } } as any))
-    void api.patch('/api/settings', {
-      terminal: { osc52Clipboard: policy },
-    }).catch(() => {})
+    dispatch(updateSettingsLocal({ terminal: { osc52Clipboard: policy } }))
   }, [dispatch])
 
   const advanceOsc52Prompt = useCallback(() => {

@@ -9,6 +9,11 @@ import connectionReducer from '@/store/connectionSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import TerminalView from '@/components/TerminalView'
 import type { TerminalPaneContent } from '@/store/paneTypes'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  resolveLocalSettings,
+} from '@shared/settings'
 
 const wsMocks = vi.hoisted(() => ({
   send: vi.fn(),
@@ -94,6 +99,26 @@ class MockResizeObserver {
 
 const OSC52_COPY = '\u001b]52;c;Y29weQ==\u0007'
 
+const defaultServerSettings = createDefaultServerSettings({
+  loggingDebug: defaultSettings.logging.debug,
+})
+
+function createSettingsState(policy: 'ask' | 'always' | 'never') {
+  const localSettings = resolveLocalSettings({
+    terminal: {
+      osc52Clipboard: policy,
+    },
+  })
+
+  return {
+    serverSettings: defaultServerSettings,
+    localSettings,
+    settings: composeResolvedSettings(defaultServerSettings, localSettings),
+    loaded: true,
+    lastSavedAt: undefined,
+  }
+}
+
 function createStore(policy: 'ask' | 'always' | 'never') {
   const paneContent: TerminalPaneContent = {
     kind: 'terminal',
@@ -136,16 +161,7 @@ function createStore(policy: 'ask' | 'always' | 'never') {
         activePane: { 'tab-1': 'pane-1' },
         paneTitles: {},
       },
-      settings: {
-        loaded: true,
-        settings: {
-          ...defaultSettings,
-          terminal: {
-            ...defaultSettings.terminal,
-            osc52Clipboard: policy,
-          },
-        },
-      },
+      settings: createSettingsState(policy),
       connection: { status: 'ready' as const, error: null },
       turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {}, attentionByPane: {} },
     } as any,
@@ -184,7 +200,7 @@ describe('terminal OSC52 policy flow (e2e)', () => {
     messageHandler = null
   })
 
-  it('Ask policy prompts and Always updates global policy', async () => {
+  it('Ask policy prompts and Always updates browser-local policy only', async () => {
     const { store, paneContent } = createStore('ask')
 
     render(
@@ -209,9 +225,8 @@ describe('terminal OSC52 policy flow (e2e)', () => {
 
     expect(clipboardMocks.copyText).toHaveBeenCalledWith('copy')
     expect(store.getState().settings.settings.terminal.osc52Clipboard).toBe('always')
-    expect(apiMocks.patch).toHaveBeenCalledWith('/api/settings', {
-      terminal: { osc52Clipboard: 'always' },
-    })
+    expect(store.getState().settings.localSettings.terminal.osc52Clipboard).toBe('always')
+    expect(apiMocks.patch).not.toHaveBeenCalled()
   })
 
   it('Never policy does not prompt and does not copy', async () => {

@@ -8,6 +8,11 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
+import {
+  composeResolvedSettings,
+  createDefaultServerSettings,
+  resolveLocalSettings,
+} from '@shared/settings'
 
 const wsMocks = vi.hoisted(() => ({
   send: vi.fn(),
@@ -117,6 +122,26 @@ class MockResizeObserver {
 
 const OSC52_COPY = '\u001b]52;c;Y29weQ==\u0007'
 
+const defaultServerSettings = createDefaultServerSettings({
+  loggingDebug: defaultSettings.logging.debug,
+})
+
+function createSettingsState(policy: 'ask' | 'always' | 'never') {
+  const localSettings = resolveLocalSettings({
+    terminal: {
+      osc52Clipboard: policy,
+    },
+  })
+
+  return {
+    serverSettings: defaultServerSettings,
+    localSettings,
+    settings: composeResolvedSettings(defaultServerSettings, localSettings),
+    loaded: true,
+    lastSavedAt: undefined,
+  }
+}
+
 function createStore(policy: 'ask' | 'always' | 'never') {
   const tabId = 'tab-osc52'
   const paneId = 'pane-osc52'
@@ -158,16 +183,7 @@ function createStore(policy: 'ask' | 'always' | 'never') {
         activePane: { [tabId]: paneId },
         paneTitles: {},
       },
-      settings: {
-        loaded: true,
-        settings: {
-          ...defaultSettings,
-          terminal: {
-            ...defaultSettings.terminal,
-            osc52Clipboard: policy,
-          },
-        },
-      },
+      settings: createSettingsState(policy),
       connection: { status: 'ready', error: null },
       turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {}, attentionByPane: {} },
     } as any,
@@ -270,7 +286,7 @@ describe('TerminalView OSC52 policy handling', () => {
     expect(store.getState().settings.settings.terminal.osc52Clipboard).toBe('ask')
   })
 
-  it('ask + Always copies and persists always policy', async () => {
+  it('ask + Always copies and persists always policy locally', async () => {
     const { store, terminalId } = await renderView('ask')
     act(() => {
       messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: `before${OSC52_COPY}after` })
@@ -281,12 +297,11 @@ describe('TerminalView OSC52 policy handling', () => {
 
     expect(clipboardMocks.copyText).toHaveBeenCalledWith('copy')
     expect(store.getState().settings.settings.terminal.osc52Clipboard).toBe('always')
-    expect(apiMocks.patch).toHaveBeenCalledWith('/api/settings', {
-      terminal: { osc52Clipboard: 'always' },
-    })
+    expect(store.getState().settings.localSettings.terminal.osc52Clipboard).toBe('always')
+    expect(apiMocks.patch).not.toHaveBeenCalled()
   })
 
-  it('ask + Never does not copy and persists never policy', async () => {
+  it('ask + Never does not copy and persists never policy locally', async () => {
     const { store, terminalId } = await renderView('ask')
     act(() => {
       messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: `before${OSC52_COPY}after` })
@@ -297,9 +312,8 @@ describe('TerminalView OSC52 policy handling', () => {
 
     expect(clipboardMocks.copyText).not.toHaveBeenCalled()
     expect(store.getState().settings.settings.terminal.osc52Clipboard).toBe('never')
-    expect(apiMocks.patch).toHaveBeenCalledWith('/api/settings', {
-      terminal: { osc52Clipboard: 'never' },
-    })
+    expect(store.getState().settings.localSettings.terminal.osc52Clipboard).toBe('never')
+    expect(apiMocks.patch).not.toHaveBeenCalled()
   })
 
   it('swallows clipboard write rejection', async () => {
