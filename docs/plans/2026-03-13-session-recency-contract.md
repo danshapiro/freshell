@@ -4,7 +4,7 @@
 
 **Goal:** Stop sidebar flashes caused by filesystem-observation churn by replacing coding-session `updatedAt` with a semantic `lastActivityAt` contract that only moves when the session itself meaningfully advances.
 
-**Architecture:** Make provider parsers own the semantic clock. File-backed providers must derive `createdAt` and `lastActivityAt` from transcript events, while the indexer uses filesystem `mtime` only as an internal cache invalidation key. Then cut the new `lastActivityAt` field through the server read model, websocket invalidation boundary, CLI/client API types, Redux store, and UI so every session-facing sort, cursor, and “Last used” label is driven by semantic activity rather than file touches.
+**Architecture:** Make provider parsers own the semantic clock. File-backed providers derive `createdAt` and `lastActivityAt` from transcript events, the session indexer keeps filesystem `mtime` only as an internal cache invalidation key, and every server/client read model that represents a coding session switches to `lastActivityAt` in one cut. The shared session-directory response shape lives in `shared/read-models.ts` so the server, CLI, and browser stop carrying duplicate `updatedAt` definitions.
 
 **Tech Stack:** Node.js, TypeScript, Express, React 18, Redux Toolkit, Vitest, Testing Library
 
@@ -12,61 +12,70 @@
 
 ## Strategy Gate
 
-The problem framing is correct: this is a data-contract bug, not a rendering-policy bug. The current contract lets file `mtime` masquerade as session recency, so any background write that does not change what the user sees can still reshuffle the sidebar and trip `sessions.changed`.
+The framing is correct: this is a session-data contract bug, not a rendering-policy bug. The sidebar flashes because touch-only file writes currently leak through `CodingCliSession.updatedAt`, which the directory projection treats as visible state and the sidebar sorts on by default. Fixing the renderer while keeping `mtime`-driven recency would leave the read model, websocket invalidation boundary, CLI output, search ordering, and pagination contract wrong.
 
-The important strategy correction is to finish the contract fix in one cut:
+Direct architectural decisions:
 
-- Rename coding-session recency from `updatedAt` to `lastActivityAt` everywhere that represents a session.
-- Keep unrelated `updatedAt` fields alone. Terminal metadata, codex activity records, tab registry records, and device records still use observation/update timestamps and should not be renamed in this change.
-- Do not add a long-lived compatibility alias. A mixed `updatedAt`/`lastActivityAt` session contract would preserve the ambiguity that caused the bug.
+- Rename coding-session recency from `updatedAt` to `lastActivityAt` everywhere the system represents a coding session.
+- Keep unrelated `updatedAt` fields alone. Terminal metadata, codex activity records, tab registry records, device records, and other observation timestamps are not part of this change.
+- Do not add a compatibility alias. A mixed `updatedAt`/`lastActivityAt` session contract keeps the ambiguity that caused the bug.
+- `shared/read-models.ts` becomes the single shared definition for session-directory request and response shapes.
+- File `mtimeMs` remains internal cache state only. It must never be copied onto a session object, never drive sort order, never participate in session-directory comparators, and never trigger `sessions.changed`.
+- If a file reparse yields no semantic timestamps, carry forward the previous cached `createdAt` and `lastActivityAt` instead of falling back to `mtime`.
+- Direct-list providers such as OpenCode may map their upstream semantic timestamp directly into `lastActivityAt`.
+- Keep generic container names like `oldestLoadedTimestamp` and `oldestIncludedTimestamp` unless the field itself is part of the session wire/read-model contract. They can continue to hold semantic session time without a wide rename.
+- No storage migration is needed. Session windows are in-memory state, not persisted localStorage schema.
 
-Clean steady-state decisions:
+Steady-state contract:
 
 - `ParsedSessionMeta.createdAt`: earliest semantic timestamp seen in provider data.
 - `ParsedSessionMeta.lastActivityAt`: latest semantic timestamp seen in provider data.
-- `CodingCliSession.lastActivityAt`: canonical session-recency field for all server and client session consumers.
-- File `mtimeMs`: internal cache invalidation input only. Never expose it on a session object, never sort by it, never diff on it, never use it for websocket invalidation.
-- If a file reparse yields no semantic timestamps, preserve the prior cached `createdAt`/`lastActivityAt` values instead of falling back to `mtime`.
-- Direct-list providers such as OpenCode may map their upstream semantic timestamp straight into `lastActivityAt`.
+- `CodingCliSession.lastActivityAt`: canonical session-recency field for all coding-session server and client consumers.
+- Session-directory ordering, pagination, search results, CLI output, sidebar timestamps, HistoryView timestamps, and context-menu "Last used" all derive from `lastActivityAt`.
 
-Provider-specific semantic-clock policy:
+Provider semantic-clock policy:
 
-- Claude counts transcript/session events that reflect real session progress: session init/start, user/assistant messages, tool use/results, reasoning/thinking, and completion/error-style events if present.
-- Claude ignores bookkeeping-only records such as usage/token snapshots or debug-sidecar information.
-- Codex counts semantic events such as `session_meta` for creation, `response_item` messages/tool calls/tool results, reasoning events, and task lifecycle events that reflect actual session progression.
-- Codex ignores housekeeping-only events such as `token_count`, `turn_context`, and file-history snapshot records.
+- Claude counts transcript/session records that represent real session progress: init/start records, user/assistant messages, tool use/results, reasoning/thinking, and completion/error-style records if present.
+- Claude ignores bookkeeping-only records such as `file-history-snapshot`, usage-only assistant payloads, and debug-sidecar data.
+- Codex counts semantic records such as `session_meta`, `response_item` messages/tool calls/tool results, `agent_reasoning`, `task_started`, `task_complete`, and `turn_aborted`.
+- Codex ignores housekeeping-only records such as `token_count`, `turn_context`, and any other metadata-only snapshots that do not represent visible session progress.
 
 Implementation invariants:
 
 - `server/coding-cli/session-indexer.ts` may still use `mtimeMs` and file size to decide whether to reparse a file, but reparsing must not itself move session recency.
-- `server/session-directory/projection.ts` and `server/sessions-sync/service.ts` must invalidate on `lastActivityAt` changes, not on observation-only churn.
-- The session-directory cursor, pagination, search ordering, CLI output, and sidebar/history/context-menu timestamps must all use the same `lastActivityAt` field.
-- Existing stale-while-refresh sidebar behavior stays intact; this plan removes the bad invalidations at the source rather than adding more client suppression.
-- `docs/index.html` stays untouched. This is a behavioral correctness fix, not a new surface.
-- Focused test runs should use repo-owned Vitest entry points. The final broad run must use the coordinator and set `FRESHELL_TEST_SUMMARY`.
+- `server/session-directory/projection.ts` and `server/sessions-sync/service.ts` must invalidate on `lastActivityAt` changes, not observation-only churn.
+- The executor should reuse existing real fixture/event shapes already present in provider tests instead of inventing new fake housekeeping formats where the repo already has one.
+- Existing stale-while-refresh sidebar behavior stays intact; this fix removes bad invalidations at the source rather than layering more client suppression on top.
+- `docs/index.html` stays untouched. This is a correctness fix, not a new feature surface.
+- Focused test runs use repo-owned Vitest entry points. The final broad run uses the coordinator and sets `FRESHELL_TEST_SUMMARY`.
 
 Rejected approaches:
 
 - Silently redefining session `updatedAt` to mean semantic activity. That hides the contract change instead of making it explicit.
 - Client-only sidebar suppression while keeping `mtime`-driven invalidations. That treats the symptom and leaves every other session consumer wrong.
-- Falling back to file `mtime` whenever provider parsing cannot find a timestamp. That reintroduces the same root-cause leak under a new name.
-- A staged compatibility period where some session consumers use `updatedAt` and others use `lastActivityAt`. That guarantees drift and makes reviews harder, not easier.
+- Falling back to file `mtime` when provider parsing cannot find a timestamp. That reintroduces the same root-cause leak under a new name.
+- A staged compatibility period where some session consumers use `updatedAt` and others use `lastActivityAt`. That guarantees drift.
+- A blanket rename of every generic timestamp variable in the repo. The contract field must change; generic pagination/cache container names do not.
 
-### Task 1: Lock semantic-clock rules with red tests
+### Task 1: Red-test provider semantic clocks
 
 **Files:**
 - Modify: `test/unit/server/coding-cli/claude-provider.test.ts`
 - Modify: `test/unit/server/coding-cli/codex-provider.test.ts`
-- Modify: `test/unit/server/coding-cli/session-indexer.test.ts`
-- Modify: `test/unit/server/session-directory/projection.test.ts`
-- Modify: `test/unit/server/sessions-sync/service.test.ts`
 
-**Step 1: Add the Claude parser red tests**
+**Step 1: Add Claude parser red tests**
 
-Extend `test/unit/server/coding-cli/claude-provider.test.ts` with two explicit parser cases:
+Extend `test/unit/server/coding-cli/claude-provider.test.ts` with:
+
+- one test that derives `createdAt` and `lastActivityAt` from semantic transcript records
+- one test that proves later bookkeeping records do not move `lastActivityAt`
+
+Use the real housekeeping shapes the file already knows about: `file-history-snapshot` and usage-only assistant payloads. Do not invent a second fake "bookkeeping" format when the repo already has exact examples.
+
+Representative target:
 
 ```ts
-it('derives createdAt and lastActivityAt from semantic transcript timestamps', () => {
+it('derives createdAt and lastActivityAt from semantic Claude transcript records', () => {
   const meta = parseSessionContent([
     JSON.stringify({ type: 'system', subtype: 'init', session_id: SESSION_A, cwd: '/repo', timestamp: '2026-03-01T00:00:00.000Z' }),
     JSON.stringify({ type: 'user', message: 'Ship it', timestamp: '2026-03-01T00:00:03.000Z' }),
@@ -76,36 +85,19 @@ it('derives createdAt and lastActivityAt from semantic transcript timestamps', (
   expect(meta.createdAt).toBe(Date.parse('2026-03-01T00:00:00.000Z'))
   expect(meta.lastActivityAt).toBe(Date.parse('2026-03-01T00:00:05.000Z'))
 })
-
-it('does not move lastActivityAt for usage-only bookkeeping lines', () => {
-  const meta = parseSessionContent([
-    JSON.stringify({ type: 'assistant', message: 'Visible reply', timestamp: '2026-03-01T00:00:05.000Z' }),
-    JSON.stringify({ type: 'assistant', uuid: 'usage-only', message: { role: 'assistant', usage: { input_tokens: 1, output_tokens: 2 } }, timestamp: '2026-03-01T00:00:20.000Z' }),
-  ].join('\n'))
-
-  expect(meta.lastActivityAt).toBe(Date.parse('2026-03-01T00:00:05.000Z'))
-})
 ```
 
-The second test is the critical guard: later bookkeeping writes must not advance the session clock.
+**Step 2: Add Codex parser red tests**
 
-**Step 2: Add the Codex parser red tests**
+Extend `test/unit/server/coding-cli/codex-provider.test.ts` with:
 
-Extend `test/unit/server/coding-cli/codex-provider.test.ts` with two explicit cases:
+- one fixture-backed test that proves `task-events.sanitized.jsonl` yields semantic `createdAt` and `lastActivityAt`
+- one explicit test that appending later `token_count` and `turn_context` lines does not move `lastActivityAt`
+
+Representative target:
 
 ```ts
-it('derives createdAt and lastActivityAt from semantic codex events', () => {
-  const meta = parseCodexSessionContent([
-    JSON.stringify({ timestamp: '2026-03-01T00:00:00.000Z', type: 'session_meta', payload: { id: 'session-1', cwd: '/repo' } }),
-    JSON.stringify({ timestamp: '2026-03-01T00:00:04.000Z', type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Visible reply' }] } }),
-    JSON.stringify({ timestamp: '2026-03-01T00:00:06.000Z', type: 'event_msg', payload: { type: 'task_complete' } }),
-  ].join('\n'))
-
-  expect(meta.createdAt).toBe(Date.parse('2026-03-01T00:00:00.000Z'))
-  expect(meta.lastActivityAt).toBe(Date.parse('2026-03-01T00:00:06.000Z'))
-})
-
-it('ignores housekeeping-only codex events when deriving lastActivityAt', () => {
+it('ignores token_count and turn_context when deriving lastActivityAt', () => {
   const meta = parseCodexSessionContent([
     JSON.stringify({ timestamp: '2026-03-01T00:00:00.000Z', type: 'session_meta', payload: { id: 'session-1', cwd: '/repo' } }),
     JSON.stringify({ timestamp: '2026-03-01T00:00:04.000Z', type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Visible reply' }] } }),
@@ -117,50 +109,72 @@ it('ignores housekeeping-only codex events when deriving lastActivityAt', () => 
 })
 ```
 
-If the sanitized fixture exposes a real file-history snapshot payload name, add that as a third ignored-housekeeping example in the same block instead of inventing a new one.
+**Step 3: Run the focused red parser pack**
 
-**Step 3: Add the indexer red test that proves `mtime` no longer leaks**
+Run:
 
-Extend `test/unit/server/coding-cli/session-indexer.test.ts` with a file-backed refresh test:
+```bash
+npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/claude-provider.test.ts test/unit/server/coding-cli/codex-provider.test.ts
+```
 
-- initial parse returns `createdAt: 100`, `lastActivityAt: 200`, `title: 'Session A'`
-- touch the file so `mtimeMs` changes
-- second parse returns the exact same semantic timestamps and visible fields
-- expect the refreshed project snapshot to keep `lastActivityAt === 200`
-- expect the indexer not to emit a changed project set for the touch-only refresh
+Expected: FAIL because providers do not yet expose `createdAt`/`lastActivityAt`.
 
-Use `indexer.onUpdate()` to count actual update emissions instead of asserting only on file-cache internals.
+**Step 4: Commit the red parser tests**
 
-**Step 4: Rename the projection/sync tests to the new field and keep the behavior red**
+Run:
 
-Update `test/unit/server/session-directory/projection.test.ts` and `test/unit/server/sessions-sync/service.test.ts` so their comparable snapshots and upserts use `lastActivityAt` instead of `updatedAt`, while preserving the same assertions:
+```bash
+git add test/unit/server/coding-cli/claude-provider.test.ts test/unit/server/coding-cli/codex-provider.test.ts
+git commit -m "test: lock provider semantic session clocks"
+```
+
+### Task 2: Red-test the no-flash invalidation boundary
+
+**Files:**
+- Modify: `test/unit/server/coding-cli/session-indexer.test.ts`
+- Modify: `test/unit/server/session-directory/projection.test.ts`
+- Modify: `test/unit/server/sessions-sync/service.test.ts`
+
+**Step 1: Add the indexer red test for touch-only churn**
+
+Extend `test/unit/server/coding-cli/session-indexer.test.ts` with a file-backed refresh test that proves the root cause is gone:
+
+- the first parse returns `createdAt: 100`, `lastActivityAt: 200`, `title: 'Session A'`
+- the file is touched so `mtimeMs` changes
+- the second parse returns the same semantic timestamps and visible fields, or omits them entirely so the cache carry-forward path is exercised
+- `indexer.getProjects()` still reports `lastActivityAt === 200`
+- `indexer.onUpdate()` does not emit a second change for the touch-only refresh
+
+Use `onUpdate()` emission count, not file-cache internals, as the regression signal. This is the direct "sidebar should not flash while idle" guard.
+
+**Step 2: Update projection/sync tests to the new field and the new boundary**
+
+Update `test/unit/server/session-directory/projection.test.ts` and `test/unit/server/sessions-sync/service.test.ts` so they use `lastActivityAt` and explicitly assert:
 
 - invisible metadata stays ignored
-- `lastActivityAt` remains directory-visible and invalidates the snapshot
-- websocket revisions advance only when directory-visible session state changes
+- unchanged `lastActivityAt` plus invisible metadata churn does not invalidate the directory snapshot
+- changing `lastActivityAt` does invalidate the snapshot and advance websocket revision
 
-These tests should fail at compile/runtime until the server cutover is real.
-
-**Step 5: Run the focused red pack**
+**Step 3: Run the focused red invalidation pack**
 
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/claude-provider.test.ts test/unit/server/coding-cli/codex-provider.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/session-directory/projection.test.ts test/unit/server/sessions-sync/service.test.ts
+npm run test:vitest -- --config vitest.server.config.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/session-directory/projection.test.ts test/unit/server/sessions-sync/service.test.ts
 ```
 
-Expected: FAIL because the session model and parsers still expose `updatedAt` and still derive recency from `mtime`.
+Expected: FAIL because the indexer and projection still leak `mtime` through session `updatedAt`.
 
-**Step 6: Commit the red tests**
+**Step 4: Commit the red invalidation tests**
 
 Run:
 
 ```bash
-git add test/unit/server/coding-cli/claude-provider.test.ts test/unit/server/coding-cli/codex-provider.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/session-directory/projection.test.ts test/unit/server/sessions-sync/service.test.ts
-git commit -m "test: lock semantic session recency contract"
+git add test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/session-directory/projection.test.ts test/unit/server/sessions-sync/service.test.ts
+git commit -m "test: lock session invalidation boundary"
 ```
 
-### Task 2: Make providers and the indexer own semantic session time
+### Task 3: Implement semantic session clocks in providers and the indexer
 
 **Files:**
 - Modify: `server/coding-cli/types.ts`
@@ -180,14 +194,14 @@ git commit -m "test: lock semantic session recency contract"
 - Modify: `test/server/session-association.test.ts`
 - Modify: `test/integration/server/codex-session-rebind-regression.test.ts`
 
-**Step 1: Change the core session types**
+**Step 1: Cut the core session types**
 
 In `server/coding-cli/types.ts`:
 
 - add `createdAt?: number` and `lastActivityAt?: number` to `ParsedSessionMeta`
 - rename `CodingCliSession.updatedAt` to `CodingCliSession.lastActivityAt`
 
-Use the new names directly. Do not leave both fields on `CodingCliSession`.
+In `server/coding-cli/providers/claude.ts`, either fold `JsonlMeta` into `ParsedSessionMeta` or extend it so the new semantic clock fields exist on the parser return type too. Do not leave a local parser return type that silently omits the new fields.
 
 Representative target shape:
 
@@ -210,56 +224,55 @@ export interface CodingCliSession {
 }
 ```
 
-**Step 2: Implement semantic clock extraction in the Claude parser**
+**Step 2: Implement the Claude semantic clock**
 
-Add small helpers in `server/coding-cli/providers/claude.ts`:
+In `server/coding-cli/providers/claude.ts`:
 
-- `parseTimestampMs(value: unknown): number | undefined`
-- `noteCreatedAt(current, candidate): number | undefined`
-- `noteLastActivityAt(current, candidate): number | undefined`
-- `isClaudeSemanticRecord(obj: any): boolean`
+- add `parseTimestampMs(value: unknown): number | undefined`
+- add helpers to record earliest/latest semantic timestamps
+- add a tight `isClaudeSemanticRecord(obj: any): boolean`
+- update `parseSessionContent()` so `createdAt` and `lastActivityAt` come only from semantic records
 
-Then, during the existing line scan in `parseSessionContent()`, capture:
+The semantic filter must explicitly ignore `file-history-snapshot` and usage-only assistant payloads.
 
-- earliest semantic timestamp into `createdAt`
-- latest semantic timestamp into `lastActivityAt`
+**Step 3: Implement the Codex semantic clock**
 
-Exclude usage-only records from `lastActivityAt`. Keep token-usage aggregation behavior unchanged.
+In `server/coding-cli/providers/codex.ts`:
 
-**Step 3: Implement semantic clock extraction in the Codex parser**
+- add the same timestamp helpers
+- add an explicit `isSemanticCodexEvent(obj: any): boolean`
+- derive `createdAt` and `lastActivityAt` during the existing JSONL scan
 
-Add the equivalent helpers in `server/coding-cli/providers/codex.ts` and derive `createdAt`/`lastActivityAt` during the existing JSONL pass.
-
-The semantic-event filter should be explicit and small. A good starting rule is:
+Good starting rule:
 
 ```ts
 function isSemanticCodexEvent(obj: any): boolean {
   if (obj?.type === 'session_meta') return true
   if (obj?.type === 'response_item') {
-    return obj?.payload?.type === 'message' ||
-      obj?.payload?.type === 'function_call' ||
-      obj?.payload?.type === 'function_call_output'
+    return obj?.payload?.type === 'message'
+      || obj?.payload?.type === 'function_call'
+      || obj?.payload?.type === 'function_call_output'
   }
   if (obj?.type === 'event_msg') {
-    return obj?.payload?.type === 'agent_reasoning' ||
-      obj?.payload?.type === 'task_started' ||
-      obj?.payload?.type === 'task_complete' ||
-      obj?.payload?.type === 'turn_aborted'
+    return obj?.payload?.type === 'agent_reasoning'
+      || obj?.payload?.type === 'task_started'
+      || obj?.payload?.type === 'task_complete'
+      || obj?.payload?.type === 'turn_aborted'
   }
   return false
 }
 ```
 
-Do not broaden this with catch-all `event_msg` logic. Housekeeping writes are exactly what this change is supposed to stop.
+Do not broaden this with catch-all `event_msg` logic.
 
 **Step 4: Switch the indexer to semantic recency**
 
 In `server/coding-cli/session-indexer.ts`:
 
-- keep `mtimeMs`/`size` caching exactly for “should we reparse?”
-- build `baseSession.lastActivityAt` from `meta.lastActivityAt`, not file stat
-- preserve prior cached `createdAt`/`lastActivityAt` when the new parse omits them
-- sort sessions/projects/new-session callbacks by `lastActivityAt`
+- keep `mtimeMs` and `size` only for "should we reparse?"
+- build `baseSession.lastActivityAt` from parser output, never from file stat
+- preserve prior cached `createdAt` and `lastActivityAt` when the new parse omits them
+- sort sessions, projects, and new-session callbacks by `lastActivityAt`
 - keep file `mtimeMs` inside `CachedSessionEntry`, not inside `baseSession`
 
 Use a fallback chain like:
@@ -274,19 +287,19 @@ const lastActivityAt =
   0
 ```
 
-This is the point of the fix: the semantic clock may stay unchanged across reparses even when the file changed.
+In `server/coding-cli/providers/opencode.ts`, map the upstream DB timestamp into `lastActivityAt` while leaving the SQL column name alone.
 
-**Step 5: Update internal session consumers**
+**Step 5: Rename session-domain internal bookkeeping**
 
-Replace session-domain `updatedAt` reads with `lastActivityAt` in:
+Update internal consumers so their names and comparisons match the new contract:
 
-- `server/coding-cli/codex-activity-tracker.ts` for “last seen session time” bookkeeping
-- `server/session-association-coordinator.ts` for association watermarks/age checks
-- `server/index.ts` where new-session association passes a session snapshot into the coordinator
+- `server/coding-cli/codex-activity-tracker.ts`: session-domain reads use `lastActivityAt`; rename internal state like `lastSeenSessionUpdatedAt` to `lastSeenSessionActivityAt`
+- `server/session-association-coordinator.ts`: compare and watermark by `lastActivityAt`; rename helpers like `normalizeUpdatedAt()` to `normalizeLastActivityAt()`
+- `server/index.ts`: pass session snapshots with `lastActivityAt` into association flow and fix any stale comments that still describe session recency as `updatedAt`
 
 Leave terminal-meta and codex-activity record `updatedAt` fields untouched.
 
-**Step 6: Run the focused server model pack**
+**Step 6: Run the focused semantic-clock pack**
 
 Run:
 
@@ -302,10 +315,10 @@ Run:
 
 ```bash
 git add server/coding-cli/types.ts server/coding-cli/providers/claude.ts server/coding-cli/providers/codex.ts server/coding-cli/providers/opencode.ts server/coding-cli/session-indexer.ts server/coding-cli/codex-activity-tracker.ts server/session-association-coordinator.ts server/index.ts test/unit/server/coding-cli/claude-provider.test.ts test/unit/server/coding-cli/codex-provider.test.ts test/unit/server/coding-cli/opencode-provider.test.ts test/unit/server/coding-cli/session-indexer.test.ts test/unit/server/coding-cli/codex-activity-tracker.test.ts test/unit/server/session-association-coordinator.test.ts test/server/session-association.test.ts test/integration/server/codex-session-rebind-regression.test.ts
-git commit -m "refactor: derive semantic coding session recency"
+git commit -m "refactor: derive semantic coding session clocks"
 ```
 
-### Task 3: Cut the server read model and CLI over to `lastActivityAt`
+### Task 4: Cut the shared server and CLI session read model to `lastActivityAt`
 
 **Files:**
 - Modify: `shared/read-models.ts`
@@ -327,7 +340,7 @@ git commit -m "refactor: derive semantic coding session recency"
 - Modify: `test/server/ws-sidebar-snapshot-refresh.test.ts`
 - Modify: `test/unit/cli/commands.test.ts`
 
-**Step 1: Centralize the read-model response contract**
+**Step 1: Centralize the session-directory response contract**
 
 Extend `shared/read-models.ts` with shared response schemas/types for the session directory:
 
@@ -359,40 +372,25 @@ export const SessionDirectoryPageSchema = z.object({
 })
 ```
 
-Then update `server/session-directory/types.ts` to alias these shared types instead of carrying a second local copy. This contract change is the whole feature; keeping a single shared definition is worth the small extra work.
+Then update `server/session-directory/types.ts` to alias these shared types instead of carrying a second local copy.
 
-**Step 2: Rename the directory comparator and cursor semantics**
+**Step 2: Rename the server read model and CLI transforms**
 
-In `server/session-directory/projection.ts` and `server/session-directory/service.ts`:
-
-- rename comparable-item fields and cursor payload from `updatedAt` to `lastActivityAt`
-- sort and compare by `lastActivityAt`
-- compute route `revision` from session `lastActivityAt` plus terminal-meta `updatedAt`
-- keep terminal-meta contribution unchanged
-
-Representative cursor shape:
-
-```ts
-type CursorPayload = {
-  lastActivityAt: number
-  key: string
-}
-```
-
-The route behavior must stay identical except for the field name and the fact that observation-only file touches no longer move session recency.
-
-**Step 3: Rename every server-side session read-model consumer**
-
-Update `server/session-search.ts`, `server/session-pagination.ts`, `server/sessions-sync/service.ts`, `server/sessions-router.ts`, and `server/cli/index.ts` to use `lastActivityAt`.
+Update `server/session-directory/projection.ts`, `server/session-directory/service.ts`, `server/session-search.ts`, `server/session-pagination.ts`, `server/sessions-sync/service.ts`, `server/sessions-router.ts`, and `server/cli/index.ts` so they use `lastActivityAt`.
 
 Important details:
 
-- `server/session-search.ts` search result schema and sort order must use `lastActivityAt`
-- `server/session-pagination.ts` cursor/filter/sort output must use `lastActivityAt`
-- `server/cli/index.ts` transformation helpers must emit `lastActivityAt`
-- `server/sessions-sync/service.ts` needs only the field rename because the projection helper already defines visibility
+- comparator fields and cursor payloads use `lastActivityAt`
+- route `revision` is the max of session `lastActivityAt` and terminal-meta `updatedAt`
+- `server/session-search.ts` search result schema and ordering use `lastActivityAt`
+- `server/session-pagination.ts` sorts and paginates by `lastActivityAt`, but generic container names like `oldestIncludedTimestamp` and `before` may stay as generic timestamp names
+- `server/cli/index.ts` emits `lastActivityAt` in session/project/search output
 
 Do not touch unrelated terminal or registry schemas in `shared/ws-protocol.ts`.
+
+**Step 3: Update server and CLI tests/fixtures**
+
+Update the listed tests so their fixtures and assertions use `lastActivityAt`, including `test/server/ws-sidebar-snapshot-refresh.test.ts` bootstrap fixtures. Keep the websocket behavior itself unchanged: it should still broadcast lightweight `sessions.changed` invalidations, just no longer for touch-only session churn.
 
 **Step 4: Run the focused server/CLI contract pack**
 
@@ -405,16 +403,16 @@ npm run test:vitest -- test/unit/cli/commands.test.ts
 
 Expected: PASS
 
-**Step 5: Commit the server contract cutover**
+**Step 5: Commit the server/CLI contract cutover**
 
 Run:
 
 ```bash
 git add shared/read-models.ts server/session-directory/types.ts server/session-directory/projection.ts server/session-directory/service.ts server/session-search.ts server/session-pagination.ts server/sessions-sync/service.ts server/sessions-router.ts server/cli/index.ts test/unit/server/session-directory/projection.test.ts test/unit/server/session-directory/service.test.ts test/unit/server/session-search.test.ts test/unit/server/session-pagination.test.ts test/unit/server/sessions-sync/diff.test.ts test/unit/server/sessions-sync/service.test.ts test/integration/server/session-directory-router.test.ts test/server/ws-sidebar-snapshot-refresh.test.ts test/unit/cli/commands.test.ts
-git commit -m "refactor: rename session read model recency to lastActivityAt"
+git commit -m "refactor: cut session read model to lastActivityAt"
 ```
 
-### Task 4: Cut the client/store/UI over to `lastActivityAt`
+### Task 5: Cut the client/store/UI session contract to `lastActivityAt`
 
 **Files:**
 - Modify: `src/store/types.ts`
@@ -440,13 +438,16 @@ git commit -m "refactor: rename session read model recency to lastActivityAt"
 - Modify: `test/e2e/open-tab-session-sidebar-visibility.test.tsx`
 - Modify: `test/e2e/sidebar-click-opens-pane.test.tsx`
 
-**Step 1: Rename the client session model and API response mapping**
+**Step 1: Update client session-domain types and response parsing**
 
 In `src/store/types.ts` and `src/lib/api.ts`:
 
 - rename session-domain `updatedAt` to `lastActivityAt`
 - keep non-session `updatedAt` shapes alone
-- update `fetchSidebarSessionsSnapshot()` and `searchSessions()` transforms to read/write `lastActivityAt`
+- rename `SearchResult.updatedAt` to `lastActivityAt`
+- import `SessionDirectoryPageSchema` and the inferred response type from `@shared/read-models`
+- remove the local duplicate `SessionDirectoryItemResponse`/`SessionDirectoryPageResponse` types
+- parse the HTTP session-directory response with the shared schema before regrouping it
 
 Representative client-side shape:
 
@@ -461,47 +462,37 @@ export interface CodingCliSession {
 }
 ```
 
-Also rename the legacy cursor encoder in `src/lib/api.ts` so it serializes `lastActivityAt` instead of `updatedAt`.
+Update the legacy cursor encoder in `src/lib/api.ts` so it serializes `lastActivityAt` instead of `updatedAt`.
 
 **Step 2: Switch store-level recency math**
 
-Update `src/store/sessionsSlice.ts` and `src/store/sessionsThunks.ts` so all project sorting, oldest-loaded calculations, pagination cursors, and search-result normalization use `lastActivityAt`.
+Update `src/store/sessionsSlice.ts` and `src/store/sessionsThunks.ts` so project sorting, merge logic, pagination cursors, oldest-loaded calculations, and search-result regrouping all use `lastActivityAt`.
 
-This includes:
-
-- `projectNewestUpdatedAt()` -> `projectNewestLastActivityAt()`
-- `oldestLoadedTimestamp` calculations
-- search-result regrouping
-- merge logic that compares or sorts session recency
-
-Keep the existing loading and invalidation behavior exactly as-is.
+Keep generic state names like `oldestLoadedTimestamp` as-is; just feed them semantic session time.
 
 **Step 3: Switch UI consumers**
 
 Update these session-facing UI consumers to read `lastActivityAt`:
 
 - `src/store/selectors/sidebarSelectors.ts` for sidebar timestamps/order
-- `src/components/Sidebar.tsx` comments/comparator semantics where session timestamps are compared
-- `src/components/HistoryView.tsx` for “last used” sorting and display
-- `src/components/context-menu/ContextMenuProvider.tsx` for delete-confirmation and copied session metadata
+- `src/components/Sidebar.tsx` comments and comparator semantics where session timestamps are compared
+- `src/components/HistoryView.tsx` for "last used" sorting and display
+- `src/components/context-menu/ContextMenuProvider.tsx` for copied session metadata and confirmation UI
 
-Do not rename tab or terminal timestamps in the same files. Only the session-domain objects change.
+Do not rename tab or terminal timestamps in the same files.
 
-**Step 4: Add and fix client/e2e coverage**
+**Step 4: Update client and jsdom e2e coverage**
 
-Update the listed client and jsdom e2e tests so they exercise the new contract explicitly:
+Update the listed client tests so they build session fixtures with `lastActivityAt` and assert the renamed field is preserved end-to-end:
 
-- `test/unit/client/lib/api.test.ts` should assert `lastActivityAt` is preserved from directory items
-- `test/unit/client/store/sessionsSlice.test.ts` should sort by newest `lastActivityAt`
-- `test/unit/client/store/sessionsThunks.test.ts` and `test/unit/client/sessionsSlice.pagination.test.ts` should keep pagination and window state anchored to `lastActivityAt`
-- `test/unit/client/store/selectors/sidebarSelectors.test.ts` and `.knownKeys.test.ts` should build session fixtures with `lastActivityAt`
-- `test/unit/client/store/selectors/sidebarSelectors.runningTerminal.test.ts` should keep running-session joins intact with the renamed field
-- `test/unit/client/components/App.test.tsx` and `test/unit/client/components/App.ws-bootstrap.test.tsx` should consume websocket/bootstrap session snapshots with `lastActivityAt`
-- `test/unit/client/components/Sidebar.test.tsx` should continue to render relative time from the renamed field
-- `test/unit/client/components/ContextMenuProvider.test.tsx` should show “Last used” from `lastActivityAt`
-- `test/e2e/open-tab-session-sidebar-visibility.test.tsx` and `test/e2e/sidebar-click-opens-pane.test.tsx` should use the new payload shape so the app-level harness proves the rename is real end-to-end
+- API tests parse `lastActivityAt` from session-directory payloads
+- store tests sort/merge/paginate by `lastActivityAt`
+- selector tests build fixtures with `lastActivityAt`
+- `App` and websocket bootstrap tests consume `lastActivityAt` session snapshots
+- sidebar/history/context-menu tests render relative time from `lastActivityAt`
+- jsdom e2e harnesses use the new payload shape
 
-Do not add a fake browser-visual flash test here. The root-cause contract is already pinned by provider/indexer/sync tests; client coverage only needs to prove the app still consumes the new field correctly.
+Do not add a fake visual-flash test here. The root cause is already pinned by provider/indexer/projection/sync coverage.
 
 **Step 5: Run the focused client pack**
 
@@ -513,16 +504,16 @@ npm run test:vitest -- test/unit/client/lib/api.test.ts test/unit/client/store/s
 
 Expected: PASS
 
-**Step 6: Commit the client cutover**
+**Step 6: Commit the client contract cutover**
 
 Run:
 
 ```bash
 git add src/store/types.ts src/store/sessionsSlice.ts src/store/sessionsThunks.ts src/store/selectors/sidebarSelectors.ts src/lib/api.ts src/components/Sidebar.tsx src/components/HistoryView.tsx src/components/context-menu/ContextMenuProvider.tsx test/unit/client/lib/api.test.ts test/unit/client/store/sessionsSlice.test.ts test/unit/client/store/sessionsThunks.test.ts test/unit/client/sessionsSlice.pagination.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/store/selectors/sidebarSelectors.knownKeys.test.ts test/unit/client/store/selectors/sidebarSelectors.runningTerminal.test.ts test/unit/client/components/App.test.tsx test/unit/client/components/App.ws-bootstrap.test.tsx test/unit/client/components/Sidebar.test.tsx test/unit/client/components/ContextMenuProvider.test.tsx test/unit/client/components/HistoryView.mobile.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx test/e2e/sidebar-click-opens-pane.test.tsx
-git commit -m "refactor: cut session clients over to lastActivityAt"
+git commit -m "refactor: cut session clients to lastActivityAt"
 ```
 
-### Task 5: Sweep remaining session-domain fallout and run the full verification stack
+### Task 6: Sweep remaining fallout and run full verification
 
 **Files:**
 - Modify: `test/unit/client/components/MobileTabStrip.test.tsx`
@@ -535,26 +526,17 @@ git commit -m "refactor: cut session clients over to lastActivityAt"
 - Modify: `test/unit/client/store/state-edge-cases.test.ts`
 - Modify: `test/server/ws-handshake-snapshot.test.ts`
 - Modify: `test/unit/server/unified-rename.test.ts`
-- Verify: `package.json`
 - Verify: coordinator state via `npm run test:status`
 
-**Step 1: Sweep for session-domain `updatedAt` stragglers**
+**Step 1: Sweep remaining session-domain `updatedAt` stragglers**
 
 Run:
 
 ```bash
-rg -n "\bupdatedAt\b" server src test
+rg -n "\bupdatedAt\b" shared server src test
 ```
 
-Convert every remaining coding-session/session-directory/search/sidebar/history/context-menu occurrence to `lastActivityAt`. Leave the following categories alone:
-
-- terminal metadata
-- codex activity records
-- tab registry records
-- device/known-device records
-- generic test harness timestamps unrelated to coding sessions
-
-If a file is ambiguous, read it and decide deliberately; do not blanket-replace.
+Convert only the remaining coding-session, session-directory, session-search, CLI, sidebar, history, and related test-fixture occurrences to `lastActivityAt`. Leave terminal metadata, codex activity records, tab registry records, device records, and generic non-session timestamps alone.
 
 **Step 2: Run lint and typecheck**
 
@@ -567,7 +549,7 @@ npm run typecheck
 
 Expected: PASS
 
-**Step 3: Run the broad focused suites that matter most for this feature**
+**Step 3: Run the broad focused suites most likely to catch missed fixture fallout**
 
 Run:
 
@@ -598,7 +580,7 @@ FRESHELL_TEST_SUMMARY="session recency contract" CI=true npm test
 
 Expected: PASS
 
-**Step 6: Commit the final verified cut**
+**Step 6: Commit the fully verified cut**
 
 Run:
 
@@ -611,9 +593,10 @@ git commit -m "refactor: land semantic session recency contract"
 
 Before considering the work complete, confirm all of the following are true:
 
-- Touching a session file without changing semantic session events does not change `CodingCliSession.lastActivityAt`.
-- `SessionsSyncService` does not broadcast `sessions.changed` for `mtime`-only churn.
+- Touching a session file without changing semantic transcript events does not change `CodingCliSession.lastActivityAt`.
+- `CodingCliSessionIndexer` does not emit a changed project update for touch-only churn.
+- `SessionsSyncService` does not broadcast `sessions.changed` for touch-only churn.
 - The session-directory route, cursor, search ordering, CLI output, and client API all expose `lastActivityAt`.
-- Sidebar ordering, HistoryView ordering, and context-menu “Last used” all render from `lastActivityAt`.
-- No coding-session/session-directory contract surface still exposes `updatedAt`.
+- Sidebar ordering, HistoryView ordering, and context-menu "Last used" all render from `lastActivityAt`.
+- No coding-session or session-directory contract surface still exposes `updatedAt`.
 - Terminal metadata and other non-session domains still use their own `updatedAt` fields unchanged.
