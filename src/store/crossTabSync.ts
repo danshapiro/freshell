@@ -118,8 +118,18 @@ function dispatchHydrateBrowserPreferencesFromPersisted(store: StoreLike, raw: s
 
   const pendingWriteState = getPendingBrowserPreferencesWriteState(store)
   const remoteSettingsPatch = parsed.settings ?? {}
-  const nextSettings = pendingWriteState.settingsPatch
-    ? resolveLocalSettings(mergeLocalSettings(remoteSettingsPatch, pendingWriteState.settingsPatch))
+  let mergedSettingsPatch = remoteSettingsPatch
+  if (pendingWriteState.settingsPatch) {
+    mergedSettingsPatch = mergeLocalSettings(mergedSettingsPatch, pendingWriteState.settingsPatch)
+  }
+  if (pendingWriteState.transientSettingsPatch) {
+    mergedSettingsPatch = mergeLocalSettings(mergedSettingsPatch, pendingWriteState.transientSettingsPatch)
+  }
+  const nextSettings = (
+    pendingWriteState.settingsPatch
+    || pendingWriteState.transientSettingsPatch
+  )
+    ? resolveLocalSettings(mergedSettingsPatch)
     : resolveBrowserPreferenceSettings(parsed)
   const nextSearchRangeDays = pendingWriteState.hasPendingSearchRangeDays
     ? pendingWriteState.searchRangeDays

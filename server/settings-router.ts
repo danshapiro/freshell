@@ -9,7 +9,7 @@ export function buildSettingsPatchSchema(validCliProviders: readonly string[] = 
   return buildServerSettingsPatchSchema(validCliProviders)
 }
 
-export const SettingsPatchSchema = buildSettingsPatchSchema()
+export const SettingsPatchSchema = buildServerSettingsPatchSchema()
 
 export type SettingsPatch = ServerSettingsPatch
 

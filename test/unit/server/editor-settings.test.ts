@@ -39,4 +39,20 @@ describe('editor settings schema', () => {
     })
     expect(result.success).toBe(true)
   })
+
+  it('accepts runtime CLI provider names in the exported schema', () => {
+    const result = SettingsPatchSchema.safeParse({
+      codingCli: {
+        enabledProviders: ['custom-cli'],
+        knownProviders: ['custom-cli'],
+        providers: {
+          'custom-cli': {
+            model: 'custom-model',
+          },
+        },
+      },
+    })
+
+    expect(result.success).toBe(true)
+  })
 })

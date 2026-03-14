@@ -33,9 +33,12 @@ export function createShellBootstrapRouter(deps: ShellBootstrapRouterDeps): Rout
         lane: 'critical',
         signal,
         run: async (scheduledSignal) => {
-          const [settings, legacyLocalSettingsSeed, platform, shell, perf, configFallback] = await Promise.all([
-            deps.getSettings(),
-            deps.getLegacyLocalSettingsSeed?.() ?? Promise.resolve(undefined),
+          const settings = await deps.getSettings()
+          const legacyLocalSettingsSeed = deps.getLegacyLocalSettingsSeed
+            ? await deps.getLegacyLocalSettingsSeed()
+            : undefined
+
+          const [platform, shell, perf, configFallback] = await Promise.all([
             deps.getPlatform(),
             (async () => {
               if (deps.getShellState) {

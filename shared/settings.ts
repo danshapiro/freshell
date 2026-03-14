@@ -449,10 +449,10 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
   return Object.keys(normalized).length > 0 ? normalized : undefined
 }
 
-function createCliProviderNameSchema(validCliProviders: readonly string[] = DEFAULT_ENABLED_CLI_PROVIDERS) {
-  const allowedProviders = new Set(validCliProviders)
+function createCliProviderNameSchema(validCliProviders?: readonly string[]) {
+  const allowedProviders = validCliProviders ? new Set(validCliProviders) : null
   return z.string().min(1).superRefine((value, ctx) => {
-    if (allowedProviders.has(value)) {
+    if (!allowedProviders || allowedProviders.has(value)) {
       return
     }
     ctx.addIssue({
@@ -496,7 +496,7 @@ function createAgentChatProviderDefaultsPatchSchema() {
     .strict()
 }
 
-export function buildServerSettingsSchema(validCliProviders: readonly string[] = DEFAULT_ENABLED_CLI_PROVIDERS) {
+export function buildServerSettingsSchema(validCliProviders?: readonly string[]) {
   const CliProviderNameSchema = createCliProviderNameSchema(validCliProviders)
 
   return z.object({
@@ -531,7 +531,7 @@ export function buildServerSettingsSchema(validCliProviders: readonly string[] =
   }).strict()
 }
 
-export function buildServerSettingsPatchSchema(validCliProviders: readonly string[] = DEFAULT_ENABLED_CLI_PROVIDERS) {
+export function buildServerSettingsPatchSchema(validCliProviders?: readonly string[]) {
   const CliProviderNameSchema = createCliProviderNameSchema(validCliProviders)
 
   return z.object({

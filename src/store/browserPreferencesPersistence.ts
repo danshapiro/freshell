@@ -258,6 +258,7 @@ export function getPendingBrowserPreferencesWriteState(store: { getState: Browse
   }
   return {
     settingsPatch: pending.settingsPatch,
+    transientSettingsPatch: pending.transientSettingsPatch,
     hasPendingSearchRangeDays: pending.hasPendingSearchRangeDays,
     searchRangeDays: pending.searchRangeDays,
   }

@@ -100,4 +100,54 @@ describe('GET /api/bootstrap', () => {
     expect(res.status).toBe(200)
     expect(schedule).toHaveBeenCalledTimes(1)
   })
+
+  it('does not trigger concurrent cold config loads when settings and legacy seed share a loader', async () => {
+    const seed = {
+      theme: 'dark' as const,
+    }
+    let cachedConfig:
+      | {
+          settings: typeof defaultSettings
+          legacyLocalSettingsSeed: typeof seed
+        }
+      | undefined
+    let activeColdLoads = 0
+    let maxConcurrentColdLoads = 0
+    let coldLoadCount = 0
+
+    const loadConfig = vi.fn(async () => {
+      if (cachedConfig) {
+        return cachedConfig
+      }
+      coldLoadCount += 1
+      activeColdLoads += 1
+      maxConcurrentColdLoads = Math.max(maxConcurrentColdLoads, activeColdLoads)
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        cachedConfig = {
+          settings: defaultSettings,
+          legacyLocalSettingsSeed: seed,
+        }
+        return cachedConfig
+      } finally {
+        activeColdLoads -= 1
+      }
+    })
+
+    const sharedLoaderApp = createTestApp({
+      getSettings: async () => (await loadConfig()).settings,
+      getLegacyLocalSettingsSeed: async () => (await loadConfig()).legacyLocalSettingsSeed,
+    })
+
+    const res = await request(sharedLoaderApp)
+      .get('/api/bootstrap')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+
+    expect(res.status).toBe(200)
+    expect(res.body.settings).toEqual(defaultSettings)
+    expect(res.body.legacyLocalSettingsSeed).toEqual(seed)
+    expect(loadConfig).toHaveBeenCalledTimes(2)
+    expect(coldLoadCount).toBe(1)
+    expect(maxConcurrentColdLoads).toBe(1)
+  })
 })

@@ -221,6 +221,36 @@ describe('crossTabSync', () => {
     }
   })
 
+  it('preserves transient skipPersist local settings while hydrating remote browser preferences', () => {
+    const store = configureStore({
+      reducer: { settings: settingsReducer, tabRegistry: tabRegistryReducer },
+      middleware: (getDefault) => getDefault().concat(browserPreferencesPersistenceMiddleware),
+    })
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    store.dispatch({
+      ...updateSettingsLocal({
+        sidebar: {
+          collapsed: true,
+        },
+      }),
+      meta: { skipPersist: true, source: 'responsive-auto-collapse' },
+    })
+
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: BROWSER_PREFERENCES_STORAGE_KEY,
+      newValue: JSON.stringify({
+        settings: {
+          theme: 'dark',
+        },
+      }),
+    }))
+
+    expect(store.getState().settings.settings.theme).toBe('dark')
+    expect(store.getState().settings.settings.sidebar.collapsed).toBe(true)
+  })
+
   it('merges remote browser-preference writes without clobbering dirty local settings', () => {
     vi.useFakeTimers()
 
