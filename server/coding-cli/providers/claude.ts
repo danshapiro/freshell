@@ -136,6 +136,23 @@ function recordSemanticClock(
   clock.lastActivityAt = clock.lastActivityAt === undefined ? at : Math.max(clock.lastActivityAt, at)
 }
 
+function resolveClaudeSemanticTimestampMs(
+  obj: any,
+  clock: { createdAt?: number; lastActivityAt?: number },
+): number | undefined {
+  const explicit = parseTimestampMs(obj?.timestamp)
+  if (explicit !== undefined) return explicit
+
+  if (obj?.type === 'result') {
+    const baseAt = clock.lastActivityAt ?? clock.createdAt
+    if (baseAt === undefined) return undefined
+    const durationMs = toFiniteNumber(obj?.duration_ms)
+    return baseAt + Math.max(1, Math.round(durationMs ?? 1))
+  }
+
+  return undefined
+}
+
 function resolveClaudeCompactPercentThreshold(): number {
   const override = toFiniteNumber(process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE)
   if (!override || override < 1) return CLAUDE_DEFAULT_COMPACT_PERCENT
@@ -334,7 +351,7 @@ export function parseSessionContent(content: string, options: ParseSessionOption
 
     if (isClaudeSemanticRecord(obj)) {
       const clock = { createdAt, lastActivityAt }
-      recordSemanticClock(clock, obj?.timestamp)
+      recordSemanticClock(clock, resolveClaudeSemanticTimestampMs(obj, clock))
       createdAt = clock.createdAt
       lastActivityAt = clock.lastActivityAt
     }

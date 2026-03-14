@@ -133,6 +133,35 @@ describe('parseSessionContent() - token usage snapshots', () => {
     expect(meta.lastActivityAt).toBe(Date.parse('2026-03-01T00:00:05.000Z'))
   })
 
+  it('advances semantic recency for untimestamped result completion records', () => {
+    const meta = parseSessionContent([
+      JSON.stringify({
+        type: 'system',
+        subtype: 'init',
+        session_id: '11111111-1111-1111-1111-111111111111',
+        cwd: '/repo',
+        timestamp: '2026-03-01T00:00:00.000Z',
+      }),
+      JSON.stringify({
+        type: 'user',
+        message: 'Ship it',
+        timestamp: '2026-03-01T00:00:03.000Z',
+      }),
+      JSON.stringify({
+        type: 'result',
+        subtype: 'error',
+        is_error: true,
+        duration_ms: 2_000,
+        num_turns: 1,
+        session_id: '11111111-1111-1111-1111-111111111111',
+        uuid: 'result-1',
+      }),
+    ].join('\n'))
+
+    expect(meta.createdAt).toBe(Date.parse('2026-03-01T00:00:00.000Z'))
+    expect(meta.lastActivityAt).toBe(Date.parse('2026-03-01T00:00:05.000Z'))
+  })
+
   it('uses latest assistant usage snapshot with uuid -> message.id -> line-hash dedupe priority', () => {
     const content = [
       JSON.stringify({
