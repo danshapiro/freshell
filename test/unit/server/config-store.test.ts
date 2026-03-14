@@ -858,6 +858,60 @@ describe('ConfigStore', () => {
 
       expect(updated.terminal.scrollback).toBe(10000)
     })
+
+    it('preserves runtime CLI providers when loading and saving config', async () => {
+      await fsp.mkdir(configDir, { recursive: true })
+      const existingConfig: UserConfig = {
+        version: 1,
+        settings: {
+          ...defaultSettings,
+          codingCli: {
+            ...defaultSettings.codingCli,
+            enabledProviders: ['claude', 'gemini'],
+            knownProviders: ['claude', 'codex', 'opencode', 'gemini'],
+            providers: {
+              ...defaultSettings.codingCli.providers,
+              gemini: {
+                cwd: '/workspace/gemini',
+                model: 'gemini-2.5-pro',
+              },
+            },
+          },
+        },
+        sessionOverrides: {},
+        terminalOverrides: {},
+        projectColors: {},
+      }
+      await fsp.writeFile(configPath, JSON.stringify(existingConfig, null, 2))
+
+      const store = new ConfigStore()
+      const loaded = await store.load()
+
+      expect(loaded.settings.codingCli.enabledProviders).toEqual(['claude', 'gemini'])
+      expect(loaded.settings.codingCli.knownProviders).toEqual(['claude', 'codex', 'opencode', 'gemini'])
+      expect(loaded.settings.codingCli.providers.gemini).toEqual({
+        cwd: '/workspace/gemini',
+        model: 'gemini-2.5-pro',
+      })
+
+      const updated = await store.patchSettings({ defaultCwd: '/workspace' })
+
+      expect(updated.defaultCwd).toBe('/workspace')
+      expect(updated.codingCli.enabledProviders).toEqual(['claude', 'gemini'])
+      expect(updated.codingCli.knownProviders).toEqual(['claude', 'codex', 'opencode', 'gemini'])
+      expect(updated.codingCli.providers.gemini).toEqual({
+        cwd: '/workspace/gemini',
+        model: 'gemini-2.5-pro',
+      })
+
+      const saved = JSON.parse(await fsp.readFile(configPath, 'utf-8'))
+      expect(saved.settings.codingCli.enabledProviders).toEqual(['claude', 'gemini'])
+      expect(saved.settings.codingCli.knownProviders).toEqual(['claude', 'codex', 'opencode', 'gemini'])
+      expect(saved.settings.codingCli.providers.gemini).toEqual({
+        cwd: '/workspace/gemini',
+        model: 'gemini-2.5-pro',
+      })
+    })
   })
 
   describe('agentChat defaults', () => {

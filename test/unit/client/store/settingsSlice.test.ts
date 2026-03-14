@@ -118,6 +118,53 @@ describe('settingsSlice', () => {
     expect(state.settings.sidebar.sortMode).toBe(initialState.settings.sidebar.sortMode)
   })
 
+  it('preserves runtime CLI providers when hydrating and previewing server settings', async () => {
+    const {
+      default: settingsReducer,
+      setServerSettings,
+      previewServerSettingsPatch,
+    } = await importFreshSettingsSlice()
+
+    const initialState = settingsReducer(undefined, { type: 'unknown' })
+    const hydrated = settingsReducer(initialState, setServerSettings({
+      ...initialState.serverSettings,
+      codingCli: {
+        ...initialState.serverSettings.codingCli,
+        enabledProviders: ['claude', 'gemini'],
+        knownProviders: ['claude', 'codex', 'opencode', 'gemini'],
+        providers: {
+          ...initialState.serverSettings.codingCli.providers,
+          gemini: {
+            cwd: '/workspace/gemini',
+          },
+        },
+      },
+    }))
+
+    expect(hydrated.serverSettings.codingCli.enabledProviders).toEqual(['claude', 'gemini'])
+    expect(hydrated.serverSettings.codingCli.knownProviders).toEqual(['claude', 'codex', 'opencode', 'gemini'])
+    expect(hydrated.serverSettings.codingCli.providers.gemini).toEqual({
+      cwd: '/workspace/gemini',
+    })
+
+    const previewed = settingsReducer(hydrated, previewServerSettingsPatch({
+      codingCli: {
+        providers: {
+          gemini: {
+            model: 'gemini-2.5-pro',
+          },
+        },
+      },
+    }))
+
+    expect(previewed.serverSettings.codingCli.enabledProviders).toEqual(['claude', 'gemini'])
+    expect(previewed.settings.codingCli.knownProviders).toEqual(['claude', 'codex', 'opencode', 'gemini'])
+    expect(previewed.serverSettings.codingCli.providers.gemini).toEqual({
+      cwd: '/workspace/gemini',
+      model: 'gemini-2.5-pro',
+    })
+  })
+
   it('updateSettingsLocal only applies local fields', async () => {
     const {
       default: settingsReducer,

@@ -5,6 +5,7 @@ import {
   composeResolvedSettings,
   createDefaultServerSettings,
   extractLegacyLocalSettingsSeed,
+  mergeServerSettings,
   resolveLocalSettings,
   stripLocalSettings,
 } from '@shared/settings'
@@ -56,6 +57,28 @@ describe('shared settings contract', () => {
     expect(resolved.terminal.scrollback).toBe(5000)
     expect(resolved.sidebar.sortMode).toBe('project')
     expect(resolved.agentChat.defaultPlugins).toEqual([])
+  })
+
+  it('mergeServerSettings preserves runtime CLI providers outside the built-in defaults', () => {
+    const merged = mergeServerSettings(createDefaultServerSettings({ loggingDebug: false }), {
+      codingCli: {
+        enabledProviders: ['claude', 'gemini'],
+        knownProviders: ['claude', 'codex', 'opencode', 'gemini'],
+        providers: {
+          gemini: {
+            cwd: '/workspace/gemini',
+            model: 'gemini-2.5-pro',
+          },
+        },
+      },
+    })
+
+    expect(merged.codingCli.enabledProviders).toEqual(['claude', 'gemini'])
+    expect(merged.codingCli.knownProviders).toEqual(['claude', 'codex', 'opencode', 'gemini'])
+    expect(merged.codingCli.providers.gemini).toEqual({
+      cwd: '/workspace/gemini',
+      model: 'gemini-2.5-pro',
+    })
   })
 
   it('extracts only moved local settings into the legacy seed', () => {

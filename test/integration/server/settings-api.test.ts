@@ -127,6 +127,40 @@ describe('Settings API Integration', () => {
     expect(res.body.agentChat.defaultPlugins).toEqual(['fs', 'search'])
   })
 
+  it('PATCH /api/settings preserves runtime CLI providers outside the built-in defaults', async () => {
+    const res = await request(app)
+      .patch('/api/settings')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({
+        codingCli: {
+          enabledProviders: ['claude', 'gemini'],
+          knownProviders: ['claude', 'codex', 'opencode', 'gemini'],
+          providers: {
+            gemini: {
+              cwd: '/workspace/gemini',
+              model: 'gemini-2.5-pro',
+            },
+          },
+        },
+      })
+
+    expect(res.status).toBe(200)
+    expect(res.body.codingCli.enabledProviders).toEqual(['claude', 'gemini'])
+    expect(res.body.codingCli.knownProviders).toEqual(['claude', 'codex', 'opencode', 'gemini'])
+    expect(res.body.codingCli.providers.gemini).toEqual({
+      cwd: '/workspace/gemini',
+      model: 'gemini-2.5-pro',
+    })
+
+    const stored = await configStore.getSettings()
+    expect(stored.codingCli.enabledProviders).toEqual(['claude', 'gemini'])
+    expect(stored.codingCli.knownProviders).toEqual(['claude', 'codex', 'opencode', 'gemini'])
+    expect(stored.codingCli.providers.gemini).toEqual({
+      cwd: '/workspace/gemini',
+      model: 'gemini-2.5-pro',
+    })
+  })
+
   it('PATCH /api/settings accepts defaultCwd: null and clears it', async () => {
     await request(app)
       .patch('/api/settings')

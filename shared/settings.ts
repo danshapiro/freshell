@@ -604,7 +604,8 @@ function sanitizeServerSettingsPatch(patch: ServerSettingsPatch): ServerSettings
 
   const candidate = stripLocalSettings(patch as Record<string, unknown>)
   const sanitized: ServerSettingsPatch = {}
-  const cliProviderNameSchema = createCliProviderNameSchema()
+  // Merge/load paths must preserve runtime provider names that were already accepted elsewhere.
+  const cliProviderNameSchema = z.string().min(1)
   const codingCliProviderConfigPatchSchema = createCodingCliProviderConfigPatchSchema()
   const agentChatProviderDefaultsPatchSchema = createAgentChatProviderDefaultsPatchSchema()
 
