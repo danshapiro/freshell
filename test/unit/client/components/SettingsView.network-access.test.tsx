@@ -279,6 +279,99 @@ describe('SettingsView network access section', () => {
     expect(screen.getByRole('switch', { name: /remote access/i })).toBeChecked()
   })
 
+  it('shows a visible error and performs a final status refresh when WSL teardown polling times out', async () => {
+    vi.useFakeTimers()
+    const { api } = await import('@/lib/api')
+    vi.mocked(api.post).mockResolvedValueOnce({ method: 'wsl2', status: 'started' })
+    const configuringStatus = createNetworkStatus({
+      host: '0.0.0.0',
+      remoteAccessEnabled: true,
+      remoteAccessRequested: true,
+      accessUrl: 'http://192.168.1.100:3001/?token=abc',
+      firewall: { platform: 'wsl2', active: true, portOpen: true, commands: [], configuring: true },
+    } as any)
+    const reconciledStatus = createNetworkStatus({
+      host: '0.0.0.0',
+      remoteAccessEnabled: false,
+      remoteAccessRequested: false,
+      accessUrl: 'http://localhost:3001/?token=abc',
+      firewall: { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false },
+    } as any)
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      vi.mocked(api.get).mockResolvedValueOnce(configuringStatus)
+    }
+    vi.mocked(api.get).mockResolvedValueOnce(reconciledStatus)
+
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            host: '0.0.0.0',
+            remoteAccessEnabled: true,
+            remoteAccessRequested: true,
+            firewall: { platform: 'wsl2', active: true, portOpen: true, commands: [], configuring: false },
+          } as any),
+        }),
+      },
+    })
+
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    fireEvent.click(screen.getByRole('switch', { name: /remote access/i }))
+
+    await act(async () => {
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(22000)
+      await Promise.resolve()
+    })
+
+    expect(api.get).toHaveBeenCalledTimes(11)
+    expect(screen.getByRole('alert')).toHaveTextContent(/timed out turning off remote access/i)
+    expect(screen.getByRole('switch', { name: /remote access/i })).not.toBeChecked()
+  })
+
+  it('shows a visible error and performs a final status refresh when WSL teardown polling fails', async () => {
+    vi.useFakeTimers()
+    const { api } = await import('@/lib/api')
+    vi.mocked(api.post).mockResolvedValueOnce({ method: 'wsl2', status: 'started' })
+    vi.mocked(api.get)
+      .mockRejectedValueOnce(new Error('network status failed'))
+      .mockResolvedValueOnce(createNetworkStatus({
+        host: '0.0.0.0',
+        remoteAccessEnabled: false,
+        remoteAccessRequested: false,
+        accessUrl: 'http://localhost:3001/?token=abc',
+        firewall: { platform: 'wsl2', active: true, portOpen: false, commands: [], configuring: false },
+      } as any))
+
+    const store = createSettingsViewStore({
+      extraPreloadedState: {
+        network: createNetworkState({
+          status: createNetworkStatus({
+            host: '0.0.0.0',
+            remoteAccessEnabled: true,
+            remoteAccessRequested: true,
+            firewall: { platform: 'wsl2', active: true, portOpen: true, commands: [], configuring: false },
+          } as any),
+        }),
+      },
+    })
+
+    renderSettingsView(store, { onNavigate: vi.fn() })
+
+    fireEvent.click(screen.getByRole('switch', { name: /remote access/i }))
+
+    await act(async () => {
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(2000)
+      await Promise.resolve()
+    })
+
+    expect(api.get).toHaveBeenCalledTimes(2)
+    expect(screen.getByRole('alert')).toHaveTextContent(/failed to refresh remote access status/i)
+    expect(screen.getByRole('switch', { name: /remote access/i })).not.toBeChecked()
+  })
+
   it('shows an admin-approval modal before starting Windows firewall repair', async () => {
     mockFetchFirewallConfig
       .mockResolvedValueOnce({

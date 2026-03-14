@@ -375,6 +375,23 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
     queueFirewallRefresh(refreshRequestId, detail)
   }, [queueFirewallRefresh])
 
+  const reconcileRemoteAccessRefreshFailure = useCallback(async (
+    refreshRequestId: number,
+    errorMessage: string,
+  ) => {
+    try {
+      await dispatch(fetchNetworkStatus()).unwrap()
+    } catch (refreshError) {
+      log.warn('Failed to reconcile remote access status after polling error', refreshError)
+    } finally {
+      if (remoteAccessRefreshRequestRef.current !== refreshRequestId) {
+        return
+      }
+      setRemoteAccessPending(false)
+      setRemoteAccessError(errorMessage)
+    }
+  }, [dispatch])
+
   const queueRemoteAccessRefresh = useCallback((refreshRequestId: number, attempts = 0) => {
     remoteAccessRefreshTimerRef.current = setTimeout(() => {
       remoteAccessRefreshTimerRef.current = null
@@ -387,7 +404,10 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
 
           if (status.firewall.configuring) {
             if (attempts + 1 >= SETTINGS_FIREWALL_POLL_MAX_ATTEMPTS) {
-              setRemoteAccessPending(false)
+              void reconcileRemoteAccessRefreshFailure(
+                refreshRequestId,
+                'Timed out turning off remote access',
+              )
               return
             }
 
@@ -405,13 +425,17 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
 
           setRemoteAccessPending(false)
         })
-        .catch(() => {
+        .catch((error) => {
           if (remoteAccessRefreshRequestRef.current === refreshRequestId) {
-            setRemoteAccessPending(false)
+            log.warn('Failed to refresh remote access status', error)
+            void reconcileRemoteAccessRefreshFailure(
+              refreshRequestId,
+              'Failed to refresh remote access status',
+            )
           }
         })
     }, SETTINGS_FIREWALL_POLL_INTERVAL_MS)
-  }, [dispatch])
+  }, [dispatch, reconcileRemoteAccessRefreshFailure])
 
   const scheduleRemoteAccessRefresh = useCallback(() => {
     setRemoteAccessPending(true)

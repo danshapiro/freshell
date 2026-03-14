@@ -91,7 +91,7 @@ function buildWindowsFirewallRepairCommands(
 
   return [
     ...stalePorts.map(
-      (port) => `netsh advfirewall firewall delete rule name="${getManagedWindowsFirewallRuleName(port)}" 2>\\$null`,
+      (port) => `netsh advfirewall firewall delete rule name="${getManagedWindowsFirewallRuleName(port)}" 2>$null`,
     ),
     ...buildWindowsFirewallAddCommands(addPorts),
   ]

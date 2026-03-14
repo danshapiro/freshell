@@ -355,6 +355,8 @@ describe('Network API integration', () => {
         expect(spawnCall).toBeDefined()
         const elevatedArgs = spawnCall?.[1] as string[]
         expect(elevatedArgs[1]).toContain('delete rule name=\"Freshell (port 3001)\"')
+        expect(elevatedArgs[1]).toContain('2>$null')
+        expect(elevatedArgs[1]).not.toContain('2>\\$null')
         expect(elevatedArgs[1]).toContain('add rule name=\"Freshell (port 5173)\"')
         expect(elevatedArgs[1]).not.toContain('add rule name=\"Freshell (port 3001)\"')
       } finally {

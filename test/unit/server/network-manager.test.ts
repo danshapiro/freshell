@@ -359,7 +359,7 @@ describe('NetworkManager', () => {
     expect(status.remoteAccessEnabled).toBe(true)
     expect(status.firewall.portOpen).toBe(false)
     expect(status.firewall.commands).toContain(
-      'netsh advfirewall firewall delete rule name="Freshell (port 9876)" 2>\\$null',
+      'netsh advfirewall firewall delete rule name="Freshell (port 9876)" 2>$null',
     )
     expect(status.firewall.commands).toContain(
       'netsh advfirewall firewall add rule name="Freshell (port 5173)" dir=in action=allow protocol=TCP localport=5173 profile=private',
