@@ -478,8 +478,14 @@ function buildWslPortForwardingPlan(
   existingFirewallPorts: Set<number>,
   managedPorts: Set<number>,
 ): WslPortForwardingPlan {
+  const requiredPortSet = new Set(requiredPorts)
+  const staleOwnedPorts = Array.from(new Set([...existingFirewallPorts, ...managedPorts]))
+    .filter((port) => !requiredPortSet.has(port))
+  const staleOwnedPortProxyPorts = staleOwnedPorts.filter((port) => existingRules.has(port))
   const portsNeedUpdate = needsPortForwardingUpdate(wslIp, requiredPorts, existingRules)
+    || staleOwnedPortProxyPorts.length > 0
   const firewallNeedsUpdate = needsFirewallUpdate(requiredPorts, existingFirewallPorts)
+    || staleOwnedPorts.length > 0
 
   if (!portsNeedUpdate && !firewallNeedsUpdate) {
     return {
@@ -489,7 +495,7 @@ function buildWslPortForwardingPlan(
   }
 
   const scriptKind = portsNeedUpdate ? 'full' : 'firewall-only'
-  const cleanupPorts = Array.from(new Set([...requiredPorts, ...managedPorts]))
+  const cleanupPorts = Array.from(new Set([...requiredPorts, ...managedPorts, ...existingFirewallPorts]))
   const script = scriptKind === 'full'
     ? buildPortForwardingScript(wslIp, requiredPorts, cleanupPorts)
     : buildFirewallOnlyScript(requiredPorts)

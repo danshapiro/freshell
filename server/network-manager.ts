@@ -1,13 +1,101 @@
 import http from 'node:http'
 import os from 'node:os'
+import { execFile } from 'node:child_process'
 import isPortReachable from 'is-port-reachable'
 import { detectLanIps } from './bootstrap.js'
 import { detectFirewall, firewallCommands, type FirewallInfo, type FirewallPlatform } from './firewall.js'
 import type { ConfigStore, NetworkSettings } from './config-store.js'
 import { logger } from './logger.js'
 import { isRemoteAccessEnabled } from './network-access.js'
+import { computeWslPortForwardingPlanAsync } from './wsl-port-forward.js'
 
 const log = logger.child({ component: 'network-manager' })
+const WINDOWS_FIREWALL_QUERY_TIMEOUT_MS = 10_000
+
+type ExecFileSettledResult = {
+  error: Error | null
+  stdout: string
+  stderr: string
+}
+
+function toExecText(value: unknown): string {
+  if (typeof value === 'string') {
+    return value
+  }
+
+  if (value instanceof Uint8Array) {
+    return Buffer.from(value).toString('utf-8')
+  }
+
+  return ''
+}
+
+function execFileSettledAsync(
+  command: string,
+  args: string[],
+  options: { encoding: 'utf-8'; timeout: number },
+): Promise<ExecFileSettledResult> {
+  return new Promise((resolve) => {
+    execFile(command, args, options, (error, stdout, stderr) => {
+      resolve({
+        error: error ?? null,
+        stdout: toExecText(stdout),
+        stderr: toExecText(stderr),
+      })
+    })
+  })
+}
+
+function getManagedWindowsFirewallRuleName(port: number): string {
+  return `Freshell (port ${port})`
+}
+
+async function getExistingManagedWindowsFirewallPorts(ports: number[]): Promise<Set<number>> {
+  const existingPorts = new Set<number>()
+
+  await Promise.all(ports.map(async (port) => {
+    const ruleName = getManagedWindowsFirewallRuleName(port)
+    const { error, stdout, stderr } = await execFileSettledAsync(
+      'netsh',
+      ['advfirewall', 'firewall', 'show', 'rule', `name=${ruleName}`],
+      { encoding: 'utf-8', timeout: WINDOWS_FIREWALL_QUERY_TIMEOUT_MS },
+    )
+
+    const output = `${stdout}\n${stderr}`
+    if (!error || output.includes(ruleName)) {
+      existingPorts.add(port)
+    }
+  }))
+
+  return existingPorts
+}
+
+function buildWindowsFirewallAddCommands(ports: number[]): string[] {
+  return ports.map(
+    (port) => `netsh advfirewall firewall add rule name="${getManagedWindowsFirewallRuleName(port)}" dir=in action=allow protocol=TCP localport=${port} profile=private`,
+  )
+}
+
+function buildWindowsFirewallRepairCommands(
+  requiredPorts: number[],
+  existingManagedPorts: Set<number>,
+  advertisedPortReachable: boolean,
+): string[] {
+  const requiredPortSet = new Set(requiredPorts)
+  const stalePorts = Array.from(existingManagedPorts)
+    .filter((port) => !requiredPortSet.has(port))
+    .sort((a, b) => a - b)
+  const addPorts = advertisedPortReachable
+    ? requiredPorts.filter((port) => !existingManagedPorts.has(port))
+    : requiredPorts
+
+  return [
+    ...stalePorts.map(
+      (port) => `netsh advfirewall firewall delete rule name="${getManagedWindowsFirewallRuleName(port)}" 2>\\$null`,
+    ),
+    ...buildWindowsFirewallAddCommands(addPorts),
+  ]
+}
 
 export interface NetworkStatus {
   configured: boolean
@@ -123,7 +211,7 @@ export class NetworkManager {
         ? process.env.HOST as '127.0.0.1' | '0.0.0.0'
         : network.host
 
-    let portOpen: boolean | null = null
+    let rawPortOpen: boolean | null = null
     if (effectiveHost === '0.0.0.0' && this.lanIps.length > 0) {
       const probeResults = await Promise.all(
         remoteAccessPorts.map(async (port) => {
@@ -136,21 +224,45 @@ export class NetworkManager {
       )
 
       if (probeResults.includes(false)) {
-        portOpen = false
+        rawPortOpen = false
       } else if (probeResults.includes(null)) {
-        portOpen = null
+        rawPortOpen = null
       } else {
-        portOpen = true
+        rawPortOpen = true
       }
     }
 
-    const commands = firewallInfo.active
-      ? firewallCommands(firewallInfo.platform, remoteAccessPorts)
-      : []
-
     const remoteAccessRequested = isRemoteAccessEnabled(network, effectiveHost, firewallInfo.platform)
+    const legacyDevUpgradePorts = this.devMode
+      ? this.getRelevantPorts().filter((port) => !remoteAccessPorts.includes(port))
+      : []
+    let staleUpgradeExposure = false
+    let existingManagedWindowsPorts = new Set<number>()
+
+    if (
+      remoteAccessRequested
+      && effectiveHost === '0.0.0.0'
+      && rawPortOpen === true
+      && legacyDevUpgradePorts.length > 0
+    ) {
+      if (firewallInfo.platform === 'wsl2') {
+        const wslPlan = await computeWslPortForwardingPlanAsync(remoteAccessPorts)
+        staleUpgradeExposure = wslPlan.status === 'ready'
+      } else if (firewallInfo.platform === 'windows' && firewallInfo.active) {
+        existingManagedWindowsPorts = await getExistingManagedWindowsFirewallPorts(this.getRelevantPorts())
+        staleUpgradeExposure = Array.from(existingManagedWindowsPorts)
+          .some((port) => !remoteAccessPorts.includes(port))
+      }
+    }
+
+    const portOpen = staleUpgradeExposure ? false : rawPortOpen
+    const commands = firewallInfo.active
+      ? firewallInfo.platform === 'windows' && staleUpgradeExposure
+        ? buildWindowsFirewallRepairCommands(remoteAccessPorts, existingManagedWindowsPorts, rawPortOpen === true)
+        : firewallCommands(firewallInfo.platform, remoteAccessPorts)
+      : []
     const remoteAccessEnabled = firewallInfo.platform === 'wsl2'
-      ? portOpen === true
+      ? rawPortOpen === true
       : remoteAccessRequested
 
     const token = process.env.AUTH_TOKEN ?? ''

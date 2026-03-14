@@ -84,6 +84,10 @@ describe('Network API integration', () => {
   beforeEach(async () => {
     const cp = await import('node:child_process')
     vi.mocked(cp.execFile).mockReset()
+    vi.mocked(cp.execFile).mockImplementation((_cmd: any, _args: any, _opts: any, cb: any) => {
+      cb?.(Object.assign(new Error('rule not found'), { code: 1 }), '', '')
+      return { on: vi.fn() } as any
+    })
     vi.mocked(detectFirewall).mockReset()
     vi.mocked(isPortReachable).mockReset()
     vi.mocked(wslModule.computeWslPortForwardingPlan).mockReset()
@@ -274,6 +278,85 @@ describe('Network API integration', () => {
           method: 'none',
           message: 'No configuration changes required',
         })
+      } finally {
+        await devNetworkManager.stop()
+        await new Promise<void>((resolve, reject) => {
+          devServer.close((err) => {
+            if (err) reject(err)
+            else resolve()
+          })
+        })
+      }
+    })
+
+    it('prompts for Windows cleanup when a stale dev-mode API-port rule remains from the old contract', async () => {
+      const cp = await import('node:child_process')
+      const devConfigStore = new ConfigStore()
+      const devServer = http.createServer()
+      const devNetworkManager = new NetworkManager(devServer, devConfigStore, 3001, true, 5173)
+      const devApp = express()
+      devApp.use(express.json())
+      devApp.use('/api', httpAuthMiddleware)
+      devApp.use('/api', createNetworkRouter({
+        networkManager: devNetworkManager,
+        configStore: devConfigStore,
+        wsHandler: { broadcast: vi.fn() },
+        detectLanIps: () => ['192.168.1.100'],
+      }))
+
+      await devConfigStore.patchSettings({
+        network: {
+          configured: true,
+          host: '0.0.0.0',
+        },
+      })
+      await new Promise<void>((resolve) => devServer.listen(0, '0.0.0.0', resolve))
+
+      vi.mocked(detectFirewall).mockResolvedValue({
+        platform: 'windows',
+        active: true,
+      })
+      vi.mocked(isPortReachable).mockImplementation(async (port) => port === 5173)
+      vi.mocked(cp.execFile).mockImplementation((cmd: any, args: any, _opts: any, cb: any) => {
+        if (cmd === 'netsh' && args.at(-1) === 'name=Freshell (port 3001)') {
+          cb?.(null, 'Rule Name: Freshell (port 3001)\n', '')
+          return { on: vi.fn() } as any
+        }
+        if (cmd === 'netsh') {
+          cb?.(Object.assign(new Error('rule not found'), { code: 1 }), '', '')
+          return { on: vi.fn() } as any
+        }
+        cb?.(null, '', '')
+        return { on: vi.fn() } as any
+      })
+      devNetworkManager.resetFirewallCache()
+
+      try {
+        const firstRes = await request(devApp)
+          .post('/api/network/configure-firewall')
+          .set('x-auth-token', token)
+          .send({})
+
+        expect(firstRes.status).toBe(200)
+        expectConfirmationRequired(firstRes.body)
+
+        const confirmedRes = await request(devApp)
+          .post('/api/network/configure-firewall')
+          .set('x-auth-token', token)
+          .send({
+            confirmElevation: true,
+            confirmationToken: firstRes.body.confirmationToken,
+          })
+
+        expect(confirmedRes.status).toBe(200)
+        expect(confirmedRes.body).toEqual({ method: 'windows-elevated', status: 'started' })
+
+        const spawnCall = vi.mocked(cp.execFile).mock.calls.find(([cmd]) => cmd === 'powershell.exe')
+        expect(spawnCall).toBeDefined()
+        const elevatedArgs = spawnCall?.[1] as string[]
+        expect(elevatedArgs[1]).toContain('delete rule name=\"Freshell (port 3001)\"')
+        expect(elevatedArgs[1]).toContain('add rule name=\"Freshell (port 5173)\"')
+        expect(elevatedArgs[1]).not.toContain('add rule name=\"Freshell (port 3001)\"')
       } finally {
         await devNetworkManager.stop()
         await new Promise<void>((resolve, reject) => {

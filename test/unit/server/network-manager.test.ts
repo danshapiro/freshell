@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import http from 'node:http'
+import { execFile } from 'node:child_process'
 import { NetworkManager } from '../../../server/network-manager.js'
 import { detectLanIps } from '../../../server/bootstrap.js'
 import { detectFirewall, firewallCommands } from '../../../server/firewall.js'
@@ -15,6 +16,13 @@ vi.mock('../../../server/firewall.js', () => ({
   detectFirewall: vi.fn().mockResolvedValue({ platform: 'linux-none', active: false }),
   firewallCommands: vi.fn().mockReturnValue([]),
 }))
+vi.mock('../../../server/wsl-port-forward.js', () => ({
+  computeWslPortForwardingPlanAsync: vi.fn().mockResolvedValue({ status: 'noop', wslIp: '172.30.149.249' }),
+}))
+vi.mock('node:child_process', async () => {
+  const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process')
+  return { ...actual, execFile: vi.fn() }
+})
 
 describe('NetworkManager', () => {
   const testPort = 9876
@@ -57,6 +65,10 @@ describe('NetworkManager', () => {
     delete process.env.EXTRA_ALLOWED_ORIGINS
     delete process.env.HOST
     vi.mocked(detectFirewall).mockResolvedValue({ platform: 'linux-none', active: false })
+    vi.mocked(execFile).mockImplementation((_cmd: any, _args: any, _opts: any, cb: any) => {
+      cb?.(Object.assign(new Error('rule not found'), { code: 1 }), '', '')
+      return {} as any
+    })
   })
 
   afterEach(async () => {
@@ -283,6 +295,78 @@ describe('NetworkManager', () => {
     const probedPorts = vi.mocked(portReachable.default).mock.calls.map(([port]) => port)
     expect(probedPorts).toEqual([5173])
     expect(vi.mocked(firewallCommands)).toHaveBeenCalledWith('windows', [5173])
+  })
+
+  it('flags stale dev-mode WSL exposure for cleanup while keeping the LAN URL active', async () => {
+    const firewallModule = await import('../../../server/firewall.js')
+    const portReachable = await import('is-port-reachable')
+    const wslPortForward = await import('../../../server/wsl-port-forward.js')
+    vi.mocked(firewallModule.detectFirewall).mockResolvedValue({
+      platform: 'wsl2',
+      active: true,
+    })
+    vi.mocked(portReachable.default).mockImplementation(async (port) => port === 5173)
+    vi.mocked(wslPortForward.computeWslPortForwardingPlanAsync).mockResolvedValue({
+      status: 'ready',
+      wslIp: '172.30.149.249',
+      scriptKind: 'full',
+      script: '$null # mock script',
+    })
+    mockConfigStore = createMockConfigStore({
+      network: {
+        host: '0.0.0.0',
+        configured: true,
+      },
+    })
+    manager = new NetworkManager(server, mockConfigStore, 9876, true, 5173)
+    await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+
+    const status = await manager.getStatus()
+
+    expect(status.remoteAccessEnabled).toBe(true)
+    expect(status.accessUrl).toContain('192.168.1.100:5173')
+    expect(status.firewall.portOpen).toBe(false)
+  })
+
+  it('builds cleanup commands for stale native Windows dev-mode API-port rules on upgrade', async () => {
+    const firewallModule = await import('../../../server/firewall.js')
+    const portReachable = await import('is-port-reachable')
+    vi.mocked(firewallModule.detectFirewall).mockResolvedValue({
+      platform: 'windows',
+      active: true,
+    })
+    vi.mocked(portReachable.default).mockImplementation(async (port) => port === 5173)
+    vi.mocked(execFile).mockImplementation((_cmd: any, args: any, _opts: any, cb: any) => {
+      const ruleNameArg = args.at(-1)
+      if (ruleNameArg === 'name=Freshell (port 9876)') {
+        cb?.(null, 'Rule Name: Freshell (port 9876)\n', '')
+        return {} as any
+      }
+      cb?.(Object.assign(new Error('rule not found'), { code: 1 }), '', '')
+      return {} as any
+    })
+    mockConfigStore = createMockConfigStore({
+      network: {
+        host: '0.0.0.0',
+        configured: true,
+      },
+    })
+    manager = new NetworkManager(server, mockConfigStore, 9876, true, 5173)
+    await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve))
+
+    const status = await manager.getStatus()
+
+    expect(status.remoteAccessEnabled).toBe(true)
+    expect(status.firewall.portOpen).toBe(false)
+    expect(status.firewall.commands).toContain(
+      'netsh advfirewall firewall delete rule name="Freshell (port 9876)" 2>\\$null',
+    )
+    expect(status.firewall.commands).toContain(
+      'netsh advfirewall firewall add rule name="Freshell (port 5173)" dir=in action=allow protocol=TCP localport=5173 profile=private',
+    )
+    expect(status.firewall.commands).not.toContain(
+      'netsh advfirewall firewall add rule name="Freshell (port 9876)" dir=in action=allow protocol=TCP localport=9876 profile=private',
+    )
   })
 
   it('preserves WsHandler across rebind via prepareForRebind/resumeAfterRebind', async () => {

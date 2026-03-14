@@ -567,6 +567,37 @@ Address         Port        Address         Port
         script: expect.stringContaining('connectaddress=172.30.149.249 connectport=3001'),
       })
     })
+
+    it('returns a full repair plan when stale old dev-mode API-port exposure remains after the single-port upgrade', () => {
+      vi.mocked(isWSL2).mockReturnValue(true)
+      vi.mocked(execSync)
+        .mockReturnValueOnce('inet 172.30.149.249/20 scope global eth0\n')
+        .mockReturnValueOnce(`
+Listen on ipv4:             Connect to ipv4:
+
+Address         Port        Address         Port
+--------------- ----------  --------------- ----------
+0.0.0.0         3001        172.30.149.249  3001
+0.0.0.0         5173        172.30.149.249  5173
+`)
+        .mockReturnValueOnce(`Rule Name: FreshellLANAccess\nLocalPort: 3001,5173\n`)
+
+      const plan = computeWslPortForwardingPlan([5173])
+      expect(plan).toEqual({
+        status: 'ready',
+        wslIp: '172.30.149.249',
+        scriptKind: 'full',
+        script: expect.stringContaining('listenport=3001'),
+      })
+      if (plan.status === 'ready') {
+        expect(plan.script).toContain('listenport=3001')
+        expect(plan.script).toContain('listenport=5173')
+        expect(plan.script).not.toContain('connectport=3001')
+        expect(plan.script).toContain('connectport=5173')
+        expect(plan.script).toContain('localport=5173')
+        expect(plan.script).not.toContain('localport=3001,5173')
+      }
+    })
   })
 
   describe('buildPortForwardingTeardownScript', () => {
