@@ -190,6 +190,12 @@ export class LayoutStore {
     return this.findSplitById(node.children?.[0], splitId) || this.findSplitById(node.children?.[1], splitId)
   }
 
+  private getSinglePaneId(tabId: string): string | null {
+    const root = this.snapshot?.layouts?.[tabId]
+    if (!root || root.type !== 'leaf') return null
+    return root.id
+  }
+
   private buildHorizontalRow(leaves: Leaf[]): any {
     if (leaves.length === 1) return leaves[0]
     if (leaves.length === 2) {
@@ -452,6 +458,14 @@ export class LayoutStore {
     const tab = this.snapshot.tabs.find((t) => t.id === tabId)
     if (!tab) return { message: 'tab not found' as const }
     tab.title = title
+    const singlePaneId = this.getSinglePaneId(tabId)
+    if (singlePaneId && title) {
+      const paneTitleMaps = this.getPaneTitleMaps(tabId)
+      if (paneTitleMaps) {
+        paneTitleMaps.paneTitles[singlePaneId] = title
+        paneTitleMaps.paneTitleSetByUser[singlePaneId] = true
+      }
+    }
     return { tabId }
   }
 
@@ -466,6 +480,11 @@ export class LayoutStore {
 
     paneTitleMaps.paneTitles[paneId] = title
     paneTitleMaps.paneTitleSetByUser[paneId] = true
+    const singlePaneId = this.getSinglePaneId(pane.tabId)
+    if (singlePaneId === paneId) {
+      const tab = this.snapshot.tabs.find((item) => item.id === pane.tabId)
+      if (tab) tab.title = title
+    }
     return { tabId: pane.tabId, paneId }
   }
 

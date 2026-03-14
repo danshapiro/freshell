@@ -522,7 +522,7 @@ describe('PaneContainer', () => {
       expect(store.getState().tabs.tabs[0].title).toBe('Ops desk')
     })
 
-    it('updates only the local pane title when the server confirms no tab rename happened', async () => {
+    it('applies the single-pane sync rule locally even if the server response omits tabRenamed', async () => {
       mockApiPatch.mockResolvedValueOnce({
         status: 'ok',
         data: { tabId: 'tab-1', paneId: 'pane-1', tabRenamed: false },
@@ -558,7 +558,7 @@ describe('PaneContainer', () => {
       await waitFor(() => {
         expect(store.getState().panes.paneTitles['tab-1']?.['pane-1']).toBe('Ops desk')
       })
-      expect(store.getState().tabs.tabs[0].title).toBe('Tab 1')
+      expect(store.getState().tabs.tabs[0].title).toBe('Ops desk')
     })
 
     it('keeps the rename editor open and does not update local titles when the server reports pane not found in a 200 response', async () => {

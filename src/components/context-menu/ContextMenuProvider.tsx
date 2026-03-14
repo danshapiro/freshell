@@ -99,6 +99,7 @@ export function ContextMenuProvider({
   const dispatch = useAppDispatch()
   const tabsState = useAppSelector((s) => s.tabs)
   const panes = useAppSelector((s) => s.panes.layouts)
+  const paneTitles = useAppSelector((s) => s.panes.paneTitles)
   const sessions = useAppSelector((s) => s.sessions.projects)
   const expandedProjects = useAppSelector((s) => s.sessions.expandedProjects)
   const platform = useAppSelector((s) => s.connection?.platform ?? null)
@@ -160,16 +161,16 @@ export function ContextMenuProvider({
   }, [buildShareLink])
 
   const copyTabNames = useCallback(async () => {
-    const names = tabsState.tabs.map((tab) => getTabDisplayTitle(tab, panes[tab.id], extensionEntries))
+    const names = tabsState.tabs.map((tab) => getTabDisplayTitle(tab, panes[tab.id], paneTitles?.[tab.id], extensionEntries))
     await copyText(names.join('\n'))
-  }, [tabsState.tabs, panes, extensionEntries])
+  }, [tabsState.tabs, panes, paneTitles, extensionEntries])
 
   const copyTabName = useCallback(async (tabId: string) => {
     const tab = tabsState.tabs.find((t) => t.id === tabId)
     if (!tab) return
-    const name = getTabDisplayTitle(tab, panes[tab.id], extensionEntries)
+    const name = getTabDisplayTitle(tab, panes[tab.id], paneTitles?.[tab.id], extensionEntries)
     await copyText(name)
-  }, [tabsState.tabs, panes, extensionEntries])
+  }, [tabsState.tabs, panes, paneTitles, extensionEntries])
 
   const newDefaultTab = useCallback(() => {
     dispatch(addTab({ mode: 'shell' }))

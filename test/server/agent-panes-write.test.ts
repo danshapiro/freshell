@@ -203,12 +203,10 @@ it('syncs the tab title when renaming the only pane in a tab', async () => {
   const app = express()
   app.use(express.json())
   const renamePane = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
-  const renameTab = vi.fn(() => ({ tabId: 'tab_1' }))
   const broadcastUiCommand = vi.fn()
   app.use('/api', createAgentApiRouter({
     layoutStore: {
       renamePane,
-      renameTab,
       listPanes: () => [{ id: 'pane_1' }],
       getPaneSnapshot: () => ({
         tabId: 'tab_1',
@@ -225,14 +223,9 @@ it('syncs the tab title when renaming the only pane in a tab', async () => {
   expect(res.status).toBe(200)
   expect(res.body.data).toMatchObject({ tabId: 'tab_1', paneId: 'pane_1', tabRenamed: true })
   expect(renamePane).toHaveBeenCalledWith('pane_1', 'Docs')
-  expect(renameTab).toHaveBeenCalledWith('tab_1', 'Docs')
   expect(broadcastUiCommand).toHaveBeenCalledWith({
     command: 'pane.rename',
     payload: { tabId: 'tab_1', paneId: 'pane_1', title: 'Docs' },
-  })
-  expect(broadcastUiCommand).toHaveBeenCalledWith({
-    command: 'tab.rename',
-    payload: { id: 'tab_1', title: 'Docs' },
   })
 })
 

@@ -41,6 +41,7 @@ import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
 import type { ProjectGroup, CodingCliSession } from '@/store/types'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
+import { applyPaneRename } from '@/store/titleSync'
 
 // Stable empty object to avoid selector memoization issues
 const EMPTY_PANE_TITLES: Record<string, string> = {}
@@ -244,10 +245,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       if (response?.data?.paneId !== paneId) {
         throw new Error(response?.message || 'Failed to rename pane')
       }
-      dispatch(updatePaneTitle({ tabId, paneId, title: trimmed }))
-      if (response.data.tabRenamed === true) {
-        dispatch(updateTab({ id: tabId, updates: { title: trimmed } }))
-      }
+      dispatch(applyPaneRename({ tabId, paneId, title: trimmed }))
       setRenameError(null)
       setRenamingPaneId(null)
       setRenameValue('')

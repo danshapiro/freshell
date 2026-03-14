@@ -206,6 +206,51 @@ describe('TabBar tab title derivation', () => {
     expect(screen.getByText('docs.example.com')).toBeInTheDocument()
   })
 
+  it('prefers the only pane title over a non-user tab title', () => {
+    const store = createStore(
+      {
+        tabs: [
+          {
+            id: 'tab-1',
+            createRequestId: 'tab-1',
+            title: 'Tab 1',
+            titleSetByUser: false,
+            status: 'running',
+            mode: 'shell',
+            shell: 'system',
+            createdAt: Date.now(),
+          },
+        ],
+        activeTabId: 'tab-1',
+      },
+      {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'shell',
+              createRequestId: 'req-1',
+              status: 'running',
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: { 'tab-1': { 'pane-1': 'Release notes' } },
+      }
+    )
+
+    render(
+      <Provider store={store}>
+        <TabBar />
+      </Provider>
+    )
+
+    expect(screen.getByText('Release notes')).toBeInTheDocument()
+    expect(screen.queryByText('Tab 1')).not.toBeInTheDocument()
+  })
+
   it('derives title from shell terminal using last directory segment', () => {
     const store = createStore(
       {

@@ -34,6 +34,26 @@ it('renames a pane in its owning tab', () => {
   expect(store.renamePane('pane_1', 'Logs')).toEqual({ tabId: 'tab_a', paneId: 'pane_1' })
   expect((store as any).snapshot.paneTitles.tab_a.pane_1).toBe('Logs')
   expect((store as any).snapshot.paneTitleSetByUser.tab_a.pane_1).toBe(true)
+  expect((store as any).snapshot.tabs[0].title).toBe('Logs')
+})
+
+it('renaming a single-pane tab also renames its only pane', () => {
+  const store = new LayoutStore()
+  store.updateFromUi({
+    tabs: [{ id: 'tab_a', title: 'Alpha' }],
+    activeTabId: 'tab_a',
+    layouts: {
+      tab_a: { type: 'leaf', id: 'pane_1', content: { kind: 'terminal', terminalId: 'term_1' } },
+    },
+    activePane: { tab_a: 'pane_1' },
+    paneTitles: {},
+    timestamp: Date.now(),
+  }, 'conn-1')
+
+  expect(store.renameTab('tab_a', 'Docs')).toEqual({ tabId: 'tab_a' })
+  expect((store as any).snapshot.tabs[0].title).toBe('Docs')
+  expect((store as any).snapshot.paneTitles.tab_a.pane_1).toBe('Docs')
+  expect((store as any).snapshot.paneTitleSetByUser.tab_a.pane_1).toBe(true)
 })
 
 it('lists pane titles from the public pane snapshot', () => {

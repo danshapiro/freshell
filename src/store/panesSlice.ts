@@ -1186,18 +1186,23 @@ export const panesSlice = createSlice({
      */
     updatePaneTitleByTerminalId: (
       state,
-      action: PayloadAction<{ terminalId: string; title: string }>
+      action: PayloadAction<{ terminalId: string; title: string; setByUser?: boolean }>
     ) => {
-      const { terminalId, title } = action.payload
+      const { terminalId, title, setByUser } = action.payload
       for (const tabId of Object.keys(state.layouts)) {
         const paneId = findPaneIdByTerminalId(state.layouts[tabId], terminalId)
         if (paneId) {
+          if (setByUser === false && state.paneTitleSetByUser?.[tabId]?.[paneId]) {
+            continue
+          }
           if (!state.paneTitles[tabId]) state.paneTitles[tabId] = {}
           state.paneTitles[tabId][paneId] = title
-          // Mark as user-set so programmatic updates don't overwrite it
-          if (!state.paneTitleSetByUser) state.paneTitleSetByUser = {}
-          if (!state.paneTitleSetByUser[tabId]) state.paneTitleSetByUser[tabId] = {}
-          state.paneTitleSetByUser[tabId][paneId] = true
+          if (setByUser !== false) {
+            // Mark as user-set so programmatic updates don't overwrite it
+            if (!state.paneTitleSetByUser) state.paneTitleSetByUser = {}
+            if (!state.paneTitleSetByUser[tabId]) state.paneTitleSetByUser[tabId] = {}
+            state.paneTitleSetByUser[tabId][paneId] = true
+          }
         }
       }
     },

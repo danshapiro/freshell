@@ -36,6 +36,7 @@ import { CSS } from '@dnd-kit/utilities'
 import type { Tab, TabAttentionStyle } from '@/store/types'
 import type { PaneContent } from '@/store/paneTypes'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
+import { applyTabRename } from '@/store/titleSync'
 
 interface SortableTabProps {
   tab: Tab
@@ -124,6 +125,7 @@ function SortableTab({
 
 // Stable empty object to avoid creating new references
 const EMPTY_LAYOUTS: Record<string, never> = {}
+const EMPTY_PANE_TITLES: Record<string, Record<string, string>> = {}
 const EMPTY_ATTENTION: Record<string, boolean> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_ACTIVITY_TERMINAL_IDS: string[] = []
@@ -142,6 +144,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   const activeTabId = tabsState?.activeTabId ?? null
   const renameRequestTabId = tabsState?.renameRequestTabId ?? null
   const paneLayouts = useAppSelector((s) => s.panes?.layouts) ?? EMPTY_LAYOUTS
+  const paneTitles = useAppSelector((s) => s.panes?.paneTitles) ?? EMPTY_PANE_TITLES
   const attentionByTab = useAppSelector((s) => s.turnCompletion?.attentionByTab) ?? EMPTY_ATTENTION
   const attentionByPane = useAppSelector((s) => s.turnCompletion?.attentionByPane) ?? EMPTY_ATTENTION
   const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
@@ -156,8 +159,8 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   // Compute display title for a single tab
   // Priority: user-set title > programmatically-set title (e.g., from Claude) > derived name
   const getDisplayTitle = useCallback(
-    (tab: Tab): string => getTabDisplayTitle(tab, paneLayouts[tab.id], extensions),
-    [paneLayouts, extensions]
+    (tab: Tab): string => getTabDisplayTitle(tab, paneLayouts[tab.id], paneTitles[tab.id], extensions),
+    [paneLayouts, paneTitles, extensions]
   )
 
   const getPaneContents = useCallback((tab: Tab): PaneContent[] | undefined => {
@@ -287,12 +290,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         tabAttentionStyle={tabAttentionStyle}
         onRenameChange={setRenameValue}
         onRenameBlur={() => {
-          dispatch(
-            updateTab({
-              id: tab.id,
-              updates: { title: renameValue || tab.title, titleSetByUser: true },
-            })
-          )
+          dispatch(applyTabRename({ tabId: tab.id, title: renameValue || tab.title }))
           setRenamingId(null)
         }}
         onRenameKeyDown={(e) => {

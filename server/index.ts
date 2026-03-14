@@ -63,6 +63,7 @@ import { createAgentTimelineService } from './agent-timeline/service.js'
 import { createAgentTimelineRouter } from './agent-timeline/router.js'
 import { createTerminalViewService } from './terminal-view/service.js'
 import { resolveStartupBanner } from './startup-banner.js'
+import { shouldPromoteSessionTitle } from './session-title-sync.js'
 
 function compileArgTemplate(
   template: string[] | undefined,
@@ -524,21 +525,13 @@ async function main() {
           pendingMetadataSync.set(term.terminalId, session)
 
           // Auto-update terminal titles based on session data
-          if (session.title) {
-            const defaultTitle =
-              session.provider === 'claude'
-                ? 'Claude'
-                : session.provider === 'codex'
-                  ? 'Codex'
-                  : 'CLI'
-            if (term.title === defaultTitle) {
-              registry.updateTitle(term.terminalId, session.title)
-              wsHandler.broadcast({
-                type: 'terminal.title.updated',
-                terminalId: term.terminalId,
-                title: session.title,
-              })
-            }
+          if (session.title && shouldPromoteSessionTitle(term.title, session.provider)) {
+            registry.updateTitle(term.terminalId, session.title)
+            wsHandler.broadcast({
+              type: 'terminal.title.updated',
+              terminalId: term.terminalId,
+              title: session.title,
+            })
           }
         }
       }

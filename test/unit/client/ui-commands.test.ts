@@ -93,8 +93,8 @@ describe('handleUiCommand', () => {
       payload: { tabId: 't1', paneId: 'p1', title: 'Logs' },
     }, dispatch)
 
-    expect(actions[0].type).toBe('panes/updatePaneTitle')
-    expect(actions[0].payload).toEqual({ tabId: 't1', paneId: 'p1', title: 'Logs' })
+    expect(actions).toHaveLength(1)
+    expect(typeof actions[0]).toBe('function')
   })
 
   it('dispatches closeTab thunk for tab.close', () => {

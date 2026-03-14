@@ -2,6 +2,7 @@ import { addTab, setActiveTab, closeTab, updateTab, closePaneWithCleanup } from 
 import { initLayout, splitPane, setActivePane, updatePaneContent, updatePaneTitle, resizePanes, swapPanes } from '@/store/panesSlice'
 import { captureUiScreenshot } from '@/lib/ui-screenshot'
 import type { AppDispatch, RootState } from '@/store/store'
+import { applyPaneRename, applyTabRename } from '@/store/titleSync'
 
 type DispatchFn = (action: any) => any
 
@@ -93,7 +94,7 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
     case 'tab.select':
       return dispatch(setActiveTab(msg.payload.id))
     case 'tab.rename':
-      return dispatch(updateTab({ id: msg.payload.id, updates: { title: msg.payload.title } }))
+      return dispatch(applyTabRename({ tabId: msg.payload.id, title: msg.payload.title }))
     case 'tab.close':
       return dispatch(closeTab(msg.payload.id))
     case 'pane.split':
@@ -109,7 +110,7 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
     case 'pane.select':
       return dispatch(setActivePane({ tabId: msg.payload.tabId, paneId: msg.payload.paneId }))
     case 'pane.rename':
-      return dispatch(updatePaneTitle({
+      return dispatch(applyPaneRename({
         tabId: msg.payload.tabId,
         paneId: msg.payload.paneId,
         title: msg.payload.title,
